@@ -1253,14 +1253,17 @@ function parseModelRef(text, fallbackProvider) {
 }
 const formatModelRef = (spec) => [spec?.provider, spec?.model, spec?.effort].filter(Boolean).join(':');
 const modelRefKey = (spec) => `${spec.provider}:${spec.model || ''}:${spec.effort || ''}`;
+// Harnesses by their product names (the stored key stays lowercase).
+const HARNESS_LABELS = { claude: 'Claude', codex: 'Codex', opencode: 'OpenCode' };
+const harnessLabel = (provider) => HARNESS_LABELS[provider] || provider;
 function modelLabel(provider, model) {
-  if (!model) return 'default model';
+  if (!model) return 'Default model';
   const option = modelOptions(provider).find((candidate) => modelIdOf(candidate) === model);
   return (option && typeof option !== 'string' && option.displayName) || model;
 }
 function modelFaceHtml(spec) {
   if (!spec?.provider) return '';
-  return `<span class="mf-harness" data-harness="${esc(spec.provider)}">${esc(spec.provider)}</span>`
+  return `<span class="mf-harness" data-harness="${esc(spec.provider)}">${esc(harnessLabel(spec.provider))}</span>`
     + `<span class="mf-name">${esc(modelLabel(spec.provider, spec.model))}</span>`
     + (spec.effort ? `<span class="mf-effort">${esc(spec.effort)}</span>` : '');
 }
@@ -1380,7 +1383,7 @@ function wireModelField(field, { fallbackProvider } = {}) {
     rows = filterModelRows(modelPickerRows(), typed ? input.value : '').map((row) =>
       !typed && row.provider === value.provider && row.model === value.model ? { ...row, effort: value.effort, isCurrent: true } : row);
     menu.innerHTML = rows.length ? rows.map((row, index) => `<div class="combo-opt mf-row${index === active ? ' active' : ''}" role="option" data-index="${index}">
-        <span class="mf-harness" data-harness="${esc(row.provider)}">${esc(row.provider)}</span>
+        <span class="mf-harness" data-harness="${esc(row.provider)}">${esc(harnessLabel(row.provider))}</span>
         <span class="mf-row-name" title="${esc(row.description || row.model)}">${esc(row.label)}${row.label !== row.model ? ` <code>${esc(row.model)}</code>` : ''}</span>
         <span class="mf-efforts">${row.efforts.length ? ['', ...EFFORT_ORDER].map((effort) => effort && !row.efforts.includes(effort)
           ? `<span class="mf-effort-chip mf-effort-gap" aria-hidden="true">${esc(effort)}</span>`
@@ -1945,17 +1948,17 @@ function renderField(f, own, inherited, withChips, alt, agentOpts) {
   if (f.type === 'responder') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderResponderField(f, own, inherited, alt)}</div>`;
   if (f.type === 'text') {
     // The prompt field also carries durable uploads and wiki context.
-    const placeholder = withChips ? 'Describe the task (drop files here, type [[ to add wiki context)' : (f.placeholder || '');
+    const placeholder = withChips ? 'Describe the task' : (f.placeholder || '');
     const ta = `<textarea ${attrs} rows="4" placeholder="${esc(placeholder)}">${esc(v)}</textarea>`;
     // For the prompt field, pasted images render inside the box (below the text),
     // growing it as needed — rather than in a separate "Images" section.
     if (withChips)
-      // The prompt box's clean bottom row: a borderless "wiki context" field,
-      // seeded elsewhere with the default [[proj:tag:default]] / [[org:tag:default]] so
-      // the user sees (and can backspace away) what's inlined by default.
+      // The prompt box's clean bottom row: the wiki context as chips (seeded
+      // elsewhere with the default [[proj:tag:default]] / [[org:tag:default]]), so
+      // the user sees (and can remove) what's inlined by default; [[ adds more.
       return `<div class="form-row" data-row="${esc(f.name)}">${label}<div class="prompt-field">${ta}<div class="img-chips attachment-chips" id="tf-chips" style="display:none"></div>
-        <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input id="tf-files" type="file" multiple hidden></label><span title="25 MB each · 50 MB per prompt">25 MB each · 50 MB per prompt</span></div>
-        <div class="prompt-context-row"><span class="pc-prefix" title="Wiki pages, labels ([[…:tag:…]]), or folders ([[…/*]]) inlined into this task's context. Type [[ to add; backspace to remove.">context</span><textarea id="tf-context" class="prompt-context" rows="1" spellcheck="false" placeholder="type [[ to attach a wiki page, label, or folder"></textarea></div></div></div>`;
+        <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input id="tf-files" type="file" multiple hidden></label>${policyTip('Drop or paste files here (25 MB each, 50 MB per task). Type [[ to add a wiki page.')}</div>
+        <div class="prompt-context-row"><span class="pc-prefix">Context</span>${policyTip('Wiki pages the agent reads before it starts. Type [[ to add a page, a label or a folder.')}<input type="hidden" id="tf-context"><span class="pc-chips" id="tf-context-chips"></span><textarea id="tf-context-add" class="prompt-context" rows="1" spellcheck="false" aria-label="Add wiki context" placeholder="[[ to add"></textarea></div></div></div>`;
     return `<div class="form-row" data-row="${esc(f.name)}">${label}${ta}</div>`;
   }
   if (f.type === 'boolean')
@@ -2216,7 +2219,8 @@ function agentAuthoritySummary(authority, projects = S.projects) {
   const credentials = (authority.credentialGrants || []).length;
   if (credentials) parts.push(`${credentials} credential${credentials === 1 ? '' : 's'}`);
   const payments = authority.paymentPolicy;
-  if (payments?.cardIds) parts.push(payments.cardIds.length ? `${payments.cardIds.length} card${payments.cardIds.length === 1 ? '' : 's'}` : 'no cards');
+  // Only what it holds: no cards is the default, not news.
+  if (payments?.cardIds?.length) parts.push(`${payments.cardIds.length} card${payments.cardIds.length === 1 ? '' : 's'}`);
   if (payments?.cardIds?.length && payments.budget !== undefined) parts.push(payments.budget === null ? 'no budget limit'
     : `${fromMinorUnits(payments.budget, payments.currency || 'usd')} ${(payments.currency || 'usd').toUpperCase()}`);
   return parts.join(' · ');
@@ -2636,11 +2640,38 @@ function humanAudienceOptions() {
   ];
 }
 // A comma-separated audience box whose suggestions follow the entry being typed.
+// Away from the keyboard it reads by name ("Task creator"), not as the stored
+// tokens (@creator); focused, the tokens are edited as text.
 function audienceComboHtml(className, audience, label) {
-  return `<div class="combo audience-combo"><input class="${className}" value="${esc(audience)}" aria-label="${esc(label)}" placeholder="@creator, @team:leaders, or search for a person" autocomplete="off" spellcheck="false" /><button type="button" class="combo-caret" tabindex="-1" aria-label="Show people and teams">▾</button><div class="combo-menu" hidden></div></div>`;
+  return `<div class="combo audience-combo"><input class="${className}" value="${esc(audience)}" aria-label="${esc(label)}" placeholder="Search people or teams" autocomplete="off" spellcheck="false" /><span class="audience-face" aria-hidden="true"></span><button type="button" class="combo-caret" tabindex="-1" aria-label="Show people and teams">▾</button><div class="combo-menu" hidden></div></div>`;
+}
+function audienceNames(value) {
+  let options = [];
+  try { options = humanAudienceOptions(); } catch { /* people not loaded yet */ }
+  return String(value || '').split(',').map((entry) => entry.trim()).filter(Boolean)
+    .map((entry) => (options.find((o) => o.value === entry)?.label || entry).replace(/^Person · /, '')).join(', ');
+}
+function wireAudienceFace(combo) {
+  const input = combo.querySelector('input');
+  const face = combo.querySelector('.audience-face');
+  if (!input || !face || input.dataset.faceWired) return;
+  input.dataset.faceWired = '1';
+  const paint = () => {
+    const names = audienceNames(input.value);
+    face.textContent = names;
+    input.classList.toggle('has-face', !!names && names !== input.value.trim().replace(/,\s*$/, ''));
+    if (input.isConnected) {
+      const style = getComputedStyle(input);
+      face.style.paddingLeft = `${parseFloat(style.paddingLeft) + parseFloat(style.borderLeftWidth)}px`;
+      face.style.fontSize = style.fontSize;
+      if (input.offsetHeight) face.style.lineHeight = `${input.offsetHeight}px`;
+    }
+  };
+  for (const type of ['input', 'change', 'blur']) input.addEventListener(type, paint);
+  paint();
 }
 function wireAudienceCombos(root) {
-  root.querySelectorAll('.audience-combo').forEach((combo) => wireCombo(combo, humanAudienceOptions, null, { multiple: true }));
+  root.querySelectorAll('.audience-combo').forEach((combo) => { wireCombo(combo, humanAudienceOptions, null, { multiple: true }); wireAudienceFace(combo); });
 }
 // An agent other than the main one: its block carries Instructions and its own
 // Authorization row (inheriting the main agent's until changed).
@@ -5148,13 +5179,16 @@ function scheduleSearch(background = false) {
   }, 180);
 }
 
+// What the search box shows for a query: nothing for a view's own query (its
+// chip is lit), else the query. Typing in the empty box starts a new search.
+function searchBoxText(q) { return viewIdForQuery(q) ? '' : q || ''; }
+
 // Programmatically set the working query (view selection, filter/sort/group menus).
-// Updates the topbar box (which renderMain doesn't own) and the URL, re-evaluates,
-// re-renders.
+// Updates the search box and the URL, re-evaluates, re-renders.
 async function setQuery(q) {
   S.search = q || '';
   const box = $('#task-search');
-  if (box) box.value = S.search;
+  if (box) box.value = searchBoxText(S.search);
   syncQueryUrl();
   const search = runSearch();
   if (isTaskListTab()) renderMain();
@@ -6404,10 +6438,14 @@ function flushBgRender() {
 // WS-driven repaints into one per animation frame: the last state wins and the
 // browser paints once, at a frame boundary.
 let taskPageRenderQueued = false;
+// An event's payload in one line: what it says, without empty fields or the
+// opaque ids (tokens, runs, turns) a person cannot act on.
 function summarize(p) {
   if (!p) return '';
   if (p.text) return p.text.slice(0, 160);
-  return Object.entries(p).map(([k, val]) => `${k}=${typeof val === 'object' ? JSON.stringify(val).slice(0, 40) : val}`).join(' ').slice(0, 160);
+  return Object.entries(p)
+    .filter(([k, val]) => val != null && val !== '' && !/token|^(?:workflowRunId|turnId|executionId|id)$/i.test(k))
+    .map(([k, val]) => `${k}=${typeof val === 'object' ? JSON.stringify(val).slice(0, 40) : val}`).join(' ').slice(0, 160);
 }
 
 function scheduleTaskPageRender() {
@@ -6778,18 +6816,20 @@ function tasksView() {
       <button type="button" class="btn icon-only" id="new-from-template" data-shortcut="nav.newTask" title="New task from template" aria-label="New task from template">${ICON.template}</button>
       <button type="button" class="btn primary icon-only" id="add-task" title="New task" aria-label="New task">${ICON.send}</button>
     </div>`;
-  const trailing = everywhere ? '' : home ? projectFilterHtml()
-    : `<button class="q-sel" id="manage-tags" title="Manage the project's tags">Tags</button>`;
+  // Tags are managed from the Filter menu's Tag picker, not beside the query menus.
+  const trailing = everywhere || !home ? '' : projectFilterHtml();
+  // A view's own query is its lit chip; the box holds only a search of your own.
+  const boxText = searchBoxText(S.search);
   // The bell's page has no tab bar or composer to say where you are.
   return `${everywhere ? '<h1 class="page-title">Inbox</h1>' : ''}${composer}
     <div class="organizer">
       <div class="search-box${S.searchPending ? ' searching' : ''}">
         <span class="search-ic">⌕</span>
-        <input id="task-search" class="task-search" data-shortcut="nav.search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
+        <input id="task-search" class="task-search" data-shortcut="nav.search" spellcheck="false" autocomplete="off" value="${esc(boxText)}"
           placeholder="Search tasks" aria-label="Search and filter tasks" />
         ${S.searchPending ? '<span class="search-pending" role="status">Searching…</span>' : store ? '' : `<span class="search-count">${count} task${count === 1 ? '' : 's'}</span>`}
         ${policyTip('Type words to search, or filters: status:active  -tag:bug  priority:>=2  group:stage  sort:updated-desc')}
-        ${S.search ? `<button class="search-x" id="q-clear" title="Clear (Esc)">✕</button>` : ''}
+        ${boxText ? `<button class="search-x" id="q-clear" title="Clear (Esc)">✕</button>` : ''}
       </div>
       <div class="organizer-row">${viewsBar()}${queryToolbarHtml(S.search || '', 'q', trailing)}</div>
     </div>
@@ -7033,18 +7073,20 @@ function wireTaskStore() {
 
 // Why a row is in a `for:` list, from the inbox kind of the ask, most pressing first.
 // A short label on the row; the explanation is its tooltip.
+// "Needs …", as the task page says it (stageLabel's "Needs input"), and never a
+// stage's own name: the row's stage chip says "Review", its ask "Needs review".
 const ATTENTION_REASONS = {
-  'approval-requested': ['Approval', 'Waiting for your approval'],
-  'review-requested': ['Review', 'Waiting for your review'],
-  escalated: ['Input', 'Waiting for your answer'],
+  'approval-requested': ['Needs approval', 'Waiting for your approval'],
+  'review-requested': ['Needs review', 'Waiting for your review'],
+  escalated: ['Needs input', 'Waiting for your answer'],
   assigned: ['Assigned', 'Assigned to you'],
   mentioned: ['Mentioned', 'You were mentioned'],
 };
 // A hold on a person says what it is waiting for (waitingFor.reason).
 const HOLD_REASONS = {
   error: ['Failed', 'Stopped on an error — needs you'],
-  authorization: ['Access', 'Needs an authorization you can grant'],
-  merge: ['Merge', 'Waiting for you to merge'],
+  authorization: ['Needs access', 'Needs an authorization you can grant'],
+  merge: ['Needs merging', 'Waiting for you to merge'],
 };
 // What a task's pull request asks (SPEC §11.1): the task itself is not waiting on it.
 const PULL_REQUEST_REASONS = {
@@ -7111,7 +7153,8 @@ const CHEVRON = '<svg class="project-pick-caret" viewBox="0 0 24 24" width="12" 
 function projectPickerHtml(id, projectId, editable = true) {
   const project = projectById(projectId);
   if (!project) return '';
-  const label = (p) => `<span class="task-project">${esc(projectSlug(p))}</span>`;
+  // The task form names its project as the task page does: by name, not slug.
+  const label = (p) => `<span class="task-project project-name">${esc(projectPath(p) || p.name)}</span>`;
   const choices = editable ? (S.projects || []).filter((p) => p.organizationId === project.organizationId) : [];
   if (choices.length < 2) return `<span class="project-pick static" id="${esc(id)}" title="${esc(projectPath(project))}">${label(project)}</span>`;
   return `<span class="project-pick-wrap">
@@ -7391,7 +7434,7 @@ const PARKED_WAITS = new Set(['timer', 'job', 'subtask', 'collaboration', 'paren
 // GitHub may alternate between queue admission, checks, and mergeability without
 // the task ever leaving Landing. The short wait reason is rendered separately.
 function stageLabel(v) {
-  if (v.state?.draft) return 'draft';
+  if (v.state?.draft) return 'Draft';
   // A full disk stopped the task: say so, not "blocked" (wiki features/computers).
   if (v.outOfDisk) return 'Out of disk';
   // A human hold is a public software-dev stage, even though the workflow keeps
@@ -7407,8 +7450,11 @@ function stageLabel(v) {
   // (task 433 read "working" for hours while paused until the next morning).
   if (v.stage === 'do' && v.status === 'waiting' && PARKED_WAITS.has(v.waitingFor?.kind)) return waitingText(v.waitingFor);
   // `do` and `merge` are the replay-stable workflow keys; a person reads them
-  // as "working" and "landing" and never has to learn the internal names.
-  return { do: 'working', merge: 'landing' }[v.stage || 'setup'] || v.stage || 'setup';
+  // as "Working" and "Landing" and never has to learn the internal names. Any
+  // other key reads in sentence case (`needs_review` → "Needs review").
+  const stage = v.stage || 'setup';
+  const words = { do: 'Working', merge: 'Landing', pr: 'PR' }[stage] || String(stage).replace(/[_-]+/g, ' ').trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
 // The stage indicator is also the lifecycle control. The server supplies the
@@ -7465,8 +7511,20 @@ function pipeline(v) {
 }
 
 // ── task-organization control wiring (views bar + query toolbar + modals) ─────
+// A row that scrolls sideways (a phone's chips) fades at an edge with more beyond it.
+function wireScrollFade(el) {
+  if (!el) return;
+  const paint = () => {
+    el.classList.toggle('fade-start', el.scrollLeft > 1);
+    el.classList.toggle('fade-end', el.scrollLeft + el.clientWidth < el.scrollWidth - 1);
+  };
+  el.addEventListener('scroll', paint, { passive: true });
+  paint();
+}
+
 function wireOrgControls() {
   const main = $('#main');
+  wireScrollFade(main.querySelector('.organizer-row'));
   // Saved-view chips: each selects a query.
   // A chip is a link (new tab on a modified click); a plain click switches the
   // query in place, replacing the history entry as typing a query does.
@@ -7494,7 +7552,6 @@ function wireOrgControls() {
     }),
   );
   $('#save-view')?.addEventListener('click', saveCurrentView);
-  $('#manage-tags')?.addEventListener('click', openTagsManager);
   $('#q-clear')?.addEventListener('click', () => { setQuery(''); $('#task-search')?.focus(); });
 
   // The in-list search box drives the working query. Debounced re-evaluation keeps
@@ -7502,7 +7559,7 @@ function wireOrgControls() {
   const search = $('#task-search');
   if (search) {
     search.addEventListener('input', (e) => { S.search = e.target.value; scheduleSearch(); });
-    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search) { e.stopPropagation(); setQuery(''); } });
+    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && e.target.value) { e.stopPropagation(); setQuery(''); } });
   }
 
   wireQueryToolbar(main, 'q', { get: () => S.search, set: (q) => setQuery(q) });
@@ -7580,11 +7637,13 @@ function openFilterPicker(fieldKey, onAdd) {
   const apply = (value, negate) => { host.remove(); if (value === '' || value == null) return; onAdd((negate ? '-' : '') + field.key, value); };
 
   let inner = '';
+  // On a project's list the Tag picker is also where its tags are managed.
+  const manageTags = field.type === 'tag' && !!S.projectId && S.tab === 'tasks';
   if (field.type === 'tag') {
     // Show the hierarchy as indented paths; picking one adds tag:<path>.
     const rows = S.tags.length
       ? S.tags.map((t) => `<div class="opt" data-val="${esc(tagPathStr(t.id))}">${esc(tagPathStr(t.id))}${t.kind ? ` <span class="pal-sub">${esc(t.kind)}</span>` : ''}</div>`).join('')
-      : `<div class="pal-empty">No tags yet. Create one with the Tags button.</div>`;
+      : `<div class="pal-empty">${manageTags ? 'No tags yet. Add one with Manage tags.' : 'No tags yet'}</div>`;
     inner = rows;
   } else if (field.options) {
     inner = field.options.map((o) => `<div class="opt" data-val="${esc(o.value)}">${esc(o.label)}</div>`).join('');
@@ -7596,12 +7655,13 @@ function openFilterPicker(fieldKey, onAdd) {
     inner = `<div class="fp-row">${ops}<input id="fp-val" class="title-in" placeholder="${ph}" /></div><button class="btn primary" id="fp-add">Add filter</button>`;
   }
   host.innerHTML = `<div class="palette-scrim" id="fp-scrim"><div class="palette fp">
-    <div class="fp-head">Filter by ${esc(field.label)} <label class="fp-neg"><input type="checkbox" id="fp-negate" /> exclude</label></div>
+    <div class="fp-head">Filter by ${esc(field.label)} <label class="fp-neg"><input type="checkbox" id="fp-negate" /> Exclude</label>${manageTags ? '<button type="button" class="btn sm ghost" id="fp-manage-tags" title="Create, rename, nest and delete the project’s tags">Manage tags</button>' : ''}</div>
     <div id="fp-list">${inner}</div>
   </div></div>`;
   const neg = () => $('#fp-negate', host)?.checked;
   $('#fp-scrim', host).addEventListener('click', (e) => { if (e.target.id === 'fp-scrim') host.remove(); });
   host.querySelectorAll('.opt[data-val]').forEach((o) => o.addEventListener('click', () => apply(o.dataset.val, neg())));
+  $('#fp-manage-tags', host)?.addEventListener('click', () => { host.remove(); openTagsManager(); });
   $('#fp-add', host)?.addEventListener('click', () => { const op = $('#fp-op', host)?.value || ''; const val = $('#fp-val', host)?.value.trim(); if (val) apply(op + val, neg()); });
   $('#fp-val', host)?.focus();
   $('#fp-val', host)?.addEventListener('keydown', (e) => { if (e.key === 'Enter') { const op = $('#fp-op', host)?.value || ''; const val = e.target.value.trim(); if (val) apply(op + val, neg()); } });
@@ -7699,11 +7759,11 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['run'], query 
   const rowHtml = (t) => {
     const v = t.lastView || {};
     const status = v.status || (awaitingApproval(t) || t.params?.triggerState === 'armed' ? 'waiting' : t.params?.draft ? 'cancelled' : 'active');
-    const chipLabel = awaitingApproval(t) ? 'waiting for approval' : t.params?.draft ? 'draft' : t.params?.triggerState === 'armed' ? 'waiting for trigger' : stageLabel(v);
+    const chipLabel = awaitingApproval(t) ? 'Waiting for approval' : t.params?.draft ? 'Draft' : t.params?.triggerState === 'armed' ? 'Waiting for trigger' : stageLabel(v);
     const open = expanded.has(t.id);
     return `<div class="pick-row" data-nav data-task="${t.id}">
       <div class="task-main">
-        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">repeatable</span>' : ''}${t.params?.avatar ? ` ${avatarChip}` : ''}</div>
+        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">Archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">Repeatable</span>' : ''}${t.params?.avatar ? ` ${avatarChip}` : ''}</div>
         <div class="task-sub">${organizationWide && t.projectId !== S.projectId ? projectLabel(t) : ''}<span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t, false)}</div>
       </div>
       ${mode === 'agent' ? `<span class="pk-caret">${open ? '▾' : '▸'}</span>` : ''}
@@ -8080,7 +8140,7 @@ function projectTemplates(projectId, fresh = false) {
 /** Palette entries for each template of the project new tasks go to, once loaded. */
 function templateCommands() {
   return (loadedTemplates(newTaskTarget()) || []).map((template, i) => ({ id: `template.${template.id}`,
-    title: `New task: ${template.name}`, group: 'Navigation', help: false, sub: `n ${i + 1}`, run: () => openNewTaskForm(template) }));
+    title: `New task: ${template.name}`, group: 'General', help: false, sub: `n ${i + 1}`, run: () => openNewTaskForm(template) }));
 }
 /** The templates a project offers, if already loaded (the palette lists them). */
 function loadedTemplates(projectId) { return templateRequests.get(projectId)?.list || null; }
@@ -8325,7 +8385,7 @@ function triggersSection(values, selfId) {
     atVal = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
   }
   const gridCells = CRON_FIELDS.map(
-    (f, i) => `<label class="cron-cell">${f.label}<input id="${f.id}" placeholder="*" value="${esc(cronVal(i))}"><small>${f.hint}</small></label>`,
+    (f, i) => `<label class="cron-cell" title="${f.hint}">${f.label}<input id="${f.id}" placeholder="*" value="${esc(cronVal(i))}"></label>`,
   ).join('');
   // One block like the agent and computer blocks: when the task starts, and
   // whether each start is a fresh run (a schedule forces that on).
@@ -8344,7 +8404,7 @@ function triggersSection(values, selfId) {
         <input id="trig-at" type="datetime-local" value="${atVal}">
         <label class="tb-label" for="ev-type">On event ${policyTip('Start when something happens: a GitHub issue is labelled, a webhook or chat message arrives, another task emits an event. Each event starts its own run and the run receives the event.')}</label>
         ${eventTriggerHtml(existing.find((t) => t.kind === 'event'))}
-        <label class="tb-repeat"><input type="checkbox" id="trig-repeatable" ${values.repeatable ? 'checked' : ''}>
+        <label class="tb-repeat"><input type="checkbox" class="toggle" id="trig-repeatable" ${values.repeatable ? 'checked' : ''}>
           Repeatable ${policyTip('Each run is kept: a trigger (or “Run again”) spawns a fresh run instead of running this task once.')}</label>
       </div>
     </div>`;
@@ -9031,8 +9091,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
             ${promptField ? '' : `<div class="form-row" data-row="__images">
               <div class="label-row"><label>Attachments</label></div>
               <div class="img-chips attachment-chips" id="tf-chips" style="display:none"></div>
-              <label class="attach-file-button" tabindex="0">Attach files<input id="tf-files" type="file" multiple hidden></label>
-              <span style="color:var(--ink-3);font-size:12px">Drop files into a text field above, or choose up to 8 files (25 MB each, 50 MB total).</span>
+              <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input id="tf-files" type="file" multiple hidden></label>${policyTip('Drop files into a field above, or choose up to 8 (25 MB each, 50 MB in all).')}</div>
             </div>`}
             <section class="tf-section tf-triggers">${triggersSection(values, draft?.id)}</section>
             ${templateEdit ? '' : `<section class="tf-section tf-avatar">${avatarSectionHtml(values.avatar)}</section>`}
@@ -9046,12 +9105,12 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
               <input id="tf-attempt-count" type="number" min="1" max="8" value="1">
             </div>` : ''}
             ${templateEdit ? '' : `<div class="form-row" data-row="__creds">
-              <div class="label-row"><label>Codex/Claude</label>${policyTip('Drag to reorder, toggle to disable — for this task only.')}<span class="label-row-fill"></span></div>
+              <div class="label-row"><label>Accounts</label>${policyTip('The Claude and Codex accounts this task runs on, first available first. Drag to reorder; switch one off to skip it, for this task only.')}<span class="label-row-fill"></span></div>
               <div id="cred-editor-newtask">Loading…</div>
             </div>`}
             <div class="form-row" data-row="__notes">
-              <div class="label-row"><label>Notes</label>${policyTip('Private to you; never sent to the agent.')}</div>
-              <textarea id="tf-notes" rows="3" placeholder="Add a note…" style="width:100%">${esc(draft?.notes || seed?.notes || '')}</textarea>
+              <div class="label-row"><label>Notes</label>${policyTip(NOTES_TIP)}<span class="label-row-fill"></span></div>
+              <textarea id="tf-notes" rows="3" placeholder="Add a note…">${esc(draft?.notes || seed?.notes || '')}</textarea>
             </div>
           </aside>
         </div>
@@ -9194,20 +9253,17 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const promptTa = $('#tf-body')?.querySelector('textarea[data-field="prompt"]');
   if (promptTa) wireWikiMention(promptTa, projectId);
   // The prompt's "wiki context" bottom row: seed with the task's tokens, or the
-  // defaults so the user can see (and backspace away) what's inlined by default.
-  const contextTa = $('#tf-context');
-  if (contextTa) {
+  // defaults so the user can see (and remove) what's inlined by default.
+  const contextValue = $('#tf-context');
+  if (contextValue) {
     const wc = draft?.params?.wikiContext;
-    contextTa.value = Array.isArray(wc)
+    const seeded = Array.isArray(wc)
       ? wc.map((token) => {
         const value = String(token);
         return /^@(proj|org):\S+$/i.test(value) ? `[[${value.slice(1)}]]` : value;
-      }).join(' ')
-      : '[[proj:tag:default]] [[org:tag:default]]';
-    const growContext = () => { contextTa.style.height = 'auto'; contextTa.style.height = `${contextTa.scrollHeight}px`; };
-    growContext();
-    contextTa.addEventListener('input', growContext);
-    wireWikiMention(contextTa, projectId);
+      })
+      : ['[[proj:tag:default]]', '[[org:tag:default]]'];
+    wireContextChips(contextValue, seeded, projectId);
   }
   paintFormChips();
   if ((values['agent:do'] || values['agent:unified'])?.resumeFrom?.taskId) showForkWorldHelp($('#tf-body'));
@@ -9771,7 +9827,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // says what it risks (confirmAvatar).
   const avatarBox = $('#tf-avatar');
   const avatarCombo = root.querySelector('.tf-avatar .audience-combo');
-  if (avatarCombo) wireCombo(avatarCombo, humanAudienceOptions, null, { multiple: true });
+  if (avatarCombo) { wireCombo(avatarCombo, humanAudienceOptions, null, { multiple: true }); wireAudienceFace(avatarCombo); }
   avatarBox?.addEventListener('change', () => {
     root.querySelector('.tf-avatar-options').hidden = !avatarBox.checked;
     const saveAvatar = $('#tf-save-avatar');
@@ -9901,10 +9957,10 @@ async function renderSeriesPage(rec) {
           <a class="icon-btn" id="tp-back" href="${esc(taskBackRoute())}" data-shortcut="nav.close" title="Back (Esc)">←</a>
           ${rec.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}
           <h2>${esc(rec.title)}</h2>
-          <span class="chip">repeatable</span>
+          <span class="chip">Repeatable</span>
         </div>
         <div class="meta">
-          <span>${esc(wf)}</span>
+          <span>${esc(workflowLabel(wf))}</span>
           ${rec.params?.triggers?.length ? `<span>${esc(triggerSummary(rec.params.triggers))}</span>` : ''}
           <span>${runs.length} run${runs.length === 1 ? '' : 's'}</span>
         </div>
@@ -9913,11 +9969,11 @@ async function renderSeriesPage(rec) {
         <div id="tf-body">
           ${renderFields(fields, values, inherited)}
           <div class="form-row" data-row="__notes">
-            <div class="label-row"><label>Notes</label></div>
-            <textarea id="tf-notes" rows="3" placeholder="Only you see this — never sent to the agent" style="width:100%">${esc(rec.notes || '')}</textarea>
+            <div class="label-row"><label>Notes</label>${policyTip(NOTES_TIP)}<span class="label-row-fill"></span></div>
+            <textarea id="tf-notes" rows="3" placeholder="Add a note…">${esc(rec.notes || '')}</textarea>
           </div>
           <details class="advanced" style="margin-top:10px">
-            <summary>Codex/Claude — which accounts run this, in what order</summary>
+            <summary title="The Claude and Codex accounts each run uses, first available first">Accounts</summary>
             <div id="cred-editor-newtask">Loading…</div>
           </details>
           ${triggersSection(values, rec.id)}
@@ -10931,7 +10987,7 @@ function renderTaskPage() {
           <a class="icon-btn" id="tp-back" href="${esc(taskBackRoute())}" data-shortcut="nav.close" title="Back to the list (Esc)">←</a>
           ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
-          ${v.approvalRequests ? `<span class="chip approval-needed">approval needed</span>` : ''}
+          ${v.approvalRequests ? `<span class="chip approval-needed">Approval needed</span>` : ''}
           ${pullRequestLinks(v)}
           <span class="tp-stage">${pipeline(v)}${stageIndicator(v, v.taskId)}</span>
           <nav class="tp-views segmented" aria-label="Task view">
@@ -11157,7 +11213,7 @@ function openApprovalHistory(v) {
   root.appendChild(host);
   const previousFocus = document.activeElement;
   host.innerHTML = `<div class="palette-scrim" id="ah-scrim"><div class="palette ah-dialog" role="dialog" aria-modal="true" aria-labelledby="ah-title">
-    <div class="fp-head"><span id="ah-title">Approval requests</span><span class="q-spacer"></span><button type="button" class="icon-btn" id="ah-close" title="Close (Esc)" aria-label="Close">✕</button></div>
+    <div class="fp-head"><span id="ah-title">${v.pendingDecisions ? 'Approval requests' : 'Request history'}</span><span class="q-spacer"></span><button type="button" class="icon-btn" id="ah-close" title="Close (Esc)" aria-label="Close">✕</button></div>
     <div class="ah-body" id="task-approval-history">${approvalHistoryHtml()}</div>
   </div></div>`;
   const close = () => {
@@ -12126,14 +12182,14 @@ function subTaskState(rec) {
   const v = rec?.lastView || {};
   const done = v.status === 'done' || v.stage === 'done';
   // A draft sub-task waits to be run; once queued, for its parent to start it.
-  if (v.state?.draft) return { label: v.state.queued ? 'queued' : 'draft', tone: v.state.queued ? 'waiting' : 'draft',
+  if (v.state?.draft) return { label: v.state.queued ? 'Queued' : 'Draft', tone: v.state.queued ? 'waiting' : 'draft',
     complete: false, approval: false, draft: !v.state.queued };
   const tone = done ? 'done' : v.stage === 'escalated' ? 'blocked' : v.status || 'active';
   return { label: stageLabel(v), tone, complete: done, approval: !!v.approvalRequests };
 }
 
 function subTaskStateHtml(state, className) {
-  return `<span class="${className}">${esc(state.label)}${state.approval ? ' <span class="chip approval-needed">approval needed</span>' : ''}</span>`;
+  return `<span class="${className}"><span class="chip ${esc(state.tone)}">${esc(state.label)}</span>${state.approval ? ' <span class="chip approval-needed">Approval needed</span>' : ''}</span>`;
 }
 
 function subTasksSection(v) {
@@ -12153,33 +12209,20 @@ function subTasksSection(v) {
     return { id, rec, state };
   });
   const complete = children.filter((child) => child.state.complete).length;
-  const progress = Math.round((complete / children.length) * 100);
   const rows = children.map(({ id, rec, state }) => {
     const title = rec?.title || `Sub-task ${numLabel(id)}`;
-    const childView = { workflow: rec?.workflow || v.workflow, ...(rec?.lastView || {}) };
     const row = `<a class="subtask-row" data-open="${esc(id)}" data-spa href="${esc(taskUrl(id, rec))}" aria-label="Open ${esc(title)} — ${esc(state.label)}">
-      <span class="subtask-state ${esc(state.tone)}" aria-hidden="true"></span>
       <span class="subtask-identity">
         <span class="subtask-title">${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}<strong>${esc(title)}</strong></span>
         ${subTaskStateHtml(state, 'subtask-copy')}
       </span>
-      <span class="subtask-pipeline" aria-hidden="true">${state.draft || state.label === 'queued' ? '' : pipeline(childView)}</span>
       <span class="subtask-arrow" aria-hidden="true">›</span>
     </a>`;
     // A draft runs from here; it starts off this task's work as it is then.
     return state.draft ? `<div class="subtask-draft">${row}<button type="button" class="btn sm" data-run-subtask="${esc(id)}" title="Start it from this task's current work">Run</button></div>` : row;
   }).join('');
-  return `<section class="subtasks" aria-labelledby="subtasks-title">
-    <div class="subtasks-head">
-      <div>
-        <div class="subtasks-kicker">Delegated work</div>
-        <h3 id="subtasks-title">Sub-tasks</h3>
-      </div>
-      <div class="subtasks-count"><strong>${complete}</strong> of ${children.length} complete</div>
-    </div>
-    <div class="subtasks-progress" role="progressbar" aria-label="Sub-task completion" aria-valuemin="0" aria-valuemax="${children.length}" aria-valuenow="${complete}">
-      <span style="--subtask-progress:${progress}%"></span>
-    </div>
+  return `<section class="rail-sec subtasks" aria-labelledby="subtasks-title">
+    <div class="rail-h" id="subtasks-title">Sub-tasks <span class="rail-count" title="${complete} of ${children.length} done">${complete}/${children.length}</span></div>
     <div class="subtask-list">${rows}</div>
   </section>`;
 }
@@ -12231,7 +12274,6 @@ function forkTreeHtml(nodes) {
     const state = subTaskState(task);
     return `<li class="fork-tree-item">
       <a class="fork-row" data-spa href="${esc(taskUrl(task.id))}" aria-label="Open ${esc(task.title)} — ${esc(state.label)}">
-        <span class="subtask-state ${esc(state.tone)}" aria-hidden="true"></span>
         <span class="fork-identity">
           <span class="fork-title">${task.num != null ? `<span class="task-num">#${task.num}</span>` : ''}<strong>${esc(task.title)}</strong></span>
           ${subTaskStateHtml(state, 'fork-state')}
@@ -12248,14 +12290,8 @@ function agentForksSection(v) {
   if (!tree.length) return '';
   const countNodes = (nodes) => nodes.reduce((total, node) => total + 1 + countNodes(node.children), 0);
   const count = countNodes(tree);
-  return `<section class="agent-forks" aria-labelledby="agent-forks-title">
-    <div class="agent-forks-head">
-      <div>
-        <div class="agent-forks-kicker">Branched conversations</div>
-        <h3 id="agent-forks-title">Agent forks</h3>
-      </div>
-      <div class="agent-forks-count">${count} task fork${count === 1 ? '' : 's'}</div>
-    </div>
+  return `<section class="rail-sec agent-forks" aria-labelledby="agent-forks-title">
+    <div class="rail-h" id="agent-forks-title">Forks <span class="rail-count">${count}</span></div>
     ${forkTreeHtml(tree)}
   </section>`;
 }
@@ -12274,15 +12310,8 @@ function forkSourceTree(v) {
 function forkSourcesSection(v) {
   const tree = forkSourceTree(v);
   if (!tree.length) return '';
-  const count = v.forkSourceSummaries.length;
-  return `<section class="agent-forks" aria-labelledby="fork-sources-title">
-    <div class="agent-forks-head">
-      <div>
-        <div class="agent-forks-kicker">Branched conversation</div>
-        <h3 id="fork-sources-title">Forked from</h3>
-      </div>
-      <div class="agent-forks-count">${count} source task${count === 1 ? '' : 's'}</div>
-    </div>
+  return `<section class="rail-sec agent-forks" aria-labelledby="fork-sources-title">
+    <div class="rail-h" id="fork-sources-title">Forked from</div>
     ${forkTreeHtml(tree)}
   </section>`;
 }
@@ -12370,12 +12399,10 @@ function checkoutsSection(v) {
     const row = own.get(c.name);
     if (row) {
       const landed = row.label === 'Landed';
-      return `<div class="checkout-row ${landed ? 'landed' : ''}" data-branch-state="${esc(row.label)}">
+      return `<div class="checkout-row ${landed ? 'landed' : ''}" data-branch-state="${esc(row.label)}"${c.branch ? ` title="⎇ ${esc(c.branch)}"` : ''}>
       <span class="checkout-mark">${landed ? '✓' : ''}</span>
       ${checkoutLabel(v, c.name)}
-      <span class="mono" style="color:var(--ink-3)">⎇ ${esc(c.branch)}</span>
-      <span style="color:var(--ink-3)">→ ${esc(row.lane.target)}</span>
-      <span style="flex:1"></span>
+      <span class="checkout-target">→ ${esc(row.lane.target)}</span>
       ${pullRequestChip(row)}
       ${pullRequestLink(row.pr)}
       <a class="btn sm ghost" data-open="${esc(row.lane.childTaskId)}" data-spa href="${esc(taskUrl(row.lane.childTaskId, row.rec))}" title="Its Review and landing">Open</a>
@@ -12384,18 +12411,15 @@ function checkoutsSection(v) {
     }
     const dest = c.stackedOn ? `on ${c.stackedOn}` : `→ ${c.target || v.targetBranch || 'target'}`;
     const [label, tone] = proposalState(v, c);
-    return `<div class="checkout-row ${label === 'Landed' ? 'landed' : ''}"${label ? ` data-branch-state="${esc(label)}"` : ''}>
+    return `<div class="checkout-row ${label === 'Landed' ? 'landed' : ''}"${label ? ` data-branch-state="${esc(label)}"` : ''}${c.branch ? ` title="⎇ ${esc(c.branch)}"` : ''}>
       <span class="checkout-mark">${label === 'Landed' ? '✓' : ''}</span>
       ${checkoutLabel(v, c.name)}
-      <span class="mono" style="color:var(--ink-3)">⎇ ${esc(c.branch)}</span>
-      <span style="color:var(--ink-3)">${esc(dest)}</span>
-      <span style="flex:1"></span>
+      <span class="checkout-target">${esc(dest)}</span>
       ${label ? `<span class="chip ${esc(tone)}">${esc(label)}</span>` : ''}
       ${pullRequestLink(c.pr)}
     </div>`;
   }).join('');
-  return `<div class="section-h">Branches</div>
-    <div class="card checkout-list">${rows}</div>`;
+  return `<section class="rail-sec"><div class="rail-h">Branches</div><div class="checkout-list">${rows}</div></section>`;
 }
 
 // Pull requests that want a person now, or were just approved and are on
@@ -12433,19 +12457,21 @@ function proposalState(v, c) {
 // both views, so choosing an agent or the terminal works from Parameters too.
 function taskRail(v, rec = taskRecord(v.taskId)) {
   const section = (title, body, extra = '') => body ? `<section class="rail-sec">${title ? `<div class="rail-h">${title}${extra}</div>` : ''}${body}</section>` : '';
+  // Branches, when shown, already say where each one lands.
+  const branches = checkoutsSection(v);
   const meta = [
     customBranch(v, v.taskId) ? `<span class="mono" title="Branch">⎇ ${esc(v.branch)}</span>` : '',
-    v.targetBranch ? `<span class="mono" title="Lands on">→ ${esc(v.targetBranch)}</span>` : '',
+    v.targetBranch && !branches ? landsOnLabel(v) : '',
     mergeQueueBadge(v),
     v.landing?.provider && v.landing.provider !== 'none'
-      ? `<span title="${esc(v.landing.detail || 'Provider landing state')}">landing: ${esc(v.landing.provider)}</span>` : '',
+      ? `<span title="${esc(v.landing.detail || 'Where the merge queue has it')}">${esc(LANDING_STATES[v.landing.provider] || sentenceCase(v.landing.provider))}</span>` : '',
     runsOnChip(v),
     diskMeter(v),
     freeComputerButton(v),
   ].filter(Boolean).join('');
   const attempts = S.attemptGroup?.attempts?.length || 0;
   return `<div class="rail-inner">
-    ${checkoutsSection(v)}
+    ${branches}
     ${attempts > 1 ? section('Attempts', taskAttempts(v)) : attempts === 1 ? `<div class="rail-sec rail-new-attempt">${addAttemptButton('rail-link')}</div>` : ''}
     ${subTasksSection(v)}
     ${forkSourcesSection(v)}
@@ -12460,11 +12486,27 @@ function taskRail(v, rec = taskRecord(v.taskId)) {
   </div>`;
 }
 
+// Where the task lands: its target branch, or — for a sub-task landing on its
+// parent's own branch — the parent by number rather than a random branch name.
+function landsOnLabel(v) {
+  const id = String(v.targetBranch).match(/^(?:tavya|karmax)\/(.+)$/)?.[1];
+  const parent = id && (taskRecord(id) || (v.parentTask?.id === id ? v.parentTask : null));
+  const label = parent ? (parent.num != null ? `#${parent.num}` : 'Parent task') : v.targetBranch;
+  return `<span class="${parent ? '' : 'mono'}" title="Lands on ${esc(v.targetBranch)}">→ ${esc(label)}</span>`;
+}
+// A provider merge queue's state for the task (landing.provider), in words.
+const LANDING_STATES = { admitting: 'Joining merge queue', queued: 'In merge queue', validating: 'Checks running', ejected: 'Left merge queue' };
+function sentenceCase(text) {
+  const words = String(text ?? '').replace(/[_-]+/g, ' ').trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
 // The record of every request the task raised, with how many still wait on a
-// decision — ignored ones too: the agent waits on those all the same.
+// decision — ignored ones too: the agent waits on those all the same. With none
+// waiting it is only their history.
 function approvalHistoryLink(v) {
   const pending = v.pendingDecisions || 0;
-  return `<button type="button" class="btn tool rail-link" id="approval-history-open" title="Every app, credential and permission request this task raised">Approval requests${pending
+  return `<button type="button" class="btn tool rail-link${pending ? ' pending' : ''}" id="approval-history-open" title="Every app, credential and permission request this task raised">${pending ? 'Approval requests' : 'Request history'}${pending
     ? ` <span class="rail-link-count" aria-label="${pending} pending">${pending}</span>` : ''}</button>`;
 }
 
@@ -12671,9 +12713,9 @@ function conversationPane(v, t) {
   const forkCmd = sess?.id && sess?.home && localWorldPath(v) ? forkCommandFor(sess, v.worldPath) : '';
   const remoteFork = sess?.id && sess?.home && v.worldAvailable && !v.worldPath && !v.agentTurn && hostLocal();
   const copy = forkCmd
-    ? `<button class="btn tool copy-cmd" data-tool="Fork in CLI" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">${ICON.terminal}Fork in CLI</button>`
+    ? `<button class="btn tool copy-cmd" data-tool="Fork in CLI" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running" aria-label="Fork in CLI">${ICON.terminal}<span class="tool-label">Fork in CLI</span></button>`
     : remoteFork
-      ? `<button class="btn tool fork-local" data-tool="Fork locally" data-provider="${esc(sess.provider)}" data-session="${esc(sess.id)}" data-home="${esc(sess.home)}" title="Materialize the cloud branch locally, then copy a native session-fork command">${ICON.laptop}Fork locally</button>`
+      ? `<button class="btn tool fork-local" data-tool="Fork locally" data-provider="${esc(sess.provider)}" data-session="${esc(sess.id)}" data-home="${esc(sess.home)}" title="Materialize the cloud branch locally, then copy a native session-fork command" aria-label="Fork locally">${ICON.laptop}<span class="tool-label">Fork locally</span></button>`
       : '';
   // The follow-up affordance (SPEC §5.6) lives inside each agent's conversation,
   // so a human can address any agent — Do, Merge, or Confirm — not just Do. It
@@ -12714,10 +12756,10 @@ function conversationPane(v, t) {
   const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
         <div class="prompt-field">
-          <textarea class="followup-input" placeholder="${t.shared ? `${defaultRecipientFor(v) === 'agent:do' ? 'Message the agent' : `Reply to ${participantLabelOf(defaultRecipientFor(v).slice(6), v)}`} · @ to call an agent or person · [[ for wiki` : `Send a follow-up to ${agentName} (drop files here, type [[ for wiki context)`}" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
+          <textarea class="followup-input" placeholder="${t.shared ? `${defaultRecipientFor(v) === 'agent:do' ? 'Message the agent' : `Reply to ${participantLabelOf(defaultRecipientFor(v).slice(6), v)}`}` : t.role === 'do' ? 'Message the agent' : `Message ${agentName}`}" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
           ${t.shared ? newAgentFormsHtml(v, `${v.taskId}/${t.role}`) : ''}
           <div class="img-chips attachment-chips followup-chips" style="display:none"></div>
-          <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label><span title="25 MB each · 50 MB per prompt">25 MB each · 50 MB per prompt</span></div>
+          <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label>${policyTip(`Drop or paste files here (25 MB each, 50 MB per message). Type ${t.shared ? '@ to bring in an agent or a person, ' : ''}[[ to add a wiki page.`)}</div>
         </div>
         ${t.shared && stoppableAgent(v) ? stopAgentButton(stoppableAgent(v), 'btn followup-stop') : ''}
         <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}${continues ? ' title="The approved PR lands as it is. The agent carries on in a new task."' : ''}>${continues ? 'Continue' : 'Send'}</button>
@@ -12730,11 +12772,11 @@ function conversationPane(v, t) {
         : presence.tone === 'idle' || presence.tone === 'done' ? '' : `<span class="conversation-presence ${presence.tone}"><span class="presence-dot"></span>${esc(presence.label)}</span>`}
       <span style="flex:1"></span>
       <div class="ck-tools">
-        <button class="btn tool" id="share-task-conversation" data-tool="Share" data-role="${esc(t.role)}" title="Share this conversation">${ICON.share}Share</button>
-        <button class="btn tool" id="fork-task-agent" data-tool="Fork" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">${ICON.fork}Fork</button>
-        ${S.meta?.hosted ? `<button type="button" class="btn tool" id="local-checkout" data-tool="Work locally" title="Check out this task on your computer">${ICON.laptop}Work locally</button>` : ''}
+        <button class="btn tool" id="share-task-conversation" data-tool="Share" data-role="${esc(t.role)}" title="Share this conversation" aria-label="Share">${ICON.share}<span class="tool-label">Share</span></button>
+        <button class="btn tool" id="fork-task-agent" data-tool="Fork" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation" aria-label="Fork">${ICON.fork}<span class="tool-label">Fork</span></button>
+        ${S.meta?.hosted ? `<button type="button" class="btn tool" id="local-checkout" data-tool="Work locally" title="Check out this task on your computer" aria-label="Work locally">${ICON.laptop}<span class="tool-label">Work locally</span></button>` : ''}
         ${copy}
-        <button class="btn tool" id="save-task-template" data-tool="Template" title="Save this task’s form as a template, to start new tasks from">${ICON.template}Template</button>
+        <button class="btn tool" id="save-task-template" data-tool="Save as template" title="Save this task’s form as a template, to start new tasks from" aria-label="Save as template">${ICON.template}<span class="tool-label">Save as template</span></button>
         <span class="tool-sep" aria-hidden="true"></span>
         ${conversationFullscreenButton()}
       </div>
@@ -12826,7 +12868,7 @@ function conversationEntries(t) {
       : activity;
     activities.set(key, {
       type: 'activity',
-      activity: { ...(prior?.activity || {}), ...displayed },
+      activity: { ...prior?.activity, ...displayed },
       ts: prior?.ts || event.ts,
       sortTs: Number(prior?.ts || event.ts),
       order: prior?.order ?? event.seq ?? event.ts,
@@ -13769,7 +13811,7 @@ function parametersTab(v) {
   return `
     ${workflowSection(v)}
     ${paramsSection(v)}
-    <div class="label-row tp-creds-head"><label>Codex/Claude</label>${policyTip('Drag to reorder, toggle to disable — for this task only.')}<span class="label-row-fill"></span></div>
+    <div class="label-row tp-creds-head"><label>Accounts</label>${policyTip('The Claude and Codex accounts this task runs on, first available first. Drag to reorder; switch one off to skip it, for this task only.')}<span class="label-row-fill"></span></div>
     <div id="cred-editor-task" data-live-key="${esc(v.taskId)}">Loading…</div>`;
 }
 
@@ -14552,9 +14594,11 @@ async function loadParamDefaults(taskId) {
 // at ANY stage (active, done, cancelled, failed, archived) — the endpoint has no
 // stage guard. The current value comes from the freshly-fetched view (`v.notes`),
 // so it's correct even for a task not in the loaded list.
+// One tip wherever a task's notes are written: the rail, the task form, a series.
+const NOTES_TIP = 'Only you see these. They are never sent to an agent.';
 function notesSection(v) {
   return `<section class="rail-sec" id="task-notes-box">
-    <div class="rail-h">Notes ${policyTip('Private to you — never sent to an agent. Saved when you click away.')}</div>
+    <div class="rail-h">Notes ${policyTip(NOTES_TIP)}</div>
     <textarea id="task-notes" rows="2" aria-label="Notes" placeholder="Add a note…">${esc(v.notes || '')}</textarea>
   </section>`;
 }
@@ -14741,7 +14785,7 @@ function repoBranchesFrozenRow(f, value, lock) {
   if (!entries.length) return '';
   return `<div class="form-row pf-frozen" data-row="${esc(f.name)}"><div class="label-row"><label>Branches per repo</label>${lock}<span class="label-row-fill"></span></div>
     <div class="pf-ro rb-frozen">${entries.map(([source, entry]) => {
-      return `<div><span class="rb-repo" title="${esc(source)}">${esc(repositoryShortName(source))}</span> ${esc(entry?.base || '(default)')} → ${esc(entry?.target || '(default)')}</div>`;
+      return `<div><span class="rb-repo" title="${esc(source)}">${esc(repositoryShortName(source))}</span> ${esc(entry?.base || 'Default')} → ${esc(entry?.target || 'Default')}</div>`;
     }).join('')}</div></div>`;
 }
 
@@ -14776,23 +14820,24 @@ function paramCurrentValue(f, v, rec) {
   if (f.type === 'confirmer' && S.attemptGroup?.confirmer !== undefined) return S.attemptGroup.confirmer;
   return own[f.name];
 }
+// A frozen parameter's value as words: names, not ids, tokens or enum keys.
 function displayParam(f, val) {
-  if (val === undefined || val === null || val === '') return '(default)';
-  if (f.type === 'agent') return [val.provider, val.model].filter(Boolean).join(' · ') || '(default)';
+  if (val === undefined || val === null || val === '') return 'Default';
+  const agent = (spec) => spec?.provider ? `${harnessLabel(spec.provider)} · ${modelLabel(spec.provider, spec.model)}` : 'Default';
+  if (f.type === 'agent') return agent(val);
   if (f.type === 'computer') return computerSummary(val);
   if (f.type === 'confirmer') {
     const layers = cfLayersOf(val);
-    if (!layers.length) return 'auto-confirm';
-    return layers.map((l) => (l.kind === 'agent' ? `agent (${[l.provider, l.model].filter(Boolean).join(' · ') || 'default'})` : 'human')).join(' → ');
+    if (!layers.length) return 'Auto-confirms';
+    return layers.map((l) => (l.kind === 'agent' ? `Agent (${agent(l)})` : audienceNames((l.audience || ['@creator']).join(', ')))).join(' → ');
   }
   if (f.type === 'responder') {
     const route = responderOf(val);
-    return route.kind === 'agent'
-      ? `agent (${[route.provider, route.model].filter(Boolean).join(' · ') || 'default'})`
-      : `human (${(route.audience || ['@creator']).join(', ')})`;
+    return route.kind === 'agent' ? `Agent (${agent(route)})` : audienceNames((route.audience || ['@creator']).join(', '));
   }
-  if (Array.isArray(val)) return val.join(', ') || '(none)';
-  if (typeof val === 'boolean') return val ? 'on' : 'off';
+  if (Array.isArray(val)) return val.join(', ') || 'None';
+  if (typeof val === 'boolean') return val ? 'On' : 'Off';
+  if (f.optionLabels?.[val]) return f.optionLabels[val];
   return String(val);
 }
 // Read back the editable param controls as a patch (no inherit-diffing — these
@@ -14958,9 +15003,9 @@ function hasOpenPullRequest(v) {
 }
 
 function taskActionLabel(v, action) {
-  if (action.name === 'openPr' && v?.stage === 'escalated') return action.label || 'Manually Open & Confirm PR';
+  if (action.name === 'openPr' && v?.stage === 'escalated') return action.label || 'Send to review';
   if (action.name === 'openPr')
-    return hasOpenPullRequest(v) ? 'Return to Review & Confirm' : 'Manually Open & Confirm PR';
+    return hasOpenPullRequest(v) ? 'Back to review' : 'Send to review';
   // Waiting for the person to open the upstream pull request: Confirm checks now.
   if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.kind === 'human' && v.waitingFor.reason === 'merge')
     return 'I opened it';
@@ -15747,9 +15792,9 @@ function mergeQueueBadge(v) {
   const q = v.mergeQueue;
   if (!q) return '';
   if (q.unreachable) {
-    return `<span style="color:var(--danger)" title="The merge-queue coordinator for this domain did not answer. It is wedged or has not started; this task keeps waiting for a grant that may never arrive.">queue unreachable</span>`;
+    return `<span class="rail-warn" title="The merge queue did not answer, so this task may keep waiting. Ask an administrator to check it.">Merge queue not answering</span>`;
   }
-  return `<span>queue #${q.position}/${q.total}</span>`;
+  return `<span title="Place in the merge queue">Queue ${q.position} of ${q.total}</span>`;
 }
 
 // Rank a task within its domain: the leased (merging) task pins to the top, then the
@@ -15780,7 +15825,7 @@ function mergeQueuePanel() {
   const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage)
     && (taskMergeDomains(t.lastView).length > 0 || !providerTaskIds.has(t.id)));
   if (!inMerge.length && !providerOwned.length)
-    return `<div class="card queue-empty">Nothing waiting to merge</div>`;
+    return `<div class="queue-empty">Nothing waiting to merge</div>`;
   // Group by merge domain — reordering is only meaningful within a single serialization
   // domain. With one domain (the common case) this renders as a single list.
   const groups = new Map();
@@ -15806,8 +15851,8 @@ function mergeQueuePanel() {
           return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" data-domain="${esc(domain)}" tabindex="0" role="group" aria-label="${esc(queueRowLabel(t, merging ? 'merging' : v.mergeQueue?.unreachable ? 'queue unreachable' : 'queued', merging ? null : pos))}" ${canMove ? 'draggable="true"' : ''}>
         ${canMove ? '<span class="drag-handle" title="Drag to reorder">⠿</span>' : '<span class="drag-handle placeholder"></span>'}
         <span class="pos">${merging ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
-        <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${merging ? 'merging' : v.mergeQueue?.unreachable ? 'queue unreachable' : 'queued'}</span></div>
-          <div class="task-sub"><span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span></div></div>
+        <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${merging ? 'Merging' : v.mergeQueue?.unreachable ? 'Queue not answering' : 'Queued'}</span></div>
+          <div class="task-sub">${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span> ` : ''}→ <span class="branch">${esc(v.targetBranch || '')}</span></div></div>
         ${canMove ? `<div class="queue-actions"><button class="btn sm" data-move="top" data-id="${t.id}" data-domain="${esc(domain)}">Move to top</button><button class="btn sm" data-move="bottom" data-id="${t.id}" data-domain="${esc(domain)}">Move to bottom</button></div>` : ''}
       </div>`;
         })
@@ -15826,7 +15871,7 @@ function mergeQueuePanel() {
           : `<span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span>`;
         return `<div class="queue-item" data-id="${t.id}" tabindex="0" role="group" aria-label="${esc(queueRowLabel(t, `${authority} ${state}`))}">
           <span class="drag-handle placeholder"></span><span class="pos">⇱</span>
-          <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${esc(authority)} ${esc(state)}</span></div>
+          <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip" title="${esc(authority === 'external' ? 'Landed by an outside merge queue' : 'Landed by the provider’s merge queue')}">${esc(LANDING_STATES[state] || sentenceCase(state))}</span></div>
             <div class="task-sub">${route}${v.landing?.detail ? ` · ${esc(v.landing.detail)}` : ''}</div></div>
         </div>`;
       }).join('')}</div>`
@@ -15851,14 +15896,14 @@ function agentQueuePanel() {
       return `<div class="queue-item ${x.active ? 'current' : ''}" data-agent-turn="${esc(x.turnId)}" data-id="${esc(x.taskId)}" tabindex="0" role="group" aria-label="${esc(queueRowLabel({ num: task?.num, title }, x.active ? 'active lease' : 'queued', x.active ? null : i - active.length + 1))}" ${x.active ? '' : 'draggable="true"'}>
         ${x.active ? '<span class="drag-handle placeholder"></span>' : '<span class="drag-handle" title="Drag to reorder">⠿</span>'}
         <span class="pos">${x.active ? '▶' : `#${i - active.length + 1}`}</span>
-        <div style="flex:1"><div class="task-title">${num}${esc(title)} <span class="chip">${x.active ? 'active lease' : 'queued'}</span></div>
-          <div class="task-sub">${esc(x.role || 'agent')} agent${x.provider ? ` · ${esc(x.provider)}` : ''}</div></div>
+        <div style="flex:1"><div class="task-title">${num}${esc(title)} <span class="chip">${x.active ? 'Running' : 'Queued'}</span></div>
+          ${x.provider ? `<div class="task-sub">${esc(harnessLabel(x.provider))}</div>` : ''}</div>
         ${x.active ? '' : `<div class="queue-actions"><button class="btn sm" data-agent-move="top" data-turn="${esc(x.turnId)}">Move to top</button><button class="btn sm" data-agent-move="bottom" data-turn="${esc(x.turnId)}">Move to bottom</button></div>`}
       </div>`;
     }).join('');
   return rows
     ? `<div class="queue-list agent-queue-list">${rows}</div>`
-    : `<div class="card queue-empty">No agents running</div>`;
+    : `<div class="queue-empty">No agents running</div>`;
 }
 
 const WORK_PRIORITY = { low: 1, medium: 2, high: 3, urgent: 4 };
@@ -15905,7 +15950,7 @@ function workPinTitle(pins, numOf) {
 function agentWorkPanel() {
   const view = S.agentWork;
   const groups = agentWorkGroups(view);
-  if (!groups.length) return `<div class="card queue-empty">No agents running or waiting</div>`;
+  if (!groups.length) return `<div class="queue-empty">No agents running or waiting</div>`;
   const nums = new Map();
   for (const g of groups) { nums.set(g.root, g.num); for (const t of g.tasks.values()) nums.set(t.taskId, t.num); }
   const numOf = (id) => nums.get(id);
@@ -16019,18 +16064,22 @@ function queuesView() {
   const contributions = (S.contributions?.slots || []).filter((x) => ['queue-panel', 'merge-queue-panel'].includes(x.contribution?.slot));
   // Agent work replaces the agent queue whenever the scheduler answers.
   const renderers = { 'merge-queue': mergeQueuePanel, 'agent-queue': S.agentWork ? agentWorkPanel : agentQueuePanel };
-  return contributions.map((x) => {
+  const panels = contributions.map((x) => {
     const component = x.contribution?.component;
     const render = renderers[component];
     if (!render) return '';
+    const body = render();
     const work = component === 'agent-queue' && S.agentWork;
     const suffix = component === 'agent-queue' && !work ? ` <span class="pill">${(S.agentQueue?.current || []).length}/${S.agentQueue?.capacity ?? 3}</span>` : '';
     const tip = work
       ? 'Agents running now, then waiting work in the order it gets model quota: higher priority first, and work that has used less. Quota is kept back for higher-priority work that usually arrives before a login resets. Drag to change the order.'
       : { 'merge-queue': 'Tasks ready to land, in the order they merge. Drag to reorder.', 'agent-queue': 'Agents working now, then those waiting for a free slot.' }[component];
     const title = work ? 'Agent work' : (x.contribution.title || x.workflow);
-    return `<div class="section-h">${esc(title)}${suffix}${tip ? ` ${policyTip(tip)}` : ''}</div>${render()}`;
-  }).join('') || `<div class="empty">No workflows contribute a queue.</div>`;
+    return { empty: body.startsWith('<div class="queue-empty">'), html: `<div class="section-h">${esc(title)}${suffix}${tip ? ` ${policyTip(tip)}` : ''}</div>${body}` };
+  }).filter(Boolean);
+  // Every queue empty: one quiet line, not a heading and an empty box per queue.
+  if (panels.length && panels.every((panel) => panel.empty)) return '<div class="queue-empty">Nothing running or waiting to merge</div>';
+  return panels.map((panel) => panel.html).join('') || '<div class="queue-empty">No workflow adds a queue</div>';
 }
 
 // Optimistically mutate the cached order for a domain so the reorder shows instantly,
@@ -16182,10 +16231,10 @@ async function seedActivity() {
   } catch {}
 }
 function activityView() {
-  if (!S.activity.length) return `<div class="empty"><div class="big">No activity yet</div>Events stream here as agents work.</div>`;
-  return `<div class="card"><div class="events" style="max-height:none">${S.activity
+  if (!S.activity.length) return '<div class="queue-empty">No activity yet</div>';
+  return `<div class="card"><div class="events events-page">${S.activity
     .slice(0, 300)
-    .map((e) => `<div class="ev"><span class="t">${esc(e.type)}</span><span class="mono" style="color:var(--ink-3)">${esc(numLabel(e.taskId))}</span><span>${esc(summarize(e.payload))}</span></div>`)
+    .map((e) => `<div class="ev"><span class="t">${esc(e.type)}</span><span class="ev-task">${esc(numLabel(e.taskId))}</span><span>${esc(summarize(e.payload))}</span></div>`)
     .join('')}</div></div>`;
 }
 
@@ -17351,8 +17400,7 @@ function avatarSectionHtml(value) {
   const callers = (setting?.callableBy?.length ? setting.callableBy : ['@project']).join(', ');
   return `<div class="form-row" data-row="__avatar">
     <div class="tf-avatar-line">
-      <label class="tf-avatar-toggle"><input type="checkbox" id="tf-avatar" ${setting ? 'checked' : ''}> Avatār
-        <span class="tf-avatar-hint">(automatically grants future forks the same authorizations)</span></label>
+      <label class="tf-avatar-toggle"><input type="checkbox" class="toggle" id="tf-avatar" ${setting ? 'checked' : ''}> Avatār</label>
       <span class="risk-chip">! At your own risk</span>${policyTip(AVATAR_DISCLAIMER)}
     </div>
     <div class="tf-avatar-options" ${setting ? '' : 'hidden'}>
@@ -17746,6 +17794,54 @@ function wikiRefMatches(value) {
     });
   }
   return out;
+}
+
+// A wiki-context reference as a chip: where it is, and what (a page, every page
+// with a label, a folder) — never the raw [[proj:tag:…]] token.
+function wikiRefChipLabel(ref) {
+  const where = ref.scope === 'project' ? 'Project' : 'Organization';
+  const what = ref.kind === 'label' ? `#${ref.value}` : ref.kind === 'folder' ? `${ref.value}/` : ref.value;
+  return `${where} · ${what}`;
+}
+// The task form's wiki context: chips over a hidden value (the tokens the form
+// saves) and a small box where [[ adds more. Backspace in the empty box removes
+// the last chip.
+function wireContextChips(value, tokens, projectId) {
+  const row = value.closest('.prompt-context-row');
+  const chips = row.querySelector('.pc-chips');
+  const add = row.querySelector('.prompt-context');
+  let list = [...new Set(tokens.filter((token) => wikiRefMatches(token).length))];
+  const changed = () => add.dispatchEvent(new Event('input', { bubbles: true }));
+  const paint = () => {
+    value.value = list.join(' ');
+    chips.innerHTML = list.map((token, i) => {
+      const ref = wikiRefMatches(token)[0];
+      return `<span class="pc-chip wiki-ref-${esc(ref.kind)}" title="${esc(token)}">${esc(wikiRefChipLabel(ref))}<button type="button" class="pc-chip-x" data-i="${i}" aria-label="Remove ${esc(wikiRefChipLabel(ref))}">×</button></span>`;
+    }).join('');
+  };
+  chips.addEventListener('click', (event) => {
+    const x = event.target.closest('.pc-chip-x');
+    if (!x) return;
+    list.splice(Number(x.dataset.i), 1);
+    paint(); changed(); add.focus();
+  });
+  add.addEventListener('input', () => {
+    const refs = wikiRefMatches(add.value);
+    if (!refs.length) return;
+    for (const ref of refs) if (!list.includes(ref.raw)) list.push(ref.raw);
+    let rest = add.value;
+    for (const ref of [...refs].reverse()) rest = rest.slice(0, ref.start) + rest.slice(ref.end);
+    add.value = rest.trim();
+    paint(); changed();
+  });
+  add.addEventListener('keydown', (event) => {
+    if (event.key !== 'Backspace' || add.value || !list.length) return;
+    event.preventDefault();
+    list.pop();
+    paint(); changed();
+  });
+  paint();
+  wireWikiMention(add, projectId);
 }
 
 function wikiRefHref(ref, projectId) {
@@ -24788,13 +24884,13 @@ function navCommand(href) { return { href, run: () => go(href()) }; }
 // Host commands. `key` is only the fallback — the binding of record comes from
 // the server's command registry (S.contributions), so packages can rebind ids.
 const HOST_COMMANDS = [
-  { id: 'nav.commandPalette', title: 'Command palette', key: 'meta+k', run: () => openPalette() },
-  { id: 'help.keyboard', title: 'Keyboard shortcuts', key: '?', run: () => openHelp() },
+  { id: 'nav.commandPalette', title: 'Command palette', key: 'meta+k', group: 'General', run: () => openPalette() },
+  { id: 'help.keyboard', title: 'Keyboard shortcuts', key: '?', group: 'General', run: () => openHelp() },
   // Opens the task form, in the project new tasks go to (Home's choice, else the open project).
   // `n` picks a template (0, the Task defaults, is Enter); `N` skips the picker.
-  { id: 'nav.newTask', title: 'New task from template', key: 'n', run: () => openTemplatePicker() },
-  { id: 'nav.newTaskDefault', title: 'New task', key: 'N', run: () => openNewTaskForm() },
-  { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (!isTaskListTab()) switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
+  { id: 'nav.newTask', title: 'New task from template', key: 'n', group: 'General', run: () => openTemplatePicker() },
+  { id: 'nav.newTaskDefault', title: 'New task', key: 'N', group: 'General', run: () => openNewTaskForm() },
+  { id: 'nav.search', title: 'Search tasks', key: '/', group: 'General', run: () => { if (!isTaskListTab()) switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
   { id: 'nav.home', title: 'Go home', key: 'g H', ...navCommand(() => homeRoute(currentOrg(), DEFAULT_LIST_QUERY)) },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', ...navCommand(() => tabRoute('tasks')) },
   { id: 'nav.queue', title: 'Go to queues', key: 'g q', ...navCommand(() => tabRoute('queue')) },
@@ -25329,15 +25425,17 @@ function openPalette() {
   const close = () => (root.remove());
   let items = [];
   let active = 0;
-  const GROUP_ORDER = { Task: 0, Navigation: 1, List: 2 };
+  const GROUP_ORDER = { Task: 0, General: 1, Navigation: 2, List: 3 };
   const build = () => {
     const q = input.value.trim();
     items = [];
     for (const c of allCommands()) {
-      if (c.palette === false || !c.available || c.id === 'nav.commandPalette') continue; // not itself
+      // Not itself, nor Esc: the palette's own Esc closes it.
+      if (c.palette === false || !c.available || c.id === 'nav.commandPalette' || c.id === 'nav.close') continue;
       const score = fuzzyScore(q, c.title);
       if (score < 0) continue;
-      items.push({ group: c.group, title: c.title, kbd: c.keybinding, sub: c.sub || c.workflow, danger: c.danger, score, run: c.run, href: c.href?.() });
+      // The open task's own commands need no workflow name beside them.
+      items.push({ group: c.group, title: c.title, kbd: c.keybinding, sub: c.sub, danger: c.danger, score, run: c.run, href: c.href?.() });
     }
     items.sort((a, b) => (GROUP_ORDER[a.group] ?? 9) - (GROUP_ORDER[b.group] ?? 9) || b.score - a.score);
     items = items.slice(0, 14);
@@ -25347,7 +25445,7 @@ function openPalette() {
   const draw = () => {
     let lastGroup = null;
     list.innerHTML = items.map((it, i) => {
-      const head = it.group !== lastGroup ? `<div class="pal-group">${esc(it.group)}</div>` : '';
+      const head = it.group !== lastGroup ? `<div class="pal-group">${esc(COMMAND_GROUP_LABELS[it.group] || it.group)}</div>` : '';
       lastGroup = it.group;
       const tag = it.href ? 'a' : 'div';
       return `${head}<${tag} class="opt ${i === active ? 'active' : ''}${it.danger ? ' danger' : ''}"${it.href ? ` href="${esc(it.href)}"` : ''} data-i="${i}">${esc(it.title)}${it.sub ? `<span class="pal-sub">${esc(it.sub)}</span>` : ''}${it.kbd ? `<span class="key">${esc(fmtKeys(it.kbd))}</span>` : ''}</${tag}>`;
@@ -25377,23 +25475,27 @@ function openPalette() {
 // Rows come from the registry; the families of numbered keys (views, toolbar,
 // action buttons) and the keys that are not commands (⌘↵, Esc, the task-page
 // grammar documented before a task is open) are listed once each.
-const HELP_GENERAL = ['nav.commandPalette', 'help.keyboard', 'nav.newTask', 'nav.newTaskDefault', 'nav.search'];
+// The palette and this panel head their groups alike.
+const COMMAND_GROUP_LABELS = { Task: 'Task page' };
 function openHelp() {
   const root = createTransientOverlay();
-  const cmds = allCommands().filter((c) => c.keybinding && c.help !== false);
+  // Esc (nav.close) is the General row that says everything it does.
+  const cmds = allCommands().filter((c) => c.keybinding && c.help !== false && c.id !== 'nav.close');
+  // A command's workflow is named only when several workflows bind keys.
+  const workflows = new Set(cmds.map((c) => c.workflow).filter(Boolean));
   const row = (k, title, sub) => `<div class="help-row"><span class="key">${esc(k)}</span><span>${esc(title)}${sub ? ` <span class="pal-sub">${esc(sub)}</span>` : ''}</span></div>`;
-  const rows = (list) => list.map((c) => row(fmtKeys(c.keybinding), c.title, c.workflow)).join('');
-  const group = (g) => cmds.filter((c) => c.group === g && !HELP_GENERAL.includes(c.id));
+  const rows = (list) => list.map((c) => row(fmtKeys(c.keybinding), c.title, workflows.size > 1 && c.workflow ? workflowLabel(c.workflow) : '')).join('');
+  const group = (g) => cmds.filter((c) => c.group === g);
   const sections = [
-    ['General', rows(HELP_GENERAL.map((id) => cmds.find((c) => c.id === id)).filter(Boolean))
+    ['General', rows(group('General'))
       + row(fmtKeys('meta+Enter'), 'Save, apply or send')
       + row('Esc', 'Close · leave a field · exit full screen')],
     ['Navigation', rows(group('Navigation'))],
     ['Views', row('v 1–9', 'Switch view') + rows(group('Views'))],
     ['List', rows(group('List'))],
-    ['On a task page', rows(group('Task'))
+    [COMMAND_GROUP_LABELS.Task, rows(group('Task'))
       + row('1–9', 'Action buttons')
-      + row('. 1–9', 'Share, Fork, Work locally, Template, Full screen')
+      + row('. 1–9', 'Share, Fork, Work locally, Save as template, Full screen')
       + row('[ / ]', 'Chat / Parameters')
       + row('{ / }', 'Previous / next attempt')
       + row('a n', 'New attempt')
@@ -25404,7 +25506,7 @@ function openHelp() {
     ['Settings', row('{ / }', 'Previous / next section')],
   ];
   root.innerHTML = `<div class="palette-scrim" id="help-scrim"><div class="palette help-panel" role="dialog" aria-label="Keyboard shortcuts">
-    <div class="help-head"><b>Keyboard shortcuts</b><span class="help-tip">${policyTip('Press a prefix key (g, v, .) and the keys it can reach show beside their buttons.')}</span><span style="flex:1"></span><button class="icon-btn" id="help-close" aria-label="Close">✕</button></div>
+    <div class="help-head"><b>Keyboard shortcuts</b><span class="help-tip">${policyTip('Press a prefix key (g, v, .) and the keys it can reach show beside their buttons.')}</span><span style="flex:1"></span><button class="icon-btn" id="help-close" title="Close (Esc)" aria-label="Close">✕</button></div>
     <div class="help-grid">${sections.filter(([, body]) => body).map(([title, body]) => `<section class="help-section"><div class="section-h">${esc(title)}</div>${body}</section>`).join('')}</div>
   </div></div>`;
   $('#help-close').addEventListener('click', () => (root.remove()));

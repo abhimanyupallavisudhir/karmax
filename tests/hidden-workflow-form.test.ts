@@ -23,6 +23,7 @@ describe('existing hidden workflow forms', () => {
       vm.runInContext([
         source.slice(source.indexOf('const WORKFLOWS ='), source.indexOf('const NODES =')),
         "const esc = (s) => String(s ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;');",
+        "const policyTip = () => '';",
         source.slice(source.indexOf('const eff ='), source.indexOf('function renderField(')),
         fn('schemaFor'), fn('consumingField'), fn('renderField'),
       ].join('\n'), context);

@@ -41,7 +41,7 @@ describe('model field', () => {
     const { ui, read, input } = await agentField();
     expect(await ui.page.locator('.agent-controls select').count()).toBe(0);
     expect(await input.inputValue()).toBe('claude:claude-opus-5-5:high');
-    expect(await ui.page.locator('.mf-face').innerText()).toMatch(/claude\s*Opus 5\.5\s*high/);
+    expect(await ui.page.locator('.mf-face').innerText()).toMatch(/Claude\s*Opus 5\.5\s*high/);
     expect(await read()).toMatchObject({ provider: 'claude', model: 'claude-opus-5-5', effort: 'high' });
 
     // The harness follows from the model; effort and model are optional.
@@ -127,7 +127,7 @@ describe('model field', () => {
     await input.click();
     const typed = ui.page.locator('.mf-row', { hasText: 'gpt-7-preview' });
     expect(await typed.count()).toBe(1);
-    expect(await typed.locator('.mf-harness').innerText()).toBe('codex');
+    expect(await typed.locator('.mf-harness').innerText()).toBe('Codex');
     expect(await typed.locator('.mf-effort-chip.on').innerText()).toBe('high');
     await ui.close();
   });

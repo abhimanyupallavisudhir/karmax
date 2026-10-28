@@ -106,7 +106,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await page.keyboard.press('.');
     await echoIs('.');
     const tools = await page.locator('[data-tool]').evaluateAll((els) => els.filter((el) => el.getClientRects().length).map((el) => el.dataset.tool));
-    assert.deepEqual(tools, ['Share', 'Fork', 'Template', 'Full screen'], 'self-hosted: Share, Fork, Template, Full screen');
+    assert.deepEqual(tools, ['Share', 'Fork', 'Save as template', 'Full screen'], 'self-hosted: Share, Fork, Save as template, Full screen');
     assert.deepEqual(await hints(), ['1', '2', '3', '4'], 'pressing . numbers the tool buttons');
     if (shots) await page.screenshot({ path: `${shots}/tool-hints.png` });
     await page.keyboard.press('4');
@@ -144,7 +144,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     const help = page.locator('.help-panel');
     await help.waitFor();
     const text = await help.innerText();
-    for (const line of ['v 1–9', 'Switch view', 'v s', 'Save search as view', '. 1–9', 'Share, Fork, Work locally, Template, Full screen',
+    for (const line of ['v 1–9', 'Switch view', 'v s', 'Save search as view', '. 1–9', 'Share, Fork, Work locally, Save as template, Full screen',
       'Ctrl+↵', 'Save, apply or send', 'g V', 'Go to passwords & payments', 'Esc'])
       assert.ok(text.includes(line), `help lists “${line}”`);
     if (shots) await help.screenshot({ path: `${shots}/help.png` });

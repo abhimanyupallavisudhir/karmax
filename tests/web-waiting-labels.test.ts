@@ -115,13 +115,13 @@ describe('waiting labels in task summaries', () => {
       status: 'waiting',
       state: {},
       waitingFor: { kind: 'agentSlot', provider: 'claude', detail: 'Starting agent' },
-    })).toBe('working');
+    })).toBe('Working');
     expect(stageLabel({
       stage: 'merge',
       status: 'waiting',
       state: { mergeGranted: false },
       waitingFor: { kind: 'github', detail: 'Waiting for CI while retaining the front landing spot.' },
-    })).toBe('landing');
+    })).toBe('Landing');
   });
 
   it.each([
@@ -207,7 +207,7 @@ describe('waiting labels in task summaries', () => {
     const job = { kind: 'job', detail: 'Waiting for job-5a1d7bab', until };
     expect(stageLabel({ stage: 'do', status: 'waiting', state: {}, waitingFor: job }))
       .toBe(waitingText(job));
-    expect(stageLabel({ stage: 'do', status: 'active', state: {}, waitingFor: timer })).toBe('working');
+    expect(stageLabel({ stage: 'do', status: 'active', state: {}, waitingFor: timer })).toBe('Working');
     const ask = { kind: 'human', detail: 'Which region?', audience: ['@creator'], until };
     expect(stageLabel({ stage: 'do', status: 'waiting', state: {}, waitingFor: ask }))
       .toBe(`Needs input until ${waitDeadline(until)}`);
@@ -241,10 +241,10 @@ describe('waiting labels in task summaries', () => {
     expect(stageLabel({ stage: 'do', status: 'waiting', state: {}, waitingFor: { kind: 'parent', detail: 'Which region?', until } }))
       .toBe(`Waiting for parent until ${waitDeadline(until)}`);
     // A child held at Review for its parent is still in review.
-    expect(stageLabel({ stage: 'review', status: 'waiting', state: {}, waitingFor: { kind: 'parent' } })).toBe('review');
+    expect(stageLabel({ stage: 'review', status: 'waiting', state: {}, waitingFor: { kind: 'parent' } })).toBe('Review');
     // Work still running inside the turn, or about to start one, is working.
     for (const kind of ['agentSlot', 'subagent', 'shell']) {
-      expect(stageLabel({ stage: 'do', status: 'waiting', state: {}, waitingFor: { kind } })).toBe('working');
+      expect(stageLabel({ stage: 'do', status: 'waiting', state: {}, waitingFor: { kind } })).toBe('Working');
     }
   });
 
@@ -304,10 +304,10 @@ describe('waiting labels in task summaries', () => {
   });
 
   it('keeps ordinary and legacy merge-stage labels intact', () => {
-    expect(stageLabel({ stage: 'do', state: {} })).toBe('working');
-    expect(stageLabel({ stage: 'do', status: 'active', waitingFor: { kind: 'human' }, state: {} })).toBe('working');
-    expect(stageLabel({ stage: 'merge', state: { mergeGranted: false } })).toBe('landing');
-    expect(stageLabel({ stage: 'setup', state: { draft: true } })).toBe('draft');
+    expect(stageLabel({ stage: 'do', state: {} })).toBe('Working');
+    expect(stageLabel({ stage: 'do', status: 'active', waitingFor: { kind: 'human' }, state: {} })).toBe('Working');
+    expect(stageLabel({ stage: 'merge', state: { mergeGranted: false } })).toBe('Landing');
+    expect(stageLabel({ stage: 'setup', state: { draft: true } })).toBe('Draft');
   });
 
   it('keeps repeatable-run summaries on their stable stage', () => {
@@ -322,8 +322,8 @@ describe('waiting labels in task summaries', () => {
         waitingFor: { kind: 'agentSlot', detail: 'Starting agent' },
       },
     };
-    expect(runSubRow(run)).toContain('<span class="chip waiting">working</span>');
-    expect(runPageRow(run)).toContain('<span class="chip waiting">working</span>');
+    expect(runSubRow(run)).toContain('<span class="chip waiting">Working</span>');
+    expect(runPageRow(run)).toContain('<span class="chip waiting">Working</span>');
   });
 
   it('uses the truthful startup state in agent conversations', () => {
@@ -365,7 +365,7 @@ describe('waiting labels in task summaries', () => {
       detail: 'Starting agent',
       provider: 'codex',
     });
-    expect(stageLabel(view)).toBe('working');
+    expect(stageLabel(view)).toBe('Working');
 
     expect(patchTaskListFromEvent({
       taskId: 'task-1',

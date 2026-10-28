@@ -57,9 +57,9 @@ const prCrumb = parentTaskContext({ taskId: 'pr-docs', parentTaskId: 'parent', p
 ok(prCrumb.includes('pull request “docs”') && !prCrumb.includes('Parent task') && prCrumb.includes('data-open="parent"'),
   "a pull request's page names its task and which pull request of it this is");
 
-ok(subTaskState(S.tasks[1]).label === 'working', 'active work reads as it does in the task list');
+ok(subTaskState(S.tasks[1]).label === 'Working', 'active work reads as it does in the task list');
 ok(subTaskState(S.tasks[2]).complete === true, 'done work contributes to completion');
-ok(subTaskState(S.tasks[3]).label === 'escalated' && subTaskState(S.tasks[3]).tone === 'blocked', 'blocked work is called out');
+ok(subTaskState(S.tasks[3]).label === 'Escalated' && subTaskState(S.tasks[3]).tone === 'blocked', 'blocked work is called out');
 
 // Faithfulness: every state a real child passes through (tasks #429, #456) gets
 // the same label the task list gives it, never a second invented vocabulary that
@@ -67,18 +67,18 @@ ok(subTaskState(S.tasks[3]).label === 'escalated' && subTaskState(S.tasks[3]).to
 // "In progress" for a child that is landing or needs a person).
 const state = (lastView, extra = {}) => subTaskState({ lastView, ...extra });
 const cases = [
-  [{ stage: 'do', status: 'waiting', waitingFor: { kind: 'agentSlot', detail: 'Starting agent' } }, 'working', 'waiting'],
+  [{ stage: 'do', status: 'waiting', waitingFor: { kind: 'agentSlot', detail: 'Starting agent' } }, 'Working', 'waiting'],
   [{ stage: 'do', status: 'waiting', waitingFor: { kind: 'timer', until: 1 } }, 'Waiting until 4:00 PM', 'waiting'],
   [{ stage: 'do', status: 'waiting', waitingFor: { kind: 'human', detail: 'Approve the sandbox keys' } }, 'Needs input', 'waiting'],
   [{ stage: 'do', status: 'waiting', waitingFor: { kind: 'subtask' } }, 'Waiting for sub-tasks', 'waiting'],
-  [{ stage: 'review', status: 'waiting', waitingFor: { kind: 'parent' } }, 'review', 'waiting'],
-  [{ stage: 'review', status: 'active' }, 'review', 'active'],
-  [{ stage: 'merge', status: 'active' }, 'landing', 'active'],
-  [{ stage: 'merge', status: 'waiting', waitingFor: { kind: 'github', detail: 'waiting for required checks' } }, 'landing', 'waiting'],
-  [{ stage: 'done', status: 'done' }, 'done', 'done'],
-  [{ stage: 'failed', status: 'failed' }, 'failed', 'failed'],
-  [{ stage: 'cancelled', status: 'cancelled' }, 'cancelled', 'cancelled'],
-  [{ stage: 'setup', status: 'active', state: { draft: true } }, 'draft', 'draft'],
+  [{ stage: 'review', status: 'waiting', waitingFor: { kind: 'parent' } }, 'Review', 'waiting'],
+  [{ stage: 'review', status: 'active' }, 'Review', 'active'],
+  [{ stage: 'merge', status: 'active' }, 'Landing', 'active'],
+  [{ stage: 'merge', status: 'waiting', waitingFor: { kind: 'github', detail: 'waiting for required checks' } }, 'Landing', 'waiting'],
+  [{ stage: 'done', status: 'done' }, 'Done', 'done'],
+  [{ stage: 'failed', status: 'failed' }, 'Failed', 'failed'],
+  [{ stage: 'cancelled', status: 'cancelled' }, 'Cancelled', 'cancelled'],
+  [{ stage: 'setup', status: 'active', state: { draft: true } }, 'Draft', 'draft'],
 ];
 for (const [view, label, tone] of cases) {
   const s = state(view);
@@ -96,13 +96,13 @@ const panel = subTasksSection({
   subTasks: ['child-a', 'child-b', 'child-c'],
 });
 ok(panel.includes('Polish navigation') && panel.includes('Verify keyboard access') && panel.includes('Resolve visual regression'), 'rows use human titles instead of only ids');
-ok(panel.includes('<strong>1</strong> of 3 complete') && panel.includes('--subtask-progress:33%'), 'panel summarizes group progress');
+ok(panel.includes('>1/3<') && panel.includes('title="1 of 3 done"') && !panel.includes('progressbar'), 'the heading counts finished children; no second progress bar');
 ok((panel.match(/class="subtask-row"/g) || []).length === 3, 'every child is one large navigation row');
 ok(/<a class="subtask-row" data-open="child-a" data-spa href="\/acme\/web\/tasks\/11"/.test(panel), 'and a link to the child, so it opens in a new tab too');
 ok(!/In progress|Ready to return|Needs direction/.test(panel), 'no second state vocabulary beside the real one');
-ok(panel.includes('>working<') && panel.includes('>escalated<'), 'each row carries its task-list label');
-ok(panel.includes('aria-label="Open Polish navigation — working"'), 'the accessible name carries the same label');
-ok(panel.includes('role="progressbar"') && panel.includes('aria-valuenow="1"'), 'completion is exposed to assistive technology');
+ok(panel.includes('<span class="chip active">Working</span>') && panel.includes('<span class="chip blocked">Escalated</span>'), 'each row carries its task-list label, as a status chip');
+ok(!panel.includes('subtask-state'), 'one status signal per row: no dot beside the chip');
+ok(panel.includes('aria-label="Open Polish navigation — Working"'), 'the accessible name carries the same label');
 
 // A finished child is archived out of the live task list, and a replaced parent
 // run forgets children that had already settled. Neither may fall back to
@@ -120,22 +120,22 @@ const summaries = {
 };
 const archived = subTasksSection(summaries);
 ok((archived.match(/class="subtask-row"/g) || []).length === 3, 'children missing from the run and the live list still appear');
-ok(archived.includes('Land the migration') && archived.includes('>done<') && archived.includes('test-pipeline">done'),
+ok(archived.includes('Land the migration') && archived.includes('<span class="chip done">Done</span>'),
   'an archived child shows its real finished state, not setup');
-ok(archived.includes('>cancelled<') && !archived.includes('test-pipeline">setup'), 'no child falls back to the setup placeholder');
-ok(archived.includes('<strong>1</strong> of 3 complete'), 'archived children count towards completion');
+ok(archived.includes('>Cancelled<') && !archived.includes('>Setup<'), 'no child falls back to the setup placeholder');
+ok(archived.includes('>1/3<'), 'archived children count towards completion');
 
 // The parent's summary is the authority: a stale copy of the child elsewhere in
 // the console (an old search result) must not override it.
 S.searchResult = { tasks: [{ id: 'archived-done', num: 14, title: 'Land the migration', lastView: { stage: 'do', status: 'active' } }] };
-ok(subTasksSection(summaries).includes('<strong>1</strong> of 3 complete'), 'the summary wins over a stale search-result copy');
+ok(subTasksSection(summaries).includes('>1/3<'), 'the summary wins over a stale search-result copy');
 S.searchResult = null;
 
 const approval = subTasksSection({ taskId: 'parent', workflow: 'software-dev', subTaskSummaries: [
   { id: 'needs-key', num: 16, title: 'Paddle storage packs', workflow: 'software-dev',
     lastView: { stage: 'do', status: 'waiting', waitingFor: { kind: 'timer', until: 1 }, approvalRequests: 2 } },
 ] });
-ok(approval.includes('Waiting until 4:00 PM') && approval.includes('approval needed'), 'a child waiting on an approval shows it in the parent');
+ok(approval.includes('Waiting until 4:00 PM') && approval.includes('Approval needed'), 'a child waiting on an approval shows it in the parent');
 
 // pramana#102: a pull request of the task is part of it (shown under Branches),
 // never a sub-task — even when the task's run no longer lists it among its own.
@@ -144,7 +144,7 @@ const withPullRequest = subTasksSection({ taskId: 'parent', workflow: 'software-
   { id: 'pr-docs', title: 'Breadcrumbs fix', workflow: 'software-dev', pullRequest: { checkout: 'docs', target: 'main' },
     lastView: { stage: 'review', status: 'waiting', waitingFor: { kind: 'human' } } },
 ] });
-ok(withPullRequest.includes('Polish navigation') && !withPullRequest.includes('Breadcrumbs fix') && withPullRequest.includes('of 1 complete'),
+ok(withPullRequest.includes('Polish navigation') && !withPullRequest.includes('Breadcrumbs fix') && withPullRequest.includes('>0/1<'),
   "a pull request of the task is not listed (or counted) as a sub-task");
 ok(subTasksSection({ taskId: 'parent', workflow: 'software-dev', subTasks: ['pr-docs'], subTaskSummaries: [
   { id: 'pr-docs', title: 'Breadcrumbs fix', workflow: 'software-dev', pullRequest: { checkout: 'docs' }, lastView: { stage: 'review', status: 'waiting' } },
