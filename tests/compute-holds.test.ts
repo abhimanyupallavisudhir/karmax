@@ -2,6 +2,9 @@
 // its machine's next minutes against the organization's credit before it runs,
 // renews them while it runs, and is stopped and parked when they run out.
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { Context } from '@temporalio/activity';
 import { Store } from '../src/store/db.js';
 import { COMPUTE_HOLD, ComputeCreditExhausted, assertComputeCredit, computeCredit, holdManagedCompute, listRate,
@@ -10,6 +13,10 @@ import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { hadLiveWorldWork, hasLiveWorldWork } from '../src/domain/view-publication.js';
+import { WorktreeProvider } from '../src/world/worktree.js';
+import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
+import { startJob, stopJobs } from '../src/world/jobs.js';
+import type { World } from '../src/world/types.js';
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -239,5 +246,44 @@ describe('a VM world resized to a bigger machine', () => {
       task: { taskId: task.id, projectId: f.project.id, title: task.title, prompt: 'work', project: {}, workflow: 'just-do',
         agents: { do: { provider: 'mock' } } } } as any);
     expect(await f.store.computeHold('turn:turn-big')).toMatchObject({ activeMicrosPerHour: 79_911, closedAt: expect.any(Number) });
+  }, 30_000);
+});
+
+describe('a job wait on managed compute', () => {
+  it('holds at the size the world is registered at, not the size its handle was given at', async () => {
+    // Production, 2026-10-29: a job wait on a 50 GB Hetzner world held 20 GB
+    // of disk (the provider's default), since the handle it was given named no size.
+    const f = await fixture();
+    const task = await f.task('Jobs');
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-jobhold-'));
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-jobhold-repo-'));
+    cleanups.push(() => { fs.rmSync(home, { recursive: true, force: true }); fs.rmSync(repo, { recursive: true, force: true }); });
+    await gitOrThrow(repo, ['init', '-q', '-b', 'main']);
+    await ensureIdentity(repo);
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
+    await git(repo, ['add', '-A']);
+    await git(repo, ['commit', '-q', '-m', 'init']);
+    const local = await new WorktreeProvider(home).create({ taskId: task.id, repo, base: 'main', target: 'main' });
+    cleanups.push(async () => { await stopJobs(local); });
+    const machine = { cpu: 4, memoryMb: 8192, diskGb: 50 };
+    const handle = { ...local.handle, kind: 'hetzner', version: 2, meta: { ...local.handle.meta, funding: 'managed' } } as any;
+    await f.store.registerWorld({ ...handle, meta: { ...handle.meta, machine, computer: machine } }, f.project.id);
+    const world = new Proxy(local, { get(target, key) {
+      if (key === 'handle') return handle;
+      const value = (target as any)[key];
+      return typeof value === 'function' ? value.bind(target) : value;
+    } }) as World;
+    const worlds = new WorldRegistry();
+    worlds.register({ kind: 'hetzner', capabilities: { remote: true }, async create() { throw new Error('unused'); },
+      async open() { return world; }, async destroy() {} } as any);
+    await f.store.setComputePackGift(f.organization.id, 1, 'operator');
+    vi.spyOn(Context, 'current').mockImplementation(() => ({ cancellationSignal: new AbortController().signal, heartbeat() {},
+      info: { attempt: 1, activityId: '7', workflowExecution: { workflowId: task.id, runId: 'run' } } } as any));
+    cleanups.push(() => { vi.restoreAllMocks(); });
+    const core = makeCoreActivities({ store: f.store, worlds, adapters: new Map() as any, profiles: new ProfileResolver(f.store, 'mock') });
+    const job = await startJob(local, { command: 'sleep 30', name: 'build' });
+    await core.awaitJobs(handle, [job.id], Date.now() + 1_500);
+    expect(await f.store.computeHold(`jobs:${task.id}:run:7`)).toMatchObject({ purpose: 'jobs', provider: 'hetzner',
+      ...listRate('hetzner', machine), closedAt: expect.any(Number) });
   }, 30_000);
 });
