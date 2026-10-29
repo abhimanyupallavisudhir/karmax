@@ -28,6 +28,11 @@ describe('credential Retry end to end', () => {
   let expectedHome = '';
   let quotaFailures = 0;
   let sandboxQuotaFailures = 0;
+  /** A sandbox-reported limit's window and reset, and (when set) the only login it hits: the first one used. */
+  let sandboxLimit = { window: '5h', resetHint: 'in 2s' };
+  let sandboxFirstLoginOnly = false;
+  let sandboxFailedHome: string | undefined;
+  const homesUsed: (string | undefined)[] = [];
   let hostUsage: UsageResult | undefined;
   const probed: string[] = [];
   const accountId = 'login:claude:personal';
@@ -45,12 +50,16 @@ describe('credential Retry end to end', () => {
       provider: 'claude',
       async runTurn(input, ctx) {
         turns++;
-        expect(input.resolvedAuth?.configHome).toBe(expectedHome || home);
-        if (sandboxQuotaFailures > 0) {
+        const used = input.resolvedAuth?.configHome;
+        homesUsed.push(used);
+        if (!sandboxFirstLoginOnly) expect(used).toBe(expectedHome || home);
+        if (sandboxQuotaFailures > 0 && (!sandboxFirstLoginOnly || (sandboxFailedHome ?? used) === used)) {
           sandboxQuotaFailures--;
+          sandboxFailedHome = used;
           // What the adapters throw for a limit the CLI reported inside a remote sandbox.
-          throw new SandboxProviderFailure(providerFailure('Claude usage limit reached · resets in 2s', {
-            kind: 'quota', permanence: 'transient', provider: 'claude', source: 'structured', window: '5h', resetHint: 'in 2s',
+          throw new SandboxProviderFailure(providerFailure(`Claude usage limit reached · resets ${sandboxLimit.resetHint}`, {
+            kind: 'quota', permanence: 'transient', provider: 'claude', source: 'structured',
+            window: sandboxLimit.window as '5h', resetHint: sandboxLimit.resetHint,
           }));
         }
         if (quotaFailures > 0) {
@@ -244,6 +253,53 @@ describe('credential Retry end to end', () => {
     expect(probed).toEqual(Array(4).fill(home));
     expect(await status(accountId)).toBe('available');
     await h.api.signalTask(token, task.id, 'cancel');
+  }, 90_000);
+
+  // funding-analysis#2: three tasks hit one login's weekly limit, the host could not
+  // confirm it, and each slept 59 hours for that login's reset while two other
+  // logins sat idle. Unconfirmed, the limit is this task's alone: it avoids that
+  // login until then and goes on at once on another.
+  it('goes on at once on another login after a sandbox-reported limit the host cannot confirm', async () => {
+    const coordinator = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+    const spare = homes.ensure('claude', 'spare');
+    fs.writeFileSync(path.join(spare, 'karmax-oauth.json'), JSON.stringify({ token: 'spare-setup-token' }));
+    await coordinator.registerAccounts([
+      { id: accountId, provider: 'claude', kind: 'login', configHome: home, maxConcurrent: 1 },
+      { id: 'login:claude:spare', provider: 'claude', kind: 'login', configHome: spare, maxConcurrent: 1 },
+    ]);
+    await coordinator.setAccountAvailability({ accountId, status: 'available' });
+    healthy = true;
+    hostUsage = { ok: false, at: Date.now(), reason: 'setup-token' };
+    sandboxLimit = { window: 'weekly', resetHint: 'in 3600s' };
+    sandboxFirstLoginOnly = true;
+    sandboxFailedHome = undefined;
+    sandboxQuotaFailures = 1;
+    homesUsed.length = 0;
+    const before = turns;
+    try {
+      const repo = await h.makeRepo('sandbox-quota-other');
+      const project = (await h.store.createProject('Sandbox quota other', { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false }));
+      const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
+      const task = await h.api.createTask(token, { projectId: project.id, title: 'Sandbox quota other',
+        prompt: '@write so.txt :: SO\n@run git add so.txt && git commit -m so\n@review Sandbox quota other',
+        params: { 'agent:do': { provider: 'claude', model: 'claude-fable-5-1' } },
+      });
+      const view = () => h.client.workflow.getHandle(task.id).query('view') as Promise<any>;
+      await expect.poll(async () => (await view()).stage, { timeout: 30_000 }).toBe('review');
+      expect(turns).toBe(before + 2);
+      // The second turn ran on the other login; the first stays everyone else's.
+      expect(homesUsed[1]).not.toBe(homesUsed[0]);
+      expect(await status(accountId)).toBe('available');
+      expect(await status('login:claude:spare')).toBe('available');
+      await h.api.signalTask(token, task.id, 'cancel');
+    } finally {
+      sandboxLimit = { window: '5h', resetHint: 'in 2s' };
+      sandboxFirstLoginOnly = false;
+      sandboxQuotaFailures = 0;
+      hostUsage = undefined;
+      await coordinator.registerAccounts([{ id: accountId, provider: 'claude', kind: 'login', configHome: home, maxConcurrent: 1 }]);
+      await homes.remove('claude', 'spare');
+    }
   }, 90_000);
 
   it('parks the login when the host confirms a sandbox-reported limit', async () => {
