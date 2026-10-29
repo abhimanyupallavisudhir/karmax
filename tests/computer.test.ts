@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { applyComputer, assertInFlightComputerEdit, computerConfig, computerOf, describeMachine, machineShape,
-  normalizeComputer, sameMachine } from '../src/domain/computer.js';
+  normalizeComputer, sameMachine, worldMachine } from '../src/domain/computer.js';
 
 describe('computer value', () => {
   it('round-trips between the form value and the execution config', () => {
@@ -48,5 +48,20 @@ describe('computer value', () => {
     expect(() => assertInFlightComputerEdit(current, { flavor: 'desktop' })).toThrow(/experience/);
     expect(() => assertInFlightComputerEdit(current, { network: { unrestricted: false, allowDomains: [], allowCidrs: [] } })).toThrow(/network/);
     expect(() => assertInFlightComputerEdit(current, { network: { unrestricted: true } })).not.toThrow();
+  });
+});
+
+describe('worldMachine', () => {
+  it('is the recorded machine, never smaller than the Computer it starts at', () => {
+    // Rounded up by the provider: the machine as made.
+    expect(worldMachine({ machine: { cpu: 2, memoryMb: 4096, diskGb: 20 }, computer: { cpu: 2, memoryMb: 2048, diskGb: 20 } }))
+      .toEqual({ cpu: 2, memoryMb: 4096, diskGb: 20 });
+    // Resized before resize recorded it: the Computer it now starts at.
+    expect(worldMachine({ machine: { cpu: 2, memoryMb: 4096, diskGb: 50 }, computer: { cpu: 4, memoryMb: 8192, diskGb: 50 } }))
+      .toEqual({ cpu: 4, memoryMb: 8192, diskGb: 50 });
+    expect(worldMachine({ computer: { cpu: 4 } })).toEqual({ cpu: 4 });
+    expect(worldMachine({ machine: { cpu: 2, memoryMb: 2048 }, computer: { diskGb: 80 } })).toEqual({ cpu: 2, memoryMb: 2048, diskGb: 80 });
+    expect(worldMachine({})).toBeUndefined();
+    expect(worldMachine(undefined)).toBeUndefined();
   });
 });

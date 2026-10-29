@@ -1,4 +1,4 @@
-import { applyComputer, isAnyProvider, isCloudProvider, machineShape, normalizeComputer } from '../domain/computer.js';
+import { applyComputer, isAnyProvider, isCloudProvider, machineShape, normalizeComputer, worldMachine } from '../domain/computer.js';
 import { taskEnded } from '../world/task-ended.js';
 import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
 import { conversationFor, participantLabel, workDigest } from '../domain/participants.js';
@@ -286,9 +286,7 @@ function classifyTurnError(err: unknown, provider?: Provider, sandbox?: { diagno
 /** The machine a world runs on, as holds price it: what the provider made
  * (VM worlds), else what its Computer asked for. */
 function worldShape(handle: WorldHandle): { cpu?: number; memoryMb?: number; diskGb?: number } | undefined {
-  const meta = handle.meta as { machine?: { cpu?: number; memoryMb?: number; diskGb?: number };
-    computer?: { cpu?: number; memoryMb?: number; diskGb?: number } } | undefined;
-  return meta?.machine ?? meta?.computer;
+  return worldMachine(handle.meta);
 }
 
 function parseInterruption(value: string | undefined): WorldDiagnosis | undefined {

@@ -490,7 +490,8 @@ export interface WorldProvider {
    * disk grows now, CPU and memory at the next start. Providers without it
    * move a resized world through hibernation and a checkpoint restore. */
   resize?(handle: WorldHandle, to: import('../domain/computer.js').MachineShape): Promise<{ disk: 'grown' | 'unchanged'; restart: boolean;
-    /** The machine as it now is: record it as the handle's `meta.machine`. */
+    /** The machine from its next start on (CPU and memory change only then; a
+     * running world is resized only in disk): record it as the handle's `meta.machine`. */
     machine: { cpu: number; memoryMb: number; diskGb: number } }>;
   /** Periodic provider upkeep (deferred deletes, stale image builders), once
    * per lifecycle sweep for each organization connected to it. */

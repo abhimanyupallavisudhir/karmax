@@ -181,7 +181,7 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
     await world.writeFile('keep.txt', 'all of it');
     const handle = world.handle as WorldHandle;
     expect(await provider.resize(handle, { diskGb: 150, cpu: 4, memoryMb: 8192 }))
-      .toEqual({ disk: 'grown', restart: true, machine: { cpu: 2, memoryMb: 4096, diskGb: 150 } });
+      .toEqual({ disk: 'grown', restart: true, machine: { cpu: 4, memoryMb: 8192, diskGb: 150 } });
     expect([...hetzner.volumes.values()][0]!.size).toBe(150);
     await provider.park(handle);
     const woken = await provider.open({ ...handle, meta: { ...handle.meta, computer: { cpu: 4, memoryMb: 8192, diskGb: 150 } } });

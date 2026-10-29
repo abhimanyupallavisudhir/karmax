@@ -313,8 +313,10 @@ export class VmWorldProvider implements WorldProvider {
     // A running machine grows its filesystem now (the boot script does it on a stopped one).
     if (grown && await this.driver.state(connection, sealed).catch(() => undefined) === 'ready')
       await growFilesystem(this.transportFor(handle.id, connection, sealed), this.home()).catch(() => undefined);
+    // Every start from now on is at this size (shapeOf), and nothing records
+    // it again: holds, the World prompt and the task's chip read it.
     return { disk: grown ? 'grown' : 'unchanged', restart: next.cpu !== made.cpu || next.memoryMb !== made.memoryMb,
-      machine: { cpu: made.cpu, memoryMb: made.memoryMb, diskGb: next.diskGb } };
+      machine: { cpu: next.cpu, memoryMb: next.memoryMb, diskGb: next.diskGb } };
   }
 
   async listSandboxes(organizationId?: string): Promise<ProviderSandboxRef[]> {
