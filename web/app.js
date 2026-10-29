@@ -1958,7 +1958,7 @@ function renderField(f, own, inherited, withChips, alt, agentOpts) {
       // the user sees (and can remove) what's inlined by default; [[ adds more.
       return `<div class="form-row" data-row="${esc(f.name)}">${label}<div class="prompt-field">${ta}<div class="img-chips attachment-chips" id="tf-chips" style="display:none"></div>
         <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input id="tf-files" type="file" multiple hidden></label>${policyTip('Drop or paste files here (25 MB each, 50 MB per task). Type [[ to add a wiki page.')}</div>
-        <div class="prompt-context-row"><span class="pc-prefix">Context</span>${policyTip('Wiki pages the agent reads before it starts. Type [[ to add a page, a label or a folder.')}<input type="hidden" id="tf-context"><span class="pc-chips" id="tf-context-chips"></span><textarea id="tf-context-add" class="prompt-context" rows="1" spellcheck="false" aria-label="Add wiki context" placeholder="[[ to add"></textarea></div></div></div>`;
+        <div class="prompt-context-row"><span class="pc-prefix">Context</span>${policyTip('Wiki pages the agent reads before it starts.')}<input type="hidden" id="tf-context"><span class="pc-chips" id="tf-context-chips"></span><textarea id="tf-context-add" class="prompt-context" rows="1" spellcheck="false" aria-label="Add wiki context" placeholder="type [[ to attach a wiki page, label, or folder"></textarea></div></div></div>`;
     return `<div class="form-row" data-row="${esc(f.name)}">${label}${ta}</div>`;
   }
   if (f.type === 'boolean')
@@ -2640,38 +2640,13 @@ function humanAudienceOptions() {
   ];
 }
 // A comma-separated audience box whose suggestions follow the entry being typed.
-// Away from the keyboard it reads by name ("Task creator"), not as the stored
-// tokens (@creator); focused, the tokens are edited as text.
+// It shows the tokens themselves (@creator, @team:leaders): seeing them is how
+// people learn to write them.
 function audienceComboHtml(className, audience, label) {
-  return `<div class="combo audience-combo"><input class="${className}" value="${esc(audience)}" aria-label="${esc(label)}" placeholder="@creator, @team:leaders, or search for a person" autocomplete="off" spellcheck="false" /><span class="audience-face" aria-hidden="true"></span><button type="button" class="combo-caret" tabindex="-1" aria-label="Show people and teams">▾</button><div class="combo-menu" hidden></div></div>`;
-}
-function audienceNames(value) {
-  let options = [];
-  try { options = humanAudienceOptions(); } catch { /* people not loaded yet */ }
-  return String(value || '').split(',').map((entry) => entry.trim()).filter(Boolean)
-    .map((entry) => (options.find((o) => o.value === entry)?.label || entry).replace(/^Person · /, '')).join(', ');
-}
-function wireAudienceFace(combo) {
-  const input = combo.querySelector('input');
-  const face = combo.querySelector('.audience-face');
-  if (!input || !face || input.dataset.faceWired) return;
-  input.dataset.faceWired = '1';
-  const paint = () => {
-    const names = audienceNames(input.value);
-    face.textContent = names;
-    input.classList.toggle('has-face', !!names && names !== input.value.trim().replace(/,\s*$/, ''));
-    if (input.isConnected) {
-      const style = getComputedStyle(input);
-      face.style.paddingLeft = `${parseFloat(style.paddingLeft) + parseFloat(style.borderLeftWidth)}px`;
-      face.style.fontSize = style.fontSize;
-      if (input.offsetHeight) face.style.lineHeight = `${input.offsetHeight}px`;
-    }
-  };
-  for (const type of ['input', 'change', 'blur']) input.addEventListener(type, paint);
-  paint();
+  return `<div class="combo audience-combo"><input class="${className}" value="${esc(audience)}" aria-label="${esc(label)}" placeholder="@creator, @team:leaders, or search for a person" autocomplete="off" spellcheck="false" /><button type="button" class="combo-caret" tabindex="-1" aria-label="Show people and teams">▾</button><div class="combo-menu" hidden></div></div>`;
 }
 function wireAudienceCombos(root) {
-  root.querySelectorAll('.audience-combo').forEach((combo) => { wireCombo(combo, humanAudienceOptions, null, { multiple: true }); wireAudienceFace(combo); });
+  root.querySelectorAll('.audience-combo').forEach((combo) => { wireCombo(combo, humanAudienceOptions, null, { multiple: true }); });
 }
 // An agent other than the main one: its block carries Instructions and its own
 // Authorization row (inheriting the main agent's until changed).
@@ -3031,7 +3006,7 @@ function authorizationLevels() {
 function authorizationScopeSuggestions(projects, query) {
   const q = String(query || '').trim().toLowerCase();
   return [
-    { value: '@organization', label: 'Whole organization' },
+    { value: '@organization', label: '@organization' },
     ...(projects || []).slice().sort((a, b) => a.name.localeCompare(b.name))
       .map((project) => ({ value: project.id, label: project.name })),
   ].filter((option) => !q || `${option.value} ${option.label}`.toLowerCase().includes(q));
@@ -3065,7 +3040,7 @@ function authorizationEditorHtml(id, value, projects, fallbackProjectId) {
     ${authorizationWarningHtml(level)}
     <div class="authz-scope-combo" ${level.scope === 'selectable' ? '' : 'hidden'}>
       <div class="authz-scope-field">
-        <span class="authz-scope-chips">${chips.map((scope) => `<span class="authz-scope-chip" data-scope="${esc(scope)}"><span>${esc(scope === '@organization' ? 'Whole organization' : names.get(scope) || scope)}</span><button type="button" aria-label="Remove ${esc(scope === '@organization' ? 'Whole organization' : names.get(scope) || scope)}">×</button></span>`).join('')}</span>
+        <span class="authz-scope-chips">${chips.map((scope) => `<span class="authz-scope-chip" data-scope="${esc(scope)}"><span>${esc(scope === '@organization' ? scope : names.get(scope) || scope)}</span><button type="button" aria-label="Remove ${esc(scope === '@organization' ? scope : names.get(scope) || scope)}">×</button></span>`).join('')}</span>
         <input class="authz-scope-input" aria-label="Authorization scope" autocomplete="off" spellcheck="false" placeholder="${esc(authorizationScopePlaceholder(chips))}">
         <button type="button" class="authz-scope-caret" aria-label="Show authorization scopes" tabindex="-1">⌄</button>
       </div>
@@ -3088,7 +3063,7 @@ function authorizationSummary(value, projects) {
   const selected = normalizedAuthorization(value);
   const level = authorizationLevels().find((candidate) => candidate.id === selected.level)?.name || selected.level;
   if (selected.scope === 'global') return level;
-  if (selected.scope === 'organization') return `${level} · Whole organization`;
+  if (selected.scope === 'organization') return `${level} · @organization`;
   const names = new Map((projects || []).map((project) => [project.id, project.name]));
   return `${level} · ${(selected.projectIds || []).map((id) => names.get(id) || id).join(', ')}`;
 }
@@ -3200,12 +3175,12 @@ function summonDialog({ title, tip, missing = [], summon, recipients = [], limit
   });
 }
 
-/** "Project maintainer · Site", "Developer · 3 projects", "Administrator · Whole organization". */
+/** "Project maintainer · Site", "Developer · 3 projects", "Administrator · @organization". */
 function authorizationShortSummary(value, projects) {
   const selected = normalizedAuthorization(value);
   const level = authorizationLevels().find((candidate) => candidate.id === selected.level)?.name || selected.level;
   if (selected.scope === 'global') return level;
-  if (selected.scope === 'organization') return `${level} · Whole organization`;
+  if (selected.scope === 'organization') return `${level} · @organization`;
   const ids = selected.projectIds || [];
   return `${level} · ${ids.length === 1 ? (projects || []).find((project) => project.id === ids[0])?.name || ids[0] : `${ids.length} projects`}`;
 }
@@ -3335,7 +3310,7 @@ function wireAuthorizationEditor(root, projects, onChange) {
     const warning = root.querySelector('.authz-warning');
     if (warning) warning.outerHTML = authorizationWarningHtml(levelOf());
     const selected = value.scope === 'organization' ? ['@organization'] : (value.projectIds || []);
-    chips.innerHTML = selected.map((scope) => `<span class="authz-scope-chip" data-scope="${esc(scope)}"><span>${esc(scope === '@organization' ? 'Whole organization' : projectById.get(scope)?.name || scope)}</span><button type="button" aria-label="Remove ${esc(scope === '@organization' ? 'Whole organization' : projectById.get(scope)?.name || scope)}">×</button></span>`).join('');
+    chips.innerHTML = selected.map((scope) => `<span class="authz-scope-chip" data-scope="${esc(scope)}"><span>${esc(scope === '@organization' ? scope : projectById.get(scope)?.name || scope)}</span><button type="button" aria-label="Remove ${esc(scope === '@organization' ? scope : projectById.get(scope)?.name || scope)}">×</button></span>`).join('');
     input.placeholder = authorizationScopePlaceholder(selected, root);
     chips.querySelectorAll('button').forEach((button) => button.addEventListener('click', () => {
       const scope = button.closest('[data-scope]').dataset.scope;
@@ -9167,8 +9142,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
               <div id="cred-editor-newtask">Loading…</div>
             </div>`}
             <div class="form-row" data-row="__notes">
-              <div class="label-row"><label>Notes</label>${policyTip(NOTES_TIP)}<span class="label-row-fill"></span></div>
-              <textarea id="tf-notes" rows="3" placeholder="Add a note…">${esc(draft?.notes || seed?.notes || '')}</textarea>
+              <div class="label-row"><label>Notes</label><span class="label-row-fill"></span></div>
+              <textarea id="tf-notes" rows="3" placeholder="Only you see this — never sent to the agent">${esc(draft?.notes || seed?.notes || '')}</textarea>
             </div>
           </aside>
         </div>
@@ -9885,7 +9860,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // says what it risks (confirmAvatar).
   const avatarBox = $('#tf-avatar');
   const avatarCombo = root.querySelector('.tf-avatar .audience-combo');
-  if (avatarCombo) { wireCombo(avatarCombo, humanAudienceOptions, null, { multiple: true }); wireAudienceFace(avatarCombo); }
+  if (avatarCombo) wireCombo(avatarCombo, humanAudienceOptions, null, { multiple: true });
   avatarBox?.addEventListener('change', () => {
     root.querySelector('.tf-avatar-options').hidden = !avatarBox.checked;
     const saveAvatar = $('#tf-save-avatar');
@@ -10027,8 +10002,8 @@ async function renderSeriesPage(rec) {
         <div id="tf-body">
           ${renderFields(fields, values, inherited)}
           <div class="form-row" data-row="__notes">
-            <div class="label-row"><label>Notes</label>${policyTip(NOTES_TIP)}<span class="label-row-fill"></span></div>
-            <textarea id="tf-notes" rows="3" placeholder="Add a note…">${esc(rec.notes || '')}</textarea>
+            <div class="label-row"><label>Notes</label><span class="label-row-fill"></span></div>
+            <textarea id="tf-notes" rows="3" placeholder="Only you see this — never sent to the agent">${esc(rec.notes || '')}</textarea>
           </div>
           <details class="advanced" style="margin-top:10px">
             <summary title="The Claude and Codex accounts each run uses, first available first">Accounts</summary>
@@ -14665,11 +14640,10 @@ async function loadParamDefaults(taskId) {
 // stage guard. The current value comes from the freshly-fetched view (`v.notes`),
 // so it's correct even for a task not in the loaded list.
 // One tip wherever a task's notes are written: the rail, the task form, a series.
-const NOTES_TIP = 'Only you see these. They are never sent to an agent.';
 function notesSection(v) {
   return `<section class="rail-sec" id="task-notes-box">
-    <div class="rail-h">Notes ${policyTip(NOTES_TIP)}</div>
-    <textarea id="task-notes" rows="2" aria-label="Notes" placeholder="Add a note…">${esc(v.notes || '')}</textarea>
+    <div class="rail-h">Notes</div>
+    <textarea id="task-notes" rows="2" aria-label="Notes" placeholder="Only you see this — never sent to the agent">${esc(v.notes || '')}</textarea>
   </section>`;
 }
 
@@ -14890,7 +14864,8 @@ function paramCurrentValue(f, v, rec) {
   if (f.type === 'confirmer' && S.attemptGroup?.confirmer !== undefined) return S.attemptGroup.confirmer;
   return own[f.name];
 }
-// A frozen parameter's value as words: names, not ids, tokens or enum keys.
+// A frozen parameter's value as words: names, not ids or enum keys; audiences
+// keep their tokens (@creator), as everywhere else they are written.
 function displayParam(f, val) {
   if (val === undefined || val === null || val === '') return 'Default';
   const agent = (spec) => spec?.provider ? `${harnessLabel(spec.provider)} · ${modelLabel(spec.provider, spec.model)}` : 'Default';
@@ -14899,11 +14874,11 @@ function displayParam(f, val) {
   if (f.type === 'confirmer') {
     const layers = cfLayersOf(val);
     if (!layers.length) return 'Auto-confirms';
-    return layers.map((l) => (l.kind === 'agent' ? `Agent (${agent(l)})` : audienceNames((l.audience || ['@creator']).join(', ')))).join(' → ');
+    return layers.map((l) => (l.kind === 'agent' ? `Agent (${agent(l)})` : (l.audience || ['@creator']).join(', '))).join(' → ');
   }
   if (f.type === 'responder') {
     const route = responderOf(val);
-    return route.kind === 'agent' ? `Agent (${agent(route)})` : audienceNames((route.audience || ['@creator']).join(', '));
+    return route.kind === 'agent' ? `Agent (${agent(route)})` : (route.audience || ['@creator']).join(', ');
   }
   if (Array.isArray(val)) return val.join(', ') || 'None';
   if (typeof val === 'boolean') return val ? 'On' : 'Off';
@@ -17896,6 +17871,7 @@ function wikiRefMatches(value) {
 
 // A wiki-context reference as a chip: where it is, and what (a page, every page
 // with a label, a folder) — never the raw [[proj:tag:…]] token.
+// Said in words on hover; the chip itself shows the token ([[proj:tag:default]]).
 function wikiRefChipLabel(ref) {
   const where = ref.scope === 'project' ? 'Project' : 'Organization';
   const what = ref.kind === 'label' ? `#${ref.value}` : ref.kind === 'folder' ? `${ref.value}/` : ref.value;
@@ -17914,7 +17890,7 @@ function wireContextChips(value, tokens, projectId) {
     value.value = list.join(' ');
     chips.innerHTML = list.map((token, i) => {
       const ref = wikiRefMatches(token)[0];
-      return `<span class="pc-chip wiki-ref-${esc(ref.kind)}" title="${esc(token)}">${esc(wikiRefChipLabel(ref))}<button type="button" class="pc-chip-x" data-i="${i}" aria-label="Remove ${esc(wikiRefChipLabel(ref))}">×</button></span>`;
+      return `<span class="pc-chip wiki-ref-${esc(ref.kind)}" title="${esc(wikiRefChipLabel(ref))}">${esc(token)}<button type="button" class="pc-chip-x" data-i="${i}" aria-label="Remove ${esc(token)}">×</button></span>`;
     }).join('');
   };
   chips.addEventListener('click', (event) => {
@@ -18282,7 +18258,7 @@ function renderWikiHome(info, proj, pane, data) {
       </details>`).join('')}
     </div>` : '') + (data.tocText ? `
     <div class="card wiki-uncond">
-      <div class="wiki-uncond-head"><b>Table of contents</b>${policyTip('Agents get the names and descriptions, and open an entry when they need it.')}<span class="grow"></span>${tex(data.tocText)}</div>
+      <div class="wiki-uncond-head"><b>Table of contents</b>${policyTip('Agents get the names and descriptions, and open an entry with read_wiki when they need it.')}<span class="grow"></span>${tex(data.tocText)}</div>
       <div class="msg-text md wiki-md wiki-toc"></div>
     </div>` : '');
   pane.querySelectorAll('.wiki-always-row .wiki-md').forEach((el, i) =>
@@ -18513,12 +18489,6 @@ function eventOutcome(event) {
   }).join(' · ');
 }
 
-// An event type (dotted words, e.g. github.pull_request.opened) said in words:
-// "Pull request opened". The type itself, which triggers match, is its title.
-function eventTypeLabel(type) {
-  const words = String(type || '').replace(/^github\./, '').replace(/[._-]+/g, ' ').trim();
-  return words ? words.charAt(0).toUpperCase() + words.slice(1) : 'Event';
-}
 function eventSourceLabel(source, hooks) {
   const id = source.split(':')[1];
   const hook = hooks.find((h) => h.id === id);
@@ -18537,10 +18507,10 @@ function projectEventsHtml(projectId, list, events) {
     : h.deliveries ? `${h.deliveries} received · last ${fmtAgo(h.lastDeliveryAt)}` : 'Nothing received yet';
   const sourceRow = (h) => `<div class="setting-row" data-hook="${esc(h.id)}">
     <span class="setting-label">${esc(h.name)}</span>
-    <span class="setting-value"><span class="setting-muted">${h.kind ? `${CHAT_PLATFORM_LABELS[h.kind]}${h.bot?.username ? ` · ${esc(h.bot.username.startsWith('+') ? h.bot.username : '@' + h.bot.username)}` : ''}` : `<span title="${esc(h.type)}">${esc(eventTypeLabel(h.type))}</span>`}</span><span class="setting-sep">·</span><span class="setting-muted">${health(h)}</span></span>
+    <span class="setting-value"><span class="setting-muted">${h.kind ? `${CHAT_PLATFORM_LABELS[h.kind]}${h.bot?.username ? ` · ${esc(h.bot.username.startsWith('+') ? h.bot.username : '@' + h.bot.username)}` : ''}` : `<code>${esc(h.type)}</code>`}</span><span class="setting-sep">·</span><span class="setting-muted">${health(h)}</span></span>
     <span class="setting-actions">${!h.kind || CHAT_URL_PASTED[h.kind] ? `<button class="btn sm ghost" data-hook-copy="${esc(list.urlBase + h.id)}"${h.kind ? ` title="${esc(chatUrlTip(h.kind))}"` : ''}>Copy URL</button>` : ''}${h.kind ? '' : `<button class="btn sm ghost" data-hook-rotate title="Replace the secret; the old one stops working">New secret</button>`}<button class="btn sm ghost" data-hook-delete title="Delete">✕</button></span></div>${h.kind ? chatPeopleHtml(h) : ''}`;
   const eventRow = (e) => `<details class="pe-event"><summary class="setting-row">
-    <span class="setting-label" title="${esc(e.type)}">${esc(eventTypeLabel(e.type))}</span>
+    <span class="setting-label"><code>${esc(e.type)}</code></span>
     <span class="setting-value">${eventSourceLabel(e.source, hooks)}${e.subject ? ` · ${/^https?:/.test(e.subject) ? `<a href="${esc(e.subject)}" target="_blank" rel="noopener">${esc(e.subject.replace(/^https?:\/\/(www\.)?/, '').slice(0, 60))}</a>` : esc(e.subject.slice(0, 60))}` : ''}<span class="setting-sep">·</span>${eventOutcome(e)}</span>
     <span class="setting-actions setting-muted">${fmtAgo(e.receivedAt)}</span></summary>
     <pre class="pe-payload">${esc(JSON.stringify(e.payload, null, 2))}</pre></details>`;
@@ -18811,7 +18781,7 @@ async function hydrateProjectSecrets(proj) {
       <details class="settings-disclosure compact" id="project-secret-add"><summary><b>Add a secret</b></summary>
         <div class="project-form-grid">
           <label class="form-row"><span>Name</span><input id="project-secret-name" placeholder="DATABASE_URL"></label>
-          <div class="form-row"><span><label for="project-secret-value">Value</label> ${policyTip('Encrypted at once and never shown again.')}</span><input id="project-secret-value" type="password" autocomplete="new-password"></div>
+          <div class="form-row"><span><label for="project-secret-value">Value</label> ${policyTip('Encrypted at once and never shown again.')}</span><input id="project-secret-value" type="password" autocomplete="new-password" placeholder="Write-only value"></div>
           <div class="form-row wide"><span>Deliver to ${policyTip(destinationTip)}</span>${secretDestinationComboHtml('project-secret-file')}</div>
         </div><div class="project-form-actions"><button class="btn sm primary" id="project-secret-save">Save secret</button></div>
       </details>
@@ -19570,7 +19540,7 @@ async function hydrateProjectAccess(proj) {
     const userRecord = (id) => S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
     const userName = (id) => userRecord(id)?.name || userRecord(id)?.email?.split('@')[0] || 'Unnamed member';
     const principalName = (principal) => principal.kind === 'user' ? userName(principal.userId)
-      : principal.kind === 'organization' ? 'Whole organization'
+      : principal.kind === 'organization' ? '@all'
       : `@team:${S.teams.find((team) => team.id === principal.teamId)?.slug || principal.teamId}`;
     accessBox.innerHTML = `<div class="section-h section-h-action"><span>Project access ${policyTip('People and teams with a role in this project beyond their organization role.')}</span><a class="btn sm ghost" data-spa href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-people">Manage people</a></div>
       <div class="setting-rows">${members.map((member) => { const id = member.principal.userId || member.principal.teamId || member.principal.organizationId; return `<div class="setting-row member-line" data-project-member data-kind="${esc(member.principal.kind)}" data-id="${esc(id)}"><span class="setting-value"><b>${esc(principalName(member.principal))}</b>${member.protectedOwner ? '<span class="setting-muted">Creator</span>' : ''}</span><span class="chip">${esc(authorizationLevels().find((level) => level.id === (member.profileId || 'developer'))?.name || member.profileId || 'Developer')}</span><span class="setting-actions"><button class="icon-btn project-member-remove" type="button" title="Remove" aria-label="Remove ${esc(principalName(member.principal))}">×</button></span></div>`; }).join('') || '<div class="setting-muted">No project-specific roles</div>'}</div>`;
@@ -20232,7 +20202,7 @@ async function hydrateWorkflows(organizationId = S.organizationId) {
   list.sort((a, b) => rank(a) - rank(b) || workflowInfo(a).label.localeCompare(workflowInfo(b).label));
   if (!list.length) { box.innerHTML = '<div class="setting-muted">No workflows</div>'; return; }
   box.innerHTML = list.map((w) => { const info = workflowInfo(w); return `<div class="setting-row workflow-line">
-      <span class="setting-value"><b>${esc(info.label)}</b>${info.description ? policyTip(info.description) : ''}${w.source === 'bundled' ? '' : '<span class="chip">Installed</span>'}</span>
+      <span class="setting-value"><b>${esc(info.label)}</b><code class="setting-muted">${esc(w.name)}</code>${info.description ? policyTip(info.description) : ''}${w.source === 'bundled' ? '' : '<span class="chip">Installed</span>'}</span>
       <span class="setting-actions"><span class="setting-muted" title="${esc(`${w.versions.length} version${w.versions.length === 1 ? '' : 's'}: ${w.versions.join(', ')}`)}">${esc(w.latest)}</span></span></div>`; }).join('');
 }
 // ── payments: budget policy + cards (SPEC §7.6) ──────────────────────────────
@@ -20881,7 +20851,7 @@ const VAULT_ACTION_ICON = {
   rotate: vaultSvg('<path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/>'),
   delete: vaultSvg('<path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6M10 11v6M14 11v6"/>'),
 };
-// [field, label, tip] per hand-added credential type.
+// [field, label, format placeholder] per hand-added credential type.
 const VAULT_SECRET_LABELS = {
   login: [['password', 'Password'], ['totp', 'TOTP seed', 'Base32, an otpauth:// link, or paste an image of the QR code'], ['note', 'Notes']],
   'api-key': [['secret', 'API key']],
@@ -21536,10 +21506,10 @@ async function wireVaultCards(organizationId) {
       ? 'Optional. Agents get the path to this key file in this variable. Not the public key.'
       : 'Optional. Agents get this key in this variable.';
     box.querySelector('.vault-secret-rows').innerHTML = VAULT_SECRET_LABELS[type].map(([field, label, tip]) =>
-      `<div class="form-row"><span class="form-row-head"><label>${esc(label)}</label>${tip ? policyTip(tip) : ''}</span>${field === 'env' || field === 'privateKey' || field === 'note'
-        ? `<textarea class="vi-secret" data-field="${field}" rows="3" style="width:100%"></textarea>`
+      `<div class="form-row"><span class="form-row-head"><label>${esc(label)}</label></span>${field === 'env' || field === 'privateKey' || field === 'note'
+        ? `<textarea class="vi-secret" data-field="${field}" rows="3" style="width:100%"${tip ? ` placeholder="${esc(tip)}"` : ''}></textarea>`
         : field === 'totp' ? `<div class="totp-secret-control">
-            <input class="vi-secret vi-totp-input" data-field="totp" type="password" autocomplete="off" />
+            <input class="vi-secret vi-totp-input" data-field="totp" type="password" autocomplete="off"${tip ? ` placeholder="${esc(tip)}"` : ''} />
             <div class="totp-qr-preview" role="status" aria-live="polite" hidden>
               <img alt="Pasted TOTP QR code" />
               <span class="totp-qr-status">Reading QR…</span>
@@ -22030,7 +22000,7 @@ async function wireVaultCards(organizationId) {
     list.innerHTML = conns.map((c) => `<div class="setting-row" data-conn="${esc(c.name)}">
       <span class="setting-label">${esc(c.label)} ${connectorTip(c)}</span>
       <span class="setting-value">${c.available ? '<span class="chip ok">Connected</span>' : '<span class="chip">Not connected</span>'}${connectorNote(c) ? `<span class="setting-muted">${esc(connectorNote(c))}</span>` : ''}${c.config?.lastAutoSync?.error ? `<span class="chip warn" title="${esc(c.config.lastAutoSync.error)}">Sync error</span>` : ''}
-      ${c.setup !== 'git-pass' && !c.available && c.name !== 'pass' ? `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'Session key' : 'Service-account token'}" aria-label="${esc(c.label)} ${c.name === 'bitwarden' ? 'session key' : 'service-account token'}" />` : ''}
+      ${c.setup !== 'git-pass' && !c.available && c.name !== 'pass' ? `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : '1Password service-account token'}" aria-label="${esc(c.label)} ${c.name === 'bitwarden' ? 'session key' : 'service-account token'}" />` : ''}
       ${(c.pendingWrites || []).filter(write => !write.id).map(write => `<span>${esc(write.label)}: pending write-back ${c.config?.writeBack ? `<button class="btn sm" data-write-retry="${esc(write.itemId)}">Retry</button>` : ''}<button class="btn sm" data-write-remote="${esc(write.itemId)}">Use remote value</button></span>`).join('')}</span>
       <span class="setting-actions">${c.pendingWrites?.length ? `${c.config?.writeBack ? `<button class="btn sm" data-conn-retry title="${esc(c.pendingWrites[0]?.error || 'Saved in the vault; waiting for the external store')}">Retry ${c.pendingWrites.length} pending</button>` : `<span class="chip" title="Write-back is off; turn it on under Import… to send these">${c.pendingWrites.length} pending</span>`}<button class="btn sm" data-conn-discard title="Stop retrying these writes; credentials stay in the vault">Dismiss</button>` : ''}
       ${c.setup === 'git-pass'
@@ -22327,7 +22297,7 @@ async function wireOutboundEmailCard() {
       ${instRow('From', `<input id="oe-from" class="setting-input" aria-label="From address" placeholder="${siteNameMarkup()} &lt;noreply@yourdomain.com&gt;">`)}
       <div class="setting-rows" id="oe-smtp" hidden>
         ${instRow(`Host ${policyTip('Found automatically for Gmail, Outlook and Fastmail.')}`, '<input id="oe-host" class="setting-input" aria-label="SMTP host" placeholder="smtp.example.com">')}
-        ${instRow('Port', '<input id="oe-port" class="setting-input" aria-label="SMTP port" inputmode="numeric" placeholder="587">')}
+        ${instRow('Port', '<input id="oe-port" class="setting-input" aria-label="SMTP port" inputmode="numeric" placeholder="587, or 465 for TLS">')}
         ${instRow(`Implicit TLS ${policyTip('For port 465. Leave off for 587.')}`, '', '<input class="toggle" type="checkbox" id="oe-secure" aria-label="Implicit TLS">')}
         ${instRow('Username', '<input id="oe-user" class="setting-input" aria-label="SMTP username" placeholder="Same as From">')}
       </div>
@@ -22407,7 +22377,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
         ${p.scope === ownScope ? `<button type="button" class="field-reset" data-resetprofile="${esc(p.id)}" title="Drop this override and inherit">↺ Reset to inherited</button>` : ''}</div>
       ${agentBlockHtml(`td-agent-${scope}-${p.id}`, { provider: p.provider, model: p.model, effort: p.effort, mcpConnections: inherited ? undefined : p.mcpConnections },
         { role: p.role, fork: false, inherited: { mcpConnections: p.inherited?.mcpConnections },
-          extraControls: `<input class="pf-maxturns" type="number" min="1" placeholder="Turns" title="Most tool steps per turn; blank for no limit" aria-label="Max turns" value="${p.maxTurns ?? ''}" />`,
+          extraControls: `<input class="pf-maxturns" type="number" min="1" placeholder="Turns: ∞" title="Most tool steps per turn; blank for no limit" aria-label="Max turns" value="${p.maxTurns ?? ''}" />`,
           ...(p === main ? { authority: { html: resourceDefaultsHtml(scope), summary: 'Loading…' } } : {}) })}
     </div>`;
   }).join('');
@@ -24530,9 +24500,9 @@ function roleCapabilityTree(groups, capabilities, selectable = false) {
     const included = group.capabilities.filter((cap) => roleAllows(capabilities, cap.id));
     if (!included.length) return '';
     return `<details class="role-capability-group"><summary>${esc(group.label)} <span class="setting-muted">${included.length}</span>${group.description ? policyTip(group.description) : ''}</summary>
-      <ul>${included.map((cap) => `<li title="${esc(cap.id)}">
+      <ul>${included.map((cap) => `<li>
         ${selectable ? `<label><input type="checkbox" name="capability" value="${esc(cap.id)}"><b>${esc(cap.label)}</b></label>` : `<b>${esc(cap.label)}</b>`}
-        ${cap.description ? policyTip(cap.description) : ''}</li>`).join('')}</ul></details>`;
+        <code>${esc(cap.id)}</code>${cap.description ? policyTip(cap.description) : ''}</li>`).join('')}</ul></details>`;
   }).join('');
 }
 
@@ -24543,12 +24513,13 @@ function renderOrganizationRoles() {
   if (!catalog) { root.textContent = 'Could not load roles. Reload this page to try again.'; return; }
   const levels = authorizationLevels();
   const roles = catalog.profiles.slice().sort((a, b) => levels.findIndex((level) => level.id === a.id) - levels.findIndex((level) => level.id === b.id));
-  // Folded: a reference most people open rarely. A role's description, and the
-  // exact grants behind it, are its tip; its capabilities are named, not coded.
+  // Folded: a reference most people open rarely. A role's description is its
+  // tip; its capabilities show their ids, and its exact grant patterns fold under it.
   root.innerHTML = `<details class="settings-disclosure roles-fold"><summary><b>Roles ${policyTip('Expand a role, then a category, to see what it may do. Access is limited by the selected projects or organization and by the person granting it; task actions also depend on workflow state.')}</b><span>${roles.length}</span></summary>
     ${roles.map((role) => `<details class="authorization-role">
-      <summary><b>${esc(role.name)}</b>${policyTip(`${role.description}\n\nExact grants: ${role.capabilities.join(', ')}. A * grants every matching capability, including future ones.`)}${role.builtin ? '' : '<span class="chip">Custom</span>'}</summary>
+      <summary><b>${esc(role.name)}</b>${policyTip(role.description)}${role.builtin ? '' : '<span class="chip">Custom</span>'}</summary>
       ${roleCapabilityTree(catalog.capabilityGroups, role.capabilities)}
+      <details class="role-capability-group"><summary>Exact grant patterns ${policyTip('A * grants every matching capability, including future ones. Scope limits still apply; for example, project scope excludes Review-gate approval.')}</summary><ul>${role.capabilities.map((cap) => `<li><code>${esc(cap)}</code></li>`).join('')}</ul></details>
     </details>`).join('')}
     ${catalog.canCreate ? `<details class="authorization-role"><summary><b>Create role</b>${policyTip('Choose specific capabilities. Only permissions you can grant within this organization are offered. New roles are available for people and tasks; existing grants stay unchanged.')}</summary>
       <form id="create-authorization-role">
