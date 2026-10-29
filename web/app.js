@@ -105,6 +105,10 @@ const ICON = {
   fork: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></svg>',
   terminal: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg>',
   laptop: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"/></svg>',
+  // The task page's two views: its conversation, and its settings.
+  chat: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
+  sliders: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg>',
+  clock: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
   // The task page's details rail: a panel with its right column.
   sidebar: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg>',
   // Window controls: a matched pair, drawn on the same grid and stroke.
@@ -7462,14 +7466,44 @@ function customBranch(v, taskId) {
 // The task's GitHub pull requests (remote policy 'pr'), with their live state —
 // merged / closed / open — so the PR is visible from the task, not just in the
 // event log. `prs` carries one per repo; `pr` alone is the pre-multi-repo shape.
-function pullRequestLinks(v) {
+function headerPullRequestLink(pr, named) {
+  const state = pr.merged ? 'merged' : pr.state === 'closed' ? 'closed' : 'open';
+  const label = named && pr.repo ? `${pr.repo} #${pr.number}` : `PR #${pr.number}`;
+  return `<a class="pr-link ${state}" href="${esc(safeHref(pr.url))}" target="_blank" rel="noopener"
+    title="${esc(pr.slug ? `${pr.slug} — ${state}` : state)}">⇱ ${esc(label)}<span class="pr-state">${state}</span></a>`;
+}
+
+// A task's pull requests on the header's top line: one is its link; several
+// fold into "PRs N", whose list opens on a click and stays open across refreshes.
+function pullRequestMenu(v) {
   const prs = v.prs?.length ? v.prs : v.pr ? [v.pr] : [];
-  return prs.map((pr) => {
-    const state = pr.merged ? 'merged' : pr.state === 'closed' ? 'closed' : 'open';
-    const label = prs.length > 1 && pr.repo ? `${pr.repo} #${pr.number}` : `PR #${pr.number}`;
-    return `<a class="pr-link ${state}" href="${esc(safeHref(pr.url))}" target="_blank" rel="noopener"
-      title="${esc(pr.slug ? `${pr.slug} — ${state}` : state)}">⇱ ${esc(label)}<span class="pr-state">${state}</span></a>`;
-  }).join('');
+  if (prs.length < 2) return prs.map((pr) => headerPullRequestLink(pr, false)).join('');
+  const open = prs.filter((pr) => !pr.merged && pr.state !== 'closed').length;
+  const state = open ? 'open' : prs.every((pr) => pr.merged) ? 'merged' : 'closed';
+  return `<details class="tp-prs"${S.prMenuOpen === v.taskId ? ' open' : ''}>
+    <summary class="pr-link ${state}" title="Pull requests">⇱ PRs<span class="pr-state">${prs.length}</span></summary>
+    <div class="tp-prs-menu">${prs.map((pr) => headerPullRequestLink(pr, true)).join('')}</div>
+  </details>`;
+}
+
+let prMenuOutsideInstalled = false;
+function wirePullRequestMenu(v) {
+  const menu = $('#main .tp-prs');
+  if (!menu) return;
+  if (!prMenuOutsideInstalled) {
+    prMenuOutsideInstalled = true;
+    document.addEventListener('pointerdown', (e) => {
+      const open = document.querySelector('#main .tp-prs[open]');
+      if (open && !open.contains(e.target)) open.open = false;
+    });
+  }
+  menu.addEventListener('toggle', () => { S.prMenuOpen = menu.open ? v.taskId : null; });
+  menu.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || !menu.open) return;
+    e.preventDefault();
+    menu.open = false;
+    menu.querySelector('summary').focus();
+  });
 }
 
 const PARKED_WAITS = new Set(['timer', 'job', 'subtask', 'collaboration', 'parent']);
@@ -9937,9 +9971,9 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
 // the host only lays them out. Declared actions (Confirm/Cancel/…) live in a
 // footer bar under the conversation that stays visible on every view.
 const TASK_TABS = [
-  { key: 'checkin', label: 'Chat' },
-  { key: 'parameters', label: 'Parameters' },
-  { key: 'timing', label: 'Timing' },
+  { key: 'checkin', label: 'Chat', icon: 'chat' },
+  { key: 'parameters', label: 'Parameters', icon: 'sliders' },
+  { key: 'timing', label: 'Timing', icon: 'clock' },
 ];
 // Former tabs whose content now lives on the Chat view; old links still land.
 const TASK_TAB_ALIASES = { overview: 'checkin', approvals: 'checkin' };
@@ -11026,21 +11060,24 @@ function renderTaskPage() {
   const base = taskUrl(v.taskId);
   const retainedThread = patchTaskPage(main, `
     <div class="task-page${taskRailOpen() ? '' : ' rail-closed'}">
-      <div class="tp-head wide">
-        ${taskBreadcrumb(v)}
-        <div class="row1">
-          <a class="icon-btn" id="tp-back" href="${esc(taskBackRoute())}" data-shortcut="nav.close" title="Back to the list (Esc)">←</a>
-          ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
-          <h2>${esc(v.title)}</h2>
-          ${v.approvalRequests ? `<span class="chip approval-needed">Approval needed</span>` : ''}
-          ${pullRequestLinks(v)}
-          <span class="tp-stage">${pipeline(v)}${stageIndicator(v, v.taskId)}</span>
-          <nav class="tp-views segmented" aria-label="Task view">
-            ${visibleTaskTabs().map((t) => `<a class="tab${t.key === tab ? ' active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}" aria-pressed="${t.key === tab}"${t.key === tab ? ' aria-current="page"' : ''}>${t.label}</a>`).join('')}
-          </nav>
-          <button type="button" class="icon-btn tp-rail-toggle" id="tp-rail-toggle" data-shortcut="task.rail" aria-controls="tp-rail" aria-expanded="${taskRailOpen()}" title="Details (i)">${ICON.sidebar}</button>
+      <div class="tp-chrome"><div class="tp-chrome-inner">
+        <div class="tp-head wide">
+          <div class="tp-topline">
+            ${taskBreadcrumb(v)}
+            <span class="tp-status">
+              ${v.approvalRequests ? `<span class="chip approval-needed">Approval needed</span>` : ''}
+              <span class="tp-stage">${pipeline(v)}${stageIndicator(v, v.taskId)}</span>
+              ${pullRequestMenu(v)}
+            </span>
+          </div>
+          <div class="row1">
+            <a class="icon-btn" id="tp-back" href="${esc(taskBackRoute())}" data-shortcut="nav.close" title="Back to the list (Esc)">←</a>
+            ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
+            <h2>${esc(v.title)}</h2>
+          </div>
         </div>
-      </div>
+        ${taskBar(v, tab)}
+      </div></div>
       <div class="tp-main">
         <div class="tp-col">
           <div class="tp-body" id="tp-body" data-tab="${tab}" tabindex="-1"><div class="tp-content">${taskTabBody(v, tab)}</div></div>
@@ -11058,6 +11095,7 @@ function renderTaskPage() {
       else setTaskTab(a.dataset.tasktab);
     })),
   );
+  wirePullRequestMenu(v);
   wireAttempts(v);
   wireStageTransitions(v);
   wireWorkflowMode(v);
@@ -11105,8 +11143,46 @@ function renderTaskPage() {
   // re-renders — so the page is keyboard-scrollable the moment it appears. On the
   // Check-in tab the conversation thread is the scroller, not the (fixed) body.
   const scroller = thread || newBody;
+  wireChromeTuck(scroller, `${v.taskId}/${tab}/${thread?.dataset.role || ''}`);
   const overlayOpen = $('#overlay-root')?.childElementCount > 0 || $('#modal-root')?.childElementCount > 0;
   if (scroller && shouldFocusTaskBody(main, document.activeElement, overlayOpen)) scroller.focus({ preventScroll: true });
+}
+
+// On a phone, scrolling down the page tucks its top away — the app bar, the
+// task header and its toolbar — and scrolling back up a little brings it back.
+// Only a person's own scrolling counts: a refresh re-pinning the conversation,
+// or the reflow of the tuck itself, leaves it as it is. `key` names what is
+// shown (task, view, conversation); showing something else starts untucked.
+const CHROME_TUCK_MEDIA = '(max-width: 720px)';
+function setChromeTucked(on) {
+  const root = document.documentElement;
+  if (root.classList.contains('chrome-tucked') === on) return;
+  root.classList.toggle('chrome-tucked', on);
+  if (on) $('#main .tp-prs[open]')?.removeAttribute('open');
+}
+function wireChromeTuck(scroller, key) {
+  const root = document.documentElement;
+  if (root.dataset.tuckKey !== key) { root.dataset.tuckKey = key; setChromeTucked(false); }
+  if (!scroller || scroller.tuckWired) return;
+  scroller.tuckWired = true;
+  let last = scroller.scrollTop, travel = 0, intent = 0, settled = 0;
+  const touched = () => { intent = Date.now(); };
+  for (const type of ['touchstart', 'touchmove', 'wheel']) scroller.addEventListener(type, touched, { passive: true });
+  scroller.addEventListener('keydown', touched);
+  scroller.addEventListener('scroll', () => {
+    const top = scroller.scrollTop, delta = top - last, now = Date.now();
+    last = top;
+    if (!window.matchMedia?.(CHROME_TUCK_MEDIA).matches) return setChromeTucked(false);
+    if (top <= 4) return setChromeTucked(false);
+    if (now < settled || now - intent > 1000) { travel = 0; return; }
+    travel = Math.sign(travel) === Math.sign(delta) ? travel + delta : delta;
+    const tucked = root.classList.contains('chrome-tucked');
+    if (tucked ? travel < -24 : travel > 24) {
+      setChromeTucked(!tucked);
+      settled = now + 300; // the tuck's own reflow scrolls the thread too
+      travel = 0;
+    }
+  }, { passive: true });
 }
 
 // Hydrate a data-live-key section once; a retained one keeps its handlers and
@@ -12751,24 +12827,10 @@ function conversationPane(v, t) {
   // (one per page, patched by the WS stream).
   const liveText = liveOutputFor(v, t.role);
   const live = `<div class="msg agent ${liveText ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(liveText)}</div>`;
-  // Only subscription/CLI sessions carry a config home; API-key / stateless
-  // sessions can't be forked from a terminal, so no command is shown. The session
-  // id is published mid-turn (#3), so this appears WHILE the agent runs.
-  const sess = S.sessions && S.sessions[t.role];
-  const forkCmd = sess?.id && sess?.home && localWorldPath(v) ? forkCommandFor(sess, v.worldPath) : '';
-  const remoteFork = sess?.id && sess?.home && v.worldAvailable && !v.worldPath && !v.agentTurn && hostLocal();
-  const copy = forkCmd
-    ? `<button class="btn tool copy-cmd" data-tool="Fork in CLI" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running" aria-label="Fork in CLI">${ICON.terminal}<span class="tool-label">Fork in CLI</span></button>`
-    : remoteFork
-      ? `<button class="btn tool fork-local" data-tool="Fork locally" data-provider="${esc(sess.provider)}" data-session="${esc(sess.id)}" data-home="${esc(sess.home)}" title="Materialize the cloud branch locally, then copy a native session-fork command" aria-label="Fork locally">${ICON.laptop}<span class="tool-label">Fork locally</span></button>`
-      : '';
   // The follow-up affordance (SPEC §5.6) lives inside each agent's conversation,
   // so a human can address any agent — Do, Merge, or Confirm — not just Do. It
   // appears only when the workflow currently allows follow-ups.
   const agentName = esc(t.label || t.role);
-  // The page header already states a lone agent's state; with several, say whose.
-  const presence = conversationPresence(v, t);
-  const transcripts = taskTranscripts(v);
   const followUp = (v.actions || []).find((a) => a.name === 'followUp');
   // After Confirm the approved PR lands as it is: a message to the agent
   // carries the work on in a new task (wiki features/continue-after-confirm).
@@ -12811,23 +12873,55 @@ function conversationPane(v, t) {
       </div></div>`
     : '';
   return `
-    <div class="ck-pane-head">
-      ${transcripts.length > 1 ? `<select class="sel sm ck-switch" id="ck-transcript" aria-label="Conversation">${transcripts.map((x) => `<option value="${esc(x.role)}"${x.role === t.role ? ' selected' : ''}>${esc(x.label || x.role)}</option>`).join('')}</select>` : ''}
-      ${t.shared ? activeAgentsHtml(v)
-        : presence.tone === 'idle' || presence.tone === 'done' ? '' : `<span class="conversation-presence ${presence.tone}"><span class="presence-dot"></span>${esc(presence.label)}</span>`}
-      <span style="flex:1"></span>
-      <div class="ck-tools">
-        <button class="btn tool" id="share-task-conversation" data-tool="Share" data-role="${esc(t.role)}" title="Share this conversation" aria-label="Share">${ICON.share}<span class="tool-label">Share</span></button>
-        <button class="btn tool" id="fork-task-agent" data-tool="Fork" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation" aria-label="Fork">${ICON.fork}<span class="tool-label">Fork</span></button>
-        ${S.meta?.hosted ? `<button type="button" class="btn tool" id="local-checkout" data-tool="Work locally" title="Check out this task on your computer" aria-label="Work locally">${ICON.laptop}<span class="tool-label">Work locally</span></button>` : ''}
-        ${copy}
-        <button class="btn tool" id="save-task-template" data-tool="Save as template" title="Save this task’s form as a template, to start new tasks from" aria-label="Save as template">${ICON.template}<span class="tool-label">Save as template</span></button>
-        <span class="tool-sep" aria-hidden="true"></span>
-        ${conversationFullscreenButton()}
-      </div>
-    </div>
     <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}${conversationWaitNotice(v)}${conversationError(v)}${conversationApprovalRequests()}${conversationPullRequestAsks(v)}${conversationReviewInfo(v, resourceRequestIndex >= 0)}</div></div>
     ${fu}`;
+}
+
+// The task page's one toolbar, under the title: its two views, then — on the
+// conversation — whose conversation and what is running, the conversation's
+// tools, and the details rail at the end.
+function taskBar(v, tab) {
+  const sel = tab === 'checkin' ? checkinSelection(v) : null;
+  const t = sel && sel !== 'terminal' ? taskTranscripts(v).find((x) => x.role === sel) : null;
+  const base = taskUrl(v.taskId);
+  return `<div class="tp-bar">
+    <nav class="tp-views segmented" aria-label="Task view">
+      ${visibleTaskTabs().map((x) => `<a class="tab${x.key === tab ? ' active' : ''}" data-tasktab="${x.key}" href="${esc(base)}/${x.key}" aria-label="${x.label}" title="${x.label}" aria-pressed="${x.key === tab}"${x.key === tab ? ' aria-current="page"' : ''}>${ICON[x.icon]}</a>`).join('')}
+    </nav>
+    ${t ? `${conversationBar(v, t)}<span class="tool-sep tp-rail-sep" aria-hidden="true"></span>` : '<span class="tp-bar-fill"></span>'}
+    <button type="button" class="btn tool icon tp-rail-toggle" id="tp-rail-toggle" data-shortcut="task.rail" aria-controls="tp-rail" aria-expanded="${taskRailOpen()}" aria-label="Details" title="Details (i)">${ICON.sidebar}</button>
+  </div>`;
+}
+
+// The conversation's part of the toolbar.
+function conversationBar(v, t) {
+  // Only subscription/CLI sessions carry a config home; API-key / stateless
+  // sessions can't be forked from a terminal, so no command is shown. The session
+  // id is published mid-turn (#3), so this appears WHILE the agent runs.
+  const sess = S.sessions && S.sessions[t.role];
+  const forkCmd = sess?.id && sess?.home && localWorldPath(v) ? forkCommandFor(sess, v.worldPath) : '';
+  const remoteFork = sess?.id && sess?.home && v.worldAvailable && !v.worldPath && !v.agentTurn && hostLocal();
+  const copy = forkCmd
+    ? `<button class="btn tool copy-cmd" data-tool="Fork in CLI" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running" aria-label="Fork in CLI">${ICON.terminal}<span class="tool-label">Fork in CLI</span></button>`
+    : remoteFork
+      ? `<button class="btn tool fork-local" data-tool="Fork locally" data-provider="${esc(sess.provider)}" data-session="${esc(sess.id)}" data-home="${esc(sess.home)}" title="Materialize the cloud branch locally, then copy a native session-fork command" aria-label="Fork locally">${ICON.laptop}<span class="tool-label">Fork locally</span></button>`
+      : '';
+  // The page header already states a lone agent's state; with several, say whose.
+  const presence = conversationPresence(v, t);
+  const transcripts = taskTranscripts(v);
+  return `${transcripts.length > 1 ? `<select class="sel sm ck-switch" id="ck-transcript" aria-label="Conversation">${transcripts.map((x) => `<option value="${esc(x.role)}"${x.role === t.role ? ' selected' : ''}>${esc(x.label || x.role)}</option>`).join('')}</select>` : ''}
+    ${t.shared ? activeAgentsHtml(v)
+      : presence.tone === 'idle' || presence.tone === 'done' ? '' : `<span class="conversation-presence ${presence.tone}" title="${esc(presence.label)}"><span class="presence-dot"></span><span class="presence-label">${esc(presence.label)}</span></span>`}
+    <span class="tp-bar-fill"></span>
+    <div class="ck-tools">
+      <button class="btn tool" id="share-task-conversation" data-tool="Share" data-role="${esc(t.role)}" title="Share this conversation" aria-label="Share">${ICON.share}<span class="tool-label">Share</span></button>
+      <button class="btn tool" id="fork-task-agent" data-tool="Fork" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation" aria-label="Fork">${ICON.fork}<span class="tool-label">Fork</span></button>
+      ${S.meta?.hosted ? `<button type="button" class="btn tool" id="local-checkout" data-tool="Work locally" title="Check out this task on your computer" aria-label="Work locally">${ICON.laptop}<span class="tool-label">Work locally</span></button>` : ''}
+      ${copy}
+      <button class="btn tool" id="save-task-template" data-tool="Save as template" title="Save this task’s form as a template, to start new tasks from" aria-label="Save as template">${ICON.template}<span class="tool-label">Save as template</span></button>
+      <span class="tool-sep" aria-hidden="true"></span>
+      ${conversationFullscreenButton()}
+    </div>`;
 }
 
 // The provider stream is an ordered item timeline (Codex ThreadItems / Claude
@@ -25873,10 +25967,10 @@ function socialSignInError(params) {
   return SOCIAL_SIGN_IN_ERRORS[code] ?? `${provider} sign-in failed (${code}).`;
 }
 
-function wireSocialBtn(id, provider, errSelector, requireAcceptance = false) {
+function wireSocialBtn(id, provider, errSelector) {
   $(`#${id}`)?.addEventListener('click', async () => {
     try {
-      if (requireAcceptance) {
+      if ($('#signup-policy-acceptance')?.checked) {
         const acceptance = readPolicyAcceptance('signup');
         const accepted = await feedbackFetch('/api/legal/preaccept', { method: 'POST', headers: { 'content-type': 'application/json' },
           body: JSON.stringify(acceptance) });
@@ -26246,26 +26340,44 @@ function renderLanding() {
   window.onpopstate = () => boot();
 }
 
-function renderLogin() {
+// Sign in and create account are one page, at /login and /signup alike: the
+// social buttons (which do either), then the two forms — side by side on a
+// wide screen, stacked on a phone.
+function renderLogin() { renderAuth('signin'); }
+function renderSignup() { renderAuth('signup'); }
+
+function renderAuth(intent) {
   document.body.classList.remove('landing-active');
-  document.title = `Sign in · ${siteName()}`;
+  document.title = `${intent === 'signup' ? 'Create account' : 'Sign in'} · ${siteName()}`;
   window.onpopstate = () => boot();
-  $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
+  const social = googleBtn('google-btn') + githubBtn('github-btn')
+    + (S.sso ? `<button class="btn" id="sso-btn" type="button"${S.sso.unavailable ? ' disabled title="Company sign-in is temporarily unavailable. Try again in a few minutes."' : ''}>Continue with company SSO</button>` : '');
+  $('#app').innerHTML = `<div class="login-wrap"><div class="login-card auth-card">
     <a href="/" id="login-home" class="login-home">← About ${siteNameMarkup()}</a>
-    <div class="brand" style="margin-bottom:18px">${brandMark()} ${siteNameMarkup()}</div>
+    <div class="brand auth-brand">${brandMark()} ${siteNameMarkup()}</div>
     ${S.justVerified ? '<p class="task-sub" style="color:var(--merged)">✓ Email confirmed. Sign in to continue.</p>' : ''}
-    ${S.pendingInvite ? `<p class="task-sub">You've been invited to a ${siteNameMarkup()} organization. Sign in — or <b>create an account</b> — to accept it.</p>` : ''}
-    <div class="form-row"><label for="email">Email</label><input type="email" id="email" autocomplete="username" /></div>
-    <div class="form-row"><label for="pw">Password</label><input type="password" id="pw" autocomplete="current-password" /></div>
-    <button class="btn primary" id="login-btn" style="width:100%">Sign in</button>
-    ${googleBtn('google-btn')}
-    ${githubBtn('github-btn')}
-    ${S.sso ? `<button class="btn" id="sso-btn" style="width:100%;margin-top:8px"${S.sso.unavailable ? ' disabled title="Company sign-in is temporarily unavailable. Try again in a few minutes."' : ''}>Continue with company SSO</button>` : ''}
-    <a class="btn" id="signup-open" href="/signup" style="width:100%;margin-top:8px">Create account</a>
-    ${S.emailDelivery ? '<div style="text-align:center;margin-top:10px"><a href="#" id="forgot-open" style="color:var(--ink-3);font-size:12px">Forgot password?</a></div>' : ''}
-    <div id="login-err" style="color:var(--danger);font-size:12px;margin-top:8px">${S.signInError ? esc(S.signInError) : ''}</div>
+    ${S.pendingInvite ? '<p class="task-sub">Sign in or create an account with the address your invitation went to.</p>' : ''}
+    ${social ? `<div class="auth-social">${social}</div><div class="auth-err" id="social-err" role="alert">${S.signInError ? esc(S.signInError) : ''}</div><div class="auth-or"><span>or</span></div>` : ''}
+    <div class="auth-forms">
+      <form class="auth-form" id="auth-signin" novalidate aria-labelledby="auth-signin-title">
+        <h2 id="auth-signin-title">Sign in</h2>
+        <div class="form-row"><label for="email">Email</label><input type="email" id="email" autocomplete="username" /></div>
+        <div class="form-row"><span class="auth-label-row"><label for="pw">Password</label>${S.emailDelivery ? '<a href="#" id="forgot-open">Forgot?</a>' : ''}</span><input type="password" id="pw" autocomplete="current-password" /></div>
+        <button class="btn primary" id="login-btn" type="submit">Sign in</button>
+        <div class="auth-err" id="login-err" role="alert">${!social && S.signInError ? esc(S.signInError) : ''}</div>
+      </form>
+      <form class="auth-form" id="auth-signup" novalidate aria-labelledby="auth-signup-title">
+        <h2 id="auth-signup-title">Create account</h2>
+        <div class="form-row"><label for="signup-name">Name</label><input id="signup-name" autocomplete="name" /></div>
+        <div class="form-row"><label for="signup-email">Email</label><input type="email" id="signup-email" autocomplete="email" /></div>
+        <div class="form-row"><label for="signup-pw">Password (10+ characters)</label><input type="password" id="signup-pw" autocomplete="new-password" /></div>
+        ${policyAcceptanceMarkup('signup', 'signup-policy-acceptance')}
+        <button class="btn primary" id="signup-btn" type="submit">Create account</button>
+        <div class="auth-err" id="signup-err" role="alert"></div>
+      </form>
+    </div>
   </div></div>`;
-  const go = async () => {
+  const signIn = async () => {
     const email = $('#email').value.trim();
     const password = $('#pw').value;
     if (!email || !password) {
@@ -26279,23 +26391,60 @@ function renderLogin() {
       if (res.ok) boot(); else $('#login-err').textContent = 'Invalid email or password';
     } catch { $('#login-err').textContent = 'Login failed'; }
   };
-  $('#login-btn').addEventListener('click', go);
+  const signUp = async () => {
+    const name = $('#signup-name').value.trim();
+    const email = $('#signup-email').value.trim();
+    const password = $('#signup-pw').value;
+    let acceptance;
+    const invalidEmail = !email || !$('#signup-email').checkValidity();
+    const validationError = !name ? 'Enter your name.'
+      : invalidEmail ? 'Enter a valid email address.'
+        : password.length < 10 ? 'Password must be at least 10 characters.' : '';
+    if (validationError) {
+      $('#signup-err').textContent = validationError;
+      (!name ? $('#signup-name') : invalidEmail ? $('#signup-email') : $('#signup-pw')).focus();
+      return;
+    }
+    try { acceptance = readPolicyAcceptance('signup'); }
+    catch (error) { $('#signup-err').textContent = error.message; $('#signup-policy-acceptance').focus(); return; }
+    $('#signup-err').textContent = '';
+    try {
+      const res = await feedbackFetch('/api/signup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        name, email, password, acceptedPolicies: acceptance.accepted, policyVersions: acceptance.versions,
+      }) });
+      if (res.ok) return boot();
+      const body = await res.json().catch(() => ({}));
+      // Surface the real reason (Better Auth returns `.message`, e.g. "User already
+      // exists") rather than a blanket "Could not create account".
+      const reason = body.error || body.message || 'Could not create account';
+      if (/already exists/i.test(reason)) {
+        $('#signup-err').textContent = 'An account with that email already exists. Sign in instead.';
+        $('#email').value = email;
+        $('#pw').focus();
+      } else {
+        $('#signup-err').textContent = reason;
+      }
+    } catch {
+      $('#signup-err').textContent = 'Could not create account. Check your connection and try again.';
+    }
+  };
+  $('#auth-signin').addEventListener('submit', (e) => { e.preventDefault(); signIn(); });
+  $('#auth-signup').addEventListener('submit', (e) => { e.preventDefault(); signUp(); });
   $('#login-home')?.addEventListener('click', plainClick(() => openPublicAuth('/', renderLanding)));
-  wireSocialBtn('google-btn', 'google', '#login-err');
-  wireSocialBtn('github-btn', 'github', '#login-err');
+  // One pair of social buttons serves both forms: a new account made with them
+  // records the policies when the sign-up box is ticked, and is asked for them
+  // on arrival otherwise (renderPolicyCompletion).
+  wireSocialBtn('google-btn', 'google', '#social-err');
+  wireSocialBtn('github-btn', 'github', '#social-err');
   $('#sso-btn')?.addEventListener('click', async () => {
     try {
       const response = await feedbackFetch('/api/sso/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ callbackURL: location.href }) });
       const result = await response.json();
       if (!response.ok || !result.url) throw new Error(result.error || 'SSO unavailable');
       location.href = result.url;
-    } catch (error) { $('#login-err').textContent = error.message; }
+    } catch (error) { $('#social-err').textContent = error.message; }
   });
-  // An invitee stays on the invitation link: boot() accepts it once the account
-  // exists, and /signup would drop its token.
-  $('#signup-open').addEventListener('click', plainClick(() => S.pendingInvite ? renderSignup() : openPublicAuth('/signup', renderSignup)));
   $('#forgot-open')?.addEventListener('click', (e) => { e.preventDefault(); renderForgotPassword(); });
-  $('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 
 // Request a password-reset email. Better Auth mails a link back to /reset-password
@@ -26365,69 +26514,6 @@ function renderResetPassword(token) {
   $('#reset-btn')?.addEventListener('click', go);
   $('#reset-back').addEventListener('click', plainClick(() => { history.replaceState({ kx: 1 }, '', '/login'); renderLogin(); }));
   $('#reset-pw')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
-}
-
-function renderSignup() {
-  document.body.classList.remove('landing-active');
-  document.title = `Create account · ${siteName()}`;
-  window.onpopstate = () => boot();
-  $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px">${brandMark()} Create account</div>
-    ${S.pendingInvite
-      ? '<p class="task-sub">Accepting an invitation — <b>use the email address it was sent to</b>, or the invite won\'t match.</p>'
-      : '<p class="task-sub">You\'ll start in your own personal workspace, ready to create a project. You can be invited into other organizations too.</p>'}
-    <div class="form-row"><label for="signup-name">Name</label><input id="signup-name" autocomplete="name" /></div>
-    <div class="form-row"><label for="signup-email">Email</label><input type="email" id="signup-email" autocomplete="username" /></div>
-    <div class="form-row"><label for="signup-pw">Password (10+ characters)</label><input type="password" id="signup-pw" autocomplete="new-password" /></div>
-    ${policyAcceptanceMarkup('signup', 'signup-policy-acceptance')}
-    <button class="btn primary" id="signup-btn" style="width:100%">Create account</button>
-    ${googleBtn('signup-google-btn')}
-    ${githubBtn('signup-github-btn')}
-    <a class="btn" id="signup-back" href="/login" style="width:100%;margin-top:8px">Back to sign in</a>
-    <div id="signup-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
-  </div></div>`;
-  const go = async () => {
-    const name = $('#signup-name').value.trim();
-    const email = $('#signup-email').value.trim();
-    const password = $('#signup-pw').value;
-    let acceptance;
-    const invalidEmail = !email || !$('#signup-email').checkValidity();
-    const validationError = !name ? 'Enter your name.'
-      : invalidEmail ? 'Enter a valid email address.'
-        : password.length < 10 ? 'Password must be at least 10 characters.' : '';
-    if (validationError) {
-      $('#signup-err').textContent = validationError;
-      (!name ? $('#signup-name') : invalidEmail ? $('#signup-email') : $('#signup-pw')).focus();
-      return;
-    }
-    try { acceptance = readPolicyAcceptance('signup'); }
-    catch (error) { $('#signup-err').textContent = error.message; $('#signup-policy-acceptance').focus(); return; }
-    $('#signup-err').textContent = '';
-    try {
-      const res = await feedbackFetch('/api/signup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-        name, email, password, acceptedPolicies: acceptance.accepted, policyVersions: acceptance.versions,
-      }) });
-      if (res.ok) return boot();
-      const body = await res.json().catch(() => ({}));
-      // Surface the real reason (Better Auth returns `.message`, e.g. "User already
-      // exists") rather than a blanket "Could not create account".
-      const reason = body.error || body.message || 'Could not create account';
-      const el = $('#signup-err');
-      if (/already exists/i.test(reason)) {
-        el.innerHTML = `An account with that email already exists. <a href="/login" id="signup-to-login" style="color:var(--accent)">Sign in instead</a> — or reset your password.`;
-        $('#signup-to-login')?.addEventListener('click', plainClick(() => (S.pendingInvite ? renderLogin() : openPublicAuth('/login', renderLogin))));
-      } else {
-        el.textContent = reason;
-      }
-    } catch {
-      $('#signup-err').textContent = 'Could not create account. Check your connection and try again.';
-    }
-  };
-  $('#signup-btn').addEventListener('click', go);
-  wireSocialBtn('signup-google-btn', 'google', '#signup-err', true);
-  wireSocialBtn('signup-github-btn', 'github', '#signup-err', true);
-  $('#signup-back').addEventListener('click', plainClick(() => S.pendingInvite ? renderLogin() : openPublicAuth('/login', renderLogin)));
-  $('#signup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 
 function renderPolicyCompletion() {

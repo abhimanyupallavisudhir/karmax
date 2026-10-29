@@ -31,7 +31,8 @@ for (const fullscreen of [false, true]) {
         toast = () => {}; refreshTask = async () => {}; refreshTasks = async () => {};
         renderTaskPage = () => {
           const focus = captureFollowupFocus(document.getElementById('main'));
-          patchTaskPage(document.getElementById('main'), checkinTab(S.view));
+          // The conversation under its toolbar (full screen's button), as on the task page.
+          patchTaskPage(document.getElementById('main'), '<div class="task-page">' + taskBar(S.view, 'checkin') + checkinTab(S.view) + '</div>');
           wireFollowups(S.view); wireCheckinSidebar(S.view);
           restoreFollowupFocus(document.getElementById('main'), focus);
         };

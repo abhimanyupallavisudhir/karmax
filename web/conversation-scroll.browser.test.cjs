@@ -25,15 +25,15 @@ function fn(name) {
       window.$ = (s) => document.querySelector(s);
       window.S = { view: { taskId: 'a', title: 'Conversation', actions: [] }, taskTab: 'checkin' };
       window.TASK_TABS = [];
-      for (const name of ['taskRecord', 'parentTaskContext', 'taskBreadcrumb', 'stageIndicator', 'workflowLabel', 'customBranch', 'mergeQueueBadge', 'pullRequestLinks', 'diskMeter', 'taskAttempts', 'taskActions', 'captureFocus', 'captureFollowupFocus', 'captureThreadSelection', 'restoreThreadSelection', 'restoreFocus', 'restoreFollowupFocus', 'closeTask', 'taskBackRoute', 'wireAttempts', 'wireStageTransitions', 'wireWorkflowMode', 'wireTiming', 'wireNotes', 'wireResourceInventory', 'loadReviewThumbnails', 'wireActions', 'wireTaskOrg', 'wireResourceReview', 'wireReviewActions', 'wireTaskApprovalRequests', 'wireCheckinSidebar', 'wireFollowups', 'wireTerminal', 'wireExplainMessages', 'wireCopyButtons', 'wireMessageCopies', 'typesetMath', 'shouldFocusTaskBody', 'pipeline', 'taskRail', 'wireTaskRail', 'paintApprovalHistory']) window[name] = () => '';
+      for (const name of ['taskRecord', 'parentTaskContext', 'taskBreadcrumb', 'stageIndicator', 'workflowLabel', 'customBranch', 'mergeQueueBadge', 'pullRequestMenu', 'wirePullRequestMenu', 'checkinSelection', 'taskTranscripts', 'wireChromeTuck', 'diskMeter', 'taskAttempts', 'taskActions', 'captureFocus', 'captureFollowupFocus', 'captureThreadSelection', 'restoreThreadSelection', 'restoreFocus', 'restoreFollowupFocus', 'closeTask', 'taskBackRoute', 'wireAttempts', 'wireStageTransitions', 'wireWorkflowMode', 'wireTiming', 'wireNotes', 'wireResourceInventory', 'loadReviewThumbnails', 'wireActions', 'wireTaskOrg', 'wireResourceReview', 'wireReviewActions', 'wireTaskApprovalRequests', 'wireCheckinSidebar', 'wireFollowups', 'wireTerminal', 'wireExplainMessages', 'wireCopyButtons', 'wireMessageCopies', 'typesetMath', 'shouldFocusTaskBody', 'pipeline', 'taskRail', 'wireTaskRail', 'paintApprovalHistory']) window[name] = () => '';
       window.taskRailOpen = () => false;
-      window.ICON = { sidebar: '' };
+      window.ICON = { sidebar: '', chat: '', sliders: '', clock: '' };
       window.esc = (s) => String(s ?? '');
       window.taskUrl = () => '/task/a';
       window.role = 'do'; window.count = 30; window.extra = 0;
       window.taskTabBody = () => `<div class="ck-layout"><div class="ck-side">Agents</div><div class="ck-pane"><div class="ck-thread" id="ck-thread" data-task-id="${S.view.taskId}" data-role="${role}"><div class="thread">${Array.from({ length: count }, (_, i) => `<div class="entry" data-conversation-key="${i}">${i === 0 ? 'Extra<br>'.repeat(extra) : ''}Message ${i}<details><summary>Details</summary><pre>Output</pre></details></div>`).join('')}</div></div></div></div>`;
     });
-    await page.addScriptTag({ content: ['isNewTabClick', 'plainClick', 'visibleTaskTabs', 'captureConversationScroll', 'restoreConversationScroll', 'settleConversation', 'rememberConversationFolds', 'retainedTaskNodes', 'retainsLiveChild', 'syncAttributes', 'patchChildren', 'patchConversationRows', 'patchTaskPage', 'renderTaskPage'].map(fn).join('\n') });
+    await page.addScriptTag({ content: ['isNewTabClick', 'plainClick', 'visibleTaskTabs', 'captureConversationScroll', 'restoreConversationScroll', 'settleConversation', 'rememberConversationFolds', 'retainedTaskNodes', 'retainsLiveChild', 'syncAttributes', 'patchChildren', 'patchConversationRows', 'patchTaskPage', 'taskBar', 'renderTaskPage'].map(fn).join('\n') });
     const result = await page.evaluate(() => {
       renderTaskPage();
       const thread = document.getElementById('ck-thread');
