@@ -877,8 +877,7 @@ a.git-repo-name:hover { color:var(--accent); }
 .tp-head h2 { font-size: 17px; margin: 0; flex: 1; letter-spacing: -0.01em; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tp-head .row1 .task-num { font-size: 13px; }
 /* Where the task lives: project › parent task, one quiet line above the title. */
-.tp-head:has(> .tp-crumbs) { padding-top: 10px; }
-.tp-head > .tp-crumbs { display: flex; align-items: center; gap: 6px; min-width: 0; padding-left: 72px; padding-bottom: 4px; font-size: 12px; line-height: 18px; color: var(--ink-3); }
+.tp-crumbs { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 12px; line-height: 18px; color: var(--ink-3); }
 .tp-crumb {
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   padding: 0; border: 0; background: transparent; font: inherit; color: var(--ink-2); font-weight: 500;
@@ -898,21 +897,39 @@ a.git-repo-name:hover { color:var(--accent); }
 .tp-foot-inner { max-width: 960px; margin: 0 auto; padding: 0 28px; display: flex; gap: 8px; align-items: center; }
 .tp-foot-inner > .actions { flex: 1; }
 
-/* The task page proper: one header row (where it is, what it is, its stage,
-   its two views), then the conversation column beside the details rail. The
-   header spans the page; the thread and its dock share one centred column. */
-.tp-head.wide { padding: 10px 20px; }
+/* The task page proper: a top line (where it is · its stage · its pull
+   requests), the title, then one toolbar (the two views, the conversation's
+   tools, the details rail); under them the conversation column beside the
+   details rail. The thread and its dock share one centred column. */
+.tp-head.wide { padding: 6px 20px 8px; }
 .tp-head.wide > * { max-width: none; padding: 0; }
-.tp-head.wide > .tp-crumbs { padding-left: 44px; }
-.tp-head.wide .row1 { flex-wrap: wrap; row-gap: 6px; }
-.tp-head.wide .row1 > .pr-link, .tp-head.wide .row1 > .chip { flex: none; }
+.tp-topline { display: flex; align-items: center; gap: 10px; min-height: 24px; margin-bottom: 2px; font-size: 12px; }
+.tp-head.wide > .tp-topline { padding-left: 44px; } /* the project lines up with the task number */
+.tp-topline > .tp-crumbs { flex: 1 1 auto; }
+.tp-status { display: inline-flex; align-items: center; gap: 8px; flex: none; margin-left: auto; }
 .tp-stage { display: inline-flex; align-items: center; gap: 8px; flex: none; }
 .tp-stage .pipeline .seg { width: 12px; height: 4px; }
 .tp-stage .pipeline .ponr { width: 7px; height: 7px; }
+/* Several pull requests fold into "PRs N"; the list drops below it. */
+.tp-prs { position: relative; flex: none; }
+.tp-prs > summary { list-style: none; cursor: pointer; }
+.tp-prs > summary::-webkit-details-marker { display: none; }
+.tp-prs-menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 35;
+  display: flex; flex-direction: column; align-items: flex-start; gap: 10px;
+  width: max-content; max-width: min(380px, calc(100vw - 24px)); padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--surface); box-shadow: var(--shadow);
+}
+.tp-prs-menu .pr-link { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tp-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; min-height: 40px; padding: 5px 14px 5px 20px; border-bottom: 1px solid var(--line); background: var(--surface); }
+.tp-bar-fill { flex: 1; }
+.tp-bar .ck-tools { margin-right: 0; }
+.tp-bar .tool-sep { flex: none; width: 1px; height: 16px; background: var(--line); }
 .tp-views { flex: none; }
-.tp-views .tab { padding: 3px 12px; margin: 0; border: 0; border-radius: 6px; color: var(--ink-3); font-size: 12.5px; font-weight: 500; text-decoration: none; }
+.tp-views .tab { display: grid; place-items: center; width: 32px; height: 24px; padding: 0; margin: 0; border: 0; border-radius: 6px; color: var(--ink-3); text-decoration: none; }
+.tp-views .tab svg { display: block; }
 .tp-views .tab:hover { color: var(--ink); }
-.tp-views .tab.active { background: var(--surface); color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgb(0 0 0 / .1); }
+.tp-views .tab.active { background: var(--surface); color: var(--ink); box-shadow: 0 1px 2px rgb(0 0 0 / .1); }
 .tp-rail-toggle { flex: none; }
 .task-page:not(.rail-closed) .tp-rail-toggle { color: var(--accent); }
 .tp-main { flex: 1; min-height: 0; display: flex; position: relative; }
@@ -1085,7 +1102,9 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
 .ck-live { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); flex: none; animation: pulse 1.4s ease-in-out infinite; }
 .ck-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
 /* Conversation focus view stays below dialogs, menus and notifications. */
-.ck-pane.ck-fullscreen { position: fixed; inset: 0; z-index: 40; height: var(--visible-height, 100%); background: var(--paper); }
+/* Full screen keeps the conversation, its toolbar and its composer. */
+.task-page:has(.ck-pane.ck-fullscreen) { position: fixed; inset: 0; z-index: 40; height: var(--visible-height, 100%); background: var(--paper); }
+.task-page:has(.ck-pane.ck-fullscreen) :is(.tp-head, .tp-rail, .tp-foot, .tp-views, .tp-rail-sep, .tp-rail-toggle) { display: none; }
 .ck-pane-head { display: flex; align-items: center; gap: 10px; padding: 6px 20px; min-height: 40px; box-sizing: border-box; border-bottom: 1px solid var(--line); background: var(--surface); flex-wrap: wrap; }
 .ck-tools { display: inline-flex; align-items: center; gap: 2px; margin-right: -6px; }
 .ck-tools .tool-sep { width: 1px; height: 16px; margin: 0 4px; background: var(--line); }
@@ -1094,6 +1113,10 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
   .ck-tools .tool-label { display: none; }
   .ck-tools .btn.tool { width: 32px; padding: 0; justify-content: center; }
   .ck-pane-head { padding: 4px 12px; }
+  .tp-bar .ck-tools .btn.tool { width: 30px; }
+  /* The stage on the top line already says it; the dot keeps the toolbar one line. */
+  .tp-bar .conversation-presence { padding: 2px 4px; }
+  .tp-bar .conversation-presence .presence-label { display: none; }
 }
 /* min-height:0 lets the thread SHRINK below its content (a flex item's default
    min-height is the content size) — without it a long conversation grows the
@@ -1162,9 +1185,6 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
 .fork-tree .fork-tree { margin: 0 0 0 16px; padding: 0 0 0 8px; border-left: 1px solid var(--line); }
 .fork-tree-item { margin: 0; padding: 0; }
 
-@media (max-width: 700px) {
-  .tp-head > .tp-crumbs { padding-left: 28px; }
-}
 
 /* thread — a reading surface (Gemini-like): the agent's answers are prose on
    the page, unboxed, at body size; a person's turn is a soft tinted bubble on
@@ -2268,6 +2288,35 @@ html[data-theme="light"] .landing-theme .moon { display: block; }
 .login-card { width: 320px; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 28px; box-shadow: var(--shadow); }
 .login-home { display: inline-block; margin-bottom: 18px; color: var(--ink-3); font-size: 12px; }
 .login-home:hover { color: var(--accent); }
+/* Sign in and create account on one card: social buttons (either), "or", then
+   the two forms side by side; stacked on a phone, the short one first. */
+.login-wrap:has(.auth-card) { height: auto; min-height: 100dvh; padding: 24px 16px; }
+.auth-card { width: min(720px, 100%); }
+.auth-brand { margin-bottom: 18px; }
+.auth-social { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; }
+.auth-social > * { width: 100%; margin: 0; }
+.auth-social > .btn { justify-content: center; height: 40px; }
+.auth-or { display: flex; align-items: center; gap: 12px; margin: 18px 0; color: var(--ink-3); font-size: 12px; }
+.auth-or::before, .auth-or::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+.auth-forms { display: grid; grid-template-columns: 1fr 1fr; }
+.auth-form { display: flex; flex-direction: column; min-width: 0; padding: 0 28px; }
+.auth-form:first-child { padding-left: 0; }
+.auth-form + .auth-form { padding-right: 0; border-left: 1px solid var(--line); }
+.auth-form h2 { margin: 0 0 12px; font-size: 15px; font-weight: 650; letter-spacing: -.01em; }
+.auth-form > .btn { width: 100%; }
+.auth-form .policy-acceptance { margin: 4px 0 14px; }
+.auth-label-row { display: flex; align-items: baseline; justify-content: space-between; }
+.auth-label-row a { color: var(--ink-3); font-size: 12px; }
+.auth-label-row a:hover { color: var(--accent); }
+.auth-err { min-height: 0; margin-top: 8px; color: var(--danger); font-size: 12px; }
+.auth-err:empty { display: none; }
+@media (max-width: 640px) {
+  .login-wrap:has(.auth-card) { place-items: start stretch; padding: 0; background: var(--surface); }
+  .auth-card { border: 0; border-radius: 0; box-shadow: none; padding: 16px 20px 32px; }
+  .auth-forms { grid-template-columns: 1fr; }
+  .auth-form, .auth-form:first-child { padding: 0; }
+  .auth-form + .auth-form { margin-top: 24px; padding-top: 20px; border-left: 0; border-top: 1px solid var(--line); }
+}
 .google-signin-btn {
   width: 100%; height: 40px; margin-top: 8px; padding: 0 12px;
   display: grid; grid-template-columns: 20px 1fr 20px; align-items: center; column-gap: 10px;
@@ -2423,12 +2472,19 @@ html[data-theme="dark"] .github-signin-btn:active,
   .tp-content { padding: 16px 16px 40px; }
   .tp-foot { padding: 10px 0; }
   .tp-foot-inner { padding: 0 16px; }
-  .tp-head.wide { padding: 8px 12px; }
-  .tp-head.wide h2 { flex-basis: calc(100% - 90px); }
-  .tp-views .tab { padding: 3px 10px; }
+  .tp-head.wide { padding: 6px 12px 8px; }
+  .tp-head.wide h2 { font-size: 16px; }
+  .tp-head.wide > .tp-topline { padding-left: 0; gap: 8px; }
   .tp-stage .pipeline { display: none; }
-  .tp-head.wide .tp-views { margin-left: auto; }
-  .tp-head.wide > .tp-crumbs { padding-left: 0; }
+  .tp-bar { gap: 4px 6px; padding: 4px 8px 4px 12px; }
+  /* Scrolling down the page tucks its top away (wireChromeTuck): the app bar
+     slides up, the header and toolbar fold to nothing. */
+  .topbar { transition: margin-top .2s ease; }
+  html.chrome-tucked #app:has(.task-page) > .topbar { margin-top: -52px; }
+  .tp-chrome { display: grid; grid-template-rows: 1fr; transition: grid-template-rows .2s ease; }
+  .tp-chrome-inner { min-height: 0; overflow: hidden; }
+  .tp-chrome-inner:has(.tp-prs[open]) { overflow: visible; }
+  html.chrome-tucked .tp-chrome { grid-template-rows: 0fr; }
   .tp-col .tp-content { padding: 16px 16px 40px; }
   .tp-col .tp-foot-inner { padding: 0 16px; }
 }

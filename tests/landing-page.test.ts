@@ -35,17 +35,57 @@ describe('public landing page', () => {
       const ui = await consolePage({ path, api: signedOut });
       await ui.run('boot()');
       await ui.page.locator('#app > *').first().waitFor();
+      // Sign in and create account are one page; its title names what was asked for.
       const shown = await ui.run<string>(`document.querySelector('#landing-main') ? 'landing'
-        : document.querySelector('#signup-btn') ? 'signup'
-          : document.querySelector('#login-btn') ? 'login' : document.getElementById('app').innerText.slice(0, 80)`);
+        : document.querySelector('#auth-signin #login-btn') && document.querySelector('#auth-signup #signup-btn') ? document.title.split(' · ')[0]
+          : document.getElementById('app').innerText.slice(0, 80)`);
       await ui.close();
       return shown;
     };
     expect(await screen('/')).toBe('landing');
-    expect(await screen('/login')).toBe('login');
-    expect(await screen('/signup')).toBe('signup');
-    expect(await screen('/invite?token=invitation')).toBe('login');
-    expect(await screen('/?error=access_denied')).toBe('login');
+    expect(await screen('/login')).toBe('Sign in');
+    expect(await screen('/signup')).toBe('Create account');
+    expect(await screen('/invite?token=invitation')).toBe('Sign in');
+    expect(await screen('/?error=access_denied')).toBe('Sign in');
+  });
+
+  it('signs in and creates accounts on one page, with the social buttons for both', async () => {
+    const api = ({ method, path }: { method: string; path: string }) => path === '/api/session'
+      ? { authRequired: true, authenticated: false, google: true, github: true }
+      : method === 'POST' && path === '/api/signup' ? { status: 422, json: { message: 'User already exists. Use another email.' } }
+        : method === 'POST' && path === '/api/legal/preaccept' ? { ok: true }
+          : method === 'POST' && path === '/api/auth/sign-in/social' ? { status: 500, json: { error: 'stop here' } }
+            : signedOut({ path });
+    const ui = await consolePage({ path: '/signup', api, viewport: { width: 390, height: 844 } });
+    const { page } = ui;
+    await ui.run('boot()');
+    const signIn = page.getByRole('form', { name: 'Sign in' });
+    const signUp = page.getByRole('form', { name: 'Create account' });
+    await signUp.waitFor();
+    // A phone stacks them, the short sign-in first, under the social buttons.
+    const tops = await page.evaluate(() => ['.auth-social', '#auth-signin', '#auth-signup']
+      .map((selector) => document.querySelector(selector).getBoundingClientRect().top));
+    expect(tops).toEqual([...tops].sort((a, b) => a - b));
+    expect(await page.locator('#signup-open, #signup-back').count()).toBe(0);
+
+    // A social button records the policies only when the sign-up box is ticked.
+    await page.locator('#google-btn').click();
+    await page.locator('#social-err').getByText('stop here').waitFor();
+    expect(ui.calls.some((call) => call.path === '/api/legal/preaccept')).toBe(false);
+    await page.locator('#signup-policy-acceptance').check();
+    await page.locator('#github-btn').click();
+    await expect.poll(() => ui.calls.filter((call) => call.path === '/api/legal/preaccept').length).toBe(1);
+
+    // An address that already has an account is handed to the sign-in form.
+    await signUp.getByLabel('Name').fill('Ann');
+    await signUp.getByLabel('Email').fill('ann@example.test');
+    await signUp.getByLabel('Password (10+ characters)').fill('long-enough-password');
+    await signUp.getByLabel('Password (10+ characters)').press('Enter');
+    await signUp.getByText('An account with that email already exists. Sign in instead.').waitFor();
+    expect(await signIn.getByLabel('Email').inputValue()).toBe('ann@example.test');
+    expect(await page.evaluate(() => document.activeElement.id)).toBe('pw');
+    expect(ui.errors).toEqual([]);
+    await ui.close();
   });
 
   it('carries the product thesis and each promised capability', async () => {

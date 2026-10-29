@@ -1,5 +1,7 @@
-// Real browser regression: the task page header stays compact. The title, its
-// pull requests, its stage and the Chat/Parameters switch share one line;
+// Real browser regression: the task page header stays compact. Where the task
+// lives, its stage and its pull requests (several fold into "PRs N") share the
+// top line, the title has the next, and the views (icons), the conversation's
+// tools and the details toggle share one toolbar;
 // attempts head the details rail with the New attempt action; priority and tags live
 // in the details rail; the workflow name/version live on Parameters only. Tasks
 // open on Chat, its toolbar actions share one size, and a draft attempt opens its form.
@@ -51,7 +53,7 @@ const attempt = (n, extra = {}) => ({
       const file = path.join(root, p === '/' ? 'index.html' : p);
       if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return route.abort();
       let body = fs.readFileSync(p === '/app.js' && process.env.APP_SOURCE || file, 'utf8');
-      if (p === '/app.js') body = body.replace(/^boot\(\)\.catch\(.*$/m, 'window.headerTest = { S, openTask, setTaskTab }; installLinkRouter();');
+      if (p === '/app.js') body = body.replace(/^boot\(\)\.catch\(.*$/m, 'window.headerTest = { S, openTask, setTaskTab, renderTaskPage }; installLinkRouter();');
       return route.fulfill({ body, contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html' });
     });
     await page.goto('http://header.test/');
@@ -84,7 +86,10 @@ const attempt = (n, extra = {}) => ({
         attemptsInHead: head.querySelectorAll('.attempt-card, #add-attempt').length,
         attemptsFirstInRail: document.querySelector('#tp-rail .rail-inner > :first-child')?.querySelectorAll('.attempt-card').length,
         cardHeight: Math.max(...[...document.querySelectorAll('#tp-rail .attempt-card')].map((el) => el.getBoundingClientRect().height)),
-        titleRows: new Set([...head.querySelectorAll('.row1 h2, .row1 .pr-link, .tp-stage, .tp-views, #tp-rail-toggle')].map(top)).size,
+        toplineRows: new Set([...head.querySelectorAll('.tp-crumbs, .tp-stage, .tp-prs > summary')].map(top)).size,
+        toplineAboveTitle: top(head.querySelector('.tp-stage')) < top(head.querySelector('.row1 h2')),
+        barRows: new Set([...document.querySelectorAll('.tp-bar .tp-views, .tp-bar .ck-tools, .tp-bar #tp-rail-toggle')].map(top)).size,
+        prLinksShown: [...head.querySelectorAll('.pr-link')].filter((el) => el.checkVisibility()).length,
         orgInRail: !!document.querySelector('#tp-rail .org-priority') && !head.querySelector('.org-priority'),
         headHeight: head.getBoundingClientRect().height,
       };
@@ -106,16 +111,31 @@ const attempt = (n, extra = {}) => ({
     assert.equal(layout.attemptsInHead, 0, 'attempts are not in the header');
     assert.equal(layout.attemptsFirstInRail, 3, 'attempts head the details rail');
     assert.ok(layout.cardHeight <= 32, `attempt cards are single-line (${layout.cardHeight}px)`);
-    assert.equal(layout.titleRows, 1, 'the title, its pull requests, its stage and the view switch share one line');
+    assert.equal(layout.toplineRows, 1, 'the project, the stage and the pull requests share one line');
+    assert.equal(layout.toplineAboveTitle, true, 'that line is above the title');
+    assert.equal(layout.barRows, 1, 'the views, the conversation tools and the details toggle share one toolbar');
+    assert.equal(layout.prLinksShown, 1, 'two pull requests fold into one "PRs" control');
     assert.equal(layout.orgInRail, true, 'priority and tags live in the details rail');
-    assert.ok(layout.headHeight <= 120, `header is compact (${layout.headHeight}px)`);
+    assert.ok(layout.headHeight <= 80, `header is compact (${layout.headHeight}px)`);
+
+    // "PRs 2" opens the list, which a refresh keeps open and a click elsewhere closes.
+    const prs = page.locator('.tp-head .tp-prs');
+    assert.match(await prs.locator('summary').innerText(), /PRs\s*2/);
+    await prs.locator('summary').click();
+    assert.deepEqual(await prs.locator('.tp-prs-menu .pr-link').evaluateAll((links) => links.map((a) => a.textContent.replace(/\s+/g, ' ').trim())),
+      ['⇱ videos #1open', '⇱ videos-wiki #1open']);
+    await page.evaluate(() => window.headerTest.renderTaskPage());
+    assert.equal(await page.locator('.tp-head .tp-prs[open]').count(), 1, 'a refresh keeps the list open');
+    await page.locator('.tp-head h2').click();
+    assert.equal(await page.locator('.tp-head .tp-prs[open]').count(), 0, 'a click elsewhere closes it');
 
     // Without a pinned tab a task opens on Check-in, whose toolbar is one quiet row.
     await open(undefined);
     await page.waitForSelector('#fork-task-agent');
-    assert.equal(await page.locator('.tp-views .tab.active').innerText(), 'Chat');
-    assert.deepEqual(await page.locator('.tp-views .tab').allInnerTexts(), ['Chat', 'Parameters'], 'two views: the conversation and the parameters');
-    await shot('task-checkin-toolbar.png', '.task-page .ck-pane-head');
+    assert.equal(await page.locator('.tp-views .tab.active').getAttribute('aria-label'), 'Chat');
+    assert.deepEqual(await page.locator('.tp-views .tab').evaluateAll((tabs) => tabs.map((a) => [a.getAttribute('aria-label'), a.textContent.trim(), !!a.querySelector('svg')])),
+      [['Chat', '', true], ['Parameters', '', true]], 'two views, as icons: the conversation and the parameters');
+    await shot('task-checkin-toolbar.png', '.task-page .tp-bar');
     const tools = await page.evaluate(() => [...document.querySelectorAll('.ck-tools .btn')]
       .map((el) => Math.round(el.getBoundingClientRect().height)));
     assert.ok(tools.length === 5 && tools.every((h) => h === 28), `toolbar actions share one size (${tools})`);

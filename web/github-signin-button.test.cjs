@@ -1,5 +1,5 @@
 // GitHub login should sit beside Google as a recognizable, accessible identity
-// option on both sign-in and account creation. Run: node web/github-signin-button.test.cjs
+// option on the one page that signs in and creates accounts. Run: node web/github-signin-button.test.cjs
 const fs = require('fs');
 const path = require('path');
 
@@ -18,14 +18,13 @@ function ok(condition, message) {
 ok(/class="github-signin-btn"/.test(githubButton), 'GitHub uses a dedicated branded button');
 ok(/<svg[^>]+aria-hidden="true"/.test(githubButton), 'button includes a decorative GitHub mark');
 ok(/Continue with GitHub/.test(githubButton), 'button names the GitHub sign-in action');
-ok(/githubBtn\('github-btn'\)/.test(app), 'GitHub appears on sign-in');
-ok(/githubBtn\('signup-github-btn'\)/.test(app), 'GitHub appears on account creation');
-ok(/wireSocialBtn\('github-btn',\s*'github'/.test(app), 'sign-in button starts the GitHub provider');
-ok(/wireSocialBtn\('signup-github-btn',\s*'github'/.test(app), 'sign-up button starts the GitHub provider');
+ok(/githubBtn\('github-btn'\)/.test(app), 'GitHub appears on the sign-in page');
+ok(/wireSocialBtn\('github-btn',\s*'github'/.test(app), 'the button starts the GitHub provider');
+ok(!/signup-github-btn|signup-google-btn/.test(app), 'one pair of social buttons serves sign-in and account creation');
 ok(/\.github-signin-btn\s*\{[\s\S]*?background:\s*#24292f/.test(styles), 'light button uses GitHub dark fill');
 ok(/data-theme="dark"[^}]*\.github-signin-btn[\s\S]*?background:\s*#f0f6fc/.test(styles),
   'dark theme uses GitHub light treatment');
 ok(/\.github-signin-btn:focus-visible/.test(styles), 'button has a visible keyboard focus treatment');
 
-console.log(`\n${10 - failed} passed, ${failed} failed`);
+console.log(`\n${9 - failed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
