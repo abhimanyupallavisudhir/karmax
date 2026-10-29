@@ -208,3 +208,36 @@ describe('waiting for compute credit', () => {
     expect(hadLiveWorldWork(outOfCompute)).toBe(true);
   });
 });
+
+describe('a VM world resized to a bigger machine', () => {
+  it('holds at the size it now runs at, not the size it was made at', async () => {
+    // Production, 2026-10-29: a Hetzner world made at 2 vCPU and moved to 4
+    // kept `meta.machine` at 2 vCPU, so its holds reserved half its rate.
+    vi.stubEnv('KARMAX_AGENT_PROVIDER', 'mock');
+    cleanups.push(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+    const f = await fixture();
+    const task = await f.task('Resized');
+    const worlds = new WorldRegistry();
+    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+    cleanups.push(() => world.destroy());
+    const booked = (id: string, cpu: number, memoryMb: number, costMicros: number, endedAt: number) => f.store.recordUsage({
+      id: `usage:memory:${id}`, organizationId: f.organization.id, taskId: task.id, worldId: task.id, provider: 'memory',
+      kind: 'world.active', quantity: 3600, unit: 'second', costMicros, startedAt: endedAt - 3_600_000, endedAt,
+      fundingSource: 'managed', metadata: { cpu, memoryMb } });
+    await booked('small', 2, 4096, 44_226, Date.now() - 30 * MIN);
+    await booked('big', 4, 8192, 79_911, Date.now() + 30 * MIN);
+    await f.store.setComputePackGift(f.organization.id, 1, 'operator');
+    vi.spyOn(Context, 'current').mockImplementation(() => ({ info: { attempt: 1, activityId: 'turn', workflowExecution: { runId: 'run' } },
+      cancellationSignal: new AbortController().signal, heartbeat: () => {} }) as any);
+    const runTurn = vi.fn(async (input: any) => ({ termination: { kind: 'success', status: 'end_turn' }, output: 'done', session: input.session }));
+    const core = makeCoreActivities({ store: f.store, worlds, adapters: new Map([['mock', { provider: 'mock', runTurn }]]) as any,
+      profiles: new ProfileResolver(f.store, 'mock') });
+    const handle = { ...world.handle, meta: { ...world.handle.meta, funding: 'managed',
+      machine: { cpu: 2, memoryMb: 4096, diskGb: 50 }, computer: { cpu: 4, memoryMb: 8192, diskGb: 50 } } };
+    await core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: 'turn-big', agentSlotGranted: true, agentAdmissionManaged: true,
+      worldHandle: handle, session: 'session', deliveredMessages: 0, messages: [{ id: 'm0', role: 'user', text: 'Go', ts: 0 }],
+      task: { taskId: task.id, projectId: f.project.id, title: task.title, prompt: 'work', project: {}, workflow: 'just-do',
+        agents: { do: { provider: 'mock' } } } } as any);
+    expect(await f.store.computeHold('turn:turn-big')).toMatchObject({ activeMicrosPerHour: 79_911, closedAt: expect.any(Number) });
+  }, 30_000);
+});

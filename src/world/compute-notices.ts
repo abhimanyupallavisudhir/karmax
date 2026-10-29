@@ -1,7 +1,7 @@
 import type { Store } from '../store/db.js';
 import type { WorldHandleRef } from '../domain/types.js';
 import { COMPUTE_TERMS, computeChargeMicros } from '../domain/entitlements.js';
-import { isVmWorldProvider } from '../domain/computer.js';
+import { isVmWorldProvider, worldMachine } from '../domain/computer.js';
 import { computeCredit, machineRate } from './managed-compute.js';
 
 const dollars = (micros: number) => `$${(micros / 1e6).toFixed(2)}`;
@@ -38,7 +38,7 @@ export async function parkedManagedDisks(store: Store, organizationId: string): 
       machine?: { cpu?: number; memoryMb?: number; diskGb?: number }; computer?: { cpu?: number; memoryMb?: number; diskGb?: number } } | undefined;
     if (meta?.funding !== 'managed' || !isVmWorldProvider(candidate.handle.kind)) continue;
     if ((await store.getProject(String(meta.projectId ?? '')))?.organizationId !== organizationId) continue;
-    const shape = meta.machine ?? meta.computer;
+    const shape = worldMachine(meta);
     const rate = await machineRate(store, { organizationId, taskId: candidate.handle.id, provider: candidate.handle.kind, shape });
     out.push({ handle: candidate.handle, updatedAt: candidate.updatedAt, provider: candidate.handle.kind,
       ...(shape?.diskGb ? { diskGb: shape.diskGb } : {}), diskMicrosPerHour: rate.diskMicrosPerHour });

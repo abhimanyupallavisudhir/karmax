@@ -169,6 +169,21 @@ export function machineShape(config: Partial<ProjectConfig> | undefined): Machin
   };
 }
 
+/** The machine a world runs on, from its handle's meta: the recorded
+ * `machine`, never smaller than its `computer`. A VM machine starts at its
+ * Computer's CPU and memory; worlds resized before that was recorded kept the
+ * size they were made at in `machine` (wiki features/managed-compute). */
+export function worldMachine(meta: Record<string, unknown> | undefined): MachineShape | undefined {
+  const machine = meta?.machine as MachineShape | undefined;
+  const computer = meta?.computer as MachineShape | undefined;
+  if (!machine || !computer) return machine ?? computer;
+  const larger = (key: keyof MachineShape) => machine[key] == null ? computer[key]
+    : computer[key] == null ? machine[key] : Math.max(machine[key]!, computer[key]!);
+  const shape: MachineShape = {};
+  for (const key of ['cpu', 'memoryMb', 'diskGb'] as const) { const value = larger(key); if (value != null) shape[key] = value; }
+  return shape;
+}
+
 export function sameMachine(a: MachineShape | undefined, b: MachineShape | undefined): boolean {
   return (a?.cpu ?? DEFAULT_MACHINE.cpu) === (b?.cpu ?? DEFAULT_MACHINE.cpu)
     && (a?.memoryMb ?? DEFAULT_MACHINE.memoryMb) === (b?.memoryMb ?? DEFAULT_MACHINE.memoryMb)
