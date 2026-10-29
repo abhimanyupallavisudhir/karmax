@@ -245,6 +245,7 @@ eval(extractFn('conversationWaitNotice'));
 eval(extractFn('contentKey'));
 eval(extractFn('conversationFullscreenButton'));
 eval(extractFn('conversationPane'));
+eval(extractFn('conversationBar'));
 for (const fn of ['humanWaitDetail', 'conversationOutline', 'foldDuration', 'foldPreview', 'conversationFoldHead']) eval(extractFn(fn));
 eval(extractFn('liveOutputFor'));
 eval(extractFn('forkBranchDefaults'));
@@ -272,7 +273,8 @@ for (const status of ['done', 'cancelled', 'waiting']) {
   for (const role of ['do', 'merge', 'confirm', 'resolve']) {
     const html = conversationPane(forkView, { role, messages: [] });
     ok(html.includes('Pending approvals'), `${role} conversation includes pending task approvals`);
-    ok(html.includes('id="fork-task-agent"') && html.includes(`data-role="${role}"`), `${role} conversation offers a task fork without a CLI session`);
+    const bar = conversationBar(forkView, { role, messages: [] });
+    ok(bar.includes('id="fork-task-agent"') && bar.includes(`data-role="${role}"`), `${role} conversation offers a task fork without a CLI session`);
     let click;
     global.$ = (selector) => selector === '#main'
       ? { querySelector: () => null, querySelectorAll: () => [] }

@@ -75,8 +75,9 @@ it('restores a backup over lost state, and the console carries the restored task
   const { page, step, errors } = operator;
   await step('sign in with the restored account', async () => {
     await page.goto(`${app!.url}/login`);
-    await page.getByLabel('Email').fill('rita@example.test');
-    await page.getByLabel('Password').fill(PASSWORD);
+    const signIn = page.getByRole('form', { name: 'Sign in' });
+    await signIn.getByLabel('Email').fill('rita@example.test');
+    await signIn.getByLabel('Password').fill(PASSWORD);
     await page.locator('#login-btn').click();
     await page.locator('#new-project').waitFor();
   });

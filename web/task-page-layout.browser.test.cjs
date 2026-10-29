@@ -74,8 +74,8 @@ const root = __dirname;
     await page.waitForSelector('#tp-rail .subtask-row');
     await page.waitForSelector('.review-info');
     await shot('task-page.png');
-    assert.deepEqual(await page.locator('.tp-views .tab').allInnerTexts(), ['Chat', 'Parameters'], 'two views, no Overview or Approval Requests');
-    assert.equal(await page.locator('.tp-views .tab.active').innerText(), 'Chat', 'a task opens on its conversation');
+    assert.deepEqual(await page.locator('.tp-views .tab').evaluateAll((tabs) => tabs.map((a) => a.getAttribute('aria-label'))), ['Chat', 'Parameters'], 'two views, no Overview or Approval Requests');
+    assert.equal(await page.locator('.tp-views .tab.active').getAttribute('aria-label'), 'Chat', 'a task opens on its conversation');
     const text = await page.locator('.task-page').innerText();
     const count = (needle) => text.split(needle).length - 1;
     assert.equal(count('Toggle lives in Settings'), 1, 'the review shows once, closing the conversation');
@@ -131,7 +131,7 @@ const root = __dirname;
     // A former tab's link opens the conversation.
     await open('overview');
     await page.waitForSelector('.review-info');
-    assert.equal(await page.locator('.tp-views .tab.active').innerText(), 'Chat');
+    assert.equal(await page.locator('.tp-views .tab.active').getAttribute('aria-label'), 'Chat');
 
     // Closing the rail on a wide window sticks across repaints.
     await page.locator('#tp-rail-toggle').click();
@@ -153,6 +153,32 @@ const root = __dirname;
     assert.equal(await page.locator('#tp-rail').isVisible(), true, 'a background repaint keeps the open rail');
     await page.locator('.tp-col').dispatchEvent('pointerdown');
     assert.equal(await page.locator('#tp-rail').isVisible(), false, 'touching the conversation puts it away');
+
+    // A phone: the header is two short lines and one toolbar; scrolling down
+    // the conversation tucks them away, scrolling back up a little returns them.
+    const chrome = () => page.evaluate(() => ({
+      tucked: document.documentElement.classList.contains('chrome-tucked'),
+      height: Math.round(document.querySelector('.tp-chrome').getBoundingClientRect().height),
+    }));
+    const shown = await chrome();
+    assert.equal(shown.tucked, false);
+    assert.ok(shown.height <= 125, `the phone header and toolbar are compact (${shown.height}px)`);
+    await page.evaluate(() => {
+      document.querySelector('#ck-thread .thread').insertAdjacentHTML('afterbegin', '<div style="height:3000px"></div>');
+      document.getElementById('ck-thread').scrollTop = 0;
+    });
+    const box = await page.locator('#ck-thread').boundingBox();
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.wheel(0, 400);
+    await page.waitForTimeout(450);
+    assert.deepEqual(await chrome(), { tucked: true, height: 0 }, 'scrolling down tucks the header and toolbar away');
+    await page.mouse.wheel(0, -60);
+    await page.waitForTimeout(450);
+    assert.deepEqual(await chrome(), shown, 'scrolling up a little brings them back');
+    await page.waitForTimeout(1100);
+    await page.evaluate(() => { document.getElementById('ck-thread').scrollTop += 800; });
+    await page.waitForTimeout(100);
+    assert.equal((await chrome()).tucked, false, 'only a person scrolling tucks them (not a refresh re-pinning the thread)');
     await page.setViewportSize({ width: 1400, height: 900 });
     await page.evaluate(() => window.layoutTest.renderTaskPage());
     assert.equal(await page.locator('#tp-rail').isVisible(), true, 'a narrow window never closes the wide one’s rail');

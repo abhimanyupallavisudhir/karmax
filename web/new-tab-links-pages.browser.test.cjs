@@ -70,10 +70,12 @@ runNewTabChecks(async ({ check, open, opensInNewTab, sameDocument, ORIGIN }) => 
     await opensInNewTab(t, '#landing-sign-in', '/login');
     await page.locator('#landing-sign-in').click();
     await page.waitForURL(`${ORIGIN}/login`);
-    await opensInNewTab(t, '#signup-open', '/signup');
-    await page.locator('#signup-open').click();
+    assert.equal(await page.locator('#auth-signin, #auth-signup').count(), 2, 'one page signs in and creates accounts');
+    await opensInNewTab(t, '#login-home', '/');
+    await page.locator('#login-home').click();
+    await page.locator('#landing-start').click();
     await page.waitForURL(`${ORIGIN}/signup`);
-    await opensInNewTab(t, '#signup-back', '/login');
+    assert.equal(await page.locator('#auth-signin, #auth-signup').count(), 2, 'Get started shows the same page');
     assert.ok(await sameDocument(page), 'no reload');
   }, { signedOut: true });
 

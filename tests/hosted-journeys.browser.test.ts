@@ -66,11 +66,12 @@ class PaddleStub {
   }
 }
 
-/** Fills and submits the console's sign-up card. */
+/** Fills and submits the sign-up form of the console's sign-in page. */
 async function signUp(page: Page, name: string, email: string) {
-  await page.getByLabel('Name').fill(name);
-  await page.getByLabel('Email').fill(email);
-  await page.getByLabel('Password (10+ characters)').fill(PASSWORD);
+  const form = page.getByRole('form', { name: 'Create account' });
+  await form.getByLabel('Name').fill(name);
+  await form.getByLabel('Email').fill(email);
+  await form.getByLabel('Password (10+ characters)').fill(PASSWORD);
   await page.locator('#signup-policy-acceptance').check();
   await page.locator('#signup-btn').click();
 }
@@ -174,9 +175,7 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
 
       const { page, step } = invitee;
       await step('open the emailed link', () => page.goto(link!));
-      await page.getByText('create an account').waitFor();
-      await page.locator('#signup-open').click();
-      await page.getByText('Accepting an invitation').waitFor();
+      await page.getByText('Sign in or create an account with the address your invitation went to.').waitFor();
       await signUp(page, 'Ivan Invitee', 'ivan@example.test');
       // A newcomer lands where the team works, welcomed, not in its settings.
       await step('the invitation is accepted', () => page.getByText('Welcome to Olive Team').waitFor());

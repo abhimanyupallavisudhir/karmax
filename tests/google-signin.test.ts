@@ -351,11 +351,11 @@ describe('Google sign-in when configured', () => {
         errorCallbackURL: 'http://console.test/login?next=%2Ftasks&auth_provider=google' });
     } finally { await login.close(); }
 
-    // Better Auth appends `?error=<code>` to that URL; the card says what happened and the URL is cleaned.
+    // Better Auth appends `?error=<code>` to that URL; the page says what happened, under the social buttons, and the URL is cleaned.
     const back = await consolePage({ path: '/login?next=%2Ftasks&auth_provider=google&error=account_not_linked', api: signedOut });
     try {
       await back.run('boot()');
-      await expect.poll(() => back.page.locator('#login-err').textContent())
+      await expect.poll(() => back.page.locator('#social-err').textContent())
         .toBe('An account already exists for that email address with a password. Sign in with that password instead — social sign-in requires confirming the address first.');
       expect(await back.run<string>('location.pathname + location.search')).toBe('/login?next=%2Ftasks');
     } finally { await back.close(); }

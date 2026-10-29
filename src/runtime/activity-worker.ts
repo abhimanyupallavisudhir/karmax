@@ -52,7 +52,10 @@ export async function createActivityWorkerRuntime(): Promise<WorkerProcessRuntim
     } finally { release(); }
   };
   try {
-    store = await Store.create(database);
+    // Hosted like the primary's: without it every hosted limit an activity
+    // checks (plan entitlements, compute holds and credit) reads as a private
+    // installation's, so managed compute ran unmetered.
+    store = await Store.create(database, { hosted: deployment.hosted });
     await assertDataEpoch(store.db);
     // The primary relays this process's events to browsers; wake it on every
     // commit rather than leaving delivery to its poll (LT-15).

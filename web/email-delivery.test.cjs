@@ -26,8 +26,8 @@ assert.equal(banner({ user: unverified, emailDelivery: false }), '', 'no nag whe
 assert.match(banner({ user: unverified, emailDelivery: true }), /Resend link/, 'the nag when a link can be sent');
 assert.equal(banner({ user: { ...unverified, emailVerified: true }, emailDelivery: true }), '');
 
-const login = fn('renderLogin');
-assert.match(login, /S\.emailDelivery \? '<div[^']*id="forgot-open"/, '"Forgot password?" only when a reset email can be sent');
+const login = fn('renderAuth');
+assert.match(login, /S\.emailDelivery \? '<a[^']*id="forgot-open"/, '"Forgot?" only when a reset email can be sent');
 assert.match(login, /\$\('#forgot-open'\)\?\.addEventListener/, 'wiring tolerates the hidden link');
 assert.match(src, /S\.emailDelivery = session\.emailDelivery === true;/, 'boot reads the gateway’s answer');
 assert.match(src, /S\.emailDelivery \? '<button class="btn sm" id="profile-resend-confirmation"/, 'profile resend follows the same rule');
