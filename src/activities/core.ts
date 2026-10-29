@@ -3037,6 +3037,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Same-provider task forks use the provider's native branch operation. Cross-
       // provider histories, uploads, and public shares go through panagent; API rails
       // and unsupported native targets receive a guarded context message instead.
+      // A forked agent's history is another task's conversation: its first turn
+      // is told which task it now is, so it works here instead of acting as the
+      // source (which once opened yet another task for its own follow-up).
+      let forkNotice: string | undefined;
       if (!session && spec?.resumeFrom) {
         const srcRole = forkSourceRole(spec.resumeFrom, args.role); // a task has many agents; pick the source's
         // A task fork reads the source's conversation, native session and world.
@@ -3061,6 +3065,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               nonRetryable: true,
             });
           }
+          forkNotice = `You are now task #${preparationTask?.num ?? args.taskId}, a fork of task #${source.num ?? source.id}'s ${participantLabel(srcRole)}: `
+            + 'the conversation before this message happened there. Work here, in this task\'s own world and branch'
+            + `${args.worldHandle.branch ? ` ${args.worldHandle.branch}` : ''}, and do what is asked yourself rather than creating a new task for it.`;
           // The fork carries the source's conversation, so what the source
           // received is scrubbed from everything kept about the fork (SS-3).
           (await recordSecretRefs(store, args.taskId, [taskRef(spec.resumeFrom.taskId)]));
@@ -3521,9 +3528,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const last = messages.length - 1;
         if (notice) messages = messages.map((message, index) => index === last ? { ...message, text: `${message.text}\n\n(${notice})` } : message);
       }
+      if (forkNotice && !resumedActivityAttempt && messages.length > (deliveredMessages ?? 0)) {
+        const last = messages.length - 1;
+        messages = messages.map((message, index) => index === last ? { ...message, text: `${message.text}\n\n(${forkNotice})` } : message);
+        forkNotice = undefined;
+      }
       // What the agent should know about its disk rides on the newest message it
       // has not read; with none, on its instructions for this turn.
-      let diskPromptNotice = '';
+      let diskPromptNotice = forkNotice ? `\n\n${forkNotice}` : '';
       if (turnDisk?.notices.length && !resumedActivityAttempt) {
         const text = turnDisk.notices.join('\n\n');
         if (messages.length > (deliveredMessages ?? 0)) {

@@ -194,3 +194,35 @@ it('tells the next Do turn, once, which files its last checkpoint could not save
   expect(delivered[1]![2]).toBe('and again');
   expect(checkpoints.takeNotice).toHaveBeenCalledTimes(2);
 });
+
+// A forked agent's history is its source task's conversation; on its first
+// turn it once took the new task for the old one and opened yet another task
+// for work it should have done itself (tavya #777, 2026-10-29).
+it('tells a forked agent, on its first turn, which task it now is and to work there', async () => {
+  home = fs.mkdtempSync(path.join(os.tmpdir(), 'prompt-review-'));
+  store = await Store.create(':memory:');
+  const project = await store.createProject('Fork');
+  const source = await store.createTask({ projectId: project.id, title: 'Original', workflow: 'software-dev', workflowVersion: '1.26.0', params: { prompt: 'original' } });
+  await store.saveView(source.id, { taskId: source.id, status: 'done', messages: [{ role: 'user', text: 'earlier work' }], state: {} } as any);
+  const fork = await store.createTask({ projectId: project.id, title: 'Fork of #1 do', workflow: 'software-dev', workflowVersion: '1.26.0',
+    params: { prompt: 'follow up', 'agent:do': { resumeFrom: { taskId: source.id, role: 'do' } } } });
+  const worlds = new WorldRegistry();
+  world = await worlds.create('memory', { taskId: fork.id, base: 'main' });
+  vi.spyOn(worlds, 'open').mockResolvedValue(world);
+  const delivered: string[] = [];
+  const core = makeCoreActivities({ store, worlds, contentDir: home, profiles: new ProfileResolver(store, 'mock'),
+    adapters: new Map([['mock', { provider: 'mock', runTurn: async (input: any) => {
+      delivered.push(input.messages.at(-1)?.text);
+      return { output: 'done', termination: { kind: 'success', status: 'fixture' } };
+    } }]]) as any });
+  const turn = (session?: string) => core.runAgentTurn({ taskId: fork.id, role: 'do', agentSlotGranted: true, worldHandle: world.handle,
+    deliveredMessages: 0, ...(session ? { session } : {}), messages: [{ id: 'm1', role: 'user', text: 'Also fix the docs', ts: 0 }],
+    task: { taskId: fork.id, projectId: project.id, title: fork.title, prompt: 'follow up', project: {},
+      agents: { do: { provider: 'mock', resumeFrom: { taskId: source.id, role: 'do' } } } } } as any);
+  await turn();
+  expect(delivered[0]).toBe(`Also fix the docs\n\n(You are now task #${fork.num}, a fork of task #${source.num}'s Agent: the conversation before this message happened there. `
+    + `Work here, in this task's own world and branch ${world.handle.branch}, and do what is asked yourself rather than creating a new task for it.)`);
+  // Once it has its own session, it is no longer told.
+  await turn('own-session');
+  expect(delivered[1]).toBe('Also fix the docs');
+});
