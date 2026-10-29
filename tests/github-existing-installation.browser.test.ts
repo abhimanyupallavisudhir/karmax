@@ -136,10 +136,12 @@ it('connects an already-installed GitHub account from settings and survives relo
     expect(await page.locator('#github-existing-installation').count()).toBe(0);
     visible = false;
     await page.locator('#connect-github').click();
-    await page.getByText('No existing installations are available for this GitHub account.', { exact: false }).waitFor();
+    // Nothing installed on their account yet: installing it there is the one step, said plainly.
+    await page.getByText('isn’t installed on', { exact: false }).waitFor();
     expect(await page.locator('#github-connect-existing').count()).toBe(0);
-    expect(await page.getByRole('link', { name: 'Install on another GitHub account' }).getAttribute('href'))
-      .toContain('/apps/test-app/installations/new?state=');
+    const install = page.getByRole('link', { name: 'Install on GitHub' });
+    expect(await install.getAttribute('href')).toContain('/apps/test-app/installations/new?state=');
+    expect(await install.getAttribute('class')).toContain('primary');
     await page.route('https://github.com/login/oauth/authorize**', route => route.fulfill({ body: 'GitHub account selector' }));
     await page.locator('#github-switch-account').click();
     await page.waitForURL('https://github.com/login/oauth/authorize**');

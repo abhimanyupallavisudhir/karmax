@@ -1303,3 +1303,102 @@ it('bounds GitHub provisioning requests with an abort signal (PS-7)', async () =
     expect(signal).toBeInstanceOf(AbortSignal);
   } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+// Who can have a repository made where: a GitHub organization's repositories are
+// made by the installation, so anyone tavya lets create them may; a personal
+// account takes them only from its owner (GitHub's POST /user/repos makes one in
+// the *caller's* account, so anyone else must be refused before GitHub acts).
+describe('creating repositories in a connected account', () => {
+  async function fixture(accountType: 'User' | 'Organization', accountLogin: string, options: { installationRefuses?: boolean } = {}) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-create-'));
+    const store = (await Store.create(':memory:'));
+    const broker = new CredentialBroker(new Vault(dir));
+    const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
+      privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
+    (await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey, INSTALLATION_SCOPE));
+    const organization = (await store.createOrganization({ name: 'Team', ownerUserId: 'owner' }));
+    const connection = (await store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '42', accountLogin, accountType }));
+    const people: Record<string, { id: number; login: string }> = { 'pat-token': { id: 7, login: 'pat' }, 'srajma-token': { id: 8, login: 'srajma' } };
+    const calls: Array<{ method: string; path: string; auth: string }> = [];
+    let nextId = 100;
+    const created = new Map<string, unknown>();
+    const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const method = init.method ?? 'GET';
+      const auth = String((init.headers as Record<string, string> | undefined)?.authorization ?? '').replace(/^Bearer /, '');
+      calls.push({ method, path: url.pathname, auth });
+      const repository = (owner: string, name: string) => ({ id: nextId++, name, private: true, ssh_url: `git@github.com:${owner}/${name}.git`, default_branch: 'main', owner: { login: owner } });
+      const payload = (owner: string) => {
+        const made = repository(owner, JSON.parse(String(init.body)).name);
+        created.set(`${owner}/${made.name}`, made);
+        return Response.json(made);
+      };
+      if (url.pathname === '/user' && people[auth]) return Response.json(people[auth]);
+      if (url.pathname === '/app/installations/42/access_tokens')
+        return Response.json({ token: 'installation-token', expires_at: new Date(Date.now() + 3600_000).toISOString() });
+      if (url.pathname === '/user/repos' && method === 'POST' && people[auth]) return payload(people[auth]!.login);
+      if (url.pathname === `/orgs/${accountLogin}/repos` && method === 'POST') {
+        if (options.installationRefuses && auth === 'installation-token')
+          return Response.json({ message: 'Resource not accessible by integration', status: '403' }, { status: 403 });
+        return payload(accountLogin);
+      }
+      if (/^\/user\/installations\/42\/repositories\/\d+$/.test(url.pathname) && method === 'PUT') return new Response(null, { status: 204 });
+      // The installation sees what it (or anyone) made; nothing else exists.
+      const existing = created.get(url.pathname.replace(/^\/repos\//, ''));
+      if (url.pathname.startsWith('/repos/') && method === 'GET' && existing) return Response.json(existing);
+      return new Response('not found', { status: 404 });
+    };
+    const service = (await GitHubAppService.create(store, broker, { appId: '123', clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch }));
+    const link = (userId: string, token: string) => service.adoptUserAuthorization(userId, String(people[token]!.id), {
+      accessToken: token, accessTokenExpiresAt: new Date(Date.now() + 3600_000) });
+    const close = async () => { (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); };
+    return { store, service, connection, calls, link, close };
+  }
+
+  it('refuses to make one in someone else’s personal account, before GitHub could put it in the caller’s', async () => {
+    const { service, connection, calls, link, close } = await fixture('User', 'srajma');
+    await link('pat-user', 'pat-token');
+    await expect(service.createRepository(connection.id, 'pat-user', { name: 'corruption-detector' }))
+      .rejects.toMatchObject({ status: 403, message: expect.stringMatching(/^Only srajma can create repositories in their personal GitHub account\. Connect your own GitHub account/) });
+    expect(calls.some((call) => call.method === 'POST' && call.path.endsWith('/repos'))).toBe(false);
+    expect(await service.canCreateRepositories(connection, 'pat-user')).toBe(false);
+    expect(await service.repositoryCreator(connection, ['pat-user'])).toBeUndefined();
+    await close();
+  });
+
+  it('makes one in a personal account as its owner', async () => {
+    const { service, connection, calls, link, close } = await fixture('User', 'srajma');
+    await link('srajma-user', 'srajma-token');
+    await expect(service.createRepository(connection.id, 'srajma-user', { name: 'corruption-detector' }))
+      .resolves.toMatchObject({ owner: 'srajma', name: 'corruption-detector', gitConnectionId: connection.id });
+    expect(calls.find((call) => call.method === 'POST' && call.path.endsWith('/repos'))).toMatchObject({ path: '/user/repos', auth: 'srajma-token' });
+    expect(await service.canCreateRepositories(connection, 'srajma-user')).toBe(true);
+    expect(await service.repositoryCreator(connection, ['pat-user', 'srajma-user'])).toEqual({ userId: 'srajma-user' });
+    await close();
+  });
+
+  it('has the installation make one in a GitHub organization, for anyone tavya lets', async () => {
+    const { service, connection, calls, close } = await fixture('Organization', 'acme');
+    await expect(service.createRepository(connection.id, 'no-github-user', { name: 'corruption-detector' }))
+      .resolves.toMatchObject({ owner: 'acme', name: 'corruption-detector', gitConnectionId: connection.id });
+    expect(calls.find((call) => call.method === 'POST' && call.path.endsWith('/repos'))).toMatchObject({ path: '/orgs/acme/repos', auth: 'installation-token' });
+    expect(await service.canCreateRepositories(connection, 'no-github-user')).toBe(true);
+    expect(await service.repositoryCreator(connection, ['no-github-user'])).toEqual({});
+    // The wiki, made by the installation alone.
+    await expect(service.ensureRepository(connection.id, undefined, { name: 'site-wiki-1', private: true }))
+      .resolves.toMatchObject({ owner: 'acme', name: 'site-wiki-1' });
+    await close();
+  });
+
+  it('falls back to the person’s own authorization, and says plainly when neither may', async () => {
+    const { service, connection, calls, link, close } = await fixture('Organization', 'acme', { installationRefuses: true });
+    await expect(service.createRepository(connection.id, 'no-github-user', { name: 'corruption-detector' }))
+      .rejects.toMatchObject({ status: 403, message: "tavya's GitHub app can't create repositories in acme yet. An owner of acme needs to approve its permissions on GitHub (Organization settings → Resources → GitHub shows the update)." });
+    await link('pat-user', 'pat-token');
+    await expect(service.createRepository(connection.id, 'pat-user', { name: 'corruption-detector' }))
+      .resolves.toMatchObject({ owner: 'acme' });
+    expect(calls.filter((call) => call.method === 'POST' && call.path.endsWith('/repos')).map((call) => call.auth)).toEqual(['installation-token', 'installation-token', 'pat-token']);
+    await close();
+  });
+});

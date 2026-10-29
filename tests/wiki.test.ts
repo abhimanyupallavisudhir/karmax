@@ -838,6 +838,10 @@ describe('existing project wiki remote backfill', () => {
     const inputs: Array<{ name: string; private?: boolean }> = [];
     const githubApp = {
       status: (userId?: string) => ({ userAuthorized: userId === 'owner' }),
+      async repositoryCreator(_connection: unknown, candidates: string[]) {
+        const userId = candidates.find((candidate) => candidate === 'owner');
+        return userId ? { userId } : {};
+      },
       async ensureRepository(_connectionId: string, userId: string, input: { name: string; private?: boolean }) {
         actors.push(userId);
         inputs.push(input);

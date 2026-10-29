@@ -1622,50 +1622,102 @@ export class GitHubAppService {
 
   /** Create a GitHub repository, add it to a selected-repository App
    * installation, and return the durable record. */
+  /**
+   * Make a repository in a connected account, then enroll it. A GitHub
+   * organization's repository is made by the App's installation, so anyone
+   * tavya lets create repositories may, whether or not they belong to that
+   * organization on GitHub; the person's own authorization is the fallback (an
+   * installation that has not approved Administration yet). A personal account
+   * takes repositories only from its owner: GitHub's `POST /user/repos` makes
+   * one in the *calling* person's account, so anyone else is refused before
+   * GitHub could put it in the wrong account.
+   */
   async createRepository(connectionId: string, userId: string, input: {
     name: string; description?: string; private?: boolean; defaultBranch?: string; autoInit?: boolean;
   }, options: { accountId?: string } = {}): Promise<Repository> {
     const connection = (await this.store.getGitConnection(connectionId));
     if (!connection) throw new Error('GitHub connection not found');
     const name = this.repositoryName(input.name);
-    const pathname = connection.accountType === 'Organization'
-      ? `/orgs/${encodeURIComponent(connection.accountLogin)}/repos`
-      : '/user/repos';
+    const body = JSON.stringify({ name, description: input.description?.trim().slice(0, 350) || undefined,
+      private: input.private !== false, auto_init: input.autoInit !== false });
     if (options.accountId) await this.assertUserAccount(userId, options.accountId);
-    const created = await this.userRequest<GitHubRepositoryPayload>(userId, pathname, {
-      method: 'POST', body: JSON.stringify({ name, description: input.description?.trim().slice(0, 350) || undefined,
-        private: input.private !== false, auto_init: input.autoInit !== false }),
-    }, options.accountId);
+    const created = await this.makeRepository(connection, userId, name, body, options.accountId);
     return this.enrollRepository(connection, userId, created, input.defaultBranch, options.accountId);
+  }
+
+  /** Whether `userId` may have a repository made in `connection`'s account:
+   * any account for a GitHub organization (the installation makes it), only
+   * their own for a personal one. */
+  async canCreateRepositories(connection: GitConnection, userId: string): Promise<boolean> {
+    if (connection.accountType === 'Organization') return true;
+    return Boolean(await this.ownAccount(userId, connection.accountLogin));
+  }
+
+  /** Who of `candidates` can have a repository made in `connection`'s account
+   * as themselves: for an organization, the first with GitHub authorization
+   * (undefined: the installation alone); for a personal account, its owner. */
+  async repositoryCreator(connection: GitConnection, candidates: string[]): Promise<{ userId?: string } | undefined> {
+    for (const candidate of candidates) {
+      if (connection.accountType === 'Organization' ? (await this.status(candidate)).userAuthorized
+        : await this.ownAccount(candidate, connection.accountLogin)) return { userId: candidate };
+    }
+    return connection.accountType === 'Organization' ? {} : undefined;
+  }
+
+  private async ownAccount(userId: string, login: string): Promise<GitHubUserAccount | undefined> {
+    return (await this.listUserAccounts(userId).catch(() => []))
+      .find((account) => account.login.toLowerCase() === login.toLowerCase());
+  }
+
+  private async makeRepository(connection: GitConnection, userId: string | undefined, name: string, body: string,
+    accountId?: string): Promise<GitHubRepositoryPayload> {
+    const login = connection.accountLogin;
+    if (connection.accountType !== 'Organization') {
+      const own = userId ? await this.ownAccount(userId, login) : undefined;
+      if (!userId || !own) throw new GitHubRepositoryCreationError(
+        `Only ${login} can create repositories in their personal GitHub account. Connect your own GitHub account to this organization to create one there.`, 403);
+      try {
+        return await this.userRequest<GitHubRepositoryPayload>(userId, '/user/repos', { method: 'POST', body }, accountId ?? own.id);
+      } catch (error) { throw repositoryCreationFailure(connection, name, error); }
+    }
+    const pathname = `/orgs/${encodeURIComponent(login)}/repos`;
+    try {
+      return await this.request<GitHubRepositoryPayload>(pathname, await this.installationToken(connection), { method: 'POST', body });
+    } catch (installationError) {
+      if (/GitHub API 422/.test(String(installationError))) throw repositoryCreationFailure(connection, name, installationError);
+      if (!userId || !(await this.status(userId)).userAuthorized) throw repositoryCreationFailure(connection, name, installationError);
+      try {
+        return await this.userRequest<GitHubRepositoryPayload>(userId, pathname, { method: 'POST', body }, accountId);
+      } catch (error) { throw repositoryCreationFailure(connection, name, error); }
+    }
   }
 
   /** Idempotently provision a platform-owned repository. A previous attempt can
    * succeed at GitHub and then be interrupted before the durable record or
    * repository record is saved; retrying must adopt that exact private repository
-   * instead of repeatedly failing with GitHub's "name already exists" 422. */
-  async ensureRepository(connectionId: string, userId: string, input: {
+   * instead of repeatedly failing with GitHub's "name already exists" 422.
+   * `userId` is who it is made as (`repositoryCreator`); without one, an
+   * organization's installation makes it. */
+  async ensureRepository(connectionId: string, userId: string | undefined, input: {
     name: string; description?: string; private?: boolean; defaultBranch?: string; autoInit?: boolean;
   }): Promise<Repository> {
     const connection = (await this.store.getGitConnection(connectionId));
     if (!connection) throw new Error('GitHub connection not found');
     const name = this.repositoryName(input.name);
+    const slugPath = `/repos/${encodeURIComponent(connection.accountLogin)}/${encodeURIComponent(name)}`;
     let repository: GitHubRepositoryPayload;
     try {
-      repository = await this.userRequest<GitHubRepositoryPayload>(userId,
-        `/repos/${encodeURIComponent(connection.accountLogin)}/${encodeURIComponent(name)}`,
-      );
+      repository = userId
+        ? await this.userRequest<GitHubRepositoryPayload>(userId, slugPath)
+        : await this.request<GitHubRepositoryPayload>(slugPath, await this.installationToken(connection));
       if (repository.archived) throw new Error(`existing GitHub repository ${connection.accountLogin}/${name} is archived`);
       if (input.private !== false && !repository.private)
         throw new Error(`existing GitHub repository ${connection.accountLogin}/${name} must be private`);
     } catch (error) {
       if (!(error instanceof Error) || !error.message.includes('GitHub API 404')) throw error;
-      const pathname = connection.accountType === 'Organization'
-        ? `/orgs/${encodeURIComponent(connection.accountLogin)}/repos`
-        : '/user/repos';
-      repository = await this.userRequest<GitHubRepositoryPayload>(userId, pathname, {
-        method: 'POST', body: JSON.stringify({ name, description: input.description?.trim().slice(0, 350) || undefined,
-          private: input.private !== false, auto_init: input.autoInit !== false }),
-      });
+      repository = await this.makeRepository(connection, userId, name, JSON.stringify({ name,
+        description: input.description?.trim().slice(0, 350) || undefined,
+        private: input.private !== false, auto_init: input.autoInit !== false }));
     }
     return this.enrollRepository(connection, userId, repository, input.defaultBranch);
   }
@@ -1677,14 +1729,16 @@ export class GitHubAppService {
     return name;
   }
 
-  private async enrollRepository(connection: GitConnection, userId: string,
+  private async enrollRepository(connection: GitConnection, userId: string | undefined,
     created: GitHubRepositoryPayload, defaultBranch?: string, accountId?: string): Promise<Repository> {
     // Installation may have been limited to selected repositories. User
     // authorization lets Karmax enroll the repository without sending the
     // operator back through GitHub settings. The PUT is idempotent for selected
     // installations; installations covering every repository may reject it,
-    // but their installation token can already see the repository.
+    // but their installation token can already see the repository (as it can
+    // one it made itself).
     try {
+      if (!userId) throw new Error('made by the installation');
       await this.userRequest(userId,
         `/user/installations/${encodeURIComponent(connection.installationId)}/repositories/${encodeURIComponent(String(created.id))}`,
         { method: 'PUT' }, accountId);
@@ -2112,4 +2166,22 @@ function withoutApiLinks(value: unknown): unknown {
   return Object.fromEntries(Object.entries(value as Record<string, unknown>)
     .filter(([key]) => key === 'html_url' || !(key === 'url' || key.endsWith('_url')))
     .map(([key, item]) => [key, withoutApiLinks(item)]));
+}
+
+
+/** A repository GitHub would not make, said so people know what to do. */
+export class GitHubRepositoryCreationError extends Error {
+  constructor(message: string, readonly status = 400) { super(message); }
+}
+
+function repositoryCreationFailure(connection: GitConnection, name: string, error: unknown): Error {
+  const text = error instanceof Error ? error.message : String(error);
+  const login = connection.accountLogin;
+  if (/GitHub API 422/.test(text) && /already exists/i.test(text))
+    return new GitHubRepositoryCreationError(`${login}/${name} already exists on GitHub. Choose another name, or add the existing repository.`, 409);
+  if (/GitHub API 403/.test(text) && connection.accountType === 'Organization')
+    return new GitHubRepositoryCreationError(`${BRAND}'s GitHub app can't create repositories in ${login} yet. An owner of ${login} needs to approve its permissions on GitHub (Organization settings → Resources → GitHub shows the update).`, 403);
+  if (/GitHub API 40[34]/.test(text))
+    return new GitHubRepositoryCreationError(`GitHub didn't let ${BRAND} create ${login}/${name}. Reconnect GitHub on your profile and try again.`, 403);
+  return error instanceof Error ? error : new Error(text);
 }

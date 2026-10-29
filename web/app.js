@@ -4476,6 +4476,18 @@ function plainError(error) {
     return 'A GitHub repository with that name already exists. Choose another name, or add the existing one from the list.';
   if (/Bad credentials|token (?:has )?expired|refresh token/i.test(text) && /github/i.test(text))
     return 'Your GitHub connection has expired. Reconnect GitHub on your profile.';
+  // GitHub's own answer, as the server passed it through: its message, in words.
+  const github = /GitHub API (\d{3}): ([\s\S]*)$/.exec(text);
+  if (github) {
+    let said = github[2].trim();
+    try { said = String(JSON.parse(said).message || said); } catch { /* not JSON */ }
+    if (/Resource not accessible by integration/i.test(said))
+      return 'tavya’s GitHub app isn’t allowed to do that. An admin of that GitHub account may need to approve its permissions on GitHub.';
+    if (/already exists/i.test(said)) return 'That already exists on GitHub. Choose another name.';
+    if (github[1] === '404') return 'GitHub couldn’t find that, or tavya’s GitHub app can’t see it.';
+    if (/^5/.test(github[1])) return 'GitHub isn’t responding right now. Try again in a moment.';
+    return `GitHub said: ${said.replace(/\s+/g, ' ').slice(0, 200)}`;
+  }
   // What stays is meant for people; drop what is meant for agents and logs.
   return text
     .replace(/\s*Ask for it with request_permission \(capabilities: [^)]*\)\.?/g, '')
@@ -19124,13 +19136,20 @@ async function connectOrganizationGithub(organizationId, onConnected) {
   if (!Array.isArray(result.installations)) { location.assign(result.url); return; }
   const dialog = document.createElement('dialog');
   dialog.className = 'modal-card';
-  dialog.innerHTML = `<form method="dialog"><h2>Connect GitHub</h2><p>${result.installations.length ? 'Choose an existing GitHub App installation for this organization.' : 'No existing installations are available for this GitHub account. Install the app or sign in to another account.'}</p>
-    ${result.installations.length ? `<label class="form-row">GitHub account<select id="github-existing-installation">${result.installations.map(item => `<option value="${esc(item.id)}">${esc(item.accountLogin)}</option>`).join('')}</select></label>` : ''}
+  // Either pick an account tavya is already installed on, or install it on
+  // one (GitHub asks which). Signed in to GitHub as someone else? Switch first.
+  const you = result.login ? `<b>${esc(result.login)}</b>` : 'your GitHub account';
+  const installed = result.installations.length > 0;
+  dialog.innerHTML = `<form method="dialog" class="github-connect"><h2>Connect GitHub</h2>
+    <p>${installed ? 'Choose the GitHub account whose repositories this organization works on.' : `${siteNameMarkup()} isn’t installed on ${you} yet. Install it there, choosing which repositories it may use.`}</p>
+    ${installed ? `<label class="form-row">GitHub account<select id="github-existing-installation">${result.installations.map(item => `<option value="${esc(item.id)}">${esc(item.accountLogin)}</option>`).join('')}</select></label>` : ''}
     <p class="task-sub" role="alert" id="github-connect-error"></p>
-    ${result.installations.length ? '<button class="btn primary" type="button" id="github-connect-existing">Connect</button>' : ''}
-    <a class="btn" href="${esc(result.url)}">Install on another GitHub account</a>
-    ${result.canAuthorize ? '<button class="btn" type="button" id="github-switch-account">Use another GitHub account</button>' : ''}
-    <button class="btn" type="submit">Cancel</button></form>`;
+    <div class="github-connect-actions">
+      ${installed ? '<button class="btn primary" type="button" id="github-connect-existing">Connect</button>' : ''}
+      <a class="btn ${installed ? '' : 'primary'}" href="${esc(result.url)}">${installed ? 'Install on another account' : 'Install on GitHub'}</a>
+      ${result.canAuthorize ? `<button class="btn ghost" type="button" id="github-switch-account" title="Signed in to GitHub as someone else? Switch accounts.">${result.login ? `Not ${esc(result.login)}?` : 'Use another GitHub account'}</button>` : ''}
+      <button class="btn ghost" type="submit">Cancel</button>
+    </div></form>`;
   dialog.addEventListener('close', () => dialog.remove());
   dialog.querySelector('#github-switch-account')?.addEventListener('click', async () => {
     try {
@@ -19323,6 +19342,14 @@ function githubRepositoryName(text) {
 }
 // The organization's GitHub account new repositories go to by default: the
 // person's own when the organization connected it, else the first one.
+// The connected accounts a person can have a new repository made in: any
+// GitHub organization (tavya's app makes it, for anyone tavya lets) and their
+// own personal account (GitHub takes a personal account's repositories only
+// from its owner). `githubLogins`: the GitHub accounts they linked.
+function creatableGitConnections(gitConnections, githubLogins = []) {
+  const own = new Set(githubLogins.map((login) => String(login).toLowerCase()));
+  return gitConnections.filter((connection) => connection.accountType === 'Organization' || own.has(String(connection.accountLogin).toLowerCase()));
+}
 function defaultGitConnection(gitConnections, githubLogin) {
   return gitConnections.find((connection) => githubLogin && connection.accountLogin?.toLowerCase() === githubLogin.toLowerCase())
     || gitConnections[0];
@@ -19338,7 +19365,7 @@ function repositoryPickerHtml(id, { placeholder, disabled }) {
 // matches none offers "+ New repo" (which opens the New repository dialog
 // with it), and off hosted the typed URL or path itself. ↑/↓ move, Enter
 // chooses, Esc closes. `attachedKeys()` names what is already in the list.
-function wireRepositoryPicker(input, { repositories, gitConnections = [], githubLogin, canCreate, attachedKeys, add, create, fork }) {
+function wireRepositoryPicker(input, { repositories, gitConnections = [], createIn = gitConnections, githubLogin, canCreate, attachedKeys, add, create, fork }) {
   if (!input) return;
   const root = input.closest('.repo-combo');
   const menu = root.querySelector('[role="listbox"]');
@@ -19364,8 +19391,8 @@ function wireRepositoryPicker(input, { repositories, gitConnections = [], github
     // "+ New repo": a bare name goes to the default account; owner/name to that
     // account when the organization connected it.
     if (canCreate) {
-      const [owner, name] = typed.includes('/') ? typed.split('/') : [defaultGitConnection(gitConnections, githubLogin)?.accountLogin, typed];
-      const connection = owner && ownAccount(owner);
+      const [owner, name] = typed.includes('/') ? typed.split('/') : [defaultGitConnection(createIn, githubLogin)?.accountLogin, typed];
+      const connection = owner && createIn.find((each) => each.accountLogin?.toLowerCase() === owner.toLowerCase());
       const valid = /^[A-Za-z0-9._-]+$/.test(name || '') && connection && !/^\.+$/.test(name);
       if (!typed) next.push({ kind: 'create', name: '', label: 'New repo…' });
       else if (valid && !exists(`${connection.accountLogin}/${name}`))
@@ -19501,11 +19528,12 @@ async function loadOrganizationGithub(organizationId) {
 
 // Settings → Project → Git & GitHub: the project's repositories (each add or
 // remove saves at once), then who gives access and who commits.
-function renderProjectRepositories(box, proj, { repositories, gitConnections, githubApp, githubLoadError, githubLogin }) {
+function renderProjectRepositories(box, proj, { repositories, gitConnections, githubApp, githubLoadError, githubLogin, githubLogins = [] }) {
   const sources = proj.config.repos || [];
   const attached = new Set(sources.map((source) => repositorySourceView(source).key));
   const { canAdd, placeholder } = repositoryInput(repositories);
-  const canCreate = githubApp.configured && gitConnections.length && githubApp.userAuthorized;
+  const createIn = creatableGitConnections(gitConnections, githubLogins);
+  const canCreate = githubApp.configured && createIn.length > 0;
   const access = githubAccessView({ githubApp, gitConnections, githubLoadError }, proj.organizationId,
     { error: 'project-github-error', connect: 'project-connect-github', refresh: 'project-refresh-github' });
   const identity = `<b>You</b>${githubLogin && githubApp.userAuthorized ? `<span class="setting-sep">·</span><span class="setting-muted">${esc(githubLogin)}</span>` : ''}`;
@@ -19536,10 +19564,10 @@ function renderProjectRepositories(box, proj, { repositories, gitConnections, gi
   box.querySelectorAll('.git-repo').forEach((item) => item.querySelector('.git-repo-remove').addEventListener('click', () =>
     save(sources.filter((source) => source !== item.dataset.source))));
   wireRepositoryPicker($('#project-repository-input'), {
-    repositories, gitConnections, githubLogin, canCreate,
+    repositories, gitConnections, createIn, githubLogin, canCreate,
     attachedKeys: () => attached,
     add: async (source) => { if (await save([...sources, source])) $('#project-repository-input')?.focus(); },
-    create: canCreate ? ({ name, connectionId }, opener) => openNewGithubRepositoryDialog(proj.organizationId, gitConnections, opener, async (repository) => {
+    create: canCreate ? ({ name, connectionId }, opener) => openNewGithubRepositoryDialog(proj.organizationId, createIn, opener, async (repository) => {
       await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) });
       toast('Repository created and attached'); await loadProjects(); await rerender();
     }, { name, connectionId }) : null,
@@ -19575,7 +19603,8 @@ async function hydrateProjectAccess(proj) {
     accessBox.innerHTML = `<div class="section-h section-h-action"><span>Project access ${policyTip('People and teams with a role in this project beyond their organization role.')}</span><a class="btn sm ghost" data-spa href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-people">Manage people</a></div>
       <div class="setting-rows">${members.map((member) => { const id = member.principal.userId || member.principal.teamId || member.principal.organizationId; return `<div class="setting-row member-line" data-project-member data-kind="${esc(member.principal.kind)}" data-id="${esc(id)}"><span class="setting-value"><b>${esc(principalName(member.principal))}</b>${member.protectedOwner ? '<span class="setting-muted">Creator</span>' : ''}</span><span class="chip">${esc(authorizationLevels().find((level) => level.id === (member.profileId || 'developer'))?.name || member.profileId || 'Developer')}</span><span class="setting-actions"><button class="icon-btn project-member-remove" type="button" title="Remove" aria-label="Remove ${esc(principalName(member.principal))}">×</button></span></div>`; }).join('') || '<div class="setting-muted">No project-specific roles</div>'}</div>`;
     renderProjectRepositories(repositoryBox, proj, { repositories, gitConnections, githubApp, githubLoadError,
-      githubLogin: (userGithub?.accounts || []).find((account) => account.active)?.login });
+      githubLogin: (userGithub?.accounts || []).find((account) => account.active)?.login,
+      githubLogins: (userGithub?.accounts || []).map((account) => account.login) });
     accessBox.querySelectorAll('[data-project-member]').forEach((row) => row.querySelector('.project-member-remove')?.addEventListener('click', async () => {
       if (!confirm('Remove this member’s access to the project?')) return;
       try { await api(`/api/projects/${proj.id}/members/${row.dataset.kind}/${encodeURIComponent(row.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectAccess(proj); }
@@ -24912,24 +24941,26 @@ function newProject(options) {
   </form></div>`;
   const $in = (selector) => host.querySelector(selector);
   const repos = [];
-  let github = { repositories: [], gitConnections: [], githubApp: { configured: false }, githubLoadError: null, githubLogin: undefined };
+  let github = { repositories: [], gitConnections: [], githubApp: { configured: false }, githubLoadError: null, githubLogin: undefined, githubLogins: [] };
   let useDefault = true;
 
   // The repository named after the project: the organization's existing one,
-  // else one to create in its default account (when the person may create).
+  // else one to make in an account the person may create in. With none, it
+  // says why (`blocked`: whose personal account it is) and how to fix it.
   const defaultRepository = () => {
-    const { repositories, gitConnections, githubApp, githubLoadError, githubLogin } = github;
+    const { repositories, gitConnections, githubApp, githubLoadError, githubLogin, githubLogins } = github;
     if (!organizationId || githubLoadError || !githubApp.configured || !gitConnections.length) return null;
     const name = githubRepositoryName($in('#new-project-name').value);
-    const connection = defaultGitConnection(gitConnections, githubLogin);
+    const createIn = creatableGitConnections(gitConnections, githubLogins);
+    const connection = defaultGitConnection(createIn, githubLogin);
     const owned = (repository) => gitConnections.some((each) => each.accountLogin?.toLowerCase() === repository.owner.toLowerCase());
-    const existing = name ? (repositories.find((repository) => repository.name.toLowerCase() === name && repository.owner.toLowerCase() === connection.accountLogin.toLowerCase())
+    const existing = name ? (repositories.find((repository) => repository.name.toLowerCase() === name && repository.owner.toLowerCase() === connection?.accountLogin.toLowerCase())
       || repositories.find((repository) => repository.name.toLowerCase() === name && owned(repository))) : null;
     if (existing) return { existing, slug: `${existing.owner}/${existing.name}` };
-    if (!githubApp.userAuthorized) return null;
+    if (!connection) return { blocked: gitConnections[0].accountLogin };
     return { create: { connectionId: connection.id, name }, owner: connection.accountLogin, slug: `${connection.accountLogin}/${name}` };
   };
-  const usingDefault = () => useDefault && !!defaultRepository();
+  const usingDefault = () => { const chosen = useDefault && defaultRepository(); return !!chosen && !chosen.blocked; };
   const projectRepositories = () => {
     if (!usingDefault()) return [...repos];
     const chosen = defaultRepository();
@@ -24939,23 +24970,33 @@ function newProject(options) {
     const row = $in('.np-default');
     const chosen = defaultRepository();
     row.hidden = !chosen;
-    $in('.np-repos').hidden = !!chosen && useDefault;
+    $in('.np-repos').hidden = usingDefault();
     if (!chosen) return renderInstall();
-    const label = chosen.existing ? 'Work on existing GitHub repo' : 'Create new GitHub repo';
-    const slug = chosen.existing || chosen.create.name ? esc(chosen.slug) : `${esc(chosen.owner)}/<span class="np-default-blank">project-name</span>`;
-    if (row.querySelector('input')) { row.querySelector('.np-default-label').innerHTML = `${label} <code>${slug}</code>`; }
-    else {
-      // Two choices, one always picked: the repository named after the project, or others.
-      row.setAttribute('role', 'radiogroup');
-      row.setAttribute('aria-label', 'Repositories');
-      row.innerHTML = `<label class="np-default-row"><input type="radio" name="np-repo-mode" value="default" ${useDefault ? 'checked' : ''}><span class="np-default-label">${label} <code>${slug}</code></span></label>
-        <label class="np-default-row"><input type="radio" name="np-repo-mode" value="custom" ${useDefault ? '' : 'checked'}><span>Choose other repositories</span></label>`;
-      row.querySelectorAll('input').forEach((radio) => radio.addEventListener('change', () => {
-        useDefault = row.querySelector('input[value="default"]').checked;
-        renderDefault();
-        if (!useDefault) $in('#np-repo-input')?.focus();
-      }));
-    }
+    const kind = chosen.existing ? 'existing' : chosen.blocked ? 'blocked' : 'create';
+    const label = kind === 'existing' ? 'Work on existing GitHub repo' : 'Create new GitHub repo';
+    const slug = chosen.blocked ? '' : chosen.existing || chosen.create.name ? esc(chosen.slug) : `${esc(chosen.owner)}/<span class="np-default-blank">project-name</span>`;
+    const labelHtml = `${label}${slug ? ` <code>${slug}</code>` : ''}`;
+    if (row.dataset.kind === kind) { row.querySelector('.np-default-label').innerHTML = labelHtml; return renderInstall(); }
+    row.dataset.kind = kind;
+    // Two choices, one always picked: the repository named after the project, or
+    // others. When the person may not create one, the first says why and offers
+    // the fix (their own GitHub account here), and the list is open.
+    const blocked = kind === 'blocked';
+    const checked = useDefault && !blocked;
+    row.setAttribute('role', 'radiogroup');
+    row.setAttribute('aria-label', 'Repositories');
+    row.innerHTML = `<label class="np-default-row${blocked ? ' np-default-blocked' : ''}"><input type="radio" name="np-repo-mode" value="default" ${checked ? 'checked' : ''} ${blocked ? 'disabled' : ''}><span class="np-default-label">${labelHtml}</span>${blocked ? `${policyTip(`Only ${chosen.blocked} can create repos in their personal GitHub account. Connect your own GitHub account to create one.`)}<button class="btn sm ghost" type="button" id="np-connect-own-github">Connect your GitHub</button>` : ''}</label>
+      <label class="np-default-row"><input type="radio" name="np-repo-mode" value="custom" ${checked ? '' : 'checked'}><span>Choose other repositories</span></label>`;
+    row.querySelectorAll('input').forEach((radio) => radio.addEventListener('change', () => {
+      useDefault = row.querySelector('input[value="default"]').checked;
+      renderDefault();
+      if (!useDefault) $in('#np-repo-input')?.focus();
+    }));
+    row.querySelector('#np-connect-own-github')?.addEventListener('click', async () => {
+      try { await connectOrganizationGithub(organizationId, async () => { useDefault = true; await loadGithub(); }); }
+      catch (error) { toast(error.message, true); }
+    });
+    $in('.np-repos').hidden = usingDefault();
     renderInstall();
   };
 
@@ -24967,9 +25008,10 @@ function newProject(options) {
   };
   const renderGit = () => {
     const box = $in('.np-git');
-    const { repositories, gitConnections, githubApp, githubLogin } = github;
+    const { repositories, gitConnections, githubApp, githubLogin, githubLogins } = github;
     const { canAdd, placeholder } = repositoryInput(repositories);
-    const canCreate = !!(githubApp.configured && gitConnections.length && githubApp.userAuthorized);
+    const createIn = creatableGitConnections(gitConnections, githubLogins);
+    const canCreate = !!(githubApp.configured && createIn.length);
     const access = organizationId ? githubAccessView(github, organizationId, { error: 'np-github-error', connect: 'np-connect-github', refresh: 'np-refresh-github' }) : null;
     box.innerHTML = `<div class="git-repos">${repos.map((source) => gitRepoRow(source, repositories)).join('')}
         <div class="git-repo-add">${repositoryPickerHtml('np-repo-input', { placeholder: canCreate ? 'Find or create a repository' : placeholder, disabled: !canAdd && !canCreate })}</div></div>
@@ -24981,10 +25023,10 @@ function newProject(options) {
       $in('#np-repo-input')?.focus();
     }));
     wireRepositoryPicker($in('#np-repo-input'), {
-      repositories, gitConnections, githubLogin, canCreate,
+      repositories, gitConnections, createIn, githubLogin, canCreate,
       attachedKeys: () => new Set(repos.map((source) => repositorySourceView(source).key)),
       add: (source) => { repos.push(source); renderGit(); renderInstall(); $in('#np-repo-input').focus(); },
-      create: canCreate ? ({ name, connectionId }, opener) => openNewGithubRepositoryDialog(organizationId, gitConnections, opener, async (repository) => {
+      create: canCreate ? ({ name, connectionId }, opener) => openNewGithubRepositoryDialog(organizationId, createIn, opener, async (repository) => {
         github = { ...github, repositories: [...github.repositories, repository] };
         repos.push(repository.sshUrl);
         renderGit(); renderInstall();
@@ -25001,7 +25043,8 @@ function newProject(options) {
     if (organizationId) {
       try {
         const [loaded, accounts] = await Promise.all([loadOrganizationGithub(organizationId), api('/api/user/github-accounts').catch(() => null)]);
-        github = { ...loaded, githubLogin: (accounts?.accounts || []).find((account) => account.active)?.login };
+        github = { ...loaded, githubLogin: (accounts?.accounts || []).find((account) => account.active)?.login,
+          githubLogins: (accounts?.accounts || []).map((account) => account.login) };
       } catch (error) { github = { ...github, githubLoadError: error }; }
     }
     if (closed) return;
