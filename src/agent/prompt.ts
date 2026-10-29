@@ -192,7 +192,16 @@ function describeComputer(world: WorldHandle, taskId: string, requested?: Machin
   providers: Array<{ provider: string; diskGb?: number }> = [], moveTo?: string, anyProvider = false): string {
   const base = describeMachineAndRoom(world, taskId, requested, disk, given, moveTo);
   if (!base) return '';
-  return base + describeOtherProviders(world, taskId, disk, given, providers, moveTo, anyProvider);
+  return base + describeReach(world, given) + describeOtherProviders(world, taskId, disk, given, providers, moveTo, anyProvider);
+}
+
+/** A machine whose account reaches only its provider's essential services
+ * (Daytona Tier 1–2; the task chose Basic internet is enough), so the agent
+ * neither waits on a blocked site nor reads the block as an outage. */
+function describeReach(world: WorldHandle, given?: EffectiveComputerLimits): string {
+  if (computerFeatures(world.kind, given).internet !== 'basic') return '';
+  return ' This machine reaches only essential services: package registries, Git hosts, AI and cloud APIs, CDNs and container registries. '
+    + 'Other websites are blocked by its provider, not down: if the task needs one, say so in your final response.';
 }
 
 /** How a move to another provider works, said wherever one is offered or pending. */

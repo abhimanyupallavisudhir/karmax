@@ -17,7 +17,7 @@ import {
 } from '../platform/platform-request.js';
 import { SUB_TASK_ACTIONS, URGENCY_LEVELS, type AgentWait, type SubTaskAction, type Urgency } from '../domain/types.js';
 import { BRAND } from '../domain/brand.js';
-import { CLOUD_WORLD_PROVIDERS } from '../domain/computer.js';
+import { changeNetwork, CLOUD_WORLD_PROVIDERS, NETWORK_CHOICES } from '../domain/computer.js';
 
 /** The longest a single wait may last: a week, after which a parked world may hibernate. */
 export const MAX_WAIT_MINUTES = 7 * 24 * 60;
@@ -762,7 +762,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         environment_flavor: { type: 'string', enum: ['headless', 'desktop'] },
         region: { type: 'string', enum: ['eu', 'us'], description: 'Where "any" may put computers' },
         cpu: { type: 'number' }, memory_mb: { type: 'number' }, disk_gb: { type: 'number', description: 'Free disk for task files, in GB' }, gpu: { type: 'number' },
-        unrestricted_internet: { type: 'boolean' },
+        network: { type: 'string', enum: ['full', 'basic', 'allowlist'], description: 'Outbound network: full internet (default), basic (package registries, Git hosts, AI and cloud APIs are enough; "any" may then use accounts that reach only those), or allowlist (allow_domains/allow_cidrs only)' },
+        unrestricted_internet: { type: 'boolean', description: 'Legacy: true is network "full", false is "allowlist"' },
         allow_domains: { type: 'array', items: { type: 'string' } },
         allow_cidrs: { type: 'array', items: { type: 'string' } },
         monthly_budget_usd: { type: 'number' }, hibernate_after_days: { type: 'number' },
@@ -1615,7 +1616,8 @@ export function platformToolHandlers(
       // partial change is merged against the policy currently in force rather
       // than silently clearing the fields the caller did not mention.
       const wantsResources = args?.cpu !== undefined || args?.memory_mb !== undefined || args?.disk_gb !== undefined || args?.gpu !== undefined;
-      const wantsNetwork = args?.unrestricted_internet !== undefined || args?.allow_domains !== undefined || args?.allow_cidrs !== undefined;
+      const wantsNetwork = args?.network !== undefined || args?.unrestricted_internet !== undefined || args?.allow_domains !== undefined
+        || args?.allow_cidrs !== undefined;
       if (wantsResources || wantsNetwork) {
         const current: any = await platformRequest('GET', url).catch(() => undefined);
         // Two response shapes: the project route answers `{override, …}`, the
@@ -1632,11 +1634,10 @@ export function platformToolHandlers(
           policy.resources = resources;
         }
         if (wantsNetwork) {
-          const network: Record<string, unknown> = { ...(base.network ?? {}) };
-          if (args?.unrestricted_internet !== undefined) network.unrestricted = args.unrestricted_internet;
-          if (args?.allow_domains !== undefined) network.allowDomains = args.allow_domains;
-          if (args?.allow_cidrs !== undefined) network.allowCidrs = args.allow_cidrs;
-          policy.network = network;
+          const choice = args?.network;
+          if (choice !== undefined && !(NETWORK_CHOICES as readonly unknown[]).includes(choice)) throw new Error('network must be full, basic or allowlist');
+          policy.network = changeNetwork(base.network, { choice, unrestricted: args?.unrestricted_internet,
+            allowDomains: args?.allow_domains, allowCidrs: args?.allow_cidrs });
         }
       }
       return JSON.stringify(await platformRequest('PUT', url, projectId ? { override: policy } : { policy }));

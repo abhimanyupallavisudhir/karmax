@@ -660,9 +660,11 @@ export interface ProjectConfig {
    * the task's files get (E2B: template `minFreeDiskMb`; Daytona: disk size). */
   runnerPoolId?: string;
   resources?: { cpu?: number; memoryMb?: number; diskGb?: number; gpu?: number };
-  /** Remote-world egress policy. Normal coding uses unrestricted internet;
-   * allowlists are an explicit organization-level hardening mode. */
-  network?: { allowDomains?: string[]; allowCidrs?: string[]; unrestricted?: boolean };
+  /** Remote-world egress policy (`networkChoice` in computer.ts): Full
+   * internet (`unrestricted: true`, or none), Basic internet is enough
+   * (`basic: true`: routing may pick an account that reaches only essential
+   * services) or Allowlist only (`unrestricted: false` with its lists). */
+  network?: { allowDomains?: string[]; allowCidrs?: string[]; unrestricted?: boolean; basic?: boolean };
   /** Immutable remote environment selector. Provider adapters resolve this to
    * their image/snapshot primitive and stamp the result on the world handle. */
   environment?: { flavor?: 'headless' | 'desktop'; template?: string; image?: string; snapshot?: string };

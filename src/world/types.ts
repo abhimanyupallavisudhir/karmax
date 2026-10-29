@@ -182,7 +182,9 @@ export interface WorldSpec {
   repositoryOrigins?: Record<string, string>;
   /** Provider-internal per-repository projection of repositoryAuthorities. */
   sourceAuthority?: 'project' | 'origin';
-  network?: { allowDomains?: string[]; allowCidrs?: string[]; unrestricted?: boolean };
+  /** Absent ⇒ deny by default; Full and Basic both mean open egress
+   * (`worldNetworkOpen`): Basic only lets routing pick a basic-only account. */
+  network?: { allowDomains?: string[]; allowCidrs?: string[]; unrestricted?: boolean; basic?: boolean };
   environment?: { flavor?: 'headless' | 'desktop'; template?: string; image?: string; snapshot?: string };
   resources?: { cpu?: number; memoryMb?: number; diskGb?: number; gpu?: number };
   /** Where the checkouts sit under the world root. `flat` (the default for a
@@ -538,4 +540,10 @@ export function worldWorkingRelativePath(handle: WorldHandle, relPath: string): 
   if (!workdir.startsWith(`${root}/`)) throw new Error('working directory escapes world');
   const prefix = workdir.slice(root.length + 1);
   return safe === '.' ? prefix : `${prefix}/${safe}`;
+}
+
+/** Whether a world's network policy is open egress (Full or Basic internet)
+ * rather than an allowlist. A world spec without one is denied by default. */
+export function worldNetworkOpen(network: WorldSpec['network']): boolean {
+  return network?.unrestricted === true || (network?.basic === true && network.unrestricted !== false);
 }

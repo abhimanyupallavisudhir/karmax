@@ -18,6 +18,20 @@ describe('E2B cloud world provider', () => {
     await expect(provider.open(world.handle)).resolves.toBeDefined();
   });
 
+  it('gives Basic and Full the open internet, and only the allowlist its rules', async () => {
+    const updates: unknown[] = [];
+    const sandbox = fakeSandbox(() => undefined);
+    sandbox.updateNetwork = async (network) => { updates.push(network); };
+    const created: Array<Record<string, unknown>> = [];
+    const provider = new E2BWorldProvider({ create: async (options: Record<string, unknown>) => { created.push(options); return sandbox; },
+      connect: async () => sandbox } as any);
+    for (const network of [{ unrestricted: true }, { basic: true }]) await provider.create({ taskId: `open-${updates.length}`, base: 'main', network });
+    expect(updates).toEqual([]);
+    expect(created.every((options) => options.allowInternetAccess === true)).toBe(true);
+    await provider.create({ taskId: 'allowlist', base: 'main', network: { unrestricted: false, allowDomains: ['pypi.org'] } });
+    expect(updates).toEqual([expect.objectContaining({ allowOut: expect.arrayContaining(['pypi.org']), denyOut: ['0.0.0.0/0'] })]);
+  });
+
   it('runs a computer of another size on a template built once at that size', async () => {
     const created: Array<string | undefined> = [];
     const ensureTemplate = vi.fn(async () => undefined);

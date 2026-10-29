@@ -54,6 +54,17 @@ describe('the computer in the World section', () => {
     expect(assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world })).not.toContain('Computer:');
   });
 
+  it('tells an agent on a basic-internet machine that only essential services are reachable', () => {
+    const daytona = { ...world, kind: 'daytona', meta: { computer: { cpu: 2, memoryMb: 4096 } } } as any;
+    const basic = { cpu: 4, source: { cpu: 'provider' } as const, network: { internet: 'basic' as const, allowlist: false } };
+    const prompt = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world: daytona, limits: basic });
+    expect(prompt).toContain('This machine reaches only essential services: package registries, Git hosts, AI and cloud APIs, CDNs and container registries.');
+    // A Tier 3 account, or E2B, reaches the open internet: nothing to say.
+    for (const [kind, limits] of [['daytona', { ...basic, network: { internet: 'full' as const, allowlist: true } }], ['e2b', undefined]] as const)
+      expect(assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world: { ...daytona, kind }, limits }))
+        .not.toContain('reaches only essential services');
+  });
+
   // compute-disk item 2: the real ceiling, not a generic "diskGb: 50".
   it('names the disk in use and the largest the account allows, and offers exactly that', () => {
     const e2b = { ...world, kind: 'e2b', meta: { computer: { cpu: 2, memoryMb: 2048 } } } as any;

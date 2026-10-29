@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { applyComputer, assertInFlightComputerEdit, computerConfig, computerOf, describeMachine, machineShape,
-  normalizeComputer, sameMachine } from '../src/domain/computer.js';
+  networkChoice, normalizeComputer, sameMachine } from '../src/domain/computer.js';
 
 describe('computer value', () => {
   it('round-trips between the form value and the execution config', () => {
@@ -48,5 +48,28 @@ describe('computer value', () => {
     expect(() => assertInFlightComputerEdit(current, { flavor: 'desktop' })).toThrow(/experience/);
     expect(() => assertInFlightComputerEdit(current, { network: { unrestricted: false, allowDomains: [], allowCidrs: [] } })).toThrow(/network/);
     expect(() => assertInFlightComputerEdit(current, { network: { unrestricted: true } })).not.toThrow();
+  });
+
+  it('has three outbound network choices, and stored values keep their meaning', () => {
+    // Stored before Basic existed: unrestricted true is Full, false is the allowlist; none is Full.
+    expect(networkChoice({ unrestricted: true })).toBe('full');
+    expect(networkChoice({ unrestricted: false, allowDomains: [] })).toBe('allowlist');
+    expect(networkChoice(undefined)).toBe('full');
+    expect(networkChoice({ basic: true })).toBe('basic');
+    expect(normalizeComputer({ network: { unrestricted: true } })).toEqual({ network: { unrestricted: true } });
+    expect(normalizeComputer({ network: { basic: true } })).toEqual({ network: { basic: true } });
+    // The API, MCP and CLI may name the choice.
+    expect(normalizeComputer({ network: 'full' })).toEqual({ network: { unrestricted: true } });
+    expect(normalizeComputer({ network: 'basic' })).toEqual({ network: { basic: true } });
+    expect(normalizeComputer({ network: 'allowlist' })).toEqual({ network: { unrestricted: false, allowDomains: [], allowCidrs: [] } });
+    expect(() => normalizeComputer({ network: 'open' })).toThrow(/network must be full, basic or allowlist/);
+    // An allowlist wins over a stray basic flag; basic drops lists it does not use.
+    expect(normalizeComputer({ network: { unrestricted: false, basic: true, allowDomains: ['a.com'] } }))
+      .toEqual({ network: { unrestricted: false, allowDomains: ['a.com'], allowCidrs: [] } });
+    expect(normalizeComputer({ network: { basic: true, allowDomains: ['a.com'] } })).toEqual({ network: { basic: true } });
+    // A running task keeps its network: Basic is not Full.
+    expect(() => assertInFlightComputerEdit({ network: { basic: true } }, { network: { unrestricted: true } })).toThrow(/network/);
+    expect(() => assertInFlightComputerEdit({ network: { basic: true } }, { network: { basic: true } })).not.toThrow();
+    expect(() => assertInFlightComputerEdit({}, { network: { unrestricted: true } })).not.toThrow();
   });
 });

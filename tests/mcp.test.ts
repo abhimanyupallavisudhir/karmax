@@ -368,6 +368,15 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     expect((await call({ unrestrictedInternet: false })).network).toMatchObject({
       unrestricted: false, allowCidrs: ['10.0.0.0/8'],
     });
+
+    // The three outbound choices by name: Basic drops the lists, Allowlist keeps them.
+    expect((await call({ network: 'basic' })).network).toEqual({ basic: true });
+    expect((await call({ network: 'allowlist', allowDomains: ['pypi.org'] })).network)
+      .toEqual({ unrestricted: false, allowDomains: ['pypi.org'], allowCidrs: [] });
+    expect((await call({ network: 'full' })).network).toEqual({ unrestricted: true });
+    await call({ network: 'basic' });
+    // The legacy flag still means what it did: true is Full, not "Basic and unrestricted".
+    expect((await call({ unrestrictedInternet: true })).network).toEqual({ unrestricted: true });
   });
 
   /**

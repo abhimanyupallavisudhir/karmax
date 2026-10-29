@@ -82,16 +82,24 @@ describe('the Computer block', () => {
     // The computer sits between the agents and the branches; triggers, then the Avatar setting, come last.
     expect(await body.locator('.tf-main > section').evaluateAll((sections) => sections.map((section) => section.className.replace('tf-section ', ''))))
       .toEqual(['tf-agent', 'tf-responder', 'tf-confirmer', 'tf-computer', 'tf-where', 'tf-triggers', 'tf-avatar']);
-    expect(await values(block)).toEqual({ provider: 'e2b', cpu: '2', memory: '4', disk: '50', flavor: 'headless', hibernate: '7', network: 'unrestricted' });
+    expect(await values(block)).toEqual({ provider: 'e2b', cpu: '2', memory: '4', disk: '50', flavor: 'headless', hibernate: '7', network: 'full' });
     await body.locator('textarea[data-field="prompt"]').fill('Download the dataset');
     await block.locator('.cf-disk').fill('60');
     await block.locator('.cf-disk').dispatchEvent('change');
     await expect.poll(async () => (await store.listTasks(project.id)).find((task) => task.params?.prompt === 'Download the dataset')?.params?.computer,
       { timeout: 15_000 }).toEqual({ diskGb: 60 });
-    // Restricted network reveals its allowlist; the account's limit caps the disk.
+    // Three outbound choices, explained on hover only; Basic is stored compactly.
     await block.locator('.computer-more > summary').click();
+    const network = block.locator('.cf-network');
+    expect(await network.locator('option').allTextContents()).toEqual(['Full internet', 'Basic internet is enough', 'Allowlist only']);
+    expect(await network.evaluate((select) => select.closest('label')!.querySelector('[title]')!.getAttribute('title')))
+      .toMatch(/^Full internet: any website\. Basic: only package registries \(npm, PyPI, Maven…\), Git hosts \(GitHub, GitLab\), AI APIs/);
     expect(await block.locator('.cf-allowlist').isHidden()).toBe(true);
-    await block.locator('.cf-network').selectOption('restricted');
+    await network.selectOption('basic');
+    await expect.poll(async () => (await store.listTasks(project.id)).find((task) => task.params?.prompt === 'Download the dataset')?.params?.computer,
+      { timeout: 15_000 }).toEqual({ diskGb: 60, network: { basic: true } });
+    // Allowlist only reveals its lists; the account's limit caps the disk.
+    await network.selectOption('allowlist');
     expect(await block.locator('.cf-allowlist').isVisible()).toBe(true);
     expect(await block.locator('.cf-disk').getAttribute('max')).toBe('64');
     expect(errors).toEqual([]);
@@ -105,8 +113,11 @@ describe('the Computer block', () => {
     const reset = page.locator('#task-defaults-project .td-computer .field-reset');
     expect(await reset.isVisible()).toBe(true);
     await block.locator('.cf-cpu').fill('4');
+    await block.locator('.computer-more > summary').click();
+    await block.locator('.cf-network').selectOption('basic');
     await page.locator('#task-defaults-project [data-save-task-defaults]').click();
     await expect.poll(async () => (await store.getProject(project.id))!.config.resources).toEqual({ cpu: 4, diskGb: 50 });
+    expect((await store.getProject(project.id))!.config.network).toEqual({ basic: true });
     // Reset: the project inherits the organization's computer again.
     await reset.click();
     await page.locator('#task-defaults-project [data-save-task-defaults]').click();

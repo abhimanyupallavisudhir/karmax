@@ -21,11 +21,14 @@ describe('computer limits', () => {
   // A provider's form shows only what it can do: VM worlds have no desktop and
   // no outbound allowlist; providers without a record (this machine) offer all.
   it('says which Computer options each provider supports', () => {
-    expect(providerFeatures('e2b')).toEqual({ desktop: true, allowlist: true, environmentBuilds: true });
-    expect(providerFeatures('daytona')).toEqual({ desktop: true, allowlist: true, environmentBuilds: true });
-    expect(providerFeatures('fly')).toEqual({ desktop: false, allowlist: false, environmentBuilds: false });
-    expect(providerFeatures('hetzner')).toEqual({ desktop: false, allowlist: false, environmentBuilds: false });
-    expect(providerFeatures('container')).toEqual({ desktop: true, allowlist: true, environmentBuilds: true });
+    expect(providerFeatures('e2b')).toEqual({ desktop: true, internet: 'full', allowlist: true, environmentBuilds: true });
+    // Daytona's network is measured per account; until then, what Tier 1 gives.
+    expect(providerFeatures('daytona')).toEqual({ desktop: true, internet: 'basic', allowlist: false, environmentBuilds: true });
+    expect(providerFeatures('fly')).toEqual({ desktop: false, internet: 'full', allowlist: false, environmentBuilds: false });
+    expect(providerFeatures('hetzner')).toEqual({ desktop: false, internet: 'full', allowlist: false, environmentBuilds: false });
+    expect(providerFeatures('container')).toEqual({ desktop: true, internet: 'full', allowlist: true, environmentBuilds: true });
+    // A measurement only speaks for a provider that measures it.
+    expect(providerFeatures('hetzner', { network: { internet: 'full', allowlist: true } })).toMatchObject({ allowlist: false });
   });
   it('reads the limit out of each provider\'s refusal', () => {
     expect(limitFromMessage(E2B.disk)).toEqual({ dimension: 'disk', value: 25600, unit: 'MiB' });
@@ -122,14 +125,65 @@ describe('provider limit probes', () => {
       return { status: 404, body: {} };
     });
     const limits = await probeDaytonaLimits('dtn-key', { fetch, apiUrl: 'https://daytona.test/api', target: 'us', now: () => 9 });
-    expect(limits).toEqual({ cpu: 4, memoryMb: 8192, diskGb: 10, pool: { cpu: 10, memoryMb: 10_240, diskGb: 30 }, checkedAt: 9 });
-    expect(calls.filter((call) => call.method === 'POST').every((call) => call.body.buildInfo)).toBe(true);
+    // A size refusal to the network rule too: this account accepts rules (Tier 3+).
+    expect(limits).toEqual({ cpu: 4, memoryMb: 8192, diskGb: 10, pool: { cpu: 10, memoryMb: 10_240, diskGb: 30 },
+      network: { internet: 'full', allowlist: true }, checkedAt: 9 });
+    // Every size is asked of an image build, refused before anything is queued.
+    expect(calls.filter((call) => call.method === 'POST' && call.body.labels?.karmaxProbe === 'limits').every((call) => call.body.buildInfo)).toBe(true);
   });
 
   it('keeps what it learned when part of a Daytona probe fails', async () => {
     const { fetch } = fakeFetch(({ method }) => method === 'POST'
       ? { status: 400, body: { message: DAYTONA.disk } } : { status: 401, body: { message: 'Invalid credentials' } });
     expect(await probeDaytonaLimits('dtn-key', { fetch, apiUrl: 'https://daytona.test/api', now: () => 3 }))
-      .toEqual({ diskGb: 10, checkedAt: 3 });
+      .toEqual({ diskGb: 10, network: { internet: 'full', allowlist: true }, checkedAt: 3 });
+  });
+
+  // Daytona Tier 1–2 (docs network-limits, 2026-10-29): "network access is
+  // restricted and cannot be overridden at the sandbox level". Hosted
+  // Daytona's own words, checked live 2026-10-29 on production's Tier 1
+  // organization: the network rule is refused before the size is looked at.
+  const RESTRICTED = 'Network access is restricted and cannot be overridden at the sandbox level. Remove domainAllowList from the request. See https://www.daytona.io/docs/en/network-limits/#tier-based-network-restrictions';
+  const daytonaApi = (organization: Record<string, unknown> | undefined, network: (call: Call) => { status: number; body: unknown }) =>
+    fakeFetch((call) => {
+      if (call.url.endsWith('/api-keys/current')) return { status: 200, body: { organizationId: 'org-1' } };
+      // Hosted Daytona does not let an API key read the organization record.
+      if (call.url.endsWith('/organizations/org-1')) return organization ? { status: 200, body: organization } : { status: 401, body: { message: 'Invalid credentials' } };
+      if (call.body?.labels?.karmaxProbe === 'network') return network(call);
+      if (call.method === 'POST') return { status: 400, body: { message: DAYTONA.disk } };
+      return { status: 404, body: {} };
+    });
+  const network = { basic: { internet: 'basic', allowlist: false }, full: { internet: 'full', allowlist: true } } as const;
+
+  it('reads whether a Daytona organization reaches only essential services from its record', async () => {
+    for (const [limited, expected] of [[true, network.basic], [false, network.full]] as const) {
+      const { calls, fetch } = daytonaApi({ id: 'org-1', sandboxLimitedNetworkEgress: limited }, () => { throw new Error('not asked'); });
+      expect(await probeDaytonaLimits('dtn-key', { fetch, apiUrl: 'https://daytona.test/api', now: () => 4 }))
+        .toEqual({ diskGb: 10, network: expected, checkedAt: 4 });
+      expect(calls.some((call) => call.body?.labels?.karmaxProbe === 'network')).toBe(false);
+    }
+  });
+
+  it('otherwise asks for a sandbox with a network rule and an impossible disk, making nothing', async () => {
+    // Tier 1–2: the rule is refused first.
+    let probe = daytonaApi(undefined, () => ({ status: 400, body: { message: RESTRICTED } }));
+    expect(await probeDaytonaLimits('dtn-key', { fetch: probe.fetch, apiUrl: 'https://daytona.test/api', now: () => 5 }))
+      .toEqual({ diskGb: 10, network: network.basic, checkedAt: 5 });
+    expect(probe.calls.find((call) => call.body?.labels?.karmaxProbe === 'network')).toMatchObject({ method: 'POST',
+      url: 'https://daytona.test/api/sandbox', body: { domainAllowList: expect.any(String), disk: 100_000, buildInfo: expect.anything() } });
+    // Tier 3+: the rule passes, the size does not.
+    probe = daytonaApi(undefined, () => ({ status: 400, body: { message: DAYTONA.disk } }));
+    expect(await probeDaytonaLimits('dtn-key', { fetch: probe.fetch, apiUrl: 'https://daytona.test/api', now: () => 6 }))
+      .toEqual({ diskGb: 10, network: network.full, checkedAt: 6 });
+    // Made after all: that answers too, and it is deleted.
+    const made = fakeFetch((call) => call.url.endsWith('/api-keys/current') ? { status: 200, body: { organizationId: 'org-1' } }
+      : call.body?.labels?.karmaxProbe === 'network' ? { status: 200, body: { id: 'sbx-1' } }
+      : call.method === 'DELETE' ? { status: 200, body: {} } : call.method === 'POST' ? { status: 400, body: { message: DAYTONA.disk } } : { status: 401, body: {} });
+    expect((await probeDaytonaLimits('dtn-key', { fetch: made.fetch, apiUrl: 'https://daytona.test/api', now: () => 7 })).network).toEqual(network.full);
+    expect(made.calls).toContainEqual({ method: 'DELETE', url: 'https://daytona.test/api/sandbox/sbx-1', body: undefined });
+    // A refusal that says nothing about either (an outage) tells nothing.
+    probe = daytonaApi(undefined, () => ({ status: 503, body: { message: 'Service Unavailable' } }));
+    expect(await probeDaytonaLimits('dtn-key', { fetch: probe.fetch, apiUrl: 'https://daytona.test/api', now: () => 8 }))
+      .toEqual({ diskGb: 10, checkedAt: 8 });
   });
 });

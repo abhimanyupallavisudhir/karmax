@@ -1,4 +1,4 @@
-import { describeMachine, type ComputeRegion, type MachineShape } from './computer.js';
+import { DEFAULT_MACHINE, describeMachine, type ComputeRegion, type MachineShape } from './computer.js';
 
 /**
  * What one provider account lets a Computer be (wiki features/computers).
@@ -23,8 +23,20 @@ export interface ComputerLimits {
   /** The organization's total across all its running machines, when the
    * provider has one (Daytona's tiers). One machine never exceeds it. */
   pool?: { cpu?: number; memoryMb?: number; diskGb?: number };
+  /** What the account's outbound network gives, when the provider says so per
+   * account (Daytona's tiers); otherwise the provider's documented features. */
+  network?: AccountNetwork;
   /** When the provider was last asked. */
   checkedAt?: number;
+}
+
+/** What an account's machines can reach: the open internet, or only the
+ * provider's fixed essential services (Daytona Tier 1–2: package registries,
+ * Git hosts, AI and cloud APIs, CDNs); and whether it enforces a custom
+ * outbound allowlist (`network.unrestricted: false`). */
+export interface AccountNetwork {
+  internet: 'full' | 'basic';
+  allowlist: boolean;
 }
 
 export type LimitSource = 'provider' | 'configured' | 'default';
@@ -45,6 +57,9 @@ interface ProviderFacts {
   limits: ComputerLimits;
   /** What else a Computer may ask of it; the form shows only these. */
   features: ComputerFeatures;
+  /** Its network is measured per account (ComputerLimits.network), these
+   * features being only what an account gives until it is asked. */
+  measuresNetwork?: boolean;
   /** List price in USD, for ranking where "Any" runs a task (compute-router.ts):
    * per vCPU-hour, per GB of memory per hour, per GB of disk per month, and
    * per running hour whatever the size (a public IPv4 address). */
@@ -60,6 +75,8 @@ interface ProviderFacts {
 export interface ComputerFeatures {
   /** A screen people can watch and take over (`flavor: 'desktop'`). */
   desktop: boolean;
+  /** The open internet, or only the provider's essential services ("Basic"). */
+  internet: 'full' | 'basic';
   /** Outbound network limited to an allowlist (`network.unrestricted: false`). */
   allowlist: boolean;
   /** Project setup baked into an image or snapshot (Project Settings →
@@ -67,8 +84,29 @@ export interface ComputerFeatures {
   environmentBuilds: boolean;
 }
 
-const ALL_FEATURES: ComputerFeatures = { desktop: true, allowlist: true, environmentBuilds: true };
-const VM_FEATURES: ComputerFeatures = { desktop: false, allowlist: false, environmentBuilds: false };
+const ALL_FEATURES: ComputerFeatures = { desktop: true, internet: 'full', allowlist: true, environmentBuilds: true };
+const VM_FEATURES: ComputerFeatures = { desktop: false, internet: 'full', allowlist: false, environmentBuilds: false };
+/** Daytona Tier 1–2, where every account starts (docs network-limits,
+ * 2026-10-29): only essential services, and no sandbox may set its own rules.
+ * Tier 3+ gives the open internet and allowlists; the probe tells them apart. */
+const DAYTONA_TIER_1_FEATURES: ComputerFeatures = { ...ALL_FEATURES, internet: 'basic', allowlist: false };
+
+/** Daytona's general Linux snapshots, smallest first (cpu, GiB RAM, GB disk). */
+export const DAYTONA_SIZES = [
+  { snapshot: 'daytona-small', cpu: 1, memory: 1, disk: 3 },
+  { snapshot: 'daytona-medium', cpu: 2, memory: 4, disk: 8 },
+  { snapshot: 'daytona-large', cpu: 4, memory: 8, disk: 10 },
+] as const;
+/** The smallest general Daytona size that covers the requested CPU, memory
+ * and disk (the largest when none does); an unset size is karmax's default
+ * machine, the same 2 vCPU / 2 GB as E2B's template. */
+export function daytonaSize(resources?: MachineShape): (typeof DAYTONA_SIZES)[number] {
+  const cpu = resources?.cpu ?? DEFAULT_MACHINE.cpu;
+  const memoryMb = resources?.memoryMb ?? DEFAULT_MACHINE.memoryMb;
+  const diskGb = resources?.diskGb ?? 0;
+  return DAYTONA_SIZES.find((size) => size.cpu >= cpu && size.memory * 1024 >= memoryMb && size.disk >= diskGb)
+    ?? DAYTONA_SIZES.at(-1)!;
+}
 
 /** One entry per cloud provider. A new provider (Fly.io, Hetzner…) adds its
  * documented facts here and, if its API can tell, a probe in provider-limits.ts. */
@@ -83,8 +121,8 @@ const PROVIDERS: Record<string, ProviderFacts> = {
     price: { cpuHour: 0.0504, gbHour: 0.0162, diskGbMonth: 0 }, wakeSeconds: 2, region: () => 'us' },
   // Daytona's documented per-sandbox maximum (raised by its support); karmax
   // starts a default computer on `daytona-medium` (2 vCPU / 4 GiB / 8 GB).
-  daytona: { label: 'Daytona', defaults: { cpu: 2, memoryMb: 4096, diskGb: 8 }, limits: { cpu: 4, memoryMb: 8192, diskGb: 10 }, features: ALL_FEATURES,
-    price: { cpuHour: 0.0504, gbHour: 0.0162, diskGbMonth: 0.08 }, wakeSeconds: 3,
+  daytona: { label: 'Daytona', defaults: { cpu: 2, memoryMb: 4096, diskGb: 8 }, limits: { cpu: 4, memoryMb: 8192, diskGb: 10 },
+    features: DAYTONA_TIER_1_FEATURES, measuresNetwork: true, price: { cpuHour: 0.0504, gbHour: 0.0162, diskGbMonth: 0.08 }, wakeSeconds: 3,
     region: (config) => (config.target === 'eu' ? 'eu' : 'us') },
   // VM worlds (wiki features/vm-worlds): disk is the volume mounted as the
   // home, the size `df ~` shows. Fly: a volume holds at most 500 GB, the
@@ -152,10 +190,59 @@ export function providerLabel(provider: string): string {
   return PROVIDERS[provider]?.label ?? provider;
 }
 
-/** What else a Computer on `provider` may ask for. A provider without a
- * record (this machine, Docker) offers everything. */
-export function providerFeatures(provider: string): ComputerFeatures {
-  return { ...(PROVIDERS[provider]?.features ?? ALL_FEATURES) };
+/** What else a Computer on `provider` may ask for: what the account said of
+ * its network (`measured`), else the provider's documented features. A
+ * provider without a record (this machine, Docker) offers everything. */
+export function providerFeatures(provider: string, measured?: ComputerLimits): ComputerFeatures {
+  const facts = PROVIDERS[provider];
+  const network = facts?.measuresNetwork && measured?.network ? accountNetwork(measured.network) : undefined;
+  return { ...(facts?.features ?? ALL_FEATURES), ...network };
+}
+
+/** Whether a provider's network is measured per account, so an account not yet
+ * asked should be. */
+export function measuresNetwork(provider: string): boolean {
+  return PROVIDERS[provider]?.measuresNetwork === true;
+}
+
+function accountNetwork(value: unknown): AccountNetwork | undefined {
+  const raw = value as Partial<AccountNetwork> | undefined;
+  return raw && (raw.internet === 'full' || raw.internet === 'basic') && typeof raw.allowlist === 'boolean'
+    ? { internet: raw.internet, allowlist: raw.allowlist } : undefined;
+}
+
+/** What a machine asked as `shape` really takes on `provider`: Daytona rounds
+ * a size up to its general snapshots (an image is made at the size asked, so
+ * this may overcount it); every other provider gives the size asked. */
+export function providerMachine(provider: string, shape: MachineShape): { cpu: number; memoryMb: number } {
+  const defaults = PROVIDERS[provider]?.defaults;
+  if (provider === 'daytona') {
+    const size = daytonaSize(shape);
+    return { cpu: size.cpu, memoryMb: size.memory * 1024 };
+  }
+  return { cpu: shape.cpu ?? defaults?.cpu ?? DEFAULT_MACHINE.cpu, memoryMb: shape.memoryMb ?? defaults?.memoryMb ?? DEFAULT_MACHINE.memoryMb };
+}
+
+/** The outbound network a Computer asks for (`networkChoice` in computer.ts). */
+export type NetworkChoice = 'full' | 'basic' | 'allowlist';
+
+/** Why an account with `features` cannot give `choice`, in a few words; or
+ * undefined when it can. Full needs the open internet, Basic anything, an
+ * allowlist an account that enforces one. */
+export function networkUnfit(choice: NetworkChoice | undefined, features: ComputerFeatures): string | undefined {
+  if (choice === 'allowlist') return features.allowlist ? undefined : 'no outbound allowlist';
+  if (choice === 'basic') return undefined;
+  return features.internet === 'full' ? undefined : 'basic internet only';
+}
+
+/** Refuse a network choice the account cannot give, before any machine is made. */
+export function assertNetworkFits(choice: NetworkChoice | undefined, features: ComputerFeatures, provider: string): void {
+  const reason = networkUnfit(choice, features);
+  if (!reason) return;
+  const account = `This ${providerLabel(provider)} account`;
+  throw new Error(reason === 'basic internet only'
+    ? `${account} gives basic internet only (registries, Git hosts, AI and cloud APIs): choose Basic internet is enough, or another provider`
+    : `${account} has no outbound allowlist: choose another provider`);
 }
 
 /** The machine a provider gives when the Computer asks for nothing more. */
@@ -178,6 +265,8 @@ export function computerLimits(provider: string, measured?: ComputerLimits, conf
     if (value !== undefined) { out[key] = value; out.source[key] = source; }
   }
   if (measured?.pool && Object.keys(measured.pool).length) out.pool = { ...measured.pool };
+  const network = facts.measuresNetwork ? accountNetwork(measured?.network) : undefined;
+  if (network) out.network = network;
   if (measured?.checkedAt) out.checkedAt = measured.checkedAt;
   return out;
 }

@@ -53,8 +53,8 @@ describe('the rule', () => {
     // A desktop or an allowlist only where the provider has one.
     expect(rankComputeOptions({ desktop: true }, [option('aws', 'managed'), option('e2b', 'own')]).rejected)
       .toEqual([{ provider: 'aws', funding: 'managed', reason: 'no desktop' }]);
-    expect(rankComputeOptions({ allowlist: true }, [option('hetzner', 'managed'), option('daytona', 'own')]).candidates
-      .map((candidate) => candidate.provider)).toEqual(['daytona']);
+    expect(rankComputeOptions({ allowlist: true }, [option('hetzner', 'managed'), option('e2b', 'own')]).candidates
+      .map((candidate) => candidate.provider)).toEqual(['e2b']);
   });
 
   it('tries the organization\'s own accounts first, then managed compute by price for the size', () => {
@@ -164,8 +164,8 @@ describe('a CPU quota shared by an account\'s machines', () => {
     const task = await f.store.createTask({ projectId: project.id, title: 'Big', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } as any });
     const runners = new RunnerPoolService(f.store, f.connections);
     const lease = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'gcp', resources: { cpu: 22, memoryMb: 4096 } });
-    expect(await f.store.runningWorldCpus('gcp', null)).toBe(22);
-    expect(await f.store.runningWorldCpus('gcp', other.id)).toBe(0);
+    expect(await f.store.runningWorldMachines('gcp', null)).toEqual([{ cpu: 22, memoryMb: 4096 }]);
+    expect(await f.store.runningWorldMachines('gcp', other.id)).toEqual([]);
 
     const gcp = async (cpu: number) => (await f.router.options(f.organization.id, { cpu })).find((value) => value.provider === 'gcp');
     expect((await gcp(2))?.busy).toBeUndefined();
@@ -174,6 +174,116 @@ describe('a CPU quota shared by an account\'s machines', () => {
       .toEqual([{ provider: 'gcp', funding: 'managed', reason: '22 of its 24 CPUs in use', busy: true }]);
     await runners.release(lease.leaseId, 'gcp');
     expect((await gcp(4))?.busy).toBeUndefined();
+  });
+});
+
+describe('outbound network', () => {
+  // What each account gives (wiki features/compute-routing): E2B the open
+  // internet and an allowlist; a Daytona Tier 1–2 account only its essential
+  // services, no allowlist; Tier 3+ both; VM providers the open internet only.
+  const tier12 = { internet: 'basic' as const, allowlist: false };
+  const tier3 = { internet: 'full' as const, allowlist: true };
+  const daytona = (network: { internet: 'full' | 'basic'; allowlist: boolean }, extra: Partial<ComputeOption> = {}) =>
+    option('daytona', 'own', { features: providerFeatures('daytona', { network }), ...extra });
+
+  it('reads the choice from the Computer, keeping what stored values meant', () => {
+    expect(computeNeeds({ network: { unrestricted: true } })).toEqual({});
+    expect(computeNeeds({})).toEqual({});
+    expect(computeNeeds({ network: { basic: true } })).toEqual({ basic: true });
+    expect(computeNeeds({ network: { unrestricted: false, allowDomains: ['pypi.org'] } })).toEqual({ allowlist: true });
+  });
+
+  it('gives Full only accounts with the open internet, Basic any, Allowlist only accounts that enforce one', () => {
+    const options = [daytona(tier12), option('e2b', 'own'), option('hetzner', 'managed')];
+    const providers = (route: ReturnType<typeof rankComputeOptions>) => route.candidates.map((candidate) => candidate.provider).sort();
+    const full = rankComputeOptions({}, options);
+    expect(providers(full)).toEqual(['e2b', 'hetzner']);
+    expect(full.rejected).toEqual([{ provider: 'daytona', funding: 'own', reason: 'basic internet only' }]);
+    expect(providers(rankComputeOptions({ basic: true }, options))).toEqual(['daytona', 'e2b', 'hetzner']);
+    const allowlist = rankComputeOptions({ allowlist: true }, options);
+    expect(providers(allowlist)).toEqual(['e2b']);
+    expect(allowlist.rejected).toEqual([{ provider: 'daytona', funding: 'own', reason: 'no outbound allowlist' },
+      { provider: 'hetzner', funding: 'managed', reason: 'no outbound allowlist' }]);
+    // A Tier 3 account gives all three.
+    for (const needs of [{}, { basic: true as const }, { allowlist: true as const }])
+      expect(providers(rankComputeOptions(needs, [daytona(tier3)]))).toEqual(['daytona']);
+  });
+
+  it('knows what each provider gives until the account itself is asked', () => {
+    expect(providerFeatures('e2b')).toMatchObject({ internet: 'full', allowlist: true });
+    expect(providerFeatures('hetzner')).toMatchObject({ internet: 'full', allowlist: false });
+    // Every Daytona account starts on Tier 1: until measured, basic internet only.
+    expect(providerFeatures('daytona')).toMatchObject({ internet: 'basic', allowlist: false });
+    expect(providerFeatures('daytona', { network: tier3 })).toMatchObject({ internet: 'full', allowlist: true });
+    expect(providerFeatures('worktree')).toMatchObject({ internet: 'full', allowlist: true });
+  });
+
+  it('refuses a named provider that cannot give the choice when the Computer is saved, and Any when none can', async () => {
+    const f = await fixture({ plan: 'team' });
+    await f.connections.save({ organizationId: f.organization.id, provider: 'daytona', apiKey: 'dtn' });
+    await f.store.setWorldProviderConnectionLimits(f.organization.id, 'daytona', { network: tier12, checkedAt: 1 });
+    expect((await f.connections.get(f.organization.id, 'daytona'))?.features).toMatchObject({ internet: 'basic', allowlist: false });
+    await expect(f.connections.assertFits(f.organization.id, 'daytona', {}, 'full'))
+      .rejects.toThrow('This Daytona account gives basic internet only');
+    await expect(f.connections.assertFits(f.organization.id, 'daytona', {}, 'allowlist'))
+      .rejects.toThrow('This Daytona account has no outbound allowlist');
+    await expect(f.connections.assertFits(f.organization.id, 'daytona', {}, 'basic')).resolves.toBeUndefined();
+    // Any: refused only when no account the organization can use gives it.
+    await expect(f.connections.assertFits(f.organization.id, 'any', {}, 'full')).rejects.toThrow('basic internet only');
+    await expect(f.connections.assertFits(f.organization.id, 'any', {}, 'basic')).resolves.toBeUndefined();
+    await f.connections.save({ organizationId: f.organization.id, provider: 'hetzner', apiKey: 'h' });
+    await expect(f.connections.assertFits(f.organization.id, 'any', {}, 'full')).resolves.toBeUndefined();
+    await expect(f.connections.assertFits(f.organization.id, 'any', {}, 'allowlist')).rejects.toThrow('no outbound allowlist');
+    // A tier upgrade is noticed at the next measurement.
+    await f.store.setWorldProviderConnectionLimits(f.organization.id, 'daytona', { network: tier3, checkedAt: 2 });
+    await expect(f.connections.assertFits(f.organization.id, 'daytona', {}, 'allowlist')).resolves.toBeUndefined();
+    expect((await f.router.route(f.organization.id, { worldProvider: 'any', network: { unrestricted: false } })).candidates
+      .map((candidate) => candidate.provider)).toEqual(['daytona']);
+  });
+
+  it('asks an account that has never said what its network gives, and keeps what it said when it cannot answer', async () => {
+    let answer: Record<string, unknown> | undefined = { network: tier12 };
+    const asked: string[] = [];
+    const store = await Store.create(':memory:', { hosted: true });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-network-'));
+    cleanups.push(async () => { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+    const connections = new WorldProviderConnectionService(store, new CredentialBroker(new Vault(path.join(dir, 'vault'))), {
+      check: async () => {}, limits: async (provider) => { asked.push(provider); return { cpu: 4, ...answer, checkedAt: Date.now() }; } });
+    const organization = await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
+    await connections.save({ organizationId: organization.id, provider: 'daytona', apiKey: 'dtn' });
+    // Limits measured before the network was: a listing asks again.
+    await store.setWorldProviderConnectionLimits(organization.id, 'daytona', { cpu: 4, checkedAt: 1 });
+    expect((await connections.list(organization.id)).find((view) => view.provider === 'daytona')?.features)
+      .toMatchObject({ internet: 'basic', allowlist: false });
+    expect(asked).toEqual(['daytona']);
+    expect((await store.getWorldProviderConnection(organization.id, 'daytona'))?.measuredLimits?.network).toEqual(tier12);
+    // A test that cannot tell keeps what was known.
+    answer = undefined;
+    await connections.test(organization.id, 'daytona');
+    expect((await store.getWorldProviderConnection(organization.id, 'daytona'))?.measuredLimits?.network).toEqual(tier12);
+    answer = { network: tier3 };
+    await connections.test(organization.id, 'daytona');
+    expect((await connections.get(organization.id, 'daytona'))?.features).toMatchObject({ internet: 'full', allowlist: true });
+  });
+});
+
+describe('a memory quota shared by an account\'s machines', () => {
+  it('counts the memory running on it as the provider gives it (Daytona rounds up to its sizes)', async () => {
+    const f = await fixture({ plan: 'team' });
+    await f.connections.save({ organizationId: f.organization.id, provider: 'daytona', apiKey: 'dtn' });
+    // Tier 1: 10 vCPU / 10 GiB / 30 GiB across all running sandboxes.
+    await f.store.setWorldProviderConnectionLimits(f.organization.id, 'daytona',
+      { pool: { cpu: 10, memoryMb: 10_240, diskGb: 30 }, network: { internet: 'basic', allowlist: false }, checkedAt: Date.now() });
+    const project = await f.store.createProject('Ours', { worldProvider: 'any' }, f.organization.id);
+    const runners = new RunnerPoolService(f.store, f.connections);
+    const daytona = async () => (await f.router.options(f.organization.id, {})).find((value) => value.provider === 'daytona');
+    // Two default computers: each asks 2 GB, Daytona gives 4 GiB (daytona-medium).
+    for (const title of ['one', 'two']) {
+      const task = await f.store.createTask({ projectId: project.id, title, workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } as any });
+      expect((await daytona())?.busy).toBeUndefined();
+      await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'daytona' });
+    }
+    expect(await daytona()).toMatchObject({ busy: '8 of its 10 GB memory in use' });
   });
 });
 

@@ -17,6 +17,9 @@ const CONNECTIONS = `[
   { provider: 'aws', enabled: true, credentialConfigured: true, managed: true,
     limits: { cpu: 16, memoryMb: 65536, diskGb: 2048, source: {} }, features: { desktop: false, allowlist: false } },
 ]`;
+// A Daytona Tier 1–2 account of the organization's own: basic internet only.
+const BASIC_DAYTONA = `{ provider: 'daytona', enabled: true, credentialConfigured: true, status: 'ready',
+  limits: { cpu: 4, memoryMb: 8192, diskGb: 10, source: {} }, features: { desktop: true, internet: 'basic', allowlist: false } }`;
 
 it('offers Any first, with what it reaches, its largest sizes and a region', async () => {
   const ui = await consolePage();
@@ -77,6 +80,28 @@ it('shows where a task runs, and Settings → Computers what Any reaches', async
       limits: any.querySelector('.computer-limits').textContent };
   })()`);
   expect(row).toEqual({ first: true, reach: 'E2B (yours), Hetzner, AWS', limits: '≤ 16 CPU · 64 GB · 2048 GB disk' });
+
+  // A basic-only account is marked, and counts in Any only for Basic.
+  const basic = await ui.run<{ reach: string; chip: string; tip: string; others: number }>(`(() => {
+    fixture().innerHTML = computersMarkup([${BASIC_DAYTONA}, ...${CONNECTIONS}]);
+    const chip = document.querySelector('.computer-provider[data-provider="daytona"] .computer-basic');
+    return { reach: document.querySelector('.computer-any .computer-reach').textContent, chip: chip.textContent, tip: chip.title,
+      others: document.querySelectorAll('.computer-basic').length };
+  })()`);
+  expect(basic).toEqual({ reach: 'Daytona (yours, Basic only), E2B (yours), Hetzner, AWS', chip: 'Basic internet', others: 1,
+    tip: expect.stringMatching(/^Reaches only package registries .* Runs tasks whose network is Basic internet is enough\. Daytona Tier 3 reaches the whole internet: Test again after upgrading\.$/) });
+  // Installation → Managed compute marks the installation's own the same way.
+  expect(await ui.run(`(() => {
+    fixture().innerHTML = managedComputeMarkup({ providers: [{ ...${BASIC_DAYTONA}, running: 0, organizations: 0, costMicros: 0, chargedMicros: 0, seconds: 0 }] });
+    return document.querySelector('.computer-provider[data-provider="daytona"] .computer-basic')?.textContent;
+  })()`)).toBe('Basic internet');
+
+  // Any offers Full only while some account reaches the open internet.
+  await ui.run(`S.worldProviderConnections = [${BASIC_DAYTONA}];
+    fixture().innerHTML = computerBlockHtml('computer', undefined, { provider: 'any', network: { unrestricted: true } });`);
+  const options = await ui.page.locator('#fixture .cf-network option:not([hidden])').evaluateAll((all) => all.map((option) => (option as unknown as { value: string }).value));
+  expect(options).toEqual(['basic']);
+  expect(await ui.run(`computerOverride(document.querySelector('#fixture .computer-field'))`)).toMatchObject({ network: { basic: true } });
   expect(ui.errors).toEqual([]);
   await ui.close();
 });

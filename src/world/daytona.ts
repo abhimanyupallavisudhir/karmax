@@ -6,15 +6,15 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import type { ExecOptions, ExecResult, ProviderSandboxRef, World, WorldHandle, WorldHttpRequest, WorldHttpResponse,
   WorldDiagnosis, WorldLifecycleState, WorldProcess, WorldProcessSpec, WorldProvider, WorldPty, WorldPtySpec, WorldPtyTermination, WorldSpec } from './types.js';
-import { worldRelativePath, worldWorkingDirectory, WorldCheckoutSpec } from './types.js';
+import { worldNetworkOpen, worldRelativePath, worldWorkingDirectory, WorldCheckoutSpec } from './types.js';
 import { addCheckoutViaExec } from './checkout.js';
 import { boundedResponseBody } from './http.js';
 import { serviceHomeLabel } from './services.js';
 import { connectionScope, fundingRef, type ResolvedWorldProviderConnection } from './connections.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow as provisionRun, type ProvisionTarget } from './provision-git.js';
 import { taskBranch } from '../domain/brand.js';
-import { DEFAULT_MACHINE, machineShape } from '../domain/computer.js';
-import { fitComputer, limitWarning } from '../domain/computer-limits.js';
+import { machineShape } from '../domain/computer.js';
+import { daytonaSize, fitComputer, limitWarning } from '../domain/computer-limits.js';
 
 const DEFAULT_IDLE_MS = 10 * 60_000;
 /** Daytona's toolbox closes a PTY socket that receives an input frame over
@@ -25,25 +25,11 @@ const PTY_REATTACH_LIMIT = 3;
 const PTY_REATTACH_WINDOW_MS = 10 * 60_000;
 const DIAGNOSIS_WINDOW_MS = 30 * 60_000;
 const METRICS_SILENT_MS = 5 * 60_000;
-/** Daytona's general Linux snapshots, smallest first (cpu, GiB RAM, GB disk).
- * Without a configured snapshot Daytona uses a 1 vCPU / 1 GiB default, too
- * small for an agent, its browser and a dependency install (task #514). */
-const DAYTONA_SIZES = [
-  { snapshot: 'daytona-small', cpu: 1, memory: 1, disk: 3 },
-  { snapshot: 'daytona-medium', cpu: 2, memory: 4, disk: 8 },
-  { snapshot: 'daytona-large', cpu: 4, memory: 8, disk: 10 },
-] as const;
-/** The smallest general Daytona size that covers the requested CPU, memory
- * and disk (the largest when none does); an unset size is karmax's default
- * machine, the same 2 vCPU / 2 GB as E2B's template. Task worlds and setup
- * snapshots share it. */
-export function daytonaSize(resources?: { cpu?: number; memoryMb?: number; diskGb?: number }): (typeof DAYTONA_SIZES)[number] {
-  const cpu = resources?.cpu ?? DEFAULT_MACHINE.cpu;
-  const memoryMb = resources?.memoryMb ?? DEFAULT_MACHINE.memoryMb;
-  const diskGb = resources?.diskGb ?? 0;
-  return DAYTONA_SIZES.find((size) => size.cpu >= cpu && size.memory * 1024 >= memoryMb && size.disk >= diskGb)
-    ?? DAYTONA_SIZES.at(-1)!;
-}
+// Daytona's general Linux snapshots and the one covering a size live with the
+// account facts (computer-limits.ts): routing counts a machine at that size.
+// Without a configured snapshot Daytona uses a 1 vCPU / 1 GiB default, too
+// small for an agent, its browser and a dependency install (task #514).
+export { daytonaSize };
 
 /** Structural SDK boundary: production uses @daytona/sdk, tests use an in-memory
  * double. Provider SDK objects and sandbox IDs never cross this module. */
@@ -201,7 +187,7 @@ export class DaytonaWorldProvider implements WorldProvider {
       const provisioner = provisionTarget(sandbox, spec.signal);
       if (adopted) {
         await provisionRun(provisioner, `rm -rf ${quote(root)} && mkdir -p ${quote(root)}`);
-        if (trustedSsh && !spec.network?.unrestricted) await updateNetwork(sandbox, { networkBlockAll: false });
+        if (trustedSsh && !worldNetworkOpen(spec.network)) await updateNetwork(sandbox, { networkBlockAll: false });
       }
       await provisionGitCredentials(provisioner, spec, home);
       const provisioned = await provisionGitRepos(provisioner, spec, {
@@ -210,7 +196,7 @@ export class DaytonaWorldProvider implements WorldProvider {
         copyGlobsWarning: 'copyGlobs are host-local and were not copied into the remote Daytona world',
       });
       await provisionRun(provisioner, `rm -f ${quote(path.posix.join(home, '.ssh'))}/karmax-auth-*`);
-      if (trustedSsh && !spec.network?.unrestricted) await updateNetwork(sandbox, network);
+      if (trustedSsh && !worldNetworkOpen(spec.network)) await updateNetwork(sandbox, network);
       spec.signal?.throwIfAborted();
       const handle: WorldHandle = {
         version: 2, kind: this.kind, provider: this.kind, id: spec.taskId, root, workspaceRoot: root,
@@ -732,7 +718,7 @@ function isMissingSnapshot(error: unknown): boolean {
 
 function explainDaytonaError(error: unknown): unknown {
   if (/network access is restricted and cannot be overridden/i.test(String(error)))
-    return new Error('Custom network rules require Daytona Tier 3 or higher. Upgrade Daytona or select unrestricted networking in Compute settings; Daytona account restrictions still apply.', { cause: error });
+    return new Error('Allowlist only needs Daytona Tier 3 or higher: this account reaches only essential services. Choose Basic internet is enough, or another provider.', { cause: error });
   return error;
 }
 
@@ -817,7 +803,7 @@ async function sizeSnapshotSandbox(sandbox: DaytonaSandboxLike, spec: WorldSpec)
 }
 
 function daytonaNetwork(spec: WorldSpec): Record<string, unknown> {
-  if (spec.network?.unrestricted) return { networkBlockAll: false };
+  if (worldNetworkOpen(spec.network)) return { networkBlockAll: false };
   if (spec.network?.allowCidrs?.length)
     throw new Error('Daytona cannot combine CIDR rules with the domain allowlist needed by task agents. Use allowed domains or an unrestricted network.');
   let gateway: string[] = [];

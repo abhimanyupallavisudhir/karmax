@@ -7,6 +7,7 @@ import type { MachineShape } from '../../domain/computer.js';
 import { providerFeatures } from '../../domain/computer-limits.js';
 import type { ProviderSandboxRef, ProviderUsagePage, ProviderUsageEvent, World, WorldDiagnosis, WorldHandle,
   WorldLifecycleState, WorldProvider, WorldSpec } from '../types.js';
+import { worldNetworkOpen } from '../types.js';
 import { serviceHomeLabel } from '../services.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow, provisionTimeoutMs, type ProvisionTarget } from '../provision-git.js';
 import { taskBranch } from '../../domain/brand.js';
@@ -139,7 +140,7 @@ export class VmWorldProvider implements WorldProvider {
   async create(spec: WorldSpec): Promise<World> {
     spec.signal?.throwIfAborted();
     const features = providerFeatures(this.kind);
-    if (!features.allowlist && spec.network && !spec.network.unrestricted)
+    if (!features.allowlist && spec.network && !worldNetworkOpen(spec.network))
       throw new Error(`${this.driver.name} computers have unrestricted outbound network. Choose E2B or Daytona for an allowlist.`);
     if (!features.desktop && spec.environment?.flavor === 'desktop')
       throw new Error(`${this.driver.name} computers are headless. Choose E2B or Daytona for a desktop.`);

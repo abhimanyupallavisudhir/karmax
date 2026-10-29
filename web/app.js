@@ -1668,11 +1668,34 @@ const COMPUTER_REGION_LABELS = { eu: 'EU', us: 'US' };
 // choose among — the organization's own, and the managed compute it may use.
 const computerReach = () => (S.worldProviderConnections || [])
   .filter((c) => c.enabled && c.credentialConfigured && CLOUD_COMPUTERS.includes(c.provider));
-// "E2B (yours), Hetzner, AWS": what Any can reach, own accounts first.
+// "E2B (yours), Daytona (Basic only), AWS": what Any can reach, own accounts
+// first; an account that reaches only essential services counts only for
+// tasks whose network is Basic internet is enough.
 function computerReachText(reach = computerReach()) {
   const names = [...reach].sort((a, b) => Number(!!a.managed) - Number(!!b.managed))
-    .map((c) => `${COMPUTER_PROVIDER_LABELS[c.provider] || c.provider}${c.managed ? '' : ' (yours)'}`);
+    .map((c) => {
+      const notes = [c.managed ? '' : 'yours', c.features?.internet === 'basic' ? 'Basic only' : ''].filter(Boolean);
+      return `${COMPUTER_PROVIDER_LABELS[c.provider] || c.provider}${notes.length ? ` (${notes.join(', ')})` : ''}`;
+    });
   return names.length ? names.join(', ') : 'nothing yet: connect a computer in Settings → Resources';
+}
+// Outbound network (wiki features/computers): what a task's machine may reach.
+const NETWORK_LABELS = { full: 'Full internet', basic: 'Basic internet is enough', allowlist: 'Allowlist only' };
+const BASIC_INTERNET = 'package registries (npm, PyPI, Maven…), Git hosts (GitHub, GitLab), AI APIs (OpenAI, Anthropic, Hugging Face), AWS, Google Cloud and Azure, CDNs and container registries';
+const NETWORK_TIP = `Full internet: any website. Basic: only ${BASIC_INTERNET}, enough for most coding; Any may then also use computers that reach only those. Allowlist only: just the sites you list.`;
+// Stored values keep their meaning: unrestricted false is the allowlist, anything else without basic is Full.
+const networkChoiceOf = (network) => (network?.unrestricted === false ? 'allowlist' : network?.basic === true ? 'basic' : 'full');
+// The choices a provider can give: Full needs the open internet, Allowlist an
+// account that enforces one; Basic every computer gives.
+function networkChoicesFor(features) {
+  return ['full', 'basic', 'allowlist'].filter((choice) => (choice === 'full' ? features.internet !== 'basic' : choice === 'allowlist' ? features.allowlist : true));
+}
+// "Basic internet": an account that reaches only its provider's essential services.
+function basicInternetChip(connection) {
+  if (connection?.features?.internet !== 'basic') return '';
+  const name = COMPUTER_PROVIDERS[connection.provider]?.name || connection.provider;
+  const tip = `Reaches only ${BASIC_INTERNET}. Runs tasks whose network is Basic internet is enough.${connection.provider === 'daytona' ? ' Daytona Tier 3 reaches the whole internet: Test again after upgrading.' : ''}`;
+  return `<span class="chip computer-basic" title="${esc(tip)}" aria-label="${esc(`${name}: basic internet. ${tip}`)}">Basic internet</span>`;
 }
 const ANY_TIP = 'Runs on the first that fits and has room: your own accounts first, then the cheapest. A full one gives way to the next.';
 // What a machine gets when the Computer asks for nothing more (disk is total GB).
@@ -1699,10 +1722,11 @@ function computerLimitsFor(provider) {
 function computerFeaturesFor(provider) {
   if (provider === 'any') {
     const reach = computerReach();
-    return reach.length ? { desktop: reach.some((c) => c.features?.desktop !== false), allowlist: reach.some((c) => c.features?.allowlist !== false) }
-      : { desktop: true, allowlist: true };
+    return reach.length ? { desktop: reach.some((c) => c.features?.desktop !== false), allowlist: reach.some((c) => c.features?.allowlist !== false),
+      internet: reach.some((c) => c.features?.internet !== 'basic') ? 'full' : 'basic' }
+      : { desktop: true, allowlist: true, internet: 'full' };
   }
-  return { desktop: true, allowlist: true, ...((S.worldProviderConnections || []).find((c) => c.provider === provider)?.features) };
+  return { desktop: true, allowlist: true, internet: 'full', ...((S.worldProviderConnections || []).find((c) => c.provider === provider)?.features) };
 }
 // "This E2B account allows up to 29 GB" — the hover text of each size.
 function computerLimitTip(provider, limits, key) {
@@ -1744,12 +1768,13 @@ function computerBlockHtml(name, value, inherited, opts = {}) {
   const inh = inherited || {};
   const v = { ...inh, ...value };
   const provider = v.provider || '';
-  const restricted = v.network?.unrestricted === false;
   // In flight, a task may resize or move to another cloud provider (at its next
   // pause); another experience or network would be another computer.
   const fixed = opts.inFlight ? 'disabled' : '';
   const size = computerSizeAttrs(provider);
   const features = computerFeaturesFor(provider);
+  const choices = networkChoicesFor(features);
+  const network = choices.includes(networkChoiceOf(v.network)) ? networkChoiceOf(v.network) : choices[0];
   const sizeAttrs = (key) => `max="${esc(size[key].max)}" placeholder="${esc(size[key].placeholder)}"`;
   const tip = (key) => (size[key].title ? ` title="${esc(size[key].title)}"` : '');
   const body = `<div class="computer-controls">
@@ -1766,9 +1791,9 @@ function computerBlockHtml(name, value, inherited, opts = {}) {
         <option value="" ${v.region ? '' : 'selected'}>Anywhere</option>${Object.entries(COMPUTER_REGION_LABELS).map(([key, label]) => `<option value="${key}" ${v.region === key ? 'selected' : ''}>${label}</option>`).join('')}</select></label>
       <label class="form-row"><span>Hibernate after (days) ${policyTip('How long a paused task keeps its computer before packing it away. Waking it afterwards takes a little longer.')}</span>
         <input class="cf-hibernate" type="number" min="0" max="365" step="1" value="${esc(v.hibernateAfterDays ?? '')}" placeholder="7"></label>
-      <label class="form-row"${features.allowlist ? '' : ' hidden'}><span>Outbound network ${policyTip('Agents normally need package registries, documentation, search and APIs. Allowlist only is for organizations that maintain an egress policy.')}</span><select class="cf-network" ${fixed}>
-        <option value="unrestricted" ${restricted ? '' : 'selected'}>Normal internet</option><option value="restricted" ${restricted ? 'selected' : ''}>Allowlist only</option></select></label>
-      <div class="cf-allowlist" ${restricted && features.allowlist ? '' : 'hidden'}>
+      <label class="form-row"><span>Outbound network ${policyTip(NETWORK_TIP)}</span><select class="cf-network" data-want="${networkChoiceOf(v.network)}" ${fixed}>
+        ${Object.entries(NETWORK_LABELS).map(([choice, label]) => `<option value="${choice}"${choice === network ? ' selected' : ''}${choices.includes(choice) ? '' : ' hidden disabled'}${choice === 'basic' ? ` title="${esc(`Only ${BASIC_INTERNET}`)}"` : ''}>${label}</option>`).join('')}</select></label>
+      <div class="cf-allowlist" ${network === 'allowlist' ? '' : 'hidden'}>
         <input class="cf-domains" ${fixed} value="${esc((v.network?.allowDomains || []).join(', '))}" placeholder="Allowed domains: registry.npmjs.org, pypi.org" aria-label="Allowed domains">
         <input class="cf-cidrs" ${fixed} value="${esc((v.network?.allowCidrs || []).join(', '))}" placeholder="Allowed CIDRs: 10.20.0.0/16" aria-label="Allowed CIDRs">
       </div>
@@ -1841,9 +1866,14 @@ function readComputerBlock(box) {
   const number = (selector) => { const raw = value(selector); return raw === '' || !Number.isFinite(Number(raw)) ? undefined : Number(raw); };
   const list = (selector) => value(selector).split(',').map((item) => item.trim()).filter(Boolean);
   const memory = number('.cf-memory');
-  // A provider without a desktop or an allowlist gets headless and normal
-  // internet, even if the defaults it inherits ask for more.
+  // A provider without a desktop gets headless, and the network it can give,
+  // even if the defaults it inherits ask for more.
   const features = computerFeaturesFor(value('.cf-provider'));
+  const choices = networkChoicesFor(features);
+  // A running task's network is fixed: it stays what it is, and a move to a
+  // provider that cannot give it is refused with that reason.
+  const select = box.querySelector('.cf-network');
+  const network = select?.disabled ? select.dataset.want || 'full' : choices.includes(value('.cf-network')) ? value('.cf-network') : choices[0];
   const out = {
     provider: value('.cf-provider') || undefined,
     // A region is what "Any" may choose among; a named provider runs where its account is.
@@ -1853,8 +1883,8 @@ function readComputerBlock(box) {
     diskGb: number('.cf-disk'),
     flavor: features.desktop ? value('.cf-flavor') || undefined : 'headless',
     hibernateAfterDays: number('.cf-hibernate'),
-    network: features.allowlist && value('.cf-network') === 'restricted'
-      ? { unrestricted: false, allowDomains: list('.cf-domains'), allowCidrs: list('.cf-cidrs') } : { unrestricted: true },
+    network: network === 'allowlist' ? { unrestricted: false, allowDomains: list('.cf-domains'), allowCidrs: list('.cf-cidrs') }
+      : network === 'basic' ? { basic: true } : { unrestricted: true },
   };
   return Object.fromEntries(Object.entries(out).filter(([, item]) => item !== undefined));
 }
@@ -1863,8 +1893,8 @@ function computerOverride(box, attr = 'data-inherit') {
   const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
   const read = readComputerBlock(box);
   // Missing domain or CIDR lists are empty ones, so an unchanged allowlist is no override.
-  const network = (n) => JSON.stringify(n?.unrestricted === false
-    ? { unrestricted: false, allowDomains: n.allowDomains || [], allowCidrs: n.allowCidrs || [] } : { unrestricted: true });
+  const network = (n) => JSON.stringify(networkChoiceOf(n) === 'allowlist'
+    ? { unrestricted: false, allowDomains: n.allowDomains || [], allowCidrs: n.allowCidrs || [] } : networkChoiceOf(n));
   return Object.fromEntries(Object.entries(read).filter(([key, item]) => key === 'network'
     ? network(item) !== network(inh.network) : !sameJson(item, inh[key])));
 }
@@ -1874,7 +1904,9 @@ function resetComputerBlock(box, attr = 'data-inherit') {
   set('.cf-provider', inh.provider);
   set('.cf-cpu', inh.cpu); set('.cf-memory', gbOf(inh.memoryMb)); set('.cf-disk', inh.diskGb);
   set('.cf-flavor', inh.flavor || 'headless'); set('.cf-hibernate', inh.hibernateAfterDays);
-  set('.cf-network', inh.network?.unrestricted === false ? 'restricted' : 'unrestricted');
+  set('.cf-network', networkChoiceOf(inh.network));
+  const select = box.querySelector('.cf-network');
+  if (select) select.dataset.want = networkChoiceOf(inh.network);
   set('.cf-region', inh.region);
   set('.cf-domains', (inh.network?.allowDomains || []).join(', ')); set('.cf-cidrs', (inh.network?.allowCidrs || []).join(', '));
   syncComputerBlock(box);
@@ -1896,20 +1928,30 @@ function syncComputerBlock(box) {
   const reach = box.querySelector('.cf-reach');
   if (reach) reach.hidden = provider !== 'any';
   if (row('.cf-flavor')) row('.cf-flavor').hidden = !features.desktop;
-  if (row('.cf-network')) row('.cf-network').hidden = !features.allowlist;
+  const select = box.querySelector('.cf-network');
+  if (select) {
+    // Only the choices this provider can give. The one asked for (`want`: the
+    // inherited or last picked) comes back on a provider that can give it;
+    // elsewhere the first it can stands in.
+    const choices = networkChoicesFor(features);
+    for (const option of select.options) option.hidden = option.disabled = !choices.includes(option.value);
+    select.value = choices.includes(select.dataset.want) ? select.dataset.want : choices[0];
+  }
   const allowlist = box.querySelector('.cf-allowlist');
-  if (allowlist) allowlist.hidden = !features.allowlist || box.querySelector('.cf-network')?.value !== 'restricted';
+  if (allowlist) allowlist.hidden = select?.value !== 'allowlist';
 }
 // One delegated listener keeps every Computer block's dependent controls in step.
 document.addEventListener('change', (event) => {
   const box = event.target?.closest?.('.computer-field');
+  if (event.target?.matches?.('.cf-network')) event.target.dataset.want = event.target.value;
   if (box) syncComputerBlock(box);
 });
 // "E2B · 4 CPU · 8 GB · 50 GB disk" — a frozen or summarized Computer.
 function computerSummary(value) {
   const v = value || {};
   return [COMPUTER_PROVIDER_LABELS[v.provider] || v.provider, v.cpu != null ? `${v.cpu} CPU` : '', v.memoryMb != null ? `${gbOf(v.memoryMb)} GB` : '',
-    v.diskGb != null ? `${v.diskGb} GB disk` : '', v.flavor === 'desktop' ? 'desktop' : '', v.region ? COMPUTER_REGION_LABELS[v.region] : '']
+    v.diskGb != null ? `${v.diskGb} GB disk` : '', v.flavor === 'desktop' ? 'desktop' : '', v.region ? COMPUTER_REGION_LABELS[v.region] : '',
+    networkChoiceOf(v.network) === 'basic' ? 'basic internet' : networkChoiceOf(v.network) === 'allowlist' ? 'allowlist' : '']
     .filter(Boolean).join(' · ') || '(default)';
 }
 
@@ -23961,6 +24003,7 @@ function managedComputeMarkup(view) {
     const hours = account ? Math.round(account.seconds / 360) / 10 : 0;
     return `<div class="computer-provider" data-provider="${id}"><b>${esc(info.name)}</b>
       ${state ? `<span class="chip ${state[1]}"${account.lastError ? ` title="${esc(account.lastError)}"` : ''}>${state[0]}</span>` : ''}
+      ${basicInternetChip(account)}
       ${account ? `<span class="setting-muted" title="Machines running now${account.config?.maxRunning ? ', of the account’s limit' : ''}">${account.running}${account.config?.maxRunning ? ` of ${account.config.maxRunning}` : ''} running</span>
         <span class="setting-muted managed-month" title="${esc(`This month: ${hours} machine-hours for ${account.organizations} organization${account.organizations === 1 ? '' : 's'}. The provider’s price, then what organizations were charged.`)}">${money(account.costMicros)} → ${money(account.chargedMicros)}</span>` : ''}
       <span class="label-row-fill"></span>
@@ -24326,7 +24369,7 @@ const COMPUTER_PROVIDERS = {
   e2b: { name: 'E2B', keys: 'https://e2b.dev/dashboard?tab=keys',
     advanced: [['template', 'Headless template', 'Default'], ['desktopTemplate', 'Desktop template', 'E2B desktop']] },
   daytona: { name: 'Daytona', keys: 'https://app.daytona.io',
-    tip: 'Daytona Tiers 1–2 reach only package registries, Git hosts and AI APIs, not the open internet. Use E2B or Daytona Tier 3+ for general web access.',
+    tip: 'Tiers 1–2 reach only package registries, Git hosts and AI and cloud APIs, so they run tasks whose network is Basic internet is enough. Tier 3+ reaches the whole internet.',
     advanced: [['snapshot', 'Headless snapshot', 'Daytona default'], ['image', 'Headless image', 'used when no snapshot'],
       ['desktopSnapshot', 'Desktop snapshot', 'Daytona default'], ['desktopImage', 'Desktop image', 'used when no desktop snapshot'],
       ['apiUrl', 'API URL', 'https://app.daytona.io/api'], ['target', 'Target', 'provider default']] },
@@ -24426,6 +24469,7 @@ function computersMarkup(connections, held = []) {
     const mine = held.filter((computer) => computer.provider === id);
     return `<div class="computer-provider" data-provider="${id}"><b>${esc(info.name)}</b>
       <span class="chip ${state.tone}"${connection?.managed ? ` title="${esc(`Runs on ${siteName()}’s ${info.name} account, charged to this organization’s monthly compute (Plan & billing). Connect your own account to use it instead.`)}"` : connection?.lastError ? ` title="${esc(connection.lastError)}"` : ''}>${esc(state.label)}</span>
+      ${basicInternetChip(connection)}
       ${connection?.limits ? computerLimitsSummary(id, connection.limits) : ''}
       ${mine.length ? `<button class="chip computer-held-toggle" type="button" aria-expanded="false" title="Tasks holding a machine or disk here">${mine.length} in use</button>` : ''}
       <span class="label-row-fill"></span>

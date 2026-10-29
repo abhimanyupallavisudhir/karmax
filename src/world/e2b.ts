@@ -29,7 +29,7 @@ import type {
 } from './types.js';
 import { diagnoseMetrics } from './health.js';
 import { withTimeout } from '../util/timeout.js';
-import { worldRelativePath, worldWorkingDirectory, WorldCheckoutSpec } from './types.js';
+import { worldNetworkOpen, worldRelativePath, worldWorkingDirectory, WorldCheckoutSpec } from './types.js';
 import { addCheckoutViaExec } from './checkout.js';
 import { boundedResponseBody } from './http.js';
 import { sliceStream } from './file-prefix.js';
@@ -1149,7 +1149,7 @@ function envPositiveInt(name: string, fallback: number): number {
 }
 
 function e2bNetwork(spec: WorldSpec): Pick<Parameters<E2BFactory['create']>[0], 'allowInternetAccess' | 'network'> {
-  if (spec.network?.unrestricted) return { allowInternetAccess: true };
+  if (worldNetworkOpen(spec.network)) return { allowInternetAccess: true };
   const allowOut = [...new Set(['github.com', 'api.github.com', 'ssh.github.com', 'registry.npmjs.org',
     'cdn.playwright.dev', 'playwright.download.prss.microsoft.com',
     'storage.googleapis.com', 'chrome-for-testing-public.storage.googleapis.com',

@@ -1,7 +1,7 @@
 import { ProviderCapacityFull, ProviderOutage } from '../agent/limits.js';
 import { BRAND } from '../domain/brand.js';
-import { machineShape, type ComputeRegion, type MachineShape } from '../domain/computer.js';
-import { cloudProviders, listPriceMicrosPerHour, providerDefaults, providerLabel, providerRegion, providerWakeSeconds,
+import { machineShape, networkChoice, type ComputeRegion, type MachineShape } from '../domain/computer.js';
+import { cloudProviders, listPriceMicrosPerHour, networkUnfit, providerLabel, providerMachine, providerRegion, providerWakeSeconds,
   type ComputerFeatures, type ComputerLimits } from '../domain/computer-limits.js';
 import type { ProjectConfig } from '../domain/types.js';
 import type { Store } from '../store/db.js';
@@ -19,9 +19,14 @@ import { assertComputeCredit, ComputeCreditExhausted, ManagedComputeBusy } from 
  * never funded by an account other than the one the organization chose.
  *
  * A candidate qualifies when its account allows a machine of the task's size,
- * offers what the task needs (a desktop, an outbound allowlist), runs in the
- * region asked for, and is known to have room: managed compute needs credit
- * left this month and fewer than its `maxRunning` machines in use.
+ * offers what the task needs (a desktop; the outbound network chosen: Full
+ * internet needs an account with the open internet, Basic is enough takes one
+ * that reaches only essential services too, Allowlist only one that enforces
+ * an allowlist), runs in the region asked for, and is known to have room:
+ * managed compute needs credit left this month and fewer than its
+ * `maxRunning` machines in use, and an account with a pool shared by all its
+ * machines (Daytona's tiers, a Google Cloud CPU quota) needs that much CPU and
+ * memory left.
  *
  * The qualifying candidates are tried in this order:
  *   1. a restored world's previous provider (it comes back where it was);
@@ -36,17 +41,21 @@ import { assertComputeCredit, ComputeCreditExhausted, ManagedComputeBusy } from 
  * refuses does the task wait for a machine.
  */
 
-/** What a task asks of the machine "Any" picks. */
+/** What a task asks of the machine "Any" picks. Neither `basic` nor
+ * `allowlist`: it needs the open internet. */
 export interface ComputeNeeds extends MachineShape {
   desktop?: boolean;
+  /** Basic internet is enough (registries, Git hosts, AI and cloud APIs). */
+  basic?: boolean;
   allowlist?: boolean;
   region?: ComputeRegion;
 }
 
 export function computeNeeds(config: Partial<ProjectConfig> | undefined): ComputeNeeds {
+  const network = networkChoice(config?.network);
   return { ...machineShape(config),
     ...(config?.environment?.flavor === 'desktop' ? { desktop: true } : {}),
-    ...(config?.network?.unrestricted === false ? { allowlist: true } : {}),
+    ...(network === 'basic' ? { basic: true } : network === 'allowlist' ? { allowlist: true } : {}),
     ...(config?.region ? { region: config.region } : {}) };
 }
 
@@ -105,7 +114,8 @@ export function unfit(needs: ComputeNeeds, option: ComputeOption): string | unde
   if (needs.memoryMb != null && limits.memoryMb != null && needs.memoryMb > limits.memoryMb) return `at most ${gb(limits.memoryMb)} GB memory`;
   if (needs.diskGb != null && limits.diskGb != null && needs.diskGb > limits.diskGb) return `at most ${limits.diskGb} GB disk`;
   if (needs.desktop && !features.desktop) return 'no desktop';
-  if (needs.allowlist && !features.allowlist) return 'no outbound allowlist';
+  const network = networkUnfit(needs.allowlist ? 'allowlist' : needs.basic ? 'basic' : 'full', features);
+  if (network) return network;
   if (needs.region && option.region !== needs.region) return `not in ${REGION_LABEL[needs.region]}`;
   return undefined;
 }
@@ -209,15 +219,22 @@ export class ComputeRouter {
         if (maxRunning && await this.store.runningManagedWorlds(view.provider) >= maxRunning)
           return { ...option, busy: `all ${maxRunning} in use` };
       } else if (view.status === 'error') option.doubt = 'its last connection test failed';
-      // A CPU quota all of the account's machines share (Google Cloud: the
-      // lowest of E2_CPUS, CPUS and CPUS_ALL_REGIONS; Daytona's tier): room is
-      // what the worlds running on it leave. Machines outside tavya on the same
-      // account are not counted; the provider's own refusal still falls over.
-      const pool = view.limits.pool?.cpu;
-      if (pool) {
-        const used = await this.store.runningWorldCpus(view.provider, funding === 'managed' ? null : organizationId);
-        const cpu = needs.cpu ?? providerDefaults(view.provider)?.cpu ?? 2;
-        if (used + cpu > pool) return { ...option, busy: `${used} of its ${pool} CPUs in use` };
+      // A CPU and memory quota all of the account's machines share (Google
+      // Cloud: the lowest of E2_CPUS, CPUS and CPUS_ALL_REGIONS; Daytona's tier,
+      // where a machine takes the snapshot size covering it): room is what the
+      // worlds running on it leave. Machines outside tavya on the same account
+      // are not counted, nor Daytona's disk pool (stopped sandboxes count
+      // there, and tavya does not record them); the provider's own refusal
+      // still falls over.
+      const pool = view.limits.pool;
+      if (pool?.cpu || pool?.memoryMb) {
+        const running = await this.store.runningWorldMachines(view.provider, funding === 'managed' ? null : organizationId);
+        const used = running.map((machine) => providerMachine(view.provider, machine))
+          .reduce((sum, machine) => ({ cpu: sum.cpu + machine.cpu, memoryMb: sum.memoryMb + machine.memoryMb }), { cpu: 0, memoryMb: 0 });
+        const next = providerMachine(view.provider, needs);
+        if (pool.cpu && used.cpu + next.cpu > pool.cpu) return { ...option, busy: `${used.cpu} of its ${pool.cpu} CPUs in use` };
+        if (pool.memoryMb && used.memoryMb + next.memoryMb > pool.memoryMb)
+          return { ...option, busy: `${gb(used.memoryMb)} of its ${gb(pool.memoryMb)} GB memory in use` };
       }
       const full = await this.recentFull(funding === 'managed' ? MANAGED_COMPUTE : organizationId, view.provider);
       if (full) option.doubt = full;

@@ -8,11 +8,12 @@ afterAll(closeConsoleBrowser);
  * and network — those would be a different computer. */
 it('lets a running task resize its computer, and nothing else about it', async () => {
   const ui = await consolePage();
-  const render = (editable: string[]) => ui.run(`
-    S.tasks = [{ id: 't', projectId: 'p', workflow: 'software-dev', params: { computer: { diskGb: 40 } } }];
+  const render = (editable: string[], computer: unknown = { diskGb: 40 }) => ui.run(`
+    S.tasks = [{ id: 't', projectId: 'p', workflow: 'software-dev', params: { computer: ${JSON.stringify(computer)} } }];
     S.schema = [{ name: 'software-dev', params: [{ name: 'computer', type: 'computer', label: 'Computer', scopes: ['task', 'project', 'global'], bind: 'computer', mutable: 'always' }] }];
     S.paramDefaults = { computer: { provider: 'e2b', cpu: 2, memoryMb: 2048, flavor: 'headless', network: { unrestricted: true } } };
-    S.worldProviderConnections = [{ provider: 'e2b', enabled: true, credentialConfigured: true }];
+    S.worldProviderConnections = [{ provider: 'e2b', enabled: true, credentialConfigured: true },
+      { provider: 'daytona', enabled: true, credentialConfigured: true, features: { desktop: true, internet: 'basic', allowlist: false } }];
     document.getElementById('main').innerHTML = paramsSection({ taskId: 't', workflow: 'software-dev', stage: 'do',
       editableParams: ${JSON.stringify(editable)}, agents: {}, messages: [], participants: [] });
   `);
@@ -25,6 +26,17 @@ it('lets a running task resize its computer, and nothing else about it', async (
   await block.locator('.cf-disk').fill('50');
   expect(await ui.run(`collectParamEdits(document.getElementById('tp-params'), paramFields({ workflow: 'software-dev', taskId: 't' }))`))
     .toEqual({ computer: { provider: 'e2b', cpu: 2, memoryMb: 2048, diskGb: 50, flavor: 'headless', network: { unrestricted: true } } });
+  // Its network stays what it is (Basic here), even on a provider that offers less.
+  await render(['computer'], { diskGb: 40, network: { basic: true } });
+  expect(await block.locator('.cf-network').inputValue()).toBe('basic');
+  await block.locator('.cf-provider').selectOption('daytona');
+  expect(await ui.run(`collectParamEdits(document.getElementById('tp-params'), paramFields({ workflow: 'software-dev', taskId: 't' }))`))
+    .toMatchObject({ computer: { provider: 'daytona', network: { basic: true } } });
+  await render(['computer']);
+  await block.locator('.cf-provider').selectOption('daytona');
+  // A Full-internet task asks to move as it is; the server says Daytona cannot.
+  expect(await ui.run(`collectParamEdits(document.getElementById('tp-params'), paramFields({ workflow: 'software-dev', taskId: 't' }))`))
+    .toMatchObject({ computer: { provider: 'daytona', network: { unrestricted: true } } });
   // Once used up (past the point of no return, or finished), the whole block is frozen.
   await render([]);
   expect(Object.values(await disabled()).every(Boolean)).toBe(true);

@@ -1,5 +1,7 @@
 import type { ProjectConfig } from './types.js';
-import { providerFeatures, providerLabel } from './computer-limits.js';
+import { measuresNetwork, providerFeatures, providerLabel, type NetworkChoice } from './computer-limits.js';
+
+export type { NetworkChoice };
 
 /**
  * The computer a task runs on — one value, edited as one block wherever an
@@ -27,6 +29,36 @@ export interface ComputerSpec {
   network?: NonNullable<ProjectConfig['network']>;
   /** Where "Any" may run it; a named provider runs where its account is. */
   region?: ComputeRegion;
+}
+
+/**
+ * The outbound network a Computer asks for (wiki features/computers):
+ * - `full` — the open internet (`{unrestricted: true}`, and no value at all);
+ * - `basic` — package registries, Git hosts, AI and cloud APIs are enough
+ *   (`{basic: true}`), so "Any" may also pick an account that reaches only
+ *   those (Daytona Tier 1–2); the machine itself is not restricted by tavya;
+ * - `allowlist` — only the listed domains and CIDRs (`{unrestricted: false, …}`).
+ * Values stored before Basic existed keep their meaning.
+ */
+export const NETWORK_CHOICES = ['full', 'basic', 'allowlist'] as const;
+const NETWORK_VALUES: Record<NetworkChoice, NonNullable<ProjectConfig['network']>> = {
+  full: { unrestricted: true }, basic: { basic: true }, allowlist: { unrestricted: false, allowDomains: [], allowCidrs: [] } };
+export function networkChoice(network: { unrestricted?: boolean; basic?: boolean } | null | undefined): NetworkChoice {
+  return network?.unrestricted === false ? 'allowlist' : network?.basic === true ? 'basic' : 'full';
+}
+
+/** A sparse change to a stored network policy (set_execution_policy): a
+ * named choice replaces it, keeping an allowlist's lists; the legacy
+ * `unrestricted` flag sets Full or the allowlist; lists change only themselves. */
+export function changeNetwork(base: ProjectConfig['network'] | undefined, change: { choice?: NetworkChoice; unrestricted?: boolean;
+  allowDomains?: string[]; allowCidrs?: string[] }): NonNullable<ProjectConfig['network']> {
+  let network: NonNullable<ProjectConfig['network']> = { ...base };
+  if (change.choice) network = change.choice === 'allowlist'
+    ? { unrestricted: false, allowDomains: base?.allowDomains ?? [], allowCidrs: base?.allowCidrs ?? [] } : { ...NETWORK_VALUES[change.choice] };
+  if (change.unrestricted !== undefined) { delete network.basic; network.unrestricted = change.unrestricted; }
+  if (change.allowDomains !== undefined) network.allowDomains = change.allowDomains;
+  if (change.allowCidrs !== undefined) network.allowCidrs = change.allowCidrs;
+  return network;
 }
 
 /** The provider value that asks tavya to choose (wiki features/compute-routing). */
@@ -95,13 +127,17 @@ export function normalizeComputer(raw: unknown): ComputerSpec | undefined {
     if (value.flavor !== 'headless' && value.flavor !== 'desktop') throw new Error('experience must be headless or desktop');
     out.flavor = value.flavor;
   }
-  if (value.network != null) {
-    if (typeof value.network !== 'object' || Array.isArray(value.network)) throw new Error('network must be an object');
-    const network = value.network as Record<string, unknown>;
+  if (value.network != null && value.network !== '') {
+    // The API, MCP and CLI may name the choice; the form sends the stored shape.
+    const named = typeof value.network === 'string';
+    if (named && !(NETWORK_CHOICES as readonly unknown[]).includes(value.network)) throw new Error('network must be full, basic or allowlist');
+    if (!named && (typeof value.network !== 'object' || Array.isArray(value.network))) throw new Error('network must be an object');
+    const network = (named ? NETWORK_VALUES[value.network as NetworkChoice] : value.network) as Record<string, unknown>;
     const list = (entry: unknown) => Array.isArray(entry) ? entry.map((item) => String(item).trim()).filter(Boolean) : [];
-    out.network = network.unrestricted === false
+    const choice = networkChoice(network);
+    out.network = choice === 'allowlist'
       ? { unrestricted: false, allowDomains: list(network.allowDomains), allowCidrs: list(network.allowCidrs) }
-      : { unrestricted: true };
+      : { ...NETWORK_VALUES[choice] };
   }
   if (value.region != null && value.region !== '') {
     if (!(COMPUTE_REGIONS as readonly unknown[]).includes(value.region)) throw new Error(`region must be ${COMPUTE_REGIONS.join(' or ')}`);
@@ -194,7 +230,8 @@ const LOCAL_PROVIDERS = new Set(['worktree', 'container', 'memory']);
 export function assertInFlightComputerEdit(current: ComputerSpec, next: ComputerSpec): void {
   if (next.flavor !== undefined && next.flavor !== current.flavor)
     throw new Error('a running task\'s experience can\'t change — only its provider, CPU, memory, disk and hibernation');
-  if (next.network !== undefined && JSON.stringify(next.network) !== JSON.stringify(current.network ?? { unrestricted: true }))
+  if (next.network !== undefined && JSON.stringify(normalizeComputer({ network: next.network })?.network)
+    !== JSON.stringify(normalizeComputer({ network: current.network ?? { unrestricted: true } })?.network))
     throw new Error('a running task\'s outbound network can\'t change — only its provider, CPU, memory, disk and hibernation');
   // "Any" never moves a world that exists: it routes the next new one.
   if (next.provider === undefined || next.provider === current.provider || isAnyProvider(next.provider)) return;
@@ -203,7 +240,9 @@ export function assertInFlightComputerEdit(current: ComputerSpec, next: Computer
   const features = providerFeatures(next.provider);
   if (current.flavor === 'desktop' && !features.desktop)
     throw new Error(`${providerLabel(next.provider)} has no desktop, which this task uses`);
-  if (current.network?.unrestricted === false && !features.allowlist)
+  // A provider that measures its network per account (Daytona) is judged on
+  // that account when the edit is saved (assertFits), not on documented facts.
+  if (networkChoice(current.network) === 'allowlist' && !features.allowlist && !measuresNetwork(next.provider))
     throw new Error(`${providerLabel(next.provider)} has no outbound allowlist, which this task uses`);
 }
 

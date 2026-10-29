@@ -149,4 +149,11 @@ it('starts a task on a computer: any (tavya picks) or a named provider, at least
   const bad = await f.tavya(f.laptop, ['task', 'new', 'Tiny', '--cpu', 'lots', '--project', f.project.id]);
   expect(bad.code).toBe(2);
   expect(bad.stderr).toContain('--cpu must be a positive number');
+  // The outbound network by name, stored as the form stores it.
+  const basic = await f.tavya(f.laptop, ['task', 'new', 'Fetch deps', '--network', 'basic', '--draft', '--project', f.project.id, '--json']);
+  expect(basic.code, basic.stderr).toBe(0);
+  expect((await f.store.getTask(JSON.parse(basic.stdout).id))!.params.computer).toEqual({ network: { basic: true } });
+  const open = await f.tavya(f.laptop, ['task', 'new', 'Browse', '--network', 'open', '--project', f.project.id]);
+  expect(open.code).toBe(2);
+  expect(open.stderr).toContain('--network must be full, basic or allowlist');
 });

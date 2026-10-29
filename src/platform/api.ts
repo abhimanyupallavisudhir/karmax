@@ -51,7 +51,7 @@ import { parseQuery } from '../domain/query-language.js';
 import { assertComputerFits, providerLabel } from '../domain/computer-limits.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
 import { taskProvider } from '../world/task-provider.js';
-import { ANY_PROVIDER, applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, isAnyProvider, machineShape, normalizeComputer, sameMachine,
+import { ANY_PROVIDER, applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, isAnyProvider, machineShape, networkChoice, normalizeComputer, sameMachine,
   type ComputerSpec, type MachineShape } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { splitSharedSettings } from '../domain/shared-settings.js';
@@ -986,8 +986,12 @@ export class KarmaxApi {
     if (provider && !['worktree', 'container', 'memory'].includes(provider)
       && !(await this.deps.providerConnections?.available(input.organizationId, provider)))
       throw new Error(`${provider} is not connected and verified`);
-    if (provider && policy.resources && typeof policy.resources === 'object')
-      (await this.deps.providerConnections?.assertFits?.(input.organizationId, provider, machineShape(candidate as Partial<import('../domain/types.js').ProjectConfig>)));
+    // The sizes and the outbound network it sets, on the provider it ends with.
+    const network = policy.network !== undefined || policy.worldProvider !== undefined
+      ? networkChoice((candidate as Partial<import('../domain/types.js').ProjectConfig>).network) : undefined;
+    if (provider && ((policy.resources && typeof policy.resources === 'object') || network))
+      (await this.deps.providerConnections?.assertFits?.(input.organizationId, provider,
+        policy.resources && typeof policy.resources === 'object' ? machineShape(candidate as Partial<import('../domain/types.js').ProjectConfig>) : {}, network));
     const runnerPoolId = typeof candidate.runnerPoolId === 'string' ? candidate.runnerPoolId : undefined;
     if (runnerPoolId) {
       const pool = (await this.deps.store.getRunnerPool(runnerPoolId));
@@ -1200,10 +1204,11 @@ export class KarmaxApi {
     // Ask only for what the organization's provider account can give (wiki
     // features/computers): the sizes this value names, or every effective size
     // when it moves to another provider.
-    if (computer && (provider || computer.cpu != null || computer.memoryMb != null || computer.diskGb != null)) {
+    if (computer && (provider || computer.network || computer.cpu != null || computer.memoryMb != null || computer.diskGb != null)) {
       const effective = applyComputer(await this.deps.store.effectiveProjectConfig(project), computer);
       const shape = provider ? machineShape(effective) : machineShape({ resources: computer });
-      try { await this.deps.providerConnections?.assertFits?.(project.organizationId ?? 'org_personal', effective.worldProvider, shape); }
+      const network = provider || computer.network ? networkChoice(effective.network) : undefined;
+      try { await this.deps.providerConnections?.assertFits?.(project.organizationId ?? 'org_personal', effective.worldProvider, shape, network); }
       catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
     }
     return computer;

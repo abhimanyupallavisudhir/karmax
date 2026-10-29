@@ -420,6 +420,18 @@ describe('Daytona cloud world provider', () => {
     expect(output).toBe('🙂');
   });
 
+  it('gives Basic and Full the open internet: no rule a Tier 1–2 account would refuse', async () => {
+    for (const network of [{ unrestricted: true }, { basic: true }]) {
+      const sandbox = fakeSandbox();
+      sandbox.updateNetworkSettings = vi.fn(async () => undefined);
+      const create = vi.fn(async (_options: Record<string, unknown>) => sandbox);
+      await new DaytonaWorldProvider({ create, get: async () => sandbox }).create({ taskId: 'open', base: 'main', network });
+      expect(create.mock.calls[0]![0]).toMatchObject({ networkBlockAll: false });
+      expect(create.mock.calls[0]![0]).not.toHaveProperty('domainAllowList');
+      expect(sandbox.updateNetworkSettings).not.toHaveBeenCalled();
+    }
+  });
+
   it('explains restricted-tier failures without retrying with a weaker network policy', async () => {
     const create = vi.fn(async () => { throw new Error('Network access is restricted and cannot be overridden at the sandbox level. Remove domainAllowList from the request.'); });
     await expect(new DaytonaWorldProvider({ create, get: async () => fakeSandbox() }).create({ taskId: 'tier', base: 'main' }))

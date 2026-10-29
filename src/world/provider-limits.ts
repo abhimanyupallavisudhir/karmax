@@ -1,4 +1,4 @@
-import { limitFromMessage, type ComputerLimits } from '../domain/computer-limits.js';
+import { limitFromMessage, type AccountNetwork, type ComputerLimits } from '../domain/computer-limits.js';
 import { e2bTotalDiskGb } from './e2b-template.js';
 
 /**
@@ -8,6 +8,8 @@ import { e2bTotalDiskGb } from './e2b-template.js';
  * anything; Daytona's API also reports the organization's tier pool. Each probe
  * asks for an impossible size per dimension and reads the refusal. Anything a
  * probe was unexpectedly allowed to create is deleted again.
+ *
+ * Daytona also says what its network gives (`daytonaNetwork`).
  */
 interface ProbeOptions { fetch?: typeof globalThis.fetch; now?: () => number; timeoutMs?: number }
 
@@ -58,10 +60,12 @@ export async function probeDaytonaLimits(apiKey: string,
   // per-sandbox check runs before anything is queued.
   const asks: Array<[Dimension, Record<string, number>]> = [
     ['disk', { cpu: 1, memory: 1, disk: huge }], ['memory', { cpu: 1, memory: huge, disk: 3 }], ['cpu', { cpu: huge, memory: 1, disk: 3 }]];
+  const organization = call('GET', `${base}/api-keys/current`).then((key) =>
+    key.ok && typeof key.body?.organizationId === 'string' ? key.body.organizationId as string : undefined, () => undefined);
+  const network = daytonaNetwork(call, base, organization).catch(() => undefined);
   const pool = (async () => {
     // The organization's tier: CPU, memory (GiB) and disk (GiB) across all its running sandboxes.
-    const key = await call('GET', `${base}/api-keys/current`);
-    const organizationId = key.ok && typeof key.body?.organizationId === 'string' ? key.body.organizationId : undefined;
+    const organizationId = await organization;
     if (!organizationId) return;
     const usage = await call('GET', `${base}/organizations/${encodeURIComponent(organizationId)}/usage`);
     const regions = Array.isArray(usage.body?.regionUsage) ? usage.body.regionUsage as Array<Record<string, unknown>> : [];
@@ -93,8 +97,47 @@ export async function probeDaytonaLimits(apiKey: string,
   await pool;
   // What a refusal states is what this account enforces, whatever the usage report says.
   Object.assign(limits, refused);
+  const reach = await network;
+  if (reach) limits.network = reach;
   if (limits.pool && !Object.keys(limits.pool).length) delete limits.pool;
   return finish(limits, options);
+}
+
+const BASIC_ONLY: AccountNetwork = { internet: 'basic', allowlist: false };
+const OPEN: AccountNetwork = { internet: 'full', allowlist: true };
+/** Daytona's words for a Tier 1–2 organization asked for a network rule. */
+const RESTRICTED = /network access is restricted|cannot be overridden/i;
+
+/**
+ * What a Daytona organization's network gives (docs network-limits, checked
+ * 2026-10-29): on Tier 1–2 "network access is restricted and cannot be
+ * overridden at the sandbox level" — only Daytona's essential services, no
+ * allowlist or block-all; Tier 3+ the open internet and per-sandbox rules.
+ * The organization record says which (`sandboxLimitedNetworkEgress`), where
+ * the key may read it (self-hosted Daytona; hosted Daytona answers 401).
+ * Otherwise a sandbox is asked for with a domain allowlist and an impossible
+ * disk, like the size probes: hosted Daytona refuses the rule for a Tier 1–2
+ * organization before it looks at the size (checked live 2026-10-29), so a
+ * size refusal means the rule was accepted. Nothing is made; anything that
+ * was is deleted. Undefined when Daytona said neither.
+ */
+async function daytonaNetwork(call: ReturnType<typeof request>, base: string,
+  organization: Promise<string | undefined>): Promise<AccountNetwork | undefined> {
+  const organizationId = await organization;
+  if (organizationId) {
+    const record = await call('GET', `${base}/organizations/${encodeURIComponent(organizationId)}`).catch(() => undefined);
+    const limited = record?.ok ? record.body?.sandboxLimitedNetworkEgress : undefined;
+    if (typeof limited === 'boolean') return limited ? BASIC_ONLY : OPEN;
+  }
+  const answer = await call('POST', `${base}/sandbox`, { cpu: 1, memory: 1, disk: 100_000, buildInfo: { dockerfileContent: 'FROM alpine:3.20\n' },
+    domainAllowList: 'example.com', labels: { karmaxProbe: 'network' }, autoStopInterval: 1, autoDeleteInterval: 0 });
+  if (answer.ok) {
+    const id = typeof answer.body?.id === 'string' ? answer.body.id : undefined;
+    if (id) await call('DELETE', `${base}/sandbox/${encodeURIComponent(id)}`).catch(() => undefined);
+    return OPEN;
+  }
+  const message = typeof answer.body?.message === 'string' ? answer.body.message : '';
+  return RESTRICTED.test(message) ? BASIC_ONLY : limitFromMessage(message) ? OPEN : undefined;
 }
 
 function refusal(body: any, dimension: Dimension) {
@@ -103,7 +146,7 @@ function refusal(body: any, dimension: Dimension) {
 }
 
 function finish(limits: ComputerLimits, options: ProbeOptions): ComputerLimits {
-  const order: Array<keyof ComputerLimits> = ['cpu', 'memoryMb', 'diskGb', 'pool'];
+  const order: Array<keyof ComputerLimits> = ['cpu', 'memoryMb', 'diskGb', 'pool', 'network'];
   const out = Object.fromEntries(order.filter((key) => limits[key] !== undefined).map((key) => [key, limits[key]])) as ComputerLimits;
   return { ...out, checkedAt: (options.now ?? Date.now)() };
 }

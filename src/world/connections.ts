@@ -1,7 +1,8 @@
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
 import { isAnyProvider, type MachineShape } from '../domain/computer.js';
-import { assertComputerFits, computerLimits, providerFeatures, type ComputerFeatures, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
+import { assertComputerFits, assertNetworkFits, computerLimits, measuresNetwork, networkUnfit, providerFeatures, providerLabel, type ComputerFeatures,
+  type ComputerLimits, type EffectiveComputerLimits, type NetworkChoice } from '../domain/computer-limits.js';
 import type { WorldProviderConnection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { probeDaytonaLimits, probeE2BLimits } from './provider-limits.js';
@@ -90,7 +91,7 @@ export class WorldProviderConnectionService {
   private async view(value: WorldProviderConnection): Promise<WorldProviderConnectionView> {
     const { measuredLimits, ...rest } = value;
     return { ...rest, credentialConfigured: await this.broker.hasHandle(value.credentialHandle),
-      limits: computerLimits(value.provider, measuredLimits, value.config.limits), features: providerFeatures(value.provider) };
+      limits: computerLimits(value.provider, measuredLimits, value.config.limits), features: providerFeatures(value.provider, measuredLimits) };
   }
 
   /** Every connection, with its limits. One never asked is asked now (briefly
@@ -108,7 +109,9 @@ export class WorldProviderConnectionService {
   private async listOwn(organizationId: string): Promise<WorldProviderConnectionView[]> {
     const values = await this.store.listWorldProviderConnections(organizationId);
     const configured = await Promise.all(values.map((value) => this.broker.hasHandle(value.credentialHandle)));
-    const unknown = values.filter((value, index) => !value.measuredLimits && value.enabled && configured[index]);
+    // Never asked, or asked before its network was measured (a Daytona tier).
+    const unknown = values.filter((value, index) => value.enabled && configured[index]
+      && (!value.measuredLimits || (measuresNetwork(value.provider) && !value.measuredLimits.network)));
     if (unknown.length) {
       const probes = unknown.map((value) => this.probeOnce(organizationId, value.provider));
       await Promise.race([Promise.allSettled(probes), new Promise((resolve) => setTimeout(resolve, LIST_PROBE_WAIT_MS).unref())]);
@@ -150,17 +153,27 @@ export class WorldProviderConnectionService {
    * For "Any", each size is the largest some reachable account allows. */
   async limits(organizationId: string | undefined, provider: string): Promise<EffectiveComputerLimits> {
     if (isAnyProvider(provider)) return organizationId ? anyLimits(await this.reachable(organizationId)) : { source: {} };
-    let value = organizationId ? await this.store.getWorldProviderConnection(organizationId, provider) : undefined;
-    if (!value && organizationId && await this.funding(organizationId, provider) === 'managed')
-      value = await this.store.getWorldProviderConnection(MANAGED_COMPUTE, provider);
+    const value = await this.account(organizationId, provider);
     return computerLimits(provider, value?.measuredLimits, value?.config.limits);
   }
 
-  /** Refuse a size this organization's account cannot give, before any machine is made. */
-  async assertFits(organizationId: string | undefined, provider: string | undefined, spec: MachineShape): Promise<void> {
+  /** The account a named provider's computers run on for this organization:
+   * its own, else the managed compute it uses. */
+  private async account(organizationId: string | undefined, provider: string): Promise<WorldProviderConnection | undefined> {
+    const value = organizationId ? await this.store.getWorldProviderConnection(organizationId, provider) : undefined;
+    if (!value && organizationId && await this.funding(organizationId, provider) === 'managed')
+      return this.store.getWorldProviderConnection(MANAGED_COMPUTE, provider);
+    return value;
+  }
+
+  /** Refuse a size, or an outbound network, this organization's account cannot
+   * give, before any machine is made. For "Any": when no reachable account can. */
+  async assertFits(organizationId: string | undefined, provider: string | undefined, spec: MachineShape, network?: NetworkChoice): Promise<void> {
     if (!provider) return;
-    if (isAnyProvider(provider)) return assertSomeFits(spec, organizationId ? await this.reachable(organizationId) : []);
-    assertComputerFits(spec, await this.limits(organizationId, provider), provider);
+    if (isAnyProvider(provider)) return assertSomeFits(spec, organizationId ? await this.reachable(organizationId) : [], network);
+    const value = await this.account(organizationId, provider);
+    assertComputerFits(spec, computerLimits(provider, value?.measuredLimits, value?.config.limits), provider);
+    if (network) assertNetworkFits(network, providerFeatures(provider, value?.measuredLimits), provider);
   }
 
   /** Merge what the provider said into what is known about this account. */
@@ -174,7 +187,9 @@ export class WorldProviderConnectionService {
     const connection = await this.resolve(organizationId, provider);
     const limits = await this.probes.limits(provider, connection);
     if (!limits || !Object.keys(limits).some((key) => key !== 'checkedAt')) return undefined;
-    await this.recordLimits(organizationId, provider, limits, true);
+    // A probe that could not tell what the network gives keeps what was known.
+    const known = limits.network ? undefined : (await this.store.getWorldProviderConnection(organizationId, provider))?.measuredLimits?.network;
+    await this.recordLimits(organizationId, provider, known ? { ...limits, network: known } : limits, true);
     return limits;
   }
 
@@ -365,9 +380,15 @@ export function anyLimits(views: Array<{ limits: ComputerLimits }>): EffectiveCo
   return out;
 }
 
-/** Refuse a size no single reachable account can give. Nothing reachable: nothing to judge. */
-function assertSomeFits(spec: MachineShape, views: Array<{ provider: string; limits: ComputerLimits }>): void {
+/** Refuse a size, or a network, no single reachable account can give.
+ * Nothing reachable: nothing to judge. */
+function assertSomeFits(spec: MachineShape, views: Array<{ provider: string; limits: ComputerLimits; features: ComputerFeatures }>,
+  network?: NetworkChoice): void {
   if (!views.length) return;
+  const reaching = views.filter((view) => !networkUnfit(network, view.features));
+  if (!reaching.length) throw new Error(`No computer this organization can use gives ${network === 'allowlist' ? 'an outbound allowlist' : 'full internet'}: ${
+    views.map((view) => `${providerLabel(view.provider)}: ${networkUnfit(network, view.features)}`).join('; ')}`);
+  views = reaching;
   const failures: string[] = [];
   for (const view of views) {
     try { assertComputerFits(spec, view.limits, view.provider); return; }

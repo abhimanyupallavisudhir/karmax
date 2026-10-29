@@ -4,7 +4,8 @@ import { probeDaytonaLimits } from '../src/world/provider-limits.js';
 
 // Daytona refuses a size above an organization's per-sandbox maximum at once
 // (400 "Disk request 12GB exceeds maximum allowed per sandbox (10GB)") and
-// reports its tier pool in /organizations/<id>/usage (features/computers).
+// reports its tier pool in /organizations/<id>/usage (features/computers). A
+// Tier 1–2 organization refuses a sandbox network rule before it looks at size.
 describe.skipIf(!liveEnabled() || !process.env.DAYTONA_API_KEY)('Daytona computer limits', () => {
   it('learns the organization\'s per-sandbox maxima and tier pool, creating nothing', async () => {
     const limits = await probeDaytonaLimits(process.env.DAYTONA_API_KEY!, { apiUrl: process.env.DAYTONA_API_URL });
@@ -14,8 +15,14 @@ describe.skipIf(!liveEnabled() || !process.env.DAYTONA_API_KEY)('Daytona compute
     expect(limits.memoryMb).toBeGreaterThanOrEqual(1024);
     expect(limits.diskGb).toBeGreaterThanOrEqual(3);
     expect(limits.pool?.diskGb).toBeGreaterThanOrEqual(limits.diskGb!);
-    const listed = await fetch(`${process.env.DAYTONA_API_URL ?? 'https://app.daytona.io/api'}/sandbox?labels=${encodeURIComponent(JSON.stringify({ karmaxProbe: 'limits' }))}`,
-      { headers: { Authorization: `Bearer ${process.env.DAYTONA_API_KEY}` } });
-    expect((await listed.json() as { items: unknown[] }).items).toEqual([]);
+    // And what its network gives: production's Tier 1 organization reaches only
+    // essential services and refuses sandbox network rules (2026-10-29).
+    expect(limits.network).toEqual(expect.objectContaining({ internet: expect.stringMatching(/^(full|basic)$/) }));
+    expect(limits.network!.allowlist).toBe(limits.network!.internet === 'full');
+    for (const probe of ['limits', 'network']) {
+      const listed = await fetch(`${process.env.DAYTONA_API_URL ?? 'https://app.daytona.io/api'}/sandbox?labels=${encodeURIComponent(JSON.stringify({ karmaxProbe: probe }))}`,
+        { headers: { Authorization: `Bearer ${process.env.DAYTONA_API_KEY}` } });
+      expect((await listed.json() as { items: unknown[] }).items).toEqual([]);
+    }
   }, 60_000);
 });

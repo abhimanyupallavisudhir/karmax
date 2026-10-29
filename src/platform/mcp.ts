@@ -12,7 +12,7 @@ import {
 } from './platform-request.js';
 import { BRAND } from '../domain/brand.js';
 import { continuedReply } from '../domain/forks.js';
-import { CLOUD_WORLD_PROVIDERS, type CloudWorldProvider } from '../domain/computer.js';
+import { changeNetwork, CLOUD_WORLD_PROVIDERS, NETWORK_CHOICES, type CloudWorldProvider } from '../domain/computer.js';
 
 // Re-exported so the platform MCP module stays the one place a reader looks for
 // the agent-facing contract; `src/agent/tools.ts` imports the same definitions
@@ -434,7 +434,8 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       worldProvider: z.string().nullish(), runnerPoolId: z.string().nullish(),
       environmentFlavor: z.enum(['headless', 'desktop']).optional(), region: z.enum(['eu', 'us']).nullish(),
       cpu: z.number().positive().optional(), memoryMb: z.number().int().min(128).optional(), diskGb: z.number().int().min(1).optional(), gpu: z.number().nonnegative().optional(),
-      unrestrictedInternet: z.boolean().optional(), allowDomains: z.array(z.string()).optional(), allowCidrs: z.array(z.string()).optional(),
+      network: z.enum(NETWORK_CHOICES).optional().describe('Outbound network: full internet (default), basic (package registries, Git hosts, AI and cloud APIs are enough; "any" may then use accounts that reach only those), or allowlist (allowDomains/allowCidrs only)'),
+      unrestrictedInternet: z.boolean().optional().describe('Legacy: true is network "full", false is "allowlist"'), allowDomains: z.array(z.string()).optional(), allowCidrs: z.array(z.string()).optional(),
       monthlyBudgetUsd: z.number().nonnegative().nullish(), hibernateAfterDays: z.number().nonnegative().nullish(),
     } },
     async (a) => wrap(async () => {
@@ -453,7 +454,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       // set `unrestricted:false` and dropped `allowCidrs`, and `{memoryMb}` alone
       // erased `cpu`/`gpu`. Only keys the caller actually supplied are assigned.
       const wantsResources = a.cpu !== undefined || a.memoryMb !== undefined || a.diskGb !== undefined || a.gpu !== undefined;
-      const wantsNetwork = a.unrestrictedInternet !== undefined || a.allowDomains !== undefined || a.allowCidrs !== undefined;
+      const wantsNetwork = a.network !== undefined || a.unrestrictedInternet !== undefined || a.allowDomains !== undefined || a.allowCidrs !== undefined;
       if (wantsResources || wantsNetwork) {
         // Either `{organization, override?, effective?}` or a bare policy — see below.
         const current = await ops.getExecutionPolicy(a.organizationId, a.projectId).catch(() => undefined) as
@@ -477,13 +478,8 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
           if (a.gpu !== undefined) resources.gpu = a.gpu;
           policy.resources = resources;
         }
-        if (wantsNetwork) {
-          const network: Record<string, unknown> = { ...(base.network ?? {}) };
-          if (a.unrestrictedInternet !== undefined) network.unrestricted = a.unrestrictedInternet;
-          if (a.allowDomains !== undefined) network.allowDomains = a.allowDomains;
-          if (a.allowCidrs !== undefined) network.allowCidrs = a.allowCidrs;
-          policy.network = network;
-        }
+        if (wantsNetwork) policy.network = changeNetwork(base.network, { choice: a.network, unrestricted: a.unrestrictedInternet,
+          allowDomains: a.allowDomains, allowCidrs: a.allowCidrs });
       }
       return (await ops.setExecutionPolicy({ organizationId: a.organizationId, projectId: a.projectId, policy }));
     }),
