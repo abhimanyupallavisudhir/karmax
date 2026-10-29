@@ -1,6 +1,6 @@
 # Whole-UI sweep, round 2 (2026-10-27) — checklist
 
-Status: done 2026-10-28 (sections A–D on sweep-a…d, merged). Deliberately kept: project slugs on list rows (match `project:` queries), the "God" role name and "unix pass" (test-pinned product names), "Concurrent agent turns" (docs-pinned). Search box: typing narrows the lit view.
+Status: done 2026-10-28 (sections A–D on sweep-a…d, merged). Deliberately kept: project slugs on list rows (match `project:` queries), the "God" role name and "unix pass" (test-pinned product names), "Concurrent agent turns" (docs-pinned). Search box: typing narrows the lit view. **Reverted 2026-10-29 (owner): keep what teaches** — the box shows the whole query, and placeholders keep their @ / [[ / audience / cron hints (wiki features/settings-design).
 
 Rule set as in PLAN.md and the wiki's `features/settings-design`: every fact
 once; no help paragraphs or subtitles (tips via `policyTip`); sentence case; no
@@ -43,10 +43,10 @@ rights follow tavya roles (no GitHub merge notice in the task form).
 - [x] Mobile: paid-launch mono overflow; Composio input; Host capacity empty value
 
 ## C. Task page, task form, help, palette, queues, activity
-- [x] "25 MB each · 50 MB per prompt" / drop-files paragraph / long placeholders ("Message the agent · @ … · [[ …", "Describe the task (drop files…)") → short placeholder + tip
+- [x] "25 MB each · 50 MB per prompt" / drop-files paragraph → tip. ~~Long placeholders → short~~ reverted: the @ / [[ hints teach (keep what teaches)
 - [x] Rail: "→ main" repeats Branches; Sub-tasks "0 of 1 complete" + bar + dot; Branches card in a card with inline styles; "Approval requests" when none pending; dead "Delegated work" kicker
 - [x] stageLabel returns raw/lowercase stage keys → sentence case everywhere (shared with D)
-- [x] Search box shows the active view's query (`for:me -is:archived`) → empty with placeholder (shared with D)
+- [ ] ~~Search box shows the active view's query (`for:me -is:archived`) → empty with placeholder~~ reverted: the query in the box is how people learn to write one
 - [x] Help: Esc twice; raw "software-dev"; title-case command names; palette groups disagree with help
 - [x] Task form: raw `[[proj:tag:default]]` context tokens → chips; "Codex/Claude" label (pinned by tests — check); account chips (see A); "claude default model"; Responder "@creator" raw token; "no cards"; slug in header
 - [x] Store recommendations (shared with D): 5 cards, "Repeatable" chip on most, "Needs GitHub" ×3 with disabled Install → actionable ones + "N more in Task store", one "Connect GitHub" line; title "Auto-create project wiki (memories, skills, AGENTS.md)"

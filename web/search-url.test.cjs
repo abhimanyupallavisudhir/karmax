@@ -250,11 +250,12 @@ eval(extractFn('setQuery'));
   eq(currentPath(), '/acme/website-redesign?q=', 'clearing the search shows every task — kept in the URL so it survives a reload');
   await setQuery('for:me -is:archived');
   eq(currentPath(), '/acme/website-redesign', 'the default view needs no param');
-  eq(box.value, '', "a view's own query is its lit chip, not text in the search box");
+  // The box always shows the whole query: it is how people learn to write one.
+  eq(box.value, 'for:me -is:archived', "a view's own query shows in the search box, with its chip lit");
   await setQuery('-is:archived');
-  eq(box.value, '', 'nor is Active’s');
+  eq(box.value, '-is:archived', 'and so does Active’s');
   await setQuery('for:me -is:archived tag:bug');
-  eq(box.value, 'tag:bug', 'a search narrowing a view shows only what narrows it; the view stays lit');
+  eq(box.value, 'for:me -is:archived tag:bug', 'a search narrowing a view shows in full; the view stays lit');
   await setQuery('status:active tag:bug');
   eq(box.value, 'status:active tag:bug', 'a search of your own shows in full');
   await setQuery('for:me -is:archived');

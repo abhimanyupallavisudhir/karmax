@@ -91,7 +91,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await page.locator('[data-id="t3"]').waitFor();
     await settle();
     assert.deepEqual(await rows(), ['t1', 't2', 't3', 't5', 't6'], 'Active hides archived tasks, and sub-tasks as before');
-    assert.equal(await page.locator('#task-search').inputValue(), '', "the lit chip is the query; the box is left for a search");
+    assert.equal(await page.locator('#task-search').inputValue(), '-is:archived', 'the box shows the lit chip’s query, so people learn to write one');
     await page.reload();
     await page.locator('[data-id="t3"]').waitFor();
     assert.equal(await activeView(), '__active__', 'a reloaded Active stays Active');
@@ -102,16 +102,16 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await page.waitForFunction(() => !document.querySelector('[data-id="t3"]'));
     await settle();
     assert.deepEqual(await rows(), ['t2', 't5'], 'only that project');
-    assert.equal(await page.locator('#task-search').inputValue(), 'project:mobile-app', 'the box holds what narrows the view');
+    assert.equal(await page.locator('#task-search').inputValue(), '-is:archived project:mobile-app', 'the box shows the whole query');
     assert.equal(await activeView(), '__active__', 'and Active stays lit');
     await page.locator('#q-project').selectOption('');
     await page.waitForFunction(() => location.search === '?q=-is:archived');
 
-    // ── typing narrows the lit view; clearing goes back to it ────────────────
-    await page.locator('#task-search').fill('x');
+    // ── typing after a view's query narrows it, and the view stays lit ───────
+    await page.locator('#task-search').fill('-is:archived x');
     await page.waitForFunction(() => location.search === '?q=-is:archived+x');
     assert.equal(await activeView(), '__active__', 'the narrowed view stays lit');
-    await page.locator('#task-search').fill('');
+    await page.locator('#task-search').fill('-is:archived');
     await page.waitForFunction(() => location.search === '?q=-is:archived');
 
     // ── the lit chip switches off: the empty query is every task, archived too ─
