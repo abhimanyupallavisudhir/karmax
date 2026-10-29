@@ -1309,7 +1309,7 @@ it('bounds GitHub provisioning requests with an abort signal (PS-7)', async () =
 // account takes them only from its owner (GitHub's POST /user/repos makes one in
 // the *caller's* account, so anyone else must be refused before GitHub acts).
 describe('creating repositories in a connected account', () => {
-  async function fixture(accountType: 'User' | 'Organization', accountLogin: string, options: { installationRefuses?: boolean } = {}) {
+  async function fixture(accountType: 'User' | 'Organization', accountLogin: string, options: { installationRefuses?: boolean; personRefused?: boolean } = {}) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-create-'));
     const store = (await Store.create(':memory:'));
     const broker = new CredentialBroker(new Vault(dir));
@@ -1341,6 +1341,8 @@ describe('creating repositories in a connected account', () => {
       if (url.pathname === `/orgs/${accountLogin}/repos` && method === 'POST') {
         if (options.installationRefuses && auth === 'installation-token')
           return Response.json({ message: 'Resource not accessible by integration', status: '403' }, { status: 403 });
+        if (options.personRefused && auth === 'pat-token')
+          return Response.json({ message: 'You need admin access to the organization before adding a repository to it.' }, { status: 403 });
         return payload(accountLogin);
       }
       if (/^\/user\/installations\/42\/repositories\/\d+$/.test(url.pathname) && method === 'PUT') return new Response(null, { status: 204 });
@@ -1391,14 +1393,23 @@ describe('creating repositories in a connected account', () => {
     await close();
   });
 
-  it('falls back to the person’s own authorization, and says plainly when neither may', async () => {
-    const { service, connection, calls, link, close } = await fixture('Organization', 'acme', { installationRefuses: true });
-    await expect(service.createRepository(connection.id, 'no-github-user', { name: 'corruption-detector' }))
+  it('makes one as the person when GitHub lets them, else by the installation, and says plainly when neither may', async () => {
+    const asPerson = await fixture('Organization', 'acme');
+    await asPerson.link('pat-user', 'pat-token');
+    await expect(asPerson.service.createRepository(asPerson.connection.id, 'pat-user', { name: 'mine' })).resolves.toMatchObject({ owner: 'acme' });
+    expect(asPerson.calls.filter((call) => call.method === 'POST' && call.path.endsWith('/repos')).map((call) => call.auth)).toEqual(['pat-token']);
+    await asPerson.close();
+
+    // Not a member of that organization on GitHub: the installation makes it for them.
+    const refused = await fixture('Organization', 'acme', { personRefused: true });
+    await refused.link('pat-user', 'pat-token');
+    await expect(refused.service.createRepository(refused.connection.id, 'pat-user', { name: 'theirs' })).resolves.toMatchObject({ owner: 'acme' });
+    expect(refused.calls.filter((call) => call.method === 'POST' && call.path.endsWith('/repos')).map((call) => call.auth)).toEqual(['pat-token', 'installation-token']);
+    await refused.close();
+
+    const neither = await fixture('Organization', 'acme', { installationRefuses: true });
+    await expect(neither.service.createRepository(neither.connection.id, 'no-github-user', { name: 'corruption-detector' }))
       .rejects.toMatchObject({ status: 403, message: "tavya's GitHub app can't create repositories in acme yet. An owner of acme needs to approve its permissions on GitHub (Organization settings → Resources → GitHub shows the update)." });
-    await link('pat-user', 'pat-token');
-    await expect(service.createRepository(connection.id, 'pat-user', { name: 'corruption-detector' }))
-      .resolves.toMatchObject({ owner: 'acme' });
-    expect(calls.filter((call) => call.method === 'POST' && call.path.endsWith('/repos')).map((call) => call.auth)).toEqual(['installation-token', 'installation-token', 'pat-token']);
-    await close();
+    await neither.close();
   });
 });

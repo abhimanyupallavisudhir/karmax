@@ -1624,10 +1624,10 @@ export class GitHubAppService {
    * installation, and return the durable record. */
   /**
    * Make a repository in a connected account, then enroll it. A GitHub
-   * organization's repository is made by the App's installation, so anyone
-   * tavya lets create repositories may, whether or not they belong to that
-   * organization on GitHub; the person's own authorization is the fallback (an
-   * installation that has not approved Administration yet). A personal account
+   * organization's repository is made as the person when they have GitHub and
+   * GitHub lets them (it then names them, and a task's pinned account holds),
+   * else by the App's installation, so anyone tavya lets create repositories
+   * may, whether or not they belong to that organization on GitHub. A personal account
    * takes repositories only from its owner: GitHub's `POST /user/repos` makes
    * one in the *calling* person's account, so anyone else is refused before
    * GitHub could put it in the wrong account.
@@ -1681,15 +1681,19 @@ export class GitHubAppService {
       } catch (error) { throw repositoryCreationFailure(connection, name, error); }
     }
     const pathname = `/orgs/${encodeURIComponent(login)}/repos`;
-    try {
-      return await this.request<GitHubRepositoryPayload>(pathname, await this.installationToken(connection), { method: 'POST', body });
-    } catch (installationError) {
-      if (/GitHub API 422/.test(String(installationError))) throw repositoryCreationFailure(connection, name, installationError);
-      if (!userId || !(await this.status(userId)).userAuthorized) throw repositoryCreationFailure(connection, name, installationError);
+    // As the person when they have GitHub (GitHub then names them, and a task's
+    // pinned account is honoured); by the installation when they have none, or
+    // GitHub refuses them (not a member of that organization).
+    if (userId && (await this.status(userId)).userAuthorized) {
       try {
         return await this.userRequest<GitHubRepositoryPayload>(userId, pathname, { method: 'POST', body }, accountId);
-      } catch (error) { throw repositoryCreationFailure(connection, name, error); }
+      } catch (error) {
+        if (!/GitHub API 40[34]/.test(String(error))) throw repositoryCreationFailure(connection, name, error);
+      }
     }
+    try {
+      return await this.request<GitHubRepositoryPayload>(pathname, await this.installationToken(connection), { method: 'POST', body });
+    } catch (error) { throw repositoryCreationFailure(connection, name, error); }
   }
 
   /** Idempotently provision a platform-owned repository. A previous attempt can
@@ -2179,7 +2183,7 @@ function repositoryCreationFailure(connection: GitConnection, name: string, erro
   const login = connection.accountLogin;
   if (/GitHub API 422/.test(text) && /already exists/i.test(text))
     return new GitHubRepositoryCreationError(`${login}/${name} already exists on GitHub. Choose another name, or add the existing repository.`, 409);
-  if (/GitHub API 403/.test(text) && connection.accountType === 'Organization')
+  if (/GitHub API 40[34]/.test(text) && connection.accountType === 'Organization')
     return new GitHubRepositoryCreationError(`${BRAND}'s GitHub app can't create repositories in ${login} yet. An owner of ${login} needs to approve its permissions on GitHub (Organization settings → Resources → GitHub shows the update).`, 403);
   if (/GitHub API 40[34]/.test(text))
     return new GitHubRepositoryCreationError(`GitHub didn't let ${BRAND} create ${login}/${name}. Reconnect GitHub on your profile and try again.`, 403);
