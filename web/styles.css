@@ -1804,9 +1804,6 @@ a.ins-task-title:hover { color: var(--accent); }
 }
 .combo-caret:hover { color: var(--ink); }
 /* An audience box reads by name until it is focused (audienceComboHtml). */
-.audience-face { display: none; position: absolute; inset: 0 30px 0 0; align-items: center; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--ink); pointer-events: none; }
-.audience-combo:not(:focus-within) > input.has-face { color: transparent; }
-.audience-combo:not(:focus-within) > input.has-face + .audience-face { display: block; line-height: normal; align-content: center; }
 .combo-menu {
   position: absolute; top: calc(100% + 3px); left: 0; right: 0; z-index: 70;
   max-height: 220px; overflow: auto; background: var(--surface);
