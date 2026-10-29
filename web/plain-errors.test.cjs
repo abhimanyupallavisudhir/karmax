@@ -48,6 +48,12 @@ eq(plainError(''), 'Something went wrong. Try again.', 'empty');
 eq(plainError('Repository creation failed: name already exists on this account'),
   'A GitHub repository with that name already exists. Choose another name, or add the existing one from the list.', 'existing repo name');
 
+// GitHub's raw answers, as the server passes them through, read as words.
+eq(plainError('GitHub API 403: {"message":"Resource not accessible by integration","documentation_url":"https://docs.github.com/rest/repos/repos#create-a-repository-for-the-authenticated-user","status":"403"}'),
+  'tavya’s GitHub app isn’t allowed to do that. An admin of that GitHub account may need to approve its permissions on GitHub.', 'integration refusal');
+eq(plainError('GitHub API 502: <html>Bad gateway</html>'), 'GitHub isn’t responding right now. Try again in a moment.', 'GitHub outage');
+eq(plainError('GitHub API 422: {"message":"Validation Failed","errors":[]}'), 'GitHub said: Validation Failed', 'other refusals keep only the message');
+
 // Task failures: a plain summary, with the exact text kept as details.
 const oom = plainTaskError('Activity task failed → agent turn interrupted by SIGKILL: host out of memory — the agent was likely killed by the OS OOM killer');
 eq(oom.summary, 'The task’s computer ran out of memory. Retry, or choose a bigger computer in Parameters.', 'OOM summary');

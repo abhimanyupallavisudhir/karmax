@@ -259,7 +259,7 @@ describe('Project settings', () => {
   it('offers “+ New repo” in the repository combobox, opening repository creation with the typed name', async () => {
     const ui = await settings({ api: ({ method, path: route }) => method !== 'GET' ? undefined
       : route.endsWith('/github/app') ? { configured: true, userAuthorized: true }
-        : route.endsWith('/git-connections') ? [{ id: 'gc', provider: 'github', accountLogin: 'octo' }] : undefined });
+        : route.endsWith('/git-connections') ? [{ id: 'gc', provider: 'github', accountLogin: 'octo', accountType: 'Organization' }] : undefined });
     const picker = ui.page.getByRole('combobox', { name: 'Add a repository' });
     await picker.waitFor();
     expect(await ui.page.getByRole('button', { name: 'New repository' }).count()).toBe(0);
@@ -283,7 +283,7 @@ describe('Project settings', () => {
     const fork = { id: 'repo_fork', owner: 'octo', name: 'widgets', sshUrl: 'git@github.com:octo/widgets.git',
       upstream: { owner: 'acme', name: 'widgets', defaultBranch: 'main', private: false } };
     const ui = await settings({ api: ({ method, path: route }) => route.endsWith('/github/app') ? { configured: true, userAuthorized: true }
-      : route.endsWith('/git-connections') ? [{ id: 'gc', provider: 'github', accountLogin: 'octo' }]
+      : route.endsWith('/git-connections') ? [{ id: 'gc', provider: 'github', accountLogin: 'octo', accountType: 'Organization' }]
         : method === 'GET' && route.endsWith('/repositories') ? [fork]
           : method === 'POST' && route.endsWith('/github/refresh') ? { repositories: [fork], count: 1 }
             : method === 'POST' && route.endsWith('/repositories') ? { ok: true } : undefined });
@@ -307,7 +307,7 @@ describe('Project settings', () => {
     const fork = { id: 'repo_secret', owner: 'octo', name: 'secret', sshUrl: 'git@github.com:octo/secret.git',
       upstream: { owner: 'acme', name: 'secret', defaultBranch: 'main', private: true } };
     const ui = await settings({ api: ({ method, path: route }) => route.endsWith('/github/app') ? { configured: true, userAuthorized: true, appSlug: 'tavya-app' }
-      : route.endsWith('/git-connections') ? [{ id: 'gc', provider: 'github', accountLogin: 'octo' }]
+      : route.endsWith('/git-connections') ? [{ id: 'gc', provider: 'github', accountLogin: 'octo', accountType: 'Organization' }]
         : route === '/api/user/github-accounts' ? { accounts: [{ id: 'a1', login: 'octo', active: true, profile: {} }] }
           : method === 'GET' && route.endsWith('/repositories') ? [fork]
             : method === 'POST' && route.endsWith('/github/refresh') ? { repositories: [fork], count: 1 }
@@ -356,7 +356,7 @@ describe('Project settings', () => {
       if (route === '/api/projects/p') return project();
       if (route === '/api/organizations/o/repositories') return repositories;
       if (route.endsWith('/github/app')) return { configured: true, oauthConfigured: true, userAuthorized: true };
-      if (route.endsWith('/git-connections')) return [{ id: 'gc', provider: 'github', accountLogin: 'acme', permissionStatus: { ready: true } }];
+      if (route.endsWith('/git-connections')) return [{ id: 'gc', provider: 'github', accountLogin: 'acme', accountType: 'Organization', permissionStatus: { ready: true } }];
       if (route === '/api/user/github-accounts') return { accounts: [{ id: 'a', login: 'octo', active: true }] };
       return emptySettings(call);
     }, { projects: [project()] }) });

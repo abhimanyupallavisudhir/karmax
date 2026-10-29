@@ -833,7 +833,10 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     });
     expect(substitutedResponse.status).toBe(400);
     expect(await substitutedResponse.json()).toMatchObject({ error: expect.stringMatching(/pinned GitHub account is not connected/i) });
-    expect(calls.filter((call) => call.path === '/orgs/acme/repos' && call.method === 'POST')).toHaveLength(2);
+    // Two made as people (pinned, then active); the substituted account made none.
+    // (The project's wiki may be made by the installation: nobody here is the one to wait for.)
+    expect(calls.filter((call) => call.path === '/orgs/acme/repos' && call.method === 'POST'
+      && call.authorization !== 'Bearer installation-token').map((call) => call.authorization)).toEqual(['Bearer pinned-token', 'Bearer active-token']);
 
     const audits = (await h.store.auditSince(0, 5000)).filter((event) =>
       event.principalId === 'task-agent:task-create-repository:do');

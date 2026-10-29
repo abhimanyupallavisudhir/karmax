@@ -3464,7 +3464,10 @@ export class Gateway {
         if (!status.userAuthorized && status.oauthConfigured) return authorize();
         try {
           const installations = status.userAuthorized ? await githubApp.connectableInstallations(subject.userId) : [];
-          return this.json(res, 200, { url: await githubApp.installationUrl(state), installations, canAuthorize: status.oauthConfigured });
+          const login = status.userAuthorized
+            ? (await githubApp.listUserAccounts(subject.userId).catch(() => [])).find((account) => account.active)?.login : undefined;
+          return this.json(res, 200, { url: await githubApp.installationUrl(state), installations, canAuthorize: status.oauthConfigured,
+            ...(login ? { login } : {}) });
         } catch (error) {
           // A revoked/expired user token may be removed during discovery. Resume
           // authorization instead of sending an existing installation to GitHub's dead end.
@@ -3526,7 +3529,10 @@ export class Gateway {
             { name: String(b.name ?? ''), description: b.description ? String(b.description) : undefined,
               private: b.private !== false, autoInit: b.autoInit !== false,
               ...(b.defaultBranch ? { defaultBranch: String(b.defaultBranch) } : {}) }, { accountId: githubAccountId }));
-        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        } catch (error) {
+          const status = typeof (error as { status?: unknown })?.status === 'number' ? (error as { status: number }).status : 400;
+          return this.json(res, status, { error: error instanceof Error ? error.message : String(error) });
+        }
       }
       const organizationProjects = p.match(/^\/api\/organizations\/([^/]+)\/projects$/);
       if (organizationProjects) {
@@ -8850,8 +8856,6 @@ export class Gateway {
         .sort((a, b) => Number(b.role === 'owner') - Number(a.role === 'owner'))
         .map((membership) => membership.userId),
     ])];
-    const actor = (await __asyncCollections.find(candidates, async (candidate) => (await this.deps.githubApp!.status(candidate)).userAuthorized));
-    if (!actor) return;
     const connections = (await this.deps.store.listGitConnections(organizationId));
     const attachedConnectionIds = [...new Set((await this.deps.store.listProjectRepositories(project.id))
       .map((candidate) => candidate.repository.gitConnectionId).filter((id): id is string => Boolean(id)))];
@@ -8861,6 +8865,12 @@ export class Gateway {
       ? connections.find((candidate) => candidate.id === attachedConnectionIds[0])
       : connections.length === 1 ? connections[0] : undefined;
     if (!connection) return;
+    // Who it is made as: an organization's installation (with a person's
+    // authorization as fallback), or a personal account's own owner. Without
+    // that owner the wiki stays local until they are around.
+    const creator = typeof githubApp.repositoryCreator === 'function'
+      ? await githubApp.repositoryCreator(connection, candidates).catch(() => undefined) : undefined;
+    if (!creator) return;
     if (this.wikiRemotesProvisioning.has(project.id)) return;
     this.wikiRemotesProvisioning.add(project.id);
     this.trackWikiWork((async () => {
@@ -8869,7 +8879,7 @@ export class Gateway {
         // Preserve the remote identity across project renames. The deterministic
         // name is only for the first provisioning attempt.
         const name = current?.name ?? `${base}-wiki-${project.id.slice(-8)}`;
-        const repository = await githubApp.ensureRepository(connection.id, actor, {
+        const repository = await githubApp.ensureRepository(connection.id, creator.userId, {
           name, description: `${(await this.siteName)} project wiki for ${project.name}`,
           private: true, defaultBranch: 'main', autoInit: false,
         });

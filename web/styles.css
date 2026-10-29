@@ -645,6 +645,12 @@ a.git-repo-name:hover { color:var(--accent); }
 .np-default-row input { flex:none; margin:0; accent-color:var(--accent); }
 .np-default-row code { padding:1px 6px; border-radius:5px; background:var(--surface-2); color:var(--ink); font:12px var(--font-mono); }
 .np-default-blank { color:var(--ink-3); }
+.np-default-blocked { cursor:default; color:var(--ink-3); }
+.np-default-blocked .btn { margin-left:auto; }
+.github-connect { display:grid; gap:10px; max-width:440px; }
+.github-connect h2 { margin:0; }
+.github-connect p { margin:0; line-height:1.5; }
+.github-connect-actions { display:flex; flex-wrap:wrap; gap:8px; justify-content:flex-end; }
 .np-repos[hidden], .np-default[hidden] { display:none; }
 .np-loading { padding:10px 0; color:var(--ink-3); font-size:12px; }
 .np-github .setting-row { min-height:40px; }

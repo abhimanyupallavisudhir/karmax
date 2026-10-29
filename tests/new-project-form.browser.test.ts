@@ -9,12 +9,16 @@ afterAll(closeConsoleBrowser);
 
 const site = { id: 'r1', owner: 'acme', name: 'site', sshUrl: 'git@github.com:acme/site.git', defaultBranch: 'main' };
 
-async function form(options: { github?: boolean; hosted?: boolean; refuseCreate?: boolean; repositories?: unknown[] } = {}) {
+async function form(options: { github?: boolean; hosted?: boolean; refuseCreate?: boolean; repositories?: unknown[];
+  connection?: Record<string, unknown>; logins?: string[] } = {}) {
   const github = options.github ?? true;
   const projects: Array<Record<string, unknown>> = [{ id: 'p', organizationId: 'o', name: 'Workspace', config: {} }];
   const ui = await consolePage({ path: '/org/workspace', api: signedIn(({ method, path, body }: ApiCall) => {
     if (method === 'GET' && path === '/api/organizations/o/repositories') return github ? options.repositories ?? [site] : [];
-    if (method === 'GET' && path === '/api/organizations/o/git-connections') return github ? [{ id: 'g1', accountLogin: 'acme' }] : [];
+    if (method === 'GET' && path === '/api/organizations/o/git-connections')
+      return github ? [options.connection ?? { id: 'g1', accountLogin: 'acme', accountType: 'Organization' }] : [];
+    if (method === 'GET' && path === '/api/user/github-accounts')
+      return { accounts: (options.logins ?? []).map((login, index) => ({ id: String(index), login, active: index === 0 })) };
     if (method === 'GET' && path === '/api/organizations/o/github/app') return { configured: true, userAuthorized: github };
     if (method === 'POST' && path === '/api/organizations/o/projects') {
       const project = { id: 'n', organizationId: 'o', name: 'Site', folder: 'Clients', config: { repos: body.repos } };
@@ -171,6 +175,33 @@ describe('New project form', () => {
     await dialog.getByRole('button', { name: 'Create project' }).click();
     await expect.poll(() => ui.calls.find((call) => call.path === '/api/organizations/o/projects')?.body)
       .toEqual({ name: 'Fresh', config: {}, repos: ['git@github.com:acme/brand-new.git'] });
+    await ui.close();
+  });
+
+  it('in someone else’s personal GitHub account, says why it cannot create one and offers to connect yours', async () => {
+    const { ui, dialog } = await form({ connection: { id: 'g1', accountLogin: 'srajma', accountType: 'User' }, logins: ['pat'], repositories: [] });
+    await dialog.getByRole('textbox', { name: 'Project name' }).fill('Corruption Detector');
+    const create = dialog.getByRole('radio', { name: /Create new GitHub repo/ });
+    await expect.poll(() => create.isDisabled()).toBe(true);
+    expect(await dialog.getByRole('radio', { name: 'Choose other repositories' }).isChecked()).toBe(true);
+    expect(await dialog.locator('.np-default [data-tip], .np-default [title]').first().evaluate((element) =>
+      element.getAttribute('data-tip') || element.getAttribute('title'))).toBe('Only srajma can create repos in their personal GitHub account. Connect your own GitHub account to create one.');
+    await dialog.getByRole('button', { name: 'Connect your GitHub' }).waitFor();
+    // Nor does the list offer to make one there.
+    const picker = dialog.getByRole('combobox', { name: 'Add a repository' });
+    await picker.fill('corruption-detector');
+    expect(await ui.page.getByRole('listbox', { name: 'Repositories' }).getByRole('option').allInnerTexts()).toEqual([]);
+    await dialog.getByRole('textbox', { name: 'Project name' }).press('Enter');
+    await expect.poll(() => ui.calls.filter((call) => call.method !== 'GET'))
+      .toEqual([{ method: 'POST', path: '/api/organizations/o/projects', body: { name: 'Corruption Detector', config: {} } }]);
+    await ui.close();
+  });
+
+  it('in their own personal GitHub account, creates it there', async () => {
+    const { ui, dialog } = await form({ connection: { id: 'g1', accountLogin: 'srajma', accountType: 'User' }, logins: ['srajma'], repositories: [] });
+    await dialog.getByRole('textbox', { name: 'Project name' }).fill('Corruption Detector');
+    await expect.poll(() => dialog.locator('.np-default-label').innerText()).toBe('Create new GitHub repo srajma/corruption-detector');
+    expect(await dialog.getByRole('radio', { name: /Create new GitHub repo/ }).isChecked()).toBe(true);
     await ui.close();
   });
 
