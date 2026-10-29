@@ -1948,7 +1948,7 @@ function renderField(f, own, inherited, withChips, alt, agentOpts) {
   if (f.type === 'responder') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderResponderField(f, own, inherited, alt)}</div>`;
   if (f.type === 'text') {
     // The prompt field also carries durable uploads and wiki context.
-    const placeholder = withChips ? 'Describe the task' : (f.placeholder || '');
+    const placeholder = withChips ? 'Describe the task (drop files here, type [[ to add wiki context)' : (f.placeholder || '');
     const ta = `<textarea ${attrs} rows="4" placeholder="${esc(placeholder)}">${esc(v)}</textarea>`;
     // For the prompt field, pasted images render inside the box (below the text),
     // growing it as needed — rather than in a separate "Images" section.
@@ -2643,7 +2643,7 @@ function humanAudienceOptions() {
 // Away from the keyboard it reads by name ("Task creator"), not as the stored
 // tokens (@creator); focused, the tokens are edited as text.
 function audienceComboHtml(className, audience, label) {
-  return `<div class="combo audience-combo"><input class="${className}" value="${esc(audience)}" aria-label="${esc(label)}" placeholder="Search people or teams" autocomplete="off" spellcheck="false" /><span class="audience-face" aria-hidden="true"></span><button type="button" class="combo-caret" tabindex="-1" aria-label="Show people and teams">▾</button><div class="combo-menu" hidden></div></div>`;
+  return `<div class="combo audience-combo"><input class="${className}" value="${esc(audience)}" aria-label="${esc(label)}" placeholder="@creator, @team:leaders, or search for a person" autocomplete="off" spellcheck="false" /><span class="audience-face" aria-hidden="true"></span><button type="button" class="combo-caret" tabindex="-1" aria-label="Show people and teams">▾</button><div class="combo-menu" hidden></div></div>`;
 }
 function audienceNames(value) {
   let options = [];
@@ -5202,10 +5202,8 @@ function scheduleSearch(background = false) {
   }, 180);
 }
 
-// What the search box shows for a query: nothing for a view's own query (its
-// chip is lit), else the query. Typing in the empty box starts a new search.
-// The view a query starts from: its chip stays lit and the search box holds
-// only what narrows it ("for:me -is:archived bug" → For me + "bug").
+// The view a query starts from ("for:me -is:archived bug" → For me, narrowed
+// by "bug"): its chip stays lit while the query narrows it.
 function queryView(q) {
   const raw = (q || '').trim();
   const norm = normalizeQuery(raw);
@@ -5220,7 +5218,9 @@ function queryView(q) {
   }
   return best;
 }
-function searchBoxText(q) { const view = queryView(q); return view ? view.rest : q || ''; }
+// The search box always shows the whole query, a view's own included: seeing
+// "for:me -is:archived" under For me is how people learn to write their own.
+function searchBoxText(q) { return q || ''; }
 
 // Programmatically set the working query (view selection, filter/sort/group menus).
 // Updates the search box and the URL, re-evaluates, re-renders.
@@ -6866,7 +6866,6 @@ function tasksView() {
     </div>`;
   // Tags are managed from the Filter menu's Tag picker, not beside the query menus.
   const trailing = everywhere || !home ? '' : projectFilterHtml();
-  // A view's own query is its lit chip; the box holds only a search of your own.
   const boxText = searchBoxText(S.search);
   // The bell's page has no tab bar or composer to say where you are.
   return `${everywhere ? '<h1 class="page-title">Inbox</h1>' : ''}${composer}
@@ -7612,16 +7611,14 @@ function wireOrgControls() {
     }),
   );
   $('#save-view')?.addEventListener('click', saveCurrentView);
-  $('#q-clear')?.addEventListener('click', () => { setQuery(queryView(S.search)?.query || ''); $('#task-search')?.focus(); });
+  $('#q-clear')?.addEventListener('click', () => { setQuery(''); $('#task-search')?.focus(); });
 
   // The in-list search box drives the working query. Debounced re-evaluation keeps
   // typing smooth; the focus/caret survive the re-render via captureFocus/restoreFocus.
   const search = $('#task-search');
   if (search) {
-    // Typing narrows the lit view; clearing goes back to it.
-    const base = queryView(S.search)?.query || '';
-    search.addEventListener('input', (e) => { S.search = [base, e.target.value].filter((part) => part.trim()).join(' '); scheduleSearch(); });
-    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && e.target.value) { e.stopPropagation(); setQuery(base); } });
+    search.addEventListener('input', (e) => { S.search = e.target.value; scheduleSearch(); });
+    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && e.target.value) { e.stopPropagation(); setQuery(''); } });
   }
 
   wireQueryToolbar(main, 'q', { get: () => S.search, set: (q) => setQuery(q) });
@@ -8446,7 +8443,7 @@ function triggersSection(values, selfId) {
     atVal = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
   }
   const gridCells = CRON_FIELDS.map(
-    (f, i) => `<label class="cron-cell" title="${f.hint}">${f.label}<input id="${f.id}" placeholder="*" value="${esc(cronVal(i))}"></label>`,
+    (f, i) => `<label class="cron-cell">${f.label}<input id="${f.id}" placeholder="*" value="${esc(cronVal(i))}"><small>${f.hint}</small></label>`,
   ).join('');
   // One block like the agent and computer blocks: when the task starts, and
   // whether each start is a fresh run (a schedule forces that on).
@@ -12817,7 +12814,7 @@ function conversationPane(v, t) {
   const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
         <div class="prompt-field">
-          <textarea class="followup-input" placeholder="${t.shared ? `${defaultRecipientFor(v) === 'agent:do' ? 'Message the agent' : `Reply to ${participantLabelOf(defaultRecipientFor(v).slice(6), v)}`}` : t.role === 'do' ? 'Message the agent' : `Message ${agentName}`}" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
+          <textarea class="followup-input" placeholder="${t.shared ? `${defaultRecipientFor(v) === 'agent:do' ? 'Message the agent' : `Reply to ${participantLabelOf(defaultRecipientFor(v).slice(6), v)}`} · @ to call an agent or person · [[ for wiki` : `${t.role === 'do' ? 'Message the agent' : `Message ${agentName}`} · [[ for wiki`}" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
           ${t.shared ? newAgentFormsHtml(v, `${v.taskId}/${t.role}`) : ''}
           <div class="img-chips attachment-chips followup-chips" style="display:none"></div>
           <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label>${policyTip(`Drop or paste files here (25 MB each, 50 MB per message). Type ${t.shared ? '@ to bring in an agent or a person, ' : ''}[[ to add a wiki page.`)}</div>
