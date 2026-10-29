@@ -82,7 +82,9 @@ const describeStatus = (view: TaskView) => {
 
 /** The Computer `task new` asks for: --computer any|<provider> (any: tavya
  * picks a computer that fits and has room), --cpu, --memory and --disk in GB,
- * --region eu|us. The server validates it like the task form. */
+ * --region eu|us, --network full|basic (basic: registries, Git hosts, AI and
+ * cloud APIs are enough, so Any may also use computers limited to those).
+ * The server validates it like the task form. */
 export function computerFlags(flags: Record<string, any>): Record<string, unknown> | undefined {
   const number = (name: string, value: unknown): number | undefined => {
     if (value === undefined) return undefined;
@@ -91,9 +93,12 @@ export function computerFlags(flags: Record<string, any>): Record<string, unknow
     return parsed;
   };
   const memory = number('memory', flags.memory);
+  if (flags.network !== undefined && !['full', 'basic'].includes(flags.network))
+    throw new CliError('--network must be full or basic', EXIT.usage);
   const computer = Object.fromEntries(Object.entries({
     provider: flags.computer, cpu: number('cpu', flags.cpu), memoryMb: memory === undefined ? undefined : Math.round(memory * 1024),
     diskGb: number('disk', flags.disk), region: flags.region,
+    network: flags.network === undefined ? undefined : flags.network === 'basic' ? { unrestricted: true, basic: true } : { unrestricted: true },
   }).filter(([, value]) => value !== undefined));
   return Object.keys(computer).length ? computer : undefined;
 }
@@ -103,7 +108,7 @@ export async function task(api: Api, args: string[], out: Output, flags: Record<
   switch (action) {
     case 'new': case 'create': {
       const title = rest.join(' ').trim();
-      if (!title) throw new CliError('usage: tavya task new <title> [--template <number|name>] [--prompt <text> | --prompt-file <file> | stdin] [--computer any|<provider>] [--cpu N] [--memory GB] [--disk GB] [--region eu|us]', EXIT.usage);
+      if (!title) throw new CliError('usage: tavya task new <title> [--template <number|name>] [--prompt <text> | --prompt-file <file> | stdin] [--computer any|<provider>] [--cpu N] [--memory GB] [--disk GB] [--region eu|us] [--network full|basic]', EXIT.usage);
       const target = await resolveProject(api, flags.project, workspace);
       // A template's own prompt stands unless one is given; without one, the title is the prompt.
       const template = flags.template ? await resolveTemplate(api, target.project.id, flags.template) : undefined;

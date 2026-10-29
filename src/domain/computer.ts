@@ -99,9 +99,14 @@ export function normalizeComputer(raw: unknown): ComputerSpec | undefined {
     if (typeof value.network !== 'object' || Array.isArray(value.network)) throw new Error('network must be an object');
     const network = value.network as Record<string, unknown>;
     const list = (entry: unknown) => Array.isArray(entry) ? entry.map((item) => String(item).trim()).filter(Boolean) : [];
+    // Three choices: full internet (the default), "basic internet is enough"
+    // (package registries, Git hosts, AI and cloud APIs: what Daytona's lower
+    // tiers give), or an allowlist. Basic is still unrestricted to the
+    // provider, which never narrows it; only "Any" reads it, to also take an
+    // account whose internet is basic.
     out.network = network.unrestricted === false
       ? { unrestricted: false, allowDomains: list(network.allowDomains), allowCidrs: list(network.allowCidrs) }
-      : { unrestricted: true };
+      : network.basic === true ? { unrestricted: true, basic: true } : { unrestricted: true };
   }
   if (value.region != null && value.region !== '') {
     if (!(COMPUTE_REGIONS as readonly unknown[]).includes(value.region)) throw new Error(`region must be ${COMPUTE_REGIONS.join(' or ')}`);

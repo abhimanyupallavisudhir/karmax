@@ -1200,9 +1200,10 @@ export class KarmaxApi {
     // Ask only for what the organization's provider account can give (wiki
     // features/computers): the sizes this value names, or every effective size
     // when it moves to another provider.
-    if (computer && (provider || computer.cpu != null || computer.memoryMb != null || computer.diskGb != null)) {
+    if (computer && (provider || computer.cpu != null || computer.memoryMb != null || computer.diskGb != null || computer.network)) {
       const effective = applyComputer(await this.deps.store.effectiveProjectConfig(project), computer);
-      const shape = provider ? machineShape(effective) : machineShape({ resources: computer });
+      // Its outbound network too: "Any" needs an account that gives it.
+      const shape = { ...(provider ? machineShape(effective) : machineShape({ resources: computer })), network: effective.network };
       try { await this.deps.providerConnections?.assertFits?.(project.organizationId ?? 'org_personal', effective.worldProvider, shape); }
       catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
     }

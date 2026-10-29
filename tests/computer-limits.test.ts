@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { assertComputerFits, computerLimits, limitFromMessage, providerDefaults, providerFeatures } from '../src/domain/computer-limits.js';
+import { accountFeatures, assertComputerFits, computerLimits, limitFromMessage, providerDefaults, providerFeatures } from '../src/domain/computer-limits.js';
 import { e2bFreeDiskMb, e2bTotalDiskGb } from '../src/world/e2b-template.js';
 import { probeDaytonaLimits, probeE2BLimits } from '../src/world/provider-limits.js';
 
@@ -21,11 +21,22 @@ describe('computer limits', () => {
   // A provider's form shows only what it can do: VM worlds have no desktop and
   // no outbound allowlist; providers without a record (this machine) offer all.
   it('says which Computer options each provider supports', () => {
-    expect(providerFeatures('e2b')).toEqual({ desktop: true, allowlist: true, environmentBuilds: true });
-    expect(providerFeatures('daytona')).toEqual({ desktop: true, allowlist: true, environmentBuilds: true });
-    expect(providerFeatures('fly')).toEqual({ desktop: false, allowlist: false, environmentBuilds: false });
-    expect(providerFeatures('hetzner')).toEqual({ desktop: false, allowlist: false, environmentBuilds: false });
-    expect(providerFeatures('container')).toEqual({ desktop: true, allowlist: true, environmentBuilds: true });
+    expect(providerFeatures('e2b')).toEqual({ desktop: true, allowlist: true, internet: 'full', environmentBuilds: true });
+    expect(providerFeatures('daytona')).toEqual({ desktop: true, allowlist: true, internet: 'full', environmentBuilds: true });
+    expect(providerFeatures('fly')).toEqual({ desktop: false, allowlist: false, internet: 'full', environmentBuilds: false });
+    expect(providerFeatures('hetzner')).toEqual({ desktop: false, allowlist: false, internet: 'full', environmentBuilds: false });
+    expect(providerFeatures('container')).toEqual({ desktop: true, allowlist: true, internet: 'full', environmentBuilds: true });
+  });
+  // Daytona's Tiers 1 and 2 reach essential services only, and no sandbox can
+  // change that: such an account has basic internet and no allowlist.
+  it('narrows an account measured to have basic internet', () => {
+    expect(accountFeatures('daytona', { network: 'basic' })).toMatchObject({ internet: 'basic', allowlist: false, desktop: true });
+    expect(accountFeatures('daytona', { network: 'full' })).toMatchObject({ internet: 'full', allowlist: true });
+    expect(computerLimits('daytona', { network: 'basic' })).toMatchObject({ network: 'basic' });
+    expect(() => assertComputerFits({ network: { unrestricted: false } }, { network: 'basic' }, 'daytona'))
+      .toThrow("This Daytona account has basic internet only, so it can't use an allowlist");
+    // A named provider gives the internet its account has.
+    expect(() => assertComputerFits({ network: { unrestricted: true } }, { network: 'basic' }, 'daytona')).not.toThrow();
   });
   it('reads the limit out of each provider\'s refusal', () => {
     expect(limitFromMessage(E2B.disk)).toEqual({ dimension: 'disk', value: 25600, unit: 'MiB' });
@@ -113,6 +124,7 @@ describe('provider limit probes', () => {
   it('reads a Daytona organization\'s pool and per-sandbox maxima', async () => {
     const { calls, fetch } = fakeFetch(({ method, url, body }) => {
       if (url.endsWith('/api-keys/current')) return { status: 200, body: { name: 'k', organizationId: 'org-1' } };
+      if (url.endsWith('/organizations/org-1')) return { status: 200, body: { id: 'org-1', sandboxLimitedNetworkEgress: true } };
       if (url.endsWith('/organizations/org-1/usage')) return { status: 200, body: { regionUsage: [
         { regionId: 'us', sandboxClass: 'windows', totalCpuQuota: 2, totalMemoryQuota: 8, totalDiskQuota: 30, maxDiskPerSandbox: 50 },
         { regionId: 'us', sandboxClass: 'container', totalCpuQuota: 10, totalMemoryQuota: 10, totalDiskQuota: 30,
@@ -122,7 +134,7 @@ describe('provider limit probes', () => {
       return { status: 404, body: {} };
     });
     const limits = await probeDaytonaLimits('dtn-key', { fetch, apiUrl: 'https://daytona.test/api', target: 'us', now: () => 9 });
-    expect(limits).toEqual({ cpu: 4, memoryMb: 8192, diskGb: 10, pool: { cpu: 10, memoryMb: 10_240, diskGb: 30 }, checkedAt: 9 });
+    expect(limits).toEqual({ cpu: 4, memoryMb: 8192, diskGb: 10, pool: { cpu: 10, memoryMb: 10_240, diskGb: 30 }, network: 'basic', checkedAt: 9 });
     expect(calls.filter((call) => call.method === 'POST').every((call) => call.body.buildInfo)).toBe(true);
   });
 

@@ -434,7 +434,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       worldProvider: z.string().nullish(), runnerPoolId: z.string().nullish(),
       environmentFlavor: z.enum(['headless', 'desktop']).optional(), region: z.enum(['eu', 'us']).nullish(),
       cpu: z.number().positive().optional(), memoryMb: z.number().int().min(128).optional(), diskGb: z.number().int().min(1).optional(), gpu: z.number().nonnegative().optional(),
-      unrestrictedInternet: z.boolean().optional(), allowDomains: z.array(z.string()).optional(), allowCidrs: z.array(z.string()).optional(),
+      unrestrictedInternet: z.boolean().optional(), basicInternet: z.boolean().optional(), allowDomains: z.array(z.string()).optional(), allowCidrs: z.array(z.string()).optional(),
       monthlyBudgetUsd: z.number().nonnegative().nullish(), hibernateAfterDays: z.number().nonnegative().nullish(),
     } },
     async (a) => wrap(async () => {
@@ -453,7 +453,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       // set `unrestricted:false` and dropped `allowCidrs`, and `{memoryMb}` alone
       // erased `cpu`/`gpu`. Only keys the caller actually supplied are assigned.
       const wantsResources = a.cpu !== undefined || a.memoryMb !== undefined || a.diskGb !== undefined || a.gpu !== undefined;
-      const wantsNetwork = a.unrestrictedInternet !== undefined || a.allowDomains !== undefined || a.allowCidrs !== undefined;
+      const wantsNetwork = a.unrestrictedInternet !== undefined || a.basicInternet !== undefined || a.allowDomains !== undefined || a.allowCidrs !== undefined;
       if (wantsResources || wantsNetwork) {
         // Either `{organization, override?, effective?}` or a bare policy — see below.
         const current = await ops.getExecutionPolicy(a.organizationId, a.projectId).catch(() => undefined) as
@@ -480,6 +480,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         if (wantsNetwork) {
           const network: Record<string, unknown> = { ...(base.network ?? {}) };
           if (a.unrestrictedInternet !== undefined) network.unrestricted = a.unrestrictedInternet;
+          if (a.basicInternet !== undefined) network.basic = a.basicInternet;
           if (a.allowDomains !== undefined) network.allowDomains = a.allowDomains;
           if (a.allowCidrs !== undefined) network.allowCidrs = a.allowCidrs;
           policy.network = network;

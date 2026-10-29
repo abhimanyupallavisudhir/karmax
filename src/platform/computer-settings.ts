@@ -43,7 +43,8 @@ export async function saveOrganizationComputer(store: Store, organizationId: str
   const spec = normalizeComputer(raw) ?? {};
   await assertProvider(options.providerConnections, organizationId, spec.provider, options.hosted);
   const fallback = store.defaultOrganizationExecutionPolicy();
-  await options.providerConnections?.assertFits?.(organizationId, spec.provider ?? fallback.worldProvider, machineShape({ resources: spec }));
+  await options.providerConnections?.assertFits?.(organizationId, spec.provider ?? fallback.worldProvider,
+    { ...machineShape({ resources: spec }), network: spec.network ?? fallback.network });
   const current = (await store.getOrganizationExecutionPolicy(organizationId));
   const chosen = computerConfig(spec);
   return store.setOrganizationExecutionPolicy(organizationId, {
@@ -66,7 +67,8 @@ export async function saveProjectComputer(store: Store, project: Project, raw: u
   const spec: ComputerSpec = normalizeComputer(raw) ?? {};
   await assertProvider(options.providerConnections, project.organizationId ?? 'org_personal', spec.provider, options.hosted);
   const provider = spec.provider ?? (await store.getOrganizationExecutionPolicy(project.organizationId ?? 'org_personal')).worldProvider;
-  await options.providerConnections?.assertFits?.(project.organizationId ?? 'org_personal', provider, machineShape({ resources: spec }));
+  await options.providerConnections?.assertFits?.(project.organizationId ?? 'org_personal', provider,
+    { ...machineShape({ resources: spec }), ...(spec.network ? { network: spec.network } : {}) });
   const chosen = computerConfig(spec);
   const { cpu: _cpu, memoryMb: _memoryMb, diskGb: _diskGb, ...otherResources } = project.config.resources ?? {};
   const { flavor: _flavor, ...otherEnvironment } = project.config.environment ?? {};

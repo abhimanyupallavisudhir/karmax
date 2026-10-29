@@ -559,7 +559,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         draft: { type: 'boolean' },
         priority: { type: 'string', enum: [...PRIORITY_NAMES] },
         tags: { type: 'array', items: { type: 'string' } },
-        params: { type: 'object', description: 'Full task-form field values for the workflow. Its "computer" is {provider?, cpu?, memoryMb?, diskGb?, region?: "eu"|"us", flavor?, network?}: provider "any" (the usual default) picks a computer that fits and has room; a named provider pins it.' },
+        params: { type: 'object', description: 'Full task-form field values for the workflow. Its "computer" is {provider?, cpu?, memoryMb?, diskGb?, region?: "eu"|"us", flavor?, network?}: provider "any" (the usual default) picks a computer that fits and has room; a named provider pins it. network {"basic": true} says basic internet (package registries, Git hosts, AI and cloud APIs) is enough, so "any" may also use computers limited to those; {"unrestricted": false, "allowDomains": [...]} is an allowlist.' },
         authorization: {
           type: 'object',
           properties: {
@@ -763,6 +763,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         region: { type: 'string', enum: ['eu', 'us'], description: 'Where "any" may put computers' },
         cpu: { type: 'number' }, memory_mb: { type: 'number' }, disk_gb: { type: 'number', description: 'Free disk for task files, in GB' }, gpu: { type: 'number' },
         unrestricted_internet: { type: 'boolean' },
+        basic_internet: { type: 'boolean', description: 'Basic internet (package registries, Git hosts, AI and cloud APIs) is enough: "any" may then also use computers limited to those' },
         allow_domains: { type: 'array', items: { type: 'string' } },
         allow_cidrs: { type: 'array', items: { type: 'string' } },
         monthly_budget_usd: { type: 'number' }, hibernate_after_days: { type: 'number' },
@@ -1615,7 +1616,7 @@ export function platformToolHandlers(
       // partial change is merged against the policy currently in force rather
       // than silently clearing the fields the caller did not mention.
       const wantsResources = args?.cpu !== undefined || args?.memory_mb !== undefined || args?.disk_gb !== undefined || args?.gpu !== undefined;
-      const wantsNetwork = args?.unrestricted_internet !== undefined || args?.allow_domains !== undefined || args?.allow_cidrs !== undefined;
+      const wantsNetwork = args?.unrestricted_internet !== undefined || args?.basic_internet !== undefined || args?.allow_domains !== undefined || args?.allow_cidrs !== undefined;
       if (wantsResources || wantsNetwork) {
         const current: any = await platformRequest('GET', url).catch(() => undefined);
         // Two response shapes: the project route answers `{override, …}`, the
@@ -1634,6 +1635,7 @@ export function platformToolHandlers(
         if (wantsNetwork) {
           const network: Record<string, unknown> = { ...(base.network ?? {}) };
           if (args?.unrestricted_internet !== undefined) network.unrestricted = args.unrestricted_internet;
+          if (args?.basic_internet !== undefined) network.basic = args.basic_internet;
           if (args?.allow_domains !== undefined) network.allowDomains = args.allow_domains;
           if (args?.allow_cidrs !== undefined) network.allowCidrs = args.allow_cidrs;
           policy.network = network;

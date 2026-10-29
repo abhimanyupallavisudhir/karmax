@@ -499,6 +499,11 @@ export class WorldCheckpointService {
         { runnerPoolId: acquired?.runnerPoolId ?? checkpoint.runnerPoolId,
           environmentDigest: environment.digest ?? checkpoint.environmentDigest })) as WorldHandle;
       world.handle = registered;
+      // What the new machine could not give (Daytona at a smaller snapshot than
+      // asked, a setup step that failed) is said, as createWorld says it.
+      for (const warning of registered.warnings ?? [])
+        await this.store.appendEvent({ taskId: checkpoint.worldId, type: 'world.warning', ts: Date.now(), payload: { warning } });
+      if (registered.warnings?.length) await this.addNotice(checkpoint.worldId, registered.warnings.join('\n\n'));
       return registered;
     } catch (error) {
       await this.resources?.release(world.handle).catch(() => undefined);

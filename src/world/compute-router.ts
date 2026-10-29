@@ -40,13 +40,15 @@ import { assertComputeCredit, ComputeCreditExhausted, ManagedComputeBusy } from 
 export interface ComputeNeeds extends MachineShape {
   desktop?: boolean;
   allowlist?: boolean;
+  /** Full internet unless the Computer says basic internet is enough (or uses an allowlist). */
+  fullInternet?: boolean;
   region?: ComputeRegion;
 }
 
 export function computeNeeds(config: Partial<ProjectConfig> | undefined): ComputeNeeds {
   return { ...machineShape(config),
     ...(config?.environment?.flavor === 'desktop' ? { desktop: true } : {}),
-    ...(config?.network?.unrestricted === false ? { allowlist: true } : {}),
+    ...(config?.network?.unrestricted === false ? { allowlist: true } : config?.network?.basic ? {} : { fullInternet: true }),
     ...(config?.region ? { region: config.region } : {}) };
 }
 
@@ -106,6 +108,7 @@ export function unfit(needs: ComputeNeeds, option: ComputeOption): string | unde
   if (needs.diskGb != null && limits.diskGb != null && needs.diskGb > limits.diskGb) return `at most ${limits.diskGb} GB disk`;
   if (needs.desktop && !features.desktop) return 'no desktop';
   if (needs.allowlist && !features.allowlist) return 'no outbound allowlist';
+  if (needs.fullInternet && features.internet === 'basic') return 'basic internet only';
   if (needs.region && option.region !== needs.region) return `not in ${REGION_LABEL[needs.region]}`;
   return undefined;
 }

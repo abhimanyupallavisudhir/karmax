@@ -63,6 +63,11 @@ export async function probeDaytonaLimits(apiKey: string,
     const key = await call('GET', `${base}/api-keys/current`);
     const organizationId = key.ok && typeof key.body?.organizationId === 'string' ? key.body.organizationId : undefined;
     if (!organizationId) return;
+    // Tiers 1 and 2 reach essential services only (registries, Git hosts, AI
+    // and cloud APIs), and no sandbox can change that: "Any" needs to know.
+    const organization = await call('GET', `${base}/organizations/${encodeURIComponent(organizationId)}`).catch(() => undefined);
+    const limited = organization?.ok ? organization.body?.sandboxLimitedNetworkEgress : undefined;
+    if (typeof limited === 'boolean') limits.network = limited ? 'basic' : 'full';
     const usage = await call('GET', `${base}/organizations/${encodeURIComponent(organizationId)}/usage`);
     const regions = Array.isArray(usage.body?.regionUsage) ? usage.body.regionUsage as Array<Record<string, unknown>> : [];
     const containers = regions.filter((region) => (region.sandboxClass ?? 'container') === 'container' && Number(region.totalDiskQuota) > 0);
@@ -103,7 +108,7 @@ function refusal(body: any, dimension: Dimension) {
 }
 
 function finish(limits: ComputerLimits, options: ProbeOptions): ComputerLimits {
-  const order: Array<keyof ComputerLimits> = ['cpu', 'memoryMb', 'diskGb', 'pool'];
+  const order: Array<keyof ComputerLimits> = ['cpu', 'memoryMb', 'diskGb', 'pool', 'network'];
   const out = Object.fromEntries(order.filter((key) => limits[key] !== undefined).map((key) => [key, limits[key]])) as ComputerLimits;
   return { ...out, checkedAt: (options.now ?? Date.now)() };
 }

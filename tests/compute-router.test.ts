@@ -34,7 +34,22 @@ describe('the rule', () => {
   it('asks Any for the size, desktop, allowlist and region the Computer states', () => {
     expect(computeNeeds({ resources: { cpu: 4, memoryMb: 8192, diskGb: 100 }, environment: { flavor: 'desktop' },
       network: { unrestricted: false }, region: 'eu' })).toEqual({ cpu: 4, memoryMb: 8192, diskGb: 100, desktop: true, allowlist: true, region: 'eu' });
-    expect(computeNeeds({ resources: { cpu: 2 }, network: { unrestricted: true } })).toEqual({ cpu: 2 });
+    // Full internet unless the Computer says basic is enough.
+    expect(computeNeeds({ resources: { cpu: 2 }, network: { unrestricted: true } })).toEqual({ cpu: 2, fullInternet: true });
+    expect(computeNeeds({ resources: { cpu: 2 } })).toEqual({ cpu: 2, fullInternet: true });
+    expect(computeNeeds({ resources: { cpu: 2 }, network: { unrestricted: true, basic: true } })).toEqual({ cpu: 2 });
+  });
+
+  // Daytona's Tiers 1 and 2 reach only essential services (registries, Git
+  // hosts, AI and cloud APIs): such an account takes only a task whose
+  // Computer says basic internet is enough (owner, 2026-10-29).
+  it('gives a basic-internet account only tasks for which basic internet is enough', () => {
+    const basic = option('daytona', 'managed', { features: { ...providerFeatures('daytona'), internet: 'basic', allowlist: false } });
+    const full = rankComputeOptions({ fullInternet: true }, [basic, option('e2b', 'managed')]);
+    expect(full.candidates.map((candidate) => candidate.provider)).toEqual(['e2b']);
+    expect(full.rejected).toEqual([{ provider: 'daytona', funding: 'managed', reason: 'basic internet only' }]);
+    expect(rankComputeOptions({}, [basic, option('e2b', 'managed')]).candidates.map((candidate) => candidate.provider)).toEqual(['e2b', 'daytona']);
+    expect(rankComputeOptions({ allowlist: true }, [basic]).rejected).toEqual([{ provider: 'daytona', funding: 'managed', reason: 'no outbound allowlist' }]);
   });
 
   it('keeps only accounts that can give the machine, and says why the others cannot', () => {
@@ -129,6 +144,27 @@ describe('the accounts Any can reach', () => {
     await expect(f.connections.assertFits(f.organization.id, 'any', { cpu: 32, diskGb: 100 })).resolves.toBeUndefined();
     await expect(f.connections.assertFits(f.organization.id, 'any', { cpu: 128 })).rejects.toThrow('CPU can be at most 64 on the computers this organization can use');
     expect(await f.connections.available(f.organization.id, 'any')).toBe(true);
+  });
+
+  it('learns which Daytona accounts reach basic internet only, and Any asks for a computer one of them can give', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-compute-basic-'));
+    const store = await Store.create(':memory:', { hosted: true });
+    cleanups.push(async () => { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+    const asked: string[] = [];
+    const connections = new WorldProviderConnectionService(store, new CredentialBroker(new Vault(path.join(dir, 'vault'))),
+      { check: async () => {}, limits: async (provider) => { asked.push(provider); return provider === 'daytona' ? { cpu: 4, network: 'basic' } : {}; } });
+    const organization = await store.createOrganization({ name: 'Basic', ownerUserId: 'owner' });
+    await connections.save({ organizationId: MANAGED_COMPUTE, provider: 'daytona', apiKey: 'dtn' });
+    // A Daytona account read before its internet was is read again.
+    await store.setWorldProviderConnectionLimits(MANAGED_COMPUTE, 'daytona', { cpu: 4, checkedAt: 1 });
+    const options = await new ComputeRouter(store, connections).options(organization.id);
+    expect(asked).toEqual(['daytona']);
+    expect(options[0]?.features).toMatchObject({ internet: 'basic', allowlist: false });
+    await expect(connections.assertFits(organization.id, 'any', { cpu: 2 }))
+      .rejects.toThrow('None of the computers this organization can use has full internet; choose "Basic internet is enough"');
+    await expect(connections.assertFits(organization.id, 'any', { cpu: 2, network: { unrestricted: true, basic: true } })).resolves.toBeUndefined();
+    await expect(connections.assertFits(organization.id, 'any', { network: { unrestricted: false } }))
+      .rejects.toThrow('None of the computers this organization can use has an outbound allowlist');
   });
 
   it('knows managed compute is full or out of credit, and remembers a provider\'s refusal for a while', async () => {

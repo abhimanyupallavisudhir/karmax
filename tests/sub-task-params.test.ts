@@ -214,7 +214,8 @@ it('a sub-task Computer the provider account cannot give is refused when create_
     expect(await subTaskParams(store, { projectId: project.id, parentTaskId: parent.id, params: { computer: { cpu: 2 } }, computers }))
       .toEqual({ computer: { cpu: 2 } });
     // Judged on the provider the child really gets: its parent's.
-    expect(judged).toContainEqual({ provider: 'hetzner', cpu: 2 });
+    // Its outbound network too, so "Any" can refuse one no account gives.
+    expect(judged).toContainEqual({ provider: 'hetzner', cpu: 2, network: { unrestricted: true } });
   } finally { await store.close(); }
 });
 

@@ -1,4 +1,4 @@
-import type { AgentSpec, Avatar, Project, SubTaskParams } from '../domain/types.js';
+import type { AgentSpec, Avatar, Project, ProjectConfig, SubTaskParams } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { applyComputer, machineShape, normalizeComputer, type ComputerSpec, type MachineShape } from '../domain/computer.js';
 import { manifest } from '../contrib/manifests.js';
@@ -60,7 +60,7 @@ const SUB_TASK_AGENT_KEYS = ['provider', 'model', 'effort', 'mcpConnections'];
  * gateway's and the worker's WorldProviderConnectionService). */
 export interface ComputerChecks {
   available(organizationId: string | undefined, provider: string): Promise<boolean>;
-  assertFits(organizationId: string | undefined, provider: string | undefined, spec: MachineShape): Promise<void>;
+  assertFits(organizationId: string | undefined, provider: string | undefined, spec: MachineShape & { network?: ProjectConfig['network'] }): Promise<void>;
 }
 
 /** A parent's own Computer (its task-level value), which its sub-tasks start
@@ -144,7 +144,7 @@ async function subTaskComputer(store: Store, project: Project, parentTaskId: str
     const parent = (await store.getTask(parentTaskId));
     const effective = applyComputer(await store.effectiveProjectConfig(project), childComputer(parent?.params, computer));
     // Only the sizes it names, or every size when it moves to another provider.
-    const shape = provider ? machineShape(effective) : machineShape({ resources: computer });
+    const shape = { ...(provider ? machineShape(effective) : machineShape({ resources: computer })), network: effective.network };
     try { await computers.assertFits(organizationId, effective.worldProvider, shape); }
     catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
   }

@@ -23,10 +23,15 @@ export interface ComputerLimits {
   /** The organization's total across all its running machines, when the
    * provider has one (Daytona's tiers). One machine never exceeds it. */
   pool?: { cpu?: number; memoryMb?: number; diskGb?: number };
+  /** The internet its machines reach: `basic` is a fixed list of essential
+   * services (package registries, Git hosts, AI and cloud APIs) that no
+   * sandbox can widen or narrow — Daytona's Tiers 1 and 2. */
+  network?: AccountInternet;
   /** When the provider was last asked. */
   checkedAt?: number;
 }
 
+export type AccountInternet = 'full' | 'basic';
 export type LimitSource = 'provider' | 'configured' | 'default';
 export type LimitKey = 'cpu' | 'memoryMb' | 'diskGb';
 
@@ -62,13 +67,15 @@ export interface ComputerFeatures {
   desktop: boolean;
   /** Outbound network limited to an allowlist (`network.unrestricted: false`). */
   allowlist: boolean;
+  /** The internet its machines reach (`ComputerLimits.network`). */
+  internet: AccountInternet;
   /** Project setup baked into an image or snapshot (Project Settings →
    * Environment); without it setup runs live in every new world. */
   environmentBuilds: boolean;
 }
 
-const ALL_FEATURES: ComputerFeatures = { desktop: true, allowlist: true, environmentBuilds: true };
-const VM_FEATURES: ComputerFeatures = { desktop: false, allowlist: false, environmentBuilds: false };
+const ALL_FEATURES: ComputerFeatures = { desktop: true, allowlist: true, internet: 'full', environmentBuilds: true };
+const VM_FEATURES: ComputerFeatures = { desktop: false, allowlist: false, internet: 'full', environmentBuilds: false };
 
 /** One entry per cloud provider. A new provider (Fly.io, Hetzner…) adds its
  * documented facts here and, if its API can tell, a probe in provider-limits.ts. */
@@ -158,6 +165,13 @@ export function providerFeatures(provider: string): ComputerFeatures {
   return { ...(PROVIDERS[provider]?.features ?? ALL_FEATURES) };
 }
 
+/** What one account offers: its provider's features, narrowed by what was
+ * measured — an account with basic internet can take no allowlist either. */
+export function accountFeatures(provider: string, measured?: ComputerLimits): ComputerFeatures {
+  const features = providerFeatures(provider);
+  return measured?.network === 'basic' ? { ...features, internet: 'basic', allowlist: false } : features;
+}
+
 /** The machine a provider gives when the Computer asks for nothing more. */
 export function providerDefaults(provider: string): Required<MachineShape> | undefined {
   return PROVIDERS[provider] ? { ...PROVIDERS[provider].defaults } : undefined;
@@ -178,6 +192,7 @@ export function computerLimits(provider: string, measured?: ComputerLimits, conf
     if (value !== undefined) { out[key] = value; out.source[key] = source; }
   }
   if (measured?.pool && Object.keys(measured.pool).length) out.pool = { ...measured.pool };
+  if (measured?.network) out.network = measured.network;
   if (measured?.checkedAt) out.checkedAt = measured.checkedAt;
   return out;
 }
@@ -188,8 +203,12 @@ const gb = (mb: number) => Number.isInteger(mb / 1024) ? String(mb / 1024) : (mb
 
 /** Refuse a size the account cannot give, before any machine is made. Only the
  * sizes `spec` names are judged. */
-export function assertComputerFits(spec: MachineShape, limits: ComputerLimits, provider: string): void {
+export function assertComputerFits(spec: MachineShape & { network?: { unrestricted?: boolean } }, limits: ComputerLimits, provider: string): void {
   const where = `on this ${providerLabel(provider)} account`;
+  // A named provider gives the internet its account has; only an allowlist,
+  // which a basic-internet account cannot set, is refused.
+  if (spec.network?.unrestricted === false && limits.network === 'basic')
+    throw new Error(`This ${providerLabel(provider)} account has basic internet only, so it can't use an allowlist`);
   if (spec.diskGb != null && limits.diskGb != null && spec.diskGb > limits.diskGb)
     throw new Error(`Disk can be at most ${limits.diskGb} GB ${where}`);
   if (spec.memoryMb != null && limits.memoryMb != null && spec.memoryMb > limits.memoryMb)
