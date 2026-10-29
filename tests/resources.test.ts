@@ -643,6 +643,11 @@ describe('project resources', () => {
     expect(inventory.entries.some((entry) => entry.path.startsWith('generated'))).toBe(false);
     expect(JSON.stringify(inventory)).not.toContain('must-not-be-read');
     expect(JSON.stringify(inventory)).not.toContain('scratch-content');
+    // A pull request of the task lands a snapshot of one branch; its task's
+    // world (and the ignored output in it) stays with the task.
+    const pullRequest = await store.createTask({ projectId: project.id, title: 'main: Generate', workflow: 'software-dev',
+      workflowVersion: '1.30.0', params: { prompt: 'p', _shippedFrom: { taskId: task.id, checkout: 'repo' } }, parentTaskId: task.id });
+    expect(await resources.ignoredInventory(pullRequest.id)).toEqual({ entries: [], truncated: false });
 
     await resources.discardCandidate(task.id, staged.candidate.id, 'user:reviewer');
     expect((await store.getResourceCandidate(staged.candidate.id))).toMatchObject({ state: 'discarded' });

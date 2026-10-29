@@ -38,6 +38,7 @@ import { CHUNK_BYTES, chunkObjectKey, openCompressed, openDeterministic, openRan
 import { REPOSITORY_ROUTE, RepositoryTokens, ResourceRepositoryServer, parseRepositoryName } from './resource-repository.js';
 import { RESTIC_ENGINE, ROOT_PART, ResticResources, isParted, isPartsCapture, partsTotals, resticRef, storedRef, type Parts, type PartsCapture,
   type ChangeSet, type Repository, type ResticCapture, type ResticPlace } from './restic-engine.js';
+import { pullRequestOf } from '../domain/pull-requests.js';
 import { ResourceConflictError } from './resource-conflict.js';
 import { applyMerged, clearMerge, conflictKind, mergeFiles, type FileMerge } from './resource-file-merge.js';
 import { policyFor, readPolicies, type PolicyRule } from './resource-policy.js';
@@ -1358,8 +1359,10 @@ export class ProjectResourceService {
 
   /** Metadata-only safety net for ignored output that has neither an attachment
    * nor a staged candidate. No bytes are read and the bounded result is safe to
-   * show at checkpoint/Review. */
+   * show at checkpoint/Review. A pull request of a task (SPEC §11.1) has no
+   * world of its own: its task keeps the world and whatever is ignored in it. */
   async ignoredInventory(taskId: string, limit = 100, checkContinue?: () => Promise<void>): Promise<IgnoredResourceInventory> {
+    if (pullRequestOf(await this.store.getTask(taskId))) return { entries: [], truncated: false };
     const { handle, world } = await this.currentTaskWorld(taskId);
     const excluded = [
       ...Object.values((handle.meta?.resourceProjections ?? {}) as Record<string, { target?: string }>)
