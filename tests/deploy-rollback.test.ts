@@ -9,7 +9,7 @@ const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 const operator = fs.readFileSync(new URL('../deploy/karmax', import.meta.url), 'utf8');
 
-function update(previousEpoch: string | undefined, targetEpoch: string, ready = false, failure = '', flags: string[] = []) {
+function update(previousEpoch: string | undefined, targetEpoch: string, ready = false, failure = '', flags: string[] = [], env = '') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-rollback-')); roots.push(root);
   const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   git('init', '-q', '-b', 'master');
@@ -25,7 +25,7 @@ function update(previousEpoch: string | undefined, targetEpoch: string, ready = 
   const target = git('rev-parse', 'HEAD');
   git('update-ref', 'refs/remotes/origin/master', target); git('checkout', '-q', '--detach', previous);
   fs.mkdirSync(path.join(root, 'deploy'), { recursive: true });
-  fs.writeFileSync(path.join(root, 'deploy/.turnkey.env'), '');
+  fs.writeFileSync(path.join(root, 'deploy/.turnkey.env'), env);
   // Exercise the real updater against a real Git history. Only infrastructure
   // effects are stubbed; failed readiness must select the safe recovery branch.
   const script = operator.slice(0, operator.indexOf('\nusage() {')) + `
@@ -58,7 +58,8 @@ cmd_update "$@"
   const after = flags[0] === '--after';
   const result = spawnSync('sh', [file, ...(after ? [target, ...flags.slice(1)] : [...flags, target])], { cwd: root, encoding: 'utf8' });
   const operations = fs.existsSync(path.join(root, 'operations')) ? fs.readFileSync(path.join(root, 'operations'), 'utf8') : '';
-  return { ...result, operations, head: git('rev-parse', 'HEAD'), previous, target };
+  return { ...result, operations, head: git('rev-parse', 'HEAD'), previous, target,
+    env: fs.readFileSync(path.join(root, 'deploy/.turnkey.env'), 'utf8') };
 }
 
 it('stops instead of starting legacy code against migrated state', () => {
@@ -92,6 +93,20 @@ it('reports which role the app connects as after a healthy update, never failing
   expect(unreadable.status).toBe(0);
   expect(unreadable.stderr).toContain('could not ask PostgreSQL');
   expect(unreadable.stdout).toContain('Update complete');
+});
+// e2b was written as the default only because nothing else could be; `up`
+// rewrote it, but tavya.io is only ever updated, so its organizations stayed
+// on an E2B no one had connected (2026-10-29).
+it('makes a stale E2B default Any, and a rollback puts it back', () => {
+  const env = 'KARMAX_DOMAIN=example.test\nKARMAX_CLOUD_WORLD_PROVIDER=e2b\nPOSTGRES_PASSWORD=p\n';
+  const healthy = update('2\n', '2\n', true, '', [], env);
+  expect(healthy.status).toBe(0);
+  expect(healthy.env).toBe(env.replace('=e2b', '=any'));
+  const rolledBack = update('2\n', '2\n', false, '', [], env);
+  expect(rolledBack.stderr).toContain('production was restored');
+  expect(rolledBack.env).toBe(env);
+  const chosen = 'KARMAX_CLOUD_WORLD_PROVIDER=hetzner\n';
+  expect(update('2\n', '2\n', true, '', [], chosen).env).toBe(chosen);
 });
 it('rejects a malformed epoch before changing the deployment', () => {
   const result = update('2\n', 'not-an-epoch\n');
