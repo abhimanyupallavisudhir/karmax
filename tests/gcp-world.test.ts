@@ -200,9 +200,11 @@ describe.skipIf(!sshdAvailable)('Google Cloud worlds (fake Compute Engine, real 
     await provider.park(world.handle as WorldHandle);
     const [instance] = [...gcp.instances.values()];
     // Made 1 h 23 min ago; ran its last 7 minutes and was stopped a minute ago.
-    const start = Date.now() - 83 * 60_000;
-    instance!.lastStartTimestamp = new Date(Date.now() - 8 * 60_000).toISOString();
-    instance!.lastStopTimestamp = new Date(Date.now() - 60_000).toISOString();
+    // One clock reading: two could differ by a millisecond (CI #2412: 2.0000166 minutes).
+    const now = Date.now();
+    const start = now - 83 * 60_000;
+    instance!.lastStartTimestamp = new Date(now - 8 * 60_000).toISOString();
+    instance!.lastStopTimestamp = new Date(now - 60_000).toISOString();
     for (const disk of gcp.disks.values()) disk.creationTimestamp = new Date(start).toISOString();
     await provider.destroy(world.handle as WorldHandle);
     expect([gcp.instances.size, gcp.disks.size]).toEqual([0, 0]);
