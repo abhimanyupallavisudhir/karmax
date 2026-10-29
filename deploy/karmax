@@ -957,6 +957,18 @@ cmd_update() {
 
   note "Checking out validated revision $target…"
   git -C "$ROOT_DIR" checkout --detach "$target"
+  # `up` rewrites a stale default when it writes the file; an instance that
+  # is only ever updated (tavya.io) never ran it, so its organizations stayed
+  # on an E2B that no one had connected (wiki features/compute-routing).
+  # A rollback puts the file back as it was, for the release before.
+  if [ "$(env_value KARMAX_CLOUD_WORLD_PROVIDER)" = e2b ]; then
+    if [ -z "$migration_backup" ]; then
+      migration_backup="$ENV_FILE.migration.$$"
+      cp -p "$ENV_FILE" "$migration_backup"
+    fi
+    sed -i 's/^KARMAX_CLOUD_WORLD_PROVIDER=e2b$/KARMAX_CLOUD_WORLD_PROVIDER=any/' "$ENV_FILE"
+    note 'The default computer is now Any (was E2B).'
+  fi
   # This file is the target's own, so it knows every secret the target mounts.
   if ! ensure_secrets; then
     git -C "$ROOT_DIR" checkout --detach "$previous"

@@ -42,6 +42,10 @@ export type ComputeRegion = (typeof COMPUTE_REGIONS)[number];
 /** Cloud providers an organization can connect for task worlds (BYOK). */
 export const CLOUD_WORLD_PROVIDERS = ['e2b', 'daytona', 'fly', 'hetzner', 'aws', 'gcp'] as const;
 export type CloudWorldProvider = (typeof CLOUD_WORLD_PROVIDERS)[number];
+/** A cloud provider, or "Any" (which picks one). */
+export function isCloudProvider(provider: string | undefined): boolean {
+  return isAnyProvider(provider) || (CLOUD_WORLD_PROVIDERS as readonly string[]).includes(provider ?? '');
+}
 
 /** The cloud providers whose worlds are VMs reached over SSH (src/world/vm/):
  * the disk is a volume that keeps everything and grows in place. */

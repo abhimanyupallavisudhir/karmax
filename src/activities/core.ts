@@ -1,4 +1,4 @@
-import { applyComputer, isAnyProvider, machineShape, normalizeComputer } from '../domain/computer.js';
+import { applyComputer, isAnyProvider, isCloudProvider, machineShape, normalizeComputer } from '../domain/computer.js';
 import { taskEnded } from '../world/task-ended.js';
 import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
 import { conversationFor, participantLabel, workDigest } from '../domain/participants.js';
@@ -2098,7 +2098,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }, 1_000);
         cancellationHeartbeat.unref();
       };
-      startCancellationHeartbeat(args.kind);
       const stopCancellationHeartbeat = () => {
         if (cancellationHeartbeat) clearInterval(cancellationHeartbeat);
         cancellationHeartbeat = undefined;
@@ -2107,14 +2106,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const trace = (await installationTiming(store, { taskId: args.taskId }, async row => (await record(args.taskId, 'timing', { ...row }))));
       try { trace.signal = activityContext.current().cancellationSignal; } catch { /* direct fixture */ }
       return (await withTiming(trace, () => trace.measure('world.prepare', async () => {
-      // Provider "Any": the router picks the provider below (compute-router.ts).
-      const routed = isAnyProvider(args.kind);
-      const remote = routed || isRemote(args.kind);
-      if (store.hosted && !remote)
-        throw new Error(`hosted deployments cannot run task code in the control plane (${args.kind}); select a remote runner`);
-      (await record(args.taskId, 'world.provisioning', { provider: args.kind }));
       const projectId = args.projectId ?? (await store.getTask(args.taskId))?.projectId;
       const project = projectId ? (await store.getProject(projectId)) : undefined;
+      // The workflow passes the provider its task had when it started. A new
+      // world goes where the task's Computer (else its project's, else its
+      // organization's default) says now: someone may have picked another
+      // provider, or the default may have become "Any", since then.
+      const current = project ? (await store.effectiveTaskConfig(project, args.taskId)).worldProvider : undefined;
+      const kind = (isCloudProvider(args.kind) && isCloudProvider(current) ? current : args.kind) as WorldKind;
+      startCancellationHeartbeat(kind);
+      // Provider "Any": the router picks the provider below (compute-router.ts).
+      const routed = isAnyProvider(kind);
+      const remote = routed || isRemote(kind);
+      if (store.hosted && !remote)
+        throw new Error(`hosted deployments cannot run task code in the control plane (${kind}); select a remote runner`);
+      (await record(args.taskId, 'world.provisioning', { provider: kind }));
       const forkPlan = (await store.getTask(args.taskId))?.params._forkWorld as ForkWorldSource | undefined;
       const forkSource = forkPlan && forkPlan.base === args.base ? forkPlan : undefined;
       let forkCheckpoint: import('../domain/types.js').WorldCheckpoint | undefined;
@@ -2531,7 +2537,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           return await (worlds.withOperation ? worlds.withOperation(args.taskId, provision) : provision());
         } finally { stopCancellationHeartbeat(); }
       };
-      if (!routed) return provisionOn(args.kind);
+      if (!routed) return provisionOn(kind);
       // "Any": the first candidate with room takes it; a full one gives way to
       // the next, and the task waits only when every one is full.
       const router = deps.providerConnections?.list && deps.providerConnections.managedConnections

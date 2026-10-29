@@ -347,6 +347,23 @@ describe('createWorld with provider "Any"', () => {
     expect(a.hetzner.made).toEqual([]);
     expect(await a.events(taskId, 'world.routed')).toEqual([]);
   });
+
+  // A workflow passes the provider its task had when it started. A task that
+  // has no world yet runs where its Computer says now: the one that failed on
+  // an E2B the organization never connected (tavya.io, 2026-10-29) did not
+  // land on Hetzner when someone picked it, nor on Any once that was the default.
+  it('makes a new world where the task\'s Computer says now, not where it said when the workflow started', async () => {
+    const a = await activities();
+    const pinned = await a.task('Changed to Hetzner', { provider: 'hetzner' });
+    const handle = await a.core.createWorld({ taskId: pinned, base: 'main', kind: 'e2b' });
+    expect(handle.kind).toBe('hetzner');
+    expect(a.hetzner.made).toEqual([pinned]);
+    expect((await a.events(pinned, 'world.provisioning'))[0]?.payload).toEqual({ provider: 'hetzner' });
+
+    const unpinned = await a.task('Started when E2B was the default');
+    expect((await a.core.createWorld({ taskId: unpinned, base: 'main', kind: 'e2b' })).kind).toBe('hetzner');
+    expect((await a.events(unpinned, 'world.routed'))[0]?.payload).toMatchObject({ provider: 'hetzner', funding: 'managed' });
+  });
 });
 
 function fakeServiceAccount() {
