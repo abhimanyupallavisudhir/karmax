@@ -149,4 +149,9 @@ it('starts a task on a computer: any (tavya picks) or a named provider, at least
   const bad = await f.tavya(f.laptop, ['task', 'new', 'Tiny', '--cpu', 'lots', '--project', f.project.id]);
   expect(bad.code).toBe(2);
   expect(bad.stderr).toContain('--cpu must be a positive number');
+  // Basic internet is enough: Any may also use computers limited to essential services.
+  const basic = await f.tavya(f.laptop, ['task', 'new', 'Lint', '--computer', 'any', '--network', 'basic', '--draft', '--project', f.project.id, '--json']);
+  expect(basic.code, basic.stderr).toBe(0);
+  expect((await f.store.getTask(JSON.parse(basic.stdout).id))!.params.computer).toEqual({ provider: 'any', network: { unrestricted: true, basic: true } });
+  expect((await f.tavya(f.laptop, ['task', 'new', 'Odd', '--network', 'some', '--project', f.project.id])).stderr).toContain('--network must be full or basic');
 });

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { ProviderCapacityFull } from '../src/agent/limits.js';
 import { FlyDriver, flyComputeDollarsPerSecond, flyGuest, machineRuns } from '../src/world/fly.js';
 import { VmWorldProvider } from '../src/world/vm/provider.js';
 import type { ResolvedWorldProviderConnection } from '../src/world/connections.js';
@@ -146,6 +147,22 @@ describe.skipIf(!sshdAvailable)('Fly.io worlds (fake Machines API, real sshd)', 
       socket: fly.socket, user: os.userInfo().username, home: fly.home, provision: { stamp, script: 'echo broken >&2; exit 3', sudo: false } });
     await expect(failing.create({ taskId: 'task_fail', base: 'main', generation: 1 })).rejects.toThrow(/provisioning the Fly.io machine failed: the script exited with status 3:\nbroken/);
     expect(fly.apps.size).toBe(0);
+  });
+
+  // Fly allows an organization 50 machines unless billing@fly.io raises it, and a
+  // region can be out of room: either is a full provider, so the task waits for a
+  // machine or Any tries the next provider, instead of failing.
+  it('says it is full when Fly refuses a machine for its organization\'s limit or a full region, and leaves nothing behind', async () => {
+    for (const error of ['Your organization has reached its machine limit. Please contact billing@fly.io',
+      'insufficient resources available to fulfill request: could not reserve resource for machine']) {
+      fly.refuseMachines = { status: 422, error };
+      const failure = await provider.create({ taskId: 'task_full', base: 'main', generation: 1 }).catch((value) => value);
+      expect(failure).toBeInstanceOf(ProviderCapacityFull);
+      expect(failure.message).toContain(error);
+      expect(fly.apps.size).toBe(0);
+    }
+    fly.refuseMachines = { status: 422, error: 'invalid image' };
+    expect(await provider.create({ taskId: 'task_bad', base: 'main', generation: 1 }).catch((value) => value)).not.toBeInstanceOf(ProviderCapacityFull);
   });
 
   it('refuses an organization on Fly’s free trial, which stops every machine after 5 minutes', async () => {

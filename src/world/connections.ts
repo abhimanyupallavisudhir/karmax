@@ -1,7 +1,7 @@
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
 import { isAnyProvider, type MachineShape } from '../domain/computer.js';
-import { assertComputerFits, computerLimits, providerFeatures, type ComputerFeatures, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
+import { accountFeatures, assertComputerFits, computerLimits, type ComputerFeatures, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
 import type { WorldProviderConnection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { probeDaytonaLimits, probeE2BLimits } from './provider-limits.js';
@@ -90,7 +90,7 @@ export class WorldProviderConnectionService {
   private async view(value: WorldProviderConnection): Promise<WorldProviderConnectionView> {
     const { measuredLimits, ...rest } = value;
     return { ...rest, credentialConfigured: await this.broker.hasHandle(value.credentialHandle),
-      limits: computerLimits(value.provider, measuredLimits, value.config.limits), features: providerFeatures(value.provider) };
+      limits: computerLimits(value.provider, measuredLimits, value.config.limits), features: accountFeatures(value.provider, measuredLimits) };
   }
 
   /** Every connection, with its limits. One never asked is asked now (briefly
@@ -108,7 +108,7 @@ export class WorldProviderConnectionService {
   private async listOwn(organizationId: string): Promise<WorldProviderConnectionView[]> {
     const values = await this.store.listWorldProviderConnections(organizationId);
     const configured = await Promise.all(values.map((value) => this.broker.hasHandle(value.credentialHandle)));
-    const unknown = values.filter((value, index) => !value.measuredLimits && value.enabled && configured[index]);
+    const unknown = values.filter((value, index) => value.enabled && configured[index] && needsProbe(value));
     if (unknown.length) {
       const probes = unknown.map((value) => this.probeOnce(organizationId, value.provider));
       await Promise.race([Promise.allSettled(probes), new Promise((resolve) => setTimeout(resolve, LIST_PROBE_WAIT_MS).unref())]);
@@ -119,9 +119,8 @@ export class WorldProviderConnectionService {
 
   /** The installation's enabled managed compute accounts that have a key. */
   async managedConnections(): Promise<WorldProviderConnectionView[]> {
-    const values = (await this.store.listWorldProviderConnections(MANAGED_COMPUTE)).filter((value) => value.enabled);
-    const usable = await Promise.all(values.map(async (value) => await this.broker.hasHandle(value.credentialHandle)));
-    return Promise.all(values.filter((_, index) => usable[index]).map((value) => this.view(value)));
+    // Asked like an organization's own, so "Any" knows what each one gives.
+    return (await this.listOwn(MANAGED_COMPUTE)).filter((value) => value.enabled && value.credentialConfigured);
   }
 
   /** Whether `provider` computers for this organization run on managed
@@ -157,7 +156,7 @@ export class WorldProviderConnectionService {
   }
 
   /** Refuse a size this organization's account cannot give, before any machine is made. */
-  async assertFits(organizationId: string | undefined, provider: string | undefined, spec: MachineShape): Promise<void> {
+  async assertFits(organizationId: string | undefined, provider: string | undefined, spec: ComputerFitSpec): Promise<void> {
     if (!provider) return;
     if (isAnyProvider(provider)) return assertSomeFits(spec, organizationId ? await this.reachable(organizationId) : []);
     assertComputerFits(spec, await this.limits(organizationId, provider), provider);
@@ -355,6 +354,15 @@ const defaultProbes: ProviderProbes = {
   },
 };
 
+/** What `assertFits` judges: the sizes, and the outbound network asked for. */
+export type ComputerFitSpec = MachineShape & { network?: { unrestricted?: boolean; basic?: boolean } };
+
+/** An account whose limits were never read, or a Daytona account read before
+ * its internet was (Tiers 1 and 2 reach essential services only). */
+function needsProbe(value: WorldProviderConnection): boolean {
+  return !value.measuredLimits || (value.provider === 'daytona' && !value.measuredLimits.network);
+}
+
 /** Each size, the largest any reachable account allows ("Any"'s ceiling). */
 export function anyLimits(views: Array<{ limits: ComputerLimits }>): EffectiveComputerLimits {
   const out: EffectiveComputerLimits = { source: {} };
@@ -366,8 +374,15 @@ export function anyLimits(views: Array<{ limits: ComputerLimits }>): EffectiveCo
 }
 
 /** Refuse a size no single reachable account can give. Nothing reachable: nothing to judge. */
-function assertSomeFits(spec: MachineShape, views: Array<{ provider: string; limits: ComputerLimits }>): void {
-  if (!views.length) return;
+function assertSomeFits(spec: ComputerFitSpec, all: Array<{ provider: string; limits: ComputerLimits; features?: ComputerFeatures }>): void {
+  if (!all.length) return;
+  // Only accounts that give the outbound network asked for: an allowlist, or
+  // full internet unless basic is enough.
+  const views = all.filter((view) => spec.network?.unrestricted === false ? view.features?.allowlist !== false
+    : spec.network?.basic || view.features?.internet !== 'basic');
+  if (!views.length) throw new Error(spec.network?.unrestricted === false
+    ? 'None of the computers this organization can use has an outbound allowlist'
+    : 'None of the computers this organization can use has full internet; choose "Basic internet is enough"');
   const failures: string[] = [];
   for (const view of views) {
     try { assertComputerFits(spec, view.limits, view.provider); return; }

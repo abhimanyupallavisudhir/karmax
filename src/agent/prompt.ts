@@ -244,7 +244,9 @@ function describeMachineAndRoom(world: WorldHandle, taskId: string, requested?: 
   const routed = typeof world.meta?.routed === 'string'
     ? ` It runs on ${providerLabel(world.kind)}, which ${BRAND} chose because this task's Computer lets it (${world.meta.routed}).` : '';
   const allows = routed + (allowed.length ? ` This ${providerLabel(world.kind)} account allows up to ${allowed.length > 1
-    ? `${allowed.slice(0, -1).join(', ')} and ${allowed.at(-1)}` : allowed[0]}.` : '');
+    ? `${allowed.slice(0, -1).join(', ')} and ${allowed.at(-1)}` : allowed[0]}.` : '')
+    // Daytona's Tiers 1 and 2: a fixed list of essential services, nothing else.
+    + (given?.network === 'basic' ? ' Its internet is basic: it reaches package registries, Git hosts and AI and cloud APIs, not arbitrary websites.' : '');
   if (moveTo && moveTo !== world.kind)
     return `Computer: ${current}.${allows} This task is moving to ${providerLabel(moveTo)}: you move when the task parks, so end your turn `
       + 'with pause(3) without jobs. A pause that waits on jobs keeps this machine, so first let them finish or stop them (stop_job). '
@@ -257,9 +259,12 @@ function describeMachineAndRoom(world: WorldHandle, taskId: string, requested?: 
   if (requested && !sameMachine(shape, requested))
     return `Computer: ${current}.${allows} This task's computer is now ${describeMachine(requested)}: you move to it when the task parks, so ${move}`;
   const resize = (key: string, value: number) => `platform_request(PATCH, "/api/tasks/${taskId}/params", {"params": {"computer": {"${key}": ${value}}}})`;
-  const atDiskCeiling = limits.diskGb != null && totalGb != null && totalGb >= limits.diskGb;
+  // A documented ceiling still bounds what to ask for (Daytona: 10 GB unless its
+  // support raised it), though it is not named as this account's own.
+  const diskCeiling = limits.diskGb ?? given?.diskGb;
+  const atDiskCeiling = diskCeiling != null && totalGb != null && totalGb >= diskCeiling;
   if (!atDiskCeiling) {
-    const diskGb = limits.diskGb ?? Math.max(2 * (totalGb ?? 20), 40);
+    const diskGb = diskCeiling ?? Math.max(2 * (totalGb ?? 20), 40);
     return `Computer: ${current}.${allows} If it is too small (out of disk or memory), resize it yourself with ${resize('diskGb', diskGb)} `
       + `(or cpu, memoryMb) and then ${move}`;
   }

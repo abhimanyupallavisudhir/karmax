@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { validateDeployment } from '../src/config/deployment.js';
+import { CLOUD_WORLD_PROVIDERS } from '../src/domain/computer.js';
+import { providerName } from '../src/world/connections.js';
 import { ACCEPTANCE_POLICIES, CHECKOUT_DISCLOSURES, POLICY_SLUGS, POLICY_VERSION,
   assertPaidLaunchReady, assertPolicyAcceptance, launchConfig,
   policyDocument, policyVersions, publicLaunchInfo } from '../src/launch/legal.js';
@@ -186,8 +188,15 @@ describe('paid-launch policies', () => {
     expect(billing).toContain('files Git ignores (such as installed dependencies, build output and caches) and running processes are deleted and not restored');
     expect(JSON.stringify(policyDocument('billing'))).toContain('compute top-ups are charged when bought');
     // A changed disclosure is a new version: acceptance evidence names the text a person saw.
-    expect(policyDocument('billing')!.version).toBe('2026-10-22.2');
-    expect(policyDocument('billing')!.effectiveDate).toBe('October 22, 2026');
+    expect(policyDocument('billing')!.version).toBe('2026-10-29.1');
+    expect(policyDocument('billing')!.effectiveDate).toBe('October 29, 2026');
+  });
+
+  // AWS and Google Cloud ran managed compute from 2026-10-20 without being
+  // listed (found 2026-10-29): every cloud a task can run on is named.
+  it('names every cloud provider a task world can run on as a subprocessor', () => {
+    const subprocessors = JSON.stringify(policyDocument('subprocessors'));
+    for (const provider of CLOUD_WORLD_PROVIDERS) expect(subprocessors).toContain(providerName(provider));
   });
 
   it('incorporates a scoped processing addendum without claiming execution or launch approval', () => {

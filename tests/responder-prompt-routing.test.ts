@@ -73,6 +73,22 @@ describe('the computer in the World section', () => {
     expect(full).toContain('{"params": {"computer": {"memoryMb": 8192}}}');
   });
 
+  // Daytona's documented 10 GB ceiling: an agent once asked for 40 GB, which
+  // its account refuses. A basic-internet account says what it reaches.
+  it('offers no more disk than a documented ceiling, and says when the internet is basic', () => {
+    const daytona = { ...world, kind: 'daytona', meta: { computer: { cpu: 2, memoryMb: 4096 } } } as any;
+    const limits = { cpu: 4, memoryMb: 8192, diskGb: 10, network: 'basic' as const,
+      source: { cpu: 'default', memoryMb: 'default', diskGb: 'default' } as const };
+    const base = { profile, role: 'do' as const, task: task({ kind: 'human', audience: ['@creator'] }), world: daytona, limits,
+      computer: { cpu: 2, memoryMb: 4096 } };
+    const small = assemblePrompt({ ...base, disk: { totalKb: 8 * 2 ** 20, usedKb: 6 * 2 ** 20, availKb: 2 * 2 ** 20 } });
+    expect(small).toContain('{"params": {"computer": {"diskGb": 10}}}');
+    expect(small).toContain('Its internet is basic: it reaches package registries, Git hosts and AI and cloud APIs, not arbitrary websites.');
+    const full = assemblePrompt({ ...base, disk: { totalKb: 10 * 2 ** 20, usedKb: 9 * 2 ** 20, availKb: 2 ** 20 } });
+    expect(full).toContain('Its disk is the largest this account allows');
+    expect(full).not.toContain('"diskGb"');
+  });
+
   // pramana#3: the agent paused on its rebuild job after its owner chose 50 GB;
   // a pause that waits on jobs never parks, so the machine never moved.
   it('says a resize needs a pause without jobs, and names a size the task asks for but has not reached', () => {

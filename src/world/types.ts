@@ -182,7 +182,7 @@ export interface WorldSpec {
   repositoryOrigins?: Record<string, string>;
   /** Provider-internal per-repository projection of repositoryAuthorities. */
   sourceAuthority?: 'project' | 'origin';
-  network?: { allowDomains?: string[]; allowCidrs?: string[]; unrestricted?: boolean };
+  network?: { allowDomains?: string[]; allowCidrs?: string[]; unrestricted?: boolean; basic?: boolean };
   environment?: { flavor?: 'headless' | 'desktop'; template?: string; image?: string; snapshot?: string };
   resources?: { cpu?: number; memoryMb?: number; diskGb?: number; gpu?: number };
   /** Where the checkouts sit under the world root. `flat` (the default for a

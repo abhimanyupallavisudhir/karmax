@@ -974,3 +974,49 @@ function storedObjects(root: string): Buffer[] {
   return (fs.readdirSync(root, { recursive: true }) as string[]).map(name => path.join(root, name))
     .filter(file => fs.statSync(file).isFile()).map(file => fs.readFileSync(file));
 }
+
+// A move restores on a new machine. What that machine could not give (Daytona
+// at a smaller snapshot than asked when its resize API answers 404) was put on
+// the handle and never said; createWorld records and tells it, so restore does.
+it('records and tells what a restored machine could not give', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-restore-warning-'));
+  const repo = path.join(dir, 'repo');
+  fs.mkdirSync(repo);
+  await gitOrThrow(repo, ['init', '-q', '-b', 'main']);
+  await ensureIdentity(repo);
+  fs.writeFileSync(path.join(repo, 'tracked.txt'), 'before\n');
+  await git(repo, ['add', '-A']);
+  await gitOrThrow(repo, ['commit', '-q', '-m', 'init']);
+  const store = (await Store.create(':memory:'));
+  const project = (await store.createProject('Cloud', { repos: [repo], defaultBase: 'main' }));
+  const task = (await store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'test' } }));
+  const worlds = new WorldRegistry();
+  const worktrees = new WorktreeProvider(path.join(dir, 'worlds'));
+  let restoring = false;
+  worlds.register({
+    kind: 'sandbox-test', parkable: true,
+    capabilities: { remote: true, pty: false, snapshots: true, ports: false, networkPolicy: false },
+    async create(spec: Parameters<WorktreeProvider['create']>[0]) {
+      const w = await worktrees.create(spec);
+      w.handle.kind = 'sandbox-test';
+      if (restoring) w.handle.warnings = ['This computer runs at the Daytona snapshot\'s size (2 CPU · 4 GB): resize is not supported'];
+      return w;
+    },
+    async open(handle: Parameters<WorktreeProvider['open']>[0]) { const w = await worktrees.open(handle); w.handle.kind = 'sandbox-test'; return w; },
+  } as any);
+  const checkpoints = new WorldCheckpointService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')),
+    new CredentialBroker(new Vault(path.join(dir, 'vault'))));
+  const world = await worlds.create('sandbox-test', { taskId: task.id, repos: [repo], base: 'main' });
+  world.handle.meta = { projectId: project.id };
+  world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
+  const checkpoint = await checkpoints.checkpoint(world.handle);
+  await world.destroy();
+  restoring = true;
+  const restored = await checkpoints.restore(checkpoint.id, 'sandbox-test');
+  const warnings = (await store.eventsSince(task.id, 0)).filter((event) => event.type === 'world.warning').map((event) => event.payload.warning);
+  expect(warnings).toEqual(['This computer runs at the Daytona snapshot\'s size (2 CPU · 4 GB): resize is not supported']);
+  expect(await checkpoints.takeNotice(task.id)).toContain('runs at the Daytona snapshot\'s size');
+  await (await worlds.open(restored)).destroy();
+  (await store.close());
+  fs.rmSync(dir, { recursive: true, force: true });
+});
