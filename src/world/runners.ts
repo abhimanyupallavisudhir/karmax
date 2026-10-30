@@ -603,14 +603,27 @@ export class WorldLifecycleManager {
       // The installation's managed compute account first: its feed reports
       // every organization's managed machines, booked as managed (charged to
       // their compute credit). Should an organization connect the very same
-      // account as its own, the rows are already booked when its feed repeats them.
+      // account as its own, that feed also reports the organization's own
+      // machines: those are booked as its own (production, 2026-10-30: an
+      // organization's own E2B sandboxes took half its compute credit).
+      const funding = new Map<string, 'managed' | 'byok'>();
+      const managedFunding = async (owner: string, taskId: string | undefined): Promise<'managed' | 'byok'> => {
+        const key = `${owner}:${taskId ?? ''}`;
+        if (!funding.has(key)) {
+          const world = taskId ? (await this.store.currentWorld(taskId)) : undefined;
+          funding.set(key, world && (world.kind ?? world.provider) === provider.kind
+            ? world.meta?.funding === 'managed' ? 'managed' : 'byok'
+            : (await this.store.getWorldProviderConnection(owner, provider.kind))?.enabled ? 'byok' : 'managed');
+        }
+        return funding.get(key)!;
+      };
       for (const organization of [{ id: MANAGED_COMPUTE }, ...organizations]) {
         // Each tenant key sees its own E2B project feed. Environment credentials
         // are imported into org_personal on boot, so an absent connection means
         // this organization must not be polled through another tenant's fallback.
         const connection = (await this.store.getWorldProviderConnection(organization.id, provider.kind));
         if (!connection?.enabled) continue;
-        const fundingSource = organization.id === MANAGED_COMPUTE ? 'managed' : 'byok';
+        const managedFeed = organization.id === MANAGED_COMPUTE;
         const syncKey = `usage-sync:${organization.id}:${provider.kind}`;
         let previous: Record<string, unknown> = {};
         try { previous = JSON.parse((await this.store.kvGet(syncKey)) ?? '{}'); } catch {}
@@ -633,7 +646,12 @@ export class WorldLifecycleManager {
             for (const event of batch) {
               const id = `usage:${provider.kind}:${event.id}`;
               const existing = recorded.get(id);
-              if (existing?.taskId) continue;
+              if (existing?.taskId) {
+                if (managedFeed && existing.fundingSource === 'managed'
+                  && (await managedFunding(existing.organizationId, existing.taskId)) === 'byok')
+                  (await this.store.rebookUsageAsOwn(id));
+                continue;
+              }
               if (event.taskId && !attribution.has(event.taskId))
                 attribution.set(event.taskId, (await this.store.taskAttribution(event.taskId)));
               const task = event.taskId ? attribution.get(event.taskId) : undefined;
@@ -650,6 +668,8 @@ export class WorldLifecycleManager {
                 // Repairs rows an earlier sync booked to whoever read them first.
                 if (existing.organizationId !== owner || attributed.taskId)
                   (await this.store.reattributeUsageEvent(id, { organizationId: owner, ...attributed }));
+                if (managedFeed && existing.fundingSource === 'managed' && (await managedFunding(owner, attributed.taskId)) === 'byok')
+                  (await this.store.rebookUsageAsOwn(id));
                 continue;
               }
               const seconds = event.activeMs / 1000;
@@ -658,7 +678,7 @@ export class WorldLifecycleManager {
                 organizationId: owner,
                 ...attributed,
                 provider: provider.kind, kind: disk ? 'world.disk' : 'world.active', quantity: seconds, unit: 'second',
-                fundingSource,
+                fundingSource: managedFeed ? (await managedFunding(owner, attributed.taskId)) : 'byok',
                 // The provider's own price when it reports one (Fly, Hetzner); karmax's rates otherwise.
                 costMicros: event.costMicros ?? Math.round(seconds * costMicrosPerSecond(provider.kind,
                   event.cpu, event.memoryMb, event.gpu ?? 0)),
