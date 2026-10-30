@@ -404,12 +404,15 @@ export interface WorldProviderConnection {
     /** Fly.io: the organization slug machines are created in. */
     organization?: string;
     /** Per-machine limits entered in Advanced, for what the provider's API
-     * cannot tell (wiki features/computers). Disk is total GB. */
-    limits?: { cpu?: number; memoryMb?: number; diskGb?: number };
-    /** Managed compute (the installation's own account): how many of its
-     * machines may run at once across every organization, the account's
-     * concurrency limit (E2B Hobby: 20). Above it, new ones wait for a
-     * machine instead of failing at the provider. */
+     * cannot tell (wiki features/computers). Disk is total GB. `pool` is the
+     * account's budget across its running machines where the provider cannot
+     * say it (Hetzner's CPU limit, E2B's and Fly.io's machine counts); it wins
+     * over the measured one. */
+    limits?: { cpu?: number; memoryMb?: number; diskGb?: number; pool?: { cpu?: number; machines?: number } };
+    /** Managed compute: the most of the account's budget one organization may
+     * hold while another waits for room, in percent (default 50). */
+    share?: number;
+    /** Before 2026-10-30: machines at once, now `limits.pool.machines`. */
     maxRunning?: number;
   };
   /** What the provider account itself said it allows, from a probe or a

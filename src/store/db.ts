@@ -8959,6 +8959,14 @@ export class Store {
     return Number((row as { n?: number } | undefined)?.n ?? 0);
   }
 
+  /** The machines running on the installation's `provider` account, each
+   * with its organization and CPUs (null: the provider's default size). */
+  async runningManagedLeases(provider: string): Promise<Array<{ organizationId: string; cpu: number | null }>> {
+    return ((await this.db.prepare(`SELECT l.organizationId organizationId, l.cpu cpu FROM world_leases l JOIN runner_pools p ON p.id=l.runnerPoolId
+      WHERE l.state='active' AND p.mode='managed' AND p.provider=? AND p.id=p.organizationId || ':tavya-' || p.provider`).all(provider)) as Array<Record<string, unknown>>)
+      .map((row) => ({ organizationId: String(row.organizationId ?? row.organizationid), cpu: row.cpu == null ? null : Number(row.cpu) }));
+  }
+
   async runningManagedWorlds(provider: string): Promise<number> {
     return Number(((await this.db.prepare(`SELECT COUNT(*) n FROM world_leases l JOIN runner_pools p ON p.id=l.runnerPoolId
       WHERE l.state='active' AND p.mode='managed' AND p.provider=? AND p.id=p.organizationId || ':tavya-' || p.provider`).get(provider)) as { n?: number } | undefined)?.n ?? 0);

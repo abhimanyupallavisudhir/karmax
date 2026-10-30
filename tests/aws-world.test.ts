@@ -131,6 +131,15 @@ describe.skipIf(!sshdAvailable)('AWS worlds (fake EC2, real sshd)', () => {
     expect(await driver.limits(connection(aws.key))).toMatchObject({ cpu: 192, memoryMb: 1_572_864, diskGb: 16_384 });
   });
 
+  // Every instance of karmax's families counts against the account's running
+  // On-Demand Standard vCPU quota: the budget "Any" and managed compute admit by.
+  it('reads the account’s vCPU quota as its budget, when the key may read Service Quotas', async () => {
+    aws.vcpuLimit = 64;
+    expect((await driver.limits(connection(aws.key))).pool).toBeUndefined();
+    aws.quotasReadable = true;
+    expect((await driver.limits(connection(aws.key))).pool).toEqual({ cpu: 64 });
+  });
+
   it('creates a world: a gp3 home volume, an instance in the default VPC behind karmax’s security group, IMDSv2, no public key', async () => {
     const world = await provider.create({ taskId: 'task_aws', base: 'main', generation: 1, organizationId: 'org_a', resources: { diskGb: 100 } });
     const home = [...aws.volumes.values()].find((volume) => volume.tags.karmaxRole === 'home')!;
