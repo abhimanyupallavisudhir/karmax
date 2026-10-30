@@ -162,6 +162,7 @@ const root = __dirname;
     }));
     const shown = await chrome();
     assert.equal(shown.tucked, false);
+    assert.deepEqual(await page.locator('.tp-views .tab').evaluateAll((tabs) => tabs.map((a) => a.innerText.trim())), ['', ''], 'a phone shows the views as icons alone');
     assert.ok(shown.height <= 125, `the phone header and toolbar are compact (${shown.height}px)`);
     await page.evaluate(() => {
       document.querySelector('#ck-thread .thread').insertAdjacentHTML('afterbegin', '<div style="height:3000px"></div>');
