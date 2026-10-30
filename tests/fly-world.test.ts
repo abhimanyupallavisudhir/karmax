@@ -106,7 +106,7 @@ describe.skipIf(!sshdAvailable)('Fly.io worlds (fake Machines API, real sshd)', 
     await world.writeFile('data.bin', 'x'.repeat(1000));
     const handle = world.handle as WorldHandle;
     expect(await provider.resize(handle, { diskGb: 150, cpu: 4, memoryMb: 8192 }))
-      .toEqual({ disk: 'grown', restart: true, machine: { cpu: 2, memoryMb: 2048, diskGb: 150 } });
+      .toEqual({ disk: 'grown', restart: true, machine: { cpu: 4, memoryMb: 8192, diskGb: 150 } });
     expect([...fly.volumes.values()][0]!.size_gb).toBe(150);
     // Never shrinks.
     expect(await provider.resize(handle, { diskGb: 120 })).toMatchObject({ disk: 'unchanged' });

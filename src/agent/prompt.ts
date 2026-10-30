@@ -1,4 +1,4 @@
-import { describeMachine, isVmWorldProvider, sameMachine, type MachineShape } from '../domain/computer.js';
+import { describeMachine, isVmWorldProvider, sameMachine, worldMachine, type MachineShape } from '../domain/computer.js';
 import { computerLimits, providerFeatures as computerFeatures, providerLabel, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
 import type { DiskSpace } from '../world/disk.js';
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
@@ -278,7 +278,7 @@ function describeMachineAndRoom(world: WorldHandle, taskId: string, requested?: 
 /** A VM world (Fly.io, Hetzner, AWS, Google Cloud): its disk is a volume that keeps everything and grows in place. */
 function describeVmComputer(world: WorldHandle, taskId: string, shape: MachineShape, requested: MachineShape | undefined,
   known: { current: string; allows: string; totalGb?: number; limits: ComputerLimits }): string {
-  const machine = (world.meta?.machine as MachineShape | undefined) ?? shape;
+  const machine = worldMachine(world.meta) ?? shape;
   const home = world.kind === 'hetzner'
     ? ' Only your home directory (/home/user) lasts through a long pause: install tools there or in the project, not with apt.' : '';
   const pending = requested && (requested.cpu !== undefined && requested.cpu !== machine.cpu

@@ -52,7 +52,7 @@ import { assertComputerFits, providerLabel } from '../domain/computer-limits.js'
 import { MANAGED_COMPUTE } from '../world/connections.js';
 import { taskProvider } from '../world/task-provider.js';
 import { ANY_PROVIDER, applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, isAnyProvider, machineShape, normalizeComputer, sameMachine,
-  type ComputerSpec, type MachineShape } from '../domain/computer.js';
+  type ComputerSpec, type MachineShape, worldMachine } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { splitSharedSettings } from '../domain/shared-settings.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM, applyRepoBranches, normalizeRepoBranches, repositoryBranchDefaults } from './branch-defaults.js';
@@ -3644,7 +3644,7 @@ export class KarmaxApi {
         const held = await this.deps.store.worldStateSnapshot(taskId).catch(() => undefined);
         const world = held && ['ready', 'parked', 'degraded'].includes(held.state) ? await this.deps.store.currentWorld(taskId) : undefined;
         if (world && held && isRemoteWorldKind(world.kind)) {
-          const machine = (world.meta?.machine ?? world.meta?.computer) as MachineShape | undefined;
+          const machine = worldMachine(world.meta);
           view = { ...view, runsOn: { provider: world.kind, ...(world.meta?.funding === 'managed' ? { managed: true } : {}),
             ...(machine ? { machine } : {}), ...(typeof world.meta?.routed === 'string' ? { routed: world.meta.routed } : {}) } };
           if (view.status !== 'active')

@@ -8863,11 +8863,12 @@ export class Store {
   }
 
   async computeHold(id: string): Promise<{ id: string; organizationId: string; taskId?: string; provider: string;
-    purpose: string; startedAt: number; endsAt: number; closedAt?: number } | undefined> {
+    purpose: string; activeMicrosPerHour: number; diskMicrosPerHour: number; startedAt: number; endsAt: number; closedAt?: number } | undefined> {
     const row = (await this.db.prepare('SELECT * FROM compute_holds WHERE id=?').get(id)) as Record<string, unknown> | undefined;
     if (!row) return undefined;
     return { id: String(row.id), organizationId: String(row.organizationId), ...(row.taskId ? { taskId: String(row.taskId) } : {}),
-      provider: String(row.provider), purpose: String(row.purpose), startedAt: Number(row.startedAt), endsAt: Number(row.endsAt),
+      provider: String(row.provider), purpose: String(row.purpose), activeMicrosPerHour: Number(row.activeMicrosPerHour),
+      diskMicrosPerHour: Number(row.diskMicrosPerHour), startedAt: Number(row.startedAt), endsAt: Number(row.endsAt),
       ...(row.closedAt != null ? { closedAt: Number(row.closedAt) } : {}) };
   }
 
