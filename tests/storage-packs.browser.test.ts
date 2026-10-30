@@ -42,7 +42,7 @@ it('adds and removes storage and compute packs in Plan & billing, showing only v
   // The installation runs E2B computers, so compute shows beside storage.
   const providerConnections = new WorldProviderConnectionService(store, new CredentialBroker(new Vault(path.join(directory, 'vault'))),
     { check: async () => {}, limits: async () => ({}) });
-  await providerConnections.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', apiKey: 'operator-key', config: { maxRunning: 20 } });
+  await providerConnections.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', apiKey: 'operator-key', config: {} });
   await store.recordUsage({ id: 'usage:e2b:browser', organizationId: org.id, provider: 'e2b', kind: 'world.active', quantity: 3600,
     unit: 'second', costMicros: 1_500_000, startedAt: Date.now() - 3_700_000, endedAt: Date.now() - 100_000, fundingSource: 'managed' });
   const worlds = new WorldRegistry(), tokens = new TokenAuthority();

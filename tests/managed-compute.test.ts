@@ -63,7 +63,7 @@ describe('managed compute accounts', () => {
     await expect(f.connections.resolve(f.organization.id, 'e2b')).rejects.toThrow(/not connected/);
     expect(await f.connections.funding(f.organization.id, 'e2b')).toBeUndefined();
 
-    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', apiKey: 'operator-key', config: { maxRunning: 20 } });
+    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', apiKey: 'operator-key', config: {} });
     const managed = await f.connections.resolve(f.organization.id, 'e2b');
     expect(managed).toMatchObject({ apiKey: 'operator-key', managed: true, organizationId: f.organization.id });
     expect(await f.connections.funding(f.organization.id, 'e2b')).toBe('managed');
@@ -87,9 +87,13 @@ describe('managed compute accounts', () => {
 
   it('keeps the installation\'s key in the installation\'s vault scope and offers nothing once disabled', async () => {
     const f = await fixture();
-    const saved = await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'hetzner', apiKey: 'hcloud', config: { maxRunning: 5, region: 'fsn1' } });
-    expect(saved.config).toMatchObject({ maxRunning: 5, region: 'fsn1' });
+    const saved = await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'hetzner', apiKey: 'hcloud',
+      config: { limits: { pool: { cpu: 12 } }, share: 40, region: 'fsn1' } });
+    expect(saved.config).toMatchObject({ limits: { pool: { cpu: 12 } }, share: 40, region: 'fsn1' });
+    expect(saved.limits.pool).toEqual({ cpu: 12 });
     expect((await f.connections.list(f.organization.id))[0]).toMatchObject({ provider: 'hetzner', config: { region: 'fsn1' } });
+    // Organizations see what one machine may be, never the installation's budget or share.
+    expect(JSON.stringify(await f.connections.list(f.organization.id))).not.toMatch(/"pool"|"share"/);
     await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'hetzner', enabled: false });
     expect(await f.connections.list(f.organization.id)).toEqual([]);
     await expect(f.connections.resolve(f.organization.id, 'hetzner')).rejects.toThrow(/not connected/);
@@ -157,7 +161,7 @@ describe('managed compute admission', () => {
 
   it('runs no more of the installation\'s machines at once than its account allows, across organizations', async () => {
     const f = await fixture();
-    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', apiKey: 'operator-key', config: { maxRunning: 1 } });
+    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', apiKey: 'operator-key', config: { limits: { pool: { machines: 1 } } } });
     const other = await f.store.createOrganization({ name: 'Other', ownerUserId: 'other' });
     const otherProject = await f.store.createProject('Theirs', { worldProvider: 'e2b' }, other.id);
     for (const id of [f.organization.id, other.id]) await f.store.setOrganizationPlan(id, 'team');
@@ -172,6 +176,82 @@ describe('managed compute admission', () => {
     await f.connections.save({ organizationId: other.id, provider: 'e2b', apiKey: 'their-key' });
     await expect(runners.acquire({ project: otherProject, taskId: theirs.id, worldId: theirs.id, provider: 'e2b', work: true })).resolves.toBeDefined();
     await runners.release(held.leaseId, 'e2b');
+  });
+
+  // The account's budget (wiki features/managed-compute § Budget): CPUs and
+  // machines at once, read from the provider or entered, and a fair share.
+  describe('the account\'s budget', () => {
+    async function two(config: Record<string, unknown>) {
+      const f = await fixture();
+      await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', apiKey: 'operator-key', config });
+      const other = await f.store.createOrganization({ name: 'Other', ownerUserId: 'other' });
+      const otherProject = await f.store.createProject('Theirs', { worldProvider: 'e2b' }, other.id);
+      for (const id of [f.organization.id, other.id]) await f.store.setOrganizationPlan(id, 'team');
+      const runners = new RunnerPoolService(f.store, f.connections);
+      const ours = async () => { const task = await f.task(); return runners.acquire({ project: f.project, taskId: task.id, worldId: task.id, provider: 'e2b', work: true }); };
+      const theirs = async () => {
+        const task = await f.store.createTask({ projectId: otherProject.id, title: 'Theirs', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } as any });
+        return runners.acquire({ project: otherProject, taskId: task.id, worldId: task.id, provider: 'e2b', work: true });
+      };
+      return { ...f, runners, ours, theirs };
+    }
+
+    it('admits machines while their CPUs fit the account\'s, whatever their number', async () => {
+      const f = await two({ limits: { pool: { cpu: 4 } } });
+      await f.ours();
+      await f.theirs();
+      const refused = await f.ours().catch((error) => error);
+      expect(refused).toBeInstanceOf(ManagedComputeBusy);
+      expect(refused.message).toBe('tavya\'s E2B computers are using 4 of their 4 CPUs; waiting for room.');
+    });
+
+    it('lets one organization use all of it alone, and holds it to its share once another waits', async () => {
+      const f = await two({ limits: { pool: { cpu: 8 } } });
+      const held = [await f.ours(), await f.ours(), await f.ours(), await f.ours()];
+      // Full: the other organization waits, and is remembered as waiting.
+      expect(await f.theirs().catch((error) => error)).toBeInstanceOf(ManagedComputeBusy);
+      await f.runners.release(held.pop()!.leaseId, 'e2b');
+      // The freed room is not ours again: we hold 6 of 8 CPUs, past half, while they wait.
+      const ours = await f.ours().catch((error) => error);
+      expect(ours).toBeInstanceOf(ManagedComputeBusy);
+      expect(ours.message).toBe('This organization already uses its share of tavya\'s E2B computers (6 of 8 CPUs) while other organizations wait for one; waiting for one of its machines to finish.');
+      await expect(f.theirs()).resolves.toBeDefined();
+      // A share of 100% gives no way, and an organization holding nothing always gets its first machine.
+      const g = await two({ limits: { pool: { cpu: 4 } }, share: 100 });
+      await g.ours();
+      expect(await g.theirs().catch(() => 'refused')).not.toBe('refused');
+      expect(await g.theirs().catch((error) => error)).toBeInstanceOf(ManagedComputeBusy);
+      await expect(g.ours()).rejects.toBeInstanceOf(ManagedComputeBusy);
+    });
+
+    // Owner, 2026-10-30: no limits besides the providers'. The machines at once
+    // entered before (tavya's own caution) are not a budget; each provider's
+    // own refusal makes a task wait or move instead.
+    it('ignores machines at once saved before the budget, and drops it at the next save', async () => {
+      const f = await two({});
+      const row = (await f.store.getWorldProviderConnection(MANAGED_COMPUTE, 'e2b'))!;
+      await f.store.upsertWorldProviderConnection({ ...row, config: { ...row.config, maxRunning: 1 } as any });
+      expect((await f.connections.managedConnections())[0]!.limits.pool).toBeUndefined();
+      await f.ours();
+      await expect(f.theirs()).resolves.toBeDefined();
+      await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', config: { region: 'us' } });
+      expect((await f.store.getWorldProviderConnection(MANAGED_COMPUTE, 'e2b'))!.config).not.toHaveProperty('maxRunning');
+    });
+
+    it('takes a budget the provider tells, and an entered one over it', async () => {
+      const f = await fixture();
+      const measured = new WorldProviderConnectionService(f.store, f.broker,
+        { check: async () => {}, limits: async () => ({ cpu: 32, pool: { cpu: 24, machines: 24 } }) });
+      await measured.save({ organizationId: MANAGED_COMPUTE, provider: 'gcp', apiKey: JSON.stringify({ type: 'service_account', project_id: 'p',
+        client_email: 'a@p.iam.gserviceaccount.com', private_key: (await import('node:crypto')).generateKeyPairSync('rsa', { modulusLength: 2048 })
+          .privateKey.export({ type: 'pkcs8', format: 'pem' }) }) });
+      await measured.test(MANAGED_COMPUTE, 'gcp');
+      const account = async () => (await measured.managedConnections()).find((value) => value.provider === 'gcp')!;
+      // One machine is never more than the whole budget.
+      expect((await account()).limits).toMatchObject({ cpu: 24, pool: { cpu: 24, machines: 24 } });
+      await measured.save({ organizationId: MANAGED_COMPUTE, provider: 'gcp', config: { limits: { pool: { cpu: 12 } } } });
+      expect((await account()).limits).toMatchObject({ cpu: 12, pool: { cpu: 12, machines: 24 }, source: { cpu: 'configured' } });
+    });
   });
 
   it('bills a lease-priced managed provider (Daytona) as managed', async () => {

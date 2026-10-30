@@ -405,16 +405,32 @@ function managedView(value: WorldProviderConnectionView): WorldProviderConnectio
   return { id: `managed:${value.provider}`, organizationId: MANAGED_COMPUTE, provider: value.provider, name: providerName(value.provider),
     credentialHandle: '', config: value.config.region ? { region: value.config.region } : {}, enabled: true,
     status: value.status === 'error' ? 'error' : 'ready', createdAt: value.createdAt, updatedAt: value.updatedAt,
-    credentialConfigured: true, limits: value.limits, features: value.features, managed: true } as WorldProviderConnectionView;
+    // The installation's budget (its CPUs and machines at once) is its own business.
+    credentialConfigured: true, limits: withoutPool(value.limits), features: value.features, managed: true } as WorldProviderConnectionView;
+}
+
+function withoutPool(limits: EffectiveComputerLimits): EffectiveComputerLimits {
+  const { pool: _pool, ...rest } = limits;
+  return rest;
 }
 
 function cleanLimits(value: unknown): WorldProviderConnection['config']['limits'] {
-  if (!value || typeof value !== 'object') return undefined;
-  const raw = value as Record<string, unknown>;
-  const out = Object.fromEntries((['cpu', 'memoryMb', 'diskGb'] as const)
-    .map((key) => [key, Number(raw[key])] as const)
+  const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+  const numbers = (input: Record<string, unknown>, keys: readonly string[]) => Object.fromEntries(keys
+    .map((key) => [key, Number(input[key])] as const)
     .filter(([, number]) => Number.isInteger(number) && number > 0 && number <= 1_000_000));
+  const out: NonNullable<WorldProviderConnection['config']['limits']> = numbers(raw, ['cpu', 'memoryMb', 'diskGb']);
+  // The account's budget, where the provider cannot tell it.
+  const pool = numbers(raw.pool && typeof raw.pool === 'object' ? raw.pool as Record<string, unknown> : {}, ['cpu', 'machines']);
+  if (Object.keys(pool).length) out.pool = pool;
   return Object.keys(out).length ? out : undefined;
+}
+
+/** An organization's most of a managed account's budget while another waits, in percent. */
+export const DEFAULT_MANAGED_SHARE = 50;
+function share(value: unknown): number | undefined {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 1 && number <= 100 ? number : undefined;
 }
 
 function cleanConfig(value: WorldProviderConnection['config'], hosted = false): WorldProviderConnection['config'] {
@@ -441,13 +457,8 @@ function cleanConfig(value: WorldProviderConnection['config'], hosted = false): 
     ...(slug(value.region, 'region') ? { region: slug(value.region, 'region') } : {}),
     ...(slug(value.organization, 'organization') ? { organization: slug(value.organization, 'organization') } : {}),
     ...(limits ? { limits } : {}),
-    ...(maxRunning(value.maxRunning) ? { maxRunning: maxRunning(value.maxRunning) } : {}),
+    ...(share(value.share) ? { share: share(value.share) } : {}),
   };
-}
-
-function maxRunning(value: unknown): number | undefined {
-  const number = Number(value);
-  return Number.isInteger(number) && number > 0 && number <= 100_000 ? number : undefined;
 }
 
 /** A Fly region, Hetzner location, AWS region or Google Cloud zone (`fra`,

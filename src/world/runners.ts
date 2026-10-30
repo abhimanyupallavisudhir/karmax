@@ -24,7 +24,7 @@ const fits = (shape: MachineShape, limits: ComputerLimits): boolean => {
  * (WorldProviderConnectionService). */
 export interface ManagedComputeAccounts {
   funding(organizationId: string | undefined, provider: string): Promise<'managed' | 'own' | undefined>;
-  managedConnections(): Promise<Array<{ provider: string; config: { maxRunning?: number } }>>;
+  managedConnections(): Promise<Array<{ provider: string; config: { share?: number }; limits: { pool?: { cpu?: number; machines?: number } } }>>;
 }
 
 // Private/explicit pools retain physical resource totals. Hosted customer-owned
@@ -101,7 +101,8 @@ export class RunnerPoolService {
       if (input.work) await assertComputeCredit(this.store, input.project.organizationId!, input.provider, Date.now(),
         { shape: config.resources, taskId: input.taskId });
       const account = (await this.managed?.managedConnections())?.find((value) => value.provider === input.provider);
-      await assertManagedRoom(this.store, input.provider, account?.config.maxRunning);
+      if (account) await assertManagedRoom(this.store, input.provider, { pool: account.limits.pool, share: account.config.share },
+        input.project.organizationId!, config.resources?.cpu);
     }
     const month = monthWindow(Date.now());
     const organizationPolicy = (await this.store.getOrganizationExecutionPolicy(input.project.organizationId!));

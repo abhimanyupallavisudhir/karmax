@@ -305,11 +305,14 @@ export class GcpDriver implements VmDriver {
       ...(project.quotas ?? []).filter((entry) => entry.metric === 'CPUS_ALL_REGIONS')]
       .map((entry) => entry.limit).filter((limit) => Number.isFinite(limit) && limit >= 0);
     const quota = quotas.length ? Math.min(...quotas) : undefined;
+    // Machines at once: the region's INSTANCES quota (a new project: 24).
+    const instances = (region.quotas ?? []).find((entry) => entry.metric === 'INSTANCES')?.limit;
     const cpu = Math.min(E2_MAX_CPU, quota !== undefined && quota >= 2 ? Math.floor(quota / 2) * 2 : E2_MAX_CPU);
     // The quota is shared by every machine running at once: the account's pool,
     // which the router weighs against the CPUs already running (compute-router.ts).
     return { cpu, memoryMb: Math.min(E2_MAX_MEMORY_MB, cpu * 8192), diskGb: GCP_MAX_DISK_GB,
-      ...(quota !== undefined ? { pool: { cpu: quota } } : {}), checkedAt: Date.now() };
+      ...(quota !== undefined || instances ? { pool: { ...(quota !== undefined ? { cpu: quota } : {}),
+        ...(instances && Number.isFinite(instances) ? { machines: instances } : {}) } } : {}), checkedAt: Date.now() };
   }
 
   /** The key works, Compute Engine is on, and the project has the default network worlds use. */
