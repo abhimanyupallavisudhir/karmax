@@ -4926,8 +4926,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const organizationId = await projectOrganization();
             if (organizationId) {
               const now = Date.now();
+              // The world as registered now: the handle this wait was given can
+              // predate its size (production, 2026-10-29: a 50 GB disk held as 20).
+              const current = ((await store.currentWorld(handle.id)) ?? handle) as WorldHandle;
               holdEndsAt = await holdManagedCompute(store, { id: holdId!, organizationId, taskId: handle.id, worldId: handle.id,
-                provider: handle.kind, purpose: 'jobs', shape: worldShape(handle as WorldHandle) }, now)
+                provider: handle.kind, purpose: 'jobs', shape: worldShape(current) }, now)
                 .catch((error: Error) => error.name === 'ComputeCreditExhausted' ? now : holdEndsAt);
               if (holdEndsAt <= now) {
                 const spent = (await outOfCompute(store, organizationId, handle.kind)).message;
