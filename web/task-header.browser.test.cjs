@@ -133,8 +133,8 @@ const attempt = (n, extra = {}) => ({
     await open(undefined);
     await page.waitForSelector('#fork-task-agent');
     assert.equal(await page.locator('.tp-views .tab.active').getAttribute('aria-label'), 'Chat');
-    assert.deepEqual(await page.locator('.tp-views .tab').evaluateAll((tabs) => tabs.map((a) => [a.getAttribute('aria-label'), a.textContent.trim(), !!a.querySelector('svg')])),
-      [['Chat', '', true], ['Parameters', '', true]], 'two views, as icons: the conversation and the parameters');
+    assert.deepEqual(await page.locator('.tp-views .tab').evaluateAll((tabs) => tabs.map((a) => [a.getAttribute('aria-label'), a.innerText.trim(), !!a.querySelector('svg')])),
+      [['Chat', 'Chat', true], ['Parameters', 'Parameters', true]], 'two views, icon and label: the conversation and the parameters');
     await shot('task-checkin-toolbar.png', '.task-page .tp-bar');
     const tools = await page.evaluate(() => [...document.querySelectorAll('.ck-tools .btn')]
       .map((el) => Math.round(el.getBoundingClientRect().height)));

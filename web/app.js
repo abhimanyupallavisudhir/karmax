@@ -12905,7 +12905,7 @@ function taskBar(v, tab) {
   const base = taskUrl(v.taskId);
   return `<div class="tp-bar">
     <nav class="tp-views segmented" aria-label="Task view">
-      ${visibleTaskTabs().map((x) => `<a class="tab${x.key === tab ? ' active' : ''}" data-tasktab="${x.key}" href="${esc(base)}/${x.key}" aria-label="${x.label}" title="${x.label}" aria-pressed="${x.key === tab}"${x.key === tab ? ' aria-current="page"' : ''}>${ICON[x.icon]}</a>`).join('')}
+      ${visibleTaskTabs().map((x) => `<a class="tab${x.key === tab ? ' active' : ''}" data-tasktab="${x.key}" href="${esc(base)}/${x.key}" aria-label="${x.label}" title="${x.label}" aria-pressed="${x.key === tab}"${x.key === tab ? ' aria-current="page"' : ''}>${ICON[x.icon]}<span class="tool-label">${x.label}</span></a>`).join('')}
     </nav>
     ${t ? `${conversationBar(v, t)}<span class="tool-sep tp-rail-sep" aria-hidden="true"></span>` : '<span class="tp-bar-fill"></span>'}
     <button type="button" class="btn tool icon tp-rail-toggle" id="tp-rail-toggle" data-shortcut="task.rail" aria-controls="tp-rail" aria-expanded="${taskRailOpen()}" aria-label="Details" title="Details (i)">${ICON.sidebar}</button>

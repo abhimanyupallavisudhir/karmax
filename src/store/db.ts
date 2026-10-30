@@ -8496,15 +8496,22 @@ export class Store {
   }
 
   /** Which of these usage ids are recorded, and whom each is booked to. */
-  async recordedUsageEvents(ids: string[]): Promise<Map<string, { organizationId: string; taskId?: string }>> {
-    const recorded = new Map<string, { organizationId: string; taskId?: string }>();
+  async recordedUsageEvents(ids: string[]): Promise<Map<string, { organizationId: string; taskId?: string; fundingSource?: string }>> {
+    const recorded = new Map<string, { organizationId: string; taskId?: string; fundingSource?: string }>();
     for (let offset = 0; offset < ids.length; offset += 500) {
       const batch = ids.slice(offset, offset + 500);
-      const rows = (await this.db.prepare(`SELECT id, organizationId, taskId FROM usage_events WHERE id IN (${batch.map(() => '?').join(',')})`)
-        .all(...batch)) as Array<{ id: string; organizationId: string; taskId: string | null }>;
-      for (const row of rows) recorded.set(row.id, { organizationId: row.organizationId, ...(row.taskId ? { taskId: row.taskId } : {}) });
+      const rows = (await this.db.prepare(`SELECT id, organizationId, taskId, fundingSource FROM usage_events WHERE id IN (${batch.map(() => '?').join(',')})`)
+        .all(...batch)) as Array<{ id: string; organizationId: string; taskId: string | null; fundingSource: string | null }>;
+      for (const row of rows) recorded.set(row.id, { organizationId: row.organizationId, ...(row.taskId ? { taskId: row.taskId } : {}),
+        ...(row.fundingSource ? { fundingSource: row.fundingSource } : {}) });
     }
     return recorded;
+  }
+
+  /** Rebook a provider usage row that the installation's managed feed booked
+   * as managed although the machine was the organization's own. */
+  async rebookUsageAsOwn(id: string): Promise<void> {
+    (await this.db.prepare("UPDATE usage_events SET fundingSource='byok' WHERE id=? AND fundingSource='managed'").run(id));
   }
 
   /** Move a usage row that no task claimed yet to the organization (and task)

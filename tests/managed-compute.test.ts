@@ -286,6 +286,34 @@ describe('managed compute usage', () => {
     expect(summary).toMatchObject({ costMicros: 133_200, byFundingSource: { managed: 133_200 } });
     expect((await computeCredit(f.store, f.organization.id, Date.UTC(2026, 9, 15))).usedMicros).toBe(266_400);
   });
+
+  it('books an organization\'s own machines as its own when it connected the installation\'s very account', async () => {
+    // Production, 2026-10-30: an organization whose own E2B key is the same
+    // E2B account as the installation's had its own sandboxes, read through
+    // the installation's feed, charged to its compute credit.
+    const f = await fixture();
+    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', apiKey: 'shared-account' });
+    await f.connections.save({ organizationId: f.organization.id, provider: 'e2b', apiKey: 'shared-account' });
+    const [own, managed, earlier] = [await f.task('Own'), await f.task('Managed'), await f.task('Earlier')];
+    // A world made on managed compute before the organization connected its key keeps it.
+    for (const [task, meta] of [[own, {}], [managed, { funding: 'managed' }], [earlier, {}]] as const)
+      await f.store.registerWorld({ id: task.id, kind: 'e2b', root: '/home/user', meta } as any, f.project.id);
+    const hour = (n: number) => Date.UTC(2026, 9, 1, n);
+    const event = (id: string, taskId: string, at: number) => ({ id, sandboxId: `sandbox-${id}`, taskId, organizationId: f.organization.id,
+      startedAt: at, endedAt: at + 3_600_000, activeMs: 3_600_000, cpu: 2, memoryMb: 2048 });
+    // An earlier release booked this one as managed.
+    await f.store.recordUsage({ id: 'usage:e2b:earlier', organizationId: f.organization.id, projectId: f.project.id, taskId: earlier.id,
+      worldId: earlier.id, provider: 'e2b', kind: 'world.active', quantity: 3600, unit: 'second', costMicros: 133_200,
+      startedAt: hour(8), endedAt: hour(9), fundingSource: 'managed' });
+    // One account: both keys read the same feed.
+    const events = [event('own', own.id, hour(10)), event('managed', managed.id, hour(10)), event('earlier', earlier.id, hour(8))];
+    const worlds = new WorldRegistry();
+    worlds.register({ kind: 'e2b', parkable: true, listUsageEvents: async () => ({ events }) } as any);
+    await new WorldLifecycleManager(f.store, worlds, {} as any).sweep(hour(12));
+    expect(await f.store.usageSummary(f.organization.id)).toMatchObject({ costMicros: 3 * 133_200,
+      byFundingSource: { managed: 133_200, byok: 2 * 133_200 } });
+    expect((await computeCredit(f.store, f.organization.id, Date.UTC(2026, 9, 15))).usedMicros).toBe(266_400);
+  });
 });
 
 describe('out-of-compute notices', () => {

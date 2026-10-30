@@ -633,10 +633,10 @@ integration('PostgreSQL cutover', () => {
       expect((await store.recordedUsageEvents([])).size).toBe(0);
       const ids = Array.from({ length: 501 }, (_, i) => `missing-${i}`);
       expect((await store.recordedUsageEvents([...ids, 'usage:e2b:known'])))
-        .toEqual(new Map([['usage:e2b:known', { organizationId: project.organizationId }]]));
+        .toEqual(new Map([['usage:e2b:known', { organizationId: project.organizationId, fundingSource: 'customer' }]]));
       (await store.reattributeUsageEvent('usage:e2b:known', { organizationId: 'org_owner', projectId: project.id, taskId: task.id, worldId: task.id }));
       expect((await store.recordedUsageEvents(['usage:e2b:known'])))
-        .toEqual(new Map([['usage:e2b:known', { organizationId: 'org_owner', taskId: task.id }]]));
+        .toEqual(new Map([['usage:e2b:known', { organizationId: 'org_owner', taskId: task.id, fundingSource: 'customer' }]]));
     } finally { (await store.close()); }
   });
 
