@@ -24,6 +24,8 @@ export class FakeFly {
   private ids = 0;
   /** An organization with no payment method: Fly's free trial. */
   trial = false;
+  /** What Fly answers a new machine when it has no room for it (an organization's machine limit, a full region). */
+  refuseMachines: { status: number; error: string } | undefined;
   /** Fly's eventual consistency: this many GETs of a just-created machine answer 404. */
   notFoundAfterCreate = 0;
   private unseen = new Map<string, number>();
@@ -106,6 +108,7 @@ export class FakeFly {
     }
     if (kind !== 'machines') return json(404, { error: 'not found' });
     if (method === 'POST' && !id) {
+      if (this.refuseMachines) return json(this.refuseMachines.status, { error: this.refuseMachines.error });
       const machine = { id: `m_${++this.ids}`, app: appName, region: body.region, state: 'created', config: body.config, events: [] as any[] };
       this.machines.set(machine.id, machine);
       if (this.notFoundAfterCreate) this.unseen.set(machine.id, this.notFoundAfterCreate);

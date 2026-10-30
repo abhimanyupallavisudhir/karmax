@@ -6,6 +6,7 @@ import type { VmAllocation, VmBootKeys, VmDriver, VmListing, VmShape } from './v
 import { VM_ETC, VM_HOME, VM_SSH_PORT, vmBootScript } from './vm/provision.js';
 import { PublishedVmImage } from './vm/image.js';
 import { diskHours, FINAL_USAGE_WINDOW_MS, type FinalUsage } from './vm/runs.js';
+import { ProviderCapacityFull } from '../agent/limits.js';
 
 /**
  * Fly.io Machines as VM worlds (`vm/provider.ts`). One Fly app per world: the
@@ -101,7 +102,7 @@ export class FlyDriver implements VmDriver {
       const evidence = created ? await this.evidence(connection, app, created) : '';
       await api('DELETE', `/apps/${app}?force=true`).catch(() => undefined);
       if (evidence && error instanceof Error) error.message = `${error.message} (${evidence})`;
-      throw error;
+      throw flyFull(error) ?? error;
     }
   }
 
@@ -123,7 +124,7 @@ export class FlyDriver implements VmDriver {
     if (machine.state !== 'started' && machine.state !== 'starting')
       await api('POST', `/apps/${ref.app}/machines/${ref.machine}/start`).catch((error) => {
         // Fly pins a machine with a volume to that volume's host; a larger size can find it full.
-        if (/insufficient|capacity/i.test(String(error))) throw new Error(`Fly.io has no room for this machine on its volume's host: ${String(error)}`);
+        if (/insufficient|capacity/i.test(String(error))) throw new ProviderCapacityFull(`Fly.io has no room for this machine on its volume's host: ${String(error)}`, { cause: error });
         throw error;
       });
     await this.waitFor(connection, ref.app!, ref.machine!, 'started');
@@ -336,6 +337,14 @@ export class FlyDriver implements VmDriver {
       }
     };
   }
+}
+
+/** Fly refusing a machine for want of room: the organization's machine limit
+ * (50 unless billing@fly.io raises it) or a region with no capacity. The task
+ * then waits for a machine, or Any tries the next provider, as for any full one. */
+function flyFull(error: unknown): ProviderCapacityFull | undefined {
+  if (!(error instanceof FlyError) || !/machine limit|insufficient (resources|capacity)|no capacity/i.test(error.message)) return undefined;
+  return new ProviderCapacityFull(`Fly.io has no room for a new machine just now: ${error.message}`, { cause: error });
 }
 
 export class FlyError extends Error {
