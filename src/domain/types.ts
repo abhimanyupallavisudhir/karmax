@@ -412,8 +412,6 @@ export interface WorldProviderConnection {
     /** Managed compute: the most of the account's budget one organization may
      * hold while another waits for room, in percent (default 50). */
     share?: number;
-    /** Before 2026-10-30: machines at once, now `limits.pool.machines`. */
-    maxRunning?: number;
   };
   /** What the provider account itself said it allows, from a probe or a
    * refused build (src/world/provider-limits.ts). */

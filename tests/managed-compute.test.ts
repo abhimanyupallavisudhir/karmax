@@ -63,7 +63,7 @@ describe('managed compute accounts', () => {
     await expect(f.connections.resolve(f.organization.id, 'e2b')).rejects.toThrow(/not connected/);
     expect(await f.connections.funding(f.organization.id, 'e2b')).toBeUndefined();
 
-    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', apiKey: 'operator-key', config: { maxRunning: 20 } });
+    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', apiKey: 'operator-key', config: {} });
     const managed = await f.connections.resolve(f.organization.id, 'e2b');
     expect(managed).toMatchObject({ apiKey: 'operator-key', managed: true, organizationId: f.organization.id });
     expect(await f.connections.funding(f.organization.id, 'e2b')).toBe('managed');
@@ -224,19 +224,18 @@ describe('managed compute admission', () => {
       await expect(g.ours()).rejects.toBeInstanceOf(ManagedComputeBusy);
     });
 
-    it('reads machines at once saved before the budget (maxRunning) as its machines, until limits are saved anew', async () => {
+    // Owner, 2026-10-30: no limits besides the providers'. The machines at once
+    // entered before (tavya's own caution) are not a budget; each provider's
+    // own refusal makes a task wait or move instead.
+    it('ignores machines at once saved before the budget, and drops it at the next save', async () => {
       const f = await two({});
       const row = (await f.store.getWorldProviderConnection(MANAGED_COMPUTE, 'e2b'))!;
-      await f.store.upsertWorldProviderConnection({ ...row, config: { ...row.config, maxRunning: 1 } });
-      expect((await f.connections.managedConnections())[0]!.limits.pool).toEqual({ machines: 1 });
-      await f.ours();
-      expect(await f.theirs().catch((error) => error)).toBeInstanceOf(ManagedComputeBusy);
-      // Saving limits without it clears it; saving anything else keeps it.
-      await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', config: { region: 'us' } });
-      expect((await f.connections.managedConnections())[0]!.limits.pool).toEqual({ machines: 1 });
-      await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', config: { limits: {} } });
+      await f.store.upsertWorldProviderConnection({ ...row, config: { ...row.config, maxRunning: 1 } as any });
       expect((await f.connections.managedConnections())[0]!.limits.pool).toBeUndefined();
-      expect((await f.store.getWorldProviderConnection(MANAGED_COMPUTE, 'e2b'))!.config.maxRunning).toBeUndefined();
+      await f.ours();
+      await expect(f.theirs()).resolves.toBeDefined();
+      await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', config: { region: 'us' } });
+      expect((await f.store.getWorldProviderConnection(MANAGED_COMPUTE, 'e2b'))!.config).not.toHaveProperty('maxRunning');
     });
 
     it('takes a budget the provider tells, and an entered one over it', async () => {

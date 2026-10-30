@@ -24518,7 +24518,7 @@ function openComputerDialog(provider, connection, organizationId, onSaved, { man
     <div class="modal-head"><b>${esc(info.name)}</b>${info.tip ? policyTip(info.tip) : ''}<span class="label-row-fill"></span><button class="icon-btn computer-close" type="button" aria-label="Close">×</button></div>
     ${computerKeyMarkup(info, connection)}
     ${managed ? `<div class="settings-grid">${[['cpu', 'CPUs at once'], ['machines', 'Machines at once']].map(([key, label]) => {
-        const own = config.limits?.pool?.[key] ?? (key === 'machines' ? config.maxRunning : undefined);
+        const own = config.limits?.pool?.[key];
         const known = connection?.limits?.pool?.[key];
         return `<label class="form-row"><span>${label} ${key === 'cpu' ? policyTip(`How much of the account may run at once. Google Cloud, AWS and Daytona tell it themselves; enter it where they can’t (Hetzner’s CPU limit, E2B’s and Fly.io’s machine counts). Beyond it, tasks wait for a machine.`) : ''}</span>
           <input data-pool="${key}" type="number" min="1" step="1" inputmode="numeric" value="${esc(own ?? '')}" placeholder="${esc(own == null && known ? `${known} (${info.name})` : 'No limit')}"></label>`;

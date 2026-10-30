@@ -1,7 +1,7 @@
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
 import { isAnyProvider, type MachineShape } from '../domain/computer.js';
-import { accountFeatures, assertComputerFits, computerLimits, configuredLimits, type ComputerFeatures, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
+import { accountFeatures, assertComputerFits, computerLimits, type ComputerFeatures, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
 import type { WorldProviderConnection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { probeDaytonaLimits, probeE2BLimits } from './provider-limits.js';
@@ -31,7 +31,7 @@ export async function worldAccountLimits(store: Store, world: { kind: string; me
   const scope = world.meta?.funding === 'managed' ? MANAGED_COMPUTE : organizationId;
   const connection = await store.getWorldProviderConnection(scope, world.kind)
     ?? (scope === organizationId ? await store.getWorldProviderConnection(MANAGED_COMPUTE, world.kind) : undefined);
-  return computerLimits(world.kind, connection?.measuredLimits, configuredLimits(connection?.config));
+  return computerLimits(world.kind, connection?.measuredLimits, connection?.config.limits);
 }
 
 /** What a sealed reference records about the account a world was made on. */
@@ -90,7 +90,7 @@ export class WorldProviderConnectionService {
   private async view(value: WorldProviderConnection): Promise<WorldProviderConnectionView> {
     const { measuredLimits, ...rest } = value;
     return { ...rest, credentialConfigured: await this.broker.hasHandle(value.credentialHandle),
-      limits: computerLimits(value.provider, measuredLimits, configuredLimits(value.config)), features: accountFeatures(value.provider, measuredLimits) };
+      limits: computerLimits(value.provider, measuredLimits, value.config.limits), features: accountFeatures(value.provider, measuredLimits) };
   }
 
   /** Every connection, with its limits. One never asked is asked now (briefly
@@ -152,7 +152,7 @@ export class WorldProviderConnectionService {
     let value = organizationId ? await this.store.getWorldProviderConnection(organizationId, provider) : undefined;
     if (!value && organizationId && await this.funding(organizationId, provider) === 'managed')
       value = await this.store.getWorldProviderConnection(MANAGED_COMPUTE, provider);
-    return computerLimits(provider, value?.measuredLimits, configuredLimits(value?.config));
+    return computerLimits(provider, value?.measuredLimits, value?.config.limits);
   }
 
   /** Refuse a size this organization's account cannot give, before any machine is made. */
@@ -199,9 +199,7 @@ export class WorldProviderConnectionService {
     const handle = existing?.credentialHandle ?? worldProviderCredentialHandle(input.organizationId, input.provider);
     // Validate every non-secret field before rotating the vault handle. A bad
     // endpoint must leave the previous working credential/config untouched.
-    // Limits sent anew replace a budget saved the old way (`maxRunning`), so clearing it clears it.
-    const { maxRunning: legacy, ...kept } = existing?.config ?? {};
-    const config = cleanConfig({ ...kept, ...(input.config?.limits ? {} : { maxRunning: legacy }), ...(input.config ?? {}) }, this.store.hosted);
+    const config = cleanConfig({ ...(existing?.config ?? {}), ...(input.config ?? {}) }, this.store.hosted);
     const key = input.apiKey?.trim();
     // A key in the wrong form is refused here, not at the first machine.
     if (key && input.provider === 'aws') (await import('./aws.js')).awsCredentials(key);
@@ -238,7 +236,7 @@ export class WorldProviderConnectionService {
         ...(organizationId === MANAGED_COMPUTE ? { managed: true } : {}),
         apiKey: await this.broker.resolve(value.credentialHandle, { caps: [`use-credential:${value.credentialHandle}`] }),
         config: cleanConfig(value.config, this.store.hosted),
-        limits: computerLimits(provider, value.measuredLimits, configuredLimits(value.config)),
+        limits: computerLimits(provider, value.measuredLimits, value.config.limits),
         recordLimits: (limits) => this.recordLimits(organizationId!, provider, limits),
       };
     }
@@ -416,15 +414,14 @@ function withoutPool(limits: EffectiveComputerLimits): EffectiveComputerLimits {
   return rest;
 }
 
-function cleanLimits(value: unknown, legacyMachines?: unknown): WorldProviderConnection['config']['limits'] {
+function cleanLimits(value: unknown): WorldProviderConnection['config']['limits'] {
   const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {};
   const numbers = (input: Record<string, unknown>, keys: readonly string[]) => Object.fromEntries(keys
     .map((key) => [key, Number(input[key])] as const)
     .filter(([, number]) => Number.isInteger(number) && number > 0 && number <= 1_000_000));
   const out: NonNullable<WorldProviderConnection['config']['limits']> = numbers(raw, ['cpu', 'memoryMb', 'diskGb']);
-  // The account's budget; machines at once saved before it (`maxRunning`) become its machines.
+  // The account's budget, where the provider cannot tell it.
   const pool = numbers(raw.pool && typeof raw.pool === 'object' ? raw.pool as Record<string, unknown> : {}, ['cpu', 'machines']);
-  if (pool.machines === undefined && maxRunning(legacyMachines)) pool.machines = maxRunning(legacyMachines)!;
   if (Object.keys(pool).length) out.pool = pool;
   return Object.keys(out).length ? out : undefined;
 }
@@ -438,7 +435,7 @@ function share(value: unknown): number | undefined {
 
 function cleanConfig(value: WorldProviderConnection['config'], hosted = false): WorldProviderConnection['config'] {
   const one = (input: unknown, max = 500) => typeof input === 'string' && input.trim() ? input.trim().slice(0, max) : undefined;
-  const limits = cleanLimits(value.limits, value.maxRunning);
+  const limits = cleanLimits(value.limits);
   const apiUrl = one(value.apiUrl);
   if (apiUrl) {
     const url = new URL(apiUrl);
@@ -462,11 +459,6 @@ function cleanConfig(value: WorldProviderConnection['config'], hosted = false): 
     ...(limits ? { limits } : {}),
     ...(share(value.share) ? { share: share(value.share) } : {}),
   };
-}
-
-function maxRunning(value: unknown): number | undefined {
-  const number = Number(value);
-  return Number.isInteger(number) && number > 0 && number <= 100_000 ? number : undefined;
 }
 
 /** A Fly region, Hetzner location, AWS region or Google Cloud zone (`fra`,

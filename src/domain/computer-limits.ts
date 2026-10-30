@@ -184,14 +184,6 @@ export function providerDefaults(provider: string): Required<MachineShape> | und
 /** What a person entered for an account: per-machine limits and its budget. */
 export type ConfiguredLimits = Partial<Record<LimitKey, number>> & { pool?: { cpu?: number; machines?: number } };
 
-/** An account's entered limits, with a budget saved before 2026-10-30 (its
- * machines at once, `maxRunning`) read as `pool.machines`. */
-export function configuredLimits(config: { limits?: ConfiguredLimits; maxRunning?: number } | undefined): ConfiguredLimits | undefined {
-  const legacy = config?.maxRunning;
-  if (!positive(legacy) || positive(config?.limits?.pool?.machines)) return config?.limits;
-  return { ...config?.limits, pool: { ...config?.limits?.pool, machines: legacy } };
-}
-
 /** Configured over measured over documented, per limit; a machine is never
  * allowed more than the account's whole pool (configured over measured too).
  * Providers without an account (this machine, Docker) have no limits. */

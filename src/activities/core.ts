@@ -115,7 +115,7 @@ import { publicShare, publicConversationHtml } from '../gateway/conversation-sha
 import { isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome, readRemoteImport, RemoteAgentCliUnavailable } from '../agent/remote-process.js';
 import { checkWorldDisk, diskNotice, diskRatio, diskWasFull, DISK_REARM_RATIO, DISK_WARN_RATIO, isDiskFullMessage, largestWorldPaths,
   outOfDiskMessage, worldUsage, type DiskCheck } from '../world/disk.js';
-import { computerLimits, configuredLimits } from '../domain/computer-limits.js';
+import { computerLimits } from '../domain/computer-limits.js';
 import { materializeFileAttachments } from '../agent/files.js';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -760,7 +760,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   async function accountLimits(organizationId: string, kind: string) {
     const connection = await store.getWorldProviderConnection(organizationId, kind).catch(() => undefined)
       ?? await store.getWorldProviderConnection(MANAGED_COMPUTE, kind).catch(() => undefined);
-    return computerLimits(kind, connection?.measuredLimits, configuredLimits(connection?.config));
+    return computerLimits(kind, connection?.measuredLimits, connection?.config.limits);
   }
 
   /** The largest disk the account is known to allow; a documented default is
