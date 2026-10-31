@@ -4520,7 +4520,7 @@ function setupFix(text) {
   const raw = String(text || '');
   const settings = globalRoute('organization');
   if (/\bOut of compute\b/.test(raw)) return { label: 'Get compute', href: `${settings}#settings-plan` };
-  if (/No computer is connected|under Settings → Computers/i.test(raw)) return { label: 'Connect a computer', href: `${settings}#settings-computers` };
+  if (/No computer (?:is connected|this organization can use fits)/.test(raw)) return { label: 'Connect a computer', href: `${settings}#settings-computers` };
   if (/No usable \S+ credential|has no usable .* credential|^No \S+ credential\b|Every allowed credential needs attention/i.test(raw))
     return { label: 'Manage accounts', href: `${settings}#settings-agents` };
   if (/GitHub PR identity is not connected|Connect GitHub on your profile|reconnect GitHub on your profile/i.test(raw))
