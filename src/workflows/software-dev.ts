@@ -16,6 +16,7 @@ import {
   CancellationScope,
   isCancellation,
   ApplicationFailure,
+  TemporalFailure,
   ParentClosePolicy,
   log,
   patched,
@@ -39,6 +40,7 @@ import {
   participantLabel, participantRole, reviewerKey, selectorAgent,
 } from '../domain/participants.js';
 import { resetAtFromHint } from '../agent/limits.js';
+import { failureText } from '../domain/failure-text.js';
 import { isCapacityFailure, isInfraFailure, limitFailureClassification, CAPACITY_WAIT_MS, CAPACITY_WAIT_LIMIT_MS, INFRA_BACKOFF_MS, WORLD_WAIT_MS, WORLD_WAIT_LIMIT_MS } from './failures.js';
 import {
   TaskInput,
@@ -433,6 +435,10 @@ const CONTINUE_AFTER_BYTES = 4 * 1024 * 1024;
 const CONTINUE_AFTER_EVENTS_BEFORE = 4_000;
 const CONTINUE_AFTER_BYTES_BEFORE = 8 * 1024 * 1024;
 const CONTINUE_SOONER = 'software-dev-continue-sooner-v1';
+/** A run that fails publishes why, and the stage Retry resumes, before it
+ * closes: the reconciler used to settle it a minute later as "workflow
+ * failed", with the cause left in Temporal's history (pramana#13, #137). */
+const FAILURE_NAMES_CAUSE = 'software-dev-failure-names-cause-v1';
 /** A continuation input is recorded by value: stay well inside the 2 MB payload limit. */
 const MAX_CONTINUATION_BYTES = 1024 * 1024;
 const CONTINUE_RETRY_EVENTS = 500;
@@ -943,6 +949,7 @@ async function softwareDevImpl(
   let reviewInfo: ReviewInfo | undefined = recovery?.reviewInfo;
   let error: string | undefined = continued?.error;
   let terminalOrigin: Stage | undefined;
+  let failedFrom: Stage | undefined;
   let prs: TaskPullRequest[] = recovery?.prs?.map((candidate) => ({ ...candidate })) ?? [];
   let pr: TaskPullRequest | undefined = prs[0];
   const prHeadMap = (items: TaskPullRequest[]): Record<string, string> => Object.fromEntries(
@@ -1519,6 +1526,7 @@ async function softwareDevImpl(
         // createWorld would force-remove the dirty worktree and lose work.
         recoveryWorld: world,
         ...(terminalOrigin ? { cancelledFrom: terminalOrigin } : {}),
+        ...(failedFrom ? { failedFrom } : {}),
         ...(humanPauseActive ? { humanPauseOrigin: recoveryStage } : {}),
         ...(interlocksLandingTransitions && lifecycleTransitionBlocked ? { lifecycleTransitionBlocked: true } : {}),
       },
@@ -6556,10 +6564,23 @@ Inspect the complete current diff and specifically compare its delta from the re
   return { stage, sha };
   } catch (e) {
     if (e instanceof Cancelled || (isCancellation(e) && cancelled)) return await abort();
+    // Only a Temporal failure fails the run; anything else (a bug) fails the
+    // workflow task, which Temporal retries, so the run is not over.
+    if (e instanceof TemporalFailure && patched(FAILURE_NAMES_CAUSE)) await publishFailure(e);
     throw e;
   }
 
   // ── helpers ──
+  /** Say why the run failed, and where Retry picks it up, before it closes. */
+  async function publishFailure(e: unknown) {
+    failedFrom = multiAgent && stage === 'escalated' && escalatedFrom ? escalatedFrom : stage;
+    stage = 'failed';
+    status = 'failed';
+    waitingFor = undefined;
+    error = `workflow failed${failureText(e)}`;
+    await publish().catch(() => undefined);
+  }
+
   async function abort() {
     // Whatever happens to the world now happens to all of it.
     if (fullWorld) { world = fullWorld; fullWorld = undefined; }

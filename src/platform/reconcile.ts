@@ -4,6 +4,7 @@ import { TerminatedFailure } from '@temporalio/common';
 import { Store } from '../store/db.js';
 import { TaskView, TaskRecord } from '../domain/types.js';
 import { withTimeout } from '../util/timeout.js';
+import { failureText } from '../domain/failure-text.js';
 import { notifyChildSettlement } from './child-settlement.js';
 
 const TERMINAL = ['done', 'failed', 'cancelled'];
@@ -147,24 +148,24 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
           }
           return;
         }
-        let terminationReason: string | undefined;
-        if (name === 'TERMINATED') {
+        let closeReason: string | undefined;
+        if (name === 'TERMINATED' || name === 'FAILED') {
           try {
             // result() requests only the close event, not a potentially 50MB
             // history. Bind to the described run in case recovery starts another.
             await withTimeout(client.workflow.getHandle(t.id, desc.runId).result(), DESCRIBE_TIMEOUT_MS);
           } catch (error) {
             if (error instanceof WorkflowFailedError && error.cause instanceof TerminatedFailure)
-              terminationReason = error.cause.message;
-            // Diagnostics failure must not turn a known termination into "lost".
+              closeReason = `workflow terminated: ${error.cause.message}`;
+            else if (error instanceof WorkflowFailedError && error.cause)
+              closeReason = `workflow failed${failureText(error.cause)}`;
+            // Diagnostics failure must not turn a known close into "lost".
           }
         }
         const next: TaskView =
           name === 'COMPLETED'
             ? { ...base, status: 'done', stage: 'done', updatedAt: base.updatedAt }
-            : { ...failedView(base), error: terminationReason
-              ? `workflow terminated: ${terminationReason}`
-              : base.error ?? `workflow ${name.toLowerCase()}`, updatedAt: base.updatedAt };
+            : { ...failedView(base), error: closeReason ?? base.error ?? `workflow ${name.toLowerCase()}`, updatedAt: base.updatedAt };
         (await settle(t.id, next));
         settled++;
       } catch (e) {
