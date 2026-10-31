@@ -4514,9 +4514,44 @@ function plainTaskError(text) {
   const plain = /[.!?]$/.test(summary) || !summary ? summary : `${summary}.`;
   return { summary: plain + retrying, detail: plain + retrying === raw ? '' : raw };
 }
+// Where a person fixes what a task stopped or waits on, when it is a setting:
+// an agent account, a computer, compute credit, GitHub.
+function setupFix(text) {
+  const raw = String(text || '');
+  const settings = globalRoute('organization');
+  if (/\bOut of compute\b/.test(raw)) return { label: 'Get compute', href: `${settings}#settings-plan` };
+  if (/No computer is connected|under Settings → Computers/i.test(raw)) return { label: 'Connect a computer', href: `${settings}#settings-computers` };
+  if (/No usable \S+ credential|has no usable .* credential|^No \S+ credential\b|Every allowed credential needs attention/i.test(raw))
+    return { label: 'Manage accounts', href: `${settings}#settings-agents` };
+  if (/GitHub PR identity is not connected|Connect GitHub on your profile|reconnect GitHub on your profile/i.test(raw))
+    return { label: 'Connect GitHub', href: '/profile' };
+  if (/connect GitHub in organization settings/i.test(raw)) return { label: 'Connect GitHub', href: `${settings}#settings-code` };
+  return null;
+}
+function setupFixHtml(text) {
+  const fix = setupFix(text);
+  return fix ? ` <a class="btn sm setup-fix" data-spa href="${esc(fix.href)}">${esc(fix.label)}</a>` : '';
+}
+// An error shown in place of what failed to load: the plain sentence, the
+// exact text on hover (for whoever reports it).
+function inlineErrorHtml(error) {
+  const raw = String(error?.message ?? error ?? '');
+  const plain = plainError(error);
+  return plain === raw ? esc(plain) : `<span title="${esc(raw)}">${esc(plain)}</span>`;
+}
 function taskErrorHtml(text) {
   const { summary, detail } = plainTaskError(text);
-  return `<div class="msg-text">${esc(summary)}</div>${detail ? `<details class="error-details"><summary>Details</summary><pre>${esc(detail)}</pre></details>` : ''}`;
+  return `<div class="msg-text">${esc(summary)}${setupFixHtml(text)}</div>${detail ? `<details class="error-details"><summary>Details</summary><pre>${esc(detail)}</pre></details>` : ''}`;
+}
+
+// Why a sign-in was refused, in words: a wrong password is only one reason.
+async function signInRefusal(res) {
+  if (res.status === 401) return 'Invalid email or password';
+  if (res.status === 429) return 'Too many attempts. Wait a few minutes, then try again.';
+  const body = await res.json().catch(() => ({}));
+  const said = String(body.error || body.message || '').trim();
+  if (res.status >= 500 || !said) return plainError(`HTTP ${res.status}`);
+  return /[.!?]$/.test(said) ? said : `${said.charAt(0).toUpperCase()}${said.slice(1)}.`;
 }
 
 function toast(msg, err = false, action) {
@@ -4551,6 +4586,20 @@ function toast(msg, err = false, action) {
   $('#toasts').appendChild(t);
   setTimeout(() => t.remove(), action ? 6500 : err ? 9000 : 3200);
 }
+
+// A request that failed where nothing caught it (a handler without its own
+// error path) is still told, instead of failing silently. Only failed
+// requests: any other stray rejection is a bug for the console log, not news
+// for the person. A sign-out (401) already shows the sign-in page.
+function unhandledRequestFailure(reason) {
+  const message = String(reason?.message ?? '');
+  const request = typeof reason?.status === 'number' || /^(?:Failed to fetch|Load failed|NetworkError)/i.test(message);
+  return request && reason?.status !== 401 && message !== 'unauthorized' ? message || `HTTP ${reason.status}` : '';
+}
+window.addEventListener('unhandledrejection', (event) => {
+  const message = unhandledRequestFailure(event.reason);
+  if (message) toast(message, true);
+});
 
 function showTaskError(error, projectId) {
   const message = error?.message || String(error);
@@ -8220,6 +8269,8 @@ function wireTasksView() {
 // `template`: start from a task template instead of the Task defaults alone.
 function openNewTaskForm(template) {
   const projectId = newTaskTarget();
+  // A task lives in a project: with none yet, make one first.
+  if (!projectId) return toast('Create a project first', false, { label: 'New project', fn: () => newProject() });
   openTaskForm(template?.workflow || NEW_TASK_WORKFLOW, undefined, '', template?.params,
     { ...(projectId ? { projectId } : {}), ...(template ? { template } : {}) });
 }
@@ -8399,7 +8450,7 @@ async function hydrateTemplatesCard(card) {
   try {
     list = scope === 'project' ? await projectTemplates(projectId, true)
       : await api(`/api/organizations/${encodeURIComponent(organizationId)}/templates`);
-  } catch (e) { if (current()) rows.innerHTML = `<div class="setting-muted">${esc(e.message)}</div>`; return; }
+  } catch (e) { if (current()) rows.innerHTML = `<div class="setting-muted">${inlineErrorHtml(e)}</div>`; return; }
   if (!current()) return;
   // An organization's template is edited in its settings; a project shows where.
   const orgLink = `${globalRoute('organization', organizationById(organizationId) || currentOrg())}#settings-defaults`;
@@ -9058,6 +9109,55 @@ function taskFormLoadingPage(project, draft, title) {
   </div>`;
 }
 
+// What a task in this project still lacks before it can start — an account for
+// each of its agents, a computer — as links to where each is set up. Empty when
+// nothing is missing, or when the answer is unknown (it never blocks the form).
+function readinessGaps(readiness) {
+  if (!readiness) return [];
+  const settings = globalRoute('organization');
+  const gaps = [];
+  const harnesses = [...new Set((readiness.agents || []).filter((a) => !a.ready).map((a) => a.provider))];
+  for (const harness of harnesses) {
+    const name = ACCOUNT_PROVIDER_LABELS[harness] || harness;
+    gaps.push({ label: `Add a ${name} account`, href: `${settings}#settings-agents`,
+      tip: `No ${name} login or API key is switched on for this project.` });
+  }
+  const compute = readiness.compute;
+  if (compute && !compute.ready) gaps.push(compute.outOfCredit
+    ? { label: 'Get compute', href: `${settings}#settings-plan`, tip: compute.outOfCredit }
+    : { label: 'Connect a computer', href: `${settings}#settings-computers`, tip: 'There is nowhere for this task to run yet.' });
+  return gaps;
+}
+function readinessNoticeHtml(gaps) {
+  return gaps.length ? `<span class="tf-ready-mark" aria-hidden="true">!</span><span>Can’t start yet:</span> ${gaps
+    .map((gap) => `<a data-spa href="${esc(gap.href)}" title="${esc(gap.tip)}">${esc(gap.label)}</a>`).join('<span class="tf-ready-sep" aria-hidden="true">·</span>')}` : '';
+}
+// Keeps the task form's readiness notice in step with the agents it names.
+function wireTaskReadiness(page, projectId) {
+  const el = page?.querySelector('#tf-ready');
+  if (!el || !projectId) return;
+  let asked = null;
+  const refresh = async () => {
+    const agents = [...page.querySelectorAll('.agent-field')].map((box) => {
+      const spec = readAgentSpec(box);
+      return spec.provider ? `${spec.provider}${spec.model ? `:${spec.model}` : ''}` : '';
+    }).filter(Boolean);
+    const query = new URLSearchParams(agents.map((agent) => ['agent', agent])).toString();
+    if (query === asked) return;
+    asked = query;
+    const readiness = await api(`/api/projects/${encodeURIComponent(projectId)}/readiness?${query}`).catch(() => null);
+    if (asked !== query || !el.isConnected) return;
+    const html = readinessNoticeHtml(readinessGaps(readiness));
+    el.innerHTML = html;
+    el.hidden = !html;
+  };
+  let timer = null;
+  const later = () => { clearTimeout(timer); timer = setTimeout(refresh, 250); };
+  page.addEventListener('change', later);
+  page.addEventListener('click', later);
+  refresh();
+}
+
 // Identity of the task form currently mounted in the overlay. Opening a new form
 // bumps this, so a still-pending debounced auto-save from a PRIOR form instance can
 // tell it has been superseded and bail — otherwise its timer fires against the new
@@ -9229,6 +9329,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         <div class="tf-foot-inner">
           ${templateEdit ? '<span class="tf-hint"></span>' : `<button class="btn ghost" id="tf-save-template" title="Save this form as a template, to start new tasks from" aria-label="Save as template">${ICON.template}<span class="tf-save-template-label">Save as template</span></button>
           <span class="tf-hint">${store ? storeFormHint(store) : ''}</span>
+          <span class="tf-ready" id="tf-ready" role="status" hidden></span>
           <button class="btn" id="tf-save-avatar" ${values.avatar ? '' : 'hidden'}>Save as Avatār without running</button>
           <button class="btn" id="tf-draft">Save draft</button>`}
           <button class="btn primary" id="tf-queue">${templateEdit ? 'Save template' : editInPlace ? 'Save' : store?.repeatable && values.repeatable ? 'Install' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
@@ -9236,6 +9337,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       </div>
     </div>`;
   const mainPaymentsReady = wireTaskPayments($('#tf-payments'), projectId, values.paymentPolicy);
+  wireTaskReadiness($('#tf-page'), projectId);
   const formKeyController = new AbortController();
   activeTaskFormKeyController = formKeyController;
   const releaseFormKeys = () => {
@@ -10035,10 +10137,13 @@ function renderTaskLoadingPage(rec, error, notStarted = false) {
       ${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}
       <h2>${esc(title)}</h2>
     </div></div>
-    <div class="tf-loading" role="status">${notStarted
+    <div class="tf-loading" role="status">${notStarted && !rec
+      // Nothing by this id in the list or on the server: no Refresh will bring it.
+      ? '<div class="task-load-error"><b>No such task</b><span>It was deleted, or you can’t see it.</span></div>'
+      : notStarted
       ? '<div class="task-load-error"><b>Not started yet</b><button class="btn sm" id="task-load-retry">Refresh</button></div>'
       : error
-      ? `<div class="task-load-error"><b>Couldn’t load this task</b><span>${esc(error)}</span><button class="btn sm" id="task-load-retry">Try again</button></div>`
+      ? `<div class="task-load-error"><b>Couldn’t load this task</b><span title="${esc(error)}">${esc(plainError(error))}</span><button class="btn sm" id="task-load-retry">Try again</button></div>`
       : '<span class="global-search-loading">Loading task…</span>'}</div>
   </div>`;
   $('#tp-back')?.addEventListener('click', plainClick(closeTask));
@@ -13619,7 +13724,9 @@ function presenceDetail(v) {
   if (!w) return '';
   const raw = (['account', 'agentSlot'].includes(w.kind) || (w.kind === 'retry' && w.summary)) && typeof w.detail === 'string' ? w.detail.trim() : '';
   // A retry waits out an error: say it the way the task's error box does.
-  const detail = raw && w.kind === 'retry' ? plainTaskError(raw).summary : raw;
+  const detail = raw && w.kind === 'retry' ? plainTaskError(raw).summary
+    // The coordinator names a harness by its id ("No claude credential"); say it the way Settings does.
+    : raw.replace(/^No (\w+) credential\b/, (_, id) => `No ${ACCOUNT_PROVIDER_LABELS[id] || id} account`);
   return [detail, w.earliestResetAt ? `Earliest ${fmtReset(w.earliestResetAt)}` : ''].filter(Boolean).join(' · ');
 }
 
@@ -13883,7 +13990,7 @@ async function cliHandoffDialog({ command, note, gitOnly }) {
     loaded = true;
     const body = opened.host.querySelector('.local-git-only-body');
     try { await gitOnly(body); }
-    catch (error) { loaded = false; body.innerHTML = `<p class="task-sub" role="alert">${esc(error.message)}</p>`; }
+    catch (error) { loaded = false; body.innerHTML = `<p class="task-sub" role="alert">${inlineErrorHtml(error)}</p>`; }
   });
   return opened;
 }
@@ -13913,7 +14020,7 @@ async function openLocalCheckout(v) {
           const refreshed = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/refresh-from-github`, { method: 'POST', body: '{}' });
           result.textContent = `${refreshed.updated.length} repositor${refreshed.updated.length === 1 ? 'y' : 'ies'} refreshed${refreshed.parked ? ' and world parked' : ''}.${refreshed.warning ? ` ${refreshed.warning}` : ''}`;
           await refreshTask();
-        } catch (error) { result.textContent = error.message; button.disabled = false; }
+        } catch (error) { result.textContent = plainError(error); button.disabled = false; }
       });
     },
   });
@@ -14223,7 +14330,7 @@ function conversationWaitNotice(v) {
   if (w?.kind === 'account' && typeof w.detail === 'string' && w.detail.startsWith('Held'))
     return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))} <button type="button" class="btn sm ghost" data-run-now="${esc(v.taskId)}" title="${esc(RUN_NOW_TIP)}">Run now</button></div>`;
   const detail = presenceDetail(v);
-  return detail ? `<div class="msg system wait-notice" role="status">${esc(waitingText(v.waitingFor))} · ${esc(detail)}</div>` : '';
+  return detail ? `<div class="msg system wait-notice" role="status">${esc(waitingText(v.waitingFor))} · ${esc(detail)}${setupFixHtml(w?.detail)}</div>` : '';
 }
 
 // A targeted human hold carries the actual question a person must answer. Keep
@@ -14309,7 +14416,7 @@ async function runLoginFlow(out, { organizationId, provider, account, modelProvi
       method: 'POST',
       body: JSON.stringify({ provider, account, browserMcp: 'none', modelProvider, authMethod, force: true }),
     });
-  } catch (e) { out.textContent = e.message; out.style.color = 'var(--bad, crimson)'; return false; }
+  } catch (e) { out.textContent = plainError(e); out.style.color = 'var(--bad, crimson)'; return false; }
   if (r.status === 'logged_in') { show('🟢 Already signed in.', 'var(--ok, green)'); onSignedIn?.(); return true; }
   if (r.status !== 'awaiting_oauth' || !r.loginUrl) {
     out.textContent = `Could not start login: ${r.detail || r.status}`;
@@ -17113,7 +17220,7 @@ async function renderInsights({ refresh = false } = {}) {
       loadInsightQuota(organizationId),
     ]);
   } catch (e) {
-    if (renderIsCurrent()) box.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+    if (renderIsCurrent()) box.innerHTML = `<div class="empty">${inlineErrorHtml(e)}</div>`;
     return;
   }
   if (!renderIsCurrent() || S.tab !== 'insights' || (S.organizationId || 'org_personal') !== organizationId) return;
@@ -17389,7 +17496,7 @@ function wireTaskDefaultsSave(scope, projectId, organizationId) {
       await saveCommonSettings(scope, projectId, organizationId, owned.map((field) => field.name), values);
       if (scope === 'project') await loadProjects();
       flashSaved(button);
-    } catch (e) { error.textContent = e.message; toast(e.message, true); }
+    } catch (e) { error.textContent = plainError(e); toast(e.message, true); }
   });
 }
 
@@ -17500,7 +17607,7 @@ async function hydrateExplanationSettings(scope, projectId, organizationId) {
     : `/api/organizations/${encodeURIComponent(organizationId)}/explanation-settings`;
   let data;
   try { data = await api(url); }
-  catch (error) { card.querySelector('.explanation-setting-effective').textContent = error.message; return; }
+  catch (error) { card.querySelector('.explanation-setting-effective').textContent = plainError(error); return; }
   const own = data.own || {};
   const inherited = data.inherited || DEFAULT_EXPLANATION_SETTINGS;
   const endpoint = card.querySelector('.explanation-setting-endpoint');
@@ -17859,7 +17966,7 @@ async function wireWikiView(proj) {
     paintNav(data);
     if (!sel) renderWikiHome(info, proj, pane, data);
   }, (error) => {
-    if (current() && !sel) pane.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`;
+    if (current() && !sel) pane.innerHTML = `<span class="task-sub">${inlineErrorHtml(error)}</span>`;
   });
   if (!page) return;
   // Not an entry on this view (a stale link, or a cited attachment inside an
@@ -19254,7 +19361,7 @@ async function connectOrganizationGithub(organizationId, onConnected) {
         method: 'POST', body: JSON.stringify({ returnTo: 'installation', mode: 'add' }),
       });
       location.assign(authorization.url);
-    } catch (error) { dialog.querySelector('#github-connect-error').textContent = error.message; }
+    } catch (error) { dialog.querySelector('#github-connect-error').textContent = plainError(error); }
   });
   dialog.querySelector('#github-connect-existing')?.addEventListener('click', async (event) => {
     const button = event.currentTarget;
@@ -19267,7 +19374,7 @@ async function connectOrganizationGithub(organizationId, onConnected) {
       await onConnected();
       toast('GitHub connected');
     } catch (error) {
-      dialog.querySelector('#github-connect-error').textContent = error.message;
+      dialog.querySelector('#github-connect-error').textContent = plainError(error);
       button.disabled = false;
     }
   });
@@ -19736,7 +19843,7 @@ async function hydrateProjectAccess(proj) {
       catch (error) { toast(error.message, true); }
     }));
   } catch (error) {
-    if (renderIsCurrent()) accessBox.innerHTML = repositoryBox.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`;
+    if (renderIsCurrent()) accessBox.innerHTML = repositoryBox.innerHTML = `<span class="task-sub">${inlineErrorHtml(error)}</span>`;
   }
 }
 async function hydrateWorkflowPins(projectId) {
@@ -20506,7 +20613,7 @@ async function wireStripePlatformCard() {
   const endpoint = `/api/organizations/${encodeURIComponent(S.organizationId)}/payments/stripe/platform`;
   let platform;
   try { platform = await api(endpoint); }
-  catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; return; }
+  catch (error) { box.innerHTML = `<p class="task-sub">${inlineErrorHtml(error)}</p>`; return; }
   const status = !platform.configured ? '<span class="chip">Not set up</span>'
     : platform.webhookConfigured ? '<span class="chip done">Ready</span>'
       : tipChip('Webhook secret missing', 'Callbacks from Stripe can’t be verified until the webhook signing secret is saved.', 'waiting');
@@ -20546,7 +20653,7 @@ async function wirePaidLaunchCard() {
   if (!box) return;
   let state;
   try { state = await api('/api/settings/paid-launch'); }
-  catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; return; }
+  catch (error) { box.innerHTML = `<p class="task-sub">${inlineErrorHtml(error)}</p>`; return; }
   const contacts = state.contacts || {};
   const stripe = state.stripe || {};
   const paddle = state.paddle || {};
@@ -22294,7 +22401,7 @@ async function wireVaultCards(organizationId) {
         tree.before(notice);
       }
     }
-    catch (e) { tree.innerHTML = `<span style="color:var(--warn,#e0b15a)">${esc(e.message)}</span>`; return; }
+    catch (e) { tree.innerHTML = `<span style="color:var(--warn,#e0b15a)">${inlineErrorHtml(e)}</span>`; return; }
     if (!ext.length) tree.innerHTML = '<span style="color:var(--ink-3)">Nothing to import yet.</span>';
     const folders = {};
     ext.forEach((i) => { (folders[i.folder || ''] = folders[i.folder || ''] || []).push(i); });
@@ -22445,7 +22552,7 @@ async function wireAgentMailCard(organizationId) {
       result.textContent = 'Connected';
       toast('Agent email connected');
     } catch (e) {
-      result.textContent = e.message;
+      result.textContent = plainError(e);
       toast(e.message, true);
     } finally {
       button.disabled = false;
@@ -22521,7 +22628,7 @@ async function wireOutboundEmailCard() {
         $('#oe-secret').value = '';
         toast(result.detail || 'Email connected');
         await wireOutboundEmailCard();
-      } catch (e) { $('#oe-result').textContent = e.message; $('#oe-result').classList.add('setting-warn'); toast(e.message, true); }
+      } catch (e) { $('#oe-result').textContent = plainError(e); $('#oe-result').classList.add('setting-warn'); toast(e.message, true); }
       finally { btn.disabled = false; }
     });
     $('#oe-test')?.addEventListener('click', async () => {
@@ -22668,7 +22775,7 @@ function wireGlobalSettings(organizationId) {
       $('#wf-url').value = ''; $('#wf-ref').value = '';
       hydrateWorkflows(organizationId);
     } catch (e) {
-      out.textContent = e.message;
+      out.textContent = plainError(e);
       out.style.color = 'var(--bad, crimson)';
     } finally { btn.disabled = false; }
   });
@@ -23460,7 +23567,7 @@ async function hydrateProfilePaidSubscriptions() {
     box.innerHTML = profilePaidSubscriptionsMarkup(result.subscriptions);
   } catch (error) {
     if ($('#profile-paid-subscriptions') !== box || S.user?.id !== userId) return;
-    box.innerHTML = `<p class="task-sub" role="alert">Could not load paid subscriptions: ${esc(error.message)}</p><button class="btn sm" type="button">Retry</button>`;
+    box.innerHTML = `<p class="task-sub" role="alert">Could not load paid subscriptions: ${inlineErrorHtml(error)}</p><button class="btn sm" type="button">Retry</button>`;
     box.querySelector('button')?.addEventListener('click', () => hydrateProfilePaidSubscriptions());
   }
 }
@@ -23711,7 +23818,7 @@ async function wireInstallationGithubCard() {
   const base = `/api/organizations/${encodeURIComponent(S.organizationId)}/github`;
   let status;
   try { status = await api(`${base}/app`); }
-  catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; return; }
+  catch (error) { box.innerHTML = `<p class="task-sub">${inlineErrorHtml(error)}</p>`; return; }
   if (!status.configured) {
     box.innerHTML = `<div class="setting-rows">${instRow(`GitHub App ${policyTip(`Create the one GitHub App ${siteName()} uses for repository access and signing in with GitHub. Organizations then choose their own App installations and repositories.`)}`,
       '<span class="chip">Not set up</span>', '<button class="btn sm primary" id="installation-github-setup">Set up GitHub App</button>')}</div>`;
@@ -23771,7 +23878,7 @@ async function wireInstallationUsers() {
       ${reviews ? '<div id="account-erasure-panel" aria-live="polite"></div>' : ''}`;
     box.querySelectorAll('[data-erasure-user]').forEach(button => button.addEventListener('click', () =>
       loadAccountErasure(button.dataset.erasureUser).catch(error => toast(error.message, true))));
-  } catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; }
+  } catch (error) { box.innerHTML = `<p class="task-sub">${inlineErrorHtml(error)}</p>`; }
 }
 
 function erasureStateChip(record) {
@@ -23826,7 +23933,7 @@ async function loadAccountErasure(userId) {
     } catch (error) {
       await loadAccountErasure(userId);
       const feedback = $('#erasure-feedback');
-      if (feedback) feedback.textContent = error.message;
+      if (feedback) feedback.textContent = plainError(error);
     }
   };
   $('#erasure-close')?.addEventListener('click', () => mutate({ action: 'close', fingerprint: preview.fingerprint,
@@ -24740,7 +24847,7 @@ function renderOrganizationRoles() {
         body: JSON.stringify({ name: data.get('name'), description: data.get('description'), capabilities }) });
       await hydrateOrganizationView(['people']);
       toast('Role created');
-    } catch (e) { error.textContent = e.message; button.disabled = false; }
+    } catch (e) { error.textContent = plainError(e); button.disabled = false; }
   });
 }
 
@@ -26068,7 +26175,7 @@ function wireSocialBtn(id, provider, errSelector) {
       const label = provider === 'github' ? 'GitHub' : 'Google';
       if (!response.ok || !result.url) throw new Error(result.error || result.message || `${label} sign-in unavailable`);
       location.href = result.url;
-    } catch (error) { $(errSelector).textContent = error.message; }
+    } catch (error) { $(errSelector).textContent = plainError(error); }
   });
 }
 
@@ -26467,8 +26574,9 @@ function renderAuth(intent) {
     $('#login-err').textContent = '';
     try {
       const res = await feedbackFetch('/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password }) });
-      if (res.ok) boot(); else $('#login-err').textContent = 'Invalid email or password';
-    } catch { $('#login-err').textContent = 'Login failed'; }
+      if (res.ok) return boot().catch(bootFailed);
+      $('#login-err').textContent = await signInRefusal(res);
+    } catch (error) { $('#login-err').textContent = plainError(error); }
   };
   const signUp = async () => {
     const name = $('#signup-name').value.trim();
@@ -26485,13 +26593,13 @@ function renderAuth(intent) {
       return;
     }
     try { acceptance = readPolicyAcceptance('signup'); }
-    catch (error) { $('#signup-err').textContent = error.message; $('#signup-policy-acceptance').focus(); return; }
+    catch (error) { $('#signup-err').textContent = plainError(error); $('#signup-policy-acceptance').focus(); return; }
     $('#signup-err').textContent = '';
     try {
       const res = await feedbackFetch('/api/signup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
         name, email, password, acceptedPolicies: acceptance.accepted, policyVersions: acceptance.versions,
       }) });
-      if (res.ok) return boot();
+      if (res.ok) return boot().catch(bootFailed);
       const body = await res.json().catch(() => ({}));
       // Surface the real reason (Better Auth returns `.message`, e.g. "User already
       // exists") rather than a blanket "Could not create account".
@@ -26521,7 +26629,7 @@ function renderAuth(intent) {
       const result = await response.json();
       if (!response.ok || !result.url) throw new Error(result.error || 'SSO unavailable');
       location.href = result.url;
-    } catch (error) { $('#social-err').textContent = error.message; }
+    } catch (error) { $('#social-err').textContent = plainError(error); }
   });
   $('#forgot-open')?.addEventListener('click', (e) => { e.preventDefault(); renderForgotPassword(); });
 }
@@ -26612,7 +26720,7 @@ function renderPolicyCompletion() {
         body: JSON.stringify(acceptance) });
       if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || 'Could not record acceptance.');
       await boot();
-    } catch (error) { $('#policy-completion-err').textContent = error.message; }
+    } catch (error) { $('#policy-completion-err').textContent = plainError(error); }
   });
 }
 
@@ -26706,7 +26814,15 @@ function fitToVisualViewport() {
 }
 
 fitToVisualViewport();
-boot().catch((e) => { console.error(e); document.getElementById('app').innerHTML = `<div class="empty"><div class="big">Failed to load</div>${esc(e.message)}</div>`; });
+// The console could not start (the server restarting, the network down): say
+// so plainly, keep the exact error one hover away, and offer to try again.
+function bootFailed(e) {
+  console.error(e);
+  document.getElementById('app').innerHTML = `<div class="empty boot-failed" role="alert"><div class="big">Couldn’t load</div>
+    <p title="${esc(String(e?.message ?? e))}">${esc(plainError(e))}</p><button class="btn primary" id="boot-retry" type="button">Try again</button></div>`;
+  document.getElementById('boot-retry')?.addEventListener('click', () => boot().catch(bootFailed));
+}
+boot().catch(bootFailed);
 
 // MCP choices belong to the agent, independent of the model login.
 function mcpScope(projectId = S.projectId, organizationId = S.organizationId) {
@@ -27045,7 +27161,7 @@ async function finishMcpCallback() {
       window.close(); return;
     }
     location.replace(pending.back.startsWith('/') && !pending.back.startsWith('//') ? pending.back : '/');
-  } catch (e) { status.textContent = e.message; }
+  } catch (e) { status.textContent = plainError(e); }
 }
 
 
@@ -27189,7 +27305,7 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
       };
       save.onclick = () => box._save().catch(() => {});
     }
-  } catch (e) { box.querySelector('.payment-error').textContent = e.message; }
+  } catch (e) { box.querySelector('.payment-error').textContent = plainError(e); }
 }
 
 // Timing is fetched on demand, independently of the bounded conversation window.
@@ -27243,7 +27359,7 @@ function wireTiming(v) {
       if (timingReports.size >= 10) timingReports.delete(timingReports.keys().next().value);
       timingReports.set(v.taskId, report);
       if (S.selected === v.taskId && S.taskTab === 'timing') renderTaskPage();
-    } catch (e) { const error = document.getElementById('timing-error'); if (error) error.textContent = e.message; }
+    } catch (e) { const error = document.getElementById('timing-error'); if (error) error.textContent = plainError(e); }
     finally { refresh.disabled = false; }
   };
   document.getElementById('timing-download').onclick = () => {
@@ -27349,7 +27465,7 @@ async function renderDeviceApproval() {
       $('#device-continue').hidden = true;
       $('.grant-actions').hidden = false;
       $('#device-approve').focus();
-    } catch (error) { message.textContent = error.message; input.readOnly = false; input.select(); }
+    } catch (error) { message.textContent = plainError(error); input.readOnly = false; input.select(); }
   };
   const decide = async (decision) => {
     $('#device-approve').disabled = $('#device-deny').disabled = true;
@@ -27357,7 +27473,7 @@ async function renderDeviceApproval() {
       await api(`/api/oauth/device/${decision}`, { method: 'POST', body: JSON.stringify({ code, ...(decision === 'approve' ? readGrantLimit($('#device-detail')) : {}) }) });
       if (decision === 'approve') grantDone('Signed in', 'Return to your device. You can close this tab.');
       else grantDone('Sign-in denied', 'The device was not signed in.');
-    } catch (error) { message.textContent = error.message; $('#device-approve').disabled = $('#device-deny').disabled = false; }
+    } catch (error) { message.textContent = plainError(error); $('#device-approve').disabled = $('#device-deny').disabled = false; }
   };
   input.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !input.readOnly) lookup(); });
   $('#device-continue').addEventListener('click', lookup);
@@ -27386,7 +27502,7 @@ async function renderOAuthConsent() {
       const result = await api(`/api/oauth/authorizations/${encodeURIComponent(id)}/${decision}`, { method: 'POST',
         body: JSON.stringify(decision === 'approve' ? readGrantLimit($('#consent-limit')) : {}) });
       location.assign(result.redirectUri);
-    } catch (error) { $('#grant-msg').textContent = error.message; $('#consent-allow').disabled = $('#consent-deny').disabled = false; }
+    } catch (error) { $('#grant-msg').textContent = plainError(error); $('#consent-allow').disabled = $('#consent-deny').disabled = false; }
   };
   $('#consent-allow').addEventListener('click', () => decide('approve'));
   $('#consent-deny').addEventListener('click', () => decide('deny'));
@@ -27406,7 +27522,7 @@ async function hydrateAppGrants() {
   if (!box) return;
   let result, projects;
   try { [result, projects] = await Promise.all([api('/api/user/app-grants'), grantLimitOptions()]); }
-  catch (error) { box.innerHTML = `<p class="task-sub" role="alert">${esc(error.message)}</p>`; return; }
+  catch (error) { box.innerHTML = `<p class="task-sub" role="alert">${inlineErrorHtml(error)}</p>`; return; }
   if ($('#profile-app-grants') !== box) return;
   const levels = result.levels || [];
   const day = (epoch) => new Date(epoch).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });

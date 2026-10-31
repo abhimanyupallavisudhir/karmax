@@ -209,6 +209,8 @@ export interface GithubPrActor {
 /** Preserve GitHub's HTTP classification across the integration boundary so
  * callers can distinguish re-auth/user action from a transient service error. */
 export class GithubApiError extends Error {
+  /** GitHub's own status: the gateway never answers its 401 as tavya's (error-status.ts). */
+  readonly upstream = true;
   constructor(public readonly status: number, message: string) {
     super(message);
     this.name = 'GithubApiError';

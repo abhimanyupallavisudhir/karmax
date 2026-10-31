@@ -17,7 +17,8 @@ function extract(name, kind = 'function') {
 }
 global.esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 eval(`${extract('CAPABILITY_ACTIONS', 'const')}; global.CAPABILITY_ACTIONS = CAPABILITY_ACTIONS;`);
-for (const fn of ['permissionSentence', 'plainError', 'plainTaskError', 'taskErrorHtml']) eval(`global.${fn} = ${extract(fn)}`);
+global.globalRoute = () => '/org/settings';
+for (const fn of ['permissionSentence', 'plainError', 'plainTaskError', 'setupFix', 'setupFixHtml', 'taskErrorHtml']) eval(`global.${fn} = ${extract(fn)}`);
 
 let passed = 0;
 const eq = (actual, expected, label) => { assert.strictEqual(actual, expected, label); passed++; };
@@ -68,6 +69,7 @@ eq(plainTaskError('Out of disk: this task\'s computer filled its 20 GB disk. Big
 const plain = plainTaskError('GitHub account octo can’t see acme/web. Ask an admin of acme/web to add octo as a collaborator, then Retry.');
 eq(plain.detail, '', 'nothing hidden when the summary is the message');
 assert.ok(!taskErrorHtml(plain.summary).includes('<details'), 'no Details fold without details'); passed++;
+assert.ok(taskErrorHtml('No computer is connected: connect one under Settings → Computers.').includes('<a class="btn sm setup-fix" data-spa href="/org/settings#settings-computers">Connect a computer</a>'), 'a setting that unblocks the task is one click away'); passed++;
 assert.ok(taskErrorHtml('Activity task failed → envd timeout').includes('<details class="error-details"><summary>Details</summary>'), 'Details fold holds the exact text'); passed++;
 
 console.log(`${passed} passed, 0 failed`);

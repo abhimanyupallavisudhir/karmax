@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import crypto from 'node:crypto';
 import type { Browser, Page } from 'playwright';
-import { hostedGateway, launchChromium, openConsole, signIn, type HostedGateway } from './helpers/browser.js';
+import { consoleRequest, hostedGateway, launchChromium, openConsole, signIn, type HostedGateway } from './helpers/browser.js';
 import { WorldProviderConnectionService } from '../src/world/connections.js';
 import { PaidLaunchSettingsService } from '../src/launch/settings.js';
 import { PaddleSubscriptionProvider } from '../src/billing/paddle.js';
@@ -154,6 +154,33 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await step('the guide steps aside', () => page.locator('#hosted-onboarding .onboarding-card').waitFor({ state: 'detached' }));
       // The step that finished setup navigated; the person is still told so.
       await step('setup completion is confirmed', () => page.locator('#hosted-onboarding .onboarding-complete').getByText('Setup complete').waitFor());
+      expect(errors).toEqual([]);
+    } finally { await context.close(); }
+  }, 90_000);
+
+  it('names what a new task still needs in its form, and stops once it is set up', async () => {
+    const { user, organization } = await g.owner({ name: 'Rita Ready', email: 'rita@example.test', password: PASSWORD, organization: 'Rita Lab' });
+    const { page, errors, step, context } = await openConsole(browser, { ip: '192.0.2.51' });
+    try {
+      await signIn(context, g.url, user.email, PASSWORD);
+      const project = await consoleRequest(context, g.url, 'POST', `/api/organizations/${organization.id}/projects`, { name: 'Lab', config: {} });
+      await step('open the project', () => page.goto(`${g.url}/${organization.slug}/${project.slug}`));
+      await page.locator('#expand-task').click();
+      const notice = page.locator('#tf-ready');
+      await step('the form says there is no computer', () => notice.getByRole('link', { name: 'Connect a computer' }).waitFor());
+      expect(await notice.innerText()).toMatch(/^!?\s*Can’t start yet:/);
+      expect(await notice.getByRole('link', { name: 'Connect a computer' }).getAttribute('href'))
+        .toBe(`/${organization.slug}/settings#settings-computers`);
+
+      // Connected elsewhere meanwhile: the next look at the form agrees.
+      await consoleRequest(context, g.url, 'PUT', `/api/organizations/${organization.id}/world-providers/e2b`, { apiKey: 'e2b_ready' });
+      // An Anthropic key runs the default Claude agent.
+      await consoleRequest(context, g.url, 'POST', `/api/organizations/${organization.id}/accounts`,
+        { provider: 'anthropic', account: 'lab', apiKey: 'sk-ant-ready' });
+      await page.locator('#tf-close').click();
+      await page.locator('#expand-task').click();
+      await page.locator('#tf-queue').waitFor();
+      await step('nothing is missing', () => expect.poll(async () => await notice.isHidden() ? '' : notice.innerText(), { timeout: 8_000 }).toBe(''));
       expect(errors).toEqual([]);
     } finally { await context.close(); }
   }, 90_000);

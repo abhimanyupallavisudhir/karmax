@@ -151,6 +151,8 @@ export interface GithubActionsInspectOptions {
 }
 
 export class GithubActionsApiError extends Error {
+  /** GitHub's own status: the gateway never answers its 401 as tavya's (error-status.ts). */
+  readonly upstream = true;
   constructor(public readonly status: number, message: string) {
     super(message);
     this.name = 'GithubActionsApiError';

@@ -27,7 +27,7 @@ test('paid subscriptions precede Your data and show escaped links, cancellation,
 test('profile loader shows failures with retry and ignores stale responses', async () => {
   let retry;
   let current = { innerHTML: '', querySelector: () => ({ addEventListener: (_, fn) => { retry = fn; } }) };
-  const ctx = vm.createContext({ esc, policyTip, S: { user: { id: 'alice' } }, $: () => current,
+  const ctx = vm.createContext({ esc, policyTip, inlineErrorHtml: (error) => esc(error.message), S: { user: { id: 'alice' } }, $: () => current,
     api: async () => { throw new Error('<offline>'); } });
   vm.runInContext(functions, ctx);
   await ctx.hydrateProfilePaidSubscriptions();

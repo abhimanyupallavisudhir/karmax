@@ -39,12 +39,13 @@ import { WorldRegistry } from '../world/registry.js';
 import { World, WorldHandle, WorldKind, WorldSpec, type WorldRepo, worldWorkingDirectory, type WorldDiagnosis } from '../world/types.js';
 import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
+import { managedModelCostCeiling, managedModelRailAvailable } from '../agent/managed-models.js';
 import {
   apiKeyEnv,
   assertRunnableProvider,
   canonicalModelProvider,
   credentialAliases,
-  credentialMatchesProfile,
+  credentialServesProfile,
   credentialProvider,
   MODEL_PROVIDERS,
   modelProviderFromModel,
@@ -2622,26 +2623,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (profile?.provider === 'opencode') {
         missingNamespace = recognizedOpenCodePrefix ? openCodePrefix! : 'opencode-compatible';
       }
-      const ordered = enabled.filter((credential) => {
-        if (!profile) return credentialAliases(args.provider).includes(credential.provider);
-        if (profile.provider !== 'opencode') {
-          missingNamespace = credentialProvider(profile);
-          return credentialMatchesProfile(profile, credential);
-        }
-
-        // An OpenCode subscription is harness-native and may carry credentials
-        // for multiple model vendors. API keys are narrowed only when the model
-        // has a recognizable `provider/model` prefix. With an unprefixed or
-        // custom id, the user's general Credentials ordering is authoritative.
-        if (credential.kind !== 'key') {
-          if (credential.provider !== 'opencode') return false;
-          if (!credential.modelProvider) return recognizedOpenCodePrefix;
-          return !recognizedOpenCodePrefix
-            || credentialAliases(openCodePrefix!).includes(credential.modelProvider);
-        }
-        if (!recognizedOpenCodePrefix) return true;
-        return credentialAliases(openCodePrefix!).includes(credential.provider);
-      });
+      if (profile && profile.provider !== 'opencode' && enabled.length) missingNamespace = credentialProvider(profile);
+      const ordered = enabled.filter((credential) => profile
+        ? credentialServesProfile(profile, credential, all)
+        : credentialAliases(args.provider).includes(credential.provider));
       // A native OpenCode fork is stored in the source XDG home. Lease that
       // exact login first so account concurrency, quota failures, and policy
       // attribution remain honest; never reopen one account after leasing
@@ -7409,33 +7394,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
   };
   return activities;
-}
-
-/** Installation-side authorization boundary for platform-funded model calls.
- * Values are worst-case micro-dollar debits per admitted request, keyed by
- * `provider/model`, `provider/*`, or `provider`. Invalid/absent configuration
- * fails managed admission closed and never affects BYOK. */
-function managedModelRailAvailable(
-  hosted: boolean,
-  policy: { managedSpendCapMicros?: number | null; managedModelProviders: string[] },
-  profile: import('../domain/types.js').AgentProfile,
-): boolean {
-  const provider = canonicalModelProvider(credentialProvider(profile));
-  return hosted && !!policy.managedSpendCapMicros && policy.managedModelProviders.includes(provider)
-    && !!managedModelCostCeiling(provider, profile.model)
-    && ((profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY)
-      || (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY)
-      || (profile.provider === 'opencode' && !!process.env[apiKeyEnv(provider)]));
-}
-
-function managedModelCostCeiling(provider: string, model?: string): number | undefined {
-  const raw = process.env.KARMAX_MANAGED_MODEL_REQUEST_CEILINGS;
-  if (!raw) return undefined;
-  let values: Record<string, unknown>;
-  try { values = JSON.parse(raw) as Record<string, unknown>; } catch { return undefined; }
-  const value = values[`${provider}/${model ?? '*'}`] ?? values[`${provider}/*`] ?? values[provider];
-  const amount = Number(value);
-  return Number.isSafeInteger(amount) && amount > 0 ? amount : undefined;
 }
 
 type TokenCounters = {
