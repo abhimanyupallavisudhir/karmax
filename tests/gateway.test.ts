@@ -1799,6 +1799,16 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     }
   });
 
+  it('takes repositories as people paste them: owner/name, a GitHub page or a clone URL', async () => {
+    const project: any = await fetch(`${base}/api/organizations/org_personal/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Pasted repositories', repos: ['https://github.com/acme/web/tree/main', 'acme/api', 'git@github.com:acme/cli.git'] }) })
+      .then((r) => r.json());
+    expect(project.config.repos).toEqual(['https://github.com/acme/web.git', 'https://github.com/acme/api.git', 'git@github.com:acme/cli.git']);
+    const saved: any = await fetch(`${base}/api/projects/${project.id}/repository-sources`, { method: 'PUT', headers: auth(),
+      body: JSON.stringify({ repos: ['github.com/acme/docs.git'] }) }).then((r) => r.json());
+    expect(saved.config.repos).toEqual(['https://github.com/acme/docs.git']);
+  });
+
   it('drives tags, saved views, and query search over HTTP (a view is a saved query)', async () => {
     const post = (path: string, body: unknown) =>
       fetch(`${base}${path}`, { method: 'POST', headers: auth(), body: JSON.stringify(body) }).then((r) => r.json());

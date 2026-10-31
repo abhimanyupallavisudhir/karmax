@@ -19260,15 +19260,22 @@ async function connectOrganizationGithub(organizationId, onConnected) {
   document.body.append(dialog);
   dialog.showModal();
 }
-// `owner/name` from a GitHub URL or slug.
+// `owner/name` of the GitHub repository a person pasted or typed: owner/name,
+// a clone URL, or the address of any page in it (github.com/owner/name/tree/main).
+// The same reading as the server's githubRepositoryOf.
 function githubRepositorySlug(text) {
-  const match = String(text || '').trim().match(/^(?:(?:https?:\/\/)?(?:www\.)?github\.com[/:]|git@github\.com:)?([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/);
-  return match ? `${match[1]}/${match[2]}` : '';
+  const raw = String(text || '').trim();
+  const address = raw.match(/^(?:(?:https?|ssh|git):\/\/)?(?:[\w.-]+@)?(?:www\.|ssh\.)?github\.com(?::\d+)?[/:]([^?#]*)/i);
+  const match = address
+    ? address[1].match(/^\/*([A-Za-z0-9][A-Za-z0-9-]*)\/([\w.-]+?)(?:\.git)?(?:\/.*)?$/)
+    : raw.match(/^([A-Za-z0-9][A-Za-z0-9-]*)\/([\w.-]+?)(?:\.git)?\/?$/);
+  return match && !/^\.+$/.test(match[2]) ? `${match[1]}/${match[2]}` : '';
 }
 
 // Work on someone else's repository: fork it on GitHub (where the App can reach
 // it), then attach the fork. Its pull requests open on the original.
-function openForkRepositoryDialog(proj, opener, githubApp = {}, preset = '') {
+// `attach(fork, repositories)` puts it wherever it was asked for.
+function openForkRepositoryDialog(organizationId, opener, githubApp, preset, attach) {
   const host = document.createElement('div');
   host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-repository-dialog" role="dialog" aria-modal="true" aria-labelledby="fork-repository-title">
     <div class="new-repository-head"><b id="fork-repository-title">Fork a repository</b><button class="icon-btn new-repository-close" type="button" aria-label="Close">×</button></div>
@@ -19299,7 +19306,7 @@ function openForkRepositoryDialog(proj, opener, githubApp = {}, preset = '') {
     const button = event.submitter;
     if (button) button.disabled = true;
     try {
-      const { repositories } = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' });
+      const { repositories } = await api(`/api/organizations/${organizationId}/github/refresh`, { method: 'POST', body: '{}' });
       const fork = (repositories || []).find((repository) => repository.upstream
         && `${repository.upstream.owner}/${repository.upstream.name}`.toLowerCase() === slug);
       if (!fork) {
@@ -19311,7 +19318,7 @@ function openForkRepositoryDialog(proj, opener, githubApp = {}, preset = '') {
       if (fork.upstream.private && privateAcknowledged !== fork.id) {
         const { accounts = [] } = await api('/api/user/github-accounts').catch(() => ({}));
         if (!accounts.some((account) => account.profile?.githubToken)) {
-          const install = githubApp.appSlug ? `https://github.com/apps/${encodeURIComponent(githubApp.appSlug)}/installations/new` : '';
+          const install = githubApp?.appSlug ? `https://github.com/apps/${encodeURIComponent(githubApp.appSlug)}/installations/new` : '';
           note.innerHTML = `<b>${esc(slug)} is private.</b> tavya can only open pull requests there if ${install
             ? `<a href="${esc(install)}" target="_blank" rel="noopener">an owner installs the GitHub App on it ↗</a>` : 'an owner installs the GitHub App on it'}
             or you <a href="/profile#github-token" target="_blank" rel="noopener">save a GitHub token</a> with the repo scope.`;
@@ -19321,8 +19328,8 @@ function openForkRepositoryDialog(proj, opener, githubApp = {}, preset = '') {
           return;
         }
       }
-      await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: fork.id }) });
-      close(); toast('Fork attached'); await loadProjects(); await hydrateProjectAccess(projectById(proj.id) || proj);
+      await attach(fork, repositories);
+      close();
     } catch (error) {
       toast(error.message, true);
     } finally {
@@ -19409,13 +19416,16 @@ function repositoryInput(repositories) {
   return { pickOnly, canAdd, placeholder };
 }
 // The source a typed repository names: the organization's GitHub repository it
-// matches (owner/name or URL), else what was typed. Null when a hosted project
-// may not use it.
+// matches (owner/name or any GitHub address), else a GitHub page or owner/name
+// as its https clone URL, else what was typed. Null when a hosted project may
+// not use it. The same rule as the server's projectRepositorySource.
 function repositorySourceFor(typed, repositories) {
-  const known = repositories.find((repository) => `${repository.owner}/${repository.name}`.toLowerCase() === typed.toLowerCase()
-    || repository.sshUrl === typed) || repositories.find((repository) => repositorySourceView(repository.sshUrl).key === repositorySourceView(typed).key);
-  if (repositoryInput(repositories).pickOnly && !known) return null;
-  return known?.sshUrl || typed;
+  const slug = githubRepositorySlug(typed);
+  const known = repositories.find((repository) => repository.sshUrl === typed
+    || (slug && `${repository.owner}/${repository.name}`.toLowerCase() === slug.toLowerCase()));
+  if (known) return known.sshUrl;
+  if (repositoryInput(repositories).pickOnly) return null;
+  return slug && repositorySourceView(typed).kind !== 'github' ? `https://github.com/${slug}.git` : typed;
 }
 // A name GitHub accepts for a new repository, made from what people type:
 // "Clients/Fresh Ideas" → "fresh-ideas" (the last folder of a project name).
@@ -19448,6 +19458,7 @@ function repositoryPickerHtml(id, { placeholder, disabled }) {
 // matches none offers "+ New repo" (which opens the New repository dialog
 // with it), and off hosted the typed URL or path itself. ↑/↓ move, Enter
 // chooses, Esc closes. `attachedKeys()` names what is already in the list.
+// Returns `commit()` for a form that saves the list (see below).
 function wireRepositoryPicker(input, { repositories, gitConnections = [], createIn = gitConnections, githubLogin, canCreate, attachedKeys, add, create, fork }) {
   if (!input) return;
   const root = input.closest('.repo-combo');
@@ -19460,7 +19471,8 @@ function wireRepositoryPicker(input, { repositories, gitConnections = [], create
   const build = () => {
     const typed = input.value.trim();
     const needle = typed.toLowerCase();
-    const typedKey = repositorySourceView(typed).key.toLowerCase();
+    const slug = githubRepositorySlug(typed);
+    const typedKey = slug.toLowerCase();
     const attached = attachedKeys();
     const next = repositories
       .filter((repository) => !attached.has(slugOf(repository).toLowerCase()))
@@ -19468,22 +19480,19 @@ function wireRepositoryPicker(input, { repositories, gitConnections = [], create
       .sort((a, b) => Number(b.name.toLowerCase() === needle) - Number(a.name.toLowerCase() === needle)
         || Number(b.name.toLowerCase().startsWith(needle)) - Number(a.name.toLowerCase().startsWith(needle)))
       .map((repository) => ({ kind: 'repository', repository }));
-    const known = typed && repositorySourceFor(typed, repositories);
-    const knownKey = known && repositorySourceView(known).key.toLowerCase();
-    const exists = (slug) => repositories.some((repository) => slugOf(repository).toLowerCase() === slug.toLowerCase());
-    // "+ New repo": a bare name goes to the default account; owner/name to that
-    // account when the organization connected it.
+    const exists = (each) => repositories.some((repository) => slugOf(repository).toLowerCase() === each.toLowerCase());
+    // "+ New repo": a bare name goes to the default account; owner/name (or a
+    // GitHub address) to that account when the organization connected it.
     if (canCreate) {
-      const [owner, name] = typed.includes('/') ? typed.split('/') : [defaultGitConnection(createIn, githubLogin)?.accountLogin, typed];
+      const [owner, name] = slug ? slug.split('/') : typed.includes('/') ? [] : [defaultGitConnection(createIn, githubLogin)?.accountLogin, typed];
       const connection = owner && createIn.find((each) => each.accountLogin?.toLowerCase() === owner.toLowerCase());
       const valid = /^[A-Za-z0-9._-]+$/.test(name || '') && connection && !/^\.+$/.test(name);
       if (!typed) next.push({ kind: 'create', name: '', label: 'New repo…' });
       else if (valid && !exists(`${connection.accountLogin}/${name}`))
         next.push({ kind: 'create', name, connectionId: connection.id, label: `New repo ${connection.accountLogin}/${name}` });
     }
-    const slug = githubRepositorySlug(typed);
-    if (typed && !pickOnly && !knownKey && /[/:~]|^\./.test(typed) && !(slug && ownAccount(slug.split('/')[0])))
-      next.push({ kind: 'source', source: typed, label: `Add ${typed}` });
+    if (typed && !pickOnly && !exists(slug) && /[/:~]|^\./.test(typed) && !(slug && ownAccount(slug.split('/')[0])))
+      next.push({ kind: 'source', source: repositorySourceFor(typed, repositories), label: `Add ${slug || typed}` });
     if (fork && slug && !exists(slug) && !ownAccount(slug.split('/')[0]))
       next.push({ kind: 'fork', slug, label: `Fork ${slug}…` });
     else if (fork && !typed) next.push({ kind: 'fork', slug: '', label: 'Fork a repository…' });
@@ -19582,6 +19591,22 @@ function wireRepositoryPicker(input, { repositories, gitConnections = [], create
     const option = event.target.closest('[role="option"]');
     if (option && Number(option.dataset.index) !== active) { active = Number(option.dataset.index); paint(); }
   });
+  // Text still in the field when the form is saved is never dropped silently:
+  // a repository it names outright is added; otherwise the menu opens on what
+  // can be done with it and the reason to stop comes back.
+  const commit = async () => {
+    const typed = input.value.trim();
+    if (!typed) return null;
+    const source = repositorySourceFor(typed, repositories);
+    if (source && (repositories.some((repository) => repository.sshUrl === source) || /[/:~]|^\./.test(typed))) {
+      input.value = '';
+      if (!attachedKeys().has(repositorySourceView(source).key)) await add(source);
+      return null;
+    }
+    input.focus(); draw();
+    return options.length ? `Choose what to do with “${typed}”, or clear it.` : `“${typed}” is not a repository you can add. Clear it to continue.`;
+  };
+  return { commit };
 }
 // The GitHub row's value and actions: the organization's connected accounts,
 // or the step that connects them. `ids` name its buttons.
@@ -19654,7 +19679,10 @@ function renderProjectRepositories(box, proj, { repositories, gitConnections, gi
       await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) });
       toast('Repository created and attached'); await loadProjects(); await rerender();
     }, { name, connectionId }) : null,
-    fork: githubApp.configured && gitConnections.length ? (slug, opener) => openForkRepositoryDialog(proj, opener, githubApp, slug) : null,
+    fork: githubApp.configured && gitConnections.length ? (slug, opener) => openForkRepositoryDialog(proj.organizationId, opener, githubApp, slug, async (fork) => {
+      await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: fork.id }) });
+      toast('Fork attached'); await loadProjects(); await rerender();
+    }) : null,
   });
   $('#project-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(proj.organizationId, rerender); } catch (error) { toast(error.message, true); } });
   $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
@@ -25027,6 +25055,7 @@ function newProject(options) {
   </form></div>`;
   const $in = (selector) => host.querySelector(selector);
   const repos = [];
+  let picker = null;
   let github = { repositories: [], gitConnections: [], githubApp: { configured: false }, githubLoadError: null, githubLogin: undefined, githubLogins: [] };
   let useDefault = true;
 
@@ -25108,15 +25137,17 @@ function newProject(options) {
       renderGit(); renderInstall();
       $in('#np-repo-input')?.focus();
     }));
-    wireRepositoryPicker($in('#np-repo-input'), {
+    const attach = (repository, catalog = [...github.repositories, repository]) => {
+      github = { ...github, repositories: catalog.some((each) => each.id === repository.id) ? catalog : [...catalog, repository] };
+      if (!repos.includes(repository.sshUrl)) repos.push(repository.sshUrl);
+      renderGit(); renderInstall();
+    };
+    picker = wireRepositoryPicker($in('#np-repo-input'), {
       repositories, gitConnections, createIn, githubLogin, canCreate,
       attachedKeys: () => new Set(repos.map((source) => repositorySourceView(source).key)),
       add: (source) => { repos.push(source); renderGit(); renderInstall(); $in('#np-repo-input').focus(); },
-      create: canCreate ? ({ name, connectionId }, opener) => openNewGithubRepositoryDialog(organizationId, createIn, opener, async (repository) => {
-        github = { ...github, repositories: [...github.repositories, repository] };
-        repos.push(repository.sshUrl);
-        renderGit(); renderInstall();
-      }, { name, connectionId }) : null,
+      create: canCreate ? ({ name, connectionId }, opener) => openNewGithubRepositoryDialog(organizationId, createIn, opener, attach, { name, connectionId }) : null,
+      fork: githubApp.configured && gitConnections.length ? (slug, opener) => openForkRepositoryDialog(organizationId, opener, githubApp, slug, attach) : null,
     });
     $in('#np-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(organizationId, loadGithub); } catch (error) { toast(error.message, true); } });
     $in('#np-refresh-github')?.addEventListener('click', async (event) => {
@@ -25137,6 +25168,7 @@ function newProject(options) {
     renderGit(); renderDefault();
   };
   $in('#new-project-name').addEventListener('input', () => { if (github.githubApp.configured) renderDefault(); });
+  $in('form').addEventListener('input', () => { $in('.new-project-error').hidden = true; });
 
   const controller = new AbortController();
   let closed = false, creating = false;
@@ -25161,6 +25193,12 @@ function newProject(options) {
     const button = $in('button[type="submit"]');
     if (!name || creating) return;
     error.hidden = true;
+    // Nothing named for the project is dropped on the way: a repository it
+    // cannot have stops Create, saying why.
+    const unnamed = usingDefault() && defaultRepository().create?.name === '';
+    const pending = unnamed ? 'A GitHub repo name needs Latin letters or digits. Rename the project, or choose other repositories.'
+      : !usingDefault() ? await picker?.commit() : null;
+    if (pending) { error.textContent = pending; error.hidden = false; return; }
     button.disabled = true; button.textContent = 'Creating…';
     let project;
     try {

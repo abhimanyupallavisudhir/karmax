@@ -83,7 +83,7 @@ export const PLATFORM_API_CATALOG = {
     // deployment: bare `POST /api/projects` rejects there with "hosted projects must
     // be created inside an organization". Leaving it undocumented meant an agent on
     // a hosted install had no discoverable way to create a project at all.
-    'GET|POST /api/organizations/:organizationId/projects (on hosted, project-create MUST use this form; POST body {name, config?, repos?} — repos attach as repository-sources does)',
+    'GET|POST /api/organizations/:organizationId/projects (on hosted, project-create MUST use this form; POST body {name, config?, repos?} — repos (owner/name, GitHub URLs or clone URLs) attach as repository-sources does)',
     'GET /api/projects/:projectId/transfer (eligible destinations; add ?destinationOrganizationId=… for a preview)',
     'POST /api/projects/:projectId/transfer (body {destinationOrganizationId, previewId}; requires project:transfer-out in source and project:transfer-in in destination; same API for agents and humans)',
     'PATCH /api/projects/:projectId/folder (body {folder, name} — atomically rename an implicit sidebar folder tree)',

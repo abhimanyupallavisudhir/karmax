@@ -382,11 +382,23 @@ describe('Project settings', () => {
       ['git@github.com:acme/web.git', '/srv/code/tools', 'git@github.com:acme/api.git'],
       ['git@github.com:acme/web.git', 'git@github.com:acme/api.git'],
     ]);
+    // Pasted GitHub addresses name the repository: the organization's own, or another's clone URL.
+    await ui.page.locator('#project-repository-input').fill('https://github.com/acme/api/tree/main');
+    await ui.page.keyboard.press('Enter');
+    await expect.poll(() => ui.toasts()).toContain('Already added');
+    await ui.page.locator('#project-repository-input').fill('https://github.com/other/lib/blob/main/README.md');
+    await expect.poll(() => ui.page.getByRole('listbox', { name: 'Repositories' }).getByRole('option').allInnerTexts())
+      .toEqual(['Add other/lib', 'Fork other/lib…']);
+    await ui.page.keyboard.press('Enter');
+    await expect.poll(() => ui.calls.filter((call) => call.method === 'PUT').at(-1)?.body.repos)
+      .toEqual(['git@github.com:acme/web.git', 'git@github.com:acme/api.git', 'https://github.com/other/lib.git']);
+    await rows.filter({ hasText: 'other/lib' }).getByRole('button', { name: 'Remove other/lib' }).click();
+    await expect.poll(() => rows.count()).toBe(2);
     // A repository already in the project is not added twice.
     await ui.page.locator('#project-repository-input').fill('git@github.com:acme/web.git');
     await ui.page.keyboard.press('Enter');
     await expect.poll(() => ui.toasts()).toContain('Already added');
-    expect(ui.calls.filter((call) => call.method === 'PUT')).toHaveLength(2);
+    expect(ui.calls.filter((call) => call.method === 'PUT')).toHaveLength(4);
     await ui.close();
   });
 
