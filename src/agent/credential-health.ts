@@ -11,6 +11,7 @@ import {
   isUsagePollable,
   probeClaudeUsage,
   probeCodexUsage,
+  withLastReading,
   usageProvesAvailable,
   type UsageResult,
 } from './usage.js';
@@ -88,7 +89,9 @@ export async function refreshCredentialHealth(
         ? probeCodexUsage({ configHome })
         : probeClaudeUsage({ configHome }))
         .then(async (snapshot) => {
-          (await deps.store.kvSet(`usage:${credential.key}`, JSON.stringify(snapshot)));
+          // A check that fails keeps the numbers the last one read.
+          const previous = await deps.store.kvGet(`usage:${credential.key}`).then((raw) => (raw ? JSON.parse(raw) : undefined)).catch(() => undefined);
+          (await deps.store.kvSet(`usage:${credential.key}`, JSON.stringify(withLastReading(previous, snapshot))));
           // The quota scheduler reads windows from readings it can line up with spend.
           if (snapshot.ok && 'kvCompareAndSet' in deps.store) {
             const { recordQuotaReading } = await import('../scheduling/state.js');

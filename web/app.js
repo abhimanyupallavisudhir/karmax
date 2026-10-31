@@ -16627,12 +16627,14 @@ function usageBlock(snap, isPollable) {
     const why = snap.reason === 'setup-token' ? 'Not reported for setup-token sign-ins'
       : snap.reason === 'logged-out' ? 'Signed out'
       : snap.reason === 'not-subscription' || snap.reason === 'no-rate-limits' ? 'No subscription limits'
-      : `Unavailable${snap.reason ? ` (${snap.reason})` : ''}`;
-    return `<span class="setting-muted">${esc(why)}</span>`;
+      : 'Couldn’t check usage';
+    return `<span class="setting-muted" title="${esc(snap.reason || '')}">${esc(why)}</span>`;
   }
   const rows = usageWindows(snap).map(([label, win]) => usageRow(label, win)).join('');
-  const freshness = snap.stale ? `Re-checking (last ${fmtAgo(snap.at)})` : `Checked ${fmtAgo(snap.at)}`;
-  return `<div class="acct-usage">${rows}<span class="acct-checked">${esc(freshness)}</span></div>`;
+  // A failed check keeps the last numbers; say how old they are.
+  const freshness = snap.failedAt ? `Couldn’t check ${fmtAgo(snap.failedAt)} · read ${fmtAgo(snap.at)}`
+    : snap.stale ? `Re-checking (last ${fmtAgo(snap.at)})` : `Checked ${fmtAgo(snap.at)}`;
+  return `<div class="acct-usage">${rows}<span class="acct-checked"${snap.failure ? ` title="${esc(snap.failure)}"` : ''}>${esc(freshness)}</span></div>`;
 }
 
 function usageRow(label, win) {
