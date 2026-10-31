@@ -52,7 +52,7 @@ function signedInGithubApp(store: Store, installationId?: string) {
 async function boot(hosted: boolean, githubApp?: (store: Store) => object) {
   const port = await findFreePortFrom(48260);
   const identity = await IdentityService.open(':memory:', { baseURL: `http://127.0.0.1:${port}` });
-  const store = (await Store.create(':memory:'));
+  const store = (await Store.create(':memory:', { hosted }));
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-onboarding-'));
   tempDirs.push(dir);
   const broker = new CredentialBroker(new Vault(dir));
@@ -97,28 +97,46 @@ async function boot(hosted: boolean, githubApp?: (store: Store) => object) {
 }
 
 describe('hosted onboarding status API', () => {
-  it('accepts Daytona instead of E2B and keeps the paid plan optional', async () => {
-    const { store, broker, providers, request, subscriptions } = await boot(true);
-    expect((await (await request()).json() as any).steps.paidPlan).toEqual({ complete: false, blocking: false });
+  it('completes the compute step with Daytona instead of E2B', async () => {
+    const { store, broker, providers, request } = await boot(true);
+    expect((await (await request()).json() as any).steps.compute).toEqual({ complete: false, managed: false, own: false });
     await providers.save({ organizationId: 'org_personal', provider: 'daytona', apiKey: 'daytona-test' });
-    expect((await (await request()).json() as any).steps.e2b.complete).toBe(true);
+    expect((await (await request()).json() as any).steps.compute).toEqual({ complete: true, managed: false, own: true });
     await providers.delete('org_personal', 'daytona');
-    expect((await (await request()).json() as any).steps.e2b.complete).toBe(false);
+    expect((await (await request()).json() as any).steps.compute.complete).toBe(false);
     await providers.save({ organizationId: 'org_personal', provider: 'daytona', apiKey: 'daytona-test' });
     await store.upsertGitConnection({ organizationId: 'org_personal', provider: 'github',
       installationId: 'daytona-onboarding', accountLogin: 'alice', accountType: 'User' });
     await broker.registerHandle('openai:first', 'sk-test', INSTALLATION_SCOPE);
     await store.createProject('Daytona project', {}, 'org_personal');
-    const complete = await (await request()).json() as any;
-    expect(complete).toMatchObject({ complete: true, completedRequired: 4, totalRequired: 4 });
-    expect(complete.steps.paidPlan).toEqual({ complete: false, blocking: false });
-    await subscriptions.checkout('org_personal', 'individual', { success: 'https://test/s', cancel: 'https://test/c' }, 'optional-paid');
-    expect((await (await request()).json() as any).steps.paidPlan.complete).toBe(false);
-    await subscriptions.handleWebhook(Buffer.from(JSON.stringify({ id: 'optional-active', type: 'customer.subscription.updated',
-      created: 100, data: { object: { id: 'sub_optional', customer: 'cus_org_personal', status: 'active',
-        items: { data: [{ id: 'si', price: { id: 'price_individual' }, quantity: 1 }] } } } })));
-    expect((await (await request()).json() as any).steps.paidPlan).toEqual({ complete: true, blocking: false });
+    expect(await (await request()).json()).toMatchObject({ complete: true, completedRequired: 4, totalRequired: 4 });
   });
+
+  it('completes the compute step with a paid plan instead of a compute account of the organization’s own', async () => {
+    const { store, broker, request, subscriptions } = await boot(true);
+    await store.upsertGitConnection({ organizationId: 'org_personal', provider: 'github',
+      installationId: 'paid-onboarding', accountLogin: 'alice', accountType: 'User' });
+    await broker.registerHandle('openai:first', 'sk-test', INSTALLATION_SCOPE);
+    await store.createProject('Paid project', {}, 'org_personal');
+    expect(await (await request()).json()).toMatchObject({ complete: false, completedRequired: 3, totalRequired: 4,
+      steps: { compute: { complete: false, managed: false, own: false } } });
+    await subscriptions.checkout('org_personal', 'individual', { success: 'https://test/s', cancel: 'https://test/c' }, 'onboarding-paid');
+    // An unpaid checkout is not a plan yet.
+    expect((await (await request()).json() as any).steps.compute.complete).toBe(false);
+    await subscriptions.handleWebhook(Buffer.from(JSON.stringify({ id: 'onboarding-active', type: 'customer.subscription.updated',
+      created: 100, data: { object: { id: 'sub_onboarding', customer: 'cus_org_personal', status: 'active',
+        items: { data: [{ id: 'si', price: { id: 'price_individual' }, quantity: 1 }] } } } })));
+    expect(await (await request()).json()).toMatchObject({ complete: true, completedRequired: 4,
+      steps: { compute: { complete: true, managed: true, own: false } } });
+  });
+
+  it('counts gifted compute credit as tavya’s computers', async () => {
+    const { store, request } = await boot(true);
+    expect((await (await request()).json() as any).steps.compute.managed).toBe(false);
+    await store.setComputePackGift('org_personal', 1, 'operator');
+    expect((await (await request()).json() as any).steps.compute).toEqual({ complete: true, managed: true, own: false });
+  });
+
   it('persists display state, derives required steps from live state, and makes completion sticky', async () => {
     const { store, broker, providers, request } = await boot(true);
     const initial = await (await request()).json() as any;
@@ -145,7 +163,7 @@ describe('hosted onboarding status API', () => {
     (await providers.delete('org_personal', 'e2b'));
     const afterDisconnect = await (await request()).json() as any;
     expect(afterDisconnect).toMatchObject({ visible: false, complete: true });
-    expect(afterDisconnect.steps.e2b.complete).toBe(false);
+    expect(afterDisconnect.steps.compute.complete).toBe(false);
 
     (await new VaultItems(store, broker, undefined, 'org_personal').save({
       type: 'login', label: 'Example login', secrets: { password: 'secret' },
@@ -367,7 +385,7 @@ describe('hosted onboarding completion semantics', () => {
         const saved = parseHostedOnboardingRecord((await reopened.kvGet(`hosted:onboarding:user${i}:org1`)));
         expect(saved).toEqual(record);
         expect(hostedOnboardingStatus({ hosted: true, organizationId: 'org1', record: saved,
-          facts: { github: true, agentLogin: false, e2b: false, vault: false, card: false, project: true },
+          facts: { github: true, agentLogin: false, ownCompute: false, managedCompute: false, vault: false, card: false, project: true },
         }).visible).toBe(i !== 2 && i !== 4);
       }));
     } finally { (await reopened.close()); }
@@ -378,7 +396,7 @@ describe('hosted onboarding completion semantics', () => {
       hosted: true,
       organizationId: 'org_1',
       record: { display: 'expanded' },
-      facts: { github: true, agentLogin: true, e2b: true, vault: false, card: false, project: true },
+      facts: { github: true, agentLogin: true, ownCompute: true, managedCompute: false, vault: false, card: false, project: true },
     });
     expect(status).toMatchObject({ complete: true, completedRequired: 4, totalRequired: 4 });
     expect(status.steps.optional).toMatchObject({ complete: false, blocking: false });
@@ -388,7 +406,7 @@ describe('hosted onboarding completion semantics', () => {
     const status = hostedOnboardingStatus({
       hosted: true,
       organizationId: 'org_established',
-      facts: { github: false, agentLogin: false, e2b: false, vault: false, card: false, project: true },
+      facts: { github: false, agentLogin: false, ownCompute: false, managedCompute: false, vault: false, card: false, project: true },
     });
     expect(status).toMatchObject({ eligible: false, visible: false });
   });

@@ -5798,9 +5798,17 @@ function onboardingStep(number, key, title, detail, action) {
   const step = S.onboarding?.steps?.[key] || {};
   return `<li class="onboarding-step ${step.complete ? 'complete' : ''}">
     <span class="onboarding-check" aria-hidden="true">${step.complete ? '✓' : number}</span>
-    <div class="onboarding-step-copy"><div class="onboarding-step-title">${esc(title)}${key === 'optional' || key === 'paidPlan' ? '<span class="onboarding-optional">Optional</span>' : ''}</div>
-      <p>${detail}</p>${action}</div>
+    <div class="onboarding-step-copy"><div class="onboarding-step-title">${esc(title)}${key === 'optional' ? '<span class="onboarding-optional">Optional</span>' : ''}</div>
+      ${detail ? `<p>${detail}</p>` : ''}${action}</div>
   </li>`;
+}
+
+/** One of the ways to finish a step; either one completes it. */
+function onboardingOption(done, title, hint, href, label) {
+  return `<div class="onboarding-option ${done ? 'complete' : ''}">
+    <div><b>${done ? '<span aria-hidden="true">✓ </span>' : ''}${esc(title)}</b><small>${hint}</small></div>
+    <a class="btn sm" data-spa href="${href}">${label}</a>
+  </div>`;
 }
 
 function pollOnboarding() {
@@ -5860,6 +5868,7 @@ function renderOnboarding() {
   }
   const settings = globalRoute('organization');
   const optional = state.steps.optional || {};
+  const compute = state.steps.compute || {};
   host.innerHTML = `<section class="onboarding-card" aria-labelledby="onboarding-title">
     <div class="onboarding-head"><div><span class="onboarding-eyebrow">Workspace setup</span><h2 id="onboarding-title">Set up ${siteNameMarkup()}</h2></div>
       <div class="onboarding-controls">
@@ -5871,10 +5880,13 @@ function renderOnboarding() {
     <ol class="onboarding-list">
       ${onboardingStep(1, 'github', 'Connect GitHub', `Import repositories and let ${siteNameMarkup()} work through reviewed pull requests.`, `<a class="btn sm" data-spa href="${settings}#settings-code">${state.steps.github.complete ? 'Manage GitHub' : 'Connect GitHub'}</a>`)}
       ${onboardingStep(2, 'agentLogin', 'Add agent logins', 'Connect at least one usable Codex, Claude, or API-key account.', `<a class="btn sm" data-spa href="${settings}#settings-agents">${state.steps.agentLogin.complete ? 'Manage agent logins' : 'Add agent login'}</a>`)}
-      ${onboardingStep(3, 'e2b', 'Connect a cloud computer', 'Add an E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud key: your agents work on its computers.', `<a class="btn sm" data-spa href="${settings}#settings-computers">${state.steps.e2b.complete ? 'Manage computers' : 'Connect a computer'}</a>`)}
+      ${onboardingStep(3, 'compute', 'Get computers for your agents', '', `<div class="onboarding-options">
+        ${onboardingOption(compute.managed, 'Buy a paid plan', `Includes ${siteNameMarkup()}’s computers`, `${settings}#settings-plan`, compute.managed ? 'Manage plan' : 'View plans')}
+        <span class="onboarding-or">or</span>
+        ${onboardingOption(compute.own, 'Connect your own compute', 'E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud', `${settings}#settings-computers`, compute.own ? 'Manage' : 'Connect')}
+      </div>`)}
       ${onboardingStep(4, 'optional', 'Connect apps and payment cards', 'Connect services and give agents approved access to passwords and purchases. This never blocks setup.', `<a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault || optional.card ? 'Manage apps &amp; cards' : 'Set up apps &amp; cards'}</a>`)}
-      ${onboardingStep(5, 'paidPlan', 'Buy paid plan', 'Choose a paid subscription for this workspace, or keep using Free. This never blocks setup.', `<a class="btn sm" data-spa href="${settings}#settings-plan">${state.steps.paidPlan?.complete ? 'Manage paid plan' : 'View plans &amp; billing'}</a>`)}
-      ${onboardingStep(6, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
+      ${onboardingStep(5, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
     </ol>
     <div class="onboarding-foot">${state.replay && state.completedRequired === state.totalRequired ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span></div>
   </section>`;

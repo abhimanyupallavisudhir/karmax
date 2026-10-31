@@ -130,7 +130,7 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await step('the agent key counts', () => expect.poll(completed, { timeout: 15_000 }).toBe('1 of 4 required steps'));
 
       await page.locator('#onboarding-expand').click();
-      await guide.getByRole('link', { name: 'Connect a computer' }).click();
+      await guide.getByRole('link', { name: 'Connect', exact: true }).click();
       await page.locator('#org-computers .computer-add > summary').click();
       await page.locator('#org-computers .computer-add [data-provider="e2b"]').click();
       await page.locator('.computer-dialog .computer-key').fill('e2b_journey');
