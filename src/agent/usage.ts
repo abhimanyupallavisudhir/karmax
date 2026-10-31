@@ -63,6 +63,10 @@ export interface UsageSnapshot {
   models?: { name: string; pct: number; resetLabel: string; tz?: string; resetAt?: number }[];
 }
 
+/** A cached reading carried past a failed check: its numbers are from `at`;
+ * the check at `failedAt` could not read new ones. */
+export type UsageReading = UsageResult & { failedAt?: number; failure?: string };
+
 export interface UsageUnavailable {
   ok: false;
   at: number;
@@ -124,9 +128,10 @@ export function parseUsagePanel(text: string, now: number): UsageResult {
   }
 
   if (!s && !wa && models.length === 0) {
-    // No numbers. Distinguish "subscription but usage query returned nothing"
-    // (setup-token) from "not logged in / not a subscription".
-    return { ok: false, at: now, reason: SUBSCRIPTION_RE.test(text) ? 'setup-token' : 'not-subscription' };
+    // No numbers. A subscription header alone means the usage query itself
+    // failed (only full logins are probed; e.g. an unusable access token), which
+    // is not the same as "not logged in / not a subscription".
+    return { ok: false, at: now, reason: SUBSCRIPTION_RE.test(text) ? 'probe-failed: no usage numbers' : 'not-subscription' };
   }
   return {
     ok: true,
@@ -223,12 +228,23 @@ export const USAGE_TTL_MS = 15 * 60_000;
  * when the probe itself is older than the TTL. A *fresh* failed probe is NOT stale
  * (don't hammer a failing CLI); it becomes stale again once the TTL passes.
  */
-export function isUsageStale(snap: UsageResult | undefined, now: number, ttlMs = USAGE_TTL_MS): boolean {
+export function isUsageStale(snap: UsageReading | undefined, now: number, ttlMs = USAGE_TTL_MS): boolean {
   if (!snap) return true; // pollable but never probed
-  if (now - snap.at > ttlMs) return true;
+  if (now - (snap.failedAt ?? snap.at) > ttlMs) return true;
+  if (snap.failedAt) return false; // the last check failed: back off like a failed probe
   if (!snap.ok) return false;
   const wins = [snap.session, snap.week, ...(snap.models ?? [])].filter((w): w is UsageWindow => !!w);
   return wins.some((w) => w.resetAt !== undefined && w.resetAt < now);
+}
+
+/** What to cache after a check: a failed check (`probe-failed`: a timeout, a CLI
+ * that printed no numbers) keeps the last numbers, marked with when and why it
+ * failed, rather than replacing them with nothing. A new reading, or a definite
+ * answer (signed out, no subscription), replaces them. */
+export function withLastReading(previous: UsageReading | undefined, fresh: UsageResult): UsageReading {
+  if (fresh.ok || !fresh.reason.startsWith('probe-failed') || !previous?.ok) return fresh;
+  const { failedAt: _failedAt, failure: _failure, ...last } = previous;
+  return { ...last, failedAt: fresh.at, failure: fresh.reason };
 }
 
 /** A native quota probe authenticates through the same provider login used for
@@ -289,6 +305,9 @@ function tzOffsetMs(instant: number, tz: string): number {
 
 // ── Probe ──────────────────────────────────────────────────────────────────────
 
+/** A usage check needs its access token to outlive the CLI call. */
+const CLAUDE_USAGE_TOKEN_MARGIN_MS = 30_000;
+
 /** Path to the full-login credential for a home (or ambient ~/.claude). */
 function claudeCredentialPath(configHome?: string): string {
   return path.join(configHome ?? path.join(os.homedir(), '.claude'), '.credentials.json');
@@ -303,7 +322,8 @@ function codexCredentialPath(configHome?: string): string {
  * the ambient ~/.claude login). Returns real numbers only for full-login creds.
  */
 export async function probeClaudeUsage(
-  opts: { configHome?: string; now?: number; timeoutMs?: number; run?: UsageRunner } = {},
+  opts: { configHome?: string; now?: number; timeoutMs?: number; run?: UsageRunner;
+    /** Tests: the canonical login refresh (refreshClaudeAccessToken's runner). */ refresh?: UsageRunner } = {},
 ): Promise<UsageResult> {
   const now = opts.now ?? Date.now();
   if (opts.configHome) await modelLoginsFor(opts.configHome)?.sync(opts.configHome);
@@ -312,6 +332,21 @@ export async function probeClaudeUsage(
   // karmax-oauth.json) or logged-out homes are reported unavailable, not probed.
   if (!hasClaudeNativeCredential(path.dirname(cred))) {
     return { ok: false, at: now, reason: opts.configHome ? 'setup-token' : 'logged-out' };
+  }
+  // The probe below has no refresh authority, so an access token that has
+  // lapsed (an idle login's does within hours) reads no numbers. Refresh it
+  // first through the one canonical, single-writer refresh.
+  if (opts.configHome) {
+    const home = opts.configHome;
+    const expiresAt = claudeAccessTokenExpiresAt(home);
+    if (!claudeAccessToken(home) || (expiresAt !== undefined && expiresAt - now < CLAUDE_USAGE_TOKEN_MARGIN_MS)) {
+      try {
+        await refreshClaudeAccessToken({ configHome: home, timeoutMs: opts.timeoutMs, run: opts.refresh });
+      } catch (e) {
+        if (e instanceof ProviderFailure && e.metadata.kind === 'credential') return { ok: false, at: now, reason: 'logged-out' };
+        return { ok: false, at: now, reason: `probe-failed: ${String((e as Error).message ?? e)}` };
+      }
+    }
   }
   // Isolate: the probe gets the current access token and account metadata, but no
   // refresh authority. A successful refresh commonly rotates the refresh token;

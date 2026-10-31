@@ -13,13 +13,13 @@ const credentials = [login('claude', 'work'), login('codex', 'home'),
   { key: 'key:handle:kimi-k', label: 'kimi:k', provider: 'kimi', kind: 'key', account: 'k' }];
 const [claude, codex, kimi] = credentials.map((c) => c.key) as [string, string, string];
 
-async function agentsCard() {
+async function agentsCard(claudeUsage?: Record<string, unknown>) {
   const accounts = [
     { id: claude, status: 'available', inUse: 0, maxConcurrent: 10 },
     { id: codex, status: 'exhausted', resetAt: Date.now() + 5 * H, inUse: 0, maxConcurrent: 1_000_000 },
     { id: kimi, status: 'available', inUse: 2, maxConcurrent: 4 },
   ];
-  const usage = { [claude]: { ok: true, at: Date.now(), session: { pct: 23, resetAt: Date.now() + H }, week: { pct: 91, resetAt: Date.now() + 50 * H } } };
+  const usage = { [claude]: claudeUsage ?? { ok: true, at: Date.now(), session: { pct: 23, resetAt: Date.now() + H }, week: { pct: 91, resetAt: Date.now() + 50 * H } } };
   let policy: Record<string, unknown> = {};
   const ui = await consolePage({ api: ({ method, path, body }: ApiCall) => {
     const base = '/api/organizations/org_x';
@@ -103,6 +103,25 @@ describe('Settings → Agents accounts list', () => {
     await ui.page.getByRole('button', { name: /Unsaved changes/ }).click();
     await expect.poll(() => posts('/credentials/policy')).toEqual([{ scope: 'global', policy: { order: [kimi, claude, codex] } }]);
     expect(ui.errors).toEqual([]);
+    await ui.close();
+  });
+
+  it('keeps the last numbers when a check fails, saying so', async () => {
+    const { ui, row } = await agentsCard({ ok: true, at: Date.now() - 2 * H, failedAt: Date.now(), failure: 'probe-failed: usage probe timed out',
+      week: { pct: 40, resetAt: Date.now() + 50 * H } });
+    expect(await row(claude).locator('.acct-meter').innerText()).toMatch(/40%\s*week/);
+    await row(claude).locator('.acct-expand').click();
+    const checked = row(claude).locator('.acct-checked');
+    expect(await checked.innerText()).toBe('Couldn’t check just now · read 2h ago');
+    expect(await checked.getAttribute('title')).toBe('probe-failed: usage probe timed out');
+    await ui.close();
+  });
+
+  it('says a check failed rather than blaming a setup-token sign-in', async () => {
+    const { ui, row } = await agentsCard({ ok: false, at: Date.now(), reason: 'probe-failed: no usage numbers' });
+    await row(claude).locator('.acct-expand').click();
+    expect(await row(claude).locator('.acct-detail').innerText()).toContain('Couldn’t check usage');
+    expect(await row(claude).locator('.acct-detail').innerText()).not.toContain('setup-token');
     await ui.close();
   });
 

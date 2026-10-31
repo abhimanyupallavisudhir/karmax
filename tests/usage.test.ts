@@ -17,6 +17,7 @@ import {
   isUsagePollable,
   isUsageStale,
   USAGE_TTL_MS,
+  withLastReading,
 } from '../src/agent/usage.js';
 import { isTransportError, ProviderFailure, ProviderOutage } from '../src/agent/limits.js';
 
@@ -40,7 +41,8 @@ const FULL_PANEL = [
   '  90% of your usage was at >150k context',
 ].join('\n');
 
-// A setup-token login: the header renders but the usage query returns no numbers.
+// The header renders but the usage query returns no numbers — what a full login
+// prints when its access token cannot be used (setup-token homes are never probed).
 const HEADER_ONLY = 'You are currently using your subscription to power your Claude Code usage';
 
 // A logged-out home: `/usage` falls through to the print-mode stats footer.
@@ -89,9 +91,9 @@ describe('parseUsagePanel', () => {
     expect(r.session!.resetAt!).toBeLessThan(NOW + 2 * 86_400_000);
   });
 
-  it('flags a setup-token login (header, no numbers) as unavailable/setup-token', () => {
+  it('reads a header without numbers as a failed check, not a setup-token login', () => {
     const r = parseUsagePanel(HEADER_ONLY, NOW);
-    expect(r).toEqual({ ok: false, at: NOW, reason: 'setup-token' });
+    expect(r).toEqual({ ok: false, at: NOW, reason: 'probe-failed: no usage numbers' });
   });
 
   it('flags a logged-out home (stats footer) as unavailable/not-subscription', () => {
@@ -250,6 +252,71 @@ describe('probeClaudeUsage', () => {
       } });
       expect(r.ok).toBe(true);
       expect(fs.readFileSync(path.join(home, '.credentials.json'), 'utf8')).toBe(credential);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // An idle login's access token lapses within hours; the probe has no refresh
+  // authority, so it used to read nothing and the login showed "setup-token"
+  // until a task happened to refresh it (2026-10-31).
+  it('refreshes an expired access token through the canonical login before reading usage', async () => {
+    const home = mkHome(false);
+    fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+      accessToken: 'expired-access', refreshToken: 'canonical-refresh', expiresAt: NOW - 60_000,
+    } }));
+    const refreshed: string[] = [];
+    try {
+      const r = await probeClaudeUsage({ configHome: home, now: NOW,
+        refresh: async (canonicalHome) => {
+          refreshed.push(canonicalHome);
+          fs.writeFileSync(path.join(canonicalHome, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+            accessToken: 'fresh-access', refreshToken: 'rotated-refresh', expiresAt: Date.now() + 3_600_000,
+          } }));
+          return '';
+        },
+        run: async (probeHome) => {
+          const probeCredential = JSON.parse(fs.readFileSync(path.join(probeHome, '.credentials.json'), 'utf8'));
+          return probeCredential.claudeAiOauth.accessToken === 'fresh-access' && !probeCredential.claudeAiOauth.refreshToken
+            ? FULL_PANEL : HEADER_ONLY;
+        } });
+      expect(refreshed).toEqual([home]);
+      expect(r.ok).toBe(true);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves a still-valid access token alone', async () => {
+    const home = mkHome(false);
+    fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+      accessToken: 'current-access', refreshToken: 'canonical-refresh', expiresAt: NOW + 3_600_000,
+    } }));
+    let refreshes = 0;
+    try {
+      const r = await probeClaudeUsage({ configHome: home, now: NOW, refresh: async () => { refreshes++; return ''; }, run: async () => FULL_PANEL });
+      expect(r.ok).toBe(true);
+      expect(refreshes).toBe(0);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('reports a login whose refresh finds it signed out as logged-out', async () => {
+    const home = mkHome(false);
+    fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+      accessToken: 'expired-access', refreshToken: 'revoked-refresh', expiresAt: NOW - 60_000,
+    } }));
+    let ran = false;
+    try {
+      const r = await probeClaudeUsage({ configHome: home, now: NOW,
+        refresh: async (canonicalHome) => {
+          fs.writeFileSync(path.join(canonicalHome, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: '', expiresAt: 0 } }));
+          return '';
+        },
+        run: async () => { ran = true; return FULL_PANEL; } });
+      expect(r).toEqual({ ok: false, at: NOW, reason: 'logged-out' });
+      expect(ran).toBe(false);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }
@@ -726,5 +793,25 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }
+  });
+});
+
+describe('withLastReading', () => {
+  const good = { ok: true as const, at: NOW - 3_600_000, week: { pct: 40, resetLabel: 'Jul 9', resetAt: NOW + 86_400_000 } };
+  it('keeps the last numbers when a check fails, saying when and why', () => {
+    const failed = { ok: false as const, at: NOW, reason: 'probe-failed: usage probe timed out' };
+    const kept = withLastReading(good, failed);
+    expect(kept).toEqual({ ...good, failedAt: NOW, failure: 'probe-failed: usage probe timed out' });
+    // A failed check backs off like a fresh one: no re-probe every minute.
+    expect(isUsageStale(kept, NOW + 60_000)).toBe(false);
+    expect(isUsageStale(kept, NOW + USAGE_TTL_MS + 1)).toBe(true);
+  });
+  it('takes a new reading, and a definite answer (signed out) over old numbers', () => {
+    const fresh = { ok: true as const, at: NOW, session: { pct: 5, resetLabel: 'x' } };
+    expect(withLastReading({ ...good, failedAt: NOW - 1, failure: 'probe-failed: x' }, fresh)).toEqual(fresh);
+    const loggedOut = { ok: false as const, at: NOW, reason: 'logged-out' };
+    expect(withLastReading(good, loggedOut)).toEqual(loggedOut);
+    const failed = { ok: false as const, at: NOW, reason: 'probe-failed: boom' };
+    expect(withLastReading(undefined, failed)).toEqual(failed);
   });
 });
