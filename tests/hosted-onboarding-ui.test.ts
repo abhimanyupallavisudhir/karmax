@@ -7,8 +7,8 @@ type Status = Record<string, any>;
 const status = (overrides: Status = {}): Status => ({
   organizationId: 'o', visible: true, display: 'expanded', complete: false, replay: false,
   completedRequired: 2, totalRequired: 4,
-  steps: { github: { complete: true }, agentLogin: { complete: false }, e2b: { complete: true }, optional: {},
-    paidPlan: { complete: false }, project: { complete: false } },
+  steps: { github: { complete: true }, agentLogin: { complete: false },
+    compute: { complete: true, managed: false, own: true }, optional: {}, project: { complete: false } },
   ...overrides,
 });
 
@@ -33,14 +33,34 @@ describe('hosted onboarding UI', () => {
     const steps = guide(ui).locator('.onboarding-step');
     await steps.first().waitFor();
     expect(await steps.locator('.onboarding-step-title').allInnerTexts()).toEqual([
-      'Connect GitHub', 'Add agent logins', 'Connect a cloud computer',
-      'Connect apps and payment cards\nOPTIONAL', 'Buy paid plan\nOPTIONAL', 'Create your first project', // chip is upper-cased by CSS
+      'Connect GitHub', 'Add agent logins', 'Get computers for your agents',
+      'Connect apps and payment cards\nOPTIONAL', 'Create your first project', // chip is upper-cased by CSS
     ]);
     expect(await steps.nth(3).innerText()).toContain('This never blocks setup.');
-    expect(await steps.nth(4).innerText()).toContain('This never blocks setup.');
     expect(await guide(ui).locator('.onboarding-foot').innerText()).toContain('Optional items do not count toward completion.');
     // Completed steps show a tick instead of their number.
-    expect(await steps.locator('.onboarding-check').allInnerTexts()).toEqual(['✓', '2', '✓', '4', '5', '6']);
+    expect(await steps.locator('.onboarding-check').allInnerTexts()).toEqual(['✓', '2', '✓', '4', '5']);
+    await ui.close();
+  });
+
+  it('offers a paid plan or the organization’s own compute as two ways to finish one required step', async () => {
+    let compute = { complete: false, managed: false, own: false };
+    const ui = await hosted({ onboarding: () => status({ steps: { ...status().steps, compute } }) });
+    const step = guide(ui).locator('.onboarding-step').nth(2);
+    await step.waitFor();
+    expect(await step.locator('.onboarding-optional').count()).toBe(0); // required, neither option is "optional"
+    const options = step.locator('.onboarding-option');
+    expect(await options.locator('b').allInnerTexts()).toEqual(['Buy a paid plan', 'Connect your own compute']);
+    expect((await step.locator('.onboarding-or').innerText()).toLowerCase()).toBe('or');
+    expect(await options.locator('a.btn').evaluateAll((links) => links.map((link) => [link.textContent?.trim(), link.getAttribute('href')])))
+      .toEqual([['View plans', '/org/settings#settings-plan'], ['Connect', '/org/settings#settings-computers']]);
+    expect(await step.locator('.onboarding-check').innerText()).toBe('3');
+
+    // Either option alone completes the step; the one taken is ticked and offers management.
+    compute = { complete: true, managed: true, own: false };
+    await expect.poll(() => step.locator('.onboarding-check').innerText(), { timeout: 8_000 }).toBe('✓');
+    expect(await options.evaluateAll((rows) => rows.map((row) => row.classList.contains('complete')))).toEqual([true, false]);
+    expect(await options.locator('a.btn').allInnerTexts()).toEqual(['Manage plan', 'Connect']);
     await ui.close();
   });
 
@@ -49,8 +69,8 @@ describe('hosted onboarding UI', () => {
     const actions = await guide(ui).locator('.onboarding-step a.btn').evaluateAll((links) =>
       links.map((link) => [link.textContent?.trim(), link.getAttribute('href')]));
     expect(actions.map(([, href]) => href)).toEqual(['/org/settings#settings-code', '/org/settings#settings-agents',
-      '/org/settings#settings-computers', '/org/settings#settings-payments', '/org/settings#settings-plan']);
-    expect(actions[2]![0]).toBe('Manage computers'); // a completed step offers management, not setup
+      '/org/settings#settings-plan', '/org/settings#settings-computers', '/org/settings#settings-payments']);
+    expect(actions[3]![0]).toBe('Manage'); // a completed option offers management, not setup
     await guide(ui).locator('.onboarding-step a[href$="#settings-agents"]').click();
     await expect.poll(() => ui.run<string>('location.pathname + location.hash')).toBe('/org/settings#settings-agents');
     await guide(ui).locator('#onboarding-new-project').click();
