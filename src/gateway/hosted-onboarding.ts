@@ -7,12 +7,18 @@ export const parseHostedOnboardingDisplay = (value: unknown): HostedOnboardingDi
 export interface HostedOnboardingFacts {
   github: boolean;
   agentLogin: boolean;
-  e2b: boolean;
+  /** A compute provider account of the organization's own (E2B, Daytona, …). */
+  ownCompute: boolean;
+  /** tavya's computers: a paid plan, or compute credit from packs or a gift. */
+  managedCompute: boolean;
   vault: boolean;
   card: boolean;
   project: boolean;
-  paidPlan?: boolean;
 }
+
+/** The facts every required step needs, in walkthrough order. */
+export const hostedOnboardingRequired = (facts: HostedOnboardingFacts) =>
+  [facts.github, facts.agentLogin, facts.ownCompute || facts.managedCompute, facts.project];
 
 export interface HostedOnboardingRecord {
   display: HostedOnboardingDisplay;
@@ -44,7 +50,8 @@ export function hostedOnboardingStatus(input: {
   record?: HostedOnboardingRecord;
   facts: HostedOnboardingFacts;
 }) {
-  const requiredComplete = input.facts.github && input.facts.agentLogin && input.facts.e2b && input.facts.project;
+  const required = hostedOnboardingRequired(input.facts);
+  const requiredComplete = required.every(Boolean);
   const complete = Boolean(input.record?.completedAt) || (requiredComplete && !input.record?.replay);
   return {
     organizationId: input.organizationId,
@@ -53,13 +60,17 @@ export function hostedOnboardingStatus(input: {
     complete,
     replay: input.record?.replay === true,
     display: input.record?.display ?? 'expanded' as HostedOnboardingDisplay,
-    completedRequired: [input.facts.github, input.facts.agentLogin, input.facts.e2b, input.facts.project]
-      .filter(Boolean).length,
-    totalRequired: 4,
+    completedRequired: required.filter(Boolean).length,
+    totalRequired: required.length,
     steps: {
       github: { complete: input.facts.github },
       agentLogin: { complete: input.facts.agentLogin },
-      e2b: { complete: input.facts.e2b },
+      // One step, two ways to satisfy it: tavya's computers or the organization's own.
+      compute: {
+        complete: input.facts.ownCompute || input.facts.managedCompute,
+        managed: input.facts.managedCompute,
+        own: input.facts.ownCompute,
+      },
       optional: {
         complete: input.facts.vault && input.facts.card,
         blocking: false,
@@ -67,7 +78,6 @@ export function hostedOnboardingStatus(input: {
         card: input.facts.card,
       },
       project: { complete: input.facts.project },
-      paidPlan: { complete: input.facts.paidPlan === true, blocking: false },
     },
   };
 }
