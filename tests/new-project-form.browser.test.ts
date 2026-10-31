@@ -10,7 +10,7 @@ afterAll(closeConsoleBrowser);
 const site = { id: 'r1', owner: 'acme', name: 'site', sshUrl: 'git@github.com:acme/site.git', defaultBranch: 'main' };
 
 async function form(options: { github?: boolean; hosted?: boolean; refuseCreate?: boolean; repositories?: unknown[];
-  connection?: Record<string, unknown>; logins?: string[] } = {}) {
+  connection?: Record<string, unknown>; logins?: string[]; refreshed?: unknown[] } = {}) {
   const github = options.github ?? true;
   const projects: Array<Record<string, unknown>> = [{ id: 'p', organizationId: 'o', name: 'Workspace', config: {} }];
   const ui = await consolePage({ path: '/org/workspace', api: signedIn(({ method, path, body }: ApiCall) => {
@@ -29,6 +29,8 @@ async function form(options: { github?: boolean; hosted?: boolean; refuseCreate?
       return { status: 422, json: { error: 'Repository creation failed: name already exists on this account' } };
     if (method === 'POST' && path === '/api/organizations/o/repositories/create')
       return { id: 'r2', owner: 'acme', name: body.name, sshUrl: `git@github.com:acme/${body.name}.git`, defaultBranch: 'main' };
+    if (method === 'POST' && path === '/api/organizations/o/github/refresh')
+      return { repositories: options.refreshed ?? options.repositories ?? [site], count: (options.refreshed ?? []).length };
     if (method === 'POST' && path === '/api/projects/n/secrets') return { imported: ['API_KEY'] };
     if (method === 'PUT' && path === '/api/projects/n/environment') return { spec: body };
     return undefined;
@@ -126,8 +128,8 @@ describe('New project form', () => {
     await dialog.getByRole('radio', { name: 'Choose other repositories' }).check();
     const picker = dialog.getByRole('combobox', { name: 'Add a repository' });
     const options = ui.page.getByRole('listbox', { name: 'Repositories' }).getByRole('option');
-    // Focused and empty: every repository, and a way to make a new one.
-    await expect.poll(() => options.allInnerTexts()).toEqual(['acme/site', 'acme/docs', 'New repo…']);
+    // Focused and empty: every repository, and ways to make a new one or fork another.
+    await expect.poll(() => options.allInnerTexts()).toEqual(['acme/site', 'acme/docs', 'New repo…', 'Fork a repository…']);
     expect(await picker.getAttribute('aria-expanded')).toBe('true');
     await picker.fill('do');
     await expect.poll(() => options.allInnerTexts()).toEqual(['acme/docs', 'New repo acme/do']);
@@ -141,7 +143,7 @@ describe('New project form', () => {
     expect(await picker.inputValue()).toBe('');
     // What is in the list is no longer offered.
     await picker.fill('');
-    await expect.poll(() => options.allInnerTexts()).toEqual(['acme/site', 'New repo…']);
+    await expect.poll(() => options.allInnerTexts()).toEqual(['acme/site', 'New repo…', 'Fork a repository…']);
     // Esc closes the menu, not the New project dialog.
     await picker.press('Escape');
     expect(await picker.getAttribute('aria-expanded')).toBe('false');
@@ -178,6 +180,64 @@ describe('New project form', () => {
     await ui.close();
   });
 
+  it('adds a repository still typed in the list when Create is pressed, by any GitHub address', async () => {
+    const { ui, dialog } = await form({ hosted: true });
+    await dialog.getByRole('textbox', { name: 'Project name' }).fill('Fresh');
+    await dialog.getByRole('radio', { name: 'Choose other repositories' }).check();
+    const picker = dialog.getByRole('combobox', { name: 'Add a repository' });
+    // A pasted page of the repository finds it in the list.
+    await picker.fill('https://github.com/acme/site/tree/main');
+    await expect.poll(() => ui.page.getByRole('listbox', { name: 'Repositories' }).getByRole('option').first().innerText()).toBe('acme/site');
+    await dialog.getByRole('button', { name: 'Create project' }).click();
+    await expect.poll(() => ui.calls.find((call) => call.path === '/api/organizations/o/projects')?.body)
+      .toEqual({ name: 'Fresh', config: {}, repos: ['git@github.com:acme/site.git'] });
+    await ui.close();
+  });
+
+  it('forks someone else’s repository from the list, pasted as a .git URL, and makes the project on the fork', async () => {
+    const fork = { id: 'r9', owner: 'acme', name: 'widgets', sshUrl: 'git@github.com:acme/widgets.git', defaultBranch: 'main',
+      upstream: { owner: 'octo', name: 'widgets', defaultBranch: 'main', private: false } };
+    const { ui, dialog } = await form({ hosted: true, refreshed: [site, fork] });
+    await dialog.getByRole('textbox', { name: 'Project name' }).fill('Widgets');
+    await dialog.getByRole('radio', { name: 'Choose other repositories' }).check();
+    const picker = dialog.getByRole('combobox', { name: 'Add a repository' });
+    const options = ui.page.getByRole('listbox', { name: 'Repositories' }).getByRole('option');
+    await expect.poll(() => options.allInnerTexts()).toEqual(['acme/site', 'New repo…', 'Fork a repository…']);
+    await picker.fill('https://github.com/octo/widgets.git');
+    await expect.poll(() => options.allInnerTexts()).toEqual(['Fork octo/widgets…']);
+    // Left unchosen, Create stops and points at what to do with it.
+    await dialog.getByRole('button', { name: 'Create project' }).click();
+    const error = dialog.locator('.new-project-error');
+    await error.waitFor();
+    expect(await error.innerText()).toBe('Choose what to do with “https://github.com/octo/widgets.git”, or clear it.');
+    expect(await picker.getAttribute('aria-expanded')).toBe('true');
+    expect(ui.calls.some((call) => call.method === 'POST')).toBe(false);
+    await picker.press('Enter');
+    const forking = ui.page.getByRole('dialog', { name: 'Fork a repository' });
+    expect(await forking.getByLabel('Repository').inputValue()).toBe('octo/widgets');
+    expect(await forking.getByRole('link', { name: /Fork on GitHub/ }).getAttribute('href')).toBe('https://github.com/octo/widgets/fork');
+    await forking.getByRole('button', { name: 'Attach fork' }).click();
+    await forking.waitFor({ state: 'detached' });
+    const row = dialog.locator('.git-repo', { hasText: 'widgets' });
+    expect(await row.innerText()).toContain('→ octo/widgets');
+    await dialog.getByRole('button', { name: 'Create project' }).click();
+    await expect.poll(() => ui.calls.find((call) => call.path === '/api/organizations/o/projects')?.body)
+      .toEqual({ name: 'Widgets', config: {}, repos: ['git@github.com:acme/widgets.git'] });
+    expect(ui.errors).toEqual([]);
+    await ui.close();
+  });
+
+  it('says so instead of making a project without the repository named after it', async () => {
+    const { ui, dialog } = await form();
+    await dialog.getByRole('textbox', { name: 'Project name' }).fill('日本');
+    await dialog.getByRole('button', { name: 'Create project' }).click();
+    const error = dialog.locator('.new-project-error');
+    await error.waitFor();
+    expect(await error.innerText()).toBe('A GitHub repo name needs Latin letters or digits. Rename the project, or choose other repositories.');
+    expect(ui.calls.some((call) => call.method === 'POST')).toBe(false);
+    await ui.close();
+  });
+
   it('in someone else’s personal GitHub account, says why it cannot create one and offers to connect yours', async () => {
     const { ui, dialog } = await form({ connection: { id: 'g1', accountLogin: 'srajma', accountType: 'User' }, logins: ['pat'], repositories: [] });
     await dialog.getByRole('textbox', { name: 'Project name' }).fill('Corruption Detector');
@@ -191,6 +251,14 @@ describe('New project form', () => {
     const picker = dialog.getByRole('combobox', { name: 'Add a repository' });
     await picker.fill('corruption-detector');
     expect(await ui.page.getByRole('listbox', { name: 'Repositories' }).getByRole('option').allInnerTexts()).toEqual([]);
+    // Create does not drop what was typed: it stops, saying so.
+    await dialog.getByRole('textbox', { name: 'Project name' }).press('Enter');
+    const error = dialog.locator('.new-project-error');
+    await error.waitFor();
+    expect(await error.innerText()).toBe('“corruption-detector” is not a repository you can add. Clear it to continue.');
+    expect(ui.calls.some((call) => call.method !== 'GET')).toBe(false);
+    await picker.fill('');
+    expect(await error.isVisible()).toBe(false);
     await dialog.getByRole('textbox', { name: 'Project name' }).press('Enter');
     await expect.poll(() => ui.calls.filter((call) => call.method !== 'GET'))
       .toEqual([{ method: 'POST', path: '/api/organizations/o/projects', body: { name: 'Corruption Detector', config: {} } }]);

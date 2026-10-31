@@ -59,7 +59,7 @@ import { validCodexSessionId } from '../agent/codex-history.js';
 import { conversionWarningsHeader, exportConversationWithPanagent, PanagentError, type PanagentWarning } from '../agent/panagent.js';
 import { DEFAULT_MCP_CONNECTIONS, defaultModel, defaultEffort, organizationProfileId, projectProfileId, roleDefaultProfile } from '../agent/profiles.js';
 import { repositoryBranchDefaults } from '../platform/branch-defaults.js';
-import { sameRepository } from '../world/repository-identity.js';
+import { projectRepositorySource, sameRepository } from '../world/repository-identity.js';
 import { QRY_AGENT_QUEUE, accountCoordinatorId, agentQueueId } from '../coordinators/names.js';
 import { COMPUTE_PRICE_MULTIPLIER, computeChargeMicros, hostedMonthlyPriceCents } from '../domain/entitlements.js';
 import { computeCredit, computeMonth } from '../world/managed-compute.js';
@@ -8788,12 +8788,16 @@ export class Gateway {
 
   /** A project's requested repository sources. Hosted projects may only use
    * repositories the organization's GitHub connection reaches. */
+  /** The sources a project keeps for the repositories a request names, in any
+   * spelling people paste (owner/name, a GitHub page, a clone URL). */
   private async requestedRepositorySources(value: unknown, organizationId: string): Promise<string[]> {
-    const repos = Array.isArray(value) ? value.map(String) : [];
-    if (this.deps.hosted && repos.length) {
-      const known = (await this.deps.store.listRepositories(organizationId)).map((repository) => repository.sshUrl);
-      const unknown = repos.filter((repo) => !known.some((candidate) => sameRepository(candidate, repo)));
-      if (unknown.length) throw new Error('Hosted projects must select repositories available through the organization GitHub connection');
+    const requested = Array.isArray(value) ? value.map(String) : [];
+    if (!requested.length) return [];
+    const catalog = await this.deps.store.listRepositories(organizationId);
+    const repos = requested.map((repo) => projectRepositorySource(repo, catalog));
+    if (this.deps.hosted) {
+      const unknown = requested.filter((_, index) => !catalog.some((repository) => sameRepository(repository.sshUrl, repos[index]!)));
+      if (unknown.length) throw new Error(`Hosted projects must select repositories available through the organization GitHub connection (not ${unknown.join(', ')})`);
     }
     return repos;
   }
