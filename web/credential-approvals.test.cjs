@@ -33,7 +33,7 @@ global.taskRecord = () => undefined;
 global.projectById = (id) => id === 'project_1' ? { id, name: 'App' } : undefined;
 global.projectBase = () => '/personal/app';
 
-for (const name of ['policyTip', 'credentialRequestTaskLink', 'credentialRequestRows', 'permissionRequestRows', 'ignoredChip', 'ignoreRequestButton', 'defaultTaskTab']) eval(extractFn(name));
+for (const name of ['policyTip', 'credentialRequestTaskLink', 'credentialRequestRows', 'requestReasonLine', 'permissionRequestRows', 'ignoredChip', 'ignoreRequestButton', 'defaultTaskTab']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
