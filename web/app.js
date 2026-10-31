@@ -11333,11 +11333,11 @@ function approvalHistoryHtml() {
   if (S.taskApprovalsFor !== S.selected) return '<span class="global-search-loading">Loading…</span>';
   return `<div class="approval-list">
     ${connectionRows(S.connections || [], true)}
-    ${permissionRequestRows(S.permissionRequests)}
+    ${permissionRequestRows(S.permissionRequests, { inTask: true })}
     ${authorizationRequestRows(S.authorizationRequests || [])}
     ${repositoryAccessRequestRows(S.repositoryAccessRequests || [])}
     ${credentialRequestRows(S.approvalRequests, S.approvalItems, {
-      historyLimit: 20,
+      historyLimit: 20, inTask: true,
       showEmpty: !S.permissionRequests.length && !(S.authorizationRequests || []).length && !(S.connections || []).length
         && !(S.repositoryAccessRequests || []).length,
     })}
@@ -11387,10 +11387,10 @@ function conversationApprovalRequests() {
   const connections = (S.connections || []).filter((connection) => !connection.dismissed
     && (['requested', 'connecting', 'expired'].includes(connection.status) || connection.disconnectPending));
   const rows = connectionRows(connections, true)
-    + permissionRequestRows(pending(S.permissionRequests))
+    + permissionRequestRows(pending(S.permissionRequests), { inTask: true })
     + authorizationRequestRows(pending(S.authorizationRequests))
     + repositoryAccessRequestRows(pending(S.repositoryAccessRequests))
-    + credentialRequestRows(pending(S.approvalRequests), S.approvalItems, { showEmpty: false });
+    + credentialRequestRows(pending(S.approvalRequests), S.approvalItems, { showEmpty: false, inTask: true });
   return rows ? `<div class="msg agent" id="task-approval-requests"><div class="role">Approval requests</div><div class="approval-list">${rows}</div></div>` : '';
 }
 
@@ -21126,7 +21126,7 @@ function credentialRequestTaskLink(request) {
 // lives outside the row so a re-render of the approvals list keeps the choice.
 const credentialRequestBindings = new Map();
 
-function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = true } = {}) {
+function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = true, inTask = false } = {}) {
   const itemLabel = (id) => items.find((item) => item.id === id)?.label || id;
   const pending = requests.filter((request) => request.status === 'pending');
   const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
@@ -21142,7 +21142,7 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
             ${request.kind === 'reset' ? '<span class="chip approval-needed">reported invalid</span>' : `<span class="chip">${esc({ use: 'Blind use', reveal: 'Agent sees' }[request.mode] || request.mode)}</span>`}
             ${request.dismissed ? ignoredChip() : ''}
           </div>
-          <div class="task-sub">${credentialRequestTaskLink(request)}${request.why ? ` — ${esc(request.why)}` : ''}</div>
+          ${requestReasonLine(request, request.why, inTask)}
           ${request.kind === 'reset' ? `<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; ${siteNameMarkup()} will resume the agent automatically.</div>`
             : request.mode === 'reveal' ? `<div class="approval-request-warn">The agent will see the plaintext: it travels to the model provider and may end up in training data.</div>`
             : items.find((item) => item.id === request.itemId)?.type === 'passkey' ? '' : `<div class="approval-request-warn caution">Blind use is not foolproof: a misbehaving agent can still leak it, e.g. by entering it on a malicious site.</div>`}
@@ -21178,7 +21178,13 @@ Deny: Rejects this request.`, '?')}
   return pendingHtml + history;
 }
 
-function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
+// Why a request was made, after the task that made it unless that task is the one open.
+function requestReasonLine(request, reason, inTask) {
+  const parts = [inTask ? '' : credentialRequestTaskLink(request), reason ? esc(reason) : ''].filter(Boolean);
+  return parts.length ? `<div class="task-sub">${parts.join(' — ')}</div>` : '';
+}
+
+function permissionRequestRows(requests, { historyLimit = 20, inTask = false } = {}) {
   const pending = requests.filter((request) => request.status === 'pending');
   const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
   const pendingHtml = pending.map((request) => `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-preq="${esc(request.id)}">
@@ -21189,7 +21195,7 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
       <div class="approval-request-caps">${request.capabilities.map((capability) =>
         `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
       ${request.projectIds?.length ? `<div class="approval-request-projects">Add projects: ${request.projectIds.map((id) => `<span class="chip mono">${esc(projectById(id)?.name || id)}</span>`).join(' ')}</div>` : ''}
-      <div class="task-sub">${credentialRequestTaskLink(request)} — ${esc(request.reason)}</div>
+      ${requestReasonLine(request, request.reason, inTask)}
       <div class="approval-request-help">Requested from ${request.audience.map((selector) => {
         const grantor = selector.startsWith('task:') ? (request.grantorTasks || []).find((task) => task.id === selector.slice(5)) : undefined;
         return grantor ? credentialRequestTaskLink({ taskId: grantor.id, task: grantor }) : esc(selector);

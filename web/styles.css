@@ -1366,10 +1366,11 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
 .approval-page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
 .approval-page-head p { margin: 3px 0 0; }
 .approval-list { display: flex; flex-direction: column; gap: 8px; }
-.approval-request { display: flex; align-items: center; gap: 16px; padding: 13px 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); }
-.approval-request-main { flex: 1; min-width: 0; }
+/* The buttons sit beside the text only while the text keeps a readable width; otherwise they wrap below it. */
+.approval-request { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 13px 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); }
+.approval-request-main { flex: 1 1 260px; min-width: 0; overflow-wrap: anywhere; }
 .approval-request-title { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font-weight: 650; margin-bottom: 4px; }
-.approval-request-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 6px; }
+.approval-request-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
 .approval-request-actions .vreq-pick { gap: 8px; max-width: 260px; }
 .approval-request-actions .vreq-pick .tf-vault-count { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .approval-request-actions .vreq-add { font-size: 12px; white-space: nowrap; }
@@ -1380,10 +1381,6 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
 .approval-empty { padding: 24px 14px; border: 1px dashed var(--line); border-radius: var(--r); color: var(--ink-3); text-align: center; }
 .approval-history { margin-top: 14px; }
 .approval-history-row { display: flex; align-items: center; gap: 8px; padding: 6px 2px; border-bottom: 1px solid var(--line); }
-@media (max-width: 760px) {
-  .approval-request { align-items: stretch; flex-direction: column; }
-  .approval-request-actions { justify-content: flex-start; }
-}
 .diff { font-family: var(--font-mono); font-size: 12px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px; overflow-x: auto; white-space: pre; }
 .diff .add { color: var(--merged); }
 .diff .del { color: var(--danger); }
