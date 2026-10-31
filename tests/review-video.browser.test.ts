@@ -142,7 +142,14 @@ it('a ~100 MB saved video starts playing in the Review viewer', async () => {
       responses.push(`${response.status()} ${response.request().headers().range ?? 'whole'}`);
     });
     let resolves = 0;
-    page.on('request', (request) => { if (request.url().endsWith('/review-action')) resolves++; });
+    // The viewer's fresh-URL request too: a failure says whether it was sent and answered.
+    const sinceOpen = () => `${Math.round(Date.now() - openedAt)}ms`;
+    let openedAt = Date.now();
+    page.on('request', (request) => { if (request.url().endsWith('/review-action')) { resolves++; responses.push(`${sinceOpen()} review-action sent`); } });
+    page.on('requestfinished', async (request) => {
+      if (request.url().endsWith('/review-action')) responses.push(`${sinceOpen()} review-action ${(await request.response())?.status()}`);
+    });
+    page.on('requestfailed', (request) => { if (request.url().endsWith('/review-action')) responses.push(`${sinceOpen()} review-action failed: ${request.failure()?.errorText}`); });
     // The first link answers as an expired one would: the viewer gets a fresh
     // URL and plays anyway.
     // (Installed once the gallery's thumbnail has its frame: the viewer reuses
@@ -153,6 +160,7 @@ it('a ~100 MB saved video starts playing in the Review viewer', async () => {
     await thumbnail.waitFor({ state: 'attached' });
     await expect.poll(() => thumbnail.evaluate((v) => (v as any).readyState), { timeout: 20_000 }).toBeGreaterThan(0);
     await page.route(media, async (route) => { await route.fulfill({ status: 403, body: '' }); await page.unroute(media); });
+    openedAt = Date.now();
     await page.getByRole('button', { name: /Watch the video/ }).click();
 
     const player = page.locator('dialog.artifact-reader video');

@@ -126,7 +126,7 @@ import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, knownProviderEndpoin
   requestExplanation, type ExplanationSettings } from '../agent/explanation.js';
 import { avatarCallableBy } from '../platform/avatars.js';
 import { AccountErasureService, ErasureError } from '../privacy/account-erasure.js';
-import { hostedOnboardingKey, hostedOnboardingStatus, parseHostedOnboardingRecord,
+import { hostedOnboardingKey, hostedOnboardingRequired, hostedOnboardingStatus, parseHostedOnboardingRecord,
   parseHostedOnboardingDisplay } from './hosted-onboarding.js';
 import { CHECKOUT_DISCLOSURES, assertPaidLaunchReady, assertPolicyAcceptance,
   policyDocument, publicLaunchInfo } from '../launch/legal.js';
@@ -2606,15 +2606,16 @@ export class Gateway {
           // This organization's own repository access; signing in with GitHub alone gives it none.
           github: (await store.listGitConnections(organizationId)).some((connection) => !connection.suspendedAt),
           agentLogin: enabledCredentials.length > 0,
-          e2b: (await Promise.all(clouds.map(async (connection) => !!connection?.enabled
+          ownCompute: (await Promise.all(clouds.map(async (connection) => !!connection?.enabled
             && !!await this.deps.broker?.hasHandle(connection.credentialHandle)))).some(Boolean),
-          paidPlan: await this.deps.subscriptions?.hasPaidSubscription(organizationId) ?? false,
+          managedCompute: (await this.deps.subscriptions?.hasPaidSubscription(organizationId) ?? false)
+            || ((await store.organizationEntitlements(organizationId)).computeCreditMicros ?? 0) > 0,
           vault: (await new VaultItems(store, this.deps.broker, undefined, organizationId).list())
             .some((item) => item.type === 'login' && item.fields.includes('password')),
           card: (await store.listOrganizationCards(organizationId)).length > 0,
           project: (await store.listProjects()).some((project) => project.organizationId === organizationId),
         };
-        if (finishReplay && record?.replay && facts.github && facts.agentLogin && facts.e2b && facts.project) {
+        if (finishReplay && record?.replay && hostedOnboardingRequired(facts).every(Boolean)) {
           record = { display: record.display, completedAt: Date.now() };
           (await store.kvSet(key, JSON.stringify(record)));
         }
