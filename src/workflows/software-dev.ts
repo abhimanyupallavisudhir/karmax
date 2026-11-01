@@ -439,6 +439,12 @@ const CONTINUE_SOONER = 'software-dev-continue-sooner-v1';
  * closes: the reconciler used to settle it a minute later as "workflow
  * failed", with the cause left in Temporal's history (pramana#13, #137). */
 const FAILURE_NAMES_CAUSE = 'software-dev-failure-names-cause-v1';
+/** The snapshot before sub-tasks heartbeats instead of a 5-minute limit, and
+ * a failure goes to the asking agent as a failed create_sub_task (pramana#137). */
+const SUBTASK_SNAPSHOT_TO_AGENT = 'software-dev-subtask-snapshot-to-agent-v1';
+/** A pull request that cannot move to the head its task's agent opened it at
+ * tells that agent and stays where it was (pramana#137's pull request). */
+const PR_MOVE_FAILURE_TO_AGENT = 'software-dev-pr-move-failure-to-agent-v1';
 /** A continuation input is recorded by value: stay well inside the 2 MB payload limit. */
 const MAX_CONTINUATION_BYTES = 1024 * 1024;
 const CONTINUE_RETRY_EVENTS = 500;
@@ -4123,7 +4129,18 @@ Inspect the complete current diff and specifically compare its delta from the re
         if (pendingHead && world) {
           const head = pendingHead;
           pendingHead = undefined;
-          await core.movePullRequest(world as WorldHandle, head);
+          if (patched(PR_MOVE_FAILURE_TO_AGENT)) {
+            // A head this pull request cannot take is its task's agent's to fix,
+            // not the end of it (pramana#137's): it stays at its last commit.
+            const moved = await core.movePullRequest(world as WorldHandle, head).then(() => true, async (err) => {
+              if (isCancellation(err)) throw err;
+              if (input.parentTaskId) await getExternalWorkflowHandle(input.parentTaskId).signal(pullRequestNoticeSignal,
+                { childTaskId: taskId, kind: 'needs-work', text: `It could not be updated to ${head.slice(0, 8)}: ${innermostMessage(err).trim().replace(/\.?$/, '.')} It is still at its previous commit.` })
+                .catch(() => undefined);
+              return false;
+            });
+            if (!moved) { prRequested = false; continue; }
+          } else await core.movePullRequest(world as WorldHandle, head);
         }
         seen = msgs.length;
         return { completed: true, providerCompleted: true, output: '', openPrRequested: true };
@@ -4148,7 +4165,21 @@ Inspect the complete current diff and specifically compare its delta from the re
    *  the top. Commit-on-spawn snapshots our work first (worktrees share commits, not the
    *  dirty tree) so children fork the current state. */
   async function spawnSubTasks(list: SpawnRequest[], requester = MAIN_AGENT) {
-    await core.commitWork(world as any, `tavya: snapshot before sub-tasks for ${taskId}`);
+    const snapshot = `tavya: snapshot before sub-tasks for ${taskId}`;
+    // Committing every checkout takes as long as git walks them, minutes with
+    // a large data tree; a snapshot that cannot be made is the asking agent's,
+    // not the end of this task (pramana#137: 3 × 5 minutes, then "workflow failed").
+    if (list.length && patched(SUBTASK_SNAPSHOT_TO_AGENT)) {
+      preparingSubTask = true;
+      await publish();
+      try { await prepareSubTask(list[0]!, () => childPreparation.commitWork(world as any, snapshot)); }
+      catch (err) {
+        if (isCancellation(err)) throw err;
+        preparingSubTask = false;
+        await unpreparedSubTasks(list[0]!, list.slice(1), err, requester);
+        return;
+      } finally { preparingSubTask = false; }
+    } else await core.commitWork(world as any, snapshot);
     for (const [index, s] of list.entries()) {
       // Preserve recorded spawn/drop decisions during replay. New decisions have
       // no per-parent child cap; execution is governed by shared admission control.
@@ -4186,7 +4217,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       if (patched('subtask-prepare-failure-to-agent-v1')) {
         preparingSubTask = true;
         await publish();
-        try { childInput = await prepareSubTask(s, prepare); }
+        try { childInput = await prepareSubTask(s, () => childPreparation.prepareChildTask(prepare)); }
         catch (err) {
           if (isCancellation(err)) throw err;
           preparingSubTask = false;
@@ -4224,9 +4255,9 @@ Inspect the complete current diff and specifically compare its delta from the re
    * than the activity's retries (a VM whose connection stays lost): that is
    * waited out as any stage's infrastructure is, visibly, a Retry or a cancel
    * ending a wait early. */
-  async function prepareSubTask(request: SubTaskRequest, prepare: Parameters<coreActivities['prepareChildTask']>[0]) {
+  async function prepareSubTask<T>(request: SubTaskRequest, prepare: () => Promise<T>): Promise<T> {
     for (let waits = 0; ; waits++) {
-      try { return await childPreparation.prepareChildTask(prepare); }
+      try { return await prepare(); }
       catch (err) {
         if (!isInfraFailure(err) || waits >= INFRA_BACKOFF_MS.length || !patched(SUBTASK_PREPARE_WAITS_FOR_WORLD)) throw err;
         const wait = INFRA_BACKOFF_MS[waits]!;
