@@ -107,24 +107,32 @@ describe('events through an agent\'s task token', () => {
     try {
       const listed = await storeOf();
       expect(listed.map((t: any) => t.id)).toEqual(['project-wiki', 'repair-github-workflow', 'build-planned-issues', 'triage-issues', 'chat-requests']);
-      expect(Object.fromEntries(listed.map((t: any) => [t.id, t.repeatable]))).toEqual({ 'project-wiki': false, 'repair-github-workflow': true,
+      expect(Object.fromEntries(listed.map((t: any) => [t.id, t.repeatable]))).toEqual({ 'project-wiki': true, 'repair-github-workflow': true,
         'build-planned-issues': true, 'triage-issues': true, 'chat-requests': true });
       expect(Object.fromEntries(listed.map((t: any) => [t.id, t.missing]))).toEqual({ 'project-wiki': [], 'repair-github-workflow': ['github'],
         'build-planned-issues': ['github'], 'triage-issues': ['github'], 'chat-requests': ['chat'] });
-      expect(listed[0].name).toBe('Set up the project wiki');
+      expect(listed[0]).toMatchObject({ name: 'Maintain the project wiki', runOnInstall: true });
 
-      // An ordinary task runs at once, as often as asked.
+      // The wiki keeps itself current: installing it writes the wiki now, then weekly.
+      const runsOf = async (seriesId: string) => (await store.listTasks(projectId)).filter((task) => task.params?.runOf === seriesId);
       const wiki = json(await dev.request('POST', `/api/projects/${projectId}/task-store/project-wiki`));
-      const run = (await store.getTask(wiki.id))!;
-      expect(run).toMatchObject({ title: 'Set up the project wiki', workflow: 'software-dev', params: { template: 'project-wiki' } });
-      expect(run.params.draft).toBeFalsy();
-      expect(run.params).not.toHaveProperty('repeatable');
-      expect(String(run.params.prompt)).toContain('Migrate AGENTS.md, CLAUDE.md');
-      expect(String(run.params.prompt)).toContain('"default" label');
-      expect(String(run.params.prompt)).not.toContain('Queue');
-      const again = json(await dev.request('POST', `/api/projects/${projectId}/task-store/project-wiki`));
-      expect(again.id).not.toBe(wiki.id);
-      expect((await storeOf()).find((t: any) => t.id === 'project-wiki').installed.sort()).toEqual([again.id, wiki.id].sort());
+      const wikiSeries = (await store.getTask(wiki.id))!;
+      expect(wikiSeries).toMatchObject({ title: 'Maintain the project wiki', workflow: 'software-dev', params: { template: 'project-wiki', repeatable: true,
+        triggerState: 'armed', triggers: [{ kind: 'schedule', cron: '0 6 * * 1', recurring: true }] } });
+      const [first, ...more] = await runsOf(wiki.id);
+      expect(more).toEqual([]);
+      expect(first).toMatchObject({ title: 'Maintain the project wiki', params: { template: 'project-wiki', runOf: wiki.id } });
+      expect(String(first!.params.prompt)).toContain('Migrate AGENTS.md, CLAUDE.md');
+      expect(String(first!.params.prompt)).toMatch(/Otherwise keep it current/);
+      expect(String(first!.params.prompt)).toContain('"default" label');
+      expect(String(first!.params.prompt)).not.toContain('Queue');
+      // Installed is the series, not its runs; saving it again starts nothing.
+      expect((await storeOf()).find((t: any) => t.id === 'project-wiki').installed).toEqual([wiki.id]);
+      json(await dev.request('PATCH', `/api/tasks/${wiki.id}/params`, { replace: true, keepArmed: true,
+        params: { ...wikiSeries.params, prompt: 'Keep the API pages current.' } }));
+      expect(await runsOf(wiki.id)).toHaveLength(1);
+      for (const run of await runsOf(wiki.id)) await store.deleteTask(run.id);
+      expect(json(await dev.request('DELETE', `/api/tasks/${wiki.id}`))).toEqual({ ok: true });
 
       // A repeatable one installs as often as asked; deleting its series takes it back.
       const installed = json(await dev.request('POST', `/api/projects/${projectId}/task-store/build-planned-issues`));
@@ -162,6 +170,20 @@ describe('events through an agent\'s task token', () => {
       created.push(triage.id);
       expect((await store.getTask(triage.id))!).toMatchObject({ title: 'Triage GitHub issues', params: { template: 'triage-issues', repeatable: true,
         prompt: 'Triage only bug reports.', triggerState: 'armed', triggers: [{ kind: 'schedule', cron: '0 6 * * 1' }] } });
+      const runsOf = async (seriesId: string) => (await store.listTasks(projectId)).filter((task) => task.params?.runOf === seriesId);
+      expect(await runsOf(triage.id)).toEqual([]);
+
+      // The wiki from the task form, kept as a draft first: running the draft
+      // installs it, and installing it starts its first run.
+      const wikiDraft = json(await dev.request('POST', `/api/projects/${projectId}/tasks`, { title: 'Maintain the project wiki', draft: true,
+        params: { prompt: 'Keep it short.', repeatable: true, template: 'project-wiki', triggers: [{ kind: 'schedule', cron: '0 6 * * 1', recurring: true }] } }));
+      created.push(wikiDraft.id);
+      expect(await runsOf(wikiDraft.id)).toEqual([]);
+      json(await dev.request('POST', `/api/tasks/${wikiDraft.id}/queue`, {}));
+      const wikiRuns = await runsOf(wikiDraft.id);
+      created.push(...wikiRuns.map((run) => run.id));
+      expect(wikiRuns.map((run) => run.params.prompt)).toEqual(['Keep it short.']);
+      expect(await installedOf('project-wiki')).toEqual([wikiDraft.id]);
 
       // The task form creates it as an ordinary task naming its store entry: a draft
       // is not taken yet; running it installs it; another (say, for another label)

@@ -38,7 +38,7 @@ import {
 import { templateContent, templateName, templateParams, templateAuthorization } from '../domain/task-templates.js';
 import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget, type Avatar } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries } from '../domain/triggers.js';
-import { STORE_TASKS, storeTaskNeeds, storeTaskRepeatable, takenFromStore, type StoreNeed, type StoreTask } from '../domain/task-store.js';
+import { STORE_TASKS, runsOnInstall, storeTaskNeeds, storeTaskRepeatable, takenFromStore, type StoreNeed, type StoreTask } from '../domain/task-store.js';
 import { applyTriggerContext, normalizeEventInput, validateFollow, type EventFilter, type EventFollow, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventInput, type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
 import { newId } from '../util/id.js';
@@ -1894,15 +1894,18 @@ export class KarmaxApi {
     // workflow-agnostic — a trigger gates *when* the workflow starts, not what
     // it does, so it applies to any task with any workflow.
     if (hasActiveTriggers(task.params)) {
+      let armed: TaskRecord;
       try {
-        const armed = (await this.armStoredTask(task.id));
+        armed = (await this.armStoredTask(task.id));
         await queueCreatedAlternates();
         if (typeof args.notes === 'string') armed.notes = args.notes || undefined;
-        return armed;
       } catch (e) {
         (await undoCreation()); // undo the whole logical task on an invalid trigger
         throw e;
       }
+      // Installed; a run that fails to start leaves it installed, to run again.
+      if (runsOnInstall(armed.params)) await this.spawnRun(token, armed.id);
+      return armed;
     }
 
     const input = assembleTaskInput(manifest, resolved, {
@@ -2431,7 +2434,10 @@ export class KarmaxApi {
     // than starting now — otherwise a triggered draft would start immediately and
     // its triggers would be pointless. `fired` tasks have already started.
     if (hasActiveTriggers(task.params) && task.params.triggerState !== 'fired') {
-      return (await this.armStoredTask(taskId));
+      const installing = !!task.params.draft;
+      const armed = (await this.armStoredTask(taskId));
+      if (installing && runsOnInstall(armed.params)) await this.spawnRun(token, taskId);
+      return armed;
     }
     // A repeatable series never runs its own workflow — queueing it spawns a run.
     if (task.params.repeatable) {
