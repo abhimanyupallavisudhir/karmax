@@ -122,7 +122,10 @@ const headerSecrets = (headers: Record<string, string>) =>
  * treats quote characters literally, unlike a TOML document parser. */
 export function codexMcpFlags(servers: AgentMcpServer[] = [], explicit = false): string[] {
   const flags: string[] = [];
-  if (explicit) flags.push('-c', 'mcp_servers={}');
+  // Codex Apps is an MCP outside mcp_servers: the Codex login's own ChatGPT
+  // connectors (its Gmail, not the task's), which tavya cannot grant. Agents
+  // reach people's accounts through request_connection instead.
+  if (explicit) flags.push('-c', 'mcp_servers={}', '-c', 'features.apps=false');
   for (const s of servers) {
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(s.name)) throw new Error('Invalid MCP server name');
     const key = `mcp_servers.${s.name}`;

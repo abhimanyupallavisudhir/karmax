@@ -330,11 +330,11 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
-    name: 'list_connections', description: 'List app accounts explicitly shared with this task or project. Prefer these to requesting passwords; tokens stay server-side.',
+    name: 'list_connections', description: 'List the app accounts this task can use now; tokens stay server-side. For an app not listed, call request_connection: the user may already have it connected and only needs to allow it.',
     parameters: { type: 'object', properties: {} },
   },
   {
-    name: 'request_connection', description: 'Request access to an app for this task. Prefer a native MCP server: pass mcp as its MCP Registry name (e.g. com.example/gmail, find one with GET /api/mcp/registry?search=) or its public HTTPS URL. Use toolkit (a Composio slug such as gmail or googlecalendar) only as the fallback when no suitable remote MCP server exists. The user allows an account they already connected or signs in; a Connect button appears in this task and it resumes automatically. Continue independent work, but do not finish while the connection is pending. Reuse accounts from list_connections.',
+    name: 'request_connection', description: 'Request access to an app for this task. Prefer a native MCP server: pass mcp as its MCP Registry name (e.g. com.example/gmail, find one with GET /api/mcp/registry?search=) or its public HTTPS URL. Use toolkit (a Composio slug such as gmail or googlecalendar) only as the fallback when no suitable remote MCP server exists. The user allows an account they already connected or signs in; a Connect button appears in this task and it resumes automatically. Continue independent work; you may end your turn while it is pending, and the task resumes once it is connected. Reuse accounts from list_connections.',
     parameters: { type: 'object', properties: { mcp: { type: 'string' }, toolkit: { type: 'string' }, why: { type: 'string' } }, required: ['why'] },
   },
   {
