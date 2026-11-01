@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Context } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
 import { ProviderCapacityFull } from '../src/agent/limits.js';
+import { accountKey, waiters, wakeFullKey } from '../src/world/compute-queue.js';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { WorldBusy } from '../src/world/shared-coordination.js';
@@ -429,6 +430,11 @@ describe('separate waiting-world maintenance', () => {
     expect(failed).toMatchObject({ type: 'world-capacity', nonRetryable: true });
     expect(failed.message).toContain('shared CPUs is full');
     expect(await f.store.worldState(f.handle.id)).toBe('parked');
+    // It waits its turn for the account, and how long it has waited is kept,
+    // so the lifecycle sweep moves it once that lasts (relocateStuckWakes).
+    expect((await waiters(f.store)).find((waiter) => waiter.taskId === f.task.id)?.accounts)
+      .toHaveProperty([accountKey(f.project.organizationId!, 'hetzner')]);
+    expect(JSON.parse((await f.store.kvGet(wakeFullKey(f.handle.id)))!)).toMatchObject({ generation: f.handle.generation ?? 1 });
   });
 
   it('propagates maintenance failure without repeating the authoritative publication', async () => {

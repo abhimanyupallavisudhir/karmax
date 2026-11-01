@@ -80,7 +80,10 @@ export async function enqueue(store: Store, request: { taskId: string; organizat
   now = Date.now()): Promise<void> {
   const priority = await taskPriority(store, request.taskId);
   await change(store, now, (queue) => {
-    const waiter = queue[request.taskId] ?? { taskId: request.taskId, organizationId: request.organizationId, priority, since: now, accounts: {} };
+    // A new waiter joins after everyone already waiting, even within one millisecond.
+    const last = Math.max(0, ...Object.values(queue).map((waiter) => waiter.since));
+    const waiter = queue[request.taskId] ?? { taskId: request.taskId, organizationId: request.organizationId, priority,
+      since: Math.max(now, last + 1), accounts: {} };
     waiter.priority = priority;
     waiter.accounts[request.account] = now;
     if (request.cpu !== undefined) waiter.cpu = request.cpu;
@@ -109,7 +112,8 @@ export function before(a: Pick<Waiter, 'organizationId' | 'priority' | 'since' |
 /** The waiters for `account` in queue order. Within each organization its
  * places in the arrival order are filled by its own waiters by priority. */
 export function ordered(all: Waiter[], account: AccountKey): Waiter[] {
-  const here = all.filter((waiter) => account in waiter.accounts).sort((a, b) => a.since - b.since || (a.taskId < b.taskId ? -1 : 1));
+  const here = all.filter((waiter) => account in waiter.accounts)
+    .sort((a, b) => (a.since === b.since ? (a.taskId < b.taskId ? -1 : 1) : a.since < b.since ? -1 : 1));
   const byOrganization = new Map<string, Waiter[]>();
   for (const waiter of here) byOrganization.set(waiter.organizationId, [...(byOrganization.get(waiter.organizationId) ?? []), waiter]);
   for (const list of byOrganization.values()) list.sort((a, b) => (before(a, b) ? -1 : before(b, a) ? 1 : 0));

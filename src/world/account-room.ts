@@ -113,9 +113,11 @@ export async function accountRoom(store: Store, account: Account, request: RoomR
       : `${name}'s disks take ${use.diskGb} of its ${pool.diskGb} GB (parked ones too); waiting for room.` });
   else if (queued && request.taskId) {
     // Room now: is it someone else's, who waited first and could take it?
-    // Its place: where it waits, or where it would join (now, at its priority).
+    // Its place: where it waits, or where it would join — after everyone
+    // already waiting (within its organization, at its priority).
     const me: Waiter = queue.find((waiter) => waiter.taskId === request.taskId)
-      ?? { taskId: request.taskId, organizationId: request.organizationId, priority: await taskPriority(store, request.taskId), since: now, accounts: {} };
+      ?? { taskId: request.taskId, organizationId: request.organizationId, priority: await taskPriority(store, request.taskId),
+        since: Number.POSITIVE_INFINITY, accounts: {} };
     const line = ordered([...queue.filter((waiter) => waiter.taskId !== me.taskId), { ...me, accounts: { ...me.accounts, [key]: now } }], key);
     const fits = (waiter: Waiter) => (!pool.cpu || use.cpu + (waiter.cpu ?? cpu) <= pool.cpu)
       && (!pool.diskGb || use.diskGb + accountDiskGb(provider, waiter.diskGb) <= pool.diskGb);
