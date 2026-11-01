@@ -90,6 +90,24 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
     if (snapshots === undefined) delete process.env.KARMAX_HETZNER_SNAPSHOTS; else process.env.KARMAX_HETZNER_SNAPSHOTS = snapshots;
   });
 
+  // Only making a computer may move an organization to managed compute: its
+  // existing computers keep the account they were made on (connections.ts resolve).
+  it('asks for the account of a new computer only when it makes one', async () => {
+    const asked: Array<{ new?: boolean } | undefined> = [];
+    const recording = new VmWorldProvider(driver, async (_organizationId, _provider, options) => { asked.push(options); return connection(hetzner.token); },
+      undefined, { socket: hetzner.socket, user: os.userInfo().username, home: hetzner.home,
+        provision: { stamp, script: `echo provisioned > ${stamp}`, sudo: false } });
+    const world = await recording.create({ taskId: 'task_new', base: 'main', generation: 1, organizationId: 'org_h' });
+    expect(asked[0]).toEqual({ new: true });
+    const made = asked.length;
+    const handle = world.handle as WorldHandle;
+    await recording.park(handle);
+    await recording.open(handle);
+    await recording.destroy(handle);
+    expect(asked.length).toBeGreaterThan(made);
+    expect(asked.slice(made).filter((options) => options?.new)).toEqual([]);
+  });
+
   it('creates a world from a volume and a server behind the project firewall, with no root password', async () => {
     const world = await provider.create({ taskId: 'task_hz', base: 'main', generation: 1, organizationId: 'org_h', resources: { diskGb: 100 } });
     const [volume] = [...hetzner.volumes.values()];
@@ -253,8 +271,8 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
     // Setup waits it out like an outage (world-infra) instead of asking a person at once.
     expect(isTransportError(refused)).toBe(true);
     // It names the task holding them, and that the memory decides the server too (pramana#88).
-    expect((refused as Error).message).toBe('Hetzner refused a 4-CPU, 8 GB server: this Hetzner project\'s limit on shared CPUs is full, '
-      + 'with 2 in use by 1 other server (task task_busy). tavya waits until enough are free; to start sooner, give this task fewer CPUs '
+    expect((refused as Error).message).toBe('Hetzner refused a 4-CPU, 8 GB server: the Hetzner account\'s limit on shared CPUs, '
+      + 'counted across all its projects, is full; this project\'s other servers use 2 (1 server, task task_busy). tavya waits until enough are free; to start sooner, give this task fewer CPUs '
       + 'and less memory (Hetzner\'s servers with 8 GB have 4 CPUs), stop another task, or ask Hetzner to raise the limit (Hetzner Console → Limits).');
     // Nothing of the refused world is left behind.
     expect([hetzner.servers.size, hetzner.volumes.size]).toEqual([1, 1]);
@@ -279,8 +297,8 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
       .then(() => undefined, (error: unknown) => error);
     expect(refused).toBeInstanceOf(ProviderCapacityFull);
     expect(isTransportError(refused)).toBe(true);
-    expect((refused as Error).message).toBe('Hetzner refused a new server: this Hetzner project\'s limit on public IP addresses is full, '
-      + 'with 1 server using them. tavya waits until one is free; to start sooner, stop another task, '
+    expect((refused as Error).message).toBe('Hetzner refused a new server: the Hetzner account\'s limit on public IP addresses, '
+      + 'counted across all its projects, is full; this project has 1 server. tavya waits until one is free; to start sooner, stop another task, '
       + 'or ask Hetzner to raise the limit (Hetzner Console → Limits).');
     expect([hetzner.servers.size, hetzner.volumes.size]).toEqual([1, 1]);
   });
@@ -385,8 +403,8 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
       .then(() => undefined, (error: unknown) => error);
     expect(refused).toBeInstanceOf(ProviderCapacityFull);
     expect(isTransportError(refused)).toBe(true);
-    expect((refused as Error).message).toBe('Hetzner refused a 70 GB disk: this Hetzner project\'s limit on the total size of its volumes '
-      + 'is full, with 100 GB in 1 volume. tavya waits until there is room; to start sooner, give this task a smaller disk, '
+    expect((refused as Error).message).toBe('Hetzner refused a 70 GB disk: the Hetzner account\'s limit on the total size of volumes, '
+      + 'counted across all its projects, is full; this project holds 100 GB in 1 volume. tavya waits until there is room; to start sooner, give this task a smaller disk, '
       + 'delete another task, or ask Hetzner to raise the limit (Hetzner Console → Limits).');
     expect(hetzner.volumes.size).toBe(1);
   });

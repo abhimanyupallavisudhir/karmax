@@ -30,7 +30,7 @@ tavya makes each computer in the region's default VPC: an instance with a public
 {
   "Version": "2012-10-17",
   "Statement": [
-    { "Sid": "Read", "Effect": "Allow", "Action": ["ec2:Describe*", "pricing:GetProducts"], "Resource": "*" },
+    { "Sid": "Read", "Effect": "Allow", "Action": ["ec2:Describe*", "pricing:GetProducts", "servicequotas:GetServiceQuota"], "Resource": "*" },
     { "Sid": "LaunchTagged", "Effect": "Allow", "Action": ["ec2:RunInstances", "ec2:CreateVolume"],
       "Resource": ["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*"],
       "Condition": { "Null": { "aws:RequestTag/karmaxHome": "false" } } },
@@ -60,7 +60,7 @@ tavya makes each computer in the region's default VPC: an instance with a public
 3. Under the user's **Security credentials**, create an access key ("Application running outside AWS").
 4. In tavya, **Settings → Computers → AWS → Connect**: paste the access key ID and the secret access key. Under **Advanced**, choose the region (default `eu-central-1`).
 
-The first computer in a region builds tavya's machine image there (about 10 minutes, once); until then computers set themselves up from Debian, which takes a few minutes more. A new AWS account may run only a few CPUs at once: ask for more under **Service Quotas → Amazon EC2 → Running On-Demand Standard instances**. A region without a default VPC needs one (**VPC → Your VPCs → Actions → Create default VPC**).
+The first computer in a region builds tavya's machine image there (about 10 minutes, once); until then computers set themselves up from Debian, which takes a few minutes more. A new AWS account may run only a few CPUs at once: ask for more under **Service Quotas → Amazon EC2 → Running On-Demand Standard instances**. tavya reads that quota (and your gp3 storage quota) to queue tasks instead of letting AWS refuse them. A region without a default VPC needs one (**VPC → Your VPCs → Actions → Create default VPC**).
 
 ## Google Cloud
 

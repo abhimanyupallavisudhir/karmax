@@ -41,6 +41,8 @@ export class FakeAws {
   ];
   deletedSnapshots: string[] = [];
   requests: Array<{ action: string; params: Record<string, string> }> = [];
+  /** Service Quotas calls, as IAM actions (`servicequotas:GetServiceQuota`). */
+  quotaRequests: string[] = [];
   zones = ['eu-central-1a', 'eu-central-1b', 'eu-central-1c'];
   /** `type@zone` with no capacity just now. */
   noCapacity = new Set<string>();
@@ -90,6 +92,7 @@ export class FakeAws {
 
   /** Service Quotas, which an EC2-only key may not read (`quotasReadable` false). */
   private serviceQuota(target: string | null, body: { ServiceCode: string; QuotaCode: string }): Response {
+    this.quotaRequests.push(`servicequotas:${target?.split('.').pop()}`);
     if (!this.quotasReadable) return new Response(JSON.stringify({ __type: 'AccessDeniedException',
       message: 'User is not authorized to perform: servicequotas:GetServiceQuota' }), { status: 400 });
     const value = target !== 'ServiceQuotasV20190624.GetServiceQuota' ? undefined

@@ -100,7 +100,8 @@ export class WorldProviderConnectionService {
   async list(organizationId: string): Promise<WorldProviderConnectionView[]> {
     const own = await this.listOwn(organizationId);
     if (organizationId === MANAGED_COMPUTE) return own;
-    const mine = new Set(own.map((value) => value.provider));
+    // A disabled own account takes no new computers, so managed compute is offered beside it.
+    const mine = new Set(own.filter((value) => value.enabled).map((value) => value.provider));
     const managed = (await this.managedConnections()).filter((value) => !mine.has(value.provider));
     return [...own, ...managed.map((value) => managedView(value))];
   }
@@ -123,12 +124,13 @@ export class WorldProviderConnectionService {
     return (await this.listOwn(MANAGED_COMPUTE)).filter((value) => value.enabled && value.credentialConfigured);
   }
 
-  /** Whether `provider` computers for this organization run on managed
-   * compute: it has no connection of its own and the installation offers one. */
+  /** Whether new `provider` computers for this organization run on managed
+   * compute: it has no enabled connection of its own and the installation
+   * offers one. (A disabled own connection only keeps the computers made on it.) */
   async funding(organizationId: string | undefined, provider: string): Promise<'managed' | 'own' | undefined> {
     if (!organizationId) return undefined;
     const own = await this.store.getWorldProviderConnection(organizationId, provider);
-    if (own) return 'own';
+    if (own?.enabled) return 'own';
     return (await this.managedConnections()).some((value) => value.provider === provider) ? 'managed' : undefined;
   }
 
@@ -150,7 +152,7 @@ export class WorldProviderConnectionService {
   async limits(organizationId: string | undefined, provider: string): Promise<EffectiveComputerLimits> {
     if (isAnyProvider(provider)) return organizationId ? anyLimits(await this.reachable(organizationId)) : { source: {} };
     let value = organizationId ? await this.store.getWorldProviderConnection(organizationId, provider) : undefined;
-    if (!value && organizationId && await this.funding(organizationId, provider) === 'managed')
+    if (!value?.enabled && organizationId && await this.funding(organizationId, provider) === 'managed')
       value = await this.store.getWorldProviderConnection(MANAGED_COMPUTE, provider);
     return computerLimits(provider, value?.measuredLimits, value?.config.limits);
   }
@@ -226,10 +228,14 @@ export class WorldProviderConnectionService {
   /** The account a computer runs on: the organization's own connection;
    * else, when it has none, the installation's managed compute account (the
    * world records that, so `MANAGED_COMPUTE` resolves it ever after); else,
-   * self-hosted only, an environment key. */
-  async resolve(organizationId: string | undefined, provider: string): Promise<ResolvedWorldProviderConnection> {
+   * self-hosted only, an environment key. A disabled own connection still
+   * serves the computers made on it, never a `new` one: those go to managed
+   * compute as if it were not there, so an organization moves to managed
+   * compute without stranding a computer on a key that cannot see it. */
+  async resolve(organizationId: string | undefined, provider: string, options: { new?: boolean } = {}): Promise<ResolvedWorldProviderConnection> {
     const value = organizationId ? (await this.store.getWorldProviderConnection(organizationId, provider)) : undefined;
-    if (value?.enabled && await this.broker.hasHandle(value.credentialHandle)) {
+    const serves = value && (value.enabled || (!options.new && organizationId !== MANAGED_COMPUTE));
+    if (serves && await this.broker.hasHandle(value.credentialHandle)) {
       return {
         organizationId,
         provider,
@@ -242,16 +248,16 @@ export class WorldProviderConnectionService {
     }
     if (organizationId === MANAGED_COMPUTE)
       throw new Error(`${BRAND}'s ${providerName(provider)} computers are not available`);
-    if (value && !value.enabled) throw new Error(`${providerName(provider)} is disabled for this organization`);
     // An organization without its own account uses the installation's managed
     // compute account when there is one; usage there is charged to the
     // organization's compute allowance (src/world/managed-compute.ts).
-    if (!value && organizationId) {
+    if ((!value || (!value.enabled && options.new)) && organizationId) {
       const managed = await this.store.getWorldProviderConnection(MANAGED_COMPUTE, provider);
       if (managed?.enabled && await this.broker.hasHandle(managed.credentialHandle))
         return { ...(await this.resolve(MANAGED_COMPUTE, provider)), organizationId, managed: true,
           recordLimits: (limits) => this.recordLimits(MANAGED_COMPUTE, provider, limits) };
     }
+    if (value && !value.enabled) throw new Error(`${providerName(provider)} is disabled for this organization`);
     // Hosted organizations otherwise connect their own account: a bootstrap
     // environment key is never a centrally funded rail (importEnvironment()
     // moves it into the installation owner's explicit connection).
@@ -266,7 +272,7 @@ export class WorldProviderConnectionService {
   async available(organizationId: string | undefined, provider: string): Promise<boolean> {
     // "Any" is always a valid choice: it uses whatever the organization can reach.
     if (isAnyProvider(provider)) return true;
-    try { (await this.resolve(organizationId, provider)); return true; }
+    try { (await this.resolve(organizationId, provider, { new: true })); return true; }
     catch { return false; }
   }
 

@@ -119,7 +119,7 @@ export class DaytonaWorldProvider implements WorldProvider {
     private idleMs = positiveInt(process.env.KARMAX_DAYTONA_IDLE_MS, DEFAULT_IDLE_MS),
     private snapshot = process.env.KARMAX_DAYTONA_SNAPSHOT,
     private image = process.env.KARMAX_DAYTONA_IMAGE,
-    private resolveConnection?: (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>,
+    private resolveConnection?: (organizationId: string | undefined, provider: string, options?: { new?: boolean }) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>,
     private desktopSnapshot = process.env.KARMAX_DAYTONA_DESKTOP_SNAPSHOT,
     private desktopImage = process.env.KARMAX_DAYTONA_DESKTOP_IMAGE,
     private referenceKeys?: WorldReferenceKeys) {
@@ -131,7 +131,7 @@ export class DaytonaWorldProvider implements WorldProvider {
 
   async create(spec: WorldSpec): Promise<World> {
     spec.signal?.throwIfAborted();
-    const connection = (await this.connection(spec.organizationId));
+    const connection = (await this.connection(spec.organizationId, { new: true }));
     const factory = this.factoryFor(connection);
     // A size above the account's limit (stored before its limits were known)
     // would be refused outright: fit it, and say so.
@@ -347,8 +347,8 @@ export class DaytonaWorldProvider implements WorldProvider {
 
   private sandboxId(handle: WorldHandle): string { return this.reference(handle).sandboxId; }
 
-  private async connection(organizationId: string | undefined): Promise<ResolvedWorldProviderConnection | undefined> {
-    if (this.resolveConnection) return (await this.resolveConnection(organizationId, this.kind));
+  private async connection(organizationId: string | undefined, options?: { new?: boolean }): Promise<ResolvedWorldProviderConnection | undefined> {
+    if (this.resolveConnection) return (await this.resolveConnection(organizationId, this.kind, options));
     return process.env.DAYTONA_API_KEY ? { organizationId, provider: this.kind, apiKey: process.env.DAYTONA_API_KEY,
       config: { snapshot: this.snapshot, image: this.image, desktopSnapshot: this.desktopSnapshot,
         desktopImage: this.desktopImage, apiUrl: process.env.DAYTONA_API_URL,

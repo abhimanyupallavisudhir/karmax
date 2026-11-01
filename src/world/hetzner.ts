@@ -377,12 +377,12 @@ export class HetznerDriver implements VmDriver {
   private async volumesFull(connection: ResolvedWorldProviderConnection, what: string, cause: unknown): Promise<ProviderCapacityFull> {
     const volumes = await this.pages<Volume>(connection, '/volumes', 'volumes').catch(() => [] as Volume[]);
     const used = volumes.reduce((sum, volume) => sum + volume.size, 0);
-    return new ProviderCapacityFull(`Hetzner refused ${what}: this Hetzner project's limit on the total size of its volumes is full, `
-      + `with ${used} GB in ${volumes.length} volume${volumes.length === 1 ? '' : 's'}. tavya waits until there is room; `
+    return new ProviderCapacityFull(`Hetzner refused ${what}: the Hetzner account's limit on the total size of volumes, counted across all its projects, `
+      + `is full; this project holds ${used} GB in ${volumes.length} volume${volumes.length === 1 ? '' : 's'}. tavya waits until there is room; `
       + 'to start sooner, give this task a smaller disk, delete another task, or ask Hetzner to raise the limit (Hetzner Console → Limits).', { cause });
   }
 
-  /** What a full project limit is, what holds it, and what a person can do. */
+  /** What a full account limit is (Hetzner counts it across all the customer's projects), what of it this project holds, and what a person can do. */
   private async limitFull(connection: ResolvedWorldProviderConnection, type: ServerType, limit: string, cause: unknown): Promise<ProviderCapacityFull> {
     const servers = await this.servers(connection).catch(() => [] as Server[]);
     const raise = 'or ask Hetzner to raise the limit (Hetzner Console → Limits).';
@@ -392,18 +392,18 @@ export class HetznerDriver implements VmDriver {
       const inUse = holding.reduce((sum, server) => sum + server.server_type.cores, 0);
       // Which tasks hold them (pramana#88: "1 other server" named nothing).
       const tasks = [...new Set(holding.map((server) => server.labels?.karmaxTaskId).filter(Boolean))];
-      const whose = tasks.length ? ` (task${tasks.length === 1 ? '' : 's'} ${tasks.slice(0, 3).join(', ')}${tasks.length > 3 ? ', …' : ''})` : '';
       // A server's memory comes with its CPUs: fewer CPUs alone still asked
       // for the same server when the memory did not change (pramana#88).
       const memory = `${Math.round(type.memory)} GB`;
-      return new ProviderCapacityFull(`Hetzner refused a ${type.cores}-CPU, ${memory} server: this Hetzner project's limit on ${cores} CPUs is full, `
-        + `with ${inUse} in use by ${holding.length} other server${holding.length === 1 ? '' : 's'}${whose}. tavya waits until enough are free; `
+      const held = `${holding.length} server${holding.length === 1 ? '' : 's'}${tasks.length ? `, task${tasks.length === 1 ? '' : 's'} ${tasks.slice(0, 3).join(', ')}${tasks.length > 3 ? ', …' : ''}` : ''}`;
+      return new ProviderCapacityFull(`Hetzner refused a ${type.cores}-CPU, ${memory} server: the Hetzner account's limit on ${cores} CPUs, counted across all its projects, `
+        + `is full; this project's other servers use ${inUse} (${held}). tavya waits until enough are free; `
         + `to start sooner, give this task fewer CPUs and less memory (Hetzner's servers with ${memory} have ${type.cores} CPUs), stop another task, ${raise}`, { cause });
     }
     const counted = `${servers.length} server${servers.length === 1 ? '' : 's'}`;
-    const what = limit === 'primary_ip_limit' ? `limit on public IP addresses is full, with ${counted} using them`
-      : `${limit.replace(/_/g, ' ')} is reached, with ${counted}`;
-    return new ProviderCapacityFull(`Hetzner refused a new server: this Hetzner project's ${what}. tavya waits until one is free; `
+    const what = limit === 'primary_ip_limit' ? 'limit on public IP addresses' : limit.replace(/_/g, ' ');
+    return new ProviderCapacityFull(`Hetzner refused a new server: the Hetzner account's ${what}, counted across all its projects, is full; `
+      + `this project has ${counted}. tavya waits until one is free; `
       + `to start sooner, stop another task, ${raise}`, { cause });
   }
 

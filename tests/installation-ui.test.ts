@@ -167,7 +167,7 @@ describe('Installation → Appearance and Managed compute', () => {
     // Disk (parked computers' too) and the queue, once there is a disk budget and someone waits.
     await ui.run(`document.getElementById('main').innerHTML = managedComputeMarkup(${JSON.stringify({ providers: [{ ...gcp, diskGb: 400, waiting: 2,
       limits: { ...gcp.limits, pool: { ...gcp.limits.pool, diskGb: 5000 } } }] })})`);
-    expect(await ui.page.locator('.managed-running').innerText()).toBe('3 of 10 running · 6 of 24 CPU · 400 of 5000 GB · 2 waiting');
+    expect(await ui.page.locator('.managed-running').innerText()).toBe('3 of 10 running · 6 of 24 CPU · 400 of 5,000 GB · 2 waiting');
     await ui.run(`document.getElementById('main').innerHTML = managedComputeMarkup(${JSON.stringify({ providers: [gcp] })})`);
     await ui.run(`openComputerDialog('gcp', ${JSON.stringify(gcp)}, undefined, undefined, { managed: true })`);
     const cpus = ui.page.locator('[data-pool="cpu"]');

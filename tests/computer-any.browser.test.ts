@@ -80,3 +80,23 @@ it('shows where a task runs, and Settings → Computers what Any reaches', async
   expect(ui.errors).toEqual([]);
   await ui.close();
 });
+
+// An organization moving to managed compute (wiki features/managed-compute):
+// its own account, switched off, keeps its row; what that means is one hover away.
+it('says a switched-off own account leaves new computers to tavya\'s', async () => {
+  const ui = await consolePage();
+  await ui.run(FIXTURE);
+  const row = await ui.run<{ chip: string; title: string; reach: string }>(`(() => {
+    fixture().innerHTML = computersMarkup([
+      { provider: 'hetzner', enabled: false, credentialConfigured: true, status: 'ready', limits: { cpu: 16, source: {} } },
+      { provider: 'hetzner', enabled: true, credentialConfigured: true, managed: true, limits: { cpu: 10, source: {} } },
+    ]);
+    const chip = document.querySelector('.computer-provider[data-provider="hetzner"] .chip');
+    return { chip: chip.textContent, title: chip.title, reach: document.querySelector('.computer-reach').textContent };
+  })()`);
+  expect(row.chip).toBe('Off');
+  expect(row.title).toMatch(/^New computers run on .*’s Hetzner account, charged to this organization’s monthly compute\. Ones already on yours stay there until their tasks end\.$/);
+  expect(row.reach).toBe('Hetzner');
+  expect(ui.errors).toEqual([]);
+  await ui.close();
+});

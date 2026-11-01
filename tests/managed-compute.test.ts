@@ -88,6 +88,33 @@ describe('managed compute accounts', () => {
     expect((await f.connections.list(f.organization.id)).map((value) => value.managed ?? false)).toEqual([false]);
   });
 
+  // Moving an organization from its own account to managed compute
+  // (nisada-personal, 2026-11-01): disabling its own connection sends every
+  // new computer to managed compute, while computers already made on its own
+  // account keep that account until they end, so none is stranded on a key
+  // that cannot see it (deleting the connection is refused while they exist).
+  it('sends new computers to managed compute once an organization disables its own account, and keeps its existing ones on it', async () => {
+    const f = await fixture();
+    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'hetzner', apiKey: 'managed-project', config: {} });
+    await f.connections.save({ organizationId: f.organization.id, provider: 'hetzner', apiKey: 'own-project' });
+    await f.connections.save({ organizationId: f.organization.id, provider: 'hetzner', enabled: false });
+
+    expect(await f.connections.funding(f.organization.id, 'hetzner')).toBe('managed');
+    expect(await f.connections.resolve(f.organization.id, 'hetzner', { new: true }))
+      .toMatchObject({ apiKey: 'managed-project', managed: true, organizationId: f.organization.id });
+    expect(await f.connections.available(f.organization.id, 'hetzner')).toBe(true);
+    // "Any" can choose managed Hetzner; Settings still shows the organization's own, off.
+    expect((await f.connections.reachable(f.organization.id)).map((value) => [value.provider, value.managed ?? false]))
+      .toEqual([['hetzner', true]]);
+    expect((await f.connections.list(f.organization.id))[0]).toMatchObject({ provider: 'hetzner', enabled: false });
+    expect((await f.connections.list(f.organization.id))[0]!.managed).toBeUndefined();
+
+    // A computer made on its own account (no `funding` in its reference) still reaches it.
+    const existing = await f.connections.resolve(connectionScope({ organizationId: f.organization.id }), 'hetzner');
+    expect(existing).toMatchObject({ apiKey: 'own-project' });
+    expect(existing.managed).toBeUndefined();
+  });
+
   it('keeps the installation\'s key in the installation\'s vault scope and offers nothing once disabled', async () => {
     const f = await fixture();
     const saved = await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'hetzner', apiKey: 'hcloud',
