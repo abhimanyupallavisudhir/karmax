@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import { allRoles, roleDef, roleCeiling, manifest, agentMcpToConfig, WorkflowManifest } from '../src/contrib/manifests.js';
 import { applyAgentSpec, defaultModel, makeDefaultProfiles } from '../src/agent/profiles.js';
 import { assemblePrompt } from '../src/agent/prompt.js';
+import { PLATFORM_TOOL_SCHEMAS, TOOL_SCHEMAS } from '../src/agent/tools.js';
 import { GLOBAL_INSTRUCTIONS } from '../src/agent/instructions.js';
 import { autoResolve } from '../src/resolve/cases.js';
 import { allows } from '../src/platform/capabilities.js';
@@ -293,6 +294,17 @@ describe('prompt preamble (SPEC §5.4)', () => {
     const out = assemblePrompt({ profile: profile(), role: 'do', task: { ...task, workflow: 'software-dev' } as any, world });
     expect(out).not.toContain('Your final response notifies nobody');
     expect(out).toContain('Your final response is posted in the conversation: answer there whatever you were just asked, even when you then pause.');
+  });
+
+  // #797: told only to "use connected apps", agents with nothing in list_connections
+  // reported "I don't have access to your Gmail" instead of asking for it.
+  it('tells agents to request an app account they lack instead of reporting no access', () => {
+    const out = assemblePrompt({ profile: profile(), role: 'do', task: { ...task, workflow: 'software-dev' } as any, world });
+    expect(out).toContain("When the work needs an account list_connections doesn't show, request it instead of saying you lack access");
+    for (const tool of [...PLATFORM_TOOL_SCHEMAS, ...TOOL_SCHEMAS].filter((t) => t.name === 'request_connection'))
+      expect(tool.description).not.toContain('do not finish');
+    for (const tool of [...PLATFORM_TOOL_SCHEMAS, ...TOOL_SCHEMAS].filter((t) => t.name === 'list_connections'))
+      expect(tool.description).toContain('request_connection');
   });
 
   it('repeats the optional, verification-only review guidance in global instructions', () => {

@@ -71,7 +71,7 @@ describe('MCP connections', () => {
     (await store.upsertProfile({ id: projectProfileId(project, 'do'), name: 'Agent', role: 'do', provider: 'codex' }));
     expect((await roleDefaultProfile(store, 'do', project))?.mcpConnections).toEqual(['browser:playwright']);
     expect(applyAgentSpec(base, { provider: 'codex', mcpConnections: [] }).mcpConnections).toEqual([]);
-    expect(codexMcpFlags([], true)).toEqual(['-c', 'mcp_servers={}']);
+    expect(codexMcpFlags([], true)).toEqual(['-c', 'mcp_servers={}', '-c', 'features.apps=false']);
     expect(codexMcpFlags([{ name: 'test-mcp', command: 'node', env: { TEST_KEY: 'value' } }])).toContain('mcp_servers.test-mcp.command="node"');
     expect(codexMcpFlags([{ name: 'test-mcp', command: 'node', env: { TEST_KEY: 'value' } }])).toContain('mcp_servers.test-mcp.env.TEST_KEY="value"');
     expect(() => codexMcpFlags([{ name: 'bad.name', command: 'node' }])).toThrow(/Invalid/);
