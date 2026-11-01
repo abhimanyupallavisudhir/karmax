@@ -48,6 +48,8 @@ export class FakeAws {
   notOffered = new Set<string>();
   /** The account's running On-Demand vCPU quota. */
   vcpuLimit?: number;
+  /** Whether the key may read Service Quotas (servicequotas:GetServiceQuota). */
+  quotasReadable = false;
   defaultVpc = true;
   /** Volumes refuse a second modification within 6 hours, as EBS does. */
   priceListDown = false;
@@ -66,6 +68,7 @@ export class FakeAws {
     if (!headers.get('authorization')?.startsWith(`AWS4-HMAC-SHA256 Credential=${this.accessKeyId}/`))
       return xmlError(401, 'AuthFailure', 'AWS was not able to validate the provided access credentials');
     if (url.host === 'api.pricing.us-east-1.amazonaws.com') return this.pricing(JSON.parse(String(init.body)));
+    if (url.host.startsWith('servicequotas.')) return this.serviceQuota(headers.get('x-amz-target'), JSON.parse(String(init.body)));
     const params = Object.fromEntries(new URLSearchParams(String(init.body)));
     const request = { action: params.Action!, params };
     this.requests.push(request);
@@ -81,6 +84,15 @@ export class FakeAws {
       return xmlError(status, code, message);
     };
     this.faults.push(fault);
+  }
+
+  /** Service Quotas, which an EC2-only key may not read (`quotasReadable` false). */
+  private serviceQuota(target: string | null, body: { ServiceCode: string; QuotaCode: string }): Response {
+    if (!this.quotasReadable) return new Response(JSON.stringify({ __type: 'AccessDeniedException',
+      message: 'User is not authorized to perform: servicequotas:GetServiceQuota' }), { status: 400 });
+    if (target !== 'ServiceQuotasV20190624.GetServiceQuota' || body.ServiceCode !== 'ec2' || body.QuotaCode !== 'L-1216C47A' || this.vcpuLimit === undefined)
+      return new Response(JSON.stringify({ __type: 'NoSuchResourceException', message: 'no such quota' }), { status: 400 });
+    return new Response(JSON.stringify({ Quota: { QuotaCode: body.QuotaCode, Value: this.vcpuLimit } }), { status: 200 });
   }
 
   private pricing(body: { Filters: Array<{ Field: string; Value: string }> }): Response {

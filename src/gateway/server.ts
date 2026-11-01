@@ -71,6 +71,7 @@ import { withTimeout } from '../util/timeout.js';
 import { AgentAuthority, AgentSpec, AuthorizationSelection, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, WorldLocation, normalizeUrgency } from '../domain/types.js';
 import { dotenvFile, dotenvSecretName, parseDotenv } from '../domain/dotenv.js';
 import { CLOUD_WORLD_PROVIDERS } from '../domain/computer.js';
+import { providerDefaults } from '../domain/computer-limits.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
@@ -2729,7 +2730,8 @@ export class Gateway {
       // Managed compute (wiki features/managed-compute): the installation's
       // own provider accounts, which organizations without their own use and
       // are charged for. GET lists them with this month's use; PUT saves one
-      // (key write-only, `config.maxRunning` its concurrency); POST …/test
+      // (key write-only; `config.limits.pool` its budget where the provider
+      // cannot say it, `config.share` an organization's fair share); POST …/test
       // checks the key and reads the account's limits.
       const managedCompute = p.match(/^\/api\/settings\/managed-compute(?:\/([a-z0-9-]+)(\/test)?)?$/);
       if (managedCompute) {
@@ -2745,7 +2747,10 @@ export class Gateway {
               providers: await Promise.all(accounts.map(async (account) => {
                 const rows = costs.filter((row) => row.provider === account.provider);
                 const costMicros = rows.reduce((total, row) => total + row.costMicros, 0);
-                return { ...account, running: await store.runningManagedWorlds(account.provider), organizations: rows.length,
+                const leases = await store.runningManagedLeases(account.provider);
+                const size = providerDefaults(account.provider)?.cpu ?? 2;
+                return { ...account, running: leases.length, runningCpus: leases.reduce((total, lease) => total + (lease.cpu ?? size), 0),
+                  organizations: rows.length,
                   costMicros, chargedMicros: computeChargeMicros(costMicros), seconds: rows.reduce((total, row) => total + row.seconds, 0) };
               })) });
           }
@@ -2756,7 +2761,7 @@ export class Gateway {
               apiKey: b.apiKey ? String(b.apiKey) : undefined,
               config: b.config && typeof b.config === 'object' ? b.config as WorldProviderConnection['config'] : {}, enabled: b.enabled !== false });
             await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'managed-compute.save', `installation:${provider}`,
-              { enabled: saved.enabled, maxRunning: saved.config.maxRunning, keyChanged: Boolean(b.apiKey), ...identityAuditDetail(callerIdentity) });
+              { enabled: saved.enabled, pool: saved.config.limits?.pool, share: saved.config.share, keyChanged: Boolean(b.apiKey), ...identityAuditDetail(callerIdentity) });
             return this.json(res, 200, saved);
           }
           if (provider && !managedCompute[2] && method === 'DELETE') {
@@ -3553,6 +3558,7 @@ export class Gateway {
           if (callerIdentity.humanSubject) (await store.setProjectMembership(project.id,
             { kind: 'user', userId: callerIdentity.humanSubject.userId }, 'owner'));
           await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
+          await this.installDefaultTasks(project);
           return this.json(res, 200, project);
         }
       }
@@ -4070,6 +4076,7 @@ export class Gateway {
           (await store.setProjectMembership(project.id,
             { kind: 'user', userId: callerIdentity.humanSubject.userId }, 'owner'));
         await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
+        await this.installDefaultTasks(project);
         return this.json(res, 200, project);
       }
       const projectTransfer = p.match(/^\/api\/projects\/([^/]+)\/transfer$/);
@@ -8828,6 +8835,13 @@ export class Gateway {
     if (!this.wikiLocalReady.has(project.id)) return this.ensureProjectWiki(project, userId);
     this.trackWikiWork(this.ensureProjectWiki(project, userId).catch(error =>
       console.warn(`[karmax] could not refresh wiki for ${project.id}:`, error instanceof Error ? error.message : error)));
+  }
+
+  /** What every project comes with from the task store: the repair of failed
+   *  deploys (src/integrations/github-events.ts). The project is made either way. */
+  async installDefaultTasks(project: import('../domain/types.js').Project): Promise<void> {
+    try { await this.githubEvents.ensureRecoveryTask(project.id, project.organizationId ?? 'org_personal'); }
+    catch (error) { console.warn(`[karmax] could not install the repair task in ${project.id}:`, error instanceof Error ? error.message : error); }
   }
 
   private async ensureProjectWiki(project: import('../domain/types.js').Project, userId?: string): Promise<void> {

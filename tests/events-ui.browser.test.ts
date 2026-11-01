@@ -252,9 +252,8 @@ describe('events in the console', () => {
     await expect.poll(() => page.url()).toMatch(/\/store\/project-wiki$/);
     const fresh = await open('/personal/factory/store/project-wiki');
     await fresh.page.locator('#tf-page:not([aria-busy]) [data-field="prompt"]').waitFor();
-    expect(await fresh.page.locator('[data-field="prompt"]').inputValue()).toContain('Set up this project');
-    expect(await fresh.page.locator('#tf-queue').textContent()).toMatch(/^Run task/);
-    expect(await fresh.page.locator('#trig-repeatable').isChecked()).toBe(false);
+    expect(await fresh.page.locator('[data-field="prompt"]').inputValue()).toContain('Maintain this project');
+    expect(await fresh.page.locator('#trig-repeatable').isChecked()).toBe(true);
     // An entry the store does not have lands on the store.
     const missing = await open('/personal/factory/store/no-such-task');
     await expect.poll(() => missing.page.url()).toMatch(/\/personal\/factory\?q=is(:|%3A)store$/);
@@ -268,11 +267,14 @@ describe('events in the console', () => {
     const form = page.locator('#tf-page:not([aria-busy])');
     await form.locator('[data-field="prompt"]').fill('Write the wiki, but only for the API.');
     await form.locator('#tf-queue').click();
+    // It installs, and its first run starts now: that run is where it goes.
     await expect.poll(() => page.url()).toMatch(/\/personal\/factory\/tasks\/\d+$/);
-    const run = (await store.listTasks(project.id)).find((task) => task.params?.template === 'project-wiki')!;
-    expect(run.title).toBe('Set up the project wiki');
+    const wiki = (await store.listTasks(project.id)).find((task) => task.params?.template === 'project-wiki' && !task.params?.runOf)!;
+    expect(wiki.params).toMatchObject({ repeatable: true, triggerState: 'armed', triggers: [{ kind: 'schedule', cron: '0 6 * * 1' }] });
+    const run = (await store.listTasks(project.id)).find((task) => task.params?.runOf === wiki.id)!;
+    expect(run.title).toBe('Maintain the project wiki');
     expect(run.params.prompt).toBe('Write the wiki, but only for the API.');
-    expect(run.params.draft).toBeFalsy();
+    expect(page.url()).toMatch(new RegExp(`/tasks/${run.num}$`));
 
     // A changed automation keeps its run title and its place in the store.
     await page.goto(`${base}/personal/factory/store/build-planned-issues`);
@@ -285,7 +287,8 @@ describe('events in the console', () => {
     expect(series.params).toMatchObject({ repeatable: true, triggerState: 'armed', prompt: 'Build the issue below; keep the change small.',
       triggers: [{ type: 'github.issues.labeled', where: { 'label.name': 'ready' } }] });
     const row = page.locator('.store-row[data-store-task="build-planned-issues"]');
-    await expect.poll(async () => row.textContent()).toMatch(/Installed[\s\S]*Open/);
+    // Said before its button, so nobody installs it again not knowing.
+    await expect.poll(async () => row.locator('.task-right').innerText()).toMatch(/^✓ Installed\s*Open$/);
     // Installed, its row still opens the form, to install another (say, for another label).
     await row.click({ position: { x: 40, y: 12 } });
     await form.locator('#ev-conds .ev-val').waitFor();
@@ -295,16 +298,22 @@ describe('events in the console', () => {
     await expect.poll(() => page.url()).toMatch(/\/personal\/factory\?q=is(:|%3A)store$/);
     const both = (await store.listTasks(project.id)).filter((task) => task.params?.template === 'build-planned-issues');
     expect(both.map((task) => (task.params.triggers as any)[0].where['label.name']).sort()).toEqual(['ready', 'urgent']);
-    await expect.poll(async () => row.locator('.chip').textContent()).toBe('2 installed');
+    await expect.poll(async () => row.locator('.store-installed').textContent()).toBe('✓ 2 installed');
     // Open lists them both.
     await row.locator('a', { hasText: 'Open' }).click();
     await expect.poll(() => page.url()).toMatch(/q=store(:|%3A)build-planned-issues(\+|%20)is(:|%3A)series$/);
     await expect.poll(async () => page.locator('#main .series-row').count()).toBe(2);
-    for (const task of [...both, run]) await store.deleteTask(task.id);
+    for (const task of [...both, run, wiki]) await store.deleteTask(task.id);
     expect(errors).toEqual([]);
   });
 
   it('asks which project a store task is for on the organization home', async () => {
+    // With one project there is nobody to ask: the home shows that project's store.
+    const single = await open('/personal?q=is%3Astore');
+    await single.page.locator('.store-row[data-store-task="triage-issues"]').waitFor();
+    expect(await single.page.locator('.store-row[data-store-task="project-wiki"] [data-store-run]').textContent()).toBe('Install');
+    expect(await single.page.locator('.store-row[data-store-task="triage-issues"]').textContent()).toContain('Needs GitHub');
+    expect(single.errors).toEqual([]);
     const other = await store.createProject('Website');
     try {
       const { page, errors } = await open('/personal?q=is%3Astore');
@@ -358,7 +367,7 @@ describe('events in the console', () => {
     expect(await row('build-planned-issues').locator('[data-store-run]').isDisabled()).toBe(true);
     expect(await row('build-planned-issues').textContent()).toContain('Needs GitHub');
     expect(await row('chat-requests').textContent()).toContain('Needs a chat bot');
-    expect(await row('project-wiki').locator('[data-store-run]').textContent()).toBe('Run');
+    expect(await row('project-wiki').locator('[data-store-run]').textContent()).toBe('Install');
 
     const repository = await store.upsertRepository({ organizationId: project.organizationId ?? 'org_personal', provider: 'github', providerId: '99',
       owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git', defaultBranch: 'main', private: true, gitConnectionId: 'gc_1' });
@@ -370,10 +379,12 @@ describe('events in the console', () => {
     expect(series.params).toMatchObject({ repeatable: true, triggerState: 'armed', triggers: [{ type: 'github.issues.labeled' }] });
     if (process.env.KARMAX_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'task-store.png') });
 
-    // An ordinary one runs at once and opens.
+    // One that runs when installed installs, and its first run opens.
     await row('project-wiki').locator('[data-store-run]').click();
-    await expect.poll(async () => (await store.listTasks(project.id)).filter((task) => task.params?.template === 'project-wiki').length).toBe(1);
     await expect.poll(() => page.url()).toMatch(/\/tasks\/\d+$/);
+    const wiki = (await store.listTasks(project.id)).filter((task) => task.params?.template === 'project-wiki');
+    expect(wiki.map((task) => task.params.runOf ? 'run' : 'series').sort()).toEqual(['run', 'series']);
+    expect(page.url()).toMatch(new RegExp(`/tasks/${wiki.find((task) => task.params.runOf)!.num}$`));
 
     // The series page deletes it, and the store offers it again.
     await page.goto(`${base}/personal/factory?q=is%3Astore`);

@@ -37,7 +37,7 @@ import { serviceHomeLabel } from './services.js';
 import { connectionScope, fundingRef, type ResolvedWorldProviderConnection } from './connections.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow as provisionRun, type ProvisionTarget } from './provision-git.js';
 import { taskBranch } from '../domain/brand.js';
-import { isTransportError } from '../agent/limits.js';
+import { isTransportError, ProviderCapacityFull } from '../agent/limits.js';
 
 const HOME = '/home/user';
 const ROOT = '/home/user/karmax';
@@ -224,7 +224,7 @@ export class E2BWorldProvider implements WorldProvider {
         adopted = true;
         return recovered;
       }
-      throw error;
+      throw e2bFull(error) ?? error;
     });
     this.sandboxes.set(sandbox.sandboxId, sandbox);
     this.states.set(sandbox.sandboxId, 'ready');
@@ -1172,3 +1172,17 @@ function publicGatewayDomains(): string[] {
   }
   catch { return []; }
 }
+
+/** E2B refusing a new sandbox for want of room: the account's concurrent
+ * sandboxes are all in use (429, the SDK's RateLimitError) or E2B has none to
+ * place just now (503, ServiceBusyError). The task then waits for a machine,
+ * or Any tries the next provider, as for any full one. */
+export function e2bFull(error: unknown): ProviderCapacityFull | undefined {
+  const name = (error as { name?: string } | undefined)?.name;
+  const status = (error as { status?: number } | undefined)?.status;
+  const message = error instanceof Error ? error.message : String(error);
+  if (name !== 'RateLimitError' && name !== 'ServiceBusyError' && status !== 429 && status !== 503
+    && !/rate limit exceeded|concurrent sandbox/i.test(message)) return undefined;
+  return new ProviderCapacityFull(`E2B has no room for another sandbox just now: ${message}`, { cause: error });
+}
+

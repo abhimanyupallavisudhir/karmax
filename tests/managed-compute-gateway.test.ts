@@ -74,13 +74,13 @@ describe('managed compute API', () => {
   it('lets an operator connect, test and disable an account, never showing its key', async () => {
     expect((await call(tokenFor.tenantOwner!, 'PUT', '/api/settings/managed-compute/e2b', { apiKey: 'stolen' })).status).toBe(403);
     expect((await call(tokenFor.reader!, 'PUT', '/api/settings/managed-compute/e2b', { apiKey: 'nope' })).status).toBe(403);
-    const saved = await call(tokenFor.operator!, 'PUT', '/api/settings/managed-compute/e2b', { apiKey: 'operator-secret', config: { maxRunning: 20 } });
+    const saved = await call(tokenFor.operator!, 'PUT', '/api/settings/managed-compute/e2b', { apiKey: 'operator-secret', config: { limits: { pool: { machines: 20 } }, share: 40 } });
     expect(saved.status).toBe(200);
     expect(JSON.stringify(await saved.json())).not.toContain('operator-secret');
     expect((await call(tokenFor.operator!, 'POST', '/api/settings/managed-compute/e2b/test')).status).toBe(200);
     const listed = await (await call(tokenFor.reader!, 'GET', '/api/settings/managed-compute')).json();
-    expect(listed).toMatchObject({ multiplier: 2, providers: [{ provider: 'e2b', enabled: true, status: 'ready', running: 0,
-      config: { maxRunning: 20 }, limits: { cpu: 8 }, costMicros: 0, chargedMicros: 0 }] });
+    expect(listed).toMatchObject({ multiplier: 2, providers: [{ provider: 'e2b', enabled: true, status: 'ready', running: 0, runningCpus: 0,
+      config: { limits: { pool: { machines: 20 } }, share: 40 }, limits: { cpu: 8, pool: { machines: 20 } }, costMicros: 0, chargedMicros: 0 }] });
     expect(JSON.stringify(listed)).not.toContain('operator-secret');
     expect((await call(tokenFor.tenantOwner!, 'GET', '/api/settings/managed-compute')).status).toBe(403);
     // No organization path reaches the installation's accounts, whatever the caller's authority.
@@ -94,7 +94,7 @@ describe('managed compute API', () => {
   it('shows an organization the provider and its compute against the credit, not the account', async () => {
     const providers = await (await call(tokenFor.tenantOwner!, 'GET', `/api/organizations/${organizationId}/world-providers`)).json();
     expect(providers).toEqual([expect.objectContaining({ provider: 'e2b', managed: true })]);
-    expect(JSON.stringify(providers)).not.toMatch(/maxRunning|operator-secret/);
+    expect(JSON.stringify(providers)).not.toMatch(/maxRunning|"pool"|"share"|operator-secret/);
     await store.recordUsage({ id: 'usage:e2b:x', organizationId, provider: 'e2b', kind: 'world.active', quantity: 3600, unit: 'second',
       costMicros: 1_000_000, startedAt: inThisMonth(Date.now() - 3_700_000), endedAt: inThisMonth(Date.now() - 100_000), fundingSource: 'managed' });
     const entitlements = await (await call(tokenFor.tenantOwner!, 'GET', `/api/organizations/${organizationId}/entitlements`)).json();

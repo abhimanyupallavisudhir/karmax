@@ -7030,9 +7030,13 @@ function storeActionHtml(item, projectId) {
 // A store task's own form: /<org>/<project>/store/<id>.
 function storeTaskRoute(projectId, id) { return `${projectBase(projectId)}/store/${encodeURIComponent(id)}`; }
 // On the organization home a store task asks which project it is for: the
-// row's state and actions there would be about a project nobody chose.
+// row's state and actions there would be about a project nobody chose. With
+// one project there is nobody to ask, so it shows that project's.
+function storeAsksProject() {
+  return S.tab === 'home' && (S.projects || []).filter((project) => project.organizationId === S.organizationId).length > 1;
+}
 function storeRowHtml(item) {
-  const home = S.tab === 'home';
+  const home = storeAsksProject();
   const projectId = storeProjectId();
   const installed = !home && item.repeatable ? item.installed?.length || 0 : 0;
   const need = home ? null : storeNeed(item);
@@ -7043,9 +7047,9 @@ function storeRowHtml(item) {
   return `<div class="task-row store-row has-row-link" data-store-task="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(item.name)}">
       <div class="task-main">
         <div class="task-title">${esc(item.name)} ${item.summary ? policyTip(item.summary) : ''}</div>
-        ${installed || need ? `<div class="task-sub">${installed ? `<span class="chip">${installed > 1 ? `${installed} installed` : 'Installed'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>` : ''}
+        ${need ? `<div class="task-sub"><span>${esc(need[0])}</span></div>` : ''}
       </div>
-      <div class="task-right">${action}</div>
+      <div class="task-right">${installed ? `<span class="store-installed">✓ ${installed > 1 ? `${installed} installed` : 'Installed'}</span>` : ''}${action}</div>
       ${link}
     </div>`;
 }
@@ -7072,6 +7076,10 @@ async function applyStoreTaskRoute(projectId, id, routeIsCurrent) {
   carriedStoreForm = null;
   openTaskForm(item.task.workflow || NEW_TASK_WORKFLOW, undefined, '',
     carried || { ...item.task.params, prompt: item.task.prompt, template: item.id }, { projectId, store: item });
+}
+// A series' newest run (null when it has none, or they cannot be read).
+function newestRun(seriesId) {
+  return api(`/api/tasks/${seriesId}/runs`).then((runs) => runs.reduce((a, b) => (b.createdAt > (a?.createdAt ?? 0) ? b : a), null)).catch(() => null);
 }
 function storeBackRoute() { return S.returnRoute || listRoute(projectBase(S.projectId), STORE_VIEW_QUERY); }
 function closeStoreTask() {
@@ -7204,7 +7212,10 @@ function wireTaskStore() {
       const task = await api(`/api/projects/${encodeURIComponent(projectId)}/task-store/${encodeURIComponent(button.dataset.storeRun)}`, { method: 'POST', body: '{}' });
       await loadTaskStore(projectId, { force: true });
       refreshTasks();
-      if (item?.repeatable) { toast('Installed'); renderMain(); }
+      // One that starts its first run when installed shows that run, as Run does.
+      const run = item?.runOnInstall ? await newestRun(task.id) : null;
+      if (run) { toast('Installed'); go(taskUrl(run.id, run)); }
+      else if (item?.repeatable) { toast('Installed'); renderMain(); }
       else go(taskUrl(task.id, task));
     } catch (e) { button.disabled = false; showTaskError(e, projectId); }
   }));
@@ -9980,9 +9991,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       }
       succeeded = true;
       // Running a repeatable task starts a new task, its run: name it and go
-      // there, so it is never mistaken for this one (#616/#617).
-      const run = !editInPlace && !draftMode && st.body.repeatable && !st.body.triggers?.length && primaryId
-        ? await api(`/api/tasks/${primaryId}/runs`).then((runs) => runs.reduce((a, b) => (b.createdAt > (a?.createdAt ?? 0) ? b : a), null)).catch(() => null)
+      // there, so it is never mistaken for this one (#616/#617). So does
+      // installing a store task that runs when installed.
+      const run = !editInPlace && !draftMode && st.body.repeatable && (!st.body.triggers?.length || store?.runOnInstall) && primaryId
+        ? await newestRun(primaryId)
         : null;
       releaseFormKeys();
       root.innerHTML = '';
@@ -24223,7 +24235,7 @@ function managedComputeMarkup(view) {
     return `<div class="computer-provider" data-provider="${id}"><b>${esc(info.name)}</b>
       ${state ? `<span class="chip ${state[1]}"${account.lastError ? ` title="${esc(account.lastError)}"` : ''}>${state[0]}</span>` : ''}
       ${account?.features?.internet === 'basic' ? `<span class="chip computer-basic" title="${esc('Reaches package registries, Git hosts, AI and cloud APIs only. Any gives it only tasks whose Outbound network says basic internet is enough.')}">Basic internet</span>` : ''}
-      ${account ? `<span class="setting-muted" title="Machines running now${account.config?.maxRunning ? ', of the account’s limit' : ''}">${account.running}${account.config?.maxRunning ? ` of ${account.config.maxRunning}` : ''} running</span>
+      ${account ? `<span class="setting-muted managed-running" title="Running now, of what the account allows at once">${managedRunning(account)}</span>
         <span class="setting-muted managed-month" title="${esc(`This month: ${hours} machine-hours for ${account.organizations} organization${account.organizations === 1 ? '' : 's'}. The provider’s price, then what organizations were charged.`)}">${money(account.costMicros)} → ${money(account.chargedMicros)}</span>` : ''}
       <span class="label-row-fill"></span>
       ${account ? `<button class="icon-btn computer-edit" type="button" title="Edit ${esc(info.name)}" aria-label="Edit ${esc(info.name)}">✎</button><button class="btn sm computer-test" type="button">Test</button>`
@@ -24236,6 +24248,11 @@ function managedComputeMarkup(view) {
   return `${connected.length ? `<div class="computer-providers">${connected.map(row).join('')}</div>` : ''}
     ${unconnected.length ? `<details class="inst-fold managed-off"><summary>Not connected <span class="setting-muted">${unconnected.length}</span></summary>
       <div class="computer-providers">${unconnected.map(row).join('')}</div></details>` : ''}`;
+}
+/** "3 of 50 running · 6 of 24 CPU": machines and CPUs in use against the account's budget. */
+function managedRunning(account) {
+  const pool = account.limits?.pool || {};
+  return `${account.running}${pool.machines ? ` of ${pool.machines}` : ''} running${pool.cpu ? ` · ${account.runningCpus ?? 0} of ${pool.cpu} CPU` : ''}`;
 }
 async function wireManagedComputeCard() {
   const card = $('#managed-compute-card');
@@ -24754,8 +24771,14 @@ function openComputerDialog(provider, connection, organizationId, onSaved, { man
   overlay.innerHTML = `<div class="modal-card computer-dialog" role="dialog" aria-modal="true" aria-label="${esc(info.name)}">
     <div class="modal-head"><b>${esc(info.name)}</b>${info.tip ? policyTip(info.tip) : ''}<span class="label-row-fill"></span><button class="icon-btn computer-close" type="button" aria-label="Close">×</button></div>
     ${computerKeyMarkup(info, connection)}
-    ${managed ? `<div class="settings-grid"><label class="form-row"><span>Machines at once ${policyTip(`The account’s concurrency limit (E2B Hobby: 20). Beyond it, tasks wait for a machine instead of being refused by ${info.name}. Blank: no limit.`)}</span>
-      <input class="computer-max-running" type="number" min="1" step="1" inputmode="numeric" value="${esc(config.maxRunning ?? '')}" placeholder="No limit"></label>
+    ${managed ? `<div class="settings-grid">${[['cpu', 'CPUs at once'], ['machines', 'Machines at once']].map(([key, label]) => {
+        const own = config.limits?.pool?.[key];
+        const known = connection?.limits?.pool?.[key];
+        return `<label class="form-row"><span>${label} ${key === 'cpu' ? policyTip(`How much of the account may run at once. Google Cloud, AWS and Daytona tell it themselves; enter it where they can’t (Hetzner’s CPU limit, E2B’s and Fly.io’s machine counts). Beyond it, tasks wait for a machine.`) : ''}</span>
+          <input data-pool="${key}" type="number" min="1" step="1" inputmode="numeric" value="${esc(own ?? '')}" placeholder="${esc(own == null && known ? `${known} (${info.name})` : 'No limit')}"></label>`;
+      }).join('')}
+      <label class="form-row"><span>Fair share (%) ${policyTip('While another organization waits for room, one organization may hold at most this much of the account. Alone, it may use all of it.')}</span>
+        <input class="computer-share" type="number" min="1" max="100" step="1" inputmode="numeric" value="${esc(config.share ?? '')}" placeholder="50"></label>
       <label class="switch computer-enabled-row"><input class="toggle computer-enabled" type="checkbox" ${connection?.enabled === false ? '' : 'checked'}>Offer to organizations</label></div>` : ''}
     <details class="computer-advanced"><summary>Advanced</summary><div class="settings-grid">
       ${info.advanced.map(([key, label, placeholder]) => `<label class="form-row">${esc(label)}<input data-config="${esc(key)}" value="${esc(config[key] || '')}" placeholder="${esc(placeholder)}"></label>`).join('')}
@@ -24781,14 +24804,20 @@ function openComputerDialog(provider, connection, organizationId, onSaved, { man
     const limits = Object.fromEntries([...overlay.querySelectorAll('[data-limit]')]
       .filter((input) => input.value.trim() !== '' && Number(input.value) > 0)
       .map((input) => [input.dataset.limit, input.dataset.limit === 'memoryMb' ? Math.round(Number(input.value) * 1024) : Math.round(Number(input.value))]));
-    const maxRunning = Number(overlay.querySelector('.computer-max-running')?.value);
+    // The account's budget, where its provider cannot tell it; blank uses what it says.
+    const pool = Object.fromEntries([...overlay.querySelectorAll('[data-pool]')]
+      .filter((input) => input.value.trim() !== '' && Number(input.value) > 0)
+      .map((input) => [input.dataset.pool, Math.round(Number(input.value))]));
+    if (Object.keys(pool).length) limits.pool = pool;
+    const share = Number(overlay.querySelector('.computer-share')?.value);
     let apiKey;
     try { apiKey = computerKeyValue(overlay); }
     catch (error) { toast(error.message, true); button.disabled = false; return; }
     const body = { apiKey,
       ...(managed ? { enabled: overlay.querySelector('.computer-enabled').checked } : {}),
       config: { ...Object.fromEntries([...overlay.querySelectorAll('[data-config]')].map((input) => [input.dataset.config, input.value.trim()])), limits,
-        ...(managed && maxRunning > 0 ? { maxRunning: Math.round(maxRunning) } : {}) } };
+        // Blank goes back to the default share.
+        ...(managed ? { share: share > 0 ? Math.min(100, Math.round(share)) : '' } : {}) } };
     // A refused save changed nothing: keep what was typed. A saved one is
     // verified at once, and its state (or error) shows on the row.
     try { await api(base, { method: 'PUT', body: JSON.stringify(body) }); }

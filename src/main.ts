@@ -726,6 +726,8 @@ async function main() {
   if ((await store.listProjects()).length === 0) {
     (await store.createProject('My project'));
   }
+  // Projects from before every project came with the repair task get it now (once each).
+  void (async () => { for (const project of await store.listProjects()) await gateway.installDefaultTasks(project); })();
   if (installationOwner) {
     for (const project of (await store.listProjects()).filter((candidate) => candidate.organizationId === 'org_personal')) {
       if (!(await store.userIsProjectMember(project.id, installationOwner.id)))

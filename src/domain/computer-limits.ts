@@ -20,9 +20,11 @@ export interface ComputerLimits {
   memoryMb?: number;
   /** Largest total disk one machine may have, in GB. */
   diskGb?: number;
-  /** The organization's total across all its running machines, when the
-   * provider has one (Daytona's tiers). One machine never exceeds it. */
-  pool?: { cpu?: number; memoryMb?: number; diskGb?: number };
+  /** The account's budget across all its running machines: its CPU quota
+   * (Google Cloud, AWS, Daytona's tiers) and how many machines may run at once
+   * (E2B's plan, Fly.io's organization limit), read from the provider or
+   * entered by a person. One machine never exceeds it. */
+  pool?: AccountPool;
   /** The internet its machines reach: `basic` is a fixed list of essential
    * services (package registries, Git hosts, AI and cloud APIs) that no
    * sandbox can widen or narrow — Daytona's Tiers 1 and 2. */
@@ -30,6 +32,8 @@ export interface ComputerLimits {
   /** When the provider was last asked. */
   checkedAt?: number;
 }
+
+export interface AccountPool { cpu?: number; memoryMb?: number; diskGb?: number; machines?: number }
 
 export type AccountInternet = 'full' | 'basic';
 export type LimitSource = 'provider' | 'configured' | 'default';
@@ -177,21 +181,28 @@ export function providerDefaults(provider: string): Required<MachineShape> | und
   return PROVIDERS[provider] ? { ...PROVIDERS[provider].defaults } : undefined;
 }
 
+/** What a person entered for an account: per-machine limits and its budget. */
+export type ConfiguredLimits = Partial<Record<LimitKey, number>> & { pool?: { cpu?: number; machines?: number } };
+
 /** Configured over measured over documented, per limit; a machine is never
- * allowed more than the organization's whole pool. Providers without an
- * account (this machine, Docker) have no limits. */
-export function computerLimits(provider: string, measured?: ComputerLimits, configured?: Partial<Record<LimitKey, number>>): EffectiveComputerLimits {
+ * allowed more than the account's whole pool (configured over measured too).
+ * Providers without an account (this machine, Docker) have no limits. */
+export function computerLimits(provider: string, measured?: ComputerLimits, configured?: ConfiguredLimits): EffectiveComputerLimits {
   const facts = PROVIDERS[provider];
   if (!facts) return { source: {} };
   const out: EffectiveComputerLimits = { source: {} };
+  const pool: AccountPool = { ...measured?.pool };
+  for (const key of ['cpu', 'machines'] as const) if (positive(configured?.pool?.[key])) pool[key] = configured.pool[key];
+  for (const key of Object.keys(pool) as Array<keyof AccountPool>) if (!positive(pool[key])) delete pool[key];
   for (const key of KEYS) {
     const chosen: [number | undefined, LimitSource][] = [[configured?.[key], 'configured'], [measured?.[key], 'provider'], [facts.limits[key], 'default']];
     let [value, source] = chosen.find(([candidate]) => positive(candidate)) ?? [undefined, 'default'];
-    const pool = measured?.pool?.[key];
-    if (positive(pool) && (value === undefined || pool < value)) [value, source] = [pool, 'provider'];
+    const whole = pool[key];
+    if (positive(whole) && (value === undefined || whole < value))
+      [value, source] = [whole, positive(configured?.pool?.[key as 'cpu']) ? 'configured' : 'provider'];
     if (value !== undefined) { out[key] = value; out.source[key] = source; }
   }
-  if (measured?.pool && Object.keys(measured.pool).length) out.pool = { ...measured.pool };
+  if (Object.keys(pool).length) out.pool = pool;
   if (measured?.network) out.network = measured.network;
   if (measured?.checkedAt) out.checkedAt = measured.checkedAt;
   return out;
