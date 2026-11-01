@@ -373,6 +373,11 @@ export class WorkspaceConflict extends Error {
   }
 }
 
+/** The world is parked or hibernated, and the caller asked not to wake it. */
+export class WorldNotRunningError extends Error {
+  constructor() { super("the task's computer is not running"); this.name = 'WorldNotRunningError'; }
+}
+
 export class ProjectResourceService {
   private publishLocks = new Map<string, Promise<void>>();
   /** The restic repositories resources are saved in, and the server restic reaches them at. */
@@ -1361,8 +1366,17 @@ export class ProjectResourceService {
    * nor a staged candidate. No bytes are read and the bounded result is safe to
    * show at checkpoint/Review. A pull request of a task (SPEC §11.1) has no
    * world of its own: its task keeps the world and whatever is ignored in it. */
-  async ignoredInventory(taskId: string, limit = 100, checkContinue?: () => Promise<void>): Promise<IgnoredResourceInventory> {
+  async ignoredInventory(taskId: string, limit = 100, checkContinue?: () => Promise<void>,
+    options: { wake?: boolean } = {}): Promise<IgnoredResourceInventory> {
     if (pullRequestOf(await this.store.getTask(taskId))) return { entries: [], truncated: false };
+    if (options.wake === false) {
+      // Looking at a task must not start its computer: a woken cloud machine
+      // stays up with nothing to park it (production, 2026-11-01: the task
+      // page's inventory woke parked VMs, a Hetzner one as a new billed hour).
+      const current = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
+      if (current && this.worlds.get(current.kind).capabilities?.remote && (await this.store.worldState(current.id)) !== 'ready')
+        throw new WorldNotRunningError();
+    }
     const { handle, world } = await this.currentTaskWorld(taskId);
     const excluded = [
       ...Object.values((handle.meta?.resourceProjections ?? {}) as Record<string, { target?: string }>)
