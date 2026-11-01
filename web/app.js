@@ -24173,11 +24173,12 @@ function managedComputeMarkup(view) {
     ${unconnected.length ? `<details class="inst-fold managed-off"><summary>Not connected <span class="setting-muted">${unconnected.length}</span></summary>
       <div class="computer-providers">${unconnected.map(row).join('')}</div></details>` : ''}`;
 }
-/** "3 of 50 running · 6 of 24 CPU · 400 of 1024 GB · 2 waiting": what is in use against the account's budget, and its queue. */
+/** "3 of 50 running · 6 of 24 CPU · 400 of 1,024 GB · 2 waiting": what is in use against the account's budget, and its queue. */
 function managedRunning(account) {
   const pool = account.limits?.pool || {};
-  return `${account.running}${pool.machines ? ` of ${pool.machines}` : ''} running${pool.cpu ? ` · ${account.runningCpus ?? 0} of ${pool.cpu} CPU` : ''}`
-    + `${pool.diskGb ? ` · ${account.diskGb ?? 0} of ${pool.diskGb} GB` : ''}${account.waiting ? ` · ${account.waiting} waiting` : ''}`;
+  const n = (value) => Number(value || 0).toLocaleString('en-US');
+  return `${n(account.running)}${pool.machines ? ` of ${n(pool.machines)}` : ''} running${pool.cpu ? ` · ${n(account.runningCpus)} of ${n(pool.cpu)} CPU` : ''}`
+    + `${pool.diskGb ? ` · ${n(account.diskGb)} of ${n(pool.diskGb)} GB` : ''}${account.waiting ? ` · ${n(account.waiting)} waiting` : ''}`;
 }
 async function wireManagedComputeCard() {
   const card = $('#managed-compute-card');
