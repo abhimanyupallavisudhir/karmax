@@ -132,9 +132,9 @@ async function fixture(options: { hosted?: boolean; plan?: string } = {}) {
 describe('the accounts Any can reach', () => {
   it('offers the organization\'s own accounts and the managed compute it may use, never both for one provider', async () => {
     const f = await fixture({ plan: 'team' });
-    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'hetzner', apiKey: 'h', config: { maxRunning: 4, region: 'fsn1',
+    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'hetzner', apiKey: 'h', config: { region: 'fsn1',
       limits: { cpu: 4, memoryMb: 8192, diskGb: 200 } } });
-    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'aws', apiKey: 'AKIA1234567890ABCDEF:secretvalue', config: { maxRunning: 24 } });
+    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'aws', apiKey: 'AKIA1234567890ABCDEF:secretvalue', config: {} });
     await f.connections.save({ organizationId: f.organization.id, provider: 'aws', apiKey: 'AKIAOWNX4567890ABCD:ownsecret' });
     const options = await f.router.options(f.organization.id);
     expect(options.map((value) => `${value.provider}:${value.funding}:${value.region}`).sort()).toEqual(['aws:own:eu', 'hetzner:managed:eu']);
@@ -169,7 +169,7 @@ describe('the accounts Any can reach', () => {
 
   it('knows managed compute is full or out of credit, and remembers a provider\'s refusal for a while', async () => {
     const f = await fixture({ plan: 'free' });
-    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'gcp', apiKey: JSON.stringify(fakeServiceAccount()), config: { maxRunning: 1 } });
+    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'gcp', apiKey: JSON.stringify(fakeServiceAccount()), config: {} });
     await f.connections.save({ organizationId: f.organization.id, provider: 'e2b', apiKey: 'own' });
     await f.store.setWorldProviderConnectionStatus(f.organization.id, 'e2b', 'error', 'bad key');
     let options = await f.router.options(f.organization.id);
@@ -191,7 +191,7 @@ describe('a CPU quota shared by an account\'s machines', () => {
   it('counts the CPUs already running on it, across organizations for managed compute', async () => {
     const f = await fixture({ plan: 'team' });
     await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'gcp', apiKey: JSON.stringify(fakeServiceAccount()),
-      config: { maxRunning: 10, limits: { cpu: 8, memoryMb: 32_768, diskGb: 1024 } } });
+      config: { limits: { cpu: 8, memoryMb: 32_768, diskGb: 1024 } } });
     // What the account said: the lowest of E2_CPUS 24, CPUS 200 and CPUS_ALL_REGIONS 100.
     await f.store.setWorldProviderConnectionLimits(MANAGED_COMPUTE, 'gcp', { cpu: 24, pool: { cpu: 24 }, checkedAt: Date.now() });
     const other = await f.store.createOrganization({ name: 'Other', ownerUserId: 'other' });

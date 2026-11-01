@@ -6,7 +6,7 @@ import { cloudProviders, listPriceMicrosPerHour, providerDefaults, providerLabel
 import type { ProjectConfig } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { MANAGED_COMPUTE } from './connections.js';
-import { assertComputeCredit, ComputeCreditExhausted, ManagedComputeBusy } from './managed-compute.js';
+import { assertComputeCredit, ComputeCreditExhausted, ManagedComputeBusy, managedRoom } from './managed-compute.js';
 
 /**
  * Compute routing (wiki features/compute-routing): the machine a task gets
@@ -21,7 +21,8 @@ import { assertComputeCredit, ComputeCreditExhausted, ManagedComputeBusy } from 
  * A candidate qualifies when its account allows a machine of the task's size,
  * offers what the task needs (a desktop, an outbound allowlist), runs in the
  * region asked for, and is known to have room: managed compute needs credit
- * left this month and fewer than its `maxRunning` machines in use.
+ * left this month and room in the account's budget (its CPUs and machines at
+ * once, and this organization's fair share of them: managed-compute.ts).
  *
  * The qualifying candidates are tried in this order:
  *   1. a restored world's previous provider (it comes back where it was);
@@ -173,7 +174,7 @@ function outageCause(error: unknown): Error | undefined {
 export interface RouterConnections {
   list(organizationId: string): Promise<Array<{ provider: string; enabled: boolean; credentialConfigured: boolean; status?: string;
     managed?: boolean; limits: ComputerLimits; features: ComputerFeatures; config: { region?: string; target?: string } }>>;
-  managedConnections(): Promise<Array<{ provider: string; config: { maxRunning?: number } }>>;
+  managedConnections(): Promise<Array<{ provider: string; config: { share?: number }; limits: { pool?: { cpu?: number; machines?: number } } }>>;
 }
 
 /** One decision, as recorded in `world.routed`. */
@@ -208,17 +209,19 @@ export class ComputeRouter {
         const short = await assertComputeCredit(this.store, organizationId, view.provider, this.now(), { shape: needs })
           .then(() => undefined, (error: unknown) => { if (error instanceof ComputeCreditExhausted) return error; throw error; });
         if (short) return { ...option, busy: 'out of compute this month', outOfCredit: short.message };
-        const maxRunning = accounts.find((account) => account.provider === view.provider)?.config.maxRunning;
-        if (maxRunning && await this.store.runningManagedWorlds(view.provider) >= maxRunning)
-          return { ...option, busy: `all ${maxRunning} in use` };
+        // The account's budget (CPUs, machines) and this organization's fair share of it.
+        const account = accounts.find((value) => value.provider === view.provider);
+        const full = account && await managedRoom(this.store, view.provider, { pool: account.limits.pool, share: account.config.share },
+          organizationId, needs.cpu, this.now());
+        if (full) return { ...option, busy: full.reason };
       } else if (view.status === 'error') option.doubt = 'its last connection test failed';
-      // A CPU quota all of the account's machines share (Google Cloud: the
-      // lowest of E2_CPUS, CPUS and CPUS_ALL_REGIONS; Daytona's tier): room is
-      // what the worlds running on it leave. Machines outside tavya on the same
+      // An own account's CPU quota, shared by all its machines (Google Cloud:
+      // the lowest of E2_CPUS, CPUS and CPUS_ALL_REGIONS; Daytona's tier): room
+      // is what its running worlds leave. Machines outside tavya on the same
       // account are not counted; the provider's own refusal still falls over.
-      const pool = view.limits.pool?.cpu;
+      const pool = funding === 'own' ? view.limits.pool?.cpu : undefined;
       if (pool) {
-        const used = await this.store.runningWorldCpus(view.provider, funding === 'managed' ? null : organizationId);
+        const used = await this.store.runningWorldCpus(view.provider, organizationId);
         const cpu = needs.cpu ?? providerDefaults(view.provider)?.cpu ?? 2;
         if (used + cpu > pool) return { ...option, busy: `${used} of its ${pool} CPUs in use` };
       }

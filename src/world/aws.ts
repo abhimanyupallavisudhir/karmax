@@ -31,6 +31,8 @@ import { ProviderCapacityFull, ProviderOutage } from '../agent/limits.js';
 
 const API_VERSION = '2016-11-15';
 export const AWS_DEFAULT_REGION = 'eu-central-1';
+/** Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances, in vCPUs. */
+const AWS_STANDARD_VCPU_QUOTA = 'L-1216C47A';
 export const AWS_MAX_DISK_GB = 16_384;
 export const AWS_DEFAULT_DISK_GB = 20;
 /** The root disk: the system and karmax's tools; the world is on its own volume. */
@@ -401,11 +403,25 @@ export class AwsDriver implements VmDriver {
     await this.removeImages(connection, (image) => image.version === vmProvisionVersion() || now - image.created < 86_400_000);
   }
 
-  /** The largest instance of karmax's families offered in the region, and a 16 TiB volume. */
+  /** The largest instance of karmax's families offered in the region, a 16
+   * TiB volume, and the account's budget: its running On-Demand Standard vCPU
+   * quota, which every instance of karmax's families (C, M, R) counts against. */
   async limits(connection: ResolvedWorldProviderConnection): Promise<ComputerLimits> {
-    const types = await this.types(connection);
+    const [types, quota] = await Promise.all([this.types(connection), this.vcpuQuota(connection)]);
     return { ...(types.length ? { cpu: Math.max(...types.map((type) => type.cpu)), memoryMb: Math.max(...types.map((type) => type.memoryMb)) } : {}),
-      diskGb: AWS_MAX_DISK_GB, checkedAt: Date.now() };
+      diskGb: AWS_MAX_DISK_GB, ...(quota ? { pool: { cpu: quota } } : {}), checkedAt: Date.now() };
+  }
+
+  /** Service Quotas `L-1216C47A` in the region; undefined when the key may not
+   * read it (it needs `servicequotas:GetServiceQuota`), so a person enters it. */
+  private async vcpuQuota(connection: ResolvedWorldProviderConnection): Promise<number | undefined> {
+    const region = this.region(connection);
+    try {
+      const answer = await this.json(connection, `https://servicequotas.${region}.amazonaws.com/`, region, 'servicequotas',
+        'ServiceQuotasV20190624.GetServiceQuota', { ServiceCode: 'ec2', QuotaCode: AWS_STANDARD_VCPU_QUOTA }) as { Quota?: { Value?: number } };
+      const value = Math.floor(Number(answer.Quota?.Value));
+      return Number.isFinite(value) && value > 0 ? value : undefined;
+    } catch { return undefined; }
   }
 
   /** The key works, and the region has the default VPC worlds are made in. */
