@@ -2405,6 +2405,35 @@ export class KarmaxApi {
 
   /** Start a previously-saved draft (SPEC §10.4). */
   async queueTask(token: string, taskId: string): Promise<TaskRecord> {
+    // Read first: queueing clears the wait (Store.clearDraft).
+    const awaited = (await this.deps.store.getTask(taskId))?.params?._awaitingApproval;
+    const queued = (await this.queueStoredTask(token, taskId));
+    if (typeof awaited === 'string') (await this.withdrawApprovalWait(token, queued, awaited));
+    return queued;
+  }
+
+  /** Whoever runs a task waiting for approval has decided its authority: the
+   * request no longer asks anyone, and approving it later could not regrant
+   * what they chose (indike.org #19: it stayed in the conversation after Run). */
+  private async withdrawApprovalWait(token: string, task: TaskRecord, requestId: string): Promise<void> {
+    if (task.params?._awaitingApproval) (await this.deps.store.patchTaskParams(task.id, { _awaitingApproval: null }));
+    const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId;
+    const by = (await this.deps.tokens.verify(token))?.principal ?? 'unknown';
+    const agentOf = /^task-agent:([^:]+):/.exec(by)?.[1];
+    const agentTask = agentOf ? (await this.deps.store.getTask(agentOf)) : undefined;
+    const name = by.startsWith('user:') ? (await this.deps.store.userDisplayName(by.slice(5)))
+      : agentTask ? `Task #${agentTask.num ?? agentTask.id}'s agent` : undefined;
+    const reason = `${name ?? 'Someone'} ran the task`;
+    const withdrawn = organizationId
+      && (await new AuthorizationRequests(this.deps.store, organizationId).withdraw(requestId, by, reason));
+    if (!withdrawn) return;
+    const event = { taskId: task.id, type: 'authorization.approval-resolved', ts: Date.now(),
+      payload: { requestId, action: 'withdraw', resolvedBy: by, reason } };
+    const seq = (await this.deps.store.appendEvent(event));
+    this.deps.bus?.emit({ ...event, seq });
+  }
+
+  private async queueStoredTask(token: string, taskId: string): Promise<TaskRecord> {
     const receivedAt = (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
     const task = await this.deps.store.getTask(taskId);
     if (!task) throw new NotFoundError(`no task ${taskId}`);

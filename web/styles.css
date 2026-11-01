@@ -1069,8 +1069,21 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
 .tf-foot .tf-ready a { color: var(--working); font-weight: 600; text-decoration: underline; text-underline-offset: 2px; }
 .tf-ready-mark { display: inline-grid; place-items: center; width: 16px; height: 16px; border-radius: 50%;
   background: var(--working-weak); font-size: 11px; font-weight: 700; }
+/* A task waiting for approval: what it asks for, and Approve/Deny, above its form. */
+.tf-approval { background: var(--working-weak); border-bottom: 1px solid var(--line); }
+.tf-approval[hidden] { display: none; }
+.tf-approval-row { max-width: 1120px; margin: 0 auto; padding: 11px 28px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.tf-approval-row + .tf-approval-row { border-top: 1px solid var(--line); }
+.tf-approval-row .tf-ready-mark { color: var(--surface); background: var(--working); }
+.tf-approval-main { flex: 1 1 320px; min-width: 0; }
+.tf-approval-what { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; font-weight: 600; }
+.tf-approval-what a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+.tf-approval-reason { margin-top: 2px; color: var(--ink-2); font-size: 12.5px; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.tf-approval-actions { display: flex; align-items: center; gap: 6px; }
 @media (max-width: 900px) {
   .tf-columns { grid-template-columns: 1fr; }
+  .tf-approval-row { padding-left: 16px; padding-right: 16px; }
   .tf-head-inner, .tf-foot-inner, .tf-columns { padding-left: 16px; padding-right: 16px; }
   .tf-columns { padding-top: 18px; padding-bottom: 40px; }
   .tf-side { margin-top: 10px; border-top: 1px solid var(--line); }
