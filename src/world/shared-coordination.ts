@@ -1,7 +1,36 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { acquireFileLock } from '../util/file-lock.js';
+import { Context as activityContext } from '@temporalio/activity';
+import { acquireFileLock, FileLockTimeout } from '../util/file-lock.js';
+
+/** How long an operation on a world waits while another process runs one on
+ * it (waking or parking its machine, scanning a large resource: minutes). An
+ * activity waits as the in-process lock does, heartbeating and cancellable, up
+ * to `activityMs`; anything else (a console request) answers busy after
+ * `requestMs`. Each wait is in `roundMs` slices. */
+export const WORLD_OPERATION_WAIT = { activityMs: 20 * 60_000, requestMs: 30_000, roundMs: 10_000 };
+
+/** Another operation held the world for the whole wait: infrastructure that
+ * clears by itself, never the task's or the agent's error. */
+export class WorldBusy extends Error {
+  readonly status = 503;
+  constructor(waitedMs: number, options?: { cause?: unknown }) {
+    super(`This task's computer was busy with another operation (starting, saving or parking it) for ${
+      waitedMs >= 120_000 ? `${Math.round(waitedMs / 60_000)} minutes` : `${Math.round(waitedMs / 1000)} seconds`}`, options);
+    this.name = 'WorldBusy';
+  }
+}
+
+/** The running activity's cancellation and heartbeat, when there is one. */
+function ambientActivity(): { signal: AbortSignal; heartbeat: () => void } | undefined {
+  try {
+    const context = activityContext.current();
+    return { signal: context.cancellationSignal, heartbeat: () => context.heartbeat({ waitingFor: 'world-operation' }) };
+  } catch {
+    return undefined;
+  }
+}
 
 /** Shared by a supervised same-host gateway/worker group. Separate lock inodes
  * let an accessor pin itself before waiting for a world transition, and release
@@ -26,7 +55,22 @@ export class SharedWorldCoordination {
   }
 
   async operation<T>(worldId: string, work: () => Promise<T>): Promise<T> {
-    const release = await acquireFileLock(this.filename(worldId, 'operation'));
+    const activity = ambientActivity();
+    const limit = activity ? WORLD_OPERATION_WAIT.activityMs : WORLD_OPERATION_WAIT.requestMs;
+    const started = Date.now();
+    let release: (() => void) | undefined;
+    for (;;) {
+      activity?.signal.throwIfAborted();
+      const left = limit - (Date.now() - started);
+      if (left <= 0) throw new WorldBusy(Date.now() - started);
+      try {
+        release = await acquireFileLock(this.filename(worldId, 'operation'), { waitMs: Math.min(WORLD_OPERATION_WAIT.roundMs, left) });
+        break;
+      } catch (error) {
+        if (!(error instanceof FileLockTimeout)) throw error;
+        activity?.heartbeat();
+      }
+    }
     try { return await work(); }
     finally { release!(); }
   }

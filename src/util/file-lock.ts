@@ -3,6 +3,11 @@ import { spawn } from 'node:child_process';
 
 let pending = 0;
 
+/** Another holder kept the lock for the whole wait. */
+export class FileLockTimeout extends Error {
+  constructor() { super('file lock admission timed out'); this.name = 'FileLockTimeout'; }
+}
+
 /** Same-host Linux coordination. The helper locks an inherited open file
  * description; after it exits, the parent's descriptor retains the kernel lock.
  * Closing that descriptor (including process death) releases it. Lock files
@@ -32,7 +37,7 @@ export async function acquireFileLock(filename: string, options: {
       child.once('close', resolve);
     });
     if (status === 73 && waitMs === 0) return undefined;
-    if (status === 73) throw new Error('file lock admission timed out');
+    if (status === 73) throw new FileLockTimeout();
     if (status !== 0) throw new Error('file lock helper failed');
     fd = undefined; // Ownership transfers to the idempotent release callback.
     let released = false;

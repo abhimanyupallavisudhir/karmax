@@ -84,4 +84,8 @@ assert.ok(taskErrorHtml('Activity task failed → something unexpected').include
 assert.ok(!taskErrorHtml('No computer is connected: connect one under Settings → Computers.').includes('Press Retry'), 'a setting is the fix, not Retry'); passed++;
 assert.ok(!taskErrorHtml('Activity task failed → stream ended unexpectedly').includes('Press Retry to try again'), 'specific advice stays as written'); passed++;
 
+// pramana#155 (2026-11-01): another operation held the task's computer past the wait.
+assert.match(plainTaskError('Could not publish resources: file lock admission timed out Nothing was lost; Retry publishes again.').summary,
+  /^The task’s computer was busy with another operation \(starting, saving or parking it\)\. Retry usually fixes this\.$/); passed++;
+
 console.log(`${passed} passed, 0 failed`);
