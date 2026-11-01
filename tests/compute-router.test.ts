@@ -11,6 +11,7 @@ import { Store } from '../src/store/db.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { MANAGED_COMPUTE, WorldProviderConnectionService } from '../src/world/connections.js';
+import { waiters } from '../src/world/compute-queue.js';
 import { ComputeRouter, FULL_MEMORY_MS, computeNeeds, rankComputeOptions, type ComputeOption } from '../src/world/compute-router.js';
 import { ComputeCreditExhausted, ManagedComputeBusy } from '../src/world/managed-compute.js';
 import { ProviderCapacityFull, ProviderOutage } from '../src/agent/limits.js';
@@ -382,6 +383,26 @@ describe('createWorld with provider "Any"', () => {
     expect(failure).toMatchObject({ type: 'world-capacity', message: 'AWS: VcpuLimitExceeded' });
     expect(a.hetzner.made).toEqual([]);
     expect(await a.events(taskId, 'world.routed')).toEqual([]);
+  });
+
+  // The queue (wiki features/managed-compute § Queue): every account that had
+  // no room for the task keeps its place; a machine takes it off.
+  it('puts a task in line at each account that refused it, and takes it off once it has a machine', async () => {
+    const a = await activities();
+    a.hetzner.full = 'Hetzner: the CPU limit is full';
+    a.aws.full = 'AWS: VcpuLimitExceeded';
+    const routed = await a.task('Any');
+    await a.core.createWorld({ taskId: routed, base: 'main', kind: ANY_PROVIDER }).catch(() => undefined);
+    expect(Object.keys((await waiters(a.store)).find((value) => value.taskId === routed)?.accounts ?? {}).sort())
+      .toEqual(['installation:aws', 'installation:hetzner']);
+    const pinned = await a.task('Pinned', { provider: 'aws' });
+    await a.core.createWorld({ taskId: pinned, base: 'main', kind: 'aws' }).catch(() => undefined);
+    expect((await waiters(a.store)).find((value) => value.taskId === pinned)?.accounts).toHaveProperty(['installation:aws']);
+    a.aws.full = undefined;
+    // The routed one waited first: the pinned one does not pass it.
+    expect((await a.core.createWorld({ taskId: routed, base: 'main', kind: ANY_PROVIDER })).kind).toBe('aws');
+    expect((await a.core.createWorld({ taskId: pinned, base: 'main', kind: 'aws' })).kind).toBe('aws');
+    expect(await waiters(a.store)).toEqual([]);
   });
 
   // A workflow passes the provider its task had when it started. A task that

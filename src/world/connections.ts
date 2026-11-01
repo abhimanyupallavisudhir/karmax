@@ -421,7 +421,7 @@ function cleanLimits(value: unknown): WorldProviderConnection['config']['limits'
     .filter(([, number]) => Number.isInteger(number) && number > 0 && number <= 1_000_000));
   const out: NonNullable<WorldProviderConnection['config']['limits']> = numbers(raw, ['cpu', 'memoryMb', 'diskGb']);
   // The account's budget, where the provider cannot tell it.
-  const pool = numbers(raw.pool && typeof raw.pool === 'object' ? raw.pool as Record<string, unknown> : {}, ['cpu', 'machines']);
+  const pool = numbers(raw.pool && typeof raw.pool === 'object' ? raw.pool as Record<string, unknown> : {}, ['cpu', 'machines', 'diskGb']);
   if (Object.keys(pool).length) out.pool = pool;
   return Object.keys(out).length ? out : undefined;
 }

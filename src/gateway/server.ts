@@ -71,7 +71,8 @@ import { withTimeout } from '../util/timeout.js';
 import { AgentAuthority, AgentSpec, AuthorizationSelection, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, WorldLocation, normalizeUrgency } from '../domain/types.js';
 import { dotenvFile, dotenvSecretName, parseDotenv } from '../domain/dotenv.js';
 import { CLOUD_WORLD_PROVIDERS } from '../domain/computer.js';
-import { providerDefaults } from '../domain/computer-limits.js';
+import { accountUse } from '../world/account-room.js';
+import { accountKey, waiters } from '../world/compute-queue.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
@@ -2747,9 +2748,10 @@ export class Gateway {
               providers: await Promise.all(accounts.map(async (account) => {
                 const rows = costs.filter((row) => row.provider === account.provider);
                 const costMicros = rows.reduce((total, row) => total + row.costMicros, 0);
-                const leases = await store.runningManagedLeases(account.provider);
-                const size = providerDefaults(account.provider)?.cpu ?? 2;
-                return { ...account, running: leases.length, runningCpus: leases.reduce((total, lease) => total + (lease.cpu ?? size), 0),
+                // What runs and exists on it now, as admission counts it (account-room.ts).
+                const use = await accountUse(store, account.provider, null);
+                return { ...account, running: use.machines, runningCpus: use.cpu, diskGb: use.diskGb,
+                  waiting: (await waiters(store)).filter((waiter) => accountKey(MANAGED_COMPUTE, account.provider) in waiter.accounts).length,
                   organizations: rows.length,
                   costMicros, chargedMicros: computeChargeMicros(costMicros), seconds: rows.reduce((total, row) => total + row.seconds, 0) };
               })) });

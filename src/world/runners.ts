@@ -5,7 +5,9 @@ import type { Store } from '../store/db.js';
 import type { Project, RunnerPool, WorldHandleRef } from '../domain/types.js';
 import type { ProviderSandboxRef, WorldHandle } from './types.js';
 import { ANY_PROVIDER, describeMachine, isAnyProvider, machineShape, sameMachine, type MachineShape } from '../domain/computer.js';
-import { assertComputerFits, type ComputerLimits } from '../domain/computer-limits.js';
+import { assertComputerFits, type AccountPool, type ComputerLimits } from '../domain/computer-limits.js';
+import { accountRoom } from './account-room.js';
+import { ProviderCapacityFull } from '../agent/limits.js';
 import type { WorldRegistry } from './registry.js';
 import type { WorldCheckpointService } from './checkpoint.js';
 import type { ObjectStore } from '../store/objects.js';
@@ -15,6 +17,13 @@ import { taskEnded } from './task-ended.js';
 import { taskProvider } from './task-provider.js';
 import { assertComputeCredit, assertManagedRoom } from './managed-compute.js';
 import { MANAGED_COMPUTE, worldAccountLimits } from './connections.js';
+import { WAKE_RELOCATE_AFTER_MS, wakeFullKey } from './compute-queue.js';
+
+/** What a machine of this config takes from its account's budget. */
+const roomShape = (config: Parameters<typeof machineShape>[0]): { cpu?: number; diskGb?: number } => {
+  const shape = machineShape(config);
+  return { ...(shape.cpu !== undefined ? { cpu: shape.cpu } : {}), ...(shape.diskGb !== undefined ? { diskGb: shape.diskGb } : {}) };
+};
 
 const fits = (shape: MachineShape, limits: ComputerLimits): boolean => {
   try { assertComputerFits(shape, limits, ''); return true; } catch { return false; }
@@ -24,7 +33,9 @@ const fits = (shape: MachineShape, limits: ComputerLimits): boolean => {
  * (WorldProviderConnectionService). */
 export interface ManagedComputeAccounts {
   funding(organizationId: string | undefined, provider: string): Promise<'managed' | 'own' | undefined>;
-  managedConnections(): Promise<Array<{ provider: string; config: { share?: number }; limits: { pool?: { cpu?: number; machines?: number } } }>>;
+  managedConnections(): Promise<Array<{ provider: string; config: { share?: number }; limits: { pool?: AccountPool } }>>;
+  /** What a computer on the account the organization runs `provider` on may be, and the account's budget. */
+  limits?(organizationId: string | undefined, provider: string): Promise<{ pool?: AccountPool }>;
 }
 
 // Private/explicit pools retain physical resource totals. Hosted customer-owned
@@ -102,7 +113,13 @@ export class RunnerPoolService {
         { shape: config.resources, taskId: input.taskId });
       const account = (await this.managed?.managedConnections())?.find((value) => value.provider === input.provider);
       if (account) await assertManagedRoom(this.store, input.provider, { pool: account.limits.pool, share: account.config.share },
-        input.project.organizationId!, config.resources?.cpu);
+        input.project.organizationId!, { ...roomShape(config), taskId: input.taskId, worldId: input.worldId });
+    } else if (this.managed?.limits && await this.managed.funding(input.project.organizationId, input.provider) === 'own') {
+      // The organization's own account: its budget and its queue (account-room.ts).
+      const refusal = await accountRoom(this.store, { provider: input.provider, managed: false,
+        pool: (await this.managed.limits(input.project.organizationId, input.provider)).pool },
+        { organizationId: input.project.organizationId!, ...roomShape(config), taskId: input.taskId, worldId: input.worldId });
+      if (refusal) throw new ProviderCapacityFull(refusal.message);
     }
     const month = monthWindow(Date.now());
     const organizationPolicy = (await this.store.getOrganizationExecutionPolicy(input.project.organizationId!));
@@ -259,6 +276,7 @@ export class WorldLifecycleManager {
     await this.step('checkpoint garbage', async () => this.checkpoints.collectGarbage?.());
     if (this.objects instanceof DeferredDeleteObjectStore) await this.objects.purgeDue(now).catch(() => undefined);
     await this.step('provider usage', () => this.reconcileProviderUsage(now));
+    await this.step('stuck wakes', () => this.relocateStuckWakes(now));
     await this.step('promoted artifacts', async () => {
       for (const artifact of (await this.store.expiredPromotedArtifacts(now))) {
         (await this.store.deletePromotedArtifact(artifact.id));
@@ -530,6 +548,35 @@ export class WorldLifecycleManager {
         await this.checkpoints.addNotice?.(candidate.handle.id, COMPUTE_HIBERNATED_NOTICE);
     }
     return freed;
+  }
+
+  /**
+   * A parked world its account had no room to wake (its disk's host, zone or
+   * location full) for WAKE_RELOCATE_AFTER_MS is hibernated: its park
+   * checkpoint is kept and its machine and disk freed, so its task's next try
+   * restores it where it can run now — on "Any", any provider with room; on a
+   * named provider, a new machine there (wiki features/compute-routing § Stuck
+   * wakes). Its agent is told what did not carry over.
+   */
+  async relocateStuckWakes(now = Date.now()): Promise<number> {
+    let moved = 0;
+    for (const candidate of await this.store.listWorldInstances('parked')) {
+      const raw = await this.store.kvGet(wakeFullKey(candidate.handle.id));
+      if (!raw) continue;
+      let since = 0; let generation = 0;
+      try { ({ since, generation } = JSON.parse(raw) as { since: number; generation: number }); } catch { /* malformed: drop it */ }
+      if (generation !== (candidate.handle.generation ?? 1)) { await this.store.kvDelete(wakeFullKey(candidate.handle.id)); continue; }
+      if (now - since < WAKE_RELOCATE_AFTER_MS) continue;
+      const done = await this.hibernate(candidate, { reason: 'no-room', onFailure: (error) =>
+        this.recordLifecycle(candidate.handle, 'world.hibernate_failed', { error: error instanceof Error ? error.message : String(error), reason: 'no-room' }),
+      }).catch(() => false);
+      if (!done) continue;
+      moved++;
+      await this.store.kvDelete(wakeFullKey(candidate.handle.id));
+      if ((await this.store.worldState(candidate.handle.id)) === 'hibernated')
+        await this.checkpoints.addNotice?.(candidate.handle.id, STUCK_WAKE_NOTICE);
+    }
+    return moved;
   }
 
   /** Checkpoint a parked (or idle ready) world and delete it at its provider;
@@ -852,6 +899,12 @@ export const COMPUTE_HIBERNATED_NOTICE = 'While this task waited, the organizati
   + 'was hibernated: it was saved and its machine and disk deleted. You are on a new machine with the same files your repositories '
   + 'track, and the same uncommitted changes. Git-ignored files (installed dependencies, build output, caches) and running processes '
   + 'did not carry over: reinstall or restart what you need.';
+
+/** Told to the agent whose parked computer could not wake where its disk was (relocateStuckWakes). */
+export const STUCK_WAKE_NOTICE = 'This task\'s parked computer could not start again where its disk was (no room there), so it was restored from '
+  + 'its last checkpoint on a new machine. You have the same files your repositories track, the same uncommitted changes and the same '
+  + 'project data. Git-ignored files (installed dependencies, build output, caches) and running processes did not carry over: '
+  + 'reinstall or restart what you need.';
 const HIBERNATE_RETRY_MS = 5 * 60_000;
 /** How long the world of a task that ended (done, cancelled, failed) is kept
  * before its machine and disk are freed: long enough for an accidental cancel

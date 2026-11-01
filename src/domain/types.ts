@@ -406,9 +406,9 @@ export interface WorldProviderConnection {
     /** Per-machine limits entered in Advanced, for what the provider's API
      * cannot tell (wiki features/computers). Disk is total GB. `pool` is the
      * account's budget across its running machines where the provider cannot
-     * say it (Hetzner's CPU limit, E2B's and Fly.io's machine counts); it wins
-     * over the measured one. */
-    limits?: { cpu?: number; memoryMb?: number; diskGb?: number; pool?: { cpu?: number; machines?: number } };
+     * say it (Hetzner's CPU and volume limits, E2B's and Fly.io's machine
+     * counts); it wins over the measured one. */
+    limits?: { cpu?: number; memoryMb?: number; diskGb?: number; pool?: { cpu?: number; machines?: number; diskGb?: number } };
     /** Managed compute: the most of the account's budget one organization may
      * hold while another waits for room, in percent (default 50). */
     share?: number;

@@ -24173,10 +24173,11 @@ function managedComputeMarkup(view) {
     ${unconnected.length ? `<details class="inst-fold managed-off"><summary>Not connected <span class="setting-muted">${unconnected.length}</span></summary>
       <div class="computer-providers">${unconnected.map(row).join('')}</div></details>` : ''}`;
 }
-/** "3 of 50 running · 6 of 24 CPU": machines and CPUs in use against the account's budget. */
+/** "3 of 50 running · 6 of 24 CPU · 400 of 1024 GB · 2 waiting": what is in use against the account's budget, and its queue. */
 function managedRunning(account) {
   const pool = account.limits?.pool || {};
-  return `${account.running}${pool.machines ? ` of ${pool.machines}` : ''} running${pool.cpu ? ` · ${account.runningCpus ?? 0} of ${pool.cpu} CPU` : ''}`;
+  return `${account.running}${pool.machines ? ` of ${pool.machines}` : ''} running${pool.cpu ? ` · ${account.runningCpus ?? 0} of ${pool.cpu} CPU` : ''}`
+    + `${pool.diskGb ? ` · ${account.diskGb ?? 0} of ${pool.diskGb} GB` : ''}${account.waiting ? ` · ${account.waiting} waiting` : ''}`;
 }
 async function wireManagedComputeCard() {
   const card = $('#managed-compute-card');
@@ -24695,10 +24696,10 @@ function openComputerDialog(provider, connection, organizationId, onSaved, { man
   overlay.innerHTML = `<div class="modal-card computer-dialog" role="dialog" aria-modal="true" aria-label="${esc(info.name)}">
     <div class="modal-head"><b>${esc(info.name)}</b>${info.tip ? policyTip(info.tip) : ''}<span class="label-row-fill"></span><button class="icon-btn computer-close" type="button" aria-label="Close">×</button></div>
     ${computerKeyMarkup(info, connection)}
-    ${managed ? `<div class="settings-grid">${[['cpu', 'CPUs at once'], ['machines', 'Machines at once']].map(([key, label]) => {
+    ${managed ? `<div class="settings-grid">${[['cpu', 'CPUs at once'], ['machines', 'Machines at once'], ['diskGb', 'Disk (GB)']].map(([key, label]) => {
         const own = config.limits?.pool?.[key];
         const known = connection?.limits?.pool?.[key];
-        return `<label class="form-row"><span>${label} ${key === 'cpu' ? policyTip(`How much of the account may run at once. Google Cloud, AWS and Daytona tell it themselves; enter it where they can’t (Hetzner’s CPU limit, E2B’s and Fly.io’s machine counts). Beyond it, tasks wait for a machine.`) : ''}</span>
+        return `<label class="form-row"><span>${label} ${key === 'cpu' ? policyTip(`What the account allows at once. Google Cloud, AWS and Daytona tell it themselves; enter it where they can’t (Hetzner’s CPU and volume limits, E2B’s and Fly.io’s machine counts). Disk counts parked computers’ disks too. Beyond it, tasks wait their turn.`) : ''}</span>
           <input data-pool="${key}" type="number" min="1" step="1" inputmode="numeric" value="${esc(own ?? '')}" placeholder="${esc(own == null && known ? `${known} (${info.name})` : 'No limit')}"></label>`;
       }).join('')}
       <label class="form-row"><span>Fair share (%) ${policyTip('While another organization waits for room, one organization may hold at most this much of the account. Alone, it may use all of it.')}</span>

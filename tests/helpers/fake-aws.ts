@@ -50,6 +50,8 @@ export class FakeAws {
   vcpuLimit?: number;
   /** Whether the key may read Service Quotas (servicequotas:GetServiceQuota). */
   quotasReadable = false;
+  /** The account's gp3 storage quota, in TiB. */
+  gp3StorageTiB?: number;
   defaultVpc = true;
   /** Volumes refuse a second modification within 6 hours, as EBS does. */
   priceListDown = false;
@@ -90,9 +92,11 @@ export class FakeAws {
   private serviceQuota(target: string | null, body: { ServiceCode: string; QuotaCode: string }): Response {
     if (!this.quotasReadable) return new Response(JSON.stringify({ __type: 'AccessDeniedException',
       message: 'User is not authorized to perform: servicequotas:GetServiceQuota' }), { status: 400 });
-    if (target !== 'ServiceQuotasV20190624.GetServiceQuota' || body.ServiceCode !== 'ec2' || body.QuotaCode !== 'L-1216C47A' || this.vcpuLimit === undefined)
-      return new Response(JSON.stringify({ __type: 'NoSuchResourceException', message: 'no such quota' }), { status: 400 });
-    return new Response(JSON.stringify({ Quota: { QuotaCode: body.QuotaCode, Value: this.vcpuLimit } }), { status: 200 });
+    const value = target !== 'ServiceQuotasV20190624.GetServiceQuota' ? undefined
+      : body.ServiceCode === 'ec2' && body.QuotaCode === 'L-1216C47A' ? this.vcpuLimit
+      : body.ServiceCode === 'ebs' && body.QuotaCode === 'L-7A658B76' ? this.gp3StorageTiB : undefined;
+    if (value === undefined) return new Response(JSON.stringify({ __type: 'NoSuchResourceException', message: 'no such quota' }), { status: 400 });
+    return new Response(JSON.stringify({ Quota: { QuotaCode: body.QuotaCode, Value: value } }), { status: 200 });
   }
 
   private pricing(body: { Filters: Array<{ Field: string; Value: string }> }): Response {

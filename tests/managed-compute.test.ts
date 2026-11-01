@@ -191,12 +191,18 @@ describe('managed compute admission', () => {
       const otherProject = await f.store.createProject('Theirs', { worldProvider: 'e2b' }, other.id);
       for (const id of [f.organization.id, other.id]) await f.store.setOrganizationPlan(id, 'team');
       const runners = new RunnerPoolService(f.store, f.connections);
-      const ours = async () => { const task = await f.task(); return runners.acquire({ project: f.project, taskId: task.id, worldId: task.id, provider: 'e2b', work: true }); };
-      const theirs = async () => {
-        const task = await f.store.createTask({ projectId: otherProject.id, title: 'Theirs', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } as any });
-        return runners.acquire({ project: otherProject, taskId: task.id, worldId: task.id, provider: 'e2b', work: true });
+      const resources = (cpu: number) => ({ cpu, memoryMb: 2048, gpu: 0 });
+      // A new task of ours or theirs asks for a machine (or `taskId`, one that asked before, again).
+      const ours = async (cpu = 2, taskId?: string) => {
+        const id = taskId ?? (await f.task()).id;
+        return runners.acquire({ project: f.project, taskId: id, worldId: id, provider: 'e2b', work: true, resources: resources(cpu) });
       };
-      return { ...f, runners, ours, theirs };
+      const theirTask = async () => (await f.store.createTask({ projectId: otherProject.id, title: 'Theirs', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } as any })).id;
+      const theirs = async (cpu = 2, taskId?: string) => {
+        const id = taskId ?? await theirTask();
+        return runners.acquire({ project: otherProject, taskId: id, worldId: id, provider: 'e2b', work: true, resources: resources(cpu) });
+      };
+      return { ...f, runners, ours, theirs, theirTask };
     }
 
     it('admits machines while their CPUs fit the account\'s, whatever their number', async () => {
@@ -208,17 +214,32 @@ describe('managed compute admission', () => {
       expect(refused.message).toBe('tavya\'s E2B computers are using 4 of their 4 CPUs; waiting for room.');
     });
 
-    it('lets one organization use all of it alone, and holds it to its share once another waits', async () => {
+    // The queue (wiki features/managed-compute § Queue): room that frees goes to
+    // who waited first when it fits them, not to whoever asks next.
+    it('gives freed room to the task that waited first, not to a newer one', async () => {
       const f = await two({ limits: { pool: { cpu: 8 } } });
       const held = [await f.ours(), await f.ours(), await f.ours(), await f.ours()];
-      // Full: the other organization waits, and is remembered as waiting.
-      expect(await f.theirs().catch((error) => error)).toBeInstanceOf(ManagedComputeBusy);
+      // Full: the other organization's task waits in line.
+      const waiting = await f.theirTask();
+      expect(await f.theirs(2, waiting).catch((error) => error)).toBeInstanceOf(ManagedComputeBusy);
       await f.runners.release(held.pop()!.leaseId, 'e2b');
-      // The freed room is not ours again: we hold 6 of 8 CPUs, past half, while they wait.
+      const ours = await f.ours().catch((error) => error);
+      expect(ours).toBeInstanceOf(ManagedComputeBusy);
+      expect(ours.message).toBe('A task is waiting ahead of this one for tavya\'s E2B computers; waiting its turn.');
+      // The one that waited first gets the room when it asks again.
+      await expect(f.theirs(2, waiting)).resolves.toBeDefined();
+    });
+
+    it('lets one organization use all of it alone, and holds it to its share once another waits for more than is free', async () => {
+      const f = await two({ limits: { pool: { cpu: 8 } } });
+      await f.ours(); await f.ours(); await f.ours();
+      // They need 4 CPUs and only 2 are free: they wait. Their place does not
+      // hold back a 2-CPU machine that fits the room now, but our share does:
+      // we hold 6 of 8 while they wait.
+      expect(await f.theirs(4).catch((error) => error)).toBeInstanceOf(ManagedComputeBusy);
       const ours = await f.ours().catch((error) => error);
       expect(ours).toBeInstanceOf(ManagedComputeBusy);
       expect(ours.message).toBe('This organization already uses its share of tavya\'s E2B computers (6 of 8 CPUs) while other organizations wait for one; waiting for one of its machines to finish.');
-      await expect(f.theirs()).resolves.toBeDefined();
       // A share of 100% gives no way, and an organization holding nothing always gets its first machine.
       const g = await two({ limits: { pool: { cpu: 4 } }, share: 100 });
       await g.ours();
