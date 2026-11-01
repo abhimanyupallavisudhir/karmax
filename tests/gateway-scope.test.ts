@@ -386,7 +386,7 @@ describe('gateway request scope for bare-id routes', () => {
     expect(own.status).toBe(403);
     expect(await own.json()).toMatchObject({ error: 'an agent cannot dismiss its own request' });
 
-    const approver = (await tokens.mintPrincipal('user:a', ['task:read', 'credential:write'], mine, 60_000, acmeId)).token;
+    const approver = (await tokens.mintPrincipal('user:a', ['task:read', 'credential:read', 'credential:write'], mine, 60_000, acmeId)).token;
     const viewUrl = `${base}/api/tasks/${task.id}`;
     const headers = { authorization: `Bearer ${approver}` };
     expect(await (await fetch(viewUrl, { headers })).json()).toMatchObject({ approvalRequests: 1, pendingDecisions: 1 });

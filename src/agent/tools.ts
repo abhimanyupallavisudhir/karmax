@@ -879,7 +879,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'escalate',
     description:
       'Redirect a request you received but cannot answer yourself to people who can — the question you were asked as a ' +
-      'Responder, or a request a sub-task routed to you (pass its task_id). The request waits for them instead; your own ' +
+      'Responder, or a request a sub-task routed to you (pass its task_id). A sub-task\'s credential, permission and app requests ' +
+      'that came through you go to them with your note, the context they lack. The request waits for them instead; your own ' +
       'work is not interrupted. Audience selectors as for notify (people, teams, Avatārs).',
     parameters: {
       type: 'object',

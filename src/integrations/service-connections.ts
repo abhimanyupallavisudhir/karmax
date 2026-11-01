@@ -8,6 +8,7 @@ import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js
 import { newId } from '../util/id.js';
 import { CONNECTION_PREFIX as PREFIX, OPEN_CONNECTION as OPEN } from './connection-requests.js';
 import { delegatingAncestors } from '../platform/delegation.js';
+import type { Via } from '../platform/sub-task-asks.js';
 import { beginOAuth, finishOAuth, connectionHeaders, leasedOAuthRefresh, type OAuthVault, type OAuthTarget } from '../mcp/connections/oauth.js';
 import { RefreshLeases } from '../autonomy/refresh-lease.js';
 import { authorizesWithGitHub, openRemoteMcp, remoteMcpAuth, type RemoteMcpTransport } from '../mcp/connections/remote.js';
@@ -43,6 +44,11 @@ export interface ServiceConnection {
   notifiedAt?: number;
   /** An open request a person ignored: it no longer notifies anyone, but stays open. */
   dismissed?: { by: string; at: number };
+  /** Whom a task's request asks, when its parent named them (sub-task-asks.ts);
+   * absent ⇒ its creator and the organization's owners. */
+  audience?: string[];
+  /** A sub-task's request: the parent it came through, and its agent's note. */
+  via?: Via;
 }
 /** `github`: the server authorizes through GitHub, so the owner signs in with
  * the installation's GitHub App; `githubAccountId` pins the account used. */
@@ -193,7 +199,8 @@ export class ServiceConnections {
       (await this.store.kvSet(PREFIX + c.id, JSON.stringify(c)));
       const announce = async (type: string, payload: Record<string, unknown>) =>
         (await this.store.appendEvent({ taskId: c.taskId!, type, ts: c.updatedAt, payload: { requestId: c.id, ...payload } }));
-      if (!before) (await announce('connection.requested', { connectionId: c.id, toolkit: c.toolkit, ...(c.why ? { why: c.why } : {}) }));
+      if (!before) (await announce('connection.requested', { connectionId: c.id, toolkit: c.toolkit, ...(c.why ? { why: c.why } : {}),
+        ...(c.via ? { via: c.via } : {}) }));
       else if (before.status !== c.status) (await announce('connection.updated', { connectionId: c.id, status: c.status }));
       if (c.dismissed && !before?.dismissed) (await announce('connection.dismissed', {}));
       return c;
@@ -227,7 +234,8 @@ export class ServiceConnections {
   }
   async pending(taskId: string) { return (await this.all()).filter(c => c.taskId === taskId && OPEN.includes(c.status)); }
   async catalog(search = '') { return this.remote(async () => (await this.backend()).catalog(search.slice(0, 200))); }
-  async request(org: string, toolkit: string, taskId: string, role: string, why: string) {
+  /** `via`: a sub-task's parent at work, which a new request comes through (sub-task-asks.ts). */
+  async request(org: string, toolkit: string, taskId: string, role: string, why: string, via?: Via) {
     return this.store.transaction(async () => {
     this.slug(toolkit);
     // One open request per task and app.
@@ -240,7 +248,8 @@ export class ServiceConnections {
       && !!c.taskId && ancestors.includes(c.taskId));
     if (inherited) return inherited;
     return (await this.save({ id: newId('conn'), organizationId: org, toolkit, label: toolkit,
-      taskId, role, why: why.slice(0, 2000), projectIds: [], status: 'requested', createdAt: Date.now(), updatedAt: Date.now() }));
+      taskId, role, why: why.slice(0, 2000), projectIds: [], status: 'requested', createdAt: Date.now(), updatedAt: Date.now(),
+      ...(via ? { via } : {}) }));
       });
   }
   /** Resolves an agent's MCP request: an MCP Registry name or a public HTTPS URL. */
@@ -260,7 +269,7 @@ export class ServiceConnections {
     return { transport: remote.transport as RemoteMcpTransport, label: entry.title && entry.title !== entry.name ? entry.title : entry.name,
       registry: { name: entry.name, version: entry.version } };
   }
-  async requestMcp(org: string, server: Awaited<ReturnType<ServiceConnections['resolveMcp']>>, taskId: string, role: string, why: string) {
+  async requestMcp(org: string, server: Awaited<ReturnType<ServiceConnections['resolveMcp']>>, taskId: string, role: string, why: string, via?: Via) {
     const ancestors = (await this.taskChain(taskId)).slice(1);
     const open = async () => (await this.all()).find(c => c.organizationId === org && c.mcp?.url === server.transport.url && c.taskId === taskId && !['disconnected', 'expired'].includes(c.status))
       ?? (await this.all()).find(c => c.organizationId === org && c.mcp?.url === server.transport.url && c.status === 'active' && !!c.taskId && ancestors.includes(c.taskId));
@@ -272,7 +281,8 @@ export class ServiceConnections {
     return this.store.transaction(async () => (await this.store.lock(`service-connections:${org}:${taskId}`), await open()) ?? (await this.save({ id: newId('conn'), organizationId: org,
       toolkit: `mcp:${server.registry?.name ?? new URL(server.transport.url).hostname}`.slice(0, 120), label: server.label.slice(0, 120),
       mcp: { ...server.transport, auth, ...(server.registry ? { registry: server.registry } : {}) },
-      taskId, role, why: why.slice(0, 2000), projectIds: [], status: 'requested', createdAt: Date.now(), updatedAt: Date.now() })));
+      taskId, role, why: why.slice(0, 2000), projectIds: [], status: 'requested', createdAt: Date.now(), updatedAt: Date.now(),
+      ...(via ? { via } : {}) })));
   }
   private slug(value: string) { if (!/^[a-z][a-z0-9_]{0,79}$/.test(value)) throw new ConnectionError('Invalid app identifier'); }
   private sameApp(a: ServiceConnection, b: ServiceConnection) { return a.mcp ? a.mcp.url === b.mcp?.url : !b.mcp && a.toolkit === b.toolkit; }
