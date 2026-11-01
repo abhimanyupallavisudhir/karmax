@@ -138,6 +138,9 @@ describe.skipIf(!sshdAvailable)('AWS worlds (fake EC2, real sshd)', () => {
     expect((await driver.limits(connection(aws.key))).pool).toBeUndefined();
     aws.quotasReadable = true;
     expect((await driver.limits(connection(aws.key))).pool).toEqual({ cpu: 64 });
+    // Its gp3 storage quota is the account's disk, in GiB.
+    aws.gp3StorageTiB = 50;
+    expect((await driver.limits(connection(aws.key))).pool).toEqual({ cpu: 64, diskGb: 51_200 });
   });
 
   it('creates a world: a gp3 home volume, an instance in the default VPC behind karmax’s security group, IMDSv2, no public key', async () => {

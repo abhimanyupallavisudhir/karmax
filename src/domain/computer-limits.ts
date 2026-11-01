@@ -35,6 +35,12 @@ export interface ComputerLimits {
 
 export interface AccountPool { cpu?: number; memoryMb?: number; diskGb?: number; machines?: number }
 
+/** What a parked world still holds of its account's budget: a machine that
+ * counts toward its machines at once (Fly.io keeps a stopped machine, Google
+ * Cloud counts stopped instances toward INSTANCES) and a disk that counts
+ * toward its disk (every VM's volume; Daytona's sandboxes). */
+export interface ParkedHolds { machine: boolean; disk: boolean }
+
 export type AccountInternet = 'full' | 'basic';
 export type LimitSource = 'provider' | 'configured' | 'default';
 export type LimitKey = 'cpu' | 'memoryMb' | 'diskGb';
@@ -63,6 +69,10 @@ interface ProviderFacts {
   wakeSeconds: number;
   /** Where its machines run, from the account's region setting. */
   region(config: { region?: string; target?: string }): ComputeRegion | undefined;
+  /** What a parked world still holds of the account's budget. */
+  parked: ParkedHolds;
+  /** A machine's own root disk besides the home disk, counted in the account's disk. */
+  rootDiskGb?: number;
 }
 
 /** Options beyond size that a provider may or may not offer. */
@@ -91,34 +101,37 @@ const PROVIDERS: Record<string, ProviderFacts> = {
   // account is asked, offer only what every account has. E2B's cloud runs in
   // the US; its disk costs nothing extra.
   e2b: { label: 'E2B', defaults: { cpu: 2, memoryMb: 2048, diskGb: 22 }, limits: { cpu: 8, memoryMb: 8192, diskGb: 22 }, features: ALL_FEATURES,
-    price: { cpuHour: 0.0504, gbHour: 0.0162, diskGbMonth: 0 }, wakeSeconds: 2, region: () => 'us' },
+    price: { cpuHour: 0.0504, gbHour: 0.0162, diskGbMonth: 0 }, wakeSeconds: 2, region: () => 'us',
+    parked: { machine: false, disk: false } },
   // Daytona's documented per-sandbox maximum (raised by its support); karmax
   // starts a default computer on `daytona-medium` (2 vCPU / 4 GiB / 8 GB).
   daytona: { label: 'Daytona', defaults: { cpu: 2, memoryMb: 4096, diskGb: 8 }, limits: { cpu: 4, memoryMb: 8192, diskGb: 10 }, features: ALL_FEATURES,
     price: { cpuHour: 0.0504, gbHour: 0.0162, diskGbMonth: 0.08 }, wakeSeconds: 3,
-    region: (config) => (config.target === 'eu' ? 'eu' : 'us') },
+    region: (config) => (config.target === 'eu' ? 'eu' : 'us'), parked: { machine: false, disk: true } },
   // VM worlds (wiki features/vm-worlds): disk is the volume mounted as the
   // home, the size `df ~` shows. Fly: a volume holds at most 500 GB, the
   // largest machine is performance-16x with 128 GB; no account API says more.
   fly: { label: 'Fly.io', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 16, memoryMb: 131_072, diskGb: 500 }, features: VM_FEATURES,
-    price: { cpuHour: 0.0037, gbHour: 0.01, diskGbMonth: 0.15 }, wakeSeconds: 5, region: (config) => flyRegion(config.region ?? 'fra') },
+    price: { cpuHour: 0.0037, gbHour: 0.01, diskGbMonth: 0.15 }, wakeSeconds: 5, region: (config) => flyRegion(config.region ?? 'fra'),
+    parked: { machine: true, disk: true } },
   // Hetzner: volumes up to 10 TB; the largest machine is whatever server type
   // the location offers (the connection test asks), else the shared CPX51.
   // A default computer gets the cheapest type covering it (CPX11, 2 CPU / 2 GB, 2026-10-10).
   hetzner: { label: 'Hetzner', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 16, memoryMb: 32_768, diskGb: 10_240 }, features: VM_FEATURES,
     price: { cpuHour: 0.0035, gbHour: 0.0012, diskGbMonth: 0.09, hour: 0.0012 }, wakeSeconds: 35,
-    region: (config) => (/^(?:ash|hil)/.test(config.region ?? '') ? 'us' : /^(?:fsn|nbg|hel)/.test(config.region ?? 'fsn1') ? 'eu' : undefined) },
+    region: (config) => (/^(?:ash|hil)/.test(config.region ?? '') ? 'us' : /^(?:fsn|nbg|hel)/.test(config.region ?? 'fsn1') ? 'eu' : undefined),
+    parked: { machine: false, disk: true } },
   // AWS: an EBS gp3 volume holds 16 TiB; the largest machine is the largest
   // instance of karmax's families in the region (the connection test asks).
   // A default computer is the cheapest covering it (c7i-flex.large, 2 CPU / 4 GB).
   aws: { label: 'AWS', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 64, memoryMb: 262_144, diskGb: 16_384 }, features: VM_FEATURES,
     price: { cpuHour: 0.0336, gbHour: 0.0045, diskGbMonth: 0.08, hour: 0.005 }, wakeSeconds: 30,
-    region: (config) => cloudRegion(config.region ?? 'eu-central-1', 'eu-', 'us-') },
+    region: (config) => cloudRegion(config.region ?? 'eu-central-1', 'eu-', 'us-'), parked: { machine: false, disk: true }, rootDiskGb: 20 },
   // Google Cloud: E2 custom machines of exactly the size asked (2–32 CPUs, up
   // to 128 GB), within the region's CPU quota; a pd-balanced disk holds 64 TB.
   gcp: { label: 'Google Cloud', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 32, memoryMb: 131_072, diskGb: 65_536 }, features: VM_FEATURES,
     price: { cpuHour: 0.0218, gbHour: 0.0029, diskGbMonth: 0.1, hour: 0.005 }, wakeSeconds: 50,
-    region: (config) => cloudRegion(config.region ?? 'europe-west3-a', 'europe-', 'us-') },
+    region: (config) => cloudRegion(config.region ?? 'europe-west3-a', 'europe-', 'us-'), parked: { machine: true, disk: true }, rootDiskGb: 20 },
 };
 
 function cloudRegion(code: string, eu: string, us: string): ComputeRegion | undefined {
@@ -147,6 +160,18 @@ export function listPriceMicrosPerHour(provider: string, shape: MachineShape): n
   const disk = shape.diskGb ?? facts.defaults.diskGb;
   const { price } = facts;
   return Math.round((cpu * price.cpuHour + gb * price.gbHour + disk * price.diskGbMonth / 730 + (price.hour ?? 0)) * 1e6);
+}
+
+/** What a parked world on `provider` still holds of its account's budget. */
+export function parkedHolds(provider: string): ParkedHolds {
+  return { ...(PROVIDERS[provider]?.parked ?? { machine: false, disk: false }) };
+}
+
+/** The disk a world of `diskGb` takes from its account's disk budget: its home
+ * disk (the provider's default when not stated) and the machine's root disk. */
+export function accountDiskGb(provider: string, diskGb: number | undefined): number {
+  const facts = PROVIDERS[provider];
+  return (diskGb ?? facts?.defaults.diskGb ?? 0) + (facts?.rootDiskGb ?? 0);
 }
 
 /** Typical wake time, in seconds. */
@@ -182,7 +207,7 @@ export function providerDefaults(provider: string): Required<MachineShape> | und
 }
 
 /** What a person entered for an account: per-machine limits and its budget. */
-export type ConfiguredLimits = Partial<Record<LimitKey, number>> & { pool?: { cpu?: number; machines?: number } };
+export type ConfiguredLimits = Partial<Record<LimitKey, number>> & { pool?: { cpu?: number; machines?: number; diskGb?: number } };
 
 /** Configured over measured over documented, per limit; a machine is never
  * allowed more than the account's whole pool (configured over measured too).
@@ -192,14 +217,14 @@ export function computerLimits(provider: string, measured?: ComputerLimits, conf
   if (!facts) return { source: {} };
   const out: EffectiveComputerLimits = { source: {} };
   const pool: AccountPool = { ...measured?.pool };
-  for (const key of ['cpu', 'machines'] as const) if (positive(configured?.pool?.[key])) pool[key] = configured.pool[key];
+  for (const key of ['cpu', 'machines', 'diskGb'] as const) if (positive(configured?.pool?.[key])) pool[key] = configured.pool[key];
   for (const key of Object.keys(pool) as Array<keyof AccountPool>) if (!positive(pool[key])) delete pool[key];
   for (const key of KEYS) {
     const chosen: [number | undefined, LimitSource][] = [[configured?.[key], 'configured'], [measured?.[key], 'provider'], [facts.limits[key], 'default']];
     let [value, source] = chosen.find(([candidate]) => positive(candidate)) ?? [undefined, 'default'];
     const whole = pool[key];
     if (positive(whole) && (value === undefined || whole < value))
-      [value, source] = [whole, positive(configured?.pool?.[key as 'cpu']) ? 'configured' : 'provider'];
+      [value, source] = [whole, positive(configured?.pool?.[key as 'cpu' | 'diskGb']) ? 'configured' : 'provider'];
     if (value !== undefined) { out[key] = value; out.source[key] = source; }
   }
   if (Object.keys(pool).length) out.pool = pool;

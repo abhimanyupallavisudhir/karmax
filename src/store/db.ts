@@ -8968,10 +8968,45 @@ export class Store {
 
   /** The machines running on the installation's `provider` account, each
    * with its organization and CPUs (null: the provider's default size). */
-  async runningManagedLeases(provider: string): Promise<Array<{ organizationId: string; cpu: number | null }>> {
-    return ((await this.db.prepare(`SELECT l.organizationId organizationId, l.cpu cpu FROM world_leases l JOIN runner_pools p ON p.id=l.runnerPoolId
-      WHERE l.state='active' AND p.mode='managed' AND p.provider=? AND p.id=p.organizationId || ':tavya-' || p.provider`).all(provider)) as Array<Record<string, unknown>>)
-      .map((row) => ({ organizationId: String(row.organizationId ?? row.organizationid), cpu: row.cpu == null ? null : Number(row.cpu) }));
+  async runningManagedLeases(provider: string): Promise<Array<{ organizationId: string; cpu: number | null; worldId: string }>> {
+    return this.runningLeases(provider, null);
+  }
+
+  /** The machines running on one provider account: the installation's
+   * managed one (`organizationId` null, every organization's) or an
+   * organization's own. */
+  async runningLeases(provider: string, organizationId: string | null): Promise<Array<{ organizationId: string; cpu: number | null; worldId: string }>> {
+    const rows = organizationId === null
+      ? await this.db.prepare(`SELECT l.organizationId organizationId, l.cpu cpu, l.worldId worldId FROM world_leases l JOIN runner_pools p ON p.id=l.runnerPoolId
+          WHERE l.state='active' AND p.mode='managed' AND p.provider=? AND p.id=p.organizationId || ':tavya-' || p.provider`).all(provider)
+      : await this.db.prepare(`SELECT l.organizationId organizationId, l.cpu cpu, l.worldId worldId FROM world_leases l JOIN runner_pools p ON p.id=l.runnerPoolId
+          WHERE l.state='active' AND p.provider=? AND p.organizationId=? AND p.id<>p.organizationId || ':tavya-' || p.provider`).all(provider, organizationId);
+    return (rows as Array<Record<string, unknown>>).map((row) => ({ organizationId: String(row.organizationId ?? row.organizationid),
+      cpu: row.cpu == null ? null : Number(row.cpu), worldId: String(row.worldId ?? row.worldid) }));
+  }
+
+  /** The worlds that exist on one provider account (running or parked): the
+   * installation's managed one (`organizationId` null) or an organization's
+   * own, with the home disk each was made with. */
+  async liveWorlds(provider: string, organizationId: string | null): Promise<Array<{ worldId: string; organizationId: string; state: 'ready' | 'parked'; diskGb?: number }>> {
+    const rows = (await this.db.prepare(`SELECT worldId, handle, state FROM world_instances WHERE state IN ('ready', 'parked')`).all()) as Array<Record<string, unknown>>;
+    const organizations = new Map<string, string | undefined>();
+    const out: Array<{ worldId: string; organizationId: string; state: 'ready' | 'parked'; diskGb?: number }> = [];
+    for (const row of rows) {
+      let handle: WorldHandleRef & { meta?: Record<string, any> };
+      try { handle = JSON.parse(String(row.handle)); } catch { continue; }
+      if ((handle.provider ?? handle.kind) !== provider) continue;
+      if ((handle.meta?.funding === 'managed') !== (organizationId === null)) continue;
+      const projectId = handle.meta?.projectId;
+      if (typeof projectId !== 'string') continue;
+      if (!organizations.has(projectId)) organizations.set(projectId, (await this.getProject(projectId))?.organizationId);
+      const owner = organizations.get(projectId);
+      if (!owner || (organizationId !== null && owner !== organizationId)) continue;
+      const disk = Number(handle.meta?.machine?.diskGb ?? handle.meta?.computer?.diskGb);
+      out.push({ worldId: String(row.worldId ?? row.worldid), organizationId: owner, state: row.state as 'ready' | 'parked',
+        ...(Number.isFinite(disk) && disk > 0 ? { diskGb: disk } : {}) });
+    }
+    return out;
   }
 
   async runningManagedWorlds(provider: string): Promise<number> {

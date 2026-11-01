@@ -1,12 +1,14 @@
 import { ProviderCapacityFull, ProviderOutage } from '../agent/limits.js';
 import { BRAND } from '../domain/brand.js';
 import { machineShape, type ComputeRegion, type MachineShape } from '../domain/computer.js';
-import { cloudProviders, listPriceMicrosPerHour, providerDefaults, providerLabel, providerRegion, providerWakeSeconds,
-  type ComputerFeatures, type ComputerLimits } from '../domain/computer-limits.js';
+import { cloudProviders, listPriceMicrosPerHour, providerLabel, providerRegion, providerWakeSeconds,
+  type AccountPool, type ComputerFeatures, type ComputerLimits } from '../domain/computer-limits.js';
 import type { ProjectConfig } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { MANAGED_COMPUTE } from './connections.js';
 import { assertComputeCredit, ComputeCreditExhausted, ManagedComputeBusy, managedRoom } from './managed-compute.js';
+import { accountRoom } from './account-room.js';
+import { accountKey, dequeue, enqueue } from './compute-queue.js';
 
 /**
  * Compute routing (wiki features/compute-routing): the machine a task gets
@@ -93,6 +95,8 @@ export interface ComputeRoute {
   rejected: RejectedOption[];
   /** The provider a restored world was on, tried first. */
   prefer?: string;
+  /** The task routed: it waits in the queue of each account that has no room for it. */
+  taskId?: string;
 }
 
 /** A provider refusal is remembered this long, during which it is tried last. */
@@ -174,7 +178,7 @@ function outageCause(error: unknown): Error | undefined {
 export interface RouterConnections {
   list(organizationId: string): Promise<Array<{ provider: string; enabled: boolean; credentialConfigured: boolean; status?: string;
     managed?: boolean; limits: ComputerLimits; features: ComputerFeatures; config: { region?: string; target?: string } }>>;
-  managedConnections(): Promise<Array<{ provider: string; config: { share?: number }; limits: { pool?: { cpu?: number; machines?: number } } }>>;
+  managedConnections(): Promise<Array<{ provider: string; config: { share?: number }; limits: { pool?: AccountPool } }>>;
 }
 
 /** One decision, as recorded in `world.routed`. */
@@ -193,11 +197,12 @@ export class ComputeRouter {
 
   /** Every cloud account the organization can reach, with what is known about
    * its room for a machine of `needs`. */
-  async options(organizationId: string, needs: ComputeNeeds = {}): Promise<ComputeOption[]> {
+  async options(organizationId: string, needs: ComputeNeeds = {}, task?: { taskId: string; worldId?: string }): Promise<ComputeOption[]> {
     const views = (await this.connections.list(organizationId))
       .filter((view) => cloudProviders().includes(view.provider) && view.enabled && view.credentialConfigured);
     const managed = views.some((view) => view.managed);
     const accounts = managed ? await this.connections.managedConnections() : [];
+    const size = { ...(needs.cpu !== undefined ? { cpu: needs.cpu } : {}), ...(needs.diskGb !== undefined ? { diskGb: needs.diskGb } : {}) };
     return Promise.all(views.map(async (view): Promise<ComputeOption> => {
       const funding: ComputeFunding = view.managed ? 'managed' : 'own';
       const region = providerRegion(view.provider, view.config);
@@ -209,21 +214,19 @@ export class ComputeRouter {
         const short = await assertComputeCredit(this.store, organizationId, view.provider, this.now(), { shape: needs })
           .then(() => undefined, (error: unknown) => { if (error instanceof ComputeCreditExhausted) return error; throw error; });
         if (short) return { ...option, busy: 'out of compute this month', outOfCredit: short.message };
-        // The account's budget (CPUs, machines) and this organization's fair share of it.
+        // The account's budget, its queue and this organization's fair share of it.
         const account = accounts.find((value) => value.provider === view.provider);
         const full = account && await managedRoom(this.store, view.provider, { pool: account.limits.pool, share: account.config.share },
-          organizationId, needs.cpu, this.now());
+          organizationId, { ...size, ...task }, this.now());
         if (full) return { ...option, busy: full.reason };
-      } else if (view.status === 'error') option.doubt = 'its last connection test failed';
-      // An own account's CPU quota, shared by all its machines (Google Cloud:
-      // the lowest of E2_CPUS, CPUS and CPUS_ALL_REGIONS; Daytona's tier): room
-      // is what its running worlds leave. Machines outside tavya on the same
-      // account are not counted; the provider's own refusal still falls over.
-      const pool = funding === 'own' ? view.limits.pool?.cpu : undefined;
-      if (pool) {
-        const used = await this.store.runningWorldCpus(view.provider, organizationId);
-        const cpu = needs.cpu ?? providerDefaults(view.provider)?.cpu ?? 2;
-        if (used + cpu > pool) return { ...option, busy: `${used} of its ${pool} CPUs in use` };
+      } else {
+        if (view.status === 'error') option.doubt = 'its last connection test failed';
+        // An own account's budget (Google Cloud's quotas, Daytona's tier, or
+        // entered) and its queue. Machines outside tavya on the same account
+        // are not counted; the provider's own refusal still falls over.
+        const full = await accountRoom(this.store, { provider: view.provider, managed: false, pool: view.limits.pool },
+          { organizationId, ...size, ...task }, this.now());
+        if (full) return { ...option, busy: full.reason };
       }
       const full = await this.recentFull(funding === 'managed' ? MANAGED_COMPUTE : organizationId, view.provider);
       if (full) option.doubt = full;
@@ -231,9 +234,10 @@ export class ComputeRouter {
     }));
   }
 
-  async route(organizationId: string, config: Partial<ProjectConfig> | undefined, prefer?: string): Promise<ComputeRoute> {
+  async route(organizationId: string, config: Partial<ProjectConfig> | undefined, prefer?: string,
+    task?: { taskId: string; worldId?: string }): Promise<ComputeRoute> {
     const needs = computeNeeds(config);
-    return rankComputeOptions(needs, await this.options(organizationId, needs), prefer);
+    return { ...rankComputeOptions(needs, await this.options(organizationId, needs, task), prefer), ...(task ? { taskId: task.taskId } : {}) };
   }
 
   /** Remember that an account refused for capacity, so the next routing tries it last. */
@@ -284,6 +288,7 @@ export class ComputeRouter {
       try {
         const value = await attempt(candidate, routeReason(route, candidate, full));
         await this.noteRoom(organizationId, candidate).catch(() => undefined);
+        if (route.taskId) await dequeue(this.store, route.taskId).catch(() => undefined);
         await record(decision(candidate)).catch(() => undefined);
         return { value, candidate };
       } catch (error) {
@@ -294,7 +299,14 @@ export class ComputeRouter {
         full.push({ candidate, detail: cause.message, ...(capacity ? {} : { outage: true }) });
         // Spent credit and managed compute in use are counted, not discovered:
         // only a provider's own refusal is worth remembering.
-        if (capacity?.name === 'ProviderCapacityFull') await this.noteFull(organizationId, candidate, cause.message).catch(() => undefined);
+        if (capacity?.name === 'ProviderCapacityFull') {
+          await this.noteFull(organizationId, candidate, cause.message).catch(() => undefined);
+          // The provider refused: the task waits its turn for this account too.
+          if (route.taskId) await enqueue(this.store, { taskId: route.taskId, organizationId,
+            account: accountKey(candidate.funding === 'managed' ? MANAGED_COMPUTE : organizationId, candidate.provider),
+            ...(route.needs.cpu !== undefined ? { cpu: route.needs.cpu } : {}),
+            ...(route.needs.diskGb !== undefined ? { diskGb: route.needs.diskGb } : {}) }).catch(() => undefined);
+        }
       }
     }
     await record(decision()).catch(() => undefined);

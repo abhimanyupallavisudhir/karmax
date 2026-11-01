@@ -28,7 +28,8 @@ import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
 import { COMPUTE_HOLD, holdManagedCompute, outOfCompute, type ComputeHoldRequest } from '../world/managed-compute.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
-import { ComputeRouter, type RouterConnections } from '../world/compute-router.js';
+import { capacityCause, ComputeRouter, type RouterConnections } from '../world/compute-router.js';
+import { accountKey, dequeue, enqueue, wakeFullKey } from '../world/compute-queue.js';
 import { AgentChannelLost, AgentToolsUnavailable, toolsUnavailableActivity, toolsUnavailableNotice, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { markCheckpointStale } from '../world/checkpoint-staleness.js';
@@ -363,7 +364,8 @@ export interface CoreActivityDeps {
   configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
   resources?: import('../world/resources.js').ProjectResourceService;
   /** The organization's provider accounts, which judge a sub-task's Computer. */
-  providerConnections?: import('../platform/agent-params.js').ComputerChecks & Partial<RouterConnections>;
+  providerConnections?: import('../platform/agent-params.js').ComputerChecks & Partial<RouterConnections>
+    & { funding?(organizationId: string | undefined, provider: string): Promise<'managed' | 'own' | undefined> };
   objects?: ObjectStore;
   contentDir?: string;
   /** Snapshot of whether this console is running on the user's own machine. */
@@ -1665,6 +1667,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const world = await (worlds.withOperation ? worlds.withOperation(handle.id, () => open(woke)) : open(woke));
         // One pull request of a task's world (SPEC §11.1): the task's world,
         // narrowed to that pull request's worktree.
+        if (world) await wokeOrRan(handle, taskId);
         if (world && isPullRequestView(handle)) return await restorePullRequest(pullRequestView(world, handle), world);
         // The task's own proposal, without checkouts that are pull requests of their own.
         const only = proposalCheckouts(handle);
@@ -1674,8 +1677,31 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // for its transition. Re-enter admission before opening the provider.
       }
     } catch (error) {
+      await wakeRefused(handle, taskId, error).catch(() => undefined);
       throw worldUnreachable(handle, error);
     } finally { releaseAccess?.(); }
+  }
+
+  /** A world opened: it no longer waits for room. */
+  async function wokeOrRan(handle: WorldHandle, taskId: string): Promise<void> {
+    await dequeue(store, taskId).catch(() => undefined);
+    if (await store.kvGet(wakeFullKey(handle.id))) await store.kvDelete(wakeFullKey(handle.id));
+  }
+
+  /** A parked world its account had no room to wake: the task waits its turn
+   * for that account, and the lifecycle sweep moves it elsewhere once the
+   * wait has lasted (WAKE_RELOCATE_AFTER_MS, runners.ts). */
+  async function wakeRefused(handle: WorldHandle, taskId: string, error: unknown): Promise<void> {
+    if (!isRemote(handle.kind) || !capacityCause(error)) return;
+    const current = ((await store.currentWorld(handle.id)) ?? handle) as WorldHandle;
+    const project = await store.getProject(String(current.meta?.projectId ?? (await store.getTask(taskId))?.projectId ?? ''));
+    const organizationId = project?.organizationId;
+    if (!organizationId) return;
+    const computer = current.meta?.machine as { cpu?: number; diskGb?: number } | undefined;
+    await enqueue(store, { taskId, organizationId, account: accountKey(current.meta?.funding === 'managed' ? MANAGED_COMPUTE : organizationId, current.kind),
+      ...(computer?.cpu !== undefined ? { cpu: computer.cpu } : {}), ...(computer?.diskGb !== undefined ? { diskGb: computer.diskGb } : {}) });
+    if ((await store.worldState(handle.id)) === 'parked' && !(await store.kvGet(wakeFullKey(handle.id))))
+      await store.kvSet(wakeFullKey(handle.id), JSON.stringify({ since: Date.now(), generation: current.generation ?? 1 }));
   }
 
   /** A cloud world that cannot be woken or reached right now (a provider
@@ -2541,13 +2567,29 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           return await (worlds.withOperation ? worlds.withOperation(args.taskId, provision) : provision());
         } finally { stopCancellationHeartbeat(); }
       };
-      if (!routed) return provisionOn(kind);
+      if (!routed) {
+        // A named provider: its own refusal queues the task for that account,
+        // as admission's does (account-room.ts); a machine takes it off.
+        try {
+          const made = await provisionOn(kind);
+          await dequeue(store, args.taskId).catch(() => undefined);
+          return made;
+        } catch (error) {
+          if (capacityCause(error)?.name === 'ProviderCapacityFull' && remote) {
+            const funding = await deps.providerConnections?.funding?.(organizationId, kind).catch(() => undefined);
+            const shape = machineShape(executionConfig);
+            await enqueue(store, { taskId: args.taskId, organizationId, account: accountKey(funding === 'managed' ? MANAGED_COMPUTE : organizationId, kind),
+              ...(shape.cpu !== undefined ? { cpu: shape.cpu } : {}), ...(shape.diskGb !== undefined ? { diskGb: shape.diskGb } : {}) }).catch(() => undefined);
+          }
+          throw error;
+        }
+      }
       // "Any": the first candidate with room takes it; a full one gives way to
       // the next, and the task waits only when every one is full.
       const router = deps.providerConnections?.list && deps.providerConnections.managedConnections
         ? new ComputeRouter(store, deps.providerConnections as RouterConnections) : undefined;
       if (!router || !project) throw new Error('provider "Any" needs a project and connected computers');
-      const route = await router.route(organizationId, executionConfig, undefined);
+      const route = await router.route(organizationId, executionConfig, undefined, { taskId: args.taskId, worldId: args.taskId });
       try {
         return (await router.run(organizationId, route, (candidate, reason) => provisionOn(candidate.provider as WorldKind, reason),
           async (decision) => { await record(args.taskId, 'world.routed', { ...decision }); })).value;

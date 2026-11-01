@@ -1,11 +1,12 @@
 import { ProviderCapacityFull } from '../agent/limits.js';
 import { BRAND } from '../domain/brand.js';
 import { COMPUTE_TERMS, computeChargeMicros } from '../domain/entitlements.js';
-import { providerDefaults } from '../domain/computer-limits.js';
+import { providerDefaults, type AccountPool } from '../domain/computer-limits.js';
 import { flyComputeDollarsPerSecond, flyGuest, flyVolumeDollarsPerSecond } from './fly.js';
 import { costMicrosPerSecond } from './runners.js';
 import type { Store } from '../store/db.js';
-import { DEFAULT_MANAGED_SHARE, providerName } from './connections.js';
+import { providerName } from './connections.js';
+import { accountRoom } from './account-room.js';
 
 /** Managed compute: tasks of an organization without its own provider account
  * run on the installation's (src/world/connections.ts MANAGED_COMPUTE), and
@@ -243,81 +244,24 @@ export async function holdManagedCompute(store: Store, request: ComputeHoldReque
   throw exhausted(await computeCredit(store, request.organizationId, now), request.provider);
 }
 
-/** How long an organization refused room on a managed account counts as
- * waiting for it (its retries come every 30 s to 5 min). */
-export const MANAGED_WANT_MS = 10 * 60_000;
-
 /** A managed account's budget and fair share, as its connection states them. */
-export interface ManagedBudget { pool?: { cpu?: number; machines?: number }; share?: number }
+export interface ManagedBudget { pool?: AccountPool; share?: number }
 
-/** Why the installation's `provider` account has no room now: `reason` in a
- * few words (the router's), `message` for the task's wait. */
+/** Why the installation's `provider` account has no room now (account-room.ts). */
 export interface ManagedNoRoom { reason: string; message: string }
 
-/**
- * Whether the installation's `provider` account has room for one more machine
- * of `cpu` CPUs for `organizationId` (wiki features/managed-compute § Budget):
- *   - fewer than `pool.machines` machines run on it (E2B's plan, Fly.io's limit);
- *   - its running machines' CPUs plus this one fit `pool.cpu` (the CPU quota,
- *     read from Google Cloud, AWS and Daytona, or entered);
- *   - while another organization waits for room on it, an organization that
- *     already holds a machine there may not go past its `share` of the budget
- *     (default 50%). Alone, an organization may use all of it.
- * Not a queue: whichever waiting task tries first after room frees up gets
- * it, and a race can pass the budget by one; the provider's own refusal then
- * waits the same way.
- */
+/** Whether the installation's `provider` account has room for one more
+ * machine for `organizationId`: its budget, its queue and the fair share
+ * (account-room.ts). A refused task with a `taskId` joins the queue. */
 export async function managedRoom(store: Store, provider: string, budget: ManagedBudget, organizationId: string,
-  cpu: number | undefined, now = Date.now()): Promise<ManagedNoRoom | undefined> {
-  const machines = budget.pool?.machines;
-  const cpus = budget.pool?.cpu;
-  if (!machines && !cpus) return undefined;
-  const size = (value: number | null | undefined) => value ?? providerDefaults(provider)?.cpu ?? 2;
-  const leases = await store.runningManagedLeases(provider);
-  const used = leases.reduce((total, lease) => total + size(lease.cpu), 0);
-  const name = `${BRAND}'s ${providerName(provider)} computers`;
-  let refusal: ManagedNoRoom | undefined;
-  if (machines && leases.length >= machines)
-    refusal = { reason: `all ${machines} in use`, message: `All ${machines} of ${name} are in use; waiting for one to free up.` };
-  else if (cpus && used + size(cpu) > cpus)
-    refusal = { reason: `${used} of its ${cpus} CPUs in use`, message: `${name} are using ${used} of their ${cpus} CPUs; waiting for room.` };
-  else {
-    const mine = leases.filter((lease) => lease.organizationId === organizationId);
-    const share = (budget.share ?? DEFAULT_MANAGED_SHARE) / 100;
-    const held = cpus ? mine.reduce((total, lease) => total + size(lease.cpu), 0) : mine.length;
-    const whole = cpus ?? machines!;
-    const unit = cpus ? 'CPUs' : 'machines';
-    if (mine.length && held + (cpus ? size(cpu) : 1) > share * whole && await othersWaiting(store, provider, organizationId, now))
-      refusal = { reason: `its share (${held} of ${whole} ${unit}) while others wait`,
-        message: `This organization already uses its share of ${name} (${held} of ${whole} ${unit}) while other organizations wait for one; waiting for one of its machines to finish.` };
-  }
-  await noteWant(store, provider, organizationId, Boolean(refusal), now);
-  return refusal;
+  request: { cpu?: number; diskGb?: number; taskId?: string; worldId?: string; peek?: boolean } = {}, now = Date.now()): Promise<ManagedNoRoom | undefined> {
+  return accountRoom(store, { provider, managed: true, pool: budget.pool, share: budget.share }, { organizationId, ...request }, now);
 }
 
-/** Refuse a new machine on the installation's account without room for it
- * (managedRoom): the task waits for one instead of the provider refusing it. */
+/** Refuse a new machine on the installation's account without room for it:
+ * the task waits for one instead of the provider refusing it. */
 export async function assertManagedRoom(store: Store, provider: string, budget: ManagedBudget, organizationId: string,
-  cpu: number | undefined, now = Date.now()): Promise<void> {
-  const refusal = await managedRoom(store, provider, budget, organizationId, cpu, now);
+  request: { cpu?: number; diskGb?: number; taskId?: string; worldId?: string } = {}, now = Date.now()): Promise<void> {
+  const refusal = await managedRoom(store, provider, budget, organizationId, request, now);
   if (refusal) throw new ManagedComputeBusy(refusal.message);
-}
-
-const wantKey = (provider: string) => `compute-wanted:${provider}`;
-
-async function wanting(store: Store, provider: string): Promise<Record<string, number>> {
-  try { return JSON.parse((await store.kvGet(wantKey(provider))) ?? '{}') as Record<string, number>; } catch { return {}; }
-}
-
-async function othersWaiting(store: Store, provider: string, organizationId: string, now: number): Promise<boolean> {
-  return Object.entries(await wanting(store, provider)).some(([organization, at]) => organization !== organizationId && now - at < MANAGED_WANT_MS);
-}
-
-/** Remember who was refused room (and forget who got it), for the fair share. */
-async function noteWant(store: Store, provider: string, organizationId: string, refused: boolean, now: number): Promise<void> {
-  const current = await wanting(store, provider);
-  if (!refused && !(organizationId in current)) return;
-  const next = Object.fromEntries(Object.entries(current).filter(([organization, at]) => organization !== organizationId && now - at < MANAGED_WANT_MS));
-  if (refused) next[organizationId] = now;
-  await store.kvSet(wantKey(provider), JSON.stringify(next));
 }

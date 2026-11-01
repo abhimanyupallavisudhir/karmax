@@ -239,6 +239,9 @@ describe.skipIf(!sshdAvailable)('Google Cloud worlds (fake Compute Engine, real 
     // The region's INSTANCES quota is how many machines may run at once.
     gcp.instanceQuota = 24;
     expect((await new GcpDriver(gcp.fetch, 1).limits(connection(gcp.key))).pool).toEqual({ cpu: 24, machines: 24 });
+    // And its SSD_TOTAL_GB is the account's disk.
+    gcp.ssdQuota = 5000;
+    expect((await new GcpDriver(gcp.fetch, 1).limits(connection(gcp.key))).pool).toEqual({ cpu: 24, machines: 24, diskGb: 5000 });
   });
 
   it('refuses a project without the default network at the connection test, and a bad key at the token', async () => {

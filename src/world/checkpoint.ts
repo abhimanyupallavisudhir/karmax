@@ -298,7 +298,7 @@ export class WorldCheckpointService {
     const config = await this.store.effectiveTaskConfig(project, handle.id);
     if (!isAnyProvider(config.worldProvider)) return undefined;
     const organizationId = project.organizationId;
-    const route = await this.router!.route(organizationId, config, handle.kind);
+    const route = await this.router!.route(organizationId, config, handle.kind, { taskId: handle.id, worldId: handle.id });
     const { value: restored } = await this.router!.run(organizationId, route,
       (candidate, reason) => this.restore(checkpointId, candidate.provider as WorldKind, { ...ambientActivityHooks(), routed: reason }),
       (decision) => this.store.appendEvent({ taskId: handle.id, type: 'world.routed', ts: Date.now(),
