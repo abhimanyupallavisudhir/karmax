@@ -9,7 +9,7 @@ import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { WorktreeProvider } from '../src/world/worktree.js';
-import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
+import { ObjectSnapshotEngine, ProjectResourceService, WorldNotRunningError } from '../src/world/resources.js';
 import { resourceSecretHandle } from '../src/domain/resource-drivers.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
 import { createRequire } from 'node:module';
@@ -648,6 +648,16 @@ describe('project resources', () => {
     const pullRequest = await store.createTask({ projectId: project.id, title: 'main: Generate', workflow: 'software-dev',
       workflowVersion: '1.30.0', params: { prompt: 'p', _shippedFrom: { taskId: task.id, checkout: 'repo' } }, parentTaskId: task.id });
     expect(await resources.ignoredInventory(pullRequest.id)).toEqual({ entries: [], truncated: false });
+    // Asked not to wake it, a parked cloud world is not opened (production,
+    // 2026-11-01: the task page's inventory started parked VMs).
+    (worlds.get('worktree') as any).capabilities = { ...(worlds.get('worktree') as any).capabilities, remote: true };
+    await store.setWorldState(world.handle as any, 'parked');
+    const open = vi.spyOn(worlds, 'open');
+    await expect(resources.ignoredInventory(task.id, 100, undefined, { wake: false })).rejects.toBeInstanceOf(WorldNotRunningError);
+    expect(open).not.toHaveBeenCalled();
+    open.mockRestore();
+    await store.setWorldState(world.handle as any, 'ready');
+    expect((await resources.ignoredInventory(task.id, 100, undefined, { wake: false })).entries.length).toBeGreaterThan(0);
 
     await resources.discardCandidate(task.id, staged.candidate.id, 'user:reviewer');
     expect((await store.getResourceCandidate(staged.candidate.id))).toMatchObject({ state: 'discarded' });

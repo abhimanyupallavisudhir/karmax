@@ -77,7 +77,7 @@ import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
 import { cliVersionOf, olderVersion } from '../domain/cli-version.js';
-import { WorkspaceConflict } from '../world/resources.js';
+import { WorkspaceConflict, WorldNotRunningError } from '../world/resources.js';
 import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, openCodeKeyModels, mergeModels,
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
 import { ARTIFICIAL_ANALYSIS_KEY_ENV, ArtificialAnalysis, toBenchmarks, type ModelBenchmarks } from '../agent/model-benchmarks.js';
@@ -4795,10 +4795,12 @@ export class Gateway {
       const taskResourceInventory = p.match(/^\/api\/tasks\/([^/]+)\/resources\/inventory$/);
       if (taskResourceInventory && method === 'GET') {
         if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
-        try { return this.json(res, 200, await this.deps.resources.ignoredInventory(taskResourceInventory[1]!)); }
+        try { return this.json(res, 200, await this.deps.resources.ignoredInventory(taskResourceInventory[1]!, 100, undefined, { wake: false })); }
         catch (error) {
           const checkpointed = (await store.latestWorldCheckpoint(taskResourceInventory[1]!))?.ignored;
           if (checkpointed) return this.json(res, 200, checkpointed);
+          // A parked world was checkpointed as it parked; one with nothing ignored records none.
+          if (error instanceof WorldNotRunningError) return this.json(res, 200, { entries: [], truncated: false });
           return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
         }
       }
