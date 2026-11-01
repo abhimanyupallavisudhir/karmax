@@ -6,7 +6,7 @@ import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import type { WorldDiagnosis } from '../src/world/types.js';
 import { withClaudeStartupDeadline } from '../src/agent/sdk-stream.js';
-import { providerFailure, ProviderOutage } from '../src/agent/limits.js';
+import { AgentToolsUnavailable, providerFailure, ProviderOutage } from '../src/agent/limits.js';
 
 /**
  * Tasks 348 and 349 escalated to a human because a sandbox frozen by memory
@@ -132,6 +132,50 @@ describe('sandbox-caused turn failures', () => {
         + 'Your final response from it was never posted: a reply is posted only when the turn ends. '
         + 'Continue from where you left off, then give your full final response, even if you had already written it; '
         + 'do not mention the interruption unless it changes the result.)']);
+    } finally {
+      context.mockRestore();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      (await store.close());
+    }
+  });
+
+  // DharmaArtha's #5 (2026-10-31): the browser tool did not connect within 30 s
+  // on a machine busy with the agent's own checks, and the task stopped for a person.
+  it('retries a turn whose tools did not start, and the retry carries on without them', async () => {
+    const store = (await Store.create(':memory:'));
+    const worlds = new WorldRegistry();
+    const world = {
+      handle: { kind: 'fake-remote', id: 'tools-task', root: '/workspace', branch: 'tavya/tools-task', base: 'main' },
+      async exec() { return { code: 0, stdout: '', stderr: '' }; },
+      async writeFile() {}, async readFile() { return ''; }, async listFiles() { return []; }, async destroy() {},
+      async diagnose() { return undefined; },
+    };
+    worlds.register({ kind: 'fake-remote', capabilities: { remote: true }, async create() { throw new Error('unused'); },
+      async open() { return world; }, async destroy() {} } as any);
+    const optional: Array<boolean | undefined> = [];
+    const adapters = new Map([['mock', { provider: 'mock', async runTurn(input: any) {
+      optional.push(input.toolsOptional);
+      if (!input.toolsOptional) throw new AgentToolsUnavailable([{ name: 'chrome-devtools', status: 'failed' }]);
+      return { termination: { kind: 'success', status: 'end_turn' }, output: 'done', session: 'session-1' };
+    } }]]) as any;
+    const core = makeCoreActivities({ store, worlds, adapters, profiles: new ProfileResolver(store, 'mock') });
+    let attempt = 1;
+    const context = vi.spyOn(Context, 'current').mockImplementation(() => ({
+      cancellationSignal: new AbortController().signal, heartbeat() {},
+      info: { attempt, activityId: '1', workflowExecution: { workflowId: 'tools-task', runId: 'run' },
+        currentAttemptScheduledTimestampMs: Date.now() },
+    } as any));
+    const turn = () => core.runAgentTurn({
+      taskId: 'tools-task', role: 'do', agentTurnId: 'tools-task#0', worldHandle: world.handle,
+      messages: [{ id: 'm0', role: 'user', text: 'check the site', ts: 0 }],
+      task: { projectId: 'project', title: 'Tools', prompt: 'check the site', project: {}, workflow: 'software-dev' },
+    } as any);
+    try {
+      await expect(turn()).rejects.toMatchObject({ type: 'agent-infra', nonRetryable: false,
+        message: "The agent's tools didn't start: chrome-devtools (failed)" });
+      attempt = 2;
+      await turn();
+      expect(optional).toEqual([undefined, true]);
     } finally {
       context.mockRestore();
       await new Promise((resolve) => setTimeout(resolve, 100));

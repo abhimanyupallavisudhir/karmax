@@ -1062,12 +1062,22 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
 .tf-foot { border-top: 1px solid var(--line); background: var(--surface); padding: 12px 0; }
 .tf-foot-inner { display: flex; gap: 8px; align-items: center; justify-content: flex-end; }
 .tf-foot .tf-hint { margin-right: auto; color: var(--ink-3); font-size: 12px; }
+/* What the task still needs to start (an agent account, a computer), as links to set it up. */
+.tf-foot .tf-ready { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin-right: 6px;
+  color: var(--working); font-size: 12.5px; }
+.tf-foot .tf-ready[hidden] { display: none; }
+.tf-foot .tf-ready a { color: var(--working); font-weight: 600; text-decoration: underline; text-underline-offset: 2px; }
+.tf-ready-mark { display: inline-grid; place-items: center; width: 16px; height: 16px; border-radius: 50%;
+  background: var(--working-weak); font-size: 11px; font-weight: 700; }
 @media (max-width: 900px) {
   .tf-columns { grid-template-columns: 1fr; }
   .tf-head-inner, .tf-foot-inner, .tf-columns { padding-left: 16px; padding-right: 16px; }
   .tf-columns { padding-top: 18px; padding-bottom: 40px; }
   .tf-side { margin-top: 10px; border-top: 1px solid var(--line); }
   .tf-foot .tf-hint { display: none; }
+  .tf-foot-inner { flex-wrap: wrap; }
+  .tf-foot .tf-ready { flex-basis: 100%; gap: 4px 12px; margin-right: 0; }
+  .tf-foot .tf-ready-sep { display: none; }
 }
 @media (max-width: 720px) {
   .task-form-page { left: 0; } /* the rail is hidden */
@@ -4311,3 +4321,7 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
   .tf-foot .tf-save-template-label, .tf-template-label { display: none; }
 }
 .template-save .tpl-scope-label { font-size: 13px; color: var(--ink-2); }
+
+/* A one-click way to the setting that unblocks a stopped or waiting task. */
+.setup-fix { margin-left: 8px; vertical-align: baseline; }
+.msg.system.error .setup-fix { display: flex; width: fit-content; margin: 8px 0 2px; }

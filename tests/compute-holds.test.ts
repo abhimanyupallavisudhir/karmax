@@ -8,7 +8,7 @@ import path from 'node:path';
 import { Context } from '@temporalio/activity';
 import { Store } from '../src/store/db.js';
 import { COMPUTE_HOLD, ComputeCreditExhausted, assertComputeCredit, computeCredit, holdManagedCompute, listRate,
-  machineRate } from '../src/world/managed-compute.js';
+  computeMonth, machineRate } from '../src/world/managed-compute.js';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { WorldRegistry } from '../src/world/registry.js';
@@ -152,16 +152,19 @@ describe('a turn that outlives its hold', () => {
     const worlds = new WorldRegistry();
     const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
     cleanups.push(() => world.destroy());
+    // Earlier this month, however early in it the test runs (CI #2449 ran at 01:31 UTC
+    // on the 1st, and usage "two hours ago" fell in the month before).
+    const ago = (ms: number) => Math.max(computeMonth(Date.now()).from, Date.now() - ms);
     // The machine costs $3.60 an hour ($7.20 at tavya's prices): $0.006 left is three seconds of it.
     await f.store.recordUsage({ id: 'usage:memory:earlier', organizationId: f.organization.id, taskId: task.id, worldId: task.id,
       provider: 'memory', kind: 'world.active', quantity: 3600, unit: 'second', costMicros: 3_600_000,
-      startedAt: Date.now() - 2 * 3_600_000, endedAt: Date.now() - 3_600_000, fundingSource: 'managed' });
+      startedAt: ago(2 * 3_600_000), endedAt: ago(3_600_000), fundingSource: 'managed' });
     // $5 + a $10 gift, of which $7.20 used here and the rest elsewhere but $0.006.
     await f.store.setComputePackGift(f.organization.id, 1, 'operator');
     const used = 2 * 3_600_000;
     await f.store.recordUsage({ id: 'usage:memory:other', organizationId: f.organization.id, provider: 'memory', kind: 'world.active',
-      quantity: 1, unit: 'second', costMicros: (15_000_000 - used - 6_000) / 2, startedAt: Date.now() - 3_600_000,
-      endedAt: Date.now() - 3_599_000, fundingSource: 'managed' });
+      quantity: 1, unit: 'second', costMicros: (15_000_000 - used - 6_000) / 2, startedAt: ago(3_600_000),
+      endedAt: ago(3_599_000), fundingSource: 'managed' });
     vi.spyOn(Context, 'current').mockImplementation(() => ({ info: { attempt: 1, activityId: 'turn', workflowExecution: { runId: 'run' } },
       cancellationSignal: new AbortController().signal, heartbeat: () => {} }) as any);
     const sessions: Array<string | undefined> = [];

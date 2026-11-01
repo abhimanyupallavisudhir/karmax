@@ -64,6 +64,30 @@ export function credentialMatchesProfile(
     : credential.provider === profile.provider;
 }
 
+/** Whether `credential` may run a turn of `profile`: the account coordinator's
+ * filter. `all` is every credential the organization has, enabled or not: an
+ * OpenCode model's `provider/` prefix narrows its API keys only when some
+ * vendor by that name is known. */
+export function credentialServesProfile(
+  profile: Pick<AgentProfile, 'provider' | 'modelProvider' | 'model'>,
+  credential: { provider: string; kind: 'login' | 'ambient' | 'key'; modelProvider?: string },
+  all: ReadonlyArray<{ provider: string; kind: 'login' | 'ambient' | 'key' }>,
+): boolean {
+  if (profile.provider !== 'opencode') return credentialMatchesProfile(profile, credential);
+  const prefix = modelProviderFromModel(profile.model);
+  const recognized = !!prefix && ((MODEL_PROVIDERS as readonly string[]).includes(prefix)
+    || all.some((candidate) => candidate.kind === 'key' && credentialAliases(prefix).includes(candidate.provider)));
+  // An OpenCode subscription is harness-native and may carry credentials for
+  // several model vendors. API keys are narrowed only when the model has a
+  // recognizable `provider/model` prefix; otherwise the general order decides.
+  if (credential.kind !== 'key') {
+    if (credential.provider !== 'opencode') return false;
+    if (!credential.modelProvider) return recognized;
+    return !recognized || credentialAliases(prefix!).includes(credential.modelProvider);
+  }
+  return !recognized || credentialAliases(prefix!).includes(credential.provider);
+}
+
 export function isAgentProvider(value: unknown): value is Provider {
   return typeof value === 'string' && (AGENT_PROVIDERS as readonly string[]).includes(value)
     && (value !== 'mock' || mockAgentEnabled());

@@ -151,6 +151,7 @@ export const PLATFORM_API_CATALOG = {
   ],
   tasks: [
     'GET|POST /api/projects/:projectId/tasks (POST body {title?, prompt, params?, templateId?, draft?, authorization?, credentialGrants?, holdForAuthorization?, authorizationAudience?, authorizationReason?}: authorization and credentials beyond the caller are refused 403, or with holdForAuthorization:true held for approval — routed at once to authorizationAudience (default: the summon) and started once approved — returned with authorizationGap {summary, missingCapabilities, summon, next} and authorizationRequest {id, audience}; a held draft:true is only kept)', 'GET /api/projects/:projectId/tasks/by-num/:number',
+    'GET /api/projects/:projectId/readiness?agent=<harness>[:<model>] (repeatable: whether a task here can start — agents [{provider, model, ready}]: some switched-on login or key runs it; agentLogin: any at all; compute {ready, local, managed, own, outOfCredit?}: somewhere to run; task:read)',
     'GET /api/search?q=&limit=&offset= (every organization at once: one query over every project you can read in each, sorted together; tasks carry projectId, `projects` their organizationId; `for:me` adds reasons)',
     'GET /api/organizations/:organizationId/search?q=&limit=&offset= (the organization task list: one query over every project you can read, sorted together; tasks carry projectId; `for:me` adds reasons)',
     'GET /api/projects/:projectId/search?q=', 'GET|POST /api/projects/:projectId/tags',

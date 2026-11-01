@@ -111,6 +111,8 @@ import { paths } from '../config/paths.js';
 import { ensureProjectWikiRepositoryAsync, setProjectWikiRemote } from '../wiki/repository.js';
 import { worldRepos, worldWorkingDirectory, worldWorkingRelativePath, type WorldHandle } from '../world/types.js';
 import { enumerateCredentials, resolveCredentials, resolveExplanationCredentials } from '../platform/credentials.js';
+import { errorStatus } from './error-status.js';
+import { projectReadiness, usableAgentCredentials, type ReadinessDeps } from '../platform/readiness.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems, itemHandle, relatedVaultItems, searchVaultItems, weakensProtection } from '../autonomy/vault-items.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
@@ -386,6 +388,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
     return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/tasks\/[^/]+\/resources/.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/^\/api\/tasks\/[^/]+\/resource-candidates/.test(p)) return read ? 'task:read' : 'task:review:execute';
+  if (/^\/api\/projects\/[^/]+\/readiness$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/tasks/.test(p)) return read ? 'task:read' : 'task:create';
   // Project events: reading needs the event stream; emitting can start runs.
   if (/^\/api\/projects\/[^/]+\/events$/.test(p)) return read ? 'task:event:read' : 'task:create';
@@ -2592,15 +2595,7 @@ export class Gateway {
           finishReplay = b.finishReplay === true;
           (await store.kvSet(key, JSON.stringify(record)));
         }
-        const credentials = enumerateCredentials(await gatherCredentialSources({
-          configHomes: this.deps.configHomes,
-          broker: this.deps.broker,
-          organizationId,
-        })).filter((credential) => !this.deps.hosted
-          || credential.kind === 'login' || Boolean(credential.apiKeyHandle));
-        const enabledCredentials = resolveCredentials(credentials, {
-          global: parsePolicy((await store.kvGet(credPolicyKey.organization(organizationId)))),
-        });
+        const enabledCredentials = await usableAgentCredentials(this.readinessDeps(), { organizationId });
         const clouds = await Promise.all(CLOUD_WORLD_PROVIDERS.map((provider) => store.getWorldProviderConnection(organizationId, provider)));
         const facts = {
           // This organization's own repository access; signing in with GitHub alone gives it none.
@@ -4226,6 +4221,19 @@ export class Gateway {
             typeof b.folder === 'string' ? b.folder : undefined)));
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
+      // Whether this project's tasks can start: an agent login for each named
+      // agent (`agent=<harness>[:<model>]`, repeatable) and a computer.
+      const projectReadinessMatch = p.match(/^\/api\/projects\/([^/]+)\/readiness$/);
+      if (projectReadinessMatch && method === 'GET') {
+        const project = (await store.getProject(projectReadinessMatch[1]!));
+        if (!project) return this.json(res, 404, { error: 'no project' });
+        const agents = url.searchParams.getAll('agent').slice(0, 8).map((value) => {
+          const at = value.indexOf(':');
+          return at < 0 ? { provider: value } : { provider: value.slice(0, at), ...(value.slice(at + 1) ? { model: value.slice(at + 1) } : {}) };
+        }).filter((agent): agent is { provider: Provider; model?: string } => isAgentProvider(agent.provider));
+        return this.json(res, 200, (await projectReadiness(this.readinessDeps(),
+          { organizationId: project.organizationId ?? 'org_personal', projectId: project.id }, agents)));
+      }
       const projectExecution = p.match(/^\/api\/projects\/([^/]+)\/execution-policy$/);
       if (projectExecution) {
         const project = (await store.getProject(projectExecution[1]!));
@@ -4822,7 +4830,7 @@ export class Gateway {
             ? await api.adoptProjectResource(token, taskResourceCandidate[1]!, taskResourceCandidate[2]!)
             : await api.discardProjectResource(token, taskResourceCandidate[1]!, taskResourceCandidate[2]!);
           return this.json(res, 200, result);
-        } catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
+        } catch (error) { return this.json(res, errorStatus(error, 409),
           { error: error instanceof Error ? error.message : String(error) }); }
       }
       const projectMembers = p.match(/^\/api\/projects\/([^/]+)\/members$/);
@@ -4885,7 +4893,7 @@ export class Gateway {
             if (project) await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
             return this.json(res, 200, attached);
           } catch (error) {
-            return this.json(res, Number((error as any)?.status ?? 409),
+            return this.json(res, errorStatus(error, 409),
               { error: error instanceof Error ? error.message : String(error) });
           }
         }
@@ -5572,7 +5580,7 @@ export class Gateway {
         } catch (e) {
           // Frozen in-flight (cancelled / past the point of no return / finished),
           // or a stale draft edit — the workflow validator's reason is authoritative.
-          return this.json(res, Number((e as any)?.status ?? 409), {
+          return this.json(res, errorStatus(e, 409), {
             error: e instanceof Error ? e.message : String(e),
             ...((e as any)?.code ? { code: (e as any).code } : {}),
             ...(e instanceof AuthorizationGrantError ? e.gap : {}),
@@ -5815,7 +5823,7 @@ export class Gateway {
           repository: url.searchParams.get('repository') ?? undefined,
           page: url.searchParams.has('page') ? Number(url.searchParams.get('page')) : undefined,
           perPage: url.searchParams.has('perPage') ? Number(url.searchParams.get('perPage')) : undefined,
-        })); } catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
+        })); } catch (error) { return this.json(res, errorStatus(error, 409),
           { error: error instanceof Error ? error.message : String(error) }); }
       }
       if (p === '/api/agent/github/actions/runs' && method === 'GET') {
@@ -5830,7 +5838,7 @@ export class Gateway {
             page: url.searchParams.has('page') ? Number(url.searchParams.get('page')) : undefined,
             perPage: url.searchParams.has('perPage') ? Number(url.searchParams.get('perPage')) : undefined,
           }));
-        } catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
+        } catch (error) { return this.json(res, errorStatus(error, 409),
           { error: error instanceof Error ? error.message : String(error) }); }
       }
       const githubActionsRun = p.match(/^\/api\/agent\/github\/actions\/runs\/(\d+)$/);
@@ -5847,7 +5855,7 @@ export class Gateway {
           tailLines: url.searchParams.has('tailLines') ? Number(url.searchParams.get('tailLines')) : undefined,
           maxChars: url.searchParams.has('maxChars') ? Number(url.searchParams.get('maxChars')) : undefined,
         })); }
-        catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
+        catch (error) { return this.json(res, errorStatus(error, 409),
           { error: error instanceof Error ? error.message : String(error) }); }
       }
       if (githubActionsRun && method === 'POST') {
@@ -5856,7 +5864,7 @@ export class Gateway {
           taskId: b.taskId, repository: b.repository ? String(b.repository) : undefined, runId: Number(githubActionsRun[1]),
           action: String(b.action ?? '') as any,
         })); }
-        catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
+        catch (error) { return this.json(res, errorStatus(error, 409),
           { error: error instanceof Error ? error.message : String(error) }); }
       }
       if (p === '/api/agent/github/actions/dispatch' && method === 'POST') {
@@ -5866,7 +5874,7 @@ export class Gateway {
           workflow: typeof b.workflow === 'number' ? b.workflow : String(b.workflow ?? ''),
           ref: String(b.ref ?? ''), inputs: b.inputs && typeof b.inputs === 'object' && !Array.isArray(b.inputs) ? b.inputs : undefined,
         })); }
-        catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
+        catch (error) { return this.json(res, errorStatus(error, 409),
           { error: error instanceof Error ? error.message : String(error) }); }
       }
       if (p === '/api/agent/git/import' && method === 'POST') {
@@ -5882,7 +5890,7 @@ export class Gateway {
       if (p === '/api/agent/resource-candidates' && method === 'POST') {
         const b = await this.body(req);
         try { return this.json(res, 200, await api.proposeProjectResource(token, b as any)); }
-        catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
+        catch (error) { return this.json(res, errorStatus(error, 409),
           { error: error instanceof Error ? error.message : String(error) }); }
       }
       if (p === '/api/agent/escalate' && method === 'POST') {
@@ -8779,9 +8787,9 @@ export class Gateway {
       // A status-bearing platform error (denied / not found / invalid input) is a
       // caller-facing answer, not a server fault: surface its own code rather
       // than letting `fail` flatten everything but CapabilityError to a 500.
-      const declared = typeof (e as { status?: unknown })?.status === 'number' ? (e as { status: number }).status : undefined;
+      const declared = errorStatus(e, 0) || undefined;
       const code = (e as { code?: unknown })?.code;
-      if (declared) return this.json(res, declared, { error: (e as Error).message,
+      if (declared && !(e instanceof URIError)) return this.json(res, declared, { error: (e as Error).message,
         ...(code ? { code: String(code) } : {}), ...(e instanceof AuthorizationGrantError ? e.gap : {}) });
       throw e;
     }
@@ -10163,6 +10171,11 @@ export class Gateway {
     }
   }
 
+  private readinessDeps(): ReadinessDeps {
+    return { store: this.deps.store, hosted: this.deps.hosted === true, configHomes: this.deps.configHomes,
+      broker: this.deps.broker, providerConnections: this.deps.providerConnections };
+  }
+
   private async enableHostedOnboarding(userId: string, organizationId: string): Promise<void> {
     const key = hostedOnboardingKey(userId, organizationId);
     if (!(await this.deps.store.kvGet(key)))
@@ -10440,11 +10453,17 @@ export class Gateway {
   private async body(req: http.IncomingMessage, maxBytes = 2 * 1024 * 1024): Promise<any> {
     const value = await this.rawBody(req, maxBytes);
     if (!value.length) return {};
+    let parsed: unknown;
     try {
-      return JSON.parse(value.toString('utf8'));
+      parsed = JSON.parse(value.toString('utf8'));
     } catch {
       throw Object.assign(new Error('invalid JSON body'), { status: 400 });
     }
+    // Every route reads named fields; `null`, a list or a bare value would fail
+    // as a server error deep inside one.
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+      throw Object.assign(new Error('the request body must be a JSON object'), { status: 400 });
+    return parsed;
   }
   /** Read a request body into a Buffer, aborting if it exceeds `maxBytes`. */
   private async rawBody(req: http.IncomingMessage, maxBytes: number): Promise<Buffer> {
@@ -10470,17 +10489,18 @@ export class Gateway {
    *  status. Several routes wrapped their body in `catch → 400`, which flattened
    *  a denial (403) and a bad identifier (404) into "your input was malformed". */
   private badRequest(res: http.ServerResponse, e: unknown) {
-    const declared = typeof (e as { status?: unknown })?.status === 'number' ? (e as { status: number }).status : undefined;
-    return this.json(res, declared ?? 400, { error: e instanceof Error ? e.message : String(e) });
+    return this.json(res, errorStatus(e, 400), { error: e instanceof Error ? e.message : String(e) });
   }
   private fail(res: http.ServerResponse, e: unknown) {
-    const declared = typeof (e as { status?: unknown })?.status === 'number' ? (e as { status: number }).status : undefined;
+    // Too late for an answer of its own: end the response, so the client is
+    // not left waiting for the socket to time out.
+    if (res.headersSent) { res.destroy(); return; }
     try {
-      this.json(res, declared ?? (e instanceof AttachmentError && /too large/i.test(e.message) ? 413 : 500),
-        { error: String((e as Error)?.message ?? e), ...grantRefusal(e),
-          ...(e instanceof AuthorizationGrantError ? e.gap : {}) });
+      this.json(res, errorStatus(e, e instanceof AttachmentError && /too large/i.test(e.message) ? 413 : 500),
+        { error: e instanceof URIError ? 'malformed address: a %-escape in it is not valid' : String((e as Error)?.message ?? e),
+          ...grantRefusal(e), ...(e instanceof AuthorizationGrantError ? e.gap : {}) });
     } catch {
-      /* ignore */
+      res.destroy();
     }
   }
 }
