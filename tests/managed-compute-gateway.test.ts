@@ -16,6 +16,10 @@ import { findFreePortFrom } from '../src/util/ports.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { MANAGED_COMPUTE, WorldProviderConnectionService } from '../src/world/connections.js';
 
+/** A time this month: usage booked "an hour ago" just after a month began
+ * would fall partly in the month before, whose credit is not the one asked for. */
+const inThisMonth = (at: number) => { const now = new Date(); return Math.max(at, Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)); };
+
 /**
  * Managed compute accounts are the installation's: settings:read to see them,
  * settings:write to change them, and no organization grant reaches them — not
@@ -92,7 +96,7 @@ describe('managed compute API', () => {
     expect(providers).toEqual([expect.objectContaining({ provider: 'e2b', managed: true })]);
     expect(JSON.stringify(providers)).not.toMatch(/maxRunning|operator-secret/);
     await store.recordUsage({ id: 'usage:e2b:x', organizationId, provider: 'e2b', kind: 'world.active', quantity: 3600, unit: 'second',
-      costMicros: 1_000_000, startedAt: Date.now() - 3_700_000, endedAt: Date.now() - 100_000, fundingSource: 'managed' });
+      costMicros: 1_000_000, startedAt: inThisMonth(Date.now() - 3_700_000), endedAt: inThisMonth(Date.now() - 100_000), fundingSource: 'managed' });
     const entitlements = await (await call(tokenFor.tenantOwner!, 'GET', `/api/organizations/${organizationId}/entitlements`)).json();
     expect(entitlements).toMatchObject({ computeCreditMicros: 5_000_000, compute: { usedMicros: 2_000_000, providers: ['e2b'] },
       currentMonthlyPriceCents: 900 });

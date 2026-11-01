@@ -206,6 +206,9 @@ export class VmWorldProvider implements WorldProvider {
       transport = this.transportFor(handle.id, connection, sealed);
       if (state !== 'ready') {
         const shape = await this.shapeOf(handle, connection);
+        // Who wakes a stopped machine, for when one is found running while its
+        // world is parked (the lifecycle sweep's stray-wake check).
+        console.info(`[${this.kind}] waking ${handle.id} from ${state}: ${wakeCaller()}`);
         try {
           await timed(`${this.kind}.start`, () => this.driver.start(connection, sealed, shape, keysOf(sealed)));
           transport.reset();
@@ -250,6 +253,12 @@ export class VmWorldProvider implements WorldProvider {
     await timed(`${this.kind}.stop`, () => this.driver.stop(connection, sealed));
     this.states.set(handle.id, 'parked');
     return handle;
+  }
+
+  async stopStray(handle: WorldHandle): Promise<void> {
+    // Another process may have woken it: what this one remembers says nothing.
+    this.states.delete(handle.id);
+    await this.park(handle);
   }
 
   async destroy(handle: WorldHandle): Promise<void> {
@@ -541,4 +550,10 @@ function provisionTarget(transport: SshTransport, signal?: AbortSignal): Provisi
 /** The ledger keys of a provider account's deleted worlds (`…:<world>`). */
 function finalUsageKey(kind: string, scope: string | undefined): string {
   return `vm-final-usage:${kind}:${scope ?? '-'}:`;
+}
+
+/** The callers of a wake, nearest first, without this file's frames. */
+function wakeCaller(): string {
+  return (new Error().stack ?? '').split('\n').slice(1).map((line) => line.trim().replace(/^at /, ''))
+    .filter((line) => !line.includes('/world/vm/provider.') && !line.includes('node:internal')).slice(0, 6).join(' < ');
 }

@@ -20,6 +20,7 @@ import { scrubbedEnv } from '../autonomy/config-homes.js';
 import { createCustodyEnv, registerAgent, releaseAgent, killAgent } from './custody.js';
 import { trackProcess } from '../util/processes.js';
 import {
+  AgentToolsUnavailable,
   apiThrottle,
   classifyLimitError,
   nativeProviderDiagnostic,
@@ -33,6 +34,8 @@ import {
   isProviderPolicyRejection,
   type ProviderFailureMetadata,
   SandboxProviderFailure,
+  toolsUnavailableActivity,
+  toolsUnavailableNotice,
 } from './limits.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
 import { activityDetail, codexItemActivity, toolActivityDetail } from './activity.js';
@@ -264,7 +267,8 @@ export class CodexAdapter implements AgentAdapter {
     const baseUrl = process.env.KARMAX_OPENAI_BASE_URL ?? 'https://api.openai.com/v1';
     const model = input.profile.model ?? 'gpt-5.5';
     (await (await currentTiming())?.mark('provider.selected', { provider: 'codex', model }));
-    const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal);
+    const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal, input.toolsOptional);
+    if (mcp.unavailable.length) await ctx.emitActivity?.(toolsUnavailableActivity(mcp.unavailable));
     try {
     const handlers = { ...platformToolHandlers(input.world, ctx, () => workEnvironment(input)), ...mcp.handlers };
     // Responses API function tools are flat ({type:'function', name, ...}).
@@ -317,7 +321,8 @@ export class CodexAdapter implements AgentAdapter {
       // it, alongside the chain id. (Claude's metered path does the same.)
       // `stream`: text reaches the task as it is generated (LT-5); the terminal
       // event carries the same response object the non-streaming call returns.
-      const body: any = { model, tools, tool_choice: completionPending ? 'none' : 'auto', store: true, stream: true, input: nextInput, instructions: input.systemPrompt };
+      const body: any = { model, tools, tool_choice: completionPending ? 'none' : 'auto', store: true, stream: true, input: nextInput,
+        instructions: input.systemPrompt + (mcp.unavailable.length ? `\n\n${toolsUnavailableNotice(mcp.unavailable)}` : '') };
       if (respId) body.previous_response_id = respId;
       // Reasoning effort (SPEC §10.5) — only reasoning models accept it (not gpt-4.1).
       const reasoningEffort = codexReasoningEffort(model, input.profile.effort);
@@ -462,7 +467,7 @@ export class CodexAdapter implements AgentAdapter {
     // login). scrubbedEnv also strips OPENAI_API_KEY so a stray key can't shadow it.
     const remote = isRemoteAgentWorld(runtimeWorld);
     const remoteHome = remote
-      ? await timed('bootstrap.home', () => seedRemoteAgentHome(runtimeWorld, 'codex', input.resolvedAuth?.configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none'))
+      ? await timed('bootstrap.home', () => seedRemoteAgentHome(runtimeWorld, 'codex', input.resolvedAuth?.configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none', undefined, input.toolsOptional))
       : undefined;
     const dynamicTools = codexDynamicTools(remote);
     // Resume/fork cannot override dynamicTools. Migrate into a new rollout
@@ -825,6 +830,8 @@ export class CodexAdapter implements AgentAdapter {
           // explicit MCP-name correlation above, but do not get the stronger
           // generic-error correlation without positive account proof.
         });
+      const unavailableTools: string[] = [...(remoteHome?.unavailableTools ?? [])];
+      if (unavailableTools.length) await ctx.emitActivity?.(toolsUnavailableActivity(unavailableTools));
       const requiredMcp = input.profile.mcpConnections !== undefined ? (input.agentMcp ?? []).map((s) => s.name) : remote ? Object.keys(remoteHome?.browserMcp ?? {}) : [];
       const readiness = requiredMcp.length ? timed('provider.mcp-readiness', async () => {
         // Dynamic Karmax tools use this control channel and therefore need no
@@ -849,10 +856,17 @@ export class CodexAdapter implements AgentAdapter {
           if (!missing.length || Date.now() >= deadline) break;
           await new Promise((resolve) => setTimeout(resolve, 250));
         } while (true);
-        if (missing.length) {
+        if (missing.length && !input.toolsOptional) {
           const observed = servers.map((server) => ({ name: server?.name,
             tools: server?.tools && typeof server.tools === 'object' ? Object.keys(server.tools) : [] }));
-          throw new Error(`remote Codex MCP startup incomplete (missing ${missing.join(', ')}; observed ${JSON.stringify(observed)}; startup ${JSON.stringify(mcpStartup)})`);
+          throw new AgentToolsUnavailable(missing.map((name) => ({ name,
+            status: servers.some((server) => server?.name === name) ? 'no tools' : 'missing' })),
+          { cause: new Error(`remote Codex MCP startup incomplete (missing ${missing.join(', ')}; observed ${JSON.stringify(observed)}; startup ${JSON.stringify(mcpStartup)})`) });
+        }
+        // The retry carries on without them, and says so to the agent and in the conversation.
+        if (missing.length) {
+          unavailableTools.push(...missing);
+          await ctx.emitActivity?.(toolsUnavailableActivity(missing));
         }
       }) : undefined;
       const [, ready] = await Promise.allSettled([accountHealth, readiness]);
@@ -906,7 +920,8 @@ export class CodexAdapter implements AgentAdapter {
       // ── Initial input (the delta; agent turns attributed so a fresh-thread replay
       //    never folds the agent's own prior replies back in as user input). ──
       const convo = messagesToDeliver(input).filter((m) => m.role !== 'system');
-      const initialText = conversationToPromptText(convo) || (resuming ? 'Continue.' : 'Begin the task described in the developer instructions.');
+      const initialText = [...(unavailableTools.length ? [toolsUnavailableNotice(unavailableTools)] : []),
+        conversationToPromptText(convo) || (resuming ? 'Continue.' : 'Begin the task described in the developer instructions.')].join('\n\n');
       let nextInput: any[] = [{ type: 'text', text: initialText, text_elements: [] }, ...await imageItems(convo)];
 
       (await sessionEnd?.());

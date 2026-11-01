@@ -172,6 +172,23 @@ describe.skipIf(!sshdAvailable)('AWS worlds (fake EC2, real sshd)', () => {
     expect(instance!.tags.karmaxLastRun).toMatch(/^\d+-\d+$/);
   });
 
+  it('stops a parked world another process woke, though this one remembers parking it', async () => {
+    // Production, 2026-10-31: the lifecycle sweep's stray-wake check runs in
+    // the gateway, which may have parked the world itself before.
+    const world = await provider.create({ taskId: 'task_stray', base: 'main', generation: 1, organizationId: 'org_a' });
+    const handle = world.handle as WorldHandle;
+    await provider.park(handle);
+    const [instance] = [...aws.instances.values()];
+    await waitFor(() => instance!.state === 'stopped');
+    instance!.state = 'running'; // started elsewhere
+    await provider.park(handle);
+    expect(instance!.state).toBe('running');
+    expect(await provider.probe(handle)).toBe('ready');
+    await provider.stopStray(handle);
+    await waitFor(() => instance!.state === 'stopped');
+    expect(await provider.probe(handle)).toBe('parked');
+  });
+
   it('wakes at a new size by changing the stopped instance’s type', async () => {
     const world = await provider.create({ taskId: 'task_size', base: 'main', generation: 1, organizationId: 'org_a' });
     const handle = world.handle as WorldHandle;

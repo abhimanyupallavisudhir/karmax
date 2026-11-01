@@ -16,9 +16,11 @@
  *   - API-key paths surface a 429 (with retry-after/-reset headers upstream if we
  *     ever thread them through); classification still works off the message.
  */
+import { BRAND } from '../domain/brand.js';
+import type { UsageResult } from './usage.js';
+
 export type LimitWindow = '5h' | 'weekly' | 'model';
 export type ProviderFailureKind = 'quota' | 'credential';
-import type { UsageResult } from './usage.js';
 
 export type ProviderFailureSource = 'structured' | 'message';
 
@@ -150,6 +152,30 @@ export class AgentChannelLost extends Error {
     super(message);
     this.name = 'AgentChannelLost';
   }
+}
+
+/** Tools the agent was given (MCP servers: the browser, a connected app) did
+ * not start. Usually the machine was busy or a server was briefly unreachable,
+ * so the turn is retried as infrastructure; the retry starts without whatever
+ * still fails (`AdapterTurn.toolsOptional`) and tells the agent, rather than
+ * stopping the task for a person. */
+export class AgentToolsUnavailable extends Error {
+  constructor(readonly servers: ReadonlyArray<{ name: string; status: string }>, options?: { cause?: unknown }) {
+    super(`The agent's tools didn't start: ${servers.map((server) => `${server.name} (${server.status})`).join(', ')}`, options);
+    this.name = 'AgentToolsUnavailable';
+  }
+}
+
+/** What the agent is told when its turn starts without some of its tools. */
+export function toolsUnavailableNotice(names: readonly string[]): string {
+  return `[${BRAND} notice] These tools didn't start this turn, so they are unavailable: ${names.join(', ')}. `
+    + 'Carry on without them; they are started again next turn.';
+}
+
+/** The conversation's note that a turn started without some of its tools. */
+export function toolsUnavailableActivity(names: readonly string[]) {
+  return { id: 'tools-unavailable', kind: 'status' as const, phase: 'completed' as const,
+    title: `Started without ${names.join(', ')}`, detail: "These tools didn't start; the agent carries on without them." };
 }
 
 /** A provider rejected requests from a login it had just proven valid. Neither

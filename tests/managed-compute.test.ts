@@ -1,7 +1,7 @@
 // Managed compute (wiki features/managed-compute): organizations without their
 // own provider account run on the installation's, within a monthly compute
 // credit their plan, packs and gifts give them.
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,7 +17,10 @@ import { WorldRegistry } from '../src/world/registry.js';
 import { ProviderCapacityFull } from '../src/agent/limits.js';
 
 const cleanups: Array<() => Promise<void> | void> = [];
-afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
+afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); vi.useRealTimers(); });
+// Mid-month: usage booked minutes ago, or checked minutes ahead, must fall in
+// the month whose credit is asked for, which it does not near a month's end.
+beforeEach(() => { vi.useFakeTimers({ now: Date.UTC(2026, 9, 15, 12), toFake: ['Date'] }); });
 const probes = { check: async () => {}, limits: async () => ({}) };
 
 async function fixture(options: { hosted?: boolean } = {}) {

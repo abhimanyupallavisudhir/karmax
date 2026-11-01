@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 const state = vi.hoisted(() => ({ close: vi.fn(async () => {}) }));
-vi.mock('../src/mcp/connections/client.js', () => ({ apiMcpTools: async () => ({ tools: [], handlers: {}, close: state.close }) }));
+vi.mock('../src/mcp/connections/client.js', () => ({ apiMcpTools: async () => ({ tools: [], handlers: {}, close: state.close, unavailable: [] }) }));
 import { ClaudeAdapter } from '../src/agent/claude.js';
 import { CodexAdapter } from '../src/agent/codex.js';
 

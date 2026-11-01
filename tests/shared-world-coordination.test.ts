@@ -3,8 +3,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
-import { afterEach, expect, it } from 'vitest';
-import { SharedWorldCoordination } from '../src/world/shared-coordination.js';
+import { afterEach, expect, it, vi } from 'vitest';
+import { Context } from '@temporalio/activity';
+import { SharedWorldCoordination, WORLD_OPERATION_WAIT, WorldBusy } from '../src/world/shared-coordination.js';
 import { WorldOperationLock } from '../src/world/operation-lock.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { acquireFileLock } from '../src/util/file-lock.js';
@@ -162,3 +163,75 @@ linux('falls back to trying the lock when /proc/locks cannot be read', async () 
   release();
   expect(await other.hasAccess('world')).toBe(false);
 });
+
+// pramana#155 (2026-11-01): publishing a task's resources waited 30 s for its
+// world while another process held it (waking a parked Hetzner machine, or
+// scanning a 1.1-million-file resource: minutes), three times, then stopped
+// the task with "file lock admission timed out" for a person to press Retry.
+function withWait(wait: Partial<typeof WORLD_OPERATION_WAIT>) {
+  const saved = { ...WORLD_OPERATION_WAIT };
+  Object.assign(WORLD_OPERATION_WAIT, wait);
+  return () => Object.assign(WORLD_OPERATION_WAIT, saved);
+}
+function inActivity() {
+  const controller = new AbortController();
+  const heartbeat = vi.fn();
+  const spy = vi.spyOn(Context, 'current').mockImplementation(() => ({ cancellationSignal: controller.signal, heartbeat }) as any);
+  return { controller, heartbeat, restore: () => spy.mockRestore() };
+}
+
+linux('lets an activity wait out another process\'s long operation on the world, heartbeating', async () => {
+  const restore = withWait({ activityMs: 20_000, requestMs: 500, roundMs: 300 });
+  const activity = inActivity();
+  try {
+    const dir = directory();
+    const owner = await childOwner(dir, 'operation');
+    let entered = false;
+    const waiting = new SharedWorldCoordination(dir).operation('world', async () => { entered = true; });
+    // Well past what a request would wait, the activity is still waiting, and alive.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    expect(entered).toBe(false);
+    expect(activity.heartbeat).toHaveBeenCalled();
+    const closed = once(owner, 'close');
+    owner.kill('SIGKILL');
+    await closed;
+    await waiting;
+    expect(entered).toBe(true);
+  } finally { activity.restore(); restore(); }
+}, 30_000);
+
+linux('calls the world busy, as infrastructure, when the other operation outlasts the wait', async () => {
+  const restore = withWait({ activityMs: 1_000, requestMs: 400, roundMs: 300 });
+  try {
+    const dir = directory();
+    await childOwner(dir, 'operation');
+    // A console request answers soon.
+    const request = await new SharedWorldCoordination(dir).operation('world', async () => 'ran').catch((error) => error);
+    expect(request).toBeInstanceOf(WorldBusy);
+    expect(request.status).toBe(503);
+    expect(request.message).toMatch(/^This task's computer was busy with another operation/);
+    // An activity waits longer, then says the same.
+    const activity = inActivity();
+    try {
+      const started = Date.now();
+      const failure = await new SharedWorldCoordination(dir).operation('world', async () => 'ran').catch((error) => error);
+      expect(failure).toBeInstanceOf(WorldBusy);
+      expect(Date.now() - started).toBeGreaterThanOrEqual(900);
+    } finally { activity.restore(); }
+  } finally { restore(); }
+}, 30_000);
+
+linux('stops waiting when its activity is cancelled', async () => {
+  const restore = withWait({ activityMs: 20_000, roundMs: 300 });
+  const activity = inActivity();
+  try {
+    const dir = directory();
+    await childOwner(dir, 'operation');
+    const waiting = new SharedWorldCoordination(dir).operation('world', async () => 'ran').catch((error) => error);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    activity.controller.abort(new Error('cancelled'));
+    const result = await waiting;
+    expect(result).toBeInstanceOf(Error);
+    expect(result.message).toBe('cancelled');
+  } finally { activity.restore(); restore(); }
+}, 30_000);

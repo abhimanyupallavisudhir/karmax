@@ -5,6 +5,7 @@ import { ApplicationFailure } from '@temporalio/common';
 import { ProviderCapacityFull } from '../src/agent/limits.js';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
+import { WorldBusy } from '../src/world/shared-coordination.js';
 import { WorldAccessService } from '../src/world/access.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { makeCoreActivities } from '../src/activities/core.js';
@@ -458,6 +459,28 @@ describe('resource work on a world the provider cannot start', () => {
       expect(failed).toBeInstanceOf(ApplicationFailure);
       expect(failed).toMatchObject({ type: 'world-capacity', nonRetryable: true });
       expect((failed as Error).message).toContain('limit on public IP addresses is full');
+    }
+    await store.close();
+  });
+});
+
+// pramana#155 (2026-11-01): publishing waited for a world another process held
+// (waking or parking it, scanning a huge resource), timed out, and stopped the
+// task for a person ("file lock admission timed out").
+describe('resource work on a world another operation keeps busy', () => {
+  it('is infrastructure to wait out, in its own words', async () => {
+    const store = await Store.create(':memory:');
+    const busy = () => new WorldBusy(20 * 60_000);
+    const resources = { settleReview: async () => { throw busy(); }, takeDeliveries: async () => { throw busy(); },
+      integratePublished: async () => { throw busy(); }, stageCandidates: async () => { throw busy(); } };
+    const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock'), resources: resources as any });
+    for (const run of [() => core.settleResourceReview('task'), () => core.refreshResourceForks('task'),
+      () => core.integratePublishedResources('task'), () => core.stageResourceCandidates('task')]) {
+      const failed = await run().then(() => undefined, (error: unknown) => error);
+      expect(failed).toBeInstanceOf(ApplicationFailure);
+      expect(failed).toMatchObject({ type: 'world-infra', nonRetryable: false });
+      expect((failed as Error).message).toBe("This task's computer was busy with another operation (starting, saving or parking it) for 20 minutes");
     }
     await store.close();
   });

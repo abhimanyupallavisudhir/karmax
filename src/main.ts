@@ -152,7 +152,12 @@ async function main() {
   // retains karmax's same-address health watcher and restart behavior.
   const serverWatch = server ? watchDevServer(server, { dbFilename: temporalDb, logLevel: 'error' }) : { stop() {} };
 
-  const { client, close: closeClient } = await makeClient(conn);
+  const { client, close: closeClient } = await makeClient(conn).catch((error: unknown) => {
+    // gRPC says only "Failed to connect before the deadline": name the server.
+    throw new Error(`can't reach Temporal at ${conn.address}${externalTemporal
+      ? ' — is it running there? It is the service KARMAX_TEMPORAL_ADDRESS names.'
+      : ''} (${error instanceof Error ? error.message : String(error)})`, { cause: error });
+  });
 
   // ── Core services ──
   const openedStore = (await openStore(path.join(p.state, 'karmax.db'), process.env.KARMAX_DATABASE_URL,

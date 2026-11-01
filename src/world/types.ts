@@ -467,6 +467,9 @@ export interface WorldProvider {
   open(handle: WorldHandle): Promise<World>;
   /** Release metered compute while retaining the world's durable state. */
   park?(handle: WorldHandle): Promise<WorldHandle>;
+  /** Stop the machine of a world recorded as parked that runs anyway,
+   * whatever this process last knew of it (the lifecycle sweep's check). */
+  stopStray?(handle: WorldHandle): Promise<void>;
   /** Delete through the control plane without resuming the sandbox. */
   destroy?(handle: WorldHandle): Promise<void>;
   status?(handle: WorldHandle): Promise<WorldLifecycleState>;
