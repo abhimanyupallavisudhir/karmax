@@ -7030,9 +7030,13 @@ function storeActionHtml(item, projectId) {
 // A store task's own form: /<org>/<project>/store/<id>.
 function storeTaskRoute(projectId, id) { return `${projectBase(projectId)}/store/${encodeURIComponent(id)}`; }
 // On the organization home a store task asks which project it is for: the
-// row's state and actions there would be about a project nobody chose.
+// row's state and actions there would be about a project nobody chose. With
+// one project there is nobody to ask, so it shows that project's.
+function storeAsksProject() {
+  return S.tab === 'home' && (S.projects || []).filter((project) => project.organizationId === S.organizationId).length > 1;
+}
 function storeRowHtml(item) {
-  const home = S.tab === 'home';
+  const home = storeAsksProject();
   const projectId = storeProjectId();
   const installed = !home && item.repeatable ? item.installed?.length || 0 : 0;
   const need = home ? null : storeNeed(item);
@@ -7043,9 +7047,9 @@ function storeRowHtml(item) {
   return `<div class="task-row store-row has-row-link" data-store-task="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(item.name)}">
       <div class="task-main">
         <div class="task-title">${esc(item.name)} ${item.summary ? policyTip(item.summary) : ''}</div>
-        ${installed || need ? `<div class="task-sub">${installed ? `<span class="chip">${installed > 1 ? `${installed} installed` : 'Installed'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>` : ''}
+        ${need ? `<div class="task-sub"><span>${esc(need[0])}</span></div>` : ''}
       </div>
-      <div class="task-right">${action}</div>
+      <div class="task-right">${installed ? `<span class="store-installed">✓ ${installed > 1 ? `${installed} installed` : 'Installed'}</span>` : ''}${action}</div>
       ${link}
     </div>`;
 }
@@ -7072,6 +7076,10 @@ async function applyStoreTaskRoute(projectId, id, routeIsCurrent) {
   carriedStoreForm = null;
   openTaskForm(item.task.workflow || NEW_TASK_WORKFLOW, undefined, '',
     carried || { ...item.task.params, prompt: item.task.prompt, template: item.id }, { projectId, store: item });
+}
+// A series' newest run (null when it has none, or they cannot be read).
+function newestRun(seriesId) {
+  return api(`/api/tasks/${seriesId}/runs`).then((runs) => runs.reduce((a, b) => (b.createdAt > (a?.createdAt ?? 0) ? b : a), null)).catch(() => null);
 }
 function storeBackRoute() { return S.returnRoute || listRoute(projectBase(S.projectId), STORE_VIEW_QUERY); }
 function closeStoreTask() {
@@ -7204,7 +7212,10 @@ function wireTaskStore() {
       const task = await api(`/api/projects/${encodeURIComponent(projectId)}/task-store/${encodeURIComponent(button.dataset.storeRun)}`, { method: 'POST', body: '{}' });
       await loadTaskStore(projectId, { force: true });
       refreshTasks();
-      if (item?.repeatable) { toast('Installed'); renderMain(); }
+      // One that starts its first run when installed shows that run, as Run does.
+      const run = item?.runOnInstall ? await newestRun(task.id) : null;
+      if (run) { toast('Installed'); go(taskUrl(run.id, run)); }
+      else if (item?.repeatable) { toast('Installed'); renderMain(); }
       else go(taskUrl(task.id, task));
     } catch (e) { button.disabled = false; showTaskError(e, projectId); }
   }));
@@ -9939,9 +9950,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       }
       succeeded = true;
       // Running a repeatable task starts a new task, its run: name it and go
-      // there, so it is never mistaken for this one (#616/#617).
-      const run = !editInPlace && !draftMode && st.body.repeatable && !st.body.triggers?.length && primaryId
-        ? await api(`/api/tasks/${primaryId}/runs`).then((runs) => runs.reduce((a, b) => (b.createdAt > (a?.createdAt ?? 0) ? b : a), null)).catch(() => null)
+      // there, so it is never mistaken for this one (#616/#617). So does
+      // installing a store task that runs when installed.
+      const run = !editInPlace && !draftMode && st.body.repeatable && (!st.body.triggers?.length || store?.runOnInstall) && primaryId
+        ? await newestRun(primaryId)
         : null;
       releaseFormKeys();
       root.innerHTML = '';

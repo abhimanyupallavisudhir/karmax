@@ -3553,6 +3553,7 @@ export class Gateway {
           if (callerIdentity.humanSubject) (await store.setProjectMembership(project.id,
             { kind: 'user', userId: callerIdentity.humanSubject.userId }, 'owner'));
           await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
+          await this.installDefaultTasks(project);
           return this.json(res, 200, project);
         }
       }
@@ -4070,6 +4071,7 @@ export class Gateway {
           (await store.setProjectMembership(project.id,
             { kind: 'user', userId: callerIdentity.humanSubject.userId }, 'owner'));
         await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
+        await this.installDefaultTasks(project);
         return this.json(res, 200, project);
       }
       const projectTransfer = p.match(/^\/api\/projects\/([^/]+)\/transfer$/);
@@ -8828,6 +8830,13 @@ export class Gateway {
     if (!this.wikiLocalReady.has(project.id)) return this.ensureProjectWiki(project, userId);
     this.trackWikiWork(this.ensureProjectWiki(project, userId).catch(error =>
       console.warn(`[karmax] could not refresh wiki for ${project.id}:`, error instanceof Error ? error.message : error)));
+  }
+
+  /** What every project comes with from the task store: the repair of failed
+   *  deploys (src/integrations/github-events.ts). The project is made either way. */
+  async installDefaultTasks(project: import('../domain/types.js').Project): Promise<void> {
+    try { await this.githubEvents.ensureRecoveryTask(project.id, project.organizationId ?? 'org_personal'); }
+    catch (error) { console.warn(`[karmax] could not install the repair task in ${project.id}:`, error instanceof Error ? error.message : error); }
   }
 
   private async ensureProjectWiki(project: import('../domain/types.js').Project, userId?: string): Promise<void> {
