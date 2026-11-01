@@ -97,7 +97,9 @@ it('restores a backup over lost state, and the console carries the restored task
     const view = await consoleRequest(operator.context, app!.url, 'GET', `/api/tasks/${created.id}`);
     const events = await consoleRequest(operator.context, app!.url, 'GET', `/api/tasks/${created.id}/events?since=0&limit=300`);
     const tail = (events.events ?? events).slice(-25).map((event: any) => `${event.type}${event.payload?.error ? `: ${event.payload.error}` : ''}`);
-    throw new Error(`${error.message}\nstage ${view.stage}, status ${view.status}, waiting ${JSON.stringify(view.waitingFor)}, landing ${JSON.stringify(view.landing)}\n${tail.join('\n')}`);
+    // Confirm requested but not acted on (CI #2179, #2339, #2406, #2452, #2456): what the app itself logged since.
+    const log = fs.readFileSync(path.join(home, 'main.log'), 'utf8').split('\n').filter((line) => line.trim()).slice(-60).join('\n');
+    throw new Error(`${error.message}\nstage ${view.stage}, status ${view.status}, waiting ${JSON.stringify(view.waitingFor)}, landing ${JSON.stringify(view.landing)}\n${tail.join('\n')}\n--- app log (last 60 lines) ---\n${log}`);
   }));
   await step('open Passwords & payments', () => page.goto(`${app!.url}/personal/settings#settings-payments`));
   await step('the restored vault item is listed', async () => {

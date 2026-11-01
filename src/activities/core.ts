@@ -36,6 +36,7 @@ import { usageAdmissionId as admissionIdFor } from '../domain/turn-admission.js'
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store, type ViewPublicationOrder } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
+import { WorldBusy } from '../world/shared-coordination.js';
 import { World, WorldHandle, WorldKind, WorldSpec, type WorldRepo, worldWorkingDirectory, type WorldDiagnosis } from '../world/types.js';
 import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
@@ -206,6 +207,8 @@ function repositoryAccessFailure(actor: GithubPrActor, slug: string, askedAdmins
  * the workflow waits for a machine instead of asking a person at once
  * (pramana#79: a full Hetzner IP limit escalated a publication). */
 function providerUnavailable(error: unknown): unknown {
+  // Another operation on the same machine (a wake, a park, a large scan) outlasted the wait: it clears by itself.
+  if (error instanceof WorldBusy) return ApplicationFailure.create({ message: error.message, type: 'world-infra', nonRetryable: false, cause: error });
   if (!(error instanceof ProviderOutage)) return error;
   return capacityFailure(error) ?? ApplicationFailure.create({ message: error.message, type: 'world-infra', nonRetryable: false, cause: error });
 }
@@ -1681,6 +1684,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
    * workflow waits it out, then asks a person (pramana#56: Hetzner's full CPU
    * limit reached the workflow as a plain error and failed the task). */
   function worldUnreachable(handle: WorldHandle, error: unknown): unknown {
+    if (error instanceof WorldBusy) return providerUnavailable(error);
     if (error instanceof ApplicationFailure || !isRemote(handle.kind) || !isTransportError(error)) return error;
     const full = capacityFailure(error);
     if (full) return full;
