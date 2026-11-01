@@ -13,6 +13,7 @@ import { deleteItemConnectorWrites } from './connector-writes.js';
 import { Capability, allows } from '../platform/capabilities.js';
 import { newId } from '../util/id.js';
 import type { Urgency } from '../domain/types.js';
+import type { Via } from '../platform/sub-task-asks.js';
 import { isEnvName } from '../util/shell.js';
 import { envEntryProblem, type SkippedEnv } from '../util/work-env.js';
 import { parseSavedSession, sessionDomainError } from './browser-session.js';
@@ -163,6 +164,11 @@ export interface CredentialAccessRequest {
   resolution?: { action: 'once' | 'task' | 'always' | 'deny'; by: string; at: number };
   /** Ignored by a person: it no longer notifies anyone, but stays pending. */
   dismissed?: { by: string; at: number };
+  /** Whom it asks, when its parent named them (sub-task-asks.ts); absent ⇒
+   * the task's creator and the organization's owners. */
+  audience?: string[];
+  /** A sub-task's request: the parent it came through, and its agent's note. */
+  via?: Via;
   createdAt: number;
   /** Human-facing task metadata added by the gateway; never persisted in the
    * organization-scoped request record. */
@@ -923,7 +929,9 @@ export class VaultItems {
    * (no matching item; parked with the domain so the human can add one or say
    * "create it yourself") | denied (hard policy no).
    */
-  async request(args: { taskId: string; projectId?: string; caps: Capability[]; itemId?: string; domain?: string; field?: VaultFieldName; mode?: AccessMode; kind?: 'access' | 'reset'; why?: string; urgency?: Urgency }): Promise<{ status: AccessStatus | 'not_in_vault'; reason?: string; requestId?: string; itemId?: string }> {
+  /** `via`: a sub-task's parent at work, which a new request comes through.
+   * `raised`: this call raised the request (an identical pending one is joined). */
+  async request(args: { taskId: string; projectId?: string; caps: Capability[]; itemId?: string; domain?: string; field?: VaultFieldName; mode?: AccessMode; kind?: 'access' | 'reset'; why?: string; urgency?: Urgency; via?: Via }): Promise<{ status: AccessStatus | 'not_in_vault'; reason?: string; requestId?: string; itemId?: string; raised?: CredentialAccessRequest }> {
     const mode: AccessMode = args.mode === 'reveal' ? 'reveal' : 'use';
     const kind = args.kind === 'reset' ? 'reset' : 'access';
     const item = args.itemId
@@ -935,7 +943,8 @@ export class VaultItems {
       if (!args.itemId && !args.domain) throw new Error('itemId or domain required');
       const parked = (await this.park({ ...args, mode, kind, itemId: undefined, ...(args.itemId ? { name: args.itemId } : {}) }));
       (await this.store.appendAudit({ principalId: `task:${args.taskId}`, action: 'vault.requested', detail: { domain: args.domain, itemId: args.itemId, mode, kind, status: 'not_in_vault' } }));
-      return { status: 'not_in_vault', reason: args.itemId ? `no vault item ${args.itemId}` : `no vault item matches ${args.domain}`, requestId: parked.id };
+      return { status: 'not_in_vault', reason: args.itemId ? `no vault item ${args.itemId}` : `no vault item matches ${args.domain}`, requestId: parked.id,
+        ...(this.raised.has(parked) ? { raised: parked } : {}) };
     }
     // A reset report ALWAYS parks for the human — the whole point is that the
     // stored secret failed, so "granted" access to a wrong password is useless.
@@ -949,7 +958,8 @@ export class VaultItems {
     }
     const parked = (await this.park({ ...args, mode, kind, itemId: item.id }));
     (await this.store.appendAudit({ principalId: `task:${args.taskId}`, action: 'vault.requested', detail: { itemId: item.id, mode, kind, status: 'needs_approval' } }));
-    return { status: 'needs_approval', reason: kind === 'reset' ? `reported invalid: "${item.label}" — the human will update it (or send a reset code)` : undefined, requestId: parked.id, itemId: item.id };
+    return { status: 'needs_approval', reason: kind === 'reset' ? `reported invalid: "${item.label}" — the human will update it (or send a reset code)` : undefined, requestId: parked.id, itemId: item.id,
+      ...(this.raised.has(parked) ? { raised: parked } : {}) };
   }
 
   /** Park a request, or join the identical one still pending. A new one is
@@ -957,7 +967,7 @@ export class VaultItems {
    * (request_credential, a blocked reveal, fill or session restore): the
    * conversation, the inbox and notifications all learn of it from that event,
    * and a route that forgot to emit it left the ask invisible until a reload. */
-  private async park(args: { taskId: string; projectId?: string; itemId?: string; domain?: string; name?: string; field?: VaultFieldName; mode: AccessMode; kind?: 'access' | 'reset'; why?: string; urgency?: Urgency }): Promise<CredentialAccessRequest> {
+  private async park(args: { taskId: string; projectId?: string; itemId?: string; domain?: string; name?: string; field?: VaultFieldName; mode: AccessMode; kind?: 'access' | 'reset'; why?: string; urgency?: Urgency; via?: Via }): Promise<CredentialAccessRequest> {
     return this.store.transaction(async () => {
     await this.lockVault();
     const all = (await this.requests());
@@ -976,20 +986,50 @@ export class VaultItems {
       mode: args.mode,
       ...(args.kind === 'reset' ? { kind: 'reset' as const } : {}),
       ...(args.why ? { why: args.why } : {}),
+      ...(args.via ? { via: args.via } : {}),
       status: 'pending',
       createdAt: Date.now(),
     };
     (await this.saveRequests([...all, req]));
+    (await this.announce(req, req.createdAt, args.urgency));
+    this.raised.add(req);
+    return req;
+
+    });
+  }
+
+  /** The requests this instance raised (not joined), for `request`'s `raised`. */
+  private raised = new WeakSet<CredentialAccessRequest>();
+
+  /** Tell the request's task of it: the conversation, the inbox and
+   * notifications all follow this event. */
+  private async announce(req: CredentialAccessRequest, ts: number, urgency?: Urgency): Promise<void> {
     // A task of another tenant never hears of this organization's requests.
     if (this.store.appendEvent && (await this.store.taskAttribution?.(req.taskId))?.organizationId === this.organizationId)
-      (await this.store.appendEvent({ taskId: req.taskId, type: 'credential.approval-requested', ts: req.createdAt, payload: {
+      (await this.store.appendEvent({ taskId: req.taskId, type: 'credential.approval-requested', ts, payload: {
         requestId: req.id, status: 'approval-needed', mode: req.mode, kind: req.kind ?? 'access',
         ...(req.itemId ? { itemId: req.itemId } : {}), ...(req.domain ? { domain: req.domain } : {}),
         ...(req.name ? { name: req.name } : {}),
-        ...(req.why ? { why: req.why } : {}), ...(args.urgency ? { urgency: args.urgency } : {}),
+        ...(req.why ? { why: req.why } : {}), ...(urgency ? { urgency } : {}),
+        ...(req.audience ? { audience: req.audience } : {}), ...(req.via ? { via: req.via } : {}),
       } }));
-    return req;
+  }
 
+  /** Address a sub-task's pending request to the people its parent named, with
+   * its note (sub-task-asks.ts): announced again, now to them. */
+  async passOn(requestId: string, audience: string[], via: Via): Promise<CredentialAccessRequest> {
+    return this.store.transaction(async () => {
+      await this.lockVault();
+      const all = (await this.requests());
+      const req = all.find((r) => r.id === requestId);
+      if (!req) throw new Error(`no credential request ${requestId}`);
+      if (req.status !== 'pending') throw new Error(`request ${requestId} is already ${req.status}`);
+      req.audience = audience;
+      req.via = via;
+      delete req.dismissed;
+      (await this.saveRequests(all));
+      (await this.announce(req, via.at));
+      return req;
     });
   }
 

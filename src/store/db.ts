@@ -5670,11 +5670,17 @@ export class Store {
       }
     } else if (ev.type === 'credential.approval-requested' || ev.type === 'connection.requested') {
       kind = 'approval-requested'; actionable = true;
-      users = (await this.humanAudience(task.id, ['@creator']));
-      // The creator is the natural first audience, while organization owners
-      // remain a deterministic resolver for automated/delegated tasks.
-      for (const member of (await this.listOrganizationMemberships(project.organizationId)))
-        if (member.role === 'owner') users.push(member.userId);
+      if (Array.isArray(ev.payload.audience)) {
+        // Whom it asks: a sub-task's parent (`task:<id>`, its agent is told,
+        // no person is) or the people the parent passed it on to.
+        users = (await this.humanAudience(task.id, ev.payload.audience.map(String)));
+      } else {
+        users = (await this.humanAudience(task.id, ['@creator']));
+        // The creator is the natural first audience, while organization owners
+        // remain a deterministic resolver for automated/delegated tasks.
+        for (const member of (await this.listOrganizationMemberships(project.organizationId)))
+          if (member.role === 'owner') users.push(member.userId);
+      }
     } else if (ev.type === 'permission.approval-requested' || ev.type === 'authorization.approval-requested'
       || ev.type === 'repository-access.approval-requested') {
       kind = 'approval-requested'; actionable = true;
@@ -5690,7 +5696,8 @@ export class Store {
         : [];
       // An ask that resolves to nobody still reaches someone who can act.
       if (!users.length) users = (await this.escalationAudience(task));
-    } else if (ev.type === 'view.updated' && (ev.payload.waitingFor === 'human' || escalated)) {
+    } else if (ev.type === 'view.updated' && (ev.payload.waitingFor === 'human' || escalated && ev.payload.waitingFor !== 'parent')) {
+      // (A sub-task escalated to its parent asks its parent's agent, not people.)
       // The lifecycle states that are an ask: the task is parked ON a human.
       // While an approval is outstanding that approval IS the ask, and it was
       // already routed to exactly the people who can answer it.
@@ -5770,7 +5777,8 @@ export class Store {
       WHERE COALESCE(json_extract(lastView, '$.status'), 'setup') NOT IN ('done', 'failed', 'cancelled'))`, []));
     dropped += (await this.deleteInbox(`kind IN ('review-requested', 'escalated') AND taskId IN (SELECT id FROM tasks
       WHERE COALESCE(json_extract(lastView, '$.waitingFor.kind'), '') <> 'human'
-        AND COALESCE(json_extract(lastView, '$.stage'), '') <> 'escalated')`, []));
+        AND (COALESCE(json_extract(lastView, '$.stage'), '') <> 'escalated'
+          OR COALESCE(json_extract(lastView, '$.waitingFor.kind'), '') = 'parent'))`, []));
     if ((await this.db.prepare("SELECT 1 FROM inbox WHERE kind='approval-requested' LIMIT 1").get())) {
       dropped += (await this.deleteInbox(`subject IS NULL AND kind='approval-requested' AND taskId NOT IN (
         SELECT e.taskId FROM events e
@@ -5789,6 +5797,7 @@ export class Store {
   private async backfillEscalations(): Promise<void> {
     const rows = (await this.db.prepare(`SELECT id FROM tasks WHERE json_extract(lastView, '$.stage')='escalated'
       AND COALESCE(json_extract(lastView, '$.status'), '') NOT IN ('done', 'failed', 'cancelled')
+      AND COALESCE(json_extract(lastView, '$.waitingFor.kind'), '') <> 'parent'
       AND id NOT IN (SELECT taskId FROM inbox WHERE actionable=1)`).all()) as Array<{ id: string }>;
     for (const row of rows) {
       const task = (await this.getTaskShallow(String(row.id)));

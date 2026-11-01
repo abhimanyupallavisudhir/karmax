@@ -42,7 +42,8 @@ describe('credential approval requests are announced however they are raised', (
       bus.onTask(task.id, (event) => { heard.push(event as any); });
       const tokens = new TokenAuthority(store);
       const gateway = await Gateway.create({ store, broker, bus, tokens,
-        contributions: new ContributionRegistry(), overlays: new Overlays(), client: {} as any, api: {} as any,
+        contributions: new ContributionRegistry(), overlays: new Overlays(), client: {} as any,
+        api: { viaParent: async () => undefined, tellParentOf: async () => undefined } as any,
         taskQueue: 'test', staticDir: home, agentInfo: { provider: 'mock', reason: 'announcement test' }, worlds: new WorldRegistry(),
       } as any);
       const running = await gateway.listen(await findFreePortFrom(48_700));

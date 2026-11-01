@@ -28,6 +28,7 @@ import { publicModelFetch, publicUrl } from '../mcp/connections/http.js';
 import { sharingPolicy, currentShare, createShare, revokeShare, publicShare, publicConversationHtml } from './conversation-sharing.js';
 import http from 'node:http';
 import { ServiceConnections, ConnectionError } from '../integrations/service-connections.js';
+import { OPEN_CONNECTION } from '../integrations/connection-requests.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -319,7 +320,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // need only credential:read — the per-item grant + policy check happens in
   // the handler against the caller's own capability set.
   if (p === '/api/vault/store' || p === '/api/vault/passkey/save' || p === '/api/vault/session/save') return 'vault:store';
-  if (/^\/api\/vault\/requests\/[^/]+\/resolve$/.test(p)) return 'credential:write';
+  // Deciding a credential request is credential:write, checked in the handler,
+  // which also lets a sub-task's parent decline one (src/platform/sub-task-asks.ts).
+  if (/^\/api\/vault\/requests\/[^/]+\/resolve$/.test(p)) return 'credential:read';
   if (p === '/api/vault/import/bitwarden') return 'credential:write';
   if (p.startsWith('/api/vault/items')) return read ? 'credential:read' : 'credential:write';
   // Connectors: describe is read; connect/sync/config/write-back are admin.
@@ -7130,19 +7133,22 @@ export class Gateway {
           if (p === '/api/connections/request' && method === 'POST') {
             if (!callerTaskId || !task) return this.json(res, 400, { error: 'A task-agent token is required' });
             const why = String(b.why ?? '');
+            const opened = new Set((await service.pending(task.id)).map((pending) => pending.id));
             let c;
             if (typeof b.mcp === 'string' && b.mcp.trim()) {
               const server = await service.resolveMcp(b.mcp);
               const available = (await service.list(org, { taskId, projectId })).find(c => c.mcp?.url === server.transport.url && c.status === 'active');
               if (available) return this.json(res, 200, { status: 'connected', connection: available });
-              c = (await service.requestMcp(org, server, task.id, authRecord.role ?? 'do', why));
+              c = (await service.requestMcp(org, server, task.id, authRecord.role ?? 'do', why, await api.viaParent(task.id)));
             } else {
               const toolkit = String(b.toolkit ?? '');
               if (!toolkit) return this.json(res, 400, { error: 'Pass mcp (an MCP Registry name or HTTPS URL) or a Composio toolkit' });
               const available = (await service.list(org, { taskId, projectId })).find(c => !c.mcp && c.toolkit === toolkit && c.status === 'active');
               if (available) return this.json(res, 200, { status: 'connected', connection: available });
-              c = (await service.request(org, toolkit, task.id, authRecord.role ?? 'do', why));
+              c = (await service.request(org, toolkit, task.id, authRecord.role ?? 'do', why, await api.viaParent(task.id)));
             }
+            // A sub-task's new request comes through its parent, whose agent is told (src/platform/sub-task-asks.ts).
+            if (c.via && c.status === 'requested' && c.taskId === task.id && !opened.has(c.id)) await api.tellParentOf(task.id, { connection: c });
             return this.json(res, 200, { status: c.status === 'denied' || c.status === 'disconnected' ? 'denied' : 'needs_connection',
               connection: service.view(c), detail: 'A Connect button is available in this task’s Approval Requests. Continue independent work; the task resumes after sign-in.' });
           }
@@ -7181,6 +7187,10 @@ export class Gateway {
                   return this.json(res, 400, { error: 'arguments must be an object' });
                 return this.json(res, 200, await withTiming(trace, () => trace.measure('service.execution', () => service.execute(org, id, callerTaskId, projectId, String(b.tool ?? ''), b.arguments), undefined, undefined, toolFailed)));
               }
+            } else if (callerTaskId && action === 'disconnect' && method === 'POST' && !c.ownerId && c.taskId
+              && OPEN_CONNECTION.includes(c.status) && (await store.getTask(c.taskId))?.parentTaskId === callerTaskId) {
+              // A sub-task's request is its parent's to decline (src/platform/sub-task-asks.ts).
+              return this.json(res, 200, await service.disconnect(org, id, `task:${callerTaskId}`));
             } else {
               const userId = requireOwner();
               if (callerTaskId || (c.ownerId !== userId && !(['disconnect', 'dismiss'].includes(action) && !c.ownerId && c.taskId && (await this.deps.tokens.check(token, 'task:edit', { projectId: (await store.getTask(c.taskId))?.projectId, organizationId: org })).ok))) return this.json(res, 403, { error: 'Only the connection owner can manage this account' });
@@ -7542,7 +7552,7 @@ export class Gateway {
           const b = await this.body(req);
           if (!callerTaskId) return this.json(res, 400, { error: 'a task-agent token is required to request credential access' });
           // The vault announces a new request on the task itself.
-          const decision = (await vault.request({
+          const decision = (await this.requestCredential(vault, {
             taskId: callerTaskId,
             projectId: authRecord?.projectId,
             caps,
@@ -7561,6 +7571,13 @@ export class Gateway {
           const b = await this.body(req);
           const action = String(b.action ?? '');
           if (!['once', 'task', 'always', 'deny', 'dismiss'].includes(action)) return this.json(res, 400, { error: 'action must be once | task | always | deny | dismiss' });
+          const unwritable = (await this.refusal(token, 'credential:write', requestedScope));
+          if (unwritable) {
+            const asking = (await vault.requests()).find((candidate) => candidate.id === vres[1]);
+            const parentDeclines = action === 'deny' && !!callerTaskId && !!asking
+              && (await store.getTask(asking.taskId))?.parentTaskId === callerTaskId;
+            if (!parentDeclines) return this.json(res, 403, { error: unwritable });
+          }
           if (action === 'dismiss') {
             // Silencing an ask is for whoever it would notify, never the agent asking.
             const request = (await vault.requests()).find((candidate) => candidate.id === vres[1]);
@@ -9819,12 +9836,23 @@ export class Gateway {
   ): Promise<Record<string, unknown>> {
     const base: Record<string, unknown> = { ...decision, itemId: ctx.item.id };
     if (decision.status !== 'needs_approval' || !ctx.taskId) return base;
-    const raised = (await vault.request({
+    const raised = (await this.requestCredential(vault, {
       taskId: ctx.taskId, projectId: ctx.projectId, caps: ctx.caps,
       itemId: ctx.item.id, field: ctx.field as VaultFieldName | undefined, mode: ctx.mode,
       why: ctx.why != null ? String(ctx.why) : undefined,
     }));
     return raised.requestId ? { ...base, requestId: raised.requestId } : base;
+  }
+
+  /** Every credential request an agent raises: a sub-task's comes through its
+   * parent, whose agent is told (src/platform/sub-task-asks.ts). */
+  private async requestCredential(vault: VaultItems, args: Parameters<VaultItems['request']>[0] & { taskId: string }) {
+    const { raised, ...decision } = (await vault.request({ ...args, via: await this.deps.api.viaParent(args.taskId) }));
+    if (raised?.via) {
+      const item = raised.itemId ? await vault.get(raised.itemId) : undefined;
+      await this.deps.api.tellParentOf(args.taskId, { credential: raised, label: item?.label ?? raised.domain ?? raised.name ?? 'credential' });
+    }
+    return decision;
   }
 
   /**

@@ -21287,6 +21287,7 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
             ${request.dismissed ? ignoredChip() : ''}
           </div>
           ${requestReasonLine(request, request.why, inTask)}
+          ${subTaskAskLine(request)}
           ${request.kind === 'reset' ? `<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; ${siteNameMarkup()} will resume the agent automatically.</div>`
             : request.mode === 'reveal' ? `<div class="approval-request-warn">The agent will see the plaintext: it travels to the model provider and may end up in training data.</div>`
             : items.find((item) => item.id === request.itemId)?.type === 'passkey' ? '' : `<div class="approval-request-warn caution">Blind use is not foolproof: a misbehaving agent can still leak it, e.g. by entering it on a malicious site.</div>`}
@@ -21340,6 +21341,7 @@ function permissionRequestRows(requests, { historyLimit = 20, inTask = false } =
         `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
       ${request.projectIds?.length ? `<div class="approval-request-projects">Add projects: ${request.projectIds.map((id) => `<span class="chip mono">${esc(projectById(id)?.name || id)}</span>`).join(' ')}</div>` : ''}
       ${requestReasonLine(request, request.reason, inTask)}
+      ${subTaskAskLine(request)}
       <div class="approval-request-help">Requested from ${request.audience.map((selector) => {
         const grantor = selector.startsWith('task:') ? (request.grantorTasks || []).find((task) => task.id === selector.slice(5)) : undefined;
         return grantor ? credentialRequestTaskLink({ taskId: grantor.id, task: grantor }) : esc(selector);
@@ -21570,6 +21572,7 @@ function connectionRows(connections, inTask = false) {
     return `<div class="approval-request${open && c.dismissed ? ' approval-request-dismissed' : ''}" data-connection="${esc(c.id)}">
       <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span>${open && c.dismissed ? ` ${ignoredChip()}` : ''}</div>
         ${c.why && inTask ? `<p class="task-sub">${esc(c.why)}</p>` : ''}
+        ${open ? subTaskAskLine(c) : ''}
         <p class="task-sub">${c.taskId ? 'This account may be used by the requesting task.' : 'Private until you share it with a project.'}</p>
         ${own && !inTask ? `<details data-unsaved><summary>Project access</summary><p class="task-sub">Selected projects may run app actions using this account, within the permissions you granted at sign-in.</p>
           ${projects.map(p => `<label class="connection-project"><input type="checkbox" value="${esc(p.id)}" ${c.projectIds.includes(p.id) ? 'checked' : ''}> ${esc(p.name)}</label>`).join('')}
@@ -21585,6 +21588,13 @@ function connectionRows(connections, inTask = false) {
         ${canConnect && inTask && open && !c.dismissed ? ignoreRequestButton('data-connection-action') : ''}
       </div></div>`;
   }).join('');
+}
+
+// A sub-task's request comes via its parent, the task people know: name it,
+// with the note its agent added — the context they otherwise lack.
+function subTaskAskLine(request) {
+  if (!request.via?.taskId) return '';
+  return `<div class="approval-request-help">Via ${credentialRequestTaskLink({ taskId: request.via.taskId })}${request.via.note ? `: ${esc(request.via.note)}` : ''}</div>`;
 }
 
 // Ignoring a request silences it — no inbox row, alert or "approval needed"

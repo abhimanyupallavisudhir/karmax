@@ -35,7 +35,7 @@ describe('credential selection ranking through HTTP', () => {
       for (let i = 0; i < 5; i++) await vault.resolveField(accessed, 'password', { mode: 'use' });
       const tokens = new TokenAuthority();
       const gateway = await Gateway.create({ store, broker, bus: new KarmaxBus(), tokens,
-        contributions: new ContributionRegistry(), overlays: new Overlays(), client: {} as any, api: {} as any,
+        contributions: new ContributionRegistry(), overlays: new Overlays(), client: {} as any, api: { viaParent: async () => undefined, tellParentOf: async () => undefined } as any,
         taskQueue: 'test', staticDir: home, agentInfo: { provider: 'mock', reason: 'selection test' }, worlds: new WorldRegistry(),
       } as any);
       const running = await gateway.listen(await findFreePortFrom(48_400));

@@ -2,6 +2,7 @@ import type { AuthorizationSelection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
 import { CAPABILITIES, type Capability } from './capabilities.js';
+import type { Via } from './sub-task-asks.js';
 
 export interface PermissionRequest {
   id: string;
@@ -20,8 +21,11 @@ export interface PermissionRequest {
   /** Avatar principals selected at request time. Kept separate from human ids
    * so the inbox never attempts to materialize an Avatar as a user. */
   avatarRecipients?: string[];
-  /** Tasks the requester acts for that hold what it asks: their agents decide. */
+  /** Tasks the requester acts for that hold what it asks: their agents decide.
+   * A sub-task's parent that does not is one too, to decline it. */
   taskRecipients?: string[];
+  /** A sub-task's request: the parent it came through, and its agent's note. */
+  via?: Via;
   reason: string;
   requestedBy: string;
   status: 'pending' | 'granted' | 'denied' | 'withdrawn';
@@ -179,6 +183,7 @@ export class PermissionRequests {
     recipients: string[];
     avatarRecipients?: string[];
     taskRecipients?: string[];
+    via?: Via;
     reason: string;
     requestedBy: string;
   }): Promise<PermissionRequest> {
@@ -220,6 +225,7 @@ export class PermissionRequests {
       recipients,
       ...(avatarRecipients.length ? { avatarRecipients } : {}),
       ...(taskRecipients.length ? { taskRecipients } : {}),
+      ...(input.via ? { via: input.via } : {}),
       reason,
       requestedBy: input.requestedBy,
       status: 'pending',
@@ -265,6 +271,27 @@ export class PermissionRequests {
     }));
     return request;
 
+    });
+  }
+
+  /** Address a sub-task's request to the people (and Avatārs) its parent
+   * named, with its note (sub-task-asks.ts). The parent stays a recipient: it
+   * may still decline it, or grant it once it holds it itself. */
+  async passOn(id: string, input: { audience: string[]; recipients: string[]; avatarRecipients: string[]; via: Via }): Promise<PermissionRequest> {
+    return this.store.transaction(async () => {
+      const request = (await this.lockedRequest(id));
+      if (!request) throw new Error(`no permission request ${id}`);
+      if (request.status !== 'pending') throw new Error(`request ${id} is already ${request.status}`);
+      if (!input.recipients.length && !input.avatarRecipients.length) throw new Error('choose at least one person, team, or Avatar');
+      request.audience = [...new Set([...request.audience, ...input.audience])];
+      request.recipients = [...new Set(input.recipients)];
+      request.avatarRecipients = [...new Set(input.avatarRecipients)];
+      request.via = input.via;
+      delete request.dismissed;
+      (await this.save(request));
+      (await this.store.appendAudit({ principalId: `task:${input.via.taskId}`, action: 'permission.request.passed-on',
+        scopeKey: `project:${request.projectId}`, detail: { requestId: id, audience: input.audience, recipients: request.recipients } }));
+      return request;
     });
   }
 

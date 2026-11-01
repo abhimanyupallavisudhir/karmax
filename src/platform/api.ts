@@ -90,7 +90,9 @@ import { enrollWorldRepositories } from '../world/repository-enrollment.js';
 import { ensureTaskBranchAncestry } from '../world/task-branch.js';
 import type { WorldAccessService } from '../world/access.js';
 import type { RunnerPoolService } from '../world/runners.js';
-import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
+import { VaultItems, type CredentialAccessRequest, type VaultItemPolicy, type VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
+import { connectionRequestsVia, passOnConnectionRequest } from '../integrations/connection-requests.js';
+import type { ServiceConnection } from '../integrations/service-connections.js';
 import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { avatarAllows, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled, avatarPrincipal, avatarRoleOf, forkedAvatar,
   normalizeAvatarSetting, AVATAR_ROLE_LABELS, type AvatarRole } from './avatars.js';
@@ -108,6 +110,7 @@ import type { GithubActionsStatus, GithubActionsInspectOptions } from '../integr
 import { BRAND } from '../domain/brand.js';
 import { withPullRequestStates } from '../integrations/github-pr.js';
 import { canMergeAll, mergeCapableUsers } from '../integrations/github-merge-rights.js';
+import { throughYouText, viaParent, type Via } from './sub-task-asks.js';
 
 export { CapabilityError, NotFoundError, ValidationError } from './errors.js';
 
@@ -4587,7 +4590,10 @@ export class KarmaxApi {
     // historical lifecycle move that stops the work and holds for input.
     const waitingOn = view.waitingFor?.kind;
     const redirect = this.sharedConversation(task) && (waitingOn === 'human' || waitingOn === 'parent' || waitingOn === 'responder');
-    if (!redirect && !(await this.availableStageTransitions(task, view)).some((move) => move.target === 'human'))
+    // A parent adding its note to its sub-task's requests through it: they go
+    // to these people with it, and a sub-task still at work keeps working.
+    const passing = caller.taskId !== '*' && caller.taskId !== taskId ? await this.subTaskAsks(task, caller.taskId) : undefined;
+    if (!redirect && !passing?.count && !(await this.availableStageTransitions(task, view)).some((move) => move.target === 'human'))
       throw new Error(`cannot request human input from ${stageName(view.stage)}`);
 
     const audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
@@ -4611,6 +4617,10 @@ export class KarmaxApi {
     if ([...detail].length > 4_000) throw new Error('message must be at most 4000 characters');
 
     let held: TaskView;
+    if (!redirect && passing?.count) {
+      await this.passOnSubTaskAsks(token, task, passing, audience, { taskId: caller.taskId, note: detail, at: Date.now() });
+      return { ...view, note: `Passed ${passing.count === 1 ? 'its request' : `its ${passing.count} requests`} on to ${audience.join(', ')}.` } as TaskView;
+    }
     if (redirect) {
       await (await this.workflowHandle(taskId)).signal('reroute', { audience: audience.filter((selector) => !selector.startsWith('avatar:')).length
         ? audience : [...audience, '@creator'], detail });
@@ -4638,6 +4648,8 @@ export class KarmaxApi {
     };
     const seq = (await this.deps.store.appendEvent(event));
     this.deps.bus?.emit({ ...event, seq });
+    // After the escalation, so its approvals are the people's ask (one actionable row per task).
+    if (passing?.count) await this.passOnSubTaskAsks(token, task, passing, audience, { taskId: caller.taskId, note: detail, at: Date.now() });
     if (task.parentTaskId && caller.taskId === taskId) await this.noteInParent(task, audience, detail);
     for (const avatar of avatarRecipients) {
       await this.callAvatar(token, avatar, 'responder', `${avatar.name}: respond to task #${task.num ?? task.id}`,
@@ -4726,6 +4738,10 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
       projectIds.length ? capabilities : missing, projectIds, baseAuthorization);
     // No audience: the nearest who can grant it (permissionGrantors), else the creator.
     if (!audience.length) audience = [grantors.default ?? '@creator'];
+    // A sub-task's parent at work that cannot grant it either: it comes through
+    // the parent, whose agent may decline it (sub-task-asks.ts).
+    const parentVia = await viaParent(this.deps.store, task);
+    const via = parentVia && !grantors.tasks.some((grantor) => grantor.taskId === parentVia.taskId) ? parentVia : undefined;
     if (audience.length > 32) throw new Error('at most 32 audience selectors may be used');
     const recipients = new Set<string>();
     const avatarRecipients = new Set<string>();
@@ -4760,7 +4776,8 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
       audience,
       recipients: [...recipients],
       avatarRecipients: [...avatarRecipients],
-      taskRecipients: [...taskRecipients],
+      taskRecipients: [...taskRecipients, ...(via ? [via.taskId] : [])],
+      ...(via ? { via } : {}),
       reason: args.reason,
       requestedBy: `task-agent:${task.id}:${caller.profileId}`,
     }));
@@ -4778,6 +4795,7 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
           recipients: request.recipients,
           avatarRecipients: request.avatarRecipients,
           taskRecipients: request.taskRecipients,
+          ...(request.via ? { via: request.via } : {}),
           reason: request.reason,
           requestedBy: request.requestedBy,
           // An approval blocks the agent on a person, so it is high by default —
@@ -4799,17 +4817,8 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
         });
       }
       for (const grantorId of taskRecipients) await this.askTaskToGrant(grantorId, task, request, project.organizationId);
-      for (const avatarId of avatarRecipients) {
-        const avatar = (await this.deps.store.getAvatar(avatarId))!;
-        await this.callAvatar(token, avatar, 'confirm', `${avatar.name}: decide permission request`,
-          `Decide whether to approve or deny permission request ${request.id} for task #${task.num ?? task.id}.
-
-Requested capabilities: ${request.capabilities.join(', ')}
-${request.projectIds?.length ? `Add projects to the task's ${request.baseAuthorization?.level} authorization (existing permissions apply there too): ${request.projectIds.join(', ')}\n` : ''}${untrustedBlock('reason from the requesting agent', request.reason)}
-
-Resolve the request exactly once by calling platform_request with POST /api/permission-requests/${request.id}/resolve?organizationId=${project.organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
-          { taskId: task.id, type: 'avatar.authorization-dispatch-failed', payload: { requestId: request.id, avatarId } });
-      }
+      if (request.via) await this.tellParentOf(task.id, { permission: request, organizationId: project.organizationId });
+      await this.askAvatarsToDecide(token, task, request, project.organizationId, [...avatarRecipients]);
     }
     return {
       status: 'needs_approval',
@@ -4821,26 +4830,113 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     };
   }
 
+  /** Call each Avatār to decide a permission request. */
+  private async askAvatarsToDecide(token: string, task: TaskRecord, request: PermissionRequest, organizationId: string, avatarIds: string[]) {
+    for (const avatarId of avatarIds) {
+      const avatar = (await this.deps.store.getAvatar(avatarId))!;
+      await this.callAvatar(token, avatar, 'confirm', `${avatar.name}: decide permission request`,
+        `Decide whether to approve or deny permission request ${request.id} for task #${task.num ?? task.id}.
+
+Requested capabilities: ${request.capabilities.join(', ')}
+${request.projectIds?.length ? `Add projects to the task's ${request.baseAuthorization?.level} authorization (existing permissions apply there too): ${request.projectIds.join(', ')}\n` : ''}${untrustedBlock('reason from the requesting agent', request.reason)}
+${request.via?.note ? `${untrustedBlock(`note from task ${request.via.taskId}, which it came through`, request.via.note)}\n` : ''}
+Resolve the request exactly once by calling platform_request with POST /api/permission-requests/${request.id}/resolve?organizationId=${organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
+        { taskId: task.id, type: 'avatar.authorization-dispatch-failed', payload: { requestId: request.id, avatarId } });
+    }
+  }
+
+  /** A sub-task's requests through its parent `parentId` that still wait (sub-task-asks.ts). */
+  private async subTaskAsks(task: TaskRecord, parentId: string) {
+    const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId;
+    if (!organizationId) return undefined;
+    const permissions = (await new PermissionRequests(this.deps.store, organizationId).requests({ taskId: task.id, status: 'pending' }))
+      .filter((request) => request.via?.taskId === parentId);
+    const credentials = (await new VaultItems(this.deps.store, this.deps.broker, undefined, organizationId).requests({ taskId: task.id, status: 'pending' }))
+      .filter((request) => request.via?.taskId === parentId);
+    const connections = await connectionRequestsVia(this.deps.store, task.id, parentId);
+    return { organizationId, permissions, credentials, connections, count: permissions.length + credentials.length + connections.length };
+  }
+
+  /** Address a sub-task's requests through its parent to the people (and, for
+   * permissions, Avatārs) the parent named, with its note. */
+  private async passOnSubTaskAsks(token: string, task: TaskRecord, asks: NonNullable<Awaited<ReturnType<KarmaxApi['subTaskAsks']>>>,
+    audience: string[], via: Via) {
+    const people = audience.filter((selector) => !selector.startsWith('avatar:'));
+    const recipients = people.length ? await this.deps.store.humanAudience(task.id, people) : [];
+    const avatarIds = audience.filter((selector) => selector.startsWith('avatar:')).map((selector) => selector.slice(7));
+    if (!recipients.length && (asks.credentials.length || asks.connections.length))
+      throw new ValidationError('Name the people to pass its requests on to: an Avatār cannot connect an app or approve a credential.');
+    const service = new PermissionRequests(this.deps.store, asks.organizationId);
+    for (const pending of asks.permissions) {
+      const request = await service.passOn(pending.id, { audience, recipients, avatarRecipients: avatarIds, via });
+      const event = { taskId: task.id, type: 'permission.approval-requested', ts: via.at, payload: {
+        requestId: request.id, role: request.role, capabilities: request.capabilities, projectIds: request.projectIds,
+        audience: request.audience, recipients: request.recipients, avatarRecipients: request.avatarRecipients,
+        taskRecipients: request.taskRecipients, reason: request.reason, requestedBy: request.requestedBy, via,
+        urgency: DEFAULT_URGENCY['approval-requested'] } };
+      const seq = (await this.deps.store.appendEvent(event));
+      this.deps.bus?.emit({ ...event, seq });
+      await this.askAvatarsToDecide(token, task, request, asks.organizationId, avatarIds);
+    }
+    const vault = new VaultItems(this.deps.store, this.deps.broker, undefined, asks.organizationId);
+    for (const pending of asks.credentials) await vault.passOn(pending.id, people, via);
+    for (const pending of asks.connections) await passOnConnectionRequest(this.deps.store, pending.id, people, via);
+  }
+
+  /** Tell a sub-task's parent's agent of a request that came through it
+   * (sub-task-asks.ts): what is asked, and how to add context or decline it. */
+  async tellParentOf(childId: string, ask: { credential: CredentialAccessRequest; label: string } | { connection: ServiceConnection }
+    | { permission: PermissionRequest; organizationId: string }) {
+    const child = await this.deps.store.getTask(childId);
+    const request = 'credential' in ask ? ask.credential : 'connection' in ask ? ask.connection : ask.permission;
+    if (!child || !request.via) return;
+    const text = 'credential' in ask
+      ? throughYouText(child, { why: ask.credential.why,
+        what: ask.credential.kind === 'reset' ? `to fix the credential "${ask.label}", which it reports wrong`
+          : `for the credential "${ask.label}"${ask.credential.mode === 'reveal' ? ' (to see it)' : ''}`,
+        decline: `platform_request(POST, "/api/vault/requests/${ask.credential.id}/resolve", {"action": "deny"})` })
+      : 'connection' in ask
+        ? throughYouText(child, { what: `to connect ${ask.connection.label}`, why: ask.connection.why,
+          decline: `platform_request(POST, "/api/connections/${ask.connection.id}/disconnect")` })
+        : throughYouText(child, { why: ask.permission.reason,
+          what: `for ${[...ask.permission.capabilities, ...(ask.permission.projectIds ?? []).map((id) => `project ${id}`)].join(', ')}`,
+          decline: `platform_request(POST, "/api/permission-requests/${ask.permission.id}/resolve?organizationId=${ask.organizationId}", {"action": "deny"})` });
+    await this.tellTask(request.via.taskId, child, text, { type: 'subtask.parent-unreachable',
+      payload: { requestId: request.id, parentTaskId: request.via.taskId } });
+  }
+
+  /** The parent a new credential or connection request of `taskId` comes through, if any (sub-task-asks.ts). */
+  async viaParent(taskId: string): Promise<Via | undefined> {
+    return viaParent(this.deps.store, await this.deps.store.getTask(taskId));
+  }
+
   /** Tell a task's agent that a task acting for it asks for what it holds,
    *  and how to decide. Its reply is the decision, not a message. */
   private async askTaskToGrant(grantorId: string, task: TaskRecord, request: PermissionRequest, organizationId: string) {
-    const grantor = await this.deps.store.getTask(grantorId);
-    if (!grantor) return;
     const asked = request.capabilities.join(', ')
       + (request.projectIds?.length ? `${request.capabilities.length ? '; ' : ''}projects ${request.projectIds.join(', ')}` : '');
+    const resolve = `/api/permission-requests/${request.id}/resolve?organizationId=${organizationId}`;
     const text = `Task #${task.num ?? task.id} "${task.title}" (${task.id}) asks you for ${asked}, which you hold. `
-      + `Grant it if its work needs it: platform_request(POST, "/api/permission-requests/${request.id}/resolve?organizationId=${organizationId}", {"action": "approve"}), `
+      + `Grant it if its work needs it: platform_request(POST, "${resolve}", {"action": "approve"}), `
       + `or {"action": "deny"}.\n${untrustedBlock('its reason', request.reason)}`;
+    await this.tellTask(grantorId, task, text, { type: 'permission.grantor-unreachable', payload: { requestId: request.id, grantorTaskId: grantorId } });
+  }
+
+  /** Say `text` to a task's main agent as `from` (a task acting for it), calling
+   *  it. A failure is recorded on `from` as `failure`. */
+  private async tellTask(taskId: string, from: TaskRecord, text: string, failure: { type: string; payload: Record<string, unknown> }) {
+    const target = await this.deps.store.getTask(taskId);
+    if (!target) return;
     try {
-      if (this.sharedConversation(grantor)) {
-        const message: Message = { id: `u${randomUUID()}`, role: 'user', author: `task:${task.id}`,
-          authorLabel: `Task #${task.num ?? task.id}`, text, ts: Date.now() };
-        await (await this.workflowHandle(grantor.id)).signal(SIG.followUp, message);
-        await this.publishConversationMessage(grantor.id, MAIN_AGENT, message);
-      } else await this.deliverWorkflowMessage(grantor.id, text);
+      if (this.sharedConversation(target)) {
+        const message: Message = { id: `u${randomUUID()}`, role: 'user', author: `task:${from.id}`,
+          authorLabel: `Task #${from.num ?? from.id}`, text, ts: Date.now() };
+        await (await this.workflowHandle(target.id)).signal(SIG.followUp, message);
+        await this.publishConversationMessage(target.id, MAIN_AGENT, message);
+      } else await this.deliverWorkflowMessage(target.id, text);
     } catch (error) {
-      const failed = { taskId: task.id, type: 'permission.grantor-unreachable', ts: Date.now(),
-        payload: { requestId: request.id, grantorTaskId: grantorId, error: error instanceof Error ? error.message : String(error) } };
+      const failed = { taskId: from.id, type: failure.type, ts: Date.now(),
+        payload: { ...failure.payload, error: error instanceof Error ? error.message : String(error) } };
       const seq = (await this.deps.store.appendEvent(failed));
       this.deps.bus?.emit({ ...failed, seq });
     }
