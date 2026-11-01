@@ -28,6 +28,7 @@ const context = vm.createContext({
   pipeline: () => '',
   fmtReset: (at: number) => `at ${at}`,
   liveRoleFor: () => 'do',
+  globalRoute: () => '/org/settings',
   // `cancelling` holds the tasks whose cancel click has not yet been reflected by
   // the server; the list patcher reads it through pendingCancellationView().
   S: { tasks: [], cancelling: new Set<string>() },
@@ -42,6 +43,9 @@ vm.runInContext(
     extractFunction('waitingText'),
     extractFunction('waitDeadline'),
     extractFunction('presenceDetail'),
+    extractConst('ACCOUNT_PROVIDER_LABELS'),
+    extractFunction('setupFix'),
+    extractFunction('setupFixHtml'),
     extractFunction('conversationWaitNotice'),
     extractFunction('humanWaitDetail'),
     extractFunction('conversationTextKey'),

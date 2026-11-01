@@ -9,6 +9,7 @@ import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { McpConnections } from '../src/mcp/connections/store.js';
 import { WorktreeProvider } from '../src/world/worktree.js';
+import { AgentToolsUnavailable } from '../src/agent/limits.js';
 
 describe('Untrusted MCP processes', () => {
   let dir: string; const clients: { close(): Promise<void> }[] = [];
@@ -40,6 +41,15 @@ describe('Untrusted MCP processes', () => {
   it('handles an unavailable executable without a hanging initialization', async () => {
     await expect(connectWorldMcp(world(), { name: 'missing', command: path.join(dir, 'does-not-exist') })).rejects.toThrow(/could not start/);
   }, 5000);
+  it('names a server that will not start as a turn to retry, and the retry goes on without it', async () => {
+    const missing = { name: 'missing', command: path.join(dir, 'does-not-exist') };
+    const failure = await apiMcpTools(world(), [missing, server()]).then((api) => { clients.push(api); }, (error) => error);
+    expect(failure).toBeInstanceOf(AgentToolsUnavailable);
+    expect(failure.servers).toEqual([{ name: 'missing', status: 'failed' }]);
+    const api = await apiMcpTools(world(), [missing, server()], undefined, true); clients.push(api);
+    expect(api.unavailable).toEqual(['missing']);
+    expect(api.tools.length).toBeGreaterThan(0); // the server that did start is still there
+  }, 10000);
   it('exposes prompts and templates through API rails with stable names', async () => {
     const api = await apiMcpTools(world(), [server()]); clients.push(api);
     const get = api.tools.find((t) => t.description.includes('Get a prompt'))!;

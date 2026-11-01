@@ -20,6 +20,7 @@ import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION
 import { DEFAULT_CDP_PORT } from '../autonomy/cdp-endpoint.js';
 import { exposeRemoteNodeCommand, installRemoteNodeCommand, PINNED_REMOTE_NODE_VERSION, PINNED_REMOTE_NPM_VERSION } from './remote-node.js';
 import { collectStartupProbe, StartupProtocolTrace } from './startup-diagnostics.js';
+import { AgentToolsUnavailable } from './limits.js';
 import { BRAND } from '../domain/brand.js';
 import { acpHomeEnv, isAcpProvider } from './provider-registry.js';
 import { OPENCODE_PACKAGE as PINNED_OPENCODE_PACKAGE } from './acp-packages.js';
@@ -65,6 +66,8 @@ export interface RemoteAgentHome {
   syncedHistory?: ReadonlyMap<string, CodexHistoryFile>;
   /** Every MCP server the seeded Codex config defines, when karmax can tell without asking Codex. */
   configuredMcpServers?: string[];
+  /** Browser tools the login's config names that could not be made ready (a retry goes on without them). */
+  unavailableTools?: string[];
 }
 
 /** Seed the leased subscription credentials/config into this task's persistent
@@ -78,7 +81,8 @@ export interface RemoteAgentHome {
  * config files upload beside it. History the sandbox already holds byte for
  * byte is not sent again (AD-13). */
 export async function seedRemoteAgentHome(world: World, provider: Provider, localHome: string,
-  session?: string, browserOverride?: 'none', onStartupStep?: (step: string) => Promise<void>): Promise<RemoteAgentHome> {
+  session?: string, browserOverride?: 'none', onStartupStep?: (step: string) => Promise<void>,
+  toolsOptional = false): Promise<RemoteAgentHome> {
   if (!localHome) throw new Error(`${provider} subscription has no config home to seed`);
   const relative = remoteAgentHomeRelative(provider, localHome);
   const absolute = path.posix.join(world.handle.root, relative);
@@ -138,14 +142,22 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
       }),
   ]);
   await onStartupStep?.('prepare-browser');
-  const browserMcp = browser ? await timed('bootstrap.browser', () => ensureRemoteBrowser(world, browser, bootstrap.runtimeBin)) : undefined;
+  // A browser that cannot be made ready is a tool that did not start: the
+  // turn is retried, and the retry goes on without it (AgentToolsUnavailable).
+  let unavailableTools: string[] | undefined;
+  const browserMcp = browser ? await timed('bootstrap.browser', () => ensureRemoteBrowser(world, browser, bootstrap.runtimeBin)).catch((error) => {
+    if (!toolsOptional) throw new AgentToolsUnavailable([{ name: browser, status: 'failed' }], { cause: error });
+    unavailableTools = [browser];
+    return undefined;
+  }) : undefined;
   const seededConfig = codexConfig ?? (provider === 'codex' ? remoteCodexConfig(localHome, browserMcp) : undefined);
   if (provider === 'codex' && codexConfig === undefined)
     await timed('bootstrap.config', () => world.writeFile(`${relative}/config.toml`, seededConfig!));
   // Codex reads MCP servers from this config and, when present, a system layer
   // karmax did not write; only then must Codex be asked for their names.
   const configuredMcpServers = seededConfig !== undefined && !bootstrap.systemCodexConfig ? codexConfigMcpServers(seededConfig) : undefined;
-  return { ...home, ...(browserMcp ? { browserMcp } : {}), ...(configuredMcpServers ? { configuredMcpServers } : {}) };
+  return { ...home, ...(browserMcp ? { browserMcp } : {}), ...(configuredMcpServers ? { configuredMcpServers } : {}),
+    ...(unavailableTools ? { unavailableTools } : {}) };
 }
 
 /** Start the sandbox half of this turn's start-up while the caller prepares
