@@ -360,14 +360,17 @@ describe.skipIf(!sshdAvailable)('AWS worlds (fake EC2, real sshd)', () => {
     aws.images.push({ imageId: 'ami-old', name: 'old', state: 'available', tags: { karmaxImage: 'old' }, owner: 'self', creationDate: '2026-01-01T00:00:00.000Z', snapshot: 'snap-old' });
     await driver.housekeep(connection(aws.key));
     await provider.destroy(handle);
+    aws.quotasReadable = true; aws.vcpuLimit = 64; aws.gp3StorageTiB = 50;
+    expect((await driver.limits(connection(aws.key))).pool).toEqual({ cpu: 64, diskGb: 51_200 });
     const markdown = fs.readFileSync(new URL('../web/docs/computers.md', import.meta.url), 'utf8');
     const policy = JSON.parse(markdown.match(/```json\n([\s\S]*?)```/)![1]!) as { Statement: Array<{ Action: string | string[] }> };
     const allowed = policy.Statement.flatMap((statement) => [statement.Action].flat());
-    const used = [...new Set(aws.requests.map((request) => `ec2:${request.action}`))];
+    const used = [...new Set([...aws.requests.map((request) => `ec2:${request.action}`), ...aws.quotaRequests])];
     const missing = used.filter((action) => !allowed.some((pattern) => new RegExp(`^${pattern.replace(/\*/g, '.*')}$`).test(action)));
     expect(missing).toEqual([]);
     expect(used).toEqual(expect.arrayContaining(['ec2:RunInstances', 'ec2:AttachVolume', 'ec2:ModifyVolume', 'ec2:StartInstances',
-      'ec2:ModifyInstanceAttribute', 'ec2:CreateTags', 'ec2:DeregisterImage', 'ec2:TerminateInstances', 'ec2:DeleteVolume']));
+      'ec2:ModifyInstanceAttribute', 'ec2:CreateTags', 'ec2:DeregisterImage', 'ec2:TerminateInstances', 'ec2:DeleteVolume',
+      'servicequotas:GetServiceQuota']));
   });
 
   it('lists its worlds by home, and housekeeping ends stale builders and old images', async () => {
