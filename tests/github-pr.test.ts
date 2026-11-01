@@ -1927,7 +1927,7 @@ function freshnessGithub(branches: Record<string, string>) {
   const prs = new Map<number, { head: string; ref: string; base: string; merged?: string }>();
   const checks = new Map<string, string>();
   const calls: string[] = [];
-  const outage = { readiness: undefined as string | undefined };
+  const outage = { readiness: undefined as string | undefined, diff: false };
   const commit = (sha: string, ...parents: string[]) => {
     ancestry.set(sha, new Set([sha, ...parents.flatMap((parent) => [...ancestry.get(parent)!])]));
     return sha;
@@ -1940,6 +1940,13 @@ function freshnessGithub(branches: Record<string, string>) {
     const body = init.body ? JSON.parse(String(init.body)) : {};
     calls.push(`${method} ${decodeURIComponent(url.pathname)}`);
     const compare = decodeURIComponent(url.pathname).match(/\/compare\/(.+)\.\.\.(.+)$/);
+    if (compare && outage.diff) return Response.json({ message: 'Server Error: Sorry, this diff is taking too long to generate.',
+      errors: [{ resource: 'Comparison', field: 'diff', code: 'not_available' }], status: '422' }, { status: 422 });
+    if (url.pathname === '/graphql' && String(body.query).includes('compare(headRef')) {
+      const base = branches[body.variables.base];
+      return Response.json({ data: { repository: { ref: base ? { target: { oid: base }, compare: {
+        aheadBy: behindBy(base, body.variables.head), behindBy: behindBy(body.variables.head, base) } } : null } } });
+    }
     if (compare) {
       const base = branches[compare[1]!] ?? compare[1]!;
       return Response.json({ status: 'diverged', base_commit: { sha: base },
@@ -2079,6 +2086,19 @@ describe('Sub-task landing freshness (GH-26)', () => {
     expect(github.calls).toContain('GET /repos/acme/widgets/compare/karmax/task_parent...fresh-head');
     expect(github.calls.some((call) => call.endsWith('/update-branch'))).toBe(false);
     expect(github.branches['karmax/task_parent']).toBe('merge-1');
+  });
+
+  it('checks freshness without the diff GitHub cannot build in time, instead of asking a person (pramana#149)', async () => {
+    const github = freshnessGithub({ 'karmax/task_parent': 'parent-0' });
+    github.branches['karmax/task_parent'] = github.commit('parent-1', 'parent-0');
+    github.checks.set(github.commit('stale-head', 'parent-0'), 'SUCCESS');
+    github.checks.set(github.commit('fresh-head', 'parent-1'), 'SUCCESS');
+    github.outage.diff = true;
+    const { parent, confirmed } = await freshnessCore(github);
+    const stale = await confirmed(1, 'stale-head', 'karmax/task_parent', parent.id);
+    await expect(stale.land()).resolves.toMatchObject({ status: 'waiting', detail: expect.stringMatching(/mechanically updated/) });
+    const fresh = await confirmed(2, 'fresh-head', 'karmax/task_parent', parent.id);
+    await expect(fresh.land()).resolves.toMatchObject({ status: 'merged' });
   });
 
   it("keeps GitHub's policy authoritative for a target that is not the parent's task branch", async () => {

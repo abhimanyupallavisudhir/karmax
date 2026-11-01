@@ -5197,7 +5197,7 @@ async function runSearch() {
   const store = taskStoreForQuery();
   if (store) { S.searchPending = false; S.searchFailed = false; return store; }
   const isCurrent = () => scopeOf() === scope;
-  const q = effectiveQuery(S.search); // adds the default -is:run -is:subtask unless overridden
+  const q = effectiveQuery(S.search); // adds the default -is:folded unless overridden
   const epoch = S.searchEpoch = (S.searchEpoch || 0) + 1;
   S.searchPending = true;
   try {
@@ -6664,25 +6664,26 @@ function taskMatches(t, q) {
   return s.split(/\s+/).every((term) => !term || hay.includes(term));
 }
 
-// The default list transparently hides two kinds of nesting unless the query opts in:
-// the auto-spawned *runs* of a repeatable series (`-is:run`), and delegated *sub-tasks*
-// (`-is:subtask`) — a sub-task lives under its parent's detail page, not as a sibling
-// at the top level, so a fan-out of children doesn't flood the list. Its parent still
-// shows, and you drill into children with `is:subtask` (or the Repeatable view). These
-// are therefore just facets, not toggles. The clean `S.search` stays in the box; only
-// the evaluated query carries the defaults. If the query already mentions a facet, we
-// leave it. Archived tasks are not hidden implicitly: the views that leave them out say
-// `-is:archived`, so an empty query is every task. The task-picker overlay passes its
-// own facet list.
+// The default list folds two kinds of nesting unless the query opts in: the
+// auto-spawned *runs* of a repeatable series, and delegated *sub-tasks* — a sub-task
+// lives under its parent's detail page, not as a sibling at the top level, so a
+// fan-out of children doesn't flood the list. Its parent still shows, and you drill
+// into children with `is:subtask` (or the Repeatable view). One that needs you is not
+// folded (`-is:folded` keeps it), so For me is always Active narrowed to your asks
+// (pramana#149). The clean `S.search` stays in the box; only the evaluated query
+// carries the defaults. If the query already mentions a facet, we leave it. Archived
+// tasks are not hidden implicitly: the views that leave them out say `-is:archived`,
+// so an empty query is every task. The task-picker overlay passes its own facet list.
 function queryMentionsFacet(q, facet) { return new RegExp(`(^|\\s)-?(is|has):[^\\s]*${facet}`, 'i').test(q || ''); }
 // A `for:` query asks what waits on a person, wherever it sits: a sub-task or a
 // run that needs a human routes to them, so those facets are not hidden.
 function queryNamesPerson(q) { return /(^|\s)for:\S/i.test(q || ''); }
-function listShowsNested(q, facet) { return queryMentionsFacet(q, facet) || queryNamesPerson(q); }
 function effectiveQuery(q, facets = ['run', 'subtask']) {
   let s = (q || '').trim();
-  for (const facet of facets)
-    if (!queryMentionsFacet(s, facet) && !queryNamesPerson(s)) s = `${s} -is:${facet}`.trim();
+  if (queryNamesPerson(s) || queryMentionsFacet(s, 'folded')) return s;
+  const hidden = facets.filter((facet) => !queryMentionsFacet(s, facet));
+  if (hidden.length === 2) return `${s} -is:folded`.trim();
+  for (const facet of hidden) s = `${s} -is:${facet}`.trim();
   return s;
 }
 
@@ -6887,23 +6888,15 @@ function tasksView() {
   // Only while its series is live: a run whose task was un-ticked, moved to
   // drafts or deleted is an ordinary task (the server's `is:run` agrees).
   const nestedRun = (t) => !!t.params?.runOf && isSeries(loaded.get(t.params.runOf)?.params);
-  // Runs nest under their series row and sub-tasks nest under their parent's detail page,
-  // so by default neither belongs in the flat top-level list. The server already drops both
-  // (the -is:run/-is:subtask defaults from effectiveQuery); this is the client-side fallback,
-  // and it opts back in when the query explicitly asks for that facet (the Sub-tasks view's
-  // `is:subtask`, or a hand-typed `is:run`) so those views aren't stripped to empty.
-  const keepRun = listShowsNested(S.search, 'run');
-  const keepSub = listShowsNested(S.search, 'subtask');
-  const topLevel = (t) => (keepRun || !nestedRun(t)) && (keepSub || !t.parentTaskId);
-  // The server already applied the query. The fallback (before the first result lands)
-  // filters the open project's rows, which never include archived ones.
-  // Before the first result the open project's rows are a fair preview of a text
-  // search, but not of a structured one (for:, status:…) nor of the home's.
+  // The server already applied the query, folding included (effectiveQuery). Before
+  // the first result lands, the open project's rows are a fair preview of a text
+  // search, but not of a structured one (for:, status:…) nor of the home's; the
+  // preview folds every sub-task and run, and never shows archived rows.
   const preview = !across && !/(^|\s)-?[\w.#-]+:/.test(S.search || '');
-  const flat = (r
+  const flat = r
     ? r.tasks
-    : preview ? S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived).slice().sort(byLastUpdate) : []
-  ).filter(topLevel);
+    : preview ? S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived && !nestedRun(t) && !t.parentTaskId)
+      .slice().sort(byLastUpdate) : [];
   const row = (t, opts = {}) => taskRow(t, { ...opts, ...(across ? { showTags: false, project: true } : {}) });
   const groups = r && r.groups ? r.groups : null;
   const count = flat.length;
@@ -6915,11 +6908,11 @@ function tasksView() {
   } else if (groups) {
     body = r.hierarchical
       ? [
-        ...(groups.find((g) => g.key === '__untagged__')?.tasks || []).filter(topLevel).map((t) => row(t, { showTags: false })),
-        ...groups.filter((g) => g.key !== '__untagged__').map((g) => tagGroupHtml(g, topLevel)),
+        ...(groups.find((g) => g.key === '__untagged__')?.tasks || []).map((t) => row(t, { showTags: false })),
+        ...groups.filter((g) => g.key !== '__untagged__').map((g) => tagGroupHtml(g)),
       ].join('')
       : groups.map((g) => {
-        const gt = g.tasks.filter(topLevel);
+        const gt = g.tasks;
         return `<h2 class="task-group-heading">${esc(g.label)} <span class="task-group-count">${gt.length} task${gt.length === 1 ? '' : 's'}</span></h2>${gt.map((t) => row(t)).join('')}`;
       }).join('');
   } else {
@@ -7364,7 +7357,7 @@ function wireProjectPicker(button, onPick) {
   });
 }
 
-function tagGroupHtml(group, keep, depth = 0) {
+function tagGroupHtml(group, keep = () => true, depth = 0) {
   const ownTasks = (group.tasks || []).filter(keep);
   const children = (group.children || []).map((child) => tagGroupHtml(child, keep, depth + 1)).join('');
   const count = tagGroupVisibleTasks(group, keep).size;
