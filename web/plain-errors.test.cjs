@@ -18,7 +18,7 @@ function extract(name, kind = 'function') {
 global.esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 eval(`${extract('CAPABILITY_ACTIONS', 'const')}; global.CAPABILITY_ACTIONS = CAPABILITY_ACTIONS;`);
 global.globalRoute = () => '/org/settings';
-for (const fn of ['permissionSentence', 'plainError', 'plainTaskError', 'setupFix', 'setupFixHtml', 'taskErrorHtml']) eval(`global.${fn} = ${extract(fn)}`);
+for (const fn of ['permissionSentence', 'plainError', 'plainTaskError', 'toolsDidNotStart', 'setupFix', 'setupFixHtml', 'taskErrorHtml']) eval(`global.${fn} = ${extract(fn)}`);
 
 let passed = 0;
 const eq = (actual, expected, label) => { assert.strictEqual(actual, expected, label); passed++; };
@@ -71,5 +71,17 @@ eq(plain.detail, '', 'nothing hidden when the summary is the message');
 assert.ok(!taskErrorHtml(plain.summary).includes('<details'), 'no Details fold without details'); passed++;
 assert.ok(taskErrorHtml('No computer is connected: connect one under Settings → Computers.').includes('<a class="btn sm setup-fix" data-spa href="/org/settings#settings-computers">Connect a computer</a>'), 'a setting that unblocks the task is one click away'); passed++;
 assert.ok(taskErrorHtml('Activity task failed → envd timeout').includes('<details class="error-details"><summary>Details</summary>'), 'Details fold holds the exact text'); passed++;
+
+// A tool that did not start (DharmaArtha's #5): said in words, never "Check Agent tools settings".
+for (const raw of ['Activity task failed → MCP connections could not start: chrome-devtools (failed). Check Agent tools settings.',
+  "The agent's tools didn't start: chrome-devtools (failed), linear (needs-auth)"]) {
+  const tools = plainTaskError(raw);
+  assert.match(tools.summary, /^The agent’s tools didn’t start \((chrome-devtools|chrome-devtools, linear)\)\. Retry carries on without them/, raw); passed++;
+  assert.ok(!/Check Agent tools settings/.test(tools.summary)); passed++;
+}
+// An error with nothing more specific to say suggests Retry; one with its own fix or advice does not.
+assert.ok(taskErrorHtml('Activity task failed → something unexpected').includes('something unexpected. Press Retry to try again.'), 'generic errors suggest Retry'); passed++;
+assert.ok(!taskErrorHtml('No computer is connected: connect one under Settings → Computers.').includes('Press Retry'), 'a setting is the fix, not Retry'); passed++;
+assert.ok(!taskErrorHtml('Activity task failed → stream ended unexpectedly').includes('Press Retry to try again'), 'specific advice stays as written'); passed++;
 
 console.log(`${passed} passed, 0 failed`);

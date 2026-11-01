@@ -4510,9 +4510,18 @@ function plainTaskError(text) {
     : /GitHub PR identity is not connected|reconnect GitHub on your profile|Connect GitHub on your profile/i.test(body) ? 'Connect GitHub on your profile, then press Retry.'
     : /^merge failed: conflict/i.test(body) ? 'These changes conflict with newer work on the same branch. Ask the agent to resolve the conflict.'
     : /^merge failed/i.test(body) ? 'The changes couldn’t be landed. Ask the agent to look into it, or Retry.'
-    : plainError(body.replace(/\s*— retrying \w+ in .*$/, ''));
-  const plain = /[.!?]$/.test(summary) || !summary ? summary : `${summary}.`;
-  return { summary: plain + retrying, detail: plain + retrying === raw ? '' : raw };
+    : toolsDidNotStart(body) ? `The agent’s tools didn’t start (${toolsDidNotStart(body)}). Retry carries on without them if they still won’t.`
+    : '';
+  // Nothing more specific to say: the error's own words, and (taskErrorHtml) that Retry is worth a try.
+  const generic = !summary && !retrying;
+  const said = summary || plainError(body.replace(/\s*— retrying \w+ in .*$/, ''));
+  const plain = /[.!?]$/.test(said) || !said ? said : `${said}.`;
+  return { summary: plain + retrying, detail: plain + retrying === raw ? '' : raw, generic };
+}
+// The tools a turn's start-up named as not started ("chrome-devtools"), if that is what failed.
+function toolsDidNotStart(text) {
+  const listed = /(?:MCP connections could not start|The agent's tools didn't start): ([^.]+)/.exec(text)?.[1];
+  return listed ? listed.replace(/ \([^)]*\)/g, '').trim() : '';
 }
 // Where a person fixes what a task stopped or waits on, when it is a setting:
 // an agent account, a computer, compute credit, GitHub.
@@ -4540,7 +4549,8 @@ function inlineErrorHtml(error) {
   return plain === raw ? esc(plain) : `<span title="${esc(raw)}">${esc(plain)}</span>`;
 }
 function taskErrorHtml(text) {
-  const { summary, detail } = plainTaskError(text);
+  const { summary: said, detail, generic } = plainTaskError(text);
+  const summary = generic && !setupFix(text) && !/\bretry\b/i.test(said) ? `${said} Press Retry to try again.` : said;
   return `<div class="msg-text">${esc(summary)}${setupFixHtml(text)}</div>${detail ? `<details class="error-details"><summary>Details</summary><pre>${esc(detail)}</pre></details>` : ''}`;
 }
 

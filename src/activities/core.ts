@@ -29,7 +29,7 @@ import { ApplicationFailure } from '@temporalio/common';
 import { COMPUTE_HOLD, holdManagedCompute, outOfCompute, type ComputeHoldRequest } from '../world/managed-compute.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
 import { ComputeRouter, type RouterConnections } from '../world/compute-router.js';
-import { AgentChannelLost, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
+import { AgentChannelLost, AgentToolsUnavailable, toolsUnavailableActivity, toolsUnavailableNotice, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { markCheckpointStale } from '../world/checkpoint-staleness.js';
 import { usageAdmissionId as admissionIdFor } from '../domain/turn-admission.js';
@@ -240,7 +240,8 @@ function classifyTurnError(err: unknown, provider?: Provider, sandbox?: { diagno
   // backpressure/outages therefore cannot be an agent error and must retain
   // their retryable infrastructure classification through this outer boundary.
   if (err instanceof AdmissionBackpressureError || err instanceof AgentAdmissionInfrastructureError
-    || err instanceof AgentResourcesUnavailableError || err instanceof AgentChannelLost || err instanceof RemoteAgentCliUnavailable) {
+    || err instanceof AgentResourcesUnavailableError || err instanceof AgentChannelLost || err instanceof RemoteAgentCliUnavailable
+    || err instanceof AgentToolsUnavailable) {
     return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
   }
   if (err instanceof ProviderPolicyFailure || isProviderPolicyRejection(err)) {
@@ -3742,9 +3743,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // Recreate their stable world paths immediately before every turn so a
         // restored cloud sandbox or a repeatedly-forked session can still read them.
         const turnMessages = await materializeFileAttachments(world, messages);
+        const unreadyTools: string[] = [];
         const chosenMcp = profile.mcpConnections === undefined ? [] : await timed('tool.connection.prepare', () => prepareConnections(
           deps.broker ? new McpConnections(store, deps.broker, organizationId) : undefined, world, profile.mcpConnections!, args.task.projectId, args.taskId, (cleanup) => { mcpCleanup = cleanup; },
-          (values) => secrets.add(...values)));
+          (values) => secrets.add(...values), { toolsOptional: activityAttempt > 1, onUnavailable: (name) => unreadyTools.push(name) }));
+        // A retry goes on without a tool that still would not start; the agent and the conversation are told.
+        if (unreadyTools.length) (await record(args.taskId, 'agent.activity', { ...toolsUnavailableActivity(unreadyTools),
+          role: args.role, attempt: activityAttempt, workflowRunId,
+          ...((args.agentTurnId ?? legacyAgentTurnId) ? { turnId: args.agentTurnId ?? legacyAgentTurnId } : {}) }));
         (await store.appendAudit({ principalId: `task:${args.taskId}`, action: 'mcp.selected', scopeKey: `project:${args.task.projectId}`, detail: { connections: profile.mcpConnections ?? [], role: args.role } }));
         let pullSecretEnv: (() => Promise<Record<string, string>>) | undefined;
         secrets.add(token, resolvedAuth?.apiKey, resolvedAuth?.oauthToken);
@@ -3814,13 +3820,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           session,
           deliveredMessages,
           fork,
-          systemPrompt: systemPrompt + diskPromptNotice + skippedEnvNotice(skippedEnv) + (profile.mcpConnections?.some(id => id.startsWith('composio:')) ? '\nSelected app accounts (use list_connections and the connection tools; existing sharing permissions still apply): ' + profile.mcpConnections.filter(id => id.startsWith('composio:')).map(id => id.slice(9)).join(', ') : ''),
+          systemPrompt: systemPrompt + diskPromptNotice + skippedEnvNotice(skippedEnv) + (unreadyTools.length ? `\n\n${toolsUnavailableNotice(unreadyTools)}` : '') + (profile.mcpConnections?.some(id => id.startsWith('composio:')) ? '\nSelected app accounts (use list_connections and the connection tools; existing sharing permissions still apply): ' + profile.mcpConnections.filter(id => id.startsWith('composio:')).map(id => id.slice(9)).join(', ') : ''),
           role: args.role,
           maxTurns: profile.maxTurns,
           ...(resolvedAuth ? { resolvedAuth } : {}),
           ...turnEnv,
           // MCP servers the workflow gives its agents (SPEC §7.5).
           agentMcp: [...(args.task.workflow ? manifest(args.task.workflow)?.agentMcp ?? [] : []), ...chosenMcp],
+          ...(activityAttempt > 1 ? { toolsOptional: true } : {}),
         } }, {
           adapters: deps.adapters,
           onProviderStart: async () => {

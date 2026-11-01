@@ -20,6 +20,9 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { newSubagentTracker, trackTaskMessage, pendingSubagentCount, pendingBackgroundShellCount, backgroundShellDescriptions } from './subagents.js';
 import {
   AgentChannelLost,
+  AgentToolsUnavailable,
+  toolsUnavailableActivity,
+  toolsUnavailableNotice,
   ProviderFailure,
   apiThrottle,
   classifyLimitError,
@@ -96,7 +99,8 @@ export class ClaudeAdapter implements AgentAdapter {
     // but not effort-capable, so `claudeMessagesEffort` returned undefined for it).
     const model = input.profile.model ?? CLAUDE_DEFAULT_MODEL;
     (await (await currentTiming())?.mark('provider.selected', { provider: 'claude', model }));
-    const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal);
+    const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal, input.toolsOptional);
+    if (mcp.unavailable.length) await ctx.emitActivity?.(toolsUnavailableActivity(mcp.unavailable));
     const reportedUsage = new ReportedUsage();
     try {
     const handlers = { ...platformToolHandlers(input.world, ctx, () => workEnvironment(input)), ...mcp.handlers };
@@ -160,7 +164,7 @@ export class ClaudeAdapter implements AgentAdapter {
             // the loop below then has to recover from at the cost of an extra billed
             // round trip. Derived per model (see effort.ts) instead of hard-coded.
             max_tokens: claudeMaxTokens(model),
-            system: input.systemPrompt,
+            system: input.systemPrompt + (mcp.unavailable.length ? `\n\n${toolsUnavailableNotice(mcp.unavailable)}` : ''),
             messages,
             tools,
             // Reasoning effort (SPEC §10.5) — sent only on models that accept it.
@@ -410,7 +414,7 @@ export class ClaudeAdapter implements AgentAdapter {
     await startupActivity('updated', 'prepare-environment');
     const remoteHome = remote
       ? await timed('bootstrap.home', () => seedRemoteAgentHome(runtimeWorld, 'claude', configHome ?? '', input.session,
-        input.profile.mcpConnections === undefined ? undefined : 'none', step => startupActivity('updated', step)))
+        input.profile.mcpConnections === undefined ? undefined : 'none', step => startupActivity('updated', step), input.toolsOptional))
       : undefined;
     // The SDK only sees a codeless exit when the sandbox stream drops; the
     // process knows the agent may still be running there (task 348).
@@ -431,11 +435,14 @@ export class ClaudeAdapter implements AgentAdapter {
     if (input.profile.mcpConnections !== undefined) {
       delete configuredMcp['chrome-devtools']; delete configuredMcp.playwright;
     }
-    if (input.profile.mcpConnections === undefined && remoteHome?.browserMcp) {
+    if (input.profile.mcpConnections === undefined && (remoteHome?.browserMcp || remoteHome?.unavailableTools)) {
       delete configuredMcp['chrome-devtools'];
       delete configuredMcp.playwright;
-      Object.assign(configuredMcp, remoteHome.browserMcp);
+      Object.assign(configuredMcp, remoteHome.browserMcp ?? {});
     }
+    // A retry that goes on without the login's browser says so.
+    if (remoteHome?.unavailableTools?.length) await ctx.emitActivity?.(toolsUnavailableActivity(remoteHome.unavailableTools));
+    const unavailableNotice = remoteHome?.unavailableTools?.length ? `\n\n${toolsUnavailableNotice(remoteHome.unavailableTools)}` : '';
     const { forwardEnv: _forwardEnv, ...platform } = platformMcpSpec(
       process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505',
     );
@@ -700,7 +707,7 @@ export class ClaudeAdapter implements AgentAdapter {
         // Review with an empty diff (the "agent just stopped" reports, only in karmax
         // and never in the CLI, because the CLI always runs this preset). We keep
         // karmax's own task/tooling instructions by APPENDING them to the preset.
-        systemPrompt: { type: 'preset', preset: 'claude_code', append: input.systemPrompt },
+        systemPrompt: { type: 'preset', preset: 'claude_code', append: input.systemPrompt + unavailableNotice },
         ...(input.profile.model ? { model: input.profile.model } : {}),
         // Reasoning effort (SPEC §10.5); the SDK silently downgrades for models
         // that don't support the level, so no gating is needed here.
@@ -808,7 +815,14 @@ export class ClaudeAdapter implements AgentAdapter {
           const inventory = (message as any).mcp_servers ?? [];
           const status = (name: string): string => inventory.find((c: any) => c.name === name)?.status ?? 'missing';
           const missing = (input.agentMcp ?? []).filter((s) => status(s.name) !== 'connected');
-          if (missing.length) throw new Error(`MCP connections could not start: ${missing.map((s) => `${s.name} (${status(s.name)})`).join(', ')}. Check Agent tools settings.`);
+          if (missing.length && !input.toolsOptional)
+            throw new AgentToolsUnavailable(missing.map((s) => ({ name: s.name, status: status(s.name) })));
+          // The retry carries on without them, and says so to the agent and in the conversation.
+          if (missing.length) {
+            const names = missing.map((s) => s.name);
+            injector.push(send(toolsUnavailableNotice(names)));
+            await ctx.emitActivity?.(toolsUnavailableActivity(names));
+          }
         }
         if (ctx.signal?.aborted) break; // cancelled mid-turn (SPEC §5.6)
         // Publish the session id the moment it's known — the SDK's init message carries

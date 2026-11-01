@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const sdkState = vi.hoisted(() => ({ messages: [] as any[], options: undefined as any,
+const sdkState = vi.hoisted(() => ({ messages: [] as any[], options: undefined as any, prompt: undefined as any,
   run: undefined as undefined | ((options: any) => AsyncGenerator<any>) }));
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
@@ -12,6 +12,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   tool: (name: string, description: string, schema: unknown, handler: unknown) => ({ name, description, schema, handler }),
   query: (args: any) => {
     sdkState.options = args.options;
+    sdkState.prompt = args.prompt;
     if (sdkState.run) return sdkState.run(args.options);
     return (async function* () {
       for (const message of sdkState.messages) yield message;
@@ -39,7 +40,7 @@ vi.mock('../src/world/bounded-exec.js', () => ({
 
 import { ClaudeAdapter } from '../src/agent/claude.js';
 import { CUSTODY_ENV } from '../src/agent/custody.js';
-import { ProviderFailure, isTransportError } from '../src/agent/limits.js';
+import { AgentToolsUnavailable, ProviderFailure, isTransportError } from '../src/agent/limits.js';
 import { remoteAgentHomeRelative } from '../src/agent/remote-process.js';
 import { localProviderCli } from '../src/agent/provider-cli.js';
 import { controlClient } from './helpers/control-server.js';
@@ -73,13 +74,32 @@ const ctx: any = {
 describe('Claude Agent SDK terminal outcome contract', () => {
   beforeEach(() => { sdkState.messages = []; sdkState.options = undefined; sdkState.run = undefined; });
 
-  it('names each selected MCP connection that did not start, with its status', async () => {
+  it('names each selected MCP connection that did not start, with its status, as a failure worth retrying', async () => {
     sdkState.messages = [{ type: 'system', subtype: 'init', session_id: 's', mcp_servers: [
       { name: 'chrome-devtools', status: 'failed' }, { name: 'linear', status: 'needs-auth' }, { name: 'github', status: 'connected' },
     ] }, { type: 'result', subtype: 'success' }];
     const agentMcp = ['chrome-devtools', 'linear', 'github', 'absent'].map((name) => ({ name, command: 'node' }));
-    await expect(new ClaudeAdapter().runTurn({ ...input, profile: { ...input.profile, mcpConnections: [] }, agentMcp }, ctx))
-      .rejects.toThrow('MCP connections could not start: chrome-devtools (failed), linear (needs-auth), absent (missing). Check Agent tools settings.');
+    const failure = await new ClaudeAdapter().runTurn({ ...input, profile: { ...input.profile, mcpConnections: [] }, agentMcp }, ctx)
+      .then(() => undefined, (error) => error);
+    expect(failure).toBeInstanceOf(AgentToolsUnavailable);
+    expect(failure.message).toBe("The agent's tools didn't start: chrome-devtools (failed), linear (needs-auth), absent (missing)");
+    expect(failure.servers.map((server: any) => server.name)).toEqual(['chrome-devtools', 'linear', 'absent']);
+  });
+
+  it('on the retry, carries on without tools that still did not start, and tells the agent and the conversation', async () => {
+    const sent: any[] = [];
+    sdkState.run = async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 's', mcp_servers: [{ name: 'chrome-devtools', status: 'failed' }] };
+      const prompt = sdkState.prompt[Symbol.asyncIterator]();
+      sent.push((await prompt.next()).value, (await prompt.next()).value);
+      yield { type: 'result', subtype: 'success', num_turns: 1 };
+    };
+    const activities: any[] = [];
+    const agentMcp = [{ name: 'chrome-devtools', command: 'node' }];
+    await new ClaudeAdapter().runTurn({ ...input, profile: { ...input.profile, mcpConnections: ['browser:chrome-devtools'] }, agentMcp,
+      toolsOptional: true }, { ...ctx, emitActivity: (activity: any) => { activities.push(activity); } });
+    expect(JSON.stringify(sent[1].message.content)).toContain("These tools didn't start this turn, so they are unavailable: chrome-devtools.");
+    expect(activities).toContainEqual(expect.objectContaining({ id: 'tools-unavailable', title: 'Started without chrome-devtools' }));
   });
 
   it('passes explicit per-turn and profile caps to the SDK', async () => {

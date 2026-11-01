@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { serializeMessage } from '@modelcontextprotocol/sdk/shared/stdio.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import { AgentToolsUnavailable } from '../../agent/limits.js';
 import type { AgentMcpServer } from '../../contrib/manifests.js';
 import type { World } from '../../world/types.js';
 import { RemoteSpawnedProcess, isRemoteAgentWorld } from '../../agent/remote-process.js';
@@ -78,14 +79,25 @@ export async function connectWorldMcp(world: World, server: AgentMcpServer, sign
   try { await client.connect(transport, { timeout: 60_000 }); return client; }
   catch { await transport.close(); throw new Error(`MCP connection ${server.name} could not start. Check its settings and credentials.`); }
 }
-export async function apiMcpTools(world: World, servers: AgentMcpServer[] = [], signal?: AbortSignal) {
+/** The agent's MCP tools on the API path. A server that will not start fails
+ * the turn as `AgentToolsUnavailable` (retried as infrastructure), unless
+ * `optional` (the retry): then the turn goes on without it, named in `unavailable`. */
+export async function apiMcpTools(world: World, servers: AgentMcpServer[] = [], signal?: AbortSignal, optional = false) {
   const clients: Client[] = []; const tools: { name: string; description: string; parameters: any }[] = [];
   const handlers: Record<string, (input: any) => Promise<any>> = {};
+  const unavailable: string[] = [];
   let catalogBytes = 0;
   const close = async () => { await Promise.allSettled(clients.map((c) => c.close())); };
   try {
     for (const server of servers) {
-      const client = await timed('tool.connection.start', () => connectWorldMcp(world, server, signal)); clients.push(client);
+      let client: Client;
+      try { client = await timed('tool.connection.start', () => connectWorldMcp(world, server, signal)); }
+      catch (error) {
+        if (signal?.aborted) throw error;
+        unavailable.push(server.name);
+        continue;
+      }
+      clients.push(client);
       const capabilities = client.getServerCapabilities();
       const protocolTool = (operation: string, description: string, properties: Record<string, unknown>, required: string[], run: (args: any) => Promise<any>) => {
         const name = `mcp_${crypto.createHash('sha256').update(server.name + '\0protocol:' + operation).digest('hex').slice(0, 24)}`;
@@ -119,6 +131,8 @@ export async function apiMcpTools(world: World, servers: AgentMcpServer[] = [], 
         cursor = page.nextCursor;
       } while (cursor);
     }
-    return { tools, handlers, close };
+    if (unavailable.length && !optional)
+      throw new AgentToolsUnavailable(unavailable.map((name) => ({ name, status: 'failed' })));
+    return { tools, handlers, close, unavailable };
   } catch (e) { await close(); throw e; }
 }

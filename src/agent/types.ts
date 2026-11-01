@@ -149,6 +149,11 @@ export interface TurnInput {
   secretEnv?: Record<string, string>;
   /** MCP servers the workflow gives its agents, beyond the platform baseline (SPEC §7.5). */
   agentMcp?: import('../contrib/manifests.js').AgentMcpServer[];
+  /** Start the turn even if some of its MCP tools fail to start, telling the
+   *  agent which are missing. Set on a retry: the first attempt fails as
+   *  `AgentToolsUnavailable` (often only a busy machine), the next carries on
+   *  without what still will not start rather than stopping the task. */
+  toolsOptional?: boolean;
 }
 
 /** When no turn cap is set, agents run "unlimited" — this is only a runaway

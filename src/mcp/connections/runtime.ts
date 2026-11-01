@@ -6,6 +6,7 @@ import type { World } from '../../world/types.js';
 import type { AgentMcpServer } from '../../contrib/manifests.js';
 import { isRemoteAgentWorld, ensureRemoteNode, ensureRemoteBrowser } from '../../agent/remote-process.js';
 import { mcpServerMap } from '../../autonomy/config-homes.js';
+import { AgentToolsUnavailable } from '../../agent/limits.js';
 import { BUILTIN_MCPS, McpConnections, validateMcpSelection } from './store.js';
 import { connectionHeaders } from './oauth.js';
 const quote = (s: string) => "'" + s.replace(/'/g, "'\"'\"'") + "'";
@@ -18,7 +19,10 @@ async function runnerBundle() {
 }
 export async function prepareConnections(service: McpConnections | undefined, world: World, ids: string[], projectId: string, taskId: string, onCleanup: (cleanup: () => Promise<void>) => void,
   /** Told every credential value written into the world, before it is written. */
-  onSecrets?: (values: string[]) => void): Promise<AgentMcpServer[]> {
+  onSecrets?: (values: string[]) => void,
+  /** A browser that cannot be made ready fails the turn as `AgentToolsUnavailable`
+   *  (retried as infrastructure), unless `toolsOptional`: then it is left out and named. */
+  tools: { toolsOptional?: boolean; onUnavailable?: (name: string) => void } = {}): Promise<AgentMcpServer[]> {
   validateMcpSelection(ids);
   const remote = isRemoteAgentWorld(world);
   if (process.env.KARMAX_DEPLOYMENT === 'hosted' && !remote) throw new Error('Hosted MCP connections require a remote execution environment');
@@ -32,7 +36,13 @@ export async function prepareConnections(service: McpConnections | undefined, wo
   const out: AgentMcpServer[] = [];
   for (const browser of ['chrome-devtools', 'playwright'] as const) {
     if (!ids.includes(`browser:${browser}`)) continue;
-    const servers = remote ? await ensureRemoteBrowser(world, browser, bin) : mcpServerMap({ browser });
+    let servers: Awaited<ReturnType<typeof ensureRemoteBrowser>>;
+    try { servers = remote ? await ensureRemoteBrowser(world, browser, bin) : mcpServerMap({ browser }); }
+    catch (error) {
+      if (!tools.toolsOptional) throw new AgentToolsUnavailable([{ name: browser, status: 'failed' }], { cause: error });
+      tools.onUnavailable?.(browser);
+      continue;
+    }
     for (const [name, spec] of Object.entries(servers)) out.push({ name, ...spec });
   }
   if (!selected.length || !service) return out;
