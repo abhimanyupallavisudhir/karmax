@@ -208,6 +208,8 @@ export class WorldLifecycleManager {
   /** Last provider probe per world generation, so reconciliation does not hit
    * the provider control plane on every sweep tick. */
   private probedAt = new Map<string, number>();
+  /** Parked VM worlds a probe found running, and when it first did. */
+  private strayRunning = new Map<string, number>();
   /** Failed hibernation attempts of one parked snapshot (generation and
    * updatedAt). Each attempt reopens, and so resumes and bills, the provider
    * sandbox, so a persistent failure must not repeat on every sweep (WD-2).
@@ -348,8 +350,43 @@ export class WorldLifecycleManager {
         await this.recordLifecycle(candidate.handle, 'world.destroyed', { retried: true });
       })));
     }
+    // The other way round: a VM world recorded as parked whose machine runs.
+    // Something woke it and nothing parked it again (production, 2026-10-31:
+    // a managed AWS world ran ten hours after its task had parked it, with no
+    // lease, turn or compute hold). Seen running by two probes a reconcile
+    // period apart while nothing holds or uses it, it is stopped again.
+    if (reconcileAfter > 0) {
+      for (const candidate of (await this.store.listWorldInstances('parked', now - reconcileAfter))) {
+        let provider: ReturnType<WorldRegistry['get']> | undefined;
+        try { provider = this.worlds.get(candidate.handle.kind); } catch { continue; }
+        if (!provider?.stopStray) continue;
+        const id = candidate.handle.id;
+        const key = `parked:${id}:${candidate.handle.generation ?? 1}`;
+        if ((this.probedAt.get(key) ?? 0) > now - reconcileAfter) continue;
+        await this.step(`probe parked ${id}`, () => this.worlds.withOperation(id, async () => {
+          const unchanged = async () => {
+            const current = await this.store.worldStateSnapshot(id);
+            return current?.state === 'parked' && current.generation === (candidate.handle.generation ?? 1)
+              && current.updatedAt === Number(candidate.updatedAt);
+          };
+          const held = async () => (await this.store.activeWorldLeaseCount(id)) > 0 || (await this.worlds.hasActiveAccess(id));
+          if (!(await unchanged())) return;
+          this.probedAt.set(key, now);
+          if (await held() || (await this.worlds.probe(candidate.handle as any).catch(() => undefined)) !== 'ready') {
+            this.strayRunning.delete(key);
+            return;
+          }
+          const since = this.strayRunning.get(key);
+          if (since === undefined) { this.strayRunning.set(key, now); return; }
+          if (await held() || !(await unchanged())) return;
+          await provider.stopStray!(candidate.handle as any);
+          this.strayRunning.delete(key);
+          await this.recordLifecycle(candidate.handle, 'world.parked', { reason: 'stray-wake', seenRunningAt: since });
+        }));
+      }
+    }
     for (const [key, probedAt] of this.probedAt)
-      if (probedAt < now - Math.max(2 * reconcileAfter, 60_000)) this.probedAt.delete(key);
+      if (probedAt < now - Math.max(2 * reconcileAfter, 60_000)) { this.probedAt.delete(key); this.strayRunning.delete(key); }
     await this.step('orphan sandboxes', () => this.reapOrphanSandboxes());
     await this.step('provider upkeep', () => this.housekeepProviders());
     let hibernated = 0;

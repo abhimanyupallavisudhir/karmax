@@ -372,3 +372,43 @@ it('frees a task\'s computer on request, unless the task is working', async () =
   try { await expect(held.lifecycle.release(held.task.id)).rejects.toThrow(/something is using this computer/); }
   finally { release(); }
 });
+
+// Production, 2026-10-31: a managed AWS world's machine was started an hour
+// after its task parked it, and ran ten hours more with the world recorded as
+// parked: no lease, no turn, no compute hold, nothing to stop it again.
+it.each(['stray', 'leased', 'accessed', 'not a VM', 'stops by itself'])('stops a parked VM world whose machine runs: %s', async (variant) => {
+  const store = await Store.create(':memory:'); stores.push(store);
+  const project = await store.createProject('Stray', { hibernateAfterMs: 7 * 24 * 60 * 60 * 1000 });
+  const task = await store.createTask({ projectId: project.id, title: 'Parked', workflow: 'software-dev',
+    workflowVersion: '1.0.0', params: { prompt: 'fixture' } });
+  const handle = await store.registerWorld({ kind: 'memory', id: task.id, root: '/fixture', branch: 'main', base: 'main' }, project.id) as WorldHandle;
+  await store.setWorldState(handle, 'parked');
+  const worlds = new WorldRegistry();
+  const probe = vi.fn(async () => 'ready');
+  const stopStray = vi.fn(async () => {});
+  worlds.register({ kind: 'memory', parkStopsProcesses: true, open: vi.fn(), probe,
+    ...(variant === 'not a VM' ? {} : { stopStray }) } as any);
+  if (variant === 'leased') {
+    await store.createRunnerPool({ id: 'test', organizationId: project.organizationId!, name: 'Test', provider: 'memory',
+      mode: 'customer', capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
+    await store.requestWorldLease({ runnerPoolId: 'test', organizationId: project.organizationId!, projectId: project.id,
+      taskId: task.id, worldId: task.id });
+  }
+  const release = variant === 'accessed' ? await worlds.holdAccess(task.id) : undefined;
+  const lifecycle = new WorldLifecycleManager(store, worlds, { checkpoint: vi.fn() } as any);
+  try {
+    // Seen running once: it may be a wake still on its way to `ready`.
+    await lifecycle.sweep(Date.now() + 20 * 60_000);
+    expect(stopStray).not.toHaveBeenCalled();
+    if (variant === 'stops by itself') probe.mockResolvedValue('parked');
+    await lifecycle.sweep(Date.now() + 25 * 60_000);
+    expect(stopStray).not.toHaveBeenCalled(); // probed once per reconcile period
+    await lifecycle.sweep(Date.now() + 31 * 60_000);
+  } finally { release?.(); }
+  const stopped = variant === 'stray';
+  expect(stopStray).toHaveBeenCalledTimes(stopped ? 1 : 0);
+  expect(probe).toHaveBeenCalledTimes(['not a VM', 'leased', 'accessed'].includes(variant) ? 0 : 2);
+  expect((await store.eventsOfType(task.id, 'world.parked')).map((event) => event.payload))
+    .toEqual(stopped ? [expect.objectContaining({ reason: 'stray-wake' })] : []);
+  expect(await store.worldState(task.id)).toBe('parked');
+});

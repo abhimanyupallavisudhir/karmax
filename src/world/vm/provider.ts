@@ -252,6 +252,12 @@ export class VmWorldProvider implements WorldProvider {
     return handle;
   }
 
+  async stopStray(handle: WorldHandle): Promise<void> {
+    // Another process may have woken it: what this one remembers says nothing.
+    this.states.delete(handle.id);
+    await this.park(handle);
+  }
+
   async destroy(handle: WorldHandle): Promise<void> {
     const sealed = this.reference(handle);
     const scope = connectionScope(sealed);

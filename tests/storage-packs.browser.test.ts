@@ -19,6 +19,10 @@ import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { MANAGED_COMPUTE, WorldProviderConnectionService } from '../src/world/connections.js';
 
+/** A time this month: usage booked "an hour ago" just after a month began
+ * would fall partly in the month before, whose credit is not the one asked for. */
+const inThisMonth = (at: number) => { const now = new Date(); return Math.max(at, Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)); };
+
 it('adds and removes storage and compute packs in Plan & billing, showing only verified packs', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'storage-packs-browser-'));
   const port = await findFreePortFrom(48860);
@@ -44,7 +48,7 @@ it('adds and removes storage and compute packs in Plan & billing, showing only v
     { check: async () => {}, limits: async () => ({}) });
   await providerConnections.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', apiKey: 'operator-key', config: { maxRunning: 20 } });
   await store.recordUsage({ id: 'usage:e2b:browser', organizationId: org.id, provider: 'e2b', kind: 'world.active', quantity: 3600,
-    unit: 'second', costMicros: 1_500_000, startedAt: Date.now() - 3_700_000, endedAt: Date.now() - 100_000, fundingSource: 'managed' });
+    unit: 'second', costMicros: 1_500_000, startedAt: inThisMonth(Date.now() - 3_700_000), endedAt: inThisMonth(Date.now() - 100_000), fundingSource: 'managed' });
   const worlds = new WorldRegistry(), tokens = new TokenAuthority();
   const client = { workflow: { getHandle: () => ({ query: async () => [] }) } } as any;
   const api = new KarmaxApi({ store, tokens, worlds, client, taskQueue: 'test', contentDir: directory });
