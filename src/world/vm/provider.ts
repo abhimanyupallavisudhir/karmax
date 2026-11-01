@@ -86,7 +86,8 @@ export interface VmDriver {
   test(connection: ResolvedWorldProviderConnection): Promise<void>;
 }
 
-type Resolver = (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>;
+/** The account for an organization's computers; `new` for one about to be made (src/world/connections.ts resolve). */
+type Resolver = (organizationId: string | undefined, provider: string, options?: { new?: boolean }) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>;
 
 /** Where a deleted world's last usage waits for the feed (the store's kv). */
 export interface VmUsageLedger {
@@ -143,7 +144,7 @@ export class VmWorldProvider implements WorldProvider {
       throw new Error(`${this.driver.name} computers have unrestricted outbound network. Choose E2B or Daytona for an allowlist.`);
     if (!features.desktop && spec.environment?.flavor === 'desktop')
       throw new Error(`${this.driver.name} computers are headless. Choose E2B or Daytona for a desktop.`);
-    const connection = await this.connection(spec.organizationId);
+    const connection = await this.connection(spec.organizationId, { new: true });
     const shape = await this.driver.shape(spec.resources, connection);
     const labels = { karmaxHome: serviceHomeLabel(), karmaxTaskId: spec.taskId, karmaxGeneration: String(spec.generation ?? 1),
       ...(spec.organizationId ? { karmaxOrganizationId: spec.organizationId } : {}) };
@@ -451,8 +452,8 @@ export class VmWorldProvider implements WorldProvider {
 
   private home(): string { return this.options.home ?? VM_HOME; }
 
-  private async connection(organizationId: string | undefined): Promise<ResolvedWorldProviderConnection> {
-    return this.resolveConnection(organizationId, this.kind);
+  private async connection(organizationId: string | undefined, options?: { new?: boolean }): Promise<ResolvedWorldProviderConnection> {
+    return this.resolveConnection(organizationId, this.kind, options);
   }
 
   private seal(value: Record<string, string>): string {

@@ -137,7 +137,7 @@ export class E2BWorldProvider implements WorldProvider {
     private factory: E2BFactory = defaultE2BFactory(),
     private idleMs = envPositiveInt('KARMAX_E2B_IDLE_MS', DEFAULT_IDLE_MS),
     private template = e2bTemplate(),
-    private resolveConnection?: (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>,
+    private resolveConnection?: (organizationId: string | undefined, provider: string, options?: { new?: boolean }) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>,
     private desktopTemplate = process.env.KARMAX_E2B_DESKTOP_TEMPLATE ?? 'desktop',
     private referenceKeys?: WorldReferenceKeys,
   ) {
@@ -151,7 +151,7 @@ export class E2BWorldProvider implements WorldProvider {
   }
 
   async create(spec: WorldSpec): Promise<World> {
-    const connection = (await this.connection(spec.organizationId));
+    const connection = (await this.connection(spec.organizationId, { new: true }));
     const flavor = spec.environment?.flavor ?? 'headless';
     const baseTemplate = flavor === 'desktop'
       ? spec.environment?.template ?? spec.environment?.snapshot ?? connection?.config.desktopTemplate ?? this.desktopTemplate
@@ -499,8 +499,8 @@ export class E2BWorldProvider implements WorldProvider {
     return this.factory.connect(matches[0]!.sandboxId, options);
   }
 
-  private async connection(organizationId: string | undefined): Promise<ResolvedWorldProviderConnection | undefined> {
-    if (this.resolveConnection) return (await this.resolveConnection(organizationId, this.kind));
+  private async connection(organizationId: string | undefined, options?: { new?: boolean }): Promise<ResolvedWorldProviderConnection | undefined> {
+    if (this.resolveConnection) return (await this.resolveConnection(organizationId, this.kind, options));
     return process.env.E2B_API_KEY ? { organizationId, provider: this.kind, apiKey: process.env.E2B_API_KEY,
       config: { template: this.template, desktopTemplate: this.desktopTemplate } } : undefined;
   }

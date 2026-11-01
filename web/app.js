@@ -24628,9 +24628,13 @@ function computersMarkup(connections, held = []) {
   return `<div class="computer-providers">${reach ? computerAnyRow(connections) : ''}${connectedIds.map((id) => [id, COMPUTER_PROVIDERS[id]]).map(([id, info]) => {
     const connection = connections.find((candidate) => candidate.provider === id);
     const state = computerConnectionState(connection);
+    // Its own account switched off: new computers take the managed one offered beside it.
+    const included = connection && !connection.enabled && connections.some((candidate) => candidate.provider === id && candidate.managed);
     const mine = held.filter((computer) => computer.provider === id);
     return `<div class="computer-provider" data-provider="${id}"><b>${esc(info.name)}</b>
-      <span class="chip ${state.tone}"${connection?.managed ? ` title="${esc(`Runs on ${siteName()}’s ${info.name} account, charged to this organization’s monthly compute (Plan & billing). Connect your own account to use it instead.`)}"` : connection?.lastError ? ` title="${esc(connection.lastError)}"` : ''}>${esc(state.label)}</span>
+      <span class="chip ${state.tone}"${connection?.managed ? ` title="${esc(`Runs on ${siteName()}’s ${info.name} account, charged to this organization’s monthly compute (Plan & billing). Connect your own account to use it instead.`)}"`
+        : included ? ` title="${esc(`New computers run on ${siteName()}’s ${info.name} account, charged to this organization’s monthly compute. Ones already on yours stay there until their tasks end.`)}"`
+        : connection?.lastError ? ` title="${esc(connection.lastError)}"` : ''}>${esc(state.label)}</span>
       ${connection?.limits ? computerLimitsSummary(id, connection.limits) : ''}
       ${connection?.features?.internet === 'basic' ? `<span class="chip computer-basic" title="${esc('Reaches package registries, Git hosts, AI and cloud APIs only, and takes no allowlist. Any runs only tasks whose Outbound network says basic internet is enough here.')}">Basic internet</span>` : ''}
       ${mine.length ? `<button class="chip computer-held-toggle" type="button" aria-expanded="false" title="Tasks holding a machine or disk here">${mine.length} in use</button>` : ''}
