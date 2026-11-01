@@ -6,7 +6,7 @@ import { bootHarness, Harness } from './helpers/harness.js';
 import { git, gitOrThrow, ensureIdentity, defaultBranch } from '../src/world/git.js';
 import { reconcileTasks } from '../src/platform/reconcile.js';
 import { WorkflowFailedError } from '@temporalio/client';
-import { TerminatedFailure } from '@temporalio/common';
+import { ActivityFailure, ApplicationFailure, RetryState, TerminatedFailure } from '@temporalio/common';
 import { Store } from '../src/store/db.js';
 
 describe('defaultBranch detection', () => {
@@ -78,6 +78,28 @@ describe('reconcileTasks (settle lost workflows on restart)', () => {
       expect((await reconcileTasks(store, client)).settled).toBe(1);
       expect(handles).toEqual([undefined, 'terminated-run']);
       expect((await store.getTask(t.id))?.lastView?.error).toBe('workflow terminated: Workflow history size exceeds limit.');
+    } finally { (await store.close()); }
+  });
+
+  // A run that failed said only "workflow failed": what failed, and in which
+  // activity, was left in Temporal's history (pramana#13, #137).
+  it('keeps the cause of a failed run, naming the activity that failed', async () => {
+    const store = (await Store.create(':memory:'));
+    const p = (await store.createProject('P', {}));
+    const t = (await store.createTask({ projectId: p.id, title: 'T', workflow: 'software-dev', workflowVersion: '1.30.0', params: { prompt: 'x' } }));
+    (await store.saveView(t.id, { taskId: t.id, title: 'T', workflow: 'software-dev', stage: 'review', status: 'active',
+      messages: [], actions: [], state: {}, updatedAt: 0 }));
+    const cause = new ActivityFailure('Activity task failed', 'checkProposal', '7', RetryState.MAXIMUM_ATTEMPTS_REACHED, 'worker',
+      ApplicationFailure.create({ message: 'git push was rejected', type: 'Error' }));
+    const client: any = { workflow: { getHandle: () => ({
+      describe: async () => ({ status: { name: 'FAILED' }, runId: 'failed-run' }),
+      result: async () => { throw new WorkflowFailedError('Workflow execution failed', cause, 'NON_RETRYABLE_FAILURE'); },
+    }) } };
+    try {
+      expect((await reconcileTasks(store, client)).settled).toBe(1);
+      expect((await store.getTask(t.id))?.lastView).toMatchObject({
+        status: 'failed', state: { failedFrom: 'review' }, error: 'workflow failed in checkProposal: git push was rejected',
+      });
     } finally { (await store.close()); }
   });
 

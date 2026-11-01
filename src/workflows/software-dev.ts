@@ -16,6 +16,7 @@ import {
   CancellationScope,
   isCancellation,
   ApplicationFailure,
+  TemporalFailure,
   ParentClosePolicy,
   log,
   patched,
@@ -39,6 +40,7 @@ import {
   participantLabel, participantRole, reviewerKey, selectorAgent,
 } from '../domain/participants.js';
 import { resetAtFromHint } from '../agent/limits.js';
+import { failureText } from '../domain/failure-text.js';
 import { isCapacityFailure, isInfraFailure, limitFailureClassification, CAPACITY_WAIT_MS, CAPACITY_WAIT_LIMIT_MS, INFRA_BACKOFF_MS, WORLD_WAIT_MS, WORLD_WAIT_LIMIT_MS } from './failures.js';
 import {
   TaskInput,
@@ -433,6 +435,16 @@ const CONTINUE_AFTER_BYTES = 4 * 1024 * 1024;
 const CONTINUE_AFTER_EVENTS_BEFORE = 4_000;
 const CONTINUE_AFTER_BYTES_BEFORE = 8 * 1024 * 1024;
 const CONTINUE_SOONER = 'software-dev-continue-sooner-v1';
+/** A run that fails publishes why, and the stage Retry resumes, before it
+ * closes: the reconciler used to settle it a minute later as "workflow
+ * failed", with the cause left in Temporal's history (pramana#13, #137). */
+const FAILURE_NAMES_CAUSE = 'software-dev-failure-names-cause-v1';
+/** The snapshot before sub-tasks heartbeats instead of a 5-minute limit, and
+ * a failure goes to the asking agent as a failed create_sub_task (pramana#137). */
+const SUBTASK_SNAPSHOT_TO_AGENT = 'software-dev-subtask-snapshot-to-agent-v1';
+/** A pull request that cannot move to the head its task's agent opened it at
+ * tells that agent and stays where it was (pramana#137's pull request). */
+const PR_MOVE_FAILURE_TO_AGENT = 'software-dev-pr-move-failure-to-agent-v1';
 /** A continuation input is recorded by value: stay well inside the 2 MB payload limit. */
 const MAX_CONTINUATION_BYTES = 1024 * 1024;
 const CONTINUE_RETRY_EVENTS = 500;
@@ -943,6 +955,7 @@ async function softwareDevImpl(
   let reviewInfo: ReviewInfo | undefined = recovery?.reviewInfo;
   let error: string | undefined = continued?.error;
   let terminalOrigin: Stage | undefined;
+  let failedFrom: Stage | undefined;
   let prs: TaskPullRequest[] = recovery?.prs?.map((candidate) => ({ ...candidate })) ?? [];
   let pr: TaskPullRequest | undefined = prs[0];
   const prHeadMap = (items: TaskPullRequest[]): Record<string, string> => Object.fromEntries(
@@ -1519,6 +1532,7 @@ async function softwareDevImpl(
         // createWorld would force-remove the dirty worktree and lose work.
         recoveryWorld: world,
         ...(terminalOrigin ? { cancelledFrom: terminalOrigin } : {}),
+        ...(failedFrom ? { failedFrom } : {}),
         ...(humanPauseActive ? { humanPauseOrigin: recoveryStage } : {}),
         ...(interlocksLandingTransitions && lifecycleTransitionBlocked ? { lifecycleTransitionBlocked: true } : {}),
       },
@@ -4115,7 +4129,18 @@ Inspect the complete current diff and specifically compare its delta from the re
         if (pendingHead && world) {
           const head = pendingHead;
           pendingHead = undefined;
-          await core.movePullRequest(world as WorldHandle, head);
+          if (patched(PR_MOVE_FAILURE_TO_AGENT)) {
+            // A head this pull request cannot take is its task's agent's to fix,
+            // not the end of it (pramana#137's): it stays at its last commit.
+            const moved = await core.movePullRequest(world as WorldHandle, head).then(() => true, async (err) => {
+              if (isCancellation(err)) throw err;
+              if (input.parentTaskId) await getExternalWorkflowHandle(input.parentTaskId).signal(pullRequestNoticeSignal,
+                { childTaskId: taskId, kind: 'needs-work', text: `It could not be updated to ${head.slice(0, 8)}: ${innermostMessage(err).trim().replace(/\.?$/, '.')} It is still at its previous commit.` })
+                .catch(() => undefined);
+              return false;
+            });
+            if (!moved) { prRequested = false; continue; }
+          } else await core.movePullRequest(world as WorldHandle, head);
         }
         seen = msgs.length;
         return { completed: true, providerCompleted: true, output: '', openPrRequested: true };
@@ -4140,7 +4165,21 @@ Inspect the complete current diff and specifically compare its delta from the re
    *  the top. Commit-on-spawn snapshots our work first (worktrees share commits, not the
    *  dirty tree) so children fork the current state. */
   async function spawnSubTasks(list: SpawnRequest[], requester = MAIN_AGENT) {
-    await core.commitWork(world as any, `tavya: snapshot before sub-tasks for ${taskId}`);
+    const snapshot = `tavya: snapshot before sub-tasks for ${taskId}`;
+    // Committing every checkout takes as long as git walks them, minutes with
+    // a large data tree; a snapshot that cannot be made is the asking agent's,
+    // not the end of this task (pramana#137: 3 × 5 minutes, then "workflow failed").
+    if (list.length && patched(SUBTASK_SNAPSHOT_TO_AGENT)) {
+      preparingSubTask = true;
+      await publish();
+      try { await prepareSubTask(list[0]!, () => childPreparation.commitWork(world as any, snapshot)); }
+      catch (err) {
+        if (isCancellation(err)) throw err;
+        preparingSubTask = false;
+        await unpreparedSubTasks(list[0]!, list.slice(1), err, requester);
+        return;
+      } finally { preparingSubTask = false; }
+    } else await core.commitWork(world as any, snapshot);
     for (const [index, s] of list.entries()) {
       // Preserve recorded spawn/drop decisions during replay. New decisions have
       // no per-parent child cap; execution is governed by shared admission control.
@@ -4178,7 +4217,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       if (patched('subtask-prepare-failure-to-agent-v1')) {
         preparingSubTask = true;
         await publish();
-        try { childInput = await prepareSubTask(s, prepare); }
+        try { childInput = await prepareSubTask(s, () => childPreparation.prepareChildTask(prepare)); }
         catch (err) {
           if (isCancellation(err)) throw err;
           preparingSubTask = false;
@@ -4216,9 +4255,9 @@ Inspect the complete current diff and specifically compare its delta from the re
    * than the activity's retries (a VM whose connection stays lost): that is
    * waited out as any stage's infrastructure is, visibly, a Retry or a cancel
    * ending a wait early. */
-  async function prepareSubTask(request: SubTaskRequest, prepare: Parameters<coreActivities['prepareChildTask']>[0]) {
+  async function prepareSubTask<T>(request: SubTaskRequest, prepare: () => Promise<T>): Promise<T> {
     for (let waits = 0; ; waits++) {
-      try { return await childPreparation.prepareChildTask(prepare); }
+      try { return await prepare(); }
       catch (err) {
         if (!isInfraFailure(err) || waits >= INFRA_BACKOFF_MS.length || !patched(SUBTASK_PREPARE_WAITS_FOR_WORLD)) throw err;
         const wait = INFRA_BACKOFF_MS[waits]!;
@@ -6556,10 +6595,23 @@ Inspect the complete current diff and specifically compare its delta from the re
   return { stage, sha };
   } catch (e) {
     if (e instanceof Cancelled || (isCancellation(e) && cancelled)) return await abort();
+    // Only a Temporal failure fails the run; anything else (a bug) fails the
+    // workflow task, which Temporal retries, so the run is not over.
+    if (e instanceof TemporalFailure && patched(FAILURE_NAMES_CAUSE)) await publishFailure(e);
     throw e;
   }
 
   // ── helpers ──
+  /** Say why the run failed, and where Retry picks it up, before it closes. */
+  async function publishFailure(e: unknown) {
+    failedFrom = multiAgent && stage === 'escalated' && escalatedFrom ? escalatedFrom : stage;
+    stage = 'failed';
+    status = 'failed';
+    waitingFor = undefined;
+    error = `workflow failed${failureText(e)}`;
+    await publish().catch(() => undefined);
+  }
+
   async function abort() {
     // Whatever happens to the world now happens to all of it.
     if (fullWorld) { world = fullWorld; fullWorld = undefined; }
