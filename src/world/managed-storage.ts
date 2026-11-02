@@ -101,6 +101,11 @@ export class ManagedStorageService {
     let notices = 0;
     if (store.hosted) for (const organization of (await store.listOrganizations()))
       notices += (await this.enforceQuota(organization.id, now));
+    // Insights' storage over time (wiki features/insights): today's figure, by kind and project.
+    const { recordStorageDay } = await import('../platform/insights-usage.js');
+    for (const organization of (await store.listOrganizations()))
+      await recordStorageDay(store, organization.id, now)
+        .catch((error) => console.warn(`[storage] could not record ${organization.id}'s storage for today: ${error instanceof Error ? error.message : String(error)}`));
     return { expiredCheckpoints, deletedRevisions, expiredVersions, notices };
   }
 

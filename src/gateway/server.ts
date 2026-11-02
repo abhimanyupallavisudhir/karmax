@@ -3663,10 +3663,18 @@ export class Gateway {
       if (insights && method === 'GET') {
         const organizationId = insights[1]!;
         const { organizationInsights } = await import('../platform/insights.js');
+        const may = async (capability: Capability, scope?: { organizationId: string }) => (await this.deps.tokens.check(token, capability, scope)).ok;
+        // Managed compute (wiki features/insights): the month's credit where it is
+        // offered; each account's budget only for the installation's operators.
+        const managed = (await this.deps.providerConnections?.managedConnections()) ?? [];
         return this.json(res, 200, await organizationInsights(store, organizationId, {
           days: Number(url.searchParams.get('days') ?? 30),
           utcOffsetMinutes: Number(url.searchParams.get('utcOffset') ?? 0),
-          includeSpend: (await this.deps.tokens.check(token, 'payment:read', { organizationId })).ok,
+          includeSpend: await may('payment:read', { organizationId }),
+          includeLogins: await may('credential:read', { organizationId }),
+          computeCredit: store.hosted && managed.length > 0,
+          ...(managed.length && await may('settings:read')
+            ? { managedBudgets: managed.map((account) => ({ provider: account.provider, ...(account.limits?.pool ? { pool: account.limits.pool } : {}) })) } : {}),
         }));
       }
       const usage = p.match(/^\/api\/organizations\/([^/]+)\/usage$/);
