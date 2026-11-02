@@ -1,7 +1,7 @@
 import { BRAND } from '../domain/brand.js';
 import { accountDiskGb, parkedHolds, providerDefaults, type AccountPool } from '../domain/computer-limits.js';
 import type { Store } from '../store/db.js';
-import { accountKey, enqueue, ordered, RESERVE_AFTER_MS, taskPriority, waiters, type Waiter } from './compute-queue.js';
+import { accountKey, enqueue, ordered, RESERVE_AFTER_MS, taskPriority, waiters, withStandings, type Waiter } from './compute-queue.js';
 import { DEFAULT_MANAGED_SHARE, MANAGED_COMPUTE, providerName } from './connections.js';
 
 /**
@@ -114,18 +114,22 @@ export async function accountRoom(store: Store, account: Account, request: RoomR
   else if (queued && request.taskId) {
     // Room now: is it someone else's, who waited first and could take it?
     // Its place: where it waits, or where it would join — after everyone
-    // already waiting (within its organization, at its priority).
+    // already waiting (within its organization, by its tree's standing).
     const me: Waiter = queue.find((waiter) => waiter.taskId === request.taskId)
       ?? { taskId: request.taskId, organizationId: request.organizationId, priority: await taskPriority(store, request.taskId),
         since: Number.POSITIVE_INFINITY, accounts: {} };
-    const line = ordered([...queue.filter((waiter) => waiter.taskId !== me.taskId), { ...me, accounts: { ...me.accounts, [key]: now } }], key);
-    const fits = (waiter: Waiter) => (!pool.cpu || use.cpu + (waiter.cpu ?? cpu) <= pool.cpu)
-      && (!pool.diskGb || use.diskGb + accountDiskGb(provider, waiter.diskGb) <= pool.diskGb);
+    const line = ordered(await withStandings(store,
+      [...queue.filter((waiter) => waiter.taskId !== me.taskId), { ...me, accounts: { ...me.accounts, [key]: now } }], now), key);
+    const diskFits = (waiter: Waiter) => !pool.diskGb || use.diskGb + accountDiskGb(provider, waiter.diskGb) <= pool.diskGb;
+    const fits = (waiter: Waiter) => (!pool.cpu || use.cpu + (waiter.cpu ?? cpu) <= pool.cpu) && diskFits(waiter);
     const known = Boolean(pool.cpu || pool.diskGb || pool.machines);
     // Where the budget is known, one ahead blocks only if it could take this
-    // room (or has waited long enough to keep it); else the order is strict.
+    // room, or has waited long enough to keep it — CPUs and machines free as
+    // worlds park, so keeping them lets a big machine through; disk frees
+    // only when worlds go, so keeping it for one that does not fit blocked
+    // everyone behind it for hours (pramana, 2026-11-02). Else the order is strict.
     const ahead = line.slice(0, line.findIndex((waiter) => waiter.taskId === me.taskId))
-      .filter((waiter) => !known || fits(waiter) || now - waiter.since >= RESERVE_AFTER_MS);
+      .filter((waiter) => !known || fits(waiter) || (now - waiter.since >= RESERVE_AFTER_MS && diskFits(waiter)));
     if (ahead.length)
       refusal = ({ reason: `${ahead.length} waiting ahead`, message: `${ahead.length === 1 ? 'A task is' : `${ahead.length} tasks are`} waiting ahead of this one for `
         + `${account.managed ? name : `this organization's ${providerName(provider)} account`}; waiting its turn.` });

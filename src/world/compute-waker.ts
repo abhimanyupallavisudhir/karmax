@@ -1,6 +1,6 @@
 import type { Store } from '../store/db.js';
 import { accountRoom, type Account } from './account-room.js';
-import { dequeue, noteSignalled, ordered, waiters, type AccountKey } from './compute-queue.js';
+import { dequeue, noteSignalled, ordered, waiters, withStandings, type AccountKey } from './compute-queue.js';
 
 /**
  * The compute queue's waker (wiki features/managed-compute § Queue): a task
@@ -37,7 +37,7 @@ export async function wakeComputeQueue(deps: WakerDeps): Promise<string[]> {
     const status = (await store.getTask(waiter.taskId))?.lastView?.status;
     if (status === undefined || ENDED.has(status)) await dequeue(store, waiter.taskId, now);
   }
-  all = await waiters(store, now);
+  all = await withStandings(store, await waiters(store, now), now);
   const told: string[] = [];
   for (const key of new Set(all.flatMap((waiter) => Object.keys(waiter.accounts)))) {
     const account = await deps.account(key);

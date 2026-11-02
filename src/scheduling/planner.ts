@@ -58,7 +58,7 @@ export interface PlannerStore extends ModelSource {
 }
 
 /** People's orders and run-now marks, less those on tasks that are gone (deleted, done, cancelled). */
-async function manualChoices(store: PlannerStore, org: string): Promise<{ order: OrderConstraint[]; runNow: Set<string> }> {
+export async function manualChoices(store: PlannerStore, org: string): Promise<{ order: OrderConstraint[]; runNow: Set<string> }> {
   const order = (await kvJson<OrderConstraint[]>(store, orderKey(org))) ?? [];
   const marks = (await kvJson<RunNow[]>(store, runNowKey(org))) ?? [];
   const ids = [...new Set([...order.flatMap((c) => [c.above, c.below]), ...marks.map((m) => m.root)])];

@@ -1,3 +1,4 @@
+import { computeStandings } from '../scheduling/compute-order.js';
 import type { Store } from '../store/db.js';
 
 /**
@@ -13,8 +14,12 @@ import type { Store } from '../store/db.js';
  * that now fits to try again at once instead of at its next retry.
  *
  * Order: across organizations, who waited first; within one organization,
- * the higher priority first (its root task's, none counting as medium), then
- * who waited first. Priority never jumps another organization's queue, so no
+ * the order the quota scheduler gives its trees (priority × how little the
+ * tree has spent, people's placements, Run now), each tree's rank divided by
+ * one more than the machines it holds, so a task with many sub-tasks gets its
+ * share, not every machine (scheduling/compute-order.ts). Without that
+ * (`withStandings` not applied, or it failed), the root's priority, then who
+ * waited first. Neither ever jumps another organization's queue, so no
  * organization gets ahead by marking everything urgent.
  */
 
@@ -35,6 +40,10 @@ export interface Waiter {
   diskGb?: number;
   /** When the waker last told it to try again. */
   signalled?: number;
+  /** Its standing in its organization, computed when ordering (never stored): see `withStandings`. */
+  rank?: number;
+  within?: number;
+  runNow?: boolean;
 }
 
 /** A waiter that has not asked for an account this long is gone (its task
@@ -102,11 +111,45 @@ export async function noteSignalled(store: Store, taskId: string, now = Date.now
   await change(store, now, (queue) => { if (queue[taskId]) queue[taskId].signalled = now; });
 }
 
+const near = (x: number, y: number) => Math.abs(x - y) <= 1e-6 * Math.max(Math.abs(x), Math.abs(y));
+
+type Ordering = Pick<Waiter, 'organizationId' | 'priority' | 'since' | 'taskId' | 'rank' | 'within' | 'runNow'>;
+
 /** Whether `a` comes before `b` in the queue. */
-export function before(a: Pick<Waiter, 'organizationId' | 'priority' | 'since' | 'taskId'>, b: Pick<Waiter, 'organizationId' | 'priority' | 'since' | 'taskId'>): boolean {
+export function before(a: Ordering, b: Ordering): boolean {
   if (a.taskId === b.taskId) return false;
-  if (a.organizationId === b.organizationId && a.priority !== b.priority) return a.priority > b.priority;
+  if (a.organizationId === b.organizationId) {
+    if (a.rank !== undefined && b.rank !== undefined) {
+      if (Boolean(a.runNow) !== Boolean(b.runNow)) return Boolean(a.runNow);
+      // Ranks within a millionth are equal: people's placements nudge untouched ones by about that much.
+      if (!near(a.rank, b.rank)) return a.rank > b.rank;
+      if (!near(a.within ?? 1, b.within ?? 1)) return (a.within ?? 1) > (b.within ?? 1);
+    } else if (a.priority !== b.priority) return a.priority > b.priority;
+  }
   return a.since !== b.since ? a.since < b.since : a.taskId < b.taskId;
+}
+
+/**
+ * The waiters with their standing in their organization filled in (rank,
+ * within, runNow), for `ordered`. An organization with one waiter needs none;
+ * one whose standings cannot be read keeps the priority order.
+ */
+export async function withStandings(store: Store, all: Waiter[], now = Date.now()): Promise<Waiter[]> {
+  const byOrganization = new Map<string, Waiter[]>();
+  for (const waiter of all) byOrganization.set(waiter.organizationId, [...(byOrganization.get(waiter.organizationId) ?? []), waiter]);
+  const standing = new Map<string, Pick<Waiter, 'rank' | 'within' | 'runNow'>>();
+  for (const [organization, list] of byOrganization) {
+    if (list.length < 2) continue;
+    try {
+      const found = await computeStandings(store, organization,
+        list.map((w) => ({ taskId: w.taskId, since: Number.isFinite(w.since) ? w.since : now })), now);
+      for (const [taskId, s] of found) standing.set(taskId, s);
+    } catch { /* the priority order */ }
+  }
+  return all.map((waiter) => {
+    const s = standing.get(waiter.taskId);
+    return s ? { ...waiter, rank: s.rank, within: s.within, ...(s.runNow ? { runNow: true } : {}) } : waiter;
+  });
 }
 
 /** The waiters for `account` in queue order. Within each organization its
