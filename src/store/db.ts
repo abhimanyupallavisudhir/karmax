@@ -1086,7 +1086,7 @@ export class Store {
         createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS subscription_gifts (
-        organizationId TEXT PRIMARY KEY, plan TEXT NOT NULL,
+        organizationId TEXT PRIMARY KEY, plan TEXT NOT NULL, seats INTEGER,
         grantedBy TEXT NOT NULL, grantedAt INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS storage_pack_gifts (
@@ -1491,6 +1491,12 @@ export class Store {
       (await this.db.exec('ALTER TABLE organizations ADD COLUMN storagePacks INTEGER NOT NULL DEFAULT 0'));
     if (!organizationCols.some((c) => c.name === 'computePacks'))
       (await this.db.exec('ALTER TABLE organizations ADD COLUMN computePacks INTEGER NOT NULL DEFAULT 0'));
+    if (!organizationCols.some((c) => c.name === 'seatLimit'))
+      (await this.db.exec('ALTER TABLE organizations ADD COLUMN seatLimit INTEGER'));
+    const giftCols = (await this.db.prepare('PRAGMA table_info(subscription_gifts)').all()) as { name: string }[];
+    if (!giftCols.some((c) => c.name === 'seats'))
+      (await this.db.exec('ALTER TABLE subscription_gifts ADD COLUMN seats INTEGER'));
+    (await this.migrateGiftSeats());
     const policyAcceptanceCols = (await this.db.prepare('PRAGMA table_info(policy_acceptances)').all()) as { name: string }[];
     if (!policyAcceptanceCols.some((c) => c.name === 'organizationId'))
       (await this.db.exec('ALTER TABLE policy_acceptances ADD COLUMN organizationId TEXT'));
@@ -2317,7 +2323,31 @@ export class Store {
       (await this.listOrganizationMemberships(organizationId)).length, {
         storagePacks: organization.storagePacks ?? 0, giftedStoragePacks: (await this.storagePackGift(organizationId))?.packs ?? 0,
         computePacks: organization.computePacks ?? 0, giftedComputePacks: (await this.computePackGift(organizationId))?.packs ?? 0,
+        seatLimit: organization.seatLimit ?? null,
       });
+  }
+
+  /** Gifted Teams from before gifts had seats cover the people they had
+   * then: the seats their members hold, at least the one a Team includes. */
+  async migrateGiftSeats(): Promise<void> {
+    const rows = (await this.db.prepare("SELECT organizationId FROM subscription_gifts WHERE plan='team' AND seats IS NULL").all()) as { organizationId: string }[];
+    for (const { organizationId } of rows) {
+      const members = Number(((await this.db.prepare('SELECT COUNT(*) n FROM organization_memberships WHERE organizationId=?')
+        .get(organizationId)) as any).n);
+      (await this.db.prepare("UPDATE subscription_gifts SET seats=? WHERE organizationId=? AND plan='team' AND seats IS NULL")
+        .run(Math.max(1, members), organizationId));
+    }
+  }
+
+  /** Billing's seat boundary, beside setOrganizationPlan: how many people the
+   * organization's Team covers when nothing bills a new one (a gifted Team and
+   * the seats bought beside it), or null when anyone may join. */
+  async setOrganizationSeatLimit(organizationId: string, seatLimit: number | null): Promise<void> {
+    await this.db.transaction(async () => {
+      if (seatLimit !== null && (!Number.isSafeInteger(seatLimit) || seatLimit < 1)) throw new Error('a seat limit must be a positive integer');
+      (await this.db.prepare('UPDATE organizations SET seatLimit=? WHERE id=?').run(seatLimit, organizationId));
+      this.notifyOrganizationEntitlementsChanged(organizationId);
+    });
   }
 
   /** Storage packs the operator gifted, independent of billing. */
@@ -2410,9 +2440,12 @@ export class Store {
   private async assertOrganizationMemberCapacity(organizationId: string, userId?: string): Promise<void> {
     if (!this.hosted || (userId && (await this.organizationMembership(organizationId, userId)))) return;
     const entitlements = (await this.organizationEntitlements(organizationId));
-    if (entitlements.maxMembers == null) return;
     const count = entitlements.currentMemberCount;
     if (entitlements.memberAdmissionAllowed) return;
+    if (entitlements.maxMembers == null) {
+      const seats = entitlements.seatLimit ?? 0;
+      throw new EntitlementError(`All ${seats} seat${seats === 1 ? ' is' : 's are'} taken. An owner can add a seat in Plan & billing.`);
+    }
     if (entitlements.overMemberLimit) {
       const extra = count - entitlements.maxMembers;
       throw new EntitlementError(
@@ -10953,7 +10986,7 @@ function requiredTargets(policy: ConfirmationPolicy): number {
 function rowToOrganization(r: any): Organization {
   return { id: r.id, name: r.name, slug: r.slug, kind: r.kind, nameVisibility: r.nameVisibility === 'public' ? 'public' : 'members',
     plan: isHostedPlanId(r.plan) ? r.plan : 'free', storagePacks: Number(r.storagePacks ?? 0) || 0,
-    computePacks: Number(r.computePacks ?? 0) || 0, createdAt: r.createdAt };
+    computePacks: Number(r.computePacks ?? 0) || 0, ...(r.seatLimit == null ? {} : { seatLimit: Number(r.seatLimit) }), createdAt: r.createdAt };
 }
 
 function rowToTeam(r: any): Team {

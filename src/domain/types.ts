@@ -54,6 +54,9 @@ export interface Organization {
   storagePacks?: number;
   /** Paid compute packs billing has verified; ignored on Free. */
   computePacks?: number;
+  /** People a Team covers when nothing bills a new seat (a gifted Team, with
+   * any seats bought beside it); absent when anyone may join. */
+  seatLimit?: number;
   createdAt: number;
 }
 

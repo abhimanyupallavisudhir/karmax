@@ -334,7 +334,8 @@ describe('Paddle storage pack items', () => {
       paddle(items, overrides).provider.updateStoragePacks({ subscriptionId: 'sub_1', storagePacks: 1, idempotencyKey: 'k' });
     await expect(reject([item('pri_team', 1)], { storagePackPriceId: undefined }))
       .rejects.toThrow(new BillingRequestRejected('storage packs are not configured'));
-    await expect(reject([item('pri_seat', 2)])).rejects.toThrow(new BillingRequestRejected('cannot add storage packs to a Paddle subscription without a plan'));
+    // Seats alone ride beside a gifted Team (tests/team-seats.test.ts); nothing at all is no subscription to add to.
+    await expect(reject([])).rejects.toThrow(new BillingRequestRejected('cannot add storage packs to a Paddle subscription without a plan'));
     await expect(reject([item('pri_team', 1), item('pri_other', 1)]))
       .rejects.toThrow(new BillingRequestRejected('Paddle subscription has unexpected items; reconcile before changing storage packs'));
     const invalid = paddle([item('pri_team', 1)]);
