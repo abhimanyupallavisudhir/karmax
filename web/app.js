@@ -6259,17 +6259,9 @@ function editRailFolder(button) {
   });
 }
 
-// The rail's project rows: the organization's projects grouped into their
-// folders. A folder is implicit — it exists exactly while a project names it
-// (`p.folder`, a `/`-separated path), nests by that path, and sits where its
-// first project sits, so dragging orders folders and loose projects alike.
-// Nesting is the --depth custom property, not DOM structure: the rail stays a
-// flat list the drag logic can walk. A collapsed folder still shows the open
-// project, so navigating into a tucked-away project never blanks the selection.
-function railProjectRows(projectScoped) {
-  const query = (S.projectSearch || '').trim().toLocaleLowerCase();
-  const projects = S.projects.filter((p) => (!S.organizationId || p.organizationId === S.organizationId)
-    && projectPath(p).toLocaleLowerCase().includes(query));
+// The sidebar's tree of projects: each folder sits where its first project
+// would, its projects and subfolders inside in the same order.
+function projectTree(projects) {
   const root = { path: '', children: [] };
   const nodes = new Map([['', root]]);
   const dir = (path) => {
@@ -6282,6 +6274,26 @@ function railProjectRows(projectScoped) {
     return node;
   };
   for (const p of projects) dir(p.folder || '').children.push(p);
+  return root;
+}
+/** Projects in the order the sidebar lists them. */
+function inSidebarOrder(projects) {
+  const flat = (node) => node.children.flatMap((child) => (child.id ? [child] : flat(child)));
+  return flat(projectTree(projects));
+}
+
+// The rail's project rows: the organization's projects grouped into their
+// folders. A folder is implicit — it exists exactly while a project names it
+// (`p.folder`, a `/`-separated path), nests by that path, and sits where its
+// first project sits, so dragging orders folders and loose projects alike.
+// Nesting is the --depth custom property, not DOM structure: the rail stays a
+// flat list the drag logic can walk. A collapsed folder still shows the open
+// project, so navigating into a tucked-away project never blanks the selection.
+function railProjectRows(projectScoped) {
+  const query = (S.projectSearch || '').trim().toLocaleLowerCase();
+  const projects = S.projects.filter((p) => (!S.organizationId || p.organizationId === S.organizationId)
+    && projectPath(p).toLocaleLowerCase().includes(query));
+  const root = projectTree(projects);
   const folded = railCollapsedFolders();
   // A project row is an item: checklist icon, regular text, a link. A folder
   // row is a group heading: a chevron and a small uppercase name (styled in
@@ -7108,50 +7120,10 @@ function storeFormHint(item) {
     ? `<span class="store-need" title="This installs another copy, which runs alongside it">Installed already</span>` : '';
 }
 // Which project a store task chosen on the organization home is for; its form
-// opens there. With one project there is nothing to ask.
+// opens there.
 function chooseStoreProject(id) {
-  const projects = (S.projects || []).filter((project) => project.organizationId === S.organizationId);
-  const open = (projectId) => { rememberNewTaskProject(projectId); spaNavigate(storeTaskRoute(projectId, id)); };
-  if (projects.length === 1) return open(projects[0].id);
-  if (!projects.length) return;
   const name = (S.taskStore?.[storeProjectId()] || []).find((item) => item.id === id)?.name || 'Task';
-  const previousFocus = document.activeElement;
-  const root = createTransientOverlay();
-  root.innerHTML = `<div class="palette-scrim" id="sp-scrim"><div class="palette store-project-picker" role="dialog" aria-label="${esc(name)}: choose a project">
-    <input id="sp-in" placeholder="${esc(name)} in…" autocomplete="off" aria-label="Project" />
-    <div id="sp-list" role="listbox"></div>
-  </div></div>`;
-  const input = root.querySelector('#sp-in'), list = root.querySelector('#sp-list');
-  const preferred = newTaskProjectId();
-  const all = [...projects].sort((a, b) => (b.id === preferred) - (a.id === preferred));
-  let shown = all, active = 0;
-  const close = () => root.remove();
-  const dismiss = () => { close(); previousFocus?.focus?.(); };
-  const choose = (project) => { if (!project) return; close(); open(project.id); };
-  const draw = () => {
-    list.innerHTML = shown.map((project, i) => `<div class="opt${i === active ? ' active' : ''}" role="option" aria-selected="${i === active}" data-i="${i}" title="${esc(projectPath(project))}">
-      <span class="task-project">${esc(projectSlug(project))}</span>${i === active ? '<span class="key">↵</span>' : ''}</div>`).join('')
-      || '<div class="pal-empty">No such project</div>';
-    list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
-  };
-  input.addEventListener('input', () => {
-    const q = input.value.trim();
-    shown = q ? all.map((project) => ({ project, score: fuzzyScore(q, `${projectSlug(project)} ${project.name || ''}`) })).filter((x) => x.score >= 0)
-      .sort((a, b) => b.score - a.score).map((x) => x.project) : all;
-    active = 0;
-    draw();
-  });
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { e.stopPropagation(); dismiss(); }
-    else if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(shown.length - 1, active + 1); draw(); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
-    else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); choose(shown[active]); }
-  });
-  list.addEventListener('click', (e) => { const o = e.target.closest('.opt'); if (o) choose(shown[Number(o.dataset.i)]); });
-  list.addEventListener('mousemove', (e) => { const o = e.target.closest('.opt'); if (o && Number(o.dataset.i) !== active) { active = Number(o.dataset.i); draw(); } });
-  root.querySelector('#sp-scrim').addEventListener('click', (e) => { if (e.target.id === 'sp-scrim') dismiss(); });
-  draw();
-  input.focus();
+  pickProject(`${name} in…`, (projectId) => spaNavigate(storeTaskRoute(projectId, id)));
 }
 // The store's rows the query's words match (name or summary).
 function storeViewHtml() {
@@ -8298,15 +8270,13 @@ function wireTasksView() {
 }
 
 // The quick composer above a project's list, and above the organization home,
-// where it creates the task in the project its picker shows.
-// Home creates in the project its new tasks go to (the form can change it); a project list in that project.
-// `template`: start from a task template instead of the Task defaults alone.
-function openNewTaskForm(template) {
-  const projectId = newTaskTarget();
-  // A task lives in a project: with none yet, make one first.
-  if (!projectId) return toast('Create a project first', false, { label: 'New project', fn: () => newProject() });
+// where it first asks which project (withNewTaskProject).
+// `template`: start from a task template instead of the Task defaults alone; a
+// project's own template starts in that project.
+function openNewTaskForm(template, projectId = template?.projectId) {
+  if (!projectId) return withNewTaskProject((chosen) => openNewTaskForm(template, chosen));
   openTaskForm(template?.workflow || NEW_TASK_WORKFLOW, undefined, '', template?.params,
-    { ...(projectId ? { projectId } : {}), ...(template ? { template } : {}) });
+    { projectId, ...(template ? { template } : {}) });
 }
 function newTaskTarget() { return S.tab === 'home' ? newTaskProjectId() : S.projectId; }
 function wireNewTaskComposer() {
@@ -8347,44 +8317,42 @@ function templatesChanged() {
 function templateScopeLabel(template) { return template.projectId ? '' : 'Organization'; }
 function templatesSettingsRoute(projectId) { return `${projectRoute(projectId, 'settings')}#project-defaults`; }
 
-// The `n` picker: digits pick by number (at once, unless a longer number
-// starts with them), words search the names, Enter takes the highlighted one —
-// with nothing typed, template 0. `pick(template?)` gets the choice (the task
-// form's own button reloads that form); by default it opens the new task form.
-function openTemplatePicker(projectId = newTaskTarget(), pick = openNewTaskForm) {
-  if (!projectId) return pick();
+// A numbered pick list (a .palette): digits pick by number (at once, unless a
+// longer number starts with them), words search the names, Enter takes the
+// highlighted one — with nothing typed, entry `initial`. `entries` are
+// `{ n, name, sub?, search? }`; with `loading`, more are on their way,
+// and digits typed before `setEntries` brings them still pick by number once it
+// does. `pick(entry)` gets the choice.
+function openNumberedPicker({ id, label, placeholder, inputLabel, empty, entries, loading = false, initial = 0, foot = '', pick }) {
   const previousFocus = document.activeElement;
   const root = createTransientOverlay();
-  root.innerHTML = `<div class="palette-scrim" id="tpl-scrim"><div class="palette tpl-picker" role="dialog" aria-label="New task from template">
-    <input id="tpl-in" placeholder="New task from template…" autocomplete="off" aria-label="Template name or number" />
-    <div id="tpl-list" role="listbox"></div>
-    <a class="tpl-manage" href="${esc(templatesSettingsRoute(projectId))}" data-spa>Manage templates</a>
+  root.innerHTML = `<div class="palette-scrim"><div class="palette numbered-picker" id="${id}-picker" role="dialog" aria-label="${esc(label)}">
+    <input id="${id}-in" placeholder="${esc(placeholder)}" autocomplete="off" aria-label="${esc(inputLabel)}" />
+    <div class="numbered-list" id="${id}-list" role="listbox"></div>${foot}
   </div></div>`;
-  const input = root.querySelector('#tpl-in'), list = root.querySelector('#tpl-list');
-  let templates = loadedTemplates(projectId), shown = [], active = 0;
+  const scrim = root.firstElementChild, input = root.querySelector('input'), list = root.querySelector('.numbered-list');
+  let all = entries, ready = !loading, shown = [], active = 0;
   const close = () => root.remove();
   const dismiss = () => { close(); previousFocus?.focus?.(); };
-  const entries = () => [{ n: 0, name: 'Default', template: null }, ...(templates || []).map((template, i) => ({ n: i + 1, name: template.name, template }))];
-  const choose = (entry) => { if (!entry) return; close(); pick(entry.template || undefined); };
+  const choose = (entry) => { if (!entry) return; close(); pick(entry); };
   const draw = () => {
     list.innerHTML = shown.map((entry, i) => `<div class="opt${i === active ? ' active' : ''}" role="option" aria-selected="${i === active}" data-i="${i}">
-      <span class="tpl-num">${entry.n}</span><span class="tpl-name">${esc(entry.name)}</span>${entry.template && templateScopeLabel(entry.template) ? `<span class="pal-sub">${esc(templateScopeLabel(entry.template))}</span>` : ''}${i === active ? '<span class="key">↵</span>' : ''}</div>`).join('')
-      || '<div class="pal-empty">No such template</div>';
+      <span class="tpl-num">${entry.n}</span><span class="tpl-name">${esc(entry.name)}</span>${entry.sub ? `<span class="pal-sub">${esc(entry.sub)}</span>` : ''}${i === active ? '<span class="key">↵</span>' : ''}</div>`).join('')
+      || `<div class="pal-empty">${esc(empty)}</div>`;
     list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
   };
   const update = (typed) => {
     const q = input.value.trim();
-    const all = entries();
     if (/^\d+$/.test(q)) {
       shown = all.filter((entry) => String(entry.n).startsWith(q));
       active = Math.max(0, shown.findIndex((entry) => String(entry.n) === q));
       // A number nothing longer starts with is a choice already.
-      if (typed && templates && shown.length === 1 && String(shown[0].n) === q) return choose(shown[0]);
+      if (typed && ready && shown.length === 1 && String(shown[0].n) === q) return choose(shown[0]);
     } else if (q) {
-      shown = all.map((entry) => ({ entry, score: fuzzyScore(q, entry.name) })).filter((x) => x.score >= 0)
+      shown = all.map((entry) => ({ entry, score: fuzzyScore(q, entry.search || entry.name) })).filter((x) => x.score >= 0)
         .sort((a, b) => b.score - a.score).map((x) => x.entry);
       active = 0;
-    } else { shown = all; active = 0; }
+    } else { shown = all; active = Math.max(0, Math.min(initial, all.length - 1)); }
     draw();
   };
   input.addEventListener('input', () => update(true));
@@ -8396,18 +8364,67 @@ function openTemplatePicker(projectId = newTaskTarget(), pick = openNewTaskForm)
   });
   list.addEventListener('click', (e) => { const o = e.target.closest('.opt'); if (o) choose(shown[Number(o.dataset.i)]); });
   list.addEventListener('mousemove', (e) => { const o = e.target.closest('.opt'); if (o && Number(o.dataset.i) !== active) { active = Number(o.dataset.i); draw(); } });
-  root.querySelector('#tpl-scrim').addEventListener('click', (e) => { if (e.target.id === 'tpl-scrim') dismiss(); });
-  root.querySelector('.tpl-manage').addEventListener('click', () => close());
+  scrim.addEventListener('click', (e) => { if (e.target === scrim) dismiss(); });
   update(false);
   input.focus();
-  // Always fresh (someone may have added one); digits typed before the list
-  // arrived still pick by number once it does.
-  projectTemplates(projectId, true).then((list) => {
-    if (!root.isConnected) return;
-    const picked = templates === null;
-    templates = list;
-    update(picked && !!input.value.trim());
-  });
+  return {
+    root,
+    close,
+    setEntries(next) {
+      if (!root.isConnected) return;
+      const early = !ready && !!input.value.trim();
+      all = next;
+      ready = true;
+      update(early);
+    },
+  };
+}
+
+// Which of the organization's projects something goes in, numbered in the
+// sidebar's order so a number always means the same project. Enter takes the
+// one new tasks went to last; the choice is remembered. With one project there
+// is nothing to ask.
+function pickProject(placeholder, onPick) {
+  const projects = inSidebarOrder((S.projects || []).filter((project) => project.organizationId === S.organizationId));
+  const open = (projectId) => { rememberNewTaskProject(projectId); onPick(projectId); };
+  if (projects.length < 2) return projects[0] && open(projects[0].id);
+  const preferred = newTaskProjectId();
+  openNumberedPicker({ id: 'pp', label: 'Choose a project', placeholder, inputLabel: 'Project name or number',
+    empty: 'No such project', initial: Math.max(0, projects.findIndex((project) => project.id === preferred)),
+    entries: projects.map((project, i) => ({ n: i + 1, name: projectPath(project) || project.name, search: `${projectPath(project)} ${projectSlug(project)}`, project })),
+    pick: (entry) => open(entry.project.id) });
+}
+// Runs `then(projectId)` in the project a new task goes to. On the
+// organization home that is a choice, unless its query names a project
+// already; elsewhere it is the project you are in.
+function withNewTaskProject(then) {
+  if (S.tab !== 'home' || queryProjectSlug(S.search)) {
+    const projectId = newTaskTarget();
+    // A task lives in a project: with none yet, make one first.
+    return projectId ? then(projectId) : toast('Create a project first', false, { label: 'New project', fn: () => newProject() });
+  }
+  if (!(S.projects || []).some((project) => project.organizationId === S.organizationId)) {
+    return toast('Create a project first', false, { label: 'New project', fn: () => newProject() });
+  }
+  pickProject('New task in…', then);
+}
+
+// The `n` picker: template 0 is the Task defaults. `pick(template?)` gets the
+// choice (the task form's own button reloads that form); by default it opens
+// the new task form — on the organization home, after asking which project.
+function openTemplatePicker(projectId, pick) {
+  if (!projectId) return withNewTaskProject((chosen) => openTemplatePicker(chosen, (template) => openNewTaskForm(template, chosen)));
+  pick ||= (template) => openNewTaskForm(template, projectId);
+  const entries = (templates) => [{ n: 0, name: 'Default', template: null },
+    ...templates.map((template, i) => ({ n: i + 1, name: template.name, sub: templateScopeLabel(template), template }))];
+  const loaded = loadedTemplates(projectId);
+  const picker = openNumberedPicker({ id: 'tpl', label: 'New task from template', placeholder: 'New task from template…',
+    inputLabel: 'Template name or number', empty: 'No such template', entries: entries(loaded || []), loading: !loaded,
+    foot: `<a class="tpl-manage" href="${esc(templatesSettingsRoute(projectId))}" data-spa>Manage templates</a>`,
+    pick: (entry) => pick(entry.template || undefined) });
+  picker.root.querySelector('.tpl-manage').addEventListener('click', () => picker.close());
+  // Always fresh (someone may have added one).
+  projectTemplates(projectId, true).then((list) => picker.setEntries(entries(list)));
 }
 
 /** Asks what to call a new template and where it belongs. Resolves

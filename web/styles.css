@@ -4360,11 +4360,11 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 }
 
 /* ── Task templates ─────────────────────────────────────────────────────────
-   The `n` picker (a .palette), a template's number wherever it is listed, the
+   The `n` picker and the project picker (a .numbered-picker), a template's number wherever it is listed, the
    Templates card in Task defaults, and the template form's head. */
-.tpl-picker, .store-project-picker { width: min(440px, 92vw); }
-.tpl-picker #tpl-list, .store-project-picker #sp-list { max-height: 50vh; overflow: auto; padding: 4px 0; }
-.tpl-picker .opt, .store-project-picker .opt { padding: 8px 16px; }
+.numbered-picker { width: min(440px, 92vw); }
+.numbered-list { max-height: 50vh; overflow: auto; padding: 4px 0; }
+.numbered-picker .opt { padding: 8px 16px; }
 .tpl-num { flex: none; min-width: 20px; padding: 1px 5px; border: 1px solid var(--line); border-radius: 5px;
   font-family: var(--font-mono); font-size: 11px; text-align: center; color: var(--ink-2); background: var(--surface-2); }
 .tpl-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
