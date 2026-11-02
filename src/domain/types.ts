@@ -1509,6 +1509,12 @@ export interface Message {
    * context for whoever runs next.
    */
   to?: string[];
+  /**
+   * A notice of tavya's that woke an agent whose work waited in Review: it
+   * hands finished work back, so the console starts a new round at it instead
+   * of folding the agent's report away (web/app.js returnsWork).
+   */
+  returnsWork?: true;
 }
 
 /**

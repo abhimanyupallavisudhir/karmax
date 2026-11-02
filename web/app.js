@@ -13363,11 +13363,12 @@ function messageOrigin(m) {
 }
 
 // tavya's prompts that hand finished work back to the agent: the proposal came
-// back from checks, a reviewer or landing. Every other prompt of tavya's (a job
+// back from checks, a reviewer or landing, or a notice (a late grant) woke the
+// agent while its work waited in Review. Every other prompt of tavya's (a job
 // or pause ending, its own sub-task's news, a grant it waited for, a nudge)
 // carries on the work it was doing.
 function returnsWork(m) {
-  return /^(review-ci|cv|pr-conflict|pr-refused|merge-revise|landing-retry|integration|integration-wait|ir|restore-refused|resource-merge|resource-integrate)-?\d+$/.test(m.id || '');
+  return !!m.returnsWork || /^(review-ci|cv|pr-conflict|pr-refused|merge-revise|landing-retry|integration|integration-wait|ir|restore-refused|resource-merge|resource-integrate)-?\d+$/.test(m.id || '');
 }
 
 // The conversation as people read it: what they said and the agent's answers
