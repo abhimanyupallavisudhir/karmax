@@ -1658,6 +1658,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return deps.resources ? await deps.resources.prepare(world) : world;
     };
     try {
+      if (recover) await restoreHibernated(handle, taskId);
       for (;;) {
         const parked = (await store.worldState(handle.id)) === 'parked';
         const before = ((await store.currentWorld(handle.id)) ?? handle) as WorldHandle;
@@ -1680,6 +1681,24 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       await wakeRefused(handle, taskId, error).catch(() => undefined);
       throw worldUnreachable(handle, error);
     } finally { releaseAccess?.(); }
+  }
+
+  /**
+   * A hibernated world has no machine: it comes back from its checkpoint where
+   * its task can run now (checkpoint.ts restoreWhereTaskRuns: Any routes it),
+   * before any account is asked for room. Asking its old account first kept a
+   * world hibernated because that account had no room (a stuck wake,
+   * managed-compute § Queue) waiting there for good (pramana#137).
+   */
+  async function restoreHibernated(handle: WorldHandle, taskId: string): Promise<void> {
+    if (!isRemote(handle.kind) || !deps.checkpoints || (await store.worldState(handle.id)) !== 'hibernated') return;
+    if (await taskEnded(store, handle.id)) return;
+    const current = ((await store.currentWorld(handle.id)) ?? handle) as WorldHandle;
+    const checkpointId = current.checkpointId;
+    if (!checkpointId) return;
+    (await record(taskId, 'world.recovering', { checkpointId, reason: 'hibernated' }));
+    const restored = await deps.checkpoints.restoreWhereTaskRuns(checkpointId, current);
+    (await record(taskId, 'world.recovered', { checkpointId, generation: restored.generation, provider: restored.kind }));
   }
 
   /** A world opened: it no longer waits for room. */

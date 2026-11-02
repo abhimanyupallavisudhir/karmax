@@ -91,6 +91,23 @@ describe('admission by the account\'s budget and queue', () => {
       .toMatchObject({ reason: '1 waiting ahead' });
   });
 
+  // pramana (2026-11-02): one task pinned to tavya's Hetzner asked for a 250 GB disk while 150 of its 324 GB were
+  // taken; having waited, it kept its place for seven hours and every task behind it waited too.
+  it('keeps no room for one ahead that needs more disk than is free: disks free only when worlds go, not by waiting', async () => {
+    const f = await fixture();
+    await f.world(f.other, 'hetzner', 'parked', 150);
+    const big = await f.task(f.other);
+    const small = await f.task(f.acme);
+    const account = { provider: 'hetzner', managed: true, pool: { cpu: 10, diskGb: 324 } };
+    const later = 10_000 + RESERVE_AFTER_MS + 120_000;
+    // It keeps asking, as a waiting task does, and has waited long enough to keep its place.
+    for (const at of [10_000, later - 60_000]) expect(await accountRoom(f.store, account, { organizationId: f.other, taskId: big, cpu: 8, diskGb: 250 }, at)).toBeDefined();
+    expect(await accountRoom(f.store, account, { organizationId: f.acme, taskId: small, cpu: 2, diskGb: 20 }, later)).toBeUndefined();
+    // With the disk free, it would keep its place.
+    expect(await accountRoom(f.store, { ...account, pool: { cpu: 10, diskGb: 1000 } }, { organizationId: f.acme, taskId: small, cpu: 2, diskGb: 20 }, later))
+      .toMatchObject({ reason: '1 waiting ahead' });
+  });
+
   it('keeps strict order on an account whose budget is unknown, its own included', async () => {
     const f = await fixture();
     const first = await f.task(f.acme);

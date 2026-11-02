@@ -14,6 +14,7 @@ import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import type { WorldHandle } from '../src/world/types.js';
+import { ManagedComputeBusy } from '../src/world/managed-compute.js';
 
 // Task #552 (2026-10-09): resized at 00:13, its world was restored as
 // generation 2 from a generation-1 checkpoint; the task finished at 00:36 and
@@ -122,4 +123,27 @@ it('does not rebuild a finished task\'s world whose sandbox vanished', async () 
   await expect(f.core.commitWork((await f.store.currentWorld(f.task.id)) as WorldHandle, 'late')).rejects.toThrow(/vanished/);
   expect(f.create).not.toHaveBeenCalled();
   expect((await f.store.currentWorld(f.task.id))?.generation).toBe(1);
+});
+
+// pramana#137 (2026-11-02): a parked world that could not wake for want of room
+// on its account was hibernated so that its task could restore it where there
+// is room, but every later turn asked that same account for room first, and
+// waited behind it for hours instead of moving.
+it('restores a hibernated world where its task can run before asking its old account for room', async () => {
+  const f = await fixture();
+  await f.world.destroy();
+  await f.vanish(1);
+  await f.store.setWorldState((await f.store.currentWorld(f.task.id))!, 'hibernated');
+  // The old account has no room; only a restored world can be let in.
+  let restored = false;
+  f.create.mockImplementation(async (spec: any) => { restored = true; const w = await new WorktreeProvider(path.dirname(f.world.handle.root)).create(spec);
+    w.handle.kind = 'sandbox-test' as any; if (spec.generation) w.handle.generation = spec.generation; return w; });
+  const acquire = f.runners.acquire.getMockImplementation()!;
+  f.runners.acquire.mockImplementation(async (input: any) => {
+    if (!restored) throw new ManagedComputeBusy('4 tasks are waiting ahead of this one for tavya\'s Hetzner Cloud computers; waiting its turn.');
+    return acquire(input);
+  });
+  expect((await f.core.commitWork((await f.store.currentWorld(f.task.id)) as WorldHandle, 'after the move')).committed).toBe(true);
+  expect((await f.store.currentWorld(f.task.id))?.generation).toBe(2);
+  expect(await f.store.worldState(f.task.id)).toBe('ready');
 });

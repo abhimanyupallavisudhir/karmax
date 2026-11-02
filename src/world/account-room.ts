@@ -120,13 +120,16 @@ export async function accountRoom(store: Store, account: Account, request: RoomR
         since: Number.POSITIVE_INFINITY, accounts: {} };
     const line = ordered(await withStandings(store,
       [...queue.filter((waiter) => waiter.taskId !== me.taskId), { ...me, accounts: { ...me.accounts, [key]: now } }], now), key);
-    const fits = (waiter: Waiter) => (!pool.cpu || use.cpu + (waiter.cpu ?? cpu) <= pool.cpu)
-      && (!pool.diskGb || use.diskGb + accountDiskGb(provider, waiter.diskGb) <= pool.diskGb);
+    const diskFits = (waiter: Waiter) => !pool.diskGb || use.diskGb + accountDiskGb(provider, waiter.diskGb) <= pool.diskGb;
+    const fits = (waiter: Waiter) => (!pool.cpu || use.cpu + (waiter.cpu ?? cpu) <= pool.cpu) && diskFits(waiter);
     const known = Boolean(pool.cpu || pool.diskGb || pool.machines);
     // Where the budget is known, one ahead blocks only if it could take this
-    // room (or has waited long enough to keep it); else the order is strict.
+    // room, or has waited long enough to keep it — CPUs and machines free as
+    // worlds park, so keeping them lets a big machine through; disk frees
+    // only when worlds go, so keeping it for one that does not fit blocked
+    // everyone behind it for hours (pramana, 2026-11-02). Else the order is strict.
     const ahead = line.slice(0, line.findIndex((waiter) => waiter.taskId === me.taskId))
-      .filter((waiter) => !known || fits(waiter) || now - waiter.since >= RESERVE_AFTER_MS);
+      .filter((waiter) => !known || fits(waiter) || (now - waiter.since >= RESERVE_AFTER_MS && diskFits(waiter)));
     if (ahead.length)
       refusal = ({ reason: `${ahead.length} waiting ahead`, message: `${ahead.length === 1 ? 'A task is' : `${ahead.length} tasks are`} waiting ahead of this one for `
         + `${account.managed ? name : `this organization's ${providerName(provider)} account`}; waiting its turn.` });
