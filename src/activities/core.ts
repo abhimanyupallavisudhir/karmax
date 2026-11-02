@@ -1540,6 +1540,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const next = (await store.updateWorldMeta(handle, { worldLeaseId: acquired.leaseId, runnerPoolId: acquired.runnerPoolId }));
     (await store.setWorldState(next, 'ready'));
     (await record(taskId, 'world.lease-acquired', { leaseId: acquired.leaseId, runnerPoolId: acquired.runnerPoolId }));
+    // It has its machine: it waits for room no longer, even while its world
+    // opens (restoring project data can take an hour; pramana#149 kept the
+    // queue's first place meanwhile and everyone behind it waited).
+    await dequeue(store, taskId).catch(() => undefined);
     return next as WorldHandle;
   }
 

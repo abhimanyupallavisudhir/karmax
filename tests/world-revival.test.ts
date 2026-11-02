@@ -15,6 +15,7 @@ import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import type { WorldHandle } from '../src/world/types.js';
 import { ManagedComputeBusy } from '../src/world/managed-compute.js';
+import { accountKey, enqueue, waiters } from '../src/world/compute-queue.js';
 
 // Task #552 (2026-10-09): resized at 00:13, its world was restored as
 // generation 2 from a generation-1 checkpoint; the task finished at 00:36 and
@@ -146,4 +147,24 @@ it('restores a hibernated world where its task can run before asking its old acc
   expect((await f.core.commitWork((await f.store.currentWorld(f.task.id)) as WorldHandle, 'after the move')).committed).toBe(true);
   expect((await f.store.currentWorld(f.task.id))?.generation).toBe(2);
   expect(await f.store.worldState(f.task.id)).toBe('ready');
+});
+
+// pramana#149 (2026-11-02): it had its machine at 10:18 but kept first place in
+// the queue while it restored 22 GB of project data, so every task behind it
+// went on waiting for room it no longer needed.
+it('leaves the compute queue as soon as its machine is granted, not once its world has opened', async () => {
+  const f = await fixture();
+  await enqueue(f.store, { taskId: f.task.id, organizationId: f.project.organizationId!, account: accountKey('installation', 'sandbox-test') });
+  let queuedWhileOpening: string[] | undefined;
+  const acquire = f.runners.acquire.getMockImplementation()!;
+  f.runners.acquire.mockImplementation(async (input: any) => acquire(input));
+  const open = vi.spyOn(f.worlds, 'open');
+  open.mockImplementation(async function (this: any, handle: any) {
+    queuedWhileOpening = (await waiters(f.store)).map((w) => w.taskId);
+    open.mockRestore();
+    return f.worlds.open(handle);
+  });
+  await f.store.setWorldState((await f.store.currentWorld(f.task.id))!, 'parked');
+  await f.core.commitWork((await f.store.currentWorld(f.task.id)) as WorldHandle, 'woken');
+  expect(queuedWhileOpening).toEqual([]);
 });
