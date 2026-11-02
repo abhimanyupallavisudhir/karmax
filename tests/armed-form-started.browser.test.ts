@@ -30,12 +30,13 @@ it('an armed task\'s form shows the task running once its trigger fired, instead
     const num = (await g.store.getTask(follow.id))!.num;
     const toasts: string[] = [];
     await page.exposeFunction('recordToast', (text: string) => toasts.push(text));
-    await page.addInitScript(() => new MutationObserver(() => {
+    // Every toast as it appears: they fade before a poll could read them.
+    await page.addInitScript(`new MutationObserver(() => {
       for (const toast of document.querySelectorAll('.toast:not([data-seen])')) {
-        (toast as HTMLElement).dataset.seen = '1';
-        (window as any).recordToast(toast.textContent ?? '');
+        toast.dataset.seen = '1';
+        window.recordToast(toast.textContent ?? '');
       }
-    }).observe(document, { childList: true, subtree: true }));
+    }).observe(document, { childList: true, subtree: true });`);
 
     await step('its page is its form, with Save', async () => {
       await page.goto(`${g.url}/acme/website/tasks/${num}`);
