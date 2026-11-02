@@ -44,6 +44,8 @@ vm.runInContext(
     extractFunction('waitDeadline'),
     extractFunction('presenceDetail'),
     extractConst('ACCOUNT_PROVIDER_LABELS'),
+    extractFunction('storageFull'),
+    extractFunction('setupFixes'),
     extractFunction('setupFix'),
     extractFunction('setupFixHtml'),
     extractFunction('conversationWaitNotice'),

@@ -63,7 +63,7 @@ describe('compute holds', () => {
     expect((await computeCredit(f.store, f.organization.id, T)).availableMicros).toBeLessThanOrEqual(0);
     const refused = await f.hold('e', e!.id).catch((error) => error);
     expect(refused).toBeInstanceOf(ComputeCreditExhausted);
-    expect(refused.message).toMatch(/^Out of compute: this month's \$5\.00 of compute is used up or held by work running now\. Add a compute pack or turn on auto top-up in Plan & billing/);
+    expect(refused.message).toMatch(/^Out of compute: this month's \$5\.00 of compute is used up or held by work running now\. Add a \$10 pack or turn on auto top-up in Plan & billing/);
     expect(await f.store.computeHold('e')).toBeUndefined();
     expect(JSON.parse((await f.store.kvGet(`compute-short:${f.organization.id}`))!)).toMatchObject({ neededMicros: 1_430_500 });
   });

@@ -48,6 +48,9 @@ export interface SubscriptionCommercialTerms {
   activeUsers: number;
   storagePacks?: number;
   computePacks?: number;
+  /** Team seats bought beside a gifted Team (checkoutPacks), each billed at
+   * the Team seat price. */
+  seats?: number;
   monthlyTotalPriceCents: number;
 }
 
@@ -63,6 +66,8 @@ export interface SubscriptionCheckoutResult {
 
 export interface SubscriptionGift {
   plan: PaidHostedPlanId;
+  /** People a gifted Team covers for nothing; more are bought beside it. */
+  seats?: number;
   grantedBy: string;
   grantedAt: number;
 }
@@ -115,6 +120,11 @@ export interface SubscriptionProvider {
   updateStoragePacks(input: { subscriptionId: string; storagePacks: number; idempotencyKey: string }): Promise<{ id: string }>;
   /** Sets the subscription's total compute packs, keeping every other item. */
   updateComputePacks(input: { subscriptionId: string; computePacks: number; idempotencyKey: string }): Promise<{ id: string }>;
+  /** Sets the Team seats billed on a subscription with no plan of its own,
+   * beside a gifted Team, keeping every other item. */
+  updateAddOnSeats?(input: { subscriptionId: string; extraSeats: number; idempotencyKey: string }): Promise<{ id: string }>;
+  /** Withdraws a cancellation scheduled for the end of the period. */
+  resumeSubscription?(input: { subscriptionId: string; idempotencyKey: string }): Promise<{ id: string }>;
   /** Charges a compute top-up once, now, to the subscription's saved payment
    * method (wiki features/managed-compute § Auto top-up). */
   chargeComputeTopUp?(input: { subscriptionId: string; topUpId: string; amountCents: number }): Promise<{ id: string }>;
@@ -134,7 +144,7 @@ export interface BillingEvent {
 }
 
 export interface BillingRequestIntent {
-  kind: 'checkout' | 'change' | 'cancel' | 'seats' | 'storage' | 'compute' | 'abandon';
+  kind: 'checkout' | 'change' | 'cancel' | 'resume' | 'seats' | 'storage' | 'compute' | 'abandon';
   subscriptionId?: string;
   checkoutId?: string;
   plan?: PaidHostedPlanId;
@@ -261,6 +271,11 @@ export class StripeSubscriptionProvider implements SubscriptionProvider {
     return this.request(`/v1/subscriptions/${encodeURIComponent(input.subscriptionId)}`, params, input.idempotencyKey);
   }
 
+  resumeSubscription(input: { subscriptionId: string; idempotencyKey: string }) {
+    return this.request(`/v1/subscriptions/${encodeURIComponent(input.subscriptionId)}`,
+      { cancel_at_period_end: false }, input.idempotencyKey);
+  }
+
   async updateStoragePacks(): Promise<{ id: string }> {
     throw new BillingRequestRejected('storage packs are billed only through Paddle');
   }
@@ -380,12 +395,16 @@ export class SubscriptionBillingService {
     const computePackGift = await this.store.computePackGift(organizationId);
     // What the subscription bills each month: its plan and seats, and its packs.
     const billedMonthlyPriceCents = account?.subscriptionId && ['active', 'trialing', 'past_due'].includes(status)
-      ? hostedMonthlyPriceCents(billedPlan, seats, account.storagePacks, account.computePacks) : null;
+      ? billedMonthlyCents(account) : null;
+    const teamSeats = this.seatState(plan, members, account, gift);
     return { managed: true, providerConfigured: (await provider.configured()), plan, billedPlan, status, seats, gift, pendingRequest, pendingCheckout,
       billedMonthlyPriceCents,
       storagePacks: account?.storagePacks ?? 0, storagePack, storagePackGift, giftedStoragePacks: storagePackGift?.packs ?? 0,
       computePacks: account?.computePacks ?? 0, computePack, computePackGift, giftedComputePacks: computePackGift?.packs ?? 0,
-      activeUsers: members, seatDeficit: gift?.plan === 'team' ? 0 : plan === 'team' ? Math.max(0, members - seats)
+      activeUsers: members, teamSeats,
+      // People a paid Team still has to bill seats for (Bill seats); none
+      // where nothing bills them (a gifted Team, or one the operator set).
+      seatDeficit: teamSeats ? (teamSeats.autoBill ? Math.max(0, members - (teamSeats.total ?? members)) : 0)
         : Math.max(0, members - HOSTED_PLANS[plan].includedActiveUsers),
       access, cancelAtPeriodEnd: account?.cancelAtPeriodEnd ?? false,
       currentPeriodEnd: account?.currentPeriodEnd, verifiedAt: account?.verifiedAt,
@@ -394,21 +413,29 @@ export class SubscriptionBillingService {
 
   /** Complimentary access is independent of the provider ledger. A gift never
    * downgrades paid access or changes an existing financial contract. */
-  async gift(organizationId: string, plan: unknown, grantedBy: string, key: string) {
+  async gift(organizationId: string, plan: unknown, grantedBy: string, key: string, seats?: unknown) {
     if (!this.hosted) throw new Error('subscription gifts are only available on hosted installations');
     this.requireKey(key);
     if (plan !== null && !isPaidHostedPlanId(plan)) throw new Error('choose Individual or Team, or null to remove the gift');
+    if (seats !== undefined && seats !== null && (typeof seats !== 'number' || !Number.isSafeInteger(seats) || seats < 1 || seats > MAX_SEATS))
+      throw new Error(`gifted seats must be a whole number from 1 to ${MAX_SEATS}`);
     return this.store.transaction(async () => {
       await this.store.lock(`org:${organizationId}`);
       if (!(await this.store.getOrganization(organizationId))) throw new Error('organization not found');
-      return this.idempotent(organizationId, `gift:${plan}`, key, async () => {
+      return this.idempotent(organizationId, `gift:${plan}:${seats ?? ''}`, key, async () => {
         if (plan === null) {
           await this.store.db.prepare('DELETE FROM subscription_gifts WHERE organizationId=?').run(organizationId);
         } else {
-          await this.store.db.prepare(`INSERT INTO subscription_gifts (organizationId, plan, grantedBy, grantedAt)
-            VALUES (?, ?, ?, ?) ON CONFLICT(organizationId) DO UPDATE SET
-            plan=excluded.plan, grantedBy=excluded.grantedBy, grantedAt=excluded.grantedAt`)
-            .run(organizationId, plan, grantedBy, Date.now());
+          // A gifted Team covers the seats asked for; else the ones it covered
+          // before, else the people there now (at least the one Team includes).
+          const before = await this.currentGift(organizationId);
+          const members = (await this.store.listOrganizationMemberships(organizationId)).length;
+          const covered = plan !== 'team' ? null : typeof seats === 'number' ? seats
+            : before?.plan === 'team' && before.seats ? before.seats : Math.max(HOSTED_PLANS.team.includedActiveUsers, members);
+          await this.store.db.prepare(`INSERT INTO subscription_gifts (organizationId, plan, seats, grantedBy, grantedAt)
+            VALUES (?, ?, ?, ?, ?) ON CONFLICT(organizationId) DO UPDATE SET
+            plan=excluded.plan, seats=excluded.seats, grantedBy=excluded.grantedBy, grantedAt=excluded.grantedAt`)
+            .run(organizationId, plan, covered, grantedBy, Date.now());
         }
         await this.reconcileOrganization(organizationId);
         return this.current(organizationId);
@@ -449,9 +476,29 @@ export class SubscriptionBillingService {
   }
 
   async currentGift(organizationId: string): Promise<SubscriptionGift | null> {
-    const row = await this.store.db.prepare('SELECT plan, grantedBy, grantedAt FROM subscription_gifts WHERE organizationId=?')
-      .get(organizationId) as SubscriptionGift | undefined;
-    return row ?? null;
+    const row = await this.store.db.prepare('SELECT plan, seats, grantedBy, grantedAt FROM subscription_gifts WHERE organizationId=?')
+      .get(organizationId) as (Omit<SubscriptionGift, 'seats'> & { seats: number | string | null }) | undefined;
+    if (!row) return null;
+    const { seats, ...gift } = row;
+    return { ...gift, grantedAt: Number(gift.grantedAt), ...(row.plan === 'team' && seats != null ? { seats: Number(seats) } : {}) };
+  }
+
+  /** The seats a Team covers: a paid Team's (one included, more at the seat
+   * price), or a gifted Team's gifted seats and those bought beside it.
+   * `limit` is how many people may be members (null: anyone may join, as on
+   * a paid Team, whose next person is billed a seat). Null off Team. */
+  private seatState(plan: HostedPlanId, members: number, account: BillingAccount | undefined,
+    gift: SubscriptionGift | null, now = Date.now()): TeamSeats | null {
+    if (plan !== 'team') return null;
+    const paid = account ? this.paidFor(account, now) : false;
+    const billedTeam = paid && account!.plan === 'team';
+    const extra = paid ? billedExtraSeats(account!) : 0;
+    const gifted = gift?.plan === 'team' ? Math.max(1, gift.seats ?? members) : 0;
+    const included = gifted || (billedTeam ? HOSTED_PLANS.team.includedActiveUsers : 0);
+    // A Team the operator set directly has no seats to count.
+    const total = included ? included + extra : null;
+    return { total, used: members, gifted, paid: extra, included, limit: billedTeam ? null : total,
+      autoBill: billedTeam, priceCents: HOSTED_PLANS.team.monthlyAdditionalActiveUserPriceCents };
   }
 
   /** Re-applies effective plans from the last verified provider state. The main
@@ -488,7 +535,7 @@ export class SubscriptionBillingService {
    * subscription to carry them, so the first ones start a subscription of
    * packs alone, and later ones change it like a paid plan's. A Free
    * organization chooses a plan instead. */
-  async checkoutPacks(organizationId: string, order: { storagePacks?: unknown; computePacks?: unknown },
+  async checkoutPacks(organizationId: string, order: { storagePacks?: unknown; computePacks?: unknown; seats?: unknown },
     urls: { success: string; cancel: string }, key: string): Promise<SubscriptionCheckoutResult> {
     const provider = await this.requireHosted(); this.requireKey(key);
     const count = (kind: string, packs: unknown = 0): number => {
@@ -497,18 +544,25 @@ export class SubscriptionBillingService {
       return packs;
     };
     const storagePacks = count('storage', order.storagePacks), computePacks = count('compute', order.computePacks);
-    if (!storagePacks && !computePacks) throw new Error('choose at least one pack');
+    if (order.seats !== undefined && (typeof order.seats !== 'number' || !Number.isSafeInteger(order.seats) || order.seats < 0 || order.seats > MAX_SEATS))
+      throw new Error(`seats must be a whole number from 0 to ${MAX_SEATS}`);
+    const seats = (order.seats as number | undefined) ?? 0;
+    if (!storagePacks && !computePacks && !seats) throw new Error('choose at least one pack or seat');
     const catalog = await provider.catalog();
     if (storagePacks && !catalog?.storagePackPriceId) throw new Error('storage packs are not available yet');
     if (computePacks && !catalog?.computePackPriceId) throw new Error('compute packs are not available yet');
     await this.assertNoSubscription(organizationId, provider, 'add packs to the existing subscription');
-    if (!(await this.currentGift(organizationId))) throw new Error('packs need a plan: choose Individual or Team first');
+    const gift = await this.currentGift(organizationId);
+    if (!gift) throw new Error('packs need a plan: choose Individual or Team first');
+    if (seats && gift.plan !== 'team') throw new Error('seats are part of Team: upgrade to Team first');
     const activeUsers = (await this.store.listOrganizationMemberships(organizationId)).length;
-    return this.startCheckout(organizationId, { seats: 0, storagePacks, computePacks }, {
+    const seatPrice = HOSTED_PLANS.team.monthlyAdditionalActiveUserPriceCents;
+    return this.startCheckout(organizationId, { seats, storagePacks, computePacks }, {
       planId: null, planName: null, currency: 'usd', billingInterval: 'month',
-      monthlyBasePriceCents: 0, includedActiveUsers: 0, monthlyAdditionalActiveUserPriceCents: 0, activeUsers,
-      storagePacks, computePacks, monthlyTotalPriceCents: hostedMonthlyPriceCents('free', activeUsers, storagePacks, computePacks),
-    }, `checkout:packs:${storagePacks}:${computePacks}`, urls, key, provider);
+      monthlyBasePriceCents: 0, includedActiveUsers: 0, monthlyAdditionalActiveUserPriceCents: seats ? seatPrice : 0, activeUsers,
+      storagePacks, computePacks, ...(seats ? { seats } : {}),
+      monthlyTotalPriceCents: hostedMonthlyPriceCents('free', activeUsers, storagePacks, computePacks) + seats * seatPrice,
+    }, `checkout:packs:${storagePacks}:${computePacks}${seats ? `:${seats}` : ''}`, urls, key, provider);
   }
 
   private async assertNoSubscription(organizationId: string, provider: SubscriptionProvider, existing: string): Promise<void> {
@@ -570,8 +624,10 @@ export class SubscriptionBillingService {
     const provider = await this.requireHosted(account?.provider);
     if (!account?.subscriptionId || !['active', 'trialing', 'past_due'].includes(account.status))
       throw new Error('there is no changeable subscription');
+    // A Team keeps the seats it bills; Individual has one.
     const seats = Math.max(HOSTED_PLANS[plan].includedActiveUsers,
-      (await this.store.listOrganizationMemberships(organizationId)).length);
+      (await this.store.listOrganizationMemberships(organizationId)).length,
+      plan === 'team' && account.plan === 'team' ? account.seats : 0);
     if (plan === 'individual' && HOSTED_PLANS.individual.maxMembers != null
       && seats > HOSTED_PLANS.individual.maxMembers)
       throw new Error('remove additional active users before downgrading to Individual');
@@ -599,6 +655,57 @@ export class SubscriptionBillingService {
     return this.idempotent(organizationId, 'cancel', key, () => provider.cancelAtPeriodEnd({
       subscriptionId: account.subscriptionId!, idempotencyKey: `${key}:cancel`,
     }), provider, { kind: 'cancel', subscriptionId: account.subscriptionId });
+  }
+
+  /** Keeps a subscription whose cancellation is scheduled for the end of
+   * its period: its plan (or what it carries beside a gift) goes on. */
+  async resume(organizationId: string, key: string) {
+    this.requireKey(key);
+    const account = await this.account(organizationId);
+    const provider = await this.requireHosted(account?.provider);
+    if (!account?.subscriptionId || !['active', 'trialing', 'past_due'].includes(account.status) || !account.cancelAtPeriodEnd)
+      throw new Error('there is no ending subscription to keep');
+    if (!provider.resumeSubscription) throw new Error(`${provider.name} cannot keep an ending subscription; resubscribe instead`);
+    return this.idempotent(organizationId, 'resume', key, () => provider.resumeSubscription!({
+      subscriptionId: account.subscriptionId!, idempotencyKey: `${key}:resume`,
+    }), provider, { kind: 'resume', subscriptionId: account.subscriptionId });
+  }
+
+  /** Sets how many people a Team covers (wiki ops/billing-paddle § Seats):
+   * a paid Team's subscription bills every seat past the one it includes; a
+   * gifted Team's owner buys seats past the gifted ones beside the gift (the
+   * first at checkout, checkoutPacks). Never fewer than the people there.
+   * Like packs, seats are granted only from the verified state that follows. */
+  async seats(organizationId: string, seats: unknown, key: string) {
+    this.requireKey(key);
+    if (typeof seats !== 'number' || !Number.isSafeInteger(seats) || seats < 1 || seats > MAX_SEATS)
+      throw new Error(`seats must be a whole number from 1 to ${MAX_SEATS}`);
+    const organization = await this.store.getOrganization(organizationId);
+    if (!organization) throw new Error('organization not found');
+    if (organization.plan !== 'team') throw new Error('seats are part of Team: upgrade to Team first');
+    const members = (await this.store.listOrganizationMemberships(organizationId)).length;
+    if (seats < members) throw new Error(`${members} people are in this organization: remove members first to go below ${members} seats`);
+    const account = await this.account(organizationId);
+    const gift = await this.currentGift(organizationId);
+    const state = this.seatState('team', members, account, gift)!;
+    if (state.total == null) throw new Error('this Team has no seats to change');
+    if (seats < state.included) throw new Error(`${state.included} seats come with this Team: there are only paid seats to remove`);
+    const extra = seats - state.included;
+    if (!account?.subscriptionId || !['active', 'trialing', 'past_due'].includes(account.status))
+      throw new Error(gift?.plan === 'team' ? 'buy the first seats at checkout' : 'there is no subscription to bill seats on');
+    if (account.plan === 'individual') throw new Error('change the subscription to Team to add seats');
+    if (extra > billedExtraSeats(account) && account.status === 'past_due')
+      throw new Error('update the payment method before adding seats');
+    const provider = await this.requireHosted(account.provider);
+    if (account.plan === 'team') {
+      const billed = HOSTED_PLANS.team.includedActiveUsers + extra;
+      return this.idempotent(organizationId, `seats:${seats}`, key, () => provider.updateSeats({ subscriptionId: account.subscriptionId!,
+        seatItemId: account.items.teamSeat, seats: billed, idempotencyKey: `${key}:seats` }), provider,
+      { kind: 'seats', subscriptionId: account.subscriptionId, plan: 'team', seats: billed });
+    }
+    if (!provider.updateAddOnSeats) throw new Error(`${provider.name} cannot bill seats beside a gifted Team`);
+    return this.idempotent(organizationId, `seats:${seats}`, key, () => provider.updateAddOnSeats!({ subscriptionId: account.subscriptionId!,
+      extraSeats: extra, idempotencyKey: `${key}:seats` }), provider, { kind: 'seats', subscriptionId: account.subscriptionId, seats: extra });
   }
 
   /** Sets the total storage packs billed on the subscription: a paid plan's,
@@ -669,12 +776,18 @@ export class SubscriptionBillingService {
       + `${gigabytes(retainedBytes)} is stored and the quota would be ${gigabytes(quota)}.`);
   }
 
+  /** Bills a paid Team a seat for each person who joined without one. It
+   * never removes seats: one someone left stays the owner's to remove (or
+   * give to the next person), so a seat bought ahead of an invitation is not
+   * taken back by the next sweep. */
   async syncSeats(organizationId: string): Promise<void> {
     if (!this.hosted) return;
     const account = (await this.account(organizationId));
     if (!account?.subscriptionId || account.plan !== 'team' || !['active', 'trialing', 'past_due'].includes(account.status)) return;
-    const seats = Math.max(HOSTED_PLANS.team.includedActiveUsers,
-      (await this.store.listOrganizationMemberships(organizationId)).length);
+    const members = (await this.store.listOrganizationMemberships(organizationId)).length;
+    const state = this.seatState('team', members, account, await this.currentGift(organizationId));
+    if (!state?.autoBill || state.total == null || state.total >= members) return;
+    const seats = HOSTED_PLANS.team.includedActiveUsers + Math.max(billedExtraSeats(account), members - state.included);
     if (seats === account.seats) return;
     const provider = await this.requireHosted(account.provider);
     const key = `seat-sync:${organizationId}:${seats}:${account.lastEventAt}`;
@@ -903,6 +1016,9 @@ export class SubscriptionBillingService {
         await this.store.setOrganizationStoragePacks(organizationId, storagePacks);
       if ((organization?.computePacks ?? 0) !== computePacks)
         await this.store.setOrganizationComputePacks(organizationId, computePacks);
+      const members = (await this.store.listOrganizationMemberships(organizationId)).length;
+      const seatLimit = this.seatState(plan, members, account, gift, now)?.limit ?? null;
+      if ((organization?.seatLimit ?? null) !== seatLimit) await this.store.setOrganizationSeatLimit(organizationId, seatLimit);
     });
   }
 
@@ -956,12 +1072,14 @@ export class SubscriptionBillingService {
         computePacks = quantity; items.computePack = String(item.id);
       } else if (provider.customerMode === 'checkout') throw new Error('Paddle subscription contains an unexpected price');
     }
-    // Packs alone carry a gifted plan's packs (checkoutPacks); they bill no plan.
-    if (!plan && !items.teamSeat && (storagePacks || computePacks)) plan = 'free';
+    // Packs and seats alone ride beside a gifted plan (checkoutPacks); they
+    // bill no plan. Their `seats` are the seats bought, none included.
+    if (!plan && (items.teamSeat || storagePacks || computePacks)) plan = 'free';
     if (!plan) throw new Error(`subscription contains no configured ${BRAND} plan price`);
     if (provider.customerMode === 'checkout' && plan === 'individual' && items.teamSeat)
       throw new Error('Individual subscription contains Team seats');
-    return { plan, seats: plan === 'team' ? seats : HOSTED_PLANS.individual.includedActiveUsers, storagePacks, computePacks, items };
+    return { plan, seats: plan === 'team' ? seats : plan === 'free' && items.teamSeat ? seats - HOSTED_PLANS.team.includedActiveUsers
+      : HOSTED_PLANS.individual.includedActiveUsers, storagePacks, computePacks, items };
   }
 
   private async account(organizationId: string): Promise<BillingAccount | undefined> {
@@ -1087,7 +1205,42 @@ export class FakeSubscriptionProvider implements SubscriptionProvider {
   async updateSeats(input: any) { this.calls.push({ method: 'updateSeats', input }); return { id: input.subscriptionId }; }
   async updateStoragePacks(input: any) { this.calls.push({ method: 'updateStoragePacks', input }); return { id: input.subscriptionId }; }
   async updateComputePacks(input: any) { this.calls.push({ method: 'updateComputePacks', input }); return { id: input.subscriptionId }; }
+  async updateAddOnSeats(input: any) { this.calls.push({ method: 'updateAddOnSeats', input }); return { id: input.subscriptionId }; }
+  async resumeSubscription(input: any) { this.calls.push({ method: 'resumeSubscription', input }); return { id: input.subscriptionId }; }
   verifyWebhook(raw: Buffer): BillingEvent { return JSON.parse(raw.toString('utf8')); }
+}
+
+/** The most seats one Team may set at once. */
+const MAX_SEATS = 10_000;
+
+/** How many people a Team covers and how they are paid for (seatState). */
+export interface TeamSeats {
+  /** People covered: the included or gifted seats plus those bought; null
+   * on a Team the operator set directly, which counts no seats. */
+  total: number | null;
+  used: number;
+  gifted: number;
+  /** Seats bought at the seat price. */
+  paid: number;
+  /** Seats that cost nothing: the plan's one, or the gifted ones. */
+  included: number;
+  /** How many people may be members; null when the next one is billed a seat. */
+  limit: number | null;
+  autoBill: boolean;
+  priceCents: number;
+}
+
+/** Seats a subscription bills at the seat price: a Team's past the one it
+ * includes, or those alone beside a gifted Team. */
+function billedExtraSeats(account: BillingAccount): number {
+  if (account.plan === 'team') return Math.max(0, account.seats - HOSTED_PLANS.team.includedActiveUsers);
+  return account.plan === 'free' && account.items.teamSeat ? Math.max(0, account.seats) : 0;
+}
+
+/** What a subscription bills each month: its plan and seats, packs and any seats beside a gift. */
+function billedMonthlyCents(account: BillingAccount): number {
+  const besideGift = account.plan === 'free' ? billedExtraSeats(account) * HOSTED_PLANS.team.monthlyAdditionalActiveUserPriceCents : 0;
+  return hostedMonthlyPriceCents(account.plan, account.seats, account.storagePacks, account.computePacks) + besideGift;
 }
 
 function rowAccount(row: any): BillingAccount | undefined {

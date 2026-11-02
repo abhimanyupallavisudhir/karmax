@@ -132,7 +132,7 @@ export function computeNoticeEmail(organization: string, site: string, notice: {
   creditMicros: number; renewsAt: number; hibernateAt?: number; computers?: number }, publicUrl?: string): { subject: string; text: string } {
   const manage = publicUrl ? `\n\nAdd compute: ${publicUrl.replace(/\/$/, '')}/settings` : '';
   const computers = (n = 0) => `${n} parked computer${n === 1 ? '' : 's'}`;
-  const add = 'add a compute pack, turn on auto top-up or change the plan in Plan & billing, or connect your own provider account in Settings → Computers';
+  const add = 'add a $10 pack, turn on auto top-up or change the plan in Plan & billing, or connect your own provider account in Settings → Computers';
   if (notice.stage === 'hibernated') return {
     subject: `${organization}'s parked ${site} computers were hibernated`,
     text: `${organization} is out of compute on ${site}, so its ${computers(notice.computers)} ${notice.computers === 1 ? 'was' : 'were'} hibernated: `
