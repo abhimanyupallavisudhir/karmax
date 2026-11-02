@@ -95,6 +95,29 @@ describe('organization task list', () => {
     } finally { await f.store.close(); }
   });
 
+  it('folds sub-tasks into their parent except the ones waiting on you, so For me narrows Active (pramana#149)', async () => {
+    const f = await fixture();
+    try {
+      const child = async (title: string, mention?: string) => {
+        const task = await f.store.createTask({ projectId: f.web.id, title, workflow: 'software-dev', workflowVersion: '1',
+          params: { prompt: title }, parentTaskId: f.t1.id, createdBy: { kind: 'task-agent', taskId: f.t1.id, role: 'do' } } as any);
+        if (mention) await f.store.appendEvent({ taskId: task.id, type: 'task.mentioned', ts: Date.now(),
+          payload: { principal: { kind: 'user', userId: mention } } });
+        return task;
+      };
+      await child('child asks ana', 'ana');
+      await child('child asks olu', 'owner');
+      await child('quiet child');
+      const active = titles((await f.call(f.ana, f.org.id, 'q=-is:archived -is:folded')).body);
+      const forMe = titles((await f.call(f.ana, f.org.id, 'q=for:me -is:archived')).body);
+      expect(active).toEqual(['ana draft', 'child asks ana', 'redesign header', 'review the app']);
+      expect(forMe).toEqual(['ana draft', 'child asks ana', 'review the app']);
+      expect(forMe.filter((title: string) => !active.includes(title))).toEqual([]);
+      // Asking for sub-tasks shows them all.
+      expect(titles((await f.call(f.ana, f.org.id, 'q=is:subtask')).body)).toEqual(['child asks ana', 'child asks olu', 'quiet child']);
+    } finally { await f.store.close(); }
+  });
+
   it('leads with the task that last changed status, and For you with the task that last came to you', async () => {
     const f = await fixture();
     const olu = { user: 'Olu', userId: 'owner', email: 'olu@example.com', apiToken: 'session' };

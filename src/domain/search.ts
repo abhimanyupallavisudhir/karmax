@@ -171,6 +171,7 @@ export const FACET_OPTIONS: FieldOption[] = [
   { value: 'blocked-on-deps', label: 'Waiting on a dependency' },
   { value: 'series', label: 'Repeatable (template)' },
   { value: 'run', label: 'A run of a repeatable task' },
+  { value: 'folded', label: 'Folded (a sub-task or run with nothing for you)' },
 ];
 
 function facetsOf(t: SearchTask, ctx?: FieldContext): string[] {
@@ -204,6 +205,11 @@ function facetsOf(t: SearchTask, ctx?: FieldContext): string[] {
   // once it is un-ticked, moved to drafts or deleted, the run is an ordinary task.
   const runOf = t.params?.runOf;
   if (typeof runOf === 'string' && (ctx?.series ? ctx.series.has(runOf) : true)) f.push('run');
+  // Lists fold sub-tasks into their parent and runs into their series
+  // (`-is:folded`), except those that need the viewer, so that `for:me` narrows
+  // a list rather than showing rows it hides (pramana#149).
+  if ((f.includes('subtask') || f.includes('run')) && !(ctx?.userId && attentionReasons(t, ctx.userId, ctx).length))
+    f.push('folded');
   return f;
 }
 
@@ -730,6 +736,12 @@ export function evaluateQuery(tasks: SearchTask[], query: TaskQuery, ctx: EvalCo
 /** Every value of every `for:` clause (negated ones too) — what the API resolves. */
 export function forClauseValues(query: TaskQuery): string[] {
   return (query.filters ?? []).filter((c) => fieldByKey(c.field)?.key === 'for').flatMap((c) => c.values);
+}
+
+/** Whether the query uses `is:folded`, which needs the caller's asks (the API resolves them). */
+export function queryFolds(query: TaskQuery): boolean {
+  return (query.filters ?? []).some((c) => fieldByKey(c.field)?.key === 'is'
+    && c.values.some((value) => value.toLowerCase() === 'folded'));
 }
 
 /** The users the query's positive `for:` clauses name. */
