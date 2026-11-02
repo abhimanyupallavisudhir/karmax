@@ -193,7 +193,7 @@ const EMPTY = { ...fixture(), totals: { ...fixture().totals, shipped: 0, created
     // Trend tiles: lower time-to-ship is good; spend only appears with payment access.
     assert.equal(await page.locator('.ins-kpi').count(), 6);
     // Compute: list cost with machine time and what was charged to credit; storage against its quota.
-    assert.match(await page.locator('.ins-kpi', { hasText: 'Compute' }).textContent(), /\$8\.40.*machine · \$4\.40 charged/s);
+    assert.match(await page.locator('.ins-kpi', { hasText: 'Compute' }).textContent(), /\$8\.40.*\$4\.40 charged/s);
     assert.match(await page.locator('.ins-kpi', { hasText: 'Storage' }).textContent(), /4\.9 GB.*3% of 150 GB/s);
     assert.ok((await page.locator('.ins-kpi', { hasText: 'Time to ship' }).locator('.ins-delta').getAttribute('class')).includes('good'));
     assert.ok((await page.locator('.ins-kpi', { hasText: 'Agent time' }).textContent()).includes('10% failed'));
@@ -273,6 +273,8 @@ const EMPTY = { ...fixture(), totals: { ...fixture().totals, shipped: 0, created
       await page.mouse.move(box.x + 50, box.y + 60);
       assert.match(await page.locator('.ins-plot .ins-tip').first().textContent(), /Estimated from what is stored now/);
     }
+    assert.deepEqual(await page.$$eval('.ins-svg text.tick', els => els.map(e => e.textContent).filter(t => /B$/.test(t))), ['0 B', '2 GB', '4 GB', '6 GB'],
+      'bytes tick in whole units');
     // Close to the quota, the line is drawn on the axis.
     await page.evaluate(() => { const data = S.insightsData; data.storage = { ...data.storage, quotaBytes: 8 * 1024 ** 3 }; drawInsightChart(document.querySelector('.ins-chart'), data); });
     assert.equal(await page.locator('.ins-svg .ins-limit line').count(), 1);
@@ -307,6 +309,18 @@ const EMPTY = { ...fixture(), totals: { ...fixture().totals, shipped: 0, created
       await page.mouse.move(box.x + box.width - 2, box.y + 10);
       assert.match(await logins.locator('.ins-mini .ins-tip').first().textContent(), /5-hour window.*Week.*Of \$150 per 5 hours and \$900 per week/s);
     }
+
+    // Turns from before logins were recorded: one gray row and bar, apart from the logins' shares.
+    await page.evaluate(() => { window.insightsResponse = () => ({ ...FIXTURE, logins: [...FIXTURE.logins, { id: 'unrecorded:anthropic', provider: 'anthropic',
+      unrecorded: true, turns: 1681, tokens: 1e9, usd: 3699, share: 0, daily: [500, 0, 0, 0, 0, 0, 0], dailyTokens: [0, 0, 0, 0, 0, 0, 0] }] }); return renderPage(); });
+    assert.match(await page.locator('.ins-unrecorded').textContent(), /Login not recorded\s*1\.7k turns/);
+    assert.match(await page.locator('.ins-unrecorded').getAttribute('title'), /before tavya recorded which login/);
+    await page.locator('[data-ins-lens="tokens"]').click();
+    await page.locator('[data-ins-split="login"]').click();
+    assert.deepEqual(await page.$$eval('.ins-chart .ins-legend span', els => els.map(e => e.textContent)), ['claude:work', 'claude:spare', 'Not recorded', 'Weekly pace']);
+    await page.locator('[data-ins-split="model"]').click();
+    await page.locator('[data-ins-lens="shipped"]').click();
+    await page.evaluate(() => { window.insightsResponse = () => FIXTURE; return renderPage(); });
 
     // Credit: charges so far against the month's credit, with the pace to the end.
     const credit = page.locator('.ins-credit');

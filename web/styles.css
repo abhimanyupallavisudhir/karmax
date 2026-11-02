@@ -4367,3 +4367,5 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 /* A one-click way to the setting that unblocks a stopped or waiting task. */
 .setup-fix { margin-left: 8px; vertical-align: baseline; }
 .msg.system.error .setup-fix { display: flex; width: fit-content; margin: 8px 0 2px; }
+.ins-unrecorded { color: var(--ink-3); font-size: 12px; cursor: help; }
+.ins-unrecorded .ins-login-share b { width: auto; color: var(--ink-3); }

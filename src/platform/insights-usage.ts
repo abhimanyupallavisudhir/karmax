@@ -153,8 +153,10 @@ export interface LoginInsights {
   tokens: number;
   /** API-equivalent dollars (list API prices): how subscriptions' quotas are measured. */
   usd: number;
-  /** Share of all logins' API-equivalent dollars in the window. */
+  /** Share of the recorded logins' API-equivalent dollars in the window (0 for `unrecorded`). */
   share: number;
+  /** Turns that did not record their login (before 2026-10-28, when turns began to), per provider. */
+  unrecorded?: true;
   daily: number[];
   dailyTokens: number[];
   /** Subscriptions only: dollars per window (learned from readings, else the prior). */
@@ -412,6 +414,20 @@ async function storageNow(store: Store, organizationId: string): Promise<Storage
   for (const attachment of contents.attachments)
     put(attachment.projectId, 'resources', contents.repositoryBytes.get(attachment.id) ?? 0, firstRevision.get(attachment.id) ?? 0);
   for (const checkpoint of contents.checkpoints) put(checkpoint.projectId, 'workspaces', checkpoint.bytes, checkpoint.createdAt);
+  // A chunked checkpoint keeps its files as chunks every checkpoint of the
+  // organization shares (wiki features/chunked-world-checkpoints): workspaces,
+  // split between projects in proportion to what their tasks uploaded.
+  if (managed) {
+    const chunks = Number(((await store.db.prepare(`SELECT COALESCE(SUM(bytes), 0) AS bytes FROM resource_snapshot_chunks
+      WHERE organizationId=? AND storageLocationId=?`).get(organizationId, managed.id)) as { bytes?: number } | undefined)?.bytes ?? 0);
+    if (chunks > 0) {
+      const uploads = (await store.db.prepare(`SELECT projectId, SUM(quantity) AS bytes, MIN(startedAt) AS since FROM usage_events
+        WHERE organizationId=? AND kind='checkpoint.storage' AND projectId IS NOT NULL GROUP BY projectId`).all(organizationId)) as
+        Array<{ projectId: string; bytes: number; since: number }>;
+      const total = uploads.reduce((sum, row) => sum + Number(row.bytes), 0);
+      if (total > 0) for (const row of uploads) put(String(row.projectId), 'workspaces', chunks * Number(row.bytes) / total, Number(row.since));
+    }
+  }
   for (const artifact of contents.artifacts) put(artifact.projectId, 'reviewFiles', artifact.bytes, artifact.createdAt);
   const counted = byKind.resources + byKind.workspaces + byKind.reviewFiles;
   byKind.other = managed ? Math.max(0, bytes - counted) : 0;
@@ -493,9 +509,10 @@ export async function loginInsights(store: Store, rows: TokenRow[], window: Insi
   const logins = new Map<string, LoginInsights & { turnsAt: Array<[number, number]> }>();
   const hoursFrom = Math.floor((window.now - 7 * DAY) / HOUR) * HOUR;
   for (const row of rows) {
-    const id = typeof row.metadata.account === 'string' && row.metadata.account ? row.metadata.account : `unattributed:${row.provider}`;
+    const recorded = typeof row.metadata.account === 'string' && row.metadata.account;
+    const id = recorded ? row.metadata.account as string : `unrecorded:${row.provider}`;
     let entry = logins.get(id);
-    if (!entry) logins.set(id, entry = { id, provider: row.provider, turns: 0, tokens: 0, usd: 0, share: 0,
+    if (!entry) logins.set(id, entry = { id, provider: row.provider, ...(recorded ? {} : { unrecorded: true as const }), turns: 0, tokens: 0, usd: 0, share: 0,
       daily: Array.from({ length: window.days }, () => 0), dailyTokens: Array.from({ length: window.days }, () => 0), turnsAt: [] });
     const usd = turnUsd(row.metadata);
     // The windows look back up to a week before the chart's first hour.
@@ -505,12 +522,13 @@ export async function loginInsights(store: Store, rows: TokenRow[], window: Insi
     entry.turns++; entry.tokens += row.quantity; entry.usd += usd;
     entry.daily[index]! += usd; entry.dailyTokens[index]! += row.quantity;
   }
-  const total = [...logins.values()].reduce((sum, login) => sum + login.usd, 0);
+  // Shares are among turns that know their login: how the scheduler spread work.
+  const total = [...logins.values()].filter((login) => !login.unrecorded).reduce((sum, login) => sum + login.usd, 0);
   const hours = Math.ceil((window.now - hoursFrom) / HOUR);
   const out: LoginInsights[] = [];
   for (const { turnsAt, ...login } of logins.values()) {
     if (!login.turns) continue;
-    login.share = total > 0 ? login.usd / total : 0;
+    login.share = total > 0 && !login.unrecorded ? login.usd / total : 0;
     login.usd = Math.round(login.usd * 100) / 100;
     login.daily = login.daily.map((value) => Math.round(value * 100) / 100);
     if (login.id.startsWith('login:')) {
@@ -535,7 +553,7 @@ export async function loginInsights(store: Store, rows: TokenRow[], window: Insi
     }
     out.push(login);
   }
-  return out.sort((a, b) => b.usd - a.usd || b.turns - a.turns);
+  return out.sort((a, b) => Number(Boolean(a.unrecorded)) - Number(Boolean(b.unrecorded)) || b.usd - a.usd || b.turns - a.turns);
 }
 
 /** Hour by hour, how full the 5-hour window and the week were. A 5-hour

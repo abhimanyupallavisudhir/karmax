@@ -17091,9 +17091,9 @@ function insightComputeTile(data, tile) {
   if (!c || !(c.totals.activeSeconds || c.totals.diskGbHours || c.previous.activeSeconds || c.credit)) return '';
   const time = insDuration(c.totals.activeSeconds * 1000);
   if (!c.money) return tile('Compute', 'Time machines ran for your tasks', time, insDelta(c.totals.activeSeconds, c.previous.activeSeconds, data.days));
-  return tile('Compute', `What providers bill for your tasks' machines and disks, at list price. Managed compute is charged to your credit at ${c.multiplier}× list.`,
+  return tile('Compute', `What providers bill for your tasks' machines and disks, at list price (${time} of machine time). Managed compute is charged to your credit at ${c.multiplier}× list.`,
     insMoney(c.totals.listMicros), insDelta(c.totals.listMicros, c.previous.listMicros, data.days),
-    `${time} machine${c.totals.chargedMicros ? ` · ${insMoney(c.totals.chargedMicros)} charged` : ''}`);
+    c.totals.chargedMicros ? `${insMoney(c.totals.chargedMicros)} charged` : `${time} machine`);
 }
 
 function insightStorageTile(data, tile) {
@@ -17112,10 +17112,12 @@ function insightSeries(data, lens) {
     if (insightSplit(data, 'tokens').key === 'login') {
       // API-equivalent dollars: how subscription quotas are measured, so the
       // logins' weekly quotas can be drawn on the same axis.
-      const logins = data.logins;
-      const totals = Object.fromEntries(logins.map((login) => [login.id, login.usd]));
-      const keys = insTopKeys(totals);
+      const logins = data.logins.filter((login) => !login.unrecorded);
+      const keys = insTopKeys(Object.fromEntries(logins.map((login) => [login.id, login.usd])));
       const bars = insStack(daily.map((_, i) => Object.fromEntries(logins.map((login) => [login.id, login.daily[i] || 0]))), (d) => d, keys, accountShortName);
+      // Turns from before logins were recorded: gray, apart from the logins' own colors.
+      const unrecorded = daily.map((_, i) => data.logins.filter((login) => login.unrecorded).reduce((sum, login) => sum + (login.daily[i] || 0), 0));
+      if (unrecorded.some(Boolean)) bars.push({ key: 'unrecorded', label: 'Not recorded', color: 'var(--line-strong)', values: unrecorded });
       const week = logins.reduce((sum, login) => sum + (login.capacity?.week || 0), 0);
       return { unit: 'usd', bars,
         ...(week ? { limit: { value: week / 7, label: 'Weekly pace',
@@ -17199,7 +17201,9 @@ function insightChartSvg(data, lens, width) {
   // A limit far above the data would flatten it: then it is named, not drawn.
   const limit = series.limit && dataMax > 0 ? { ...series.limit, onScale: series.limit.value <= dataMax * 4 } : null;
   const max = Math.max(dataMax, limit?.onScale ? limit.value : 0);
-  const ticks = insNiceTicks(max);
+  // Bytes tick in whole binary units (25 GB, 50 GB), not decimal fractions of them.
+  const scale = series.unit === 'bytes' && max > 0 ? 1024 ** Math.floor(Math.log(max) / Math.log(1024)) : 1;
+  const ticks = insNiceTicks(max / scale).map((tick) => tick * scale);
   const top = ticks.at(-1) || 1;
   const y = (v) => padT + plotH - (v / top) * plotH;
   const band = plotW / n;
@@ -17473,7 +17477,9 @@ function insightLoginsHtml(data, quota) {
     const login = logins.find((value) => value.id === id);
     const state = live.get(id);
     const snap = state?.usage;
-    const name = id.startsWith('unattributed:') ? `${id.slice('unattributed:'.length)} (API key)` : accountShortName(id);
+    if (login?.unrecorded) return `<div class="ins-quota ins-unrecorded" title="${esc(`Turns from before tavya recorded which login served each one (Oct 28, 2026): ${insMoney(login.usd * 1e6)} at API prices`)}">
+      <div class="ins-quota-name"><span>Login not recorded</span><span class="ins-login-share"><b>${insNum(login.turns)}</b> turns</span></div></div>`;
+    const name = accountShortName(id);
     const status = state?.status && state.status !== 'available'
       ? `<span class="ins-quota-state">${state.status === 'manual-off' ? 'off' : state.status === 'needs-attention' ? 'needs attention' : 'exhausted'}${
         state.resetAt > Date.now() ? ` · back ${esc(fmtCountdown(state.resetAt))}` : ''}</span>` : '';
@@ -17559,7 +17565,7 @@ function insightBudgetsHtml(data) {
         ...(cap ? { limit: { value: cap } } : {}), series: [{ values, color: 'var(--accent)', bars: true }],
         tip: (i) => `<div class="ins-tip-h">${esc(insDayLabel(data.daily[i].day, 30))}</div>${insTipRow(`Peak ${unit}`, String(values[i]), 'var(--accent)')}${cap ? insTipRow('Budget', String(cap)) : ''}` })}</div>`;
   }).join('');
-  return `<section class="card ins-card ins-budgets"><div class="ins-card-h"><span title="tavya's own provider accounts, every organization together: the most running at once each day against each account's budget (Installation → Managed compute)">Managed accounts</span>
+  return `<section class="card ins-card ins-budgets"><div class="ins-card-h"><span title="tavya's own provider accounts, every organization together: the most running at once each day, from booked machine time, against each account's budget (Installation → Managed compute). Hetzner books whole hours, so short runs count for their hour.">Managed accounts</span>
     <a class="ins-more" data-spa href="${esc(installationRoute())}#installation-compute">Manage</a></div>${rows}</section>`;
 }
 

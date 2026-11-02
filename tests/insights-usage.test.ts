@@ -226,6 +226,25 @@ describe('insights: storage', () => {
     } finally { await f.store.close(); }
   });
 
+  it('counts chunked workspaces\' shared chunks as workspaces, split by what each project uploaded', async () => {
+    const f = await storageFixture();
+    try {
+      const location = managedStorageLocationId(f.organization.id);
+      await f.store.db.prepare(`INSERT INTO resource_snapshot_chunks (organizationId, chunkId, storageLocationId, refs, bytes) VALUES (?, ?, ?, 1, ?)`)
+        .run(f.organization.id, 'chunk-1', location, 4 * GIB);
+      // Web's tasks uploaded 1 GiB of checkpoints (the fixture), Backend's 3 GiB.
+      const other = await f.task(f.api.id, 'Backend work');
+      await f.store.recordUsage({ organizationId: f.organization.id, projectId: f.api.id, taskId: other.id, provider: 'e2b',
+        kind: 'checkpoint.storage', quantity: 3 * GIB, unit: 'byte', costMicros: 0, fundingSource: 'managed',
+        startedAt: NOW - DAY, endedAt: NOW - DAY } as any);
+      const { storage } = await organizationInsights(f.store, f.organization.id, { days: 7, now: NOW });
+      expect(storage.byKind).toEqual({ resources: 0, workspaces: 5 * GIB, reviewFiles: 10 * 1024 ** 2, other: 0 });
+      const project = (id: string) => storage.projects.find((p) => p.id === id)!;
+      expect(project(f.web.id).byKind.workspaces / GIB).toBeCloseTo(2, 5);
+      expect(project(f.api.id).byKind.workspaces / GIB).toBeCloseTo(3, 5);
+    } finally { await f.store.close(); }
+  });
+
   it('remembers each day\'s storage, so deleted data still shows on the days it was kept', async () => {
     const f = await storageFixture();
     try {
@@ -273,8 +292,11 @@ describe('insights: model logins', () => {
       const hidden = await organizationInsights(f.store, f.organization.id, { days: 7, now: NOW });
       expect(hidden.logins).toBeUndefined();
       const { logins } = await organizationInsights(f.store, f.organization.id, { days: 7, now: NOW, includeLogins: true });
-      expect(logins!.map((login) => [login.id, login.turns])).toEqual([[max1, 4], [max2, 1], ['unattributed:anthropic', 1]]);
-      expect(logins![0]!.share).toBeCloseTo(4 / 6);
+      // A turn that did not record its login is kept apart: shares are among the logins known.
+      expect(logins!.map((login) => [login.id, login.turns, login.unrecorded])).toEqual([[max1, 4, undefined], [max2, 1, undefined],
+        ['unrecorded:anthropic', 1, true]]);
+      expect(logins![0]!.share).toBeCloseTo(4 / 5);
+      expect(logins![2]!.share).toBe(0);
       expect(logins![0]!.capacity).toMatchObject({ learned: true });
       expect(logins![0]!.observed).toEqual({ week: { utilization: 0.31, resetsAt: NOW + 2 * DAY, at: NOW - HOUR } });
       expect(logins![2]!.hourly).toBeUndefined();
