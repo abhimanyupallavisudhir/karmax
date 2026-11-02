@@ -133,6 +133,20 @@ const legacyLineEndingEntries = conversationEntries({ role: 'do', messages: [
 ] });
 ok(legacyLineEndingEntries.filter((entry) => entry.activity?.title === 'All done' || entry.message?.id === 'legacy-crlf').length === 1,
   'historical provider/transcript copies de-duplicate across line-ending normalization');
+// The provider item a transcript reply stands for is the turn's final answer;
+// narration between tool calls is not (the outline keeps only answers in view).
+S.taskEvents.push({ seq: 3.5, ts: 1710000003500, type: 'agent.activity', payload: {
+  role: 'do', turnId: 'turn-1', attempt: 1, id: 'narration', kind: 'message', phase: 'completed', title: 'Running the tests now',
+} });
+const answerOf = (list) => list.filter((entry) => entry.answer).map((entry) => entry.activity.title).join('|');
+ok(answerOf(conversationEntries(transcript)) === 'All done', 'the provider item a reply links to is the answer; narration is not');
+ok(answerOf(conversationEntries({ role: 'do', messages: [
+  { id: 'replaced-id', role: 'agent', text: 'All done', ts: 2, sourceActivity: { turnId: 'turn-1', id: 'provider-replaced-this-id', attempt: 1 } },
+] })) === 'All done', 'a replaced provider item id still marks the answer');
+ok(answerOf(conversationEntries({ role: 'do', messages: [{ id: 'legacy-a1', role: 'agent', text: 'All done', ts: 2 }] })) === 'All done',
+  'a historical transcript copy marks its answer by text');
+ok(answerOf(conversationEntries({ role: 'do', messages: [] })) === '', 'without a transcript reply nothing is an answer yet');
+S.taskEvents = S.taskEvents.filter((event) => event.seq !== 3.5);
 S.explanationErrors['activity:4'] = { code: 'explanation_api_key_missing', provider: 'openrouter' };
 const missingKey = renderConversationEntry(entries.find((entry) => entry.sourceKey === 'activity:4'));
 ok(missingKey.includes('API key for openrouter not found') && missingKey.includes('#settings-agents') && missingKey.includes('#project-explanation'), 'missing-key guidance links to agent logins and the project explanation default');
