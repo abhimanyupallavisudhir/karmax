@@ -1,4 +1,9 @@
 import type { Store } from '../store/db.js';
+import type { AccountPool } from '../domain/computer-limits.js';
+import {
+  computeInsights, loginInsights, storageInsights,
+  type ComputeInsights, type InsightWindow, type LoginInsights, type StorageInsights,
+} from './insights-usage.js';
 
 /**
  * Organization Insights — what the organization's agents got done and what it
@@ -38,6 +43,12 @@ export interface OrganizationInsights {
   pipeline: { stages: Record<string, InsightStage>; working: number; waiting: number; drafts: number };
   working: InsightTaskRef[]; waiting: InsightTaskRef[]; recent: InsightTaskRef[];
   spend?: { modelMicros: number; cardMicros: number };
+  /** Machines (insights-usage.ts). Without payment:read every amount is 0 and `money` false. */
+  compute: ComputeInsights & { money: boolean };
+  /** Managed storage over the days, against the quota. */
+  storage: StorageInsights;
+  /** Model logins: share of the work and their quota windows (credential:read). */
+  logins?: LoginInsights[];
 }
 
 function emptyTotals(): InsightTotals {
@@ -62,6 +73,12 @@ const AGENT_WAITS = new Set(['subtask', 'timer', 'job', 'collaboration', 'parent
 
 export async function organizationInsights(store: Store, organizationId: string, options: {
   days?: number; utcOffsetMinutes?: number; now?: number; includeSpend?: boolean;
+  /** The caller may see the organization's logins (credential:read). */
+  includeLogins?: boolean;
+  /** Hosted with managed compute offered: the month's compute credit. */
+  computeCredit?: boolean;
+  /** Operators (installation settings:read): the managed accounts' budgets. */
+  managedBudgets?: Array<{ provider: string; pool?: AccountPool }>;
 } = {}): Promise<OrganizationInsights> {
   const days = (INSIGHT_PERIODS as readonly number[]).includes(Number(options.days)) ? Number(options.days) : 30;
   const offset = Math.max(-14 * 60, Math.min(14 * 60, Math.round(Number(options.utcOffsetMinutes) || 0))) * 60_000;
@@ -204,8 +221,26 @@ export async function organizationInsights(store: Store, organizationId: string,
     }
   }
 
+  const window: InsightWindow = { days, from, previousFrom, now, offset, firstDay };
+  const [compute, storage, logins] = await Promise.all([
+    computeInsights(store, organizationId, window, {
+      projectName,
+      task: (taskId) => taskById.get(taskId),
+      credit: Boolean(options.includeSpend && options.computeCredit),
+      ...(options.includeSpend && options.managedBudgets ? { budgets: options.managedBudgets } : {}),
+    }),
+    storageInsights(store, organizationId, window, projectName),
+    options.includeLogins
+      ? loginInsights(store, rows.tokens.map((row) => ({ provider: row.provider, quantity: row.quantity,
+        metadata: parseJson(row.metadata), startedAt: row.startedAt })), window)
+      : undefined,
+  ]);
+
   const result: OrganizationInsights = {
     days, from, to: now, utcOffsetMinutes: offset / 60_000,
+    compute: options.includeSpend ? { ...compute, money: true } : withoutMoney(compute),
+    storage,
+    ...(logins ? { logins } : {}),
     totals, previous, daily,
     // Ranked by work done: tokens are missing for unreported turns, turns never are.
     models: [...perModel.values()].sort((a, b) => b.turns - a.turns || b.tokens - a.tokens),
@@ -235,4 +270,18 @@ export async function organizationInsights(store: Store, organizationId: string,
     previous.spendMicros = previousModelMicros + cardMicros(inPrevious);
   }
   return result;
+}
+
+/** Compute without amounts, for members who may not see money: machine time
+ * and disk stay, every amount is 0. */
+function withoutMoney(compute: ComputeInsights): ComputeInsights & { money: false } {
+  const zero = <T extends { listMicros: number; chargedMicros: number }>(entry: T): T => ({ ...entry, listMicros: 0, chargedMicros: 0 });
+  const zeroValues = (values: Record<string, number>) => Object.fromEntries(Object.keys(values).map((key) => [key, 0]));
+  const { credit: _credit, budgets: _budgets, ...rest } = compute;
+  return { ...rest, money: false,
+    totals: { ...zero(compute.totals), managed: zero(compute.totals.managed), own: zero(compute.totals.own) },
+    previous: zero(compute.previous),
+    daily: compute.daily.map((day) => ({ ...zero(day), byProvider: zeroValues(day.byProvider), byFunding: { managed: 0, own: 0 },
+      byProject: zeroValues(day.byProject), bySize: zeroValues(day.bySize) })),
+    providers: compute.providers.map(zero), projects: compute.projects.map(zero), tasks: compute.tasks.map(zero), sizes: compute.sizes.map(zero) };
 }

@@ -120,7 +120,7 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/organizations/:organizationId/entitlements (current hosted plan, limits, and live usage; private installs are unlimited)',
     'GET /api/organizations/:organizationId/export (full-tenant dump; organization:edit)',
     'GET /api/organizations/:organizationId/usage (spend + token usage for the tenant)',
-    'GET /api/organizations/:organizationId/insights?days=7|30|90&utcOffset=<minutes east of UTC> (shipped/started tasks, agent time, tokens by model, per-project, live pipeline; spend with payment:read)',
+    'GET /api/organizations/:organizationId/insights?days=7|30|90&utcOffset=<minutes east of UTC> (shipped/started tasks, agent time, tokens by model, per-project, live pipeline; compute: machine time and cost by provider, funding, project, task and size, where provider Any routed computers, the month\'s compute credit against charges; storage: stored bytes per day by kind and project against the quota; amounts with payment:read, logins (share of work, 5-hour and weekly windows) with credential:read, managed accounts\' budgets for installation operators)',
     'GET|PUT /api/organizations/:organizationId/identity-policy', 'POST /api/organizations/:organizationId/scim-token',
     'GET|POST /api/organizations/:organizationId/roles (POST body {name, description, capabilities}; organization-owned roles may contain only catalog capabilities held by the caller)',
     'GET|POST /api/organizations/:organizationId/members', 'DELETE /api/organizations/:organizationId/members/:userId',
