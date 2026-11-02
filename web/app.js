@@ -9307,6 +9307,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           </div>
         </div>
       </div>
+      ${awaitingApproval(draft) ? '<div class="tf-approval" id="tf-approval" hidden></div>' : ''}
       <div class="tf-scroll">
         <div class="tf-columns parameter-fields" id="tf-body" data-project-id="${esc(projectId)}">
           <div class="tf-main">
@@ -9781,6 +9782,46 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       ...(formImages.length ? { images: [...formImages] } : {}), ...(formFiles.length ? { files: [...formFiles] } : {}) } }));
     leavePage(navigating);
   };
+
+  // A task waiting for approval says what it asks for, and its approvers decide
+  // here: approving runs it (armed while what it waits for is unfinished),
+  // denying leaves it a draft. Either way its page opens as it now is.
+  if (awaitingApproval(draft)) (async () => {
+    const box = $('#tf-approval');
+    const organizationId = projectOrganizationId || S.organizationId || '';
+    const requests = (await api(`/api/authorization-requests?taskId=${encodeURIComponent(draft.id)}&organizationId=${encodeURIComponent(organizationId)}`)
+      .catch(() => [])).filter((request) => request.status === 'pending');
+    const items = requests.some((request) => requestedCredentialIds(request).length)
+      ? await api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId)}`).catch(() => []) : [];
+    if (activeFormToken !== formToken || !box?.isConnected) return;
+    box.innerHTML = approvalBannerHtml(requests, items);
+    box.hidden = !requests.length;
+    const buttons = () => box.querySelectorAll('button');
+    buttons().forEach((button) => button.addEventListener('click', async () => {
+      const act = button.dataset.areqAct;
+      buttons().forEach((b) => { b.disabled = true; });
+      try {
+        // Decide on the task as last edited here.
+        clearTimeout(saveTimer);
+        if (edited) await persistDraft();
+        const result = await api(`/api/authorization-requests/${encodeURIComponent(button.closest('[data-areq]').dataset.areq)}/resolve?organizationId=${encodeURIComponent(organizationId)}`,
+          { method: 'POST', body: JSON.stringify({ action: act }) });
+        toast(act === 'deny' ? 'Authorization denied' : result.queued ? 'Approved — task queued' : 'Authorization approved');
+      } catch (error) {
+        buttons().forEach((b) => { b.disabled = false; });
+        toast(error.message, true);
+        return;
+      }
+      releaseFormKeys();
+      root.innerHTML = '';
+      loadInbox().catch(() => {});
+      if (!page || S.selected !== draft.id) { refreshTasks(); return; }
+      S.attemptGroup = null;
+      renderTaskLoadingPage(taskRecord(draft.id) || draft);
+      await refreshTasks();
+      if (S.selected === draft.id) openTask(draft.id);
+    }));
+  })();
 
   // ── Templates: this form as a template (Save as template), or a template's own form ──
   const templateBody = (st = formState()) => ({ workflow: wf, params: st.body, notes: st.notes,
@@ -21355,6 +21396,41 @@ function permissionRequestRows(requests, { historyLimit = 20, inTask = false } =
   return pendingHtml + history;
 }
 
+function requestedCredentialIds(request) {
+  return [...new Set([...(request.credentialGrants || []), ...(request.missingCapabilities || [])]
+    .filter((cap) => cap.startsWith('use-credential:item:')).map((cap) => cap.slice('use-credential:item:'.length)))];
+}
+
+// The approval requests of a task waiting for approval, as a band on its form:
+// what is asked, by whom and why, and Approve/Deny for those it was sent to.
+function approvalBannerHtml(requests, items = []) {
+  const signedInUserId = typeof S.user === 'string' ? S.user : S.user?.id;
+  return requests.map((request) => {
+    const askingTask = /^task-agent:([^:]+):/.exec(request.requestedBy || '')?.[1];
+    const asker = askingTask && taskRecord(askingTask);
+    const askerHtml = asker ? `<a data-spa href="${esc(taskUrl(asker.id, asker))}" title="${esc(asker.title)}">${asker.num != null ? `#${asker.num}` : esc(asker.title)}</a> asks for`
+      : 'Asks for';
+    const missing = (request.missingCapabilities || []).filter((cap) => !cap.startsWith('use-credential:'));
+    const credentials = requestedCredentialIds(request).map((id) => items.find((item) => item.id === id)?.label || 'a vault credential');
+    const projects = S.projects.filter((project) => project.organizationId === request.organizationId);
+    const canResolve = signedInUserId && request.recipients.includes(signedInUserId);
+    return `<div class="tf-approval-row" data-areq="${esc(request.id)}">
+      <span class="tf-ready-mark" aria-hidden="true">!</span>
+      <div class="tf-approval-main">
+        <div class="tf-approval-what">${askerHtml}
+          <span class="chip"${missing.length ? ` title="${esc(`Adds ${missing.join(', ')}`)}"` : ''}>${esc(authorizationSummary(request.authorization, projects))}</span>
+          ${credentials.map((label) => `<span class="chip" title="Vault credential">${esc(label)}</span>`).join('')}
+        </div>
+        ${request.reason ? `<div class="tf-approval-reason" title="${esc(request.reason)}">${esc(request.reason)}</div>` : ''}
+      </div>
+      <div class="tf-approval-actions">${canResolve
+        ? `<button type="button" class="btn sm primary" data-areq-act="approve" title="Grant it and run the task">Approve</button>
+          <button type="button" class="btn sm" data-areq-act="deny" title="Keep it a draft">Deny</button>`
+        : `<span class="task-sub">Waiting for ${request.audience.map(esc).join(', ')}</span>`}</div>
+    </div>`;
+  }).join('');
+}
+
 function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
   const signedInUserId = typeof S.user === 'string' ? S.user : S.user?.id;
   const pending = requests.filter((request) => request.status === 'pending');
@@ -21382,7 +21458,7 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
   </div>`;
   }).join('');
   const history = recent.length ? `<div class="approval-history"><div class="section-h">Recent authorization decisions</div>${recent.map((request) =>
-    `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
+    `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : request.status === 'withdrawn' ? '' : 'done'}"${request.withdrawn ? ` title="${esc(request.withdrawn.reason)}"` : ''}>${esc(request.status)}</span>
       <span>${esc(authorizationSummary(request.authorization, S.projects))}</span>
       <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>` : '';
   return pendingHtml + history;

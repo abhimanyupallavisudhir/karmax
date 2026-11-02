@@ -150,3 +150,50 @@ describe('an agent granting more than it has', () => {
     ]));
   });
 });
+
+describe('a task waiting for approval', () => {
+  /** An agent's follow-up that waits on its own task and asks @maintainers for
+   * more authority than the agent holds (task #19 of indike.org). */
+  async function waiting() {
+    const f = await fixture();
+    const agent = await f.agentOf(f.parent.id);
+    const draft = await f.api.createTask(agent, { projectId: f.project.id, workflow: 'just-do', prompt: 'verify the deploy',
+      authorization: f.maintainer, draft: true, allowAttenuation: true,
+      params: { triggers: [{ kind: 'dependency', tasks: [f.parent.id] }] } } as any);
+    expect((await f.store.getTask(draft.id))!.params.triggers).toHaveLength(1);
+    const request = await f.api.requestAuthorization(agent, { projectId: f.project.id,
+      target: { kind: 'task', taskId: draft.id, queueAfterApproval: true }, authorization: f.maintainer, audience: ['@maintainers'] });
+    expect((await f.store.getTask(draft.id))!.params._awaitingApproval).toBe(request.id);
+    return { ...f, draft, request };
+  }
+  const requestsOf = async (f: Awaited<ReturnType<typeof waiting>>) =>
+    f.api.listAuthorizationRequests(await f.human('owner'), { organizationId: f.organization.id, taskId: f.draft.id });
+
+  it('is decided by running it: the request no longer asks, and a later approval cannot regrant it', async () => {
+    const f = await waiting();
+    // A maintainer runs it from its form with only developer authority.
+    const maint = await f.human('maint');
+    await f.api.setTaskAuthorization(maint, f.draft.id, { level: 'developer', scope: 'projects', projectIds: [f.project.id] });
+    await f.api.queueTask(maint, f.draft.id);
+    const task = (await f.store.getTask(f.draft.id))!;
+    // Its dependency has not finished, so running it arms it rather than starting it.
+    expect(task.params).toMatchObject({ triggerState: 'armed', _awaitingApproval: null });
+    expect(task.params.draft).toBeFalsy();
+    const [request] = await requestsOf(f);
+    expect(request).toMatchObject({ status: 'withdrawn', withdrawn: { by: 'user:maint', reason: expect.stringMatching(/ran/i) } });
+    const events = await f.store.eventsOfType(f.draft.id, 'authorization.approval-resolved');
+    expect(events.at(-1)?.payload).toMatchObject({ requestId: f.request.id, action: 'withdraw' });
+    // The stale request cannot raise the task to maintainer after the fact.
+    await expect(f.api.resolveAuthorizationRequest(await f.human('owner'),
+      { organizationId: f.organization.id, requestId: f.request.id, action: 'approve' })).rejects.toThrow(/withdrawn/);
+    expect((await f.store.getTask(f.draft.id))!.params._authorization).toMatchObject({ level: 'developer' });
+  });
+
+  it('is armed, not started, when approved before its dependency finishes', async () => {
+    const f = await waiting();
+    const resolved = await f.api.resolveAuthorizationRequest(await f.human('maint'),
+      { organizationId: f.organization.id, requestId: f.request.id, action: 'approve' });
+    expect(resolved).toMatchObject({ status: 'granted', queued: true });
+    expect((await f.store.getTask(f.draft.id))!.params).toMatchObject({ triggerState: 'armed', _awaitingApproval: null });
+  });
+});
