@@ -169,6 +169,8 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       const notice = page.locator('#tf-ready');
       await step('the form says there is no computer', () => notice.getByRole('link', { name: 'Connect a computer' }).waitFor());
       expect(await notice.innerText()).toMatch(/^!?\s*Can’t start yet:/);
+      // At the top of the form, seen before anything is written.
+      expect(await page.locator('.tf-main > .tf-ready:first-child').count()).toBe(1);
       expect(await notice.getByRole('link', { name: 'Connect a computer' }).getAttribute('href'))
         .toBe(`/${organization.slug}/settings#settings-computers`);
 

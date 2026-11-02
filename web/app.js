@@ -17,7 +17,7 @@ const esc = (s) =>
 function storageOverQuotaMarkup(contents) {
   if (!contents?.overQuota) return '';
   const date = new Date(contents.overQuota.deleteAt).toLocaleDateString();
-  return `<p class="task-sub storage-over">Over the limit: adding data is paused. ${policyTip(`Free space or upgrade by ${date}. After that, stored data is deleted, older versions first, until it fits.`)}</p>`;
+  return `<p class="task-sub storage-over">Over the limit: adding data is paused. ${policyTip(`Free space or add a 100 GB pack by ${date}. After that, stored data is deleted, older versions first, until it fits.`)} <a class="btn sm" href="#settings-plan">Add storage</a></p>`;
 }
 // Deleted data the bucket keeps for its 30-day recovery window: real bytes,
 // but not the organization's to count against its limit.
@@ -4470,6 +4470,7 @@ function plainError(error) {
   if (/^message too large/i.test(text)) return 'That message is too long. Shorten it, or attach the text as a file.';
   if (/^Workflow Update failed$/i.test(text)) return 'This task couldn’t take that change just now. Refresh the page and try again.';
   if (/^invalid JSON body$/i.test(text)) return 'That didn’t send correctly. Refresh the page and try again.';
+  if (storageFull(text)) return 'Your organization’s storage is full. Free some space, or add a 100 GB pack in Plan & billing.';
   if (/name already exists on this account/i.test(text))
     return 'A GitHub repository with that name already exists. Choose another name, or add the existing one from the list.';
   if (/Bad credentials|token (?:has )?expired|refresh token/i.test(text) && /github/i.test(text))
@@ -4498,7 +4499,14 @@ function plainTaskError(text) {
   const body = raw.replace(/^infrastructure: /, '').replace(/^(?:Activity task failed → )+/, '');
   const retry = /— retrying (\w+) in (\d+\s*\w+) \((\d+)\/(\d+)\)\s*$/.exec(body);
   const retrying = retry ? ` tavya will try again in ${retry[2]} (attempt ${retry[3]} of ${retry[4]}).` : '';
-  const summary = /context window|prompt is too long|maximum context length/i.test(body)
+  // Out of compute (it names "Plan & billing", which the AI-limit pattern below
+  // would take for a model's billing): what happened in one line; what to do is
+  // the buttons beside it.
+  const spent = /Out of compute: this month's (\$[\d.,]+) of compute is used up( or held)?/i.exec(body);
+  const summary = /Out of compute: .*come with a paid plan/i.test(body) ? `${siteName()}’s computers come with a paid plan.`
+    : spent ? `This month’s ${spent[1]} of compute is used up${spent[2] ? ' or held by work running now' : ''}.`
+    : storageFull(body) ? 'Your organization’s storage is full. Free some space, or add a 100 GB pack in Plan & billing.'
+    : /context window|prompt is too long|maximum context length/i.test(body)
     ? 'The conversation grew too long for the AI model. Send a shorter message, or start a new task.'
     : /safety rejection|content policy|flagged/i.test(body) ? 'The AI provider declined this request. Rephrase it and try again.'
     : /No usable \S+ credential|has no usable .* credential/i.test(body) ? 'No AI account is available to run this task. Ask an admin to connect one in organization settings.'
@@ -4526,21 +4534,30 @@ function toolsDidNotStart(text) {
 }
 // Where a person fixes what a task stopped or waits on, when it is a setting:
 // an agent account, a computer, compute credit, GitHub.
-function setupFix(text) {
+// Storage refused over the organization's quota, however it was said.
+function storageFull(text) { return /storage quota exceeded|organization's storage is full/i.test(String(text || '')); }
+function setupFixes(text) {
   const raw = String(text || '');
   const settings = globalRoute('organization');
-  if (/\bOut of compute\b/.test(raw)) return { label: 'Get compute', href: `${settings}#settings-plan` };
-  if (/No computer (?:is connected|this organization can use fits)/.test(raw)) return { label: 'Connect a computer', href: `${settings}#settings-computers` };
+  const plan = `${settings}#settings-plan`, computers = `${settings}#settings-computers`;
+  const own = { label: 'Use your own account', href: computers };
+  // Never bought a plan, or spent this month's compute: more on the plan, or one's own account.
+  if (/\bOut of compute\b/.test(raw)) return [{ label: /come with a paid plan/.test(raw) ? 'Choose a plan' : 'Add compute', href: plan }, own];
+  if (/No computer (?:is connected|this organization can use fits)/.test(raw)) return [{ label: 'Connect a computer', href: computers }];
+  // Every one of tavya's computers busy: one's own account starts it now.
+  if (/Every computer this task can use is full|of \S+'s [\w. ]+ computers are in use|\S+'s [\w. ]+ computers are using|uses its share of/.test(raw)
+    && !/This organization's \S+ account/.test(raw)) return [own];
+  if (storageFull(raw)) return [{ label: 'Add storage', href: plan }];
   if (/No usable \S+ credential|has no usable .* credential|^No \S+ credential\b|Every allowed credential needs attention/i.test(raw))
-    return { label: 'Manage accounts', href: `${settings}#settings-agents` };
+    return [{ label: 'Manage accounts', href: `${settings}#settings-agents` }];
   if (/GitHub PR identity is not connected|Connect GitHub on your profile|reconnect GitHub on your profile/i.test(raw))
-    return { label: 'Connect GitHub', href: '/profile' };
-  if (/connect GitHub in organization settings/i.test(raw)) return { label: 'Connect GitHub', href: `${settings}#settings-code` };
-  return null;
+    return [{ label: 'Connect GitHub', href: '/profile' }];
+  if (/connect GitHub in organization settings/i.test(raw)) return [{ label: 'Connect GitHub', href: `${settings}#settings-code` }];
+  return [];
 }
+function setupFix(text) { return setupFixes(text)[0] ?? null; }
 function setupFixHtml(text) {
-  const fix = setupFix(text);
-  return fix ? ` <a class="btn sm setup-fix" data-spa href="${esc(fix.href)}">${esc(fix.label)}</a>` : '';
+  return setupFixes(text).map((fix, index) => ` <a class="btn sm setup-fix${index ? ' ghost' : ''}" data-spa href="${esc(fix.href)}">${esc(fix.label)}</a>`).join('');
 }
 // An error shown in place of what failed to load: the plain sentence, the
 // exact text on hover (for whoever reports it).
@@ -4572,6 +4589,8 @@ function toast(msg, err = false, action) {
   span.textContent = err ? plainError(msg) : msg;
   if (span.textContent !== String(msg)) span.title = String(msg); // the exact text, for whoever reports it
   t.appendChild(span);
+  // An error a setting fixes (storage full, out of compute) links to it.
+  if (err && !action) action = setupFix(String(msg?.message ?? msg ?? '')) ?? undefined;
   // An optional action (e.g. Undo) — gives the toast a clickable button and more
   // dwell time. Backward-compatible: existing toast(msg[, err]) calls are unchanged.
   // An action with an `href` is a link (so it opens in a new tab too) instead.
@@ -9138,14 +9157,30 @@ function readinessGaps(readiness) {
       tip: `No ${name} login or API key is switched on for this project.` });
   }
   const compute = readiness.compute;
-  if (compute && !compute.ready) gaps.push(compute.outOfCredit
-    ? { label: 'Get compute', href: `${settings}#settings-plan`, tip: compute.outOfCredit }
-    : { label: 'Connect a computer', href: `${settings}#settings-computers`, tip: 'There is nowhere for this task to run yet.' });
+  const plan = `${settings}#settings-plan`, computers = `${settings}#settings-computers`;
+  const providers = 'E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud';
+  // Out of compute: never bought a plan (need: plan) or spent this month's (credit).
+  const need = compute?.need ?? (compute?.outOfCredit ? 'credit' : 'computer');
+  if (compute && !compute.ready) gaps.push(...(need === 'plan' ? [
+    { label: 'Choose a plan', href: plan, tip: `${siteName()}’s computers come with Individual or Team.` },
+    { label: 'Connect your own computer', href: computers, tip: `Run tasks on your own ${providers} account.` }]
+    : need === 'credit' ? [{ label: 'Add compute', href: plan, tip: compute.outOfCredit || 'This month’s compute is used up.' },
+      { label: 'Use your own account', href: computers, tip: `Run tasks on your own ${providers} account instead.` }]
+    : [{ label: 'Connect a computer', href: computers, tip: 'There is nowhere for this task to run yet.' }]));
+  // Full storage does not stop a task, but nothing new it saves is kept.
+  const storage = readiness.storage;
+  if (storage?.full) gaps.push({ label: 'Add storage', href: plan, warn: true,
+    tip: `Storage is full (${formatBytes(storage.usedBytes)} of ${formatBytes(storage.quotaBytes)}). New project data isn’t saved until you free some or add a 100 GB pack.` });
   return gaps;
 }
 function readinessNoticeHtml(gaps) {
-  return gaps.length ? `<span class="tf-ready-mark" aria-hidden="true">!</span><span>Can’t start yet:</span> ${gaps
-    .map((gap) => `<a data-spa href="${esc(gap.href)}" title="${esc(gap.tip)}">${esc(gap.label)}</a>`).join('<span class="tf-ready-sep" aria-hidden="true">·</span>')}` : '';
+  if (!gaps.length) return '';
+  const link = (gap) => `<a data-spa href="${esc(gap.href)}" title="${esc(gap.tip)}">${esc(gap.label)}</a>`;
+  const sep = '<span class="tf-ready-sep" aria-hidden="true">·</span>';
+  const blocking = gaps.filter((gap) => !gap.warn), warnings = gaps.filter((gap) => gap.warn);
+  return `<span class="tf-ready-mark" aria-hidden="true">!</span>${[
+    blocking.length ? `<span>Can’t start yet:</span> ${blocking.map(link).join(sep)}` : '',
+    warnings.length ? `<span>Storage is full:</span> ${warnings.map(link).join(sep)}` : ''].filter(Boolean).join(sep)}`;
 }
 // Keeps the task form's readiness notice in step with the agents it names.
 function wireTaskReadiness(page, projectId) {
@@ -9310,6 +9345,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       <div class="tf-scroll">
         <div class="tf-columns parameter-fields" id="tf-body" data-project-id="${esc(projectId)}">
           <div class="tf-main">
+            ${templateEdit ? '' : '<div class="tf-ready" id="tf-ready" role="status" hidden></div>'}
             ${promptField ? renderField(promptField, values[promptField.name], inherited[promptField.name], true) : ''}
             ${agentFields.map((f) => `<section class="tf-section tf-${esc(f.type)}">${agentSectionHtml(f)}</section>`).join('')}
             ${otherFields.length ? `<section class="tf-section tf-where">${renderFields(otherFields, values, inherited)}</section>` : ''}
@@ -9344,7 +9380,6 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         <div class="tf-foot-inner">
           ${templateEdit ? '<span class="tf-hint"></span>' : `<button class="btn ghost" id="tf-save-template" title="Save this form as a template, to start new tasks from" aria-label="Save as template">${ICON.template}<span class="tf-save-template-label">Save as template</span></button>
           <span class="tf-hint">${store ? storeFormHint(store) : ''}</span>
-          <span class="tf-ready" id="tf-ready" role="status" hidden></span>
           <button class="btn" id="tf-save-avatar" ${values.avatar ? '' : 'hidden'}>Save as Avatār without running</button>
           <button class="btn" id="tf-draft">Save draft</button>`}
           <button class="btn primary" id="tf-queue">${templateEdit ? 'Save template' : editInPlace ? 'Save' : store?.repeatable && values.repeatable ? 'Install' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
@@ -14346,7 +14381,8 @@ function conversationWaitNotice(v) {
   if (w?.kind === 'account' && typeof w.detail === 'string' && w.detail.startsWith('Held'))
     return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))} <button type="button" class="btn sm ghost" data-run-now="${esc(v.taskId)}" title="${esc(RUN_NOW_TIP)}">Run now</button></div>`;
   const detail = presenceDetail(v);
-  return detail ? `<div class="msg system wait-notice" role="status">${esc(waitingText(v.waitingFor))} · ${esc(detail)}${setupFixHtml(w?.detail)}</div>` : '';
+  const raw = typeof w?.detail === 'string' ? w.detail.trim() : '';
+  return detail ? `<div class="msg system wait-notice" role="status"${raw && raw !== detail ? ` title="${esc(raw)}"` : ''}>${esc(waitingText(v.waitingFor))} · ${esc(detail)}${setupFixHtml(w?.detail)}</div>` : '';
 }
 
 // A targeted human hold carries the actual question a person must answer. Keep
