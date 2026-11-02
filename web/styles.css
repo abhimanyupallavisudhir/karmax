@@ -4328,3 +4328,5 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 /* A one-click way to the setting that unblocks a stopped or waiting task. */
 .setup-fix { margin-left: 8px; vertical-align: baseline; }
 .msg.system.error .setup-fix { display: flex; width: fit-content; margin: 8px 0 2px; }
+/* A wait's ways out sit on its line, upright like any button. */
+.msg.system.wait-notice .setup-fix { font-style: normal; margin-left: 6px; vertical-align: baseline; }

@@ -216,7 +216,7 @@ describe('Plan & billing', () => {
     expect(html).toContain('1 seat gifted; each more is $5/month');
     const beside = markup(team, { ...gifted, billedPlan: 'free', status: 'active', billedMonthlyPriceCents: 900, storagePacks: 1,
       currentPeriodEnd: Date.UTC(2026, 10, 3), teamSeats: { ...gifted.teamSeats, total: 2, paid: 1, limit: 2 } });
-    expect(text(beside)).toMatch(/Team Gifted Seats &amp; Packs \$9\/month · renews/);
+    expect(text(beside)).toMatch(/Team Gifted Seats &amp; packs \$9\/month · renews/);
     expect(beside).toMatch(/billing-seats" data-kind="seats" data-packs="3" data-add/);
     expect(beside).not.toMatch(/billing-buy" data-kind="seats"/);
   });

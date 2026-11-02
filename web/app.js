@@ -24330,7 +24330,7 @@ function planBillingMarkup(e, state) {
     : state?.cancelAtPeriodEnd && state.currentPeriodEnd ? `Ends ${day(state.currentPeriodEnd)}`
     : ({ past_due: 'Payment failed', unpaid: 'Unpaid', paused: 'Paused', incomplete: 'Checkout incomplete', trialing: 'Trial' })[state?.status] || '';
   // What rides beside a gift: its seats, its packs, or both.
-  const addOns = [state?.teamSeats?.paid && billed === 'free' ? 'Seats' : '', state?.storagePacks || state?.computePacks ? 'Packs' : ''].filter(Boolean).join(' & ') || 'Packs';
+  const addOns = (state?.teamSeats?.paid && billed === 'free' ? (state?.storagePacks || state?.computePacks ? 'Seats & packs' : 'Seats') : 'Packs');
   const price = packsOnly ? `${addOns} ${planMoney(state.billedMonthlyPriceCents)}/month`
     : (state?.gift && !subscribed) || e.plan === 'free' ? '' : `${planMoney(e.currentMonthlyPriceCents)}/month`;
   const renews = (paying || packsOnly) && state.currentPeriodEnd
