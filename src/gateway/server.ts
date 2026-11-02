@@ -5563,13 +5563,15 @@ export class Gateway {
         // let the validator reject anything frozen — a clear 409, never a silent
         // no-op on the stored record (which the running workflow would ignore).
         try {
-          const applied = await api.updateParams(token, id, b.params ?? {}, { acceptAttenuation: attenuation.acceptAttenuation });
+          const applied = await api.updateParams(token, id, b.params ?? {}, { acceptAttenuation: attenuation.acceptAttenuation, replace: b.replace === true });
           // Authoritative read: reflect the just-applied update, not a snapshot that
           // may pre-date the workflow's next publish.
           // Without its conversation (compactTaskView): every reply carried it whole, 100k+ characters.
           return this.json(res, 200, { ...applied, view: compactTaskView(await api.getTaskView(token, id, { live: true }) as Record<string, unknown> | undefined) });
         } catch (e) {
-          return this.json(res, grantRefusal(e).code ? 403 : 409, { error: e instanceof Error ? e.message : String(e), ...grantRefusal(e) });
+          // A coded refusal is a grant's (403) unless it says otherwise: `task_started` is a 409.
+          const status = (e as { status?: unknown }).status === 409 || !grantRefusal(e).code ? 409 : 403;
+          return this.json(res, status, { error: e instanceof Error ? e.message : String(e), ...grantRefusal(e) });
         }
       }
       // One agent's own authority (not the main agent's, which is the task's

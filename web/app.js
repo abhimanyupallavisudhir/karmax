@@ -9749,7 +9749,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         // chain link can land after a NEWER form instance has mounted its own head.
         if (activeFormToken === formToken) paintSaveState($('#tf-savestate'), 'saved', editInPlace ? 'Saved' : 'Draft saved');
         refreshTasks();
-      } catch {
+      } catch (error) {
+        if (await startedMeanwhile(error)) return;
         // Auto-save used to fail silently, leaving the form looking saved while
         // the latest edit existed only in this tab. Keep the form open and the
         // dirty signature retryable, but tell the user the durable write missed.
@@ -9760,6 +9761,33 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     });
     return saveChain;
   }
+
+  // A started task's live page replaces the one rendered under the form.
+  const showStartedPage = async () => {
+    S.attemptGroup = null; // its cached record still says draft
+    // The page under the form was rendered while it was a draft; never
+    // show it for a frame while the task list reloads.
+    renderTaskLoadingPage(taskRecord(draft.id) || draft);
+    await refreshTasks();
+    if (S.selected === draft.id) {
+      history.replaceState({ kx: 1 }, '', taskUrl(draft.id));
+      openTask(draft.id, null, S.viewingAttempt === draft.id);
+    }
+  };
+  // An armed task's trigger can fire while its form is open — a save that
+  // meets its dependency does (#805). Its params are then the running task's,
+  // so a later save is refused: show the task running instead.
+  const startedMeanwhile = async (error) => {
+    if (error?.code !== 'task_started' || !draft) return false;
+    if (activeFormToken !== formToken) return true; // closed already
+    clearTimeout(saveTimer);
+    releaseFormKeys();
+    root.innerHTML = '';
+    toast('Task started');
+    if (page && S.selected === draft.id) await showStartedPage();
+    else { refreshTasks(); goToTask(draft.id); }
+    return true;
+  };
 
   // Debounced auto-save while typing.
   let saveTimer = null;
@@ -10061,17 +10089,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       if (page && S.selected === draft.id) {
         // A saved draft leaves its page like Back; a started one shows its live page.
         if (draftMode) closeTask();
-        else {
-          S.attemptGroup = null; // its cached record still says draft
-          // The page under the form was rendered while it was a draft; never
-          // show it for a frame while the task list reloads.
-          renderTaskLoadingPage(taskRecord(draft.id) || draft);
-          await refreshTasks();
-          if (S.selected === draft.id) {
-            history.replaceState({ kx: 1 }, '', taskUrl(draft.id));
-            openTask(draft.id, null, S.viewingAttempt === draft.id);
-          }
-        }
+        else await showStartedPage();
       }
       // Keep the toast in the button's vocabulary: "Run task" → "Task started",
       // whether the task was just written or was an existing draft. Starting an
@@ -10082,6 +10100,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         : draftMode ? (st.body.avatar ? 'Saved as Avatār' : 'Draft saved') : 'Task started');
       refreshTasks();
     } catch (e) {
+      if (await startedMeanwhile(e)) {
+        succeeded = true;
+        return true;
+      }
       if (!draftMode && isAuthorizationGrantGap(e)) {
         try {
           // The refusal names the agent whose authority exceeds the user's (`do`,

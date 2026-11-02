@@ -52,8 +52,8 @@ describe('payment policy currency through the API', () => {
       const second = await new MockPaymentProvider(store).provisionCard({ scope: 'project', scopeId: project.id, label: 'Euro 2', cap: 1000, currency: 'EUR' } as any);
       (await store.setSettings(project.id, 'payments', { cardIds: [card.id, second.id], budget: 500, currency: 'eur' }));
       const member = (await mint(['task:*']));
-      const task = await api.createTask(member, { projectId: project.id, title: 'Buy', workflow: 'just-do',
-        params: { prompt: 'buy', draft: true, paymentPolicy: { budget: 500, cardIds: [second.id, card.id], currency: 'eur' } } } as any);
+      const task = await api.createTask(member, { projectId: project.id, title: 'Buy', workflow: 'just-do', draft: true,
+        params: { prompt: 'buy', paymentPolicy: { budget: 500, cardIds: [second.id, card.id], currency: 'eur' } } } as any);
       const edited = await api.updateArmedParams(member, task.id, { prompt: 'buy more', draft: true,
         paymentPolicy: { currency: 'eur', cardIds: [second.id, card.id], budget: 500 } }, { replace: true });
       expect(edited.params.prompt).toBe('buy more');
