@@ -9027,6 +9027,12 @@ export class Store {
       cpu: row.cpu == null ? null : Number(row.cpu), worldId: String(row.worldId ?? row.worldid) }));
   }
 
+  /** The task of each machine one organization holds now, on any provider (the compute queue's per-tree share). */
+  async activeLeaseTasks(organizationId: string): Promise<string[]> {
+    const rows = await this.db.prepare(`SELECT taskId FROM world_leases WHERE state='active' AND organizationId=?`).all(organizationId);
+    return (rows as Array<Record<string, unknown>>).map((row) => String(row.taskId ?? row.taskid));
+  }
+
   /** The worlds that exist on one provider account (running or parked): the
    * installation's managed one (`organizationId` null) or an organization's
    * own, with the home disk each was made with. */

@@ -5,7 +5,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { STUCK_WAKE_NOTICE, WorldLifecycleManager } from '../src/world/runners.js';
-import { accountKey, dequeue, enqueue, ordered, RESERVE_AFTER_MS, WAITER_STALE_MS, WAKE_RELOCATE_AFTER_MS, waiters, wakeFullKey, type Waiter } from '../src/world/compute-queue.js';
+import { accountKey, dequeue, enqueue, ordered, RESERVE_AFTER_MS, WAITER_STALE_MS, WAKE_RELOCATE_AFTER_MS, waiters, wakeFullKey, withStandings, type Waiter } from '../src/world/compute-queue.js';
+import { orderKey, runNowKey, treeKey } from '../src/scheduling/state.js';
 import { accountRoom, accountUse } from '../src/world/account-room.js';
 import { BLIND_SIGNAL_GAP_MS, wakeComputeQueue } from '../src/world/compute-waker.js';
 import { MANAGED_COMPUTE } from '../src/world/connections.js';
@@ -113,6 +114,70 @@ describe('admission by the account\'s budget and queue', () => {
     const own = { provider: 'hetzner', managed: false };
     await enqueue(f.store, { taskId: early, organizationId: f.acme, account: accountKey(f.acme, 'hetzner') });
     expect(await accountRoom(f.store, own, { organizationId: f.acme, taskId: urgent })).toBeUndefined();
+  });
+});
+
+describe('one organization\'s order: the quota scheduler\'s, with a tree\'s rank shared among the machines it holds', () => {
+  const key = accountKey(MANAGED_COMPUTE, 'aws');
+  async function org() {
+    const f = await fixture();
+    const sub = async (parent: string) => (await f.store.createTask({ projectId: f.projects[f.acme]!.id, title: 'S', parentTaskId: parent,
+      workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x' } as any })).id;
+    /** `taskId` holds a machine now. */
+    let leases = 0;
+    const holds = async (taskId: string) => f.store.db.prepare(`INSERT INTO world_leases (id, runnerPoolId, organizationId, projectId, taskId, worldId,
+      cpu, memoryMb, gpu, priority, state, createdAt) VALUES (?, ?, ?, ?, ?, ?, 2, 2048, 0, 0, 'active', 1)`)
+      .run(`l${leases++}`, `${f.acme}:tavya-aws`, f.acme, f.projects[f.acme]!.id, taskId, taskId);
+    const line = async (now = 10_000) => ordered(await withStandings(f.store, await waiters(f.store, now), now), key).map((w) => w.taskId);
+    const wait = (taskId: string, at: number, organizationId = f.acme) => enqueue(f.store, { taskId, organizationId, account: key }, at);
+    return { ...f, sub, holds, line, wait };
+  }
+
+  it('gives a task that fans out into many sub-tasks its share of machines, not all of them', async () => {
+    const f = await org();
+    const big = await f.task(f.acme), fresh = await f.task(f.acme);
+    const parts = [await f.sub(big), await f.sub(big), await f.sub(big), await f.sub(big)];
+    for (const part of parts.slice(0, 3)) await f.holds(part);
+    // The big task's fourth sub-task waited first; a new task of the same priority still goes ahead of it.
+    await f.wait(parts[3]!, 1_000);
+    await f.wait(fresh, 2_000);
+    expect(await f.line()).toEqual([fresh, parts[3]]);
+    // Holding nothing, the big task's sub-task keeps its place.
+    await f.store.db.prepare(`UPDATE world_leases SET state='released'`).run();
+    expect(await f.line()).toEqual([parts[3], fresh]);
+  });
+
+  it('serves a task that has spent little before one that has spent a lot, and a higher priority first', async () => {
+    const f = await org();
+    const spender = await f.task(f.acme), fresh = await f.task(f.acme), urgent = await f.task(f.acme, 4);
+    await f.store.kvSet(treeKey(spender), JSON.stringify({ organizationId: f.acme, spent: 400 }));
+    await f.store.kvSet(treeKey(urgent), JSON.stringify({ organizationId: f.acme, spent: 5 }));
+    await f.wait(spender, 1_000); await f.wait(fresh, 2_000); await f.wait(urgent, 3_000);
+    expect(await f.line()).toEqual([urgent, fresh, spender]);
+  });
+
+  it('follows people\'s placements and Run now, and never reorders another organization\'s places', async () => {
+    const f = await org();
+    const a = await f.task(f.acme), b = await f.task(f.acme), c = await f.task(f.acme), theirs = await f.task(f.other);
+    await f.wait(a, 1_000); await f.wait(theirs, 1_500, f.other); await f.wait(b, 2_000); await f.wait(c, 3_000);
+    expect(await f.line()).toEqual([a, theirs, b, c]);
+    // Someone placed c above a; then said to run b now.
+    await f.store.kvSet(orderKey(f.acme), JSON.stringify([{ above: c, below: a, at: 1, moved: 'above' }]));
+    expect(await f.line()).toEqual([c, theirs, a, b]);
+    await f.store.kvSet(runNowKey(f.acme), JSON.stringify([{ root: b, at: 2 }]));
+    expect(await f.line()).toEqual([b, theirs, c, a]);
+  });
+
+  it('admits by that order: a new task of the organization gets the next machine before the big task\'s next sub-task', async () => {
+    const f = await org();
+    const big = await f.task(f.acme), fresh = await f.task(f.acme);
+    const parts = [await f.sub(big), await f.sub(big), await f.sub(big)];
+    for (const part of parts.slice(0, 2)) await f.holds(part);
+    await f.wait(fresh, 1_000);
+    const account = { provider: 'aws', managed: true, pool: { cpu: 96 } };
+    expect(await accountRoom(f.store, account, { organizationId: f.acme, taskId: parts[2], cpu: 2 }, 2_000))
+      .toMatchObject({ reason: '1 waiting ahead' });
+    expect(await accountRoom(f.store, account, { organizationId: f.acme, taskId: fresh, cpu: 2 }, 2_000)).toBeUndefined();
   });
 });
 

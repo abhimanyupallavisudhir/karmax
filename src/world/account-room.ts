@@ -1,7 +1,7 @@
 import { BRAND } from '../domain/brand.js';
 import { accountDiskGb, parkedHolds, providerDefaults, type AccountPool } from '../domain/computer-limits.js';
 import type { Store } from '../store/db.js';
-import { accountKey, enqueue, ordered, RESERVE_AFTER_MS, taskPriority, waiters, type Waiter } from './compute-queue.js';
+import { accountKey, enqueue, ordered, RESERVE_AFTER_MS, taskPriority, waiters, withStandings, type Waiter } from './compute-queue.js';
 import { DEFAULT_MANAGED_SHARE, MANAGED_COMPUTE, providerName } from './connections.js';
 
 /**
@@ -114,11 +114,12 @@ export async function accountRoom(store: Store, account: Account, request: RoomR
   else if (queued && request.taskId) {
     // Room now: is it someone else's, who waited first and could take it?
     // Its place: where it waits, or where it would join — after everyone
-    // already waiting (within its organization, at its priority).
+    // already waiting (within its organization, by its tree's standing).
     const me: Waiter = queue.find((waiter) => waiter.taskId === request.taskId)
       ?? { taskId: request.taskId, organizationId: request.organizationId, priority: await taskPriority(store, request.taskId),
         since: Number.POSITIVE_INFINITY, accounts: {} };
-    const line = ordered([...queue.filter((waiter) => waiter.taskId !== me.taskId), { ...me, accounts: { ...me.accounts, [key]: now } }], key);
+    const line = ordered(await withStandings(store,
+      [...queue.filter((waiter) => waiter.taskId !== me.taskId), { ...me, accounts: { ...me.accounts, [key]: now } }], now), key);
     const fits = (waiter: Waiter) => (!pool.cpu || use.cpu + (waiter.cpu ?? cpu) <= pool.cpu)
       && (!pool.diskGb || use.diskGb + accountDiskGb(provider, waiter.diskGb) <= pool.diskGb);
     const known = Boolean(pool.cpu || pool.diskGb || pool.machines);
