@@ -250,6 +250,50 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
     } finally { await context.close(); }
   }, 90_000);
 
+  it('adds seats to a gifted Team: the first at checkout, the next on the same subscription', async () => {
+    const { user: owner, organization } = await g.owner({ name: 'Nisa Gifted', email: 'nisa@example.test', password: PASSWORD, organization: 'Nisa Lab' });
+    await subscriptions.gift(organization.id, 'team', 'user:operator', 'journey-gift-seats');
+    const { page, errors, step, context } = await openConsole(browser, { ip: '192.0.2.43' });
+    await context.route('https://cdn.paddle.com/**', (route) => route.fulfill({ contentType: 'application/javascript', body: `
+      window.Paddle = { Environment: { set() {} }, Checkout: { open() {} },
+        Initialize(options) { setTimeout(() => options.eventCallback({ name: 'checkout.completed' }), 50); } };` }));
+    try {
+      await signIn(context, g.url, owner.email, PASSWORD);
+      await step('open Plan & billing', () => page.goto(`${g.url}/${organization.slug}/settings#settings-plan`));
+      const plan = page.locator('#org-plan');
+      const people = plan.locator('[data-limit="people"]');
+      await step('the gifted seat is taken', () => people.getByText('1 of 1 seat').waitFor());
+      // Nobody can join until there is a free seat.
+      await expect(consoleRequest(context, g.url, 'POST', `/api/organizations/${organization.id}/invitations`,
+        { email: 'early@example.test' })).rejects.toThrow(/HTTP 409 .*All 1 seat is taken/);
+      await people.getByRole('button', { name: 'Add a seat' }).click();
+      const dialog = page.getByRole('dialog', { name: 'Add a seat' });
+      await step('the checkout dialog opens', () => dialog.waitFor());
+      expect(await dialog.innerText()).toContain('One more person on Team for $5/month');
+      await dialog.locator('#checkout-policy-acceptance').check();
+      await dialog.getByRole('button', { name: 'Checkout' }).click();
+      await step('Paddle checkout returns to settings', () => page.waitForURL(/billing=success/));
+      const transaction = [...paddle.transactions.values()].at(-1);
+      expect(transaction.items).toEqual([{ price: { id: PADDLE.teamSeatPriceId }, quantity: 1 }]);
+
+      const notification = paddle.subscriptionCreated(transaction.id, 'sub_gifted_seats');
+      expect((await fetch(`${g.url}/api/subscriptions/paddle/webhook`, { method: 'POST', body: notification.raw,
+        headers: { 'paddle-signature': notification.signature } })).status).toBe(200);
+      await page.reload();
+      await step('the seat is billed beside the gift', () => people.getByText('1 of 2 seats').waitFor());
+      expect(await plan.locator('.plan-head').innerText()).toMatch(/Team\s+Gifted\s+Seats \$5\/month · renews/);
+      if (process.env.KARMAX_REVIEW_SCREENSHOT_SEATS) await page.locator('#settings-billing').screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT_SEATS });
+      // Now someone can be invited into the free seat.
+      await consoleRequest(context, g.url, 'POST', `/api/organizations/${organization.id}/invitations`, { email: 'second@example.test' });
+
+      const patches = paddle.patches.length;
+      await people.getByRole('button', { name: 'Add a seat' }).click();
+      await step('the subscription is changed', () => expect.poll(() => paddle.patches.length).toBe(patches + 1));
+      expect(paddle.patches.at(-1)).toEqual({ items: [{ price_id: PADDLE.teamSeatPriceId, quantity: 2 }], proration_billing_mode: 'prorated_next_billing_period' });
+      expect(errors).toEqual([]);
+    } finally { await context.close(); }
+  }, 90_000);
+
   it('buys storage packs beside a gifted plan: checkout first, then the same subscription', async () => {
     const { user: owner, organization } = await g.owner({ name: 'Gita Gifted', email: 'gita@example.test', password: PASSWORD, organization: 'Gita Studio' });
     await subscriptions.gift(organization.id, 'team', 'user:operator', 'journey-gift-team');
@@ -263,11 +307,11 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       const plan = page.locator('#org-plan');
       await plan.locator('.plan-head').getByText('Gifted').waitFor();
       // Nothing to remove yet; the first pack is bought at checkout, with the policies accepted.
-      expect(await plan.getByRole('button', { name: 'Remove a storage pack' }).isDisabled()).toBe(true);
-      await plan.getByRole('button', { name: 'Add a storage pack' }).click();
-      const dialog = page.getByRole('dialog', { name: 'Add a storage pack' });
+      expect(await plan.getByRole('button', { name: 'Remove a 100 GB pack' }).isDisabled()).toBe(true);
+      await plan.getByRole('button', { name: 'Add a 100 GB pack' }).click();
+      const dialog = page.getByRole('dialog', { name: 'Add a 100 GB pack' });
       await step('the checkout dialog opens', () => dialog.waitFor());
-      expect(await dialog.innerText()).toContain('100 GB for $4/month');
+      expect(await dialog.innerText()).toContain('100 GB of storage for $4/month');
       if (process.env.KARMAX_REVIEW_SCREENSHOT_DIALOG) await page.screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT_DIALOG });
       await dialog.getByRole('button', { name: 'Checkout' }).click();
       await step('checkout needs the policies', () => page.getByText('Accept the current policies to continue.').waitFor());
@@ -286,14 +330,14 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await page.reload();
       await step('the pack is billed beside the gift', () => plan.locator('.plan-head').getByText('Packs $4/month', { exact: false }).waitFor());
       expect(await plan.locator('.plan-head').innerText()).toMatch(/Team\s+Gifted\s+Packs \$4\/month · renews/);
-      expect(await plan.locator('[data-limit="storage"]').innerText()).toMatch(/of 200 GB\s+−\s+1\s+\+\s+pack/);
+      expect(await plan.locator('[data-limit="storage"]').innerText()).toMatch(/of 200 GB\s+−\s+1\s+\+\s+100 GB pack/);
       if (process.env.KARMAX_REVIEW_SCREENSHOT) await page.locator('#settings-billing').screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT });
 
       // The next pack changes that subscription: no second checkout.
-      const checkouts = paddle.transactions.size;
-      await plan.getByRole('button', { name: 'Add a storage pack' }).click();
-      await step('the subscription is changed', () => expect.poll(() => paddle.patches.length).toBe(1));
-      expect(paddle.patches[0]).toEqual({ items: [{ price_id: PADDLE.storagePackPriceId, quantity: 2 }], proration_billing_mode: 'prorated_next_billing_period' });
+      const checkouts = paddle.transactions.size, patches = paddle.patches.length;
+      await plan.getByRole('button', { name: 'Add a 100 GB pack' }).click();
+      await step('the subscription is changed', () => expect.poll(() => paddle.patches.length).toBe(patches + 1));
+      expect(paddle.patches.at(-1)).toEqual({ items: [{ price_id: PADDLE.storagePackPriceId, quantity: 2 }], proration_billing_mode: 'prorated_next_billing_period' });
       expect(paddle.transactions.size).toBe(checkouts);
       expect(errors).toEqual([]);
     } finally { await context.close(); }

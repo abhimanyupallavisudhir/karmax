@@ -8,8 +8,8 @@
 import { COMPUTE_PACK, COMPUTE_PRICE_MULTIPLIER, COMPUTE_TERMS, HOSTED_PLANS, STORAGE_PACK } from '../domain/entitlements.js';
 import { DEFAULT_SITE_NAME } from '../domain/brand.js';
 
-export const POLICY_VERSION = '2026-10-29.1';
-export const POLICY_EFFECTIVE_DATE = 'October 29, 2026';
+export const POLICY_VERSION = '2026-11-02.1';
+export const POLICY_EFFECTIVE_DATE = 'November 2, 2026';
 export const POLICY_DRAFT_NOTICE = 'Launch draft: these terms take effect when the operator opens paid checkout. Not legal advice or a statement of completed legal review.';
 
 export type PolicySlug = 'terms' | 'acceptable-use' | 'privacy' | 'billing' | 'subprocessors' | 'security' | 'data' | 'dpa';
@@ -27,6 +27,7 @@ export interface PolicyDocument {
 /** Cents as the terms write money: $10, $2.50. */
 const dollars = (cents: number) => `$${cents % 100 ? (cents / 100).toFixed(2) : cents / 100}`;
 const topUp = dollars(COMPUTE_TERMS.topUpCents);
+const gb = (bytes: number) => `${Math.round(bytes / 1024 ** 3)} GB`;
 
 const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>> = {
   terms: {
@@ -125,7 +126,8 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
         'Deleting an account does not silently replace subscription cancellation. The account-deletion flow directs customers to cancel first and support must resolve any active billing relationship as part of deletion.',
       ] },
       { heading: 'Packs and managed compute', paragraphs: [
-        'A paid plan includes managed storage and, where tavya offers it, a monthly amount of managed compute: cloud computers tavya runs for tasks of an organization that has not connected its own provider account. Storage packs and compute packs add to them, billed monthly with the subscription and prorated on the next bill when added or removed. Packs end with the subscription.',
+        `A paid plan includes managed storage and, where tavya offers it, a monthly amount of managed compute: cloud computers tavya runs for tasks of an organization that has not connected its own provider account. ${gb(STORAGE_PACK.bytes)} packs (${gb(STORAGE_PACK.bytes)} more storage each) and ${dollars(COMPUTE_PACK.creditMicros / 10_000)} packs (${dollars(COMPUTE_PACK.creditMicros / 10_000)} more managed compute a month each) add to them, billed monthly with the subscription and prorated on the next bill when added or removed. Packs end with the subscription.`,
+        `A plan the operator gifts is free until the operator removes it. A gifted Team covers the seats gifted with it; its owner can buy more seats, and an owner of a gifted plan can buy packs, at the prices above, on a subscription of their own beside the gift, billed and canceled like a paid plan's. Removing the last seat or pack from that subscription ends it at the end of the period paid for.`,
         'Managed compute is charged against the month’s amount at twice the provider’s list price for the computer’s size and running time (and, where the provider charges for it, its disk, including while the computer is paused), as shown in Organization settings. Unused compute of the month’s amount does not carry over to the next month and is not refunded. Computers on an organization’s own provider account are billed by that provider, not by tavya.',
         `Before work runs on a managed computer, tavya sets aside the cost of its next ${COMPUTE_TERMS.holdMinutes} minutes from the compute left, and renews that while the work runs. What is set aside is not a charge: once the provider reports the actual usage, only that is charged and the rest is released. Work starts only if at least ${COMPUTE_TERMS.minStartMinutes} minutes of its computer fit. When the compute left no longer covers the next minutes, the agent is told a few minutes ahead, its turn is stopped and its computer paused with its files kept, and the work waits until more compute is added or the next month begins; it then continues by itself. tavya does not charge for compute used beyond the amount.`,
         `Auto top-up is off unless an organization owner turns it on in Plan & billing; it needs an active paid subscription. While it is on and the organization’s work needs more compute than is left, tavya buys a compute top-up: ${topUp} of managed compute for ${topUp}, a one-time charge made at once to the payment method saved for the subscription, with its own receipt from the payment provider. It buys as many as the work needs, but never more in a calendar month than the monthly limit the owner set. A top-up does not change the subscription or its renewal price. Top-up compute is used after the month’s amount, carries over from month to month until used, and stays usable if the subscription ends; it is not refunded except where the law requires. If a top-up payment is declined, auto top-up pauses for a day and the owners are told. An owner can turn it off or change the limit at any time, for later top-ups.`,
