@@ -24,3 +24,14 @@ export class ValidationError extends Error {
   code = 'invalid_request';
   status = 400;
 }
+
+/**
+ * A whole-form save meant for a draft or an armed task reached it after it
+ * started (its trigger fired meanwhile): its params are now the workflow's,
+ * which takes in-flight edits only. A 409 the console answers by showing the
+ * running task.
+ */
+export class TaskStartedError extends Error {
+  code = 'task_started';
+  status = 409;
+}

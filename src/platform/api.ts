@@ -96,7 +96,7 @@ import type { ServiceConnection } from '../integrations/service-connections.js';
 import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { avatarAllows, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled, avatarPrincipal, avatarRoleOf, forkedAvatar,
   normalizeAvatarSetting, AVATAR_ROLE_LABELS, type AvatarRole } from './avatars.js';
-import { CapabilityError, NotFoundError, ValidationError } from './errors.js';
+import { CapabilityError, NotFoundError, TaskStartedError, ValidationError } from './errors.js';
 import type { AccountQueueView } from '../coordinators/account.js';
 import type { SchedulingQueueTask, SchedulingQueueView } from '../scheduling/view.js';
 import { assertAgentSpec, childComputer, subTaskParams } from './agent-params.js';
@@ -280,6 +280,11 @@ const acceptedActionKey = (taskId: string) => `accepted-action:${taskId}`;
  * and delegation, its pinned GitHub account, fork provenance, the Temporal run
  * id, one-shot start flags. Only the platform writes them; remove any a caller
  * put in a params bag. Mutates and returns `params`. */
+/** A draft, a task armed on a trigger, or a repeatable series: what has no workflow of its own yet. */
+function unstarted(task: Pick<TaskRecord, 'params'> | undefined): boolean {
+  return !!task && (!!task.params?.draft || task.params?.triggerState === 'armed' || !!task.params?.repeatable);
+}
+
 function stripPlatformMetadata<T extends Record<string, unknown>>(params: T): T {
   for (const key of Object.keys(params)) if (key.startsWith('_')) delete params[key];
   return params;
@@ -3185,16 +3190,23 @@ export class KarmaxApi {
    * start failure so a fire is never silently lost.
    */
   async fireTriggeredTask(token: string, taskId: string, mode: 'self' | 'clone', trigger?: TriggerContext): Promise<{ startedTaskId: string }> {
-    const task = (await this.deps.store.getTask(taskId));
-    const caller = (await this.require(token, 'create_task', { projectId: task?.projectId, taskId }));
-    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    const armed = (await this.deps.store.getTask(taskId));
+    const caller = (await this.require(token, 'create_task', { projectId: armed?.projectId, taskId }));
+    if (!armed) throw new NotFoundError(`no task ${taskId}`);
 
     if (mode === 'clone') return { startedTaskId: (await this.spawnRun(token, taskId, trigger)).id };
 
-    const shaped = trigger ? applyTriggerContext(task.title, task.params as Record<string, unknown>, trigger) : undefined;
-    const fired: Record<string, unknown> = { ...(shaped?.params ?? task.params as Record<string, unknown>), triggerState: 'fired' };
-    delete fired.triggerPending;
-    (await this.deps.store.updateTaskParams(taskId, fired as any));
+    // Under the task's lock, from its latest params: an edit of the armed task
+    // either lands before (and starts with it) or is refused (writeUnstartedParams).
+    const { task, shaped, fired } = (await this.deps.store.transaction(async () => {
+      (await this.deps.store.lockTask(taskId));
+      const task = (await this.deps.store.getTask(taskId)) ?? armed;
+      const shaped = trigger ? applyTriggerContext(task.title, task.params as Record<string, unknown>, trigger) : undefined;
+      const fired: Record<string, unknown> = { ...(shaped?.params ?? task.params as Record<string, unknown>), triggerState: 'fired' };
+      delete fired.triggerPending;
+      (await this.deps.store.updateTaskParams(taskId, fired as any));
+      return { task, shaped, fired };
+    }));
     if (shaped && shaped.title !== task.title) (await this.deps.store.setTaskTitle(taskId, shaped.title));
     (await this.followTriggerSubject(task, trigger));
     try {
@@ -3552,6 +3564,8 @@ export class KarmaxApi {
     // edited triggers the same dependency check.
     (await this.validateAndAuthorizeResumeSources(token, params, task.projectId));
     (await this.authorizeDependencies(token, params));
+    // Refused, not authorized, first; then before anything is written.
+    if (!unstarted(task)) throw new TaskStartedError('This task has already started');
     const inheritedFiles = (await this.inheritedResumeFiles(params));
     for (const file of inheritedFiles) (await this.deps.store.grantAttachment(file.id, task.projectId));
     const promptFiles = uniqueFileRefs([
@@ -3633,25 +3647,44 @@ export class KarmaxApi {
     // Keep the display title tracking the (edited) prompt when it was derived
     // from the prompt (SPEC §10). A title given at creation stays: a store
     // automation's `#{{issue.number}} {{issue.title}}` names each of its runs.
-    if (typeof base.prompt === 'string' && base.prompt.trim() && task.title === firstLine(String(task.params?.prompt ?? task.params?.command ?? 'Task')))
-      (await this.deps.store.setTaskTitle(taskId, firstLine(String(base.prompt))));
+    // Written with the params, so an edit refused there renames nothing.
+    const retitled = typeof base.prompt === 'string' && base.prompt.trim() && task.title === firstLine(String(task.params?.prompt ?? task.params?.command ?? 'Task'))
+      ? firstLine(String(base.prompt)) : undefined;
+    const write = async (params: Record<string, unknown>) => {
+      (await this.writeUnstartedParams(taskId, params));
+      if (retitled !== undefined) (await this.deps.store.setTaskTitle(taskId, retitled));
+    };
     // A cron/recurring trigger forces the series flag on (mirrors createTask).
     if (forcesRepeatable(normalizeTriggers(base))) base.repeatable = true;
     // A repeatable series stays a series when saved: persist, then arm it if it
     // has triggers (each fire spawns a run) or leave it as a manual template.
     if (base.repeatable && keepArmed) {
-      (await this.deps.store.updateTaskParams(taskId, base as any));
+      (await write(base));
       if (hasActiveTriggers(base)) return (await this.armStoredTask(taskId));
       this.armer?.disarm(taskId);
       return (await this.deps.store.getTask(taskId))!;
     }
     if (keepArmed && hasActiveTriggers(base)) {
-      (await this.deps.store.updateTaskParams(taskId, base as any));
+      (await write({ ...base, triggerState: 'armed' }));
       return (await this.armStoredTask(taskId)); // re-validate + re-arm (disarm old, arm new)
     }
+    (await write({ ...base, draft: true }));
     this.armer?.disarm(taskId);
-    (await this.deps.store.updateTaskParams(taskId, { ...base, draft: true } as any));
     return (await this.deps.store.getTask(taskId))!;
+  }
+
+  /**
+   * Write the params of a task that has not started, unless its trigger fired
+   * since it was read: its params are then the running workflow's, and the
+   * edit is refused rather than written under it (#805). The fire takes the
+   * same lock (fireTriggeredTask), so one of the two always sees the other.
+   */
+  private async writeUnstartedParams(taskId: string, params: Record<string, unknown>): Promise<void> {
+    (await this.deps.store.transaction(async () => {
+      (await this.deps.store.lockTask(taskId));
+      if (!unstarted((await this.deps.store.taskMetadata(taskId)))) throw new TaskStartedError('This task has already started');
+      (await this.deps.store.updateTaskParams(taskId, params as TaskRecord['params']));
+    }));
   }
 
   async getTaskView(
@@ -7207,13 +7240,19 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
   async setTaskPaymentPolicy(token: string, taskId: string, value: unknown): Promise<void> {
     const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
-    (await this.require(token, 'manage_payments', { projectId: task.projectId, taskId }));
+    value = (await this.checkedTaskPaymentPolicy(token, task, value));
+    (await this.deps.store.updateTaskParams(taskId, { ...task.params, paymentPolicy: value } as any));
+  }
+
+  /** A task's new cards and budget, checked: who may set them, and that they exist. */
+  private async checkedTaskPaymentPolicy(token: string, task: TaskRecord, value: unknown): Promise<unknown> {
+    (await this.require(token, 'manage_payments', { projectId: task.projectId, taskId: task.id }));
     // An Avatār's budget is its forks' pool: it is topped up after it ran too.
     if (!task.params?.avatar && ['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? ''))
       throw new Error('Payments are read-only after a task finishes');
-    value = withPolicyCurrency(value, (await resolvePaymentPolicy(this.deps.store, task.projectId, taskId)).currency);
+    value = withPolicyCurrency(value, (await resolvePaymentPolicy(this.deps.store, task.projectId, task.id)).currency);
     (await validatePaymentPolicy(this.deps.store, task.projectId, (await this.deps.store.getProject(task.projectId))!.organizationId ?? 'org_personal', value));
-    (await this.deps.store.updateTaskParams(taskId, { ...task.params, paymentPolicy: value } as any));
+    return value;
   }
 
   /**
@@ -7224,12 +7263,24 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
    * re-derive the window.
    */
   async updateParams(token: string, taskId: string, patch: Record<string, unknown>,
-    options: { acceptAttenuation?: boolean | string[] } = {}): Promise<{ applied: string[] }> {
+    options: { acceptAttenuation?: boolean | string[]; replace?: boolean } = {}): Promise<{ applied: string[] }> {
     const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     const caller = (await this.require(token, 'edit_task', { projectId: task.projectId, taskId }));
-    if ('paymentPolicy' in patch) throw new Error('Use the task payments endpoint to change cards or budget');
+    // Replacing every param is how a draft's or an armed task's form saves; one
+    // arriving here was sent before the task started (#805).
+    if (options.replace) throw new TaskStartedError('This task has already started');
     patch = stripPlatformMetadata({ ...patch });
+    // Cards and budget are the task's, not the workflow's. A policy equal to the
+    // one in force (a form sends it back whole) is no edit; a change needs
+    // payment authority, checked before anything else is applied.
+    let paymentPolicy: unknown;
+    if (Object.hasOwn(patch, 'paymentPolicy')) {
+      const current = (await resolvePaymentPolicy(this.deps.store, task.projectId, taskId));
+      if (!samePaymentPolicy(withPolicyCurrency(patch.paymentPolicy, current.currency), current))
+        paymentPolicy = (await this.checkedTaskPaymentPolicy(token, task, patch.paymentPolicy));
+      delete patch.paymentPolicy;
+    }
     this.assertBranchParams(patch);
     // A running task may resize its computer, not swap it for another one.
     const project = (await this.deps.store.getProject(task.projectId));
@@ -7314,6 +7365,11 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
           (await this.deliverWorkflowMessage(taskId, computerChangeNotice(change, resized.inPlace)).catch(() => undefined));
         else if (grown?.disk === 'grown' && live && caller.taskId !== taskId && !task.lastView?.outOfDisk)
           (await this.deliverWorkflowMessage(taskId, diskGrownNotice(grown.machine.diskGb)).catch(() => undefined));
+      }
+      // Read at each spend, so it applies from the next one.
+      if (paymentPolicy !== undefined) {
+        (await this.deps.store.patchTaskParams(taskId, { paymentPolicy }));
+        result.applied = [...result.applied, 'paymentPolicy'];
       }
       (await this.updateAgentSnapshot(taskId, patch, result.applied));
       if (result.applied.includes('target') && typeof patch.target === 'string')
