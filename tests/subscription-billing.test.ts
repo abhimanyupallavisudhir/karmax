@@ -528,7 +528,7 @@ describe('subscription administration HTTP authorization', () => {
     vi.unstubAllEnvs();
   });
 
-  const post = (action: 'gift' | 'gift-storage' | 'checkout' | 'portal' | 'change' | 'cancel' | 'sync-seats' | 'storage-packs',
+  const post = (action: 'gift' | 'gift-storage' | 'checkout' | 'portal' | 'change' | 'cancel' | 'resume' | 'seats' | 'sync-seats' | 'storage-packs',
     organizationId: string, token: string, body: Record<string, unknown> = {}) => fetch(
     `${base}/api/organizations/${organizationId}/subscription/${action}`, {
       method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json',
@@ -536,7 +536,7 @@ describe('subscription administration HTTP authorization', () => {
         acceptedPolicies: true, policyVersions: policyVersions('checkout'), ...body }),
     });
 
-  it.each(['checkout', 'portal', 'change', 'cancel', 'sync-seats', 'storage-packs'] as const)(
+  it.each(['checkout', 'portal', 'change', 'cancel', 'resume', 'seats', 'sync-seats', 'storage-packs'] as const)(
     'rejects an agent without a verified owner subject from %s', async (action) => {
       const agent = (await tokens.mint({ taskId: `task_billing_attack_${action}`, profileId: 'developer', principal: 'agent:test',
         organizationId: memberOrganizationId, ceiling: ['payment:write'], grantorCaps: ['payment:write'] })).token;
@@ -580,7 +580,7 @@ describe('subscription administration HTTP authorization', () => {
     const agent = await tokens.mint({ taskId: 'task_personal_billing', profileId: 'developer', principal: 'agent:test',
       ceiling: ['payment:write'], grantorCaps: ['payment:write'] });
     expect((await list(agent.token)).status).toBe(403);
-    await billing.gift(org.id, 'team', 'user:operator', 'profile-owner-transfer');
+    await billing.gift(org.id, 'team', 'user:operator', 'profile-owner-transfer', 2);
     await store.setOrganizationMembership(org.id, 'replacement-owner', 'owner');
     await store.removeOrganizationMembership(org.id, 'me');
     expect((await (await list()).json() as any).subscriptions).toContainEqual(expect.objectContaining({
@@ -588,7 +588,7 @@ describe('subscription administration HTTP authorization', () => {
     await store.db.prepare('DELETE FROM policy_acceptances WHERE organizationId=?').run(org.id);
   });
 
-  it.each(['checkout', 'portal', 'change', 'cancel', 'sync-seats', 'storage-packs'] as const)(
+  it.each(['checkout', 'portal', 'change', 'cancel', 'resume', 'seats', 'sync-seats', 'storage-packs'] as const)(
     'rejects an interactive non-owner from %s', async (action) => {
       const response = await post(action, memberOrganizationId, browserToken);
       expect(response.status).toBe(403);
@@ -718,6 +718,30 @@ describe('subscription administration HTTP authorization', () => {
     const invalid = await post('storage-packs', org.id, browserToken, { packs: -1 });
     expect(invalid.status).toBe(400);
     expect(await invalid.json()).toMatchObject({ error: expect.stringMatching(/whole number/) });
+  });
+
+  it('lets the interactive owner set Team seats and keep a plan whose end is scheduled', async () => {
+    const org = await store.createOrganization({ name: 'Seat owner', ownerUserId: 'me' });
+    await billing.checkout(org.id, 'team', { success: 'https://krmax.test/success', cancel: 'https://krmax.test/cancel' }, 'checkout-seat-owner');
+    const snapshot = (cancel: boolean, created: number) => billing.handleWebhook(event(`evt_seat_owner_${created}`, 'customer.subscription.updated', {
+      id: `sub_${org.id}`, customer: `cus_${org.id}`, status: 'active', cancel_at_period_end: cancel,
+      items: { data: [{ id: 'si_base', price: { id: 'price_team_base' }, quantity: 1 }] } }, created));
+    await snapshot(false, 600);
+    const seats = await post('seats', org.id, browserToken, { seats: 3 });
+    expect(seats.status).toBe(202);
+    expect(provider.calls.at(-1)).toMatchObject({ method: 'updateSeats', input: { subscriptionId: `sub_${org.id}`, seats: 3 } });
+    const invalid = await post('seats', org.id, browserToken, { seats: 0 });
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toMatchObject({ error: expect.stringMatching(/whole number/) });
+    // Nothing to keep until a cancellation is scheduled.
+    expect((await post('resume', org.id, browserToken)).status).toBe(400);
+    expect((await post('cancel', org.id, browserToken)).status).toBe(202);
+    await snapshot(true, 601);
+    const state = await (await fetch(`${base}/api/organizations/${org.id}/subscription/status`,
+      { headers: { authorization: `Bearer ${browserToken}` } })).json() as any;
+    expect(state).toMatchObject({ cancelAtPeriodEnd: true, teamSeats: { total: 1, used: 1, autoBill: true } });
+    expect((await post('resume', org.id, browserToken)).status).toBe(202);
+    expect(provider.calls.at(-1)).toMatchObject({ method: 'resumeSubscription', input: { subscriptionId: `sub_${org.id}` } });
   });
 
   it('makes owner-only administration explicit in subscription status', async () => {

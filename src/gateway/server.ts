@@ -258,7 +258,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/entitlements$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/status$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/(?:gift|gift-storage|gift-compute)$/.test(p)) return 'subscription:gift';
-  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:checkout|portal|change|cancel|sync-seats|storage-packs|compute-packs|auto-top-up|reconcile)$/.test(p))
+  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:checkout|portal|change|cancel|resume|seats|sync-seats|storage-packs|compute-packs|auto-top-up|reconcile)$/.test(p))
     return 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/payments\/stripe\/platform$/.test(p)) return read ? 'settings:read' : 'settings:write';
   if (/^\/api\/organizations\/[^/]+\/payments(?:\/|$)/.test(p)) return read ? 'payment:read' : 'payment:write';
@@ -2964,7 +2964,7 @@ export class Gateway {
           queuedAgentRuns,
         });
       }
-      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|sync-seats|storage-packs|compute-packs|auto-top-up|reconcile|gift|gift-storage|gift-compute)$/);
+      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|resume|seats|sync-seats|storage-packs|compute-packs|auto-top-up|reconcile|gift|gift-storage|gift-compute)$/);
       if (subscription) {
         const organizationId = subscription[1]!;
         const action = subscription[2]!;
@@ -3001,9 +3001,9 @@ export class Gateway {
             const body = await this.body(req);
             const key = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : '';
             const actor = actorPrincipal(callerIdentity.actor);
-            const result = await billing.gift(organizationId, body.plan, actor, key);
+            const result = await billing.gift(organizationId, body.plan, actor, key, body.seats);
             await this.deps.authorization?.audit(actor, 'subscription.gift', `organization:${organizationId}`,
-              { plan: body.plan, requestKey: key, ...identityAuditDetail(callerIdentity) });
+              { plan: body.plan, ...(body.seats === undefined ? {} : { seats: body.seats }), requestKey: key, ...identityAuditDetail(callerIdentity) });
             return this.json(res, 200, result);
           } catch (error) {
             return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -3025,8 +3025,8 @@ export class Gateway {
             const versions = assertPolicyAcceptance('checkout', body.acceptedPolicies, body.policyVersions);
             const urls = { success: `${settingsBase}?billing=success#settings-billing`,
               cancel: `${settingsBase}?billing=canceled#settings-billing` };
-            // {plan}, or {storagePacks, computePacks} beside a gifted plan.
-            const result = body.plan === undefined && (body.storagePacks !== undefined || body.computePacks !== undefined)
+            // {plan}, or {storagePacks, computePacks, seats} beside a gifted plan.
+            const result = body.plan === undefined && (body.storagePacks !== undefined || body.computePacks !== undefined || body.seats !== undefined)
               ? await billing.checkoutPacks(organizationId, body, urls, idempotencyKey)
               : await billing.checkout(organizationId, String(body.plan ?? ''), urls, idempotencyKey);
             (await store.recordPolicyAcceptance({
@@ -3049,6 +3049,9 @@ export class Gateway {
               String(body.plan ?? ''), idempotencyKey));
           }
           if (action === 'cancel') return this.json(res, 202, await billing.cancel(organizationId, idempotencyKey));
+          if (action === 'resume') return this.json(res, 202, await billing.resume(organizationId, idempotencyKey));
+          if (action === 'seats')
+            return this.json(res, 202, await billing.seats(organizationId, (await this.body(req)).seats, idempotencyKey));
           if (action === 'storage-packs')
             return this.json(res, 202, await billing.storagePacks(organizationId, (await this.body(req)).packs, idempotencyKey));
           if (action === 'compute-packs')

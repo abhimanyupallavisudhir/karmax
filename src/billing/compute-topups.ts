@@ -205,7 +205,7 @@ export class ComputeTopUps {
     await this.options.tell?.(organizationId, {
       subject: `Compute top-up for ${organization?.name ?? organizationId} was declined`,
       text: `Auto top-up tried to add $${(COMPUTE_TOP_UP.amountCents / 100).toFixed(2)} of compute and the payment did not go through (${reason}). `
-        + 'It tries again in a day; update the payment method in Plan & billing → Billing, or add a compute pack. '
+        + 'It tries again in a day; update the payment method in Plan & billing → Billing, or add a $10 pack. '
         + 'Tasks on managed computers wait for compute meanwhile.',
     }).catch(() => undefined);
   }

@@ -121,6 +121,20 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
       items, proration_billing_mode: 'prorated_next_billing_period',
     });
   }
+  /** Withdraws a scheduled cancellation, alone in its PATCH as Paddle requires. */
+  async resumeSubscription(input: { subscriptionId: string; idempotencyKey: string }) {
+    const current = await this.request(`/subscriptions/${encodeURIComponent(input.subscriptionId)}`, 'GET');
+    if (current.status === 'canceled') throw new BillingRequestRejected('the subscription has already ended; subscribe again');
+    if (current.scheduled_change?.action !== 'cancel') return { id: input.subscriptionId };
+    await this.keep(input.subscriptionId);
+    return { id: input.subscriptionId };
+  }
+  /** Team seats beside a gifted Team: the seat line of a subscription with no
+   * plan of its own, kept with its packs. A plan's seats go with the plan
+   * (updateSeats). */
+  async updateAddOnSeats(input: { subscriptionId: string; extraSeats: number; idempotencyKey: string }) {
+    return this.updatePacks('seats', input.subscriptionId, input.extraSeats);
+  }
   async updateStoragePacks(input: Parameters<SubscriptionProvider['updateStoragePacks']>[0]) {
     return this.updatePacks('storage', input.subscriptionId, input.storagePacks);
   }
@@ -171,20 +185,24 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
       : transaction.status === 'canceled' ? 'failed' as const : transaction.status === 'past_due' ? 'declined' as const : 'pending' as const;
     return { state, transactionId: String(transaction.id) };
   }
-  /** Sets one kind of pack's quantity, keeping every other item as it is. */
-  private async updatePacks(kind: 'storage' | 'compute', subscriptionId: string, packs: number) {
+  /** Sets one kind of pack's quantity (or the seats beside a gifted Team),
+   * keeping every other item as it is. */
+  private async updatePacks(kind: 'storage' | 'compute' | 'seats', subscriptionId: string, packs: number) {
     const catalog = await this.catalog();
     if (!catalog) throw new BillingRequestRejected('Paddle prices are not configured');
-    const pack = kind === 'storage' ? catalog.storagePackPriceId : catalog.computePackPriceId;
-    if (!pack) throw new BillingRequestRejected(`${kind} packs are not configured`);
-    if (!Number.isSafeInteger(packs) || packs < 0) throw new BillingRequestRejected(`invalid ${kind} pack count`);
+    const pack = kind === 'storage' ? catalog.storagePackPriceId : kind === 'compute' ? catalog.computePackPriceId : catalog.teamSeatPriceId;
+    const what = kind === 'seats' ? 'seats' : `${kind} packs`;
+    if (!pack) throw new BillingRequestRejected(`${what} are not configured`);
+    if (!Number.isSafeInteger(packs) || packs < 0) throw new BillingRequestRejected(kind === 'seats' ? 'invalid seat count' : `invalid ${kind} pack count`);
     const subscription = await this.request(`/subscriptions/${encodeURIComponent(subscriptionId)}`, 'GET');
     const plans = planPrices(catalog);
-    // A plan's subscription, or one of packs alone beside a gifted plan.
-    if (!Array.isArray(subscription.items) || !subscription.items.some((item: any) => [...plans, ...packPrices(catalog)].includes(item.price?.id)))
-      throw new BillingRequestRejected(`cannot add ${kind} packs to a Paddle subscription without a plan`);
-    if (subscription.items.some((item: any) => ![...plans, catalog.teamSeatPriceId, ...packPrices(catalog)].includes(item.price?.id)))
-      throw new BillingRequestRejected(`Paddle subscription has unexpected items; reconcile before changing ${kind} packs`);
+    // A plan's subscription, or one of packs and seats alone beside a gifted plan.
+    if (!Array.isArray(subscription.items) || !subscription.items.some((item: any) => [...plans, ...addOnPrices(catalog)].includes(item.price?.id)))
+      throw new BillingRequestRejected(`cannot add ${what} to a Paddle subscription without a plan`);
+    if (subscription.items.some((item: any) => ![...plans, ...addOnPrices(catalog)].includes(item.price?.id)))
+      throw new BillingRequestRejected(`Paddle subscription has unexpected items; reconcile before changing ${what}`);
+    if (kind === 'seats' && subscription.items.some((item: any) => plans.includes(item.price?.id)))
+      throw new BillingRequestRejected('seats on a plan subscription change with the plan');
     const items = [...subscription.items.filter((item: any) => item.price.id !== pack)
       .map((item: any) => ({ price_id: item.price.id as string, quantity: Number(item.quantity) })),
     ...(packs ? [{ price_id: pack, quantity: packs }] : [])];
@@ -252,6 +270,10 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
     if (intent.kind !== 'checkout') {
       if (!intent.subscriptionId) return null;
       const catalog = await this.catalog();
+      if (intent.kind === 'resume') {
+        const subscription = await this.request(`/subscriptions/${encodeURIComponent(intent.subscriptionId)}`, 'GET');
+        return subscription.status !== 'canceled' && subscription.scheduled_change?.action !== 'cancel' ? { id: intent.subscriptionId } : absent;
+      }
       if (intent.kind === 'storage' && (intent.storagePacks === undefined || !catalog?.storagePackPriceId)) return null;
       if (intent.kind === 'compute' && (intent.computePacks === undefined || !catalog?.computePackPriceId)) return null;
       const subscription = await this.request(`/subscriptions/${encodeURIComponent(intent.subscriptionId)}`, 'GET');
@@ -265,11 +287,14 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
         ? { id: intent.subscriptionId } : absent;
       if (intent.kind === 'compute') return packs(catalog!.computePackPriceId!) === intent.computePacks
         ? { id: intent.subscriptionId } : absent;
+      // Seats beside a gifted Team, settled by the seat line alone.
+      if (intent.kind === 'seats' && !intent.plan) return intent.seats === undefined || !catalog ? null
+        : packs(catalog.teamSeatPriceId) === intent.seats ? { id: intent.subscriptionId } : absent;
       if (!intent.plan || !intent.seats) return null;
       const planItems = subscription.items.filter((item: any) => !packPrices(catalog).includes(item.price?.id));
       return sameItems(planItems, await this.items(intent.plan, intent.seats)) ? { id: intent.subscriptionId } : absent;
     }
-    if (!(intent.plan ? intent.seats : intent.storagePacks || intent.computePacks) || !intent.successUrl) return null;
+    if (!(intent.plan ? intent.seats : intent.storagePacks || intent.computePacks || intent.seats) || !intent.successUrl) return null;
     let found: any;
     if (intent.checkoutId) {
       found = await this.request(`/transactions/${encodeURIComponent(intent.checkoutId)}`, 'GET');
@@ -309,11 +334,16 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
     url.searchParams.set('_ptxn', found.id);
     return { id: found.id, url: url.toString() };
   }
-  /** A checkout's items: a plan and its seats, then any packs. */
+  /** A checkout's items: a plan and its seats (or, beside a gifted Team,
+   * seats alone), then any packs. */
   private async checkoutItems(order: { plan?: 'individual' | 'team'; seats: number; storagePacks?: number; computePacks?: number }) {
     const catalog = await this.catalog();
     if (!catalog) throw new BillingRequestRejected('Paddle prices are not configured');
     const items = order.plan ? await this.items(order.plan, order.seats) : [];
+    if (!order.plan && order.seats) {
+      if (!Number.isSafeInteger(order.seats) || order.seats < 0) throw new BillingRequestRejected('invalid seat count');
+      items.push({ price_id: catalog.teamSeatPriceId, quantity: order.seats });
+    }
     for (const [kind, packs, price] of [['storage', order.storagePacks, catalog.storagePackPriceId],
       ['compute', order.computePacks, catalog.computePackPriceId]] as const) {
       if (!packs) continue;
@@ -374,6 +404,11 @@ function packsEnding(catalog: SubscriptionCatalogConfig | undefined, subscriptio
 /** The prices of every kind of pack the catalog offers. */
 function packPrices(catalog: SubscriptionCatalogConfig | undefined): string[] {
   return [catalog?.storagePackPriceId, catalog?.computePackPriceId].filter((id): id is string => Boolean(id));
+}
+
+/** What may ride beside a gifted plan with no plan of its own: packs and Team seats. */
+function addOnPrices(catalog: SubscriptionCatalogConfig | undefined): string[] {
+  return [...packPrices(catalog), ...(catalog?.teamSeatPriceId ? [catalog.teamSeatPriceId] : [])];
 }
 
 /** The pack lines a rewrite keeps unchanged (Paddle has no zero quantity). */

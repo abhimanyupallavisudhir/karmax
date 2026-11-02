@@ -56,11 +56,12 @@ it('composes a task whose Responder and Reviewer carry their own authority', asy
     await page.locator('#expand-task').click();
     const body = page.locator('#tf-body');
     await expect.poll(() => body.locator('.tf-main > *').evaluateAll((elements) => elements.map((el) =>
-      el.matches('[data-row="prompt"]') ? 'prompt' : el.classList.contains('tf-agent') ? 'agent'
+      el.id === 'tf-ready' ? 'ready' : el.matches('[data-row="prompt"]') ? 'prompt' : el.classList.contains('tf-agent') ? 'agent'
         : el.classList.contains('tf-responder') ? 'responder' : el.classList.contains('tf-confirmer') ? 'review'
           : el.classList.contains('tf-computer') ? 'computer' : el.classList.contains('tf-where') ? 'where'
             : el.classList.contains('tf-triggers') ? 'triggers' : el.classList.contains('tf-avatar') ? 'avatar' : 'other'))).toEqual(
-      ['prompt', 'agent', 'responder', 'review', 'computer', 'where', 'triggers', 'avatar']);
+      // What the task still needs to start comes first, before anything is written.
+      ['ready', 'prompt', 'agent', 'responder', 'review', 'computer', 'where', 'triggers', 'avatar']);
     // Triggers is an open block like the others, with Repeatable inside it.
     const triggers = body.locator('.tf-triggers');
     expect(await triggers.locator('details').count()).toBe(0);
