@@ -324,10 +324,10 @@ describe('events in the console', () => {
       expect(await row.locator('[data-store-choose]').first().textContent()).toBe('Install…');
       expect(await row.textContent()).not.toContain('Needs GitHub');
       await row.click({ position: { x: 40, y: 12 } });
-      const picker = page.locator('.store-project-picker');
+      const picker = page.locator('#pp-picker');
       await picker.waitFor();
       expect(await picker.locator('.opt').count()).toBe(2);
-      await picker.locator('#sp-in').fill('webs');
+      await picker.locator('#pp-in').fill('webs');
       await page.keyboard.press('Enter');
       await expect.poll(() => page.url()).toMatch(/\/personal\/website\/store\/triage-issues$/);
       const form = page.locator('#tf-page:not([aria-busy])');

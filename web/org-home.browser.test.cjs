@@ -1,7 +1,7 @@
 // The organization home: `/` lands on `/<org>`, one task list over every
 // project that opens on "For me" (what waits on you, each row saying why), with
 // "Active" one click away and bookmarkable, the empty query showing archived tasks too, a project filter, project permalinks,
-// a New task field that opens the task form in the project new tasks go to,
+// a New task field that asks which project, then opens the task form there,
 // the logo as the way home, and a ☰ that folds the sidebar on a wide screen.
 // Run: node web/org-home.browser.test.cjs   (HOME_SCREENSHOTS=<dir> also saves screenshots)
 const assert = require('node:assert/strict');
