@@ -16881,7 +16881,29 @@ const INSIGHT_LENSES = [
   { key: 'shipped', label: 'Shipped' },
   { key: 'time', label: 'Agent time' },
   { key: 'tokens', label: 'Tokens' },
+  { key: 'compute', label: 'Compute' },
+  { key: 'storage', label: 'Storage' },
 ];
+// What a lens's bars are split by. Tokens by login and compute by anything but
+// time need data only some callers get (credential:read, payment:read).
+const INSIGHT_SPLITS = {
+  tokens: [{ key: 'model', label: 'Model' }, { key: 'login', label: 'Login', needs: (data) => data.logins?.length }],
+  compute: [{ key: 'provider', label: 'Provider' }, { key: 'funding', label: 'Funding' }, { key: 'project', label: 'Project' }, { key: 'size', label: 'Size' }]
+    .map((split) => ({ ...split, needs: (data) => data.compute?.money })),
+  storage: [{ key: 'kind', label: 'Kind' }, { key: 'project', label: 'Project' }],
+};
+const INSIGHT_STORAGE_KINDS = [
+  { key: 'resources', label: 'Data versions', color: 'var(--viz-1)', tip: 'Project data resources, every version kept' },
+  { key: 'workspaces', label: 'Task workspaces', color: 'var(--viz-2)', tip: 'Saved workspaces of tasks: uncommitted work kept while a task sleeps' },
+  { key: 'reviewFiles', label: 'Review files', color: 'var(--viz-3)', tip: 'Files agents attached for review: screenshots, reports, videos' },
+  { key: 'other', label: 'Other', color: 'var(--viz-other)', tip: 'Stored before data had its own repositories' },
+];
+const INSIGHT_FUNDING = {
+  own: { label: 'Own accounts', color: 'var(--viz-1)', tip: 'Your own provider accounts: the provider bills you at its list price' },
+  managed: { label: 'Managed', color: 'var(--viz-2)', tip: 'tavya\'s accounts: charged to your compute credit at twice list price' },
+};
+const INSIGHT_PROVIDERS = { e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', aws: 'AWS', gcp: 'Google Cloud' };
+const insProvider = (provider) => INSIGHT_PROVIDERS[provider] || provider;
 // The org-wide track reuses the task pipeline's stages; `resolve` (conflict
 // resolution) is part of landing.
 const INSIGHT_STAGES = [
@@ -16927,6 +16949,42 @@ function insDuration(ms) {
 }
 const insMoney = (micros) => `$${(Number(micros || 0) / 1e6).toLocaleString(undefined,
   { minimumFractionDigits: micros < 1e8 ? 2 : 0, maximumFractionDigits: micros < 1e8 ? 2 : 0 })}`;
+// Axis ticks: as short as the value allows ($0, $0.5, $12, $1.2k).
+const insMoneyTick = (micros) => {
+  const usd = Number(micros || 0) / 1e6;
+  return usd >= 1000 ? `$${insNum(usd)}` : `$${+usd.toFixed(usd < 1 ? 2 : usd < 10 ? 1 : 0)}`;
+};
+function insBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  const units = ['KB', 'MB', 'GB', 'TB', 'PB'];
+  let amount = bytes, unit = -1;
+  do { amount /= 1024; unit++; } while (amount >= 1024 && unit < units.length - 1);
+  return `${+amount.toFixed(amount >= 100 ? 0 : amount >= 10 ? 1 : 2)} ${units[unit]}`;
+}
+const insPct = (share) => `${Math.round((Number(share) || 0) * 100)}%`;
+// Top three keys by total take the categorical slots; the rest fold into Other.
+function insTopKeys(totals) {
+  return Object.entries(totals).filter(([, value]) => value > 0).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([key]) => key);
+}
+function insStack(daily, pick, keys, label, colors = (_, i) => `var(--viz-${i + 1})`) {
+  const bars = keys.map((key, i) => ({ key, label: label(key), color: colors(key, i), values: daily.map((day) => pick(day)?.[key] || 0) }));
+  const other = daily.map((day) => Object.entries(pick(day) || {}).reduce((sum, [key, n]) => sum + (keys.includes(key) ? 0 : n), 0));
+  if (other.some(Boolean)) bars.push({ key: 'other', label: 'Other', color: 'var(--viz-other)', values: other });
+  return bars;
+}
+// The providers ranked by what they cost in the period: one color each on the whole page.
+function insightProviderColors(compute) {
+  const totals = {};
+  for (const row of compute?.providers || []) totals[row.key] = (totals[row.key] || 0) + (compute.money ? row.listMicros : row.activeSeconds);
+  const ranked = insTopKeys(totals);
+  return { ranked, color: (provider) => { const i = ranked.indexOf(provider); return i < 0 ? 'var(--viz-other)' : `var(--viz-${i + 1})`; } };
+}
+function insightSplit(data, lens) {
+  const splits = (INSIGHT_SPLITS[lens] || []).filter((split) => !split.needs || split.needs(data));
+  const chosen = S.insightsSplit?.[lens];
+  return splits.length ? { splits, key: splits.some((split) => split.key === chosen) ? chosen : splits[0].key } : { splits, key: null };
+}
 
 // Change vs the preceding window of equal length. `better` names the direction
 // that is good news; metrics that are neither (tokens, spend) stay neutral.
@@ -17024,7 +17082,25 @@ function insightKpisHtml(data) {
         : t.tokens ? `${insNum(t.inputTokens)} in · ${insNum(t.outputTokens)} out` : '')}
     ${spend ? tile('Spend', 'Metered model and sandbox cost plus card purchases by agents (USD)', insMoney(t.spendMicros), insDelta(t.spendMicros, p.spendMicros, days),
       spend.cardMicros ? `${insMoney(spend.cardMicros)} on cards` : '') : ''}
+    ${insightComputeTile(data, tile)}${insightStorageTile(data, tile)}
   </div>`;
+}
+
+function insightComputeTile(data, tile) {
+  const c = data.compute;
+  if (!c || !(c.totals.activeSeconds || c.totals.diskGbHours || c.previous.activeSeconds || c.credit)) return '';
+  const time = insDuration(c.totals.activeSeconds * 1000);
+  if (!c.money) return tile('Compute', 'Time machines ran for your tasks', time, insDelta(c.totals.activeSeconds, c.previous.activeSeconds, data.days));
+  return tile('Compute', `What providers bill for your tasks' machines and disks, at list price. Managed compute is charged to your credit at ${c.multiplier}× list.`,
+    insMoney(c.totals.listMicros), insDelta(c.totals.listMicros, c.previous.listMicros, data.days),
+    `${time} machine${c.totals.chargedMicros ? ` · ${insMoney(c.totals.chargedMicros)} charged` : ''}`);
+}
+
+function insightStorageTile(data, tile) {
+  const st = data.storage;
+  if (!st || !(st.bytes || st.daily.some((d) => d.bytes))) return '';
+  return tile('Storage', 'What managed storage holds now: data versions, task workspaces and review files', insBytes(st.bytes), '',
+    st.quotaBytes ? `${insPct(st.bytes / st.quotaBytes)} of ${insBytes(st.quotaBytes)}` : '');
 }
 
 // Series for the chosen lens: `bars` stack bottom-up; an optional `line` shares
@@ -17033,12 +17109,60 @@ function insightSeries(data, lens) {
   const daily = data.daily;
   if (lens === 'time') return { unit: 'h', bars: [{ label: 'Agent hours', color: 'var(--accent)', values: daily.map((d) => d.agentSeconds / 3600) }] };
   if (lens === 'tokens') {
+    if (insightSplit(data, 'tokens').key === 'login') {
+      // API-equivalent dollars: how subscription quotas are measured, so the
+      // logins' weekly quotas can be drawn on the same axis.
+      const logins = data.logins;
+      const totals = Object.fromEntries(logins.map((login) => [login.id, login.usd]));
+      const keys = insTopKeys(totals);
+      const bars = insStack(daily.map((_, i) => Object.fromEntries(logins.map((login) => [login.id, login.daily[i] || 0]))), (d) => d, keys, accountShortName);
+      const week = logins.reduce((sum, login) => sum + (login.capacity?.week || 0), 0);
+      return { unit: 'usd', bars,
+        ...(week ? { limit: { value: week / 7, label: 'Weekly pace',
+          tip: 'All logins\' weekly quotas spread evenly over the week. Above it, the week runs out early.' } } : {}) };
+    }
     const color = insightModelColors(data.models);
     const top = insightTopTokenModels(data.models);
     const bars = top.map((model) => ({ label: model, color: color(model), values: daily.map((d) => d.tokensByModel[model] || 0) }));
     const other = daily.map((d) => Object.entries(d.tokensByModel).reduce((sum, [model, n]) => sum + (top.includes(model) ? 0 : n), 0));
     if (other.some(Boolean)) bars.push({ label: 'Other', color: 'var(--viz-other)', values: other });
     return { unit: 'tokens', bars };
+  }
+  if (lens === 'compute') {
+    const compute = data.compute;
+    if (!compute) return { unit: 'h', bars: [] };
+    const machine = (i) => [{ label: 'Machine time', value: insDuration(compute.daily[i].activeSeconds * 1000) }];
+    if (!compute.money) return { unit: 'h', bars: [{ label: 'Machine hours', color: 'var(--accent)', values: compute.daily.map((d) => d.activeSeconds / 3600) }] };
+    const split = insightSplit(data, 'compute').key;
+    const extra = (i) => [...(compute.daily[i].chargedMicros ? [{ label: 'Charged to credit', value: insMoney(compute.daily[i].chargedMicros) }] : []), ...machine(i)];
+    let bars;
+    if (split === 'funding') bars = ['own', 'managed'].map((key) => ({ key, label: INSIGHT_FUNDING[key].label, color: INSIGHT_FUNDING[key].color,
+      values: compute.daily.map((d) => d.byFunding[key] || 0) })).filter((bar) => bar.values.some(Boolean));
+    else if (split === 'provider') {
+      const { ranked, color } = insightProviderColors(compute);
+      bars = insStack(compute.daily, (d) => d.byProvider, ranked, insProvider, color);
+    } else {
+      const field = split === 'project' ? 'byProject' : 'bySize';
+      const rows = split === 'project' ? compute.projects : compute.sizes;
+      const keys = insTopKeys(Object.fromEntries(rows.map((row) => [row.key, row.listMicros])));
+      const label = (key) => rows.find((row) => row.key === key)?.label || key || 'Unattributed';
+      bars = insStack(compute.daily, (d) => d[field], keys, label);
+    }
+    return { unit: 'micros', bars, extra };
+  }
+  if (lens === 'storage') {
+    const storage = data.storage;
+    if (!storage) return { unit: 'bytes', bars: [] };
+    const bars = insightSplit(data, 'storage').key === 'project'
+      ? insStack(storage.daily, (d) => d.byProject, insTopKeys(Object.fromEntries(storage.projects.map((p) => [p.id, p.bytes]))),
+        (id) => storage.projects.find((p) => p.id === id)?.name || projectById(id)?.name || id)
+      : INSIGHT_STORAGE_KINDS.map((kind) => ({ key: kind.key, label: kind.label, color: kind.color, values: storage.daily.map((d) => d.byKind[kind.key] || 0) }))
+        .filter((bar) => bar.values.some(Boolean));
+    return { unit: 'bytes', bars,
+      extra: (i) => storage.daily[i].added ? [{ label: 'Uploaded', value: insBytes(storage.daily[i].added) }] : [],
+      note: (i) => storage.daily[i].estimated ? 'Estimated from what is stored now' : '',
+      ...(storage.quotaBytes ? { limit: { value: storage.quotaBytes, label: 'Quota',
+        tip: `Your plan's storage${storage.packs.paid + storage.packs.gifted ? ' with its storage packs' : ''}` } } : {}) };
   }
   return {
     unit: 'tasks',
@@ -17061,7 +17185,9 @@ const insDayLabel = (day, days) => {
   const date = new Date(`${day}T00:00:00Z`);
   return date.toLocaleDateString(undefined, days <= 7 ? { weekday: 'short', timeZone: 'UTC' } : { month: 'short', day: 'numeric', timeZone: 'UTC' });
 };
-const insFmtValue = (value, unit) => unit === 'h' ? insDuration(value * 3_600_000) : unit === 'tokens' ? insNum(value) : String(Math.round(value));
+const insFmtValue = (value, unit) => unit === 'h' ? insDuration(value * 3_600_000) : unit === 'tokens' ? insNum(value)
+  : unit === 'micros' ? insMoney(value) : unit === 'usd' ? insMoney(value * 1e6) : unit === 'bytes' ? insBytes(value) : String(Math.round(value));
+const insFmtTick = (value, unit) => unit === 'micros' ? insMoneyTick(value) : unit === 'usd' ? insMoneyTick(value * 1e6) : insFmtValue(value, unit);
 
 function insightChartSvg(data, lens, width) {
   const series = insightSeries(data, lens);
@@ -17069,7 +17195,10 @@ function insightChartSvg(data, lens, width) {
   const H = 188, padL = 34, padR = 6, padT = 10, padB = 22;
   const plotW = Math.max(40, width - padL - padR), plotH = H - padT - padB;
   const stackTotals = data.daily.map((_, i) => series.bars.reduce((sum, bar) => sum + bar.values[i], 0));
-  const max = Math.max(0, ...stackTotals, ...(series.line?.values || []));
+  const dataMax = Math.max(0, ...stackTotals, ...(series.line?.values || []));
+  // A limit far above the data would flatten it: then it is named, not drawn.
+  const limit = series.limit && dataMax > 0 ? { ...series.limit, onScale: series.limit.value <= dataMax * 4 } : null;
+  const max = Math.max(dataMax, limit?.onScale ? limit.value : 0);
   const ticks = insNiceTicks(max);
   const top = ticks.at(-1) || 1;
   const y = (v) => padT + plotH - (v / top) * plotH;
@@ -17077,7 +17206,7 @@ function insightChartSvg(data, lens, width) {
   const barW = Math.max(2, Math.min(24, band * 0.64));
   const x = (i) => padL + band * i + band / 2;
   const grid = ticks.map((tick) => `<line class="grid${tick ? '' : ' base'}" x1="${padL}" x2="${padL + plotW}" y1="${y(tick)}" y2="${y(tick)}"/>
-    <text class="tick" x="${padL - 6}" y="${y(tick) + 3}" text-anchor="end">${esc(insFmtValue(tick, series.unit))}</text>`).join('');
+    <text class="tick" x="${padL - 6}" y="${y(tick) + 3}" text-anchor="end">${esc(insFmtTick(tick, series.unit))}</text>`).join('');
   const labelEvery = n <= 7 ? 1 : Math.ceil(n / 6);
   const xLabels = data.daily.map((d, i) => (n - 1 - i) % labelEvery ? '' :
     `<text class="tick" x="${x(i)}" y="${H - 6}" text-anchor="middle">${esc(insDayLabel(d.day, n))}</text>`).join('');
@@ -17099,17 +17228,31 @@ function insightChartSvg(data, lens, width) {
   const line = series.line && max > 0
     ? `<path class="ins-line" stroke="${series.line.color}" d="${series.line.values.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join('')}"/>` : '';
   const empty = max === 0 ? `<text class="ins-empty-t" x="${padL + plotW / 2}" y="${padT + plotH / 2}" text-anchor="middle">No activity in the last ${n} days</text>` : '';
-  return { series, band, padL, x, y, H, svg: `<svg class="ins-svg" width="${width}" height="${H}" viewBox="0 0 ${width} ${H}" role="img"
+  const limitLabel = limit ? `${limit.label} ${insFmtValue(limit.value, series.unit)}` : '';
+  const limitMark = !limit ? '' : limit.onScale
+    ? `<g class="ins-limit"><title>${esc(limit.tip)}</title><line x1="${padL}" x2="${padL + plotW}" y1="${y(limit.value)}" y2="${y(limit.value)}"/>
+      <text x="${padL + plotW}" y="${y(limit.value) - 4}" text-anchor="end">${esc(limitLabel)}</text></g>`
+    : `<g class="ins-limit off"><title>${esc(limit.tip)}</title><text x="${padL + plotW}" y="${padT + 2}" text-anchor="end">${esc(limitLabel)} ↑</text></g>`;
+  return { series, band, padL, x, y, H, limit, svg: `<svg class="ins-svg" width="${width}" height="${H}" viewBox="0 0 ${width} ${H}" role="img"
     aria-label="${esc(`${INSIGHT_LENSES.find((l) => l.key === lens)?.label} per day, last ${n} days`)}">
-    ${grid}${bars}${line}${xLabels}${empty}<rect class="ins-hover" x="0" y="${padT}" width="${barW + 8}" height="${plotH}" rx="4" visibility="hidden"/>
+    ${grid}${bars}${line}${limitMark}${xLabels}${empty}<rect class="ins-hover" x="0" y="${padT}" width="${barW + 8}" height="${plotH}" rx="4" visibility="hidden"/>
     ${series.line ? `<circle class="ins-hover-dot" r="4" fill="${series.line.color}" visibility="hidden"/>` : ''}</svg>` };
 }
 
 function insightLegendHtml(series) {
   const items = [...series.bars.map((bar) => ({ ...bar, kind: 'bar' })), ...(series.line ? [{ ...series.line, kind: 'line' }] : [])];
-  if (items.length < 2) return '';
-  return `<div class="ins-legend">${items.map((item) =>
-    `<span><i class="${item.kind}" style="background:${item.color}"></i>${esc(item.label)}</span>`).join('')}</div>`;
+  const limit = series.limit ? `<span title="${esc(series.limit.tip)}"><i class="limit"></i>${esc(series.limit.label)}</span>` : '';
+  if (items.length < 2 && !limit) return '';
+  return `<div class="ins-legend">${items.length < 2 ? '' : items.map((item) =>
+    `<span><i class="${item.kind}" style="background:${item.color}"></i>${esc(item.label)}</span>`).join('')}${limit}</div>`;
+}
+
+// The chosen lens's split (Model · Login, Provider · Funding…), beside the legend.
+function insightSplitHtml(data, lens) {
+  const { splits, key } = insightSplit(data, lens);
+  if (splits.length < 2) return '';
+  return `<div class="ins-seg sm ins-split" role="radiogroup" aria-label="Split by">${splits.map((split) =>
+    `<button type="button" role="radio" aria-checked="${split.key === key}" class="${split.key === key ? 'on' : ''}" data-ins-split="${split.key}">${esc(split.label)}</button>`).join('')}</div>`;
 }
 
 function drawInsightChart(box, data) {
@@ -17119,7 +17262,11 @@ function drawInsightChart(box, data) {
   if (!width) return;
   plot.dataset.width = String(width);
   const chart = insightChartSvg(data, lens, width);
-  box.querySelector('.ins-legend-slot').innerHTML = insightLegendHtml(chart.series);
+  box.querySelector('.ins-legend-slot').innerHTML = `${insightLegendHtml(chart.series)}${insightSplitHtml(data, lens)}`;
+  box.querySelectorAll('[data-ins-split]').forEach((button) => button.addEventListener('click', () => {
+    S.insightsSplit = { ...S.insightsSplit, [lens]: button.dataset.insSplit };
+    drawInsightChart(box, S.insightsData);
+  }));
   plot.innerHTML = `${chart.svg}<div class="ins-tip" hidden></div>`;
   const svg = plot.querySelector('svg'), tip = plot.querySelector('.ins-tip');
   const hover = svg.querySelector('.ins-hover'), dot = svg.querySelector('.ins-hover-dot');
@@ -17135,7 +17282,11 @@ function drawInsightChart(box, data) {
     if (dot) { dot.setAttribute('cx', String(cx)); dot.setAttribute('cy', String(chart.y(chart.series.line.values[i]))); dot.setAttribute('visibility', 'visible'); }
     const rows = [...chart.series.bars, ...(chart.series.line ? [chart.series.line] : [])]
       .map((s) => `<div><i style="background:${s.color}"></i><span>${esc(s.label)}</span><b>${esc(insFmtValue(s.values[i], chart.series.unit))}</b></div>`);
-    tip.innerHTML = `<div class="ins-tip-h">${esc(new Date(`${day.day}T00:00:00Z`).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' }))}</div>${rows.join('')}`;
+    if (chart.series.bars.length > 1) rows.push(`<div class="ins-tip-total"><i></i><span>Total</span><b>${esc(insFmtValue(chart.series.bars.reduce((sum, bar) => sum + bar.values[i], 0), chart.series.unit))}</b></div>`);
+    for (const row of chart.series.extra?.(i) || []) rows.push(`<div class="ins-tip-extra"><i></i><span>${esc(row.label)}</span><b>${esc(row.value)}</b></div>`);
+    if (chart.limit) rows.push(`<div class="ins-tip-extra"><i class="limit"></i><span>${esc(chart.limit.label)}</span><b>${esc(insFmtValue(chart.limit.value, chart.series.unit))}</b></div>`);
+    const note = chart.series.note?.(i);
+    tip.innerHTML = `<div class="ins-tip-h">${esc(new Date(`${day.day}T00:00:00Z`).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' }))}</div>${rows.join('')}${note ? `<div class="ins-tip-note">${esc(note)}</div>` : ''}`;
     tip.hidden = false;
     const left = Math.min(Math.max(0, cx + 14), width - tip.offsetWidth);
     tip.style.left = `${cx + 14 + tip.offsetWidth > width ? Math.max(0, cx - 14 - tip.offsetWidth) : left}px`;
@@ -17181,8 +17332,135 @@ function insightModelsHtml(data) {
   }).join('')}</tbody></table>`;
 }
 
-function insightQuotaHtml(quota) {
-  if (!quota?.logins?.length) return '';
+// A tag naming whose account ran a machine.
+function insFundingTag(funding) {
+  const f = INSIGHT_FUNDING[funding === 'managed' ? 'managed' : 'own'];
+  return `<span class="ins-tag" title="${esc(f.tip)}">${funding === 'managed' ? 'managed' : 'own'}</span>`;
+}
+
+// Machines, broken down one way at a time: list cost, what managed compute
+// charged, and machine time. Amounts only for callers who may see money.
+function insightComputeHtml(data) {
+  const c = data.compute;
+  if (!c || !(c.totals.activeSeconds || c.totals.diskGbHours)) return '';
+  const by = ['provider', 'project', 'task', 'size'].includes(S.insightsComputeBy) ? S.insightsComputeBy : 'provider';
+  const rows = { provider: c.providers, project: c.projects, task: c.tasks, size: c.sizes }[by].slice(0, 8);
+  const { color } = insightProviderColors(c);
+  const charged = c.money && c.totals.chargedMicros > 0;
+  const total = rows.reduce((sum, row) => sum + (c.money ? row.listMicros : row.activeSeconds), 0) || 1;
+  const name = (row) => {
+    if (by === 'provider') return `${esc(insProvider(row.key))} ${insFundingTag(row.funding)}`;
+    if (by === 'task') {
+      const href = row.projectId ? insightTaskHref({ projectId: row.projectId, num: row.num, taskId: row.key }) : null;
+      const title = `${row.num != null ? `<span class="ins-num">#${esc(row.num)}</span> ` : ''}${esc(row.label)}`;
+      return href ? `<a data-spa href="${esc(href)}">${title}</a>` : title;
+    }
+    if (by === 'project' && row.key && projectById(row.key)) return `<a data-spa href="${esc(projectRoute(row.key))}">${esc(row.label)}</a>`;
+    return esc(row.label);
+  };
+  const body = rows.map((row) => {
+    const share = Math.round(((c.money ? row.listMicros : row.activeSeconds) / total) * 100);
+    const disk = row.diskGbHours ? ` · disk ${insNum(row.diskGbHours)} GB·h` : '';
+    return `<tr>
+      <td class="ins-name">${name(row)}<span class="ins-share" title="${share}% of compute${disk}"><i style="width:${share}%;background:${by === 'provider' ? color(row.key) : 'var(--accent)'}"></i></span></td>
+      <td class="num ins-time-col">${esc(insDuration(row.activeSeconds * 1000))}</td>
+      ${c.money ? `<td class="num">${esc(insMoney(row.listMicros))}</td>` : ''}
+      ${charged ? `<td class="num">${row.chargedMicros ? esc(insMoney(row.chargedMicros)) : '<span class="ins-unreported">—</span>'}</td>` : ''}
+    </tr>`;
+  }).join('');
+  const seg = `<div class="ins-seg sm" role="radiogroup" aria-label="Compute by">${[['provider', 'Provider'], ['project', 'Project'], ['task', 'Task'], ['size', 'Size']].map(([key, label]) =>
+    `<button type="button" role="radio" aria-checked="${key === by}" class="${key === by ? 'on' : ''}" data-ins-cby="${key}">${label}</button>`).join('')}</div>`;
+  return `<section class="card ins-card ins-compute"><div class="ins-card-h"><span>Compute</span>${seg}</div>
+    <table class="ins-table"><thead><tr><th><span class="sr-only">${esc(by)}</span></th><th class="num ins-time-col" title="Time machines ran">Machine</th>
+      ${c.money ? '<th class="num" title="What the provider bills, at its list price">List</th>' : ''}
+      ${charged ? `<th class="num" title="Charged to your compute credit: managed compute at ${c.multiplier}× list">Charged</th>` : ''}</tr></thead>
+    <tbody>${body}</tbody></table></section>`;
+}
+
+function wireInsightCompute(box) {
+  box.querySelectorAll('[data-ins-cby]').forEach((button) => button.addEventListener('click', () => {
+    S.insightsComputeBy = button.dataset.insCby;
+    box.querySelector('.ins-compute').outerHTML = insightComputeHtml(S.insightsData);
+    wireInsightCompute(box);
+  }));
+}
+
+// What managed storage holds per project, by kind, against the quota.
+function insightStorageHtml(data) {
+  const st = data.storage;
+  if (!st || !st.bytes) return '';
+  const max = Math.max(1, ...st.projects.map((p) => p.bytes));
+  const kinds = INSIGHT_STORAGE_KINDS.filter((kind) => st.byKind[kind.key] > 0);
+  const packs = st.packs.paid + st.packs.gifted;
+  const quota = st.quotaBytes ? `<span class="ins-count" title="${esc(`Plan ${insBytes(st.includedBytes || 0)}${packs ? ` + ${packs} storage pack${packs === 1 ? '' : 's'} of ${insBytes(st.packs.packBytes)}${st.packs.gifted ? ` (${st.packs.gifted} gifted)` : ''}` : ''}${st.packs.monthlyCents ? ` · $${st.packs.monthlyCents / 100}/month` : ''}`)}">${esc(insBytes(st.bytes))} of ${esc(insBytes(st.quotaBytes))}</span>` : `<span class="ins-count">${esc(insBytes(st.bytes))}</span>`;
+  const meter = st.quotaBytes ? `<div class="ins-meter" aria-hidden="true">${kinds.map((kind) =>
+    `<i style="width:${Math.min(100, (st.byKind[kind.key] / st.quotaBytes) * 100)}%;background:${kind.color}"></i>`).join('')}</div>` : '';
+  const legend = `<div class="ins-legend ins-kinds">${kinds.map((kind) => `<span title="${esc(kind.tip)}"><i style="background:${kind.color}"></i>${esc(kind.label)} ${esc(insBytes(st.byKind[kind.key]))}</span>`).join('')}</div>`;
+  const rows = st.projects.slice(0, 8).map((project) => `<tr>
+    <td class="ins-name">${projectById(project.id) ? `<a data-spa href="${esc(projectRoute(project.id))}">${esc(project.name)}</a>` : esc(project.name)}</td>
+    <td><span class="ins-stack" title="${esc(kinds.map((kind) => `${kind.label} ${insBytes(project.byKind[kind.key] || 0)}`).join(' · '))}">${kinds.map((kind) =>
+      project.byKind[kind.key] ? `<i style="width:${(project.byKind[kind.key] / max) * 100}%;background:${kind.color}"></i>` : '').join('')}</span></td>
+    <td class="num">${esc(insBytes(project.bytes))}</td></tr>`).join('');
+  return `<section class="card ins-card ins-storage"><div class="ins-card-h"><span>Storage</span>${quota}</div>${meter}${legend}
+    ${rows ? `<table class="ins-table"><tbody>${rows}</tbody></table>` : ''}
+    ${st.packs.monthlyCents ? `<div class="ins-foot">${st.packs.paid} storage pack${st.packs.paid === 1 ? '' : 's'} · $${st.packs.monthlyCents / 100}/month</div>` : ''}</section>`;
+}
+
+// Small line or bar charts inside cards (credit, login windows, budgets) are
+// drawn once their width is known; each element names its spec here.
+const insMini = new Map();
+let insMiniSeq = 0;
+function insMiniSlot(spec, cls = '') {
+  const id = `m${++insMiniSeq}`;
+  insMini.set(id, spec);
+  return `<div class="ins-mini ${cls}" data-ins-mini="${id}" style="height:${spec.height || 44}px"></div>`;
+}
+function drawInsightMinis(root) {
+  root.querySelectorAll('[data-ins-mini]').forEach((el) => {
+    const spec = insMini.get(el.dataset.insMini);
+    const width = Math.floor(el.clientWidth);
+    if (!spec || !width || String(width) === el.dataset.width) return;
+    el.dataset.width = String(width);
+    const H = spec.height || 44, padT = 6, padB = spec.axis ? 14 : 2;
+    const plotH = H - padT - padB;
+    const top = Math.max(spec.limit?.value || 0, ...spec.series.flatMap((line) => line.values.filter((v) => v != null))) || 1;
+    const x = (i) => spec.n > 1 ? (i / (spec.n - 1)) * (width - 2) + 1 : width / 2;
+    const y = (v) => padT + plotH - (Math.min(v, top) / top) * plotH;
+    const path = (values) => values.map((v, i) => v == null ? '' : `${i && values[i - 1] != null ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join('');
+    const marks = spec.series.map((line) => line.bars
+      ? line.values.map((v, i) => v ? `<rect x="${(x(i) - Math.max(1, width / spec.n / 2 - 1)).toFixed(1)}" y="${y(v).toFixed(1)}" width="${Math.max(1, width / spec.n - 2).toFixed(1)}" height="${(padT + plotH - y(v)).toFixed(1)}" rx="1" fill="${line.color}"/>` : '').join('')
+      : `<path class="ins-mini-line${line.dash ? ' dash' : ''}" stroke="${line.color}" d="${path(line.values)}"/>`).join('');
+    const limit = spec.limit ? `<line class="ins-mini-limit" x1="0" x2="${width}" y1="${y(spec.limit.value)}" y2="${y(spec.limit.value)}"/>` : '';
+    const axis = spec.axis ? spec.axis.map(([i, text], k) => `<text class="tick" x="${x(i)}" y="${H - 2}" text-anchor="${k ? 'end' : 'start'}">${esc(text)}</text>`).join('') : '';
+    el.innerHTML = `<svg width="${width}" height="${H}" viewBox="0 0 ${width} ${H}" role="img" aria-label="${esc(spec.label)}">${limit}${marks}${axis}
+      <line class="ins-mini-hover" y1="${padT}" y2="${padT + plotH}" visibility="hidden"/></svg><div class="ins-tip" hidden></div>`;
+    const svg = el.querySelector('svg'), tip = el.querySelector('.ins-tip'), hover = svg.querySelector('.ins-mini-hover');
+    const hide = () => { tip.hidden = true; hover.setAttribute('visibility', 'hidden'); };
+    const show = (event) => {
+      const rect = svg.getBoundingClientRect();
+      const i = Math.round(((event.clientX - rect.left - 1) / Math.max(1, width - 2)) * (spec.n - 1));
+      if (i < 0 || i >= spec.n) return hide();
+      hover.setAttribute('x1', String(x(i))); hover.setAttribute('x2', String(x(i))); hover.setAttribute('visibility', 'visible');
+      tip.innerHTML = spec.tip(i);
+      tip.hidden = false;
+      tip.style.top = `${H + 4}px`;
+      tip.style.left = `${Math.max(0, Math.min(width - tip.offsetWidth, x(i) - tip.offsetWidth / 2))}px`;
+    };
+    svg.addEventListener('pointermove', show);
+    svg.addEventListener('pointerdown', show);
+    svg.addEventListener('pointerleave', hide);
+  });
+}
+const insTipRow = (label, value, color) => `<div>${color ? `<i style="background:${color}"></i>` : '<i></i>'}<span>${esc(label)}</span><b>${esc(value)}</b></div>`;
+
+// Model logins: the share of the period's work each served (how the scheduler
+// spread it) and, for subscriptions, their 5-hour and weekly windows against
+// capacity over the last week, with the provider's live reading below.
+function insightLoginsHtml(data, quota) {
+  const logins = data.logins || [];
+  const live = new Map((quota?.logins || []).map((login) => [login.id, login]));
+  const ids = [...new Set([...logins.map((login) => login.id), ...live.keys()])];
+  if (!ids.length) return '';
   const bar = (label, win) => {
     const pct = Math.max(0, Math.min(100, Math.round(win.pct || 0)));
     const expired = win.resetAt && win.resetAt < Date.now();
@@ -17191,16 +17469,98 @@ function insightQuotaHtml(quota) {
       <span>${esc(label)}</span><span class="ins-quota-bar${tone}"><i style="width:${pct}%"></i></span>
       <b>${pct}%</b><span class="ins-quota-reset">${win.resetAt && !expired ? esc(fmtCountdown(win.resetAt).replace(/^in /, '')) : ''}</span></div>`;
   };
-  const rows = quota.logins.map((login) => {
-    const snap = login.usage;
-    const state = login.status && login.status !== 'available'
-      ? `<span class="ins-quota-state">${login.status === 'manual-off' ? 'off' : login.status === 'needs-attention' ? 'needs attention' : 'exhausted'}${
-        login.resetAt > Date.now() ? ` · back ${esc(fmtCountdown(login.resetAt))}` : ''}</span>` : '';
-    const windows = snap?.ok ? [snap.session && bar('Session', snap.session), snap.week && bar('Week', snap.week)].filter(Boolean).join('') : '';
-    return `<div class="ins-quota"><div class="ins-quota-name"><span class="mono">${esc(accountShortName(login.id))}</span>${state}</div>${windows}</div>`;
+  const rows = ids.map((id) => {
+    const login = logins.find((value) => value.id === id);
+    const state = live.get(id);
+    const snap = state?.usage;
+    const name = id.startsWith('unattributed:') ? `${id.slice('unattributed:'.length)} (API key)` : accountShortName(id);
+    const status = state?.status && state.status !== 'available'
+      ? `<span class="ins-quota-state">${state.status === 'manual-off' ? 'off' : state.status === 'needs-attention' ? 'needs attention' : 'exhausted'}${
+        state.resetAt > Date.now() ? ` · back ${esc(fmtCountdown(state.resetAt))}` : ''}</span>` : '';
+    const share = login ? `<span class="ins-login-share" title="${esc(`${insPct(login.share)} of the work in ${data.days} days · ${insMoney(login.usd * 1e6)} at API prices · ${login.turns} turn${login.turns === 1 ? '' : 's'}`)}">
+      <span class="ins-share"><i style="width:${Math.round(login.share * 100)}%;background:var(--accent)"></i></span><b>${insPct(login.share)}</b></span>` : '';
+    let windows = '';
+    if (login?.hourly) {
+      const { from, session, week } = login.hourly;
+      const hour = (i) => new Date(from + i * 3_600_000);
+      windows = insMiniSlot({ n: session.length, height: 40, label: `${name}: 5-hour window and week over the last 7 days`,
+        limit: { value: 1 },
+        series: [{ values: week, color: 'var(--viz-other)' }, { values: session, color: 'var(--viz-1)' }],
+        axis: [[0, hour(0).toLocaleDateString(undefined, { weekday: 'short' })], [session.length - 1, 'now']],
+        tip: (i) => `<div class="ins-tip-h">${esc(hour(i).toLocaleString(undefined, { weekday: 'short', hour: 'numeric' }))}</div>
+          ${insTipRow('5-hour window', insPct(session[i]), 'var(--viz-1)')}${insTipRow('Week', insPct(week[i]), 'var(--viz-other)')}
+          <div class="ins-tip-note">${esc(`Of ${insMoney(login.capacity.session * 1e6)} per 5 hours and ${insMoney(login.capacity.week * 1e6)} per week at API prices${login.capacity.learned ? ', learned from its readings' : ' (assumed until readings teach it)'}`)}</div>` }, 'ins-login-chart');
+    }
+    const bars = snap?.ok ? [snap.session && bar('Session', snap.session), snap.week && bar('Week', snap.week)].filter(Boolean).join('') : '';
+    return `<div class="ins-quota"><div class="ins-quota-name"><span class="mono">${esc(name)}</span>${status}${share}</div>${windows}${bars}</div>`;
   }).join('');
-  return `<section class="card ins-card"><div class="ins-card-h"><span>Quota</span>
+  const key = logins.some((login) => login.hourly)
+    ? `<span class="ins-legend ins-mini-key"><span><i class="line" style="background:var(--viz-1)"></i>5-hour</span><span><i class="line" style="background:var(--viz-other)"></i>Week</span><span title="A window's quota: past this line the login waits for its reset"><i class="limit"></i>Limit</span></span>` : '';
+  return `<section class="card ins-card ins-logins"><div class="ins-card-h"><span>Logins</span>${key}
     <a class="ins-more" data-spa href="${esc(globalRoute('organization'))}#settings-agents">Manage</a></div>${rows}</section>`;
+}
+
+// The month's compute credit (plan, packs, gifts, top-ups) against what
+// managed compute charged so far, with the pace to the month's end.
+function insightCreditHtml(data) {
+  const credit = data.compute?.credit;
+  if (!credit) return '';
+  const total = credit.creditMicros + credit.topUpMicros;
+  const days = credit.daysInMonth;
+  const spent = credit.cumulative;
+  const today = spent.length - 1;
+  const pace = today > 0 ? spent[today] / (today + 1) : spent[today] || 0;
+  const projection = Array.from({ length: days }, (_, i) => i < today ? null : Math.round(spent[today] + pace * (i - today)));
+  const line = Array.from({ length: days }, (_, i) => i <= today ? spent[i] : null);
+  const date = (i) => new Date(credit.from + i * 86_400_000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' });
+  const parts = [['Plan', credit.includedMicros], ['Packs', credit.packMicros], ['Gifts', credit.giftMicros], ['Top-ups left', credit.topUpMicros]]
+    .filter(([, value]) => value).map(([label, value]) => `${label} ${insMoney(value)}`).join(' · ');
+  const over = credit.usedMicros + credit.heldMicros > total;
+  return `<section class="card ins-card ins-credit"><div class="ins-card-h"><span>Compute credit</span>
+    <span class="ins-count${over ? ' over' : ''}" title="${esc(`${parts || 'No credit'}${credit.heldMicros ? ` · ${insMoney(credit.heldMicros)} held for work running now` : ''}`)}">${esc(insMoney(credit.usedMicros))} of ${esc(insMoney(total))}</span></div>
+    ${insMiniSlot({ n: days, height: 64, label: `Compute credit used this month against ${insMoney(total)}`, limit: { value: total },
+      series: [{ values: projection, color: 'var(--accent)', dash: true }, { values: line, color: 'var(--accent)' }],
+      axis: [[0, date(0)], [days - 1, date(days - 1)]],
+      tip: (i) => `<div class="ins-tip-h">${esc(date(i))}</div>${i <= today ? insTipRow('Charged so far', insMoney(spent[i]), 'var(--accent)')
+        : insTipRow('At this pace', insMoney(projection[i]), 'var(--accent)')}${insTipRow('Credit', insMoney(total))}` })}
+    <div class="ins-foot" title="Managed compute is charged at ${data.compute.multiplier}× the provider's list price; your own accounts never use credit">${esc(`${insMoney(Math.max(0, credit.availableMicros))} left${pace > 0 && spent[today] + pace * (days - 1 - today) > total ? ` · runs out ~${date(Math.min(days - 1, Math.ceil(Math.max(0, total - spent[today]) / pace) + today))}` : ''}`)}</div></section>`;
+}
+
+// Where provider "Any" put this organization's computers, and why.
+function insightRoutingHtml(data) {
+  const routing = data.compute?.routing;
+  if (!routing || !(routing.total || routing.unplaced)) return '';
+  const max = Math.max(1, ...routing.providers.map((row) => row.count));
+  const rows = routing.providers.map((row) => `<div class="ins-route" title="${esc(row.reasons.map((r) => `${r.reason} (${r.count})`).join('\\n'))}">
+    <span class="ins-name">${esc(insProvider(row.provider))} ${row.funding ? insFundingTag(row.funding) : ''}</span>
+    <span class="ins-share"><i style="width:${(row.count / max) * 100}%;background:var(--accent)"></i></span><b>${row.count}</b></div>`).join('');
+  const notes = [
+    routing.fellOver ? `<span title="${esc(`A cheaper account had no room, so the next took it: ${routing.full.map((f) => `${insProvider(f.provider)} full ${f.count}×`).join(', ')}`)}">${routing.fellOver} fell over</span>` : '',
+    routing.unplaced ? `<span class="warn" title="Every account was full: the task waited for a machine">${routing.unplaced} waited</span>` : '',
+  ].filter(Boolean).join(' · ');
+  return `<section class="card ins-card ins-routing"><div class="ins-card-h"><span title="Tasks whose computer is Any: tavya picks the first account that fits and has room, your own before managed, cheapest first">Where Any ran</span>
+    <b class="ins-count">${routing.total}</b></div>${rows}${notes ? `<div class="ins-foot">${notes}</div>` : ''}</section>`;
+}
+
+// Operators: each managed account's peak use per day against its budget.
+function insightBudgetsHtml(data) {
+  const budgets = data.compute?.budgets;
+  if (!budgets?.length) return '';
+  const rows = budgets.map((budget) => {
+    const cpu = budget.pool.cpu != null || !budget.pool.machines;
+    const values = cpu ? budget.peakCpu : budget.peakMachines;
+    const cap = cpu ? budget.pool.cpu : budget.pool.machines;
+    const unit = cpu ? 'CPU' : 'machines';
+    const peak = Math.max(0, ...values);
+    const tone = cap && peak >= cap ? ' over' : '';
+    return `<div class="ins-budget"><div class="ins-quota-name"><span>${esc(insProvider(budget.provider))}</span>
+      <span class="ins-count${tone}">peak ${peak}${cap ? ` of ${cap}` : ''} ${unit}</span></div>
+      ${insMiniSlot({ n: values.length, height: 30, label: `${insProvider(budget.provider)}: peak ${unit} in use per day`,
+        ...(cap ? { limit: { value: cap } } : {}), series: [{ values, color: 'var(--accent)', bars: true }],
+        tip: (i) => `<div class="ins-tip-h">${esc(insDayLabel(data.daily[i].day, 30))}</div>${insTipRow(`Peak ${unit}`, String(values[i]), 'var(--accent)')}${cap ? insTipRow('Budget', String(cap)) : ''}` })}</div>`;
+  }).join('');
+  return `<section class="card ins-card ins-budgets"><div class="ins-card-h"><span title="tavya's own provider accounts, every organization together: the most running at once each day against each account's budget (Installation → Managed compute)">Managed accounts</span>
+    <a class="ins-more" data-spa href="${esc(installationRoute())}#installation-compute">Manage</a></div>${rows}</section>`;
 }
 
 async function loadInsightQuota(organizationId) {
@@ -17242,10 +17602,12 @@ async function renderInsights({ refresh = false } = {}) {
   if (!renderIsCurrent() || S.tab !== 'insights' || (S.organizationId || 'org_personal') !== organizationId) return;
   // A live refresh repaints only when something changed, so hovering the chart
   // or reading a list is never disturbed by an identical redraw.
-  const signature = JSON.stringify([data.totals, data.pipeline, data.daily, data.working, data.waiting, data.recent, quota]);
+  const signature = JSON.stringify([data.totals, data.pipeline, data.daily, data.working, data.waiting, data.recent, quota,
+    data.compute, data.storage, data.logins]);
   if (!refresh || signature !== box.dataset.signature) {
     box.dataset.signature = signature;
     S.insightsData = data;
+    insMini.clear();
     const lens = INSIGHT_LENSES.some((l) => l.key === S.insightsLens) ? S.insightsLens : 'shipped';
     if (insightsIsEmpty(data)) {
       const project = firstProjectForOrganization(organizationId);
@@ -17266,6 +17628,8 @@ async function renderInsights({ refresh = false } = {}) {
             <div class="ins-plot"></div>
           </section>
           <section class="card ins-card"><div class="ins-card-h"><span>Projects</span></div>${insightProjectsHtml(data)}</section>
+          ${insightComputeHtml(data)}
+          ${insightStorageHtml(data)}
           ${data.models?.length ? `<section class="card ins-card"><div class="ins-card-h"><span>Models</span></div>${insightModelsHtml(data)}</section>` : ''}
           <section class="card ins-card"><div class="ins-card-h"><span>Recently shipped</span></div>
             ${data.recent.length ? data.recent.map((ref) => insightTaskRow(ref, 'shipped')).join('') : `<div class="ins-empty">Nothing shipped in ${days} days</div>`}</section>
@@ -17275,10 +17639,15 @@ async function renderInsights({ refresh = false } = {}) {
             ${data.waiting.length ? data.waiting.map((ref) => insightTaskRow(ref, 'waiting')).join('') : '<div class="ins-empty">Nothing is waiting ✓</div>'}</section>
           <section class="card ins-card"><div class="ins-card-h"><span>With agents</span><b class="ins-count">${data.pipeline.working}</b></div>
             ${data.working.length ? data.working.map((ref) => insightTaskRow(ref, 'working')).join('') : '<div class="ins-empty">No agent is working</div>'}</section>
-          ${insightQuotaHtml(quota)}
+          ${insightLoginsHtml(data, quota)}
+          ${insightCreditHtml(data)}
+          ${insightRoutingHtml(data)}
+          ${insightBudgetsHtml(data)}
         </div>
       </div>`;
     if (!refresh) box.classList.add('ins-enter');
+    drawInsightMinis(box);
+    wireInsightCompute(box);
     const chart = box.querySelector('.ins-chart');
     if (chart) {
       drawInsightChart(chart, data);
@@ -17293,6 +17662,7 @@ async function renderInsights({ refresh = false } = {}) {
         const plot = chart.querySelector('.ins-plot');
         if (!chart.isConnected) return observer.disconnect();
         if (plot && String(Math.floor(plot.clientWidth)) !== plot.dataset.width) drawInsightChart(chart, S.insightsData);
+        drawInsightMinis(box);
       });
       observer.observe(chart);
     }

@@ -331,6 +331,23 @@ describe.each(BACKENDS)('%s', (name) => {
     });
 
   describe('storage page', () => {
+    it('records what each organization stores today, for Insights\' storage over time', async () => {
+      const f = (await fixture());
+      const data = (await f.attachment('data'));
+      (await f.resources.importFiles(data.id, [{ path: 'file.bin', data: Buffer.alloc(4096, 7) }]));
+      const doing = (await f.task('waiting'));
+      (await f.worldCheckpoint(doing.id, Date.now()));
+      const now = Date.now();
+      (await f.service.run(now));
+      const day = JSON.parse((await f.store.kvGet(`storage-day:${f.organizationId}:${new Date(now).toISOString().slice(0, 10)}`))!);
+      const stored = (await f.usage()).retainedBytes;
+      expect(day.bytes).toBe(stored);
+      expect(day.byKind.workspaces).toBe(100);
+      expect(day.byKind.resources).toBeGreaterThan(0);
+      expect(day.byKind.resources + day.byKind.workspaces + day.byKind.reviewFiles + day.byKind.other).toBe(stored);
+      expect(day.byProject[f.project.id]).toBe(day.byKind.resources + day.byKind.workspaces);
+    });
+
     it('shows deleted data the bucket still holds, without counting it toward the quota', async () => {
       const f = (await fixture());
       const data = (await f.attachment('data'));
