@@ -17991,7 +17991,7 @@ function wikiTreeHtml(entries, sel, depth = 0) {
   return (entries || []).map((e) => e.kind === 'section'
     ? `<span class="wiki-sec" style="padding-left:${10 + depth * 12}px">${esc(e.name)}/</span>${wikiTreeHtml(e.children, sel, depth + 1)}`
     : `<a href="#${encodeURIComponent(e.path)}" class="${sel === e.path ? 'active' : ''}" data-wiki-path="${esc(e.path)}"
-         style="padding-left:${10 + depth * 12}px" title="${esc(e.description || '')}">${wikiGlyph(e)} ${esc(e.name)}</a>`,
+         style="padding-left:${10 + depth * 12}px" title="${esc(e.description || '')}">${wikiGlyph(e)} <span>${esc(e.name)}</span></a>`,
   ).join('');
 }
 

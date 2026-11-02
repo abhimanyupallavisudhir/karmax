@@ -533,13 +533,15 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .settings-header { display:flex; justify-content:space-between; align-items:flex-start; gap:14px; }
 .settings-layout { display:grid; grid-template-columns:190px minmax(0,1fr); gap:38px; align-items:start; }
 .settings-content { min-width:0; }
-.settings-nav { position:sticky; top:24px; display:flex; flex-direction:column; gap:2px; padding:8px 14px 12px 0; border-right:1px solid var(--line); }
+.settings-nav { position:sticky; top:var(--nav-top); --nav-top:24px; display:flex; flex-direction:column; gap:2px; padding:8px 14px 12px 0; border-right:1px solid var(--line); }
 .settings-nav > span { color:var(--ink-3); font-size:10px; font-weight:700; letter-spacing:.12em; text-transform:uppercase; padding:5px 10px 9px; }
 .settings-nav a { position:relative; color:var(--ink-2); text-decoration:none; font-size:13px; padding:8px 10px; border-radius:8px; transition:background .15s,color .15s; }
 .settings-nav a::before { content:''; position:absolute; left:-15px; top:8px; bottom:8px; width:2px; border-radius:2px; background:transparent; }
 .settings-nav a:hover { color:var(--ink); background:var(--surface-2); }
 .settings-nav a.active { color:var(--accent); background:var(--accent-weak); font-weight:600; }
 .settings-nav a.active::before { background:var(--accent); }
+/* Under a project's sticky tabs (45px tall), a section nav sticks below them, not beneath them. */
+.tabs ~ * .settings-nav { --nav-top:61px; }
 /* One pane at a time: the rail chooses, the pane answers. */
 .settings-pane { display:none; }
 .settings-pane.active { display:block; animation:pane-in .16s ease; }
@@ -684,7 +686,7 @@ a.git-repo-name:hover { color:var(--accent); }
 .team-rename-form[hidden] { display:none; }
 .inline-form { display:flex; gap:7px; flex-wrap:wrap; margin-top:12px; }
 .inline-form input, .inline-form select { min-width:0; flex:1; padding:7px 9px; border:1px solid var(--line); background:var(--surface-2); border-radius:7px; }
-@media (max-width: 850px) { .responsibility-editor { grid-template-columns:1fr; } .settings-disclosure > summary span { display:none; } .settings-layout { grid-template-columns:1fr; gap:14px; } .settings-nav { position:sticky; top:0; z-index:4; flex-direction:row; overflow-x:auto; padding:8px 0; border:0; border-bottom:1px solid var(--line); background:var(--paper); } .settings-nav > span { display:none; } .settings-nav a { white-space:nowrap; } .settings-nav a::before { display:none; } }
+@media (max-width: 850px) { .responsibility-editor { grid-template-columns:1fr; } .settings-disclosure > summary span { display:none; } .settings-layout { grid-template-columns:1fr; gap:14px; } .settings-nav { position:sticky; --nav-top:0px; z-index:4; flex-direction:row; overflow-x:auto; padding:8px 0; border:0; border-bottom:1px solid var(--line); background:var(--paper); } .settings-nav > span { display:none; } .settings-nav a { white-space:nowrap; } .settings-nav a::before { display:none; } .tabs ~ * .settings-nav { --nav-top:45px; } }
 @media (max-width: 560px) { .project-form-grid { grid-template-columns:1fr; } .project-form-grid .form-row.wide { grid-column:auto; } .new-repository-identity { grid-template-columns:1fr; } .new-repository-slash { display:none; } }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
@@ -3258,13 +3260,24 @@ html[data-theme="dark"] .github-signin-btn:active,
 }
 
 /* ── wiki (org/project skills, memories, prompts) ─────────────────────────── */
-.wiki-nav { max-height: calc(100vh - 140px); overflow-y: auto; }
+/* A long wiki scrolls its nav, sized to what the window leaves below the top
+   bar (52px), where it sticks, and a 16px margin; its rows keep their height
+   instead of shrinking to fit. The left padding (offset by the margin) keeps
+   the active entry's accent bar inside the scrolling box, not clipped by it. */
+.wiki-nav { max-height: calc(var(--visible-height, 100dvh) - 68px - var(--nav-top)); overflow-y: auto; margin-left: -15px; padding-left: 15px;
+  scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+.wiki-nav > * { flex-shrink: 0; }
 .wiki-nav .wiki-sec { color: var(--ink-3); font-size: 12px; font-weight: 600; letter-spacing: 0; text-transform: none; padding: 7px 10px 2px; }
-.wiki-nav a { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A tree of dozens of entries: tighter rows and a wider column than a settings
+   nav. The name, not the link, is clipped: the link's accent bar sits outside it. */
+.wiki-nav a { display: flex; gap: .35em; white-space: nowrap; padding-block: 5px; }
+.wiki-nav a > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+@media (min-width: 851px) { .wiki-page .settings-layout { grid-template-columns: 220px minmax(0,1fr); } }
 /* A phone's nav is one scrolling row: the button sits in it like the links. */
 @media (max-width: 850px) {
+  .wiki-nav { max-height: none; margin-left: 0; padding-left: 0; }
   .wiki-nav .wiki-new { flex: none; align-self: center; margin: 0 4px 0 0; }
-  .wiki-nav a { flex: none; overflow: visible; } /* the row scrolls; names stay whole */
+  .wiki-nav a { flex: none; } /* the row scrolls; names stay whole */
 }
 .wiki-page .settings-section-title .chip { vertical-align: 3px; margin-left: 6px; }
 .wiki-view-picker { display: flex; align-items: center; gap: 8px; color: var(--ink-3); font-size: 11.5px; }
