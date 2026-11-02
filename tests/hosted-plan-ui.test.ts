@@ -24,7 +24,7 @@ const markup = Function('esc', 'S', 'location', `
   const COMPUTER_PROVIDERS = { e2b: { name: 'E2B' }, hetzner: { name: 'Hetzner' } };
   ${extractFunction('formatBytes')}
   const PLAN_ACTIVE = ['active', 'trialing', 'past_due'];
-  ${extractFunction('planMoney')}; ${extractFunction('planDollars')}; ${extractFunction('planMeter')}; ${extractFunction('planStepper')};
+  ${extractFunction('planMoney')}; ${extractFunction('planDollars')}; ${extractFunction('planMeter')}; ${extractFunction('planPackName')}; ${extractFunction('planStepper')};
   ${extractFunction('planBillingMarkup')}; return planBillingMarkup;`)(esc, { launch: { paidLaunch: true, ready: true } }, { search: '' });
 const GB = 1024 ** 3;
 const catalog = [
@@ -39,7 +39,7 @@ const entitlements = (overrides: Record<string, unknown> = {}) => ({ deployment:
   activeAgentRuns: 0, queuedAgentRuns: 0, storageQuotaBytes: 5 * GB, includedStorageBytes: 5 * GB, storageUsedBytes: 2 * GB,
   storagePacks: 0, giftedStoragePacks: 0, storagePackBytes: 100 * GB, computeCreditMicros: 0, includedComputeCreditMicros: 0,
   computePacks: 0, giftedComputePacks: 0, computePackCreditMicros: 10_000_000, compute: null, ...overrides });
-const status = (overrides: Record<string, unknown> = {}) => ({ managed: true, providerConfigured: true, plan: 'free', billedPlan: 'free',
+const status = (overrides: Record<string, unknown> = {}): any => ({ managed: true, providerConfigured: true, plan: 'free', billedPlan: 'free',
   status: 'none', catalog, canManage: true, canGift: false, activeUsers: 1, storagePacks: 0, computePacks: 0,
   storagePack: { bytes: 100 * GB, monthlyPriceCents: 400, available: true }, computePack: { creditMicros: 10_000_000, monthlyPriceCents: 1_000, available: true },
   ...overrides });
@@ -74,11 +74,16 @@ describe('Plan & billing', () => {
     expect(text(html)).toMatch(/Individual \$23\/month · renews/);
     expect(text(html)).toMatch(/\$13\.00 of \$15\.00 this month/);
     expect(html).toMatch(/plan-meter near/);
-    expect(html).toContain('50 GB with Individual + 100 GB in 1 pack');
-    expect(html).toContain('$5.00 with Individual + $10.00 in 1 pack');
+    expect(html).toContain('50 GB with Individual + 1 × 100 GB pack');
+    expect(html).toContain('$5.00 with Individual + 1 × $10 pack');
     expect(html).toContain('data-kind="storage"');
     expect(html).toContain('data-kind="compute" data-packs="2"');
-    expect(html).toContain('Each pack adds $10.00 of compute a month for $10/month');
+    expect(html).toContain('Each $10 pack adds $10 of compute a month for $10/month');
+    // Packs are named by what they give, on their buttons and beside their count.
+    expect(html).toContain('aria-label="Add a 100 GB pack"');
+    expect(html).toContain('aria-label="Remove a $10 pack"');
+    expect(text(html)).toMatch(/− 1 \+ 100 GB pack\b/);
+    expect(text(html)).toMatch(/− 1 \+ \$10 pack\b/);
     expect(html).toContain('Upgrade to Team');
     expect(html).toContain('billing-cancel');
     expect(html).not.toContain('data-plan="team" disabled');
@@ -134,10 +139,10 @@ describe('Plan & billing', () => {
     status({ plan: 'team', gift: { plan: 'team' } }));
     expect(text(giftedTeam)).toMatch(/^\s*Team Gifted\s+People/);
     // The first pack opens checkout; there is nothing to remove yet.
-    expect(giftedTeam).toMatch(/billing-buy" data-kind="storage" data-packs="1" data-add aria-label="Add a storage pack"/);
+    expect(giftedTeam).toMatch(/billing-buy" data-kind="storage" data-packs="1" data-add aria-label="Add a 100 GB pack"/);
     expect(giftedTeam).toMatch(/billing-buy" data-kind="compute" data-packs="1" data-add/);
-    expect(giftedTeam).toMatch(/billing-packs" data-kind="storage" data-packs="-1" aria-label="Remove a storage pack" disabled/);
-    // Team seats come with the gift: nothing to buy, no plan choices, no cancel.
+    expect(giftedTeam).toMatch(/billing-packs" data-kind="storage" data-packs="-1" aria-label="Remove a 100 GB pack" disabled/);
+    // No plan choices or cancel on a gift; no seat counts without its seats.
     expect(giftedTeam).not.toContain('Upgrade to Team');
     expect(giftedTeam).not.toContain('billing-checkout');
     expect(giftedTeam).not.toContain('billing-cancel');
@@ -172,6 +177,67 @@ describe('Plan & billing', () => {
     expect(ungifted).toMatch(/billing-change" data-plan="individual"/);
     expect(ungifted).not.toContain('billing-checkout');
     expect(ungifted).not.toContain('policy-acceptance');
+  });
+
+  it('shows a Team\'s seats and lets its owner add one ahead of an invitation, or remove an unused one', () => {
+    const team = entitlements({ plan: 'team', planName: 'Team', currentMonthlyPriceCents: 2_900, maxMembers: null, currentMemberCount: 2 });
+    const paid = status({ plan: 'team', billedPlan: 'team', status: 'active', currentPeriodEnd: Date.UTC(2026, 10, 3),
+      teamSeats: { total: 3, used: 2, gifted: 0, paid: 2, included: 1, limit: null, autoBill: true, priceCents: 500 } });
+    const html = markup(team, paid);
+    expect(text(html)).toMatch(/People ⓘ 2 of 3 seats 1 free − 3 \+ seats/);
+    expect(html).toMatch(/billing-seats" data-kind="seats" data-packs="4" data-add aria-label="Add a seat"/);
+    // Never below the people there.
+    expect(html).toMatch(/billing-seats" data-kind="seats" data-packs="2" aria-label="Remove a seat"\s*>/);
+    expect(markup(team, { ...paid, teamSeats: { ...paid.teamSeats, total: 2, paid: 1 } }))
+      .toMatch(/data-packs="1" aria-label="Remove a seat" disabled/);
+    expect(html).toContain('Someone who joins without a free seat is billed one.');
+    // A member sees the seats, not the controls.
+    expect(markup(team, { ...paid, canManage: false })).not.toContain('billing-seats');
+    // Someone joined without a seat: Bill seats, not the stepper.
+    const short = markup(entitlements({ plan: 'team', planName: 'Team', maxMembers: null, currentMemberCount: 3 }),
+      { ...paid, seatDeficit: 1, teamSeats: { ...paid.teamSeats, used: 3, total: 2 } });
+    expect(short).toContain('billing-sync');
+    expect(text(short)).toContain('1 seat not yet billed');
+    // A Team the operator set directly bills nothing: no Bill seats, no stepper.
+    const direct = markup(entitlements({ plan: 'team', planName: 'Team', maxMembers: null, currentMemberCount: 2 }),
+      status({ plan: 'team', seatDeficit: 0, teamSeats: { total: null, used: 2, gifted: 0, paid: 0, included: 0, limit: null, autoBill: false, priceCents: 500 } }));
+    expect(text(direct)).toMatch(/People 2 people/);
+    expect(direct).not.toContain('billing-sync');
+    expect(direct).not.toContain('billing-seats');
+  });
+
+  it('lets a gifted Team buy its first seat at checkout, then change seats beside the gift', () => {
+    const team = entitlements({ plan: 'team', planName: 'Team', maxMembers: null, currentMemberCount: 1 });
+    const gifted = status({ plan: 'team', gift: { plan: 'team', seats: 1 },
+      teamSeats: { total: 1, used: 1, gifted: 1, paid: 0, included: 1, limit: 1, autoBill: false, priceCents: 500 } });
+    const html = markup(team, gifted);
+    expect(text(html)).toMatch(/People ⓘ 1 of 1 seat all taken − 1 \+ seat/);
+    expect(html).toMatch(/billing-buy" data-kind="seats" data-packs="2" data-add aria-label="Add a seat"/);
+    expect(html).toContain('1 seat gifted; each more is $5/month');
+    const beside = markup(team, { ...gifted, billedPlan: 'free', status: 'active', billedMonthlyPriceCents: 900, storagePacks: 1,
+      currentPeriodEnd: Date.UTC(2026, 10, 3), teamSeats: { ...gifted.teamSeats, total: 2, paid: 1, limit: 2 } });
+    expect(text(beside)).toMatch(/Team Gifted Seats &amp; packs \$9\/month · renews/);
+    expect(beside).toMatch(/billing-seats" data-kind="seats" data-packs="3" data-add/);
+    expect(beside).not.toMatch(/billing-buy" data-kind="seats"/);
+  });
+
+  it('keeps a plan whose cancellation is scheduled', () => {
+    const ending = markup(entitlements({ plan: 'individual', planName: 'Individual', currentMonthlyPriceCents: 900 }),
+      status({ plan: 'individual', billedPlan: 'individual', status: 'active', cancelAtPeriodEnd: true, currentPeriodEnd: Date.UTC(2026, 10, 3) }));
+    expect(text(ending)).toMatch(/Individual Ends/);
+    expect(ending).toContain('billing-resume');
+    expect(ending).not.toContain('billing-cancel');
+    expect(markup(entitlements({ plan: 'individual', planName: 'Individual' }),
+      status({ plan: 'individual', billedPlan: 'individual', status: 'active', currentPeriodEnd: Date.UTC(2026, 10, 3) }))).not.toContain('billing-resume');
+  });
+
+  it('gifts Team seats and names gifted packs by what they give', () => {
+    const operator = markup(entitlements({ plan: 'team', planName: 'Team', maxMembers: null, currentMemberCount: 2 }),
+      status({ canGift: true, gift: { plan: 'team', seats: 4 } }));
+    expect(operator).toMatch(/id="billing-gift-seats"[^>]*value="4"/);
+    expect(text(operator)).toContain('100 GB packs');
+    expect(text(operator)).toContain('$10 compute packs');
+    expect(markup(entitlements(), status({ canGift: true, gift: { plan: 'individual' } }))).toMatch(/id="billing-gift-seats"[^>]*hidden/);
   });
 
   it('makes private-install behavior explicit instead of showing hosted limits', () => {

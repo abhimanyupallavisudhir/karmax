@@ -61,6 +61,30 @@ const screens = {
     computeCreditMicros: 25e6, includedComputeCreditMicros: 5e6, computePacks: 2, compute: compute(3.6e6, 25e6) },
   { managed: true, providerConfigured: true, plan: 'individual', billedPlan: 'free', status: 'active', catalog, canManage: true, gift: { plan: 'individual' }, ...packs,
     storagePacks: 1, computePacks: 2, billedMonthlyPriceCents: 2400, currentPeriodEnd: Date.UTC(2026, 10, 3) }],
+  // A gifted Team (nisada-personal): its one gifted seat taken; the next is bought at checkout.
+  'plan-gifted-team-seats': [{ ...base, plan: 'team', planName: 'Team', currentMonthlyPriceCents: 1900, maxMembers: null, maxActiveAgentRuns: 20,
+    monthlyAdditionalActiveUserPriceCents: 500, storageQuotaBytes: 100 * GB, includedStorageBytes: 100 * GB, storageUsedBytes: 41 * GB,
+    computeCreditMicros: 10e6, includedComputeCreditMicros: 10e6, compute: compute(6.2e6, 10e6) },
+  { managed: true, providerConfigured: true, plan: 'team', billedPlan: 'free', status: 'none', catalog, canManage: true, gift: { plan: 'team', seats: 1 }, ...packs,
+    teamSeats: { total: 1, used: 1, gifted: 1, paid: 0, included: 1, limit: 1, autoBill: false, priceCents: 500 } }],
+  // …once it bought two seats and a 100 GB pack beside the gift, one seat still free.
+  'plan-gifted-team-seats-bought': [{ ...base, plan: 'team', planName: 'Team', currentMemberCount: 2, currentMonthlyPriceCents: 1900, maxMembers: null, maxActiveAgentRuns: 25,
+    monthlyAdditionalActiveUserPriceCents: 500, storageQuotaBytes: 210 * GB, includedStorageBytes: 110 * GB, storagePacks: 1, storageUsedBytes: 41 * GB,
+    computeCreditMicros: 13e6, includedComputeCreditMicros: 13e6, compute: compute(6.2e6, 13e6) },
+  { managed: true, providerConfigured: true, plan: 'team', billedPlan: 'free', status: 'active', catalog, canManage: true, gift: { plan: 'team', seats: 1 }, ...packs,
+    storagePacks: 1, billedMonthlyPriceCents: 1400, currentPeriodEnd: Date.UTC(2026, 11, 2),
+    teamSeats: { total: 3, used: 2, gifted: 1, paid: 2, included: 1, limit: 3, autoBill: false, priceCents: 500 } }],
+  // A paid Team with a seat bought ahead of an invitation, and a $10 pack.
+  'plan-team-seats': [{ ...base, plan: 'team', planName: 'Team', currentMemberCount: 3, currentMonthlyPriceCents: 3900, maxMembers: null, maxActiveAgentRuns: 30,
+    monthlyAdditionalActiveUserPriceCents: 500, storageQuotaBytes: 120 * GB, includedStorageBytes: 120 * GB, storageUsedBytes: 64 * GB,
+    computeCreditMicros: 26e6, includedComputeCreditMicros: 16e6, computePacks: 1, compute: compute(8.9e6, 26e6) },
+  { managed: true, providerConfigured: true, plan: 'team', billedPlan: 'team', status: 'active', catalog, canManage: true, ...packs, computePacks: 1,
+    currentPeriodEnd: Date.UTC(2026, 11, 2), teamSeats: { total: 4, used: 3, gifted: 0, paid: 3, included: 1, limit: null, autoBill: true, priceCents: 500 } }],
+  // Canceled at the period end: Keep plan withdraws it.
+  'plan-ending': [{ ...base, plan: 'individual', planName: 'Individual', currentMonthlyPriceCents: 900, maxMembers: 1, maxActiveAgentRuns: 10,
+    storageQuotaBytes: 50 * GB, includedStorageBytes: 50 * GB, storageUsedBytes: 12 * GB, computeCreditMicros: 5e6, includedComputeCreditMicros: 5e6, compute: compute(1.1e6, 5e6) },
+  { managed: true, providerConfigured: true, plan: 'individual', billedPlan: 'individual', status: 'active', catalog, canManage: true, ...packs,
+    cancelAtPeriodEnd: true, currentPeriodEnd: Date.UTC(2026, 11, 2) }],
 };
 const managedCompute = { providers: [
   { provider: 'hetzner', enabled: true, status: 'ready', config: { maxRunning: 8, region: 'fsn1' }, running: 3, organizations: 4, costMicros: 6.1e6, chargedMicros: 12.2e6, seconds: 512 * 3600 },
@@ -83,7 +107,7 @@ const managedCompute = { providers: [
     const policyLinks = () => '<a href="#">Terms</a> and <a href="#">Billing terms</a>';
     ${constant('COMPUTER_PROVIDERS')}
     const PLAN_ACTIVE = ['active', 'trialing', 'past_due'];
-    ${['formatBytes', 'policyTip', 'policyAcceptanceMarkup', 'planMoney', 'planDollars', 'planMeter', 'planStepper', 'checkoutTermsTip', 'planBillingMarkup', 'managedComputeMarkup'].map(fn).join('\n')}` });
+    ${['formatBytes', 'policyTip', 'policyAcceptanceMarkup', 'planMoney', 'planDollars', 'planMeter', 'planPackName', 'planStepper', 'checkoutTermsTip', 'planBillingMarkup', 'managedRunning', 'managedComputeMarkup'].map(fn).join('\n')}` });
   for (const [name, [e, state]] of Object.entries(screens)) {
     await page.evaluate(([e, state]) => { document.querySelector('#shot').innerHTML = planBillingMarkup(e, state); document.querySelector('.plan-operator')?.setAttribute('open', ''); }, [e, state]);
     await page.locator('.main-inner').screenshot({ path: path.join(out, `${name}.png`) });

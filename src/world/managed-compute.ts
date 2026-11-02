@@ -139,7 +139,7 @@ function exhausted(credit: ComputeCredit, provider: string): ComputeCreditExhaus
     ? `this month's ${dollars(credit.creditMicros! + credit.topUpMicros)} of compute is used up or held by work running now`
     : `this month's ${dollars(credit.creditMicros! + credit.topUpMicros)} of compute is used up`;
   return new ComputeCreditExhausted(`Out of compute: ${spent}. `
-    + `Add a compute pack or turn on auto top-up in Plan & billing, or ${own}. It renews on ${renews}.`);
+    + `Add a $10 pack or turn on auto top-up in Plan & billing, or ${own}. It renews on ${renews}.`);
 }
 
 /** Why managed work on `provider` cannot go on: the credit as it stands. */

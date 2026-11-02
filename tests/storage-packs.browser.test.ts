@@ -70,8 +70,8 @@ it('adds and removes storage and compute packs in Plan & billing, showing only v
       headers: { origin: server.url, 'x-forwarded-for': '192.0.2.181' }, data: { email: user.email, password: 'long-fixture-password' },
     })).status()).toBe(200);
     await page.goto(`${server.url}/${org.slug}/settings#settings-billing`);
-    const add = page.getByRole('button', { name: 'Add a storage pack' });
-    const remove = page.getByRole('button', { name: 'Remove a storage pack' });
+    const add = page.getByRole('button', { name: 'Add a 100 GB pack' });
+    const remove = page.getByRole('button', { name: 'Remove a 100 GB pack' });
     await add.waitFor({ timeout: 10_000 });
     await page.getByRole('button', { name: 'Close setup guide' }).click();
     expect(await remove.isDisabled()).toBe(true);
@@ -80,26 +80,26 @@ it('adds and removes storage and compute packs in Plan & billing, showing only v
     // Storage and compute, each against its limit; this month's compute at twice E2B's price.
     expect(await plan.locator('[data-limit="storage"]').innerText()).toMatch(/0 B\s+of 100 GB/);
     expect(await plan.locator('[data-limit="compute"]').innerText()).toMatch(/\$3\.00\s+of \$10\.00 this month/);
-    expect(await plan.locator('[data-limit="storage"] .pack-stepper').getAttribute('title')).toBe('Each pack adds 100 GB for $4/month');
+    expect(await plan.locator('[data-limit="storage"] .pack-stepper').getAttribute('title')).toBe('Each 100 GB pack is $4/month');
 
     await add.click();
     await expect.poll(() => provider.calls.filter(call => call.method === 'updateStoragePacks').length).toBe(1);
-    expect(dialogs.at(-1)).toBe('Add 100 GB for $4/month?');
+    expect(dialogs.at(-1)).toBe('Add a 100 GB pack for $4/month?');
     expect(provider.calls.at(-1)?.input).toMatchObject({ subscriptionId: 'sub_browser_packs', storagePacks: 1 });
     // The click alone grants nothing; the signed subscription state does.
     expect((await store.organizationEntitlements(org.id)).storagePacks).toBe(0);
 
-    await page.getByRole('button', { name: 'Add a compute pack' }).click();
+    await page.getByRole('button', { name: 'Add a $10 pack' }).click();
     await expect.poll(() => provider.calls.filter(call => call.method === 'updateComputePacks').length).toBe(1);
-    expect(dialogs.at(-1)).toBe('Add $10.00 of compute a month for $10/month?');
+    expect(dialogs.at(-1)).toBe('Add a $10 compute pack for $10/month?');
     expect(provider.calls.at(-1)?.input).toMatchObject({ subscriptionId: 'sub_browser_packs', computePacks: 1 });
 
     await verified(2, 1);
     await page.reload();
     await plan.locator('.plan-head').getByText('$37/month', { exact: false }).waitFor();
-    expect(await plan.locator('[data-limit="storage"]').innerText()).toMatch(/of 300 GB\s+−\s+2\s+\+\s+packs/);
-    expect(await plan.locator('[data-limit="compute"]').innerText()).toMatch(/\$3\.00\s+of \$20\.00 this month\s+−\s+1\s+\+\s+pack/);
-    expect(await plan.locator('[data-limit="storage"] .info-dot').getAttribute('title')).toContain('100 GB with Team + 200 GB in 2 packs');
+    expect(await plan.locator('[data-limit="storage"]').innerText()).toMatch(/of 300 GB\s+−\s+2\s+\+\s+100 GB packs/);
+    expect(await plan.locator('[data-limit="compute"]').innerText()).toMatch(/\$3\.00\s+of \$20\.00 this month\s+−\s+1\s+\+\s+\$10 pack/);
+    expect(await plan.locator('[data-limit="storage"] .info-dot').getAttribute('title')).toContain('100 GB with Team + 2 × 100 GB packs');
     if (process.env.KARMAX_REVIEW_SCREENSHOT) await page.locator('#settings-billing').screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT });
 
     await remove.click();

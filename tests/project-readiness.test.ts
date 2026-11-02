@@ -17,6 +17,7 @@ import { Vault } from '../src/autonomy/vault.js';
 import { MANAGED_COMPUTE, WorldProviderConnectionService } from '../src/world/connections.js';
 import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 import { credPolicyKey } from '../src/platform/credential-sources.js';
+import { managedStorageLocationId } from '../src/store/storage-locations.js';
 
 const closers: Array<() => Promise<void>> = [];
 afterAll(async () => { for (const close of closers) await close().catch(() => {}); });
@@ -58,7 +59,7 @@ describe('project readiness: can a task here start?', () => {
     expect(await readiness('claude:claude-opus-5-5', 'codex')).toEqual({
       agents: [{ provider: 'claude', model: 'claude-opus-5-5', ready: false }, { provider: 'codex', ready: false }],
       agentLogin: false,
-      compute: { ready: false, local: false, managed: false, own: false },
+      compute: { ready: false, local: false, managed: false, own: false, need: 'computer' },
     });
 
     // An OpenAI key runs Codex, not Claude.
@@ -77,16 +78,36 @@ describe('project readiness: can a task here start?', () => {
   it('says tavya’s computers are out of credit, and takes a gifted pack as compute', async () => {
     const { store, providers, readiness } = await boot(true);
     await providers.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', apiKey: 'e2b_managed' });
-    const spent = (await readiness()).compute;
-    expect(spent).toMatchObject({ ready: false, managed: false, own: false });
-    expect(spent.outOfCredit).toMatch(/^Out of compute: .*paid plan/);
+    const never = (await readiness()).compute;
+    expect(never).toMatchObject({ ready: false, managed: false, own: false, need: 'plan' });
+    expect(never.outOfCredit).toMatch(/^Out of compute: .*paid plan/);
     await store.setComputePackGift('org_personal', 1, 'operator');
     expect((await readiness()).compute).toEqual({ ready: true, local: false, managed: true, own: false });
+    // This month's $10 spent (at twice the provider's $5.50): more credit, not a plan, is what it needs.
+    const now = Date.now(), monthStart = Date.UTC(new Date(now).getUTCFullYear(), new Date(now).getUTCMonth(), 1);
+    await store.recordUsage({ id: 'usage:e2b:spent', organizationId: 'org_personal', provider: 'e2b', kind: 'world.active', quantity: 3600,
+      unit: 'second', costMicros: 5_500_000, startedAt: Math.max(monthStart, now - 3_600_000), endedAt: now, fundingSource: 'managed' });
+    const spent = (await readiness()).compute;
+    expect(spent).toMatchObject({ ready: false, need: 'credit' });
+    expect(spent.outOfCredit).toMatch(/^Out of compute: this month's \$10\.00 of compute is used up/);
+  });
+
+  it('says when managed storage is full, which does not stop a task', async () => {
+    const { store, readiness } = await boot(true);
+    const id = managedStorageLocationId('org_personal');
+    await store.saveStorageLocation({ id, organizationId: 'org_personal', name: 'Managed storage', kind: 'managed', config: {},
+      isDefault: true, status: 'ready', createdAt: Date.now(), updatedAt: Date.now() });
+    expect((await readiness()).storage).toEqual({ full: false, usedBytes: 0, quotaBytes: 5 * 1024 ** 3 });
+    await store.db.prepare(`INSERT INTO resource_snapshot_chunks (organizationId, chunkId, storageLocationId, refs, bytes)
+      VALUES (?, ?, ?, 1, ?)`).run('org_personal', 'chunk-full', id, 6 * 1024 ** 3);
+    expect((await readiness()).storage).toEqual({ full: true, usedBytes: 6 * 1024 ** 3, quotaBytes: 5 * 1024 ** 3 });
   });
 
   it('runs self-hosted tasks on the machine itself', async () => {
     const { readiness } = await boot(false);
-    expect((await readiness()).compute).toEqual({ ready: true, local: true, managed: false, own: false });
+    const local = await readiness();
+    expect(local.compute).toEqual({ ready: true, local: true, managed: false, own: false });
+    expect(local.storage).toBeUndefined();
   });
 
   it('ignores an agent it does not know rather than calling it unready', async () => {

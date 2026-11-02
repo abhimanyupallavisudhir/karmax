@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import crypto from 'node:crypto';
 import type { Browser, Page } from 'playwright';
 import { consoleRequest, hostedGateway, launchChromium, openConsole, signIn, type HostedGateway } from './helpers/browser.js';
-import { WorldProviderConnectionService } from '../src/world/connections.js';
+import { MANAGED_COMPUTE, WorldProviderConnectionService } from '../src/world/connections.js';
 import { PaidLaunchSettingsService } from '../src/launch/settings.js';
 import { PaddleSubscriptionProvider } from '../src/billing/paddle.js';
 import { SubscriptionBillingService } from '../src/billing/subscriptions.js';
@@ -85,6 +85,7 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
   let g: HostedGateway;
   let browser: Browser;
   let subscriptions: SubscriptionBillingService;
+  let providers: WorldProviderConnectionService;
   const paddle = new PaddleStub();
 
   beforeAll(async () => {
@@ -92,6 +93,7 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       const paidLaunchSettings = new PaidLaunchSettingsService(store, broker, LAUNCH_ENV);
       await paidLaunchSettings.configure({ billingProvider: 'paddle', paidLaunch: true, paddle: PADDLE }, url);
       const providerConnections = new WorldProviderConnectionService(store, broker);
+      providers = providerConnections;
       // Verifying an E2B key lists sandboxes on E2B's API; the journey only
       // needs the saved connection.
       providerConnections.test = async (organizationId, provider) =>
@@ -169,6 +171,8 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       const notice = page.locator('#tf-ready');
       await step('the form says there is no computer', () => notice.getByRole('link', { name: 'Connect a computer' }).waitFor());
       expect(await notice.innerText()).toMatch(/^!?\s*Can’t start yet:/);
+      // At the top of the form, seen before anything is written.
+      expect(await page.locator('.tf-main > .tf-ready:first-child').count()).toBe(1);
       expect(await notice.getByRole('link', { name: 'Connect a computer' }).getAttribute('href'))
         .toBe(`/${organization.slug}/settings#settings-computers`);
 
@@ -183,6 +187,37 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await step('nothing is missing', () => expect.poll(async () => await notice.isHidden() ? '' : notice.innerText(), { timeout: 8_000 }).toBe(''));
       expect(errors).toEqual([]);
     } finally { await context.close(); }
+  }, 90_000);
+
+  it('tells a Free organization, before it writes a task, that tavya’s computers come with a plan or its own account', async () => {
+    const { user, organization } = await g.owner({ name: 'Fern Free', email: 'fern@example.test', password: PASSWORD, organization: 'Fern Lab' });
+    // The installation runs E2B computers for organizations; a Free plan has no compute on them.
+    await providers.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', apiKey: 'e2b_managed', config: {} });
+    const { page, errors, step, context } = await openConsole(browser, { ip: '192.0.2.52' });
+    try {
+      await signIn(context, g.url, user.email, PASSWORD);
+      await consoleRequest(context, g.url, 'POST', `/api/organizations/${organization.id}/accounts`,
+        { provider: 'anthropic', account: 'lab', apiKey: 'sk-ant-ready' });
+      const project = await consoleRequest(context, g.url, 'POST', `/api/organizations/${organization.id}/projects`, { name: 'Lab', config: {} });
+      await step('open the project', () => page.goto(`${g.url}/${organization.slug}/${project.slug ?? 'lab'}`));
+      await page.locator('#expand-task').waitFor();
+      await page.locator('#expand-task').click();
+      const notice = page.locator('.tf-main > #tf-ready');
+      await step('the form says what would let it run', () => notice.getByRole('link', { name: 'Choose a plan' }).waitFor());
+      expect((await notice.innerText()).replace(/\s+/g, ' ')).toMatch(/^! Can’t start yet: Choose a plan ·? ?Connect your own computer$/);
+      expect(await notice.getByRole('link', { name: 'Choose a plan' }).getAttribute('href')).toBe(`/${organization.slug}/settings#settings-plan`);
+      expect(await notice.getByRole('link', { name: 'Choose a plan' }).getAttribute('title')).toMatch(/’s computers come with Individual or Team\.$/);
+      expect(await notice.getByRole('link', { name: 'Connect your own computer' }).getAttribute('href')).toBe(`/${organization.slug}/settings#settings-computers`);
+      if (process.env.KARMAX_REVIEW_SCREENSHOT_NOTICE) await page.waitForTimeout(600).then(() => page.screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT_NOTICE }));
+      // Its plan's link opens Plan & billing, with the plans to choose from.
+      await notice.getByRole('link', { name: 'Choose a plan' }).click();
+      await step('Plan & billing opens', () => page.locator('#org-plan .plan-choices').waitFor());
+      expect(await page.locator('.toast.err').count()).toBe(0);
+      expect(errors).toEqual([]);
+    } finally {
+      await context.close();
+      await providers.delete(MANAGED_COMPUTE, 'e2b');
+    }
   }, 90_000);
 
   it('invites a teammate who signs up from the emailed link and joins the organization (CI-38u)', async () => {
@@ -250,6 +285,50 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
     } finally { await context.close(); }
   }, 90_000);
 
+  it('adds seats to a gifted Team: the first at checkout, the next on the same subscription', async () => {
+    const { user: owner, organization } = await g.owner({ name: 'Nisa Gifted', email: 'nisa@example.test', password: PASSWORD, organization: 'Nisa Lab' });
+    await subscriptions.gift(organization.id, 'team', 'user:operator', 'journey-gift-seats');
+    const { page, errors, step, context } = await openConsole(browser, { ip: '192.0.2.43' });
+    await context.route('https://cdn.paddle.com/**', (route) => route.fulfill({ contentType: 'application/javascript', body: `
+      window.Paddle = { Environment: { set() {} }, Checkout: { open() {} },
+        Initialize(options) { setTimeout(() => options.eventCallback({ name: 'checkout.completed' }), 50); } };` }));
+    try {
+      await signIn(context, g.url, owner.email, PASSWORD);
+      await step('open Plan & billing', () => page.goto(`${g.url}/${organization.slug}/settings#settings-plan`));
+      const plan = page.locator('#org-plan');
+      const people = plan.locator('[data-limit="people"]');
+      await step('the gifted seat is taken', () => people.getByText('1 of 1 seat').waitFor());
+      // Nobody can join until there is a free seat.
+      await expect(consoleRequest(context, g.url, 'POST', `/api/organizations/${organization.id}/invitations`,
+        { email: 'early@example.test' })).rejects.toThrow(/HTTP 409 .*All 1 seat is taken/);
+      await people.getByRole('button', { name: 'Add a seat' }).click();
+      const dialog = page.getByRole('dialog', { name: 'Add a seat' });
+      await step('the checkout dialog opens', () => dialog.waitFor());
+      expect(await dialog.innerText()).toContain('One more person on Team for $5/month');
+      await dialog.locator('#checkout-policy-acceptance').check();
+      await dialog.getByRole('button', { name: 'Checkout' }).click();
+      await step('Paddle checkout returns to settings', () => page.waitForURL(/billing=success/));
+      const transaction = [...paddle.transactions.values()].at(-1);
+      expect(transaction.items).toEqual([{ price: { id: PADDLE.teamSeatPriceId }, quantity: 1 }]);
+
+      const notification = paddle.subscriptionCreated(transaction.id, 'sub_gifted_seats');
+      expect((await fetch(`${g.url}/api/subscriptions/paddle/webhook`, { method: 'POST', body: notification.raw,
+        headers: { 'paddle-signature': notification.signature } })).status).toBe(200);
+      await page.reload();
+      await step('the seat is billed beside the gift', () => people.getByText('1 of 2 seats').waitFor());
+      expect(await plan.locator('.plan-head').innerText()).toMatch(/Team\s+Gifted\s+Seats \$5\/month · renews/);
+      if (process.env.KARMAX_REVIEW_SCREENSHOT_SEATS) await page.locator('#settings-billing').screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT_SEATS });
+      // Now someone can be invited into the free seat.
+      await consoleRequest(context, g.url, 'POST', `/api/organizations/${organization.id}/invitations`, { email: 'second@example.test' });
+
+      const patches = paddle.patches.length;
+      await people.getByRole('button', { name: 'Add a seat' }).click();
+      await step('the subscription is changed', () => expect.poll(() => paddle.patches.length).toBe(patches + 1));
+      expect(paddle.patches.at(-1)).toEqual({ items: [{ price_id: PADDLE.teamSeatPriceId, quantity: 2 }], proration_billing_mode: 'prorated_next_billing_period' });
+      expect(errors).toEqual([]);
+    } finally { await context.close(); }
+  }, 90_000);
+
   it('buys storage packs beside a gifted plan: checkout first, then the same subscription', async () => {
     const { user: owner, organization } = await g.owner({ name: 'Gita Gifted', email: 'gita@example.test', password: PASSWORD, organization: 'Gita Studio' });
     await subscriptions.gift(organization.id, 'team', 'user:operator', 'journey-gift-team');
@@ -263,11 +342,11 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       const plan = page.locator('#org-plan');
       await plan.locator('.plan-head').getByText('Gifted').waitFor();
       // Nothing to remove yet; the first pack is bought at checkout, with the policies accepted.
-      expect(await plan.getByRole('button', { name: 'Remove a storage pack' }).isDisabled()).toBe(true);
-      await plan.getByRole('button', { name: 'Add a storage pack' }).click();
-      const dialog = page.getByRole('dialog', { name: 'Add a storage pack' });
+      expect(await plan.getByRole('button', { name: 'Remove a 100 GB pack' }).isDisabled()).toBe(true);
+      await plan.getByRole('button', { name: 'Add a 100 GB pack' }).click();
+      const dialog = page.getByRole('dialog', { name: 'Add a 100 GB pack' });
       await step('the checkout dialog opens', () => dialog.waitFor());
-      expect(await dialog.innerText()).toContain('100 GB for $4/month');
+      expect(await dialog.innerText()).toContain('100 GB of storage for $4/month');
       if (process.env.KARMAX_REVIEW_SCREENSHOT_DIALOG) await page.screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT_DIALOG });
       await dialog.getByRole('button', { name: 'Checkout' }).click();
       await step('checkout needs the policies', () => page.getByText('Accept the current policies to continue.').waitFor());
@@ -286,14 +365,14 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await page.reload();
       await step('the pack is billed beside the gift', () => plan.locator('.plan-head').getByText('Packs $4/month', { exact: false }).waitFor());
       expect(await plan.locator('.plan-head').innerText()).toMatch(/Team\s+Gifted\s+Packs \$4\/month · renews/);
-      expect(await plan.locator('[data-limit="storage"]').innerText()).toMatch(/of 200 GB\s+−\s+1\s+\+\s+pack/);
+      expect(await plan.locator('[data-limit="storage"]').innerText()).toMatch(/of 200 GB\s+−\s+1\s+\+\s+100 GB pack/);
       if (process.env.KARMAX_REVIEW_SCREENSHOT) await page.locator('#settings-billing').screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT });
 
       // The next pack changes that subscription: no second checkout.
-      const checkouts = paddle.transactions.size;
-      await plan.getByRole('button', { name: 'Add a storage pack' }).click();
-      await step('the subscription is changed', () => expect.poll(() => paddle.patches.length).toBe(1));
-      expect(paddle.patches[0]).toEqual({ items: [{ price_id: PADDLE.storagePackPriceId, quantity: 2 }], proration_billing_mode: 'prorated_next_billing_period' });
+      const checkouts = paddle.transactions.size, patches = paddle.patches.length;
+      await plan.getByRole('button', { name: 'Add a 100 GB pack' }).click();
+      await step('the subscription is changed', () => expect.poll(() => paddle.patches.length).toBe(patches + 1));
+      expect(paddle.patches.at(-1)).toEqual({ items: [{ price_id: PADDLE.storagePackPriceId, quantity: 2 }], proration_billing_mode: 'prorated_next_billing_period' });
       expect(paddle.transactions.size).toBe(checkouts);
       expect(errors).toEqual([]);
     } finally { await context.close(); }

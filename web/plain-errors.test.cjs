@@ -18,7 +18,7 @@ function extract(name, kind = 'function') {
 global.esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 eval(`${extract('CAPABILITY_ACTIONS', 'const')}; global.CAPABILITY_ACTIONS = CAPABILITY_ACTIONS;`);
 global.globalRoute = () => '/org/settings';
-for (const fn of ['permissionSentence', 'plainError', 'plainTaskError', 'toolsDidNotStart', 'setupFix', 'setupFixHtml', 'taskErrorHtml']) eval(`global.${fn} = ${extract(fn)}`);
+for (const fn of ['permissionSentence', 'plainError', 'plainTaskError', 'toolsDidNotStart', 'storageFull', 'setupFixes', 'setupFix', 'setupFixHtml', 'taskErrorHtml']) eval(`global.${fn} = ${extract(fn)}`);
 
 let passed = 0;
 const eq = (actual, expected, label) => { assert.strictEqual(actual, expected, label); passed++; };

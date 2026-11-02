@@ -17,6 +17,7 @@ import { managedModelRailAvailable } from '../agent/managed-models.js';
 import { enumerateCredentials, resolveCredentials, type Credential } from './credentials.js';
 import { gatherCredentialSources, readPolicyLayers } from './credential-sources.js';
 import { ComputeRouter, type RouterConnections } from '../world/compute-router.js';
+import { computeCredit } from '../world/managed-compute.js';
 
 export interface ReadinessDeps {
   store: Store;
@@ -42,7 +43,14 @@ export interface Readiness {
     own: boolean;
     /** Why tavya's computers can't take a task, when that is all there is. */
     outOfCredit?: string;
+    /** What would let a task start, when nothing can: a paid plan (tavya's
+     * computers, never bought), more credit (this month's is spent), or a
+     * computer at all (no managed compute here, and none of its own). */
+    need?: 'plan' | 'credit' | 'computer';
   };
+  /** Managed storage over its quota (hosted): a task still starts, but new
+   * project data it saves is refused. */
+  storage?: { full: boolean; usedBytes: number; quotaBytes: number };
 }
 
 /** The organization's enabled agent credentials, in policy order: the
@@ -68,16 +76,32 @@ export async function projectReadiness(deps: ReadinessDeps,
         || managedModelRailAvailable(deps.hosted, policy!, agent) })),
     agentLogin: credentials.length > 0,
     compute: await computeReadiness(deps, scope.organizationId),
+    ...(await storageReadiness(deps, scope.organizationId)),
   };
+}
+
+async function storageReadiness(deps: ReadinessDeps, organizationId: string): Promise<Pick<Readiness, 'storage'>> {
+  if (!deps.hosted) return {};
+  const location = (await deps.store.listStorageLocations(organizationId)).find((candidate) => candidate.kind === 'managed');
+  if (!location) return {};
+  const quotaBytes = await deps.store.storageLocationQuotaBytes(location);
+  if (quotaBytes == null) return {};
+  const { retainedBytes } = await deps.store.storageLocationUsage(location.id);
+  return { storage: { full: retainedBytes >= quotaBytes, usedBytes: retainedBytes, quotaBytes } };
 }
 
 async function computeReadiness(deps: ReadinessDeps, organizationId: string): Promise<Readiness['compute']> {
   // A self-hosted installation runs tasks on its own machine.
   if (!deps.hosted) return { ready: true, local: true, managed: false, own: false };
-  if (!deps.providerConnections) return { ready: false, local: false, managed: false, own: false };
+  if (!deps.providerConnections) return { ready: false, local: false, managed: false, own: false, need: 'computer' };
   const options = await new ComputeRouter(deps.store, deps.providerConnections).options(organizationId);
   const managed = options.some((option) => option.funding === 'managed' && !option.outOfCredit);
   const own = options.some((option) => option.funding === 'own');
   const outOfCredit = !managed && !own ? options.find((option) => option.outOfCredit)?.outOfCredit : undefined;
-  return { ready: managed || own, local: false, managed, own, ...(outOfCredit ? { outOfCredit } : {}) };
+  if (managed || own) return { ready: true, local: false, managed, own };
+  if (!outOfCredit) return { ready: false, local: false, managed, own, need: 'computer' };
+  // Spent, or never had any: no plan's credit, top-up or pack at all.
+  const credit = await computeCredit(deps.store, organizationId);
+  const never = !credit.creditMicros && !credit.topUpMicros;
+  return { ready: false, local: false, managed, own, outOfCredit, need: never ? 'plan' : 'credit' };
 }

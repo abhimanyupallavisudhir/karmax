@@ -424,6 +424,23 @@ describe('Paddle provider operations', () => {
     expect(api.requests.at(-1)).toMatchObject({ method: 'POST', body: { effective_from: 'next_billing_period' } });
   });
 
+  it('keeps a subscription whose end is scheduled, in a write of its own, and settles it by reading', async () => {
+    const ending = paddleApi({ 'GET /subscriptions/sub_1': { id: 'sub_1', status: 'active', scheduled_change: { action: 'cancel' } },
+      'PATCH /subscriptions/sub_1': { id: 'sub_1', status: 'active', scheduled_change: null } });
+    expect(await ending.provider().resumeSubscription({ subscriptionId: 'sub_1', idempotencyKey: 'k' })).toEqual({ id: 'sub_1' });
+    expect(ending.requests.at(-1)).toMatchObject({ method: 'PATCH', body: { scheduled_change: null } });
+    // Not ending: nothing to write. Already over: subscribe again instead.
+    const going = paddleApi({ 'GET /subscriptions/sub_1': { id: 'sub_1', status: 'active', scheduled_change: null } });
+    await going.provider().resumeSubscription({ subscriptionId: 'sub_1', idempotencyKey: 'k' });
+    expect(going.requests).toHaveLength(1);
+    const over = paddleApi({ 'GET /subscriptions/sub_1': { id: 'sub_1', status: 'canceled', scheduled_change: null } });
+    await expect(over.provider().resumeSubscription({ subscriptionId: 'sub_1', idempotencyKey: 'k' })).rejects.toThrow(BillingRequestRejected);
+    const intent = { kind: 'resume' as const, subscriptionId: 'sub_1' };
+    expect(await going.provider().reconcileRequest(intent, 'ref', Date.now())).toEqual({ id: 'sub_1' });
+    expect(await paddleApi({ 'GET /subscriptions/sub_1': { id: 'sub_1', status: 'active', scheduled_change: { action: 'cancel' } } })
+      .provider().reconcileRequest(intent, 'ref', Date.now())).toEqual({ absent: true });
+  });
+
   it('changes seats only on a plain Team subscription', async () => {
     const seats = (items: unknown, count = 5) => {
       const api = paddleApi({ 'GET /subscriptions/sub_1': { id: 'sub_1', items }, 'PATCH /subscriptions/sub_1': { id: 'sub_1' } });
