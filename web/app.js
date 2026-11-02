@@ -13320,20 +13320,29 @@ function conversationEntries(t) {
   // agent/system messages instead: carry the last real timestamp forward so such a
   // message sorts right after the one it answers, not at the top of the timeline.
   let carriedTs = 0;
+  // The provider item a transcript reply stands for is the turn's final answer
+  // (what the agent said when its turn ended), not narration on the way.
+  const answer = (entry) => { if (entry) entry.answer = true; return false; };
   const messages = (t.messages || [])
     .filter((message) => {
       if (message.role !== 'agent') return true;
       const source = message.sourceActivity;
       if (source) {
-        if (providerActivityRefs.has(`${source.turnId}/${source.id}/${source.attempt}`)) return false;
+        const ref = `${source.turnId}/${source.id}/${source.attempt}`;
+        if (providerActivityRefs.has(ref)) return answer(activities.get(ref));
         // A provider may replace the final item id while completing a streamed
         // message. Keep the identity check primary, then fall back only inside
         // that same turn/attempt so a genuinely repeated reply in another turn
         // remains visible.
-        return !providerGroupTexts.has(`${source.turnId}/${source.attempt}/${conversationTextKey(message.text)}`);
+        const group = `${source.turnId}/${source.attempt}/${conversationTextKey(message.text)}`;
+        return !providerGroupTexts.has(group) || answer(lastProviderMessage.get(group));
       }
       // Replay/back-compat for messages recorded before sourceActivity existed.
-      return !providerTexts.has(conversationTextKey(message.text));
+      if (!providerTexts.has(conversationTextKey(message.text))) return true;
+      for (const entry of visibleActivities) {
+        if (entry.activity.kind === 'message' && conversationTextKey(entry.activity.title) === conversationTextKey(message.text)) answer(entry);
+      }
+      return false;
     })
     .map((message, index) => {
       const real = Number(message.ts) > 100000000000;
@@ -13445,20 +13454,23 @@ function returnsWork(m) {
   return !!m.returnsWork || /^(review-ci|cv|pr-conflict|pr-refused|merge-revise|landing-retry|integration|integration-wait|ir|restore-refused|resource-merge|resource-integrate)-?\d+$/.test(m.id || '');
 }
 
-// The conversation as people read it: what they said and the agent's answers
-// to them (its last message before the work came back to it — a failed check,
-// a conflict, a reviewer's revision — or the message they replied to, or one
-// addressed to a person) stay in view. Everything between — tool steps,
-// progress notes, tavya's prompts and the agent's replies to those — folds
-// into one line. `live`: the agent is working, so the latest work is not yet
-// answered and stays open; `asking`: the task waits on a person's answer to
-// its latest message.
+// The conversation as people read it: what they said and what the agent said
+// to them stays in view — every turn's final answer (the harnesses mark it: the
+// message a turn ends with, as against the narration between its tool calls),
+// the message a person replied to, and one addressed to a person. Once tavya
+// hands the work back on its own (a failed check, a conflict, a reviewer's
+// revision), only the last answer of that stretch stays. Everything else —
+// tool steps, narration, tavya's prompts and the agent's replies to the
+// handed-back work — folds into one line. The agent's answer to a person's
+// message (`reply`) is its last before the work came back to it. `live`: the
+// agent is working, so the latest work is not yet answered and stays open;
+// `asking`: the task waits on a person's answer to its latest message.
 function conversationOutline(entries, options) {
   const live = !!options?.live, asking = !!options?.asking;
   const kinds = entries.map((entry) => {
     if (entry.type === 'input-request') return 'spine';
     if (entry.type === 'explanation') return 'note';
-    if (entry.type === 'activity') return entry.activity?.kind === 'message' ? 'said' : 'work';
+    if (entry.type === 'activity') return entry.activity?.kind !== 'message' ? 'work' : entry.answer ? 'answer' : 'said';
     const m = entry.message || {};
     const origin = messageOrigin(m);
     if (origin === 'person') return 'person';
@@ -13467,17 +13479,19 @@ function conversationOutline(entries, options) {
     // bring finished work back start a new round; the rest are the same work.
     if (m.role === 'system') return 'spine';
     if (origin === 'platform') return returnsWork(m) ? 'prompt' : 'work';
-    return (m.to || []).some((selector) => !selector.startsWith('agent:')) ? 'spine' : 'said';
+    return (m.to || []).some((selector) => !selector.startsWith('agent:')) ? 'spine' : 'answer';
   });
   const spine = kinds.map((kind) => kind === 'person' || kind === 'spine');
   const reply = new Set();
   const keep = (i) => { if (i >= 0) spine[i] = true; };
-  const lastSaid = (from, to) => { for (let i = to - 1; i >= from; i--) if (kinds[i] === 'said') return i; return -1; };
+  const said = (kind) => kind === 'said' || kind === 'answer';
+  const lastSaid = (from, to) => { for (let i = to - 1; i >= from; i--) if (said(kinds[i])) return i; return -1; };
   const starts = [0, ...kinds.flatMap((kind, i) => kind === 'person' && i > 0 ? [i] : [])];
   starts.forEach((start, r) => {
     const end = starts[r + 1] ?? entries.length;
     let prompt = kinds[start] === 'person' ? start + 1 : start;
     while (prompt < end && kinds[prompt] !== 'prompt') prompt++;
+    for (let i = start; i < prompt; i++) if (kinds[i] === 'answer') keep(i);
     // The person's message is answered by the last thing the agent said before
     // the work first came back to it — unless it is still working on that answer.
     if (!(live && prompt === end && end === entries.length)) reply.add(lastSaid(start, prompt));
@@ -13498,7 +13512,7 @@ function conversationOutline(entries, options) {
     const tavyas = run[0].type === 'message' && run[0].message?.role === 'user';
     if (run.length === 1 && !tavyas) items.push({ entry: run[0] });
     else {
-      const latest = run.findLast((entry, k) => kinds[i + k] === 'said');
+      const latest = run.findLast((entry, k) => said(kinds[i + k]));
       items.push({ fold: true, entries: run, key: `fold:${run[0].sourceKey || run[0].activityRef || i}`,
         automatic: run.filter((entry, k) => kinds[i + k] === 'prompt').length,
         latest: latest || run.find((entry, k) => kinds[i + k] === 'prompt'),
