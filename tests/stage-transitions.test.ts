@@ -311,6 +311,17 @@ describe('task stage transitions', () => {
     ]);
   });
 
+  it('marks a notice that wakes an agent whose work waits in Review as returning work', async () => {
+    const f = (await fixture());
+    f.signalled.length = 0;
+    await f.api.resumeAfterCredentialDecision(f.task.id, 'Access granted');
+    (await f.store.saveView(f.task.id, { ...f.view, stage: 'review', status: 'waiting', updatedAt: 2 }));
+    await f.api.resumeAfterCredentialDecision(f.task.id, 'Access granted');
+    const [working, reviewed] = f.signalled.map((s) => s.args[0] as any);
+    expect(working.returnsWork).toBeUndefined();
+    expect(reviewed).toMatchObject({ id: expect.stringMatching(/^n/), returnsWork: true });
+  });
+
   it('preserves parameter edits accepted while a replacement start is awaiting acknowledgement', async () => {
     const f = (await fixture());
     vi.spyOn(f.client.workflow, 'start').mockImplementation(async () => {
