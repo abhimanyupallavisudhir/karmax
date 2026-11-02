@@ -131,6 +131,20 @@ ok(keys(outline) === 'm0 1 a2 u3 [4 n05f0e0d0-1111-2222-3333-444455556666 a6 7 s
 ok(outline[4].automatic === 0, 'news from its own sub-task and a job is its own work, not an automatic follow-up');
 ok(outline[5].reply === true, 'the report answers the person');
 
+// Task #796 (production, 2026-11-01): a credential the agent had said to
+// ignore was approved after it opened its PR. The notice woke it in Review and
+// it confirmed one detail: that is the finished work coming back to it, so its
+// report stays the answer and the confirmation folds as a follow-up.
+outline = conversationOutline([
+  msg('m0', 'user', 'Fix the lists'), act(1), msg('a2', 'agent', 'Both are fixed; the PR is open.'),
+  msg('n3f0e0d0c-1111-2222-3333-444455556666', 'user', '[tavya credential decision] approved', { returnsWork: true }), act(4),
+  msg('a5', 'agent', 'The replacement query works on real GitHub.'),
+]);
+ok(keys(outline) === 'm0 1 a2 [n3f0e0d0c-1111-2222-3333-444455556666 4 a5]',
+  `a notice that reopens work in Review starts a new round: ${keys(outline)}`);
+ok(outline[2].reply === true, 'the report answers the person');
+ok(outline[3].automatic === 1 && outline[3].latest.sourceKey === 'message:a5', 'the confirmation is an automatic follow-up');
+
 // Decisions recorded before notices were signed (u…) are still tavya's.
 ok(messageOrigin({ id: 'uec4c6ea3-6fad-4e7b-929a-7472ca1dc4ad', role: 'user', text: '[tavya permission decision]\n\nApproved for this task' }) === 'platform',
   'a legacy permission decision is tavya\'s');

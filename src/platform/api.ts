@@ -737,8 +737,10 @@ export class KarmaxApi {
   private async deliverWorkflowMessage(taskId: string, text: string, role = 'do'): Promise<Message> {
     const now = Date.now();
     // `n` (a notice): tavya's own words, never a person's `u` follow-up — the
-    // console tells them apart by it (web/app.js messageOrigin).
-    const message: Message = { id: `n${randomUUID()}`, role: 'user', text, ts: now };
+    // console tells them apart by it (web/app.js messageOrigin). One that wakes
+    // an agent whose work waits in Review brings that work back to it.
+    const review = (await this.deps.store.getTask(taskId))?.lastView?.stage === 'review';
+    const message: Message = { id: `n${randomUUID()}`, role: 'user', text, ts: now, ...(review ? { returnsWork: true } : {}) };
     await (await this.workflowHandle(taskId)).signal(SIG.followUp, message, role);
     (await this.publishConversationMessage(taskId, role, message));
     return message;
