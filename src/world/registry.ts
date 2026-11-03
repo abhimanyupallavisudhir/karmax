@@ -114,7 +114,8 @@ export class WorldRegistry {
     return this.withOperation(handle.id, async () => {
       const current = (await this.resolveHandle?.(handle)) ?? handle;
       try {
-        return await this.get(current.kind).open(current, options);
+        const provider = this.get(current.kind);
+        return await (options ? provider.open(current, options) : provider.open(current));
       } catch (error) {
         // Not waking it means not making it anew either.
         if (this.recoveryDisabled.getStore() || options?.wake === false) throw error;

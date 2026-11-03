@@ -1415,7 +1415,7 @@ export class ProjectResourceService {
     const handle = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
     if (!handle) throw new Error('calling task has no active world');
     (await this.store.assertCurrentWorld(handle));
-    return { task, project, handle, world: await this.worlds.open(handle, open) };
+    return { task, project, handle, world: await (open ? this.worlds.open(handle, open) : this.worlds.open(handle)) };
   }
 
   private async requiredCandidate(taskId: string, candidateId: string): Promise<ResourceCandidate> {
