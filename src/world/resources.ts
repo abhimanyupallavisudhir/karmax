@@ -18,8 +18,8 @@ import type { StorageLocationService } from '../store/storage-locations.js';
 import type { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
 import type { ExecOptions, ExecResult, World, WorldHandle, WorldHttpRequest, WorldHttpResponse,
-  WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec } from './types.js';
-import { isRemoteWorldKind, worldLocationPath, worldRelativePath, worldRepos, worldWorkingDirectory, worldWorkingRelativePath } from './types.js';
+  WorldOpenOptions, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec } from './types.js';
+import { WorldNotRunningError, isRemoteWorldKind, worldLocationPath, worldRelativePath, worldRepos, worldWorkingDirectory, worldWorkingRelativePath } from './types.js';
 import { dotenvSecretName, renderDotenv } from '../domain/dotenv.js';
 import type { WorldRegistry } from './registry.js';
 import { QRY_RESOURCE_PUBLISH, RESOURCE_PUBLISH_COORDINATOR_WORKFLOW, SIG_CANCEL_RESOURCE_PUBLISH,
@@ -373,10 +373,7 @@ export class WorkspaceConflict extends Error {
   }
 }
 
-/** The world is parked or hibernated, and the caller asked not to wake it. */
-export class WorldNotRunningError extends Error {
-  constructor() { super("the task's computer is not running"); this.name = 'WorldNotRunningError'; }
-}
+export { WorldNotRunningError };
 
 export class ProjectResourceService {
   private publishLocks = new Map<string, Promise<void>>();
@@ -1377,7 +1374,10 @@ export class ProjectResourceService {
       if (current && this.worlds.get(current.kind).capabilities?.remote && (await this.store.worldState(current.id)) !== 'ready')
         throw new WorldNotRunningError();
     }
-    const { handle, world } = await this.currentTaskWorld(taskId);
+    // The store says `ready` until a park in flight records it, so the provider
+    // is asked too: it refuses to start a machine it finds stopped (production,
+    // 2026-11-03: the page's refresh as a turn ended woke two Hetzner worlds).
+    const { handle, world } = await this.currentTaskWorld(taskId, options.wake === false ? { wake: false } : undefined);
     const excluded = [
       ...Object.values((handle.meta?.resourceProjections ?? {}) as Record<string, { target?: string }>)
         .map((projection) => projection.target).filter((value): value is string => Boolean(value)),
@@ -1407,7 +1407,7 @@ export class ProjectResourceService {
     return { entries: found, truncated };
   }
 
-  private async currentTaskWorld(taskId: string) {
+  private async currentTaskWorld(taskId: string, open?: WorldOpenOptions) {
     const task = (await this.store.getTask(taskId));
     if (!task) throw new Error('calling task not found');
     const project = (await this.store.getProject(task.projectId));
@@ -1415,7 +1415,7 @@ export class ProjectResourceService {
     const handle = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
     if (!handle) throw new Error('calling task has no active world');
     (await this.store.assertCurrentWorld(handle));
-    return { task, project, handle, world: await this.worlds.open(handle) };
+    return { task, project, handle, world: await (open ? this.worlds.open(handle, open) : this.worlds.open(handle)) };
   }
 
   private async requiredCandidate(taskId: string, candidateId: string): Promise<ResourceCandidate> {

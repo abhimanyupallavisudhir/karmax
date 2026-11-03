@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,7 +8,8 @@ import { VmWorldProvider } from '../src/world/vm/provider.js';
 import { diskHours, runSlices } from '../src/world/vm/runs.js';
 import { vmProvisionVersion } from '../src/world/vm/provision.js';
 import type { ResolvedWorldProviderConnection } from '../src/world/connections.js';
-import type { WorldHandle } from '../src/world/types.js';
+import { WorldNotRunningError, type WorldHandle } from '../src/world/types.js';
+import { WorldRegistry } from '../src/world/registry.js';
 import { FakeAws } from './helpers/fake-aws.js';
 import { sshdAvailable } from './helpers/local-sshd.js';
 
@@ -199,6 +200,26 @@ describe.skipIf(!sshdAvailable)('AWS worlds (fake EC2, real sshd)', () => {
     expect(await restarted.status(parked.handle as WorldHandle)).toBe('parked');
     expect(await restarted.status(running.handle as WorldHandle)).toBe('ready');
     expect(instance).toMatchObject({ state: 'stopped', launches: 1 });
+  });
+
+  it('does not start a parked world for a caller that asked not to wake it, nor make it anew', async () => {
+    // Production, 2026-11-03: the task page's ignored-files list, refreshed as
+    // a turn ended, reached a world the provider had just stopped while the
+    // store still said ready, and started it again (a new Hetzner server).
+    const world = await provider.create({ taskId: 'task_nowake', base: 'main', generation: 1, organizationId: 'org_a' });
+    await provider.park(world.handle as WorldHandle);
+    const instance = [...aws.instances.values()].find((value) => value.tags.karmaxTaskId === 'task_nowake')!;
+    await waitFor(() => instance.state === 'stopped');
+    await expect(provider.open(world.handle as WorldHandle, { wake: false })).rejects.toBeInstanceOf(WorldNotRunningError);
+    const recover = vi.fn(async () => world.handle as WorldHandle);
+    const registry = new WorldRegistry();
+    registry.register(provider);
+    registry.setRecoveryHandler(recover);
+    await expect(registry.open(world.handle as WorldHandle, { wake: false })).rejects.toBeInstanceOf(WorldNotRunningError);
+    expect(recover).not.toHaveBeenCalled();
+    expect(instance).toMatchObject({ state: 'stopped', launches: 1 });
+    expect((await provider.open(world.handle as WorldHandle)).handle.id).toBe('task_nowake');
+    expect(instance.state).toBe('running');
   });
 
   it('stops a parked world another process woke, though this one remembers parking it', async () => {
