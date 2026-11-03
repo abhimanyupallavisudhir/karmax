@@ -326,6 +326,19 @@ describe('platform MCP server (capability-checked tool calls)', () => {
       worldProvider: 'e2b', resources: { cpu: 4, memoryMb: 8192 }, network: { unrestricted: true },
       hibernateAfterMs: 2 * 86_400_000,
     });
+    // Only a current world on the organization's own account holds the connection.
+    const project = await store.createProject('Worlds', {}, organization.id);
+    const world = async (meta: Record<string, unknown> = {}) => store.registerWorld({ id: (await store.createTask({ projectId: project.id,
+      title: 'w', workflow: 'software-dev', workflowVersion: '1.26.0', params: { prompt: 'w' } })).id, kind: 'e2b', root: '/workspace',
+      branch: 'task', base: 'main', meta } as any, project.id);
+    const replaced = await world();
+    await store.setWorldState(await store.registerWorld({ ...replaced, generation: undefined }, project.id), 'released');
+    await world({ funding: 'managed' });
+    const own = await world();
+    const refused: any = await client.callTool({ name: 'disconnect_world_provider', arguments: { organizationId: organization.id, provider: 'e2b' } });
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0].text).toContain('1 task world(s) still use e2b');
+    await store.setWorldState(own, 'hibernated');
     const removed: any = await client.callTool({ name: 'disconnect_world_provider', arguments: { organizationId: organization.id, provider: 'e2b' } });
     expect(JSON.parse(removed.content[0].text)).toEqual({ deleted: true });
   });
