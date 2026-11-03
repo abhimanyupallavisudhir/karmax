@@ -6,7 +6,8 @@ import { connectionScope, fundingRef, type ResolvedWorldProviderConnection } fro
 import type { MachineShape } from '../../domain/computer.js';
 import { providerFeatures } from '../../domain/computer-limits.js';
 import type { ProviderSandboxRef, ProviderUsagePage, ProviderUsageEvent, World, WorldDiagnosis, WorldHandle,
-  WorldLifecycleState, WorldProvider, WorldSpec } from '../types.js';
+  WorldLifecycleState, WorldOpenOptions, WorldProvider, WorldSpec } from '../types.js';
+import { WorldNotRunningError } from '../types.js';
 import { serviceHomeLabel } from '../services.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow, provisionTimeoutMs, type ProvisionTarget } from '../provision-git.js';
 import { taskBranch } from '../../domain/brand.js';
@@ -197,13 +198,14 @@ export class VmWorldProvider implements WorldProvider {
     }
   }
 
-  async open(handle: WorldHandle): Promise<World> {
+  async open(handle: WorldHandle, options?: WorldOpenOptions): Promise<World> {
     const sealed = this.reference(handle);
     const connection = await this.connection(connectionScope(sealed));
     let transport = this.transports.get(handle.id);
     if (!transport || this.states.get(handle.id) === 'parked') {
       const state = await this.driver.state(connection, sealed);
       if (state === 'missing') throw Object.assign(new Error(`the ${this.driver.name} machine of this world no longer exists`), { status: 404 });
+      if (state !== 'ready' && options?.wake === false) throw new WorldNotRunningError();
       transport = this.transportFor(handle.id, connection, sealed);
       if (state !== 'ready') {
         const shape = await this.shapeOf(handle, connection);

@@ -657,7 +657,12 @@ describe('project resources', () => {
     expect(open).not.toHaveBeenCalled();
     open.mockRestore();
     await store.setWorldState(world.handle as any, 'ready');
+    // The store says ready until a park in flight records it (production,
+    // 2026-11-03), so the provider is told not to wake the world either.
+    const asked = vi.spyOn(worlds, 'open');
     expect((await resources.ignoredInventory(task.id, 100, undefined, { wake: false })).entries.length).toBeGreaterThan(0);
+    expect(asked).toHaveBeenCalledWith(expect.anything(), { wake: false });
+    asked.mockRestore();
 
     await resources.discardCandidate(task.id, staged.candidate.id, 'user:reviewer');
     expect((await store.getResourceCandidate(staged.candidate.id))).toMatchObject({ state: 'discarded' });
