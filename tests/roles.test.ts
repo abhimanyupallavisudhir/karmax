@@ -312,6 +312,12 @@ describe('prompt preamble (SPEC §5.4)', () => {
     expect(GLOBAL_INSTRUCTIONS).toContain('at most 280 characters');
     expect(GLOBAL_INSTRUCTIONS).toContain('Source code is not a human-readable output');
     expect(GLOBAL_INSTRUCTIONS).toMatch(/summaries of changes\/answers in your final response/i);
+    // Reviewers often judge the work from the review info alone, and open targets
+    // are snapshotted when attached, so agents must re-attach after later edits.
+    expect(GLOBAL_INSTRUCTIONS).toContain('Reviewers often judge the work from the review info alone');
+    expect(GLOBAL_INSTRUCTIONS).toMatch(/call create_review_info again/);
+    for (const tool of [...PLATFORM_TOOL_SCHEMAS, ...TOOL_SCHEMAS].filter((t) => t.name === 'create_review_info'))
+      expect(tool.description).toMatch(/snapshot.*call (it )?again/is);
   });
 
   it('steers agents to MCP connections and the wiki in global instructions', () => {

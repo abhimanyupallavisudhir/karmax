@@ -135,10 +135,29 @@ describe('create_review_info validation', () => {
       expect(reviewInfo).toBeUndefined();
     }
     // Actions accumulate across calls; the cap applies to the total.
-    const many = Array.from({ length: 12 }, (_, i) => ({ kind: 'open', label: `Open ${i}`, target: `f${i}.pdf` }));
-    const { results, reviewInfo, published } = await attempt({ actions: many }, { actions: many });
+    const many = (prefix: string) => Array.from({ length: 12 }, (_, i) => ({ kind: 'open', label: `Open ${i}`, target: `${prefix}${i}.pdf` }));
+    const { results, reviewInfo, published } = await attempt({ actions: many('a') }, { actions: many('b') });
     expect(results).toEqual(['review info recorded', expect.stringMatching(/^review info rejected: .*actions/)]);
     expect(reviewInfo?.actions).toHaveLength(12);
     expect(published).toHaveLength(1);
+  });
+
+  // Agents are told to re-attach review info after changing what it shows, since
+  // open targets are snapshotted when attached: re-attaching must update the
+  // buttons in place, not pile up duplicates until the action cap rejects it.
+  it('replaces a re-attached action instead of duplicating it', async () => {
+    const first = [{ kind: 'open', label: 'Report', target: 'out/report.html' },
+      { kind: 'run', label: 'Start app', command: 'npm start', server: true }];
+    const second = [{ kind: 'open', label: 'Updated report', target: 'out/report.html' },
+      { kind: 'run', label: 'Start app', command: 'npm run dev', server: true },
+      { kind: 'open', label: 'Screenshot', target: 'out/shot.png' }];
+    const { results, reviewInfo } = await attempt({ actions: first }, { actions: second },
+      ...Array.from({ length: 20 }, () => ({ actions: second })));
+    expect(results.every((r) => r === 'review info recorded')).toBe(true);
+    expect(reviewInfo?.actions).toEqual([
+      { kind: 'open', label: 'Updated report', target: 'out/report.html' },
+      { kind: 'run', label: 'Start app', command: 'npm run dev', server: true },
+      { kind: 'open', label: 'Screenshot', target: 'out/shot.png' },
+    ]);
   });
 });
