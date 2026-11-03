@@ -93,6 +93,19 @@ export function validateReviewInfoCall(info: ReviewInfo): ReviewInfo {
   return out;
 }
 
+/** Agents re-attach review info after changing what it shows, so an action
+ * naming the same `open` target or `run` label replaces the earlier one in
+ * place; anything else appends. */
+export function mergeReviewActions(existing: ReviewAction[], added: ReviewAction[]): ReviewAction[] {
+  const key = (a: ReviewAction) => `${a.kind}\0${a.kind === 'open' ? a.target : a.label}`;
+  const merged = [...existing];
+  for (const action of added) {
+    const at = merged.findIndex((a) => key(a) === key(action));
+    if (at >= 0) merged[at] = action; else merged.push(action);
+  }
+  return merged;
+}
+
 /** Bound what a turn accumulates across calls (actions append). */
 export function assertReviewInfoTotal(info: ReviewInfo): void {
   if ((info.actions?.length ?? 0) > MAX_ACTIONS) reject(`at most ${MAX_ACTIONS} actions per Review; attach only the most useful ones`);
