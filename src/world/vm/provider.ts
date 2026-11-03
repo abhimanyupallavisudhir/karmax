@@ -299,7 +299,16 @@ export class VmWorldProvider implements WorldProvider {
   async status(handle: WorldHandle): Promise<WorldLifecycleState> {
     if (this.destroyed.has(handle)) return 'missing';
     this.reference(handle); // an unreadable reference must fail here, as on E2B
-    return this.states.get(handle.id) ?? 'ready';
+    const known = this.states.get(handle.id);
+    if (known) return known;
+    // A process that has not touched this world since it started knows
+    // nothing of its machine: ask the cloud, never assume it runs. Taking a
+    // parked world for a running one woke it to be parked again, after every
+    // restart (production, 2026-11-03: each of an organization's parked VM
+    // worlds, out of compute, booted after a deploy, on Hetzner a billed hour).
+    const probed = await this.probe(handle);
+    if (probed === 'ready' || probed === 'parked') this.states.set(handle.id, probed);
+    return probed ?? 'ready';
   }
 
   async probe(handle: WorldHandle): Promise<WorldLifecycleState | undefined> {
