@@ -149,7 +149,7 @@ function constant(name) {
     await page.setViewportSize({ width: 320, height: 700 });
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'no overflow on small phones');
     // The real loader: one badge over every organization, whichever page is open.
-    await page.addScriptTag({ content: ['loadInbox', 'inboxArrivals', 'scheduleHomeRefresh'].map(fn).join('\n') + '\nlet homeRefreshTimer = null; const HOME_REFRESH_MS = 10;' });
+    await page.addScriptTag({ content: ['loadInbox', 'inboxArrivals', 'scheduleHomeRefresh'].map(fn).join('\n') + '\nlet homeRefreshTimer = null; const HOME_REFRESH_MS = 10; function refreshForMeCounts() {}' });
     await page.evaluate(() => {
       document.body.insertAdjacentHTML('afterbegin', '<a id="bell"><span id="bell-badge"></span></a>');
       S.organizations = [{ id: 'personal' }, { id: 'team' }];

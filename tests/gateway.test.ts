@@ -558,6 +558,36 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     });
   });
 
+  it('switches the installation\'s look, keeping its logo, and tells every console', async () => {
+    const meta = async () => (await (await fetch(`${base}/api/meta`)).json()) as any;
+    expect((await meta()).skin).toBe('');
+    await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { icon: 'knot' } }),
+    });
+    const saved = await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { skin: 'classic' } }),
+    });
+    expect(saved.status).toBe(200);
+    expect(await (await fetch(`${base}/api/settings/global/appearance`, { headers: auth() })).json()).toEqual({ icon: 'knot', skin: 'classic' });
+    // Public: the sign-in screen wears the look too.
+    expect((await meta()).skin).toBe('classic');
+    expect((await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { skin: 'neon' } }),
+    })).status).toBe(400);
+    expect((await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: {} }),
+    })).status).toBe(400);
+    const dev = (await h.tokens.mintPrincipal('user:dev', ['task:*', 'project:read'])).token;
+    expect((await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: { authorization: `Bearer ${dev}`, 'content-type': 'application/json' }, body: JSON.stringify({ values: { skin: '' } }),
+    })).status).toBe(403);
+    expect((await meta()).skin).toBe('classic');
+    await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { skin: '', icon: 'diamond' } }),
+    });
+    expect((await meta()).skin).toBe('');
+  });
+
   it('omits the disabled Resolve agent from schemas and profiles', async () => {
     const schemas = (await (await fetch(`${base}/api/schema`, { headers: auth() })).json()) as any[];
     const softwareDev = schemas.find((s) => s.name === 'software-dev');

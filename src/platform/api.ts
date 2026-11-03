@@ -5973,6 +5973,18 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
    */
   async searchOrganizationTasks(token: string, organizationId: string, query: string | TaskQuery,
     page: { limit?: number; offset?: number } = {}, now = Date.now()) {
+    const { readable, principal } = await this.readableOrganizationProjects(token, organizationId);
+    return this.searchAuthorizedOrganization(readable, query, principal, page, now);
+  }
+
+  /** How many tasks a query finds in each of an organization's projects (the sidebar's For me numbers). */
+  async countOrganizationTasks(token: string, organizationId: string, query: string | TaskQuery, now = Date.now()) {
+    const { readable, principal } = await this.readableOrganizationProjects(token, organizationId);
+    return this.countAuthorizedOrganization(readable, query, principal, now);
+  }
+
+  /** The projects of an organization a token may search, and who it searches as. */
+  private async readableOrganizationProjects(token: string, organizationId: string) {
     if (!(await this.deps.store.getOrganization(organizationId))) throw new NotFoundError(`no such organization ${organizationId}`);
     const caller = await this.deps.tokens.verify(token);
     if (!caller) throw new CapabilityError('unauthorized');
@@ -5988,7 +6000,15 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     if (!readable.length && !(caller.organizationId === organizationId && allows(caller.caps, 'task:read'))
       && !(await this.deps.tokens.check(token, 'task:read', { organizationId })).ok)
       throw new CapabilityError(`denied: task:read in no project of organization ${organizationId}`);
-    return this.searchAuthorizedOrganization(readable, query, caller.principal, page, now);
+    return { readable, principal: caller.principal };
+  }
+
+  /** One query's rows counted per project, over already-authorized projects; the rows are never sent. */
+  async countAuthorizedOrganization(projects: Project[], query: string | TaskQuery, principalId: string, now = Date.now()) {
+    const { result } = await this.evaluateProjects(projects, query, principalId, now);
+    const counts: Record<string, number> = {};
+    for (const task of result.tasks) counts[task.projectId] = (counts[task.projectId] ?? 0) + 1;
+    return { total: result.total, counts };
   }
 
   /** Evaluate one query across already-authorized projects — an organization's,

@@ -71,7 +71,7 @@ ok(/<li><strong>bold<\/strong> item<\/li>/.test(renderMarkdown('- **bold** item'
 // Inline code and fenced code keep their contents verbatim (escaped, unformatted).
 ok(renderMarkdown('use `a_b` here', {}).includes('<code class="md-inline">a_b</code>'), 'inline code is not italicised');
 const fence = renderMarkdown('```js\nlet x = 1 < 2;\n```', {});
-ok(fence.includes('<pre class="md-code"><code>let x = 1 &lt; 2;</code></pre>'), 'fenced code escaped and unwrapped by <p>');
+ok(fence.includes('<pre class="md-code lang-js"><code>let x = 1 &lt; 2;</code></pre>'), 'fenced code escaped and unwrapped by <p>');
 
 // The placeholder scheme must not collide with ordinary "space number space" text.
 ok(renderMarkdown('I have 3 apples and 7 pears', {}).includes('I have 3 apples and 7 pears'), 'digits in prose are untouched');

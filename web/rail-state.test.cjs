@@ -59,6 +59,7 @@ global.S = {
 
 eval(extractFn('railCollapsedFolders'));
 eval(extractFn('projectTree'));
+eval(extractFn('forMeCountHtml'));
 eval(extractFn('railProjectRows'));
 eval(extractFn('renderRail'));
 

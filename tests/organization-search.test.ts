@@ -95,6 +95,18 @@ describe('organization task list', () => {
     } finally { await f.store.close(); }
   });
 
+  it('counts a query per project without the rows, for the sidebar\'s For me numbers', async () => {
+    const f = await fixture();
+    try {
+      // Two of Ana's three For me tasks are in App; the rest is never sent.
+      const { status, body } = await f.call(f.ana, f.org.id, `q=${encodeURIComponent('for:me -is:archived')}&countBy=project`);
+      expect(status).toBe(200);
+      expect(body).toEqual({ total: 2, counts: { [f.app.id]: 2 } });
+      // Every row counts, beyond one page of them.
+      expect((await f.call(f.ana, f.org.id, 'q=&countBy=project&limit=1')).body.counts).toEqual({ [f.web.id]: 1, [f.app.id]: 2 });
+    } finally { await f.store.close(); }
+  });
+
   it('folds sub-tasks into their parent except the ones waiting on you, so For me narrows Active (pramana#149)', async () => {
     const f = await fixture();
     try {

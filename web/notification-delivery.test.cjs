@@ -35,7 +35,7 @@ function browser() {
     WebSocket: function () {},
     api: async () => { if (response instanceof Error) throw response; return response; },
     announceInbox: (items) => alerts.push(...items),
-    updateBell() {}, bgRenderMain() {}, scheduleHomeRefresh() {}, homeEventChangesList: () => false, patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false,
+    updateBell() {}, refreshForMeCounts() {}, bgRenderMain() {}, scheduleHomeRefresh() {}, homeEventChangesList: () => false, patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false,
     LIST_RELOAD_EVENTS: new Set(), setWsOnline() {}, checkConsoleRevision() {}, syncLiveWatch() {},
     refreshTasks: async () => {},
     setTimeout: (fn) => { timers.push(fn); return timers.length; },
