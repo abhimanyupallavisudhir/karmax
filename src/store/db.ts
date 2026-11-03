@@ -2867,6 +2867,30 @@ export class Store {
     return { worlds, objectKeys: [...objectKeys], attachmentIds, leases };
   }
 
+  /** The task worlds an organization's own `provider` account still runs: of
+   * each world only its current generation (as currentWorld reads it; an older,
+   * superseded one has no machine left), unless released or hibernated, and not
+   * one made on managed compute, which stays on the installation's account. */
+  async worldsOnOwnConnection(organizationId: string, provider: string): Promise<WorldHandleRef[]> {
+    const taskIds = ((await this.db.prepare('SELECT t.id FROM tasks t JOIN projects p ON p.id=t.projectId WHERE p.organizationId=?')
+      .all(organizationId)) as any[]).map((r) => String(r.id));
+    const current = new Map<string, { generation: number; state: string; handle: string }>();
+    for (const row of (await rowsFor(this.db, 'world_instances', 'worldId', taskIds))) {
+      if (row.state === 'superseded') continue;
+      const seen = current.get(row.worldId);
+      if (!seen || Number(row.generation) > seen.generation)
+        current.set(row.worldId, { generation: Number(row.generation), state: String(row.state), handle: String(row.handle) });
+    }
+    const worlds: WorldHandleRef[] = [];
+    for (const row of current.values()) {
+      if (row.state === 'released' || row.state === 'hibernated') continue;
+      let handle: WorldHandleRef;
+      try { handle = JSON.parse(row.handle) as WorldHandleRef; } catch { continue; }
+      if ((handle.provider ?? handle.kind) === provider && handle.meta?.funding !== 'managed') worlds.push(handle);
+    }
+    return worlds;
+  }
+
   async organizationResources(organizationId: string): Promise<{ worlds: WorldHandleRef[]; objectKeys: string[];
     attachmentIds: string[]; leases: Array<{ id: string; provider: string }> }> {
     const projectIds = ((await this.db.prepare('SELECT id FROM projects WHERE organizationId=?').all(organizationId)) as any[]).map((r) => String(r.id));

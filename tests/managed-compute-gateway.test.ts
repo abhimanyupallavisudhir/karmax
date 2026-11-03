@@ -108,4 +108,26 @@ describe('managed compute API', () => {
     expect(((await (await call(tokenFor.tenantOwner!, 'GET', `/api/organizations/${organizationId}/entitlements`)).json()) as { compute: unknown }).compute).toBeNull();
     expect((await call(tokenFor.operator!, 'DELETE', '/api/settings/managed-compute/e2b')).status).toBe(200);
   });
+
+  // An organization that moved to managed compute must be able to delete its own
+  // connection: only the current generation of a world its own account still runs
+  // counts, not superseded generations nor worlds made on managed compute.
+  it('refuses to delete an own connection only while a current own world uses it', async () => {
+    expect((await call(tokenFor.tenantOwner!, 'PUT', `/api/organizations/${organizationId}/world-providers/e2b`, { apiKey: 'own' })).status).toBe(200);
+    const project = await store.createProject('Worlds', {}, organizationId);
+    const task = (title: string) => store.createTask({ projectId: project.id, title, workflow: 'software-dev', workflowVersion: '1.26.0', params: { prompt: title } });
+    const world = async (meta: Record<string, unknown> = {}) =>
+      store.registerWorld({ id: (await task('w')).id, kind: 'e2b', root: '/workspace', branch: 'task', base: 'main', meta } as any, project.id);
+    const replaced = await world();
+    await store.setWorldState(await store.registerWorld({ ...replaced, generation: undefined }, project.id), 'hibernated');
+    await world({ funding: 'managed' });
+    const own = await store.registerWorld({ ...(await world()), generation: undefined }, project.id);
+    const refused = await call(tokenFor.tenantOwner!, 'DELETE', `/api/organizations/${organizationId}/world-providers/e2b`);
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toEqual({ error: '1 task world(s) still use e2b; finish or delete them first' });
+    await store.setWorldState(own, 'released');
+    const deleted = await call(tokenFor.tenantOwner!, 'DELETE', `/api/organizations/${organizationId}/world-providers/e2b`);
+    expect(deleted.status).toBe(200);
+    expect(await deleted.json()).toEqual({ deleted: true });
+  });
 });

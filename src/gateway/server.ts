@@ -3650,8 +3650,7 @@ export class Gateway {
           } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
         if (method === 'DELETE') {
-          const active = (await store.organizationResources(organizationId)).worlds
-            .filter((handle) => (handle.provider ?? handle.kind) === provider);
+          const active = await store.worldsOnOwnConnection(organizationId, provider);
           if (active.length) return this.json(res, 409, { error: `${active.length} task world(s) still use ${provider}; finish or delete them first` });
           return this.json(res, 200, { deleted: Boolean((await this.deps.providerConnections.delete(organizationId, provider))) });
         }
