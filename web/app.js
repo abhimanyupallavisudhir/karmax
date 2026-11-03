@@ -6864,9 +6864,10 @@ function menuFieldByKey(key) { return allMenuFields().find((f) => f.key === key)
 function queryToolbarHtml(q, prefix, trailing = '') {
   const fields = allMenuFields();
   const params = paramMenuFields();
-  // Filter menu: everything with discrete-ish values (skip free-text title/notes),
-  // but always include param fields even though they're text-typed.
-  const filterFields = fields.filter((f) => f.type !== 'text' && !f.param && !f.groupOnly);
+  // Filter menu: everything with discrete-ish values (skip free-text title/notes,
+  // which bare words already search), plus the conversation, which they don't;
+  // param fields get their own group below.
+  const filterFields = fields.filter((f) => (f.type !== 'text' || f.key === 'conversation') && !f.param && !f.groupOnly);
   const grpFields = fields.filter((f) => f.groupable || f.param);
   const sortFields = fields.filter((f) => f.sortable || f.param);
   const curGroup = (q.match(/(?:^|\s)group:(\S+)/) || [])[1] || '';
