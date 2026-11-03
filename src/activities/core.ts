@@ -1437,18 +1437,24 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
   /** The revisions selecting the branch's own commits (see commitsAheadOfPrBase). */
   async function prBaseRange(world: World, repo: ReturnType<typeof worldRepos>[number], base: string): Promise<string[]> {
-    const dwim = [`${base}..${repo.branch}`];
-    if (base.startsWith('refs/') || /^[0-9a-f]{40,64}$/i.test(base)) return dwim;
+    return [repo.branch, ...(await prBaseRefs(world, repo, base)).map((ref) => `^${ref}`)];
+  }
+
+  /** The refs that stand for `base` in this world: both the local branch and
+   * origin's, whichever exist, since either may be the stale one (see
+   * commitsAheadOfPrBase). */
+  async function prBaseRefs(world: World, repo: ReturnType<typeof worldRepos>[number], base: string): Promise<string[]> {
+    if (base.startsWith('refs/') || /^[0-9a-f]{40,64}$/i.test(base)) return [base];
     const candidates = [`refs/heads/${base}`, `refs/remotes/origin/${base}`];
     const listed = await world.exec('git', ['for-each-ref', '--format=%(refname)', ...candidates], { cwd: repo.root });
     const lines = listed.code === 0 ? listed.stdout.split('\n').map((line) => line.trim()) : [];
     const present = candidates.filter((ref) => lines.includes(ref));
-    if (present.length) return [repo.branch, ...present.map((ref) => `^${ref}`)];
+    if (present.length) return present;
     if (repo.baseSha) {
       const ancestor = await world.exec('git', ['merge-base', '--is-ancestor', repo.baseSha, repo.branch], { cwd: repo.root });
-      if (ancestor.code === 0) return [`${repo.baseSha}..${repo.branch}`];
+      if (ancestor.code === 0) return [repo.baseSha];
     }
-    return dwim;
+    return [base];
   }
 
   /** The commit messages of the branch's own commits, oldest first. */
@@ -4310,8 +4316,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // (they feed the confirmer's review packet, so a reviewer would be shown —
         // and asked to approve — changes the task never made). The merge-base is
         // resolved to a commit so the comparison still includes the worktree, which
-        // `<base>...HEAD` would drop along with every uncommitted change.
-        const forkPoint = await world.exec('git', ['merge-base', repoBase, 'HEAD'], { cwd: repo.root });
+        // `<base>...HEAD` would drop along with every uncommitted change. The fork
+        // point is taken against every ref standing for the base: the local branch
+        // stays where the world was provisioned, so work that already landed (an
+        // earlier pull request from this branch, merged back in) would be listed
+        // again for approval (pramana#137).
+        const forkPoint = await world.exec('git', ['merge-base', 'HEAD', ...(await prBaseRefs(world, repo, repoBase))], { cwd: repo.root });
         const since = forkPoint.code === 0 && forkPoint.stdout.trim() ? forkPoint.stdout.trim() : repoBase;
         // NUL-separated output is never C-quoted, whatever the world's Git config
         // (non-ASCII, quotes and newlines in names survive verbatim; WD-27).

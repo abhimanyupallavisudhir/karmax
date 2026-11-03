@@ -12787,7 +12787,8 @@ function checkoutsSection(v) {
     const row = own.get(c.name);
     if (row) {
       const landed = row.label === 'Landed';
-      return `<div class="checkout-row ${landed ? 'landed' : ''}" data-branch-state="${esc(row.label)}"${c.branch ? ` title="⎇ ${esc(c.branch)}"` : ''}>
+      const tip = [row.rec?.title, c.branch && `⎇ ${c.branch}`].filter(Boolean).map(esc).join('&#10;');
+      return `<div class="checkout-row ${landed ? 'landed' : ''}" data-branch-state="${esc(row.label)}"${tip ? ` title="${tip}"` : ''}>
       <span class="checkout-mark">${landed ? '✓' : ''}</span>
       ${checkoutLabel(v, c.name)}
       <span class="checkout-target">→ ${esc(row.lane.target)}</span>
@@ -12818,11 +12819,13 @@ function pullRequestAsks(v) {
 
 // Each pull request of its own waiting to be approved, as a small box at the
 // end of the conversation; approved, it stays to show it landing, then goes.
+// Named by its title: one branch can send several pull requests in turn, and
+// by its branch alone the next looks like the one just approved (pramana#137).
 function conversationPullRequestAsks(v) {
   const asks = pullRequestAsks(v);
   return asks.length ? `<div class="pr-asks" id="task-pr-asks">${asks.map((row) => `<div class="pr-ask" data-branch-state="${esc(row.label)}">
-      ${checkoutLabel(v, row.lane.checkout)}
-      <span class="pr-ask-target">→ ${esc(row.lane.target)}</span>
+      ${row.rec?.title ? `<b class="pr-ask-title" title="${esc(row.rec.title)}">${esc(row.rec.title)}</b>` : ''}
+      <span class="pr-ask-target">${row.rec?.title ? esc(row.lane.checkout === v?.worldWiki ? 'Wiki' : row.lane.checkout) : checkoutLabel(v, row.lane.checkout)} → ${esc(row.lane.target)}</span>
       ${pullRequestLink(row.pr)}
       <a class="btn sm ghost" data-open="${esc(row.lane.childTaskId)}" data-spa href="${esc(taskUrl(row.lane.childTaskId, row.rec))}" title="Its Review: what it changes">Open</a>
       ${row.approvable ? approvePullRequestButton(row, 'btn sm primary') : pullRequestChip(row)}

@@ -785,6 +785,7 @@ a.git-repo-name:hover { color:var(--accent); }
 .pr-ask { display: inline-flex; align-items: center; gap: 8px; padding: 5px 6px 5px 12px; font-size: 13px;
   border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); box-shadow: var(--shadow); }
 .pr-ask-target { color: var(--ink-3); }
+.pr-ask-title { min-width: 0; max-width: 32ch; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-weight: 600; }
 
 /* ── buttons ────────────────────────────────────────────────── */
 .btn {

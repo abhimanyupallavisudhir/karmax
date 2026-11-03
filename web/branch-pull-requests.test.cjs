@@ -117,6 +117,27 @@ test('a pull request its run forgot is shown from its own record', () => {
   assert.doesNotMatch(html, /data-open="sub"/, 'a sub-task is not a branch');
 });
 
+// pramana#137: by its branch alone, the next pull request from a branch looked
+// like the one just approved and landed, asking to be approved again.
+test('the next pull request from a branch is named by its own title', () => {
+  const task = {
+    stage: 'do', status: 'waiting', targetBranch: 'master', actions: [],
+    checkouts: ['pramana', 'submissions'].map((name) => ({ name, branch: `tavya/t-${name}`, base: 'master', target: 'master' })),
+    subTaskSummaries: [
+      { id: 'pr-ss1', title: 'Self-service submissions (SS1)', workflow: 'software-dev',
+        pullRequest: { checkout: 'submissions', target: 'master' }, lastView: { stage: 'done', status: 'done' } },
+      { id: 'pr-ab1', title: 'About › For collaborators (AB1)', workflow: 'software-dev',
+        pullRequest: { checkout: 'submissions', target: 'master' }, lastView: { stage: 'review', status: 'waiting', waitingFor: { kind: 'human' } } },
+    ],
+  };
+  const box = context.conversationPullRequestAsks(task);
+  assert.match(box, /About › For collaborators \(AB1\)<\/b>/);
+  assert.doesNotMatch(box, /SS1/);
+  assert.match(box, /data-approve-pr="pr-ab1"/);
+  assert.match(row(context.checkoutsSection(task), 'submissions'), /title="About › For collaborators \(AB1\)&#10;⎇ tavya\/t-submissions"/,
+    'its row says which pull request on hover');
+});
+
 test('a task with one branch still shows that branch\'s pull request', () => {
   const checkouts = [{ name: 'app', branch: 'tavya/t', base: 'main', target: 'main' }];
   assert.equal(context.checkoutsSection({ stage: 'do', actions: [], checkouts }), '', 'nothing to say without one');
@@ -165,7 +186,8 @@ test('a pull request waiting for its approval is a small box in the conversation
   assert.equal(context.conversationPullRequestAsks(pending({ stage: 'do', status: 'active' })), '', 'nothing to approve, nothing shown');
   const box = context.conversationPullRequestAsks(pending(reviewing, { number: 86, url: 'u86', state: 'open' }));
   assert.match(box, /class="pr-ask"/);
-  assert.match(box, /<b>docs<\/b>/);
+  assert.match(box, /docs: x<\/b>/, 'named by its title');
+  assert.match(box, /docs → main/, 'its branch said quietly');
   assert.match(box, /#86/);
   assert.match(box, /data-approve-pr="pr-docs"/);
   // Approved, it stays to show it landing, then goes.
