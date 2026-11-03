@@ -96,7 +96,10 @@ export class RunnerPoolService {
   }
 
   async acquire(input: { project: Project; taskId: string; worldId: string; provider: string; priority?: number;
-    /** The task's own machine size, when its Computer differs from the project's. */
+    /** The machine's size; by default its task's Computer (the project's
+     * default only where the task names none). Waking with the project's
+     * asked an account for room for 8 CPUs to wake a 2-CPU world, and was
+     * refused there for good (pramana#137). */
     resources?: Project['config']['resources'];
     /** New work (a task's first machine): refused once the organization's
      * managed compute credit is spent. Waking a world to save or publish its
@@ -105,8 +108,8 @@ export class RunnerPoolService {
     heartbeat?: () => void; signal?: AbortSignal; pollMs?: number }): Promise<{ leaseId: string; runnerPoolId: string }> {
     if (input.signal?.aborted)
       throw input.signal.reason ?? new Error('runner lease cancelled');
-    const projectConfig = (await this.store.effectiveProjectConfig(input.project));
-    const config = input.resources ? { ...projectConfig, resources: input.resources } : projectConfig;
+    const taskConfig = (await this.store.effectiveTaskConfig(input.project, input.taskId));
+    const config = input.resources ? { ...taskConfig, resources: input.resources } : taskConfig;
     const pool = (await this.ensureDefaultPool(input.project, input.provider));
     if (pool.mode === 'managed') {
       if (input.work) await assertComputeCredit(this.store, input.project.organizationId!, input.provider, Date.now(),
