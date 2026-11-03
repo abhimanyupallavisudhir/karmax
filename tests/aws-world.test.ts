@@ -184,6 +184,23 @@ describe.skipIf(!sshdAvailable)('AWS worlds (fake EC2, real sshd)', () => {
     expect(instance!.tags.karmaxLastRun).toMatch(/^\d+-\d+$/);
   });
 
+  it('tells a restarted process that a parked world is parked, so nothing wakes it to park it again', async () => {
+    // Production, 2026-11-03: after a deploy the waiting workflows' park step
+    // asked a fresh process for each world's status, was told 'ready', and
+    // booted every parked VM world (on Hetzner a new, billed server) to park it.
+    const parked = await provider.create({ taskId: 'task_restart', base: 'main', generation: 1, organizationId: 'org_a' });
+    const running = await provider.create({ taskId: 'task_running', base: 'main', generation: 1, organizationId: 'org_a' });
+    await provider.park(parked.handle as WorldHandle);
+    const instance = [...aws.instances.values()].find((value) => value.tags.karmaxTaskId === 'task_restart')!;
+    await waitFor(() => instance.state === 'stopped');
+    const restarted = new VmWorldProvider(driver, async () => connection(aws.key), undefined, {
+      socket: aws.socket, user: os.userInfo().username, home: aws.home,
+      provision: { stamp, script: `echo provisioned > ${stamp}`, sudo: false } });
+    expect(await restarted.status(parked.handle as WorldHandle)).toBe('parked');
+    expect(await restarted.status(running.handle as WorldHandle)).toBe('ready');
+    expect(instance).toMatchObject({ state: 'stopped', launches: 1 });
+  });
+
   it('stops a parked world another process woke, though this one remembers parking it', async () => {
     // Production, 2026-10-31: the lifecycle sweep's stray-wake check runs in
     // the gateway, which may have parked the world itself before.
