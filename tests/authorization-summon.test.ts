@@ -218,7 +218,27 @@ describe('running a draft its creator could not fully authorize', () => {
     expect((task.params._authorization as { capabilities: string[] }).capabilities).toContain('project:edit');
   });
 
-  it('runs a draft a project transfer left without a grantor (pramana)', async () => {
+  it('runs a weekly draft a sub-task’s agent saved, for the organization owner (pramana)', async () => {
+    const f = await fixture();
+    // A sub-task's agent merges only into its parent's branch, so it cannot
+    // grant a Developer task's merge-into:* and saves the draft limited.
+    const held = (await f.authorization.capabilities('user:maint', f.project.id, f.organization.id))
+      .filter((capability) => capability !== 'merge-into:*');
+    const agent = await f.agentOf(f.parent.id, [...held, 'merge-into:tavya/parent', 'use-credential:item:vi_upload']);
+    const draft = await f.api.createTask(agent, { projectId: f.project.id, workflow: 'just-do', prompt: 'Process readers’ submissions',
+      authorization: { level: 'developer', scope: 'projects', projectIds: [f.project.id] },
+      credentialGrants: ['use-credential:item:vi_upload'], draft: true, allowAttenuation: true,
+      params: { repeatable: true, triggers: [{ kind: 'schedule', cron: '0 6 * * 1', recurring: true }] } } as any);
+    expect(draft.params._authorization).toMatchObject({ profileAttenuated: true, attenuationAccepted: false });
+    await f.api.queueTask(await f.human('owner'), draft.id);
+    const task = (await f.store.getTask(draft.id))!;
+    expect(task.params).toMatchObject({ triggerState: 'armed' });
+    expect(task.params._authorization).toMatchObject({ level: 'developer', principal: 'user:owner', profileAttenuated: false });
+    expect((task.params._authorization as { capabilities: string[] }).capabilities)
+      .toEqual(expect.arrayContaining(['merge-into:*', 'use-credential:item:vi_upload']));
+  });
+
+  it('runs a draft a project transfer left without a grantor', async () => {
     const f = await fixture();
     const draft = await f.api.createTask(await f.human('dev'), { projectId: f.project.id, workflow: 'just-do',
       prompt: 'Process readers’ submissions', draft: true });
