@@ -58,13 +58,42 @@ export function newReleases(cli, pinned, releases) {
   }];
 }
 
-async function releasesOf(repository) {
+/**
+ * A Codex release carries ~300 assets, so a page of 100 is ~50 MB and GitHub
+ * often answers it with a 504 (2026-11-04). Ask in pages of 10 instead (each ~4 MB),
+ * newest first, until one holds a stable release of the CLI: anything newer
+ * was on an earlier page.
+ * @param {(typeof WATCHED_CLIS)[number]} cli
+ * @param {typeof fetch} [fetchImpl]
+ */
+export async function releasesOf(cli, fetchImpl = fetch, { pageSize = 10, maxPages = 10, retryMs = 5_000 } = {}) {
   const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
-  const response = await fetch(`https://api.github.com/repos/${repository}/releases?per_page=100`, {
-    headers: { accept: 'application/vnd.github+json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
-  });
-  if (!response.ok) throw new Error(`GitHub answered ${response.status} for ${repository}'s releases: ${(await response.text()).slice(0, 300)}`);
-  return response.json();
+  const headers = { accept: 'application/vnd.github+json', ...(token ? { authorization: `Bearer ${token}` } : {}) };
+  const releases = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const url = `https://api.github.com/repos/${cli.repository}/releases?per_page=${pageSize}&page=${page}`;
+    const batch = await getJson(url, headers, fetchImpl, retryMs);
+    releases.push(...batch);
+    if (batch.length < pageSize || batch.some((release) => !release.prerelease && !release.draft && cli.tag.test(release.tag_name))) break;
+  }
+  return releases;
+}
+
+/** GitHub's 5xx and dropped connections are transient: three tries, then the command fails. */
+async function getJson(url, headers, fetchImpl, retryMs) {
+  for (let attempt = 1; ; attempt++) {
+    let failure;
+    try {
+      const response = await fetchImpl(url, { headers, signal: AbortSignal.timeout(60_000) });
+      if (response.ok) return await response.json();
+      failure = new Error(`GitHub answered ${response.status} for ${url}: ${(await response.text()).slice(0, 300)}`);
+      if (response.status < 500) attempt = 3;
+    } catch (error) {
+      failure = error;
+    }
+    if (attempt >= 3) throw failure;
+    await new Promise((resolve) => setTimeout(resolve, retryMs * attempt));
+  }
 }
 
 async function main() {
@@ -72,7 +101,7 @@ async function main() {
   const pinned = pinnedVersions(fs.readFileSync(path.join(root, 'environments/browser/Dockerfile'), 'utf8'));
   const dryRun = process.argv.includes('--dry-run');
   for (const cli of WATCHED_CLIS) {
-    const events = newReleases(cli, pinned[cli.id], await releasesOf(cli.repository));
+    const events = newReleases(cli, pinned[cli.id], await releasesOf(cli));
     if (!events.length) console.log(`${cli.name} ${pinned[cli.id]} is current`);
     for (const event of events) {
       if (dryRun) { console.log(JSON.stringify(event)); continue; }

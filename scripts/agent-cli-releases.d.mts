@@ -9,3 +9,8 @@ export const EVENT_TYPE: string;
 export const WATCHED_CLIS: WatchedCli[];
 export function pinnedVersions(dockerfile: string): Record<string, string>;
 export function newReleases(cli: WatchedCli, pinned: string, releases: GitHubRelease[]): ReleaseEvent[];
+export function releasesOf(
+  cli: WatchedCli,
+  fetchImpl?: typeof fetch,
+  options?: { pageSize?: number; maxPages?: number; retryMs?: number },
+): Promise<GitHubRelease[]>;
