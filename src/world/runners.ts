@@ -1,4 +1,4 @@
-import { checkpointStale } from './checkpoint-staleness.js';
+import { branchUnpublished, checkpointStale } from './checkpoint-staleness.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import type { Store } from '../store/db.js';
@@ -657,6 +657,15 @@ export class WorldLifecycleManager {
         await this.store.setWorldState(candidate.handle, 'released');
         await this.recordLifecycle(candidate.handle, 'world.destroyed', reason);
         return true;
+      }
+      // Commits its remote refused live only in this sandbox: keep it (under
+      // the sweep's backoff) until a park pushes them. Only an ended task, or
+      // a person freeing its computer, lets them go.
+      const unpublished = !['released', 'task-ended'].includes(reason.reason ?? '')
+        && await branchUnpublished(this.store, candidate.handle);
+      if (unpublished) {
+        await options.onFailure?.(new Error(`its commits are not on their remote yet (${unpublished})`));
+        return false;
       }
       try {
         let checkpoint = await this.store.latestWorldCheckpoint(candidate.handle.id);
