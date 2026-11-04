@@ -6012,6 +6012,7 @@ function renderShell() {
         </div>
         <div class="rail-top">
           ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
+          <button class="btn primary rail-new-task" id="rail-new-task" type="button" data-shortcut="nav.newTaskDefault" title="${esc(commandHint('New task', 'nav.newTaskDefault'))}">${ICON.plus}<span>New task</span></button>
           <nav class="rail-org-nav" aria-label="Organization">${RAIL_ORG_NAV.map(([id, label, icon, , , , command]) =>
             `<a class="rail-row" id="${id}" data-spa data-shortcut="${command}" href="#">${ICON[icon]}<span>${label}</span></a>`).join('')}</nav>
         </div>
@@ -6036,6 +6037,7 @@ function renderShell() {
     <kbd class="key-echo" id="key-echo" aria-hidden="true"></kbd>
     <aside class="hosted-onboarding" id="hosted-onboarding" aria-live="polite" hidden></aside>`;
   $('#rail-palette').addEventListener('click', openPalette);
+  $('#rail-new-task').addEventListener('click', () => openNewTaskForm());
   $('#rail-help').addEventListener('click', openHelp);
   $('#key-echo').addEventListener('animationend', () => echoKeys('')); // faded out
   wireVerificationBanner();
@@ -7014,12 +7016,11 @@ function tasksView() {
       // does not mean the project has never had a task.
       : `<div class="card queue-empty">No open tasks ${policyTip('Finished tasks move to Archived.')}</div>`;
   // Home creates in one of its projects; with none yet there is nowhere to put a task.
-  // A stand-in for the full task form: the field and Send both open it.
+  // A stand-in for the full task form: the field opens it (so does the sidebar's New task).
   const composer = everywhere || (home && !newTaskProjectId()) ? '' : `
     <div class="composer">
       <button type="button" class="new-task-field" id="expand-task" data-shortcut="nav.newTaskDefault">New task…</button>
       <button type="button" class="btn icon-only" id="new-from-template" data-shortcut="nav.newTask" title="New task from template" aria-label="New task from template">${ICON.template}</button>
-      <button type="button" class="btn primary icon-only" id="add-task" title="New task" aria-label="New task">${ICON.send}</button>
     </div>`;
   // Tags are managed from the Filter menu's Tag picker, not beside the query menus.
   const trailing = everywhere || !home ? '' : projectFilterHtml();
@@ -7511,7 +7512,7 @@ function runSubRow(r) {
         <div class="task-title">${esc(r.title)} <span class="chip ${status}">${esc(stageLabel(v))}</span>${v.approvalRequests ? ' <span class="chip approval-needed">approval needed</span>' : ''}</div>
         <div class="task-sub"><span style="color:var(--ink-3)">${new Date(r.createdAt).toLocaleString()}</span></div>
       </div>
-      <div class="task-right">${pipeline(v)}</div>
+      <div class="task-right">${pipeline(v, true)}</div>
     </div>`;
 }
 
@@ -7584,9 +7585,145 @@ function taskRow(t, { showTags = true, project = false } = {}) {
           ${v.approvalRequests && !why ? '<span class="chip approval-needed">approval needed</span>' : ''}
           ${priorityFlag(t)}${showTags ? tagChips(t) : ''}
         </div>
+        ${ownAsk ? rowAskHtml(t) : ''}
       </div>
-      <div class="task-right">${rowWhen(t)}${pipeline(v)}${archiveBtn}</div>
+      <div class="task-right">${rowWhen(t)}${pipeline(v, true)}${archiveBtn}</div>
     </div>`;
+}
+
+// ── acting from a list ─────────────────────────────────────────────────────
+// A For me row that waits on a decision shows it, with the task page's own
+// buttons and handlers (so a decision made here is the same decision), and a
+// row whose question has one-click answers shows those: most asks are answered
+// without opening the task. Decisions load per task, only for rows that ask
+// for one, and again whenever the row's pending count changes.
+const rowDecisions = new Map(); // taskId → { key, credential, permission, authorization, repository, items }
+const rowDecisionLoads = new Map();
+function rowDecisionKey(t) { return `${t.lastView?.pendingDecisions ?? ''}:${t.lastView?.updatedAt ?? ''}`; }
+function rowOrganizationId(t) {
+  return projectById(t.projectId)?.organizationId || S.searchResult?.projects?.find((p) => p.id === t.projectId)?.organizationId || S.organizationId;
+}
+/** The quick question a row's task is waiting on, if its last question has one-click answers. */
+function rowQuickQuestion(t) {
+  const v = t.lastView || {};
+  const text = v.waitingFor?.detail || (v.lastMessage?.role === 'agent' ? v.lastMessage.text : '');
+  const blocks = [...String(text || '').matchAll(/```form[ \t]*\n([\s\S]*?)```/gi)];
+  if (!blocks.length) return null;
+  const { form } = KarmaxMarkdown.parseForm(blocks.at(-1)[1]);
+  if (!form?.quick || form.save) return null;
+  const field = form.fields[0];
+  const before = String(text).slice(0, blocks.at(-1).index).trim().split('\n').filter(Boolean).at(-1) || '';
+  return { field, question: field.label || before.replace(/[*_`#>]/g, '').trim() };
+}
+function rowAskHtml(t) {
+  const ask = rowAsk(t);
+  if (ask?.kind === 'escalated') {
+    const quick = rowQuickQuestion(t);
+    if (!quick) return '';
+    return `<div class="row-ask" data-row-quick="${esc(t.id)}">
+      ${quick.question ? `<span class="row-ask-q">${esc(quick.question)}</span>` : ''}
+      <span class="row-ask-actions">${quick.field.options.map((option) =>
+        `<button type="button" class="btn sm" data-row-answer="${esc(option.value)}"${option.hint ? ` title="${esc(option.hint)}"` : ''}>${esc(option.label)}</button>`).join('')}</span>
+    </div>`;
+  }
+  if (ask?.kind !== 'approval-requested') return '';
+  const loaded = rowDecisions.get(t.id);
+  if (!loaded || loaded.key !== rowDecisionKey(t)) return `<div class="row-ask" data-row-decisions="${esc(t.id)}" data-loading></div>`;
+  const signedIn = typeof S.user === 'string' ? S.user : S.user?.id;
+  const pending = (list) => (list || []).filter((request) => request.status === 'pending' && !request.dismissed);
+  const itemLabel = (id) => loaded.items.find((item) => item.id === id)?.label || 'a saved credential';
+  const decisions = [
+    ...pending(loaded.credential).map((request) => {
+      const item = loaded.items.find((candidate) => candidate.id === request.itemId);
+      const question = request.kind === 'reset' ? `“${itemLabel(request.itemId)}” didn’t work`
+        : request.mode === 'reveal' ? `Show “${itemLabel(request.itemId)}” to the agent?` : `Use “${itemLabel(request.itemId)}” without seeing it?`;
+      // Choosing a credential, or fixing one, happens on the task page.
+      const answers = request.itemId && request.kind !== 'reset'
+        ? credentialChoices(request, item).filter(([act]) => act !== 'always')
+          .map(([act, label, tip, cls]) => `<button type="button" class="btn sm${cls ? ` ${cls}` : ''}" data-vreq-act="${act}" title="${esc(tip)}">${label}</button>`).join('')
+        : '';
+      return `<div class="row-decision" data-vreq="${esc(request.id)}"><span class="row-ask-q">${request.itemId ? esc(question) : `Use a sign-in for ${esc(request.domain || request.name || 'a site')}?`}</span>
+        <span class="row-ask-actions">${answers || '<span class="task-sub">Open to choose</span>'}</span></div>`;
+    }),
+    ...pending(loaded.permission).map((request) => `<div class="row-decision" data-preq="${esc(request.id)}">
+      <span class="row-ask-q" title="${esc(request.capabilities.join(', '))}">Give the agent ${request.capabilities.length === 1 ? `<code>${esc(request.capabilities[0])}</code>` : `${request.capabilities.length} permissions`}?</span>
+      <span class="row-ask-actions"><button type="button" class="btn sm primary" data-preq-act="approve">Allow</button><button type="button" class="btn sm" data-preq-act="deny">Deny</button></span></div>`),
+    ...pending(loaded.authorization).filter((request) => request.recipients?.includes(signedIn)).map((request) => `<div class="row-decision" data-areq="${esc(request.id)}">
+      <span class="row-ask-q">Give this task ${esc(authorizationSummary(request.authorization, S.projects.filter((project) => project.organizationId === request.organizationId)))}?</span>
+      <span class="row-ask-actions"><button type="button" class="btn sm primary" data-areq-act="approve">Allow</button><button type="button" class="btn sm" data-areq-act="deny">Deny</button></span></div>`),
+    ...pending(loaded.repository).filter((request) => request.recipients?.includes(signedIn)).map((request) => `<div class="row-decision" data-raccess="${esc(request.id)}">
+      <span class="row-ask-q">Give <span class="mono">${esc(request.login)}</span> access to <span class="mono">${esc(request.slug)}</span>?</span>
+      <span class="row-ask-actions"><button type="button" class="btn sm primary" data-raccess-act="approve">Give access</button><button type="button" class="btn sm" data-raccess-act="deny">Deny</button></span></div>`),
+  ];
+  if (!decisions.length) return '';
+  return `<div class="row-ask" data-row-decisions="${esc(t.id)}">${decisions.slice(0, 2).join('')}${decisions.length > 2 ? `<span class="task-sub">${decisions.length - 2} more — open the task</span>` : ''}</div>`;
+}
+async function loadRowDecisions(t) {
+  const key = rowDecisionKey(t);
+  if (rowDecisionLoads.get(t.id)?.key === key) return rowDecisionLoads.get(t.id).promise;
+  const organizationId = rowOrganizationId(t);
+  const query = `taskId=${encodeURIComponent(t.id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
+  const promise = (async () => {
+    const [credential, permission, authorization, repository] = await Promise.all([
+      api(`/api/vault/requests?${query}`).catch(() => []), api(`/api/permission-requests?${query}`).catch(() => []),
+      api(`/api/authorization-requests?${query}`).catch(() => []), api(`/api/repository-access-requests?${query}`).catch(() => [])]);
+    const items = credential.some((request) => request.status === 'pending')
+      ? await api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []) : [];
+    rowDecisions.set(t.id, { key, credential, permission, authorization, repository, items });
+  })().finally(() => rowDecisionLoads.delete(t.id));
+  rowDecisionLoads.set(t.id, { key, promise });
+  return promise;
+}
+/** Load what list rows ask, answer from them, and refresh the lists after a decision. */
+function wireRowAsks(root = $('#main')) {
+  if (!root) return;
+  const taskOf = (id) => (S.searchResult?.tasks || []).find((t) => t.id === id) || taskRecord(id);
+  const resolved = async () => {
+    await Promise.all([loadInbox().catch(() => {}), refreshTasks()]);
+    if (isCrossProjectList()) scheduleHomeRefresh();
+  };
+  root.querySelectorAll('[data-row-decisions][data-loading]').forEach((box) => {
+    const t = taskOf(box.dataset.rowDecisions);
+    if (!t) return;
+    loadRowDecisions(t).then(() => {
+      const live = root.querySelector(`[data-row-decisions="${CSS.escape(t.id)}"][data-loading]`);
+      if (!live) return;
+      live.outerHTML = rowAskHtml(t) || '';
+      wireRowAsks(root);
+    });
+  });
+  root.querySelectorAll('[data-row-decisions]:not([data-loading]):not([data-wired])').forEach((box) => {
+    box.dataset.wired = '1';
+    const t = taskOf(box.dataset.rowDecisions);
+    const organizationId = t ? rowOrganizationId(t) : S.organizationId;
+    const done = async () => { rowDecisions.delete(box.dataset.rowDecisions); await resolved(); };
+    wireCredentialRequestActions(box, organizationId, done);
+    wirePermissionRequestActions(box, organizationId, done);
+    wireAuthorizationRequestActions(box, organizationId, done);
+    wireRepositoryAccessRequestActions(box, organizationId, done);
+  });
+  root.querySelectorAll('[data-row-quick]:not([data-wired])').forEach((box) => {
+    box.dataset.wired = '1';
+    box.querySelectorAll('[data-row-answer]').forEach((button) => button.addEventListener('click', async () => {
+      const t = taskOf(box.dataset.rowQuick);
+      const quick = t && rowQuickQuestion(t);
+      if (!quick) return;
+      const option = quick.field.options.find((o) => o.value === button.dataset.rowAnswer);
+      const text = !option || option.label === option.value ? button.dataset.rowAnswer : `${option.label} (${option.value})`;
+      box.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+      const feedback = beginActionFeedback(button);
+      let ok = false;
+      try {
+        await postReply({ taskId: t.id, participants: t.lastView?.participants }, 'do', { text, to: ['agent:do'] });
+        ok = true;
+        toast(`Answered #${t.num ?? ''} — ${text}`);
+        await resolved();
+      } catch (error) {
+        box.querySelectorAll('button').forEach((b) => { b.disabled = false; });
+        toast(plainError(error), true);
+      } finally { finishActionFeedback(feedback, ok); }
+    }));
+  });
 }
 
 // Every task gets an isolated worktree on an auto-generated `tavya/<taskId>`
@@ -7701,7 +7838,7 @@ function stageIndexOf(stages, stage) {
   return 0;
 }
 
-function pipeline(v) {
+function pipeline(v, labelled = false) {
   const stages = stagesFor(v.workflow);
   // 'escalated' is a blocked, awaiting-human state — NOT a pipeline position. Don't
   // pin it to a stage (it used to mis-map onto Merge); flag the whole track instead.
@@ -7722,7 +7859,11 @@ function pipeline(v) {
     }
     segs += `<span class="${cls}"></span>`;
   }
-  return `<div class="pipeline${escalated ? ' escalated' : ''}" title="${escalated ? 'Escalated — awaiting a human' : esc(stageLabel(v))}">${segs}</div>`;
+  const bar = `<div class="pipeline${escalated ? ' escalated' : ''}" title="${escalated ? 'Escalated — awaiting a human' : esc(stageLabel(v))}">${segs}</div>`;
+  if (!labelled) return bar;
+  // On a row the bar says which stage it is in words too, not by colour alone.
+  const name = done ? 'Done' : escalated ? 'Escalated' : stages[idx]?.label || '';
+  return `<span class="pipeline-labelled">${name ? `<span class="pipeline-label">${esc(name)}</span>` : ''}${bar}</span>`;
 }
 
 // ── task-organization control wiring (views bar + query toolbar + modals) ─────
@@ -8243,6 +8384,7 @@ function wireTasksView() {
   );
   const home = isCrossProjectList();
   $('#main').querySelectorAll('.task-row[data-id]').forEach((e) => wireTaskNav(e, () => e.dataset.id));
+  wireRowAsks();
   // A draft or armed row links to its task page, where it opens in the task form.
   // In its own project's list a plain click opens that form in place instead
   // (below); on the organization home (and the bell's page) it may belong to any
@@ -8332,7 +8474,6 @@ function openNewTaskForm(template, projectId = template?.projectId) {
 function newTaskTarget() { return S.tab === 'home' ? newTaskProjectId() : S.projectId; }
 function wireNewTaskComposer() {
   $('#expand-task')?.addEventListener('click', () => openNewTaskForm());
-  $('#add-task')?.addEventListener('click', () => openNewTaskForm());
   $('#new-from-template')?.addEventListener('click', () => openTemplatePicker());
   // Fetch the form's defaults while the person decides what to write.
   const projectId = newTaskTarget();
@@ -13211,7 +13352,7 @@ function taskBar(v, tab) {
   const base = taskUrl(v.taskId);
   return `<div class="tp-bar">
     <nav class="tp-views segmented" aria-label="Task view">
-      ${visibleTaskTabs().map((x) => `<a class="tab${x.key === tab ? ' active' : ''}" data-tasktab="${x.key}" href="${esc(base)}/${x.key}" aria-label="${x.label}" title="${x.label}" aria-pressed="${x.key === tab}"${x.key === tab ? ' aria-current="page"' : ''}>${ICON[x.icon]}<span class="tool-label">${x.label}</span></a>`).join('')}
+      ${visibleTaskTabs().map((x) => `<a class="tab${x.key === tab ? ' active' : ''}" data-tasktab="${x.key}" href="${esc(base)}/${x.key}" aria-label="${x.label}" title="${x.label}"${x.key === tab ? ' aria-current="page"' : ''}>${ICON[x.icon]}<span class="tool-label">${x.label}</span></a>`).join('')}
     </nav>
     ${t ? `${conversationBar(v, t)}<span class="tool-sep tp-rail-sep" aria-hidden="true"></span>` : '<span class="tp-bar-fill"></span>'}
     <button type="button" class="btn tool icon tp-rail-toggle" id="tp-rail-toggle" data-shortcut="task.rail" aria-controls="tp-rail" aria-expanded="${taskRailOpen()}" aria-label="Details" title="Details (i)">${ICON.sidebar}</button>
@@ -18270,7 +18411,7 @@ function settingsForms(scope, projectId) {
       // A workflow whose every field is a common default has nothing of its own to show.
       if (!html.trim()) return '';
       return `<details class="card" data-wf="${esc(s.name)}" data-unsaved ${s.name === 'software-dev' ? 'open' : ''}>
-        <summary style="cursor:pointer;font-weight:600">${esc(workflowLabel(s.name))} ${policyTip(`Defaults for ${workflowLabel(s.name)} tasks only`)}</summary>
+        <summary style="cursor:pointer;font-weight:600">${esc(workflowLabel(s.name))}</summary>
         <div class="wf-form parameter-fields" style="margin-top:10px">${html}</div>
         <button class="btn primary sm" data-save="${esc(s.name)}" data-unsaved-save>Save</button>
       </details>`;
@@ -19516,10 +19657,10 @@ function settingsView(proj) {
     <div class="card"><div id="project-events-box">Loading…</div></div>
     <div class="settings-section-title" id="project-agents"><div>Agents</div></div>
     <div class="card"><div class="section-h section-h-action"><span>Account order ${policyTip('Tasks in this project use the first available account. Drag to reorder; switch one off to skip it here.')}</span><a class="btn sm ghost organization-settings-link" data-spa href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage accounts</a></div><div id="cred-editor-project">Loading…</div></div>
-    <div class="settings-section-title" id="project-defaults"><div>Task defaults ${policyTip(`How new tasks begin, unless a task says otherwise`)}</div></div>
+    <div class="settings-section-title" id="project-defaults"><div>Task defaults</div></div>
     ${settingsForms('project', proj.id)}
-    <div class="settings-section-title" id="project-payments"><div>Payments ${policyTip(`What this project's tasks may spend`)}</div></div>${paymentsCard('project')}
-    <div class="settings-section-title" id="project-people"><div>People &amp; authorization ${policyTip(`Who can work here, and what they may do`)}</div></div>
+    <div class="settings-section-title" id="project-payments"><div>Payments</div></div>${paymentsCard('project')}
+    <div class="settings-section-title" id="project-people"><div>People &amp; authorization</div></div>
     <div class="card"><div id="project-access">Loading…</div></div>
     <div class="card"><div id="project-conversation-sharing">Loading…</div></div>
     <div class="settings-section-title" id="project-workflows"><div>Workflows ${policyTip(`The recipes this project's tasks run on, and their versions. New tasks start on the version chosen here; running tasks keep the version they started on. Latest follows platform releases.`)}</div></div>
@@ -19537,7 +19678,7 @@ function settingsView(proj) {
         <span class="setting-value setting-muted">Permanent</span>
         <span class="setting-actions"><button class="btn sm danger" id="delete-project">Delete…</button></span></div>
     </div></div>
-    <div class="card" id="project-experimental"><div class="section-h">Experimental ${policyTip(`Optional features for this project`)}</div><div id="project-avatar-settings">Loading…</div></div>
+    <div class="card" id="project-experimental"><div class="section-h">Experimental</div><div id="project-avatar-settings">Loading…</div></div>
     </div></div></div>`;
 }
 // ── Events: where outside happenings come from, and what each one did ───────
@@ -21050,9 +21191,9 @@ function agentAccountsCard() {
 
 function globalSettingsView(embedded = false) {
   return `
-    ${embedded ? `<div class="settings-section-title" id="settings-defaults"><div>Task defaults ${policyTip('How new tasks begin, unless a project or task says otherwise')}</div></div>` : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
+    ${embedded ? `<div class="settings-section-title" id="settings-defaults"><div>Task defaults</div></div>` : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
     ${settingsForms('global')}
-    <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments ${policyTip(`Credentials agents may use on your behalf, and what tasks may spend`)}</div></div>
+    <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments</div></div>
     <div class="card" id="settings-connections"><div class="section-h">Connected apps ${policyTip('Apps agents can use through MCP or Composio. Choose which ones new tasks get in Task defaults.')}</div>
       <div id="native-connections">Loading connections…</div></div>
     ${passwordsCard()}
@@ -21550,8 +21691,8 @@ async function wirePaidLaunchCard() {
       ${instRow('Individual $9 price', input('paid-stripe-individual-price', stripe.individualPriceId, 'price_…'))}
       ${instRow('Team $19 base price', input('paid-stripe-team-base-price', stripe.teamBasePriceId, 'price_…'))}
       ${instRow('Extra user $5 price', input('paid-stripe-team-seat-price', stripe.teamSeatPriceId, 'price_…'))}
-      ${instRow(`Individual product ${policyTip('Optional')}`, input('paid-stripe-individual-product', stripe.individualProductId, 'prod_…'))}
-      ${instRow(`Team product ${policyTip('Optional')}`, input('paid-stripe-team-product', stripe.teamProductId, 'prod_…'))}
+      ${instRow(`Individual product`, input('paid-stripe-individual-product', stripe.individualProductId, 'prod_…'))}
+      ${instRow(`Team product`, input('paid-stripe-team-product', stripe.teamProductId, 'prod_…'))}
       ${instCopyRow('Webhook URL', stripe.webhookUrl)}
       <details class="inst-fold"><summary>Setup steps</summary><ol class="inst-steps">
         <li><a href="https://dashboard.stripe.com/register" target="_blank" rel="noopener">Create a Stripe account</a> for the legal business and complete live-mode verification.</li>
@@ -22090,6 +22231,23 @@ function credentialRequestTaskLink(request) {
 // lives outside the row so a re-render of the approvals list keeps the choice.
 const credentialRequestBindings = new Map();
 
+// A credential request's answers, each named by what it allows: [action, label,
+// what it does (its tooltip), class]. Least to most, then Deny; the usual one
+// (for the task that asked) is the primary button.
+function credentialChoices(request, item) {
+  const what = item ? `“${item.label}”` : 'it';
+  const once = ({
+    passkey: 'loads this passkey into the agent’s browser for one sign-in, up to 3 minutes.',
+    session: 'signs the agent’s browser in to this site once; it stays signed in until the site ends the session.',
+  })[item?.type] || 'for this one use only.';
+  return [
+    ['once', 'Allow once', once.charAt(0).toUpperCase() + once.slice(1)],
+    ['task', 'Allow for this task', `Until this task ends. Other tasks still ask.`, 'primary'],
+    ['always', 'Always allow', `For this task, and from now on a task given ${what} ${request.mode === 'reveal' ? 'sees' : 'uses'} it without asking.`],
+    ['deny', 'Deny', 'Refuse; the agent is told.'],
+  ];
+}
+
 function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = true, inTask = false } = {}) {
   const itemLabel = (id) => items.find((item) => item.id === id)?.label || id;
   const pending = requests.filter((request) => request.status === 'pending');
@@ -22098,38 +22256,30 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
     ? pending.map((request) => {
       const bound = request.itemId ? undefined : credentialRequestBindings.get(request.id);
       const unbound = !request.itemId && !bound;
+      const item = items.find((candidate) => candidate.id === request.itemId);
+      const choices = credentialChoices(request, item);
+      const name = request.itemId ? `“${esc(itemLabel(request.itemId))}”` : `a sign-in for ${esc(request.domain || request.name || 'this site')}`;
+      // The question in words: what the agent wants to do with what.
+      const title = request.kind === 'reset' ? `${name} didn’t work`
+        : request.mode === 'reveal' ? `Show ${name} to the agent?` : `Use ${name} without seeing it?`;
       return `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-vreq="${esc(request.id)}"${bound ? ` data-vreq-item="${esc(bound.id)}"` : ''}>
         <div class="approval-request-main">
-          <div class="approval-request-title">${request.itemId
-            ? esc(itemLabel(request.itemId))
-            : `${esc(request.domain || request.name || '?')} <span class="chip approval-needed">not in vault</span>`}
-            ${request.kind === 'reset' ? '<span class="chip approval-needed">reported invalid</span>' : `<span class="chip">${esc({ use: 'Blind use', reveal: 'Agent sees' }[request.mode] || request.mode)}</span>`}
+          <div class="approval-request-title">${title}
+            ${request.itemId ? '' : '<span class="chip approval-needed">Not in vault</span>'}
             ${request.dismissed ? ignoredChip() : ''}
           </div>
           ${requestReasonLine(request, request.why, inTask)}
           ${subTaskAskLine(request)}
-          ${request.kind === 'reset' ? `<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; ${siteNameMarkup()} will resume the agent automatically.</div>`
-            : request.mode === 'reveal' ? `<div class="approval-request-warn">The agent will see the plaintext: it travels to the model provider and may end up in training data.</div>`
-            : items.find((item) => item.id === request.itemId)?.type === 'passkey' ? '' : `<div class="approval-request-warn caution">Blind use is not foolproof: a misbehaving agent can still leak it, e.g. by entering it on a malicious site.</div>`}
+          ${request.kind === 'reset' ? `<div class="approval-request-help">Update it in the vault or send the task a reset code, then allow it; ${siteNameMarkup()} resumes the agent.</div>`
+            : request.mode === 'reveal' ? `<div class="approval-request-warn">The agent will see it in plain text: it goes to the model provider and may end up in training data.</div>`
+            : item?.type === 'passkey' ? '' : `<div class="approval-request-warn caution">The agent never sees it, but a misbehaving agent could still misuse it, e.g. on a malicious site.</div>`}
         </div>
         <div class="approval-request-actions">
           ${request.itemId ? '' : `<a class="vreq-add" data-spa href="${globalRoute('organization')}#settings-payments" data-domain="${esc(request.domain || '')}" data-name="${esc(request.name || '')}" title="Add it in Settings → Passwords &amp; payments">Add to vault</a>
           <button type="button" class="btn sm vreq-pick" aria-haspopup="dialog"><span>Vault credentials</span><span class="tf-vault-count">${bound ? esc(bound.label) : 'Choose…'}</span></button>`}
-          <button class="btn sm" data-vreq-act="once" ${unbound ? 'disabled' : ''}>Once</button>
-          <button class="btn sm" data-vreq-act="task" ${unbound ? 'disabled' : ''}>This task</button>
-          <button class="btn sm" data-vreq-act="always" ${unbound ? 'disabled' : ''}>Always</button>
-          <button class="btn sm" data-vreq-act="deny">Deny</button>
+          ${choices.map(([act, label, tip, cls]) => `<button class="btn sm${cls ? ` ${cls}` : ''}" data-vreq-act="${act}" title="${esc(tip)}" ${unbound && act !== 'deny' ? 'disabled' : ''}>${label}</button>`).join('')}
           ${request.dismissed ? '' : ignoreRequestButton('data-vreq-act')}
-          ${policyTip(`Once: ${({
-            passkey: 'Loads this passkey into the agent\'s browser for one sign-in session, up to 3 minutes. The agent can use it on the site until then.',
-            session: 'Signs the agent\'s browser into this site once. It stays signed in until the site ends the session.',
-          })[items.find((item) => item.id === request.itemId)?.type] || 'Approves one credential operation, consumed when used, not at the next agent turn.'}
-
-This task: Approves the operation and grants this task the credential across turns. Its policy stays unchanged, so “ask” can prompt again.
-
-Always: Does the same as “This task” and sets this credential’s ${request.mode === 'reveal' ? '“agent sees”' : '“blind use”'} policy to “auto” until changed. The other policy stays unchanged. Future tasks still need a grant for this credential; it is not automatically included in every task. Task-specific policy overrides still apply.
-
-Deny: Rejects this request.`, '?')}
+          ${policyTip(choices.map(([, label, tip]) => `${label}: ${tip}`).join('\n'))}
         </div>
       </div>`;
     }).join('')
@@ -22138,7 +22288,7 @@ Deny: Rejects this request.`, '?')}
     ? `<div class="approval-history"><div class="section-h">Recent decisions</div>${recent.map((request) =>
       `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
         <span>${request.itemId ? esc(itemLabel(request.itemId)) : esc(request.domain || request.name || '?')}</span>
-        <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
+        <span class="task-sub">${esc(({ once: 'Allowed once', task: 'Allowed for this task', always: 'Always allowed', deny: 'Denied', dismiss: 'Ignored' })[request.resolution?.action] || request.resolution?.action || '')}</span></div>`).join('')}</div>`
     : '';
   return pendingHtml + history;
 }
@@ -22154,8 +22304,8 @@ function permissionRequestRows(requests, { historyLimit = 20, inTask = false } =
   const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
   const pendingHtml = pending.map((request) => `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-preq="${esc(request.id)}">
     <div class="approval-request-main">
-      <div class="approval-request-title">${esc(request.role || 'task')} agent permission
-        ${request.dismissed ? ignoredChip() : '<span class="chip approval-needed">approval needed</span>'}
+      <div class="approval-request-title">Give the agent ${request.capabilities.length === 1 ? 'this permission' : `these ${request.capabilities.length} permissions`}${request.projectIds?.length ? ' and projects' : ''}?
+        ${request.dismissed ? ignoredChip() : ''}
       </div>
       <div class="approval-request-caps">${request.capabilities.map((capability) =>
         `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
@@ -22165,10 +22315,10 @@ function permissionRequestRows(requests, { historyLimit = 20, inTask = false } =
       <div class="approval-request-help">Requested from ${request.audience.map((selector) => {
         const grantor = selector.startsWith('task:') ? (request.grantorTasks || []).find((task) => task.id === selector.slice(5)) : undefined;
         return grantor ? credentialRequestTaskLink({ taskId: grantor.id, task: grantor }) : esc(selector);
-      }).join(', ')}. ${request.projectIds?.length ? `Approval grants the full ${esc(request.baseAuthorization?.level || 'selected')} authorization across these and the existing projects. Existing permissions for all task roles apply there too. Listed capabilities are granted to the ${esc(request.role || 'requesting')} agent.` : `Approval grants only these exact capabilities to this task’s ${esc(request.role || 'requesting')} agent.`}</div>
+      }).join(', ')}. ${request.projectIds?.length ? `Allowing gives this task its ${esc(request.baseAuthorization?.level || 'current')} access in these projects too.` : 'Allowing gives only these, and only to this task.'}</div>
     </div>
     <div class="approval-request-actions">
-      <button class="btn sm primary" data-preq-act="approve">Approve for agent</button>
+      <button class="btn sm primary" data-preq-act="approve" title="Give this task’s agent these permissions">Allow</button>
       <button class="btn sm" data-preq-act="deny">Deny</button>
       ${request.dismissed ? '' : ignoreRequestButton('data-preq-act')}
     </div>
@@ -22225,8 +22375,8 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
     const canResolve = signedInUserId && request.recipients.includes(signedInUserId);
     return `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-areq="${esc(request.id)}">
     <div class="approval-request-main">
-      <div class="approval-request-title">Task agent authorization
-        ${request.dismissed ? ignoredChip() : '<span class="chip approval-needed">approval needed</span>'}
+      <div class="approval-request-title">Give this task more access?
+        ${request.dismissed ? ignoredChip() : ''}
       </div>
       <div class="approval-request-caps"><span class="chip">${esc(authorizationSummary(request.authorization,
         S.projects.filter((project) => project.organizationId === request.organizationId)))}</span></div>
@@ -22234,10 +22384,10 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
       <div class="approval-request-help">Requested from ${request.audience.map((selector) => {
         const grantor = selector.startsWith('task:') ? (request.grantorTasks || []).find((task) => task.id === selector.slice(5)) : undefined;
         return grantor ? credentialRequestTaskLink({ taskId: grantor.id, task: grantor }) : esc(selector);
-      }).join(', ')}. Approval delegates this authorization directly to the ${esc(request.target.kind)}; it does not elevate the requester.</div>
+      }).join(', ')}. Only this ${esc(request.target.kind)} gets it, not whoever asked.</div>
     </div>
     <div class="approval-request-actions">
-      ${canResolve ? '<button class="btn sm primary" data-areq-act="approve">Approve authorization</button><button class="btn sm" data-areq-act="deny">Deny</button>'
+      ${canResolve ? '<button class="btn sm primary" data-areq-act="approve" title="Give this task the access shown">Allow</button><button class="btn sm" data-areq-act="deny">Deny</button>'
         : '<span class="task-sub">Awaiting a routed approver</span>'}
       ${canResolve && !request.dismissed ? ignoreRequestButton('data-areq-act') : ''}
     </div>
@@ -22260,8 +22410,8 @@ function repositoryAccessRequestRows(requests, { historyLimit = 20 } = {}) {
     const canResolve = signedInUserId && request.recipients.includes(signedInUserId);
     return `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-raccess="${esc(request.id)}">
     <div class="approval-request-main">
-      <div class="approval-request-title">GitHub access ${request.dismissed ? ignoredChip() : '<span class="chip approval-needed">approval needed</span>'}</div>
-      <div class="task-sub"><span class="mono">${esc(request.login)}</span> can't see <span class="mono">${esc(request.slug)}</span>.</div>
+      <div class="approval-request-title">Give <span class="mono">${esc(request.login)}</span> access to <span class="mono">${esc(request.slug)}</span> on GitHub? ${request.dismissed ? ignoredChip() : ''}</div>
+      <div class="task-sub">They can’t see it yet, so the task is stuck.</div>
     </div>
     <div class="approval-request-actions">
       ${canResolve ? `<button class="btn sm primary" data-raccess-act="approve" title="${esc(`Adds ${request.login} to ${request.slug} on GitHub with write access, then continues the task`)}">Give access</button>
@@ -23741,6 +23891,8 @@ function updateBell() {
   const n = inboxUnreadCount();
   badge.textContent = n;
   badge.classList.toggle('hidden', n === 0);
+  // Its name includes the count it shows, so a screen reader hears what is seen.
+  $('#bell')?.setAttribute('aria-label', n ? `Inbox, ${n} new` : 'Inbox');
   $('#bell')?.classList.toggle('active', S.tab === 'inbox');
   // A phone's sidebar is off screen: its ☰ carries a dot while something waits.
   $('#mobile-menu')?.classList.toggle('has-unread', n > 0);
@@ -24295,7 +24447,7 @@ function profileView() {
             `<button type="button" data-theme-choice="${value}" aria-pressed="${theme === value}">${label}</button>`).join('')}</span></span>
         </div>
         <label class="setting-row" for="profile-md-render">
-          <span class="setting-label">Markdown ${policyTip('Format agent messages.')}</span>
+          <span class="setting-label">Markdown</span>
           <span class="setting-value"></span>
           <span class="setting-actions"><input class="toggle" type="checkbox" id="profile-md-render" ${markdownEnabled() ? 'checked' : ''} /></span>
         </label>
@@ -24319,7 +24471,7 @@ function profileView() {
           <span class="setting-actions"><button class="btn sm" id="export-user-data" type="button">Export</button></span>
         </div>
         ${u ? `<div class="setting-row">
-          <span class="setting-label">Session ${policyTip('Sign out of this browser.')}</span>
+          <span class="setting-label">Session</span>
           <span class="setting-value"></span>
           <span class="setting-actions"><button class="btn sm" id="profile-logout">Sign out</button></span>
         </div>` : ''}
@@ -24993,7 +25145,7 @@ function installationView() {
       <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
       <a href="#installation-access">Phone access</a>${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}
     </nav><div class="settings-content">
-      <div class="settings-section-title" id="installation-appearance"><div>Appearance ${policyTip(`The identity shown before an organization is known`)}</div></div>${appearanceCard()}
+      <div class="settings-section-title" id="installation-appearance"><div>Appearance</div></div>${appearanceCard()}
       <div class="settings-section-title" id="installation-health"><div>Health ${policyTip(`Load, agent turns and every process ${siteName()} runs. Memory and disk are under Service limits.`)}</div></div>
       <div id="host-diag"><div class="card"><span class="task-sub">Loading…</span></div></div>
       <div id="proc-panel" style="margin-top:12px"></div>
@@ -25004,7 +25156,7 @@ function installationView() {
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity ${policyTip(`Admission limits shared by all agent work`)}</div></div>${hostCapacityCard()}
       <div class="settings-section-title" id="installation-github"><div>GitHub</div></div>${installationGithubCard()}
       <div class="settings-section-title" id="installation-composio"><div>Composio</div></div><div class="card" id="installation-composio-card"><span class="task-sub">Loading…</span></div>
-      <div class="settings-section-title" id="installation-paid-launch"><div>Paid launch ${policyTip(`Subscription billing, legal operator details and the launch checklist`)}</div></div>${paidLaunchCard()}
+      <div class="settings-section-title" id="installation-paid-launch"><div>Paid launch</div></div>${paidLaunchCard()}
       <div class="settings-section-title" id="installation-stripe"><div>Agent cards ${policyTip(`Optional: the Stripe Connect application behind the cards agents spend from. Not used for plan subscriptions.`)}</div></div>${stripePlatformCard()}
       <div class="settings-section-title" id="installation-email"><div>Email</div></div>${outboundEmailCard()}
       <div class="settings-section-title" id="installation-access"><div>Phone access ${policyTip(`Open ${siteName()} from your phone over a private Tailscale network`)}</div></div>${phone}
@@ -25696,10 +25848,10 @@ function organizationView() {
     <nav class="settings-nav" aria-label="Settings sections"><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Resources</a><a href="#settings-agents">Agents</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
 
-    <div class="settings-section-title" id="settings-plan"><div>Plan &amp; billing ${policyTip(`What this organization’s plan includes, what it uses, and its subscription`)}</div></div>
+    <div class="settings-section-title" id="settings-plan"><div>Plan &amp; billing</div></div>
     <div class="card plan-card" id="settings-billing"><div id="org-plan">Loading…</div></div>
 
-    <div class="settings-section-title" id="settings-people"><div>People &amp; authorization ${policyTip(`Who is in this organization, and what each person may do`)}</div></div>
+    <div class="settings-section-title" id="settings-people"><div>People &amp; authorization</div></div>
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
       <div class="authz-invite-row"><input id="invite-email" type="email" placeholder="teammate@company.com" aria-label="Email to invite">${authorizationEditorHtml('invite-authorization', { level: 'developer', scope: 'organization' }, authorizationProjects)}<button class="btn sm primary" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div></div>
     <div class="card"><div class="section-h">Teams ${policyTip('Teams are reusable review routes: a team named Leaders is available to workflows as @team:leaders.')}</div><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form team-create"><input id="team-name" placeholder="New team name" aria-label="New team name"><button class="btn sm" id="create-team">Create team</button></div></div>
@@ -25710,7 +25862,7 @@ function organizationView() {
       </select></span></div>
       <div id="organization-conversation-sharing"><div class="setting-row setting-muted">Loading…</div></div></div></div>
     <div class="card" id="organization-roles"><div class="setting-muted">Loading roles…</div></div>
-    <div class="settings-section-title" id="settings-code"><div>Resources ${policyTip(`GitHub, computers and storage shared by this organization’s projects`)}</div></div>
+    <div class="settings-section-title" id="settings-code"><div>Resources</div></div>
     <div class="card"><div class="section-h">Git &amp; GitHub</div><div id="org-github">Loading…</div></div>
     <div class="card"><div class="section-h" id="settings-computers">Computers ${policyTip('The cloud computers tasks run on. Each task’s computer—its size, experience and network—is set in the task form and Task defaults.')}</div><div id="org-computers">Loading…</div></div>
     <div class="card"><div class="section-h" id="settings-storage">Data storage ${policyTip(`Where project data, saved task workspaces and review files are kept, and what uses the space. For live or fast-changing data, add the bucket to a project as a service instead of copying it into ${siteName()}.`)}</div><div id="org-storage">Loading…</div></div>
@@ -25730,7 +25882,7 @@ function organizationView() {
         <span class="setting-actions"><button class="btn sm danger" id="delete-organization">Delete…</button></span></div>` : ''}
     </div></div>
     <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync ${policyTip('For companies with an identity provider: OIDC signs employees in through your company; SCIM adds, removes and groups them. Use the values your identity administrator gives you.')}</b></summary><div id="org-identity" data-unsaved>Loading…</div></details>
-    <div class="card" id="settings-experimental"><div class="section-h">Experimental ${policyTip(`Optional features for this organization`)}</div><div id="organization-avatar-settings">Loading…</div></div>
+    <div class="card" id="settings-experimental"><div class="section-h">Experimental</div><div id="organization-avatar-settings">Loading…</div></div>
     <div id="org-misc-slot"></div>
     </div></div></div>`;
 }

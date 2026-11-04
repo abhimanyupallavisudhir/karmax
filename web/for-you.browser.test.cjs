@@ -89,7 +89,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.equal(await label.innerText(), 'website', 'a row names its project by slug');
     assert.equal(await page.locator('[data-id="t1"] .chip.task-project').count(), 0, 'a project label is not a status chip');
     const style = await label.evaluate((el) => { const s = getComputedStyle(el); return { font: s.fontFamily, border: s.borderTopWidth, background: s.backgroundColor }; });
-    assert.match(style.font, /mono/i, 'a monospace slug');
+    assert.match(style.font, /^Inter/, 'the slug reads in the UI face: monospace is for code (owner, 2026-11-04)');
     assert.equal(style.border, '0px');
     assert.equal(style.background, 'rgba(0, 0, 0, 0)', 'no pill behind it');
 
@@ -114,10 +114,10 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await page.waitForFunction(() => !document.querySelector('#tf-page'));
     assert.deepEqual(created.at(-1).projectId, 'q', 'the form runs the task in the chosen project');
     assert.equal(created.at(-1).body.params.prompt, 'Dark mode');
-    // Send asks the same, the project chosen last highlighted.
+    // The sidebar's New task asks the same, the project chosen last highlighted.
     await page.reload();
     await page.locator('[data-id="t1"]').waitFor();
-    await page.locator('#add-task').click();
+    await page.locator('#rail-new-task').click();
     await page.locator('#pp-in').waitFor();
     await page.keyboard.press('Enter');
     await page.locator('#tf-project').waitFor();

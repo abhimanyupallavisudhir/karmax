@@ -67,12 +67,11 @@ const { chromium } = require('playwright');
     const note = (region) => region.locator('.save-state');
     const noteText = async (region) => (await note(region).count()) ? (await note(region).textContent()) : '';
 
-    // Organization Task defaults: its heading's tip is a tip, not source text.
+    // Organization Task defaults: its heading is text, with no placeholder shown as source.
     await page.goto('http://console.test/org/settings#settings-defaults');
     const heading = page.locator('#settings-defaults');
     await heading.waitFor();
-    assert.equal((await heading.textContent()).trim(), 'Task defaults ⓘ');
-    assert.equal(await heading.locator('[title]').getAttribute('title'), 'How new tasks begin, unless a project or task says otherwise');
+    assert.equal((await heading.textContent()).trim(), 'Task defaults');
     assert.equal(await page.getByText('${policyTip').count(), 0, 'no placeholder is shown as text');
 
     // Project settings: a workflow's defaults wait for their Save button.

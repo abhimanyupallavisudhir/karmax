@@ -33,7 +33,7 @@ global.taskRecord = () => undefined;
 global.projectById = (id) => id === 'project_1' ? { id, name: 'App' } : undefined;
 global.projectBase = () => '/personal/app';
 
-for (const name of ['policyTip', 'credentialRequestTaskLink', 'credentialRequestRows', 'requestReasonLine', 'subTaskAskLine', 'permissionRequestRows', 'ignoredChip', 'ignoreRequestButton', 'defaultTaskTab']) eval(extractFn(name));
+for (const name of ['policyTip', 'credentialRequestTaskLink', 'credentialChoices', 'credentialRequestRows', 'requestReasonLine', 'subTaskAskLine', 'permissionRequestRows', 'ignoredChip', 'ignoreRequestButton', 'defaultTaskTab']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
@@ -60,10 +60,13 @@ ok(!rows.includes('tell the agent'), 'request UI never asks the human to perform
 // #367 review item 16: "Once" on a passkey loads it into the agent's browser
 // for a whole sign-in session, not one operation; say so.
 const passkeyRows = credentialRequestRows([request], [{ id: 'vi_1', label: 'GitHub passkey', type: 'passkey' }]);
-ok(/Once: .*passkey.*agent.*browser.*3 minutes/.test(passkeyRows), 'a passkey once-grant says it lasts a browser session');
-ok(!/Once: .*3 minutes/.test(rows), 'other once-grants keep the one-operation wording');
+ok(/Allow once: .*passkey.*agent.*browser.*3 minutes/.test(passkeyRows.replace(/&#39;|’/g, "'")), 'a passkey once-grant says it lasts a browser session');
+ok(!/Allow once: .*3 minutes/.test(rows), 'other once-grants keep the one-operation wording');
+// The answers say what they allow (the request said "Once / This task / Always"; owner, 2026-11-04).
+ok(rows.includes('>Allow once<') && rows.includes('>Allow for this task<') && rows.includes('>Always allow<') && rows.includes('>Deny<'), 'each answer is named by what it allows');
+ok(rows.includes('Use “Example login” without seeing it?'), 'the request asks a plain question');
 const sessionRows = credentialRequestRows([request], [{ id: 'vi_1', label: 'notes.test (signed in)', type: 'session' }]);
-ok(/Once: Signs the agent's browser into this site once/.test(sessionRows.replace(/&#39;|'/g, "'")), 'a session once-grant says it signs the browser in once');
+ok(/Allow once: Signs the agent's browser in to this site once/.test(sessionRows.replace(/&#39;|’/g, "'")), 'a session once-grant says it signs the browser in once');
 
 const permission = {
   id: 'preq_1',
@@ -86,7 +89,7 @@ ok(permissionRows.includes('data-preq-act="approve"') && permissionRows.includes
 const scopeRows = permissionRequestRows([{ ...permission, capabilities: [], projectIds: ['proj_second<script>'],
   baseAuthorization: { level: 'developer' } }]);
 ok(scopeRows.includes('proj_second&lt;script&gt;') && !scopeRows.includes('<script>'), 'project scopes are visible and escaped');
-ok(scopeRows.includes('Existing permissions for all task roles apply there too'), 'scope approval explains its full effect');
+ok(scopeRows.includes('Allowing gives this task its developer access in these projects too.'), 'scope approval explains its full effect');
 
 ok(defaultTaskTab({ approvalRequests: 1, actions: [] }) === 'checkin', 'a task needing approval opens its conversation, where the request waits');
 ok(defaultTaskTab({ approvalRequests: 0, actions: [{ name: 'confirm', enabled: true }] }) === 'checkin', 'review-only tasks retain the Check-in default');
