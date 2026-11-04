@@ -285,6 +285,10 @@ describe('prompt preamble (SPEC §5.4)', () => {
     expect(out).toMatch(/create_review_info.*optional/i);
     expect(out).toContain('limited to 280 characters');
     expect(out).toContain('Source code is not a human-readable output');
+    // Agents can ask with a form (web/markdown.js parseForm) instead of "reply A, B or C".
+    expect(out).toContain('a ```form fence holding JSON');
+    expect(out).toContain('{"label": "Which database?", "options": ["Postgres", "SQLite"]}');
+    expect(out).toContain('"value": "{{key}}"');
     expect(manifest('software-dev')!.promptPreamble).toBeUndefined();
   });
 

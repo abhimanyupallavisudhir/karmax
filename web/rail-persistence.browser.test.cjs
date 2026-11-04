@@ -43,7 +43,7 @@ function fn(name) {
         window.wireProjectDrag = () => {};
         window.syncRailNav = () => {};
       });
-      await page.addScriptTag({ content: ['railCollapsedFolders', 'saveRailCollapsedFolders', 'toggleRailFolder', 'renameCollapsedRailFolder', 'projectTree', 'railProjectRows', 'renderRail'].map(fn).join('\n') });
+      await page.addScriptTag({ content: ['railCollapsedFolders', 'saveRailCollapsedFolders', 'toggleRailFolder', 'renameCollapsedRailFolder', 'projectTree', 'forMeCountHtml', 'railProjectRows', 'renderRail'].map(fn).join('\n') });
       await page.evaluate(() => renderRail());
     };
     const folder = p => page.locator(`.folder-toggle[data-folder="${p}"]`);

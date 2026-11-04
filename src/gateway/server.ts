@@ -37,7 +37,7 @@ import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
 import type { ChildTaskSummary, KarmaxEvent, Organization, TaskView, WorldProviderConnection } from '../domain/types.js';
-import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf, BRAND } from '../domain/brand.js';
+import { BRAND_FILES, brandIconOf, isBrandIcon, isSkin, siteNameError, siteNameOf, skinOf, BRAND } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { ProjectTransfers, ProjectTransferError } from '../platform/project-transfer.js';
 import { AttachmentStore, AttachmentError, MAX_FILE_BYTES, MAX_IMAGE_BYTES } from '../store/attachments.js';
@@ -1796,7 +1796,8 @@ export class Gateway {
       res.writeHead(share ? 200 : 404, { 'content-type': 'text/html; charset=utf-8',
         'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex, nofollow',
         'content-security-policy': `default-src 'none'; script-src 'self' ${MATHJAX_SCRIPT_SOURCE}; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'` });
-      return void res.end(publicConversationHtml(share, { siteName: await this.siteName, signedIn }));
+      return void res.end(publicConversationHtml(share, { siteName: await this.siteName, signedIn,
+        skin: skinOf(await this.deps.store.getSettings('global', 'appearance')) }));
     }
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
     if (p.startsWith('/brand/')) return this.brand(p, res, req);
@@ -2329,6 +2330,7 @@ export class Gateway {
         hosted: this.deps.hosted ?? false,
         hostLocal: this.hostLocal,
         siteName: (await this.siteName),
+        skin: skinOf((await this.deps.store.getSettings('global', 'appearance'))),
         worldProviders: this.deps.worlds.catalog(),
         // Which inbox delivery channels actually have an adapter wired. The console
         // used to render Email/Slack switches unconditionally and toast "saved" for
@@ -8744,8 +8746,11 @@ export class Gateway {
           if (wf === 'agent-queue' && (!Number.isFinite(Number(b.values?.capacity)) || Number(b.values.capacity) < 1)) {
             return this.json(res, 400, { error: 'Concurrent agent turns must be at least 1' });
           }
-          if (wf === 'appearance' && !isBrandIcon(b.values?.icon)) {
-            return this.json(res, 400, { error: 'Unknown brand icon' });
+          if (wf === 'appearance') {
+            const v = b.values ?? {};
+            if (!('icon' in v) && !('skin' in v)) return this.json(res, 400, { error: 'Choose a logo or a style' });
+            if ('icon' in v && !isBrandIcon(v.icon)) return this.json(res, 400, { error: 'Unknown brand icon' });
+            if ('skin' in v && !isSkin(v.skin)) return this.json(res, 400, { error: 'Unknown style' });
           }
           const values = hostedSettingsValues(b.values ?? {}, this.deps.hosted === true);
           // Appearance is installation identity rather than a replace-all task
@@ -10061,9 +10066,12 @@ export class Gateway {
   private async searchOrganization(res: http.ServerResponse, session: Session, organizationId: string, url: URL) {
     const query = url.searchParams.get('q') ?? '';
     const page = { limit: Number(url.searchParams.get('limit') ?? 200), offset: Number(url.searchParams.get('offset') ?? 0) };
+    // `countBy=project`: how many rows each project has, not the rows (the sidebar's For me numbers).
+    const countOnly = url.searchParams.get('countBy') === 'project';
     if (!(await this.deps.store.getOrganization(organizationId))) return this.json(res, 404, { error: 'organization not found' });
     const member = this.searchMember(session);
-    if (!member) return this.json(res, 200, await this.deps.api.searchOrganizationTasks(session.apiToken, organizationId, query, page));
+    if (!member) return this.json(res, 200, countOnly ? await this.deps.api.countOrganizationTasks(session.apiToken, organizationId, query)
+      : await this.deps.api.searchOrganizationTasks(session.apiToken, organizationId, query, page));
     const projects = await this.searchableProjects(res, session, organizationId);
     // An empty list is an answer only to a member or to someone who may read the
     // organization's tasks (an installation administrator); anyone else is
@@ -10071,7 +10079,8 @@ export class Gateway {
     if (!projects.length && !(await this.deps.store.organizationMembership(organizationId, member))
       && !allows(await this.personCaps(session, undefined, organizationId), 'task:read'))
       return this.json(res, 403, { error: 'You are not a member of this organization' });
-    return this.json(res, 200, await this.deps.api.searchAuthorizedOrganization(projects, query, `user:${member}`, page));
+    return this.json(res, 200, countOnly ? await this.deps.api.countAuthorizedOrganization(projects, query, `user:${member}`)
+      : await this.deps.api.searchAuthorizedOrganization(projects, query, `user:${member}`, page));
   }
 
   /** A browser session searches as its signed-in person; a bearer by its token. */

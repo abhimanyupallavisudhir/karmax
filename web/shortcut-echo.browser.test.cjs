@@ -1,5 +1,5 @@
-// The topbar's shortcut echo: whatever the person just did — by mouse, palette
-// or keys — shows its keyboard shortcut next to their profile link, so they
+// The shortcut echo: whatever the person just did — by mouse, palette
+// or keys — shows its keyboard shortcut at the window's top right, so they
 // learn the keys by using the console. Full shell, trusted Chromium input.
 // Run: node web/shortcut-echo.browser.test.cjs
 const assert = require('node:assert/strict');
@@ -36,20 +36,20 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
       if (title) assert.equal(await echo.getAttribute('title'), title);
     };
 
-    // It leads the topbar's right-hand cluster (profile 🔔) — appearing
-    // there shifts none of those buttons — and is invisible until something happens.
-    assert.equal(await page.evaluate(() => document.querySelector('#key-echo').nextElementSibling?.id), 'topbar-user');
+    // It floats at the window's top right, over the page — appearing there
+    // shifts nothing — and is invisible until something happens.
+    assert.equal(await echo.evaluate((el) => getComputedStyle(el).position), 'fixed');
     assert.equal(await echo.textContent(), '');
     assert.equal(await echo.isVisible(), false, 'nothing to show before the first action');
 
     // Mouse: a project tab, the profile link, the inbox bell, the search box.
     await page.locator('.tab[data-tab="queue"]').click();
     await shows('g q', 'Go to queues');
-    await page.locator('#topbar-user').click();
+    await page.locator('#rail-profile').click();
     await shows('g A', 'Go to your profile');
     await page.locator('#bell').click();
     await shows('g N', 'Go to inbox');
-    // The sidebar's icon-only entries teach theirs too.
+    // The sidebar's places teach theirs too.
     await page.locator('#rail-wiki').click();
     await shows('g W', 'Go to organization wiki');
     await page.goto('http://console.test/org/workspace');

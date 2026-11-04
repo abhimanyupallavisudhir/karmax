@@ -114,14 +114,18 @@ const ICON = {
   // Window controls: a matched pair, drawn on the same grid and stroke.
   minimize: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"><path d="M6 12h12"/></svg>',
   close: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"><path d="m7 7 10 10"/><path d="M17 7 7 17"/></svg>',
-  // Sidebar navigation, icon-only (the name is the aria-label and tooltip):
-  // organization views at the top, installation-wide entries at the foot.
+  // Sidebar navigation: organization views at the top (with their names),
+  // installation-wide tools at the foot (icons; the name is the aria-label and tooltip).
   home: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.2a2 2 0 0 1 .7-1.5l7-6a2 2 0 0 1 2.6 0l7 6a2 2 0 0 1 .7 1.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M9.5 21v-6.5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1V21"/></svg>',
   insights: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="m7 15 4-5 3.5 3L20 6.5"/></svg>',
   wiki: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3Z"/></svg>',
   settings: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z"/><circle cx="12" cy="12" r="3"/></svg>',
-  // Topbar: the inbox bell and the phone sidebar toggle, drawn like the rail icons.
+  // The inbox bell and the phone's sidebar toggle, drawn like the rail icons.
   bell: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>',
+  // A secret a form keeps out of the conversation.
+  lock: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>',
+  // Fold or bring back the sidebar: a window with its left column.
+  panel: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M9 4v16"/></svg>',
   menu: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>',
   docs: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.5"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>',
   palette: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3"/></svg>',
@@ -194,7 +198,7 @@ const S = {
   searchFailed: false, // last evaluation errored — distinct from "nothing matched"
   searchRefusal: '', // …because the server refused it (4xx), in the server's words
   searchPending: false, // a new query is being evaluated; the list labels its interim local preview
-  wsOnline: true, // live socket up; false shows the topbar "Reconnecting" pill
+  wsOnline: true, // live socket up; false shows the floating "Reconnecting" pill
   orgProjectId: null, // which project S.tags/S.views were loaded for (staleness guard)
   schema: [],
   paramDefaults: {},
@@ -710,7 +714,7 @@ function go(path, opts = {}) {
   return applyRoute();
 }
 
-// The task form page floats over #main with the shell (topbar/rail) still live
+// The task form page floats over #main with the shell (sidebar) still live
 // behind it, so the user can navigate mid-edit. Any navigation closes it like
 // leaving any other page — via its close button, which flushes the draft.
 function closeTaskFormPage() {
@@ -4974,6 +4978,7 @@ async function loadInbox() {
   S.announcedInbox = new Map(S.inbox.map((item) => [item.id, urgencyRank(item.urgency)]));
   announceInbox(inboxArrivals(seen, S.inbox));
   updateBell();
+  refreshForMeCounts();
   // The bell's page lists what the inbox says waits on you.
   if (S.tab === 'inbox' && !S.selected) scheduleHomeRefresh();
 }
@@ -5728,6 +5733,7 @@ async function refreshTasks() {
         if (S.tab === 'queue' && !S.selected) seedQueue();
       } catch {}
     } while (taskRefreshQueued);
+    refreshForMeCounts();
   })();
   try {
     await taskRefreshPromise;
@@ -5799,6 +5805,7 @@ function siteName() { return S.meta?.siteName || 'tavya'; }
 function siteNameMarkup() { return esc(siteName()); }
 
 function applyDocumentBrand() {
+  applySkin(S.meta?.skin);
   document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute('content', siteName());
   document.querySelector('meta[name="description"]')?.setAttribute('content',
     `${siteName()} is the to-do list for managing AI agents: parallel cloud worlds, review gates, permissions, credentials, and payments in one calm interface.`);
@@ -5991,34 +5998,42 @@ function renderShell() {
   window.onpopstate = null; // public-page history is replaced by the app router below
   const app = $('#app');
   app.innerHTML = `
-    <div class="topbar">
-      <button class="icon-btn mobile-menu" id="mobile-menu" aria-controls="rail" aria-label="Sidebar" aria-expanded="true">${ICON.menu}</button>
-      <a class="brand" id="brand-home" data-spa data-shortcut="nav.home" href="${esc(homeRoute())}" title="Home" aria-label="Home">${brandMark()} ${siteNameMarkup()}</a>
+    <div class="mobile-bar">
+      <button class="icon-btn mobile-menu" id="mobile-menu" aria-controls="rail" aria-label="Sidebar" aria-expanded="false">${ICON.menu}</button>
+      <a class="brand" data-spa href="${esc(homeRoute())}" aria-label="Home">${brandMark()}</a>
       <span class="topbar-context" id="topbar-context"></span>
-      <div class="spacer"></div>
-      <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
-      <kbd class="key-echo" id="key-echo" aria-hidden="true"></kbd>
-      <a class="topbar-user" id="topbar-user" data-spa data-shortcut="nav.profile" href="${profileRoute()}" title="${esc(userDisplayName())}" aria-label="Your profile">${userAvatarHtml()}</a>
-      <a class="icon-btn has-badge" id="bell" data-shortcut="nav.notifications" data-spa href="${esc(inboxRoute(DEFAULT_LIST_QUERY))}" title="What needs you, in every organization" role="button" aria-label="Inbox">${ICON.bell}<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
     ${verificationBanner()}
     <div class="body">
       <div class="rail" id="rail">
+        <div class="rail-head">
+          <a class="brand" id="brand-home" data-spa data-shortcut="nav.home" href="${esc(homeRoute())}" title="Home">${brandMark()}<span class="wordmark">${siteNameMarkup()}</span></a>
+          <button class="rail-icon rail-collapse" id="rail-collapse" type="button" aria-controls="rail" aria-label="Hide sidebar" title="Hide sidebar">${ICON.panel}</button>
+        </div>
         <div class="rail-top">
           ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
-          <nav class="rail-icons rail-org-nav" aria-label="Organization">${RAIL_ORG_NAV.map(([id, label, icon, , , , command]) =>
-            `<a class="rail-icon" id="${id}" data-spa data-shortcut="${command}" href="#" aria-label="${label}">${ICON[icon]}</a>`).join('')}</nav>
+          <nav class="rail-org-nav" aria-label="Organization">${RAIL_ORG_NAV.map(([id, label, icon, , , , command]) =>
+            `<a class="rail-row" id="${id}" data-spa data-shortcut="${command}" href="#">${ICON[icon]}<span>${label}</span></a>`).join('')}</nav>
         </div>
         <div class="rail-list" id="rail-list"></div>
-        <div class="rail-icons rail-foot">
-          <a class="rail-icon" id="rail-docs" href="/docs" target="_blank" rel="noopener" aria-label="Docs" title="Docs">${ICON.docs}</a>
-          <button class="rail-icon" id="rail-palette" type="button" data-shortcut="nav.commandPalette" aria-label="Command palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">${ICON.palette}</button>
-          <button class="rail-icon" id="rail-help" type="button" data-shortcut="help.keyboard" aria-label="Keyboard shortcuts" title="${esc(commandHint('Keyboard shortcuts', 'help.keyboard'))}" aria-haspopup="dialog">${ICON.keyboard}</button>
+        <div class="rail-foot">
+          <div class="rail-tools">
+            <a class="rail-icon" id="rail-docs" href="/docs" target="_blank" rel="noopener" aria-label="Docs" title="Docs">${ICON.docs}</a>
+            <button class="rail-icon" id="rail-palette" type="button" data-shortcut="nav.commandPalette" aria-label="Command palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">${ICON.palette}</button>
+            <button class="rail-icon" id="rail-help" type="button" data-shortcut="help.keyboard" aria-label="Keyboard shortcuts" title="${esc(commandHint('Keyboard shortcuts', 'help.keyboard'))}" aria-haspopup="dialog">${ICON.keyboard}</button>
+          </div>
+          <div class="rail-person">
+            <a class="rail-profile" id="rail-profile" data-spa data-shortcut="nav.profile" href="${profileRoute()}" title="${esc(commandHint('Your profile', 'nav.profile'))}"><span class="avatar">${userAvatarHtml()}</span><span class="rail-person-name">${esc(userDisplayName())}</span></a>
+            <a class="rail-icon has-badge" id="bell" data-shortcut="nav.notifications" data-spa href="${esc(inboxRoute(DEFAULT_LIST_QUERY))}" title="${esc(commandHint('Inbox — what needs you, in every organization', 'nav.notifications'))}" aria-label="Inbox">${ICON.bell}<span class="badge hidden" id="bell-badge">0</span></a>
+          </div>
         </div>
       </div>
       <button class="rail-scrim" id="rail-scrim" aria-label="Close navigation"></button>
+      <button class="rail-expand" id="rail-expand" type="button" aria-controls="rail" aria-label="Show sidebar" title="Show sidebar">${ICON.panel}</button>
       <div class="main"><div class="main-inner" id="main"></div></div>
     </div>
+    <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
+    <kbd class="key-echo" id="key-echo" aria-hidden="true"></kbd>
     <aside class="hosted-onboarding" id="hosted-onboarding" aria-live="polite" hidden></aside>`;
   $('#rail-palette').addEventListener('click', openPalette);
   $('#rail-help').addEventListener('click', openHelp);
@@ -6029,10 +6044,19 @@ function renderShell() {
     $('#rail-scrim')?.classList.remove('visible');
     syncRailToggle();
   };
-  // ☰ slides the rail over the page on a phone, and folds it away on a wider
-  // screen (remembered per browser, like the theme).
+  // ⇤ folds the sidebar away on a computer, and the button left at the window's
+  // edge brings it back (remembered per browser, like the theme); ☰ slides it
+  // over the page on a phone.
+  $('#rail-collapse')?.addEventListener('click', () => {
+    if (narrowViewport()) return closeMobileNav();
+    setRailCollapsed(true);
+    $('#rail-expand')?.focus({ preventScroll: true });
+  });
+  $('#rail-expand')?.addEventListener('click', () => {
+    setRailCollapsed(false);
+    $('#rail-collapse')?.focus({ preventScroll: true });
+  });
   $('#mobile-menu')?.addEventListener('click', () => {
-    if (!narrowViewport()) return setRailCollapsed(!railCollapsed());
     const open = !$('#rail')?.classList.contains('mobile-open');
     $('#rail')?.classList.toggle('mobile-open', open);
     $('#rail-scrim')?.classList.toggle('visible', open);
@@ -6045,7 +6069,7 @@ function renderShell() {
     if (event.target.closest('.folder-toggle, .rail-edit-action, .rail-inline-edit, .organization-combo')) return;
     if (event.target.closest('a, button, [data-project], [data-nav]')) closeMobileNav();
   });
-  // #topbar-user and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
+  // #rail-profile and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
   wireOrganizationCombo($('#org-switcher'), () => currentOrg()?.id, async (id) => {
     if (id === '__new') return createOrganization();
     // Recheck membership before entering an organization discovered on focus.
@@ -6056,6 +6080,7 @@ function renderShell() {
   }, true, (id) => (id === '__new' ? null : organizationLandingRoute(id)));
   syncRailNav();
   renderOnboarding();
+  refreshForMeCounts(0);
   // The rail/main are painted by applyRoute() (boot calls it right after), so the
   // shell reflects the initial URL instead of a default view.
 }
@@ -6072,11 +6097,9 @@ function setRailCollapsed(collapsed) {
 function syncRailToggle() {
   const collapsed = railCollapsed();
   document.documentElement.classList.toggle('rail-collapsed', collapsed);
-  const toggle = $('#mobile-menu');
-  if (!toggle) return;
-  const open = narrowViewport() ? !!$('#rail')?.classList.contains('mobile-open') : !collapsed;
-  toggle.setAttribute('aria-expanded', String(open));
-  toggle.title = open ? 'Hide sidebar' : 'Show sidebar';
+  $('#mobile-menu')?.setAttribute('aria-expanded', String(!!$('#rail')?.classList.contains('mobile-open')));
+  $('#rail-expand')?.setAttribute('aria-expanded', 'false');
+  $('#rail-collapse')?.setAttribute('aria-expanded', 'true');
   $('#rail')?.toggleAttribute('inert', !narrowViewport() && collapsed);
 }
 
@@ -6301,7 +6324,7 @@ function railProjectRows(projectScoped) {
   // names its kind for the first-time reader. Folders carry their own "+" so a
   // project can be created in place.
   const row = (p, depth) => `<div class="proj project-row ${projectScoped && p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" data-folder="${esc(p.folder || '')}" style="--depth:${depth}" draggable="${!query}" title="${query ? 'Project' : 'Drag to reorder'}">
-          <a class="project-link" data-spa href="${projectRoute(p.id)}" data-project="${p.id}" tabindex="0" title="Project · ${esc(projectPath(p))}"><span class="glyph">${ICON.project}</span><span class="rail-name">${esc(p.name)}</span></a>
+          <a class="project-link" data-spa href="${projectRoute(p.id)}" data-project="${p.id}" tabindex="0" title="Project · ${esc(projectPath(p))}"><span class="glyph">${ICON.project}</span><span class="rail-name">${esc(p.name)}</span>${forMeCountHtml(p.id)}</a>
           <button class="rail-edit-action" type="button" data-project-edit="${p.id}" draggable="false" title="Edit project path" aria-label="Edit ${esc(projectPath(p))}">${ICON.edit}</button>
         </div>`;
   const header = (node, depth, open) => `<div class="proj folder ${open ? 'open' : ''}" data-folder="${esc(node.path)}" style="--depth:${depth}"><button class="folder-toggle" type="button" data-folder="${esc(node.path)}" aria-expanded="${open}" title="Folder · ${esc(node.path)} (click to ${open ? 'collapse' : 'expand'})"><span class="glyph chevron">${ICON.chevron}</span><span class="rail-name">${esc(node.name)}</span></button><button class="rail-edit-action" type="button" data-folder-add="${esc(node.path)}" title="New project in this folder" aria-label="New project in ${esc(node.path)}">${ICON.plus}</button><button class="rail-edit-action" type="button" data-folder-edit="${esc(node.path)}" title="Rename folder" aria-label="Rename ${esc(node.path)}">${ICON.edit}</button></div>`;
@@ -6315,8 +6338,31 @@ function railProjectRows(projectScoped) {
   return walk(root, 0) || (query ? '<div class="rail-search-empty" role="status">No matching projects</div>' : '');
 }
 
-// The organization's views, icon-only at the top of the sidebar:
-// [id, name (aria-label), icon, tab(s) it marks current, route, tooltip, command].
+// How many tasks each project's For me list holds (its default list), beside
+// its name in the sidebar. One count-only search over the organization; the
+// rail repaints when it lands. Coalesced: inbox and list refreshes come in bursts.
+function forMeCountHtml(projectId) {
+  const n = S.forMeCounts?.organizationId === S.organizationId ? S.forMeCounts.counts[projectId] : 0;
+  return n ? `<span class="count" title="${n} ${n === 1 ? 'task' : 'tasks'} for you">${n > 99 ? '99+' : n}</span>` : '';
+}
+let forMeCountTimer = null;
+function refreshForMeCounts(delay = 300) {
+  clearTimeout(forMeCountTimer);
+  forMeCountTimer = setTimeout(async () => {
+    const organizationId = S.organizationId;
+    if (!organizationId || !S.user) return;
+    try {
+      const { counts } = await api(`/api/organizations/${encodeURIComponent(organizationId)}/search?q=${encodeURIComponent(DEFAULT_LIST_QUERY)}&countBy=project`);
+      if (organizationId !== S.organizationId) return;
+      const before = JSON.stringify(S.forMeCounts);
+      S.forMeCounts = { organizationId, counts: counts || {} };
+      if (JSON.stringify(S.forMeCounts) !== before) renderRail();
+    } catch {}
+  }, delay);
+}
+
+// The organization's views, rows at the top of the sidebar:
+// [id, name, icon, tab(s) it marks current, route, tooltip, command].
 const RAIL_ORG_NAV = [
   ['rail-home', 'Home', 'home', ['home'], () => homeRoute(), 'Home — every project, what needs you first', 'nav.home'],
   ['rail-insights', 'Insights', 'insights', ['insights'], () => globalRoute('insights'), 'Insights', 'nav.insights'],
@@ -6336,15 +6382,20 @@ function syncRailNav() {
     if (tabs.includes(S.tab)) link.setAttribute('aria-current', 'page');
     else link.removeAttribute('aria-current');
   }
-  const foot = $('#rail .rail-foot');
+  const tools = $('#rail .rail-tools');
   let installation = $('#rail-installation');
-  if (foot && S.installationAccess && !installation) {
-    foot.insertAdjacentHTML('beforeend', `<a class="rail-icon" id="rail-installation" data-spa href="${installationRoute()}" aria-label="Installation settings" title="Installation settings">${ICON.installation}</a>`);
+  if (tools && S.installationAccess && !installation) {
+    tools.insertAdjacentHTML('beforeend', `<a class="rail-icon" id="rail-installation" data-spa href="${installationRoute()}" aria-label="Installation settings" title="Installation settings">${ICON.installation}</a>`);
     installation = $('#rail-installation');
   } else if (installation && !S.installationAccess) { installation.remove(); installation = null; }
   if (installation) {
     if (S.tab === 'installation') installation.setAttribute('aria-current', 'page');
     else installation.removeAttribute('aria-current');
+  }
+  const profile = $('#rail-profile');
+  if (profile) {
+    if (S.tab === 'profile' && !S.profileUserId) profile.setAttribute('aria-current', 'page');
+    else profile.removeAttribute('aria-current');
   }
 }
 
@@ -6379,7 +6430,7 @@ function renderRail() {
     </label>
     ${railProjectRows(projectScoped)}
     <div class="grow" id="rail-projects-end"></div>`;
-  // Your profile lives in the top bar (#topbar-user), not the rail. Project and
+  // Your profile and inbox live at the rail's foot (#rail-profile, #bell). Project and
   // organization entries are real <a> links — installLinkRouter() routes their
   // plain click in place and the browser handles new-tab gestures.
   if (!searching) {
@@ -9240,7 +9291,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   activeTaskFormKeyController?.abort();
   activeTaskFormKeyController = null;
   const formToken = (activeFormToken = {});
-  // The shell (topbar/rail) stays live behind the page, so the user can navigate
+  // The shell (sidebar) stays live behind the page, so the user can navigate
   // mid-edit. Pin the project NOW: every later write (auto-save flush, submit)
   // must land in the project the form was opened in, not wherever S.projectId
   // points by the time the async chain runs.
@@ -11399,6 +11450,7 @@ function renderTaskPage() {
   if (thread) {
     restoreThreadSelection(thread, threadSel);
     wireMessageCopies(thread);
+    wireMessageForms(thread, v);
     typesetMath(thread);
   }
   restoreFocus(main, focusState);
@@ -13113,8 +13165,11 @@ function conversationPane(v, t) {
   }
   const resourceRequestIndex = v.stage === 'review' && requestedInput
     ? entries.findLastIndex((entry) => entry.type === 'input-request' && entry.request.text === requestedInput) : -1;
+  // A form is live in the latest agent message that has one, until a person answers.
+  const formIndex = canFollowUp && followUp.enabled ? liveFormIndex(entries) : -1;
   const row = (entry, attrs = '') => renderConversationEntry(
-    entry === entries[resourceRequestIndex] ? { ...entry, resourceReview: true } : entry, v)
+    entry === entries[resourceRequestIndex] ? { ...entry, resourceReview: true }
+      : entry === entries[formIndex] ? { ...entry, formLive: true } : entry, v)
     .replace(' ', ` data-conversation-key="${esc(entry.type === 'activity' ? `activity:${entry.activityRef}` : entry.sourceKey || `explanation:${entry.order}`)}"${attrs} `);
   const working = t.shared ? v.participants.some((p) => p.state === 'running') : v.agentTurn?.role === t.role;
   const outline = conversationOutline(entries, { live: working, asking: !!humanWaitDetail(v) });
@@ -13694,8 +13749,8 @@ function annotateWorldFileLinks(html, v = S.view) {
 // What a person is asked to do. A landing ask (open the upstream pull request)
 // is tavya's own text: its links are app routes and GitHub pages, never
 // citations of files in the task's world.
-function renderWaitDetail(text, v = S.view, math = mathjaxEnabled()) {
-  if (v?.waitingFor?.reason !== 'merge') return renderAgentMessageBody(text, v, math);
+function renderWaitDetail(text, v = S.view, math = mathjaxEnabled(), form = null) {
+  if (v?.waitingFor?.reason !== 'merge') return renderAgentMessageBody(text, v, math, form);
   if (markdownEnabled()) return renderMessageBody(text, math);
   const link = /\[([^\]\n]+)\]\(([^\s)]+)\)/g;
   let html = '';
@@ -13707,8 +13762,231 @@ function renderWaitDetail(text, v = S.view, math = mathjaxEnabled()) {
   return html + esc(String(text).slice(at));
 }
 
-function renderAgentMessageBody(text, v = S.view, math = mathjaxEnabled()) {
-  return markdownEnabled() ? annotateWorldFileLinks(renderMessageBody(text, math), v) : renderConversationText(text, 'agent', v);
+function renderAgentMessageBody(text, v = S.view, math = mathjaxEnabled(), form = null) {
+  return markdownEnabled() ? withMessageForms(annotateWorldFileLinks(renderMessageBody(text, math), v), form, v) : renderConversationText(text, 'agent', v);
+}
+
+// ── message forms ────────────────────────────────────────────────────────────
+// An agent asks for input with a ```form fence (web/markdown.js parseForm) and
+// the conversation draws it as a form. The latest one nobody has answered yet,
+// in a conversation the person may reply to, is live; what they submit is sent
+// as their ordinary reply — the same follow-up as typing it — so the agent
+// reads "- Region: eu-west" exactly as if it had been typed.
+//
+// A form with `save` first makes that request from this browser, as the person
+// and with their authority (so it can only change what they could change in
+// Settings), then tells the agent it was saved and where. It may only write
+// settings (SETTINGS_TARGETS), and a secret field only into the write-only
+// secret field of a secret store, as a whole value: a secret typed into a form
+// is never shown in the conversation, kept in its history or read back.
+const FORM_BLOCK = /<pre class="md-code lang-form"><code>([\s\S]*?)<\/code><\/pre>/g;
+const SECRET_FIELD_KEY = /^(?:value|secret|secrets|key|apiKey|api_key|token|password|clientSecret|privateKey|totp)$/i;
+// [method, path, what it is (from the path's ids and the body), a secret store?]
+const SETTINGS_TARGETS = [
+  ['POST', /^\/api\/projects\/([^/]+)\/secrets$/, (m, b) => `${formLiteral(b.name) ? `${b.name} · ` : ''}${formProjectName(m[1])} secrets`, true],
+  ['PUT', /^\/api\/projects\/([^/]+)\/environment$/, (m) => `${formProjectName(m[1])} environment`],
+  ['PATCH', /^\/api\/projects\/([^/]+)$/, (m) => `${formProjectName(m[1])} settings`],
+  ['PUT', /^\/api\/settings\/project\/([^/]+)\/[^/]+$/, (m) => `${formProjectName(m[1])} task defaults`],
+  ['PUT', /^\/api\/settings\/managed-compute\/([^/]+)$/, (m) => `Managed compute · ${formProviderName(m[1])}`, true],
+  ['PUT', /^\/api\/settings\/[\w/-]+$/, () => 'Installation settings'],
+  ['PATCH', /^\/api\/organizations\/([^/]+)$/, (m) => `${formOrganizationName(m[1])} settings`],
+  ['POST', /^\/api\/organizations\/([^/]+)\/accounts$/, (m) => `${formOrganizationName(m[1])} agent accounts`, true],
+  ['PATCH', /^\/api\/organizations\/([^/]+)\/accounts\/keys\/[^/]+\/[^/]+$/, (m) => `${formOrganizationName(m[1])} agent accounts`, true],
+  ['PUT', /^\/api\/organizations\/([^/]+)\/world-providers\/([^/]+)$/, (m) => `${formProviderName(m[2])} computers · ${formOrganizationName(m[1])}`, true],
+  ['POST', /^\/api\/organizations\/([^/]+)\/storage$/, (m) => `${formOrganizationName(m[1])} storage`, true],
+  ['POST', /^\/api\/vault\/items$/, (m, b) => `Passwords${formLiteral(b.label) ? ` · ${b.label}` : ''}`, true],
+  ['POST', /^\/api\/mcp$/, (m, b) => `MCP servers${formLiteral(b.label) ? ` · ${b.label}` : ''}`, true],
+  ['PUT', /^\/api\/connections\/config$/, () => 'App connections', true],
+  ['PATCH', /^\/api\/user\/preferences$/, () => 'Your preferences'],
+];
+function formLiteral(value) { return typeof value === 'string' && value && !value.includes('{{'); }
+function formProjectName(id) { const p = projectById(decodeURIComponent(id)); return p ? p.name : 'Project'; }
+function formOrganizationName(id) { return organizationById(decodeURIComponent(id))?.name || 'Organization'; }
+function formProviderName(id) { return S.meta?.worldProviders?.find?.((p) => p.id === id)?.label || id; }
+
+/** Where a form's `save` writes, in words, and whether it may hold secrets — or null when a form may not write there. */
+function settingsTarget(save) {
+  const path = save.path.split('?')[0];
+  for (const [method, pattern, describe, secret] of SETTINGS_TARGETS) {
+    const match = save.method === method && pattern.exec(path);
+    if (match) return { label: describe(match, save.body || {}), secret: !!secret };
+  }
+  return null;
+}
+
+/** Why a form's secrets could leak through where it saves them, if they could. */
+function formSecretLeak(form, target) {
+  const secrets = new Set(form.fields.filter((field) => field.type === 'secret').map((field) => field.name));
+  if (!secrets.size) return '';
+  if (!target.secret) return 'This form would save a secret where it can be read back, so it was not shown.';
+  let leak = '';
+  const walk = (value, key) => {
+    if (typeof value === 'string') {
+      for (const [, name] of value.matchAll(/\{\{\s*([\w.-]+)\s*\}\}/g)) {
+        if (!secrets.has(name)) continue;
+        if (!/^\{\{\s*[\w.-]+\s*\}\}$/.test(value) || !SECRET_FIELD_KEY.test(String(key))) leak = 'This form would save a secret where it can be read back, so it was not shown.';
+      }
+    } else if (Array.isArray(value)) value.forEach((item) => walk(item, key));
+    else if (value && typeof value === 'object') Object.entries(value).forEach(([k, item]) => walk(item, k));
+  };
+  walk(form.save.body, '');
+  return leak;
+}
+
+function decodeHtml(html) {
+  const area = document.createElement('textarea');
+  area.innerHTML = html;
+  return area.value;
+}
+
+/** The forms in a rendered agent message, drawn live or read-only (`ctx`: {key, live}). */
+function withMessageForms(html, ctx, v = S.view) {
+  if (!html.includes('lang-form')) return html;
+  let index = 0;
+  return html.replace(FORM_BLOCK, (block, code) => {
+    const key = `${v?.taskId || 'task'}/${ctx?.key || 'message'}/${index++}`;
+    const parsed = KarmaxMarkdown.parseForm(decodeHtml(code));
+    const target = parsed.form?.save ? settingsTarget(parsed.form.save) : null;
+    const problem = parsed.error || (parsed.form.save && !target ? 'This form would change something outside settings, so it was not shown.' : '')
+      || (target ? formSecretLeak(parsed.form, target) : '');
+    // The agent's mistake stays readable: what went wrong, with its source folded.
+    if (problem) return `<details class="ask-form-problem"><summary>${esc(problem)}</summary>${block}</details>`;
+    const form = parsed.form;
+    const live = !!ctx?.live && !S.answeredForms?.has(key);
+    // What wireMessageForms submits: the form as read, by its key on the page.
+    if (live) (S.formSpecs ||= new Map()).set(key, form);
+    const secret = form.fields.some((field) => field.type === 'secret');
+    const note = target ? `${secret ? ICON.lock : ''}<span>${secret ? 'Saved to' : 'Saves to'} <b>${esc(target.label)}</b>${secret ? ', not into the conversation' : ''}</span>` : '';
+    return KarmaxMarkdown.renderForm(form, { key, live, values: S.formDrafts?.[key] || {}, note, error: S.formErrors?.[key] || '' });
+  });
+}
+
+/** Whether a message holds a form (cheap: before rendering). */
+function hasMessageForm(text) { return /```form[ \t]*\n/i.test(String(text || '')); }
+/** An entry's agent-written text, if it has some. */
+function agentEntryText(entry) {
+  if (entry.type === 'input-request') return entry.request?.text || '';
+  if (entry.type === 'message') return entry.message?.role === 'agent' ? entry.message.text : '';
+  return entry.type === 'activity' && entry.activity?.kind === 'message' ? entry.activity.title : '';
+}
+/** The entry whose forms are live: the last with a form, unless a person has spoken since. */
+function liveFormIndex(entries) {
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (entry.type === 'message' && entry.message?.role === 'user' && messageOrigin(entry.message) === 'person') return -1;
+    if (hasMessageForm(agentEntryText(entry))) return index;
+  }
+  return -1;
+}
+/** What names a form on the page: its entry, and the form's place in it. */
+function formEntryKey(entry) {
+  return entry.type === 'activity' ? `activity:${entry.activityRef}` : entry.sourceKey || entry.message?.id || 'message';
+}
+
+/** The values a person entered, by field name, as the form's fields say. */
+function messageFormValues(formEl, form, submitter) {
+  const data = new FormData(formEl);
+  if (submitter?.name) data.set(submitter.name, submitter.value);
+  const values = {};
+  for (const field of form.fields) {
+    if (field.type === 'toggle') values[field.name] = data.has(field.name);
+    else if (field.type === 'choice' && field.multiple) values[field.name] = data.getAll(field.name).map(String);
+    else if (field.type === 'number') { const raw = String(data.get(field.name) ?? '').trim(); if (raw !== '') values[field.name] = Number(raw); }
+    else { const raw = String(data.get(field.name) ?? ''); if (raw.trim() !== '') values[field.name] = field.type === 'secret' ? raw : raw.trim(); }
+  }
+  return values;
+}
+
+/** What the agent reads: the answer as the person might have typed it. Secrets are never in it. */
+function messageFormAnswer(form, values, target) {
+  const optionText = (field, value) => {
+    const option = field.options.find((o) => o.value === value);
+    return !option ? value : option.label === option.value ? option.label : `${option.label} (${option.value})`;
+  };
+  if (form.quick) return optionText(form.fields[0], values[form.fields[0].name]);
+  const shown = (field) => {
+    const value = values[field.name];
+    if (field.type === 'secret') return value ? 'saved' : '';
+    if (field.type === 'toggle') return value ? 'Yes' : 'No';
+    if (field.type === 'choice') return (Array.isArray(value) ? value : value ? [value] : []).map((item) => optionText(field, item)).join(', ');
+    return value == null ? '' : String(value);
+  };
+  const lines = form.fields.map((field) => [field.label || field.name, shown(field), field.type === 'paragraph'])
+    .filter(([, text]) => text !== '')
+    .map(([label, text, long]) => long && text.includes('\n') ? `- ${label}:\n\n${text.split('\n').map((line) => `  ${line}`).join('\n')}` : `- ${label}: ${text}`);
+  return `${lines.join('\n')}${target ? `\n\nSaved to ${target.label}.` : ''}`;
+}
+
+/** `{{name}}` in a save's body → that field's value (a whole "{{name}}" keeps the value's type). */
+function fillFormTemplate(body, values) {
+  if (typeof body === 'string') {
+    const whole = /^\{\{\s*([\w.-]+)\s*\}\}$/.exec(body);
+    if (whole) return values[whole[1]] ?? '';
+    return body.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (_, name) => values[name] == null ? '' : String(values[name]));
+  }
+  if (Array.isArray(body)) return body.map((item) => fillFormTemplate(item, values));
+  if (body && typeof body === 'object') return Object.fromEntries(Object.entries(body).map(([key, item]) => [key, fillFormTemplate(item, values)]));
+  return body;
+}
+
+function wireMessageForms(root, v) {
+  S.formDrafts ||= {};
+  S.formErrors ||= {};
+  S.answeredForms ||= new Set();
+  root.querySelectorAll('form.ask-form.live:not([data-wired])').forEach((formEl) => {
+    formEl.dataset.wired = '1';
+    const key = formEl.dataset.form;
+    const form = S.formSpecs?.get(key);
+    if (!form) return;
+    // A draft survives the conversation's live repaints (never a secret: that stays in the field alone).
+    formEl.addEventListener('input', () => {
+      const values = messageFormValues(formEl, form);
+      for (const field of form.fields) if (field.type === 'secret') delete values[field.name];
+      S.formDrafts[key] = values;
+    });
+    formEl.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (formEl.getAttribute('aria-busy') === 'true') return;
+      if (!formEl.reportValidity()) return;
+      const submitter = event.submitter;
+      const values = messageFormValues(formEl, form, submitter);
+      const role = formEl.closest('.ck-thread')?.dataset.role || 'do';
+      const target = form.save ? settingsTarget(form.save) : null;
+      const button = submitter || formEl.querySelector('.ask-submit');
+      formEl.setAttribute('aria-busy', 'true');
+      formEl.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+      const feedback = beginActionFeedback(button);
+      let ok = false;
+      try {
+        if (form.save) {
+          try {
+            await api(form.save.path, { method: form.save.method, body: JSON.stringify(fillFormTemplate(form.save.body, values)) });
+          } catch (error) {
+            throw Object.assign(error, { formMessage: `Not saved: ${plainError(error)}` });
+          }
+        }
+        const author = formEl.closest('[data-form-author]')?.dataset.formAuthor;
+        const result = await postReply(v, role, { text: messageFormAnswer(form, values, target), to: [author || defaultRecipientFor(v)] });
+        ok = true;
+        S.answeredForms.add(key);
+        delete S.formDrafts[key];
+        delete S.formErrors[key];
+        if (result?.continuedIn) return followContinuation(v, result);
+        toast(form.save ? 'Saved' : 'Sent');
+        showSentReply(v, role, result);
+      } catch (error) {
+        S.formErrors[key] = error.formMessage || plainError(error);
+        const box = formEl.querySelector('.ask-error') || formEl.querySelector('.ask-actions, .ask-quick')?.insertAdjacentElement('afterend', Object.assign(document.createElement('div'), { className: 'ask-error', role: 'alert' }));
+        if (box) box.textContent = S.formErrors[key];
+      } finally {
+        finishActionFeedback(feedback, ok);
+        if (!ok) {
+          formEl.removeAttribute('aria-busy');
+          formEl.querySelectorAll('button').forEach((b) => { b.disabled = false; });
+        }
+      }
+    });
+  });
 }
 
 function explanationModelLabel(model = S.explanationSettings?.model) {
@@ -13751,16 +14029,18 @@ function renderConversationEntry(entry, v = S.view) {
   if (entry.type === 'input-request') {
     const escalate = v.waitingFor?.kind === 'human' || v.waitingFor?.kind === 'parent'
       ? `<button class="btn sm ghost escalate-request" title="Pass this to someone who can answer">Escalate…</button>` : '';
-    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div>${v.waitingFor?.reason === 'error' ? taskErrorHtml(entry.request.text) : `<div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math)}</div>`}${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div>${v.waitingFor?.reason === 'error' ? taskErrorHtml(entry.request.text) : `<div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math, { key: formEntryKey(entry), live: !!entry.formLive })}</div>`}${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
   }
   if (entry.type === 'message') {
     const m = entry.message;
     const shared = sharedConversation(v);
     const role = shared ? messageSpeaker(m, v) : m.role === 'user' ? (messageOrigin(m) === 'platform' ? siteName() : 'You') : m.role === 'agent' ? 'Agent' : 'System';
-    const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v, math) : renderMessageBody(m.text, math);
+    const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v, math, { key: formEntryKey(entry), live: !!entry.formLive }) : renderMessageBody(m.text, math);
     const otherAgent = shared && m.role === 'agent' && m.author && m.author !== 'do' ? ' other-agent' : '';
     const platform = m.role === 'user' && messageOrigin(m) === 'platform' ? ' platform' : '';
-    return `<div class="msg ${m.role}${otherAgent}${platform}"><div class="msg-meta"><span class="role">${esc(role)}</span>${shared ? recipientsHtml(m, v) : ''}${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${body}</div>${renderMessageImages(m.images)}${renderMessageFiles(m.files)}${m.role === 'agent' ? explainMessageAffordance(entry, v) : ''}</div>`;
+    // A form's answer goes back to the agent that asked (in a shared conversation).
+    const asker = shared && m.role === 'agent' && entry.formLive ? ` data-form-author="agent:${esc(m.author || 'do')}"` : '';
+    return `<div class="msg ${m.role}${otherAgent}${platform}"${asker}><div class="msg-meta"><span class="role">${esc(role)}</span>${shared ? recipientsHtml(m, v) : ''}${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${body}</div>${renderMessageImages(m.images)}${renderMessageFiles(m.files)}${m.role === 'agent' ? explainMessageAffordance(entry, v) : ''}</div>`;
   }
   if (entry.type === 'explanation') {
     const e = entry.explanation;
@@ -13769,7 +14049,8 @@ function renderConversationEntry(entry, v = S.view) {
   const a = entry.activity;
   const speaker = entry.speaker ? participantLabelOf(entry.speaker, v) : 'Agent';
   if (a.kind === 'message') {
-    return `<div class="msg agent${entry.speaker && entry.speaker !== 'do' ? ' other-agent' : ''}"><div class="msg-meta"><span class="role">${esc(speaker)}</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v, math)}</div>${explainMessageAffordance(entry, v)}</div>`;
+    const asker = sharedConversation(v) && entry.formLive ? ` data-form-author="agent:${esc(entry.speaker || 'do')}"` : '';
+    return `<div class="msg agent${entry.speaker && entry.speaker !== 'do' ? ' other-agent' : ''}"${asker}><div class="msg-meta"><span class="role">${esc(speaker)}</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v, math, { key: formEntryKey(entry), live: !!entry.formLive })}</div>${explainMessageAffordance(entry, v)}</div>`;
   }
   const icons = { reasoning: '◇', command: '›_', file: '±', tool: '⚙', search: '⌕', subagent: '⑂', status: '·', turn: '●', error: '!' };
   const detail = a.detail
@@ -16019,6 +16300,36 @@ function openEscalateDialog(v) {
   });
 }
 
+// A person's reply in a conversation: a message in a shared conversation (to
+// `payload.to`), else a follow-up signal to the conversation's agent. The
+// composer and message forms both send through here.
+function postReply(v, role, payload) {
+  return sharedConversation(v) && role === 'do'
+    ? api(`/api/tasks/${v.taskId}/messages`, { method: 'POST', body: JSON.stringify(payload) })
+    : api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: 'followUp', role,
+      ...Object.fromEntries(Object.entries(payload).filter(([k]) => k !== 'to' && k !== 'agents')) }) });
+}
+// After Confirm a message carries the work on in a new task: go there.
+function followContinuation(v, result) {
+  toast(`Continuing in #${result.continuedIn.num ?? result.continuedIn.id}`);
+  refreshTasks();
+  const { id, num } = result.continuedIn;
+  spaNavigate(taskUrl(id, { projectId: taskRecord(v.taskId)?.projectId || S.projectId, num }));
+}
+// Put a sent reply on screen at once — even if this browser's event WebSocket
+// is reconnecting; the durable WS copy is de-duplicated by conversationEntries
+// once it lands — then show the end of the conversation and refresh.
+function showSentReply(v, role, result, repaint = true) {
+  if (result?.message && !S.taskEvents.some((event) => event.type === 'conversation.message' && event.payload?.message?.id === result.message.id)) {
+    S.taskEvents.push({ type: 'conversation.message', taskId: v.taskId, ts: result.message.ts, payload: { role: result.role || role, message: result.message } });
+  }
+  if (!repaint) return;
+  S.conversationSent = `${v.taskId}/${role}`;
+  renderTaskPage();
+  setTimeout(refreshTask, 250);
+  setTimeout(refreshTasks, 400);
+}
+
 function wireFollowups(v) {
   if (!S.followupImages) S.followupImages = {};
   if (!S.followupFiles) S.followupFiles = {};
@@ -16071,15 +16382,9 @@ function wireFollowups(v) {
         const newAgents = shared ? Object.fromEntries(Object.entries(followupNewAgents(key))
           .filter(([agentKey]) => mentions.some((m) => m.selector === `agent:${agentKey}`))) : {};
         const to = shared ? composeRecipients(text, mentions, defaultRecipientFor(v)) : undefined;
-        const result = shared
-          ? await api(`/api/tasks/${v.taskId}/messages`, { method: 'POST', body: JSON.stringify({ text, to,
-              ...(Object.keys(newAgents).length ? { agents: newAgents } : {}),
-              ...(images.length ? { images: [...images] } : {}), ...(files.length ? { files: [...files] } : {}) }) })
-          : await api(`/api/tasks/${v.taskId}/signal`, {
-          method: 'POST',
-          body: JSON.stringify({ signal: 'followUp', text, role,
-            ...(images.length ? { images: [...images] } : {}), ...(files.length ? { files: [...files] } : {}) }),
-        });
+        const result = await postReply(v, role, { text, ...(shared ? { to } : {}),
+          ...(Object.keys(newAgents).length ? { agents: newAgents } : {}),
+          ...(images.length ? { images: [...images] } : {}), ...(files.length ? { files: [...files] } : {}) });
         sent = true;
         if (shared) {
           countMentions(to);
@@ -16091,17 +16396,10 @@ function wireFollowups(v) {
           delete S.followupHeights[key];
           images.length = 0;
           files.length = 0;
-          toast(`Continuing in #${result.continuedIn.num ?? result.continuedIn.id}`);
-          refreshTasks();
-          const { id, num } = result.continuedIn;
-          spaNavigate(taskUrl(id, { projectId: taskRecord(v.taskId)?.projectId || S.projectId, num }));
+          followContinuation(v, result);
           return;
         }
-        // Render immediately even if this browser's event WebSocket is reconnecting.
-        // The durable WS copy is de-duplicated by conversationEntries once it lands.
-        if (result?.message && !S.taskEvents.some((event) => event.type === 'conversation.message' && event.payload?.message?.id === result.message.id)) {
-          S.taskEvents.push({ type: 'conversation.message', taskId: v.taskId, ts: result.message.ts, payload: { role: result.role || role, message: result.message } });
-        }
+        showSentReply(v, role, result, false);
         // Clear the persisted draft + image store FIRST, so neither the re-render
         // below nor a background refresh can repopulate the box from them. The box
         // content is sourced from S.followupDrafts on every render, so this — not
@@ -16125,10 +16423,7 @@ function wireFollowups(v) {
         if (active?.closest?.('.followup-box')?.dataset.role === role) active.blur();
         toast(shared && to && (to.length > 1 || to[0] !== 'agent:do')
           ? `Sent to ${to.map((selector) => recipientLabel(selector, v)).join(', ')}` : 'Follow-up sent');
-        S.conversationSent = `${v.taskId}/${role}`;
-        renderTaskPage();
-        setTimeout(refreshTask, 250);
-        setTimeout(refreshTasks, 400);
+        showSentReply(v, role, null);
       } catch (e) { toast(e.message, true); }
       finally {
         if (waiting) finishActionFeedback(waiting, sent);
@@ -20623,7 +20918,9 @@ function appearanceCard() {
       </div>
       ${instRow(`Logo ${policyTip('The mark in the console, the browser tab and the installed app.')}`,
     '<span class="brand-current" id="brand-current"></span>',
-    '<button class="btn sm" type="button" id="brand-change" aria-expanded="false" aria-controls="brand-picker">Change</button>')}</div>
+    '<button class="btn sm" type="button" id="brand-change" aria-expanded="false" aria-controls="brand-picker">Change</button>')}
+      ${instRow(`Style ${policyTip('How the console looks for everyone. Classic is the earlier indigo look. Each person still picks light or dark in their profile.')}`,
+    instSegmented('skin-choice', SKINS.map((skin) => [skin.id, skin.label]), document.documentElement.getAttribute('data-skin') || '', 'Style'))}</div>
       <div class="brand-picker" id="brand-picker" hidden>
         ${BRAND_ICON_CHOICES.map((c) => `<button type="button" class="brand-option" data-icon="${esc(c.id)}" aria-pressed="false">
           <img src="/brand/${esc(c.id)}/icon-192.png" alt="" /><span>${esc(c.label)}</span>
@@ -20658,6 +20955,26 @@ async function wireAppearanceCard() {
   }
   catch { $('#appearance-card').style.display = 'none'; return; }
   mark(current);
+  // The style applies at once and saves on choice, like the logo.
+  const skins = $('#appearance-card .skin-choice');
+  if (skins) {
+    wireInstSegmented(skins.parentElement);
+    skins.addEventListener('change', async () => {
+      const previous = S.meta?.skin || '';
+      const skin = skins.dataset.value || '';
+      applySkin(skin);
+      try {
+        await api('/api/settings/global/appearance', { method: 'PUT', body: JSON.stringify({ values: { skin } }) });
+        if (S.meta) S.meta.skin = skin;
+        toast(`${SKINS.find((choice) => choice.id === skin)?.label || 'Default'} style`);
+      } catch (e) {
+        applySkin(previous);
+        skins.dataset.value = skins.dataset.unsavedValue = previous;
+        skins.querySelectorAll('[data-choice]').forEach((button) => button.setAttribute('aria-pressed', String(button.dataset.choice === previous)));
+        toast(e.message, true);
+      }
+    });
+  }
   const nameInput = $('#site-name');
   if (nameInput) nameInput.value = installation.siteName || siteName();
   $('#site-name-save')?.addEventListener('click', async () => {
@@ -22869,12 +23186,13 @@ async function wireVaultCards(organizationId) {
       <span class="setting-label">${esc(c.label)} ${connectorTip(c)}</span>
       <span class="setting-value">${c.available ? '<span class="chip ok">Connected</span>' : '<span class="chip">Not connected</span>'}${connectorNote(c) ? `<span class="setting-muted">${esc(connectorNote(c))}</span>` : ''}${c.config?.lastAutoSync?.error ? `<span class="chip warn" title="${esc(c.config.lastAutoSync.error)}">Sync error</span>` : ''}
       ${c.setup !== 'git-pass' && !c.available && c.name !== 'pass' ? `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : '1Password service-account token'}" aria-label="${esc(c.label)} ${c.name === 'bitwarden' ? 'session key' : 'service-account token'}" />` : ''}
-      ${(c.pendingWrites || []).filter(write => !write.id).map(write => `<span>${esc(write.label)}: pending write-back ${c.config?.writeBack ? `<button class="btn sm" data-write-retry="${esc(write.itemId)}">Retry</button>` : ''}<button class="btn sm" data-write-remote="${esc(write.itemId)}">Use remote value</button></span>`).join('')}</span>
+</span>
       <span class="setting-actions">${c.pendingWrites?.length ? `${c.config?.writeBack ? `<button class="btn sm" data-conn-retry title="${esc(c.pendingWrites[0]?.error || 'Saved in the vault; waiting for the external store')}">Retry ${c.pendingWrites.length} pending</button>` : `<span class="chip" title="Write-back is off; turn it on under Import… to send these">${c.pendingWrites.length} pending</span>`}<button class="btn sm" data-conn-discard title="Stop retrying these writes; credentials stay in the vault">Dismiss</button>` : ''}
       ${c.setup === 'git-pass'
         ? `<button class="btn sm" data-git-pass-connect>${c.available ? 'Reconfigure' : 'Configure'}</button>${c.available ? '<button class="btn sm" data-git-pass-check>Check connection</button>' : ''}`
         : c.available || c.name === 'pass' ? '' : '<button class="btn sm" data-conn-connect>Connect</button>'}
-      ${c.available ? '<button class="btn sm" data-conn-import>Import…</button>' : ''}</span></div>`).join('')
+      ${c.available ? '<button class="btn sm" data-conn-import>Import…</button>' : ''}</span>
+      ${(c.pendingWrites || []).some(write => !write.id) ? `<div class="conn-pending">${(c.pendingWrites || []).filter(write => !write.id).map(write => `<span>${esc(write.label)}: pending write-back ${c.config?.writeBack ? `<button class="btn sm" data-write-retry="${esc(write.itemId)}">Retry</button>` : ''}<button class="btn sm" data-write-remote="${esc(write.itemId)}">Use remote value</button></span>`).join('')}</div>` : ''}</div>`).join('')
       || '<div class="setting-muted">No password managers</div>';
     list.querySelectorAll('[data-conn]').forEach((row) => {
       const name = row.dataset.conn;
@@ -23424,6 +23742,8 @@ function updateBell() {
   badge.textContent = n;
   badge.classList.toggle('hidden', n === 0);
   $('#bell')?.classList.toggle('active', S.tab === 'inbox');
+  // A phone's sidebar is off screen: its ☰ carries a dot while something waits.
+  $('#mobile-menu')?.classList.toggle('has-unread', n > 0);
 }
 function markInboxItemReadLocally(item) {
   if (!item?.unread) return;
@@ -23721,7 +24041,7 @@ function inboxItemRoute(item) {
   return `${projectBase(project.id)}/tasks/${item.task.num ?? item.task.id}${tab}`;
 }
 
-// The signed-in person's display name for the topbar/rail. The legacy single-user
+// The signed-in person's display name for the sidebar. The legacy single-user
 // session is the string 'me'; real identity sessions carry a Better Auth user.
 function userDisplayName() {
   const u = S.user;
@@ -25771,6 +26091,7 @@ async function createOrganization() {
 }
 
 // ── theme ────────────────────────────────────────────────────────────────────
+const SKINS = [{ id: '', label: 'Default' }, { id: 'classic', label: 'Classic' }];
 /** 'light', 'dark', or '' to follow the system. */
 function setTheme(next) {
   if (next) document.documentElement.setAttribute('data-theme', next);
@@ -25780,7 +26101,19 @@ function setTheme(next) {
 (function initTheme() {
   const t = localStorage.getItem('karmax-theme');
   if (t) document.documentElement.setAttribute('data-theme', t);
+  // The installation's look arrives with /api/meta; until then, the one it had
+  // last time, so a classic installation never flashes the default look.
+  try { applySkin(localStorage.getItem('karmax-skin') || ''); } catch {}
 })();
+/** The installation's look (Installation → Appearance → Style): '' is the
+ * default, 'classic' the earlier indigo console. Every colour, radius and type
+ * size is a token of the look (web/styles.css "Looks"). */
+function applySkin(skin) {
+  const value = SKINS.some((s) => s.id === skin) ? skin : '';
+  if (value) document.documentElement.setAttribute('data-skin', value);
+  else document.documentElement.removeAttribute('data-skin');
+  try { localStorage.setItem('karmax-skin', value); } catch {}
+}
 
 // ── projects ─────────────────────────────────────────────────────────────────
 // The folder a world checks a repository source out into (its basename), which
@@ -26340,7 +26673,7 @@ function openAdjacentTask(delta) {
 function railRows() {
   // Search results are projects; skip their folder headings during a filtered walk.
   const folders = (S.projectSearch || '').trim() ? '' : ', #rail .folder-toggle';
-  return [...document.querySelectorAll('#rail .rail-icon, #rail .rail-add, #project-search, #rail .project-link' + folders)];
+  return [...document.querySelectorAll('#rail .rail-row, #rail .rail-icon, #rail .rail-profile, #rail .rail-add, #project-search, #rail .project-link' + folders)];
 }
 function inRail() { return !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('#rail')); }
 // Unfold a folded sidebar (or slide it over a phone's page) so it can take focus.
@@ -26380,7 +26713,7 @@ function closeTopOverlay() {
 
 // -- the shortcut echo: what you just did, as keys ---------------------------
 // Every action with a shortcut — clicked, run from the palette or typed — shows
-// its keys in the topbar for a moment, so the console teaches its own keyboard.
+// its keys at the window's top right for a moment, so the console teaches its own keyboard.
 // A chord prefix ('g') shows until the chord completes or lapses. The keys come
 // from the same registry as dispatch: clickable controls name their command in
 // `data-shortcut` (its id), or a raw binding in `data-keys`.
@@ -26520,7 +26853,7 @@ function submitTarget(from = document.activeElement) {
   return marked.length === 1 ? marked[0] : null;
 }
 // Is `button` what ⌘/Ctrl+Enter presses while typing in its form? Then a click
-// on it teaches that key in the topbar echo.
+// on it teaches that key in the key echo.
 function submitsByKey(button) {
   const form = button.closest(SUBMIT_FORM) || topSurface();
   const field = [...(form?.querySelectorAll('textarea, select, input:not([type="hidden"]):not([type="file"])') || [])]

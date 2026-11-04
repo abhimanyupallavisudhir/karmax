@@ -43,7 +43,7 @@ global.S = {
 global.ICON = { stop: '<svg></svg>' };
 global.waitingText = (w) => ({ account: 'Waiting for credential' }[w.kind] || w.kind);
 for (const fn of ['defaultRecipientFor', 'sharedConversation', 'participantLabelOf', 'messageOrigin', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'composeRecipients',
-  'nextAgentKeyFor', 'locateMentions', 'taskTranscripts', 'conversationTextKey', 'conversationEntries', 'renderConversationEntry',
+  'nextAgentKeyFor', 'locateMentions', 'taskTranscripts', 'conversationTextKey', 'conversationEntries', 'formEntryKey', 'renderConversationEntry',
   'activeAgentsHtml', 'waitingText', 'waitingLabel', 'stoppableAgent', 'stopAgentButton', 'conversationPresence']) eval(extractFn(fn));
 
 const view = {

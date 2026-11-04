@@ -191,7 +191,7 @@ const PAGE = `<!doctype html><html data-theme="light"><body><main class="main"><
 
     // At the Installation page's width every bar keeps a readable length.
     for (const bar of await page.locator('.limits-bar').all())
-      assert.ok((await bar.boundingBox()).width >= 90, 'a bar is squeezed at the settings column width');
+      { const w = (await bar.boundingBox()).width; assert.ok(w >= 90, `a bar is squeezed at the settings column width (${w}px)`); }
     // Editing: limits, plan, the Cloudflare token (write-only) — one PUT.
     await page.locator('[data-limits-edit="cloudflare-workers"]').click();
     const editor = page.locator('.limits-editor');

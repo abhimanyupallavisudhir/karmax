@@ -174,7 +174,7 @@ it('lands on the organization home, For me across projects, Active one click awa
     await page.locator('#tf-close').click();
     const shots = process.env.HOME_SCREENSHOTS;
     if (shots) {
-      await page.locator('#mobile-menu').click();
+      await page.locator('#rail-collapse').click();
       await expect.poll(async () => (await page.locator('#rail').boundingBox())?.width ?? 0).toBeLessThan(1);
       await page.screenshot({ path: path.join(shots, 'app-home-collapsed.png') });
       await page.setViewportSize({ width: 390, height: 780 });
