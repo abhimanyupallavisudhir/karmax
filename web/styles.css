@@ -586,6 +586,7 @@ a { color: var(--accent); text-decoration: none; }
 .tabs-action { flex: none; align-self: center; margin: 0 4px 0 0; }
 
 .page-title { font-size: var(--fs-15); font-weight: 650; margin: 0 0 14px; letter-spacing: -0.01em; }
+.scope-title code { font-family: var(--font-mono); font-size: .92em; font-weight: 600; letter-spacing: 0; padding: .1em .4em; border-radius: 5px; background: var(--tint); overflow-wrap: anywhere; }
 
 /* new-task composer */
 .composer { display: flex; gap: 8px; margin-bottom: 18px; }

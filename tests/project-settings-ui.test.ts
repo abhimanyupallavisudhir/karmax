@@ -20,15 +20,31 @@ const visible = (ui: Console, selector: string) => ui.page.locator(selector).isV
 const pane = (ui: Console, id: string) => ui.page.locator(`.settings-nav a[href="#${id}"]`).click();
 
 describe('Project settings', () => {
-  it('uses the same name-first heading hierarchy for project and organization settings', async () => {
+  it('names the scope and its name in every settings and wiki heading', async () => {
+    const heading = async (ui: Console) => {
+      const title = ui.page.locator('h1.page-title');
+      await title.waitFor();
+      return [await title.textContent(), await title.locator('code').textContent(),
+        await title.locator('code').evaluate((element) => getComputedStyle(element).fontFamily)];
+    };
+    const mono = expect.stringMatching(/mono/i);
     const project = await settings();
-    expect(await project.page.locator('h1.page-title').textContent()).toBe('Workspace');
-    expect(await project.page.locator('.settings-intro').count()).toBe(0); // the active tab already says Project settings
+    expect(await heading(project)).toEqual(['Project settings: Workspace', 'Workspace', mono]);
+    expect(await project.page.locator('.settings-intro').count()).toBe(0);
     await project.close();
     const organization = await settings({ path: '/org/settings' });
-    expect(await organization.page.locator('h1.page-title').textContent()).toBe('Organization');
+    expect(await heading(organization)).toEqual(['Organization settings: Organization', 'Organization', mono]);
     expect(await organization.page.locator('.settings-intro').count()).toBe(0);
     await organization.close();
+    const wiki = (route: string) => consolePage({ path: route, api: signedIn(async (call: ApiCall) =>
+      /\/wiki(\/refs)?(\?|$)/.test(call.path) ? { toc: { children: [] }, unconditional: [], defaultBranch: 'main', branches: ['main'], tasks: [] }
+        : emptySettings(call)) }).then(async (ui) => { await ui.run('boot()'); return ui; });
+    const projectWiki = await wiki('/org/workspace/wiki');
+    expect(await heading(projectWiki)).toEqual(['Project wiki: Workspace', 'Workspace', mono]);
+    await projectWiki.close();
+    const organizationWiki = await wiki('/org/wiki');
+    expect(await heading(organizationWiki)).toEqual(['Organization wiki: Organization', 'Organization', mono]);
+    await organizationWiki.close();
   });
 
   it('places permission-gated rename controls in Advanced settings and saves only the name', async () => {

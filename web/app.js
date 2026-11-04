@@ -18590,11 +18590,17 @@ function wikiScopeInfo(proj) {
   return { scope: 'organization', id: org.id, title: org.name, base: `/api/organizations/${encodeURIComponent(org.id)}/wiki`, view: '' };
 }
 
+// "Project settings: `app`": organization and project pages look alike, so
+// every settings and wiki page says whose it is.
+function scopeTitle(scope, name) {
+  return `<h1 class="page-title scope-title">${scope}${name ? `: <code>${esc(name)}</code>` : ''}</h1>`;
+}
+
 function wikiView(proj) {
   const info = wikiScopeInfo(proj);
   if (!info) return `<div class="empty">No organization yet.</div>`;
   // The branch picker shows only once there is another branch or task to view.
-  return `<div class="organization-settings wiki-page"><div class="settings-header">${proj ? '' : '<h1 class="page-title">Wiki</h1>'}${proj ? `<label class="wiki-view-picker" title="Show this wiki on another branch, or live in a task's checkout"${wikiViewChoices(proj) ? '' : ' hidden'}>
+  return `<div class="organization-settings wiki-page"><div class="settings-header">${scopeTitle(proj ? 'Project wiki' : 'Organization wiki', info.title)}${proj ? `<label class="wiki-view-picker" title="Show this wiki on another branch, or live in a task's checkout"${wikiViewChoices(proj) ? '' : ' hidden'}>
       <span>Viewing</span><select id="wiki-view-select">${wikiViewOptionsHtml(proj)}</select></label>` : ''}</div>
     <div class="settings-layout"><nav class="settings-nav wiki-nav" id="wiki-nav" aria-label="Wiki entries"></nav>
     <div class="settings-content" id="wiki-pane"></div></div></div>`;
@@ -19496,7 +19502,7 @@ function renderWikiEditor(info, proj, pane, page) {
 }
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
-  return `<div class="organization-settings"><div class="settings-header"><h1 class="page-title">${esc(proj.name)}</h1></div><div class="settings-layout">
+  return `<div class="organization-settings"><div class="settings-header">${scopeTitle('Project settings', proj.name)}</div><div class="settings-layout">
     <nav class="settings-nav" aria-label="Project settings sections"><a href="#project">Project</a><a href="#project-agents">Agents</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project"><div>Project</div></div>
     <div class="project-config-section" id="project-git"><div><h2>Git &amp; GitHub ${policyTip('Everyone in this project gets access to its repositories on GitHub automatically.')}</h2></div></div>
@@ -25690,7 +25696,7 @@ function openComputerDialog(provider, connection, organizationId, onSaved, { man
 function organizationView() {
   const org = S.organizations.find((o) => o.id === S.organizationId);
   const authorizationProjects = S.projects.filter((project) => project.organizationId === S.organizationId);
-  return `<div class="organization-settings"><div class="settings-header"><h1 class="page-title">${esc(org?.name || 'Organization')}</h1></div>
+  return `<div class="organization-settings"><div class="settings-header">${scopeTitle('Organization settings', org?.name || '')}</div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
     <nav class="settings-nav" aria-label="Settings sections"><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Resources</a><a href="#settings-agents">Agents</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
