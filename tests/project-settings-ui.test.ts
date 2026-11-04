@@ -3,6 +3,8 @@ import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { closeConsoleBrowser, consolePage, emptySettings, signedIn, type ApiCall, type ApiHandler } from './helpers/console-page.js';
 
+declare const getComputedStyle: (element: unknown) => { fontFamily: string }; // runs in the page
+
 afterAll(closeConsoleBrowser);
 
 async function settings(options: { path?: string; api?: ApiHandler; projects?: Array<Record<string, unknown>>;
