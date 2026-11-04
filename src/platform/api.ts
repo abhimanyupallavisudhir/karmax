@@ -4022,10 +4022,14 @@ export class KarmaxApi {
     if (infrastructureBackoff && !actions.some((action) => action.name === 'retry'))
       actions.unshift(RETRY_ACTION());
     // A wait for a credential or its quota resumes by itself, but only a person
-    // knows they just topped up credits or that a limit lifted early.
+    // knows they just topped up credits or that a limit lifted early: the button
+    // checks the logins again. Nothing failed, so it is not "Retry". A turn the
+    // quota scheduler holds back has usable logins, so checking them changes
+    // nothing; its control is Run now (pramana#137 showed a useless Retry).
     if (view.status === 'waiting' && view.waitingFor?.kind === 'account' && view.waitingFor.provider
+      && !view.waitingFor.detail?.startsWith('Held')
       && !actions.some((action) => action.name === 'retry'))
-      actions.unshift(RETRY_ACTION());
+      actions.unshift({ ...RETRY_ACTION(), label: 'Check again' });
 
     const origin = view.state?.humanPauseOrigin as Stage | undefined;
     if (view.status !== 'waiting' || view.waitingFor?.kind !== 'human' || !origin)

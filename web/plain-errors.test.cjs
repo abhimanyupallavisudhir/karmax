@@ -88,4 +88,12 @@ assert.ok(!taskErrorHtml('Activity task failed → stream ended unexpectedly').i
 assert.match(plainTaskError('Could not publish resources: file lock admission timed out Nothing was lost; Retry publishes again.').summary,
   /^The task’s computer was busy with another operation \(starting, saving or parking it\)\. Retry usually fixes this\.$/); passed++;
 
+// pramana#137 (2026-11-04): a run crashed because Hetzner's CPUs were full, and
+// the task said only "workflow failed". The reason, as of a stopped task.
+const full = plainTaskError("workflow failed: tavya's Hetzner Cloud computers are using 8 of their 10 CPUs; waiting for room.");
+eq(full.summary, "The task stopped: tavya's Hetzner Cloud computers are using 8 of their 10 CPUs. Retry once there’s room.", 'a full provider, said as stopped');
+assert.ok(!taskErrorHtml("workflow failed: tavya's Hetzner Cloud computers are using 8 of their 10 CPUs; waiting for room.").includes('Press Retry'), 'its advice is not doubled'); passed++;
+eq(plainTaskError('workflow failed: could not seed the parent branch').summary, 'The task stopped: could not seed the parent branch.', 'any other crash keeps its cause');
+assert.ok(taskErrorHtml('workflow failed: could not seed the parent branch').includes('Press Retry to try again.'), 'and suggests Retry'); passed++;
+
 console.log(`${passed} passed, 0 failed`);

@@ -10,7 +10,7 @@ import { reconcileTasks } from '../src/platform/reconcile.js';
 import { mergeQueueDomains } from '../src/domain/types.js';
 import { mergeQueueId, SIG_CANCEL_MERGE } from '../src/coordinators/names.js';
 import { WorkflowFailedError } from '@temporalio/client';
-import { TerminatedFailure } from '@temporalio/common';
+import { ActivityFailure, ApplicationFailure, RetryState, TerminatedFailure } from '@temporalio/common';
 // Derived, not hard-coded: the pinned type moves every time a workflow ships a
 // new replay version, and a literal here just makes an unrelated PR red.
 const bundledVersion = (name: string) => MANIFESTS.find((m) => m.name === name)!.version;
@@ -353,5 +353,59 @@ describe('failed software-dev recovery', () => {
     expect(await api.getTaskView(token, task.id)).toMatchObject({ status: 'waiting', updatedAt: 1,
       waitingFor: { kind: 'account', earliestResetAt: 123_000, detail: 'Provider usage limit reached' } });
     expect(queries).toBe(1);
+  });
+
+  // pramana#137 (2026-11-04): a save before sub-tasks found Hetzner's CPUs full,
+  // the run failed, and the task said only "workflow failed".
+  it('records what failed a run that ended without settling its view', async () => {
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Crashed'));
+    const task = (await store.createTask({ projectId: project.id, title: 'T', workflow: 'software-dev',
+      workflowVersion: '1.30.0', params: { prompt: 'x' } }));
+    (await store.saveView(task.id, { taskId: task.id, title: 'T', workflow: 'software-dev', stage: 'do', status: 'active',
+      messages: [], actions: [], state: {}, updatedAt: 1 }));
+    const full = "tavya's Hetzner Cloud computers are using 8 of their 10 CPUs; waiting for room.";
+    const failed = { workflow: { getHandle: () => ({
+      describe: async () => ({ status: { name: 'FAILED' }, runId: 'run-137' }),
+      result: async () => { throw new WorkflowFailedError('Workflow execution failed',
+        new ActivityFailure('Activity task failed', 'commitWork', '74', RetryState.NON_RETRYABLE_FAILURE, 'worker',
+          ApplicationFailure.create({ type: 'world-capacity', nonRetryable: true, message: full,
+            // Under a world failure is the provider's raw answer, never shown.
+            cause: ApplicationFailure.create({ type: 'ManagedComputeBusy', message: '{"raw":"provider"}' }) })),
+        'NON_RETRYABLE_FAILURE'); },
+    }) } } as any;
+    expect((await reconcileTasks(store, failed)).settled).toBe(1);
+    expect((await store.getTask(task.id))?.lastView).toMatchObject({
+      stage: 'failed', status: 'failed', state: { failedFrom: 'do' }, error: `workflow failed: ${full}` });
+  });
+
+  // pramana#137, after its Retry: the turn waited for a login the quota
+  // scheduler held for higher-priority work, and the page offered "Retry".
+  describe('a turn waiting for a login', () => {
+    const fixture = async (detail: string) => {
+      const store = (await Store.create(':memory:'));
+      const tokens = new TokenAuthority();
+      const token = (await tokens.mint({ taskId: 'operator', profileId: 'do', principal: 'user:test',
+        ceiling: ['read-task'], grantorCaps: ['read-task'] })).token;
+      const project = (await store.createProject('Logins'));
+      const task = (await store.createTask({ projectId: project.id, title: 'T', workflow: 'software-dev',
+        workflowVersion: bundledVersion('software-dev'), params: { prompt: 'x' } }));
+      (await store.saveView(task.id, { taskId: task.id, title: 'T', workflow: 'software-dev', stage: 'do', status: 'waiting',
+        waitingFor: { kind: 'account', provider: 'claude' }, messages: [], actions: [], state: {}, updatedAt: 1 }));
+      const client = { workflow: { getHandle: (id: string) => ({ query: async () => id === 'account-coordinator'
+        ? { waiting: true, detail } : undefined }) } } as any;
+      return (await new KarmaxApi({ store, client, taskQueue: 'test', tokens }).getTaskView(token, task.id))!;
+    };
+
+    it('offers no Retry while the scheduler holds it back: nothing failed, and its control is Run now', async () => {
+      const view = await fixture('Held for higher-priority work');
+      expect(view.waitingFor?.detail).toBe('Held for higher-priority work');
+      expect(view.actions.map((action) => action.name)).not.toContain('retry');
+    });
+
+    it('offers to check the logins again while they are limited, not to "Retry"', async () => {
+      const view = await fixture('Provider usage limit reached');
+      expect(view.actions.find((action) => action.name === 'retry')).toMatchObject({ label: 'Check again' });
+    });
   });
 });
