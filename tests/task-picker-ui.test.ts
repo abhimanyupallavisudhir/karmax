@@ -92,7 +92,10 @@ describe('fork picker across projects', () => {
     const ui = await consolePage({ path: '/org/workspace', api: signedIn(({ method, path }) => {
       const pathname = path.split('?')[0];
       if (method === 'GET' && pathname === '/api/organizations/o/search') {
-        const q = new URL(`http://x${path}`).searchParams.get('q') || '';
+        const params = new URL(`http://x${path}`).searchParams;
+        // The sidebar's For me counts are their own search, not the picker's.
+        if (params.get('countBy')) return { total: 0, counts: {} };
+        const q = params.get('q') || '';
         queries.push(q);
         return { tasks: [
           { id: 'task_p', num: 1, projectId: 'p', title: 'Here', workflow: 'software-dev', params: {}, lastView: { status: 'done' } },
@@ -129,7 +132,10 @@ describe('dependency picker', () => {
     const projects = [{ id: 'p', organizationId: 'o', name: 'Workspace', config: {} }, { id: 'q', organizationId: 'o', name: 'Website', config: {} }];
     const ui = await consolePage({ path: '/org/workspace', api: signedIn(({ method, path }) => {
       if (method === 'GET' && path.split('?')[0] === '/api/organizations/o/search') {
-        const q = new URL(`http://x${path}`).searchParams.get('q') || '';
+        const params = new URL(`http://x${path}`).searchParams;
+        // The sidebar's For me counts are their own search, not the picker's.
+        if (params.get('countBy')) return { total: 0, counts: {} };
+        const q = params.get('q') || '';
         queries.push(q);
         return { tasks: q.includes('project:workspace') ? [] : [
           { id: 'task_q', num: 2, projectId: 'q', title: 'Elsewhere', workflow: 'software-dev', params: {}, lastView: { status: 'done' } }] };

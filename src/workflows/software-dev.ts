@@ -377,6 +377,10 @@ const SEVERAL_BRANCHES_DATA_REVIEW = 'several-branches-data-review-v1';
 /** A sub-task whose parent world cannot be reached is waited out, then a
  * person's, never the asking agent's (pramana#39/#43). */
 const SUBTASK_PREPARE_WAITS_FOR_WORLD = 'software-dev-subtask-prepare-waits-for-world-v1';
+/** The save before sub-tasks start, and a pull request's move to its new
+ * head, wait for a machine the provider cannot start yet, as resource work
+ * does, instead of failing the task (pramana#137: Hetzner's CPUs were full). */
+const WORLD_REOPENS_WAIT = 'software-dev-world-reopens-wait-v1';
 /** A message that comes while Review sets up returns to the agent before
  * Review waits on anyone. Setup used to publish a wait, which parked the world
  * first, and its message started nothing until the park ended (legibench3 #20). */
@@ -4115,7 +4119,8 @@ Inspect the complete current diff and specifically compare its delta from the re
         if (pendingHead && world) {
           const head = pendingHead;
           pendingHead = undefined;
-          await core.movePullRequest(world as WorldHandle, head);
+          const move = () => core.movePullRequest(world as WorldHandle, head);
+          await (patched(WORLD_REOPENS_WAIT) ? waitingForWorld(move) : move());
         }
         seen = msgs.length;
         return { completed: true, providerCompleted: true, output: '', openPrRequested: true };
@@ -4140,7 +4145,17 @@ Inspect the complete current diff and specifically compare its delta from the re
    *  the top. Commit-on-spawn snapshots our work first (worktrees share commits, not the
    *  dirty tree) so children fork the current state. */
   async function spawnSubTasks(list: SpawnRequest[], requester = MAIN_AGENT) {
-    await core.commitWork(world as any, `tavya: snapshot before sub-tasks for ${taskId}`);
+    const snapshot = () => core.commitWork(world as any, `tavya: snapshot before sub-tasks for ${taskId}`);
+    if (!patched(WORLD_REOPENS_WAIT)) await snapshot();
+    else {
+      try { await waitingForWorld(snapshot); }
+      catch (err) {
+        // Still no machine after the waits: a person's Retry saves and creates them again.
+        if (!list.length || !isInfraFailure(err)) throw err;
+        await unpreparedSubTasks(list[0]!, list.slice(1), err, requester);
+        return;
+      }
+    }
     for (const [index, s] of list.entries()) {
       // Preserve recorded spawn/drop decisions during replay. New decisions have
       // no per-parent child cap; execution is governed by shared admission control.

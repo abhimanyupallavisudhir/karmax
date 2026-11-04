@@ -197,3 +197,59 @@ describe('a task waiting for approval', () => {
     expect((await f.store.getTask(f.draft.id))!.params).toMatchObject({ triggerState: 'armed', _awaitingApproval: null });
   });
 });
+
+describe('running a draft its creator could not fully authorize', () => {
+  it('grants it with the authority of whoever runs it, when they hold all of it', async () => {
+    const f = await fixture();
+    const agent = await f.agentOf(f.parent.id);
+    const draft = await f.api.createTask(agent, { projectId: f.project.id, workflow: 'just-do', prompt: 'child',
+      authorization: f.maintainer, draft: true, allowAttenuation: true });
+    // Its creator still cannot start what it could not grant…
+    const refusal = await f.api.queueTask(agent, draft.id).catch((error) => error);
+    expect(refusal).toBeInstanceOf(AuthorizationGrantError);
+    expect(refusal.message).toMatch(/"queueAfterApproval":true/);
+    expect((await f.store.getTask(draft.id))!.params).toMatchObject({ draft: true,
+      _authorization: { principal: `task-agent:${f.parent.id}:do`, attenuationAccepted: false } });
+    // …but someone who holds the whole package runs it under their own authority.
+    await f.api.queueTask(await f.human('maint'), draft.id);
+    const task = (await f.store.getTask(draft.id))!;
+    expect(task.params.draft).toBeFalsy();
+    expect(task.params._authorization).toMatchObject({ level: 'maintainer', principal: 'user:maint', profileAttenuated: false });
+    expect((task.params._authorization as { capabilities: string[] }).capabilities).toContain('project:edit');
+  });
+
+  it('runs a weekly draft a sub-task’s agent saved, for the organization owner (pramana)', async () => {
+    const f = await fixture();
+    // A sub-task's agent merges only into its parent's branch, so it cannot
+    // grant a Developer task's merge-into:* and saves the draft limited.
+    const held = (await f.authorization.capabilities('user:maint', f.project.id, f.organization.id))
+      .filter((capability) => capability !== 'merge-into:*');
+    const agent = await f.agentOf(f.parent.id, [...held, 'merge-into:tavya/parent', 'use-credential:item:vi_upload']);
+    const draft = await f.api.createTask(agent, { projectId: f.project.id, workflow: 'just-do', prompt: 'Process readers’ submissions',
+      authorization: { level: 'developer', scope: 'projects', projectIds: [f.project.id] },
+      credentialGrants: ['use-credential:item:vi_upload'], draft: true, allowAttenuation: true,
+      params: { repeatable: true, triggers: [{ kind: 'schedule', cron: '0 6 * * 1', recurring: true }] } } as any);
+    expect(draft.params._authorization).toMatchObject({ profileAttenuated: true, attenuationAccepted: false });
+    await f.api.queueTask(await f.human('owner'), draft.id);
+    const task = (await f.store.getTask(draft.id))!;
+    expect(task.params).toMatchObject({ triggerState: 'armed' });
+    expect(task.params._authorization).toMatchObject({ level: 'developer', principal: 'user:owner', profileAttenuated: false });
+    expect((task.params._authorization as { capabilities: string[] }).capabilities)
+      .toEqual(expect.arrayContaining(['merge-into:*', 'use-credential:item:vi_upload']));
+  });
+
+  it('runs a draft a project transfer left without a grantor', async () => {
+    const f = await fixture();
+    const draft = await f.api.createTask(await f.human('dev'), { projectId: f.project.id, workflow: 'just-do',
+      prompt: 'Process readers’ submissions', draft: true });
+    // What src/platform/project-transfer.ts stores for every moved draft.
+    await f.store.patchTaskParams(draft.id, { _authorization: { profileId: 'developer', level: 'developer', scope: 'projects',
+      projectIds: [f.project.id], organizationId: f.organization.id, capabilities: [], principal: 'system:project-transfer',
+      profileAttenuated: true, attenuationAccepted: false } });
+    await f.api.queueTask(await f.human('owner'), draft.id);
+    const task = (await f.store.getTask(draft.id))!;
+    expect(task.params.draft).toBeFalsy();
+    expect(task.params._authorization).toMatchObject({ level: 'developer', principal: 'user:owner', profileAttenuated: false });
+    expect((task.params._authorization as { capabilities: string[] }).capabilities.length).toBeGreaterThan(0);
+  });
+});

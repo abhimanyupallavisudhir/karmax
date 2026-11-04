@@ -32,6 +32,7 @@ const code = [
   ...['urgencyRank', 'inboxUnreadCount', 'inboxRowLabel', 'notifyPrefs', 'inboxArrivals',
     'announceInbox', 'inboxTitle', 'showVisualNotification', 'showSystemNotification', 'syncNotificationAlerts', 'updateBell',
     'markInboxItemReadLocally', 'markInboxItemRead', 'isNewTabClick', 'loadInbox'].map(fn),
+  'function refreshForMeCounts() {}',
 ].join('\n');
 
 (async () => {

@@ -285,6 +285,10 @@ describe('prompt preamble (SPEC §5.4)', () => {
     expect(out).toMatch(/create_review_info.*optional/i);
     expect(out).toContain('limited to 280 characters');
     expect(out).toContain('Source code is not a human-readable output');
+    // Agents can ask with a form (web/markdown.js parseForm) instead of "reply A, B or C".
+    expect(out).toContain('a ```form fence holding JSON');
+    expect(out).toContain('{"label": "Which database?", "options": ["Postgres", "SQLite"]}');
+    expect(out).toContain('"value": "{{key}}"');
     expect(manifest('software-dev')!.promptPreamble).toBeUndefined();
   });
 
@@ -312,6 +316,12 @@ describe('prompt preamble (SPEC §5.4)', () => {
     expect(GLOBAL_INSTRUCTIONS).toContain('at most 280 characters');
     expect(GLOBAL_INSTRUCTIONS).toContain('Source code is not a human-readable output');
     expect(GLOBAL_INSTRUCTIONS).toMatch(/summaries of changes\/answers in your final response/i);
+    // Reviewers often judge the work from the review info alone, and open targets
+    // are snapshotted when attached, so agents must re-attach after later edits.
+    expect(GLOBAL_INSTRUCTIONS).toContain('Reviewers often judge the work from the review info alone');
+    expect(GLOBAL_INSTRUCTIONS).toMatch(/call create_review_info again/);
+    for (const tool of [...PLATFORM_TOOL_SCHEMAS, ...TOOL_SCHEMAS].filter((t) => t.name === 'create_review_info'))
+      expect(tool.description).toMatch(/snapshot.*call (it )?again/is);
   });
 
   it('steers agents to MCP connections and the wiki in global instructions', () => {

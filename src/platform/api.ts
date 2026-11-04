@@ -2447,18 +2447,21 @@ export class KarmaxApi {
 
   private async queueStoredTask(token: string, taskId: string): Promise<TaskRecord> {
     const receivedAt = (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
-    const task = await this.deps.store.getTask(taskId);
+    let task = await this.deps.store.getTask(taskId);
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     const caller = (await this.require(token, 'create_task', { projectId: task.projectId, taskId }));
     const storedAuthorization = task.params?._authorization as {
       profileAttenuated?: boolean; attenuationAccepted?: boolean; missingCredentialGrants?: string[];
     } | undefined;
+    // A limited grant nobody accepted (its creator could not grant it all, or a
+    // project transfer left it without a grantor) is granted again by whoever
+    // runs it; it is refused only if they cannot grant it all either.
     if ((storedAuthorization?.profileAttenuated || storedAuthorization?.missingCredentialGrants?.length)
       && !storedAuthorization.attenuationAccepted) {
-      const selection = previousTaskGrants(task).authorization;
-      throw selection ? await this.authorizationGap(token, task.projectId, selection, { kind: 'task', taskId, queue: true },
-        { credentialGrants: storedAuthorization.missingCredentialGrants })
-        : new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
+      const { authorization: selection, credentialGrants } = previousTaskGrants(task);
+      if (!selection) throw new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
+      task = (await this.setTaskAuthorization(token, taskId, selection,
+        [...credentialGrants, ...(storedAuthorization.missingCredentialGrants ?? [])], undefined, { queue: true }));
     }
     // A draft sub-task is started by its parent, under the parent's grant.
     if (task.parentTaskId && task.params?.draft) return this.queueSubTaskDraft(caller, task);
@@ -2643,7 +2646,9 @@ export class KarmaxApi {
     requested: string | AuthorizationSelection,
     credentialGrants?: string[],
     credentialPolicies?: VaultTaskPolicyOverrides,
-    options: { allowAttenuation?: boolean; acceptAttenuation?: boolean; preserveCredentialGrants?: boolean } = {},
+    options: { allowAttenuation?: boolean; acceptAttenuation?: boolean; preserveCredentialGrants?: boolean;
+      /** Granting it to start it: a refusal's summons also starts it once approved. */
+      queue?: boolean } = {},
   ): Promise<TaskRecord> {
     const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
@@ -2716,7 +2721,7 @@ export class KarmaxApi {
       && !(editInPlace && options.allowAttenuation) && !attenuationAccepted)
       throw await this.authorizationGap(token, task.projectId,
         typeof requested === 'string' ? selectionOf(authorization, task.projectId) : requested,
-        { kind: 'task', taskId }, { credentialGrants: missingCredentialGrants });
+        { kind: 'task', taskId, queue: options.queue }, { credentialGrants: missingCredentialGrants });
     const authorizationScope = authorization as typeof authorization & {
       scope?: 'projects' | 'organization' | 'global'; projectIds?: string[]; organizationId?: string;
     };
@@ -4017,10 +4022,14 @@ export class KarmaxApi {
     if (infrastructureBackoff && !actions.some((action) => action.name === 'retry'))
       actions.unshift(RETRY_ACTION());
     // A wait for a credential or its quota resumes by itself, but only a person
-    // knows they just topped up credits or that a limit lifted early.
+    // knows they just topped up credits or that a limit lifted early: the button
+    // checks the logins again. Nothing failed, so it is not "Retry". A turn the
+    // quota scheduler holds back has usable logins, so checking them changes
+    // nothing; its control is Run now (pramana#137 showed a useless Retry).
     if (view.status === 'waiting' && view.waitingFor?.kind === 'account' && view.waitingFor.provider
+      && !view.waitingFor.detail?.startsWith('Held')
       && !actions.some((action) => action.name === 'retry'))
-      actions.unshift(RETRY_ACTION());
+      actions.unshift({ ...RETRY_ACTION(), label: 'Check again' });
 
     const origin = view.state?.humanPauseOrigin as Stage | undefined;
     if (view.status !== 'waiting' || view.waitingFor?.kind !== 'human' || !origin)
@@ -5968,6 +5977,18 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
    */
   async searchOrganizationTasks(token: string, organizationId: string, query: string | TaskQuery,
     page: { limit?: number; offset?: number } = {}, now = Date.now()) {
+    const { readable, principal } = await this.readableOrganizationProjects(token, organizationId);
+    return this.searchAuthorizedOrganization(readable, query, principal, page, now);
+  }
+
+  /** How many tasks a query finds in each of an organization's projects (the sidebar's For me numbers). */
+  async countOrganizationTasks(token: string, organizationId: string, query: string | TaskQuery, now = Date.now()) {
+    const { readable, principal } = await this.readableOrganizationProjects(token, organizationId);
+    return this.countAuthorizedOrganization(readable, query, principal, now);
+  }
+
+  /** The projects of an organization a token may search, and who it searches as. */
+  private async readableOrganizationProjects(token: string, organizationId: string) {
     if (!(await this.deps.store.getOrganization(organizationId))) throw new NotFoundError(`no such organization ${organizationId}`);
     const caller = await this.deps.tokens.verify(token);
     if (!caller) throw new CapabilityError('unauthorized');
@@ -5983,7 +6004,15 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     if (!readable.length && !(caller.organizationId === organizationId && allows(caller.caps, 'task:read'))
       && !(await this.deps.tokens.check(token, 'task:read', { organizationId })).ok)
       throw new CapabilityError(`denied: task:read in no project of organization ${organizationId}`);
-    return this.searchAuthorizedOrganization(readable, query, caller.principal, page, now);
+    return { readable, principal: caller.principal };
+  }
+
+  /** One query's rows counted per project, over already-authorized projects; the rows are never sent. */
+  async countAuthorizedOrganization(projects: Project[], query: string | TaskQuery, principalId: string, now = Date.now()) {
+    const { result } = await this.evaluateProjects(projects, query, principalId, now);
+    const counts: Record<string, number> = {};
+    for (const task of result.tasks) counts[task.projectId] = (counts[task.projectId] ?? 0) + 1;
+    return { total: result.total, counts };
   }
 
   /** Evaluate one query across already-authorized projects — an organization's,

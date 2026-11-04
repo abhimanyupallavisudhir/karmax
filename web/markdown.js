@@ -22,8 +22,11 @@
     let s = source;
     // Fenced code blocks first (a blank line around the placeholder keeps it its
     // own block).
-    s = s.replace(/```[^\n]*\n([\s\S]*?)```/g, (_, body) =>
-      `\n${keep(`<pre class="md-code"><code>${esc(body.replace(/\n$/, ''))}</code></pre>`)}\n`);
+    // A fence's language becomes a class (`lang-form` is a message form, below).
+    s = s.replace(/```([^\n]*)\n([\s\S]*?)```/g, (_, info, body) => {
+      const lang = String(info).trim().split(/\s+/)[0].toLowerCase().replace(/[^a-z0-9-]/g, '');
+      return `\n${keep(`<pre class="md-code${lang ? ` lang-${lang}` : ''}"><code>${esc(body.replace(/\n$/, ''))}</code></pre>`)}\n`;
+    });
     if (withMath) s = s.replace(/\$\$([\s\S]+?)\$\$/g, (_, body) => keep(`<span class="md-math">$$${esc(body)}$$</span>`));
     if (withMath) s = s.replace(/\\\[([\s\S]+?)\\\]/g, (_, body) => keep(`<span class="md-math">\\[${esc(body)}\\]</span>`));
     s = s.replace(/`([^`\n]+)`/g, (_, body) => keep(`<code class="md-inline">${esc(body)}</code>`));
@@ -404,5 +407,119 @@
     });
     return mathjaxLoad;
   }
-  globalThis.KarmaxMarkdown = { renderMarkdown, ensureMathJax };
+  // ── Message forms ─────────────────────────────────────────────────────────
+  // An agent asks for input with a ```form fence holding JSON: the console draws
+  // it as a form, and what a person submits is sent as their ordinary reply.
+  //   {"options": ["Postgres", "SQLite"]}                      one click answers
+  //   {"title"?, "fields": [{name, label?, type?, options?, multiple?, optional?,
+  //     placeholder?, default?, hint?, min?, max?}], "submit"?, "save"?}
+  // Types: text, paragraph, number, date, email, url, choice, toggle, secret.
+  // `save` ({method, path, body}) is an API request the person's own browser
+  // makes on submit, with {{name}} in the body replaced by that field's value:
+  // how a secret field reaches settings without ever entering the conversation.
+  const FORM_TYPES = ['text', 'paragraph', 'number', 'date', 'email', 'url', 'choice', 'toggle', 'secret'];
+  const FORM_LIMITS = { fields: 20, options: 50, text: 200 };
+  const clip = (value, max = FORM_LIMITS.text) => String(value ?? '').slice(0, max);
+  function humanize(name) {
+    const words = String(name).replace(/[_-]+/g, ' ').replace(/([a-z])([A-Z])/g, (_, a, b) => `${a} ${b.toLowerCase()}`).trim();
+    return words ? words[0].toUpperCase() + words.slice(1) : '';
+  }
+  function formOption(option) {
+    if (option && typeof option === 'object') {
+      const value = clip(option.value ?? option.label);
+      return value ? { value, label: clip(option.label ?? value), ...(option.hint ? { hint: clip(option.hint) } : {}) } : null;
+    }
+    const value = clip(option);
+    return value ? { value, label: value } : null;
+  }
+  /** A form fence's source → `{form}` (normalized) or `{error}` (said where the form would be). */
+  function parseForm(source) {
+    let raw;
+    try { raw = JSON.parse(String(source)); } catch { return { error: 'This form could not be read.' }; }
+    if (Array.isArray(raw)) raw = { fields: raw };
+    if (!raw || typeof raw !== 'object') return { error: 'This form could not be read.' };
+    const listed = Array.isArray(raw.options) ? [{ name: 'answer', label: raw.label || raw.question || '', type: 'choice', options: raw.options }]
+      : Array.isArray(raw.fields) ? raw.fields : [];
+    const seen = new Set();
+    const fields = [];
+    for (const [index, field] of listed.slice(0, FORM_LIMITS.fields).entries()) {
+      if (!field || typeof field !== 'object') continue;
+      let name = clip(field.name || `field${index + 1}`, 60).replace(/[^\w.-]/g, '_');
+      while (seen.has(name)) name += '_';
+      seen.add(name);
+      const options = Array.isArray(field.options) ? field.options.slice(0, FORM_LIMITS.options).map(formOption).filter(Boolean) : [];
+      let type = FORM_TYPES.includes(field.type) ? field.type : options.length ? 'choice' : field.type === 'boolean' || field.type === 'checkbox' ? 'toggle' : field.type === 'textarea' ? 'paragraph' : field.type === 'password' ? 'secret' : 'text';
+      if (type === 'choice' && !options.length) type = 'text';
+      fields.push({
+        name, type, label: clip(field.label ?? (raw.options ? '' : humanize(name))),
+        ...(field.hint ? { hint: clip(field.hint) } : {}),
+        ...(field.placeholder ? { placeholder: clip(field.placeholder) } : {}),
+        ...(field.default !== undefined && type !== 'secret' ? { default: field.default } : {}),
+        ...(type === 'choice' ? { options, multiple: field.multiple === true } : {}),
+        ...(type === 'number' && Number.isFinite(Number(field.min)) && field.min !== null && field.min !== '' ? { min: Number(field.min) } : {}),
+        ...(type === 'number' && Number.isFinite(Number(field.max)) && field.max !== null && field.max !== '' ? { max: Number(field.max) } : {}),
+        optional: field.optional === true || field.required === false || type === 'toggle',
+      });
+    }
+    if (!fields.length) return { error: 'This form asks for nothing.' };
+    let save;
+    if (raw.save != null) {
+      const method = String(raw.save.method || 'POST').toUpperCase();
+      const path = String(raw.save.path || '');
+      if (!['POST', 'PUT', 'PATCH'].includes(method) || !/^\/api\/[\w./:@%?=&-]+$/.test(path) || path.includes('..'))
+        return { error: 'This form saves somewhere it may not.' };
+      save = { method, path, body: raw.save.body && typeof raw.save.body === 'object' ? raw.save.body : {} };
+    }
+    if (fields.some((field) => field.type === 'secret') && !save)
+      return { error: 'This form asks for a secret without saying where it is kept, so it was not shown.' };
+    const quick = !save && fields.length === 1 && fields[0].type === 'choice' && !fields[0].multiple && fields[0].options.length <= 6;
+    return { form: { ...(raw.title ? { title: clip(raw.title) } : {}), fields, submit: clip(raw.submit || (save ? 'Save' : 'Send'), 40), ...(save ? { save } : {}), quick } };
+  }
+  /**
+   * A form's markup. `key` names it (unique on the page); a form that is not
+   * `live` (answered, or shown read-only) is drawn with its controls disabled.
+   * `values` are a draft to put back; `note` sits beside the submit button.
+   */
+  function renderForm(form, { key = 'form', live = false, values = {}, note = '', error = '' } = {}) {
+    const id = `ask-${String(key).replace(/[^\w-]/g, '-')}`;
+    const off = live ? '' : ' disabled';
+    const value = (field) => values[field.name] ?? field.default;
+    const hint = (field) => field.hint ? `<span class="ask-hint" id="${id}-${field.name}-hint">${esc(field.hint)}</span>` : '';
+    const described = (field) => field.hint ? ` aria-describedby="${id}-${field.name}-hint"` : '';
+    const label = (field, own) => field.label
+      ? `<${own ? `label for="${id}-${esc(field.name)}"` : `span id="${id}-${esc(field.name)}-label"`} class="ask-label">${esc(field.label)}${field.optional && field.type !== 'toggle' ? ' <span class="ask-optional">optional</span>' : ''}</${own ? 'label' : 'span'}>` : '';
+    if (form.quick) {
+      const field = form.fields[0];
+      return `<form class="ask-form quick${live ? ' live' : ''}" data-form="${esc(key)}" novalidate>${form.title ? `<div class="ask-title">${esc(form.title)}</div>` : ''}${label(field, false)}${hint(field)}
+        <div class="ask-quick" role="group"${field.label ? ` aria-labelledby="${id}-${esc(field.name)}-label"` : ''}>${field.options.map((option) =>
+          `<button type="submit" class="btn ask-choice" name="${esc(field.name)}" value="${esc(option.value)}"${option.hint ? ` title="${esc(option.hint)}"` : ''}${off}>${esc(option.label)}</button>`).join('')}</div>
+        ${error ? `<div class="ask-error" role="alert">${esc(error)}</div>` : ''}</form>`;
+    }
+    const control = (field) => {
+      const name = esc(field.name);
+      const fid = `${id}-${name}`;
+      const current = value(field);
+      const required = field.optional ? '' : ' required';
+      if (field.type === 'paragraph')
+        return `${label(field, true)}${hint(field)}<textarea class="ask-input" id="${fid}" name="${name}" rows="3"${field.placeholder ? ` placeholder="${esc(field.placeholder)}"` : ''}${described(field)}${required}${off}>${esc(current ?? '')}</textarea>`;
+      if (field.type === 'toggle')
+        return `<label class="ask-toggle" for="${fid}"><input class="toggle" type="checkbox" id="${fid}" name="${name}"${current === true || current === 'true' ? ' checked' : ''}${described(field)}${off}><span>${esc(field.label || humanize(field.name))}</span></label>${hint(field)}`;
+      if (field.type === 'choice') {
+        const chosen = new Set((Array.isArray(current) ? current : current == null ? [] : [current]).map(String));
+        if (field.options.length > 8 && !field.multiple)
+          return `${label(field, true)}${hint(field)}<select class="ask-input" id="${fid}" name="${name}"${described(field)}${required}${off}><option value="">Choose…</option>${field.options.map((option) =>
+            `<option value="${esc(option.value)}"${chosen.has(option.value) ? ' selected' : ''}>${esc(option.label)}</option>`).join('')}</select>`;
+        return `${label(field, false)}${hint(field)}<div class="ask-options" role="${field.multiple ? 'group' : 'radiogroup'}"${field.label ? ` aria-labelledby="${fid}-label"` : ''}>${field.options.map((option, n) =>
+          `<label class="ask-option"><input type="${field.multiple ? 'checkbox' : 'radio'}" name="${name}" value="${esc(option.value)}"${chosen.has(option.value) ? ' checked' : ''}${!field.multiple && !field.optional && n === 0 ? required : ''}${off}><span>${esc(option.label)}${option.hint ? `<small>${esc(option.hint)}</small>` : ''}</span></label>`).join('')}</div>`;
+      }
+      const type = { number: 'number', date: 'date', email: 'email', url: 'url', secret: 'password' }[field.type] || 'text';
+      return `${label(field, true)}${hint(field)}<input class="ask-input${field.type === 'secret' ? ' ask-secret' : ''}" id="${fid}" name="${name}" type="${type}"${field.type === 'secret' ? ' autocomplete="off" spellcheck="false" data-secret' : ''}${type === 'text' ? ' autocomplete="off"' : ''}${field.min !== undefined ? ` min="${field.min}"` : ''}${field.max !== undefined ? ` max="${field.max}"` : ''}${field.type === 'number' ? ' step="any"' : ''}${field.placeholder ? ` placeholder="${esc(field.placeholder)}"` : ''}${current != null && field.type !== 'secret' ? ` value="${esc(current)}"` : ''}${described(field)}${required}${off}>`;
+    };
+    return `<form class="ask-form${live ? ' live' : ''}${form.save ? ' saves' : ''}" data-form="${esc(key)}" novalidate>${form.title ? `<div class="ask-title">${esc(form.title)}</div>` : ''}
+      ${form.fields.map((field) => `<div class="ask-field" data-name="${esc(field.name)}" data-type="${field.type}">${control(field)}</div>`).join('')}
+      ${error ? `<div class="ask-error" role="alert">${esc(error)}</div>` : ''}
+      <div class="ask-actions">${note ? `<span class="ask-note">${note}</span>` : ''}<button type="submit" class="btn primary ask-submit"${off}>${esc(form.submit)}</button></div></form>`;
+  }
+
+  globalThis.KarmaxMarkdown = { renderMarkdown, ensureMathJax, parseForm, renderForm };
 })();

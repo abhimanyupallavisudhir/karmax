@@ -34,7 +34,9 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
         const source = file === 'app.js' && process.env.CONSOLE_APP_JS ? process.env.CONSOLE_APP_JS : path.join(__dirname, file);
         return route.fulfill({ contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html', body: fs.readFileSync(source, 'utf8') });
       }
-      const entry = { key: `${req.method()} ${p}`, start: Date.now(), end: Infinity };
+      // The sidebar's For me counts are their own (count-only) search.
+      const countOnly = url.searchParams.get('countBy') ? `?countBy=${url.searchParams.get('countBy')}` : '';
+      const entry = { key: `${req.method()} ${p}${countOnly}`, start: Date.now(), end: Infinity };
       log.push(entry);
       await new Promise(resolve => setTimeout(resolve, LATENCY_MS));
       let data = [], m;
@@ -186,9 +188,12 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
       };
       // 25: the default view reads the project's task store, in parallel, for its
       // recommendations (none once dismissed).
-      budget('boot', 25, 5);
-      budget('boot (other organization)', 25, 5);
-      budget('boot (home)', 25, 5);
+      // 26: the sidebar's For me counts are one count-only search, sent alongside
+      // the rest (no extra round trip in sequence).
+      budget('boot', 26, 5);
+      budget('boot (other organization)', 26, 5);
+      budget('boot (home)', 26, 5);
+      assert.equal(results.boot.counts['GET /api/organizations/o/search?countBy=project'], 1, 'the sidebar counts For me once');
       assert.equal(results.boot.counts['GET /api/projects/p/task-store'], 1, 'the default view reads the task store once');
       assert.equal(results.boot.counts['GET /api/user/preferences'], undefined, 'preferences come with the session');
       assert.equal(results['boot (home)'].counts['GET /api/organizations/o/search'], 1, 'the home searches its organization once');

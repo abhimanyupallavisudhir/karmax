@@ -21,8 +21,8 @@ it.each(cases)('keeps the $name sidebar whole and in view', async ({ width, tabs
     await page.route('http://wiki.test/**', route => {
       const url = new URL(route.request().url());
       if (url.pathname.startsWith('/fonts/')) return route.fulfill({ body: fs.readFileSync(`web${url.pathname}`) });
-      // The console's shell: top bar, then a scrolling main column.
-      return route.fulfill({ contentType: 'text/html', body: `<div id="app"><div class="topbar"></div><div class="body">
+      // The console's shell: a phone's bar (none on a computer), then the sidebar beside a scrolling main column.
+      return route.fulfill({ contentType: 'text/html', body: `<div id="app"><div class="mobile-bar"></div><div class="body">
         <div class="rail"></div><div class="main"><div class="main-inner" id="main"></div></div></div></div>` });
     });
     await page.goto('http://wiki.test/');
@@ -54,7 +54,7 @@ it.each(cases)('keeps the $name sidebar whole and in view', async ({ width, tabs
       document.querySelector('.main').scrollTop = 600;
       const navBox = document.getElementById('wiki-nav').getBoundingClientRect();
       const tabsBox = document.querySelector('.tabs')?.getBoundingClientRect();
-      return { top: navBox.top, bottom: navBox.bottom, tabsBottom: tabsBox?.bottom ?? 52, height: innerHeight };
+      return { top: navBox.top, bottom: navBox.bottom, tabsBottom: tabsBox?.bottom ?? document.querySelector('.mobile-bar').getBoundingClientRect().bottom, height: innerHeight };
     });
     expect(stuck.top).toBeGreaterThanOrEqual(stuck.tabsBottom);
     expect(stuck.bottom).toBeLessThanOrEqual(stuck.height);

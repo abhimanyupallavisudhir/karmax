@@ -32,6 +32,19 @@ export function brandIconOf(settings: Record<string, unknown> | undefined): Bran
   return isBrandIcon(settings?.icon) ? settings.icon : DEFAULT_BRAND_ICON;
 }
 
+/** The console's look (web/styles.css "Looks"): '' is the default, 'classic'
+ * the earlier indigo console. Installation-wide, like the logo. */
+export const SKINS = ['', 'classic'] as const;
+export type Skin = (typeof SKINS)[number];
+
+export function isSkin(value: unknown): value is Skin {
+  return SKINS.includes(value as Skin);
+}
+
+export function skinOf(settings: Record<string, unknown> | undefined): Skin {
+  return isSkin(settings?.skin) ? settings.skin : '';
+}
+
 export function siteNameError(value: unknown): string | undefined {
   if (typeof value !== 'string' || !value.trim()) return 'Site name is required';
   if ([...value.trim()].length > MAX_SITE_NAME_LENGTH)

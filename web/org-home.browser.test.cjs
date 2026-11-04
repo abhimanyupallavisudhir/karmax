@@ -142,15 +142,16 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.equal(await path_(), '/org/website', 'a project list\'s default view is the bare path');
     assert.equal(await activeView(), '__for_me__');
 
-    // ── ☰ folds the sidebar on a wide screen, remembered ──────────────────────
-    const toggle = page.locator('#mobile-menu');
-    assert.ok(await toggle.isVisible(), 'the menu button is there on a desktop');
-    assert.equal(await toggle.getAttribute('aria-expanded'), 'true');
-    await toggle.click();
+    // ── ⇤ folds the sidebar on a wide screen, remembered; the edge button brings it back ──
+    const fold = page.locator('#rail-collapse');
+    const unfold = page.locator('#rail-expand');
+    assert.ok(await fold.isVisible(), 'the fold button is there on a desktop');
+    assert.equal(await unfold.isVisible(), false);
+    await fold.click();
     await page.waitForFunction(() => document.querySelector('#rail').getBoundingClientRect().width < 1);
-    assert.equal(await toggle.getAttribute('aria-expanded'), 'false');
     assert.equal(await page.locator('#rail').isVisible(), false, 'the folded rail is out of sight');
     assert.ok(await page.locator('#rail').evaluate((rail) => rail.inert), 'and out of the tab order');
+    assert.ok(await unfold.isVisible(), 'a button brings it back');
     if (shots) {
       await page.goto('http://console.test/org');
       await page.locator('[data-id="t1"]').waitFor();
@@ -160,13 +161,14 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await page.reload();
     await page.locator('[data-id="t1"]').waitFor();
     assert.equal(await page.locator('#rail').isVisible(), false, 'folded stays folded after a reload');
-    await toggle.focus();
+    await unfold.focus();
     await page.keyboard.press('Enter');
     await page.waitForFunction(() => document.querySelector('#rail').getBoundingClientRect().width > 200);
-    assert.equal(await toggle.getAttribute('aria-expanded'), 'true', 'the keyboard unfolds it');
+    assert.equal(await unfold.isVisible(), false, 'the keyboard unfolds it');
 
-    // ── a phone keeps its sliding menu ────────────────────────────────────────
-    await page.locator('#mobile-menu').click(); // folded on the desktop…
+    // ── a phone keeps its sliding menu, whatever the desktop chose ───────────
+    const toggle = page.locator('#mobile-menu');
+    await fold.click(); // folded on the desktop…
     await page.setViewportSize({ width: 390, height: 780 });
     await page.goto('http://console.test/org');
     await page.locator('[data-id="t1"]').waitFor();
