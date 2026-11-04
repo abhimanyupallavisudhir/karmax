@@ -17,6 +17,7 @@
   "tests/agent-authority.test.ts": 1,
   "tests/agent-authorization.test.ts": 0.4,
   "tests/agent-card-fill.test.ts": 2.4,
+  "tests/agent-cli-releases.test.ts": 0,
   "tests/agent-control-tools.test.ts": 0.3,
   "tests/agent-defaults.test.ts": 0.1,
   "tests/agent-mail-edge.test.ts": 0.4,
