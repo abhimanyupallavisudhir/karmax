@@ -10,6 +10,7 @@ import * as __asyncCollections from '../util/async-collections.js';
 import { GatewayMetrics, type MemorySource } from './metrics.js';
 import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
 import { assetExists, MATHJAX_SCRIPT_SOURCE, serveStaticAsset, staticAssetRevision, unpublishedAsset } from './static-assets.js';
+import { docPath, LANDING_TAGLINE, policySlugOf, publicBody, publicHead, publicPath, publicPaths, resolvePublicRoute, robotsTxt, sitemapXml, type PublicPageContext, type PublicRoute } from './public-pages.js';
 import { SwrCache } from '../util/swr-cache.js';
 import { MAX_REVIEW_ARTIFACT_BYTES, savedReviewArtifact } from '../store/review-artifacts.js';
 import { readWorldFilePrefix } from '../world/file-prefix.js';
@@ -9204,23 +9205,81 @@ export class Gateway {
     res.end(body);
   }
 
+  /** Everything the public pages are rendered from, for this request; the
+   * policy document only for the policy page `pathname` names. */
+  private async publicPageContext(req?: http.IncomingMessage, pathname = ''): Promise<PublicPageContext> {
+    const siteName = (await this.siteName);
+    const launch = (await this.deps.paidLaunchSettings?.publicLaunchInfo(siteName)) ?? publicLaunchInfo(process.env, undefined, siteName);
+    const slug = policySlugOf(pathname);
+    const document = slug ? ((await this.deps.paidLaunchSettings?.policyDocument(slug, siteName)) ?? policyDocument(slug, process.env, undefined, siteName)) : undefined;
+    return { staticDir: this.deps.staticDir, siteName, launch, policy: (wanted) => (wanted === document?.slug ? document : undefined),
+      origin: req ? this.publicUrl(req) : process.env.KARMAX_PUBLIC_URL?.replace(/\/$/, '') ?? '' };
+  }
+
   // ── static SPA ──
   private async static(p: string, res: http.ServerResponse, req?: http.IncomingMessage) {
+    // Only a hosted installation's public pages are for search engines; a
+    // self-hosted one is somebody's private console.
+    const indexable = this.deps.hosted === true;
+    if (p === '/robots.txt' || p === '/sitemap.xml') {
+      const origin = req ? this.publicUrl(req) : '';
+      if (p === '/sitemap.xml' && !indexable) return void res.writeHead(404).end('not found');
+      const body = p === '/robots.txt' ? robotsTxt(origin, indexable) : sitemapXml(origin, publicPaths((await this.publicPageContext(req))));
+      res.writeHead(200, { 'content-type': MIME[path.extname(p)]!, 'cache-control': 'no-cache', 'content-length': String(Buffer.byteLength(body)) });
+      return void res.end(req?.method === 'HEAD' ? undefined : body);
+    }
     const rel = p === '/' ? '/index.html' : p === '/billing/checkout' ? '/paddle-checkout.html' : p;
     let file = path.join(this.deps.staticDir, rel);
     if (unpublishedAsset(file)) return void res.writeHead(404).end('not found');
     if (!(await assetExists(this.deps.staticDir, file))) file = path.join(this.deps.staticDir, 'index.html'); // SPA fallback
     const name = path.basename(file);
-    // Brand the HTML response itself, not just the hydrated SPA. That avoids a
-    // flash of the default name and gives crawlers/non-JS clients the current
-    // installation identity. The checked-in shell remains a portable fallback.
-    const brandShell = async (data: Buffer) => {
-      const siteName = escapeHtml((await this.siteName));
-      return Buffer.from(data.toString('utf8')
-        .replace(/(<meta name="description" content=")[^"]*(" \/>)/, `$1${siteName} is the to-do list for managing AI agents: parallel cloud worlds, review gates, permissions, credentials, and payments in one calm interface.$2`)
-        .replace(/(<meta name="apple-mobile-web-app-title" content=")[^"]*(" \/>)/, `$1${siteName}$2`)
-        .replace(/<title>[^<]*<\/title>/, `<title>${siteName}</title>`));
-    };
+    // A docs page's Markdown source (agents read it) points search engines at the page.
+    const docSource = name !== 'index.html' && p.match(/^\/docs\/([^/]+)\.md$/)?.[1];
+    if (docSource) {
+      const origin = req ? this.publicUrl(req) : '';
+      return void (await serveStaticAsset(req, res, file, undefined,
+        { headers: { link: `<${origin}${docPath(docSource)}>; rel="canonical"` } }).catch(() => {
+        if (!res.headersSent) res.writeHead(404).end('not found');
+      }));
+    }
+    // The shell answers for its URL: a public page gets its own title,
+    // description, canonical URL, social tags and a plain rendering of its
+    // content; a public URL that names nothing is a 404; the console is not
+    // for indexing. Branding the HTML itself also avoids a flash of the
+    // default name. The checked-in shell remains a portable fallback.
+    let shell: { status: number; headers: Record<string, string>; transform: (data: Buffer) => Promise<Buffer> } | undefined;
+    if (name === 'index.html') {
+      // A public page that cannot be rendered is still served, as the console.
+      const context = publicPath(p) ? (await this.publicPageContext(req, p).catch(() => undefined)) : undefined;
+      let route: PublicRoute = { kind: 'console' };
+      try { if (context) route = resolvePublicRoute(context, p); } catch { /* the console renders it */ }
+      if (route.kind === 'redirect') {
+        const query = req?.url?.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+        res.writeHead(301, { location: `${route.location}${query}`, 'cache-control': 'no-cache' });
+        return void res.end();
+      }
+      const page = route.kind === 'page' ? route.page : undefined;
+      const site = context?.siteName ?? (await this.siteName);
+      const siteName = escapeHtml(site);
+      // The card names the product, so a renamed installation shows none.
+      const socialImage = site === BRAND ? { path: '/social-card.png', alt: `${BRAND} — ${LANDING_TAGLINE}` } : undefined;
+      shell = {
+        status: route.kind === 'not-found' ? 404 : 200,
+        headers: indexable && page ? {} : { 'x-robots-tag': 'noindex' },
+        transform: async (data) => {
+          // Replacer functions: a price ("$19") is not a replacement pattern.
+          const description = escapeHtml(page?.description ?? `${site} is the to-do list for managing AI agents: parallel cloud worlds, review gates, permissions, credentials, and payments in one calm interface.`);
+          let html = data.toString('utf8')
+            .replace(/(<meta name="description" content=")[^"]*(" \/>)/, (_, open: string, close: string) => `${open}${description}${close}`)
+            .replace(/(<meta name="apple-mobile-web-app-title" content=")[^"]*(" \/>)/, (_, open: string, close: string) => `${open}${siteName}${close}`)
+            .replace(/<title>[^<]*<\/title>/, () => `<title>${escapeHtml(page?.title ?? site)}</title>`);
+          if (page && context) html = html
+            .replace(/(\n\s*)<\/head>/, (_, indent: string) => `\n    ${publicHead(context, page, socialImage)}${indent}</head>`)
+            .replace('<div id="app"></div>', () => `<div id="app">${publicBody(context, page)}</div>`);
+          return Buffer.from(html);
+        },
+      };
+    }
     // `llms.txt` is also public product copy. Keep its checked-in version a
     // useful default, then brand both its prose and same-origin links at the
     // edge so hosted and self-hosted installations describe themselves.
@@ -9234,7 +9293,8 @@ export class Gateway {
         .replace(/https:\/\/tavya\.io/g, origin || 'https://tavya.io'));
     };
     try {
-      await serveStaticAsset(req, res, file, name === 'index.html' ? brandShell : name === 'llms.txt' ? brandLlms : undefined);
+      await serveStaticAsset(req, res, file, shell?.transform ?? (name === 'llms.txt' ? brandLlms : undefined),
+        shell ? { status: shell.status, headers: shell.headers } : undefined);
     } catch {
       if (!res.headersSent) res.writeHead(404).end('not found');
     }

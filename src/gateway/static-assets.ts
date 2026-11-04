@@ -171,18 +171,21 @@ export function unpublishedAsset(file: string): boolean {
 /**
  * Serve one console asset. `transform` rewrites the body per request (the
  * installation's name in the HTML shell); validators always describe the bytes
- * actually sent, and each encoding has its own (RFC 9110 §8.8.3).
+ * actually sent, and each encoding has its own (RFC 9110 §8.8.3). `status`
+ * and `headers` answer for the URL rather than the file (a public page that
+ * does not exist, its canonical URL, whether to index it).
  */
 export async function serveStaticAsset(
   req: http.IncomingMessage | undefined,
   res: http.ServerResponse,
   file: string,
   transform?: (data: Buffer) => Buffer | Promise<Buffer>,
+  { status = 200, headers: extra = {} }: { status?: number; headers?: Record<string, string> } = {},
 ): Promise<void> {
   const source = await readFile(file);
   const data = transform ? await transform(source.data) : source.data;
   const revision = transform ? revisionOf(data) : source.revision;
-  const headers = staticAssetHeaders(file, req?.headers.host);
+  const headers = { ...staticAssetHeaders(file, req?.headers.host), ...extra };
   const compressible = COMPRESSIBLE.has(path.extname(file)) && data.length >= MIN_COMPRESS_BYTES;
   const encoding = compressible ? preferredEncoding(req?.headers['accept-encoding']) : undefined;
   if (compressible) headers.vary = 'accept-encoding';
@@ -191,13 +194,13 @@ export async function serveStaticAsset(
   const matches = String(req?.headers['if-none-match'] ?? '')
     .split(',').map((tag) => tag.trim().replace(/^W\//, ''))
     .some((tag) => tag === etag || tag === '*');
-  if (matches) {
+  if (matches && status === 200) {
     res.writeHead(304, headers);
     return void res.end();
   }
   const body = encoding ? await encode(data, revision, encoding) : data;
   if (encoding) headers['content-encoding'] = encoding;
   headers['content-length'] = String(body.length);
-  res.writeHead(200, headers);
+  res.writeHead(status, headers);
   res.end(req?.method === 'HEAD' ? undefined : body);
 }
