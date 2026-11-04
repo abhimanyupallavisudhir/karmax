@@ -4497,6 +4497,16 @@ function plainError(error) {
 function plainTaskError(text) {
   const raw = String(text || '').trim();
   const body = raw.replace(/^infrastructure: /, '').replace(/^(?:Activity task failed → )+/, '');
+  // A run that crashed, with what crashed it (pramana#137). A full provider was
+  // only "waiting for room" while the run lived; the task has stopped since.
+  const crashed = /^workflow failed: ([\s\S]+)$/.exec(body);
+  if (crashed) {
+    const cause = crashed[1].trim();
+    const full = /;\s*waiting (?:for room|its turn)\.?$/i.test(cause);
+    const said = `The task stopped: ${plainError(cause.replace(/;\s*waiting (?:for room|its turn)\.?$/i, '')).replace(/[.!?]?$/, '.')}`;
+    const summary = full ? `${said} Retry once there’s room.` : said;
+    return { summary, detail: summary === raw ? '' : raw, generic: !full };
+  }
   const retry = /— retrying (\w+) in (\d+\s*\w+) \((\d+)\/(\d+)\)\s*$/.exec(body);
   const retrying = retry ? ` tavya will try again in ${retry[2]} (attempt ${retry[3]} of ${retry[4]}).` : '';
   // Out of compute (it names "Plan & billing", which the AI-limit pattern below
@@ -15460,6 +15470,9 @@ function taskActionTip(v, action) {
   if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.reason !== 'merge') return 'Let tavya merge this on GitHub as you.';
   if (action.name === 'openPr') return 'Send the agent’s work so far to Review now.';
   if (action.name === 'cancel') return 'Stop this task. Nothing more is added to the project.';
+  if (action.name === 'retry' && v?.waitingFor?.kind === 'account') return 'Check now whether an AI login can be used again.';
+  // Why it failed, on the button itself: the error is at the end of the conversation.
+  if (action.name === 'retry' && v?.error) return plainTaskError(v.error).summary.replace(/(?<=[.!?])\s+(?:Press )?Retry\b[^.]*\.$/, '') || 'Try the last step again.';
   if (action.name === 'retry') return 'Try the last step again.';
   return '';
 }
