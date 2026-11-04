@@ -4,6 +4,7 @@ import { ProviderCapacityFull, providerErrorFromMessage } from './limits.js';
 import { worldRepoTarget, worldRepos, worldWorkingRelativePath } from '../world/types.js';
 import { platformToolHandlers } from './tools.js';
 import { SUB_TASK_ACTIONS, type SubTaskAction } from '../domain/types.js';
+import { readFileSync } from 'node:fs';
 
 /**
  * Deterministic mock agent for hermetic tests. It executes simple directives
@@ -58,6 +59,15 @@ import { SUB_TASK_ACTIONS, type SubTaskAction } from '../domain/types.js';
  *   @heard                          report the conversation this turn was handed, one
  *                                   `role: first line` entry per message (shared conversations)
  *   @instructed <text>              report whether this turn's system prompt contains <text>
+ *   @say <markdown>                 the turn's reply (\n decoded); replaces the directive log
+ *   @summary <text>                 the completion summary Review shows (default: none)
+ *   @step <kind> <title> [:: detail]  show one activity row (read/edit/command/search/tool)
+ *   @tool <name> <json>             call a platform tool (request_connection, store_credential, …)
+ *
+ * Scripted demos: KARMAX_MOCK_SCRIPT names a JSON file of `{ "match": <regex>,
+ * "directives": <text>, "role"?: <role> }`; the directives of every entry whose
+ * regex matches the message a turn acts on run before that message's own, so a
+ * recorded demo can type natural prompts (design/launch-video).
  *
  * A Responder, Reviewer or called-in agent in a shared conversation (software-dev
  * ≥1.27) reads other agents' messages, not directive-bearing prompts, so it also
@@ -102,6 +112,8 @@ export class MockAdapter implements AgentAdapter {
     let lastJob: string | undefined;
     let revealed: string | undefined;
     const outputs: string[] = [];
+    const says: string[] = [];
+    let summary: string | undefined;
     // How many `msgs` this turn has consumed — the schedule snapshot to start, then
     // one more per in-flight follow-up injected below (SPEC §5.6). Reported so the
     // workflow advances its boundary past exactly what we processed.
@@ -400,6 +412,38 @@ export class MockAdapter implements AgentAdapter {
           outputs.push(`shells: ${rest.trim()}`);
           break;
         }
+        case 'summary':
+          summary = rest;
+          break;
+        case 'say':
+          says.push(rest.replace(/\\n/g, '\n'));
+          break;
+        case 'step': {
+          const [head, detail = ''] = splitOn(rest, '::');
+          const [kind = 'tool', ...title] = head.trim().split(/\s+/);
+          const kinds: Record<string, 'file' | 'command' | 'search' | 'tool' | 'reasoning'> = { read: 'file', edit: 'file', file: 'file', command: 'command', search: 'search', tool: 'tool', think: 'reasoning' };
+          const id = `step-${outputs.length}-${says.length}-${title.join(' ')}`;
+          ctx.emitActivity({ id, kind: kinds[kind] ?? 'tool', phase: 'completed', title: title.join(' '), ...(detail.trim() ? { detail: detail.trim().replace(/\\n/g, '\n') } : {}) });
+          break;
+        }
+        case 'tool': {
+          const name = rest.match(/^(\w+)\s*/)?.[1] ?? '';
+          const handler = platformToolHandlers(input.world, ctx)[name];
+          if (!handler) { outputs.push(`no tool ${name}`); break; }
+          // __SELF_TASK__ names this task (a local world is named after it), e.g. for a follow-up's dependency trigger.
+          const args = rest.slice(rest.indexOf(name) + name.length).trim().replaceAll('__SELF_TASK__', input.world.handle.id);
+          ctx.emitActivity({ id: `tool-${name}-${outputs.length}`, kind: 'tool', phase: 'started', title: `tavya · ${name}` });
+          try {
+            const result = await handler(args ? JSON.parse(args) : {});
+            ctx.emitActivity({ id: `tool-${name}-${outputs.length}`, kind: 'tool', phase: 'completed', title: `tavya · ${name}`, detail: String(result).slice(0, 1600) });
+            outputs.push(`${name}: ${String(result).split('\n')[0]}`);
+          } catch (e: any) {
+            ctx.emitActivity({ id: `tool-${name}-${outputs.length}`, kind: 'tool', phase: 'failed', title: `tavya · ${name}`, detail: String(e?.message ?? e) });
+            outputs.push(`${name} refused: ${e?.message ?? e}`);
+          }
+          if (['pause', 'escalate_to_human', 'raise_to_parent', 'wait_for_subtasks', 'request_connection'].includes(name)) complete = false;
+          break;
+        }
         case 'instructed':
           outputs.push(`${input.systemPrompt.includes(rest) ? 'instructed' : 'not instructed'}: ${rest}`);
           break;
@@ -436,7 +480,7 @@ export class MockAdapter implements AgentAdapter {
       const instructions = input.systemPrompt.match(/Instructions for you:\n([\s\S]*?)(?:\n\n|$)/)?.[1];
       if (instructions && recent.length) await processText(instructions);
     }
-    await processText(initialText);
+    await processText(scriptedDirectives(initialText, input.role, input.systemPrompt) + initialText);
     // A competent agent answers a dirty-proposal/landing rejection by committing
     // (machinery never sweeps uncommitted work). In current software-dev this is
     // the same Do agent; historical pins may still run the old Merge role.
@@ -494,25 +538,38 @@ done < unresolved
       stickyShells.set(input.world.handle.id, stickySh - 1);
     }
 
-    if (outputs.length === 0) outputs.push('(mock agent: no directives; nothing to do)');
+    if (outputs.length === 0 && !says.length) outputs.push('(mock agent: no directives; nothing to do)');
+    const reply = says.length ? says.join('\n\n') : outputs.join('\n');
     if (complete) {
-      ctx.signalCompletion(outputs.join('; '));
+      ctx.signalCompletion(says.length ? summary ?? '' : outputs.join('; '));
       // A competent current Do agent follows the prompt and explicitly opens the
       // PR when its work is complete. Auxiliary roles never own this transition.
       // Some adapter-only unit fixtures intentionally provide a partial context;
       // production runtimes always install the control bridge.
       if (input.role === 'do') ctx.openPr?.();
     }
-    ctx.emitActivity({ id: `message-${deliveredIndex}`, kind: 'message', phase: 'completed', title: outputs.join('\n') });
+    ctx.emitActivity({ id: `message-${deliveredIndex}`, kind: 'message', phase: 'completed', title: reply });
     return {
       termination: { kind: 'success', status: 'mock.completed' },
       session,
-      output: outputs.join('\n'),
+      output: reply,
       delivered: deliveredIndex,
       ...(pendingSubagents ? { pendingSubagents } : {}),
       ...(pendingBackgroundShells ? { pendingBackgroundShells } : {}),
     };
   }
+}
+
+/** The KARMAX_MOCK_SCRIPT directives for a message, one per matching entry. An
+ * entry naming a `role` (e.g. confirm) runs only for that role, matched against
+ * its instructions as well; the others run for the Do agent. */
+function scriptedDirectives(text: string, role: string, systemPrompt: string): string {
+  const file = process.env.KARMAX_MOCK_SCRIPT;
+  if (!file) return '';
+  const entries = JSON.parse(readFileSync(file, 'utf8')) as Array<{ match: string; directives: string; role?: string }>;
+  return entries.filter((entry) => (entry.role ?? 'do') === role
+    && new RegExp(entry.match, 'im').test(entry.role ? `${systemPrompt}\n${text}` : text))
+    .map((entry) => `${entry.directives}\n`).join('');
 }
 
 function splitOn(s: string, sep: string): [string, string] {

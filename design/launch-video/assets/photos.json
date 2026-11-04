@@ -1,0 +1,189 @@
+{
+ "photos": [
+  {
+   "file": "IMG_4012.jpg",
+   "picsum": 49,
+   "album": "2025-07 Santorini"
+  },
+  {
+   "file": "IMG_4046.jpg",
+   "picsum": 50,
+   "album": "2025-07 Santorini"
+  },
+  {
+   "file": "IMG_4071.jpg",
+   "picsum": 74,
+   "album": "2025-07 Santorini"
+  },
+  {
+   "file": "IMG_4098.jpg",
+   "picsum": 77,
+   "album": "2025-07 Santorini"
+  },
+  {
+   "file": "IMG_4106.jpg",
+   "picsum": 16,
+   "album": "2025-07 Santorini"
+  },
+  {
+   "file": "IMG_4114.jpg",
+   "picsum": 14,
+   "album": "2025-07 Santorini"
+  },
+  {
+   "file": "IMG_4139.jpg",
+   "picsum": 260,
+   "album": "2025-10 Scottish Highlands"
+  },
+  {
+   "file": "IMG_4144.jpg",
+   "picsum": 58,
+   "album": "2025-10 Scottish Highlands"
+  },
+  {
+   "file": "IMG_4168.jpg",
+   "picsum": 66,
+   "album": "2025-10 Scottish Highlands"
+  },
+  {
+   "file": "IMG_4191.jpg",
+   "picsum": 67,
+   "album": "2025-10 Scottish Highlands"
+  },
+  {
+   "file": "IMG_4211.jpg",
+   "picsum": 11,
+   "album": "2025-10 Scottish Highlands"
+  },
+  {
+   "file": "IMG_4238.jpg",
+   "picsum": 79,
+   "album": "2025-10 Scottish Highlands"
+  },
+  {
+   "file": "IMG_4262.jpg",
+   "picsum": 235,
+   "album": "2025-10 Scottish Highlands"
+  },
+  {
+   "file": "IMG_4295.jpg",
+   "picsum": 43,
+   "album": "2026-02 New York"
+  },
+  {
+   "file": "IMG_4304.jpg",
+   "picsum": 57,
+   "album": "2026-02 New York"
+  },
+  {
+   "file": "IMG_4325.jpg",
+   "picsum": 84,
+   "album": "2026-02 New York"
+  },
+  {
+   "file": "IMG_4355.jpg",
+   "picsum": 88,
+   "album": "2026-02 New York"
+  },
+  {
+   "file": "IMG_4389.jpg",
+   "picsum": 190,
+   "album": "2025-10 Scottish Highlands"
+  },
+  {
+   "file": "IMG_4401.jpg",
+   "picsum": 320,
+   "album": "2026-02 New York"
+  },
+  {
+   "file": "IMG_4430.jpg",
+   "picsum": 10,
+   "album": "2026-05 Cornwall"
+  },
+  {
+   "file": "IMG_4457.jpg",
+   "picsum": 12,
+   "album": "2026-05 Cornwall"
+  },
+  {
+   "file": "IMG_4491.jpg",
+   "picsum": 13,
+   "album": "2026-05 Cornwall"
+  },
+  {
+   "file": "IMG_4497.jpg",
+   "picsum": 215,
+   "album": "2026-05 Cornwall"
+  },
+  {
+   "file": "IMG_4499.jpg",
+   "picsum": 28,
+   "album": "2026-05 Cornwall"
+  },
+  {
+   "file": "IMG_4521.jpg",
+   "picsum": 63,
+   "album": "Coffee & food"
+  },
+  {
+   "file": "IMG_4557.jpg",
+   "picsum": 75,
+   "album": "Coffee & food"
+  },
+  {
+   "file": "IMG_4567.jpg",
+   "picsum": 225,
+   "album": "Coffee & food"
+  },
+  {
+   "file": "IMG_4568.jpg",
+   "picsum": 365,
+   "album": "Coffee & food"
+  },
+  {
+   "file": "IMG_4569.jpg",
+   "picsum": 20,
+   "album": "Desk setups"
+  },
+  {
+   "file": "IMG_4600.jpg",
+   "picsum": 48,
+   "album": "Desk setups"
+  },
+  {
+   "file": "IMG_4626.jpg",
+   "picsum": 60,
+   "album": "Desk setups"
+  },
+  {
+   "file": "IMG_4661.jpg",
+   "picsum": 180,
+   "album": "Desk setups"
+  },
+  {
+   "file": "IMG_4683.jpg",
+   "picsum": 370,
+   "album": "Desk setups"
+  },
+  {
+   "file": "IMG_4699.jpg",
+   "picsum": 36,
+   "album": "Desk setups"
+  },
+  {
+   "file": "IMG_4728.jpg",
+   "picsum": 96,
+   "album": "Desk setups"
+  }
+ ],
+ "duplicates": [
+  {
+   "file": "IMG_4012 (1).jpg",
+   "copyOf": "IMG_4012.jpg"
+  },
+  {
+   "file": "IMG_4295 copy.jpg",
+   "copyOf": "IMG_4295.jpg"
+  }
+ ]
+}
