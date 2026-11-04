@@ -96,7 +96,10 @@ export class RunnerPoolService {
   }
 
   async acquire(input: { project: Project; taskId: string; worldId: string; provider: string; priority?: number;
-    /** The task's own machine size, when its Computer differs from the project's. */
+    /** The machine's size; by default its task's Computer (the project's
+     * default only where the task names none). Waking with the project's
+     * asked an account for room for 8 CPUs to wake a 2-CPU world, and was
+     * refused there for good (pramana#137). */
     resources?: Project['config']['resources'];
     /** New work (a task's first machine): refused once the organization's
      * managed compute credit is spent. Waking a world to save or publish its
@@ -105,8 +108,8 @@ export class RunnerPoolService {
     heartbeat?: () => void; signal?: AbortSignal; pollMs?: number }): Promise<{ leaseId: string; runnerPoolId: string }> {
     if (input.signal?.aborted)
       throw input.signal.reason ?? new Error('runner lease cancelled');
-    const projectConfig = (await this.store.effectiveProjectConfig(input.project));
-    const config = input.resources ? { ...projectConfig, resources: input.resources } : projectConfig;
+    const taskConfig = (await this.store.effectiveTaskConfig(input.project, input.taskId));
+    const config = input.resources ? { ...taskConfig, resources: input.resources } : taskConfig;
     const pool = (await this.ensureDefaultPool(input.project, input.provider));
     if (pool.mode === 'managed') {
       if (input.work) await assertComputeCredit(this.store, input.project.organizationId!, input.provider, Date.now(),
@@ -236,6 +239,10 @@ export class WorldLifecycleManager {
   constructor(private store: Store, private worlds: WorldRegistry, private checkpoints: WorldCheckpointService,
     private intervalMs = 60_000, private objects?: ObjectStore, private runners?: RunnerPoolService,
     private access?: import('./access.js').WorldAccessService) {}
+
+  /** Ask a task waiting for a machine to try again now (its workflow's Retry);
+   * false when it is not waiting for one. Set where the workflow client is. */
+  retry?: (taskId: string) => Promise<boolean>;
 
   start(): void {
     if (this.timer) return;
@@ -553,10 +560,17 @@ export class WorldLifecycleManager {
   /**
    * A parked world its account had no room to wake (its disk's host, zone or
    * location full) for WAKE_RELOCATE_AFTER_MS is hibernated: its park
-   * checkpoint is kept and its machine and disk freed, so its task's next try
-   * restores it where it can run now — on "Any", any provider with room; on a
-   * named provider, a new machine there (wiki features/compute-routing § Stuck
-   * wakes). Its agent is told what did not carry over.
+   * checkpoint is kept and its machine and disk freed, so its task restores it
+   * where it can run now — on "Any", any provider with room; on a named
+   * provider, a new machine there (wiki features/managed-compute § Queue).
+   * Its agent is told what did not carry over, and its task tries again at
+   * once (`retry`) rather than at its next scheduled try, minutes later.
+   *
+   * A move costs what a new machine must fetch or rebuild: the Git-ignored
+   * files its park checkpoint lists and the project data it restores. Where
+   * that is at most CHEAP_MOVE_BYTES and another account has room now (Any
+   * only), the world moves at the first sweep after the refusal instead of
+   * waiting out the 15 minutes for room where its disk is.
    */
   async relocateStuckWakes(now = Date.now()): Promise<number> {
     let moved = 0;
@@ -566,17 +580,38 @@ export class WorldLifecycleManager {
       let since = 0; let generation = 0;
       try { ({ since, generation } = JSON.parse(raw) as { since: number; generation: number }); } catch { /* malformed: drop it */ }
       if (generation !== (candidate.handle.generation ?? 1)) { await this.store.kvDelete(wakeFullKey(candidate.handle.id)); continue; }
-      if (now - since < WAKE_RELOCATE_AFTER_MS) continue;
-      const done = await this.hibernate(candidate, { reason: 'no-room', onFailure: (error) =>
-        this.recordLifecycle(candidate.handle, 'world.hibernate_failed', { error: error instanceof Error ? error.message : String(error), reason: 'no-room' }),
+      const cheap = now - since < WAKE_RELOCATE_AFTER_MS ? await this.cheapMove(candidate.handle) : undefined;
+      if (now - since < WAKE_RELOCATE_AFTER_MS && cheap === undefined) continue;
+      const reason = cheap === undefined ? 'no-room' : 'no-room-cheap-move';
+      const done = await this.hibernate(candidate, { reason, onFailure: (error) =>
+        this.recordLifecycle(candidate.handle, 'world.hibernate_failed', { error: error instanceof Error ? error.message : String(error), reason }),
       }).catch(() => false);
       if (!done) continue;
       moved++;
       await this.store.kvDelete(wakeFullKey(candidate.handle.id));
-      if ((await this.store.worldState(candidate.handle.id)) === 'hibernated')
-        await this.checkpoints.addNotice?.(candidate.handle.id, STUCK_WAKE_NOTICE);
+      if ((await this.store.worldState(candidate.handle.id)) !== 'hibernated') continue;
+      await this.checkpoints.addNotice?.(candidate.handle.id, STUCK_WAKE_NOTICE);
+      await this.retry?.(candidate.handle.id).catch(() => false);
     }
     return moved;
+  }
+
+  /** The bytes a move of this parked world would fetch or rebuild, when that
+   * is at most CHEAP_MOVE_BYTES and its task can run elsewhere now; else
+   * undefined. Unknown counts as costly: a park checkpoint that could not list
+   * its ignored files, or listed only some, never moves early. */
+  private async cheapMove(handle: WorldHandleRef): Promise<number | undefined> {
+    const checkpoint = await this.store.latestWorldCheckpoint(handle.id);
+    if (!checkpoint || checkpoint.generation !== (handle.generation ?? 1) || checkpoint.ignoredUnknown || checkpoint.ignored?.truncated) return undefined;
+    let bytes = (checkpoint.ignored?.entries ?? []).reduce((sum, entry) => sum + entry.bytes, 0);
+    for (const ref of checkpoint.resources ?? []) {
+      if (bytes > CHEAP_MOVE_BYTES) return undefined;
+      const revision = await this.store.getResourceRevision(ref.revisionId);
+      if (!revision) return undefined;
+      bytes += revision.bytes;
+    }
+    if (bytes > CHEAP_MOVE_BYTES) return undefined;
+    return await this.checkpoints.roomElsewhere?.(handle as WorldHandle) ? bytes : undefined;
   }
 
   /** Checkpoint a parked (or idle ready) world and delete it at its provider;
@@ -901,6 +936,10 @@ export const COMPUTE_HIBERNATED_NOTICE = 'While this task waited, the organizati
   + 'did not carry over: reinstall or restart what you need.';
 
 /** Told to the agent whose parked computer could not wake where its disk was (relocateStuckWakes). */
+/** A stuck parked world whose move would fetch or rebuild at most this much
+ * (its Git-ignored files and project data) moves at once (relocateStuckWakes). */
+export const CHEAP_MOVE_BYTES = 1024 ** 3;
+
 export const STUCK_WAKE_NOTICE = 'This task\'s parked computer could not start again where its disk was (no room there), so it was restored from '
   + 'its last checkpoint on a new machine. You have the same files your repositories track, the same uncommitted changes and the same '
   + 'project data. Git-ignored files (installed dependencies, build output, caches) and running processes did not carry over: '

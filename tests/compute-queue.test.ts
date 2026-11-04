@@ -4,7 +4,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
-import { STUCK_WAKE_NOTICE, WorldLifecycleManager } from '../src/world/runners.js';
+import { CHEAP_MOVE_BYTES, STUCK_WAKE_NOTICE, WorldLifecycleManager } from '../src/world/runners.js';
 import { accountKey, dequeue, enqueue, ordered, RESERVE_AFTER_MS, WAITER_STALE_MS, WAKE_RELOCATE_AFTER_MS, waiters, wakeFullKey, withStandings, type Waiter } from '../src/world/compute-queue.js';
 import { orderKey, runNowKey, treeKey } from '../src/scheduling/state.js';
 import { accountRoom, accountUse } from '../src/world/account-room.js';
@@ -259,5 +259,70 @@ describe('a parked world that cannot wake where its disk is', () => {
     expect(await f.store.worldState(recent.id)).toBe('parked');
     expect(await f.store.kvGet(wakeFullKey(moved.id))).toBeUndefined();
     expect((await f.store.eventsSince(stuck.id, 0)).find((event) => event.type === 'world.hibernated')?.payload).toMatchObject({ reason: 'no-room' });
+  });
+
+  // pramana#137: a move is worth waiting 15 minutes for only when it would
+  // lose much. One that fetches or rebuilds little goes as soon as another
+  // account has room, and its task tries again at once either way.
+  describe('moves at once when it would lose little and another account has room', () => {
+    async function stuckWorld(f: Awaited<ReturnType<typeof fixture>>, manifest: Record<string, unknown>) {
+      const handle = await f.world(f.acme, 'hetzner', 'parked', 70);
+      await f.store.saveWorldCheckpoint({ id: `checkpoint-${handle.id}`, worldId: handle.id, generation: 1, projectId: f.projects[f.acme]!.id,
+        runnerPoolId: 'local', environmentDigest: 'test', repos: [], createdAt: Date.now(), ...manifest } as any);
+      return handle;
+    }
+    async function sweep(f: Awaited<ReturnType<typeof fixture>>, roomElsewhere: boolean, since: number, now: number, ...handles: WorldHandle[]) {
+      for (const handle of handles) await f.store.kvSet(wakeFullKey(handle.id), JSON.stringify({ since, generation: 1 }));
+      const worlds = new WorldRegistry();
+      worlds.register({ kind: 'hetzner', parkable: true, destroy: vi.fn(async () => {}), probe: async () => undefined } as any);
+      const lifecycle = new WorldLifecycleManager(f.store, worlds,
+        { checkpoint: vi.fn(), addNotice: vi.fn(async () => {}), roomElsewhere: vi.fn(async () => roomElsewhere) } as any);
+      const retry = vi.fn(async () => true);
+      lifecycle.retry = retry;
+      return { moved: await lifecycle.relocateStuckWakes(now), retry };
+    }
+    const small = { ignored: { entries: [{ path: 'node_modules', bytes: 300 * 1024 ** 2, likelySecret: false }], truncated: false } };
+
+    it('a minute after the refusal, and tells its task to try again now', async () => {
+      const f = await fixture();
+      const cheap = await stuckWorld(f, small);
+      const nothingIgnored = await stuckWorld(f, {});
+      const now = Date.now();
+      const { moved, retry } = await sweep(f, true, now - 60_000, now, cheap, nothingIgnored);
+      expect(moved).toBe(2);
+      for (const handle of [cheap, nothingIgnored]) {
+        expect(await f.store.worldState(handle.id)).toBe('hibernated');
+        expect(retry).toHaveBeenCalledWith(handle.id);
+        expect((await f.store.eventsSince(handle.id, 0)).find((event) => event.type === 'world.hibernated')?.payload)
+          .toMatchObject({ reason: 'no-room-cheap-move' });
+      }
+    });
+
+    it('not when it would lose much, may lose what it does not know, or nothing else has room', async () => {
+      const f = await fixture();
+      const bigIgnored = await stuckWorld(f, { ignored: { entries: [{ path: 'build', bytes: CHEAP_MOVE_BYTES + 1, likelySecret: false }], truncated: false } });
+      const truncated = await stuckWorld(f, { ignored: { entries: [], truncated: true } });
+      const unknown = await stuckWorld(f, { ignoredUnknown: true });
+      // pramana's project data: 23 GB to restore on a new machine.
+      const attachment = await f.store.createResourceAttachment({ organizationId: f.acme, projectId: f.projects[f.acme]!.id,
+        name: 'Corpus', driver: 'object-tree@1', target: { kind: 'path', path: 'data' }, access: 'write', isolation: 'fork',
+        source: {}, credentialHandles: [], publish: 'review' });
+      const revision = await f.store.saveResourceRevision({ attachmentId: attachment.id, engine: 'restic', sealedRef: 'sealed',
+        rootDigest: 'digest', bytes: 23 * 1024 ** 3 });
+      const bigData = await stuckWorld(f, { resources: [{ attachmentId: attachment.id, revisionId: revision.id }] });
+      const handles = [bigIgnored, truncated, unknown, bigData];
+      const now = Date.now();
+      expect((await sweep(f, true, now - 60_000, now, ...handles)).moved).toBe(0);
+      for (const handle of handles) expect(await f.store.worldState(handle.id)).toBe('parked');
+
+      const g = await fixture();
+      const cheapButNowhere = await stuckWorld(g, small);
+      expect((await sweep(g, false, now - 60_000, now, cheapButNowhere)).moved).toBe(0);
+      expect(await g.store.worldState(cheapButNowhere.id)).toBe('parked');
+      // After 15 minutes it moves anyway, as before, and its task tries again at once.
+      const late = await sweep(g, false, now - WAKE_RELOCATE_AFTER_MS - 1, now, cheapButNowhere);
+      expect(late.moved).toBe(1);
+      expect(late.retry).toHaveBeenCalledWith(cheapButNowhere.id);
+    });
   });
 });

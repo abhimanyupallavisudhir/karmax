@@ -143,6 +143,23 @@ describe('moving a running task to another provider', () => {
     expect(notices).toEqual([]);
   });
 
+  // relocateStuckWakes moves a cheap stuck world at once only when this says
+  // another account would take it (pramana#137).
+  it('tells whether another account fits an "Any" task and has room, without joining any queue', async () => {
+    const any = await anyFixture();
+    expect(await any.service.roomElsewhere(any.handle)).toBe(true);
+    expect(await any.store.kvGet('compute-queue')).toBeUndefined();
+    // A disk no account gives.
+    const none = await anyFixture({ diskGb: 3000 });
+    expect(await none.service.roomElsewhere(none.handle)).toBe(false);
+    // On AWS, where a 1 TB disk fits only AWS: nowhere else.
+    const onlyHere = await anyFixture({ diskGb: 1000 });
+    expect(await onlyHere.service.roomElsewhere({ ...onlyHere.handle, kind: 'aws', provider: 'aws' })).toBe(false);
+    // A task that names its provider never moves for room.
+    const named = await anyFixture({ provider: 'e2b' });
+    expect(await named.service.roomElsewhere(named.handle)).toBe(false);
+  });
+
   it('brings it back on the next candidate when its provider is full or no longer fits, and says so', async () => {
     const full = await anyFixture();
     (full.service as any).restore = async (_id: string, kind: string) => {

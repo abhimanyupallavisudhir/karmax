@@ -360,6 +360,8 @@ export interface WorldCheckpoint {
   /** Metadata-only inventory of ignored paths omitted from the portable delta.
    * Contents are never read or uploaded by this safety net. */
   ignored?: IgnoredResourceInventory;
+  /** Its ignored files could not be listed: what a move would lose is unknown. */
+  ignoredUnknown?: boolean;
   /** Accepted provider-neutral runtime declarations pinned at checkpoint time.
    * Provider snapshots remain accelerators; generated endpoints are excluded. */
   environment?: ProjectEnvironmentSpec;

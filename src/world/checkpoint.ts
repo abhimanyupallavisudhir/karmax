@@ -20,7 +20,7 @@ import { newId } from '../util/id.js';
 import { activateProjectRuntime, selectProjectEnvironment, snapshotProjectRuntime } from './project-runtime.js';
 import { destroyWorldServices } from './services.js';
 import { RunnerPoolService } from './runners.js';
-import type { ComputeRouter } from './compute-router.js';
+import { computeNeeds, rankComputeOptions, type ComputeRouter } from './compute-router.js';
 import { sameRepository } from './repository-identity.js';
 import { clearCheckpointStale } from './checkpoint-staleness.js';
 import { ChunkedCheckpointStore, CheckpointRefusedError, formatBytes, type CaptureEntry } from './checkpoint-chunks.js';
@@ -157,7 +157,7 @@ export class WorldCheckpointService {
       worldId: handle.id, generation: handle.generation ?? 1, projectId,
       runnerPoolId: handle.runnerPoolId ?? 'local', environmentDigest: handle.environmentDigest ?? 'karmax-local',
       repos, ...(resourceRefs.length ? { resources: resourceRefs } : {}),
-      ...(ignored?.entries.length || ignored?.truncated ? { ignored } : {}),
+      ...(ignored === undefined ? { ignoredUnknown: true } : ignored.entries.length || ignored.truncated ? { ignored } : {}),
       ...(await snapshotProjectRuntime(this.store, projectId)),
     };
     // Git cleanliness alone is insufficient: resources, runtime settings and a
@@ -312,6 +312,20 @@ export class WorldCheckpointService {
         + 'Git-ignored files (installed dependencies, build output, caches) and running processes did not carry over: reinstall or restart what you need.');
     }
     return restored;
+  }
+
+  /** Whether this world's task could run on another account now: its
+   * Computer says "Any" and an account other than the world's fits it and
+   * has room (compute-router.ts). Only looks: it joins no account's queue. */
+  async roomElsewhere(handle: WorldHandle): Promise<boolean> {
+    if (!this.router || await taskProvider(this.store, handle.id)) return false;
+    const project = await this.store.getProject(String(handle.meta?.projectId ?? (await this.store.taskProjectIdAsync(handle.id)) ?? ''));
+    if (!project?.organizationId) return false;
+    const config = await this.store.effectiveTaskConfig(project, handle.id);
+    if (!isAnyProvider(config.worldProvider)) return false;
+    const needs = computeNeeds(config);
+    const route = rankComputeOptions(needs, await this.router.options(project.organizationId, needs));
+    return route.candidates.some((candidate) => candidate.provider !== handle.kind && !candidate.doubt);
   }
 
   /** Tell the agent something about its world on its next turn, once. */
