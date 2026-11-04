@@ -4444,6 +4444,11 @@ html[data-theme="dark"] .github-signin-btn:active,
 .setting-sep { color:var(--ink-3); }
 .setting-warn { color:var(--warn); }
 .setting-actions { flex:none; display:flex; align-items:center; gap:6px; }
+/* A password store's items waiting to be written back: their own line under its row, never squeezed beside its actions. */
+.setting-row:has(> .conn-pending) { flex-wrap:wrap; }
+.conn-pending { flex-basis:100%; display:flex; flex-direction:column; gap:6px; padding-left:164px; font-size:var(--fs-13); }
+.conn-pending > span { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
+@media (max-width: 720px) { .conn-pending { padding-left:0; } }
 .setting-row.danger .setting-label { color:var(--danger); }
 .card > .section-h + .setting-rows { margin-top:-4px; }
 @media (max-width:560px) {

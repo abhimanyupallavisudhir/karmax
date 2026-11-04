@@ -23186,12 +23186,13 @@ async function wireVaultCards(organizationId) {
       <span class="setting-label">${esc(c.label)} ${connectorTip(c)}</span>
       <span class="setting-value">${c.available ? '<span class="chip ok">Connected</span>' : '<span class="chip">Not connected</span>'}${connectorNote(c) ? `<span class="setting-muted">${esc(connectorNote(c))}</span>` : ''}${c.config?.lastAutoSync?.error ? `<span class="chip warn" title="${esc(c.config.lastAutoSync.error)}">Sync error</span>` : ''}
       ${c.setup !== 'git-pass' && !c.available && c.name !== 'pass' ? `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : '1Password service-account token'}" aria-label="${esc(c.label)} ${c.name === 'bitwarden' ? 'session key' : 'service-account token'}" />` : ''}
-      ${(c.pendingWrites || []).filter(write => !write.id).map(write => `<span>${esc(write.label)}: pending write-back ${c.config?.writeBack ? `<button class="btn sm" data-write-retry="${esc(write.itemId)}">Retry</button>` : ''}<button class="btn sm" data-write-remote="${esc(write.itemId)}">Use remote value</button></span>`).join('')}</span>
+</span>
       <span class="setting-actions">${c.pendingWrites?.length ? `${c.config?.writeBack ? `<button class="btn sm" data-conn-retry title="${esc(c.pendingWrites[0]?.error || 'Saved in the vault; waiting for the external store')}">Retry ${c.pendingWrites.length} pending</button>` : `<span class="chip" title="Write-back is off; turn it on under Import… to send these">${c.pendingWrites.length} pending</span>`}<button class="btn sm" data-conn-discard title="Stop retrying these writes; credentials stay in the vault">Dismiss</button>` : ''}
       ${c.setup === 'git-pass'
         ? `<button class="btn sm" data-git-pass-connect>${c.available ? 'Reconfigure' : 'Configure'}</button>${c.available ? '<button class="btn sm" data-git-pass-check>Check connection</button>' : ''}`
         : c.available || c.name === 'pass' ? '' : '<button class="btn sm" data-conn-connect>Connect</button>'}
-      ${c.available ? '<button class="btn sm" data-conn-import>Import…</button>' : ''}</span></div>`).join('')
+      ${c.available ? '<button class="btn sm" data-conn-import>Import…</button>' : ''}</span>
+      ${(c.pendingWrites || []).some(write => !write.id) ? `<div class="conn-pending">${(c.pendingWrites || []).filter(write => !write.id).map(write => `<span>${esc(write.label)}: pending write-back ${c.config?.writeBack ? `<button class="btn sm" data-write-retry="${esc(write.itemId)}">Retry</button>` : ''}<button class="btn sm" data-write-remote="${esc(write.itemId)}">Use remote value</button></span>`).join('')}</div>` : ''}</div>`).join('')
       || '<div class="setting-muted">No password managers</div>';
     list.querySelectorAll('[data-conn]').forEach((row) => {
       const name = row.dataset.conn;
