@@ -4321,8 +4321,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     /** Auto-derive the changed-files summary so Review always shows what changed
      *  (§5.5). Diffs are intentionally NOT computed — they were removed from the
-     *  review packet; reviewers use the changed-files list + the in-world terminal. */
-    async buildReview(handle: WorldHandle, base: string): Promise<{ summary: string; changedFiles: string[] }> {
+     *  review packet; reviewers use the changed-files list + the in-world terminal.
+     *  `landed`: per checkout, the head its latest pull request landed at (several
+     *  branches): work up to it is no longer the task's to show, however it landed
+     *  (a squash leaves no ancestry) and whether or not this world fetched it. */
+    async buildReview(handle: WorldHandle, base: string, landed?: Record<string, string>): Promise<{ summary: string; changedFiles: string[] }> {
       const world = await openWorld(handle);
       const repos = worldRepos(handle);
       if (!repos.length) {
@@ -4348,7 +4351,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // stays where the world was provisioned, so work that already landed (an
         // earlier pull request from this branch, merged back in) would be listed
         // again for approval (pramana#137).
-        const forkPoint = await world.exec('git', ['merge-base', 'HEAD', ...(await prBaseRefs(world, repo, repoBase))], { cwd: repo.root });
+        const landedHead = landed?.[repo.name];
+        const landedRefs = landedHead && /^[0-9a-f]{40,64}$/i.test(landedHead)
+          && (await world.exec('git', ['cat-file', '-e', `${landedHead}^{commit}`], { cwd: repo.root })).code === 0 ? [landedHead] : [];
+        const forkPoint = await world.exec('git', ['merge-base', 'HEAD', ...(await prBaseRefs(world, repo, repoBase)), ...landedRefs], { cwd: repo.root });
         const since = forkPoint.code === 0 && forkPoint.stdout.trim() ? forkPoint.stdout.trim() : repoBase;
         // NUL-separated output is never C-quoted, whatever the world's Git config
         // (non-ASCII, quotes and newlines in names survive verbatim; WD-27).
