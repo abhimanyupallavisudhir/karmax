@@ -168,7 +168,9 @@ const PROMPTS = {
   trigger: 'Create a repeatable task that is triggered by codex/claude code updates on github and updates tavya to be compatible with them.',
   flight: 'Book me the cheapest direct flight to London on January 3 with reasonable timings. My passport, loyalty card numbers etc. are in this folder.',
   finale: 'Create a launch video for tavya.io that shows just how great it is',
+  ending: 'Build something great.',
 };
+const NEW_PROJECT = 'big-idea';
 
 (async () => {
   fs.mkdirSync(OUT, { recursive: true });
@@ -362,6 +364,34 @@ const PROMPTS = {
     if (manifest['finale-viewer']) manifest['finale-viewer'].boxes.picture = pic;
     }
     fs.writeFileSync(path.join(OUT, 'shots.json'), JSON.stringify(manifest, null, 1));
+    // ── the ending: a new project, and its first task ──
+    if (want('ending')) {
+      await go('/personal?q=-is%3Aarchived', 1500);
+      await shot('ending-home', { add: page.locator('#new-project') });
+      await page.locator('#new-project').click();
+      const name = page.locator('#new-project-name');
+      await name.waitFor(); await sleep(600);
+      const dir = path.join(OUT, 'ending-project');
+      fs.rmSync(dir, { recursive: true, force: true }); fs.mkdirSync(dir, { recursive: true });
+      let n = 0;
+      const frame = async () => page.screenshot({ path: path.join(dir, `${String(n++).padStart(4, '0')}.jpg`), type: 'jpeg', quality: 92 });
+      await frame();
+      for (const ch of NEW_PROJECT) { await name.press(ch === '-' ? 'Minus' : ch); await frame(); }
+      manifest['ending-project'] = { kind: 'sequence', frames: n, boxes: { name: await box(name), create: await box(page.getByRole('button', { name: 'Create project' })) } };
+      await page.getByRole('button', { name: 'Create project' }).click();
+      await sleep(2500);
+      const list = await api('GET', '/api/projects');
+      const made = (Array.isArray(list) ? list : list.projects ?? []).find((p) => p.name === NEW_PROJECT);
+      projects[NEW_PROJECT] = made?.id;
+      await go(`/personal/${NEW_PROJECT}`, 1500);
+      await shot('ending-empty', { add: page.locator('#expand-task') });
+      await typed('ending-task', NEW_PROJECT, PROMPTS.ending, { every: 1 });
+      const t = await findTask(NEW_PROJECT, 'Build something great');
+      await go(`/personal/${NEW_PROJECT}/tasks/${t.num}`, 2500);
+      await page.getByText('Read the project', { exact: false }).first().waitFor({ timeout: 60000 }).catch(() => {});
+      await sleep(2500);
+      await shot('ending-started', { msg: page.locator('.msg.user').last() });
+    }
   } catch (e) { failed = e; console.error('capture failed:', e); await page.screenshot({ path: path.join(OUT, 'failure.png') }).catch(() => {}); }
   await browser.close();
   process.exit(failed ? 1 : 0);

@@ -281,6 +281,13 @@ entry(r'credential decision\]\s+Access to "amazon.com" was approved', [
 Order **113-4827715-0091**. I ticked them off in `notes/groceries.md`."""),
 ], pace=1000)
 
+# ── The third cut's ending: a new project, one sentence ─────────────────
+entry(r'^Build something great', [
+    '@step read Read the project: no repository yet, an empty wiki',
+    '@step think Something great, for this person: start by finding out what they care about. Their other projects say research, tools and writing.',
+    '@sleep 900000',
+])
+
 # ── Sub-tasks (the feature grid's still; created and deleted off camera) ──
 SUBTASKS = [
     ('Write the Show HN post and the Product Hunt listing', False),

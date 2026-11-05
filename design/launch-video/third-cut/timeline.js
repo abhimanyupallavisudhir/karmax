@@ -470,41 +470,33 @@ scene(...next(3.6), (L) => {
   };
 });
 
-// 14 · And one more: this very video, made by a task; open it and fall into its first frame.
-scene(...next(8.2), (L) => {
-  const N = seqFrames('finale-type');
-  const h = headline(L, 'And *one more.*', null);
-  const zoom = el('div', 'zoomer', L);
-  const w = browserWindow(zoom, { screens: ['finale-type/', 'finale-review', 'finale-viewer'] });
-  const tile = mid('finale-review', 'tile');
-  const pic = bx('finale-viewer', 'picture') ?? { x: 360, y: 200, w: 720, h: 405 };
-  // The delivered video, on its first frame: the title card, drawn exactly as the film opens.
-  const mini = el('div', 'mini', zoom);
-  el('div', 'bgfill', mini);
-  const card = titleCard(mini); card(0);
-  const s = 1400 / 1440, X = (cx) => 260 + 720 + (cx - 720) * s, Y = (cy) => 212 + (40 + cy) * s;
-  const R = { x: X(pic.x), y: Y(pic.y), w: pic.w * s, h: pic.h * s };
-  const K = 1920 / R.w;
+// 14 · Your turn: a new project, and its first task.
+scene(...next(8.0), (L, dur) => {
+  const NP = seqFrames('ending-project'), NT = seqFrames('ending-task');
+  const h = headline(L, 'Your *turn.*', 'A new project, one sentence, and an agent on it.');
+  const w = browserWindow(L, { screens: ['ending-home', 'ending-project/', 'ending-empty', 'ending-task/', 'ending-started'] });
+  const add = mid('ending-home', 'add', [300, 260]), create = mid('ending-project', 'create', [900, 600]), newTask = mid('ending-empty', 'add', [720, 120]);
   return (lt) => {
-    h(lt);
-    L.querySelector('.headline').style.opacity = 1 - ramp(lt, 5.0, 5.4);
-    const q = ramp(lt, 0.1, 0.85, ease.outQuint);
-    w.place(260, 212 + (1 - q) * 60, s * (0.97 + 0.03 * q), q, `perspective(2400px) rotateX(${(1 - q) * 8}deg)`);
-    w.seq('finale-type/', 'finale-type', Math.round(ramp(lt, 0.5, 2.3, (p) => p) * (N - 1)));
-    showAt(w, lt, [[0, 'finale-type/'], [2.7, 'finale-review'], [4.3, 'finale-viewer']]);
-    w.url(host(lt < 2.7 ? '/personal/tavya' : '/personal/tavya/tasks/825'));
-    const [z, fx, fy] = kf(lt, [[0.3, [1, 720, 450]], [0.8, at('finale-type', 'prompt', 1.5)], [2.4, at('finale-type', 'prompt', 1.5)], [2.8, [1, 720, 450]], [3.4, [1.3, tile[0], tile[1] - 80]], [4.1, [1.3, tile[0], tile[1] - 80]], [4.4, [1, 720, 450]]]);
+    h(lt); enter(w, lt, dur);
+    w.seq('ending-project/', 'ending-project', Math.round(ramp(lt, 1.35, 2.25, (p) => p) * (NP - 1)));
+    w.seq('ending-task/', 'ending-task', Math.round(ramp(lt, 3.85, 5.05, (p) => p) * (NT - 1)));
+    showAt(w, lt, [[0, 'ending-home'], [1.2, 'ending-project/'], [2.95, 'ending-empty'], [3.7, 'ending-task/'], [5.55, 'ending-started']], 0.18);
+    w.url(host(lt < 2.95 ? '/personal' : lt < 5.55 ? '/personal/big-idea' : '/personal/big-idea/tasks/1'));
+    const [z, fx, fy] = kf(lt, [[0.3, [1, 720, 450]], [1.0, [1.35, add[0] + 160, add[1] + 90]], [1.2, [1.25, 720, 420]], [2.4, [1.35, ...mid('ending-project', 'name', [720, 400])]], [2.9, [1.25, 720, 420]],
+      [3.2, [1, 720, 450]], [3.9, at('ending-task', 'prompt', 1.6)], [5.2, at('ending-task', 'prompt', 1.6)], [5.6, [1, 720, 450]], [6.4, at('ending-started', 'msg', 1.45)], [dur, at('ending-started', 'msg', 1.5)]]);
     w.camera(z, fx, fy);
-    pointerAt(w, lt, [[2.7, 1000, 700], [3.6, ...tile], [4.1, ...tile], [4.6, tile[0] + 40, tile[1] + 60]], [3.9], ramp(lt, 2.9, 3.2) * (1 - ramp(lt, 4.4, 4.6)));
-    // The first frame over the viewer's picture, then the camera falls into it.
-    mini.style.opacity = ramp(lt, 4.25, 4.4);
-    mini.style.transform = `translate(${R.x}px, ${R.y}px) scale(${R.w / 1920})`;
-    const p = ramp(lt, 5.0, 7.5, ease.inOut);
-    const sc = Math.pow(K, p);
-    const cx = lerp(R.x + R.w / 2, 960, (sc - 1) / (K - 1)), cy = lerp(R.y + R.h / 2, 540, (sc - 1) / (K - 1));
-    zoom.style.transform = `translate(${cx - (R.x + R.w / 2) * sc}px, ${cy - (R.y + R.h / 2) * sc}px) scale(${sc})`;
+    pointerAt(w, lt, [[0, 900, 600], [0.8, ...add], [1.1, ...add], [2.3, create[0] + 80, create[1] + 60], [2.65, ...create], [3.0, create[0], create[1]], [3.4, ...newTask], [3.7, ...newTask], [5.6, newTask[0] + 120, newTask[1] + 200], [dur, newTask[0] + 120, newTask[1] + 200]],
+      [0.95, 2.75, 3.55], ramp(lt, 0.4, 0.7) * (1 - ramp(lt, 3.8, 4.1)));
   };
-}, { fadeOut: 0 });
+});
+
+// 15 · The end card.
+scene(...next(4.4), (L) => {
+  L.id = 'end';
+  const update = titleCard(L);
+  const note = el('div', 'tagline', L, 'Open to everyone, starting today.'); note.style.top = '850px'; note.style.fontSize = '26px';
+  return (lt) => { update(lt); note.style.opacity = ramp(lt, 1.5, 2.1); };
+}, { fadeOut: 0.6 });
 
 const DURATION = T;
 async function seek(t) {
