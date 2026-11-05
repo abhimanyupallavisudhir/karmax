@@ -61,7 +61,7 @@ def speak(text):
 
 marks = {m['name']: m['at'] for m in meta['marks']}
 total = meta['total']
-track = np.zeros(int(SR * (total + 1)), dtype=np.float32)
+track = np.zeros(int(SR * total), dtype=np.float32)
 cursor, report = 0.0, []
 for name, offset, text in LINES:
     if name not in marks: continue
@@ -83,10 +83,10 @@ with wave.open(vo, 'wb') as w:
 music = os.path.join(take, 'music.wav')
 # Music under the voice: ducked by a sidechain on the voice, then both levelled.
 subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-i', cut, '-i', music, '-i', vo, '-filter_complex',
-                '[2:a]aresample=48000,asplit=2[v1][v2];[1:a]volume=0.8[m];'
+                f'[2:a]aresample=48000,asplit=2[v1][v2];[1:a]volume=0.8[m];'
                 '[m][v1]sidechaincompress=threshold=0.015:ratio=12:attack=25:release=450:makeup=1[duck];'
-                '[duck][v2]amix=inputs=2:normalize=0:weights=1 1.15,loudnorm=I=-16:TP=-1.5:LRA=9[a]',
-                '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest',
+                f'[duck][v2]amix=inputs=2:normalize=0:weights=1 1.15,loudnorm=I=-16:TP=-1.5:LRA=9,aresample=48000,atrim=0:{total:.3f}[a]',
+                '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-t', f'{total:.3f}',
                 '-movflags', '+faststart', out], check=True)
 json.dump({**meta, 'video': out}, open(out + '.json', 'w'))
 print('→', out)
