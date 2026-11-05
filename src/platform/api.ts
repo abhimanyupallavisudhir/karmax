@@ -36,6 +36,7 @@ import {
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
 import { templateContent, templateName, templateParams, templateAuthorization } from '../domain/task-templates.js';
+import { derivedTaskTitle, isDerivedTaskTitle } from '../domain/task-title.js';
 import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget, type Avatar } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries } from '../domain/triggers.js';
 import { STORE_TASKS, runsOnInstall, storeTaskNeeds, storeTaskRepeatable, takenFromStore, type StoreNeed, type StoreTask } from '../domain/task-store.js';
@@ -186,7 +187,6 @@ export interface TriggerArmer {
   projectEventRecorded?(event: ProjectEvent): void;
 }
 
-const firstLine = (s: string) => (s.split('\n')[0] ?? 'Task').slice(0, 80) || 'Task';
 // Human-facing stage names. `do` is the replay-stable internal key; a person
 // reads it as "Working" (the console's stageLabel says the same).
 const stageName = (stage: string) => stage === 'human'
@@ -1672,7 +1672,7 @@ export class KarmaxApi {
     // effective list the world will. An empty list is a supported zero-repo run.
     if (!args.draft) (await this.assertRepositoriesValid(manifest, project, resolved));
 
-    const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
+    const title = args.title?.trim() || derivedTaskTitle(resolved);
     const createdBy = await this.taskCreator(caller, project.id);
     // Pin the connected account when the task is created. Switching the user's
     // active account later must not silently change an existing task's commit or
@@ -3647,14 +3647,15 @@ export class KarmaxApi {
       }));
     }
     // Keep the display title tracking the (edited) prompt when it was derived
-    // from the prompt (SPEC §10). A title given at creation stays: a store
-    // automation's `#{{issue.number}} {{issue.title}}` names each of its runs.
-    // Written with the params, so an edit refused there renames nothing.
-    const retitled = typeof base.prompt === 'string' && base.prompt.trim() && task.title === firstLine(String(task.params?.prompt ?? task.params?.command ?? 'Task'))
-      ? firstLine(String(base.prompt)) : undefined;
+    // from the prompt (SPEC §10) — through every edit, an emptied prompt too
+    // ("Task"), so a title once derived stays derived. A title given at
+    // creation stays: a store automation's `#{{issue.number}} {{issue.title}}`
+    // names each of its runs. Written with the params, so an edit refused
+    // there renames nothing.
+    const retitled = isDerivedTaskTitle(task.title, task.params) ? derivedTaskTitle(base) : undefined;
     const write = async (params: Record<string, unknown>) => {
       (await this.writeUnstartedParams(taskId, params));
-      if (retitled !== undefined) (await this.deps.store.setTaskTitle(taskId, retitled));
+      if (retitled !== undefined && retitled !== task.title) (await this.deps.store.setTaskTitle(taskId, retitled));
     };
     // A cron/recurring trigger forces the series flag on (mirrors createTask).
     if (forcesRepeatable(normalizeTriggers(base))) base.repeatable = true;

@@ -222,6 +222,52 @@ describe('events through an agent\'s task token', () => {
     }
   });
 
+  it('a draft\'s title is the first words of its prompt as it is now, through every edit', async () => {
+    const dev = await agent('developer');
+    const created: string[] = [];
+    const draft = async (body: Record<string, unknown>) => {
+      const task = json(await dev.request('POST', `/api/projects/${projectId}/tasks`, { draft: true, ...body }));
+      created.push(task.id);
+      return task.id as string;
+    };
+    const edit = async (id: string, prompt: string) =>
+      json(await dev.request('PATCH', `/api/tasks/${id}/params`, { replace: true, params: { prompt } }));
+    const title = async (id: string) => (await store.getTask(id))!.title;
+    try {
+      // Typed, backspaced to nothing, then retyped: the title follows the new words.
+      const typed = await draft({ params: { prompt: 'Fix the login' } });
+      await edit(typed, 'Fix');
+      expect(await title(typed)).toBe('Fix');
+      await edit(typed, '');
+      await edit(typed, 'Add dark mode');
+      expect(await title(typed)).toBe('Add dark mode');
+      await edit(typed, '   ');
+      await edit(typed, 'Ship it');
+      expect(await title(typed)).toBe('Ship it');
+
+      // The first words, not a blank first line or its indentation.
+      const spaced = await draft({ params: { prompt: '\n\n   Tidy   the list  \nthen more' } });
+      expect(await title(spaced)).toBe('Tidy the list');
+      await edit(spaced, '\nRename it');
+      expect(await title(spaced)).toBe('Rename it');
+
+      // A title given at creation is the task's own and stays through the same edits.
+      const named = await draft({ title: 'Weekly report', params: { prompt: 'Summarize the week' } });
+      await edit(named, '');
+      await edit(named, 'Summarize the month');
+      expect(await title(named)).toBe('Weekly report');
+
+      // A draft titled by the earlier rule (its raw first line) still follows its prompt.
+      const legacy = await draft({ params: { prompt: '  Old style\nbody' } });
+      await store.setTaskTitle(legacy, '  Old style');
+      await edit(legacy, 'New style');
+      expect(await title(legacy)).toBe('New style');
+    } finally {
+      for (const id of created) await store.deleteTask(id);
+      dev.restore();
+    }
+  });
+
   it('deletes what never started a workflow of its own, and nothing that did', async () => {
     const a = await agent('developer');
     try {
