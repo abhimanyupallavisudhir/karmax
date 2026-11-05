@@ -16,7 +16,6 @@ const stage = (...scenes) => execFileSync('python3', ['-I', path.join(__dirname,
 // Back to the imported data, then into these scenes (a scene may rewrite a conversation).
 const prepare = (...scenes) => execFileSync(path.join(__dirname, 'prepare.sh'), scenes, { stdio: 'inherit' });
 const manifest = fs.existsSync(path.join(OUT, 'shots.json')) ? JSON.parse(fs.readFileSync(path.join(OUT, 'shots.json'), 'utf8')) : {};
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 (async () => {
   fs.mkdirSync(OUT, { recursive: true });

@@ -63,7 +63,7 @@ function headline(parent, title, sub) {
 const CURSOR = `<svg viewBox="0 0 24 24" width="30" height="30"><path d="M4 2.5v17.2l4.6-4.3 3 6.8 2.9-1.3-3-6.6h6.3z" fill="#111" stroke="#fff" stroke-width="1.4" stroke-linejoin="round"/></svg>`;
 
 // A browser window showing 1440×900 screens with a camera (zoom z at focus fx, fy).
-function browserWindow(parent, { url, screens, x = 260, y = 212, scale = 1400 / 1440 }) {
+function browserWindow(parent, { screens, x = 260, y = 212, scale = 1400 / 1440 }) {
   const win = el('div', 'win', parent);
   const chrome = el('div', 'chrome', win, '<i></i><i></i><i></i>');
   const bar = el('div', 'url', chrome);
@@ -140,7 +140,7 @@ let T = 0;
 const next = (d) => { const a = T; T += d; return [a, T]; };
 
 // 0 · Mark, name, tagline.
-scene(...next(3.0), (L, dur) => {
+scene(...next(3.0), (L) => {
   L.id = 'intro';
   const mark = el('img', 'mark', L); setSrc(mark, A + 'brand/icon-512.png'); mark.style.top = '300px';
   const glow = el('div', '', L); Object.assign(glow.style, { position: 'absolute', left: '50%', top: '384px', width: '700px', height: '700px', margin: '-350px', borderRadius: '50%', background: 'radial-gradient(circle, rgba(240,191,85,.28), transparent 65%)' });
@@ -254,7 +254,7 @@ scene(...next(5.0), (L, dur) => {
   const tag = el('div', 'tag', L);
   return (lt) => {
     h(lt);
-    const a = ramp(lt, 1.65, 1.9), b = ramp(lt, 3.1, 3.4);
+    const a = ramp(lt, 1.65, 1.9);
     enter(w, lt, 3.4 + 0.35);
     w.show({ 'made-legibench': 1 - a, 'made-lvpm': a });
     w.url(host(lt < 1.8 ? '/personal/legibench3/tasks/19' : '/personal/lvpm/tasks/8'));
@@ -311,9 +311,9 @@ scene(...next(4.6), (L, dur) => {
 });
 
 // 11 · Everywhere else.
-scene(...next(4.0), (L, dur) => {
+scene(...next(4.0), (L) => {
   const h = headline(L, 'In your pocket, too.', null);
-  const phones = ['mobile-home', 'mobile-task'].map((n, i) => { const p = el('div', 'phone', L); setSrc(el('img', '', p), `${A}${n}.png`); return p; });
+  const phones = ['mobile-home', 'mobile-task'].map((n) => { const p = el('div', 'phone', L); setSrc(el('img', '', p), `${A}${n}.png`); return p; });
   const chips = el('div', 'chips', L);
   const items = ['Project wiki & skills', 'Sub-tasks', 'Teams & Avatārs', 'MCP for any agent', 'tavya CLI', 'Your own cloud accounts'];
   const nodes = items.map((t) => el('span', 'chip', chips, t));
@@ -330,7 +330,7 @@ scene(...next(4.0), (L, dur) => {
 });
 
 // 12 · End card.
-scene(...next(4.4), (L, dur) => {
+scene(...next(4.4), (L) => {
   L.id = 'end';
   const mark = el('img', 'mark', L); setSrc(mark, A + 'brand/icon-512.png'); mark.style.top = '250px';
   const name = el('div', 'wordmark', L, 'tavya'); name.style.top = '440px';
