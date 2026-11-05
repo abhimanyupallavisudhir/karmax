@@ -106,17 +106,17 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await page.keyboard.press('.');
     await echoIs('.');
     const tools = await page.locator('[data-tool]').evaluateAll((els) => els.filter((el) => el.getClientRects().length).map((el) => el.dataset.tool));
-    assert.deepEqual(tools, ['Share', 'Fork', 'Save as template', 'Full screen'], 'self-hosted: Share, Fork, Save as template, Full screen');
-    assert.deepEqual(await hints(), ['1', '2', '3', '4'], 'pressing . numbers the tool buttons');
+    assert.deepEqual(tools, ['Find', 'Share', 'Fork', 'Save as template', 'Full screen'], 'self-hosted: Find, Share, Fork, Save as template, Full screen');
+    assert.deepEqual(await hints(), ['1', '2', '3', '4', '5'], 'pressing . numbers the tool buttons');
     if (shots) await page.screenshot({ path: `${shots}/tool-hints.png` });
-    await page.keyboard.press('4');
+    await page.keyboard.press('5');
     await page.locator('.ck-pane.ck-fullscreen').waitFor();
-    await echoIs('. 4');
+    await echoIs('. 5');
     await page.keyboard.press('Escape');
     await page.locator('.ck-pane.ck-fullscreen').waitFor({ state: 'detached' });
     // A click on a tool teaches its number.
     await page.locator('#conversation-fullscreen').click();
-    await echoIs('. 4');
+    await echoIs('. 5');
     await page.keyboard.press('Escape');
 
     // ── ⌘/Ctrl+Enter presses a dialog's main button ──

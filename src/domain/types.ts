@@ -1835,6 +1835,23 @@ export interface ForkTaskSummary extends ChildTaskSummary {
   forkOf: string[];
 }
 
+/** What a forked agent's conversation was before it became this task's: one
+ *  task of its lineage, cut where the fork branched off it
+ *  (`GET /api/tasks/:id/fork-history`, oldest first). `shared`: that task's
+ *  conversation has several speakers, named by `participants`. `events` are
+ *  the newest of its conversation events up to `until`. */
+export interface InheritedConversation {
+  taskId: string;
+  num?: number;
+  title: string;
+  role: string;
+  until: number;
+  shared?: boolean;
+  participants?: TaskParticipant[];
+  messages: Message[];
+  events: (KarmaxEvent & { seq: number })[];
+}
+
 export interface TaskView {
   taskId: string;
   /**

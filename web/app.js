@@ -102,6 +102,7 @@ const ICON = {
   // Toolbar actions (conversation head, tab rails): one stroke weight and size.
   template: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="7" x="3" y="3" rx="1"/><rect width="9" height="7" x="3" y="14" rx="1"/><rect width="5" height="7" x="16" y="14" rx="1"/></svg>',
   share: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7"/><path d="m16 6-4-4-4 4"/><path d="M12 2v13"/></svg>',
+  find: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>',
   fork: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></svg>',
   terminal: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg>',
   laptop: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"/></svg>',
@@ -5598,6 +5599,8 @@ function connectWs() {
             ws.send(JSON.stringify({ type: 'timing.frame', id: ev.timingDeliveryId, frameMs: performance.now() - received }));
         }));
       }
+      // The fork happened (its first turn copied the session): what it inherited is cut there.
+      if (ev.type === 'session.forked') S.forkHistory = {};
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
         refreshTask(ev.type);
@@ -10704,6 +10707,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   S.explanationSettings = DEFAULT_EXPLANATION_SETTINGS;
   S.explanationPending = {};
   S.explanationErrors = {};
+  S.forkHistory = {};
   S.widgets = [];
   S.paramDefaults = {};
   S.attemptGroup = null;
@@ -11400,6 +11404,7 @@ function renderTaskPage() {
     wireFollowups(v);
     wireTerminal(v.taskId);
     wireExplainMessages(v);
+    wireConversationSearch();
   } else if (tab === 'parameters') {
     wireParams(v);
     paintParticipantStates(v);
@@ -11422,6 +11427,7 @@ function renderTaskPage() {
     wireMessageCopies(thread);
     wireMessageForms(thread, v);
     typesetMath(thread);
+    paintConversationSearch(thread);
   }
   restoreFocus(main, focusState);
   restoreFollowupFocus(main, fuState);
@@ -13084,6 +13090,204 @@ function setConversationFullscreen(active) {
   button.focus({ preventScroll: true });
 }
 
+// ── conversation search ──
+// Find in the open conversation: every row drawn, folded work and the history
+// a fork inherited included (the loaded window of it, like the page). Matches
+// are marked with the CSS Custom Highlight API, which paints text without
+// touching the DOM the live refresh morphs, so marks are redrawn after every
+// render (`paintConversationSearch`); the current match opens the folds around
+// it. State: S.conversationSearch = { key: '<task>/<role>', query, index }.
+const CONVERSATION_SEARCH_SKIP = 'script, style, svg, button, textarea, .msg-meta, .fold-head, .activity-state, .explain-tools, .hidden, mjx-container';
+function conversationSearchKey(v, t) { return `${v.taskId}/${t.role}`; }
+function conversationSearchOpen(v, t) { return S.conversationSearch?.key === conversationSearchKey(v, t); }
+function conversationSearchBar(v, t) {
+  if (!conversationSearchOpen(v, t)) return '';
+  return `<div class="ck-find" id="ck-find" role="search" data-live-key="find:${esc(conversationSearchKey(v, t))}">
+    <input id="ck-find-input" type="text" placeholder="Find in conversation" aria-label="Find in conversation" autocomplete="off" spellcheck="false" value="${esc(S.conversationSearch.query || '')}">
+    <span class="ck-find-count" aria-live="polite"></span>
+    <button type="button" class="btn tool icon ck-find-prev" data-find-step="-1" title="Previous (Shift+Enter)" aria-label="Previous match">${ICON.chevron}</button>
+    <button type="button" class="btn tool icon ck-find-next" data-find-step="1" title="Next (Enter)" aria-label="Next match">${ICON.chevron}</button>
+    <button type="button" class="btn tool icon" data-find-close title="Close (Esc)" aria-label="Close find">${ICON.close}</button>
+  </div>`;
+}
+function openConversationSearch() {
+  const thread = document.getElementById('ck-thread');
+  if (!thread) return;
+  const key = `${thread.dataset.taskId}/${thread.dataset.role}`;
+  // Text selected in the conversation is what to find, as in a browser.
+  const selected = String(window.getSelection?.() || '').trim();
+  const fromSelection = selected && !selected.includes('\n') && thread.contains(window.getSelection().anchorNode) ? selected : '';
+  if (S.conversationSearch?.key !== key) S.conversationSearch = { key, query: '', index: -1 };
+  if (fromSelection) Object.assign(S.conversationSearch, { query: fromSelection, index: -1 });
+  renderTaskPage();
+  const input = document.getElementById('ck-find-input');
+  input?.focus();
+  input?.select();
+}
+function closeConversationSearch() {
+  S.conversationSearch = null;
+  CSS.highlights?.delete('conversation-search');
+  CSS.highlights?.delete('conversation-search-current');
+  renderTaskPage();
+  document.getElementById('find-in-conversation')?.focus({ preventScroll: true });
+}
+// Every match of `query` in the thread's text, case-insensitive, as ranges in
+// reading order. Text is read per block, so a match may cross inline marks
+// (bold, a link, code) but never runs from one message into the next.
+function conversationSearchRanges(root, query) {
+  const needle = query.trim();
+  if (!root || !needle) return [];
+  const pattern = new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+'), 'giu');
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode: (node) => node.parentElement?.closest(CONVERSATION_SEARCH_SKIP) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
+  });
+  const block = (node) => node.parentElement?.closest('p, li, pre, td, th, h1, h2, h3, h4, h5, h6, blockquote, summary, .activity-title, .msg-text, .msg, .agent-activity, .fork-point');
+  const ranges = [];
+  const scan = (nodes) => {
+    if (!nodes.length) return;
+    const starts = [];
+    let text = '';
+    for (const node of nodes) { starts.push(text.length); text += node.data; }
+    const at = (offset, end) => {
+      // The node holding this offset; a match's end at a node boundary stays in the earlier node.
+      let i = starts.length - 1;
+      while (i > 0 && (end ? starts[i] >= offset : starts[i] > offset)) i--;
+      return [nodes[i], offset - starts[i]];
+    };
+    for (const match of text.matchAll(pattern)) {
+      if (!match[0]) continue;
+      const range = document.createRange();
+      range.setStart(...at(match.index, false));
+      range.setEnd(...at(match.index + match[0].length, true));
+      ranges.push(range);
+    }
+  };
+  let run = [], runBlock = null;
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const b = block(node);
+    if (b !== runBlock) { scan(run); run = []; runBlock = b; }
+    run.push(node);
+  }
+  scan(run);
+  return ranges;
+}
+// Where a match is on screen: its own box, or — hidden in a closed fold — the
+// fold's line that holds it.
+function conversationSearchTop(range) {
+  let closed = null;
+  for (let d = range.startContainer.parentElement?.closest('details'); d; d = d.parentElement?.closest('details')) if (!d.open) closed = d;
+  return (closed || range).getBoundingClientRect().top;
+}
+// Redraw the marks after a render; `step` moves to the next (1) or previous
+// (-1) match, `jump` (a new query) to the first one from where the reader is.
+function paintConversationSearch(thread, options) {
+  thread ||= document.getElementById('ck-thread');
+  const step = options?.step || 0, jump = !!options?.jump;
+  const state = S.conversationSearch;
+  const bar = document.getElementById('ck-find');
+  if (!thread || !state || !bar || state.key !== `${thread.dataset.taskId}/${thread.dataset.role}`) return;
+  const ranges = conversationSearchRanges(thread.querySelector('.thread'), state.query || '');
+  const count = bar.querySelector('.ck-find-count');
+  bar.classList.toggle('empty', !!state.query?.trim() && !ranges.length);
+  bar.querySelectorAll('[data-find-step]').forEach((button) => { button.disabled = !ranges.length; });
+  if (!ranges.length) {
+    state.index = -1;
+    count.textContent = state.query?.trim() ? '0/0' : '';
+    CSS.highlights?.delete('conversation-search');
+    CSS.highlights?.delete('conversation-search-current');
+    return;
+  }
+  if (jump || state.index < 0) {
+    const top = thread.getBoundingClientRect().top;
+    const next = ranges.findIndex((range) => conversationSearchTop(range) >= top - 1);
+    state.index = next < 0 ? ranges.length - 1 : next;
+  } else {
+    state.index = (Math.min(state.index, ranges.length - 1) + step + ranges.length) % ranges.length;
+  }
+  const current = ranges[state.index];
+  count.textContent = `${state.index + 1}/${ranges.length}`;
+  if (window.Highlight && CSS.highlights) {
+    CSS.highlights.set('conversation-search', new Highlight(...ranges));
+    CSS.highlights.set('conversation-search-current', new Highlight(current));
+  }
+  if (!step && !jump) return;
+  // Open what hides it (a fold, a step's details), then bring it to the upper third.
+  for (let d = current.startContainer.parentElement?.closest('details'); d; d = d.parentElement?.closest('details')) d.open = true;
+  const box = current.getBoundingClientRect();
+  const view = thread.getBoundingClientRect();
+  if (box.top < view.top + 8 || box.bottom > view.bottom - 8)
+    thread.scrollTop += box.top - view.top - thread.clientHeight / 3;
+}
+function wireConversationSearch() {
+  const bar = document.getElementById('ck-find');
+  const toggle = document.getElementById('find-in-conversation');
+  if (toggle && !toggle.dataset.wired) {
+    toggle.dataset.wired = '1';
+    toggle.addEventListener('click', () => (toggle.getAttribute('aria-pressed') === 'true' ? closeConversationSearch() : openConversationSearch()));
+  }
+  if (!bar || bar.dataset.wired) return;
+  bar.dataset.wired = '1';
+  const input = bar.querySelector('#ck-find-input');
+  input.addEventListener('input', () => {
+    if (!S.conversationSearch) return;
+    S.conversationSearch.query = input.value;
+    paintConversationSearch(undefined, { jump: true });
+  });
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); paintConversationSearch(undefined, { step: event.shiftKey ? -1 : 1 }); }
+    else if (event.key === 'Escape') { event.preventDefault(); closeConversationSearch(); }
+  });
+  bar.querySelectorAll('[data-find-step]').forEach((button) => button.addEventListener('click', () =>
+    paintConversationSearch(undefined, { step: Number(button.dataset.findStep) })));
+  bar.querySelector('[data-find-close]').addEventListener('click', closeConversationSearch);
+}
+
+// One folded stretch of work; `opened` holds the folds a reader opened or closed.
+function conversationFoldHtml(item, key, opened, row) {
+  const open = opened[key] ?? item.live;
+  return `<details class="conv-fold${item.automatic ? ' automatic' : ''}" data-conversation-key="${esc(key)}" data-fold="${esc(key)}" data-drawn-open="${open ? '1' : '0'}"${open ? ' open' : ''}>${conversationFoldHead(item)}<div class="fold-body">${item.entries.map((entry) => row(entry)).join('')}</div></details>`;
+}
+
+// The key a conversation row is morphed, anchored and searched by.
+function conversationEntryKey(entry) {
+  return entry.type === 'activity' ? `activity:${entry.activityRef}` : entry.sourceKey || `explanation:${entry.order}`;
+}
+
+// A forked agent's conversation began in another task: what was said there
+// before the fork reads above this task's own, as the agent remembers it. The
+// server walks the fork lineage (`GET /api/tasks/:id/fork-history`), so a fork
+// of a fork shows both, each closed by a line naming the task at the point it
+// was forked. Loaded once per opened task, and again once its fork happens.
+function loadForkHistory(v, role) {
+  const key = `${v.taskId}/${role}`;
+  S.forkHistory ||= {};
+  if (!v.forkSourceSummaries?.length || S.forkHistory[key]) return;
+  const epoch = S.taskOpenEpoch;
+  S.forkHistory[key] = { segments: [] };
+  api(`/api/tasks/${encodeURIComponent(v.taskId)}/fork-history?role=${encodeURIComponent(role)}`)
+    .then((segments) => {
+      if (S.taskOpenEpoch !== epoch || !Array.isArray(segments) || !segments.length) return;
+      S.forkHistory[key] = { segments };
+      scheduleTaskPageRender();
+    }, () => {});
+}
+function inheritedConversationHtml(v, t, opened) {
+  const segments = S.forkHistory?.[`${v.taskId}/${t.role}`]?.segments || [];
+  return segments.map((segment) => {
+    const prefix = `fork:${segment.taskId}:`;
+    // Drawn as that task's: its speakers, its files; nothing in it acts.
+    const source = { taskId: segment.taskId, messages: segment.messages, ...(segment.shared ? { participants: segment.participants || [] } : {}) };
+    const entries = conversationEntries({ role: segment.role, messages: segment.messages, shared: !!segment.shared }, segment.events)
+      .map((entry) => ({ ...entry, inherited: true }));
+    const row = (entry) => renderConversationEntry(entry, source)
+      .replace(' ', ` data-conversation-key="${esc(prefix + conversationEntryKey(entry))}" `);
+    const body = conversationOutline(entries).map((item) => item.fold
+      ? conversationFoldHtml(item, prefix + item.key, opened, row) : row(item.entry)).join('');
+    const name = `${segment.num != null ? `#${segment.num} ` : ''}${segment.title || ''}`.trim();
+    return `${body}<div class="fork-point" data-conversation-key="${esc(prefix)}point"><a data-spa href="${esc(taskUrl(segment.taskId))}" title="Said in that task before this one forked from it">${ICON.fork}<span>Forked from ${esc(name)}</span></a></div>`;
+  }).join('');
+}
+
 function conversationPane(v, t) {
   if (!t) return '<div class="empty"><div class="big">No conversations yet</div>Agents appear here once the workflow starts one.</div>';
   const entries = conversationEntries(t);
@@ -13117,7 +13321,7 @@ function conversationPane(v, t) {
   const row = (entry, attrs = '') => renderConversationEntry(
     entry === entries[resourceRequestIndex] ? { ...entry, resourceReview: true }
       : entry === entries[formIndex] ? { ...entry, formLive: true } : entry, v)
-    .replace(' ', ` data-conversation-key="${esc(entry.type === 'activity' ? `activity:${entry.activityRef}` : entry.sourceKey || `explanation:${entry.order}`)}"${attrs} `);
+    .replace(' ', ` data-conversation-key="${esc(conversationEntryKey(entry))}"${attrs} `);
   const working = t.shared ? v.participants.some((p) => p.state === 'running') : v.agentTurn?.role === t.role;
   const outline = conversationOutline(entries, { live: working, asking: !!humanWaitDetail(v) });
   // Opening the task lands on the latest thing said to people (renderTaskPage).
@@ -13127,10 +13331,12 @@ function conversationPane(v, t) {
   const before = land && outline.slice(0, outline.indexOf(land)).findLast((item) => !item.fold);
   const question = before?.entry.type === 'message' && messageOrigin(before.entry.message) === 'person' ? before : null;
   const opened = S.conversationFolds?.[`${v.taskId}/${t.role}`] || {};
-  const msgs = historyStatus + (outline.map((item) => item.fold
-    ? `<details class="conv-fold${item.automatic ? ' automatic' : ''}" data-conversation-key="${esc(item.key)}" data-fold="${esc(item.key)}" data-drawn-open="${opened[item.key] ?? item.live ? '1' : '0'}"${opened[item.key] ?? item.live ? ' open' : ''}>${conversationFoldHead(item)}<div class="fold-body">${item.entries.map((entry) => row(entry)).join('')}</div></details>`
+  loadForkHistory(v, t.role);
+  const inherited = inheritedConversationHtml(v, t, opened);
+  const msgs = historyStatus + inherited + (outline.map((item) => item.fold
+    ? conversationFoldHtml(item, item.key, opened, row)
     : row(item.entry, item === land ? ' data-land' : item === question ? ' data-land-question' : '')).join('')
-    || (historyStatus ? '' : '<div class="msg system">No messages yet</div>'));
+    || (historyStatus || inherited ? '' : '<div class="msg system">No messages yet</div>'));
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
   const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
@@ -13144,7 +13350,7 @@ function conversationPane(v, t) {
         <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}${continues ? ' title="The approved PR lands as it is. The agent carries on in a new task."' : ''}>${continues ? 'Continue' : 'Send'}</button>
       </div></div>`
     : '';
-  return `
+  return `${conversationSearchBar(v, t)}
     <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}${conversationWaitNotice(v)}${conversationError(v)}${conversationApprovalRequests()}${conversationPullRequestAsks(v)}${conversationReviewInfo(v, resourceRequestIndex >= 0)}</div></div>
     ${fu}`;
 }
@@ -13186,6 +13392,7 @@ function conversationBar(v, t) {
       : presence.tone === 'idle' || presence.tone === 'done' ? '' : `<span class="conversation-presence ${presence.tone}" title="${esc(presence.label)}"><span class="presence-dot"></span><span class="presence-label">${esc(presence.label)}</span></span>`}
     <span class="tp-bar-fill"></span>
     <div class="ck-tools">
+      <button class="btn tool" id="find-in-conversation" data-tool="Find" data-shortcut="task.find" title="Find in conversation (${esc(fmtKeys('meta+f'))})" aria-label="Find" aria-pressed="${conversationSearchOpen(v, t)}">${ICON.find}<span class="tool-label">Find</span></button>
       <button class="btn tool" id="share-task-conversation" data-tool="Share" data-role="${esc(t.role)}" title="Share this conversation" aria-label="Share">${ICON.share}<span class="tool-label">Share</span></button>
       <button class="btn tool" id="fork-task-agent" data-tool="Fork" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation" aria-label="Fork">${ICON.fork}<span class="tool-label">Fork</span></button>
       ${S.meta?.hosted ? `<button type="button" class="btn tool" id="local-checkout" data-tool="Work locally" title="Check out this task on your computer" aria-label="Work locally">${ICON.laptop}<span class="tool-label">Work locally</span></button>` : ''}
@@ -13214,18 +13421,18 @@ function stagingProgress() {
     title: p.count > 1 ? `Resource ${p.index + 1} of ${p.count}` : '' };
 }
 
-function conversationEntries(t) {
+function conversationEntries(t, events = S.taskEvents) {
   // Fetch/WS races can merge an older durable window with newer events in either
   // array order. Fold provider updates in their durable order so a stale
   // "started" update can never replace a later "completed" one. Explanations
   // also carry their source event: it keeps an explained message present after
   // that message ages out of the ordinary bounded event window.
-  const sourceEvents = (S.taskEvents || [])
+  const sourceEvents = (events || [])
     .filter((event) => event.type === 'conversation.explanation' && event.payload?.role === t.role)
     .map((event) => event.payload?.sourceEvent)
     .filter((event) => event?.type === 'agent.activity');
   const seenEvents = new Set();
-  const orderedEvents = [...(S.taskEvents || []), ...sourceEvents]
+  const orderedEvents = [...(events || []), ...sourceEvents]
     .map((event, index) => ({ event, index }))
     .filter(({ event }) => {
       const key = event.seq != null ? `seq:${event.seq}` : `${event.type}/${event.ts}/${JSON.stringify(event.payload)}`;
@@ -13958,7 +14165,7 @@ function explainMessageAffordance(entry, v) {
   const error = !failure ? '' : failure.code === 'explanation_api_key_missing'
     ? `<div class="explain-error">API key for ${esc(failure.provider)} not found. Please add an API key in <a data-spa href="${globalRoute('organization', organization)}#settings-agents">agent logins</a> or try with a different model (<a data-spa href="${projectRoute(project?.id, 'settings')}#project-explanation">change default</a>).</div>`
     : `<div class="explain-error">${esc(failure.message || 'Could not explain this message.')}</div>`;
-  const explain = !explanationsEnabled() ? '' : `<button class="explain-run" ${pending ? 'disabled' : ''}>${pending ? 'Explaining…' : `Explain this with ${esc(explanationModelLabel())}`}</button>
+  const explain = entry.inherited || !explanationsEnabled() ? '' : `<button class="explain-run" ${pending ? 'disabled' : ''}>${pending ? 'Explaining…' : `Explain this with ${esc(explanationModelLabel())}`}</button>
     <button class="explain-more" ${pending ? 'disabled' : ''} aria-label="Change explanation model and prompt" title="Change explanation model and prompt">${ICON.more}</button>`;
   // The TeX button only where there is math to typeset: on every message it is noise.
   const tex = hasMath(entry.message?.text ?? entry.activity?.title ?? entry.request?.text) ? texToggleHtml(!markdownEnabled()) : '';
@@ -26480,6 +26687,9 @@ function allCommands() {
   add({ id: 'task.tab.prev', title: 'Chat / Parameters', keybinding: '[', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(-1) });
   add({ id: 'task.tab.next', title: 'Chat / Parameters', keybinding: ']', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(1) });
   add({ id: 'task.rail', title: 'Show / hide details', keybinding: 'i', group: 'Task', help: false, available: !!(S.selected && S.view && $('#tp-rail-toggle')), run: toggleTaskRail });
+  // ⌘F finds in the conversation; pressed again in its box, the browser's own find.
+  add({ id: 'task.find', title: 'Find in conversation', keybinding: 'meta+f', group: 'Task', help: false,
+    available: !!(S.selected && S.view && $('#find-in-conversation')) && document.activeElement?.id !== 'ck-find-input', run: () => openConversationSearch() });
   add({ id: 'task.terminal', title: 'Terminal / conversation', keybinding: 't', group: 'Task', help: false, available: !!(S.selected && S.view && $('#tp-rail [data-open-terminal]:not(:disabled)')), run: () => toggleTaskTerminal() });
   // { / } also walk the settings rail's panes (project or organization settings).
   const onSettings = ['settings', 'organization', 'global'].includes(S.tab) && !S.selected;
@@ -27021,7 +27231,8 @@ function openHelp() {
     ['List', rows(group('List'))],
     [COMMAND_GROUP_LABELS.Task, rows(group('Task'))
       + row('1–9', 'Action buttons')
-      + row('. 1–9', 'Share, Fork, Work locally, Save as template, Full screen')
+      + row('. 1–9', 'Find, Share, Fork, Work locally, Save as template, Full screen')
+      + row(fmtKeys('meta+f'), 'Find in conversation')
       + row('[ / ]', 'Chat / Parameters')
       + row('{ / }', 'Previous / next attempt')
       + row('a n', 'New attempt')
