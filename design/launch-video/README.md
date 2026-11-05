@@ -37,6 +37,22 @@ cp /tmp/demo/takeA.mp4 /tmp/demo/assets/launch-v1.mp4
 design/launch-video/record.sh /tmp/demo/takeB && python3 design/launch-video/edit.py /tmp/demo/takeB /tmp/demo/tavya-launch.mp4
 ```
 
+### All eight cuts
+
+`all-cuts.sh` makes every version: the snappy and the readable film (a take
+recorded with `DEMO_HOLD=1.8`, so every reading pause lasts 1.8× longer, and
+edited with `--readable`, so waits and typing are sped up less), each with and
+without a voiceover, each in landscape (1920×1080) and portrait (1080×1350).
+
+- `voice.py` speaks one line per scene with OpenAI's `gpt-4o-mini-tts`
+  (`OPENAI_API_KEY`; voice `coral`, override with `VO_VOICE`), starting at the
+  scene's mark and never over the next line, ducks the music under it and ends
+  exactly with the picture. Lines are cached by text in `/tmp/demo/vo-cache`.
+- `mobile.py` crops each frame to the square around the action (the camera's
+  focus when zoomed, else the cursor), so text is ~1.8× larger on a phone, and
+  sets the captions large in their own band. Title card, terminal and grid are
+  shown whole.
+
 A take also seeds, off camera, the logins the vault shows (dummies; the
 United login the flight task asks for) and pretend documents in admin_docs.
 
@@ -51,6 +67,7 @@ United login the flight task asks for) and pretend documents in admin_docs.
 | `shots.cjs` | Stills of the real console for the feature grid, taken off camera (cut from the film). |
 | `director.cjs` | The take. Each `mark(name, speed)` sets the playback speed from there on (waits run ×3–5; 0 cuts). |
 | `edit.py`, `music.py` | Frames retimed onto 60 fps H.264; a synthesised music bed. |
+| `voice.py`, `mobile.py`, `all-cuts.sh` | The voiceover, the portrait cut, and every cut in one go. |
 
 ## Safety
 
