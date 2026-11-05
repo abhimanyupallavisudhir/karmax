@@ -223,6 +223,22 @@ entry(r'credential decision\]\s+Access to "flights/united" was approved', [
 - The e-ticket went to your e-mail, and I put the flight in the wiki under `travel/2027-01-london`.'''),
 ], pace=1100)
 
+# ── Sub-tasks (the feature grid's still; created and deleted off camera) ──
+SUBTASKS = [
+    ('Write the Show HN post and the Product Hunt listing', False),
+    ('Record the launch video', False),
+    ('Docs: get started in five minutes', False),
+    ('Pricing page: final plans and limits', True),
+]
+entry(r'^Get tavya ready for its public launch', [
+    '@step read Read the roadmap, the docs and the pricing page',
+    *[f'@tool create_sub_task ' + json.dumps({'title': t, 'prompt': t + '.', **({'draft': True} if d else {})}) for t, d in SUBTASKS],
+    '@say Split the launch into four sub-tasks; the pricing page waits for your go-ahead.',
+])
+entry(r'^Write the Show HN post', ['@step edit Write launch/show-hn.md', '@summary Drafted.', '@say Drafted both.'])
+entry(r'^Docs: get started', ['@step edit Write docs/getting-started.md', '@summary Written.', '@say Written.'])
+entry(r'^Record the launch video', ['@sleep 900000'])
+
 # ── Photos via the CLI ───────────────────────────────────────────────────
 entry(r'^Sort my photos', [
     '@step command exiftool -T -DateTimeOriginal -GPSPosition photos/*.jpg :: 37 image files read',

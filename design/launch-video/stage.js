@@ -69,6 +69,7 @@
   @keyframes run{0%,100%{background:#c9c9d6;box-shadow:none}35%,65%{background:#2fb67c;box-shadow:0 0 0 4px rgba(47,182,124,.18)}}
   #grid .tile.on .shot img{animation:kb 6s cubic-bezier(.3,.1,.3,1) forwards}
   #grid .shot img.b{opacity:0}
+  #grid .shot img.fit{object-fit:contain;object-position:50% 50%;padding:10px 0;box-sizing:border-box;transform-origin:50% 50%}
   #grid .tile.on .shot img.b{animation:kb 6s cubic-bezier(.3,.1,.3,1) forwards,xfade 6s ease forwards}
   @keyframes kb{from{transform:scale(1)}to{transform:scale(1.07)}}
   @keyframes xfade{0%,32%{opacity:0}42%,100%{opacity:1}}
@@ -80,7 +81,9 @@
   const CURSOR = '<svg viewBox="0 0 24 24" width="24" height="24"><path d="M4 2.5v18l4.6-4.3 2.9 6.7 3.2-1.4-2.9-6.6h6.5z" fill="#111" stroke="#fff" stroke-width="1.5" stroke-linejoin="round"/></svg>';
     const $ = (q) => document.querySelector(q);
   let pos = [W / 2, H / 2 + 60];
-  let cam = { s: 1, tx: 0, ty: 0 };
+  let cam = { s: 1, tx: 0, ty: 0, fx: W / 2, fy: H / 2 };
+  // What a portrait cut should frame, sampled for the edit: captions, and the point of interest.
+  const log = { captions: [], track: [] };
   const ease = (t) => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
   const place = () => { $('#cursor').style.transform = `translate(${pos[0] - 4}px,${pos[1] - 2}px)`; };
   function build(src) {
@@ -93,10 +96,20 @@
       <div id="layer"><div id="scrim"></div><div id="term"><div class="tbar"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="title">zsh</span></div><pre></pre></div>
         <div id="grid"></div><div id="card"></div><div id="cursor">${CURSOR}</div></div>`;
     place();
+    // Every 50 ms: where the action is (stage px), and whether a full-stage layer is up.
+    setInterval(() => {
+      const m = new DOMMatrixReadOnly(getComputedStyle($('#win')).transform);
+      const zoomed = m.a > 1.01;
+      const x = zoomed ? X0 + m.e + m.a * (cam.fx - X0) : pos[0];
+      const y = zoomed ? Y0 + m.f + m.a * (cam.fy - Y0) : pos[1];
+      const full = ['#card', '#scrim', '#grid', '#term'].some((q) => $(q)?.classList.contains('on')) || !!$('#still');
+      log.track.push({ t: Date.now() / 1000, x, y, z: m.a, full });
+    }, 50);
     setInterval(() => { try { const l = $('#app').contentWindow.location; const p = decodeURIComponent(l.pathname + l.search); $('#path').textContent = p === '/' ? '' : p; } catch {} }, 150);
   }
   const api = {
     build,
+    log,
     geometry: { W, H, S, BAR, X0, Y0, WW, WH, Z },
     move(x, y, ms = 600) {
       const from = [...pos], t0 = performance.now();
@@ -116,6 +129,7 @@
     ripple() { const r = document.createElement('div'); r.className = 'ripple'; r.style.left = `${pos[0]}px`; r.style.top = `${pos[1]}px`; $('#layer').appendChild(r); setTimeout(() => r.remove(), 600); },
     cursorVisible(on) { $('#cursor').style.opacity = on ? '1' : '0'; },
     caption(html) {
+      log.captions.push({ t: Date.now() / 1000, html: html || '' });
       const c = $('#caption');
       if (!html) { c.classList.remove('on'); return; }
       const show = () => { c.innerHTML = html; void c.offsetWidth; c.classList.add('on'); };
@@ -128,7 +142,7 @@
       // Zoomed in, the window always fills the stage: no backdrop at an edge.
       if (WW * s >= W) tx = Math.min(-X0, Math.max(W - X0 - WW * s, tx));
       if ((WH + BAR) * s >= H) ty = Math.min(-Y0, Math.max(H - Y0 - (WH + BAR) * s, ty));
-      cam = { s, tx, ty };
+      cam = { s, tx, ty, fx, fy };
       w.style.transition = ms ? `transform ${ms}ms cubic-bezier(.45,.05,.2,1)` : 'none';
       w.style.transform = s === 1 ? '' : `translate(${tx}px,${ty}px) scale(${s})`;
       return new Promise((r) => setTimeout(r, ms));
@@ -172,7 +186,7 @@
       /** tiles: [{icon (svg markup), title, hint, shots: [src, src?] or html, origin: 'x% y%'}] */
       open(title, tiles) {
         const g = $('#grid');
-        g.innerHTML = `<h2>${title}</h2><div class="tiles">${tiles.map((t) => `<div class="tile"><div class="shot" style="--o:${t.origin ?? '0 0'}">${t.html ?? t.shots.map((src, k) => `<img class="${k ? 'b' : 'a'}" src="${src}" alt="">`).join('')}</div>
+        g.innerHTML = `<h2>${title}</h2><div class="tiles">${tiles.map((t) => `<div class="tile"><div class="shot" style="--o:${t.origin ?? '0 0'}">${t.html ?? t.shots.map((src, k) => `<img class="${k ? 'b' : 'a'}${t.fit ? ' fit' : ''}" src="${src}" alt="">`).join('')}</div>
           <div class="cap"><span class="ico">${t.icon}</span><div><div class="t">${t.title}</div>${t.hint ? `<div class="h">${t.hint}</div>` : ''}</div></div></div>`).join('')}</div>`;
         return Promise.all([...g.querySelectorAll('img')].map((i) => i.decode().catch(() => {}))).then(() => { void g.offsetWidth; g.classList.add('on'); });
       },

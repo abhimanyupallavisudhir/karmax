@@ -2,7 +2,7 @@
 // page (2× for crisp tiles). Each is a crop around the part that tells the story.
 const path = require('node:path');
 
-module.exports = async function shoot(browser, { app, storageState, out, route }) {
+module.exports = async function shoot(browser, { app, storageState, out, route, subtasks }) {
   const context = await browser.newContext({ storageState, viewport: { width: 1440, height: 810 }, deviceScaleFactor: 2, colorScheme: 'light' });
   if (route) await route(context);
   const page = await context.newPage();
@@ -33,14 +33,11 @@ module.exports = async function shoot(browser, { app, storageState, out, route }
   await crop('agents', [ref], 14, { bottom: rb.y + 318 });
   await page.keyboard.press('Escape'); await sleep(200);
 
-  // Triggers: after a task, on a schedule, on an event.
-  const triggers = page.locator('#tf-page .form-row[data-row="__triggers"]');
-  await triggers.evaluate((e) => e.scrollIntoView({ block: 'center' })); await sleep(400);
-  const cron = triggers.locator('input').filter({ visible: true });
-  for (const [i, v] of ['0', '3'].entries()) await cron.nth(i).fill(v);
-  await triggers.getByPlaceholder('github.issues.labeled').fill('agent-cli.released');
-  await triggers.locator('input[type=checkbox]').last().check({ force: true }).catch(() => {}); await sleep(400);
-  await crop('triggers', [triggers]);
+  // Sub-tasks: a task that split itself up, its children in every state.
+  if (subtasks) {
+    await page.goto(`${app}${subtasks}`); await sleep(2500);
+    await crop('subtasks', [page.locator('.rail-sec.subtasks')], 6);
+  }
 
   // The vault and connected apps.
   await page.goto(`${app}/personal/settings#settings-payments`); await sleep(1800);

@@ -6,6 +6,8 @@ WIKI=${KARMAX_WIKI:-$(ls -d "$K"/../krmax-wiki-* 2>/dev/null | head -1)}; PANAGE
 TEMPORAL_CLI=${TEMPORAL_CLI:-$HOME/.temporalio/bin/temporal}
 OUT=${1:-$D/rec}; APP=http://127.0.0.1:48950
 pkill -f "$D/home/temporal" 2>/dev/null; pkill -f "KARMAX_HOME=$D/home" 2>/dev/null; sleep 1
+# A server from an interrupted take (setsid outlives its job) would share the home.
+for pid in $(ss -ltnpH "sport = :48950" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2); do kill -TERM "$pid"; done; sleep 1
 chmod -R u+w $D/home $D/repos 2>/dev/null; rm -rf $D/home $D/repos
 cd $D && tar -xzf pristine.tgz
 python3 $T/script.py >/dev/null
