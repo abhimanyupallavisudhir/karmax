@@ -150,6 +150,41 @@ describe('software-dev: every branch of a task lands as its own pull request', (
     expect((await view(handle)).subTasks).toHaveLength(1);
   }, 150_000);
 
+  it('"Changed files" stops listing a branch once its pull request lands, and is empty once everything has', async () => {
+    const repo = await h.makeRepo('ship-changed-files');
+    const { handle } = await start(repo, [
+      '@branch docs',
+      docsCommit,
+      '@ship docs',
+      '@write feature.js :: export const feature = 1;',
+      '@incomplete',
+    ].join('\n'));
+    const files = async () => ((await view(handle)).reviewInfo?.changedFiles ?? []) as string[];
+    const { child } = await pullRequest(handle, 1);
+    // The agent's turn ended: the list is both branches' work, the docs pull request's included.
+    await expect.poll(async () => `${(await view(handle)).stage}/${(await view(handle)).waitingFor?.kind}`, { timeout: 30_000 }).toBe('do/human');
+    await expect.poll(async () => (await files()).some((file) => file.endsWith('docs/guide.md')), { timeout: 30_000 }).toBe(true);
+    expect((await files()).some((file) => file.endsWith('feature.js (new)'))).toBe(true);
+
+    // The docs pull request lands while the task waits for its agent: its work
+    // leaves the list, what has not landed stays.
+    await child.signal('confirm');
+    expect((await child.result()).stage).toBe('done');
+    await expect.poll(async () => (await files()).some((file) => file.endsWith('docs/guide.md')), { timeout: 30_000 }).toBe(false);
+    expect(await files()).toEqual([expect.stringMatching(/feature\.js \(new\)$/)]);
+    expect((await view(handle)).stage).toBe('do');
+
+    // The rest goes through the task's own Review, whose list is its proposal's.
+    await handle.signal('followUp', { id: 'f1', role: 'user', ts: 0, text: '@run git add -A && git commit -qm feature' });
+    await expect.poll(async () => { const v = await view(handle); return `${v.stage}/${v.waitingFor?.kind}`; },
+      { timeout: 30_000 }).toBe('review/human');
+    expect(await files()).toEqual(['feature.js']);
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    // Everything landed: nothing is left to list.
+    expect(await files()).toEqual([]);
+  }, 150_000);
+
   it('opening a pull request again before Review updates it; after it lands, the branch opens a new one', async () => {
     const repo = await h.makeRepo('ship-again');
     const { handle } = await start(repo, [
