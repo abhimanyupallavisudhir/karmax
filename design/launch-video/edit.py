@@ -12,7 +12,8 @@ frames = sorted(json.load(open(f'{take}/frames.json')), key=lambda f: f['t'])
 marks = json.load(open(f'{take}/marks.json'))
 start = marks[0]['t']; stop = marks[-1]['t']
 
-PACE = 1.0 if readable else 1.08  # the snappy film a touch quicker than life
+PACE = 1.0 if readable else 1.15  # the snappy film a touch quicker than life
+WAITS = 1.0 if readable else 1.5   # and its waits and typing quicker still
 
 def speed_at(t):
     s = None
@@ -20,6 +21,7 @@ def speed_at(t):
         if m['t'] <= t: s = m['speed']
         else: break
     if s and readable and s > 1: s = 1 + (s - 1) * 0.45
+    if s and s > 1: s *= WAITS
     return s and s * PACE
 
 def out_len(a, b):

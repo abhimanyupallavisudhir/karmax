@@ -387,6 +387,10 @@ const WORLD_REOPENS_WAIT = 'software-dev-world-reopens-wait-v1';
  * Review waits on anyone. Setup used to publish a wait, which parked the world
  * first, and its message started nothing until the park ended (legibench3 #20). */
 const REVIEW_SETUP_FOLLOW_UP = 'software-dev-review-setup-follow-up-v1';
+/** "Changed files" lists only work that has not landed: a branch's pull
+ * request landing rebuilds it, leaving that pull request's work out, and the
+ * whole task landing empties it (it had been the last Review's snapshot). */
+const CHANGED_FILES_AFTER_LANDING = 'software-dev-changed-files-after-landing-v1';
 const quietNotice = (m: Message): boolean => m.id.startsWith(QUIET_NOTICE);
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max)}…` : text;
 /** A turn can return while the agent's own in-harness sub-agents (Claude Agent SDK
@@ -1031,6 +1035,11 @@ async function softwareDevImpl(
   let finishRounds = 0;
   /** The whole world, while `world` is narrowed to the task's own proposal. */
   let fullWorld: WorldHandleLike | undefined;
+  /** A pull request landed since "Changed files" was built: it still lists that work. */
+  let changedFilesStale = false;
+  /** Per pull request, the heads it was opened at that it took; an update it
+   * refused (it came after approval) is not what lands. */
+  const shippedHeads = new Map<string, string[]>();
   /** A pull request (v1.30): the commit its agent opened it at again, not yet in its worktree. */
   let pendingHead: string | undefined;
   // A pull request opened with its task's data (SPEC §11.1): what it publishes
@@ -2350,6 +2359,7 @@ async function softwareDevImpl(
   setHandler(pullRequestNoticeSignal, ({ childTaskId, kind, text }) => {
     const shipment = shipments.find((candidate) => candidate.childTaskId === childTaskId);
     if (!shipsBranches || !shipment) return;
+    if (kind === 'update-refused') shippedHeads.get(childTaskId)?.pop();
     // Finishing: the agent has stopped, so a pull request needing it closes.
     if (finishing) {
       if (kind === 'needs-work') void getExternalWorkflowHandle(childTaskId).signal(closePullRequestSignal).catch(() => undefined);
@@ -3774,14 +3784,28 @@ async function softwareDevImpl(
    * each runs at once (the task is parked, so nothing else is working) and the
    * wait resumes unless it is now ready. Before 1.27 it is a plain condition. */
   async function waitServing(ready: () => boolean, timeoutMs?: number): Promise<boolean> {
-    if (!multiAgent) return timeoutMs === undefined ? (await condition(ready), true) : condition(ready, timeoutMs);
+    // A pull request landing while the agent waits refreshes "Changed files"
+    // (only ever set where CHANGED_FILES_AFTER_LANDING was taken).
+    const landed = () => changedFilesStale && stage === 'do' && !cancelled;
     const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
+    if (!multiAgent) {
+      for (;;) {
+        const wake = () => ready() || landed();
+        const woke = deadline === undefined ? (await condition(wake), true)
+          : await condition(wake, Math.max(0, deadline - Date.now()));
+        if (ready()) return true;
+        if (!woke) return false;
+        if (!landed()) return true;
+        await refreshChangedFiles();
+      }
+    }
     for (;;) {
-      const wake = () => ready() || (agentQueue.length > 0 && !cancelled);
+      const wake = () => ready() || (agentQueue.length > 0 && !cancelled) || landed();
       const woke = deadline === undefined ? (await condition(wake), true)
         : await condition(wake, Math.max(0, deadline - Date.now()));
       if (ready()) return true;
       if (!woke) return false;
+      if (landed()) { await refreshChangedFiles(); continue; }
       await runCalledAgents();
     }
   }
@@ -3947,6 +3971,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         for (const child of children) noteShipmentSettled(child.taskId, child.stage);
       }
     }
+    await refreshChangedFiles();
     stage = 'done';
     status = 'done';
     waitingFor = undefined;
@@ -3971,6 +3996,8 @@ Inspect the complete current diff and specifically compare its delta from the re
   async function awaitPullRequests(): Promise<'settled' | 'agent' | 'cancelled'> {
     try {
       for (;;) {
+        if (cancelled) return 'cancelled';
+        await refreshChangedFiles();
         if (cancelled) return 'cancelled';
         if (mainUnread()) return 'agent';
         const open = openShipments();
@@ -4008,6 +4035,29 @@ Inspect the complete current diff and specifically compare its delta from the re
       : `${name} closed without landing (${childStage}).${stacked.length ? ` ${stacked.join(', ')} builds on it.` : ''}`;
     const quiet = shipment.state === 'landed' && !stacked.length;
     whenLoaded(() => msgs.push({ id: `${quiet ? QUIET_NOTICE : 'pr-'}${msgs.length}`, role: 'user', text, ts: Date.now() }));
+    if (shipment.state === 'landed' && reviewInfo?.changedFiles?.length && patched(CHANGED_FILES_AFTER_LANDING)) changedFilesStale = true;
+  }
+
+  /** Per checkout, the head its latest landed pull request landed at. */
+  function landedHeads(): Record<string, string> {
+    const heads: Record<string, string> = {};
+    for (const shipment of shipments) if (shipment.state === 'landed')
+      heads[shipment.checkout] = shippedHeads.get(shipment.childTaskId)?.at(-1) ?? shipment.head;
+    return heads;
+  }
+
+  /** Rebuild "Changed files" without what landed. It runs as a pull request
+   * settles, while the landing has just used the world (so it wakes nothing),
+   * and only while the agent works: a Review's list is that Review's. */
+  async function refreshChangedFiles(): Promise<void> {
+    if (!changedFilesStale) return;
+    changedFilesStale = false;
+    const whole = fullWorld ?? world;
+    if (!whole || cancelled) return;
+    const fresh = await core.buildReview(whole as WorldHandle, base, landedHeads()).catch(() => undefined);
+    if (!fresh) return;
+    reviewInfo = { ...reviewInfo, changedFiles: fresh.changedFiles };
+    await publish();
   }
 
   const openShipments = () => shipments.filter((shipment) => shipment.state === 'open');
@@ -4048,6 +4098,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         return { ok: true, childTaskId: open.childTaskId, branch: open.branch, checkout: open.checkout, target: open.target, updated: true };
       const taken = await takeData();
       if (!taken.ok) return taken;
+      shippedHeads.set(open.childTaskId, [...shippedHeads.get(open.childTaskId) ?? [open.head], check.head]);
       open.head = check.head;
       open.requestId = request.requestId;
       open.data = taken.data?.length ? taken.data : undefined;
@@ -4975,7 +5026,9 @@ Inspect the complete current diff and specifically compare its delta from the re
           || (!!needsInput && prRequested) || halted(),
         // Agents called while the main agent is paused run now; its pause goes
         // on unless what they say is for it.
-        ...(multiAgent ? { serveable: () => agentQueue.length > 0 && !cancelled, serve: runCalledAgents } : {}),
+        // A pull request landing meanwhile refreshes "Changed files".
+        serveable: () => (multiAgent && agentQueue.length > 0 && !cancelled) || (changedFilesStale && !cancelled),
+        serve: async () => { if (changedFilesStale && !cancelled) await refreshChangedFiles(); else await runCalledAgents(); },
       }).finally(() => { if (multiAgent) turnOwners.pop(); });
       if (cancelled) return await abort();
       if (multiAgent && stopping?.key === MAIN_AGENT) {
@@ -5210,7 +5263,10 @@ Inspect the complete current diff and specifically compare its delta from the re
       // (summary/links/html) takes precedence where present (§5.5). Diffs are
       // intentionally omitted from the review packet — reviewers use the
       // changed-files list plus the in-world terminal / conversation transcripts.
-      const auto = await core.buildReview(world as any, base).catch(() => undefined);
+      // A pull request of its own landed: that work is no longer the task's to list.
+      const landedSoFar = shipsBranches && shipments.some((shipment) => shipment.state === 'landed') ? landedHeads() : undefined;
+      if (landedSoFar) changedFilesStale = false;
+      const auto = await (landedSoFar ? core.buildReview(world as any, base, landedSoFar) : core.buildReview(world as any, base)).catch(() => undefined);
       if (auto) {
         reviewInfo = {
           // Prefer the agent's terse caption; fall back to the git-derived summary.
@@ -5621,6 +5677,7 @@ Inspect the complete current diff and specifically compare its delta from the re
   }
   }
   if (pullRequestsSettled) {
+    await refreshChangedFiles();
     stage = 'done';
     status = 'done';
     const landed = shipments.filter((shipment) => shipment.state === 'landed');
@@ -6593,6 +6650,9 @@ Inspect the complete current diff and specifically compare its delta from the re
   if (fullWorld) { world = fullWorld; fullWorld = undefined; }
   stage = 'done';
   status = 'done';
+  // What it proposed has landed: "Changed files" no longer lists it.
+  changedFilesStale = false;
+  if (reviewInfo?.changedFiles?.length && patched(CHANGED_FILES_AFTER_LANDING)) reviewInfo = { ...reviewInfo, changedFiles: [] };
   // The landing adds to the work summary; it never replaces it.
   const landed = landedNote(world, target, sha);
   if (landed) reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${reviewInfo.summary}\n\n${landed}` : landed };

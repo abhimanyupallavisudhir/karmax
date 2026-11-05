@@ -289,10 +289,10 @@
     const keepLink = (html) => `\u0002${links.push(html) - 1}\u0002`;
     const format = (value) => {
       let out = value;
-      out = out.replace(/\*\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*\*/g, '<strong><em>$1</em></strong>');
-      out = out.replace(/___([^\s](?:[\s\S]*?[^\s])?)___/g, '<strong><em>$1</em></strong>');
-      out = out.replace(/\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*/g, '<strong>$1</strong>');
-      out = out.replace(/__([^\s](?:[\s\S]*?[^\s])?)__/g, '<strong>$1</strong>');
+      out = out.replace(/\*\*\*([^\s](?:[\s\S]*?[^\s])??)\*\*\*/g, '<strong><em>$1</em></strong>');
+      out = out.replace(/___([^\s](?:[\s\S]*?[^\s])??)___/g, '<strong><em>$1</em></strong>');
+      out = out.replace(/\*\*([^\s](?:[\s\S]*?[^\s])??)\*\*/g, '<strong>$1</strong>');
+      out = out.replace(/__([^\s](?:[\s\S]*?[^\s])??)__/g, '<strong>$1</strong>');
       out = out.replace(/(^|[^*])\*([^\s*][^*]*?)\*(?!\*)/g, '$1<em>$2</em>');
       out = out.replace(/(^|[^_\w])_([^\s_][^_]*?)_(?![_\w])/g, '$1<em>$2</em>');
       return out.replace(/~~([\s\S]+?)~~/g, '<del>$1</del>');

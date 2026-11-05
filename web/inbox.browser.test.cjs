@@ -71,7 +71,7 @@ function constant(name) {
       constant('URGENCY_LEVELS'), 'const systemNotifications = new Map();',
       ...['updateBell', 'syncNotificationAlerts', 'urgencyRank', 'inboxUnreadCount', 'taskHasUnreadAsk', 'inboxRowLabel', 'inboxTitle', 'urgencyChip',
         'inboxNotices', 'inboxNoticesHtml', 'wireInboxNotices', 'isNewTabClick', 'wireRowLink', 'markInboxItemRead', 'slugify', 'projectSlug', 'projectPath', 'orgSlug', 'projectLabel',
-        'rowKey', 'cursorRows', 'applyCursor', 'moveCursor', 'openListRow', 'isSeries', 'rowTime', 'fmtWhen', 'rowWhen', 'taskRow'].map(fn),
+        'rowKey', 'cursorRows', 'applyCursor', 'moveCursor', 'openListRow', 'isSeries', 'rowTime', 'fmtWhen', 'rowWhen', 'rowQuickQuestion', 'rowAskHtml', 'taskRow'].map(fn),
       'renderMain();',
     ].join('\n') });
     await page.evaluate(() => document.fonts.ready);
@@ -85,7 +85,7 @@ function constant(name) {
     const reference = '.task-row[data-id="reference"]';
     assert.deepEqual(await pick(notification), await pick(reference));
     assert.deepEqual(await pick(`${notification} .task-title`).then(({ fontSize }) => fontSize), await pick(`${reference} .task-title`).then(({ fontSize }) => fontSize));
-    // A new ask has an accent edge; a project is a plain monospace slug, never a chip.
+    // A new ask has an accent edge; a project is a plain slug in the UI face, never a chip.
     const shadow = selector => page.locator(selector).evaluate(el => getComputedStyle(el).boxShadow);
     assert.notEqual(await shadow(reference), 'none', 'the unread task row has an accent edge');
     assert.equal(await shadow(notification), 'none', 'a read notice does not');
@@ -94,7 +94,7 @@ function constant(name) {
       return { text: el.textContent, font: s.fontFamily, border: s.borderTopWidth, background: s.backgroundColor, radius: s.borderRadius };
     });
     assert.equal(label.text, 'fixture/karmax');
-    assert.match(label.font, /mono/i);
+    assert.match(label.font, /^Inter/);
     assert.deepEqual([label.border, label.background, label.radius], ['0px', 'rgba(0, 0, 0, 0)', '0px']);
     await page.locator('[data-inbox="resource"] a.row-link').click(); // the row is a link to what it is about
     assert.deepEqual(await page.evaluate(() => opened), ['resource']);

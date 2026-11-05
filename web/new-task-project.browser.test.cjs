@@ -64,7 +64,7 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     await closeForm();
 
     // ── the choice is remembered: Enter takes it next time, numbers stay put ──
-    await page.locator('#add-task').click();
+    await page.locator('#rail-new-task').click();
     await page.locator('#pp-in').waitFor();
     assert.deepEqual(await options(), numbered, 'the remembered project keeps its number');
     assert.equal(await highlighted(), 'Mobile App', 'the project last chosen is highlighted');

@@ -10,7 +10,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
 (async () => {
   const browser = await launch();
   try {
-    const context = await browser.newContext({ serviceWorkers: 'block', viewport: { width: 1280, height: 760 } });
+    const context = await browser.newContext({ serviceWorkers: 'block', viewport: { width: 1280, height: 960 } }); // the whole conversation on screen, so Find starts at its first match
     const errors = [];
     const project = { id: 'p', organizationId: 'o', name: 'Workspace', config: {} };
     const T0 = Date.now() - 3 * 3600_000;

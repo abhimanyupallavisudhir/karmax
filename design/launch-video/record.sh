@@ -15,7 +15,7 @@ setsid env -i PATH="$PATH" HOME=$D/fakehome LANG=C.UTF-8 TZ=UTC TEMPORAL_CLI=$TE
 SERVER=$!
 for i in $(seq 120); do curl -sf $APP/api/meta >/dev/null && break; sleep 1; done
 sleep 4
-cd $T && node director.cjs "$OUT" ${2:-}
+cd $T && node ${DIRECTOR:-director.cjs} "$OUT" ${2:-}
 CODE=$?
 kill -TERM -$SERVER 2>/dev/null; sleep 2; pkill -f "$D/home/temporal" 2>/dev/null
 echo "director exit $CODE"

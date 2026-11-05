@@ -223,6 +223,64 @@ entry(r'credential decision\]\s+Access to "flights/united" was approved', [
 - The e-ticket went to your e-mail, and I put the flight in the wiki under `travel/2027-01-london`.'''),
 ], pace=1100)
 
+# ── Google Play: publish tavya's Android app, asking for each account as it goes ──
+entry(r'^Publish tavya on the Google Play Store', [
+    '@step read Read karmax/web/manifest.webmanifest :: installable web app · icons 192/512 · standalone',
+    '@step think tavya is already an installable web app, so a Trusted Web Activity wraps it: one codebase, and the Play build follows every deploy.',
+    '@step command npx @bubblewrap/cli init --manifest https://tavya.io/manifest.webmanifest :: Android project io.tavya.app (Trusted Web Activity)',
+    '@step command ./gradlew bundleRelease :: app-release.aab  2.1 MB · signed with a new upload key',
+    '@tool store_credential {"type": "api-key", "label": "Play upload key · io.tavya.app", "envVar": "ANDROID_UPLOAD_KEY", "secrets": {"secret": "demo-not-a-key"}}',
+    '@tool fill_credential {"domain": "play.google.com", "field": "password", "selector": "#password"}',
+    '@say ' + esc("""The Android build is ready: **io.tavya.app**, 2.1 MB, signed with a new upload key (saved to the vault).
+
+To create the app in the Play Console I need to sign in with your **Google account** from the vault. Allow it below."""),
+], pace=1400)
+entry(r'credential decision\]\s+Access to "Google account" was approved', [
+    '@step tool chrome-devtools · navigate_page :: https://play.google.com/console/developers/create-new-app',
+    '@step tool tavya · fill_credential :: Google sign-in typed into the Play Console (the agent never sees the password)',
+    '@step tool chrome-devtools · fill_form :: App: tavya · default language English (UK) · free · content rating questionnaire',
+    '@step command fastlane supply --aab app-release.aab --track internal :: Uploaded 1.0.0 (1) to internal testing',
+    '@tool request_connection {"toolkit": "google_play_console", "why": "Publish releases, read reviews and Android vitals, and answer Google\'s policy notices for io.tavya.app."}',
+    '@say ' + esc("""tavya 1.0.0 is in the Play Console's internal testing track; the store listing, screenshots and content rating are filled in.
+
+To keep on top of it after launch (new releases, reviews, crashes and Google's policy notices), I'd like ongoing access to your **Google Play Console**."""),
+], pace=1200)
+entry(r'^(Google Play Console|google_play_console) is connected', [
+    '@step tool tavya · execute_connection_tool :: GOOGLE_PLAY_CONSOLE_GET_REVIEW_STATUS  io.tavya.app: approved for production',
+    '@step command fastlane supply --track production --rollout 0.2 :: 1.0.0 (1) → production, 20% rollout',
+    '@step edit Write karmax/.github/workflows/play-release.yml',
+    '@run cd karmax && mkdir -p .github/workflows && printf "name: Play release\\non: {push: {tags: [\\"v*\\"]}}\\n" > .github/workflows/play-release.yml && git add -A && git commit -qm "Ship each release tag to Google Play"',
+    '@step tool tavya · create_task :: Watch Google Play: reviews, crashes and policy mail (repeatable, every Monday)',
+    '@openaction Google Play :: https://play.google.com/store/apps/details?id=io.tavya.app',
+    '@summary tavya is on Google Play.',
+    '@say ' + esc("""**tavya is on Google Play** (io.tavya.app), rolling out to 20% of users.
+
+- Every release tag now builds and uploads to Play (`.github/workflows/play-release.yml`).
+- A repeatable task reads new reviews, Android vitals and Google's policy notices every Monday, and opens a fix when something needs one."""),
+], pace=1100)
+
+# ── Groceries: an Amazon order, with the login it must be allowed to use ──
+entry(r'^Order this week.s groceries', [
+    '@step read Read notes/groceries.md :: 14 items · oat milk ×2 · eggs (12) · bananas · coffee beans · …',
+    '@step search Amazon Fresh delivery slots, Sat 7 Nov :: 8–10 am free · 10–12 am free · 12–2 pm $3.99',
+    '@step think Saturday 8–10 am is free. Everything on the list is in stock except the usual coffee beans; the same roaster\'s other blend is $1 cheaper.',
+    '@tool fill_credential {"domain": "amazon.com", "field": "password", "selector": "#ap_password"}',
+    '@say ' + esc("""Your 14 items come to **$71.40** with free delivery on **Saturday, 8–10 am**. Your usual coffee beans are out of stock, so I picked the same roaster's other blend.
+
+To order on your account I need your **Amazon login** from the vault. Allow it below."""),
+], pace=1200)
+entry(r'credential decision\]\s+Access to "amazon.com" was approved', [
+    '@step tool chrome-devtools · navigate_page :: https://www.amazon.com/alm/storefront?almBrandId=QW1hem9uIEZyZXNo',
+    '@step tool tavya · fill_credential :: Amazon login typed in (the agent never sees the password)',
+    '@step tool chrome-devtools · fill_form :: 14 items in the cart · delivery Sat 7 Nov, 8–10 am',
+    '@tool request_spend {"amount": 7140, "card_name": "abhimanyu", "merchant": "Amazon Fresh", "why": "This week\'s groceries, 14 items"}',
+    '@step tool tavya · fill_payment_card :: Card details filled into Amazon checkout (never shown to the agent)',
+    '@summary Ordered: 14 items, Saturday 8–10 am, $71.40.',
+    '@say ' + esc("""**Ordered**: 14 items from Amazon Fresh, **$71.40** on your card, arriving **Saturday 8–10 am**.
+
+Order **113-4827715-0091**. I ticked them off in `notes/groceries.md`."""),
+], pace=1000)
+
 # ── Sub-tasks (the feature grid's still; created and deleted off camera) ──
 SUBTASKS = [
     ('Write the Show HN post and the Product Hunt listing', False),

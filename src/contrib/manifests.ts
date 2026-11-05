@@ -456,7 +456,7 @@ export const MANIFESTS: WorkflowManifest[] = [
         // The stage and merge-queue place already head the task page.
         title: 'Changed files',
         widgets: [
-          { type: 'list', bind: 'reviewInfo.changedFiles', empty: 'No changes yet.' },
+          { type: 'list', bind: 'reviewInfo.changedFiles', empty: 'Nothing to land.' },
         ],
       },
       { slot: 'review-area', tier: 4, component: 'review-iframe', title: 'Review' },

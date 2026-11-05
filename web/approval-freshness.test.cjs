@@ -81,7 +81,7 @@ test('a GitHub access request offers its decision only to the admins it was rout
   const request = { id: 'r1', status: 'pending', login: 'dharmaarthamaxxer-damx', slug: 'srajma/dam-videos',
     recipients: ['owner'], approvers: [{ userId: 'owner', login: 'srajma' }] };
   const admin = ctx.repositoryAccessRequestRows([request]);
-  assert.match(admin, /dharmaarthamaxxer-damx<\/span> can't see <span class="mono">srajma\/dam-videos/);
+  assert.match(admin, /Give <span class="mono">dharmaarthamaxxer-damx<\/span> access to <span class="mono">srajma\/dam-videos<\/span> on GitHub?/);
   assert.match(admin, /data-raccess-act="approve"[^>]*>Give access</);
   assert.match(admin, /data-raccess-act="dismiss"/);
   assert.doesNotMatch(ctx.repositoryAccessRequestRows([{ ...request, dismissed: { by: 'user:owner', at: 1 } }]), /data-raccess-act="dismiss"/);

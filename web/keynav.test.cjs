@@ -46,11 +46,12 @@ let pass = 0, fail = 0;
 const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('FAIL:', msg); } };
 const ev = (key, mods = {}) => ({ key, metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, ...mods });
 
-// ── New task: a stand-in field and Send open the form; beside them, the templates ──
+// ── New task: a stand-in field (and the sidebar's New task) open the form; beside it, the templates ──
 ok(src.includes('id="expand-task" data-shortcut="nav.newTaskDefault">New task…</button>'), 'the New task field is a button that opens the form (N)');
 ok(src.includes('id="new-from-template" data-shortcut="nav.newTask"'), 'a button beside it picks a template (n)');
-ok(extractFn('wireNewTaskComposer').includes("$('#expand-task')?.addEventListener('click', () => openNewTaskForm())")
-  && extractFn('wireNewTaskComposer').includes("$('#add-task')?.addEventListener('click', () => openNewTaskForm())"), 'the field and Send both open the form');
+ok(extractFn('wireNewTaskComposer').includes("$('#expand-task')?.addEventListener('click', () => openNewTaskForm())"), 'the field opens the form');
+ok(src.includes('id="rail-new-task" type="button" data-shortcut="nav.newTaskDefault"') && src.includes("$('#rail-new-task').addEventListener('click', () => openNewTaskForm())"), 'the sidebar\'s New task opens it from every page');
+ok(!src.includes('id="add-task"'), 'no second, arrow-shaped button that looks like Send');
 ok(!src.includes('id="new-task"') && !src.includes('id="draft-task"') && !src.includes('id="new-task-files"'), 'no typed quick task, draft or attach buttons beside it');
 ok(!src.includes('quick: true') && !src.includes('quickSettingsForms'), 'no quick-task payload or quick-task settings');
 ok(src.includes("{ id: 'nav.newTask', title: 'New task from template', key: 'n', group: 'General', run: () => openTemplatePicker() }"), 'n picks a template');
