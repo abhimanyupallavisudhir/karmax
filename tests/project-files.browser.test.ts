@@ -11,7 +11,7 @@ import { projectFilesFixture } from './helpers/project-files-fixture.js';
 // the host mirror, data from a real restic repository mounted at site/data/raw.
 // Screens land in design/files/ when SHOTS=1.
 
-declare const document: any, location: any;
+declare const document: any, location: any, window: any;
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -327,7 +327,7 @@ it('meets WCAG 2.2 AA on a folder, a code file and a rendered Markdown file, lig
       await page.goto(`${base}${at}`);
       await page.locator(ready).first().waitFor();
       await page.evaluate(axe); // as an expression: CDP evaluation is not subject to the page's CSP
-      const result = await page.evaluate(async () => (window as any).axe.run(document, {
+      const result = await page.evaluate(async () => window.axe.run(document, {
         runOnly: { type: 'tag', values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'] },
         exclude: [['.mark']],
       }));
