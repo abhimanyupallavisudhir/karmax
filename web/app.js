@@ -4371,7 +4371,7 @@ function paintMarkdownSurface(el) {
 
 // The TeX button beside every conversation message and Markdown preview.
 function texToggleHtml(disabled = false) {
-  return `<button type="button" class="tex-toggle" aria-label="Typeset math" aria-pressed="${mathjaxEnabled()}" title="${disabled ? 'Enable Markdown in Appearance to typeset math' : 'Typeset math everywhere'}" ${disabled ? 'disabled' : ''}><span class="tex-mark" aria-hidden="true">T<span>E</span>X</span></button>`;
+  return `<button type="button" class="tex-toggle" aria-label="TeX: typeset math" aria-pressed="${mathjaxEnabled()}" title="${disabled ? 'Enable Markdown in Appearance to typeset math' : 'Typeset math everywhere'}" ${disabled ? 'disabled' : ''}><span class="tex-mark" aria-hidden="true">T<span>E</span>X</span></button>`;
 }
 function wireTexToggles(root) {
   root?.querySelectorAll('.tex-toggle').forEach((btn) => {

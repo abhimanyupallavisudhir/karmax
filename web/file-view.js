@@ -151,7 +151,7 @@
   }
 
   const linesHtml = (lines) => `<div class="files-code" role="table" aria-label="File contents">${lines.map((line, i) =>
-    `<div class="files-line" id="L${i + 1}" role="row"><a class="files-ln" href="#L${i + 1}" data-line="${i + 1}" aria-label="Line ${i + 1}" tabindex="-1"></a><span class="files-lc" role="cell">${line || ' '}</span></div>`).join('')}</div>`;
+    `<div class="files-line" id="L${i + 1}" role="row"><span class="files-lnc" role="rowheader"><a class="files-ln" href="#L${i + 1}" data-line="${i + 1}" aria-label="Line ${i + 1}" tabindex="-1"></a></span><span class="files-lc" role="cell">${line || ' '}</span></div>`).join('')}</div>`;
 
   // RFC 4180 rows (quotes, doubled quotes, newlines inside quotes), at most `limit`.
   function parseDelimited(text, delimiter, limit) {

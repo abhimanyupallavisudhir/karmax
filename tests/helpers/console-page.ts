@@ -28,7 +28,7 @@ const WEB = path.resolve('web');
 // The scripts the console page loads, in its order (the service worker's deferred registration aside),
 // so a script the console adds is here too.
 const scripts = [...fs.readFileSync(path.join(WEB, 'index.html'), 'utf8').matchAll(/<script\b([^>]*)\bsrc="\/([^"]+\.js)"([^>]*)>/g)]
-  .filter((m) => !/\bdefer\b/.test(`${m[1]}${m[3]}`)).map((m) => m[2]);
+  .filter((m) => !/\bdefer\b/.test(`${m[1]}${m[3]}`)).map((m) => m[2] as string);
 let browser: Promise<Browser> | undefined;
 
 export async function closeConsoleBrowser(): Promise<void> {

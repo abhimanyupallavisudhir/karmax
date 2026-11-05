@@ -1451,9 +1451,9 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
 .explain-run:disabled, .explain-more:disabled { cursor: wait; opacity: .65; }
 .explain-more { display: inline-flex; align-items: center; font-style: normal; }
 .explain-more svg { width: 16px; height: 16px; }
-.tex-toggle { display: inline-flex; align-items: center; justify-content: center; min-width: 30px; min-height: 24px; margin-left: 4px; padding: 2px 5px; border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--ink-3); cursor: pointer; }
+.tex-toggle { display: inline-flex; align-items: center; justify-content: center; min-width: 30px; min-height: 24px; margin-left: 4px; padding: 2px 5px; border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--ink-2); cursor: pointer; }
 .tex-toggle:hover { color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
-.tex-toggle[aria-pressed="true"] { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); border-color: color-mix(in srgb, var(--accent) 25%, transparent); }
+.tex-toggle[aria-pressed="true"] { color: color-mix(in srgb, var(--accent) 85%, var(--ink)); background: color-mix(in srgb, var(--accent) 12%, transparent); border-color: color-mix(in srgb, var(--accent) 25%, transparent); }
 .tex-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .tex-toggle:disabled { opacity: .45; cursor: default; }
 /* Outside a conversation the TeX button sits at the end of its row. */
@@ -4726,6 +4726,8 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 .files-rendered.md { padding: 20px 28px; max-width: 900px; }
 .files-code { padding: 8px 0; overflow-x: auto; font-family: var(--font-mono); font-size: var(--fs-12); line-height: 1.6; tab-size: 4; }
 .files-line { display: flex; min-width: max-content; }
+/* The line number's cell adds no box: the number stays a sticky flex item. */
+.files-lnc { display: contents; }
 .files-line.selected { background: color-mix(in srgb, var(--attention) 18%, transparent); }
 .files-ln { position: sticky; left: 0; flex: none; width: 56px; padding-right: 14px; text-align: right; color: var(--ink-3); opacity: .65;
   background: var(--surface); text-decoration: none; user-select: none; cursor: pointer; }
@@ -4749,7 +4751,7 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 .files-code .hljs-string, .files-code .hljs-regexp, .files-code .hljs-addition, .files-code .hljs-meta .hljs-string { color: var(--merged); }
 .files-code .hljs-number, .files-code .hljs-literal, .files-code .hljs-symbol, .files-code .hljs-bullet, .files-code .hljs-variable.constant_ { color: var(--working); }
 .files-code .hljs-comment, .files-code .hljs-quote { color: var(--ink-3); font-style: italic; }
-.files-code .hljs-title, .files-code .hljs-section, .files-code .hljs-name, .files-code .hljs-selector-id, .files-code .hljs-selector-class { color: color-mix(in srgb, var(--viz-2) 85%, var(--ink)); }
+.files-code .hljs-title, .files-code .hljs-section, .files-code .hljs-name, .files-code .hljs-selector-id, .files-code .hljs-selector-class { color: color-mix(in srgb, var(--viz-2) 70%, var(--ink)); }
 .files-code .hljs-built_in, .files-code .hljs-type, .files-code .hljs-title.class_ { color: color-mix(in srgb, var(--accent) 55%, var(--merged)); }
 .files-code .hljs-attr, .files-code .hljs-attribute, .files-code .hljs-property, .files-code .hljs-template-variable { color: color-mix(in srgb, var(--accent) 60%, var(--ink)); }
 .files-code .hljs-meta { color: var(--ink-3); }

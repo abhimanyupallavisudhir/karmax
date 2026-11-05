@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import type { Browser, Page } from 'playwright';
 import { launchChromium, openConsole } from './helpers/browser.js';
 import { projectFilesFixture } from './helpers/project-files-fixture.js';
@@ -305,3 +306,34 @@ async function clickAddressEnd(page: Page) {
   const box = (await address.boundingBox())!;
   await address.click({ position: { x: box.width - 12, y: box.height / 2 } });
 }
+
+// The same axe-core gate the console's main pages pass (tests/accessibility-check.cjs).
+it('meets WCAG 2.2 AA on a folder, a code file and a rendered Markdown file, light and dark', async () => {
+  const f = await projectFilesFixture(cleanups, { files: { 'src/server.ts': SERVER_TS } });
+  const { page, errors, context } = await openConsole(browser, { viewport: { width: 1280, height: 820 } });
+  cleanups.push(() => context.close());
+  const axe = fs.readFileSync(createRequire(import.meta.url).resolve('axe-core/axe.min.js'), 'utf8');
+  const violations: string[] = [];
+  await page.goto(`${f.server.url}/projects/site-builder/files`);
+  await page.locator('.files-row', { hasText: 'site-wiki' }).waitFor();
+  const base = page.url();
+  for (const scheme of ['light', 'dark'] as const) {
+    await page.emulateMedia({ colorScheme: scheme });
+    for (const [name, at, ready] of [
+      ['folder', '/site', '.files-row'],
+      ['code', '/site/src/server.ts', '.files-code .hljs-keyword'],
+      ['markdown', '/site/README.md', '.files-page .md'],
+    ] as const) {
+      await page.goto(`${base}${at}`);
+      await page.locator(ready).first().waitFor();
+      await page.evaluate(axe); // as an expression: CDP evaluation is not subject to the page's CSP
+      const result = await page.evaluate(async () => (window as any).axe.run(document, {
+        runOnly: { type: 'tag', values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'] },
+        exclude: [['.mark']],
+      }));
+      for (const v of result.violations) violations.push(`${scheme} · ${name}: ${v.id} — ${v.help}: ${v.nodes.slice(0, 3).map((n: any) => `${n.target.join(' ')} (${(n.failureSummary || '').split('\n').slice(1, 2).join('').trim()})`).join(', ')}`);
+    }
+  }
+  expect(violations).toEqual([]);
+  expect(errors).toEqual([]);
+}, 90_000);
