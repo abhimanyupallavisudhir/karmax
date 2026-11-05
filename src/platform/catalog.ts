@@ -206,6 +206,7 @@ export const PLATFORM_API_CATALOG = {
   ],
   conversations: [
     'GET /api/tasks/:taskId/agents', 'GET /api/tasks/:taskId/conversation?role=',
+    'GET /api/tasks/:taskId/fork-history?role= (a forked agent\'s conversation before this task: each readable source task, oldest first, cut where the next forked from it)',
     'GET|POST|DELETE /api/tasks/:taskId/conversation-share?role=',
     'GET|PUT /api/projects/:projectId/conversation-sharing',
     'GET|PUT /api/organizations/:organizationId/conversation-sharing',

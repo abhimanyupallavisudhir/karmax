@@ -444,6 +444,38 @@ describe('WorktreeProvider (real git)', () => {
     }
   });
 
+  it('leaves out what a branch\'s pull request landed, even squashed and never fetched into the world', async () => {
+    const store = (await Store.create(':memory:'));
+    const worlds = new WorldRegistry();
+    worlds.register(new WorktreeProvider(home));
+    const core = makeCoreActivities({ store, worlds, adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock') });
+    try {
+      const handle = await core.createWorld({ taskId: 'landed-heads', repos: [repo], base: 'main', target: 'main', kind: 'worktree' });
+      const workdir = handle.workdir ?? handle.root;
+      const name = handle.repos![0]!.name;
+
+      // A pull request of this branch landed at this commit (squashed upstream,
+      // so no ref this world has contains it).
+      fs.writeFileSync(path.join(workdir, 'landed.js'), 'console.log("landed")\n');
+      await git(workdir, ['add', '-A']);
+      await git(workdir, ['commit', '-q', '-m', 'landed pull request']);
+      const landed = (await git(workdir, ['rev-parse', 'HEAD'])).stdout.trim();
+      expect((await core.buildReview(handle, 'main')).changedFiles).toEqual(['landed.js']);
+      expect((await core.buildReview(handle, 'main', { [name]: landed })).changedFiles).toEqual([]);
+
+      // Work after it is still listed, committed or not.
+      fs.writeFileSync(path.join(workdir, 'after.js'), 'console.log("after")\n');
+      expect((await core.buildReview(handle, 'main', { [name]: landed })).changedFiles).toEqual(['after.js (new)']);
+      // A head the world does not have changes nothing.
+      expect((await core.buildReview(handle, 'main', { [name]: 'f'.repeat(40) })).changedFiles).toEqual(['landed.js', 'after.js (new)']);
+
+      await worlds.open(handle).then((world) => world.destroy());
+    } finally {
+      (await store.close());
+    }
+  });
+
   it('warns (but still forks off HEAD) when the configured base branch does not exist', async () => {
     const provider = new WorktreeProvider(home);
     const world = await provider.create({ taskId: 'nobase', repo, base: 'develop', target: 'main' });

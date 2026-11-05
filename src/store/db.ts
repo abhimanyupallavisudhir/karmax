@@ -6970,6 +6970,16 @@ export class Store {
       .map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
   }
 
+  /** The newest `limit` events of the kinds a conversation is drawn from, up to
+   *  time `untilTs`, oldest first: another task's conversation as it stood when
+   *  a fork branched from it (`KarmaxApi.taskForkHistory`). */
+  async conversationEventsUntil(taskId: string, untilTs: number, limit: number): Promise<(KarmaxEvent & { seq: number })[]> {
+    const rows = (await this.db.prepare(`SELECT * FROM events WHERE taskId = ? AND ts <= ? AND seq <= ?
+      AND type IN ('agent.activity', 'conversation.message', 'conversation.explanation') ORDER BY seq DESC LIMIT ?`)
+      .all(taskId, untilTs, await this.eventWatermark(), limit)) as any[];
+    return rows.reverse().map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
+  }
+
   /** Read only the sparse evidence a consumer needs, preserving revocation order. */
   async eventsOfTypes(taskId: string, types: string[]): Promise<(KarmaxEvent & { seq: number })[]> {
     if (!types.length) return [];

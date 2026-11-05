@@ -311,7 +311,14 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     // FORK, not continue: B replays A's conversation into a FRESH session.
     expect(events.some((e: any) => e.type === 'session.forked')).toBe(true);
     expect(events.some((e: any) => e.type === 'session.resumed')).toBe(false);
-    expect(events.find((e: any) => e.type === 'session.forked').payload.replayed).toBeGreaterThan(0);
+    const forked = events.find((e: any) => e.type === 'session.forked');
+    expect(forked.payload.replayed).toBeGreaterThan(0);
+    expect(forked.payload.role).toBe('do');
+    // B's page shows what its agent heard in A before the fork, above its own.
+    const inherited = await get(`/api/tasks/${b.id}/fork-history?role=do`);
+    expect(inherited.map((segment: any) => [segment.taskId, segment.role, segment.until])).toEqual([[a.id, 'do', forked.ts]]);
+    expect(inherited[0].messages.map((m: any) => m.text)).toEqual((await get(`/api/tasks/${a.id}`)).messages.map((m: any) => m.text));
+    expect(inherited[0].events.some((e: any) => e.type === 'agent.activity')).toBe(true);
     // Source is untouched: A's stored session is unchanged; B has its own, independent one.
     expect(await get(`/api/tasks/${a.id}/sessions`)).toEqual(aBefore);
     expect((await get(`/api/tasks/${b.id}/sessions`)).do?.id).not.toBe(aBefore.do?.id);

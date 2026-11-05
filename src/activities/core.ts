@@ -663,6 +663,18 @@ export async function ownSubTaskResponses(store: Pick<Store, 'getTask'>, taskId:
   return { ...(kept.length ? { kept } : {}), refused };
 }
 
+/** Make `head`, a commit of the checkout at `source`, present in the pull
+ * request worktree at `root`. They share one repository until the world is
+ * restored from a checkpoint, which makes each checkout its own clone: a
+ * commit made since is then only the checkout's (pramana#137's pull request
+ * failed with "Could not parse object"). A failed fetch leaves the reset that
+ * follows to say what is missing. */
+async function commitInto(world: World, root: string, head: string, source: string | undefined): Promise<void> {
+  if (!source || source === root) return;
+  if ((await world.exec('git', ['cat-file', '-e', `${head}^{commit}`], { cwd: root })).code === 0) return;
+  await world.exec('git', ['fetch', '-q', '--no-tags', source, head], { cwd: root });
+}
+
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
   const isRemote = (kind: WorldKind) => worlds.get(kind).capabilities?.remote === true;
@@ -1502,7 +1514,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const repo = worldRepos(view.handle)[0];
     if (!repo) return view;
     if ((await world.exec('git', ['rev-parse', '--git-dir'], { cwd: repo.root }).catch(() => undefined))?.code === 0) return view;
-    const sibling = worldRepos(world.handle).find((candidate) => candidate.repo === repo.repo);
+    // Its own checkout first: several checkouts can be branches of one
+    // repository, each its own clone after a restore (pramana#137); then any
+    // that has the pull request's branch.
+    const others = worldRepos(world.handle).filter((candidate) => candidate.root !== repo.root);
+    const candidates = [...others.filter((candidate) => candidate.name === repo.name),
+      ...others.filter((candidate) => candidate.name !== repo.name && candidate.repo === repo.repo)];
+    let sibling = candidates[0];
+    for (const candidate of candidates) {
+      const has = await world.exec('git', ['rev-parse', '--verify', '--quiet', `refs/heads/${repo.branch}`], { cwd: candidate.root }).catch(() => undefined);
+      if (has?.code === 0) { sibling = candidate; break; }
+    }
     if (!sibling) throw new Error(`the pull request's repository "${repo.name}" is no longer in its task's world`);
     await world.exec('git', ['worktree', 'prune'], { cwd: sibling.root });
     const added = await world.exec('git', ['worktree', 'add', '-q', repo.root, repo.branch], { cwd: sibling.root });
@@ -3119,7 +3141,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             && (!deps.tokens || !token
               || (await deps.tokens.check(token, 'task:conversation:read', { taskId: source.id })).ok);
           if (!readable) {
-            (await record(args.taskId, 'session.fork-failed', { from: spec.resumeFrom, reason: 'source-not-authorized' }));
+            (await record(args.taskId, 'session.fork-failed', { from: spec.resumeFrom, role: args.role, reason: 'source-not-authorized' }));
             const sourceProject = source && sourceOrganization === organizationId ? (await store.getProject(source.projectId)) : undefined;
             throw ApplicationFailure.create({
               message: sourceProject
@@ -3311,7 +3333,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             if (prepared) {
               session = srcSession;
               fork = true; // adapter branches a NEW session id from it (native fork)
-              (await record(args.taskId, 'session.forked', { from: spec.resumeFrom, session: srcSession, native: true }));
+              (await record(args.taskId, 'session.forked', { from: spec.resumeFrom, role: args.role, session: srcSession, native: true }));
             }
           }
           // When the selected destination agent differs, panagent translates the
@@ -3326,7 +3348,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   `task:${spec.resumeFrom.taskId}:${srcRole}:${srcProvider}:${srcSession}`);
                 prepared = true;
                 (await record(args.taskId, 'session.forked', {
-                  from: spec.resumeFrom, session: srcSession, native: kind === 'native', converted: true,
+                  from: spec.resumeFrom, role: args.role, session: srcSession, native: kind === 'native', converted: true,
                   sourceProvider: srcProvider, provider: profile.provider,
                 }));
               } catch (error) {
@@ -3360,7 +3382,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               : srcMsgs;
             if (seed.length) {
               messages = [...seed, ...ownView];
-              (await record(args.taskId, 'session.forked', { from: spec.resumeFrom, replayed: seed.length, native: false }));
+              (await record(args.taskId, 'session.forked', { from: spec.resumeFrom, role: args.role, replayed: seed.length, native: false }));
             }
           }
         }
@@ -4299,8 +4321,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     /** Auto-derive the changed-files summary so Review always shows what changed
      *  (§5.5). Diffs are intentionally NOT computed — they were removed from the
-     *  review packet; reviewers use the changed-files list + the in-world terminal. */
-    async buildReview(handle: WorldHandle, base: string): Promise<{ summary: string; changedFiles: string[] }> {
+     *  review packet; reviewers use the changed-files list + the in-world terminal.
+     *  `landed`: per checkout, the head its latest pull request landed at (several
+     *  branches): work up to it is no longer the task's to show, however it landed
+     *  (a squash leaves no ancestry) and whether or not this world fetched it. */
+    async buildReview(handle: WorldHandle, base: string, landed?: Record<string, string>): Promise<{ summary: string; changedFiles: string[] }> {
       const world = await openWorld(handle);
       const repos = worldRepos(handle);
       if (!repos.length) {
@@ -4326,7 +4351,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // stays where the world was provisioned, so work that already landed (an
         // earlier pull request from this branch, merged back in) would be listed
         // again for approval (pramana#137).
-        const forkPoint = await world.exec('git', ['merge-base', 'HEAD', ...(await prBaseRefs(world, repo, repoBase))], { cwd: repo.root });
+        const landedHead = landed?.[repo.name];
+        const landedRefs = landedHead && /^[0-9a-f]{40,64}$/i.test(landedHead)
+          && (await world.exec('git', ['cat-file', '-e', `${landedHead}^{commit}`], { cwd: repo.root })).code === 0 ? [landedHead] : [];
+        const forkPoint = await world.exec('git', ['merge-base', 'HEAD', ...(await prBaseRefs(world, repo, repoBase)), ...landedRefs], { cwd: repo.root });
         const since = forkPoint.code === 0 && forkPoint.stdout.trim() ? forkPoint.stdout.trim() : repoBase;
         // NUL-separated output is never C-quoted, whatever the world's Git config
         // (non-ASCII, quotes and newlines in names survive verbatim; WD-27).
@@ -4606,6 +4634,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const view = pullRequestHandle(world.handle, args.checkout, args.childTaskId, args.target);
       const repo = worldRepos(view)[0]!;
       const exists = (await world.exec('git', ['rev-parse', '--is-inside-work-tree'], { cwd: repo.root }).catch(() => undefined))?.code === 0;
+      if (exists) await commitInto(world, repo.root, args.head, args.checkout.root);
       const moved = exists
         ? await world.exec('git', ['reset', '-q', '--hard', args.head], { cwd: repo.root })
         : await world.exec('git', ['worktree', 'add', '-q', '-B', repo.branch, repo.root, args.head], { cwd: args.checkout.root });
@@ -4621,6 +4650,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const world = await openWorld(view);
       const repo = worldRepos(world.handle)[0];
       if (!repo) throw new Error('this pull request has no worktree');
+      const full = await openWorld({ ...view, meta: { ...view.meta, pullRequest: undefined } });
+      const source = worldRepos(full.handle).find((candidate) => candidate.name === repo.name && candidate.root !== repo.root);
+      await commitInto(world, repo.root, head, source?.root);
       const moved = await world.exec('git', ['reset', '-q', '--hard', head], { cwd: repo.root });
       if (moved.code !== 0) throw new Error(`could not move the pull request to ${head}: ${moved.stderr || moved.stdout}`);
       (await record(view.id, 'pull-request.snapshot', { checkout: repo.name, childTaskId: view.meta?.pullRequest, branch: repo.branch, head }));
@@ -4762,21 +4794,31 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async commitWork(handle: WorldHandle, message: string): Promise<{ committed: boolean; sha?: string }> {
-      const world = await openWorld(handle);
-      const repos = worldRepos(world.handle);
-      const roots = repos.length ? repos.map((repo) => repo.root) : [world.handle.root];
-      let committed = true;
-      let sha: string | undefined;
-      for (const root of roots) {
-        const add = await world.exec('git', ['add', '-A'], { cwd: root });
-        const commit = add.code === 0 ? await world.exec('git', ['commit', '-q', '-m', message], { cwd: root }) : add;
-        const head = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: root });
-        const nothing = /nothing to commit|no changes added/i.test(`${commit.stdout}${commit.stderr}`);
-        committed &&= add.code === 0 && (commit.code === 0 || nothing) && head.code === 0;
-        sha = head.stdout.trim() || sha;
-      }
-      (await record(handle.id, 'work.committed', { committed, repos: roots.length }));
-      return { committed, sha };
+      let context: ReturnType<typeof activityContext.current> | undefined;
+      try { context = activityContext.current(); } catch { /* direct tests */ }
+      // git walks every checkout: minutes in a world with a large data tree
+      // (pramana#137). Heartbeats say it is alive, for callers that time it by them.
+      const beat = () => { try { context?.heartbeat({ operation: 'commit-work' }); } catch { /* completion/cancellation */ } };
+      beat();
+      const pulse = setInterval(beat, 5_000);
+      try {
+        const world = await openWorld(handle);
+        const repos = worldRepos(world.handle);
+        const roots = repos.length ? repos.map((repo) => repo.root) : [world.handle.root];
+        let committed = true;
+        let sha: string | undefined;
+        for (const root of roots) {
+          context?.cancellationSignal.throwIfAborted();
+          const add = await world.exec('git', ['add', '-A'], { cwd: root });
+          const commit = add.code === 0 ? await world.exec('git', ['commit', '-q', '-m', message], { cwd: root }) : add;
+          const head = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: root });
+          const nothing = /nothing to commit|no changes added/i.test(`${commit.stdout}${commit.stderr}`);
+          committed &&= add.code === 0 && (commit.code === 0 || nothing) && head.code === 0;
+          sha = head.stdout.trim() || sha;
+        }
+        (await record(handle.id, 'work.committed', { committed, repos: roots.length }));
+        return { committed, sha };
+      } finally { clearInterval(pulse); }
     },
 
     /** Persist a cloud task branch before releasing its sandbox. Unlike the

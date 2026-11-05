@@ -16,6 +16,7 @@ import {
   CancellationScope,
   isCancellation,
   ApplicationFailure,
+  TemporalFailure,
   ParentClosePolicy,
   log,
   patched,
@@ -39,6 +40,7 @@ import {
   participantLabel, participantRole, reviewerKey, selectorAgent,
 } from '../domain/participants.js';
 import { resetAtFromHint } from '../agent/limits.js';
+import { innermostMessage } from '../domain/failure-text.js';
 import { isCapacityFailure, isInfraFailure, limitFailureClassification, CAPACITY_WAIT_MS, CAPACITY_WAIT_LIMIT_MS, INFRA_BACKOFF_MS, WORLD_WAIT_MS, WORLD_WAIT_LIMIT_MS } from './failures.js';
 import {
   TaskInput,
@@ -385,6 +387,10 @@ const WORLD_REOPENS_WAIT = 'software-dev-world-reopens-wait-v1';
  * Review waits on anyone. Setup used to publish a wait, which parked the world
  * first, and its message started nothing until the park ended (legibench3 #20). */
 const REVIEW_SETUP_FOLLOW_UP = 'software-dev-review-setup-follow-up-v1';
+/** "Changed files" lists only work that has not landed: a branch's pull
+ * request landing rebuilds it, leaving that pull request's work out, and the
+ * whole task landing empties it (it had been the last Review's snapshot). */
+const CHANGED_FILES_AFTER_LANDING = 'software-dev-changed-files-after-landing-v1';
 const quietNotice = (m: Message): boolean => m.id.startsWith(QUIET_NOTICE);
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max)}…` : text;
 /** A turn can return while the agent's own in-harness sub-agents (Claude Agent SDK
@@ -437,6 +443,16 @@ const CONTINUE_AFTER_BYTES = 4 * 1024 * 1024;
 const CONTINUE_AFTER_EVENTS_BEFORE = 4_000;
 const CONTINUE_AFTER_BYTES_BEFORE = 8 * 1024 * 1024;
 const CONTINUE_SOONER = 'software-dev-continue-sooner-v1';
+/** A run that fails publishes why, and the stage Retry resumes, before it
+ * closes: the reconciler used to settle it a minute later as "workflow
+ * failed", with the cause left in Temporal's history (pramana#13, #137). */
+const FAILURE_NAMES_CAUSE = 'software-dev-failure-names-cause-v1';
+/** The snapshot before sub-tasks heartbeats instead of a 5-minute limit, and
+ * a failure goes to the asking agent as a failed create_sub_task (pramana#137). */
+const SUBTASK_SNAPSHOT_TO_AGENT = 'software-dev-subtask-snapshot-to-agent-v1';
+/** A pull request that cannot move to the head its task's agent opened it at
+ * tells that agent and stays where it was (pramana#137's pull request). */
+const PR_MOVE_FAILURE_TO_AGENT = 'software-dev-pr-move-failure-to-agent-v1';
 /** A continuation input is recorded by value: stay well inside the 2 MB payload limit. */
 const MAX_CONTINUATION_BYTES = 1024 * 1024;
 const CONTINUE_RETRY_EVENTS = 500;
@@ -947,6 +963,7 @@ async function softwareDevImpl(
   let reviewInfo: ReviewInfo | undefined = recovery?.reviewInfo;
   let error: string | undefined = continued?.error;
   let terminalOrigin: Stage | undefined;
+  let failedFrom: Stage | undefined;
   let prs: TaskPullRequest[] = recovery?.prs?.map((candidate) => ({ ...candidate })) ?? [];
   let pr: TaskPullRequest | undefined = prs[0];
   const prHeadMap = (items: TaskPullRequest[]): Record<string, string> => Object.fromEntries(
@@ -1018,6 +1035,11 @@ async function softwareDevImpl(
   let finishRounds = 0;
   /** The whole world, while `world` is narrowed to the task's own proposal. */
   let fullWorld: WorldHandleLike | undefined;
+  /** A pull request landed since "Changed files" was built: it still lists that work. */
+  let changedFilesStale = false;
+  /** Per pull request, the heads it was opened at that it took; an update it
+   * refused (it came after approval) is not what lands. */
+  const shippedHeads = new Map<string, string[]>();
   /** A pull request (v1.30): the commit its agent opened it at again, not yet in its worktree. */
   let pendingHead: string | undefined;
   // A pull request opened with its task's data (SPEC §11.1): what it publishes
@@ -1523,6 +1545,7 @@ async function softwareDevImpl(
         // createWorld would force-remove the dirty worktree and lose work.
         recoveryWorld: world,
         ...(terminalOrigin ? { cancelledFrom: terminalOrigin } : {}),
+        ...(failedFrom ? { failedFrom } : {}),
         ...(humanPauseActive ? { humanPauseOrigin: recoveryStage } : {}),
         ...(interlocksLandingTransitions && lifecycleTransitionBlocked ? { lifecycleTransitionBlocked: true } : {}),
       },
@@ -2336,6 +2359,7 @@ async function softwareDevImpl(
   setHandler(pullRequestNoticeSignal, ({ childTaskId, kind, text }) => {
     const shipment = shipments.find((candidate) => candidate.childTaskId === childTaskId);
     if (!shipsBranches || !shipment) return;
+    if (kind === 'update-refused') shippedHeads.get(childTaskId)?.pop();
     // Finishing: the agent has stopped, so a pull request needing it closes.
     if (finishing) {
       if (kind === 'needs-work') void getExternalWorkflowHandle(childTaskId).signal(closePullRequestSignal).catch(() => undefined);
@@ -3760,14 +3784,28 @@ async function softwareDevImpl(
    * each runs at once (the task is parked, so nothing else is working) and the
    * wait resumes unless it is now ready. Before 1.27 it is a plain condition. */
   async function waitServing(ready: () => boolean, timeoutMs?: number): Promise<boolean> {
-    if (!multiAgent) return timeoutMs === undefined ? (await condition(ready), true) : condition(ready, timeoutMs);
+    // A pull request landing while the agent waits refreshes "Changed files"
+    // (only ever set where CHANGED_FILES_AFTER_LANDING was taken).
+    const landed = () => changedFilesStale && stage === 'do' && !cancelled;
     const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
+    if (!multiAgent) {
+      for (;;) {
+        const wake = () => ready() || landed();
+        const woke = deadline === undefined ? (await condition(wake), true)
+          : await condition(wake, Math.max(0, deadline - Date.now()));
+        if (ready()) return true;
+        if (!woke) return false;
+        if (!landed()) return true;
+        await refreshChangedFiles();
+      }
+    }
     for (;;) {
-      const wake = () => ready() || (agentQueue.length > 0 && !cancelled);
+      const wake = () => ready() || (agentQueue.length > 0 && !cancelled) || landed();
       const woke = deadline === undefined ? (await condition(wake), true)
         : await condition(wake, Math.max(0, deadline - Date.now()));
       if (ready()) return true;
       if (!woke) return false;
+      if (landed()) { await refreshChangedFiles(); continue; }
       await runCalledAgents();
     }
   }
@@ -3933,6 +3971,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         for (const child of children) noteShipmentSettled(child.taskId, child.stage);
       }
     }
+    await refreshChangedFiles();
     stage = 'done';
     status = 'done';
     waitingFor = undefined;
@@ -3957,6 +3996,8 @@ Inspect the complete current diff and specifically compare its delta from the re
   async function awaitPullRequests(): Promise<'settled' | 'agent' | 'cancelled'> {
     try {
       for (;;) {
+        if (cancelled) return 'cancelled';
+        await refreshChangedFiles();
         if (cancelled) return 'cancelled';
         if (mainUnread()) return 'agent';
         const open = openShipments();
@@ -3994,6 +4035,29 @@ Inspect the complete current diff and specifically compare its delta from the re
       : `${name} closed without landing (${childStage}).${stacked.length ? ` ${stacked.join(', ')} builds on it.` : ''}`;
     const quiet = shipment.state === 'landed' && !stacked.length;
     whenLoaded(() => msgs.push({ id: `${quiet ? QUIET_NOTICE : 'pr-'}${msgs.length}`, role: 'user', text, ts: Date.now() }));
+    if (shipment.state === 'landed' && reviewInfo?.changedFiles?.length && patched(CHANGED_FILES_AFTER_LANDING)) changedFilesStale = true;
+  }
+
+  /** Per checkout, the head its latest landed pull request landed at. */
+  function landedHeads(): Record<string, string> {
+    const heads: Record<string, string> = {};
+    for (const shipment of shipments) if (shipment.state === 'landed')
+      heads[shipment.checkout] = shippedHeads.get(shipment.childTaskId)?.at(-1) ?? shipment.head;
+    return heads;
+  }
+
+  /** Rebuild "Changed files" without what landed. It runs as a pull request
+   * settles, while the landing has just used the world (so it wakes nothing),
+   * and only while the agent works: a Review's list is that Review's. */
+  async function refreshChangedFiles(): Promise<void> {
+    if (!changedFilesStale) return;
+    changedFilesStale = false;
+    const whole = fullWorld ?? world;
+    if (!whole || cancelled) return;
+    const fresh = await core.buildReview(whole as WorldHandle, base, landedHeads()).catch(() => undefined);
+    if (!fresh) return;
+    reviewInfo = { ...reviewInfo, changedFiles: fresh.changedFiles };
+    await publish();
   }
 
   const openShipments = () => shipments.filter((shipment) => shipment.state === 'open');
@@ -4034,6 +4098,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         return { ok: true, childTaskId: open.childTaskId, branch: open.branch, checkout: open.checkout, target: open.target, updated: true };
       const taken = await takeData();
       if (!taken.ok) return taken;
+      shippedHeads.set(open.childTaskId, [...shippedHeads.get(open.childTaskId) ?? [open.head], check.head]);
       open.head = check.head;
       open.requestId = request.requestId;
       open.data = taken.data?.length ? taken.data : undefined;
@@ -4120,7 +4185,19 @@ Inspect the complete current diff and specifically compare its delta from the re
           const head = pendingHead;
           pendingHead = undefined;
           const move = () => core.movePullRequest(world as WorldHandle, head);
-          await (patched(WORLD_REOPENS_WAIT) ? waitingForWorld(move) : move());
+          if (patched(PR_MOVE_FAILURE_TO_AGENT)) {
+            // A head this pull request cannot take is its task's agent's to fix,
+            // not the end of it (pramana#137's): it stays at its last commit.
+            // A machine the provider cannot start yet is waited for first.
+            const moved = await waitingForWorld(move).then(() => true, async (err) => {
+              if (isCancellation(err)) throw err;
+              if (input.parentTaskId) await getExternalWorkflowHandle(input.parentTaskId).signal(pullRequestNoticeSignal,
+                { childTaskId: taskId, kind: 'needs-work', text: `It could not be updated to ${head.slice(0, 8)}: ${innermostMessage(err).replace(/\.?$/, '.')} It is still at its previous commit.` })
+                .catch(() => undefined);
+              return false;
+            });
+            if (!moved) { prRequested = false; continue; }
+          } else await (patched(WORLD_REOPENS_WAIT) ? waitingForWorld(move) : move());
         }
         seen = msgs.length;
         return { completed: true, providerCompleted: true, output: '', openPrRequested: true };
@@ -4145,8 +4222,25 @@ Inspect the complete current diff and specifically compare its delta from the re
    *  the top. Commit-on-spawn snapshots our work first (worktrees share commits, not the
    *  dirty tree) so children fork the current state. */
   async function spawnSubTasks(list: SpawnRequest[], requester = MAIN_AGENT) {
-    const snapshot = () => core.commitWork(world as any, `tavya: snapshot before sub-tasks for ${taskId}`);
-    if (!patched(WORLD_REOPENS_WAIT)) await snapshot();
+    const message = `tavya: snapshot before sub-tasks for ${taskId}`;
+    const snapshot = () => core.commitWork(world as any, message);
+    if (list.length && patched(SUBTASK_SNAPSHOT_TO_AGENT)) {
+      // Committing every checkout takes as long as git walks them, minutes with
+      // a large data tree: it heartbeats instead of a 5-minute limit. A machine
+      // the provider cannot start yet is waited for (Hetzner's CPUs were full);
+      // a snapshot still impossible is the asking agent's, or a person's Retry
+      // for a world that stays unreachable, never the end of this task
+      // (pramana#137: 3 × 5 minutes, then "workflow failed").
+      preparingSubTask = true;
+      await publish();
+      try { await waitingForWorld(() => childPreparation.commitWork(world as any, message)); }
+      catch (err) {
+        if (isCancellation(err)) throw err;
+        preparingSubTask = false;
+        await unpreparedSubTasks(list[0]!, list.slice(1), err, requester);
+        return;
+      } finally { preparingSubTask = false; }
+    } else if (!patched(WORLD_REOPENS_WAIT)) await snapshot();
     else {
       try { await waitingForWorld(snapshot); }
       catch (err) {
@@ -4193,7 +4287,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       if (patched('subtask-prepare-failure-to-agent-v1')) {
         preparingSubTask = true;
         await publish();
-        try { childInput = await prepareSubTask(s, prepare); }
+        try { childInput = await prepareSubTask(s, () => childPreparation.prepareChildTask(prepare)); }
         catch (err) {
           if (isCancellation(err)) throw err;
           preparingSubTask = false;
@@ -4231,9 +4325,9 @@ Inspect the complete current diff and specifically compare its delta from the re
    * than the activity's retries (a VM whose connection stays lost): that is
    * waited out as any stage's infrastructure is, visibly, a Retry or a cancel
    * ending a wait early. */
-  async function prepareSubTask(request: SubTaskRequest, prepare: Parameters<coreActivities['prepareChildTask']>[0]) {
+  async function prepareSubTask<T>(request: SubTaskRequest, prepare: () => Promise<T>): Promise<T> {
     for (let waits = 0; ; waits++) {
-      try { return await childPreparation.prepareChildTask(prepare); }
+      try { return await prepare(); }
       catch (err) {
         if (!isInfraFailure(err) || waits >= INFRA_BACKOFF_MS.length || !patched(SUBTASK_PREPARE_WAITS_FOR_WORLD)) throw err;
         const wait = INFRA_BACKOFF_MS[waits]!;
@@ -4932,7 +5026,9 @@ Inspect the complete current diff and specifically compare its delta from the re
           || (!!needsInput && prRequested) || halted(),
         // Agents called while the main agent is paused run now; its pause goes
         // on unless what they say is for it.
-        ...(multiAgent ? { serveable: () => agentQueue.length > 0 && !cancelled, serve: runCalledAgents } : {}),
+        // A pull request landing meanwhile refreshes "Changed files".
+        serveable: () => (multiAgent && agentQueue.length > 0 && !cancelled) || (changedFilesStale && !cancelled),
+        serve: async () => { if (changedFilesStale && !cancelled) await refreshChangedFiles(); else await runCalledAgents(); },
       }).finally(() => { if (multiAgent) turnOwners.pop(); });
       if (cancelled) return await abort();
       if (multiAgent && stopping?.key === MAIN_AGENT) {
@@ -5167,7 +5263,10 @@ Inspect the complete current diff and specifically compare its delta from the re
       // (summary/links/html) takes precedence where present (§5.5). Diffs are
       // intentionally omitted from the review packet — reviewers use the
       // changed-files list plus the in-world terminal / conversation transcripts.
-      const auto = await core.buildReview(world as any, base).catch(() => undefined);
+      // A pull request of its own landed: that work is no longer the task's to list.
+      const landedSoFar = shipsBranches && shipments.some((shipment) => shipment.state === 'landed') ? landedHeads() : undefined;
+      if (landedSoFar) changedFilesStale = false;
+      const auto = await (landedSoFar ? core.buildReview(world as any, base, landedSoFar) : core.buildReview(world as any, base)).catch(() => undefined);
       if (auto) {
         reviewInfo = {
           // Prefer the agent's terse caption; fall back to the git-derived summary.
@@ -5578,6 +5677,7 @@ Inspect the complete current diff and specifically compare its delta from the re
   }
   }
   if (pullRequestsSettled) {
+    await refreshChangedFiles();
     stage = 'done';
     status = 'done';
     const landed = shipments.filter((shipment) => shipment.state === 'landed');
@@ -6550,6 +6650,9 @@ Inspect the complete current diff and specifically compare its delta from the re
   if (fullWorld) { world = fullWorld; fullWorld = undefined; }
   stage = 'done';
   status = 'done';
+  // What it proposed has landed: "Changed files" no longer lists it.
+  changedFilesStale = false;
+  if (reviewInfo?.changedFiles?.length && patched(CHANGED_FILES_AFTER_LANDING)) reviewInfo = { ...reviewInfo, changedFiles: [] };
   // The landing adds to the work summary; it never replaces it.
   const landed = landedNote(world, target, sha);
   if (landed) reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${reviewInfo.summary}\n\n${landed}` : landed };
@@ -6571,10 +6674,23 @@ Inspect the complete current diff and specifically compare its delta from the re
   return { stage, sha };
   } catch (e) {
     if (e instanceof Cancelled || (isCancellation(e) && cancelled)) return await abort();
+    // Only a Temporal failure fails the run; anything else (a bug) fails the
+    // workflow task, which Temporal retries, so the run is not over.
+    if (e instanceof TemporalFailure && patched(FAILURE_NAMES_CAUSE)) await publishFailure(e);
     throw e;
   }
 
   // ── helpers ──
+  /** Say why the run failed, and where Retry picks it up, before it closes. */
+  async function publishFailure(e: unknown) {
+    failedFrom = multiAgent && stage === 'escalated' && escalatedFrom ? escalatedFrom : stage;
+    stage = 'failed';
+    status = 'failed';
+    waitingFor = undefined;
+    error = `workflow failed: ${innermostMessage(e)}`;
+    await publish().catch(() => undefined);
+  }
+
   async function abort() {
     // Whatever happens to the world now happens to all of it.
     if (fullWorld) { world = fullWorld; fullWorld = undefined; }
@@ -6674,19 +6790,6 @@ function conflictGuide(err: any): string | undefined {
     if (typeof guide === 'string' && guide) return guide;
   }
   return undefined;
-}
-
-function innermostMessage(err: any): string {
-  let e: any = err;
-  let message = '';
-  for (let depth = 0; e && depth < 6; depth++) {
-    if (e.message) message = e.message;
-    // A world the provider cannot start says so in people's words; what is
-    // under it is the provider's raw answer (pramana#79: Hetzner's JSON).
-    if (e.type === 'world-infra' || e.type === 'world-capacity') break;
-    e = e.cause;
-  }
-  return message || String(err);
 }
 
 function describeError(err: any): string {

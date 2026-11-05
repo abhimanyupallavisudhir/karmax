@@ -159,7 +159,9 @@ it('a ~100 MB saved video starts playing in the Review viewer', async () => {
     const thumbnail = page.locator('.review-tile video');
     await thumbnail.waitFor({ state: 'attached' });
     await expect.poll(() => thumbnail.evaluate((v) => (v as any).readyState), { timeout: 20_000 }).toBeGreaterThan(0);
-    await page.route(media, async (route) => { await route.fulfill({ status: 403, body: '' }); await page.unroute(media); });
+    // `times: 1` retires the route as it fires: unrouting from inside the handler raced the
+    // viewer's next request on CI, which then hung in the router and never played (CI #2592).
+    await page.route(media, (route) => route.fulfill({ status: 403, body: '' }), { times: 1 });
     openedAt = Date.now();
     await page.getByRole('button', { name: /Watch the video/ }).click();
 
