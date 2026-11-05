@@ -49,6 +49,8 @@ export interface UsageWindow {
   tz?: string;
   /** Best-effort absolute reset instant (epoch ms) for a countdown; display uses the label. */
   resetAt?: number;
+  /** Read from a turn after the check (epoch ms): the check's numbers were older. */
+  readAt?: number;
 }
 
 export interface UsageSnapshot {
@@ -235,6 +237,31 @@ export function isUsageStale(snap: UsageReading | undefined, now: number, ttlMs 
   if (!snap.ok) return false;
   const wins = [snap.session, snap.week, ...(snap.models ?? [])].filter((w): w is UsageWindow => !!w);
   return wins.some((w) => w.resetAt !== undefined && w.resetAt < now);
+}
+
+/**
+ * A usage check's numbers, with any window a turn has read since put in its
+ * place: every Claude turn reports the login's utilization as it runs, and
+ * the quota scheduler acts on that, so Settings must not show the check's
+ * older 73% beside a scheduler holding work at 99%. A window that has reset
+ * since the check loses the check's reset text, which named the old reset.
+ */
+export function withStreamReadings<T extends UsageReading>(snap: T,
+  observed: Partial<Record<'session' | 'week', { utilization: number; resetsAt?: number; at: number }>> | undefined): T {
+  if (!snap.ok || !observed) return snap;
+  let out: UsageSnapshot & { failedAt?: number; failure?: string } = snap;
+  for (const kind of ['session', 'week'] as const) {
+    const reading = observed[kind];
+    if (!reading || reading.at <= snap.at) continue;
+    const checked = snap[kind];
+    const sameReset = checked?.resetAt !== undefined && reading.resetsAt !== undefined
+      && Math.abs(checked.resetAt - reading.resetsAt) < 2 * 60_000;
+    const resetAt = reading.resetsAt ?? checked?.resetAt;
+    out = { ...out, [kind]: { pct: Math.round(Math.min(1, reading.utilization) * 100),
+      ...(checked && (sameReset || reading.resetsAt === undefined) ? { resetLabel: checked.resetLabel, ...(checked.tz ? { tz: checked.tz } : {}) } : { resetLabel: '' }),
+      ...(resetAt !== undefined ? { resetAt } : {}), readAt: reading.at } };
+  }
+  return out as T;
 }
 
 /** What to cache after a check: a failed check (`probe-failed`: a timeout, a CLI
