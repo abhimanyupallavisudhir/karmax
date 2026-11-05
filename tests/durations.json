@@ -522,6 +522,7 @@
   "tests/responder-prompt-routing.test.ts": 0,
   "tests/response-size.test.ts": 0,
   "tests/restore-journey.browser.test.ts": 15.7,
+  "tests/restore-recovery.test.ts": 0.9,
   "tests/restore-review.test.ts": 7.7,
   "tests/review-action-generation.test.ts": 0.2,
   "tests/review-action-ports.test.ts": 6,
