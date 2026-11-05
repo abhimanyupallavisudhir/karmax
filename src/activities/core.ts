@@ -5449,6 +5449,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      */
     async proposeUpstream(ref: WorldHandleRef, target: string, details: OpenPrDetails = {}): Promise<UpstreamProposal> {
       const handle = ref as WorldHandle;
+      // Which checkouts are forks is project data, not world state. With none,
+      // there is nothing to propose: opening the world would wake a parked
+      // computer for nothing, and every Confirm waited 1–2½ minutes for it
+      // (longer when compute was short or the restore hung; task #826).
+      // The same checkouts githubPrTargets reads from the opened world.
+      const current = ((await store.currentWorld(handle.id)) ?? handle) as WorldHandle;
+      let fork = false;
+      for (const repo of worldRepos(current)) {
+        if ((await enrolledRepositoryForCheckout(handle, repo))?.upstream) { fork = true; break; }
+      }
+      if (!fork) return { prs: [], pending: [] };
       const world = await openWorld(handle);
       const targets = (await githubPrTargets(world, handle)).filter((candidate) => candidate.headRepository);
       const changed: Array<(typeof targets)[number] & { base: string }> = [];

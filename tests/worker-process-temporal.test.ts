@@ -7,7 +7,8 @@ import { expect, it } from 'vitest';
 import { startDevServer } from '../src/temporal/dev-server.js';
 import { makeClient } from '../src/temporal/client.js';
 import { WorkerProcessManager } from '../src/temporal/worker-process.js';
-import { bump, finish, countQuery, pingWorkflow } from '../src/workflows/ping.js';
+import { bump, finish, countQuery, pingWorkflow, pingStallWorkflow } from '../src/workflows/ping.js';
+import { temporal } from '@temporalio/proto';
 
 const test = process.platform === 'linux' ? it : it.skip;
 test('resumes durable workflow history in a replacement supervised worker process', async () => {
@@ -92,6 +93,49 @@ test('shrinks the workflow cache under workflow-heap pressure and keeps every wo
     expect(worker.failure).toBeUndefined();
   } finally {
     await worker.stop();
+    await close();
+    await server.stop();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+}, 90_000);
+
+// Task #826: a deploy stopped the worker holding a GitHub check, and Temporal
+// retried it only at its 5-minute start-to-close; the task's Confirm waited
+// all that time. A stopping worker reports what it abandons, so the next one
+// runs it again at once.
+test('a worker stopped mid-activity hands the activity to the next worker at once', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-worker-process-home-'));
+  const server = await startDevServer({ headless: true, logLevel: 'never' });
+  const { client, close } = await makeClient({ address: server.address, namespace: server.namespace });
+  const queue = `stopped-worker-${crypto.randomUUID()}`;
+  const workers: WorkerProcessManager[] = [];
+  const create = () => {
+    const worker = new WorkerProcessManager({
+      entrypoint: fileURLToPath(new URL('./fixtures/temporal-worker-process.ts', import.meta.url)),
+      execArgv: ['--import', 'tsx', '--max-old-space-size=512'],
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, KARMAX_HOME: home,
+        KARMAX_TASK_QUEUE: queue, WORKER_FIXTURE_TEMPORAL_ADDRESS: server.address },
+    });
+    workers.push(worker);
+    return worker;
+  };
+  try {
+    const first = create();
+    await first.start();
+    const handle = await client.workflow.start(pingStallWorkflow, {
+      taskQueue: queue, workflowId: crypto.randomUUID(), args: [120_000] });
+    await expect.poll(async () => (await handle.describe()).raw.pendingActivities?.[0]?.state, { timeout: 10_000 })
+      .toBe(temporal.api.enums.v1.PendingActivityState.PENDING_ACTIVITY_STATE_STARTED);
+    const stopped = Date.now();
+    await first.stop();
+    expect(first.failure).toBeUndefined();
+    const second = create();
+    await second.start();
+    expect(await handle.result()).toBe(2);
+    expect(Date.now() - stopped).toBeLessThan(30_000);
+    await second.stop();
+  } finally {
+    for (const worker of workers) await worker.stop();
     await close();
     await server.stop();
     fs.rmSync(home, { recursive: true, force: true });

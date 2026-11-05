@@ -7,7 +7,7 @@ export { mergeQueueWatch } from './merge-queue-watch.js';
  * gateway/tests) to avoid same-name collisions across workflows. Every side
  * effect goes through an activity (SPEC §3.1).
  */
-export { pingWorkflow } from './ping.js';
+export { pingWorkflow, pingStallWorkflow } from './ping.js';
 export { softwareDev } from './software-dev.js';
 export { justDo } from './just-do.js';
 export { scriptExec } from './script-exec.js';
