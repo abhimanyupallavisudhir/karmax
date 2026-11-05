@@ -160,3 +160,63 @@ it('fits a phone', async () => {
   });
   expect(errors).toEqual([]);
 }, 60_000);
+
+it('shows image thumbnails, and shares a folder as a public snapshot anyone can browse', async () => {
+  const f = await projectFilesFixture(cleanups, { files: { 'src/server.ts': SERVER_TS, 'assets/logo.svg': LOGO_SVG } });
+  await f.store.kvSet(`conversation-sharing:organization:${f.project.organizationId}`, 'enabled');
+  const { page, errors, step, context } = await openConsole(browser, { viewport: { width: 1280, height: 820 } });
+  cleanups.push(() => context.close());
+  const shoot = async (target: typeof page, name: string) => { if (shots) { fs.mkdirSync(shots, { recursive: true }); await target.screenshot({ path: path.join(shots, `${name}.png`) }); } };
+
+  await step('an image in a folder is its own icon', async () => {
+    await page.goto(`${f.server.url}/projects/site-builder/files`);
+    await page.locator('.files-row', { hasText: 'site-wiki' }).waitFor();
+    await page.goto(page.url().replace(/\/files$/, '/files/site/assets'));
+    await page.locator('.files-row', { hasText: 'logo.svg' }).locator('.files-icon.has-thumb').waitFor();
+    await shoot(page, 'thumbnails');
+  });
+
+  let link = '';
+  await step('Share makes a public link to this folder', async () => {
+    await page.goto(page.url().replace(/\/files\/site\/assets$/, '/files/site'));
+    await page.locator('.files-row', { hasText: 'README.md' }).waitFor();
+    await page.locator('#files-share:not([hidden])').click();
+    const dialog = page.locator('.files-share-dialog');
+    await dialog.locator('[data-create]').click();
+    link = await dialog.locator('[data-link]').inputValue();
+    expect(link).toMatch(new RegExp(`^${f.server.url}/share/files/[A-Za-z0-9_-]{43}$`));
+    await page.waitForFunction(() => !document.querySelector('.action-pending, .action-succeeded'));
+    await shoot(page, 'share-dialog');
+    await page.keyboard.press('Escape');
+    await dialog.waitFor({ state: 'detached' });
+  });
+
+  await step('someone signed out browses the snapshot', async () => {
+    const outsider = await browser.newContext({ serviceWorkers: 'block', viewport: { width: 1280, height: 820 } });
+    cleanups.push(() => outsider.close());
+    const shared = await outsider.newPage();
+    const outsiderErrors: string[] = [];
+    shared.on('pageerror', (error) => outsiderErrors.push(error.message));
+    await shared.goto(link);
+    await shared.locator('.files-row', { hasText: 'README.md' }).waitFor();
+    expect(await shared.locator('.files-crumb').allInnerTexts()).toEqual(['site']);
+    await shared.locator('.files-link', { hasText: /^src$/ }).click();
+    await shared.locator('.files-link', { hasText: 'server.ts' }).click();
+    await shared.locator('.files-code .hljs-keyword').first().waitFor();
+    expect(shared.url()).toBe(`${link}/src/server.ts`);
+    await shoot(shared, 'shared-page');
+    await shared.goBack();
+    await shared.locator('.files-link', { hasText: 'server.ts' }).waitFor();
+    await shared.goto(`${link}/README.md`);
+    await shared.locator('.files-rendered h1', { hasText: 'Site' }).waitFor();
+    expect(outsiderErrors).toEqual([]);
+  });
+
+  await step('Stop sharing ends the link', async () => {
+    await page.locator('#files-share').click();
+    await page.locator('.files-share-dialog [data-revoke]').click();
+    await page.locator('.files-share-dialog [data-create]').waitFor();
+    expect((await fetch(link)).status).toBe(404);
+  });
+  expect(errors).toEqual([]);
+}, 120_000);

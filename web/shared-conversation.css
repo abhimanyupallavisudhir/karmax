@@ -1,7 +1,10 @@
 /* A public reading view of the same conversation, using the console's tokens. */
 .shared-page { min-height: 100%; height: auto; background: var(--surface); }
 .shared-page [hidden] { display: none !important; }
-.shared-topbar { position: sticky; top: 0; padding-inline: 24px; }
+/* The console has no top bar since the sidebar redesign, so the public pages draw their own. */
+.shared-topbar { position: sticky; top: 0; z-index: 30; display: flex; align-items: center; gap: 16px; height: 56px; padding-inline: 24px;
+  background: var(--surface); border-bottom: 1px solid var(--line); }
+.shared-topbar .spacer { flex: 1; }
 .shared-topbar .brand { color: var(--ink); font-size: 14px; gap: 9px; min-width: 0; }
 .shared-topbar .brand span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .shared-topbar nav { display: flex; align-items: center; gap: 12px; flex-shrink: 0; }

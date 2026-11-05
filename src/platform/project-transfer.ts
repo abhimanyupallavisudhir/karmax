@@ -293,6 +293,10 @@ export class ProjectTransfers {
     for (const key of [`authz:default:project:${id}`, `credpolicy:project:${id}`, `project-environment-builds:${id}`, `avatars:project:${id}`]) (await s.kvDelete(key));
     for (const entry of (await s.kvEntries(`wfpin:${id}:`)).filter(e => e.key.startsWith(`wfpin:${id}:`))) (await s.kvDelete(entry.key));
     (await s.kvSet(`conversation-sharing:project:${id}`, 'disabled'));
+    // Public file links were the source organization's to give; they end with the move.
+    for (const share of (await s.kvEntries(`file-share-index:${id}:`)).filter(e => e.key.startsWith(`file-share-index:${id}:`))) {
+      (await s.kvDelete(`file-share:${share.value}`)); (await s.kvDelete(share.key));
+    }
     // Retain only portable code/branch policy. Compute and profile selectors are
     // organization-owned; the preview explicitly describes their reset.
     const { base: defaultBase, target: defaultTarget, remote, landingAuthority, multiPr } = branchPolicy;

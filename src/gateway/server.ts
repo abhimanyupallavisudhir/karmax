@@ -79,7 +79,8 @@ import { accountKey, waiters } from '../world/compute-queue.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
-import { FileAccessError, FileNotFoundError, ProjectFiles, type OpenedFile } from '../world/project-files.js';
+import { FileAccessError, FileNotFoundError, ProjectFiles, splitPath, type FileNode, type OpenedFile } from '../world/project-files.js';
+import { createFileShare, currentFileShare, projectFileShares, publicFileShare, publicFilesHtml, revokeFileShare, type FileShare } from './file-sharing.js';
 import { cliVersionOf, olderVersion } from '../domain/cli-version.js';
 import { WorkspaceConflict, WorldNotRunningError } from '../world/resources.js';
 import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, openCodeKeyModels, mergeModels,
@@ -385,6 +386,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/workspace$/.test(p) || /^\/api\/projects\/[^/]+\/git-credential$/.test(p)) return 'repository:read';
   // The Files page: data under it also needs project:settings:read, checked there.
   if (/^\/api\/projects\/[^/]+\/files(?:\/raw)?$/.test(p)) return 'repository:read';
+  // Public links to a snapshot of a path: anyone who reads Files sees them; making or revoking one is its own capability.
+  if (/^\/api\/projects\/[^/]+\/file-shares$/.test(p)) return read ? 'repository:read' : 'project:files:share';
   if (/^\/api\/organizations\/[^/]+\/cli-git-credentials$/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/projects\/[^/]+\/secrets\/values$/.test(p)) return 'project:secret:use';
   if (/^\/api\/projects\/[^/]+\/resources\/[^/]+\/read-grant$/.test(p)) return 'project:settings:read';
@@ -1809,6 +1812,19 @@ export class Gateway {
       return void res.end(publicConversationHtml(share, { siteName: await this.siteName, signedIn,
         skin: skinOf(await this.deps.store.getSettings('global', 'appearance')) }));
     }
+    // A shared snapshot of project files: the page, and what it reads (no sign-in).
+    const sharedFilesPage = p.match(/^\/share\/files\/([A-Za-z0-9_-]+)(?:\/.*)?$/);
+    if (sharedFilesPage) {
+      const share = req.method === 'GET' ? await publicFileShare(this.deps.store, sharedFilesPage[1]!) : undefined;
+      const signedIn = !!(await this.deps.identity?.session(requestHeaders(req.headers)).catch(() => null));
+      res.writeHead(share ? 200 : 404, { 'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex, nofollow',
+        'content-security-policy': `default-src 'none'; script-src 'self' ${MATHJAX_SCRIPT_SOURCE}; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob:; media-src 'self'; frame-src blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'` });
+      return void res.end(publicFilesHtml(share, { siteName: await this.siteName, signedIn,
+        skin: skinOf(await this.deps.store.getSettings('global', 'appearance')) }));
+    }
+    const sharedFiles = p.match(/^\/api\/shared-files\/([A-Za-z0-9_-]+)(\/raw)?$/);
+    if (sharedFiles && (req.method === 'GET' || req.method === 'HEAD')) return this.serveSharedFiles(req, res, url, sharedFiles[1]!, !!sharedFiles[2]);
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
     if (p.startsWith('/brand/')) return this.brand(p, res, req);
     if (p === '/app.webmanifest' && req.method === 'GET') return (await this.webManifest(res));
@@ -4979,6 +4995,50 @@ export class Gateway {
           else (await store.kvDelete(cliGitCredentialsKey(organizationId)));
         }
         return this.json(res, 200, { enabled: (await store.kvGet(cliGitCredentialsKey(organizationId))) === 'enabled' });
+      }
+      // Public links to a snapshot of a file or folder (wiki features/project-files).
+      const fileShares = p.match(/^\/api\/projects\/([^/]+)\/file-shares$/);
+      if (fileShares) {
+        const projectId = fileShares[1]!;
+        const project = await store.getProject(projectId);
+        if (!project) return this.json(res, 404, { error: 'project not found' });
+        const scope = { projectId, organizationId: project.organizationId };
+        const shareUrl = (share: FileShare) => `/share/files/${share.id}`;
+        if (method === 'GET' && !url.searchParams.has('path')) {
+          return this.json(res, 200, { shares: (await projectFileShares(store, projectId)).map((share) => ({ path: share.path, kind: share.kind,
+            url: shareUrl(share), createdAt: share.createdAt })) });
+        }
+        let filePath: string;
+        try { filePath = splitPath(url.searchParams.get('path') ?? '').join('/'); }
+        catch (error) { return this.json(res, 404, { error: error instanceof Error ? error.message : String(error) }); }
+        const policy = await sharingPolicy(store, projectId);
+        if (method === 'DELETE') {
+          await revokeFileShare(store, projectId, filePath);
+          await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'files.share.revoke', `project:${projectId}`, { path: filePath });
+          return this.json(res, 200, { revoked: true });
+        }
+        let share = await currentFileShare(store, projectId, filePath);
+        if (method === 'POST') {
+          if (!policy.effective) return this.json(res, 403, { error: 'Public links are turned off in organization or project settings' });
+          const data = (await this.deps.tokens.check(token, 'project:settings:read', scope)).ok;
+          try {
+            share = await createFileShare(store, projectId, filePath, actorPrincipal(callerIdentity.actor), async () => {
+              const { pins, node } = await this.projectFiles().snapshot(projectId, filePath, { data });
+              return { pins, kind: node.kind };
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return this.json(res, error instanceof FileNotFoundError ? 404 : error instanceof FileAccessError ? 403 : 502, { error: message });
+          }
+          await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'files.share.create', `project:${projectId}`, { path: filePath });
+        } else if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
+        // Where to turn links on, for the dialog, when they are off.
+        const settings = policy.effective ? null : !policy.organization
+          ? { scope: 'organization', id: project.organizationId!, canManage: (await this.deps.tokens.check(token,
+            'organization:edit', { organizationId: project.organizationId })).ok }
+          : { scope: 'project', id: projectId, canManage: (await this.deps.tokens.check(token, 'project:settings:write', scope)).ok };
+        return this.json(res, 200, { enabled: policy.effective, canShare: (await this.deps.tokens.check(token, 'project:files:share', scope)).ok,
+          settings, url: share ? shareUrl(share) : null, createdAt: share?.createdAt ?? null, kind: share?.kind ?? null });
       }
       // The project as a file tree (wiki features/project-files).
       const projectFiles = p.match(/^\/api\/projects\/([^/]+)\/files(\/raw)?$/);
@@ -10084,6 +10144,43 @@ export class Gateway {
         if (this.deps.hosted) throw new Error('Connect GitHub in organization settings, then try again.');
         return {};
       } });
+  }
+
+  /** `GET /api/shared-files/:share[/raw]?path=`: a public link's snapshot,
+   * `path` relative to what was shared. Paths and sources are given relative
+   * to it too, so nothing outside the shared path is named. */
+  private async serveSharedFiles(req: http.IncomingMessage, res: http.ServerResponse, url: URL, id: string, raw: boolean): Promise<void> {
+    const share = await publicFileShare(this.deps.store, id);
+    if (!share) return this.json(res, 404, { error: 'This link was revoked, or sharing was turned off.' });
+    let inside: string[];
+    try { inside = splitPath(url.searchParams.get('path') ?? ''); }
+    catch (error) { return this.json(res, 404, { error: error instanceof Error ? error.message : String(error) }); }
+    if (share.kind !== 'directory' && inside.length) return this.json(res, 404, { error: 'Nothing there' });
+    const root = splitPath(share.path);
+    const full = [...root, ...inside].join('/');
+    const relative = (node: FileNode): FileNode => {
+      const { source } = node;
+      // A shared file is named by its own name; inside a shared folder, by its path there.
+      return { ...node, path: share.kind === 'directory' ? inside.join('/') : root.at(-1) ?? '',
+        source: source.kind === 'data' ? { kind: 'data', id: '', name: source.name, access: source.access }
+          : source.kind === 'repository' ? { ...source } : { kind: 'project' } };
+    };
+    try {
+      if (!raw) {
+        res.setHeader('cache-control', 'private, no-cache');
+        res.setHeader('x-robots-tag', 'noindex, nofollow');
+        const node = relative(await this.projectFiles().stat(share.projectId, full, { data: true, pins: share.pins }));
+        return this.json(res, 200, { ...node, shared: { kind: share.kind, createdAt: share.createdAt } });
+      }
+      return await this.projectFiles().open(share.projectId, full, { data: true, pins: share.pins },
+        (file) => this.sendProjectFile(req, res, { ...file, node: relative(file.node) }, url.searchParams.has('download')));
+    } catch (error) {
+      if (res.headersSent) return void res.destroy();
+      const message = error instanceof Error ? error.message : String(error);
+      // Nothing about the project's own layout or failures beyond this link.
+      return this.json(res, error instanceof FileNotFoundError ? 404 : error instanceof FileAccessError ? 403 : 502,
+        { error: error instanceof FileNotFoundError ? 'Nothing there' : error instanceof FileAccessError ? message : 'Couldn’t read this file right now.' });
+    }
   }
 
   /** `GET /api/projects/:id/files/raw`: one file's bytes, in a single byte

@@ -96,11 +96,15 @@ export async function mirroredClone(source: string, clone: string, env: Record<s
  * branch's commit and must only read objects (the project Files page). A tip
  * origin advertised within `maxAgeMs` is trusted without asking it again, so a
  * person browsing a repository costs origin one round trip per window rather
- * than one per click; the credential was proved by that same advertisement. */
+ * than one per click; the credential was proved by that same advertisement.
+ * `commit` reads that commit of the branch instead of its tip (a shared
+ * snapshot): it must be in the mirror, which only ever holds origin's objects,
+ * else `readMirrored` throws `MirroredCommitMissing`. */
 export async function readMirrored<T>(source: string, env: Record<string, string>,
-  options: { branch?: string; scratch: string; scope?: string; maxAgeMs?: number },
+  options: { branch?: string; scratch: string; scope?: string; maxAgeMs?: number; commit?: string },
   read: (repository: string, commit: string, branch: string) => Promise<T>): Promise<T> {
   if (options.branch && !validGitBranch(options.branch)) throw new Error(`Git broker rejected invalid branch "${options.branch}"`);
+  if (options.commit !== undefined && !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(options.commit)) throw new MirroredCommitMissing();
   const persistent = usesPersistentMirrors();
   const mirror = persistent ? persistentMirror(source, options.scope) : undefined;
   const key = mirror ? `${mirror}\n${options.branch ?? ''}` : '';
@@ -110,8 +114,9 @@ export async function readMirrored<T>(source: string, env: Record<string, string
     const releaseUse = await acquireFileLock(lockFile(mirror, 'use'), { shared: true, waitMs: LOCK_WAIT_MS });
     if (releaseUse) {
       try {
-        const present = await git(mirror, ['cat-file', '-e', `${known.commit}^{commit}`]).catch(() => undefined);
-        if (present?.code === 0) return await read(mirror, known.commit, known.branch);
+        const wanted = options.commit ?? known.commit;
+        const present = await git(mirror, ['cat-file', '-e', `${wanted}^{commit}`]).catch(() => undefined);
+        if (present?.code === 0) return await read(mirror, wanted, known.branch);
       } finally { releaseUse(); }
     }
     recentTips.delete(key);
@@ -125,14 +130,24 @@ export async function readMirrored<T>(source: string, env: Record<string, string
     const tip = await git(synced.mirror, ['rev-parse', '--verify', `refs/heads/${synced.branch}^{commit}`]);
     if (tip.code !== 0) { releaseUse?.(); throw new Error(tip.stderr || tip.stdout); }
     commit = tip.stdout.trim();
+    if (options.commit) {
+      const present = await git(synced.mirror, ['cat-file', '-e', `${options.commit}^{commit}`]).catch(() => undefined);
+      if (present?.code !== 0) { releaseUse?.(); throw new MirroredCommitMissing(); }
+    }
   } finally { synced.releaseUpdate?.(); }
   if (key) {
     if (recentTips.size >= 256) recentTips.delete(recentTips.keys().next().value!);
     recentTips.set(key, { commit, branch: synced.branch, at: Date.now() });
   }
   const release = borrowRelease(synced.mirror, synced.persistent, releaseUse);
-  try { return await read(synced.mirror, commit, synced.branch); }
+  try { return await read(synced.mirror, options.commit ?? commit, synced.branch); }
   finally { await release(); }
+}
+
+/** The commit `readMirrored` was asked for is not on origin any more (a
+ * force-push removed it) or was never a commit of that repository. */
+export class MirroredCommitMissing extends Error {
+  constructor() { super('That version is no longer in the repository.'); }
 }
 
 /** Tips `readMirrored` last saw origin advertise, by mirror and branch. */

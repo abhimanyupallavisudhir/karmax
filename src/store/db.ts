@@ -6640,6 +6640,8 @@ export class Store {
       (await exact.run(`credpolicy:project:${projectId}`));
       (await exact.run(`avatars:project:${projectId}`));
       (await exact.run(`conversation-sharing:project:${projectId}`));
+      for (const share of await this.kvEntries(`file-share-index:${projectId}:`)) await exact.run(`file-share:${share.value}`);
+      await this.kvDeletePrefix(`file-share-index:${projectId}:`);
       await this.kvDeletePrefix(`wfpin:${projectId}:`);
     }
     for (const taskId of taskIds) {

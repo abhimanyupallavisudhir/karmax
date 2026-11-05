@@ -128,3 +128,74 @@ it('splits paths without resolving them', () => {
   expect(splitPath('/a//b/./c/')).toEqual(['a', 'b', 'c']);
   expect(() => splitPath('a/../b')).toThrow(/leaves the project/);
 });
+
+it('shares a fixed snapshot of a folder or file by public link, when the organization allows it', async () => {
+  const f = await fixture();
+  const { capsOf } = await import('./helpers/project-files-fixture.js');
+  const maintainer = await f.tokenFor(capsOf('maintainer') as string[]);
+  const developer = await f.tokenFor(capsOf('developer') as string[]);
+  type Reply = { status: number; headers: Headers; json(): Promise<any>; text(): Promise<string> };
+  const shares = (filePath: string, token: string, method = 'GET'): Promise<Reply> => fetch(`${f.server.url}/api/projects/${f.project.id}/file-shares?path=${encodeURIComponent(filePath)}`,
+    { method, headers: { authorization: `Bearer ${token}` } });
+  const pub = (id: string, filePath = '', raw = false): Promise<Reply> => fetch(`${f.server.url}/api/shared-files/${id}${raw ? '/raw' : ''}?path=${encodeURIComponent(filePath)}`);
+
+  // Off until the organization turns public links on (the conversations setting).
+  expect(await (await shares('site/src', maintainer)).json()).toMatchObject({ enabled: false, canShare: true, url: null,
+    settings: { scope: 'organization', canManage: false } });
+  expect((await shares('site/src', maintainer, 'POST')).status).toBe(403);
+  await f.store.kvSet(`conversation-sharing:organization:${f.project.organizationId}`, 'enabled');
+  // Sharing project files is its own capability: Project maintainers and up.
+  expect((await shares('site/src', developer, 'POST')).status).toBe(403);
+  expect((await (await shares('site/src', developer)).json()).canShare).toBe(false);
+  const made = await (await shares('site/src', maintainer, 'POST')).json();
+  expect(made).toMatchObject({ enabled: true, kind: 'directory', url: expect.stringMatching(/^\/share\/files\/[A-Za-z0-9_-]{43}$/) });
+  const id = made.url.split('/').pop();
+  // Sharing again gives the same link.
+  expect((await (await shares('site/src', maintainer, 'POST')).json()).url).toBe(made.url);
+
+  // Anyone can read it, without signing in, relative to what was shared.
+  const folder = await (await pub(id)).json();
+  expect(folder).toMatchObject({ path: '', kind: 'directory', source: { kind: 'repository', branch: 'main' }, shared: { kind: 'directory' } });
+  expect(folder.entries.map((entry: any) => entry.name)).toEqual(['app.ts', 'weird name #1.txt']);
+  expect(await (await pub(id, 'app.ts', true)).text()).toBe('export const answer = 42;\n');
+  expect((await pub(id, '../README.md')).status).toBe(404);
+  expect((await pub(id, 'nope')).status).toBe(404);
+  const page = await fetch(`${f.server.url}${made.url}/app.ts`);
+  expect(page.status).toBe(200);
+  expect(page.headers.get('content-security-policy')).toContain("default-src 'none'");
+  expect(page.headers.get('x-robots-tag')).toBe('noindex, nofollow');
+  expect(await page.text()).toContain(`data-share="${id}"`);
+
+  // A snapshot: a later commit does not reach it, while Files shows it.
+  fs.writeFileSync(path.join(f.site.work, 'src/app.ts'), 'export const answer = 43;\n');
+  sh(f.site.work, 'commit', '-qam', 'change');
+  sh(f.site.work, 'push', '-q', f.site.bare, 'main');
+  const { readMirrored } = await import('../src/world/git-mirror.js');
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-files-read-'));
+  cleanups.push(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  await readMirrored(`git@github.com:${f.owner}/site.git`, {}, { branch: 'main', scratch }, async () => undefined);
+  expect(await (await f.get('site/src/app.ts', f.viewer, true)).text()).toBe('export const answer = 43;\n');
+  expect(await (await pub(id, 'app.ts', true)).text()).toBe('export const answer = 42;\n');
+
+  // A file of data, pinned to its version, and a shared file takes no path.
+  const csv = await (await shares('site/data/raw/pages/b.csv', maintainer, 'POST')).json();
+  const csvId = csv.url.split('/').pop();
+  await f.resources.importFiles(f.data.id, [{ path: 'pages/b.csv', data: Buffer.from('x,y\n9,9\n') }]);
+  expect(await (await f.get('site/data/raw/pages/b.csv', f.viewer, true)).text()).toBe('x,y\n9,9\n');
+  expect(await (await pub(csvId)).json()).toMatchObject({ path: 'b.csv', kind: 'file', source: { kind: 'data', name: 'raw_data', id: '' } });
+  expect(await (await pub(csvId, '', true)).text()).toBe('x,y\n1,2\n');
+  expect((await pub(csvId, 'x')).status).toBe(404);
+
+  // Everyone who reads Files sees the project's links; revoking ends one.
+  expect(((await (await fetch(`${f.server.url}/api/projects/${f.project.id}/file-shares`, { headers: { authorization: `Bearer ${f.viewer}` } })).json()) as any)
+    .shares.map((share: any) => share.path).sort()).toEqual(['site/data/raw/pages/b.csv', 'site/src']);
+  expect((await shares('site/src', developer, 'DELETE')).status).toBe(403);
+  expect((await shares('site/src', maintainer, 'DELETE')).status).toBe(200);
+  expect((await pub(id)).status).toBe(404);
+  expect((await fetch(`${f.server.url}${made.url}`)).status).toBe(404);
+  // Turning links off hides the rest until they are on again.
+  await f.store.kvSet(`conversation-sharing:project:${f.project.id}`, 'disabled');
+  expect((await pub(csvId)).status).toBe(404);
+  await f.store.kvDelete(`conversation-sharing:project:${f.project.id}`);
+  expect((await pub(csvId)).status).toBe(200);
+});

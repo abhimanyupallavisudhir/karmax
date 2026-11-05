@@ -18771,43 +18771,15 @@ function confirmAvatar() {
 // The project as one tree, laid out as a task's world: a folder per repository
 // (the branch tasks start from), the project wiki, and data where it is
 // mounted. An address bar (breadcrumbs; click or `g l` to type a path), folder
-// listings, and a view for any text file — code coloured by highlight.js,
-// Markdown and CSV rendered — besides images, media and PDFs.
-const FILES_TEXT_MAX = 2 * 1024 * 1024;      // shown in the page; larger files download
-const FILES_HIGHLIGHT_MAX = 512 * 1024;      // coloured; larger text stays plain
-const FILES_TABLE_ROWS = 5000;
-const FILES_ICONS = {
-  directory: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>',
-  file: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z"/><path d="M14 3v6h6"/></svg>',
-  symlink: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z"/><path d="M9 16v-2a3 3 0 0 1 3-3h3"/><path d="m13 9 2 2-2 2"/></svg>',
-  submodule: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M3 12h6m6 0h6"/></svg>',
-  repository: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 19.5V5a2 2 0 0 1 2-2h12v15H7a2 2 0 0 0-2 2 2 2 0 0 0 2 2h12"/><path d="M9 7h6"/></svg>',
-  data: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="8" ry="2.5"/><path d="M4 5.5v13c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5v-13"/><path d="M4 12c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5"/></svg>',
-  up: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>',
-  open: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>',
-  download: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>',
-};
-const FILES_IMAGE = /\.(?:png|jpe?g|gif|webp|avif|svg)$/i;
-const FILES_VIDEO = /\.(?:mp4|webm|mov|m4v)$/i;
-const FILES_AUDIO = /\.(?:mp3|m4a|wav|ogg|oga|opus|flac)$/i;
+// listings with image thumbnails, a view for any text file (code coloured,
+// Markdown and CSV rendered), images, media and PDFs (web/file-view.js, shared
+// with the public page of a shared snapshot), and Share for a public link.
+const FV = globalThis.KarmaxFileView;
 
-function filesParts(filePath) { return String(filePath || '').split('/').filter(Boolean); }
-function filesJoin(...parts) { return parts.flatMap(filesParts).join('/'); }
-function filesParent(filePath) { return filesParts(filePath).slice(0, -1).join('/'); }
 function filesApi(pid, filePath, raw = false, download = false) {
   return `/api/projects/${encodeURIComponent(pid)}/files${raw ? '/raw' : ''}?path=${encodeURIComponent(filePath)}${download ? '&download=1' : ''}`;
 }
-// Resolve `target` (a symlink's or a Markdown link's) against `dir`: null when it leaves the project.
-function filesResolve(dir, target) {
-  const out = String(target || '').startsWith('/') ? [] : filesParts(dir);
-  for (const part of String(target || '').split('/')) {
-    if (!part || part === '.') continue;
-    if (part === '..') { if (!out.length) return null; out.pop(); } else out.push(part);
-  }
-  return out.join('/');
-}
-
-function filesState() { return (S.files ||= { cache: new Map() }); }
+function filesState() { return (S.files ||= { cache: new Map(), sharing: new Map() }); }
 function filesPageShows(pid, filePath) {
   const page = $('#files-page');
   return !!page && page.dataset.project === pid && page.dataset.path === (filePath || '');
@@ -18816,12 +18788,14 @@ function filesPageShows(pid, filePath) {
 function filesView(proj) {
   if (!proj) return '<div class="empty">No project.</div>';
   const filePath = S.filesPath || '';
-  const parts = filesParts(filePath);
+  const parts = FV.parts(filePath);
+  const sharing = filesState().sharing.get(proj.id);
   return `<div class="files-page" id="files-page" data-project="${esc(proj.id)}" data-path="${esc(filePath)}">
     <div class="files-bar">
-      <a class="btn sm icon files-up${parts.length ? '' : ' disabled'}" data-spa href="${esc(filesRoute(proj.id, filesParent(filePath)))}" aria-label="Up a folder" title="Up a folder (Backspace)"${parts.length ? '' : ' aria-disabled="true" tabindex="-1"'}>${FILES_ICONS.up}</a>
+      <a class="btn sm icon files-up${parts.length ? '' : ' disabled'}" data-spa href="${esc(filesRoute(proj.id, FV.parent(filePath)))}" aria-label="Up a folder" title="Up a folder (Backspace)"${parts.length ? '' : ' aria-disabled="true" tabindex="-1"'}>${FV.ICONS.up}</a>
       <div class="files-address" id="files-address" title="Click to type a path (g l)">${filesCrumbsHtml(proj, parts)}</div>
       <span class="files-source" id="files-source"></span>
+      <button type="button" class="btn sm icon files-share" id="files-share" data-tool="Share" title="Share a public link" aria-label="Share"${sharing?.canShare ? '' : ' hidden'}>${FV.ICONS.share}</button>
     </div>
     <div class="files-body" id="files-body"><div class="files-status" role="status" aria-busy="true">Loading…</div></div>
   </div>`;
@@ -18842,10 +18816,10 @@ function editFilesAddress() {
   const current = page.dataset.path || '';
   const crumbs = bar.innerHTML;
   bar.classList.add('editing');
-  bar.innerHTML = `<input id="files-path-input" class="files-path-input" spellcheck="false" autocomplete="off" aria-label="Path" list="files-path-options" value="${esc(current ? `${current}` : '')}" placeholder="repository/folder/file"><datalist id="files-path-options"></datalist>`;
+  bar.innerHTML = `<input id="files-path-input" class="files-path-input" spellcheck="false" autocomplete="off" aria-label="Path" list="files-path-options" value="${esc(current)}" placeholder="repository/folder/file"><datalist id="files-path-options"></datalist>`;
   const input = bar.querySelector('input');
   const options = bar.querySelector('datalist');
-  let restored = false, timer = 0, asked = '';
+  let restored = false, timer = 0, asked = null;
   const restore = () => { if (restored) return; restored = true; bar.classList.remove('editing'); bar.innerHTML = crumbs; };
   // Suggest what the folder being typed holds.
   const suggest = async () => {
@@ -18856,15 +18830,15 @@ function editFilesAddress() {
     const node = await filesLoad(pid, dir).catch(() => null);
     if (restored || asked !== dir || node?.kind !== 'directory') return;
     options.innerHTML = (node.entries || []).slice(0, 200).map((entry) =>
-      `<option value="${esc(filesJoin(dir, entry.name))}${entry.kind === 'directory' ? '/' : ''}"></option>`).join('');
+      `<option value="${esc(FV.join(dir, entry.name))}${entry.kind === 'directory' ? '/' : ''}"></option>`).join('');
   };
   input.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(suggest, 120); });
   input.addEventListener('keydown', (event) => {
     event.stopPropagation();
-    if (event.key === 'Escape') { event.preventDefault(); restore(); bar.focus?.(); }
+    if (event.key === 'Escape') { event.preventDefault(); restore(); }
     if (event.key === 'Enter') {
       event.preventDefault();
-      const target = filesResolve('', input.value.trim());
+      const target = FV.resolve('', input.value.trim());
       restored = true;
       go(filesRoute(pid, target ?? ''));
     }
@@ -18875,9 +18849,8 @@ function editFilesAddress() {
   suggest();
 }
 
-// A place's node, from this tab's cache when fresh enough (and then refreshed
-// behind it), else from the server. Directories and file facts only: bytes
-// come from `/raw`.
+// A place's node, from this tab's cache while fresh, else from the server.
+// Folders and file facts only: bytes come from `/raw`.
 async function filesLoad(pid, filePath, { fresh = false } = {}) {
   const state = filesState();
   const key = `${pid}\n${filePath}`;
@@ -18896,10 +18869,10 @@ function installFilesKeys() {
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Backspace' || event.metaKey || event.ctrlKey || event.altKey || event.defaultPrevented) return;
     const page = $('#files-page');
-    if (S.tab !== 'files' || !page || !page.dataset.path) return;
+    if (S.tab !== 'files' || !page || !page.dataset.path || document.querySelector('dialog[open]')) return;
     if (event.target.closest?.('input, textarea, select, [contenteditable], dialog, .modal-overlay')) return;
     event.preventDefault();
-    go(filesRoute(page.dataset.project, filesParent(page.dataset.path)));
+    go(filesRoute(page.dataset.project, FV.parent(page.dataset.path)));
   });
 }
 
@@ -18911,8 +18884,18 @@ async function wireFilesView(proj) {
   // A long path keeps its last names in view.
   if (bar) bar.scrollLeft = bar.scrollWidth;
   bar?.addEventListener('click', (event) => { if (!event.target.closest('a, input')) editFilesAddress(); });
+  $('#files-share')?.addEventListener('click', () => openFilesShare(pid, filePath));
   installFilesKeys();
   const shows = () => filesPageShows(pid, filePath) && S.tab === 'files';
+  // Whether you may share here: asked once per project, then the button shows.
+  const sharing = filesState().sharing;
+  if (!sharing.has(pid)) {
+    sharing.set(pid, null);
+    api(`/api/projects/${encodeURIComponent(pid)}/file-shares?path=`).then((state) => {
+      sharing.set(pid, { canShare: !!state.canShare });
+      if (state.canShare && filesPageShows(pid, $('#files-page')?.dataset.path ?? '')) $('#files-share')?.removeAttribute('hidden');
+    }, () => sharing.delete(pid));
+  }
   let node;
   try { node = await filesLoad(pid, filePath); }
   catch (error) {
@@ -18923,262 +18906,76 @@ async function wireFilesView(proj) {
     return;
   }
   if (!shows()) return;
-  paintFilesNode(proj, node);
-}
-
-function filesSourceHtml(source) {
-  if (!source || source.kind === 'project') return '';
-  if (source.kind === 'repository') return `<span class="files-chip" title="${esc(source.role === 'project-wiki' ? 'Project wiki' : 'Branch new tasks start from')} · ${esc(source.commit)}">${source.role === 'project-wiki' ? FILES_ICONS.repository : FILES_ICONS.repository}<span>${esc(source.branch)}</span><code>${esc(String(source.commit).slice(0, 7))}</code></span>`;
-  return `<span class="files-chip data" title="Data resource ${esc(source.name)}: its current version${source.access === 'read' ? ' (read-only in tasks)' : ''}">${FILES_ICONS.data}<span>${esc(source.name)}</span></span>`;
-}
-
-function paintFilesNode(proj, node) {
-  const body = $('#files-body');
-  $('#files-source').innerHTML = filesSourceHtml(node.source);
-  if (node.kind === 'directory') return paintFilesDirectory(proj, node, body);
-  if (node.kind === 'symlink') {
-    const target = filesResolve(filesParent(node.path), node.target);
-    body.innerHTML = `<div class="files-status">${FILES_ICONS.symlink}<span>Link to <code>${esc(node.target)}</code></span>
-      ${target !== null ? `<a class="btn sm" data-spa href="${esc(filesRoute(proj.id, target))}">Open</a>` : ''}</div>`;
-    return;
-  }
-  if (node.kind === 'submodule') {
-    body.innerHTML = `<div class="files-status">${FILES_ICONS.submodule}<span>Submodule at <code>${esc(String(node.target || '').slice(0, 12))}</code></span></div>`;
-    return;
-  }
-  paintFilesFile(proj, node, body);
-}
-
-function paintFilesDirectory(proj, node, body) {
-  const entries = node.entries || [];
-  if (!entries.length) { body.innerHTML = `<div class="files-status muted">${node.path ? 'Empty folder' : 'This project has no repositories or data yet.'}</div>`; return; }
-  const icon = (entry) => entry.mount === 'data' ? FILES_ICONS.data : entry.mount ? FILES_ICONS.repository : FILES_ICONS[entry.kind] || FILES_ICONS.file;
-  const badge = (entry) => entry.mount === 'data' ? '<span class="files-badge" title="Data resource mounted here">data</span>'
-    : entry.mount === 'wiki' ? '<span class="files-badge" title="The project wiki">wiki</span>' : '';
-  body.innerHTML = `<ul class="files-list" role="list">${entries.map((entry) => `<li class="files-row kind-${esc(entry.kind)}${entry.mount ? ` mount-${esc(entry.mount)}` : ''}">
-      <a class="files-link" data-spa href="${esc(filesRoute(proj.id, filesJoin(node.path, entry.name)))}"><span class="files-icon">${icon(entry)}</span><span class="files-name">${esc(entry.name)}</span>${badge(entry)}</a>
-      <span class="files-size">${entry.size !== undefined && entry.kind !== 'directory' ? esc(formatBytes(entry.size)) : ''}</span></li>`).join('')}</ul>`;
-  const links = [...body.querySelectorAll('.files-link')];
-  body.querySelector('.files-list').addEventListener('keydown', (event) => {
-    const at = links.indexOf(document.activeElement);
-    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
-    event.preventDefault();
-    links[Math.max(0, Math.min(links.length - 1, at < 0 ? 0 : at + (event.key === 'ArrowDown' ? 1 : -1)))]?.focus();
+  $('#files-source').innerHTML = FV.sourceHtml(node.source);
+  // Arriving from a subfolder: its row gets the focus, so ↑/↓ carry on from there.
+  const from = S.filesFrom && FV.parent(S.filesFrom) === node.path ? FV.parts(S.filesFrom).pop() : null;
+  FV.render($('#files-body'), node, {
+    href: (where) => filesRoute(pid, where), link: ' data-spa', raw: (where, download) => filesApi(pid, where, true, download),
+    from, emptyRoot: 'This project has no repositories or data yet.', shows,
+    fetch: (url) => feedbackFetch(url, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} }),
+    markdown: (el, text, after) => mountMarkdownSurface(el, (math) => renderMarkdown(text, { math }), after),
+    markdownTools: texToggleHtml(), wireTools: wireTexToggles,
+    copy: (text) => copyToClipboard(text).then(() => toast('Copied')), errorText: plainError,
   });
-  // Arriving from a subfolder: focus where you came from, so ↑/↓ carry on from there.
-  const from = S.filesFrom && filesParent(S.filesFrom) === node.path ? S.filesFrom.split('/').pop() : null;
-  const back = from ? links.find((link) => link.querySelector('.files-name')?.textContent === from) : null;
-  if (back) back.focus({ preventScroll: false });
 }
 
-// Which highlight.js language a file may be, from its name; null = plain text.
-// The caller checks it against the loaded library (hljs.getLanguage).
-function filesLanguage(name) {
-  const lower = String(name).toLowerCase();
-  const special = { makefile: 'makefile', dockerfile: 'bash', 'cmakelists.txt': 'cmake', gemfile: 'ruby', rakefile: 'ruby', '.bashrc': 'bash', '.zshrc': 'bash', '.env': 'bash' };
-  if (special[lower]) return special[lower];
-  if (lower.startsWith('.env.')) return 'bash';
-  const ext = lower.includes('.') ? lower.split('.').pop() : '';
-  const aliases = { mjs: 'javascript', cjs: 'javascript', jsx: 'javascript', mts: 'typescript', cts: 'typescript', tsx: 'typescript', vue: 'xml', svelte: 'xml',
-    htm: 'xml', svg: 'xml', toml: 'ini', cfg: 'ini', conf: 'ini', jsonl: 'json', ndjson: 'json', ipynb: 'json', webmanifest: 'json', tf: 'ini', zsh: 'bash', ps1: 'powershell', txt: null, log: null, csv: null, tsv: null };
-  if (ext in aliases) return aliases[ext];
-  return ext && /^[a-z0-9+#-]{1,12}$/.test(ext) ? ext : null;
-}
-
-function loadHighlighter() {
-  if (globalThis.hljs) return Promise.resolve(globalThis.hljs);
-  return (loadHighlighter.pending ||= new Promise((resolve) => {
-    const script = document.createElement('script');
-    script.src = '/vendor/highlight.min.js';
-    script.onload = () => resolve(globalThis.hljs || null);
-    script.onerror = () => { loadHighlighter.pending = null; resolve(null); };
-    document.head.appendChild(script);
-  }));
-}
-
-// highlight.js's HTML split into lines, each closing and reopening the spans
-// that cross it, so every line is a well-formed element of its own.
-function splitHighlightedLines(html) {
-  const lines = [];
-  const open = [];
-  let line = '';
-  const tag = /<span[^>]*>|<\/span>|\n|[^<\n]+|</g;
-  let match;
-  while ((match = tag.exec(html))) {
-    const token = match[0];
-    if (token === '\n') { lines.push(line + '</span>'.repeat(open.length)); line = open.join(''); }
-    else if (token.startsWith('<span')) { open.push(token); line += token; }
-    else if (token === '</span>') { open.pop(); line += token; }
-    else line += token;
-  }
-  lines.push(line + '</span>'.repeat(open.length));
-  return lines;
-}
-
-function filesLinesHtml(lines) {
-  return `<div class="files-code" role="table" aria-label="File contents">${lines.map((line, i) =>
-    `<div class="files-line" id="L${i + 1}" role="row"><a class="files-ln" href="#L${i + 1}" data-line="${i + 1}" aria-label="Line ${i + 1}" tabindex="-1"></a><span class="files-lc" role="cell">${line || ' '}</span></div>`).join('')}</div>`;
-}
-
-// RFC 4180 rows (quotes, doubled quotes, newlines inside quotes), at most `limit`.
-function parseDelimited(text, delimiter, limit) {
-  const rows = [];
-  let row = [], field = '', quoted = false;
-  for (let i = 0; i < text.length && rows.length < limit; i++) {
-    const c = text[i];
-    if (quoted) {
-      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else quoted = false; } else field += c;
-    } else if (c === '"' && field === '') quoted = true;
-    else if (c === delimiter) { row.push(field); field = ''; }
-    else if (c === '\n' || c === '\r') {
-      if (c === '\r' && text[i + 1] === '\n') i++;
-      row.push(field); rows.push(row); row = []; field = '';
-    } else field += c;
-  }
-  if ((field || row.length) && rows.length < limit) { row.push(field); rows.push(row); }
-  return rows;
-}
-
-async function paintFilesFile(proj, node, body) {
-  const name = node.path.split('/').pop() || 'file';
-  const raw = filesApi(proj.id, node.path, true);
-  const download = filesApi(proj.id, node.path, true, true);
-  const head = (meta = '', tools = '') => `<div class="files-file-head"><span class="files-file-name">${esc(name)}</span><span class="files-file-meta">${meta}</span><span class="files-spacer"></span>${tools}
-    <a class="btn sm icon" href="${esc(raw)}" target="_blank" rel="noopener" title="Open raw file in a new tab" aria-label="Open raw">${FILES_ICONS.open}</a>
-    <a class="btn sm icon" href="${esc(download)}" download="${esc(name)}" title="Download" aria-label="Download">${FILES_ICONS.download}</a></div>`;
-  const size = formatBytes(node.size ?? 0);
-  const shows = () => filesPageShows(proj.id, node.path);
-  if (FILES_IMAGE.test(name)) {
-    body.innerHTML = `<div class="files-file">${head(esc(size))}<div class="files-media files-image"><img src="${esc(raw)}" alt="${esc(name)}"></div></div>`;
-    return;
-  }
-  if (FILES_VIDEO.test(name) || FILES_AUDIO.test(name)) {
-    const tag = FILES_VIDEO.test(name) ? 'video' : 'audio';
-    body.innerHTML = `<div class="files-file">${head(esc(size))}<div class="files-media"><${tag} controls preload="metadata" src="${esc(raw)}"></${tag}></div></div>`;
-    return;
-  }
-  const tooLarge = (node.size ?? 0) > (/\.pdf$/i.test(name) ? 50 * 1024 * 1024 : FILES_TEXT_MAX);
-  if (tooLarge) {
-    body.innerHTML = `<div class="files-file">${head(esc(size))}<div class="files-status muted">Too large to show here. <a href="${esc(download)}" download="${esc(name)}">Download</a></div></div>`;
-    return;
-  }
-  body.innerHTML = `<div class="files-file">${head(esc(size))}<div class="files-status" role="status" aria-busy="true">Loading…</div></div>`;
-  let response;
-  try {
-    response = await feedbackFetch(raw, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} });
-    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || `HTTP ${response.status}`);
-  } catch (error) {
-    if (!shows()) return;
-    body.querySelector('.files-status').outerHTML = `<div class="files-status error" role="alert">${esc(plainError(error.message))}</div>`;
-    return;
-  }
-  if (/\.pdf$/i.test(name)) {
-    const blob = await response.blob();
-    if (!shows()) return;
-    const frame = document.createElement('iframe');
-    frame.className = 'files-pdf';
-    frame.title = name;
-    frame.src = URL.createObjectURL(new Blob([blob], { type: 'application/pdf' }));
-    body.querySelector('.files-status').replaceWith(frame);
-    return;
-  }
-  const binary = /octet-stream/.test(response.headers.get('content-type') || '');
-  if (binary) {
-    response.body?.cancel().catch(() => {});
-    if (!shows()) return;
-    body.querySelector('.files-status').outerHTML = `<div class="files-status muted">Binary file. <a href="${esc(download)}" download="${esc(name)}">Download</a></div>`;
-    return;
-  }
-  const text = await response.text();
-  const guess = filesLanguage(name);
-  const kind = /\.(?:md|markdown|mdx)$/i.test(name) ? 'markdown' : /\.(?:csv|tsv)$/i.test(name) ? 'table' : 'code';
-  // Colouring needs the library: wait for it only when this file wants it.
-  const hljs = guess && text.length <= FILES_HIGHLIGHT_MAX ? await loadHighlighter() : null;
-  const language = hljs?.getLanguage(guess) ? guess : null;
-  if (!shows()) return;
-  const lines = text.endsWith('\n') ? text.slice(0, -1).split('\n') : text.split('\n');
-  const meta = `${lines.length.toLocaleString()} line${lines.length === 1 ? '' : 's'} · ${esc(size)}`;
-  const modes = kind === 'code' ? '' : `<div class="segmented sm files-modes" role="group" aria-label="View">
-      <button type="button" data-mode="rendered" aria-pressed="true">${kind === 'markdown' ? 'Preview' : 'Table'}</button><button type="button" data-mode="code" aria-pressed="false">Code</button></div>`;
-  const copy = `<button class="btn sm icon files-copy" type="button" title="Copy contents" aria-label="Copy contents">${ICON.copy}</button>`;
-  body.innerHTML = `<div class="files-file">${head(meta, `${modes}${kind === 'markdown' ? texToggleHtml() : ''}${copy}`)}<div class="files-content" id="files-content"></div></div>`;
-  const content = body.querySelector('#files-content');
-  let codeHtml = null;
-  const code = () => {
-    if (codeHtml === null) {
-      let html;
-      try { html = hljs && language ? hljs.highlight(lines.join('\n'), { language, ignoreIllegals: true }).value : null; } catch { html = null; }
-      codeHtml = filesLinesHtml(html ? splitHighlightedLines(html) : lines.map((line) => esc(line)));
-    }
-    content.className = 'files-content files-source-view';
-    content.innerHTML = codeHtml;
-    wireFilesLines(content);
+// A public link to a snapshot of this file or folder (the same organization and
+// project setting as shared conversations), and the project's other links.
+async function openFilesShare(pid, filePath) {
+  const endpoint = `/api/projects/${encodeURIComponent(pid)}/file-shares?path=${encodeURIComponent(filePath)}`;
+  const name = FV.parts(filePath).pop() || projectSlug(projectById(pid)) || 'project';
+  let state, all;
+  try { [state, all] = await Promise.all([api(endpoint), api(`/api/projects/${encodeURIComponent(pid)}/file-shares`)]); }
+  catch (error) { return toast(plainError(error.message), true); }
+  const previousFocus = document.activeElement;
+  const dialog = document.createElement('dialog');
+  dialog.className = 'modal-card files-share-dialog';
+  dialog.setAttribute('aria-labelledby', 'files-share-title');
+  const draw = () => {
+    const settings = state.settings;
+    const settingsUrl = settings?.scope === 'organization'
+      ? `${globalRoute('organization', organizationById(settings.id))}#organization-conversation-sharing`
+      : `${projectRoute(settings?.id, 'settings')}#project-conversation-sharing`;
+    const blocked = !state.enabled ? `<p class="files-share-note" role="status">Public links are off for this ${esc(settings?.scope || 'project')}. ${settings?.canManage
+      ? `<a data-spa data-sharing-settings href="${esc(settingsUrl)}">Turn them on</a>` : `Ask ${settings?.scope === 'organization' ? 'an organization' : 'a project'} administrator to turn them on.`}</p>` : '';
+    const link = state.url ? new URL(state.url, location.origin).href : '';
+    const others = (all?.shares || []).filter((share) => share.path !== filePath);
+    dialog.innerHTML = `<header class="files-share-head"><h2 id="files-share-title">Share <code>${esc(name)}</code></h2>
+        ${policyTip('Anyone with the link can read this as it is now, without signing in. Later changes don’t reach it; share again for a newer copy.')}
+        <span class="files-spacer"></span><button class="icon-btn" data-close aria-label="Close" title="Close (Esc)">${ICON.close}</button></header>
+      ${blocked}
+      ${state.url ? `<div class="files-share-link"><input data-link readonly value="${esc(link)}" aria-label="Public link">
+          <button class="btn sm primary" data-copy>Copy</button></div>
+        <div class="files-share-meta"><span>Snapshot of ${esc(new Date(state.createdAt).toLocaleString())}</span><span class="files-spacer"></span>
+          <a class="btn sm" href="${esc(state.url)}" target="_blank" rel="noopener noreferrer">Open</a><button class="btn sm danger" data-revoke>Stop sharing</button></div>`
+        : `<button class="btn primary" data-create data-submit ${state.enabled ? '' : 'disabled'}>Create public link</button>`}
+      ${others.length ? `<details class="files-share-others"><summary>Other links in this project (${others.length})</summary><ul>${others.map((share) =>
+        `<li><a data-spa href="${esc(filesRoute(pid, share.path))}" data-goto>${esc(share.path || projectSlug(projectById(pid)))}</a><span class="files-spacer"></span>
+          <a href="${esc(share.url)}" target="_blank" rel="noopener noreferrer" title="Open the public page">↗</a>
+          <button class="icon-btn" data-revoke-other="${esc(share.path)}" aria-label="Stop sharing ${esc(share.path)}" title="Stop sharing">${ICON.close}</button></li>`).join('')}</ul></details>` : ''}`;
+    dialog.querySelector('[data-close]').onclick = () => dialog.close();
+    dialog.querySelectorAll('[data-sharing-settings], [data-goto]').forEach((anchor) => anchor.addEventListener('click', () => dialog.close()));
+    dialog.querySelector('[data-copy]')?.addEventListener('click', () => copyToClipboard(link).then(() => toast('Link copied'), () => dialog.querySelector('[data-link]').select()));
+    const mutate = async (button, method, target = filePath) => {
+      button.disabled = true;
+      try {
+        await api(`/api/projects/${encodeURIComponent(pid)}/file-shares?path=${encodeURIComponent(target)}`, { method });
+        [state, all] = await Promise.all([api(endpoint), api(`/api/projects/${encodeURIComponent(pid)}/file-shares`)]);
+        draw();
+        if (method === 'POST') dialog.querySelector('[data-copy]')?.focus();
+      } catch (error) { button.disabled = false; toast(plainError(error.message), true); }
+    };
+    dialog.querySelector('[data-create]')?.addEventListener('click', (event) => mutate(event.currentTarget, 'POST'));
+    dialog.querySelector('[data-revoke]')?.addEventListener('click', (event) => mutate(event.currentTarget, 'DELETE'));
+    dialog.querySelectorAll('[data-revoke-other]').forEach((button) => button.addEventListener('click', () => mutate(button, 'DELETE', button.dataset.revokeOther)));
   };
-  const rendered = () => {
-    content.className = 'files-content files-rendered';
-    if (kind === 'markdown') {
-      content.classList.add('msg-text', 'md');
-      mountMarkdownSurface(content, (math) => renderMarkdown(text, { math }), (el) => {
-        // Relative links go to their file in this tree.
-        el.querySelectorAll('a[data-md-local]').forEach((link) => {
-          // A Markdown link may carry a fragment or query; a typed path never does.
-          let local = link.dataset.mdLocal.split(/[?#]/)[0];
-          try { local = decodeURIComponent(local); } catch { /* as written */ }
-          const target = filesResolve(filesParent(node.path), local);
-          if (target === null) return;
-          link.href = filesRoute(proj.id, target);
-          link.setAttribute('data-spa', '');
-        });
-      });
-      wireTexToggles(body);
-    } else {
-      const rows = parseDelimited(text, /\.tsv$/i.test(name) ? '\t' : ',', FILES_TABLE_ROWS + 1);
-      const [header = [], ...rest] = rows;
-      content.innerHTML = `<div class="files-table-wrap"><table class="files-table"><thead><tr>${header.map((cell) => `<th>${esc(cell)}</th>`).join('')}</tr></thead>
-        <tbody>${rest.slice(0, FILES_TABLE_ROWS).map((row) => `<tr>${row.map((cell) => `<td>${esc(cell)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
-        ${rest.length > FILES_TABLE_ROWS ? `<div class="files-status muted">First ${FILES_TABLE_ROWS.toLocaleString()} rows. Switch to Code for the rest.</div>` : ''}`;
-    }
-  };
-  // A line link (#L12) opens the code, even of a Markdown file.
-  const wantsLine = /^#L\d+/.test(location.hash);
-  if (kind === 'code' || wantsLine) code(); else rendered();
-  body.querySelectorAll('.files-modes [data-mode]').forEach((button) => {
-    button.setAttribute('aria-pressed', String((button.dataset.mode === 'code') === (kind === 'code' || wantsLine)));
-    button.addEventListener('click', () => {
-      body.querySelectorAll('.files-modes [data-mode]').forEach((other) => other.setAttribute('aria-pressed', String(other === button)));
-      if (button.dataset.mode === 'code') code(); else rendered();
-    });
-  });
-  body.querySelector('.files-copy')?.addEventListener('click', (event) => copyToClipboard(text).then(() => {
-    const button = event.currentTarget || body.querySelector('.files-copy');
-    toast('Copied');
-    button?.blur();
-  }));
-}
-
-// Line numbers link to the line (#L12); shift-click a second one for a range.
-function wireFilesLines(content) {
-  const mark = () => {
-    content.querySelectorAll('.files-line.selected').forEach((line) => line.classList.remove('selected'));
-    const match = /^#L(\d+)(?:-L(\d+))?$/.exec(location.hash);
-    if (!match) return null;
-    const from = Number(match[1]), to = Number(match[2] || match[1]);
-    for (let n = Math.min(from, to); n <= Math.max(from, to); n++) content.querySelector(`#L${n}`)?.classList.add('selected');
-    return content.querySelector(`#L${Math.min(from, to)}`);
-  };
-  const first = mark();
-  if (first) first.scrollIntoView({ block: 'center' });
-  content.addEventListener('click', (event) => {
-    const link = event.target.closest('.files-ln');
-    if (!link) return;
-    event.preventDefault();
-    const line = Number(link.dataset.line);
-    const anchor = /^#L(\d+)/.exec(location.hash)?.[1];
-    const hash = event.shiftKey && anchor && Number(anchor) !== line
-      ? `#L${Math.min(Number(anchor), line)}-L${Math.max(Number(anchor), line)}` : `#L${line}`;
-    history.replaceState(history.state, '', `${location.pathname}${location.search}${hash}`);
-    mark();
-  });
+  draw();
+  dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.close(); });
+  dialog.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); dialog.close(); } });
+  dialog.addEventListener('close', () => { dialog.remove(); if (previousFocus?.isConnected) previousFocus.focus(); }, { once: true });
+  document.body.appendChild(dialog);
+  dialog.showModal();
+  (dialog.querySelector('[data-copy], [data-create]:not([disabled])') || dialog.querySelector('[data-close]')).focus();
 }
 
 function wikiScopeInfo(proj) {
@@ -20370,7 +20167,7 @@ async function hydrateConversationSharing(scope, id) {
   const url = `/api/${scope === 'project' ? 'projects' : 'organizations'}/${encodeURIComponent(id)}/conversation-sharing`;
   try {
     const policy = await api(url);
-    const tip = policyTip('Lets developers publish a read-only snapshot of an agent conversation; anyone with the link can read it. Turning this off hides existing links until it is back on.');
+    const tip = policyTip('Lets people publish read-only snapshots of agent conversations and of project files; anyone with the link can read them. Turning this off hides existing links until it is back on.');
     // The organization turns links on or off; a project follows it or turns them off.
     const control = scope === 'organization'
       ? `<input type="checkbox" class="toggle" aria-label="Public conversation links" ${policy.enabled ? 'checked' : ''} ${policy.canManage ? '' : 'disabled'}>`

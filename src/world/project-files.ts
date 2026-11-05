@@ -7,7 +7,7 @@ import type { Store } from '../store/db.js';
 import type { WorkspaceManifest, WorkspaceService } from './workspace.js';
 import type { ProjectResourceService } from './resources.js';
 import type { GitBrokerCredential } from './git-broker.js';
-import { readMirrored } from './git-mirror.js';
+import { MirroredCommitMissing, readMirrored } from './git-mirror.js';
 import { catBlob, git } from './git.js';
 import { materializeGitCredential } from './git-credential.js';
 import { RESTIC_ENGINE, ROOT_PART, storedRef, type Repository as ResticRepository, type SnapshotEntry } from './restic-engine.js';
@@ -51,6 +51,13 @@ export interface FileNode {
   version?: string;
 }
 
+/** A snapshot of the tree (a public link): the commit of each repository it
+ * spans, by its SSH URL, and the version of each data resource (null: none
+ * yet). Repositories and data it does not name are not part of it. */
+export interface FilePins { repositories: Record<string, string>; data: Record<string, string | null> }
+
+export interface FileReadOptions { data: boolean; pins?: FilePins }
+
 export interface OpenedFile { node: FileNode; size: number; stream: Readable; done: Promise<void>; stop: () => void }
 
 export class FileNotFoundError extends Error {}
@@ -70,6 +77,7 @@ const TIP_MAX_AGE_MS = 30_000;
 const LISTING_CACHE = 500;
 
 type Mount = WorkspaceManifest['resources'][number] & { segments: string[] };
+type PinnedRepository = WorkspaceManifest['repositories'][number] & { commit?: string };
 
 export class ProjectFiles {
   private readonly listings = new Map<string, SnapshotEntry[]>();
@@ -79,22 +87,48 @@ export class ProjectFiles {
   /** What is at `relative`: a directory with its entries, or a file's facts.
    * `data: false` (no right to read the project's data) still shows where
    * data is mounted, but refuses its contents. */
-  async stat(projectId: string, relative: string, options: { data: boolean }): Promise<FileNode> {
+  async stat(projectId: string, relative: string, options: FileReadOptions): Promise<FileNode> {
     const at = await this.locate(projectId, relative, options);
     return at.stat();
   }
 
   /** A file's bytes. `consume` runs while the source is held open (a Git
    * mirror stays borrowed until it settles). */
-  async open<T>(projectId: string, relative: string, options: { data: boolean }, consume: (file: OpenedFile) => Promise<T>): Promise<T> {
+  async open<T>(projectId: string, relative: string, options: FileReadOptions, consume: (file: OpenedFile) => Promise<T>): Promise<T> {
     const at = await this.locate(projectId, relative, options);
     return at.open(consume);
   }
 
-  private async locate(projectId: string, relative: string, options: { data: boolean }): Promise<{
-    stat: () => Promise<FileNode>; open: <T>(consume: (file: OpenedFile) => Promise<T>) => Promise<T> }> {
+  /** Pin what `relative` spans now (each repository's commit, each data
+   * resource's version) and check it is there: what a public link shows. */
+  async snapshot(projectId: string, relative: string, options: { data: boolean }): Promise<{ pins: FilePins; node: FileNode }> {
     const segments = splitPath(relative);
     const manifest = await this.deps.workspaces.project(projectId);
+    const pins: FilePins = { repositories: {}, data: {} };
+    for (const repository of manifest.repositories) {
+      if (segments.length && segments[0] !== repository.name) continue;
+      pins.repositories[repository.sshUrl] = await this.withRepository(projectId, repository, async (_mirror, commit) => commit);
+    }
+    for (const resource of manifest.resources) {
+      const mount = splitPath(resource.path);
+      if (!startsWith(segments, mount) && !startsWith(mount, segments)) continue;
+      if (!options.data) { if (startsWith(segments, mount)) throw new FileAccessError('Sharing data needs access to project settings (project:settings:read).'); continue; }
+      pins.data[resource.id] = resource.revisionId ?? null;
+    }
+    return { pins, node: await this.stat(projectId, relative, { data: options.data, pins }) };
+  }
+
+  private async locate(projectId: string, relative: string, options: FileReadOptions): Promise<{
+    stat: () => Promise<FileNode>; open: <T>(consume: (file: OpenedFile) => Promise<T>) => Promise<T> }> {
+    const segments = splitPath(relative);
+    let manifest: WorkspaceManifest = await this.deps.workspaces.project(projectId);
+    // A snapshot reads its pinned versions, and nothing it does not name.
+    const pins = options.pins;
+    if (pins) manifest = { ...manifest,
+      repositories: manifest.repositories.filter((repository) => pins.repositories[repository.sshUrl])
+        .map((repository) => ({ ...repository, commit: pins.repositories[repository.sshUrl] })),
+      resources: manifest.resources.filter((resource) => resource.id in pins.data).map(({ revisionId: _current, bytes: _bytes, ...resource }) =>
+        ({ ...resource, ...(pins.data[resource.id] ? { revisionId: pins.data[resource.id]! } : {}) })) };
     const mounts: Mount[] = manifest.resources.map((resource) => ({ ...resource, segments: splitPath(resource.path) }))
       .filter((mount) => mount.segments.length > 0);
     const mount = mounts.filter((candidate) => startsWith(segments, candidate.segments))
@@ -133,21 +167,23 @@ export class ProjectFiles {
 
   // ── repositories ──────────────────────────────────────────────────────────
 
-  private async withRepository<T>(projectId: string, repository: WorkspaceManifest['repositories'][number],
+  private async withRepository<T>(projectId: string, repository: PinnedRepository,
     read: (mirror: string, commit: string, source: FileSource) => Promise<T>): Promise<T> {
     const credential = await this.deps.gitCredential(projectId, repository.sshUrl);
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-files-'));
     try {
       const { env } = materializeGitCredential(scratch, credential);
-      return await readMirrored(repository.sshUrl, env, { branch: repository.branch, scratch, scope: credential.mirrorScope, maxAgeMs: TIP_MAX_AGE_MS },
+      return await readMirrored(repository.sshUrl, env, { branch: repository.branch, scratch, scope: credential.mirrorScope, maxAgeMs: TIP_MAX_AGE_MS,
+        ...(repository.commit ? { commit: repository.commit } : {}) },
         (mirror, commit, branch) => read(mirror, commit, { kind: 'repository', name: repository.name, role: repository.role, branch, commit }));
     } catch (error) {
       if (error instanceof FileNotFoundError || error instanceof FileAccessError) throw error;
+      if (error instanceof MirroredCommitMissing) throw new FileNotFoundError(`${repository.name}: ${error.message}`);
       throw new Error(`Couldn’t read ${repository.name}: ${firstLine(error)}`);
     } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
   }
 
-  private gitStat(projectId: string, repository: WorkspaceManifest['repositories'][number], inside: string[], display: string,
+  private gitStat(projectId: string, repository: PinnedRepository, inside: string[], display: string,
     overlay: FileEntry[]): Promise<FileNode> {
     return this.withRepository(projectId, repository, async (mirror, commit, source) => {
       const directory = async (tree: string, version?: string): Promise<FileNode> => ({ path: display, kind: 'directory', source,
@@ -169,7 +205,7 @@ export class ProjectFiles {
     });
   }
 
-  private gitOpen<T>(projectId: string, repository: WorkspaceManifest['repositories'][number], inside: string[], display: string,
+  private gitOpen<T>(projectId: string, repository: PinnedRepository, inside: string[], display: string,
     consume: (file: OpenedFile) => Promise<T>): Promise<T> {
     return this.withRepository(projectId, repository, async (mirror, commit, source) => {
       const entry = inside.length ? await treeEntry(mirror, commit, inside.join('/')) : undefined;

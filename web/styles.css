@@ -4709,7 +4709,11 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 .files-link:hover .files-name { text-decoration: underline; text-underline-offset: 3px; }
 .files-link:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .files-row:hover { background: var(--surface-2); }
-.files-icon { display: inline-flex; flex: none; color: var(--ink-3); }
+.files-icon { position: relative; display: inline-flex; flex: none; width: 16px; height: 16px; color: var(--ink-3); }
+/* An image is its own icon once it loads. */
+.files-thumb { position: absolute; left: -4px; top: -4px; width: 24px; height: 24px; object-fit: cover; border-radius: 4px; }
+.files-icon.has-thumb svg { visibility: hidden; }
+.files-icon.has-thumb .files-thumb { box-shadow: 0 0 0 1px var(--line); background: var(--surface-2); }
 .files-row.kind-directory .files-icon, .files-row.kind-submodule .files-icon { color: var(--accent); }
 .files-row.mount-data .files-icon { color: var(--merged); }
 .files-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-13); }
@@ -4762,3 +4766,23 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
   .files-rendered.md { padding: 14px 16px; }
   .files-file-meta { display: none; }
 }
+
+/* Share a public link (Files ▸ Share). */
+.files-share-dialog { width: min(520px, calc(100vw - 32px)); display: flex; flex-direction: column; gap: 14px; }
+.files-share-dialog::backdrop { background: rgb(0 0 0 / .35); }
+.files-share-head { display: flex; align-items: center; gap: 8px; }
+.files-share-head h2 { margin: 0; font-size: var(--fs-15); font-weight: 650; min-width: 0; overflow-wrap: anywhere; }
+.files-share-head h2 code { font-family: var(--font-mono); font-size: .9em; }
+.files-share-note { margin: 0; color: var(--ink-2); font-size: var(--fs-13); }
+.files-share-link { display: flex; gap: 8px; }
+.files-share-link input { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: var(--fs-12); }
+.files-share-meta { display: flex; align-items: center; gap: 8px; color: var(--ink-3); font-size: var(--fs-12); }
+.files-share-dialog > .btn.primary { align-self: flex-start; }
+.files-share-others summary { cursor: pointer; color: var(--ink-2); font-size: var(--fs-13); }
+.files-share-others ul { list-style: none; margin: 8px 0 0; padding: 0; }
+.files-share-others li { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-family: var(--font-mono); font-size: var(--fs-12); }
+.files-share-others li a { color: var(--ink); text-decoration: none; overflow-wrap: anywhere; }
+.files-share-others li a:hover { text-decoration: underline; }
+/* The public page of a shared snapshot: the Files view, wider than a conversation. */
+.shared-main.shared-files-main { max-width: 1160px; }
+.shared-main.shared-files-main .shared-heading { margin-bottom: 16px; }

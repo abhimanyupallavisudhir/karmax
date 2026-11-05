@@ -109,6 +109,6 @@ export async function projectFilesFixture(cleanups: Array<() => Promise<void> | 
     json(): Promise<any>; text(): Promise<string>; arrayBuffer(): Promise<ArrayBuffer> }> =>
     fetch(`${server.url}/api/projects/${project.id}/files${raw ? '/raw' : ''}?path=${encodeURIComponent(query)}`,
       { headers: { authorization: `Bearer ${token}`, ...headers } });
-  return { owner, dir, store, project, gateway, data, corpus, site, binary, server, get, tokenFor, viewer: await tokenFor(capsOf('viewer') as string[]) };
+  return { owner, resources, dir, store, project, gateway, data, corpus, site, binary, server, get, tokenFor, viewer: await tokenFor(capsOf('viewer') as string[]) };
 }
 
