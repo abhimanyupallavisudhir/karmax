@@ -65,7 +65,7 @@ it("shows a fork's inherited conversation above its own, and finds in it", async
     await page.keyboard.press('Control+f');
     await page.locator('#ck-find-input').fill('heron');
     await expect.poll(() => page.locator('.ck-find-count').innerText()).toBe('1/2');
-    expect(await page.evaluate(() => [...(CSS as any).highlights.get('conversation-search-current')][0].startContainer.parentElement
+    expect(await page.evaluate(() => [...(globalThis as any).CSS.highlights.get('conversation-search-current')][0].startContainer.parentElement
       .closest('[data-conversation-key]').dataset.conversationKey)).toBe(`fork:${source.id}:message:a1`);
     expect(errors).toEqual([]);
   } finally {
