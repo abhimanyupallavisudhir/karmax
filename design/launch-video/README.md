@@ -27,8 +27,18 @@ python3 design/launch-video/edit.py /tmp/demo/take /tmp/demo/tavya-launch.mp4
 ```
 
 The ending zooms into the video a task delivers in its review panel, held on
-its first frame, which is the film's own first frame, so the film loops. Copy
-a render to `/tmp/demo/assets/launch-v1.mp4` and record again for the final cut.
+its first frame, which is the film's own first frame, so the film loops. So a
+final cut is two takes: the first becomes `/tmp/demo/assets/launch-v1.mp4`
+(the delivered video), the second is the film:
+
+```bash
+design/launch-video/record.sh /tmp/demo/takeA && python3 design/launch-video/edit.py /tmp/demo/takeA /tmp/demo/takeA.mp4
+cp /tmp/demo/takeA.mp4 /tmp/demo/assets/launch-v1.mp4
+design/launch-video/record.sh /tmp/demo/takeB && python3 design/launch-video/edit.py /tmp/demo/takeB /tmp/demo/tavya-launch.mp4
+```
+
+A take also seeds, off camera, the logins the vault shows (dummies; the
+United login the flight task asks for) and pretend documents in admin_docs.
 
 ## Pieces
 
@@ -37,8 +47,9 @@ a render to `/tmp/demo/assets/launch-v1.mp4` and record again for the final cut.
 | `fetch.py` | The production snapshot, filtered through the wiki's private list. |
 | `build.sh`, `setup.cjs`, `seed-*.{cjs,py}` | A fresh home: the owner, 16 projects in their folders, every visible task at its real number, the project wiki, the brand icon, a card, Gmail and Search Console accounts to allow, a CLI token. |
 | `script.py` | What each demo agent does and says. The CV, SEO and release-trigger messages mirror real runs (personal-website #7, tavya #821, #822). |
-| `stage.js` | The stage: backdrop, a browser window holding the console, captions, cursor, camera, title card, terminal, checklist. |
-| `director.cjs` | The take. Each `mark(name, speed)` sets the playback speed from there on (waits run ×3–5). |
+| `stage.js` | The stage: backdrop, a browser window holding the console, captions, cursor, camera, title card, terminal, feature grid. |
+| `shots.cjs` | Stills of the real console for the feature grid, taken off camera (cut from the film). |
+| `director.cjs` | The take. Each `mark(name, speed)` sets the playback speed from there on (waits run ×3–5; 0 cuts). |
 | `edit.py`, `music.py` | Frames retimed onto 60 fps H.264; a synthesised music bed. |
 
 ## Safety

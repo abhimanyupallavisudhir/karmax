@@ -472,7 +472,7 @@ S.finale = async () => {
   await F().evaluate(() => {
     const fmt = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     const fix = () => {
-      for (const l of document.querySelectorAll('.fold-label')) if (/^Worked /.test(l.textContent) && l.textContent !== 'Worked 2 h 40 min') l.textContent = 'Worked 2 h 40 min';
+      for (const l of document.querySelectorAll('.fold-label')) if (l.textContent.startsWith('Worked ') && l.textContent !== 'Worked 2 h 40 min') l.textContent = 'Worked 2 h 40 min';
       const you = document.querySelector('.msg.user time');
       if (you && you.dataset.shifted !== you.getAttribute('datetime')) {
         you.textContent = fmt.format(new Date(Date.parse(you.getAttribute('datetime')) - (2 * 3600 + 40 * 60 + 9) * 1000));
