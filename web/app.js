@@ -174,8 +174,6 @@ const S = {
   viewingAttempt: null, // explicit attempt selection; prevents principal auto-redirection
   view: null, // selected task view
   taskTab: null, // open view of the task page ('checkin'|'parameters'|'timing'; null → auto)
-  taskFile: null, // URL-owned agent citation handoff ({ path, line? }); null on the ordinary task page
-  taskFileLoad: null, // { key, status, result|error } for the current handoff page
   checkinSel: null, // selected check-in pane: an agent role, or 'terminal' (null → the stage's agent)
   taskEvents: [],
   approvalRequests: [], // credential decisions for the selected task
@@ -554,8 +552,8 @@ function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
 /** Tabs that belong to the selected project (the router reads them from URLs,
  *  the rail highlights the project, the main pane shows its tab bar). One list
  *  so they never drift apart again. */
-const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'settings'];
-const PROJECT_TAB_COMMANDS = { tasks: 'nav.tasks', queue: 'nav.queue', wiki: 'nav.wiki', settings: 'nav.settings' };
+const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'files', 'wiki', 'settings'];
+const PROJECT_TAB_COMMANDS = { tasks: 'nav.tasks', queue: 'nav.queue', files: 'nav.files', wiki: 'nav.wiki', settings: 'nav.settings' };
 // The query a task list opens with: what needs the signed-in person.
 const DEFAULT_LIST_QUERY = 'for:me -is:archived';
 // Second-segment words that name an organization-level view rather than a project.
@@ -572,6 +570,8 @@ function decodeRoutePart(value, component = false) {
 
 function parseRoute(url) {
   let [pathname, search = ''] = String(url).split('?');
+  // A Files path keeps its own escaping: each segment is one encoded name.
+  const rawSegments = pathname.split('#')[0].split('/').filter(Boolean);
   try { pathname = decodeURI(pathname); } catch {}
   const query = new URLSearchParams(search);
   const q = query.has('q') ? query.get('q') : DEFAULT_LIST_QUERY;
@@ -608,10 +608,13 @@ function parseRoute(url) {
   const taskTab = taskKey ? taskTabOf(seg[4]) : null;
   const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
   const wikiView = tab === 'wiki' ? wikiViewFromQuery(query) : '';
+  const filesPath = tab === 'files' ? rawSegments.slice(3).map((part) => decodeRoutePart(part, true)).join('/') : null;
+  // Which tree Files shows rides in the query, as the wiki's does: ?task=<n> or ?branch=<name>.
+  const filesView = tab === 'files' ? (query.get('task') ? `task:${query.get('task')}` : query.get('branch') ? `branch:${query.get('branch')}` : '') : '';
   // A Task store entry, opened to read before running or installing it.
   const storeKey = seg[2] === 'store' && seg[3] ? seg[3] : null;
   return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab, q, ...(taskFile ? { taskFile } : {}),
-    ...(wikiView ? { wikiView } : {}), ...(storeKey ? { storeKey } : {}) };
+    ...(wikiView ? { wikiView } : {}), ...(storeKey ? { storeKey } : {}), ...(filesPath !== null ? { filesPath, filesView } : {}) };
 }
 
 // Which branch the project wiki shows is part of the page, so it lives in the
@@ -628,6 +631,18 @@ function wikiRoute(pid, view = '', entry = '') {
   const query = kind === 'task' && value ? `?task=${encodeURIComponent(value)}`
     : kind === 'branch' && value ? `?branch=${encodeURIComponent(value)}` : '';
   return `${projectRoute(pid, 'wiki')}${query}${entry ? `#${encodeURIComponent(entry)}` : ''}`;
+}
+
+// A place in the project's Files: /<org>/<project>/files/<path>, each name
+// escaped, in a view: '' (the branches tasks start from), 'task:<n>' or 'branch:<name>'.
+function filesRoute(pid, filePath = '', view = pid === S.projectId ? S.filesView || '' : '') {
+  const parts = String(filePath).split('/').filter(Boolean);
+  return `${projectRoute(pid, 'files')}${parts.length ? `/${parts.map(encodeURIComponent).join('/')}` : ''}${filesViewQuery(view, '?')}`;
+}
+function filesViewQuery(view, lead = '&') {
+  const [kind, ...rest] = String(view || '').split(':');
+  const value = rest.join(':');
+  return (kind === 'task' || kind === 'branch') && value ? `${lead}${kind}=${encodeURIComponent(value)}` : '';
 }
 
 function fileRouteTarget(query) {
@@ -866,6 +881,9 @@ async function applyRoute() {
   if (!routeIsCurrent()) return;
   const tab = r.tab || 'tasks';
   S.wikiView = r.wikiView || '';
+  S.filesFrom = S.tab === 'files' && (S.filesView || '') === (r.filesView || '') ? S.filesPath : null;
+  S.filesPath = r.filesPath || '';
+  S.filesView = r.filesView || '';
   if (!sameProject) {
     // Switching projects: drop the previous project's per-project view state so
     // its query/roving-cursor/search-result can't bleed into the new project
@@ -945,18 +963,16 @@ async function applyRoute() {
     await (listSearch || runSearch().catch(() => {}));
     if (!routeIsCurrent()) return;
   }
+  // An agent's cited file (/tasks/<n>/file?path=…&line=…) opens in Files.
+  if (taskId && r.taskFile) return openCitedFile(taskId, r.taskFile, routeIsCurrent);
   renderRail();
   if (taskId) {
-    const nextTaskFile = r.taskFile || null;
-    if (JSON.stringify(S.taskFile) !== JSON.stringify(nextTaskFile)) S.taskFileLoad = null;
-    S.taskFile = nextTaskFile;
     if (S.selected !== taskId) return openTask(taskId, r.taskTab, r.taskKey === taskId);
     S.viewingAttempt = r.taskKey === taskId ? taskId : null;
     if (r.taskTab) S.taskTab = r.taskTab;
     showDraftPage(taskId);
     return renderTaskPage();
   }
-  S.taskFile = null;
   if (canPaintCachedProject && tab !== 'tasks') return;
   renderMain();
   if (tab === 'activity') seedActivity();
@@ -4355,7 +4371,7 @@ function paintMarkdownSurface(el) {
 
 // The TeX button beside every conversation message and Markdown preview.
 function texToggleHtml(disabled = false) {
-  return `<button type="button" class="tex-toggle" aria-label="Typeset math" aria-pressed="${mathjaxEnabled()}" title="${disabled ? 'Enable Markdown in Appearance to typeset math' : 'Typeset math everywhere'}" ${disabled ? 'disabled' : ''}><span class="tex-mark" aria-hidden="true">T<span>E</span>X</span></button>`;
+  return `<button type="button" class="tex-toggle" aria-label="TeX: typeset math" aria-pressed="${mathjaxEnabled()}" title="${disabled ? 'Enable Markdown in Appearance to typeset math' : 'Typeset math everywhere'}" ${disabled ? 'disabled' : ''}><span class="tex-mark" aria-hidden="true">T<span>E</span>X</span></button>`;
 }
 function wireTexToggles(root) {
   root?.querySelectorAll('.tex-toggle').forEach((btn) => {
@@ -6691,12 +6707,15 @@ function renderMain() {
   // the async rehydrate). Navigation still repaints — it changes S.tab or
   // clears S.wikiEditing first.
   if ((S.tab === 'wiki' || S.tab === 'orgwiki') && S.wikiEditing && $('#wiki-path')) return;
+  // The Files page shown is already this place: a background refresh must not
+  // repaint (and re-highlight) an open file or lose its scroll.
+  if (S.tab === 'files' && filesPageShows(S.projectId, S.filesPath)) return;
   const proj = S.projects.find((p) => p.id === S.projectId);
   // Activity remains available by direct URL for debugging, but is deliberately
   // absent from user-facing navigation.
-  const tabs = ['tasks', 'queue', 'wiki', 'settings'];
+  const tabs = ['tasks', 'queue', 'files', 'wiki', 'settings'];
   // On a phone "Project settings" is "Settings": the top bar names the project.
-  const labels = { tasks: 'Tasks', queue: 'Queues', wiki: 'Wiki', settings: '<span class="tab-wide">Project settings</span><span class="tab-narrow">Settings</span>' };
+  const labels = { tasks: 'Tasks', queue: 'Queues', files: 'Files', wiki: 'Wiki', settings: '<span class="tab-wide">Project settings</span><span class="tab-narrow">Settings</span>' };
   const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
@@ -6712,6 +6731,7 @@ function renderMain() {
   else if (S.tab === 'organization') content = organizationView();
   else if (S.tab === 'installation') content = installationView();
   else if (S.tab === 'wiki') content = wikiView(proj);
+  else if (S.tab === 'files') content = filesView(proj);
   else if (S.tab === 'orgwiki') content = wikiView(null);
   else if (S.tab === 'profile') content = profileView();
   else if (S.tab === 'settings') content = settingsView(proj);
@@ -6728,6 +6748,7 @@ function renderMain() {
   if (isTaskListTab()) wireTasksView();
   if (S.tab === 'queue') wireQueueView();
   if (S.tab === 'wiki') wireWikiView(proj);
+  if (S.tab === 'files') wireFilesView(proj);
   if (S.tab === 'orgwiki') wireWikiView(null);
   if (S.tab === 'settings') wireSettingsView(proj);
   if (S.tab === 'global') wireGlobalSettings();
@@ -11023,8 +11044,6 @@ function closeTaskDom() {
   S.view = null;
   S.attemptGroup = null;
   S.taskTab = null;
-  S.taskFile = null;
-  S.taskFileLoad = null;
   S.checkinSel = null;
   S.conversationFullscreen = false;
   S.liveOutput = {}; // drop any streamed live text so it can't reappear on the next task page
@@ -11109,86 +11128,22 @@ function wireTaskOrg(v) {
   wireOrgEditor($('#main'), rec, { ensureId: async () => v.taskId, afterChange: renderTaskPage });
 }
 
-function taskFileKey(v, target) {
-  return `${v.taskId}\n${target.path}\n${target.line || ''}\n${hostLocal() ? 'host' : 'portable'}`;
-}
-
-function citedFileName(target) {
-  return String(target.path || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'File';
-}
-
-function vscodeFileUrl(file, line) {
-  const normalized = String(file).replace(/\\/g, '/');
-  const encoded = normalized.split('/').map(encodeURIComponent).join('/');
-  return `vscode://file${encoded.startsWith('/') ? '' : '/'}${encoded}${line ? `:${line}` : ''}`;
-}
-
-function fileHandoffResultHtml(state, target) {
-  if (!state || state.status === 'loading') return `<div class="fh-status" role="status" aria-busy="true">
-    <span class="fh-pulse" aria-hidden="true"></span><div><b>${hostLocal() ? 'Preparing a local checkout' : 'Preparing checkout instructions'}</b>
-    <span>${hostLocal() ? 'The task branch is crossing the Git handoff boundary. Existing clean checkouts are reused.' : 'Resolving the cited world path to its repository and task branch.'}</span></div></div>`;
-  if (state.status === 'error') return `<div class="fh-status error" role="alert"><span class="fh-mark">!</span><div><b>Couldn’t prepare this file</b>
-    <span>${esc(state.error)}</span><button class="btn sm" id="fh-retry">Try again</button></div></div>`;
-  const result = state.result;
-  if (hostLocal()) return `<div class="fh-status ready"><span class="fh-mark">✓</span><div><b>${result.materialized ? 'Checkout materialized' : 'File found locally'}</b>
-      <span>The world remains isolated; this path is the host-side checkout.</span></div></div>
-    <div class="fh-command"><div><span>Local file</span><code>${esc(result.path)}${target.line ? `:${target.line}` : ''}</code></div>
-      <div class="fh-actions"><a class="btn sm primary" href="${esc(vscodeFileUrl(result.path, target.line))}">Open in VS Code</a>
-      <button class="btn sm fh-copy" data-value="${esc(result.command)}">${ICON.copy} Copy command</button></div></div>`;
-  return `<div class="fh-status ready"><span class="fh-mark">↧</span><div><b>Ready to materialize on your computer</b>
-      <span>Run this from the folder where you keep working copies. It clones once, fast-forwards a clean checkout thereafter, and opens the cited line.</span></div></div>
-    <div class="fh-command"><div><span>Checkout + open</span><code>${esc(result.workspace)}/${esc(result.file.repository)}/${esc(result.file.relativePath)}${target.line ? `:${target.line}` : ''}</code></div>
-      <button class="btn sm primary fh-copy" data-value="${esc(result.openScript)}">${ICON.copy} Copy checkout-and-open script</button></div>
-    <pre class="raw fh-script">${esc(result.openScript)}</pre>`;
-}
-
-function renderTaskFilePage(v, target) {
-  const main = $('#main');
-  if (!main) return;
-  const key = taskFileKey(v, target);
-  const state = S.taskFileLoad?.key === key ? S.taskFileLoad : null;
-  const back = `${taskUrl(v.taskId)}/checkin`;
-  main.innerHTML = `<div class="task-file-page">
-    <header class="fh-head"><a class="fh-back" data-spa href="${esc(back)}">← Conversation</a>
-      <span class="fh-kicker">Agent file handoff${v.num != null ? ` · Task #${v.num}` : ''}</span>
-      <h1>${esc(citedFileName(target))}</h1>
-      <p>${esc(target.path)}${target.line ? `<span>:${target.line}</span>` : ''}</p></header>
-    <main class="fh-body">
-      <div class="fh-rail" aria-label="File handoff progress">
-        <div class="done"><i>1</i><span>Task world</span></div><b></b>
-        <div class="${state?.status === 'ready' ? 'done' : 'current'}"><i>2</i><span>Local checkout</span></div><b></b>
-        <div class="${state?.status === 'ready' ? 'current' : ''}"><i>3</i><span>Editor</span></div>
-      </div>
-      <section class="fh-panel">${fileHandoffResultHtml(state, target)}</section>
-      <p class="fh-footnote">This permalink is scoped to this task. ${siteNameMarkup()} resolves the agent’s world path server-side and refuses paths outside the task repositories.</p>
-    </main></div>`;
-  $('#fh-retry')?.addEventListener('click', () => { S.taskFileLoad = null; renderTaskFilePage(v, target); });
-  main.querySelectorAll('.fh-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
-    const label = button.innerHTML; button.textContent = '✓ Copied'; setTimeout(() => { button.innerHTML = label; }, 1200);
-  })));
-  if (!state) hydrateTaskFilePage(v, target, key);
-}
-
-async function hydrateTaskFilePage(v, target, key) {
-  S.taskFileLoad = { key, status: 'loading' };
+// A file an agent cited (/tasks/<n>/file?path=…&line=…) opens in Files, in
+// its task's view (live while the task runs, else as last saved), at the line.
+// The server places the path (absolute in the world, or relative to the
+// agent's working folder); one it cannot place goes back to the task, saying why.
+async function openCitedFile(taskId, target, routeIsCurrent = () => true) {
+  const name = String(target.path || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'file';
+  renderRouteLoadingPage(name, 'Opening…');
   try {
-    const endpoint = hostLocal() ? 'open-command' : 'file-checkout';
-    const result = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/${endpoint}`, {
-      method: 'POST', body: JSON.stringify(target),
-    });
-    if (taskFileKey(v, target) !== key || S.taskFileLoad?.key !== key) return;
-    // A wiki file is shown in the wiki itself, on this task's branch.
-    if (result.wiki) {
-      S.taskFileLoad = null;
-      if (S.selected !== v.taskId || !S.taskFile) return;
-      return go(wikiRoute(taskRecord(v.taskId)?.projectId || S.projectId, `task:${v.num ?? v.taskId}`, result.wiki.path), { replace: true });
-    }
-    S.taskFileLoad = { key, status: 'ready', result };
+    const found = await api(`/api/tasks/${encodeURIComponent(taskId)}/file-location?path=${encodeURIComponent(target.path)}`);
+    if (!routeIsCurrent()) return;
+    return go(`${filesRoute(found.projectId, found.path, `task:${found.num ?? found.taskId}`)}${target.line ? `#L${target.line}` : ''}`, { replace: true });
   } catch (error) {
-    if (taskFileKey(v, target) !== key || S.taskFileLoad?.key !== key) return;
-    S.taskFileLoad = { key, status: 'error', error: error.message };
+    if (!routeIsCurrent()) return;
+    toast(plainError(error.message), true);
+    return go(taskUrl(taskId), { replace: true });
   }
-  if (S.selected === v.taskId && S.taskFile && taskFileKey(v, S.taskFile) === key) renderTaskFilePage(v, target);
 }
 
 // Type-to-add tag combobox: filter existing tags as you type; a non-matching entry
@@ -11463,7 +11418,6 @@ function renderTaskPage() {
   const v = S.view;
   const main = $('#main');
   if (!v || !main) return;
-  if (S.taskFile) return renderTaskFilePage(v, S.taskFile);
   if (S.taskTab === 'timing' && !S.meta?.timingEnabled) S.taskTab = null;
   if (!S.taskTab) S.taskTab = defaultTaskTab(v); // resolved once at open; never auto-switches under the user
   const tab = S.taskTab;
@@ -14018,7 +13972,7 @@ function worldWikiHref(target, v) {
 
 function worldFileAnchor(href) {
   const wiki = !/\/tasks\/[^/]+\/file\?/.test(href);
-  return `<a href="${esc(href)}" class="world-file-link" target="_blank" rel="noopener" title="${wiki ? 'Open in the wiki' : 'Open this file from its task workspace'}">`;
+  return `<a href="${esc(href)}" class="world-file-link" target="_blank" rel="noopener" title="${wiki ? 'Open in the wiki' : 'Open in Files'}">`;
 }
 
 function decodeMarkdownAttribute(value) {
@@ -14030,6 +13984,10 @@ function decodeMarkdownAttribute(value) {
 // Markdown mode renders anchors itself; replace in-world targets afterwards.
 // Relative links ride in data-md-local, while absolute links retain their href.
 function annotateWorldFileLinks(html, v = S.view) {
+  // An image the agent cites by path is read from its task's world (Files' task view).
+  const projectId = v?.taskId ? taskRecord(v.taskId)?.projectId || v.projectId : null;
+  if (projectId) html = String(html).replace(/<img data-md-src="([^"]*)"/g, (whole, src) =>
+    `<img src="${esc(`/api/projects/${encodeURIComponent(projectId)}/files/raw?task=${encodeURIComponent(v.num ?? v.taskId)}&cited=1&path=${encodeURIComponent(decodeMarkdownAttribute(src))}`)}" data-md-src="${src}"`);
   return String(html).replace(/<a href="([^"]*)"([^>]*)>/g, (anchor, href, attrs) => {
     const local = attrs.match(/\sdata-md-local="([^"]*)"/);
     const fileUrl = worldFileHref(decodeMarkdownAttribute(local ? local[1] : href), v);
@@ -18892,6 +18850,340 @@ function confirmAvatar() {
   });
 }
 
+// ── Files (wiki features/project-files) ─────────────────────────────────────
+// The project as one tree, laid out as a task's world: a folder per repository
+// (the branch tasks start from), the project wiki, and data where it is
+// mounted. An address bar (breadcrumbs; click or `g l` to type a path), folder
+// listings with image thumbnails, a view for any text file (code coloured,
+// Markdown and CSV rendered), images, media and PDFs (web/file-view.js, shared
+// with the public page of a shared snapshot), and Share for a public link.
+const FV = globalThis.KarmaxFileView;
+
+function filesApi(pid, filePath, raw = false, download = false, view = S.filesView) {
+  return `/api/projects/${encodeURIComponent(pid)}/files${raw ? '/raw' : ''}?path=${encodeURIComponent(filePath)}${filesViewQuery(view)}${download ? '&download=1' : ''}`;
+}
+function filesState() { return (S.files ||= { cache: new Map(), sharing: new Map(), views: new Map() }); }
+function filesPageShows(pid, filePath, view = S.filesView) {
+  const page = $('#files-page');
+  return !!page && page.dataset.project === pid && page.dataset.path === (filePath || '') && page.dataset.view === (view || '');
+}
+
+function filesView(proj) {
+  if (!proj) return '<div class="empty">No project.</div>';
+  const filePath = S.filesPath || '';
+  const parts = FV.parts(filePath);
+  const sharing = filesState().sharing.get(proj.id);
+  const view = S.filesView || '';
+  return `<div class="files-page" id="files-page" data-project="${esc(proj.id)}" data-path="${esc(filePath)}" data-view="${esc(view)}">
+    <div class="files-bar">
+      <button type="button" class="files-view-button" id="files-view" aria-haspopup="listbox" title="Show another branch, or a task’s files">${filesViewLabelHtml(proj.id, view)}</button>
+      <a class="btn sm icon files-up${parts.length ? '' : ' disabled'}" data-spa href="${esc(filesRoute(proj.id, FV.parent(filePath)))}" aria-label="Up a folder" title="Up a folder (Backspace)"${parts.length ? '' : ' aria-disabled="true" tabindex="-1"'}>${FV.ICONS.up}</a>
+      <div class="files-address" id="files-address" title="Click to type a path (g l)">${filesCrumbsHtml(proj, parts)}</div>
+      <span class="files-source" id="files-source"></span>
+      <button type="button" class="btn sm icon files-share" id="files-share" data-tool="Share" title="Share a public link" aria-label="Share"${sharing?.canShare && !view ? '' : ' hidden'}>${FV.ICONS.share}</button>
+    </div>
+    <div class="files-body" id="files-body"><div class="files-status" role="status" aria-busy="true">Loading…</div></div>
+  </div>`;
+}
+
+function filesCrumbsHtml(proj, parts) {
+  const crumbs = [`<a class="files-crumb files-crumb-root" data-spa href="${esc(filesRoute(proj.id))}">${esc(projectSlug(proj))}</a>`];
+  // (Each crumb keeps the view: filesRoute carries it.)
+  parts.forEach((part, i) => crumbs.push(`<span class="files-sep" aria-hidden="true">/</span><a class="files-crumb" data-spa href="${esc(filesRoute(proj.id, parts.slice(0, i + 1).join('/')))}"${i === parts.length - 1 ? ' aria-current="page"' : ''}>${esc(part)}</a>`));
+  return `<nav class="files-crumbs" aria-label="Path">${crumbs.join('')}</nav>`;
+}
+
+// The address bar becomes a text field: Enter goes there, Esc (or leaving it) puts the breadcrumbs back.
+function editFilesAddress() {
+  const bar = $('#files-address');
+  const page = $('#files-page');
+  if (!bar || !page || bar.querySelector('input')) return bar?.querySelector('input')?.focus();
+  const pid = page.dataset.project;
+  const current = page.dataset.path || '';
+  const crumbs = bar.innerHTML;
+  bar.classList.add('editing');
+  bar.innerHTML = `<input id="files-path-input" class="files-path-input" spellcheck="false" autocomplete="off" aria-label="Path" list="files-path-options" value="${esc(current)}" placeholder="repository/folder/file"><datalist id="files-path-options"></datalist>`;
+  const input = bar.querySelector('input');
+  const options = bar.querySelector('datalist');
+  let restored = false, timer = 0, asked = null;
+  const restore = () => { if (restored) return; restored = true; bar.classList.remove('editing'); bar.innerHTML = crumbs; };
+  // Suggest what the folder being typed holds.
+  const suggest = async () => {
+    const value = input.value.replace(/^\/+/, '');
+    const dir = value.includes('/') ? value.slice(0, value.lastIndexOf('/')) : '';
+    if (dir === asked) return;
+    asked = dir;
+    const node = await filesLoad(pid, dir).catch(() => null);
+    if (restored || asked !== dir || node?.kind !== 'directory') return;
+    options.innerHTML = (node.entries || []).slice(0, 200).map((entry) =>
+      `<option value="${esc(FV.join(dir, entry.name))}${entry.kind === 'directory' ? '/' : ''}"></option>`).join('');
+  };
+  input.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(suggest, 120); });
+  input.addEventListener('keydown', (event) => {
+    event.stopPropagation();
+    if (event.key === 'Escape') { event.preventDefault(); restore(); }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      const target = FV.resolve('', input.value.trim());
+      restored = true;
+      go(filesRoute(pid, target ?? ''));
+    }
+  });
+  input.addEventListener('blur', () => setTimeout(restore, 150));
+  input.focus();
+  input.select();
+  suggest();
+}
+
+// A place's node, from this tab's cache while fresh, else from the server.
+// Folders and file facts only: bytes come from `/raw`.
+async function filesLoad(pid, filePath, { fresh = false, view = S.filesView } = {}) {
+  const state = filesState();
+  const key = `${pid}\n${view || ''}\n${filePath}`;
+  const cached = state.cache.get(key);
+  if (!fresh && cached && Date.now() - cached.at < 30_000) return cached.node;
+  const node = await api(filesApi(pid, filePath, false, false, view));
+  // A running task's files change under you: never kept.
+  if (node.view?.mode === 'live') return node;
+  if (state.cache.size >= 300) state.cache.delete(state.cache.keys().next().value);
+  state.cache.set(key, { node, at: Date.now() });
+  return node;
+}
+
+// Backspace goes up a folder wherever the focus is on the Files page (not in a field or dialog).
+function installFilesKeys() {
+  if (installFilesKeys.done) return;
+  installFilesKeys.done = true;
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Backspace' || event.metaKey || event.ctrlKey || event.altKey || event.defaultPrevented) return;
+    const page = $('#files-page');
+    if (S.tab !== 'files' || !page || !page.dataset.path || document.querySelector('dialog[open]')) return;
+    if (event.target.closest?.('input, textarea, select, [contenteditable], dialog, .modal-overlay')) return;
+    event.preventDefault();
+    go(filesRoute(page.dataset.project, FV.parent(page.dataset.path)));
+  });
+}
+
+async function wireFilesView(proj) {
+  if (!proj) return;
+  const pid = proj.id;
+  const filePath = S.filesPath || '';
+  const bar = $('#files-address');
+  // A long path keeps its last names in view.
+  if (bar) bar.scrollLeft = bar.scrollWidth;
+  bar?.addEventListener('click', (event) => { if (!event.target.closest('a, input')) editFilesAddress(); });
+  $('#files-share')?.addEventListener('click', () => openFilesShare(pid, filePath));
+  $('#files-view')?.addEventListener('click', () => openFilesViewPicker(pid));
+  installFilesKeys();
+  const shows = () => filesPageShows(pid, filePath) && S.tab === 'files';
+  // Whether you may share here: asked once per project, then the button shows.
+  const sharing = filesState().sharing;
+  if (!sharing.has(pid)) {
+    sharing.set(pid, null);
+    api(`/api/projects/${encodeURIComponent(pid)}/file-shares?path=`).then((state) => {
+      sharing.set(pid, { canShare: !!state.canShare });
+      if (state.canShare && !S.filesView && filesPageShows(pid, $('#files-page')?.dataset.path ?? '')) $('#files-share')?.removeAttribute('hidden');
+    }, () => sharing.delete(pid));
+  }
+  let node;
+  try { node = await filesLoad(pid, filePath); }
+  catch (error) {
+    if (!shows()) return;
+    $('#files-body').innerHTML = `<div class="files-status error" role="alert"><span>${esc(plainError(error.message))}</span>
+      <button class="btn sm" id="files-retry">Try again</button></div>`;
+    $('#files-retry')?.addEventListener('click', () => { filesState().cache.clear(); $('#files-page').dataset.path = '\u0000'; renderMain(); });
+    return;
+  }
+  if (!shows()) return;
+  $('#files-source').innerHTML = FV.sourceHtml(node.source);
+  if (node.view) { S.filesViewInfo = { ...S.filesViewInfo, [`${pid}\n${S.filesView}`]: node.view }; $('#files-view').innerHTML = filesViewLabelHtml(pid, S.filesView); }
+  // Arriving from a subfolder: its row gets the focus, so ↑/↓ carry on from there.
+  const from = S.filesFrom && FV.parent(S.filesFrom) === node.path ? FV.parts(S.filesFrom).pop() : null;
+  FV.render($('#files-body'), node, {
+    href: (where) => filesRoute(pid, where), link: ' data-spa', raw: (where, download) => filesApi(pid, where, true, download),
+    from, emptyRoot: 'This project has no repositories or data yet.', shows,
+    fetch: (url) => feedbackFetch(url, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} }),
+    markdown: (el, text, after) => mountMarkdownSurface(el, (math) => renderMarkdown(text, { math }), after),
+    markdownTools: texToggleHtml(), wireTools: wireTexToggles,
+    copy: (text) => copyToClipboard(text).then(() => toast('Copied')), errorText: plainError,
+  });
+}
+
+// ── Files: which tree (the view picker) ──
+// Default: the branches tasks start from. A branch: each repository on it
+// where it has one, else its default. A task: its world, live while it runs,
+// else as last saved (each checkout's commit plus its uncommitted files).
+function filesViewLabelHtml(pid, view) {
+  const info = S.filesViewInfo?.[`${pid}\n${view || ''}`];
+  const [kind, ...rest] = String(view || '').split(':');
+  const value = rest.join(':');
+  const branchIcon = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="8" r="2.5"/><path d="M6 8.5v7"/><path d="M18 10.5c0 4-6 3-11 5.5"/></svg>';
+  const caret = '<span class="files-view-caret" aria-hidden="true">▾</span>';
+  if (kind === 'task') {
+    const task = (S.tasks || []).find((t) => t.projectId === pid && (String(t.num) === value || t.id === value));
+    const mode = info?.mode === 'live' ? '<span class="files-view-state live" title="Running: what its agent has written so far">Live</span>'
+      : info?.mode === 'saved' ? `<span class="files-view-state" title="As it was when the task last paused">${esc(relativeTimeShort(info.savedAt))}</span>`
+        : info?.mode === 'published' ? '<span class="files-view-state" title="Not saved yet: its branch as pushed to GitHub">On GitHub</span>' : '';
+    return `${FV.ICONS.directory}<span class="files-view-name">#${esc(value)} ${esc(info?.title || task?.title || '')}</span>${mode}${caret}`;
+  }
+  if (kind === 'branch') return `${branchIcon}<span class="files-view-name">${esc(value)}</span>${caret}`;
+  const views = filesState().views.get(pid)?.data;
+  const defaults = [...new Set((views?.repositories || []).filter((r) => r.role !== 'project-wiki').map((r) => r.default))];
+  return `${branchIcon}<span class="files-view-name">${esc(defaults.length === 1 ? defaults[0] : 'Default branches')}</span>${caret}`;
+}
+
+function relativeTimeShort(at) {
+  if (!at) return 'Saved';
+  const minutes = Math.round((Date.now() - at) / 60_000);
+  return minutes < 1 ? 'Saved just now' : minutes < 60 ? `Saved ${minutes} min ago` : minutes < 1440 ? `Saved ${Math.round(minutes / 60)} h ago`
+    : `Saved ${new Date(at).toLocaleDateString()}`;
+}
+
+// The branches and tasks to choose from: read once a minute at most.
+async function filesViews(pid) {
+  const views = filesState().views;
+  const entry = views.get(pid);
+  if (entry?.data && Date.now() - entry.at < 60_000) return entry.data;
+  if (entry?.pending) return entry.pending;
+  const pending = api(`/api/projects/${encodeURIComponent(pid)}/files/views`).then((data) => {
+    views.set(pid, { data, at: Date.now() });
+    return data;
+  }, (error) => { views.delete(pid); throw error; });
+  views.set(pid, { ...entry, pending });
+  return pending;
+}
+
+// One searchable list: the default, tasks (running ones marked), then
+// branches; ↑/↓ move, Enter picks, Esc closes; typing filters.
+async function openFilesViewPicker(pid) {
+  const button = $('#files-view');
+  if (!button || $('#files-view-menu')) return $('#files-view-menu input')?.focus();
+  const menu = document.createElement('div');
+  menu.id = 'files-view-menu';
+  menu.className = 'files-view-menu';
+  menu.setAttribute('role', 'dialog');
+  menu.setAttribute('aria-label', 'Show');
+  menu.innerHTML = `<input type="search" placeholder="Find a task or branch" aria-label="Find a task or branch" autocomplete="off" spellcheck="false">
+    <ul role="listbox" aria-label="Views"><li class="files-view-note">Loading…</li></ul>`;
+  button.closest('.files-bar').appendChild(menu);
+  button.setAttribute('aria-expanded', 'true');
+  const input = menu.querySelector('input');
+  const list = menu.querySelector('ul');
+  let options = [], active = 0;
+  const close = () => { menu.remove(); button.setAttribute('aria-expanded', 'false'); document.removeEventListener('pointerdown', outside, true); };
+  const outside = (event) => { if (!menu.contains(event.target) && event.target !== button && !button.contains(event.target)) close(); };
+  document.addEventListener('pointerdown', outside, true);
+  const pick = (value) => { close(); go(filesRoute(pid, S.filesPath, value)); };
+  const paint = () => {
+    const query = input.value.trim().toLowerCase();
+    const shown = options.filter((option) => !query || option.search.includes(query));
+    active = Math.min(active, Math.max(0, shown.length - 1));
+    let group = '';
+    list.innerHTML = shown.map((option, i) => {
+      const head = option.group !== group ? `<li class="files-view-group" role="presentation">${esc((group = option.group))}</li>` : '';
+      return `${head}<li role="option" data-i="${i}" aria-selected="${i === active}" class="${option.value === (S.filesView || '') ? 'current' : ''}">
+        <span class="files-view-option">${option.html}</span>${option.note ? `<span class="files-view-note">${esc(option.note)}</span>` : ''}</li>`;
+    }).join('') || '<li class="files-view-note">Nothing matches</li>';
+    list.querySelectorAll('[role="option"]').forEach((row) => {
+      row.addEventListener('click', () => pick(shown[Number(row.dataset.i)].value));
+      row.addEventListener('pointermove', () => { if (active !== Number(row.dataset.i)) { active = Number(row.dataset.i); paint(); } });
+    });
+    list.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' });
+    menu.shown = shown;
+  };
+  input.addEventListener('input', () => { active = 0; paint(); });
+  input.addEventListener('keydown', (event) => {
+    event.stopPropagation();
+    const shown = menu.shown || [];
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); active = (active + (event.key === 'ArrowDown' ? 1 : -1) + shown.length) % Math.max(1, shown.length); paint(); }
+    else if (event.key === 'Enter' && shown[active]) { event.preventDefault(); pick(shown[active].value); }
+    else if (event.key === 'Escape') { event.preventDefault(); close(); button.focus(); }
+  });
+  input.focus();
+  try {
+    const views = await filesViews(pid);
+    if (!menu.isConnected) return;
+    const defaults = [...new Set((views.repositories || []).filter((r) => r.role !== 'project-wiki').map((r) => r.default))];
+    const repos = (views.repositories || []).filter((r) => r.role !== 'project-wiki');
+    const branches = new Map();
+    for (const repo of repos) for (const branch of repo.branches) branches.set(branch, [...(branches.get(branch) || []), repo.name]);
+    options = [
+      { group: 'Default', value: '', search: `${defaults.join(' ')} default`.toLowerCase(), html: esc(defaults.length === 1 ? defaults[0] : 'Default branches'), note: 'Where new tasks start' },
+      ...(views.tasks || []).map((task) => ({ group: 'Tasks', value: `task:${task.num ?? task.id}`, search: `#${task.num} ${task.title} ${task.branch || ''}`.toLowerCase(),
+        html: `<span class="files-view-num">#${esc(task.num ?? '')}</span> ${esc(task.title)}${task.live ? ' <span class="files-view-state live">Live</span>' : ''}` })),
+      ...[...branches].filter(([branch]) => !(defaults.length === 1 && branch === defaults[0]) && !/^tavya\/task_|^karmax\/task_/.test(branch))
+        .map(([branch, inRepos]) => ({ group: 'Branches', value: `branch:${branch}`, search: branch.toLowerCase(), html: esc(branch),
+          note: repos.length > 1 && inRepos.length < repos.length ? inRepos.join(', ') : '' })),
+    ];
+    if (views.error) options.push({ group: 'Branches', value: S.filesView || '', search: '', html: `<span class="files-view-note">${esc(plainError(views.error))}</span>` });
+    active = Math.max(0, options.findIndex((option) => option.value === (S.filesView || '')));
+    paint();
+    const label = $('#files-view');
+    if (label) label.innerHTML = filesViewLabelHtml(pid, S.filesView);
+  } catch (error) {
+    if (menu.isConnected) list.innerHTML = `<li class="files-view-note">${esc(plainError(error.message))}</li>`;
+  }
+}
+
+// A public link to a snapshot of this file or folder (the same organization and
+// project setting as shared conversations), and the project's other links.
+async function openFilesShare(pid, filePath) {
+  const endpoint = `/api/projects/${encodeURIComponent(pid)}/file-shares?path=${encodeURIComponent(filePath)}`;
+  const name = FV.parts(filePath).pop() || projectSlug(projectById(pid)) || 'project';
+  let state, all;
+  try { [state, all] = await Promise.all([api(endpoint), api(`/api/projects/${encodeURIComponent(pid)}/file-shares`)]); }
+  catch (error) { return toast(plainError(error.message), true); }
+  const previousFocus = document.activeElement;
+  const dialog = document.createElement('dialog');
+  dialog.className = 'modal-card files-share-dialog';
+  dialog.setAttribute('aria-labelledby', 'files-share-title');
+  const draw = () => {
+    const settings = state.settings;
+    const settingsUrl = settings?.scope === 'organization'
+      ? `${globalRoute('organization', organizationById(settings.id))}#organization-conversation-sharing`
+      : `${projectRoute(settings?.id, 'settings')}#project-conversation-sharing`;
+    const blocked = !state.enabled ? `<p class="files-share-note" role="status">Public links are off for this ${esc(settings?.scope || 'project')}. ${settings?.canManage
+      ? `<a data-spa data-sharing-settings href="${esc(settingsUrl)}">Turn them on</a>` : `Ask ${settings?.scope === 'organization' ? 'an organization' : 'a project'} administrator to turn them on.`}</p>` : '';
+    const link = state.url ? new URL(state.url, location.origin).href : '';
+    const others = (all?.shares || []).filter((share) => share.path !== filePath);
+    dialog.innerHTML = `<header class="files-share-head"><h2 id="files-share-title">Share <code>${esc(name)}</code></h2>
+        ${policyTip('Anyone with the link can read this as it is now, without signing in. Later changes don’t reach it; share again for a newer copy.')}
+        <span class="files-spacer"></span><button class="icon-btn" data-close aria-label="Close" title="Close (Esc)">${ICON.close}</button></header>
+      ${blocked}
+      ${state.url ? `<div class="files-share-link"><input data-link readonly value="${esc(link)}" aria-label="Public link">
+          <button class="btn sm primary" data-copy>Copy</button></div>
+        <div class="files-share-meta"><span>Snapshot of ${esc(new Date(state.createdAt).toLocaleString())}</span><span class="files-spacer"></span>
+          <a class="btn sm" href="${esc(state.url)}" target="_blank" rel="noopener noreferrer">Open</a><button class="btn sm danger" data-revoke>Stop sharing</button></div>`
+        : `<button class="btn primary" data-create data-submit ${state.enabled ? '' : 'disabled'}>Create public link</button>`}
+      ${others.length ? `<details class="files-share-others"><summary>Other links in this project (${others.length})</summary><ul>${others.map((share) =>
+        `<li><a data-spa href="${esc(filesRoute(pid, share.path))}" data-goto>${esc(share.path || projectSlug(projectById(pid)))}</a><span class="files-spacer"></span>
+          <a href="${esc(share.url)}" target="_blank" rel="noopener noreferrer" title="Open the public page">↗</a>
+          <button class="icon-btn" data-revoke-other="${esc(share.path)}" aria-label="Stop sharing ${esc(share.path)}" title="Stop sharing">${ICON.close}</button></li>`).join('')}</ul></details>` : ''}`;
+    dialog.querySelector('[data-close]').onclick = () => dialog.close();
+    dialog.querySelectorAll('[data-sharing-settings], [data-goto]').forEach((anchor) => anchor.addEventListener('click', () => dialog.close()));
+    dialog.querySelector('[data-copy]')?.addEventListener('click', () => copyToClipboard(link).then(() => toast('Link copied'), () => dialog.querySelector('[data-link]').select()));
+    const mutate = async (button, method, target = filePath) => {
+      button.disabled = true;
+      try {
+        await api(`/api/projects/${encodeURIComponent(pid)}/file-shares?path=${encodeURIComponent(target)}`, { method });
+        [state, all] = await Promise.all([api(endpoint), api(`/api/projects/${encodeURIComponent(pid)}/file-shares`)]);
+        draw();
+        if (method === 'POST') dialog.querySelector('[data-copy]')?.focus();
+      } catch (error) { button.disabled = false; toast(plainError(error.message), true); }
+    };
+    dialog.querySelector('[data-create]')?.addEventListener('click', (event) => mutate(event.currentTarget, 'POST'));
+    dialog.querySelector('[data-revoke]')?.addEventListener('click', (event) => mutate(event.currentTarget, 'DELETE'));
+    dialog.querySelectorAll('[data-revoke-other]').forEach((button) => button.addEventListener('click', () => mutate(button, 'DELETE', button.dataset.revokeOther)));
+  };
+  draw();
+  dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.close(); });
+  dialog.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); dialog.close(); } });
+  dialog.addEventListener('close', () => { dialog.remove(); if (previousFocus?.isConnected) previousFocus.focus(); }, { once: true });
+  document.body.appendChild(dialog);
+  dialog.showModal();
+  (dialog.querySelector('[data-copy], [data-create]:not([disabled])') || dialog.querySelector('[data-close]')).focus();
+}
+
 function wikiScopeInfo(proj) {
   if (proj) return { scope: 'project', id: proj.id, title: proj.name, base: `/api/projects/${encodeURIComponent(proj.id)}/wiki`,
     view: S.wikiView || '' };
@@ -19611,11 +19903,18 @@ function wireWikiPathEditor(el, warnEl, kindOf) {
 // mdInline for scheme-less targets) address other wiki pages by path — route
 // them through the wiki view rather than leaving them inert.
 // Each becomes a link to the entry's URL, so it opens in a new tab too.
-function wireWikiLocalLinks(root, proj) {
+function wireWikiLocalLinks(root, proj, page = '') {
   root?.querySelectorAll('a[data-md-local]').forEach((a) => {
     const path = (a.dataset.mdLocal || '').replace(/^\.?\//, '').replace(/[?#].*$/, '').replace(/\/+$/, '');
     a.href = wikiEntryHref(path);
     a.addEventListener('click', plainClick(() => openWikiEntry(proj, path)));
+  });
+  // An image a page shows sits in the page's folder (or a path from the wiki's root).
+  const info = wikiScopeInfo(proj);
+  if (root && info) FV.resolveImages(root, (src) => {
+    const target = FV.resolve(src.startsWith('/') ? '' : page, src.replace(/^\/+/, ''));
+    const taskId = proj && info.view.startsWith('task:') ? wikiTaskIds.get(`${proj.id}:${info.view.slice(5)}`) : undefined;
+    return target === null ? null : wikiUrl({ ...info, ...(taskId ? { taskId } : {}) }, '/file', { path: target });
   });
 }
 
@@ -19677,7 +19976,7 @@ function renderWikiPage(info, proj, pane, page) {
       ${page.files?.length ? `<div class="settings-divider"></div><div class="task-sub">${page.files.map((f) => `<code>${esc(f)}</code>`).join(' ')}</div>` : ''}
       <div class="inline-form" style="margin-top:10px">${page._wikiWritable === false ? (info.scope === 'project' ? '<span class="task-sub">Read-only branch view</span>' : '') : `<button class="btn sm" id="wiki-page-edit">Edit</button>${remove}`}${hasMath(wikiBody(page.content)) ? texToggleHtml(!markdownEnabled()) : ''}</div>
     </div>`;
-  mountMarkdownSurface(pane.querySelector('.wiki-md'), (math) => renderMessageBody(wikiBody(page.content), math), (body) => wireWikiLocalLinks(body, proj));
+  mountMarkdownSurface(pane.querySelector('.wiki-md'), (math) => renderMessageBody(wikiBody(page.content), math), (body) => wireWikiLocalLinks(body, proj, page.path || ''));
   wireTexToggles(pane);
   $('#wiki-page-delete')?.addEventListener('click', async () => {
     const q = page.builtin
@@ -20081,7 +20380,7 @@ async function hydrateConversationSharing(scope, id) {
   const url = `/api/${scope === 'project' ? 'projects' : 'organizations'}/${encodeURIComponent(id)}/conversation-sharing`;
   try {
     const policy = await api(url);
-    const tip = policyTip('Lets developers publish a read-only snapshot of an agent conversation; anyone with the link can read it. Turning this off hides existing links until it is back on.');
+    const tip = policyTip('Lets people publish read-only snapshots of agent conversations and of project files; anyone with the link can read them. Turning this off hides existing links until it is back on.');
     // The organization turns links on or off; a project follows it or turns them off.
     const control = scope === 'organization'
       ? `<input type="checkbox" class="toggle" aria-label="Public conversation links" ${policy.enabled ? 'checked' : ''} ${policy.canManage ? '' : 'disabled'}>`
@@ -26781,7 +27080,9 @@ const HOST_COMMANDS = [
   { id: 'nav.queue', title: 'Go to queues', key: 'g q', ...navCommand(() => tabRoute('queue')) },
   { id: 'nav.insights', title: 'Go to insights', key: 'g I', ...navCommand(() => tabRoute('insights')) },
   { id: 'nav.settings', title: 'Go to project settings', key: 'g s', ...navCommand(() => tabRoute('settings')) },
+  { id: 'nav.files', title: 'Go to project files', key: 'g f', ...navCommand(() => tabRoute('files')) },
   { id: 'nav.wiki', title: 'Go to project wiki', key: 'g w', ...navCommand(() => tabRoute('wiki')) },
+  { id: 'files.address', title: 'Type a path', key: 'g l', group: 'Files', available: () => S.tab === 'files' && !!$('#files-address'), run: () => editFilesAddress() },
   { id: 'nav.orgwiki', title: 'Go to organization wiki', key: 'g W', ...navCommand(() => globalRoute('orgwiki')) },
   { id: 'nav.global', title: 'Go to organization settings', key: 'g S', ...navCommand(() => tabRoute('global')) },
   { id: 'nav.projects', title: 'Go to projects', key: 'g P', run: () => focusRail() },
@@ -27392,6 +27693,7 @@ function openHelp() {
       + row('t', 'Terminal / conversation')
       + row('u', 'Back to the list')],
     ['Projects', rows(group('Projects'))],
+    ['Files', rows(group('Files')) + row('↑ / ↓', 'Move in a folder') + row('Backspace', 'Up a folder')],
     ['Settings', row('{ / }', 'Previous / next section')],
   ];
   root.innerHTML = `<div class="palette-scrim" id="help-scrim"><div class="palette help-panel" role="dialog" aria-label="Keyboard shortcuts">

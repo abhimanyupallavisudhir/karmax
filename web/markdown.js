@@ -56,7 +56,7 @@
       template.innerHTML = html;
       const allowedTags = new Set([
         'A', 'BLOCKQUOTE', 'BR', 'CODE', 'DEL', 'EM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
-        'HR', 'LI', 'OL', 'P', 'PRE', 'SPAN', 'STRONG', 'TABLE', 'TBODY', 'TD', 'TH',
+        'HR', 'IMG', 'LI', 'OL', 'P', 'PRE', 'SPAN', 'STRONG', 'TABLE', 'TBODY', 'TD', 'TH',
         'THEAD', 'TR', 'UL',
       ]);
       for (const el of template.content.querySelectorAll('*')) {
@@ -72,6 +72,12 @@
           if (el.tagName === 'A' && name === 'target' && value === '_blank') continue;
           if (el.tagName === 'A' && name === 'rel' && value === 'noopener noreferrer') continue;
           if (el.tagName === 'A' && name === 'data-md-local') continue;
+          // Images: web addresses load directly (no referrer); anything else
+          // rides in data-md-src for the page showing it to resolve, else none shows.
+          if (el.tagName === 'IMG' && name === 'src' && /^https?:\/\//i.test(value)) continue;
+          if (el.tagName === 'IMG' && (name === 'alt' || name === 'title' || name === 'data-md-src')) continue;
+          if (el.tagName === 'IMG' && name === 'loading' && value === 'lazy') continue;
+          if (el.tagName === 'IMG' && name === 'referrerpolicy' && value === 'no-referrer') continue;
           if (el.tagName === 'OL' && name === 'start' && /^-?\d+$/.test(value)) continue;
           if ((el.tagName === 'TH' || el.tagName === 'TD') && name === 'style'
             && /^text-align:\s*(?:left|center|right);?$/i.test(value)) continue;
@@ -297,6 +303,16 @@
     // neutralised, while an editor suffix like `file.ts:12` remains local) rides in
     // data-md-local so an in-app resolver (e.g. the wiki view) can route it to a
     // page, while it stays inert (href="#") everywhere else.
+    // Images ![alt](src "title"): before links, which would take their brackets.
+    // A web address loads as is; a relative path (the file beside a README, a
+    // wiki page's image, a screenshot in an agent's world) waits in data-md-src
+    // for the page to resolve; any other scheme shows only its alt text.
+    x = x.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+&quot;(.*?)&quot;)?\s*\)/g, (_, alt, src, title) => {
+      const titled = title ? ` title="${title}"` : '';
+      if (/^https?:\/\//i.test(src)) return keepLink(`<img src="${src}" alt="${alt}"${titled} loading="lazy" referrerpolicy="no-referrer">`);
+      if (!/^[a-z][a-z0-9+.-]*:/i.test(src) && !src.startsWith('//')) return keepLink(`<img data-md-src="${src}" alt="${alt}"${titled} loading="lazy">`);
+      return alt;
+    });
     x = x.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+[^)]*)?\)/g, (_, txt, href) => {
       if (/^(https?:|mailto:|\/)/i.test(href))
         return keepLink(`<a href="${href}" target="_blank" rel="noopener noreferrer">${format(txt)}</a>`);

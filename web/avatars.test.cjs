@@ -15,7 +15,7 @@ const fn = (name) => {
 const constant = (name) => app.match(new RegExp(`^const ${name} = [^\\n]*;$`, 'm'))[0];
 
 test('Avatars are no longer a project tab or a separate editor', () => {
-  assert.match(app, /const tabs = \['tasks', 'queue', 'wiki', 'settings'\];/);
+  assert.match(app, /const tabs = \['tasks', 'queue', 'files', 'wiki', 'settings'\];/);
   for (const gone of ['openAvatarEditor', 'avatarsView', 'avatarRoute', 'af-avatar'])
     assert.ok(!app.includes(gone), `${gone} is gone`);
 });

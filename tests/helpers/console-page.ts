@@ -25,7 +25,10 @@ export type ApiReply = unknown | { status: number; json?: unknown };
 export type ApiHandler = (call: ApiCall) => ApiReply | Promise<ApiReply>;
 
 const WEB = path.resolve('web');
-const scripts = ['totp-qr.js', 'markdown.js', 'app.js'];
+// The scripts the console page loads, in its order (the service worker's deferred registration aside),
+// so a script the console adds is here too.
+const scripts = [...fs.readFileSync(path.join(WEB, 'index.html'), 'utf8').matchAll(/<script\b([^>]*)\bsrc="\/([^"]+\.js)"([^>]*)>/g)]
+  .filter((m) => !/\bdefer\b/.test(`${m[1]}${m[3]}`)).map((m) => m[2] as string);
 let browser: Promise<Browser> | undefined;
 
 export async function closeConsoleBrowser(): Promise<void> {

@@ -18,6 +18,9 @@
     for (const { node, source } of messages) {
       node.classList.add('md');
       node.innerHTML = KarmaxMarkdown.renderMarkdown(source, { math });
+      // A relative image names a file in the task's world, which a public page cannot read: its alt text.
+      node.querySelectorAll('img[data-md-src]').forEach((img) => img.replaceWith(document.createTextNode(img.alt || '')));
+      node.querySelectorAll('img').forEach((img) => img.addEventListener('error', () => img.replaceWith(document.createTextNode(img.alt || '')), { once: true }));
       // An agent's form, as it was asked: read-only here.
       node.querySelectorAll('pre.lang-form').forEach((pre) => {
         const { form } = KarmaxMarkdown.parseForm(pre.textContent);

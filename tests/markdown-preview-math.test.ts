@@ -33,7 +33,7 @@ describe('Markdown preview math', () => {
     expect(await reader.locator('.artifact-reader-content').innerText()).toContain('$x^2$');
     // The conversation behind the reader follows the same preference.
     expect(await ui.page.locator('#main .tex-toggle').getAttribute('aria-pressed')).toBe('false');
-    await expect.poll(() => ui.page.evaluate(() => (globalThis as any).document.activeElement?.getAttribute('aria-label'))).toBe('Typeset math');
+    await expect.poll(() => ui.page.evaluate(() => (globalThis as any).document.activeElement?.getAttribute('aria-label'))).toBe('TeX: typeset math');
 
     await toggle.click();
     await reader.locator('.artifact-reader-content mjx-container').first().waitFor();

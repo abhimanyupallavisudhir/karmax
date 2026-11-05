@@ -79,6 +79,9 @@ import { accountKey, waiters } from '../world/compute-queue.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
+import { validGitBranch } from '../util/git-ref.js';
+import { FileAccessError, FileNotFoundError, ProjectFiles, projectRepositoryCredential, splitPath, type FileNode, type FileView, type OpenedFile } from '../world/project-files.js';
+import { createFileShare, currentFileShare, projectFileShares, publicFileShare, publicFilesHtml, revokeFileShare, type FileShare } from './file-sharing.js';
 import { cliVersionOf, olderVersion } from '../domain/cli-version.js';
 import { WorkspaceConflict, WorldNotRunningError } from '../world/resources.js';
 import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, openCodeKeyModels, mergeModels,
@@ -179,6 +182,8 @@ export interface GatewayDeps {
   resources?: import('../world/resources.js').ProjectResourceService;
   /** Releases chunked task checkpoints when their project is deleted. */
   checkpoints?: import('../world/checkpoint.js').WorldCheckpointService;
+  /** The project Files reader (wiki features/project-files); built lazily when absent (tests). */
+  projectFiles?: ProjectFiles;
   subscriptions?: import('../billing/subscriptions.js').SubscriptionBillingService;
   /** Auto top-up of managed compute (wiki features/managed-compute § Auto top-up). */
   computeTopUps?: import('../billing/compute-topups.js').ComputeTopUps;
@@ -382,6 +387,11 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The tavya CLI (wiki planned/tavya-cli). Grants to read a resource are a
   // read, whatever the method; saving one is a settings write (or a task edit).
   if (/^\/api\/projects\/[^/]+\/workspace$/.test(p) || /^\/api\/projects\/[^/]+\/git-credential$/.test(p)) return 'repository:read';
+  // The Files page: data under it also needs project:settings:read, checked there.
+  if (/^\/api\/projects\/[^/]+\/files(?:\/raw|\/views)?$/.test(p)) return 'repository:read';
+  if (/^\/api\/tasks\/[^/]+\/file-location$/.test(p)) return 'task:read';
+  // Public links to a snapshot of a path: anyone who reads Files sees them; making or revoking one is its own capability.
+  if (/^\/api\/projects\/[^/]+\/file-shares$/.test(p)) return read ? 'repository:read' : 'project:files:share';
   if (/^\/api\/organizations\/[^/]+\/cli-git-credentials$/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/projects\/[^/]+\/secrets\/values$/.test(p)) return 'project:secret:use';
   if (/^\/api\/projects\/[^/]+\/resources\/[^/]+\/read-grant$/.test(p)) return 'project:settings:read';
@@ -1806,6 +1816,19 @@ export class Gateway {
       return void res.end(publicConversationHtml(share, { siteName: await this.siteName, signedIn,
         skin: skinOf(await this.deps.store.getSettings('global', 'appearance')) }));
     }
+    // A shared snapshot of project files: the page, and what it reads (no sign-in).
+    const sharedFilesPage = p.match(/^\/share\/files\/([A-Za-z0-9_-]+)(?:\/.*)?$/);
+    if (sharedFilesPage) {
+      const share = req.method === 'GET' ? await publicFileShare(this.deps.store, sharedFilesPage[1]!) : undefined;
+      const signedIn = !!(await this.deps.identity?.session(requestHeaders(req.headers)).catch(() => null));
+      res.writeHead(share ? 200 : 404, { 'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex, nofollow',
+        'content-security-policy': `default-src 'none'; script-src 'self' ${MATHJAX_SCRIPT_SOURCE}; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob:; media-src 'self'; frame-src blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'` });
+      return void res.end(publicFilesHtml(share, { siteName: await this.siteName, signedIn,
+        skin: skinOf(await this.deps.store.getSettings('global', 'appearance')) }));
+    }
+    const sharedFiles = p.match(/^\/api\/shared-files\/([A-Za-z0-9_-]+)(\/raw)?$/);
+    if (sharedFiles && (req.method === 'GET' || req.method === 'HEAD')) return this.serveSharedFiles(req, res, url, sharedFiles[1]!, !!sharedFiles[2]);
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
     if (p.startsWith('/brand/')) return this.brand(p, res, req);
     if (p === '/app.webmanifest' && req.method === 'GET') return (await this.webManifest(res));
@@ -4977,6 +5000,95 @@ export class Gateway {
         }
         return this.json(res, 200, { enabled: (await store.kvGet(cliGitCredentialsKey(organizationId))) === 'enabled' });
       }
+      // Where a path an agent cited sits in its project's Files (its task's view).
+      const fileLocation = p.match(/^\/api\/tasks\/([^/]+)\/file-location$/);
+      if (fileLocation && method === 'GET') {
+        const task = await store.getTask(fileLocation[1]!);
+        if (!task) return this.json(res, 404, { error: 'task not found' });
+        let relative: string;
+        try { relative = await this.citedFilePath(task, url.searchParams.get('path') ?? ''); }
+        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        return this.json(res, 200, { projectId: task.projectId, taskId: task.id, ...(task.num != null ? { num: task.num } : {}), path: relative });
+      }
+      // Public links to a snapshot of a file or folder (wiki features/project-files).
+      const fileShares = p.match(/^\/api\/projects\/([^/]+)\/file-shares$/);
+      if (fileShares) {
+        const projectId = fileShares[1]!;
+        const project = await store.getProject(projectId);
+        if (!project) return this.json(res, 404, { error: 'project not found' });
+        const scope = { projectId, organizationId: project.organizationId };
+        const shareUrl = (share: FileShare) => `/share/files/${share.id}`;
+        if (method === 'GET' && !url.searchParams.has('path')) {
+          return this.json(res, 200, { shares: (await projectFileShares(store, projectId)).map((share) => ({ path: share.path, kind: share.kind,
+            url: shareUrl(share), createdAt: share.createdAt })) });
+        }
+        let filePath: string;
+        try { filePath = splitPath(url.searchParams.get('path') ?? '').join('/'); }
+        catch (error) { return this.json(res, 404, { error: error instanceof Error ? error.message : String(error) }); }
+        const policy = await sharingPolicy(store, projectId);
+        if (method === 'DELETE') {
+          await revokeFileShare(store, projectId, filePath);
+          await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'files.share.revoke', `project:${projectId}`, { path: filePath });
+          return this.json(res, 200, { revoked: true });
+        }
+        let share = await currentFileShare(store, projectId, filePath);
+        if (method === 'POST') {
+          if (!policy.effective) return this.json(res, 403, { error: 'Public links are turned off in organization or project settings' });
+          const data = (await this.deps.tokens.check(token, 'project:settings:read', scope)).ok;
+          try {
+            share = await createFileShare(store, projectId, filePath, actorPrincipal(callerIdentity.actor), async () => {
+              const { pins, node } = await this.projectFiles().snapshot(projectId, filePath, { data });
+              return { pins, kind: node.kind };
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return this.json(res, error instanceof FileNotFoundError ? 404 : error instanceof FileAccessError ? 403 : 502, { error: message });
+          }
+          await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'files.share.create', `project:${projectId}`, { path: filePath });
+        } else if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
+        // Where to turn links on, for the dialog, when they are off.
+        const settings = policy.effective ? null : !policy.organization
+          ? { scope: 'organization', id: project.organizationId!, canManage: (await this.deps.tokens.check(token,
+            'organization:edit', { organizationId: project.organizationId })).ok }
+          : { scope: 'project', id: projectId, canManage: (await this.deps.tokens.check(token, 'project:settings:write', scope)).ok };
+        return this.json(res, 200, { enabled: policy.effective, canShare: (await this.deps.tokens.check(token, 'project:files:share', scope)).ok,
+          settings, url: share ? shareUrl(share) : null, createdAt: share?.createdAt ?? null, kind: share?.kind ?? null });
+      }
+      // The project as a file tree (wiki features/project-files).
+      const projectFiles = p.match(/^\/api\/projects\/([^/]+)\/files(\/raw|\/views)?$/);
+      if (projectFiles && (method === 'GET' || method === 'HEAD')) {
+        const projectId = projectFiles[1]!;
+        if (projectFiles[2] === '/views') {
+          if (!(await store.getProject(projectId))) return this.json(res, 404, { error: 'project not found' });
+          const [repositories, tasks] = await Promise.all([
+            this.projectFiles().branches(projectId).catch((error) => ({ error: error instanceof Error ? error.message : String(error) })),
+            (await this.deps.tokens.check(session.apiToken, 'task:read', { projectId })).ok ? this.filesTaskViews(projectId) : []]);
+          res.setHeader('cache-control', 'private, no-cache');
+          return this.json(res, 200, Array.isArray(repositories) ? { repositories, tasks } : { repositories: [], tasks, error: repositories.error });
+        }
+        const data = (await this.deps.tokens.check(session.apiToken, 'project:settings:read', { projectId })).ok;
+        let relative = url.searchParams.get('path') ?? '';
+        const view = await this.filesView(session.apiToken, projectId, url);
+        if ('error' in view) return this.json(res, view.status, { error: view.error });
+        // `cited`: a path as the task's agent wrote it (an image in its message).
+        if (view.kind === 'task' && url.searchParams.has('cited')) {
+          try { relative = await this.citedFilePath((await store.getTask(view.taskId))!, relative); }
+          catch (error) { return this.json(res, 404, { error: error instanceof Error ? error.message : String(error) }); }
+        }
+        try {
+          if (!projectFiles[2]) {
+            res.setHeader('cache-control', 'private, no-cache');
+            return this.json(res, 200, await this.projectFiles().stat(projectId, relative, { data, view }));
+          }
+          return await this.projectFiles().open(projectId, relative, { data, view },
+            (file) => this.sendProjectFile(req, res, file, url.searchParams.has('download')));
+        } catch (error) {
+          if (res.headersSent) return void res.destroy();
+          const message = error instanceof Error ? error.message : String(error);
+          return this.json(res, error instanceof FileNotFoundError ? 404 : error instanceof FileAccessError ? 403
+            : /project not found/.test(message) ? 404 : 502, { error: message });
+        }
+      }
       const projectWorkspace = p.match(/^\/api\/projects\/([^/]+)\/workspace$/);
       if (projectWorkspace && method === 'GET') {
         try { return this.json(res, 200, await this.workspaces().project(projectWorkspace[1]!)); }
@@ -6734,7 +6846,7 @@ export class Gateway {
       // family per scope; KarmaxApi enforces read/write capabilities and path
       // safety, so the wiki works identically for humans (UI) and agents
       // (read_wiki/search_wiki/platform_request, including from cloud worlds).
-      const wikiMatch = p.match(/^\/api\/(organizations|projects)\/([^/]+)\/wiki(?:\/(page|search|suggest|refs|history))?$/);
+      const wikiMatch = p.match(/^\/api\/(organizations|projects)\/([^/]+)\/wiki(?:\/(page|search|suggest|refs|history|file))?$/);
       if (wikiMatch) {
         const scope = wikiMatch[1] === 'projects' ? ('project' as const) : ('organization' as const);
         const id = wikiMatch[2]!;
@@ -6745,6 +6857,13 @@ export class Gateway {
         };
         try {
           if (!sub && method === 'GET') return this.json(res, 200, await api.readWikiResolved(token, scope, id, url.searchParams.get('path') ?? '', selector));
+          // A file a page shows (an image beside it): bytes, as untrusted content.
+          if (sub === 'file' && method === 'GET') {
+            const file = await api.readWikiFile(token, scope, id, url.searchParams.get('path') ?? '', selector);
+            const type = ARTIFACT_MIME[path.extname(file.name).toLowerCase()] ?? (path.extname(file.name).toLowerCase() === '.svg' ? 'image/svg+xml' : 'application/octet-stream');
+            res.writeHead(200, { ...artifactHeaders(type, file.name), 'cache-control': 'private, max-age=60', 'content-length': String(file.data.length) });
+            return void res.end(file.data);
+          }
           if (sub === 'page') {
             if (method === 'GET') {
               const read = await api.readWikiResolved(token, scope, id, String(url.searchParams.get('path') ?? ''), selector);
@@ -10046,6 +10165,160 @@ export class Gateway {
   private workspaceService?: WorkspaceService;
   private workspaces(): WorkspaceService {
     return this.workspaceService ??= new WorkspaceService(this.deps.store, this.deps.resources, this.deps.handoffs);
+  }
+
+  private projectFilesService?: ProjectFiles;
+  private projectFiles(): ProjectFiles {
+    return this.projectFilesService ??= this.deps.projectFiles ?? new ProjectFiles({ store: this.deps.store, workspaces: this.workspaces(),
+      resources: this.deps.resources, gitCredential: projectRepositoryCredential(this.deps.store, { hosted: this.deps.hosted, githubApp: this.deps.githubApp }),
+      ...(this.deps.checkpoints ? { checkpoints: this.deps.checkpoints } : {}),
+      openWorld: async (taskId, handle) => {
+        if (this.deps.worldAccess) { const access = await this.deps.worldAccess.open(taskId, handle); return { world: access.world, release: () => access.release(false) }; }
+        return { world: await this.deps.worlds.open(handle), release: async () => {} };
+      } });
+  }
+
+  /** What `?task=` (a number or id) or `?branch=` asks the Files page to show, or a refusal. */
+  private async filesView(token: string, projectId: string, url: URL): Promise<FileView | { error: string; status: number }> {
+    const taskKey = url.searchParams.get('task');
+    const branch = url.searchParams.get('branch');
+    if (taskKey) {
+      const task = /^\d+$/.test(taskKey) ? await this.deps.store.getTaskByNum(projectId, Number(taskKey)) : await this.deps.store.getTask(taskKey);
+      if (!task || task.projectId !== projectId) return { error: 'No such task in this project.', status: 404 };
+      if (!(await this.deps.tokens.check(token, 'task:read', { projectId, taskId: task.id })).ok) return { error: 'missing capability task:read', status: 403 };
+      return { kind: 'task', taskId: task.id };
+    }
+    if (branch) return validGitBranch(branch) ? { kind: 'branch', name: branch } : { error: 'invalid branch', status: 400 };
+    return { kind: 'default' };
+  }
+
+  /** Where a path an agent cited (absolute in its world, or relative to its
+   * working folder) sits in its project's Files, relative to the world root. */
+  private async citedFilePath(task: import('../domain/types.js').TaskRecord, cited: string): Promise<string> {
+    const value = String(cited).replace(/\\/g, '/');
+    if (!value) throw new Error('missing path');
+    const handle = ((await this.deps.store.currentWorld(task.id)) ?? task.lastView?.world) as WorldHandle | undefined;
+    let relative = value;
+    if (handle) {
+      const root = String(handle.root ?? '').replace(/\/+$/, '');
+      if (value.startsWith('/')) {
+        if (value !== root && !value.startsWith(`${root}/`)) throw new Error('That file is outside the task’s world.');
+        relative = value === root ? '' : value.slice(root.length + 1);
+      } else relative = worldWorkingRelativePath(handle, value);
+    }
+    return splitPath(relative === '.' ? '' : relative).join('/');
+  }
+
+  /** Tasks whose world can be shown (running, parked or saved), newest first, for the view picker. */
+  private async filesTaskViews(projectId: string) {
+    const tasks = [];
+    for (const task of (await this.deps.store.listTasks(projectId)).sort((a, b) => (b.num ?? 0) - (a.num ?? 0))) {
+      if (tasks.length >= 100) break;
+      const handle = ((await this.deps.store.currentWorld(task.id)) ?? task.lastView?.world) as WorldHandle | undefined;
+      if (!handle) continue;
+      const state = await this.deps.store.worldState(handle.id);
+      if (!state || state === 'released') continue;
+      tasks.push({ id: task.id, num: task.num, title: task.title, branch: handle.branch, status: task.lastView?.status ?? 'queued',
+        live: state === 'ready' });
+    }
+    return tasks;
+  }
+
+  /** `GET /api/shared-files/:share[/raw]?path=`: a public link's snapshot,
+   * `path` relative to what was shared. Paths and sources are given relative
+   * to it too, so nothing outside the shared path is named. */
+  private async serveSharedFiles(req: http.IncomingMessage, res: http.ServerResponse, url: URL, id: string, raw: boolean): Promise<void> {
+    const share = await publicFileShare(this.deps.store, id);
+    if (!share) return this.json(res, 404, { error: 'This link was revoked, or sharing was turned off.' });
+    let inside: string[];
+    try { inside = splitPath(url.searchParams.get('path') ?? ''); }
+    catch (error) { return this.json(res, 404, { error: error instanceof Error ? error.message : String(error) }); }
+    if (share.kind !== 'directory' && inside.length) return this.json(res, 404, { error: 'Nothing there' });
+    const root = splitPath(share.path);
+    const full = [...root, ...inside].join('/');
+    const relative = (node: FileNode): FileNode => {
+      const { source } = node;
+      // A shared file is named by its own name; inside a shared folder, by its path there.
+      return { ...node, path: share.kind === 'directory' ? inside.join('/') : root.at(-1) ?? '',
+        source: source.kind === 'data' ? { kind: 'data', id: '', name: source.name, access: source.access }
+          : source.kind === 'repository' ? { ...source } : { kind: 'project' } };
+    };
+    try {
+      if (!raw) {
+        res.setHeader('cache-control', 'private, no-cache');
+        res.setHeader('x-robots-tag', 'noindex, nofollow');
+        const node = relative(await this.projectFiles().stat(share.projectId, full, { data: true, pins: share.pins }));
+        return this.json(res, 200, { ...node, shared: { kind: share.kind, createdAt: share.createdAt } });
+      }
+      return await this.projectFiles().open(share.projectId, full, { data: true, pins: share.pins },
+        (file) => this.sendProjectFile(req, res, { ...file, node: relative(file.node) }, url.searchParams.has('download')));
+    } catch (error) {
+      if (res.headersSent) return void res.destroy();
+      const message = error instanceof Error ? error.message : String(error);
+      // Nothing about the project's own layout or failures beyond this link.
+      return this.json(res, error instanceof FileNotFoundError ? 404 : error instanceof FileAccessError ? 403 : 502,
+        { error: error instanceof FileNotFoundError ? 'Nothing there' : error instanceof FileAccessError ? message : 'Couldn’t read this file right now.' });
+    }
+  }
+
+  /** `GET /api/projects/:id/files/raw`: one file's bytes, in a single byte
+   * range when asked (media seeking), with the content's version as ETag. */
+  private async sendProjectFile(req: http.IncomingMessage, res: http.ServerResponse, file: OpenedFile, download: boolean): Promise<void> {
+    const etag = file.node.version ? `"${file.node.version}"` : undefined;
+    if (etag && req.headers['if-none-match'] === etag) { file.stop(); file.done.catch(() => {}); res.writeHead(304, { etag }).end(); return; }
+    const name = path.posix.basename(file.node.path) || 'file';
+    const extension = path.extname(name).toLowerCase();
+    // Media the browser shows as itself; everything else is shown as text
+    // (the page decides how to render it) unless it is binary.
+    const media = extension === '.svg' ? 'image/svg+xml' : /^(?:image|video|audio)\/|^application\/pdf/.test(ARTIFACT_MIME[extension] ?? '') ? ARTIFACT_MIME[extension]! : undefined;
+    const range = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range ?? ''));
+    let start = 0, end = file.size - 1;
+    if (range && file.size > 0 && (range[1] || range[2])) {
+      start = range[1] ? Number(range[1]) : Math.max(0, file.size - Number(range[2]));
+      end = range[1] && range[2] ? Math.min(Number(range[2]), file.size - 1) : file.size - 1;
+      if (start > end || start >= file.size) {
+        file.stop(); file.done.catch(() => {});
+        res.writeHead(416, { 'content-range': `bytes */${file.size}` }).end();
+        return;
+      }
+    }
+    const partial = start !== 0 || end !== file.size - 1;
+    let headWritten = false;
+    const writeHead = (head: Buffer) => {
+      headWritten = true;
+      const type = media ?? (head.includes(0) ? 'application/octet-stream' : 'text/plain; charset=utf-8');
+      res.writeHead(partial ? 206 : 200, { ...artifactHeaders(type, name, download), 'cache-control': 'private, no-cache',
+        'accept-ranges': 'bytes', 'content-length': String(file.size ? end - start + 1 : 0),
+        ...(partial ? { 'content-range': `bytes ${start}-${end}/${file.size}` } : {}), ...(etag ? { etag } : {}) });
+      if (req.method === 'HEAD') { file.stop(); res.end(); }
+    };
+    let offset = 0;
+    // The response closing early (a client gone) stops the read; the request's
+    // own 'close' only means its body was read.
+    res.on('close', () => { if (!res.writableFinished) file.stop(); });
+    await new Promise<void>((resolve) => {
+      file.stream.on('data', (chunk: Buffer) => {
+        if (!headWritten) writeHead(chunk.subarray(0, 8192));
+        if (req.method === 'HEAD' || res.destroyed) return;
+        const from = Math.max(0, start - offset), to = Math.min(chunk.length, end + 1 - offset);
+        offset += chunk.length;
+        if (to > from && !res.write(chunk.subarray(from, to))) { file.stream.pause(); res.once('drain', () => file.stream.resume()); }
+        if (offset > end) file.stop();
+      });
+      file.stream.on('end', resolve);
+      file.stream.on('error', resolve);
+      file.stream.on('close', resolve);
+    });
+    try { await file.done; }
+    catch (error) {
+      // Stopped on purpose (a range served, a client gone) is not a failure.
+      if (offset <= end && !res.destroyed && !req.destroyed) {
+        if (!headWritten) return void this.json(res, 502, { error: error instanceof Error ? error.message : String(error) });
+        return void res.destroy();
+      }
+    }
+    if (!headWritten) writeHead(Buffer.alloc(0));
+    if (!res.writableEnded) res.end();
   }
 
   private publicUrl(req: http.IncomingMessage, browserUrl?: unknown): string {

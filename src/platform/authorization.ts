@@ -72,7 +72,7 @@ const developer = [
 ] satisfies Capability[];
 const maintainer = [
   ...developer, 'task:*', 'project:delete', 'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
-  'project:resource:shared-write',
+  'project:resource:shared-write', 'project:files:share',
   'workflow:edit', 'team:write', 'repository:write',
   'github:actions:write',
   // A maintainer's agent may stand in for a human at a Review gate; a
@@ -88,7 +88,7 @@ const maintainer = [
 // tenant-owned credentials and payments but cannot cross that boundary.
 const PROJECT_GRANT_CEILING: Capability[] = [
   'project:read', 'project:edit', 'project:delete', 'project:settings:*', 'project:secret:use',
-  'project:resource:shared-write',
+  'project:resource:shared-write', 'project:files:share',
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
   'credential:read', 'vault:store', 'connection:use', 'use-credential:*', 'skill:write',
   'use-card:*',
@@ -101,7 +101,7 @@ export const ORGANIZATION_GRANT_CEILING: Capability[] = [
   'project:transfer-out', 'project:transfer-in',
   'organization:*', 'team:*', 'repository:*', 'inbox:*',
   'project:read', 'project:create', 'project:edit', 'project:delete', 'project:settings:*', 'project:secret:use',
-  'project:resource:shared-write',
+  'project:resource:shared-write', 'project:files:share',
   // Loading code into the shared worker is installation authority, never tenant authority.
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
   'credential:*', 'credential:reveal', 'vault:store', 'connection:use', 'use-credential:*', 'skill:write', 'payment:*', 'use-card:*',
@@ -119,7 +119,7 @@ const administrator: Capability[] = [
   'organization:read', 'organization:create', 'organization:edit', 'organization:wiki:write',
   'organization:member:read', 'organization:member:write', 'team:*', 'repository:*', 'inbox:*',
   'project:read', 'project:create', 'project:edit', 'project:delete', 'project:settings:*', 'project:secret:use',
-  'project:resource:shared-write',
+  'project:resource:shared-write', 'project:files:share',
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
   'credential:read', 'credential:write', 'vault:store', 'connection:use', 'use-credential:*', 'skill:write',
   'payment:read', 'use-card:*',
@@ -178,7 +178,7 @@ const PREVIOUS_BUILTIN_DESCRIPTIONS: Record<string, string> = {
 
 /** The organization ceiling before vault read access was its own capability:
  * Administrator was this whole set, which historical profiles still match. */
-const PREVIOUS_ORGANIZATION_GRANT_CEILING: Capability[] = ORGANIZATION_GRANT_CEILING.filter((capability) => capability !== 'credential:reveal' && capability !== 'project:secret:use');
+const PREVIOUS_ORGANIZATION_GRANT_CEILING: Capability[] = ORGANIZATION_GRANT_CEILING.filter((capability) => capability !== 'credential:reveal' && capability !== 'project:secret:use' && capability !== 'project:files:share');
 
 const PREVIOUS_BUILTIN_CAPABILITIES = {
   developer: [
@@ -216,7 +216,7 @@ const LEGACY_BUILTIN_CAPABILITIES: Partial<Record<AuthorizationProfileId, Capabi
   ]],
   maintainer: [PREVIOUS_BUILTIN_CAPABILITIES.maintainer!,
     // workflow:install releases predate organization:wiki:write.
-    [...maintainer.filter((capability) => capability !== 'organization:wiki:write' && capability !== 'project:secret:use'), 'workflow:install'],
+    [...maintainer.filter((capability) => capability !== 'organization:wiki:write' && capability !== 'project:secret:use' && capability !== 'project:files:share'), 'workflow:install'],
     // With workflow:install (before it became global authority), with and without `review:approve`…
     [...PREVIOUS_BUILTIN_CAPABILITIES.maintainer!, 'workflow:install'],
     [...PREVIOUS_BUILTIN_CAPABILITIES.maintainer!.filter((capability) => capability !== 'review:approve'), 'workflow:install'],

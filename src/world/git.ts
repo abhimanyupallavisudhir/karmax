@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { BRAND } from '../domain/brand.js';
 
@@ -111,6 +111,20 @@ export async function ensureIdentity(dir: string) {
   if (email.code !== 0 || !email.stdout.trim()) {
     await git(dir, ['config', 'user.email', `${BRAND}@localhost`]);
   }
+}
+
+/** `git cat-file blob <object>` streamed, from a repository only the host
+ * writes (a broker mirror): the project Files page. `done` rejects if Git fails. */
+export function catBlob(repository: string, object: string): { stream: import('node:stream').Readable; done: Promise<void>; stop: () => void } {
+  const child = spawn('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'protocol.ext.allow=never',
+    'cat-file', 'blob', object], { cwd: repository, env: { ...hostGitEnvironment(), GIT_TERMINAL_PROMPT: '0' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = '';
+  child.stderr.on('data', (chunk: Buffer) => { stderr = (stderr + chunk.toString('utf8')).slice(-8 * 1024); });
+  const done = new Promise<void>((resolve, reject) => {
+    child.on('error', reject);
+    child.on('close', (code) => code === 0 ? resolve() : reject(new Error(stderr.trim() || `git cat-file exited ${code}`)));
+  });
+  return { stream: child.stdout, done, stop: () => { if (child.exitCode === null) child.kill('SIGTERM'); } };
 }
 
 /** The environment host Git inherits. An allowlist, so karmax's own secrets and

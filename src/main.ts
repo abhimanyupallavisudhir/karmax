@@ -299,6 +299,13 @@ async function main() {
       siteName: async () => siteNameOf((await store.getSettings('global', 'appearance'))) }) });
   const handoffs = new WorldHandoffService(store, worlds, githubApp, runners, worldAccess, p.localCheckouts, resources);
   const worldLifecycle = new WorldLifecycleManager(store, worlds, checkpoints, 60_000, objectStore, runners, worldAccess);
+  // The project Files page and the wiki's view of a parked task read through
+  // one service, so a saved task world is read the same way everywhere.
+  const { ProjectFiles, projectRepositoryCredential } = await import('./world/project-files.js');
+  const { WorkspaceService } = await import('./world/workspace.js');
+  const projectFiles = new ProjectFiles({ store, workspaces: new WorkspaceService(store, resources, handoffs), resources, checkpoints,
+    gitCredential: projectRepositoryCredential(store, { hosted: deployment.hosted, githubApp }),
+    openWorld: async (taskId, handle) => { const access = await worldAccess.open(taskId, handle); return { world: access.world, release: () => access.release(false) }; } });
   const delivery = new DeliveryDispatcher(store, {
     browser: new BrowserDeliveryAdapter(),
     ...(process.env.KARMAX_EMAIL_DELIVERY_URL ? { email: new WebhookDeliveryAdapter(process.env.KARMAX_EMAIL_DELIVERY_URL, 'email') } : {}),
@@ -375,7 +382,7 @@ async function main() {
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows,
     authorization, defaultAgentProvider: provider, hosted: deployment.hosted, hostLocal: deployment.hostLocal,
     providerConnections, worlds,
-    worldAccess, runners, worldLifecycle, resources, objects: objectStore, broker, githubApp, bus,
+    worldAccess, runners, worldLifecycle, resources, objects: objectStore, broker, githubApp, bus, projectFiles,
     refreshCredentialHealth: async (task, credentialProvider, options) => {
       if (!credentialProvider) return;
       const { retryCredentials } = await import('./agent/credential-health.js');
@@ -430,6 +437,7 @@ async function main() {
     objects: objectStore,
     resources,
     checkpoints,
+    projectFiles,
     subscriptions: subscriptionBilling,
     computeTopUps,
     paidLaunchSettings,

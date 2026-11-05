@@ -62,40 +62,10 @@ export interface MirroredClone {
  * that origin has. `branch` must exist on origin, as with `git clone --branch`. */
 export async function mirroredClone(source: string, clone: string, env: Record<string, string>,
   options: { branch?: string; also?: string[]; scratch: string; scope?: string }): Promise<MirroredClone> {
-  const named = [options.branch, ...(options.also ?? [])].filter((name): name is string => name !== undefined);
-  for (const name of named) if (!validGitBranch(name)) throw new Error(`Git broker rejected invalid branch "${name}"`);
-  const listed = await git(path.dirname(clone), ['ls-remote', '--symref', source, 'HEAD', ...named.map((name) => `refs/heads/${name}`)],
-    { env, timeoutMs: 2 * 60_000 });
-  if (listed.code !== 0) throw new Error(listed.stderr || listed.stdout || 'git ls-remote failed');
-  const advertised = parseAdvertisement(listed.stdout);
-  if (options.branch && !advertised.tips[options.branch])
-    throw new Error(`Remote branch ${options.branch} not found in upstream origin`);
-  const branch = options.branch ?? advertised.head;
-  const wanted = [...new Set([branch, ...(options.also ?? [])])]
-    .filter((name): name is string => Boolean(name && advertised.tips[name]));
-
-  const persistent = maxBytes() > 0 && process.platform === 'linux';
-  const mirror = persistent
-    ? path.join(mirrorRoot(), `${crypto.createHash('sha256').update(JSON.stringify([options.scope ?? null, sshUser(source),
-      canonicalRepositoryIdentity(source)])).digest('hex').slice(0, 32)}.git`)
-    : path.join(options.scratch, 'mirror.git');
-  if (persistent) fs.mkdirSync(mirrorRoot(), { recursive: true });
-  const releaseUpdate = persistent ? await acquireFileLock(lockFile(mirror, 'lock'), { waitMs: LOCK_WAIT_MS }) : undefined;
+  const synced = await syncMirror(source, env, options);
+  const { mirror, persistent, branch, wanted } = synced;
   let releaseUse: (() => void) | undefined;
   try {
-    await ensureMirror(mirror);
-    const stale: string[] = [];
-    for (const name of wanted) {
-      const local = await git(mirror, ['rev-parse', '--verify', '--quiet', `refs/heads/${name}^{commit}`]);
-      if (local.code !== 0 || local.stdout.trim() !== advertised.tips[name]) stale.push(name);
-    }
-    if (stale.length) {
-      await dropConflictingRefs(mirror, stale);
-      const fetched = await git(mirror, [...QUIET_REPOSITORY, 'fetch', '--no-tags', '--no-write-fetch-head', source,
-        ...stale.map((name) => `+refs/heads/${name}:refs/heads/${name}`)], { env, timeoutMs: 10 * 60_000 });
-      if (fetched.code !== 0) throw new Error(fetched.stderr || fetched.stdout || 'git fetch failed');
-      if (persistent) await collectGarbage(mirror);
-    }
     // Nobody holds `.use` exclusively without also holding `.lock`, so this
     // never waits.
     if (persistent) releaseUse = await acquireFileLock(lockFile(mirror, 'use'), { shared: true, waitMs: LOCK_WAIT_MS });
@@ -116,19 +86,136 @@ export async function mirroredClone(source: string, clone: string, env: Record<s
     releaseUse?.();
     throw error;
   } finally {
-    releaseUpdate?.();
+    synced.releaseUpdate?.();
   }
+  return { clone, release: borrowRelease(mirror, persistent, releaseUse) };
+}
+
+/** Read `branch` (origin's default branch when omitted) straight from the
+ * mirror, with no scratch clone: `read` gets the bare repository and the
+ * branch's commit and must only read objects (the project Files page). A tip
+ * origin advertised within `maxAgeMs` is trusted without asking it again, so a
+ * person browsing a repository costs origin one round trip per window rather
+ * than one per click; the credential was proved by that same advertisement.
+ * `commit` reads that commit of the branch instead of its tip (a shared
+ * snapshot): it must be in the mirror, which only ever holds origin's objects,
+ * else `readMirrored` throws `MirroredCommitMissing`. */
+export async function readMirrored<T>(source: string, env: Record<string, string>,
+  options: { branch?: string; scratch: string; scope?: string; maxAgeMs?: number; commit?: string },
+  read: (repository: string, commit: string, branch: string) => Promise<T>): Promise<T> {
+  if (options.branch && !validGitBranch(options.branch)) throw new Error(`Git broker rejected invalid branch "${options.branch}"`);
+  if (options.commit !== undefined && !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(options.commit)) throw new MirroredCommitMissing();
+  const persistent = usesPersistentMirrors();
+  const mirror = persistent ? persistentMirror(source, options.scope) : undefined;
+  const key = mirror ? `${mirror}\n${options.branch ?? ''}` : '';
+  const known = mirror && options.maxAgeMs ? recentTips.get(key) : undefined;
+  if (mirror && known && Date.now() - known.at < options.maxAgeMs!) {
+    // Eviction needs `.use` exclusively, so once held the objects stay.
+    const releaseUse = await acquireFileLock(lockFile(mirror, 'use'), { shared: true, waitMs: LOCK_WAIT_MS });
+    if (releaseUse) {
+      try {
+        const wanted = options.commit ?? known.commit;
+        const present = await git(mirror, ['cat-file', '-e', `${wanted}^{commit}`]).catch(() => undefined);
+        if (present?.code === 0) return await read(mirror, wanted, known.branch);
+      } finally { releaseUse(); }
+    }
+    recentTips.delete(key);
+  }
+  const synced = await syncMirror(source, env, options);
+  let releaseUse: (() => void) | undefined;
+  let commit: string;
+  try {
+    if (!synced.branch || !synced.wanted.includes(synced.branch)) throw new Error('origin has no default branch');
+    if (synced.persistent) releaseUse = await acquireFileLock(lockFile(synced.mirror, 'use'), { shared: true, waitMs: LOCK_WAIT_MS });
+    const tip = await git(synced.mirror, ['rev-parse', '--verify', `refs/heads/${synced.branch}^{commit}`]);
+    if (tip.code !== 0) { releaseUse?.(); throw new Error(tip.stderr || tip.stdout); }
+    commit = tip.stdout.trim();
+    if (options.commit) {
+      const present = await git(synced.mirror, ['cat-file', '-e', `${options.commit}^{commit}`]).catch(() => undefined);
+      if (present?.code !== 0) { releaseUse?.(); throw new MirroredCommitMissing(); }
+    }
+  } finally { synced.releaseUpdate?.(); }
+  if (key) {
+    if (recentTips.size >= 256) recentTips.delete(recentTips.keys().next().value!);
+    recentTips.set(key, { commit, branch: synced.branch, at: Date.now() });
+  }
+  const release = borrowRelease(synced.mirror, synced.persistent, releaseUse);
+  try { return await read(synced.mirror, options.commit ?? commit, synced.branch); }
+  finally { await release(); }
+}
+
+/** The commit `readMirrored` was asked for is not on origin any more (a
+ * force-push removed it) or was never a commit of that repository. */
+export class MirroredCommitMissing extends Error {
+  constructor() { super('That version is no longer in the repository.'); }
+}
+
+/** Tips `readMirrored` last saw origin advertise, by mirror and branch. */
+const recentTips = new Map<string, { commit: string; branch: string; at: number }>();
+
+function usesPersistentMirrors(): boolean { return maxBytes() > 0 && process.platform === 'linux'; }
+
+function persistentMirror(source: string, scope: string | undefined): string {
+  return path.join(mirrorRoot(), `${crypto.createHash('sha256').update(JSON.stringify([scope ?? null, sshUser(source),
+    canonicalRepositoryIdentity(source)])).digest('hex').slice(0, 32)}.git`);
+}
+
+/** Ask origin for its tips with the caller's credential, then fetch into the
+ * mirror whichever wanted branches it lacks. Returns holding the update lock
+ * (`releaseUpdate`), which the caller releases once it borrows the mirror. */
+async function syncMirror(source: string, env: Record<string, string>,
+  options: { branch?: string; also?: string[]; scratch: string; scope?: string }): Promise<{
+    mirror: string; persistent: boolean; branch?: string; wanted: string[]; releaseUpdate?: () => void }> {
+  const named = [options.branch, ...(options.also ?? [])].filter((name): name is string => name !== undefined);
+  for (const name of named) if (!validGitBranch(name)) throw new Error(`Git broker rejected invalid branch "${name}"`);
+  const listed = await git(options.scratch, ['ls-remote', '--symref', source, 'HEAD', ...named.map((name) => `refs/heads/${name}`)],
+    { env, timeoutMs: 2 * 60_000 });
+  if (listed.code !== 0) throw new Error(listed.stderr || listed.stdout || 'git ls-remote failed');
+  const advertised = parseAdvertisement(listed.stdout);
+  if (options.branch && !advertised.tips[options.branch])
+    throw new Error(`Remote branch ${options.branch} not found in upstream origin`);
+  const branch = options.branch ?? advertised.head;
+  const wanted = [...new Set([branch, ...(options.also ?? [])])]
+    .filter((name): name is string => Boolean(name && advertised.tips[name]));
+
+  const persistent = usesPersistentMirrors();
+  const mirror = persistent ? persistentMirror(source, options.scope) : path.join(options.scratch, 'mirror.git');
+  if (persistent) fs.mkdirSync(mirrorRoot(), { recursive: true });
+  const releaseUpdate = persistent ? await acquireFileLock(lockFile(mirror, 'lock'), { waitMs: LOCK_WAIT_MS }) : undefined;
+  try {
+    await ensureMirror(mirror);
+    const stale: string[] = [];
+    for (const name of wanted) {
+      const local = await git(mirror, ['rev-parse', '--verify', '--quiet', `refs/heads/${name}^{commit}`]);
+      if (local.code !== 0 || local.stdout.trim() !== advertised.tips[name]) stale.push(name);
+    }
+    if (stale.length) {
+      await dropConflictingRefs(mirror, stale);
+      const fetched = await git(mirror, [...QUIET_REPOSITORY, 'fetch', '--no-tags', '--no-write-fetch-head', source,
+        ...stale.map((name) => `+refs/heads/${name}:refs/heads/${name}`)], { env, timeoutMs: 10 * 60_000 });
+      if (fetched.code !== 0) throw new Error(fetched.stderr || fetched.stdout || 'git fetch failed');
+      if (persistent) await collectGarbage(mirror);
+    }
+  } catch (error) {
+    releaseUpdate?.();
+    throw error;
+  }
+  return { mirror, persistent, branch, wanted, releaseUpdate };
+}
+
+/** Stop borrowing a mirror: touch it (its mtime orders eviction), drop the
+ * shared `.use` lock and evict what no longer fits. */
+function borrowRelease(mirror: string, persistent: boolean, releaseUse: (() => void) | undefined): () => Promise<void> {
   let released = false;
-  return { clone, release: async () => {
+  return async () => {
     if (released) return;
     released = true;
     if (!persistent) return;
-    // The mirror directory's mtime orders mirrors for eviction.
     const now = new Date();
     try { fs.utimesSync(mirror, now, now); } catch { /* evicted or unreadable: eviction copes */ }
     releaseUse?.();
     await evictMirrors();
-  } };
+  };
 }
 
 /** `ls-remote --symref` names the default branch and gives its tip only as

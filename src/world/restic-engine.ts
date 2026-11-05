@@ -10,7 +10,7 @@ import type { ObjectStore } from '../store/objects.js';
 import { SYSTEM_JOB_ROOT, jobStatuses, startJob, stopJobs } from './jobs.js';
 import { REPOSITORY_ROUTE, RepositoryTokens, parseRepositoryName, repositoryName, repositoryObjectKey, repositoryPassword,
   type RepositoryAccess } from './resource-repository.js';
-import { RESTIC_VERSION, hostResticBinary, resticFailure, runHostRestic, worldResticBinary, type ResticRun } from './restic.js';
+import { RESTIC_VERSION, hostResticBinary, resticFailure, runHostRestic, streamHostRestic, worldResticBinary, type ResticRun } from './restic.js';
 import { ensureWorldExcluded } from './secret-exclude.js';
 import { ResourceKeptChangingError } from './resource-conflict.js';
 import type { SnapshotVerification } from './resources.js';
@@ -122,6 +122,8 @@ export function isPartsCapture(capture: ResticCapture | PartsCapture): capture i
 }
 
 /** A resource's repository in one storage location ({@link repositoryName}). */
+/** One entry of a snapshot directory (`ResticResources.entries`). */
+export interface SnapshotEntry { name: string; type: 'dir' | 'file' | 'symlink' | 'other'; size?: number; linkTarget?: string; modifiedAt?: number }
 export interface Repository { attachment: ResourceAttachment; storageLocationId?: string; name: string }
 
 export interface ChangeSet { files: Map<string, '+' | 'M' | '-'>; removedDirectories: string[]; addedDirectories: string[] }
@@ -373,6 +375,36 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     const files: Array<{ path: string; bytes: number }> = [];
     for (const name of Object.keys(ref.parts ?? {}).sort()) files.push(...await this.files(attachment, ref.parts![name]!.snapshot));
     return files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  }
+
+  /** What is directly inside `dir` (relative to the snapshot's root, '' for
+   * the root) of a snapshot, as `restic ls` gives one directory: the project
+   * Files page. A path that is not a directory there lists nothing. */
+  async entries(repository: Repository, snapshot: string, dir: string): Promise<SnapshotEntry[]> {
+    const parent = `/${dir.replace(/^\/+|\/+$/g, '')}`.replace(/\/$/, '') || '/';
+    const run = await this.onHost(repository, 'read', false, ['ls', '--json', '--no-lock', snapshot, parent], { key: 'host' });
+    if (run.code !== 0) throw resticFailure(run, 'listing the resource');
+    const entries: SnapshotEntry[] = [];
+    for (const line of run.stdout.split('\n')) {
+      if (!line.startsWith('{')) continue;
+      const node = JSON.parse(line);
+      if (node.struct_type !== 'node' || path.posix.dirname(String(node.path)) !== parent) continue;
+      entries.push({ name: String(node.name), type: node.type === 'dir' || node.type === 'file' || node.type === 'symlink' ? node.type : 'other',
+        ...(node.type === 'file' ? { size: Number(node.size ?? 0) } : {}),
+        ...(node.type === 'symlink' && typeof node.linktarget === 'string' ? { linkTarget: node.linktarget } : {}),
+        ...(node.mtime ? { modifiedAt: Date.parse(node.mtime) } : {}) });
+    }
+    return entries;
+  }
+
+  /** One file of a snapshot, streamed as it is decrypted (`restic dump`).
+   * `done` rejects if restic fails, even after some bytes were read. */
+  async open(repository: Repository, snapshot: string, file: string): Promise<{ stream: import('node:stream').Readable; done: Promise<void>; stop: () => void }> {
+    const env = { ...await this.env(repository, await this.deps.endpoints.host(), 'read', false),
+      ...(this.deps.cacheDir ? { RESTIC_CACHE_DIR: this.deps.cacheDir } : {}), GOMAXPROCS: String(HOST_CORES) };
+    const run = streamHostRestic([...(this.deps.cacheDir ? [] : ['--no-cache']), 'dump', '--no-lock', snapshot, `/${file.replace(/^\/+/, '')}`], env);
+    return { stream: run.stdout, stop: run.stop,
+      done: run.done.then((result) => { if (result.code !== 0) throw resticFailure(result, 'reading the resource'); }) };
   }
 
   /** Split a snapshot of a whole resource into parts, one per top-level

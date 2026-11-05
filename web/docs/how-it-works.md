@@ -4,7 +4,7 @@ The few ideas behind tavya — organizations, projects, tasks, agents, worlds, t
 
 ## Organizations and projects
 
-An **organization** is a team: its people, billing, agent accounts, passwords and payment cards. A **project** belongs to one organization and is one task list, with its repositories, data, secrets and wiki.
+An **organization** is a team: its people, billing, agent accounts, passwords and payment cards. A **project** belongs to one organization and is one task list, with its repositories, data, secrets and wiki. Its **Files** tab shows the repositories, wiki and data as one folder tree, laid out as a task's world has them; a file or folder can be shared by public link when the organization allows it.
 
 ## Tasks
 

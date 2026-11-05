@@ -9,7 +9,7 @@ const path = require('node:path');
 const { chromium } = require('playwright');
 
 const WEB = path.join(__dirname, '..', '..', 'web');
-const ASSETS = new Set(['/app.js', '/styles.css', '/markdown.js', '/totp-qr.js', '/register-service-worker.js']);
+const ASSETS = new Set(['/app.js', '/styles.css', '/markdown.js', '/file-view.js', '/totp-qr.js', '/register-service-worker.js', '/vendor/highlight.min.js']);
 const REPLY = Symbol('reply');
 
 const launch = () => chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH || undefined, args: ['--no-sandbox'] });
