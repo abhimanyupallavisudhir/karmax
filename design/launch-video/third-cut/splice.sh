@@ -8,6 +8,8 @@ NEW=${NEW:-/tmp/demo/v3-assets}; MERGED=${MERGED:-/tmp/demo/v3-render-assets}; F
 rm -rf "$MERGED" && mkdir -p "$MERGED"
 [ -n "$FIRST" ] && for f in "$FIRST"/*; do ln -s "$f" "$MERGED/$(basename "$f")"; done
 for f in "$NEW"/*; do n=$(basename "$f"); [ "$n" = shots.json ] && n=v3-shots.json; rm -f "$MERGED/$n"; ln -s "$f" "$MERGED/$n"; done
+# tavya.io's logo, from the repository.
+[ -e "$MERGED/brand" ] || { mkdir -p "$MERGED/brand" && cp "$here/../../../web/brand/royal-gold-arrow/icon-512.png" "$MERGED/brand/icon-512.png"; }
 ASSETS="$MERGED" node "$here/render.cjs" "$out.tail" --from "$from" --workers "${WORKERS:-3}"
 dur=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['duration'])" "$out.tail.json")
 # The earlier render up to FROM, then the new tail; one encode, so the cut is frame-exact.

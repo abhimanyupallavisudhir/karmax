@@ -122,7 +122,7 @@ function pointerAt(w, lt, keys, clicks = [], visible = 1) {
 // ── third cut: what the capture recorded (boxes to aim at, the CLI's real output) ──
 const getJSON = (u) => { try { const x = new XMLHttpRequest(); x.open('GET', u, false); x.send(); return JSON.parse(x.responseText); } catch { return {}; } };
 const SHOTS = getJSON(A + 'v3-shots.json');
-const CLI = getJSON(A + 'cli.json');
+const CLI = [].concat(getJSON(A + 'cli.json')).filter((e) => e && e.cmd); // [] when only later scenes are rendered
 const bx = (shot, key) => SHOTS[shot]?.boxes?.[key] ?? null;
 /** Camera [z, fx, fy] aimed at a box: its centre, or for a big box its top-left part. */
 const at = (shot, key, z, dx = 0, dy = 0) => {
@@ -481,7 +481,7 @@ scene(...next(8.0), (L, dur) => {
     w.seq('ending-project/', 'ending-project', Math.round(ramp(lt, 1.35, 2.25, (p) => p) * (NP - 1)));
     w.seq('ending-task/', 'ending-task', Math.round(ramp(lt, 3.85, 5.05, (p) => p) * (NT - 1)));
     showAt(w, lt, [[0, 'ending-home'], [1.2, 'ending-project/'], [2.95, 'ending-empty'], [3.7, 'ending-task/'], [5.55, 'ending-started']], 0.18);
-    w.url(host(lt < 2.95 ? '/personal' : lt < 5.55 ? '/personal/big-idea' : '/personal/big-idea/tasks/1'));
+    w.url(host(lt < 2.95 ? '/personal' : lt < 5.55 ? '/personal/big-idea' : '/personal/big-idea/tasks/2'));
     const [z, fx, fy] = kf(lt, [[0.3, [1, 720, 450]], [1.0, [1.35, add[0] + 160, add[1] + 90]], [1.2, [1.25, 720, 420]], [2.4, [1.35, ...mid('ending-project', 'name', [720, 400])]], [2.9, [1.25, 720, 420]],
       [3.2, [1, 720, 450]], [3.9, at('ending-task', 'prompt', 1.6)], [5.2, at('ending-task', 'prompt', 1.6)], [5.6, [1, 720, 450]], [6.4, at('ending-started', 'msg', 1.45)], [dur, at('ending-started', 'msg', 1.5)]]);
     w.camera(z, fx, fy);
