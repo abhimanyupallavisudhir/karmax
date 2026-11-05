@@ -437,6 +437,8 @@ export class MockAdapter implements AgentAdapter {
             const result = await handler(args ? JSON.parse(args) : {});
             ctx.emitActivity({ id: `tool-${name}-${outputs.length}`, kind: 'tool', phase: 'completed', title: `tavya · ${name}`, detail: String(result).slice(0, 1600) });
             outputs.push(`${name}: ${String(result).split('\n')[0]}`);
+            // A request parked for a person (a credential, a spend) waits like a pause.
+            if (/"status"\s*:\s*"needs_approval"/.test(String(result))) complete = false;
           } catch (e: any) {
             ctx.emitActivity({ id: `tool-${name}-${outputs.length}`, kind: 'tool', phase: 'failed', title: `tavya · ${name}`, detail: String(e?.message ?? e) });
             outputs.push(`${name} refused: ${e?.message ?? e}`);

@@ -197,6 +197,32 @@ entry(r'^Create a launch video for tavya', [
     '@say ' + esc('''The launch video is ready: about two minutes, 1080p at 60 fps, and it loops. Open it in the review panel.'''),
 ], pace=1600)
 
+# ── admin_docs: a flight, with a vault login it must be allowed to use ────
+FLIGHT = 'United UA 901, Sun 3 Jan: San Francisco 4:10 pm → London Heathrow 10:30 am (+1)'
+entry(r'^Book me the cheapest direct flight to London', [
+    '@step read Read documents/passport.pdf :: Passport · valid to 2031',
+    '@step read Read documents/loyalty-programmes.md :: United MileagePlus · BA Executive Club · Virgin Atlantic Flying Club',
+    '@step search Direct flights SFO → London, Sun 3 Jan :: UA 901  16:10 → 10:30+1  $486\\nVS 20   16:45 → 11:00+1  $541\\nBA 284  21:30 → 15:40+1  $574\\nBA 286  19:55 → 14:10+1  $598',
+    '@step think UA 901 is the cheapest direct flight and leaves at a sane hour. Booked on the MileagePlus account, the miles count and the passport is already on file.',
+    '@tool fill_credential {"domain": "united.com", "field": "password", "selector": "#password"}',
+    '@say ' + esc(f'''The cheapest direct flight with reasonable times is **{FLIGHT}**, Economy, **$486**.
+
+To book it on your MileagePlus account (so the miles are yours and your passport is already on file) I need to sign in to united.com with your **United login** from the vault. Allow it below and I'll finish the booking.'''),
+], pace=1500)
+entry(r'credential decision\]\s+Access to "flights/united" was approved', [
+    '@step tool chrome-devtools · navigate_page :: https://www.united.com/en/us/fsr/choose-flights?f=SFO&t=LHR&d=2027-01-03',
+    '@step tool tavya · fill_credential :: MileagePlus login typed into united.com (the agent never sees the password)',
+    '@step tool chrome-devtools · fill_form :: Traveller from your saved passport · seat 23A (window, as in your profile)',
+    '@tool request_spend {"amount": 48600, "card_name": "abhimanyu", "merchant": "United Airlines", "why": "UA 901 SFO → LHR, 3 Jan, Economy"}',
+    '@step tool tavya · fill_payment_card :: Card details filled into united.com checkout (never shown to the agent)',
+    '@summary Booked UA 901 to London on 3 Jan, $486.',
+    '@say ' + esc(f'''**Booked: {FLIGHT}.**
+
+- Economy, window seat **23A**, **$486** on your card ($14 under your budget).
+- Confirmation **K7Q2XD**; your MileagePlus number is on the booking, so the miles are yours.
+- The e-ticket went to your e-mail, and I put the flight in the wiki under `travel/2027-01-london`.'''),
+], pace=1100)
+
 # ── Photos via the CLI ───────────────────────────────────────────────────
 entry(r'^Sort my photos', [
     '@step command exiftool -T -DateTimeOriginal -GPSPosition photos/*.jpg :: 37 image files read',

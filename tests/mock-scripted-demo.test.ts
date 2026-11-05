@@ -25,7 +25,7 @@ describe('mock agent: scripted demos', () => {
       signalCompletion(summary) { completion = summary; },
       openPr() { opened = true; },
       confirmDecision(d) { confirmed = d; },
-      async platformRequest(method, p, body) { opts.requests?.push([method, p, body]); return { ok: true, id: 'task_new' }; },
+      async platformRequest(method, p, body) { opts.requests?.push([method, p, body]); return p === '/api/vault/resolve' ? { status: 'needs_approval', requestId: 'req_1' } : { ok: true, id: 'task_new' }; },
     };
     const world = { handle: { id: 'task_self' }, async writeFile() {}, async exec() { return { code: 0, stdout: '', stderr: '' }; } } as any;
     const messages: Message[] = [{ id: 'm0', role: 'user', text, ts: 0 }];
@@ -71,6 +71,16 @@ describe('mock agent: scripted demos', () => {
     const review = await run('Please review', { role: 'confirm', systemPrompt: 'Instructions for you:\nCheck the sitemap is valid.' });
     expect(review.confirmed).toEqual({ action: 'confirm', text: 'Checked the sitemap.' });
     expect(review.turn.output).not.toContain('Do agent');
+  });
+
+  it('waits for a request a tool parked for approval instead of finishing the turn', async () => {
+    fs.writeFileSync(script, JSON.stringify([{ match: '^Book me', directives:
+      '@tool get_credential {"item_id": "vi_united"}\n@say I need your United login.' }]));
+    process.env.KARMAX_MOCK_SCRIPT = script;
+    const { turn, completion, opened } = await run('Book me a flight');
+    expect(turn.output).toBe('I need your United login.');
+    expect(completion).toBeUndefined();
+    expect(opened).toBe(false);
   });
 
   it('without a script, keeps the plain directive behaviour', async () => {

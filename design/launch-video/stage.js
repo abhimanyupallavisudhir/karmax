@@ -1,6 +1,6 @@
 // The recording stage. In the top page (/__stage) it builds a brand backdrop,
 // a browser window holding the real console in an iframe, a caption band, a
-// cursor, title cards, a terminal and a checklist; `window.__demo` drives them.
+// cursor, title cards, a terminal and a feature grid; `window.__demo` drives them.
 // Inside the console's frame it only makes the console show Mac shortcuts.
 (() => {
   try { Object.defineProperty(Navigator.prototype, 'platform', { get: () => 'MacIntel' }); } catch {}
@@ -53,22 +53,28 @@
   #term .p{color:#9d98ff}#term .ok{color:#62d6a0}#term .dim{color:#8a8aa2}
   #term .caret{display:inline-block;width:9px;height:18px;background:#e8e8f2;vertical-align:-3px;animation:blink 1s steps(1) infinite}
   @keyframes blink{50%{opacity:0}}
-  #list{position:absolute;left:50%;top:50%;width:860px;transform:translate(-50%,-47%);opacity:0;transition:all .5s cubic-bezier(.2,.9,.25,1);z-index:14;
-    background:#fff;border-radius:20px;box-shadow:0 40px 110px rgba(30,30,60,.25),0 0 0 1px rgba(20,20,40,.06);padding:26px 32px 18px;color:#16161d}
-  #list.on{opacity:1;transform:translate(-50%,-50%)}
-  #list h2{margin:0 0 10px;font-size:28px;letter-spacing:-.02em}
-  #list .row{display:flex;align-items:center;gap:15px;padding:10px 4px;border-top:1px solid #ececf1;font-size:21px;font-weight:500;opacity:0;transform:translateY(8px);transition:all .35s ease}
-  #list .row.on{opacity:1;transform:none}
-  #list .box{flex:none;width:25px;height:25px;border-radius:8px;border:2px solid #c9c9d6;display:grid;place-items:center;transition:all .22s ease}
-  #list .row.done .box{background:#5b5bd6;border-color:#5b5bd6}
-  #list .box svg{opacity:0;transform:scale(.4);transition:all .25s cubic-bezier(.2,.9,.25,1.4)}
-  #list .row.done .box svg{opacity:1;transform:none}
-  #list .hint{margin-left:auto;font-size:16px;color:#8a8aa2;font-weight:500}`;
+  #grid{position:absolute;left:50%;top:47%;width:1290px;transform:translate(-50%,-48%);opacity:0;transition:opacity .45s ease,transform .6s cubic-bezier(.2,.9,.25,1);z-index:14;color:#16161d}
+  #grid.on{opacity:1;transform:translate(-50%,-50%)}
+  #grid h2{margin:0 0 18px;font-size:34px;font-weight:700;letter-spacing:-.03em;text-align:center}
+  #grid .tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+  #grid .tile{background:#fff;border-radius:18px;overflow:hidden;box-shadow:0 18px 50px rgba(30,30,60,.16),0 0 0 1px rgba(20,20,40,.06);opacity:0;transform:translateY(16px) scale(.97);transition:all .55s cubic-bezier(.2,.9,.25,1)}
+  #grid .tile.on{opacity:1;transform:none}
+  #grid .shot{position:relative;height:218px;overflow:hidden;background:#f7f8fa;border-bottom:1px solid #ececf1}
+  #grid .shot img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform-origin:var(--o,50% 50%)}
+  #grid .tile.on .shot img{animation:kb 6s cubic-bezier(.3,.1,.3,1) forwards}
+  #grid .shot img.b{opacity:0}
+  #grid .tile.on .shot img.b{animation:kb 6s cubic-bezier(.3,.1,.3,1) forwards,xfade 6s ease forwards}
+  @keyframes kb{from{transform:scale(1)}to{transform:scale(1.07)}}
+  @keyframes xfade{0%,32%{opacity:0}42%,100%{opacity:1}}
+  #grid .cap{display:flex;align-items:center;gap:14px;padding:15px 18px 16px}
+  #grid .ico{flex:none;width:42px;height:42px;border-radius:12px;background:#efeffd;color:#5b5bd6;display:grid;place-items:center}
+  #grid .t{font-size:19px;font-weight:650;letter-spacing:-.015em;line-height:1.2}
+  #grid .h{font-size:14.5px;color:#7a7a90;font-weight:500;margin-top:3px}`;
   const MARK = '<img src="/brand/icon.svg" width="100%" height="100%" alt="">';
   const CURSOR = '<svg viewBox="0 0 24 24" width="24" height="24"><path d="M4 2.5v18l4.6-4.3 2.9 6.7 3.2-1.4-2.9-6.6h6.5z" fill="#111" stroke="#fff" stroke-width="1.5" stroke-linejoin="round"/></svg>';
-  const TICK = '<svg width="15" height="15" viewBox="0 0 16 16"><path d="M3 8.5 6.5 12 13 4.5" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-  const $ = (q) => document.querySelector(q);
+    const $ = (q) => document.querySelector(q);
   let pos = [W / 2, H / 2 + 60];
+  let cam = { s: 1, tx: 0, ty: 0 };
   const ease = (t) => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
   const place = () => { $('#cursor').style.transform = `translate(${pos[0] - 4}px,${pos[1] - 2}px)`; };
   function build(src) {
@@ -79,7 +85,7 @@
         <div class="view"><iframe id="app" name="app" src="${src}"></iframe></div></div>
       <div id="band"><div id="caption"></div></div>
       <div id="layer"><div id="scrim"></div><div id="term"><div class="tbar"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="title">zsh</span></div><pre></pre></div>
-        <div id="list"></div><div id="card"></div><div id="cursor">${CURSOR}</div></div>`;
+        <div id="grid"></div><div id="card"></div><div id="cursor">${CURSOR}</div></div>`;
     place();
     setInterval(() => { try { const l = $('#app').contentWindow.location; const p = decodeURIComponent(l.pathname + l.search); $('#path').textContent = p === '/' ? '' : p; } catch {} }, 150);
   }
@@ -99,6 +105,8 @@
       });
     },
     where() { return pos; },
+    /** A stage point as it would be with the camera at rest. */
+    unzoom(x, y) { return [X0 + (x - X0 - cam.tx) / cam.s, Y0 + (y - Y0 - cam.ty) / cam.s]; },
     ripple() { const r = document.createElement('div'); r.className = 'ripple'; r.style.left = `${pos[0]}px`; r.style.top = `${pos[1]}px`; $('#layer').appendChild(r); setTimeout(() => r.remove(), 600); },
     cursorVisible(on) { $('#cursor').style.opacity = on ? '1' : '0'; },
     caption(html) {
@@ -110,7 +118,11 @@
     /** Zoom the window so stage point (fx, fy) is centred at scale s. */
     camera(s = 1, fx = W / 2, fy = H / 2, ms = 900) {
       const w = $('#win');
-      const tx = s === 1 ? 0 : W / 2 - (fx - X0) * s - X0, ty = s === 1 ? 0 : H / 2 - (fy - Y0) * s - Y0;
+      let tx = s === 1 ? 0 : W / 2 - (fx - X0) * s - X0, ty = s === 1 ? 0 : H / 2 - (fy - Y0) * s - Y0;
+      // Zoomed in, the window always fills the stage: no backdrop at an edge.
+      if (WW * s >= W) tx = Math.min(-X0, Math.max(W - X0 - WW * s, tx));
+      if ((WH + BAR) * s >= H) ty = Math.min(-Y0, Math.max(H - Y0 - (WH + BAR) * s, ty));
+      cam = { s, tx, ty };
       w.style.transition = ms ? `transform ${ms}ms cubic-bezier(.45,.05,.2,1)` : 'none';
       w.style.transform = s === 1 ? '' : `translate(${tx}px,${ty}px) scale(${s})`;
       return new Promise((r) => setTimeout(r, ms));
@@ -122,7 +134,7 @@
       void c.offsetWidth; c.classList.add('on');
     },
     // The tagline's line is laid out (invisible) from the first frame, so adding it moves nothing.
-    cardInstant(sub = 'The to-do list for AI agents.') { const c = $('#card'); c.style.transition = 'none'; c.innerHTML = `<div class="mark">${MARK}</div><div class="word">tavya</div><div class="sub" style="opacity:0">${sub}</div>`; c.querySelectorAll('*').forEach((e) => { e.style.transition = 'none'; }); c.classList.add('on'); void c.offsetWidth; c.style.transition = ''; },
+    cardInstant(sub = 'The agentic to-do list that completes itself.') { const c = $('#card'); c.style.transition = 'none'; c.innerHTML = `<div class="mark">${MARK}</div><div class="word">tavya</div><div class="sub" style="opacity:0">${sub}</div>`; c.querySelectorAll('*').forEach((e) => { e.style.transition = 'none'; }); c.classList.add('on'); void c.offsetWidth; c.style.transition = ''; },
     /** A still laid exactly over stage rect (x, y, w, h), then grown to fill the stage. */
     still(src, x, y, w, h, ms = 1500) {
       const img = document.createElement('img'); img.id = 'still'; img.src = src;
@@ -150,15 +162,16 @@
         for (const ch of text) { pre.querySelector('.caret')?.remove(); pre.insertAdjacentText('beforeend', ch); api.term.caret(); await new Promise((r) => setTimeout(r, ms * (0.6 + Math.random() * 0.8))); }
       },
     },
-    list: {
-      open(title, rows) {
-        const l = $('#list');
-        l.innerHTML = `<h2>${title}</h2>` + rows.map(([text, hint]) => `<div class="row"><span class="box">${TICK}</span><span class="txt">${text}</span>${hint ? `<span class="hint">${hint}</span>` : ''}</div>`).join('');
-        void l.offsetWidth; l.classList.add('on');
+    grid: {
+      /** tiles: [{icon (svg markup), title, hint, shots: [src, src?], origin: 'x% y%'}] */
+      open(title, tiles) {
+        const g = $('#grid');
+        g.innerHTML = `<h2>${title}</h2><div class="tiles">${tiles.map((t) => `<div class="tile"><div class="shot" style="--o:${t.origin ?? '50% 50%'}">${t.shots.map((src, k) => `<img class="${k ? 'b' : 'a'}" src="${src}" alt="">`).join('')}</div>
+          <div class="cap"><span class="ico">${t.icon}</span><div><div class="t">${t.title}</div>${t.hint ? `<div class="h">${t.hint}</div>` : ''}</div></div></div>`).join('')}</div>`;
+        return Promise.all([...g.querySelectorAll('img')].map((i) => i.decode().catch(() => {}))).then(() => { void g.offsetWidth; g.classList.add('on'); });
       },
-      show(i) { document.querySelectorAll('#list .row')[i]?.classList.add('on'); },
-      tick(i) { document.querySelectorAll('#list .row')[i]?.classList.add('done'); },
-      close() { $('#list').classList.remove('on'); },
+      show(i) { document.querySelectorAll('#grid .tile')[i]?.classList.add('on'); },
+      close() { $('#grid').classList.remove('on'); },
     },
   };
   window.__demo = api;
