@@ -517,4 +517,6 @@ window.seek = seek;
 window.DURATION = DURATION;
 window.FPS = FPS;
 window.SCENES = scenes.map((s) => [s.start, s.end]);
-window.CLICKS = [];
+// Cursor clicks (scene, offset): the score (../first-cut/music.py) puts a tick on each.
+window.CLICKS = [[2, 3.85], [2, 5.65], [5, 6.35], [5, 7.4], [5, 11.0], [7, 1.9], [7, 3.95], [7, 5.4], [10, 4.9], [11, 2.05], [14, 0.95], [14, 2.75], [14, 3.55]]
+  .map(([i, d]) => scenes[i].start + d);

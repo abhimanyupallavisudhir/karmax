@@ -14,7 +14,7 @@ browser window with a camera, the dark backdrop), extended:
   started, then the end card (tagline, tavya.io, "Open to everyone, starting today.").
   The earlier recursive ending (a task delivering this video, the camera falling into its
   first frame) is in git history.
-- Music: `../music.py`.
+- Music: the first cut's score (`../first-cut/music.py`), timed to this cut's scene starts and cursor clicks (owner's change, 2026-11-05; task #820's `../music.py` before).
 
 ```bash
 # The clone (../fetch.py, ../build.sh), then the new screens (≈30 min; a regex re-shoots some):
