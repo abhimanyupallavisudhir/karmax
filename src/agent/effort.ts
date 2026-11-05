@@ -111,7 +111,8 @@ export function claudeMessagesEffort(model: string | undefined, effort?: string)
   // Facts are taken from the installed @anthropic-ai/claude-agent-sdk's own
   // EffortLevel docs: the parameter is accepted by Opus 4.5+, Sonnet 4.6 and
   // Fable 5; `xhigh` by Fable 5 and Opus 4.7+; `max` by Fable 5, Opus 4.6+ and
-  // Sonnet 4.6. That list is illustrative of what exists today, NOT an
+  // Sonnet 4.6 (Claude Code 2.1.318's own picker adds every level on Sonnet 5.5
+  // and Haiku 5.5). That list is illustrative of what exists today, NOT an
   // exhaustive registry — so each threshold below sits one generation above
   // the newest member the SDK is known to REJECT, and any later generation of
   // the family inherits the capability (see `claudeGeneration()` for why an
@@ -120,7 +121,7 @@ export function claudeMessagesEffort(model: string | undefined, effort?: string)
   // ids stay correctly excluded, a future one is assumed to have caught up.
   const floors: Record<ClaudeFamily, { effort: number; max: number; xhigh: number }> = {
     opus: { effort: 4005, max: 4006, xhigh: 4007 }, // 4.5 / 4.6 / 4.7
-    sonnet: { effort: 4006, max: 4006, xhigh: 5000 }, // 4.6; no sonnet takes xhigh yet
+    sonnet: { effort: 4006, max: 4006, xhigh: 5000 }, // 4.6 / 4.6 / 5
     haiku: { effort: 5000, max: 5000, xhigh: 5000 }, // 4.5 rejects the parameter
     fable: { effort: 5000, max: 5000, xhigh: 5000 },
     mythos: { effort: 5000, max: 5000, xhigh: 5000 },

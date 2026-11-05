@@ -298,7 +298,7 @@ describe('remote subscription agents', () => {
       fs.mkdirSync(stubs); fs.mkdirSync(home, { recursive: true });
       const count = path.join(root, 'installs');
       const cli = { broken: 'echo "Error: claude native binary not installed." >&2; exit 1',
-        working: 'case "$1" in --version) echo "2.1.281 (Claude Code)" ;; *) echo "agent args=$*" ;; esac' };
+        working: 'case "$1" in --version) echo "2.1.318 (Claude Code)" ;; *) echo "agent args=$*" ;; esac' };
       fs.writeFileSync(path.join(stubs, 'npx'), [
         '#!/bin/sh',
         `n=$(( $(cat ${count} 2>/dev/null || echo 0) + 1 )); echo $n > ${count}`,
@@ -360,7 +360,7 @@ describe('remote subscription agents', () => {
           write: async () => {}, resize: async () => {}, close: async () => {} });
         world.exec = async () => ({ code: 0, stdout: '', stderr: '' });
         const child = new RemoteSpawnedProcess(world, 'command', '/workspace', {}, undefined, '/home/agent-stderr.log',
-          undefined, undefined, '@anthropic-ai/claude-code@2.1.281');
+          undefined, undefined, '@anthropic-ai/claude-code@2.1.318');
         const exited = new Promise((resolve) => child.once('exit', resolve));
         await Promise.resolve();
         exit(code);
@@ -369,7 +369,7 @@ describe('remote subscription agents', () => {
       };
       const unavailable = await ending(REMOTE_CLI_UNAVAILABLE);
       expect(unavailable).toBeInstanceOf(RemoteAgentCliUnavailable);
-      expect(unavailable?.message).toBe('Could not start @anthropic-ai/claude-code@2.1.281 in the sandbox: it did not run after 3 fresh installs '
+      expect(unavailable?.message).toBe('Could not start @anthropic-ai/claude-code@2.1.318 in the sandbox: it did not run after 3 fresh installs '
         + '(npm skips a native binary it fails to download). Retry installs it again.');
       expect(await ending(1)).toBeUndefined();
     });
@@ -531,7 +531,7 @@ describe('remote subscription agents', () => {
     expect(remoteAgentCommand('claude', '/usr/bin/node', ['/host/sdk/cli.js', '--resume', 's']).args)
       .toEqual(expect.arrayContaining([`@anthropic-ai/claude-code@${pinned}`, '--print', '--resume', 's']));
     expect(remoteAgentCommand('codex', 'codex', ['app-server']).args)
-      .toEqual(expect.arrayContaining(['@openai/codex@0.162.1', 'app-server']));
+      .toEqual(expect.arrayContaining(['@openai/codex@0.166.0', 'app-server']));
   });
 
   it('exports only the current Claude session and never replaces newer or divergent history', async () => {
@@ -786,7 +786,7 @@ describe('remote subscription agents', () => {
     const launcher = world.openedPty?.command?.match(/^exec sh '\/workspace\/([^']+)'$/)?.[1];
     expect(launcher).toMatch(/^\.karmax-injection\/agent\/codex\/[0-9a-f]+\/launch-[0-9a-f-]+\.sh$/);
     const script = world.files.get(launcher!)?.toString() ?? '';
-    expect(script).toContain('@openai/codex@0.162.1');
+    expect(script).toContain('@openai/codex@0.166.0');
     expect(script).toContain('/opt/karmax/bin/codex');
     expect(script).toContain('app-server');
     expect(script).toContain('stty raw -echo');

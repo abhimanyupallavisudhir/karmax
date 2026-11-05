@@ -15,6 +15,9 @@ describe('reasoning-effort → provider parameter mapping (SPEC §10.5)', () => 
       expect(claudeMessagesEffort('claude-opus-4-8', 'high')).toBe('high');
       expect(claudeMessagesEffort('claude-sonnet-4-6', 'medium')).toBe('medium');
       expect(claudeMessagesEffort('claude-opus-4-8', 'xhigh')).toBe('xhigh');
+      // Claude Code 2.1.318 lists every level for Sonnet 5.5 and Haiku 5.5.
+      for (const model of ['claude-sonnet-5-5', 'claude-haiku-5-5'])
+        for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) expect(claudeMessagesEffort(model, effort)).toBe(effort);
     });
     it('sends nothing on models that reject the parameter', () => {
       expect(claudeMessagesEffort('claude-sonnet-4-5', 'high')).toBeUndefined();

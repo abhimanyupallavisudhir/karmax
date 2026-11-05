@@ -48,6 +48,11 @@ describe('classifyLimitError', () => {
     expect(c.resetHint).toBe('3:45pm');
   });
 
+  it('classifies the 5-hour limit by the name Claude Code 2.1.312+ gives it', () => {
+    const c = classifyLimitError("You've hit your 5-hour limit · resets 3:45pm");
+    expect(c).toMatchObject({ limited: true, window: '5h', resetHint: '3:45pm' });
+  });
+
   it('classifies a weekly-limit string', () => {
     const c = classifyLimitError("You've hit your weekly limit · resets Mon 12:00am");
     expect(c.limited).toBe(true);

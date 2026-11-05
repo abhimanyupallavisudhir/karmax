@@ -305,6 +305,7 @@ def write_codex(
     mode: str = "transcript",
     cwd: str | None = None,
     session_id: str | None = None,
+    model_provider: str = "openai",
     **_: Any,
 ) -> Rendered:
     validate_conversation(conv)
@@ -332,7 +333,8 @@ def write_codex(
                 "cli_version": __version__,
                 "source": "cli",
                 "thread_source": "user",
-                "model_provider": "openai",
+                # Codex 0.166+ resumes a thread only under the provider it was saved with.
+                "model_provider": model_provider,
                 "base_instructions": None,
                 "panagent": {"schema": conv["schema"], "source": conv["source"], "warnings": conv.get("warnings", [])},
             },

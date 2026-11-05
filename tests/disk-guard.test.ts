@@ -89,8 +89,13 @@ describe('out of disk', () => {
       'SqliteError: database or disk is full',
       'OSError: [Errno 28] No space left on device',
       'write /tmp/x: disk quota exceeded',
+      // Claude Code 2.1.301+ names the disk instead of a raw ENOSPC (its login refresh
+      // used to say "Please run /login", and the temp-volume check is new in 2.1.309).
+      'Claude provider invalid_request: OAuth access token could not be refreshed: the disk that holds the Claude Code config directory, or the disk quota on it, is full; delete files you no longer need on that disk and try again',
+      'Failed to refresh OAuth token: the disk that holds the Claude Code config directory (~/.claude by default), or your disk quota on it, is full. Delete files you no longer need on that disk and retry',
+      "Disk full: this computer's volume holding /tmp/claude-1000 (Claude Code's temporary directory) has 3 MB free",
     ]) expect(isDiskFullMessage(message)).toBe(true);
-    for (const message of ['exited with code 127', 'Error: spawn ENOENT', 'disk usage is fine', 'rate limited'])
+    for (const message of ['exited with code 127', 'Error: spawn ENOENT', 'disk usage is fine', 'rate limited', 'the disk is fully encrypted'])
       expect(isDiskFullMessage(message)).toBe(false);
   });
 

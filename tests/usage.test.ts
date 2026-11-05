@@ -91,6 +91,19 @@ describe('parseUsagePanel', () => {
     expect(r.session!.resetAt!).toBeLessThan(NOW + 2 * 86_400_000);
   });
 
+  it('parses the panel Claude Code 2.1.318 printed with no session row', () => {
+    const panel = [
+      'You are currently using your subscription to power your Claude Code usage',
+      '',
+      'Current week (all models): 99% used · resets Nov 9, 2:59am (UTC)',
+      'Current week (Fable): 0% used · resets Nov 9, 3am (UTC)',
+    ].join('\n');
+    const r = parseUsagePanel(panel, Date.UTC(2026, 10, 5));
+    expect(r).toMatchObject({ ok: true, week: { pct: 99, resetLabel: 'Nov 9, 2:59am', tz: 'UTC', resetAt: Date.UTC(2026, 10, 9, 2, 59) },
+      models: [{ name: 'Fable', pct: 0, resetLabel: 'Nov 9, 3am', tz: 'UTC' }] });
+    expect(r.ok && r.session).toBeUndefined();
+  });
+
   it('reads a header without numbers as a failed check, not a setup-token login', () => {
     const r = parseUsagePanel(HEADER_ONLY, NOW);
     expect(r).toEqual({ ok: false, at: NOW, reason: 'probe-failed: no usage numbers' });
