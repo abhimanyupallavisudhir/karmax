@@ -1,4 +1,6 @@
 import { Worker, NativeConnection, Runtime, DefaultLogger, WorkflowBundle } from '@temporalio/worker';
+import { Context } from '@temporalio/activity';
+import { ApplicationFailure } from '@temporalio/common';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { TASK_QUEUE, TemporalConn } from './config.js';
@@ -8,6 +10,10 @@ import { memoryBudget, separateWorkerMode, type HeapUsage, type MemoryBudget } f
 export interface WorkerHandle {
   run(): Promise<void>;
   shutdown(): void;
+  /** Fail, as retryable, every running activity that does not heartbeat, so
+   * Temporal retries it on the next worker now. Only for a worker about to
+   * exit: the abandoned work still runs here until the process ends. */
+  abandonActivities(): void;
   /** Cached workflows, and the heap of the thread they run in (RT-35). */
   status(): Promise<WorkerStatus>;
   /** Heap snapshots of the workflow threads (each forces a full GC first).
@@ -126,6 +132,8 @@ export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, op
   const source = opts.workflowBundle
     ? { workflowBundle: opts.workflowBundle }
     : { workflowsPath: fileURLToPath(new URL('../workflows/index.ts', import.meta.url)) };
+  /** Running activities without a heartbeat, by how to abandon them. */
+  const running = new Set<(error: Error) => void>();
   const worker = await Worker.create({
     connection,
     namespace: conn.namespace,
@@ -157,6 +165,16 @@ export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, op
     // harness boot in the test suite (main.ts has its own exit backstop for a
     // truly wedged drain).
     shutdownGraceTime: opts.shutdownGraceTime ?? '1 second',
+    interceptors: { activity: [() => ({ inbound: { execute: async (input, next) => {
+      // A heartbeating activity of a dead worker is retried at its heartbeat
+      // timeout; one that does not heartbeat only at its start-to-close.
+      if (Context.current().info.heartbeatTimeoutMs) return next(input);
+      let abandon!: (error: Error) => void;
+      const abandoned = new Promise<never>((_, reject) => { abandon = reject; });
+      running.add(abandon);
+      try { return await Promise.race([next(input), abandoned]); }
+      finally { running.delete(abandon); }
+    } } })] },
   });
 
   let runPromise: Promise<void> | undefined;
@@ -168,6 +186,13 @@ export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, op
     },
     shutdown() {
       worker.shutdown();
+    },
+    abandonActivities() {
+      // A deploy killed the worker holding task #826's GitHub check: Temporal
+      // retried it after its 5-minute start-to-close, and the task's Confirm
+      // waited for it all that time.
+      for (const abandon of running) abandon(ApplicationFailure.retryable(
+        'The worker stopped (a restart or deploy) before this finished; it runs again on the next one.', 'WorkerStopped'));
     },
     async status() {
       return { cachedWorkflows: worker.getStatus().numCachedWorkflows, cacheLimit,

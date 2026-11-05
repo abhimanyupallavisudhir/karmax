@@ -139,7 +139,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.equal(saved[1].workflow, 'software-dev');
     await closeForm();
 
-    // ── The form's template button, beside the workflow: the same picker ──
+    // ── The form's template button, at the end of its bar: the same picker ──
     const templateButton = page.locator('#tf-template');
     const pickInForm = async (key) => {
       await templateButton.click();
@@ -152,7 +152,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await page.locator('#tpl-in').waitFor();
     await page.keyboard.press('2');
     await templateButton.waitFor(); // #tf-page alone may still be the loading page
-    assert.equal(await page.locator('#tf-template + #tf-wf').count(), 1, 'right before the workflow');
+    assert.equal(await page.locator('.tf-head-end > #tf-template:last-child').count(), 1, 'last in the bar');
     assert.equal(await templateButton.innerText(), 'Release notes', 'names the template the form started from');
     // Another template reloads the form from it; an untouched prompt is the new template's.
     await pickInForm('1');

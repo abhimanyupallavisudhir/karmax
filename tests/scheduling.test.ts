@@ -269,6 +269,54 @@ describe('what the scheduler learns', () => {
     expect(weekly).toMatchObject({ kind: 'week', capacity: 900, used: 0 });
   });
 
+  // Production 2026-11-05: logins whose metered spend reached 50 $ in one 5-hour
+  // window and 208 $ in one week had learned 25 $ and 55 $, so the scheduler
+  // read their quota as gone and held or parked work while they still served.
+  it('learns a login\'s capacity without bias when spend lands at turn end and readings arrive during turns', async () => {
+    const learn = async (every: number, seed: number) => {
+      const store = kv();
+      const credential = 'login:org:claude:sim';
+      const truth = 300;
+      let state = seed >>> 0;
+      const random = () => { state = (state * 1664525 + 1013904223) >>> 0; return state / 2 ** 32; };
+      const turns: { end: number; rate: number; spent: number; next: number }[] = [];
+      let used = 0;
+      for (let t = 0; used / truth < 1; t += 0.25) {
+        while (turns.length < 5) turns.push({ end: t + 1 + -Math.log(random()) * 15, rate: 0.1 + random() * 0.4, spent: 0, next: t });
+        for (const turn of turns.slice()) {
+          turn.spent += turn.rate * 0.25;
+          used += turn.rate * 0.25;
+          if (t >= turn.next) {
+            turn.next += every;
+            await recordQuotaReading(store, credential, 'week', { utilization: Math.min(1, used / truth), resetsAt: 7 * DAY * 60_000, at: t * 60_000 });
+          }
+          if (t >= turn.end) {
+            await recordTurnSpend(store, { root: 'T', credential, usd: turn.spent, minutes: 1, at: t * 60_000 });
+            turns.splice(turns.indexOf(turn), 1);
+          }
+        }
+      }
+      return JSON.parse(store.data.get(`quota:capacity:${credential}`) ?? 'null')?.week?.usd as number | undefined;
+    };
+    for (const every of [0.5, 15]) {
+      const learned = await Promise.all([1, 2, 3, 4, 5, 6].map((seed) => learn(every, seed)));
+      const mean = Math.exp(learned.reduce((sum: number, usd) => sum + Math.log(usd ?? 1), 0) / learned.length);
+      expect(mean).toBeGreaterThan(300 * 0.85);
+      expect(mean).toBeLessThan(300 * 1.15);
+    }
+  });
+
+  it('gives a login with weekly limits only no 5-hour window', async () => {
+    const store = kv();
+    store.data.set('usage:login:org:claude:w', JSON.stringify({ ok: true, at: 1000, week: { pct: 40, resetAt: 7 * 24 * 3600_000 } }));
+    const windows = await loginWindows(store, 'login:org:claude:w', 60_000);
+    expect(windows.map((w) => w.kind)).toEqual(['week']);
+    expect(windows[0]).toMatchObject({ used: 360 });
+    // A turn reporting a 5-hour window after that check brings it back.
+    await recordQuotaReading(store, 'login:org:claude:w', 'session', { utilization: 0.5, resetsAt: 5 * 3600_000, at: 2000 });
+    expect((await loginWindows(store, 'login:org:claude:w', 60_000)).map((w) => w.kind)).toEqual(['session', 'week']);
+  });
+
   it('fits tree sizes, shrunk toward the prior while history is short; no priority runs as medium', () => {
     expect(fitSize([])).toEqual(PRIOR.size);
     const many = fitSize(Array.from({ length: 2000 }, (_, i) => Math.exp(1 + Math.sin(i))));

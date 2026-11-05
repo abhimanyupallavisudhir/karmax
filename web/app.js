@@ -1154,26 +1154,15 @@ function principalLabel(principal) {
 // person just sees "Agent"; the other roles keep their descriptive names.
 function agentRoleLabel(role) { return !role || role === 'do' ? 'Agent' : `${role} agent`; }
 
-// The workflows a human may pick when creating a task. INTENDED: `just-do` and
-// `script-exec` are deliberately absent because they are clutter in the picker —
-// nobody wants to choose them. That is the whole reason; they are still
-// registered and still run (their manifests carry `selectable: false`), so
-// existing tasks keep replaying and automation can still use them. Do not
-// "fix" this by adding them back. `workflowLabel` falls back to the raw id so
-// such a task still renders sensibly wherever one does appear.
+// The workflows a new task can be. With one choice there is no workflow
+// picker, and no task names its workflow: the Goal workflow is retired — an
+// agent Reviewer covers it — and `just-do`/`script-exec` were never choices.
+// All three stay registered (`selectable: false`), so existing executions keep
+// replaying. `workflowLabel` falls back to the raw id wherever one appears.
 const WORKFLOWS = [
   { id: 'software-dev', label: 'Software dev' },
-  { id: 'goal', label: 'Goal (auto-run)' },
 ];
 const workflowLabel = (id) => WORKFLOWS.find((w) => w.id === id)?.label || id;
-
-// Hidden workflows remain editable on existing tasks without becoming choices
-// for new tasks. Include the current value so the select cannot imply a switch.
-function taskFormWorkflows(currentWorkflow, existingTask) {
-  return existingTask && !WORKFLOWS.some((w) => w.id === currentWorkflow)
-    ? [...WORKFLOWS, { id: currentWorkflow, label: workflowLabel(currentWorkflow) }]
-    : WORKFLOWS;
-}
 
 const NODES = [
   { key: 'setup', label: 'Setup' },
@@ -1189,8 +1178,8 @@ const NODES = [
 // Grok Build are not admitted by the server, so their models run through OpenCode.
 const AGENT_PROVIDERS = ['claude', 'codex', 'opencode'];
 const MODELS = {
-  claude: ['default', 'opus[1m]', { id: 'claude-opus-5-5', displayName: 'Opus 5.5' }, { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, 'sonnet', 'haiku'],
-  codex: ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
+  claude: ['default', 'opus[1m]', { id: 'claude-opus-5-5', displayName: 'Opus 5.5' }, { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, { id: 'claude-sonnet-5-5', displayName: 'Sonnet 5.5' }, { id: 'claude-haiku-5-5', displayName: 'Haiku 5.5' }, 'sonnet', 'haiku'],
+  codex: ['gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
 };
 const agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
@@ -5581,6 +5570,7 @@ function connectWs() {
     if (ev.type === 'review.updated' || ev.type.startsWith('resource.')) {
       resourceReviewCache.delete(ev.taskId); resourceInventoryCache.delete(ev.taskId);
     }
+    if (ev.type === 'review.updated') forgetReviewArtifactUrls(ev.taskId);
     if (S.selected && ev.taskId === S.selected) {
       if (ev.type.startsWith('spend.') || ev.type.startsWith('payment.')) $('#tp-payments')?.refreshSpent?.();
       if (ev.type !== 'agent.output') {
@@ -7992,7 +7982,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['run'], query 
     return `<div class="pick-row" data-nav data-task="${t.id}">
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">Archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">Repeatable</span>' : ''}${t.params?.avatar ? ` ${avatarChip}` : ''}</div>
-        <div class="task-sub">${organizationWide && t.projectId !== S.projectId ? projectLabel(t) : ''}<span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t, false)}</div>
+        <div class="task-sub">${organizationWide && t.projectId !== S.projectId ? projectLabel(t) : ''}<span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t, false)}</div>
       </div>
       ${mode === 'agent' ? `<span class="pk-caret">${open ? '▾' : '▸'}</span>` : ''}
     </div>${open ? `<div class="pk-sessions">${sessionsHtml(t)}</div>` : ''}`;
@@ -9328,7 +9318,6 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const armed = draft?.params?.triggerState === 'armed'; // a "waiting for trigger" task
   const series = isSeries(draft?.params); // a repeatable template
   const editInPlace = armed || series; // neither has a running workflow — edit its stored params
-  const workflowEditable = !draft || !!draft.params?.draft;
   // A new task can start over from another template (a fork keeps its own form).
   const templatePickable = !draft && !templateEdit && !opts?.fork && !store;
   // Carry over seed text (or whatever was typed before switching
@@ -9417,7 +9406,6 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           <div class="tf-head-end">
             <span class="tf-savestate save-state quiet" id="tf-savestate" role="status"></span>
             ${templatePickable ? `<button type="button" class="tf-template" id="tf-template" title="Start from a template" aria-label="Template${opts?.template ? `: ${esc(opts.template.name)}` : ''}">${ICON.template}${opts?.template ? `<span class="tf-template-label">${esc(opts.template.name)}</span>` : ''}</button>` : ''}
-            <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${taskFormWorkflows(wf, draft).map((w) => `<option value="${esc(w.id)}" ${w.id === wf ? 'selected' : ''}>${esc(w.label)}</option>`).join('')}</select>
           </div>
         </div>
       </div>
@@ -9478,33 +9466,6 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // Reassigned below once auto-save is wired; flushes pending edits before closing.
   const navigatingAway = () => !!root.querySelector('#tf-page')?.dataset.navigating;
   let closeForm = () => { const navigating = navigatingAway(); releaseFormKeys(); root.innerHTML = ''; leavePage(navigating); };
-  $('#tf-wf')?.addEventListener('change', async () => {
-    const select = $('#tf-wf');
-    const nextWorkflow = select.value;
-    const st = formState();
-    clearTimeout(saveTimer);
-    select.disabled = true;
-    try {
-      await persistDraft(st);
-      if (draftId) {
-        const changed = await api(`/api/tasks/${draftId}/workflow`, {
-          method: 'PATCH', body: JSON.stringify({ workflow: nextWorkflow }),
-        });
-        const at = S.tasks.findIndex((task) => task.id === draftId);
-        if (at >= 0 && changed.task) S.tasks[at] = changed.task;
-        return openTaskForm(nextWorkflow, changed.task, undefined, undefined, { page });
-      }
-      const carried = consumingField(fields)
-        ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(consumingField(fields).name)}"]`)?.value
-        : '';
-      openTaskForm(nextWorkflow, undefined, (carried || '').trim(), undefined, { projectId,
-        ...(templateEdit ? { templateEdit: { ...templateEdit, name: $('#tf-template-name')?.value ?? '' } } : {}) });
-    } catch (error) {
-      select.value = wf;
-      select.disabled = !workflowEditable;
-      toast(error.message, true);
-    }
-  });
   // Another project: the same form there, with what you wrote. Its settings
   // are that project's defaults; the draft auto-save made here moves with you.
   wireProjectPicker($('#tf-project'), async (nextProjectId) => {
@@ -10368,7 +10329,6 @@ async function renderSeriesPage(rec) {
           <span class="chip">Repeatable</span>
         </div>
         <div class="meta">
-          <span>${esc(workflowLabel(wf))}</span>
           ${rec.params?.triggers?.length ? `<span>${esc(triggerSummary(rec.params.triggers))}</span>` : ''}
           <span>${runs.length} run${runs.length === 1 ? '' : 's'}</span>
         </div>
@@ -11427,7 +11387,6 @@ function renderTaskPage() {
   wirePullRequestMenu(v);
   wireAttempts(v);
   wireStageTransitions(v);
-  wireWorkflowMode(v);
   wireTiming(v);
   wireActions(v); // the footer action bar lives on every view
   wireTaskRail(v); // so does the details rail (agents, priority/tags, notes, …)
@@ -11580,40 +11539,6 @@ function restoreThreadSelection(thread, snap) {
     sel.removeAllRanges();
     sel.addRange(range);
   } catch {}
-}
-
-function wireWorkflowMode(v) {
-  const select = document.getElementById('tp-workflow-mode');
-  if (!select) return;
-  select.addEventListener('change', async () => {
-    const prior = v.workflow;
-    const workflow = select.value;
-    select.disabled = true;
-    try {
-      const changed = await api(`/api/tasks/${v.taskId}/workflow`, {
-        method: 'PATCH',
-        body: JSON.stringify({ workflow }),
-      });
-      v.workflow = changed.workflow;
-      const rec = taskRecord(v.taskId);
-      if (rec) rec.workflow = changed.workflow;
-      toast(changed.workflow === 'goal'
-        ? 'Goal mode enabled — the agent will continue autonomously'
-        : 'Software Dev mode enabled — the task will stop at Review');
-      await Promise.all([refreshTask(), refreshTasks()]);
-      // The workflow just changed, and param defaults key off it — reload them here
-      // (refreshTask deliberately doesn't, to avoid a git subprocess per WS refresh).
-      loadParamDefaults(v.taskId).then((d) => {
-        if (S.selected !== v.taskId) return;
-        S.paramDefaults = d;
-        if (S.taskTab === 'parameters') renderTaskPage();
-      });
-    } catch (e) {
-      select.value = prior;
-      select.disabled = !v.workflowSwitchable;
-      toast(e.message, true);
-    }
-  });
 }
 
 // Switch the open task page to another of its tabs, pinning the tab in the URL
@@ -12134,7 +12059,7 @@ async function showArtifactViewer({ name, url, view, text, refresh, gallery }) {
   const content = dialog.querySelector('.artifact-reader-content');
   const links = () => dialog.querySelectorAll('[data-download], [data-new-tab]');
   let media = null, current = null, refreshedAt = 0, closed = false;
-  const point = (href) => links().forEach((link) => { link.href = href; });
+  const point = (href) => links().forEach((link) => { link.href = link.hasAttribute('data-download') ? downloadHref(href) : href; });
   const stopMedia = () => { if (media) { media.removeAttribute('src'); media.load?.(); } media = null; };
   // Show one file in the open card (the first, or the next one stepped to).
   const mount = (item) => {
@@ -12252,8 +12177,14 @@ async function downloadArtifact({ url, name }) {
   const head = await fetch(url, { method: 'HEAD' }).catch(() => null);
   if (!head?.ok) throw new Error(`Could not download ${name}`);
   const anchor = document.createElement('a');
-  anchor.href = url; anchor.download = name; anchor.rel = 'noopener';
+  anchor.href = downloadHref(url); anchor.download = name; anchor.rel = 'noopener';
   document.body.appendChild(anchor); anchor.click(); anchor.remove();
+}
+
+// A browser ignores `download` on a link to another origin (the artifact edge),
+// so the URL itself asks to be saved rather than shown.
+function downloadHref(url) {
+  return `${url}${url.includes('?') ? '&' : '?'}download=1`;
 }
 
 // What the viewer needs to show what `POST /review-action` resolved
@@ -12282,8 +12213,13 @@ async function openArtifact(resolved, refresh) {
 function isReviewTile(a) { return a.kind === 'open' && !/^https?:\/\//i.test(a.target || ''); }
 
 // Signed artifact URLs of a task's open actions, shared by the thumbnails and
-// the viewer: one resolve per action an hour (a signed URL lasts one).
+// the viewer: one resolve per action an hour (a signed URL lasts one). A saved
+// file's URL names its content, so the browser keeps its bytes for that hour;
+// a republished Review gets new URLs.
 const reviewArtifactUrls = new Map();
+function forgetReviewArtifactUrls(taskId) {
+  for (const key of reviewArtifactUrls.keys()) if (key.startsWith(`${taskId}\n`)) reviewArtifactUrls.delete(key);
+}
 function resolveReviewArtifact(v, index, fresh = false) {
   const action = v.reviewInfo?.actions?.[index];
   const key = `${v.taskId}\n${index}\n${action?.target || ''}`;
@@ -14304,7 +14240,7 @@ function portableForkCommandFor(session, cwd) {
     'mkdir -p "$HOME/.codex/sessions/tavya"',
     `cp -n "${source}" "$HOME/.codex/sessions/tavya/${filename}"`,
     `cd ${shellQuote(cwd)}`,
-    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.162.1"} fork ${shellQuote(sessionId)}`,
+    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.166.0"} fork ${shellQuote(sessionId)}`,
   ].join('\n');
   if (session.provider === 'claude') return [
     `tavya_cwd="$(cd ${shellQuote(cwd)} && pwd -P)"`,
@@ -14527,7 +14463,6 @@ function parametersTab(v) {
   // The rest mirrors the task form: its agents, where it runs, when it starts,
   // and the logins it may use.
   return `
-    ${workflowSection(v)}
     ${paramsSection(v)}
     <div class="label-row tp-creds-head"><label>Accounts</label>${policyTip('The Claude and Codex accounts this task runs on, first available first. Drag to reorder; switch one off to skip it, for this task only.')}<span class="label-row-fill"></span></div>
     <div id="cred-editor-task" data-live-key="${esc(v.taskId)}">Loading…</div>`;
@@ -14707,7 +14642,7 @@ function renderDiff(d) {
 function waitingLabel(w) {
   if (!w) return '';
   switch (w.kind) {
-    case 'account': return w.earliestResetAt ? 'quota' : 'credential';
+    case 'account': return 'model login';
     case 'agentSlot': return 'agent';
     case 'mergeSlot': return 'merge';
     case 'github': return /\b(?:ci|checks?|validat(?:e|es|ed|ing|ion))\b/i.test(w.detail || '') ? 'CI' : 'GitHub';
@@ -14725,6 +14660,18 @@ function waitingLabel(w) {
   }
 }
 
+// Why a turn waits for a model login: the coordinator's reason, or, for a view
+// published before it gave one, what its detail says.
+function accountWaitReason(w) {
+  if (w?.reason) return w.reason;
+  const detail = typeof w?.detail === 'string' ? w.detail : '';
+  if (detail.startsWith('Held')) return 'held';
+  if (w?.earliestResetAt || /usage limit|quota/i.test(detail)) return 'quota';
+  if (/free slot|running all it may/.test(detail)) return 'slot';
+  if (/^No \w+ credential|needs attention|^Couldn't read/.test(detail)) return 'login';
+  return '';
+}
+
 // Short status used by the task-page wait card and conversation presence. The
 // workflow's detailed diagnostic remains in durable state/history; copying it
 // into a status label made normal polling look like a stream of new problems.
@@ -14740,9 +14687,18 @@ function waitingText(w) {
   if (w?.kind === 'retry' && typeof w.summary === 'string' && w.summary.trim())
     return `${w.summary.trim().slice(0, 48)}${Number.isFinite(w.until) ? `, trying at ${waitDeadline(w.until)}` : ''}`;
   if (w?.kind === 'retry') return Number.isFinite(w.until) ? `Retrying at ${waitDeadline(w.until)}` : 'Retrying';
-  // The quota scheduler keeps this login's quota for higher-priority work until then.
-  if (w?.kind === 'account' && typeof w.detail === 'string' && w.detail.startsWith('Held'))
-    return Number.isFinite(w.until) ? `Held for higher-priority work until ${waitDeadline(w.until)}` : 'Held for higher-priority work';
+  if (w?.kind === 'account') {
+    const who = w.provider ? ACCOUNT_PROVIDER_LABELS[w.provider] || w.provider : '';
+    switch (accountWaitReason(w)) {
+      // The quota scheduler keeps this login's quota for higher-priority work until then.
+      case 'held': return Number.isFinite(w.until) ? `Held for higher-priority work until ${waitDeadline(w.until)}` : 'Held for higher-priority work';
+      case 'quota': return `Waiting for ${who ? `${who} ` : ''}quota${w.earliestResetAt > Date.now() ? ` until ${waitDeadline(w.earliestResetAt)}` : ''}`;
+      case 'slot': return `Waiting for a free ${who ? `${who} ` : ''}login`;
+      case 'planning': return who ? `Queued for ${who}` : 'Queued';
+      case 'login': return (w.detail || '').startsWith("Couldn't read") ? 'Credential policy unreadable' : `Needs a ${who ? `${who} ` : ''}login`;
+      default: return who ? `Waiting for ${who}` : 'Waiting for a model login';
+    }
+  }
   // A job is shown by the name its agent gave it. The deadline is when the
   // agent resumes even if the job never finishes.
   if (w?.kind === 'job') {
@@ -14768,8 +14724,12 @@ function waitDeadline(until) {
 // The generic header label alone would hide that diagnosis.
 function conversationWaitNotice(v) {
   const w = v.waitingFor;
-  if (w?.kind === 'account' && typeof w.detail === 'string' && w.detail.startsWith('Held'))
+  const reason = w?.kind === 'account' ? accountWaitReason(w) : '';
+  if (reason === 'held')
     return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))} <button type="button" class="btn sm ghost" data-run-now="${esc(v.taskId)}" title="${esc(RUN_NOW_TIP)}">Run now</button></div>`;
+  // The label already says what it waits for and until when; a person can do nothing more here.
+  if (reason === 'quota' || reason === 'slot' || reason === 'planning')
+    return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))}</div>`;
   const detail = presenceDetail(v);
   const raw = typeof w?.detail === 'string' ? w.detail.trim() : '';
   return detail ? `<div class="msg system wait-notice" role="status"${raw && raw !== detail ? ` title="${esc(raw)}"` : ''}>${esc(waitingText(v.waitingFor))} · ${esc(detail)}${setupFixHtml(w?.detail)}</div>` : '';
@@ -15351,18 +15311,6 @@ function wireNotes(v) {
   };
   // Saved on blur, so notes aren't lost when the page closes.
   ta.addEventListener('blur', save);
-}
-
-// The workflow (and its pinned version) configures the task, so it lives with
-// the parameters rather than in the header of every tab.
-function workflowSection(v) {
-  const version = taskRecord(v.taskId)?.workflowVersion;
-  const mode = v.workflowOptions?.length > 1
-    ? `<select id="tp-workflow-mode" class="q-sel" aria-label="Workflow mode" title="${v.workflowSwitchable ? 'Switch workflow mode' : 'Workflow mode is locked after confirmation begins'}" ${v.workflowSwitchable ? '' : 'disabled'}>
-        ${v.workflowOptions.map((w) => `<option value="${esc(w)}" ${w === v.workflow ? 'selected' : ''}>${esc(workflowLabel(w))}</option>`).join('')}
-      </select>`
-    : `<span>${esc(workflowLabel(v.workflow))}</span>`;
-  return `<div class="tp-workflow"><label>Workflow</label>${mode}${version ? `<span class="mono" title="Workflow version this task is pinned to">v${esc(version)}</span>` : ''}</div>`;
 }
 
 // The fields the Parameters tab shows: the workflow's task fields plus one
@@ -21332,7 +21280,7 @@ function revealPhoneAccess() {
 // say in a line what each is for (the manifests' descriptions are for builders).
 const WORKFLOW_INFO = {
   'software-dev': ['Software dev', 'An agent works on a branch; the work is reviewed, then merged or proposed as a pull request.'],
-  goal: ['Goal (auto-run)', 'Software dev that keeps going by itself until the goal is met.'],
+  goal: ['Goal', 'Retired: give a task an agent Reviewer instead. Kept for tasks already running it.'],
   'just-do': ['Just do', 'The older single-agent workflow, kept for existing tasks.'],
   'merge-only': ['Merge only', 'Review and merge a branch, with no agent doing the work first.'],
   'script-exec': ['Script', 'The older command workflow, kept for existing tasks.'],
@@ -27407,7 +27355,7 @@ function renderLanding() {
   const tick = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.6 8.4l2.9 2.9 5.9-6.6"/></svg>';
   const check = (title, detail = '') => `<li><span class="landing-tick">${tick}</span><div><h3>${title}</h3>${detail}</div></li>`;
   document.body.classList.add('landing-active');
-  document.title = `${siteName()} — the to-do list for agents`;
+  document.title = `${siteName()} — the to-do list for AI agents`;
   $('#app').innerHTML = `<div class="landing-page">
     <a class="landing-skip" href="#landing-main">Skip to content</a>
     <header class="landing-nav" aria-label="Primary navigation"><div class="landing-nav-inner">

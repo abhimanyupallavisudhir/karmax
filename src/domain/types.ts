@@ -1813,6 +1813,9 @@ export interface DeclaredAction {
 
 /** The typed projection of a task's state + allowed actions the UI renders. */
 /** A sub-task as its parent's Sub-tasks panel shows it. */
+/** Why a turn waits for a model login (TaskView.waitingFor.reason of an `account` wait). */
+export type AccountWaitReason = 'planning' | 'held' | 'quota' | 'slot' | 'login';
+
 export interface ChildTaskSummary {
   id: string;
   num?: number;
@@ -1944,8 +1947,12 @@ export interface TaskView {
     /** `human`: why people are asked. `input` (default) is an agent's question;
      * `error` a failure automatic recovery could not fix (the stage is kept —
      * there is no Escalated stage from software-dev 1.27); `authorization` and
-     * `merge` an authority the task lacks. */
-    reason?: 'input' | 'error' | 'authorization' | 'merge';
+     * `merge` an authority the task lacks.
+     * `account`: why no model login is given yet (the account coordinator's
+     * answer, read when the view is served): `planning`, `held` (for
+     * higher-priority work), `quota` (none has quota left until a reset),
+     * `slot` (every one with quota runs all it may), `login` (none usable). */
+    reason?: 'input' | 'error' | 'authorization' | 'merge' | AccountWaitReason;
     /** Durable jobs this wait watches (a `job` wait, or an ask that also waits
      * on jobs): their world must keep running, or parking it freezes them. */
     jobs?: string[] };

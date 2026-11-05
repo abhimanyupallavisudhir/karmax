@@ -32,7 +32,7 @@ import { capacityCause, ComputeRouter, type RouterConnections } from '../world/c
 import { accountKey, dequeue, enqueue, wakeFullKey } from '../world/compute-queue.js';
 import { AgentChannelLost, AgentToolsUnavailable, toolsUnavailableActivity, toolsUnavailableNotice, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
-import { markCheckpointStale } from '../world/checkpoint-staleness.js';
+import { clearBranchUnpublished, markBranchUnpublished, markCheckpointStale } from '../world/checkpoint-staleness.js';
 import { usageAdmissionId as admissionIdFor } from '../domain/turn-admission.js';
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store, type ViewPublicationOrder } from '../store/db.js';
@@ -1939,7 +1939,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 await parkingTrace.measure('lifecycle.enroll-repositories', () => enrollLiveProjectRepositories(remoteWorld, taskId));
                 if (!(await valid())) return;
                 const pushed = await parkingTrace.measure('lifecycle.publish-branch', () => withTiming(parkingTrace, () => publishTaskBranch(remoteWorld, taskId, true, true)));
-                if (pushed.skipped.length) throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
+                if (pushed.skipped.length) {
+                  const reason = `could not persist branch for ${describePublishFailures(pushed)}`;
+                  await markBranchUnpublished(store, remoteWorld.handle, reason);
+                  throw new Error(reason);
+                }
+                await clearBranchUnpublished(store, remoteWorld.handle.id);
                 (await record(taskId, 'push.branch', { branch: remoteWorld.handle.branch, repos: pushed.pushed, reason: 'checkpoint' }));
               }
             }
@@ -5449,6 +5454,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      */
     async proposeUpstream(ref: WorldHandleRef, target: string, details: OpenPrDetails = {}): Promise<UpstreamProposal> {
       const handle = ref as WorldHandle;
+      // Which checkouts are forks is project data, not world state. With none,
+      // there is nothing to propose: opening the world would wake a parked
+      // computer for nothing, and every Confirm waited 1–2½ minutes for it
+      // (longer when compute was short or the restore hung; task #826).
+      // The same checkouts githubPrTargets reads from the opened world.
+      const current = ((await store.currentWorld(handle.id)) ?? handle) as WorldHandle;
+      let fork = false;
+      for (const repo of worldRepos(current)) {
+        if ((await enrolledRepositoryForCheckout(handle, repo))?.upstream) { fork = true; break; }
+      }
+      if (!fork) return { prs: [], pending: [] };
       const world = await openWorld(handle);
       const targets = (await githubPrTargets(world, handle)).filter((candidate) => candidate.headRepository);
       const changed: Array<(typeof targets)[number] & { base: string }> = [];

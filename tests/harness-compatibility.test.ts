@@ -12,7 +12,7 @@ import { CLAUDE_EXTRA_ARGS, controlMcpServer } from '../src/agent/claude.js';
 import { ClaudeStreamUsage } from '../src/agent/claude-stream-usage.js';
 import { PLATFORM_TOOL_SCHEMAS } from '../src/agent/tools.js';
 
-it('Claude 2.1.281 preserves SDK tools, explicit effort, resume and fork', async () => {
+it('Claude 2.1.318 preserves SDK tools, explicit effort, resume and fork', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-sdk-compat-'));
   const requests: any[] = [];
   const calls: string[] = [];
@@ -235,7 +235,7 @@ async function messagesFixture(reply: (body: any) => any,
 // funding-analysis#2: what a turn spent is counted from the CLI's frames, so a turn
 // the usage limit ends is metered too. The main loop streams its final output count
 // (`message_delta`); a sub-agent's frames carry only its exact input and cache counts.
-it('Claude 2.1.281 frames meter every request of a turn, sub-agents included', async () => {
+it('Claude 2.1.318 frames meter every request of a turn, sub-agents included', async () => {
   const spent = (n: number) => ({ input_tokens: 1000 * n + 1, output_tokens: 50 + n,
     cache_read_input_tokens: 100 * n + 2, cache_creation_input_tokens: 10 * n + 3 });
   const fixture = await messagesFixture((body) => {

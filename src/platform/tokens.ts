@@ -162,10 +162,13 @@ export class TokenAuthority {
       const parent = (await this.delegation(record.parentDelegationId, visited));
       if (!parent || parent.humanUserId !== record.humanUserId) return undefined;
       if (parent.organizationId && record.organizationId !== parent.organizationId) return undefined;
-      if (parent.projectId && record.projectId !== parent.projectId) return undefined;
-      const recordProjects = record.projectIds?.length ? record.projectIds : record.projectId ? [record.projectId] : [];
-      if (parent.projectIds?.length && (!recordProjects.length
-        || recordProjects.some((projectId) => !parent.projectIds!.includes(projectId)))) return undefined;
+      // `projectId: p` and `projectIds: [p]` are one scope, as in assertScopeWithin:
+      // a run holding the first created a task holding the second (#835).
+      const projectsOf = (scope: HumanDelegation) => scope.projectIds?.length ? scope.projectIds : scope.projectId ? [scope.projectId] : [];
+      const recordProjects = projectsOf(record);
+      const parentProjects = projectsOf(parent);
+      if (parentProjects.length && (!recordProjects.length
+        || recordProjects.some((projectId) => !parentProjects.includes(projectId)))) return undefined;
       if (record.externalIdentities?.githubAccountId !== parent.externalIdentities?.githubAccountId) return undefined;
       if (record.expiresAt > parent.expiresAt) return undefined;
     }

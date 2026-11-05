@@ -41,10 +41,9 @@ global.S = {
   ],
 };
 global.ICON = { stop: '<svg></svg>' };
-global.waitingText = (w) => ({ account: 'Waiting for credential' }[w.kind] || w.kind);
 for (const fn of ['defaultRecipientFor', 'sharedConversation', 'participantLabelOf', 'messageOrigin', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'composeRecipients',
   'nextAgentKeyFor', 'locateMentions', 'taskTranscripts', 'conversationTextKey', 'conversationEntries', 'formEntryKey', 'renderConversationEntry',
-  'activeAgentsHtml', 'waitingText', 'waitingLabel', 'stoppableAgent', 'stopAgentButton', 'conversationPresence']) eval(extractFn(fn));
+  'activeAgentsHtml', 'waitingText', 'waitingLabel', 'accountWaitReason', 'stoppableAgent', 'stopAgentButton', 'conversationPresence']) eval(extractFn(fn));
 
 const view = {
   taskId: 'task-1',
@@ -133,7 +132,7 @@ const list = activeAgentsHtml(busy);
 assert.deepStrictEqual([...list.matchAll(/data-stop-agent="([^"]+)" title="([^"]+)"/g)].map((m) => [m[1], m[2]]),
   [['do', 'Stop Agent'], ['agent-1', 'Stop Agent 1'], ['agent-2', 'Stop Agent 2']]);
 assert.strictEqual(stoppableAgent(busy).key, 'agent-1', 'the innermost waiting agent');
-assert.deepStrictEqual(conversationPresence(busy, { shared: true, role: 'do' }), { label: 'Agent 1 · Waiting for credential', tone: 'waiting' });
+assert.deepStrictEqual(conversationPresence(busy, { shared: true, role: 'do' }), { label: 'Agent 1 · Waiting for a model login', tone: 'waiting' });
 busy.participants[2].state = 'running';
 assert.strictEqual(stoppableAgent(busy).key, 'agent-2');
 assert.strictEqual(stoppableAgent({ participants: [{ key: 'do', state: 'idle' }, { key: 'agent-1', state: 'queued' }] }), undefined);

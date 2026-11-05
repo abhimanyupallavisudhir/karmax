@@ -50,6 +50,7 @@ services:
       KARMAX_S3_SECRET_ACCESS_KEY_FILE: /run/secrets/s3_secret_key
       # The Cloudflare Worker sandboxes save resources through (wiki features/resource-storage).
       KARMAX_RESOURCE_EDGE_URL: ${KARMAX_RESOURCE_EDGE_URL:-}
+      KARMAX_ARTIFACT_EDGE_URL: ${KARMAX_ARTIFACT_EDGE_URL:-}
       # Agent mailboxes: every organization without its own mail provider gets
       # agent-<token>@ this domain, whose mail a Cloudflare Email Worker posts
       # to the app, signed (`deploy/karmax deploy-agent-mail-edge`). Empty:

@@ -119,7 +119,8 @@ describe('installation-wide settings report who may manage them', () => {
     expect(meta.siteName).toBe('tavya');
     const manifest = await (await fetch(`${base}/app.webmanifest`)).json() as any;
     expect(manifest).toMatchObject({ name: 'tavya', short_name: 'tavya' });
-    const shell = await (await fetch(base)).text();
+    // A console URL; the landing at / has its own title.
+    const shell = await (await fetch(`${base}/settings`)).text();
     expect(shell).toContain('<title>tavya</title>');
     expect(shell).toContain('apple-mobile-web-app-title" content="tavya"');
     expect(shell).not.toContain('<title>krmax</title>');
