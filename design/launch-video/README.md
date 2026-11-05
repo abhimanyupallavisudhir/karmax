@@ -1,47 +1,77 @@
 # Launch video
 
-A 63-second, 1080p/30 fps launch video of tavya, set in the owner's real organization
-(Abhimanyu Pallavi Sudhir / `personal`) cloned into a scratch tavya, with friends'
-projects left out. Every screen is the real console showing real tasks; the motion,
-headlines and score are composited here.
+The launch video is recorded, not animated: a scratch tavya is seeded as a clone
+of the personal organization, and a director drives the real console through
+the stories in one continuous take. The agents are the mock agent acting out
+`script.py`, one entry per prompt (`KARMAX_MOCK_SCRIPT`, see `src/agent/mock.ts`);
+everything else (task forms, Review, auto-confirm, app grants, the CLI pushing
+and pulling data, merges, the wiki) is the product doing what it does.
 
-```
-export.py      tavya.io → EXPORT_DIR (projects, tasks, views, Review files, activity)   read-only, keep out of git
-private.py     what is never shown: reads the list from the private wiki, ops/launch-video
-setup.cjs      first-run administrator of the scratch app
-import.py      EXPORT_DIR → the scratch app's SQLite store (ids, numbers, times kept)
-hold.sh        unfinished tasks stay "running" for the reconciler (a hold no worker serves)
-stage.py       scenes: a task rewound to the moment shown (Working, Review, …)
-prepare.sh     import + hold + stage, re-runnable
-seed-extras.cjs  task defaults as on tavya.io, stand-in vault items and card (made-up values)
-capture.cjs    2x stills, frame sequences and element boxes → ASSETS
-stage.html + timeline.js   the composition; seek(t) poses frame t
-render.cjs     frames → H.264;  music.py  the synthesized score;  make.sh  both, muxed
-```
+What must never be shown (friends' private projects and organizations) is
+listed in the private wiki page `ops/launch-video`, not here.
 
 ## Make it
 
 ```bash
-# scratch app with the mock agent (no model is ever called)
-KARMAX_HOME=/home/user/demo/home KARMAX_PORT=48950 KARMAX_AGENT_PROVIDER=mock npx tsx src/main.ts
-node design/launch-video/setup.cjs                       # once; stores /home/user/demo/state.json
-KARMAX_TOKEN=… python3 design/launch-video/export.py /home/user/karmax/demo-export
-design/launch-video/prepare.sh                           # import, hold, stage tidy busy
-node design/launch-video/seed-extras.cjs
-python3 -c "import sqlite3,json;c=sqlite3.connect('/home/user/demo/home/state/karmax.db');c.execute('INSERT OR REPLACE INTO settings VALUES (?,?,?)',('global','appearance',json.dumps({'icon':'royal-gold-arrow'})));c.commit()"  # tavya.io's logo
-node design/launch-video/capture.cjs                     # → /home/user/demo/assets (+ brand/icon-512.png from web/brand/royal-gold-arrow)
-design/launch-video/make.sh /home/user/demo/out/tavya-launch.mp4
-node design/launch-video/render.cjs /tmp/stills --stills 10,20,30   # check single frames
+# 1. Snapshot tavya.io: projects, task lists, the real review artifacts the
+#    video re-enacts, and the photos. Needs KARMAX_GATEWAY_URL + KARMAX_TOKEN
+#    (any tavya task has them) and the wiki checkout (KARMAX_WIKI).
+python3 design/launch-video/fetch.py
+# 2. Build the clone and snapshot it (/tmp/demo/pristine.tgz).
+design/launch-video/build.sh
+# 3. One take: restore the snapshot, start it, direct, stop. ~7 minutes.
+design/launch-video/record.sh /tmp/demo/take
+# 4. Retime it into the film (speeds come from the director's marks) and lay
+#    the music under it.
+python3 design/launch-video/edit.py /tmp/demo/take /tmp/demo/tavya-launch.mp4
 ```
 
-Needs ffmpeg, pdftoppm (poppler-utils), Inter (fonts-inter) and numpy + scipy.
+The ending zooms into the video a task delivers in its review panel, held on
+its first frame, which is the film's own first frame, so the film loops. So a
+final cut is two takes: the first becomes `/tmp/demo/assets/launch-v1.mp4`
+(the delivered video), the second is the film:
 
-## What is staged, and why
+```bash
+design/launch-video/record.sh /tmp/demo/takeA && python3 design/launch-video/edit.py /tmp/demo/takeA /tmp/demo/takeA.mp4
+cp /tmp/demo/takeA.mp4 /tmp/demo/assets/launch-v1.mp4
+design/launch-video/record.sh /tmp/demo/takeB && python3 design/launch-video/edit.py /tmp/demo/takeB /tmp/demo/tavya-launch.mp4
+```
 
-The clone is the real data; a few tasks are shown at an earlier moment than now, so
-every stage of a task's life appears once: `stage.py` rewinds merged tasks back to Review
-(their pull requests reopened, summary "N file(s) changed."), marks four finished tasks
-Working, and shows personal-website #5 mid-turn by replaying its real activity events up
-to a cut-off (`capture.cjs` filters `/events`). It also drops the "Setup warning" lines
-worlds print before the agent starts. The vault and card are stand-ins: the real vault is
-personal. The thesis task's conversation is not shown.
+### All eight cuts
+
+`all-cuts.sh` makes every version: the snappy and the readable film (a take
+recorded with `DEMO_HOLD=1.8`, so every reading pause lasts 1.8× longer, and
+edited with `--readable`, so waits and typing are sped up less), each with and
+without a voiceover, each in landscape (1920×1080) and portrait (1080×1350).
+
+- `voice.py` speaks one line per scene with OpenAI's `gpt-4o-mini-tts`
+  (`OPENAI_API_KEY`; voice `coral`, override with `VO_VOICE`), starting at the
+  scene's mark and never over the next line, ducks the music under it and ends
+  exactly with the picture. Lines are cached by text in `/tmp/demo/vo-cache`.
+- `mobile.py` crops each frame to the square around the action (the camera's
+  focus when zoomed, else the cursor), so text is ~1.8× larger on a phone, and
+  sets the captions large in their own band. Title card, terminal and grid are
+  shown whole.
+
+A take also seeds, off camera, the logins the vault shows (dummies; the
+United login the flight task asks for) and pretend documents in admin_docs.
+
+## Pieces
+
+| File | What it does |
+| --- | --- |
+| `fetch.py` | The production snapshot, filtered through the wiki's private list. |
+| `build.sh`, `setup.cjs`, `seed-*.{cjs,py}` | A fresh home: the owner, 16 projects in their folders, every visible task at its real number, the project wiki, the brand icon, a card, Gmail and Search Console accounts to allow, a CLI token. |
+| `script.py` | What each demo agent does and says. The CV, SEO and release-trigger messages mirror real runs (personal-website #7, tavya #821, #822). |
+| `stage.js` | The stage: backdrop, a browser window holding the console, captions, cursor, camera, title card, terminal, feature grid. |
+| `shots.cjs` | Stills of the real console for the feature grid, taken off camera (cut from the film). |
+| `director.cjs` | The take. Each `mark(name, speed)` sets the playback speed from there on (waits run ×3–5; 0 cuts). |
+| `edit.py`, `music.py` | Frames retimed onto 60 fps H.264; a synthesised music bed. |
+| `voice.py`, `mobile.py`, `all-cuts.sh` | The voiceover, the portrait cut, and every cut in one go. |
+
+## Safety
+
+The demo server runs with an emptied environment (no host API keys, no Claude
+login; dummy keys only so Accounts look normal), and the recording browser
+rewrites every agent `provider` in requests to `mock`. A take cannot reach a
+real model or spend anything; the card is a test card on the local vault rail.

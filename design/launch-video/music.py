@@ -1,123 +1,97 @@
-#!/usr/bin/env python3
-"""The launch video's score, synthesized (no samples, nothing licensed).
+# A quiet, warm music bed for the launch video, synthesised so it needs no
+# licence: pads, a plucked arpeggio and a soft kick at 112 BPM.
+# Usage: python3 music.py <out.wav> <seconds> [marks.json]
+import sys, wave, numpy as np
 
-    python3 design/launch-video/music.py out.wav CUTS CLICKS DURATION
-
-CUTS and CLICKS are comma-separated times in seconds (scene starts, cursor clicks):
-a soft swell leads into each cut, a tick marks each click. 112 BPM, D major,
-Dmaj9 – Bm9 – Gmaj9 – A6sus, pad + plucked arpeggio + a light kick and hats.
-"""
-import sys
-import numpy as np
-from scipy.signal import butter, sosfilt
-
+out, seconds = sys.argv[1], float(sys.argv[2])
 SR = 48000
-out, cuts, clicks, duration = sys.argv[1], [float(x) for x in sys.argv[2].split(',') if x], \
-    [float(x) for x in sys.argv[3].split(',') if x], float(sys.argv[4])
-N = int(SR * (duration + 0.5))
-L = np.zeros(N); R = np.zeros(N)
+n = int(SR * (seconds + 0.5))
+t = np.arange(n) / SR
+BPM = 112; beat = 60 / BPM; bar = 4 * beat
 rng = np.random.default_rng(7)
-BPM = 112; BEAT = 60 / BPM; BAR = 4 * BEAT
-midi = lambda m: 440 * 2 ** ((m - 69) / 12)
-lp = lambda x, f, o=2: sosfilt(butter(o, f, 'low', fs=SR, output='sos'), x)
-hp = lambda x, f, o=2: sosfilt(butter(o, f, 'high', fs=SR, output='sos'), x)
 
-def add(sig, t0, gain=1.0, pan=0.0):
-    i = int(t0 * SR)
-    if i >= N: return
-    sig = sig[: N - i]
-    L[i:i + len(sig)] += sig * gain * (1 - max(pan, 0))
-    R[i:i + len(sig)] += sig * gain * (1 + min(pan, 0))
+def note(m):  # MIDI → Hz
+    return 440 * 2 ** ((m - 69) / 12)
 
-def env(n, a, r, sustain=1.0):
-    e = np.ones(n) * sustain
-    na, nr = int(a * SR), int(r * SR)
-    e[:na] = np.linspace(0, sustain, na)
-    if nr: e[-nr:] *= np.linspace(1, 0, nr)
+# Cmaj9 – Am9 – Fmaj9 – G6/9: bright, unresolved, forward-leaning.
+CHORDS = [[48, 55, 64, 67, 71, 74], [45, 52, 60, 64, 67, 71], [41, 48, 57, 60, 64, 67], [43, 50, 59, 62, 64, 69]]
+L = np.zeros(n); R = np.zeros(n)
+
+def env(length, a, r):
+    e = np.ones(length); ai = min(int(a * SR), length); ri = min(int(r * SR), length - ai)
+    if ai: e[:ai] = np.linspace(0, 1, ai) ** 2
+    if ri: e[-ri:] *= np.linspace(1, 0, ri) ** 1.5
     return e
 
-# Chords (MIDI): voicings kept close and warm.
-CHORDS = [[50, 57, 61, 64, 66, 69], [47, 54, 57, 61, 62, 66], [43, 50, 54, 57, 59, 62], [45, 52, 54, 57, 59, 64]]
-ROOTS = [38, 35, 31, 33]
+def lowpass(x, cutoff):
+    a = np.exp(-2 * np.pi * cutoff / SR); y = np.empty_like(x); acc = 0.0
+    for i in range(len(x)): acc = (1 - a) * x[i] + a * acc; y[i] = acc
+    return y
 
-def saw(f, n, detune):
-    """Band-limited (additive) detuned saw: harmonics 1/h up to 6 kHz, no aliasing."""
-    t = np.arange(n) / SR
-    x = np.zeros(n)
-    for d in (-detune, 0, detune):
-        ff = f * (1 + d)
-        for h in range(1, int(6000 // ff) + 1):
-            x += np.sin(2 * np.pi * ff * h * t + h * 0.37) / h
-    return x / 3
+# Pads: detuned soft saws (few harmonics), one chord per bar.
+bars = int(seconds / bar) + 2
+for b in range(bars):
+    chord = CHORDS[b % 4]; s0 = int(b * bar * SR); length = int(bar * SR * 1.15)
+    if s0 >= n: break
+    length = min(length, n - s0); tt = np.arange(length) / SR
+    sig = np.zeros(length)
+    for k, m in enumerate(chord[1:]):
+        f = note(m)
+        for det in (-0.12, 0.12):
+            ff = f * 2 ** (det / 12)
+            sig += sum(np.sin(2 * np.pi * ff * h * tt + k) / h ** 1.6 for h in (1, 2, 3))
+    sig *= env(length, 0.6, 0.5) * 0.018
+    pan = 0.5 + 0.15 * np.sin(b)
+    L[s0:s0 + length] += sig * (1 - pan) * 2; R[s0:s0 + length] += sig * pan * 2
+    # Bass: the root, round.
+    f = note(chord[0] - 12 if chord[0] > 44 else chord[0])
+    bass = np.sin(2 * np.pi * f * tt) + 0.25 * np.sin(4 * np.pi * f * tt)
+    bass *= env(length, 0.02, 0.3) * 0.05
+    L[s0:s0 + length] += bass; R[s0:s0 + length] += bass
 
-# Pad: two bars per chord, from 0.4 s to the end.
-t = 0.0; ci = 0
-while t < duration:
-    n = int(2 * BAR * SR) + int(0.8 * SR)
-    chord = CHORDS[ci % 4]
-    for k, m in enumerate(chord):
-        for side, det in ((-0.6, 0.0035), (0.6, 0.0045)):
-            x = lp(saw(midi(m), n, det), 900 + 500 * (k / len(chord)), 4)
-            add(x * env(n, 0.9, 0.9, 1.0), t, 0.030, side)
-    sub = np.sin(2 * np.pi * midi(ROOTS[ci % 4]) * np.arange(n) / SR)
-    add(sub * env(n, 0.5, 0.8), t, 0.10)
-    t += 2 * BAR; ci += 1
+# Plucked arpeggio in eighths, entering after the title card.
+ARP = [0, 2, 4, 5, 3, 4, 2, 1]
+start_arp = 2.6
+step = beat / 2
+k = 0
+s = start_arp
+while s < seconds - 1:
+    b = int(s / bar); chord = CHORDS[b % 4]
+    m = chord[1:][ARP[k % 8] % 5] + 12
+    f = note(m); length = int(0.6 * SR); s0 = int(s * SR)
+    if s0 + length > n: break
+    tt = np.arange(length) / SR
+    tone = (np.sin(2 * np.pi * f * tt) + 0.3 * np.sin(4 * np.pi * f * tt) + 0.08 * np.sin(6 * np.pi * f * tt)) * np.exp(-tt * 7)
+    vel = 0.032 * (1.0 if k % 2 == 0 else 0.7)
+    pan = 0.3 if k % 2 else 0.7
+    L[s0:s0 + length] += tone * vel * (1 - pan) * 2; R[s0:s0 + length] += tone * vel * pan * 2
+    k += 1; s += step
 
-# Plucked arpeggio from the first statement on (8ths), brighter later.
-def pluck(f, n=int(0.6 * SR), bright=0.5):
-    tt = np.arange(n) / SR
-    x = sum(np.sin(2 * np.pi * f * h * tt) / h ** (1.6 - bright) for h in (1, 2, 3, 4))
-    return x * np.exp(-tt * 7) * env(n, 0.004, 0.08)
-ARP = [0, 2, 3, 5, 4, 2, 3, 1]
-start = cuts[1] if len(cuts) > 1 else 3.0
-k = 0; t = start
-while t < duration - 3.5:
-    ci = int(t // (2 * BAR)) % 4
-    chord = CHORDS[ci]
-    note = chord[ARP[k % 8] % len(chord)] + 12
-    bright = min(1.0, 0.3 + t / duration)
-    add(pluck(midi(note), bright=bright), t, 0.07, 0.35 if k % 2 else -0.35)
-    t += BEAT / 2; k += 1
+# Soft kick on 1 and 3, hats on the off-beats, from the first full bar after the intro.
+s = np.ceil(start_arp / bar) * bar
+while s < seconds - 1.5:
+    for off, kind in ((0, 'k'), (beat, 'h'), (2 * beat, 'k'), (3 * beat, 'h'), (1.5 * beat, 'h2'), (3.5 * beat, 'h2')):
+        s0 = int((s + off) * SR)
+        if kind == 'k':
+            length = int(0.35 * SR); tt = np.arange(length) / SR
+            f = 45 + 70 * np.exp(-tt * 30)
+            kick = np.sin(2 * np.pi * np.cumsum(f) / SR) * np.exp(-tt * 9) * 0.16
+        else:
+            length = int(0.06 * SR); tt = np.arange(length) / SR
+            noise = rng.standard_normal(length)
+            noise = noise - lowpass(noise, 6000)
+            kick = noise * np.exp(-tt * 70) * (0.010 if kind == 'h' else 0.006)
+        if s0 + length <= n: L[s0:s0 + length] += kick; R[s0:s0 + length] += kick
+    s += bar
 
-# Kick on 1 and 3, hats on the off-beats, between the third cut and the end card.
-def kick():
-    n = int(0.35 * SR); tt = np.arange(n) / SR
-    f = 52 + 90 * np.exp(-tt * 30)
-    return np.sin(2 * np.pi * np.cumsum(f) / SR) * np.exp(-tt * 9)
-def hat():
-    n = int(0.06 * SR)
-    return hp(rng.standard_normal(n), 7000) * np.exp(-np.arange(n) / SR * 70)
-k_from = cuts[2] if len(cuts) > 2 else 11.0
-h_from = cuts[3] if len(cuts) > 3 else 18.0
-end_card = cuts[-1] if cuts else duration - 4
-b = 0; t = 0.0
-while t < end_card:
-    if t >= k_from and b % 2 == 0: add(kick(), t, 0.42)
-    if t >= h_from: add(hat(), t + BEAT / 2, 0.05, 0.2)
-    t += BEAT; b += 1
-
-# Swell into each cut; a tick on each click.
-for c in cuts[1:]:
-    n = int(0.6 * SR)
-    noise = lp(hp(rng.standard_normal(n), 900), 5000)
-    add(noise * np.linspace(0, 1, n) ** 2.2, c - 0.6, 0.035)
-for c in clicks:
-    n = int(0.05 * SR); tt = np.arange(n) / SR
-    add(np.sin(2 * np.pi * 2200 * tt) * np.exp(-tt * 140), c, 0.12)
-
-# End: the tonic chord rings out over the end card.
-n = int(4.5 * SR)
-for m in [50, 57, 62, 66, 69, 74]:
-    tt = np.arange(n) / SR
-    add(np.sin(2 * np.pi * midi(m) * tt) * np.exp(-tt * 0.8) * env(n, 0.02, 1.0), end_card, 0.05)
-
-mix = np.stack([L, R], 1)[: int(SR * duration)]
-fade = int(1.6 * SR)
-mix[-fade:] *= np.linspace(1, 0, fade)[:, None] ** 1.5
-mix[: int(0.3 * SR)] *= np.linspace(0, 1, int(0.3 * SR))[:, None]
-mix = np.tanh(mix / (np.abs(mix).max() + 1e-9) * 1.6) * 0.72
-import wave
+# A swell into the finale, a gentle fade at each end.
+fade = np.ones(n)
+fi = int(0.6 * SR); fo = int(1.2 * SR)
+fade[:fi] = np.linspace(0, 1, fi); fade[-fo:] = np.linspace(1, 0, fo) ** 1.4
+L *= fade; R *= fade
+mix = np.stack([L, R], axis=1)
+mix /= np.max(np.abs(mix)) / 0.7  # peak −3 dB: about −16 LUFS, the only sound in the film
+pcm = (mix * 32767).astype('<i2')
 with wave.open(out, 'wb') as w:
-    w.setnchannels(2); w.setsampwidth(2); w.setframerate(SR)
-    w.writeframes((mix * 32767).astype('<i2').tobytes())
-print('wrote', out, f'{duration:.2f}s')
+    w.setnchannels(2); w.setsampwidth(2); w.setframerate(SR); w.writeframes(pcm.tobytes())
+print(f'music {seconds:.1f}s → {out}')

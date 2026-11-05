@@ -20,4 +20,5 @@ except (OSError, AttributeError):
 
 _lines = [l.strip() for l in _block.splitlines() if l.strip()]
 PRIVATE_PROJECTS = {p.strip() for l in _lines if l.startswith('projects:') for p in l[9:].split(',') if p.strip()}
-PRIVATE = re.compile('|'.join(l for l in _lines if not l.startswith('projects:')), re.I)
+TERMS = [l for l in _lines if not l.startswith('projects:')]
+PRIVATE = re.compile('|'.join(TERMS), re.I)
