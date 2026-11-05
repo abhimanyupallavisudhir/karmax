@@ -3119,7 +3119,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             && (!deps.tokens || !token
               || (await deps.tokens.check(token, 'task:conversation:read', { taskId: source.id })).ok);
           if (!readable) {
-            (await record(args.taskId, 'session.fork-failed', { from: spec.resumeFrom, reason: 'source-not-authorized' }));
+            (await record(args.taskId, 'session.fork-failed', { from: spec.resumeFrom, role: args.role, reason: 'source-not-authorized' }));
             const sourceProject = source && sourceOrganization === organizationId ? (await store.getProject(source.projectId)) : undefined;
             throw ApplicationFailure.create({
               message: sourceProject
@@ -3311,7 +3311,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             if (prepared) {
               session = srcSession;
               fork = true; // adapter branches a NEW session id from it (native fork)
-              (await record(args.taskId, 'session.forked', { from: spec.resumeFrom, session: srcSession, native: true }));
+              (await record(args.taskId, 'session.forked', { from: spec.resumeFrom, role: args.role, session: srcSession, native: true }));
             }
           }
           // When the selected destination agent differs, panagent translates the
@@ -3326,7 +3326,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   `task:${spec.resumeFrom.taskId}:${srcRole}:${srcProvider}:${srcSession}`);
                 prepared = true;
                 (await record(args.taskId, 'session.forked', {
-                  from: spec.resumeFrom, session: srcSession, native: kind === 'native', converted: true,
+                  from: spec.resumeFrom, role: args.role, session: srcSession, native: kind === 'native', converted: true,
                   sourceProvider: srcProvider, provider: profile.provider,
                 }));
               } catch (error) {
@@ -3360,7 +3360,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               : srcMsgs;
             if (seed.length) {
               messages = [...seed, ...ownView];
-              (await record(args.taskId, 'session.forked', { from: spec.resumeFrom, replayed: seed.length, native: false }));
+              (await record(args.taskId, 'session.forked', { from: spec.resumeFrom, role: args.role, replayed: seed.length, native: false }));
             }
           }
         }
