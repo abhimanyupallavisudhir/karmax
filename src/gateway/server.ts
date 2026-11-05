@@ -6178,13 +6178,20 @@ export class Gateway {
         // workflow must replay. Anything else is resolved from the AUTHORITATIVE
         // live view (the stored lastView can lag the workflow), by index — the
         // client never supplies the command, so only agent-authored actions are runnable.
-        const stored = (await store.getTask(taskId))?.lastView;
+        const record = await store.getTask(taskId);
+        const stored = record?.lastView;
         const shown = stored && (await store.withPendingReviewInfoAsync(taskId, stored));
-        const view = shown?.reviewInfo?.actions?.[Number(b.index)]?.kind === 'open' ? shown
+        const opensFile = shown?.reviewInfo?.actions?.[Number(b.index)]?.kind === 'open';
+        // Skipping the query must not skip what it checks: reading the task.
+        if (opensFile) {
+          const readable = await this.deps.tokens.check(token, 'task:read', { projectId: record!.projectId, taskId });
+          if (!readable.ok) throw new CapabilityError(readable.reason ?? 'denied: task:read');
+        }
+        const view = opensFile ? shown
           : (await api.getTaskView(token, taskId, { live: true }).catch(liveViewUnavailable)) ?? stored;
         const action = view?.reviewInfo?.actions?.[Number(b.index)];
         if (!action) return this.json(res, 404, { error: 'no such review action' });
-        const task = (await store.getTask(taskId));
+        const task = record;
         if (action.kind === 'payment') {
           const request = action.requestId ? (await store.getPaymentSpendRequest(action.requestId)) : undefined;
           const organizationId = task ? (await store.getProject(task.projectId))?.organizationId : undefined;
