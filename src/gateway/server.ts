@@ -1146,6 +1146,11 @@ export class Gateway {
     return counts;
   }
 
+  /** A list row parked on a model login says why it waits now, as the task's page does (KarmaxApi.withLiveAccountWait). */
+  private async liveAccountWait(taskId: string, view: TaskView | undefined): Promise<TaskView | undefined> {
+    return view ? this.deps.api.withLiveAccountWait(taskId, view) : view;
+  }
+
   private async withApprovalRequests(view: TaskView | undefined, taskId: string,
     counts?: ApprovalCounts): Promise<TaskView | undefined> {
     if (!view) return view;
@@ -5106,7 +5111,7 @@ export class Gateway {
             const organizationId = (await store.getProject(projectId))?.organizationId;
             const counts: ApprovalCounts = organizationId ? (await this.approvalCounts(organizationId)) : new Map();
             return this.json(res, 200, { ...result, tasks: (await __asyncCollections.map(result.tasks, async task => ({ ...task,
-              lastView: (await this.withApprovalRequests(task.lastView, task.id, counts)) }))) });
+              lastView: (await this.withApprovalRequests(await this.liveAccountWait(task.id, task.lastView), task.id, counts)) }))) });
           }
           const all = await api.listTaskSummaries(token, projectId);
           // Archived tasks are hidden from the default list (SPEC §11 housekeeping).
@@ -5137,7 +5142,7 @@ export class Gateway {
           const approvalCounts: ApprovalCounts = organizationId ? (await this.approvalCounts(organizationId)) : new Map();
           const listed = (await __asyncCollections.map(page, async (t) => ({
             ...t,
-            lastView: trimListView((await this.withApprovalRequests(t.lastView, t.id, approvalCounts))),
+            lastView: trimListView((await this.withApprovalRequests(await this.liveAccountWait(t.id, t.lastView), t.id, approvalCounts))),
           })));
           if (limit > 0) return this.json(res, 200, { tasks: listed, total: filtered.length, offset });
           return this.json(res, 200, listed);
@@ -8497,7 +8502,8 @@ export class Gateway {
       if (resourcePath === '/api/accounts/usage' && method === 'GET') {
         const { enumerateCredentials } = await import('../platform/credentials.js');
         const { gatherCredentialSources } = await import('../platform/credential-sources.js');
-        const { isUsagePollable, isUsageStale } = await import('../agent/usage.js');
+        const { isUsagePollable, isUsageStale, withStreamReadings } = await import('../agent/usage.js');
+        const { kvJson, observedKey } = await import('../scheduling/state.js');
         const creds = enumerateCredentials(await gatherCredentialSources({
           configHomes: this.deps.configHomes,
           broker: this.deps.broker,
@@ -8514,7 +8520,7 @@ export class Gateway {
           // current (a week-old 15% once masqueraded as live while the login was
           // actually exhausted).
           if (cached) {
-            const snap = JSON.parse(cached);
+            const snap = withStreamReadings(JSON.parse(cached), await kvJson(store, observedKey(c.key)));
             usage[c.key] = canPoll ? { ...snap, stale: isUsageStale(snap, Date.now()) } : snap;
           }
           // Explain absence on a login that CAN'T be polled (setup-token, no full

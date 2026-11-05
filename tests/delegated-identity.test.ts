@@ -164,4 +164,30 @@ describe('delegated human identity authority', () => {
     expect(requireInteractiveHuman(identity)).toMatchObject({ userId: 'alice', presence: 'interactive' });
     expect(resolveCallerIdentity(human.record, 'bob').humanSubject).toBeUndefined();
   });
+
+  // #835: a run of an automation held a delegation for `projectId: p1`; the
+  // task its agent created got one for `projectIds: [p1]` — the same single
+  // project — and every turn of it failed "task-mismatched human delegation".
+  it('treats projectId and a one-project projectIds as the same scope along a delegation chain', async () => {
+    const human = (await tokens.mintPrincipal('user:alice', ['repository:write'], 'p1', 60_000, 'o1'));
+    const run = (await tokens.delegateHuman(human.token, { taskId: 'run', projectId: 'p1', organizationId: 'o1' }))!;
+    const runAgent = (await tokens.mint({ taskId: 'run', profileId: 'do', principal: 'user:alice', projectIds: ['p1'], organizationId: 'o1',
+      ceiling: ['repository:write'], grantorCaps: ['repository:write'], delegationId: run.id }));
+    const created = (await tokens.delegateHuman(runAgent.token, { taskId: 'created', projectIds: ['p1'], organizationId: 'o1' }))!;
+    const agent = (await tokens.mint({ taskId: 'created', profileId: 'do', principal: 'user:alice', projectIds: ['p1'], organizationId: 'o1',
+      ceiling: ['repository:write'], grantorCaps: ['repository:write'], delegationId: created.id }));
+    expect(agent.record.humanSubject).toMatchObject({ userId: 'alice', presence: 'delegated' });
+    expect((await tokens.delegationCovers(created.id, { projectId: 'p1', organizationId: 'o1' }))).toBe(true);
+
+    // Still no wider than its parent: a child naming another project is refused.
+    const now = Date.now();
+    (await store.putHumanDelegation('dlg_wider', { id: 'dlg_wider', taskId: 'wider', humanUserId: 'alice', projectIds: ['p1', 'p2'],
+      organizationId: 'o1', parentDelegationId: run.id, issuedAt: now, expiresAt: run.expiresAt }, run.expiresAt));
+    await expect(tokens.mint({ taskId: 'wider', profileId: 'do', principal: 'user:alice', projectIds: ['p1'], organizationId: 'o1',
+      ceiling: ['repository:write'], grantorCaps: ['repository:write'], delegationId: 'dlg_wider' })).rejects.toThrow(/task-mismatched/i);
+    (await store.putHumanDelegation('dlg_unscoped', { id: 'dlg_unscoped', taskId: 'unscoped', humanUserId: 'alice',
+      organizationId: 'o1', parentDelegationId: run.id, issuedAt: now, expiresAt: run.expiresAt }, run.expiresAt));
+    await expect(tokens.mint({ taskId: 'unscoped', profileId: 'do', principal: 'user:alice', projectId: 'p1', organizationId: 'o1',
+      ceiling: ['repository:write'], grantorCaps: ['repository:write'], delegationId: 'dlg_unscoped' })).rejects.toThrow(/task-mismatched/i);
+  });
 });

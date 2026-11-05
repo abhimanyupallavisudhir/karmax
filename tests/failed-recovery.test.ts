@@ -382,7 +382,7 @@ describe('failed software-dev recovery', () => {
   // pramana#137, after its Retry: the turn waited for a login the quota
   // scheduler held for higher-priority work, and the page offered "Retry".
   describe('a turn waiting for a login', () => {
-    const fixture = async (detail: string) => {
+    const fixture = async (detail: string | Record<string, unknown>, published: Record<string, unknown> = {}) => {
       const store = (await Store.create(':memory:'));
       const tokens = new TokenAuthority();
       const token = (await tokens.mint({ taskId: 'operator', profileId: 'do', principal: 'user:test',
@@ -391,15 +391,32 @@ describe('failed software-dev recovery', () => {
       const task = (await store.createTask({ projectId: project.id, title: 'T', workflow: 'software-dev',
         workflowVersion: bundledVersion('software-dev'), params: { prompt: 'x' } }));
       (await store.saveView(task.id, { taskId: task.id, title: 'T', workflow: 'software-dev', stage: 'do', status: 'waiting',
-        waitingFor: { kind: 'account', provider: 'claude' }, messages: [], actions: [], state: {}, updatedAt: 1 }));
+        waitingFor: { kind: 'account', provider: 'claude', ...published }, messages: [], actions: [], state: {}, updatedAt: 1 }));
       const client = { workflow: { getHandle: (id: string) => ({ query: async () => id === 'account-coordinator'
-        ? { waiting: true, detail } : undefined }) } } as any;
+        ? { waiting: true, ...(typeof detail === 'string' ? { detail } : detail) } : undefined }) } } as any;
       return (await new KarmaxApi({ store, client, taskQueue: 'test', tokens }).getTaskView(token, task.id))!;
     };
 
     it('offers no Retry while the scheduler holds it back: nothing failed, and its control is Run now', async () => {
       const view = await fixture('Held for higher-priority work');
       expect(view.waitingFor?.detail).toBe('Held for higher-priority work');
+      expect(view.actions.map((action) => action.name)).not.toContain('retry');
+    });
+
+    // The view a workflow published says what the coordinator answered when the
+    // turn asked; the answer changes as the scheduler plans again.
+    it('says why it waits now, not what it was told when it asked', async () => {
+      const reset = Date.now() + 3_600_000;
+      const view = await fixture({ reason: 'quota', detail: 'Out of quota until a login resets', earliestResetAt: reset },
+        { detail: 'Held for higher-priority work', until: reset - 1000 });
+      expect(view.waitingFor).toEqual({ kind: 'account', provider: 'claude', reason: 'quota',
+        detail: 'Out of quota until a login resets', earliestResetAt: reset });
+      expect(view.actions.find((action) => action.name === 'retry')).toMatchObject({ label: 'Check again' });
+    });
+
+    it('offers nothing to check while the scheduler places the turn', async () => {
+      const view = await fixture({ reason: 'planning', planning: true });
+      expect(view.waitingFor).toEqual({ kind: 'account', provider: 'claude', reason: 'planning' });
       expect(view.actions.map((action) => action.name)).not.toContain('retry');
     });
 
