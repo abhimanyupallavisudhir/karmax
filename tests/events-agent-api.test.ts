@@ -250,6 +250,9 @@ describe('events through an agent\'s task token', () => {
       expect(await title(spaced)).toBe('Tidy the list');
       await edit(spaced, '\nRename it');
       expect(await title(spaced)).toBe('Rename it');
+      // A long first line ends at a word, not in the middle of one.
+      await edit(spaced, 'Task titles in the task list etc. should reflect the first words of the current task contents');
+      expect(await title(spaced)).toBe('Task titles in the task list etc. should reflect the first words of the current…');
 
       // A title given at creation is the task's own and stays through the same edits.
       const named = await draft({ title: 'Weekly report', params: { prompt: 'Summarize the week' } });
