@@ -13,7 +13,7 @@ const slice = (from: string, to: string) => {
   const start = app.indexOf(from);
   vm.runInContext(app.slice(start, app.indexOf(to, start)), context);
 };
-slice('function credentialRequestRows(', 'function wireAuthorizationRequestActions(');
+slice('function credentialChoices(', 'function wireAuthorizationRequestActions(');
 slice('function connectionRows(', '/** Distinct names for a person');
 slice('function approvalHistoryLink(', '// The shell, last in the rail');
 slice('function inboxEventChanges(', 'let inboxRefreshTimer');
@@ -32,7 +32,9 @@ describe('ignored approval rows', () => {
       recipients: ['approver'], audience: ['@owners'], target: { kind: 'task' }, reason: 'Read task' };
     const render = context[`${kind}RequestRows`];
     expect(render([request])).toContain(IGNORE);
-    expect(render([request])).toContain('approval-needed');
+    // A pending request asks its question with Allow / Deny; no separate "approval needed" badge.
+    expect(render([request])).toMatch(/approval-request-title">[^<]*\?/);
+    expect(render([request])).not.toContain('approval-needed');
     const ignored = render([{ ...request, dismissed: { by: 'approver', at: 1 } }]);
     expect(ignored).toContain('approval-request-dismissed');
     expect(ignored).toContain('>ignored</span>');

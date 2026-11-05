@@ -43,10 +43,17 @@ it.each([560, 980])('lays out approval requests in a %ipx conversation without c
       return { width: box.width, main: main.width, title: title.height };
     }));
     expect(rows).toHaveLength(3);
+    // A credential's four choices sit under its question, never beside it.
+    const choices = await page.locator('[data-vreq="bound"]').evaluate((node) => {
+      const main = node.querySelector('.approval-request-main')!.getBoundingClientRect();
+      const actions = node.querySelector('.approval-request-actions')!.getBoundingClientRect();
+      return { below: actions.top >= main.bottom - 1, full: main.width };
+    });
+    expect(choices.below).toBe(true);
     for (const row of rows) {
-      // The text gets at least half of the card; its title is one line.
+      // The text gets at least half of the card; its question wraps at most once.
       expect(row.main).toBeGreaterThan(row.width / 2);
-      expect(row.title).toBeLessThan(32);
+      expect(row.title).toBeLessThan(56);
     }
     // In its own conversation a request does not name the task it belongs to.
     expect(await page.locator('#task-approval-requests').innerText()).not.toContain('Remove the unused');

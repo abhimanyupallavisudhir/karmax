@@ -1656,6 +1656,10 @@ textarea.ask-input { resize: vertical; min-height: 4.5em; }
 .approval-request-main { flex: 1 1 260px; min-width: 0; overflow-wrap: anywhere; }
 .approval-request-title { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font-weight: 650; margin-bottom: 4px; }
 .approval-request-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+/* Four or more choices (a credential's Allow once / for this task / always / Deny)
+   are a choice to read, not a button beside the text: they take their own line
+   under it, so the question keeps the card's width. */
+.approval-request-actions:has(> .btn:nth-of-type(4)) { flex-basis: 100%; }
 .approval-request-actions .vreq-pick { gap: 8px; max-width: 260px; }
 .approval-request-actions .vreq-pick .tf-vault-count { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .approval-request-actions .vreq-add { font-size: var(--fs-12); white-space: nowrap; }
