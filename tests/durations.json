@@ -385,6 +385,7 @@
   "tests/merge.test.ts": 15.2,
   "tests/message-other-tasks.test.ts": 0.1,
   "tests/mock-agent.test.ts": 0,
+  "tests/mock-scripted-demo.test.ts": 0,
   "tests/model-benchmarks.test.ts": 0,
   "tests/model-credential-routing.test.ts": 1,
   "tests/model-field.browser.test.ts": 2.9,
