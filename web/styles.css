@@ -1009,60 +1009,10 @@ a.git-repo-name:hover { color:var(--accent); }
    scroll container stops and the inner column unclamps to the full cell —
    tp-head/tp-content re-center their own 960px column against the full-bleed
    head/foot borders. */
-.main:has(.task-page), .main:has(.task-file-page) { overflow: hidden; }
-.main-inner:has(> .task-page), .main-inner:has(> .task-file-page) { max-width: none; padding: 0; height: 100%; }
+.main:has(.task-page) { overflow: hidden; }
+.main-inner:has(> .task-page) { max-width: none; padding: 0; height: 100%; }
 .task-page { display: flex; flex-direction: column; height: 100%; }
 
-/* Agent citations cross a real boundary: provider world → Git handoff → the
-   developer's editor. The rail encodes that transfer; everything else stays
-   deliberately quiet so this page feels like a utility, not a second product. */
-.task-file-page { min-height: 100%; overflow: auto; background: var(--surface); }
-.fh-head { padding: clamp(30px, 7vw, 76px) clamp(24px, 8vw, 104px) 30px; border-bottom: 1px solid var(--line); }
-.fh-back { display: inline-flex; margin-bottom: 42px; color: var(--ink-2); font-size: var(--fs-12); font-weight: 600; }
-.fh-back:hover { color: var(--accent); }
-.fh-kicker { display: block; margin-bottom: 10px; color: var(--accent); font: 600 var(--fs-11)/1 var(--font-mono); letter-spacing: .09em; text-transform: uppercase; }
-.fh-head h1 { margin: 0; max-width: 900px; font-size: clamp(32px, 6vw, 68px); line-height: .98; letter-spacing: -.055em; overflow-wrap: anywhere; }
-.fh-head p { margin: 18px 0 0; max-width: 900px; color: var(--ink-2); font: var(--fs-12)/1.6 var(--font-mono); overflow-wrap: anywhere; }
-.fh-head p span { color: var(--accent); }
-.fh-body { width: min(920px, calc(100% - 48px)); margin: 0 auto; padding: 42px 0 70px; }
-.fh-rail { display: grid; grid-template-columns: auto minmax(24px, 1fr) auto minmax(24px, 1fr) auto; align-items: start; margin-bottom: 30px; }
-.fh-rail > div { display: grid; justify-items: center; gap: 7px; color: var(--ink-3); font: 600 var(--fs-10)/1 var(--font-mono); text-transform: uppercase; letter-spacing: .04em; }
-.fh-rail i { display: grid; place-items: center; width: 27px; height: 27px; border: 1px solid var(--line-strong); border-radius: 50%; background: var(--surface); font-style: normal; }
-.fh-rail b { height: 1px; margin-top: 13px; background: var(--line-strong); }
-.fh-rail .done, .fh-rail .current { color: var(--ink); }
-.fh-rail .done i { border-color: var(--merged); background: var(--merged); color: #fff; }
-.fh-rail .done + b { background: var(--merged); }
-.fh-rail .current i { border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-weak); }
-.fh-panel { border: 1px solid var(--line); border-radius: 14px; background: var(--surface-2); box-shadow: var(--shadow); overflow: hidden; }
-.fh-status { display: flex; gap: 14px; align-items: flex-start; padding: 22px; }
-.fh-status > div { display: grid; gap: 4px; }
-.fh-status span:not(.fh-pulse):not(.fh-mark) { color: var(--ink-2); font-size: var(--fs-12); }
-.fh-status .btn { justify-self: start; margin-top: 8px; }
-.fh-status.error { background: var(--danger-weak); }
-.fh-pulse, .fh-mark { flex: none; display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: var(--accent-weak); color: var(--accent); font: 700 var(--fs-12)/1 var(--font-mono); }
-.fh-pulse::after { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
-.fh-status.ready .fh-mark { background: var(--merged-weak); color: var(--merged); }
-.fh-status.error .fh-mark { background: var(--danger); color: white; }
-.fh-command { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding: 18px 22px; border-top: 1px solid var(--line); background: var(--surface); }
-.fh-command > div:first-child { min-width: 0; display: grid; gap: 4px; }
-.fh-command span { color: var(--ink-3); font: var(--fs-10)/1 var(--font-mono); text-transform: uppercase; letter-spacing: .06em; }
-.fh-command code { font: var(--fs-12)/1.5 var(--font-mono); overflow-wrap: anywhere; }
-.fh-actions { display: flex; flex: none; gap: 8px; }
-.fh-copy { display: inline-flex; align-items: center; gap: 6px; }
-.fh-script { margin: 0; border: 0; border-top: 1px solid var(--line); border-radius: 0; max-height: 300px; }
-.fh-footnote { margin: 15px 4px 0; color: var(--ink-3); font-size: var(--fs-11); }
-@media (prefers-reduced-motion: no-preference) {
-  .fh-pulse { animation: fh-breathe 1.4s ease-in-out infinite; }
-  @keyframes fh-breathe { 50% { box-shadow: 0 0 0 7px var(--accent-weak); } }
-}
-@media (max-width: 640px) {
-  .fh-head { padding: 24px 20px; }
-  .fh-back { margin-bottom: 30px; }
-  .fh-body { width: calc(100% - 28px); padding-top: 30px; }
-  .fh-rail > div span { font-size: 8px; }
-  .fh-command { align-items: stretch; flex-direction: column; }
-  .fh-actions { flex-wrap: wrap; }
-}
 /* Head, body content and foot all share ONE column: max-width 960 incl. 28px
    side padding, centered — so the title, meta, tabs, section content and the
    action buttons line up on the same left edge (the strips stay full-bleed). */
@@ -4786,3 +4736,30 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 /* The public page of a shared snapshot: the Files view, wider than a conversation. */
 .shared-main.shared-files-main { max-width: 1160px; }
 .shared-main.shared-files-main .shared-heading { margin-bottom: 16px; }
+
+/* Files ▸ which tree: the default branches, a branch, or a task's world. */
+.files-bar { position: relative; }
+.files-view-button { display: inline-flex; align-items: center; gap: 7px; flex: none; max-width: 300px; height: 36px; padding: 0 10px 0 11px;
+  border: 1px solid var(--line); border-radius: var(--r-field); background: var(--surface); color: var(--ink); font-size: var(--fs-12h); cursor: pointer; }
+.files-view-button:hover { border-color: var(--line-strong); }
+.files-view-button[aria-expanded="true"] { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+.files-view-button svg { flex: none; color: var(--ink-3); }
+.files-view-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 550; }
+.files-view-caret { color: var(--ink-3); font-size: 10px; }
+.files-view-state { flex: none; padding: 1px 7px; border-radius: 999px; background: var(--surface-2); color: var(--ink-3); font-size: var(--fs-11); font-weight: 500; white-space: nowrap; }
+.files-view-state.live { background: var(--merged-weak); color: var(--merged); }
+.files-view-menu { position: absolute; z-index: 40; top: 42px; left: 40px; width: min(420px, calc(100vw - 32px)); display: flex; flex-direction: column;
+  border: 1px solid var(--line-strong); border-radius: var(--r); background: var(--surface); box-shadow: var(--shadow), 0 12px 32px rgb(0 0 0 / .12); overflow: hidden; }
+.files-view-menu input { margin: 8px; height: 34px; padding: 0 10px; border: 1px solid var(--line); border-radius: var(--r-field); background: var(--surface); color: var(--ink); font-size: var(--fs-13); }
+.files-view-menu ul { list-style: none; margin: 0; padding: 0 6px 6px; max-height: min(60vh, 420px); overflow: auto; }
+.files-view-menu li[role="option"] { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 6px; cursor: pointer; font-size: var(--fs-13); }
+.files-view-menu li[aria-selected="true"] { background: var(--surface-2); }
+.files-view-menu li.current .files-view-option { font-weight: 650; }
+.files-view-option { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.files-view-num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.files-view-group { padding: 10px 10px 4px; color: var(--ink-3); font-size: var(--fs-11); font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+.files-view-note { color: var(--ink-3); font-size: var(--fs-12); white-space: nowrap; }
+.files-view-menu > ul > .files-view-note { padding: 10px; }
+/* Images in rendered Markdown (wiki pages, READMEs, agents' messages) fit their column. */
+.md img { max-width: 100%; height: auto; border-radius: 6px; }
+@media (max-width: 720px) { .files-view-button { max-width: 40vw; } .files-view-state { display: none; } .files-view-menu { left: 0; } }

@@ -2,24 +2,35 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { Readable } from 'node:stream';
+import { spawn } from 'node:child_process';
+import { Readable } from 'node:stream';
 import type { Store } from '../store/db.js';
+import type { WorldCheckpoint } from '../domain/types.js';
 import type { WorkspaceManifest, WorkspaceService } from './workspace.js';
 import type { ProjectResourceService } from './resources.js';
 import type { GitBrokerCredential } from './git-broker.js';
+import type { ManifestEntry } from './checkpoint-chunks.js';
+import type { World, WorldHandle } from './types.js';
+import { isRemoteWorldKind, worldRepos, worldRepoSource } from './types.js';
 import { MirroredCommitMissing, readMirrored } from './git-mirror.js';
 import { catBlob, git } from './git.js';
 import { materializeGitCredential } from './git-credential.js';
+import { sameRepository } from './repository-identity.js';
 import { RESTIC_ENGINE, ROOT_PART, storedRef, type Repository as ResticRepository, type SnapshotEntry } from './restic-engine.js';
 
 /**
  * The project as a file tree (wiki features/project-files): the layout a
  * task's world has and `tavya clone` assembles (WorkspaceService): a folder per
- * repository at the branch tasks start from, the project wiki, and each data
- * resource's current version where it is mounted, over whatever the repository
- * has there. Paths are relative to that root, `/`-separated, as in the address
- * bar. Everything is read on the host: Git from the broker's mirror cache,
- * data with restic from the resource's repository. Nothing here writes.
+ * repository, the project wiki, and each data resource where it is mounted,
+ * over whatever the repository has there. Paths are relative to that root,
+ * `/`-separated, as in the address bar.
+ *
+ * What it shows (`FileView`): the branches tasks start from (default), another
+ * branch of each repository, or a task's world. A task's world is read live
+ * while it runs, and otherwise from its last save (each checkout's commit plus
+ * the uncommitted files its checkpoint holds, and the data it had), so looking
+ * never wakes a sandbox. Everything else is read on the host: Git from the
+ * broker's mirror cache, data with restic. Nothing here writes.
  */
 
 export type FileKind = 'directory' | 'file' | 'symlink' | 'submodule';
@@ -35,8 +46,14 @@ export interface FileEntry {
 /** Where a path's content comes from. */
 export type FileSource =
   | { kind: 'project' }
-  | { kind: 'repository'; name: string; role: 'development' | 'project-wiki'; branch: string; commit: string }
-  | { kind: 'data'; id: string; name: string; revisionId?: string; access: 'read' | 'write' };
+  | { kind: 'repository'; name: string; role: 'development' | 'project-wiki'; branch: string; commit: string; changed?: true }
+  | { kind: 'data'; id: string; name: string; revisionId?: string; access: 'read' | 'write' }
+  | { kind: 'world' };
+
+/** What a node was read from: a branch, or a task's world live or as last saved. */
+export type FileViewInfo =
+  | { kind: 'branch'; name: string }
+  | { kind: 'task'; id: string; num?: number; title: string; mode: 'live' | 'saved' | 'published'; savedAt?: number };
 
 export interface FileNode {
   path: string;
@@ -49,6 +66,7 @@ export interface FileNode {
   target?: string;
   /** Changes whenever the content does (an ETag). */
   version?: string;
+  view?: FileViewInfo;
 }
 
 /** A snapshot of the tree (a public link): the commit of each repository it
@@ -56,12 +74,19 @@ export interface FileNode {
  * yet). Repositories and data it does not name are not part of it. */
 export interface FilePins { repositories: Record<string, string>; data: Record<string, string | null> }
 
-export interface FileReadOptions { data: boolean; pins?: FilePins }
+export type FileView = { kind: 'default' } | { kind: 'branch'; name: string } | { kind: 'task'; taskId: string };
+
+export interface FileReadOptions { data: boolean; pins?: FilePins; view?: FileView }
 
 export interface OpenedFile { node: FileNode; size: number; stream: Readable; done: Promise<void>; stop: () => void }
 
 export class FileNotFoundError extends Error {}
 export class FileAccessError extends Error {}
+
+/** A task's saved uncommitted files: the reader WorldCheckpointService gives. */
+export interface SavedCheckpointFiles {
+  savedFiles(checkpoint: WorldCheckpoint): Promise<{ files: ManifestEntry[]; read(entry: ManifestEntry): AsyncIterable<Buffer> }>;
+}
 
 export interface ProjectFilesDeps {
   store: Store;
@@ -69,18 +94,61 @@ export interface ProjectFilesDeps {
   resources?: ProjectResourceService;
   /** The credential the host reads a project repository with. */
   gitCredential: (projectId: string, sshUrl: string) => Promise<GitBrokerCredential>;
+  /** Saved task worlds; without it a task shows its branch on GitHub. */
+  checkpoints?: SavedCheckpointFiles;
+  /** A running task world, borrowed (never resumed from a park); released after. */
+  openWorld?: (taskId: string, handle: WorldHandle) => Promise<{ world: World; release(): Promise<void> }>;
+}
+
+/** The credential the host reads a project's repository (or its wiki) with:
+ * the organization's GitHub App; hosted refuses without it; a self-host reads
+ * with the host's own Git setup, as its worlds are provisioned. */
+export function projectRepositoryCredential(store: Store, options: { hosted?: boolean;
+  githubApp?: { brokerCredentials(repository: import('../domain/types.js').Repository): Promise<GitBrokerCredential> } }) {
+  return async (projectId: string, sshUrl: string): Promise<GitBrokerCredential> => {
+    const repositories = [...(await store.listProjectRepositories(projectId)).map((linked) => linked.repository),
+      ...[(await store.projectWiki(projectId))?.repository].filter((wiki): wiki is NonNullable<typeof wiki> => Boolean(wiki))];
+    const repository = repositories.find((candidate) => safeSame(candidate.sshUrl, sshUrl));
+    if (options.githubApp && repository?.gitConnectionId) return options.githubApp.brokerCredentials(repository);
+    if (options.hosted) throw new Error('Connect GitHub in organization settings, then try again.');
+    return {};
+  };
 }
 
 /** How long a branch tip origin advertised is trusted before asking again. */
 const TIP_MAX_AGE_MS = 30_000;
 /** Snapshot listings never change: kept by snapshot and directory. */
 const LISTING_CACHE = 500;
+/** A live file larger than this is not read through a provider that cannot stream. */
+const LIVE_UNSTREAMED_MAX = 100 * 1024 * 1024;
+/** What a live world never shows: tavya's own state (tokens, jobs) and Git internals. */
+const HIDDEN_NAMES = new Set(['.karmax-injection', '.git']);
 
 type Mount = WorkspaceManifest['resources'][number] & { segments: string[] };
-type PinnedRepository = WorkspaceManifest['repositories'][number] & { commit?: string };
+
+/** A task's saved changes on top of one checkout's commit (or the world root). */
+interface Overlay { files: Map<string, ManifestEntry>; read(entry: ManifestEntry): AsyncIterable<Buffer> }
+
+interface Checkout {
+  name: string;
+  /** Where it sits; [] = the root itself. */
+  segments: string[];
+  role: 'development' | 'project-wiki';
+  sshUrl: string;
+  branch: string;
+  /** Read instead when `branch` is not on origin (a branch view, an unpublished task). */
+  fallbackBranch?: string;
+  commit?: string;
+  overlay?: Overlay;
+}
+
+interface Layout { checkouts: Checkout[]; mounts: Mount[]; rootOverlay?: Overlay; view?: FileViewInfo }
+
+interface Located { stat: () => Promise<FileNode>; open: <T>(consume: (file: OpenedFile) => Promise<T>) => Promise<T> }
 
 export class ProjectFiles {
   private readonly listings = new Map<string, SnapshotEntry[]>();
+  private readonly saved = new Map<string, Promise<{ files: ManifestEntry[]; read(entry: ManifestEntry): AsyncIterable<Buffer> }>>();
 
   constructor(private readonly deps: ProjectFilesDeps) {}
 
@@ -88,114 +156,278 @@ export class ProjectFiles {
    * `data: false` (no right to read the project's data) still shows where
    * data is mounted, but refuses its contents. */
   async stat(projectId: string, relative: string, options: FileReadOptions): Promise<FileNode> {
-    const at = await this.locate(projectId, relative, options);
-    return at.stat();
+    return (await this.locate(projectId, relative, options)).stat();
   }
 
   /** A file's bytes. `consume` runs while the source is held open (a Git
-   * mirror stays borrowed until it settles). */
+   * mirror stays borrowed, a live world open, until it settles). */
   async open<T>(projectId: string, relative: string, options: FileReadOptions, consume: (file: OpenedFile) => Promise<T>): Promise<T> {
-    const at = await this.locate(projectId, relative, options);
-    return at.open(consume);
+    return (await this.locate(projectId, relative, options)).open(consume);
   }
 
   /** Pin what `relative` spans now (each repository's commit, each data
    * resource's version) and check it is there: what a public link shows. */
   async snapshot(projectId: string, relative: string, options: { data: boolean }): Promise<{ pins: FilePins; node: FileNode }> {
     const segments = splitPath(relative);
-    const manifest = await this.deps.workspaces.project(projectId);
+    const layout = await this.projectLayout(projectId, {});
     const pins: FilePins = { repositories: {}, data: {} };
-    for (const repository of manifest.repositories) {
-      if (segments.length && segments[0] !== repository.name) continue;
-      pins.repositories[repository.sshUrl] = await this.withRepository(projectId, repository, async (_mirror, commit) => commit);
+    for (const checkout of layout.checkouts) {
+      if (segments.length && segments[0] !== checkout.name) continue;
+      pins.repositories[checkout.sshUrl] = await this.withRepository(projectId, checkout, async (_mirror, commit) => commit);
     }
-    for (const resource of manifest.resources) {
-      const mount = splitPath(resource.path);
-      if (!startsWith(segments, mount) && !startsWith(mount, segments)) continue;
-      if (!options.data) { if (startsWith(segments, mount)) throw new FileAccessError('Sharing data needs access to project settings (project:settings:read).'); continue; }
-      pins.data[resource.id] = resource.revisionId ?? null;
+    for (const mount of layout.mounts) {
+      if (!startsWith(segments, mount.segments) && !startsWith(mount.segments, segments)) continue;
+      if (!options.data) { if (startsWith(segments, mount.segments)) throw new FileAccessError('Sharing data needs access to project settings (project:settings:read).'); continue; }
+      pins.data[mount.id] = mount.revisionId ?? null;
     }
     return { pins, node: await this.stat(projectId, relative, { data: options.data, pins }) };
   }
 
-  private async locate(projectId: string, relative: string, options: FileReadOptions): Promise<{
-    stat: () => Promise<FileNode>; open: <T>(consume: (file: OpenedFile) => Promise<T>) => Promise<T> }> {
+  /** Branches each repository has, for the view picker. */
+  async branches(projectId: string): Promise<Array<{ name: string; role: 'development' | 'project-wiki'; default: string; branches: string[] }>> {
+    const layout = await this.projectLayout(projectId, {});
+    return Promise.all(layout.checkouts.map(async (checkout) => {
+      const credential = await this.deps.gitCredential(projectId, checkout.sshUrl);
+      const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-files-'));
+      try {
+        const { env } = materializeGitCredential(scratch, credential);
+        const listed = await git(scratch, ['ls-remote', '--heads', checkout.sshUrl], { env, timeoutMs: 60_000 });
+        if (listed.code !== 0) throw new Error(firstLine(listed.stderr || listed.stdout));
+        const branches = listed.stdout.split('\n').map((line) => line.split('\trefs/heads/')[1]).filter((name): name is string => Boolean(name)).sort();
+        return { name: checkout.name, role: checkout.role, default: checkout.branch, branches };
+      } catch (error) {
+        throw new Error(`Couldn’t list the branches of ${checkout.name}: ${firstLine(error)}`);
+      } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+    }));
+  }
+
+  /** Write one checkout of a task's saved world (the wiki's, by role) into
+   * `target`: its commit, then the saved uncommitted files. False when the
+   * task has no saved world to read this way. Never wakes a sandbox. */
+  async copySavedCheckout(taskId: string, role: 'project-wiki', target: string): Promise<boolean> {
+    const task = await this.deps.store.getTask(taskId);
+    if (!task) return false;
+    const layout = await this.taskLayout(task.projectId, taskId, { live: false });
+    const checkout = layout && 'checkouts' in layout ? layout.checkouts.find((candidate) => candidate.role === role) : undefined;
+    if (!checkout) return false;
+    await this.withRepository(task.projectId, checkout, async (mirror, commit) => {
+      await archive(mirror, commit, target);
+    });
+    for (const [file, entry] of checkout.overlay?.files ?? []) {
+      const destination = path.join(target, file);
+      if (!destination.startsWith(path.resolve(target) + path.sep)) continue;
+      if ('deleted' in entry) { fs.rmSync(destination, { force: true }); continue; }
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.rmSync(destination, { force: true });
+      if ('link' in entry) { fs.symlinkSync(entry.link, destination); continue; }
+      const chunks: Buffer[] = [];
+      for await (const chunk of checkout.overlay!.read(entry)) chunks.push(chunk);
+      fs.writeFileSync(destination, Buffer.concat(chunks));
+    }
+    return true;
+  }
+
+  // ── layouts ─────────────────────────────────────────────────────────────────
+
+  private async locate(projectId: string, relative: string, options: FileReadOptions): Promise<Located> {
     const segments = splitPath(relative);
-    let manifest: WorkspaceManifest = await this.deps.workspaces.project(projectId);
-    // A snapshot reads its pinned versions, and nothing it does not name.
+    if (options.view?.kind === 'task') {
+      const layout = await this.taskLayout(projectId, options.view.taskId, { live: true });
+      if (!layout) throw new FileNotFoundError('This task has no files yet.');
+      if ('live' in layout) return this.locateLive(projectId, layout, segments, options);
+      return this.locateIn(projectId, layout, segments, options);
+    }
+    return this.locateIn(projectId, await this.projectLayout(projectId, options), segments, options);
+  }
+
+  /** The project's layout: each repository at its base (or `view`'s branch, or a pin). */
+  private async projectLayout(projectId: string, options: Pick<FileReadOptions, 'pins' | 'view'>): Promise<Layout> {
+    const manifest = await this.deps.workspaces.project(projectId);
     const pins = options.pins;
-    if (pins) manifest = { ...manifest,
-      repositories: manifest.repositories.filter((repository) => pins.repositories[repository.sshUrl])
-        .map((repository) => ({ ...repository, commit: pins.repositories[repository.sshUrl] })),
-      resources: manifest.resources.filter((resource) => resource.id in pins.data).map(({ revisionId: _current, bytes: _bytes, ...resource }) =>
-        ({ ...resource, ...(pins.data[resource.id] ? { revisionId: pins.data[resource.id]! } : {}) })) };
-    const mounts: Mount[] = manifest.resources.map((resource) => ({ ...resource, segments: splitPath(resource.path) }))
+    const branch = options.view?.kind === 'branch' ? options.view.name : undefined;
+    const checkouts: Checkout[] = manifest.repositories
+      .filter((repository) => !pins || pins.repositories[repository.sshUrl])
+      .map((repository) => ({ name: repository.name, segments: [repository.name], role: repository.role, sshUrl: repository.sshUrl,
+        branch: branch ?? repository.branch, ...(branch && branch !== repository.branch ? { fallbackBranch: repository.branch } : {}),
+        ...(pins ? { commit: pins.repositories[repository.sshUrl] } : {}) }));
+    const mounts = manifest.resources.filter((resource) => !pins || resource.id in pins.data)
+      .map(({ revisionId, bytes, ...resource }) => ({ ...resource, segments: splitPath(resource.path),
+        ...(pins ? (pins.data[resource.id] ? { revisionId: pins.data[resource.id]! } : {}) : { ...(revisionId ? { revisionId } : {}), ...(bytes !== undefined ? { bytes } : {}) }) }))
       .filter((mount) => mount.segments.length > 0);
-    const mount = mounts.filter((candidate) => startsWith(segments, candidate.segments))
-      .sort((a, b) => b.segments.length - a.segments.length)[0];
+    return { checkouts, mounts, ...(branch ? { view: { kind: 'branch' as const, name: branch } } : {}) };
+  }
+
+  /** A task's world: live while it runs (and `live` is allowed), else as it
+   * was last saved, else its branches on GitHub. */
+  private async taskLayout(projectId: string, taskId: string, options: { live: boolean }): Promise<Layout | LiveWorld | undefined> {
+    const task = await this.deps.store.getTask(taskId);
+    if (!task || task.projectId !== projectId) throw new FileNotFoundError('No such task in this project.');
+    const handle = ((await this.deps.store.currentWorld(taskId)) ?? task.lastView?.world) as WorldHandle | undefined;
+    if (!handle) return undefined;
+    const info = { kind: 'task' as const, id: task.id, ...(task.num != null ? { num: task.num } : {}), title: task.title };
+    const state = await this.deps.store.worldState(handle.id);
+    // A world on this host (a worktree) is read in place; a remote one only while it runs.
+    const local = !isRemoteWorldKind(handle.kind) && Boolean(handle.root && fs.existsSync(handle.root));
+    if (options.live && this.deps.openWorld && (state === 'ready' || (local && state !== 'released')))
+      return { live: true, handle, taskId, view: { ...info, mode: 'live' } };
+    const project = await this.deps.workspaces.project(projectId);
+    const checkpoint = await this.deps.store.latestWorldCheckpoint(handle.id);
+    if (checkpoint && checkpoint.filesystemDelta?.format === 2 && this.deps.checkpoints) {
+      const saved = await this.savedFiles(checkpoint);
+      const byCheckout = new Map<string, Map<string, ManifestEntry>>();
+      const root = new Map<string, ManifestEntry>();
+      for (const file of saved.files) {
+        // As restore places them: `repo: ''` is the world root; a checkout's own name, else the first.
+        const owner = file.repo === '' ? undefined : checkpoint.repos.find((repo) => repo.checkoutPath === file.repo) ?? checkpoint.repos[0];
+        const into = owner ? byCheckout.get(owner.checkoutPath) ?? byCheckout.set(owner.checkoutPath, new Map()).get(owner.checkoutPath)! : root;
+        into.set(file.path, file);
+      }
+      const repositories = await this.deps.store.listProjectRepositories(projectId);
+      const wiki = (await this.deps.store.projectWiki(projectId))?.repository;
+      const checkouts: Checkout[] = [];
+      for (const repo of checkpoint.repos) {
+        const sshUrl = repo.source ?? (await this.deps.store.getRepository(repo.repositoryId))?.sshUrl;
+        if (!sshUrl) continue;
+        const linked = repositories.find((candidate) => safeSame(candidate.repository.sshUrl, sshUrl));
+        const role = repo.role ?? (wiki && safeSame(wiki.sshUrl, sshUrl) ? 'project-wiki' : 'development');
+        const name = repo.checkoutPath === '.' ? (linked?.repository.name ?? 'repository') : repo.checkoutPath;
+        const files = byCheckout.get(repo.checkoutPath);
+        checkouts.push({ name, segments: repo.checkoutPath === '.' ? [] : [repo.checkoutPath], role, sshUrl, branch: repo.branch,
+          ...(repo.base && repo.base !== repo.branch ? { fallbackBranch: repo.base } : {}),
+          ...(repo.headSha ? { commit: repo.headSha } : {}), ...(files?.size ? { overlay: { files, read: saved.read } } : {}) });
+      }
+      const versions = new Map((checkpoint.resources ?? []).map((resource) => [resource.attachmentId, resource.revisionId]));
+      const mounts = await Promise.all(project.resources.map(async ({ revisionId: current, bytes: _bytes, ...resource }) => {
+        const attachment = versions.has(resource.id) ? undefined : await this.deps.store.getResourceAttachment(resource.id);
+        const revisionId = versions.get(resource.id)
+          ?? (attachment && this.deps.resources ? await this.deps.resources.workspaceRevision(attachment, taskId) : current);
+        return { ...resource, segments: splitPath(resource.path), ...(revisionId ? { revisionId } : {}) };
+      }));
+      return { checkouts, mounts: mounts.filter((mount) => mount.segments.length > 0), ...(root.size ? { rootOverlay: { files: root, read: saved.read } } : {}),
+        view: { ...info, mode: 'saved', savedAt: checkpoint.createdAt } };
+    }
+    // Never saved: what the task published (its branch on GitHub, else its base).
+    const checkouts: Checkout[] = [];
+    for (const repo of worldRepos(handle)) {
+      const sshUrl = worldRepoSource(repo);
+      const name = repo.name ?? path.posix.basename(repo.root);
+      checkouts.push({ name, segments: repo.root === handle.root ? [] : [name], role: repo.role === 'project-wiki' ? 'project-wiki' : 'development',
+        sshUrl, branch: repo.branch, ...(repo.base && repo.base !== repo.branch ? { fallbackBranch: repo.base } : {}) });
+    }
+    return { checkouts, mounts: project.resources.map(({ bytes: _bytes, ...resource }) => ({ ...resource, segments: splitPath(resource.path) }))
+      .filter((mount) => mount.segments.length > 0), view: { ...info, mode: 'published' } };
+  }
+
+  private savedFiles(checkpoint: WorldCheckpoint) {
+    let pending = this.saved.get(checkpoint.id);
+    if (!pending) {
+      pending = this.deps.checkpoints!.savedFiles(checkpoint);
+      pending.catch(() => this.saved.delete(checkpoint.id));
+      if (this.saved.size >= 16) this.saved.delete(this.saved.keys().next().value!);
+      this.saved.set(checkpoint.id, pending);
+    }
+    return pending;
+  }
+
+  private locateIn(projectId: string, layout: Layout, segments: string[], options: FileReadOptions): Located {
     const display = segments.join('/');
+    const withView = (node: FileNode): FileNode => layout.view ? { ...node, view: layout.view } : node;
+    const folder = (stat: () => Promise<FileNode>): Located => ({ stat: async () => withView(await stat()),
+      open: () => { throw new FileAccessError('This is a folder.'); } });
+    const mount = layout.mounts.filter((candidate) => startsWith(segments, candidate.segments))
+      .sort((a, b) => b.segments.length - a.segments.length)[0];
     if (mount) {
-      if (!options.data) throw new FileAccessError(`Viewing data needs access to project settings (project:settings:read).`);
+      if (!options.data) throw new FileAccessError('Viewing data needs access to project settings (project:settings:read).');
       const inside = segments.slice(mount.segments.length);
       return {
-        stat: () => this.dataStat(mount, inside, display, mounts, segments),
-        open: (consume) => this.dataOpen(mount, inside, display, consume),
+        stat: async () => withView(await this.dataStat(mount, inside, display, layout.mounts, segments)),
+        open: (consume) => this.dataOpen(mount, inside, display, (file) => consume({ ...file, node: withView(file.node) })),
       };
     }
-    const overlay = (directory: string[]) => overlayEntries(mounts, directory);
-    if (!segments.length) {
+    const mounts = (directory: string[]) => overlayEntries(layout.mounts, directory);
+    const checkout = layout.checkouts.filter((candidate) => startsWith(segments, candidate.segments))
+      .sort((a, b) => b.segments.length - a.segments.length)[0];
+    if (checkout) {
+      const inside = segments.slice(checkout.segments.length);
+      // The root checkout of a one-repository world sits beside the world's other saved files.
+      const extra = checkout.segments.length ? [] : savedChildren(layout.rootOverlay, display);
       return {
-        stat: async () => ({ path: '', kind: 'directory', source: { kind: 'project' },
-          entries: sortEntries(merge(manifest.repositories.map((repository): FileEntry => ({ name: repository.name, kind: 'directory',
-            mount: repository.role === 'project-wiki' ? 'wiki' : 'repository' })), overlay([]))) }),
-        open: () => { throw new FileAccessError('This is a folder.'); },
+        stat: async () => withView(await this.gitStat(projectId, checkout, inside, display, merge(mounts(segments), extra))),
+        open: (consume) => this.gitOpen(projectId, checkout, inside, display, (file) => consume({ ...file, node: withView(file.node) })),
       };
     }
-    const repository = manifest.repositories.find((candidate) => candidate.name === segments[0]);
-    if (!repository) {
-      const virtual = overlay(segments);
-      if (virtual.length) return { stat: async () => ({ path: display, kind: 'directory', source: { kind: 'project' }, entries: sortEntries(virtual) }),
-        open: () => { throw new FileAccessError('This is a folder.'); } };
-      throw new FileNotFoundError(`Nothing at ${display}`);
+    const saved = layout.rootOverlay?.files.get(display);
+    if (saved && !('deleted' in saved)) return this.savedFile(layout.rootOverlay!, saved, display, { kind: 'world' }, withView);
+    if (!segments.length) {
+      return folder(async () => ({ path: '', kind: 'directory', source: { kind: 'project' },
+        entries: sortEntries(merge(merge(layout.checkouts.map((repository): FileEntry => ({ name: repository.name, kind: 'directory',
+          mount: repository.role === 'project-wiki' ? 'wiki' : 'repository' })), savedChildren(layout.rootOverlay, '')), mounts([]))) }));
     }
-    const inside = segments.slice(1);
+    const virtual = merge(savedChildren(layout.rootOverlay, display), mounts(segments));
+    if (virtual.length) return folder(async () => ({ path: display, kind: 'directory', source: { kind: 'project' }, entries: sortEntries(virtual) }));
+    throw new FileNotFoundError(`Nothing at ${display}`);
+  }
+
+  /** A saved file (a task's uncommitted work) read from its checkpoint. */
+  private savedFile(overlay: Overlay, entry: ManifestEntry, display: string, source: FileSource, withView: (node: FileNode) => FileNode): Located {
+    const node = (): FileNode => 'link' in entry ? withView({ path: display, kind: 'symlink', source, target: entry.link })
+      : withView({ path: display, kind: 'file', source, size: 'bytes' in entry ? entry.bytes : 0, ...('sha256' in entry ? { version: entry.sha256.slice(0, 40) } : {}) });
     return {
-      stat: () => this.gitStat(projectId, repository, inside, display, overlay(segments)),
-      open: (consume) => this.gitOpen(projectId, repository, inside, display, consume),
+      stat: async () => node(),
+      open: async (consume) => {
+        const file = node();
+        if (file.kind !== 'file') throw new FileAccessError(`${display} is not a file.`);
+        return consume(streamOf(file, overlay.read(entry)));
+      },
     };
   }
 
   // ── repositories ──────────────────────────────────────────────────────────
 
-  private async withRepository<T>(projectId: string, repository: PinnedRepository,
-    read: (mirror: string, commit: string, source: FileSource) => Promise<T>): Promise<T> {
-    const credential = await this.deps.gitCredential(projectId, repository.sshUrl);
+  private async withRepository<T>(projectId: string, checkout: Checkout,
+    read: (mirror: string, commit: string, source: Extract<FileSource, { kind: 'repository' }>) => Promise<T>): Promise<T> {
+    const credential = await this.deps.gitCredential(projectId, checkout.sshUrl);
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-files-'));
     try {
       const { env } = materializeGitCredential(scratch, credential);
-      return await readMirrored(repository.sshUrl, env, { branch: repository.branch, scratch, scope: credential.mirrorScope, maxAgeMs: TIP_MAX_AGE_MS,
-        ...(repository.commit ? { commit: repository.commit } : {}) },
-        (mirror, commit, branch) => read(mirror, commit, { kind: 'repository', name: repository.name, role: repository.role, branch, commit }));
+      const attempt = (branch: string) => readMirrored(checkout.sshUrl, env, { branch, scratch, scope: credential.mirrorScope, maxAgeMs: TIP_MAX_AGE_MS,
+        ...(checkout.commit ? { commit: checkout.commit } : {}) },
+        (mirror, commit, at) => read(mirror, commit, { kind: 'repository', name: checkout.name, role: checkout.role, branch: at, commit }));
+      try { return await attempt(checkout.branch); }
+      catch (error) {
+        // A branch only some repositories have, or a task branch never pushed: its base.
+        const missing = /Remote branch .* not found/.test(String((error as Error)?.message));
+        if (!checkout.fallbackBranch || !(missing || (error instanceof MirroredCommitMissing && checkout.commit))) throw error;
+        return await attempt(checkout.fallbackBranch);
+      }
     } catch (error) {
       if (error instanceof FileNotFoundError || error instanceof FileAccessError) throw error;
-      if (error instanceof MirroredCommitMissing) throw new FileNotFoundError(`${repository.name}: ${error.message}`);
-      throw new Error(`Couldn’t read ${repository.name}: ${firstLine(error)}`);
+      if (error instanceof MirroredCommitMissing) throw new FileNotFoundError(checkout.commit && checkout.overlay !== undefined || checkout.fallbackBranch
+        ? `${checkout.name}: this task’s latest commits haven’t reached GitHub yet.` : `${checkout.name}: ${error.message}`);
+      throw new Error(`Couldn’t read ${checkout.name}: ${firstLine(error)}`);
     } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
   }
 
-  private gitStat(projectId: string, repository: PinnedRepository, inside: string[], display: string,
-    overlay: FileEntry[]): Promise<FileNode> {
-    return this.withRepository(projectId, repository, async (mirror, commit, source) => {
-      const directory = async (tree: string, version?: string): Promise<FileNode> => ({ path: display, kind: 'directory', source,
-        entries: sortEntries(merge(await listTree(mirror, tree), overlay)), ...(version ? { version } : {}) });
+  private gitStat(projectId: string, checkout: Checkout, inside: string[], display: string, overlay: FileEntry[]): Promise<FileNode> {
+    const rel = inside.join('/');
+    const saved = checkout.overlay?.files.get(rel);
+    return this.withRepository(projectId, checkout, async (mirror, commit, base) => {
+      const source = checkout.overlay ? { ...base, ...(saved || savedChildren(checkout.overlay, rel).length ? { changed: true as const } : {}) } : base;
+      const directory = async (tree: string | undefined, version?: string): Promise<FileNode> => ({ path: display, kind: 'directory', source,
+        entries: sortEntries(merge(applySaved(tree ? await listTree(mirror, tree) : [], checkout.overlay, rel), overlay)),
+        ...(version && !checkout.overlay ? { version } : {}) });
+      if (saved && !('deleted' in saved)) {
+        if ('link' in saved) return { path: display, kind: 'symlink', source, target: saved.link };
+        return { path: display, kind: 'file', source, size: saved.bytes, version: saved.sha256.slice(0, 40) };
+      }
       if (!inside.length) return directory(commit, `${commit}:`);
-      const entry = await treeEntry(mirror, commit, inside.join('/'));
+      const entry = saved ? undefined : await treeEntry(mirror, commit, rel);
       if (!entry) {
-        // A folder only a data mount below it makes (data/raw with no data/ in Git).
-        if (overlay.length) return { path: display, kind: 'directory', source, entries: sortEntries(overlay) };
+        // A folder only saved files or a data mount below it make.
+        if (savedChildren(checkout.overlay, rel).length || overlay.length) return directory(undefined);
         throw new FileNotFoundError(`Nothing at ${display}`);
       }
-      if (entry.kind === 'directory') return directory(`${commit}:${inside.join('/')}`, entry.object);
+      if (entry.kind === 'directory') return directory(`${commit}:${rel}`, entry.object);
       if (entry.kind === 'submodule') return { path: display, kind: 'submodule', source, target: entry.object };
       if (entry.kind === 'symlink') {
         const target = await git(mirror, ['cat-file', 'blob', entry.object]);
@@ -205,16 +437,88 @@ export class ProjectFiles {
     });
   }
 
-  private gitOpen<T>(projectId: string, repository: PinnedRepository, inside: string[], display: string,
+  private gitOpen<T>(projectId: string, checkout: Checkout, inside: string[], display: string,
     consume: (file: OpenedFile) => Promise<T>): Promise<T> {
-    return this.withRepository(projectId, repository, async (mirror, commit, source) => {
-      const entry = inside.length ? await treeEntry(mirror, commit, inside.join('/')) : undefined;
+    const rel = inside.join('/');
+    const saved = checkout.overlay?.files.get(rel);
+    return this.withRepository(projectId, checkout, async (mirror, commit, source) => {
+      if (saved) {
+        if ('deleted' in saved) throw new FileNotFoundError(`Nothing at ${display}`);
+        if ('link' in saved) throw new FileAccessError(`${display} is not a file.`);
+        return consume(streamOf({ path: display, kind: 'file', source: { ...source, changed: true }, size: saved.bytes,
+          version: saved.sha256.slice(0, 40) }, checkout.overlay!.read(saved)));
+      }
+      const entry = inside.length ? await treeEntry(mirror, commit, rel) : undefined;
       if (!entry) throw new FileNotFoundError(`Nothing at ${display}`);
       if (entry.kind !== 'file') throw new FileAccessError(`${display} is not a file.`);
       const blob = catBlob(mirror, entry.object);
       return consume({ node: { path: display, kind: 'file', source, size: entry.size ?? 0, version: entry.object },
         size: entry.size ?? 0, ...blob });
     });
+  }
+
+  // ── a running world ───────────────────────────────────────────────────────
+
+  /** Read the world itself: whatever its agent has written, committed or not.
+   * tavya's own folder, Git internals, `.env` files and the project's secret
+   * files never show, and no path may lead out of the world. */
+  private async locateLive(projectId: string, live: LiveWorld, segments: string[], options: FileReadOptions): Promise<Located> {
+    const display = segments.join('/');
+    if (segments.some((segment) => HIDDEN_NAMES.has(segment))) throw new FileNotFoundError(`Nothing at ${display}`);
+    const project = await this.deps.workspaces.project(projectId);
+    const secrets = new Set(project.secrets.flatMap((secret) => [secret.file, secret.dotenv].filter((place): place is string => Boolean(place))));
+    const hidden = (rel: string) => secrets.has(rel) || path.posix.basename(rel) === '.env';
+    if (hidden(display)) throw new FileNotFoundError(`Nothing at ${display}`);
+    const mounts = project.resources.map((resource) => ({ ...resource, segments: splitPath(resource.path) })).filter((mount) => mount.segments.length > 0);
+    const dataMount = mounts.find((mount) => startsWith(segments, mount.segments));
+    if (dataMount && !options.data) throw new FileAccessError('Viewing data needs access to project settings (project:settings:read).');
+    const repos = worldRepos(live.handle);
+    const withView = (node: FileNode): FileNode => ({ ...node, view: live.view });
+    const inspect = async (world: World): Promise<LiveStat> => {
+      const result = await world.exec('node', ['-e', LIVE_STAT, JSON.stringify([live.handle.root, display])], { cwd: live.handle.root });
+      if (result.code !== 0) throw new Error(`Couldn’t read the task’s world: ${firstLine(result.stderr || result.stdout)}`);
+      return JSON.parse(result.stdout) as LiveStat;
+    };
+    const withWorld = async <T>(read: (world: World) => Promise<T>): Promise<T> => {
+      const access = await this.deps.openWorld!(live.taskId, live.handle);
+      try { return await read(access.world); }
+      finally { await access.release(); }
+    };
+    const nodeOf = (stat: LiveStat): FileNode => {
+      if (stat.missing || stat.outside) throw new FileNotFoundError(`Nothing at ${display}`);
+      if (stat.kind === 'symlink') return withView({ path: display, kind: 'symlink', source: { kind: 'world' }, target: stat.target ?? '' });
+      if (stat.kind === 'file') return withView({ path: display, kind: 'file', source: { kind: 'world' }, size: stat.size ?? 0 });
+      if (stat.kind !== 'directory') throw new FileAccessError(`${display} is not a file or folder.`);
+      const marks = (name: string): FileEntry['mount'] => {
+        const child = [...segments, name];
+        if (mounts.some((mount) => mount.segments.join('/') === child.join('/'))) return 'data';
+        const repo = repos.find((candidate) => path.posix.relative(live.handle.root, candidate.root) === child.join('/'));
+        return repo ? (repo.role === 'project-wiki' ? 'wiki' : 'repository') : undefined;
+      };
+      const entries = (stat.entries ?? []).filter((entry) => !HIDDEN_NAMES.has(entry.name) && !hidden([...segments, entry.name].join('/')))
+        .map((entry): FileEntry => { const mount = marks(entry.name); return { name: entry.name, kind: entry.kind, ...(entry.size !== undefined ? { size: entry.size } : {}), ...(mount ? { mount } : {}) }; });
+      return withView({ path: display, kind: 'directory', source: { kind: 'world' }, entries: sortEntries(entries) });
+    };
+    return {
+      stat: () => withWorld(async (world) => nodeOf(await inspect(world))),
+      open: async (consume) => {
+        const access = await this.deps.openWorld!(live.taskId, live.handle);
+        let released = false;
+        const release = async () => { if (!released) { released = true; await access.release(); } };
+        try {
+          const stat = await inspect(access.world);
+          const node = nodeOf(stat);
+          if (node.kind !== 'file') throw new FileAccessError(`${display} is not a file.`);
+          const real = stat.real ?? display;
+          let chunks: AsyncIterable<Buffer>;
+          if (access.world.readFileStream) chunks = access.world.readFileStream(real);
+          else if ((node.size ?? 0) > LIVE_UNSTREAMED_MAX) throw new FileAccessError('Too large to read from this world here.');
+          else { const buffer = await access.world.readFileBuffer(real); chunks = (async function* () { yield buffer; })(); }
+          const opened = streamOf(node, chunks);
+          return await consume({ ...opened, done: opened.done.finally(release) });
+        } finally { await release(); }
+      },
+    };
   }
 
   // ── data ──────────────────────────────────────────────────────────────────
@@ -302,6 +606,78 @@ export class ProjectFiles {
   }
 }
 
+interface LiveWorld { live: true; handle: WorldHandle; taskId: string; view: FileViewInfo }
+
+interface LiveStat {
+  missing?: true; outside?: true; kind?: FileKind | 'other'; size?: number; target?: string; real?: string;
+  entries?: Array<{ name: string; kind: FileKind; size?: number }>;
+}
+
+/** Runs in the world: what one path is, never following a link out of the
+ * world root, and a folder's entries (sizes of files; links as links). */
+const LIVE_STAT = `const fs = require('node:fs'), path = require('node:path');
+const [root, rel] = JSON.parse(process.argv[1]);
+const out = (value) => { process.stdout.write(JSON.stringify(value)); process.exit(0); };
+const realRoot = fs.realpathSync(root);
+const target = path.join(root, rel);
+let s;
+try { s = fs.lstatSync(target); } catch { out({ missing: true }); }
+let real;
+try { real = fs.realpathSync(target); } catch { real = undefined; }
+const inside = (p) => p === realRoot || p.startsWith(realRoot + path.sep);
+if (s.isSymbolicLink()) out({ kind: 'symlink', target: fs.readlinkSync(target) });
+if (!real || !inside(real)) out({ outside: true });
+const relReal = path.relative(realRoot, real).split(path.sep).join('/');
+if (s.isFile()) out({ kind: 'file', size: s.size, real: relReal });
+if (!s.isDirectory()) out({ kind: 'other' });
+const entries = [];
+for (const entry of fs.readdirSync(real, { withFileTypes: true }).slice(0, 10000)) {
+  const kind = entry.isSymbolicLink() ? 'symlink' : entry.isDirectory() ? 'directory' : entry.isFile() ? 'file' : null;
+  if (!kind) continue;
+  let size;
+  if (kind === 'file') { try { size = fs.lstatSync(path.join(real, entry.name)).size; } catch {} }
+  entries.push(size === undefined ? { name: entry.name, kind } : { name: entry.name, kind, size });
+}
+out({ kind: 'directory', real: relReal, entries });`;
+
+/** An async source of bytes as an OpenedFile; `stop` abandons it. */
+function streamOf(node: FileNode, chunks: AsyncIterable<Buffer>): OpenedFile {
+  const stream = Readable.from(chunks, { objectMode: false });
+  let failure: unknown;
+  const done = new Promise<void>((resolve, reject) => {
+    stream.on('error', (error) => { failure = error; reject(error); });
+    stream.on('close', () => { if (!failure) resolve(); });
+  });
+  done.catch(() => {});
+  return { node, size: node.size ?? 0, stream, done, stop: () => { stream.destroy(); } };
+}
+
+/** `git archive <commit>` unpacked into `target` (a checkout's files). */
+async function archive(mirror: string, commit: string, target: string): Promise<void> {
+  fs.mkdirSync(target, { recursive: true });
+  await new Promise<void>((resolve, reject) => {
+    const producer = spawn('git', ['-c', 'core.hooksPath=/dev/null', 'archive', '--format=tar', commit], { cwd: mirror, stdio: ['ignore', 'pipe', 'pipe'] });
+    const consumer = spawn('tar', ['-x', '-C', target], { stdio: ['pipe', 'ignore', 'pipe'] });
+    let stderr = '';
+    producer.stderr.on('data', (chunk) => { stderr += chunk; });
+    consumer.stderr.on('data', (chunk) => { stderr += chunk; });
+    producer.stdout.pipe(consumer.stdin);
+    let left = 2, failed = false;
+    const settle = (code: number | null) => {
+      if (code !== 0 && !failed) { failed = true; reject(new Error(stderr.trim() || 'git archive failed')); }
+      if (--left === 0 && !failed) resolve();
+    };
+    producer.on('close', settle);
+    consumer.on('close', settle);
+    producer.on('error', reject);
+    consumer.on('error', reject);
+  });
+}
+
+function safeSame(a: string, b: string): boolean {
+  try { return sameRepository(a, b); } catch { return a === b; }
+}
+
 /** `a//b/` → ['a', 'b']; `..` and `.` are refused, not resolved. */
 export function splitPath(value: string): string[] {
   const segments = String(value ?? '').replace(/\\/g, '/').split('/').filter((segment) => segment !== '' && segment !== '.');
@@ -325,6 +701,34 @@ function overlayEntries(mounts: Mount[], directory: string[]): FileEntry[] {
     else if (!entries.has(name)) entries.set(name, { name, kind: 'directory' });
   }
   return [...entries.values()];
+}
+
+/** Entries saved files add directly inside `dir` (files, links, and the folders on the way to deeper ones). */
+function savedChildren(overlay: Overlay | undefined, dir: string): FileEntry[] {
+  if (!overlay) return [];
+  const prefix = dir ? `${dir}/` : '';
+  const entries = new Map<string, FileEntry>();
+  for (const [file, entry] of overlay.files) {
+    if (!file.startsWith(prefix) || 'deleted' in entry) continue;
+    const rest = file.slice(prefix.length);
+    const slash = rest.indexOf('/');
+    if (slash >= 0) { if (!entries.has(rest.slice(0, slash))) entries.set(rest.slice(0, slash), { name: rest.slice(0, slash), kind: 'directory' }); continue; }
+    entries.set(rest, 'link' in entry ? { name: rest, kind: 'symlink' } : { name: rest, kind: 'file', size: entry.bytes });
+  }
+  return [...entries.values()];
+}
+
+/** A commit's entries of `dir` with the task's saved changes on top: deletions removed, files replaced or added. */
+function applySaved(entries: FileEntry[], overlay: Overlay | undefined, dir: string): FileEntry[] {
+  if (!overlay) return entries;
+  const prefix = dir ? `${dir}/` : '';
+  const removed = new Set<string>();
+  for (const [file, entry] of overlay.files)
+    if ('deleted' in entry && file.startsWith(prefix) && !file.slice(prefix.length).includes('/')) removed.add(file.slice(prefix.length));
+  const added = savedChildren(overlay, dir);
+  const byName = new Map(entries.filter((entry) => !removed.has(entry.name)).map((entry) => [entry.name, entry]));
+  for (const entry of added) if (entry.kind !== 'directory' || !byName.has(entry.name)) byName.set(entry.name, entry);
+  return [...byName.values()];
 }
 
 /** A mount replaces what its folder has under the same name, as it does in a world. */

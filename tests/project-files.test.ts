@@ -199,3 +199,65 @@ it('shares a fixed snapshot of a folder or file by public link, when the organiz
   await f.store.kvDelete(`conversation-sharing:project:${f.project.id}`);
   expect((await pub(csvId)).status).toBe(200);
 });
+
+it('shows another branch where a repository has it, a task by its branch, and where an agent’s cited file is', async () => {
+  const f = await fixture();
+  // A branch only `site` has.
+  sh(f.site.work, 'checkout', '-qb', 'feature');
+  fs.writeFileSync(path.join(f.site.work, 'README.md'), '# Site on feature\n');
+  sh(f.site.work, 'commit', '-qam', 'feature');
+  sh(f.site.work, 'push', '-q', f.site.bare, 'feature');
+  const view = (query: string, file = '', raw = false) => fetch(`${f.server.url}/api/projects/${f.project.id}/files${raw ? '/raw' : ''}?path=${encodeURIComponent(file)}${query}`,
+    { headers: { authorization: `Bearer ${f.viewer}` } });
+  expect(await (await view('&branch=feature', 'site/README.md', true)).text()).toBe('# Site on feature\n');
+  expect(((await (await view('&branch=feature', 'site')).json()) as any)).toMatchObject({ source: { branch: 'feature' }, view: { kind: 'branch', name: 'feature' } });
+  // The wiki has no such branch: its default shows.
+  expect(((await (await view('&branch=feature', 'site-wiki')).json()) as any).source).toMatchObject({ branch: 'main' });
+  expect((await view('&branch=..%2Fx', 'site')).status).toBe(400);
+
+  // A task whose world never saved: its branch on GitHub.
+  sh(f.site.work, 'checkout', '-qb', 'tavya/task_one', 'main');
+  fs.writeFileSync(path.join(f.site.work, 'src/app.ts'), 'export const answer = 7;\n');
+  sh(f.site.work, 'commit', '-qam', 'task work');
+  sh(f.site.work, 'push', '-q', f.site.bare, 'tavya/task_one');
+  const task = await f.store.createTask({ projectId: f.project.id, title: 'Change the answer', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x' } });
+  const handle = { id: task.id, kind: 'e2b', root: '/home/user/w', workdir: '/home/user/w/site', branch: 'tavya/task_one', base: 'main',
+    repos: [{ name: 'site', root: '/home/user/w/site', repo: `git@github.com:${f.owner}/site.git`, branch: 'tavya/task_one', base: 'main' }] } as any;
+  await f.store.registerWorld(handle, f.project.id);
+  await f.store.setWorldState(handle, 'parked');
+  const tasks = ((await (await fetch(`${f.server.url}/api/projects/${f.project.id}/files/views`, { headers: { authorization: `Bearer ${f.viewer}` } })).json()) as any);
+  expect(tasks.repositories).toEqual([{ name: 'site', role: 'development', default: 'main', branches: ['feature', 'main', 'tavya/task_one'] },
+    { name: 'site-wiki', role: 'project-wiki', default: 'main', branches: ['main'] }]);
+  expect(tasks.tasks).toEqual([expect.objectContaining({ id: task.id, num: task.num, title: 'Change the answer', live: false })]);
+  const shown = (await (await view(`&task=${task.num}`, 'site')).json()) as any;
+  expect(shown.view).toMatchObject({ kind: 'task', id: task.id, mode: 'published' });
+  expect(await (await view(`&task=${task.num}`, 'site/src/app.ts', true)).text()).toBe('export const answer = 7;\n');
+  // An agent's citation, absolute or relative to its working folder.
+  const locate = async (cited: string) => fetch(`${f.server.url}/api/tasks/${task.id}/file-location?path=${encodeURIComponent(cited)}`,
+    { headers: { authorization: `Bearer ${f.viewer}` } });
+  expect(await (await locate('/home/user/w/site/src/app.ts')).json()).toEqual({ projectId: f.project.id, taskId: task.id, num: task.num, path: 'site/src/app.ts' });
+  expect(((await (await locate('src/app.ts')).json()) as any).path).toBe('site/src/app.ts');
+  expect((await locate('/etc/passwd')).status).toBe(400);
+  // An image the agent cites by path in its message.
+  expect(await (await view(`&task=${task.num}&cited=1`, 'src/app.ts', true)).text()).toBe('export const answer = 7;\n');
+  // Reading a task needs task:read.
+  const noTasks = await f.tokenFor(['project:read', 'repository:read']);
+  expect((await fetch(`${f.server.url}/api/projects/${f.project.id}/files?path=site&task=${task.num}`, { headers: { authorization: `Bearer ${noTasks}` } })).status).toBe(403);
+});
+
+it('serves a wiki page’s own files, such as the image it shows', async () => {
+  const f = await fixture();
+  const { wikiRoot } = await import('../src/wiki/wiki.js');
+  const { paths } = await import('../src/config/paths.js');
+  const page = path.join(wikiRoot(paths().content, 'organization', f.project.organizationId!), 'guides', 'setup');
+  fs.mkdirSync(page, { recursive: true });
+  fs.writeFileSync(path.join(page, 'SKILL.md'), '---\nname: Setup\ndescription: How\n---\n![Diagram](diagram.svg)\n');
+  fs.writeFileSync(path.join(page, 'diagram.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>');
+  const token = f.viewer;
+  const image = await fetch(`${f.server.url}/api/organizations/${f.project.organizationId}/wiki/file?path=guides/setup/diagram.svg`, { headers: { authorization: `Bearer ${token}` } });
+  expect(image.status).toBe(200);
+  expect(image.headers.get('content-type')).toBe('image/svg+xml');
+  expect(image.headers.get('content-security-policy')).toContain('sandbox');
+  expect((await fetch(`${f.server.url}/api/organizations/${f.project.organizationId}/wiki/file?path=../../etc/passwd`, { headers: { authorization: `Bearer ${token}` } })).status).not.toBe(200);
+  expect((await fetch(`${f.server.url}/api/organizations/${f.project.organizationId}/wiki/file?path=guides`, { headers: { authorization: `Bearer ${token}` } })).status).toBe(404);
+});

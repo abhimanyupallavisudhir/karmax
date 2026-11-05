@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { Browser } from 'playwright';
+import type { Browser, Page } from 'playwright';
 import { launchChromium, openConsole } from './helpers/browser.js';
 import { projectFilesFixture } from './helpers/project-files-fixture.js';
 
@@ -75,7 +75,7 @@ it('browses repositories, the wiki and mounted data with an address bar, and sho
   });
 
   await step('the address bar takes a typed path; code is coloured with numbered, linkable lines', async () => {
-    await page.locator('#files-address').click({ position: { x: 600, y: 18 } });
+    await clickAddressEnd(page);
     const input = page.locator('#files-path-input');
     await input.waitFor();
     expect(await input.inputValue()).toBe('site/docs');
@@ -96,7 +96,7 @@ it('browses repositories, the wiki and mounted data with an address bar, and sho
   });
 
   await step('a name with spaces and # survives the URL and a reload', async () => {
-    await page.locator('#files-address').click({ position: { x: 600, y: 18 } });
+    await clickAddressEnd(page);
     await page.locator('#files-path-input').fill('site/src/weird name #1.txt');
     await page.locator('#files-path-input').press('Enter');
     await page.waitForURL(/weird%20name%20%231\.txt$/);
@@ -220,3 +220,88 @@ it('shows image thumbnails, and shares a folder as a public snapshot anyone can 
   });
   expect(errors).toEqual([]);
 }, 120_000);
+
+it('switches to a branch or a task with the picker, opens an agent’s cited file at its line, and shows Markdown images', async () => {
+  const f = await projectFilesFixture(cleanups, { files: { 'src/server.ts': SERVER_TS, 'assets/logo.svg': LOGO_SVG,
+    'docs/guide.md': '## Guide\n\n![The logo](../assets/logo.svg)\n' } });
+  const { sh } = await import('./helpers/project-files-fixture.js');
+  sh(f.site.work, 'checkout', '-qb', 'redesign');
+  fs.writeFileSync(path.join(f.site.work, 'README.md'), '# Site, redesigned\n');
+  sh(f.site.work, 'commit', '-qam', 'redesign');
+  sh(f.site.work, 'push', '-q', f.site.bare, 'redesign');
+  sh(f.site.work, 'checkout', '-qb', 'tavya/task_one', 'main');
+  fs.writeFileSync(path.join(f.site.work, 'src/server.ts'), SERVER_TS.replace('cheap', 'cheap and fast'));
+  sh(f.site.work, 'commit', '-qam', 'task work');
+  sh(f.site.work, 'push', '-q', f.site.bare, 'tavya/task_one');
+  const task = await f.store.createTask({ projectId: f.project.id, title: 'Speed up health checks', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x' } });
+  const handle = { id: task.id, kind: 'e2b', root: '/home/user/w', workdir: '/home/user/w/site', branch: 'tavya/task_one', base: 'main',
+    repos: [{ name: 'site', root: '/home/user/w/site', repo: `git@github.com:${f.owner}/site.git`, branch: 'tavya/task_one', base: 'main' }] } as any;
+  await f.store.registerWorld(handle, f.project.id);
+  await f.store.setWorldState(handle, 'parked');
+  // An organization wiki page with its own image.
+  const { wikiRoot } = await import('../src/wiki/wiki.js');
+  const { paths } = await import('../src/config/paths.js');
+  const wikiPage = path.join(wikiRoot(paths().content, 'organization', f.project.organizationId!), 'guides', 'brand');
+  fs.mkdirSync(wikiPage, { recursive: true });
+  fs.writeFileSync(path.join(wikiPage, 'SKILL.md'), '---\nname: Brand\ndescription: Our mark\n---\nOur mark:\n\n![Mark](mark.svg)\n');
+  fs.writeFileSync(path.join(wikiPage, 'mark.svg'), LOGO_SVG);
+
+  const { page, errors, step, context } = await openConsole(browser, { viewport: { width: 1280, height: 820 } });
+  cleanups.push(() => context.close());
+  const shoot = async (name: string) => { if (shots) { fs.mkdirSync(shots, { recursive: true }); await page.screenshot({ path: path.join(shots, `${name}.png`) }); } };
+
+  await step('a Markdown file shows the image beside it', async () => {
+    await page.goto(`${f.server.url}/projects/site-builder/files`);
+    await page.locator('.files-row', { hasText: 'site-wiki' }).waitFor();
+    await page.goto(page.url().replace(/\/files$/, '/files/site/docs/guide.md'));
+    await page.waitForFunction(() => document.querySelector('.files-rendered img')?.naturalWidth === 120);
+  });
+
+  await step('the picker shows a branch', async () => {
+    await page.goto(page.url().replace(/\/files\/.*$/, '/files/site'));
+    await page.locator('.files-row', { hasText: 'README.md' }).waitFor();
+    await page.locator('#files-view').click();
+    const menu = page.locator('#files-view-menu');
+    await menu.locator('[role="option"]', { hasText: 'redesign' }).waitFor();
+    expect(await menu.locator('.files-view-group').allInnerTexts()).toEqual(['DEFAULT', 'TASKS', 'BRANCHES']);
+    await shoot('view-picker');
+    await page.keyboard.type('redes');
+    await page.keyboard.press('Enter');
+    await page.waitForURL(/\/files\/site\?branch=redesign$/);
+    await page.locator('.files-link', { hasText: 'README.md' }).click();
+    await page.locator('.files-rendered h1', { hasText: 'Site, redesigned' }).waitFor();
+    expect(await page.locator('#files-view').innerText()).toContain('redesign');
+  });
+
+  await step('the picker shows a task’s files', async () => {
+    await page.locator('#files-view').click();
+    await page.locator('#files-view-menu [role="option"]', { hasText: 'Speed up health checks' }).click();
+    await page.waitForURL(new RegExp(`/files/site/README\\.md\\?task=${task.num}$`));
+    await page.locator('.files-crumb', { hasText: /^src$/ }).count();
+    await page.goto(page.url().replace(/README\.md\?/, 'src/server.ts?'));
+    await page.locator('.files-lc', { hasText: 'cheap and fast' }).waitFor();
+    expect(await page.locator('#files-view').innerText()).toMatch(new RegExp(`#${task.num} Speed up health checks`));
+    await shoot('task-view');
+  });
+
+  await step('an agent’s cited file opens in Files, in its task, at the line', async () => {
+    await page.goto(`${f.server.url}/projects/site-builder/tasks/${task.num}/file?path=${encodeURIComponent('/home/user/w/site/src/server.ts')}&line=6`);
+    await page.waitForURL(new RegExp(`/files/site/src/server\\.ts\\?task=${task.num}#L6$`));
+    await page.locator('#L6.selected').waitFor();
+    expect(await page.locator('#L6 .files-lc').innerText()).toContain('cheap and fast');
+  });
+
+  await step('a wiki page shows its own image', async () => {
+    await page.goto(`${f.server.url}/personal/wiki#guides/brand`);
+    await page.waitForFunction(() => document.querySelector('.wiki-md img')?.naturalWidth === 120);
+    await shoot('wiki-image');
+  });
+  expect(errors).toEqual([]);
+}, 120_000);
+
+// Click the address bar's empty right end (past the breadcrumbs), wherever the bar ends.
+async function clickAddressEnd(page: Page) {
+  const address = page.locator('#files-address');
+  const box = (await address.boundingBox())!;
+  await address.click({ position: { x: box.width - 12, y: box.height / 2 } });
+}

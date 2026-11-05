@@ -85,6 +85,24 @@ export class WorldCheckpointService {
   }
   private chunks: ChunkedCheckpointStore;
 
+  /** A checkpoint's saved files, read on the host without its world (the
+   * Files page and the wiki show a parked task this way): the manifest's
+   * entries, and one entry's verified bytes. */
+  async savedFiles(checkpoint: WorldCheckpoint): Promise<{ files: import('./checkpoint-chunks.js').ManifestEntry[];
+    read(entry: import('./checkpoint-chunks.js').ManifestEntry): AsyncIterable<Buffer> }> {
+    const organizationId = (await this.store.getProject(checkpoint.projectId))?.organizationId;
+    if (!organizationId) throw new Error('checkpoint has no owning organization');
+    const manifest = await this.chunks.manifest(checkpoint, organizationId);
+    const chunks = this.chunks;
+    return { files: manifest.files, read: async function* (wanted) {
+      for await (const entry of chunks.entries(checkpoint, organizationId, manifest)) {
+        if (entry.repo !== wanted.repo || entry.path !== wanted.path) continue;
+        if (entry.content) yield* entry.content();
+        return;
+      }
+    } };
+  }
+
   async checkpoint(handleInput: WorldHandleRef, options: { scrubSecrets?: boolean; checkContinue?: () => Promise<void>; reuseClean?: boolean } = {}): Promise<WorldCheckpoint> {
     return this.worlds.withOperation(handleInput.id, async () => {
     await this.store.pruneWorldCheckpoints(handleInput.id);

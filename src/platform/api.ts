@@ -443,6 +443,8 @@ export interface KarmaxApiDeps {
   /** World access for permission-checked collaboration tools. */
   worlds?: WorldRegistry;
   worldAccess?: WorldAccessService;
+  /** The project Files reader: the wiki reads a parked task's checkout from its last save through it. */
+  projectFiles?: import('../world/project-files.js').ProjectFiles;
   /** Durable execution-capacity leases. Production always supplies this; small
    * unit harnesses may omit it and still get direct store-level release. */
   runners?: RunnerPoolService;
@@ -8371,6 +8373,24 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     } finally { await remote.release(); }
   }
 
+  /** One file of a wiki (an image a page shows), from the same view its
+   * pages are read in. Folders, Git internals and links out of the wiki are refused. */
+  async readWikiFile(token: string, scope: WikiScope, id: string, rel: string,
+    selector: { taskId?: string; branch?: string } = {}): Promise<{ name: string; data: Buffer }> {
+    const file = safeWikiPath(rel);
+    if (!file || file.split('/').includes('.git')) throw new NotFoundError('wiki file not found');
+    const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, false, selector) : undefined;
+    try {
+      const root = remote?.root ?? (await this.wikiScope(token, scope, id, false, selector)).root;
+      const realRoot = fs.realpathSync(root);
+      let real: string;
+      try { real = fs.realpathSync(path.join(root, file)); } catch { throw new NotFoundError('wiki file not found'); }
+      if (!real.startsWith(realRoot + path.sep) || !fs.statSync(real).isFile()) throw new NotFoundError('wiki file not found');
+      if (fs.statSync(real).size > 50 * 1024 * 1024) throw new Error('wiki file is too large to show here');
+      return { name: path.basename(file), data: fs.readFileSync(real) };
+    } finally { await remote?.release(); }
+  }
+
   async searchWikiResolved(token: string, scope: WikiScope, id: string, query: string,
     selector: { taskId?: string; branch?: string } = {}) {
     const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, false, selector) : undefined;
@@ -8490,9 +8510,17 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     const readOnly = { flush: async () => { throw new Error('read-only wiki snapshot'); } };
     // The task's own agent edits this checkout with its shell and must read
     // back exactly what it wrote, so its reads stay live; everyone else
-    // browsing the branch shares the cached copy.
+    // browsing the branch shares the cached copy. A world that is not running
+    // is read from its last save (its commit plus the saved uncommitted
+    // files): browsing never wakes a sandbox, nor fails on one the provider
+    // has since deleted ("Paused sandbox not found").
     if (!write && caller.taskId !== taskId) {
-      const root = await this.remoteWikiReads.read(taskId, `${handle.id}:${handle.generation ?? 1}`, copy);
+      const running = (await this.deps.store.worldState(handle.id)) === 'ready';
+      const saved = running || !this.deps.projectFiles ? undefined : await this.deps.store.latestWorldCheckpoint(handle.id);
+      const fromSave = saved ? async (root: string) => {
+        if (!(await this.deps.projectFiles!.copySavedCheckout(taskId, 'project-wiki', root))) await copy(root);
+      } : undefined;
+      const root = await this.remoteWikiReads.read(taskId, `${handle.id}:${handle.generation ?? 1}:${saved?.id ?? 'live'}`, fromSave ?? copy);
       return { root, repo, taskId, ...readOnly, release: async () => {} };
     }
     if (!write) {

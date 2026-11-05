@@ -52,6 +52,22 @@
     return `${Number(amount.toFixed(amount >= 100 ? 0 : amount >= 10 ? 1 : 2))} ${units[unit]}`;
   }
 
+  /** Give each Markdown image waiting in data-md-src (a relative path) its
+   * address: `resolve(path)` answers a URL, or null to show its alt text. */
+  function resolveImages(root, resolveSrc) {
+    root.querySelectorAll('img[data-md-src]:not([src])').forEach((img) => {
+      let src = img.dataset.mdSrc.split(/[?#]/)[0];
+      try { src = decodeURIComponent(src); } catch { /* as written */ }
+      const url = resolveSrc(src);
+      if (url) img.src = url; else img.replaceWith(document.createTextNode(img.alt || ''));
+    });
+  }
+  // An image that cannot load (gone, refused, blocked) shows its alt text instead.
+  if (typeof document !== 'undefined') document.addEventListener('error', (event) => {
+    const img = event.target;
+    if (img?.tagName === 'IMG' && img.closest?.('.md') && !img.closest('.files-media')) img.replaceWith(document.createTextNode(img.alt || ''));
+  }, true);
+
   // ── folders ───────────────────────────────────────────────────────────────
   // `ctx.href(path)` links a place; `ctx.raw(path)` is a file's bytes; `ctx.link`
   // is extra attributes for in-page links (the console's data-spa).
@@ -280,6 +296,12 @@
             link.href = ctx.href(target);
             for (const attribute of (ctx.link || '').trim().split(/\s+/).filter(Boolean)) link.setAttribute(attribute, '');
           });
+          // Images beside it; `/…` is from its repository's root, as on GitHub.
+          resolveImages(el, (src) => {
+            const base = src.startsWith('/') ? (node.source?.kind === 'repository' ? parts(node.path)[0] || '' : '') : parent(node.path);
+            const target = resolve(base, src.replace(/^\/+/, ''));
+            return target === null ? null : ctx.raw(target);
+          });
         });
         ctx.wireTools?.(body);
         return;
@@ -329,5 +351,5 @@
     return `<span class="files-chip data" title="Data resource ${esc(source.name)}">${ICONS.data}<span>${esc(source.name)}</span></span>`;
   }
 
-  globalThis.KarmaxFileView = { ICONS, parts, join, parent, resolve, formatBytes, render, sourceHtml, listingHtml, wireListing, language, splitHighlightedLines, parseDelimited };
+  globalThis.KarmaxFileView = { ICONS, parts, join, parent, resolve, formatBytes, render, sourceHtml, listingHtml, wireListing, language, splitHighlightedLines, parseDelimited, resolveImages };
 })();
