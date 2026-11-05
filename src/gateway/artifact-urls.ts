@@ -57,3 +57,28 @@ export class ArtifactUrls {
     })();
   }
 }
+
+/**
+ * The Review artifact edge (src/edge/artifact-worker.ts), when this
+ * installation has one: `KARMAX_ARTIFACT_EDGE_URL` (recorded by
+ * `deploy/karmax deploy-artifact-edge`) and the key its URLs are signed with,
+ * derived from the auth secret so the Worker's copy can mint nothing else.
+ */
+export function artifactEdge(env: NodeJS.ProcessEnv = process.env): { url: string; key: string } | undefined {
+  const url = artifactEdgeOrigin(env);
+  const key = artifactEdgeKey(env);
+  // The Worker reads the managed bucket: with any other store it has nothing to serve.
+  return url && key && env.KARMAX_OBJECT_STORE?.trim() === 's3' ? { url, key } : undefined;
+}
+
+/** The edge's origin (`https://host`), for the console's content-security policy too. */
+export function artifactEdgeOrigin(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const url = env.KARMAX_ARTIFACT_EDGE_URL?.trim().replace(/\/+$/, '');
+  return url && /^https:\/\/[a-z0-9.-]+(?::\d{1,5})?$/i.test(url) ? url : undefined;
+}
+
+export function artifactEdgeKey(env: NodeJS.ProcessEnv = process.env): string {
+  const root = env.KARMAX_AUTH_SECRET ?? '';
+  if (root.length < 32) return '';
+  return Buffer.from(crypto.hkdfSync('sha256', root, '', 'tavya review-artifact edge v1', 32)).toString('base64url');
+}

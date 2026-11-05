@@ -13,7 +13,8 @@ import { assetExists, MATHJAX_SCRIPT_SOURCE, serveStaticAsset, staticAssetRevisi
 import { SwrCache } from '../util/swr-cache.js';
 import { MAX_REVIEW_ARTIFACT_BYTES, savedReviewArtifact } from '../store/review-artifacts.js';
 import { readWorldFilePrefix } from '../world/file-prefix.js';
-import { ArtifactUrls } from './artifact-urls.js';
+import { ArtifactUrls, artifactEdge } from './artifact-urls.js';
+import { signArtifactEdgeToken } from '../edge/artifact-edge-token.js';
 import { bufferSource, sendArtifact, type ArtifactSource } from './artifact-response.js';
 import { TimingDelivery } from '../timing/delivery.js';
 import { timingEnabled, installationTiming, withTiming, toolFailed } from '../timing/index.js';
@@ -6221,8 +6222,17 @@ export class Gateway {
           const name = saved?.name ?? (path.posix.basename(target.replace(/\\/g, '/')) || 'artifact');
           const mediaType = untrustedContentHeaders(saved?.mediaType
             ?? ARTIFACT_MIME[path.extname(name).toLowerCase()] ?? 'application/octet-stream', name)['content-type']!;
-          const signed = `/api/artifact-content/${await this.artifactUrls.mint({ taskId, path: target,
-            ...(saved ? { artifact: saved.id } : {}) })}/${encodeURIComponent(name)}`;
+          // A saved file comes from the artifact edge when there is one: the
+          // nearest Cloudflare location reads it from the bucket, instead of
+          // every byte crossing this server (wiki features/review-artifacts).
+          const edge = saved && artifactEdge();
+          const headers = saved && untrustedContentHeaders(saved.mediaType, saved.name);
+          const signed = edge && saved && headers
+            ? `${edge.url}/${await signArtifactEdgeToken({ key: saved.objectKey, bytes: saved.bytes, sha256: saved.sha256,
+              type: headers['content-type']!, disposition: headers['content-disposition']!.startsWith('attachment') ? 'attachment' : 'inline',
+              csp: headers['content-security-policy']!, name: saved.name, expiresAt: Date.now() + ArtifactUrls.TTL_MS }, edge.key)}/${encodeURIComponent(name)}`
+            : `/api/artifact-content/${await this.artifactUrls.mint({ taskId, path: target,
+              ...(saved ? { artifact: saved.id } : {}) })}/${encodeURIComponent(name)}`;
           return this.json(res, 200, { kind: 'open', url: signed, external: false, name, mediaType,
             ...(saved ? { bytes: saved.bytes } : {}) });
         }

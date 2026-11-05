@@ -203,6 +203,7 @@ services:
       # The Cloudflare Worker sandboxes save resources through;
       # written by `deploy/karmax deploy-repository-edge`, empty means none.
       KARMAX_RESOURCE_EDGE_URL: ${KARMAX_RESOURCE_EDGE_URL:-}
+      KARMAX_ARTIFACT_EDGE_URL: ${KARMAX_ARTIFACT_EDGE_URL:-}
       # Agent mailboxes: every organization without its own mail provider gets
       # agent-<token>@ this domain, whose mail a Cloudflare Email Worker posts
       # to the app, signed (`deploy/karmax deploy-agent-mail-edge`). Empty:

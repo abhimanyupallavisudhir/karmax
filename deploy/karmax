@@ -616,6 +616,35 @@ cmd_deploy_agent_mail_edge() {
   note "Organizations without their own mail provider now get addresses on $domain."
 }
 
+# The Review artifact edge: a Cloudflare Worker that serves saved Review files
+# (videos above all) from the managed R2 bucket at the Cloudflare location
+# nearest the viewer, instead of relaying every byte through this host (wiki
+# features/review-artifacts). It holds the bucket binding and the URL signing
+# key (derived from auth_secret) as a secret. Takes CLOUDFLARE_API_TOKEN
+# (Workers Scripts: Edit, Workers R2 Storage: Read) from the environment and
+# stores it nowhere. Repeatable. Records the URL as KARMAX_ARTIFACT_EDGE_URL and
+# restarts the app when it changed; deleting that line from .turnkey.env (and
+# restarting) serves them from this host again.
+cmd_deploy_artifact_edge() {
+  need_docker
+  [ -f "$ENV_FILE" ] || die 'this instance is not configured'
+  [ -n "${CLOUDFLARE_API_TOKEN:-}" ] || die 'set CLOUDFLARE_API_TOKEN (Workers Scripts: Edit, Workers R2 Storage: Read)'
+  output=$(dc run --rm --no-deps -T -e CLOUDFLARE_API_TOKEN -e CLOUDFLARE_ACCOUNT_ID app npm run --silent deploy-artifact-edge < /dev/null) \
+    || die 'the artifact edge was not deployed; see above'
+  url=$(printf '%s\n' "$output" | tail -n 1)
+  case "$url" in https://*.workers.dev) ;; *) die "unexpected edge URL: $url" ;; esac
+  note "Deployed the Review artifact edge at $url."
+  [ "$(env_value KARMAX_ARTIFACT_EDGE_URL)" != "$url" ] || return 0
+  staged="$ENV_FILE.artifacts.$$"
+  if ! (umask 077 && { sed '/^KARMAX_ARTIFACT_EDGE_URL=/d' "$ENV_FILE" && printf 'KARMAX_ARTIFACT_EDGE_URL=%s\n' "$url"; } > "$staged"); then
+    rm -f "$staged"; die 'could not record the edge URL; nothing was changed'
+  fi
+  mv "$staged" "$ENV_FILE"
+  note 'Restarting the app with it…'
+  dc up -d --no-build app && wait_ready || die 'Karmax failed its readiness check after enabling the artifact edge'
+  note 'Saved Review files are now served from the edge.'
+}
+
 cmd_backup() {
   need_docker
   [ -f "$ENV_FILE" ] || die 'this instance is not configured'
@@ -1180,6 +1209,8 @@ Usage: ./deploy/karmax COMMAND
                                (needs CLOUDFLARE_API_TOKEN), and use it
   deploy-agent-mail-edge MAIL-DOMAIN
                                Deploy the Cloudflare Email Worker agent mail arrives through
+  deploy-artifact-edge         Deploy the Cloudflare Worker that serves saved Review files
+                               (needs CLOUDFLARE_API_TOKEN), and use it
   configure-backups s3://BUCKET/PREFIX https://ENDPOINT PUBLIC_KEY
                                Stream PostgreSQL WAL and base backups off-host (key in
                                KARMAX_PG_BACKUP_ACCESS_KEY_ID / _SECRET_ACCESS_KEY)
@@ -1206,6 +1237,7 @@ case "$command" in
   reconcile-storage) cmd_reconcile_storage "$@" ;;
   deploy-repository-edge) cmd_deploy_repository_edge "$@" ;;
   deploy-agent-mail-edge) cmd_deploy_agent_mail_edge "$@" ;;
+  deploy-artifact-edge) cmd_deploy_artifact_edge "$@" ;;
   configure-backups) cmd_configure_backups "$@" ;;
   pg-restore) cmd_pg_restore "$@" ;;
   down) need_docker; [ -f "$ENV_FILE" ] || die 'not configured'; dc down ;;

@@ -38,7 +38,8 @@ export function bundleRepositoryEdge(): Promise<string> {
   return bundleWorker(SOURCE);
 }
 
-export type WorkerBinding = { type: 'plain_text' | 'secret_text'; name: string; text: string };
+export type WorkerBinding = { type: 'plain_text' | 'secret_text'; name: string; text: string }
+  | { type: 'r2_bucket'; name: string; bucket_name: string; jurisdiction?: string };
 
 /** Cloudflare's Workers API for one account, with errors that say which
  * permission a refused token lacks. */
@@ -86,10 +87,17 @@ export interface EdgeDeployment {
 export async function deployRepositoryEdge(options: EdgeDeployment): Promise<string> {
   const fetcher = options.fetch ?? fetch;
   const script = options.script ?? EDGE_SCRIPT;
-  const { account, call, upload } = workersApi(options.apiToken, options.accountId, fetcher);
+  const { upload } = workersApi(options.apiToken, options.accountId, fetcher);
   await upload(script, await bundleRepositoryEdge(),
     [{ type: 'plain_text', name: 'ORIGIN', text: options.origin.replace(/\/+$/, '') }]);
+  return serveOnWorkersDev(options.apiToken, options.accountId, script, EDGE_MARKER, options, fetcher);
+}
 
+/** Serve the uploaded script `script` on the account's workers.dev subdomain
+ * and wait until its URL answers `marker`; returns the URL. */
+export async function serveOnWorkersDev(apiToken: string, accountId: string, script: string, marker: string,
+  options: { readyTimeoutMs?: number; readyIntervalMs?: number }, fetcher: typeof fetch = fetch): Promise<string> {
+  const { account, call } = workersApi(apiToken, accountId, fetcher);
   const subdomain = (await call<{ subdomain?: string } | null>('GET', `${account}/subdomain`).catch((error: Error) => {
     if (/subdomain|10007/i.test(error.message)) return null;
     throw error;
@@ -104,7 +112,7 @@ export async function deployRepositoryEdge(options: EdgeDeployment): Promise<str
   const deadline = Date.now() + (options.readyTimeoutMs ?? 120_000);
   for (let served = 0; served < READY_ANSWERS;) {
     const answer = await fetcher(`${url}/`, { signal: AbortSignal.timeout(10_000) }).then((r) => r.text()).catch(() => '');
-    served = answer.startsWith(EDGE_MARKER) ? served + 1 : 0;
+    served = answer.startsWith(marker) ? served + 1 : 0;
     if (served < READY_ANSWERS && Date.now() > deadline)
       throw new Error(`deployed, but ${url} does not serve the Worker reliably yet; run this again in a few minutes`);
     if (served < READY_ANSWERS) await new Promise((resolve) => setTimeout(resolve, options.readyIntervalMs ?? 2_000));
