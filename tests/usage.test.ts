@@ -18,6 +18,7 @@ import {
   isUsageStale,
   USAGE_TTL_MS,
   withLastReading,
+  withStreamReadings,
 } from '../src/agent/usage.js';
 import { isTransportError, ProviderFailure, ProviderOutage } from '../src/agent/limits.js';
 
@@ -826,5 +827,31 @@ describe('withLastReading', () => {
     expect(withLastReading(good, loggedOut)).toEqual(loggedOut);
     const failed = { ok: false as const, at: NOW, reason: 'probe-failed: boom' };
     expect(withLastReading(undefined, failed)).toEqual(failed);
+  });
+});
+
+// Settings showed a login's check (73% of its 5-hour window) while every turn
+// since had read 99% and the quota scheduler held work on it: the login looked free.
+describe('withStreamReadings', () => {
+  const reset = Date.UTC(2026, 10, 5, 4);
+  const checked = { ok: true as const, at: 1_000, session: { pct: 73, resetLabel: 'Nov 5, 4am', tz: 'UTC', resetAt: reset },
+    week: { pct: 0, resetLabel: 'Nov 10, 2am', tz: 'UTC', resetAt: reset + 5 * 86_400_000 } };
+
+  it('shows what turns read after the check', () => {
+    expect(withStreamReadings(checked, { session: { utilization: 0.99, resetsAt: reset, at: 2_000 } })).toEqual({
+      ...checked, session: { pct: 99, resetLabel: 'Nov 5, 4am', tz: 'UTC', resetAt: reset, readAt: 2_000 } });
+  });
+
+  it('keeps the check where it is newer, or where no turn read the window', () => {
+    expect(withStreamReadings(checked, { session: { utilization: 0.5, resetsAt: reset, at: 500 } })).toEqual(checked);
+    expect(withStreamReadings(checked, undefined)).toEqual(checked);
+    const signedOut = { ok: false as const, at: 1_000, reason: 'logged-out' };
+    expect(withStreamReadings(signedOut, { session: { utilization: 0.5, at: 2_000 } })).toEqual(signedOut);
+  });
+
+  it('drops the check\'s reset text for a window that has reset since', () => {
+    const next = reset + 5 * 3_600_000;
+    expect(withStreamReadings(checked, { session: { utilization: 0.1, resetsAt: next, at: 2_000 } }).session)
+      .toEqual({ pct: 10, resetLabel: '', resetAt: next, readAt: 2_000 });
   });
 });

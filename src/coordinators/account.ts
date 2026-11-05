@@ -32,6 +32,7 @@ import {
   CREDENTIAL_POLICY_UNAVAILABLE,
 } from './names.js';
 import type { PlanHold, PlanInput, PlanOutput } from '../scheduling/planner.js';
+import type { AccountWaitReason } from '../workflows/contract.js';
 
 /**
  * The token / account coordinator (SPEC §6.2). Same lease pattern as the merge
@@ -191,10 +192,11 @@ export const setAccountAvailabilitySignal = defineSignal<[{ accountId: string; s
 export const reportExhaustedUpdate = defineUpdate<void, [{ accountId: string; window: LimitWindow; resetAt: number; note?: string; transition?: AccountTransition }]>(UPD_REPORT_EXHAUSTED);
 export const setAccountAvailabilityUpdate = defineUpdate<void, [{ accountId: string; status: AccountStatus; resetAt?: number; onlyIfStatus?: AccountStatus; transition?: AccountTransition }]>(UPD_SET_ACCOUNT_AVAILABILITY);
 export const accountsQuery = defineQuery<AccountsView>(QRY_ACCOUNTS);
-export const accountLeaseQuery = defineQuery<
-  { waiting: boolean; earliestResetAt?: number; detail?: string; continuingAsNew?: true; heldUntil?: number; planning?: true },
-  [{ taskId: string; turnId?: string }]
->(QRY_ACCOUNT_LEASE);
+export interface AccountLeaseAnswer {
+  waiting: boolean; earliestResetAt?: number; detail?: string; continuingAsNew?: true; heldUntil?: number; planning?: true;
+  reason?: AccountWaitReason;
+}
+export const accountLeaseQuery = defineQuery<AccountLeaseAnswer, [{ taskId: string; turnId?: string }]>(QRY_ACCOUNT_LEASE);
 export const accountTaskLeasesQuery = defineQuery<string[], [string]>(QRY_ACCOUNT_TASK_LEASES);
 export interface AccountQueueView {
   queue: { taskId: string; turnId: string; provider?: string }[];
@@ -508,31 +510,37 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     })),
     waiting: queue.length,
   }));
-  setHandler(accountLeaseQuery, ({ taskId, turnId }) => {
+  setHandler(accountLeaseQuery, ({ taskId, turnId }): AccountLeaseAnswer => {
     if (continuingAsNew) return { waiting: false, continuingAsNew: true as const };
     const req = queue.find((r) => r.taskId === taskId && (turnId === undefined || r.turnId === turnId));
     if (!req) return { waiting: false };
     // A query records nothing in history, so this wording can change freely.
     if (req.allowed?.length && req.allowed.every((id) => id === CREDENTIAL_POLICY_UNAVAILABLE))
-      return { waiting: true, detail: 'Couldn\'t read this task\'s credential policy — Retry reads it again' };
+      return { waiting: true, reason: 'login', detail: 'Couldn\'t read this task\'s credential policy — Retry reads it again' };
     const compatible = accounts.filter((a) => req.allowed !== undefined
       ? req.allowed.includes(a.id) : a.provider === req.provider);
     const hold = holds.get(`${req.taskId}:${req.turnId}`);
     // A credential has room and the scheduler is about to decide: the answer is a moment away.
-    if (scheduling && !hold && serveable(req) && !(req.allowed?.length === 0)) return { waiting: true, planning: true as const };
-    if (hold?.status === 'held') return { waiting: true, detail: 'Held for higher-priority work', ...(hold.until ? { heldUntil: hold.until } : {}) };
+    if (scheduling && !hold && serveable(req) && !(req.allowed?.length === 0)) return { waiting: true, planning: true as const, reason: 'planning' };
+    if (hold?.status === 'held') return { waiting: true, reason: 'held', detail: 'Held for higher-priority work', ...(hold.until ? { heldUntil: hold.until } : {}) };
+    // The scheduler reads every allowed login's windows as used up (its readings
+    // and what was spent since), although none has been refused yet: that is a
+    // wait for quota, not for a credential.
+    if (hold?.status === 'quota') return { waiting: true, reason: 'quota', detail: 'Out of quota until a login resets',
+      ...(hold.until ? { earliestResetAt: hold.until } : {}) };
     if (compatible.some((a) => a.status === 'available'))
-      return { waiting: true, detail: 'Waiting for a free slot on an allowed account' };
+      return { waiting: true, reason: 'slot', detail: 'Every allowed login is running all it may' };
     const resets = compatible.filter((a) => a.status === 'exhausted' && a.resetAt != null)
       .map((a) => a.resetAt!);
     if (resets.length) return {
       waiting: true,
+      reason: 'quota',
       earliestResetAt: Math.min(...resets),
       detail: 'Provider usage limit reached; the task resumes automatically when quota resets',
     };
     // None at all is not "needs attention": nothing will recover by itself.
-    if (!compatible.length) return { waiting: true, detail: `No ${req.provider ?? 'allowed'} credential — add one, or stop this agent` };
-    return { waiting: true, detail: 'Every allowed credential needs attention — sign in again or add one' };
+    if (!compatible.length) return { waiting: true, reason: 'login', detail: `No ${req.provider ?? 'allowed'} credential — add one, or stop this agent` };
+    return { waiting: true, reason: 'login', detail: 'Every allowed credential needs attention — sign in again or add one' };
   });
   // Every turn of `taskId` this coordinator still owes something for — queued
   // requests AND granted leases. Shape stays `string[]` of turnIds so the caller

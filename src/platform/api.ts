@@ -97,7 +97,7 @@ import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { avatarAllows, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled, avatarPrincipal, avatarRoleOf, forkedAvatar,
   normalizeAvatarSetting, AVATAR_ROLE_LABELS, type AvatarRole } from './avatars.js';
 import { CapabilityError, NotFoundError, TaskStartedError, ValidationError } from './errors.js';
-import type { AccountQueueView } from '../coordinators/account.js';
+import type { AccountLeaseAnswer, AccountQueueView } from '../coordinators/account.js';
 import type { SchedulingQueueTask, SchedulingQueueView } from '../scheduling/view.js';
 import { assertAgentSpec, childComputer, subTaskParams } from './agent-params.js';
 import { CALLED_AGENT_FIELD, agentSpecsByParticipant, authorityKey, normalizeAgentAuthority, type StoredAgentAuthorization } from './agent-authority.js';
@@ -3732,23 +3732,7 @@ export class KarmaxApi {
         const { world, worldPath, worldAvailable, worldDesktop, worldProvider, ...history } = view;
         view = history;
       }
-      // Why a turn waits for a credential changes after it asked (the quota
-      // scheduler may hold it back), so read the coordinator's current answer.
-      // Existing parked executions recorded only "account" and get it this way too.
-      if (view.waitingFor?.kind === 'account') {
-        try {
-          const lease = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId())
-            .query(QRY_ACCOUNT_LEASE, { taskId }) as Promise<{
-              waiting: boolean; earliestResetAt?: number; detail?: string; heldUntil?: number;
-            }>, 500);
-          if (lease.waiting && lease.detail && (!view.waitingFor.detail || lease.heldUntil !== undefined
-            || lease.detail.startsWith('Held'))) view = { ...view, waitingFor: {
-            ...view.waitingFor, detail: lease.detail,
-            ...(lease.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
-            ...(lease.heldUntil !== undefined ? { until: lease.heldUntil } : {}),
-          } };
-        } catch { /* A coordinator outage must not block reading the task. */ }
-      }
+      view = await this.withLiveAccountWait(taskId, view);
       const rawAgents = await this.deps.store.kvGetAsync(agentSnapshotKey(taskId));
       let agents: Record<string, AgentSpec> | undefined;
       try { const parsed = rawAgents ? JSON.parse(rawAgents) : undefined;
@@ -3756,7 +3740,8 @@ export class KarmaxApi {
       } catch { /* Same malformed-snapshot fallback as readAgentSnapshot. */ }
       const task = await this.deps.store.taskMetadataAsync(taskId);
       const group = await this.deps.store.attemptCommitAsync(taskId);
-      const subTaskSummaries = await this.deps.store.childTaskSummaries(taskId);
+      const subTaskSummaries = await Promise.all((await this.deps.store.childTaskSummaries(taskId)).map(async (child) =>
+        child.lastView ? { ...child, lastView: await this.withLiveAccountWait(child.id, child.lastView) } : child));
       const forkSummaries = await this.deps.store.forkTaskSummaries(taskId);
       const forkSourceSummaries = await this.deps.store.forkSourceTaskSummaries(taskId);
       const accepted = (await this.acceptedAction(taskId, view));
@@ -3886,6 +3871,34 @@ export class KarmaxApi {
   async listTasks(token: string, projectId: string): Promise<TaskRecord[]> {
     (await this.require(token, 'list_tasks', { projectId }));
     return this.deps.store.listTasksAsync(projectId);
+  }
+
+  /**
+   * Why a turn waits for a model login changes after it asked (the quota
+   * scheduler decides, holds it back, or finds every login's quota used), and
+   * the view the workflow published only says what it was told then. So a
+   * waiting view takes the coordinator's current answer. Executions that
+   * recorded only "account" get their reason this way too.
+   */
+  async withLiveAccountWait<V extends Pick<TaskView, 'waitingFor'>>(taskId: string, view: V): Promise<V> {
+    if (view.waitingFor?.kind !== 'account') return view;
+    try {
+      const lease = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId())
+        .query(QRY_ACCOUNT_LEASE, { taskId }) as Promise<AccountLeaseAnswer>, 500);
+      if (!lease.waiting) return view;
+      // The coordinator's answer replaces the published one whole: a stale
+      // "Held until 14:20" must not survive into a wait for quota, nor its time.
+      const { detail: _detail, earliestResetAt: _reset, until: _until, reason: _reason, ...rest } = view.waitingFor;
+      return { ...view, waitingFor: { ...rest,
+        ...(lease.reason ? { reason: lease.reason } : {}),
+        ...(lease.detail ? { detail: lease.detail } : {}),
+        ...(lease.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
+        ...(lease.heldUntil !== undefined ? { until: lease.heldUntil } : {}),
+      } };
+    } catch {
+      // A coordinator outage must not block reading the task.
+      return view;
+    }
   }
 
   async listTaskSummaries(token: string, projectId: string): Promise<TaskRecord[]> {
@@ -4026,8 +4039,10 @@ export class KarmaxApi {
     // checks the logins again. Nothing failed, so it is not "Retry". A turn the
     // quota scheduler holds back has usable logins, so checking them changes
     // nothing; its control is Run now (pramana#137 showed a useless Retry).
+    // Nor does it help a turn the scheduler is placing or that waits for a free slot.
+    const accountReason = view.waitingFor?.reason;
     if (view.status === 'waiting' && view.waitingFor?.kind === 'account' && view.waitingFor.provider
-      && !view.waitingFor.detail?.startsWith('Held')
+      && !view.waitingFor.detail?.startsWith('Held') && accountReason !== 'held' && accountReason !== 'planning' && accountReason !== 'slot'
       && !actions.some((action) => action.name === 'retry'))
       actions.unshift({ ...RETRY_ACTION(), label: 'Check again' });
 
