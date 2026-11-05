@@ -1,12 +1,12 @@
 // Automated accessibility checks (axe-core, WCAG 2.2 A/AA) on the console's main
 // pages — For me with its in-row decisions, a task asking for a credential, a
-// task with a question, settings, Insights, the profile — in both looks, light
-// and dark, and on a phone. Fails on any violation, so a contrast, label, name
+// task with a question, settings, Insights, the profile — and the public site
+// (landing, docs, pricing, policies), in both looks, light and dark, and on a phone. Fails on any violation, so a contrast, label, name
 // or target-size regression is caught before it ships.
 // Run: node tests/accessibility-check.cjs   (A11Y_REPORT=1 prints every violation; CI runs it from tests/accessibility.browser.test.ts)
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const { launch } = require('./helpers/fake-console.cjs');
+const { fakeConsole, launch } = require('./helpers/fake-console.cjs');
 const { uxConsole } = require('./helpers/ux-console.cjs');
 
 const AXE = fs.readFileSync(require.resolve('axe-core/axe.min.js'), 'utf8');
@@ -20,6 +20,8 @@ const PAGES = [
   ['insights', '/org/insights'],
   ['profile', '/profile'],
 ];
+// Signed out: the landing at /, and the pages it links to.
+const PUBLIC_PAGES = [['landing', '/'], ['docs', '/docs'], ['pricing', '/pricing'], ['policies', '/legal']];
 const LOOKS = [
   { name: 'default light', skin: '', scheme: 'light' },
   { name: 'default dark', skin: '', scheme: 'dark' },
@@ -42,21 +44,40 @@ const LOOKS = [
         await page.goto(`http://console.test${url}`);
         await page.locator('#main').waitFor();
         await page.waitForTimeout(1200);
-        await page.addScriptTag({ content: AXE });
-        const result = await page.evaluate(async () => window.axe.run(document, {
-          runOnly: { type: 'tag', values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'] },
-          // The fixture's brand image is a stand-in without its file.
-          exclude: [['.brand .mark']],
-        }));
-        for (const violation of result.violations) {
-          failures.push(`${look.name} · ${name}: ${violation.id} (${violation.impact}) — ${violation.help}\n${violation.nodes.slice(0, 4)
-            .map((node) => `    ${node.target.join(' ')}${node.failureSummary ? ` — ${node.failureSummary.split('\n').slice(1, 2).join(' ').trim()}` : ''}`).join('\n')}`);
-        }
+        await check(page, look, name);
       }
       await context.close();
+      // The public site, signed out.
+      const outside = await browser.newContext({ serviceWorkers: 'block', viewport: look.viewport || { width: 1280, height: 820 }, colorScheme: look.scheme, reducedMotion: 'reduce' });
+      await outside.addInitScript((skin) => { try { localStorage.setItem('karmax-skin', skin); } catch {} }, look.skin);
+      await fakeConsole(outside, { project: { id: 'p', organizationId: 'o', name: 'Website', config: {} }, api(p) {
+        if (p === '/api/meta') return { siteName: 'Fixture', hostLocal: false, consoleRevision: 'one', agent: { provider: 'mock' }, worldProviders: [], skin: look.skin };
+        if (p === '/api/session') return { authRequired: true, authenticated: false };
+      } });
+      const visitor = await outside.newPage();
+      for (const [name, url] of PUBLIC_PAGES) {
+        await visitor.goto(`http://console.test${url}`);
+        await visitor.locator('.landing-page, .legal-shell').first().waitFor();
+        await visitor.waitForTimeout(800);
+        await check(visitor, look, name);
+      }
+      await outside.close();
     }
   } finally { await browser.close(); }
   if (process.env.A11Y_REPORT || failures.length) console.error(failures.join('\n'));
   assert.equal(failures.length, 0, `${failures.length} accessibility violations`);
   console.log('Accessibility: ok');
+
+  async function check(page, look, name) {
+    await page.addScriptTag({ content: AXE });
+    const result = await page.evaluate(async () => window.axe.run(document, {
+      runOnly: { type: 'tag', values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'] },
+      // The fixture's brand images are stand-ins without their files.
+      exclude: [['.mark']],
+    }));
+    for (const violation of result.violations) {
+      failures.push(`${look.name} · ${name}: ${violation.id} (${violation.impact}) — ${violation.help}\n${violation.nodes.slice(0, 4)
+        .map((node) => `    ${node.target.join(' ')}${node.failureSummary ? ` — ${node.failureSummary.split('\n').slice(1, 2).join(' ').trim()}` : ''}`).join('\n')}`);
+    }
+  }
 })().catch((error) => { console.error(error.message); process.exit(1); });

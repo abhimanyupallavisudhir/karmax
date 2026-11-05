@@ -23,7 +23,7 @@ describe('public landing page', () => {
     expect(await page.title()).toBe('tavya — the to-do list for agents');
     expect(await page.locator('.product-browserbar span').textContent()).toBe('console.test / tavya');
     expect(await page.locator('.product-wordmark strong').textContent()).toBe('tavya');
-    expect(await page.locator('.product-project.active').textContent()).toBe('◇ tavya');
+    expect(await page.locator('.product-project.active span').textContent()).toBe('tavya');
     // The issue-tracker URL is a repository identifier, not branding.
     expect(await page.locator('.landing-page').innerText()).not.toMatch(/krmax/i);
     expect(ui.errors).toEqual([]);
@@ -151,6 +151,47 @@ describe('public landing page', () => {
     await ui.close();
   });
 
+  it('wears the console\'s look: its colours, its primary button, light or dark, default or classic', async () => {
+    for (const [skin, scheme] of [['', 'light'], ['', 'dark'], ['classic', 'light']] as const) {
+      const ui = await landing();
+      await ui.page.emulateMedia({ colorScheme: scheme });
+      await ui.run(`applySkin(${JSON.stringify(skin)})`);
+      await ui.page.waitForTimeout(300); // the buttons fade between colours
+      const look = await ui.page.evaluate(() => {
+        const root = getComputedStyle(document.documentElement);
+        const probe = (value: string) => { const el = document.createElement('i'); el.style.color = value; document.body.append(el); const c = getComputedStyle(el).color; el.remove(); return c; };
+        const start = getComputedStyle(document.querySelector('#landing-start'));
+        return {
+          page: getComputedStyle(document.querySelector('.landing-page')).backgroundColor, paper: probe(root.getPropertyValue('--paper')),
+          button: start.backgroundColor, primary: probe(root.getPropertyValue('--primary')),
+          radius: start.borderTopLeftRadius, ink: start.color,
+        };
+      });
+      expect(look.page, `${skin || 'default'} ${scheme}`).toBe(look.paper);
+      expect(look.button, `${skin || 'default'} ${scheme}`).toBe(look.primary);
+      expect(parseFloat(look.radius), 'a pill in the default look, the classic look\'s corner otherwise').toBe(skin ? 8 : 999);
+      await ui.close();
+    }
+  });
+
+  it('pictures today\'s console: New task, the organization\'s places, projects with their For me numbers, sentence case', async () => {
+    const ui = await landing();
+    const { page } = ui;
+    expect(await page.locator('.product-new').innerText()).toBe('New task');
+    expect(await page.locator('.product-nav span').allInnerTexts()).toEqual(['Home', 'Insights', 'Wiki', 'Settings']);
+    expect(await page.locator('.product-project b').allInnerTexts()).toEqual(['2', '1']);
+    expect(await page.locator('.product-person').innerText()).toBe('A\nAda');
+    expect(await page.locator('.product-topline span').allInnerTexts()).toEqual(['Tasks', 'Queues', 'Wiki', 'Project settings']);
+    // No small capitals, and the stage names in the reading face.
+    const caps = await page.evaluate(() => [...document.querySelectorAll('.product-frame *')].filter((el) => getComputedStyle(el).textTransform === 'uppercase').length);
+    expect(caps).toBe(0);
+    expect(await page.locator('.product-stage.done').first().innerText()).toBe('Done');
+    expect(await page.evaluate(() => getComputedStyle(document.querySelector('.product-stage')).fontFamily))
+      .toBe(await page.evaluate(() => getComputedStyle(document.body).fontFamily));
+    expect(ui.errors).toEqual([]);
+    await ui.close();
+  });
+
   it('closes on the brand mark', async () => {
     const ui = await landing();
     const mark = ui.page.locator('.landing-final-mark .mark');
@@ -190,7 +231,7 @@ describe('public landing page', () => {
       'Wiki-based agent memory',
     ]);
     expect(await page.locator('.product-task .product-stage.done').count()).toBe(7);
-    expect(await page.locator('.product-topline').innerText()).toMatch(/Queues\s+Wiki\s+Settings/);
+    expect(await page.locator('.product-topline').innerText()).toMatch(/Queues\s+Wiki\s+Project settings/);
     await ui.close();
   });
 

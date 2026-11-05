@@ -68,6 +68,11 @@ ok(listAround.includes('<p class="md-p">Intro:</p>') && listAround.includes('<p 
 // Inline formatting still works inside list items.
 ok(/<li><strong>bold<\/strong> item<\/li>/.test(renderMarkdown('- **bold** item', {})), 'inline formatting inside a list item');
 
+// A one-character bold closes at its own ** rather than running on to the next
+// bold span (the docs' "Press **+** next to **Projects**").
+ok(renderMarkdown('Press **+** next to **Projects** in', {}).includes('Press <strong>+</strong> next to <strong>Projects</strong> in'), 'one-character bold');
+ok(renderMarkdown('a ***x*** b ***y*** c __z__ d __w__', {}).includes('a <strong><em>x</em></strong> b <strong><em>y</em></strong> c <strong>z</strong> d <strong>w</strong>'), 'one-character bold italic and underscore bold');
+
 // Inline code and fenced code keep their contents verbatim (escaped, unformatted).
 ok(renderMarkdown('use `a_b` here', {}).includes('<code class="md-inline">a_b</code>'), 'inline code is not italicised');
 const fence = renderMarkdown('```js\nlet x = 1 < 2;\n```', {});

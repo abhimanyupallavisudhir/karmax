@@ -27569,24 +27569,26 @@ function renderLanding() {
           <div class="product-shell">
             <aside class="product-rail">
               <div class="product-wordmark">${brandMark()}<strong>${siteNameMarkup()}</strong></div>
-              <small>PROJECTS</small>
-              <div class="product-project active"><span>◇</span> ${siteNameMarkup()}</div>
-              <div class="product-project"><span>◇</span> Website</div>
-              <div class="product-project"><span>◇</span> Research</div>
+              <div class="product-new">${ICON.plus}New task</div>
+              <div class="product-nav">${[['home', 'Home'], ['insights', 'Insights'], ['wiki', 'Wiki'], ['settings', 'Settings']]
+                .map(([icon, label]) => `<span>${ICON[icon]}${label}</span>`).join('')}</div>
+              <small>Projects</small>
+              <div class="product-project active">${ICON.project}<span>${siteNameMarkup()}</span><b>2</b></div>
+              <div class="product-project">${ICON.project}<span>Website</span><b>1</b></div>
+              <div class="product-project">${ICON.project}<span>Research</span></div>
               <div class="product-rail-spacer"></div>
-              <div class="product-project"><span>🕮</span> Wiki</div>
-              <div class="product-project"><span>⚙</span> Settings</div>
+              <div class="product-person"><i>A</i>Ada</div>
             </aside>
             <div class="product-main">
-              <div class="product-topline"><span>Tasks <b>7</b></span><span>Queues</span><span>Wiki</span><span>Settings</span><i>+ New task</i></div>
-              <div class="product-compose"><span>What needs doing?</span><kbd>⌘ ↵</kbd></div>
-              <div class="product-list-head"><span>TODAY</span><span>7 tasks</span></div>
+              <div class="product-topline"><span>Tasks</span><span>Queues</span><span>Wiki</span><span>Project settings</span></div>
+              <div class="product-compose">New task…</div>
+              <div class="product-list-head"><span>For me</span><span class="on">Active</span><span>Scheduled</span><span class="product-count">7 tasks</span></div>
               <div class="product-list">${tasks.map(([title, delay]) => `
               <article class="product-task" style="--d:${delay}s">
                 <span class="product-check">${tick}</span>
                 <div><strong>${title}</strong></div>
                 <span class="product-pipe" aria-hidden="true"><i></i></span>
-                <div class="product-stages"><span class="product-stage working" aria-hidden="true">working</span><div class="product-stage done">done</div></div>
+                <div class="product-stages"><span class="product-stage working" aria-hidden="true">Working</span><div class="product-stage done">Done</div></div>
               </article>`).join('')}
               </div>
             </div>
