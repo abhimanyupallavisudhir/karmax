@@ -5,6 +5,7 @@ import zlib from 'node:zlib';
 import { promisify } from 'node:util';
 import type http from 'node:http';
 import { MIME } from '../store/artifact-mime.js';
+import { artifactEdgeOrigin } from './artifact-urls.js';
 
 /**
  * The console has no build step, so the gateway itself is its asset server:
@@ -32,29 +33,33 @@ export const MATHJAX_SCRIPT_SOURCE = 'https://cdn.jsdelivr.net/npm/mathjax@3.2.2
  *  Agent-authored documents (review HTML, HTML artifacts) are separate responses
  *  with their own sandbox policy, because a srcdoc or blob: document would
  *  inherit this one. */
-export function consoleContentSecurityPolicy(host?: string): string {
+export function consoleContentSecurityPolicy(host?: string, edge = artifactEdgeOrigin()): string {
   // Older Safari does not match ws: or wss: against 'self', so the console's
   // own socket is named (ws: only ever loads from a plain-http install; https
   // pages refuse it as mixed content). The Host header is the requester's to
   // choose, so only a bare host[:port] is trusted into the policy.
   const socket = host && /^(?:[a-z0-9.-]+|\[[0-9a-f:.]+\])(?::\d{1,5})?$/i.test(host) ? ` wss://${host} ws://${host}` : '';
+  // Saved Review files come from the artifact edge, another origin: the viewer
+  // plays, frames and (for text) reads them from there.
+  const files = edge ? ` ${edge}` : '';
   return [
     "default-src 'self'",
     // Without KARMAX_PREVIEW_ORIGIN, live previews are served under /preview/ on
     // this origin, so their scripts count as 'self'; set it to contain them.
     `script-src 'self' ${MATHJAX_SCRIPT_SOURCE}`,
-    `connect-src 'self'${socket}`,
+    `connect-src 'self'${socket}${files}`,
     // The console and MathJax style elements directly; styles cannot run script.
     "style-src 'self' 'unsafe-inline'",
     // Profile pictures come from the sign-in provider; previews are blob: URLs.
     "img-src 'self' data: blob: https:",
-    "media-src 'self' blob:",
+    `media-src 'self' blob:${files}`,
     // A PDF artifact opens as a blob: document, which inherits this policy.
     'object-src blob:',
     // qr-scanner decodes in a worker built from a blob; older Safari reads
     // child-src for workers and ignores worker-src.
     "worker-src 'self' blob:",
     "child-src 'self' blob:",
+    `frame-src 'self' blob:${files}`,
     "base-uri 'none'",
     // Creating the shared GitHub App posts its manifest to GitHub.
     "form-action 'self' https://github.com",

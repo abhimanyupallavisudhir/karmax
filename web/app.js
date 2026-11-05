@@ -5581,6 +5581,7 @@ function connectWs() {
     if (ev.type === 'review.updated' || ev.type.startsWith('resource.')) {
       resourceReviewCache.delete(ev.taskId); resourceInventoryCache.delete(ev.taskId);
     }
+    if (ev.type === 'review.updated') forgetReviewArtifactUrls(ev.taskId);
     if (S.selected && ev.taskId === S.selected) {
       if (ev.type.startsWith('spend.') || ev.type.startsWith('payment.')) $('#tp-payments')?.refreshSpent?.();
       if (ev.type !== 'agent.output') {
@@ -12134,7 +12135,7 @@ async function showArtifactViewer({ name, url, view, text, refresh, gallery }) {
   const content = dialog.querySelector('.artifact-reader-content');
   const links = () => dialog.querySelectorAll('[data-download], [data-new-tab]');
   let media = null, current = null, refreshedAt = 0, closed = false;
-  const point = (href) => links().forEach((link) => { link.href = href; });
+  const point = (href) => links().forEach((link) => { link.href = link.hasAttribute('data-download') ? downloadHref(href) : href; });
   const stopMedia = () => { if (media) { media.removeAttribute('src'); media.load?.(); } media = null; };
   // Show one file in the open card (the first, or the next one stepped to).
   const mount = (item) => {
@@ -12252,8 +12253,14 @@ async function downloadArtifact({ url, name }) {
   const head = await fetch(url, { method: 'HEAD' }).catch(() => null);
   if (!head?.ok) throw new Error(`Could not download ${name}`);
   const anchor = document.createElement('a');
-  anchor.href = url; anchor.download = name; anchor.rel = 'noopener';
+  anchor.href = downloadHref(url); anchor.download = name; anchor.rel = 'noopener';
   document.body.appendChild(anchor); anchor.click(); anchor.remove();
+}
+
+// A browser ignores `download` on a link to another origin (the artifact edge),
+// so the URL itself asks to be saved rather than shown.
+function downloadHref(url) {
+  return `${url}${url.includes('?') ? '&' : '?'}download=1`;
 }
 
 // What the viewer needs to show what `POST /review-action` resolved
@@ -12282,8 +12289,13 @@ async function openArtifact(resolved, refresh) {
 function isReviewTile(a) { return a.kind === 'open' && !/^https?:\/\//i.test(a.target || ''); }
 
 // Signed artifact URLs of a task's open actions, shared by the thumbnails and
-// the viewer: one resolve per action an hour (a signed URL lasts one).
+// the viewer: one resolve per action an hour (a signed URL lasts one). A saved
+// file's URL names its content, so the browser keeps its bytes for that hour;
+// a republished Review gets new URLs.
 const reviewArtifactUrls = new Map();
+function forgetReviewArtifactUrls(taskId) {
+  for (const key of reviewArtifactUrls.keys()) if (key.startsWith(`${taskId}\n`)) reviewArtifactUrls.delete(key);
+}
 function resolveReviewArtifact(v, index, fresh = false) {
   const action = v.reviewInfo?.actions?.[index];
   const key = `${v.taskId}\n${index}\n${action?.target || ''}`;

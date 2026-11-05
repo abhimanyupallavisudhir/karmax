@@ -4,8 +4,10 @@ import { INSTALLATION_SCOPE } from '../autonomy/vault-keys.js';
 
 const KEY_HANDLE = 'review-artifacts:url-key';
 
-/** What a signed artifact URL opens: one Review "open" target of one task. */
-export interface ArtifactGrant { taskId: string; path: string }
+/** What a signed artifact URL opens: one Review "open" target of one task;
+ * for a saved file, the saved copy it named (`artifact`), whose bytes never
+ * change, so the browser may keep them for the URL's life. */
+export interface ArtifactGrant { taskId: string; path: string; artifact?: string }
 
 /**
  * Short-lived, stateless URLs for Review artifacts. A `<video>`, `<img>` or
@@ -24,19 +26,21 @@ export class ArtifactUrls {
   constructor(private broker?: CredentialBroker) {}
 
   async mint(grant: ArtifactGrant, now = Date.now()): Promise<string> {
-    const body = Buffer.from(JSON.stringify({ t: grant.taskId, p: grant.path, e: now + ArtifactUrls.TTL_MS })).toString('base64url');
+    const body = Buffer.from(JSON.stringify({ t: grant.taskId, p: grant.path, ...(grant.artifact ? { a: grant.artifact } : {}),
+      e: now + ArtifactUrls.TTL_MS })).toString('base64url');
     return `${body}.${this.sign(await this.secret(), body)}`;
   }
 
-  async verify(token: string, now = Date.now()): Promise<ArtifactGrant | undefined> {
+  async verify(token: string, now = Date.now()): Promise<(ArtifactGrant & { expiresAt: number }) | undefined> {
     const [body, signature, extra] = token.split('.');
     if (!body || !signature || extra !== undefined) return undefined;
     const expected = this.sign(await this.secret(), body);
     if (signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return undefined;
-    let claims: { t?: unknown; p?: unknown; e?: unknown };
+    let claims: { t?: unknown; p?: unknown; a?: unknown; e?: unknown };
     try { claims = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')); } catch { return undefined; }
-    if (typeof claims.t !== 'string' || typeof claims.p !== 'string' || typeof claims.e !== 'number' || claims.e <= now) return undefined;
-    return { taskId: claims.t, path: claims.p };
+    if (typeof claims.t !== 'string' || typeof claims.p !== 'string' || typeof claims.e !== 'number' || claims.e <= now
+      || claims.a !== undefined && typeof claims.a !== 'string') return undefined;
+    return { taskId: claims.t, path: claims.p, ...(claims.a ? { artifact: claims.a } : {}), expiresAt: claims.e };
   }
 
   private sign(key: Buffer, body: string): string {
@@ -52,4 +56,29 @@ export class ArtifactUrls {
       return Buffer.from(await broker.resolve(KEY_HANDLE, { caps: [`use-credential:${KEY_HANDLE}`] }), 'base64');
     })();
   }
+}
+
+/**
+ * The Review artifact edge (src/edge/artifact-worker.ts), when this
+ * installation has one: `KARMAX_ARTIFACT_EDGE_URL` (recorded by
+ * `deploy/karmax deploy-artifact-edge`) and the key its URLs are signed with,
+ * derived from the auth secret so the Worker's copy can mint nothing else.
+ */
+export function artifactEdge(env: NodeJS.ProcessEnv = process.env): { url: string; key: string } | undefined {
+  const url = artifactEdgeOrigin(env);
+  const key = artifactEdgeKey(env);
+  // The Worker reads the managed bucket: with any other store it has nothing to serve.
+  return url && key && env.KARMAX_OBJECT_STORE?.trim() === 's3' ? { url, key } : undefined;
+}
+
+/** The edge's origin (`https://host`), for the console's content-security policy too. */
+export function artifactEdgeOrigin(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const url = env.KARMAX_ARTIFACT_EDGE_URL?.trim().replace(/\/+$/, '');
+  return url && /^https:\/\/[a-z0-9.-]+(?::\d{1,5})?$/i.test(url) ? url : undefined;
+}
+
+export function artifactEdgeKey(env: NodeJS.ProcessEnv = process.env): string {
+  const root = env.KARMAX_AUTH_SECRET ?? '';
+  if (root.length < 32) return '';
+  return Buffer.from(crypto.hkdfSync('sha256', root, '', 'tavya review-artifact edge v1', 32)).toString('base64url');
 }

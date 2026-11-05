@@ -181,11 +181,14 @@ it('a ~100 MB saved video starts playing in the Review viewer', async () => {
     expect(delivered).toBeLessThan(80 * MB);
     expect(statuses).toContain(206);
     expect(resolves).toBe(2);
-    // Download stays available, from the same signed URL.
+    // Download stays available, from the same signed URL asking to be saved
+    // (a browser ignores `download` on a link to the artifact edge's origin).
     const src = await player.getAttribute('src');
     expect(src).toMatch(/^\/api\/artifact-content\//);
     const download = page.locator('dialog.artifact-reader [data-download]');
-    expect(await download.getAttribute('href')).toBe(src);
+    expect(await download.getAttribute('href')).toBe(`${src}?download=1`);
+    const saved = await page.evaluate(async (href) => (await fetch(href!, { method: 'HEAD' })).headers.get('content-disposition'), await download.getAttribute('href'));
+    expect(saved).toMatch(/^attachment;/);
     expect(await download.getAttribute('download')).toBe('the_great_experiment_web.webm');
     expect(popups).toBe(0);
     expect(await page.evaluate(() => (globalThis as any).opened.length)).toBe(0);
