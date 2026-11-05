@@ -39,6 +39,7 @@ function extractConst(name) {
   const code = [
     extractFn('waitingLabel'),
     extractFn('waitingText'),
+    extractFn('accountWaitReason'),
     extractFn('waitDeadline'),
     extractFn('conversationPresence'),
     // Stubbed: the real one walks the transcript list, which isn't what's under
@@ -52,7 +53,7 @@ function extractConst(name) {
   const concise = {
     mergeSlot: 'Waiting to merge',
     agentSlot: 'Waiting for agent',
-    account: 'Waiting for credential',
+    account: 'Waiting for a model login',
     subtask: 'Waiting for sub-tasks',
     collaboration: 'Waiting for collaborator',
     confirm: 'Waiting for review',

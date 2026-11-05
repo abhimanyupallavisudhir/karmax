@@ -14719,7 +14719,7 @@ function renderDiff(d) {
 function waitingLabel(w) {
   if (!w) return '';
   switch (w.kind) {
-    case 'account': return w.earliestResetAt ? 'quota' : 'credential';
+    case 'account': return 'model login';
     case 'agentSlot': return 'agent';
     case 'mergeSlot': return 'merge';
     case 'github': return /\b(?:ci|checks?|validat(?:e|es|ed|ing|ion))\b/i.test(w.detail || '') ? 'CI' : 'GitHub';
@@ -14737,6 +14737,18 @@ function waitingLabel(w) {
   }
 }
 
+// Why a turn waits for a model login: the coordinator's reason, or, for a view
+// published before it gave one, what its detail says.
+function accountWaitReason(w) {
+  if (w?.reason) return w.reason;
+  const detail = typeof w?.detail === 'string' ? w.detail : '';
+  if (detail.startsWith('Held')) return 'held';
+  if (w?.earliestResetAt || /usage limit|quota/i.test(detail)) return 'quota';
+  if (/free slot|running all it may/.test(detail)) return 'slot';
+  if (/^No \w+ credential|needs attention|^Couldn't read/.test(detail)) return 'login';
+  return '';
+}
+
 // Short status used by the task-page wait card and conversation presence. The
 // workflow's detailed diagnostic remains in durable state/history; copying it
 // into a status label made normal polling look like a stream of new problems.
@@ -14752,9 +14764,18 @@ function waitingText(w) {
   if (w?.kind === 'retry' && typeof w.summary === 'string' && w.summary.trim())
     return `${w.summary.trim().slice(0, 48)}${Number.isFinite(w.until) ? `, trying at ${waitDeadline(w.until)}` : ''}`;
   if (w?.kind === 'retry') return Number.isFinite(w.until) ? `Retrying at ${waitDeadline(w.until)}` : 'Retrying';
-  // The quota scheduler keeps this login's quota for higher-priority work until then.
-  if (w?.kind === 'account' && typeof w.detail === 'string' && w.detail.startsWith('Held'))
-    return Number.isFinite(w.until) ? `Held for higher-priority work until ${waitDeadline(w.until)}` : 'Held for higher-priority work';
+  if (w?.kind === 'account') {
+    const who = w.provider ? ACCOUNT_PROVIDER_LABELS[w.provider] || w.provider : '';
+    switch (accountWaitReason(w)) {
+      // The quota scheduler keeps this login's quota for higher-priority work until then.
+      case 'held': return Number.isFinite(w.until) ? `Held for higher-priority work until ${waitDeadline(w.until)}` : 'Held for higher-priority work';
+      case 'quota': return `Waiting for ${who ? `${who} ` : ''}quota${w.earliestResetAt > Date.now() ? ` until ${waitDeadline(w.earliestResetAt)}` : ''}`;
+      case 'slot': return `Waiting for a free ${who ? `${who} ` : ''}login`;
+      case 'planning': return who ? `Queued for ${who}` : 'Queued';
+      case 'login': return (w.detail || '').startsWith("Couldn't read") ? 'Credential policy unreadable' : `Needs a ${who ? `${who} ` : ''}login`;
+      default: return who ? `Waiting for ${who}` : 'Waiting for a model login';
+    }
+  }
   // A job is shown by the name its agent gave it. The deadline is when the
   // agent resumes even if the job never finishes.
   if (w?.kind === 'job') {
@@ -14780,8 +14801,12 @@ function waitDeadline(until) {
 // The generic header label alone would hide that diagnosis.
 function conversationWaitNotice(v) {
   const w = v.waitingFor;
-  if (w?.kind === 'account' && typeof w.detail === 'string' && w.detail.startsWith('Held'))
+  const reason = w?.kind === 'account' ? accountWaitReason(w) : '';
+  if (reason === 'held')
     return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))} <button type="button" class="btn sm ghost" data-run-now="${esc(v.taskId)}" title="${esc(RUN_NOW_TIP)}">Run now</button></div>`;
+  // The label already says what it waits for and until when; a person can do nothing more here.
+  if (reason === 'quota' || reason === 'slot' || reason === 'planning')
+    return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))}</div>`;
   const detail = presenceDetail(v);
   const raw = typeof w?.detail === 'string' ? w.detail.trim() : '';
   return detail ? `<div class="msg system wait-notice" role="status"${raw && raw !== detail ? ` title="${esc(raw)}"` : ''}>${esc(waitingText(v.waitingFor))} · ${esc(detail)}${setupFixHtml(w?.detail)}</div>` : '';

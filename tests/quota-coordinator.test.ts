@@ -259,7 +259,7 @@ describe('account coordinator — quota engine', () => {
     const g = await grantee();
     await coord.signal('leaseAccount', { taskId: g.id, turnId: 't1', provider: 'google', allowed: ['key:handle:google:removed'] });
     await expect.poll(() => coord.query('accountLease', { taskId: g.id }), { timeout: 10_000 }).toEqual({
-      waiting: true, detail: 'No google credential — add one, or stop this agent',
+      waiting: true, reason: 'login', detail: 'No google credential — add one, or stop this agent',
     });
     expect(await grants(g.id)).toEqual([]);
     await coord.terminate('done');
@@ -273,7 +273,7 @@ describe('account coordinator — quota engine', () => {
     // A query can reach the run that is still continuing as new (the lease
     // activity retries that acknowledgement the same way).
     await expect.poll(() => coord.query('accountLease', { taskId: g.id }), { timeout: 10_000 }).toEqual({
-      waiting: true, detail: 'Every allowed credential needs attention — sign in again or add one',
+      waiting: true, reason: 'login', detail: 'Every allowed credential needs attention — sign in again or add one',
     });
     expect(await grants(g.id)).toEqual([]);
     await coord.signal('setAccountAvailability', { accountId: 'A', status: 'available', onlyIfStatus: 'needs-attention' });
@@ -291,7 +291,7 @@ describe('account coordinator — quota engine', () => {
     const g = await grantee();
     await coord.signal('leaseAccount', { taskId: g.id, turnId: 't1', provider: 'claude', allowed: [CREDENTIAL_POLICY_UNAVAILABLE] });
     await expect.poll(() => coord.query('accountLease', { taskId: g.id }), { timeout: 10_000 }).toEqual({
-      waiting: true, detail: 'Couldn\'t read this task\'s credential policy — Retry reads it again',
+      waiting: true, reason: 'login', detail: 'Couldn\'t read this task\'s credential policy — Retry reads it again',
     });
     expect(await grants(g.id)).toEqual([]);
     await g.h.signal('finish');
@@ -426,7 +426,8 @@ describe('account coordinator — quota engine', () => {
     const parked = await grantee();
     await expect(activities.leaseAccount(parked.id, 'parked', 'claude', ['A'])).resolves.toEqual({
       waiting: true,
-      detail: 'Waiting for a free slot on an allowed account',
+      reason: 'slot',
+      detail: 'Every allowed login is running all it may',
     });
     expect((await accounts()).waiting).toBe(1);
 
@@ -443,7 +444,7 @@ describe('account coordinator — quota engine', () => {
     ]);
     const activities = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
     const g = await grantee();
-    const expected = { waiting: true, earliestResetAt: resetAt,
+    const expected = { waiting: true, reason: 'quota', earliestResetAt: resetAt,
       detail: 'Provider usage limit reached; the task resumes automatically when quota resets' };
     expect(await activities.leaseAccount(g.id, 'quota', 'claude', ['allowed'])).toEqual(expected);
     expect(await coord.query('accountLease', { taskId: g.id })).toEqual(expected);
