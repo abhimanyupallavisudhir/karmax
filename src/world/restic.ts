@@ -57,6 +57,21 @@ export function runHostRestic(args: string[], env: Record<string, string>, optio
   });
 }
 
+/** Run restic on this host with its standard output as a stream (`dump`):
+ * `done` settles when it exits, with stderr for `resticFailure`. */
+export function streamHostRestic(args: string[], env: Record<string, string>): {
+  stdout: import('node:stream').Readable; done: Promise<ResticRun>; stop: () => void } {
+  const child = spawn(hostResticBinary(), args, {
+    env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: process.env.HOME ?? '/tmp', ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = '';
+  child.stderr.on('data', (chunk: Buffer) => { stderr = (stderr + chunk.toString('utf8')).slice(-64 * 1024); });
+  const done = new Promise<ResticRun>((resolve) => {
+    child.on('error', (error) => resolve({ code: -1, stdout: '', stderr: error.message }));
+    child.on('close', (code) => resolve({ code: code ?? -1, stdout: '', stderr }));
+  });
+  return { stdout: child.stdout, done, stop: () => { if (child.exitCode === null) child.kill('SIGTERM'); } };
+}
+
 /** restic's own words for a failed command: its JSON errors, else stderr. */
 export function resticFailure(run: ResticRun, what: string): Error {
   const messages: string[] = [];

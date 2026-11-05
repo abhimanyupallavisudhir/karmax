@@ -79,6 +79,7 @@ import { accountKey, waiters } from '../world/compute-queue.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
+import { FileAccessError, FileNotFoundError, ProjectFiles, type OpenedFile } from '../world/project-files.js';
 import { cliVersionOf, olderVersion } from '../domain/cli-version.js';
 import { WorkspaceConflict, WorldNotRunningError } from '../world/resources.js';
 import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, openCodeKeyModels, mergeModels,
@@ -382,6 +383,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The tavya CLI (wiki planned/tavya-cli). Grants to read a resource are a
   // read, whatever the method; saving one is a settings write (or a task edit).
   if (/^\/api\/projects\/[^/]+\/workspace$/.test(p) || /^\/api\/projects\/[^/]+\/git-credential$/.test(p)) return 'repository:read';
+  // The Files page: data under it also needs project:settings:read, checked there.
+  if (/^\/api\/projects\/[^/]+\/files(?:\/raw)?$/.test(p)) return 'repository:read';
   if (/^\/api\/organizations\/[^/]+\/cli-git-credentials$/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/projects\/[^/]+\/secrets\/values$/.test(p)) return 'project:secret:use';
   if (/^\/api\/projects\/[^/]+\/resources\/[^/]+\/read-grant$/.test(p)) return 'project:settings:read';
@@ -4976,6 +4979,26 @@ export class Gateway {
           else (await store.kvDelete(cliGitCredentialsKey(organizationId)));
         }
         return this.json(res, 200, { enabled: (await store.kvGet(cliGitCredentialsKey(organizationId))) === 'enabled' });
+      }
+      // The project as a file tree (wiki features/project-files).
+      const projectFiles = p.match(/^\/api\/projects\/([^/]+)\/files(\/raw)?$/);
+      if (projectFiles && (method === 'GET' || method === 'HEAD')) {
+        const projectId = projectFiles[1]!;
+        const data = (await this.deps.tokens.check(session.apiToken, 'project:settings:read', { projectId })).ok;
+        const relative = url.searchParams.get('path') ?? '';
+        try {
+          if (!projectFiles[2]) {
+            res.setHeader('cache-control', 'private, no-cache');
+            return this.json(res, 200, await this.projectFiles().stat(projectId, relative, { data }));
+          }
+          return await this.projectFiles().open(projectId, relative, { data },
+            (file) => this.sendProjectFile(req, res, file, url.searchParams.has('download')));
+        } catch (error) {
+          if (res.headersSent) return void res.destroy();
+          const message = error instanceof Error ? error.message : String(error);
+          return this.json(res, error instanceof FileNotFoundError ? 404 : error instanceof FileAccessError ? 403
+            : /project not found/.test(message) ? 404 : 502, { error: message });
+        }
       }
       const projectWorkspace = p.match(/^\/api\/projects\/([^/]+)\/workspace$/);
       if (projectWorkspace && method === 'GET') {
@@ -10046,6 +10069,81 @@ export class Gateway {
   private workspaceService?: WorkspaceService;
   private workspaces(): WorkspaceService {
     return this.workspaceService ??= new WorkspaceService(this.deps.store, this.deps.resources, this.deps.handoffs);
+  }
+
+  private projectFilesService?: ProjectFiles;
+  private projectFiles(): ProjectFiles {
+    return this.projectFilesService ??= new ProjectFiles({ store: this.deps.store, workspaces: this.workspaces(), resources: this.deps.resources,
+      gitCredential: async (projectId, sshUrl) => {
+        const repositories = [...(await this.deps.store.listProjectRepositories(projectId)).map((linked) => linked.repository),
+          ...[(await this.deps.store.projectWiki(projectId))?.repository].filter((wiki): wiki is NonNullable<typeof wiki> => Boolean(wiki))];
+        const repository = repositories.find((candidate) => { try { return sameRepository(candidate.sshUrl, sshUrl); } catch { return false; } });
+        if (this.deps.githubApp && repository?.gitConnectionId) return this.deps.githubApp.brokerCredentials(repository);
+        // Hosted reads only through the organization's GitHub App; a self-host
+        // reads with the host's own Git setup, as its worlds are provisioned.
+        if (this.deps.hosted) throw new Error('Connect GitHub in organization settings, then try again.');
+        return {};
+      } });
+  }
+
+  /** `GET /api/projects/:id/files/raw`: one file's bytes, in a single byte
+   * range when asked (media seeking), with the content's version as ETag. */
+  private async sendProjectFile(req: http.IncomingMessage, res: http.ServerResponse, file: OpenedFile, download: boolean): Promise<void> {
+    const etag = file.node.version ? `"${file.node.version}"` : undefined;
+    if (etag && req.headers['if-none-match'] === etag) { file.stop(); file.done.catch(() => {}); res.writeHead(304, { etag }).end(); return; }
+    const name = path.posix.basename(file.node.path) || 'file';
+    const extension = path.extname(name).toLowerCase();
+    // Media the browser shows as itself; everything else is shown as text
+    // (the page decides how to render it) unless it is binary.
+    const media = extension === '.svg' ? 'image/svg+xml' : /^(?:image|video|audio)\/|^application\/pdf/.test(ARTIFACT_MIME[extension] ?? '') ? ARTIFACT_MIME[extension]! : undefined;
+    const range = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range ?? ''));
+    let start = 0, end = file.size - 1;
+    if (range && file.size > 0 && (range[1] || range[2])) {
+      start = range[1] ? Number(range[1]) : Math.max(0, file.size - Number(range[2]));
+      end = range[1] && range[2] ? Math.min(Number(range[2]), file.size - 1) : file.size - 1;
+      if (start > end || start >= file.size) {
+        file.stop(); file.done.catch(() => {});
+        res.writeHead(416, { 'content-range': `bytes */${file.size}` }).end();
+        return;
+      }
+    }
+    const partial = start !== 0 || end !== file.size - 1;
+    let headWritten = false;
+    const writeHead = (head: Buffer) => {
+      headWritten = true;
+      const type = media ?? (head.includes(0) ? 'application/octet-stream' : 'text/plain; charset=utf-8');
+      res.writeHead(partial ? 206 : 200, { ...artifactHeaders(type, name, download), 'cache-control': 'private, no-cache',
+        'accept-ranges': 'bytes', 'content-length': String(file.size ? end - start + 1 : 0),
+        ...(partial ? { 'content-range': `bytes ${start}-${end}/${file.size}` } : {}), ...(etag ? { etag } : {}) });
+      if (req.method === 'HEAD') { file.stop(); res.end(); }
+    };
+    let offset = 0;
+    // The response closing early (a client gone) stops the read; the request's
+    // own 'close' only means its body was read.
+    res.on('close', () => { if (!res.writableFinished) file.stop(); });
+    await new Promise<void>((resolve) => {
+      file.stream.on('data', (chunk: Buffer) => {
+        if (!headWritten) writeHead(chunk.subarray(0, 8192));
+        if (req.method === 'HEAD' || res.destroyed) return;
+        const from = Math.max(0, start - offset), to = Math.min(chunk.length, end + 1 - offset);
+        offset += chunk.length;
+        if (to > from && !res.write(chunk.subarray(from, to))) { file.stream.pause(); res.once('drain', () => file.stream.resume()); }
+        if (offset > end) file.stop();
+      });
+      file.stream.on('end', resolve);
+      file.stream.on('error', resolve);
+      file.stream.on('close', resolve);
+    });
+    try { await file.done; }
+    catch (error) {
+      // Stopped on purpose (a range served, a client gone) is not a failure.
+      if (offset <= end && !res.destroyed && !req.destroyed) {
+        if (!headWritten) return void this.json(res, 502, { error: error instanceof Error ? error.message : String(error) });
+        return void res.destroy();
+      }
+    }
+    if (!headWritten) writeHead(Buffer.alloc(0));
+    if (!res.writableEnded) res.end();
   }
 
   private publicUrl(req: http.IncomingMessage, browserUrl?: unknown): string {

@@ -554,8 +554,8 @@ function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
 /** Tabs that belong to the selected project (the router reads them from URLs,
  *  the rail highlights the project, the main pane shows its tab bar). One list
  *  so they never drift apart again. */
-const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'settings'];
-const PROJECT_TAB_COMMANDS = { tasks: 'nav.tasks', queue: 'nav.queue', wiki: 'nav.wiki', settings: 'nav.settings' };
+const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'files', 'wiki', 'settings'];
+const PROJECT_TAB_COMMANDS = { tasks: 'nav.tasks', queue: 'nav.queue', files: 'nav.files', wiki: 'nav.wiki', settings: 'nav.settings' };
 // The query a task list opens with: what needs the signed-in person.
 const DEFAULT_LIST_QUERY = 'for:me -is:archived';
 // Second-segment words that name an organization-level view rather than a project.
@@ -572,6 +572,8 @@ function decodeRoutePart(value, component = false) {
 
 function parseRoute(url) {
   let [pathname, search = ''] = String(url).split('?');
+  // A Files path keeps its own escaping: each segment is one encoded name.
+  const rawSegments = pathname.split('#')[0].split('/').filter(Boolean);
   try { pathname = decodeURI(pathname); } catch {}
   const query = new URLSearchParams(search);
   const q = query.has('q') ? query.get('q') : DEFAULT_LIST_QUERY;
@@ -608,10 +610,11 @@ function parseRoute(url) {
   const taskTab = taskKey ? taskTabOf(seg[4]) : null;
   const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
   const wikiView = tab === 'wiki' ? wikiViewFromQuery(query) : '';
+  const filesPath = tab === 'files' ? rawSegments.slice(3).map((part) => decodeRoutePart(part, true)).join('/') : null;
   // A Task store entry, opened to read before running or installing it.
   const storeKey = seg[2] === 'store' && seg[3] ? seg[3] : null;
   return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab, q, ...(taskFile ? { taskFile } : {}),
-    ...(wikiView ? { wikiView } : {}), ...(storeKey ? { storeKey } : {}) };
+    ...(wikiView ? { wikiView } : {}), ...(storeKey ? { storeKey } : {}), ...(filesPath !== null ? { filesPath } : {}) };
 }
 
 // Which branch the project wiki shows is part of the page, so it lives in the
@@ -628,6 +631,12 @@ function wikiRoute(pid, view = '', entry = '') {
   const query = kind === 'task' && value ? `?task=${encodeURIComponent(value)}`
     : kind === 'branch' && value ? `?branch=${encodeURIComponent(value)}` : '';
   return `${projectRoute(pid, 'wiki')}${query}${entry ? `#${encodeURIComponent(entry)}` : ''}`;
+}
+
+// A place in the project's Files: /<org>/<project>/files/<path>, each name escaped.
+function filesRoute(pid, filePath = '') {
+  const parts = String(filePath).split('/').filter(Boolean);
+  return `${projectRoute(pid, 'files')}${parts.length ? `/${parts.map(encodeURIComponent).join('/')}` : ''}`;
 }
 
 function fileRouteTarget(query) {
@@ -866,6 +875,8 @@ async function applyRoute() {
   if (!routeIsCurrent()) return;
   const tab = r.tab || 'tasks';
   S.wikiView = r.wikiView || '';
+  S.filesFrom = S.tab === 'files' ? S.filesPath : null;
+  S.filesPath = r.filesPath || '';
   if (!sameProject) {
     // Switching projects: drop the previous project's per-project view state so
     // its query/roving-cursor/search-result can't bleed into the new project
@@ -6689,12 +6700,15 @@ function renderMain() {
   // the async rehydrate). Navigation still repaints — it changes S.tab or
   // clears S.wikiEditing first.
   if ((S.tab === 'wiki' || S.tab === 'orgwiki') && S.wikiEditing && $('#wiki-path')) return;
+  // The Files page shown is already this place: a background refresh must not
+  // repaint (and re-highlight) an open file or lose its scroll.
+  if (S.tab === 'files' && filesPageShows(S.projectId, S.filesPath)) return;
   const proj = S.projects.find((p) => p.id === S.projectId);
   // Activity remains available by direct URL for debugging, but is deliberately
   // absent from user-facing navigation.
-  const tabs = ['tasks', 'queue', 'wiki', 'settings'];
+  const tabs = ['tasks', 'queue', 'files', 'wiki', 'settings'];
   // On a phone "Project settings" is "Settings": the top bar names the project.
-  const labels = { tasks: 'Tasks', queue: 'Queues', wiki: 'Wiki', settings: '<span class="tab-wide">Project settings</span><span class="tab-narrow">Settings</span>' };
+  const labels = { tasks: 'Tasks', queue: 'Queues', files: 'Files', wiki: 'Wiki', settings: '<span class="tab-wide">Project settings</span><span class="tab-narrow">Settings</span>' };
   const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
@@ -6710,6 +6724,7 @@ function renderMain() {
   else if (S.tab === 'organization') content = organizationView();
   else if (S.tab === 'installation') content = installationView();
   else if (S.tab === 'wiki') content = wikiView(proj);
+  else if (S.tab === 'files') content = filesView(proj);
   else if (S.tab === 'orgwiki') content = wikiView(null);
   else if (S.tab === 'profile') content = profileView();
   else if (S.tab === 'settings') content = settingsView(proj);
@@ -6726,6 +6741,7 @@ function renderMain() {
   if (isTaskListTab()) wireTasksView();
   if (S.tab === 'queue') wireQueueView();
   if (S.tab === 'wiki') wireWikiView(proj);
+  if (S.tab === 'files') wireFilesView(proj);
   if (S.tab === 'orgwiki') wireWikiView(null);
   if (S.tab === 'settings') wireSettingsView(proj);
   if (S.tab === 'global') wireGlobalSettings();
@@ -18751,6 +18767,420 @@ function confirmAvatar() {
   });
 }
 
+// ── Files (wiki features/project-files) ─────────────────────────────────────
+// The project as one tree, laid out as a task's world: a folder per repository
+// (the branch tasks start from), the project wiki, and data where it is
+// mounted. An address bar (breadcrumbs; click or `g l` to type a path), folder
+// listings, and a view for any text file — code coloured by highlight.js,
+// Markdown and CSV rendered — besides images, media and PDFs.
+const FILES_TEXT_MAX = 2 * 1024 * 1024;      // shown in the page; larger files download
+const FILES_HIGHLIGHT_MAX = 512 * 1024;      // coloured; larger text stays plain
+const FILES_TABLE_ROWS = 5000;
+const FILES_ICONS = {
+  directory: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>',
+  file: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z"/><path d="M14 3v6h6"/></svg>',
+  symlink: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z"/><path d="M9 16v-2a3 3 0 0 1 3-3h3"/><path d="m13 9 2 2-2 2"/></svg>',
+  submodule: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M3 12h6m6 0h6"/></svg>',
+  repository: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 19.5V5a2 2 0 0 1 2-2h12v15H7a2 2 0 0 0-2 2 2 2 0 0 0 2 2h12"/><path d="M9 7h6"/></svg>',
+  data: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="8" ry="2.5"/><path d="M4 5.5v13c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5v-13"/><path d="M4 12c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5"/></svg>',
+  up: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>',
+  open: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>',
+  download: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>',
+};
+const FILES_IMAGE = /\.(?:png|jpe?g|gif|webp|avif|svg)$/i;
+const FILES_VIDEO = /\.(?:mp4|webm|mov|m4v)$/i;
+const FILES_AUDIO = /\.(?:mp3|m4a|wav|ogg|oga|opus|flac)$/i;
+
+function filesParts(filePath) { return String(filePath || '').split('/').filter(Boolean); }
+function filesJoin(...parts) { return parts.flatMap(filesParts).join('/'); }
+function filesParent(filePath) { return filesParts(filePath).slice(0, -1).join('/'); }
+function filesApi(pid, filePath, raw = false, download = false) {
+  return `/api/projects/${encodeURIComponent(pid)}/files${raw ? '/raw' : ''}?path=${encodeURIComponent(filePath)}${download ? '&download=1' : ''}`;
+}
+// Resolve `target` (a symlink's or a Markdown link's) against `dir`: null when it leaves the project.
+function filesResolve(dir, target) {
+  const out = String(target || '').startsWith('/') ? [] : filesParts(dir);
+  for (const part of String(target || '').split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') { if (!out.length) return null; out.pop(); } else out.push(part);
+  }
+  return out.join('/');
+}
+
+function filesState() { return (S.files ||= { cache: new Map() }); }
+function filesPageShows(pid, filePath) {
+  const page = $('#files-page');
+  return !!page && page.dataset.project === pid && page.dataset.path === (filePath || '');
+}
+
+function filesView(proj) {
+  if (!proj) return '<div class="empty">No project.</div>';
+  const filePath = S.filesPath || '';
+  const parts = filesParts(filePath);
+  return `<div class="files-page" id="files-page" data-project="${esc(proj.id)}" data-path="${esc(filePath)}">
+    <div class="files-bar">
+      <a class="btn sm icon files-up${parts.length ? '' : ' disabled'}" data-spa href="${esc(filesRoute(proj.id, filesParent(filePath)))}" aria-label="Up a folder" title="Up a folder (Backspace)"${parts.length ? '' : ' aria-disabled="true" tabindex="-1"'}>${FILES_ICONS.up}</a>
+      <div class="files-address" id="files-address" title="Click to type a path (g l)">${filesCrumbsHtml(proj, parts)}</div>
+      <span class="files-source" id="files-source"></span>
+    </div>
+    <div class="files-body" id="files-body"><div class="files-status" role="status" aria-busy="true">Loading…</div></div>
+  </div>`;
+}
+
+function filesCrumbsHtml(proj, parts) {
+  const crumbs = [`<a class="files-crumb files-crumb-root" data-spa href="${esc(filesRoute(proj.id))}">${esc(projectSlug(proj))}</a>`];
+  parts.forEach((part, i) => crumbs.push(`<span class="files-sep" aria-hidden="true">/</span><a class="files-crumb" data-spa href="${esc(filesRoute(proj.id, parts.slice(0, i + 1).join('/')))}"${i === parts.length - 1 ? ' aria-current="page"' : ''}>${esc(part)}</a>`));
+  return `<nav class="files-crumbs" aria-label="Path">${crumbs.join('')}</nav>`;
+}
+
+// The address bar becomes a text field: Enter goes there, Esc (or leaving it) puts the breadcrumbs back.
+function editFilesAddress() {
+  const bar = $('#files-address');
+  const page = $('#files-page');
+  if (!bar || !page || bar.querySelector('input')) return bar?.querySelector('input')?.focus();
+  const pid = page.dataset.project;
+  const current = page.dataset.path || '';
+  const crumbs = bar.innerHTML;
+  bar.classList.add('editing');
+  bar.innerHTML = `<input id="files-path-input" class="files-path-input" spellcheck="false" autocomplete="off" aria-label="Path" list="files-path-options" value="${esc(current ? `${current}` : '')}" placeholder="repository/folder/file"><datalist id="files-path-options"></datalist>`;
+  const input = bar.querySelector('input');
+  const options = bar.querySelector('datalist');
+  let restored = false, timer = 0, asked = '';
+  const restore = () => { if (restored) return; restored = true; bar.classList.remove('editing'); bar.innerHTML = crumbs; };
+  // Suggest what the folder being typed holds.
+  const suggest = async () => {
+    const value = input.value.replace(/^\/+/, '');
+    const dir = value.includes('/') ? value.slice(0, value.lastIndexOf('/')) : '';
+    if (dir === asked) return;
+    asked = dir;
+    const node = await filesLoad(pid, dir).catch(() => null);
+    if (restored || asked !== dir || node?.kind !== 'directory') return;
+    options.innerHTML = (node.entries || []).slice(0, 200).map((entry) =>
+      `<option value="${esc(filesJoin(dir, entry.name))}${entry.kind === 'directory' ? '/' : ''}"></option>`).join('');
+  };
+  input.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(suggest, 120); });
+  input.addEventListener('keydown', (event) => {
+    event.stopPropagation();
+    if (event.key === 'Escape') { event.preventDefault(); restore(); bar.focus?.(); }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      const target = filesResolve('', input.value.trim());
+      restored = true;
+      go(filesRoute(pid, target ?? ''));
+    }
+  });
+  input.addEventListener('blur', () => setTimeout(restore, 150));
+  input.focus();
+  input.select();
+  suggest();
+}
+
+// A place's node, from this tab's cache when fresh enough (and then refreshed
+// behind it), else from the server. Directories and file facts only: bytes
+// come from `/raw`.
+async function filesLoad(pid, filePath, { fresh = false } = {}) {
+  const state = filesState();
+  const key = `${pid}\n${filePath}`;
+  const cached = state.cache.get(key);
+  if (!fresh && cached && Date.now() - cached.at < 30_000) return cached.node;
+  const node = await api(filesApi(pid, filePath));
+  if (state.cache.size >= 300) state.cache.delete(state.cache.keys().next().value);
+  state.cache.set(key, { node, at: Date.now() });
+  return node;
+}
+
+// Backspace goes up a folder wherever the focus is on the Files page (not in a field or dialog).
+function installFilesKeys() {
+  if (installFilesKeys.done) return;
+  installFilesKeys.done = true;
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Backspace' || event.metaKey || event.ctrlKey || event.altKey || event.defaultPrevented) return;
+    const page = $('#files-page');
+    if (S.tab !== 'files' || !page || !page.dataset.path) return;
+    if (event.target.closest?.('input, textarea, select, [contenteditable], dialog, .modal-overlay')) return;
+    event.preventDefault();
+    go(filesRoute(page.dataset.project, filesParent(page.dataset.path)));
+  });
+}
+
+async function wireFilesView(proj) {
+  if (!proj) return;
+  const pid = proj.id;
+  const filePath = S.filesPath || '';
+  const bar = $('#files-address');
+  // A long path keeps its last names in view.
+  if (bar) bar.scrollLeft = bar.scrollWidth;
+  bar?.addEventListener('click', (event) => { if (!event.target.closest('a, input')) editFilesAddress(); });
+  installFilesKeys();
+  const shows = () => filesPageShows(pid, filePath) && S.tab === 'files';
+  let node;
+  try { node = await filesLoad(pid, filePath); }
+  catch (error) {
+    if (!shows()) return;
+    $('#files-body').innerHTML = `<div class="files-status error" role="alert"><span>${esc(plainError(error.message))}</span>
+      <button class="btn sm" id="files-retry">Try again</button></div>`;
+    $('#files-retry')?.addEventListener('click', () => { filesState().cache.clear(); $('#files-page').dataset.path = '\u0000'; renderMain(); });
+    return;
+  }
+  if (!shows()) return;
+  paintFilesNode(proj, node);
+}
+
+function filesSourceHtml(source) {
+  if (!source || source.kind === 'project') return '';
+  if (source.kind === 'repository') return `<span class="files-chip" title="${esc(source.role === 'project-wiki' ? 'Project wiki' : 'Branch new tasks start from')} · ${esc(source.commit)}">${source.role === 'project-wiki' ? FILES_ICONS.repository : FILES_ICONS.repository}<span>${esc(source.branch)}</span><code>${esc(String(source.commit).slice(0, 7))}</code></span>`;
+  return `<span class="files-chip data" title="Data resource ${esc(source.name)}: its current version${source.access === 'read' ? ' (read-only in tasks)' : ''}">${FILES_ICONS.data}<span>${esc(source.name)}</span></span>`;
+}
+
+function paintFilesNode(proj, node) {
+  const body = $('#files-body');
+  $('#files-source').innerHTML = filesSourceHtml(node.source);
+  if (node.kind === 'directory') return paintFilesDirectory(proj, node, body);
+  if (node.kind === 'symlink') {
+    const target = filesResolve(filesParent(node.path), node.target);
+    body.innerHTML = `<div class="files-status">${FILES_ICONS.symlink}<span>Link to <code>${esc(node.target)}</code></span>
+      ${target !== null ? `<a class="btn sm" data-spa href="${esc(filesRoute(proj.id, target))}">Open</a>` : ''}</div>`;
+    return;
+  }
+  if (node.kind === 'submodule') {
+    body.innerHTML = `<div class="files-status">${FILES_ICONS.submodule}<span>Submodule at <code>${esc(String(node.target || '').slice(0, 12))}</code></span></div>`;
+    return;
+  }
+  paintFilesFile(proj, node, body);
+}
+
+function paintFilesDirectory(proj, node, body) {
+  const entries = node.entries || [];
+  if (!entries.length) { body.innerHTML = `<div class="files-status muted">${node.path ? 'Empty folder' : 'This project has no repositories or data yet.'}</div>`; return; }
+  const icon = (entry) => entry.mount === 'data' ? FILES_ICONS.data : entry.mount ? FILES_ICONS.repository : FILES_ICONS[entry.kind] || FILES_ICONS.file;
+  const badge = (entry) => entry.mount === 'data' ? '<span class="files-badge" title="Data resource mounted here">data</span>'
+    : entry.mount === 'wiki' ? '<span class="files-badge" title="The project wiki">wiki</span>' : '';
+  body.innerHTML = `<ul class="files-list" role="list">${entries.map((entry) => `<li class="files-row kind-${esc(entry.kind)}${entry.mount ? ` mount-${esc(entry.mount)}` : ''}">
+      <a class="files-link" data-spa href="${esc(filesRoute(proj.id, filesJoin(node.path, entry.name)))}"><span class="files-icon">${icon(entry)}</span><span class="files-name">${esc(entry.name)}</span>${badge(entry)}</a>
+      <span class="files-size">${entry.size !== undefined && entry.kind !== 'directory' ? esc(formatBytes(entry.size)) : ''}</span></li>`).join('')}</ul>`;
+  const links = [...body.querySelectorAll('.files-link')];
+  body.querySelector('.files-list').addEventListener('keydown', (event) => {
+    const at = links.indexOf(document.activeElement);
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    event.preventDefault();
+    links[Math.max(0, Math.min(links.length - 1, at < 0 ? 0 : at + (event.key === 'ArrowDown' ? 1 : -1)))]?.focus();
+  });
+  // Arriving from a subfolder: focus where you came from, so ↑/↓ carry on from there.
+  const from = S.filesFrom && filesParent(S.filesFrom) === node.path ? S.filesFrom.split('/').pop() : null;
+  const back = from ? links.find((link) => link.querySelector('.files-name')?.textContent === from) : null;
+  if (back) back.focus({ preventScroll: false });
+}
+
+// Which highlight.js language a file may be, from its name; null = plain text.
+// The caller checks it against the loaded library (hljs.getLanguage).
+function filesLanguage(name) {
+  const lower = String(name).toLowerCase();
+  const special = { makefile: 'makefile', dockerfile: 'bash', 'cmakelists.txt': 'cmake', gemfile: 'ruby', rakefile: 'ruby', '.bashrc': 'bash', '.zshrc': 'bash', '.env': 'bash' };
+  if (special[lower]) return special[lower];
+  if (lower.startsWith('.env.')) return 'bash';
+  const ext = lower.includes('.') ? lower.split('.').pop() : '';
+  const aliases = { mjs: 'javascript', cjs: 'javascript', jsx: 'javascript', mts: 'typescript', cts: 'typescript', tsx: 'typescript', vue: 'xml', svelte: 'xml',
+    htm: 'xml', svg: 'xml', toml: 'ini', cfg: 'ini', conf: 'ini', jsonl: 'json', ndjson: 'json', ipynb: 'json', webmanifest: 'json', tf: 'ini', zsh: 'bash', ps1: 'powershell', txt: null, log: null, csv: null, tsv: null };
+  if (ext in aliases) return aliases[ext];
+  return ext && /^[a-z0-9+#-]{1,12}$/.test(ext) ? ext : null;
+}
+
+function loadHighlighter() {
+  if (globalThis.hljs) return Promise.resolve(globalThis.hljs);
+  return (loadHighlighter.pending ||= new Promise((resolve) => {
+    const script = document.createElement('script');
+    script.src = '/vendor/highlight.min.js';
+    script.onload = () => resolve(globalThis.hljs || null);
+    script.onerror = () => { loadHighlighter.pending = null; resolve(null); };
+    document.head.appendChild(script);
+  }));
+}
+
+// highlight.js's HTML split into lines, each closing and reopening the spans
+// that cross it, so every line is a well-formed element of its own.
+function splitHighlightedLines(html) {
+  const lines = [];
+  const open = [];
+  let line = '';
+  const tag = /<span[^>]*>|<\/span>|\n|[^<\n]+|</g;
+  let match;
+  while ((match = tag.exec(html))) {
+    const token = match[0];
+    if (token === '\n') { lines.push(line + '</span>'.repeat(open.length)); line = open.join(''); }
+    else if (token.startsWith('<span')) { open.push(token); line += token; }
+    else if (token === '</span>') { open.pop(); line += token; }
+    else line += token;
+  }
+  lines.push(line + '</span>'.repeat(open.length));
+  return lines;
+}
+
+function filesLinesHtml(lines) {
+  return `<div class="files-code" role="table" aria-label="File contents">${lines.map((line, i) =>
+    `<div class="files-line" id="L${i + 1}" role="row"><a class="files-ln" href="#L${i + 1}" data-line="${i + 1}" aria-label="Line ${i + 1}" tabindex="-1"></a><span class="files-lc" role="cell">${line || ' '}</span></div>`).join('')}</div>`;
+}
+
+// RFC 4180 rows (quotes, doubled quotes, newlines inside quotes), at most `limit`.
+function parseDelimited(text, delimiter, limit) {
+  const rows = [];
+  let row = [], field = '', quoted = false;
+  for (let i = 0; i < text.length && rows.length < limit; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else quoted = false; } else field += c;
+    } else if (c === '"' && field === '') quoted = true;
+    else if (c === delimiter) { row.push(field); field = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); rows.push(row); row = []; field = '';
+    } else field += c;
+  }
+  if ((field || row.length) && rows.length < limit) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+async function paintFilesFile(proj, node, body) {
+  const name = node.path.split('/').pop() || 'file';
+  const raw = filesApi(proj.id, node.path, true);
+  const download = filesApi(proj.id, node.path, true, true);
+  const head = (meta = '', tools = '') => `<div class="files-file-head"><span class="files-file-name">${esc(name)}</span><span class="files-file-meta">${meta}</span><span class="files-spacer"></span>${tools}
+    <a class="btn sm icon" href="${esc(raw)}" target="_blank" rel="noopener" title="Open raw file in a new tab" aria-label="Open raw">${FILES_ICONS.open}</a>
+    <a class="btn sm icon" href="${esc(download)}" download="${esc(name)}" title="Download" aria-label="Download">${FILES_ICONS.download}</a></div>`;
+  const size = formatBytes(node.size ?? 0);
+  const shows = () => filesPageShows(proj.id, node.path);
+  if (FILES_IMAGE.test(name)) {
+    body.innerHTML = `<div class="files-file">${head(esc(size))}<div class="files-media files-image"><img src="${esc(raw)}" alt="${esc(name)}"></div></div>`;
+    return;
+  }
+  if (FILES_VIDEO.test(name) || FILES_AUDIO.test(name)) {
+    const tag = FILES_VIDEO.test(name) ? 'video' : 'audio';
+    body.innerHTML = `<div class="files-file">${head(esc(size))}<div class="files-media"><${tag} controls preload="metadata" src="${esc(raw)}"></${tag}></div></div>`;
+    return;
+  }
+  const tooLarge = (node.size ?? 0) > (/\.pdf$/i.test(name) ? 50 * 1024 * 1024 : FILES_TEXT_MAX);
+  if (tooLarge) {
+    body.innerHTML = `<div class="files-file">${head(esc(size))}<div class="files-status muted">Too large to show here. <a href="${esc(download)}" download="${esc(name)}">Download</a></div></div>`;
+    return;
+  }
+  body.innerHTML = `<div class="files-file">${head(esc(size))}<div class="files-status" role="status" aria-busy="true">Loading…</div></div>`;
+  let response;
+  try {
+    response = await feedbackFetch(raw, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} });
+    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || `HTTP ${response.status}`);
+  } catch (error) {
+    if (!shows()) return;
+    body.querySelector('.files-status').outerHTML = `<div class="files-status error" role="alert">${esc(plainError(error.message))}</div>`;
+    return;
+  }
+  if (/\.pdf$/i.test(name)) {
+    const blob = await response.blob();
+    if (!shows()) return;
+    const frame = document.createElement('iframe');
+    frame.className = 'files-pdf';
+    frame.title = name;
+    frame.src = URL.createObjectURL(new Blob([blob], { type: 'application/pdf' }));
+    body.querySelector('.files-status').replaceWith(frame);
+    return;
+  }
+  const binary = /octet-stream/.test(response.headers.get('content-type') || '');
+  if (binary) {
+    response.body?.cancel().catch(() => {});
+    if (!shows()) return;
+    body.querySelector('.files-status').outerHTML = `<div class="files-status muted">Binary file. <a href="${esc(download)}" download="${esc(name)}">Download</a></div>`;
+    return;
+  }
+  const text = await response.text();
+  const guess = filesLanguage(name);
+  const kind = /\.(?:md|markdown|mdx)$/i.test(name) ? 'markdown' : /\.(?:csv|tsv)$/i.test(name) ? 'table' : 'code';
+  // Colouring needs the library: wait for it only when this file wants it.
+  const hljs = guess && text.length <= FILES_HIGHLIGHT_MAX ? await loadHighlighter() : null;
+  const language = hljs?.getLanguage(guess) ? guess : null;
+  if (!shows()) return;
+  const lines = text.endsWith('\n') ? text.slice(0, -1).split('\n') : text.split('\n');
+  const meta = `${lines.length.toLocaleString()} line${lines.length === 1 ? '' : 's'} · ${esc(size)}`;
+  const modes = kind === 'code' ? '' : `<div class="segmented sm files-modes" role="group" aria-label="View">
+      <button type="button" data-mode="rendered" aria-pressed="true">${kind === 'markdown' ? 'Preview' : 'Table'}</button><button type="button" data-mode="code" aria-pressed="false">Code</button></div>`;
+  const copy = `<button class="btn sm icon files-copy" type="button" title="Copy contents" aria-label="Copy contents">${ICON.copy}</button>`;
+  body.innerHTML = `<div class="files-file">${head(meta, `${modes}${kind === 'markdown' ? texToggleHtml() : ''}${copy}`)}<div class="files-content" id="files-content"></div></div>`;
+  const content = body.querySelector('#files-content');
+  let codeHtml = null;
+  const code = () => {
+    if (codeHtml === null) {
+      let html;
+      try { html = hljs && language ? hljs.highlight(lines.join('\n'), { language, ignoreIllegals: true }).value : null; } catch { html = null; }
+      codeHtml = filesLinesHtml(html ? splitHighlightedLines(html) : lines.map((line) => esc(line)));
+    }
+    content.className = 'files-content files-source-view';
+    content.innerHTML = codeHtml;
+    wireFilesLines(content);
+  };
+  const rendered = () => {
+    content.className = 'files-content files-rendered';
+    if (kind === 'markdown') {
+      content.classList.add('msg-text', 'md');
+      mountMarkdownSurface(content, (math) => renderMarkdown(text, { math }), (el) => {
+        // Relative links go to their file in this tree.
+        el.querySelectorAll('a[data-md-local]').forEach((link) => {
+          // A Markdown link may carry a fragment or query; a typed path never does.
+          let local = link.dataset.mdLocal.split(/[?#]/)[0];
+          try { local = decodeURIComponent(local); } catch { /* as written */ }
+          const target = filesResolve(filesParent(node.path), local);
+          if (target === null) return;
+          link.href = filesRoute(proj.id, target);
+          link.setAttribute('data-spa', '');
+        });
+      });
+      wireTexToggles(body);
+    } else {
+      const rows = parseDelimited(text, /\.tsv$/i.test(name) ? '\t' : ',', FILES_TABLE_ROWS + 1);
+      const [header = [], ...rest] = rows;
+      content.innerHTML = `<div class="files-table-wrap"><table class="files-table"><thead><tr>${header.map((cell) => `<th>${esc(cell)}</th>`).join('')}</tr></thead>
+        <tbody>${rest.slice(0, FILES_TABLE_ROWS).map((row) => `<tr>${row.map((cell) => `<td>${esc(cell)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
+        ${rest.length > FILES_TABLE_ROWS ? `<div class="files-status muted">First ${FILES_TABLE_ROWS.toLocaleString()} rows. Switch to Code for the rest.</div>` : ''}`;
+    }
+  };
+  // A line link (#L12) opens the code, even of a Markdown file.
+  const wantsLine = /^#L\d+/.test(location.hash);
+  if (kind === 'code' || wantsLine) code(); else rendered();
+  body.querySelectorAll('.files-modes [data-mode]').forEach((button) => {
+    button.setAttribute('aria-pressed', String((button.dataset.mode === 'code') === (kind === 'code' || wantsLine)));
+    button.addEventListener('click', () => {
+      body.querySelectorAll('.files-modes [data-mode]').forEach((other) => other.setAttribute('aria-pressed', String(other === button)));
+      if (button.dataset.mode === 'code') code(); else rendered();
+    });
+  });
+  body.querySelector('.files-copy')?.addEventListener('click', (event) => copyToClipboard(text).then(() => {
+    const button = event.currentTarget || body.querySelector('.files-copy');
+    toast('Copied');
+    button?.blur();
+  }));
+}
+
+// Line numbers link to the line (#L12); shift-click a second one for a range.
+function wireFilesLines(content) {
+  const mark = () => {
+    content.querySelectorAll('.files-line.selected').forEach((line) => line.classList.remove('selected'));
+    const match = /^#L(\d+)(?:-L(\d+))?$/.exec(location.hash);
+    if (!match) return null;
+    const from = Number(match[1]), to = Number(match[2] || match[1]);
+    for (let n = Math.min(from, to); n <= Math.max(from, to); n++) content.querySelector(`#L${n}`)?.classList.add('selected');
+    return content.querySelector(`#L${Math.min(from, to)}`);
+  };
+  const first = mark();
+  if (first) first.scrollIntoView({ block: 'center' });
+  content.addEventListener('click', (event) => {
+    const link = event.target.closest('.files-ln');
+    if (!link) return;
+    event.preventDefault();
+    const line = Number(link.dataset.line);
+    const anchor = /^#L(\d+)/.exec(location.hash)?.[1];
+    const hash = event.shiftKey && anchor && Number(anchor) !== line
+      ? `#L${Math.min(Number(anchor), line)}-L${Math.max(Number(anchor), line)}` : `#L${line}`;
+    history.replaceState(history.state, '', `${location.pathname}${location.search}${hash}`);
+    mark();
+  });
+}
+
 function wikiScopeInfo(proj) {
   if (proj) return { scope: 'project', id: proj.id, title: proj.name, base: `/api/projects/${encodeURIComponent(proj.id)}/wiki`,
     view: S.wikiView || '' };
@@ -26629,7 +27059,9 @@ const HOST_COMMANDS = [
   { id: 'nav.queue', title: 'Go to queues', key: 'g q', ...navCommand(() => tabRoute('queue')) },
   { id: 'nav.insights', title: 'Go to insights', key: 'g I', ...navCommand(() => tabRoute('insights')) },
   { id: 'nav.settings', title: 'Go to project settings', key: 'g s', ...navCommand(() => tabRoute('settings')) },
+  { id: 'nav.files', title: 'Go to project files', key: 'g f', ...navCommand(() => tabRoute('files')) },
   { id: 'nav.wiki', title: 'Go to project wiki', key: 'g w', ...navCommand(() => tabRoute('wiki')) },
+  { id: 'files.address', title: 'Type a path', key: 'g l', group: 'Files', available: () => S.tab === 'files' && !!$('#files-address'), run: () => editFilesAddress() },
   { id: 'nav.orgwiki', title: 'Go to organization wiki', key: 'g W', ...navCommand(() => globalRoute('orgwiki')) },
   { id: 'nav.global', title: 'Go to organization settings', key: 'g S', ...navCommand(() => tabRoute('global')) },
   { id: 'nav.projects', title: 'Go to projects', key: 'g P', run: () => focusRail() },
@@ -27240,6 +27672,7 @@ function openHelp() {
       + row('t', 'Terminal / conversation')
       + row('u', 'Back to the list')],
     ['Projects', rows(group('Projects'))],
+    ['Files', rows(group('Files')) + row('↑ / ↓', 'Move in a folder') + row('Backspace', 'Up a folder')],
     ['Settings', row('{ / }', 'Previous / next section')],
   ];
   root.innerHTML = `<div class="palette-scrim" id="help-scrim"><div class="palette help-panel" role="dialog" aria-label="Keyboard shortcuts">
