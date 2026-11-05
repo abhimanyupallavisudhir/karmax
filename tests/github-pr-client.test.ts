@@ -272,6 +272,58 @@ describe('GitHub PR client', () => {
     expect(failure.status).toBe(500);
     expect(failure.message.length).toBeLessThan(350);
   });
+
+  it('says what GitHub said, not the JSON it said it in', async () => {
+    const { api } = github(
+      on('GET', '/repos/acme/app/pulls/1', () => json(422, { message: 'Validation Failed',
+        errors: [{ resource: 'PullRequest', code: 'custom', message: 'No commits between main and karmax/t' }],
+        documentation_url: 'https://docs.github.com/rest' })),
+      on('GET', '/repos/acme/app/pulls/2', () => new Response('<html>Bad gateway</html>', { status: 502 })),
+    );
+    expect((await api.get(SLUG, 1).catch((error) => error)).message)
+      .toBe('GitHub API 422: Validation Failed: No commits between main and karmax/t');
+    expect((await api.get(SLUG, 2).catch((error) => error)).message).toBe('GitHub API 502: <html>Bad gateway</html>');
+  });
+});
+
+describe('Comparing branches GitHub cannot diff (pramana#149)', () => {
+  // GitHub's REST compare also builds the diff, and refuses when that takes too
+  // long (a data release of thousands of files). Only the commit counts matter.
+  const tooLong = () => json(422, { message: 'Server Error: Sorry, this diff is taking too long to generate.',
+    errors: [{ resource: 'Comparison', field: 'diff', code: 'not_available' }], status: '422' });
+  const counts = (ref: unknown) => on('POST', '/graphql', () => json(200, { data: { repository: { ref } } }));
+
+  it('counts commits with GraphQL, which builds no diff', async () => {
+    const { api, calls } = github(on('GET', /\/compare\//, tooLong),
+      counts({ target: { oid: 'b'.repeat(40) }, compare: { aheadBy: 3, behindBy: 1 } }));
+    expect(await api.compare(SLUG, 'karmax/task_parent', 'h'.repeat(40)))
+      .toEqual({ aheadBy: 3, behindBy: 1, baseSha: 'b'.repeat(40) });
+    expect(calls.at(-1)?.body.variables).toEqual({ owner: 'acme', name: 'app', base: 'karmax/task_parent', head: 'h'.repeat(40) });
+  });
+
+  it('does the same when a merged PR\'s branch is checked for new commits', async () => {
+    const { api } = github(
+      on('GET', /\/pulls\?state=all/, () => json(200, [pr(1, { state: 'closed', merged: true })])),
+      on('GET', /\/compare\//, tooLong), counts({ target: { oid: 'b'.repeat(40) }, compare: { aheadBy: 0, behindBy: 4 } }));
+    expect(await api.openOrUpdate(SLUG, { head: 'karmax/t', base: 'main', title: 'T', body: 'B' }))
+      .toMatchObject({ created: false, pr: { number: 1, merged: true } });
+  });
+
+  it('says plainly that GitHub could not compare when GraphQL cannot either, so landing retries', async () => {
+    const { api } = github(on('GET', /\/compare\//, tooLong), counts(null));
+    const failure = await api.compare(SLUG, 'c'.repeat(40), 'h'.repeat(40)).catch((error) => error);
+    expect(failure).not.toBeInstanceOf(GithubApiError);
+    expect(failure.message).toBe(`GitHub could not compare ${'h'.repeat(40)} with ${'c'.repeat(40)}: `
+      + 'Server Error: Sorry, this diff is taking too long to generate.');
+  });
+
+  it('leaves every other refusal as it was', async () => {
+    const { api, calls } = github(on('GET', /\/compare\//, () => json(404, { message: 'Not Found' })));
+    const failure = await api.compare(SLUG, 'main', 'gone').catch((error) => error);
+    expect(failure).toBeInstanceOf(GithubApiError);
+    expect(failure.status).toBe(404);
+    expect(calls.some((call) => call.path === '/graphql')).toBe(false);
+  });
 });
 
 describe('GitHub webhook correlation', () => {

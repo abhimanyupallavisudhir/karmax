@@ -6,6 +6,12 @@ import { makeWorker, workflowCacheSize, WorkerHandle, WorkerStatus } from './wor
 import { buildVersionedBundle, ExternalWorkflowRef } from '../packages/bundle.js';
 import { governorConfig, governWorkflowCache, type GovernorState } from './heap-governor.js';
 
+/** How long a stopping worker lets running activities finish before it
+ * abandons the ones that do not heartbeat (`WorkerHandle.abandonActivities`).
+ * Inside the stop budget (3 s in the worker process, 3.5 s from the gateway),
+ * leaving time to report them before the process exits. */
+export const ABANDON_ACTIVITIES_AFTER_MS = 1_500;
+
 /** Let the supervisor restart the service instead of serving without a poller. */
 export function terminateOnWorkerFailure(error: unknown): void {
   console.error('  ! Activity worker failed:', error);
@@ -34,7 +40,8 @@ export class WorkerManager {
   private refreshing?: Promise<void>;
   private starting?: Promise<void>;
   private stopping?: Promise<void>;
-  private draining = new Set<Promise<void>>();
+  /** Workers rolled out by `refresh`, still finishing their activities. */
+  private draining = new Map<WorkerHandle, Promise<void>>();
   private stopRequested = false;
   private readonly governor = governorConfig(process.env, workflowCacheSize());
   private cache: GovernorState = { limit: this.governor.configured, highStreak: 0, lastChangeAt: 0 };
@@ -114,9 +121,9 @@ export class WorkerManager {
       this.runPromise = nextRun;
       this.externals = externals;
       old?.shutdown(); // graceful drain: stop polling, let in-flight finish
-      if (oldRun) {
-        this.draining.add(oldRun);
-        void oldRun.finally(() => this.draining.delete(oldRun));
+      if (old && oldRun) {
+        this.draining.set(old, oldRun);
+        void oldRun.finally(() => this.draining.delete(old));
       }
     };
     this.refreshing = (this.refreshing ?? Promise.resolve()).then(run, run);
@@ -165,8 +172,16 @@ export class WorkerManager {
       await this.starting?.catch(() => {});
       await this.refreshing?.catch(() => {});
       this.handle?.shutdown();
-      await this.runPromise?.catch(() => {});
-      await Promise.allSettled(this.draining);
+      // This process is about to exit, and what it still runs dies with it.
+      // Reported as failed, Temporal retries it on the next worker at once
+      // instead of after its start-to-close (5 minutes for most activities).
+      const abandon = setTimeout(() => {
+        for (const handle of [this.handle, ...this.draining.keys()]) handle?.abandonActivities();
+      }, ABANDON_ACTIVITIES_AFTER_MS);
+      try {
+        await this.runPromise?.catch(() => {});
+        await Promise.allSettled(this.draining.values());
+      } finally { clearTimeout(abandon); }
     })();
     await this.stopping;
   }

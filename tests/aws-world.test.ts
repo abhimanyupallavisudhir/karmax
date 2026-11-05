@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,7 +8,8 @@ import { VmWorldProvider } from '../src/world/vm/provider.js';
 import { diskHours, runSlices } from '../src/world/vm/runs.js';
 import { vmProvisionVersion } from '../src/world/vm/provision.js';
 import type { ResolvedWorldProviderConnection } from '../src/world/connections.js';
-import type { WorldHandle } from '../src/world/types.js';
+import { WorldNotRunningError, type WorldHandle } from '../src/world/types.js';
+import { WorldRegistry } from '../src/world/registry.js';
 import { FakeAws } from './helpers/fake-aws.js';
 import { sshdAvailable } from './helpers/local-sshd.js';
 
@@ -131,6 +132,18 @@ describe.skipIf(!sshdAvailable)('AWS worlds (fake EC2, real sshd)', () => {
     expect(await driver.limits(connection(aws.key))).toMatchObject({ cpu: 192, memoryMb: 1_572_864, diskGb: 16_384 });
   });
 
+  // Every instance of karmax's families counts against the account's running
+  // On-Demand Standard vCPU quota: the budget "Any" and managed compute admit by.
+  it('reads the account’s vCPU quota as its budget, when the key may read Service Quotas', async () => {
+    aws.vcpuLimit = 64;
+    expect((await driver.limits(connection(aws.key))).pool).toBeUndefined();
+    aws.quotasReadable = true;
+    expect((await driver.limits(connection(aws.key))).pool).toEqual({ cpu: 64 });
+    // Its gp3 storage quota is the account's disk, in GiB.
+    aws.gp3StorageTiB = 50;
+    expect((await driver.limits(connection(aws.key))).pool).toEqual({ cpu: 64, diskGb: 51_200 });
+  });
+
   it('creates a world: a gp3 home volume, an instance in the default VPC behind karmax’s security group, IMDSv2, no public key', async () => {
     const world = await provider.create({ taskId: 'task_aws', base: 'main', generation: 1, organizationId: 'org_a', resources: { diskGb: 100 } });
     const home = [...aws.volumes.values()].find((volume) => volume.tags.karmaxRole === 'home')!;
@@ -170,6 +183,43 @@ describe.skipIf(!sshdAvailable)('AWS worlds (fake EC2, real sshd)', () => {
     expect(await woken.readFile('cache/kept.txt')).toBe('kept');
     // The run before the wake stays countable.
     expect(instance!.tags.karmaxLastRun).toMatch(/^\d+-\d+$/);
+  });
+
+  it('tells a restarted process that a parked world is parked, so nothing wakes it to park it again', async () => {
+    // Production, 2026-11-03: after a deploy the waiting workflows' park step
+    // asked a fresh process for each world's status, was told 'ready', and
+    // booted every parked VM world (on Hetzner a new, billed server) to park it.
+    const parked = await provider.create({ taskId: 'task_restart', base: 'main', generation: 1, organizationId: 'org_a' });
+    const running = await provider.create({ taskId: 'task_running', base: 'main', generation: 1, organizationId: 'org_a' });
+    await provider.park(parked.handle as WorldHandle);
+    const instance = [...aws.instances.values()].find((value) => value.tags.karmaxTaskId === 'task_restart')!;
+    await waitFor(() => instance.state === 'stopped');
+    const restarted = new VmWorldProvider(driver, async () => connection(aws.key), undefined, {
+      socket: aws.socket, user: os.userInfo().username, home: aws.home,
+      provision: { stamp, script: `echo provisioned > ${stamp}`, sudo: false } });
+    expect(await restarted.status(parked.handle as WorldHandle)).toBe('parked');
+    expect(await restarted.status(running.handle as WorldHandle)).toBe('ready');
+    expect(instance).toMatchObject({ state: 'stopped', launches: 1 });
+  });
+
+  it('does not start a parked world for a caller that asked not to wake it, nor make it anew', async () => {
+    // Production, 2026-11-03: the task page's ignored-files list, refreshed as
+    // a turn ended, reached a world the provider had just stopped while the
+    // store still said ready, and started it again (a new Hetzner server).
+    const world = await provider.create({ taskId: 'task_nowake', base: 'main', generation: 1, organizationId: 'org_a' });
+    await provider.park(world.handle as WorldHandle);
+    const instance = [...aws.instances.values()].find((value) => value.tags.karmaxTaskId === 'task_nowake')!;
+    await waitFor(() => instance.state === 'stopped');
+    await expect(provider.open(world.handle as WorldHandle, { wake: false })).rejects.toBeInstanceOf(WorldNotRunningError);
+    const recover = vi.fn(async () => world.handle as WorldHandle);
+    const registry = new WorldRegistry();
+    registry.register(provider);
+    registry.setRecoveryHandler(recover);
+    await expect(registry.open(world.handle as WorldHandle, { wake: false })).rejects.toBeInstanceOf(WorldNotRunningError);
+    expect(recover).not.toHaveBeenCalled();
+    expect(instance).toMatchObject({ state: 'stopped', launches: 1 });
+    expect((await provider.open(world.handle as WorldHandle)).handle.id).toBe('task_nowake');
+    expect(instance.state).toBe('running');
   });
 
   it('stops a parked world another process woke, though this one remembers parking it', async () => {
@@ -348,14 +398,17 @@ describe.skipIf(!sshdAvailable)('AWS worlds (fake EC2, real sshd)', () => {
     aws.images.push({ imageId: 'ami-old', name: 'old', state: 'available', tags: { karmaxImage: 'old' }, owner: 'self', creationDate: '2026-01-01T00:00:00.000Z', snapshot: 'snap-old' });
     await driver.housekeep(connection(aws.key));
     await provider.destroy(handle);
+    aws.quotasReadable = true; aws.vcpuLimit = 64; aws.gp3StorageTiB = 50;
+    expect((await driver.limits(connection(aws.key))).pool).toEqual({ cpu: 64, diskGb: 51_200 });
     const markdown = fs.readFileSync(new URL('../web/docs/computers.md', import.meta.url), 'utf8');
     const policy = JSON.parse(markdown.match(/```json\n([\s\S]*?)```/)![1]!) as { Statement: Array<{ Action: string | string[] }> };
     const allowed = policy.Statement.flatMap((statement) => [statement.Action].flat());
-    const used = [...new Set(aws.requests.map((request) => `ec2:${request.action}`))];
+    const used = [...new Set([...aws.requests.map((request) => `ec2:${request.action}`), ...aws.quotaRequests])];
     const missing = used.filter((action) => !allowed.some((pattern) => new RegExp(`^${pattern.replace(/\*/g, '.*')}$`).test(action)));
     expect(missing).toEqual([]);
     expect(used).toEqual(expect.arrayContaining(['ec2:RunInstances', 'ec2:AttachVolume', 'ec2:ModifyVolume', 'ec2:StartInstances',
-      'ec2:ModifyInstanceAttribute', 'ec2:CreateTags', 'ec2:DeregisterImage', 'ec2:TerminateInstances', 'ec2:DeleteVolume']));
+      'ec2:ModifyInstanceAttribute', 'ec2:CreateTags', 'ec2:DeregisterImage', 'ec2:TerminateInstances', 'ec2:DeleteVolume',
+      'servicequotas:GetServiceQuota']));
   });
 
   it('lists its worlds by home, and housekeeping ends stale builders and old images', async () => {

@@ -1,11 +1,12 @@
 import { ProviderCapacityFull } from '../agent/limits.js';
 import { BRAND } from '../domain/brand.js';
 import { COMPUTE_TERMS, computeChargeMicros } from '../domain/entitlements.js';
-import { providerDefaults } from '../domain/computer-limits.js';
+import { providerDefaults, type AccountPool } from '../domain/computer-limits.js';
 import { flyComputeDollarsPerSecond, flyGuest, flyVolumeDollarsPerSecond } from './fly.js';
 import { costMicrosPerSecond } from './runners.js';
 import type { Store } from '../store/db.js';
 import { providerName } from './connections.js';
+import { accountRoom } from './account-room.js';
 
 /** Managed compute: tasks of an organization without its own provider account
  * run on the installation's (src/world/connections.ts MANAGED_COMPUTE), and
@@ -138,7 +139,7 @@ function exhausted(credit: ComputeCredit, provider: string): ComputeCreditExhaus
     ? `this month's ${dollars(credit.creditMicros! + credit.topUpMicros)} of compute is used up or held by work running now`
     : `this month's ${dollars(credit.creditMicros! + credit.topUpMicros)} of compute is used up`;
   return new ComputeCreditExhausted(`Out of compute: ${spent}. `
-    + `Add a compute pack or turn on auto top-up in Plan & billing, or ${own}. It renews on ${renews}.`);
+    + `Add a $10 pack or turn on auto top-up in Plan & billing, or ${own}. It renews on ${renews}.`);
 }
 
 /** Why managed work on `provider` cannot go on: the credit as it stands. */
@@ -243,13 +244,24 @@ export async function holdManagedCompute(store: Store, request: ComputeHoldReque
   throw exhausted(await computeCredit(store, request.organizationId, now), request.provider);
 }
 
-/** Refuse a new machine on the installation's account while it runs as many
- * as it may (its concurrency limit): the task waits for one instead of the
- * provider refusing it. Not a queue: whichever waiting task tries first after
- * one stops gets it. */
-export async function assertManagedRoom(store: Store, provider: string, maxRunning: number | undefined): Promise<void> {
-  if (!maxRunning) return;
-  const running = await store.runningManagedWorlds(provider);
-  if (running >= maxRunning) throw new ManagedComputeBusy(
-    `All ${maxRunning} of ${BRAND}'s ${providerName(provider)} computers are in use; waiting for one to free up.`);
+/** A managed account's budget and fair share, as its connection states them. */
+export interface ManagedBudget { pool?: AccountPool; share?: number }
+
+/** Why the installation's `provider` account has no room now (account-room.ts). */
+export interface ManagedNoRoom { reason: string; message: string }
+
+/** Whether the installation's `provider` account has room for one more
+ * machine for `organizationId`: its budget, its queue and the fair share
+ * (account-room.ts). A refused task with a `taskId` joins the queue. */
+export async function managedRoom(store: Store, provider: string, budget: ManagedBudget, organizationId: string,
+  request: { cpu?: number; diskGb?: number; taskId?: string; worldId?: string; peek?: boolean } = {}, now = Date.now()): Promise<ManagedNoRoom | undefined> {
+  return accountRoom(store, { provider, managed: true, pool: budget.pool, share: budget.share }, { organizationId, ...request }, now);
+}
+
+/** Refuse a new machine on the installation's account without room for it:
+ * the task waits for one instead of the provider refusing it. */
+export async function assertManagedRoom(store: Store, provider: string, budget: ManagedBudget, organizationId: string,
+  request: { cpu?: number; diskGb?: number; taskId?: string; worldId?: string } = {}, now = Date.now()): Promise<void> {
+  const refusal = await managedRoom(store, provider, budget, organizationId, request, now);
+  if (refusal) throw new ManagedComputeBusy(refusal.message);
 }

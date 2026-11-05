@@ -54,6 +54,9 @@ export interface Organization {
   storagePacks?: number;
   /** Paid compute packs billing has verified; ignored on Free. */
   computePacks?: number;
+  /** People a Team covers when nothing bills a new seat (a gifted Team, with
+   * any seats bought beside it); absent when anyone may join. */
+  seatLimit?: number;
   createdAt: number;
 }
 
@@ -357,6 +360,8 @@ export interface WorldCheckpoint {
   /** Metadata-only inventory of ignored paths omitted from the portable delta.
    * Contents are never read or uploaded by this safety net. */
   ignored?: IgnoredResourceInventory;
+  /** Its ignored files could not be listed: what a move would lose is unknown. */
+  ignoredUnknown?: boolean;
   /** Accepted provider-neutral runtime declarations pinned at checkpoint time.
    * Provider snapshots remain accelerators; generated endpoints are excluded. */
   environment?: ProjectEnvironmentSpec;
@@ -404,13 +409,14 @@ export interface WorldProviderConnection {
     /** Fly.io: the organization slug machines are created in. */
     organization?: string;
     /** Per-machine limits entered in Advanced, for what the provider's API
-     * cannot tell (wiki features/computers). Disk is total GB. */
-    limits?: { cpu?: number; memoryMb?: number; diskGb?: number };
-    /** Managed compute (the installation's own account): how many of its
-     * machines may run at once across every organization, the account's
-     * concurrency limit (E2B Hobby: 20). Above it, new ones wait for a
-     * machine instead of failing at the provider. */
-    maxRunning?: number;
+     * cannot tell (wiki features/computers). Disk is total GB. `pool` is the
+     * account's budget across its running machines where the provider cannot
+     * say it (Hetzner's CPU and volume limits, E2B's and Fly.io's machine
+     * counts); it wins over the measured one. */
+    limits?: { cpu?: number; memoryMb?: number; diskGb?: number; pool?: { cpu?: number; machines?: number; diskGb?: number } };
+    /** Managed compute: the most of the account's budget one organization may
+     * hold while another waits for room, in percent (default 50). */
+    share?: number;
   };
   /** What the provider account itself said it allows, from a probe or a
    * refused build (src/world/provider-limits.ts). */
@@ -1508,6 +1514,12 @@ export interface Message {
    * context for whoever runs next.
    */
   to?: string[];
+  /**
+   * A notice of tavya's that woke an agent whose work waited in Review: it
+   * hands finished work back, so the console starts a new round at it instead
+   * of folding the agent's report away (web/app.js returnsWork).
+   */
+  returnsWork?: true;
 }
 
 /**
@@ -1801,6 +1813,9 @@ export interface DeclaredAction {
 
 /** The typed projection of a task's state + allowed actions the UI renders. */
 /** A sub-task as its parent's Sub-tasks panel shows it. */
+/** Why a turn waits for a model login (TaskView.waitingFor.reason of an `account` wait). */
+export type AccountWaitReason = 'planning' | 'held' | 'quota' | 'slot' | 'login';
+
 export interface ChildTaskSummary {
   id: string;
   num?: number;
@@ -1932,8 +1947,12 @@ export interface TaskView {
     /** `human`: why people are asked. `input` (default) is an agent's question;
      * `error` a failure automatic recovery could not fix (the stage is kept —
      * there is no Escalated stage from software-dev 1.27); `authorization` and
-     * `merge` an authority the task lacks. */
-    reason?: 'input' | 'error' | 'authorization' | 'merge';
+     * `merge` an authority the task lacks.
+     * `account`: why no model login is given yet (the account coordinator's
+     * answer, read when the view is served): `planning`, `held` (for
+     * higher-priority work), `quota` (none has quota left until a reset),
+     * `slot` (every one with quota runs all it may), `login` (none usable). */
+    reason?: 'input' | 'error' | 'authorization' | 'merge' | AccountWaitReason;
     /** Durable jobs this wait watches (a `job` wait, or an ask that also waits
      * on jobs): their world must keep running, or parking it freezes them. */
     jobs?: string[] };

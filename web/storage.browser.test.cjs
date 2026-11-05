@@ -79,6 +79,8 @@ const LOCATIONS = [
     const over = await page.locator('.storage-over').textContent();
     assert.match(over, /Over the limit: adding data is paused/);
     assert.match(await page.locator('.storage-over .info-dot').getAttribute('title'), /by 9\/21\/2027.*older versions first/);
+    // The way out is one click: Plan & billing, where 100 GB packs are added.
+    assert.equal(await page.locator('.storage-over a').getAttribute('href'), '#settings-plan');
     // The total, and deleted data still in the bucket, explained in a tooltip and not part of the total.
     assert.match(await page.locator('.storage-location').first().textContent(), /6\.2 GB\s*stored/);
     assert.equal((await page.locator('.storage-pending').textContent()).replace('ⓘ', '').trim(), '+ 25.7 GB being deleted');

@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { WorldOperationLock } from './operation-lock.js';
 import { SharedWorldCoordination } from './shared-coordination.js';
-import { World, WorldHandle, WorldKind, WorldLifecycleState, WorldProvider, WorldSpec } from './types.js';
+import { World, WorldHandle, WorldKind, WorldLifecycleState, WorldOpenOptions, WorldProvider, WorldSpec } from './types.js';
 import { WorktreeProvider } from './worktree.js';
 import { MemoryWorldProvider } from './memory.js';
 import { ContainerWorldProvider } from './container.js';
@@ -110,13 +110,15 @@ export class WorldRegistry {
     return this.recoveryDisabled.run(true, operation);
   }
 
-  async open(handle: WorldHandle): Promise<World> {
+  async open(handle: WorldHandle, options?: WorldOpenOptions): Promise<World> {
     return this.withOperation(handle.id, async () => {
       const current = (await this.resolveHandle?.(handle)) ?? handle;
       try {
-        return await this.get(current.kind).open(current);
+        const provider = this.get(current.kind);
+        return await (options ? provider.open(current, options) : provider.open(current));
       } catch (error) {
-        if (this.recoveryDisabled.getStore()) throw error;
+        // Not waking it means not making it anew either.
+        if (this.recoveryDisabled.getStore() || options?.wake === false) throw error;
         const restored = await this.recover?.(current, error);
         if (!restored) throw error;
         return this.get(restored.kind).open(restored);

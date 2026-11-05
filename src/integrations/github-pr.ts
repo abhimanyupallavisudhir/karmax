@@ -211,11 +211,32 @@ export interface GithubPrActor {
 export class GithubApiError extends Error {
   /** GitHub's own status: the gateway never answers its 401 as tavya's (error-status.ts). */
   readonly upstream = true;
-  constructor(public readonly status: number, message: string) {
+  constructor(public readonly status: number, message: string,
+    /** The `errors` GitHub listed with it, e.g. `{resource: 'Comparison', field: 'diff', code: 'not_available'}`. */
+    public readonly errors: Array<{ resource?: string; field?: string; code?: string }> = []) {
     super(message);
     this.name = 'GithubApiError';
   }
 }
+
+/** A REST error as people read it: GitHub's message and its items' messages,
+ * else the start of the body. */
+async function githubApiError(response: Response): Promise<GithubApiError> {
+  const text = await response.text();
+  let body: any;
+  try { body = JSON.parse(text); } catch { /* not JSON: an HTML error page, a proxy */ }
+  const errors = Array.isArray(body?.errors) ? body.errors : [];
+  const said = typeof body?.message === 'string'
+    ? [body.message, ...errors.map((item: any) => typeof item === 'string' ? item : item?.message)
+      .filter((item: unknown) => typeof item === 'string' && item)].join(': ')
+    : text;
+  return new GithubApiError(response.status, `GitHub API ${response.status}: ${said.slice(0, 300)}`,
+    errors.filter((item: unknown) => item && typeof item === 'object'));
+}
+
+/** GitHub's REST compare refused because building the diff took too long. */
+const diffUnavailable = (error: unknown): error is GithubApiError => error instanceof GithubApiError && error.status === 422
+  && error.errors.some((item) => item.field === 'diff' && item.code === 'not_available');
 
 /** A refreshable GitHub App user authorization. A forced resolution follows a
  * 401, which is safe to retry because GitHub rejected the request before
@@ -302,8 +323,7 @@ export class GithubPrApi {
     const head = input.headOwner ? `${input.headOwner}:${input.head}` : input.head;
     let reopenRefused = false;
     if (existing?.merged) {
-      const comparison = await this.request<{ ahead_by: number }>(
-        `/repos/${repositorySlug(slug)}/compare/${encodeURIComponent(input.base)}...${encodeURIComponent(head)}`);
+      const comparison = await this.comparison(slug, input.base, head);
       if (comparison.ahead_by === 0) return { pr: existing, created: false };
       if (!Number.isSafeInteger(comparison.ahead_by) || comparison.ahead_by < 0)
         throw new Error('GitHub did not report whether the branch contains new commits');
@@ -369,13 +389,36 @@ export class GithubPrApi {
   /** How `head` relates to `base`. A branch `base` is compared at its live
    * tip, which the PR's own base commit may not yet reflect. */
   async compare(slug: string, base: string, head: string): Promise<GithubComparison> {
-    const value = await this.request<any>(
-      `/repos/${repositorySlug(slug)}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`);
+    const value = await this.comparison(slug, base, head);
     const aheadBy = Number(value?.ahead_by);
     const behindBy = Number(value?.behind_by);
     if (!Number.isSafeInteger(aheadBy) || aheadBy < 0 || !Number.isSafeInteger(behindBy) || behindBy < 0)
       throw new Error(`GitHub did not report how ${head} relates to ${base}`);
     return { aheadBy, behindBy, ...(value?.base_commit?.sha ? { baseSha: String(value.base_commit.sha) } : {}) };
+  }
+
+  /** GitHub's REST comparison of `head` with `base`. That endpoint also builds
+   * the diff, and refuses when it takes too long (pramana#149: a data release);
+   * then the counts come from GraphQL, which builds none. Its `ref.compare`
+   * needs `base` to be a branch, so a SHA base still fails, as a plain error
+   * (a GitHub hiccup to retry, not a pull request for a person to fix). */
+  private async comparison(slug: string, base: string, head: string):
+  Promise<{ ahead_by: number; behind_by: number; base_commit?: { sha?: string } }> {
+    try {
+      return await this.request(`/repos/${repositorySlug(slug)}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`);
+    } catch (error) {
+      if (!diffUnavailable(error)) throw error;
+      const [owner, name] = repositorySlug(slug).split('/');
+      const value = await this.graphql<any>(
+        'query($owner:String!,$name:String!,$base:String!,$head:String!){ repository(owner:$owner,name:$name){ '
+        + 'ref(qualifiedName:$base){ target{ oid } compare(headRef:$head){ aheadBy behindBy } } } }',
+        { owner, name, base, head },
+      ).catch(() => undefined);
+      const ref = value?.data?.repository?.ref;
+      if (!ref?.compare) throw new Error(`GitHub could not compare ${head} with ${base}: ${error.message.replace(/^GitHub API \d+: /, '')}`);
+      return { ahead_by: ref.compare.aheadBy, behind_by: ref.compare.behindBy,
+        ...(ref.target?.oid ? { base_commit: { sha: String(ref.target.oid) } } : {}) };
+    }
   }
 
   /** Mirror an explicit krmax Human-confirm decision into GitHub's native PR
@@ -720,7 +763,7 @@ export class GithubPrApi {
     let response = await send();
     if (response.status === 401 && typeof this.token === 'function') response = await send(true);
     if (!response.ok && !accepted.includes(response.status))
-      throw new GithubApiError(response.status, `GitHub API ${response.status}: ${(await response.text()).slice(0, 300)}`);
+      throw await githubApiError(response);
     if (response.status === 204) return undefined as T;
     const text = await response.text();
     return (text ? JSON.parse(text) : undefined) as T;

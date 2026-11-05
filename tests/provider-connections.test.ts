@@ -58,7 +58,9 @@ describe('organization cloud provider connections', () => {
     process.env.E2B_API_KEY = 'machine-fallback';
     try {
       (await service.save({ organizationId: organization.id, provider: 'e2b', apiKey: 'tenant-key', enabled: false }));
-      await expect((async () => (await service.resolve(organization.id, 'e2b')))()).rejects.toThrow(/disabled/);
+      await expect(service.resolve(organization.id, 'e2b', { new: true })).rejects.toThrow(/disabled/);
+      // Computers made on it before it was disabled keep it, never the machine-wide key.
+      expect((await service.resolve(organization.id, 'e2b')).apiKey).toBe('tenant-key');
     } finally {
       if (prior === undefined) delete process.env.E2B_API_KEY; else process.env.E2B_API_KEY = prior;
       (await store.close()); fs.rmSync(dir, { recursive: true, force: true });

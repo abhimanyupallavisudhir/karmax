@@ -58,11 +58,11 @@ export async function publicShare(store: Store, id: string): Promise<Conversatio
   return share;
 }
 const escape = (value: string) => value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
-export function publicConversationHtml(share?: ConversationShare, options: { siteName?: string; signedIn?: boolean } = {}) {
+export function publicConversationHtml(share?: ConversationShare, options: { siteName?: string; signedIn?: boolean; skin?: string } = {}) {
   const name = escape(options.siteName ?? DEFAULT_SITE_NAME);
   const title = share ? escape(share.title) : 'Conversation unavailable';
   return `<!doctype html>
-<html lang="en"><head>
+<html lang="en"${options.skin === 'classic' ? ' data-skin="classic"' : ''}><head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex,nofollow"><title>${title} · ${name}</title>
   <link rel="icon" href="/brand/icon.svg" type="image/svg+xml">

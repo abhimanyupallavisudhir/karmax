@@ -53,13 +53,13 @@ export async function createExecutionServices(input: {
   if (bootstrap) await providerConnections.importEnvironment();
   const referenceKeys = await WorldReferenceKeys.create(broker, bootstrap);
   worlds.register(new E2BWorldProvider(undefined, undefined, undefined,
-    async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), undefined, referenceKeys));
+    async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), undefined, referenceKeys));
   worlds.register(new DaytonaWorldProvider(undefined, undefined, undefined, undefined,
-    async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), undefined, undefined, referenceKeys));
-  worlds.register(flyWorldProvider(async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), referenceKeys, store));
-  worlds.register(hetznerWorldProvider(async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), referenceKeys, store));
-  worlds.register(awsWorldProvider(async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), referenceKeys, store));
-  worlds.register(gcpWorldProvider(async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), referenceKeys, store));
+    async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), undefined, undefined, referenceKeys));
+  worlds.register(flyWorldProvider(async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), referenceKeys, store));
+  worlds.register(hetznerWorldProvider(async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), referenceKeys, store));
+  worlds.register(awsWorldProvider(async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), referenceKeys, store));
+  worlds.register(gcpWorldProvider(async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), referenceKeys, store));
   if (bootstrap) {
     const unreadable: (string | undefined)[] = [];
     for (const state of ['ready', 'parked', 'hibernated', 'degraded'] as const) {

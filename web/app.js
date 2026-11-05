@@ -17,7 +17,7 @@ const esc = (s) =>
 function storageOverQuotaMarkup(contents) {
   if (!contents?.overQuota) return '';
   const date = new Date(contents.overQuota.deleteAt).toLocaleDateString();
-  return `<p class="task-sub storage-over">Over the limit: adding data is paused. ${policyTip(`Free space or upgrade by ${date}. After that, stored data is deleted, older versions first, until it fits.`)}</p>`;
+  return `<p class="task-sub storage-over">Over the limit: adding data is paused. ${policyTip(`Free space or add a 100 GB pack by ${date}. After that, stored data is deleted, older versions first, until it fits.`)} <a class="btn sm" href="#settings-plan">Add storage</a></p>`;
 }
 // Deleted data the bucket keeps for its 30-day recovery window: real bytes,
 // but not the organization's to count against its limit.
@@ -114,14 +114,18 @@ const ICON = {
   // Window controls: a matched pair, drawn on the same grid and stroke.
   minimize: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"><path d="M6 12h12"/></svg>',
   close: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"><path d="m7 7 10 10"/><path d="M17 7 7 17"/></svg>',
-  // Sidebar navigation, icon-only (the name is the aria-label and tooltip):
-  // organization views at the top, installation-wide entries at the foot.
+  // Sidebar navigation: organization views at the top (with their names),
+  // installation-wide tools at the foot (icons; the name is the aria-label and tooltip).
   home: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.2a2 2 0 0 1 .7-1.5l7-6a2 2 0 0 1 2.6 0l7 6a2 2 0 0 1 .7 1.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M9.5 21v-6.5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1V21"/></svg>',
   insights: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="m7 15 4-5 3.5 3L20 6.5"/></svg>',
   wiki: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3Z"/></svg>',
   settings: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z"/><circle cx="12" cy="12" r="3"/></svg>',
-  // Topbar: the inbox bell and the phone sidebar toggle, drawn like the rail icons.
+  // The inbox bell and the phone's sidebar toggle, drawn like the rail icons.
   bell: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>',
+  // A secret a form keeps out of the conversation.
+  lock: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>',
+  // Fold or bring back the sidebar: a window with its left column.
+  panel: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M9 4v16"/></svg>',
   menu: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>',
   docs: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.5"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>',
   palette: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3"/></svg>',
@@ -194,7 +198,7 @@ const S = {
   searchFailed: false, // last evaluation errored — distinct from "nothing matched"
   searchRefusal: '', // …because the server refused it (4xx), in the server's words
   searchPending: false, // a new query is being evaluated; the list labels its interim local preview
-  wsOnline: true, // live socket up; false shows the topbar "Reconnecting" pill
+  wsOnline: true, // live socket up; false shows the floating "Reconnecting" pill
   orgProjectId: null, // which project S.tags/S.views were loaded for (staleness guard)
   schema: [],
   paramDefaults: {},
@@ -710,7 +714,7 @@ function go(path, opts = {}) {
   return applyRoute();
 }
 
-// The task form page floats over #main with the shell (topbar/rail) still live
+// The task form page floats over #main with the shell (sidebar) still live
 // behind it, so the user can navigate mid-edit. Any navigation closes it like
 // leaving any other page — via its close button, which flushes the draft.
 function closeTaskFormPage() {
@@ -1150,26 +1154,15 @@ function principalLabel(principal) {
 // person just sees "Agent"; the other roles keep their descriptive names.
 function agentRoleLabel(role) { return !role || role === 'do' ? 'Agent' : `${role} agent`; }
 
-// The workflows a human may pick when creating a task. INTENDED: `just-do` and
-// `script-exec` are deliberately absent because they are clutter in the picker —
-// nobody wants to choose them. That is the whole reason; they are still
-// registered and still run (their manifests carry `selectable: false`), so
-// existing tasks keep replaying and automation can still use them. Do not
-// "fix" this by adding them back. `workflowLabel` falls back to the raw id so
-// such a task still renders sensibly wherever one does appear.
+// The workflows a new task can be. With one choice there is no workflow
+// picker, and no task names its workflow: the Goal workflow is retired — an
+// agent Reviewer covers it — and `just-do`/`script-exec` were never choices.
+// All three stay registered (`selectable: false`), so existing executions keep
+// replaying. `workflowLabel` falls back to the raw id wherever one appears.
 const WORKFLOWS = [
   { id: 'software-dev', label: 'Software dev' },
-  { id: 'goal', label: 'Goal (auto-run)' },
 ];
 const workflowLabel = (id) => WORKFLOWS.find((w) => w.id === id)?.label || id;
-
-// Hidden workflows remain editable on existing tasks without becoming choices
-// for new tasks. Include the current value so the select cannot imply a switch.
-function taskFormWorkflows(currentWorkflow, existingTask) {
-  return existingTask && !WORKFLOWS.some((w) => w.id === currentWorkflow)
-    ? [...WORKFLOWS, { id: currentWorkflow, label: workflowLabel(currentWorkflow) }]
-    : WORKFLOWS;
-}
 
 const NODES = [
   { key: 'setup', label: 'Setup' },
@@ -1185,8 +1178,8 @@ const NODES = [
 // Grok Build are not admitted by the server, so their models run through OpenCode.
 const AGENT_PROVIDERS = ['claude', 'codex', 'opencode'];
 const MODELS = {
-  claude: ['default', 'opus[1m]', { id: 'claude-opus-5-5', displayName: 'Opus 5.5' }, { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, 'sonnet', 'haiku'],
-  codex: ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
+  claude: ['default', 'opus[1m]', { id: 'claude-opus-5-5', displayName: 'Opus 5.5' }, { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, { id: 'claude-sonnet-5-5', displayName: 'Sonnet 5.5' }, { id: 'claude-haiku-5-5', displayName: 'Haiku 5.5' }, 'sonnet', 'haiku'],
+  codex: ['gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
 };
 const agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
@@ -4470,6 +4463,7 @@ function plainError(error) {
   if (/^message too large/i.test(text)) return 'That message is too long. Shorten it, or attach the text as a file.';
   if (/^Workflow Update failed$/i.test(text)) return 'This task couldn’t take that change just now. Refresh the page and try again.';
   if (/^invalid JSON body$/i.test(text)) return 'That didn’t send correctly. Refresh the page and try again.';
+  if (storageFull(text)) return 'Your organization’s storage is full. Free some space, or add a 100 GB pack in Plan & billing.';
   if (/name already exists on this account/i.test(text))
     return 'A GitHub repository with that name already exists. Choose another name, or add the existing one from the list.';
   if (/Bad credentials|token (?:has )?expired|refresh token/i.test(text) && /github/i.test(text))
@@ -4496,9 +4490,26 @@ function plainError(error) {
 function plainTaskError(text) {
   const raw = String(text || '').trim();
   const body = raw.replace(/^infrastructure: /, '').replace(/^(?:Activity task failed → )+/, '');
+  // A run that crashed, with what crashed it (pramana#137). A full provider was
+  // only "waiting for room" while the run lived; the task has stopped since.
+  const crashed = /^workflow failed: ([\s\S]+)$/.exec(body);
+  if (crashed) {
+    const cause = crashed[1].trim();
+    const full = /;\s*waiting (?:for room|its turn)\.?$/i.test(cause);
+    const said = `The task stopped: ${plainError(cause.replace(/;\s*waiting (?:for room|its turn)\.?$/i, '')).replace(/[.!?]?$/, '.')}`;
+    const summary = full ? `${said} Retry once there’s room.` : said;
+    return { summary, detail: summary === raw ? '' : raw, generic: !full };
+  }
   const retry = /— retrying (\w+) in (\d+\s*\w+) \((\d+)\/(\d+)\)\s*$/.exec(body);
   const retrying = retry ? ` tavya will try again in ${retry[2]} (attempt ${retry[3]} of ${retry[4]}).` : '';
-  const summary = /context window|prompt is too long|maximum context length/i.test(body)
+  // Out of compute (it names "Plan & billing", which the AI-limit pattern below
+  // would take for a model's billing): what happened in one line; what to do is
+  // the buttons beside it.
+  const spent = /Out of compute: this month's (\$[\d.,]+) of compute is used up( or held)?/i.exec(body);
+  const summary = /Out of compute: .*come with a paid plan/i.test(body) ? `${siteName()}’s computers come with a paid plan.`
+    : spent ? `This month’s ${spent[1]} of compute is used up${spent[2] ? ' or held by work running now' : ''}.`
+    : storageFull(body) ? 'Your organization’s storage is full. Free some space, or add a 100 GB pack in Plan & billing.'
+    : /context window|prompt is too long|maximum context length/i.test(body)
     ? 'The conversation grew too long for the AI model. Send a shorter message, or start a new task.'
     : /safety rejection|content policy|flagged/i.test(body) ? 'The AI provider declined this request. Rephrase it and try again.'
     : /No usable \S+ credential|has no usable .* credential/i.test(body) ? 'No AI account is available to run this task. Ask an admin to connect one in organization settings.'
@@ -4526,21 +4537,30 @@ function toolsDidNotStart(text) {
 }
 // Where a person fixes what a task stopped or waits on, when it is a setting:
 // an agent account, a computer, compute credit, GitHub.
-function setupFix(text) {
+// Storage refused over the organization's quota, however it was said.
+function storageFull(text) { return /storage quota exceeded|organization's storage is full/i.test(String(text || '')); }
+function setupFixes(text) {
   const raw = String(text || '');
   const settings = globalRoute('organization');
-  if (/\bOut of compute\b/.test(raw)) return { label: 'Get compute', href: `${settings}#settings-plan` };
-  if (/No computer (?:is connected|this organization can use fits)/.test(raw)) return { label: 'Connect a computer', href: `${settings}#settings-computers` };
+  const plan = `${settings}#settings-plan`, computers = `${settings}#settings-computers`;
+  const own = { label: 'Use your own account', href: computers };
+  // Never bought a plan, or spent this month's compute: more on the plan, or one's own account.
+  if (/\bOut of compute\b/.test(raw)) return [{ label: /come with a paid plan/.test(raw) ? 'Choose a plan' : 'Add compute', href: plan }, own];
+  if (/No computer (?:is connected|this organization can use fits)/.test(raw)) return [{ label: 'Connect a computer', href: computers }];
+  // Every one of tavya's computers busy: one's own account starts it now.
+  if (/Every computer this task can use is full|of \S+'s [\w. ]+ computers are in use|\S+'s [\w. ]+ computers are using|uses its share of/.test(raw)
+    && !/This organization's \S+ account/.test(raw)) return [own];
+  if (storageFull(raw)) return [{ label: 'Add storage', href: plan }];
   if (/No usable \S+ credential|has no usable .* credential|^No \S+ credential\b|Every allowed credential needs attention/i.test(raw))
-    return { label: 'Manage accounts', href: `${settings}#settings-agents` };
+    return [{ label: 'Manage accounts', href: `${settings}#settings-agents` }];
   if (/GitHub PR identity is not connected|Connect GitHub on your profile|reconnect GitHub on your profile/i.test(raw))
-    return { label: 'Connect GitHub', href: '/profile' };
-  if (/connect GitHub in organization settings/i.test(raw)) return { label: 'Connect GitHub', href: `${settings}#settings-code` };
-  return null;
+    return [{ label: 'Connect GitHub', href: '/profile' }];
+  if (/connect GitHub in organization settings/i.test(raw)) return [{ label: 'Connect GitHub', href: `${settings}#settings-code` }];
+  return [];
 }
+function setupFix(text) { return setupFixes(text)[0] ?? null; }
 function setupFixHtml(text) {
-  const fix = setupFix(text);
-  return fix ? ` <a class="btn sm setup-fix" data-spa href="${esc(fix.href)}">${esc(fix.label)}</a>` : '';
+  return setupFixes(text).map((fix, index) => ` <a class="btn sm setup-fix${index ? ' ghost' : ''}" data-spa href="${esc(fix.href)}">${esc(fix.label)}</a>`).join('');
 }
 // An error shown in place of what failed to load: the plain sentence, the
 // exact text on hover (for whoever reports it).
@@ -4572,6 +4592,8 @@ function toast(msg, err = false, action) {
   span.textContent = err ? plainError(msg) : msg;
   if (span.textContent !== String(msg)) span.title = String(msg); // the exact text, for whoever reports it
   t.appendChild(span);
+  // An error a setting fixes (storage full, out of compute) links to it.
+  if (err && !action) action = setupFix(String(msg?.message ?? msg ?? '')) ?? undefined;
   // An optional action (e.g. Undo) — gives the toast a clickable button and more
   // dwell time. Backward-compatible: existing toast(msg[, err]) calls are unchanged.
   // An action with an `href` is a link (so it opens in a new tab too) instead.
@@ -4955,6 +4977,7 @@ async function loadInbox() {
   S.announcedInbox = new Map(S.inbox.map((item) => [item.id, urgencyRank(item.urgency)]));
   announceInbox(inboxArrivals(seen, S.inbox));
   updateBell();
+  refreshForMeCounts();
   // The bell's page lists what the inbox says waits on you.
   if (S.tab === 'inbox' && !S.selected) scheduleHomeRefresh();
 }
@@ -5197,7 +5220,7 @@ async function runSearch() {
   const store = taskStoreForQuery();
   if (store) { S.searchPending = false; S.searchFailed = false; return store; }
   const isCurrent = () => scopeOf() === scope;
-  const q = effectiveQuery(S.search); // adds the default -is:run -is:subtask unless overridden
+  const q = effectiveQuery(S.search); // adds the default -is:folded unless overridden
   const epoch = S.searchEpoch = (S.searchEpoch || 0) + 1;
   S.searchPending = true;
   try {
@@ -5547,6 +5570,7 @@ function connectWs() {
     if (ev.type === 'review.updated' || ev.type.startsWith('resource.')) {
       resourceReviewCache.delete(ev.taskId); resourceInventoryCache.delete(ev.taskId);
     }
+    if (ev.type === 'review.updated') forgetReviewArtifactUrls(ev.taskId);
     if (S.selected && ev.taskId === S.selected) {
       if (ev.type.startsWith('spend.') || ev.type.startsWith('payment.')) $('#tp-payments')?.refreshSpent?.();
       if (ev.type !== 'agent.output') {
@@ -5709,6 +5733,7 @@ async function refreshTasks() {
         if (S.tab === 'queue' && !S.selected) seedQueue();
       } catch {}
     } while (taskRefreshQueued);
+    refreshForMeCounts();
   })();
   try {
     await taskRefreshPromise;
@@ -5780,6 +5805,7 @@ function siteName() { return S.meta?.siteName || 'tavya'; }
 function siteNameMarkup() { return esc(siteName()); }
 
 function applyDocumentBrand() {
+  applySkin(S.meta?.skin);
   document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute('content', siteName());
   document.querySelector('meta[name="description"]')?.setAttribute('content',
     `${siteName()} is the to-do list for managing AI agents: parallel cloud worlds, review gates, permissions, credentials, and payments in one calm interface.`);
@@ -5972,34 +5998,42 @@ function renderShell() {
   window.onpopstate = null; // public-page history is replaced by the app router below
   const app = $('#app');
   app.innerHTML = `
-    <div class="topbar">
-      <button class="icon-btn mobile-menu" id="mobile-menu" aria-controls="rail" aria-label="Sidebar" aria-expanded="true">${ICON.menu}</button>
-      <a class="brand" id="brand-home" data-spa data-shortcut="nav.home" href="${esc(homeRoute())}" title="Home" aria-label="Home">${brandMark()} ${siteNameMarkup()}</a>
+    <div class="mobile-bar">
+      <button class="icon-btn mobile-menu" id="mobile-menu" aria-controls="rail" aria-label="Sidebar" aria-expanded="false">${ICON.menu}</button>
+      <a class="brand" data-spa href="${esc(homeRoute())}" aria-label="Home">${brandMark()}</a>
       <span class="topbar-context" id="topbar-context"></span>
-      <div class="spacer"></div>
-      <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
-      <kbd class="key-echo" id="key-echo" aria-hidden="true"></kbd>
-      <a class="topbar-user" id="topbar-user" data-spa data-shortcut="nav.profile" href="${profileRoute()}" title="${esc(userDisplayName())}" aria-label="Your profile">${userAvatarHtml()}</a>
-      <a class="icon-btn has-badge" id="bell" data-shortcut="nav.notifications" data-spa href="${esc(inboxRoute(DEFAULT_LIST_QUERY))}" title="What needs you, in every organization" role="button" aria-label="Inbox">${ICON.bell}<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
     ${verificationBanner()}
     <div class="body">
       <div class="rail" id="rail">
+        <div class="rail-head">
+          <a class="brand" id="brand-home" data-spa data-shortcut="nav.home" href="${esc(homeRoute())}" title="Home">${brandMark()}<span class="wordmark">${siteNameMarkup()}</span></a>
+          <button class="rail-icon rail-collapse" id="rail-collapse" type="button" aria-controls="rail" aria-label="Hide sidebar" title="Hide sidebar">${ICON.panel}</button>
+        </div>
         <div class="rail-top">
           ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
-          <nav class="rail-icons rail-org-nav" aria-label="Organization">${RAIL_ORG_NAV.map(([id, label, icon, , , , command]) =>
-            `<a class="rail-icon" id="${id}" data-spa data-shortcut="${command}" href="#" aria-label="${label}">${ICON[icon]}</a>`).join('')}</nav>
+          <nav class="rail-org-nav" aria-label="Organization">${RAIL_ORG_NAV.map(([id, label, icon, , , , command]) =>
+            `<a class="rail-row" id="${id}" data-spa data-shortcut="${command}" href="#">${ICON[icon]}<span>${label}</span></a>`).join('')}</nav>
         </div>
         <div class="rail-list" id="rail-list"></div>
-        <div class="rail-icons rail-foot">
-          <a class="rail-icon" id="rail-docs" href="/docs" target="_blank" rel="noopener" aria-label="Docs" title="Docs">${ICON.docs}</a>
-          <button class="rail-icon" id="rail-palette" type="button" data-shortcut="nav.commandPalette" aria-label="Command palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">${ICON.palette}</button>
-          <button class="rail-icon" id="rail-help" type="button" data-shortcut="help.keyboard" aria-label="Keyboard shortcuts" title="${esc(commandHint('Keyboard shortcuts', 'help.keyboard'))}" aria-haspopup="dialog">${ICON.keyboard}</button>
+        <div class="rail-foot">
+          <div class="rail-tools">
+            <a class="rail-icon" id="rail-docs" href="/docs" target="_blank" rel="noopener" aria-label="Docs" title="Docs">${ICON.docs}</a>
+            <button class="rail-icon" id="rail-palette" type="button" data-shortcut="nav.commandPalette" aria-label="Command palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">${ICON.palette}</button>
+            <button class="rail-icon" id="rail-help" type="button" data-shortcut="help.keyboard" aria-label="Keyboard shortcuts" title="${esc(commandHint('Keyboard shortcuts', 'help.keyboard'))}" aria-haspopup="dialog">${ICON.keyboard}</button>
+          </div>
+          <div class="rail-person">
+            <a class="rail-profile" id="rail-profile" data-spa data-shortcut="nav.profile" href="${profileRoute()}" title="${esc(commandHint('Your profile', 'nav.profile'))}"><span class="avatar">${userAvatarHtml()}</span><span class="rail-person-name">${esc(userDisplayName())}</span></a>
+            <a class="rail-icon has-badge" id="bell" data-shortcut="nav.notifications" data-spa href="${esc(inboxRoute(DEFAULT_LIST_QUERY))}" title="${esc(commandHint('Inbox — what needs you, in every organization', 'nav.notifications'))}" aria-label="Inbox">${ICON.bell}<span class="badge hidden" id="bell-badge">0</span></a>
+          </div>
         </div>
       </div>
       <button class="rail-scrim" id="rail-scrim" aria-label="Close navigation"></button>
+      <button class="rail-expand" id="rail-expand" type="button" aria-controls="rail" aria-label="Show sidebar" title="Show sidebar">${ICON.panel}</button>
       <div class="main"><div class="main-inner" id="main"></div></div>
     </div>
+    <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
+    <kbd class="key-echo" id="key-echo" aria-hidden="true"></kbd>
     <aside class="hosted-onboarding" id="hosted-onboarding" aria-live="polite" hidden></aside>`;
   $('#rail-palette').addEventListener('click', openPalette);
   $('#rail-help').addEventListener('click', openHelp);
@@ -6010,10 +6044,19 @@ function renderShell() {
     $('#rail-scrim')?.classList.remove('visible');
     syncRailToggle();
   };
-  // ☰ slides the rail over the page on a phone, and folds it away on a wider
-  // screen (remembered per browser, like the theme).
+  // ⇤ folds the sidebar away on a computer, and the button left at the window's
+  // edge brings it back (remembered per browser, like the theme); ☰ slides it
+  // over the page on a phone.
+  $('#rail-collapse')?.addEventListener('click', () => {
+    if (narrowViewport()) return closeMobileNav();
+    setRailCollapsed(true);
+    $('#rail-expand')?.focus({ preventScroll: true });
+  });
+  $('#rail-expand')?.addEventListener('click', () => {
+    setRailCollapsed(false);
+    $('#rail-collapse')?.focus({ preventScroll: true });
+  });
   $('#mobile-menu')?.addEventListener('click', () => {
-    if (!narrowViewport()) return setRailCollapsed(!railCollapsed());
     const open = !$('#rail')?.classList.contains('mobile-open');
     $('#rail')?.classList.toggle('mobile-open', open);
     $('#rail-scrim')?.classList.toggle('visible', open);
@@ -6026,7 +6069,7 @@ function renderShell() {
     if (event.target.closest('.folder-toggle, .rail-edit-action, .rail-inline-edit, .organization-combo')) return;
     if (event.target.closest('a, button, [data-project], [data-nav]')) closeMobileNav();
   });
-  // #topbar-user and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
+  // #rail-profile and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
   wireOrganizationCombo($('#org-switcher'), () => currentOrg()?.id, async (id) => {
     if (id === '__new') return createOrganization();
     // Recheck membership before entering an organization discovered on focus.
@@ -6037,6 +6080,7 @@ function renderShell() {
   }, true, (id) => (id === '__new' ? null : organizationLandingRoute(id)));
   syncRailNav();
   renderOnboarding();
+  refreshForMeCounts(0);
   // The rail/main are painted by applyRoute() (boot calls it right after), so the
   // shell reflects the initial URL instead of a default view.
 }
@@ -6053,11 +6097,9 @@ function setRailCollapsed(collapsed) {
 function syncRailToggle() {
   const collapsed = railCollapsed();
   document.documentElement.classList.toggle('rail-collapsed', collapsed);
-  const toggle = $('#mobile-menu');
-  if (!toggle) return;
-  const open = narrowViewport() ? !!$('#rail')?.classList.contains('mobile-open') : !collapsed;
-  toggle.setAttribute('aria-expanded', String(open));
-  toggle.title = open ? 'Hide sidebar' : 'Show sidebar';
+  $('#mobile-menu')?.setAttribute('aria-expanded', String(!!$('#rail')?.classList.contains('mobile-open')));
+  $('#rail-expand')?.setAttribute('aria-expanded', 'false');
+  $('#rail-collapse')?.setAttribute('aria-expanded', 'true');
   $('#rail')?.toggleAttribute('inert', !narrowViewport() && collapsed);
 }
 
@@ -6240,17 +6282,9 @@ function editRailFolder(button) {
   });
 }
 
-// The rail's project rows: the organization's projects grouped into their
-// folders. A folder is implicit — it exists exactly while a project names it
-// (`p.folder`, a `/`-separated path), nests by that path, and sits where its
-// first project sits, so dragging orders folders and loose projects alike.
-// Nesting is the --depth custom property, not DOM structure: the rail stays a
-// flat list the drag logic can walk. A collapsed folder still shows the open
-// project, so navigating into a tucked-away project never blanks the selection.
-function railProjectRows(projectScoped) {
-  const query = (S.projectSearch || '').trim().toLocaleLowerCase();
-  const projects = S.projects.filter((p) => (!S.organizationId || p.organizationId === S.organizationId)
-    && projectPath(p).toLocaleLowerCase().includes(query));
+// The sidebar's tree of projects: each folder sits where its first project
+// would, its projects and subfolders inside in the same order.
+function projectTree(projects) {
   const root = { path: '', children: [] };
   const nodes = new Map([['', root]]);
   const dir = (path) => {
@@ -6263,6 +6297,26 @@ function railProjectRows(projectScoped) {
     return node;
   };
   for (const p of projects) dir(p.folder || '').children.push(p);
+  return root;
+}
+/** Projects in the order the sidebar lists them. */
+function inSidebarOrder(projects) {
+  const flat = (node) => node.children.flatMap((child) => (child.id ? [child] : flat(child)));
+  return flat(projectTree(projects));
+}
+
+// The rail's project rows: the organization's projects grouped into their
+// folders. A folder is implicit — it exists exactly while a project names it
+// (`p.folder`, a `/`-separated path), nests by that path, and sits where its
+// first project sits, so dragging orders folders and loose projects alike.
+// Nesting is the --depth custom property, not DOM structure: the rail stays a
+// flat list the drag logic can walk. A collapsed folder still shows the open
+// project, so navigating into a tucked-away project never blanks the selection.
+function railProjectRows(projectScoped) {
+  const query = (S.projectSearch || '').trim().toLocaleLowerCase();
+  const projects = S.projects.filter((p) => (!S.organizationId || p.organizationId === S.organizationId)
+    && projectPath(p).toLocaleLowerCase().includes(query));
+  const root = projectTree(projects);
   const folded = railCollapsedFolders();
   // A project row is an item: checklist icon, regular text, a link. A folder
   // row is a group heading: a chevron and a small uppercase name (styled in
@@ -6270,7 +6324,7 @@ function railProjectRows(projectScoped) {
   // names its kind for the first-time reader. Folders carry their own "+" so a
   // project can be created in place.
   const row = (p, depth) => `<div class="proj project-row ${projectScoped && p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" data-folder="${esc(p.folder || '')}" style="--depth:${depth}" draggable="${!query}" title="${query ? 'Project' : 'Drag to reorder'}">
-          <a class="project-link" data-spa href="${projectRoute(p.id)}" data-project="${p.id}" tabindex="0" title="Project · ${esc(projectPath(p))}"><span class="glyph">${ICON.project}</span><span class="rail-name">${esc(p.name)}</span></a>
+          <a class="project-link" data-spa href="${projectRoute(p.id)}" data-project="${p.id}" tabindex="0" title="Project · ${esc(projectPath(p))}"><span class="glyph">${ICON.project}</span><span class="rail-name">${esc(p.name)}</span>${forMeCountHtml(p.id)}</a>
           <button class="rail-edit-action" type="button" data-project-edit="${p.id}" draggable="false" title="Edit project path" aria-label="Edit ${esc(projectPath(p))}">${ICON.edit}</button>
         </div>`;
   const header = (node, depth, open) => `<div class="proj folder ${open ? 'open' : ''}" data-folder="${esc(node.path)}" style="--depth:${depth}"><button class="folder-toggle" type="button" data-folder="${esc(node.path)}" aria-expanded="${open}" title="Folder · ${esc(node.path)} (click to ${open ? 'collapse' : 'expand'})"><span class="glyph chevron">${ICON.chevron}</span><span class="rail-name">${esc(node.name)}</span></button><button class="rail-edit-action" type="button" data-folder-add="${esc(node.path)}" title="New project in this folder" aria-label="New project in ${esc(node.path)}">${ICON.plus}</button><button class="rail-edit-action" type="button" data-folder-edit="${esc(node.path)}" title="Rename folder" aria-label="Rename ${esc(node.path)}">${ICON.edit}</button></div>`;
@@ -6284,8 +6338,31 @@ function railProjectRows(projectScoped) {
   return walk(root, 0) || (query ? '<div class="rail-search-empty" role="status">No matching projects</div>' : '');
 }
 
-// The organization's views, icon-only at the top of the sidebar:
-// [id, name (aria-label), icon, tab(s) it marks current, route, tooltip, command].
+// How many tasks each project's For me list holds (its default list), beside
+// its name in the sidebar. One count-only search over the organization; the
+// rail repaints when it lands. Coalesced: inbox and list refreshes come in bursts.
+function forMeCountHtml(projectId) {
+  const n = S.forMeCounts?.organizationId === S.organizationId ? S.forMeCounts.counts[projectId] : 0;
+  return n ? `<span class="count" title="${n} ${n === 1 ? 'task' : 'tasks'} for you">${n > 99 ? '99+' : n}</span>` : '';
+}
+let forMeCountTimer = null;
+function refreshForMeCounts(delay = 300) {
+  clearTimeout(forMeCountTimer);
+  forMeCountTimer = setTimeout(async () => {
+    const organizationId = S.organizationId;
+    if (!organizationId || !S.user) return;
+    try {
+      const { counts } = await api(`/api/organizations/${encodeURIComponent(organizationId)}/search?q=${encodeURIComponent(DEFAULT_LIST_QUERY)}&countBy=project`);
+      if (organizationId !== S.organizationId) return;
+      const before = JSON.stringify(S.forMeCounts);
+      S.forMeCounts = { organizationId, counts: counts || {} };
+      if (JSON.stringify(S.forMeCounts) !== before) renderRail();
+    } catch {}
+  }, delay);
+}
+
+// The organization's views, rows at the top of the sidebar:
+// [id, name, icon, tab(s) it marks current, route, tooltip, command].
 const RAIL_ORG_NAV = [
   ['rail-home', 'Home', 'home', ['home'], () => homeRoute(), 'Home — every project, what needs you first', 'nav.home'],
   ['rail-insights', 'Insights', 'insights', ['insights'], () => globalRoute('insights'), 'Insights', 'nav.insights'],
@@ -6305,15 +6382,20 @@ function syncRailNav() {
     if (tabs.includes(S.tab)) link.setAttribute('aria-current', 'page');
     else link.removeAttribute('aria-current');
   }
-  const foot = $('#rail .rail-foot');
+  const tools = $('#rail .rail-tools');
   let installation = $('#rail-installation');
-  if (foot && S.installationAccess && !installation) {
-    foot.insertAdjacentHTML('beforeend', `<a class="rail-icon" id="rail-installation" data-spa href="${installationRoute()}" aria-label="Installation settings" title="Installation settings">${ICON.installation}</a>`);
+  if (tools && S.installationAccess && !installation) {
+    tools.insertAdjacentHTML('beforeend', `<a class="rail-icon" id="rail-installation" data-spa href="${installationRoute()}" aria-label="Installation settings" title="Installation settings">${ICON.installation}</a>`);
     installation = $('#rail-installation');
   } else if (installation && !S.installationAccess) { installation.remove(); installation = null; }
   if (installation) {
     if (S.tab === 'installation') installation.setAttribute('aria-current', 'page');
     else installation.removeAttribute('aria-current');
+  }
+  const profile = $('#rail-profile');
+  if (profile) {
+    if (S.tab === 'profile' && !S.profileUserId) profile.setAttribute('aria-current', 'page');
+    else profile.removeAttribute('aria-current');
   }
 }
 
@@ -6348,7 +6430,7 @@ function renderRail() {
     </label>
     ${railProjectRows(projectScoped)}
     <div class="grow" id="rail-projects-end"></div>`;
-  // Your profile lives in the top bar (#topbar-user), not the rail. Project and
+  // Your profile and inbox live at the rail's foot (#rail-profile, #bell). Project and
   // organization entries are real <a> links — installLinkRouter() routes their
   // plain click in place and the browser handles new-tab gestures.
   if (!searching) {
@@ -6664,25 +6746,26 @@ function taskMatches(t, q) {
   return s.split(/\s+/).every((term) => !term || hay.includes(term));
 }
 
-// The default list transparently hides two kinds of nesting unless the query opts in:
-// the auto-spawned *runs* of a repeatable series (`-is:run`), and delegated *sub-tasks*
-// (`-is:subtask`) — a sub-task lives under its parent's detail page, not as a sibling
-// at the top level, so a fan-out of children doesn't flood the list. Its parent still
-// shows, and you drill into children with `is:subtask` (or the Repeatable view). These
-// are therefore just facets, not toggles. The clean `S.search` stays in the box; only
-// the evaluated query carries the defaults. If the query already mentions a facet, we
-// leave it. Archived tasks are not hidden implicitly: the views that leave them out say
-// `-is:archived`, so an empty query is every task. The task-picker overlay passes its
-// own facet list.
+// The default list folds two kinds of nesting unless the query opts in: the
+// auto-spawned *runs* of a repeatable series, and delegated *sub-tasks* — a sub-task
+// lives under its parent's detail page, not as a sibling at the top level, so a
+// fan-out of children doesn't flood the list. Its parent still shows, and you drill
+// into children with `is:subtask` (or the Repeatable view). One that needs you is not
+// folded (`-is:folded` keeps it), so For me is always Active narrowed to your asks
+// (pramana#149). The clean `S.search` stays in the box; only the evaluated query
+// carries the defaults. If the query already mentions a facet, we leave it. Archived
+// tasks are not hidden implicitly: the views that leave them out say `-is:archived`,
+// so an empty query is every task. The task-picker overlay passes its own facet list.
 function queryMentionsFacet(q, facet) { return new RegExp(`(^|\\s)-?(is|has):[^\\s]*${facet}`, 'i').test(q || ''); }
 // A `for:` query asks what waits on a person, wherever it sits: a sub-task or a
 // run that needs a human routes to them, so those facets are not hidden.
 function queryNamesPerson(q) { return /(^|\s)for:\S/i.test(q || ''); }
-function listShowsNested(q, facet) { return queryMentionsFacet(q, facet) || queryNamesPerson(q); }
 function effectiveQuery(q, facets = ['run', 'subtask']) {
   let s = (q || '').trim();
-  for (const facet of facets)
-    if (!queryMentionsFacet(s, facet) && !queryNamesPerson(s)) s = `${s} -is:${facet}`.trim();
+  if (queryNamesPerson(s) || queryMentionsFacet(s, 'folded')) return s;
+  const hidden = facets.filter((facet) => !queryMentionsFacet(s, facet));
+  if (hidden.length === 2) return `${s} -is:folded`.trim();
+  for (const facet of hidden) s = `${s} -is:${facet}`.trim();
   return s;
 }
 
@@ -6832,9 +6915,10 @@ function menuFieldByKey(key) { return allMenuFields().find((f) => f.key === key)
 function queryToolbarHtml(q, prefix, trailing = '') {
   const fields = allMenuFields();
   const params = paramMenuFields();
-  // Filter menu: everything with discrete-ish values (skip free-text title/notes),
-  // but always include param fields even though they're text-typed.
-  const filterFields = fields.filter((f) => f.type !== 'text' && !f.param && !f.groupOnly);
+  // Filter menu: everything with discrete-ish values (skip free-text title/notes,
+  // which bare words already search), plus the conversation, which they don't;
+  // param fields get their own group below.
+  const filterFields = fields.filter((f) => (f.type !== 'text' || f.key === 'conversation') && !f.param && !f.groupOnly);
   const grpFields = fields.filter((f) => f.groupable || f.param);
   const sortFields = fields.filter((f) => f.sortable || f.param);
   const curGroup = (q.match(/(?:^|\s)group:(\S+)/) || [])[1] || '';
@@ -6887,23 +6971,15 @@ function tasksView() {
   // Only while its series is live: a run whose task was un-ticked, moved to
   // drafts or deleted is an ordinary task (the server's `is:run` agrees).
   const nestedRun = (t) => !!t.params?.runOf && isSeries(loaded.get(t.params.runOf)?.params);
-  // Runs nest under their series row and sub-tasks nest under their parent's detail page,
-  // so by default neither belongs in the flat top-level list. The server already drops both
-  // (the -is:run/-is:subtask defaults from effectiveQuery); this is the client-side fallback,
-  // and it opts back in when the query explicitly asks for that facet (the Sub-tasks view's
-  // `is:subtask`, or a hand-typed `is:run`) so those views aren't stripped to empty.
-  const keepRun = listShowsNested(S.search, 'run');
-  const keepSub = listShowsNested(S.search, 'subtask');
-  const topLevel = (t) => (keepRun || !nestedRun(t)) && (keepSub || !t.parentTaskId);
-  // The server already applied the query. The fallback (before the first result lands)
-  // filters the open project's rows, which never include archived ones.
-  // Before the first result the open project's rows are a fair preview of a text
-  // search, but not of a structured one (for:, status:…) nor of the home's.
+  // The server already applied the query, folding included (effectiveQuery). Before
+  // the first result lands, the open project's rows are a fair preview of a text
+  // search, but not of a structured one (for:, status:…) nor of the home's; the
+  // preview folds every sub-task and run, and never shows archived rows.
   const preview = !across && !/(^|\s)-?[\w.#-]+:/.test(S.search || '');
-  const flat = (r
+  const flat = r
     ? r.tasks
-    : preview ? S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived).slice().sort(byLastUpdate) : []
-  ).filter(topLevel);
+    : preview ? S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived && !nestedRun(t) && !t.parentTaskId)
+      .slice().sort(byLastUpdate) : [];
   const row = (t, opts = {}) => taskRow(t, { ...opts, ...(across ? { showTags: false, project: true } : {}) });
   const groups = r && r.groups ? r.groups : null;
   const count = flat.length;
@@ -6915,11 +6991,11 @@ function tasksView() {
   } else if (groups) {
     body = r.hierarchical
       ? [
-        ...(groups.find((g) => g.key === '__untagged__')?.tasks || []).filter(topLevel).map((t) => row(t, { showTags: false })),
-        ...groups.filter((g) => g.key !== '__untagged__').map((g) => tagGroupHtml(g, topLevel)),
+        ...(groups.find((g) => g.key === '__untagged__')?.tasks || []).map((t) => row(t, { showTags: false })),
+        ...groups.filter((g) => g.key !== '__untagged__').map((g) => tagGroupHtml(g)),
       ].join('')
       : groups.map((g) => {
-        const gt = g.tasks.filter(topLevel);
+        const gt = g.tasks;
         return `<h2 class="task-group-heading">${esc(g.label)} <span class="task-group-count">${gt.length} task${gt.length === 1 ? '' : 's'}</span></h2>${gt.map((t) => row(t)).join('')}`;
       }).join('');
   } else {
@@ -7030,9 +7106,13 @@ function storeActionHtml(item, projectId) {
 // A store task's own form: /<org>/<project>/store/<id>.
 function storeTaskRoute(projectId, id) { return `${projectBase(projectId)}/store/${encodeURIComponent(id)}`; }
 // On the organization home a store task asks which project it is for: the
-// row's state and actions there would be about a project nobody chose.
+// row's state and actions there would be about a project nobody chose. With
+// one project there is nobody to ask, so it shows that project's.
+function storeAsksProject() {
+  return S.tab === 'home' && (S.projects || []).filter((project) => project.organizationId === S.organizationId).length > 1;
+}
 function storeRowHtml(item) {
-  const home = S.tab === 'home';
+  const home = storeAsksProject();
   const projectId = storeProjectId();
   const installed = !home && item.repeatable ? item.installed?.length || 0 : 0;
   const need = home ? null : storeNeed(item);
@@ -7043,9 +7123,9 @@ function storeRowHtml(item) {
   return `<div class="task-row store-row has-row-link" data-store-task="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(item.name)}">
       <div class="task-main">
         <div class="task-title">${esc(item.name)} ${item.summary ? policyTip(item.summary) : ''}</div>
-        ${installed || need ? `<div class="task-sub">${installed ? `<span class="chip">${installed > 1 ? `${installed} installed` : 'Installed'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>` : ''}
+        ${need ? `<div class="task-sub"><span>${esc(need[0])}</span></div>` : ''}
       </div>
-      <div class="task-right">${action}</div>
+      <div class="task-right">${installed ? `<span class="store-installed">✓ ${installed > 1 ? `${installed} installed` : 'Installed'}</span>` : ''}${action}</div>
       ${link}
     </div>`;
 }
@@ -7073,6 +7153,10 @@ async function applyStoreTaskRoute(projectId, id, routeIsCurrent) {
   openTaskForm(item.task.workflow || NEW_TASK_WORKFLOW, undefined, '',
     carried || { ...item.task.params, prompt: item.task.prompt, template: item.id }, { projectId, store: item });
 }
+// A series' newest run (null when it has none, or they cannot be read).
+function newestRun(seriesId) {
+  return api(`/api/tasks/${seriesId}/runs`).then((runs) => runs.reduce((a, b) => (b.createdAt > (a?.createdAt ?? 0) ? b : a), null)).catch(() => null);
+}
 function storeBackRoute() { return S.returnRoute || listRoute(projectBase(S.projectId), STORE_VIEW_QUERY); }
 function closeStoreTask() {
   const back = storeBackRoute();
@@ -7088,50 +7172,10 @@ function storeFormHint(item) {
     ? `<span class="store-need" title="This installs another copy, which runs alongside it">Installed already</span>` : '';
 }
 // Which project a store task chosen on the organization home is for; its form
-// opens there. With one project there is nothing to ask.
+// opens there.
 function chooseStoreProject(id) {
-  const projects = (S.projects || []).filter((project) => project.organizationId === S.organizationId);
-  const open = (projectId) => { rememberNewTaskProject(projectId); spaNavigate(storeTaskRoute(projectId, id)); };
-  if (projects.length === 1) return open(projects[0].id);
-  if (!projects.length) return;
   const name = (S.taskStore?.[storeProjectId()] || []).find((item) => item.id === id)?.name || 'Task';
-  const previousFocus = document.activeElement;
-  const root = createTransientOverlay();
-  root.innerHTML = `<div class="palette-scrim" id="sp-scrim"><div class="palette store-project-picker" role="dialog" aria-label="${esc(name)}: choose a project">
-    <input id="sp-in" placeholder="${esc(name)} in…" autocomplete="off" aria-label="Project" />
-    <div id="sp-list" role="listbox"></div>
-  </div></div>`;
-  const input = root.querySelector('#sp-in'), list = root.querySelector('#sp-list');
-  const preferred = newTaskProjectId();
-  const all = [...projects].sort((a, b) => (b.id === preferred) - (a.id === preferred));
-  let shown = all, active = 0;
-  const close = () => root.remove();
-  const dismiss = () => { close(); previousFocus?.focus?.(); };
-  const choose = (project) => { if (!project) return; close(); open(project.id); };
-  const draw = () => {
-    list.innerHTML = shown.map((project, i) => `<div class="opt${i === active ? ' active' : ''}" role="option" aria-selected="${i === active}" data-i="${i}" title="${esc(projectPath(project))}">
-      <span class="task-project">${esc(projectSlug(project))}</span>${i === active ? '<span class="key">↵</span>' : ''}</div>`).join('')
-      || '<div class="pal-empty">No such project</div>';
-    list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
-  };
-  input.addEventListener('input', () => {
-    const q = input.value.trim();
-    shown = q ? all.map((project) => ({ project, score: fuzzyScore(q, `${projectSlug(project)} ${project.name || ''}`) })).filter((x) => x.score >= 0)
-      .sort((a, b) => b.score - a.score).map((x) => x.project) : all;
-    active = 0;
-    draw();
-  });
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { e.stopPropagation(); dismiss(); }
-    else if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(shown.length - 1, active + 1); draw(); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
-    else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); choose(shown[active]); }
-  });
-  list.addEventListener('click', (e) => { const o = e.target.closest('.opt'); if (o) choose(shown[Number(o.dataset.i)]); });
-  list.addEventListener('mousemove', (e) => { const o = e.target.closest('.opt'); if (o && Number(o.dataset.i) !== active) { active = Number(o.dataset.i); draw(); } });
-  root.querySelector('#sp-scrim').addEventListener('click', (e) => { if (e.target.id === 'sp-scrim') dismiss(); });
-  draw();
-  input.focus();
+  pickProject(`${name} in…`, (projectId) => spaNavigate(storeTaskRoute(projectId, id)));
 }
 // The store's rows the query's words match (name or summary).
 function storeViewHtml() {
@@ -7204,7 +7248,10 @@ function wireTaskStore() {
       const task = await api(`/api/projects/${encodeURIComponent(projectId)}/task-store/${encodeURIComponent(button.dataset.storeRun)}`, { method: 'POST', body: '{}' });
       await loadTaskStore(projectId, { force: true });
       refreshTasks();
-      if (item?.repeatable) { toast('Installed'); renderMain(); }
+      // One that starts its first run when installed shows that run, as Run does.
+      const run = item?.runOnInstall ? await newestRun(task.id) : null;
+      if (run) { toast('Installed'); go(taskUrl(run.id, run)); }
+      else if (item?.repeatable) { toast('Installed'); renderMain(); }
       else go(taskUrl(task.id, task));
     } catch (e) { button.disabled = false; showTaskError(e, projectId); }
   }));
@@ -7353,7 +7400,7 @@ function wireProjectPicker(button, onPick) {
   });
 }
 
-function tagGroupHtml(group, keep, depth = 0) {
+function tagGroupHtml(group, keep = () => true, depth = 0) {
   const ownTasks = (group.tasks || []).filter(keep);
   const children = (group.children || []).map((child) => tagGroupHtml(child, keep, depth + 1)).join('');
   const count = tagGroupVisibleTasks(group, keep).size;
@@ -7935,7 +7982,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['run'], query 
     return `<div class="pick-row" data-nav data-task="${t.id}">
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">Archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">Repeatable</span>' : ''}${t.params?.avatar ? ` ${avatarChip}` : ''}</div>
-        <div class="task-sub">${organizationWide && t.projectId !== S.projectId ? projectLabel(t) : ''}<span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t, false)}</div>
+        <div class="task-sub">${organizationWide && t.projectId !== S.projectId ? projectLabel(t) : ''}<span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t, false)}</div>
       </div>
       ${mode === 'agent' ? `<span class="pk-caret">${open ? '▾' : '▸'}</span>` : ''}
     </div>${open ? `<div class="pk-sessions">${sessionsHtml(t)}</div>` : ''}`;
@@ -8275,15 +8322,13 @@ function wireTasksView() {
 }
 
 // The quick composer above a project's list, and above the organization home,
-// where it creates the task in the project its picker shows.
-// Home creates in the project its new tasks go to (the form can change it); a project list in that project.
-// `template`: start from a task template instead of the Task defaults alone.
-function openNewTaskForm(template) {
-  const projectId = newTaskTarget();
-  // A task lives in a project: with none yet, make one first.
-  if (!projectId) return toast('Create a project first', false, { label: 'New project', fn: () => newProject() });
+// where it first asks which project (withNewTaskProject).
+// `template`: start from a task template instead of the Task defaults alone; a
+// project's own template starts in that project.
+function openNewTaskForm(template, projectId = template?.projectId) {
+  if (!projectId) return withNewTaskProject((chosen) => openNewTaskForm(template, chosen));
   openTaskForm(template?.workflow || NEW_TASK_WORKFLOW, undefined, '', template?.params,
-    { ...(projectId ? { projectId } : {}), ...(template ? { template } : {}) });
+    { projectId, ...(template ? { template } : {}) });
 }
 function newTaskTarget() { return S.tab === 'home' ? newTaskProjectId() : S.projectId; }
 function wireNewTaskComposer() {
@@ -8324,44 +8369,42 @@ function templatesChanged() {
 function templateScopeLabel(template) { return template.projectId ? '' : 'Organization'; }
 function templatesSettingsRoute(projectId) { return `${projectRoute(projectId, 'settings')}#project-defaults`; }
 
-// The `n` picker: digits pick by number (at once, unless a longer number
-// starts with them), words search the names, Enter takes the highlighted one —
-// with nothing typed, template 0. `pick(template?)` gets the choice (the task
-// form's own button reloads that form); by default it opens the new task form.
-function openTemplatePicker(projectId = newTaskTarget(), pick = openNewTaskForm) {
-  if (!projectId) return pick();
+// A numbered pick list (a .palette): digits pick by number (at once, unless a
+// longer number starts with them), words search the names, Enter takes the
+// highlighted one — with nothing typed, entry `initial`. `entries` are
+// `{ n, name, sub?, search? }`; with `loading`, more are on their way,
+// and digits typed before `setEntries` brings them still pick by number once it
+// does. `pick(entry)` gets the choice.
+function openNumberedPicker({ id, label, placeholder, inputLabel, empty, entries, loading = false, initial = 0, foot = '', pick }) {
   const previousFocus = document.activeElement;
   const root = createTransientOverlay();
-  root.innerHTML = `<div class="palette-scrim" id="tpl-scrim"><div class="palette tpl-picker" role="dialog" aria-label="New task from template">
-    <input id="tpl-in" placeholder="New task from template…" autocomplete="off" aria-label="Template name or number" />
-    <div id="tpl-list" role="listbox"></div>
-    <a class="tpl-manage" href="${esc(templatesSettingsRoute(projectId))}" data-spa>Manage templates</a>
+  root.innerHTML = `<div class="palette-scrim"><div class="palette numbered-picker" id="${id}-picker" role="dialog" aria-label="${esc(label)}">
+    <input id="${id}-in" placeholder="${esc(placeholder)}" autocomplete="off" aria-label="${esc(inputLabel)}" />
+    <div class="numbered-list" id="${id}-list" role="listbox"></div>${foot}
   </div></div>`;
-  const input = root.querySelector('#tpl-in'), list = root.querySelector('#tpl-list');
-  let templates = loadedTemplates(projectId), shown = [], active = 0;
+  const scrim = root.firstElementChild, input = root.querySelector('input'), list = root.querySelector('.numbered-list');
+  let all = entries, ready = !loading, shown = [], active = 0;
   const close = () => root.remove();
   const dismiss = () => { close(); previousFocus?.focus?.(); };
-  const entries = () => [{ n: 0, name: 'Default', template: null }, ...(templates || []).map((template, i) => ({ n: i + 1, name: template.name, template }))];
-  const choose = (entry) => { if (!entry) return; close(); pick(entry.template || undefined); };
+  const choose = (entry) => { if (!entry) return; close(); pick(entry); };
   const draw = () => {
     list.innerHTML = shown.map((entry, i) => `<div class="opt${i === active ? ' active' : ''}" role="option" aria-selected="${i === active}" data-i="${i}">
-      <span class="tpl-num">${entry.n}</span><span class="tpl-name">${esc(entry.name)}</span>${entry.template && templateScopeLabel(entry.template) ? `<span class="pal-sub">${esc(templateScopeLabel(entry.template))}</span>` : ''}${i === active ? '<span class="key">↵</span>' : ''}</div>`).join('')
-      || '<div class="pal-empty">No such template</div>';
+      <span class="tpl-num">${entry.n}</span><span class="tpl-name">${esc(entry.name)}</span>${entry.sub ? `<span class="pal-sub">${esc(entry.sub)}</span>` : ''}${i === active ? '<span class="key">↵</span>' : ''}</div>`).join('')
+      || `<div class="pal-empty">${esc(empty)}</div>`;
     list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
   };
   const update = (typed) => {
     const q = input.value.trim();
-    const all = entries();
     if (/^\d+$/.test(q)) {
       shown = all.filter((entry) => String(entry.n).startsWith(q));
       active = Math.max(0, shown.findIndex((entry) => String(entry.n) === q));
       // A number nothing longer starts with is a choice already.
-      if (typed && templates && shown.length === 1 && String(shown[0].n) === q) return choose(shown[0]);
+      if (typed && ready && shown.length === 1 && String(shown[0].n) === q) return choose(shown[0]);
     } else if (q) {
-      shown = all.map((entry) => ({ entry, score: fuzzyScore(q, entry.name) })).filter((x) => x.score >= 0)
+      shown = all.map((entry) => ({ entry, score: fuzzyScore(q, entry.search || entry.name) })).filter((x) => x.score >= 0)
         .sort((a, b) => b.score - a.score).map((x) => x.entry);
       active = 0;
-    } else { shown = all; active = 0; }
+    } else { shown = all; active = Math.max(0, Math.min(initial, all.length - 1)); }
     draw();
   };
   input.addEventListener('input', () => update(true));
@@ -8373,18 +8416,67 @@ function openTemplatePicker(projectId = newTaskTarget(), pick = openNewTaskForm)
   });
   list.addEventListener('click', (e) => { const o = e.target.closest('.opt'); if (o) choose(shown[Number(o.dataset.i)]); });
   list.addEventListener('mousemove', (e) => { const o = e.target.closest('.opt'); if (o && Number(o.dataset.i) !== active) { active = Number(o.dataset.i); draw(); } });
-  root.querySelector('#tpl-scrim').addEventListener('click', (e) => { if (e.target.id === 'tpl-scrim') dismiss(); });
-  root.querySelector('.tpl-manage').addEventListener('click', () => close());
+  scrim.addEventListener('click', (e) => { if (e.target === scrim) dismiss(); });
   update(false);
   input.focus();
-  // Always fresh (someone may have added one); digits typed before the list
-  // arrived still pick by number once it does.
-  projectTemplates(projectId, true).then((list) => {
-    if (!root.isConnected) return;
-    const picked = templates === null;
-    templates = list;
-    update(picked && !!input.value.trim());
-  });
+  return {
+    root,
+    close,
+    setEntries(next) {
+      if (!root.isConnected) return;
+      const early = !ready && !!input.value.trim();
+      all = next;
+      ready = true;
+      update(early);
+    },
+  };
+}
+
+// Which of the organization's projects something goes in, numbered in the
+// sidebar's order so a number always means the same project. Enter takes the
+// one new tasks went to last; the choice is remembered. With one project there
+// is nothing to ask.
+function pickProject(placeholder, onPick) {
+  const projects = inSidebarOrder((S.projects || []).filter((project) => project.organizationId === S.organizationId));
+  const open = (projectId) => { rememberNewTaskProject(projectId); onPick(projectId); };
+  if (projects.length < 2) return projects[0] && open(projects[0].id);
+  const preferred = newTaskProjectId();
+  openNumberedPicker({ id: 'pp', label: 'Choose a project', placeholder, inputLabel: 'Project name or number',
+    empty: 'No such project', initial: Math.max(0, projects.findIndex((project) => project.id === preferred)),
+    entries: projects.map((project, i) => ({ n: i + 1, name: projectPath(project) || project.name, search: `${projectPath(project)} ${projectSlug(project)}`, project })),
+    pick: (entry) => open(entry.project.id) });
+}
+// Runs `then(projectId)` in the project a new task goes to. On the
+// organization home that is a choice, unless its query names a project
+// already; elsewhere it is the project you are in.
+function withNewTaskProject(then) {
+  if (S.tab !== 'home' || queryProjectSlug(S.search)) {
+    const projectId = newTaskTarget();
+    // A task lives in a project: with none yet, make one first.
+    return projectId ? then(projectId) : toast('Create a project first', false, { label: 'New project', fn: () => newProject() });
+  }
+  if (!(S.projects || []).some((project) => project.organizationId === S.organizationId)) {
+    return toast('Create a project first', false, { label: 'New project', fn: () => newProject() });
+  }
+  pickProject('New task in…', then);
+}
+
+// The `n` picker: template 0 is the Task defaults. `pick(template?)` gets the
+// choice (the task form's own button reloads that form); by default it opens
+// the new task form — on the organization home, after asking which project.
+function openTemplatePicker(projectId, pick) {
+  if (!projectId) return withNewTaskProject((chosen) => openTemplatePicker(chosen, (template) => openNewTaskForm(template, chosen)));
+  pick ||= (template) => openNewTaskForm(template, projectId);
+  const entries = (templates) => [{ n: 0, name: 'Default', template: null },
+    ...templates.map((template, i) => ({ n: i + 1, name: template.name, sub: templateScopeLabel(template), template }))];
+  const loaded = loadedTemplates(projectId);
+  const picker = openNumberedPicker({ id: 'tpl', label: 'New task from template', placeholder: 'New task from template…',
+    inputLabel: 'Template name or number', empty: 'No such template', entries: entries(loaded || []), loading: !loaded,
+    foot: `<a class="tpl-manage" href="${esc(templatesSettingsRoute(projectId))}" data-spa>Manage templates</a>`,
+    pick: (entry) => pick(entry.template || undefined) });
+  picker.root.querySelector('.tpl-manage').addEventListener('click', () => picker.close());
+  // Always fresh (someone may have added one).
+  projectTemplates(projectId, true).then((list) => picker.setEntries(entries(list)));
 }
 
 /** Asks what to call a new template and where it belongs. Resolves
@@ -9134,14 +9226,30 @@ function readinessGaps(readiness) {
       tip: `No ${name} login or API key is switched on for this project.` });
   }
   const compute = readiness.compute;
-  if (compute && !compute.ready) gaps.push(compute.outOfCredit
-    ? { label: 'Get compute', href: `${settings}#settings-plan`, tip: compute.outOfCredit }
-    : { label: 'Connect a computer', href: `${settings}#settings-computers`, tip: 'There is nowhere for this task to run yet.' });
+  const plan = `${settings}#settings-plan`, computers = `${settings}#settings-computers`;
+  const providers = 'E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud';
+  // Out of compute: never bought a plan (need: plan) or spent this month's (credit).
+  const need = compute?.need ?? (compute?.outOfCredit ? 'credit' : 'computer');
+  if (compute && !compute.ready) gaps.push(...(need === 'plan' ? [
+    { label: 'Choose a plan', href: plan, tip: `${siteName()}’s computers come with Individual or Team.` },
+    { label: 'Connect your own computer', href: computers, tip: `Run tasks on your own ${providers} account.` }]
+    : need === 'credit' ? [{ label: 'Add compute', href: plan, tip: compute.outOfCredit || 'This month’s compute is used up.' },
+      { label: 'Use your own account', href: computers, tip: `Run tasks on your own ${providers} account instead.` }]
+    : [{ label: 'Connect a computer', href: computers, tip: 'There is nowhere for this task to run yet.' }]));
+  // Full storage does not stop a task, but nothing new it saves is kept.
+  const storage = readiness.storage;
+  if (storage?.full) gaps.push({ label: 'Add storage', href: plan, warn: true,
+    tip: `Storage is full (${formatBytes(storage.usedBytes)} of ${formatBytes(storage.quotaBytes)}). New project data isn’t saved until you free some or add a 100 GB pack.` });
   return gaps;
 }
 function readinessNoticeHtml(gaps) {
-  return gaps.length ? `<span class="tf-ready-mark" aria-hidden="true">!</span><span>Can’t start yet:</span> ${gaps
-    .map((gap) => `<a data-spa href="${esc(gap.href)}" title="${esc(gap.tip)}">${esc(gap.label)}</a>`).join('<span class="tf-ready-sep" aria-hidden="true">·</span>')}` : '';
+  if (!gaps.length) return '';
+  const link = (gap) => `<a data-spa href="${esc(gap.href)}" title="${esc(gap.tip)}">${esc(gap.label)}</a>`;
+  const sep = '<span class="tf-ready-sep" aria-hidden="true">·</span>';
+  const blocking = gaps.filter((gap) => !gap.warn), warnings = gaps.filter((gap) => gap.warn);
+  return `<span class="tf-ready-mark" aria-hidden="true">!</span>${[
+    blocking.length ? `<span>Can’t start yet:</span> ${blocking.map(link).join(sep)}` : '',
+    warnings.length ? `<span>Storage is full:</span> ${warnings.map(link).join(sep)}` : ''].filter(Boolean).join(sep)}`;
 }
 // Keeps the task form's readiness notice in step with the agents it names.
 function wireTaskReadiness(page, projectId) {
@@ -9184,7 +9292,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   activeTaskFormKeyController?.abort();
   activeTaskFormKeyController = null;
   const formToken = (activeFormToken = {});
-  // The shell (topbar/rail) stays live behind the page, so the user can navigate
+  // The shell (sidebar) stays live behind the page, so the user can navigate
   // mid-edit. Pin the project NOW: every later write (auto-save flush, submit)
   // must land in the project the form was opened in, not wherever S.projectId
   // points by the time the async chain runs.
@@ -9210,7 +9318,6 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const armed = draft?.params?.triggerState === 'armed'; // a "waiting for trigger" task
   const series = isSeries(draft?.params); // a repeatable template
   const editInPlace = armed || series; // neither has a running workflow — edit its stored params
-  const workflowEditable = !draft || !!draft.params?.draft;
   // A new task can start over from another template (a fork keeps its own form).
   const templatePickable = !draft && !templateEdit && !opts?.fork && !store;
   // Carry over seed text (or whatever was typed before switching
@@ -9299,13 +9406,14 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           <div class="tf-head-end">
             <span class="tf-savestate save-state quiet" id="tf-savestate" role="status"></span>
             ${templatePickable ? `<button type="button" class="tf-template" id="tf-template" title="Start from a template" aria-label="Template${opts?.template ? `: ${esc(opts.template.name)}` : ''}">${ICON.template}${opts?.template ? `<span class="tf-template-label">${esc(opts.template.name)}</span>` : ''}</button>` : ''}
-            <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${taskFormWorkflows(wf, draft).map((w) => `<option value="${esc(w.id)}" ${w.id === wf ? 'selected' : ''}>${esc(w.label)}</option>`).join('')}</select>
           </div>
         </div>
       </div>
+      ${awaitingApproval(draft) ? '<div class="tf-approval" id="tf-approval" hidden></div>' : ''}
       <div class="tf-scroll">
         <div class="tf-columns parameter-fields" id="tf-body" data-project-id="${esc(projectId)}">
           <div class="tf-main">
+            ${templateEdit ? '' : '<div class="tf-ready" id="tf-ready" role="status" hidden></div>'}
             ${promptField ? renderField(promptField, values[promptField.name], inherited[promptField.name], true) : ''}
             ${agentFields.map((f) => `<section class="tf-section tf-${esc(f.type)}">${agentSectionHtml(f)}</section>`).join('')}
             ${otherFields.length ? `<section class="tf-section tf-where">${renderFields(otherFields, values, inherited)}</section>` : ''}
@@ -9340,7 +9448,6 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         <div class="tf-foot-inner">
           ${templateEdit ? '<span class="tf-hint"></span>' : `<button class="btn ghost" id="tf-save-template" title="Save this form as a template, to start new tasks from" aria-label="Save as template">${ICON.template}<span class="tf-save-template-label">Save as template</span></button>
           <span class="tf-hint">${store ? storeFormHint(store) : ''}</span>
-          <span class="tf-ready" id="tf-ready" role="status" hidden></span>
           <button class="btn" id="tf-save-avatar" ${values.avatar ? '' : 'hidden'}>Save as Avatār without running</button>
           <button class="btn" id="tf-draft">Save draft</button>`}
           <button class="btn primary" id="tf-queue">${templateEdit ? 'Save template' : editInPlace ? 'Save' : store?.repeatable && values.repeatable ? 'Install' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
@@ -9359,33 +9466,6 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // Reassigned below once auto-save is wired; flushes pending edits before closing.
   const navigatingAway = () => !!root.querySelector('#tf-page')?.dataset.navigating;
   let closeForm = () => { const navigating = navigatingAway(); releaseFormKeys(); root.innerHTML = ''; leavePage(navigating); };
-  $('#tf-wf')?.addEventListener('change', async () => {
-    const select = $('#tf-wf');
-    const nextWorkflow = select.value;
-    const st = formState();
-    clearTimeout(saveTimer);
-    select.disabled = true;
-    try {
-      await persistDraft(st);
-      if (draftId) {
-        const changed = await api(`/api/tasks/${draftId}/workflow`, {
-          method: 'PATCH', body: JSON.stringify({ workflow: nextWorkflow }),
-        });
-        const at = S.tasks.findIndex((task) => task.id === draftId);
-        if (at >= 0 && changed.task) S.tasks[at] = changed.task;
-        return openTaskForm(nextWorkflow, changed.task, undefined, undefined, { page });
-      }
-      const carried = consumingField(fields)
-        ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(consumingField(fields).name)}"]`)?.value
-        : '';
-      openTaskForm(nextWorkflow, undefined, (carried || '').trim(), undefined, { projectId,
-        ...(templateEdit ? { templateEdit: { ...templateEdit, name: $('#tf-template-name')?.value ?? '' } } : {}) });
-    } catch (error) {
-      select.value = wf;
-      select.disabled = !workflowEditable;
-      toast(error.message, true);
-    }
-  });
   // Another project: the same form there, with what you wrote. Its settings
   // are that project's defaults; the draft auto-save made here moves with you.
   wireProjectPicker($('#tf-project'), async (nextProjectId) => {
@@ -9692,7 +9772,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         // chain link can land after a NEWER form instance has mounted its own head.
         if (activeFormToken === formToken) paintSaveState($('#tf-savestate'), 'saved', editInPlace ? 'Saved' : 'Draft saved');
         refreshTasks();
-      } catch {
+      } catch (error) {
+        if (await startedMeanwhile(error)) return;
         // Auto-save used to fail silently, leaving the form looking saved while
         // the latest edit existed only in this tab. Keep the form open and the
         // dirty signature retryable, but tell the user the durable write missed.
@@ -9703,6 +9784,33 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     });
     return saveChain;
   }
+
+  // A started task's live page replaces the one rendered under the form.
+  const showStartedPage = async () => {
+    S.attemptGroup = null; // its cached record still says draft
+    // The page under the form was rendered while it was a draft; never
+    // show it for a frame while the task list reloads.
+    renderTaskLoadingPage(taskRecord(draft.id) || draft);
+    await refreshTasks();
+    if (S.selected === draft.id) {
+      history.replaceState({ kx: 1 }, '', taskUrl(draft.id));
+      openTask(draft.id, null, S.viewingAttempt === draft.id);
+    }
+  };
+  // An armed task's trigger can fire while its form is open — a save that
+  // meets its dependency does (#805). Its params are then the running task's,
+  // so a later save is refused: show the task running instead.
+  const startedMeanwhile = async (error) => {
+    if (error?.code !== 'task_started' || !draft) return false;
+    if (activeFormToken !== formToken) return true; // closed already
+    clearTimeout(saveTimer);
+    releaseFormKeys();
+    root.innerHTML = '';
+    toast('Task started');
+    if (page && S.selected === draft.id) await showStartedPage();
+    else { refreshTasks(); goToTask(draft.id); }
+    return true;
+  };
 
   // Debounced auto-save while typing.
   let saveTimer = null;
@@ -9777,6 +9885,46 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       ...(formImages.length ? { images: [...formImages] } : {}), ...(formFiles.length ? { files: [...formFiles] } : {}) } }));
     leavePage(navigating);
   };
+
+  // A task waiting for approval says what it asks for, and its approvers decide
+  // here: approving runs it (armed while what it waits for is unfinished),
+  // denying leaves it a draft. Either way its page opens as it now is.
+  if (awaitingApproval(draft)) (async () => {
+    const box = $('#tf-approval');
+    const organizationId = projectOrganizationId || S.organizationId || '';
+    const requests = (await api(`/api/authorization-requests?taskId=${encodeURIComponent(draft.id)}&organizationId=${encodeURIComponent(organizationId)}`)
+      .catch(() => [])).filter((request) => request.status === 'pending');
+    const items = requests.some((request) => requestedCredentialIds(request).length)
+      ? await api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId)}`).catch(() => []) : [];
+    if (activeFormToken !== formToken || !box?.isConnected) return;
+    box.innerHTML = approvalBannerHtml(requests, items);
+    box.hidden = !requests.length;
+    const buttons = () => box.querySelectorAll('button');
+    buttons().forEach((button) => button.addEventListener('click', async () => {
+      const act = button.dataset.areqAct;
+      buttons().forEach((b) => { b.disabled = true; });
+      try {
+        // Decide on the task as last edited here.
+        clearTimeout(saveTimer);
+        if (edited) await persistDraft();
+        const result = await api(`/api/authorization-requests/${encodeURIComponent(button.closest('[data-areq]').dataset.areq)}/resolve?organizationId=${encodeURIComponent(organizationId)}`,
+          { method: 'POST', body: JSON.stringify({ action: act }) });
+        toast(act === 'deny' ? 'Authorization denied' : result.queued ? 'Approved — task queued' : 'Authorization approved');
+      } catch (error) {
+        buttons().forEach((b) => { b.disabled = false; });
+        toast(error.message, true);
+        return;
+      }
+      releaseFormKeys();
+      root.innerHTML = '';
+      loadInbox().catch(() => {});
+      if (!page || S.selected !== draft.id) { refreshTasks(); return; }
+      S.attemptGroup = null;
+      renderTaskLoadingPage(taskRecord(draft.id) || draft);
+      await refreshTasks();
+      if (S.selected === draft.id) openTask(draft.id);
+    }));
+  })();
 
   // ── Templates: this form as a template (Save as template), or a template's own form ──
   const templateBody = (st = formState()) => ({ workflow: wf, params: st.body, notes: st.notes,
@@ -9939,9 +10087,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       }
       succeeded = true;
       // Running a repeatable task starts a new task, its run: name it and go
-      // there, so it is never mistaken for this one (#616/#617).
-      const run = !editInPlace && !draftMode && st.body.repeatable && !st.body.triggers?.length && primaryId
-        ? await api(`/api/tasks/${primaryId}/runs`).then((runs) => runs.reduce((a, b) => (b.createdAt > (a?.createdAt ?? 0) ? b : a), null)).catch(() => null)
+      // there, so it is never mistaken for this one (#616/#617). So does
+      // installing a store task that runs when installed.
+      const run = !editInPlace && !draftMode && st.body.repeatable && (!st.body.triggers?.length || store?.runOnInstall) && primaryId
+        ? await newestRun(primaryId)
         : null;
       releaseFormKeys();
       root.innerHTML = '';
@@ -9963,17 +10112,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       if (page && S.selected === draft.id) {
         // A saved draft leaves its page like Back; a started one shows its live page.
         if (draftMode) closeTask();
-        else {
-          S.attemptGroup = null; // its cached record still says draft
-          // The page under the form was rendered while it was a draft; never
-          // show it for a frame while the task list reloads.
-          renderTaskLoadingPage(taskRecord(draft.id) || draft);
-          await refreshTasks();
-          if (S.selected === draft.id) {
-            history.replaceState({ kx: 1 }, '', taskUrl(draft.id));
-            openTask(draft.id, null, S.viewingAttempt === draft.id);
-          }
-        }
+        else await showStartedPage();
       }
       // Keep the toast in the button's vocabulary: "Run task" → "Task started",
       // whether the task was just written or was an existing draft. Starting an
@@ -9984,6 +10123,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         : draftMode ? (st.body.avatar ? 'Saved as Avatār' : 'Draft saved') : 'Task started');
       refreshTasks();
     } catch (e) {
+      if (await startedMeanwhile(e)) {
+        succeeded = true;
+        return true;
+      }
       if (!draftMode && isAuthorizationGrantGap(e)) {
         try {
           // The refusal names the agent whose authority exceeds the user's (`do`,
@@ -10186,7 +10329,6 @@ async function renderSeriesPage(rec) {
           <span class="chip">Repeatable</span>
         </div>
         <div class="meta">
-          <span>${esc(workflowLabel(wf))}</span>
           ${rec.params?.triggers?.length ? `<span>${esc(triggerSummary(rec.params.triggers))}</span>` : ''}
           <span>${runs.length} run${runs.length === 1 ? '' : 's'}</span>
         </div>
@@ -11245,7 +11387,6 @@ function renderTaskPage() {
   wirePullRequestMenu(v);
   wireAttempts(v);
   wireStageTransitions(v);
-  wireWorkflowMode(v);
   wireTiming(v);
   wireActions(v); // the footer action bar lives on every view
   wireTaskRail(v); // so does the details rail (agents, priority/tags, notes, …)
@@ -11279,6 +11420,7 @@ function renderTaskPage() {
   if (thread) {
     restoreThreadSelection(thread, threadSel);
     wireMessageCopies(thread);
+    wireMessageForms(thread, v);
     typesetMath(thread);
   }
   restoreFocus(main, focusState);
@@ -11397,40 +11539,6 @@ function restoreThreadSelection(thread, snap) {
     sel.removeAllRanges();
     sel.addRange(range);
   } catch {}
-}
-
-function wireWorkflowMode(v) {
-  const select = document.getElementById('tp-workflow-mode');
-  if (!select) return;
-  select.addEventListener('change', async () => {
-    const prior = v.workflow;
-    const workflow = select.value;
-    select.disabled = true;
-    try {
-      const changed = await api(`/api/tasks/${v.taskId}/workflow`, {
-        method: 'PATCH',
-        body: JSON.stringify({ workflow }),
-      });
-      v.workflow = changed.workflow;
-      const rec = taskRecord(v.taskId);
-      if (rec) rec.workflow = changed.workflow;
-      toast(changed.workflow === 'goal'
-        ? 'Goal mode enabled — the agent will continue autonomously'
-        : 'Software Dev mode enabled — the task will stop at Review');
-      await Promise.all([refreshTask(), refreshTasks()]);
-      // The workflow just changed, and param defaults key off it — reload them here
-      // (refreshTask deliberately doesn't, to avoid a git subprocess per WS refresh).
-      loadParamDefaults(v.taskId).then((d) => {
-        if (S.selected !== v.taskId) return;
-        S.paramDefaults = d;
-        if (S.taskTab === 'parameters') renderTaskPage();
-      });
-    } catch (e) {
-      select.value = prior;
-      select.disabled = !v.workflowSwitchable;
-      toast(e.message, true);
-    }
-  });
 }
 
 // Switch the open task page to another of its tabs, pinning the tab in the URL
@@ -11951,7 +12059,7 @@ async function showArtifactViewer({ name, url, view, text, refresh, gallery }) {
   const content = dialog.querySelector('.artifact-reader-content');
   const links = () => dialog.querySelectorAll('[data-download], [data-new-tab]');
   let media = null, current = null, refreshedAt = 0, closed = false;
-  const point = (href) => links().forEach((link) => { link.href = href; });
+  const point = (href) => links().forEach((link) => { link.href = link.hasAttribute('data-download') ? downloadHref(href) : href; });
   const stopMedia = () => { if (media) { media.removeAttribute('src'); media.load?.(); } media = null; };
   // Show one file in the open card (the first, or the next one stepped to).
   const mount = (item) => {
@@ -12069,8 +12177,14 @@ async function downloadArtifact({ url, name }) {
   const head = await fetch(url, { method: 'HEAD' }).catch(() => null);
   if (!head?.ok) throw new Error(`Could not download ${name}`);
   const anchor = document.createElement('a');
-  anchor.href = url; anchor.download = name; anchor.rel = 'noopener';
+  anchor.href = downloadHref(url); anchor.download = name; anchor.rel = 'noopener';
   document.body.appendChild(anchor); anchor.click(); anchor.remove();
+}
+
+// A browser ignores `download` on a link to another origin (the artifact edge),
+// so the URL itself asks to be saved rather than shown.
+function downloadHref(url) {
+  return `${url}${url.includes('?') ? '&' : '?'}download=1`;
 }
 
 // What the viewer needs to show what `POST /review-action` resolved
@@ -12099,8 +12213,13 @@ async function openArtifact(resolved, refresh) {
 function isReviewTile(a) { return a.kind === 'open' && !/^https?:\/\//i.test(a.target || ''); }
 
 // Signed artifact URLs of a task's open actions, shared by the thumbnails and
-// the viewer: one resolve per action an hour (a signed URL lasts one).
+// the viewer: one resolve per action an hour (a signed URL lasts one). A saved
+// file's URL names its content, so the browser keeps its bytes for that hour;
+// a republished Review gets new URLs.
 const reviewArtifactUrls = new Map();
+function forgetReviewArtifactUrls(taskId) {
+  for (const key of reviewArtifactUrls.keys()) if (key.startsWith(`${taskId}\n`)) reviewArtifactUrls.delete(key);
+}
 function resolveReviewArtifact(v, index, fresh = false) {
   const action = v.reviewInfo?.actions?.[index];
   const key = `${v.taskId}\n${index}\n${action?.target || ''}`;
@@ -12667,7 +12786,8 @@ function checkoutsSection(v) {
     const row = own.get(c.name);
     if (row) {
       const landed = row.label === 'Landed';
-      return `<div class="checkout-row ${landed ? 'landed' : ''}" data-branch-state="${esc(row.label)}"${c.branch ? ` title="⎇ ${esc(c.branch)}"` : ''}>
+      const tip = [row.rec?.title, c.branch && `⎇ ${c.branch}`].filter(Boolean).map(esc).join('&#10;');
+      return `<div class="checkout-row ${landed ? 'landed' : ''}" data-branch-state="${esc(row.label)}"${tip ? ` title="${tip}"` : ''}>
       <span class="checkout-mark">${landed ? '✓' : ''}</span>
       ${checkoutLabel(v, c.name)}
       <span class="checkout-target">→ ${esc(row.lane.target)}</span>
@@ -12698,11 +12818,13 @@ function pullRequestAsks(v) {
 
 // Each pull request of its own waiting to be approved, as a small box at the
 // end of the conversation; approved, it stays to show it landing, then goes.
+// Named by its title: one branch can send several pull requests in turn, and
+// by its branch alone the next looks like the one just approved (pramana#137).
 function conversationPullRequestAsks(v) {
   const asks = pullRequestAsks(v);
   return asks.length ? `<div class="pr-asks" id="task-pr-asks">${asks.map((row) => `<div class="pr-ask" data-branch-state="${esc(row.label)}">
-      ${checkoutLabel(v, row.lane.checkout)}
-      <span class="pr-ask-target">→ ${esc(row.lane.target)}</span>
+      ${row.rec?.title ? `<b class="pr-ask-title" title="${esc(row.rec.title)}">${esc(row.rec.title)}</b>` : ''}
+      <span class="pr-ask-target">${row.rec?.title ? esc(row.lane.checkout === v?.worldWiki ? 'Wiki' : row.lane.checkout) : checkoutLabel(v, row.lane.checkout)} → ${esc(row.lane.target)}</span>
       ${pullRequestLink(row.pr)}
       <a class="btn sm ghost" data-open="${esc(row.lane.childTaskId)}" data-spa href="${esc(taskUrl(row.lane.childTaskId, row.rec))}" title="Its Review: what it changes">Open</a>
       ${row.approvable ? approvePullRequestButton(row, 'btn sm primary') : pullRequestChip(row)}
@@ -12990,8 +13112,11 @@ function conversationPane(v, t) {
   }
   const resourceRequestIndex = v.stage === 'review' && requestedInput
     ? entries.findLastIndex((entry) => entry.type === 'input-request' && entry.request.text === requestedInput) : -1;
+  // A form is live in the latest agent message that has one, until a person answers.
+  const formIndex = canFollowUp && followUp.enabled ? liveFormIndex(entries) : -1;
   const row = (entry, attrs = '') => renderConversationEntry(
-    entry === entries[resourceRequestIndex] ? { ...entry, resourceReview: true } : entry, v)
+    entry === entries[resourceRequestIndex] ? { ...entry, resourceReview: true }
+      : entry === entries[formIndex] ? { ...entry, formLive: true } : entry, v)
     .replace(' ', ` data-conversation-key="${esc(entry.type === 'activity' ? `activity:${entry.activityRef}` : entry.sourceKey || `explanation:${entry.order}`)}"${attrs} `);
   const working = t.shared ? v.participants.some((p) => p.state === 'running') : v.agentTurn?.role === t.role;
   const outline = conversationOutline(entries, { live: working, asking: !!humanWaitDetail(v) });
@@ -13200,20 +13325,29 @@ function conversationEntries(t) {
   // agent/system messages instead: carry the last real timestamp forward so such a
   // message sorts right after the one it answers, not at the top of the timeline.
   let carriedTs = 0;
+  // The provider item a transcript reply stands for is the turn's final answer
+  // (what the agent said when its turn ended), not narration on the way.
+  const answer = (entry) => { if (entry) entry.answer = true; return false; };
   const messages = (t.messages || [])
     .filter((message) => {
       if (message.role !== 'agent') return true;
       const source = message.sourceActivity;
       if (source) {
-        if (providerActivityRefs.has(`${source.turnId}/${source.id}/${source.attempt}`)) return false;
+        const ref = `${source.turnId}/${source.id}/${source.attempt}`;
+        if (providerActivityRefs.has(ref)) return answer(activities.get(ref));
         // A provider may replace the final item id while completing a streamed
         // message. Keep the identity check primary, then fall back only inside
         // that same turn/attempt so a genuinely repeated reply in another turn
         // remains visible.
-        return !providerGroupTexts.has(`${source.turnId}/${source.attempt}/${conversationTextKey(message.text)}`);
+        const group = `${source.turnId}/${source.attempt}/${conversationTextKey(message.text)}`;
+        return !providerGroupTexts.has(group) || answer(lastProviderMessage.get(group));
       }
       // Replay/back-compat for messages recorded before sourceActivity existed.
-      return !providerTexts.has(conversationTextKey(message.text));
+      if (!providerTexts.has(conversationTextKey(message.text))) return true;
+      for (const entry of visibleActivities) {
+        if (entry.activity.kind === 'message' && conversationTextKey(entry.activity.title) === conversationTextKey(message.text)) answer(entry);
+      }
+      return false;
     })
     .map((message, index) => {
       const real = Number(message.ts) > 100000000000;
@@ -13317,27 +13451,31 @@ function messageOrigin(m) {
 }
 
 // tavya's prompts that hand finished work back to the agent: the proposal came
-// back from checks, a reviewer or landing. Every other prompt of tavya's (a job
+// back from checks, a reviewer or landing, or a notice (a late grant) woke the
+// agent while its work waited in Review. Every other prompt of tavya's (a job
 // or pause ending, its own sub-task's news, a grant it waited for, a nudge)
 // carries on the work it was doing.
 function returnsWork(m) {
-  return /^(review-ci|cv|pr-conflict|pr-refused|merge-revise|landing-retry|integration|integration-wait|ir|restore-refused|resource-merge|resource-integrate)-?\d+$/.test(m.id || '');
+  return !!m.returnsWork || /^(review-ci|cv|pr-conflict|pr-refused|merge-revise|landing-retry|integration|integration-wait|ir|restore-refused|resource-merge|resource-integrate)-?\d+$/.test(m.id || '');
 }
 
-// The conversation as people read it: what they said and the agent's answers
-// to them (its last message before the work came back to it — a failed check,
-// a conflict, a reviewer's revision — or the message they replied to, or one
-// addressed to a person) stay in view. Everything between — tool steps,
-// progress notes, tavya's prompts and the agent's replies to those — folds
-// into one line. `live`: the agent is working, so the latest work is not yet
-// answered and stays open; `asking`: the task waits on a person's answer to
-// its latest message.
+// The conversation as people read it: what they said and what the agent said
+// to them stays in view — every turn's final answer (the harnesses mark it: the
+// message a turn ends with, as against the narration between its tool calls),
+// the message a person replied to, and one addressed to a person. Once tavya
+// hands the work back on its own (a failed check, a conflict, a reviewer's
+// revision), only the last answer of that stretch stays. Everything else —
+// tool steps, narration, tavya's prompts and the agent's replies to the
+// handed-back work — folds into one line. The agent's answer to a person's
+// message (`reply`) is its last before the work came back to it. `live`: the
+// agent is working, so the latest work is not yet answered and stays open;
+// `asking`: the task waits on a person's answer to its latest message.
 function conversationOutline(entries, options) {
   const live = !!options?.live, asking = !!options?.asking;
   const kinds = entries.map((entry) => {
     if (entry.type === 'input-request') return 'spine';
     if (entry.type === 'explanation') return 'note';
-    if (entry.type === 'activity') return entry.activity?.kind === 'message' ? 'said' : 'work';
+    if (entry.type === 'activity') return entry.activity?.kind !== 'message' ? 'work' : entry.answer ? 'answer' : 'said';
     const m = entry.message || {};
     const origin = messageOrigin(m);
     if (origin === 'person') return 'person';
@@ -13346,17 +13484,19 @@ function conversationOutline(entries, options) {
     // bring finished work back start a new round; the rest are the same work.
     if (m.role === 'system') return 'spine';
     if (origin === 'platform') return returnsWork(m) ? 'prompt' : 'work';
-    return (m.to || []).some((selector) => !selector.startsWith('agent:')) ? 'spine' : 'said';
+    return (m.to || []).some((selector) => !selector.startsWith('agent:')) ? 'spine' : 'answer';
   });
   const spine = kinds.map((kind) => kind === 'person' || kind === 'spine');
   const reply = new Set();
   const keep = (i) => { if (i >= 0) spine[i] = true; };
-  const lastSaid = (from, to) => { for (let i = to - 1; i >= from; i--) if (kinds[i] === 'said') return i; return -1; };
+  const said = (kind) => kind === 'said' || kind === 'answer';
+  const lastSaid = (from, to) => { for (let i = to - 1; i >= from; i--) if (said(kinds[i])) return i; return -1; };
   const starts = [0, ...kinds.flatMap((kind, i) => kind === 'person' && i > 0 ? [i] : [])];
   starts.forEach((start, r) => {
     const end = starts[r + 1] ?? entries.length;
     let prompt = kinds[start] === 'person' ? start + 1 : start;
     while (prompt < end && kinds[prompt] !== 'prompt') prompt++;
+    for (let i = start; i < prompt; i++) if (kinds[i] === 'answer') keep(i);
     // The person's message is answered by the last thing the agent said before
     // the work first came back to it — unless it is still working on that answer.
     if (!(live && prompt === end && end === entries.length)) reply.add(lastSaid(start, prompt));
@@ -13377,7 +13517,7 @@ function conversationOutline(entries, options) {
     const tavyas = run[0].type === 'message' && run[0].message?.role === 'user';
     if (run.length === 1 && !tavyas) items.push({ entry: run[0] });
     else {
-      const latest = run.findLast((entry, k) => kinds[i + k] === 'said');
+      const latest = run.findLast((entry, k) => said(kinds[i + k]));
       items.push({ fold: true, entries: run, key: `fold:${run[0].sourceKey || run[0].activityRef || i}`,
         automatic: run.filter((entry, k) => kinds[i + k] === 'prompt').length,
         latest: latest || run.find((entry, k) => kinds[i + k] === 'prompt'),
@@ -13556,8 +13696,8 @@ function annotateWorldFileLinks(html, v = S.view) {
 // What a person is asked to do. A landing ask (open the upstream pull request)
 // is tavya's own text: its links are app routes and GitHub pages, never
 // citations of files in the task's world.
-function renderWaitDetail(text, v = S.view, math = mathjaxEnabled()) {
-  if (v?.waitingFor?.reason !== 'merge') return renderAgentMessageBody(text, v, math);
+function renderWaitDetail(text, v = S.view, math = mathjaxEnabled(), form = null) {
+  if (v?.waitingFor?.reason !== 'merge') return renderAgentMessageBody(text, v, math, form);
   if (markdownEnabled()) return renderMessageBody(text, math);
   const link = /\[([^\]\n]+)\]\(([^\s)]+)\)/g;
   let html = '';
@@ -13569,8 +13709,231 @@ function renderWaitDetail(text, v = S.view, math = mathjaxEnabled()) {
   return html + esc(String(text).slice(at));
 }
 
-function renderAgentMessageBody(text, v = S.view, math = mathjaxEnabled()) {
-  return markdownEnabled() ? annotateWorldFileLinks(renderMessageBody(text, math), v) : renderConversationText(text, 'agent', v);
+function renderAgentMessageBody(text, v = S.view, math = mathjaxEnabled(), form = null) {
+  return markdownEnabled() ? withMessageForms(annotateWorldFileLinks(renderMessageBody(text, math), v), form, v) : renderConversationText(text, 'agent', v);
+}
+
+// ── message forms ────────────────────────────────────────────────────────────
+// An agent asks for input with a ```form fence (web/markdown.js parseForm) and
+// the conversation draws it as a form. The latest one nobody has answered yet,
+// in a conversation the person may reply to, is live; what they submit is sent
+// as their ordinary reply — the same follow-up as typing it — so the agent
+// reads "- Region: eu-west" exactly as if it had been typed.
+//
+// A form with `save` first makes that request from this browser, as the person
+// and with their authority (so it can only change what they could change in
+// Settings), then tells the agent it was saved and where. It may only write
+// settings (SETTINGS_TARGETS), and a secret field only into the write-only
+// secret field of a secret store, as a whole value: a secret typed into a form
+// is never shown in the conversation, kept in its history or read back.
+const FORM_BLOCK = /<pre class="md-code lang-form"><code>([\s\S]*?)<\/code><\/pre>/g;
+const SECRET_FIELD_KEY = /^(?:value|secret|secrets|key|apiKey|api_key|token|password|clientSecret|privateKey|totp)$/i;
+// [method, path, what it is (from the path's ids and the body), a secret store?]
+const SETTINGS_TARGETS = [
+  ['POST', /^\/api\/projects\/([^/]+)\/secrets$/, (m, b) => `${formLiteral(b.name) ? `${b.name} · ` : ''}${formProjectName(m[1])} secrets`, true],
+  ['PUT', /^\/api\/projects\/([^/]+)\/environment$/, (m) => `${formProjectName(m[1])} environment`],
+  ['PATCH', /^\/api\/projects\/([^/]+)$/, (m) => `${formProjectName(m[1])} settings`],
+  ['PUT', /^\/api\/settings\/project\/([^/]+)\/[^/]+$/, (m) => `${formProjectName(m[1])} task defaults`],
+  ['PUT', /^\/api\/settings\/managed-compute\/([^/]+)$/, (m) => `Managed compute · ${formProviderName(m[1])}`, true],
+  ['PUT', /^\/api\/settings\/[\w/-]+$/, () => 'Installation settings'],
+  ['PATCH', /^\/api\/organizations\/([^/]+)$/, (m) => `${formOrganizationName(m[1])} settings`],
+  ['POST', /^\/api\/organizations\/([^/]+)\/accounts$/, (m) => `${formOrganizationName(m[1])} agent accounts`, true],
+  ['PATCH', /^\/api\/organizations\/([^/]+)\/accounts\/keys\/[^/]+\/[^/]+$/, (m) => `${formOrganizationName(m[1])} agent accounts`, true],
+  ['PUT', /^\/api\/organizations\/([^/]+)\/world-providers\/([^/]+)$/, (m) => `${formProviderName(m[2])} computers · ${formOrganizationName(m[1])}`, true],
+  ['POST', /^\/api\/organizations\/([^/]+)\/storage$/, (m) => `${formOrganizationName(m[1])} storage`, true],
+  ['POST', /^\/api\/vault\/items$/, (m, b) => `Passwords${formLiteral(b.label) ? ` · ${b.label}` : ''}`, true],
+  ['POST', /^\/api\/mcp$/, (m, b) => `MCP servers${formLiteral(b.label) ? ` · ${b.label}` : ''}`, true],
+  ['PUT', /^\/api\/connections\/config$/, () => 'App connections', true],
+  ['PATCH', /^\/api\/user\/preferences$/, () => 'Your preferences'],
+];
+function formLiteral(value) { return typeof value === 'string' && value && !value.includes('{{'); }
+function formProjectName(id) { const p = projectById(decodeURIComponent(id)); return p ? p.name : 'Project'; }
+function formOrganizationName(id) { return organizationById(decodeURIComponent(id))?.name || 'Organization'; }
+function formProviderName(id) { return S.meta?.worldProviders?.find?.((p) => p.id === id)?.label || id; }
+
+/** Where a form's `save` writes, in words, and whether it may hold secrets — or null when a form may not write there. */
+function settingsTarget(save) {
+  const path = save.path.split('?')[0];
+  for (const [method, pattern, describe, secret] of SETTINGS_TARGETS) {
+    const match = save.method === method && pattern.exec(path);
+    if (match) return { label: describe(match, save.body || {}), secret: !!secret };
+  }
+  return null;
+}
+
+/** Why a form's secrets could leak through where it saves them, if they could. */
+function formSecretLeak(form, target) {
+  const secrets = new Set(form.fields.filter((field) => field.type === 'secret').map((field) => field.name));
+  if (!secrets.size) return '';
+  if (!target.secret) return 'This form would save a secret where it can be read back, so it was not shown.';
+  let leak = '';
+  const walk = (value, key) => {
+    if (typeof value === 'string') {
+      for (const [, name] of value.matchAll(/\{\{\s*([\w.-]+)\s*\}\}/g)) {
+        if (!secrets.has(name)) continue;
+        if (!/^\{\{\s*[\w.-]+\s*\}\}$/.test(value) || !SECRET_FIELD_KEY.test(String(key))) leak = 'This form would save a secret where it can be read back, so it was not shown.';
+      }
+    } else if (Array.isArray(value)) value.forEach((item) => walk(item, key));
+    else if (value && typeof value === 'object') Object.entries(value).forEach(([k, item]) => walk(item, k));
+  };
+  walk(form.save.body, '');
+  return leak;
+}
+
+function decodeHtml(html) {
+  const area = document.createElement('textarea');
+  area.innerHTML = html;
+  return area.value;
+}
+
+/** The forms in a rendered agent message, drawn live or read-only (`ctx`: {key, live}). */
+function withMessageForms(html, ctx, v = S.view) {
+  if (!html.includes('lang-form')) return html;
+  let index = 0;
+  return html.replace(FORM_BLOCK, (block, code) => {
+    const key = `${v?.taskId || 'task'}/${ctx?.key || 'message'}/${index++}`;
+    const parsed = KarmaxMarkdown.parseForm(decodeHtml(code));
+    const target = parsed.form?.save ? settingsTarget(parsed.form.save) : null;
+    const problem = parsed.error || (parsed.form.save && !target ? 'This form would change something outside settings, so it was not shown.' : '')
+      || (target ? formSecretLeak(parsed.form, target) : '');
+    // The agent's mistake stays readable: what went wrong, with its source folded.
+    if (problem) return `<details class="ask-form-problem"><summary>${esc(problem)}</summary>${block}</details>`;
+    const form = parsed.form;
+    const live = !!ctx?.live && !S.answeredForms?.has(key);
+    // What wireMessageForms submits: the form as read, by its key on the page.
+    if (live) (S.formSpecs ||= new Map()).set(key, form);
+    const secret = form.fields.some((field) => field.type === 'secret');
+    const note = target ? `${secret ? ICON.lock : ''}<span>${secret ? 'Saved to' : 'Saves to'} <b>${esc(target.label)}</b>${secret ? ', not into the conversation' : ''}</span>` : '';
+    return KarmaxMarkdown.renderForm(form, { key, live, values: S.formDrafts?.[key] || {}, note, error: S.formErrors?.[key] || '' });
+  });
+}
+
+/** Whether a message holds a form (cheap: before rendering). */
+function hasMessageForm(text) { return /```form[ \t]*\n/i.test(String(text || '')); }
+/** An entry's agent-written text, if it has some. */
+function agentEntryText(entry) {
+  if (entry.type === 'input-request') return entry.request?.text || '';
+  if (entry.type === 'message') return entry.message?.role === 'agent' ? entry.message.text : '';
+  return entry.type === 'activity' && entry.activity?.kind === 'message' ? entry.activity.title : '';
+}
+/** The entry whose forms are live: the last with a form, unless a person has spoken since. */
+function liveFormIndex(entries) {
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (entry.type === 'message' && entry.message?.role === 'user' && messageOrigin(entry.message) === 'person') return -1;
+    if (hasMessageForm(agentEntryText(entry))) return index;
+  }
+  return -1;
+}
+/** What names a form on the page: its entry, and the form's place in it. */
+function formEntryKey(entry) {
+  return entry.type === 'activity' ? `activity:${entry.activityRef}` : entry.sourceKey || entry.message?.id || 'message';
+}
+
+/** The values a person entered, by field name, as the form's fields say. */
+function messageFormValues(formEl, form, submitter) {
+  const data = new FormData(formEl);
+  if (submitter?.name) data.set(submitter.name, submitter.value);
+  const values = {};
+  for (const field of form.fields) {
+    if (field.type === 'toggle') values[field.name] = data.has(field.name);
+    else if (field.type === 'choice' && field.multiple) values[field.name] = data.getAll(field.name).map(String);
+    else if (field.type === 'number') { const raw = String(data.get(field.name) ?? '').trim(); if (raw !== '') values[field.name] = Number(raw); }
+    else { const raw = String(data.get(field.name) ?? ''); if (raw.trim() !== '') values[field.name] = field.type === 'secret' ? raw : raw.trim(); }
+  }
+  return values;
+}
+
+/** What the agent reads: the answer as the person might have typed it. Secrets are never in it. */
+function messageFormAnswer(form, values, target) {
+  const optionText = (field, value) => {
+    const option = field.options.find((o) => o.value === value);
+    return !option ? value : option.label === option.value ? option.label : `${option.label} (${option.value})`;
+  };
+  if (form.quick) return optionText(form.fields[0], values[form.fields[0].name]);
+  const shown = (field) => {
+    const value = values[field.name];
+    if (field.type === 'secret') return value ? 'saved' : '';
+    if (field.type === 'toggle') return value ? 'Yes' : 'No';
+    if (field.type === 'choice') return (Array.isArray(value) ? value : value ? [value] : []).map((item) => optionText(field, item)).join(', ');
+    return value == null ? '' : String(value);
+  };
+  const lines = form.fields.map((field) => [field.label || field.name, shown(field), field.type === 'paragraph'])
+    .filter(([, text]) => text !== '')
+    .map(([label, text, long]) => long && text.includes('\n') ? `- ${label}:\n\n${text.split('\n').map((line) => `  ${line}`).join('\n')}` : `- ${label}: ${text}`);
+  return `${lines.join('\n')}${target ? `\n\nSaved to ${target.label}.` : ''}`;
+}
+
+/** `{{name}}` in a save's body → that field's value (a whole "{{name}}" keeps the value's type). */
+function fillFormTemplate(body, values) {
+  if (typeof body === 'string') {
+    const whole = /^\{\{\s*([\w.-]+)\s*\}\}$/.exec(body);
+    if (whole) return values[whole[1]] ?? '';
+    return body.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (_, name) => values[name] == null ? '' : String(values[name]));
+  }
+  if (Array.isArray(body)) return body.map((item) => fillFormTemplate(item, values));
+  if (body && typeof body === 'object') return Object.fromEntries(Object.entries(body).map(([key, item]) => [key, fillFormTemplate(item, values)]));
+  return body;
+}
+
+function wireMessageForms(root, v) {
+  S.formDrafts ||= {};
+  S.formErrors ||= {};
+  S.answeredForms ||= new Set();
+  root.querySelectorAll('form.ask-form.live:not([data-wired])').forEach((formEl) => {
+    formEl.dataset.wired = '1';
+    const key = formEl.dataset.form;
+    const form = S.formSpecs?.get(key);
+    if (!form) return;
+    // A draft survives the conversation's live repaints (never a secret: that stays in the field alone).
+    formEl.addEventListener('input', () => {
+      const values = messageFormValues(formEl, form);
+      for (const field of form.fields) if (field.type === 'secret') delete values[field.name];
+      S.formDrafts[key] = values;
+    });
+    formEl.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (formEl.getAttribute('aria-busy') === 'true') return;
+      if (!formEl.reportValidity()) return;
+      const submitter = event.submitter;
+      const values = messageFormValues(formEl, form, submitter);
+      const role = formEl.closest('.ck-thread')?.dataset.role || 'do';
+      const target = form.save ? settingsTarget(form.save) : null;
+      const button = submitter || formEl.querySelector('.ask-submit');
+      formEl.setAttribute('aria-busy', 'true');
+      formEl.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+      const feedback = beginActionFeedback(button);
+      let ok = false;
+      try {
+        if (form.save) {
+          try {
+            await api(form.save.path, { method: form.save.method, body: JSON.stringify(fillFormTemplate(form.save.body, values)) });
+          } catch (error) {
+            throw Object.assign(error, { formMessage: `Not saved: ${plainError(error)}` });
+          }
+        }
+        const author = formEl.closest('[data-form-author]')?.dataset.formAuthor;
+        const result = await postReply(v, role, { text: messageFormAnswer(form, values, target), to: [author || defaultRecipientFor(v)] });
+        ok = true;
+        S.answeredForms.add(key);
+        delete S.formDrafts[key];
+        delete S.formErrors[key];
+        if (result?.continuedIn) return followContinuation(v, result);
+        toast(form.save ? 'Saved' : 'Sent');
+        showSentReply(v, role, result);
+      } catch (error) {
+        S.formErrors[key] = error.formMessage || plainError(error);
+        const box = formEl.querySelector('.ask-error') || formEl.querySelector('.ask-actions, .ask-quick')?.insertAdjacentElement('afterend', Object.assign(document.createElement('div'), { className: 'ask-error', role: 'alert' }));
+        if (box) box.textContent = S.formErrors[key];
+      } finally {
+        finishActionFeedback(feedback, ok);
+        if (!ok) {
+          formEl.removeAttribute('aria-busy');
+          formEl.querySelectorAll('button').forEach((b) => { b.disabled = false; });
+        }
+      }
+    });
+  });
 }
 
 function explanationModelLabel(model = S.explanationSettings?.model) {
@@ -13613,16 +13976,18 @@ function renderConversationEntry(entry, v = S.view) {
   if (entry.type === 'input-request') {
     const escalate = v.waitingFor?.kind === 'human' || v.waitingFor?.kind === 'parent'
       ? `<button class="btn sm ghost escalate-request" title="Pass this to someone who can answer">Escalate…</button>` : '';
-    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div>${v.waitingFor?.reason === 'error' ? taskErrorHtml(entry.request.text) : `<div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math)}</div>`}${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div>${v.waitingFor?.reason === 'error' ? taskErrorHtml(entry.request.text) : `<div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math, { key: formEntryKey(entry), live: !!entry.formLive })}</div>`}${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
   }
   if (entry.type === 'message') {
     const m = entry.message;
     const shared = sharedConversation(v);
     const role = shared ? messageSpeaker(m, v) : m.role === 'user' ? (messageOrigin(m) === 'platform' ? siteName() : 'You') : m.role === 'agent' ? 'Agent' : 'System';
-    const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v, math) : renderMessageBody(m.text, math);
+    const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v, math, { key: formEntryKey(entry), live: !!entry.formLive }) : renderMessageBody(m.text, math);
     const otherAgent = shared && m.role === 'agent' && m.author && m.author !== 'do' ? ' other-agent' : '';
     const platform = m.role === 'user' && messageOrigin(m) === 'platform' ? ' platform' : '';
-    return `<div class="msg ${m.role}${otherAgent}${platform}"><div class="msg-meta"><span class="role">${esc(role)}</span>${shared ? recipientsHtml(m, v) : ''}${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${body}</div>${renderMessageImages(m.images)}${renderMessageFiles(m.files)}${m.role === 'agent' ? explainMessageAffordance(entry, v) : ''}</div>`;
+    // A form's answer goes back to the agent that asked (in a shared conversation).
+    const asker = shared && m.role === 'agent' && entry.formLive ? ` data-form-author="agent:${esc(m.author || 'do')}"` : '';
+    return `<div class="msg ${m.role}${otherAgent}${platform}"${asker}><div class="msg-meta"><span class="role">${esc(role)}</span>${shared ? recipientsHtml(m, v) : ''}${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${body}</div>${renderMessageImages(m.images)}${renderMessageFiles(m.files)}${m.role === 'agent' ? explainMessageAffordance(entry, v) : ''}</div>`;
   }
   if (entry.type === 'explanation') {
     const e = entry.explanation;
@@ -13631,7 +13996,8 @@ function renderConversationEntry(entry, v = S.view) {
   const a = entry.activity;
   const speaker = entry.speaker ? participantLabelOf(entry.speaker, v) : 'Agent';
   if (a.kind === 'message') {
-    return `<div class="msg agent${entry.speaker && entry.speaker !== 'do' ? ' other-agent' : ''}"><div class="msg-meta"><span class="role">${esc(speaker)}</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v, math)}</div>${explainMessageAffordance(entry, v)}</div>`;
+    const asker = sharedConversation(v) && entry.formLive ? ` data-form-author="agent:${esc(entry.speaker || 'do')}"` : '';
+    return `<div class="msg agent${entry.speaker && entry.speaker !== 'do' ? ' other-agent' : ''}"${asker}><div class="msg-meta"><span class="role">${esc(speaker)}</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v, math, { key: formEntryKey(entry), live: !!entry.formLive })}</div>${explainMessageAffordance(entry, v)}</div>`;
   }
   const icons = { reasoning: '◇', command: '›_', file: '±', tool: '⚙', search: '⌕', subagent: '⑂', status: '·', turn: '●', error: '!' };
   const detail = a.detail
@@ -13874,7 +14240,7 @@ function portableForkCommandFor(session, cwd) {
     'mkdir -p "$HOME/.codex/sessions/tavya"',
     `cp -n "${source}" "$HOME/.codex/sessions/tavya/${filename}"`,
     `cd ${shellQuote(cwd)}`,
-    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.162.1"} fork ${shellQuote(sessionId)}`,
+    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.166.0"} fork ${shellQuote(sessionId)}`,
   ].join('\n');
   if (session.provider === 'claude') return [
     `tavya_cwd="$(cd ${shellQuote(cwd)} && pwd -P)"`,
@@ -14097,7 +14463,6 @@ function parametersTab(v) {
   // The rest mirrors the task form: its agents, where it runs, when it starts,
   // and the logins it may use.
   return `
-    ${workflowSection(v)}
     ${paramsSection(v)}
     <div class="label-row tp-creds-head"><label>Accounts</label>${policyTip('The Claude and Codex accounts this task runs on, first available first. Drag to reorder; switch one off to skip it, for this task only.')}<span class="label-row-fill"></span></div>
     <div id="cred-editor-task" data-live-key="${esc(v.taskId)}">Loading…</div>`;
@@ -14277,7 +14642,7 @@ function renderDiff(d) {
 function waitingLabel(w) {
   if (!w) return '';
   switch (w.kind) {
-    case 'account': return w.earliestResetAt ? 'quota' : 'credential';
+    case 'account': return 'model login';
     case 'agentSlot': return 'agent';
     case 'mergeSlot': return 'merge';
     case 'github': return /\b(?:ci|checks?|validat(?:e|es|ed|ing|ion))\b/i.test(w.detail || '') ? 'CI' : 'GitHub';
@@ -14295,6 +14660,18 @@ function waitingLabel(w) {
   }
 }
 
+// Why a turn waits for a model login: the coordinator's reason, or, for a view
+// published before it gave one, what its detail says.
+function accountWaitReason(w) {
+  if (w?.reason) return w.reason;
+  const detail = typeof w?.detail === 'string' ? w.detail : '';
+  if (detail.startsWith('Held')) return 'held';
+  if (w?.earliestResetAt || /usage limit|quota/i.test(detail)) return 'quota';
+  if (/free slot|running all it may/.test(detail)) return 'slot';
+  if (/^No \w+ credential|needs attention|^Couldn't read/.test(detail)) return 'login';
+  return '';
+}
+
 // Short status used by the task-page wait card and conversation presence. The
 // workflow's detailed diagnostic remains in durable state/history; copying it
 // into a status label made normal polling look like a stream of new problems.
@@ -14310,9 +14687,18 @@ function waitingText(w) {
   if (w?.kind === 'retry' && typeof w.summary === 'string' && w.summary.trim())
     return `${w.summary.trim().slice(0, 48)}${Number.isFinite(w.until) ? `, trying at ${waitDeadline(w.until)}` : ''}`;
   if (w?.kind === 'retry') return Number.isFinite(w.until) ? `Retrying at ${waitDeadline(w.until)}` : 'Retrying';
-  // The quota scheduler keeps this login's quota for higher-priority work until then.
-  if (w?.kind === 'account' && typeof w.detail === 'string' && w.detail.startsWith('Held'))
-    return Number.isFinite(w.until) ? `Held for higher-priority work until ${waitDeadline(w.until)}` : 'Held for higher-priority work';
+  if (w?.kind === 'account') {
+    const who = w.provider ? ACCOUNT_PROVIDER_LABELS[w.provider] || w.provider : '';
+    switch (accountWaitReason(w)) {
+      // The quota scheduler keeps this login's quota for higher-priority work until then.
+      case 'held': return Number.isFinite(w.until) ? `Held for higher-priority work until ${waitDeadline(w.until)}` : 'Held for higher-priority work';
+      case 'quota': return `Waiting for ${who ? `${who} ` : ''}quota${w.earliestResetAt > Date.now() ? ` until ${waitDeadline(w.earliestResetAt)}` : ''}`;
+      case 'slot': return `Waiting for a free ${who ? `${who} ` : ''}login`;
+      case 'planning': return who ? `Queued for ${who}` : 'Queued';
+      case 'login': return (w.detail || '').startsWith("Couldn't read") ? 'Credential policy unreadable' : `Needs a ${who ? `${who} ` : ''}login`;
+      default: return who ? `Waiting for ${who}` : 'Waiting for a model login';
+    }
+  }
   // A job is shown by the name its agent gave it. The deadline is when the
   // agent resumes even if the job never finishes.
   if (w?.kind === 'job') {
@@ -14338,10 +14724,15 @@ function waitDeadline(until) {
 // The generic header label alone would hide that diagnosis.
 function conversationWaitNotice(v) {
   const w = v.waitingFor;
-  if (w?.kind === 'account' && typeof w.detail === 'string' && w.detail.startsWith('Held'))
+  const reason = w?.kind === 'account' ? accountWaitReason(w) : '';
+  if (reason === 'held')
     return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))} <button type="button" class="btn sm ghost" data-run-now="${esc(v.taskId)}" title="${esc(RUN_NOW_TIP)}">Run now</button></div>`;
+  // The label already says what it waits for and until when; a person can do nothing more here.
+  if (reason === 'quota' || reason === 'slot' || reason === 'planning')
+    return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))}</div>`;
   const detail = presenceDetail(v);
-  return detail ? `<div class="msg system wait-notice" role="status">${esc(waitingText(v.waitingFor))} · ${esc(detail)}${setupFixHtml(w?.detail)}</div>` : '';
+  const raw = typeof w?.detail === 'string' ? w.detail.trim() : '';
+  return detail ? `<div class="msg system wait-notice" role="status"${raw && raw !== detail ? ` title="${esc(raw)}"` : ''}>${esc(waitingText(v.waitingFor))} · ${esc(detail)}${setupFixHtml(w?.detail)}</div>` : '';
 }
 
 // A targeted human hold carries the actual question a person must answer. Keep
@@ -14922,18 +15313,6 @@ function wireNotes(v) {
   ta.addEventListener('blur', save);
 }
 
-// The workflow (and its pinned version) configures the task, so it lives with
-// the parameters rather than in the header of every tab.
-function workflowSection(v) {
-  const version = taskRecord(v.taskId)?.workflowVersion;
-  const mode = v.workflowOptions?.length > 1
-    ? `<select id="tp-workflow-mode" class="q-sel" aria-label="Workflow mode" title="${v.workflowSwitchable ? 'Switch workflow mode' : 'Workflow mode is locked after confirmation begins'}" ${v.workflowSwitchable ? '' : 'disabled'}>
-        ${v.workflowOptions.map((w) => `<option value="${esc(w)}" ${w === v.workflow ? 'selected' : ''}>${esc(workflowLabel(w))}</option>`).join('')}
-      </select>`
-    : `<span>${esc(workflowLabel(v.workflow))}</span>`;
-  return `<div class="tp-workflow"><label>Workflow</label>${mode}${version ? `<span class="mono" title="Workflow version this task is pinned to">v${esc(version)}</span>` : ''}</div>`;
-}
-
 // The fields the Parameters tab shows: the workflow's task fields plus one
 // agent field per agent called into the task with `@` (`agent:agent-N`, its spec
 // in params; listed by `v.participants`, or by the params of a task whose view
@@ -15321,6 +15700,9 @@ function taskActionTip(v, action) {
   if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.reason !== 'merge') return 'Let tavya merge this on GitHub as you.';
   if (action.name === 'openPr') return 'Send the agent’s work so far to Review now.';
   if (action.name === 'cancel') return 'Stop this task. Nothing more is added to the project.';
+  if (action.name === 'retry' && v?.waitingFor?.kind === 'account') return 'Check now whether an AI login can be used again.';
+  // Why it failed, on the button itself: the error is at the end of the conversation.
+  if (action.name === 'retry' && v?.error) return plainTaskError(v.error).summary.replace(/(?<=[.!?])\s+(?:Press )?Retry\b[^.]*\.$/, '') || 'Try the last step again.';
   if (action.name === 'retry') return 'Try the last step again.';
   return '';
 }
@@ -15880,6 +16262,36 @@ function openEscalateDialog(v) {
   });
 }
 
+// A person's reply in a conversation: a message in a shared conversation (to
+// `payload.to`), else a follow-up signal to the conversation's agent. The
+// composer and message forms both send through here.
+function postReply(v, role, payload) {
+  return sharedConversation(v) && role === 'do'
+    ? api(`/api/tasks/${v.taskId}/messages`, { method: 'POST', body: JSON.stringify(payload) })
+    : api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: 'followUp', role,
+      ...Object.fromEntries(Object.entries(payload).filter(([k]) => k !== 'to' && k !== 'agents')) }) });
+}
+// After Confirm a message carries the work on in a new task: go there.
+function followContinuation(v, result) {
+  toast(`Continuing in #${result.continuedIn.num ?? result.continuedIn.id}`);
+  refreshTasks();
+  const { id, num } = result.continuedIn;
+  spaNavigate(taskUrl(id, { projectId: taskRecord(v.taskId)?.projectId || S.projectId, num }));
+}
+// Put a sent reply on screen at once — even if this browser's event WebSocket
+// is reconnecting; the durable WS copy is de-duplicated by conversationEntries
+// once it lands — then show the end of the conversation and refresh.
+function showSentReply(v, role, result, repaint = true) {
+  if (result?.message && !S.taskEvents.some((event) => event.type === 'conversation.message' && event.payload?.message?.id === result.message.id)) {
+    S.taskEvents.push({ type: 'conversation.message', taskId: v.taskId, ts: result.message.ts, payload: { role: result.role || role, message: result.message } });
+  }
+  if (!repaint) return;
+  S.conversationSent = `${v.taskId}/${role}`;
+  renderTaskPage();
+  setTimeout(refreshTask, 250);
+  setTimeout(refreshTasks, 400);
+}
+
 function wireFollowups(v) {
   if (!S.followupImages) S.followupImages = {};
   if (!S.followupFiles) S.followupFiles = {};
@@ -15932,15 +16344,9 @@ function wireFollowups(v) {
         const newAgents = shared ? Object.fromEntries(Object.entries(followupNewAgents(key))
           .filter(([agentKey]) => mentions.some((m) => m.selector === `agent:${agentKey}`))) : {};
         const to = shared ? composeRecipients(text, mentions, defaultRecipientFor(v)) : undefined;
-        const result = shared
-          ? await api(`/api/tasks/${v.taskId}/messages`, { method: 'POST', body: JSON.stringify({ text, to,
-              ...(Object.keys(newAgents).length ? { agents: newAgents } : {}),
-              ...(images.length ? { images: [...images] } : {}), ...(files.length ? { files: [...files] } : {}) }) })
-          : await api(`/api/tasks/${v.taskId}/signal`, {
-          method: 'POST',
-          body: JSON.stringify({ signal: 'followUp', text, role,
-            ...(images.length ? { images: [...images] } : {}), ...(files.length ? { files: [...files] } : {}) }),
-        });
+        const result = await postReply(v, role, { text, ...(shared ? { to } : {}),
+          ...(Object.keys(newAgents).length ? { agents: newAgents } : {}),
+          ...(images.length ? { images: [...images] } : {}), ...(files.length ? { files: [...files] } : {}) });
         sent = true;
         if (shared) {
           countMentions(to);
@@ -15952,17 +16358,10 @@ function wireFollowups(v) {
           delete S.followupHeights[key];
           images.length = 0;
           files.length = 0;
-          toast(`Continuing in #${result.continuedIn.num ?? result.continuedIn.id}`);
-          refreshTasks();
-          const { id, num } = result.continuedIn;
-          spaNavigate(taskUrl(id, { projectId: taskRecord(v.taskId)?.projectId || S.projectId, num }));
+          followContinuation(v, result);
           return;
         }
-        // Render immediately even if this browser's event WebSocket is reconnecting.
-        // The durable WS copy is de-duplicated by conversationEntries once it lands.
-        if (result?.message && !S.taskEvents.some((event) => event.type === 'conversation.message' && event.payload?.message?.id === result.message.id)) {
-          S.taskEvents.push({ type: 'conversation.message', taskId: v.taskId, ts: result.message.ts, payload: { role: result.role || role, message: result.message } });
-        }
+        showSentReply(v, role, result, false);
         // Clear the persisted draft + image store FIRST, so neither the re-render
         // below nor a background refresh can repopulate the box from them. The box
         // content is sourced from S.followupDrafts on every render, so this — not
@@ -15986,10 +16385,7 @@ function wireFollowups(v) {
         if (active?.closest?.('.followup-box')?.dataset.role === role) active.blur();
         toast(shared && to && (to.length > 1 || to[0] !== 'agent:do')
           ? `Sent to ${to.map((selector) => recipientLabel(selector, v)).join(', ')}` : 'Follow-up sent');
-        S.conversationSent = `${v.taskId}/${role}`;
-        renderTaskPage();
-        setTimeout(refreshTask, 250);
-        setTimeout(refreshTasks, 400);
+        showSentReply(v, role, null);
       } catch (e) { toast(e.message, true); }
       finally {
         if (waiting) finishActionFeedback(waiting, sent);
@@ -16876,7 +17272,29 @@ const INSIGHT_LENSES = [
   { key: 'shipped', label: 'Shipped' },
   { key: 'time', label: 'Agent time' },
   { key: 'tokens', label: 'Tokens' },
+  { key: 'compute', label: 'Compute' },
+  { key: 'storage', label: 'Storage' },
 ];
+// What a lens's bars are split by. Tokens by login and compute by anything but
+// time need data only some callers get (credential:read, payment:read).
+const INSIGHT_SPLITS = {
+  tokens: [{ key: 'model', label: 'Model' }, { key: 'login', label: 'Login', needs: (data) => data.logins?.length }],
+  compute: [{ key: 'provider', label: 'Provider' }, { key: 'funding', label: 'Funding' }, { key: 'project', label: 'Project' }, { key: 'size', label: 'Size' }]
+    .map((split) => ({ ...split, needs: (data) => data.compute?.money })),
+  storage: [{ key: 'kind', label: 'Kind' }, { key: 'project', label: 'Project' }],
+};
+const INSIGHT_STORAGE_KINDS = [
+  { key: 'resources', label: 'Data versions', color: 'var(--viz-1)', tip: 'Project data resources, every version kept' },
+  { key: 'workspaces', label: 'Task workspaces', color: 'var(--viz-2)', tip: 'Saved workspaces of tasks: uncommitted work kept while a task sleeps' },
+  { key: 'reviewFiles', label: 'Review files', color: 'var(--viz-3)', tip: 'Files agents attached for review: screenshots, reports, videos' },
+  { key: 'other', label: 'Other', color: 'var(--viz-other)', tip: 'Stored before data had its own repositories' },
+];
+const INSIGHT_FUNDING = {
+  own: { label: 'Own accounts', color: 'var(--viz-1)', tip: 'Your own provider accounts: the provider bills you at its list price' },
+  managed: { label: 'Managed', color: 'var(--viz-2)', tip: 'tavya\'s accounts: charged to your compute credit at twice list price' },
+};
+const INSIGHT_PROVIDERS = { e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', aws: 'AWS', gcp: 'Google Cloud' };
+const insProvider = (provider) => INSIGHT_PROVIDERS[provider] || provider;
 // The org-wide track reuses the task pipeline's stages; `resolve` (conflict
 // resolution) is part of landing.
 const INSIGHT_STAGES = [
@@ -16922,6 +17340,42 @@ function insDuration(ms) {
 }
 const insMoney = (micros) => `$${(Number(micros || 0) / 1e6).toLocaleString(undefined,
   { minimumFractionDigits: micros < 1e8 ? 2 : 0, maximumFractionDigits: micros < 1e8 ? 2 : 0 })}`;
+// Axis ticks: as short as the value allows ($0, $0.5, $12, $1.2k).
+const insMoneyTick = (micros) => {
+  const usd = Number(micros || 0) / 1e6;
+  return usd >= 1000 ? `$${insNum(usd)}` : `$${+usd.toFixed(usd < 1 ? 2 : usd < 10 ? 1 : 0)}`;
+};
+function insBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  const units = ['KB', 'MB', 'GB', 'TB', 'PB'];
+  let amount = bytes, unit = -1;
+  do { amount /= 1024; unit++; } while (amount >= 1024 && unit < units.length - 1);
+  return `${+amount.toFixed(amount >= 100 ? 0 : amount >= 10 ? 1 : 2)} ${units[unit]}`;
+}
+const insPct = (share) => `${Math.round((Number(share) || 0) * 100)}%`;
+// Top three keys by total take the categorical slots; the rest fold into Other.
+function insTopKeys(totals) {
+  return Object.entries(totals).filter(([, value]) => value > 0).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([key]) => key);
+}
+function insStack(daily, pick, keys, label, colors = (_, i) => `var(--viz-${i + 1})`) {
+  const bars = keys.map((key, i) => ({ key, label: label(key), color: colors(key, i), values: daily.map((day) => pick(day)?.[key] || 0) }));
+  const other = daily.map((day) => Object.entries(pick(day) || {}).reduce((sum, [key, n]) => sum + (keys.includes(key) ? 0 : n), 0));
+  if (other.some(Boolean)) bars.push({ key: 'other', label: 'Other', color: 'var(--viz-other)', values: other });
+  return bars;
+}
+// The providers ranked by what they cost in the period: one color each on the whole page.
+function insightProviderColors(compute) {
+  const totals = {};
+  for (const row of compute?.providers || []) totals[row.key] = (totals[row.key] || 0) + (compute.money ? row.listMicros : row.activeSeconds);
+  const ranked = insTopKeys(totals);
+  return { ranked, color: (provider) => { const i = ranked.indexOf(provider); return i < 0 ? 'var(--viz-other)' : `var(--viz-${i + 1})`; } };
+}
+function insightSplit(data, lens) {
+  const splits = (INSIGHT_SPLITS[lens] || []).filter((split) => !split.needs || split.needs(data));
+  const chosen = S.insightsSplit?.[lens];
+  return splits.length ? { splits, key: splits.some((split) => split.key === chosen) ? chosen : splits[0].key } : { splits, key: null };
+}
 
 // Change vs the preceding window of equal length. `better` names the direction
 // that is good news; metrics that are neither (tokens, spend) stay neutral.
@@ -17019,7 +17473,25 @@ function insightKpisHtml(data) {
         : t.tokens ? `${insNum(t.inputTokens)} in · ${insNum(t.outputTokens)} out` : '')}
     ${spend ? tile('Spend', 'Metered model and sandbox cost plus card purchases by agents (USD)', insMoney(t.spendMicros), insDelta(t.spendMicros, p.spendMicros, days),
       spend.cardMicros ? `${insMoney(spend.cardMicros)} on cards` : '') : ''}
+    ${insightComputeTile(data, tile)}${insightStorageTile(data, tile)}
   </div>`;
+}
+
+function insightComputeTile(data, tile) {
+  const c = data.compute;
+  if (!c || !(c.totals.activeSeconds || c.totals.diskGbHours || c.previous.activeSeconds || c.credit)) return '';
+  const time = insDuration(c.totals.activeSeconds * 1000);
+  if (!c.money) return tile('Compute', 'Time machines ran for your tasks', time, insDelta(c.totals.activeSeconds, c.previous.activeSeconds, data.days));
+  return tile('Compute', `What providers bill for your tasks' machines and disks, at list price (${time} of machine time). Managed compute is charged to your credit at ${c.multiplier}× list.`,
+    insMoney(c.totals.listMicros), insDelta(c.totals.listMicros, c.previous.listMicros, data.days),
+    c.totals.chargedMicros ? `${insMoney(c.totals.chargedMicros)} charged` : `${time} machine`);
+}
+
+function insightStorageTile(data, tile) {
+  const st = data.storage;
+  if (!st || !(st.bytes || st.daily.some((d) => d.bytes))) return '';
+  return tile('Storage', 'What managed storage holds now: data versions, task workspaces and review files', insBytes(st.bytes), '',
+    st.quotaBytes ? `${insPct(st.bytes / st.quotaBytes)} of ${insBytes(st.quotaBytes)}` : '');
 }
 
 // Series for the chosen lens: `bars` stack bottom-up; an optional `line` shares
@@ -17028,12 +17500,62 @@ function insightSeries(data, lens) {
   const daily = data.daily;
   if (lens === 'time') return { unit: 'h', bars: [{ label: 'Agent hours', color: 'var(--accent)', values: daily.map((d) => d.agentSeconds / 3600) }] };
   if (lens === 'tokens') {
+    if (insightSplit(data, 'tokens').key === 'login') {
+      // API-equivalent dollars: how subscription quotas are measured, so the
+      // logins' weekly quotas can be drawn on the same axis.
+      const logins = data.logins.filter((login) => !login.unrecorded);
+      const keys = insTopKeys(Object.fromEntries(logins.map((login) => [login.id, login.usd])));
+      const bars = insStack(daily.map((_, i) => Object.fromEntries(logins.map((login) => [login.id, login.daily[i] || 0]))), (d) => d, keys, accountShortName);
+      // Turns from before logins were recorded: gray, apart from the logins' own colors.
+      const unrecorded = daily.map((_, i) => data.logins.filter((login) => login.unrecorded).reduce((sum, login) => sum + (login.daily[i] || 0), 0));
+      if (unrecorded.some(Boolean)) bars.push({ key: 'unrecorded', label: 'Not recorded', color: 'var(--line-strong)', values: unrecorded });
+      const week = logins.reduce((sum, login) => sum + (login.capacity?.week || 0), 0);
+      return { unit: 'usd', bars,
+        ...(week ? { limit: { value: week / 7, label: 'Weekly pace',
+          tip: 'All logins\' weekly quotas spread evenly over the week. Above it, the week runs out early.' } } : {}) };
+    }
     const color = insightModelColors(data.models);
     const top = insightTopTokenModels(data.models);
     const bars = top.map((model) => ({ label: model, color: color(model), values: daily.map((d) => d.tokensByModel[model] || 0) }));
     const other = daily.map((d) => Object.entries(d.tokensByModel).reduce((sum, [model, n]) => sum + (top.includes(model) ? 0 : n), 0));
     if (other.some(Boolean)) bars.push({ label: 'Other', color: 'var(--viz-other)', values: other });
     return { unit: 'tokens', bars };
+  }
+  if (lens === 'compute') {
+    const compute = data.compute;
+    if (!compute) return { unit: 'h', bars: [] };
+    const machine = (i) => [{ label: 'Machine time', value: insDuration(compute.daily[i].activeSeconds * 1000) }];
+    if (!compute.money) return { unit: 'h', bars: [{ label: 'Machine hours', color: 'var(--accent)', values: compute.daily.map((d) => d.activeSeconds / 3600) }] };
+    const split = insightSplit(data, 'compute').key;
+    const extra = (i) => [...(compute.daily[i].chargedMicros ? [{ label: 'Charged to credit', value: insMoney(compute.daily[i].chargedMicros) }] : []), ...machine(i)];
+    let bars;
+    if (split === 'funding') bars = ['own', 'managed'].map((key) => ({ key, label: INSIGHT_FUNDING[key].label, color: INSIGHT_FUNDING[key].color,
+      values: compute.daily.map((d) => d.byFunding[key] || 0) })).filter((bar) => bar.values.some(Boolean));
+    else if (split === 'provider') {
+      const { ranked, color } = insightProviderColors(compute);
+      bars = insStack(compute.daily, (d) => d.byProvider, ranked, insProvider, color);
+    } else {
+      const field = split === 'project' ? 'byProject' : 'bySize';
+      const rows = split === 'project' ? compute.projects : compute.sizes;
+      const keys = insTopKeys(Object.fromEntries(rows.map((row) => [row.key, row.listMicros])));
+      const label = (key) => rows.find((row) => row.key === key)?.label || key || 'Unattributed';
+      bars = insStack(compute.daily, (d) => d[field], keys, label);
+    }
+    return { unit: 'micros', bars, extra };
+  }
+  if (lens === 'storage') {
+    const storage = data.storage;
+    if (!storage) return { unit: 'bytes', bars: [] };
+    const bars = insightSplit(data, 'storage').key === 'project'
+      ? insStack(storage.daily, (d) => d.byProject, insTopKeys(Object.fromEntries(storage.projects.map((p) => [p.id, p.bytes]))),
+        (id) => storage.projects.find((p) => p.id === id)?.name || projectById(id)?.name || id)
+      : INSIGHT_STORAGE_KINDS.map((kind) => ({ key: kind.key, label: kind.label, color: kind.color, values: storage.daily.map((d) => d.byKind[kind.key] || 0) }))
+        .filter((bar) => bar.values.some(Boolean));
+    return { unit: 'bytes', bars,
+      extra: (i) => storage.daily[i].added ? [{ label: 'Uploaded', value: insBytes(storage.daily[i].added) }] : [],
+      note: (i) => storage.daily[i].estimated ? 'Estimated from what is stored now' : '',
+      ...(storage.quotaBytes ? { limit: { value: storage.quotaBytes, label: 'Quota',
+        tip: `Your plan's storage${storage.packs.paid + storage.packs.gifted ? ' with its storage packs' : ''}` } } : {}) };
   }
   return {
     unit: 'tasks',
@@ -17056,7 +17578,9 @@ const insDayLabel = (day, days) => {
   const date = new Date(`${day}T00:00:00Z`);
   return date.toLocaleDateString(undefined, days <= 7 ? { weekday: 'short', timeZone: 'UTC' } : { month: 'short', day: 'numeric', timeZone: 'UTC' });
 };
-const insFmtValue = (value, unit) => unit === 'h' ? insDuration(value * 3_600_000) : unit === 'tokens' ? insNum(value) : String(Math.round(value));
+const insFmtValue = (value, unit) => unit === 'h' ? insDuration(value * 3_600_000) : unit === 'tokens' ? insNum(value)
+  : unit === 'micros' ? insMoney(value) : unit === 'usd' ? insMoney(value * 1e6) : unit === 'bytes' ? insBytes(value) : String(Math.round(value));
+const insFmtTick = (value, unit) => unit === 'micros' ? insMoneyTick(value) : unit === 'usd' ? insMoneyTick(value * 1e6) : insFmtValue(value, unit);
 
 function insightChartSvg(data, lens, width) {
   const series = insightSeries(data, lens);
@@ -17064,15 +17588,20 @@ function insightChartSvg(data, lens, width) {
   const H = 188, padL = 34, padR = 6, padT = 10, padB = 22;
   const plotW = Math.max(40, width - padL - padR), plotH = H - padT - padB;
   const stackTotals = data.daily.map((_, i) => series.bars.reduce((sum, bar) => sum + bar.values[i], 0));
-  const max = Math.max(0, ...stackTotals, ...(series.line?.values || []));
-  const ticks = insNiceTicks(max);
+  const dataMax = Math.max(0, ...stackTotals, ...(series.line?.values || []));
+  // A limit far above the data would flatten it: then it is named, not drawn.
+  const limit = series.limit && dataMax > 0 ? { ...series.limit, onScale: series.limit.value <= dataMax * 4 } : null;
+  const max = Math.max(dataMax, limit?.onScale ? limit.value : 0);
+  // Bytes tick in whole binary units (25 GB, 50 GB), not decimal fractions of them.
+  const scale = series.unit === 'bytes' && max > 0 ? 1024 ** Math.floor(Math.log(max) / Math.log(1024)) : 1;
+  const ticks = insNiceTicks(max / scale).map((tick) => tick * scale);
   const top = ticks.at(-1) || 1;
   const y = (v) => padT + plotH - (v / top) * plotH;
   const band = plotW / n;
   const barW = Math.max(2, Math.min(24, band * 0.64));
   const x = (i) => padL + band * i + band / 2;
   const grid = ticks.map((tick) => `<line class="grid${tick ? '' : ' base'}" x1="${padL}" x2="${padL + plotW}" y1="${y(tick)}" y2="${y(tick)}"/>
-    <text class="tick" x="${padL - 6}" y="${y(tick) + 3}" text-anchor="end">${esc(insFmtValue(tick, series.unit))}</text>`).join('');
+    <text class="tick" x="${padL - 6}" y="${y(tick) + 3}" text-anchor="end">${esc(insFmtTick(tick, series.unit))}</text>`).join('');
   const labelEvery = n <= 7 ? 1 : Math.ceil(n / 6);
   const xLabels = data.daily.map((d, i) => (n - 1 - i) % labelEvery ? '' :
     `<text class="tick" x="${x(i)}" y="${H - 6}" text-anchor="middle">${esc(insDayLabel(d.day, n))}</text>`).join('');
@@ -17094,17 +17623,31 @@ function insightChartSvg(data, lens, width) {
   const line = series.line && max > 0
     ? `<path class="ins-line" stroke="${series.line.color}" d="${series.line.values.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join('')}"/>` : '';
   const empty = max === 0 ? `<text class="ins-empty-t" x="${padL + plotW / 2}" y="${padT + plotH / 2}" text-anchor="middle">No activity in the last ${n} days</text>` : '';
-  return { series, band, padL, x, y, H, svg: `<svg class="ins-svg" width="${width}" height="${H}" viewBox="0 0 ${width} ${H}" role="img"
+  const limitLabel = limit ? `${limit.label} ${insFmtValue(limit.value, series.unit)}` : '';
+  const limitMark = !limit ? '' : limit.onScale
+    ? `<g class="ins-limit"><title>${esc(limit.tip)}</title><line x1="${padL}" x2="${padL + plotW}" y1="${y(limit.value)}" y2="${y(limit.value)}"/>
+      <text x="${padL + plotW}" y="${y(limit.value) - 4}" text-anchor="end">${esc(limitLabel)}</text></g>`
+    : `<g class="ins-limit off"><title>${esc(limit.tip)}</title><text x="${padL + plotW}" y="${padT + 2}" text-anchor="end">${esc(limitLabel)} ↑</text></g>`;
+  return { series, band, padL, x, y, H, limit, svg: `<svg class="ins-svg" width="${width}" height="${H}" viewBox="0 0 ${width} ${H}" role="img"
     aria-label="${esc(`${INSIGHT_LENSES.find((l) => l.key === lens)?.label} per day, last ${n} days`)}">
-    ${grid}${bars}${line}${xLabels}${empty}<rect class="ins-hover" x="0" y="${padT}" width="${barW + 8}" height="${plotH}" rx="4" visibility="hidden"/>
+    ${grid}${bars}${line}${limitMark}${xLabels}${empty}<rect class="ins-hover" x="0" y="${padT}" width="${barW + 8}" height="${plotH}" rx="4" visibility="hidden"/>
     ${series.line ? `<circle class="ins-hover-dot" r="4" fill="${series.line.color}" visibility="hidden"/>` : ''}</svg>` };
 }
 
 function insightLegendHtml(series) {
   const items = [...series.bars.map((bar) => ({ ...bar, kind: 'bar' })), ...(series.line ? [{ ...series.line, kind: 'line' }] : [])];
-  if (items.length < 2) return '';
-  return `<div class="ins-legend">${items.map((item) =>
-    `<span><i class="${item.kind}" style="background:${item.color}"></i>${esc(item.label)}</span>`).join('')}</div>`;
+  const limit = series.limit ? `<span title="${esc(series.limit.tip)}"><i class="limit"></i>${esc(series.limit.label)}</span>` : '';
+  if (items.length < 2 && !limit) return '';
+  return `<div class="ins-legend">${items.length < 2 ? '' : items.map((item) =>
+    `<span><i class="${item.kind}" style="background:${item.color}"></i>${esc(item.label)}</span>`).join('')}${limit}</div>`;
+}
+
+// The chosen lens's split (Model · Login, Provider · Funding…), beside the legend.
+function insightSplitHtml(data, lens) {
+  const { splits, key } = insightSplit(data, lens);
+  if (splits.length < 2) return '';
+  return `<div class="ins-seg sm ins-split" role="radiogroup" aria-label="Split by">${splits.map((split) =>
+    `<button type="button" role="radio" aria-checked="${split.key === key}" class="${split.key === key ? 'on' : ''}" data-ins-split="${split.key}">${esc(split.label)}</button>`).join('')}</div>`;
 }
 
 function drawInsightChart(box, data) {
@@ -17114,7 +17657,11 @@ function drawInsightChart(box, data) {
   if (!width) return;
   plot.dataset.width = String(width);
   const chart = insightChartSvg(data, lens, width);
-  box.querySelector('.ins-legend-slot').innerHTML = insightLegendHtml(chart.series);
+  box.querySelector('.ins-legend-slot').innerHTML = `${insightLegendHtml(chart.series)}${insightSplitHtml(data, lens)}`;
+  box.querySelectorAll('[data-ins-split]').forEach((button) => button.addEventListener('click', () => {
+    S.insightsSplit = { ...S.insightsSplit, [lens]: button.dataset.insSplit };
+    drawInsightChart(box, S.insightsData);
+  }));
   plot.innerHTML = `${chart.svg}<div class="ins-tip" hidden></div>`;
   const svg = plot.querySelector('svg'), tip = plot.querySelector('.ins-tip');
   const hover = svg.querySelector('.ins-hover'), dot = svg.querySelector('.ins-hover-dot');
@@ -17130,7 +17677,11 @@ function drawInsightChart(box, data) {
     if (dot) { dot.setAttribute('cx', String(cx)); dot.setAttribute('cy', String(chart.y(chart.series.line.values[i]))); dot.setAttribute('visibility', 'visible'); }
     const rows = [...chart.series.bars, ...(chart.series.line ? [chart.series.line] : [])]
       .map((s) => `<div><i style="background:${s.color}"></i><span>${esc(s.label)}</span><b>${esc(insFmtValue(s.values[i], chart.series.unit))}</b></div>`);
-    tip.innerHTML = `<div class="ins-tip-h">${esc(new Date(`${day.day}T00:00:00Z`).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' }))}</div>${rows.join('')}`;
+    if (chart.series.bars.length > 1) rows.push(`<div class="ins-tip-total"><i></i><span>Total</span><b>${esc(insFmtValue(chart.series.bars.reduce((sum, bar) => sum + bar.values[i], 0), chart.series.unit))}</b></div>`);
+    for (const row of chart.series.extra?.(i) || []) rows.push(`<div class="ins-tip-extra"><i></i><span>${esc(row.label)}</span><b>${esc(row.value)}</b></div>`);
+    if (chart.limit) rows.push(`<div class="ins-tip-extra"><i class="limit"></i><span>${esc(chart.limit.label)}</span><b>${esc(insFmtValue(chart.limit.value, chart.series.unit))}</b></div>`);
+    const note = chart.series.note?.(i);
+    tip.innerHTML = `<div class="ins-tip-h">${esc(new Date(`${day.day}T00:00:00Z`).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' }))}</div>${rows.join('')}${note ? `<div class="ins-tip-note">${esc(note)}</div>` : ''}`;
     tip.hidden = false;
     const left = Math.min(Math.max(0, cx + 14), width - tip.offsetWidth);
     tip.style.left = `${cx + 14 + tip.offsetWidth > width ? Math.max(0, cx - 14 - tip.offsetWidth) : left}px`;
@@ -17176,8 +17727,135 @@ function insightModelsHtml(data) {
   }).join('')}</tbody></table>`;
 }
 
-function insightQuotaHtml(quota) {
-  if (!quota?.logins?.length) return '';
+// A tag naming whose account ran a machine.
+function insFundingTag(funding) {
+  const f = INSIGHT_FUNDING[funding === 'managed' ? 'managed' : 'own'];
+  return `<span class="ins-tag" title="${esc(f.tip)}">${funding === 'managed' ? 'managed' : 'own'}</span>`;
+}
+
+// Machines, broken down one way at a time: list cost, what managed compute
+// charged, and machine time. Amounts only for callers who may see money.
+function insightComputeHtml(data) {
+  const c = data.compute;
+  if (!c || !(c.totals.activeSeconds || c.totals.diskGbHours)) return '';
+  const by = ['provider', 'project', 'task', 'size'].includes(S.insightsComputeBy) ? S.insightsComputeBy : 'provider';
+  const rows = { provider: c.providers, project: c.projects, task: c.tasks, size: c.sizes }[by].slice(0, 8);
+  const { color } = insightProviderColors(c);
+  const charged = c.money && c.totals.chargedMicros > 0;
+  const total = rows.reduce((sum, row) => sum + (c.money ? row.listMicros : row.activeSeconds), 0) || 1;
+  const name = (row) => {
+    if (by === 'provider') return `${esc(insProvider(row.key))} ${insFundingTag(row.funding)}`;
+    if (by === 'task') {
+      const href = row.projectId ? insightTaskHref({ projectId: row.projectId, num: row.num, taskId: row.key }) : null;
+      const title = `${row.num != null ? `<span class="ins-num">#${esc(row.num)}</span> ` : ''}${esc(row.label)}`;
+      return href ? `<a data-spa href="${esc(href)}">${title}</a>` : title;
+    }
+    if (by === 'project' && row.key && projectById(row.key)) return `<a data-spa href="${esc(projectRoute(row.key))}">${esc(row.label)}</a>`;
+    return esc(row.label);
+  };
+  const body = rows.map((row) => {
+    const share = Math.round(((c.money ? row.listMicros : row.activeSeconds) / total) * 100);
+    const disk = row.diskGbHours ? ` · disk ${insNum(row.diskGbHours)} GB·h` : '';
+    return `<tr>
+      <td class="ins-name">${name(row)}<span class="ins-share" title="${share}% of compute${disk}"><i style="width:${share}%;background:${by === 'provider' ? color(row.key) : 'var(--accent)'}"></i></span></td>
+      <td class="num ins-time-col">${esc(insDuration(row.activeSeconds * 1000))}</td>
+      ${c.money ? `<td class="num">${esc(insMoney(row.listMicros))}</td>` : ''}
+      ${charged ? `<td class="num">${row.chargedMicros ? esc(insMoney(row.chargedMicros)) : '<span class="ins-unreported">—</span>'}</td>` : ''}
+    </tr>`;
+  }).join('');
+  const seg = `<div class="ins-seg sm" role="radiogroup" aria-label="Compute by">${[['provider', 'Provider'], ['project', 'Project'], ['task', 'Task'], ['size', 'Size']].map(([key, label]) =>
+    `<button type="button" role="radio" aria-checked="${key === by}" class="${key === by ? 'on' : ''}" data-ins-cby="${key}">${label}</button>`).join('')}</div>`;
+  return `<section class="card ins-card ins-compute"><div class="ins-card-h"><span>Compute</span>${seg}</div>
+    <table class="ins-table"><thead><tr><th><span class="sr-only">${esc(by)}</span></th><th class="num ins-time-col" title="Time machines ran">Machine</th>
+      ${c.money ? '<th class="num" title="What the provider bills, at its list price">List</th>' : ''}
+      ${charged ? `<th class="num" title="Charged to your compute credit: managed compute at ${c.multiplier}× list">Charged</th>` : ''}</tr></thead>
+    <tbody>${body}</tbody></table></section>`;
+}
+
+function wireInsightCompute(box) {
+  box.querySelectorAll('[data-ins-cby]').forEach((button) => button.addEventListener('click', () => {
+    S.insightsComputeBy = button.dataset.insCby;
+    box.querySelector('.ins-compute').outerHTML = insightComputeHtml(S.insightsData);
+    wireInsightCompute(box);
+  }));
+}
+
+// What managed storage holds per project, by kind, against the quota.
+function insightStorageHtml(data) {
+  const st = data.storage;
+  if (!st || !st.bytes) return '';
+  const max = Math.max(1, ...st.projects.map((p) => p.bytes));
+  const kinds = INSIGHT_STORAGE_KINDS.filter((kind) => st.byKind[kind.key] > 0);
+  const packs = st.packs.paid + st.packs.gifted;
+  const quota = st.quotaBytes ? `<span class="ins-count" title="${esc(`Plan ${insBytes(st.includedBytes || 0)}${packs ? ` + ${packs} storage pack${packs === 1 ? '' : 's'} of ${insBytes(st.packs.packBytes)}${st.packs.gifted ? ` (${st.packs.gifted} gifted)` : ''}` : ''}${st.packs.monthlyCents ? ` · $${st.packs.monthlyCents / 100}/month` : ''}`)}">${esc(insBytes(st.bytes))} of ${esc(insBytes(st.quotaBytes))}</span>` : `<span class="ins-count">${esc(insBytes(st.bytes))}</span>`;
+  const meter = st.quotaBytes ? `<div class="ins-meter" aria-hidden="true">${kinds.map((kind) =>
+    `<i style="width:${Math.min(100, (st.byKind[kind.key] / st.quotaBytes) * 100)}%;background:${kind.color}"></i>`).join('')}</div>` : '';
+  const legend = `<div class="ins-legend ins-kinds">${kinds.map((kind) => `<span title="${esc(kind.tip)}"><i style="background:${kind.color}"></i>${esc(kind.label)} ${esc(insBytes(st.byKind[kind.key]))}</span>`).join('')}</div>`;
+  const rows = st.projects.slice(0, 8).map((project) => `<tr>
+    <td class="ins-name">${projectById(project.id) ? `<a data-spa href="${esc(projectRoute(project.id))}">${esc(project.name)}</a>` : esc(project.name)}</td>
+    <td><span class="ins-stack" title="${esc(kinds.map((kind) => `${kind.label} ${insBytes(project.byKind[kind.key] || 0)}`).join(' · '))}">${kinds.map((kind) =>
+      project.byKind[kind.key] ? `<i style="width:${(project.byKind[kind.key] / max) * 100}%;background:${kind.color}"></i>` : '').join('')}</span></td>
+    <td class="num">${esc(insBytes(project.bytes))}</td></tr>`).join('');
+  return `<section class="card ins-card ins-storage"><div class="ins-card-h"><span>Storage</span>${quota}</div>${meter}${legend}
+    ${rows ? `<table class="ins-table"><tbody>${rows}</tbody></table>` : ''}
+    ${st.packs.monthlyCents ? `<div class="ins-foot">${st.packs.paid} storage pack${st.packs.paid === 1 ? '' : 's'} · $${st.packs.monthlyCents / 100}/month</div>` : ''}</section>`;
+}
+
+// Small line or bar charts inside cards (credit, login windows, budgets) are
+// drawn once their width is known; each element names its spec here.
+const insMini = new Map();
+let insMiniSeq = 0;
+function insMiniSlot(spec, cls = '') {
+  const id = `m${++insMiniSeq}`;
+  insMini.set(id, spec);
+  return `<div class="ins-mini ${cls}" data-ins-mini="${id}" style="height:${spec.height || 44}px"></div>`;
+}
+function drawInsightMinis(root) {
+  root.querySelectorAll('[data-ins-mini]').forEach((el) => {
+    const spec = insMini.get(el.dataset.insMini);
+    const width = Math.floor(el.clientWidth);
+    if (!spec || !width || String(width) === el.dataset.width) return;
+    el.dataset.width = String(width);
+    const H = spec.height || 44, padT = 6, padB = spec.axis ? 14 : 2;
+    const plotH = H - padT - padB;
+    const top = Math.max(spec.limit?.value || 0, ...spec.series.flatMap((line) => line.values.filter((v) => v != null))) || 1;
+    const x = (i) => spec.n > 1 ? (i / (spec.n - 1)) * (width - 2) + 1 : width / 2;
+    const y = (v) => padT + plotH - (Math.min(v, top) / top) * plotH;
+    const path = (values) => values.map((v, i) => v == null ? '' : `${i && values[i - 1] != null ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join('');
+    const marks = spec.series.map((line) => line.bars
+      ? line.values.map((v, i) => v ? `<rect x="${(x(i) - Math.max(1, width / spec.n / 2 - 1)).toFixed(1)}" y="${y(v).toFixed(1)}" width="${Math.max(1, width / spec.n - 2).toFixed(1)}" height="${(padT + plotH - y(v)).toFixed(1)}" rx="1" fill="${line.color}"/>` : '').join('')
+      : `<path class="ins-mini-line${line.dash ? ' dash' : ''}" stroke="${line.color}" d="${path(line.values)}"/>`).join('');
+    const limit = spec.limit ? `<line class="ins-mini-limit" x1="0" x2="${width}" y1="${y(spec.limit.value)}" y2="${y(spec.limit.value)}"/>` : '';
+    const axis = spec.axis ? spec.axis.map(([i, text], k) => `<text class="tick" x="${x(i)}" y="${H - 2}" text-anchor="${k ? 'end' : 'start'}">${esc(text)}</text>`).join('') : '';
+    el.innerHTML = `<svg width="${width}" height="${H}" viewBox="0 0 ${width} ${H}" role="img" aria-label="${esc(spec.label)}">${limit}${marks}${axis}
+      <line class="ins-mini-hover" y1="${padT}" y2="${padT + plotH}" visibility="hidden"/></svg><div class="ins-tip" hidden></div>`;
+    const svg = el.querySelector('svg'), tip = el.querySelector('.ins-tip'), hover = svg.querySelector('.ins-mini-hover');
+    const hide = () => { tip.hidden = true; hover.setAttribute('visibility', 'hidden'); };
+    const show = (event) => {
+      const rect = svg.getBoundingClientRect();
+      const i = Math.round(((event.clientX - rect.left - 1) / Math.max(1, width - 2)) * (spec.n - 1));
+      if (i < 0 || i >= spec.n) return hide();
+      hover.setAttribute('x1', String(x(i))); hover.setAttribute('x2', String(x(i))); hover.setAttribute('visibility', 'visible');
+      tip.innerHTML = spec.tip(i);
+      tip.hidden = false;
+      tip.style.top = `${H + 4}px`;
+      tip.style.left = `${Math.max(0, Math.min(width - tip.offsetWidth, x(i) - tip.offsetWidth / 2))}px`;
+    };
+    svg.addEventListener('pointermove', show);
+    svg.addEventListener('pointerdown', show);
+    svg.addEventListener('pointerleave', hide);
+  });
+}
+const insTipRow = (label, value, color) => `<div>${color ? `<i style="background:${color}"></i>` : '<i></i>'}<span>${esc(label)}</span><b>${esc(value)}</b></div>`;
+
+// Model logins: the share of the period's work each served (how the scheduler
+// spread it) and, for subscriptions, their 5-hour and weekly windows against
+// capacity over the last week, with the provider's live reading below.
+function insightLoginsHtml(data, quota) {
+  const logins = data.logins || [];
+  const live = new Map((quota?.logins || []).map((login) => [login.id, login]));
+  const ids = [...new Set([...logins.map((login) => login.id), ...live.keys()])];
+  if (!ids.length) return '';
   const bar = (label, win) => {
     const pct = Math.max(0, Math.min(100, Math.round(win.pct || 0)));
     const expired = win.resetAt && win.resetAt < Date.now();
@@ -17186,16 +17864,100 @@ function insightQuotaHtml(quota) {
       <span>${esc(label)}</span><span class="ins-quota-bar${tone}"><i style="width:${pct}%"></i></span>
       <b>${pct}%</b><span class="ins-quota-reset">${win.resetAt && !expired ? esc(fmtCountdown(win.resetAt).replace(/^in /, '')) : ''}</span></div>`;
   };
-  const rows = quota.logins.map((login) => {
-    const snap = login.usage;
-    const state = login.status && login.status !== 'available'
-      ? `<span class="ins-quota-state">${login.status === 'manual-off' ? 'off' : login.status === 'needs-attention' ? 'needs attention' : 'exhausted'}${
-        login.resetAt > Date.now() ? ` · back ${esc(fmtCountdown(login.resetAt))}` : ''}</span>` : '';
-    const windows = snap?.ok ? [snap.session && bar('Session', snap.session), snap.week && bar('Week', snap.week)].filter(Boolean).join('') : '';
-    return `<div class="ins-quota"><div class="ins-quota-name"><span class="mono">${esc(accountShortName(login.id))}</span>${state}</div>${windows}</div>`;
+  const rows = ids.map((id) => {
+    const login = logins.find((value) => value.id === id);
+    const state = live.get(id);
+    const snap = state?.usage;
+    if (login?.unrecorded) return `<div class="ins-quota ins-unrecorded" title="${esc(`Turns from before tavya recorded which login served each one (Oct 28, 2026): ${insMoney(login.usd * 1e6)} at API prices`)}">
+      <div class="ins-quota-name"><span>Login not recorded</span><span class="ins-login-share"><b>${insNum(login.turns)}</b> turns</span></div></div>`;
+    const name = accountShortName(id);
+    const status = state?.status && state.status !== 'available'
+      ? `<span class="ins-quota-state">${state.status === 'manual-off' ? 'off' : state.status === 'needs-attention' ? 'needs attention' : 'exhausted'}${
+        state.resetAt > Date.now() ? ` · back ${esc(fmtCountdown(state.resetAt))}` : ''}</span>` : '';
+    const share = login ? `<span class="ins-login-share" title="${esc(`${insPct(login.share)} of the work in ${data.days} days · ${insMoney(login.usd * 1e6)} at API prices · ${login.turns} turn${login.turns === 1 ? '' : 's'}`)}">
+      <span class="ins-share"><i style="width:${Math.round(login.share * 100)}%;background:var(--accent)"></i></span><b>${insPct(login.share)}</b></span>` : '';
+    let windows = '';
+    if (login?.hourly) {
+      const { from, session, week } = login.hourly;
+      const hour = (i) => new Date(from + i * 3_600_000);
+      windows = insMiniSlot({ n: session.length, height: 40, label: `${name}: 5-hour window and week over the last 7 days`,
+        limit: { value: 1 },
+        series: [{ values: week, color: 'var(--viz-other)' }, { values: session, color: 'var(--viz-1)' }],
+        axis: [[0, hour(0).toLocaleDateString(undefined, { weekday: 'short' })], [session.length - 1, 'now']],
+        tip: (i) => `<div class="ins-tip-h">${esc(hour(i).toLocaleString(undefined, { weekday: 'short', hour: 'numeric' }))}</div>
+          ${insTipRow('5-hour window', insPct(session[i]), 'var(--viz-1)')}${insTipRow('Week', insPct(week[i]), 'var(--viz-other)')}
+          <div class="ins-tip-note">${esc(`Of ${insMoney(login.capacity.session * 1e6)} per 5 hours and ${insMoney(login.capacity.week * 1e6)} per week at API prices${login.capacity.learned ? ', learned from its readings' : ' (assumed until readings teach it)'}`)}</div>` }, 'ins-login-chart');
+    }
+    const bars = snap?.ok ? [snap.session && bar('Session', snap.session), snap.week && bar('Week', snap.week)].filter(Boolean).join('') : '';
+    return `<div class="ins-quota"><div class="ins-quota-name"><span class="mono">${esc(name)}</span>${status}${share}</div>${windows}${bars}</div>`;
   }).join('');
-  return `<section class="card ins-card"><div class="ins-card-h"><span>Quota</span>
+  const key = logins.some((login) => login.hourly)
+    ? `<span class="ins-legend ins-mini-key"><span><i class="line" style="background:var(--viz-1)"></i>5-hour</span><span><i class="line" style="background:var(--viz-other)"></i>Week</span><span title="A window's quota: past this line the login waits for its reset"><i class="limit"></i>Limit</span></span>` : '';
+  return `<section class="card ins-card ins-logins"><div class="ins-card-h"><span>Logins</span>${key}
     <a class="ins-more" data-spa href="${esc(globalRoute('organization'))}#settings-agents">Manage</a></div>${rows}</section>`;
+}
+
+// The month's compute credit (plan, packs, gifts, top-ups) against what
+// managed compute charged so far, with the pace to the month's end.
+function insightCreditHtml(data) {
+  const credit = data.compute?.credit;
+  if (!credit) return '';
+  const total = credit.creditMicros + credit.topUpMicros;
+  const days = credit.daysInMonth;
+  const spent = credit.cumulative;
+  const today = spent.length - 1;
+  const pace = today > 0 ? spent[today] / (today + 1) : spent[today] || 0;
+  const projection = Array.from({ length: days }, (_, i) => i < today ? null : Math.round(spent[today] + pace * (i - today)));
+  const line = Array.from({ length: days }, (_, i) => i <= today ? spent[i] : null);
+  const date = (i) => new Date(credit.from + i * 86_400_000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' });
+  const parts = [['Plan', credit.includedMicros], ['Packs', credit.packMicros], ['Gifts', credit.giftMicros], ['Top-ups left', credit.topUpMicros]]
+    .filter(([, value]) => value).map(([label, value]) => `${label} ${insMoney(value)}`).join(' · ');
+  const over = credit.usedMicros + credit.heldMicros > total;
+  return `<section class="card ins-card ins-credit"><div class="ins-card-h"><span>Compute credit</span>
+    <span class="ins-count${over ? ' over' : ''}" title="${esc(`${parts || 'No credit'}${credit.heldMicros ? ` · ${insMoney(credit.heldMicros)} held for work running now` : ''}`)}">${esc(insMoney(credit.usedMicros))} of ${esc(insMoney(total))}</span></div>
+    ${insMiniSlot({ n: days, height: 64, label: `Compute credit used this month against ${insMoney(total)}`, limit: { value: total },
+      series: [{ values: projection, color: 'var(--accent)', dash: true }, { values: line, color: 'var(--accent)' }],
+      axis: [[0, date(0)], [days - 1, date(days - 1)]],
+      tip: (i) => `<div class="ins-tip-h">${esc(date(i))}</div>${i <= today ? insTipRow('Charged so far', insMoney(spent[i]), 'var(--accent)')
+        : insTipRow('At this pace', insMoney(projection[i]), 'var(--accent)')}${insTipRow('Credit', insMoney(total))}` })}
+    <div class="ins-foot" title="Managed compute is charged at ${data.compute.multiplier}× the provider's list price; your own accounts never use credit">${esc(`${insMoney(Math.max(0, credit.availableMicros))} left${pace > 0 && spent[today] + pace * (days - 1 - today) > total ? ` · runs out ~${date(Math.min(days - 1, Math.ceil(Math.max(0, total - spent[today]) / pace) + today))}` : ''}`)}</div></section>`;
+}
+
+// Where provider "Any" put this organization's computers, and why.
+function insightRoutingHtml(data) {
+  const routing = data.compute?.routing;
+  if (!routing || !(routing.total || routing.unplaced)) return '';
+  const max = Math.max(1, ...routing.providers.map((row) => row.count));
+  const rows = routing.providers.map((row) => `<div class="ins-route" title="${esc(row.reasons.map((r) => `${r.reason} (${r.count})`).join('\\n'))}">
+    <span class="ins-name">${esc(insProvider(row.provider))} ${row.funding ? insFundingTag(row.funding) : ''}</span>
+    <span class="ins-share"><i style="width:${(row.count / max) * 100}%;background:var(--accent)"></i></span><b>${row.count}</b></div>`).join('');
+  const notes = [
+    routing.fellOver ? `<span title="${esc(`A cheaper account had no room, so the next took it: ${routing.full.map((f) => `${insProvider(f.provider)} full ${f.count}×`).join(', ')}`)}">${routing.fellOver} fell over</span>` : '',
+    routing.unplaced ? `<span class="warn" title="Every account was full: the task waited for a machine">${routing.unplaced} waited</span>` : '',
+  ].filter(Boolean).join(' · ');
+  return `<section class="card ins-card ins-routing"><div class="ins-card-h"><span title="Tasks whose computer is Any: tavya picks the first account that fits and has room, your own before managed, cheapest first">Where Any ran</span>
+    <b class="ins-count">${routing.total}</b></div>${rows}${notes ? `<div class="ins-foot">${notes}</div>` : ''}</section>`;
+}
+
+// Operators: each managed account's peak use per day against its budget.
+function insightBudgetsHtml(data) {
+  const budgets = data.compute?.budgets;
+  if (!budgets?.length) return '';
+  const rows = budgets.map((budget) => {
+    const cpu = budget.pool.cpu != null || !budget.pool.machines;
+    const values = cpu ? budget.peakCpu : budget.peakMachines;
+    const cap = cpu ? budget.pool.cpu : budget.pool.machines;
+    const unit = cpu ? 'CPU' : 'machines';
+    const peak = Math.max(0, ...values);
+    const tone = cap && peak >= cap ? ' over' : '';
+    return `<div class="ins-budget"><div class="ins-quota-name"><span>${esc(insProvider(budget.provider))}</span>
+      <span class="ins-count${tone}">peak ${peak}${cap ? ` of ${cap}` : ''} ${unit}</span></div>
+      ${insMiniSlot({ n: values.length, height: 30, label: `${insProvider(budget.provider)}: peak ${unit} in use per day`,
+        ...(cap ? { limit: { value: cap } } : {}), series: [{ values, color: 'var(--accent)', bars: true }],
+        tip: (i) => `<div class="ins-tip-h">${esc(insDayLabel(data.daily[i].day, 30))}</div>${insTipRow(`Peak ${unit}`, String(values[i]), 'var(--accent)')}${cap ? insTipRow('Budget', String(cap)) : ''}` })}</div>`;
+  }).join('');
+  return `<section class="card ins-card ins-budgets"><div class="ins-card-h"><span title="tavya's own provider accounts, every organization together: the most running at once each day, from booked machine time, against each account's budget (Installation → Managed compute). Hetzner books whole hours, so short runs count for their hour.">Managed accounts</span>
+    <a class="ins-more" data-spa href="${esc(installationRoute())}#installation-compute">Manage</a></div>${rows}</section>`;
 }
 
 async function loadInsightQuota(organizationId) {
@@ -17237,10 +17999,12 @@ async function renderInsights({ refresh = false } = {}) {
   if (!renderIsCurrent() || S.tab !== 'insights' || (S.organizationId || 'org_personal') !== organizationId) return;
   // A live refresh repaints only when something changed, so hovering the chart
   // or reading a list is never disturbed by an identical redraw.
-  const signature = JSON.stringify([data.totals, data.pipeline, data.daily, data.working, data.waiting, data.recent, quota]);
+  const signature = JSON.stringify([data.totals, data.pipeline, data.daily, data.working, data.waiting, data.recent, quota,
+    data.compute, data.storage, data.logins]);
   if (!refresh || signature !== box.dataset.signature) {
     box.dataset.signature = signature;
     S.insightsData = data;
+    insMini.clear();
     const lens = INSIGHT_LENSES.some((l) => l.key === S.insightsLens) ? S.insightsLens : 'shipped';
     if (insightsIsEmpty(data)) {
       const project = firstProjectForOrganization(organizationId);
@@ -17261,6 +18025,8 @@ async function renderInsights({ refresh = false } = {}) {
             <div class="ins-plot"></div>
           </section>
           <section class="card ins-card"><div class="ins-card-h"><span>Projects</span></div>${insightProjectsHtml(data)}</section>
+          ${insightComputeHtml(data)}
+          ${insightStorageHtml(data)}
           ${data.models?.length ? `<section class="card ins-card"><div class="ins-card-h"><span>Models</span></div>${insightModelsHtml(data)}</section>` : ''}
           <section class="card ins-card"><div class="ins-card-h"><span>Recently shipped</span></div>
             ${data.recent.length ? data.recent.map((ref) => insightTaskRow(ref, 'shipped')).join('') : `<div class="ins-empty">Nothing shipped in ${days} days</div>`}</section>
@@ -17270,10 +18036,15 @@ async function renderInsights({ refresh = false } = {}) {
             ${data.waiting.length ? data.waiting.map((ref) => insightTaskRow(ref, 'waiting')).join('') : '<div class="ins-empty">Nothing is waiting ✓</div>'}</section>
           <section class="card ins-card"><div class="ins-card-h"><span>With agents</span><b class="ins-count">${data.pipeline.working}</b></div>
             ${data.working.length ? data.working.map((ref) => insightTaskRow(ref, 'working')).join('') : '<div class="ins-empty">No agent is working</div>'}</section>
-          ${insightQuotaHtml(quota)}
+          ${insightLoginsHtml(data, quota)}
+          ${insightCreditHtml(data)}
+          ${insightRoutingHtml(data)}
+          ${insightBudgetsHtml(data)}
         </div>
       </div>`;
     if (!refresh) box.classList.add('ins-enter');
+    drawInsightMinis(box);
+    wireInsightCompute(box);
     const chart = box.querySelector('.ins-chart');
     if (chart) {
       drawInsightChart(chart, data);
@@ -17288,6 +18059,7 @@ async function renderInsights({ refresh = false } = {}) {
         const plot = chart.querySelector('.ins-plot');
         if (!chart.isConnected) return observer.disconnect();
         if (plot && String(Math.floor(plot.clientWidth)) !== plot.dataset.width) drawInsightChart(chart, S.insightsData);
+        drawInsightMinis(box);
       });
       observer.observe(chart);
     }
@@ -17780,11 +18552,17 @@ function wikiScopeInfo(proj) {
   return { scope: 'organization', id: org.id, title: org.name, base: `/api/organizations/${encodeURIComponent(org.id)}/wiki`, view: '' };
 }
 
+// "Project settings: `app`": organization and project pages look alike, so
+// every settings and wiki page says whose it is.
+function scopeTitle(scope, name) {
+  return `<h1 class="page-title scope-title">${scope}${name ? `: <code>${esc(name)}</code>` : ''}</h1>`;
+}
+
 function wikiView(proj) {
   const info = wikiScopeInfo(proj);
   if (!info) return `<div class="empty">No organization yet.</div>`;
   // The branch picker shows only once there is another branch or task to view.
-  return `<div class="organization-settings wiki-page"><div class="settings-header">${proj ? '' : '<h1 class="page-title">Wiki</h1>'}${proj ? `<label class="wiki-view-picker" title="Show this wiki on another branch, or live in a task's checkout"${wikiViewChoices(proj) ? '' : ' hidden'}>
+  return `<div class="organization-settings wiki-page"><div class="settings-header">${scopeTitle(proj ? 'Project wiki' : 'Organization wiki', info.title)}${proj ? `<label class="wiki-view-picker" title="Show this wiki on another branch, or live in a task's checkout"${wikiViewChoices(proj) ? '' : ' hidden'}>
       <span>Viewing</span><select id="wiki-view-select">${wikiViewOptionsHtml(proj)}</select></label>` : ''}</div>
     <div class="settings-layout"><nav class="settings-nav wiki-nav" id="wiki-nav" aria-label="Wiki entries"></nav>
     <div class="settings-content" id="wiki-pane"></div></div></div>`;
@@ -17909,7 +18687,7 @@ function wikiTreeHtml(entries, sel, depth = 0) {
   return (entries || []).map((e) => e.kind === 'section'
     ? `<span class="wiki-sec" style="padding-left:${10 + depth * 12}px">${esc(e.name)}/</span>${wikiTreeHtml(e.children, sel, depth + 1)}`
     : `<a href="#${encodeURIComponent(e.path)}" class="${sel === e.path ? 'active' : ''}" data-wiki-path="${esc(e.path)}"
-         style="padding-left:${10 + depth * 12}px" title="${esc(e.description || '')}">${wikiGlyph(e)} ${esc(e.name)}</a>`,
+         style="padding-left:${10 + depth * 12}px" title="${esc(e.description || '')}">${wikiGlyph(e)} <span>${esc(e.name)}</span></a>`,
   ).join('');
 }
 
@@ -18686,7 +19464,7 @@ function renderWikiEditor(info, proj, pane, page) {
 }
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
-  return `<div class="organization-settings"><div class="settings-header"><h1 class="page-title">${esc(proj.name)}</h1></div><div class="settings-layout">
+  return `<div class="organization-settings"><div class="settings-header">${scopeTitle('Project settings', proj.name)}</div><div class="settings-layout">
     <nav class="settings-nav" aria-label="Project settings sections"><a href="#project">Project</a><a href="#project-agents">Agents</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project"><div>Project</div></div>
     <div class="project-config-section" id="project-git"><div><h2>Git &amp; GitHub ${policyTip('Everyone in this project gets access to its repositories on GitHub automatically.')}</h2></div></div>
@@ -20108,7 +20886,9 @@ function appearanceCard() {
       </div>
       ${instRow(`Logo ${policyTip('The mark in the console, the browser tab and the installed app.')}`,
     '<span class="brand-current" id="brand-current"></span>',
-    '<button class="btn sm" type="button" id="brand-change" aria-expanded="false" aria-controls="brand-picker">Change</button>')}</div>
+    '<button class="btn sm" type="button" id="brand-change" aria-expanded="false" aria-controls="brand-picker">Change</button>')}
+      ${instRow(`Style ${policyTip('How the console looks for everyone. Classic is the earlier indigo look. Each person still picks light or dark in their profile.')}`,
+    instSegmented('skin-choice', SKINS.map((skin) => [skin.id, skin.label]), document.documentElement.getAttribute('data-skin') || '', 'Style'))}</div>
       <div class="brand-picker" id="brand-picker" hidden>
         ${BRAND_ICON_CHOICES.map((c) => `<button type="button" class="brand-option" data-icon="${esc(c.id)}" aria-pressed="false">
           <img src="/brand/${esc(c.id)}/icon-192.png" alt="" /><span>${esc(c.label)}</span>
@@ -20143,6 +20923,26 @@ async function wireAppearanceCard() {
   }
   catch { $('#appearance-card').style.display = 'none'; return; }
   mark(current);
+  // The style applies at once and saves on choice, like the logo.
+  const skins = $('#appearance-card .skin-choice');
+  if (skins) {
+    wireInstSegmented(skins.parentElement);
+    skins.addEventListener('change', async () => {
+      const previous = S.meta?.skin || '';
+      const skin = skins.dataset.value || '';
+      applySkin(skin);
+      try {
+        await api('/api/settings/global/appearance', { method: 'PUT', body: JSON.stringify({ values: { skin } }) });
+        if (S.meta) S.meta.skin = skin;
+        toast(`${SKINS.find((choice) => choice.id === skin)?.label || 'Default'} style`);
+      } catch (e) {
+        applySkin(previous);
+        skins.dataset.value = skins.dataset.unsavedValue = previous;
+        skins.querySelectorAll('[data-choice]').forEach((button) => button.setAttribute('aria-pressed', String(button.dataset.choice === previous)));
+        toast(e.message, true);
+      }
+    });
+  }
   const nameInput = $('#site-name');
   if (nameInput) nameInput.value = installation.siteName || siteName();
   $('#site-name-save')?.addEventListener('click', async () => {
@@ -20480,7 +21280,7 @@ function revealPhoneAccess() {
 // say in a line what each is for (the manifests' descriptions are for builders).
 const WORKFLOW_INFO = {
   'software-dev': ['Software dev', 'An agent works on a branch; the work is reviewed, then merged or proposed as a pull request.'],
-  goal: ['Goal (auto-run)', 'Software dev that keeps going by itself until the goal is met.'],
+  goal: ['Goal', 'Retired: give a task an agent Reviewer instead. Kept for tasks already running it.'],
   'just-do': ['Just do', 'The older single-agent workflow, kept for existing tasks.'],
   'merge-only': ['Merge only', 'Review and merge a branch, with no agent doing the work first.'],
   'script-exec': ['Script', 'The older command workflow, kept for existing tasks.'],
@@ -21275,6 +22075,7 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
             ${request.dismissed ? ignoredChip() : ''}
           </div>
           ${requestReasonLine(request, request.why, inTask)}
+          ${subTaskAskLine(request)}
           ${request.kind === 'reset' ? `<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; ${siteNameMarkup()} will resume the agent automatically.</div>`
             : request.mode === 'reveal' ? `<div class="approval-request-warn">The agent will see the plaintext: it travels to the model provider and may end up in training data.</div>`
             : items.find((item) => item.id === request.itemId)?.type === 'passkey' ? '' : `<div class="approval-request-warn caution">Blind use is not foolproof: a misbehaving agent can still leak it, e.g. by entering it on a malicious site.</div>`}
@@ -21328,6 +22129,7 @@ function permissionRequestRows(requests, { historyLimit = 20, inTask = false } =
         `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
       ${request.projectIds?.length ? `<div class="approval-request-projects">Add projects: ${request.projectIds.map((id) => `<span class="chip mono">${esc(projectById(id)?.name || id)}</span>`).join(' ')}</div>` : ''}
       ${requestReasonLine(request, request.reason, inTask)}
+      ${subTaskAskLine(request)}
       <div class="approval-request-help">Requested from ${request.audience.map((selector) => {
         const grantor = selector.startsWith('task:') ? (request.grantorTasks || []).find((task) => task.id === selector.slice(5)) : undefined;
         return grantor ? credentialRequestTaskLink({ taskId: grantor.id, task: grantor }) : esc(selector);
@@ -21346,6 +22148,41 @@ function permissionRequestRows(requests, { historyLimit = 20, inTask = false } =
         <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
     : '';
   return pendingHtml + history;
+}
+
+function requestedCredentialIds(request) {
+  return [...new Set([...(request.credentialGrants || []), ...(request.missingCapabilities || [])]
+    .filter((cap) => cap.startsWith('use-credential:item:')).map((cap) => cap.slice('use-credential:item:'.length)))];
+}
+
+// The approval requests of a task waiting for approval, as a band on its form:
+// what is asked, by whom and why, and Approve/Deny for those it was sent to.
+function approvalBannerHtml(requests, items = []) {
+  const signedInUserId = typeof S.user === 'string' ? S.user : S.user?.id;
+  return requests.map((request) => {
+    const askingTask = /^task-agent:([^:]+):/.exec(request.requestedBy || '')?.[1];
+    const asker = askingTask && taskRecord(askingTask);
+    const askerHtml = asker ? `<a data-spa href="${esc(taskUrl(asker.id, asker))}" title="${esc(asker.title)}">${asker.num != null ? `#${asker.num}` : esc(asker.title)}</a> asks for`
+      : 'Asks for';
+    const missing = (request.missingCapabilities || []).filter((cap) => !cap.startsWith('use-credential:'));
+    const credentials = requestedCredentialIds(request).map((id) => items.find((item) => item.id === id)?.label || 'a vault credential');
+    const projects = S.projects.filter((project) => project.organizationId === request.organizationId);
+    const canResolve = signedInUserId && request.recipients.includes(signedInUserId);
+    return `<div class="tf-approval-row" data-areq="${esc(request.id)}">
+      <span class="tf-ready-mark" aria-hidden="true">!</span>
+      <div class="tf-approval-main">
+        <div class="tf-approval-what">${askerHtml}
+          <span class="chip"${missing.length ? ` title="${esc(`Adds ${missing.join(', ')}`)}"` : ''}>${esc(authorizationSummary(request.authorization, projects))}</span>
+          ${credentials.map((label) => `<span class="chip" title="Vault credential">${esc(label)}</span>`).join('')}
+        </div>
+        ${request.reason ? `<div class="tf-approval-reason" title="${esc(request.reason)}">${esc(request.reason)}</div>` : ''}
+      </div>
+      <div class="tf-approval-actions">${canResolve
+        ? `<button type="button" class="btn sm primary" data-areq-act="approve" title="Grant it and run the task">Approve</button>
+          <button type="button" class="btn sm" data-areq-act="deny" title="Keep it a draft">Deny</button>`
+        : `<span class="task-sub">Waiting for ${request.audience.map(esc).join(', ')}</span>`}</div>
+    </div>`;
+  }).join('');
 }
 
 function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
@@ -21375,7 +22212,7 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
   </div>`;
   }).join('');
   const history = recent.length ? `<div class="approval-history"><div class="section-h">Recent authorization decisions</div>${recent.map((request) =>
-    `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
+    `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : request.status === 'withdrawn' ? '' : 'done'}"${request.withdrawn ? ` title="${esc(request.withdrawn.reason)}"` : ''}>${esc(request.status)}</span>
       <span>${esc(authorizationSummary(request.authorization, S.projects))}</span>
       <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>` : '';
   return pendingHtml + history;
@@ -21558,6 +22395,7 @@ function connectionRows(connections, inTask = false) {
     return `<div class="approval-request${open && c.dismissed ? ' approval-request-dismissed' : ''}" data-connection="${esc(c.id)}">
       <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span>${open && c.dismissed ? ` ${ignoredChip()}` : ''}</div>
         ${c.why && inTask ? `<p class="task-sub">${esc(c.why)}</p>` : ''}
+        ${open ? subTaskAskLine(c) : ''}
         <p class="task-sub">${c.taskId ? 'This account may be used by the requesting task.' : 'Private until you share it with a project.'}</p>
         ${own && !inTask ? `<details data-unsaved><summary>Project access</summary><p class="task-sub">Selected projects may run app actions using this account, within the permissions you granted at sign-in.</p>
           ${projects.map(p => `<label class="connection-project"><input type="checkbox" value="${esc(p.id)}" ${c.projectIds.includes(p.id) ? 'checked' : ''}> ${esc(p.name)}</label>`).join('')}
@@ -21573,6 +22411,13 @@ function connectionRows(connections, inTask = false) {
         ${canConnect && inTask && open && !c.dismissed ? ignoreRequestButton('data-connection-action') : ''}
       </div></div>`;
   }).join('');
+}
+
+// A sub-task's request comes via its parent, the task people know: name it,
+// with the note its agent added — the context they otherwise lack.
+function subTaskAskLine(request) {
+  if (!request.via?.taskId) return '';
+  return `<div class="approval-request-help">Via ${credentialRequestTaskLink({ taskId: request.via.taskId })}${request.via.note ? `: ${esc(request.via.note)}` : ''}</div>`;
 }
 
 // Ignoring a request silences it — no inbox row, alert or "approval needed"
@@ -22309,12 +23154,13 @@ async function wireVaultCards(organizationId) {
       <span class="setting-label">${esc(c.label)} ${connectorTip(c)}</span>
       <span class="setting-value">${c.available ? '<span class="chip ok">Connected</span>' : '<span class="chip">Not connected</span>'}${connectorNote(c) ? `<span class="setting-muted">${esc(connectorNote(c))}</span>` : ''}${c.config?.lastAutoSync?.error ? `<span class="chip warn" title="${esc(c.config.lastAutoSync.error)}">Sync error</span>` : ''}
       ${c.setup !== 'git-pass' && !c.available && c.name !== 'pass' ? `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : '1Password service-account token'}" aria-label="${esc(c.label)} ${c.name === 'bitwarden' ? 'session key' : 'service-account token'}" />` : ''}
-      ${(c.pendingWrites || []).filter(write => !write.id).map(write => `<span>${esc(write.label)}: pending write-back ${c.config?.writeBack ? `<button class="btn sm" data-write-retry="${esc(write.itemId)}">Retry</button>` : ''}<button class="btn sm" data-write-remote="${esc(write.itemId)}">Use remote value</button></span>`).join('')}</span>
+</span>
       <span class="setting-actions">${c.pendingWrites?.length ? `${c.config?.writeBack ? `<button class="btn sm" data-conn-retry title="${esc(c.pendingWrites[0]?.error || 'Saved in the vault; waiting for the external store')}">Retry ${c.pendingWrites.length} pending</button>` : `<span class="chip" title="Write-back is off; turn it on under Import… to send these">${c.pendingWrites.length} pending</span>`}<button class="btn sm" data-conn-discard title="Stop retrying these writes; credentials stay in the vault">Dismiss</button>` : ''}
       ${c.setup === 'git-pass'
         ? `<button class="btn sm" data-git-pass-connect>${c.available ? 'Reconfigure' : 'Configure'}</button>${c.available ? '<button class="btn sm" data-git-pass-check>Check connection</button>' : ''}`
         : c.available || c.name === 'pass' ? '' : '<button class="btn sm" data-conn-connect>Connect</button>'}
-      ${c.available ? '<button class="btn sm" data-conn-import>Import…</button>' : ''}</span></div>`).join('')
+      ${c.available ? '<button class="btn sm" data-conn-import>Import…</button>' : ''}</span>
+      ${(c.pendingWrites || []).some(write => !write.id) ? `<div class="conn-pending">${(c.pendingWrites || []).filter(write => !write.id).map(write => `<span>${esc(write.label)}: pending write-back ${c.config?.writeBack ? `<button class="btn sm" data-write-retry="${esc(write.itemId)}">Retry</button>` : ''}<button class="btn sm" data-write-remote="${esc(write.itemId)}">Use remote value</button></span>`).join('')}</div>` : ''}</div>`).join('')
       || '<div class="setting-muted">No password managers</div>';
     list.querySelectorAll('[data-conn]').forEach((row) => {
       const name = row.dataset.conn;
@@ -22864,6 +23710,8 @@ function updateBell() {
   badge.textContent = n;
   badge.classList.toggle('hidden', n === 0);
   $('#bell')?.classList.toggle('active', S.tab === 'inbox');
+  // A phone's sidebar is off screen: its ☰ carries a dot while something waits.
+  $('#mobile-menu')?.classList.toggle('has-unread', n > 0);
 }
 function markInboxItemReadLocally(item) {
   if (!item?.unread) return;
@@ -23161,7 +24009,7 @@ function inboxItemRoute(item) {
   return `${projectBase(project.id)}/tasks/${item.task.num ?? item.task.id}${tab}`;
 }
 
-// The signed-in person's display name for the topbar/rail. The legacy single-user
+// The signed-in person's display name for the sidebar. The legacy single-user
 // session is the string 'me'; real identity sessions carry a Better Auth user.
 function userDisplayName() {
   const u = S.user;
@@ -24147,7 +24995,7 @@ function managedComputeMarkup(view) {
     return `<div class="computer-provider" data-provider="${id}"><b>${esc(info.name)}</b>
       ${state ? `<span class="chip ${state[1]}"${account.lastError ? ` title="${esc(account.lastError)}"` : ''}>${state[0]}</span>` : ''}
       ${account?.features?.internet === 'basic' ? `<span class="chip computer-basic" title="${esc('Reaches package registries, Git hosts, AI and cloud APIs only. Any gives it only tasks whose Outbound network says basic internet is enough.')}">Basic internet</span>` : ''}
-      ${account ? `<span class="setting-muted" title="Machines running now${account.config?.maxRunning ? ', of the account’s limit' : ''}">${account.running}${account.config?.maxRunning ? ` of ${account.config.maxRunning}` : ''} running</span>
+      ${account ? `<span class="setting-muted managed-running" title="Running now, of what the account allows at once">${managedRunning(account)}</span>
         <span class="setting-muted managed-month" title="${esc(`This month: ${hours} machine-hours for ${account.organizations} organization${account.organizations === 1 ? '' : 's'}. The provider’s price, then what organizations were charged.`)}">${money(account.costMicros)} → ${money(account.chargedMicros)}</span>` : ''}
       <span class="label-row-fill"></span>
       ${account ? `<button class="icon-btn computer-edit" type="button" title="Edit ${esc(info.name)}" aria-label="Edit ${esc(info.name)}">✎</button><button class="btn sm computer-test" type="button">Test</button>`
@@ -24160,6 +25008,13 @@ function managedComputeMarkup(view) {
   return `${connected.length ? `<div class="computer-providers">${connected.map(row).join('')}</div>` : ''}
     ${unconnected.length ? `<details class="inst-fold managed-off"><summary>Not connected <span class="setting-muted">${unconnected.length}</span></summary>
       <div class="computer-providers">${unconnected.map(row).join('')}</div></details>` : ''}`;
+}
+/** "3 of 50 running · 6 of 24 CPU · 400 of 1,024 GB · 2 waiting": what is in use against the account's budget, and its queue. */
+function managedRunning(account) {
+  const pool = account.limits?.pool || {};
+  const n = (value) => Number(value || 0).toLocaleString('en-US');
+  return `${n(account.running)}${pool.machines ? ` of ${n(pool.machines)}` : ''} running${pool.cpu ? ` · ${n(account.runningCpus)} of ${n(pool.cpu)} CPU` : ''}`
+    + `${pool.diskGb ? ` · ${n(account.diskGb)} of ${n(pool.diskGb)} GB` : ''}${account.waiting ? ` · ${n(account.waiting)} waiting` : ''}`;
 }
 async function wireManagedComputeCard() {
   const card = $('#managed-compute-card');
@@ -24205,10 +25060,17 @@ function planMeter(used, limit) {
   const pct = Math.min(100, (Number(used) || 0) / limit * 100);
   return `<span class="plan-meter${pct >= 100 ? ' over' : pct >= 80 ? ' near' : ''}" role="meter" aria-valuemin="0" aria-valuemax="${esc(limit)}" aria-valuenow="${esc(Math.min(Number(used) || 0, limit))}"><i style="width:${pct.toFixed(1)}%"></i></span>`;
 }
-// `checkout`: the first pack beside a gifted plan, bought at checkout.
-function planStepper(kind, count, title, checkout = false) {
-  return `<span class="pack-stepper" title="${esc(title)}"><button class="icon-btn billing-packs" data-kind="${kind}" data-packs="${count - 1}" aria-label="Remove a ${kind} pack" ${count > 0 ? '' : 'disabled'}>−</button>`
-    + `<b>${count}</b><button class="icon-btn ${checkout ? 'billing-buy' : 'billing-packs'}" data-kind="${kind}" data-packs="${count + 1}" data-add aria-label="Add a ${kind} pack">+</button><span class="setting-muted">pack${count === 1 ? '' : 's'}</span></span>`;
+// A pack is named by what it gives: "100 GB" of storage, "$10" of compute a month.
+function planPackName(kind, pack) {
+  return kind === 'compute' ? planDollars(pack?.creditMicros ?? 10_000_000).replace('.00', '') : formatBytes(pack?.bytes ?? 100 * 1024 ** 3);
+}
+// − N + "100 GB packs" (or seats). `checkout`: the first one beside a gifted
+// plan, bought at checkout. `min`: the fewest it may go down to.
+function planStepper(kind, count, title, checkout = false, unit = 'pack', min = 0) {
+  const one = unit === 'seat' ? 'a seat' : `a ${unit}`;
+  const action = kind === 'seats' ? 'billing-seats' : 'billing-packs';
+  return `<span class="pack-stepper" title="${esc(title)}"><button class="icon-btn ${action}" data-kind="${kind}" data-packs="${count - 1}" aria-label="Remove ${esc(one)}" ${count > min ? '' : 'disabled'}>−</button>`
+    + `<b>${count}</b><button class="icon-btn ${checkout ? 'billing-buy' : action}" data-kind="${kind}" data-packs="${count + 1}" data-add aria-label="Add ${esc(one)}">+</button><span class="setting-muted">${esc(unit)}${count === 1 ? '' : 's'}</span></span>`;
 }
 function checkoutTermsTip() {
   const d = S.launch?.checkoutDisclosures || {};
@@ -24264,7 +25126,9 @@ function planBillingMarkup(e, state) {
   const statusChip = state?.gift && !subscribed ? 'Gifted'
     : state?.cancelAtPeriodEnd && state.currentPeriodEnd ? `Ends ${day(state.currentPeriodEnd)}`
     : ({ past_due: 'Payment failed', unpaid: 'Unpaid', paused: 'Paused', incomplete: 'Checkout incomplete', trialing: 'Trial' })[state?.status] || '';
-  const price = packsOnly ? `Packs ${planMoney(state.billedMonthlyPriceCents)}/month`
+  // What rides beside a gift: its seats, its packs, or both.
+  const addOns = (state?.teamSeats?.paid && billed === 'free' ? (state?.storagePacks || state?.computePacks ? 'Seats & packs' : 'Seats') : 'Packs');
+  const price = packsOnly ? `${addOns} ${planMoney(state.billedMonthlyPriceCents)}/month`
     : (state?.gift && !subscribed) || e.plan === 'free' ? '' : `${planMoney(e.currentMonthlyPriceCents)}/month`;
   const renews = (paying || packsOnly) && state.currentPeriodEnd
     ? ending ? ` · end ${day(state.currentPeriodEnd)}` : !state.cancelAtPeriodEnd ? ` · renews ${day(state.currentPeriodEnd)}` : '' : '';
@@ -24276,29 +25140,44 @@ function planBillingMarkup(e, state) {
   const head = `<div class="plan-head"><span class="plan-name">${esc(e.planName)}</span>${statusChip ? `<span class="chip${state?.status === 'past_due' || state?.status === 'unpaid' ? ' failed' : ''}">${esc(statusChip)}</span>` : ''}
     <span class="setting-muted plan-price">${esc(price + renews)}</span><span class="label-row-fill"></span>
     ${change}${subscribed || packsOnly ? `<button class="btn sm billing-portal" ${owner ? '' : disabled} title="Payment method and invoices">Billing</button>` : ''}
-    ${paying && !state.cancelAtPeriodEnd ? `<button class="btn sm ghost billing-cancel" ${owner ? '' : disabled}>Cancel plan</button>` : ''}</div>`;
-  // People.
+    ${paying && !state.cancelAtPeriodEnd ? `<button class="btn sm ghost billing-cancel" ${owner ? '' : disabled}>Cancel plan</button>` : ''}
+    ${paying && state.cancelAtPeriodEnd ? `<button class="btn sm billing-resume" ${disabled} title="Withdraw the cancellation: the plan renews as before">Keep plan</button>` : ''}</div>`;
+  // People: on Team, the seats it covers, added ahead of invitations and
+  // removed when unused (a paid Team bills each past the first; a gifted Team
+  // covers its gifted seats and buys more beside the gift).
   const members = Number(e.currentMemberCount ?? e.activeUsers ?? 0);
-  const people = e.maxMembers != null ? `${members} of ${e.maxMembers}` : `${members} ${members === 1 ? 'person' : 'people'}`;
-  const seatTip = e.plan === 'team' ? `First person included, then ${planMoney(e.monthlyAdditionalActiveUserPriceCents)}/month each.` : '';
-  const seatsPending = state?.seatDeficit && billed === 'team'
+  const seats = e.plan === 'team' ? state?.teamSeats : null;
+  const seatPrice = planMoney(seats?.priceCents ?? e.monthlyAdditionalActiveUserPriceCents);
+  const people = seats?.total ? `${members} of ${plural(seats.total, 'seat')}`
+    : e.maxMembers != null ? `${members} of ${e.maxMembers}` : `${members} ${members === 1 ? 'person' : 'people'}`;
+  const seatTip = !seats?.total ? '' : seats.gifted
+    ? `${plural(seats.gifted, 'seat')} gifted${seats.paid ? `, ${seats.paid} bought` : ''}; each more is ${seatPrice}/month and adds 5 agents at once, 10 GB of storage and $3 of compute a month.`
+    : `First seat included, then ${seatPrice}/month each, adding 5 agents at once, 10 GB of storage and $3 of compute a month. Someone who joins without a free seat is billed one.`;
+  const unused = seats?.total && seats.total > members ? `<span class="setting-muted">${seats.total - members} free</span>` : '';
+  const seatsPending = state?.seatDeficit && seats?.autoBill
     ? `<span class="warn">${plural(state.seatDeficit, 'seat')} not yet billed</span>` : '';
-  const peopleRow = `<div class="setting-row"><span class="setting-label">People${seatTip ? ` ${policyTip(seatTip)}` : ''}</span>
-    <span class="setting-value"><b>${esc(people)}</b>${e.overMemberLimit ? '<span class="warn">over the limit: agents are paused</span>' : ''}${seatsPending}</span>
-    ${seatsPending ? `<span class="setting-actions"><button class="btn sm billing-sync" ${disabled}>Bill seats</button></span>` : ''}</div>`;
+  const seatsFull = seats?.limit && members >= seats.limit && !seats.autoBill ? '<span class="setting-muted">all taken</span>' : '';
+  // Seats change on a paid Team, beside a gifted Team's subscription, or (the first) at checkout.
+  const seatCheckout = Boolean(seats?.gifted) && giftCheckout;
+  const canSeats = owner && seats?.total != null && (seatCheckout || ((paying && billed === 'team') || (packsOnly && state.gift?.plan === 'team')) && !busy);
+  const seatStepper = canSeats ? planStepper('seats', seats.total, `Each seat is ${seatPrice}/month`, seatCheckout, 'seat', Math.max(members, seats.included)) : '';
+  const peopleRow = `<div class="setting-row" data-limit="people"><span class="setting-label">People${seatTip ? ` ${policyTip(seatTip)}` : ''}</span>
+    <span class="setting-value"><b>${esc(people)}</b>${unused}${seatsFull}${e.overMemberLimit ? '<span class="warn">over the limit: agents are paused</span>' : ''}${seatsPending}</span>
+    ${seatsPending || seatStepper ? `<span class="setting-actions">${seatsPending ? `<button class="btn sm billing-sync" ${disabled}>Bill seats</button>` : seatStepper}</span>` : ''}</div>`;
   // Agents at once.
   const running = Number(e.activeAgentRuns || 0), waiting = Number(e.queuedAgentRuns || 0);
   const agentsRow = `<div class="setting-row"><span class="setting-label">Agents ${policyTip('How many agents can work at the same time. More wait in line until one finishes.')}</span>
     <span class="setting-value"><b>${esc(e.maxActiveAgentRuns)} at once</b>${running || waiting ? `<span class="setting-muted">${running} working${waiting ? `, ${waiting} waiting` : ''}</span>` : ''}</span></div>`;
   // Storage: used of the quota, the plan's share and the packs in the tooltip.
   const storagePack = state?.storagePack || { bytes: e.storagePackBytes, monthlyPriceCents: 400 };
+  const storageUnit = `${planPackName('storage', storagePack)} pack`;
   const storageParts = [`${formatBytes(e.includedStorageBytes)} with ${e.planName}`,
-    e.storagePacks ? `${formatBytes(e.storagePacks * e.storagePackBytes)} in ${plural(e.storagePacks, 'pack')}` : '',
-    e.giftedStoragePacks ? `${formatBytes(e.giftedStoragePacks * e.storagePackBytes)} gifted` : ''].filter(Boolean).join(' + ');
+    e.storagePacks ? `${e.storagePacks} × ${storageUnit}${e.storagePacks === 1 ? '' : 's'}` : '',
+    e.giftedStoragePacks ? `${e.giftedStoragePacks} × ${storageUnit}${e.giftedStoragePacks === 1 ? '' : 's'} gifted` : ''].filter(Boolean).join(' + ');
   const canStorage = canPacks && state?.storagePack?.available;
   const storageRow = `<div class="setting-row plan-limit" data-limit="storage"><span class="setting-label">Storage ${policyTip(`Project data, saved task workspaces and review files. ${storageParts}.`)}</span>
     <span class="setting-value">${planMeter(e.storageUsedBytes, e.storageQuotaBytes)}<span><b>${esc(formatBytes(e.storageUsedBytes ?? 0))}</b> <span class="setting-muted">of ${esc(formatBytes(e.storageQuotaBytes))}</span></span></span>
-    ${canStorage ? `<span class="setting-actions">${planStepper('storage', ending ? 0 : Number(state.storagePacks || 0), `Each pack adds ${formatBytes(storagePack.bytes)} for ${planMoney(storagePack.monthlyPriceCents)}/month`, giftCheckout)}</span>` : ''}</div>`;
+    ${canStorage ? `<span class="setting-actions">${planStepper('storage', ending ? 0 : Number(state.storagePacks || 0), `Each ${storageUnit} is ${planMoney(storagePack.monthlyPriceCents)}/month`, giftCheckout, storageUnit)}</span>` : ''}</div>`;
   // Compute: only where the installation runs computers itself.
   let computeRow = '', topUpRow = '';
   if (e.compute) {
@@ -24307,16 +25186,17 @@ function planBillingMarkup(e, state) {
     const credit = Number(e.computeCreditMicros || 0) + topUp;
     const pack = state?.computePack || { creditMicros: e.computePackCreditMicros, monthlyPriceCents: 1000 };
     const providers = (e.compute.providers || []).map((id) => COMPUTER_PROVIDERS[id]?.name || id).join(', ');
+    const computeUnit = `${planPackName('compute', pack)} pack`;
     const parts = [`${planDollars(e.includedComputeCreditMicros)} with ${e.planName}`,
-      e.computePacks ? `${planDollars(e.computePacks * e.computePackCreditMicros)} in ${plural(e.computePacks, 'pack')}` : '',
-      e.giftedComputePacks ? `${planDollars(e.giftedComputePacks * e.computePackCreditMicros)} gifted` : '',
+      e.computePacks ? `${e.computePacks} × ${computeUnit}${e.computePacks === 1 ? '' : 's'}` : '',
+      e.giftedComputePacks ? `${e.giftedComputePacks} × ${computeUnit}${e.giftedComputePacks === 1 ? '' : 's'} gifted` : '',
       topUp ? `${planDollars(topUp)} topped up, kept until used` : ''].filter(Boolean).join(' + ');
     const tip = `Cloud computers ${siteName()} runs for you (${providers}), at twice the provider’s price: a 2 CPU · 2 GB E2B computer is about $0.27 an hour. Resets ${day(e.compute.to)}. Computers on your own provider accounts aren’t counted. ${credit ? `${parts}.` : ''}${held ? ` ${planDollars(held)} is held for computers running now.` : ''}`;
     const canCompute = canPacks && state?.computePack?.available;
     computeRow = `<div class="setting-row plan-limit" data-limit="compute"><span class="setting-label">Compute ${policyTip(tip.trim())}</span>
       <span class="setting-value">${credit ? `${planMeter(Number(e.compute.usedMicros || 0) + held, credit)}<span><b>${esc(planDollars(e.compute.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(credit))} this month</span></span>`
         : '<span class="setting-muted">With a paid plan</span>'}</span>
-      ${canCompute ? `<span class="setting-actions">${planStepper('compute', ending ? 0 : Number(state.computePacks || 0), `Each pack adds ${planDollars(pack.creditMicros)} of compute a month for ${planMoney(pack.monthlyPriceCents)}/month`, giftCheckout)}</span>` : ''}</div>`;
+      ${canCompute ? `<span class="setting-actions">${planStepper('compute', ending ? 0 : Number(state.computePacks || 0), `Each ${computeUnit} adds ${planPackName('compute', pack)} of compute a month for ${planMoney(pack.monthlyPriceCents)}/month`, giftCheckout, computeUnit)}</span>` : ''}</div>`;
     // Auto top-up: once offered (its billing terms approved), or while on.
     const auto = state?.autoTopUp;
     if (auto && (auto.offered || auto.enabled)) {
@@ -24365,13 +25245,14 @@ function planBillingMarkup(e, state) {
   }
   // The operator's complimentary plan and packs.
   const gifts = state?.canGift ? `<details class="plan-operator"><summary>Gifts</summary><div class="setting-rows">
-    <div class="setting-row"><span class="setting-label">Plan ${policyTip('Free access until removed. Paid billing, if any, continues separately.')}</span><span class="setting-value">
-      <select id="billing-gift-plan" aria-label="Gift plan">${Object.values(catalog).filter((plan) => plan.id !== 'free').map((plan) => `<option value="${esc(plan.id)}" ${state.gift?.plan === plan.id ? 'selected' : ''}>${esc(plan.name)}</option>`).join('')}</select></span>
+    <div class="setting-row"><span class="setting-label">Plan ${policyTip('Free access until removed. Paid billing, if any, continues separately. A gifted Team covers this many people; its owner buys more seats beside the gift.')}</span><span class="setting-value">
+      <select id="billing-gift-plan" aria-label="Gift plan">${Object.values(catalog).filter((plan) => plan.id !== 'free').map((plan) => `<option value="${esc(plan.id)}" ${state.gift?.plan === plan.id ? 'selected' : ''}>${esc(plan.name)}</option>`).join('')}</select>
+      <input id="billing-gift-seats" type="number" min="1" max="10000" step="1" value="${esc(state.gift?.seats ?? Math.max(1, members))}" class="plan-gift-count" aria-label="Gifted seats" ${state.gift?.plan === 'individual' ? 'hidden' : ''}><span class="setting-muted billing-gift-seats-unit" ${state.gift?.plan === 'individual' ? 'hidden' : ''}>seats</span></span>
       <span class="setting-actions"><button class="btn sm billing-gift">${state.gift ? 'Update' : 'Gift'}</button>${state.gift ? '<button class="btn sm ghost billing-gift-remove">Remove</button>' : ''}</span></div>
-    <div class="setting-row"><span class="setting-label">Storage packs ${policyTip(`${formatBytes(storagePack.bytes)} each, on any plan, until set to 0. Nothing is billed.`)}</span><span class="setting-value">
+    <div class="setting-row"><span class="setting-label">${esc(planPackName('storage', storagePack))} packs ${policyTip(`${formatBytes(storagePack.bytes)} of storage each, on any plan, until set to 0. Nothing is billed.`)}</span><span class="setting-value">
       <input id="billing-gift-packs" type="number" min="0" max="1000" step="1" value="${esc(state.giftedStoragePacks || 0)}" class="plan-gift-count" aria-label="Gifted storage packs"></span>
       <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="storage">Save</button></span></div>
-    <div class="setting-row"><span class="setting-label">Compute packs ${policyTip(`${planDollars(state.computePack?.creditMicros ?? e.computePackCreditMicros)} of compute a month each, on any plan, until set to 0. Nothing is billed.`)}</span><span class="setting-value">
+    <div class="setting-row"><span class="setting-label">${esc(planPackName('compute', state.computePack ?? { creditMicros: e.computePackCreditMicros }))} compute packs ${policyTip(`${planDollars(state.computePack?.creditMicros ?? e.computePackCreditMicros)} of compute a month each, on any plan, until set to 0. Nothing is billed.`)}</span><span class="setting-value">
       <input id="billing-gift-compute" type="number" min="0" max="1000" step="1" value="${esc(state.giftedComputePacks || 0)}" class="plan-gift-count" aria-label="Gifted compute packs"></span>
       <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="compute">Save</button></span></div>
   </div></details>` : '';
@@ -24412,6 +25293,13 @@ async function hydratePlanAndBilling(organizationId) {
     if (!confirm('Cancel the plan at the end of this billing period?')) return;
     await post('cancel'); toast('Cancellation sent.');
   });
+  act('.billing-resume', async () => { await post('resume'); toast('The plan will renew. It shows once the payment provider confirms it.'); });
+  act('.billing-seats', async (button) => {
+    const seats = Number(button.dataset.packs);
+    const price = planMoney(state.teamSeats?.priceCents ?? 500);
+    if (!confirm('add' in button.dataset ? `Add a seat for ${price}/month?` : `Remove an unused seat (${price}/month)?`)) return;
+    await post('seats', { seats }); toast('Sent. It applies once payment is confirmed.');
+  });
   act('.billing-cancel-checkout', async () => {
     if (!confirm('Cancel the open checkout? Its payment link stops working.')) return;
     await post('cancel'); toast('Checkout canceled.');
@@ -24424,13 +25312,15 @@ async function hydratePlanAndBilling(organizationId) {
   });
   const packOffer = (kind) => {
     const pack = kind === 'compute' ? state.computePack : state.storagePack;
-    return { pack, what: kind === 'compute' ? `${planDollars(pack.creditMicros)} of compute a month` : formatBytes(pack.bytes) };
+    const name = planPackName(kind, pack);
+    return { pack, name: kind === 'compute' ? `${name} compute pack` : `${name} pack`,
+      what: kind === 'compute' ? `${name} of compute a month` : `${name} of storage` };
   };
   act('.billing-packs', async (button) => {
     const kind = button.dataset.kind;
     const next = Number(button.dataset.packs);
-    const { pack, what } = packOffer(kind);
-    if (!confirm('add' in button.dataset ? `Add ${what} for ${planMoney(pack.monthlyPriceCents)}/month?` : `Remove ${what} (${planMoney(pack.monthlyPriceCents)}/month)?`)) return;
+    const { pack, name } = packOffer(kind);
+    if (!confirm('add' in button.dataset ? `Add a ${name} for ${planMoney(pack.monthlyPriceCents)}/month?` : `Remove a ${name} (${planMoney(pack.monthlyPriceCents)}/month)?`)) return;
     await post(`${kind}-packs`, { packs: next }); toast('Sent. It applies once payment is confirmed.');
   });
   box.querySelectorAll('.billing-buy').forEach((button) => button.addEventListener('click', () => {
@@ -24441,8 +25331,14 @@ async function hydratePlanAndBilling(organizationId) {
       return;
     }
     const kind = button.dataset.kind;
-    const { pack, what } = packOffer(kind);
-    openPlanCheckoutDialog(`Add a ${kind} pack`, `${what[0].toUpperCase()}${what.slice(1)} for ${planMoney(pack.monthlyPriceCents)}/month`,
+    if (kind === 'seats') {
+      const extra = Number(button.dataset.packs) - Number(state.teamSeats?.included || 0);
+      openPlanCheckoutDialog(extra === 1 ? 'Add a seat' : `Add ${extra} seats`,
+        `${extra === 1 ? 'One more person' : `${extra} more people`} on Team for ${planMoney((state.teamSeats?.priceCents ?? 500) * extra)}/month`, { seats: extra }, post);
+      return;
+    }
+    const { pack, name, what } = packOffer(kind);
+    openPlanCheckoutDialog(`Add a ${name}`, `${what[0].toUpperCase()}${what.slice(1)} for ${planMoney(pack.monthlyPriceCents)}/month`,
       { [`${kind}Packs`]: 1 }, post);
   }));
   const autoTopUp = async (body) => {
@@ -24461,9 +25357,14 @@ async function hydratePlanAndBilling(organizationId) {
     if (!Number.isFinite(dollars) || dollars <= 0) { toast('Enter a monthly limit in dollars', true); return; }
     await autoTopUp({ capCents: Math.round(dollars * 100) });
   });
+  box.querySelector('#billing-gift-plan')?.addEventListener('change', (event) => {
+    for (const el of box.querySelectorAll('#billing-gift-seats, .billing-gift-seats-unit')) el.hidden = event.target.value !== 'team';
+  });
   act('.billing-gift', async () => {
     const plan = $('#billing-gift-plan').value;
-    await post('gift', { plan }); toast('Plan gifted');
+    const seats = Number($('#billing-gift-seats')?.value);
+    if (plan === 'team' && (!Number.isInteger(seats) || seats < 1 || seats > 10_000)) throw new Error('Enter a whole number of seats from 1 to 10000');
+    await post('gift', { plan, ...(plan === 'team' ? { seats } : {}) }); toast('Plan gifted');
   });
   act('.billing-gift-remove', async () => {
     if (!confirm('Remove the gifted plan?')) return;
@@ -24609,9 +25510,13 @@ function computersMarkup(connections, held = []) {
   return `<div class="computer-providers">${reach ? computerAnyRow(connections) : ''}${connectedIds.map((id) => [id, COMPUTER_PROVIDERS[id]]).map(([id, info]) => {
     const connection = connections.find((candidate) => candidate.provider === id);
     const state = computerConnectionState(connection);
+    // Its own account switched off: new computers take the managed one offered beside it.
+    const included = connection && !connection.enabled && connections.some((candidate) => candidate.provider === id && candidate.managed);
     const mine = held.filter((computer) => computer.provider === id);
     return `<div class="computer-provider" data-provider="${id}"><b>${esc(info.name)}</b>
-      <span class="chip ${state.tone}"${connection?.managed ? ` title="${esc(`Runs on ${siteName()}’s ${info.name} account, charged to this organization’s monthly compute (Plan & billing). Connect your own account to use it instead.`)}"` : connection?.lastError ? ` title="${esc(connection.lastError)}"` : ''}>${esc(state.label)}</span>
+      <span class="chip ${state.tone}"${connection?.managed ? ` title="${esc(`Runs on ${siteName()}’s ${info.name} account, charged to this organization’s monthly compute (Plan & billing). Connect your own account to use it instead.`)}"`
+        : included ? ` title="${esc(`New computers run on ${siteName()}’s ${info.name} account, charged to this organization’s monthly compute. Ones already on yours stay there until their tasks end.`)}"`
+        : connection?.lastError ? ` title="${esc(connection.lastError)}"` : ''}>${esc(state.label)}</span>
       ${connection?.limits ? computerLimitsSummary(id, connection.limits) : ''}
       ${connection?.features?.internet === 'basic' ? `<span class="chip computer-basic" title="${esc('Reaches package registries, Git hosts, AI and cloud APIs only, and takes no allowlist. Any runs only tasks whose Outbound network says basic internet is enough here.')}">Basic internet</span>` : ''}
       ${mine.length ? `<button class="chip computer-held-toggle" type="button" aria-expanded="false" title="Tasks holding a machine or disk here">${mine.length} in use</button>` : ''}
@@ -24678,8 +25583,14 @@ function openComputerDialog(provider, connection, organizationId, onSaved, { man
   overlay.innerHTML = `<div class="modal-card computer-dialog" role="dialog" aria-modal="true" aria-label="${esc(info.name)}">
     <div class="modal-head"><b>${esc(info.name)}</b>${info.tip ? policyTip(info.tip) : ''}<span class="label-row-fill"></span><button class="icon-btn computer-close" type="button" aria-label="Close">×</button></div>
     ${computerKeyMarkup(info, connection)}
-    ${managed ? `<div class="settings-grid"><label class="form-row"><span>Machines at once ${policyTip(`The account’s concurrency limit (E2B Hobby: 20). Beyond it, tasks wait for a machine instead of being refused by ${info.name}. Blank: no limit.`)}</span>
-      <input class="computer-max-running" type="number" min="1" step="1" inputmode="numeric" value="${esc(config.maxRunning ?? '')}" placeholder="No limit"></label>
+    ${managed ? `<div class="settings-grid">${[['cpu', 'CPUs at once'], ['machines', 'Machines at once'], ['diskGb', 'Disk (GB)']].map(([key, label]) => {
+        const own = config.limits?.pool?.[key];
+        const known = connection?.limits?.pool?.[key];
+        return `<label class="form-row"><span>${label} ${key === 'cpu' ? policyTip(`What the account allows at once. Google Cloud, AWS and Daytona tell it themselves; enter it where they can’t (Hetzner’s CPU and volume limits, E2B’s and Fly.io’s machine counts). Disk counts parked computers’ disks too. Beyond it, tasks wait their turn.`) : ''}</span>
+          <input data-pool="${key}" type="number" min="1" step="1" inputmode="numeric" value="${esc(own ?? '')}" placeholder="${esc(own == null && known ? `${known} (${info.name})` : 'No limit')}"></label>`;
+      }).join('')}
+      <label class="form-row"><span>Fair share (%) ${policyTip('While another organization waits for room, one organization may hold at most this much of the account. Alone, it may use all of it.')}</span>
+        <input class="computer-share" type="number" min="1" max="100" step="1" inputmode="numeric" value="${esc(config.share ?? '')}" placeholder="50"></label>
       <label class="switch computer-enabled-row"><input class="toggle computer-enabled" type="checkbox" ${connection?.enabled === false ? '' : 'checked'}>Offer to organizations</label></div>` : ''}
     <details class="computer-advanced"><summary>Advanced</summary><div class="settings-grid">
       ${info.advanced.map(([key, label, placeholder]) => `<label class="form-row">${esc(label)}<input data-config="${esc(key)}" value="${esc(config[key] || '')}" placeholder="${esc(placeholder)}"></label>`).join('')}
@@ -24705,14 +25616,20 @@ function openComputerDialog(provider, connection, organizationId, onSaved, { man
     const limits = Object.fromEntries([...overlay.querySelectorAll('[data-limit]')]
       .filter((input) => input.value.trim() !== '' && Number(input.value) > 0)
       .map((input) => [input.dataset.limit, input.dataset.limit === 'memoryMb' ? Math.round(Number(input.value) * 1024) : Math.round(Number(input.value))]));
-    const maxRunning = Number(overlay.querySelector('.computer-max-running')?.value);
+    // The account's budget, where its provider cannot tell it; blank uses what it says.
+    const pool = Object.fromEntries([...overlay.querySelectorAll('[data-pool]')]
+      .filter((input) => input.value.trim() !== '' && Number(input.value) > 0)
+      .map((input) => [input.dataset.pool, Math.round(Number(input.value))]));
+    if (Object.keys(pool).length) limits.pool = pool;
+    const share = Number(overlay.querySelector('.computer-share')?.value);
     let apiKey;
     try { apiKey = computerKeyValue(overlay); }
     catch (error) { toast(error.message, true); button.disabled = false; return; }
     const body = { apiKey,
       ...(managed ? { enabled: overlay.querySelector('.computer-enabled').checked } : {}),
       config: { ...Object.fromEntries([...overlay.querySelectorAll('[data-config]')].map((input) => [input.dataset.config, input.value.trim()])), limits,
-        ...(managed && maxRunning > 0 ? { maxRunning: Math.round(maxRunning) } : {}) } };
+        // Blank goes back to the default share.
+        ...(managed ? { share: share > 0 ? Math.min(100, Math.round(share)) : '' } : {}) } };
     // A refused save changed nothing: keep what was typed. A saved one is
     // verified at once, and its state (or error) shows on the row.
     try { await api(base, { method: 'PUT', body: JSON.stringify(body) }); }
@@ -24741,7 +25658,7 @@ function openComputerDialog(provider, connection, organizationId, onSaved, { man
 function organizationView() {
   const org = S.organizations.find((o) => o.id === S.organizationId);
   const authorizationProjects = S.projects.filter((project) => project.organizationId === S.organizationId);
-  return `<div class="organization-settings"><div class="settings-header"><h1 class="page-title">${esc(org?.name || 'Organization')}</h1></div>
+  return `<div class="organization-settings"><div class="settings-header">${scopeTitle('Organization settings', org?.name || '')}</div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
     <nav class="settings-nav" aria-label="Settings sections"><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Resources</a><a href="#settings-agents">Agents</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
@@ -25142,6 +26059,7 @@ async function createOrganization() {
 }
 
 // ── theme ────────────────────────────────────────────────────────────────────
+const SKINS = [{ id: '', label: 'Default' }, { id: 'classic', label: 'Classic' }];
 /** 'light', 'dark', or '' to follow the system. */
 function setTheme(next) {
   if (next) document.documentElement.setAttribute('data-theme', next);
@@ -25151,7 +26069,19 @@ function setTheme(next) {
 (function initTheme() {
   const t = localStorage.getItem('karmax-theme');
   if (t) document.documentElement.setAttribute('data-theme', t);
+  // The installation's look arrives with /api/meta; until then, the one it had
+  // last time, so a classic installation never flashes the default look.
+  try { applySkin(localStorage.getItem('karmax-skin') || ''); } catch {}
 })();
+/** The installation's look (Installation → Appearance → Style): '' is the
+ * default, 'classic' the earlier indigo console. Every colour, radius and type
+ * size is a token of the look (web/styles.css "Looks"). */
+function applySkin(skin) {
+  const value = SKINS.some((s) => s.id === skin) ? skin : '';
+  if (value) document.documentElement.setAttribute('data-skin', value);
+  else document.documentElement.removeAttribute('data-skin');
+  try { localStorage.setItem('karmax-skin', value); } catch {}
+}
 
 // ── projects ─────────────────────────────────────────────────────────────────
 // The folder a world checks a repository source out into (its basename), which
@@ -25711,7 +26641,7 @@ function openAdjacentTask(delta) {
 function railRows() {
   // Search results are projects; skip their folder headings during a filtered walk.
   const folders = (S.projectSearch || '').trim() ? '' : ', #rail .folder-toggle';
-  return [...document.querySelectorAll('#rail .rail-icon, #rail .rail-add, #project-search, #rail .project-link' + folders)];
+  return [...document.querySelectorAll('#rail .rail-row, #rail .rail-icon, #rail .rail-profile, #rail .rail-add, #project-search, #rail .project-link' + folders)];
 }
 function inRail() { return !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('#rail')); }
 // Unfold a folded sidebar (or slide it over a phone's page) so it can take focus.
@@ -25751,7 +26681,7 @@ function closeTopOverlay() {
 
 // -- the shortcut echo: what you just did, as keys ---------------------------
 // Every action with a shortcut — clicked, run from the palette or typed — shows
-// its keys in the topbar for a moment, so the console teaches its own keyboard.
+// its keys at the window's top right for a moment, so the console teaches its own keyboard.
 // A chord prefix ('g') shows until the chord completes or lapses. The keys come
 // from the same registry as dispatch: clickable controls name their command in
 // `data-shortcut` (its id), or a raw binding in `data-keys`.
@@ -25891,7 +26821,7 @@ function submitTarget(from = document.activeElement) {
   return marked.length === 1 ? marked[0] : null;
 }
 // Is `button` what ⌘/Ctrl+Enter presses while typing in its form? Then a click
-// on it teaches that key in the topbar echo.
+// on it teaches that key in the key echo.
 function submitsByKey(button) {
   const form = button.closest(SUBMIT_FORM) || topSurface();
   const field = [...(form?.querySelectorAll('textarea, select, input:not([type="hidden"]):not([type="file"])') || [])]
@@ -26371,9 +27301,10 @@ function renderPricing() {
       <div class="price-value">${priceLine}</div><ul>${items.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>
       ${plan.id === 'free' || checkoutReady ? '<a class="btn primary" href="/signup">Create account</a>' : '<span class="price-unavailable">Paid checkout is not yet enabled.</span>'}</article>`;
   }).join('');
+  // Packs are named by what they give: a "100 GB pack", a "$10 pack" (of compute a month).
   const addOns = packs ? `<div class="pricing-addons"><b>Need more?</b>
-      <span>${esc(formatBytes(packs.storage.bytes))} more storage · ${esc(money(packs.storage.monthlyPriceCents))}/month</span>
-      ${compute ? `<span>${esc(credit(packs.compute.creditMicros))} more compute · ${esc(money(packs.compute.monthlyPriceCents))}/month</span>` : ''}
+      <span><b>${esc(formatBytes(packs.storage.bytes))} pack</b> ${esc(formatBytes(packs.storage.bytes))} more storage · ${esc(money(packs.storage.monthlyPriceCents))}/month</span>
+      ${compute ? `<span><b>${esc(credit(packs.compute.creditMicros))} pack</b> ${esc(credit(packs.compute.creditMicros))} more compute a month · ${esc(money(packs.compute.monthlyPriceCents))}/month</span>` : ''}
       <small>On Individual and Team, as many as you like.</small></div>` : '';
   const computeTerms = compute && packs ? `<p>Compute is the cloud computers agents work on. ${esc(siteName())} runs them for you at ${packs.computePriceMultiplier}× the provider’s list price (a 2 CPU · 2 GB E2B computer is about $0.27 an hour) and pauses work when the month’s compute is used up, unless you turn on auto top-up (${esc(money(packs.computeTopUpCents ?? 1000))} at a time, up to a monthly limit you set). Computers on your own E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud account cost nothing extra and aren’t counted.</p>` : '';
   renderPublicShell('/pricing', `<main class="pricing-page"><div class="legal-kicker">Hosted plans</div><h1>Free, Individual, and Team</h1>
@@ -26424,7 +27355,7 @@ function renderLanding() {
   const tick = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.6 8.4l2.9 2.9 5.9-6.6"/></svg>';
   const check = (title, detail = '') => `<li><span class="landing-tick">${tick}</span><div><h3>${title}</h3>${detail}</div></li>`;
   document.body.classList.add('landing-active');
-  document.title = `${siteName()} — the to-do list for agents`;
+  document.title = `${siteName()} — the to-do list for AI agents`;
   $('#app').innerHTML = `<div class="landing-page">
     <a class="landing-skip" href="#landing-main">Skip to content</a>
     <header class="landing-nav" aria-label="Primary navigation"><div class="landing-nav-inner">

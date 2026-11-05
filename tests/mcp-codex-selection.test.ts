@@ -17,7 +17,7 @@ describe('Codex selection fails closed without disclosing config', () => {
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   }
   it('disables each inherited connection for an explicit empty selection', async () => {
-    expect(await inspect('console.log(JSON.stringify([{name:"legacy"},{name:"other-server"}]))')).toEqual(['-c', 'mcp_servers={}', '-c', 'mcp_servers.legacy.enabled=false', '-c', 'mcp_servers.other-server.enabled=false']);
+    expect(await inspect('console.log(JSON.stringify([{name:"legacy"},{name:"other-server"}]))')).toEqual(['-c', 'mcp_servers={}', '-c', 'features.apps=false', '-c', 'mcp_servers.legacy.enabled=false', '-c', 'mcp_servers.other-server.enabled=false']);
   });
   it.each([
     ['malformed JSON', 'console.log("secret-do-not-disclose")', 'invalid MCP configuration'],
@@ -36,7 +36,7 @@ describe('Codex selection fails closed without disclosing config', () => {
   });
   it('disables known servers without starting a process', async () => {
     expect(await selectedCodexMcpFlags(world, '/missing', os.tmpdir(), {}, [], true, undefined, ['docs']))
-      .toEqual(['-c', 'mcp_servers={}', '-c', 'mcp_servers.docs.enabled=false']);
+      .toEqual(['-c', 'mcp_servers={}', '-c', 'features.apps=false', '-c', 'mcp_servers.docs.enabled=false']);
   });
 });
 

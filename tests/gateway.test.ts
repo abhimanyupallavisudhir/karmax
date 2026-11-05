@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { bootHarness, Harness } from './helpers/harness.js';
+import type { Gateway } from '../src/gateway/server.js';
 import { git } from '../src/world/git.js';
 import { previewLeaseOrigin } from '../src/gateway/previews.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE } from '../src/integrations/github-app.js';
@@ -24,6 +25,7 @@ const webDir = fileURLToPath(new URL('../web', import.meta.url));
 describe('gateway HTTP API (real server end-to-end)', () => {
   let h: Harness;
   let base: string;
+  let gateway: Gateway;
   let token: string;
   let loginRoot: string;
   let loginHomes: ConfigHomeManager;
@@ -35,6 +37,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     h = await bootHarness('mock', undefined, { configHomes: loginHomes });
     const gw = await h.startGateway();
     base = gw.url;
+    gateway = gw.gateway;
     const session: any = await (await fetch(`${base}/api/session`)).json();
     token = session.token;
     expect(session.authRequired).toBe(false);
@@ -72,9 +75,10 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const response = await fetch(`${base}/api/models`, { headers: auth() });
     expect(response.status).toBe(200);
     const catalog: any = await response.json();
-    expect(catalog.providers.claude.map((m: any) => m.id)).toContain('claude-opus-5-5');
+    expect(catalog.providers.claude.map((m: any) => m.id))
+      .toEqual(expect.arrayContaining(['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5']));
     expect(catalog.providers.codex.map((m: any) => m.id))
-      .toEqual(expect.arrayContaining(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']));
+      .toEqual(expect.arrayContaining(['gpt-6.1-terra', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']));
   });
 
   it('charts runnable models from Artificial Analysis: the bundled snapshot, or the live list with a key', async () => {
@@ -186,7 +190,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
         expect(read.mock.calls.some(([file]) => String(file).includes(sessionId))).toBe(false);
       } finally { read.mockRestore(); }
       const sessions: any = await (await fetch(`${base}/api/tasks/${task.id}/sessions`, { headers: auth() })).json();
-      expect(sessions.do).toMatchObject({ id: sessionId, provider: 'codex', downloadable: true, requiredCodexVersion: '0.162.1' });
+      expect(sessions.do).toMatchObject({ id: sessionId, provider: 'codex', downloadable: true, requiredCodexVersion: '0.166.0' });
       const response = await fetch(`${base}${sessions.do.downloadUrl}`, { headers: auth() });
       expect(response.status).toBe(200);
       expect(response.headers.get('content-type')).toContain('application/x-ndjson');
@@ -553,6 +557,36 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     await fetch(`${base}/api/settings/global/appearance`, {
       method: 'PUT', headers: auth(), body: JSON.stringify({ values: { icon: 'diamond' } }),
     });
+  });
+
+  it('switches the installation\'s look, keeping its logo, and tells every console', async () => {
+    const meta = async () => (await (await fetch(`${base}/api/meta`)).json()) as any;
+    expect((await meta()).skin).toBe('');
+    await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { icon: 'knot' } }),
+    });
+    const saved = await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { skin: 'classic' } }),
+    });
+    expect(saved.status).toBe(200);
+    expect(await (await fetch(`${base}/api/settings/global/appearance`, { headers: auth() })).json()).toEqual({ icon: 'knot', skin: 'classic' });
+    // Public: the sign-in screen wears the look too.
+    expect((await meta()).skin).toBe('classic');
+    expect((await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { skin: 'neon' } }),
+    })).status).toBe(400);
+    expect((await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: {} }),
+    })).status).toBe(400);
+    const dev = (await h.tokens.mintPrincipal('user:dev', ['task:*', 'project:read'])).token;
+    expect((await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: { authorization: `Bearer ${dev}`, 'content-type': 'application/json' }, body: JSON.stringify({ values: { skin: '' } }),
+    })).status).toBe(403);
+    expect((await meta()).skin).toBe('classic');
+    await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { skin: '', icon: 'diamond' } }),
+    });
+    expect((await meta()).skin).toBe('');
   });
 
   it('omits the disabled Resolve agent from schemas and profiles', async () => {
@@ -1786,16 +1820,23 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(JSON.stringify(attachments)).not.toContain('private-legacy-value');
   });
 
-  it('creates a brand-new project with no tasks: the task store recommends its first ones', async () => {
+  it('creates a brand-new project with the repair of failed deploys installed: the task store recommends the rest', async () => {
     const post = (path: string, body: unknown) =>
       fetch(`${base}${path}`, { method: 'POST', headers: auth(), body: JSON.stringify(body) }).then((r) => r.json());
     for (const path of ['/api/organizations/org_personal/projects', '/api/projects']) {
       const name = path.includes('/organizations/') ? 'Fresh via organization route' : 'Fresh via legacy route';
       const project: any = await post(path, { name });
       const tasks: any = await fetch(`${base}/api/projects/${project.id}/tasks`, { headers: auth() }).then((r) => r.json());
-      expect(tasks, `new project via ${path}`).toEqual([]);
+      expect(tasks.map((task: any) => ({ title: task.title, template: task.params?.template, armed: task.params?.triggerState })), `new project via ${path}`)
+        .toEqual([{ title: 'Repair GitHub workflow {{workflow}}', template: 'repair-github-workflow', armed: 'armed' }]);
       const store: any = await fetch(`${base}/api/projects/${project.id}/task-store`, { headers: auth() }).then((r) => r.json());
-      expect(store.tasks[0]).toMatchObject({ id: 'project-wiki', repeatable: false, installed: [] });
+      const entry = (id: string) => store.tasks.find((task: any) => task.id === id);
+      expect(entry('repair-github-workflow').installed).toEqual([tasks[0].id]);
+      expect(entry('project-wiki')).toMatchObject({ repeatable: true, installed: [] });
+      // Deleting it is respected: it is never installed again.
+      expect((await fetch(`${base}/api/tasks/${tasks[0].id}`, { method: 'DELETE', headers: auth() })).status).toBe(200);
+      await gateway.installDefaultTasks(project);
+      expect(await h.store.listTasks(project.id)).toEqual([]);
     }
   });
 

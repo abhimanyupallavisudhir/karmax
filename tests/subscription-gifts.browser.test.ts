@@ -46,9 +46,13 @@ it('gifts, changes, and removes plans from the organization billing screen throu
     expect(await plan.locator('.plan-head .chip').textContent()).toBe('Gifted');
     expect((await store.organizationEntitlements(recipient.id)).maxActiveAgentRuns).toBe(10);
     await page.getByRole('combobox', { name: 'Gift plan' }).selectOption('team');
+    // A gifted Team covers the seats gifted with it.
+    await page.getByRole('spinbutton', { name: 'Gifted seats' }).fill('2');
     await page.getByRole('button', { name: 'Update', exact: true }).click();
     await plan.locator('.plan-name').filter({ hasText: 'Team' }).waitFor();
     expect((await store.organizationEntitlements(recipient.id)).maxActiveAgentRuns).toBe(20);
+    expect((await billing.currentGift(recipient.id))?.seats).toBe(2);
+    await plan.locator('[data-limit="people"]').getByText('1 of 2 seats').waitFor();
     expect(provider.calls).toHaveLength(0);
     await store.setOrganizationMembership(recipient.id, 'second-member', 'member');
     await page.reload();
@@ -61,7 +65,7 @@ it('gifts, changes, and removes plans from the organization billing screen throu
     await plan.locator('.billing-gift-packs[data-kind="storage"]').click();
     await expect.poll(async () => (await store.organizationEntitlements(recipient.id)).storageQuotaBytes).toBe(310 * 1024 ** 3);
     await plan.locator('[data-limit="storage"]').filter({ hasText: 'of 310 GB' }).waitFor();
-    expect(await plan.locator('[data-limit="storage"] .info-dot').getAttribute('title')).toContain('110 GB with Team + 200 GB gifted');
+    expect(await plan.locator('[data-limit="storage"] .info-dot').getAttribute('title')).toContain('110 GB with Team + 2 × 100 GB packs gifted');
     await page.getByRole('spinbutton', { name: 'Gifted compute packs' }).fill('1');
     await plan.locator('.billing-gift-packs[data-kind="compute"]').click();
     await expect.poll(async () => (await store.organizationEntitlements(recipient.id)).giftedComputePacks).toBe(1);

@@ -537,6 +537,33 @@ async function main() {
   const computeTopUpTimer = new AsyncInterval(async () => { await computeTopUps.run(); }, 60_000);
   computeTopUpTimer.unref();
   startupJobs.push(() => computeTopUpTimer.run());
+  /** Ask a task waiting for a machine to try again now (its workflow's Retry). */
+  const retryWaitingForMachine = async (taskId: string): Promise<boolean> => {
+    const view = (await store.getTask(taskId))?.lastView;
+    if (view?.status !== 'waiting' || view.waitingFor?.kind !== 'retry' || view.waitingFor.summary !== 'Waiting for a machine') return false;
+    await client.workflow.getHandle(taskId).signal('retry');
+    return true;
+  };
+  // A parked world moved because it could not wake: its task tries again at once.
+  worldLifecycle.retry = retryWaitingForMachine;
+  // The compute queue: tell the first task waiting for a machine that now
+  // fits to try again at once (src/world/compute-waker.ts).
+  const { wakeComputeQueue, WAKE_EVERY_MS } = await import('./world/compute-waker.js');
+  const { MANAGED_COMPUTE: INSTALLATION } = await import('./world/connections.js');
+  const computeQueueTimer = new AsyncInterval(async () => { await wakeComputeQueue({ store,
+    account: async (key) => {
+      const split = key.lastIndexOf(':');
+      const [scope, provider] = [key.slice(0, split), key.slice(split + 1)];
+      if (scope === INSTALLATION) {
+        const view = (await providerConnections.managedConnections()).find((value) => value.provider === provider);
+        return view ? { provider, managed: true, pool: view.limits.pool, share: view.config.share } : undefined;
+      }
+      if (await providerConnections.funding(scope, provider) !== 'own') return undefined;
+      return { provider, managed: false, pool: (await providerConnections.limits(scope, provider)).pool };
+    },
+    retry: retryWaitingForMachine }); }, WAKE_EVERY_MS);
+  computeQueueTimer.unref();
+  startupJobs.push(() => computeQueueTimer.run());
   // Service limits: sample the operator's accounts every 15 minutes, so a
   // daily allowance is caught well before it runs out.
   const serviceLimitsTimer = new AsyncInterval(() => serviceLimits.run(), 15 * 60_000);
@@ -726,6 +753,8 @@ async function main() {
   if ((await store.listProjects()).length === 0) {
     (await store.createProject('My project'));
   }
+  // Projects from before every project came with the repair task get it now (once each).
+  void (async () => { for (const project of await store.listProjects()) await gateway.installDefaultTasks(project); })();
   if (installationOwner) {
     for (const project of (await store.listProjects()).filter((candidate) => candidate.organizationId === 'org_personal')) {
       if (!(await store.userIsProjectMember(project.id, installationOwner.id)))
@@ -804,7 +833,7 @@ async function main() {
     // process-exit backstop bounds shutdown; do not close Store under these jobs.
     const maintenanceDrain = Promise.allSettled([
       startupMaintenance,
-      retentionTimer.stop(), serviceLimitsTimer.stop(), inboxCleanup.stop(), credentialAttentionTimer.stop(), subscriptionEntitlementTimer.stop(),
+      retentionTimer.stop(), serviceLimitsTimer.stop(), computeQueueTimer.stop(), inboxCleanup.stop(), credentialAttentionTimer.stop(), subscriptionEntitlementTimer.stop(),
       subscriptionSeatTimer.stop(),
       reconcileSweep.stop(), deploymentSweep.stop(),
       triggerScheduler.stop(), mailPoller.stop(), worldLifecycle.stop(), delivery.stop(),

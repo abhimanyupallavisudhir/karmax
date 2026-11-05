@@ -245,8 +245,9 @@ async function seed() {
   const orgId = str(organization.id);
   state.organization = { id: orgId, name: str(organization.name) }; save();
   // A second member needs a paid seat. The installation's owner can grant a
-  // plan without any payment provider.
-  await owner.call('POST', `/api/organizations/${orgId}/subscription/gift`, { plan: 'team' },
+  // plan without any payment provider; a gifted Team covers the seats it is
+  // given (older releases ignore `seats` and admit anyone).
+  await owner.call('POST', `/api/organizations/${orgId}/subscription/gift`, { plan: 'team', seats: 2 },
     { 'idempotency-key': `rehearsal-gift-${tag}` });
   await owner.call('POST', `/api/organizations/${orgId}/members`,
     { userId: memberPerson.id, authorization: { level: 'developer', scope: 'organization' } });

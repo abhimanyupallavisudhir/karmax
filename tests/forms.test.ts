@@ -2,10 +2,6 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { git } from '../src/world/git.js';
 import { httpOps } from '../src/platform/mcp.js';
-import { MANIFESTS } from '../src/contrib/manifests.js';
-// Derived, not hard-coded: the pinned type moves every time a workflow ships a
-// new replay version, and a literal here just makes an unrelated PR red.
-const bundledVersion = (name: string) => MANIFESTS.find((m) => m.name === name)!.version;
 
 describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
   let h: Harness;
@@ -77,35 +73,33 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     expect(ps.repos).toEqual([repo]);
   });
 
-  it('changes a running task from Software Dev to Goal through the task endpoint', async () => {
+  it('refuses the retired Goal workflow for a new task and for a running one', async () => {
+    const created = await fetch(`${base}/api/projects/${projectId}/tasks`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ title: 'Autonomous', workflow: 'goal', params: { prompt: 'go' } }),
+    });
+    expect(created.ok).toBe(false);
+    expect((await J(created)).error).toMatch(/Goal is retired.*agent Reviewer/);
+    expect((await get(`/api/projects/${projectId}/tasks`)).some((t: any) => t.title === 'Autonomous')).toBe(false);
+
     const task = await post(`/api/projects/${projectId}/tasks`, {
-      title: 'Switchable',
+      title: 'Not switchable',
       workflow: 'software-dev',
       params: { prompt: '@write endpoint-switch.txt :: done\n@review waiting' },
     });
-    const review = await poll(task.id, 'review');
-    expect(review.workflowSwitchable).toBe(true);
+    await poll(task.id, 'review');
     const changed = await fetch(`${base}/api/tasks/${task.id}/workflow`, {
-      method: 'PATCH',
-      headers: auth(),
-      body: JSON.stringify({ workflow: 'goal' }),
-    }).then(J);
-    expect(changed.workflow).toBe('goal');
-    const done = await poll(task.id, 'done');
-    expect(done.workflow).toBe('goal');
-    // The searchable mode changes, while replay accounting retains the actual
-    // Temporal definition that started this run.
-    expect((await h.store.getTask(task.id))).toMatchObject({
-      workflow: 'goal',
-      executionWorkflow: 'software-dev',
-      workflowVersion: bundledVersion('software-dev'),
+      method: 'PATCH', headers: auth(), body: JSON.stringify({ workflow: 'goal' }),
     });
+    expect(changed.ok).toBe(false);
+    expect((await J(changed)).error).toMatch(/Goal is retired/);
+    expect((await get(`/api/tasks/${task.id}`)).workflow).toBe('software-dev');
+    expect((await h.store.getTask(task.id))?.workflow).toBe('software-dev');
   });
 
   it('changes an unqueued draft workflow in place', async () => {
     const draft = await post(`/api/projects/${projectId}/tasks`, {
       title: 'Editable workflow',
-      workflow: 'goal',
+      workflow: 'just-do',
       draft: true,
       notes: 'keep this note',
       params: { prompt: 'prepare the repository', wikiContext: ['[[proj:SPEC.md]]'] },

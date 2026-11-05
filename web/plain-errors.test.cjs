@@ -18,7 +18,7 @@ function extract(name, kind = 'function') {
 global.esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 eval(`${extract('CAPABILITY_ACTIONS', 'const')}; global.CAPABILITY_ACTIONS = CAPABILITY_ACTIONS;`);
 global.globalRoute = () => '/org/settings';
-for (const fn of ['permissionSentence', 'plainError', 'plainTaskError', 'toolsDidNotStart', 'setupFix', 'setupFixHtml', 'taskErrorHtml']) eval(`global.${fn} = ${extract(fn)}`);
+for (const fn of ['permissionSentence', 'plainError', 'plainTaskError', 'toolsDidNotStart', 'storageFull', 'setupFixes', 'setupFix', 'setupFixHtml', 'taskErrorHtml']) eval(`global.${fn} = ${extract(fn)}`);
 
 let passed = 0;
 const eq = (actual, expected, label) => { assert.strictEqual(actual, expected, label); passed++; };
@@ -87,5 +87,13 @@ assert.ok(!taskErrorHtml('Activity task failed → stream ended unexpectedly').i
 // pramana#155 (2026-11-01): another operation held the task's computer past the wait.
 assert.match(plainTaskError('Could not publish resources: file lock admission timed out Nothing was lost; Retry publishes again.').summary,
   /^The task’s computer was busy with another operation \(starting, saving or parking it\)\. Retry usually fixes this\.$/); passed++;
+
+// pramana#137 (2026-11-04): a run crashed because Hetzner's CPUs were full, and
+// the task said only "workflow failed". The reason, as of a stopped task.
+const full = plainTaskError("workflow failed: tavya's Hetzner Cloud computers are using 8 of their 10 CPUs; waiting for room.");
+eq(full.summary, "The task stopped: tavya's Hetzner Cloud computers are using 8 of their 10 CPUs. Retry once there’s room.", 'a full provider, said as stopped');
+assert.ok(!taskErrorHtml("workflow failed: tavya's Hetzner Cloud computers are using 8 of their 10 CPUs; waiting for room.").includes('Press Retry'), 'its advice is not doubled'); passed++;
+eq(plainTaskError('workflow failed: could not seed the parent branch').summary, 'The task stopped: could not seed the parent branch.', 'any other crash keeps its cause');
+assert.ok(taskErrorHtml('workflow failed: could not seed the parent branch').includes('Press Retry to try again.'), 'and suggests Retry'); passed++;
 
 console.log(`${passed} passed, 0 failed`);

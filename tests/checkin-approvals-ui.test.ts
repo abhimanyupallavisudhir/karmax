@@ -12,7 +12,7 @@ function setup() {
   const S = { approvalRequests: [], permissionRequests: [], authorizationRequests: [], repositoryAccessRequests: [], connections: [], approvalItems: [], user: { id: 'user' }, projects: [] };
   const context = vm.createContext({ S, esc: String, credentialRequestTaskLink: () => '',
     authorizationSummary: () => 'Developer', policyTip: () => '', sortVaultItems: (v: any) => v });
-  for (const name of ['credentialRequestRows', 'requestReasonLine', 'permissionRequestRows', 'authorizationRequestRows', 'repositoryAccessRequestRows', 'connectionAccountNames', 'connectionRows', 'ignoredChip', 'ignoreRequestButton', 'conversationApprovalRequests', 'resourceReviewNeedsAction']) {
+  for (const name of ['credentialRequestRows', 'requestReasonLine', 'permissionRequestRows', 'authorizationRequestRows', 'repositoryAccessRequestRows', 'connectionAccountNames', 'connectionRows', 'subTaskAskLine', 'ignoredChip', 'ignoreRequestButton', 'conversationApprovalRequests', 'resourceReviewNeedsAction']) {
     vm.runInContext(fn(name), context);
   }
   return context;

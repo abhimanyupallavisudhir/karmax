@@ -1,10 +1,12 @@
-// The console's navigation layout: the top bar holds only the person (profile,
-// inbox). The sidebar reads top to bottom as
-//   [ Organization ▾ ]   ⌂ ⟋ 📖 ⚙    (organization: home, insights, wiki, settings)
-//   Projects +  /  search  /  the project list
-//   ? ⌘ ⌨ ▤                          (installation-wide: docs, palette, shortcuts, installation)
-// with every organization and installation-wide entry an icon with a label for
-// assistive technology and a tooltip, and no "Installation" heading.
+// The console's navigation layout: there is no top bar on a computer — the
+// sidebar holds everything, top to bottom:
+//   [mark] tavya                      [⇤]   (the logo goes home; ⇤ folds the sidebar)
+//   [ Organization ▾ ]
+//   ⌂ Home / ⟋ Insights / 📖 Wiki / ⚙ Settings   (rows with their names)
+//   Projects +  /  search  /  the project list, each with its For me count
+//   ? ⌘ ⌨ ▤                                  (docs, palette, shortcuts, installation — icons sharing one row)
+//   (A) Your name                       🔔   (profile and inbox)
+// A phone keeps a slim bar with ☰ to slide the sidebar over the page.
 // Run: node web/sidebar-layout.browser.test.cjs   (SIDEBAR_SCREENSHOTS=<dir> also saves screenshots)
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -17,10 +19,18 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
   if (shots) fs.mkdirSync(shots, { recursive: true });
   try {
     const project = { id: 'p', organizationId: 'o', name: 'Website', config: {} };
+    const quiet = { id: 'q', organizationId: 'o', name: 'Quiet project', config: {} };
+    const countQueries = [];
     const open = async ({ operator, viewport = { width: 1280, height: 760 } }) => {
       const context = await browser.newContext({ serviceWorkers: 'block', viewport });
-      await fakeConsole(context, { project, async api(p) {
+      await fakeConsole(context, { project, async api(p, request, url) {
+        if (p === '/api/projects') return [project, quiet];
         if (p === '/api/settings/installation') return { canManage: operator };
+        if (p === '/api/user/app-grants') return { grants: [], levels: [] };
+        if (p === '/api/organizations/o/search' && url.searchParams.get('countBy') === 'project') {
+          countQueries.push(url.searchParams.get('q'));
+          return { total: 3, counts: { p: 3 } };
+        }
         if (p === '/api/organizations/o/search') return { tasks: [], total: 0, offset: 0, limit: 200, projects: [], tags: [] };
         if (p === '/api/organizations/o/insights') return { totals: {}, previous: {}, pipeline: { drafts: 0, stages: {} } };
       } });
@@ -36,32 +46,72 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     // ── an operator's console ──
     const { context, page, errors } = await open({ operator: true });
 
-    // The top bar: the sidebar toggle and logo on the left, the person on the right — nothing else.
-    const topbar = await page.locator('.topbar').evaluate((bar) => [...bar.querySelectorAll('a, button, input')]
-      .filter((el) => el.offsetParent !== null).map((el) => el.id));
-    assert.deepEqual(topbar, ['mobile-menu', 'brand-home', 'topbar-user', 'bell'], 'the top bar holds only the toggle, logo, profile and inbox');
+    // No top bar on a computer: the page starts at the top of the window.
+    assert.equal(await page.locator('.mobile-bar').isVisible(), false, 'no top bar on a computer');
+    const railTop = await page.locator('#rail').evaluate((rail) => rail.getBoundingClientRect().top);
+    assert.equal(railTop, 0, 'the sidebar starts at the top of the window');
 
     // The sidebar, in order.
     const order = await page.locator('#rail').evaluate((rail) => [...rail.querySelectorAll(
-      '#org-switcher, .rail-org-nav a, .rail-heading, #project-search, .project-link, .rail-foot a, .rail-foot button')]
+      '#brand-home, #rail-collapse, #org-switcher, .rail-org-nav a, .rail-heading, #project-search, .project-link, .rail-tools a, .rail-tools button, .rail-person a')]
       .map((el) => el.id || el.className.split(' ')[0]));
-    assert.deepEqual(order, ['org-switcher', 'rail-home', 'rail-insights', 'rail-wiki', 'rail-organization',
-      'label', 'project-search', 'project-link',
-      'rail-docs', 'rail-palette', 'rail-help', 'rail-installation'], `sidebar order: ${order.join(', ')}`);
+    assert.deepEqual(order, ['brand-home', 'rail-collapse', 'org-switcher', 'rail-home', 'rail-insights', 'rail-wiki', 'rail-organization',
+      'label', 'project-search', 'project-link', 'project-link',
+      'rail-docs', 'rail-palette', 'rail-help', 'rail-installation', 'rail-profile', 'bell'], `sidebar order: ${order.join(', ')}`);
 
-    // Icons only: no visible words, but a name for assistive technology and a tooltip.
-    const icons = await page.locator('.rail-org-nav a, .rail-foot a, .rail-foot button').evaluateAll((els) => els.map((el) => ({
-      id: el.id, text: el.textContent.trim(), label: el.getAttribute('aria-label'), title: el.getAttribute('title'),
-      svg: el.querySelector('svg')?.innerHTML || '' })));
-    for (const icon of icons) {
-      assert.equal(icon.text, '', `${icon.id} shows no text`);
-      assert.ok(icon.label && icon.title, `${icon.id} is named and has a tooltip`);
-      assert.ok(icon.svg, `${icon.id} draws an icon`);
+    // The logo is the brand mark and the site's name, and goes home.
+    assert.equal((await page.locator('#brand-home').innerText()).trim(), 'Fixture');
+    assert.equal(await page.locator('#brand-home .mark').count(), 1);
+    assert.equal(await page.locator('#brand-home').getAttribute('href'), '/org');
+
+    // The organization's places are rows with their names.
+    const nav = await page.locator('.rail-org-nav a').evaluateAll((els) => els.map((el) => ({
+      text: el.innerText.trim(), svg: !!el.querySelector('svg'), height: el.getBoundingClientRect().height })));
+    assert.deepEqual(nav.map((row) => row.text), ['Home', 'Insights', 'Wiki', 'Settings']);
+    for (const row of nav) {
+      assert.ok(row.svg, `${row.text} keeps its icon`);
+      assert.ok(row.height >= 32, `${row.text} is a comfortable row (${row.height}px)`);
     }
-    const svgs = icons.map((icon) => icon.svg);
-    assert.equal(new Set(svgs).size, svgs.length, 'every entry has its own icon (installation no longer shares the palette mark)');
-    assert.deepEqual(icons.map((icon) => icon.label), ['Home', 'Insights', 'Wiki', 'Settings', 'Docs', 'Command palette', 'Keyboard shortcuts', 'Installation settings']);
-    assert.ok(!(await page.locator('#rail').innerText()).match(/Installation|Organization\n/), 'no Installation or Organization heading');
+
+    // The tools are icons sharing one row, each named and with a tooltip.
+    const tools = await page.locator('.rail-tools a, .rail-tools button').evaluateAll((els) => els.map((el) => {
+      const box = el.getBoundingClientRect();
+      return { id: el.id, text: el.textContent.trim(), label: el.getAttribute('aria-label'), title: el.getAttribute('title'),
+        svg: el.querySelector('svg')?.innerHTML || '', top: Math.round(box.top), left: box.left, right: box.right };
+    }));
+    for (const tool of tools) {
+      assert.equal(tool.text, '', `${tool.id} shows no text`);
+      assert.ok(tool.label && tool.title, `${tool.id} is named and has a tooltip`);
+      assert.ok(tool.svg, `${tool.id} draws an icon`);
+    }
+    assert.equal(new Set(tools.map((tool) => tool.svg)).size, tools.length, 'every tool has its own icon');
+    assert.deepEqual(tools.map((tool) => tool.label), ['Docs', 'Command palette', 'Keyboard shortcuts', 'Installation settings']);
+    assert.equal(new Set(tools.map((tool) => tool.top)).size, 1, 'the tools share one row, the operator\'s extra one included');
+
+    // You and your inbox: the avatar with your name opens your profile; the bell the inbox.
+    assert.equal((await page.locator('#rail-profile .rail-person-name').innerText()).trim(), 'Tester');
+    assert.equal(await page.locator('#rail-profile').getAttribute('href'), '/profile');
+    assert.equal(await page.locator('#bell').getAttribute('href'), '/inbox');
+    assert.equal(await page.locator('#bell').getAttribute('aria-label'), 'Inbox');
+
+    // Everything fits inside the sidebar: nothing spills past its edge or wraps.
+    const fit = await page.evaluate(() => {
+      const rail = document.querySelector('#rail').getBoundingClientRect();
+      const spill = [...document.querySelectorAll('#rail .rail-head *, #rail .rail-foot *')].filter((el) => {
+        const box = el.getBoundingClientRect();
+        return box.width && (box.right > rail.right - 4 || box.left < rail.left);
+      }).map((el) => el.id || el.className);
+      return { spill, footBottom: document.querySelector('.rail-foot').getBoundingClientRect().bottom, railBottom: rail.bottom };
+    });
+    assert.deepEqual(fit.spill, [], 'nothing in the head or foot spills out of the sidebar');
+    assert.ok(Math.abs(fit.railBottom - fit.footBottom) < 16, `the foot sits at the bottom (${JSON.stringify(fit)})`);
+
+    // A project's number is how many tasks its For me list holds; none, no number.
+    await page.locator('.project-row[data-id="p"] .count').waitFor();
+    assert.equal((await page.locator('.project-row[data-id="p"] .count').innerText()).trim(), '3');
+    assert.equal(await page.locator('.project-row[data-id="q"] .count').count(), 0, 'no number when nothing is for you');
+    assert.match(await page.locator('.project-row[data-id="p"] .count').getAttribute('title'), /3 tasks? for you/);
+    assert.ok(countQueries.includes('for:me -is:archived'), `counts the For me query (${countQueries.join(' | ')})`);
 
     // Docs opens in its own tab; the others route in place.
     assert.equal(await page.locator('#rail-docs').getAttribute('href'), '/docs');
@@ -81,6 +131,9 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     await page.locator('#rail-organization').click();
     await page.waitForFunction(() => location.pathname === '/org/settings');
     assert.equal(await page.locator('#rail-organization').getAttribute('aria-current'), 'page');
+    await page.locator('#rail-profile').click();
+    await page.waitForFunction(() => location.pathname === '/profile');
+    assert.equal(await page.locator('#rail-profile').getAttribute('aria-current'), 'page');
 
     // The installation-wide buttons still do their jobs.
     await page.locator('#rail-palette').click();
@@ -89,26 +142,30 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     await page.locator('#rail-help').click();
     await page.locator('#help-scrim b', { hasText: 'Keyboard shortcuts' }).waitFor();
     await page.keyboard.press('Escape');
-
-    // The bottom group stays put at the foot of a tall rail while the project list scrolls.
-    const geometry = await page.evaluate(() => {
-      const rail = document.querySelector('#rail').getBoundingClientRect();
-      const foot = document.querySelector('.rail-foot').getBoundingClientRect();
-      return { railBottom: rail.bottom, footBottom: foot.bottom };
-    });
-    assert.ok(Math.abs(geometry.railBottom - geometry.footBottom) < 16, `the installation icons sit at the bottom (${JSON.stringify(geometry)})`);
     if (shots) await page.screenshot({ path: path.join(shots, 'sidebar-operator.png') });
+
+    // ⇤ folds the sidebar away; a button at the window's edge brings it back.
+    await page.locator('#rail-collapse').click();
+    await page.waitForFunction(() => document.documentElement.classList.contains('rail-collapsed'));
+    await page.locator('#rail-expand').waitFor({ state: 'visible' });
+    if (shots) { await page.waitForTimeout(250); await page.screenshot({ path: path.join(shots, 'sidebar-folded.png') }); }
+    await page.locator('#rail-expand').click();
+    await page.waitForFunction(() => !document.documentElement.classList.contains('rail-collapsed'));
+    assert.equal(await page.locator('#rail-expand').isVisible(), false);
     assert.deepEqual(errors, []);
     await context.close();
 
-    // ── a member who does not run the installation: no installation entry ──
+    // ── a member who does not run the installation: no installation entry, the rest unchanged ──
     const member = await open({ operator: false });
     assert.equal(await member.page.locator('#rail-installation').count(), 0, 'no installation entry without installation access');
     assert.equal(await member.page.locator('#rail-docs').count(), 1);
+    const memberTools = await member.page.locator('.rail-tools a, .rail-tools button').evaluateAll((els) => els.map((el) => Math.round(el.getBoundingClientRect().top)));
+    assert.equal(new Set(memberTools).size, 1);
 
-    // ── a phone: the sidebar slides over, the picker inside it opens without closing it ──
+    // ── a phone: a slim bar with ☰; the sidebar slides over, the picker inside it opens without closing it ──
     await member.context.close();
     const phone = await open({ operator: false, viewport: { width: 390, height: 780 } });
+    assert.ok(await phone.page.locator('.mobile-bar').isVisible(), 'a phone has a bar to open the sidebar');
     await phone.page.locator('#mobile-menu').click();
     await phone.page.waitForFunction(() => document.querySelector('#rail').classList.contains('mobile-open'));
     await phone.page.locator('#org-switcher .combo-caret').click();

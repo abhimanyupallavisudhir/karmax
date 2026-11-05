@@ -448,6 +448,13 @@ export function orderCheckouts(repos: WorldRepo[]): WorldRepo[] {
   return ordered;
 }
 
+export interface WorldOpenOptions { wake?: boolean }
+
+/** The world is parked or hibernated, and the caller asked not to wake it. */
+export class WorldNotRunningError extends Error {
+  constructor() { super("the task's computer is not running"); this.name = 'WorldNotRunningError'; }
+}
+
 export interface WorldProvider {
   readonly kind: WorldKind;
   readonly capabilities?: {
@@ -463,8 +470,9 @@ export interface WorldProvider {
    * sandbox's pause keeps its processes. */
   readonly parkStopsProcesses?: boolean;
   create(spec: WorldSpec): Promise<World>;
-  /** Reconstruct a live world from a persisted handle. */
-  open(handle: WorldHandle): Promise<World>;
+  /** Reconstruct a live world from a persisted handle. With `wake: false` a
+   * stopped machine is not started: WorldNotRunningError instead. */
+  open(handle: WorldHandle, options?: WorldOpenOptions): Promise<World>;
   /** Release metered compute while retaining the world's durable state. */
   park?(handle: WorldHandle): Promise<WorldHandle>;
   /** Stop the machine of a world recorded as parked that runs anyway,

@@ -154,4 +154,34 @@ describe('Installation → Appearance and Managed compute', () => {
     expect(await fold.getAttribute('open')).toBeNull();
     await ui.close();
   });
+
+  // The account's budget (wiki features/managed-compute § Budget): what runs
+  // against it on the row; in the dialog, what the provider said as the
+  // placeholder, what a person entered over it, and the fair share.
+  it('shows machines and CPUs in use against the account\'s budget, and saves an entered budget and share', async () => {
+    const ui = await consolePage({ api: (call) => call.method === 'PUT' || call.method === 'POST' ? {} : undefined });
+    const gcp = { provider: 'gcp', enabled: true, status: 'ready', running: 3, runningCpus: 6, seconds: 0, organizations: 1, costMicros: 0, chargedMicros: 0,
+      config: { region: 'europe-west3-a', limits: { pool: { machines: 10 } } }, limits: { cpu: 24, pool: { cpu: 24, machines: 10 } } };
+    await ui.run(`document.getElementById('main').innerHTML = managedComputeMarkup(${JSON.stringify({ providers: [gcp] })})`);
+    expect(await ui.page.locator('.managed-running').innerText()).toBe('3 of 10 running · 6 of 24 CPU');
+    // Disk (parked computers' too) and the queue, once there is a disk budget and someone waits.
+    await ui.run(`document.getElementById('main').innerHTML = managedComputeMarkup(${JSON.stringify({ providers: [{ ...gcp, diskGb: 400, waiting: 2,
+      limits: { ...gcp.limits, pool: { ...gcp.limits.pool, diskGb: 5000 } } }] })})`);
+    expect(await ui.page.locator('.managed-running').innerText()).toBe('3 of 10 running · 6 of 24 CPU · 400 of 5,000 GB · 2 waiting');
+    await ui.run(`document.getElementById('main').innerHTML = managedComputeMarkup(${JSON.stringify({ providers: [gcp] })})`);
+    await ui.run(`openComputerDialog('gcp', ${JSON.stringify(gcp)}, undefined, undefined, { managed: true })`);
+    const cpus = ui.page.locator('[data-pool="cpu"]');
+    expect(await cpus.inputValue()).toBe('');
+    expect(await cpus.getAttribute('placeholder')).toBe('24 (Google Cloud)');
+    expect(await ui.page.locator('[data-pool="machines"]').inputValue()).toBe('10');
+    expect(await ui.page.locator('.computer-share').getAttribute('placeholder')).toBe('50');
+    await cpus.fill('16');
+    await ui.page.locator('[data-pool="diskGb"]').fill('1024');
+    await ui.page.locator('.computer-share').fill('40');
+    await ui.page.locator('.computer-save').click();
+    await expect.poll(() => ui.calls.find((call) => call.method === 'PUT')?.body).toMatchObject({
+      config: { limits: { pool: { cpu: 16, machines: 10, diskGb: 1024 } }, share: 40 } });
+    expect(ui.errors).toEqual([]);
+    await ui.close();
+  });
 });

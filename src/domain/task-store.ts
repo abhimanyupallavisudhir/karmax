@@ -19,6 +19,8 @@ export interface StoreTask {
     hostedPrompt?: string };
   /** What the project must have for it to do anything (default: what its triggers listen to). */
   needs?: StoreNeed[];
+  /** A repeatable one's first run starts when it is installed, not at its first trigger. */
+  runOnInstall?: boolean;
 }
 
 /** What a project must have for a store task to do anything. */
@@ -45,21 +47,27 @@ export const RECOVERY_PROMPT = [
 export const PROJECT_WIKI_TEMPLATE_ID = 'project-wiki';
 
 const projectWikiPrompt = (hosted: boolean) => [
-  `## Set up this project's wiki for agents`,
+  `## Maintain this project's wiki for agents`,
+  `If ${BRAND}'s project wiki has no pages yet, set it up:`,
   `1) Migrate AGENTS.md, CLAUDE.md or any other similar agent context files to ${BRAND}'s project wiki.`,
   '2) If no such files exist, or if they are out of date, compile wiki pages containing everything essential for a new developer/agent to get up and running: memories for facts worth knowing, skills for procedures worth repeating.',
   ...(hosted ? [] : ['3) For brownfield repos, scan for hardcoded resources (e.g. ports) that would collide between worktrees and fix them.']),
-  'Put the "default" label on wiki pages that must appear in the context of every new agent.',
+  '',
+  'Otherwise keep it current: read what changed in the repositories since the wiki was last updated (`git log` of each, against the wiki\'s), then fix or delete what is now wrong (paths, commands, names, issues since fixed), add what a newcomer would now need, and merge duplicates. If nothing changed that the wiki should know, change nothing.',
+  '',
+  'Put the "default" label on wiki pages that must appear in the context of every new agent, and only on those.',
   'Report what you changed.',
 ].join('\n');
 
 export const STORE_TASKS: readonly StoreTask[] = [
   {
     id: PROJECT_WIKI_TEMPLATE_ID,
-    name: 'Set up the project wiki',
-    summary: 'An agent reads the project and writes what every later agent should know into its wiki.',
-    task: { title: 'Set up the project wiki', workflow: 'software-dev',
-      prompt: projectWikiPrompt(false), hostedPrompt: projectWikiPrompt(true), params: {} },
+    name: 'Maintain the project wiki',
+    summary: 'An agent writes what every later agent should know into the project’s wiki now, then keeps it up to date every week.',
+    runOnInstall: true,
+    task: { title: 'Maintain the project wiki', workflow: 'software-dev',
+      prompt: projectWikiPrompt(false), hostedPrompt: projectWikiPrompt(true),
+      params: { repeatable: true, triggers: [{ kind: 'schedule', cron: '0 6 * * 1', recurring: true }] } },
   },
   {
     id: REPAIR_TEMPLATE_ID,
@@ -120,6 +128,13 @@ export function takenFromStore(task: { params?: Record<string, unknown> }, templ
   const params = task.params ?? {};
   if (params.template !== template.id || params.runOf || params.draft) return false;
   return !storeTaskRepeatable(template) || params.repeatable === true;
+}
+
+/** Whether installing this series (arming it the first time) starts its first
+ *  run too: its store task says so, and the person has not untied it from it. */
+export function runsOnInstall(params: Record<string, unknown> | undefined): boolean {
+  if (params?.repeatable !== true || params.runOf || params.draft) return false;
+  return STORE_TASKS.find((template) => template.id === params.template)?.runOnInstall === true;
 }
 
 /** What a store task needs, so the store can say what is missing. */

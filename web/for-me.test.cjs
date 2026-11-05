@@ -9,16 +9,17 @@ const src = fs.readFileSync(`${__dirname}/app.js`, 'utf8');
 const fn = (name) => { const start = src.search(new RegExp(`^(?:async )?function ${name}\\(`, 'm')); assert.ok(start >= 0, name); return src.slice(start, src.indexOf('\n}', start) + 2); };
 const constant = (name) => { const start = src.search(new RegExp(`^const ${name} =`, 'm')); assert.ok(start >= 0, name); return src.slice(start, src.indexOf('\n};', start) + 3).replace(/^const /, 'var '); };
 
-test('a for: query keeps the sub-tasks and runs that wait on you; archived is never hidden implicitly', () => {
+test('lists fold sub-tasks and runs except those that need you; archived is never hidden implicitly', () => {
   const ctx = vm.createContext({});
-  vm.runInContext(['queryMentionsFacet', 'queryNamesPerson', 'listShowsNested', 'effectiveQuery'].map(fn).join('\n'), ctx);
+  vm.runInContext(['queryMentionsFacet', 'queryNamesPerson', 'effectiveQuery'].map(fn).join('\n'), ctx);
   assert.equal(ctx.effectiveQuery('for:me -is:archived'), 'for:me -is:archived');
   assert.equal(ctx.effectiveQuery('for:"Ana Lima" status:waiting'), 'for:"Ana Lima" status:waiting');
-  assert.equal(ctx.effectiveQuery(''), '-is:run -is:subtask', 'the empty query includes archived tasks');
-  assert.equal(ctx.effectiveQuery('-is:archived'), '-is:archived -is:run -is:subtask', 'the Active view');
-  assert.equal(ctx.effectiveQuery('-for:me'), '-for:me -is:run -is:subtask', 'not waiting on you is an ordinary list');
-  assert.equal(ctx.listShowsNested('for:me', 'subtask'), true);
-  assert.equal(ctx.listShowsNested('status:active', 'subtask'), false);
+  assert.equal(ctx.effectiveQuery(''), '-is:folded', 'the empty query includes archived tasks');
+  assert.equal(ctx.effectiveQuery('-is:archived'), '-is:archived -is:folded', 'the Active view: For me narrows it (pramana#149)');
+  assert.equal(ctx.effectiveQuery('-for:me'), '-for:me -is:folded', 'not waiting on you is an ordinary list');
+  assert.equal(ctx.effectiveQuery('is:subtask'), 'is:subtask -is:run', 'asking for sub-tasks shows them all');
+  assert.equal(ctx.effectiveQuery('is:folded'), 'is:folded');
+  assert.equal(ctx.effectiveQuery('x', ['run']), 'x -is:run', 'the task picker hides runs only');
 });
 
 test('the home project filter is one project: clause in the query', () => {

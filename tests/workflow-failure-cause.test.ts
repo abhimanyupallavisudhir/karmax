@@ -36,7 +36,7 @@ it('publishes why a run failed, and the stage it failed in, before it closes', a
     const last = views.at(-1);
     expect(last).toMatchObject({
       stage: 'failed', status: 'failed',
-      error: 'workflow failed in pendingServiceConnections: the connections table is unreadable',
+      error: 'workflow failed: the connections table is unreadable',
       state: { failedFrom: expect.any(String), recoveryWorld: world },
     });
     expect(['do', 'review', 'pr']).toContain(last.state.failedFrom);

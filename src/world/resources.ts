@@ -18,8 +18,8 @@ import type { StorageLocationService } from '../store/storage-locations.js';
 import type { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
 import type { ExecOptions, ExecResult, World, WorldHandle, WorldHttpRequest, WorldHttpResponse,
-  WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec } from './types.js';
-import { isRemoteWorldKind, worldLocationPath, worldRelativePath, worldRepos, worldWorkingDirectory, worldWorkingRelativePath } from './types.js';
+  WorldOpenOptions, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec } from './types.js';
+import { WorldNotRunningError, isRemoteWorldKind, worldLocationPath, worldRelativePath, worldRepos, worldWorkingDirectory, worldWorkingRelativePath } from './types.js';
 import { dotenvSecretName, renderDotenv } from '../domain/dotenv.js';
 import type { WorldRegistry } from './registry.js';
 import { QRY_RESOURCE_PUBLISH, RESOURCE_PUBLISH_COORDINATOR_WORKFLOW, SIG_CANCEL_RESOURCE_PUBLISH,
@@ -96,6 +96,15 @@ export { ResourceConflictError };
 
 /** A publication that keeps meeting newer ones gives up after this many merges. */
 const PUBLISH_ATTEMPTS = 3;
+/** Resources restored at once into a remote world: each is mostly waiting on
+ * round trips, and a VM world's SSH server allows ten sessions per connection. */
+const RESTORES_AT_ONCE = 6;
+/** On this host each restic takes cores the app serves everyone with. */
+const HOST_RESTORES_AT_ONCE = 2;
+
+async function failLeases(store: Store, entries: Array<{ lease: { id: string } }>): Promise<void> {
+  for (const { lease } of entries) (await store.updateResourceLease(lease.id, 'failed'));
+}
 
 interface ChangeCount { added: number; modified: number; deleted: number }
 /** What a sub-task's delivery brought into its parent's world, or the files that conflict. */
@@ -373,6 +382,8 @@ export class WorkspaceConflict extends Error {
   }
 }
 
+export { WorldNotRunningError };
+
 export class ProjectResourceService {
   private publishLocks = new Map<string, Promise<void>>();
   /** The restic repositories resources are saved in, and the server restic reaches them at. */
@@ -482,6 +493,18 @@ export class ProjectResourceService {
     const projections: Record<string, { target: string; revisionId?: string; access: string; onDemand?: true; name?: string;
       bytes?: number; files?: number; parts?: number; held?: number }> = {};
     let compression: boolean | undefined;
+    type Restore = { attachment: ResourceAttachment; lease: { id: string }; target: string; revisionId: string; revision: ResourceRevision };
+    const restores: Restore[] = [];
+    // A resource's lease goes active, and its access is audited, once its files are in place.
+    const settle = async (attachment: ResourceAttachment, lease: { id: string }, target: string | undefined, revisionId: string | undefined) => {
+      if (target !== undefined && attachment.access === 'read')
+        await world.exec('bash', ['-lc', `test ! -e ${quote(target)} || chmod -R a-w ${quote(target)}`], { cwd: world.handle.root });
+      options.signal?.throwIfAborted();
+      (await this.store.updateResourceLease(lease.id, 'active', JSON.stringify({ driver: attachment.driver })));
+      (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:lease',
+        scopeKey: `project:${projectId}`, detail: { attachmentId: attachment.id, leaseId: lease.id,
+          revisionId, access: attachment.access, worldGeneration: generation } }));
+    };
     for (const attachment of (await this.store.listResourceAttachments(projectId))) {
       options.signal?.throwIfAborted();
       const missing = absentRepository(world.handle, attachment);
@@ -506,6 +529,7 @@ export class ProjectResourceService {
             ephemeralPaths.add(target);
             projections[attachment.id] = { target, revisionId, access: attachment.access };
           }
+          await settle(attachment, lease, undefined, revisionId);
         } else if (isSnapshotDriver(attachment.driver)) {
           const target = attachment.target.kind === 'path' ? worldLocationPath(world.handle, attachment.target) : undefined;
           if (!target) throw new Error(`resource "${attachment.name}" requires a path target`);
@@ -514,44 +538,70 @@ export class ProjectResourceService {
             // Its listing, not its bytes: only the parts this task had fetched before it parked come back.
             const listing = await this.materializeOnDemand(world, taskId, attachment, target, lease.id, revisionId, options.signal);
             projections[attachment.id] = { target, revisionId, access: attachment.access, onDemand: true, ...listing };
+            await settle(attachment, lease, target, revisionId);
           } else if (revisionId) {
             const revision = (await this.store.getResourceRevision(revisionId));
             if (!revision) throw new Error(`resource "${attachment.name}" revision is missing`);
-            const startedAt = Date.now();
-            await this.store.appendEvent({ taskId, type: 'world.resource-restoring', ts: startedAt,
-              payload: { attachmentId: attachment.id, revisionId, bytes: revision.bytes, files: revision.files } });
-            const checkContinue = async () => { options.signal?.throwIfAborted(); };
-            if (revision.engine === RESTIC_ENGINE) {
-              await timed('resource.restore', () => this.restoreRevision({ world, path: path.posix.join(world.handle.root, target),
-                file: fileShaped(attachment) }, attachment, revision, { key: `restore:${lease.id}`, checkContinue }),
-              { itemId: attachment.id });
-            } else {
-              // A version saved before restic, until it is converted (convertLegacyRevisions).
-              if (compression === undefined) compression = world.handle.kind === 'e2b' &&
-                (await world.exec('bash', ['-lc', 'command -v gzip >/dev/null'], { cwd: world.handle.root })).code === 0;
-              const relativeOf = (file: string) => fileShaped(attachment) ? target : target === '.' ? file : `${target}/${file}`;
-              await timed('resource.restore', () => this.engine.restore(revision, async (file, data, offset) => {
-                options.signal?.throwIfAborted();
-                await timed('resource.transfer', () => transferResourceChunk(world, relativeOf(file), data, offset,
-                  { compress: compression, signal: options.signal }));
-              }, options), { itemId: attachment.id });
-            }
-            await this.store.appendEvent({ taskId, type: 'world.resource-restored', ts: Date.now(),
-              payload: { attachmentId: attachment.id, revisionId, durationMs: Date.now() - startedAt } });
+            // A version saved before restic, until it is converted (convertLegacyRevisions).
+            if (revision.engine !== RESTIC_ENGINE && compression === undefined) compression = world.handle.kind === 'e2b' &&
+              (await world.exec('bash', ['-lc', 'command -v gzip >/dev/null'], { cwd: world.handle.root })).code === 0;
+            projections[attachment.id] = { target, revisionId, access: attachment.access };
+            // Restored below, several at a time.
+            restores.push({ attachment, lease, target, revisionId, revision });
+          } else {
+            projections[attachment.id] ??= { target, revisionId, access: attachment.access };
+            await settle(attachment, lease, target, revisionId);
           }
-          if (attachment.access === 'read')
-            await world.exec('bash', ['-lc', `test ! -e ${quote(target)} || chmod -R a-w ${quote(target)}`], { cwd: world.handle.root });
-          projections[attachment.id] ??= { target, revisionId, access: attachment.access };
         } else throw new Error(`no resource driver registered for ${attachment.driver}`);
+      } catch (error) {
+        (await this.store.updateResourceLease(lease.id, 'failed'));
+        await failLeases(this.store, restores);
+        throw error;
+      }
+    }
+    // Each restore costs seconds whatever its size (a restic process, its
+    // repository opened through the edge, the job polled), so a project of
+    // hundreds of small files restored one by one spent over an hour here and
+    // never finished world setup (personal-website #7). The first runs alone:
+    // it installs restic in the world, which the others then share.
+    const unstarted = new Set(restores);
+    const restoreOne = async (entry: Restore) => {
+      const { attachment, lease, target, revisionId, revision } = entry;
+      unstarted.delete(entry);
+      try {
         options.signal?.throwIfAborted();
-        (await this.store.updateResourceLease(lease.id, 'active', JSON.stringify({ driver: attachment.driver })));
-        (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:lease',
-          scopeKey: `project:${projectId}`, detail: { attachmentId: attachment.id, leaseId: lease.id,
-            revisionId, access: attachment.access, worldGeneration: generation } }));
+        const startedAt = Date.now();
+        await this.store.appendEvent({ taskId, type: 'world.resource-restoring', ts: startedAt,
+          payload: { attachmentId: attachment.id, revisionId, bytes: revision.bytes, files: revision.files } });
+        const checkContinue = async () => { options.signal?.throwIfAborted(); };
+        if (revision.engine === RESTIC_ENGINE) {
+          await timed('resource.restore', () => this.restoreRevision({ world, path: path.posix.join(world.handle.root, target),
+            file: fileShaped(attachment) }, attachment, revision, { key: `restore:${lease.id}`, checkContinue }),
+          { itemId: attachment.id });
+        } else {
+          const relativeOf = (file: string) => fileShaped(attachment) ? target : target === '.' ? file : `${target}/${file}`;
+          await timed('resource.restore', () => this.engine.restore(revision, async (file, data, offset) => {
+            options.signal?.throwIfAborted();
+            await timed('resource.transfer', () => transferResourceChunk(world, relativeOf(file), data, offset,
+              { compress: compression, signal: options.signal }));
+          }, options), { itemId: attachment.id });
+        }
+        await this.store.appendEvent({ taskId, type: 'world.resource-restored', ts: Date.now(),
+          payload: { attachmentId: attachment.id, revisionId, durationMs: Date.now() - startedAt } });
+        await settle(attachment, lease, target, revisionId);
       } catch (error) {
         (await this.store.updateResourceLease(lease.id, 'failed'));
         throw error;
       }
+    };
+    try {
+      if (restores.length) await restoreOne(restores[0]!);
+      await forEachConcurrent(restores.slice(1), restoreOne,
+        isRemoteWorldKind(world.handle.kind) ? RESTORES_AT_ONCE : HOST_RESTORES_AT_ONCE);
+    } catch (error) {
+      // Those never started hold a lease nothing will use.
+      await failLeases(this.store, [...unstarted]);
+      throw error;
     }
     world.handle = { ...world.handle, generation, meta: { ...world.handle.meta,
       ...(ephemeralPaths.size ? { ephemeralPaths: [...ephemeralPaths] } : {}),
@@ -1361,9 +1411,21 @@ export class ProjectResourceService {
    * nor a staged candidate. No bytes are read and the bounded result is safe to
    * show at checkpoint/Review. A pull request of a task (SPEC §11.1) has no
    * world of its own: its task keeps the world and whatever is ignored in it. */
-  async ignoredInventory(taskId: string, limit = 100, checkContinue?: () => Promise<void>): Promise<IgnoredResourceInventory> {
+  async ignoredInventory(taskId: string, limit = 100, checkContinue?: () => Promise<void>,
+    options: { wake?: boolean } = {}): Promise<IgnoredResourceInventory> {
     if (pullRequestOf(await this.store.getTask(taskId))) return { entries: [], truncated: false };
-    const { handle, world } = await this.currentTaskWorld(taskId);
+    if (options.wake === false) {
+      // Looking at a task must not start its computer: a woken cloud machine
+      // stays up with nothing to park it (production, 2026-11-01: the task
+      // page's inventory woke parked VMs, a Hetzner one as a new billed hour).
+      const current = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
+      if (current && this.worlds.get(current.kind).capabilities?.remote && (await this.store.worldState(current.id)) !== 'ready')
+        throw new WorldNotRunningError();
+    }
+    // The store says `ready` until a park in flight records it, so the provider
+    // is asked too: it refuses to start a machine it finds stopped (production,
+    // 2026-11-03: the page's refresh as a turn ended woke two Hetzner worlds).
+    const { handle, world } = await this.currentTaskWorld(taskId, options.wake === false ? { wake: false } : undefined);
     const excluded = [
       ...Object.values((handle.meta?.resourceProjections ?? {}) as Record<string, { target?: string }>)
         .map((projection) => projection.target).filter((value): value is string => Boolean(value)),
@@ -1393,7 +1455,7 @@ export class ProjectResourceService {
     return { entries: found, truncated };
   }
 
-  private async currentTaskWorld(taskId: string) {
+  private async currentTaskWorld(taskId: string, open?: WorldOpenOptions) {
     const task = (await this.store.getTask(taskId));
     if (!task) throw new Error('calling task not found');
     const project = (await this.store.getProject(task.projectId));
@@ -1401,7 +1463,7 @@ export class ProjectResourceService {
     const handle = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
     if (!handle) throw new Error('calling task has no active world');
     (await this.store.assertCurrentWorld(handle));
-    return { task, project, handle, world: await this.worlds.open(handle) };
+    return { task, project, handle, world: await (open ? this.worlds.open(handle, open) : this.worlds.open(handle)) };
   }
 
   private async requiredCandidate(taskId: string, candidateId: string): Promise<ResourceCandidate> {

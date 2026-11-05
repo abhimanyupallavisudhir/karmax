@@ -1,6 +1,6 @@
 // Creating tasks from the organization home, and the bell's page: Home creates
-// a task in any of the organization's projects (a project picker in the task
-// form's "← New task" bar, which Home's New task opens), the topbar has no second
+// a task in any of the organization's projects (Home's New task asks which, then
+// the task form's "← New task" bar can still change it), the topbar has no second
 // search, and the bell opens one Home-like list of what waits on you in every
 // organization, each row naming its organization and project as a slug.
 // Run: node web/for-you.browser.test.cjs   (FOR_YOU_SCREENSHOTS=<dir> also saves screenshots)
@@ -93,13 +93,16 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.equal(style.border, '0px');
     assert.equal(style.background, 'rgba(0, 0, 0, 0)', 'no pill behind it');
 
-    // ── New task: a stand-in field that opens the full form; the form picks the project ──
+    // ── New task: a stand-in field that asks for the project, then opens the full form ──
     assert.equal(await page.locator('#new-task-project').count(), 0, 'the composer has no project picker of its own');
     assert.equal(await page.locator('#expand-task').evaluate((el) => el.tagName), 'BUTTON', 'the field is a stand-in, not an input');
     await page.locator('#expand-task').click();
+    await page.locator('#pp-in').waitFor();
+    assert.equal(await page.locator('#pp-list .opt.active .tpl-name').innerText(), 'Website', 'Enter takes the current project');
+    await page.keyboard.press('Enter');
     const formPick = page.locator('#tf-project');
     await formPick.waitFor();
-    assert.equal(await formPick.innerText(), 'Website', 'new tasks go to the current project by default');
+    assert.equal(await formPick.innerText(), 'Website');
     await formPick.click();
     const menu = page.locator('.project-pick-menu:not([hidden])');
     assert.deepEqual(await menu.locator('[role="option"]').allInnerTexts(), ['Website', 'Mobile App'], 'the organization\'s projects, by name');
@@ -111,10 +114,12 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await page.waitForFunction(() => !document.querySelector('#tf-page'));
     assert.deepEqual(created.at(-1).projectId, 'q', 'the form runs the task in the chosen project');
     assert.equal(created.at(-1).body.params.prompt, 'Dark mode');
-    // Send opens the same form, in the project chosen last.
+    // Send asks the same, the project chosen last highlighted.
     await page.reload();
     await page.locator('[data-id="t1"]').waitFor();
     await page.locator('#add-task').click();
+    await page.locator('#pp-in').waitFor();
+    await page.keyboard.press('Enter');
     await page.locator('#tf-project').waitFor();
     assert.equal(await page.locator('#tf-project').innerText(), 'Mobile App', 'the choice is remembered');
     await page.locator('#tf-close').click();

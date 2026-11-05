@@ -99,38 +99,69 @@ export interface QuotaReading {
   at: number;
   /** The login's cumulative spend when it was read. */
   spentAt: number;
+  /** Where the current capacity measurement started (a reading of this window). */
+  anchor?: { utilization: number; spentAt: number; resetsAt?: number };
 }
 
 export type ObservedQuota = Partial<Record<WindowKind, QuotaReading>>;
-export type LearnedCapacity = Partial<Record<WindowKind, { usd: number; samples: number }>>;
+/** A window's capacity in dollars: `dollars` spent over `moved` of the window, both decayed per measurement; `usd` their ratio. */
+export type LearnedCapacity = Partial<Record<WindowKind, { usd: number; samples: number; dollars?: number; moved?: number }>>;
 
-/** A login's usage reading (from a turn's stream or a usage probe): remembered, and used to learn its capacity. */
+/** A capacity measurement spans at least this much of a window. */
+export const CAPACITY_MIN_MOVE = 0.1;
+/** Weight a measurement keeps at each later one. */
+const CAPACITY_DECAY = 0.8;
+
+/**
+ * A login's usage reading (from a turn's stream or a usage probe): remembered, and used to learn its capacity.
+ *
+ * Capacity is dollars spent over the share of the window they moved, measured
+ * from an anchor reading until the window has moved {@link CAPACITY_MIN_MOVE},
+ * and pooled as a decayed ratio of sums. Why not a ratio per pair of readings:
+ * spend is recorded when a turn ends while readings arrive during turns, so
+ * between two close readings the spend is lumpy (often $0, then a whole
+ * turn); pairs moving < 2 points were skipped, so frequent readings never
+ * learned and sparse ones kept the pairs with a large move and little
+ * recorded spend. Simulated (5 concurrent turns, 300 $ window): that
+ * learned 132 $ or nothing; this learns 293–298 $. Production (2026-11-05) had
+ * learned 25 $ a 5-hour window and 55 $ a week for logins whose metered spend
+ * reached 50 $ in one 5-hour window and 208 $ in one week.
+ */
 export async function recordQuotaReading(store: KvStore, credential: string, window: WindowKind,
   reading: { utilization: number; resetsAt?: number; at: number }): Promise<void> {
   if (!(reading.utilization >= 0 && reading.utilization <= 1.5)) return;
   const spent = (await kvJson<{ usd: number }>(store, spentKey(credential)))?.usd ?? 0;
-  let previous: QuotaReading | undefined;
+  let sample: { dollars: number; moved: number } | undefined;
   await kvUpdate<ObservedQuota>(store, observedKey(credential), (prev) => {
-    previous = prev?.[window];
+    sample = undefined;
+    const previous = prev?.[window];
     if (previous && previous.at > reading.at) return prev;
+    const here = { utilization: reading.utilization, spentAt: spent, ...(reading.resetsAt ? { resetsAt: reading.resetsAt } : {}) };
+    const old = previous?.anchor ?? (previous ? { utilization: previous.utilization, spentAt: previous.spentAt,
+      ...(previous.resetsAt ? { resetsAt: previous.resetsAt } : {}) } : undefined);
+    const sameWindow = old && (!old.resetsAt || !reading.resetsAt || Math.abs(old.resetsAt - reading.resetsAt) < 120_000);
+    const moved = old ? reading.utilization - old.utilization : 0;
+    let anchor = old;
+    if (!old || !sameWindow || moved < 0) anchor = here;
+    else if (moved >= CAPACITY_MIN_MOVE) {
+      // Readings moved by use elsewhere (no spend here) teach nothing about this login's dollars.
+      if (spent - old.spentAt > 0) sample = { dollars: spent - old.spentAt, moved };
+      anchor = here;
+    }
     return { ...prev, [window]: { utilization: reading.utilization, ...(reading.resetsAt ? { resetsAt: reading.resetsAt } : {}),
-      at: reading.at, spentAt: spent } };
+      at: reading.at, spentAt: spent, ...(anchor ? { anchor } : {}) } };
   });
-  // Capacity: dollars spent between two readings of the same window, over the share it moved.
-  const sameWindow = previous && (!previous.resetsAt || !reading.resetsAt || Math.abs(previous.resetsAt - reading.resetsAt) < 120_000);
-  const moved = previous ? reading.utilization - previous.utilization : 0;
-  const dollars = previous ? spent - previous.spentAt : 0;
-  if (sameWindow && moved >= 0.02 && dollars > 0) {
-    const sample = dollars / moved;
-    await kvUpdate<LearnedCapacity>(store, capacityKey(credential), (prev) => {
-      const old = prev?.[window];
-      const prior = defaultCapacity(window);
-      const clamped = Math.min(prior * 20, Math.max(prior / 20, sample));
-      // Geometric moving average: capacities are positive and their errors multiplicative.
-      const usd = old ? Math.exp(0.8 * Math.log(old.usd) + 0.2 * Math.log(clamped)) : clamped;
-      return { ...prev, [window]: { usd, samples: (old?.samples ?? 0) + 1 } };
-    });
-  }
+  if (!sample) return;
+  const measured = sample;
+  await kvUpdate<LearnedCapacity>(store, capacityKey(credential), (prev) => {
+    const old = prev?.[window];
+    const prior = defaultCapacity(window);
+    // A capacity learned before this measure counts as one short measurement.
+    const dollars = CAPACITY_DECAY * (old?.dollars ?? (old ? old.usd * CAPACITY_MIN_MOVE : 0)) + measured.dollars;
+    const moved = CAPACITY_DECAY * (old?.moved ?? (old ? CAPACITY_MIN_MOVE : 0)) + measured.moved;
+    const usd = Math.min(prior * 20, Math.max(prior / 20, dollars / moved));
+    return { ...prev, [window]: { usd, samples: (old?.samples ?? 0) + 1, dollars, moved } };
+  });
 }
 
 /**
@@ -168,6 +199,10 @@ export async function loginWindows(store: KvStore, credential: string, nowMs: nu
   const spentNow = spent?.usd ?? 0;
   const out: QuotaWindow[] = [];
   for (const kind of ['session', 'week'] as const) {
+    // A login whose provider shows no 5-hour window (a plan with weekly limits
+    // only: the latest usage check lists none, and no turn has reported one
+    // since) has none; inventing one kept quota back for a reset that never comes.
+    if (kind === 'session' && probe?.ok && !probe.session && probe.week && !(observed?.session && observed.session.at > probe.at)) continue;
     const usd = capacity?.[kind]?.usd ?? defaultCapacity(kind);
     const length = kind === 'session' ? SESSION_MINUTES : WEEK_MINUTES;
     const stream = observed?.[kind];

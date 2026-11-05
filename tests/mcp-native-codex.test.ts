@@ -16,6 +16,16 @@ const binary = process.env.KARMAX_MCP_CODEX_BINARY ?? 'codex';
 const available = spawnSync(binary, ['--version'], { timeout: 5000, stdio: 'ignore' }).status === 0;
 
 describe.skipIf(!available)('Native Codex MCP startup (no login or model calls)', () => {
+  it("keeps ChatGPT's own app connectors out of an explicit tool selection", async () => {
+    // Codex Apps would offer the Codex login's ChatGPT connectors (its Gmail, not the task's).
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-native-'));
+    try {
+      const env = { PATH: process.env.PATH!, HOME: dir, CODEX_HOME: dir };
+      const flags = await selectedCodexMcpFlags({ handle: { provider: 'worktree' } } as any, binary, dir, env, [], true);
+      const features = spawnSync(binary, [...flags, 'features', 'list'], { cwd: dir, env, encoding: 'utf8', timeout: 10_000 });
+      expect(features.stdout).toMatch(/^apps\s+\S+\s+false$/m);
+    } finally { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); }
+  }, 30_000);
   it('loads the actual sandbox relay and discovers its tool inventory with explicit selection', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-native-')); const store = (await Store.create(':memory:'));
     let cleanup: (() => Promise<void>) | undefined; let child: ReturnType<typeof spawn> | undefined;

@@ -188,8 +188,15 @@ describe('paid-launch policies', () => {
     expect(billing).toContain('files Git ignores (such as installed dependencies, build output and caches) and running processes are deleted and not restored');
     expect(JSON.stringify(policyDocument('billing'))).toContain('compute top-ups are charged when bought');
     // A changed disclosure is a new version: acceptance evidence names the text a person saw.
-    expect(policyDocument('billing')!.version).toBe('2026-10-29.1');
-    expect(policyDocument('billing')!.effectiveDate).toBe('October 29, 2026');
+    expect(policyDocument('billing')!.version).toBe('2026-11-02.1');
+    expect(policyDocument('billing')!.effectiveDate).toBe('November 2, 2026');
+  });
+
+  it('names packs by what they give, and bills seats and packs bought beside a gift like a paid plan (2026-11-02.1)', () => {
+    const billing = policyDocument('billing')!.sections.find((section) => section.heading === 'Packs and managed compute')!.paragraphs.join(' ');
+    expect(billing).toContain('100 GB packs (100 GB more storage each) and $10 packs ($10 more managed compute a month each)');
+    expect(billing).toContain('A gifted Team covers the seats gifted with it; its owner can buy more seats');
+    expect(billing).toContain('Removing the last seat or pack from that subscription ends it at the end of the period paid for.');
   });
 
   // AWS and Google Cloud ran managed compute from 2026-10-20 without being

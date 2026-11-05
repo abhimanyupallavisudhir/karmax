@@ -64,7 +64,8 @@ async function fixture(options: { objects?: (local: LocalObjectStore) => ObjectS
   const caps = ['task:read', 'task:review:execute'];
   const token = (await tokens.mint({ taskId: task.id, profileId: 'test', principal: `task:${task.id}`,
     organizationId: project.organizationId, ceiling: caps, grantorCaps: caps })).token;
-  const client = { workflow: { getHandle: () => ({ query: async () => (await store.getTask(task.id))?.lastView }) } } as any;
+  const query = vi.fn(async () => (await store.getTask(task.id))?.lastView);
+  const client = { workflow: { getHandle: () => ({ query }) } } as any;
   const api = new KarmaxApi({ store, tokens, client, worlds, taskQueue: 'test' });
   const gateway = (await Gateway.create({ api, store, tokens, client, worlds, objects, taskQueue: 'test',
     bus: new KarmaxBus(), contributions: new ContributionRegistry(), overlays: new Overlays(),
@@ -83,7 +84,7 @@ async function fixture(options: { objects?: (local: LocalObjectStore) => ObjectS
   /** A request with no credentials at all, as a `<video src>` makes it. */
   const anonymous = (url: string, init: RequestInit = {}) => fetch(`${server.url}${url}`, init);
   const save = () => preserveReviewArtifacts(store, local, world, task.id, info);
-  return { root, store, local, objects, task, project, world, worlds, view, info, authorized, anonymous, resolve, save, server };
+  return { root, store, local, objects, task, project, world, worlds, view, info, authorized, anonymous, resolve, save, server, query };
 }
 
 async function expectRanges(f: Awaited<ReturnType<typeof fixture>>, url: string, request = f.anonymous) {
@@ -295,11 +296,56 @@ describe('signed review artifact URLs', () => {
     await download.arrayBuffer();
   });
 
+  it('names a saved file\'s content, so the browser keeps it for the URL\'s life', async () => {
+    const f = await fixture();
+    await f.save();
+    const first = await f.resolve(0);
+    const response = await f.anonymous(first.url);
+    const cache = response.headers.get('cache-control') ?? '';
+    expect(cache).toMatch(/^private, max-age=\d+, immutable$/);
+    expect(Number(/max-age=(\d+)/.exec(cache)![1])).toBeGreaterThan(ArtifactUrls.TTL_MS / 1000 - 60);
+    expect(Number(/max-age=(\d+)/.exec(cache)![1])).toBeLessThanOrEqual(ArtifactUrls.TTL_MS / 1000);
+    await response.arrayBuffer();
+
+    // The agent publishes the same target again with other bytes: the URL
+    // already handed out keeps its content, a new one gets the new content.
+    const edited = crypto.randomBytes(1024);
+    await f.world.writeFileBuffer!('out/explainer.mp4', edited);
+    await f.save();
+    expect(Buffer.from(await (await f.anonymous(first.url)).arrayBuffer()).equals(VIDEO)).toBe(true);
+    const second = await f.resolve(0);
+    expect(second.bytes).toBe(edited.length);
+    expect(Buffer.from(await (await f.anonymous(second.url)).arrayBuffer()).equals(edited)).toBe(true);
+  });
+
+  it('keeps a file read from the world uncached: it can change under the same URL', async () => {
+    const f = await fixture();
+    const response = await f.anonymous((await f.resolve(0)).url);
+    expect(response.headers.get('cache-control')).toBe('private, no-store');
+    await response.arrayBuffer();
+  });
+
+  it('downloads instead of showing when asked to', async () => {
+    const f = await fixture();
+    await f.save();
+    const response = await f.anonymous(`${(await f.resolve(0)).url}?download=1`);
+    expect(response.headers.get('content-disposition')).toBe('attachment; filename="explainer.mp4"');
+    await response.arrayBuffer();
+  });
+
+  it('opens a file without querying the workflow (a replay can take seconds)', async () => {
+    const f = await fixture();
+    await f.save();
+    f.query.mockClear();
+    expect((await f.resolve(0)).name).toBe('explainer.mp4');
+    expect(f.query).not.toHaveBeenCalled();
+  });
+
   it('expires', async () => {
     const urls = new ArtifactUrls();
     const now = Date.now();
     const token = await urls.mint({ taskId: 'task_1', path: 'a.mp4' }, now);
-    expect(await urls.verify(token, now + 60_000)).toEqual({ taskId: 'task_1', path: 'a.mp4' });
+    expect(await urls.verify(token, now + 60_000)).toEqual({ taskId: 'task_1', path: 'a.mp4', expiresAt: now + ArtifactUrls.TTL_MS });
     expect(await urls.verify(token, now + ArtifactUrls.TTL_MS + 1)).toBeUndefined();
     expect(await new ArtifactUrls().verify(token, now)).toBeUndefined();
   });

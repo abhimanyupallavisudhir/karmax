@@ -1,7 +1,7 @@
 // The organization home: `/` lands on `/<org>`, one task list over every
 // project that opens on "For me" (what waits on you, each row saying why), with
 // "Active" one click away and bookmarkable, the empty query showing archived tasks too, a project filter, project permalinks,
-// a New task field that opens the task form in the project new tasks go to,
+// a New task field that asks which project, then opens the task form there,
 // the logo as the way home, and a ☰ that folds the sidebar on a wide screen.
 // Run: node web/org-home.browser.test.cjs   (HOME_SCREENSHOTS=<dir> also saves screenshots)
 const assert = require('node:assert/strict');
@@ -36,7 +36,8 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     const evaluate = (q) => {
       const forMe = /(^|\s)for:me\b/.test(q);
       const project = q.match(/project:(\S+)/)?.[1];
-      const hidden = (t) => (/-is:subtask/.test(q) && t.parentTaskId) || (/-is:archived/.test(q) && t.params.archived);
+      const hidden = (t) => (/-is:(subtask|folded)/.test(q) && t.parentTaskId && !(/-is:folded/.test(q) && reasons[t.id]))
+        || (/-is:archived/.test(q) && t.params.archived);
       const listed = tasks.filter((t) => !hidden(t) && (!forMe || reasons[t.id]) && (!project || slug[t.projectId] === project));
       return { tasks: listed, total: listed.length, offset: 0, limit: 200, projects: [], tags: [],
         ...(forMe ? { reasons: Object.fromEntries(listed.map((t) => [t.id, reasons[t.id]])) } : {}) };
@@ -90,7 +91,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await page.waitForFunction(() => location.search === '?q=-is:archived');
     await page.locator('[data-id="t3"]').waitFor();
     await settle();
-    assert.deepEqual(await rows(), ['t1', 't2', 't3', 't5', 't6'], 'Active hides archived tasks, and sub-tasks as before');
+    assert.deepEqual(await rows(), ['t1', 't2', 't3', 't4', 't5', 't6'], 'Active hides archived tasks; For me is a part of it — its sub-task too');
     assert.equal(await page.locator('#task-search').inputValue(), '-is:archived', 'the box shows the lit chip’s query, so people learn to write one');
     await page.reload();
     await page.locator('[data-id="t3"]').waitFor();
@@ -101,7 +102,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await page.waitForFunction(() => location.search === '?q=-is:archived+project:mobile-app');
     await page.waitForFunction(() => !document.querySelector('[data-id="t3"]'));
     await settle();
-    assert.deepEqual(await rows(), ['t2', 't5'], 'only that project');
+    assert.deepEqual(await rows(), ['t2', 't4', 't5'], 'only that project');
     assert.equal(await page.locator('#task-search').inputValue(), '-is:archived project:mobile-app', 'the box shows the whole query');
     assert.equal(await activeView(), '__active__', 'and Active stays lit');
     await page.locator('#q-project').selectOption('');
@@ -119,7 +120,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await page.waitForFunction(() => location.search === '?q=');
     await page.locator('[data-id="t7"]').waitFor();
     await settle();
-    assert.deepEqual(await rows(), ['t1', 't2', 't3', 't5', 't6', 't7'], 'nothing archived is hidden');
+    assert.deepEqual(await rows(), ['t1', 't2', 't3', 't4', 't5', 't6', 't7'], 'nothing archived is hidden');
     assert.equal(await page.locator('.view-chip.active').count(), 0, 'and no view is lit');
 
     // ── a row opens its project's task; the logo comes back home ──────────────
@@ -141,15 +142,16 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.equal(await path_(), '/org/website', 'a project list\'s default view is the bare path');
     assert.equal(await activeView(), '__for_me__');
 
-    // ── ☰ folds the sidebar on a wide screen, remembered ──────────────────────
-    const toggle = page.locator('#mobile-menu');
-    assert.ok(await toggle.isVisible(), 'the menu button is there on a desktop');
-    assert.equal(await toggle.getAttribute('aria-expanded'), 'true');
-    await toggle.click();
+    // ── ⇤ folds the sidebar on a wide screen, remembered; the edge button brings it back ──
+    const fold = page.locator('#rail-collapse');
+    const unfold = page.locator('#rail-expand');
+    assert.ok(await fold.isVisible(), 'the fold button is there on a desktop');
+    assert.equal(await unfold.isVisible(), false);
+    await fold.click();
     await page.waitForFunction(() => document.querySelector('#rail').getBoundingClientRect().width < 1);
-    assert.equal(await toggle.getAttribute('aria-expanded'), 'false');
     assert.equal(await page.locator('#rail').isVisible(), false, 'the folded rail is out of sight');
     assert.ok(await page.locator('#rail').evaluate((rail) => rail.inert), 'and out of the tab order');
+    assert.ok(await unfold.isVisible(), 'a button brings it back');
     if (shots) {
       await page.goto('http://console.test/org');
       await page.locator('[data-id="t1"]').waitFor();
@@ -159,13 +161,14 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await page.reload();
     await page.locator('[data-id="t1"]').waitFor();
     assert.equal(await page.locator('#rail').isVisible(), false, 'folded stays folded after a reload');
-    await toggle.focus();
+    await unfold.focus();
     await page.keyboard.press('Enter');
     await page.waitForFunction(() => document.querySelector('#rail').getBoundingClientRect().width > 200);
-    assert.equal(await toggle.getAttribute('aria-expanded'), 'true', 'the keyboard unfolds it');
+    assert.equal(await unfold.isVisible(), false, 'the keyboard unfolds it');
 
-    // ── a phone keeps its sliding menu ────────────────────────────────────────
-    await page.locator('#mobile-menu').click(); // folded on the desktop…
+    // ── a phone keeps its sliding menu, whatever the desktop chose ───────────
+    const toggle = page.locator('#mobile-menu');
+    await fold.click(); // folded on the desktop…
     await page.setViewportSize({ width: 390, height: 780 });
     await page.goto('http://console.test/org');
     await page.locator('[data-id="t1"]').waitFor();

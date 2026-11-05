@@ -13,7 +13,7 @@ import { TOOL_CAPABILITY, Capability, ORGANIZATION_WIKI_WRITE_DENIED, allows } f
 import { AppGrants, sessionCapabilities } from '../auth/app-grants.js';
 import { WORKFLOW_TYPE, SIG, pinnedType, TASK_WORKFLOW_TASK_TIMEOUT } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
-import { MANIFESTS, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
+import { MANIFESTS, RETIRED_WORKFLOWS, RETIRED_WORKFLOW_HINT, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
 import { organizationSkillsDir, projectSkillsDir } from '../resolve/skills.js';
 import { validGitBranch } from '../util/git-ref.js';
 import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
@@ -38,7 +38,7 @@ import {
 import { templateContent, templateName, templateParams, templateAuthorization } from '../domain/task-templates.js';
 import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget, type Avatar } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries } from '../domain/triggers.js';
-import { STORE_TASKS, storeTaskNeeds, storeTaskRepeatable, takenFromStore, type StoreNeed, type StoreTask } from '../domain/task-store.js';
+import { STORE_TASKS, runsOnInstall, storeTaskNeeds, storeTaskRepeatable, takenFromStore, type StoreNeed, type StoreTask } from '../domain/task-store.js';
 import { applyTriggerContext, normalizeEventInput, validateFollow, type EventFilter, type EventFollow, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventInput, type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
 import { newId } from '../util/id.js';
@@ -46,7 +46,7 @@ import { IncomingWebhooks, WebhookConfigError, webhookDeliveryKey, type Incoming
 import { isChatPlatform, type ChatPlatform } from '../integrations/chat-platforms.js';
 import { chatThreadKey, type ChatReplies } from '../integrations/chat-replies.js';
 import { pullRequestOf } from '../domain/pull-requests.js';
-import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
+import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates, queryFolds } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
 import { assertComputerFits, providerLabel } from '../domain/computer-limits.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
@@ -90,12 +90,14 @@ import { enrollWorldRepositories } from '../world/repository-enrollment.js';
 import { ensureTaskBranchAncestry } from '../world/task-branch.js';
 import type { WorldAccessService } from '../world/access.js';
 import type { RunnerPoolService } from '../world/runners.js';
-import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
+import { VaultItems, type CredentialAccessRequest, type VaultItemPolicy, type VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
+import { connectionRequestsVia, passOnConnectionRequest } from '../integrations/connection-requests.js';
+import type { ServiceConnection } from '../integrations/service-connections.js';
 import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { avatarAllows, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled, avatarPrincipal, avatarRoleOf, forkedAvatar,
   normalizeAvatarSetting, AVATAR_ROLE_LABELS, type AvatarRole } from './avatars.js';
-import { CapabilityError, NotFoundError, ValidationError } from './errors.js';
-import type { AccountQueueView } from '../coordinators/account.js';
+import { CapabilityError, NotFoundError, TaskStartedError, ValidationError } from './errors.js';
+import type { AccountLeaseAnswer, AccountQueueView } from '../coordinators/account.js';
 import type { SchedulingQueueTask, SchedulingQueueView } from '../scheduling/view.js';
 import { assertAgentSpec, childComputer, subTaskParams } from './agent-params.js';
 import { CALLED_AGENT_FIELD, agentSpecsByParticipant, authorityKey, normalizeAgentAuthority, type StoredAgentAuthorization } from './agent-authority.js';
@@ -108,6 +110,7 @@ import type { GithubActionsStatus, GithubActionsInspectOptions } from '../integr
 import { BRAND } from '../domain/brand.js';
 import { withPullRequestStates } from '../integrations/github-pr.js';
 import { canMergeAll, mergeCapableUsers } from '../integrations/github-merge-rights.js';
+import { throughYouText, viaParent, type Via } from './sub-task-asks.js';
 
 export { CapabilityError, NotFoundError, ValidationError } from './errors.js';
 
@@ -277,6 +280,11 @@ const acceptedActionKey = (taskId: string) => `accepted-action:${taskId}`;
  * and delegation, its pinned GitHub account, fork provenance, the Temporal run
  * id, one-shot start flags. Only the platform writes them; remove any a caller
  * put in a params bag. Mutates and returns `params`. */
+/** A draft, a task armed on a trigger, or a repeatable series: what has no workflow of its own yet. */
+function unstarted(task: Pick<TaskRecord, 'params'> | undefined): boolean {
+  return !!task && (!!task.params?.draft || task.params?.triggerState === 'armed' || !!task.params?.repeatable);
+}
+
 function stripPlatformMetadata<T extends Record<string, unknown>>(params: T): T {
   for (const key of Object.keys(params)) if (key.startsWith('_')) delete params[key];
   return params;
@@ -348,9 +356,6 @@ const FOLLOW_UP_ACTION = (role?: AgentRole): TaskView['actions'][number] => ({
   args: [{ name: 'text', type: 'text', label: 'Message', required: true }],
   ...(role ? { roles: [role] } : {}),
 });
-
-const GOAL_RESUME_MESSAGE =
-  'Workflow switched to Goal. Continue autonomously until the entire task is complete; do not stop after partial progress.';
 
 type CollaborationTargetIssue = {
   admission: string;
@@ -734,8 +739,10 @@ export class KarmaxApi {
   private async deliverWorkflowMessage(taskId: string, text: string, role = 'do'): Promise<Message> {
     const now = Date.now();
     // `n` (a notice): tavya's own words, never a person's `u` follow-up — the
-    // console tells them apart by it (web/app.js messageOrigin).
-    const message: Message = { id: `n${randomUUID()}`, role: 'user', text, ts: now };
+    // console tells them apart by it (web/app.js messageOrigin). One that wakes
+    // an agent whose work waits in Review brings that work back to it.
+    const review = (await this.deps.store.getTask(taskId))?.lastView?.stage === 'review';
+    const message: Message = { id: `n${randomUUID()}`, role: 'user', text, ts: now, ...(review ? { returnsWork: true } : {}) };
     await (await this.workflowHandle(taskId)).signal(SIG.followUp, message, role);
     (await this.publishConversationMessage(taskId, role, message));
     return message;
@@ -947,8 +954,7 @@ export class KarmaxApi {
   async deleteWorldProviderConnection(token: string, organizationId: string, provider: string) {
     (await this.require(token, 'organization:edit', { organizationId }));
     if (!this.deps.providerConnections) throw new Error('world provider connections are unavailable');
-    const active = (await this.deps.store.organizationResources(organizationId)).worlds
-      .filter((handle) => (handle.provider ?? handle.kind) === provider);
+    const active = await this.deps.store.worldsOnOwnConnection(organizationId, provider);
     if (active.length) throw new Error(`${active.length} task world(s) still use ${provider}; finish or delete them first`);
     return { deleted: Boolean((await this.deps.providerConnections.delete(organizationId, provider))) };
   }
@@ -1552,6 +1558,7 @@ export class KarmaxApi {
     const project = (await this.deps.store.getProject(args.projectId));
     if (!project) throw new NotFoundError(`no project ${args.projectId}`);
     const workflow = args.workflow ?? 'software-dev';
+    if (RETIRED_WORKFLOWS.has(workflow)) throw new Error(RETIRED_WORKFLOW_HINT);
     // Honor a per-project version pin (§21d) so a project can hold on a specific
     // version while others take the latest; unpinned → latest.
     const start = this.resolveStart(workflow, (await this.workflowPinFor(args.projectId, workflow)), project.organizationId);
@@ -1894,15 +1901,18 @@ export class KarmaxApi {
     // workflow-agnostic — a trigger gates *when* the workflow starts, not what
     // it does, so it applies to any task with any workflow.
     if (hasActiveTriggers(task.params)) {
+      let armed: TaskRecord;
       try {
-        const armed = (await this.armStoredTask(task.id));
+        armed = (await this.armStoredTask(task.id));
         await queueCreatedAlternates();
         if (typeof args.notes === 'string') armed.notes = args.notes || undefined;
-        return armed;
       } catch (e) {
         (await undoCreation()); // undo the whole logical task on an invalid trigger
         throw e;
       }
+      // Installed; a run that fails to start leaves it installed, to run again.
+      if (runsOnInstall(armed.params)) await this.spawnRun(token, armed.id);
+      return armed;
     }
 
     const input = assembleTaskInput(manifest, resolved, {
@@ -2405,19 +2415,51 @@ export class KarmaxApi {
 
   /** Start a previously-saved draft (SPEC §10.4). */
   async queueTask(token: string, taskId: string): Promise<TaskRecord> {
+    // Read first: queueing clears the wait (Store.clearDraft).
+    const awaited = (await this.deps.store.getTask(taskId))?.params?._awaitingApproval;
+    const queued = (await this.queueStoredTask(token, taskId));
+    if (typeof awaited === 'string') (await this.withdrawApprovalWait(token, queued, awaited));
+    return queued;
+  }
+
+  /** Whoever runs a task waiting for approval has decided its authority: the
+   * request no longer asks anyone, and approving it later could not regrant
+   * what they chose (indike.org #19: it stayed in the conversation after Run). */
+  private async withdrawApprovalWait(token: string, task: TaskRecord, requestId: string): Promise<void> {
+    if (task.params?._awaitingApproval) (await this.deps.store.patchTaskParams(task.id, { _awaitingApproval: null }));
+    const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId;
+    const by = (await this.deps.tokens.verify(token))?.principal ?? 'unknown';
+    const agentOf = /^task-agent:([^:]+):/.exec(by)?.[1];
+    const agentTask = agentOf ? (await this.deps.store.getTask(agentOf)) : undefined;
+    const name = by.startsWith('user:') ? (await this.deps.store.userDisplayName(by.slice(5)))
+      : agentTask ? `Task #${agentTask.num ?? agentTask.id}'s agent` : undefined;
+    const reason = `${name ?? 'Someone'} ran the task`;
+    const withdrawn = organizationId
+      && (await new AuthorizationRequests(this.deps.store, organizationId).withdraw(requestId, by, reason));
+    if (!withdrawn) return;
+    const event = { taskId: task.id, type: 'authorization.approval-resolved', ts: Date.now(),
+      payload: { requestId, action: 'withdraw', resolvedBy: by, reason } };
+    const seq = (await this.deps.store.appendEvent(event));
+    this.deps.bus?.emit({ ...event, seq });
+  }
+
+  private async queueStoredTask(token: string, taskId: string): Promise<TaskRecord> {
     const receivedAt = (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
-    const task = await this.deps.store.getTask(taskId);
+    let task = await this.deps.store.getTask(taskId);
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     const caller = (await this.require(token, 'create_task', { projectId: task.projectId, taskId }));
     const storedAuthorization = task.params?._authorization as {
       profileAttenuated?: boolean; attenuationAccepted?: boolean; missingCredentialGrants?: string[];
     } | undefined;
+    // A limited grant nobody accepted (its creator could not grant it all, or a
+    // project transfer left it without a grantor) is granted again by whoever
+    // runs it; it is refused only if they cannot grant it all either.
     if ((storedAuthorization?.profileAttenuated || storedAuthorization?.missingCredentialGrants?.length)
       && !storedAuthorization.attenuationAccepted) {
-      const selection = previousTaskGrants(task).authorization;
-      throw selection ? await this.authorizationGap(token, task.projectId, selection, { kind: 'task', taskId, queue: true },
-        { credentialGrants: storedAuthorization.missingCredentialGrants })
-        : new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
+      const { authorization: selection, credentialGrants } = previousTaskGrants(task);
+      if (!selection) throw new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
+      task = (await this.setTaskAuthorization(token, taskId, selection,
+        [...credentialGrants, ...(storedAuthorization.missingCredentialGrants ?? [])], undefined, { queue: true }));
     }
     // A draft sub-task is started by its parent, under the parent's grant.
     if (task.parentTaskId && task.params?.draft) return this.queueSubTaskDraft(caller, task);
@@ -2431,7 +2473,10 @@ export class KarmaxApi {
     // than starting now — otherwise a triggered draft would start immediately and
     // its triggers would be pointless. `fired` tasks have already started.
     if (hasActiveTriggers(task.params) && task.params.triggerState !== 'fired') {
-      return (await this.armStoredTask(taskId));
+      const installing = !!task.params.draft;
+      const armed = (await this.armStoredTask(taskId));
+      if (installing && runsOnInstall(armed.params)) await this.spawnRun(token, taskId);
+      return armed;
     }
     // A repeatable series never runs its own workflow — queueing it spawns a run.
     if (task.params.repeatable) {
@@ -2599,7 +2644,9 @@ export class KarmaxApi {
     requested: string | AuthorizationSelection,
     credentialGrants?: string[],
     credentialPolicies?: VaultTaskPolicyOverrides,
-    options: { allowAttenuation?: boolean; acceptAttenuation?: boolean; preserveCredentialGrants?: boolean } = {},
+    options: { allowAttenuation?: boolean; acceptAttenuation?: boolean; preserveCredentialGrants?: boolean;
+      /** Granting it to start it: a refusal's summons also starts it once approved. */
+      queue?: boolean } = {},
   ): Promise<TaskRecord> {
     const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
@@ -2672,7 +2719,7 @@ export class KarmaxApi {
       && !(editInPlace && options.allowAttenuation) && !attenuationAccepted)
       throw await this.authorizationGap(token, task.projectId,
         typeof requested === 'string' ? selectionOf(authorization, task.projectId) : requested,
-        { kind: 'task', taskId }, { credentialGrants: missingCredentialGrants });
+        { kind: 'task', taskId, queue: options.queue }, { credentialGrants: missingCredentialGrants });
     const authorizationScope = authorization as typeof authorization & {
       scope?: 'projects' | 'organization' | 'global'; projectIds?: string[]; organizationId?: string;
     };
@@ -3145,16 +3192,23 @@ export class KarmaxApi {
    * start failure so a fire is never silently lost.
    */
   async fireTriggeredTask(token: string, taskId: string, mode: 'self' | 'clone', trigger?: TriggerContext): Promise<{ startedTaskId: string }> {
-    const task = (await this.deps.store.getTask(taskId));
-    const caller = (await this.require(token, 'create_task', { projectId: task?.projectId, taskId }));
-    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    const armed = (await this.deps.store.getTask(taskId));
+    const caller = (await this.require(token, 'create_task', { projectId: armed?.projectId, taskId }));
+    if (!armed) throw new NotFoundError(`no task ${taskId}`);
 
     if (mode === 'clone') return { startedTaskId: (await this.spawnRun(token, taskId, trigger)).id };
 
-    const shaped = trigger ? applyTriggerContext(task.title, task.params as Record<string, unknown>, trigger) : undefined;
-    const fired: Record<string, unknown> = { ...(shaped?.params ?? task.params as Record<string, unknown>), triggerState: 'fired' };
-    delete fired.triggerPending;
-    (await this.deps.store.updateTaskParams(taskId, fired as any));
+    // Under the task's lock, from its latest params: an edit of the armed task
+    // either lands before (and starts with it) or is refused (writeUnstartedParams).
+    const { task, shaped, fired } = (await this.deps.store.transaction(async () => {
+      (await this.deps.store.lockTask(taskId));
+      const task = (await this.deps.store.getTask(taskId)) ?? armed;
+      const shaped = trigger ? applyTriggerContext(task.title, task.params as Record<string, unknown>, trigger) : undefined;
+      const fired: Record<string, unknown> = { ...(shaped?.params ?? task.params as Record<string, unknown>), triggerState: 'fired' };
+      delete fired.triggerPending;
+      (await this.deps.store.updateTaskParams(taskId, fired as any));
+      return { task, shaped, fired };
+    }));
     if (shaped && shaped.title !== task.title) (await this.deps.store.setTaskTitle(taskId, shaped.title));
     (await this.followTriggerSubject(task, trigger));
     try {
@@ -3512,6 +3566,8 @@ export class KarmaxApi {
     // edited triggers the same dependency check.
     (await this.validateAndAuthorizeResumeSources(token, params, task.projectId));
     (await this.authorizeDependencies(token, params));
+    // Refused, not authorized, first; then before anything is written.
+    if (!unstarted(task)) throw new TaskStartedError('This task has already started');
     const inheritedFiles = (await this.inheritedResumeFiles(params));
     for (const file of inheritedFiles) (await this.deps.store.grantAttachment(file.id, task.projectId));
     const promptFiles = uniqueFileRefs([
@@ -3593,25 +3649,44 @@ export class KarmaxApi {
     // Keep the display title tracking the (edited) prompt when it was derived
     // from the prompt (SPEC §10). A title given at creation stays: a store
     // automation's `#{{issue.number}} {{issue.title}}` names each of its runs.
-    if (typeof base.prompt === 'string' && base.prompt.trim() && task.title === firstLine(String(task.params?.prompt ?? task.params?.command ?? 'Task')))
-      (await this.deps.store.setTaskTitle(taskId, firstLine(String(base.prompt))));
+    // Written with the params, so an edit refused there renames nothing.
+    const retitled = typeof base.prompt === 'string' && base.prompt.trim() && task.title === firstLine(String(task.params?.prompt ?? task.params?.command ?? 'Task'))
+      ? firstLine(String(base.prompt)) : undefined;
+    const write = async (params: Record<string, unknown>) => {
+      (await this.writeUnstartedParams(taskId, params));
+      if (retitled !== undefined) (await this.deps.store.setTaskTitle(taskId, retitled));
+    };
     // A cron/recurring trigger forces the series flag on (mirrors createTask).
     if (forcesRepeatable(normalizeTriggers(base))) base.repeatable = true;
     // A repeatable series stays a series when saved: persist, then arm it if it
     // has triggers (each fire spawns a run) or leave it as a manual template.
     if (base.repeatable && keepArmed) {
-      (await this.deps.store.updateTaskParams(taskId, base as any));
+      (await write(base));
       if (hasActiveTriggers(base)) return (await this.armStoredTask(taskId));
       this.armer?.disarm(taskId);
       return (await this.deps.store.getTask(taskId))!;
     }
     if (keepArmed && hasActiveTriggers(base)) {
-      (await this.deps.store.updateTaskParams(taskId, base as any));
+      (await write({ ...base, triggerState: 'armed' }));
       return (await this.armStoredTask(taskId)); // re-validate + re-arm (disarm old, arm new)
     }
+    (await write({ ...base, draft: true }));
     this.armer?.disarm(taskId);
-    (await this.deps.store.updateTaskParams(taskId, { ...base, draft: true } as any));
     return (await this.deps.store.getTask(taskId))!;
+  }
+
+  /**
+   * Write the params of a task that has not started, unless its trigger fired
+   * since it was read: its params are then the running workflow's, and the
+   * edit is refused rather than written under it (#805). The fire takes the
+   * same lock (fireTriggeredTask), so one of the two always sees the other.
+   */
+  private async writeUnstartedParams(taskId: string, params: Record<string, unknown>): Promise<void> {
+    (await this.deps.store.transaction(async () => {
+      (await this.deps.store.lockTask(taskId));
+      if (!unstarted((await this.deps.store.taskMetadata(taskId)))) throw new TaskStartedError('This task has already started');
+      (await this.deps.store.updateTaskParams(taskId, params as TaskRecord['params']));
+    }));
   }
 
   async getTaskView(
@@ -3655,23 +3730,7 @@ export class KarmaxApi {
         const { world, worldPath, worldAvailable, worldDesktop, worldProvider, ...history } = view;
         view = history;
       }
-      // Why a turn waits for a credential changes after it asked (the quota
-      // scheduler may hold it back), so read the coordinator's current answer.
-      // Existing parked executions recorded only "account" and get it this way too.
-      if (view.waitingFor?.kind === 'account') {
-        try {
-          const lease = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId())
-            .query(QRY_ACCOUNT_LEASE, { taskId }) as Promise<{
-              waiting: boolean; earliestResetAt?: number; detail?: string; heldUntil?: number;
-            }>, 500);
-          if (lease.waiting && lease.detail && (!view.waitingFor.detail || lease.heldUntil !== undefined
-            || lease.detail.startsWith('Held'))) view = { ...view, waitingFor: {
-            ...view.waitingFor, detail: lease.detail,
-            ...(lease.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
-            ...(lease.heldUntil !== undefined ? { until: lease.heldUntil } : {}),
-          } };
-        } catch { /* A coordinator outage must not block reading the task. */ }
-      }
+      view = await this.withLiveAccountWait(taskId, view);
       const rawAgents = await this.deps.store.kvGetAsync(agentSnapshotKey(taskId));
       let agents: Record<string, AgentSpec> | undefined;
       try { const parsed = rawAgents ? JSON.parse(rawAgents) : undefined;
@@ -3679,7 +3738,8 @@ export class KarmaxApi {
       } catch { /* Same malformed-snapshot fallback as readAgentSnapshot. */ }
       const task = await this.deps.store.taskMetadataAsync(taskId);
       const group = await this.deps.store.attemptCommitAsync(taskId);
-      const subTaskSummaries = await this.deps.store.childTaskSummaries(taskId);
+      const subTaskSummaries = await Promise.all((await this.deps.store.childTaskSummaries(taskId)).map(async (child) =>
+        child.lastView ? { ...child, lastView: await this.withLiveAccountWait(child.id, child.lastView) } : child));
       const forkSummaries = await this.deps.store.forkTaskSummaries(taskId);
       const forkSourceSummaries = await this.deps.store.forkSourceTaskSummaries(taskId);
       const accepted = (await this.acceptedAction(taskId, view));
@@ -3809,6 +3869,34 @@ export class KarmaxApi {
   async listTasks(token: string, projectId: string): Promise<TaskRecord[]> {
     (await this.require(token, 'list_tasks', { projectId }));
     return this.deps.store.listTasksAsync(projectId);
+  }
+
+  /**
+   * Why a turn waits for a model login changes after it asked (the quota
+   * scheduler decides, holds it back, or finds every login's quota used), and
+   * the view the workflow published only says what it was told then. So a
+   * waiting view takes the coordinator's current answer. Executions that
+   * recorded only "account" get their reason this way too.
+   */
+  async withLiveAccountWait<V extends Pick<TaskView, 'waitingFor'>>(taskId: string, view: V): Promise<V> {
+    if (view.waitingFor?.kind !== 'account') return view;
+    try {
+      const lease = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId())
+        .query(QRY_ACCOUNT_LEASE, { taskId }) as Promise<AccountLeaseAnswer>, 500);
+      if (!lease.waiting) return view;
+      // The coordinator's answer replaces the published one whole: a stale
+      // "Held until 14:20" must not survive into a wait for quota, nor its time.
+      const { detail: _detail, earliestResetAt: _reset, until: _until, reason: _reason, ...rest } = view.waitingFor;
+      return { ...view, waitingFor: { ...rest,
+        ...(lease.reason ? { reason: lease.reason } : {}),
+        ...(lease.detail ? { detail: lease.detail } : {}),
+        ...(lease.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
+        ...(lease.heldUntil !== undefined ? { until: lease.heldUntil } : {}),
+      } };
+    } catch {
+      // A coordinator outage must not block reading the task.
+      return view;
+    }
   }
 
   async listTaskSummaries(token: string, projectId: string): Promise<TaskRecord[]> {
@@ -3945,10 +4033,16 @@ export class KarmaxApi {
     if (infrastructureBackoff && !actions.some((action) => action.name === 'retry'))
       actions.unshift(RETRY_ACTION());
     // A wait for a credential or its quota resumes by itself, but only a person
-    // knows they just topped up credits or that a limit lifted early.
+    // knows they just topped up credits or that a limit lifted early: the button
+    // checks the logins again. Nothing failed, so it is not "Retry". A turn the
+    // quota scheduler holds back has usable logins, so checking them changes
+    // nothing; its control is Run now (pramana#137 showed a useless Retry).
+    // Nor does it help a turn the scheduler is placing or that waits for a free slot.
+    const accountReason = view.waitingFor?.reason;
     if (view.status === 'waiting' && view.waitingFor?.kind === 'account' && view.waitingFor.provider
+      && !view.waitingFor.detail?.startsWith('Held') && accountReason !== 'held' && accountReason !== 'planning' && accountReason !== 'slot'
       && !actions.some((action) => action.name === 'retry'))
-      actions.unshift(RETRY_ACTION());
+      actions.unshift({ ...RETRY_ACTION(), label: 'Check again' });
 
     const origin = view.state?.humanPauseOrigin as Stage | undefined;
     if (view.status !== 'waiting' || view.waitingFor?.kind !== 'human' || !origin)
@@ -4581,7 +4675,10 @@ export class KarmaxApi {
     // historical lifecycle move that stops the work and holds for input.
     const waitingOn = view.waitingFor?.kind;
     const redirect = this.sharedConversation(task) && (waitingOn === 'human' || waitingOn === 'parent' || waitingOn === 'responder');
-    if (!redirect && !(await this.availableStageTransitions(task, view)).some((move) => move.target === 'human'))
+    // A parent adding its note to its sub-task's requests through it: they go
+    // to these people with it, and a sub-task still at work keeps working.
+    const passing = caller.taskId !== '*' && caller.taskId !== taskId ? await this.subTaskAsks(task, caller.taskId) : undefined;
+    if (!redirect && !passing?.count && !(await this.availableStageTransitions(task, view)).some((move) => move.target === 'human'))
       throw new Error(`cannot request human input from ${stageName(view.stage)}`);
 
     const audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
@@ -4605,6 +4702,10 @@ export class KarmaxApi {
     if ([...detail].length > 4_000) throw new Error('message must be at most 4000 characters');
 
     let held: TaskView;
+    if (!redirect && passing?.count) {
+      await this.passOnSubTaskAsks(token, task, passing, audience, { taskId: caller.taskId, note: detail, at: Date.now() });
+      return { ...view, note: `Passed ${passing.count === 1 ? 'its request' : `its ${passing.count} requests`} on to ${audience.join(', ')}.` } as TaskView;
+    }
     if (redirect) {
       await (await this.workflowHandle(taskId)).signal('reroute', { audience: audience.filter((selector) => !selector.startsWith('avatar:')).length
         ? audience : [...audience, '@creator'], detail });
@@ -4632,6 +4733,8 @@ export class KarmaxApi {
     };
     const seq = (await this.deps.store.appendEvent(event));
     this.deps.bus?.emit({ ...event, seq });
+    // After the escalation, so its approvals are the people's ask (one actionable row per task).
+    if (passing?.count) await this.passOnSubTaskAsks(token, task, passing, audience, { taskId: caller.taskId, note: detail, at: Date.now() });
     if (task.parentTaskId && caller.taskId === taskId) await this.noteInParent(task, audience, detail);
     for (const avatar of avatarRecipients) {
       await this.callAvatar(token, avatar, 'responder', `${avatar.name}: respond to task #${task.num ?? task.id}`,
@@ -4720,6 +4823,10 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
       projectIds.length ? capabilities : missing, projectIds, baseAuthorization);
     // No audience: the nearest who can grant it (permissionGrantors), else the creator.
     if (!audience.length) audience = [grantors.default ?? '@creator'];
+    // A sub-task's parent at work that cannot grant it either: it comes through
+    // the parent, whose agent may decline it (sub-task-asks.ts).
+    const parentVia = await viaParent(this.deps.store, task);
+    const via = parentVia && !grantors.tasks.some((grantor) => grantor.taskId === parentVia.taskId) ? parentVia : undefined;
     if (audience.length > 32) throw new Error('at most 32 audience selectors may be used');
     const recipients = new Set<string>();
     const avatarRecipients = new Set<string>();
@@ -4754,7 +4861,8 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
       audience,
       recipients: [...recipients],
       avatarRecipients: [...avatarRecipients],
-      taskRecipients: [...taskRecipients],
+      taskRecipients: [...taskRecipients, ...(via ? [via.taskId] : [])],
+      ...(via ? { via } : {}),
       reason: args.reason,
       requestedBy: `task-agent:${task.id}:${caller.profileId}`,
     }));
@@ -4772,6 +4880,7 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
           recipients: request.recipients,
           avatarRecipients: request.avatarRecipients,
           taskRecipients: request.taskRecipients,
+          ...(request.via ? { via: request.via } : {}),
           reason: request.reason,
           requestedBy: request.requestedBy,
           // An approval blocks the agent on a person, so it is high by default —
@@ -4793,17 +4902,8 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
         });
       }
       for (const grantorId of taskRecipients) await this.askTaskToGrant(grantorId, task, request, project.organizationId);
-      for (const avatarId of avatarRecipients) {
-        const avatar = (await this.deps.store.getAvatar(avatarId))!;
-        await this.callAvatar(token, avatar, 'confirm', `${avatar.name}: decide permission request`,
-          `Decide whether to approve or deny permission request ${request.id} for task #${task.num ?? task.id}.
-
-Requested capabilities: ${request.capabilities.join(', ')}
-${request.projectIds?.length ? `Add projects to the task's ${request.baseAuthorization?.level} authorization (existing permissions apply there too): ${request.projectIds.join(', ')}\n` : ''}${untrustedBlock('reason from the requesting agent', request.reason)}
-
-Resolve the request exactly once by calling platform_request with POST /api/permission-requests/${request.id}/resolve?organizationId=${project.organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
-          { taskId: task.id, type: 'avatar.authorization-dispatch-failed', payload: { requestId: request.id, avatarId } });
-      }
+      if (request.via) await this.tellParentOf(task.id, { permission: request, organizationId: project.organizationId });
+      await this.askAvatarsToDecide(token, task, request, project.organizationId, [...avatarRecipients]);
     }
     return {
       status: 'needs_approval',
@@ -4815,26 +4915,113 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     };
   }
 
+  /** Call each Avatār to decide a permission request. */
+  private async askAvatarsToDecide(token: string, task: TaskRecord, request: PermissionRequest, organizationId: string, avatarIds: string[]) {
+    for (const avatarId of avatarIds) {
+      const avatar = (await this.deps.store.getAvatar(avatarId))!;
+      await this.callAvatar(token, avatar, 'confirm', `${avatar.name}: decide permission request`,
+        `Decide whether to approve or deny permission request ${request.id} for task #${task.num ?? task.id}.
+
+Requested capabilities: ${request.capabilities.join(', ')}
+${request.projectIds?.length ? `Add projects to the task's ${request.baseAuthorization?.level} authorization (existing permissions apply there too): ${request.projectIds.join(', ')}\n` : ''}${untrustedBlock('reason from the requesting agent', request.reason)}
+${request.via?.note ? `${untrustedBlock(`note from task ${request.via.taskId}, which it came through`, request.via.note)}\n` : ''}
+Resolve the request exactly once by calling platform_request with POST /api/permission-requests/${request.id}/resolve?organizationId=${organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
+        { taskId: task.id, type: 'avatar.authorization-dispatch-failed', payload: { requestId: request.id, avatarId } });
+    }
+  }
+
+  /** A sub-task's requests through its parent `parentId` that still wait (sub-task-asks.ts). */
+  private async subTaskAsks(task: TaskRecord, parentId: string) {
+    const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId;
+    if (!organizationId) return undefined;
+    const permissions = (await new PermissionRequests(this.deps.store, organizationId).requests({ taskId: task.id, status: 'pending' }))
+      .filter((request) => request.via?.taskId === parentId);
+    const credentials = (await new VaultItems(this.deps.store, this.deps.broker, undefined, organizationId).requests({ taskId: task.id, status: 'pending' }))
+      .filter((request) => request.via?.taskId === parentId);
+    const connections = await connectionRequestsVia(this.deps.store, task.id, parentId);
+    return { organizationId, permissions, credentials, connections, count: permissions.length + credentials.length + connections.length };
+  }
+
+  /** Address a sub-task's requests through its parent to the people (and, for
+   * permissions, Avatārs) the parent named, with its note. */
+  private async passOnSubTaskAsks(token: string, task: TaskRecord, asks: NonNullable<Awaited<ReturnType<KarmaxApi['subTaskAsks']>>>,
+    audience: string[], via: Via) {
+    const people = audience.filter((selector) => !selector.startsWith('avatar:'));
+    const recipients = people.length ? await this.deps.store.humanAudience(task.id, people) : [];
+    const avatarIds = audience.filter((selector) => selector.startsWith('avatar:')).map((selector) => selector.slice(7));
+    if (!recipients.length && (asks.credentials.length || asks.connections.length))
+      throw new ValidationError('Name the people to pass its requests on to: an Avatār cannot connect an app or approve a credential.');
+    const service = new PermissionRequests(this.deps.store, asks.organizationId);
+    for (const pending of asks.permissions) {
+      const request = await service.passOn(pending.id, { audience, recipients, avatarRecipients: avatarIds, via });
+      const event = { taskId: task.id, type: 'permission.approval-requested', ts: via.at, payload: {
+        requestId: request.id, role: request.role, capabilities: request.capabilities, projectIds: request.projectIds,
+        audience: request.audience, recipients: request.recipients, avatarRecipients: request.avatarRecipients,
+        taskRecipients: request.taskRecipients, reason: request.reason, requestedBy: request.requestedBy, via,
+        urgency: DEFAULT_URGENCY['approval-requested'] } };
+      const seq = (await this.deps.store.appendEvent(event));
+      this.deps.bus?.emit({ ...event, seq });
+      await this.askAvatarsToDecide(token, task, request, asks.organizationId, avatarIds);
+    }
+    const vault = new VaultItems(this.deps.store, this.deps.broker, undefined, asks.organizationId);
+    for (const pending of asks.credentials) await vault.passOn(pending.id, people, via);
+    for (const pending of asks.connections) await passOnConnectionRequest(this.deps.store, pending.id, people, via);
+  }
+
+  /** Tell a sub-task's parent's agent of a request that came through it
+   * (sub-task-asks.ts): what is asked, and how to add context or decline it. */
+  async tellParentOf(childId: string, ask: { credential: CredentialAccessRequest; label: string } | { connection: ServiceConnection }
+    | { permission: PermissionRequest; organizationId: string }) {
+    const child = await this.deps.store.getTask(childId);
+    const request = 'credential' in ask ? ask.credential : 'connection' in ask ? ask.connection : ask.permission;
+    if (!child || !request.via) return;
+    const text = 'credential' in ask
+      ? throughYouText(child, { why: ask.credential.why,
+        what: ask.credential.kind === 'reset' ? `to fix the credential "${ask.label}", which it reports wrong`
+          : `for the credential "${ask.label}"${ask.credential.mode === 'reveal' ? ' (to see it)' : ''}`,
+        decline: `platform_request(POST, "/api/vault/requests/${ask.credential.id}/resolve", {"action": "deny"})` })
+      : 'connection' in ask
+        ? throughYouText(child, { what: `to connect ${ask.connection.label}`, why: ask.connection.why,
+          decline: `platform_request(POST, "/api/connections/${ask.connection.id}/disconnect")` })
+        : throughYouText(child, { why: ask.permission.reason,
+          what: `for ${[...ask.permission.capabilities, ...(ask.permission.projectIds ?? []).map((id) => `project ${id}`)].join(', ')}`,
+          decline: `platform_request(POST, "/api/permission-requests/${ask.permission.id}/resolve?organizationId=${ask.organizationId}", {"action": "deny"})` });
+    await this.tellTask(request.via.taskId, child, text, { type: 'subtask.parent-unreachable',
+      payload: { requestId: request.id, parentTaskId: request.via.taskId } });
+  }
+
+  /** The parent a new credential or connection request of `taskId` comes through, if any (sub-task-asks.ts). */
+  async viaParent(taskId: string): Promise<Via | undefined> {
+    return viaParent(this.deps.store, await this.deps.store.getTask(taskId));
+  }
+
   /** Tell a task's agent that a task acting for it asks for what it holds,
    *  and how to decide. Its reply is the decision, not a message. */
   private async askTaskToGrant(grantorId: string, task: TaskRecord, request: PermissionRequest, organizationId: string) {
-    const grantor = await this.deps.store.getTask(grantorId);
-    if (!grantor) return;
     const asked = request.capabilities.join(', ')
       + (request.projectIds?.length ? `${request.capabilities.length ? '; ' : ''}projects ${request.projectIds.join(', ')}` : '');
+    const resolve = `/api/permission-requests/${request.id}/resolve?organizationId=${organizationId}`;
     const text = `Task #${task.num ?? task.id} "${task.title}" (${task.id}) asks you for ${asked}, which you hold. `
-      + `Grant it if its work needs it: platform_request(POST, "/api/permission-requests/${request.id}/resolve?organizationId=${organizationId}", {"action": "approve"}), `
+      + `Grant it if its work needs it: platform_request(POST, "${resolve}", {"action": "approve"}), `
       + `or {"action": "deny"}.\n${untrustedBlock('its reason', request.reason)}`;
+    await this.tellTask(grantorId, task, text, { type: 'permission.grantor-unreachable', payload: { requestId: request.id, grantorTaskId: grantorId } });
+  }
+
+  /** Say `text` to a task's main agent as `from` (a task acting for it), calling
+   *  it. A failure is recorded on `from` as `failure`. */
+  private async tellTask(taskId: string, from: TaskRecord, text: string, failure: { type: string; payload: Record<string, unknown> }) {
+    const target = await this.deps.store.getTask(taskId);
+    if (!target) return;
     try {
-      if (this.sharedConversation(grantor)) {
-        const message: Message = { id: `u${randomUUID()}`, role: 'user', author: `task:${task.id}`,
-          authorLabel: `Task #${task.num ?? task.id}`, text, ts: Date.now() };
-        await (await this.workflowHandle(grantor.id)).signal(SIG.followUp, message);
-        await this.publishConversationMessage(grantor.id, MAIN_AGENT, message);
-      } else await this.deliverWorkflowMessage(grantor.id, text);
+      if (this.sharedConversation(target)) {
+        const message: Message = { id: `u${randomUUID()}`, role: 'user', author: `task:${from.id}`,
+          authorLabel: `Task #${from.num ?? from.id}`, text, ts: Date.now() };
+        await (await this.workflowHandle(target.id)).signal(SIG.followUp, message);
+        await this.publishConversationMessage(target.id, MAIN_AGENT, message);
+      } else await this.deliverWorkflowMessage(target.id, text);
     } catch (error) {
-      const failed = { taskId: task.id, type: 'permission.grantor-unreachable', ts: Date.now(),
-        payload: { requestId: request.id, grantorTaskId: grantorId, error: error instanceof Error ? error.message : String(error) } };
+      const failed = { taskId: from.id, type: failure.type, ts: Date.now(),
+        payload: { ...failure.payload, error: error instanceof Error ? error.message : String(error) } };
       const seq = (await this.deps.store.appendEvent(failed));
       this.deps.bus?.emit({ ...failed, seq });
     }
@@ -5803,6 +5990,18 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
    */
   async searchOrganizationTasks(token: string, organizationId: string, query: string | TaskQuery,
     page: { limit?: number; offset?: number } = {}, now = Date.now()) {
+    const { readable, principal } = await this.readableOrganizationProjects(token, organizationId);
+    return this.searchAuthorizedOrganization(readable, query, principal, page, now);
+  }
+
+  /** How many tasks a query finds in each of an organization's projects (the sidebar's For me numbers). */
+  async countOrganizationTasks(token: string, organizationId: string, query: string | TaskQuery, now = Date.now()) {
+    const { readable, principal } = await this.readableOrganizationProjects(token, organizationId);
+    return this.countAuthorizedOrganization(readable, query, principal, now);
+  }
+
+  /** The projects of an organization a token may search, and who it searches as. */
+  private async readableOrganizationProjects(token: string, organizationId: string) {
     if (!(await this.deps.store.getOrganization(organizationId))) throw new NotFoundError(`no such organization ${organizationId}`);
     const caller = await this.deps.tokens.verify(token);
     if (!caller) throw new CapabilityError('unauthorized');
@@ -5818,7 +6017,15 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     if (!readable.length && !(caller.organizationId === organizationId && allows(caller.caps, 'task:read'))
       && !(await this.deps.tokens.check(token, 'task:read', { organizationId })).ok)
       throw new CapabilityError(`denied: task:read in no project of organization ${organizationId}`);
-    return this.searchAuthorizedOrganization(readable, query, caller.principal, page, now);
+    return { readable, principal: caller.principal };
+  }
+
+  /** One query's rows counted per project, over already-authorized projects; the rows are never sent. */
+  async countAuthorizedOrganization(projects: Project[], query: string | TaskQuery, principalId: string, now = Date.now()) {
+    const { result } = await this.evaluateProjects(projects, query, principalId, now);
+    const counts: Record<string, number> = {};
+    for (const task of result.tasks) counts[task.projectId] = (counts[task.projectId] ?? 0) + 1;
+    return { total: result.total, counts };
   }
 
   /** Evaluate one query across already-authorized projects — an organization's,
@@ -5870,7 +6077,9 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       projects: new Map(projects.map((project) => [project.id, { name: project.name, slug: slugify(project.name) }])),
     };
     const forValues = forClauseValues(q);
-    if (forValues.length) {
+    // `is:folded` keeps the nested rows that need the caller, so it reads their asks too.
+    const folds = !!ctx.userId && queryFolds(q);
+    if (forValues.length || folds) {
       const organizations = [...new Set(projects.map((project) => project.organizationId ?? 'org_personal'))];
       if (forValues.some((value) => value.toLowerCase() !== 'me' && !/^user:/i.test(value))) {
         ctx.people = new Map();
@@ -5881,6 +6090,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       }
       const users = new Set(forValues.map((value) => value.toLowerCase() === 'me' ? ctx.userId
         : /^user:/i.test(value) ? value.slice(5) : ctx.people?.get(value.trim().toLowerCase())).filter((id): id is string => !!id));
+      if (folds) users.add(ctx.userId!);
       ctx.attention = new Map();
       for (const userId of users) {
         const asks = new Map<string, AttentionAsk>();
@@ -7071,13 +7281,19 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
   async setTaskPaymentPolicy(token: string, taskId: string, value: unknown): Promise<void> {
     const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
-    (await this.require(token, 'manage_payments', { projectId: task.projectId, taskId }));
+    value = (await this.checkedTaskPaymentPolicy(token, task, value));
+    (await this.deps.store.updateTaskParams(taskId, { ...task.params, paymentPolicy: value } as any));
+  }
+
+  /** A task's new cards and budget, checked: who may set them, and that they exist. */
+  private async checkedTaskPaymentPolicy(token: string, task: TaskRecord, value: unknown): Promise<unknown> {
+    (await this.require(token, 'manage_payments', { projectId: task.projectId, taskId: task.id }));
     // An Avatār's budget is its forks' pool: it is topped up after it ran too.
     if (!task.params?.avatar && ['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? ''))
       throw new Error('Payments are read-only after a task finishes');
-    value = withPolicyCurrency(value, (await resolvePaymentPolicy(this.deps.store, task.projectId, taskId)).currency);
+    value = withPolicyCurrency(value, (await resolvePaymentPolicy(this.deps.store, task.projectId, task.id)).currency);
     (await validatePaymentPolicy(this.deps.store, task.projectId, (await this.deps.store.getProject(task.projectId))!.organizationId ?? 'org_personal', value));
-    (await this.deps.store.updateTaskParams(taskId, { ...task.params, paymentPolicy: value } as any));
+    return value;
   }
 
   /**
@@ -7088,12 +7304,24 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
    * re-derive the window.
    */
   async updateParams(token: string, taskId: string, patch: Record<string, unknown>,
-    options: { acceptAttenuation?: boolean | string[] } = {}): Promise<{ applied: string[] }> {
+    options: { acceptAttenuation?: boolean | string[]; replace?: boolean } = {}): Promise<{ applied: string[] }> {
     const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     const caller = (await this.require(token, 'edit_task', { projectId: task.projectId, taskId }));
-    if ('paymentPolicy' in patch) throw new Error('Use the task payments endpoint to change cards or budget');
+    // Replacing every param is how a draft's or an armed task's form saves; one
+    // arriving here was sent before the task started (#805).
+    if (options.replace) throw new TaskStartedError('This task has already started');
     patch = stripPlatformMetadata({ ...patch });
+    // Cards and budget are the task's, not the workflow's. A policy equal to the
+    // one in force (a form sends it back whole) is no edit; a change needs
+    // payment authority, checked before anything else is applied.
+    let paymentPolicy: unknown;
+    if (Object.hasOwn(patch, 'paymentPolicy')) {
+      const current = (await resolvePaymentPolicy(this.deps.store, task.projectId, taskId));
+      if (!samePaymentPolicy(withPolicyCurrency(patch.paymentPolicy, current.currency), current))
+        paymentPolicy = (await this.checkedTaskPaymentPolicy(token, task, patch.paymentPolicy));
+      delete patch.paymentPolicy;
+    }
     this.assertBranchParams(patch);
     // A running task may resize its computer, not swap it for another one.
     const project = (await this.deps.store.getProject(task.projectId));
@@ -7178,6 +7406,11 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
           (await this.deliverWorkflowMessage(taskId, computerChangeNotice(change, resized.inPlace)).catch(() => undefined));
         else if (grown?.disk === 'grown' && live && caller.taskId !== taskId && !task.lastView?.outOfDisk)
           (await this.deliverWorkflowMessage(taskId, diskGrownNotice(grown.machine.diskGb)).catch(() => undefined));
+      }
+      // Read at each spend, so it applies from the next one.
+      if (paymentPolicy !== undefined) {
+        (await this.deps.store.patchTaskParams(taskId, { paymentPolicy }));
+        result.applied = [...result.applied, 'paymentPolicy'];
       }
       (await this.updateAgentSnapshot(taskId, patch, result.applied));
       if (result.applied.includes('target') && typeof patch.target === 'string')
@@ -7442,16 +7675,14 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     workflow: string,
   ): Promise<{ workflow: 'software-dev' | 'goal'; task?: TaskRecord }> {
     const task = (await this.deps.store.getTask(taskId));
-    const caller = (await this.require(token, 'edit_task', { projectId: task?.projectId, taskId }));
+    (await this.require(token, 'edit_task', { projectId: task?.projectId, taskId }));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
+    // Goal is retired, so the one compatible switch left is a Goal task's way
+    // back to Software Dev (asking for the mode a task already has is a no-op).
+    if (RETIRED_WORKFLOWS.has(workflow) && task.workflow !== workflow) throw new Error(RETIRED_WORKFLOW_HINT);
     if (workflow !== 'software-dev' && workflow !== 'goal') {
       throw new Error('only Software Dev and Goal are compatible in-flight');
     }
-    // Goal has no Review gate. Switching to it is the same reviewer's decision
-    // as patching `confirm.layers` to `[]` (updateParams), so a task agent,
-    // which holds task:edit on its own task, needs review:approve for it too.
-    if (workflow === 'goal' && task.workflow !== 'goal' && caller.kind === 'agent' && !allows(caller.caps, 'review:approve'))
-      throw new CapabilityError('switching a task to Goal removes its Review gate and needs review:approve (a maintainer-level authorization)');
     // A draft has no Temporal execution yet, so its workflow is ordinary editable
     // task metadata. Re-pin it to the target definition in place: identity, notes,
     // tags, authorization and sparse parameters all survive the form change.
@@ -7462,29 +7693,11 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       (await this.deps.store.setDraftWorkflow(taskId, workflow, start.manifest.version));
       return { workflow, task: (await this.deps.store.getTask(taskId))! };
     }
-    const heldView = task.lastView;
-    const heldOrigin =
-      heldView?.status === 'waiting'
-      && heldView.waitingFor?.kind === 'human'
-      && heldView.state?.humanPauseOrigin
-        ? heldView.state.humanPauseOrigin as Stage
-        : undefined;
     try {
       const result = (await this.deps.client.workflow
         .getHandle(taskId)
         .executeUpdate('changeWorkflow', { args: [workflow] })) as { workflow: 'software-dev' | 'goal' };
       (await this.deps.store.setTaskWorkflow(taskId, result.workflow));
-      // "Goal" is itself an instruction to continue autonomously. If the task
-      // was held in Do/Review, release the hold and carry that instruction into a
-      // fresh latest-version execution. This also repairs pre-1.7 held histories.
-      if (result.workflow === 'goal' && heldView && (heldOrigin === 'do' || heldOrigin === 'review')) {
-        const now = Date.now();
-        const message: Message = { id: `mode-${now}`, role: 'user', text: GOAL_RESUME_MESSAGE, ts: now };
-        const resumedView = this.withConversationMessage(heldView, 'do', message);
-        await this.stopTaskActivity(task, heldView, 'Goal mode supplied autonomous direction for a human hold');
-        const updatedTask = (await this.deps.store.getTask(taskId))!;
-        await this.startTransitionReplacement(updatedTask, resumedView, 'do');
-      }
       return result;
     } catch (e) {
       throw new Error(unwrapCause(e));

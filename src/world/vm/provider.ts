@@ -6,7 +6,8 @@ import { connectionScope, fundingRef, type ResolvedWorldProviderConnection } fro
 import type { MachineShape } from '../../domain/computer.js';
 import { providerFeatures } from '../../domain/computer-limits.js';
 import type { ProviderSandboxRef, ProviderUsagePage, ProviderUsageEvent, World, WorldDiagnosis, WorldHandle,
-  WorldLifecycleState, WorldProvider, WorldSpec } from '../types.js';
+  WorldLifecycleState, WorldOpenOptions, WorldProvider, WorldSpec } from '../types.js';
+import { WorldNotRunningError } from '../types.js';
 import { serviceHomeLabel } from '../services.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow, provisionTimeoutMs, type ProvisionTarget } from '../provision-git.js';
 import { taskBranch } from '../../domain/brand.js';
@@ -86,7 +87,8 @@ export interface VmDriver {
   test(connection: ResolvedWorldProviderConnection): Promise<void>;
 }
 
-type Resolver = (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>;
+/** The account for an organization's computers; `new` for one about to be made (src/world/connections.ts resolve). */
+type Resolver = (organizationId: string | undefined, provider: string, options?: { new?: boolean }) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>;
 
 /** Where a deleted world's last usage waits for the feed (the store's kv). */
 export interface VmUsageLedger {
@@ -143,7 +145,7 @@ export class VmWorldProvider implements WorldProvider {
       throw new Error(`${this.driver.name} computers have unrestricted outbound network. Choose E2B or Daytona for an allowlist.`);
     if (!features.desktop && spec.environment?.flavor === 'desktop')
       throw new Error(`${this.driver.name} computers are headless. Choose E2B or Daytona for a desktop.`);
-    const connection = await this.connection(spec.organizationId);
+    const connection = await this.connection(spec.organizationId, { new: true });
     const shape = await this.driver.shape(spec.resources, connection);
     const labels = { karmaxHome: serviceHomeLabel(), karmaxTaskId: spec.taskId, karmaxGeneration: String(spec.generation ?? 1),
       ...(spec.organizationId ? { karmaxOrganizationId: spec.organizationId } : {}) };
@@ -196,13 +198,14 @@ export class VmWorldProvider implements WorldProvider {
     }
   }
 
-  async open(handle: WorldHandle): Promise<World> {
+  async open(handle: WorldHandle, options?: WorldOpenOptions): Promise<World> {
     const sealed = this.reference(handle);
     const connection = await this.connection(connectionScope(sealed));
     let transport = this.transports.get(handle.id);
     if (!transport || this.states.get(handle.id) === 'parked') {
       const state = await this.driver.state(connection, sealed);
       if (state === 'missing') throw Object.assign(new Error(`the ${this.driver.name} machine of this world no longer exists`), { status: 404 });
+      if (state !== 'ready' && options?.wake === false) throw new WorldNotRunningError();
       transport = this.transportFor(handle.id, connection, sealed);
       if (state !== 'ready') {
         const shape = await this.shapeOf(handle, connection);
@@ -298,7 +301,16 @@ export class VmWorldProvider implements WorldProvider {
   async status(handle: WorldHandle): Promise<WorldLifecycleState> {
     if (this.destroyed.has(handle)) return 'missing';
     this.reference(handle); // an unreadable reference must fail here, as on E2B
-    return this.states.get(handle.id) ?? 'ready';
+    const known = this.states.get(handle.id);
+    if (known) return known;
+    // A process that has not touched this world since it started knows
+    // nothing of its machine: ask the cloud, never assume it runs. Taking a
+    // parked world for a running one woke it to be parked again, after every
+    // restart (production, 2026-11-03: each of an organization's parked VM
+    // worlds, out of compute, booted after a deploy, on Hetzner a billed hour).
+    const probed = await this.probe(handle);
+    if (probed === 'ready' || probed === 'parked') this.states.set(handle.id, probed);
+    return probed ?? 'ready';
   }
 
   async probe(handle: WorldHandle): Promise<WorldLifecycleState | undefined> {
@@ -451,8 +463,8 @@ export class VmWorldProvider implements WorldProvider {
 
   private home(): string { return this.options.home ?? VM_HOME; }
 
-  private async connection(organizationId: string | undefined): Promise<ResolvedWorldProviderConnection> {
-    return this.resolveConnection(organizationId, this.kind);
+  private async connection(organizationId: string | undefined, options?: { new?: boolean }): Promise<ResolvedWorldProviderConnection> {
+    return this.resolveConnection(organizationId, this.kind, options);
   }
 
   private seal(value: Record<string, string>): string {

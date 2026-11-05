@@ -88,6 +88,45 @@ describe('for: — what needs a person', () => {
   });
 });
 
+describe('is:folded — sub-tasks and runs folded under their parent, unless they need you', () => {
+  // pramana#149: a sub-task waiting on its creator was in For me (`for:me -is:archived`)
+  // but not in Active (`-is:archived`), because lists hid every sub-task and `for:`
+  // switched that off. Lists now fold only the nested rows that have nothing for the
+  // viewer, so For me is exactly Active narrowed to the viewer's asks.
+  const nested = [
+    ...tasks,
+    task('quiet-child', { parentTaskId: 'agent-busy' }),
+    task('child-asks-bob', { parentTaskId: 'agent-busy' }),
+    task('series', { params: { repeatable: true } }),
+    task('run-asks-me', { params: { runOf: 'series' } }),
+    task('quiet-run', { params: { runOf: 'series' } }),
+  ];
+  const withAsks = new Map([
+    [alice, new Map([...attention.get(alice)!, ['run-asks-me', ask('mentioned')]])],
+    [bob, attention.get(bob)!],
+  ]);
+  const listed = (q: string, extra: Record<string, unknown> = {}) =>
+    evaluateQuery(nested, parseQuery(q), { ...ctx, attention: withAsks, ...extra }).tasks.map((t) => t.id).sort();
+
+  it('folds a sub-task or run that has nothing for the viewer, and keeps one that needs them', () => {
+    expect(listed('is:folded')).toEqual(['child-asks-bob', 'quiet-child', 'quiet-run']);
+    expect(listed('-is:folded')).toEqual(['agent-busy', 'bobs-draft', 'child-asks-me', 'input-bob',
+      'my-draft', 'review-me', 'run-asks-me', 'series']);
+  });
+
+  it('makes For me a filter of Active', () => {
+    const active = new Set(listed('-is:archived -is:folded'));
+    const forMe = listed('for:me -is:archived');
+    expect(forMe).toEqual(['child-asks-me', 'my-draft', 'review-me', 'run-asks-me']);
+    expect(forMe.filter((id) => !active.has(id))).toEqual([]);
+  });
+
+  it('folds every nested row when nobody is signed in or no asks were loaded', () => {
+    expect(listed('is:folded', { userId: undefined })).toEqual(['child-asks-bob', 'child-asks-me', 'quiet-child', 'quiet-run', 'run-asks-me']);
+    expect(listed('is:folded', { attention: undefined })).toEqual(['child-asks-bob', 'child-asks-me', 'quiet-child', 'quiet-run', 'run-asks-me']);
+  });
+});
+
 describe('for: — order', () => {
   const HOUR = 3600e3;
   // Each task last changed status an hour apart; the asks arrived later.

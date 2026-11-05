@@ -14,9 +14,15 @@
   const draw = async () => {
     const current = ++revision;
     window.MathJax?.typesetClear?.([thread]);
+    let forms = 0;
     for (const { node, source } of messages) {
       node.classList.add('md');
       node.innerHTML = KarmaxMarkdown.renderMarkdown(source, { math });
+      // An agent's form, as it was asked: read-only here.
+      node.querySelectorAll('pre.lang-form').forEach((pre) => {
+        const { form } = KarmaxMarkdown.parseForm(pre.textContent);
+        if (form) pre.outerHTML = KarmaxMarkdown.renderForm(form, { key: `shared-${++forms}` });
+      });
     }
     toggle.setAttribute('aria-pressed', String(math));
     if (!math || !thread.querySelector('.md-math')) return;

@@ -109,7 +109,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'create_review_info',
     description:
-      "Optional. Attach click-to-verify affordances only when they are relevant: `run` actions for useful verification commands (including starting an app/server; set `server: true` and use `openUrls` to open it), and `open` actions for human-readable outputs such as reports, documents, images, or videos. Local open targets must exist and be at most 100 MiB each; their current bytes are saved in durable artifact storage so they remain available after the task lands. Source code is not a human-readable output and must not be attached as an `open` action. `caption` is optional, at most 280 characters, and says WHAT to verify. Put summaries of changes/answers in your normal response, or in a file only when the task requests one. The changed-files list is added automatically.",
+      "Optional. Attach click-to-verify affordances only when they are relevant: `run` actions for useful verification commands (including starting an app/server; set `server: true` and use `openUrls` to open it), and `open` actions for human-readable outputs such as reports, documents, images, or videos. Local open targets must exist and be at most 100 MiB each; their current bytes are saved in durable artifact storage so they remain available after the task lands. Because that snapshot is what reviewers see, call it again after changing anything it shows, with every action that should show; a re-attached action (same `open` target, or same `run` label) replaces the earlier one. Source code is not a human-readable output and must not be attached as an `open` action. `caption` is optional, at most 280 characters, and says WHAT to verify. Put summaries of changes/answers in your normal response, or in a file only when the task requests one. The changed-files list is added automatically.",
     parameters: {
       type: 'object',
       properties: {
@@ -330,11 +330,11 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
-    name: 'list_connections', description: 'List app accounts explicitly shared with this task or project. Prefer these to requesting passwords; tokens stay server-side.',
+    name: 'list_connections', description: 'List the app accounts this task can use now; tokens stay server-side. For an app not listed, call request_connection: the user may already have it connected and only needs to allow it.',
     parameters: { type: 'object', properties: {} },
   },
   {
-    name: 'request_connection', description: 'Request access to an app for this task. Prefer a native MCP server: pass mcp as its MCP Registry name (e.g. com.example/gmail, find one with GET /api/mcp/registry?search=) or its public HTTPS URL. Use toolkit (a Composio slug such as gmail or googlecalendar) only as the fallback when no suitable remote MCP server exists. The user allows an account they already connected or signs in; a Connect button appears in this task and it resumes automatically. Continue independent work, but do not finish while the connection is pending. Reuse accounts from list_connections.',
+    name: 'request_connection', description: 'Request access to an app for this task. Prefer a native MCP server: pass mcp as its MCP Registry name (e.g. com.example/gmail, find one with GET /api/mcp/registry?search=) or its public HTTPS URL. Use toolkit (a Composio slug such as gmail or googlecalendar) only as the fallback when no suitable remote MCP server exists. The user allows an account they already connected or signs in; a Connect button appears in this task and it resumes automatically. Continue independent work; you may end your turn while it is pending, and the task resumes once it is connected. Reuse accounts from list_connections.',
     parameters: { type: 'object', properties: { mcp: { type: 'string' }, toolkit: { type: 'string' }, why: { type: 'string' } }, required: ['why'] },
   },
   {
@@ -879,7 +879,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'escalate',
     description:
       'Redirect a request you received but cannot answer yourself to people who can — the question you were asked as a ' +
-      'Responder, or a request a sub-task routed to you (pass its task_id). The request waits for them instead; your own ' +
+      'Responder, or a request a sub-task routed to you (pass its task_id). A sub-task\'s credential, permission and app requests ' +
+      'that came through you go to them with your note, the context they lack. The request waits for them instead; your own ' +
       'work is not interrupted. Audience selectors as for notify (people, teams, Avatārs).',
     parameters: {
       type: 'object',

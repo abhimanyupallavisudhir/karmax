@@ -24,7 +24,7 @@ function decl(name) {
   return line[1];
 }
 
-const FUNCTIONS = ['wikiScopeInfo', 'wikiView', 'wikiViewOptionsHtml', 'wikiViewChoices', 'hasMath', 'loadWikiRefs', 'wikiUrl', 'wikiRead',
+const FUNCTIONS = ['wikiScopeInfo', 'scopeTitle', 'wikiView', 'wikiViewOptionsHtml', 'wikiViewChoices', 'hasMath', 'loadWikiRefs', 'wikiUrl', 'wikiRead',
   'forgetWikiReads', 'paintWikiRead', 'openWikiEntry', 'wikiEnclosingEntry', 'wikiTreeHtml', 'wireWikiView',
   'wikiBody', 'renderWikiHome', 'renderWikiPage', 'policyTip', 'wireWikiLocalLinks', 'wikiRoute', 'wikiViewFromQuery', 'isNewTabClick', 'plainClick', 'wikiEntryHref', 'decodeRoutePart',
   'renderFlag', 'setMathjaxEnabled', 'mountMarkdownSurface', 'paintMarkdownSurface', 'texToggleHtml', 'wireTexToggles'];

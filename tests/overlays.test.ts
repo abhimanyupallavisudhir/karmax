@@ -37,6 +37,8 @@ describe('manifest dependency resolution (SPEC §4.6)', () => {
       expect(prompt).toContain('Migrate AGENTS.md, CLAUDE.md');
       expect(prompt).toContain('memories for facts worth knowing, skills for procedures worth repeating');
       expect(prompt).toContain('"default" label');
+      // Set up once, then kept current.
+      expect(prompt).toMatch(/has no pages yet, set it up[\s\S]*Otherwise keep it current/);
       expect(prompt).not.toContain('Queue');
     }
     // Isolated cloud worlds have no worktrees to collide.

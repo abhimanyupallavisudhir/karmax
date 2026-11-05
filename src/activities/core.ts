@@ -28,10 +28,11 @@ import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
 import { COMPUTE_HOLD, holdManagedCompute, outOfCompute, type ComputeHoldRequest } from '../world/managed-compute.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
-import { ComputeRouter, type RouterConnections } from '../world/compute-router.js';
+import { capacityCause, ComputeRouter, type RouterConnections } from '../world/compute-router.js';
+import { accountKey, dequeue, enqueue, wakeFullKey } from '../world/compute-queue.js';
 import { AgentChannelLost, AgentToolsUnavailable, toolsUnavailableActivity, toolsUnavailableNotice, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
-import { markCheckpointStale } from '../world/checkpoint-staleness.js';
+import { clearBranchUnpublished, markBranchUnpublished, markCheckpointStale } from '../world/checkpoint-staleness.js';
 import { usageAdmissionId as admissionIdFor } from '../domain/turn-admission.js';
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store, type ViewPublicationOrder } from '../store/db.js';
@@ -363,7 +364,8 @@ export interface CoreActivityDeps {
   configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
   resources?: import('../world/resources.js').ProjectResourceService;
   /** The organization's provider accounts, which judge a sub-task's Computer. */
-  providerConnections?: import('../platform/agent-params.js').ComputerChecks & Partial<RouterConnections>;
+  providerConnections?: import('../platform/agent-params.js').ComputerChecks & Partial<RouterConnections>
+    & { funding?(organizationId: string | undefined, provider: string): Promise<'managed' | 'own' | undefined> };
   objects?: ObjectStore;
   contentDir?: string;
   /** Snapshot of whether this console is running on the user's own machine. */
@@ -1447,18 +1449,24 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
   /** The revisions selecting the branch's own commits (see commitsAheadOfPrBase). */
   async function prBaseRange(world: World, repo: ReturnType<typeof worldRepos>[number], base: string): Promise<string[]> {
-    const dwim = [`${base}..${repo.branch}`];
-    if (base.startsWith('refs/') || /^[0-9a-f]{40,64}$/i.test(base)) return dwim;
+    return [repo.branch, ...(await prBaseRefs(world, repo, base)).map((ref) => `^${ref}`)];
+  }
+
+  /** The refs that stand for `base` in this world: both the local branch and
+   * origin's, whichever exist, since either may be the stale one (see
+   * commitsAheadOfPrBase). */
+  async function prBaseRefs(world: World, repo: ReturnType<typeof worldRepos>[number], base: string): Promise<string[]> {
+    if (base.startsWith('refs/') || /^[0-9a-f]{40,64}$/i.test(base)) return [base];
     const candidates = [`refs/heads/${base}`, `refs/remotes/origin/${base}`];
     const listed = await world.exec('git', ['for-each-ref', '--format=%(refname)', ...candidates], { cwd: repo.root });
     const lines = listed.code === 0 ? listed.stdout.split('\n').map((line) => line.trim()) : [];
     const present = candidates.filter((ref) => lines.includes(ref));
-    if (present.length) return [repo.branch, ...present.map((ref) => `^${ref}`)];
+    if (present.length) return present;
     if (repo.baseSha) {
       const ancestor = await world.exec('git', ['merge-base', '--is-ancestor', repo.baseSha, repo.branch], { cwd: repo.root });
-      if (ancestor.code === 0) return [`${repo.baseSha}..${repo.branch}`];
+      if (ancestor.code === 0) return [repo.baseSha];
     }
-    return dwim;
+    return [base];
   }
 
   /** The commit messages of the branch's own commits, oldest first. */
@@ -1560,6 +1568,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const next = (await store.updateWorldMeta(handle, { worldLeaseId: acquired.leaseId, runnerPoolId: acquired.runnerPoolId }));
     (await store.setWorldState(next, 'ready'));
     (await record(taskId, 'world.lease-acquired', { leaseId: acquired.leaseId, runnerPoolId: acquired.runnerPoolId }));
+    // It has its machine: it waits for room no longer, even while its world
+    // opens (restoring project data can take an hour; pramana#149 kept the
+    // queue's first place meanwhile and everyone behind it waited).
+    await dequeue(store, taskId).catch(() => undefined);
     return next as WorldHandle;
   }
 
@@ -1678,6 +1690,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return deps.resources ? await deps.resources.prepare(world) : world;
     };
     try {
+      if (recover) await restoreHibernated(handle, taskId);
       for (;;) {
         const parked = (await store.worldState(handle.id)) === 'parked';
         const before = ((await store.currentWorld(handle.id)) ?? handle) as WorldHandle;
@@ -1687,6 +1700,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const world = await (worlds.withOperation ? worlds.withOperation(handle.id, () => open(woke)) : open(woke));
         // One pull request of a task's world (SPEC §11.1): the task's world,
         // narrowed to that pull request's worktree.
+        if (world) await wokeOrRan(handle, taskId);
         if (world && isPullRequestView(handle)) return await restorePullRequest(pullRequestView(world, handle), world);
         // The task's own proposal, without checkouts that are pull requests of their own.
         const only = proposalCheckouts(handle);
@@ -1696,8 +1710,49 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // for its transition. Re-enter admission before opening the provider.
       }
     } catch (error) {
+      await wakeRefused(handle, taskId, error).catch(() => undefined);
       throw worldUnreachable(handle, error);
     } finally { releaseAccess?.(); }
+  }
+
+  /**
+   * A hibernated world has no machine: it comes back from its checkpoint where
+   * its task can run now (checkpoint.ts restoreWhereTaskRuns: Any routes it),
+   * before any account is asked for room. Asking its old account first kept a
+   * world hibernated because that account had no room (a stuck wake,
+   * managed-compute § Queue) waiting there for good (pramana#137).
+   */
+  async function restoreHibernated(handle: WorldHandle, taskId: string): Promise<void> {
+    if (!isRemote(handle.kind) || !deps.checkpoints || (await store.worldState(handle.id)) !== 'hibernated') return;
+    if (await taskEnded(store, handle.id)) return;
+    const current = ((await store.currentWorld(handle.id)) ?? handle) as WorldHandle;
+    const checkpointId = current.checkpointId;
+    if (!checkpointId) return;
+    (await record(taskId, 'world.recovering', { checkpointId, reason: 'hibernated' }));
+    const restored = await deps.checkpoints.restoreWhereTaskRuns(checkpointId, current);
+    (await record(taskId, 'world.recovered', { checkpointId, generation: restored.generation, provider: restored.kind }));
+  }
+
+  /** A world opened: it no longer waits for room. */
+  async function wokeOrRan(handle: WorldHandle, taskId: string): Promise<void> {
+    await dequeue(store, taskId).catch(() => undefined);
+    if (await store.kvGet(wakeFullKey(handle.id))) await store.kvDelete(wakeFullKey(handle.id));
+  }
+
+  /** A parked world its account had no room to wake: the task waits its turn
+   * for that account, and the lifecycle sweep moves it elsewhere once the
+   * wait has lasted (WAKE_RELOCATE_AFTER_MS, runners.ts). */
+  async function wakeRefused(handle: WorldHandle, taskId: string, error: unknown): Promise<void> {
+    if (!isRemote(handle.kind) || !capacityCause(error)) return;
+    const current = ((await store.currentWorld(handle.id)) ?? handle) as WorldHandle;
+    const project = await store.getProject(String(current.meta?.projectId ?? (await store.getTask(taskId))?.projectId ?? ''));
+    const organizationId = project?.organizationId;
+    if (!organizationId) return;
+    const computer = current.meta?.machine as { cpu?: number; diskGb?: number } | undefined;
+    await enqueue(store, { taskId, organizationId, account: accountKey(current.meta?.funding === 'managed' ? MANAGED_COMPUTE : organizationId, current.kind),
+      ...(computer?.cpu !== undefined ? { cpu: computer.cpu } : {}), ...(computer?.diskGb !== undefined ? { diskGb: computer.diskGb } : {}) });
+    if ((await store.worldState(handle.id)) === 'parked' && !(await store.kvGet(wakeFullKey(handle.id))))
+      await store.kvSet(wakeFullKey(handle.id), JSON.stringify({ since: Date.now(), generation: current.generation ?? 1 }));
   }
 
   /** A cloud world that cannot be woken or reached right now (a provider
@@ -1906,7 +1961,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 await parkingTrace.measure('lifecycle.enroll-repositories', () => enrollLiveProjectRepositories(remoteWorld, taskId));
                 if (!(await valid())) return;
                 const pushed = await parkingTrace.measure('lifecycle.publish-branch', () => withTiming(parkingTrace, () => publishTaskBranch(remoteWorld, taskId, true, true)));
-                if (pushed.skipped.length) throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
+                if (pushed.skipped.length) {
+                  const reason = `could not persist branch for ${describePublishFailures(pushed)}`;
+                  await markBranchUnpublished(store, remoteWorld.handle, reason);
+                  throw new Error(reason);
+                }
+                await clearBranchUnpublished(store, remoteWorld.handle.id);
                 (await record(taskId, 'push.branch', { branch: remoteWorld.handle.branch, repos: pushed.pushed, reason: 'checkpoint' }));
               }
             }
@@ -2563,13 +2623,29 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           return await (worlds.withOperation ? worlds.withOperation(args.taskId, provision) : provision());
         } finally { stopCancellationHeartbeat(); }
       };
-      if (!routed) return provisionOn(kind);
+      if (!routed) {
+        // A named provider: its own refusal queues the task for that account,
+        // as admission's does (account-room.ts); a machine takes it off.
+        try {
+          const made = await provisionOn(kind);
+          await dequeue(store, args.taskId).catch(() => undefined);
+          return made;
+        } catch (error) {
+          if (capacityCause(error)?.name === 'ProviderCapacityFull' && remote) {
+            const funding = await deps.providerConnections?.funding?.(organizationId, kind).catch(() => undefined);
+            const shape = machineShape(executionConfig);
+            await enqueue(store, { taskId: args.taskId, organizationId, account: accountKey(funding === 'managed' ? MANAGED_COMPUTE : organizationId, kind),
+              ...(shape.cpu !== undefined ? { cpu: shape.cpu } : {}), ...(shape.diskGb !== undefined ? { diskGb: shape.diskGb } : {}) }).catch(() => undefined);
+          }
+          throw error;
+        }
+      }
       // "Any": the first candidate with room takes it; a full one gives way to
       // the next, and the task waits only when every one is full.
       const router = deps.providerConnections?.list && deps.providerConnections.managedConnections
         ? new ComputeRouter(store, deps.providerConnections as RouterConnections) : undefined;
       if (!router || !project) throw new Error('provider "Any" needs a project and connected computers');
-      const route = await router.route(organizationId, executionConfig, undefined);
+      const route = await router.route(organizationId, executionConfig, undefined, { taskId: args.taskId, worldId: args.taskId });
       try {
         return (await router.run(organizationId, route, (candidate, reason) => provisionOn(candidate.provider as WorldKind, reason),
           async (decision) => { await record(args.taskId, 'world.routed', { ...decision }); })).value;
@@ -4267,8 +4343,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // (they feed the confirmer's review packet, so a reviewer would be shown —
         // and asked to approve — changes the task never made). The merge-base is
         // resolved to a commit so the comparison still includes the worktree, which
-        // `<base>...HEAD` would drop along with every uncommitted change.
-        const forkPoint = await world.exec('git', ['merge-base', repoBase, 'HEAD'], { cwd: repo.root });
+        // `<base>...HEAD` would drop along with every uncommitted change. The fork
+        // point is taken against every ref standing for the base: the local branch
+        // stays where the world was provisioned, so work that already landed (an
+        // earlier pull request from this branch, merged back in) would be listed
+        // again for approval (pramana#137).
+        const forkPoint = await world.exec('git', ['merge-base', 'HEAD', ...(await prBaseRefs(world, repo, repoBase))], { cwd: repo.root });
         const since = forkPoint.code === 0 && forkPoint.stdout.trim() ? forkPoint.stdout.trim() : repoBase;
         // NUL-separated output is never C-quoted, whatever the world's Git config
         // (non-ASCII, quotes and newlines in names survive verbatim; WD-27).
@@ -5410,6 +5490,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      */
     async proposeUpstream(ref: WorldHandleRef, target: string, details: OpenPrDetails = {}): Promise<UpstreamProposal> {
       const handle = ref as WorldHandle;
+      // Which checkouts are forks is project data, not world state. With none,
+      // there is nothing to propose: opening the world would wake a parked
+      // computer for nothing, and every Confirm waited 1–2½ minutes for it
+      // (longer when compute was short or the restore hung; task #826).
+      // The same checkouts githubPrTargets reads from the opened world.
+      const current = ((await store.currentWorld(handle.id)) ?? handle) as WorldHandle;
+      let fork = false;
+      for (const repo of worldRepos(current)) {
+        if ((await enrolledRepositoryForCheckout(handle, repo))?.upstream) { fork = true; break; }
+      }
+      if (!fork) return { prs: [], pending: [] };
       const world = await openWorld(handle);
       const targets = (await githubPrTargets(world, handle)).filter((candidate) => candidate.headRepository);
       const changed: Array<(typeof targets)[number] & { base: string }> = [];

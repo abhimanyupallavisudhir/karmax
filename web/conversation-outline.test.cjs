@@ -28,6 +28,10 @@ const ok = (condition, message) => condition ? pass++ : (fail++, console.error('
 const T0 = 1792280000000;
 const msg = (id, role, text, extra = {}) => ({ type: 'message', message: { id, role, text, ts: T0 + 60_000 * Number(id.replace(/\D/g, '') || 0), ...extra }, ts: 0, sourceKey: `message:${id}` });
 const act = (n, title = `step ${n}`) => ({ type: 'activity', activity: { kind: 'command', phase: 'completed', title }, ts: T0 + 60_000 * n + 30_000, sourceKey: `activity:${n}` });
+// What a provider said on the way (narration between tool calls), and the
+// provider item a turn ended with (its final answer, `answer` as
+// conversationEntries marks it).
+const said = (n, text, extra = {}) => ({ type: 'activity', activity: { kind: 'message', phase: 'completed', title: text }, ts: T0 + 60_000 * n + 30_000, sourceKey: `activity:${n}`, ...extra });
 const keys = (items) => items.map((item) => item.fold ? `[${item.entries.map((e) => e.sourceKey.split(':')[1]).join(' ')}]` : item.entry.sourceKey.split(':')[1]).join(' ');
 
 // Who wrote what. tavya's prompts are role 'user' (the model must read them),
@@ -47,7 +51,8 @@ ok(messageSpeaker({ id: 'merge-revise-6', role: 'user', text: 'x' }, { participa
 ok(messageSpeaker({ id: 'u1', role: 'user', author: 'user:me', text: 'x' }, { participants: [] }) === 'You', 'your own messages still say You');
 
 // Task #templates (production, 2026-10-16): the report for the person is a5;
-// two merge-conflict rounds followed it.
+// two merge-conflict rounds followed it. a1 and a3 ended turns (the agent
+// paused for a machine, then for a job): they were said to the person too.
 const templates = [
   msg('m0', 'user', 'Let there be task templates'),
   act(1), msg('a1', 'agent', 'Moving to a larger machine.'),
@@ -65,13 +70,36 @@ const templates = [
   msg('a13', 'agent', 'The branch now merges cleanly with the newest master, and I\'ve requested landing again.'),
 ];
 let outline = conversationOutline(templates);
-ok(keys(outline) === 'm0 [1 a1 wait-2 2 3 a3 wait-4 4] a5 [5 merge-revise-6 6 a7 wait-8 a9 merge-revise-10 a11 wait-12 a13]',
-  `the prompt and its answer stay; the work and the landing repairs fold: ${keys(outline)}`);
-const [, work, , repairs] = outline;
-ok(work.fold && work.automatic === 0, 'the work before the answer is a work fold');
+ok(keys(outline) === 'm0 1 a1 [wait-2 2 3] a3 [wait-4 4] a5 [5 merge-revise-6 6 a7 wait-8 a9 merge-revise-10 a11 wait-12 a13]',
+  `every turn's answer stays; the work and the landing repairs fold: ${keys(outline)}`);
+const work = outline[3], repairs = outline[7];
+ok(work.fold && work.automatic === 0, 'the work between answers is a work fold');
 ok(repairs.automatic === 2, 'the repairs count the two automatic follow-ups');
 ok(repairs.latest?.message?.id === 'a13', 'the repairs fold previews where things stand now');
-ok(outline[2].reply === true, 'the answer is marked as the reply');
+ok(outline[6].reply === true && !outline[2].reply, 'the last answer before the work came back is the reply');
+
+// Task #805 (production, 2026-11-02): a person asked three things; the agent
+// answered them all (a21) as it paused for its tests, then reported the test
+// run (a23) and pointed back at "my previous message". A turn's answer is for
+// people even when a later turn of the same work follows it.
+outline = conversationOutline([
+  msg('u18', 'user', 'Still waiting for a machine.', { author: 'user:me' }),
+  msg('u19', 'user', 'How can I allow that?', { author: 'user:me' }), act(20),
+  msg('a21', 'agent', '#137 has its machine now. … Letting agents file quota requests themselves: …'),
+  msg('wait-22', 'user', '(Resumed: your job has finished.)'), act(22),
+  msg('a23', 'agent', 'The third fix is committed. … the role are in my previous message.'),
+  msg('u24', 'user', 'It says it already exists.', { author: 'user:me' }),
+]);
+ok(keys(outline) === 'u18 u19 20 a21 [wait-22 22] a23 u24', `an answer before a pause stays in view: ${keys(outline)}`);
+
+// Narration between tool calls is not an answer; the provider item the turn
+// ended with is, however the transcript reached the page.
+outline = conversationOutline([
+  msg('m0', 'user', 'Go'), act(1), said(2, 'Let me look at the queue.'), act(3), said(4, 'Found it: the queue holds stale entries.', { answer: true }),
+  msg('wait-5', 'user', '(Resumed: your job has finished.)'), said(6, 'Tests are running.'), act(7), said(8, 'Fixed and tested.', { answer: true }),
+]);
+ok(keys(outline) === 'm0 [1 2 3] 4 [wait-5 6 7] 8', `narration folds, each turn's answer stays: ${keys(outline)}`);
+ok(outline.at(-1).reply === true, 'the latest answer is the reply');
 
 // A CI failure while the proposal waited for Review: the original report stays.
 outline = conversationOutline([
@@ -100,9 +128,9 @@ ok(keys(outline) === 'm0 a1 [st-2] a3 [4 5]', `a message to a person is never fo
 // While the agent works on a fresh request nothing is its answer yet, and the
 // work in progress stays open to watch.
 outline = conversationOutline([
-  msg('m0', 'user', 'Go'), act(1), msg('a1', 'agent', 'Starting with the tests.'), act(2),
+  msg('m0', 'user', 'Go'), act(1), said(1.5, 'Starting with the tests.'), act(2),
 ], { live: true });
-ok(keys(outline) === 'm0 [1 a1 2]', `a progress note is not the answer: ${keys(outline)}`);
+ok(keys(outline) === 'm0 [1 1.5 2]', `a progress note is not the answer: ${keys(outline)}`);
 ok(outline[1].live === true, 'the work in progress is the live fold');
 
 // When the task is asking a person something, its latest message is the question.
@@ -114,8 +142,8 @@ ok(keys(outline) === 'm0 a1 [merge-revise-2 2] a3', `the open question stays in 
 
 // Task #704 (production, 2026-10-19): the agent's own work goes on through its
 // sub-task's news, a job waking it and a credential being granted; none of
-// that is the work coming back to it. Its report (a17) is what it said when it
-// stopped, not what it said before its sub-task first reported (a11).
+// that is the work coming back to it. Its report (a14) is the answer, and what
+// each of its turns ended with on the way stays readable above it.
 outline = conversationOutline([
   msg('m0', 'user', 'Switch on managed compute'), act(1), msg('a2', 'agent', 'Paused until the release is live.'),
   msg('u3', 'user', 'I added the Hetzner key.', { author: 'user:me' }), act(4),
@@ -126,10 +154,24 @@ outline = conversationOutline([
   msg('wait-12', 'user', '(Resumed: your 40-minute pause is over.)'), act(13),
   msg('a14', 'agent', 'Managed compute is now on in production.'),
 ]);
-ok(keys(outline) === 'm0 1 a2 u3 [4 n05f0e0d0-1111-2222-3333-444455556666 a6 7 st-8 a9 st-10 a11 wait-12 13] a14',
+ok(keys(outline) === 'm0 1 a2 u3 [4 n05f0e0d0-1111-2222-3333-444455556666] a6 [7 st-8] a9 [st-10] a11 [wait-12 13] a14',
   `the report is what the agent said when its own work ended: ${keys(outline)}`);
-ok(outline[4].automatic === 0, 'news from its own sub-task and a job is its own work, not an automatic follow-up');
-ok(outline[5].reply === true, 'the report answers the person');
+ok(outline.filter((item) => item.fold).every((fold) => fold.automatic === 0), 'news from its own sub-task and a job is its own work, not an automatic follow-up');
+ok(outline.at(-1).reply === true && outline.filter((item) => item.reply).length === 2, 'the report answers the person');
+
+// Task #796 (production, 2026-11-01): a credential the agent had said to
+// ignore was approved after it opened its PR. The notice woke it in Review and
+// it confirmed one detail: that is the finished work coming back to it, so its
+// report stays the answer and the confirmation folds as a follow-up.
+outline = conversationOutline([
+  msg('m0', 'user', 'Fix the lists'), act(1), msg('a2', 'agent', 'Both are fixed; the PR is open.'),
+  msg('n3f0e0d0c-1111-2222-3333-444455556666', 'user', '[tavya credential decision] approved', { returnsWork: true }), act(4),
+  msg('a5', 'agent', 'The replacement query works on real GitHub.'),
+]);
+ok(keys(outline) === 'm0 1 a2 [n3f0e0d0c-1111-2222-3333-444455556666 4 a5]',
+  `a notice that reopens work in Review starts a new round: ${keys(outline)}`);
+ok(outline[2].reply === true, 'the report answers the person');
+ok(outline[3].automatic === 1 && outline[3].latest.sourceKey === 'message:a5', 'the confirmation is an automatic follow-up');
 
 // Decisions recorded before notices were signed (u…) are still tavya's.
 ok(messageOrigin({ id: 'uec4c6ea3-6fad-4e7b-929a-7472ca1dc4ad', role: 'user', text: '[tavya permission decision]\n\nApproved for this task' }) === 'platform',
@@ -159,9 +201,9 @@ ok(keys(outline) === 'm0 [1 2] a3 x', `an explanation follows its message: ${key
 // automatic rounds. The preview drops Markdown and keeps one line.
 ok(foldDuration(0, 45_000) === '45 s' && foldDuration(0, 12 * 60_000) === '12 min' && foldDuration(0, 80 * 60_000) === '1 h 20 min', 'durations read naturally');
 ok(foldPreview('**PR #671** is repaired.\n\n- Merge: done') === 'PR #671 is repaired.', 'the preview is the first line without Markdown');
-const head = conversationFoldHead(conversationOutline(templates)[3]);
+const head = conversationFoldHead(conversationOutline(templates)[7]);
 ok(head.includes('2 automatic follow-ups') && head.includes('requested landing again'), `the repairs line says how many and where things stand: ${head}`);
-ok(conversationFoldHead(conversationOutline(templates)[1]).includes('Worked'), 'a work fold says how long the agent worked');
+ok(conversationFoldHead(conversationOutline(templates)[3]).includes('Worked'), 'a work fold says how long the agent worked');
 
 console.log(`conversation-outline: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

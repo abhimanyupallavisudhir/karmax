@@ -4,7 +4,7 @@ import { TerminatedFailure } from '@temporalio/common';
 import { Store } from '../store/db.js';
 import { TaskView, TaskRecord } from '../domain/types.js';
 import { withTimeout } from '../util/timeout.js';
-import { failureText } from '../domain/failure-text.js';
+import { innermostMessage } from '../domain/failure-text.js';
 import { notifyChildSettlement } from './child-settlement.js';
 
 const TERMINAL = ['done', 'failed', 'cancelled'];
@@ -157,8 +157,9 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
           } catch (error) {
             if (error instanceof WorkflowFailedError && error.cause instanceof TerminatedFailure)
               closeReason = `workflow terminated: ${error.cause.message}`;
+            // What failed it, not "workflow failed" (pramana#137: Hetzner's CPUs were full).
             else if (error instanceof WorkflowFailedError && error.cause)
-              closeReason = `workflow failed${failureText(error.cause)}`;
+              closeReason = `workflow failed: ${innermostMessage(error.cause)}`;
             // Diagnostics failure must not turn a known close into "lost".
           }
         }

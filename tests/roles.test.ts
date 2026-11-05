@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import { allRoles, roleDef, roleCeiling, manifest, agentMcpToConfig, WorkflowManifest } from '../src/contrib/manifests.js';
 import { applyAgentSpec, defaultModel, makeDefaultProfiles } from '../src/agent/profiles.js';
 import { assemblePrompt } from '../src/agent/prompt.js';
+import { PLATFORM_TOOL_SCHEMAS, TOOL_SCHEMAS } from '../src/agent/tools.js';
 import { GLOBAL_INSTRUCTIONS } from '../src/agent/instructions.js';
 import { autoResolve } from '../src/resolve/cases.js';
 import { allows } from '../src/platform/capabilities.js';
@@ -284,6 +285,10 @@ describe('prompt preamble (SPEC §5.4)', () => {
     expect(out).toMatch(/create_review_info.*optional/i);
     expect(out).toContain('limited to 280 characters');
     expect(out).toContain('Source code is not a human-readable output');
+    // Agents can ask with a form (web/markdown.js parseForm) instead of "reply A, B or C".
+    expect(out).toContain('a ```form fence holding JSON');
+    expect(out).toContain('{"label": "Which database?", "options": ["Postgres", "SQLite"]}');
+    expect(out).toContain('"value": "{{key}}"');
     expect(manifest('software-dev')!.promptPreamble).toBeUndefined();
   });
 
@@ -295,11 +300,28 @@ describe('prompt preamble (SPEC §5.4)', () => {
     expect(out).toContain('Your final response is posted in the conversation: answer there whatever you were just asked, even when you then pause.');
   });
 
+  // #797: told only to "use connected apps", agents with nothing in list_connections
+  // reported "I don't have access to your Gmail" instead of asking for it.
+  it('tells agents to request an app account they lack instead of reporting no access', () => {
+    const out = assemblePrompt({ profile: profile(), role: 'do', task: { ...task, workflow: 'software-dev' } as any, world });
+    expect(out).toContain("When the work needs an account list_connections doesn't show, request it instead of saying you lack access");
+    for (const tool of [...PLATFORM_TOOL_SCHEMAS, ...TOOL_SCHEMAS].filter((t) => t.name === 'request_connection'))
+      expect(tool.description).not.toContain('do not finish');
+    for (const tool of [...PLATFORM_TOOL_SCHEMAS, ...TOOL_SCHEMAS].filter((t) => t.name === 'list_connections'))
+      expect(tool.description).toContain('request_connection');
+  });
+
   it('repeats the optional, verification-only review guidance in global instructions', () => {
     expect(GLOBAL_INSTRUCTIONS).toMatch(/Review info is optional/i);
     expect(GLOBAL_INSTRUCTIONS).toContain('at most 280 characters');
     expect(GLOBAL_INSTRUCTIONS).toContain('Source code is not a human-readable output');
     expect(GLOBAL_INSTRUCTIONS).toMatch(/summaries of changes\/answers in your final response/i);
+    // Reviewers often judge the work from the review info alone, and open targets
+    // are snapshotted when attached, so agents must re-attach after later edits.
+    expect(GLOBAL_INSTRUCTIONS).toContain('Reviewers often judge the work from the review info alone');
+    expect(GLOBAL_INSTRUCTIONS).toMatch(/call create_review_info again/);
+    for (const tool of [...PLATFORM_TOOL_SCHEMAS, ...TOOL_SCHEMAS].filter((t) => t.name === 'create_review_info'))
+      expect(tool.description).toMatch(/snapshot.*call (it )?again/is);
   });
 
   it('steers agents to MCP connections and the wiki in global instructions', () => {

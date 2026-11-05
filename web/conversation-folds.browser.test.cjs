@@ -1,6 +1,6 @@
 // Opening a task shows the message the agent wrote for you, not the landing
 // repairs that came after it: those fold into one line that says where things
-// stand. Full console shell, Chromium, deterministic local API fakes.
+// stand. What each earlier turn ended with stays readable above it. Full console shell, Chromium, deterministic local API fakes.
 // Run: node web/conversation-folds.browser.test.cjs
 const assert = require('node:assert/strict');
 const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console.cjs');
@@ -52,14 +52,15 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.equal(landed.key, 'message:a5', 'the report is what the page lands on');
     assert.ok(landed.top >= 0 && landed.top < 40 && landed.scrolled, `the report's first line is at the top of the view (${landed.top}px)`);
 
-    // The work before it and the repairs after it are one line each.
+    // What each turn ended with stays; tavya's prompts between them and the
+    // repairs after the report are one line each.
     const folds = thread.locator('details.conv-fold');
-    assert.equal(await folds.count(), 2, 'the work and the repairs fold');
-    const repairs = folds.nth(1);
+    assert.equal(await folds.count(), 3, 'the resumes and the repairs fold');
+    const repairs = folds.nth(2);
     assert.match(await repairs.locator('summary').innerText(), /1 automatic follow-up.*The branch now merges cleanly with the newest master/s,
       'the repairs line says how many and where things stand, without Markdown');
     assert.equal(await thread.getByText('Merged master; the tests').isVisible(), false, 'the repair chatter is folded away');
-    assert.equal(await thread.getByText('Moving to a larger machine.').isVisible(), false, 'progress notes are folded away');
+    assert.equal(await thread.getByText('Moving to a larger machine.').isVisible(), true, 'what a turn ended with is said to the person');
 
     // Opened, tavya's prompt is labelled as tavya's, not as yours.
     // What the reader opened must not depend on when the browser delivers the
@@ -75,8 +76,8 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     sockets.at(-1).send(JSON.stringify({ seq: 50, type: 'agent.activity', taskId: 't', projectId: 'p', ts: Date.now(),
       payload: { role: 'do', turnId: 'turn-9', attempt: 1, id: 'cmd', kind: 'command', phase: 'completed', title: 'gh pr checks 669' } }));
     await thread.getByText('gh pr checks 669').waitFor();
-    assert.equal(await thread.locator('details.conv-fold').nth(1).evaluate((d) => d.open), true, 'an opened fold stays open as it grows');
-    assert.equal(await thread.locator('details.conv-fold').count(), 2, 'the new step joins the repairs fold');
+    assert.equal(await thread.locator('details.conv-fold').nth(2).evaluate((d) => d.open), true, 'an opened fold stays open as it grows');
+    assert.equal(await thread.locator('details.conv-fold').count(), 3, 'the new step joins the repairs fold');
     assert.deepEqual(errors, []);
     console.log('conversation-folds: ok');
   } finally {

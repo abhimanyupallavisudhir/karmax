@@ -74,13 +74,13 @@ describe('managed compute API', () => {
   it('lets an operator connect, test and disable an account, never showing its key', async () => {
     expect((await call(tokenFor.tenantOwner!, 'PUT', '/api/settings/managed-compute/e2b', { apiKey: 'stolen' })).status).toBe(403);
     expect((await call(tokenFor.reader!, 'PUT', '/api/settings/managed-compute/e2b', { apiKey: 'nope' })).status).toBe(403);
-    const saved = await call(tokenFor.operator!, 'PUT', '/api/settings/managed-compute/e2b', { apiKey: 'operator-secret', config: { maxRunning: 20 } });
+    const saved = await call(tokenFor.operator!, 'PUT', '/api/settings/managed-compute/e2b', { apiKey: 'operator-secret', config: { limits: { pool: { machines: 20 } }, share: 40 } });
     expect(saved.status).toBe(200);
     expect(JSON.stringify(await saved.json())).not.toContain('operator-secret');
     expect((await call(tokenFor.operator!, 'POST', '/api/settings/managed-compute/e2b/test')).status).toBe(200);
     const listed = await (await call(tokenFor.reader!, 'GET', '/api/settings/managed-compute')).json();
-    expect(listed).toMatchObject({ multiplier: 2, providers: [{ provider: 'e2b', enabled: true, status: 'ready', running: 0,
-      config: { maxRunning: 20 }, limits: { cpu: 8 }, costMicros: 0, chargedMicros: 0 }] });
+    expect(listed).toMatchObject({ multiplier: 2, providers: [{ provider: 'e2b', enabled: true, status: 'ready', running: 0, runningCpus: 0,
+      config: { limits: { pool: { machines: 20 } }, share: 40 }, limits: { cpu: 8, pool: { machines: 20 } }, costMicros: 0, chargedMicros: 0 }] });
     expect(JSON.stringify(listed)).not.toContain('operator-secret');
     expect((await call(tokenFor.tenantOwner!, 'GET', '/api/settings/managed-compute')).status).toBe(403);
     // No organization path reaches the installation's accounts, whatever the caller's authority.
@@ -94,7 +94,7 @@ describe('managed compute API', () => {
   it('shows an organization the provider and its compute against the credit, not the account', async () => {
     const providers = await (await call(tokenFor.tenantOwner!, 'GET', `/api/organizations/${organizationId}/world-providers`)).json();
     expect(providers).toEqual([expect.objectContaining({ provider: 'e2b', managed: true })]);
-    expect(JSON.stringify(providers)).not.toMatch(/maxRunning|operator-secret/);
+    expect(JSON.stringify(providers)).not.toMatch(/maxRunning|"pool"|"share"|operator-secret/);
     await store.recordUsage({ id: 'usage:e2b:x', organizationId, provider: 'e2b', kind: 'world.active', quantity: 3600, unit: 'second',
       costMicros: 1_000_000, startedAt: inThisMonth(Date.now() - 3_700_000), endedAt: inThisMonth(Date.now() - 100_000), fundingSource: 'managed' });
     const entitlements = await (await call(tokenFor.tenantOwner!, 'GET', `/api/organizations/${organizationId}/entitlements`)).json();
@@ -107,5 +107,27 @@ describe('managed compute API', () => {
     expect(await (await call(tokenFor.tenantOwner!, 'GET', `/api/organizations/${organizationId}/world-providers`)).json()).toEqual([]);
     expect(((await (await call(tokenFor.tenantOwner!, 'GET', `/api/organizations/${organizationId}/entitlements`)).json()) as { compute: unknown }).compute).toBeNull();
     expect((await call(tokenFor.operator!, 'DELETE', '/api/settings/managed-compute/e2b')).status).toBe(200);
+  });
+
+  // An organization that moved to managed compute must be able to delete its own
+  // connection: only the current generation of a world its own account still runs
+  // counts, not superseded generations nor worlds made on managed compute.
+  it('refuses to delete an own connection only while a current own world uses it', async () => {
+    expect((await call(tokenFor.tenantOwner!, 'PUT', `/api/organizations/${organizationId}/world-providers/e2b`, { apiKey: 'own' })).status).toBe(200);
+    const project = await store.createProject('Worlds', {}, organizationId);
+    const task = (title: string) => store.createTask({ projectId: project.id, title, workflow: 'software-dev', workflowVersion: '1.26.0', params: { prompt: title } });
+    const world = async (meta: Record<string, unknown> = {}) =>
+      store.registerWorld({ id: (await task('w')).id, kind: 'e2b', root: '/workspace', branch: 'task', base: 'main', meta } as any, project.id);
+    const replaced = await world();
+    await store.setWorldState(await store.registerWorld({ ...replaced, generation: undefined }, project.id), 'hibernated');
+    await world({ funding: 'managed' });
+    const own = await store.registerWorld({ ...(await world()), generation: undefined }, project.id);
+    const refused = await call(tokenFor.tenantOwner!, 'DELETE', `/api/organizations/${organizationId}/world-providers/e2b`);
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toEqual({ error: '1 task world(s) still use e2b; finish or delete them first' });
+    await store.setWorldState(own, 'released');
+    const deleted = await call(tokenFor.tenantOwner!, 'DELETE', `/api/organizations/${organizationId}/world-providers/e2b`);
+    expect(deleted.status).toBe(200);
+    expect(await deleted.json()).toEqual({ deleted: true });
   });
 });

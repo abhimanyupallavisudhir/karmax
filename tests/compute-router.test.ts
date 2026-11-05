@@ -11,6 +11,7 @@ import { Store } from '../src/store/db.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { MANAGED_COMPUTE, WorldProviderConnectionService } from '../src/world/connections.js';
+import { waiters } from '../src/world/compute-queue.js';
 import { ComputeRouter, FULL_MEMORY_MS, computeNeeds, rankComputeOptions, type ComputeOption } from '../src/world/compute-router.js';
 import { ComputeCreditExhausted, ManagedComputeBusy } from '../src/world/managed-compute.js';
 import { ProviderCapacityFull, ProviderOutage } from '../src/agent/limits.js';
@@ -132,9 +133,9 @@ async function fixture(options: { hosted?: boolean; plan?: string } = {}) {
 describe('the accounts Any can reach', () => {
   it('offers the organization\'s own accounts and the managed compute it may use, never both for one provider', async () => {
     const f = await fixture({ plan: 'team' });
-    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'hetzner', apiKey: 'h', config: { maxRunning: 4, region: 'fsn1',
+    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'hetzner', apiKey: 'h', config: { region: 'fsn1',
       limits: { cpu: 4, memoryMb: 8192, diskGb: 200 } } });
-    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'aws', apiKey: 'AKIA1234567890ABCDEF:secretvalue', config: { maxRunning: 24 } });
+    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'aws', apiKey: 'AKIA1234567890ABCDEF:secretvalue', config: {} });
     await f.connections.save({ organizationId: f.organization.id, provider: 'aws', apiKey: 'AKIAOWNX4567890ABCD:ownsecret' });
     const options = await f.router.options(f.organization.id);
     expect(options.map((value) => `${value.provider}:${value.funding}:${value.region}`).sort()).toEqual(['aws:own:eu', 'hetzner:managed:eu']);
@@ -169,7 +170,7 @@ describe('the accounts Any can reach', () => {
 
   it('knows managed compute is full or out of credit, and remembers a provider\'s refusal for a while', async () => {
     const f = await fixture({ plan: 'free' });
-    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'gcp', apiKey: JSON.stringify(fakeServiceAccount()), config: { maxRunning: 1 } });
+    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'gcp', apiKey: JSON.stringify(fakeServiceAccount()), config: {} });
     await f.connections.save({ organizationId: f.organization.id, provider: 'e2b', apiKey: 'own' });
     await f.store.setWorldProviderConnectionStatus(f.organization.id, 'e2b', 'error', 'bad key');
     let options = await f.router.options(f.organization.id);
@@ -191,7 +192,7 @@ describe('a CPU quota shared by an account\'s machines', () => {
   it('counts the CPUs already running on it, across organizations for managed compute', async () => {
     const f = await fixture({ plan: 'team' });
     await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'gcp', apiKey: JSON.stringify(fakeServiceAccount()),
-      config: { maxRunning: 10, limits: { cpu: 8, memoryMb: 32_768, diskGb: 1024 } } });
+      config: { limits: { cpu: 8, memoryMb: 32_768, diskGb: 1024 } } });
     // What the account said: the lowest of E2_CPUS 24, CPUS 200 and CPUS_ALL_REGIONS 100.
     await f.store.setWorldProviderConnectionLimits(MANAGED_COMPUTE, 'gcp', { cpu: 24, pool: { cpu: 24 }, checkedAt: Date.now() });
     const other = await f.store.createOrganization({ name: 'Other', ownerUserId: 'other' });
@@ -382,6 +383,26 @@ describe('createWorld with provider "Any"', () => {
     expect(failure).toMatchObject({ type: 'world-capacity', message: 'AWS: VcpuLimitExceeded' });
     expect(a.hetzner.made).toEqual([]);
     expect(await a.events(taskId, 'world.routed')).toEqual([]);
+  });
+
+  // The queue (wiki features/managed-compute § Queue): every account that had
+  // no room for the task keeps its place; a machine takes it off.
+  it('puts a task in line at each account that refused it, and takes it off once it has a machine', async () => {
+    const a = await activities();
+    a.hetzner.full = 'Hetzner: the CPU limit is full';
+    a.aws.full = 'AWS: VcpuLimitExceeded';
+    const routed = await a.task('Any');
+    await a.core.createWorld({ taskId: routed, base: 'main', kind: ANY_PROVIDER }).catch(() => undefined);
+    expect(Object.keys((await waiters(a.store)).find((value) => value.taskId === routed)?.accounts ?? {}).sort())
+      .toEqual(['installation:aws', 'installation:hetzner']);
+    const pinned = await a.task('Pinned', { provider: 'aws' });
+    await a.core.createWorld({ taskId: pinned, base: 'main', kind: 'aws' }).catch(() => undefined);
+    expect((await waiters(a.store)).find((value) => value.taskId === pinned)?.accounts).toHaveProperty(['installation:aws']);
+    a.aws.full = undefined;
+    // The routed one waited first: the pinned one does not pass it.
+    expect((await a.core.createWorld({ taskId: routed, base: 'main', kind: ANY_PROVIDER })).kind).toBe('aws');
+    expect((await a.core.createWorld({ taskId: pinned, base: 'main', kind: 'aws' })).kind).toBe('aws');
+    expect(await waiters(a.store)).toEqual([]);
   });
 
   // A workflow passes the provider its task had when it started. A task that

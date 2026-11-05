@@ -19,7 +19,7 @@ const html = fs.readFileSync(path.join(webDir, 'index.html'), 'utf8');
 function handlerAfter(anchor: string): string {
   const at = app.indexOf(anchor);
   expect(at, `anchor not found: ${anchor}`).toBeGreaterThan(-1);
-  return app.slice(at, at + 1600);
+  return app.slice(at, at + 2000);
 }
 
 describe('toasts are reachable', () => {
@@ -156,15 +156,14 @@ describe('forms report their failures', () => {
   });
 });
 
-describe('draft workflow selection', () => {
-  it('keeps the selector editable and changes the existing draft in place', () => {
-    expect(app).toContain('const workflowEditable = !draft || !!draft.params?.draft;');
-    expect(app).toContain("${workflowEditable ? '' : 'disabled'}");
-    const handler = handlerAfter("$('#tf-wf')?.addEventListener('change'");
-    expect(handler).toContain('persistDraft(st)');
-    expect(handler).toContain("method: 'PATCH'");
-    expect(handler).toContain('/workflow`');
-    expect(handler).not.toContain("method: 'DELETE'");
+describe('workflow choice', () => {
+  // Goal is retired (an agent Reviewer covers it), leaving one workflow to
+  // start: no picker in the task form and no workflow named on the task page.
+  it('offers no workflow picker and names no workflow on the task page', () => {
+    const workflows = new Function(`${app.slice(app.indexOf('const WORKFLOWS ='), app.indexOf('const workflowLabel ='))}; return WORKFLOWS;`)() as { id: string }[];
+    expect(workflows.map((w) => w.id)).toEqual(['software-dev']);
+    for (const gone of ['id="tf-wf"', "$('#tf-wf')", 'tp-workflow-mode', 'function workflowSection(', 'function wireWorkflowMode(', 'Goal (auto-run)', 'Goal mode enabled'])
+      expect(app).not.toContain(gone);
   });
 });
 

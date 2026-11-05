@@ -40,10 +40,13 @@ vm.runInContext(
     extractFunction('patchTaskListFromEvent'),
     extractFunction('pendingCancellationView'),
     extractFunction('waitingLabel'),
+    extractFunction('accountWaitReason'),
     extractFunction('waitingText'),
     extractFunction('waitDeadline'),
     extractFunction('presenceDetail'),
     extractConst('ACCOUNT_PROVIDER_LABELS'),
+    extractFunction('storageFull'),
+    extractFunction('setupFixes'),
     extractFunction('setupFix'),
     extractFunction('setupFixHtml'),
     extractFunction('conversationWaitNotice'),
@@ -107,13 +110,14 @@ describe('waiting labels in task summaries', () => {
       status: 'waiting',
       state: {},
       waitingFor: { kind: 'account', provider: 'claude', detail: 'Every allowed credential needs attention — sign in again or add one' },
-    })).toBe('Waiting for credential');
+    })).toBe('Needs a Claude login');
+    const reset = Date.now() + 60_000;
     expect(stageLabel({
       stage: 'do',
       status: 'waiting',
       state: {},
-      waitingFor: { kind: 'account', provider: 'codex', earliestResetAt: Date.now() + 60_000 },
-    })).toBe('Waiting for quota');
+      waitingFor: { kind: 'account', provider: 'codex', earliestResetAt: reset },
+    })).toBe(`Waiting for Codex quota until ${waitDeadline(reset)}`);
     expect(stageLabel({
       stage: 'do',
       status: 'waiting',
@@ -252,6 +256,28 @@ describe('waiting labels in task summaries', () => {
     }
   });
 
+  // "Waiting for credential" once covered every login wait, including turns the
+  // quota scheduler had found no quota for while the login itself looked free.
+  it('names why a turn waits for a model login, and whose', () => {
+    const reset = Date.now() + 3_600_000;
+    const label = (waitingFor: Record<string, unknown>) => waitingText({ kind: 'account', provider: 'claude', ...waitingFor });
+    expect(label({ reason: 'quota', earliestResetAt: reset })).toBe(`Waiting for Claude quota until ${waitDeadline(reset)}`);
+    expect(label({ reason: 'quota' })).toBe('Waiting for Claude quota');
+    expect(waitingText({ kind: 'account', provider: 'codex', reason: 'quota' })).toBe('Waiting for Codex quota');
+    expect(label({ reason: 'held', until: reset })).toBe(`Held for higher-priority work until ${waitDeadline(reset)}`);
+    expect(label({ reason: 'slot' })).toBe('Waiting for a free Claude login');
+    expect(label({ reason: 'planning' })).toBe('Queued for Claude');
+    expect(label({ reason: 'login', detail: 'No claude credential — add one, or stop this agent' })).toBe('Needs a Claude login');
+    // Views published before the coordinator gave a reason read it from their detail.
+    expect(label({ detail: 'Held for higher-priority work' })).toBe('Held for higher-priority work');
+    expect(label({ detail: 'Waiting for a free slot on an allowed account' })).toBe('Waiting for a free Claude login');
+    expect(label({ detail: 'Provider usage limit reached; the task resumes automatically when quota resets' })).toBe('Waiting for Claude quota');
+    expect(label({})).toBe('Waiting for Claude');
+    expect(waitingText({ kind: 'account' })).toBe('Waiting for a model login');
+    for (const reason of ['quota', 'held', 'slot', 'planning', 'login', undefined])
+      expect(label({ reason })).not.toMatch(/credential/i);
+  });
+
   it('keeps an actionable admission failure in the conversation', () => {
     expect(conversationWaitNotice({
       agentTurn: { state: 'waiting-slot' },
@@ -260,7 +286,13 @@ describe('waiting labels in task summaries', () => {
         detail: 'Free allows 1 organization user, but this organization has 2.',
       },
     })).toContain('Free allows 1 organization user, but this organization has 2.');
-    expect(conversationWaitNotice({ waitingFor: { kind: 'account', earliestResetAt: 5 } })).toContain('Earliest at 5');
+    // A wait for quota says what it waits for and until when, once.
+    const reset = Date.now() + 3_600_000;
+    expect(conversationWaitNotice({ waitingFor: { kind: 'account', provider: 'claude', reason: 'quota', earliestResetAt: reset,
+      detail: 'Out of quota until a login resets' } })).toBe(`<div class="msg system wait-notice" role="status">Waiting for Claude quota until ${waitDeadline(reset)}</div>`);
+    // A login that needs a person keeps its explanation.
+    expect(conversationWaitNotice({ waitingFor: { kind: 'account', provider: 'claude', reason: 'login',
+      detail: 'Every allowed credential needs attention — sign in again or add one' } })).toContain('sign in again');
     // A plain wait says nothing beyond the header's label.
     expect(conversationWaitNotice({ agentTurn: { state: 'waiting-slot' }, waitingFor: { kind: 'agentSlot' } })).toBe('');
     expect(conversationWaitNotice({ agentTurn: { state: 'running' } })).toBe('');

@@ -40,7 +40,7 @@ import {
   participantLabel, participantRole, reviewerKey, selectorAgent,
 } from '../domain/participants.js';
 import { resetAtFromHint } from '../agent/limits.js';
-import { failureText } from '../domain/failure-text.js';
+import { innermostMessage } from '../domain/failure-text.js';
 import { isCapacityFailure, isInfraFailure, limitFailureClassification, CAPACITY_WAIT_MS, CAPACITY_WAIT_LIMIT_MS, INFRA_BACKOFF_MS, WORLD_WAIT_MS, WORLD_WAIT_LIMIT_MS } from './failures.js';
 import {
   TaskInput,
@@ -379,6 +379,10 @@ const SEVERAL_BRANCHES_DATA_REVIEW = 'several-branches-data-review-v1';
 /** A sub-task whose parent world cannot be reached is waited out, then a
  * person's, never the asking agent's (pramana#39/#43). */
 const SUBTASK_PREPARE_WAITS_FOR_WORLD = 'software-dev-subtask-prepare-waits-for-world-v1';
+/** The save before sub-tasks start, and a pull request's move to its new
+ * head, wait for a machine the provider cannot start yet, as resource work
+ * does, instead of failing the task (pramana#137: Hetzner's CPUs were full). */
+const WORLD_REOPENS_WAIT = 'software-dev-world-reopens-wait-v1';
 /** A message that comes while Review sets up returns to the agent before
  * Review waits on anyone. Setup used to publish a wait, which parked the world
  * first, and its message started nothing until the park ended (legibench3 #20). */
@@ -4129,18 +4133,20 @@ Inspect the complete current diff and specifically compare its delta from the re
         if (pendingHead && world) {
           const head = pendingHead;
           pendingHead = undefined;
+          const move = () => core.movePullRequest(world as WorldHandle, head);
           if (patched(PR_MOVE_FAILURE_TO_AGENT)) {
             // A head this pull request cannot take is its task's agent's to fix,
             // not the end of it (pramana#137's): it stays at its last commit.
-            const moved = await core.movePullRequest(world as WorldHandle, head).then(() => true, async (err) => {
+            // A machine the provider cannot start yet is waited for first.
+            const moved = await waitingForWorld(move).then(() => true, async (err) => {
               if (isCancellation(err)) throw err;
               if (input.parentTaskId) await getExternalWorkflowHandle(input.parentTaskId).signal(pullRequestNoticeSignal,
-                { childTaskId: taskId, kind: 'needs-work', text: `It could not be updated to ${head.slice(0, 8)}: ${innermostMessage(err).trim().replace(/\.?$/, '.')} It is still at its previous commit.` })
+                { childTaskId: taskId, kind: 'needs-work', text: `It could not be updated to ${head.slice(0, 8)}: ${innermostMessage(err).replace(/\.?$/, '.')} It is still at its previous commit.` })
                 .catch(() => undefined);
               return false;
             });
             if (!moved) { prRequested = false; continue; }
-          } else await core.movePullRequest(world as WorldHandle, head);
+          } else await (patched(WORLD_REOPENS_WAIT) ? waitingForWorld(move) : move());
         }
         seen = msgs.length;
         return { completed: true, providerCompleted: true, output: '', openPrRequested: true };
@@ -4165,21 +4171,34 @@ Inspect the complete current diff and specifically compare its delta from the re
    *  the top. Commit-on-spawn snapshots our work first (worktrees share commits, not the
    *  dirty tree) so children fork the current state. */
   async function spawnSubTasks(list: SpawnRequest[], requester = MAIN_AGENT) {
-    const snapshot = `tavya: snapshot before sub-tasks for ${taskId}`;
-    // Committing every checkout takes as long as git walks them, minutes with
-    // a large data tree; a snapshot that cannot be made is the asking agent's,
-    // not the end of this task (pramana#137: 3 × 5 minutes, then "workflow failed").
+    const message = `tavya: snapshot before sub-tasks for ${taskId}`;
+    const snapshot = () => core.commitWork(world as any, message);
     if (list.length && patched(SUBTASK_SNAPSHOT_TO_AGENT)) {
+      // Committing every checkout takes as long as git walks them, minutes with
+      // a large data tree: it heartbeats instead of a 5-minute limit. A machine
+      // the provider cannot start yet is waited for (Hetzner's CPUs were full);
+      // a snapshot still impossible is the asking agent's, or a person's Retry
+      // for a world that stays unreachable, never the end of this task
+      // (pramana#137: 3 × 5 minutes, then "workflow failed").
       preparingSubTask = true;
       await publish();
-      try { await prepareSubTask(list[0]!, () => childPreparation.commitWork(world as any, snapshot)); }
+      try { await waitingForWorld(() => childPreparation.commitWork(world as any, message)); }
       catch (err) {
         if (isCancellation(err)) throw err;
         preparingSubTask = false;
         await unpreparedSubTasks(list[0]!, list.slice(1), err, requester);
         return;
       } finally { preparingSubTask = false; }
-    } else await core.commitWork(world as any, snapshot);
+    } else if (!patched(WORLD_REOPENS_WAIT)) await snapshot();
+    else {
+      try { await waitingForWorld(snapshot); }
+      catch (err) {
+        // Still no machine after the waits: a person's Retry saves and creates them again.
+        if (!list.length || !isInfraFailure(err)) throw err;
+        await unpreparedSubTasks(list[0]!, list.slice(1), err, requester);
+        return;
+      }
+    }
     for (const [index, s] of list.entries()) {
       // Preserve recorded spawn/drop decisions during replay. New decisions have
       // no per-parent child cap; execution is governed by shared admission control.
@@ -6608,7 +6627,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     stage = 'failed';
     status = 'failed';
     waitingFor = undefined;
-    error = `workflow failed${failureText(e)}`;
+    error = `workflow failed: ${innermostMessage(e)}`;
     await publish().catch(() => undefined);
   }
 
@@ -6711,19 +6730,6 @@ function conflictGuide(err: any): string | undefined {
     if (typeof guide === 'string' && guide) return guide;
   }
   return undefined;
-}
-
-function innermostMessage(err: any): string {
-  let e: any = err;
-  let message = '';
-  for (let depth = 0; e && depth < 6; depth++) {
-    if (e.message) message = e.message;
-    // A world the provider cannot start says so in people's words; what is
-    // under it is the provider's raw answer (pramana#79: Hetzner's JSON).
-    if (e.type === 'world-infra' || e.type === 'world-capacity') break;
-    e = e.cause;
-  }
-  return message || String(err);
 }
 
 function describeError(err: any): string {

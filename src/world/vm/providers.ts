@@ -7,7 +7,7 @@ import { HetznerDriver } from '../hetzner.js';
 import { providerName } from '../connections.js';
 import { VmWorldProvider, type VmUsageLedger } from './provider.js';
 
-type Resolver = (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>;
+type Resolver = (organizationId: string | undefined, provider: string, options?: { new?: boolean }) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>;
 
 /** Without an organization connection (self-hosted, tests): the installation's environment key. */
 function environmentResolver(variable: string, config: () => ResolvedWorldProviderConnection['config']): Resolver {

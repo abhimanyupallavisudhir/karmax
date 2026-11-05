@@ -1,6 +1,6 @@
 # How it works
 
-The few ideas behind tavya, each in a paragraph.
+The few ideas behind tavya — organizations, projects, tasks, agents, worlds, the wiki and authorization — each in a paragraph.
 
 ## Organizations and projects
 

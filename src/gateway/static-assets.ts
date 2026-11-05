@@ -5,6 +5,7 @@ import zlib from 'node:zlib';
 import { promisify } from 'node:util';
 import type http from 'node:http';
 import { MIME } from '../store/artifact-mime.js';
+import { artifactEdgeOrigin } from './artifact-urls.js';
 
 /**
  * The console has no build step, so the gateway itself is its asset server:
@@ -32,29 +33,33 @@ export const MATHJAX_SCRIPT_SOURCE = 'https://cdn.jsdelivr.net/npm/mathjax@3.2.2
  *  Agent-authored documents (review HTML, HTML artifacts) are separate responses
  *  with their own sandbox policy, because a srcdoc or blob: document would
  *  inherit this one. */
-export function consoleContentSecurityPolicy(host?: string): string {
+export function consoleContentSecurityPolicy(host?: string, edge = artifactEdgeOrigin()): string {
   // Older Safari does not match ws: or wss: against 'self', so the console's
   // own socket is named (ws: only ever loads from a plain-http install; https
   // pages refuse it as mixed content). The Host header is the requester's to
   // choose, so only a bare host[:port] is trusted into the policy.
   const socket = host && /^(?:[a-z0-9.-]+|\[[0-9a-f:.]+\])(?::\d{1,5})?$/i.test(host) ? ` wss://${host} ws://${host}` : '';
+  // Saved Review files come from the artifact edge, another origin: the viewer
+  // plays, frames and (for text) reads them from there.
+  const files = edge ? ` ${edge}` : '';
   return [
     "default-src 'self'",
     // Without KARMAX_PREVIEW_ORIGIN, live previews are served under /preview/ on
     // this origin, so their scripts count as 'self'; set it to contain them.
     `script-src 'self' ${MATHJAX_SCRIPT_SOURCE}`,
-    `connect-src 'self'${socket}`,
+    `connect-src 'self'${socket}${files}`,
     // The console and MathJax style elements directly; styles cannot run script.
     "style-src 'self' 'unsafe-inline'",
     // Profile pictures come from the sign-in provider; previews are blob: URLs.
     "img-src 'self' data: blob: https:",
-    "media-src 'self' blob:",
+    `media-src 'self' blob:${files}`,
     // A PDF artifact opens as a blob: document, which inherits this policy.
     'object-src blob:',
     // qr-scanner decodes in a worker built from a blob; older Safari reads
     // child-src for workers and ignores worker-src.
     "worker-src 'self' blob:",
     "child-src 'self' blob:",
+    `frame-src 'self' blob:${files}`,
     "base-uri 'none'",
     // Creating the shared GitHub App posts its manifest to GitHub.
     "form-action 'self' https://github.com",
@@ -171,18 +176,21 @@ export function unpublishedAsset(file: string): boolean {
 /**
  * Serve one console asset. `transform` rewrites the body per request (the
  * installation's name in the HTML shell); validators always describe the bytes
- * actually sent, and each encoding has its own (RFC 9110 §8.8.3).
+ * actually sent, and each encoding has its own (RFC 9110 §8.8.3). `status`
+ * and `headers` answer for the URL rather than the file (a public page that
+ * does not exist, its canonical URL, whether to index it).
  */
 export async function serveStaticAsset(
   req: http.IncomingMessage | undefined,
   res: http.ServerResponse,
   file: string,
   transform?: (data: Buffer) => Buffer | Promise<Buffer>,
+  { status = 200, headers: extra = {} }: { status?: number; headers?: Record<string, string> } = {},
 ): Promise<void> {
   const source = await readFile(file);
   const data = transform ? await transform(source.data) : source.data;
   const revision = transform ? revisionOf(data) : source.revision;
-  const headers = staticAssetHeaders(file, req?.headers.host);
+  const headers = { ...staticAssetHeaders(file, req?.headers.host), ...extra };
   const compressible = COMPRESSIBLE.has(path.extname(file)) && data.length >= MIN_COMPRESS_BYTES;
   const encoding = compressible ? preferredEncoding(req?.headers['accept-encoding']) : undefined;
   if (compressible) headers.vary = 'accept-encoding';
@@ -191,13 +199,13 @@ export async function serveStaticAsset(
   const matches = String(req?.headers['if-none-match'] ?? '')
     .split(',').map((tag) => tag.trim().replace(/^W\//, ''))
     .some((tag) => tag === etag || tag === '*');
-  if (matches) {
+  if (matches && status === 200) {
     res.writeHead(304, headers);
     return void res.end();
   }
   const body = encoding ? await encode(data, revision, encoding) : data;
   if (encoding) headers['content-encoding'] = encoding;
   headers['content-length'] = String(body.length);
-  res.writeHead(200, headers);
+  res.writeHead(status, headers);
   res.end(req?.method === 'HEAD' ? undefined : body);
 }

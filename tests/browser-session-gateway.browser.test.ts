@@ -89,7 +89,7 @@ it('saves a site\'s session from one task and signs another task in after approv
     vi.spyOn(taskBrowser, 'localTaskBrowserUrl').mockImplementation(() => devtools);
     const tokens = new TokenAuthority();
     const gateway = await Gateway.create({ store, broker, bus: new KarmaxBus(), tokens,
-      contributions: new ContributionRegistry(), overlays: new Overlays(), client: {} as any, api: {} as any,
+      contributions: new ContributionRegistry(), overlays: new Overlays(), client: {} as any, api: { viaParent: async () => undefined, tellParentOf: async () => undefined } as any,
       taskQueue: 'test', staticDir: dir, agentInfo: { provider: 'mock', reason: 'session test' }, worlds: new WorldRegistry(),
     } as any);
     const running = await gateway.listen(await findFreePortFrom(48_600));

@@ -33,7 +33,7 @@ global.taskRecord = () => undefined;
 global.projectById = (id) => id === 'project_1' ? { id, name: 'App' } : undefined;
 global.projectBase = () => '/personal/app';
 
-for (const name of ['policyTip', 'credentialRequestTaskLink', 'credentialRequestRows', 'requestReasonLine', 'permissionRequestRows', 'ignoredChip', 'ignoreRequestButton', 'defaultTaskTab']) eval(extractFn(name));
+for (const name of ['policyTip', 'credentialRequestTaskLink', 'credentialRequestRows', 'requestReasonLine', 'subTaskAskLine', 'permissionRequestRows', 'ignoredChip', 'ignoreRequestButton', 'defaultTaskTab']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
@@ -90,6 +90,14 @@ ok(scopeRows.includes('Existing permissions for all task roles apply there too')
 
 ok(defaultTaskTab({ approvalRequests: 1, actions: [] }) === 'checkin', 'a task needing approval opens its conversation, where the request waits');
 ok(defaultTaskTab({ approvalRequests: 0, actions: [{ name: 'confirm', enabled: true }] }) === 'checkin', 'review-only tasks retain the Check-in default');
+// A sub-task's request names the parent it came through, and the note its agent added.
+const via = credentialRequestRows([{ ...request, via: { taskId: 'task_lead', at: 1 } }], [{ id: 'vi_1', label: 'Example login' }]);
+ok(via.includes('Via') && via.includes('task_lead'), 'a sub-task request names the parent it came via');
+const noted = credentialRequestRows([{ ...request, audience: ['user:ann'], via: { taskId: 'task_lead', note: 'Billing needs <our> login', at: 1 } }],
+  [{ id: 'vi_1', label: 'Example login' }]);
+ok(noted.includes('Billing needs &lt;our&gt; login'), 'the parent\'s note shows, escaped');
+ok(!rows.includes('Via '), 'a top-level task request names no parent');
+
 ok(defaultTaskTab({ approvalRequests: 0, actions: [] }) === 'checkin', 'tasks open on Check-in by default');
 ok(defaultTaskTab({ approvalRequests: 0, actions: [], state: { draft: true } }) === 'parameters', 'drafts open on their parameters');
 

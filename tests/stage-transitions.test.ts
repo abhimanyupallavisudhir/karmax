@@ -311,6 +311,17 @@ describe('task stage transitions', () => {
     ]);
   });
 
+  it('marks a notice that wakes an agent whose work waits in Review as returning work', async () => {
+    const f = (await fixture());
+    f.signalled.length = 0;
+    await f.api.resumeAfterCredentialDecision(f.task.id, 'Access granted');
+    (await f.store.saveView(f.task.id, { ...f.view, stage: 'review', status: 'waiting', updatedAt: 2 }));
+    await f.api.resumeAfterCredentialDecision(f.task.id, 'Access granted');
+    const [working, reviewed] = f.signalled.map((s) => s.args[0] as any);
+    expect(working.returnsWork).toBeUndefined();
+    expect(reviewed).toMatchObject({ id: expect.stringMatching(/^n/), returnsWork: true });
+  });
+
   it('preserves parameter edits accepted while a replacement start is awaiting acknowledgement', async () => {
     const f = (await fixture());
     vi.spyOn(f.client.workflow, 'start').mockImplementation(async () => {
@@ -1453,11 +1464,11 @@ describe('task stage transitions', () => {
       .toMatchObject({ userId: `task-agent:${f.task.id}:do`, satisfied: true });
     // Re-routing who reviews follows the same rule.
     await expect(f.api.updateParams((await agent(['task:*'])), f.task.id, { confirm: { layers: [] } })).rejects.toThrow(/review:approve/);
-    // So does switching to Goal, which has no Review gate at all (WF-7).
-    await expect(f.api.changeWorkflow((await agent(['task:*'])), f.task.id, 'goal')).rejects.toThrow(/review:approve/);
+    // Goal, which had no Review gate at all (WF-7), is retired: no authority switches a task to it.
+    for (const caps of [['task:*'], ['task:*', 'review:approve']])
+      await expect(f.api.changeWorkflow((await agent(caps)), f.task.id, 'goal')).rejects.toThrow(/Goal is retired/);
     expect((await f.store.getTask(f.task.id))?.workflow).not.toBe('goal');
     await expect(f.api.changeWorkflow((await agent(['task:*'])), f.task.id, 'software-dev')).resolves.toBeTruthy();
-    await expect(f.api.changeWorkflow((await agent(['task:*', 'review:approve'])), f.task.id, 'goal')).resolves.toBeTruthy();
   });
 
   /** PL-1: an agent stands in for the human it acts for, never for more. */
@@ -1670,23 +1681,20 @@ describe('task stage transitions', () => {
     (await f.store.close());
   });
 
-  it('resumes a held Do task when Goal mode supplies autonomous direction', async () => {
+  it('refuses to switch a held task to the retired Goal workflow', async () => {
     const f = (await fixture());
     (await f.store.saveView(f.task.id, {
       ...f.view,
       status: 'waiting',
       waitingFor: { kind: 'human', audience: ['@creator'] },
-      workflowOptions: ['software-dev', 'goal'],
-      workflowSwitchable: true,
       state: { ...f.view.state, humanPauseOrigin: 'do' },
     }));
+    const startsBefore = f.starts.length;
 
-    await f.api.changeWorkflow(f.token, f.task.id, 'goal');
+    await expect(f.api.changeWorkflow(f.token, f.task.id, 'goal')).rejects.toThrow(/Goal is retired.*agent Reviewer/);
 
-    expect(f.starts.at(-1)!.type).toBe(`goal@${bundledVersion('goal')}`);
-    expect(f.starts.at(-1)!.options.args[0]).toMatchObject({ recovery: { resumeStage: 'do' } });
-    expect(f.starts.at(-1)!.options.args[0].recovery.messages.at(-1).text).toMatch(/continue autonomously/i);
-    expect((await f.store.getTask(f.task.id))?.workflow).toBe('goal');
+    expect(f.starts).toHaveLength(startsBefore);
+    expect((await f.store.getTask(f.task.id))?.workflow).not.toBe('goal');
   });
 
   it('offers held Merge input only on the Merge conversation', async () => {

@@ -23,6 +23,8 @@ it.each([true, false])('resolves approvals and resource decisions inside the rea
       if (url.pathname === '/') return route.fulfill({ contentType: 'text/html', body: '<div id="main"><div id="app"></div><div id="tp-foot"></div></div>' });
       if (url.pathname.startsWith('/fonts/')) return route.fulfill({ body: fs.readFileSync(`web${url.pathname}`) });
       if (url.pathname === '/state') return route.fulfill({ json: state });
+      // A decision refreshes the lists, and with them the sidebar's For me counts.
+      if (url.searchParams.get('countBy') === 'project') return route.fulfill({ json: { total: 0, counts: {} } });
       if (url.pathname.endsWith('/resources')) return route.fulfill({ json: resources });
       if (url.pathname.endsWith('/selection')) {
         expect(route.request().method()).toBe('PUT');

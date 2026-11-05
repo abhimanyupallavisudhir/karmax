@@ -69,7 +69,7 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
 
     // A folded sidebar unfolds for p /.
     await open();
-    await page.locator('#mobile-menu').click();
+    await page.locator('#rail-collapse').click();
     await page.waitForFunction(() => document.documentElement.classList.contains('rail-collapsed'));
     await page.evaluate(() => document.activeElement?.blur());
     await page.keyboard.press('p');

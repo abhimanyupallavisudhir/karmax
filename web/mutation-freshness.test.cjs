@@ -111,8 +111,6 @@ if (load('syncPaymentProviderControls')) {
 } else finish();
 
 function finish() {
-  ok(src.includes("await api(`/api/tasks/${draftId}/workflow`") && src.includes("method: 'PATCH'"),
-    'workflow switching updates its auto-draft in place');
   ok(src.includes('appendPendingInvitation(result.invitation, authorizationProjects);'), 'inviting a member updates Pending invitations');
   ok(src.includes("e.target.value = String(rec.params?.priority || 0)"), 'a rejected priority change restores the saved value');
   ok(src.includes('sel.value = sel.dataset.saved'), 'a rejected workflow pin restores the saved value');

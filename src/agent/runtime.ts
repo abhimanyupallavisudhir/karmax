@@ -1,7 +1,7 @@
 import { currentTiming } from '../timing/index.js';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, TurnResult } from './types.js';
 import type { Transition } from '../resolve/transitions.js';
-import { assertReviewInfoTotal, validateReviewInfoCall } from './review-info.js';
+import { assertReviewInfoTotal, mergeReviewActions, validateReviewInfoCall } from './review-info.js';
 import { AgentActivity, AgentWait, Provider, ReviewInfo, SubTaskRequest, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 import { jobStatuses } from '../world/jobs.js';
 import { worldRepos } from '../world/types.js';
@@ -315,7 +315,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       // publication so an overlapping call cannot overwrite another's actions.
       const publication = reviewPublication.then(async () => {
         const call = validateReviewInfoCall(info);
-        const actions = call.actions ? [...(reviewInfo?.actions ?? []), ...call.actions] : reviewInfo?.actions;
+        const actions = call.actions ? mergeReviewActions(reviewInfo?.actions ?? [], call.actions) : reviewInfo?.actions;
         const supplied = Object.fromEntries(Object.entries(call).filter(([, value]) => value !== undefined));
         const nextReviewInfo = { ...reviewInfo, ...supplied, ...(actions ? { actions } : {}) };
         assertReviewInfoTotal(nextReviewInfo);

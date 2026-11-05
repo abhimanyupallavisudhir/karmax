@@ -26,10 +26,12 @@ export interface AuthorizationRequest {
   avatarRecipients?: string[];
   reason: string;
   requestedBy: string;
-  status: 'pending' | 'granted' | 'denied';
+  status: 'pending' | 'granted' | 'denied' | 'withdrawn';
   claim?: { id: string; action: 'approve' | 'deny'; by: string; at: number };
   dismissed?: { by: string; at: number };
   resolution?: { action: 'approve' | 'deny'; by: string; at: number };
+  /** Settled without a decision: someone ran the task with authority they chose. */
+  withdrawn?: { by: string; at: number; reason: string };
   createdAt: number;
 }
 
@@ -141,6 +143,23 @@ export class AuthorizationRequests {
       scopeKey: `project:${request.projectId}`, detail: { requestId: id } }));
     return request;
 
+    });
+  }
+
+  /** Withdraw a request nobody needs to decide any more. One being decided is
+   * left to finish: returns undefined then, and when it was already settled. */
+  async withdraw(id: string, by: string, reason: string): Promise<AuthorizationRequest | undefined> {
+    return this.store.transaction(async () => {
+      await this.locked();
+      const all = (await this.requests());
+      const request = all.find((candidate) => candidate.id === id);
+      if (!request || request.status !== 'pending' || request.claim) return undefined;
+      request.status = 'withdrawn';
+      request.withdrawn = { by, at: Date.now(), reason };
+      (await this.save(all));
+      (await this.store.appendAudit({ principalId: by, action: 'authorization.request.withdrawn',
+        scopeKey: `project:${request.projectId}`, detail: { requestId: id, target: request.target, reason } }));
+      return request;
     });
   }
 

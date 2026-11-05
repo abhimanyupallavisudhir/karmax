@@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { WorldLifecycleManager } from '../src/world/runners.js';
-import { markCheckpointStale } from '../src/world/checkpoint-staleness.js';
+import { clearBranchUnpublished, markBranchUnpublished, markCheckpointStale } from '../src/world/checkpoint-staleness.js';
 import type { WorldHandle } from '../src/world/types.js';
 
 const stores: Store[] = [];
@@ -232,6 +232,31 @@ it('keeps a world whose newest state cannot be checkpointed', async () => {
   expect(await f.lifecycle.sweep(Date.now() + 1)).toBe(0);
   expect(f.destroy).not.toHaveBeenCalled();
   expect(await f.store.worldState(f.handle.id)).toBe('parked');
+});
+
+// Task #817 (2026-11-04): GitHub refused its park push, and the sweep then
+// hibernated it for a resize, deleting the only copy of a commit. Its checkpoint
+// named that commit, which no restore could fetch, so it never came back.
+it('keeps a world whose commits its remote refused, until a push succeeds', async () => {
+  const f = await fixture();
+  await markBranchUnpublished(f.store, f.handle, 'could not persist branch for wiki: GitHub refused the push');
+  expect(await f.lifecycle.sweep(Date.now() + 1)).toBe(0);
+  expect(f.destroy).not.toHaveBeenCalled();
+  expect(await f.store.worldState(f.handle.id)).toBe('parked');
+  expect((await f.store.eventsOfType(f.handle.id, 'world.hibernate_failed'))[0]?.payload)
+    .toMatchObject({ error: expect.stringMatching(/not on their remote/) });
+  // A re-checkpoint cannot stand in for the commits; only a successful push can.
+  await f.checkpointWorld(f.handle);
+  await clearBranchUnpublished(f.store, f.handle.id);
+  expect(await f.lifecycle.sweep(Date.now() + 10 * 60 * 60_000)).toBe(1);
+  expect(f.destroy).toHaveBeenCalledTimes(1);
+});
+
+it('lets an earlier generation\'s refused push go with it', async () => {
+  const f = await fixture();
+  await markBranchUnpublished(f.store, { ...f.handle, generation: 7 }, 'an earlier generation');
+  expect(await f.lifecycle.sweep(Date.now() + 1)).toBe(1);
+  expect(f.destroy).toHaveBeenCalledTimes(1);
 });
 
 it('trusts the latest checkpoint when no failure was recorded for this generation', async () => {

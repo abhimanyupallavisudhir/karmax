@@ -1086,7 +1086,7 @@ export class Store {
         createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS subscription_gifts (
-        organizationId TEXT PRIMARY KEY, plan TEXT NOT NULL,
+        organizationId TEXT PRIMARY KEY, plan TEXT NOT NULL, seats INTEGER,
         grantedBy TEXT NOT NULL, grantedAt INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS storage_pack_gifts (
@@ -1491,6 +1491,12 @@ export class Store {
       (await this.db.exec('ALTER TABLE organizations ADD COLUMN storagePacks INTEGER NOT NULL DEFAULT 0'));
     if (!organizationCols.some((c) => c.name === 'computePacks'))
       (await this.db.exec('ALTER TABLE organizations ADD COLUMN computePacks INTEGER NOT NULL DEFAULT 0'));
+    if (!organizationCols.some((c) => c.name === 'seatLimit'))
+      (await this.db.exec('ALTER TABLE organizations ADD COLUMN seatLimit INTEGER'));
+    const giftCols = (await this.db.prepare('PRAGMA table_info(subscription_gifts)').all()) as { name: string }[];
+    if (!giftCols.some((c) => c.name === 'seats'))
+      (await this.db.exec('ALTER TABLE subscription_gifts ADD COLUMN seats INTEGER'));
+    (await this.migrateGiftSeats());
     const policyAcceptanceCols = (await this.db.prepare('PRAGMA table_info(policy_acceptances)').all()) as { name: string }[];
     if (!policyAcceptanceCols.some((c) => c.name === 'organizationId'))
       (await this.db.exec('ALTER TABLE policy_acceptances ADD COLUMN organizationId TEXT'));
@@ -2317,7 +2323,31 @@ export class Store {
       (await this.listOrganizationMemberships(organizationId)).length, {
         storagePacks: organization.storagePacks ?? 0, giftedStoragePacks: (await this.storagePackGift(organizationId))?.packs ?? 0,
         computePacks: organization.computePacks ?? 0, giftedComputePacks: (await this.computePackGift(organizationId))?.packs ?? 0,
+        seatLimit: organization.seatLimit ?? null,
       });
+  }
+
+  /** Gifted Teams from before gifts had seats cover the people they had
+   * then: the seats their members hold, at least the one a Team includes. */
+  async migrateGiftSeats(): Promise<void> {
+    const rows = (await this.db.prepare("SELECT organizationId FROM subscription_gifts WHERE plan='team' AND seats IS NULL").all()) as { organizationId: string }[];
+    for (const { organizationId } of rows) {
+      const members = Number(((await this.db.prepare('SELECT COUNT(*) n FROM organization_memberships WHERE organizationId=?')
+        .get(organizationId)) as any).n);
+      (await this.db.prepare("UPDATE subscription_gifts SET seats=? WHERE organizationId=? AND plan='team' AND seats IS NULL")
+        .run(Math.max(1, members), organizationId));
+    }
+  }
+
+  /** Billing's seat boundary, beside setOrganizationPlan: how many people the
+   * organization's Team covers when nothing bills a new one (a gifted Team and
+   * the seats bought beside it), or null when anyone may join. */
+  async setOrganizationSeatLimit(organizationId: string, seatLimit: number | null): Promise<void> {
+    await this.db.transaction(async () => {
+      if (seatLimit !== null && (!Number.isSafeInteger(seatLimit) || seatLimit < 1)) throw new Error('a seat limit must be a positive integer');
+      (await this.db.prepare('UPDATE organizations SET seatLimit=? WHERE id=?').run(seatLimit, organizationId));
+      this.notifyOrganizationEntitlementsChanged(organizationId);
+    });
   }
 
   /** Storage packs the operator gifted, independent of billing. */
@@ -2410,9 +2440,12 @@ export class Store {
   private async assertOrganizationMemberCapacity(organizationId: string, userId?: string): Promise<void> {
     if (!this.hosted || (userId && (await this.organizationMembership(organizationId, userId)))) return;
     const entitlements = (await this.organizationEntitlements(organizationId));
-    if (entitlements.maxMembers == null) return;
     const count = entitlements.currentMemberCount;
     if (entitlements.memberAdmissionAllowed) return;
+    if (entitlements.maxMembers == null) {
+      const seats = entitlements.seatLimit ?? 0;
+      throw new EntitlementError(`All ${seats} seat${seats === 1 ? ' is' : 's are'} taken. An owner can add a seat in Plan & billing.`);
+    }
     if (entitlements.overMemberLimit) {
       const extra = count - entitlements.maxMembers;
       throw new EntitlementError(
@@ -2832,6 +2865,30 @@ export class Store {
       WHERE l.projectId=? AND l.state!='released'`).all(projectId)) as any[])
       .map((row) => ({ id: String(row.id), provider: String(row.provider) }));
     return { worlds, objectKeys: [...objectKeys], attachmentIds, leases };
+  }
+
+  /** The task worlds an organization's own `provider` account still runs: of
+   * each world only its current generation (as currentWorld reads it; an older,
+   * superseded one has no machine left), unless released or hibernated, and not
+   * one made on managed compute, which stays on the installation's account. */
+  async worldsOnOwnConnection(organizationId: string, provider: string): Promise<WorldHandleRef[]> {
+    const taskIds = ((await this.db.prepare('SELECT t.id FROM tasks t JOIN projects p ON p.id=t.projectId WHERE p.organizationId=?')
+      .all(organizationId)) as any[]).map((r) => String(r.id));
+    const current = new Map<string, { generation: number; state: string; handle: string }>();
+    for (const row of (await rowsFor(this.db, 'world_instances', 'worldId', taskIds))) {
+      if (row.state === 'superseded') continue;
+      const seen = current.get(row.worldId);
+      if (!seen || Number(row.generation) > seen.generation)
+        current.set(row.worldId, { generation: Number(row.generation), state: String(row.state), handle: String(row.handle) });
+    }
+    const worlds: WorldHandleRef[] = [];
+    for (const row of current.values()) {
+      if (row.state === 'released' || row.state === 'hibernated') continue;
+      let handle: WorldHandleRef;
+      try { handle = JSON.parse(row.handle) as WorldHandleRef; } catch { continue; }
+      if ((handle.provider ?? handle.kind) === provider && handle.meta?.funding !== 'managed') worlds.push(handle);
+    }
+    return worlds;
   }
 
   async organizationResources(organizationId: string): Promise<{ worlds: WorldHandleRef[]; objectKeys: string[];
@@ -5670,11 +5727,17 @@ export class Store {
       }
     } else if (ev.type === 'credential.approval-requested' || ev.type === 'connection.requested') {
       kind = 'approval-requested'; actionable = true;
-      users = (await this.humanAudience(task.id, ['@creator']));
-      // The creator is the natural first audience, while organization owners
-      // remain a deterministic resolver for automated/delegated tasks.
-      for (const member of (await this.listOrganizationMemberships(project.organizationId)))
-        if (member.role === 'owner') users.push(member.userId);
+      if (Array.isArray(ev.payload.audience)) {
+        // Whom it asks: a sub-task's parent (`task:<id>`, its agent is told,
+        // no person is) or the people the parent passed it on to.
+        users = (await this.humanAudience(task.id, ev.payload.audience.map(String)));
+      } else {
+        users = (await this.humanAudience(task.id, ['@creator']));
+        // The creator is the natural first audience, while organization owners
+        // remain a deterministic resolver for automated/delegated tasks.
+        for (const member of (await this.listOrganizationMemberships(project.organizationId)))
+          if (member.role === 'owner') users.push(member.userId);
+      }
     } else if (ev.type === 'permission.approval-requested' || ev.type === 'authorization.approval-requested'
       || ev.type === 'repository-access.approval-requested') {
       kind = 'approval-requested'; actionable = true;
@@ -5690,7 +5753,8 @@ export class Store {
         : [];
       // An ask that resolves to nobody still reaches someone who can act.
       if (!users.length) users = (await this.escalationAudience(task));
-    } else if (ev.type === 'view.updated' && (ev.payload.waitingFor === 'human' || escalated)) {
+    } else if (ev.type === 'view.updated' && (ev.payload.waitingFor === 'human' || escalated && ev.payload.waitingFor !== 'parent')) {
+      // (A sub-task escalated to its parent asks its parent's agent, not people.)
       // The lifecycle states that are an ask: the task is parked ON a human.
       // While an approval is outstanding that approval IS the ask, and it was
       // already routed to exactly the people who can answer it.
@@ -5770,7 +5834,8 @@ export class Store {
       WHERE COALESCE(json_extract(lastView, '$.status'), 'setup') NOT IN ('done', 'failed', 'cancelled'))`, []));
     dropped += (await this.deleteInbox(`kind IN ('review-requested', 'escalated') AND taskId IN (SELECT id FROM tasks
       WHERE COALESCE(json_extract(lastView, '$.waitingFor.kind'), '') <> 'human'
-        AND COALESCE(json_extract(lastView, '$.stage'), '') <> 'escalated')`, []));
+        AND (COALESCE(json_extract(lastView, '$.stage'), '') <> 'escalated'
+          OR COALESCE(json_extract(lastView, '$.waitingFor.kind'), '') = 'parent'))`, []));
     if ((await this.db.prepare("SELECT 1 FROM inbox WHERE kind='approval-requested' LIMIT 1").get())) {
       dropped += (await this.deleteInbox(`subject IS NULL AND kind='approval-requested' AND taskId NOT IN (
         SELECT e.taskId FROM events e
@@ -5789,6 +5854,7 @@ export class Store {
   private async backfillEscalations(): Promise<void> {
     const rows = (await this.db.prepare(`SELECT id FROM tasks WHERE json_extract(lastView, '$.stage')='escalated'
       AND COALESCE(json_extract(lastView, '$.status'), '') NOT IN ('done', 'failed', 'cancelled')
+      AND COALESCE(json_extract(lastView, '$.waitingFor.kind'), '') <> 'parent'
       AND id NOT IN (SELECT taskId FROM inbox WHERE actionable=1)`).all()) as Array<{ id: string }>;
     for (const row of rows) {
       const task = (await this.getTaskShallow(String(row.id)));
@@ -8966,6 +9032,55 @@ export class Store {
     return Number((row as { n?: number } | undefined)?.n ?? 0);
   }
 
+  /** The machines running on the installation's `provider` account, each
+   * with its organization and CPUs (null: the provider's default size). */
+  async runningManagedLeases(provider: string): Promise<Array<{ organizationId: string; cpu: number | null; worldId: string }>> {
+    return this.runningLeases(provider, null);
+  }
+
+  /** The machines running on one provider account: the installation's
+   * managed one (`organizationId` null, every organization's) or an
+   * organization's own. */
+  async runningLeases(provider: string, organizationId: string | null): Promise<Array<{ organizationId: string; cpu: number | null; worldId: string }>> {
+    const rows = organizationId === null
+      ? await this.db.prepare(`SELECT l.organizationId organizationId, l.cpu cpu, l.worldId worldId FROM world_leases l JOIN runner_pools p ON p.id=l.runnerPoolId
+          WHERE l.state='active' AND p.mode='managed' AND p.provider=? AND p.id=p.organizationId || ':tavya-' || p.provider`).all(provider)
+      : await this.db.prepare(`SELECT l.organizationId organizationId, l.cpu cpu, l.worldId worldId FROM world_leases l JOIN runner_pools p ON p.id=l.runnerPoolId
+          WHERE l.state='active' AND p.provider=? AND p.organizationId=? AND p.id<>p.organizationId || ':tavya-' || p.provider`).all(provider, organizationId);
+    return (rows as Array<Record<string, unknown>>).map((row) => ({ organizationId: String(row.organizationId ?? row.organizationid),
+      cpu: row.cpu == null ? null : Number(row.cpu), worldId: String(row.worldId ?? row.worldid) }));
+  }
+
+  /** The task of each machine one organization holds now, on any provider (the compute queue's per-tree share). */
+  async activeLeaseTasks(organizationId: string): Promise<string[]> {
+    const rows = await this.db.prepare(`SELECT taskId FROM world_leases WHERE state='active' AND organizationId=?`).all(organizationId);
+    return (rows as Array<Record<string, unknown>>).map((row) => String(row.taskId ?? row.taskid));
+  }
+
+  /** The worlds that exist on one provider account (running or parked): the
+   * installation's managed one (`organizationId` null) or an organization's
+   * own, with the home disk each was made with. */
+  async liveWorlds(provider: string, organizationId: string | null): Promise<Array<{ worldId: string; organizationId: string; state: 'ready' | 'parked'; diskGb?: number }>> {
+    const rows = (await this.db.prepare(`SELECT worldId, handle, state FROM world_instances WHERE state IN ('ready', 'parked')`).all()) as Array<Record<string, unknown>>;
+    const organizations = new Map<string, string | undefined>();
+    const out: Array<{ worldId: string; organizationId: string; state: 'ready' | 'parked'; diskGb?: number }> = [];
+    for (const row of rows) {
+      let handle: WorldHandleRef & { meta?: Record<string, any> };
+      try { handle = JSON.parse(String(row.handle)); } catch { continue; }
+      if ((handle.provider ?? handle.kind) !== provider) continue;
+      if ((handle.meta?.funding === 'managed') !== (organizationId === null)) continue;
+      const projectId = handle.meta?.projectId;
+      if (typeof projectId !== 'string') continue;
+      if (!organizations.has(projectId)) organizations.set(projectId, (await this.getProject(projectId))?.organizationId);
+      const owner = organizations.get(projectId);
+      if (!owner || (organizationId !== null && owner !== organizationId)) continue;
+      const disk = Number(handle.meta?.machine?.diskGb ?? handle.meta?.computer?.diskGb);
+      out.push({ worldId: String(row.worldId ?? row.worldid), organizationId: owner, state: row.state as 'ready' | 'parked',
+        ...(Number.isFinite(disk) && disk > 0 ? { diskGb: disk } : {}) });
+    }
+    return out;
+  }
+
   async runningManagedWorlds(provider: string): Promise<number> {
     return Number(((await this.db.prepare(`SELECT COUNT(*) n FROM world_leases l JOIN runner_pools p ON p.id=l.runnerPoolId
       WHERE l.state='active' AND p.mode='managed' AND p.provider=? AND p.id=p.organizationId || ':tavya-' || p.provider`).get(provider)) as { n?: number } | undefined)?.n ?? 0);
@@ -10901,7 +11016,7 @@ function requiredTargets(policy: ConfirmationPolicy): number {
 function rowToOrganization(r: any): Organization {
   return { id: r.id, name: r.name, slug: r.slug, kind: r.kind, nameVisibility: r.nameVisibility === 'public' ? 'public' : 'members',
     plan: isHostedPlanId(r.plan) ? r.plan : 'free', storagePacks: Number(r.storagePacks ?? 0) || 0,
-    computePacks: Number(r.computePacks ?? 0) || 0, createdAt: r.createdAt };
+    computePacks: Number(r.computePacks ?? 0) || 0, ...(r.seatLimit == null ? {} : { seatLimit: Number(r.seatLimit) }), createdAt: r.createdAt };
 }
 
 function rowToTeam(r: any): Team {

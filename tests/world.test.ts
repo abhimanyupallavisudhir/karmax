@@ -415,6 +415,35 @@ describe('WorktreeProvider (real git)', () => {
     }
   });
 
+  it('does not show work that already landed when the world\'s own copy of the base is stale (pramana#137)', async () => {
+    const store = (await Store.create(':memory:'));
+    const worlds = new WorldRegistry();
+    worlds.register(new WorktreeProvider(home));
+    const core = makeCoreActivities({ store, worlds, adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock') });
+    try {
+      const handle = await core.createWorld({ taskId: 'stale-base', repos: [repo], base: 'main', target: 'main', kind: 'worktree' });
+      const workdir = handle.workdir ?? handle.root;
+
+      // An earlier pull request from this branch lands: the remote's main has
+      // it, the world's local main (what `main` resolves to) never moves.
+      fs.writeFileSync(path.join(workdir, 'landed.js'), 'console.log("first PR")\n');
+      await git(workdir, ['add', '-A']);
+      await git(workdir, ['commit', '-q', '-m', 'first pull request']);
+      await git(workdir, ['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+
+      // The next pull request from the same branch proposes only its own work.
+      fs.writeFileSync(path.join(workdir, 'next.js'), 'console.log("second PR")\n');
+      await git(workdir, ['add', '-A']);
+      await git(workdir, ['commit', '-q', '-m', 'second pull request']);
+      expect((await core.buildReview(handle, 'main')).changedFiles).toEqual(['next.js']);
+
+      await worlds.open(handle).then((world) => world.destroy());
+    } finally {
+      (await store.close());
+    }
+  });
+
   it('warns (but still forks off HEAD) when the configured base branch does not exist', async () => {
     const provider = new WorktreeProvider(home);
     const world = await provider.create({ taskId: 'nobase', repo, base: 'develop', target: 'main' });

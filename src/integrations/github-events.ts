@@ -13,10 +13,11 @@ import type { GithubProjectWebhookEvent, GithubWebhookResult } from './github-ap
  * (the deployment monitor) — is `github.workflow.failed`.
  *
  * Repairing those failures used to be a rail hard-coded in the gateway. It is
- * now an ordinary repeatable task, "Repair GitHub workflow", that a project gets
- * the first time a failure arrives for it: people can read, edit, pause or
- * delete it like any other task, and a project that already has a task reacting
- * to workflow failures keeps its own. Deleting the seeded task is respected.
+ * now an ordinary repeatable task, "Repair GitHub workflow", installed from the
+ * task store into every project when it is created (projects from before, at
+ * boot; any left without it, at their first failure): people can read, edit,
+ * pause or delete it like any other task, and a project that already has a task
+ * reacting to workflow failures keeps its own. Deleting it is respected.
  */
 
 /** The marker that a project has (or had, and deleted) its recovery task. */
@@ -61,7 +62,8 @@ export class GithubEvents {
     return recorded;
   }
 
-  private async ensureRecoveryTask(projectId: string, organizationId: string): Promise<void> {
+  /** Install the repair task into a project, once: never again after it is deleted. */
+  async ensureRecoveryTask(projectId: string, organizationId: string): Promise<void> {
     const key = recoverySeriesKey(projectId);
     if (await this.deps.store.kvGet(key)) return;
     const own = (await this.deps.store.listArmedTasks()).find((task) => task.projectId === projectId

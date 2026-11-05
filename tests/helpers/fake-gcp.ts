@@ -33,6 +33,10 @@ export class FakeGcp {
   /** `machineType@zone` with no capacity just now. */
   noCapacity = new Set<string>();
   cpuQuota?: number;
+  /** The region's INSTANCES quota. */
+  instanceQuota?: number;
+  /** The region's SSD_TOTAL_GB quota. */
+  ssdQuota?: number;
   /** The project's CPUS_ALL_REGIONS quota. */
   globalCpuQuota?: number;
   defaultNetwork = true;
@@ -104,7 +108,9 @@ export class FakeGcp {
       return json(200, operation);
     }
     if (parts[0] === 'regions') return json(200, { name: parts[1], zones: ['a', 'b', 'c'].map((letter) => `https://x/zones/${parts[1]}-${letter}`),
-      quotas: this.cpuQuota !== undefined ? [{ metric: 'CPUS', limit: 200, usage: 0 }, { metric: 'E2_CPUS', limit: this.cpuQuota, usage: 0 }] : [] });
+      quotas: this.cpuQuota !== undefined ? [{ metric: 'CPUS', limit: 200, usage: 0 }, { metric: 'E2_CPUS', limit: this.cpuQuota, usage: 0 },
+        ...(this.instanceQuota !== undefined ? [{ metric: 'INSTANCES', limit: this.instanceQuota, usage: 0 }] : []),
+        ...(this.ssdQuota !== undefined ? [{ metric: 'SSD_TOTAL_GB', limit: this.ssdQuota, usage: 0 }] : [])] : [] });
     if (parts[0] === 'global' && parts[1] === 'networks') return this.defaultNetwork && parts[2] === 'default' ? json(200, { name: 'default' }) : notFound();
     if (parts[0] === 'global' && parts[1] === 'firewalls') {
       if (method === 'POST') { this.firewalls.push(body); return this.op(`global/firewalls/${body.name}`); }

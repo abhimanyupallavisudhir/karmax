@@ -3,6 +3,7 @@ import { E2BWorldProvider, DEFAULT_E2B_TEMPLATE, type E2BFactory, type E2BSandbo
 import { serviceHomeLabel } from '../src/world/services.js';
 import { E2B_USED_DISK_MB, e2bDiskLimitGb, sizedBuildOptions, sizedTemplateName } from '../src/world/e2b-template.js';
 import { isMissingSandbox } from '../src/world/provider-errors.js';
+import { ProviderCapacityFull } from '../src/agent/limits.js';
 
 describe('E2B cloud world provider', () => {
   it('rejects an unauthenticated legacy sandbox ID before any provider operation (WD-30)', async () => {
@@ -16,6 +17,20 @@ describe('E2B cloud world provider', () => {
     await expect(provider.destroy(forged)).rejects.toThrow('invalid E2B world handle');
     expect(connect).not.toHaveBeenCalled();
     await expect(provider.open(world.handle)).resolves.toBeDefined();
+  });
+
+  // E2B's own limit (the account's concurrent sandboxes) is the one that counts:
+  // its refusal makes the task wait for a machine, or Any try the next provider.
+  it('says it is full when E2B refuses a sandbox for its concurrency limit or for want of room', async () => {
+    for (const refusal of [Object.assign(new Error('Rate limit exceeded, please try again later.'), { name: 'RateLimitError' }),
+      Object.assign(new Error('Service is busy'), { name: 'ServiceBusyError', status: 503 })]) {
+      const provider = new E2BWorldProvider({ create: async () => { throw refusal; }, connect: async () => { throw new Error('none'); } } as any);
+      const failure = await provider.create({ taskId: 'full', base: 'main' }).catch((error) => error);
+      expect(failure).toBeInstanceOf(ProviderCapacityFull);
+      expect(failure.message).toContain(refusal.message);
+    }
+    const broken = new E2BWorldProvider({ create: async () => { throw new Error('template not found'); }, connect: async () => { throw new Error('none'); } } as any);
+    expect(await broken.create({ taskId: 'bad', base: 'main' }).catch((error) => error)).not.toBeInstanceOf(ProviderCapacityFull);
   });
 
   it('runs a computer of another size on a template built once at that size', async () => {

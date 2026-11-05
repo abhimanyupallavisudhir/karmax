@@ -1,11 +1,13 @@
-import { checkpointStale } from './checkpoint-staleness.js';
+import { branchUnpublished, checkpointStale } from './checkpoint-staleness.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import type { Store } from '../store/db.js';
 import type { Project, RunnerPool, WorldHandleRef } from '../domain/types.js';
 import type { ProviderSandboxRef, WorldHandle } from './types.js';
 import { ANY_PROVIDER, describeMachine, isAnyProvider, machineShape, sameMachine, type MachineShape } from '../domain/computer.js';
-import { assertComputerFits, type ComputerLimits } from '../domain/computer-limits.js';
+import { assertComputerFits, type AccountPool, type ComputerLimits } from '../domain/computer-limits.js';
+import { accountRoom } from './account-room.js';
+import { ProviderCapacityFull } from '../agent/limits.js';
 import type { WorldRegistry } from './registry.js';
 import type { WorldCheckpointService } from './checkpoint.js';
 import type { ObjectStore } from '../store/objects.js';
@@ -15,6 +17,13 @@ import { taskEnded } from './task-ended.js';
 import { taskProvider } from './task-provider.js';
 import { assertComputeCredit, assertManagedRoom } from './managed-compute.js';
 import { MANAGED_COMPUTE, worldAccountLimits } from './connections.js';
+import { WAKE_RELOCATE_AFTER_MS, wakeFullKey } from './compute-queue.js';
+
+/** What a machine of this config takes from its account's budget. */
+const roomShape = (config: Parameters<typeof machineShape>[0]): { cpu?: number; diskGb?: number } => {
+  const shape = machineShape(config);
+  return { ...(shape.cpu !== undefined ? { cpu: shape.cpu } : {}), ...(shape.diskGb !== undefined ? { diskGb: shape.diskGb } : {}) };
+};
 
 const fits = (shape: MachineShape, limits: ComputerLimits): boolean => {
   try { assertComputerFits(shape, limits, ''); return true; } catch { return false; }
@@ -24,7 +33,9 @@ const fits = (shape: MachineShape, limits: ComputerLimits): boolean => {
  * (WorldProviderConnectionService). */
 export interface ManagedComputeAccounts {
   funding(organizationId: string | undefined, provider: string): Promise<'managed' | 'own' | undefined>;
-  managedConnections(): Promise<Array<{ provider: string; config: { maxRunning?: number } }>>;
+  managedConnections(): Promise<Array<{ provider: string; config: { share?: number }; limits: { pool?: AccountPool } }>>;
+  /** What a computer on the account the organization runs `provider` on may be, and the account's budget. */
+  limits?(organizationId: string | undefined, provider: string): Promise<{ pool?: AccountPool }>;
 }
 
 // Private/explicit pools retain physical resource totals. Hosted customer-owned
@@ -85,7 +96,10 @@ export class RunnerPoolService {
   }
 
   async acquire(input: { project: Project; taskId: string; worldId: string; provider: string; priority?: number;
-    /** The task's own machine size, when its Computer differs from the project's. */
+    /** The machine's size; by default its task's Computer (the project's
+     * default only where the task names none). Waking with the project's
+     * asked an account for room for 8 CPUs to wake a 2-CPU world, and was
+     * refused there for good (pramana#137). */
     resources?: Project['config']['resources'];
     /** New work (a task's first machine): refused once the organization's
      * managed compute credit is spent. Waking a world to save or publish its
@@ -94,14 +108,21 @@ export class RunnerPoolService {
     heartbeat?: () => void; signal?: AbortSignal; pollMs?: number }): Promise<{ leaseId: string; runnerPoolId: string }> {
     if (input.signal?.aborted)
       throw input.signal.reason ?? new Error('runner lease cancelled');
-    const projectConfig = (await this.store.effectiveProjectConfig(input.project));
-    const config = input.resources ? { ...projectConfig, resources: input.resources } : projectConfig;
+    const taskConfig = (await this.store.effectiveTaskConfig(input.project, input.taskId));
+    const config = input.resources ? { ...taskConfig, resources: input.resources } : taskConfig;
     const pool = (await this.ensureDefaultPool(input.project, input.provider));
     if (pool.mode === 'managed') {
       if (input.work) await assertComputeCredit(this.store, input.project.organizationId!, input.provider, Date.now(),
         { shape: config.resources, taskId: input.taskId });
       const account = (await this.managed?.managedConnections())?.find((value) => value.provider === input.provider);
-      await assertManagedRoom(this.store, input.provider, account?.config.maxRunning);
+      if (account) await assertManagedRoom(this.store, input.provider, { pool: account.limits.pool, share: account.config.share },
+        input.project.organizationId!, { ...roomShape(config), taskId: input.taskId, worldId: input.worldId });
+    } else if (this.managed?.limits && await this.managed.funding(input.project.organizationId, input.provider) === 'own') {
+      // The organization's own account: its budget and its queue (account-room.ts).
+      const refusal = await accountRoom(this.store, { provider: input.provider, managed: false,
+        pool: (await this.managed.limits(input.project.organizationId, input.provider)).pool },
+        { organizationId: input.project.organizationId!, ...roomShape(config), taskId: input.taskId, worldId: input.worldId });
+      if (refusal) throw new ProviderCapacityFull(refusal.message);
     }
     const month = monthWindow(Date.now());
     const organizationPolicy = (await this.store.getOrganizationExecutionPolicy(input.project.organizationId!));
@@ -219,6 +240,10 @@ export class WorldLifecycleManager {
     private intervalMs = 60_000, private objects?: ObjectStore, private runners?: RunnerPoolService,
     private access?: import('./access.js').WorldAccessService) {}
 
+  /** Ask a task waiting for a machine to try again now (its workflow's Retry);
+   * false when it is not waiting for one. Set where the workflow client is. */
+  retry?: (taskId: string) => Promise<boolean>;
+
   start(): void {
     if (this.timer) return;
     // Recover capacity during boot, before new setup activities spend another
@@ -258,6 +283,7 @@ export class WorldLifecycleManager {
     await this.step('checkpoint garbage', async () => this.checkpoints.collectGarbage?.());
     if (this.objects instanceof DeferredDeleteObjectStore) await this.objects.purgeDue(now).catch(() => undefined);
     await this.step('provider usage', () => this.reconcileProviderUsage(now));
+    await this.step('stuck wakes', () => this.relocateStuckWakes(now));
     await this.step('promoted artifacts', async () => {
       for (const artifact of (await this.store.expiredPromotedArtifacts(now))) {
         (await this.store.deletePromotedArtifact(artifact.id));
@@ -531,6 +557,63 @@ export class WorldLifecycleManager {
     return freed;
   }
 
+  /**
+   * A parked world its account had no room to wake (its disk's host, zone or
+   * location full) for WAKE_RELOCATE_AFTER_MS is hibernated: its park
+   * checkpoint is kept and its machine and disk freed, so its task restores it
+   * where it can run now — on "Any", any provider with room; on a named
+   * provider, a new machine there (wiki features/managed-compute § Queue).
+   * Its agent is told what did not carry over, and its task tries again at
+   * once (`retry`) rather than at its next scheduled try, minutes later.
+   *
+   * A move costs what a new machine must fetch or rebuild: the Git-ignored
+   * files its park checkpoint lists and the project data it restores. Where
+   * that is at most CHEAP_MOVE_BYTES and another account has room now (Any
+   * only), the world moves at the first sweep after the refusal instead of
+   * waiting out the 15 minutes for room where its disk is.
+   */
+  async relocateStuckWakes(now = Date.now()): Promise<number> {
+    let moved = 0;
+    for (const candidate of await this.store.listWorldInstances('parked')) {
+      const raw = await this.store.kvGet(wakeFullKey(candidate.handle.id));
+      if (!raw) continue;
+      let since = 0; let generation = 0;
+      try { ({ since, generation } = JSON.parse(raw) as { since: number; generation: number }); } catch { /* malformed: drop it */ }
+      if (generation !== (candidate.handle.generation ?? 1)) { await this.store.kvDelete(wakeFullKey(candidate.handle.id)); continue; }
+      const cheap = now - since < WAKE_RELOCATE_AFTER_MS ? await this.cheapMove(candidate.handle) : undefined;
+      if (now - since < WAKE_RELOCATE_AFTER_MS && cheap === undefined) continue;
+      const reason = cheap === undefined ? 'no-room' : 'no-room-cheap-move';
+      const done = await this.hibernate(candidate, { reason, onFailure: (error) =>
+        this.recordLifecycle(candidate.handle, 'world.hibernate_failed', { error: error instanceof Error ? error.message : String(error), reason }),
+      }).catch(() => false);
+      if (!done) continue;
+      moved++;
+      await this.store.kvDelete(wakeFullKey(candidate.handle.id));
+      if ((await this.store.worldState(candidate.handle.id)) !== 'hibernated') continue;
+      await this.checkpoints.addNotice?.(candidate.handle.id, STUCK_WAKE_NOTICE);
+      await this.retry?.(candidate.handle.id).catch(() => false);
+    }
+    return moved;
+  }
+
+  /** The bytes a move of this parked world would fetch or rebuild, when that
+   * is at most CHEAP_MOVE_BYTES and its task can run elsewhere now; else
+   * undefined. Unknown counts as costly: a park checkpoint that could not list
+   * its ignored files, or listed only some, never moves early. */
+  private async cheapMove(handle: WorldHandleRef): Promise<number | undefined> {
+    const checkpoint = await this.store.latestWorldCheckpoint(handle.id);
+    if (!checkpoint || checkpoint.generation !== (handle.generation ?? 1) || checkpoint.ignoredUnknown || checkpoint.ignored?.truncated) return undefined;
+    let bytes = (checkpoint.ignored?.entries ?? []).reduce((sum, entry) => sum + entry.bytes, 0);
+    for (const ref of checkpoint.resources ?? []) {
+      if (bytes > CHEAP_MOVE_BYTES) return undefined;
+      const revision = await this.store.getResourceRevision(ref.revisionId);
+      if (!revision) return undefined;
+      bytes += revision.bytes;
+    }
+    if (bytes > CHEAP_MOVE_BYTES) return undefined;
+    return await this.checkpoints.roomElsewhere?.(handle as WorldHandle) ? bytes : undefined;
+  }
+
   /** Checkpoint a parked (or idle ready) world and delete it at its provider;
    * a world whose task finished normally is deleted without a checkpoint.
    * True when it was freed. Selection is only a hint: a gateway or activity
@@ -574,6 +657,15 @@ export class WorldLifecycleManager {
         await this.store.setWorldState(candidate.handle, 'released');
         await this.recordLifecycle(candidate.handle, 'world.destroyed', reason);
         return true;
+      }
+      // Commits its remote refused live only in this sandbox: keep it (under
+      // the sweep's backoff) until a park pushes them. Only an ended task, or
+      // a person freeing its computer, lets them go.
+      const unpublished = !['released', 'task-ended'].includes(reason.reason ?? '')
+        && await branchUnpublished(this.store, candidate.handle);
+      if (unpublished) {
+        await options.onFailure?.(new Error(`its commits are not on their remote yet (${unpublished})`));
+        return false;
       }
       try {
         let checkpoint = await this.store.latestWorldCheckpoint(candidate.handle.id);
@@ -851,6 +943,16 @@ export const COMPUTE_HIBERNATED_NOTICE = 'While this task waited, the organizati
   + 'was hibernated: it was saved and its machine and disk deleted. You are on a new machine with the same files your repositories '
   + 'track, and the same uncommitted changes. Git-ignored files (installed dependencies, build output, caches) and running processes '
   + 'did not carry over: reinstall or restart what you need.';
+
+/** Told to the agent whose parked computer could not wake where its disk was (relocateStuckWakes). */
+/** A stuck parked world whose move would fetch or rebuild at most this much
+ * (its Git-ignored files and project data) moves at once (relocateStuckWakes). */
+export const CHEAP_MOVE_BYTES = 1024 ** 3;
+
+export const STUCK_WAKE_NOTICE = 'This task\'s parked computer could not start again where its disk was (no room there), so it was restored from '
+  + 'its last checkpoint on a new machine. You have the same files your repositories track, the same uncommitted changes and the same '
+  + 'project data. Git-ignored files (installed dependencies, build output, caches) and running processes did not carry over: '
+  + 'reinstall or restart what you need.';
 const HIBERNATE_RETRY_MS = 5 * 60_000;
 /** How long the world of a task that ended (done, cancelled, failed) is kept
  * before its machine and disk are freed: long enough for an accidental cancel

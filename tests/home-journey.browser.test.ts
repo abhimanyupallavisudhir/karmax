@@ -121,9 +121,12 @@ it('lands on the organization home, For me across projects, Active one click awa
       await page.waitForURL(/\/personal$/);
       await page.locator(`[data-id="${review.id}"]`).waitFor();
     });
-    await step('New task opens the form, which creates a draft in the project picked there', async () => {
-      // It starts in the project last visited, Mobile App; choose Website.
+    await step('New task asks which project, and the form can still change it', async () => {
+      // Enter takes the project last visited, Mobile App; the form moves it to Website.
       await page.locator('#expand-task').click();
+      await page.locator('#pp-in').waitFor();
+      expect(await page.locator('#pp-list .opt.active .tpl-name').innerText()).toBe('Mobile App');
+      await page.keyboard.press('Enter');
       expect(await page.locator('#tf-project').innerText()).toBe('Mobile App');
       await page.locator('#tf-project').click();
       await page.locator('.project-pick-menu:not([hidden]) [data-project="' + web.id + '"]').click();
@@ -165,11 +168,13 @@ it('lands on the organization home, For me across projects, Active one click awa
     await page.goto(`${app.url}/personal`);
     await page.locator(`[data-id="${review.id}"]`).waitFor();
     await page.locator('#expand-task').click();
+    await page.locator('#pp-in').waitFor();
+    await page.keyboard.press('Enter');
     expect(await page.locator('#tf-project').innerText()).toBe('Website'); // the choice is remembered
     await page.locator('#tf-close').click();
     const shots = process.env.HOME_SCREENSHOTS;
     if (shots) {
-      await page.locator('#mobile-menu').click();
+      await page.locator('#rail-collapse').click();
       await expect.poll(async () => (await page.locator('#rail').boundingBox())?.width ?? 0).toBeLessThan(1);
       await page.screenshot({ path: path.join(shots, 'app-home-collapsed.png') });
       await page.setViewportSize({ width: 390, height: 780 });

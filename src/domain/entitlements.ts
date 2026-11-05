@@ -99,6 +99,10 @@ export interface OrganizationEntitlements {
   maxMembers: number | null;
   currentMemberCount: number;
   overMemberLimit: boolean;
+  /** People a Team covers when nothing bills a new seat (a gifted Team and
+   * the seats bought beside it); null when anyone may join. Never pauses
+   * agents: only someone new waits for a free seat. */
+  seatLimit: number | null;
   memberAdmissionAllowed: boolean;
   agentRunAdmissionAllowed: boolean;
   maxActiveAgentRuns: number | null;
@@ -194,6 +198,8 @@ export interface OrganizationPacks {
   giftedStoragePacks?: number;
   computePacks?: number;
   giftedComputePacks?: number;
+  /** Organization.seatLimit: the seats a gifted Team covers. */
+  seatLimit?: number | null;
 }
 
 /** Private installations deliberately have no monetization limits. */
@@ -209,7 +215,7 @@ export function organizationEntitlements(plan: HostedPlanId, hosted: boolean,
     deployment: 'private', plan: null, planName: 'Private installation',
     monthlyBasePriceCents: null, includedActiveUsers: null,
     monthlyAdditionalActiveUserPriceCents: null, maxMembers: null,
-    currentMemberCount: members, overMemberLimit: false,
+    currentMemberCount: members, overMemberLimit: false, seatLimit: null,
     memberAdmissionAllowed: true, agentRunAdmissionAllowed: true,
     maxActiveAgentRuns: null, storageQuotaBytes: null, includedStorageBytes: null, storagePacks: packs,
     giftedStoragePacks: gifted, storagePackBytes: STORAGE_PACK.bytes,
@@ -218,6 +224,7 @@ export function organizationEntitlements(plan: HostedPlanId, hosted: boolean,
   };
   const definition = hostedPlan(plan);
   const overMemberLimit = definition.maxMembers != null && members > definition.maxMembers;
+  const seatLimit = plan === 'team' && held.seatLimit != null ? Math.max(1, count(held.seatLimit)) : null;
   return {
     deployment: 'hosted', plan, planName: definition.name,
     monthlyBasePriceCents: definition.monthlyBasePriceCents,
@@ -226,7 +233,8 @@ export function organizationEntitlements(plan: HostedPlanId, hosted: boolean,
     maxMembers: definition.maxMembers,
     currentMemberCount: members,
     overMemberLimit,
-    memberAdmissionAllowed: definition.maxMembers == null || members < definition.maxMembers,
+    seatLimit,
+    memberAdmissionAllowed: (definition.maxMembers == null || members < definition.maxMembers) && (seatLimit == null || members < seatLimit),
     agentRunAdmissionAllowed: !overMemberLimit,
     maxActiveAgentRuns: hostedActiveAgentRuns(plan, members),
     storageQuotaBytes: hostedStorageQuotaBytes(plan, members, packs, gifted),

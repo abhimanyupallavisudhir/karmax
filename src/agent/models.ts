@@ -33,6 +33,8 @@ export const CLAUDE_MODEL_PRESETS: AvailableModel[] = [
   { id: 'opus[1m]' },
   { id: 'claude-opus-5-5', displayName: 'Opus 5.5' },
   { id: 'claude-fable-5-1', displayName: 'Fable 5.1' },
+  { id: 'claude-sonnet-5-5', displayName: 'Sonnet 5.5' },
+  { id: 'claude-haiku-5-5', displayName: 'Haiku 5.5' },
   { id: 'sonnet' },
   { id: 'haiku' },
 ];
@@ -45,6 +47,7 @@ export function claudeModelCatalog(discovered: AvailableModel[]): AvailableModel
 export function codexModelCatalog(discovered: AvailableModel[]): AvailableModel[] {
   return discovered.length ? discovered : [
     { id: 'gpt-6.1-sol', isDefault: true },
+    { id: 'gpt-6.1-terra' },
     { id: 'gpt-6-astra' },
     { id: 'gpt-6-sol' },
     { id: 'gpt-6-luna' },
