@@ -1,5 +1,17 @@
 # Launch video
 
+Three versions live here:
+
+| Version | Where | How it is made |
+| --- | --- | --- |
+| First cut (1:03, dark) | `first-cut/` | Stills of a clone composited frame by frame (`first-cut/README.md`). |
+| Second (≈2:27, light) | this folder | One recorded take of the clone (below); `snappy.sh` makes it. |
+| Third (≈1:36, dark) | `third-cut/` | The first cut's compositor and style, new screens captured from this folder's clone (`third-cut/README.md`). |
+
+The second and third use this folder's music (`music.py`) and the tagline
+"The agentic to-do list that completes itself."; the second's stage (`stage.js`)
+draws large headlines over the window and zooms the console inside it.
+
 The launch video is recorded, not animated: a scratch tavya is seeded as a clone
 of the personal organization, and a director drives the real console through
 the stories in one continuous take. The agents are the mock agent acting out
@@ -28,7 +40,8 @@ python3 design/launch-video/edit.py /tmp/demo/take /tmp/demo/tavya-launch.mp4
 
 The ending zooms into the video a task delivers in its review panel, held on
 its first frame, which is the film's own first frame, so the film loops. So a
-final cut is two takes: the first becomes `/tmp/demo/assets/launch-v1.mp4`
+final cut is two takes (`snappy.sh` does both, with a placeholder for take A's
+delivered video): the first becomes `/tmp/demo/assets/launch-v1.mp4`
 (the delivered video), the second is the film:
 
 ```bash

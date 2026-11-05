@@ -12,21 +12,22 @@ WIKI = os.environ.get('KARMAX_WIKI') or next((os.path.join(HERE, '../../..', d) 
 os.makedirs(f'{D}/prod', exist_ok=True); os.makedirs(f'{D}/assets', exist_ok=True)
 
 def get(p, raw=False, method='GET', body=None):
-    req = urllib.request.Request(B + p, method=method, data=json.dumps(body).encode() if body is not None else None,
-                                 headers={'Authorization': 'Bearer ' + T, 'content-type': 'application/json'})
+    # A signed artifact URL is absolute (it may be another host): no token goes with it.
+    absolute = p.startswith('http')
+    req = urllib.request.Request(p if absolute else B + p, method=method, data=json.dumps(body).encode() if body is not None else None,
+                                 headers={'User-Agent': 'tavya-launch-video'} if absolute else {'Authorization': 'Bearer ' + T, 'content-type': 'application/json'})
     with urllib.request.urlopen(req, timeout=120) as r:
         return r.read() if raw else json.load(r)
 
 # What must never be shown lives in the private wiki (ops/launch-video), not in this public repository.
-page = open(os.path.join(WIKI, 'ops/launch-video/MEMORY.md')).read()
-terms = [t.strip() for t in re.search(r'```private-terms\n(.*?)```', page, re.S).group(1).split('\n') if t.strip()]
-json.dump(terms, open(f'{D}/prod/private-terms.json', 'w'))
-PRIVATE = re.compile('|'.join(terms), re.I)
+sys.path.insert(0, HERE)
+from private import PRIVATE, PRIVATE_PROJECTS, TERMS  # noqa: E402
+json.dump(TERMS, open(f'{D}/prod/private-terms.json', 'w'))
 # Also: links to other organizations, e-mail addresses, people's surnames.
 OTHER = re.compile(r'tavya\.io/(?!personal|api|mcp|cli|docs|pricing|policies)[a-z0-9-]+|@[a-z0-9.-]+\.(com|org|io)|sudhir', re.I)
 SKIP = {'S3 storage integration tests', 'Fork contributions E2E'}
 
-projects = [p for p in get('/api/projects') if p['organizationId'] == 'org_personal' and p['name'] not in SKIP and not PRIVATE.search(p['name'])]
+projects = [p for p in get('/api/projects') if p['organizationId'] == 'org_personal' and p['name'] not in SKIP and p['name'] not in PRIVATE_PROJECTS and not PRIVATE.search(p['name'])]
 json.dump(projects, open(f'{D}/prod/projects.json', 'w'), indent=1)
 for p in projects:
     out, lo = [], 0
@@ -38,7 +39,7 @@ for p in projects:
             lv = t.get('lastView') or {}
             out.append({'num': t['num'], 'title': t['title'], 'workflow': t['workflow'], 'createdAt': t['createdAt'],
                         'statusChangedAt': t.get('statusChangedAt'), 'stage': lv.get('stage'), 'status': lv.get('status'),
-                        'prompt': (t.get('params') or {}).get('prompt', '')[:4000]})
+                        'prompt': (t.get('params') or {}).get('prompt', '')[:4000], 'parentTaskId': t.get('parentTaskId'), 'id': t['id']})
         if not d['tasks'] and lo > max([x['num'] for x in out] + [0]): break
         lo += 150
     out.sort(key=lambda t: t['num'])

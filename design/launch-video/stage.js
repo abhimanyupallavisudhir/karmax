@@ -1,12 +1,15 @@
 // The recording stage. In the top page (/__stage) it builds a brand backdrop,
-// a browser window holding the real console in an iframe, a caption band, a
+// a headline band, a browser window holding the real console in an iframe (the camera
+// zooms the console inside it), a
 // cursor, title cards, a terminal and a feature grid; `window.__demo` drives them.
 // Inside the console's frame it only makes the console show Mac shortcuts.
 (() => {
   try { Object.defineProperty(Navigator.prototype, 'platform', { get: () => 'MacIntel' }); } catch {}
   if (window !== window.top || !location.pathname.startsWith('/__stage')) return;
-  const W = 1440, H = 810, S = 0.84, BAR = 32, Z = 4 / 3;
-  const WW = Math.round(W * S), WH = Math.round(H * S), X0 = Math.round((W - WW) / 2), Y0 = 20;
+  const W = 1440, H = 810, S = 0.8, BAR = 32, Z = 4 / 3;
+  // The headline band on top; the window below it runs just past the bottom edge.
+  const WW = Math.round(W * S), WH = Math.round(H * S), X0 = Math.round((W - WW) / 2), Y0 = 150;
+  const VH = H - Y0 - BAR; // how much of the console's view is on screen
   const css = `
   html{margin:0;width:${W * Z}px;height:${H * Z}px;overflow:hidden;background:#eef0f5}
   /* Laid out at 1440×810, drawn at 1920×1080: the transform re-rasterises everything at full resolution. */
@@ -14,21 +17,24 @@
   #bg{position:absolute;inset:0;background:radial-gradient(1100px 620px at 50% 38%,#ffffff 0%,#f3f4f8 55%,#e7e9f1 100%)}
   #bg:after{content:"";position:absolute;inset:0;background:radial-gradient(700px 300px at 18% 105%,rgba(91,91,214,.10),transparent 70%),radial-gradient(600px 280px at 88% 100%,rgba(214,164,60,.10),transparent 70%)}
   #win{position:absolute;left:${X0}px;top:${Y0}px;width:${WW}px;height:${WH + BAR}px;border-radius:12px;overflow:hidden;background:#fff;
-    box-shadow:0 30px 80px rgba(30,30,60,.18),0 8px 24px rgba(30,30,60,.10),0 0 0 1px rgba(20,20,40,.08);transform-origin:0 0;will-change:transform}
+    box-shadow:0 30px 80px rgba(30,30,60,.18),0 8px 24px rgba(30,30,60,.10),0 0 0 1px rgba(20,20,40,.08);transform-origin:0 0}
   #win .bar{height:${BAR}px;display:flex;align-items:center;gap:7px;padding:0 13px;background:#f4f4f7;border-bottom:1px solid #e3e3ea;box-sizing:border-box}
   #win .dot{width:11px;height:11px;border-radius:50%}
   #win .url{margin:0 auto;transform:translateX(-24px);height:21px;min-width:360px;padding:0 14px;border-radius:7px;background:#fff;border:1px solid #e3e3ea;
     display:flex;align-items:center;justify-content:center;gap:6px;font-size:12.5px;color:#55556a;letter-spacing:.005em}
   #win .url b{color:#16161d;font-weight:600}
   #win .view{position:relative;width:${WW}px;height:${WH}px;overflow:hidden}
-  #app{position:absolute;left:0;top:0;width:${W}px;height:${H}px;border:0;transform:scale(${S});transform-origin:0 0;background:#f7f8fa}
-  #band{position:absolute;left:0;right:0;top:${Y0 + BAR + WH}px;bottom:0;display:flex;align-items:center;justify-content:center;pointer-events:none;z-index:11}
-  #caption{font-size:26px;font-weight:600;letter-spacing:-.015em;color:#16161d;opacity:0;transform:translateY(10px);transition:opacity .35s ease,transform .5s cubic-bezier(.2,.9,.25,1);white-space:nowrap;
-    padding:9px 22px;border-radius:14px;background:rgba(255,255,255,.82);backdrop-filter:blur(12px);box-shadow:0 6px 24px rgba(30,30,60,.10),0 0 0 1px rgba(20,20,40,.05)}
+  #app{position:absolute;left:0;top:0;width:${W}px;height:${H}px;border:0;transform:scale(${S});transform-origin:0 0;background:#f7f8fa;will-change:transform}
+  #head{position:absolute;left:0;right:0;top:0;height:${Y0}px;display:flex;flex-direction:column;align-items:center;justify-content:center;padding-bottom:6px;box-sizing:border-box;pointer-events:none;z-index:15;text-align:center}
+  #head .t{font-size:46px;font-weight:750;letter-spacing:-.035em;line-height:1.08;color:#16161d;white-space:nowrap}
+  #head .t em{font-style:normal;color:#5b5bd6}
+  #head .t kbd{font:650 33px Inter,system-ui;padding:1px 10px 3px;border-radius:9px;background:#16161d;color:#fff;margin:0 2px;vertical-align:4px}
+  #head .s{margin-top:10px;font-size:19px;font-weight:500;color:#6d6d82;letter-spacing:-.005em;white-space:nowrap}
+  #head .w{display:inline-block;opacity:0;transform:translateY(16px);filter:blur(7px);transition:opacity .45s ease,transform .6s cubic-bezier(.2,.9,.25,1),filter .5s ease}
+  #head .s{opacity:0;transform:translateY(8px);transition:opacity .5s ease .25s,transform .6s cubic-bezier(.2,.9,.25,1) .25s}
+  #head.on .w,#head.on .s{opacity:1;transform:none;filter:none}
+  #head.out{opacity:0;transform:translateY(-10px);transition:opacity .22s ease,transform .25s ease}
   #still{position:absolute;z-index:26;object-fit:cover;transform-origin:0 0}
-  #caption.on{opacity:1;transform:none}
-  #caption em{font-style:normal;color:#5b5bd6}
-  #caption kbd{font:600 21px Inter,system-ui;padding:2px 9px;border-radius:7px;background:#16161d;color:#fff;margin:0 2px;vertical-align:2px}
   #layer{position:absolute;inset:0;pointer-events:none;z-index:10}
   #cursor{position:absolute;left:0;top:0;width:24px;height:24px;transform:translate(-100px,-100px);will-change:transform;filter:drop-shadow(0 2px 3px rgba(0,0,0,.3));transition:opacity .25s;z-index:30}
   .ripple{position:absolute;width:32px;height:32px;margin:-16px 0 0 -16px;border-radius:50%;border:3px solid rgba(91,91,214,.7);background:rgba(91,91,214,.12);animation:rip .5s ease-out forwards;z-index:29}
@@ -43,20 +49,20 @@
   #card.on .mark,#card.on .word,#card.on .sub,#card.on .url{opacity:1;transform:none}
   #scrim{position:absolute;inset:0;background:rgba(230,232,240,.45);backdrop-filter:blur(6px);opacity:0;transition:opacity .45s ease;z-index:12}
   #scrim.on{opacity:1}
-  #term{position:absolute;left:50%;top:${Y0 + 40}px;width:920px;transform:translate(-50%,18px) scale(.97);opacity:0;transition:all .45s cubic-bezier(.2,.9,.25,1);z-index:14;
+  #term{position:absolute;left:50%;top:${Y0 + 8}px;width:920px;transform:translate(-50%,18px) scale(.97);opacity:0;transition:all .45s cubic-bezier(.2,.9,.25,1);z-index:14;
     background:#15151d;border-radius:12px;box-shadow:0 40px 110px rgba(10,10,30,.45),0 0 0 1px rgba(255,255,255,.07);overflow:hidden}
   #term.on{opacity:1;transform:translate(-50%,0)}
   #term .tbar{height:32px;background:#202029;display:flex;align-items:center;padding:0 13px;gap:7px;color:#9a9ab0;font-size:13px;font-weight:500}
   #term .dot{width:11px;height:11px;border-radius:50%}
   #term .title{flex:1;text-align:center;margin-right:48px}
-  #term pre{margin:0;padding:18px 22px 22px;height:520px;overflow:hidden;font:16px/1.6 "DejaVu Sans Mono",ui-monospace,monospace;color:#e8e8f2;white-space:pre-wrap;word-break:break-word}
+  #term pre{margin:0;padding:18px 22px 22px;height:500px;overflow:hidden;font:16px/1.6 "DejaVu Sans Mono",ui-monospace,monospace;color:#e8e8f2;white-space:pre-wrap;word-break:break-word}
   #term .p{color:#9d98ff}#term .ok{color:#62d6a0}#term .dim{color:#8a8aa2}
   #term .caret{display:inline-block;width:9px;height:18px;background:#e8e8f2;vertical-align:-3px;animation:blink 1s steps(1) infinite}
   @keyframes blink{50%{opacity:0}}
-  #grid{position:absolute;left:50%;top:47%;width:1290px;transform:translate(-50%,-48%);opacity:0;transition:opacity .45s ease,transform .6s cubic-bezier(.2,.9,.25,1);z-index:14;color:#16161d}
-  #grid.on{opacity:1;transform:translate(-50%,-50%)}
-  #grid h2{margin:0 0 18px;font-size:34px;font-weight:700;letter-spacing:-.03em;text-align:center}
-  #grid .tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+  #grid{position:absolute;left:50%;top:${Y0 + 4}px;width:1290px;transform-origin:50% 0;transform:translate(-50%,14px) scale(.92);opacity:0;transition:opacity .45s ease,transform .6s cubic-bezier(.2,.9,.25,1);z-index:14;color:#16161d}
+  #grid.on{opacity:1;transform:translate(-50%,0) scale(.92)}
+  #grid h2{display:none}
+    #grid .tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
   #grid .tile{background:#fff;border-radius:18px;overflow:hidden;box-shadow:0 18px 50px rgba(30,30,60,.16),0 0 0 1px rgba(20,20,40,.06);opacity:0;transform:translateY(16px) scale(.97);transition:all .55s cubic-bezier(.2,.9,.25,1)}
   #grid .tile.on{opacity:1;transform:none}
   #grid .shot{position:relative;height:218px;overflow:hidden;background:#f7f8fa;border-bottom:1px solid #ececf1}
@@ -92,28 +98,33 @@
       <div id="win"><div class="bar"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span>
         <div class="url"><svg width="10" height="11" viewBox="0 0 10 11"><rect x="1" y="5" width="8" height="6" rx="1.5" fill="#8a8aa2"/><path d="M3 5V3.5a2 2 0 0 1 4 0V5" fill="none" stroke="#8a8aa2" stroke-width="1.4"/></svg><b>tavya.io</b><span id="path"></span></div></div>
         <div class="view"><iframe id="app" name="app" src="${src}"></iframe></div></div>
-      <div id="band"><div id="caption"></div></div>
+      <div id="head"></div>
       <div id="layer"><div id="scrim"></div><div id="term"><div class="tbar"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="title">zsh</span></div><pre></pre></div>
         <div id="grid"></div><div id="card"></div><div id="cursor">${CURSOR}</div></div>`;
     place();
+    // scrollIntoView inside the console also scrolls its ancestors here (the stage, the window's
+    // clipped view): hold them still, or the window slides off its place.
+    const still = (el) => el.addEventListener('scroll', () => { if (el.scrollTop || el.scrollLeft) { el.scrollTop = 0; el.scrollLeft = 0; } });
+    still($('#win .view')); still($('#win')); still(document.body);
+    addEventListener('scroll', () => { if (scrollX || scrollY) scrollTo(0, 0); });
     // Every 50 ms: where the action is (stage px), and whether a full-stage layer is up.
     setInterval(() => {
-      const m = new DOMMatrixReadOnly(getComputedStyle($('#win')).transform);
-      const zoomed = m.a > 1.01;
-      const x = zoomed ? X0 + m.e + m.a * (cam.fx - X0) : pos[0];
-      const y = zoomed ? Y0 + m.f + m.a * (cam.fy - Y0) : pos[1];
-      const lx = zoomed ? X0 + m.e + m.a * (cam.left - X0) : x;
+      const m = new DOMMatrixReadOnly(getComputedStyle($('#app')).transform);
+      const z = m.a / S, zoomed = z > 1.01;
+      const x = zoomed ? X0 + m.e + m.a * ((cam.fx - X0) / S) : pos[0];
+      const y = zoomed ? Y0 + BAR + m.f + m.a * ((cam.fy - Y0 - BAR) / S) : pos[1];
+      const lx = zoomed ? X0 + m.e + m.a * ((cam.left - X0) / S) : x;
       const full = ['#card', '#scrim', '#grid', '#term'].some((q) => $(q)?.classList.contains('on')) || !!$('#still');
       // The terminal alone, when it is up: a portrait cut frames just it.
       const tr = $('#term')?.classList.contains('on') ? $('#term').getBoundingClientRect() : null;
-      log.track.push({ t: Date.now() / 1000, x, y, lx, z: m.a, full, ...(tr ? { term: [tr.x / Z, tr.y / Z, tr.width / Z, tr.height / Z] } : {}) });
+      log.track.push({ t: Date.now() / 1000, x, y, lx, z, full, ...(tr ? { term: [tr.x / Z, tr.y / Z, tr.width / Z, tr.height / Z] } : {}) });
     }, 50);
     setInterval(() => { try { const l = $('#app').contentWindow.location; const p = decodeURIComponent(l.pathname + l.search); $('#path').textContent = p === '/' ? '' : p; } catch {} }, 150);
   }
   const api = {
     build,
     log,
-    geometry: { W, H, S, BAR, X0, Y0, WW, WH, Z },
+    geometry: { W, H, S, BAR, X0, Y0, WW, WH, VH, Z },
     move(x, y, ms = 600) {
       const from = [...pos], t0 = performance.now();
       return new Promise((resolve) => {
@@ -128,26 +139,50 @@
     },
     where() { return pos; },
     /** A stage point as it would be with the camera at rest. */
-    unzoom(x, y) { return [X0 + (x - X0 - cam.tx) / cam.s, Y0 + (y - Y0 - cam.ty) / cam.s]; },
+    unzoom(x, y) { return [X0 + (x - X0 - cam.tx) / cam.s, Y0 + BAR + (y - Y0 - BAR - cam.ty) / cam.s]; },
     ripple() { const r = document.createElement('div'); r.className = 'ripple'; r.style.left = `${pos[0]}px`; r.style.top = `${pos[1]}px`; $('#layer').appendChild(r); setTimeout(() => r.remove(), 600); },
     cursorVisible(on) { $('#cursor').style.opacity = on ? '1' : '0'; },
-    caption(html) {
-      log.captions.push({ t: Date.now() / 1000, html: html || '' });
-      const c = $('#caption');
-      if (!html) { c.classList.remove('on'); return; }
-      const show = () => { c.innerHTML = html; void c.offsetWidth; c.classList.add('on'); };
-      if (c.classList.contains('on')) { c.classList.remove('on'); setTimeout(show, 280); } else show();
+    /** The headline: a title (<em> for the accent, <kbd> for keys) and an optional line under it. */
+    caption(title, sub = '') {
+      log.captions.push({ t: Date.now() / 1000, html: title || '' });
+      const h = $('#head');
+      if (title === h.dataset.title && sub === (h.dataset.sub ?? '')) return;
+      const show = () => {
+        h.className = '';
+        h.dataset.title = title || ''; h.dataset.sub = sub;
+        if (!title) { h.innerHTML = ''; return; }
+        h.innerHTML = `<div class="t">${title}</div>${sub ? `<div class="s">${sub}</div>` : ''}`;
+        // Each word (text, <em>'s words, a <kbd>) its own span, so they arrive one after another.
+        const t = h.querySelector('.t'); let i = 0;
+        const split = (node) => {
+          for (const c of Array.from(node.childNodes)) {
+            if (c.nodeType === 3) {
+              const frag = document.createDocumentFragment();
+              for (const part of c.textContent.split(/(\s+)/)) {
+                if (!part) continue;
+                if (/^\s+$/.test(part)) { frag.append(part); continue; }
+                const w = document.createElement('span'); w.className = 'w'; w.textContent = part; w.style.transitionDelay = `${i++ * 55}ms`; frag.append(w);
+              }
+              c.replaceWith(frag);
+            } else if (c.tagName === 'KBD') { c.classList.add('w'); c.style.transitionDelay = `${i++ * 55}ms`; } else split(c);
+          }
+        };
+        split(t);
+        void h.offsetWidth; h.classList.add('on');
+      };
+      if (h.classList.contains('on')) { h.classList.add('out'); setTimeout(show, 240); } else show();
     },
-    /** Zoom the window so stage point (fx, fy) is centred at scale s. */
-    camera(s = 1, fx = W / 2, fy = H / 2, ms = 900, left = fx) {
-      const w = $('#win');
-      let tx = s === 1 ? 0 : W / 2 - (fx - X0) * s - X0, ty = s === 1 ? 0 : H / 2 - (fy - Y0) * s - Y0;
-      // Zoomed in, the window always fills the stage: no backdrop at an edge.
-      if (WW * s >= W) tx = Math.min(-X0, Math.max(W - X0 - WW * s, tx));
-      if ((WH + BAR) * s >= H) ty = Math.min(-Y0, Math.max(H - Y0 - (WH + BAR) * s, ty));
+    /** Zoom the console, inside its window, so stage point (fx, fy) (as at rest) is centred at scale s. */
+    camera(s = 1, fx = W / 2, fy = Y0 + BAR + VH / 2, ms = 900, left = fx) {
+      const ax = (fx - X0) / S, ay = (fy - Y0 - BAR) / S, k = S * s;
+      let tx = WW / 2 - ax * k, ty = VH / 2 - ay * k;
+      // The console always fills the window: no gap at an edge.
+      tx = Math.min(0, Math.max(WW - W * k, tx)); ty = Math.min(0, Math.max(VH - H * k, ty));
+      if (s === 1) { tx = 0; ty = 0; }
       cam = { s, tx, ty, fx, fy, left };
-      w.style.transition = ms ? `transform ${ms}ms cubic-bezier(.45,.05,.2,1)` : 'none';
-      w.style.transform = s === 1 ? '' : `translate(${tx}px,${ty}px) scale(${s})`;
+      const a = $('#app');
+      a.style.transition = ms ? `transform ${ms}ms cubic-bezier(.45,.05,.2,1)` : 'none';
+      a.style.transform = `translate(${tx}px,${ty}px) scale(${k})`;
       return new Promise((r) => setTimeout(r, ms));
     },
     card({ word = 'tavya', sub = '', url = '' } = {}) {
