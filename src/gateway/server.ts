@@ -414,7 +414,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/workflow-pins$/.test(p)) return read ? 'workflow:read' : 'workflow:edit';
   if (/^\/api\/projects\/[^/]+\/propose-workflow-edit$/.test(p)) return 'workflow:edit';
   if (/\/(events|timing)$/.test(p) || p === '/api/activity') return 'task:event:read';
-  if (/\/(sessions|agents|conversation(?:\.jsonl)?)$/.test(p)) return 'task:conversation:read';
+  if (/\/(sessions|agents|conversation(?:\.jsonl)?|fork-history)$/.test(p)) return 'task:conversation:read';
   if (/\/fork-agent$/.test(p)) return 'task:conversation:fork';
   if (p === '/api/agent/git/publish') return 'task:git:publish';
   if (p === '/api/agent/git/import' || p === '/api/agent/git/refresh-upstream') return 'task:git:import';
@@ -6406,6 +6406,8 @@ export class Gateway {
       if (agentsMatch && method === 'GET') return this.json(res, 200, await api.listTaskAgents(token, agentsMatch[1]!));
       const conversationMatch = p.match(/^\/api\/tasks\/([^/]+)\/conversation$/);
       if (conversationMatch && method === 'GET') return this.json(res, 200, await api.taskConversation(token, conversationMatch[1]!, url.searchParams.get('role') ?? 'do'));
+      const forkHistoryMatch = p.match(/^\/api\/tasks\/([^/]+)\/fork-history$/);
+      if (forkHistoryMatch && method === 'GET') return this.json(res, 200, await api.taskForkHistory(token, forkHistoryMatch[1]!, url.searchParams.get('role') ?? 'do'));
       const conversationDownloadMatch = p.match(/^\/api\/tasks\/([^/]+)\/conversation\.jsonl$/);
       if (conversationDownloadMatch && method === 'GET') {
         const taskId = conversationDownloadMatch[1]!;

@@ -129,6 +129,8 @@ describe('gateway route capability binding', () => {
 
   it('protects native conversation downloads as conversation reads', () => {
     expect(cap('GET', '/api/tasks/t1/conversation.jsonl')).toBe('task:conversation:read');
+    // A fork's inherited conversation is a read of its sources' conversations.
+    expect(cap('GET', '/api/tasks/t1/fork-history')).toBe('task:conversation:read');
   });
 
   it('treats a person’s Git identity as authenticated self-service, not an organization credential grant', () => {
