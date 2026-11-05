@@ -6,10 +6,10 @@ Three versions live here:
 | --- | --- | --- |
 | First cut (1:03, dark) | `first-cut/` | Stills of a clone composited frame by frame (`first-cut/README.md`). |
 | Second (≈2:27, light) | this folder | One recorded take of the clone (below); `snappy.sh` makes it. |
-| Third (≈1:36, dark) | `third-cut/` | The first cut's compositor and style, new screens captured from this folder's clone (`third-cut/README.md`). |
+| Third (≈1:40, dark) | `third-cut/` | The first cut's compositor and style, new screens captured from this folder's clone (`third-cut/README.md`). |
 
-The second and third use this folder's music (`music.py`) and the tagline
-"The agentic to-do list that completes itself."; the second's stage (`stage.js`)
+The second uses this folder's music (`music.py`), the third the first cut's score
+(`first-cut/music.py`); both use the tagline "The agentic to-do list that completes itself."; the second's stage (`stage.js`)
 draws large headlines over the window and zooms the console inside it.
 
 The launch video is recorded, not animated: a scratch tavya is seeded as a clone
