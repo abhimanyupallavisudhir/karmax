@@ -22,7 +22,7 @@
   #win .url b{color:#16161d;font-weight:600}
   #win .view{position:relative;width:${WW}px;height:${WH}px;overflow:hidden}
   #app{position:absolute;left:0;top:0;width:${W}px;height:${H}px;border:0;transform:scale(${S});transform-origin:0 0;background:#f7f8fa}
-  #band{position:absolute;left:0;right:0;top:${Y0 + BAR + WH}px;bottom:0;display:flex;align-items:center;justify-content:center;pointer-events:none}
+  #band{position:absolute;left:0;right:0;top:${Y0 + BAR + WH}px;bottom:0;display:flex;align-items:center;justify-content:center;pointer-events:none;z-index:11}
   #caption{font-size:26px;font-weight:600;letter-spacing:-.015em;color:#16161d;opacity:0;transform:translateY(10px);transition:opacity .35s ease,transform .5s cubic-bezier(.2,.9,.25,1);white-space:nowrap;
     padding:9px 22px;border-radius:14px;background:rgba(255,255,255,.82);backdrop-filter:blur(12px);box-shadow:0 6px 24px rgba(30,30,60,.10),0 0 0 1px rgba(20,20,40,.05)}
   #still{position:absolute;z-index:26;object-fit:cover;transform-origin:0 0}
@@ -60,7 +60,13 @@
   #grid .tile{background:#fff;border-radius:18px;overflow:hidden;box-shadow:0 18px 50px rgba(30,30,60,.16),0 0 0 1px rgba(20,20,40,.06);opacity:0;transform:translateY(16px) scale(.97);transition:all .55s cubic-bezier(.2,.9,.25,1)}
   #grid .tile.on{opacity:1;transform:none}
   #grid .shot{position:relative;height:218px;overflow:hidden;background:#f7f8fa;border-bottom:1px solid #ececf1}
-  #grid .shot img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform-origin:var(--o,50% 50%)}
+  #grid .shot img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:0 0;transform-origin:var(--o,0 0)}
+  #grid .pcs{position:absolute;inset:0;display:grid;grid-template-columns:repeat(3,1fr);gap:10px;padding:22px 20px;align-content:center;background:linear-gradient(180deg,#fafafe,#f1f1f8)}
+  #grid .pc{height:58px;border-radius:12px;background:#fff;box-shadow:0 0 0 1px rgba(20,20,40,.08),0 4px 12px rgba(30,30,60,.06);display:flex;align-items:center;gap:9px;padding:0 13px;font:600 15px Inter,system-ui;color:#2a2a38}
+  #grid .pc i{flex:none;width:9px;height:9px;border-radius:50%;background:#c9c9d6}
+  #grid .tile.on .pc i{animation:run 3.2s ease-in-out infinite;animation-delay:calc(var(--k) * .45s)}
+  #grid .pc small{margin-left:auto;font:500 11.5px "DejaVu Sans Mono",monospace;color:#8a8aa2}
+  @keyframes run{0%,100%{background:#c9c9d6;box-shadow:none}35%,65%{background:#2fb67c;box-shadow:0 0 0 4px rgba(47,182,124,.18)}}
   #grid .tile.on .shot img{animation:kb 6s cubic-bezier(.3,.1,.3,1) forwards}
   #grid .shot img.b{opacity:0}
   #grid .tile.on .shot img.b{animation:kb 6s cubic-bezier(.3,.1,.3,1) forwards,xfade 6s ease forwards}
@@ -163,10 +169,10 @@
       },
     },
     grid: {
-      /** tiles: [{icon (svg markup), title, hint, shots: [src, src?], origin: 'x% y%'}] */
+      /** tiles: [{icon (svg markup), title, hint, shots: [src, src?] or html, origin: 'x% y%'}] */
       open(title, tiles) {
         const g = $('#grid');
-        g.innerHTML = `<h2>${title}</h2><div class="tiles">${tiles.map((t) => `<div class="tile"><div class="shot" style="--o:${t.origin ?? '50% 50%'}">${t.shots.map((src, k) => `<img class="${k ? 'b' : 'a'}" src="${src}" alt="">`).join('')}</div>
+        g.innerHTML = `<h2>${title}</h2><div class="tiles">${tiles.map((t) => `<div class="tile"><div class="shot" style="--o:${t.origin ?? '0 0'}">${t.html ?? t.shots.map((src, k) => `<img class="${k ? 'b' : 'a'}" src="${src}" alt="">`).join('')}</div>
           <div class="cap"><span class="ico">${t.icon}</span><div><div class="t">${t.title}</div>${t.hint ? `<div class="h">${t.hint}</div>` : ''}</div></div></div>`).join('')}</div>`;
         return Promise.all([...g.querySelectorAll('img')].map((i) => i.decode().catch(() => {}))).then(() => { void g.offsetWidth; g.classList.add('on'); });
       },

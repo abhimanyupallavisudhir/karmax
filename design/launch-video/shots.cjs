@@ -8,11 +8,11 @@ module.exports = async function shoot(browser, { app, storageState, out, route }
   const page = await context.newPage();
   const sleep = (ms) => page.waitForTimeout(ms);
   const shots = {};
-  const crop = async (name, locators, pad = 14) => {
+  const crop = async (name, locators, pad = 14, { bottom } = {}) => {
     const boxes = [];
     for (const l of locators) boxes.push(await l.boundingBox());
     const x = Math.max(0, Math.min(...boxes.map((b) => b.x)) - pad), y = Math.max(0, Math.min(...boxes.map((b) => b.y)) - pad);
-    const r = Math.min(1440, Math.max(...boxes.map((b) => b.x + b.width)) + pad), bt = Math.min(810, Math.max(...boxes.map((b) => b.y + b.height)) + pad);
+    const r = Math.min(1440, Math.max(...boxes.map((b) => b.x + b.width)) + pad), bt = Math.min(810, bottom ?? Math.max(...boxes.map((b) => b.y + b.height)) + pad);
     const file = path.join(out, `${name}.png`);
     await page.screenshot({ path: file, clip: { x, y, width: r - x, height: bt - y } });
     shots[name] = file;
@@ -26,27 +26,32 @@ module.exports = async function shoot(browser, { app, storageState, out, route }
   // Agents: the model picker, open.
   await form();
   const agent = page.locator('#tf-page .form-row[data-row="agent:do"]');
-  await agent.scrollIntoViewIfNeeded();
+  await agent.evaluate((e) => e.scrollIntoView({ block: 'start' })); await sleep(300);
+  await page.mouse.wheel(0, -70); await sleep(300);
   await agent.locator('.combo-caret').first().click(); await sleep(700);
-  const menu = page.locator('[role="listbox"], .combo-menu, .combo-list').filter({ visible: true }).first();
-  await crop('agents', [agent.locator('.af-ref').first(), menu]);
+  const ref = agent.locator('.af-ref').first(), rb = await ref.boundingBox();
+  await crop('agents', [ref], 14, { bottom: rb.y + 318 });
   await page.keyboard.press('Escape'); await sleep(200);
 
   // Triggers: after a task, on a schedule, on an event.
   const triggers = page.locator('#tf-page .form-row[data-row="__triggers"]');
   await triggers.evaluate((e) => e.scrollIntoView({ block: 'center' })); await sleep(400);
+  const cron = triggers.locator('input').filter({ visible: true });
+  for (const [i, v] of ['0', '3'].entries()) await cron.nth(i).fill(v);
+  await triggers.getByPlaceholder('github.issues.labeled').fill('agent-cli.released');
+  await triggers.locator('input[type=checkbox]').last().check({ force: true }).catch(() => {}); await sleep(400);
   await crop('triggers', [triggers]);
 
   // The vault and connected apps.
   await page.goto(`${app}/personal/settings#settings-payments`); await sleep(1800);
-  const apps = page.locator('section, .card, .settings-card').filter({ hasText: 'Connected apps' }).last();
+  const apps = page.locator('#settings-connections');
   await crop('apps', [apps]);
-  await page.getByText('Vault credentials', { exact: false }).first().click(); await sleep(1500);
-  await crop('vault', [page.locator('main, #main').first()], 0);
+  await page.getByText('Vault credentials').filter({ visible: true }).first().click(); await sleep(1500);
+  await crop('vault', [page.locator('dialog[open], [role="dialog"]').filter({ visible: true }).first()], 0);
 
   // Insights.
   await page.goto(`${app}/personal/insights`); await sleep(2200);
-  const chart = page.locator('section, .card, .ins-card').filter({ hasText: 'Agent time' }).filter({ has: page.locator('svg') }).last();
+  const chart = page.locator('.ins-chart').first();
   await crop('insights', [chart]);
 
   await context.close();

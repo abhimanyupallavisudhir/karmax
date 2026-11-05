@@ -5,6 +5,7 @@ const { chromium } = require('playwright');
 const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
+const shoot = require('./shots.cjs');
 
 const APP = 'http://127.0.0.1:48950';
 const OUT = process.argv[2] || '/tmp/demo/rec';
@@ -18,7 +19,7 @@ const marks = [];
 let frames = [], introFrame; // introFrame: the film's first frame, which the ending zooms into
 const mark = (name, speed = 1) => { marks.push({ t: Date.now() / 1000, name, speed }); console.log(`[${new Date().toISOString().slice(11, 19)}] ${name} ×${speed}`); };
 
-let page, context;
+let page, context, browser;
 const F = () => page.frame({ name: 'app' });
 const demo = (fn, ...args) => page.evaluate(([f, a]) => window.__demo[f](...a), [fn, args]);
 const caption = (html) => page.evaluate((h) => window.__demo.caption(h), html);
@@ -47,11 +48,29 @@ async function click(locator, { ms, dx = 0.5, dy = 0.5, pause = 120 } = {}) {
   await demo('ripple');
   await page.mouse.click(x * Z, y * Z);
 }
-/** Zoom the window onto an element (its centre, shifted down by `down` of the window height). */
-async function zoomOn(locator, scale = 1.4, down = 0) {
+/** Zoom the window onto an element: its centre, or, when it is bigger than the
+ *  zoomed view, its top-left part (where its text starts). */
+async function zoomOn(locator, scale = 1.4, { ms = 900 } = {}) {
   const b = await boxOf(locator.filter({ visible: true }).first());
   const g = await page.evaluate(() => window.__demo.geometry);
-  await page.evaluate(([s, x, y]) => window.__demo.camera(s, x, y, 900), [scale, b.x + b.width / 2, b.y + b.height / 2 + g.WH * down / scale]);
+  const sx = b.x + Math.min(b.width / 2, 0.42 * g.W / scale), sy = b.y + Math.min(b.height / 2, 0.36 * g.H / scale);
+  const [x, y] = await page.evaluate(([x, y]) => window.__demo.unzoom(x, y), [sx, sy]);
+  await page.evaluate(([s, x, y, t]) => window.__demo.camera(s, x, y, t), [scale, x, y, ms]);
+}
+/** Back to the whole window; `wait` false lets it ease out under what follows. */
+const zoomOut = (ms = 650, wait = true) => page.evaluate(([t, w]) => { const p = window.__demo.camera(1, 720, 405, t); return w ? p : null; }, [ms, wait]);
+/** Types a budget into the task form's Authorization, zoomed in on it. */
+async function setBudget(amount) {
+  await zoomOut(450);
+  await click(F().locator('summary', { hasText: 'Authorization' }).first());
+  await sleep(300);
+  const budget = F().locator('#tf-payments-budget');
+  await zoomOn(budget, 1.75, { ms: 700 });
+  await click(budget);
+  await budget.focus();
+  await budget.fill('');
+  await type(amount, 130);
+  await sleep(900);
 }
 async function type(text, delay = 34) { await page.keyboard.type(text, { delay }); }
 async function key(k) { await page.keyboard.press(k); }
@@ -78,7 +97,7 @@ async function waitStage(projectName, title, stages, timeout = 240000) {
     await sleep(700);
   }
 }
-const SLUG = { tavya: 'tavya', 'personal-website': 'personal-website', random: 'random' };
+const SLUG = { tavya: 'tavya', 'personal-website': 'personal-website', random: 'random', admin_docs: 'admin_docs' };
 /** Opens a task: by clicking its row when that is part of the story, else (or if the
  *  list re-sorted under the cursor) through the console's router. */
 async function openTask(projectName, title, { click: viaRow = false } = {}) {
@@ -94,7 +113,7 @@ async function openTask(projectName, title, { click: viaRow = false } = {}) {
   return t;
 }
 /** A new task from anywhere: n → project → template → prompt. */
-async function newTask(projectQuery, prompt, { paste, before, delay = 30 } = {}) {
+async function newTask(projectQuery, prompt, { paste, before, delay = 30, zoom = 1.3 } = {}) {
   await key('n');
   await F().locator('#pal-in, .palette input').first().waitFor();
   await sleep(150);
@@ -104,12 +123,14 @@ async function newTask(projectQuery, prompt, { paste, before, delay = 30 } = {})
   await sleep(260);
   await key('Enter');
   await F().locator('#tf-page textarea').first().waitFor();
-  await sleep(250);
+  await sleep(150);
+  if (zoom) await zoomOn(F().locator('#tf-page textarea').first(), zoom, { ms: 650 });
   await type(prompt, delay);
   if (paste) { await sleep(150); await page.keyboard.insertText(paste); }
   if (before) await before();
   await sleep(300);
   await key('Meta+Enter');
+  if (zoom) await zoomOut(650, false);
   await F().getByText('Task started').first().waitFor({ timeout: 15000 }).catch(() => {});
 }
 
@@ -160,17 +181,12 @@ S.rapid = async () => {
     delay: 24,
     before: async () => {
       mark('budget', 1);
-      await click(F().locator('summary', { hasText: 'Authorization' }).first());
-      await sleep(250);
-      const budget = F().locator('#tf-payments-budget');
-      await click(budget);
-      await budget.focus();
-      await budget.fill('');
-      await type('25', 120);
-      await sleep(600);
+      await caption('Give it a card and a budget.');
+      await setBudget('25');
       mark('rapid-typing2', 1.6);
     },
   });
+  await caption('Write a task. Hit <kbd>⌘</kbd><kbd>↵</kbd>. Write the next one.');
   await newTask('web', 'Update my CV to include tavya under my list of projects', { delay: 26 });
   await newTask('tav', "Do a pass of tavya's SEO", { delay: 30 });
   mark('rapid-done', 1);
@@ -183,12 +199,12 @@ S.domain = async () => {
   mark('domain-open', 1);
   await caption(null);
   await openTask('tavya', 'Buy the domain', { click: true });
-  await caption('Give it a card and a budget. It signs up, pays and deploys.');
+  await caption('It signs up, pays and deploys, on its own.');
   mark('domain-work', 5);
   await waitStage('tavya', 'Buy the domain', ['review']);
   await sleep(700);
   mark('domain-message', 1);
-  await zoomOn(F().getByText('Bought tavya.io', { exact: false }), 1.4);
+  await zoomOn(F().locator('.msg.agent', { hasText: 'Bought tavya.io' }).last(), 1.4);
   await sleep(3000);
   await demo('camera', 1);
   await sleep(300);
@@ -233,8 +249,10 @@ S.cv = async () => {
   await row.scrollIntoViewIfNeeded();
   await sleep(300);
   await caption('…or remove the reviewer, and it confirms itself.');
+  await zoomOn(row, 1.5, { ms: 700 });
   await click(row.locator('.cf-del').first());
-  await sleep(500);
+  await sleep(600);
+  await zoomOut(500);
   await click(F().getByRole('button', { name: 'Save parameter changes' }));
   mark('cv-landing', 4);
   await waitStage('personal-website', 'Update my CV', ['done']);
@@ -253,6 +271,7 @@ S.seoReview = async () => {
   const row = F().locator('.form-row[data-row="confirm"]');
   await row.scrollIntoViewIfNeeded();
   await sleep(300);
+  await zoomOn(row, 1.45, { ms: 700 });
   await click(row.locator('[data-route-kind="agent"]').first());
   await sleep(300);
   const ins = row.getByPlaceholder('Instructions for this agent (optional)').first();
@@ -261,13 +280,14 @@ S.seoReview = async () => {
   mark('seo-review-typing', 2.4);
   await type('Run it. Check every public page has its own title and the sitemap is valid.', 22);
   mark('seo-review-save', 1);
+  await zoomOut(500);
   await click(F().getByRole('button', { name: 'Save parameter changes' }));
   await sleep(400);
   await click(F().getByRole('link', { name: 'Chat' }));
   mark('seo-reviewing', 3);
   await waitStage('tavya', "Do a pass of tavya's SEO", ['done', 'merge']);
   mark('seo-reviewed', 1);
-  await zoomOn(F().getByText('Checked the diff', { exact: false }), 1.35);
+  await zoomOn(F().locator('.msg', { hasText: 'Checked the diff' }).last(), 1.35);
   await sleep(2600);
   await demo('camera', 1);
   await sleep(200);
@@ -296,11 +316,11 @@ S.trigger = async () => {
   await newTask('tav', TRIGGER, { delay: 22 });
   mark('trigger-open', 1);
   await openTask('tavya', 'Create a repeatable task', { click: true });
-  await caption('Agents use tavya too, through its MCP.');
+  await caption('Agents can operate tavya too, through its MCP.');
   mark('trigger-work', 4);
   await waitStage('tavya', 'Create a repeatable task', ['review']);
   mark('trigger-message', 1);
-  await zoomOn(F().getByText('Watch agent CLI releases', { exact: false }), 1.35);
+  await zoomOn(F().locator('.msg.agent', { hasText: 'Watch agent CLI releases' }).last(), 1.35);
   await sleep(2600);
   await demo('camera', 1);
   mark('trigger-series', 1);
@@ -323,7 +343,7 @@ S.cli = async () => {
   await demo('scrim', true);
   await page.evaluate(() => window.__demo.term.open('abhimanyu — ~'));
   await sleep(400);
-  await caption('Work from your laptop too: the tavya CLI.');
+  await caption('tavya is not just for code. Dump all your files into tavya…');
   mark('cli-typing', 1.6);
   await termRun('~', 'tavya clone personal/random && cd random', LAPTOP, { colour: (l) => l.startsWith('Cloned') ? `<span class="ok">${l}</span>` : l });
   await termRun('~/random', 'mv ../photos . && tavya add photos', path.join(LAPTOP, 'random'), { show: 'mv ~/Pictures/photos . && tavya add photos' });
@@ -335,10 +355,13 @@ S.cli = async () => {
   photoUrl = out.match(/https?:\/\/\S+/)?.[0]?.replace(SHOW_HOST, '');
   await page.evaluate(() => window.__demo.term.caret());
   mark('cli-typed', 1);
-  await sleep(900);
+  await goto(ACTIVE); // behind the terminal: `n` from the organization asks for a project
+  await sleep(400);
   await page.evaluate(() => window.__demo.term.close());
   await demo('scrim', false);
   await demo('cursorVisible', true);
+  await flight();
+  await caption('Review it, and it lands back on your laptop.');
   await goto(photoUrl || '/personal/random');
   mark('cli-work', 4);
   await waitStage('random', 'Sort my photos', ['review']);
@@ -365,6 +388,37 @@ S.cli = async () => {
   await sleep(300);
 };
 
+const FLIGHT = 'Book me the cheapest direct flight to London on January 3 with reasonable timings. My passport, loyalty card numbers etc. are in this folder.';
+async function flight() {
+  mark('flight', 1);
+  await caption('…and let it run your life.');
+  await sleep(700);
+  mark('flight-typing', 1.6);
+  await newTask('admin_', FLIGHT, { delay: 22, before: async () => { mark('flight-budget', 1); await setBudget('500'); mark('flight-typing2', 1.6); } });
+  mark('flight-open', 1);
+  await openTask('admin_docs', 'Book me the cheapest');
+  mark('flight-work', 4);
+  const allow = F().getByRole('button', { name: 'This task', exact: true }).first();
+  await allow.waitFor({ timeout: 120000 });
+  mark('flight-allow', 1);
+  await sleep(300);
+  await zoomOn(F().locator('.msg.agent', { hasText: 'United login' }).last(), 1.25);
+  await sleep(1900);
+  await zoomOut(500);
+  await click(allow);
+  mark('flight-booking', 4);
+  // It was already in Review (waiting for the approval): wait for the booking itself.
+  const fold = F().locator('summary.fold-head', { hasText: 'Booked:' }).last();
+  await fold.waitFor({ timeout: 120000 });
+  mark('flight-booked', 1);
+  await sleep(400);
+  await click(fold);
+  await sleep(600);
+  await zoomOn(F().locator('.msg.agent', { hasText: 'Booked:' }).last(), 1.4);
+  await sleep(2800);
+  await zoomOut(600);
+}
+
 S.wiki = async () => {
   mark('wiki', 1);
   await caption(null);
@@ -375,27 +429,32 @@ S.wiki = async () => {
   await sleep(2300);
 };
 
-S.checklist = async () => {
-  mark('checklist', 1);
+const ICON = (d) => `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
+const PROVIDERS = ['E2B', 'Hetzner', 'AWS', 'Google Cloud', 'Fly.io', 'Daytona'];
+S.grid = async () => {
+  // Stills of the real console, taken off camera (cut from the film).
+  mark('grid-shots', 0);
+  const shotDir = path.join(OUT, 'shots');
+  fs.mkdirSync(shotDir, { recursive: true });
+  await shoot(browser, { app: APP, storageState: '/tmp/demo/state.json', out: shotDir, route: hostedMeta });
+  const src = (n) => `/__stage/shots/${n}.png`;
+  const tiles = [
+    { icon: ICON('<path d="M12 3l1.9 4.6L18.5 9.5l-4.6 1.9L12 16l-1.9-4.6L5.5 9.5l4.6-1.9z"/><path d="M19 15l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z"/>'), title: 'Claude Code, Codex, OpenCode', hint: 'Your subscription or API key', shots: [src('agents')] },
+    { icon: ICON('<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>'), title: 'A cloud computer per task', hint: 'Sized to the job; it sleeps when idle',
+      html: `<div class="pcs">${PROVIDERS.map((n, k) => `<div class="pc" style="--k:${k}"><i></i>${n}</div>`).join('')}</div>` },
+    { icon: ICON('<circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3M16 7l3 3"/>'), title: 'A vault for logins, keys and cards', hint: 'Agents use them without seeing them', shots: [src('vault')] },
+    { icon: ICON('<path d="M9 2v5M15 2v5M6 7h12v4a6 6 0 0 1-12 0zM12 17v5"/>'), title: 'Any app, over MCP', hint: 'You approve each one', shots: [src('apps')] },
+    { icon: ICON('<path d="M13 2 4 14h7l-1 8 9-12h-7z"/>'), title: 'Tasks that start themselves', hint: 'After a task, on a schedule, on an event', shots: [src('triggers')] },
+    { icon: ICON('<path d="M3 20h18M7 16v-5M12 16V5M17 16v-8"/>'), title: 'Insights', hint: 'Work, tokens and compute over time', shots: [src('insights')] },
+  ];
+  mark('grid', 1);
   await caption(null);
   await demo('cursorVisible', false);
   await demo('scrim', true);
-  const rows = [
-    ['Claude Code, Codex and OpenCode', 'your subscription or key'],
-    ['A cloud computer per task', 'E2B · Hetzner · AWS · Google Cloud · Fly.io'],
-    ['A vault for logins, keys and cards', 'with budgets'],
-    ['Any app, over MCP', 'you approve each one'],
-    ['Sub-tasks, dependencies, schedules, events', ''],
-    ['Human or AI review, then it lands', ''],
-    ['Live previews of what agents build', ''],
-    ['Insights on work, tokens and compute', ''],
-  ];
-  await page.evaluate((r) => window.__demo.list.open('Also on the list', r), rows);
-  for (let i = 0; i < rows.length; i++) { await page.evaluate((j) => window.__demo.list.show(j), i); await sleep(140); }
-  await sleep(250);
-  for (let i = 0; i < rows.length; i++) { await page.evaluate((j) => window.__demo.list.tick(j), i); await sleep(290); }
-  await sleep(1300);
-  await page.evaluate(() => window.__demo.list.close());
+  await page.evaluate((t) => window.__demo.grid.open('Also built in', t), tiles);
+  for (let i = 0; i < tiles.length; i++) { await page.evaluate((j) => window.__demo.grid.show(j), i); await sleep(170); }
+  await sleep(4600);
+  await page.evaluate(() => window.__demo.grid.close());
   await demo('scrim', false);
   await demo('cursorVisible', true);
   await sleep(400);
@@ -409,6 +468,19 @@ S.finale = async () => {
   await newTask('tav', 'Create a launch video for tavya.io that shows just how great it is', { delay: 30 });
   mark('finale-open', 1);
   await openTask('tavya', 'Create a launch video', { click: true });
+  // A real launch video takes hours; the mock finishes in seconds. Show the run as it would be.
+  await F().evaluate(() => {
+    const fmt = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const fix = () => {
+      for (const l of document.querySelectorAll('.fold-label')) if (/^Worked /.test(l.textContent) && l.textContent !== 'Worked 2 h 40 min') l.textContent = 'Worked 2 h 40 min';
+      const you = document.querySelector('.msg.user time');
+      if (you && you.dataset.shifted !== you.getAttribute('datetime')) {
+        you.textContent = fmt.format(new Date(Date.parse(you.getAttribute('datetime')) - (2 * 3600 + 40 * 60 + 9) * 1000));
+        you.dataset.shifted = you.getAttribute('datetime');
+      }
+    };
+    fix(); new MutationObserver(fix).observe(document.body, { subtree: true, childList: true, characterData: true });
+  });
   await caption(null);
   mark('finale-work', 4);
   await waitStage('tavya', 'Create a launch video', ['review']);
@@ -436,15 +508,39 @@ S.finale = async () => {
   mark('end', 1);
 };
 
-const ORDER = ['intro', 'rapid', 'domain', 'seo', 'cv', 'seoReview', 'overhaul', 'trigger', 'cli', 'wiki', 'checklist', 'finale'];
+const ORDER = ['intro', 'rapid', 'domain', 'seo', 'cv', 'seoReview', 'overhaul', 'trigger', 'cli', 'wiki', 'grid', 'finale'];
+
+// Off camera, before the take: logins the vault would hold, and admin_docs' folder (pretend documents).
+const VAULT = [
+  { type: 'login', label: 'flights/united', domains: ['united.com'], username: 'MileagePlus', policy: { use: 'ask', reveal: 'ask' }, secrets: { password: 'demo-not-a-password' } },
+  { type: 'api-key', label: 'hetzner.com', domains: ['hetzner.com'], envVar: 'HCLOUD_TOKEN', secrets: { secret: 'demo-not-a-key' } },
+  { type: 'api-key', label: 'cloudflare.com', domains: ['cloudflare.com'], envVar: 'CLOUDFLARE_API_TOKEN', secrets: { secret: 'demo-not-a-key' } },
+  { type: 'ssh-key', label: 'deploy@tavya.io', secrets: { privateKey: 'demo-not-a-key' } },
+];
+const DOCUMENTS = {
+  'passport.pdf': '%PDF-1.4\n% demo: not a real passport\n',
+  'loyalty-programmes.md': '# Loyalty programmes\n\n- United MileagePlus: XX000000 (demo)\n- BA Executive Club: 00000000 (demo)\n- Virgin Atlantic Flying Club: 0000000000 (demo)\n',
+  'addresses.md': '# Addresses\n\n(demo)\n',
+};
+async function prepare() {
+  for (const item of VAULT) await api('POST', '/api/vault/items', item);
+  fs.mkdirSync(LAPTOP, { recursive: true });
+  fs.rmSync(path.join(LAPTOP, 'admin-docs'), { recursive: true, force: true });
+  console.log(sh('tavya clone personal/admin_docs', LAPTOP).split('\n')[0]);
+  const docs = path.join(LAPTOP, 'admin-docs', 'documents');
+  fs.mkdirSync(docs, { recursive: true });
+  for (const [f, text] of Object.entries(DOCUMENTS)) fs.writeFileSync(path.join(docs, f), text);
+  console.log(sh('tavya add documents', path.join(LAPTOP, 'admin-docs')).split('\n').at(-1));
+}
+const hostedMeta = (ctx) => ctx.route('**/api/meta', async (route) => { const r = await route.fetch(); route.fulfill({ response: r, json: { ...(await r.json()), hosted: true, hostLocal: false } }); });
 
 (async () => {
   fs.rmSync(OUT, { recursive: true, force: true });
   fs.mkdirSync(path.join(OUT, 'frames'), { recursive: true });
-  const browser = await chromium.launch({ args: ['--no-sandbox', '--hide-scrollbars', '--force-color-profile=srgb',
+  browser = await chromium.launch({ args: ['--no-sandbox', '--hide-scrollbars', '--force-color-profile=srgb',
     '--disable-features=LocalNetworkAccessChecks,BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessSendPreflights'] });
   context = await browser.newContext({ storageState: '/tmp/demo/state.json', viewport: { width: 1920, height: 1080 }, deviceScaleFactor: 1, colorScheme: 'light' });
-  await context.route('**/api/meta', async (route) => { const r = await route.fetch(); route.fulfill({ response: r, json: { ...(await r.json()), hosted: true, hostLocal: false } }); });
+  await hostedMeta(context);
   await context.addInitScript({ path: path.join(__dirname, 'stage.js') });
   // The console refuses to be framed elsewhere; the stage is the console's own origin.
   // Every agent in the demo is the scripted mock, whatever the form picked.
@@ -456,6 +552,8 @@ const ORDER = ['intro', 'rapid', 'domain', 'seo', 'cv', 'seoReview', 'overhaul',
   await context.route((u) => u.origin === APP && !u.pathname.startsWith('/api/'), async (route) => {
     const req = route.request();
     if (new URL(req.url()).pathname === '/__stage/first.png') return route.fulfill({ path: path.join(OUT, 'frames', introFrame), contentType: 'image/jpeg' });
+    const shot = new URL(req.url()).pathname.match(/^\/__stage\/shots\/(\w+\.png)$/);
+    if (shot) return route.fulfill({ path: path.join(OUT, 'shots', shot[1]), contentType: 'image/png' });
     if (new URL(req.url()).pathname.startsWith('/__stage')) return route.fulfill({ contentType: 'text/html', body: '<!doctype html><html><head><meta charset="utf-8"><title>tavya</title></head><body></body></html>' });
     if (req.resourceType() !== 'document') return route.fallback();
     const r = await route.fetch();
@@ -463,6 +561,7 @@ const ORDER = ['intro', 'rapid', 'domain', 'seo', 'cv', 'seoReview', 'overhaul',
     if (headers['content-security-policy']) headers['content-security-policy'] = headers['content-security-policy'].replace(/frame-ancestors[^;]*;?/g, '');
     return route.fulfill({ response: r, headers });
   });
+  await prepare();
   page = await context.newPage();
   page.on('pageerror', (e) => console.error('pageerror', e.message));
   page.on('console', (m) => { if (m.type() === 'error') console.error('console', m.text().slice(0, 200)); });

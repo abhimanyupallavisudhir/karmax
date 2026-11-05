@@ -194,7 +194,7 @@ entry(r'^Create a launch video for tavya', [
     '@step command python3 demo/launch-video/edit.py :: tavya-launch.mp4  1920×1080 · 60 fps',
     '@run mkdir -p launch && cp /tmp/demo/assets/launch-v1.mp4 launch/tavya-launch.mp4',
     '@openaction Launch video :: launch/tavya-launch.mp4',
-    '@say ' + esc('''The launch video is ready: about two minutes, 1080p at 60 fps, and it loops. Open it in the review panel.'''),
+    '@say ' + esc('''The launch video is ready: 1080p at 60 fps, and it loops. Open it in the review panel.'''),
 ], pace=1600)
 
 # ── admin_docs: a flight, with a vault login it must be allowed to use ────
