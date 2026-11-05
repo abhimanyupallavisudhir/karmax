@@ -539,7 +539,8 @@ export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'goal',
     version: '1.30.0',
-    description: 'Software Dev in autonomous completion mode with prerequisite-aware lifecycle restoration, GitHub-authoritative PR state, per-PR multi-repository landing ownership, canonical fallback admission, and reviewed adoption of task-created resources.',
+    description: 'Retired: Software Dev in autonomous completion mode, superseded by an agent Reviewer. Retained so existing tasks keep running; new tasks cannot choose it.',
+    selectable: false,
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [{ type: 'goal.completed', description: 'Goal reached.', fields: {} }],
@@ -637,6 +638,12 @@ export const LEGACY_BUNDLED_MANIFESTS: WorkflowManifest[] = MANIFESTS
   // minor below the current one, and a version bump needs no edit here.
   .flatMap((m) => Array.from({ length: Number(m.version.split('.')[1]) },
     (_, minor) => ({ ...m, version: `1.${minor}.0` })));
+
+/** Workflows no new task may start as, nor a running one switch to. Goal
+ * (autonomous completion) is superseded by an agent Reviewer; it stays
+ * registered only so executions already pinned to it replay and finish. */
+export const RETIRED_WORKFLOWS: ReadonlySet<string> = new Set(['goal']);
+export const RETIRED_WORKFLOW_HINT = 'Goal is retired: give the task an agent Reviewer instead';
 
 export function manifest(name: string): WorkflowManifest | undefined {
   return MANIFESTS.find((m) => m.name === name);

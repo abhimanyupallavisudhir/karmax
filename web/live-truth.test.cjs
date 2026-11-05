@@ -75,19 +75,20 @@ function extractConst(name) {
   console.log('ok  waiting labels are human-readable in the check-in pane');
 }
 
-// ── 2. the task list uses the workflow label, like every other surface ───────
+// ── 2. workflow labels; the task list names no workflow ──────────────────────
 {
   const ctx = {};
   new Function('ctx', `${extractConst('WORKFLOWS')}\n${extractConst('workflowLabel')}\nctx.workflowLabel = workflowLabel;`)(ctx);
   assert.strictEqual(ctx.workflowLabel('software-dev'), 'Software dev');
-  assert.strictEqual(ctx.workflowLabel('goal'), 'Goal (auto-run)');
-  // Unknown/hidden workflows (just-do, script-exec are intentionally not offered
+  // Hidden and retired workflows (just-do, script-exec, goal are not offered
   // in the composer) fall back to the id rather than rendering blank.
   assert.strictEqual(ctx.workflowLabel('just-do'), 'just-do');
+  assert.strictEqual(ctx.workflowLabel('goal'), 'goal');
 
-  assert.ok(!/<span class="wf">\$\{esc\(t\.workflow\)\}/.test(src),
-    'task list still renders the raw workflow id; use workflowLabel(t.workflow)');
-  console.log('ok  task list renders the workflow label, not the id');
+  // With one workflow to start, a row naming it says nothing.
+  assert.ok(!/<span class="wf">\$\{esc\((workflowLabel\()?t\.workflow/.test(src),
+    'task list rows name the workflow; with one choice it is noise');
+  console.log('ok  task list rows do not name the workflow');
 }
 
 // ── 3. a failed search is distinguishable from an empty result ───────────────

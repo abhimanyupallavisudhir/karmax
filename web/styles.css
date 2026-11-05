@@ -635,7 +635,6 @@ a { color: var(--accent); text-decoration: none; }
    gapped and wrapped away from the words around it. Prose flows as prose. */
 p.task-sub { display: block; line-height: 1.55; }
 p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
-.task-sub .wf { font-family: var(--font-mono); color: var(--ink-2); }
 .task-sub .branch { font-family: var(--font-mono); }
 .task-right { display: flex; align-items: center; gap: 12px; }
 .row-when { color: var(--ink-3); font-size: var(--fs-12); font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -3421,8 +3420,6 @@ html[data-theme="dark"] .github-signin-btn:active,
 .attempt-note { color: var(--accent); font-size: var(--fs-11); font-weight: 600; }
 .attempt-add { flex: none; }
 
-.tp-workflow { display: flex; align-items: center; gap: 10px; font-size: var(--fs-13); }
-.tp-workflow .mono { color: var(--ink-3); font-size: var(--fs-12); }
 
 .stage-picker { display: inline-flex; align-items: center; }
 .stage-picker select {
@@ -4253,8 +4250,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .ab-frozen, .pf-fieldset { border: 0; padding: 0; margin: 0; min-inline-size: auto; display: grid; gap: 8px; }
 .ab-frozen > *, .pf-fieldset > * { opacity: .7; }
 .tp-creds-head { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--line); }
-.tp-creds-head label, .tp-workflow > label { font-size: var(--fs-12); font-weight: 600; color: var(--ink-2); }
-.tp-workflow { margin-bottom: 10px; }
+.tp-creds-head label { font-size: var(--fs-12); font-weight: 600; color: var(--ink-2); }
 .agent-authority #tp-auth { display: grid; gap: 8px; }
 .agent-authority #tp-auth .params-save-bar { position: static; margin-top: 0; padding-top: 4px; background: none; }
 /* The main agent's cards and budget save with its authorization. */

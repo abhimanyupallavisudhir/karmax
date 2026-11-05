@@ -13,7 +13,7 @@ import { TOOL_CAPABILITY, Capability, ORGANIZATION_WIKI_WRITE_DENIED, allows } f
 import { AppGrants, sessionCapabilities } from '../auth/app-grants.js';
 import { WORKFLOW_TYPE, SIG, pinnedType, TASK_WORKFLOW_TASK_TIMEOUT } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
-import { MANIFESTS, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
+import { MANIFESTS, RETIRED_WORKFLOWS, RETIRED_WORKFLOW_HINT, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
 import { organizationSkillsDir, projectSkillsDir } from '../resolve/skills.js';
 import { validGitBranch } from '../util/git-ref.js';
 import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
@@ -356,9 +356,6 @@ const FOLLOW_UP_ACTION = (role?: AgentRole): TaskView['actions'][number] => ({
   args: [{ name: 'text', type: 'text', label: 'Message', required: true }],
   ...(role ? { roles: [role] } : {}),
 });
-
-const GOAL_RESUME_MESSAGE =
-  'Workflow switched to Goal. Continue autonomously until the entire task is complete; do not stop after partial progress.';
 
 type CollaborationTargetIssue = {
   admission: string;
@@ -1561,6 +1558,7 @@ export class KarmaxApi {
     const project = (await this.deps.store.getProject(args.projectId));
     if (!project) throw new NotFoundError(`no project ${args.projectId}`);
     const workflow = args.workflow ?? 'software-dev';
+    if (RETIRED_WORKFLOWS.has(workflow)) throw new Error(RETIRED_WORKFLOW_HINT);
     // Honor a per-project version pin (§21d) so a project can hold on a specific
     // version while others take the latest; unpinned → latest.
     const start = this.resolveStart(workflow, (await this.workflowPinFor(args.projectId, workflow)), project.organizationId);
@@ -7677,16 +7675,14 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     workflow: string,
   ): Promise<{ workflow: 'software-dev' | 'goal'; task?: TaskRecord }> {
     const task = (await this.deps.store.getTask(taskId));
-    const caller = (await this.require(token, 'edit_task', { projectId: task?.projectId, taskId }));
+    (await this.require(token, 'edit_task', { projectId: task?.projectId, taskId }));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
+    // Goal is retired, so the one compatible switch left is a Goal task's way
+    // back to Software Dev (asking for the mode a task already has is a no-op).
+    if (RETIRED_WORKFLOWS.has(workflow) && task.workflow !== workflow) throw new Error(RETIRED_WORKFLOW_HINT);
     if (workflow !== 'software-dev' && workflow !== 'goal') {
       throw new Error('only Software Dev and Goal are compatible in-flight');
     }
-    // Goal has no Review gate. Switching to it is the same reviewer's decision
-    // as patching `confirm.layers` to `[]` (updateParams), so a task agent,
-    // which holds task:edit on its own task, needs review:approve for it too.
-    if (workflow === 'goal' && task.workflow !== 'goal' && caller.kind === 'agent' && !allows(caller.caps, 'review:approve'))
-      throw new CapabilityError('switching a task to Goal removes its Review gate and needs review:approve (a maintainer-level authorization)');
     // A draft has no Temporal execution yet, so its workflow is ordinary editable
     // task metadata. Re-pin it to the target definition in place: identity, notes,
     // tags, authorization and sparse parameters all survive the form change.
@@ -7697,29 +7693,11 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       (await this.deps.store.setDraftWorkflow(taskId, workflow, start.manifest.version));
       return { workflow, task: (await this.deps.store.getTask(taskId))! };
     }
-    const heldView = task.lastView;
-    const heldOrigin =
-      heldView?.status === 'waiting'
-      && heldView.waitingFor?.kind === 'human'
-      && heldView.state?.humanPauseOrigin
-        ? heldView.state.humanPauseOrigin as Stage
-        : undefined;
     try {
       const result = (await this.deps.client.workflow
         .getHandle(taskId)
         .executeUpdate('changeWorkflow', { args: [workflow] })) as { workflow: 'software-dev' | 'goal' };
       (await this.deps.store.setTaskWorkflow(taskId, result.workflow));
-      // "Goal" is itself an instruction to continue autonomously. If the task
-      // was held in Do/Review, release the hold and carry that instruction into a
-      // fresh latest-version execution. This also repairs pre-1.7 held histories.
-      if (result.workflow === 'goal' && heldView && (heldOrigin === 'do' || heldOrigin === 'review')) {
-        const now = Date.now();
-        const message: Message = { id: `mode-${now}`, role: 'user', text: GOAL_RESUME_MESSAGE, ts: now };
-        const resumedView = this.withConversationMessage(heldView, 'do', message);
-        await this.stopTaskActivity(task, heldView, 'Goal mode supplied autonomous direction for a human hold');
-        const updatedTask = (await this.deps.store.getTask(taskId))!;
-        await this.startTransitionReplacement(updatedTask, resumedView, 'do');
-      }
       return result;
     } catch (e) {
       throw new Error(unwrapCause(e));
