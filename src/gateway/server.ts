@@ -2389,7 +2389,15 @@ export class Gateway {
     if (signedArtifact && (method === 'GET' || method === 'HEAD')) {
       const grant = await this.artifactUrls.verify(signedArtifact[1]!);
       if (!grant) return this.json(res, 403, { error: 'this link has expired; open the artifact again' });
-      return this.serveArtifact(req, res, grant.taskId, grant.path);
+      const download = url.searchParams.has('download');
+      if (!grant.artifact) return this.serveArtifact(req, res, grant.taskId, grant.path, false, download);
+      // A saved copy's bytes never change: the browser keeps them while the URL lasts,
+      // so reopening, seeking back, and the Review tile's own load cost nothing more.
+      const saved = await this.deps.store.getPromotedArtifact(grant.artifact);
+      if (!saved || saved.taskId !== grant.taskId || saved.expiresAt != null && saved.expiresAt <= Date.now())
+        return this.json(res, 404, { error: 'this file is no longer kept; open the artifact again' });
+      return this.serveSavedArtifact(req, res, saved, { download,
+        cache: `private, max-age=${Math.max(0, Math.floor((grant.expiresAt - Date.now()) / 1000))}, immutable` });
     }
 
     // ── authenticated endpoints ──
@@ -6164,10 +6172,15 @@ export class Gateway {
       if (raStartMatch && method === 'POST') {
         const taskId = raStartMatch[1]!;
         const b = await this.body(req);
-        // Resolve the action from the AUTHORITATIVE live view (the stored lastView
-        // can lag the workflow), by index — the client never supplies the command,
-        // so only agent-authored actions are runnable.
-        const view = (await api.getTaskView(token, taskId, { live: true }).catch(liveViewUnavailable)) ?? (await store.getTask(taskId))?.lastView;
+        // Opening a file needs only its target, which the stored view (what the
+        // page shows) names: no workflow query, which costs seconds when the
+        // workflow must replay. Anything else is resolved from the AUTHORITATIVE
+        // live view (the stored lastView can lag the workflow), by index — the
+        // client never supplies the command, so only agent-authored actions are runnable.
+        const stored = (await store.getTask(taskId))?.lastView;
+        const shown = stored && (await store.withPendingReviewInfoAsync(taskId, stored));
+        const view = shown?.reviewInfo?.actions?.[Number(b.index)]?.kind === 'open' ? shown
+          : (await api.getTaskView(token, taskId, { live: true }).catch(liveViewUnavailable)) ?? stored;
         const action = view?.reviewInfo?.actions?.[Number(b.index)];
         if (!action) return this.json(res, 404, { error: 'no such review action' });
         const task = (await store.getTask(taskId));
@@ -6208,7 +6221,8 @@ export class Gateway {
           const name = saved?.name ?? (path.posix.basename(target.replace(/\\/g, '/')) || 'artifact');
           const mediaType = untrustedContentHeaders(saved?.mediaType
             ?? ARTIFACT_MIME[path.extname(name).toLowerCase()] ?? 'application/octet-stream', name)['content-type']!;
-          const signed = `/api/artifact-content/${await this.artifactUrls.mint({ taskId, path: target })}/${encodeURIComponent(name)}`;
+          const signed = `/api/artifact-content/${await this.artifactUrls.mint({ taskId, path: target,
+            ...(saved ? { artifact: saved.id } : {}) })}/${encodeURIComponent(name)}`;
           return this.json(res, 200, { kind: 'open', url: signed, external: false, name, mediaType,
             ...(saved ? { bytes: saved.bytes } : {}) });
         }
@@ -9247,10 +9261,11 @@ export class Gateway {
    * gateway never holds a whole file. `sourceFile` (conversation file links)
    * defaults unknown extensions to an inline text view instead of a download,
    * for a useful source view. */
-  private async serveArtifact(req: http.IncomingMessage, res: http.ServerResponse, taskId: string, relPath: string, sourceFile = false) {
+  private async serveArtifact(req: http.IncomingMessage, res: http.ServerResponse, taskId: string, relPath: string, sourceFile = false,
+    download = false) {
     const task = (await this.deps.store.getTask(taskId));
     const saved = !sourceFile && task ? (await savedReviewArtifact(this.deps.store, taskId, relPath)) : undefined;
-    if (saved) return this.serveSavedArtifact(req, res, saved);
+    if (saved) return this.serveSavedArtifact(req, res, saved, { download });
     const handle = worldHandleForView(task?.lastView, taskId, task ? (await this.deps.store.effectiveProjectConfig(task.projectId)) : undefined);
     if (!handle) return this.json(res, 404, { error: 'no world for this task' });
     if (!relPath) return this.json(res, 400, { error: 'missing path' });
@@ -9300,8 +9315,8 @@ export class Gateway {
       const inferredType = ARTIFACT_MIME[path.extname(relPath).toLowerCase()];
       const looksTextual = !head.includes(0);
       await sendArtifact(req, res, source, {
-        ...untrustedContentHeaders(inferredType ?? (sourceFile && looksTextual ? 'text/plain; charset=utf-8' : 'application/octet-stream'),
-          path.basename(relPath)),
+        ...artifactHeaders(inferredType ?? (sourceFile && looksTextual ? 'text/plain; charset=utf-8' : 'application/octet-stream'),
+          path.basename(relPath), download),
         'cache-control': 'private, no-store',
       });
     } catch (error) {
@@ -9318,7 +9333,8 @@ export class Gateway {
    * partial response is checked by size alone. Re-hashing every range would
    * mean reading the whole object for each seek. */
   private async serveSavedArtifact(req: http.IncomingMessage, res: http.ServerResponse,
-    artifact: { objectKey: string; sha256: string; bytes: number; mediaType: string; name: string }) {
+    artifact: { objectKey: string; sha256: string; bytes: number; mediaType: string; name: string },
+    options: { download?: boolean; cache?: string } = {}) {
     const objects = this.deps.objects;
     if (!objects) return this.json(res, 503, { error: 'artifact storage is unavailable' });
     const integrity = new Error('artifact integrity check failed');
@@ -9338,8 +9354,8 @@ export class Gateway {
       return stream.body;
     } };
     try {
-      await sendArtifact(req, res, source, { ...untrustedContentHeaders(artifact.mediaType, artifact.name),
-        'cache-control': 'private, no-store' });
+      await sendArtifact(req, res, source, { ...artifactHeaders(artifact.mediaType, artifact.name, options.download),
+        'cache-control': options.cache ?? 'private, no-store' });
     } catch (error) {
       if (res.headersSent) return void res.destroy();
       return error === integrity ? this.json(res, 502, { error: integrity.message })
@@ -10684,6 +10700,13 @@ export function untrustedContentHeaders(mediaType: string, filename: string): Re
       : "sandbox; default-src 'none'",
     'x-content-type-options': 'nosniff',
   };
+}
+
+/** {@link untrustedContentHeaders}, saved to disk instead of shown when `download`
+ *  (a cross-origin `<a download>` is ignored by browsers, so the server must say it). */
+export function artifactHeaders(mediaType: string, filename: string, download = false): Record<string, string> {
+  const headers = untrustedContentHeaders(mediaType, filename);
+  return download ? { ...headers, 'content-disposition': headers['content-disposition']!.replace(/^inline/, 'attachment') } : headers;
 }
 
 /** For the gateway's own static pages (callbacks, a stopped preview): markup and
