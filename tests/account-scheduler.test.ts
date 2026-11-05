@@ -48,7 +48,7 @@ it('grants what the plan says, holds the rest until the plan\'s recheck time', a
     parks.push(timeout);
     // The query explains the held turn while it waits.
     expect(state.handlers.get('accountLease')!({ taskId: 'low', turnId: 't1' }))
-      .toEqual({ waiting: true, detail: 'Held for higher-priority work', heldUntil: 123 });
+      .toEqual({ waiting: true, reason: 'held', detail: 'Held for higher-priority work', heldUntil: 123 });
     throw stop;
   });
   await expect(run([{ taskId: 'low', turnId: 't1', provider: 'claude', allowed: ['a', 'b'] },
@@ -58,6 +58,29 @@ it('grants what the plan says, holds the rest until the plan\'s recheck time', a
   expect(state.plan).toHaveBeenCalledWith(expect.objectContaining({
     queue: [expect.objectContaining({ taskId: 'low' }), expect.objectContaining({ taskId: 'urgent' })],
     accounts: expect.arrayContaining([expect.objectContaining({ id: 'a', kind: 'login', inUse: 0 })]) }));
+});
+
+// A login the provider still serves, but whose windows the scheduler reads as
+// used up, used to explain itself as "Waiting for a free slot" ("Waiting for
+// credential" in the console) while the login looked free.
+it('says a turn waits for quota, or for a slot, as the plan says — never for a credential', async () => {
+  state.plan.mockResolvedValue({ grants: [], holds: [
+    { taskId: 'spent', turnId: 't1', status: 'quota', until: 456 },
+    { taskId: 'full', turnId: 't2', status: 'next' },
+  ], recheckMs: 60_000 });
+  const answers: unknown[] = [];
+  state.condition.mockImplementation(async (predicate: () => boolean, timeout?: number) => {
+    if (timeout === undefined) { if (!predicate()) throw stop; return true; }
+    answers.push(state.handlers.get('accountLease')!({ taskId: 'spent', turnId: 't1' }),
+      state.handlers.get('accountLease')!({ taskId: 'full', turnId: 't2' }));
+    throw stop;
+  });
+  await expect(run([{ taskId: 'spent', turnId: 't1', provider: 'claude', allowed: ['a'] },
+    { taskId: 'full', turnId: 't2', provider: 'claude', allowed: ['a'] }])).rejects.toBe(stop);
+  expect(answers).toEqual([
+    { waiting: true, reason: 'quota', detail: 'Out of quota until a login resets', earliestResetAt: 456 },
+    { waiting: true, reason: 'slot', detail: 'Every allowed login is running all it may' },
+  ]);
 });
 
 it('plans again as soon as something changes under a held turn', async () => {
@@ -149,6 +172,6 @@ it('tells a lease request a decision is coming while a credential has room, so a
     return true;
   });
   await expect(run([{ taskId: 't', turnId: 'x', provider: 'claude', allowed: ['a'] }])).rejects.toBe(stop);
-  expect(answer).toEqual({ waiting: true, planning: true });
+  expect(answer).toEqual({ waiting: true, planning: true, reason: 'planning' });
   expect(state.handlers.get('accountLease')!({ taskId: 't', turnId: 'x' })).toEqual({ waiting: false });
 });
