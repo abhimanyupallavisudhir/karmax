@@ -35,7 +35,7 @@ for (const entry of ['footer', 'command', 'form', 'scheduled']) {
         esc: text => text,
       });
       vm.runInContext(['confirmTaskAction', 'hasOpenPullRequest', 'confirmMergeRights', 'otherAttemptsConfirmation', 'actionToast',
-        'wireActions', 'runDeclaredAction', 'openActionForm', 'wireTasksView', 'isCrossProjectList'].map(fn).join('\n'), context);
+        'wireActions', 'runDeclaredAction', 'openActionForm', 'wireTasksView', 'wireRowAsks', 'isCrossProjectList'].map(fn).join('\n'), context);
       if (entry === 'footer') {
         context.wireActions(context.S.view);
         await element('button').click();

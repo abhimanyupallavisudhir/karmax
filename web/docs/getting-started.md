@@ -20,7 +20,7 @@ Press **+** next to **Projects** in the sidebar and name it. With GitHub connect
 
 ## 4. Create a task
 
-Type what you want and press **Ctrl+Enter** (**⌘+Enter** on a Mac). Open the full form to choose the agent and model, the computer's size, or who reviews the result.
+Press **New task** at the top of the sidebar (or **N**), say what you want, and press **Ctrl+Enter** (**⌘+Enter** on a Mac). The same form chooses the agent and model, the computer's size, and who reviews the result.
 
 Brief the agent as you would a colleague: the outcome you want, and how you will judge it.
 
@@ -28,7 +28,7 @@ Brief the agent as you would a colleague: the outcome you want, and how you will
 
 A task is a conversation. The agent says what it is doing; you can reply at any time, and it reads your message as it works. Type **@** to call in another agent or a person. **■** stops the agent.
 
-When an agent needs something (a decision, a password, a permission, a payment), the task shows **Needs input** and the bell in the top bar lights up.
+When an agent needs something (a decision, a password, a permission, a payment), the task shows **Needs input**, its project's number in the sidebar goes up, and the bell at the bottom of the sidebar counts it. Often it asks with a small form: answer there, or just reply.
 
 ## 6. Review
 

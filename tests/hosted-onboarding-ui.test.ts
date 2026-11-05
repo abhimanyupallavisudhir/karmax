@@ -34,7 +34,7 @@ describe('hosted onboarding UI', () => {
     await steps.first().waitFor();
     expect(await steps.locator('.onboarding-step-title').allInnerTexts()).toEqual([
       'Connect GitHub', 'Add agent logins', 'Get computers for your agents',
-      'Connect apps and payment cards\nOPTIONAL', 'Create your first project', // chip is upper-cased by CSS
+      'Connect apps and payment cards\nOptional', 'Create your first project', // sentence case, like every label
     ]);
     expect(await steps.nth(3).innerText()).toContain('This never blocks setup.');
     expect(await guide(ui).locator('.onboarding-foot').innerText()).toContain('Optional items do not count toward completion.');
