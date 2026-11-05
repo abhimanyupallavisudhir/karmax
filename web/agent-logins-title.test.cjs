@@ -32,7 +32,6 @@ function ok(condition, message) {
 
 // Task detail page — the Parameters tab renders the same control.
 global.paramsSection = () => '';
-global.workflowSection = () => '';
 global.authorizationSection = () => '';
 global.policyTip = (text) => `<button class="info-dot" title="${text}">ⓘ</button>`;
 // Isolate the account-control title from the task/payment sections, including
