@@ -29,7 +29,7 @@ function browser() {
   const state = { organizationId: 'org', organizations: [{ id: 'org' }], inbox: [], activity: [], tab: 'inbox' };
   let response = [];
   const ctx = vm.createContext({
-    document: { hidden: false }, resourceReviewCache: new Map(), resourceInventoryCache: new Map(),
+    document: { hidden: false }, resourceReviewCache: new Map(), resourceInventoryCache: new Map(), reviewArtifactUrls: new Map(),
     S: state, Map, Set, URGENCY_LEVELS: ['low', 'normal', 'high', 'critical'],
     location: { protocol: 'https:', host: 'example.test' },
     WebSocket: function () {},
@@ -42,7 +42,7 @@ function browser() {
   });
   // Module-level state connectWs reads: reconnect backoff and the vault-approvals repaint hook.
   vm.runInContext('let inboxRefreshTimer; let wsHadDropped = false; let wsRetryMs = 1500; let refreshVaultRequests = null;\n' +
-    ['urgencyRank', 'inboxArrivals', 'loadInbox', 'inboxEventChanges', 'scheduleInboxReload', 'connectWs', 'isCrossProjectList']
+    ['urgencyRank', 'inboxArrivals', 'loadInbox', 'inboxEventChanges', 'scheduleInboxReload', 'connectWs', 'isCrossProjectList', 'forgetReviewArtifactUrls']
       .map(extractFn).join('\n'), ctx);
   return { ctx, state, alerts, timers, respond: (value) => { response = value; } };
 }
@@ -98,6 +98,7 @@ test('failed fetch preserves arrivals and inbox instead of replaying the backlog
 
 test('review checkpoint refreshes the selected task without clearing streaming output or notifying the inbox', () => {
   const b = browser();
+  b.ctx.reviewArtifactUrls.set('task\n0\nlaunch.mp4', {}).set('other\n0\nlaunch.mp4', {});
   b.state.selected = 'task';
   b.state.taskEvents = [];
   b.state.liveOutput = 'Still working';
@@ -108,6 +109,8 @@ test('review checkpoint refreshes the selected task without clearing streaming o
   assert.equal(refreshes, 1);
   assert.equal(b.state.liveOutput, 'Still working');
   assert.equal(b.timers.length, 0);
+  // A republished Review names new saved copies: its old signed URLs are dropped.
+  assert.deepEqual([...b.ctx.reviewArtifactUrls.keys()], ['other\n0\nlaunch.mp4']);
 });
 
 test('opening a task reads its asks, winning over an in-flight inbox fetch without hiding later arrivals', async () => {
