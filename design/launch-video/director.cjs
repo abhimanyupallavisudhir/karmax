@@ -57,8 +57,8 @@ async function zoomOn(locator, scale = 1.4, { ms = 900 } = {}) {
   const b = await boxOf(locator.filter({ visible: true }).first());
   const g = await page.evaluate(() => window.__demo.geometry);
   const sx = b.x + Math.min(b.width / 2, 0.42 * g.W / scale), sy = b.y + Math.min(b.height / 2, 0.36 * g.H / scale);
-  const [x, y] = await page.evaluate(([x, y]) => window.__demo.unzoom(x, y), [sx, sy]);
-  await page.evaluate(([s, x, y, t]) => window.__demo.camera(s, x, y, t), [scale, x, y, ms]);
+  const [x, y, left] = await page.evaluate(([x, y, l]) => [...window.__demo.unzoom(x, y), window.__demo.unzoom(l, y)[0]], [sx, sy, b.x]);
+  await page.evaluate(([s, x, y, t, l]) => window.__demo.camera(s, x, y, t, l), [scale, x, y, ms, left]);
 }
 /** Back to the whole window; `wait` false lets it ease out under what follows. */
 const zoomOut = (ms = 650, wait = true) => page.evaluate(([t, w]) => { const p = window.__demo.camera(1, 720, 405, t); return w ? p : null; }, [ms, wait]);

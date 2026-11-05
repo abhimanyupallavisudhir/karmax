@@ -28,23 +28,29 @@ def sample(t):
     return track[max(0, min(i, len(track) - 1))]
 
 
-# Follow the action smoothly in film time: x eases towards its target (~0.35 s),
-# and the switch between crop and whole stage eases over ~0.45 s.
-rects, x_s, k_s, prev_at = [], None, None, None
+# Follow the action smoothly in film time: the framed rectangle eases towards its
+# target (~0.3 s). Target: the terminal alone; the whole stage for other full-stage
+# moments; else the square around the action, never cutting off the left edge of
+# what the camera zoomed onto (where its text starts).
+def target(s):
+    if s.get('term'):
+        x, y, w, h = (v * Z for v in s['term']); pad = 24
+        return (x - pad, y - pad, w + 2 * pad, h + 2 * pad)
+    if s['full']: return FULL
+    cx = s['x'] * Z
+    if s['z'] > 1.01: cx = min(cx, s['lx'] * Z - 36 + CROP / 2)
+    cx = min(max(cx, CROP / 2), 1920 - CROP / 2)
+    return (cx - CROP / 2, 0, CROP, CROP)
+
+rects, cur, prev_at = [], None, None
 for fr in frames:
-    s = sample(fr['src'])
-    x = min(max(s['x'] * Z, CROP / 2), 1920 - CROP / 2)
-    k = 1.0 if s['full'] else 0.0
-    if x_s is None: x_s, k_s = x, k
+    goal = target(sample(fr['src']))
+    if cur is None: cur = list(goal)
     else:
-        dt = max(0.0, fr['at'] - prev_at)
-        x_s += (x - x_s) * (1 - math.exp(-dt / 0.35))
-        k_s += (k - k_s) * (1 - math.exp(-dt / 0.15)) if abs(k - k_s) > 0.002 else 0
-        k_s = min(1.0, max(0.0, k_s))
+        a = 1 - math.exp(-max(0.0, fr['at'] - prev_at) / 0.3)
+        cur = [c + (g - c) * a for c, g in zip(cur, goal)]
     prev_at = fr['at']
-    e = k_s * k_s * (3 - 2 * k_s)  # smoothstep
-    crop = (x_s - CROP / 2, 0, CROP, CROP)
-    rects.append(tuple(c + (f - c) * e for c, f in zip(crop, FULL)))
+    rects.append(tuple(cur))
 
 src_dir = os.path.join(take, 'frames')
 dst_dir = os.path.join(take, 'mobile-frames' + ('-readable' if meta['readable'] else ''))
@@ -54,10 +60,10 @@ os.makedirs(dst_dir, exist_ok=True)
 def render(job):
     i, name, (x, y, w, h) = job
     im = Image.open(os.path.join(src_dir, name)).convert('RGB')
-    scale = PIC / w
-    pic = im.crop((round(x), round(y), round(x + w), round(y + h))).resize((PIC, round(h * scale)), Image.LANCZOS)
+    scale = min(PIC / w, PIC / h)
+    pic = im.crop((round(x), round(y), round(x + w), round(y + h))).resize((round(w * scale), round(h * scale)), Image.LANCZOS)
     canvas = Image.new('RGB', (W, H), BG)
-    canvas.paste(pic, (0, (PIC - pic.height) // 2))
+    canvas.paste(pic, ((W - pic.width) // 2, (PIC - pic.height) // 2))
     canvas.save(os.path.join(dst_dir, f'{i:07d}.jpg'), quality=92)
 
 

@@ -34,8 +34,7 @@ LINES = [
     ('flight', 0.2, 'Or let it run your life. Book the cheapest direct flight to London, on a five-hundred dollar budget. '
                     'It asks before it uses your United login, then books it.'),
     ('wiki', 0.2, 'What agents learn, they write down, in a wiki you can read.'),
-    ('grid', 0.2, 'And the rest: every major coding agent, a cloud computer per task, a vault, '
-                  'any app over MCP, sub-tasks, and insights.'),
+    ('grid', 0.1, 'Plus every major coding agent, a computer per task, a vault, any app, sub-tasks, and insights.'),
     ('finale', 0.2, 'And one more task: make a launch video. Two hours and forty minutes later…'),
     ('finale-zoom', 0.3, 'tavya.'),
 ]

@@ -81,7 +81,7 @@
   const CURSOR = '<svg viewBox="0 0 24 24" width="24" height="24"><path d="M4 2.5v18l4.6-4.3 2.9 6.7 3.2-1.4-2.9-6.6h6.5z" fill="#111" stroke="#fff" stroke-width="1.5" stroke-linejoin="round"/></svg>';
     const $ = (q) => document.querySelector(q);
   let pos = [W / 2, H / 2 + 60];
-  let cam = { s: 1, tx: 0, ty: 0, fx: W / 2, fy: H / 2 };
+  let cam = { s: 1, tx: 0, ty: 0, fx: W / 2, fy: H / 2, left: W / 2 };
   // What a portrait cut should frame, sampled for the edit: captions, and the point of interest.
   const log = { captions: [], track: [] };
   const ease = (t) => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
@@ -102,8 +102,11 @@
       const zoomed = m.a > 1.01;
       const x = zoomed ? X0 + m.e + m.a * (cam.fx - X0) : pos[0];
       const y = zoomed ? Y0 + m.f + m.a * (cam.fy - Y0) : pos[1];
+      const lx = zoomed ? X0 + m.e + m.a * (cam.left - X0) : x;
       const full = ['#card', '#scrim', '#grid', '#term'].some((q) => $(q)?.classList.contains('on')) || !!$('#still');
-      log.track.push({ t: Date.now() / 1000, x, y, z: m.a, full });
+      // The terminal alone, when it is up: a portrait cut frames just it.
+      const tr = $('#term')?.classList.contains('on') ? $('#term').getBoundingClientRect() : null;
+      log.track.push({ t: Date.now() / 1000, x, y, lx, z: m.a, full, ...(tr ? { term: [tr.x / Z, tr.y / Z, tr.width / Z, tr.height / Z] } : {}) });
     }, 50);
     setInterval(() => { try { const l = $('#app').contentWindow.location; const p = decodeURIComponent(l.pathname + l.search); $('#path').textContent = p === '/' ? '' : p; } catch {} }, 150);
   }
@@ -136,13 +139,13 @@
       if (c.classList.contains('on')) { c.classList.remove('on'); setTimeout(show, 280); } else show();
     },
     /** Zoom the window so stage point (fx, fy) is centred at scale s. */
-    camera(s = 1, fx = W / 2, fy = H / 2, ms = 900) {
+    camera(s = 1, fx = W / 2, fy = H / 2, ms = 900, left = fx) {
       const w = $('#win');
       let tx = s === 1 ? 0 : W / 2 - (fx - X0) * s - X0, ty = s === 1 ? 0 : H / 2 - (fy - Y0) * s - Y0;
       // Zoomed in, the window always fills the stage: no backdrop at an edge.
       if (WW * s >= W) tx = Math.min(-X0, Math.max(W - X0 - WW * s, tx));
       if ((WH + BAR) * s >= H) ty = Math.min(-Y0, Math.max(H - Y0 - (WH + BAR) * s, ty));
-      cam = { s, tx, ty, fx, fy };
+      cam = { s, tx, ty, fx, fy, left };
       w.style.transition = ms ? `transform ${ms}ms cubic-bezier(.45,.05,.2,1)` : 'none';
       w.style.transform = s === 1 ? '' : `translate(${tx}px,${ty}px) scale(${s})`;
       return new Promise((r) => setTimeout(r, ms));
