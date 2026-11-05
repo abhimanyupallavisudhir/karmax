@@ -24,9 +24,11 @@ for name, pid in projects.items():
               'state': {'cancelled': t['status'] == 'cancelled', 'confirmed': t['status'] == 'done', 'turnsSeen': 2, 'worldReady': False},
               'editableParams': [], 'workflowOptions': ['software-dev', 'goal'], 'workflowSwitchable': False, 'pointOfNoReturnPassed': True, 'worldAvailable': False}
         done = t['status'] in ('done', 'cancelled', 'failed')
-        db.execute('''insert into tasks (id, projectId, listId, title, workflow, workflowVersion, params, createdAt, ord, lastView, completedAt, statusChangedAt, createdBy, executionWorkflow, intentId, attemptNumber, num)
-          values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (tid, pid, list_id, t['title'], t['workflow'], '1.30.0', json.dumps({'prompt': t['prompt']}), t['createdAt'], t['num'],
-          json.dumps(lv), t['statusChangedAt'] if done else None, t['statusChangedAt'], created_by, t['workflow'], tid, 1, t['num']))
+        # Its conversation starts with its prompt, so an opened task shows what was asked.
+        convo = {'messages': [{'id': 'm0', 'role': 'user', 'text': t['prompt'], 'ts': t['createdAt']}]} if t['prompt'] else None
+        db.execute('''insert into tasks (id, projectId, listId, title, workflow, workflowVersion, params, createdAt, ord, lastView, completedAt, statusChangedAt, createdBy, executionWorkflow, intentId, attemptNumber, num, conversation)
+          values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (tid, pid, list_id, t['title'], t['workflow'], '1.30.0', json.dumps({'prompt': t['prompt']}), t['createdAt'], t['num'],
+          json.dumps(lv), t['statusChangedAt'] if done else None, t['statusChangedAt'], created_by, t['workflow'], tid, 1, t['num'], json.dumps(convo) if convo else None))
         db.execute('insert into task_intents (id, principalAttemptId, committedAttemptId, confirmer, createdAt) values (?,?,?,?,?)', (tid, tid, tid if done else None, json.dumps({'layers':[{'kind':'human','audience':['@creator']}]}), t['createdAt']))
         n += 1
     print(name, n)

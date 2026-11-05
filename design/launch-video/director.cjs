@@ -13,8 +13,8 @@ const ONLY = process.argv[3] ? new Set(process.argv[3].split(',')) : null;
 const SHOW_HOST = 'https://tavya.io';
 const projects = JSON.parse(fs.readFileSync('/tmp/demo/projects.json', 'utf8'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-// DEMO_HOLD > 1 records the readable cut: every pause for reading lasts that much longer.
-const HOLD = Number(process.env.DEMO_HOLD || 1);
+// DEMO_HOLD scales every pause for reading: 0.8 (default) for the snappy cut, 1.8 for the readable one.
+const HOLD = Number(process.env.DEMO_HOLD || 0.8);
 const hold = (ms) => sleep(ms * HOLD);
 const Z = 4 / 3; // the stage is laid out at 1440×810 and drawn at 1920×1080
 
@@ -25,7 +25,8 @@ const mark = (name, speed = 1) => { marks.push({ t: Date.now() / 1000, name, spe
 let page, context, browser;
 const F = () => page.frame({ name: 'app' });
 const demo = (fn, ...args) => page.evaluate(([f, a]) => window.__demo[f](...a), [fn, args]);
-const caption = (html) => page.evaluate((h) => window.__demo.caption(h), html);
+/** The headline over the window: a title (<em> accent) and an optional line under it. */
+const caption = (title, sub = '') => page.evaluate(([t, s]) => window.__demo.caption(t, s), [title, sub]);
 
 async function boxOf(locator) {
   await locator.waitFor({ state: 'visible', timeout: 60000 });
@@ -42,7 +43,11 @@ async function boxOf(locator) {
 }
 /** Moves the cursor to the element like a hand would, then clicks it. */
 async function click(locator, { ms, dx = 0.5, dy = 0.5, pause = 120 } = {}) {
-  const b = await boxOf(locator);
+  let b = await boxOf(locator);
+  // Zoomed in, the window shows only part of the console: zoom out if the target is off screen.
+  const g = await page.evaluate(() => window.__demo.geometry);
+  const off = (r) => r.x + r.width * dx < g.X0 + 4 || r.x + r.width * dx > g.X0 + g.WW - 4 || r.y + r.height * dy < g.Y0 + g.BAR + 4 || r.y + r.height * dy > g.H - 6;
+  if (off(b)) { await zoomOut(450); b = await boxOf(locator); }
   const x = b.x + b.width * dx, y = b.y + b.height * dy;
   const cur = await page.evaluate(() => window.__demo.where());
   const dist = Math.hypot(x - cur[0], y - cur[1]);
@@ -56,7 +61,7 @@ async function click(locator, { ms, dx = 0.5, dy = 0.5, pause = 120 } = {}) {
 async function zoomOn(locator, scale = 1.4, { ms = 900 } = {}) {
   const b = await boxOf(locator.filter({ visible: true }).first());
   const g = await page.evaluate(() => window.__demo.geometry);
-  const sx = b.x + Math.min(b.width / 2, 0.42 * g.W / scale), sy = b.y + Math.min(b.height / 2, 0.36 * g.H / scale);
+  const sx = b.x + Math.min(b.width / 2, 0.42 * g.WW / scale), sy = b.y + Math.min(b.height / 2, 0.36 * g.VH / scale);
   const [x, y, left] = await page.evaluate(([x, y, l]) => [...window.__demo.unzoom(x, y), window.__demo.unzoom(l, y)[0]], [sx, sy, b.x]);
   await page.evaluate(([s, x, y, t, l]) => window.__demo.camera(s, x, y, t, l), [scale, x, y, ms, left]);
 }
@@ -175,7 +180,7 @@ S.intro = async () => {
 const OVERHAUL = fs.readFileSync('/tmp/demo/assets/815-prompt.md', 'utf8');
 S.rapid = async () => {
   mark('rapid', 1);
-  await caption('Write a task. Hit <kbd>⌘</kbd><kbd>↵</kbd>. Write the next one.');
+  await caption('Write a task. Hit <kbd>⌘</kbd><kbd>↵</kbd>. <em>Write the next.</em>', 'Every project in one list; each task handed to an agent.');
   await sleep(900);
   mark('rapid-typing', 1.6);
   const firstLine = OVERHAUL.split('\n').slice(0, 3).join('\n');
@@ -184,28 +189,32 @@ S.rapid = async () => {
     delay: 24,
     before: async () => {
       mark('budget', 1);
-      await caption('Give it a card and a budget.');
+      await caption('Give it <em>a card and a budget.</em>', 'It can pay for what the job needs, up to what you allow.');
       await setBudget('25');
       mark('rapid-typing2', 1.6);
     },
   });
-  await caption('Write a task. Hit <kbd>⌘</kbd><kbd>↵</kbd>. Write the next one.');
+  await caption('Write a task. Hit <kbd>⌘</kbd><kbd>↵</kbd>. <em>Write the next.</em>', 'Every project in one list; each task handed to an agent.');
   await newTask('web', 'Update my CV to include tavya under my list of projects', { delay: 26 });
   await newTask('tav', "Do a pass of tavya's SEO", { delay: 30 });
   mark('rapid-done', 1);
-  await caption('Each runs on its own computer, in parallel.');
-  await demo('move', 1180, 520, 700);
-  await hold(1900);
+  await caption('Each runs on <em>its own computer.</em>', 'In parallel, while you do something else.');
+  await demo('move', 1180, 560, 700);
+  await zoomOn(F().locator('.task-title').first(), 1.55, { ms: 800 });
+  await hold(1700);
+  await zoomOut(600, false);
 };
 
 S.domain = async () => {
   mark('domain-open', 1);
   await caption(null);
   await openTask('tavya', 'Buy the domain', { click: true });
-  await caption('It signs up, pays and deploys, on its own.');
+  await caption('It signs up, pays <em>and deploys.</em>', 'Accounts, payments and logins, saved to your vault.');
+  await zoomOn(F().locator('#tp-body'), 1.3, { ms: 900 });
   mark('domain-work', 5);
   await waitStage('tavya', 'Buy the domain', ['review']);
-  await sleep(700);
+  await zoomOut(400);
+  await sleep(500);
   mark('domain-message', 1);
   await zoomOn(F().locator('.msg.agent', { hasText: 'Bought tavya.io' }).last(), 1.4);
   await hold(3000);
@@ -222,7 +231,7 @@ S.seo = async () => {
   mark('seo-open', 1.5);
   await goto(ACTIVE);
   await openTask('tavya', "Do a pass of tavya's SEO", { click: true });
-  await caption('Agents ask for the accounts they need. You click <em>Allow</em>.');
+  await caption('Agents ask for <em>the apps they need.</em>', 'Gmail, Search Console, any MCP server. You click Allow.');
   await F().getByRole('button', { name: 'Allow', exact: true }).first().waitFor({ timeout: 120000 });
   // Name the apps as people know them (Composio requests carry the toolkit slug).
   spawnSync('python3', ['-c', `import sqlite3,json
@@ -234,24 +243,28 @@ c.commit()`]);
   await goto(await F().evaluate(() => location.pathname));
   await sleep(900);
   mark('seo-allow', 1);
-  await click(F().getByRole('button', { name: 'Allow', exact: true }).first());
+  const allow = F().getByRole('button', { name: 'Allow', exact: true });
+  await zoomOn(allow.first(), 1.5, { ms: 700 });
+  await click(allow.first());
   await sleep(700);
-  await click(F().getByRole('button', { name: 'Allow', exact: true }).first());
-  await hold(1600);
+  // The next request may sit outside the zoomed view: allow the rest from the whole window.
+  await zoomOut(450);
+  for (let i = 0; i < 4 && await allow.count(); i++) { await click(allow.first()); await sleep(700); }
+  await hold(1300);
 };
 
 S.cv = async () => {
   mark('cv-open', 1);
   await openTask('personal-website', 'Update my CV');
   await waitStage('personal-website', 'Update my CV', ['review']);
-  await caption('Review it yourself…');
+  await caption('Review <em>the result</em>, not the process.', 'Agents attach what to check. You approve, and it lands.');
   await hold(1300);
   mark('cv-params', 1);
   await click(F().getByRole('link', { name: 'Parameters' }));
   const row = F().locator('.form-row[data-row="confirm"]');
   await row.scrollIntoViewIfNeeded();
   await sleep(300);
-  await caption('…or remove the reviewer, and it confirms itself.');
+  await caption('…or remove the reviewer, and it <em>confirms itself.</em>', 'Per task, or as a project default.');
   await zoomOn(row, 1.5, { ms: 700 });
   await click(row.locator('.cf-del').first());
   await sleep(600);
@@ -268,7 +281,7 @@ S.seoReview = async () => {
   mark('seo-review', 1);
   await openTask('tavya', "Do a pass of tavya's SEO");
   await waitStage('tavya', "Do a pass of tavya's SEO", ['review']);
-  await caption('…or hand the review to an AI reviewer.');
+  await caption('…or hand the review <em>to an AI.</em>', 'With your instructions.');
   await sleep(600);
   await click(F().getByRole('link', { name: 'Parameters' }));
   const row = F().locator('.form-row[data-row="confirm"]');
@@ -300,8 +313,11 @@ S.overhaul = async () => {
   mark('overhaul', 1);
   await openTask('tavya', '## usability overhaul');
   await waitStage('tavya', '## usability overhaul', ['review']);
-  await caption('Check the proof, and approve.');
-  await sleep(400);
+  await caption('Check the proof, <em>and approve.</em>', 'Before-and-after screenshots of every page it changed.');
+  await sleep(300);
+  await zoomOn(F().getByRole('button', { name: /Tasks: classic vs new/ }).first(), 1.45, { ms: 700 });
+  await sleep(300);
+  await zoomOut(450);
   await click(F().getByRole('button', { name: /Tasks: classic vs new/ }).first());
   await hold(2000);
   await click(F().getByRole('button', { name: 'Close' }).first());
@@ -310,16 +326,30 @@ S.overhaul = async () => {
   await hold(1400);
 };
 
+S.fanout = async () => {
+  mark('fanout', 1);
+  await goto('/personal/tavya/tasks/367');
+  await F().locator('.rail-sec.subtasks').waitFor();
+  await caption('Big jobs <em>fan out.</em>', 'One codebase review became 25 sub-tasks, each with its own agent.');
+  await zoomOn(F().locator('#subtasks-title'), 1.6, { ms: 900 });
+  await hold(1400);
+  const rows = F().locator('.rail-sec.subtasks a');
+  const later = Math.min(10, Math.max(0, (await rows.count()) - 1));
+  await zoomOn(rows.nth(later), 1.6, { ms: 1800 });
+  await hold(900);
+  await zoomOut(600);
+};
+
 const TRIGGER = 'Create a repeatable task that is triggered by codex/claude code updates on github and updates tavya to be compatible with them.';
 S.trigger = async () => {
   mark('trigger', 1);
   await goto(ACTIVE);
-  await caption('Tasks can start themselves: on a schedule, an event, or after another task.');
+  await caption('Work that <em>starts itself.</em>', 'On a schedule, an event, or after another task.');
   mark('trigger-typing', 1.8);
   await newTask('tav', TRIGGER, { delay: 22 });
   mark('trigger-open', 1);
   await openTask('tavya', 'Create a repeatable task', { click: true });
-  await caption('Agents can operate tavya too, through its MCP.');
+  await caption('Agents can <em>operate tavya</em> too.', 'Through its MCP: this one set up its own trigger.');
   mark('trigger-work', 4);
   await waitStage('tavya', 'Create a repeatable task', ['review']);
   mark('trigger-message', 1);
@@ -328,7 +358,7 @@ S.trigger = async () => {
   await demo('camera', 1);
   mark('trigger-series', 1);
   await goto('/personal/tavya?q=is%3Aseries%20-is%3Aarchived');
-  await caption('Tasks can start themselves: on a schedule, an event, or after another task.');
+  await caption('Work that <em>starts itself.</em>', 'On a schedule, an event, or after another task.');
   await sleep(600);
   await zoomOn(F().getByText('Watch agent CLI releases', { exact: false }), 1.5);
   await hold(1900);
@@ -346,7 +376,7 @@ S.cli = async () => {
   await demo('scrim', true);
   await page.evaluate(() => window.__demo.term.open('abhimanyu — ~'));
   await sleep(400);
-  await caption('tavya is not just for code. Dump all your files into tavya…');
+  await caption('Not just code. <em>Dump all your files in…</em>', 'tavya clone, add and pull, from your laptop.');
   mark('cli-typing', 1.6);
   await termRun('~', 'tavya clone personal/random && cd random', LAPTOP, { colour: (l) => l.startsWith('Cloned') ? `<span class="ok">${l}</span>` : l });
   await termRun('~/random', 'mv ../photos . && tavya add photos', path.join(LAPTOP, 'random'), { show: 'mv ~/Pictures/photos . && tavya add photos' });
@@ -393,7 +423,7 @@ S.cli = async () => {
 const FLIGHT = 'Book me the cheapest direct flight to London on January 3 with reasonable timings. My passport, loyalty card numbers etc. are in this folder.';
 async function flight() {
   mark('flight', 1);
-  await caption('…and let it run your life.');
+  await caption('…and let it <em>run your life.</em>', 'It reads your documents, uses your logins and pays, with your OK.');
   await sleep(700);
   mark('flight-typing', 1.6);
   await newTask('admin_', FLIGHT, { delay: 22, before: async () => { mark('flight-budget', 1); await setBudget('500'); mark('flight-typing2', 1.6); } });
@@ -425,10 +455,13 @@ S.wiki = async () => {
   mark('wiki', 1);
   await caption(null);
   await goto('/personal/tavya/wiki');
-  await caption('What agents learn, they write down: in a wiki you can read.');
-  await sleep(900);
+  await caption('What agents learn, <em>they write down.</em>', 'In a wiki you can read and edit.');
+  await sleep(700);
   await click(F().getByText('Message forms', { exact: false }).first());
-  await hold(2300);
+  await sleep(500);
+  await zoomOn(F().getByText('Message forms — agents ask', { exact: false }).last(), 1.4, { ms: 900 });
+  await hold(1700);
+  await zoomOut(500, false);
 };
 
 const ICON = (d) => `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
@@ -463,7 +496,7 @@ S.grid = async () => {
     { icon: ICON('<path d="M3 20h18M7 16v-5M12 16V5M17 16v-8"/>'), title: 'Insights', hint: 'Work, tokens and compute over time', shots: [src('insights')] },
   ];
   mark('grid', 1);
-  await caption(null);
+  await caption('Also <em>built in.</em>');
   await demo('cursorVisible', false);
   await demo('scrim', true);
   await page.evaluate((t) => window.__demo.grid.open('Also built in', t), tiles);
@@ -478,7 +511,7 @@ S.grid = async () => {
 S.finale = async () => {
   mark('finale', 1);
   await goto(ACTIVE);
-  await caption('And one more.');
+  await caption('And <em>one more.</em>');
   mark('finale-typing', 1.6);
   await newTask('tav', 'Create a launch video for tavya.io that shows just how great it is', { delay: 30 });
   mark('finale-open', 1);
@@ -518,12 +551,14 @@ S.finale = async () => {
   // Into the video, held on its first frame (the film's own first frame, so it loops):
   // that frame, laid exactly over the picture, grows to fill the screen.
   mark('finale-zoom', 1);
+  await caption(null); // the film's first frame (the title card) has no headline
+  await sleep(260);
   await page.evaluate(([x, y, w, h]) => window.__demo.still('/__stage/first.png', x, y, w, h, 1500), [cx - cw / 2, cy - ch / 2, cw, ch]);
   await sleep(500);
   mark('end', 1);
 };
 
-const ORDER = ['intro', 'rapid', 'domain', 'seo', 'cv', 'seoReview', 'overhaul', 'trigger', 'cli', 'wiki', 'grid', 'finale'];
+const ORDER = ['intro', 'rapid', 'domain', 'seo', 'cv', 'seoReview', 'overhaul', 'fanout', 'trigger', 'cli', 'wiki', 'grid', 'finale'];
 
 // Off camera, before the take: logins the vault would hold, and admin_docs' folder (pretend documents).
 const VAULT = [

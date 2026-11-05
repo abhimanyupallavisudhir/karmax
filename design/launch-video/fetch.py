@@ -12,8 +12,10 @@ WIKI = os.environ.get('KARMAX_WIKI') or next((os.path.join(HERE, '../../..', d) 
 os.makedirs(f'{D}/prod', exist_ok=True); os.makedirs(f'{D}/assets', exist_ok=True)
 
 def get(p, raw=False, method='GET', body=None):
-    req = urllib.request.Request(B + p, method=method, data=json.dumps(body).encode() if body is not None else None,
-                                 headers={'Authorization': 'Bearer ' + T, 'content-type': 'application/json'})
+    # A signed artifact URL is absolute (it may be another host): no token goes with it.
+    absolute = p.startswith('http')
+    req = urllib.request.Request(p if absolute else B + p, method=method, data=json.dumps(body).encode() if body is not None else None,
+                                 headers={'User-Agent': 'tavya-launch-video'} if absolute else {'Authorization': 'Bearer ' + T, 'content-type': 'application/json'})
     with urllib.request.urlopen(req, timeout=120) as r:
         return r.read() if raw else json.load(r)
 
