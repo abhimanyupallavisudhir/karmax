@@ -87,6 +87,7 @@ def render(
     mode: str = "auto",
     cwd: str | None = None,
     session_id: str | None = None,
+    model_provider: str | None = None,
 ) -> Rendered:
     """Write a conversation as target ("ir", "markdown", "claude-code" or "codex").
 
@@ -102,7 +103,8 @@ def render(
         mode = default_mode(conv) if fmt in NATIVE_TARGETS else "transcript"
     if mode not in {"context", "transcript"}:
         raise PanagentError(f"unknown mode: {mode}")
-    rendered = writer(conv, mode=mode, cwd=cwd, session_id=session_id)
+    rendered = writer(conv, mode=mode, cwd=cwd, session_id=session_id,
+                      **({"model_provider": model_provider} if model_provider else {}))
     rendered.format, rendered.mode = fmt, mode
     return rendered
 
@@ -137,13 +139,15 @@ def install(
     directory = str(Path(cwd or os.getcwd()).expanduser().resolve())
     # The installed copy is a new session of the target CLI, never the source's identity.
     session_id = session_id or str(uuid4())
-    rendered = render(conv, fmt, mode=mode, cwd=directory, session_id=session_id)
     if fmt == "claude-code":
+        rendered = render(conv, fmt, mode=mode, cwd=directory, session_id=session_id)
         root = Path(home or os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
         path = root / "projects" / re.sub(r"[^A-Za-z0-9]", "-", directory) / f"{session_id}.jsonl"
         command = f"cd {quote(directory)} && claude --resume {session_id}"
     else:
         root = Path(home or os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+        rendered = render(conv, fmt, mode=mode, cwd=directory, session_id=session_id,
+                          model_provider=_codex_model_provider(root))
         started = _utc(rendered.text.split("\n", 1)[0])
         path = (root / "sessions" / started.strftime("%Y/%m/%d")
                 / f"rollout-{started.strftime('%Y-%m-%dT%H-%M-%S')}-{session_id}.jsonl")
@@ -160,6 +164,21 @@ def install(
         path.unlink(missing_ok=True)
         raise
     return Installed(path, session_id, command, rendered)
+
+
+def _codex_model_provider(root: Path) -> str | None:
+    """The provider a Codex home runs: config.toml's top-level model_provider."""
+    try:
+        text = (root / "config.toml").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.lstrip().startswith("["):
+            return None  # tables follow; top-level keys come first
+        match = re.match(r"""\s*model_provider\s*=\s*["']([^"']+)["']""", line)
+        if match:
+            return match.group(1)
+    return None
 
 
 def _utc(first_record: str) -> datetime:

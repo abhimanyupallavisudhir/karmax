@@ -57,8 +57,11 @@ const fallback = normalizeComboOption('default');
 ok(fallback.value === 'default' && fallback.label === 'default', 'continues to support string fallbacks');
 
 S.modelCatalog = {};
-ok(modelOptions('claude').some(m => m.id === 'claude-opus-5-5'), 'offline picker includes Opus 5.5');
-for (const model of ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']) {
+for (const model of ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5']) {
+  ok(modelOptions('claude').some(m => m.id === model), `offline picker includes ${model}`);
+  ok(effortLevelsFor('claude', model).join() === EFFORT_ORDER.join(), `offline effort control works for ${model}`);
+}
+for (const model of ['gpt-6.1-terra', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']) {
   ok(modelOptions('codex').includes(model), `offline picker includes ${model}`);
   ok(effortLevelsFor('codex', model).join() === EFFORT_ORDER.join(), `offline effort control works for ${model}`);
 }

@@ -104,7 +104,10 @@ export function diskWasFull(check: DiskCheck | undefined): boolean {
 
 /** What a process says when it could not write because the disk is full. */
 export function isDiskFullMessage(message: string): boolean {
-  return /\bENOSPC\b|no space left on device|database or disk is full|disk quota exceeded|\bEDQUOT\b|not enough space on (the )?disk/i.test(message);
+  return /\bENOSPC\b|no space left on device|database or disk is full|disk quota exceeded|\bEDQUOT\b|not enough space on (the )?disk/i.test(message)
+    // Claude Code 2.1.301+ says it in words: "the disk that holds the Claude Code
+    // config directory …, or your disk quota on it, is full", "Disk full: this computer's volume …".
+    || /\bdisk\b[^\n]{0,120}?\bis full\b|\bdisk full:/i.test(message);
 }
 
 const gb = (kb: number) => {

@@ -596,6 +596,8 @@ export class ClaudeAdapter implements AgentAdapter {
     // where `/api/vault/resolve`'s plaintext `value` actually arrives).
     const toolNames = new Map<string, string>();
     let successfulResult: any;
+    // Claude Code 2.1.317+: what a full disk kept it from saving, sent as it exits.
+    let writesLost: { error_code?: string; lost?: string[] } | undefined;
     // Track in-harness sub-agents (the Task tool). Claude Code auto-backgrounds long
     // sub-agents, so the main `result` can arrive — completion already signalled —
     // while a sub-agent is still running. We fold every task-lifecycle message in and
@@ -1073,6 +1075,8 @@ export class ClaudeAdapter implements AgentAdapter {
             title: `${String((message as any).tool_name ?? 'Tool')} denied`,
             ...(activityDetail((message as any).message) ? { detail: activityDetail((message as any).message) } : {}),
           });
+        } else if (message.type === 'system' && (message as any).subtype === 'session_writes_lost') {
+          writesLost = message as any;
         } else if (message.type === 'system' && (message as any).subtype === 'session_state_changed') {
           harnessReportsState = true;
           if ((message as any).state === 'idle') await settleInput();
@@ -1125,6 +1129,13 @@ export class ClaudeAdapter implements AgentAdapter {
       if (remoteProcess?.lost) throw remoteProcess.lost;
       if (remoteProcess?.unavailable) throw remoteProcess.unavailable;
       throw new Error('Claude Agent SDK stream ended unexpectedly without a successful result event');
+    }
+    // The turn's results stand, but the disk is full: the next resume would miss
+    // part of the conversation, and the next turn would fail anyway.
+    if (writesLost) {
+      const lost = (writesLost.lost ?? []).map((what) => what === 'transcript' ? 'the session transcript' : what === 'global_config' ? '~/.claude.json' : what);
+      const why = writesLost.error_code === 'EDQUOT' ? 'EDQUOT: disk quota exceeded' : `${writesLost.error_code ?? 'ENOSPC'}: the disk is full`;
+      throw new Error(`Claude Code could not save ${lost.join(' or ') || 'its session'} (${why})`);
     }
     // Only a subtype=success result is a turn boundary. `delivered` = every message
     // this turn consumed (initial delta + in-flight injections).

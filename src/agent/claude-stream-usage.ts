@@ -15,7 +15,7 @@ const FIELDS: [keyof Counters, string][] = [['inputTokens', 'input_tokens'], ['o
  * Each request is keyed by its message id and keeps the largest value seen per
  * counter: `message_start` and every assistant frame carry the final input and
  * cache counts but a partial output count, which `message_delta` completes.
- * Claude Code 2.1.281 streams those events for the main loop only, so a
+ * Claude Code (2.1.281 through 2.1.318) streams those events for the main loop only, so a
  * sub-agent's output tokens are its partial count (its input and cache, the bulk
  * of an agent's tokens, are exact).
  */
