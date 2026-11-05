@@ -27407,7 +27407,7 @@ function renderLanding() {
   const tick = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.6 8.4l2.9 2.9 5.9-6.6"/></svg>';
   const check = (title, detail = '') => `<li><span class="landing-tick">${tick}</span><div><h3>${title}</h3>${detail}</div></li>`;
   document.body.classList.add('landing-active');
-  document.title = `${siteName()} — the to-do list for agents`;
+  document.title = `${siteName()} — the to-do list for AI agents`;
   $('#app').innerHTML = `<div class="landing-page">
     <a class="landing-skip" href="#landing-main">Skip to content</a>
     <header class="landing-nav" aria-label="Primary navigation"><div class="landing-nav-inner">

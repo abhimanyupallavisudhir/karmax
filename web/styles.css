@@ -2247,6 +2247,12 @@ html[data-theme="light"] :is(body.landing-active, .landing-page) { color-scheme:
 html[data-theme="dark"] :is(body.landing-active, .landing-page) { color-scheme: dark; }
 /* Public documents use normal page scrolling; the console keeps its fixed viewport. */
 .landing-active #app, #app:has(> .legal-shell) { display: block; height: auto; min-height: 100vh; min-height: 100dvh; overflow: visible; }
+/* A public page's plain rendering (src/gateway/public-pages.ts), for readers that run no script.
+   The console replaces it as it boots; until then a browser running script shows nothing, as before. */
+#app:has(> .prerendered) { display: block; height: auto; overflow: visible; }
+.prerendered { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 3rem; line-height: 1.6; }
+.prerendered nav ul { display: flex; flex-wrap: wrap; gap: .25rem 1rem; padding: 0; list-style: none; }
+@media (scripting: enabled) { .prerendered { display: none; } }
 .landing-page {
   color-scheme: light dark;
   --l-bg: light-dark(#f6f7f9, #111318);
