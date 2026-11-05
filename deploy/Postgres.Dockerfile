@@ -2,7 +2,7 @@
 # wiki ops/production-tavya). Same major version and data format as the stock
 # image it extends; with no backup settings it behaves exactly like it.
 # Digest-pinned like every base image; Dependabot proposes each refresh.
-FROM postgres:16@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
+FROM postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
 
 # The data directory's major version must match the image's: a different
 # POSTGRES_VERSION in .turnkey.env needs this file's FROM moved with it, never a
