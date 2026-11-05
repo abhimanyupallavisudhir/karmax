@@ -1424,7 +1424,8 @@ describe('a sub-task that cannot be prepared', () => {
   });
 
   it('keeps histories recorded before the wait failing on a full provider', async () => {
-    wf.absentPatches = new Set(['software-dev-world-reopens-wait-v1']);
+    // Such a history predates the snapshot going to the agent too (pramana#137).
+    wf.absentPatches = new Set(['software-dev-world-reopens-wait-v1', 'software-dev-subtask-snapshot-to-agent-v1']);
     wf.activities.accountPoolSize.mockResolvedValue(0);
     wf.activities.commitWork = vi.fn().mockRejectedValue(cpusFull());
     delegate();

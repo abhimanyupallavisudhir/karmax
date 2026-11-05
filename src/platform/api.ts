@@ -36,7 +36,8 @@ import {
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
 import { templateContent, templateName, templateParams, templateAuthorization } from '../domain/task-templates.js';
-import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget, type Avatar } from '../domain/types.js';
+import { derivedTaskTitle, isDerivedTaskTitle } from '../domain/task-title.js';
+import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget, type Avatar, type InheritedConversation } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries } from '../domain/triggers.js';
 import { STORE_TASKS, runsOnInstall, storeTaskNeeds, storeTaskRepeatable, takenFromStore, type StoreNeed, type StoreTask } from '../domain/task-store.js';
 import { applyTriggerContext, normalizeEventInput, validateFollow, type EventFilter, type EventFollow, type ProjectEvent, type ProjectEventClaim,
@@ -101,7 +102,7 @@ import type { AccountLeaseAnswer, AccountQueueView } from '../coordinators/accou
 import type { SchedulingQueueTask, SchedulingQueueView } from '../scheduling/view.js';
 import { assertAgentSpec, childComputer, subTaskParams } from './agent-params.js';
 import { CALLED_AGENT_FIELD, agentSpecsByParticipant, authorityKey, normalizeAgentAuthority, type StoredAgentAuthorization } from './agent-authority.js';
-import { continuesInNewTask } from '../domain/forks.js';
+import { continuesInNewTask, forkSourceRole } from '../domain/forks.js';
 import { AGENT_SELECTOR, MAIN_AGENT, agentSelector, conversationFor, isParticipantKey, nextAgentKey, participantLabel, selectorAgent } from '../domain/participants.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ProjectResourceService } from '../world/resources.js';
@@ -186,7 +187,6 @@ export interface TriggerArmer {
   projectEventRecorded?(event: ProjectEvent): void;
 }
 
-const firstLine = (s: string) => (s.split('\n')[0] ?? 'Task').slice(0, 80) || 'Task';
 // Human-facing stage names. `do` is the replay-stable internal key; a person
 // reads it as "Working" (the console's stageLabel says the same).
 const stageName = (stage: string) => stage === 'human'
@@ -250,6 +250,10 @@ const QUERY_TIMEOUT_MS = 3000;
 const START_TIMEOUT_MS = 12_000;
 /** Follows one task may hold (wiki features/events-and-automations). */
 const MAX_FOLLOWS_PER_TASK = 50;
+/** How many tasks of a fork lineage, and how many conversation events of each,
+ *  a forked conversation shows before its own (`taskForkHistory`). */
+const FORK_HISTORY_DEPTH = 8;
+const FORK_HISTORY_EVENTS = 300;
 /** How long a create waits for the advisory GitHub merge preflight's warning. */
 const PREFLIGHT_WAIT_MS = 2_000;
 const TERMINAL_CLEANUP_TIMEOUT_MS = 10_000;
@@ -1672,7 +1676,7 @@ export class KarmaxApi {
     // effective list the world will. An empty list is a supported zero-repo run.
     if (!args.draft) (await this.assertRepositoriesValid(manifest, project, resolved));
 
-    const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
+    const title = args.title?.trim() || derivedTaskTitle(resolved);
     const createdBy = await this.taskCreator(caller, project.id);
     // Pin the connected account when the task is created. Switching the user's
     // active account later must not silently change an existing task's commit or
@@ -3647,14 +3651,15 @@ export class KarmaxApi {
       }));
     }
     // Keep the display title tracking the (edited) prompt when it was derived
-    // from the prompt (SPEC §10). A title given at creation stays: a store
-    // automation's `#{{issue.number}} {{issue.title}}` names each of its runs.
-    // Written with the params, so an edit refused there renames nothing.
-    const retitled = typeof base.prompt === 'string' && base.prompt.trim() && task.title === firstLine(String(task.params?.prompt ?? task.params?.command ?? 'Task'))
-      ? firstLine(String(base.prompt)) : undefined;
+    // from the prompt (SPEC §10) — through every edit, an emptied prompt too
+    // ("Task"), so a title once derived stays derived. A title given at
+    // creation stays: a store automation's `#{{issue.number}} {{issue.title}}`
+    // names each of its runs. Written with the params, so an edit refused
+    // there renames nothing.
+    const retitled = isDerivedTaskTitle(task.title, task.params) ? derivedTaskTitle(base) : undefined;
     const write = async (params: Record<string, unknown>) => {
       (await this.writeUnstartedParams(taskId, params));
-      if (retitled !== undefined) (await this.deps.store.setTaskTitle(taskId, retitled));
+      if (retitled !== undefined && retitled !== task.title) (await this.deps.store.setTaskTitle(taskId, retitled));
     };
     // A cron/recurring trigger forces the series flag on (mirrors createTask).
     if (forcesRepeatable(normalizeTriggers(base))) base.repeatable = true;
@@ -5797,6 +5802,57 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       messages: conversationFor(view.messages, isParticipantKey(role) ? role : MAIN_AGENT).map((m) => ({ ...m })) };
     const transcript = role === 'do' ? undefined : view.transcripts?.find((t) => t.role === role);
     return { role, session: (await this.deps.store.kvGet(`session:${taskId}:${role}`)) || undefined, messages: (transcript?.messages ?? view.messages).map((m) => ({ ...m })) };
+  }
+
+  /** The conversation a forked agent began with: each task of its fork lineage
+   * whose conversation the caller may read, oldest first, cut where the next
+   * one branched off it — when that fork's first turn copied the session
+   * (`session.forked`), or, before that turn, when it was made. A lineage stops
+   * at a fork that failed, a source that is gone, or one the caller may not
+   * read (what came before it would be read through it). */
+  async taskForkHistory(token: string, taskId: string, role = 'do'): Promise<InheritedConversation[]> {
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'get_conversation', { projectId: task?.projectId, taskId }));
+    const out: InheritedConversation[] = [];
+    const seen = new Set([taskId]);
+    let child = task, childRole = role;
+    while (child && out.length < FORK_HISTORY_DEPTH) {
+      const params = child.params as Record<string, unknown>;
+      const spec = (childRole === MAIN_AGENT ? params['agent:do'] ?? params['agent:unified'] : params[`agent:${childRole}`]) as AgentSpec | undefined;
+      const from = spec?.resumeFrom;
+      if (!from?.taskId || seen.has(from.taskId)) break;
+      seen.add(from.taskId);
+      const source = (await this.deps.store.getTask(from.taskId));
+      if (!source) break;
+      // As forking judged it: a person by their own grants in the source's project.
+      const readable = await Promise.all((['get_conversation', 'list_events'] as const).map((capability) =>
+        this.requireAsPerson(token, capability, { projectId: source.projectId, taskId: source.id }).then(() => true, (error) => {
+          if (error instanceof CapabilityError) return false;
+          throw error;
+        })));
+      if (readable.includes(false)) break;
+      const forks = (await this.deps.store.eventsOfType(child.id, ['session.forked', 'session.fork-failed']))
+        .filter((event) => (event.payload as { from?: { taskId?: string } }).from?.taskId === source.id
+          && [undefined, childRole].includes((event.payload as { role?: string }).role));
+      if (forks[0]?.type === 'session.fork-failed') break;
+      const until = forks[0]?.ts ?? child.createdAt;
+      const sourceRole = forkSourceRole(from, childRole);
+      const view = (await this.deps.store.taskSnapshotAsync(source.id));
+      const shared = !!view?.participants?.length;
+      const transcript = shared || sourceRole === MAIN_AGENT ? undefined : view?.transcripts?.find((t) => t.role === sourceRole);
+      const all = transcript?.messages ?? (shared || sourceRole === MAIN_AGENT ? view?.messages ?? [] : []);
+      // Transcripts from before workflows stamped wall-clock time number their
+      // messages instead: they are kept until the first one stamped after the fork.
+      const cut = all.findIndex((message) => Number(message.ts) > 100_000_000_000 && Number(message.ts) > until);
+      const messages = cut < 0 ? all : all.slice(0, cut);
+      const events = (await this.deps.store.conversationEventsUntil(source.id, until, FORK_HISTORY_EVENTS))
+        .filter((event) => shared || (event.payload as { role?: string }).role === sourceRole);
+      out.unshift({ taskId: source.id, ...(source.num != null ? { num: source.num } : {}), title: source.title, role: sourceRole, until,
+        ...(shared ? { shared, participants: view!.participants } : {}), messages, events });
+      child = source;
+      childRole = sourceRole;
+    }
+    return out;
   }
 
   /** Branch a source agent into an independent task/session; the source is never mutated.

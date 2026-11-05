@@ -1320,7 +1320,18 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
 .ck-terminal-copy:hover { background: var(--surface); color: var(--ink); }
 .ck-terminal-copy svg { display: block; }
 .ck-live { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); flex: none; animation: pulse 1.4s ease-in-out infinite; }
-.ck-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
+.ck-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: hidden; position: relative; }
+/* Find in conversation: a floating bar over the thread's top right, like a browser's. */
+.ck-find { position: absolute; top: 10px; right: 18px; z-index: 6; display: flex; align-items: center; gap: 2px; padding: 4px 4px 4px 10px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface); box-shadow: var(--shadow); }
+.ck-find input { width: min(240px, 46vw); border: 0; outline: 0; background: transparent; color: var(--ink); font: inherit; font-size: var(--fs-14); }
+.ck-find-count { min-width: 3.2em; padding: 0 6px; text-align: right; color: var(--ink-3); font: var(--fs-11)/1 var(--font-mono); font-variant-numeric: tabular-nums; }
+.ck-find.empty .ck-find-count { color: var(--danger); }
+.ck-find .btn.tool.icon { width: 28px; height: 28px; padding: 0; justify-content: center; }
+.ck-find-prev svg { transform: rotate(-90deg); }
+.ck-find-next svg { transform: rotate(90deg); }
+::highlight(conversation-search) { background-color: color-mix(in srgb, var(--attention) 30%, transparent); color: inherit; }
+::highlight(conversation-search-current) { background-color: var(--attention); color: var(--attention-ink); }
+@media (max-width: 700px) { .ck-find { left: 12px; right: 12px; } .ck-find input { flex: 1; width: auto; } }
 /* Conversation focus view stays below dialogs, menus and notifications. */
 /* Full screen keeps the conversation, its toolbar and its composer. */
 .task-page:has(.ck-pane.ck-fullscreen) { position: fixed; inset: 0; z-index: 40; height: var(--visible-height, 100%); background: var(--paper); }
@@ -1613,6 +1624,13 @@ textarea.ask-input { resize: vertical; min-height: 4.5em; }
 .fold-body { display: flex; flex-direction: column; gap: 10px; margin: 6px 0 4px 19px; padding-left: 12px; border-left: 2px solid var(--line); }
 /* The work between answers reads a step down from them. */
 .ck-thread .fold-body { font-size: var(--fs-14); line-height: 1.55; }
+/* Where a forked conversation branched off its source task: a rule naming it. */
+.fork-point { display: flex; align-items: center; gap: 10px; margin: 6px 0; color: var(--ink-3); font-size: var(--fs-12); }
+.fork-point::before, .fork-point::after { content: ""; flex: 1; border-top: 1px dashed var(--line-strong); }
+.fork-point a { display: inline-flex; align-items: center; gap: 6px; max-width: 70%; color: inherit; text-decoration: none; }
+.fork-point a span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fork-point a:hover { color: var(--ink); }
+.fork-point svg { flex: none; width: 13px; height: 13px; }
 /* tavya's own prompts to the agent: part of the record, not someone speaking. */
 .msg.user.platform { align-self: flex-start; background: transparent; color: var(--ink-2); border: 1px dashed var(--line-strong); border-radius: 12px; padding: 10px 14px; font-size: var(--fs-14); line-height: 1.5; }
 .msg.user.platform .role { color: var(--ink-3); }
