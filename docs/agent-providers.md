@@ -155,9 +155,63 @@ OpenCode. Profiles and task parameters do not have a second “Credential
 provider” setting.
 
 
+## November 5, 2026 harness upgrade audit
+
+Claude Agent SDK is now **0.3.318** (Claude Code **2.1.318**, from 0.3.281 / 2.1.281)
+and Codex **0.166.0** (from 0.162.1). Reviewed every release's notes in between and
+the SDK changelog; diffed the generated Codex app-server protocol.
+
+- **New models are selectable.** Claude Sonnet 5.5 (`claude-sonnet-5-5`, 2.1.284)
+  and Haiku 5.5 (`claude-haiku-5-5`, 2.1.293) are the CLI's new `sonnet` and
+  `haiku`; both take every effort level (the CLI's own picker lists
+  low–max), and both exact ids are offline presets beside Opus 5.5 and Fable 5.1.
+  Codex adds GPT-6.1 Terra (`gpt-6.1-terra`, 0.165) to its catalog and the
+  offline list. No new effort level; Ultracode became a separate toggle
+  (2.1.284) and tavya does not use it.
+- **A full disk is said in words.** Since 2.1.301 a login refresh that cannot
+  write fails with `invalid_request` and "the disk that holds the Claude Code
+  config directory … is full" (it was `authentication_failed`, "Please run
+  /login", which looked like a dead login), and since 2.1.309 a full temp volume
+  prints "Disk full: …". `isDiskFullMessage` recognises both, so such a turn is
+  "Out of disk". Since 2.1.317 a turn whose transcript could not be saved still
+  succeeds and is followed by a `session_writes_lost` message; the adapter fails
+  that turn as a full disk instead of reporting success over a truncated session.
+- **Transcripts record each API request** (2.1.300: `api-request`,
+  `api-request-shape`, `api-request-blob`, also `session-owner`, `atis-latch`,
+  `cost-state`). panagent skips them silently; before, a converted session
+  carried one "unrecognized record" warning per request.
+- **Codex resumes a thread only under its saved provider** (0.166:
+  `modelProviderMismatch`; 0.162 resumed anyway). tavya runs Codex on `openai`,
+  writes imports as `openai`, and forks (never resumes) an imported or uploaded
+  session; a fork takes tavya's provider, so an upload from someone's Ollama or
+  Azure Codex still works (`tests/codex-foreign-provider.test.ts`). panagent's
+  `--install` now saves under the destination home's provider.
+- Unchanged for tavya: an omitted `permissionMode` now follows Claude Code's
+  own default (0.3.286, 0.3.302) — tavya always sends `bypassPermissions` with
+  a `canUseTool` approver; fork subagents are on by default in SDK sessions
+  (2.1.302); `run_in_background` commands are bounded by their `timeout`
+  (default 30 min, max 2 h) in unattended sessions (2.1.285, 2.1.288) — durable
+  work belongs in `start_job` anyway; the `/usage` panel keeps its line format
+  (verified against the real 2.1.318 output) and limit messages say "5-hour
+  limit" (2.1.312), which `classifyLimitError` already reads as the 5h window;
+  the cold-resume quota prompt (2.1.304) is a dialog kind an SDK host must opt
+  into, and tavya declares none; options are passed as `--flag=value` (0.3.295),
+  and `remoteAgentCommand` only looks for `--print`/`-p`. Sessions started on
+  2.1.286 or earlier may lose earlier thinking when resumed (2.1.318 removed that
+  fix): a one-time prompt-cache miss for tasks in flight at deploy.
+- Codex protocol changes are additive: `CodexErrorInfo` gains `modelNotFound`
+  and `policyCapacityUnavailable` (neither is a login or quota failure),
+  `ThreadItem` gains lifecycle timestamps, `ThreadUsage.nativeUsageUsdMicros`.
+  Rollout compression stays off by default (`local_thread_store_compression`),
+  so rollouts are still plain `.jsonl`.
+- Verified: the real-binary suites (Claude resume/fork/tools/metering/mid-turn
+  replay, Codex lineage/import/native MCP) pass on the new binaries; real turns on
+  Claude Code 2.1.318 (subscription, native fork, Sonnet 5.5, Haiku 5.5 at
+  xhigh) and Codex 0.166.0 (GPT-6.1 Sol and Terra with an API key).
+
 ## October 12, 2026 Codex upgrade audit
 
-Codex is now **0.162.1** (from 0.156.1). With a ChatGPT login OpenAI refuses a
+Codex became **0.162.1** (from 0.156.1; now 0.166.0, above). With a ChatGPT login OpenAI refuses a
 model that the Codex client does not offer: a task set to `gpt-6.1-sol` failed
 with `400 … The 'gpt-6.1-sol' model is not supported when using Codex with a
 ChatGPT account`. On 0.156.1 the account's `model/list` did not include it either.
@@ -187,7 +241,7 @@ default); 0.162.1 discovers it without credentials (`tests/models.test.ts`).
 
 ## September 23, 2026 harness upgrade audit
 
-The shipped versions were Codex **0.156.1** (now 0.162.1, above) and Claude Agent SDK **0.3.281**
+The shipped versions were Codex **0.156.1** (now 0.166.0, above) and Claude Agent SDK **0.3.281** (now 0.3.318)
 (paired with Claude Code **2.1.281**; see the September 24 note below). Both dependencies are exact pins: later
 harness changes require another compatibility review. The browser image pins
 match; existing images use the version-checked remote launcher fallback.

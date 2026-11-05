@@ -3,7 +3,7 @@
 // top line, the title has the next, and the views (icons), the conversation's
 // tools and the details toggle share one toolbar;
 // attempts head the details rail with the New attempt action; priority and tags live
-// in the details rail; the workflow name/version live on Parameters only. Tasks
+// in the details rail; no tab names the workflow (there is only one). Tasks
 // open on Chat, its toolbar actions share one size, and a draft attempt opens its form.
 // SCREENSHOT_DIR=<dir> also writes screenshots. APP_SOURCE can test the baseline.
 const { chromium } = require('playwright');
@@ -28,7 +28,6 @@ const attempt = (n, extra = {}) => ({
     records[1].lastView = { taskId: 'a2', stage: 'setup', status: 'waiting', state: { draft: true } };
     const view = {
       taskId: 'a1', num: 1, title: 'I want you to do an end-to-end complete pass on making a video', workflow: 'software-dev',
-      workflowOptions: ['software-dev', 'goal'], workflowSwitchable: true,
       stage: 'do', status: 'waiting', waitingFor: { kind: 'human' }, state: {}, targetBranch: 'master',
       prs: [{ repo: 'videos', number: 1, url: 'https://github.com/o/videos/pull/1', state: 'open' },
         { repo: 'videos-wiki', number: 1, url: 'https://github.com/o/videos-wiki/pull/1', state: 'open' }],
@@ -145,12 +144,12 @@ const attempt = (n, extra = {}) => ({
     const crownTitle = await page.locator('.attempt-crown.principal').getAttribute('title');
     assert.match(crownTitle, /task list/i);
 
-    // Parameters owns the workflow mode and its version.
+    // Nothing names the workflow: not Parameters, not the header.
     await open('parameters');
-    await page.waitForSelector('#tp-workflow-mode');
+    await page.waitForSelector('#cred-editor-task');
     const params = await page.locator('.tp-content').innerText();
-    assert.match(params, /v1\.26\.0/, 'workflow version is on the Parameters tab');
-    assert.equal(await page.locator('.tp-head #tp-workflow-mode').count(), 0);
+    assert.doesNotMatch(params, /Workflow|Software dev|Goal|v1\.26\.0/, 'no workflow on the Parameters tab');
+    assert.equal(await page.locator('#tp-workflow-mode, .tp-workflow').count(), 0);
 
     // A draft attempt opens straight into its form.
     await open('checkin');

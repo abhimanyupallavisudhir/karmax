@@ -324,3 +324,67 @@ it('fetches and saves parts of an on-demand resource in a remote world, keeping 
   expect(verified.status).toBe('complete');
   expect(verified.files.map((file) => file.path).sort()).toEqual([...pages.map((page) => page.path), 'README', 'big/blob.bin', 'mt/a.txt', 'mt/b.txt'].sort());
 }, REAL_RESTIC_MS);
+
+// personal-website #7: 489 single-file resources, each restore ~7 s whatever
+// its size, restored one by one: world setup outlived its 30-minute limit on
+// every attempt and the task failed. They restore several at a time now; the
+// first alone, so restic is installed in the world once.
+it('restores many single-file resources into a remote world several at a time, each once', async () => {
+  const f = await fixture();
+  const files = await Promise.all(Array.from({ length: 9 }, async (_, i) => {
+    const attachment = await f.store.createResourceAttachment({ organizationId: f.project.organizationId!, projectId: f.project.id,
+      name: `File ${i}`, driver: 'object-tree@1', target: { kind: 'path', path: `data/files/${i}.json` }, access: i % 2 ? 'read' : 'write',
+      isolation: 'fork', source: { shape: 'file' }, credentialHandles: [], publish: i % 2 ? 'discard' : 'review' });
+    const data = crypto.randomBytes(500 + i);
+    await f.resources.importFiles(attachment.id, [{ path: `${i}.json`, data }]);
+    return { attachment, data };
+  }));
+  const { task, world } = await f.sandbox('Many files');
+  const restore = f.resources.restic.restore.bind(f.resources.restic);
+  let running = 0;
+  const overlaps: number[] = [];
+  vi.spyOn(f.resources.restic, 'restore').mockImplementation(async (...args) => {
+    overlaps.push(++running);
+    try { return await restore(...args); } finally { running--; }
+  });
+
+  world.handle = await f.resources.materialize(f.project.id, task.id, world, 1);
+
+  for (const { attachment, data } of files)
+    expect(fs.readFileSync(path.join(world.handle.root, (attachment.target as { path: string }).path))).toEqual(data);
+  // One restic per resource, the first alone, never more than the bound at once.
+  expect(overlaps).toHaveLength(files.length);
+  expect(overlaps[0]).toBe(1);
+  expect(Math.max(...overlaps)).toBeGreaterThan(1);
+  expect(Math.max(...overlaps)).toBeLessThanOrEqual(6);
+  // restic was fetched into the world once.
+  const fetches = fs.readdirSync(path.join(world.handle.root, '.karmax-injection/bin')).filter((name) => name.startsWith('.restic-'));
+  expect(fetches).toEqual([]);
+  // The same record as before: an event pair and an active lease per resource.
+  const events = await f.store.eventsOfTypes(task.id, ['world.resource-restoring', 'world.resource-restored']);
+  for (const { attachment } of files)
+    expect(events.filter((event) => (event.payload as { attachmentId?: string }).attachmentId === attachment.id).map((event) => event.type))
+      .toEqual(['world.resource-restoring', 'world.resource-restored']);
+  const leases = await f.store.listResourceLeases(world.handle.id);
+  expect(leases.filter((lease) => files.some(({ attachment }) => attachment.id === lease.attachmentId)).map((lease) => lease.state))
+    .toEqual(files.map(() => 'active'));
+  // Read-only resources are still made read-only.
+  expect(fs.statSync(path.join(world.handle.root, 'data/files/1.json')).mode & 0o222).toBe(0);
+}, REAL_RESTIC_MS);
+
+it('fails the leases of resources it never restored when one restore fails', async () => {
+  const f = await fixture();
+  for (let i = 0; i < 4; i++) {
+    const attachment = await f.store.createResourceAttachment({ organizationId: f.project.organizationId!, projectId: f.project.id,
+      name: `File ${i}`, driver: 'object-tree@1', target: { kind: 'path', path: `data/files/${i}.json` }, access: 'write',
+      isolation: 'fork', source: { shape: 'file' }, credentialHandles: [], publish: 'review' });
+    await f.resources.importFiles(attachment.id, [{ path: `${i}.json`, data: Buffer.from(String(i)) }]);
+  }
+  const { task, world } = await f.sandbox('First fails');
+  const restore = vi.spyOn(f.resources.restic, 'restore').mockRejectedValue(new Error('restoring the resource failed: boom'));
+  await expect(f.resources.materialize(f.project.id, task.id, world, 1)).rejects.toThrow(/boom/);
+  // The first failed alone, so no other restore started; none of the four is left pending or active.
+  expect(restore).toHaveBeenCalledTimes(1);
+  const leases = (await f.store.listResourceLeases(world.handle.id)).filter((lease) => lease.attachmentId !== f.attachment.id);
+  expect(leases.map((lease) => lease.state)).toEqual(['failed', 'failed', 'failed', 'failed']);
+}, REAL_RESTIC_MS);

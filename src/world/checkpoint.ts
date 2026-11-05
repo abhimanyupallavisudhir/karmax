@@ -20,7 +20,7 @@ import { newId } from '../util/id.js';
 import { activateProjectRuntime, selectProjectEnvironment, snapshotProjectRuntime } from './project-runtime.js';
 import { destroyWorldServices } from './services.js';
 import { RunnerPoolService } from './runners.js';
-import type { ComputeRouter } from './compute-router.js';
+import { computeNeeds, rankComputeOptions, type ComputeRouter } from './compute-router.js';
 import { sameRepository } from './repository-identity.js';
 import { clearCheckpointStale } from './checkpoint-staleness.js';
 import { ChunkedCheckpointStore, CheckpointRefusedError, formatBytes, type CaptureEntry } from './checkpoint-chunks.js';
@@ -157,7 +157,7 @@ export class WorldCheckpointService {
       worldId: handle.id, generation: handle.generation ?? 1, projectId,
       runnerPoolId: handle.runnerPoolId ?? 'local', environmentDigest: handle.environmentDigest ?? 'karmax-local',
       repos, ...(resourceRefs.length ? { resources: resourceRefs } : {}),
-      ...(ignored?.entries.length || ignored?.truncated ? { ignored } : {}),
+      ...(ignored === undefined ? { ignoredUnknown: true } : ignored.entries.length || ignored.truncated ? { ignored } : {}),
       ...(await snapshotProjectRuntime(this.store, projectId)),
     };
     // Git cleanliness alone is insufficient: resources, runtime settings and a
@@ -314,6 +314,20 @@ export class WorldCheckpointService {
     return restored;
   }
 
+  /** Whether this world's task could run on another account now: its
+   * Computer says "Any" and an account other than the world's fits it and
+   * has room (compute-router.ts). Only looks: it joins no account's queue. */
+  async roomElsewhere(handle: WorldHandle): Promise<boolean> {
+    if (!this.router || await taskProvider(this.store, handle.id)) return false;
+    const project = await this.store.getProject(String(handle.meta?.projectId ?? (await this.store.taskProjectIdAsync(handle.id)) ?? ''));
+    if (!project?.organizationId) return false;
+    const config = await this.store.effectiveTaskConfig(project, handle.id);
+    if (!isAnyProvider(config.worldProvider)) return false;
+    const needs = computeNeeds(config);
+    const route = rankComputeOptions(needs, await this.router.options(project.organizationId, needs));
+    return route.candidates.some((candidate) => candidate.provider !== handle.kind && !candidate.doubt);
+  }
+
   /** Tell the agent something about its world on its next turn, once. */
   async addNotice(taskId: string, notice: string): Promise<void> {
     // Kept apart from the checkpoint's own notice, which each checkpoint
@@ -336,7 +350,11 @@ export class WorldCheckpointService {
     const checkpoint = (await this.store.getWorldCheckpoint(checkpointId));
     if (!checkpoint?.filesystemDelta) throw new Error('checkpoint has no portable filesystem delta');
     const filesystemDelta = checkpoint.filesystemDelta;
-    return this.worlds.withOperation(checkpoint.worldId, async () => {
+    // A restore is the recovery: nothing inside it may start another. Its
+    // cleanup once opened the world it replaces, found it gone, and so restored
+    // it again, each failure nesting one more restore holding one more lease
+    // (task #817, 2026-11-04: 23 of its organization's 25 machines in 4 min).
+    return this.worlds.withOperation(checkpoint.worldId, () => this.worlds.withoutRecovery(async () => {
     const project = (await this.store.getProject(checkpoint.projectId));
     if (!project?.organizationId) throw new Error('checkpoint project no longer exists');
     // The task's Computer as it is now: a resize requested while the world was
@@ -450,8 +468,11 @@ export class WorldCheckpointService {
         // An idle checkpoint at the provisioned base need not publish a task ref.
         // Clone normally, then restore the exact captured commit before its delta.
         if (pinnedHeads && manifestRepo) {
-          const checkout = await world.exec('git', ['checkout', '-B', manifestRepo.branch, manifestRepo.headSha!], { cwd: restoredRepo.root });
-          if (checkout.code !== 0) throw new Error(`checkpoint commit ${manifestRepo.headSha} is unavailable: ${checkout.stderr}`);
+          const lost = await checkoutPinnedHead(world, restoredRepo.root, manifestRepo.branch, manifestRepo.headSha!);
+          if (lost) world.handle.warnings = [...(world.handle.warnings ?? []), `Commit ${manifestRepo.headSha!.slice(0, 12)} of `
+            + `${manifestRepo.checkoutPath === '.' ? 'the repository' : manifestRepo.checkoutPath} was never saved to its remote, so it `
+            + `could not be restored: ${manifestRepo.branch} starts from ${lost} here, with this checkpoint's uncommitted files on top. `
+            + 'Commits made after its last successful push are lost; redo them if they mattered.'];
           restoredRepo.branch = manifestRepo.branch;
           restoredRepo.baseSha = manifestRepo.baseSha;
         }
@@ -506,13 +527,13 @@ export class WorldCheckpointService {
       if (registered.warnings?.length) await this.addNotice(checkpoint.worldId, registered.warnings.join('\n\n'));
       return registered;
     } catch (error) {
-      await this.resources?.release(world.handle).catch(() => undefined);
+      await this.resources?.release(world.handle, world).catch(() => undefined);
       await destroyWorldServices(checkpoint.worldId).catch(() => undefined);
       await world.destroy().catch(() => undefined);
       if (acquired) (await this.runners.release(acquired.leaseId, selected));
       throw error;
     }
-    });
+    }));
   }
 
   /** Apply saved work to a freshly provisioned, independent task. Never registers
@@ -740,3 +761,20 @@ function safeDeltaPath(value: string | undefined): value is string {
 }
 
 function sha256(value: Buffer): string { return crypto.createHash('sha256').update(value).digest('hex'); }
+
+/** Check out a checkpoint's commit on its branch. A commit its remote never
+ * received (a refused push, then hibernation: task #817) cannot come back:
+ * the branch then starts from what the remote has of it, else from where the
+ * clone is, and the place it started from is returned. Failing instead left
+ * the world unrestorable for good. */
+async function checkoutPinnedHead(world: World, root: string, branch: string, headSha: string): Promise<string | undefined> {
+  const exact = () => world.exec('git', ['checkout', '-B', branch, headSha], { cwd: root });
+  if ((await exact()).code === 0) return undefined;
+  if ((await world.exec('git', ['fetch', '-q', 'origin', headSha], { cwd: root })).code === 0 && (await exact()).code === 0) return undefined;
+  const remote = `refs/remotes/origin/${branch}`;
+  await world.exec('git', ['fetch', '-q', 'origin', `+refs/heads/${branch}:${remote}`], { cwd: root });
+  if ((await world.exec('git', ['checkout', '-B', branch, remote], { cwd: root })).code === 0) return `origin/${branch}`;
+  const here = await world.exec('git', ['checkout', '-B', branch], { cwd: root });
+  if (here.code !== 0) throw new Error(`checkpoint commit ${headSha} is unavailable and ${branch} cannot be recreated: ${here.stderr}`);
+  return 'its base';
+}

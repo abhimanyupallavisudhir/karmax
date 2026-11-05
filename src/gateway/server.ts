@@ -10,10 +10,12 @@ import * as __asyncCollections from '../util/async-collections.js';
 import { GatewayMetrics, type MemorySource } from './metrics.js';
 import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
 import { assetExists, MATHJAX_SCRIPT_SOURCE, serveStaticAsset, staticAssetRevision, unpublishedAsset } from './static-assets.js';
+import { docPath, LANDING_TAGLINE, policySlugOf, publicBody, publicHead, publicPath, publicPaths, resolvePublicRoute, robotsTxt, sitemapXml, type PublicPageContext, type PublicRoute } from './public-pages.js';
 import { SwrCache } from '../util/swr-cache.js';
 import { MAX_REVIEW_ARTIFACT_BYTES, savedReviewArtifact } from '../store/review-artifacts.js';
 import { readWorldFilePrefix } from '../world/file-prefix.js';
-import { ArtifactUrls } from './artifact-urls.js';
+import { ArtifactUrls, artifactEdge } from './artifact-urls.js';
+import { signArtifactEdgeToken } from '../edge/artifact-edge-token.js';
 import { bufferSource, sendArtifact, type ArtifactSource } from './artifact-response.js';
 import { TimingDelivery } from '../timing/delivery.js';
 import { timingEnabled, installationTiming, withTiming, toolFailed } from '../timing/index.js';
@@ -1142,6 +1144,11 @@ export class Gateway {
     if (this.deps.githubApp) for (const request of (await new RepositoryAccessRequests({ store: this.deps.store, githubApp: this.deps.githubApp })
       .requests(organizationId, { status: 'pending' }))) add(request.taskId, !!request.dismissed);
     return counts;
+  }
+
+  /** A list row parked on a model login says why it waits now, as the task's page does (KarmaxApi.withLiveAccountWait). */
+  private async liveAccountWait(taskId: string, view: TaskView | undefined): Promise<TaskView | undefined> {
+    return view ? this.deps.api.withLiveAccountWait(taskId, view) : view;
   }
 
   private async withApprovalRequests(view: TaskView | undefined, taskId: string,
@@ -2389,7 +2396,15 @@ export class Gateway {
     if (signedArtifact && (method === 'GET' || method === 'HEAD')) {
       const grant = await this.artifactUrls.verify(signedArtifact[1]!);
       if (!grant) return this.json(res, 403, { error: 'this link has expired; open the artifact again' });
-      return this.serveArtifact(req, res, grant.taskId, grant.path);
+      const download = url.searchParams.has('download');
+      if (!grant.artifact) return this.serveArtifact(req, res, grant.taskId, grant.path, false, download);
+      // A saved copy's bytes never change: the browser keeps them while the URL lasts,
+      // so reopening, seeking back, and the Review tile's own load cost nothing more.
+      const saved = await this.deps.store.getPromotedArtifact(grant.artifact);
+      if (!saved || saved.taskId !== grant.taskId || saved.expiresAt != null && saved.expiresAt <= Date.now())
+        return this.json(res, 404, { error: 'this file is no longer kept; open the artifact again' });
+      return this.serveSavedArtifact(req, res, saved, { download,
+        cache: `private, max-age=${Math.max(0, Math.floor((grant.expiresAt - Date.now()) / 1000))}, immutable` });
     }
 
     // ── authenticated endpoints ──
@@ -5096,7 +5111,7 @@ export class Gateway {
             const organizationId = (await store.getProject(projectId))?.organizationId;
             const counts: ApprovalCounts = organizationId ? (await this.approvalCounts(organizationId)) : new Map();
             return this.json(res, 200, { ...result, tasks: (await __asyncCollections.map(result.tasks, async task => ({ ...task,
-              lastView: (await this.withApprovalRequests(task.lastView, task.id, counts)) }))) });
+              lastView: (await this.withApprovalRequests(await this.liveAccountWait(task.id, task.lastView), task.id, counts)) }))) });
           }
           const all = await api.listTaskSummaries(token, projectId);
           // Archived tasks are hidden from the default list (SPEC §11 housekeeping).
@@ -5127,7 +5142,7 @@ export class Gateway {
           const approvalCounts: ApprovalCounts = organizationId ? (await this.approvalCounts(organizationId)) : new Map();
           const listed = (await __asyncCollections.map(page, async (t) => ({
             ...t,
-            lastView: trimListView((await this.withApprovalRequests(t.lastView, t.id, approvalCounts))),
+            lastView: trimListView((await this.withApprovalRequests(await this.liveAccountWait(t.id, t.lastView), t.id, approvalCounts))),
           })));
           if (limit > 0) return this.json(res, 200, { tasks: listed, total: filtered.length, offset });
           return this.json(res, 200, listed);
@@ -6164,13 +6179,25 @@ export class Gateway {
       if (raStartMatch && method === 'POST') {
         const taskId = raStartMatch[1]!;
         const b = await this.body(req);
-        // Resolve the action from the AUTHORITATIVE live view (the stored lastView
-        // can lag the workflow), by index — the client never supplies the command,
-        // so only agent-authored actions are runnable.
-        const view = (await api.getTaskView(token, taskId, { live: true }).catch(liveViewUnavailable)) ?? (await store.getTask(taskId))?.lastView;
+        // Opening a file needs only its target, which the stored view (what the
+        // page shows) names: no workflow query, which costs seconds when the
+        // workflow must replay. Anything else is resolved from the AUTHORITATIVE
+        // live view (the stored lastView can lag the workflow), by index — the
+        // client never supplies the command, so only agent-authored actions are runnable.
+        const record = await store.getTask(taskId);
+        const stored = record?.lastView;
+        const shown = stored && (await store.withPendingReviewInfoAsync(taskId, stored));
+        const opensFile = shown?.reviewInfo?.actions?.[Number(b.index)]?.kind === 'open';
+        // Skipping the query must not skip what it checks: reading the task.
+        if (opensFile) {
+          const readable = await this.deps.tokens.check(token, 'task:read', { projectId: record!.projectId, taskId });
+          if (!readable.ok) throw new CapabilityError(readable.reason ?? 'denied: task:read');
+        }
+        const view = opensFile ? shown
+          : (await api.getTaskView(token, taskId, { live: true }).catch(liveViewUnavailable)) ?? stored;
         const action = view?.reviewInfo?.actions?.[Number(b.index)];
         if (!action) return this.json(res, 404, { error: 'no such review action' });
-        const task = (await store.getTask(taskId));
+        const task = record;
         if (action.kind === 'payment') {
           const request = action.requestId ? (await store.getPaymentSpendRequest(action.requestId)) : undefined;
           const organizationId = task ? (await store.getProject(task.projectId))?.organizationId : undefined;
@@ -6208,7 +6235,17 @@ export class Gateway {
           const name = saved?.name ?? (path.posix.basename(target.replace(/\\/g, '/')) || 'artifact');
           const mediaType = untrustedContentHeaders(saved?.mediaType
             ?? ARTIFACT_MIME[path.extname(name).toLowerCase()] ?? 'application/octet-stream', name)['content-type']!;
-          const signed = `/api/artifact-content/${await this.artifactUrls.mint({ taskId, path: target })}/${encodeURIComponent(name)}`;
+          // A saved file comes from the artifact edge when there is one: the
+          // nearest Cloudflare location reads it from the bucket, instead of
+          // every byte crossing this server (wiki features/review-artifacts).
+          const edge = saved && artifactEdge();
+          const headers = saved && untrustedContentHeaders(saved.mediaType, saved.name);
+          const signed = edge && saved && headers
+            ? `${edge.url}/${await signArtifactEdgeToken({ key: saved.objectKey, bytes: saved.bytes, sha256: saved.sha256,
+              type: headers['content-type']!, disposition: headers['content-disposition']!.startsWith('attachment') ? 'attachment' : 'inline',
+              csp: headers['content-security-policy']!, name: saved.name, expiresAt: Date.now() + ArtifactUrls.TTL_MS }, edge.key)}/${encodeURIComponent(name)}`
+            : `/api/artifact-content/${await this.artifactUrls.mint({ taskId, path: target,
+              ...(saved ? { artifact: saved.id } : {}) })}/${encodeURIComponent(name)}`;
           return this.json(res, 200, { kind: 'open', url: signed, external: false, name, mediaType,
             ...(saved ? { bytes: saved.bytes } : {}) });
         }
@@ -8465,7 +8502,8 @@ export class Gateway {
       if (resourcePath === '/api/accounts/usage' && method === 'GET') {
         const { enumerateCredentials } = await import('../platform/credentials.js');
         const { gatherCredentialSources } = await import('../platform/credential-sources.js');
-        const { isUsagePollable, isUsageStale } = await import('../agent/usage.js');
+        const { isUsagePollable, isUsageStale, withStreamReadings } = await import('../agent/usage.js');
+        const { kvJson, observedKey } = await import('../scheduling/state.js');
         const creds = enumerateCredentials(await gatherCredentialSources({
           configHomes: this.deps.configHomes,
           broker: this.deps.broker,
@@ -8482,7 +8520,7 @@ export class Gateway {
           // current (a week-old 15% once masqueraded as live while the login was
           // actually exhausted).
           if (cached) {
-            const snap = JSON.parse(cached);
+            const snap = withStreamReadings(JSON.parse(cached), await kvJson(store, observedKey(c.key)));
             usage[c.key] = canPoll ? { ...snap, stale: isUsageStale(snap, Date.now()) } : snap;
           }
           // Explain absence on a login that CAN'T be polled (setup-token, no full
@@ -9204,23 +9242,81 @@ export class Gateway {
     res.end(body);
   }
 
+  /** Everything the public pages are rendered from, for this request; the
+   * policy document only for the policy page `pathname` names. */
+  private async publicPageContext(req?: http.IncomingMessage, pathname = ''): Promise<PublicPageContext> {
+    const siteName = (await this.siteName);
+    const launch = (await this.deps.paidLaunchSettings?.publicLaunchInfo(siteName)) ?? publicLaunchInfo(process.env, undefined, siteName);
+    const slug = policySlugOf(pathname);
+    const document = slug ? ((await this.deps.paidLaunchSettings?.policyDocument(slug, siteName)) ?? policyDocument(slug, process.env, undefined, siteName)) : undefined;
+    return { staticDir: this.deps.staticDir, siteName, launch, policy: (wanted) => (wanted === document?.slug ? document : undefined),
+      origin: req ? this.publicUrl(req) : process.env.KARMAX_PUBLIC_URL?.replace(/\/$/, '') ?? '' };
+  }
+
   // ── static SPA ──
   private async static(p: string, res: http.ServerResponse, req?: http.IncomingMessage) {
+    // Only a hosted installation's public pages are for search engines; a
+    // self-hosted one is somebody's private console.
+    const indexable = this.deps.hosted === true;
+    if (p === '/robots.txt' || p === '/sitemap.xml') {
+      const origin = req ? this.publicUrl(req) : '';
+      if (p === '/sitemap.xml' && !indexable) return void res.writeHead(404).end('not found');
+      const body = p === '/robots.txt' ? robotsTxt(origin, indexable) : sitemapXml(origin, publicPaths((await this.publicPageContext(req))));
+      res.writeHead(200, { 'content-type': MIME[path.extname(p)]!, 'cache-control': 'no-cache', 'content-length': String(Buffer.byteLength(body)) });
+      return void res.end(req?.method === 'HEAD' ? undefined : body);
+    }
     const rel = p === '/' ? '/index.html' : p === '/billing/checkout' ? '/paddle-checkout.html' : p;
     let file = path.join(this.deps.staticDir, rel);
     if (unpublishedAsset(file)) return void res.writeHead(404).end('not found');
     if (!(await assetExists(this.deps.staticDir, file))) file = path.join(this.deps.staticDir, 'index.html'); // SPA fallback
     const name = path.basename(file);
-    // Brand the HTML response itself, not just the hydrated SPA. That avoids a
-    // flash of the default name and gives crawlers/non-JS clients the current
-    // installation identity. The checked-in shell remains a portable fallback.
-    const brandShell = async (data: Buffer) => {
-      const siteName = escapeHtml((await this.siteName));
-      return Buffer.from(data.toString('utf8')
-        .replace(/(<meta name="description" content=")[^"]*(" \/>)/, `$1${siteName} is the to-do list for managing AI agents: parallel cloud worlds, review gates, permissions, credentials, and payments in one calm interface.$2`)
-        .replace(/(<meta name="apple-mobile-web-app-title" content=")[^"]*(" \/>)/, `$1${siteName}$2`)
-        .replace(/<title>[^<]*<\/title>/, `<title>${siteName}</title>`));
-    };
+    // A docs page's Markdown source (agents read it) points search engines at the page.
+    const docSource = name !== 'index.html' && p.match(/^\/docs\/([^/]+)\.md$/)?.[1];
+    if (docSource) {
+      const origin = req ? this.publicUrl(req) : '';
+      return void (await serveStaticAsset(req, res, file, undefined,
+        { headers: { link: `<${origin}${docPath(docSource)}>; rel="canonical"` } }).catch(() => {
+        if (!res.headersSent) res.writeHead(404).end('not found');
+      }));
+    }
+    // The shell answers for its URL: a public page gets its own title,
+    // description, canonical URL, social tags and a plain rendering of its
+    // content; a public URL that names nothing is a 404; the console is not
+    // for indexing. Branding the HTML itself also avoids a flash of the
+    // default name. The checked-in shell remains a portable fallback.
+    let shell: { status: number; headers: Record<string, string>; transform: (data: Buffer) => Promise<Buffer> } | undefined;
+    if (name === 'index.html') {
+      // A public page that cannot be rendered is still served, as the console.
+      const context = publicPath(p) ? (await this.publicPageContext(req, p).catch(() => undefined)) : undefined;
+      let route: PublicRoute = { kind: 'console' };
+      try { if (context) route = resolvePublicRoute(context, p); } catch { /* the console renders it */ }
+      if (route.kind === 'redirect') {
+        const query = req?.url?.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+        res.writeHead(301, { location: `${route.location}${query}`, 'cache-control': 'no-cache' });
+        return void res.end();
+      }
+      const page = route.kind === 'page' ? route.page : undefined;
+      const site = context?.siteName ?? (await this.siteName);
+      const siteName = escapeHtml(site);
+      // The card names the product, so a renamed installation shows none.
+      const socialImage = site === BRAND ? { path: '/social-card.png', alt: `${BRAND} — ${LANDING_TAGLINE}` } : undefined;
+      shell = {
+        status: route.kind === 'not-found' ? 404 : 200,
+        headers: indexable && page ? {} : { 'x-robots-tag': 'noindex' },
+        transform: async (data) => {
+          // Replacer functions: a price ("$19") is not a replacement pattern.
+          const description = escapeHtml(page?.description ?? `${site} is the to-do list for managing AI agents: parallel cloud worlds, review gates, permissions, credentials, and payments in one calm interface.`);
+          let html = data.toString('utf8')
+            .replace(/(<meta name="description" content=")[^"]*(" \/>)/, (_, open: string, close: string) => `${open}${description}${close}`)
+            .replace(/(<meta name="apple-mobile-web-app-title" content=")[^"]*(" \/>)/, (_, open: string, close: string) => `${open}${siteName}${close}`)
+            .replace(/<title>[^<]*<\/title>/, () => `<title>${escapeHtml(page?.title ?? site)}</title>`);
+          if (page && context) html = html
+            .replace(/(\n\s*)<\/head>/, (_, indent: string) => `\n    ${publicHead(context, page, socialImage)}${indent}</head>`)
+            .replace('<div id="app"></div>', () => `<div id="app">${publicBody(context, page)}</div>`);
+          return Buffer.from(html);
+        },
+      };
+    }
     // `llms.txt` is also public product copy. Keep its checked-in version a
     // useful default, then brand both its prose and same-origin links at the
     // edge so hosted and self-hosted installations describe themselves.
@@ -9234,7 +9330,8 @@ export class Gateway {
         .replace(/https:\/\/tavya\.io/g, origin || 'https://tavya.io'));
     };
     try {
-      await serveStaticAsset(req, res, file, name === 'index.html' ? brandShell : name === 'llms.txt' ? brandLlms : undefined);
+      await serveStaticAsset(req, res, file, shell?.transform ?? (name === 'llms.txt' ? brandLlms : undefined),
+        shell ? { status: shell.status, headers: shell.headers } : undefined);
     } catch {
       if (!res.headersSent) res.writeHead(404).end('not found');
     }
@@ -9247,10 +9344,11 @@ export class Gateway {
    * gateway never holds a whole file. `sourceFile` (conversation file links)
    * defaults unknown extensions to an inline text view instead of a download,
    * for a useful source view. */
-  private async serveArtifact(req: http.IncomingMessage, res: http.ServerResponse, taskId: string, relPath: string, sourceFile = false) {
+  private async serveArtifact(req: http.IncomingMessage, res: http.ServerResponse, taskId: string, relPath: string, sourceFile = false,
+    download = false) {
     const task = (await this.deps.store.getTask(taskId));
     const saved = !sourceFile && task ? (await savedReviewArtifact(this.deps.store, taskId, relPath)) : undefined;
-    if (saved) return this.serveSavedArtifact(req, res, saved);
+    if (saved) return this.serveSavedArtifact(req, res, saved, { download });
     const handle = worldHandleForView(task?.lastView, taskId, task ? (await this.deps.store.effectiveProjectConfig(task.projectId)) : undefined);
     if (!handle) return this.json(res, 404, { error: 'no world for this task' });
     if (!relPath) return this.json(res, 400, { error: 'missing path' });
@@ -9300,8 +9398,8 @@ export class Gateway {
       const inferredType = ARTIFACT_MIME[path.extname(relPath).toLowerCase()];
       const looksTextual = !head.includes(0);
       await sendArtifact(req, res, source, {
-        ...untrustedContentHeaders(inferredType ?? (sourceFile && looksTextual ? 'text/plain; charset=utf-8' : 'application/octet-stream'),
-          path.basename(relPath)),
+        ...artifactHeaders(inferredType ?? (sourceFile && looksTextual ? 'text/plain; charset=utf-8' : 'application/octet-stream'),
+          path.basename(relPath), download),
         'cache-control': 'private, no-store',
       });
     } catch (error) {
@@ -9318,7 +9416,8 @@ export class Gateway {
    * partial response is checked by size alone. Re-hashing every range would
    * mean reading the whole object for each seek. */
   private async serveSavedArtifact(req: http.IncomingMessage, res: http.ServerResponse,
-    artifact: { objectKey: string; sha256: string; bytes: number; mediaType: string; name: string }) {
+    artifact: { objectKey: string; sha256: string; bytes: number; mediaType: string; name: string },
+    options: { download?: boolean; cache?: string } = {}) {
     const objects = this.deps.objects;
     if (!objects) return this.json(res, 503, { error: 'artifact storage is unavailable' });
     const integrity = new Error('artifact integrity check failed');
@@ -9338,8 +9437,8 @@ export class Gateway {
       return stream.body;
     } };
     try {
-      await sendArtifact(req, res, source, { ...untrustedContentHeaders(artifact.mediaType, artifact.name),
-        'cache-control': 'private, no-store' });
+      await sendArtifact(req, res, source, { ...artifactHeaders(artifact.mediaType, artifact.name, options.download),
+        'cache-control': options.cache ?? 'private, no-store' });
     } catch (error) {
       if (res.headersSent) return void res.destroy();
       return error === integrity ? this.json(res, 502, { error: integrity.message })
@@ -10684,6 +10783,13 @@ export function untrustedContentHeaders(mediaType: string, filename: string): Re
       : "sandbox; default-src 'none'",
     'x-content-type-options': 'nosniff',
   };
+}
+
+/** {@link untrustedContentHeaders}, saved to disk instead of shown when `download`
+ *  (a cross-origin `<a download>` is ignored by browsers, so the server must say it). */
+export function artifactHeaders(mediaType: string, filename: string, download = false): Record<string, string> {
+  const headers = untrustedContentHeaders(mediaType, filename);
+  return download ? { ...headers, 'content-disposition': headers['content-disposition']!.replace(/^inline/, 'attachment') } : headers;
 }
 
 /** For the gateway's own static pages (callbacks, a stopped preview): markup and

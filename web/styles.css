@@ -599,6 +599,7 @@ a { color: var(--accent); text-decoration: none; }
 .tabs-action { flex: none; align-self: center; margin: 0 4px 0 0; }
 
 .page-title { font-size: var(--h1); font-weight: 650; margin: 0 0 14px; letter-spacing: -0.015em; line-height: 1.25; }
+.scope-title code { font-family: var(--font-mono); font-size: .92em; font-weight: 600; letter-spacing: 0; padding: .1em .4em; border-radius: 5px; background: var(--tint); overflow-wrap: anywhere; }
 
 /* new-task composer */
 .composer { display: flex; gap: 8px; margin-bottom: 18px; }
@@ -647,7 +648,6 @@ a { color: var(--accent); text-decoration: none; }
    gapped and wrapped away from the words around it. Prose flows as prose. */
 p.task-sub { display: block; line-height: 1.55; }
 p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
-.task-sub .wf { font-family: var(--font-ui); font-variant-numeric: tabular-nums; color: var(--ink-2); }
 .task-sub .branch { font-family: var(--font-mono); }
 .task-right { display: flex; align-items: center; gap: 12px; }
 .row-when { color: var(--ink-3); font-size: var(--fs-12); font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -2261,6 +2261,12 @@ html[data-theme="light"] :is(body.landing-active, .landing-page) { color-scheme:
 html[data-theme="dark"] :is(body.landing-active, .landing-page) { color-scheme: dark; }
 /* Public documents use normal page scrolling; the console keeps its fixed viewport. */
 .landing-active #app, #app:has(> .legal-shell) { display: block; height: auto; min-height: 100vh; min-height: 100dvh; overflow: visible; }
+/* A public page's plain rendering (src/gateway/public-pages.ts), for readers that run no script.
+   The console replaces it as it boots; until then a browser running script shows nothing, as before. */
+#app:has(> .prerendered) { display: block; height: auto; overflow: visible; }
+.prerendered { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 3rem; line-height: 1.6; }
+.prerendered nav ul { display: flex; flex-wrap: wrap; gap: .25rem 1rem; padding: 0; list-style: none; }
+@media (scripting: enabled) { .prerendered { display: none; } }
 .landing-page, .legal-shell {
   --l-bg: var(--paper);
   --l-surface: var(--surface);
@@ -3457,8 +3463,6 @@ html[data-theme="dark"] .github-signin-btn:active,
 .attempt-note { color: var(--accent); font-size: var(--fs-11); font-weight: 600; }
 .attempt-add { flex: none; }
 
-.tp-workflow { display: flex; align-items: center; gap: 10px; font-size: var(--fs-13); }
-.tp-workflow .mono { color: var(--ink-3); font-size: var(--fs-12); }
 
 .stage-picker { display: inline-flex; align-items: center; }
 .stage-picker select {
@@ -4289,8 +4293,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .ab-frozen, .pf-fieldset { border: 0; padding: 0; margin: 0; min-inline-size: auto; display: grid; gap: 8px; }
 .ab-frozen > *, .pf-fieldset > * { opacity: .7; }
 .tp-creds-head { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--line); }
-.tp-creds-head label, .tp-workflow > label { font-size: var(--fs-12); font-weight: 600; color: var(--ink-2); }
-.tp-workflow { margin-bottom: 10px; }
+.tp-creds-head label { font-size: var(--fs-12); font-weight: 600; color: var(--ink-2); }
 .agent-authority #tp-auth { display: grid; gap: 8px; }
 .agent-authority #tp-auth .params-save-bar { position: static; margin-top: 0; padding-top: 4px; background: none; }
 /* The main agent's cards and budget save with its authorization. */

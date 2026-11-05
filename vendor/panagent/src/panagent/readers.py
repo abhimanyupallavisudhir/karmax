@@ -106,12 +106,19 @@ def read_claude_code(text: str, *, source_uri: str | None = None, **_: Any) -> d
             elif record_type not in {
                 "agent-name",
                 "ai-title",
+                # Claude Code 2.1.300+ records each API request beside the conversation.
+                "api-request",
+                "api-request-blob",
+                "api-request-shape",
+                "atis-latch",
                 "attachment",
+                "cost-state",
                 "custom-title",
                 "last-prompt",
                 "mode",
                 "permission-mode",
                 "queue-operation",
+                "session-owner",
                 None,
             }:
                 warning(

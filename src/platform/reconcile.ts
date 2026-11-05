@@ -49,6 +49,20 @@ async function warnOnLargeHistory(
   console.warn(`[karmax] ${taskId}: workflow history is ${Math.round(bytes / 1048576)} MB / ${events} events; Temporal terminates it at 50 MB / 51,200`);
 }
 
+/** What went wrong, from a failure's cause chain: an activity's failure says
+ * only "Activity task failed" around it. A world the provider cannot start
+ * says so in people's words; under it is the provider's raw answer
+ * (software-dev's innermostMessage). */
+function innermostMessage(error: unknown): string | undefined {
+  let message: string | undefined;
+  for (let at = error, depth = 0; at instanceof Error && depth < 10; at = at.cause, depth++) {
+    if (at.message.trim()) message = at.message.trim();
+    const type = (at as Error & { type?: unknown }).type;
+    if (type === 'world-infra' || type === 'world-capacity') break;
+  }
+  return message;
+}
+
 /** A run that ended without settling its own view failed in the stage that
  * view shows. Keep that stage: Retry needs it to resume the run faithfully
  * (an interrupted Landing becomes an integration repair). */
@@ -148,7 +162,8 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
           return;
         }
         let terminationReason: string | undefined;
-        if (name === 'TERMINATED') {
+        let failureReason: string | undefined;
+        if (name === 'TERMINATED' || name === 'FAILED') {
           try {
             // result() requests only the close event, not a potentially 50MB
             // history. Bind to the described run in case recovery starts another.
@@ -156,6 +171,8 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
           } catch (error) {
             if (error instanceof WorkflowFailedError && error.cause instanceof TerminatedFailure)
               terminationReason = error.cause.message;
+            // What failed it, not "workflow failed" (pramana#137: Hetzner's CPUs were full).
+            else if (error instanceof WorkflowFailedError) failureReason = innermostMessage(error.cause);
             // Diagnostics failure must not turn a known termination into "lost".
           }
         }
@@ -164,6 +181,7 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
             ? { ...base, status: 'done', stage: 'done', updatedAt: base.updatedAt }
             : { ...failedView(base), error: terminationReason
               ? `workflow terminated: ${terminationReason}`
+              : failureReason ? `workflow failed: ${failureReason}`
               : base.error ?? `workflow ${name.toLowerCase()}`, updatedAt: base.updatedAt };
         (await settle(t.id, next));
         settled++;

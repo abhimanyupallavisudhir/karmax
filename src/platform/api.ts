@@ -13,7 +13,7 @@ import { TOOL_CAPABILITY, Capability, ORGANIZATION_WIKI_WRITE_DENIED, allows } f
 import { AppGrants, sessionCapabilities } from '../auth/app-grants.js';
 import { WORKFLOW_TYPE, SIG, pinnedType, TASK_WORKFLOW_TASK_TIMEOUT } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
-import { MANIFESTS, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
+import { MANIFESTS, RETIRED_WORKFLOWS, RETIRED_WORKFLOW_HINT, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
 import { organizationSkillsDir, projectSkillsDir } from '../resolve/skills.js';
 import { validGitBranch } from '../util/git-ref.js';
 import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
@@ -97,7 +97,7 @@ import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { avatarAllows, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled, avatarPrincipal, avatarRoleOf, forkedAvatar,
   normalizeAvatarSetting, AVATAR_ROLE_LABELS, type AvatarRole } from './avatars.js';
 import { CapabilityError, NotFoundError, TaskStartedError, ValidationError } from './errors.js';
-import type { AccountQueueView } from '../coordinators/account.js';
+import type { AccountLeaseAnswer, AccountQueueView } from '../coordinators/account.js';
 import type { SchedulingQueueTask, SchedulingQueueView } from '../scheduling/view.js';
 import { assertAgentSpec, childComputer, subTaskParams } from './agent-params.js';
 import { CALLED_AGENT_FIELD, agentSpecsByParticipant, authorityKey, normalizeAgentAuthority, type StoredAgentAuthorization } from './agent-authority.js';
@@ -356,9 +356,6 @@ const FOLLOW_UP_ACTION = (role?: AgentRole): TaskView['actions'][number] => ({
   args: [{ name: 'text', type: 'text', label: 'Message', required: true }],
   ...(role ? { roles: [role] } : {}),
 });
-
-const GOAL_RESUME_MESSAGE =
-  'Workflow switched to Goal. Continue autonomously until the entire task is complete; do not stop after partial progress.';
 
 type CollaborationTargetIssue = {
   admission: string;
@@ -1561,6 +1558,7 @@ export class KarmaxApi {
     const project = (await this.deps.store.getProject(args.projectId));
     if (!project) throw new NotFoundError(`no project ${args.projectId}`);
     const workflow = args.workflow ?? 'software-dev';
+    if (RETIRED_WORKFLOWS.has(workflow)) throw new Error(RETIRED_WORKFLOW_HINT);
     // Honor a per-project version pin (§21d) so a project can hold on a specific
     // version while others take the latest; unpinned → latest.
     const start = this.resolveStart(workflow, (await this.workflowPinFor(args.projectId, workflow)), project.organizationId);
@@ -3732,23 +3730,7 @@ export class KarmaxApi {
         const { world, worldPath, worldAvailable, worldDesktop, worldProvider, ...history } = view;
         view = history;
       }
-      // Why a turn waits for a credential changes after it asked (the quota
-      // scheduler may hold it back), so read the coordinator's current answer.
-      // Existing parked executions recorded only "account" and get it this way too.
-      if (view.waitingFor?.kind === 'account') {
-        try {
-          const lease = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId())
-            .query(QRY_ACCOUNT_LEASE, { taskId }) as Promise<{
-              waiting: boolean; earliestResetAt?: number; detail?: string; heldUntil?: number;
-            }>, 500);
-          if (lease.waiting && lease.detail && (!view.waitingFor.detail || lease.heldUntil !== undefined
-            || lease.detail.startsWith('Held'))) view = { ...view, waitingFor: {
-            ...view.waitingFor, detail: lease.detail,
-            ...(lease.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
-            ...(lease.heldUntil !== undefined ? { until: lease.heldUntil } : {}),
-          } };
-        } catch { /* A coordinator outage must not block reading the task. */ }
-      }
+      view = await this.withLiveAccountWait(taskId, view);
       const rawAgents = await this.deps.store.kvGetAsync(agentSnapshotKey(taskId));
       let agents: Record<string, AgentSpec> | undefined;
       try { const parsed = rawAgents ? JSON.parse(rawAgents) : undefined;
@@ -3756,7 +3738,8 @@ export class KarmaxApi {
       } catch { /* Same malformed-snapshot fallback as readAgentSnapshot. */ }
       const task = await this.deps.store.taskMetadataAsync(taskId);
       const group = await this.deps.store.attemptCommitAsync(taskId);
-      const subTaskSummaries = await this.deps.store.childTaskSummaries(taskId);
+      const subTaskSummaries = await Promise.all((await this.deps.store.childTaskSummaries(taskId)).map(async (child) =>
+        child.lastView ? { ...child, lastView: await this.withLiveAccountWait(child.id, child.lastView) } : child));
       const forkSummaries = await this.deps.store.forkTaskSummaries(taskId);
       const forkSourceSummaries = await this.deps.store.forkSourceTaskSummaries(taskId);
       const accepted = (await this.acceptedAction(taskId, view));
@@ -3886,6 +3869,34 @@ export class KarmaxApi {
   async listTasks(token: string, projectId: string): Promise<TaskRecord[]> {
     (await this.require(token, 'list_tasks', { projectId }));
     return this.deps.store.listTasksAsync(projectId);
+  }
+
+  /**
+   * Why a turn waits for a model login changes after it asked (the quota
+   * scheduler decides, holds it back, or finds every login's quota used), and
+   * the view the workflow published only says what it was told then. So a
+   * waiting view takes the coordinator's current answer. Executions that
+   * recorded only "account" get their reason this way too.
+   */
+  async withLiveAccountWait<V extends Pick<TaskView, 'waitingFor'>>(taskId: string, view: V): Promise<V> {
+    if (view.waitingFor?.kind !== 'account') return view;
+    try {
+      const lease = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId())
+        .query(QRY_ACCOUNT_LEASE, { taskId }) as Promise<AccountLeaseAnswer>, 500);
+      if (!lease.waiting) return view;
+      // The coordinator's answer replaces the published one whole: a stale
+      // "Held until 14:20" must not survive into a wait for quota, nor its time.
+      const { detail: _detail, earliestResetAt: _reset, until: _until, reason: _reason, ...rest } = view.waitingFor;
+      return { ...view, waitingFor: { ...rest,
+        ...(lease.reason ? { reason: lease.reason } : {}),
+        ...(lease.detail ? { detail: lease.detail } : {}),
+        ...(lease.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
+        ...(lease.heldUntil !== undefined ? { until: lease.heldUntil } : {}),
+      } };
+    } catch {
+      // A coordinator outage must not block reading the task.
+      return view;
+    }
   }
 
   async listTaskSummaries(token: string, projectId: string): Promise<TaskRecord[]> {
@@ -4022,10 +4033,16 @@ export class KarmaxApi {
     if (infrastructureBackoff && !actions.some((action) => action.name === 'retry'))
       actions.unshift(RETRY_ACTION());
     // A wait for a credential or its quota resumes by itself, but only a person
-    // knows they just topped up credits or that a limit lifted early.
+    // knows they just topped up credits or that a limit lifted early: the button
+    // checks the logins again. Nothing failed, so it is not "Retry". A turn the
+    // quota scheduler holds back has usable logins, so checking them changes
+    // nothing; its control is Run now (pramana#137 showed a useless Retry).
+    // Nor does it help a turn the scheduler is placing or that waits for a free slot.
+    const accountReason = view.waitingFor?.reason;
     if (view.status === 'waiting' && view.waitingFor?.kind === 'account' && view.waitingFor.provider
+      && !view.waitingFor.detail?.startsWith('Held') && accountReason !== 'held' && accountReason !== 'planning' && accountReason !== 'slot'
       && !actions.some((action) => action.name === 'retry'))
-      actions.unshift(RETRY_ACTION());
+      actions.unshift({ ...RETRY_ACTION(), label: 'Check again' });
 
     const origin = view.state?.humanPauseOrigin as Stage | undefined;
     if (view.status !== 'waiting' || view.waitingFor?.kind !== 'human' || !origin)
@@ -7658,16 +7675,14 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     workflow: string,
   ): Promise<{ workflow: 'software-dev' | 'goal'; task?: TaskRecord }> {
     const task = (await this.deps.store.getTask(taskId));
-    const caller = (await this.require(token, 'edit_task', { projectId: task?.projectId, taskId }));
+    (await this.require(token, 'edit_task', { projectId: task?.projectId, taskId }));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
+    // Goal is retired, so the one compatible switch left is a Goal task's way
+    // back to Software Dev (asking for the mode a task already has is a no-op).
+    if (RETIRED_WORKFLOWS.has(workflow) && task.workflow !== workflow) throw new Error(RETIRED_WORKFLOW_HINT);
     if (workflow !== 'software-dev' && workflow !== 'goal') {
       throw new Error('only Software Dev and Goal are compatible in-flight');
     }
-    // Goal has no Review gate. Switching to it is the same reviewer's decision
-    // as patching `confirm.layers` to `[]` (updateParams), so a task agent,
-    // which holds task:edit on its own task, needs review:approve for it too.
-    if (workflow === 'goal' && task.workflow !== 'goal' && caller.kind === 'agent' && !allows(caller.caps, 'review:approve'))
-      throw new CapabilityError('switching a task to Goal removes its Review gate and needs review:approve (a maintainer-level authorization)');
     // A draft has no Temporal execution yet, so its workflow is ordinary editable
     // task metadata. Re-pin it to the target definition in place: identity, notes,
     // tags, authorization and sparse parameters all survive the form change.
@@ -7678,29 +7693,11 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       (await this.deps.store.setDraftWorkflow(taskId, workflow, start.manifest.version));
       return { workflow, task: (await this.deps.store.getTask(taskId))! };
     }
-    const heldView = task.lastView;
-    const heldOrigin =
-      heldView?.status === 'waiting'
-      && heldView.waitingFor?.kind === 'human'
-      && heldView.state?.humanPauseOrigin
-        ? heldView.state.humanPauseOrigin as Stage
-        : undefined;
     try {
       const result = (await this.deps.client.workflow
         .getHandle(taskId)
         .executeUpdate('changeWorkflow', { args: [workflow] })) as { workflow: 'software-dev' | 'goal' };
       (await this.deps.store.setTaskWorkflow(taskId, result.workflow));
-      // "Goal" is itself an instruction to continue autonomously. If the task
-      // was held in Do/Review, release the hold and carry that instruction into a
-      // fresh latest-version execution. This also repairs pre-1.7 held histories.
-      if (result.workflow === 'goal' && heldView && (heldOrigin === 'do' || heldOrigin === 'review')) {
-        const now = Date.now();
-        const message: Message = { id: `mode-${now}`, role: 'user', text: GOAL_RESUME_MESSAGE, ts: now };
-        const resumedView = this.withConversationMessage(heldView, 'do', message);
-        await this.stopTaskActivity(task, heldView, 'Goal mode supplied autonomous direction for a human hold');
-        const updatedTask = (await this.deps.store.getTask(taskId))!;
-        await this.startTransitionReplacement(updatedTask, resumedView, 'do');
-      }
       return result;
     } catch (e) {
       throw new Error(unwrapCause(e));

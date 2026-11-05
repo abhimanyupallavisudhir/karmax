@@ -20,7 +20,7 @@ describe('public landing page', () => {
   it('renders the installation\'s name in the homepage and representative screenshot, including its address bar', async () => {
     const ui = await landing();
     const { page } = ui;
-    expect(await page.title()).toBe('tavya — the to-do list for agents');
+    expect(await page.title()).toBe('tavya — the to-do list for AI agents');
     expect(await page.locator('.product-browserbar span').textContent()).toBe('console.test / tavya');
     expect(await page.locator('.product-wordmark strong').textContent()).toBe('tavya');
     expect(await page.locator('.product-project.active span').textContent()).toBe('tavya');

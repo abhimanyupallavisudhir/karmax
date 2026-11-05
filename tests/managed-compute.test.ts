@@ -241,6 +241,19 @@ describe('managed compute admission', () => {
       expect(refused.message).toBe('tavya\'s E2B computers are using 4 of their 4 CPUs; waiting for room.');
     });
 
+    // pramana#137: the project's default Computer was 8 CPUs, the task's own 2.
+    // Any chose the account for 2 CPUs, then every wake (no `resources` given)
+    // asked it for room for 8 and was refused there for good.
+    it('asks room for the task\'s own Computer when waking its world, and books the lease at that size', async () => {
+      const f = await two({ limits: { pool: { cpu: 10 } } });
+      const big = await f.store.createProject('Big default', { worldProvider: 'any', resources: { cpu: 8, memoryMb: 8192 } } as any, f.organization.id);
+      for (let i = 0; i < 3; i++) await f.ours();
+      const task = await f.store.createTask({ projectId: big.id, title: 'Small', workflow: 'just-do', workflowVersion: '1.0.0',
+        params: { prompt: 'x', computer: { provider: 'any', cpu: 2, memoryMb: 4096 } } as any });
+      const lease = await f.runners.acquire({ project: big, taskId: task.id, worldId: task.id, provider: 'e2b' });
+      expect((await f.store.worldLease(lease.leaseId))?.cpu).toBe(2);
+    });
+
     // The queue (wiki features/managed-compute § Queue): room that frees goes to
     // who waited first when it fits them, not to whoever asks next.
     it('gives freed room to the task that waited first, not to a newer one', async () => {

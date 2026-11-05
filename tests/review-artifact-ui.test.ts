@@ -81,10 +81,24 @@ describe('review artifact viewer', () => {
     const t = setup();
     await t.context.openArtifact({ url: signed('data.bin'), name: 'data.bin', mediaType: 'application/octet-stream' });
     expect(t.fetch).toHaveBeenCalledWith(signed('data.bin'), { method: 'HEAD' });
-    expect(t.anchor.href).toBe(signed('data.bin'));
+    // The URL itself asks to be saved: on the artifact edge (another origin) `download` is ignored.
+    expect(t.anchor.href).toBe(`${signed('data.bin')}?download=1`);
     expect(t.anchor.download).toBe('data.bin');
     expect(t.anchor.click).toHaveBeenCalled();
     expect(t.show).not.toHaveBeenCalled();
+  });
+
+  it('forgets a task\'s artifact URLs when its Review is republished', async () => {
+    const t = setup();
+    let minted = 0;
+    t.context.api = vi.fn(async () => ({ url: signed(`v${++minted}.mp4`) }));
+    const view = { taskId: 'task-1', reviewInfo: { actions: [{ kind: 'open', target: 'out/v.mp4' }] } };
+    expect((await t.context.resolveReviewArtifact(view, 0)).url).toBe(signed('v1.mp4'));
+    expect((await t.context.resolveReviewArtifact(view, 0)).url).toBe(signed('v1.mp4'));
+    t.context.forgetReviewArtifactUrls('task-2');
+    expect((await t.context.resolveReviewArtifact(view, 0)).url).toBe(signed('v1.mp4'));
+    t.context.forgetReviewArtifactUrls('task-1');
+    expect((await t.context.resolveReviewArtifact(view, 0)).url).toBe(signed('v2.mp4'));
   });
 
   it('downloads text too large to lay out instead of reading it', async () => {

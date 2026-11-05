@@ -31,10 +31,7 @@ describe('existing hidden workflow forms', () => {
       const html = vm.runInContext("renderField(consumingField(schemaFor('just-do')), 'Wake #219 after #232 succeeds.', undefined, true)", context);
       expect(html).toContain('data-field="prompt"');
       expect(html).toContain('>Wake #219 after #232 succeeds.</textarea>');
-      const choices = (existing: boolean) => vm.runInContext(`taskFormWorkflows('just-do', ${existing}).map(w => w.id)`, context);
-      expect(choices(true)).toContain('just-do');
-      expect(choices(false)).not.toContain('just-do');
-      expect(choices(false)).not.toContain('script-exec');
+      expect(vm.runInContext('WORKFLOWS.map(w => w.id)', context)).toEqual(['software-dev']);
     });
   }
 });

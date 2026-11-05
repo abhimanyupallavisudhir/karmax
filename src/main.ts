@@ -537,6 +537,15 @@ async function main() {
   const computeTopUpTimer = new AsyncInterval(async () => { await computeTopUps.run(); }, 60_000);
   computeTopUpTimer.unref();
   startupJobs.push(() => computeTopUpTimer.run());
+  /** Ask a task waiting for a machine to try again now (its workflow's Retry). */
+  const retryWaitingForMachine = async (taskId: string): Promise<boolean> => {
+    const view = (await store.getTask(taskId))?.lastView;
+    if (view?.status !== 'waiting' || view.waitingFor?.kind !== 'retry' || view.waitingFor.summary !== 'Waiting for a machine') return false;
+    await client.workflow.getHandle(taskId).signal('retry');
+    return true;
+  };
+  // A parked world moved because it could not wake: its task tries again at once.
+  worldLifecycle.retry = retryWaitingForMachine;
   // The compute queue: tell the first task waiting for a machine that now
   // fits to try again at once (src/world/compute-waker.ts).
   const { wakeComputeQueue, WAKE_EVERY_MS } = await import('./world/compute-waker.js');
@@ -552,12 +561,7 @@ async function main() {
       if (await providerConnections.funding(scope, provider) !== 'own') return undefined;
       return { provider, managed: false, pool: (await providerConnections.limits(scope, provider)).pool };
     },
-    retry: async (taskId) => {
-      const view = (await store.getTask(taskId))?.lastView;
-      if (view?.status !== 'waiting' || view.waitingFor?.kind !== 'retry' || view.waitingFor.summary !== 'Waiting for a machine') return false;
-      await client.workflow.getHandle(taskId).signal('retry');
-      return true;
-    } }); }, WAKE_EVERY_MS);
+    retry: retryWaitingForMachine }); }, WAKE_EVERY_MS);
   computeQueueTimer.unref();
   startupJobs.push(() => computeQueueTimer.run());
   // Service limits: sample the operator's accounts every 15 minutes, so a

@@ -31,7 +31,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     setTimeout(() => send({ id: msg.id, result: {} }), 100);
   }
   else if (msg.method === 'turn/start') {
-    // Codes from the pinned Codex protocol (0.162.1 has no usageLimitReached; audit R-10).
+    // Codes from the pinned Codex protocol (0.166.0 has no usageLimitReached; audit R-10).
     if (process.env.STUB_MODE?.startsWith('rpc-limit')) { send({ id: msg.id, error: { code: -32000, message: 'try again in 20s', data: { codexErrorInfo: process.env.STUB_MODE === 'rpc-limit-rate' ? 'rateLimitExceeded' : 'usageLimitExceeded' } } }); return; }
     if (process.env.STUB_MODE?.startsWith('rpc-local-')) { send({ id: msg.id, error: { code: -32603, message: process.env.STUB_MODE === 'rpc-local-disk' ? 'Disk quota exceeded' : 'npm registry HTTP 401 unauthorized' } }); return; }
     send({ id: msg.id, result: { turn: { id: 'turn-1' } } });

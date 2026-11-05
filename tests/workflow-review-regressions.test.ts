@@ -1355,6 +1355,83 @@ describe('a sub-task that cannot be prepared', () => {
     expect(failureNotes()).toHaveLength(1);
   });
 
+  // pramana#137 (2026-11-04): the save before a sub-task woke the parked world,
+  // Hetzner's CPUs were full, and the failed save failed the whole task.
+  const cpusFull = () => new ActivityFailure('Activity task failed', 'commitWork', '74', RetryState.NON_RETRYABLE_FAILURE, 'worker',
+    ApplicationFailure.create({ type: 'world-capacity', nonRetryable: true,
+      message: "tavya's Hetzner Cloud computers are using 8 of their 10 CPUs; waiting for room." }));
+
+  it('waits for room to save the work before a sub-task, visibly, and then creates it', async () => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.commitWork = vi.fn().mockRejectedValueOnce(cpusFull()).mockRejectedValueOnce(cpusFull())
+      .mockResolvedValue({ committed: true });
+    wf.activities.prepareChildTask = vi.fn(async () => ({ ...input, taskId: 'child' }));
+    delegate();
+    const waits: any[] = [];
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      if (view.waitingFor?.kind === 'retry') waits.push({ view: structuredClone(view), timeout: wf.timeout });
+      else wf.handlers.get('cancel')!();
+    };
+    expect(await softwareDevV1_30(withRepo)).toEqual({ stage: 'cancelled' });
+    expect(waits.map((w) => w.timeout)).toEqual([30_000, 60_000]);
+    expect(waits[0].view).toMatchObject({ status: 'waiting',
+      waitingFor: { detail: "tavya's Hetzner Cloud computers are using 8 of their 10 CPUs; waiting for room." } });
+    expect(wf.activities.commitWork).toHaveBeenCalledTimes(3);
+    expect(wf.handlers.get('view')!().subTasks).toEqual(['child']);
+    expect(failureNotes()).toEqual([]);
+  });
+
+  it('asks a person once the room never comes, and Retry saves and creates the sub-task', async () => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    let full = true;
+    wf.activities.commitWork = vi.fn(async () => { if (full) throw cpusFull(); return { committed: true }; });
+    wf.activities.prepareChildTask = vi.fn(async () => ({ ...input, taskId: 'child' }));
+    delegate();
+    let escalated: any;
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      if (view.stage === 'escalated' && !escalated) { escalated = structuredClone(view); full = false; wf.handlers.get('retry')!(); }
+      else if (view.waitingFor?.kind !== 'retry') wf.handlers.get('cancel')!();
+    };
+    expect(await softwareDevV1_30(withRepo)).toEqual({ stage: 'cancelled' });
+    expect(escalated).toMatchObject({ status: 'blocked' });
+    expect(escalated.error).toBe('create_sub_task "OCR" failed: no sub-task was created. '
+      + "tavya's Hetzner Cloud computers are using 8 of their 10 CPUs; waiting for room. Nothing was lost; Retry creates it again.");
+    expect(escalated.actions.map((a: any) => a.name)).toContain('retry');
+    expect(wf.handlers.get('view')!().subTasks).toEqual(['child']);
+  });
+
+  // The same wake for a pull request: its task's agent opened it again, and
+  // moving its worktree to that head needs the world.
+  it('waits for room to move a pull request to its new head', async () => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.movePullRequest = vi.fn().mockRejectedValueOnce(cpusFull()).mockResolvedValue(undefined);
+    wf.buffered = [['pullRequestUpdated', [{ head: 'abcdef1234' }]]];
+    // Moved, it goes on to its proposal; the test ends there.
+    wf.activities.checkProposal = vi.fn(async () => { wf.handlers.get('cancel')!(); return { ready: false, note: 'stop' }; });
+    const waits: any[] = [];
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      if (view.waitingFor?.kind === 'retry') waits.push(view.waitingFor.detail);
+      else wf.handlers.get('cancel')!();
+    };
+    const world = { id: 'parent', kind: 'worktree', root: '/tmp/test', branch: 'b', base: 'main' };
+    await softwareDevV1_30({ ...withRepo, shippedFrom: { taskId: 'parent', checkout: 'app', world } });
+    expect(waits).toEqual(["tavya's Hetzner Cloud computers are using 8 of their 10 CPUs; waiting for room."]);
+    expect(wf.activities.movePullRequest).toHaveBeenCalledTimes(2);
+    expect(wf.activities.movePullRequest).toHaveBeenLastCalledWith(expect.anything(), 'abcdef1234');
+  });
+
+  it('keeps histories recorded before the wait failing on a full provider', async () => {
+    wf.absentPatches = new Set(['software-dev-world-reopens-wait-v1']);
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.commitWork = vi.fn().mockRejectedValue(cpusFull());
+    delegate();
+    await expect(softwareDevV1_30(withRepo)).rejects.toThrow('Activity task failed');
+    expect(wf.activities.commitWork).toHaveBeenCalledOnce();
+  });
+
   it('keeps histories recorded before it failing the task', async () => {
     wf.absentPatches = new Set(['subtask-prepare-failure-to-agent-v1']);
     wf.activities.accountPoolSize.mockResolvedValue(0);
