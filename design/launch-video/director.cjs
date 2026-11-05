@@ -355,13 +355,10 @@ S.cli = async () => {
   photoUrl = out.match(/https?:\/\/\S+/)?.[0]?.replace(SHOW_HOST, '');
   await page.evaluate(() => window.__demo.term.caret());
   mark('cli-typed', 1);
-  await goto(ACTIVE); // behind the terminal: `n` from the organization asks for a project
-  await sleep(400);
+  await sleep(900);
   await page.evaluate(() => window.__demo.term.close());
   await demo('scrim', false);
   await demo('cursorVisible', true);
-  await flight();
-  await caption('Review it, and it lands back on your laptop.');
   await goto(photoUrl || '/personal/random');
   mark('cli-work', 4);
   await waitStage('random', 'Sort my photos', ['review']);
@@ -381,11 +378,13 @@ S.cli = async () => {
   await sleep(300);
   await termRun('~/random', 'tavya pull && ls photos', path.join(LAPTOP, 'random'));
   await page.evaluate(() => window.__demo.term.caret());
-  await sleep(2000);
+  await goto(ACTIVE); // behind the terminal: `n` from the organization asks for a project
+  await sleep(1600);
   await page.evaluate(() => window.__demo.term.close());
   await demo('scrim', false);
   await demo('cursorVisible', true);
   await sleep(300);
+  await flight();
 };
 
 const FLIGHT = 'Book me the cheapest direct flight to London on January 3 with reasonable timings. My passport, loyalty card numbers etc. are in this folder.';
