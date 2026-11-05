@@ -2,6 +2,8 @@ import { proxyActivities, defineSignal, defineQuery, setHandler, condition } fro
 import type { pingActivities } from '../activities/ping.js';
 
 const act = proxyActivities<typeof pingActivities>({ startToCloseTimeout: '10s' });
+// Like most task activities: no heartbeat, a 5-minute start-to-close.
+const slow = proxyActivities<typeof pingActivities>({ startToCloseTimeout: '5 minutes', retry: { initialInterval: '1s' } });
 
 export const bump = defineSignal<[number]>('bump');
 export const finish = defineSignal('finish');
@@ -27,4 +29,9 @@ export async function pingWorkflow(start: string): Promise<{ started: string; at
   await act.echo(start);
   await condition(() => done);
   return { started: start, at, count };
+}
+
+/** Smoke test for a worker stopping mid-activity (a deploy): the attempt that finished. */
+export async function pingStallWorkflow(ms: number): Promise<number> {
+  return await slow.stallOnce(ms);
 }
