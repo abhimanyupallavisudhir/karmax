@@ -8,11 +8,13 @@ tavya is a to-do list for agents. You write tasks; agents do them on their own c
 
 ## 2. Connect your accounts
 
+Your first organization comes with **$5 of free compute for 14 days**. It pays for tavya's computers and for tavya's included model, so your first tasks need no agent login and no card.
+
 In the organization's **Settings**:
 
 - **Projects**: connect GitHub, so agents can work on your repositories and open pull requests.
-- **Agents**: sign in with a Claude or ChatGPT subscription, or add an API key.
-- **Computers**: tasks run on tavya's computers, charged to your plan, or on your own E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud account ([Cloud computers](/docs/computers)).
+- **Agents**: tasks start on tavya's included model (DeepSeek V4.1 Flash). For other models, sign in with a Claude or ChatGPT subscription or add an API key, then pick the model in **Task defaults**. Your own logins and keys are billed by their providers, not from your compute.
+- **Computers**: tasks run on tavya's computers, charged to your trial or plan, or on your own E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud account ([Cloud computers](/docs/computers)).
 
 ## 3. Create a project
 

@@ -1,6 +1,6 @@
 # Cloud computers
 
-Every task runs on its own cloud computer. tavya can run it on its own accounts (charged to your plan's compute), or on yours: connect an account under **Settings → Computers**, and your tasks use it at the provider's price, with nothing added.
+Every task runs on its own cloud computer. tavya can run it on its own accounts (charged to your plan's compute, or to the $5 free trial a new organization gets for its first 14 days), or on yours: connect an account under **Settings → Computers**, and your tasks use it at the provider's price, with nothing added.
 
 | | Disk | Paused | Good for |
 |---|---|---|---|
