@@ -4562,7 +4562,9 @@ function setupFixes(text, projectId) {
   const raw = String(text || '');
   const settings = globalRoute('organization');
   const plan = `${settings}#settings-plan`, computers = `${settings}#settings-computers`;
-  const own = { label: 'Use your own account', href: computers };
+  // The included model draws on the same credit: there, one's own is a model login or key.
+  const own = /Settings → Agents/.test(raw) ? { label: 'Use your own login', href: `${settings}#settings-agents` }
+    : { label: 'Use your own account', href: computers };
   // Never bought a plan, or spent this month's compute: more on the plan, or one's own account.
   if (/\bOut of compute\b/.test(raw)) return [{ label: /come with a paid plan|free trial/.test(raw) ? 'Choose a plan' : 'Add compute', href: plan }, own];
   if (/No computer (?:is connected|this organization can use fits)/.test(raw)) return [{ label: 'Connect a computer', href: computers }];
@@ -25624,7 +25626,7 @@ function installationView() {
       <div id="proc-panel" style="margin-top:12px"></div>
       <div class="settings-section-title" id="installation-limits"><div>Service limits ${policyTip(`Shared accounts and this server against their plans`)}</div></div>
       <div class="card service-limits" id="service-limits-card"><span class="task-sub">Loading…</span></div>
-      <div class="settings-section-title" id="installation-compute"><div>Managed compute ${policyTip(`${siteName()}’s own provider accounts. Organizations without their own account run on them, charged to their plan’s monthly compute at twice the provider’s price.`)}</div></div>
+      <div class="settings-section-title" id="installation-compute"><div>Managed compute ${policyTip(`${siteName()}’s own provider accounts. Organizations without their own account run on them, and on the included model, charged to their plan’s monthly compute at twice the provider’s price.`)}</div></div>
       <div class="card" id="managed-compute-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity ${policyTip(`Admission limits shared by all agent work`)}</div></div>${hostCapacityCard()}
       <div class="settings-section-title" id="installation-github"><div>GitHub</div></div>${installationGithubCard()}
@@ -25666,6 +25668,47 @@ function managedComputeMarkup(view) {
     ${unconnected.length ? `<details class="inst-fold managed-off"><summary>Not connected <span class="setting-muted">${unconnected.length}</span></summary>
       <div class="computer-providers">${unconnected.map(row).join('')}</div></details>` : ''}`;
 }
+// tavya's included model (wiki features/included-model): one OpenRouter
+// account, a key per organization, charged to the compute credit.
+function includedModelRow(settings) {
+  const money = (micros) => `$${(Number(micros || 0) / 1e6).toFixed(2)}`;
+  const state = !settings ? null : settings.enabled && settings.keyConfigured ? ['On', 'done'] : ['Off', ''];
+  return `<div class="computer-providers included-model"><div class="computer-provider"><b>Included model</b>
+    ${policyTip(`A model ${siteName()} pays for, so new organizations run tasks without a login of their own. Charged to their compute credit at twice OpenRouter’s price.`)}
+    ${state ? `<span class="chip ${state[1]}">${state[0]}</span><span class="setting-muted">${esc(settings.model)}</span>
+      <span class="setting-muted managed-month" title="${esc(`This month, for ${settings.organizations} organization${settings.organizations === 1 ? '' : 's'}: OpenRouter’s price, then what organizations were charged.`)}">${money(settings.costMicros)} → ${money(settings.chargedMicros)}</span>` : ''}
+    <span class="label-row-fill"></span>
+    ${settings ? '<button class="icon-btn included-model-edit" type="button" title="Edit included model" aria-label="Edit included model">✎</button>'
+      : '<button class="btn sm included-model-edit" type="button">Connect</button>'}</div></div>`;
+}
+function openIncludedModelDialog(settings, onSaved) {
+  const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-card computer-dialog" role="dialog" aria-modal="true" aria-label="Included model">
+    <div class="modal-head"><b>Included model</b>${policyTip('Runs on OpenRouter. Each organization gets its own key, limited to its compute credit.')}<span class="label-row-fill"></span><button class="icon-btn included-close" type="button" aria-label="Close">×</button></div>
+    <div class="settings-grid">
+      <label class="form-row"><span>Management key ${policyTip('OpenRouter → Settings → Management keys')}</span>
+        <input class="included-key" type="password" autocomplete="off" placeholder="${settings?.keyConfigured ? 'Saved · leave blank to keep' : 'sk-or-v1-…'}"></label>
+      <label class="form-row"><span>Model</span><input class="included-model-id" value="${esc(settings?.model || 'deepseek/deepseek-v4.1-flash')}" placeholder="deepseek/deepseek-v4.1-flash"></label>
+      <label class="switch"><input class="toggle included-enabled" type="checkbox" ${settings?.enabled === false ? '' : 'checked'}>Offer to organizations</label></div>
+    <div class="modal-actions"><span class="label-row-fill"></span><button class="btn included-cancel" type="button">Cancel</button><button class="btn primary included-save" type="button">Save</button></div></div>`;
+  const close = () => { document.removeEventListener('keydown', keydown); overlay.remove(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  overlay.querySelector('.included-close').addEventListener('click', close);
+  overlay.querySelector('.included-cancel').addEventListener('click', close);
+  overlay.querySelector('.included-save').addEventListener('click', async (event) => {
+    const button = event.currentTarget; button.disabled = true;
+    const managementKey = overlay.querySelector('.included-key').value.trim();
+    const body = { ...(managementKey ? { managementKey } : {}), model: overlay.querySelector('.included-model-id').value.trim(),
+      enabled: overlay.querySelector('.included-enabled').checked };
+    try { await api('/api/settings/included-model', { method: 'PUT', body: JSON.stringify(body) }); }
+    catch (error) { toast(error.message, true); button.disabled = false; return; }
+    close(); toast('Included model saved'); onSaved?.();
+  });
+  document.addEventListener('keydown', keydown);
+  document.body.appendChild(overlay);
+  overlay.querySelector(settings?.keyConfigured ? '.included-model-id' : '.included-key').focus();
+}
 /** "3 of 50 running · 6 of 24 CPU · 400 of 1,024 GB · 2 waiting": what is in use against the account's budget, and its queue. */
 function managedRunning(account) {
   const pool = account.limits?.pool || {};
@@ -25679,9 +25722,12 @@ async function wireManagedComputeCard() {
   let view;
   try { view = await api('/api/settings/managed-compute'); }
   catch (error) { if (card.isConnected) paneError(card, error, () => wireManagedComputeCard()); return; }
+  // The included model shares the compute credit: its row sits beside the computers.
+  const included = await api('/api/settings/included-model').then((value) => value.settings, () => undefined);
   if (!card.isConnected) return;
-  card.innerHTML = managedComputeMarkup(view);
-  card.querySelectorAll('.computer-provider').forEach((row) => {
+  card.innerHTML = managedComputeMarkup(view) + includedModelRow(included);
+  card.querySelector('.included-model-edit')?.addEventListener('click', () => openIncludedModelDialog(included, wireManagedComputeCard));
+  card.querySelectorAll('.computer-provider[data-provider]').forEach((row) => {
     const provider = row.dataset.provider;
     const account = (view.providers || []).find((candidate) => candidate.provider === provider);
     const open = () => openComputerDialog(provider, account, null, wireManagedComputeCard, { managed: true });
@@ -25851,7 +25897,9 @@ function planBillingMarkup(e, state) {
       e.computePacks ? `${e.computePacks} × ${computeUnit}${e.computePacks === 1 ? '' : 's'}` : '',
       e.giftedComputePacks ? `${e.giftedComputePacks} × ${computeUnit}${e.giftedComputePacks === 1 ? '' : 's'} gifted` : '',
       topUp ? `${planDollars(topUp)} topped up, kept until used` : ''].filter(Boolean).join(' + ');
-    const tip = `Cloud computers ${siteName()} runs for you (${providers}), at twice the provider’s price: a 2 CPU · 2 GB E2B computer is about $0.27 an hour. Resets ${day(e.compute.to)}. Computers on your own provider accounts aren’t counted. ${credit ? `${parts}.` : ''}${held ? ` ${planDollars(held)} is held for computers running now.` : ''}`;
+    // The included model draws on it too (its use is the `openrouter` row).
+    const model = (e.compute.byProvider || []).find((row) => row.provider === 'openrouter');
+    const tip = `Cloud computers ${siteName()} runs for you (${providers})${e.compute.includedModel ? ' and its included model' : ''}, at twice the provider’s price: a 2 CPU · 2 GB E2B computer is about $0.27 an hour. Resets ${day(e.compute.to)}. Your own provider accounts and logins aren’t counted. ${credit ? `${parts}.` : ''}${model ? ` ${planDollars(model.usedMicros)} of it on the included model.` : ''}${held ? ` ${planDollars(held)} is held for computers running now.` : ''}`;
     const canCompute = canPacks && state?.computePack?.available;
     computeRow = `<div class="setting-row plan-limit" data-limit="compute"><span class="setting-label">Compute ${policyTip(tip.trim())}</span>
       <span class="setting-value">${credit ? `${planMeter(Number(e.compute.usedMicros || 0) + held, credit)}<span><b>${esc(planDollars(e.compute.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(credit))} ${trialLive && !e.computeCreditMicros && !topUp ? `· free until ${esc(day(trial.endsAt))}` : 'this month'}</span></span>`

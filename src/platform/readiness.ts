@@ -14,6 +14,7 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ConfigHomeManager } from '../autonomy/config-homes.js';
 import { credentialProvider, credentialServesProfile, mockAgentEnabled } from '../agent/provider-registry.js';
 import { managedModelRailAvailable } from '../agent/managed-models.js';
+import { includedModel, isIncludedModel } from '../agent/included-model.js';
 import { enumerateCredentials, resolveCredentials, type Credential } from './credentials.js';
 import { gatherCredentialSources, readPolicyLayers } from './credential-sources.js';
 import { ComputeRouter, type RouterConnections } from '../world/compute-router.js';
@@ -38,7 +39,7 @@ export interface AgentNeed {
 
 export interface Readiness {
   /** One entry per asked-about agent: whether some enabled login or key (or a
-   * model tavya pays for) can run it. */
+   * model tavya pays for: the included model, wiki features/included-model) can run it. */
   agents: Array<{ provider: string; model?: string; ready: boolean; need?: AgentNeed }>;
   /** Any enabled login or key at all. */
   agentLogin: boolean;
@@ -88,6 +89,8 @@ export async function projectReadiness(deps: ReadinessDeps,
   const credentials = resolveCredentials(all, layers);
   const inOrganization = resolveCredentials(all, { global: layers.global });
   const policy = agents.length ? await deps.store.getOrganizationUsagePolicy(scope.organizationId) : undefined;
+  // tavya's included model runs on the organization's credit, not a login of its own.
+  const included = agents.length ? await includedModel(deps.store, deps.broker) : undefined;
   const serves = (agent: Pick<AgentProfile, 'provider' | 'model'>, pool: Credential[]) =>
     pool.some((credential) => credentialServesProfile(agent, credential, all));
   const need = (agent: Pick<AgentProfile, 'provider' | 'model'>): AgentNeed => {
@@ -99,7 +102,7 @@ export async function projectReadiness(deps: ReadinessDeps,
   return {
     agents: agents.map((agent) => {
       const ready = agent.provider === 'mock' ? mockAgentEnabled()
-        : serves(agent, credentials) || managedModelRailAvailable(deps.hosted, policy!, agent);
+        : serves(agent, credentials) || managedModelRailAvailable(deps.hosted, policy!, agent) || isIncludedModel(agent, included);
       return { ...agent, ready, ...(ready ? {} : { need: need(agent) }) };
     }),
     agentLogin: credentials.length > 0,

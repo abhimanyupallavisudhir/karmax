@@ -182,7 +182,9 @@ const dollars = (micros: number) => `$${(micros / 1e6).toFixed(2)}`;
 const day = (at: number) => new Date(at).toISOString().slice(0, 10);
 
 function exhausted(credit: ComputeCredit, provider: string): ComputeCreditExhausted {
-  const own = `connect your own ${providerName(provider)} account in Settings → Computers`;
+  // The included model (wiki features/included-model) draws on the same credit.
+  const own = provider === 'openrouter' ? 'connect your own agent login or API key in Settings → Agents'
+    : `connect your own ${providerName(provider)} account in Settings → Computers`;
   if (!credit.creditMicros && !credit.topUpMicros) {
     const trial = credit.trial;
     if (!trial) return new ComputeCreditExhausted(

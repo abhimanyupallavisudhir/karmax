@@ -528,13 +528,17 @@ async function main() {
   }, 3600_000);
   managedStorageTimer.unref();
   startupJobs.push(() => managedStorageTimer.run());
-  // Managed compute: tell owners when the compute credit is spent, hibernate
+  // Managed compute (and the included model, which shares its credit): tell owners when the compute credit is spent, hibernate
   // parked disks after their grace (wiki features/managed-compute § Spent credit),
   // close settled months of top-up credit and prune old holds.
   const { notifyComputeCredit } = await import('./world/compute-notices.js');
   const { closeComputeMonths } = await import('./world/managed-compute.js');
   // Every ten minutes: the grace of a huge parked disk can be a few hours.
-  const computeNoticeTimer = new AsyncInterval(async () => { await notifyComputeCredit({ store, email: emailService,
+  const { syncAllIncludedModelUsage } = await import('./agent/included-model.js');
+  const computeNoticeTimer = new AsyncInterval(async () => {
+    // What the included model's keys spent first, so the credit below is current.
+    await syncAllIncludedModelUsage(store, broker);
+    await notifyComputeCredit({ store, email: emailService,
     publicUrl: process.env.KARMAX_PUBLIC_URL, userEmail: async (userId) => (await identity.userById(userId))?.email ?? undefined,
     siteName: async () => siteNameOf((await store.getSettings('global', 'appearance'))),
     hibernate: (worlds) => worldLifecycle.hibernateForCompute(worlds) });
