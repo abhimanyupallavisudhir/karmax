@@ -112,7 +112,7 @@ jobs:
                   cat report.txt
                   echo '```'
                   echo
-                  echo 'What each step checks: `src/ops/smoke.ts`. Diagnosing production: wiki `ops/diagnostics`.'
+                  echo "What each step checks: src/ops/smoke.ts. Diagnosing production: the wiki's ops/diagnostics."
                   echo 'This issue closes itself when the smoke test passes again.'
                 } > issue.md
                 gh issue create --repo "$GITHUB_REPOSITORY" --label "$label" \
