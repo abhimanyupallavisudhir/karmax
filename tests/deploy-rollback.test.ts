@@ -3,13 +3,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync, spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 const operator = fs.readFileSync(new URL('../deploy/karmax', import.meta.url), 'utf8');
 
-function update(previousEpoch: string | undefined, targetEpoch: string, ready = false, failure = '', flags: string[] = [], env = '') {
+function update(previousEpoch: string | undefined, targetEpoch: string, ready = false, failure = '', flags: string[] = [], env = '',
+  options: { smokeToken?: string; environment?: Record<string, string> } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-rollback-')); roots.push(root);
   const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   git('init', '-q', '-b', 'master');
@@ -26,6 +27,10 @@ function update(previousEpoch: string | undefined, targetEpoch: string, ready = 
   git('update-ref', 'refs/remotes/origin/master', target); git('checkout', '-q', '--detach', previous);
   fs.mkdirSync(path.join(root, 'deploy'), { recursive: true });
   fs.writeFileSync(path.join(root, 'deploy/.turnkey.env'), env);
+  if (options.smokeToken !== undefined) {
+    fs.mkdirSync(path.join(root, 'deploy/.secrets'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'deploy/.secrets/smoke_token'), options.smokeToken);
+  }
   // Exercise the real updater against a real Git history. Only infrastructure
   // effects are stubbed; failed readiness must select the safe recovery branch.
   const script = operator.slice(0, operator.indexOf('\nusage() {')) + `
@@ -38,6 +43,13 @@ dc() {
   printf '%s\\n' "$*" >> "$ROOT_DIR/operations"
   case "$*" in *vault-preflight*) case "${failure}" in vault) return 3 ;; vault-fatal) return 4 ;; esac; return 0 ;; esac
   case "$*" in *psql*) [ "${failure}" != role ]; return ;; esac
+  # The smoke test runs in the candidate; it gets the token through the
+  # environment, never its command line.
+  case "$*" in *'npm run --silent smoke'*)
+    printf 'smoke token=%s\n' "\${TAVYA_SMOKE_TOKEN:+set}" >> "$ROOT_DIR/operations"
+    case "${failure}" in smoke) return 1 ;; smoke-inconclusive) return 3 ;; esac
+    return 0 ;;
+  esac
   [ "${failure}" != build ] || [ "$*" != "build --pull app" ]
 }
 cmd_backup_candidate() { destination="$DEPLOY_DIR/backups/fixture"; mkdir -p "$destination"; [ "${failure}" != backup ]; }
@@ -56,7 +68,8 @@ cmd_update "$@"
 `;
   const file = path.join(root, 'deploy/fixture-updater'); fs.writeFileSync(file, script);
   const after = flags[0] === '--after';
-  const result = spawnSync('sh', [file, ...(after ? [target, ...flags.slice(1)] : [...flags, target])], { cwd: root, encoding: 'utf8' });
+  const result = spawnSync('sh', [file, ...(after ? [target, ...flags.slice(1)] : [...flags, target])], { cwd: root, encoding: 'utf8',
+    env: { ...process.env, ...options.environment } });
   const operations = fs.existsSync(path.join(root, 'operations')) ? fs.readFileSync(path.join(root, 'operations'), 'utf8') : '';
   return { ...result, operations, head: git('rev-parse', 'HEAD'), previous, target,
     env: fs.readFileSync(path.join(root, 'deploy/.turnkey.env'), 'utf8') };
@@ -76,6 +89,51 @@ it('retains automatic rollback within the same data epoch', () => {
   expect(result.stderr).toContain('production was restored');
   expect(result.operations.match(/up -d/g)).toHaveLength(2);
   expect(result.head).toBe(result.previous);
+});
+// The smoke test (wiki ops/release-and-deploy): a release that boots and
+// answers readiness can still serve a broken console or fail every task.
+describe('the smoke test gate', () => {
+  it('runs the smoke test against the candidate, with the token from deploy/.secrets, before completing', () => {
+    const result = update('2\n', '2\n', true, '', [], 'KARMAX_DOMAIN=example.test\n', { smokeToken: 'tvp_smoke\n' });
+    expect(result.status).toBe(0);
+    expect(result.operations).toMatch(/up -d --remove-orphans\n(?:.*\n)*exec -T -e TAVYA_SMOKE_TOKEN app npm run --silent smoke -- --url https:\/\/example\.test --via http:\/\/127\.0\.0\.1:4505/);
+    expect(result.operations).toContain('--timeout-minutes 10 --require-token\nsmoke token=set');
+    expect(result.operations).not.toContain('tvp_smoke');
+    expect(result.stdout).toContain('Update complete');
+  });
+  it('still checks what a visitor loads without a token', () => {
+    const result = update('2\n', '2\n', true, '', [], 'KARMAX_DOMAIN=example.test\n');
+    expect(result.status).toBe(0);
+    expect(result.operations).toContain('--timeout-minutes 10\nsmoke token=\n');
+    expect(result.stdout).toContain('only what a visitor loads');
+  });
+  it('rolls back within a data epoch when the candidate fails it', () => {
+    const result = update('2\n', '2\n', true, 'smoke', [], 'KARMAX_DOMAIN=example.test\n', { smokeToken: 'tvp_smoke' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`deployment ${result.target} failed its smoke test; production was restored to ${result.previous}`);
+    expect(result.operations.match(/up -d/g)).toHaveLength(2);
+    expect(result.head).toBe(result.previous);
+    expect(result.stdout).not.toContain('Update complete');
+  });
+  it('leaves a candidate that crossed a data epoch running, since older code cannot run on its data', () => {
+    const result = update('2\n', '3\n', true, 'smoke', [], 'KARMAX_DOMAIN=example.test\n', { smokeToken: 'tvp_smoke' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('failed its smoke test across data epochs 2 -> 3; code-only rollback refused, app left running');
+    expect(result.operations).not.toContain('stop app');
+    expect(result.head).toBe(result.target);
+  });
+  it('lets the update stand when no computer was free in time, with a warning', () => {
+    const result = update('2\n', '2\n', true, 'smoke-inconclusive', [], 'KARMAX_DOMAIN=example.test\n', { smokeToken: 'tvp_smoke' });
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain('smoke test was inconclusive');
+    expect(result.head).toBe(result.target);
+  });
+  it('is skipped, loudly, with KARMAX_SKIP_SMOKE=1', () => {
+    const result = update('2\n', '2\n', true, 'smoke', [], 'KARMAX_DOMAIN=example.test\n', { smokeToken: 'tvp_smoke', environment: { KARMAX_SKIP_SMOKE: '1' } });
+    expect(result.status).toBe(0);
+    expect(result.operations).not.toContain('smoke');
+    expect(result.stderr).toContain('smoke test skipped (KARMAX_SKIP_SMOKE=1)');
+  });
 });
 it('completes a healthy epoch transition', () => {
   const result = update(undefined, '2\n', true);

@@ -42,11 +42,12 @@ sign_checksums() (
 # Every deployment secret except the vault key (SS-2): the vault's data keys
 # are wrapped under it, so a backup that carried it would decrypt every secret
 # it holds. Keep deploy/.secrets/vault_key off-host instead; restore needs it.
+# The smoke token is a person's credential that no restore needs.
 copy_deployment_secrets() (
   destination=$1
   mkdir "$destination" && chmod 700 "$destination" || exit 1
   for secret in "$SECRETS_DIR"/*; do
-    case "$(basename "$secret")" in vault_key|vault_key.*) continue ;; esac
+    case "$(basename "$secret")" in vault_key|vault_key.*|smoke_token) continue ;; esac
     [ -f "$secret" ] || continue
     cp -p "$secret" "$destination/" || exit 1
   done
@@ -338,6 +339,26 @@ wait_edge_serving() {
   command -v curl >/dev/null 2>&1 || { note 'curl is not installed, so Caddy is not checked.'; return 0; }
   note 'Waiting for the public edge (Caddy) to start…'
   poll_edge edge_serves "Caddy is not serving $(env_value KARMAX_DOMAIN)"
+}
+
+# The smoke test (wiki ops/release-and-deploy, "Smoke test"; src/ops/smoke.ts):
+# readiness proves the database and Temporal answer, not that the console loads
+# or a task runs. The candidate must serve the console and its assets and, with
+# the operator's token in deploy/.secrets/smoke_token (a person's token limited
+# to a smoke project; deploy.yml writes it from the TAVYA_SMOKE_TOKEN secret),
+# run a command task on a fresh computer. It reaches the app directly as Caddy
+# would, so the edge is not what it tests. The token travels in the environment,
+# never on a command line. Returns the script's status: 0 passed, 3 inconclusive
+# (no computer was free in time), anything else failed.
+smoke_check() {
+  domain=$(env_value KARMAX_DOMAIN)
+  url=${domain:+https://$domain}
+  token=''
+  [ ! -s "$SECRETS_DIR/smoke_token" ] || token=$(tr -d ' \r\n' < "$SECRETS_DIR/smoke_token")
+  if [ -n "$token" ]; then note 'Smoke-testing the candidate: the console, sign-in and a command task on a fresh computer…'
+  else note 'Smoke-testing the candidate: only what a visitor loads (no deploy/.secrets/smoke_token)…'; fi
+  TAVYA_SMOKE_TOKEN=$token dc exec -T -e TAVYA_SMOKE_TOKEN app npm run --silent smoke -- \
+    --url "${url:-http://127.0.0.1:4505}" --via http://127.0.0.1:4505 --timeout-minutes 10 ${token:+--require-token}
 }
 
 print_finish() {
@@ -1073,26 +1094,37 @@ cmd_update() {
   # certificate or DNS) does not gate the release.
   edge_before=0
   if edge_answers; then edge_before=1; fi
-  app_ready=0
+  app_ready=0 smoke=0
   if dc up -d --remove-orphans && wait_ready; then
     app_ready=1
     if [ "$edge_before" = 0 ] || wait_edge; then
-      cleanup_migration
-      migration_backup=''
-      report_app_role || true
-      reclaim_space
-      note "Update complete at $target."
-      return 0
+      if [ "${KARMAX_SKIP_SMOKE:-}" = 1 ]; then
+        echo 'karmax: warning: smoke test skipped (KARMAX_SKIP_SMOKE=1); this release has not been seen to serve the console or run a task' >&2
+      else
+        smoke_check || smoke=$?
+        [ "$smoke" != 3 ] || { echo 'karmax: warning: the smoke test was inconclusive (no computer was free in time); the update stands' >&2; smoke=0; }
+      fi
+      if [ "$smoke" = 0 ]; then
+        cleanup_migration
+        migration_backup=''
+        report_app_role || true
+        reclaim_space
+        note "Update complete at $target."
+        return 0
+      fi
     fi
   fi
+  failure="deployment $target failed"
+  [ "$smoke" = 0 ] || failure="deployment $target failed its smoke test"
 
   # Candidate startup can change durable data and advance Temporal histories.
   # Reverting only code across an incompatible boundary would hide or overwrite
   # data. Preserve the candidate/data and stop serving instead; recovery must
   # repair forward or explicitly restore a coordinated pre-update backup.
   if [ "$previous_epoch" != "$target_epoch" ]; then
-    # A healthy app behind a broken edge keeps working its tasks; stopping it
-    # would only add to the outage.
+    # A ready app behind a broken edge, or one that fails a smoke test, may
+    # still work most tasks; stopping it would only add to the outage.
+    [ "$smoke" = 0 ] || die "$failure across data epochs $previous_epoch -> $target_epoch; code-only rollback refused, app left running. Repair forward; the smoke test's report is above"
     [ "$app_ready" = 0 ] || die "deployment $target runs across data epochs $previous_epoch -> $target_epoch, but https://$(env_value KARMAX_DOMAIN) no longer answers through Caddy; code-only rollback refused, app left running. Repair the edge forward (./deploy/karmax logs caddy)"
     dc stop app || die "deployment $target failed across data epochs; could not stop the app; manual recovery required"
     die "deployment $target failed across data epochs $previous_epoch -> $target_epoch; app stopped, data retained, code-only rollback refused. Repair forward or restore the pre-update backup at $destination with its matching code and Temporal history"
@@ -1100,15 +1132,15 @@ cmd_update() {
 
   # The previous image may have been replaced under the Compose service tag, so
   # rebuild it from the previous exact source before bringing the service back.
-  note "Deployment $target failed; rolling back to $previous…"
+  note "Deployment ${failure#deployment }; rolling back to $previous…"
   git -C "$ROOT_DIR" checkout --detach "$previous"
   restore_migration
   if build_images && dc up -d --remove-orphans && wait_ready && { [ "$edge_before" = 0 ] || wait_edge; }; then
     cleanup_migration
     migration_backup=''
-    die "deployment $target failed; production was restored to $previous"
+    die "$failure; production was restored to $previous"
   fi
-  die "deployment $target failed and automatic rollback to $previous also failed"
+  die "$failure and automatic rollback to $previous also failed"
 }
 
 # The superuser password: Temporal and the setup jobs connect with it, and

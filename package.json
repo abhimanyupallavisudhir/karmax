@@ -35,6 +35,7 @@
     "reconcile-storage": "tsx src/scripts/reconcile-storage.ts",
     "object-store-check": "tsx src/scripts/object-store-check.ts",
     "replay-check": "tsx src/scripts/replay-check.ts",
+    "smoke": "tsx src/scripts/smoke.ts",
     "benchmark:latency": "tsx benchmarks/latency.ts",
     "timing:report": "tsx src/scripts/timing-report.ts",
     "deploy-repository-edge": "tsx src/scripts/deploy-repository-edge.ts",

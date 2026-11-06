@@ -127,6 +127,17 @@ Pull requests that change only tests, docs or other workflows skip it.
 shards' PostgreSQL and a Temporal dev server; it needs
 `KARMAX_TEST_POSTGRES_URL`, like every PostgreSQL test.
 
+## Smoke test of a running instance
+
+`npm run smoke -- --url <origin>` checks a live tavya from outside: readiness,
+the console and its assets, and, with `TAVYA_SMOKE_TOKEN`, a command task on a
+fresh computer. Every update runs it against the candidate before the update
+counts, and `.github/workflows/monitor.yml` runs it against tavya.io on a
+schedule (deploy/README.md, "Smoke test"). `tests/smoke.test.ts` covers how it
+judges results against a stand-in. `tests/smoke-journey.test.ts` runs its
+journey against a real gateway and Temporal. Keep `src/ops/smoke.ts` limited to
+`node:` imports, because the monitor runs it without `node_modules`.
+
 ## The live-agent test
 
 Every suite that imports `tests/helpers/live-gate.js` (`live-agent`, `cloud-live`,

@@ -1,0 +1,125 @@
+name: Monitor
+
+# The production smoke test from outside (src/ops/smoke.ts; wiki
+# ops/release-and-deploy, "Smoke test"): what a visitor loads every ten
+# minutes, and hourly and after every deploy also the signed-in journey — a
+# command task on a fresh computer, with the TAVYA_SMOKE_TOKEN secret (a
+# person's token limited to the smoke project). The deploy runs the same test
+# against each candidate before it counts as complete; this run adds the
+# public edge (DNS, TLS, Caddy) and catches what breaks between deploys (an
+# expired login, a provider outage, a full disk).
+#
+# A failure is confirmed once a minute later, then opens one issue labelled
+# production-smoke, which GitHub mails to the repository's watchers; the first
+# run that passes closes it. An inconclusive run (no computer was free in time)
+# does neither. Fourteen days before the token expires the hourly run fails
+# with a reminder to replace it.
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+    # The hourly journey: GitHub names the schedule that fired however late
+    # the run starts, which a minute-of-the-hour test could not tell.
+    - cron: '5 * * * *'
+  workflow_run:
+    workflows: [Deploy]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: smoke test
+    # tavya.io's own repository, or a fork that names its own instance.
+    if: github.repository == 'abhimanyupallavisudhir/karmax' || vars.TAVYA_MONITOR_URL != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      URL: ${{ vars.TAVYA_MONITOR_URL || 'https://tavya.io' }}
+    steps:
+      # The smoke test needs only node: modules and tsx, so no node_modules.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            package.json
+            package-lock.json
+            tsconfig.json
+            src/ops/smoke.ts
+            src/scripts/smoke.ts
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Smoke-test production
+        id: smoke
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          TOKEN: ${{ secrets.TAVYA_SMOKE_TOKEN }}
+        run: |
+          tsx="tsx@$(node -p "require('./package-lock.json').packages['node_modules/tsx'].version")"
+          journey=no
+          if [ "$EVENT" != schedule ] || [ "$SCHEDULE" = '5 * * * *' ]; then journey=yes; fi
+          smoke() {
+            if [ "$journey" = yes ] && [ -n "$TOKEN" ]; then
+              TAVYA_SMOKE_TOKEN=$TOKEN npx --yes "$tsx" src/scripts/smoke.ts --url "$URL" --require-token --expiring-within-days 14
+            else
+              npx --yes "$tsx" src/scripts/smoke.ts --url "$URL"
+            fi
+          }
+          status=0; smoke | tee report.txt || status=${PIPESTATUS[0]}
+          # One bad minute (a deploy restarting the app, a dropped connection)
+          # is not an outage: confirm before alerting.
+          if [ "$status" != 0 ] && [ "$status" != 3 ]; then
+            echo 'Failed; confirming in a minute…'
+            sleep 60
+            status=0; smoke | tee report.txt || status=${PIPESTATUS[0]}
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Open or close the production-smoke issue
+        if: always() && steps.smoke.outputs.status != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUS: ${{ steps.smoke.outputs.status }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          label=production-smoke
+          open=$(gh issue list --repo "$GITHUB_REPOSITORY" --label "$label" --state open --json number --jq '.[0].number // empty')
+          case "$STATUS" in
+            0)
+              if [ -n "$open" ]; then
+                gh issue comment "$open" --repo "$GITHUB_REPOSITORY" --body "Passing again: $RUN"
+                gh issue close "$open" --repo "$GITHUB_REPOSITORY"
+              fi ;;
+            3) echo 'Inconclusive (no computer was free in time): neither an outage nor a recovery.' ;;
+            *)
+              if [ -z "$open" ]; then
+                gh label create "$label" --repo "$GITHUB_REPOSITORY" --color B60205 \
+                  --description 'Production smoke test failing (monitor.yml)' 2>/dev/null || true
+                {
+                  echo "The smoke test of $URL failed twice, a minute apart: $RUN"
+                  echo
+                  echo '```'
+                  cat report.txt
+                  echo '```'
+                  echo
+                  echo 'What each step checks: `src/ops/smoke.ts`. Diagnosing production: wiki `ops/diagnostics`.'
+                  echo 'This issue closes itself when the smoke test passes again.'
+                } > issue.md
+                gh issue create --repo "$GITHUB_REPOSITORY" --label "$label" \
+                  --title "Production smoke test failing: $URL" --body-file issue.md
+              fi ;;
+          esac
+
+      - name: Fail the run when production failed
+        if: steps.smoke.outputs.status != '0' && steps.smoke.outputs.status != '3'
+        run: exit 1

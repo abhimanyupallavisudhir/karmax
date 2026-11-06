@@ -386,7 +386,7 @@ release their execution lease when finished.
 ./deploy/karmax logs                # or: logs temporal
 ./deploy/karmax backup              # deploy/backups/manual-<UTC timestamp>
 ./deploy/karmax prune-backups       # drop automatic snapshots past retention
-./deploy/karmax update              # backup, validate commit ancestry, rebuild
+./deploy/karmax update              # validate ancestry, rebuild, replay-check, backup, start, smoke-test
 ./deploy/karmax down                # preserves all volumes and certificates
 ./deploy/karmax restore BACKUP_DIR  # verified and signature-checked, explicit destructive prompt
 ./deploy/karmax rotate-vault-key    # replace the vault's key encryption key (resumable)
@@ -591,6 +591,50 @@ workflow (`npm run replay-check`, coordinators included). If any fails, the
 update stops, lists them, and leaves the previous release running. Fix the
 release. `KARMAX_SKIP_REPLAY_CHECK=1 ./deploy/karmax update …` skips the check,
 for when the listed workflows are already broken or may break.
+
+### Smoke test
+
+Readiness says only that the database and Temporal answer. After the candidate
+is up, `update` also runs the smoke test against it (`npm run smoke`,
+`src/ops/smoke.ts`), straight to the app with the headers Caddy sends:
+
+1. **ready**: `/api/health/ready`.
+2. **console**: the console page and every script and stylesheet it names. A
+   file the gateway lacks comes back as the page's HTML with a 200, so the
+   check looks at each file's type, not only its status.
+3. **meta**: the console's first API call.
+4. **sign-in** and **task**: these run only with a token in
+   `deploy/.secrets/smoke_token`. The token is a person's personal token,
+   limited to one project kept for the smoke test (Profile → Apps and tokens).
+   The test signs in with it and starts a command task in that project. The
+   task runs on a fresh computer, reaches the instance back from inside it, and
+   must print a number that appears nowhere in its command. It spends no model
+   tokens.
+
+If the smoke test fails, the update fails like a readiness failure. Within a
+data epoch it rolls back automatically. Across an epoch, the candidate is left
+running, since older code cannot run on its data. One outcome is
+**inconclusive** rather than failed: the task waited the whole ten minutes for
+a computer. That is a lack of capacity, not a defect, so the update stands
+with a warning. `KARMAX_SKIP_SMOKE=1 ./deploy/karmax update …` skips the test,
+for when a provider outage blocks a fix.
+
+tavya.io's `deploy.yml` writes the token from the repository secret
+`TAVYA_SMOKE_TOKEN` before each update, and backups leave it out.
+`.github/workflows/monitor.yml` uses the same secret to run the test from
+GitHub against the public site:
+
+- every ten minutes, what a visitor loads;
+- hourly and after every deploy, the signed-in journey as well.
+
+A failure is confirmed once, a minute later. It then opens one
+`production-smoke` issue, and the first passing run closes it. Fourteen days
+before the token expires, the hourly run fails with a reminder to replace it.
+To run the test by hand:
+
+```bash
+TAVYA_SMOKE_TOKEN=tvp_… npm run smoke -- --url https://tavya.io   # exit 0 ok, 1 failed, 3 inconclusive
+```
 
 ### Rollback compatibility
 

@@ -46,6 +46,7 @@ jobs:
           SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
           KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
           TARGET: ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}
+          SMOKE_TOKEN: ${{ secrets.TAVYA_SMOKE_TOKEN }}
         run: |
           case "$DEPLOY_SHA" in
             ''|*[!0-9a-fA-F]*) echo "invalid deployment SHA: $DEPLOY_SHA" >&2; exit 1 ;;
@@ -58,6 +59,13 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
           # The host key is pinned above, so an unknown one is a failure rather
           # than something to trust on first use.
+          # The updater smoke-tests the candidate with this token before the
+          # update counts (deploy/karmax smoke_check). It goes through stdin,
+          # never a command line; without the secret the host keeps its own.
+          if [ -n "$SMOKE_TOKEN" ]; then
+            printf '%s\n' "$SMOKE_TOKEN" | ssh -o StrictHostKeyChecking=yes -o ConnectTimeout=30 "$TARGET" \
+              'umask 077 && cat > /opt/karmax/deploy/.secrets/smoke_token.next && mv /opt/karmax/deploy/.secrets/smoke_token.next /opt/karmax/deploy/.secrets/smoke_token'
+          fi
           ssh -o StrictHostKeyChecking=yes -o ConnectTimeout=30 "$TARGET" "
             set -eu
             cd /opt/karmax
