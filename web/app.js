@@ -25644,7 +25644,7 @@ function installationView() {
 // One row per provider: whether organizations are offered it, how many of its
 // machines run now against the account's limit, and this month's provider cost
 // against what organizations were charged.
-function managedComputeMarkup(view) {
+function managedComputeMarkup(view, extra = '') {
   const money = (micros) => `$${(Number(micros || 0) / 1e6).toFixed(2)}`;
   const accountOf = (id) => (view.providers || []).find((candidate) => candidate.provider === id);
   const row = ([id, info]) => {
@@ -25664,7 +25664,7 @@ function managedComputeMarkup(view) {
   const providers = Object.entries(COMPUTER_PROVIDERS);
   const connected = providers.filter(([id]) => accountOf(id));
   const unconnected = providers.filter(([id]) => !accountOf(id));
-  return `${connected.length ? `<div class="computer-providers">${connected.map(row).join('')}</div>` : ''}
+  return `${connected.length ? `<div class="computer-providers">${connected.map(row).join('')}</div>` : ''}${extra}
     ${unconnected.length ? `<details class="inst-fold managed-off"><summary>Not connected <span class="setting-muted">${unconnected.length}</span></summary>
       <div class="computer-providers">${unconnected.map(row).join('')}</div></details>` : ''}`;
 }
@@ -25725,7 +25725,7 @@ async function wireManagedComputeCard() {
   // The included model shares the compute credit: its row sits beside the computers.
   const included = await api('/api/settings/included-model').then((value) => value.settings, () => undefined);
   if (!card.isConnected) return;
-  card.innerHTML = managedComputeMarkup(view) + includedModelRow(included);
+  card.innerHTML = managedComputeMarkup(view, includedModelRow(included));
   card.querySelector('.included-model-edit')?.addEventListener('click', () => openIncludedModelDialog(included, wireManagedComputeCard));
   card.querySelectorAll('.computer-provider[data-provider]').forEach((row) => {
     const provider = row.dataset.provider;
