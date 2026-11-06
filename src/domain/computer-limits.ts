@@ -42,7 +42,8 @@ export interface AccountPool { cpu?: number; memoryMb?: number; diskGb?: number;
 export interface ParkedHolds { machine: boolean; disk: boolean }
 
 export type AccountInternet = 'full' | 'basic';
-export type LimitSource = 'provider' | 'configured' | 'default';
+/** `plan`: tavya's computers on the Free plan (FREE_COMPUTER). */
+export type LimitSource = 'provider' | 'configured' | 'default' | 'plan';
 export type LimitKey = 'cpu' | 'memoryMb' | 'diskGb';
 
 /** The effective limits, with where each one came from. */
@@ -239,18 +240,22 @@ const gb = (mb: number) => Number.isInteger(mb / 1024) ? String(mb / 1024) : (mb
 
 /** Refuse a size the account cannot give, before any machine is made. Only the
  * sizes `spec` names are judged. */
-export function assertComputerFits(spec: MachineShape & { network?: { unrestricted?: boolean } }, limits: ComputerLimits, provider: string): void {
-  const where = `on this ${providerLabel(provider)} account`;
+/** Said after a size the Free plan caps (FREE_COMPUTER), with where to lift it. */
+export const FREE_COMPUTER_HINT = 'on the Free plan: choose a plan in Plan & billing for a bigger one';
+
+export function assertComputerFits(spec: MachineShape & { network?: { unrestricted?: boolean } }, limits: ComputerLimits & { source?: EffectiveComputerLimits['source'] }, provider: string): void {
+  const account = `on this ${providerLabel(provider)} account`;
+  const where = (key: LimitKey) => limits.source?.[key] === 'plan' ? FREE_COMPUTER_HINT : account;
   // A named provider gives the internet its account has; only an allowlist,
   // which a basic-internet account cannot set, is refused.
   if (spec.network?.unrestricted === false && limits.network === 'basic')
     throw new Error(`This ${providerLabel(provider)} account has basic internet only, so it can't use an allowlist`);
   if (spec.diskGb != null && limits.diskGb != null && spec.diskGb > limits.diskGb)
-    throw new Error(`Disk can be at most ${limits.diskGb} GB ${where}`);
+    throw new Error(`Disk can be at most ${limits.diskGb} GB ${where('diskGb')}`);
   if (spec.memoryMb != null && limits.memoryMb != null && spec.memoryMb > limits.memoryMb)
-    throw new Error(`Memory can be at most ${gb(limits.memoryMb)} GB ${where}`);
+    throw new Error(`Memory can be at most ${gb(limits.memoryMb)} GB ${where('memoryMb')}`);
   if (spec.cpu != null && limits.cpu != null && spec.cpu > limits.cpu)
-    throw new Error(`CPU can be at most ${limits.cpu} ${where}`);
+    throw new Error(`CPU can be at most ${limits.cpu} ${where('cpu')}`);
 }
 
 /** The part of `spec` that fits; what had to give is listed for a warning. */
@@ -285,4 +290,16 @@ export function limitFromMessage(message: string): { dimension: 'cpu' | 'memory'
   if (!dimension) return undefined;
   const unit = match[2] ? (match[2].toLowerCase() === 'mib' ? 'MiB' : 'GB') : undefined;
   return { dimension, value: Number(match[1]), ...(unit ? { unit } : {}) };
+}
+
+/** `limits`, no bigger than `cap` (each size it caps is the plan's). */
+export function capLimits(limits: EffectiveComputerLimits, cap: ComputerLimits): EffectiveComputerLimits {
+  const out: EffectiveComputerLimits = { ...limits, source: { ...limits.source } };
+  for (const key of KEYS) {
+    const most = cap[key];
+    if (most == null || (out[key] != null && out[key]! <= most)) continue;
+    out[key] = most;
+    out.source[key] = 'plan';
+  }
+  return out;
 }

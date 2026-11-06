@@ -138,3 +138,43 @@ describe('free trial', () => {
     expect(message.text).not.toMatch(/renews/);
   });
 });
+
+describe('computers on the Free plan', () => {
+  it('are at most 2 CPU, 4 GB and 40 GB until the organization pays for something; its own accounts are not limited', async () => {
+    const fs = await import('node:fs'), os = await import('node:os'), path = await import('node:path');
+    const { Vault } = await import('../src/autonomy/vault.js');
+    const { CredentialBroker } = await import('../src/autonomy/broker.js');
+    const { MANAGED_COMPUTE, WorldProviderConnectionService } = await import('../src/world/connections.js');
+    const f = await fixture();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-free-computer-'));
+    cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const connections = new WorldProviderConnectionService(f.store, new CredentialBroker(new Vault(dir)),
+      { check: async () => {}, limits: async () => ({}) });
+    await connections.save({ organizationId: MANAGED_COMPUTE, provider: 'hetzner', apiKey: 'operator', config: { limits: { cpu: 16, memoryMb: 32_768, diskGb: 256 } } });
+    await startComputeTrial(f.store, f.organization.id, 'owner', T);
+
+    const managed = (await connections.list(f.organization.id)).find((view) => view.provider === 'hetzner')!;
+    expect(managed.limits).toMatchObject({ cpu: 2, memoryMb: 4096, diskGb: 40, source: { cpu: 'plan', memoryMb: 'plan', diskGb: 'plan' } });
+    expect(await connections.limits(f.organization.id, 'hetzner')).toMatchObject({ cpu: 2, memoryMb: 4096, diskGb: 40 });
+    await expect(connections.assertFits(f.organization.id, 'hetzner', { cpu: 8 }))
+      .rejects.toThrow('CPU can be at most 2 on the Free plan: choose a plan in Plan & billing for a bigger one');
+    await expect(connections.assertFits(f.organization.id, 'any', { diskGb: 100 }))
+      .rejects.toThrow('Disk can be at most 40 GB on the Free plan: choose a plan in Plan & billing for a bigger one');
+    await connections.assertFits(f.organization.id, 'any', { cpu: 2, memoryMb: 4096, diskGb: 40 });
+
+    // A paid plan lifts it.
+    await f.store.setOrganizationPlan(f.organization.id, 'individual');
+    expect(await connections.limits(f.organization.id, 'hetzner')).toMatchObject({ cpu: 16, memoryMb: 32_768, diskGb: 256 });
+    // So does a top-up bought on a Free plan.
+    await f.store.setOrganizationPlan(f.organization.id, 'free');
+    await f.store.createComputeTopUp({ id: 'topup_1', organizationId: f.organization.id, creditMicros: 10_000_000, amountCents: 1_000,
+      subscriptionId: 'sub_1', requestedAt: T });
+    await f.store.updateComputeTopUp('topup_1', { state: 'paid', settledAt: T });
+    expect((await connections.limits(f.organization.id, 'hetzner')).cpu).toBe(16);
+
+    // Its own account is its own.
+    const other = await f.store.createOrganization({ name: 'Own', ownerUserId: 'other' });
+    await connections.save({ organizationId: other.id, provider: 'hetzner', apiKey: 'own', config: { limits: { cpu: 16 } } });
+    expect((await connections.limits(other.id, 'hetzner')).cpu).toBe(16);
+  });
+});

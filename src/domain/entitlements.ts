@@ -60,6 +60,12 @@ export const COMPUTE_TERMS = Object.freeze({
  * created the organization. Unused trial credit expires. */
 export const COMPUTE_TRIAL = Object.freeze({ creditMicros: 5_000_000, days: 14 });
 
+/** The biggest computer of tavya's an organization that has paid for nothing
+ * (no plan, pack, gift or top-up: the free trial at most) may have, so the
+ * trial is not spent in minutes on one big machine, nor worth abusing. Its
+ * own provider accounts are not limited. */
+export const FREE_COMPUTER = Object.freeze({ cpu: 2, memoryMb: 4096, diskGb: 40 });
+
 /** Managed compute is charged at the provider's own list price times this:
  * it covers the payment provider's fee, idle capacity and abuse, and is the
  * one number behind every compute price tavya shows. */
