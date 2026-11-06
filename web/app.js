@@ -15990,6 +15990,8 @@ function hasOpenPullRequest(v) {
 }
 
 function taskActionLabel(v, action) {
+  // Keep Cancel in older task views that still declare the post-landing label as Finish.
+  if (action.name === 'finish') return 'Cancel';
   if (action.name === 'openPr' && v?.stage === 'escalated') return action.label || 'Send to review';
   if (action.name === 'openPr')
     return hasOpenPullRequest(v) ? 'Back to review' : 'Send to review';
@@ -16008,6 +16010,7 @@ function taskActionTip(v, action) {
   if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.reason !== 'merge') return 'Let tavya merge this on GitHub as you.';
   if (action.name === 'openPr') return 'Send the agent’s work so far to Review now.';
   if (action.name === 'cancel') return 'Stop this task. Nothing more is added to the project.';
+  if (action.name === 'finish') return 'Stop this task. Approved pull requests may still land.';
   if (action.name === 'retry' && v?.waitingFor?.kind === 'account') return 'Check now whether an AI login can be used again.';
   // Why it failed, on the button itself: the error is at the end of the conversation.
   if (action.name === 'retry' && v?.error) return plainTaskError(v.error).summary.replace(/(?<=[.!?])\s+(?:Press )?Retry\b[^.]*\.$/, '') || 'Try the last step again.';
@@ -16076,8 +16079,8 @@ const ACCEPTED_ACTION_LABELS = { confirm: 'Confirming…', openPr: 'Opening PR�
  */
 function actionToast(signal, label) {
   if (signal === 'confirm' && String(label).toLowerCase() === 'done') return 'Confirmation sent';
-  const standard = { confirm: 'confirm', openPr: 'manually open & confirm pr', cancel: 'cancel', finish: 'finish', retry: 'retry', resume: 'resume', followUp: 'send' };
-  const done = { confirm: 'Confirmed', openPr: 'Opening PR and requesting confirmation', cancel: 'Cancelled', finish: 'Finishing', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
+  const standard = { confirm: 'confirm', openPr: 'manually open & confirm pr', cancel: 'cancel', finish: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
+  const done = { confirm: 'Confirmed', openPr: 'Opening PR and requesting confirmation', cancel: 'Cancelled', finish: 'Cancelling', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
   const text = String(label || signal).trim();
   if (signal === 'openPr' && text.toLowerCase() === 'return to review & confirm') return 'Returning to Review';
   if (signal === 'confirm' && text.toLowerCase() === 'confirm pr') return 'Confirmed';
@@ -16090,7 +16093,7 @@ const returnToReviewConfirmation = () => `Return this pull request to Review and
 
 function confirmTaskAction(action, v = S.view) {
   if (action === 'cancel') return confirm('Cancel this task?');
-  if (action === 'finish') return confirm('Finish this task? Pull requests that have not landed are closed.');
+  if (action === 'finish') return confirm('Cancel this task? Unapproved pull requests close. Approved pull requests may still land.');
   return action !== 'openPr' || confirm(v?.stage === 'escalated'
     ? ERROR_OPEN_PR_CONFIRMATION
     : hasOpenPullRequest(v) ? returnToReviewConfirmation()
