@@ -155,10 +155,46 @@ OpenCode. Profiles and task parameters do not have a second “Credential
 provider” setting.
 
 
+## November 6, 2026 Codex upgrade audit
+
+Codex is now **0.167.0** (from 0.166.0; the only stable release in between).
+Read the release notes and the linked PRs, diffed the generated app-server
+protocol and `codex-rs/features/src/lib.rs` at both tags, and compared the model
+slugs and effort levels compiled into both binaries.
+
+- **No new model or effort level.** Both binaries carry the same slugs
+  (`gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6-astra`, …) and efforts; the server's
+  catalog for 0.167.0 lists the same models tavya already offers. `ultra` (an
+  automatic-delegation mode) is still outside tavya's effort schema, as before.
+- **Protocol changes are additive.** `CommandExecutionApprovalKind` gains
+  `humanCommand` (sent only to a client that declares `requiredHumanApproval`;
+  tavya does not, and auto-approves every approval request anyway);
+  `thread/section/changed` is a new notification (ignored); audio input may be a
+  `fileId`; OTel requirements gain `log_sse_deltas`. `CodexErrorInfo` is
+  unchanged, so the quota/login classification stands.
+- **Resume across providers is a TUI change only** (#58202: the picker lists every
+  provider's chats and opens a mismatched one read-only). The app-server still
+  refuses a resume under another provider; tavya keeps forking imports
+  (`tests/codex-foreign-provider.test.ts` passes on 0.167.0).
+- **Rollouts are unchanged.** #58166 ("rollout recording … explicit") concerns the
+  separate rollout-*trace* recorder, not session rollouts; user-message events
+  gain optional `audio_references`/`audio_order` fields that older readers
+  ignore. Rollout compression stays off by default.
+- **Feature defaults:** `deferred_tool_world_state` is now on (deferred MCP tool
+  namespaces are described in the developer `<tools>` context instead of the
+  `tool_search` description) — a prompt-shape change only. Everything else new is
+  off or TUI-only.
+- Verified: typecheck; the agent suites and the real-binary suites (Codex
+  lineage, imported ids, foreign provider, native MCP, models, harness
+  compatibility); panagent's native Codex test on 0.167.0; real `codex exec` turns
+  on GPT-6.1 Sol and Terra with an API key, plus a resumed one; and the
+  `live-providers` app-server tests (a turn and a mid-turn `turn/steer`) on the
+  real 0.167.0 app-server, run with an API-key `auth.json` in `CODEX_HOME`.
+
 ## November 5, 2026 harness upgrade audit
 
 Claude Agent SDK is now **0.3.318** (Claude Code **2.1.318**, from 0.3.281 / 2.1.281)
-and Codex **0.166.0** (from 0.162.1). Reviewed every release's notes in between and
+and Codex **0.166.0** (from 0.162.1; now 0.167.0, above). Reviewed every release's notes in between and
 the SDK changelog; diffed the generated Codex app-server protocol.
 
 - **New models are selectable.** Claude Sonnet 5.5 (`claude-sonnet-5-5`, 2.1.284)
