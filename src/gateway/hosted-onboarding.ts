@@ -9,7 +9,7 @@ export interface HostedOnboardingFacts {
   agentLogin: boolean;
   /** A compute provider account of the organization's own (E2B, Daytona, …). */
   ownCompute: boolean;
-  /** tavya's computers: a paid plan, or compute credit from packs or a gift. */
+  /** tavya's computers: a paid plan, or compute credit from packs, a gift or the free trial. */
   managedCompute: boolean;
   vault: boolean;
   card: boolean;

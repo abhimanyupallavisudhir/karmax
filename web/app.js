@@ -4523,7 +4523,9 @@ function plainTaskError(text) {
   // would take for a model's billing): what happened in one line; what to do is
   // the buttons beside it.
   const spent = /Out of compute: this month's (\$[\d.,]+) of compute is used up( or held)?/i.exec(body);
+  const trial = /Out of compute: your (\$[\d.,]+) free trial (is used up or held|ended|is used up)/i.exec(body);
   const summary = /Out of compute: .*come with a paid plan/i.test(body) ? `${siteName()}’s computers come with a paid plan.`
+    : trial ? `Your ${trial[1]} free trial ${trial[2] === 'ended' ? 'has ended' : trial[2] === 'is used up or held' ? 'is used up or held by work running now' : 'is used up'}.`
     : spent ? `This month’s ${spent[1]} of compute is used up${spent[2] ? ' or held by work running now' : ''}.`
     : storageFull(body) ? 'Your organization’s storage is full. Free some space, or add a 100 GB pack in Plan & billing.'
     : /context window|prompt is too long|maximum context length/i.test(body)
@@ -4562,7 +4564,7 @@ function setupFixes(text, projectId) {
   const plan = `${settings}#settings-plan`, computers = `${settings}#settings-computers`;
   const own = { label: 'Use your own account', href: computers };
   // Never bought a plan, or spent this month's compute: more on the plan, or one's own account.
-  if (/\bOut of compute\b/.test(raw)) return [{ label: /come with a paid plan/.test(raw) ? 'Choose a plan' : 'Add compute', href: plan }, own];
+  if (/\bOut of compute\b/.test(raw)) return [{ label: /come with a paid plan|free trial/.test(raw) ? 'Choose a plan' : 'Add compute', href: plan }, own];
   if (/No computer (?:is connected|this organization can use fits)/.test(raw)) return [{ label: 'Connect a computer', href: computers }];
   // Every one of tavya's computers busy: one's own account starts it now.
   if (/Every computer this task can use is full|of \S+'s [\w. ]+ computers are in use|\S+'s [\w. ]+ computers are using|uses its share of/.test(raw)
@@ -24411,7 +24413,7 @@ function inboxRowLabel(item) {
     const n = Number(item.subject.computers || 0), computers = `${n} parked computer${n === 1 ? '' : 's'}`;
     if (item.subject.stage === 'hibernated') return `Out of compute — ${computers} hibernated`;
     if (item.subject.hibernateAt) return `Out of compute — ${computers} hibernate ${new Date(item.subject.hibernateAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
-    return `Out of compute — renews ${new Date(item.subject.renewsAt).toLocaleDateString()}`;
+    return item.subject.trial ? 'Free trial over — choose a plan' : `Out of compute — renews ${new Date(item.subject.renewsAt).toLocaleDateString()}`;
   }
   if (item.subject?.kind === 'storage') return item.subject.stage === 'deleted'
     ? 'Stored data deleted to fit the limit'
@@ -25838,18 +25840,21 @@ function planBillingMarkup(e, state) {
   if (e.compute) {
     // Top-up credit lasts until used; holds are what computers running now have reserved.
     const topUp = Number(e.compute.topUpMicros || 0), held = Number(e.compute.heldMicros || 0);
-    const credit = Number(e.computeCreditMicros || 0) + topUp;
+    // A new organization's free trial: drawn first, usable until it ends.
+    const trial = e.compute.trial, trialLive = Number(trial?.leftMicros || 0) > 0;
+    const credit = Number(e.computeCreditMicros || 0) + topUp + Number(trial?.monthMicros || 0);
     const pack = state?.computePack || { creditMicros: e.computePackCreditMicros, monthlyPriceCents: 1000 };
     const providers = (e.compute.providers || []).map((id) => COMPUTER_PROVIDERS[id]?.name || id).join(', ');
     const computeUnit = `${planPackName('compute', pack)} pack`;
-    const parts = [`${planDollars(e.includedComputeCreditMicros)} with ${e.planName}`,
+    const parts = [trial ? `${planDollars(trial.creditMicros)} free trial ${trialLive ? 'until' : 'ended'} ${day(trial.endsAt)}` : '',
+      e.includedComputeCreditMicros || !trial ? `${planDollars(e.includedComputeCreditMicros)} with ${e.planName}` : '',
       e.computePacks ? `${e.computePacks} × ${computeUnit}${e.computePacks === 1 ? '' : 's'}` : '',
       e.giftedComputePacks ? `${e.giftedComputePacks} × ${computeUnit}${e.giftedComputePacks === 1 ? '' : 's'} gifted` : '',
       topUp ? `${planDollars(topUp)} topped up, kept until used` : ''].filter(Boolean).join(' + ');
     const tip = `Cloud computers ${siteName()} runs for you (${providers}), at twice the provider’s price: a 2 CPU · 2 GB E2B computer is about $0.27 an hour. Resets ${day(e.compute.to)}. Computers on your own provider accounts aren’t counted. ${credit ? `${parts}.` : ''}${held ? ` ${planDollars(held)} is held for computers running now.` : ''}`;
     const canCompute = canPacks && state?.computePack?.available;
     computeRow = `<div class="setting-row plan-limit" data-limit="compute"><span class="setting-label">Compute ${policyTip(tip.trim())}</span>
-      <span class="setting-value">${credit ? `${planMeter(Number(e.compute.usedMicros || 0) + held, credit)}<span><b>${esc(planDollars(e.compute.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(credit))} this month</span></span>`
+      <span class="setting-value">${credit ? `${planMeter(Number(e.compute.usedMicros || 0) + held, credit)}<span><b>${esc(planDollars(e.compute.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(credit))} ${trialLive && !e.computeCreditMicros && !topUp ? `· free until ${esc(day(trial.endsAt))}` : 'this month'}</span></span>`
         : '<span class="setting-muted">With a paid plan</span>'}</span>
       ${canCompute ? `<span class="setting-actions">${planStepper('compute', ending ? 0 : Number(state.computePacks || 0), `Each ${computeUnit} adds ${planPackName('compute', pack)} of compute a month for ${planMoney(pack.monthlyPriceCents)}/month`, giftCheckout, computeUnit)}</span>` : ''}</div>`;
     // Auto top-up: once offered (its billing terms approved), or while on.
@@ -27956,6 +27961,7 @@ function renderPricing() {
       `${per(formatBytes(plan.storageBytes), plan.additionalActiveUserStorageBytes ? formatBytes(plan.additionalActiveUserStorageBytes) : '')} storage`,
       ...(compute ? [plan.computeCreditMicros
         ? `${per(credit(plan.computeCreditMicros), plan.additionalActiveUserComputeCreditMicros ? credit(plan.additionalActiveUserComputeCreditMicros) : '')} of compute a month`
+        : plan.id === 'free' && S.launch?.trial ? `${credit(S.launch.trial.creditMicros)} of compute free for ${S.launch.trial.days} days`
         : 'Your own cloud computer account'] : [])];
     const priceLine = plan.id === 'free' ? money(0, plan.currency)
       : `${money(plan.monthlyBasePriceCents, plan.currency)}<small> / month${isTeam ? ` + ${money(plan.monthlyAdditionalActiveUserPriceCents, plan.currency)} per extra person` : ''}</small>`;

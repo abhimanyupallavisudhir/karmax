@@ -5,7 +5,7 @@
  * advice. Keep the version beside the text: acceptance evidence is useful only when it can be
  * tied to the exact disclosure a person saw.
  */
-import { COMPUTE_PACK, COMPUTE_PRICE_MULTIPLIER, COMPUTE_TERMS, HOSTED_PLANS, STORAGE_PACK } from '../domain/entitlements.js';
+import { COMPUTE_PACK, COMPUTE_PRICE_MULTIPLIER, COMPUTE_TERMS, COMPUTE_TRIAL, HOSTED_PLANS, STORAGE_PACK } from '../domain/entitlements.js';
 import { DEFAULT_SITE_NAME } from '../domain/brand.js';
 
 export const POLICY_VERSION = '2026-11-02.1';
@@ -349,6 +349,7 @@ export function publicLaunchInfo(env: NodeJS.ProcessEnv = process.env, stored?: 
     pricingCatalog: Object.values(HOSTED_PLANS).map((plan) => ({ ...plan, currency: 'usd' as const,
       billingInterval: 'month' as const })),
     packs: { storage: STORAGE_PACK, compute: COMPUTE_PACK, computePriceMultiplier: COMPUTE_PRICE_MULTIPLIER, computeTopUpCents: COMPUTE_TERMS.topUpCents },
+    trial: COMPUTE_TRIAL,
     checkoutDisclosures: CHECKOUT_DISCLOSURES,
     // These are deliberately public operator fields, not private KYC details.
     // Publishing them must not depend on opening checkout or approving drafts.

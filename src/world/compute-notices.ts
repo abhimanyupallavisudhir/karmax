@@ -108,7 +108,9 @@ export async function notifyComputeCredit(deps: {
     (await store.kvSet(key, JSON.stringify(state)));
     if (!stage) continue;
     const notice = { month: day(credit.from).slice(0, 7), stage, usedMicros: credit.usedMicros,
-      creditMicros: (credit.creditMicros ?? 0) + credit.topUpMicros, renewsAt: credit.to,
+      creditMicros: (credit.creditMicros ?? 0) + credit.topUpMicros + (credit.trial?.monthMicros ?? 0), renewsAt: credit.to,
+      // Only a free trial's credit: it does not renew.
+      ...(credit.trial && !credit.creditMicros && !credit.topUpMicros ? { trial: true } : {}),
       ...(state.hibernateAt !== undefined ? { hibernateAt: state.hibernateAt, computers: disks.length } : {}),
       ...(hibernated ? { computers: hibernated } : {}) };
     const fresh = await store.syncComputeInbox(organization.id, owners, notice, now);
@@ -129,15 +131,17 @@ const LOST = 'Their repositories\' files and uncommitted changes are saved and c
   + 'files Git ignores (installed dependencies, build output, caches) are deleted.';
 
 export function computeNoticeEmail(organization: string, site: string, notice: { stage: ComputeNoticeStage; usedMicros: number;
-  creditMicros: number; renewsAt: number; hibernateAt?: number; computers?: number }, publicUrl?: string): { subject: string; text: string } {
+  creditMicros: number; renewsAt: number; hibernateAt?: number; computers?: number; trial?: boolean }, publicUrl?: string): { subject: string; text: string } {
   const manage = publicUrl ? `\n\nAdd compute: ${publicUrl.replace(/\/$/, '')}/settings` : '';
   const computers = (n = 0) => `${n} parked computer${n === 1 ? '' : 's'}`;
-  const add = 'add a $10 pack, turn on auto top-up or change the plan in Plan & billing, or connect your own provider account in Settings → Computers';
+  const add = notice.trial ? 'choose a plan in Plan & billing, or connect your own provider account in Settings → Computers'
+    : 'add a $10 pack, turn on auto top-up or change the plan in Plan & billing, or connect your own provider account in Settings → Computers';
+  const renews = notice.trial ? '' : ` The compute renews on ${day(notice.renewsAt)}.`;
   if (notice.stage === 'hibernated') return {
     subject: `${organization}'s parked ${site} computers were hibernated`,
     text: `${organization} is out of compute on ${site}, so its ${computers(notice.computers)} ${notice.computers === 1 ? 'was' : 'were'} hibernated: `
       + `saved, and ${notice.computers === 1 ? 'its machine and disk' : 'their machines and disks'} deleted. ${LOST} `
-      + `To carry on, ${add}. The compute renews on ${day(notice.renewsAt)}.${manage}`,
+      + `To carry on, ${add}.${renews}${manage}`,
   };
   const disks = notice.hibernateAt !== undefined
     ? `\n\nIts ${computers(notice.computers)} keep${notice.computers === 1 ? 's its disk' : ' their disks'} until ${when(notice.hibernateAt)}, `
@@ -146,9 +150,14 @@ export function computeNoticeEmail(organization: string, site: string, notice: {
     subject: `${organization}'s parked ${site} computers are hibernated on ${when(notice.hibernateAt!)}`,
     text: `${organization} is still out of compute on ${site}.${disks}\n\nTo keep them, ${add}.${manage}`,
   };
+  if (notice.trial) return {
+    subject: `${organization}'s free ${site} trial is over`,
+    text: `${organization}'s free trial of ${site}'s computers is used up or has ended. `
+      + `Tasks on ${site}'s computers wait until there is more: ${add}.${disks}${manage}`,
+  };
   return {
     subject: `${organization} has used this month's ${site} compute`,
     text: `${organization} has used ${dollars(notice.usedMicros)} of its ${dollars(notice.creditMicros)} of compute this month on ${site}. `
-      + `Tasks on ${site}'s computers wait until there is more: ${add}. The compute renews on ${day(notice.renewsAt)}.${disks}${manage}`,
+      + `Tasks on ${site}'s computers wait until there is more: ${add}.${renews}${disks}${manage}`,
   };
 }

@@ -35,10 +35,10 @@ const closers: Array<() => Promise<void>> = [];
 afterAll(async () => { for (const close of closers) await close().catch(() => {}); await closeConsoleBrowser(); });
 
 /** An identity + a minimally wired gateway on a free loopback port. */
-async function boot(opts: Parameters<typeof IdentityService.open>[1] = {}) {
+async function boot(opts: Parameters<typeof IdentityService.open>[1] = {}, hosted = false) {
   const port = await findFreePortFrom(47990);
   const identity = await IdentityService.open(':memory:', { baseURL: `http://127.0.0.1:${port}`, ...opts });
-  const store = (await Store.create(':memory:'));
+  const store = (await Store.create(':memory:', { hosted }));
   const tokens = new TokenAuthority();
   const authorization = (await AuthorizationService.create(store));
   const gateway = (await Gateway.create({
@@ -55,6 +55,7 @@ async function boot(opts: Parameters<typeof IdentityService.open>[1] = {}) {
     identity,
     authorization,
     worlds: new WorldRegistry(),
+    ...(hosted ? { hosted } : {}),
   }));
   const running = await gateway.listen(port);
   closers.push(() => running.close());
@@ -274,6 +275,22 @@ describe('GitHub sign-in when configured', () => {
       github: { id: '42', login: 'octocat' },
       source: { kind: 'user', userId: session.user.id, profile: 'github' },
     });
+  });
+});
+
+describe('a new person on a hosted installation', () => {
+  it('gets a personal workspace with a free trial of tavya\'s computers, once', async () => {
+    const { identity, store, base } = await boot({ github: GITHUB }, true);
+    const created = await identity.signUp({ name: 'Ada', email: 'ada@example.com', password: 'long-enough-password' });
+    const cookie = created.headers.get('set-cookie')?.split(';', 1)[0];
+    const session = await (await fetch(`${base}/api/session`, { headers: { cookie: cookie! } })).json() as any;
+    const [personal] = (await store.listOrganizations(session.user.id));
+    expect(await store.computeTrial(personal!.id)).toMatchObject({ userId: session.user.id, creditMicros: 5_000_000 });
+    // A second organization of the same person starts without one.
+    const second = await fetch(`${base}/api/organizations`, { method: 'POST', headers: { cookie: cookie!, 'content-type': 'application/json', origin: base },
+      body: JSON.stringify({ name: 'Side Gig' }) });
+    expect(second.status).toBe(200);
+    expect(await store.computeTrial(((await second.json()) as any).id)).toBeUndefined();
   });
 });
 

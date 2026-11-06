@@ -65,7 +65,7 @@ import { repositoryBranchDefaults } from '../platform/branch-defaults.js';
 import { projectRepositorySource, sameRepository } from '../world/repository-identity.js';
 import { QRY_AGENT_QUEUE, accountCoordinatorId, agentQueueId } from '../coordinators/names.js';
 import { COMPUTE_PRICE_MULTIPLIER, computeChargeMicros, hostedMonthlyPriceCents } from '../domain/entitlements.js';
-import { computeCredit, computeMonth } from '../world/managed-compute.js';
+import { computeCredit, computeMonth, startComputeTrial } from '../world/managed-compute.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
 import { SIG as WORKFLOW_SIG } from '../workflows/names.js';
 import { findFreePortFrom } from '../util/ports.js';
@@ -2649,7 +2649,8 @@ export class Gateway {
           ownCompute: (await Promise.all(clouds.map(async (connection) => !!connection?.enabled
             && !!await this.deps.broker?.hasHandle(connection.credentialHandle)))).some(Boolean),
           managedCompute: (await this.deps.subscriptions?.hasPaidSubscription(organizationId) ?? false)
-            || ((await store.organizationEntitlements(organizationId)).computeCreditMicros ?? 0) > 0,
+            || await computeCredit(store, organizationId).then((credit) =>
+              (credit.creditMicros ?? 0) + credit.topUpMicros + (credit.trial?.monthMicros ?? 0) > 0),
           vault: (await new VaultItems(store, this.deps.broker, undefined, organizationId).list())
             .some((item) => item.type === 'login' && item.fields.includes('password')),
           card: (await store.listOrganizationCards(organizationId)).length > 0,
@@ -2921,7 +2922,10 @@ export class Gateway {
         (await this.deps.authorization?.bootstrapOrganizationOwner(actorPrincipal(callerIdentity.actor), subject.userId, organization.id));
         (await this.deps.resources?.storageLocationService()?.ensureManaged(organization.id));
         (await this.linkOwnGithubInstallation(subject.userId, organization));
-        if (this.deps.hosted) (await this.enableHostedOnboarding(subject.userId, organization.id));
+        if (this.deps.hosted) {
+          (await this.enableHostedOnboarding(subject.userId, organization.id));
+          (await startComputeTrial(store, organization.id, subject.userId));
+        }
         return this.json(res, 200, organization);
       }
       if (p === '/api/invitations/accept' && method === 'POST') {
@@ -10593,7 +10597,10 @@ export class Gateway {
       (await this.deps.resources?.storageLocationService()?.ensureManaged(organization.id));
       (await inheritPersonalGithubProfile(this.deps.store, this.deps.broker, userId));
       (await this.linkOwnGithubInstallation(userId, organization));
-      if (this.deps.hosted) (await this.enableHostedOnboarding(userId, organization.id));
+      if (this.deps.hosted) {
+        (await this.enableHostedOnboarding(userId, organization.id));
+        (await startComputeTrial(this.deps.store, organization.id, userId));
+      }
       return true;
     } catch (e) {
       console.error('[signup] personal workspace provisioning failed:', e instanceof Error ? e.message : e);

@@ -899,6 +899,12 @@ export class Store {
         amountCents INTEGER NOT NULL, subscriptionId TEXT, transactionId TEXT, error TEXT,
         requestedAt INTEGER NOT NULL, settledAt INTEGER
       );
+      -- A person's one free trial (wiki features/managed-compute § Trial): kept
+      -- when the organization is deleted, so deleting one does not earn another.
+      CREATE TABLE IF NOT EXISTS compute_trials (
+        userId TEXT PRIMARY KEY, organizationId TEXT NOT NULL, creditMicros INTEGER NOT NULL,
+        startsAt INTEGER NOT NULL, endsAt INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS compute_credit_months (
         organizationId TEXT NOT NULL, month TEXT NOT NULL, allowanceMicros INTEGER NOT NULL, drawnMicros INTEGER,
         PRIMARY KEY (organizationId, month)
@@ -2364,6 +2370,23 @@ export class Store {
     const row = (await this.db.prepare(`SELECT packs, grantedBy, grantedAt FROM ${table} WHERE organizationId=?`)
       .get(organizationId)) as { packs: number | string; grantedBy: string; grantedAt: number | string } | undefined;
     return row ? { packs: Number(row.packs), grantedBy: row.grantedBy, grantedAt: Number(row.grantedAt) } : null;
+  }
+
+  /** Start `userId`'s free trial in `organizationId`, unless that person has
+   * had one (in any organization, even a deleted one). True when started. */
+  async startComputeTrial(input: { userId: string; organizationId: string; creditMicros: number; startsAt: number; endsAt: number }): Promise<boolean> {
+    const result = (await this.db.prepare(`INSERT INTO compute_trials (userId, organizationId, creditMicros, startsAt, endsAt)
+      VALUES (?, ?, ?, ?, ?) ON CONFLICT(userId) DO NOTHING`)
+      .run(input.userId, input.organizationId, input.creditMicros, input.startsAt, input.endsAt));
+    const started = Number(result.changes ?? 0) > 0;
+    if (started) this.notifyOrganizationEntitlementsChanged(input.organizationId);
+    return started;
+  }
+
+  /** The free trial an organization's owner started in it, if any. */
+  async computeTrial(organizationId: string): Promise<{ userId: string; creditMicros: number; startsAt: number; endsAt: number } | undefined> {
+    const row = (await this.db.prepare('SELECT * FROM compute_trials WHERE organizationId=?').get(organizationId)) as Record<string, unknown> | undefined;
+    return row ? { userId: String(row.userId), creditMicros: Number(row.creditMicros), startsAt: Number(row.startsAt), endsAt: Number(row.endsAt) } : undefined;
   }
 
   /** Gift `packs` storage packs (0 removes the gift). Billing's
