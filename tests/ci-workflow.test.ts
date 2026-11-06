@@ -73,7 +73,7 @@ describe('CI workflow', () => {
     fs.writeFileSync(path.join(listDir, 'ubuntu.sources'), 'Types: deb\nURIs: http://archive.ubuntu.com/ubuntu\n');
     fs.writeFileSync(path.join(root, 'sources.list'), 'deb http://archive.ubuntu.com/ubuntu resolute main\ndeb https://packages.microsoft.com/repos/x resolute main\n');
     // Run as written, against a scratch /etc/apt, with sudo as a no-op wrapper.
-    const script = steps[drop].run!.replaceAll('/etc/apt', root).replaceAll('sudo ', '');
+    const script = (steps[drop]?.run ?? '').replaceAll('/etc/apt', root).replaceAll('sudo ', '');
     expect(spawnSync('bash', ['-e', '-c', script]).status).toBe(0);
     expect(fs.readdirSync(listDir)).toEqual(['ubuntu.sources']);
     expect(fs.readFileSync(path.join(root, 'sources.list'), 'utf8')).toBe('deb http://archive.ubuntu.com/ubuntu resolute main\n');
