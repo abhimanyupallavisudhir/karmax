@@ -212,11 +212,11 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       const pick = async (ref: string) => {
         await page.locator('#tf-page .agent-field .af-ref').first().fill(ref);
         await page.keyboard.press('Enter');
-        await page.evaluate((value) => { for (const field of document.querySelectorAll<HTMLInputElement>('#tf-page .agent-field .af-ref')) {
-          if (field.value === value) continue;
-          field.value = value;
+        await page.evaluate(`for (const field of document.querySelectorAll('#tf-page .agent-field .af-ref')) {
+          if (field.value === ${JSON.stringify(ref)}) continue;
+          field.value = ${JSON.stringify(ref)};
           field.dispatchEvent(new Event('change', { bubbles: true }));
-        } }, ref);
+        }`);
       };
       await pick('opencode:openrouter/google/gemini-4-argon');
       const notice = page.locator('#tf-ready');
