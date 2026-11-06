@@ -53,6 +53,8 @@ export async function consolePage(options: { api?: ApiHandler; viewport?: { widt
     if (!url.pathname.startsWith('/api/')) {
       const file = path.join(WEB, url.pathname);
       if (url.pathname.startsWith('/fonts/') && fs.existsSync(file)) return route.fulfill({ body: fs.readFileSync(file) });
+      // The landing's film and stills.
+      if (url.pathname.startsWith('/media/') && fs.existsSync(file)) return route.fulfill({ path: file });
       return route.fulfill({ contentType: 'text/html',
         body: '<!doctype html><html><body><div id="app"><main id="main"></main></div><div id="overlay-root"></div><div id="modal-root"></div><div id="toasts"></div><div id="action-progress"></div></body></html>' });
     }

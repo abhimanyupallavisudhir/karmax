@@ -300,10 +300,17 @@ it('switches to a branch or a task with the picker, opens an agent’s cited fil
   expect(errors).toEqual([]);
 }, 120_000);
 
-// Click the address bar's empty right end (past the breadcrumbs), wherever the bar ends.
+// Click the address bar's empty right end (past the breadcrumbs), wherever the bar ends —
+// once it has stopped moving: the source chip beside it arrives on its own and narrows it.
 async function clickAddressEnd(page: Page) {
   const address = page.locator('#files-address');
-  const box = (await address.boundingBox())!;
+  let box = (await address.boundingBox())!;
+  for (let settled = 0; settled < 3;) {
+    await page.waitForTimeout(50);
+    const next = (await address.boundingBox())!;
+    settled = next.width === box.width && next.x === box.x ? settled + 1 : 0;
+    box = next;
+  }
   await address.click({ position: { x: box.width - 12, y: box.height / 2 } });
 }
 

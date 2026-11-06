@@ -4735,6 +4735,15 @@ function watchConsoleRevision() {
 }
 
 // ── boot ─────────────────────────────────────────────────────────────────────
+/** Inter, loaded — or `capMs` passed, whichever is first. */
+function interReady(capMs = 1000) {
+  if (!document.fonts?.load) return Promise.resolve();
+  return Promise.race([
+    Promise.all(['400 1em Inter', '700 1em Inter'].map((font) => document.fonts.load(font))).catch(() => {}),
+    new Promise((resolve) => setTimeout(resolve, capMs)),
+  ]);
+}
+
 async function boot() {
   // Public pages need no session, and must not read one: that provisions a
   // personal workspace and consumes the one-time git-onboarding flag. The
@@ -4751,6 +4760,9 @@ async function boot() {
   [S.meta, S.launch] = await Promise.all([
     S.meta || api('/api/meta'),
     S.launch || feedbackFetch('/api/launch').then((response) => response.json()),
+    // The first paint is in Inter, never the fallback face swapped a moment later
+    // (index.html preloads it, so this rarely waits; it never waits long).
+    interReady(),
   ]);
   applyDocumentBrand();
   if (publicPage) return publicPage();
@@ -5830,7 +5842,7 @@ function applyDocumentBrand() {
   applySkin(S.meta?.skin);
   document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute('content', siteName());
   document.querySelector('meta[name="description"]')?.setAttribute('content',
-    `${siteName()} is the to-do list for managing AI agents: parallel cloud worlds, review gates, permissions, credentials, and payments in one calm interface.`);
+    `${siteName()} is the agentic to-do list that finishes itself: agents work in parallel on their own computers; you review the result. Use your Claude or ChatGPT plan.`);
 }
 
 // The gateway resolves /brand/* against the instance-wide icon setting, so the
@@ -6034,7 +6046,10 @@ function renderShell() {
         </div>
         <div class="rail-top">
           ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
-          <button class="btn primary rail-new-task" id="rail-new-task" type="button" data-shortcut="nav.newTaskDefault" title="${esc(commandHint('New task', 'nav.newTaskDefault'))}">${ICON.plus}<span>New task</span></button>
+          <div class="rail-new" role="group" aria-label="New task">
+            <button class="btn primary rail-new-task" id="rail-new-task" type="button" data-shortcut="nav.newTaskDefault" title="${esc(commandHint('New task', 'nav.newTaskDefault'))}">${ICON.plus}<span>New task</span></button>
+            <button class="btn primary rail-new-template" id="rail-new-template" type="button" data-shortcut="nav.newTask" aria-label="New task from template" title="${esc(commandHint('New task from template', 'nav.newTask'))}">${ICON.template}</button>
+          </div>
           <nav class="rail-org-nav" aria-label="Organization">${RAIL_ORG_NAV.map(([id, label, icon, , , , command]) =>
             `<a class="rail-row" id="${id}" data-spa data-shortcut="${command}" href="#">${ICON[icon]}<span>${label}</span></a>`).join('')}</nav>
         </div>
@@ -6060,6 +6075,7 @@ function renderShell() {
     <aside class="hosted-onboarding" id="hosted-onboarding" aria-live="polite" hidden></aside>`;
   $('#rail-palette').addEventListener('click', openPalette);
   $('#rail-new-task').addEventListener('click', () => openNewTaskForm());
+  $('#rail-new-template').addEventListener('click', () => openTemplatePicker());
   $('#rail-help').addEventListener('click', openHelp);
   $('#key-echo').addEventListener('animationend', () => echoKeys('')); // faded out
   wireVerificationBanner();
@@ -7048,7 +7064,7 @@ function tasksView() {
   const composer = everywhere || (home && !newTaskProjectId()) ? '' : `
     <div class="composer">
       <button type="button" class="new-task-field" id="expand-task" data-shortcut="nav.newTaskDefault">New task…</button>
-      <button type="button" class="btn icon-only" id="new-from-template" data-shortcut="nav.newTask" title="New task from template" aria-label="New task from template">${ICON.template}</button>
+      <button type="button" class="new-task-template" id="new-from-template" data-shortcut="nav.newTask" title="${esc(commandHint('New task from template', 'nav.newTask'))}" aria-label="New task from template">${ICON.template}</button>
     </div>`;
   // Tags are managed from the Filter menu's Tag picker, not beside the query menus.
   const trailing = everywhere || !home ? '' : projectFilterHtml();
@@ -7540,7 +7556,7 @@ function runSubRow(r) {
         <div class="task-title">${esc(r.title)} <span class="chip ${status}">${esc(stageLabel(v))}</span>${v.approvalRequests ? ' <span class="chip approval-needed">approval needed</span>' : ''}</div>
         <div class="task-sub"><span style="color:var(--ink-3)">${new Date(r.createdAt).toLocaleString()}</span></div>
       </div>
-      <div class="task-right">${pipeline(v, true)}</div>
+      <div class="task-right">${pipeline(v)}</div>
     </div>`;
 }
 
@@ -7615,7 +7631,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
         </div>
         ${ownAsk ? rowAskHtml(t) : ''}
       </div>
-      <div class="task-right">${rowWhen(t)}${pipeline(v, true)}${archiveBtn}</div>
+      <div class="task-right">${rowWhen(t)}${pipeline(v)}${archiveBtn}</div>
     </div>`;
 }
 
@@ -7866,7 +7882,7 @@ function stageIndexOf(stages, stage) {
   return 0;
 }
 
-function pipeline(v, labelled = false) {
+function pipeline(v) {
   const stages = stagesFor(v.workflow);
   // 'escalated' is a blocked, awaiting-human state — NOT a pipeline position. Don't
   // pin it to a stage (it used to mis-map onto Merge); flag the whole track instead.
@@ -7887,11 +7903,9 @@ function pipeline(v, labelled = false) {
     }
     segs += `<span class="${cls}"></span>`;
   }
-  const bar = `<div class="pipeline${escalated ? ' escalated' : ''}" title="${escalated ? 'Escalated — awaiting a human' : esc(stageLabel(v))}">${segs}</div>`;
-  if (!labelled) return bar;
-  // On a row the bar says which stage it is in words too, not by colour alone.
-  const name = done ? 'Done' : escalated ? 'Escalated' : stages[idx]?.label || '';
-  return `<span class="pipeline-labelled">${name ? `<span class="pipeline-label">${esc(name)}</span>` : ''}${bar}</span>`;
+  // The row's status chip says the stage in words; the bar names it to a screen reader and on hover.
+  const label = escalated ? 'Escalated — awaiting a human' : stageLabel(v);
+  return `<div class="pipeline${escalated ? ' escalated' : ''}" role="img" aria-label="${esc(label)}" title="${esc(label)}">${segs}</div>`;
 }
 
 // ── task-organization control wiring (views bar + query toolbar + modals) ─────
@@ -27982,154 +27996,141 @@ function openPublicAuth(path, render) {
   render();
 }
 
-// The landing follows the system theme like the console; its toggle pins the
-// other one in the console's own `karmax-theme` preference.
-function landingTheme() {
-  const pinned = document.documentElement?.getAttribute('data-theme');
-  if (pinned === 'light' || pinned === 'dark') return pinned;
-  return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-}
-
-function labelLandingTheme(button) {
-  button.title = landingTheme() === 'light' ? 'Switch to dark theme' : 'Switch to light theme';
-  button.setAttribute('aria-label', button.title);
-}
-
-function toggleLandingTheme(button) {
-  const next = landingTheme() === 'light' ? 'dark' : 'light';
-  document.documentElement.setAttribute('data-theme', next);
-  localStorage.setItem('karmax-theme', next);
-  labelLandingTheme(button);
-}
+// ── public landing ───────────────────────────────────────────────────────────
+// The landing tells what the launch film tells (design/launch-video/first-cut),
+// in its look: the film first, then one chapter per scene, each pictured by a
+// still from the film (web/media/landing). Always dark, like the film.
+const LANDING_FILM = { src: '/media/tavya-launch.mp4', poster: '/media/tavya-launch-poster.jpg', length: '0:59' };
+// [still, headline (*gold*), line, picture's description]
+const LANDING_CHAPTERS = [
+  ['list', 'Every project. *One list.*', 'A SaaS, research papers, a PhD thesis — each task handed to an agent.', 'The organization’s task list across projects, agents working on several tasks at once'],
+  ['new-task', 'Say what *needs doing.*', 'In plain words. Pick the agent and model, or keep your defaults.', 'The new-task form, with a prompt typed in plain words and the agent picked'],
+  ['working', 'Agents work on *their own computers.*', 'Your repos, a terminal, a browser — in parallel, while you do something else.', 'A task’s conversation while its agent works: steps it has taken on its computer'],
+  ['fan-out', 'Big jobs *fan out.*', 'One codebase review became 25 sub-tasks, each with its own agent.', 'A codebase review task with 25 sub-tasks, each done by its own agent'],
+  ['review', 'Review the *result,* not the process.', 'Agents attach screenshots, reports and commands to check. You approve; it lands.', 'A task in Review: screenshots of a redesigned website attached by its agent'],
+  ['figures', 'Not just *code.*', 'Experiments, figures, papers, websites — from the same list.', 'A research task’s figure, open in the Review viewer'],
+];
+// [still, headline, line or the three boxes under it, picture's description]
+const LANDING_CARDS = [
+  ['vault', 'Give agents *accounts, keys and a card.*', 'They sign up, sign in and pay — only with what you allow.', 'The vault: logins and API keys agents may use, each with who may see it'],
+  ['schedules', 'Work that *starts itself.*', ['Agents can start, manage and approve tasks', 'Tasks can be triggered by webhooks and events', 'Tasks can run on schedules, or after other tasks'], 'Repeatable tasks: one on a schedule, others triggered by events'],
+  ['models', 'Any model. *Your subscription.*', 'Claude, Codex or OpenCode — on your Claude or ChatGPT plan, or an API key.', 'The model picker: Claude models with their reasoning efforts'],
+];
+const landingGold = (text) => esc(text).replace(/\*([^*]+)\*/g, '<span class="lv-gold">$1</span>');
 
 function renderLanding() {
-  // Seven real tasks the platform shipped. Each agent finishes at its own moment
-  // (`--d`), so the hero plays out as parallel work landing, then rests at done.
-  const tasks = [
-    ['Support e2b cloud environments for agents', 2.1],
-    ['Support Github auto-merge, merge queues in addition to native merge queue', 3.6],
-    ['Password vault: implement git-backed <code>unix pass</code> importer', 2.8],
-    ['Let agents create accounts with agentmail.to', 4.3],
-    ['Add spending limits for agents', 1.6],
-    ['MathJaX support in agent conversations', 3.1],
-    ['Wiki-based agent memory', 2.4],
-  ];
-  const tick = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.6 8.4l2.9 2.9 5.9-6.6"/></svg>';
-  const check = (title, detail = '') => `<li><span class="landing-tick">${tick}</span><div><h3>${title}</h3>${detail}</div></li>`;
+  const site = siteNameMarkup();
+  const still = (name, alt, eager = false) => `<img src="/media/landing/${name}.webp" alt="${esc(alt)}" width="1400" height="868"${eager ? '' : ' loading="lazy"'} decoding="async">`;
+  const play = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 4.6v10.8a.6.6 0 0 0 .9.5l8.6-5.4a.6.6 0 0 0 0-1L7.4 4.1a.6.6 0 0 0-.9.5z"/></svg>';
+  const pocket = ['Project wiki & skills', 'Sub-tasks', 'Teams & Avatārs', 'MCP for any agent', `${siteName()} CLI`, 'Your own cloud accounts'];
   document.body.classList.add('landing-active');
-  document.title = `${siteName()} — the to-do list for AI agents`;
+  document.title = `${siteName()} — the agentic to-do list that finishes itself`;
   $('#app').innerHTML = `<div class="landing-page">
     <a class="landing-skip" href="#landing-main">Skip to content</a>
     <header class="landing-nav" aria-label="Primary navigation"><div class="landing-nav-inner">
-      <div class="landing-identity"><a class="landing-brand" href="/" aria-label="${siteNameMarkup()} home">${brandMark()}<span>${siteNameMarkup()}</span></a><p class="landing-tagline">Just do things.</p></div>
-      <div class="landing-nav-actions">
+      <a class="landing-brand" href="/" aria-label="${site} home">${brandMark()}<span>${site}</span></a>
+      <nav class="landing-nav-actions" aria-label="Site">
         <a href="/docs" class="landing-text-link">Docs</a>
         <a href="/pricing" class="landing-text-link">Pricing</a>
         <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
-        <button class="landing-theme" id="landing-theme" type="button" aria-label="Switch theme"><svg class="sun" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3.4"/><path d="M10 1.8v2M10 16.2v2M1.8 10h2M16.2 10h2M4.2 4.2l1.4 1.4M14.4 14.4l1.4 1.4M4.2 15.8l1.4-1.4M14.4 5.6l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 20 20" aria-hidden="true"><path d="M16.4 12.6A6.8 6.8 0 0 1 7.4 3.6a6.8 6.8 0 1 0 9 9z"/></svg></button>
         <a class="landing-sign-in" id="landing-sign-in" href="/login">Sign in</a>
         <a class="landing-start" id="landing-start" href="/signup">Get started</a>
-      </div>
+      </nav>
     </div></header>
 
     <main id="landing-main">
-      <section class="landing-hero" aria-labelledby="landing-title">
-        <div class="landing-hero-copy">
-          <h1 id="landing-title" class="landing-analogy"><span>vscode was a fancy <b>text editor.</b></span> <span>${siteNameMarkup()} is a fancy <b>to-do list.</b></span></h1>
-          <p class="landing-intro">The interface for the era of <strong>managing agents</strong> rather than <s>manually coding/working</s>.</p>
-          <div class="landing-hero-actions">
-            <a class="landing-start landing-start-large" id="landing-hero-start" href="/signup">Start managing agents <span aria-hidden="true">→</span></a>
-          </div>
-        </div>
-
-        <figure class="product-frame" aria-label="${siteNameMarkup()} task list showing agents working in parallel">
-          <div class="product-browserbar"><i></i><i></i><i></i><span>${esc(location.host)} / ${siteNameMarkup()}</span><b>⌘ K</b></div>
-          <div class="product-shell">
-            <aside class="product-rail">
-              <div class="product-wordmark">${brandMark()}<strong>${siteNameMarkup()}</strong></div>
-              <div class="product-new">${ICON.plus}New task</div>
-              <div class="product-nav">${[['home', 'Home'], ['insights', 'Insights'], ['wiki', 'Wiki'], ['settings', 'Settings']]
-                .map(([icon, label]) => `<span>${ICON[icon]}${label}</span>`).join('')}</div>
-              <small>Projects</small>
-              <div class="product-project active">${ICON.project}<span>${siteNameMarkup()}</span><b>2</b></div>
-              <div class="product-project">${ICON.project}<span>Website</span><b>1</b></div>
-              <div class="product-project">${ICON.project}<span>Research</span></div>
-              <div class="product-rail-spacer"></div>
-              <div class="product-person"><i>A</i>Ada</div>
-            </aside>
-            <div class="product-main">
-              <div class="product-topline"><span>Tasks</span><span>Queues</span><span>Wiki</span><span>Project settings</span></div>
-              <div class="product-compose">New task…</div>
-              <div class="product-list-head"><span>For me</span><span class="on">Active</span><span>Scheduled</span><span class="product-count">7 tasks</span></div>
-              <div class="product-list">${tasks.map(([title, delay]) => `
-              <article class="product-task" style="--d:${delay}s">
-                <span class="product-check">${tick}</span>
-                <div><strong>${title}</strong></div>
-                <span class="product-pipe" aria-hidden="true"><i></i></span>
-                <div class="product-stages"><span class="product-stage working" aria-hidden="true">Working</span><div class="product-stage done">Done</div></div>
-              </article>`).join('')}
-              </div>
-            </div>
-          </div>
+      <section class="lv-hero" aria-labelledby="landing-title">
+        <p class="lv-eyebrow"><i aria-hidden="true"></i>Open to everyone, starting today</p>
+        <h1 id="landing-title">The agentic to-do list that <span class="lv-gold">finishes itself.</span></h1>
+        <figure class="lv-film">
+          <video id="lv-film" src="${LANDING_FILM.src}" poster="${LANDING_FILM.poster}" width="1920" height="1080" muted loop playsinline preload="metadata"
+            aria-label="${site}’s launch film, ${LANDING_FILM.length}: the chapters below, in motion"></video>
+          <button class="lv-sound" id="lv-sound" type="button">${play}<span>Watch with sound</span><small>${LANDING_FILM.length}</small></button>
         </figure>
-      </section>
-
-      <section class="landing-principles" aria-labelledby="principles-title">
-        <h2 id="principles-title">Your agents need a place to work.<br>Your attention needs <em>one place</em> to look.</h2>
-        <ul class="landing-checklist">
-          ${check('Agents work parallelly in isolated cloud worlds.')}
-          ${check('Yes, gitignored files are handled correctly.', '<p>secrets, databases, big files</p>')}
-          ${check('Bring your own key or OpenAI/Claude subscription')}
-          ${check(`${siteNameMarkup()} MCP lets agents access and manage your ${siteNameMarkup()} projects`, '<p>if you authorize it.</p>')}
-          ${check('Connect your apps and a payment card, and let agents Just Do Things.',
-            `<p>E.g. just create a task</p><div class="landing-examples"><span><i></i>buy me a website and deploy to it</span><span><i></i>run the experiment on vast.ai</span></div>`)}
-        </ul>
-      </section>
-
-      <section class="landing-control" aria-labelledby="control-title">
-        <div class="landing-control-head">
-          <h2 id="control-title">As human-in-the-loop<br>as <em>you</em> like.</h2>
-          <p>Want a human-managed to-do list of AI engineers? Want the automated company? ${siteNameMarkup()} can do both.</p>
-        </div>
-        <div class="landing-control-list">
-          <article><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3v5M15 3v5M6.5 8h11v3.5a5.5 5.5 0 0 1-11 0zM12 17v4"/></svg><p>${siteNameMarkup()} MCP lets agents create new tasks, manage tasks, manage settings—<strong>anything a human can do.</strong></p></article>
-          <article><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M3 19a5 5 0 0 1 10 0"/><rect x="14.5" y="4.5" width="6" height="6" rx="1.5"/><path d="M17.5 13v3.5M14 19.5h7M16 16.5h3"/></svg><p><strong>Review and human input stages</strong> can be assigned to either a human or an agent.</p></article>
-          <article><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7.5 3v5.5c0 4.6-3.2 8.2-7.5 9.5-4.3-1.3-7.5-4.9-7.5-9.5V6z"/><path d="M8.8 12.2l2.2 2.2 4.2-4.6"/></svg><p>${siteNameMarkup()} comes with a robust <strong>authorization system</strong>, so you decide whether to give agents these permissions.</p></article>
+        <p class="lv-lede">Say what needs doing. Agents do it on their own computers, in parallel — you review the result.</p>
+        <div class="lv-actions">
+          <a class="landing-start lv-large" id="landing-hero-start" href="/signup">Get started <span aria-hidden="true">→</span></a>
+          <a class="lv-ghost" href="/docs">Read the docs</a>
         </div>
       </section>
 
-      <section class="landing-final" aria-labelledby="final-title">
-        <div class="landing-final-mark" aria-hidden="true">${brandMark()}</div>
-        <h2 id="final-title">Leave the permanent<br>underclass today.</h2>
-        <a class="landing-start landing-start-large" id="landing-final-start" href="/signup">Get started with ${siteNameMarkup()} <span aria-hidden="true">→</span></a>
+      <div class="lv-chapters">${LANDING_CHAPTERS.map(([name, title, line, alt], i) => `
+        <section class="lv-chapter lv-reveal" aria-labelledby="lv-ch-${i}">
+          <div class="lv-copy"><h2 id="lv-ch-${i}">${landingGold(title)}</h2><p>${esc(line)}</p></div>
+          <figure class="lv-shot">${still(name, alt)}</figure>
+        </section>`).join('')}
+      </div>
+
+      <section class="lv-cards" aria-label="And more">${LANDING_CARDS.map(([name, title, line, alt], i) => `
+        <article class="lv-card lv-reveal" aria-labelledby="lv-card-${i}">
+          <h2 id="lv-card-${i}">${landingGold(title)}</h2>
+          ${Array.isArray(line) ? `<ul class="lv-boxes">${line.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>` : `<p>${esc(line)}</p>`}
+          <figure class="lv-shot">${still(name, alt)}</figure>
+        </article>`).join('')}
+      </section>
+
+      <section class="lv-pocket lv-reveal" aria-labelledby="lv-pocket-title">
+        <h2 id="lv-pocket-title">In your pocket, too.</h2>
+        <img class="lv-phones" src="/media/landing/phones.webp" alt="${site} on two phones: the task list, and a task’s conversation" width="1100" height="860" loading="lazy" decoding="async">
+        <ul class="lv-chips">${pocket.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>
+      </section>
+
+      <section class="lv-end" aria-labelledby="lv-end-title">
+        <div class="lv-end-mark" aria-hidden="true">${brandMark()}</div>
+        <h2 id="lv-end-title">Just do things.</h2>
+        <a class="landing-start lv-large" id="landing-final-start" href="/signup">Get started with ${site} <span aria-hidden="true">→</span></a>
+        <a class="lv-ghost" href="/pricing">See pricing</a>
       </section>
     </main>
 
-    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${siteNameMarkup()}</span></a><p>Just do things.</p><a href="/docs">Docs</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${site}</span></a><p>Just do things.</p><a href="/docs">Docs</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
   </div>`;
 
   const signIn = () => openPublicAuth('/login', renderLogin);
   const signUp = () => openPublicAuth('/signup', renderSignup);
   $('#landing-sign-in')?.addEventListener('click', plainClick(signIn));
   ['landing-start', 'landing-hero-start', 'landing-final-start'].forEach((id) => $(`#${id}`)?.addEventListener('click', plainClick(signUp)));
-  const theme = $('#landing-theme');
-  if (theme) {
-    labelLandingTheme(theme);
-    theme.addEventListener('click', () => toggleLandingTheme(theme));
-  }
-  // The checklist ticks itself off as it scrolls into view. Without an
-  // observer the ticks simply render checked.
-  const checklist = $('.landing-checklist');
-  if (checklist && 'IntersectionObserver' in window) {
-    checklist.classList.add('will-tick');
-    const observer = new IntersectionObserver(([entry]) => {
+  wireLandingFilm();
+  // Chapters rise into view as they are reached; without an observer, or with
+  // reduced motion, they are simply there.
+  const page = $('.landing-page');
+  if ('IntersectionObserver' in window && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    page.classList.add('lv-animate');
+    const observer = new IntersectionObserver((entries) => entries.forEach((entry) => {
       if (!entry.isIntersecting) return;
-      checklist.classList.add('ticked');
-      observer.disconnect();
-    }, { threshold: 0.3 });
-    observer.observe(checklist);
+      entry.target.classList.add('in');
+      observer.unobserve(entry.target);
+    }), { threshold: 0.15, rootMargin: '0px 0px -8% 0px' });
+    page.querySelectorAll('.lv-reveal').forEach((element) => observer.observe(element));
   }
   window.onpopstate = () => boot();
+}
+
+// The film plays silently, looping, while it is on screen (never with reduced
+// motion); "Watch with sound" starts it from the top with sound and controls.
+function wireLandingFilm() {
+  const film = $('#lv-film');
+  const sound = $('#lv-sound');
+  if (!film || !sound) return;
+  let watching = false;
+  const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (!still && 'IntersectionObserver' in window) {
+    new IntersectionObserver(([entry]) => {
+      if (watching) return;
+      if (entry.isIntersecting) film.play().catch(() => {});
+      else film.pause();
+    }, { threshold: 0.35 }).observe(film);
+  }
+  sound.addEventListener('click', () => {
+    watching = true;
+    film.muted = false;
+    film.loop = false;
+    film.controls = true;
+    film.currentTime = 0;
+    film.play().catch(() => {});
+    sound.hidden = true;
+    film.focus({ preventScroll: true });
+  });
 }
 
 // Sign in and create account are one page, at /login and /signup alike: the

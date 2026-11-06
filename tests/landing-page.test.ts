@@ -17,13 +17,13 @@ const signedOut = ({ path }: { path: string }) => path === '/api/meta' ? { siteN
   : path === '/api/launch' ? {} : path === '/api/session' ? { authRequired: true, authenticated: false } : undefined;
 
 describe('public landing page', () => {
-  it('renders the installation\'s name in the homepage and representative screenshot, including its address bar', async () => {
+  it('names the installation in its title, header, film and footer', async () => {
     const ui = await landing();
     const { page } = ui;
-    expect(await page.title()).toBe('tavya — the to-do list for AI agents');
-    expect(await page.locator('.product-browserbar span').textContent()).toBe('console.test / tavya');
-    expect(await page.locator('.product-wordmark strong').textContent()).toBe('tavya');
-    expect(await page.locator('.product-project.active span').textContent()).toBe('tavya');
+    expect(await page.title()).toBe('tavya — the agentic to-do list that finishes itself');
+    expect(await page.locator('.landing-nav .landing-brand span').textContent()).toBe('tavya');
+    expect(await page.locator('#lv-film').getAttribute('aria-label')).toMatch(/^tavya’s launch film, 0:59/);
+    expect((await page.locator('.lv-end .landing-start').innerText()).replace(/\s+/g, ' ')).toBe('Get started with tavya →');
     // The issue-tracker URL is a repository identifier, not branding.
     expect(await page.locator('.landing-page').innerText()).not.toMatch(/krmax/i);
     expect(ui.errors).toEqual([]);
@@ -88,121 +88,77 @@ describe('public landing page', () => {
     await ui.close();
   });
 
-  it('carries the product thesis and each promised capability', async () => {
-    const ui = await landing();
-    const text = (await ui.page.locator('.landing-page').innerText()).replace(/\s+/g, ' ');
-    for (const claim of ['vscode was a fancy text editor.', 'tavya is a fancy to-do list.',
-      'The interface for the era of managing agents rather than manually coding/working.',
-      'Agents work parallelly in isolated cloud worlds.', 'Yes, gitignored files are handled correctly.',
-      'secrets, databases, big files', 'Bring your own key or OpenAI/Claude subscription',
-      'tavya MCP lets agents access and manage your tavya projects',
-      'Connect your apps and a payment card, and let agents Just Do Things.',
-      'buy me a website and deploy to it', 'run the experiment on vast.ai', 'As human-in-the-loop as you like.',
-      'robust authorization system', 'Leave the permanent underclass today.'])
-      expect(text).toContain(claim);
-    expect(text.match(/Just do things\./g)).toHaveLength(2);
-    for (const retired of ['password vault and a payment card', 'Everything is a to-do list.', 'No new AI subscription',
-      'The whole idea', 'Human in the loop', 'Your Integrated Management Environment'])
-      expect(text).not.toContain(retired);
-    expect(await ui.page.locator('.landing-page em').allInnerTexts()).toEqual(['one place', 'you']);
-    await ui.close();
-  });
-
-  it('sets the analogy as two plain sentences, a single word space after each name', async () => {
-    const ui = await landing();
-    const lines = ui.page.locator('#landing-title > span');
-    expect(await lines.allInnerTexts()).toEqual(['vscode was a fancy text editor.', 'tavya is a fancy to-do list.']);
-    // The gap between the name and the next word is the font's own space,
-    // not a column padded to the longer name.
-    const gaps = await lines.evaluateAll((spans) => spans.map((span) => {
-      const text = span.firstChild, space = text.data.indexOf(' ');
-      const range = (start: number, end: number) => {
-        const r = document.createRange();
-        r.setStart(text, start); r.setEnd(text, end);
-        return r.getBoundingClientRect();
-      };
-      return (range(space + 1, space + 2).left - range(0, space).right) / parseFloat(getComputedStyle(span).fontSize);
-    }));
-    for (const gap of gaps) expect(gap).toBeLessThan(.35);
-    await ui.close();
-  });
-
-  it('separates the two analogy sentences by more than their line spacing, at any width', async () => {
-    for (const width of [1440, 1100, 961, 800, 390, 320]) {
-      const ui = await landing({ viewport: { width, height: 900 } });
-      const [first, second] = await ui.page.locator('#landing-title > span').evaluateAll((spans) => spans.map((span) => {
-        const box = span.getBoundingClientRect();
-        return { top: box.top, bottom: box.bottom, lineHeight: parseFloat(getComputedStyle(span).lineHeight) };
-      }));
-      // Wrapped lines of one sentence sit lineHeight apart; the sentences sit further.
-      expect(second!.top - first!.bottom, `${width}px`).toBeGreaterThan(first!.lineHeight * .4);
-      expect(await ui.page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-      await ui.close();
-    }
-  });
-
-  it('colours each analogy object in the accent, the past one muted', async () => {
-    const ui = await landing();
-    const colours = await ui.page.locator('#landing-title > span').evaluateAll((spans) => spans.map((span) =>
-      [getComputedStyle(span).color, getComputedStyle(span.querySelector('b')).color]));
-    expect(await ui.page.locator('#landing-title b').allInnerTexts()).toEqual(['text editor.', 'to-do list.']);
-    for (const [sentence, object] of colours) expect(object).not.toBe(sentence);
-    expect(colours[0]![1]).not.toBe(colours[1]![1]); // the past is a muted accent
-    await ui.close();
-  });
-
-  it('wears the console\'s look: its colours, its primary button, light or dark, default or classic', async () => {
-    for (const [skin, scheme] of [['', 'light'], ['', 'dark'], ['classic', 'light']] as const) {
-      const ui = await landing();
-      await ui.page.emulateMedia({ colorScheme: scheme });
-      await ui.run(`applySkin(${JSON.stringify(skin)})`);
-      await ui.page.waitForTimeout(300); // the buttons fade between colours
-      const look = await ui.page.evaluate(() => {
-        const root = getComputedStyle(document.documentElement);
-        const probe = (value: string) => { const el = document.createElement('i'); el.style.color = value; document.body.append(el); const c = getComputedStyle(el).color; el.remove(); return c; };
-        const start = getComputedStyle(document.querySelector('#landing-start'));
-        return {
-          page: getComputedStyle(document.querySelector('.landing-page')).backgroundColor, paper: probe(root.getPropertyValue('--paper')),
-          button: start.backgroundColor, primary: probe(root.getPropertyValue('--primary')),
-          radius: start.borderTopLeftRadius, ink: start.color,
-        };
-      });
-      expect(look.page, `${skin || 'default'} ${scheme}`).toBe(look.paper);
-      expect(look.button, `${skin || 'default'} ${scheme}`).toBe(look.primary);
-      expect(parseFloat(look.radius), 'a pill in the default look, the classic look\'s corner otherwise').toBe(skin ? 8 : 999);
-      await ui.close();
-    }
-  });
-
-  it('pictures today\'s console: New task, the organization\'s places, projects with their For me numbers, sentence case', async () => {
-    const ui = await landing();
+  it('opens on the launch film, right under its headline', async () => {
+    const ui = await landing({ viewport: { width: 1440, height: 900 } });
     const { page } = ui;
-    expect(await page.locator('.product-new').innerText()).toBe('New task');
-    expect(await page.locator('.product-nav span').allInnerTexts()).toEqual(['Home', 'Insights', 'Wiki', 'Settings']);
-    expect(await page.locator('.product-project b').allInnerTexts()).toEqual(['2', '1']);
-    expect(await page.locator('.product-person').innerText()).toBe('A\nAda');
-    expect(await page.locator('.product-topline span').allInnerTexts()).toEqual(['Tasks', 'Queues', 'Wiki', 'Project settings']);
-    // No small capitals, and the stage names in the reading face.
-    const caps = await page.evaluate(() => [...document.querySelectorAll('.product-frame *')].filter((el) => getComputedStyle(el).textTransform === 'uppercase').length);
-    expect(caps).toBe(0);
-    expect(await page.locator('.product-stage.done').first().innerText()).toBe('Done');
-    expect(await page.evaluate(() => getComputedStyle(document.querySelector('.product-stage')).fontFamily))
-      .toBe(await page.evaluate(() => getComputedStyle(document.body).fontFamily));
+    expect(await page.locator('#landing-title').innerText()).toBe('The agentic to-do list that finishes itself.');
+    expect(await page.locator('#landing-title .lv-gold').innerText()).toBe('finishes itself.');
+    const film = page.locator('#lv-film');
+    expect(await film.getAttribute('src')).toBe('/media/tavya-launch.mp4');
+    expect(await film.getAttribute('poster')).toBe('/media/tavya-launch-poster.jpg');
+    const state = await film.evaluate((video: any) => ({ muted: video.muted, loop: video.loop, inline: video.playsInline, controls: video.controls }));
+    expect(state).toEqual({ muted: true, loop: true, inline: true, controls: false });
+    // It is the first thing after the headline, and starts on the first screen.
+    const order = await page.evaluate(() => [...document.querySelectorAll('#landing-title, #lv-film, .lv-chapter')].map((el) => el.id || el.className.split(' ')[0]));
+    expect(order.slice(0, 3)).toEqual(['landing-title', 'lv-film', 'lv-chapter']);
+    expect((await film.boundingBox())!.y).toBeLessThan(900 / 2);
+    // Watch with sound: from the top, with sound and the player's controls.
+    await page.locator('#lv-sound').click();
+    const watching = await film.evaluate((video: any) => ({ muted: video.muted, loop: video.loop, controls: video.controls, at: video.currentTime }));
+    expect(watching).toMatchObject({ muted: false, loop: false, controls: true });
+    expect(watching.at, 'from the top').toBeLessThan(1);
+    expect(await page.locator('#lv-sound').isVisible()).toBe(false);
     expect(ui.errors).toEqual([]);
     await ui.close();
   });
 
-  it('closes on the brand mark', async () => {
+  it('tells the film\'s chapters in its order, each pictured by a still from it', async () => {
     const ui = await landing();
-    const mark = ui.page.locator('.landing-final-mark .mark');
-    expect(await mark.count()).toBe(1);
-    expect((await mark.boundingBox())!.width).toBeGreaterThanOrEqual(60);
+    const { page } = ui;
+    const titles = await page.locator('.lv-chapter h2, .lv-card h2, .lv-pocket h2, .lv-end h2').allInnerTexts();
+    expect(titles.map((title) => title.replace(/\s+/g, ' '))).toEqual(['Every project. One list.', 'Say what needs doing.',
+      'Agents work on their own computers.', 'Big jobs fan out.', 'Review the result, not the process.', 'Not just code.',
+      'Give agents accounts, keys and a card.', 'Work that starts itself.', 'Any model. Your subscription.', 'In your pocket, too.', 'Just do things.']);
+    // Each headline's one golden phrase, as in the film.
+    expect(await page.locator('.lv-chapter .lv-gold').allInnerTexts()).toEqual(['One list.', 'needs doing.', 'their own computers.', 'fan out.', 'result,', 'code.']);
+    expect(await page.locator('.lv-boxes li').allInnerTexts()).toEqual(['Agents can start, manage and approve tasks',
+      'Tasks can be triggered by webhooks and events', 'Tasks can run on schedules, or after other tasks']);
+    expect(await page.locator('.lv-chips li').allInnerTexts()).toEqual(['Project wiki & skills', 'Sub-tasks', 'Teams & Avatārs',
+      'MCP for any agent', 'tavya CLI', 'Your own cloud accounts']);
+    // Every still loads, is described, and keeps its space before it does.
+    const stills = page.locator('.lv-shot img, .lv-phones');
+    expect(await stills.count()).toBe(10);
+    for (const still of await stills.all()) {
+      await still.scrollIntoViewIfNeeded();
+      expect(await still.getAttribute('alt')).toBeTruthy();
+      expect(await still.getAttribute('width')).toBeTruthy();
+      await expect.poll(() => still.evaluate((img: any) => img.complete && img.naturalWidth)).toBeGreaterThan(0);
+    }
+    for (const retired of ['vscode was a fancy text editor.', 'Leave the permanent underclass today.', 'As human-in-the-loop'])
+      expect(await page.locator('.landing-page').innerText()).not.toContain(retired);
     await ui.close();
   });
 
-  it('sets type like the console: Inter with its default glyphs and natural tracking', async () => {
+  it('is dark like the film, with its gold call to action, whatever the theme or look', async () => {
+    for (const [scheme, theme, skin] of [['light', '', ''], ['dark', '', ''], ['dark', 'light', 'classic']] as const) {
+      const ui = await landing();
+      await ui.page.emulateMedia({ colorScheme: scheme });
+      await ui.run(`${theme ? `document.documentElement.dataset.theme = ${JSON.stringify(theme)};` : ''} applySkin(${JSON.stringify(skin)})`);
+      const look = await ui.page.evaluate(() => ({
+        page: getComputedStyle(document.querySelector('.landing-page')).backgroundColor,
+        start: getComputedStyle(document.querySelector('#landing-start')).backgroundImage,
+        ink: getComputedStyle(document.querySelector('#landing-start')).color,
+      }));
+      expect(look.page, `${scheme} ${theme} ${skin}`).toBe('rgb(13, 12, 19)');
+      expect(look.start).toContain('rgb(255, 215, 126)');
+      expect(look.ink).toBe('rgb(27, 20, 8)');
+      await ui.close();
+    }
+  });
+
+  it('sets its type in the console\'s Inter, with its default glyphs', async () => {
     const ui = await landing();
-    const type = await ui.page.evaluate(() => [...document.querySelectorAll('.landing-page, .landing-page h1, .landing-page h2, .landing-page h3, .landing-intro')]
+    const type = await ui.page.evaluate(() => [...document.querySelectorAll('.landing-page, .landing-page h1, .landing-page h2, .lv-lede')]
       .map((element) => {
         const style = getComputedStyle(element);
         const tracking = style.letterSpacing === 'normal' ? 0 : parseFloat(style.letterSpacing) / parseFloat(style.fontSize);
@@ -211,63 +167,31 @@ describe('public landing page', () => {
     const consoleFamily = await ui.page.evaluate(() => getComputedStyle(document.body).fontFamily);
     for (const { family, features, tracking } of type) {
       expect(family).toBe(consoleFamily);
-      expect(features).toBe('normal'); // no single-storey a or other alternates
-      expect(tracking).toBeGreaterThanOrEqual(-.025);
+      expect(features).toBe('normal');
+      expect(tracking).toBeGreaterThanOrEqual(-.036);
     }
     await ui.close();
   });
 
-  it('uses a faithful, installation-branded task list to advertise implemented features', async () => {
-    const ui = await landing();
-    const { page } = ui;
-    expect(await page.getByRole('figure', { name: 'tavya task list showing agents working in parallel' }).count()).toBe(1);
-    expect(await page.locator('.product-task strong').allInnerTexts()).toEqual([
-      'Support e2b cloud environments for agents',
-      'Support Github auto-merge, merge queues in addition to native merge queue',
-      'Password vault: implement git-backed unix pass importer',
-      'Let agents create accounts with agentmail.to',
-      'Add spending limits for agents',
-      'MathJaX support in agent conversations',
-      'Wiki-based agent memory',
-    ]);
-    expect(await page.locator('.product-task .product-stage.done').count()).toBe(7);
-    expect(await page.locator('.product-topline').innerText()).toMatch(/Queues\s+Wiki\s+Project settings/);
+  it('paints its first screen in Inter, never the fallback face swapped a moment later', async () => {
+    const ui = await consolePage({ path: '/', api: signedOut });
+    // A slow font: the page waits for it (a little) instead of showing another face first.
+    await ui.page.route('**/fonts/**', async (route) => { await new Promise((resolve) => setTimeout(resolve, 600)); await route.fallback(); });
+    await ui.run(`window.__firstFace = new Promise((resolve) => new MutationObserver((_, observer) => {
+      if (!document.querySelector('#landing-title')) return;
+      observer.disconnect();
+      resolve([...document.fonts].some((face) => face.family.replace(/"/g, '') === 'Inter' && face.status === 'loaded'));
+    }).observe(document.getElementById('app'), { childList: true, subtree: true })); boot()`);
+    expect(await ui.run('window.__firstFace')).toBe(true);
     await ui.close();
   });
 
-  it('lists capabilities as a checklist, so an item without detail is just a shorter row', async () => {
+  it('closes on the brand mark and "Just do things."', async () => {
     const ui = await landing();
-    const items = ui.page.locator('.landing-checklist > li');
-    expect(await items.count()).toBe(5);
-    expect(await ui.page.locator('.landing-checklist > li > .landing-tick').count()).toBe(5);
-    expect(await ui.page.locator('.landing-checklist article').count()).toBe(0);
-    const heights = await items.evaluateAll((rows) => rows.map((row) => row.getBoundingClientRect().height));
-    // "Agents work parallelly…" has no detail line; the gitignore item has one.
-    expect(heights[0]).toBeLessThan(heights[1]!);
-    await ui.close();
-  });
-
-  it('follows the system theme until the visitor pins one, sharing the console preference', async () => {
-    const ui = await landing();
-    const { page } = ui;
-    const background = () => page.locator('.landing-page').evaluate((element) => (globalThis as any).getComputedStyle(element).backgroundColor);
-    const toggle = page.locator('#landing-theme');
-    await page.emulateMedia({ colorScheme: 'light' });
-    const light = await background();
-    await page.emulateMedia({ colorScheme: 'dark' });
-    const dark = await background();
-    expect(light).not.toBe(dark); // unpinned, it follows the system
-    await ui.run('labelLandingTheme(document.getElementById("landing-theme"))');
-    expect(await toggle.getAttribute('aria-label')).toBe('Switch to light theme');
-    await toggle.click();
-    expect(await page.evaluate(() => [document.documentElement.dataset.theme, localStorage.getItem('karmax-theme')]))
-      .toEqual(['light', 'light']);
-    expect(await toggle.getAttribute('aria-label')).toBe('Switch to dark theme');
-    expect(await background()).toBe(light); // pinned light overrides the dark system theme
-    await page.emulateMedia({ colorScheme: 'light' });
-    await toggle.click();
-    expect(await page.evaluate(() => localStorage.getItem('karmax-theme'))).toBe('dark');
-    expect(await background()).toBe(dark);
+    const mark = ui.page.locator('.lv-end-mark .mark');
+    expect(await mark.count()).toBe(1);
+    expect((await mark.boundingBox())!.width).toBeGreaterThanOrEqual(60);
+    expect(await ui.page.locator('#lv-end-title').innerText()).toBe('Just do things.');
     await ui.close();
   });
 
@@ -282,19 +206,23 @@ describe('public landing page', () => {
     await expect.poll(top).toBeGreaterThan(0);
     await page.keyboard.press('Tab');
     expect(await page.evaluate(() => getComputedStyle(document.activeElement).outlineStyle)).toBe('solid');
-
     const navHeight = () => page.locator('.landing-nav-inner').evaluate((element) => element.getBoundingClientRect().height);
-    const wide = await navHeight();
-    await page.setViewportSize({ width: 600, height: 900 });
+    expect(await navHeight()).toBe(64);
+    for (const width of [1100, 800, 600, 390, 320]) {
+      await page.setViewportSize({ width, height: 900 });
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth), `${width}px`).toBe(true);
+    }
     expect(await navHeight()).toBe(58);
-    expect(wide).not.toBe(58);
-
-    const animation = () => page.locator('.product-task').first().evaluate((element) => (globalThis as any).getComputedStyle(element).animationName);
-    expect(await animation()).not.toBe('none');
-    await page.emulateMedia({ reducedMotion: 'reduce' });
-    expect(await animation()).toBe('none');
-    expect(await page.locator('.product-stage.working').first().isVisible()).toBe(false);
+    // Chapters rise into view; with reduced motion they are simply there, and the film waits to be played.
+    expect(await page.locator('.landing-page.lv-animate').count()).toBe(1);
     await ui.close();
+    const still = await consolePage({ viewport: { width: 1280, height: 900 } });
+    await still.page.emulateMedia({ reducedMotion: 'reduce' });
+    await still.run(`S.meta = { siteName: 'tavya' }; renderLanding()`);
+    expect(await still.page.locator('.landing-page.lv-animate').count()).toBe(0);
+    expect(await still.page.locator('.lv-chapter').first().evaluate((element) => getComputedStyle(element).opacity)).toBe('1');
+    expect(await still.page.locator('#lv-film').evaluate((video: any) => video.paused)).toBe(true);
+    await still.close();
   });
 
   it('sends public GitHub links to the issue tracker, never the private repository', async () => {

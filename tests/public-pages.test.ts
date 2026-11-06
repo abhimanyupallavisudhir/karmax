@@ -70,7 +70,13 @@ describe('public pages for search engines and link previews (hosted)', () => {
     const app = data['@graph'].find((node: { '@type': string }) => node['@type'] === 'SoftwareApplication');
     expect(app.offers.map((offer: { name: string; price: string }) => `${offer.name} ${offer.price}`)).toEqual(['Free 0.00', 'Individual 9.00', 'Team 19.00']);
     // Readers that run no script get the content and a link to every public page.
-    expect(page.body).toMatch(/<div id="app"><div class="prerendered">[\s\S]*<h1>vscode was a fancy text editor\. tavya is a fancy to-do list\.<\/h1>/);
+    expect(page.body).toMatch(/<div id="app"><div class="prerendered">[\s\S]*<h1>The agentic to-do list that finishes itself\.<\/h1>/);
+    expect(page.body).toContain('<a href="/media/tavya-launch.mp4">Watch the launch film (0:59)</a>');
+    expect(page.body).toContain('<li>Review the result, not the process.</li>');
+    // Inter downloads with the page, so the landing never paints a fallback face first.
+    expect(page.body).toContain('<link rel="preload" href="/fonts/inter/InterVariable.woff2" as="font" type="font/woff2" crossorigin />');
+    const film = await get('/media/tavya-launch.mp4');
+    expect([film.status, film.headers['content-type'], film.headers['accept-ranges']]).toEqual([200, 'video/mp4', 'bytes']);
     for (const href of ['/docs', '/docs/how-it-works', '/docs/cli', '/pricing', '/legal']) expect(page.body).toContain(`<a href="${href}">`);
     expect((await get('/social-card.png')).headers['content-type']).toBe('image/png');
   });
