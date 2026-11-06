@@ -209,10 +209,23 @@ describe('public landing page', () => {
   // later. The font is preloaded with the page, and a public page waits for it
   // (briefly) before its first paint.
   it('never paints in a fallback font', async () => {
-    const html = (await import('node:fs')).readFileSync('web/index.html', 'utf8');
-    expect(html).toContain('<link rel="preload" href="/fonts/inter/InterVariable.woff2" as="font" type="font/woff2" crossorigin />');
     const ui = await consolePage({ path: '/', api: signedOut });
     const { page } = ui;
+    // The shipped page asks for the font itself, before any script runs.
+    const shipped = await page.context().newPage();
+    const requested: string[] = [];
+    await shipped.route('http://shipped.test/**', async (route) => {
+      const url = new URL(route.request().url());
+      requested.push(url.pathname);
+      if (url.pathname === '/') return route.fulfill({ contentType: 'text/html', body: (await import('node:fs')).readFileSync('web/index.html') });
+      return route.abort();
+    });
+    await shipped.goto('http://shipped.test/', { waitUntil: 'domcontentloaded' });
+    expect(await shipped.evaluate(() => [...(globalThis as any).document.querySelectorAll('link[rel="preload"][as="font"]')]
+      .map((link: any) => ({ href: link.getAttribute('href'), type: link.type, crossOrigin: link.crossOrigin }))))
+      .toEqual([{ href: '/fonts/inter/InterVariable.woff2', type: 'font/woff2', crossOrigin: 'anonymous' }]);
+    await expect.poll(() => requested).toContain('/fonts/inter/InterVariable.woff2');
+    await shipped.close();
     await page.route('**/fonts/inter/InterVariable.woff2', async (route) => {
       await new Promise((resolve) => setTimeout(resolve, 600));
       await route.fulfill({ body: (await import('node:fs')).readFileSync('web/fonts/inter/InterVariable.woff2'), contentType: 'font/woff2' });
