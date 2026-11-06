@@ -25686,7 +25686,7 @@ function openIncludedModelDialog(settings, onSaved) {
   overlay.innerHTML = `<div class="modal-card computer-dialog" role="dialog" aria-modal="true" aria-label="Included model">
     <div class="modal-head"><b>Included model</b>${policyTip('Runs on OpenRouter. Each organization gets its own key, limited to its compute credit.')}<span class="label-row-fill"></span><button class="icon-btn included-close" type="button" aria-label="Close">×</button></div>
     <div class="settings-grid">
-      <label class="form-row"><span>Management key ${policyTip('OpenRouter → Settings → Management keys')}</span>
+      <label class="form-row"><span>Management key ${policyTip('Create one on openrouter.ai under Management keys')}</span>
         <input class="included-key" type="password" autocomplete="off" placeholder="${settings?.keyConfigured ? 'Saved · leave blank to keep' : 'sk-or-v1-…'}"></label>
       <label class="form-row"><span>Model</span><input class="included-model-id" value="${esc(settings?.model || 'deepseek/deepseek-v4.1-flash')}" placeholder="deepseek/deepseek-v4.1-flash"></label>
       <label class="switch"><input class="toggle included-enabled" type="checkbox" ${settings?.enabled === false ? '' : 'checked'}>Offer to organizations</label></div>
