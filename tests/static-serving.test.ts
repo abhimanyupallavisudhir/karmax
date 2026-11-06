@@ -46,6 +46,8 @@ describe('console static assets over HTTP', () => {
       '<!doctype html><html><head><title>krmax</title><meta name="description" content="x" /></head><body></body></html>');
     fs.writeFileSync(path.join(dir, 'app.js'), appJs);
     fs.writeFileSync(path.join(dir, 'routing.test.cjs'), 'require("node:test");');
+    fs.mkdirSync(path.join(dir, 'media'));
+    fs.writeFileSync(path.join(dir, 'media', 'film.mp4'), Buffer.from(Array.from({ length: 5000 }, (_, i) => i % 251)));
     const store = await Store.create(':memory:');
     const gateway = await Gateway.create({
       store,
@@ -145,6 +147,45 @@ describe('console static assets over HTTP', () => {
     expect(head.status).toBe(200);
     expect(head.body.length).toBe(0);
     expect(head.headers.etag).toMatch(/^"/);
+  });
+
+  // Safari plays a <video> only from a server that answers byte ranges (it
+  // asks for bytes=0-1 first), and every browser seeks with them.
+  it('answers byte ranges of a video, so every browser can play and seek it', async () => {
+    const film = fs.readFileSync(path.join(dir, 'media', 'film.mp4'));
+    const whole = await raw('/media/film.mp4');
+    expect(whole.status).toBe(200);
+    expect(whole.headers['accept-ranges']).toBe('bytes');
+    expect(whole.headers['content-type']).toBe('video/mp4');
+    expect(whole.headers['content-encoding']).toBeUndefined();
+    expect(whole.body.equals(film)).toBe(true);
+
+    const probe = await raw('/media/film.mp4', { range: 'bytes=0-1' });
+    expect(probe.status).toBe(206);
+    expect(probe.headers['content-range']).toBe('bytes 0-1/5000');
+    expect(probe.headers['content-length']).toBe('2');
+    expect(probe.body.equals(film.subarray(0, 2))).toBe(true);
+
+    const tail = await raw('/media/film.mp4', { range: 'bytes=4000-' });
+    expect(tail.status).toBe(206);
+    expect(tail.headers['content-range']).toBe('bytes 4000-4999/5000');
+    expect(tail.body.equals(film.subarray(4000))).toBe(true);
+    const suffix = await raw('/media/film.mp4', { range: 'bytes=-10' });
+    expect(suffix.headers['content-range']).toBe('bytes 4990-4999/5000');
+    expect(suffix.body.equals(film.subarray(4990))).toBe(true);
+
+    const beyond = await raw('/media/film.mp4', { range: 'bytes=6000-7000' });
+    expect(beyond.status).toBe(416);
+    expect(beyond.headers['content-range']).toBe('bytes */5000');
+    // A range of a file that changed since (If-Range) is the whole new file.
+    const changed = await raw('/media/film.mp4', { range: 'bytes=0-1', 'if-range': '"an-older-revision"' });
+    expect(changed.status).toBe(200);
+    expect(changed.body.length).toBe(5000);
+    const same = await raw('/media/film.mp4', { range: 'bytes=0-1', 'if-range': whole.headers.etag! });
+    expect(same.status).toBe(206);
+    // Text the gateway compresses is never sliced: a range there is the whole response.
+    const script = await raw('/app.js', { range: 'bytes=0-1', 'accept-encoding': 'gzip' });
+    expect(script.status).toBe(200);
   });
 
   it('does not publish the console test suites', async () => {

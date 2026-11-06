@@ -203,9 +203,41 @@ export async function serveStaticAsset(
     res.writeHead(304, headers);
     return void res.end();
   }
+  // Media and other uncompressed files answer byte ranges: Safari plays a
+  // <video> only from a server that does, and every browser seeks with them.
+  // One range per request (what players ask for); a changed file (If-Range)
+  // is sent whole.
+  if (!compressible && status === 200) {
+    headers['accept-ranges'] = 'bytes';
+    const ifRange = String(req?.headers['if-range'] ?? '');
+    const range = req?.headers.range && (!ifRange || ifRange.replace(/^W\//, '') === etag) ? byteRange(req.headers.range, data.length) : undefined;
+    if (range === 'unsatisfiable') {
+      res.writeHead(416, { ...headers, 'content-range': `bytes */${data.length}`, 'content-length': '0' });
+      return void res.end();
+    }
+    if (range) {
+      const [start, end] = range;
+      res.writeHead(206, { ...headers, 'content-range': `bytes ${start}-${end}/${data.length}`, 'content-length': String(end - start + 1) });
+      return void res.end(req?.method === 'HEAD' ? undefined : data.subarray(start, end + 1));
+    }
+  }
   const body = encoding ? await encode(data, revision, encoding) : data;
   if (encoding) headers['content-encoding'] = encoding;
   headers['content-length'] = String(body.length);
   res.writeHead(status, headers);
   res.end(req?.method === 'HEAD' ? undefined : body);
+}
+
+/** A `Range: bytes=…` header's one range, as inclusive [start, end] within `size`;
+ *  undefined to send the whole file (no range, several, or not bytes). */
+function byteRange(header: string, size: number): [number, number] | 'unsatisfiable' | undefined {
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match || (!match[1] && !match[2])) return undefined;
+  if (!match[1]) {
+    const length = Number(match[2]);
+    return length > 0 && size > 0 ? [Math.max(0, size - length), size - 1] : 'unsatisfiable';
+  }
+  const start = Number(match[1]);
+  const end = match[2] ? Math.min(Number(match[2]), size - 1) : size - 1;
+  return start < size && start <= end ? [start, end] : 'unsatisfiable';
 }

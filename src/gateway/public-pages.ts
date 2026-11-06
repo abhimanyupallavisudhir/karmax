@@ -48,8 +48,13 @@ export type PublicRoute =
   | { kind: 'not-found' }
   | { kind: 'console' };
 
+/** The landing's chapters, as the launch film and web/app.js (LANDING_CHAPTERS, LANDING_CARDS) tell them. */
+const LANDING_CHAPTERS = ['Every project. One list.', 'Say what needs doing.', 'Agents work on their own computers.', 'Big jobs fan out.',
+  'Review the result, not the process.', 'Not just code.', 'Give agents accounts, keys and a card.', 'Work that starts itself.',
+  'Any model. Your subscription.', 'In your pocket, too.'];
+
 /** The tagline the landing and its title share. */
-export const LANDING_TAGLINE = 'the to-do list for AI agents';
+export const LANDING_TAGLINE = 'the agentic to-do list that finishes itself';
 
 const DEFAULT_DOC = 'getting-started';
 
@@ -131,13 +136,15 @@ export function publicPaths(ctx: Pick<PublicPageContext, 'staticDir' | 'launch'>
 function page(ctx: PublicPageContext, pathname: string): PublicPage | 'not-found' | undefined {
   const site = ctx.siteName;
   if (pathname === '/') {
-    const description = `${site} is ${LANDING_TAGLINE}. They work in parallel on their own cloud computers; you review their work. Use your Claude or OpenAI subscription.`;
+    const description = `${site} is ${LANDING_TAGLINE}: agents work in parallel on their own computers; you review the result. Use your Claude or ChatGPT plan.`;
     const offers = ctx.launch.pricingCatalog.map((plan) => ({ '@type': 'Offer', name: plan.name,
       price: (plan.monthlyBasePriceCents / 100).toFixed(2), priceCurrency: plan.currency.toUpperCase(), url: `${ctx.origin}/pricing` }));
     return {
       path: '/', title: `${site} — ${LANDING_TAGLINE}`, name: `${site} — ${LANDING_TAGLINE}`, description,
-      body: `<h1>vscode was a fancy text editor. ${esc(site)} is a fancy to-do list.</h1>
+      body: `<h1>The agentic to-do list that finishes itself.</h1>
 <p>${esc(description)}</p>
+<p><a href="/media/tavya-launch.mp4">Watch the launch film (0:59)</a></p>
+<ul>${LANDING_CHAPTERS.map((chapter) => `<li>${esc(chapter)}</li>`).join('')}</ul>
 <p><a href="/signup">Get started</a> · <a href="/login">Sign in</a></p>`,
       structuredData: { '@context': 'https://schema.org', '@graph': [
         { '@type': 'Organization', '@id': `${ctx.origin}/#organization`, name: site, url: `${ctx.origin}/`, logo: `${ctx.origin}/brand/icon-512.png` },
