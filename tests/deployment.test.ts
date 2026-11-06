@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { OPENCODE_VERSION } from '../src/agent/acp-packages.js';
+import { CODEX_VERSION } from '../src/agent/codex-history.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -26,11 +27,13 @@ describe('deployment profiles', () => {
     const dockerfile = fs.readFileSync(path.join(repoRoot, 'deploy', 'Dockerfile'), 'utf8');
     expect(pkg.dependencies['@anthropic-ai/claude-agent-sdk']).toBe('0.3.318');
     const browserImage = fs.readFileSync(path.join(repoRoot, 'environments/browser/Dockerfile'), 'utf8');
-    expect(browserImage).toContain('ARG CODEX_VERSION=0.166.0');
+    expect(browserImage).toContain('ARG CODEX_VERSION=0.167.0');
     expect(browserImage).toContain('ARG CLAUDE_CODE_VERSION=2.1.318');
     // Remote OpenCode runs the pinned package; the template bakes that version.
     expect(browserImage).toContain(`ARG OPENCODE_VERSION=${OPENCODE_VERSION}`);
-    expect(pkg.dependencies['@openai/codex']).toBe('0.166.0');
+    expect(pkg.dependencies['@openai/codex']).toBe('0.167.0');
+    // Remote worlds and conversation exports run the version codex-history.ts names.
+    expect(CODEX_VERSION).toBe('0.167.0');
     expect(pkg.dependencies.pg).toBeTruthy();
     expect(dockerfile).toContain('npm ci --omit=dev');
   });

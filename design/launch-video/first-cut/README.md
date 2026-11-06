@@ -1,4 +1,11 @@
-# Launch video — first cut (the 63 s dark compositor)
+# Launch video — first cut (the final version, 59 s, dark compositor)
+
+The owner's final pick (2026-11-06): this cut, with the "VS Code was a fancy text editor…"
+scene removed, the title card's tagline "The agentic to-do list that finishes itself." (the
+end card keeps "Just do things."), and three boxes instead of a subtitle under "Work that
+starts itself." `patch.sh ORIGINAL.mp4 OUT.mp4` makes it from the original 63 s render
+without the screens below (it re-renders only what changed and regenerates the score);
+with the screens, `make.sh` renders it whole.
 
 A 63-second, 1080p/30 fps launch video of tavya, set in the owner's real organization
 (Abhimanyu Pallavi Sudhir / `personal`) cloned into a scratch tavya, with friends'

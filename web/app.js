@@ -9629,7 +9629,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           ${templateEdit ? '<span class="tf-hint"></span>' : `<button class="btn ghost" id="tf-save-template" title="Save this form as a template, to start new tasks from" aria-label="Save as template">${ICON.template}<span class="tf-save-template-label">Save as template</span></button>
           <span class="tf-hint">${store ? storeFormHint(store) : ''}</span>
           <button class="btn" id="tf-save-avatar" ${values.avatar ? '' : 'hidden'}>Save as Avatār without running</button>
-          <button class="btn" id="tf-draft">Save draft</button>`}
+          <button class="btn" id="tf-draft">${editInPlace ? 'Return to draft' : 'Save draft'}</button>`}
           <button class="btn primary" id="tf-queue">${templateEdit ? 'Save template' : editInPlace ? 'Save' : store?.repeatable && values.repeatable ? 'Install' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
         </div>
       </div>
@@ -10202,7 +10202,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       if (editInPlace) {
         // A waiting (armed) task or a repeatable series edits in place (incl. its
         // triggers) — it has no running workflow to queue. "Save" re-arms / keeps
-        // the series; "Save as draft" (draftMode) disarms it back to a draft.
+        // the series; "Return to draft" (draftMode) disarms it back to a draft.
         await Promise.all([
           api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, keepArmed: !draftMode, ...paramsOptions }) }),
           api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) }),
@@ -10213,9 +10213,11 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         // The usual expanded-form path was just persisted by auto-save. Do not
         // spend another RTT writing identical params and notes before queueing.
         // Accepting an agent's limited authority is recorded with its params.
-        if (!currentStateAlreadySaved || agentAccepted.length) {
+        if (!currentStateAlreadySaved || agentAccepted.length || draftMode) {
           await Promise.all([
-            api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, allowAttenuation: true, ...paramsOptions }) }),
+            // Save draft always drafts: the task may have been set waiting
+            // (run elsewhere) since this form opened as a draft.
+            api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, allowAttenuation: true, ...(draftMode ? { keepArmed: false } : {}), ...paramsOptions }) }),
             api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) }),
           ]);
         }
@@ -10299,7 +10301,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       // EXISTING draft used to say "Task created" — nothing was created, so the
       // user could not tell whether they had just made a duplicate.
       toast(editInPlace
-        ? (draftMode ? 'Moved to drafts' : 'Saved')
+        ? (draftMode ? 'Returned to draft' : 'Saved')
         : draftMode ? (st.body.avatar ? 'Saved as Avatār' : 'Draft saved') : 'Task started');
       refreshTasks();
     } catch (e) {
@@ -14562,7 +14564,7 @@ function portableForkCommandFor(session, cwd) {
     'mkdir -p "$HOME/.codex/sessions/tavya"',
     `cp -n "${source}" "$HOME/.codex/sessions/tavya/${filename}"`,
     `cd ${shellQuote(cwd)}`,
-    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.166.0"} fork ${shellQuote(sessionId)}`,
+    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.167.0"} fork ${shellQuote(sessionId)}`,
   ].join('\n');
   if (session.provider === 'claude') return [
     `tavya_cwd="$(cd ${shellQuote(cwd)} && pwd -P)"`,
@@ -15980,6 +15982,8 @@ function hasOpenPullRequest(v) {
 }
 
 function taskActionLabel(v, action) {
+  // Keep Cancel in older task views that still declare the post-landing label as Finish.
+  if (action.name === 'finish') return 'Cancel';
   if (action.name === 'openPr' && v?.stage === 'escalated') return action.label || 'Send to review';
   if (action.name === 'openPr')
     return hasOpenPullRequest(v) ? 'Back to review' : 'Send to review';
@@ -15998,6 +16002,7 @@ function taskActionTip(v, action) {
   if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.reason !== 'merge') return 'Let tavya merge this on GitHub as you.';
   if (action.name === 'openPr') return 'Send the agent’s work so far to Review now.';
   if (action.name === 'cancel') return 'Stop this task. Nothing more is added to the project.';
+  if (action.name === 'finish') return 'Stop this task. Approved pull requests may still land.';
   if (action.name === 'retry' && v?.waitingFor?.kind === 'account') return 'Check now whether an AI login can be used again.';
   // Why it failed, on the button itself: the error is at the end of the conversation.
   if (action.name === 'retry' && v?.error) return plainTaskError(v.error).summary.replace(/(?<=[.!?])\s+(?:Press )?Retry\b[^.]*\.$/, '') || 'Try the last step again.';
@@ -16066,8 +16071,8 @@ const ACCEPTED_ACTION_LABELS = { confirm: 'Confirming…', openPr: 'Opening PR�
  */
 function actionToast(signal, label) {
   if (signal === 'confirm' && String(label).toLowerCase() === 'done') return 'Confirmation sent';
-  const standard = { confirm: 'confirm', openPr: 'manually open & confirm pr', cancel: 'cancel', finish: 'finish', retry: 'retry', resume: 'resume', followUp: 'send' };
-  const done = { confirm: 'Confirmed', openPr: 'Opening PR and requesting confirmation', cancel: 'Cancelled', finish: 'Finishing', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
+  const standard = { confirm: 'confirm', openPr: 'manually open & confirm pr', cancel: 'cancel', finish: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
+  const done = { confirm: 'Confirmed', openPr: 'Opening PR and requesting confirmation', cancel: 'Cancelled', finish: 'Cancelling', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
   const text = String(label || signal).trim();
   if (signal === 'openPr' && text.toLowerCase() === 'return to review & confirm') return 'Returning to Review';
   if (signal === 'confirm' && text.toLowerCase() === 'confirm pr') return 'Confirmed';
@@ -16080,7 +16085,7 @@ const returnToReviewConfirmation = () => `Return this pull request to Review and
 
 function confirmTaskAction(action, v = S.view) {
   if (action === 'cancel') return confirm('Cancel this task?');
-  if (action === 'finish') return confirm('Finish this task? Pull requests that have not landed are closed.');
+  if (action === 'finish') return confirm('Cancel this task? Unapproved pull requests close. Approved pull requests may still land.');
   return action !== 'openPr' || confirm(v?.stage === 'escalated'
     ? ERROR_OPEN_PR_CONFIRMATION
     : hasOpenPullRequest(v) ? returnToReviewConfirmation()

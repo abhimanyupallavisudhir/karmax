@@ -145,7 +145,7 @@ scene(...next(3.0), (L) => {
   const mark = el('img', 'mark', L); setSrc(mark, A + 'brand/icon-512.png'); mark.style.top = '300px';
   const glow = el('div', '', L); Object.assign(glow.style, { position: 'absolute', left: '50%', top: '384px', width: '700px', height: '700px', margin: '-350px', borderRadius: '50%', background: 'radial-gradient(circle, rgba(240,191,85,.28), transparent 65%)' });
   const name = el('div', 'wordmark', L, 'tavya'); name.style.top = '498px';
-  const tag = el('div', 'tagline', L, 'Just do things.'); tag.style.top = '660px';
+  const tag = el('div', 'tagline', L, 'The agentic to-do list that finishes itself.'); tag.style.top = '660px';
   return (lt) => {
     const q = ramp(lt, 0.1, 1.1, ease.outQuint);
     mark.style.transform = `scale(${0.55 + 0.45 * q}) rotate(${(1 - q) * -12}deg)`; mark.style.opacity = q;
@@ -155,21 +155,7 @@ scene(...next(3.0), (L) => {
   };
 }, { fadeIn: 0.01 });
 
-// 1 · The thesis, in two lines.
-scene(...next(3.7), (L) => {
-  const a = el('div', 'big', L, 'VS Code was a fancy text editor.');
-  const b = el('div', 'big', L, '<span style="color:var(--text)">tavya</span> is a fancy <span class="gold">to-do list.</span>');
-  return (lt) => {
-    const qa = ramp(lt, 0.05, 0.7, ease.outQuint);
-    const up = ramp(lt, 1.45, 2.0, ease.inOut);
-    a.style.top = `${430 - up * 110}px`; a.style.opacity = qa * (1 - up * 0.62); a.style.transform = `translateY(${(1 - qa) * 30}px) scale(${1 - up * 0.12})`;
-    a.style.filter = `blur(${(1 - qa) * 8}px)`;
-    const qb = ramp(lt, 1.6, 2.3, ease.outQuint);
-    b.style.top = '470px'; b.style.opacity = qb; b.style.transform = `translateY(${(1 - qb) * 40}px)`; b.style.filter = `blur(${(1 - qb) * 8}px)`;
-  };
-});
-
-// 2 · One list: the organization's work across projects.
+// 1 · One list: the organization's work across projects.
 scene(...next(5.0), (L, dur) => {
   const h = headline(L, 'Every project. *One list.*', 'A SaaS, research papers, a PhD thesis — each task handed to an agent.');
   const w = browserWindow(L, { screens: ['home'] }); w.url(host('/personal'));
@@ -182,7 +168,7 @@ scene(...next(5.0), (L, dur) => {
   };
 });
 
-// 3 · Say what needs doing: the real prompt, typed.
+// 2 · Say what needs doing: the real prompt, typed.
 const PROMPT_FRAMES = 47;
 scene(...next(6.4), (L, dur) => {
   const h = headline(L, 'Say what needs doing.', 'In plain words. Pick the agent and model, or keep your defaults.');
@@ -201,7 +187,7 @@ scene(...next(6.4), (L, dur) => {
   };
 });
 
-// 4 · The agent works, on its own computer — the real run, replayed.
+// 3 · The agent works, on its own computer — the real run, replayed.
 const WORK = Array.from({ length: 11 }, (_, i) => `work-${String(i).padStart(2, '0')}`);
 scene(...next(5.6), (L, dur) => {
   const h = headline(L, 'Agents work on *their own computers.*', 'Your repos, a terminal, a browser — in parallel, while you do something else.');
@@ -218,7 +204,7 @@ scene(...next(5.6), (L, dur) => {
   };
 });
 
-// 5 · Big jobs fan out into sub-tasks.
+// 4 · Big jobs fan out into sub-tasks.
 scene(...next(4.2), (L, dur) => {
   const h = headline(L, 'Big jobs *fan out.*', 'One codebase review became 25 sub-tasks, each with its own agent.');
   const w = browserWindow(L, { screens: ['subtasks'] }); w.url(host('/personal/tavya/tasks/367'));
@@ -230,7 +216,7 @@ scene(...next(4.2), (L, dur) => {
   };
 });
 
-// 6 · Review the result: open what the agent attached, then Confirm.
+// 5 · Review the result: open what the agent attached, then Confirm.
 scene(...next(7.4), (L, dur) => {
   const h = headline(L, 'Review the *result,* not the process.', 'Agents attach screenshots, reports and commands to check. You approve; it lands.');
   const w = browserWindow(L, { screens: ['review', 'review-viewer', 'review-done'] }); w.url(host('/personal/personal-website/tasks/5'));
@@ -245,7 +231,7 @@ scene(...next(7.4), (L, dur) => {
   };
 });
 
-// 7 · Not just code: what agents made in other projects.
+// 6 · Not just code: what agents made in other projects.
 scene(...next(5.0), (L, dur) => {
   const h = headline(L, 'Not just code.', 'Experiments, figures, papers, websites — from the same list.');
   const w = browserWindow(L, { screens: ['made-legibench', 'made-lvpm'] });
@@ -270,7 +256,7 @@ scene(...next(5.0), (L, dur) => {
   };
 });
 
-// 8 · Accounts, keys and a card.
+// 7 · Accounts, keys and a card.
 scene(...next(4.6), (L, dur) => {
   const h = headline(L, 'Give agents *accounts, keys and a card.*', 'They sign up, sign in and pay — only with what you allow.');
   const w = browserWindow(L, { screens: ['vault'] }); w.url(host('/personal/settings#settings-payments'));
@@ -283,12 +269,17 @@ scene(...next(4.6), (L, dur) => {
   };
 });
 
-// 9 · Work that starts itself.
+// 8 · Work that starts itself.
 scene(...next(5.2), (L, dur) => {
-  const h = headline(L, 'Work that *starts itself.*', 'Schedules, webhooks, GitHub and release events. tavya upgrades its own agents.');
+  const h = headline(L, 'Work that *starts itself.*', null);
+  // Under the headline, three small boxes instead of a subtitle (owner's change, 2026-11-06).
+  const boxes = el('div', 'boxes', L);
+  const box = ['Agents can start, manage and approve tasks', 'Tasks can be triggered by webhooks and events', 'Tasks can run on schedules, or after other tasks']
+    .map((t) => el('span', 'box', boxes, t));
   const w = browserWindow(L, { screens: ['auto-repeatable', 'auto-upgrade'] });
   return (lt) => {
     h(lt); enter(w, lt, dur);
+    box.forEach((b, k) => { const q = ramp(lt, 0.35 + k * 0.12, 0.9 + k * 0.12, ease.outQuint); b.style.opacity = q; b.style.transform = `translateY(${(1 - q) * 12}px)`; });
     const b = ramp(lt, 2.4, 2.65);
     w.show({ 'auto-repeatable': 1 - b, 'auto-upgrade': b });
     w.url(host(lt < 2.5 ? '/personal/tavya?q=is:series' : '/personal/tavya/tasks/832'));
@@ -297,7 +288,7 @@ scene(...next(5.2), (L, dur) => {
   };
 });
 
-// 10 · Any model, your subscription.
+// 9 · Any model, your subscription.
 scene(...next(4.6), (L, dur) => {
   const h = headline(L, 'Any model. *Your subscription.*', 'Claude, Codex or OpenCode — on your Claude or ChatGPT plan, or an API key.');
   const w = browserWindow(L, { screens: ['models', 'models-compare'] }); w.url(host('/personal/personal-website/tasks/new'));
@@ -310,7 +301,7 @@ scene(...next(4.6), (L, dur) => {
   };
 });
 
-// 11 · Everywhere else.
+// 10 · Everywhere else.
 scene(...next(4.0), (L) => {
   const h = headline(L, 'In your pocket, too.', null);
   const phones = ['mobile-home', 'mobile-task'].map((n) => { const p = el('div', 'phone', L); setSrc(el('img', '', p), `${A}${n}.png`); return p; });
@@ -329,7 +320,7 @@ scene(...next(4.0), (L) => {
   };
 });
 
-// 12 · End card.
+// 11 · End card.
 scene(...next(4.4), (L) => {
   L.id = 'end';
   const mark = el('img', 'mark', L); setSrc(mark, A + 'brand/icon-512.png'); mark.style.top = '250px';
@@ -366,4 +357,4 @@ window.DURATION = DURATION;
 window.FPS = FPS;
 window.SCENES = scenes.map((s) => [s.start, s.end]);
 // Cursor clicks (scene, offset) — the score puts a tick on each.
-window.CLICKS = [[3, 4.1], [3, 5.75], [6, 1.9], [6, 4.05], [6, 5.6]].map(([i, d]) => scenes[i].start + d);
+window.CLICKS = [[2, 4.1], [2, 5.75], [5, 1.9], [5, 4.05], [5, 5.6]].map(([i, d]) => scenes[i].start + d);
