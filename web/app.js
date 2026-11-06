@@ -4556,7 +4556,7 @@ function toolsDidNotStart(text) {
 // an agent account, a computer, compute credit, GitHub.
 // Storage refused over the organization's quota, however it was said.
 function storageFull(text) { return /storage quota exceeded|organization's storage is full/i.test(String(text || '')); }
-function setupFixes(text) {
+function setupFixes(text, projectId) {
   const raw = String(text || '');
   const settings = globalRoute('organization');
   const plan = `${settings}#settings-plan`, computers = `${settings}#settings-computers`;
@@ -4570,14 +4570,17 @@ function setupFixes(text) {
   if (storageFull(raw)) return [{ label: 'Add storage', href: plan }];
   if (/No usable \S+ credential|has no usable .* credential|^No \S+ credential\b|Every allowed credential needs attention/i.test(raw))
     return [{ label: 'Manage accounts', href: `${settings}#settings-agents` }];
+  // Switched on for the project (a lower scope wins), whichever scope switched it off.
+  if (/^Your \S+ account is switched off\b/.test(raw) && projectId)
+    return [{ label: 'Turn on', href: `${projectRoute(projectId, 'settings')}#project-agents` }];
   if (/GitHub PR identity is not connected|Connect GitHub on your profile|reconnect GitHub on your profile/i.test(raw))
     return [{ label: 'Connect GitHub', href: '/profile' }];
   if (/connect GitHub in organization settings/i.test(raw)) return [{ label: 'Connect GitHub', href: `${settings}#settings-code` }];
   return [];
 }
 function setupFix(text) { return setupFixes(text)[0] ?? null; }
-function setupFixHtml(text) {
-  return setupFixes(text).map((fix, index) => ` <a class="btn sm setup-fix${index ? ' ghost' : ''}" data-spa href="${esc(fix.href)}">${esc(fix.label)}</a>`).join('');
+function setupFixHtml(text, projectId) {
+  return setupFixes(text, projectId).map((fix, index) => ` <a class="btn sm setup-fix${index ? ' ghost' : ''}" data-spa href="${esc(fix.href)}">${esc(fix.label)}</a>`).join('');
 }
 // An error shown in place of what failed to load: the plain sentence, the
 // exact text on hover (for whoever reports it).
@@ -9380,15 +9383,27 @@ function taskFormLoadingPage(project, draft, title) {
 // What a task in this project still lacks before it can start — an account for
 // each of its agents, a computer — as links to where each is set up. Empty when
 // nothing is missing, or when the answer is unknown (it never blocks the form).
-function readinessGaps(readiness) {
+function readinessGaps(readiness, projectId) {
   if (!readiness) return [];
   const settings = globalRoute('organization');
   const gaps = [];
-  const harnesses = [...new Set((readiness.agents || []).filter((a) => !a.ready).map((a) => a.provider))];
-  for (const harness of harnesses) {
-    const name = ACCOUNT_PROVIDER_LABELS[harness] || harness;
-    gaps.push({ label: `Add a ${name} account`, href: `${settings}#settings-agents`,
-      tip: `No ${name} login or API key is switched on for this project.` });
+  // What each unready agent lacks: an account of its harness (Claude, Codex)
+  // or of its model's vendor (OpenCode's `openrouter/…` runs on an OpenRouter
+  // key), or only switching on one it already has.
+  const needs = new Map();
+  for (const agent of (readiness.agents || []).filter((a) => !a.ready)) {
+    const need = agent.need || { provider: agent.provider };
+    needs.set(`${need.provider}:${need.off || ''}`, need);
+  }
+  for (const need of needs.values()) {
+    const name = ACCOUNT_PROVIDER_LABELS[need.provider] || need.provider;
+    gaps.push(need.off === 'project'
+      ? { label: `Turn on ${name}`, href: `${projectRoute(projectId, 'settings')}#project-agents`,
+        tip: `Your ${name} account is switched off for this project.` }
+      : need.off === 'organization'
+        ? { label: `Turn on ${name}`, href: `${settings}#settings-agents`, tip: `Your ${name} account is switched off.` }
+        : { label: `Add ${/^[aeiou]/i.test(name) ? 'an' : 'a'} ${name} account`, href: `${settings}#settings-agents`,
+          tip: `No ${name} login or API key yet.` });
   }
   const compute = readiness.compute;
   const plan = `${settings}#settings-plan`, computers = `${settings}#settings-computers`;
@@ -9431,7 +9446,7 @@ function wireTaskReadiness(page, projectId) {
     asked = query;
     const readiness = await api(`/api/projects/${encodeURIComponent(projectId)}/readiness?${query}`).catch(() => null);
     if (asked !== query || !el.isConnected) return;
-    const html = readinessNoticeHtml(readinessGaps(readiness));
+    const html = readinessNoticeHtml(readinessGaps(readiness, projectId));
     el.innerHTML = html;
     el.hidden = !html;
   };
@@ -9827,7 +9842,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // A store task's title rides the first create too: `#{{issue.number}} …` names each run of its series.
   const orgSeed = () => ({ ...(store ? { title: store.task.title } : {}), ...(orgRec.id || templateEdit ? {} : { ...(orgRec.params.priority ? { priority: orgRec.params.priority } : {}),
     ...(orgRec.tags.length ? { tags: orgRec.tags.map(tagPathStr) } : {}) }) });
-  const hasPolicy = () => !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length || taskCredPolicy.explainerOnly?.length);
+  const hasPolicy = () => !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length);
   // Prompt attachments ride inside `params` (references only), so they flow
   // through auto-save, draft, and queue the same way the prompt text does.
   // An Avatar the user has acknowledged (confirmAvatar) or that already was one.
@@ -14411,7 +14426,8 @@ function presenceDetail(v) {
   // A retry waits out an error: say it the way the task's error box does.
   const detail = raw && w.kind === 'retry' ? plainTaskError(raw).summary
     // The coordinator names a harness by its id ("No claude credential"); say it the way Settings does.
-    : raw.replace(/^No (\w+) credential\b/, (_, id) => `No ${ACCOUNT_PROVIDER_LABELS[id] || id} account`);
+    : raw.replace(/^No (\w+) credential\b/, (_, id) => `No ${ACCOUNT_PROVIDER_LABELS[id] || id} account`)
+      .replace(/^Your (\w+) account is switched off\b/, (_, id) => `Your ${ACCOUNT_PROVIDER_LABELS[id] || id} account is switched off`);
   return [detail, w.earliestResetAt ? `Earliest ${fmtReset(w.earliestResetAt)}` : ''].filter(Boolean).join(' · ');
 }
 
@@ -14976,7 +14992,7 @@ function accountWaitReason(w) {
   if (detail.startsWith('Held')) return 'held';
   if (w?.earliestResetAt || /usage limit|quota/i.test(detail)) return 'quota';
   if (/free slot|running all it may/.test(detail)) return 'slot';
-  if (/^No \w+ credential|needs attention|^Couldn't read/.test(detail)) return 'login';
+  if (/^No \w+ credential|needs attention|^Couldn't read| is switched off\b/.test(detail)) return 'login';
   return '';
 }
 
@@ -15003,7 +15019,9 @@ function waitingText(w) {
       case 'quota': return `Waiting for ${who ? `${who} ` : ''}quota${w.earliestResetAt > Date.now() ? ` until ${waitDeadline(w.earliestResetAt)}` : ''}`;
       case 'slot': return `Waiting for a free ${who ? `${who} ` : ''}login`;
       case 'planning': return who ? `Queued for ${who}` : 'Queued';
-      case 'login': return (w.detail || '').startsWith("Couldn't read") ? 'Credential policy unreadable' : `Needs a ${who ? `${who} ` : ''}login`;
+      case 'login': return (w.detail || '').startsWith("Couldn't read") ? 'Credential policy unreadable'
+        : / is switched off\b/.test(w.detail || '') ? `${who || 'Its account'} is switched off`
+        : who ? `Needs ${/^[aeiou]/i.test(who) ? 'an' : 'a'} ${who} account` : 'Needs a model login';
       default: return who ? `Waiting for ${who}` : 'Waiting for a model login';
     }
   }
@@ -15040,7 +15058,7 @@ function conversationWaitNotice(v) {
     return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))}</div>`;
   const detail = presenceDetail(v);
   const raw = typeof w?.detail === 'string' ? w.detail.trim() : '';
-  return detail ? `<div class="msg system wait-notice" role="status"${raw && raw !== detail ? ` title="${esc(raw)}"` : ''}>${esc(waitingText(v.waitingFor))} · ${esc(detail)}${setupFixHtml(w?.detail)}</div>` : '';
+  return detail ? `<div class="msg system wait-notice" role="status"${raw && raw !== detail ? ` title="${esc(raw)}"` : ''}>${esc(waitingText(v.waitingFor))} · ${esc(detail)}${setupFixHtml(w?.detail, v.projectId)}</div>` : '';
 }
 
 // A targeted human hold carries the actual question a person must answer. Keep
@@ -15194,15 +15212,14 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     const base = data[opts.projectId ? 'project' : 'global'] || { enabled: [] };
     const baseEnabled = new Set(base.enabled || []);
     const pol = opts.policy || {};
-    const onSet = new Set(pol.on || []), offSet = new Set(pol.off || []), explainerSet = new Set(pol.explainerOnly || []);
-    const modeOf = (k) => onSet.has(k) ? 'on' : offSet.has(k) ? 'off' : explainerSet.has(k) ? (explanationsEnabled() ? 'explainer-only' : 'off')
-      : base.modes?.[k] || (baseEnabled.has(k) ? 'on' : 'off');
+    const onSet = new Set(pol.on || []), offSet = new Set(pol.off || []);
+    const isOn = (k) => onSet.has(k) || (!offSet.has(k) && baseEnabled.has(k));
     const seen = new Set(), eff = [];
     for (const k of [...(pol.order || []), ...(base.enabled || []), ...(data.credentials || []).map((c) => c.key)]) {
-      if (!seen.has(k) && modeOf(k) === 'on' && !eff.includes(k)) eff.push(k);
+      if (!seen.has(k) && isOn(k) && !eff.includes(k)) eff.push(k);
       seen.add(k);
     }
-    sd = { own: pol, enabled: eff, modes: Object.fromEntries((data.credentials || []).map((c) => [c.key, modeOf(c.key)])) };
+    sd = { own: pol, enabled: eff };
   } else {
     sd = data[scope] || { own: {}, enabled: [] };
   }
@@ -15228,12 +15245,7 @@ async function renderCredentialEditor(el, scope, opts = {}) {
   el.innerHTML = `<div class="cred-list${live ? ' acct-list' : ''}">${ordered
     .map((key) => {
       const c = byKey[key];
-      const isOn = enabled.has(key);
-      // Explanation-only is an account/settings concern. A task chooses only
-      // whether its coding agents may use a credential, so both inherited Off
-      // and inherited Explainer-only render as the same binary Off state there.
-      const mode = scope === 'task' ? (isOn ? 'on' : 'off')
-        : c.kind === 'key' ? (sd.modes?.[key] || (isOn ? 'on' : 'off')) : (isOn ? 'on' : 'off');
+      const mode = enabled.has(key) ? 'on' : 'off';
       const loginActions = canManage && c.kind === 'login';
       const keyActions = canManage && c.kind === 'key' && c.key.startsWith('key:handle:') && c.account;
       // Compact inline chip: the kind is obvious from the label (a login is
@@ -15263,11 +15275,7 @@ async function renderCredentialEditor(el, scope, opts = {}) {
         const summary = accountStatusSummary(statusByKey[key]);
         const open = openAccounts.has(key);
         const toggle = c.signedOut ? '<span></span>'
-          : c.kind === 'key' && explanationsEnabled()
-            ? `<select class="cred-mode ${esc(mode)}" aria-label="API key availability" title="Choose where this API key may be used">
-                <option value="on"${mode === 'on' ? ' selected' : ''}>On</option><option value="off"${mode === 'off' ? ' selected' : ''}>Off</option>
-                <option value="explainer-only"${mode === 'explainer-only' ? ' selected' : ''}>Explainer-only</option></select>`
-            : `<input type="checkbox" class="toggle cred-toggle" aria-label="Use ${esc(label)}"${mode === 'on' ? ' checked' : ''} />`;
+          : `<input type="checkbox" class="toggle cred-toggle" aria-label="Use ${esc(label)}"${mode === 'on' ? ' checked' : ''} />`;
         const state = summary
           ? `<span class="acct-state ${summary[0]}"${summary[2] ? ` title="${esc(summary[2])}"` : ''}><span class="status-dot ${summary[0]}" aria-hidden="true"></span>${esc(summary[1])}</span>`
           : '<span></span>';
@@ -15281,15 +15289,8 @@ async function renderCredentialEditor(el, scope, opts = {}) {
           ${accountDetailHtml({ credential: c, account: statusByKey[key], snap: usage[key], pollable: pollable.has(key), manage: canManage })}
         </div>`;
       }
-      // The same switch as the organization's list; an API key's third state
-      // (explainer-only) needs a menu, so only then is it one.
+      // The same switch as the organization's list.
       const stateControl = c.signedOut ? ''
-        : c.kind === 'key' && scope !== 'task' && explanationsEnabled()
-        ? `<select class="cred-mode ${esc(mode)}" aria-label="API key availability" title="Choose where this API key may be used">
-            <option value="on"${mode === 'on' ? ' selected' : ''}>On</option>
-            <option value="off"${mode === 'off' ? ' selected' : ''}>Off</option>
-            <option value="explainer-only"${mode === 'explainer-only' ? ' selected' : ''}>Explainer-only</option>
-          </select>`
         : `<input type="checkbox" class="toggle cred-toggle ${mode}" aria-label="Use ${esc(label)}"${mode === 'on' ? ' checked' : ''} />`;
       return `<div class="cred-row ${esc(c.signedOut ? 'signed-out' : mode)}" draggable="true" data-key="${esc(key)}" title="${esc(c.provider)} ${esc(c.kind)} · drag to set precedence">
         <span class="cred-drag">⠿</span>
@@ -15321,18 +15322,9 @@ async function renderCredentialEditor(el, scope, opts = {}) {
   el.querySelectorAll('.cred-row').forEach((row) => {
     const key = row.dataset.key;
     row.querySelector('.cred-toggle')?.addEventListener('click', () => {
-      const on = new Set(own.on || []), off = new Set(own.off || []), explainerOnly = new Set(own.explainerOnly || []);
-      explainerOnly.delete(key);
+      const on = new Set(own.on || []), off = new Set(own.off || []);
       if (!enabled.has(key)) { on.add(key); off.delete(key); } else { off.add(key); on.delete(key); }
-      save({ ...own, on: [...on], off: [...off], explainerOnly: [...explainerOnly] });
-    });
-    row.querySelector('.cred-mode')?.addEventListener('change', (event) => {
-      const on = new Set(own.on || []), off = new Set(own.off || []), explainerOnly = new Set(own.explainerOnly || []);
-      on.delete(key); off.delete(key); explainerOnly.delete(key);
-      if (event.target.value === 'on') on.add(key);
-      else if (event.target.value === 'off') off.add(key);
-      else explainerOnly.add(key);
-      save({ ...own, on: [...on], off: [...off], explainerOnly: [...explainerOnly] });
+      save({ ...own, on: [...on], off: [...off] });
     });
     const login = loginByKey[key];
     const credential = byKey[key];

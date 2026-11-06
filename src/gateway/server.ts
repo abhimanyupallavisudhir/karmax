@@ -118,7 +118,7 @@ import { managedRepoPath } from '../world/worktree.js';
 import { paths } from '../config/paths.js';
 import { ensureProjectWikiRepositoryAsync, setProjectWikiRemote } from '../wiki/repository.js';
 import { worldRepos, worldWorkingDirectory, worldWorkingRelativePath, type WorldHandle } from '../world/types.js';
-import { enumerateCredentials, resolveCredentials, resolveExplanationCredentials } from '../platform/credentials.js';
+import { enumerateCredentials, normalizePolicy, resolveCredentials } from '../platform/credentials.js';
 import { errorStatus } from './error-status.js';
 import { projectReadiness, usableAgentCredentials, type ReadinessDeps } from '../platform/readiness.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
@@ -1242,7 +1242,7 @@ export class Gateway {
       broker: this.deps.broker,
       organizationId,
     }));
-    const ordered = resolveExplanationCredentials(credentials, (await readPolicyLayers(
+    const ordered = resolveCredentials(credentials, (await readPolicyLayers(
       async (key) => (await this.deps.store.kvGet(key)), { organizationId, projectId, taskId },
     ))).filter((credential) => credential.kind === 'key');
     const credential = ordered.find((candidate) => aliases.includes(candidate.provider));
@@ -8686,20 +8686,9 @@ export class Gateway {
           ?? (scopedOrganizationId === 'org_personal' ? parsePolicy((await store.kvGet(credPolicyKey.global()))) : undefined);
         const pr = projectId ? parsePolicy((await store.kvGet(credPolicyKey.project(projectId)))) : undefined;
         const tk = taskId ? parsePolicy((await store.kvGet(credPolicyKey.task(taskId)))) : undefined;
-        const resolved = (layers: { global?: unknown; project?: unknown; task?: unknown }) => {
-          const enabled = resolveCredentials(creds, layers as any).map((c) => c.key);
-          const explanationEnabled = new Set(resolveExplanationCredentials(creds, layers as any)
-            .filter((credential) => credential.kind === 'key')
-            .map((credential) => credential.key));
-          return {
-            enabled,
-            modes: Object.fromEntries(creds.map((credential) => [credential.key,
-              enabled.includes(credential.key) ? 'on'
-                : EXPLANATIONS_ENABLED && credential.kind === 'key' && explanationEnabled.has(credential.key) ? 'explainer-only'
-                  : 'off',
-            ])),
-          };
-        };
+        const resolved = (layers: Parameters<typeof resolveCredentials>[1]) => ({
+          enabled: resolveCredentials(creds, layers).map((c) => c.key),
+        });
         const global = resolved({ global: g });
         const project = projectId ? resolved({ global: g, project: pr }) : undefined;
         const task = taskId ? resolved({ global: g, project: pr, task: tk }) : undefined;
@@ -8747,7 +8736,7 @@ export class Gateway {
         } else {
           return this.json(res, 400, { error: 'scope must be organization, global, project, or task' });
         }
-        (await store.kvSet(key, JSON.stringify(b.policy ?? {})));
+        (await store.kvSet(key, JSON.stringify(normalizePolicy(b.policy))));
         // Parked turns resolved their allow-lists under the old policy.
         if (this.deps.client) {
           const { makeCoordinatorActivities } = await import('../activities/coordinator.js');

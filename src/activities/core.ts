@@ -2724,7 +2724,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         )
       );
       if (profile?.provider === 'opencode') {
-        missingNamespace = recognizedOpenCodePrefix ? openCodePrefix! : 'opencode-compatible';
+        missingNamespace = recognizedOpenCodePrefix ? openCodePrefix! : 'opencode';
       }
       if (profile && profile.provider !== 'opencode' && enabled.length) missingNamespace = credentialProvider(profile);
       const ordered = enabled.filter((credential) => profile
@@ -2762,10 +2762,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         await store.getOrganizationUsagePolicy(organizationId), profile)) return [];
       // An empty compatible set must not fall through to an ambient/profile
       // credential and bypass an explicit disable. A non-existent allow-list
-      // entry makes the coordinator deny the turn with a credential action.
+      // entry makes the coordinator deny the turn with a credential action;
+      // `:off` says one that would serve exists but is switched off here, so
+      // the fix is switching it on rather than adding another.
+      const switchedOff = !!profile && all.some((credential) => credentialServesProfile(profile, credential, all));
       return keys.length || profile?.provider === 'mock'
         ? keys
-        : [`missing:${organizationId}:${missingNamespace}`];
+        : [`missing:${organizationId}:${missingNamespace}${switchedOff ? ':off' : ''}`];
     },
 
     async runAgentTurn({ messagesBase: base, ...input }: RunAgentTurnArgs) {

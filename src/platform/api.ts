@@ -3895,6 +3895,8 @@ export class KarmaxApi {
       // "Held until 14:20" must not survive into a wait for quota, nor its time.
       const { detail: _detail, earliestResetAt: _reset, until: _until, reason: _reason, ...rest } = view.waitingFor;
       return { ...view, waitingFor: { ...rest,
+        // Whose account is missing: an OpenCode model's vendor, not the harness.
+        ...(lease.need ? { provider: lease.need.provider } : {}),
         ...(lease.reason ? { reason: lease.reason } : {}),
         ...(lease.detail ? { detail: lease.detail } : {}),
         ...(lease.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),

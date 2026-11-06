@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
-import { EXPLANATIONS_ENABLED } from '../src/config/features.js';
 
 describe('profile + account management settings backend', () => {
   let h: Harness;
@@ -52,10 +51,8 @@ describe('profile + account management settings backend', () => {
     });
     const oldKey = 'key:handle:openrouter:explain-old';
     const nextKey = 'key:handle:openrouter:explain-new';
-    await fetch(`${base}/api/credentials/policy`, {
-      method: 'POST', headers: auth(),
-      body: JSON.stringify({ scope: 'global', policy: { order: [oldKey], explainerOnly: [oldKey] } }),
-    });
+    // A policy saved before explanation models were retired: its explainer-only key is off.
+    await h.store.kvSet('credpolicy:organization:org_personal', JSON.stringify({ order: [oldKey], explainerOnly: [oldKey] }));
 
     const editedResponse = await fetch(`${base}/api/accounts/keys/openrouter/explain-old`, {
       method: 'PATCH', headers: auth(),
@@ -68,21 +65,20 @@ describe('profile + account management settings backend', () => {
     expect(edited.handles).not.toContain('openrouter:explain-old');
     expect(await h.broker.resolve('openrouter:explain-new', { caps: ['use-credential:*'] })).toBe('new-secret');
     expect(JSON.parse((await h.store.kvGet('credpolicy:organization:org_personal'))!)).toMatchObject({
-      order: [nextKey], explainerOnly: [nextKey],
+      order: [nextKey], off: [nextKey],
     });
     const credentials = await fetch(`${base}/api/credentials`, { headers: auth() }).then(J);
     expect(credentials.credentials.find((credential: any) => credential.key === nextKey)).toMatchObject({
       provider: 'openrouter', account: 'explain-new', kind: 'key',
     });
-    // The policy keeps the key's mode; while explanations are off it reads as Off.
-    expect(credentials.global.modes[nextKey]).toBe(EXPLANATIONS_ENABLED ? 'explainer-only' : 'off');
+    expect(credentials.global.own).toEqual({ order: [nextKey], off: [nextKey] });
     expect(credentials.global.enabled).not.toContain(nextKey);
 
     const deleted = await fetch(`${base}/api/accounts/keys/openrouter/explain-new`, { method: 'DELETE', headers: auth() });
     expect(deleted.status).toBe(200);
     expect(await h.broker.hasHandle('openrouter:explain-new')).toBe(false);
     expect(JSON.parse((await h.store.kvGet('credpolicy:organization:org_personal'))!)).toMatchObject({
-      order: [], explainerOnly: [],
+      order: [], off: [],
     });
   });
 

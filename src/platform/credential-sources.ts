@@ -4,7 +4,7 @@ import { apiKeyEnv, hasAcpAmbientLogin, LOGIN_PROVIDERS, MODEL_PROVIDERS } from 
 import { openCodeAuthProvider, type ConfigHomeManager } from '../autonomy/config-homes.js';
 import { deploymentConfig } from '../config/deployment.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
-import type { CredentialSources, CredPolicy } from './credentials.js';
+import { normalizePolicy, type CredentialSources, type CredPolicy } from './credentials.js';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -99,7 +99,7 @@ export async function concurrencyFor(get: (k: string) => string | undefined | Pr
 export function parsePolicy(raw: string | undefined): CredPolicy | undefined {
   if (!raw) return undefined;
   try {
-    return JSON.parse(raw) as CredPolicy;
+    return normalizePolicy(JSON.parse(raw));
   } catch {
     return undefined;
   }
@@ -121,7 +121,6 @@ export function remapCredentialPolicy(
     ...(policy.order ? { order: remap(policy.order) } : {}),
     ...(policy.on ? { on: remap(policy.on) } : {}),
     ...(policy.off ? { off: remap(policy.off) } : {}),
-    ...(policy.explainerOnly ? { explainerOnly: remap(policy.explainerOnly) } : {}),
   };
 }
 

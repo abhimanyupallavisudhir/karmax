@@ -12,7 +12,7 @@ import type { AgentProfile } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ConfigHomeManager } from '../autonomy/config-homes.js';
-import { credentialServesProfile, mockAgentEnabled } from '../agent/provider-registry.js';
+import { credentialProvider, credentialServesProfile, mockAgentEnabled } from '../agent/provider-registry.js';
 import { managedModelRailAvailable } from '../agent/managed-models.js';
 import { enumerateCredentials, resolveCredentials, type Credential } from './credentials.js';
 import { gatherCredentialSources, readPolicyLayers } from './credential-sources.js';
@@ -27,10 +27,19 @@ export interface ReadinessDeps {
   providerConnections?: RouterConnections;
 }
 
+/** What an unready agent lacks: a login or key of `provider` — the harness for
+ * Claude and Codex, the model's vendor for OpenCode (`openrouter/…` runs on an
+ * OpenRouter key) — or, with `off`, only that one it could use is switched off
+ * at that scope. */
+export interface AgentNeed {
+  provider: string;
+  off?: 'project' | 'organization';
+}
+
 export interface Readiness {
   /** One entry per asked-about agent: whether some enabled login or key (or a
    * model tavya pays for) can run it. */
-  agents: Array<{ provider: string; model?: string; ready: boolean }>;
+  agents: Array<{ provider: string; model?: string; ready: boolean; need?: AgentNeed }>;
   /** Any enabled login or key at all. */
   agentLogin: boolean;
   compute: {
@@ -53,27 +62,46 @@ export interface Readiness {
   storage?: { full: boolean; usedBytes: number; quotaBytes: number };
 }
 
-/** The organization's enabled agent credentials, in policy order: the
- * credentials the account coordinator would lease from. A hosted cell never
- * offers its own environment's keys to tenants. */
-export async function usableAgentCredentials(deps: ReadinessDeps,
-  scope: { organizationId: string; projectId?: string }): Promise<Credential[]> {
+/** Every agent credential of the organization, enabled or not, and the policy
+ * layers that decide which are on here. A hosted cell never offers its own
+ * environment's keys to tenants. */
+async function agentCredentials(deps: ReadinessDeps, scope: { organizationId: string; projectId?: string }) {
   const all = enumerateCredentials(await gatherCredentialSources({
     configHomes: deps.configHomes, broker: deps.broker, organizationId: scope.organizationId,
   })).filter((credential) => !deps.hosted || credential.kind === 'login' || Boolean(credential.apiKeyHandle));
   const layers = await readPolicyLayers(async (key) => (await deps.store.kvGet(key)), scope);
-  return resolveCredentials(all, { global: layers.global, project: layers.project });
+  return { all, layers: { global: layers.global, project: layers.project } };
+}
+
+/** The organization's enabled agent credentials, in policy order: the
+ * credentials the account coordinator would lease from. */
+export async function usableAgentCredentials(deps: ReadinessDeps,
+  scope: { organizationId: string; projectId?: string }): Promise<Credential[]> {
+  const { all, layers } = await agentCredentials(deps, scope);
+  return resolveCredentials(all, layers);
 }
 
 export async function projectReadiness(deps: ReadinessDeps,
   scope: { organizationId: string; projectId?: string },
   agents: Array<Pick<AgentProfile, 'provider' | 'model'>> = []): Promise<Readiness> {
-  const credentials = await usableAgentCredentials(deps, scope);
+  const { all, layers } = await agentCredentials(deps, scope);
+  const credentials = resolveCredentials(all, layers);
+  const inOrganization = resolveCredentials(all, { global: layers.global });
   const policy = agents.length ? await deps.store.getOrganizationUsagePolicy(scope.organizationId) : undefined;
+  const serves = (agent: Pick<AgentProfile, 'provider' | 'model'>, pool: Credential[]) =>
+    pool.some((credential) => credentialServesProfile(agent, credential, all));
+  const need = (agent: Pick<AgentProfile, 'provider' | 'model'>): AgentNeed => {
+    const provider = credentialProvider(agent);
+    if (serves(agent, inOrganization)) return { provider, off: 'project' };
+    if (serves(agent, all)) return { provider, off: 'organization' };
+    return { provider };
+  };
   return {
-    agents: agents.map((agent) => ({ ...agent, ready: agent.provider === 'mock' ? mockAgentEnabled()
-      : credentials.some((credential) => credentialServesProfile(agent, credential, credentials))
-        || managedModelRailAvailable(deps.hosted, policy!, agent) })),
+    agents: agents.map((agent) => {
+      const ready = agent.provider === 'mock' ? mockAgentEnabled()
+        : serves(agent, credentials) || managedModelRailAvailable(deps.hosted, policy!, agent);
+      return { ...agent, ready, ...(ready ? {} : { need: need(agent) }) };
+    }),
     agentLogin: credentials.length > 0,
     compute: await computeReadiness(deps, scope.organizationId),
     ...(await storageReadiness(deps, scope.organizationId)),

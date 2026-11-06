@@ -106,6 +106,26 @@ describe('model-agnostic harness credential routing', () => {
     })).toEqual([`key:handle:${kimiHandle}`]);
   });
 
+  // The OpenRouter key exists but is switched off for the project (once
+  // "explainer-only"): the turn asks for it by name, marked off, and an OpenCode
+  // model of a vendor with no key at all is asked for as missing.
+  it('names the model vendor an OpenCode turn lacks, and marks a key that is only switched off', async () => {
+    const organization = await store.createOrganization({ name: 'Routing' });
+    const project = await store.createProject('Site', {}, organization.id);
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+    const handle = `openrouter:${organization.id}:work`;
+    await broker.registerHandle(handle, 'sk-or-fixture', INSTALLATION_SCOPE);
+    const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
+      profiles: new ProfileResolver(store, 'opencode'), broker, configHomes: new ConfigHomeManager(path.join(dir, 'homes')) });
+    const order = (model: string) => core.resolveCredentialOrder({ taskId: 'or-task', projectId: project.id, provider: 'opencode', role: 'do',
+      task: { projectId: project.id, agents: { do: { provider: 'opencode', model } } } as any });
+    const argon = 'openrouter/google/gemini-4-argon';
+    expect(await order(argon)).toEqual([`key:handle:${handle}`]);
+    await store.kvSet(credPolicyKey.project(project.id), JSON.stringify({ explainerOnly: [`key:handle:${handle}`] }));
+    expect(await order(argon)).toEqual([`missing:${organization.id}:openrouter:off`]);
+    expect(await order('google/gemini-4-argon')).toEqual([`missing:${organization.id}:google`]);
+  });
+
   it('passes the exact leased environment-key provider to the OpenCode turn', async () => {
     const project = (await store.createProject('Personal design'));
     const runtimeTask = (await store.createTask({ projectId: project.id, title: 'Design', workflow: 'software-dev',
@@ -196,7 +216,7 @@ describe('model-agnostic harness credential routing', () => {
       provider: 'opencode',
       role: 'do',
       task: { projectId: project.id } as any,
-    })).toEqual([`missing:${organization.id}:google`]);
+    })).toEqual([`missing:${organization.id}:google:off`]);
   });
 });
 

@@ -28,6 +28,21 @@ describe('OpenCode models for an organization\'s API keys (task #515)', () => {
     expect(await openCodeKeyModels([], { fetch, now })).toEqual([]);
   });
 
+  // OpenRouter serves ~300 models; its newest 25 were small labs' previews, and
+  // Claude Opus or Gemini through OpenRouter were not offered at all.
+  it('cuts a router\'s list per lab, so every lab\'s newest models are offered', async () => {
+    const models: Record<string, unknown> = {};
+    const add = (id: string, day: number) => { models[id] = { id, tool_call: true, release_date: `2026-10-${String(day).padStart(2, '0')}` }; };
+    for (let i = 1; i <= 12; i++) add(`stealth/preview-${i}`, 10 + i);
+    add('google/gemini-4-argon', 9);
+    add('anthropic/claude-opus-5.5', 2);
+    add('~anthropic/claude-opus-latest', 2);
+    const fetch = (async () => new Response(JSON.stringify({ openrouter: { models } }))) as typeof globalThis.fetch;
+    const ids = (await openCodeKeyModels(['openrouter'], { fetch, now: Date.UTC(2026, 10, 6), perRoutedCreator: 3 })).map((model) => model.id);
+    expect(ids).toEqual(['openrouter/stealth/preview-12', 'openrouter/stealth/preview-11', 'openrouter/stealth/preview-10',
+      'openrouter/google/gemini-4-argon', 'openrouter/anthropic/claude-opus-5.5']);
+  });
+
   it('never answers one fetcher from a catalog another fetcher cached (CI #1650)', async () => {
     const now = Date.UTC(2026, 9, 9);
     const other = { openrouter: { models: { 'x/other': { id: 'x/other', tool_call: true } } } };
