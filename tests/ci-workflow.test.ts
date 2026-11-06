@@ -56,6 +56,31 @@ describe('CI workflow', () => {
     expect(fs.readdirSync(path.join(repoRoot, 'web')).some((name) => name.endsWith('.test.cjs'))).toBe(true);
     expect(fs.existsSync(path.join(repoRoot, 'tests', 'web-regressions.test.ts'))).toBe(true);
   });
+
+  // CI #2652: the Ubuntu 26.04 image's packages.microsoft.com source answered
+  // 403, so every `apt-get update` (Playwright's install-deps included) failed.
+  it('drops the runner\'s Microsoft apt source before any step that uses apt', () => {
+    const steps: { name?: string; run?: string }[] = ci.jobs.test.steps;
+    const drop = steps.findIndex((step) => step.run?.includes('packages.microsoft.com'));
+    const apt = steps.findIndex((step) => /apt-get|install-deps|--with-deps/.test(step.run ?? ''));
+    expect(drop).toBeGreaterThanOrEqual(0);
+    expect(drop).toBeLessThan(apt);
+
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'apt-sources-'));
+    const listDir = path.join(root, 'sources.list.d');
+    fs.mkdirSync(listDir);
+    fs.writeFileSync(path.join(listDir, 'microsoft prod.list'), 'deb https://packages.microsoft.com/ubuntu/26.04/prod resolute main\n');
+    fs.writeFileSync(path.join(listDir, 'ubuntu.sources'), 'Types: deb\nURIs: http://archive.ubuntu.com/ubuntu\n');
+    fs.writeFileSync(path.join(root, 'sources.list'), 'deb http://archive.ubuntu.com/ubuntu resolute main\ndeb https://packages.microsoft.com/repos/x resolute main\n');
+    // Run as written, against a scratch /etc/apt, with sudo as a no-op wrapper.
+    const script = steps[drop].run!.replaceAll('/etc/apt', root).replaceAll('sudo ', '');
+    expect(spawnSync('bash', ['-e', '-c', script]).status).toBe(0);
+    expect(fs.readdirSync(listDir)).toEqual(['ubuntu.sources']);
+    expect(fs.readFileSync(path.join(root, 'sources.list'), 'utf8')).toBe('deb http://archive.ubuntu.com/ubuntu resolute main\n');
+    // An image without the source must pass too.
+    expect(spawnSync('bash', ['-e', '-c', script]).status).toBe(0);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
 });
 
 // CI #1709 failed only on Docker Hub's anonymous pull limit (429). Every job

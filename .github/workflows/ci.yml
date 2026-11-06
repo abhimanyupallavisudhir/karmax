@@ -113,6 +113,15 @@ jobs:
 
       - uses: ./.github/actions/install
 
+      # The Ubuntu 26.04 runner image ships a packages.microsoft.com apt source
+      # that answers 403 ("no longer signed"), failing every `apt-get update`
+      # (so Playwright's --with-deps/install-deps too). Nothing here installs
+      # from it, so drop it rather than let a third-party mirror break CI.
+      - name: Drop the runner's broken Microsoft apt source
+        run: |
+          grep -rlZ 'packages.microsoft.com' /etc/apt/sources.list.d/ 2>/dev/null | xargs -0 -r sudo rm -f --
+          sudo sed -i '/packages\.microsoft\.com/d' /etc/apt/sources.list 2>/dev/null || true
+
       - id: playwright
         run: echo "version=$(node -p "require('playwright-core/package.json').version")" >> "$GITHUB_OUTPUT"
       - id: browsers
