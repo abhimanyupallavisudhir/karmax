@@ -13,7 +13,7 @@ Your first organization comes with **$5 of free compute for 14 days**. It pays f
 In the organization's **Settings**:
 
 - **Projects**: connect GitHub, so agents can work on your repositories and open pull requests.
-- **Agents**: tasks start on tavya's included model (DeepSeek V4.1 Flash). For other models, sign in with a Claude or ChatGPT subscription or add an API key, then pick the model in **Task defaults**. Your own logins and keys are billed by their providers, not from your compute.
+- **Agents**: tasks start on tavya's included model (MiMo-V2.6-Pro). Any other model on OpenRouter also runs on your compute; the task form says when one costs more. Or sign in with a Claude or ChatGPT subscription, or add an API key: those are billed by their providers, not from your compute. Pick the model in **Task defaults** or on each task.
 - **Computers**: tasks run on tavya's computers, charged to your trial or plan, or on your own E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud account ([Cloud computers](/docs/computers)).
 
 ## 3. Create a project

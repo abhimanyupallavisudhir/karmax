@@ -21,11 +21,16 @@ import type { AgentProfile } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { ComputeCreditExhausted, computeCredit, outOfCompute } from '../world/managed-compute.js';
 
-/** DeepSeek V4.1 Flash: among the strongest cheap tool-calling models for
- * agentic coding (Terminal-Bench 4.0 ≈ 32%) at $0.05 / $0.57 / $0.018 per
- * million input / output / cached tokens on OpenRouter (2026-11-06), with no
- * long-context surcharge (Claude Haiku 5.5 costs 5× past 100k tokens). */
-export const INCLUDED_MODEL_DEFAULT = 'deepseek/deepseek-v4.1-flash';
+/** Xiaomi MiMo-V2.6-Pro: the best intelligence per dollar on tavya's own
+ * workload (2026-11-06). tavya's agents read far more than they write: 10.05 B
+ * input tokens, nearly all cached, to 21.5 M output over 360 shipped tasks in
+ * 30 days, so the cached-input price decides what a task costs, not the
+ * output-heavy cost per task Artificial Analysis charts. At $0.435 / $0.87 /
+ * $0.0036 per million input / output / cached tokens it scores 46.3 on the AA
+ * Intelligence Index (Terminal-Bench 4.0: 34.9) for about $0.76 of such a task;
+ * DeepSeek V4.1 Flash scores 39.5 for about $0.59, GPT-6.1 Sol 47.8 (medium)
+ * for about $6 (its cached input is $0.10). */
+export const INCLUDED_MODEL_DEFAULT = 'xiaomi/mimo-v2.6-pro';
 
 /** Below this much credit (at tavya's prices) a turn on the included model
  * does not start. */
@@ -38,7 +43,7 @@ const keyHandle = (organizationId: string) => `included-model:organization:${org
 const apiBase = () => (process.env.KARMAX_OPENROUTER_API_URL ?? 'https://openrouter.ai/api/v1').replace(/\/$/, '');
 
 export interface IncludedModelSettings {
-  /** The OpenRouter model id, e.g. deepseek/deepseek-v4.1-flash. */
+  /** The OpenRouter model id, e.g. xiaomi/mimo-v2.6-pro. */
   model: string;
   enabled: boolean;
 }
@@ -75,10 +80,49 @@ export async function includedModel(store: Store, broker?: CredentialBroker): Pr
   return settings;
 }
 
-/** Whether `profile` runs on the included model. */
+/** Whether `profile` may run on the organization's credit: any OpenRouter
+ * model, the included one being the default (another costs what it costs;
+ * the task form says how much more: includedModelRelativeCost). */
 export function isIncludedModel(profile: Pick<AgentProfile, 'provider' | 'model'>, settings: IncludedModelSettings | undefined): boolean {
-  return !!settings && profile.provider === 'opencode' && profile.model === includedAgentModel(settings);
+  return !!settings && profile.provider === 'opencode' && /^openrouter\/[^/]+\/./.test(profile.model ?? '');
 }
+
+/** The share of a typical tavya task's tokens at each price, from production
+ * (see INCLUDED_MODEL_DEFAULT): per input token, 5% uncached and 95% read
+ * from the cache, and 0.2% as many output tokens. */
+const TASK_MIX = { prompt: 0.05, cache: 0.95, completion: 0.002 };
+const PRICES_TTL_MS = 6 * 60 * 60_000;
+let prices: { at: number; byId: Map<string, { prompt: number; completion: number; cache?: number }> } | undefined;
+
+async function openRouterPrices(now = Date.now()) {
+  if (prices && now - prices.at < PRICES_TTL_MS) return prices.byId;
+  const response = await fetch(`${apiBase()}/models`, { signal: AbortSignal.timeout(10_000) });
+  if (!response.ok) throw new Error(`OpenRouter models: ${response.status}`);
+  const byId = new Map<string, { prompt: number; completion: number; cache?: number }>();
+  for (const model of ((await response.json()) as { data?: any[] }).data ?? []) {
+    const p = model?.pricing ?? {};
+    const prompt = Number(p.prompt), completion = Number(p.completion), cache = Number(p.input_cache_read);
+    if (typeof model?.id === 'string' && Number.isFinite(prompt) && Number.isFinite(completion))
+      byId.set(model.id, { prompt, completion, ...(Number.isFinite(cache) && p.input_cache_read !== undefined ? { cache } : {}) });
+  }
+  prices = { at: now, byId };
+  return byId;
+}
+
+/** About how many times the included model's price a typical task on
+ * `agentModel` (`openrouter/<id>`) costs; undefined when either price is unknown. */
+export async function includedModelRelativeCost(settings: IncludedModelSettings, agentModel: string): Promise<number | undefined> {
+  const id = agentModel.replace(/^openrouter\//, '');
+  if (id === settings.model) return 1;
+  const byId = await openRouterPrices().catch(() => undefined);
+  const cost = (price?: { prompt: number; completion: number; cache?: number }) => price
+    && TASK_MIX.prompt * price.prompt + TASK_MIX.cache * (price.cache ?? price.prompt) + TASK_MIX.completion * price.completion;
+  const base = cost(byId?.get(settings.model)), other = cost(byId?.get(id));
+  return base && other !== undefined ? other / base : undefined;
+}
+
+/** Tests: forget cached prices. */
+export function resetIncludedModelPrices(): void { prices = undefined; }
 
 async function openRouter(broker: CredentialBroker, method: string, path: string, body?: unknown): Promise<any> {
   const key = await broker.resolve(MANAGEMENT_HANDLE, { caps: [`use-credential:${MANAGEMENT_HANDLE}`] });
@@ -96,7 +140,7 @@ export async function saveIncludedModel(store: Store, broker: CredentialBroker,
   input: { managementKey?: string; model?: string; enabled?: boolean }): Promise<IncludedModelSettings> {
   const previous = await readSettings(store);
   const model = (input.model ?? previous?.model ?? INCLUDED_MODEL_DEFAULT).trim();
-  if (!/^[a-z0-9][\w.-]*\/[\w.:~-]+$/i.test(model)) throw new Error('model must be an OpenRouter model id such as deepseek/deepseek-v4.1-flash');
+  if (!/^[a-z0-9][\w.-]*\/[\w.:~-]+$/i.test(model)) throw new Error('model must be an OpenRouter model id such as xiaomi/mimo-v2.6-pro');
   const key = input.managementKey?.trim();
   if (key) await broker.registerHandle(MANAGEMENT_HANDLE, key, INSTALLATION_SCOPE);
   else if (!(await broker.hasHandle(MANAGEMENT_HANDLE))) throw new Error('an OpenRouter management key is required');

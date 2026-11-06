@@ -14,7 +14,7 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ConfigHomeManager } from '../autonomy/config-homes.js';
 import { credentialProvider, credentialServesProfile, mockAgentEnabled } from '../agent/provider-registry.js';
 import { managedModelRailAvailable } from '../agent/managed-models.js';
-import { includedModel, isIncludedModel } from '../agent/included-model.js';
+import { includedModel, includedModelRelativeCost, isIncludedModel } from '../agent/included-model.js';
 import { enumerateCredentials, resolveCredentials, type Credential } from './credentials.js';
 import { gatherCredentialSources, readPolicyLayers } from './credential-sources.js';
 import { ComputeRouter, type RouterConnections } from '../world/compute-router.js';
@@ -40,7 +40,10 @@ export interface AgentNeed {
 export interface Readiness {
   /** One entry per asked-about agent: whether some enabled login or key (or a
    * model tavya pays for: the included model, wiki features/included-model) can run it. */
-  agents: Array<{ provider: string; model?: string; ready: boolean; need?: AgentNeed }>;
+  /** `cost`: an agent that runs on the compute credit (an OpenRouter model,
+   * no login or key of the organization's own serving it) costs about this
+   * many times the included model a task (wiki features/included-model). */
+  agents: Array<{ provider: string; model?: string; ready: boolean; need?: AgentNeed; cost?: number }>;
   /** Any enabled login or key at all. */
   agentLogin: boolean;
   compute: {
@@ -100,11 +103,14 @@ export async function projectReadiness(deps: ReadinessDeps,
     return { provider };
   };
   return {
-    agents: agents.map((agent) => {
-      const ready = agent.provider === 'mock' ? mockAgentEnabled()
-        : serves(agent, credentials) || managedModelRailAvailable(deps.hosted, policy!, agent) || isIncludedModel(agent, included);
-      return { ...agent, ready, ...(ready ? {} : { need: need(agent) }) };
-    }),
+    agents: await Promise.all(agents.map(async (agent) => {
+      if (agent.provider === 'mock') { const ready = mockAgentEnabled(); return { ...agent, ready, ...(ready ? {} : { need: need(agent) }) }; }
+      const own = serves(agent, credentials);
+      const credit = !own && isIncludedModel(agent, included);
+      const ready = own || credit || managedModelRailAvailable(deps.hosted, policy!, agent);
+      const cost = credit ? await includedModelRelativeCost(included!, agent.model!) : undefined;
+      return { ...agent, ready, ...(ready ? {} : { need: need(agent) }), ...(cost !== undefined ? { cost: Math.round(cost * 10) / 10 } : {}) };
+    })),
     agentLogin: credentials.length > 0,
     compute: await computeReadiness(deps, scope.organizationId),
     ...(await storageReadiness(deps, scope.organizationId)),

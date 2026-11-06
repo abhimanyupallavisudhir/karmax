@@ -9182,14 +9182,15 @@ export class Gateway {
     };
     // OpenCode runs on a model vendor's API key, so it lists that vendor's
     // models whether or not an `opencode` binary exists here (hosted: none).
-    const keyVendors = [...new Set(creds.filter((c) => c.kind === 'key').map((c) => canonicalModelProvider(c.provider)))]
-      .filter((vendor) => (MODEL_PROVIDERS as readonly string[]).includes(vendor));
+    // With the included model on, every OpenRouter model can run on the credit.
+    const included = await includedModel(this.deps.store, this.deps.broker);
+    const keyVendors = [...new Set([...creds.filter((c) => c.kind === 'key').map((c) => canonicalModelProvider(c.provider)),
+      ...(included ? ['openrouter'] : [])])].filter((vendor) => (MODEL_PROVIDERS as readonly string[]).includes(vendor));
     const [claude, codex, opencodeLogins, opencodeKeys] = await Promise.all([
       settled('claude'), settled('codex'), settled('opencode'), openCodeKeyModels(keyVendors).catch(() => []),
     ]);
     // tavya's included model, first: it runs on the compute credit, with no
     // login or key of the organization's own (wiki features/included-model).
-    const included = await includedModel(this.deps.store, this.deps.broker);
     const includedEntry = included ? [{ id: `openrouter/${included.model}`,
       displayName: `${(await openCodeKeyModels(['openrouter']).catch(() => []))
         .find((model) => model.id === `openrouter/${included.model}`)?.displayName ?? included.model} · included`,

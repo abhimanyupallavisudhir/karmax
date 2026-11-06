@@ -39,12 +39,20 @@ describe('what a person does about a task that cannot start', () => {
     expect(none[0].tip).toMatch(/come with Individual or Team/);
     // Full storage does not stop a task, but nothing new it makes is kept: a warning, not a blocker.
     const full = await ui.run<any[]>(`readinessGaps({ agents: [], compute: { ready: true }, storage: { full: true, usedBytes: 6 * 1024 ** 3, quotaBytes: 5 * 1024 ** 3 } })`);
-    expect(full).toEqual([{ label: 'Add storage', href: '/org/settings#settings-plan', warn: true,
+    expect(full).toEqual([{ label: 'Add storage', href: '/org/settings#settings-plan', warn: true, lead: 'Storage is full:',
       tip: 'Storage is full (6 GB of 5 GB). New project data isn’t saved until you free some or add a 100 GB pack.' }]);
     expect(await ui.run(`readinessNoticeHtml(readinessGaps({ agents: [], compute: { ready: true }, storage: { full: true, usedBytes: 1, quotaBytes: 1 } }))`))
       .toMatch(/Storage is full:<\/span> <a/);
     const both = await ui.run<string>(`readinessNoticeHtml(readinessGaps({ agents: [], compute: { ready: false, need: 'plan' }, storage: { full: true, usedBytes: 1, quotaBytes: 1 } }))`);
     expect(both.replace(/<[^>]+>/g, '')).toBe('!Can’t start yet: Choose a plan·Connect your own computer·Storage is full: Add storage');
+    // A model on the compute credit that costs much more than the included one: a warning that says how much, not a blocker.
+    const pricey = await ui.run<any[]>(`readinessGaps({ agents: [{ provider: 'opencode', model: 'openrouter/openai/gpt-6.1-sol', ready: true, cost: 7.9 },
+      { provider: 'opencode', model: 'openrouter/xiaomi/mimo-v2.6-flash', ready: true, cost: 0.4 }], compute: { ready: true } })`);
+    expect(pricey).toEqual([{ label: 'costs 7.9× the included model', href: '/org/settings#settings-plan', warn: true, lead: 'On your credit:',
+      tip: expect.stringMatching(/^openai\/gpt-6\.1-sol runs on your compute credit at about 7\.9 times the included model’s price a task\./) }]);
+    expect((await ui.run<string>(`readinessNoticeHtml(readinessGaps({ agents: [{ provider: 'opencode', model: 'openrouter/openai/gpt-6.1-sol', ready: true, cost: 12.4 }],
+      compute: { ready: true }, storage: { full: true, usedBytes: 1, quotaBytes: 1 } }))`)).replace(/<[^>]+>/g, ''))
+      .toBe('!On your credit: costs 12× the included model·Storage is full: Add storage');
     // Ready, or unknown (the readiness call failed): nothing to say.
     expect(await ui.run(`readinessGaps({ agents: [{ provider: 'claude', ready: true }], compute: { ready: true } })`)).toEqual([]);
     expect(await ui.run(`readinessGaps(null)`)).toEqual([]);
@@ -76,6 +84,17 @@ describe('what a person does about a task that cannot start', () => {
       .toEqual({ label: 'Manage accounts', href: '/org/settings#settings-agents' });
     expect(await fix('GitHub PR identity is not connected for user_1. Connect GitHub on your profile'))
       .toEqual({ label: 'Connect GitHub', href: '/profile' });
+    // The plan's own limits link to Plan & billing too.
+    expect(await fix('Waiting for Free plan capacity (5 active agent runs)')).toEqual({ label: 'Change plan', href: '/org/settings#settings-plan' });
+    expect(await fix('Free allows 1 organization user, but this organization has 2. Remove 1 member or restore Team to start another agent run.'))
+      .toEqual({ label: 'Change plan', href: '/org/settings#settings-plan' });
+    expect(await fix('CPU can be at most 2 on the Free plan: choose a plan in Plan & billing for a bigger one'))
+      .toEqual({ label: 'Choose a plan', href: '/org/settings#settings-plan' });
+    // The free trial, and the included model, which draws on the same credit (its alternative is a login of one's own).
+    expect(await fixes('Out of compute: your $5.00 free trial is used up. Choose a plan in Plan & billing, or connect your own E2B account in Settings → Computers.'))
+      .toEqual([{ label: 'Choose a plan', href: '/org/settings#settings-plan' }, { label: 'Use your own account', href: '/org/settings#settings-computers' }]);
+    expect(await fixes('Out of compute: this month\'s $5.00 of compute is used up. Add a $10 pack or turn on auto top-up in Plan & billing, or connect your own agent login or API key in Settings → Agents. It renews on 2026-12-01.'))
+      .toEqual([{ label: 'Add compute', href: '/org/settings#settings-plan' }, { label: 'Use your own login', href: '/org/settings#settings-agents' }]);
     expect(await fix('merge failed: conflict')).toBeNull();
 
     // A task stopped on it shows the fix beside the plain reason.

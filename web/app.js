@@ -4572,6 +4572,9 @@ function setupFixes(text, projectId) {
   if (/Every computer this task can use is full|of \S+'s [\w. ]+ computers are in use|\S+'s [\w. ]+ computers are using|uses its share of/.test(raw)
     && !/This organization's \S+ account/.test(raw)) return [own];
   if (storageFull(raw)) return [{ label: 'Add storage', href: plan }];
+  // The plan's own limits: agents at once, people, the Free plan's computer size.
+  if (/Waiting for \S+ plan capacity|allows \d+ organization users?, but this organization has/.test(raw)) return [{ label: 'Change plan', href: plan }];
+  if (/on the Free plan: choose a plan/.test(raw)) return [{ label: 'Choose a plan', href: plan }];
   if (/No usable \S+ credential|has no usable .* credential|^No \S+ credential\b|Every allowed credential needs attention/i.test(raw))
     return [{ label: 'Manage accounts', href: `${settings}#settings-agents` }];
   // Switched on for the project (a lower scope wins), whichever scope switched it off.
@@ -9399,6 +9402,14 @@ function readinessGaps(readiness, projectId) {
     const need = agent.need || { provider: agent.provider };
     needs.set(`${need.provider}:${need.off || ''}`, need);
   }
+  // A model on the compute credit (any OpenRouter model, with no login or key
+  // of the organization's own) that costs much more than the included one.
+  const plan0 = `${settings}#settings-plan`;
+  for (const agent of (readiness.agents || []).filter((a) => a.ready && a.cost >= 1.5)) {
+    const times = agent.cost >= 10 ? Math.round(agent.cost) : Math.round(agent.cost * 10) / 10;
+    gaps.push({ label: `costs ${times}× the included model`, href: plan0, warn: true, lead: 'On your credit:',
+      tip: `${agent.model.replace(/^openrouter\//, '')} runs on your compute credit at about ${times} times the included model’s price a task. With your own login or API key, its provider bills you instead.` });
+  }
   for (const need of needs.values()) {
     const name = ACCOUNT_PROVIDER_LABELS[need.provider] || need.provider;
     gaps.push(need.off === 'project'
@@ -9422,7 +9433,7 @@ function readinessGaps(readiness, projectId) {
     : [{ label: 'Connect a computer', href: computers, tip: 'There is nowhere for this task to run yet.' }]));
   // Full storage does not stop a task, but nothing new it saves is kept.
   const storage = readiness.storage;
-  if (storage?.full) gaps.push({ label: 'Add storage', href: plan, warn: true,
+  if (storage?.full) gaps.push({ label: 'Add storage', href: plan, warn: true, lead: 'Storage is full:',
     tip: `Storage is full (${formatBytes(storage.usedBytes)} of ${formatBytes(storage.quotaBytes)}). New project data isn’t saved until you free some or add a 100 GB pack.` });
   return gaps;
 }
@@ -9430,10 +9441,13 @@ function readinessNoticeHtml(gaps) {
   if (!gaps.length) return '';
   const link = (gap) => `<a data-spa href="${esc(gap.href)}" title="${esc(gap.tip)}">${esc(gap.label)}</a>`;
   const sep = '<span class="tf-ready-sep" aria-hidden="true">·</span>';
-  const blocking = gaps.filter((gap) => !gap.warn), warnings = gaps.filter((gap) => gap.warn);
+  const blocking = gaps.filter((gap) => !gap.warn);
+  // Warnings, each kind under its own lead ("Storage is full:", "On your credit:").
+  const leads = [...new Set(gaps.filter((gap) => gap.warn).map((gap) => gap.lead))];
   return `<span class="tf-ready-mark" aria-hidden="true">!</span>${[
     blocking.length ? `<span>Can’t start yet:</span> ${blocking.map(link).join(sep)}` : '',
-    warnings.length ? `<span>Storage is full:</span> ${warnings.map(link).join(sep)}` : ''].filter(Boolean).join(sep)}`;
+    ...leads.map((lead) => `<span>${esc(lead)}</span> ${gaps.filter((gap) => gap.warn && gap.lead === lead).map(link).join(sep)}`)]
+    .filter(Boolean).join(sep)}`;
 }
 // Keeps the task form's readiness notice in step with the agents it names.
 function wireTaskReadiness(page, projectId) {
@@ -25688,7 +25702,7 @@ function openIncludedModelDialog(settings, onSaved) {
     <div class="settings-grid">
       <label class="form-row"><span>Management key ${policyTip('Create one on openrouter.ai under Management keys')}</span>
         <input class="included-key" type="password" autocomplete="off" placeholder="${settings?.keyConfigured ? 'Saved · leave blank to keep' : 'sk-or-v1-…'}"></label>
-      <label class="form-row"><span>Model</span><input class="included-model-id" value="${esc(settings?.model || 'deepseek/deepseek-v4.1-flash')}" placeholder="deepseek/deepseek-v4.1-flash"></label>
+      <label class="form-row"><span>Model</span><input class="included-model-id" value="${esc(settings?.model || 'xiaomi/mimo-v2.6-pro')}" placeholder="xiaomi/mimo-v2.6-pro"></label>
       <label class="switch"><input class="toggle included-enabled" type="checkbox" ${settings?.enabled === false ? '' : 'checked'}>Offer to organizations</label></div>
     <div class="modal-actions"><span class="label-row-fill"></span><button class="btn included-cancel" type="button">Cancel</button><button class="btn primary included-save" type="button">Save</button></div></div>`;
   const close = () => { document.removeEventListener('keydown', keydown); overlay.remove(); };
