@@ -157,11 +157,15 @@ scene(...next(3.0), (L) => {
 
 // 1 · One list: the organization's work across projects.
 scene(...next(5.0), (L, dur) => {
-  const h = headline(L, 'Every project. *One list.*', 'A SaaS, research papers, a PhD thesis — each task handed to an agent.');
+  const h = headline(L, 'Every project. *One list.*', null);
+  // Under the headline, three small boxes instead of a subtitle (owner's change, 2026-11-06).
+  const boxes = el('div', 'boxes', L);
+  const box = ['Code, apps, websites', 'Research', 'Random bureaucratic work'].map((t) => el('span', 'box', boxes, t));
   const w = browserWindow(L, { screens: ['home'] }); w.url(host('/personal'));
   w.show({ home: 1 });
   return (lt) => {
     h(lt); enter(w, lt, dur);
+    box.forEach((b, k) => { const q = ramp(lt, 0.35 + k * 0.12, 0.9 + k * 0.12, ease.outQuint); b.style.opacity = q; b.style.transform = `translateY(${(1 - q) * 12}px)`; });
     const [z, fx, fy] = kf(lt, [[0.6, [1, 720, 450]], [4.6, [1.2, 640, 470]]], ease.inOut);
     w.camera(z, fx, fy);
     pointerAt(w, lt, [[0, 1100, 860], [1.2, 1050, 700], [2.4, 498, 160], [3.6, 498, 160], [4.8, 700, 420]], [], ramp(lt, 0.8, 1.2));
@@ -269,9 +273,9 @@ scene(...next(4.6), (L, dur) => {
   };
 });
 
-// 8 · Work that starts itself.
+// 8 · The autonomous company (was: Work that starts itself).
 scene(...next(5.2), (L, dur) => {
-  const h = headline(L, 'Work that *starts itself.*', null);
+  const h = headline(L, 'The *autonomous company.*', null);
   // Under the headline, three small boxes instead of a subtitle (owner's change, 2026-11-06).
   const boxes = el('div', 'boxes', L);
   const box = ['Agents can start, manage and approve tasks', 'Tasks can be triggered by webhooks and events', 'Tasks can run on schedules, or after other tasks']
