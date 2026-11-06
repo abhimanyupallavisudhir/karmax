@@ -1028,7 +1028,7 @@ async function softwareDevImpl(
   // rebuilds them from their records when an earlier replacement lost them.
   const shipments: TaskShipment[] = (continued?.subTasks.shipments ?? recovery?.shipments ?? []).map((shipment) => ({ ...shipment }));
   let shipping = 0;
-  /** A person chose Finish: the task ends done, closing what has not landed. */
+  /** A person chose Cancel after a landing: the task ends done after its pull requests settle. */
   let finishing = false;
   /** The agent finished (`open_pr` alone) and its pull requests are open. */
   let pullRequestsOpened = carried?.pullRequestsOpened ?? false;
@@ -1360,11 +1360,11 @@ async function softwareDevImpl(
   // ── view-model ──
   function allowed(): DeclaredAction[] {
     const actions = allowedNow();
-    // v1.30: once a pull request of the task has landed, Cancel cannot undo it;
-    // Finish takes its place, ending the task and closing what has not landed.
+    // v1.30: after a landing, keep the Cancel label but use the finish signal
+    // to preserve landed work and let approved pull requests settle.
     return shipsBranches && shipments.some((shipment) => shipment.state === 'landed')
       ? actions.map((action) => action.name === 'cancel'
-        ? { name: 'finish', kind: 'signal', label: 'Finish', enabled: action.enabled && !cancelled, danger: true }
+        ? { name: 'finish', kind: 'signal', label: 'Cancel', enabled: action.enabled && !cancelled, danger: true }
         : action)
       : actions;
   }
@@ -3946,8 +3946,8 @@ Inspect the complete current diff and specifically compare its delta from the re
     );
   }
 
-  /** Finish (v1.30): stop the agent and every open pull request — closing them
-   * — and end done with what landed. */
+  /** Post-landing cancellation (v1.30): stop the agent, close unapproved pull
+   * requests, let approved ones settle, and end done with what landed. */
   async function finish(): Promise<{ stage: Stage }> {
     // Sub-tasks of the agent's stop; pull requests not yet approved close, and
     // the rest land as reviewed. The world stays until every one has settled:

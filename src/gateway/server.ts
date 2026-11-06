@@ -5677,7 +5677,7 @@ export class Gateway {
         }
         // A waiting (armed) task or a repeatable series hasn't started its own
         // workflow — edit its stored params + triggers in place, then re-arm (or
-        // drop to a draft). `keepArmed:false` (Save as draft) disarms it.
+        // drop to a draft). `keepArmed:false` (Return to draft, or Save draft) disarms it.
         if (t.params?.triggerState === 'armed' || t.params?.repeatable) {
           try {
             const updated = await api.updateArmedParams(token, id, b.params ?? {}, { replace: b.replace === true, keepArmed: b.keepArmed !== false, ...attenuation });
