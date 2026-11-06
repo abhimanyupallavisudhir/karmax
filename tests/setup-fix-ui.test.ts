@@ -17,6 +17,16 @@ describe('what a person does about a task that cannot start', () => {
       { provider: 'codex', ready: true }], compute: { ready: false } })`);
     expect(gaps.map((gap) => [gap.label, gap.href])).toEqual([
       ['Add a Claude account', '/org/settings#settings-agents'], ['Connect a computer', '/org/settings#settings-computers']]);
+    // OpenCode runs on its model's vendor: an OpenRouter key, not an "OpenCode account"; one that is
+    // only switched off says where to switch it on.
+    await ui.run(`S.projects = [{ id: 'p', name: 'Web', slug: 'web', organizationId: 'o' }]`);
+    const vendor = await ui.run<any[]>(`readinessGaps({ agents: [
+      { provider: 'opencode', model: 'openrouter/google/gemini-4-argon', ready: false, need: { provider: 'openrouter', off: 'project' } },
+      { provider: 'opencode', model: 'openai/gpt-6', ready: false, need: { provider: 'openai' } },
+      { provider: 'opencode', model: 'xai/grok-5', ready: false, need: { provider: 'xai', off: 'organization' } }], compute: { ready: true } }, 'p')`);
+    expect(vendor.map((gap) => [gap.label, gap.href])).toEqual([
+      ['Turn on OpenRouter', '/org/web/settings#project-agents'], ['Add an OpenAI account', '/org/settings#settings-agents'],
+      ['Turn on xAI', '/org/settings#settings-agents']]);
     // tavya's computers out of credit: more compute on the plan, or one's own account; the reason is one hover away.
     const credit = await ui.run<any[]>(`readinessGaps({ agents: [], compute: { ready: false, need: 'credit', outOfCredit: 'Out of compute: spent.' } })`);
     expect(credit.map((gap) => [gap.label, gap.href, gap.tip])).toEqual([
@@ -76,6 +86,14 @@ describe('what a person does about a task that cannot start', () => {
       waitingFor: { kind: 'account', detail: 'No claude credential — add one, or stop this agent' } })`);
     expect(await ui.page.locator('#main .wait-notice').innerText()).toContain('No Claude account — add one, or stop this agent');
     expect(await ui.page.locator('#main .wait-notice a.setup-fix').innerText()).toBe('Manage accounts');
+    // A key that is only switched off: switch it on for the project (a lower scope wins).
+    await ui.run(`S.projects = [{ id: 'p', name: 'Web', slug: 'web', organizationId: 'o' }];
+      document.getElementById('main').innerHTML = conversationWaitNotice({ taskId: 't', projectId: 'p', waitingFor: { kind: 'account',
+        provider: 'openrouter', reason: 'login', detail: 'Your openrouter account is switched off for this task — turn it on, or stop this agent' } })`);
+    expect(await ui.page.locator('#main .wait-notice').innerText())
+      .toContain('OpenRouter is switched off · Your OpenRouter account is switched off for this task — turn it on, or stop this agent');
+    expect(await ui.page.locator('#main .wait-notice a.setup-fix').evaluate((link) => [link.textContent, link.getAttribute('href')]))
+      .toEqual(['Turn on', '/org/web/settings#project-agents']);
 
     // Out of compute: one line saying what happened, the ways out as buttons, the whole reason on hover.
     await ui.run(`document.getElementById('main').innerHTML = conversationWaitNotice({ taskId: 't', status: 'waiting',

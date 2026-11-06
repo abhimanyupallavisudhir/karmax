@@ -2864,13 +2864,6 @@ html[data-theme="dark"] .github-signin-btn:active,
 .cred-drag:active { cursor: grabbing; }
 .cred-label { white-space: nowrap; }
 .cred-row .info-dot { margin-left: -2px; }
-.cred-mode {
-  max-width: 108px; height: 22px; padding: 0 20px 0 7px; border: 1px solid var(--line);
-  border-radius: 999px; background: var(--surface); color: var(--ink-2);
-  font: 700 var(--fs-10)/1 var(--font-ui); cursor: pointer;
-}
-.cred-mode.on { background: var(--accent); color: #fff; border-color: transparent; }
-.cred-mode.explainer-only { background: var(--accent-weak); color: var(--accent-ink); border-color: transparent; }
 .cred-rename, .cred-del, .cred-key-edit, .cred-key-del { cursor: pointer; color: var(--ink-3); font-size: var(--fs-11); }
 .cred-rename:hover, .cred-del:hover, .cred-key-edit:hover, .cred-key-del:hover { color: var(--accent); }
 .api-key-edit-form { width: min(440px, calc(100vw - 32px)); }

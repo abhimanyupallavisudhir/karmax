@@ -65,7 +65,7 @@ describe('Settings → Agents accounts list', () => {
   it('switches an account off, sets its turns at once and when it is unavailable', async () => {
     const { ui, row, posts } = await agentsCard();
     await row(codex).getByRole('checkbox', { name: 'Use codex:home' }).click();
-    await expect.poll(() => posts('/credentials/policy')).toEqual([{ scope: 'global', policy: { on: [], off: [codex], explainerOnly: [] } }]);
+    await expect.poll(() => posts('/credentials/policy')).toEqual([{ scope: 'global', policy: { on: [], off: [codex] } }]);
     await ui.page.locator(`.cred-row.acct.off[data-key="${codex}"]`).waitFor();
 
     await row(claude).locator('.acct-expand').click();

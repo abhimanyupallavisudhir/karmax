@@ -189,6 +189,65 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
     } finally { await context.close(); }
   }, 90_000);
 
+  // An organization with only an OpenRouter key, switched off for its project
+  // while "explainer-only" existed, picks Gemini 4 Argon: the form said "Add a
+  // OpenCode account". It names the key, and switching it on is one click away.
+  it('says an OpenCode model needs its vendor’s key switched on, and where', async () => {
+    const { user, organization } = await g.owner({ name: 'Otto Router', email: 'otto@example.test', password: PASSWORD, organization: 'Otto Lab' });
+    const { page, errors, step, context } = await openConsole(browser, { ip: '192.0.2.54' });
+    try {
+      await signIn(context, g.url, user.email, PASSWORD);
+      await consoleRequest(context, g.url, 'PUT', `/api/organizations/${organization.id}/world-providers/e2b`, { apiKey: 'e2b_ready' });
+      await consoleRequest(context, g.url, 'POST', `/api/organizations/${organization.id}/accounts`,
+        { provider: 'openrouter', account: 'lab', apiKey: 'sk-or-ready' });
+      const project = await consoleRequest(context, g.url, 'POST', `/api/organizations/${organization.id}/projects`, { name: 'Lab', config: {} });
+      const home = `/${organization.slug}/${project.slug ?? 'lab'}`;
+      const { credentials } = await consoleRequest(context, g.url, 'GET', `/api/organizations/${organization.id}/credentials`);
+      const key = credentials.find((credential: any) => credential.provider === 'openrouter').key;
+      await g.store.kvSet(`credpolicy:project:${project.id}`, JSON.stringify({ explainerOnly: [key] }));
+
+      await step('open the project', () => page.goto(`${g.url}${home}`));
+      await page.locator('#expand-task').click();
+      // Do picks the model; the form's other agents (folded away) follow it.
+      const pick = async (ref: string) => {
+        await page.locator('#tf-page .agent-field .af-ref').first().fill(ref);
+        await page.keyboard.press('Enter');
+        await page.evaluate((value) => { for (const field of document.querySelectorAll<HTMLInputElement>('#tf-page .agent-field .af-ref')) {
+          if (field.value === value) continue;
+          field.value = value;
+          field.dispatchEvent(new Event('change', { bubbles: true }));
+        } }, ref);
+      };
+      await pick('opencode:openrouter/google/gemini-4-argon');
+      const notice = page.locator('#tf-ready');
+      const turnOn = notice.getByRole('link', { name: 'Turn on OpenRouter' });
+      await step('the form names the key that is switched off', () => turnOn.waitFor());
+      expect((await notice.innerText()).replace(/\s+/g, ' ')).toBe('! Can’t start yet: Turn on OpenRouter');
+      expect(await turnOn.getAttribute('href')).toBe(`${home}/settings#project-agents`);
+      expect(await page.locator('#tf-page .agent-field .mf-face').first().innerText()).toMatch(/OpenCode\s*Gemini 4 Argon/);
+      if (process.env.KARMAX_REVIEW_SCREENSHOT_OPENROUTER) await page.waitForTimeout(400).then(() => page.screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT_OPENROUTER }));
+
+      await turnOn.click();
+      const toggle = page.locator(`#cred-editor-project .cred-row[data-key="${key}"] input.cred-toggle`);
+      await step('project settings show the key, off', () => toggle.waitFor());
+      expect(await toggle.isChecked()).toBe(false);
+      expect(await page.locator('#cred-editor-project select').count()).toBe(0); // no Explainer-only menu
+      await toggle.click();
+      await expect.poll(() => toggle.isChecked()).toBe(true);
+      expect(JSON.parse((await g.store.kvGet(`credpolicy:project:${project.id}`))!)).toEqual({ on: [key], off: [] });
+
+      await step('back to the project', () => page.goto(`${g.url}${home}`));
+      await page.locator('#expand-task').click();
+      await page.locator('#tf-queue').waitFor();
+      await pick('opencode:openrouter/google/gemini-4-argon');
+      await step('nothing is missing', () => expect.poll(async () => await notice.isHidden() ? '' : notice.innerText(), { timeout: 8_000 }).toBe(''));
+      // Google's own id needs Google's key, which this organization has none of.
+      await pick('opencode:google/gemini-4-argon');
+      await step('a vendor without a key is named', () => notice.getByRole('link', { name: 'Add a Google account' }).waitFor());
+      expect(errors).toEqual([]);
+    } finally { await context.close(); }
+  }, 90_000);
+
   it('tells a Free organization, before it writes a task, that tavya’s computers come with a plan or its own account', async () => {
     const { user, organization } = await g.owner({ name: 'Fern Free', email: 'fern@example.test', password: PASSWORD, organization: 'Fern Lab' });
     // The installation runs E2B computers for organizations; a Free plan has no compute on them.

@@ -195,6 +195,19 @@ export const accountsQuery = defineQuery<AccountsView>(QRY_ACCOUNTS);
 export interface AccountLeaseAnswer {
   waiting: boolean; earliestResetAt?: number; detail?: string; continuingAsNew?: true; heldUntil?: number; planning?: true;
   reason?: AccountWaitReason;
+  /** `login`: whose account the turn lacks (the harness, or an OpenCode
+   * model's vendor), and whether one is only switched off. */
+  need?: { provider: string; off?: true };
+}
+
+/** What a turn's allow-list says it lacks: `missing:<organization>:<provider>[:off]`
+ * (resolveCredentialOrder), which matches no account. */
+export function missingCredential(allowed: readonly string[] | undefined): { provider: string; off?: true } | undefined {
+  for (const id of allowed ?? []) {
+    const match = /^missing:[^:]+:([^:]+)(:off)?$/.exec(id);
+    if (match && match[1] !== 'opencode-fork') return { provider: match[1]!, ...(match[2] ? { off: true as const } : {}) };
+  }
+  return undefined;
 }
 export const accountLeaseQuery = defineQuery<AccountLeaseAnswer, [{ taskId: string; turnId?: string }]>(QRY_ACCOUNT_LEASE);
 export const accountTaskLeasesQuery = defineQuery<string[], [string]>(QRY_ACCOUNT_TASK_LEASES);
@@ -539,7 +552,13 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
       detail: 'Provider usage limit reached; the task resumes automatically when quota resets',
     };
     // None at all is not "needs attention": nothing will recover by itself.
-    if (!compatible.length) return { waiting: true, reason: 'login', detail: `No ${req.provider ?? 'allowed'} credential — add one, or stop this agent` };
+    if (!compatible.length) {
+      const need = missingCredential(req.allowed);
+      if (need?.off) return { waiting: true, reason: 'login', need,
+        detail: `Your ${need.provider} account is switched off for this task — turn it on, or stop this agent` };
+      return { waiting: true, reason: 'login', ...(need ? { need } : {}),
+        detail: `No ${need?.provider ?? req.provider ?? 'allowed'} credential — add one, or stop this agent` };
+    }
     return { waiting: true, reason: 'login', detail: 'Every allowed credential needs attention — sign in again or add one' };
   });
   // Every turn of `taskId` this coordinator still owes something for — queued

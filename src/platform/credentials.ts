@@ -29,14 +29,27 @@ export interface Credential {
 }
 
 /** A per-scope policy layer. `order` (partial or full) sets precedence; `on`/`off`
- *  flip a credential's enablement, overriding higher scopes + the default.
- *  `explainerOnly` keeps an API key out of agent sessions while allowing the
- *  lightweight explanation call to use it. */
+ *  flip a credential's enablement, overriding higher scopes + the default. */
 export interface CredPolicy {
   order?: string[];
   on?: string[];
   off?: string[];
-  explainerOnly?: string[];
+}
+
+/** A policy as stored or sent, made canonical. Policies saved before
+ * explanation models were retired may hold `explainerOnly`: keys kept out of
+ * agent sessions. That is exactly what `off` means now, so they read as off. */
+export function normalizePolicy(raw: unknown): CredPolicy {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const value = raw as Record<string, unknown>;
+  const list = (field: unknown) => Array.isArray(field) ? field.filter((item): item is string => typeof item === 'string') : undefined;
+  const order = list(value.order), on = list(value.on), legacy = list(value.explainerOnly) ?? [];
+  const off = [...new Set([...(list(value.off) ?? []), ...legacy.filter((key) => !on?.includes(key))])];
+  return {
+    ...(order ? { order } : {}),
+    ...(on ? { on } : {}),
+    ...(off.length || value.off !== undefined ? { off } : {}),
+  };
 }
 
 export interface CredentialSources {
@@ -126,41 +139,8 @@ export function isEnabled(key: string, layers: { global?: CredPolicy; project?: 
   for (const L of [layers.task, layers.project, layers.global]) {
     if (L?.on?.includes(key)) return true;
     if (L?.off?.includes(key)) return false;
-    if (L?.explainerOnly?.includes(key)) return false;
   }
   return def;
-}
-
-/** Explanation calls accept ordinary enabled API keys as well as keys explicitly
- * reserved for explanations. Off still wins at the nearest policy layer. */
-export function isExplanationEnabled(
-  key: string,
-  layers: { global?: CredPolicy; project?: CredPolicy; task?: CredPolicy },
-  def: boolean,
-): boolean {
-  for (const L of [layers.task, layers.project, layers.global]) {
-    if (L?.on?.includes(key)) return true;
-    if (L?.off?.includes(key)) return false;
-    if (L?.explainerOnly?.includes(key)) return true;
-  }
-  return def;
-}
-
-function orderedCredentials(
-  all: Credential[],
-  layers: { global?: CredPolicy; project?: CredPolicy; task?: CredPolicy },
-  enabled: (credential: Credential) => boolean | Promise<boolean>,
-): Credential[] {
-  const order = layers.task?.order ?? layers.project?.order ?? layers.global?.order;
-  const rankOf = (c: Credential): [number, number, string] => {
-    const idx = order ? order.indexOf(c.key) : -1;
-    return idx >= 0 ? [0, idx, c.key] : [1, defaultRank(c), c.label];
-  };
-  return all.filter(enabled).sort((a, b) => {
-    const [ra0, ra1, ra2] = rankOf(a);
-    const [rb0, rb1, rb2] = rankOf(b);
-    return ra0 - rb0 || ra1 - rb1 || (typeof ra2 === 'string' ? ra2.localeCompare(rb2 as string) : 0);
-  });
 }
 
 /**
@@ -173,16 +153,16 @@ export function resolveCredentials(
   all: Credential[],
   layers: { global?: CredPolicy; project?: CredPolicy; task?: CredPolicy },
 ): Credential[] {
-  return orderedCredentials(all, layers, (c) => isEnabled(c.key, layers, defaultEnabled(c, all)));
-}
-
-/** Effective API-key pool for explanations. Callers normally pass only keys; the
- * function remains generic so its precedence semantics are independently testable. */
-export function resolveExplanationCredentials(
-  all: Credential[],
-  layers: { global?: CredPolicy; project?: CredPolicy; task?: CredPolicy },
-): Credential[] {
-  return orderedCredentials(all, layers, (c) => isExplanationEnabled(c.key, layers, defaultEnabled(c, all)));
+  const order = layers.task?.order ?? layers.project?.order ?? layers.global?.order;
+  const rankOf = (c: Credential): [number, number, string] => {
+    const idx = order ? order.indexOf(c.key) : -1;
+    return idx >= 0 ? [0, idx, c.key] : [1, defaultRank(c), c.label];
+  };
+  return all.filter((c) => isEnabled(c.key, layers, defaultEnabled(c, all))).sort((a, b) => {
+    const [ra0, ra1, ra2] = rankOf(a);
+    const [rb0, rb1, rb2] = rankOf(b);
+    return ra0 - rb0 || ra1 - rb1 || (typeof ra2 === 'string' ? ra2.localeCompare(rb2 as string) : 0);
+  });
 }
 
 /** The ordered, enabled credentials for one provider (the lease allow-list). */

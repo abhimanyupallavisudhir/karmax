@@ -265,6 +265,24 @@ describe('account coordinator — quota engine', () => {
     await coord.terminate('done');
   });
 
+  // An OpenCode turn asks as the `opencode` harness; its allow-list names the
+  // model's vendor it lacks, and whether that vendor's key is only switched off.
+  it('names the vendor an OpenCode turn lacks, and a key that is only switched off', async () => {
+    const coord = await startCoord([A({ id: 'A' })]);
+    const g = await grantee();
+    await coord.signal('leaseAccount', { taskId: g.id, turnId: 't1', provider: 'opencode', allowed: ['missing:org_personal:openrouter:off'] });
+    await expect.poll(() => coord.query('accountLease', { taskId: g.id }), { timeout: 10_000 }).toEqual({
+      waiting: true, reason: 'login', need: { provider: 'openrouter', off: true },
+      detail: 'Your openrouter account is switched off for this task — turn it on, or stop this agent',
+    });
+    const h = await grantee();
+    await coord.signal('leaseAccount', { taskId: h.id, turnId: 't2', provider: 'opencode', allowed: ['missing:org_personal:google'] });
+    await expect.poll(() => coord.query('accountLease', { taskId: h.id }), { timeout: 10_000 }).toEqual({
+      waiting: true, reason: 'login', need: { provider: 'google' }, detail: 'No google credential — add one, or stop this agent',
+    });
+    await coord.terminate('done');
+  });
+
   it('parks a request whose only allowed credential needs attention, then grants it on recovery', async () => {
     const coord = await startCoord([A({ id: 'A' })]);
     await coord.signal('setAccountAvailability', { accountId: 'A', status: 'needs-attention' });

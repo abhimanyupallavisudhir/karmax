@@ -110,7 +110,7 @@ describe('waiting labels in task summaries', () => {
       status: 'waiting',
       state: {},
       waitingFor: { kind: 'account', provider: 'claude', detail: 'Every allowed credential needs attention — sign in again or add one' },
-    })).toBe('Needs a Claude login');
+    })).toBe('Needs a Claude account');
     const reset = Date.now() + 60_000;
     expect(stageLabel({
       stage: 'do',
@@ -267,7 +267,12 @@ describe('waiting labels in task summaries', () => {
     expect(label({ reason: 'held', until: reset })).toBe(`Held for higher-priority work until ${waitDeadline(reset)}`);
     expect(label({ reason: 'slot' })).toBe('Waiting for a free Claude login');
     expect(label({ reason: 'planning' })).toBe('Queued for Claude');
-    expect(label({ reason: 'login', detail: 'No claude credential — add one, or stop this agent' })).toBe('Needs a Claude login');
+    expect(label({ reason: 'login', detail: 'No claude credential — add one, or stop this agent' })).toBe('Needs a Claude account');
+    // An OpenCode turn names the model's vendor (the coordinator's answer), not the harness.
+    expect(waitingText({ kind: 'account', provider: 'openrouter', reason: 'login', detail: 'No openrouter credential — add one, or stop this agent' }))
+      .toBe('Needs an OpenRouter account');
+    expect(waitingText({ kind: 'account', provider: 'openrouter', reason: 'login',
+      detail: 'Your openrouter account is switched off for this task — turn it on, or stop this agent' })).toBe('OpenRouter is switched off');
     // Views published before the coordinator gave a reason read it from their detail.
     expect(label({ detail: 'Held for higher-priority work' })).toBe('Held for higher-priority work');
     expect(label({ detail: 'Waiting for a free slot on an allowed account' })).toBe('Waiting for a free Claude login');

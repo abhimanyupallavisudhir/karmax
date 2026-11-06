@@ -2,13 +2,12 @@ import { describe, it, expect } from 'vitest';
 import {
   enumerateCredentials,
   resolveCredentials,
-  resolveExplanationCredentials,
   credentialsForProvider,
   defaultEnabled,
   isEnabled,
-  isExplanationEnabled,
+  normalizePolicy,
 } from '../src/platform/credentials.js';
-import { agentAccountHandles, credPolicyKey, gatherCredentialSources, readPolicyLayers, remapCredentialPolicy } from '../src/platform/credential-sources.js';
+import { agentAccountHandles, credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../src/platform/credential-sources.js';
 
 const sources = {
   logins: [
@@ -107,7 +106,6 @@ describe('default policy: logins/ambient ON, API keys OFF (opt-in)', () => {
     expect(r).toEqual(['login:claude:manyu', 'login:claude:mats', 'login:codex:work', 'ambient:claude', 'ambient:codex']);
     expect(r).not.toContain('key:codex');
     expect(r).not.toContain('key:handle:claude:broker1');
-    expect(keys(resolveExplanationCredentials(all, {}))).not.toContain('key:handle:claude:broker1');
   });
   it('defaultEnabled: subscriptions on; a key is off when a subscription exists, on when it is the only option', () => {
     expect(defaultEnabled(all.find((c) => c.kind === 'login')!, all)).toBe(true);
@@ -144,17 +142,17 @@ describe('enable / disable across scopes (task → project → global)', () => {
   it('a project "on" opts in an API key that the global default leaves off', () => {
     expect(keys(resolveCredentials(all, { project: { on: ['key:handle:claude:broker1'] } }))).toContain('key:handle:claude:broker1');
   });
-  it('an explainer-only key is excluded from agents but available to explanations', () => {
-    const layers = { global: { explainerOnly: ['key:handle:claude:broker1'] } };
-    expect(keys(resolveCredentials(all, layers))).not.toContain('key:handle:claude:broker1');
-    expect(keys(resolveExplanationCredentials(all, layers))).toContain('key:handle:claude:broker1');
-    expect(isEnabled('key:handle:claude:broker1', layers, true)).toBe(false);
-    expect(isExplanationEnabled('key:handle:claude:broker1', layers, false)).toBe(true);
-  });
-  it('a lower scope can override explainer-only in either direction', () => {
+  it('a retired explainer-only entry reads as off, and a lower scope can still turn the key on', () => {
     const key = 'key:handle:claude:broker1';
-    expect(keys(resolveCredentials(all, { global: { explainerOnly: [key] }, task: { on: [key] } }))).toContain(key);
-    expect(keys(resolveExplanationCredentials(all, { global: { explainerOnly: [key] }, task: { off: [key] } }))).not.toContain(key);
+    const legacy = parsePolicy(JSON.stringify({ order: [key], explainerOnly: [key] }));
+    expect(legacy).toEqual({ order: [key], off: [key] });
+    expect(keys(resolveCredentials(all, { global: { on: [key] }, project: legacy }))).not.toContain(key);
+    expect(keys(resolveCredentials(all, { project: legacy, task: { on: [key] } }))).toContain(key);
+  });
+  it('normalizePolicy keeps a key that is also on, on, and drops anything that is not a list of ids', () => {
+    expect(normalizePolicy({ on: ['a'], off: ['b'], explainerOnly: ['a', 'c'], junk: 1 })).toEqual({ on: ['a'], off: ['b', 'c'] });
+    expect(normalizePolicy({ order: 'x', off: [1, 'd'] })).toEqual({ off: ['d'] });
+    expect(normalizePolicy(null)).toEqual({});
   });
 });
 
@@ -180,10 +178,10 @@ describe('credential policy references', () => {
     const oldKey = 'key:handle:openrouter:old';
     const newKey = 'key:handle:openrouter:new';
     const renamed = remapCredentialPolicy({
-      order: [oldKey, newKey], on: [oldKey], off: [], explainerOnly: [oldKey],
+      order: [oldKey, newKey], on: [oldKey], off: [],
     }, oldKey, newKey);
-    expect(renamed).toEqual({ order: [newKey], on: [newKey], off: [], explainerOnly: [newKey] });
-    expect(remapCredentialPolicy(renamed, newKey)).toEqual({ order: [], on: [], off: [], explainerOnly: [] });
+    expect(renamed).toEqual({ order: [newKey], on: [newKey], off: [] });
+    expect(remapCredentialPolicy(renamed, newKey)).toEqual({ order: [], on: [], off: [] });
   });
 });
 

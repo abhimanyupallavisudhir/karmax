@@ -7,7 +7,7 @@ const KEY = 'key:handle:anthropic-work';
 const credential = { key: KEY, kind: 'key', provider: 'anthropic', account: 'work', label: 'anthropic:work' };
 
 /** Render the credential editor for `scope` against a scripted credentials API. */
-async function editor(scope: 'global' | 'project' | 'task', policy: Record<string, unknown>, explanationsEnabled = false) {
+async function editor(scope: 'global' | 'project' | 'task', policy: Record<string, unknown>) {
   const ui = await consolePage({ api: ({ method, path }: ApiCall) => {
     if (method === 'GET' && /^\/api\/organizations\/org\/credentials(\?|$)/.test(path)) return { credentials: [credential], [scope]: policy };
     if (method === 'GET' && path === '/api/organizations/org/accounts') return { logins: [] };
@@ -16,7 +16,6 @@ async function editor(scope: 'global' | 'project' | 'task', policy: Record<strin
   const opts = scope === 'task' ? { organizationId: 'org', projectId: 'p', taskId: 't' }
     : scope === 'project' ? { organizationId: 'org', projectId: 'p' } : { organizationId: 'org' };
   await ui.run(`S.organizationId = 'org'; window.confirm = () => true;
-    S.meta = { ...S.meta, explanationsEnabled: ${explanationsEnabled} };
     renderCredentialEditor(document.getElementById('main'), ${JSON.stringify(scope)}, ${JSON.stringify(opts)})`);
   await ui.page.locator('.cred-row').waitFor();
   const saved = () => ui.calls.filter((call) => call.method === 'POST' && call.path.includes('/credentials/policy'))
@@ -25,44 +24,31 @@ async function editor(scope: 'global' | 'project' | 'task', policy: Record<strin
 }
 
 describe('API key settings UI', () => {
-  it('is the same on/off switch as the organization list while explanations are turned off', async () => {
-    const { ui, row, saved } = await editor('project', { own: { on: [KEY] }, enabled: [KEY], modes: { [KEY]: 'on' } });
+  it('is the same on/off switch as the organization list, in every scope', async () => {
+    const { ui, row, saved } = await editor('project', { own: { on: [KEY] }, enabled: [KEY] });
     expect(await row.getByRole('combobox').count()).toBe(0);
     const toggle = row.locator('input.toggle.cred-toggle');
     expect(await toggle.isChecked()).toBe(true);
     await toggle.click();
     await expect.poll(saved).toHaveLength(1);
-    expect(saved()[0]).toMatchObject({ scope: 'project', projectId: 'p', policy: { on: [], off: [KEY], explainerOnly: [] } });
-    await ui.close();
-  });
-
-  it('offers all three API-key availability modes and persists them exclusively', async () => {
-    const { ui, row, saved } = await editor('project', { own: { on: [KEY] }, enabled: [KEY], modes: { [KEY]: 'on' } }, true);
-    const mode = row.getByRole('combobox', { name: 'API key availability' });
-    expect(await mode.locator('option').allTextContents()).toEqual(['On', 'Off', 'Explainer-only']);
-    expect(await mode.inputValue()).toBe('on');
-    await mode.selectOption('explainer-only');
-    await expect.poll(saved).toHaveLength(1);
-    expect(saved()[0]).toEqual({ scope: 'project', projectId: 'p',
-      policy: { on: [], off: [], explainerOnly: [KEY] } });
+    expect(saved()[0]).toEqual({ scope: 'project', projectId: 'p', policy: { on: [], off: [KEY] } });
     expect(ui.calls.find((call) => call.method === 'POST')!.path).toBe('/api/organizations/org/credentials/policy?projectId=p');
     await ui.close();
   });
 
-  it('keeps API keys binary on Task forms and renders inherited explainer-only as Off', async () => {
-    const { ui, row, saved } = await editor('task', { own: {}, enabled: [], modes: { [KEY]: 'explainer-only' } });
-    expect(await row.getByRole('combobox').count()).toBe(0);
+  it('turns an inherited Off key on for a task', async () => {
+    const { ui, row, saved } = await editor('task', { own: {}, enabled: [] });
     const toggle = row.locator('input.toggle.cred-toggle');
     expect(await toggle.isChecked()).toBe(false);
     expect(await row.getAttribute('class')).toContain('off');
     await toggle.click();
     await expect.poll(saved).toHaveLength(1);
-    expect(saved()[0]).toMatchObject({ scope: 'task', taskId: 't', policy: { on: [KEY], off: [], explainerOnly: [] } });
+    expect(saved()[0]).toMatchObject({ scope: 'task', taskId: 't', policy: { on: [KEY], off: [] } });
     await ui.close();
   });
 
   it('offers write-only edit and delete controls for saved API keys', async () => {
-    const { ui, row } = await editor('global', { own: {}, enabled: [KEY], modes: { [KEY]: 'on' } });
+    const { ui, row } = await editor('global', { own: {}, enabled: [KEY] });
     await row.getByTitle('Edit API key').click();
     const dialog = ui.page.getByRole('dialog', { name: 'Edit API key' });
     const secret = dialog.locator('.api-key-edit-secret');

@@ -57,7 +57,8 @@ describe('project readiness: can a task here start?', () => {
   it('names each missing essential on a hosted organization, by the rules the run applies', async () => {
     const { store, broker, providers, project, readiness } = await boot(true);
     expect(await readiness('claude:claude-opus-5-5', 'codex')).toEqual({
-      agents: [{ provider: 'claude', model: 'claude-opus-5-5', ready: false }, { provider: 'codex', ready: false }],
+      agents: [{ provider: 'claude', model: 'claude-opus-5-5', ready: false, need: { provider: 'claude' } },
+        { provider: 'codex', ready: false, need: { provider: 'codex' } }],
       agentLogin: false,
       compute: { ready: false, local: false, managed: false, own: false, need: 'computer' },
     });
@@ -67,12 +68,36 @@ describe('project readiness: can a task here start?', () => {
     expect((await readiness('claude', 'codex')).agents.map((agent: any) => agent.ready)).toEqual([false, true]);
     // Switched off for this project, it runs nothing here.
     await store.kvSet(credPolicyKey.project(project.id), JSON.stringify({ off: ['key:handle:openai:first'] }));
-    expect(await readiness('codex')).toMatchObject({ agents: [{ provider: 'codex', ready: false }], agentLogin: false });
+    expect(await readiness('codex')).toMatchObject({ agents: [{ provider: 'codex', ready: false, need: { provider: 'codex', off: 'project' } }], agentLogin: false });
     await store.kvDelete(credPolicyKey.project(project.id));
 
     // A compute account of the organization's own.
     await providers.save({ organizationId: 'org_personal', provider: 'e2b', apiKey: 'e2b_test' });
     expect((await readiness()).compute).toEqual({ ready: true, local: false, managed: false, own: true });
+  });
+
+  it('names the model vendor an OpenCode agent needs, and says when its key is only switched off', async () => {
+    const { store, broker, project, readiness } = await boot(true);
+    const argon = 'opencode:openrouter/google/gemini-4-argon';
+    // OpenCode runs on the model vendor's key: OpenRouter's, not an "OpenCode account".
+    expect((await readiness(argon)).agents).toEqual([{ provider: 'opencode', model: 'openrouter/google/gemini-4-argon',
+      ready: false, need: { provider: 'openrouter' } }]);
+    await broker.registerHandle('openrouter:org_personal:work', 'sk-or-test', INSTALLATION_SCOPE);
+    const key = 'key:handle:openrouter:org_personal:work';
+    expect((await readiness(argon)).agents[0]).toMatchObject({ ready: true });
+    // Google's own id needs Google's key: an OpenRouter key does not run it.
+    expect((await readiness('opencode:google/gemini-4-argon')).agents[0]).toMatchObject({ ready: false, need: { provider: 'google' } });
+
+    // A project policy saved while explainer-only existed keeps the key out of
+    // agents: the fix is switching it on here, not adding another account.
+    await store.kvSet(credPolicyKey.project(project.id), JSON.stringify({ explainerOnly: [key] }));
+    expect((await readiness(argon)).agents[0]).toMatchObject({ ready: false, need: { provider: 'openrouter', off: 'project' } });
+    await store.kvSet(credPolicyKey.project(project.id), JSON.stringify({ on: [key] }));
+    expect((await readiness(argon)).agents[0]).toMatchObject({ ready: true });
+    await store.kvDelete(credPolicyKey.project(project.id));
+    // Off for the whole organization: switched on there.
+    await store.kvSet(credPolicyKey.organization('org_personal'), JSON.stringify({ off: [key] }));
+    expect((await readiness(argon)).agents[0]).toMatchObject({ ready: false, need: { provider: 'openrouter', off: 'organization' } });
   });
 
   it('says tavya’s computers are out of credit, and takes a gifted pack as compute', async () => {

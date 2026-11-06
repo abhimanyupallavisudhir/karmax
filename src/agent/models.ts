@@ -280,10 +280,11 @@ const KIMI_CODE_MODELS: AvailableModel[] = [
  * have — and the task waited for a credential forever). Read from models.dev,
  * the catalog OpenCode itself uses, so this needs no `opencode` binary on the
  * control plane: a hosted one runs OpenCode only in sandboxes. Tool-calling
- * text models only, newest first. Empty when the catalog cannot be read.
+ * text models only, newest first: 25 per vendor, and 8 per lab a router such
+ * as OpenRouter serves. Empty when the catalog cannot be read.
  */
 export async function openCodeKeyModels(vendors: readonly string[], options: {
-  fetch?: typeof fetch; timeoutMs?: number; perVendor?: number; now?: number;
+  fetch?: typeof fetch; timeoutMs?: number; perVendor?: number; perRoutedCreator?: number; now?: number;
 } = {}): Promise<AvailableModel[]> {
   if (!vendors.length) return [];
   const now = options.now ?? Date.now();
@@ -303,11 +304,23 @@ export async function openCodeKeyModels(vendors: readonly string[], options: {
     if (vendor === 'kimi') { out.push(...KIMI_CODE_MODELS); continue; }
     const models = catalog?.[vendor]?.models;
     if (!models || typeof models !== 'object') continue;
+    // A router (OpenRouter) lists every lab's models as `creator/model`: the
+    // newest of the whole list are mostly previews of small labs, so it is cut
+    // per creator, the way a vendor's own list is cut. `~creator/…-latest` are
+    // moving aliases of models listed anyway.
+    const kept = new Map<string, number>();
     out.push(...Object.values(models as Record<string, any>)
       .filter((model) => model && typeof model.id === 'string' && model.tool_call === true && model.status !== 'deprecated'
-        && (!Array.isArray(model.modalities?.output) || model.modalities.output.includes('text')))
+        && !model.id.startsWith('~') && (!Array.isArray(model.modalities?.output) || model.modalities.output.includes('text')))
       .sort((a, b) => String(b.release_date ?? '').localeCompare(String(a.release_date ?? '')))
-      .slice(0, options.perVendor ?? 25)
+      .filter((model) => {
+        const slash = model.id.indexOf('/');
+        const creator = slash > 0 ? model.id.slice(0, slash) : '';
+        const count = kept.get(creator) ?? 0;
+        if (count >= (creator ? options.perRoutedCreator ?? 8 : options.perVendor ?? 25)) return false;
+        kept.set(creator, count + 1);
+        return true;
+      })
       .map((model) => ({ id: `${vendor}/${model.id}`, ...(typeof model.name === 'string' ? { displayName: model.name } : {}) })));
   }
   return out;
