@@ -22,6 +22,13 @@ const PAGES = [['landing', '/', true], ['docs', '/docs'], ['pricing', '/pricing'
         try {
           await page.goto(`${APP}${url}`);
           await page.waitForTimeout(1500);
+          // Lazy stills load as they come into view: walk the page first.
+          if (full) {
+            const height = await page.evaluate(() => document.documentElement.scrollHeight);
+            for (let y = 0; y < height; y += 600) { await page.evaluate((top) => scrollTo(0, top), y); await page.waitForTimeout(120); }
+            await page.evaluate(() => scrollTo(0, 0));
+            await page.waitForTimeout(800);
+          }
           await page.screenshot({ path: path.join(OUT, `${name}-${scheme}${suffix}.png`), fullPage: !!full && !suffix });
         } catch (e) { console.error(name, e.message.split('\n')[0]); }
       }

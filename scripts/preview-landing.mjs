@@ -21,6 +21,7 @@ const types = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml', '.png': 'image/png', '.woff2': 'font/woff2', '.json': 'application/json',
   '.webmanifest': 'application/manifest+json', '.txt': 'text/plain; charset=utf-8', '.md': 'text/markdown; charset=utf-8',
+  '.webp': 'image/webp', '.jpg': 'image/jpeg', '.mp4': 'video/mp4', '.webm': 'video/webm',
 };
 const api = {
   '/api/meta': { siteName, hosted: true, version: 'preview' },
@@ -38,6 +39,17 @@ http.createServer((req, res) => {
   let file = path.join(web, path.normalize(url.pathname));
   if (/^\/brand\/[^/]+\.(png|svg)$/.test(url.pathname)) file = path.join(web, 'brand', brandIcon, path.basename(url.pathname));
   if (!file.startsWith(web) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) file = path.join(web, 'index.html');
-  res.writeHead(200, { 'content-type': types[path.extname(file)] || 'application/octet-stream', 'cache-control': 'no-store' });
+  const headers = { 'content-type': types[path.extname(file)] || 'application/octet-stream', 'cache-control': 'no-store', 'accept-ranges': 'bytes' };
+  // The landing's film plays and seeks in byte ranges, as the gateway serves it.
+  const { size } = fs.statSync(file);
+  const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+  if (range && (range[1] || range[2])) {
+    const start = range[1] ? Number(range[1]) : Math.max(0, size - Number(range[2]));
+    const end = range[1] && range[2] ? Math.min(Number(range[2]), size - 1) : size - 1;
+    if (start >= size || start > end) return res.writeHead(416, { 'content-range': `bytes */${size}` }).end();
+    res.writeHead(206, { ...headers, 'content-range': `bytes ${start}-${end}/${size}`, 'content-length': end - start + 1 });
+    return fs.createReadStream(file, { start, end }).pipe(res);
+  }
+  res.writeHead(200, { ...headers, 'content-length': size });
   fs.createReadStream(file).pipe(res);
 }).listen(port, () => console.log(`${siteName} public pages: http://localhost:${port}`));

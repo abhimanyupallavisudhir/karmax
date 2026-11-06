@@ -17,13 +17,13 @@ const signedOut = ({ path }: { path: string }) => path === '/api/meta' ? { siteN
   : path === '/api/launch' ? {} : path === '/api/session' ? { authRequired: true, authenticated: false } : undefined;
 
 describe('public landing page', () => {
-  it('renders the installation\'s name in the homepage and representative screenshot, including its address bar', async () => {
+  it('names the installation in its title, brand and calls to action', async () => {
     const ui = await landing();
     const { page } = ui;
-    expect(await page.title()).toBe('tavya — the to-do list for AI agents');
-    expect(await page.locator('.product-browserbar span').textContent()).toBe('console.test / tavya');
-    expect(await page.locator('.product-wordmark strong').textContent()).toBe('tavya');
-    expect(await page.locator('.product-project.active span').textContent()).toBe('tavya');
+    expect(await page.title()).toBe('tavya — the agentic to-do list that completes itself');
+    expect(await page.locator('.landing-nav .landing-brand').innerText()).toBe('tavya');
+    expect(await page.locator('#landing-start').innerText()).toBe('Get started');
+    expect(await page.locator('#landing-sign-in').innerText()).toBe('Sign in');
     // The issue-tracker URL is a repository identifier, not branding.
     expect(await page.locator('.landing-page').innerText()).not.toMatch(/krmax/i);
     expect(ui.errors).toEqual([]);
@@ -88,190 +88,150 @@ describe('public landing page', () => {
     await ui.close();
   });
 
-  it('carries the product thesis and each promised capability', async () => {
-    const ui = await landing();
-    const text = (await ui.page.locator('.landing-page').innerText()).replace(/\s+/g, ' ');
-    for (const claim of ['vscode was a fancy text editor.', 'tavya is a fancy to-do list.',
-      'The interface for the era of managing agents rather than manually coding/working.',
-      'Agents work parallelly in isolated cloud worlds.', 'Yes, gitignored files are handled correctly.',
-      'secrets, databases, big files', 'Bring your own key or OpenAI/Claude subscription',
-      'tavya MCP lets agents access and manage your tavya projects',
-      'Connect your apps and a payment card, and let agents Just Do Things.',
-      'buy me a website and deploy to it', 'run the experiment on vast.ai', 'As human-in-the-loop as you like.',
-      'robust authorization system', 'Leave the permanent underclass today.'])
-      expect(text).toContain(claim);
-    expect(text.match(/Just do things\./g)).toHaveLength(2);
-    for (const retired of ['password vault and a payment card', 'Everything is a to-do list.', 'No new AI subscription',
-      'The whole idea', 'Human in the loop', 'Your Integrated Management Environment'])
-      expect(text).not.toContain(retired);
-    expect(await ui.page.locator('.landing-page em').allInnerTexts()).toEqual(['one place', 'you']);
-    await ui.close();
-  });
-
-  it('sets the analogy as two plain sentences, a single word space after each name', async () => {
-    const ui = await landing();
-    const lines = ui.page.locator('#landing-title > span');
-    expect(await lines.allInnerTexts()).toEqual(['vscode was a fancy text editor.', 'tavya is a fancy to-do list.']);
-    // The gap between the name and the next word is the font's own space,
-    // not a column padded to the longer name.
-    const gaps = await lines.evaluateAll((spans) => spans.map((span) => {
-      const text = span.firstChild, space = text.data.indexOf(' ');
-      const range = (start: number, end: number) => {
-        const r = document.createRange();
-        r.setStart(text, start); r.setEnd(text, end);
-        return r.getBoundingClientRect();
-      };
-      return (range(space + 1, space + 2).left - range(0, space).right) / parseFloat(getComputedStyle(span).fontSize);
-    }));
-    for (const gap of gaps) expect(gap).toBeLessThan(.35);
-    await ui.close();
-  });
-
-  it('separates the two analogy sentences by more than their line spacing, at any width', async () => {
-    for (const width of [1440, 1100, 961, 800, 390, 320]) {
-      const ui = await landing({ viewport: { width, height: 900 } });
-      const [first, second] = await ui.page.locator('#landing-title > span').evaluateAll((spans) => spans.map((span) => {
-        const box = span.getBoundingClientRect();
-        return { top: box.top, bottom: box.bottom, lineHeight: parseFloat(getComputedStyle(span).lineHeight) };
-      }));
-      // Wrapped lines of one sentence sit lineHeight apart; the sentences sit further.
-      expect(second!.top - first!.bottom, `${width}px`).toBeGreaterThan(first!.lineHeight * .4);
-      expect(await ui.page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-      await ui.close();
-    }
-  });
-
-  it('colours each analogy object in the accent, the past one muted', async () => {
-    const ui = await landing();
-    const colours = await ui.page.locator('#landing-title > span').evaluateAll((spans) => spans.map((span) =>
-      [getComputedStyle(span).color, getComputedStyle(span.querySelector('b')).color]));
-    expect(await ui.page.locator('#landing-title b').allInnerTexts()).toEqual(['text editor.', 'to-do list.']);
-    for (const [sentence, object] of colours) expect(object).not.toBe(sentence);
-    expect(colours[0]![1]).not.toBe(colours[1]![1]); // the past is a muted accent
-    await ui.close();
-  });
-
-  it('wears the console\'s look: its colours, its primary button, light or dark, default or classic', async () => {
-    for (const [skin, scheme] of [['', 'light'], ['', 'dark'], ['classic', 'light']] as const) {
-      const ui = await landing();
-      await ui.page.emulateMedia({ colorScheme: scheme });
-      await ui.run(`applySkin(${JSON.stringify(skin)})`);
-      await ui.page.waitForTimeout(300); // the buttons fade between colours
-      const look = await ui.page.evaluate(() => {
-        const root = getComputedStyle(document.documentElement);
-        const probe = (value: string) => { const el = document.createElement('i'); el.style.color = value; document.body.append(el); const c = getComputedStyle(el).color; el.remove(); return c; };
-        const start = getComputedStyle(document.querySelector('#landing-start'));
-        return {
-          page: getComputedStyle(document.querySelector('.landing-page')).backgroundColor, paper: probe(root.getPropertyValue('--paper')),
-          button: start.backgroundColor, primary: probe(root.getPropertyValue('--primary')),
-          radius: start.borderTopLeftRadius, ink: start.color,
-        };
-      });
-      expect(look.page, `${skin || 'default'} ${scheme}`).toBe(look.paper);
-      expect(look.button, `${skin || 'default'} ${scheme}`).toBe(look.primary);
-      expect(parseFloat(look.radius), 'a pill in the default look, the classic look\'s corner otherwise').toBe(skin ? 8 : 999);
-      await ui.close();
-    }
-  });
-
-  it('pictures today\'s console: New task, the organization\'s places, projects with their For me numbers, sentence case', async () => {
+  // The page is the launch film slowed to reading speed: its tagline, then the
+  // film itself, then each of its scenes with the film's own caption and a
+  // still from that moment (design/landing/film-assets.sh).
+  it('opens on the tagline and the launch film, which plays with sound only when asked', async () => {
     const ui = await landing();
     const { page } = ui;
-    expect(await page.locator('.product-new').innerText()).toBe('New task');
-    expect(await page.locator('.product-nav span').allInnerTexts()).toEqual(['Home', 'Insights', 'Wiki', 'Settings']);
-    expect(await page.locator('.product-project b').allInnerTexts()).toEqual(['2', '1']);
-    expect(await page.locator('.product-person').innerText()).toBe('A\nAda');
-    expect(await page.locator('.product-topline span').allInnerTexts()).toEqual(['Tasks', 'Queues', 'Wiki', 'Project settings']);
-    // No small capitals, and the stage names in the reading face.
-    const caps = await page.evaluate(() => [...document.querySelectorAll('.product-frame *')].filter((el) => getComputedStyle(el).textTransform === 'uppercase').length);
-    expect(caps).toBe(0);
-    expect(await page.locator('.product-stage.done').first().innerText()).toBe('Done');
-    expect(await page.evaluate(() => getComputedStyle(document.querySelector('.product-stage')).fontFamily))
-      .toBe(await page.evaluate(() => getComputedStyle(document.body).fontFamily));
+    expect((await page.locator('#landing-title').innerText()).replace(/\s+/g, ' ')).toBe('The agentic to-do list that completes itself.');
+    expect(await page.locator('#landing-title .gold').innerText()).toBe('completes itself.');
+    const video = page.locator('#landing-film video');
+    expect(await video.evaluate((v: any) => ({ src: v.querySelector('source').getAttribute('src'), type: v.querySelector('source').type,
+      poster: v.getAttribute('poster'), preload: v.preload, autoplay: v.autoplay, controls: v.controls, inline: v.playsInline })))
+      .toEqual({ src: '/landing/film.mp4', type: 'video/mp4', poster: '/landing/poster.webp', preload: 'none', autoplay: false, controls: false, inline: true });
+    // The film is the first thing below the tagline, above the fold on a laptop.
+    const box = (await page.locator('#landing-film').boundingBox())!;
+    expect(box.y).toBeLessThan(900 * .55);
+    expect(box.width / box.height).toBeCloseTo(16 / 9, 1);
+    // Play starts it with sound and hands over the browser's own controls.
+    await page.evaluate(() => { (globalThis as any).HTMLMediaElement.prototype.play = function () { (globalThis as any).played = { muted: this.muted }; return Promise.resolve(); }; });
+    const play = page.getByRole('button', { name: 'Play the launch film 1:40' });
+    await play.click();
+    expect(await page.evaluate(() => (globalThis as any).played)).toEqual({ muted: false });
+    expect(await video.evaluate((v: any) => v.controls)).toBe(true);
+    expect(await play.isVisible()).toBe(false);
+    // "Watch the film" in the hero does the same, from anywhere on the page.
+    expect(await page.locator('#landing-watch').getAttribute('href')).toBe('#landing-film');
     expect(ui.errors).toEqual([]);
     await ui.close();
   });
 
-  it('closes on the brand mark', async () => {
+  it('tells the film\'s story in its own captions, each with a still from that scene', async () => {
     const ui = await landing();
-    const mark = ui.page.locator('.landing-final-mark .mark');
-    expect(await mark.count()).toBe(1);
-    expect((await mark.boundingBox())!.width).toBeGreaterThanOrEqual(60);
-    await ui.close();
-  });
-
-  it('sets type like the console: Inter with its default glyphs and natural tracking', async () => {
-    const ui = await landing();
-    const type = await ui.page.evaluate(() => [...document.querySelectorAll('.landing-page, .landing-page h1, .landing-page h2, .landing-page h3, .landing-intro')]
-      .map((element) => {
-        const style = getComputedStyle(element);
-        const tracking = style.letterSpacing === 'normal' ? 0 : parseFloat(style.letterSpacing) / parseFloat(style.fontSize);
-        return { family: style.fontFamily, features: style.fontFeatureSettings, tracking };
-      }));
-    const consoleFamily = await ui.page.evaluate(() => getComputedStyle(document.body).fontFamily);
-    for (const { family, features, tracking } of type) {
-      expect(family).toBe(consoleFamily);
-      expect(features).toBe('normal'); // no single-storey a or other alternates
-      expect(tracking).toBeGreaterThanOrEqual(-.025);
+    const { page } = ui;
+    const chapters = await page.locator('.landing-chapter').evaluateAll((sections) => sections.map((section: any) => ({
+      title: section.querySelector('h2').innerText.replace(/\s+/g, ' '),
+      gold: [...section.querySelectorAll('h2 .gold')].map((el: any) => el.innerText.replace(/\s+/g, ' ')),
+      stills: [...section.querySelectorAll('img')].map((img: any) => img.getAttribute('src')),
+    })));
+    expect(chapters.map((c) => c.title)).toEqual([
+      'Every project. One list.', 'Say what needs doing.', 'Agents work on their own computers.',
+      'Give agents accounts, keys and a card…', 'Big jobs fan out.', 'Review the result, not the process.',
+      'The autonomous company:', 'Not just code.', 'Dump all your files in…', '…and let it run your life.',
+      'Any model. Your subscription.', 'In your pocket, too.']);
+    expect(chapters.map((c) => c.gold)).toEqual([['One list.'], ['what needs doing.'], ['their own computers.'],
+      ['accounts, keys and a card…'], ['fan out.'], ['result,'], [], ['code.'], ['your files'], ['run your life.'], ['Your subscription.'], []]);
+    expect(chapters.flatMap((c) => c.stills)).toEqual(['list', 'new-task', 'working', 'vault', 'website', 'google-play', 'groceries', 'fan-out', 'review',
+      'ai-review', 'agents-manage', 'starts-itself', 'not-just-code', 'photos', 'flight', 'any-model', 'pocket'].map((name) => `/landing/${name}.webp`));
+    const text = (await page.locator('.landing-page').innerText()).replace(/\s+/g, ' ');
+    for (const caption of ['Code, research papers, grocery shopping, your CV.', 'In plain words. Pick the agent and model, or keep your defaults.',
+      'Your repos, a terminal, a browser — in parallel, while you do something else.', 'They sign up, sign in and pay — only with what you allow.',
+      'One codebase review became 25 sub-tasks, each with its own agent.', 'Agents attach screenshots, reports and commands to check. You approve; it lands.',
+      'Experiments, figures, papers, websites — from the same list.', 'Photos, documents, notes: pushed from your laptop, sorted by an agent, pulled back.',
+      'It reads your documents, uses your logins and pays, with your OK.', 'Claude, Codex or OpenCode — on your Claude or ChatGPT plan, or an API key.',
+      'A new project, one sentence, and an agent on it.'])
+      expect(text).toContain(caption);
+    // Every still is described, lazy below the fold, and sized before it loads (no layout shift).
+    const images = await page.locator('.landing-chapter img').evaluateAll((imgs) => imgs.map((img: any) => ({
+      alt: img.alt, loading: img.loading, width: img.getAttribute('width'), height: img.getAttribute('height') })));
+    for (const image of images) {
+      expect(image.alt.length).toBeGreaterThan(10);
+      expect(image).toMatchObject({ loading: 'lazy', width: '1216', height: '712' });
     }
     await ui.close();
   });
 
-  it('uses a faithful, installation-branded task list to advertise implemented features', async () => {
+  // The film's signature: the gold phrase swaps, and its screen with it.
+  it('swaps the gold phrase and its still like the film, by itself or by choice', async () => {
     const ui = await landing();
     const { page } = ui;
-    expect(await page.getByRole('figure', { name: 'tavya task list showing agents working in parallel' }).count()).toBe(1);
-    expect(await page.locator('.product-task strong').allInnerTexts()).toEqual([
-      'Support e2b cloud environments for agents',
-      'Support Github auto-merge, merge queues in addition to native merge queue',
-      'Password vault: implement git-backed unix pass importer',
-      'Let agents create accounts with agentmail.to',
-      'Add spending limits for agents',
-      'MathJaX support in agent conversations',
-      'Wiki-based agent memory',
-    ]);
-    expect(await page.locator('.product-task .product-stage.done').count()).toBe(7);
-    expect(await page.locator('.product-topline').innerText()).toMatch(/Queues\s+Wiki\s+Project settings/);
+    const swap = page.locator('.landing-swap').first();
+    const state = () => swap.evaluate((el: any) => ({
+      phrase: el.querySelector('.swap-phrase.on').innerText.replace(/\s+/g, ' '),
+      caption: el.querySelector('.swap-caption.on').innerText,
+      still: el.querySelector('.swap-still.on').getAttribute('src'),
+      pressed: [...el.querySelectorAll('[role=tab]')].map((tab: any) => tab.getAttribute('aria-selected')),
+    }));
+    expect(await state()).toEqual({ phrase: 'buy you a website, and deploy to it.', caption: 'A domain on its $25 budget, a login saved to the vault, a deploy on every push.',
+      still: '/landing/website.webp', pressed: ['true', 'false', 'false'] });
+    await swap.getByRole('tab', { name: 'order your groceries' }).click();
+    expect(await state()).toEqual({ phrase: 'order your groceries.', caption: 'Your login, your card, your budget. It never sees the password.',
+      still: '/landing/groceries.webp', pressed: ['false', 'false', 'true'] });
+    // Left alone, it moves on (a chosen phrase holds a while first; never under the pointer).
+    await page.mouse.move(0, 0);
+    await expect.poll(async () => (await state()).phrase, { timeout: 12_000 }).toBe('buy you a website, and deploy to it.');
+    const company = page.locator('.landing-swap').nth(1);
+    expect(await company.locator('[role=tab]').allInnerTexts()).toEqual(['let AI agents review tasks', 'agents can create and manage tasks', 'work that starts itself']);
+    // Only what is shown is announced; the others are hidden from assistive tech.
+    expect(await swap.locator('.swap-phrase:not(.on)').first().getAttribute('aria-hidden')).toBe('true');
     await ui.close();
   });
 
-  it('lists capabilities as a checklist, so an item without detail is just a shorter row', async () => {
-    const ui = await landing();
-    const items = ui.page.locator('.landing-checklist > li');
-    expect(await items.count()).toBe(5);
-    expect(await ui.page.locator('.landing-checklist > li > .landing-tick').count()).toBe(5);
-    expect(await ui.page.locator('.landing-checklist article').count()).toBe(0);
-    const heights = await items.evaluateAll((rows) => rows.map((row) => row.getBoundingClientRect().height));
-    // "Agents work parallelly…" has no detail line; the gitignore item has one.
-    expect(heights[0]).toBeLessThan(heights[1]!);
-    await ui.close();
+  it('is night, like the film, whatever the visitor\'s theme or the installation\'s look', async () => {
+    const backgrounds: string[] = [];
+    for (const scheme of ['light', 'dark'] as const) for (const skin of ['', 'classic']) {
+      const ui = await landing();
+      await ui.page.emulateMedia({ colorScheme: scheme });
+      await ui.run(`applySkin(${JSON.stringify(skin)})`);
+      backgrounds.push(await ui.page.locator('.landing-page').evaluate((el) => getComputedStyle(el).backgroundColor));
+      const start = await ui.page.locator('#landing-start').evaluate((el) => getComputedStyle(el).backgroundImage);
+      expect(start, 'the film\'s gold pill').toMatch(/gradient/);
+      expect(await ui.page.locator('#landing-theme').count()).toBe(0);
+      await ui.close();
+    }
+    expect(new Set(backgrounds).size).toBe(1);
+    expect(backgrounds[0]).toBe('rgb(14, 13, 21)');
   });
 
-  it('follows the system theme until the visitor pins one, sharing the console preference', async () => {
+  it('ends like the film: the mark, "Your turn.", and a way in', async () => {
     const ui = await landing();
     const { page } = ui;
-    const background = () => page.locator('.landing-page').evaluate((element) => (globalThis as any).getComputedStyle(element).backgroundColor);
-    const toggle = page.locator('#landing-theme');
-    await page.emulateMedia({ colorScheme: 'light' });
-    const light = await background();
-    await page.emulateMedia({ colorScheme: 'dark' });
-    const dark = await background();
-    expect(light).not.toBe(dark); // unpinned, it follows the system
-    await ui.run('labelLandingTheme(document.getElementById("landing-theme"))');
-    expect(await toggle.getAttribute('aria-label')).toBe('Switch to light theme');
-    await toggle.click();
-    expect(await page.evaluate(() => [document.documentElement.dataset.theme, localStorage.getItem('karmax-theme')]))
-      .toEqual(['light', 'light']);
-    expect(await toggle.getAttribute('aria-label')).toBe('Switch to dark theme');
-    expect(await background()).toBe(light); // pinned light overrides the dark system theme
-    await page.emulateMedia({ colorScheme: 'light' });
-    await toggle.click();
-    expect(await page.evaluate(() => localStorage.getItem('karmax-theme'))).toBe('dark');
-    expect(await background()).toBe(dark);
+    const mark = page.locator('.landing-final .mark');
+    expect(await mark.count()).toBe(1);
+    expect((await mark.boundingBox())!.width).toBeGreaterThanOrEqual(64);
+    expect((await page.locator('#final-title').innerText()).replace(/\s+/g, ' ')).toBe('Your turn.');
+    expect(await page.locator('#landing-final-start').innerText()).toMatch(/^Get started/);
     await ui.close();
   });
 
-  it('is keyboard-visible, responsive, and respects reduced motion', async () => {
+  // The landing used to paint in a fallback face and switch to Inter a moment
+  // later. The font is preloaded with the page, and a public page waits for it
+  // (briefly) before its first paint.
+  it('never paints in a fallback font', async () => {
+    const html = (await import('node:fs')).readFileSync('web/index.html', 'utf8');
+    expect(html).toContain('<link rel="preload" href="/fonts/inter/InterVariable.woff2" as="font" type="font/woff2" crossorigin />');
+    const ui = await consolePage({ path: '/', api: signedOut });
+    const { page } = ui;
+    await page.route('**/fonts/inter/InterVariable.woff2', async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      await route.fulfill({ body: (await import('node:fs')).readFileSync('web/fonts/inter/InterVariable.woff2'), contentType: 'font/woff2' });
+    });
+    await page.evaluate(() => {
+      const w = globalThis as any;
+      new w.MutationObserver((_: unknown, observer: any) => {
+        if (!w.document.querySelector('.landing-page')) return;
+        w.firstPaintFont = w.document.fonts.check('700 40px Inter') && w.document.fonts.check('400 16px Inter');
+        observer.disconnect();
+      }).observe(w.document.getElementById('app'), { childList: true, subtree: true });
+    });
+    await ui.run('boot()');
+    await page.locator('.landing-page').waitFor();
+    expect(await page.evaluate(() => (globalThis as any).firstPaintFont)).toBe(true);
+    await ui.close();
+  });
+
+  it('is keyboard-visible, fits every width, and holds still for reduced motion', async () => {
     const ui = await landing({ viewport: { width: 1280, height: 900 } });
     const { page } = ui;
     const skip = page.getByRole('link', { name: 'Skip to content' });
@@ -282,26 +242,28 @@ describe('public landing page', () => {
     await expect.poll(top).toBeGreaterThan(0);
     await page.keyboard.press('Tab');
     expect(await page.evaluate(() => getComputedStyle(document.activeElement).outlineStyle)).toBe('solid');
-
-    const navHeight = () => page.locator('.landing-nav-inner').evaluate((element) => element.getBoundingClientRect().height);
-    const wide = await navHeight();
-    await page.setViewportSize({ width: 600, height: 900 });
-    expect(await navHeight()).toBe(58);
-    expect(wide).not.toBe(58);
-
-    const animation = () => page.locator('.product-task').first().evaluate((element) => (globalThis as any).getComputedStyle(element).animationName);
-    expect(await animation()).not.toBe('none');
+    for (const width of [1440, 1100, 800, 390, 320]) {
+      await page.setViewportSize({ width, height: 900 });
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth), `${width}px`).toBe(true);
+    }
+    // Reduced motion: no swapping by itself, no reveal motion; the tabs still work.
+    await page.setViewportSize({ width: 1280, height: 900 });
     await page.emulateMedia({ reducedMotion: 'reduce' });
-    expect(await animation()).toBe('none');
-    expect(await page.locator('.product-stage.working').first().isVisible()).toBe(false);
+    await ui.run('renderLanding()');
+    const phrase = () => page.locator('.landing-swap').first().locator('.swap-phrase.on').innerText();
+    const first = await phrase();
+    await page.waitForTimeout(6000);
+    expect(await phrase()).toBe(first);
+    await page.locator('.landing-swap').first().getByRole('tab', { name: 'order your groceries' }).click();
+    expect(await phrase()).toBe('order your groceries.');
     await ui.close();
   });
 
   it('sends public GitHub links to the issue tracker, never the private repository', async () => {
     const ui = await landing();
     const github = (await ui.page.locator('a[href*="github.com"]').evaluateAll((links) => links.map((link) => link.getAttribute('href'))));
-    expect(github).toEqual(['https://github.com/abhimanyupallavisudhir/krmax-issues/issues',
-      'https://github.com/abhimanyupallavisudhir/krmax-issues/issues']);
+    expect(github.length).toBeGreaterThan(0);
+    for (const href of github) expect(href).toBe('https://github.com/abhimanyupallavisudhir/krmax-issues/issues');
     await ui.close();
   });
 });

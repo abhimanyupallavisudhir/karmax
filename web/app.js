@@ -4732,6 +4732,16 @@ function watchConsoleRevision() {
 }
 
 // ── boot ─────────────────────────────────────────────────────────────────────
+// The first paint waits (briefly) for Inter, preloaded by index.html, so a page
+// never shows in a fallback face and then jumps when the font arrives.
+const FONT_WAIT_MS = 1000;
+function fontsReady() {
+  if (!document.fonts?.load) return Promise.resolve();
+  return Promise.race([
+    Promise.all(['400 16px Inter', '700 16px Inter'].map((font) => document.fonts.load(font))).catch(() => {}),
+    new Promise((resolve) => setTimeout(resolve, FONT_WAIT_MS)),
+  ]);
+}
 async function boot() {
   // Public pages need no session, and must not read one: that provisions a
   // personal workspace and consumes the one-time git-onboarding flag. The
@@ -4750,6 +4760,7 @@ async function boot() {
     S.launch || feedbackFetch('/api/launch').then((response) => response.json()),
   ]);
   applyDocumentBrand();
+  await fontsReady();
   if (publicPage) return publicPage();
   // Better Auth redirects the confirmation link back here with ?verified=1 after
   // marking the address verified. Note it, strip it from the URL, and surface it
@@ -5827,7 +5838,7 @@ function applyDocumentBrand() {
   applySkin(S.meta?.skin);
   document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute('content', siteName());
   document.querySelector('meta[name="description"]')?.setAttribute('content',
-    `${siteName()} is the to-do list for managing AI agents: parallel cloud worlds, review gates, permissions, credentials, and payments in one calm interface.`);
+    `${siteName()} is the agentic to-do list that completes itself. Say what needs doing; agents do it on their own computers, with your accounts and your OK.`);
 }
 
 // The gateway resolves /brand/* against the instance-wide icon setting, so the
@@ -6031,7 +6042,10 @@ function renderShell() {
         </div>
         <div class="rail-top">
           ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
-          <button class="btn primary rail-new-task" id="rail-new-task" type="button" data-shortcut="nav.newTaskDefault" title="${esc(commandHint('New task', 'nav.newTaskDefault'))}">${ICON.plus}<span>New task</span></button>
+          <div class="split-btn rail-new-task-group">
+            <button class="btn primary rail-new-task" id="rail-new-task" type="button" data-shortcut="nav.newTaskDefault" title="${esc(commandHint('New task', 'nav.newTaskDefault'))}">${ICON.plus}<span>New task</span></button>
+            <button class="btn primary split-tip" id="rail-new-from-template" type="button" data-shortcut="nav.newTask" title="${esc(commandHint('New task from template', 'nav.newTask'))}" aria-label="New task from template">${ICON.template}</button>
+          </div>
           <nav class="rail-org-nav" aria-label="Organization">${RAIL_ORG_NAV.map(([id, label, icon, , , , command]) =>
             `<a class="rail-row" id="${id}" data-spa data-shortcut="${command}" href="#">${ICON[icon]}<span>${label}</span></a>`).join('')}</nav>
         </div>
@@ -6057,6 +6071,7 @@ function renderShell() {
     <aside class="hosted-onboarding" id="hosted-onboarding" aria-live="polite" hidden></aside>`;
   $('#rail-palette').addEventListener('click', openPalette);
   $('#rail-new-task').addEventListener('click', () => openNewTaskForm());
+  $('#rail-new-from-template').addEventListener('click', () => openTemplatePicker());
   $('#rail-help').addEventListener('click', openHelp);
   $('#key-echo').addEventListener('animationend', () => echoKeys('')); // faded out
   wireVerificationBanner();
@@ -7045,7 +7060,7 @@ function tasksView() {
   const composer = everywhere || (home && !newTaskProjectId()) ? '' : `
     <div class="composer">
       <button type="button" class="new-task-field" id="expand-task" data-shortcut="nav.newTaskDefault">New task…</button>
-      <button type="button" class="btn icon-only" id="new-from-template" data-shortcut="nav.newTask" title="New task from template" aria-label="New task from template">${ICON.template}</button>
+      <button type="button" class="composer-tip" id="new-from-template" data-shortcut="nav.newTask" title="New task from template" aria-label="New task from template">${ICON.template}</button>
     </div>`;
   // Tags are managed from the Filter menu's Tag picker, not beside the query menus.
   const trailing = everywhere || !home ? '' : projectFilterHtml();
@@ -7537,7 +7552,7 @@ function runSubRow(r) {
         <div class="task-title">${esc(r.title)} <span class="chip ${status}">${esc(stageLabel(v))}</span>${v.approvalRequests ? ' <span class="chip approval-needed">approval needed</span>' : ''}</div>
         <div class="task-sub"><span style="color:var(--ink-3)">${new Date(r.createdAt).toLocaleString()}</span></div>
       </div>
-      <div class="task-right">${pipeline(v, true)}</div>
+      <div class="task-right">${pipeline(v)}</div>
     </div>`;
 }
 
@@ -7612,7 +7627,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
         </div>
         ${ownAsk ? rowAskHtml(t) : ''}
       </div>
-      <div class="task-right">${rowWhen(t)}${pipeline(v, true)}${archiveBtn}</div>
+      <div class="task-right">${rowWhen(t)}${pipeline(v)}${archiveBtn}</div>
     </div>`;
 }
 
@@ -7863,7 +7878,7 @@ function stageIndexOf(stages, stage) {
   return 0;
 }
 
-function pipeline(v, labelled = false) {
+function pipeline(v) {
   const stages = stagesFor(v.workflow);
   // 'escalated' is a blocked, awaiting-human state — NOT a pipeline position. Don't
   // pin it to a stage (it used to mis-map onto Merge); flag the whole track instead.
@@ -7884,11 +7899,7 @@ function pipeline(v, labelled = false) {
     }
     segs += `<span class="${cls}"></span>`;
   }
-  const bar = `<div class="pipeline${escalated ? ' escalated' : ''}" title="${escalated ? 'Escalated — awaiting a human' : esc(stageLabel(v))}">${segs}</div>`;
-  if (!labelled) return bar;
-  // On a row the bar says which stage it is in words too, not by colour alone.
-  const name = done ? 'Done' : escalated ? 'Escalated' : stages[idx]?.label || '';
-  return `<span class="pipeline-labelled">${name ? `<span class="pipeline-label">${esc(name)}</span>` : ''}${bar}</span>`;
+  return `<div class="pipeline${escalated ? ' escalated' : ''}" title="${escalated ? 'Escalated — awaiting a human' : esc(stageLabel(v))}">${segs}</div>`;
 }
 
 // ── task-organization control wiring (views bar + query toolbar + modals) ─────
@@ -27985,154 +27996,202 @@ function openPublicAuth(path, render) {
   render();
 }
 
-// The landing follows the system theme like the console; its toggle pins the
-// other one in the console's own `karmax-theme` preference.
-function landingTheme() {
-  const pinned = document.documentElement?.getAttribute('data-theme');
-  if (pinned === 'light' || pinned === 'dark') return pinned;
-  return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+// The landing is the launch film at reading speed (design/landing/film-assets.sh
+// makes its film and stills from the film's third cut): the film's tagline and
+// the film itself, then each scene with the film's own caption and a still from
+// that moment, and the film's end card. Its captions are the film's, verbatim.
+const LANDING_STILL = { width: 1216, height: 712 };
+function landingStill(name, alt, extra = '') {
+  return `<img class="landing-still${extra}" src="/landing/${name}.webp" alt="${esc(alt)}" loading="lazy" decoding="async" width="${LANDING_STILL.width}" height="${LANDING_STILL.height}">`;
 }
-
-function labelLandingTheme(button) {
-  button.title = landingTheme() === 'light' ? 'Switch to dark theme' : 'Switch to light theme';
-  button.setAttribute('aria-label', button.title);
+// A scene: its headline (`gold` marks the film's gold phrase), caption and still.
+function landingChapter(id, title, caption, still, extra = '') {
+  return `<section class="landing-chapter${extra}" aria-labelledby="${id}">
+    <div><h2 id="${id}">${title}</h2>${caption ? `<p class="landing-caption">${caption}</p>` : ''}</div>
+    ${still}
+  </section>`;
 }
-
-function toggleLandingTheme(button) {
-  const next = landingTheme() === 'light' ? 'dark' : 'light';
-  document.documentElement.setAttribute('data-theme', next);
-  localStorage.setItem('karmax-theme', next);
-  labelLandingTheme(button);
+// The film's signature: "…so it can [phrase]", the gold phrase and its screen
+// swapping together. `items`: [tab label, gold phrase, caption, still, alt].
+function landingSwap(id, lead, items) {
+  return `<div class="landing-swap${lead ? '' : ' follows'}" data-swap>
+    <h3 class="swap-line">${lead ? `<span>${lead}</span>` : ''}<span class="swap-phrases">${items.map(([, phrase], i) =>
+      `<span class="swap-phrase${i ? '' : ' on'}"${i ? ' aria-hidden="true"' : ''}>${phrase}</span>`).join('')}</span></h3>
+    <div class="swap-captions">${items.map(([, , caption], i) => `<p class="swap-caption${i ? '' : ' on'}"${i ? ' aria-hidden="true"' : ''}>${caption}</p>`).join('')}</div>
+    <div class="swap-tabs" role="tablist" aria-label="${esc(lead || 'What it can do')}">${items.map(([label], i) =>
+      `<button type="button" role="tab" id="${id}-tab-${i}" aria-controls="${id}-panel" aria-selected="${!i}" tabindex="${i ? -1 : 0}">${label}</button>`).join('')}</div>
+    <div class="swap-stills" id="${id}-panel" role="tabpanel" aria-labelledby="${id}-tab-0">${items.map(([, , , still, alt], i) =>
+      `<img class="swap-still${i ? '' : ' on'}" src="/landing/${still}.webp" alt="${esc(alt)}"${i ? ' aria-hidden="true"' : ''} loading="lazy" decoding="async" width="${LANDING_STILL.width}" height="${LANDING_STILL.height}">`).join('')}</div>
+  </div>`;
 }
 
 function renderLanding() {
-  // Seven real tasks the platform shipped. Each agent finishes at its own moment
-  // (`--d`), so the hero plays out as parallel work landing, then rests at done.
-  const tasks = [
-    ['Support e2b cloud environments for agents', 2.1],
-    ['Support Github auto-merge, merge queues in addition to native merge queue', 3.6],
-    ['Password vault: implement git-backed <code>unix pass</code> importer', 2.8],
-    ['Let agents create accounts with agentmail.to', 4.3],
-    ['Add spending limits for agents', 1.6],
-    ['MathJaX support in agent conversations', 3.1],
-    ['Wiki-based agent memory', 2.4],
-  ];
-  const tick = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.6 8.4l2.9 2.9 5.9-6.6"/></svg>';
-  const check = (title, detail = '') => `<li><span class="landing-tick">${tick}</span><div><h3>${title}</h3>${detail}</div></li>`;
+  const name = siteNameMarkup();
+  const play = '<svg viewBox="0 0 12 14" aria-hidden="true"><path d="M0 0 12 7 0 14z"/></svg>';
   document.body.classList.add('landing-active');
-  document.title = `${siteName()} — the to-do list for AI agents`;
+  document.title = `${siteName()} — the agentic to-do list that completes itself`;
   $('#app').innerHTML = `<div class="landing-page">
     <a class="landing-skip" href="#landing-main">Skip to content</a>
     <header class="landing-nav" aria-label="Primary navigation"><div class="landing-nav-inner">
-      <div class="landing-identity"><a class="landing-brand" href="/" aria-label="${siteNameMarkup()} home">${brandMark()}<span>${siteNameMarkup()}</span></a><p class="landing-tagline">Just do things.</p></div>
-      <div class="landing-nav-actions">
+      <a class="landing-brand" href="/" aria-label="${name} home">${brandMark()}<span>${name}</span></a>
+      <nav class="landing-nav-actions" aria-label="Site">
         <a href="/docs" class="landing-text-link">Docs</a>
         <a href="/pricing" class="landing-text-link">Pricing</a>
-        <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
-        <button class="landing-theme" id="landing-theme" type="button" aria-label="Switch theme"><svg class="sun" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3.4"/><path d="M10 1.8v2M10 16.2v2M1.8 10h2M16.2 10h2M4.2 4.2l1.4 1.4M14.4 14.4l1.4 1.4M4.2 15.8l1.4-1.4M14.4 5.6l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 20 20" aria-hidden="true"><path d="M16.4 12.6A6.8 6.8 0 0 1 7.4 3.6a6.8 6.8 0 1 0 9 9z"/></svg></button>
         <a class="landing-sign-in" id="landing-sign-in" href="/login">Sign in</a>
         <a class="landing-start" id="landing-start" href="/signup">Get started</a>
-      </div>
+      </nav>
     </div></header>
 
     <main id="landing-main">
       <section class="landing-hero" aria-labelledby="landing-title">
-        <div class="landing-hero-copy">
-          <h1 id="landing-title" class="landing-analogy"><span>vscode was a fancy <b>text editor.</b></span> <span>${siteNameMarkup()} is a fancy <b>to-do list.</b></span></h1>
-          <p class="landing-intro">The interface for the era of <strong>managing agents</strong> rather than <s>manually coding/working</s>.</p>
-          <div class="landing-hero-actions">
-            <a class="landing-start landing-start-large" id="landing-hero-start" href="/signup">Start managing agents <span aria-hidden="true">→</span></a>
-          </div>
+        <h1 id="landing-title">The agentic to-do list that <span class="gold">completes itself.</span></h1>
+        <p class="landing-lede">Say what needs doing. Agents do it on their own computers, with your accounts, your budget and your OK.</p>
+        <div class="landing-hero-actions">
+          <a class="landing-start landing-start-large" id="landing-hero-start" href="/signup">Get started <span aria-hidden="true">→</span></a>
+          <a class="landing-watch" id="landing-watch" href="#landing-film">${play}Watch the film <small>1:40</small></a>
         </div>
-
-        <figure class="product-frame" aria-label="${siteNameMarkup()} task list showing agents working in parallel">
-          <div class="product-browserbar"><i></i><i></i><i></i><span>${esc(location.host)} / ${siteNameMarkup()}</span><b>⌘ K</b></div>
-          <div class="product-shell">
-            <aside class="product-rail">
-              <div class="product-wordmark">${brandMark()}<strong>${siteNameMarkup()}</strong></div>
-              <div class="product-new">${ICON.plus}New task</div>
-              <div class="product-nav">${[['home', 'Home'], ['insights', 'Insights'], ['wiki', 'Wiki'], ['settings', 'Settings']]
-                .map(([icon, label]) => `<span>${ICON[icon]}${label}</span>`).join('')}</div>
-              <small>Projects</small>
-              <div class="product-project active">${ICON.project}<span>${siteNameMarkup()}</span><b>2</b></div>
-              <div class="product-project">${ICON.project}<span>Website</span><b>1</b></div>
-              <div class="product-project">${ICON.project}<span>Research</span></div>
-              <div class="product-rail-spacer"></div>
-              <div class="product-person"><i>A</i>Ada</div>
-            </aside>
-            <div class="product-main">
-              <div class="product-topline"><span>Tasks</span><span>Queues</span><span>Wiki</span><span>Project settings</span></div>
-              <div class="product-compose">New task…</div>
-              <div class="product-list-head"><span>For me</span><span class="on">Active</span><span>Scheduled</span><span class="product-count">7 tasks</span></div>
-              <div class="product-list">${tasks.map(([title, delay]) => `
-              <article class="product-task" style="--d:${delay}s">
-                <span class="product-check">${tick}</span>
-                <div><strong>${title}</strong></div>
-                <span class="product-pipe" aria-hidden="true"><i></i></span>
-                <div class="product-stages"><span class="product-stage working" aria-hidden="true">Working</span><div class="product-stage done">Done</div></div>
-              </article>`).join('')}
-              </div>
-            </div>
-          </div>
+        <figure class="landing-film" id="landing-film">
+          <video poster="/landing/poster.webp" preload="none" playsinline aria-label="The ${name} launch film"><source src="/landing/film.mp4" type="video/mp4"></video>
+          <button type="button" class="film-play"><span class="film-play-disc">${play}</span><span class="sr-only">Play the launch film</span><span class="film-play-len">1:40</span></button>
         </figure>
       </section>
 
-      <section class="landing-principles" aria-labelledby="principles-title">
-        <h2 id="principles-title">Your agents need a place to work.<br>Your attention needs <em>one place</em> to look.</h2>
-        <ul class="landing-checklist">
-          ${check('Agents work parallelly in isolated cloud worlds.')}
-          ${check('Yes, gitignored files are handled correctly.', '<p>secrets, databases, big files</p>')}
-          ${check('Bring your own key or OpenAI/Claude subscription')}
-          ${check(`${siteNameMarkup()} MCP lets agents access and manage your ${siteNameMarkup()} projects`, '<p>if you authorize it.</p>')}
-          ${check('Connect your apps and a payment card, and let agents Just Do Things.',
-            `<p>E.g. just create a task</p><div class="landing-examples"><span><i></i>buy me a website and deploy to it</span><span><i></i>run the experiment on vast.ai</span></div>`)}
-        </ul>
-      </section>
-
-      <section class="landing-control" aria-labelledby="control-title">
-        <div class="landing-control-head">
-          <h2 id="control-title">As human-in-the-loop<br>as <em>you</em> like.</h2>
-          <p>Want a human-managed to-do list of AI engineers? Want the automated company? ${siteNameMarkup()} can do both.</p>
+      <div class="landing-chapters">
+        ${landingChapter('ch-list', 'Every project. <span class="gold">One list.</span>', 'Code, research papers, grocery shopping, your CV.',
+          landingStill('list', `The ${siteName()} list: tasks from every project, each with its stage`))}
+        <div class="landing-row">
+          ${landingChapter('ch-say', 'Say <span class="gold">what needs doing.</span>', 'In plain words. Pick the agent and model, or keep your defaults.',
+            landingStill('new-task', 'A new task: “Update my CV to include tavya under my list of projects”'))}
+          ${landingChapter('ch-computers', 'Agents work on <span class="gold">their own computers.</span>', 'Your repos, a terminal, a browser — in parallel, while you do something else.',
+            landingStill('working', 'An agent reading a site’s code and running commands on its own computer'))}
         </div>
-        <div class="landing-control-list">
-          <article><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3v5M15 3v5M6.5 8h11v3.5a5.5 5.5 0 0 1-11 0zM12 17v4"/></svg><p>${siteNameMarkup()} MCP lets agents create new tasks, manage tasks, manage settings—<strong>anything a human can do.</strong></p></article>
-          <article><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M3 19a5 5 0 0 1 10 0"/><rect x="14.5" y="4.5" width="6" height="6" rx="1.5"/><path d="M17.5 13v3.5M14 19.5h7M16 16.5h3"/></svg><p><strong>Review and human input stages</strong> can be assigned to either a human or an agent.</p></article>
-          <article><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7.5 3v5.5c0 4.6-3.2 8.2-7.5 9.5-4.3-1.3-7.5-4.9-7.5-9.5V6z"/><path d="M8.8 12.2l2.2 2.2 4.2-4.6"/></svg><p>${siteNameMarkup()} comes with a robust <strong>authorization system</strong>, so you decide whether to give agents these permissions.</p></article>
+        <section class="landing-chapter" aria-labelledby="ch-accounts">
+          <div class="landing-split">
+            <div><h2 id="ch-accounts">Give agents <span class="gold">accounts, keys and a card…</span></h2>
+              <p class="landing-caption">They sign up, sign in and pay — only with what you allow.</p></div>
+            ${landingStill('vault', 'The vault: logins and API keys agents may use, each with its own policy')}
+          </div>
+          ${landingSwap('swap-can', '…so it can', [
+            ['buy you a website', 'buy you a website, and deploy to it.', 'A domain on its $25 budget, a login saved to the vault, a deploy on every push.',
+              'website', 'The agent’s report: tavya.io bought for $14.70, its login saved, DNS set, deploying on every push'],
+            ['put your app on Google Play', 'put your app on Google Play, and stay on top of it.', 'It asks for each account as it needs it. You approve with a click.',
+              'google-play', 'The agent’s report: the app is on Google Play, with a repeatable task that releases each build'],
+            ['order your groceries', 'order your groceries.', 'Your login, your card, your budget. It never sees the password.',
+              'groceries', 'The agent’s report: 14 items for $71.40, delivered Saturday 8–10 am'],
+          ])}
+        </section>
+        <div class="landing-row">
+          ${landingChapter('ch-fan', 'Big jobs <span class="gold">fan out.</span>', 'One codebase review became 25 sub-tasks, each with its own agent.',
+            landingStill('fan-out', 'A codebase review and its 25 sub-tasks, each with its own agent'))}
+          ${landingChapter('ch-review', 'Review the <span class="gold">result,</span> not the process.', 'Agents attach screenshots, reports and commands to check. You approve; it lands.',
+            landingStill('review', 'A review: the old and new homepage side by side, on a computer and a phone'))}
         </div>
-      </section>
+        <section class="landing-chapter" aria-labelledby="ch-company">
+          <div><h2 id="ch-company">The autonomous company:</h2></div>
+          ${landingSwap('swap-company', '', [
+            ['let AI agents review tasks', 'let AI agents review tasks.', 'Hand Review to an agent, with your instructions. It checks, then it lands.',
+              'ai-review', 'A reviewing agent’s verdict: confirmed, with what it checked'],
+            ['agents can create and manage tasks', 'agents can create and manage tasks.', `${name} agents can manage ${name} through MCP.`,
+              'agents-manage', 'An agent setting up repeatable tasks that watch for new releases'],
+            ['work that starts itself', 'work that starts itself.', 'Tasks can have dependencies, schedules or be triggered by webhooks and events.',
+              'starts-itself', 'Repeatable tasks that start on a failed workflow, an issue or a new release'],
+          ])}
+        </section>
+        <div class="landing-row" style="--n:3">
+          ${landingChapter('ch-code', 'Not just <span class="gold">code.</span>', 'Experiments, figures, papers, websites — from the same list.',
+            landingStill('not-just-code', 'An experiment’s figure, made and attached by an agent'))}
+          ${landingChapter('ch-files', 'Dump all <span class="gold">your files</span> in…', 'Photos, documents, notes: pushed from your laptop, sorted by an agent, pulled back.',
+            landingStill('photos', 'Photos sorted by an agent into albums by trip and theme'))}
+          ${landingChapter('ch-life', '…and let it <span class="gold">run your life.</span>', 'It reads your documents, uses your logins and pays, with your OK.',
+            landingStill('flight', 'The agent’s report: a flight booked within a $500 budget'))}
+        </div>
+        <div class="landing-row">
+          ${landingChapter('ch-model', 'Any model. <span class="gold">Your subscription.</span>', 'Claude, Codex or OpenCode — on your Claude or ChatGPT plan, or an API key.',
+            landingStill('any-model', 'Models compared by cost and intelligence, to pick one for a task'))}
+          ${landingChapter('ch-pocket', 'In your pocket, too.', 'Project wiki and skills, teams and Avatārs, live previews, your own cloud accounts, insights.',
+            landingStill('pocket', `${siteName()} on two phones: a task list and an agent’s answer`, ' bare'))}
+        </div>
+      </div>
 
       <section class="landing-final" aria-labelledby="final-title">
-        <div class="landing-final-mark" aria-hidden="true">${brandMark()}</div>
-        <h2 id="final-title">Leave the permanent<br>underclass today.</h2>
-        <a class="landing-start landing-start-large" id="landing-final-start" href="/signup">Get started with ${siteNameMarkup()} <span aria-hidden="true">→</span></a>
+        ${brandMark()}
+        <h2 id="final-title">Your <span class="gold">turn.</span></h2>
+        <p>A new project, one sentence, and an agent on it.</p>
+        <a class="landing-start landing-start-large" id="landing-final-start" href="/signup">Get started with ${name} <span aria-hidden="true">→</span></a>
+        <small>Open to everyone, starting today.</small>
       </section>
     </main>
 
-    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${siteNameMarkup()}</span></a><p>Just do things.</p><a href="/docs">Docs</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${name}</span></a><p>The agentic to-do list that completes itself.</p><a href="/docs">Docs</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
   </div>`;
 
   const signIn = () => openPublicAuth('/login', renderLogin);
   const signUp = () => openPublicAuth('/signup', renderSignup);
   $('#landing-sign-in')?.addEventListener('click', plainClick(signIn));
   ['landing-start', 'landing-hero-start', 'landing-final-start'].forEach((id) => $(`#${id}`)?.addEventListener('click', plainClick(signUp)));
-  const theme = $('#landing-theme');
-  if (theme) {
-    labelLandingTheme(theme);
-    theme.addEventListener('click', () => toggleLandingTheme(theme));
-  }
-  // The checklist ticks itself off as it scrolls into view. Without an
-  // observer the ticks simply render checked.
-  const checklist = $('.landing-checklist');
-  if (checklist && 'IntersectionObserver' in window) {
-    checklist.classList.add('will-tick');
-    const observer = new IntersectionObserver(([entry]) => {
-      if (!entry.isIntersecting) return;
-      checklist.classList.add('ticked');
-      observer.disconnect();
-    }, { threshold: 0.3 });
-    observer.observe(checklist);
-  }
+  wireLandingFilm();
+  document.querySelectorAll('.landing-swap').forEach(wireLandingSwap);
   window.onpopstate = () => boot();
+}
+
+// The film plays with sound, and only when asked: a poster with a play button,
+// then the browser's own controls. "Watch the film" brings it into view first.
+function wireLandingFilm() {
+  const film = $('#landing-film');
+  const video = film?.querySelector('video');
+  if (!video) return;
+  const start = () => {
+    film.classList.add('playing');
+    video.controls = true;
+    video.muted = false;
+    video.play()?.catch?.(() => {}); // the controls stay, to try again
+  };
+  film.querySelector('.film-play').addEventListener('click', start);
+  $('#landing-watch')?.addEventListener('click', (event) => {
+    event.preventDefault();
+    const still = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    film.scrollIntoView({ behavior: still ? 'auto' : 'smooth', block: 'center' });
+    start();
+  });
+}
+
+// The swap moves on by itself every few seconds (never with reduced motion,
+// never while a pointer or the keyboard is on it, and only while the page is
+// shown); a chosen phrase holds a while before it does. Arrow keys move
+// between the tabs.
+const SWAP_EVERY_MS = 4500, SWAP_HOLD_MS = 6000;
+function wireLandingSwap(swap) {
+  const tabs = [...swap.querySelectorAll('[role="tab"]')];
+  const layers = ['.swap-phrase', '.swap-caption', '.swap-still'].map((selector) => [...swap.querySelectorAll(selector)]);
+  const panel = swap.querySelector('[role="tabpanel"]');
+  let current = 0, holdUntil = 0;
+  const show = (index) => {
+    current = (index + tabs.length) % tabs.length;
+    tabs.forEach((tab, i) => { tab.setAttribute('aria-selected', String(i === current)); tab.tabIndex = i === current ? 0 : -1; });
+    for (const layer of layers) layer.forEach((el, i) => {
+      el.classList.toggle('on', i === current);
+      if (i === current) el.removeAttribute('aria-hidden'); else el.setAttribute('aria-hidden', 'true');
+    });
+    panel?.setAttribute('aria-labelledby', tabs[current].id);
+  };
+  tabs.forEach((tab, i) => {
+    tab.addEventListener('click', () => { show(i); holdUntil = Date.now() + SWAP_HOLD_MS; });
+    tab.addEventListener('keydown', (event) => {
+      const step = { ArrowRight: 1, ArrowLeft: -1 }[event.key];
+      if (!step) return;
+      event.preventDefault();
+      show(current + step);
+      holdUntil = Date.now() + SWAP_HOLD_MS;
+      tabs[current].focus();
+    });
+  });
+  if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return;
+  const timer = setInterval(() => {
+    if (!swap.isConnected) return clearInterval(timer);
+    const engaged = swap.matches(':hover') || !!swap.querySelector(':focus-visible');
+    if (engaged || document.hidden || Date.now() < holdUntil) return;
+    show(current + 1);
+  }, SWAP_EVERY_MS);
 }
 
 // Sign in and create account are one page, at /login and /signup alike: the

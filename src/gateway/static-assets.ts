@@ -17,6 +17,9 @@ const gzip = promisify(zlib.gzip);
 
 type Encoding = 'br' | 'gzip';
 
+/** Media: streamed from disk in byte ranges (a browser seeks a video in ranges;
+ *  Safari will not play one without them), never held in memory or compressed. */
+const STREAMED = new Set(['.mp4', '.webm']);
 /** Text formats worth compressing; fonts and images are compressed already. */
 const COMPRESSIBLE = new Set(['.html', '.js', '.mjs', '.cjs', '.css', '.svg', '.json', '.txt', '.webmanifest', '.map', '.md']);
 /** Below this, compression costs more than the bytes it saves. */
@@ -187,6 +190,7 @@ export async function serveStaticAsset(
   transform?: (data: Buffer) => Buffer | Promise<Buffer>,
   { status = 200, headers: extra = {} }: { status?: number; headers?: Record<string, string> } = {},
 ): Promise<void> {
+  if (!transform && status === 200 && STREAMED.has(path.extname(file))) return serveMediaAsset(req, res, file, extra);
   const source = await readFile(file);
   const data = transform ? await transform(source.data) : source.data;
   const revision = transform ? revisionOf(data) : source.revision;
@@ -208,4 +212,44 @@ export async function serveStaticAsset(
   headers['content-length'] = String(body.length);
   res.writeHead(status, headers);
   res.end(req?.method === 'HEAD' ? undefined : body);
+}
+
+/** A media file, whole or one byte range (RFC 9110 §14), straight from disk.
+ *  Its validator is its size and modification time, so a 14 MB film is never
+ *  hashed or cached in memory. A range the server does not handle (several
+ *  ranges) is answered with the whole file, as the RFC allows. */
+async function serveMediaAsset(req: http.IncomingMessage | undefined, res: http.ServerResponse, file: string,
+  extra: Record<string, string>): Promise<void> {
+  const stat = await fs.promises.stat(file);
+  const headers: Record<string, string> = { ...staticAssetHeaders(file, req?.headers.host), ...extra, 'accept-ranges': 'bytes' };
+  const etag = `"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`;
+  headers.etag = etag;
+  const matches = String(req?.headers['if-none-match'] ?? '')
+    .split(',').map((tag) => tag.trim().replace(/^W\//, ''))
+    .some((tag) => tag === etag || tag === '*');
+  if (matches) {
+    res.writeHead(304, headers);
+    return void res.end();
+  }
+  let start = 0, end = stat.size - 1, status = 200;
+  const range = /^bytes=(\d*)-(\d*)$/.exec(String(req?.headers.range ?? '').trim());
+  if (range && (range[1] || range[2]) && stat.size > 0) {
+    start = range[1] ? Number(range[1]) : Math.max(0, stat.size - Number(range[2]));
+    end = range[1] && range[2] ? Math.min(Number(range[2]), stat.size - 1) : stat.size - 1;
+    if (start >= stat.size || start > end) {
+      res.writeHead(416, { ...headers, 'content-range': `bytes */${stat.size}` });
+      return void res.end();
+    }
+    status = 206;
+    headers['content-range'] = `bytes ${start}-${end}/${stat.size}`;
+  }
+  headers['content-length'] = String(stat.size ? end - start + 1 : 0);
+  res.writeHead(status, headers);
+  if (req?.method === 'HEAD' || !stat.size) return void res.end();
+  await new Promise<void>((resolve) => {
+    const stream = fs.createReadStream(file, { start, end });
+    stream.on('error', () => { res.destroy(); resolve(); });
+    res.on('close', () => { stream.destroy(); resolve(); });
+    stream.pipe(res);
+  });
 }

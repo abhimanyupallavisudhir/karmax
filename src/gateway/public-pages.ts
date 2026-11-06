@@ -49,7 +49,7 @@ export type PublicRoute =
   | { kind: 'console' };
 
 /** The tagline the landing and its title share. */
-export const LANDING_TAGLINE = 'the to-do list for AI agents';
+export const LANDING_TAGLINE = 'the agentic to-do list that completes itself';
 
 const DEFAULT_DOC = 'getting-started';
 
@@ -131,12 +131,12 @@ export function publicPaths(ctx: Pick<PublicPageContext, 'staticDir' | 'launch'>
 function page(ctx: PublicPageContext, pathname: string): PublicPage | 'not-found' | undefined {
   const site = ctx.siteName;
   if (pathname === '/') {
-    const description = `${site} is ${LANDING_TAGLINE}. They work in parallel on their own cloud computers; you review their work. Use your Claude or OpenAI subscription.`;
+    const description = `${site} is ${LANDING_TAGLINE}. Say what needs doing; agents do it on their own computers, with your accounts and your OK.`;
     const offers = ctx.launch.pricingCatalog.map((plan) => ({ '@type': 'Offer', name: plan.name,
       price: (plan.monthlyBasePriceCents / 100).toFixed(2), priceCurrency: plan.currency.toUpperCase(), url: `${ctx.origin}/pricing` }));
     return {
       path: '/', title: `${site} — ${LANDING_TAGLINE}`, name: `${site} — ${LANDING_TAGLINE}`, description,
-      body: `<h1>vscode was a fancy text editor. ${esc(site)} is a fancy to-do list.</h1>
+      body: `<h1>The agentic to-do list that completes itself.</h1>
 <p>${esc(description)}</p>
 <p><a href="/signup">Get started</a> · <a href="/login">Sign in</a></p>`,
       structuredData: { '@context': 'https://schema.org', '@graph': [

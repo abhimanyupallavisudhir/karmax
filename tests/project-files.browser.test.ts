@@ -11,7 +11,7 @@ import { projectFilesFixture } from './helpers/project-files-fixture.js';
 // the host mirror, data from a real restic repository mounted at site/data/raw.
 // Screens land in design/files/ when SHOTS=1.
 
-declare const document: any, location: any;
+declare const document: any, location: any, window: any;
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -303,6 +303,7 @@ it('switches to a branch or a task with the picker, opens an agent’s cited fil
 // Click the address bar's empty right end (past the breadcrumbs), wherever the bar ends.
 async function clickAddressEnd(page: Page) {
   const address = page.locator('#files-address');
+  await address.waitFor(); // boundingBox() does not wait: null before the view renders
   const box = (await address.boundingBox())!;
   await address.click({ position: { x: box.width - 12, y: box.height / 2 } });
 }

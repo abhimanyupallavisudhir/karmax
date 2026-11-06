@@ -52,7 +52,8 @@ export async function consolePage(options: { api?: ApiHandler; viewport?: { widt
     const url = new URL(request.url());
     if (!url.pathname.startsWith('/api/')) {
       const file = path.join(WEB, url.pathname);
-      if (url.pathname.startsWith('/fonts/') && fs.existsSync(file)) return route.fulfill({ body: fs.readFileSync(file) });
+      if (/^\/(?:fonts|landing|brand)\//.test(url.pathname) && fs.existsSync(file)) return route.fulfill({ body: fs.readFileSync(file),
+        contentType: ({ '.webp': 'image/webp', '.mp4': 'video/mp4', '.png': 'image/png', '.svg': 'image/svg+xml', '.woff2': 'font/woff2' } as Record<string, string>)[path.extname(file)] });
       return route.fulfill({ contentType: 'text/html',
         body: '<!doctype html><html><body><div id="app"><main id="main"></main></div><div id="overlay-root"></div><div id="modal-root"></div><div id="toasts"></div><div id="action-progress"></div></body></html>' });
     }

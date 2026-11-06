@@ -26,6 +26,7 @@ describe('console static assets over HTTP', () => {
   let base: string;
   let close: () => Promise<void>;
   const appJs = 'export const line = "console asset";\n'.repeat(4000);
+  const film = Buffer.from(Array.from({ length: 10_000 }, (_, i) => i % 251));
 
   /** node:http, not fetch: fetch decompresses transparently and hides the encoding. */
   function raw(pathname: string, headers: Record<string, string> = {}, method = 'GET') {
@@ -46,6 +47,8 @@ describe('console static assets over HTTP', () => {
       '<!doctype html><html><head><title>krmax</title><meta name="description" content="x" /></head><body></body></html>');
     fs.writeFileSync(path.join(dir, 'app.js'), appJs);
     fs.writeFileSync(path.join(dir, 'routing.test.cjs'), 'require("node:test");');
+    fs.mkdirSync(path.join(dir, 'landing'));
+    fs.writeFileSync(path.join(dir, 'landing', 'film.mp4'), film);
     const store = await Store.create(':memory:');
     const gateway = await Gateway.create({
       store,
@@ -145,6 +148,38 @@ describe('console static assets over HTTP', () => {
     expect(head.status).toBe(200);
     expect(head.body.length).toBe(0);
     expect(head.headers.etag).toMatch(/^"/);
+  });
+
+  // The landing's film: a browser plays and seeks it in byte ranges (Safari
+  // will not play a video without them), straight from disk, uncompressed.
+  it('serves a video in byte ranges, with a validator', async () => {
+    const whole = await raw('/landing/film.mp4');
+    expect(whole.status).toBe(200);
+    expect(whole.headers['content-type']).toBe('video/mp4');
+    expect(whole.headers['accept-ranges']).toBe('bytes');
+    expect(whole.headers['content-encoding']).toBeUndefined();
+    expect(whole.headers['content-length']).toBe('10000');
+    expect(whole.body.equals(film)).toBe(true);
+    const etag = whole.headers.etag as string;
+    expect(etag).toMatch(/^"[^"]+"$/);
+
+    const part = await raw('/landing/film.mp4', { range: 'bytes=100-199' });
+    expect(part.status).toBe(206);
+    expect(part.headers['content-range']).toBe('bytes 100-199/10000');
+    expect(part.headers['content-length']).toBe('100');
+    expect(part.body.equals(film.subarray(100, 200))).toBe(true);
+    // Open-ended and suffix ranges, as media elements send them.
+    expect((await raw('/landing/film.mp4', { range: 'bytes=9990-' })).body.equals(film.subarray(9990))).toBe(true);
+    expect((await raw('/landing/film.mp4', { range: 'bytes=-10' })).body.equals(film.subarray(9990))).toBe(true);
+    const beyond = await raw('/landing/film.mp4', { range: 'bytes=20000-' });
+    expect(beyond.status).toBe(416);
+    expect(beyond.headers['content-range']).toBe('bytes */10000');
+    // A range the server does not understand gets the whole file.
+    expect((await raw('/landing/film.mp4', { range: 'bytes=1-2,5-6' })).status).toBe(200);
+    expect((await raw('/landing/film.mp4', { 'if-none-match': etag })).status).toBe(304);
+    const head = await raw('/landing/film.mp4', {}, 'HEAD');
+    expect(head.headers['content-length']).toBe('10000');
+    expect(head.body.length).toBe(0);
   });
 
   it('does not publish the console test suites', async () => {
