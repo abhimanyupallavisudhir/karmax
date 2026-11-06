@@ -4,7 +4,7 @@ Three versions live here:
 
 | Version | Where | How it is made |
 | --- | --- | --- |
-| First cut (1:03, dark) | `first-cut/` | Stills of a clone composited frame by frame (`first-cut/README.md`). |
+| **First cut — the final version** (0:59, dark) | `first-cut/` | Stills of a clone composited frame by frame (`first-cut/README.md`). |
 | Second (≈2:27, light) | this folder | One recorded take of the clone (below); `snappy.sh` makes it. |
 | Third (≈1:40, dark) | `third-cut/` | The first cut's compositor and style, new screens captured from this folder's clone (`third-cut/README.md`). |
 
