@@ -169,6 +169,7 @@ const PROMPTS = {
   flight: 'Book me the cheapest direct flight to London on January 3 with reasonable timings. My passport, loyalty card numbers etc. are in this folder.',
   finale: 'Create a launch video for tavya.io that shows just how great it is',
   ending: 'Build something great.',
+  files: 'Tavya projects should have a "files" page giving users a clean file explorer to browse through the tavya project---all the repos, including data where it is mounted, and an address bar. It should include file views for text files (I don\'t just mean txt files).',
 };
 const NEW_PROJECT = 'big-idea';
 
@@ -364,6 +365,9 @@ const NEW_PROJECT = 'big-idea';
     if (manifest['finale-viewer']) manifest['finale-viewer'].boxes.picture = pic;
     }
     fs.writeFileSync(path.join(OUT, 'shots.json'), JSON.stringify(manifest, null, 1));
+    // ── "Say what needs doing": tavya #846, typed (owner's choice, 2026-11-06) ──
+    if (want('files')) await typed('files-type', 'tavya', PROMPTS.files, { models: 'files-models', every: 3 });
+
     // ── the ending: a new project, and its first task ──
     if (want('ending')) {
       await go('/personal?q=-is%3Aarchived', 1500);

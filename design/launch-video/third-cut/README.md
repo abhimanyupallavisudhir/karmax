@@ -7,7 +7,8 @@ browser window with a camera, the dark backdrop), extended:
   and **The autonomous company: [let AI agents review tasks] [agents can create and
   manage tasks] [work that starts itself]**: the prefix stays, the gold phrase swaps
   with each screen (`swapHeadline`).
-- The CV task typed, the photos pushed and pulled from a laptop (`terminal`, the CLI's
+- "Every project. One list." shows the first cut's list (`home-original.sh` recovers it from
+  the first cut's render); "Say what needs doing" types tavya #846 (the Files page). Then the photos pushed and pulled from a laptop (`terminal`, the CLI's
   real output), a flight booked, the store's triage / build / repair automations.
 - The ending (owner's change, 2026-11-05): **Your turn.** A new project (`big-idea`) is
   created from the + beside Projects, its first task "Build something great." is typed and
@@ -25,6 +26,8 @@ design/launch-video/third-cut/make.sh /tmp/stills --stills 5,30,90   # single fr
 # Changed only the last scenes, without the earlier scenes' screens? Re-render from a
 # scene boundary and splice onto the previous render (music regenerated for the new length):
 design/launch-video/third-cut/splice.sh previous.mp4 out.mp4 87.6
+# …or only a middle stretch (same timing; the previous audio is kept):
+design/launch-video/third-cut/splice.sh previous.mp4 out.mp4 3.4 13.8
 ```
 
 `capture.cjs` starts every task in the same order whatever it shoots, so task

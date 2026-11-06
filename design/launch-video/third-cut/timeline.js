@@ -243,31 +243,31 @@ const showAt = (w, lt, list, x = 0.22) => {
 // 0 · The title card (also the end of the loop).
 scene(...next(3.4), (L) => { L.id = 'intro'; return titleCard(L); }, { fadeIn: 0 });
 
-// 1 · One list.
+// 1 · One list: the first cut's list (home-original, its home screen).
 scene(...next(4.4), (L, dur) => {
-  const h = headline(L, 'Every project. *One list.*', 'Code, research papers, grocery shopping, your CV.');
-  const w = browserWindow(L, { screens: ['home'] }); w.url(host('/personal'));
-  w.show({ home: 1 });
+  const h = headline(L, 'Every project. *One list.*', 'Code. Research papers. Your website. Random bureaucratic work.');
+  const w = browserWindow(L, { screens: ['home-original'] }); w.url(host('/personal'));
+  w.show({ 'home-original': 1 });
   return (lt) => {
     h(lt); enter(w, lt, dur);
-    const [z, fx, fy] = kf(lt, [[0.6, [1, 720, 450]], [dur, at('home', 'first', 1.3)]]);
+    const [z, fx, fy] = kf(lt, [[0.6, [1, 720, 450]], [dur, [1.2, 640, 470]]]);
     w.camera(z, fx, fy);
-    pointerAt(w, lt, [[0, 1100, 860], [1.4, 900, 600], [dur, ...mid('home', 'first')]], [], ramp(lt, 0.8, 1.2));
+    pointerAt(w, lt, [[0, 1100, 860], [1.2, 1050, 700], [2.4, 498, 160], [3.6, 498, 160], [dur, 700, 420]], [], ramp(lt, 0.8, 1.2));
   };
 });
 
-// 2 · Say what needs doing: the CV, typed; the model picker.
+// 2 · Say what needs doing: tavya #846, typed; the model picker.
 scene(...next(6.0), (L, dur) => {
-  const N = seqFrames('cv-type');
+  const N = seqFrames('files-type');
   const h = headline(L, 'Say what needs doing.', 'In plain words. Pick the agent and model, or keep your defaults.');
-  const w = browserWindow(L, { screens: ['cv-type/', 'cv-models'] }); w.url(host('/personal/personal-website'));
-  const field = mid('cv-models', 'field', [640, 480]);
+  const w = browserWindow(L, { screens: ['files-type/', 'files-models'] }); w.url(host('/personal/tavya'));
+  const field = mid('files-models', 'field', [640, 480]);
   return (lt) => {
     h(lt); enter(w, lt, dur);
-    w.seq('cv-type/', 'cv-type', Math.round(ramp(lt, 0.9, 3.3, (p) => p) * (N - 1)));
+    w.seq('files-type/', 'files-type', Math.round(ramp(lt, 0.9, 3.3, (p) => p) * (N - 1)));
     const m = ramp(lt, 3.9, 4.1) * (1 - ramp(lt, 5.1, 5.3));
-    w.show({ 'cv-type/': 1 - m, 'cv-models': m });
-    const [z, fx, fy] = kf(lt, [[0.4, [1, 720, 450]], [1.0, at('cv-type', 'prompt', 1.6)], [3.4, at('cv-type', 'prompt', 1.6)], [4.0, [1.3, field[0], field[1] + 120]], [5.1, [1.3, field[0], field[1] + 120]], [5.8, [1.15, 1000, 700]]]);
+    w.show({ 'files-type/': 1 - m, 'files-models': m });
+    const [z, fx, fy] = kf(lt, [[0.4, [1, 720, 450]], [1.0, at('files-type', 'prompt', 1.5)], [3.4, at('files-type', 'prompt', 1.5, 0, 30)], [4.0, [1.3, field[0], field[1] + 120]], [5.1, [1.3, field[0], field[1] + 120]], [5.8, [1.15, 1000, 700]]]);
     w.camera(z, fx, fy);
     pointerAt(w, lt, [[0, 900, 600], [0.6, 600, 230], [3.4, 640, 330], [3.8, field[0] - 200, field[1]], [4.9, field[0] - 200, field[1]], [5.6, 1290, 868], [dur, 1290, 868]], [3.85, 5.65], ramp(lt, 0.3, 0.6));
   };
