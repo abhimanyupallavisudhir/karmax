@@ -2232,11 +2232,9 @@ a.ins-task-title:hover { color: var(--accent); }
 @media (prefers-reduced-motion: reduce) { .chord-hint { animation: none; } }
 
 /* ── public landing ─────────────────────────────────────────────────────────
-   The landing is the launch film's page (design/launch-video/first-cut): the
-   film's ink, its violet and gold light, its headlines with one golden phrase,
-   its gold call to action. Always dark, like the film, whatever the console's
-   theme or look. Docs, Pricing and Policies (.legal-shell) wear the console's
-   look and share only the --l-* tokens, the brand and the skip link. */
+   The landing, Docs, Pricing and Policies (.legal-shell) wear the console's look
+   (light or dark, default or classic) through the shared --l-* tokens. The landing
+   is quiet: the console's ink pill, its greys, its status colours, Inter. */
 body.landing-active { color-scheme: light dark; background: var(--paper); color: var(--ink); overflow: auto; }
 html[data-theme="light"] .legal-shell { color-scheme: light; }
 html[data-theme="dark"] .legal-shell { color-scheme: dark; }
@@ -2274,43 +2272,20 @@ html[data-theme="dark"] .legal-shell { color-scheme: dark; }
   --l-wide: min(1120px, calc(100% - 48px));
 }
 .landing-page {
-  /* The film's palette (stage.html): ink, its light, white text, gold. */
-  --lv-ink: #0d0c13;
-  --lv-ink-2: #15131e;
-  --lv-text: #f4f2ff;
-  --lv-muted: #a9a6bb;
-  --lv-line: rgba(255, 255, 255, .1);
-  --lv-line-strong: rgba(255, 255, 255, .18);
-  --lv-violet: #8e95ff;
-  --lv-gold: #f0bf55;
-  --lv-gold-2: #e0a33a;
-  --lv-gold-ink: #1b1408;
-  --lv-wide: min(1180px, calc(100% - 48px));
-  --l-ink: var(--lv-text); --l-ink-3: var(--lv-muted); --l-line: var(--lv-line); --l-line-strong: var(--lv-line-strong);
-  --l-primary: var(--lv-gold); --l-primary-ink: var(--lv-gold-ink); --l-accent: var(--lv-violet);
-  color-scheme: dark;
+  --lp-wide: min(1120px, calc(100% - 48px));
   position: relative;
   min-height: 100vh;
-  background: var(--lv-ink);
-  color: var(--lv-text);
+  background: var(--l-bg);
+  color: var(--l-ink);
   font-family: var(--font-ui);
-  font-size: 17px;
-  line-height: 1.5;
-  overflow: hidden;
+  font-size: 16px;
+  line-height: 1.55;
   -webkit-font-smoothing: antialiased;
 }
-body.landing-active:has(.landing-page) { background: var(--lv-ink); color-scheme: dark; }
-/* The film's grain, over everything, never in the way. */
-.landing-page::after {
-  content: ''; position: fixed; inset: 0; z-index: 60; pointer-events: none; opacity: .045;
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
-}
-.landing-page *, .landing-page *::before, .landing-page *::after { box-sizing: border-box; }
-.landing-page :where(button, a) { font: inherit; }
-.landing-page :where(button) { cursor: pointer; }
-.landing-page :where(a) { color: inherit; text-decoration: none; }
-.landing-page :where(h1, h2, p, ul, figure) { margin: 0; }
-.landing-page :is(button, a, video):focus-visible { outline: 2px solid var(--lv-gold); outline-offset: 3px; }
+:where(.landing-page) :where(h1, h2, h3, p, ol, ul, figure) { margin: 0; }
+:where(.landing-page) :where(ol, ul) { padding: 0; list-style: none; }
+:where(.landing-page a) { color: inherit; text-decoration: none; }
+.landing-page :focus-visible { outline: 2px solid var(--l-accent); outline-offset: 3px; border-radius: 6px; }
 .landing-skip {
   position: fixed; top: 8px; left: 8px; z-index: 98;
   padding: 9px 13px; border-radius: var(--r-btn); background: var(--l-primary); color: var(--l-primary-ink);
@@ -2321,123 +2296,122 @@ body.landing-active:has(.landing-page) { background: var(--lv-ink); color-scheme
 .landing-brand .mark { width: 24px; height: 24px; border-radius: 7px; box-shadow: 0 1px 3px rgba(0, 0, 0, .16); }
 /* The console's wordmark (.brand .wordmark): Inter's display cut, tracked in. */
 .landing-brand span { font-size: 18px; line-height: 1; font-weight: 680; letter-spacing: -.035em; font-variation-settings: "opsz" 32; font-optical-sizing: none; }
-/* The film's golden phrase: the one thing each headline is about. */
-.lv-gold { background: linear-gradient(180deg, #ffd77e, var(--lv-gold-2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
 
-.landing-nav { position: sticky; top: 0; z-index: 40; background: rgba(13, 12, 19, .72); backdrop-filter: saturate(140%) blur(14px); border-bottom: 1px solid var(--lv-line); }
-.landing-nav-inner { width: var(--lv-wide); height: 64px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-.landing-nav-actions { display: flex; align-items: center; gap: 4px; }
-.landing-text-link { display: inline-flex; align-items: center; min-height: 40px; padding: 0 12px; color: var(--lv-muted); font-size: 15px; transition: color .15s ease; }
-.landing-text-link:hover, .landing-footer a:hover { color: var(--lv-text); }
-.landing-sign-in, .landing-start {
+/* Navigation: the page's own surface, a hairline under it. */
+.landing-nav { position: sticky; top: 0; z-index: 40; background: var(--l-nav); backdrop-filter: saturate(140%) blur(12px); border-bottom: 1px solid var(--l-line); }
+.landing-nav-inner { width: var(--lp-wide); height: 64px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.landing-nav-actions { display: flex; align-items: center; gap: 2px; }
+.landing-text-link { display: inline-flex; align-items: center; min-height: 40px; padding: 0 12px; color: var(--l-ink-2); font-size: 15px; transition: color .15s ease; }
+.landing-text-link:hover, .landing-footer a:hover { color: var(--l-ink); }
+/* Buttons: the console's pills, ink filled for the one thing to do. */
+.landing-sign-in, .landing-start, .lp-ghost, .lp-film-open {
   display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 40px; padding: 0 18px;
-  border-radius: 999px; font-size: 15px; font-weight: 600; white-space: nowrap; transition: background .15s ease, border-color .15s ease, box-shadow .15s ease;
+  border-radius: 999px; font: inherit; font-size: 15px; font-weight: 600; white-space: nowrap; cursor: pointer;
+  transition: background .15s ease, border-color .15s ease, color .15s ease;
 }
-.landing-sign-in { margin-left: 8px; border: 1px solid var(--lv-line-strong); color: var(--lv-text); }
-.landing-sign-in:hover { border-color: rgba(255, 255, 255, .34); }
-/* The one thing to do: the film's gold pill. */
-.landing-start { background: linear-gradient(180deg, #ffd77e, var(--lv-gold-2)); color: var(--lv-gold-ink); box-shadow: 0 8px 32px rgba(240, 191, 85, .22); }
-.landing-start:hover { box-shadow: 0 10px 40px rgba(240, 191, 85, .38); }
-.landing-start span { transition: transform .15s ease; }
-.landing-start:hover span { transform: translateX(3px); }
-.lv-large { min-height: 50px; padding: 0 26px; font-size: 17px; }
-.lv-ghost { display: inline-flex; align-items: center; min-height: 50px; padding: 0 8px; color: var(--lv-muted); font-weight: 500; transition: color .15s ease; }
-.lv-ghost:hover { color: var(--lv-text); }
+.landing-sign-in, .lp-ghost, .lp-film-open { border: 1px solid var(--btn-line); background: var(--l-surface); color: var(--l-ink); }
+.landing-sign-in { margin-left: 8px; }
+.landing-sign-in:hover, .lp-ghost:hover, .lp-film-open:hover { border-color: var(--l-ink-3); }
+.landing-start { border: 1px solid transparent; background: var(--l-primary); color: var(--l-primary-ink); }
+.landing-start:hover { background: var(--l-primary-hover); }
+.lp-large { min-height: 46px; padding: 0 24px; font-size: 16px; }
+.lp-film-open { min-height: 46px; padding: 0 20px 0 16px; font-size: 16px; }
+.lp-film-open svg { width: 16px; height: 16px; fill: currentColor; }
+.lp-film-open small { color: var(--l-ink-3); font-size: var(--fs-13); font-weight: 500; font-variant-numeric: tabular-nums; }
+.lp-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
 
-/* The film's title card, then the film. */
-.lv-hero {
-  position: relative; width: var(--lv-wide); margin: 0 auto; padding: 44px 0 96px; text-align: center;
+/* Hero: the line, then the list itself (the console's rows, drawn in HTML). */
+.lp-hero { width: var(--lp-wide); margin: 0 auto; padding: 96px 0 0; text-align: center; }
+.lp-hero h1 { max-width: 15ch; margin: 0 auto; font-size: clamp(40px, 6.4vw, 72px); line-height: 1.02; font-weight: 680; letter-spacing: -.035em;
+  font-variation-settings: "opsz" 32; font-optical-sizing: none; text-wrap: balance; }
+.lp-lede { max-width: 36em; margin: 22px auto 30px; color: var(--l-ink-2); font-size: clamp(17px, 2vw, 19px); line-height: 1.55; text-wrap: pretty; }
+.lp-list { max-width: 760px; margin: 64px auto 0; border: 1px solid var(--l-line); border-radius: calc(var(--r) + 4px); background: var(--l-surface-2); box-shadow: var(--l-frame-shadow); text-align: left; overflow: hidden; }
+.lp-list-head { display: flex; align-items: baseline; justify-content: space-between; padding: 14px 18px 12px; border-bottom: 1px solid var(--l-line); }
+.lp-list-head span { font-size: var(--fs-14); font-weight: 600; }
+.lp-list-head small { color: var(--l-ink-3); font-size: var(--fs-13); font-variant-numeric: tabular-nums; }
+.lp-list ol { display: grid; gap: 8px; padding: 10px; }
+.lp-row { display: grid; grid-template-columns: minmax(0, 1fr) 120px; align-items: center; gap: 18px; padding: 13px 16px; border: 1px solid var(--l-line); border-radius: var(--r); background: var(--l-surface); }
+.lp-row b { display: block; overflow: hidden; font-size: var(--fs-15); font-weight: 550; white-space: nowrap; text-overflow: ellipsis; }
+.lp-row-main > span { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.lp-row code { color: var(--l-ink-3); font-family: var(--font-mono); font-size: var(--fs-12); }
+.lp-chip { padding: 1px 8px; border-radius: 999px; font-size: var(--fs-12); font-style: normal; font-weight: 600; }
+.lp-chip:is([data-status="working"], [data-status="review"]) { background: var(--l-accent-weak); color: var(--l-accent); }
+.lp-chip[data-status="input"] { background: var(--working-weak); color: var(--working); }
+/* A touch of ink in the green, so small text on its tint stays ≥ 4.5:1 in every look. */
+.lp-chip[data-status="done"] { background: var(--l-merged-weak); color: color-mix(in srgb, var(--l-merged) 82%, var(--l-ink)); }
+.lp-bar { position: relative; height: 5px; border-radius: 999px; background: var(--l-line); overflow: hidden; }
+.lp-bar i { position: absolute; inset: 0 auto 0 0; width: calc(var(--p) * 100%); border-radius: inherit; background: var(--l-accent); opacity: .55; }
+.lp-bar[data-status="input"] i { background: var(--working); opacity: .8; }
+.lp-bar[data-status="done"] i { background: var(--l-merged); opacity: .8; }
+
+/* Sections: a plain heading, then their parts on the page's own surface. */
+.lp-steps, .lp-features { width: var(--lp-wide); margin: 0 auto; padding: 120px 0 0; }
+.lp-steps > h2, .lp-features > h2 { margin-bottom: 36px; font-size: clamp(28px, 3.4vw, 38px); line-height: 1.1; font-weight: 680; letter-spacing: -.03em; text-align: center; }
+.lp-steps ol { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; counter-reset: step; }
+.lp-step { display: flex; flex-direction: column; counter-increment: step; }
+.lp-step h3::before { content: counter(step); display: inline-grid; place-items: center; width: 24px; height: 24px; margin-right: 10px; border-radius: 999px;
+  background: var(--l-surface-2); color: var(--l-ink-2); font-size: var(--fs-13); font-weight: 650; vertical-align: 2px; }
+.lp-step h3, .lp-feature h3 { font-size: 19px; font-weight: 650; letter-spacing: -.015em; }
+.lp-step p, .lp-feature p, .lp-feature li { margin-top: 8px; color: var(--l-ink-2); font-size: var(--fs-15); line-height: 1.55; }
+.lp-feature ul { margin-top: 6px; }
+.lp-feature li { position: relative; margin-top: 4px; padding-left: 16px; }
+.lp-feature li::before { content: ""; position: absolute; left: 2px; top: .62em; width: 5px; height: 5px; border-radius: 50%; background: var(--l-ink-3); }
+.lp-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
+.lp-feature { display: flex; flex-direction: column; padding: 22px 22px 0; border: 1px solid var(--l-line); border-radius: calc(var(--r) + 4px); background: var(--l-surface); overflow: hidden; }
+/* A screenshot: the console's own screen, cropped, in the visitor's look. */
+.lp-shot { position: relative; margin-top: 18px; aspect-ratio: 16 / 10; border: 1px solid var(--l-line); border-radius: var(--r); background: var(--l-surface-2); overflow: hidden; }
+.lp-step .lp-shot { box-shadow: var(--l-frame-shadow); }
+/* A card's picture fills what its words leave, so a row's pictures end together. */
+.lp-feature .lp-shot { flex: 1 0 auto; min-height: 220px; aspect-ratio: auto; margin: 18px -1px -1px; border-radius: var(--r) var(--r) 0 0; }
+/* At the console's own scale (a little smaller), from the top left, the frame cropping the rest. */
+.lp-shot img { position: absolute; top: 18px; left: 18px; width: calc(var(--w) * .82px); max-width: none; height: auto;
+  border: 1px solid var(--l-line); border-radius: 8px; box-shadow: var(--l-frame-shadow); }
+.lp-shot[data-anchor="center"] img { left: 50%; transform: translateX(-50%); }
+.lp-dark { display: none; }
+html[data-theme="dark"] .lp-dark { display: block; }
+html[data-theme="dark"] .lp-light { display: none; }
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]) .lp-dark { display: block; }
+  html:not([data-theme="light"]) .lp-light { display: none; }
 }
-.lv-hero::before {
-  content: ''; position: absolute; z-index: 0; inset: -64px -30vw 0; pointer-events: none;
-  background: radial-gradient(900px 560px at 22% 6%, rgba(142, 149, 255, .17), transparent 62%),
-    radial-gradient(800px 600px at 82% 78%, rgba(240, 191, 85, .11), transparent 60%);
-}
-.lv-hero > * { position: relative; z-index: 1; }
-.lv-eyebrow { display: inline-flex; align-items: center; gap: 9px; padding: 6px 14px; border: 1px solid var(--lv-line-strong); border-radius: 999px;
-  color: var(--lv-muted); font-size: 14px; font-weight: 500; background: rgba(255, 255, 255, .03); }
-.lv-eyebrow i { width: 7px; height: 7px; border-radius: 50%; background: var(--lv-gold); box-shadow: 0 0 12px var(--lv-gold); }
-.lv-hero h1 { max-width: 15ch; margin: 20px auto 0; font-size: clamp(38px, 5.2vw, 72px); line-height: 1.02; font-weight: 700; letter-spacing: -.035em; text-wrap: balance; }
-.lv-lede { max-width: 34em; margin: 40px auto 0; color: var(--lv-muted); font-size: clamp(17px, 1.6vw, 20px); line-height: 1.55; text-wrap: balance; }
-.lv-actions { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 12px 20px; margin-top: 34px; }
-.lv-film { position: relative; margin-top: 36px; border-radius: 18px; overflow: hidden; background: #000; aspect-ratio: 16 / 9;
-  box-shadow: 0 50px 140px rgba(0, 0, 0, .6), 0 0 0 1px var(--lv-line-strong), 0 0 120px rgba(142, 149, 255, .12); }
-.lv-film video { display: block; width: 100%; height: 100%; }
-.lv-sound {
-  position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%);
-  display: inline-flex; align-items: center; gap: 10px; min-height: 46px; padding: 0 20px 0 16px;
-  border: 1px solid rgba(255, 255, 255, .2); border-radius: 999px; background: rgba(13, 12, 19, .66); backdrop-filter: blur(10px);
-  color: var(--lv-text); font-size: 15px; font-weight: 600; white-space: nowrap; transition: background .15s ease, transform .15s ease;
-}
-.lv-sound:hover { background: rgba(13, 12, 19, .86); transform: translateX(-50%) scale(1.03); }
-.lv-sound svg { width: 18px; height: 18px; fill: var(--lv-gold); }
-.lv-sound small { color: var(--lv-muted); font-size: 13px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.lp-phones { position: absolute; inset: 18px 0 0; display: flex; justify-content: center; gap: 14px; }
+.lp-phone { position: relative; width: 40%; border: 5px solid var(--l-ink); border-bottom: 0; border-radius: 26px 26px 0 0; background: var(--l-bg); overflow: hidden; }
+.lp-phone img { inset: 0 auto auto 0; width: 100%; border: 0; border-radius: 0; box-shadow: none; }
 
-/* One chapter per scene: its headline beside its still, sides alternating. */
-.lv-chapters { width: var(--lv-wide); margin: 0 auto; }
-.lv-chapter { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); align-items: center; gap: clamp(32px, 5vw, 72px); padding: clamp(56px, 8vw, 104px) 0; }
-.lv-chapter:nth-child(even) .lv-copy { order: 2; }
-.lv-chapter h2, .lv-card h2, .lv-pocket h2, .lv-end h2 { font-size: clamp(32px, 3.8vw, 52px); line-height: 1.06; font-weight: 700; letter-spacing: -.03em; text-wrap: balance; }
-.lv-copy p, .lv-card p { margin-top: 18px; color: var(--lv-muted); font-size: 18px; line-height: 1.55; text-wrap: pretty; }
-/* A still from the film: the console in its browser window, fading out where the frame cut it. */
-.lv-shot { border-radius: 14px; overflow: hidden; background: #f7f7f8;
-  box-shadow: 0 40px 110px rgba(0, 0, 0, .55), 0 0 0 1px rgba(255, 255, 255, .08);
-  -webkit-mask-image: linear-gradient(to bottom, #000 78%, transparent); mask-image: linear-gradient(to bottom, #000 78%, transparent); }
-.lv-shot img { display: block; width: 100%; height: auto; }
+/* The end: the mark, the brand's line, the one thing to do. */
+.lp-end { width: var(--lp-wide); margin: 0 auto; padding: 140px 0 120px; display: flex; flex-direction: column; align-items: center; gap: 22px; text-align: center; }
+.lp-end-mark .mark { width: 64px; height: 64px; border-radius: 16px; box-shadow: 0 6px 20px rgba(0, 0, 0, .16); }
+.lp-end h2 { font-size: clamp(34px, 5vw, 56px); line-height: 1.04; font-weight: 680; letter-spacing: -.035em; font-variation-settings: "opsz" 32; font-optical-sizing: none; }
 
-.lv-cards { width: var(--lv-wide); margin: 0 auto; padding: 48px 0 clamp(56px, 8vw, 104px); display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; }
-.lv-card { display: flex; flex-direction: column; padding: 32px 28px 0; border: 1px solid var(--lv-line); border-radius: 20px; overflow: hidden;
-  background: linear-gradient(180deg, rgba(255, 255, 255, .045), rgba(255, 255, 255, .01)); }
-.lv-card h2 { font-size: clamp(26px, 2.3vw, 32px); }
-.lv-card p { font-size: 16px; }
-.lv-card .lv-shot { margin: auto -10px 0; border-radius: 12px 12px 0 0; }
-.lv-card :is(p, .lv-boxes) { margin-bottom: 28px; }
-.lv-boxes { margin-top: 18px; padding: 0; list-style: none; display: grid; gap: 8px; }
-.lv-boxes li { padding: 8px 12px; border: 1px solid var(--lv-line-strong); border-radius: 10px; background: rgba(255, 255, 255, .05); font-size: 15px; font-weight: 500; }
+/* The film, when asked for. */
+.lp-film { width: min(1100px, calc(100% - 32px)); padding: 0; border: 0; border-radius: calc(var(--r) + 4px); background: #000; overflow: hidden; }
+.lp-film::backdrop { background: rgba(0, 0, 0, .72); }
+.lp-film video { display: block; width: 100%; height: auto; }
+.lp-film-close { position: absolute; top: 10px; right: 10px; z-index: 1; width: 36px; height: 36px; border: 0; border-radius: 999px; background: rgba(0, 0, 0, .55); color: #fff; font-size: 22px; line-height: 1; cursor: pointer; }
 
-.lv-pocket { width: var(--lv-wide); margin: 0 auto; padding: clamp(56px, 8vw, 104px) 0 24px; text-align: center; border-top: 1px solid var(--lv-line); }
-.lv-phones { display: block; width: min(820px, 100%); height: auto; margin: 16px auto 0;
-  -webkit-mask-image: radial-gradient(50% 50% at 50% 50%, #000 60%, transparent 98%); mask-image: radial-gradient(50% 50% at 50% 50%, #000 60%, transparent 98%); }
-.lv-chips { margin: 12px auto 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; max-width: 760px; }
-.lv-chips li { padding: 10px 18px; border: 1px solid var(--lv-line-strong); border-radius: 999px; background: rgba(255, 255, 255, .05); font-size: 15px; font-weight: 600; }
-
-/* The film's end card. */
-.lv-end { position: relative; width: var(--lv-wide); margin: 0 auto; padding: clamp(80px, 11vw, 140px) 0; display: flex; flex-direction: column; align-items: center; gap: 22px; text-align: center; }
-.lv-end::before { content: ''; position: absolute; z-index: 0; left: 50%; top: 50%; width: 760px; height: 760px; margin: -380px; border-radius: 50%; pointer-events: none;
-  background: radial-gradient(circle, rgba(240, 191, 85, .14), transparent 62%); }
-.lv-end > * { position: relative; }
-.lv-end-mark .mark { width: 88px; height: 88px; border-radius: 22px; box-shadow: 0 20px 60px rgba(0, 0, 0, .5); }
-.lv-end h2 { font-size: clamp(44px, 6vw, 80px); letter-spacing: -.035em; }
-.lv-end .landing-start { margin-top: 10px; }
-
-.landing-footer { position: relative; width: var(--lv-wide); min-height: 88px; margin: 0 auto; display: flex; align-items: center; flex-wrap: wrap; gap: 8px 22px;
-  border-top: 1px solid var(--lv-line); color: var(--lv-muted); font-size: 14px; }
+.landing-footer { width: var(--lp-wide); min-height: 88px; margin: 0 auto; display: flex; align-items: center; flex-wrap: wrap; gap: 8px 22px;
+  border-top: 1px solid var(--l-line); color: var(--l-ink-3); font-size: 14px; }
+.landing-footer p { margin: 0 auto 0 0; }
+.landing-footer a { color: var(--l-ink-2); }
 .landing-footer .landing-brand .mark { width: 20px; height: 20px; border-radius: 5px; }
-.landing-footer .landing-brand span { font-size: 15px; }
-.landing-footer p { flex: 1; }
-.landing-footer a { transition: color .15s ease; }
-
-/* Chapters rise into view (renderLanding adds .lv-animate; never with reduced motion). */
-.lv-animate .lv-reveal { opacity: 0; transform: translateY(28px); transition: opacity .7s cubic-bezier(.2, .7, .2, 1), transform .7s cubic-bezier(.2, .7, .2, 1); }
-.lv-animate .lv-reveal.in { opacity: 1; transform: none; }
+.landing-footer .landing-brand span { font-size: 16px; }
 
 @media (max-width: 960px) {
-  .lv-cards { grid-template-columns: 1fr; max-width: 640px; }
+  .lp-steps ol, .lp-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lp-step:last-child { grid-column: 1 / -1; }
 }
-@media (max-width: 820px) {
-  .lv-chapter { grid-template-columns: 1fr; gap: 28px; padding: 56px 0; }
-  .lv-chapter:nth-child(even) .lv-copy { order: 0; }
-  .lv-hero { padding: 32px 0 64px; }
-  .lv-film { margin-top: 28px; border-radius: 12px; }
-  .lv-sound { bottom: 10px; min-height: 36px; gap: 7px; padding: 0 13px 0 10px; font-size: 13px; }
-  .lv-sound small { display: none; }
-}
-@media (max-width: 680px) {
-  .landing-page { --lv-wide: calc(100% - 32px); }
+@media (max-width: 640px) {
+  .landing-page { --lp-wide: calc(100% - 32px); }
   .landing-nav-inner { height: 58px; }
   .landing-text-link { display: none; }
   .landing-sign-in { margin-left: 0; }
   .landing-sign-in, .landing-start { padding: 0 14px; }
+  .lp-hero { padding-top: 56px; }
+  .lp-list { margin-top: 44px; }
+  .lp-row { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .lp-steps ol, .lp-grid { grid-template-columns: minmax(0, 1fr); }
+  .lp-steps, .lp-features { padding-top: 80px; }
+  .lp-end { padding: 96px 0 80px; }
   .landing-footer { padding: 20px 0; }
 }
 @media (prefers-reduced-motion: reduce) {

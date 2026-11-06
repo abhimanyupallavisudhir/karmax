@@ -27997,32 +27997,50 @@ function openPublicAuth(path, render) {
 }
 
 // ── public landing ───────────────────────────────────────────────────────────
-// The landing tells what the launch film tells (design/launch-video/first-cut),
-// in its look: the film first, then one chapter per scene, each pictured by a
-// still from the film (web/media/landing). Always dark, like the film.
+// The landing wears the console's look (light or dark, default or classic), like
+// Docs and Pricing: a task list drawn with the console's own parts, then how a task
+// goes, then what surrounds it, each pictured by a screenshot of the console in the
+// visitor's look (web/media/landing/<name>-light|dark.webp, design/landing-v3).
 const LANDING_FILM = { src: '/media/tavya-launch.mp4', poster: '/media/tavya-launch-poster.jpg', length: '0:59' };
-// [still, headline (*gold*), line, picture's description]
-const LANDING_CHAPTERS = [
-  ['list', 'Every project. *One list.*', 'A SaaS, research papers, a PhD thesis — each task handed to an agent.', 'The organization’s task list across projects, agents working on several tasks at once'],
-  ['new-task', 'Say what *needs doing.*', 'In plain words. Pick the agent and model, or keep your defaults.', 'The new-task form, with a prompt typed in plain words and the agent picked'],
-  ['working', 'Agents work on *their own computers.*', 'Your repos, a terminal, a browser — in parallel, while you do something else.', 'A task’s conversation while its agent works: steps it has taken on its computer'],
-  ['fan-out', 'Big jobs *fan out.*', 'One codebase review became 25 sub-tasks, each with its own agent.', 'A codebase review task with 25 sub-tasks, each done by its own agent'],
-  ['review', 'Review the *result,* not the process.', 'Agents attach screenshots, reports and commands to check. You approve; it lands.', 'A task in Review: screenshots of a redesigned website attached by its agent'],
-  ['figures', 'Not just *code.*', 'Experiments, figures, papers, websites — from the same list.', 'A research task’s figure, open in the Review viewer'],
+// The hero list: the kinds of work one list holds. [title, project, status]
+const LANDING_ROWS = [
+  ['Update my CV to include tavya under my list of projects', 'personal-website', 'done'],
+  ['Do a pass of tavya’s SEO', 'tavya', 'working'],
+  ['Fill in slides.md with the experimental results', 'takehomev2', 'working'],
+  ['Book me the cheapest direct flight to London on January 3', 'admin_docs', 'input'],
+  ['Does figure 5 hold at the level of model families?', 'legibench3', 'review'],
 ];
-// [still, headline, line or the three boxes under it, picture's description]
-const LANDING_CARDS = [
-  ['vault', 'Give agents *accounts, keys and a card.*', 'They sign up, sign in and pay — only with what you allow.', 'The vault: logins and API keys agents may use, each with who may see it'],
-  ['schedules', 'Work that *starts itself.*', ['Agents can start, manage and approve tasks', 'Tasks can be triggered by webhooks and events', 'Tasks can run on schedules, or after other tasks'], 'Repeatable tasks: one on a schedule, others triggered by events'],
-  ['models', 'Any model. *Your subscription.*', 'Claude, Codex or OpenCode — on your Claude or ChatGPT plan, or an API key.', 'The model picker: Claude models with their reasoning efforts'],
+const LANDING_STATUS = { working: 'Working', input: 'Needs input', review: 'In review', done: 'Done' };
+// How a task goes. [still, title, line, picture's description]
+const LANDING_STEPS = [
+  ['write', 'Write it down', 'In plain words, in any project. Pick the agent and model, or keep your defaults.', 'The new-task form with a prompt written in plain words'],
+  ['work', 'An agent does it', 'On its own computer, with your repositories, a terminal and a browser. As many at once as you like.', 'A task’s agent at work: the steps it has taken so far'],
+  ['review', 'You review the result', 'Agents attach screenshots, reports and commands to check. Approve, and it lands.', 'A task in review, with the screenshots its agent attached'],
 ];
-const landingGold = (text) => esc(text).replace(/\*([^*]+)\*/g, '<span class="lv-gold">$1</span>');
+// What surrounds the work. [still, title, line or list, picture's description]
+const LANDING_FEATURES = [
+  ['fan-out', 'Big jobs fan out', 'A task can split into sub-tasks, each with its own agent. One codebase review became 25.', 'A task’s sub-tasks, each done by its own agent'],
+  ['vault', 'Accounts, keys and a card', 'Agents sign up, sign in and pay, only with what you allow, and never see a password.', 'The vault: logins and keys agents may use'],
+  ['automations', 'The autonomous company', ['Agents can start, manage and approve tasks', 'Tasks can be triggered by webhooks and events', 'Tasks can run on schedules, or after other tasks'], 'Repeatable tasks, started by schedules and events'],
+  ['models', 'Any model, your subscription', 'Claude Code, Codex or OpenCode, on your Claude or ChatGPT plan, or an API key.', 'The model picker'],
+  ['errand', 'Not just code', 'Research, your website, and the errands in between. It asks before it uses your login.', 'An agent asking to use a saved login before booking a flight'],
+  ['phones', 'On your phone', 'Every task, its conversation and its review, wherever you are.', 'The task list and a task on a phone'],
+];
+
+// Each screenshot's size in CSS pixels (the files are 2×), so it shows at the console's own scale.
+const LANDING_SHOT_SIZES = { write: [756, 582], work: [652, 470], review: [633, 495], 'fan-out': [305, 520], vault: [960, 420],
+  automations: [1156, 237], models: [726, 380], errand: [652, 406], 'phone-list': [390, 844], 'phone-task': [390, 844] };
 
 function renderLanding() {
   const site = siteNameMarkup();
-  const still = (name, alt, eager = false) => `<img src="/media/landing/${name}.webp" alt="${esc(alt)}" width="1400" height="868"${eager ? '' : ' loading="lazy"'} decoding="async">`;
+  // A screenshot in the visitor's look: the light and dark one, CSS shows one.
+  const shot = (name, alt) => {
+    const [width, height] = LANDING_SHOT_SIZES[name];
+    return ['light', 'dark'].map((look) => `<img class="lp-${look}" src="/media/landing/${name}-${look}.webp" alt="${look === 'light' ? esc(alt) : ''}"${look === 'dark' ? ' aria-hidden="true"' : ''} width="${width}" height="${height}" style="--w:${width}" loading="lazy" decoding="async">`).join('');
+  };
+  const phones = (alt) => `<div class="lp-phones" role="img" aria-label="${esc(alt)}">${['list', 'task'].map((n) => `<span class="lp-phone">${shot(`phone-${n}`, '')}</span>`).join('')}</div>`;
   const play = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 4.6v10.8a.6.6 0 0 0 .9.5l8.6-5.4a.6.6 0 0 0 0-1L7.4 4.1a.6.6 0 0 0-.9.5z"/></svg>';
-  const pocket = ['Project wiki & skills', 'Sub-tasks', 'Teams & Avatārs', 'MCP for any agent', `${siteName()} CLI`, 'Your own cloud accounts'];
+  const github = 'https://github.com/abhimanyupallavisudhir/krmax-issues/issues';
   document.body.classList.add('landing-active');
   document.title = `${siteName()} — the agentic to-do list that finishes itself`;
   $('#app').innerHTML = `<div class="landing-page">
@@ -28032,58 +28050,61 @@ function renderLanding() {
       <nav class="landing-nav-actions" aria-label="Site">
         <a href="/docs" class="landing-text-link">Docs</a>
         <a href="/pricing" class="landing-text-link">Pricing</a>
-        <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
+        <a href="${github}" class="landing-text-link">GitHub</a>
         <a class="landing-sign-in" id="landing-sign-in" href="/login">Sign in</a>
         <a class="landing-start" id="landing-start" href="/signup">Get started</a>
       </nav>
     </div></header>
 
     <main id="landing-main">
-      <section class="lv-hero" aria-labelledby="landing-title">
-        <p class="lv-eyebrow"><i aria-hidden="true"></i>Open to everyone, starting today</p>
-        <h1 id="landing-title">The agentic to-do list that <span class="lv-gold">finishes itself.</span></h1>
-        <figure class="lv-film">
-          <video id="lv-film" src="${LANDING_FILM.src}" poster="${LANDING_FILM.poster}" width="1920" height="1080" muted loop playsinline preload="metadata"
-            aria-label="${site}’s launch film, ${LANDING_FILM.length}: the chapters below, in motion"></video>
-          <button class="lv-sound" id="lv-sound" type="button">${play}<span>Watch with sound</span><small>${LANDING_FILM.length}</small></button>
+      <section class="lp-hero" aria-labelledby="landing-title">
+        <h1 id="landing-title">The agentic to-do list that finishes itself.</h1>
+        <p class="lp-lede">Write down what needs doing. Agents do it on their own computers, in parallel, and you review the result.</p>
+        <div class="lp-actions">
+          <a class="landing-start lp-large" id="landing-hero-start" href="/signup">Get started</a>
+          <button class="lp-film-open" id="lp-film-open" type="button">${play}Watch the film <small>${LANDING_FILM.length}</small></button>
+        </div>
+        <figure class="lp-list" aria-label="A task list: code, research, a website and an errand, each with its agent’s status">
+          <div class="lp-list-head"><span>Active</span><small>${LANDING_ROWS.length} tasks</small></div>
+          <ol>${LANDING_ROWS.map(([title, project, status], i) => `
+            <li class="lp-row"><div class="lp-row-main"><b>${esc(title)}</b><span><code>${esc(project)}</code><i class="lp-chip" data-status="${status}">${LANDING_STATUS[status]}</i></span></div>
+              <span class="lp-bar" data-status="${status}" aria-hidden="true"><i style="--p:${({ done: 1, review: .8, input: .62, working: .34 + i * .04 })[status]}"></i></span></li>`).join('')}
+          </ol>
         </figure>
-        <p class="lv-lede">Say what needs doing. Agents do it on their own computers, in parallel — you review the result.</p>
-        <div class="lv-actions">
-          <a class="landing-start lv-large" id="landing-hero-start" href="/signup">Get started <span aria-hidden="true">→</span></a>
-          <a class="lv-ghost" href="/docs">Read the docs</a>
+      </section>
+
+      <section class="lp-steps" aria-labelledby="lp-steps-title">
+        <h2 id="lp-steps-title">How a task goes</h2>
+        <ol>${LANDING_STEPS.map(([name, title, line, alt]) => `
+          <li class="lp-step"><h3>${esc(title)}</h3><p>${esc(line)}</p><figure class="lp-shot">${shot(name, alt)}</figure></li>`).join('')}
+        </ol>
+      </section>
+
+      <section class="lp-features" aria-labelledby="lp-features-title">
+        <h2 id="lp-features-title">Everything a task needs</h2>
+        <div class="lp-grid">${LANDING_FEATURES.map(([name, title, line, alt]) => `
+          <article class="lp-feature"><h3>${esc(title)}</h3>
+            ${Array.isArray(line) ? `<ul>${line.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>` : `<p>${esc(line)}</p>`}
+            <figure class="lp-shot${name === 'phones' ? ' lp-shot-phones' : ''}"${name === 'fan-out' ? ' data-anchor="center"' : ''}>${name === 'phones' ? phones(alt) : shot(name, alt)}</figure></article>`).join('')}
         </div>
       </section>
 
-      <div class="lv-chapters">${LANDING_CHAPTERS.map(([name, title, line, alt], i) => `
-        <section class="lv-chapter lv-reveal" aria-labelledby="lv-ch-${i}">
-          <div class="lv-copy"><h2 id="lv-ch-${i}">${landingGold(title)}</h2><p>${esc(line)}</p></div>
-          <figure class="lv-shot">${still(name, alt)}</figure>
-        </section>`).join('')}
-      </div>
-
-      <section class="lv-cards" aria-label="And more">${LANDING_CARDS.map(([name, title, line, alt], i) => `
-        <article class="lv-card lv-reveal" aria-labelledby="lv-card-${i}">
-          <h2 id="lv-card-${i}">${landingGold(title)}</h2>
-          ${Array.isArray(line) ? `<ul class="lv-boxes">${line.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>` : `<p>${esc(line)}</p>`}
-          <figure class="lv-shot">${still(name, alt)}</figure>
-        </article>`).join('')}
-      </section>
-
-      <section class="lv-pocket lv-reveal" aria-labelledby="lv-pocket-title">
-        <h2 id="lv-pocket-title">In your pocket, too.</h2>
-        <img class="lv-phones" src="/media/landing/phones.webp" alt="${site} on two phones: the task list, and a task’s conversation" width="1100" height="860" loading="lazy" decoding="async">
-        <ul class="lv-chips">${pocket.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>
-      </section>
-
-      <section class="lv-end" aria-labelledby="lv-end-title">
-        <div class="lv-end-mark" aria-hidden="true">${brandMark()}</div>
-        <h2 id="lv-end-title">Just do things.</h2>
-        <a class="landing-start lv-large" id="landing-final-start" href="/signup">Get started with ${site} <span aria-hidden="true">→</span></a>
-        <a class="lv-ghost" href="/pricing">See pricing</a>
+      <section class="lp-end" aria-labelledby="lp-end-title">
+        <div class="lp-end-mark" aria-hidden="true">${brandMark()}</div>
+        <h2 id="lp-end-title">Just do things.</h2>
+        <div class="lp-actions">
+          <a class="landing-start lp-large" id="landing-final-start" href="/signup">Get started with ${site}</a>
+          <a class="lp-ghost" href="/pricing">See pricing</a>
+        </div>
       </section>
     </main>
 
-    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${site}</span></a><p>Just do things.</p><a href="/docs">Docs</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
+    <dialog class="lp-film" id="lp-film" aria-label="${site}’s launch film, ${LANDING_FILM.length}">
+      <button class="lp-film-close" type="button" aria-label="Close">×</button>
+      <video src="${LANDING_FILM.src}" poster="${LANDING_FILM.poster}" width="1920" height="1080" controls playsinline preload="none"></video>
+    </dialog>
+
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${site}</span></a><p>Just do things.</p><a href="/docs">Docs</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="${github}">GitHub ↗</a></footer>
   </div>`;
 
   const signIn = () => openPublicAuth('/login', renderLogin);
@@ -28091,46 +28112,23 @@ function renderLanding() {
   $('#landing-sign-in')?.addEventListener('click', plainClick(signIn));
   ['landing-start', 'landing-hero-start', 'landing-final-start'].forEach((id) => $(`#${id}`)?.addEventListener('click', plainClick(signUp)));
   wireLandingFilm();
-  // Chapters rise into view as they are reached; without an observer, or with
-  // reduced motion, they are simply there.
-  const page = $('.landing-page');
-  if ('IntersectionObserver' in window && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
-    page.classList.add('lv-animate');
-    const observer = new IntersectionObserver((entries) => entries.forEach((entry) => {
-      if (!entry.isIntersecting) return;
-      entry.target.classList.add('in');
-      observer.unobserve(entry.target);
-    }), { threshold: 0.15, rootMargin: '0px 0px -8% 0px' });
-    page.querySelectorAll('.lv-reveal').forEach((element) => observer.observe(element));
-  }
   window.onpopstate = () => boot();
 }
 
-// The film plays silently, looping, while it is on screen (never with reduced
-// motion); "Watch with sound" starts it from the top with sound and controls.
+// The film waits in a dialog: it loads and plays, with sound, only when asked;
+// closing it stops it.
 function wireLandingFilm() {
-  const film = $('#lv-film');
-  const sound = $('#lv-sound');
-  if (!film || !sound) return;
-  let watching = false;
-  const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
-  if (!still && 'IntersectionObserver' in window) {
-    new IntersectionObserver(([entry]) => {
-      if (watching) return;
-      if (entry.isIntersecting) film.play().catch(() => {});
-      else film.pause();
-    }, { threshold: 0.35 }).observe(film);
-  }
-  sound.addEventListener('click', () => {
-    watching = true;
-    film.muted = false;
-    film.loop = false;
-    film.controls = true;
-    film.currentTime = 0;
-    film.play().catch(() => {});
-    sound.hidden = true;
-    film.focus({ preventScroll: true });
+  const dialog = $('#lp-film');
+  const video = dialog?.querySelector('video');
+  if (!dialog || !video) return;
+  $('#lp-film-open')?.addEventListener('click', () => {
+    dialog.showModal();
+    video.currentTime = 0;
+    video.play().catch(() => {});
   });
+  dialog.querySelector('.lp-film-close').addEventListener('click', () => dialog.close());
+  dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.close(); });
+  dialog.addEventListener('close', () => video.pause());
 }
 
 // Sign in and create account are one page, at /login and /signup alike: the

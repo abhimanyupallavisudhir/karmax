@@ -1,5 +1,5 @@
-// Screens of the landing (the launch film's page): the first screen, the whole
-// page and a phone. Usage: APP=http://localhost:4173 OUT=/tmp/shots/landing node design/landing-v2/shoot.cjs
+// Screens of the landing: the first screen and the whole page, on a computer and a
+// phone, in the light and the dark look. Usage: APP=http://localhost:4173 OUT=/tmp/shots/landing node design/landing-v2/shoot.cjs
 const { chromium } = require('playwright');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -8,8 +8,9 @@ const OUT = process.env.OUT || '/tmp/shots/landing';
 (async () => {
   fs.mkdirSync(OUT, { recursive: true });
   const browser = await chromium.launch({ args: ['--no-sandbox'] });
-  for (const [name, viewport, mobile] of [['desktop', { width: 1440, height: 900 }, false], ['phone', { width: 390, height: 844 }, true]]) {
-    const context = await browser.newContext({ viewport, deviceScaleFactor: mobile ? 2 : 1, isMobile: mobile, hasTouch: mobile, reducedMotion: 'reduce' });
+  for (const scheme of ['light', 'dark']) for (const [device, viewport, mobile] of [['desktop', { width: 1440, height: 900 }, false], ['phone', { width: 390, height: 844 }, true]]) {
+    const name = `${device}-${scheme}`;
+    const context = await browser.newContext({ viewport, deviceScaleFactor: mobile ? 2 : 1, isMobile: mobile, hasTouch: mobile, reducedMotion: 'reduce', colorScheme: scheme });
     const page = await context.newPage();
     page.on('pageerror', (e) => console.error('pageerror', e.message));
     await page.goto(APP);

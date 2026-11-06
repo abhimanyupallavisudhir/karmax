@@ -2,10 +2,12 @@
 
 The owner's final pick (2026-11-06): this cut, with the "VS Code was a fancy text editor…"
 scene removed, the title card's tagline "The agentic to-do list that finishes itself." (the
-end card keeps "Just do things."), and three boxes instead of a subtitle under "Work that
-starts itself." `patch.sh ORIGINAL.mp4 OUT.mp4` makes it from the original 63 s render
-without the screens below (it re-renders only what changed and regenerates the score);
-with the screens, `make.sh` renders it whole.
+end card keeps "Just do things."), and "Work that starts itself." renamed
+"The autonomous company." with three boxes under it, and three boxes under "Every project.
+One list." instead of its subtitle. Without the screens below, `patch.sh ORIGINAL.mp4 OUT.mp4`
+made the 59 s cut from the original 63 s render (it re-renders only what changed and
+regenerates the score); with the screens, `make.sh` renders it whole. `strips.sh BASE.mp4 OUT.mp4 FROM:TO …` re-renders only
+the strip above the window (headline and boxes) of some scenes over an earlier render.
 
 A 63-second, 1080p/30 fps launch video of tavya, set in the owner's real organization
 (Abhimanyu Pallavi Sudhir / `personal`) cloned into a scratch tavya, with friends'

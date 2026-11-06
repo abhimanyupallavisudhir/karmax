@@ -288,6 +288,17 @@ entry(r'^Build something great', [
     '@sleep 900000',
 ])
 
+# ── The landing page's "an agent does it" still: a task that stays mid-work ──
+entry(r'^Fill in slides\.md with content from README\.md', [
+    '@step read Read README.md :: 214 lines · method, datasets, three experiments',
+    '@step command ls results/ :: ablation.csv  baseline.csv  scaling.csv  figures/',
+    '@step command python3 -c "import pandas as pd; print(pd.read_csv(\'results/scaling.csv\').describe())" :: 6 model sizes · loss falls 2.91 → 2.07',
+    '@step think Slides: the question, the method in one picture, then one slide per experiment with its figure and the number that matters.',
+    '@step edit Edit slides.md',
+    '@step command npx @marp-team/marp-cli slides.md --pdf :: slides.pdf  9 pages',
+    '@sleep 900000',
+], pace=700)
+
 # ── Sub-tasks (the feature grid's still; created and deleted off camera) ──
 SUBTASKS = [
     ('Write the Show HN post and the Product Hunt listing', False),

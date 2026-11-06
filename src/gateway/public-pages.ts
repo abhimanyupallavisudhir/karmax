@@ -48,10 +48,11 @@ export type PublicRoute =
   | { kind: 'not-found' }
   | { kind: 'console' };
 
-/** The landing's chapters, as the launch film and web/app.js (LANDING_CHAPTERS, LANDING_CARDS) tell them. */
-const LANDING_CHAPTERS = ['Every project. One list.', 'Say what needs doing.', 'Agents work on their own computers.', 'Big jobs fan out.',
-  'Review the result, not the process.', 'Not just code.', 'Give agents accounts, keys and a card.', 'Work that starts itself.',
-  'Any model. Your subscription.', 'In your pocket, too.'];
+/** The landing's sections, as web/app.js (LANDING_STEPS, LANDING_FEATURES) tells them: [heading, its parts]. */
+const LANDING_SECTIONS: Array<[string, string[]]> = [
+  ['How a task goes', ['Write it down', 'An agent does it', 'You review the result']],
+  ['Everything a task needs', ['Big jobs fan out', 'Accounts, keys and a card', 'The autonomous company', 'Any model, your subscription', 'Not just code', 'On your phone']],
+];
 
 /** The tagline the landing and its title share. */
 export const LANDING_TAGLINE = 'the agentic to-do list that finishes itself';
@@ -144,7 +145,7 @@ function page(ctx: PublicPageContext, pathname: string): PublicPage | 'not-found
       body: `<h1>The agentic to-do list that finishes itself.</h1>
 <p>${esc(description)}</p>
 <p><a href="/media/tavya-launch.mp4">Watch the launch film (0:59)</a></p>
-<ul>${LANDING_CHAPTERS.map((chapter) => `<li>${esc(chapter)}</li>`).join('')}</ul>
+${LANDING_SECTIONS.map(([heading, parts]) => `<h2>${esc(heading)}</h2>\n<ul>${parts.map((part) => `<li>${esc(part)}</li>`).join('')}</ul>`).join('\n')}
 <p><a href="/signup">Get started</a> · <a href="/login">Sign in</a></p>`,
       structuredData: { '@context': 'https://schema.org', '@graph': [
         { '@type': 'Organization', '@id': `${ctx.origin}/#organization`, name: site, url: `${ctx.origin}/`, logo: `${ctx.origin}/brand/icon-512.png` },
