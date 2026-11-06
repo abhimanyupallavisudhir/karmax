@@ -3534,7 +3534,7 @@ export class KarmaxApi {
    * Edit a waiting (armed) task in place — its workflow hasn't started, so its
    * stored params (including its triggers) are freely editable, exactly like a
    * draft. `keepArmed` re-arms with the new triggers (Save); otherwise it disarms
-   * back to a draft (Save as draft). Removing all triggers also drops it to a draft.
+   * back to a draft (Return to draft). Removing all triggers also drops it to a draft.
    */
   async updateArmedParams(
     token: string,
