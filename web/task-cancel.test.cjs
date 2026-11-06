@@ -5,14 +5,17 @@ const vm = require('node:vm');
 const source = fs.readFileSync(`${__dirname}/app.js`, 'utf8');
 const fn = name => source.match(new RegExp(`(?:async )?function ${name}\\([^]*?\\n}`))[0];
 
-for (const entry of ['footer', 'command', 'form', 'scheduled']) {
+const cancellationCases = ['cancel', 'finish'].flatMap(signal =>
+  (signal === 'cancel' ? ['footer', 'command', 'form', 'scheduled'] : ['footer', 'command', 'form'])
+    .map(entry => [signal, entry]));
+for (const [signal, entry] of cancellationCases) {
   for (const accepted of [false, true]) {
-    test(`${entry}: ${accepted ? 'accepting' : 'dismissing'} cancellation confirmation`, async () => {
+    test(`${signal} ${entry}: ${accepted ? 'accepting' : 'dismissing'} cancellation confirmation`, async () => {
       const prompts = [], requests = [], reflected = [], feedback = [];
       const elements = new Map();
       const element = key => {
         if (!elements.has(key)) elements.set(key, {
-          dataset: { act: 'cancel', label: 'Cancel', canceltrig: 'task' },
+          dataset: { act: signal, label: 'Cancel', canceltrig: 'task' },
           disabled: false, innerHTML: 'Cancel', value: '',
           addEventListener(event, handler) { this[event] = handler; },
           querySelectorAll: selector => selector === '[data-canceltrig]' ? [element('trigger')]
@@ -40,21 +43,23 @@ for (const entry of ['footer', 'command', 'form', 'scheduled']) {
         context.wireActions(context.S.view);
         await element('button').click();
       } else if (entry === 'command') {
-        await context.runDeclaredAction({ name: 'cancel' });
+        await context.runDeclaredAction({ name: signal, label: 'Cancel' });
       } else if (entry === 'form') {
-        context.openActionForm({ name: 'cancel', args: [] });
+        context.openActionForm({ name: signal, label: 'Cancel', args: [] });
         await element('#act-send').click();
       } else {
         context.wireTasksView();
         await element('trigger').click({ stopPropagation() {} });
       }
       assert.equal(prompts.length, 1);
-      assert.match(prompts[0], /Cancel/);
+      assert.match(prompts[0], /Cancel this (?:scheduled )?task\?/);
+      assert.doesNotMatch(prompts[0], /Finish/);
+      if (signal === 'finish') assert.match(prompts[0], /[Aa]pproved.*may still land/);
       assert.equal(requests.length, accepted ? 1 : 0);
       if (accepted) {
         assert.equal(requests[0].url, `/api/tasks/task/${entry === 'scheduled' ? 'cancel-trigger' : 'signal'}`);
         assert.equal(requests[0].method, 'POST');
-        assert.deepEqual(JSON.parse(requests[0].body), entry === 'scheduled' ? {} : { signal: 'cancel' });
+        assert.deepEqual(JSON.parse(requests[0].body), entry === 'scheduled' ? {} : { signal });
       } else {
         assert.deepEqual(reflected, []);
         assert.deepEqual(feedback, []);
@@ -68,4 +73,19 @@ test('routine task actions do not prompt', () => {
   const context = vm.createContext({ confirm: () => assert.fail('unexpected confirmation') });
   vm.runInContext(fn('confirmTaskAction'), context);
   for (const action of ['retry', 'resume', 'confirm']) assert.equal(context.confirmTaskAction(action, {}), true);
+});
+
+test('cancellation after a landing keeps the Cancel label, including older task views', () => {
+  const context = vm.createContext({ esc: text => text });
+  vm.runInContext(['taskActionLabel', 'taskActionTip', 'biggerDiskButton', 'taskActions', 'actionToast'].map(fn).join('\n'), context);
+  for (const label of ['Finish', 'Cancel']) {
+    const action = { name: 'finish', label, enabled: true, danger: true };
+    const view = { actions: [action] };
+    assert.equal(context.taskActionLabel(view, action), 'Cancel');
+    const html = context.taskActions(view);
+    assert.match(html, /data-act="finish" data-label="Cancel"/);
+    assert.doesNotMatch(html, /Finish/);
+    assert.match(context.taskActionTip(view, action), /[Aa]pproved.*may still land/);
+    assert.equal(context.actionToast(action.name, context.taskActionLabel(view, action)), 'Cancelling');
+  }
 });

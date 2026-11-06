@@ -384,7 +384,7 @@ describe('software-dev: every branch of a task lands as its own pull request', (
     expect((await git(repo, ['show', 'main:docs/guide.md'])).code).not.toBe(0);
   }, 120_000);
 
-  it('Finish replaces Cancel once something landed: unapproved pull requests close, a landing one lands, then done', async () => {
+  it('Cancel keeps its label after a landing: unapproved pull requests close, a landing one lands, then done', async () => {
     const repo = await h.makeRepo('ship-finish');
     const { handle } = await start(repo, ['@branch docs', docsCommit, '@ship docs', '@incomplete'].join('\n'));
     // Something else holds the merge slot, so an approved pull request waits in
@@ -401,6 +401,7 @@ describe('software-dev: every branch of a task lands as its own pull request', (
     expect((await docs.result()).stage).toBe('done');
     await expect.poll(actions, { timeout: 30_000 }).toContain('finish');
     expect(await actions()).not.toContain('cancel');
+    expect((await view(handle)).actions.find((action: any) => action.name === 'finish')?.label).toBe('Cancel');
 
     // Two more pull requests: api is approved and waits in its landing; cli
     // waits for its Review.
