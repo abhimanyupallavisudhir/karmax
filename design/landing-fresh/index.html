@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tavya — a to-do list for agents</title>
+<meta name="description" content="Write what you want done. An agent does it on its own cloud computer — code, accounts, payments — and hands it back for your review.">
+<link rel="icon" href="/brand/icon.svg" type="image/svg+xml">
+<link rel="preload" href="fonts/Newsreader.woff2" as="font" type="font/woff2" crossorigin>
+<style>
+@font-face { font-family: "Newsreader"; font-style: normal; font-weight: 300 600; font-display: swap;
+  src: url(fonts/Newsreader.woff2) format("woff2"); }
+@font-face { font-family: "Newsreader"; font-style: italic; font-weight: 300 600; font-display: swap;
+  src: url(fonts/Newsreader-Italic.woff2) format("woff2"); }
+@font-face { font-family: "Inter"; font-style: normal; font-weight: 100 900; font-display: swap;
+  src: url(../../web/fonts/inter/InterVariable.woff2) format("woff2"); }
+
+:root {
+  --paper: #fafafc;
+  --ink: #17172b;
+  --muted: #6c6c82;
+  --rule: #e4e4ee;
+  --indigo: #5b5bd6;
+  --wash: #efeffb;
+  --serif: "Newsreader", "Iowan Old Style", Georgia, serif;
+  --sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --wrap: min(1080px, 100% - 3rem);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --paper: #111120; --ink: #ececf6; --muted: #9a9ab2; --rule: #26263a; --indigo: #8b8bf0; --wash: #1c1c33; color-scheme: dark; }
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 400 1rem/1.6 var(--sans);
+  font-feature-settings: "cv11", "ss01"; -webkit-font-smoothing: antialiased; }
+a { color: inherit; }
+:focus-visible { outline: 2px solid var(--indigo); outline-offset: 3px; border-radius: 4px; }
+.wrap { width: var(--wrap); margin-inline: auto; }
+
+/* ── header ── */
+.top { display: flex; align-items: center; justify-content: space-between; padding-block: 1.5rem; }
+.mark { display: inline-flex; align-items: center; gap: .55rem; text-decoration: none;
+  font: 500 1.55rem/1 var(--serif); letter-spacing: -.01em; }
+.mark svg { width: 1.35rem; height: 1.35rem; }
+.top nav { display: flex; align-items: center; gap: 1.75rem; font-size: .925rem; }
+.top nav a { text-decoration: none; color: var(--muted); }
+.top nav a:hover { color: var(--ink); }
+.btn { display: inline-flex; align-items: center; gap: .4rem; padding: .62rem 1.1rem; border-radius: 999px;
+  background: var(--ink); color: var(--paper) !important; text-decoration: none; font-weight: 500; font-size: .925rem;
+  transition: background .2s; }
+.btn:hover { background: var(--indigo); }
+.link { color: var(--ink); text-decoration: none; font-weight: 500; font-size: .925rem; }
+.link:hover { color: var(--indigo); }
+
+/* ── the list (signature) ── */
+.hero { padding-block: clamp(2.5rem, 6vw, 5rem) clamp(3.5rem, 8vw, 6rem); }
+.sheet-head { display: flex; justify-content: space-between; align-items: baseline;
+  padding-bottom: .9rem; border-bottom: 1px solid var(--rule);
+  font-size: .8rem; color: var(--muted); letter-spacing: .02em; }
+.sheet-head b { color: var(--ink); font-weight: 600; }
+.count { font-variant-numeric: tabular-nums; }
+.todo { list-style: none; margin: 0; padding: 0; }
+.todo li { display: grid; grid-template-columns: auto 1fr auto; align-items: baseline; column-gap: clamp(.9rem, 2.2vw, 1.6rem);
+  padding-block: clamp(.7rem, 1.6vw, 1.15rem); border-bottom: 1px solid var(--rule); }
+.todo .t { font: 380 clamp(1.75rem, 4.2vw, 3.5rem)/1.1 var(--serif); letter-spacing: -.022em;
+  font-variation-settings: "opsz" 72; text-wrap: balance; }
+.todo .t span { background: linear-gradient(currentColor, currentColor) 0 60% / 0% .055em no-repeat;
+  -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+
+.box { position: relative; top: -.02em; width: clamp(1.3rem, 2.9vw, 2.15rem); aspect-ratio: 1;
+  border: max(1.5px, .12rem) solid currentColor; border-radius: 28%; align-self: center; flex: none; }
+.box svg { position: absolute; inset: -2px; width: calc(100% + 4px); height: calc(100% + 4px); }
+.box path { fill: none; stroke: #fff; stroke-width: 3.2; stroke-linecap: round; stroke-linejoin: round;
+  stroke-dasharray: 24; stroke-dashoffset: 24; }
+.who { font-size: .82rem; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums;
+  opacity: 0; transform: translateY(4px); }
+.who i { font-style: normal; color: var(--ink); font-weight: 500; }
+
+/* each item ticks in turn: --d is its start */
+.todo li.done .box { animation: fill .22s var(--d) ease-out forwards; }
+.todo li.done .box path { animation: draw .3s calc(var(--d) + .12s) ease-out forwards; }
+.todo li.done .t { animation: fade .5s calc(var(--d) + .3s) ease-out forwards; }
+.todo li.done .t span { animation: strike .45s calc(var(--d) + .28s) cubic-bezier(.6,0,.2,1) forwards; }
+.todo li.done .who { animation: rise .4s calc(var(--d) + .45s) ease-out forwards; }
+@keyframes fill { to { background: var(--indigo); border-color: var(--indigo); } }
+@keyframes draw { to { stroke-dashoffset: 0; } }
+@keyframes strike { to { background-size: 100% .055em; } }
+@keyframes fade { to { color: var(--muted); } }
+@keyframes rise { to { opacity: 1; transform: none; } }
+
+.todo li.next { cursor: pointer; }
+.todo li.next .box { color: var(--muted); }
+.todo li.next .t { color: var(--muted); font-style: italic; }
+.todo li.next a { text-decoration: none; }
+.todo li.next a::after { content: ""; position: absolute; inset: 0; }
+.todo li.next { position: relative; }
+.caret { display: inline-block; width: .06em; height: .9em; margin-left: .06em; vertical-align: -.1em;
+  background: var(--indigo); animation: blink 1.1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+.todo li.next:hover .t, .todo li.next:focus-within .t { color: var(--ink); }
+.todo li.next:hover .box { color: var(--indigo); }
+.go { font-size: .85rem; font-weight: 500; color: var(--indigo); white-space: nowrap; opacity: 0; transition: opacity .2s; }
+.todo li.next:hover .go, .todo li.next:focus-within .go { opacity: 1; }
+@media (hover: none) { .go { opacity: 1; } }
+
+.thesis { display: grid; grid-template-columns: 1fr auto; gap: 2rem 4rem; align-items: end; margin-top: clamp(2.5rem, 5vw, 3.75rem); }
+.thesis h1 { margin: 0 0 .6rem; font: 450 clamp(1.5rem, 2.6vw, 2.05rem)/1.2 var(--serif); letter-spacing: -.012em; }
+.thesis p { margin: 0; max-width: 34rem; color: var(--muted); font-size: 1.05rem; }
+.cta { display: flex; align-items: center; gap: 1.5rem; }
+
+/* ── sections ── */
+section.band { padding-block: clamp(4rem, 9vw, 7rem); border-top: 1px solid var(--rule); }
+h2 { margin: 0 0 2.5rem; font: 420 clamp(1.75rem, 3.4vw, 2.6rem)/1.15 var(--serif); letter-spacing: -.018em; max-width: 22ch; }
+h3 { margin: 0 0 .35rem; font-size: 1rem; font-weight: 600; letter-spacing: -.005em; }
+.small { color: var(--muted); font-size: .95rem; margin: 0; }
+
+/* a task's life — a real sequence, so it is numbered by stage */
+.life { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; list-style: none; margin: 0; padding: 0; counter-reset: s; }
+.life li { position: relative; padding: 1.6rem 1.5rem 0 0; border-top: 2px solid var(--rule); }
+.life li::before { content: ""; position: absolute; top: -6px; left: 0; width: 10px; height: 10px; border-radius: 50%;
+  background: var(--paper); border: 2px solid var(--indigo); }
+.life li:last-child::before { background: var(--indigo); }
+.life li:last-child { border-top-color: var(--indigo); }
+.stage { display: block; margin-bottom: .55rem; font-size: .75rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--indigo); }
+.trace { display: block; margin-top: .9rem; font: .78rem/1.5 ui-monospace, "SF Mono", Menlo, monospace; color: var(--muted); }
+
+/* hand-offs — more of the list, unchecked */
+.handoff { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--rule); }
+.handoff li { display: grid; grid-template-columns: auto 1fr minmax(10rem, 15rem); align-items: baseline; gap: 1.25rem;
+  padding-block: 1.05rem; border-bottom: 1px solid var(--rule); }
+.handoff .box { width: 1.15rem; border-width: 1.5px; color: var(--muted); transition: background .18s, border-color .18s; }
+.handoff .box path { transition: stroke-dashoffset .25s .05s; }
+.handoff li:hover .box { background: var(--indigo); border-color: var(--indigo); }
+.handoff li:hover .box path { stroke-dashoffset: 0; }
+.handoff .t { font: 400 clamp(1.2rem, 2.2vw, 1.6rem)/1.3 var(--serif); letter-spacing: -.01em; }
+.handoff .tag { font-size: .85rem; color: var(--muted); }
+
+.three { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2.5rem; }
+.three > div { padding-top: 1.1rem; border-top: 1px solid var(--ink); }
+
+.runs { display: grid; grid-template-columns: 1fr 1fr; gap: 2.5rem 4rem; }
+.runs p { margin: 0; font: 400 clamp(1.15rem, 1.9vw, 1.4rem)/1.45 var(--serif); }
+.runs .k { display: block; margin-bottom: .5rem; font: 600 .75rem/1 var(--sans); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+
+.end { padding-block: clamp(4.5rem, 10vw, 8rem); border-top: 1px solid var(--rule); text-align: center; }
+.end h2 { margin: 0 auto 1.75rem; max-width: none; font-size: clamp(2.1rem, 5vw, 3.6rem); }
+.end h2 em { color: var(--indigo); }
+.end .cta { justify-content: center; }
+
+footer { padding-block: 2rem 2.5rem; border-top: 1px solid var(--rule); font-size: .85rem; color: var(--muted); }
+footer .wrap { display: flex; justify-content: space-between; align-items: baseline; gap: 1.5rem; flex-wrap: wrap; }
+footer nav { display: flex; gap: 1.5rem; }
+footer a { text-decoration: none; }
+footer a:hover { color: var(--ink); }
+.dev { font-family: var(--serif); font-style: italic; font-size: .95rem; }
+
+/* ── small screens ── */
+@media (max-width: 760px) {
+  .top nav .hide-sm { display: none; }
+  .todo li { grid-template-columns: auto 1fr; }
+  .todo .who, .todo .go { grid-column: 2; margin-top: .35rem; }
+  .thesis { grid-template-columns: 1fr; }
+  .life { grid-template-columns: 1fr; }
+  .life li { padding: 0 0 2rem 1.75rem; border-top: 0; border-left: 2px solid var(--rule); }
+  .life li::before { top: 0; left: -6px; }
+  .life li:last-child { border-left-color: var(--indigo); padding-bottom: 0; }
+  .handoff li { grid-template-columns: auto 1fr; row-gap: .2rem; }
+  .handoff .tag { grid-column: 2; }
+  .three, .runs { grid-template-columns: 1fr; gap: 2rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0s !important; animation-delay: 0s !important; transition: none !important; }
+  .caret { animation: none; }
+}
+</style>
+</head>
+<body>
+
+<header class="wrap top">
+  <a class="mark" href="/" aria-label="tavya home">
+    <svg viewBox="0 0 512 512" aria-hidden="true"><rect width="512" height="512" rx="120" fill="var(--indigo)"/><path d="M256 105 407 256 256 407 105 256Z" fill="none" stroke="#fff" stroke-width="42" stroke-linejoin="round"/><circle cx="256" cy="256" r="27" fill="#fff"/></svg>
+    tavya
+  </a>
+  <nav aria-label="Site">
+    <a class="hide-sm" href="/docs/how-it-works">How it works</a>
+    <a class="hide-sm" href="/pricing">Pricing</a>
+    <a class="hide-sm" href="/docs">Docs</a>
+    <a href="/signup" class="btn">Get started</a>
+  </nav>
+</header>
+
+<main>
+  <div class="wrap hero">
+    <div class="sheet-head" aria-hidden="true">
+      <b>To do</b>
+      <span class="count"><span id="done">0</span> of 3 done</span>
+    </div>
+    <ul class="todo" aria-label="Example tasks done by agents">
+      <li class="done" style="--d: .5s">
+        <span class="box"><svg viewBox="0 0 24 24"><path d="M6.5 12.5l3.6 3.6 7.4-8"/></svg></span>
+        <span class="t"><span>Fix the flaky checkout test</span></span>
+        <span class="who"><i>Codex</i> · pull request merged</span>
+      </li>
+      <li class="done" style="--d: 1.45s">
+        <span class="box"><svg viewBox="0 0 24 24"><path d="M6.5 12.5l3.6 3.6 7.4-8"/></svg></span>
+        <span class="t"><span>Set up email for the new domain</span></span>
+        <span class="who"><i>Claude</i> · signed up, keys saved</span>
+      </li>
+      <li class="done" style="--d: 2.4s">
+        <span class="box"><svg viewBox="0 0 24 24"><path d="M6.5 12.5l3.6 3.6 7.4-8"/></svg></span>
+        <span class="t"><span>Renew the domain for two years</span></span>
+        <span class="who"><i>Claude</i> · paid $27.80 of $40</span>
+      </li>
+      <li class="next">
+        <span class="box"></span>
+        <a class="t" href="/signup">Your first task<span class="caret" aria-hidden="true"></span></a>
+        <span class="go" aria-hidden="true">Start →</span>
+      </li>
+    </ul>
+
+    <div class="thesis">
+      <div>
+        <h1>A to-do list your agents work through.</h1>
+        <p>Write what you want done. An agent does it on its own cloud computer, then hands it back for you to review.</p>
+      </div>
+      <div class="cta">
+        <a class="btn" href="/signup">Get started</a>
+        <a class="link" href="/docs/how-it-works">How it works →</a>
+      </div>
+    </div>
+  </div>
+
+  <section class="band" aria-labelledby="life">
+    <div class="wrap">
+      <h2 id="life">Every task ends with something you can check.</h2>
+      <ol class="life">
+        <li>
+          <span class="stage">Write</span>
+          <h3>Say what you want</h3>
+          <p class="small">As you'd brief a colleague: the outcome, and how you'll judge it.</p>
+          <span class="trace">“Add dark mode to settings”</span>
+        </li>
+        <li>
+          <span class="stage">Working</span>
+          <h3>An agent does it</h3>
+          <p class="small">On its own computer with your repositories and data. Reply any time.</p>
+          <span class="trace">Claude · 4 CPU · 22 min</span>
+        </li>
+        <li>
+          <span class="stage">Review</span>
+          <h3>You look it over</h3>
+          <p class="small">The changes, screenshots, a live preview. Confirm, or say what to change.</p>
+          <span class="trace">Pull request #812 · 3 screenshots</span>
+        </li>
+        <li>
+          <span class="stage">Landing</span>
+          <h3>It's done</h3>
+          <p class="small">Merged, and what the agent learned goes in the wiki.</p>
+          <span class="trace">Merged into main</span>
+        </li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="band" aria-labelledby="more">
+    <div class="wrap">
+      <h2 id="more">Hand off more than code.</h2>
+      <ul class="handoff">
+        <li><span class="box"><svg viewBox="0 0 24 24"><path d="M6.5 12.5l3.6 3.6 7.4-8"/></svg></span><span class="t">Upgrade to Node 24 and fix whatever breaks</span><span class="tag">Repositories and pull requests</span></li>
+        <li><span class="box"><svg viewBox="0 0 24 24"><path d="M6.5 12.5l3.6 3.6 7.4-8"/></svg></span><span class="t">Create a Postmark account and send the welcome email from it</span><span class="tag">Logins, passwords and passkeys</span></li>
+        <li><span class="box"><svg viewBox="0 0 24 24"><path d="M6.5 12.5l3.6 3.6 7.4-8"/></svg></span><span class="t">Buy the .com if it's under $20</span><span class="tag">Payment cards, with a budget</span></li>
+        <li><span class="box"><svg viewBox="0 0 24 24"><path d="M6.5 12.5l3.6 3.6 7.4-8"/></svg></span><span class="t">Split the launch into tasks and run them side by side</span><span class="tag">Sub-tasks</span></li>
+        <li><span class="box"><svg viewBox="0 0 24 24"><path d="M6.5 12.5l3.6 3.6 7.4-8"/></svg></span><span class="t">Retrain the model on a machine with 32 GB of memory</span><span class="tag">Computers of any size</span></li>
+        <li><span class="box"><svg viewBox="0 0 24 24"><path d="M6.5 12.5l3.6 3.6 7.4-8"/></svg></span><span class="t">Write down how we deploy, so it's quicker next time</span><span class="tag">A wiki agents read and keep</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="band" aria-labelledby="charge">
+    <div class="wrap">
+      <h2 id="charge">You stay in charge.</h2>
+      <div class="three">
+        <div>
+          <h3>Same rules for everyone</h3>
+          <p class="small">People and agents share one set of permissions. An agent never has more than the person who started it.</p>
+        </div>
+        <div>
+          <h3>A budget on every card</h3>
+          <p class="small">Each task can spend up to its budget. Anything more waits for your approval.</p>
+        </div>
+        <div>
+          <h3>It asks when it should</h3>
+          <p class="small">A decision, a password, a sign-off: the task waits for you with a short form to answer.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" aria-labelledby="yours">
+    <div class="wrap">
+      <h2 id="yours">Your agents, your accounts.</h2>
+      <div class="runs">
+        <p><span class="k">Agents</span>Claude Code, Codex and OpenCode — signed in with your own Claude or ChatGPT subscription, or an API key.</p>
+        <p><span class="k">Computers</span>tavya's, charged to your plan — or your own E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud account.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="end" aria-labelledby="start">
+    <div class="wrap">
+      <h2 id="start">What should get <em>done</em> first?</h2>
+      <div class="cta">
+        <a class="btn" href="/signup">Get started</a>
+        <a class="link" href="/pricing">See pricing →</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span><span class="dev" lang="sa">-tavya</span> · Sanskrit for “to be done”</span>
+    <nav aria-label="Footer">
+      <a href="/docs">Docs</a>
+      <a href="/pricing">Pricing</a>
+      <a href="/legal">Policies</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+  // The counter follows the ticks; with reduced motion, it starts complete.
+  (() => {
+    const done = document.getElementById('done');
+    const items = [...document.querySelectorAll('.todo li.done')];
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) { done.textContent = items.length; return; }
+    let n = 0;
+    items.forEach((li) => li.querySelector('.box').addEventListener('animationend', (e) => { if (e.animationName === 'fill') done.textContent = ++n; }));
+  })();
+</script>
+</body>
+</html>
