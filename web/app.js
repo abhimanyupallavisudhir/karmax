@@ -9614,7 +9614,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           ${templateEdit ? '<span class="tf-hint"></span>' : `<button class="btn ghost" id="tf-save-template" title="Save this form as a template, to start new tasks from" aria-label="Save as template">${ICON.template}<span class="tf-save-template-label">Save as template</span></button>
           <span class="tf-hint">${store ? storeFormHint(store) : ''}</span>
           <button class="btn" id="tf-save-avatar" ${values.avatar ? '' : 'hidden'}>Save as Avatār without running</button>
-          <button class="btn" id="tf-draft">Save draft</button>`}
+          <button class="btn" id="tf-draft">${editInPlace ? 'Return to draft' : 'Save draft'}</button>`}
           <button class="btn primary" id="tf-queue">${templateEdit ? 'Save template' : editInPlace ? 'Save' : store?.repeatable && values.repeatable ? 'Install' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
         </div>
       </div>
@@ -10187,7 +10187,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       if (editInPlace) {
         // A waiting (armed) task or a repeatable series edits in place (incl. its
         // triggers) — it has no running workflow to queue. "Save" re-arms / keeps
-        // the series; "Save as draft" (draftMode) disarms it back to a draft.
+        // the series; "Return to draft" (draftMode) disarms it back to a draft.
         await Promise.all([
           api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, keepArmed: !draftMode, ...paramsOptions }) }),
           api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) }),
@@ -10198,9 +10198,11 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         // The usual expanded-form path was just persisted by auto-save. Do not
         // spend another RTT writing identical params and notes before queueing.
         // Accepting an agent's limited authority is recorded with its params.
-        if (!currentStateAlreadySaved || agentAccepted.length) {
+        if (!currentStateAlreadySaved || agentAccepted.length || draftMode) {
           await Promise.all([
-            api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, allowAttenuation: true, ...paramsOptions }) }),
+            // Save draft always drafts: the task may have been set waiting
+            // (run elsewhere) since this form opened as a draft.
+            api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, allowAttenuation: true, ...(draftMode ? { keepArmed: false } : {}), ...paramsOptions }) }),
             api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) }),
           ]);
         }
@@ -10284,7 +10286,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       // EXISTING draft used to say "Task created" — nothing was created, so the
       // user could not tell whether they had just made a duplicate.
       toast(editInPlace
-        ? (draftMode ? 'Moved to drafts' : 'Saved')
+        ? (draftMode ? 'Returned to draft' : 'Saved')
         : draftMode ? (st.body.avatar ? 'Saved as Avatār' : 'Draft saved') : 'Task started');
       refreshTasks();
     } catch (e) {
