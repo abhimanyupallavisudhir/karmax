@@ -96,7 +96,7 @@ const root = __dirname;
       'the tasks it was forked from are listed, oldest first, above its own forks');
     assert.equal(await page.locator('#fork-sources-title').locator('xpath=ancestor::section').locator('a[href$="/tasks/origin"] + .fork-tree a[href$="/tasks/attempt"]').count(), 1,
       'its direct source nests under the task that one was forked from');
-    assert.equal(await page.locator('a[href$="/tasks/fork-done"] .chip.done').count(), 1, 'the finished fork shows as done');
+    assert.equal(await page.locator('a[href$="/tasks/fork-done"] .status.done').count(), 1, 'the finished fork shows as done');
     assert.match(overview, /PR #7\s*merged/i, 'the merged pull request stays linked');
 
     await page.waitForSelector('#ck-term-item');

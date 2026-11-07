@@ -60,7 +60,7 @@ function constant(name) {
       window.stageLabel = () => 'Review';
       window.priorityFlag = () => '';
       window.pipeline = () => '';
-      window.attentionChip = () => '<span class="chip attention escalated">Input</span>';
+      window.attentionChip = () => '<span class="status human attention escalated"><span class="status-label">Input</span></span>';
       window.rowAsk = () => ({ kind: 'escalated' });
       window.renderMain = () => {
         $('#main').innerHTML = `<div class="task-list">${inboxNoticesHtml()}${taskRow({ id: 'reference', projectId: 'karmax', num: 284, title: 'Restore the deployment after a failed health check', lastView: { status: 'waiting', stage: 'review' } }, { showTags: false, project: true })}</div>`;
@@ -71,7 +71,8 @@ function constant(name) {
       constant('URGENCY_LEVELS'), 'const systemNotifications = new Map();',
       ...['updateBell', 'syncNotificationAlerts', 'urgencyRank', 'inboxUnreadCount', 'taskHasUnreadAsk', 'inboxRowLabel', 'inboxTitle', 'urgencyChip',
         'inboxNotices', 'inboxNoticesHtml', 'wireInboxNotices', 'isNewTabClick', 'wireRowLink', 'markInboxItemRead', 'slugify', 'projectSlug', 'projectPath', 'orgSlug', 'projectLabel',
-        'rowKey', 'cursorRows', 'applyCursor', 'moveCursor', 'openListRow', 'isSeries', 'rowTime', 'fmtWhen', 'rowWhen', 'rowQuickQuestion', 'rowAskHtml', 'taskRow'].map(fn),
+        'rowKey', 'cursorRows', 'applyCursor', 'moveCursor', 'openListRow', 'isSeries', 'rowTime', 'fmtWhen', 'rowWhen', 'rowQuickQuestion', 'rowAskHtml', 'accountWaitReason', 'statusTone', 'statusHtml', 'viewStatusHtml', 'taskRow'].map(fn),
+      src.match(/const PARKED_WAITS = [^\n]*/)[0],
       'renderMain();',
     ].join('\n') });
     await page.evaluate(() => document.fonts.ready);

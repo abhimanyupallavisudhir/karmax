@@ -37,7 +37,7 @@ test('a row says why it waits on you, briefly, with the reason in its tooltip', 
   const ctx = vm.createContext({ esc: (value) => String(value), S: { searchResult: { reasons: {
     a: ['review-requested'], b: ['escalated'], c: ['mentioned', 'escalated'], d: ['draft'], e: ['escalated'],
   } } } });
-  vm.runInContext([constant('ATTENTION_REASONS'), constant('HOLD_REASONS'), constant('PULL_REQUEST_REASONS'), fn('rowAsk'), fn('attentionChip')].join('\n'), ctx);
+  vm.runInContext([constant('ATTENTION_REASONS'), constant('HOLD_REASONS'), constant('PULL_REQUEST_REASONS'), fn('rowAsk'), fn('statusHtml'), fn('attentionChip')].join('\n'), ctx);
   const chip = (id, lastView = {}) => ctx.attentionChip({ id, lastView });
   assert.match(chip('a'), />Needs review</);
   assert.match(chip('a'), /title="Waiting for your review"/);
@@ -55,7 +55,7 @@ test('a row whose pull request asks says so, and the task keeps its own status',
     reasons: { a: ['review-requested'], b: ['review-requested'] },
     pullRequestAsks: { a: [{ checkout: 'pramana', kind: 'review-requested' }] },
   } } });
-  vm.runInContext([constant('ATTENTION_REASONS'), constant('HOLD_REASONS'), constant('PULL_REQUEST_REASONS'), fn('rowAsk'), fn('attentionChip')].join('\n'), ctx);
+  vm.runInContext([constant('ATTENTION_REASONS'), constant('HOLD_REASONS'), constant('PULL_REQUEST_REASONS'), fn('rowAsk'), fn('statusHtml'), fn('attentionChip')].join('\n'), ctx);
   const chip = (id) => ctx.attentionChip({ id, lastView: { stage: 'do', status: 'waiting', waitingFor: { kind: 'timer' } } });
   assert.match(chip('a'), />PR review</);
   assert.match(chip('a'), /title="The pull request for "pramana" waits for your review"/);

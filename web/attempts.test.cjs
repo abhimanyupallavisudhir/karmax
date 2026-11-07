@@ -51,8 +51,9 @@ global.attentionChip = () => '';
 global.projectLabel = () => '';
 global.taskHasUnreadAsk = () => false;
 global.markTaskAsksRead = () => {};
-for (const name of ['rowTime', 'fmtWhen', 'rowWhen', 'awaitingApproval', 'restingAvatar', 'taskRow', 'taskFormTitle']) eval(extractFn(name));
-global.awaitingApprovalChip = eval(src.match(/const awaitingApprovalChip = ('[^\n]*');/)[1]);
+for (const name of ['rowTime', 'fmtWhen', 'rowWhen', 'awaitingApproval', 'awaitingApprovalStatus', 'restingAvatar', 'taskRow', 'taskFormTitle',
+  'statusTone', 'statusHtml', 'viewStatusHtml', 'accountWaitReason']) eval(extractFn(name));
+global.PARKED_WAITS = eval(src.match(/const PARKED_WAITS = ([^\n]*);/)[1]);
 global.avatarChip = eval(src.match(/const avatarChip = ('[^\n]*');/)[1]);
 
 let pass = 0, fail = 0;
@@ -106,7 +107,7 @@ ok(archivedDraftRow.includes('data-unarchive="attempt-2"') && archivedDraftRow.i
 // Asked to run, held for an approval (task #716): numbered and waiting, not a draft to run.
 const waitingRow = taskRow({ id: 'held', title: 'Deploy', workflow: 'software-dev', num: 15,
   params: { draft: true, _awaitingApproval: 'areq_1' } });
-ok(waitingRow.includes('waiting for approval') && !waitingRow.includes('>draft<') && !waitingRow.includes('data-queue='),
+ok(waitingRow.includes('>Waiting for approval<') && !waitingRow.includes('>Draft<') && !waitingRow.includes('data-queue='),
   'a task waiting for approval says so and offers no Run task');
 ok(taskFormTitle({ title: 'Deploy', num: 15, params: { draft: true, _awaitingApproval: 'areq_1' } }).includes('#15'),
   'its page names it by number with what it waits for');

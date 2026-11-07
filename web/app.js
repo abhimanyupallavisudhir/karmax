@@ -94,10 +94,11 @@ const ICON = {
   edit: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg>',
   attach: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.4 11.6-8.9 8.9a6 6 0 0 1-8.5-8.5l9.4-9.4a4 4 0 0 1 5.7 5.7l-9.5 9.5a2 2 0 0 1-2.8-2.8l8.8-8.8"/></svg>',
   // Sidebar tree vocabulary: a plain chevron folds a folder (rotated 90° when
-  // open) and the checklist marks a project — a project is a todo list, so its
-  // icon is one.
+  // open) and a box marks a project — the container of its tasks, repositories,
+  // wiki and files. (A checklist read as one task's todo list; a folder would
+  // repeat the folder rows; `#` is a topic tag.)
   chevron: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>',
-  project: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 6h11"/><path d="M10 12h11"/><path d="M10 18h11"/><path d="m3 6 1.5 1.5L7.5 4.5"/><path d="m3 12 1.5 1.5L7.5 10.5"/><path d="m3 18 1.5 1.5L7.5 16.5"/></svg>',
+  project: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg>',
   plus: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
   // Toolbar actions (conversation head, tab rails): one stroke weight and size.
   template: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="7" x="3" y="3" rx="1"/><rect width="9" height="7" x="3" y="14" rx="1"/><rect width="5" height="7" x="16" y="14" rx="1"/></svg>',
@@ -6365,7 +6366,7 @@ function railProjectRows(projectScoped) {
     && projectPath(p).toLocaleLowerCase().includes(query));
   const root = projectTree(projects);
   const folded = railCollapsedFolders();
-  // A project row is an item: checklist icon, regular text, a link. A folder
+  // A project row is an item: box icon, regular text, a link. A folder
   // row is a group heading: a chevron and a small uppercase name (styled in
   // CSS), so it never reads like the bold active project. Each row's tooltip
   // names its kind for the first-time reader. Folders carry their own "+" so a
@@ -7350,7 +7351,7 @@ function attentionChip(t) {
   const [label, title] = pullRequest
     ? [PULL_REQUEST_REASONS[kind][0], `The pull request for "${pullRequest}" ${PULL_REQUEST_REASONS[kind][1]}`]
     : (kind === 'escalated' && HOLD_REASONS[t.lastView?.waitingFor?.reason]) || ATTENTION_REASONS[kind];
-  return `<span class="chip attention ${esc(kind)}" title="${esc(title)}">${esc(label)}</span>`;
+  return statusHtml(label, 'human', { title, className: `attention ${kind}` });
 }
 // A row's project as a slug — `project` within an organization, `org/project`
 // on the bell's page, whose rows span every organization. A label, not a status:
@@ -7556,11 +7557,10 @@ function seriesRow(t, where = '') {
 
 function runSubRow(r) {
   const v = r.lastView || {};
-  const status = v.status || 'active';
   return `
     <div class="task-row run-row" data-id="${r.id}">
       <div class="task-main">
-        <div class="task-title">${esc(r.title)} <span class="chip ${status}">${esc(stageLabel(v))}</span>${v.approvalRequests ? ' <span class="chip approval-needed">approval needed</span>' : ''}</div>
+        <div class="task-title">${esc(r.title)} ${viewStatusHtml(v)}</div>
         <div class="task-sub"><span style="color:var(--ink-3)">${new Date(r.createdAt).toLocaleString()}</span></div>
       </div>
       <div class="task-right">${pipeline(v)}</div>
@@ -7569,7 +7569,9 @@ function runSubRow(r) {
 
 /** Asked to run, held until someone approves the authorization its creator could not grant. */
 function awaitingApproval(t) { return !!t?.params?.draft && !!t.params._awaitingApproval; }
-const awaitingApprovalChip = '<span class="chip waiting" title="Starts by itself once someone who can grant its authorization approves">waiting for approval</span>';
+function awaitingApprovalStatus() {
+  return statusHtml('Waiting for approval', 'human', { title: 'Starts by itself once someone who can grant its authorization approves' });
+}
 /** Saved as an Avatar without running: it rests in the Avatar stage, editable like a draft. */
 function restingAvatar(t) { return !!t?.params?.avatar && !!t.params.draft && !t.lastView; }
 const avatarChip = '<span class="chip avatar-chip" title="Avatār: its forks act with its authorization">✦ Avatār</span>';
@@ -7584,7 +7586,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
     <div class="task-row" data-armed="${t.id}">
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub">${where}<span class="chip">waiting for trigger</span><span style="color:var(--ink-3)">${esc(triggerSummary(t.params.triggers))}</span></div>
+        <div class="task-sub">${where}${statusHtml('Waiting for trigger', 'waiting')}<span style="color:var(--ink-3)">${esc(triggerSummary(t.params.triggers))}</span></div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-runnow="${t.id}">Run now</button>
@@ -7603,7 +7605,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
     <div class="task-row" data-draft="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub">${where}${awaiting ? awaitingApprovalChip : avatar ? avatarChip : '<span class="chip">draft</span>'}${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
+        <div class="task-sub">${where}${awaiting ? awaitingApprovalStatus() : avatar ? avatarChip : statusHtml('Draft', 'draft')}${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
       <div class="task-right">
         ${rowWhen(t)}
@@ -7614,10 +7616,10 @@ function taskRow(t, { showTags = true, project = false } = {}) {
     </div>`;
   }
   const v = t.lastView || {};
-  const status = v.status || 'active';
-  // In a for: list the reason says what the task waits for; a waiting stage
-  // chip ("Needs input") would only repeat it. Not when the ask is its pull
-  // request's: the task itself may be waiting on something else entirely.
+  const tone = statusTone(v);
+  // In a for: list the reason says what the task waits for; a stage status
+  // that waits on a person ("Needs input") would only repeat it. Not when the
+  // ask is its pull request's: the task itself may be waiting on something else.
   const why = attentionChip(t);
   const ownAsk = !!why && !rowAsk(t)?.pullRequest;
   // Any task can be archived/un-archived — archiving only hides it from the list,
@@ -7632,8 +7634,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
         <div class="task-sub">
           ${where}${why}
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
-          ${ownAsk && status === 'waiting' ? '' : `<span class="chip ${status}">${esc(stageLabel(v))}</span>`}
-          ${v.approvalRequests && !why ? '<span class="chip approval-needed">approval needed</span>' : ''}
+          ${ownAsk && tone === 'human' ? '' : why ? statusHtml(stageLabel(v), tone) : viewStatusHtml(v)}
           ${priorityFlag(t)}${showTags ? tagChips(t) : ''}
         </div>
         ${ownAsk ? rowAskHtml(t) : ''}
@@ -7860,13 +7861,66 @@ function stageLabel(v) {
   return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
+// A task's status reads as a glyph and its label — never a pill, so it can't
+// be mistaken for a tag — and its colour says who has the ball: an agent
+// working (accent), a person asked for something (amber), the task waiting on
+// time, quota, a job or other tasks (grey), or a finished state.
+function statusTone(view) {
+  const v = view || {};
+  if (v.state?.draft) return 'draft';
+  if (v.outOfDisk) return 'failed';
+  if (v.status === 'done' || v.stage === 'done') return 'done';
+  if (v.status === 'failed') return 'failed';
+  if (v.status === 'cancelled') return 'stopped';
+  if (v.status === 'blocked' || v.stage === 'escalated') return 'human';
+  if (v.status !== 'waiting') return 'working';
+  const w = v.waitingFor;
+  if (w?.kind === 'human') return w.reason === 'error' ? 'failed' : 'human';
+  if (w?.kind === 'confirm') return 'human';
+  if (w?.kind === 'account') return accountWaitReason(w) === 'login' ? 'human' : 'waiting';
+  // Grey only when the label says what it waits for (stageLabel); a passing
+  // wait inside a stage (an agent slot, CI) still reads as that stage, working.
+  if (w?.kind === 'retry' || (v.stage === 'do' && PARKED_WAITS.has(w?.kind))) return 'waiting';
+  return 'working';
+}
+/** A status as the lists and the task page show it: a statusTone and its label. */
+function statusHtml(label, tone, options) {
+  const { title = '', className = '' } = options || {};
+  // One 16-unit family: a ring for states under way, a filled disc for ones
+  // that want a person or are over, its mark knocked out of the disc.
+  const ring = '<circle cx="8" cy="8" r="6.25" fill="none" stroke="currentColor" stroke-width="1.5"';
+  const disc = '<circle cx="8" cy="8" r="7" fill="currentColor"/>';
+  const glyphs = {
+    working: `${ring}/><path d="M8 4a4 4 0 0 1 0 8Z" fill="currentColor"/>`,
+    human: `${disc}<path class="mark" d="M8 4.6v3.9"/><circle class="mark-dot" cx="8" cy="11.2" r="1"/>`,
+    waiting: `${ring}/><path d="M8 5v3.2l2 1.3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>`,
+    done: `${disc}<path class="mark" d="m5 8.2 2.1 2.1L11 6.2"/>`,
+    failed: `${disc}<path class="mark" d="m5.7 5.7 4.6 4.6m0-4.6-4.6 4.6"/>`,
+    stopped: `${ring}/><path d="m5.6 10.4 4.8-4.8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>`,
+    draft: `${ring} stroke-dasharray="2.6 2.3"/>`,
+  };
+  const t = glyphs[tone] ? tone : 'working';
+  return `<span class="status ${t}${className ? ` ${className}` : ''}"${title ? ` title="${esc(title)}"` : ''}><svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">${glyphs[t]}</svg><span class="status-label">${esc(label)}</span></span>`;
+}
+/** A task view's status, with its pending approval folded in: one fact, said once. */
+function viewStatusHtml(view) {
+  const v = view || {};
+  const tone = statusTone(v);
+  const label = stageLabel(v);
+  if (!v.approvalRequests) return statusHtml(label, tone);
+  // A generic hold on a person that is really an approval says so; otherwise
+  // the approval is a second ask beside what the task is doing.
+  if (tone === 'human' && /^Needs input\b/.test(label)) return statusHtml(label.replace(/^Needs input/, 'Needs approval'), 'human');
+  return statusHtml(label, tone) + statusHtml('Needs approval', 'human');
+}
+
 // The stage indicator is also the lifecycle control. The server supplies the
 // exact moves for this attempt, so siblings may legitimately have different
 // menus (e.g. the Jayadratha winner vs a superseded/cancelled attempt).
 function stageIndicator(v, taskId, compact = false) {
   const moves = v.stageTransitions || [];
   const label = stageLabel(v);
-  if (!moves.length) return `<span class="chip ${esc(v.status || '')}">${esc(label)}</span>`;
+  if (!moves.length) return statusHtml(label, statusTone(v));
   return `<label class="stage-picker${compact ? ' compact' : ''}" title="Move this attempt to another stage">
     <span class="sr-only">Move ${esc(label)} stage</span>
     <select data-stage-move="${esc(taskId)}" aria-label="Move attempt from ${esc(label)}">
@@ -7903,7 +7957,7 @@ function pipeline(v) {
     const n = stages[i];
     let cls = 'seg';
     if (i < idx) cls += ' done';
-    if (i === idx && !done) cls += ' current ' + (v.status === 'active' ? 'working' : v.status || '');
+    if (i === idx && !done) cls += ' current ' + statusTone(v);
     if (merged && ponrIdx >= 0 && i >= ponrIdx) cls += ' merged';
     if (n.ponr) {
       segs += `<span class="ponr ${merged ? 'passed' : i === idx ? 'current' : ''}" title="point of no return"></span>`;
@@ -8165,13 +8219,13 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['run'], query 
 
   const rowHtml = (t) => {
     const v = t.lastView || {};
-    const status = v.status || (awaitingApproval(t) || t.params?.triggerState === 'armed' ? 'waiting' : t.params?.draft ? 'cancelled' : 'active');
+    const tone = awaitingApproval(t) ? 'human' : t.params?.draft ? 'draft' : t.params?.triggerState === 'armed' ? 'waiting' : statusTone(v);
     const chipLabel = awaitingApproval(t) ? 'Waiting for approval' : t.params?.draft ? 'Draft' : t.params?.triggerState === 'armed' ? 'Waiting for trigger' : stageLabel(v);
     const open = expanded.has(t.id);
     return `<div class="pick-row" data-nav data-task="${t.id}">
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">Archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">Repeatable</span>' : ''}${t.params?.avatar ? ` ${avatarChip}` : ''}</div>
-        <div class="task-sub">${organizationWide && t.projectId !== S.projectId ? projectLabel(t) : ''}<span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t, false)}</div>
+        <div class="task-sub">${organizationWide && t.projectId !== S.projectId ? projectLabel(t) : ''}${statusHtml(chipLabel, tone)}${priorityFlag(t)}${tagChips(t, false)}</div>
       </div>
       ${mode === 'agent' ? `<span class="pk-caret">${open ? '▾' : '▸'}</span>` : ''}
     </div>${open ? `<div class="pk-sessions">${sessionsHtml(t)}</div>` : ''}`;
@@ -9384,9 +9438,9 @@ async function consumeTaskFormDefaults(projectId, workflow) {
 function taskFormTitle(draft) {
   const p = draft?.params || {};
   if (p.triggerState === 'armed' && !isSeries(p) && draft.num != null)
-    return `<span class="task-num">#${draft.num}</span> ${esc(draft.title)} <span class="chip waiting" title="Starts by itself when its trigger fires">${esc(triggerSummary(p.triggers) || 'waiting')}</span>`;
+    return `<span class="task-num">#${draft.num}</span> ${esc(draft.title)} ${statusHtml(triggerSummary(p.triggers) || 'Waiting for trigger', 'waiting', { title: 'Starts by itself when its trigger fires' })}`;
   if (awaitingApproval(draft) && draft.num != null)
-    return `<span class="task-num">#${draft.num}</span> ${esc(draft.title)} ${awaitingApprovalChip}`;
+    return `<span class="task-num">#${draft.num}</span> ${esc(draft.title)} ${awaitingApprovalStatus()}`;
   return !draft ? 'New task' : p.triggerState === 'armed' || isSeries(p) ? 'Edit task' : restingAvatar(draft) ? 'Edit Avatār' : 'Edit draft';
 }
 
@@ -10601,8 +10655,7 @@ async function renderSeriesPage(rec) {
 
 function runPageRow(r) {
   const v = r.lastView || {};
-  const status = v.status || 'active';
-  return `<div class="run-row" data-runopen="${r.id}"><span class="chip ${status}">${esc(stageLabel(v))}</span><span class="run-when">${new Date(r.createdAt).toLocaleString()}</span></div>`;
+  return `<div class="run-row" data-runopen="${r.id}">${viewStatusHtml(v)}<span class="run-when">${new Date(r.createdAt).toLocaleString()}</span></div>`;
 }
 
 // Attempt links pin the execution id; the numbered task permalink follows the
@@ -10635,7 +10688,7 @@ function attemptCard(a, g, v, { tab = '', form = false } = {}) {
   const pinnedTab = draft ? '' : tab;
   const href = `${projectBase(a.projectId || taskRecord(v.taskId)?.projectId || S.projectId)}/tasks/${encodeURIComponent(a.id)}${pinnedTab ? `/${pinnedTab}` : ''}`;
   const body = `<span class="attempt-name">Attempt ${a.attemptNumber || 1}</span>
-      <span class="attempt-state"><span class="status-dot ${esc(av.status || (draft ? 'waiting' : 'active'))}"></span>${esc(label)}</span>
+      ${statusHtml(label, draft ? 'draft' : statusTone(av), { className: 'attempt-state' })}
       ${committed ? (g.otherAttempts === 'keep' ? '<span class="attempt-note" title="Other attempts are kept">Selected to merge</span>' : '<span class="attempt-note">Selected to merge</span>') : ''}`;
   if (form && selected) return `<span class="attempt-card selected" data-attempt-select="${esc(a.id)}" aria-current="true">${body}</span>`;
   return `<a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>${body}</a>`;
@@ -11502,7 +11555,7 @@ function renderTaskPage() {
           <div class="tp-topline">
             ${taskBreadcrumb(v)}
             <span class="tp-status">
-              ${v.approvalRequests ? `<span class="chip approval-needed">Approval needed</span>` : ''}
+              ${v.approvalRequests ? statusHtml('Needs approval', 'human') : ''}
               <span class="tp-stage">${pipeline(v)}${stageIndicator(v, v.taskId)}</span>
               ${pullRequestMenu(v)}
             </span>
@@ -12721,12 +12774,12 @@ function subTaskState(rec) {
   // A draft sub-task waits to be run; once queued, for its parent to start it.
   if (v.state?.draft) return { label: v.state.queued ? 'Queued' : 'Draft', tone: v.state.queued ? 'waiting' : 'draft',
     complete: false, approval: false, draft: !v.state.queued };
-  const tone = done ? 'done' : v.stage === 'escalated' ? 'blocked' : v.status || 'active';
+  const tone = statusTone(v);
   return { label: stageLabel(v), tone, complete: done, approval: !!v.approvalRequests };
 }
 
 function subTaskStateHtml(state, className) {
-  return `<span class="${className}"><span class="chip ${esc(state.tone)}">${esc(state.label)}</span>${state.approval ? ' <span class="chip approval-needed">Approval needed</span>' : ''}</span>`;
+  return `<span class="${className}">${statusHtml(state.label, state.tone)}${state.approval ? statusHtml('Needs approval', 'human') : ''}</span>`;
 }
 
 function subTasksSection(v) {
@@ -24486,7 +24539,7 @@ function inboxNoticesHtml() {
     return `<div class="task-row inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(inboxTitle(item))}">
       <div class="task-main">
         <div class="task-title">${esc(inboxTitle(item))}</div>
-        <div class="task-sub">${where}<span class="chip attention ${esc(item.kind)}">${esc(inboxRowLabel(item))}</span></div>
+        <div class="task-sub">${where}${statusHtml(inboxRowLabel(item), 'human', { className: `attention ${item.kind}` })}</div>
       </div>
       <div class="task-right">${urgencyChip(item.urgency)}</div>
     </div>`;
