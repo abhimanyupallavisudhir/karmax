@@ -111,6 +111,9 @@ import { taskForkSourceIds } from '../domain/forks.js';
 
 /** How many dismissals a person's preferences keep (the newest). */
 const MAX_DISMISSED = 500;
+/** The order queued runner leases are admitted in: priority, then who asked
+ * first (a caller that gave up at its deadline and asked again keeps its place). */
+const QUEUE_ORDER = 'priority DESC, COALESCE(queuedSince, createdAt), createdAt';
 
 // Shared by Store instances in this process, never by another gateway/worker.
 const PROCESS_EVENT_ORIGIN = crypto.randomUUID();
@@ -881,7 +884,7 @@ export class Store {
         projectId TEXT NOT NULL, taskId TEXT NOT NULL, worldId TEXT NOT NULL,
         cpu INTEGER NOT NULL, memoryMb INTEGER NOT NULL, gpu INTEGER NOT NULL,
         priority INTEGER NOT NULL, state TEXT NOT NULL, createdAt INTEGER NOT NULL,
-        acquiredAt INTEGER, releasedAt INTEGER
+        acquiredAt INTEGER, releasedAt INTEGER, queuedSince INTEGER
       );
       CREATE TABLE IF NOT EXISTS service_usage_counts (
         meter TEXT NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0,
@@ -1359,6 +1362,10 @@ export class Store {
     const savedViewCols = await this.db.prepare('PRAGMA table_info(saved_views)').all() as { name: string }[];
     if (!savedViewCols.some(column => column.name === 'organizationId')) await this.db.exec('ALTER TABLE saved_views ADD COLUMN organizationId TEXT');
     await this.db.exec('CREATE INDEX IF NOT EXISTS idx_saved_views_organization ON saved_views(organizationId)');
+    // A lease's place in its queue when its caller asked before and kept it (src/world/machine-wait.ts placeSince).
+    const leaseCols = await this.db.prepare('PRAGMA table_info(world_leases)').all() as { name: string }[];
+    if (!leaseCols.some(column => column.name === 'queuedSince')) await this.db.exec('ALTER TABLE world_leases ADD COLUMN queuedSince INTEGER');
+    await this.db.exec('CREATE INDEX IF NOT EXISTS idx_world_leases_state ON world_leases(state, taskId)');
     const candidateCols = await this.db.prepare('PRAGMA table_info(resource_candidates)').all() as { name: string }[];
     if (!candidateCols.some(column => column.name === 'error')) await this.db.exec('ALTER TABLE resource_candidates ADD COLUMN error TEXT');
     const cols = (await this.db.prepare('PRAGMA table_info(tasks)').all()) as any[];
@@ -8504,7 +8511,9 @@ export class Store {
   }
 
   async requestWorldLease(input: { runnerPoolId: string; organizationId: string; projectId: string; taskId: string;
-    worldId: string; cpu?: number; memoryMb?: number; gpu?: number; priority?: number }): Promise<{ id: string; acquired: boolean }> {
+    worldId: string; cpu?: number; memoryMb?: number; gpu?: number; priority?: number;
+    /** Its place in the queue, when its caller asked before and kept it (machine-wait.ts placeSince). */
+    since?: number }): Promise<{ id: string; acquired: boolean }> {
     return this.db.transaction(async () => {
     // A pool belongs to one organization, so this one key covers the pool's
     // capacity and the organization's active-world and start-rate limits.
@@ -8560,9 +8569,10 @@ export class Store {
         if (recent >= policy.maxRemoteStartsPerMinute) throw new AdmissionBackpressureError('organization remote sandbox start rate limit exceeded');
       }
       (await this.db.prepare(`INSERT INTO world_leases (id, runnerPoolId, organizationId, projectId, taskId, worldId,
-        cpu, memoryMb, gpu, priority, state, createdAt, acquiredAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        cpu, memoryMb, gpu, priority, state, createdAt, acquiredAt, queuedSince) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(id, pool.id, input.organizationId, input.projectId, input.taskId, input.worldId, resources.cpu,
-          resources.memoryMb, resources.gpu, input.priority ?? 0, acquired ? 'active' : 'queued', now, acquired ? now : null));
+          resources.memoryMb, resources.gpu, input.priority ?? 0, acquired ? 'active' : 'queued', now, acquired ? now : null,
+          input.since !== undefined && input.since < now ? input.since : null));
       (await this.db.exec('COMMIT'));
       return { id, acquired };
     } catch (error) {
@@ -8588,9 +8598,9 @@ export class Store {
 
     const queued = filter.runnerPoolId
       ? (await this.db.prepare(`SELECT * FROM world_leases WHERE runnerPoolId=? AND state='queued'
-          ORDER BY priority DESC, createdAt`).all(filter.runnerPoolId)) as any[]
+          ORDER BY ${QUEUE_ORDER}`).all(filter.runnerPoolId)) as any[]
       : (await this.db.prepare(`SELECT * FROM world_leases WHERE organizationId=? AND state='queued'
-          ORDER BY priority DESC, createdAt`).all(filter.organizationId)) as any[];
+          ORDER BY ${QUEUE_ORDER}`).all(filter.organizationId)) as any[];
     const activated: string[] = [];
     for (const candidate of queued) {
       const pool = (await this.getRunnerPool(candidate.runnerPoolId));
@@ -8692,7 +8702,12 @@ export class Store {
 
   async listWorldLeases(runnerPoolId: string): Promise<any[]> {
     return (await this.db.prepare(`SELECT * FROM world_leases WHERE runnerPoolId=? AND state!='released'
-      ORDER BY CASE state WHEN 'active' THEN 0 ELSE 1 END, priority DESC, createdAt`).all(runnerPoolId)) as any[];
+      ORDER BY CASE state WHEN 'active' THEN 0 ELSE 1 END, ${QUEUE_ORDER}`).all(runnerPoolId)) as any[];
+  }
+
+  /** Every lease waiting for admission, in the order admission takes them. */
+  async queuedWorldLeases(): Promise<any[]> {
+    return (await this.db.prepare(`SELECT * FROM world_leases WHERE state='queued' ORDER BY ${QUEUE_ORDER}`).all()) as any[];
   }
 
   async worldLeasesForTask(taskId: string): Promise<any[]> {

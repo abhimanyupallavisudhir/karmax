@@ -5454,6 +5454,8 @@ const LIST_RELOAD_EVENTS = new Set([
   'authorization.approval-dismissed',
   'repository-access.approval-requested',
   'repository-access.approval-resolved',
+  // A task started or stopped waiting for a machine (its runner lease): rows read it from the server.
+  'world.machine-wait',
 ]);
 
 // view.updated already contains the compact fields shown by list rows. Apply that
@@ -5649,7 +5651,7 @@ function connectWs() {
       } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.startsWith('connection.') || ev.type.endsWith('.approval-dismissed')
         // A draft sub-task saved, queued or started: only the server's summaries know it.
         || ev.type === 'subtask.created' || ev.type === 'subtask.queued' || ev.type === 'subtask.started'
-        || ev.type === 'conversation.pending') {
+        || ev.type === 'conversation.pending' || ev.type === 'world.machine-wait') {
         // Mid-turn metadata changes must not clear output or patch lifecycle state.
         refreshTask(ev.type);
       } else if (ev.type !== 'agent.output') scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
@@ -7906,12 +7908,19 @@ function statusHtml(label, tone, options) {
   const t = glyphs[tone] ? tone : 'working';
   return `<span class="status ${t}${className ? ` ${className}` : ''}"${title ? ` title="${esc(title)}"` : ''}><svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">${glyphs[t]}</svg><span class="status-label">${esc(label)}</span></span>`;
 }
+// What a wait for a machine leaves out of its one line: what is full, where,
+// and its place. Shown on hover, never as a second line.
+function waitTitle(v) {
+  const w = v?.waitingFor;
+  return v?.status === 'waiting' && w?.kind === 'retry' && w.summary === 'Waiting for a machine' && typeof w.detail === 'string' ? w.detail.trim() : '';
+}
+
 /** A task view's status, with its pending approval folded in: one fact, said once. */
 function viewStatusHtml(view) {
   const v = view || {};
   const tone = statusTone(v);
   const label = stageLabel(v);
-  if (!v.approvalRequests) return statusHtml(label, tone);
+  if (!v.approvalRequests) return statusHtml(label, tone, { title: waitTitle(v) });
   // A generic hold on a person that is really an approval says so; otherwise
   // the approval is a second ask beside what the task is doing.
   if (tone === 'human' && /^Needs input\b/.test(label)) return statusHtml(label.replace(/^Needs input/, 'Needs approval'), 'human');
@@ -7924,7 +7933,7 @@ function viewStatusHtml(view) {
 function stageIndicator(v, taskId, compact = false) {
   const moves = v.stageTransitions || [];
   const label = stageLabel(v);
-  if (!moves.length) return statusHtml(label, statusTone(v));
+  if (!moves.length) return statusHtml(label, statusTone(v), { title: waitTitle(v) });
   return `<label class="stage-picker${compact ? ' compact' : ''}" title="Move this attempt to another stage">
     <span class="sr-only">Move ${esc(label)} stage</span>
     <select data-stage-move="${esc(taskId)}" aria-label="Move attempt from ${esc(label)}">
@@ -15115,9 +15124,10 @@ function waitingText(w) {
   // A paused agent's ask carries the time it carries on without an answer.
   if (w?.kind === 'human') return Number.isFinite(w.until) ? `Needs input until ${waitDeadline(w.until)}` : 'Needs input';
   if (w?.kind === 'timer') return Number.isFinite(w.until) ? `Waiting until ${waitDeadline(w.until)}` : 'Waiting';
-  // A full provider limit: what it waits for, and when it tries again.
+  // A full provider limit: what it waits for, and when it tries again; a
+  // queued machine, its place in the queue (what is full is its tooltip, waitTitle).
   if (w?.kind === 'retry' && typeof w.summary === 'string' && w.summary.trim())
-    return `${w.summary.trim().slice(0, 48)}${Number.isFinite(w.until) ? `, trying at ${waitDeadline(w.until)}` : ''}`;
+    return `${w.summary.trim().slice(0, 48)}${w.ahead > 0 ? ` · ${w.ahead} ahead` : ''}${Number.isFinite(w.until) ? `, trying at ${waitDeadline(w.until)}` : ''}`;
   if (w?.kind === 'retry') return Number.isFinite(w.until) ? `Retrying at ${waitDeadline(w.until)}` : 'Retrying';
   if (w?.kind === 'account') {
     const who = w.provider ? ACCOUNT_PROVIDER_LABELS[w.provider] || w.provider : '';
@@ -15158,6 +15168,9 @@ function waitDeadline(until) {
 // The generic header label alone would hide that diagnosis.
 function conversationWaitNotice(v) {
   const w = v.waitingFor;
+  // A wait for a machine is one line; what is full and where is its tooltip.
+  const machine = waitTitle(v);
+  if (machine) return `<div class="msg system wait-notice" role="status" title="${esc(machine)}">${esc(waitingText(w))}</div>`;
   const reason = w?.kind === 'account' ? accountWaitReason(w) : '';
   if (reason === 'held')
     return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))} <button type="button" class="btn sm ghost" data-run-now="${esc(v.taskId)}" title="${esc(RUN_NOW_TIP)}">Run now</button></div>`;

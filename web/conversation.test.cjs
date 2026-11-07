@@ -255,6 +255,7 @@ for (const fn of ['reviewActionBtn', 'isReviewTile', 'reviewTileKind', 'reviewTi
 eval(extractFn('conversationReviewInfo'));
 eval(extractFn('conversationError'));
 eval(extractFn('presenceDetail'));
+eval(extractFn('waitTitle'));
 eval(extractFn('conversationWaitNotice'));
 eval(extractFn('contentKey'));
 eval(extractFn('conversationFullscreenButton'));

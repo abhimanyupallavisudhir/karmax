@@ -49,6 +49,7 @@ vm.runInContext(
     extractFunction('setupFixes'),
     extractFunction('setupFix'),
     extractFunction('setupFixHtml'),
+    extractFunction('waitTitle'),
     extractFunction('conversationWaitNotice'),
     extractFunction('humanWaitDetail'),
     extractFunction('conversationTextKey'),

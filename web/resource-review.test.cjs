@@ -42,7 +42,7 @@ function setup(api) {
     parametersTab: () => 'parameters', timingTab: () => 'timing',
   });
   vm.runInContext(`${freshness}\n${tabs}\n${wire}`, context);
-  for (const name of ['humanWaitDetail', 'conversationTextKey', 'conversationInputRequest', 'safeHref', 'contentKey', 'conversationError', 'reviewActionBtn', 'conversationReviewInfo', 'conversationFullscreenButton', 'hasMessageForm', 'agentEntryText', 'liveFormIndex', 'conversationEntryKey', 'conversationFoldHtml', 'loadForkHistory', 'inheritedConversationHtml', 'conversationSearchKey', 'conversationSearchOpen', 'conversationSearchBar', 'pendingMessagesHtml', 'conversationPane', 'messageOrigin', 'conversationOutline', 'foldDuration', 'foldPreview', 'conversationFoldHead', 'liveOutputFor', 'formEntryKey', 'withMessageForms', 'renderConversationEntry', 'presenceDetail', 'conversationWaitNotice']) {
+  for (const name of ['humanWaitDetail', 'conversationTextKey', 'conversationInputRequest', 'safeHref', 'contentKey', 'conversationError', 'reviewActionBtn', 'conversationReviewInfo', 'conversationFullscreenButton', 'hasMessageForm', 'agentEntryText', 'liveFormIndex', 'conversationEntryKey', 'conversationFoldHtml', 'loadForkHistory', 'inheritedConversationHtml', 'conversationSearchKey', 'conversationSearchOpen', 'conversationSearchBar', 'pendingMessagesHtml', 'conversationPane', 'messageOrigin', 'conversationOutline', 'foldDuration', 'foldPreview', 'conversationFoldHead', 'liveOutputFor', 'formEntryKey', 'withMessageForms', 'renderConversationEntry', 'presenceDetail', 'waitTitle', 'conversationWaitNotice']) {
     vm.runInContext(extract(name), context);
   }
   context.checkinTab = (v) => context.conversationPane(v, { role: 'do' });
