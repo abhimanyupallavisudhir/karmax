@@ -254,7 +254,7 @@ async function main() {
   if (installationOwner) (await store.claimPersonalOrganization(installationOwner.id, installationOwner.name));
   (await store.migratePersonalOrganizationNames((await identity.listUsers())));
   const { worlds, adapters, profiles, tokens, providerConnections, objectStore, storageLocations,
-    resources, checkpoints, runners, worldAccess, payments, paymentRegistry, configHomes } =
+    resources, checkpoints, runners, worldAccess, payments, paymentRegistry, configHomes, hostedGit } =
     await createExecutionServices({ store, client, broker, githubApp, p, deployment, provider, bootstrap: true,
       ...(separateWorker ? { coordinationDirectory: path.join(p.state, 'world-coordination') } : {}) });
   const bus = new KarmaxBus();
@@ -437,6 +437,7 @@ async function main() {
     objects: objectStore,
     resources,
     checkpoints,
+    hostedGit,
     projectFiles,
     subscriptions: subscriptionBilling,
     computeTopUps,

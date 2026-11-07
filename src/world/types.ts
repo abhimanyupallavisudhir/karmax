@@ -166,8 +166,10 @@ export interface WorldSpec {
     sshKey?: string;
     /** SSH URL -> distinct read-only clone key for non-GitHub repositories. */
     repositories?: Record<string, string>;
-    /** SSH-shaped GitHub URL -> short-lived, repository-scoped App token. */
+    /** SSH-shaped GitHub URL (or a `tavya:` one) -> short-lived, repository-scoped token. */
     httpsTokens?: Record<string, string>;
+    /** Where `tavya:` URLs point from the world: `<public URL>/git/` (world/hosted-git.ts). */
+    hostedGitBase?: string;
   };
   /** Per-repository branch policy: a task's per-repository branches, or a
    * first-class repository attachment's. Keys are the exact sources in `repos`;

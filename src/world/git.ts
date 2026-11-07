@@ -132,7 +132,7 @@ export function catBlob(repository: string, object: string): { stream: import('n
  * is the operator's trusted setup — global/system config files, environment
  * config chains (which appendGitConfig extends), proxies and CA bundles.
  * Tenant-scoped callers layer isolatedGitEnvironment() over this. */
-function hostGitEnvironment(): Record<string, string> {
+export function hostGitEnvironment(): Record<string, string> {
   const env: Record<string, string> = {};
   for (const key of ['PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'XDG_CONFIG_HOME',
     'SSH_AUTH_SOCK', 'GIT_TRACE2_EVENT', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM', 'GIT_SSH',

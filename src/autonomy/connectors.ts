@@ -1,3 +1,4 @@
+import { isHostedRepository, repositoryBrokerCredentials } from '../world/hosted-git.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -1574,7 +1575,7 @@ export async function attachedRepositoryCredential(store: ConnectorStore, github
   const repository = (await store.findRepositoryBySshUrl?.(organizationId, repositoryUrl))
     ?? (slug ? (await store.listRepositories?.(organizationId))?.find((candidate) =>
       candidate.provider === 'github' && `${candidate.owner}/${candidate.name}`.toLowerCase() === slug) : undefined);
-  return repository && githubApp ? githubApp.brokerCredentials(repository) : undefined;
+  return repository && (githubApp || isHostedRepository(repository)) ? repositoryBrokerCredentials(repository, githubApp) : undefined;
 }
 
 export class Connectors {

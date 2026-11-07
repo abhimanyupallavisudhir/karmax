@@ -16,9 +16,10 @@ export interface HostedOnboardingFacts {
   project: boolean;
 }
 
-/** The facts every required step needs, in walkthrough order. */
+/** The facts every required step needs, in walkthrough order. GitHub is not
+ * one: a project's code can live on tavya (wiki features/hosted-repositories). */
 export const hostedOnboardingRequired = (facts: HostedOnboardingFacts) =>
-  [facts.github, facts.agentLogin, facts.ownCompute || facts.managedCompute, facts.project];
+  [facts.agentLogin, facts.ownCompute || facts.managedCompute, facts.project];
 
 export interface HostedOnboardingRecord {
   display: HostedOnboardingDisplay;
@@ -63,7 +64,7 @@ export function hostedOnboardingStatus(input: {
     completedRequired: required.filter(Boolean).length,
     totalRequired: required.length,
     steps: {
-      github: { complete: input.facts.github },
+      github: { complete: input.facts.github, blocking: false },
       agentLogin: { complete: input.facts.agentLogin },
       // One step, two ways to satisfy it: tavya's computers or the organization's own.
       compute: {

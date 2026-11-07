@@ -80,6 +80,7 @@ import { brokerFinalizeMerge, brokerPublishBranch, brokerPushBranches, describeG
   isGithubPushProtectionRejection, isNonFastForwardPush, type GitBrokerAuth } from '../world/git-broker.js';
 import { enrollWorldRepositories } from '../world/repository-enrollment.js';
 import { materializeGitCredential } from '../world/git-credential.js';
+import { hostedCloneCredential, isHostedRepository, repositoryBrokerCredentials } from '../world/hosted-git.js';
 import {
   GithubApiError,
   GithubPrApi,
@@ -989,10 +990,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     args: string[],
     fallbackEnv: Record<string, string>,
   ) {
-    if (!repository?.gitConnectionId || !deps.githubApp) return hostGit(cwd, args, { env: fallbackEnv });
+    if (!isHostedRepository(repository) && (!repository?.gitConnectionId || !deps.githubApp)) return hostGit(cwd, args, { env: fallbackEnv });
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-auth-'));
     try {
-      const credential = await deps.githubApp.brokerCredentials(repository);
+      const credential = await repositoryBrokerCredentials(repository!, deps.githubApp);
       const materialized = materializeGitCredential(directory, {
         ...credential,
         env: { ...isolatedGitEnvironment(), ...(credential.env ?? {}) },
@@ -1482,7 +1483,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const linked = projectId ? (await store.listProjectRepositories(projectId)) : [];
     const wiki = projectId ? (await store.projectWiki(projectId))?.repository : undefined;
     const catalog = project?.organizationId ? (await store.listRepositories(project.organizationId)) : [];
-    if (project?.organizationId && (linked.length || wiki || catalog.length) && deps.githubApp) {
+    if (project?.organizationId && (linked.length || wiki || catalog.length) && (deps.githubApp || linked.some(({ repository }) => isHostedRepository(repository)))) {
       return async (worldRepo) => {
         const source = worldRepoSource(worldRepo);
         let repository = linked.find((candidate) => sameRepository(candidate.repository.sshUrl, source))?.repository
@@ -1497,7 +1498,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // repositories still fail the catalog guard below.
         if (!repository && worldRepo.localPath) return { env: (await gitEnvFor(handle, taskId)) };
         if (!repository) throw new Error(`Git broker rejected repository outside project enrollment: ${source}`);
-        return deps.githubApp!.brokerCredentials(repository);
+        return repositoryBrokerCredentials(repository, deps.githubApp);
       };
     }
     return (await gitEnvFor(handle, taskId));
@@ -2404,8 +2405,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
       if (linkedRepositories.length || wikiRepository || hasCatalogedLocalSource) {
-        if (!deps.githubApp && remote) throw new Error('hosted repositories require the configured GitHub App');
+        if (!deps.githubApp && remote && !linkedRepositories.every(({ repository }) => isHostedRepository(repository)))
+          throw new Error('hosted repositories require the configured GitHub App');
         const httpsTokens: Record<string, string> = {};
+        let hostedGitBase: string | undefined;
         await concurrentMap(worldSources, 3, async (source, index) => {
           const transportSource = transportSources[index]!;
           const linked = linkedRepositories.find((candidate) => sameRepository(candidate.repository.sshUrl, transportSource));
@@ -2425,6 +2428,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // Git profile/host credential while origin owns the base.
             if (sourceResolutions[index]?.localPath) return;
             if (remote) throw new Error(`repository ${source} is not enrolled in this project`);
+            return;
+          }
+          // A repository tavya hosts: a read grant, and where `tavya:` points from the world.
+          if (isHostedRepository(repository)) {
+            const clone = await hostedCloneCredential(repository);
+            httpsTokens[source] = clone.token;
+            hostedGitBase = clone.base;
             return;
           }
           // GitHub shows a private repository to an App only where the App is
@@ -2448,7 +2458,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         });
         // Repository-scoped read-only installation tokens exist only during
         // trusted provisioning and are removed before the agent starts.
-        if (Object.keys(httpsTokens).length) gitCredentials = { ...gitCredentials, httpsTokens };
+        if (Object.keys(httpsTokens).length) gitCredentials = { ...gitCredentials, httpsTokens, ...(hostedGitBase ? { hostedGitBase } : {}) };
       }
       const provisionOn = async (kind: WorldKind, routedReason?: string): Promise<WorldHandle> => {
         startCancellationHeartbeat(kind);

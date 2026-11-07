@@ -84,6 +84,7 @@ import type { WorldRegistry } from '../world/registry.js';
 import type { WorldHandle } from '../world/types.js';
 import { isRemoteWorldKind, worldRepos, worldRepoSource } from '../world/types.js';
 import { pullRequestHandle } from '../world/pr-view.js';
+import { repositoryBrokerCredentials } from '../world/hosted-git.js';
 import { brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import { sameRepository } from '../world/repository-identity.js';
 import { forkLandingBranch, forkWorldSource, type ForkWorldSource } from '../world/fork.js';
@@ -554,12 +555,11 @@ export class KarmaxApi {
     const linked = (await this.deps.store.listProjectRepositories(projectId));
     const wiki = (await this.deps.store.projectWiki(projectId))?.repository;
     return async (repo) => {
-      if (!this.deps.githubApp) throw new Error('Connect GitHub in organization settings, then try again.');
       const source = worldRepoSource(repo);
       const repository = linked.find((candidate) => sameRepository(candidate.repository.sshUrl, source))?.repository
         ?? (wiki && sameRepository(wiki.sshUrl, source) ? wiki : undefined);
       if (!repository) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
-      return this.deps.githubApp!.brokerCredentials(repository);
+      return repositoryBrokerCredentials(repository, this.deps.githubApp);
     };
   }
 
