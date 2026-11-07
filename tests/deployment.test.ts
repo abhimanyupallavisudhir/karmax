@@ -25,10 +25,10 @@ describe('deployment profiles', () => {
   it('ships both subscription-login CLIs in production dependencies', () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
     const dockerfile = fs.readFileSync(path.join(repoRoot, 'deploy', 'Dockerfile'), 'utf8');
-    expect(pkg.dependencies['@anthropic-ai/claude-agent-sdk']).toBe('0.3.318');
+    expect(pkg.dependencies['@anthropic-ai/claude-agent-sdk']).toBe('0.3.319');
     const browserImage = fs.readFileSync(path.join(repoRoot, 'environments/browser/Dockerfile'), 'utf8');
     expect(browserImage).toContain('ARG CODEX_VERSION=0.167.0');
-    expect(browserImage).toContain('ARG CLAUDE_CODE_VERSION=2.1.318');
+    expect(browserImage).toContain('ARG CLAUDE_CODE_VERSION=2.1.319');
     // Remote OpenCode runs the pinned package; the template bakes that version.
     expect(browserImage).toContain(`ARG OPENCODE_VERSION=${OPENCODE_VERSION}`);
     expect(pkg.dependencies['@openai/codex']).toBe('0.167.0');

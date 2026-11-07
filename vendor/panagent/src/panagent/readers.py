@@ -119,6 +119,8 @@ def read_claude_code(text: str, *, source_uri: str | None = None, **_: Any) -> d
                 "permission-mode",
                 "queue-operation",
                 "session-owner",
+                # The tool names a session has used so far, written after a turn that called tools.
+                "tools-used",
                 None,
             }:
                 warning(

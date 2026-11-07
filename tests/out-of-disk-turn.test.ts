@@ -79,11 +79,11 @@ describe('out of disk', () => {
   // as the agent's own error. It is the sandbox's, and a retry installs again.
   it('retries a turn whose sandbox could not install a working CLI', async () => {
     const { turn, close } = await harness(() => usage(10, 22), async () => {
-      throw new RemoteAgentCliUnavailable('@anthropic-ai/claude-code@2.1.318');
+      throw new RemoteAgentCliUnavailable('@anthropic-ai/claude-code@2.1.319');
     });
     try {
       expect(await turn().then(() => undefined, (caught) => caught)).toMatchObject({ type: 'agent-infra', nonRetryable: false,
-        message: expect.stringMatching(/^Could not start @anthropic-ai\/claude-code@2\.1\.318 in the sandbox/) });
+        message: expect.stringMatching(/^Could not start @anthropic-ai\/claude-code@2\.1\.319 in the sandbox/) });
     } finally { await close(); }
   });
 

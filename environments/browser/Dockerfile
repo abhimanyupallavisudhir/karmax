@@ -6,7 +6,7 @@ ARG PLAYWRIGHT_VERSION=1.61.1
 # Keep the pre-baked fast path paired with package.json's Agent SDK. Runtime
 # launch also verifies this version and falls back to the SDK-declared npx pin
 # when a user has not rebuilt an older template yet.
-ARG CLAUDE_CODE_VERSION=2.1.318
+ARG CLAUDE_CODE_VERSION=2.1.319
 ARG CODEX_VERSION=0.167.0
 # src/agent/acp-packages.ts OPENCODE_VERSION.
 ARG OPENCODE_VERSION=1.18.35
