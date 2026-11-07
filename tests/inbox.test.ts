@@ -55,7 +55,7 @@ async function fixture(open: StoreBackend['open']) {
 const humanWait = (stage: string) => ({ stage, status: 'waiting', waitingFor: { kind: 'human', audience: ['user:reviewer'] } });
 
 describe.each(storeBackends)('inbox ($name)', ({ name, open }) => {
-  it('keeps dismissed approvals silent across waiting lifecycle ticks', async () => {
+  it('silences an ignored approval, but not the task waiting on a person', async () => {
     const f = (await fixture(open));
     (await f.store.appendEvent({ taskId: f.task.id, type: 'permission.approval-requested', ts: Date.now(),
       payload: { requestId: 'request', recipients: ['reviewer'] } }));
@@ -63,10 +63,58 @@ describe.each(storeBackends)('inbox ($name)', ({ name, open }) => {
     (await f.store.appendEvent({ taskId: f.task.id, type: 'permission.approval-dismissed', ts: Date.now(),
       payload: { requestId: 'request' } }));
     expect((await f.inbox())).toEqual([]);
-    (await f.view({ status: 'waiting', waitingFor: { kind: 'human' } }));
-    expect((await f.inbox())).toEqual([]);
+    // Its agent's question is an ask of its own: an ignored request asks nobody,
+    // so it cannot stand in for it (LVPM #8, in nobody's For me for days).
+    (await f.view({ status: 'waiting', waitingFor: { kind: 'human', audience: ['@creator'] } }));
+    expect((await f.inbox('owner'))).toEqual([expect.objectContaining({ kind: 'escalated', actionable: true })]);
     (await f.store.pruneStaleInbox());
-    expect((await f.inbox())).toEqual([]);
+    expect((await f.inbox('owner'))).toHaveLength(1);
+  });
+
+  it('lists a task parked on a person when the request it showed for is ignored, quietly', async () => {
+    const f = (await fixture(open));
+    try {
+      (await f.store.appendEvent({ taskId: f.task.id, type: 'permission.approval-requested', ts: Date.now(),
+        payload: { requestId: 'request', recipients: ['reviewer'] } }));
+      // The live approval is the ask while the task waits: no second row.
+      (await f.view({ status: 'waiting', waitingFor: { kind: 'human', audience: ['@creator'] } }));
+      expect((await f.inbox())).toEqual([expect.objectContaining({ kind: 'approval-requested' })]);
+      expect((await f.inbox('owner'))).toEqual([]);
+      (await f.store.appendEvent({ taskId: f.task.id, type: 'permission.approval-dismissed', ts: Date.now(),
+        payload: { requestId: 'request' } }));
+      expect((await f.inbox())).toEqual([]);
+      const rows = (await f.inbox('owner'));
+      expect(rows).toEqual([expect.objectContaining({ kind: 'escalated', actionable: true })]);
+      // Not a new notification: the person just looked at the task.
+      const deliveries = (await (f.store as any).db.prepare('SELECT COUNT(*) n FROM delivery_outbox WHERE inboxId=?').get(rows[0]!.id)) as { n: number | string };
+      expect(Number(deliveries.n)).toBe(0);
+    } finally { (await f.store.close()); }
+  });
+
+  it('counts a request passed on after an Ignore as asking again', async () => {
+    const f = (await fixture(open));
+    try {
+      (await f.store.appendEvent({ taskId: f.task.id, type: 'connection.requested', ts: Date.now(),
+        payload: { requestId: 'connection' } }));
+      (await f.store.appendEvent({ taskId: f.task.id, type: 'connection.dismissed', ts: Date.now(),
+        payload: { requestId: 'connection' } }));
+      (await f.store.appendEvent({ taskId: f.task.id, type: 'connection.requested', ts: Date.now(),
+        payload: { requestId: 'connection', audience: ['user:reviewer'] } }));
+      (await f.view({ status: 'waiting', waitingFor: { kind: 'human', audience: ['@creator'] } }));
+      expect((await f.inbox())).toEqual([expect.objectContaining({ kind: 'approval-requested' })]);
+    } finally { (await f.store.close()); }
+  });
+
+  it('backfills a task waiting on a person that asks nobody', async () => {
+    const f = (await fixture(open));
+    try {
+      (await f.view({ status: 'waiting', waitingFor: { kind: 'human' } }));
+      // As an older build left it: parked on a person, and no row for anyone.
+      (await (f.store as any).deleteInbox('taskId=?', [f.task.id]));
+      expect((await f.inbox('owner'))).toEqual([]);
+      (await f.store.pruneStaleInbox());
+      expect((await f.inbox('owner'))).toEqual([expect.objectContaining({ kind: 'escalated', actionable: true })]);
+    } finally { (await f.store.close()); }
   });
 
   it('silences dismissed credential and connection asks', async () => {
@@ -84,10 +132,10 @@ describe.each(storeBackends)('inbox ($name)', ({ name, open }) => {
       (await f.store.appendEvent({ taskId: f.task.id, type: 'connection.dismissed', ts: Date.now(),
         payload: { requestId: 'connection' } }));
       expect((await f.inbox('owner'))).toEqual([]);
-      // Both still hold the task, but a lifecycle tick must not re-raise them.
+      // Neither asks again: the task's own wait is its ask (its creator's, in Do).
       (await f.view({ status: 'waiting', waitingFor: { kind: 'human' } }));
       (await f.store.pruneStaleInbox());
-      expect((await f.inbox('owner'))).toEqual([]);
+      expect((await f.inbox('owner'))).toEqual([expect.objectContaining({ kind: 'escalated' })]);
     } finally { (await f.store.close()); }
   });
 
@@ -105,9 +153,11 @@ describe.each(storeBackends)('inbox ($name)', ({ name, open }) => {
       (await f.store.appendEvent({ taskId: f.task.id, type: 'connection.resolved', ts: Date.now(),
         payload: { requestId: 'connection' } }));
       expect((await f.inbox('owner'))).toEqual([]);
+      // Still waiting on a person once the live ask is answered: only the
+      // ignored permission is left, and it asks nobody.
       (await f.view({ status: 'waiting', waitingFor: { kind: 'human' } }));
       (await f.store.pruneStaleInbox());
-      expect((await f.inbox('owner'))).toEqual([]);
+      expect((await f.inbox('owner'))).toEqual([expect.objectContaining({ kind: 'escalated', actionable: true })]);
     } finally { (await f.store.close()); }
   });
 

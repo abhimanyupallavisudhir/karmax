@@ -72,6 +72,7 @@ export const followUpSignal = defineSignal<[Message]>('followUp');
 export const collaborationRequestedSignal = defineSignal<[string]>('collaborationRequested');
 export const collaborationSettledSignal = defineSignal<[string, Message]>('collaborationSettled');
 export const resourceResolvedSignal = defineSignal(SIG.resourceResolved);
+export const connectionsChangedSignal = defineSignal(SIG.connectionsChanged);
 export const confirmSignal = defineSignal('confirm');
 export const cancelSignal = defineSignal('cancel');
 export const viewQuery = defineQuery<TaskView>('view');
@@ -286,6 +287,9 @@ async function justDoImpl(
   setHandler(resourceResolvedSignal, () => {
     resourceResolutionEpoch++;
   });
+  // Read unpatched by the connection wait: no older history carries it.
+  let connectionEpoch = 0;
+  setHandler(connectionsChangedSignal, () => { connectionEpoch++; });
   setHandler(confirmSignal, () => {
     if (awaitingResourceDecision) return;
     confirmed = true;
@@ -412,12 +416,16 @@ async function justDoImpl(
     }
     if (msgs.length > seen) continue;
     if (patched('service-connections-wait-v1')) {
+      // Taken before each check, so a change during it wakes the wait at once.
+      let checkedEpoch = connectionEpoch;
       while (await core.pendingServiceConnections(taskId) && !cancelled && msgs.length === seen) {
         status = 'waiting';
         waitingFor = { kind: 'human', detail: 'Connect the requested app in Approval Requests to continue.' };
         await publish();
-        if (patched('service-connections-signal-wait-v1')) await condition(() => cancelled || msgs.length > seen);
+        const epoch = checkedEpoch;
+        if (patched('service-connections-signal-wait-v1')) await condition(() => cancelled || msgs.length > seen || connectionEpoch !== epoch);
         else await condition(() => cancelled || msgs.length > seen, '30 seconds');
+        checkedEpoch = connectionEpoch;
       }
       if (cancelled) break;
       if (msgs.length > seen) { status = 'active'; waitingFor = undefined; continue; }

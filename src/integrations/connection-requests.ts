@@ -7,6 +7,15 @@ export const CONNECTION_PREFIX = 'service-connection:';
 /** A request still waiting on a person: before sign-in, or during it. */
 export const OPEN_CONNECTION: ServiceConnection['status'][] = ['requested', 'connecting'];
 
+/** Does this connection hold its task's Do loop: an open request someone is
+ * asked to answer, or an outcome its agent has not been told yet. An ignored
+ * request asks nobody, so it holds nothing: the task goes on to its own ask
+ * (LVPM #8 sat at "Connect the requested app" for days, its agent's reply
+ * routed to no one). It stays decidable, and an answer still resumes the task. */
+export function connectionHoldsTask(c: Pick<ServiceConnection, 'status' | 'dismissed' | 'notifiedAt'>): boolean {
+  return OPEN_CONNECTION.includes(c.status) ? !c.dismissed : !c.notifiedAt;
+}
+
 /** Ignore every open connection request of a task, as a person's Ignore does
  * one (`ServiceConnections.dismiss`): the task settled, so no sign-in can reach
  * it. Kept apart from `ServiceConnections` so the store can call it. */
