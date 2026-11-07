@@ -1609,6 +1609,11 @@ textarea.ask-input { resize: vertical; min-height: 4.5em; }
 /* tavya's own prompts to the agent: part of the record, not someone speaking. */
 .msg.user.platform { align-self: flex-start; background: transparent; color: var(--ink-2); border: 1px dashed var(--line-strong); border-radius: 12px; padding: 10px 14px; font-size: var(--fs-14); line-height: 1.5; }
 .msg.user.platform .role { color: var(--ink-3); }
+/* Queued until the task can take it (wiki features/queued-messages). */
+.msg.pending { background: transparent; border: 1px dashed var(--line-strong); }
+.msg.pending .msg-text { color: var(--ink-2); }
+.pending-mark.info-dot { width: auto; height: auto; background: transparent; color: var(--ink-3); }
+.pending-mark svg { width: 13px; height: 13px; display: block; }
 .conversation-presence { display: inline-flex; align-items: center; gap: 6px; padding: 2px 7px; border-radius: 999px; color: var(--ink-2); background: var(--surface-2); font-size: var(--fs-11); }
 .presence-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ink-3); }
 .conversation-presence.working .presence-dot { background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }

@@ -1811,6 +1811,9 @@ export interface DeclaredAction {
   args?: ActionArg[];
   /** Conversations this action may address. Omitted means every agent role. */
   roles?: AgentRole[];
+  /** A follow-up kept until the task can take it (wiki features/queued-messages):
+   * the task is between stages that accept messages. */
+  queues?: boolean;
 }
 
 /** The typed projection of a task's state + allowed actions the UI renders. */
@@ -1881,6 +1884,10 @@ export interface TaskView {
    * on: projected by the gateway until the workflow publishes its next view,
    * so the button it answered does not come back meanwhile (pramana#111). */
   acceptedAction?: { name: string; at: number };
+  /** Messages said while the task could not take them, oldest first: each is
+   * delivered when it can (wiki features/queued-messages). Projected by the
+   * platform; workflows never see them. */
+  pendingMessages?: Array<{ message: Message; role: string; mine?: boolean }>;
   /**
    * Free-form human notes (cosmetic, UI-only — never sent to any agent). Mirrored
    * onto the view from the task record so the UI can show/edit them at any stage,
