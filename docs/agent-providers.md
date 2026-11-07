@@ -155,6 +155,42 @@ OpenCode. Profiles and task parameters do not have a second “Credential
 provider” setting.
 
 
+## November 7, 2026 Claude Code upgrade audit
+
+Claude Agent SDK is now **0.3.319** (Claude Code **2.1.319**, from 0.3.318 /
+2.1.318; the only release in between). Read both changelogs, diffed `sdk.d.ts`,
+and compared the model ids, effort levels and message/record types compiled into
+both binaries.
+
+- **No new model or effort level.** Both binaries carry the same `claude-*` ids
+  and the same effort strings.
+- **`session_writes_lost` only after a clean exit** (0.3.319). A run that ends on
+  an error result now gets only the stderr line. tavya fails a turn on its error
+  result before that message could arrive, so nothing changes; the SDK's own exit
+  error now carries the run's error text instead of "exited with code 1".
+- **MCP tasks** (2.1.319) run in the background only with
+  `CLAUDE_AUTO_BACKGROUND_TASKS=1` in SDK sessions; tavya does not set it, so MCP
+  tool calls (`karmax_control`, the browser) still answer inside the call.
+- **`permissions.denyInsteadOfPrompting`** (new setting) also bypasses
+  `canUseTool`. tavya never sets it, but a login whose managed policy sets it
+  *and* disables bypass would deny tool calls instead of reaching tavya's
+  approver — the same class of policy as `disableBypassPermissionsMode`, which a
+  host cannot override.
+- **Transcripts**: no new record types. `tools-used` (after a turn that called
+  tools; already written by 2.1.318) was missing from panagent's silent set, so
+  every converted session with a tool call warned; it is now skipped silently.
+- Unchanged for tavya: the new optional `set_has_subscribers` control request;
+  `mcp_call`'s `check_permissions`; a home holding both `.claude.json` and the
+  legacy `.config.json` now prints a stderr notice (tavya's homes write only
+  `.claude.json`); `/usage` gains spend lines only behind a Claude apps gateway
+  (the real 2.1.319 panel still parses); auto-mode and Bash permission-rule
+  changes (tavya runs `bypassPermissions` with a `canUseTool` approver).
+- Verified: typecheck; the agent suites and `harness-compatibility` (real binary:
+  tools, effort, resume, fork, metering, mid-turn replay); panagent's tests and a
+  conversion of real 2.1.319 sessions without warnings; the live Claude turns
+  (Messages API, Agent SDK on a subscription, native fork, the permission seam,
+  a whole `live-agent` task) with the same results as on 2.1.318.
+
 ## November 6, 2026 Codex upgrade audit
 
 Codex is now **0.167.0** (from 0.166.0; the only stable release in between).
