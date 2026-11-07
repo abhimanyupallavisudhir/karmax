@@ -40,6 +40,7 @@ global.viewIdForQuery = (q) => (q === 'for:me' ? FOR_ME_VIEW : null);
 global.organizationById = (id) => S.organizations.find((o) => o.id === id);
 global.projectById = (id) => S.projects.find((p) => p.id === id);
 global.formatBytes = (n) => `${n} B`;
+global.syncDocumentTitle = () => {};
 
 eval(extractConst('URGENCY_LEVELS').replace('const URGENCY_LEVELS =', 'global.URGENCY_LEVELS ='));
 for (const name of ['urgencyRank', 'inboxUnreadCount', 'taskHasUnreadAsk', 'inboxRowLabel', 'inboxTitle', 'urgencyChip', 'updateBell',
