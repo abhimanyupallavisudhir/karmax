@@ -161,10 +161,18 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
     expect(run('pass', ['show', written!.externalId])).toContain('retain me');
 
     // A real gopass age mount, with its own remote and key.
+    // CI-44: gopass (1.17.2 to 1.17.4 at least) takes an X25519 recipient
+    // starting "age1pq" for a post-quantum one, fails to parse it and then
+    // encrypts to nobody ("failed to encrypt": no recipients specified). One
+    // random key in 1024 starts so; this test is not about that gopass bug.
     const ageKeyFile = path.join(root, 'age-identity');
-    run('age-keygen', ['-o', ageKeyFile]);
+    let ageRecipient = '';
+    do {
+      fs.rmSync(ageKeyFile, { force: true });
+      run('age-keygen', ['-o', ageKeyFile]);
+      ageRecipient = run('age-keygen', ['-y', ageKeyFile]).trim();
+    } while (ageRecipient.startsWith('age1pq'));
     const ageIdentity = fs.readFileSync(ageKeyFile, 'utf8');
-    const ageRecipient = run('age-keygen', ['-y', ageKeyFile]).trim();
     run('gopass', ['config', 'age.agent-enabled', 'false']);
     run('gopass', ['age', 'identities', 'add', ageIdentity.split('\n').find(line => line.startsWith('AGE-SECRET-KEY-'))!]);
     const ageStore = path.join(root, 'age-store');
