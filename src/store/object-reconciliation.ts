@@ -48,6 +48,8 @@ export interface ObjectReferences {
   /** Resource attachments and their organizations. */
   attachments: Map<string, string>;
   checkpoints: Set<string>;
+  /** `<organization>/<repository>/<pack>` of every stored pack of a repository tavya hosts. */
+  gitPacks: Set<string>;
   /** Checkpoint objects queued for deletion (`checkpoint-gc:` entries). */
   pendingCheckpointGc: Set<string>;
   artifacts: Set<string>;
@@ -69,7 +71,7 @@ export async function loadObjectReferences(db: { query(sql: string): Promise<Arr
   const json = (value: unknown): any => { try { return JSON.parse(String(value)); } catch { return undefined; } };
   const references: ObjectReferences = { chunks: new Set(), manifests: new Set(), attachments: new Map(), checkpoints: new Set(),
     pendingCheckpointGc: new Set(), artifacts: new Set(), uploadParts: new Set(), conversationExports: new Set(), repositoryFiles: new Set(),
-    tombstones: new Map(), pendingWrites: new Map(), taskOrganizations: new Map(), projectOrganizations: new Map() };
+    tombstones: new Map(), pendingWrites: new Map(), taskOrganizations: new Map(), projectOrganizations: new Map(), gitPacks: new Set() };
   for (const row of await db.query('SELECT organizationId, chunkId, storageLocationId FROM resource_snapshot_chunks WHERE refs > 0')) {
     const location = row.storageLocationId == null ? '' : String(row.storageLocationId);
     if (!location || location.startsWith('storage-managed-')) references.chunks.add(`${row.organizationId}/${row.chunkId}`);
@@ -86,6 +88,10 @@ export async function loadObjectReferences(db: { query(sql: string): Promise<Arr
     const [attachment, place] = String(row.repository).split('@');
     references.repositoryFiles.add(`resource-repositories/${attachment}/${place}/${row.kind === 'config' ? 'config' : `${row.kind}/${row.name}`}`);
   }
+  // Absent from a database older than this release, which the read-only dry run may be given.
+  for (const row of await db.query('SELECT repositoryId, organizationId, packs FROM hosted_repositories').catch(() => []))
+    for (const pack of (json(row.packs) ?? []) as Array<{ id?: unknown }>)
+      if (typeof pack?.id === 'string') references.gitPacks.add(`${row.organizationId}/${row.repositoryId}/${pack.id}`);
   for (const row of await db.query('SELECT manifest FROM world_checkpoints')) {
     const key = json(row.manifest)?.filesystemDelta?.objectKey;
     if (typeof key === 'string') references.checkpoints.add(key);
@@ -126,6 +132,7 @@ export function objectFamily(key: string): { family: string; owned: boolean } {
   if (parts[0] === 'resources' && parts[2] === 'manifests') return { family: 'resource manifest', owned: true };
   if (parts[0] === 'resource-repositories') return { family: 'resource repository', owned: true };
   if (parts[0] === 'checkpoints') return { family: 'checkpoint', owned: true };
+  if (parts[0] === 'git') return { family: 'repository pack', owned: true };
   if (parts[0] === 'artifacts') return { family: 'artifact', owned: true };
   if (parts[0] === 'resource-uploads') return { family: 'resource upload part', owned: true };
   if (parts[0] === 'conversation-exports') return { family: 'conversation export', owned: true };
@@ -138,7 +145,7 @@ export function objectFamily(key: string): { family: string; owned: boolean } {
 export function objectOrganization(key: string, references: Pick<ObjectReferences, 'attachments' | 'taskOrganizations'
   | 'projectOrganizations'>): string | undefined {
   const parts = key.split('/');
-  if (['resources', 'checkpoints', 'artifacts', 'resource-uploads'].includes(parts[0]!)) return parts[1] || undefined;
+  if (['resources', 'checkpoints', 'artifacts', 'resource-uploads', 'git'].includes(parts[0]!)) return parts[1] || undefined;
   if (parts[0] === 'resource-repositories')
     return parts[2]?.startsWith('storage-managed-') ? parts[2].slice('storage-managed-'.length) : references.attachments.get(parts[1] ?? '');
   if (parts[0] === 'conversation-exports') return references.taskOrganizations.get(parts[1] ?? '');
@@ -157,6 +164,7 @@ function referenceState(key: string, references: ObjectReferences): string {
   if (parts[0] === 'resource-repositories') return references.repositoryFiles.has(key) ? 'referenced'
     : references.attachments.has(parts[1] ?? '') ? 'no repository file row' : 'attachment deleted';
   if (parts[0] === 'checkpoints') return references.checkpoints.has(key) ? 'referenced' : 'no checkpoint row';
+  if (parts[0] === 'git') return references.gitPacks.has(parts.slice(1, 4).join('/')) ? 'referenced' : 'no repository pack';
   if (parts[0] === 'artifacts') return references.artifacts.has(key) ? 'referenced' : 'no artifact row';
   if (parts[0] === 'resource-uploads') return references.uploadParts.has(key) ? 'referenced' : 'no upload session';
   if (parts[0] === 'conversation-exports') return references.conversationExports.has(key) ? 'referenced' : 'no export row';

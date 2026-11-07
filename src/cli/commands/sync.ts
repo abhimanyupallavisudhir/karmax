@@ -18,11 +18,18 @@ export async function fetchManifest(api: Api, target: { projectId: string; taskI
     : `/api/projects/${encodeURIComponent(target.projectId)}/workspace`);
 }
 
-/** Git configuration that sends github.com credentials through `tavya git-credential`. */
-export function tavyaCredentialConfig(): string[] {
+/** Git configuration that sends `origin`'s credentials (github.com's, or a
+ * tavya server's for the repositories it hosts) through `tavya git-credential`. */
+export function tavyaCredentialConfig(origin = 'https://github.com'): string[] {
   const self = [process.execPath, ...(process.argv[1] ? [process.argv[1]] : [])].map(shellQuote).join(' ');
-  return ['credential.https://github.com.helper=', `credential.https://github.com.helper=!${self} git-credential`,
-    'credential.https://github.com.useHttpPath=true'];
+  return [`credential.${origin}.helper=`, `credential.${origin}.helper=!${self} git-credential`,
+    `credential.${origin}.useHttpPath=true`];
+}
+
+/** A repository tavya hosts (`tavya:<id>/<name>.git`): cloned from its server over HTTPS. */
+export function hostedCloneUrl(sshUrl: string, server: string): string | undefined {
+  const match = /^tavya:(repo_[a-z0-9]+)\/([A-Za-z0-9._-]+?)(?:\.git)?$/.exec(sshUrl);
+  return match ? `${server.replace(/\/$/, '')}/git/${match[1]}/${match[2]}.git` : undefined;
 }
 
 function httpsUrl(sshUrl: string): string {
@@ -54,13 +61,17 @@ function cloneProgress(out: Output, label: string) {
   };
 }
 
-async function cloneRepository(destination: string, repository: Manifest['repositories'][number], out: Output, viaTavya = false): Promise<boolean> {
+async function cloneRepository(destination: string, repository: Manifest['repositories'][number], out: Output, viaTavya: boolean,
+  server: string): Promise<boolean> {
   const root = path.dirname(destination);
   fs.mkdirSync(root, { recursive: true });
   out.info(`Cloning ${repository.name} (${repository.branch})…`);
   // `--config` is written into the new repository before it fetches, so the clone itself uses it.
-  const config = viaTavya ? tavyaCredentialConfig().flatMap((entry) => ['--config', entry]) : [];
-  const url = viaTavya ? httpsUrl(repository.sshUrl) : repository.sshUrl;
+  // A repository tavya hosts has no credentials but tavya's: its own sign-in, always.
+  const hosted = hostedCloneUrl(repository.sshUrl, server);
+  const config = (hosted ? tavyaCredentialConfig(new URL(server).origin) : viaTavya ? tavyaCredentialConfig() : [])
+    .flatMap((entry) => ['--config', entry]);
+  const url = hosted ?? (viaTavya ? httpsUrl(repository.sshUrl) : repository.sshUrl);
   const progress = cloneProgress(out, `Cloning ${repository.name}`);
   // Blobless: every commit and tree, but only the files of the checked-out commit; Git fetches older
   // files when something (log -p, blame, checking out another commit) first needs them.
@@ -77,7 +88,7 @@ async function cloneRepository(destination: string, repository: Manifest['reposi
   const reason = output.split(/[\r\n]+/).filter((line) => !latestGitProgress([line]) && !line.startsWith('Cloning into '))
     .slice(-2).join(' ');
   if (repository.role === 'project-wiki') { out.warn(`project wiki not cloned: ${reason}`); return false; }
-  throw new CliError(`cloning ${repository.sshUrl} failed: ${reason}\n${!viaTavya && /access rights|Repository not found|Permission denied/i.test(output)
+  throw new CliError(`cloning ${repository.sshUrl} failed: ${reason}\n${hosted ? `Check that you can reach ${server} and see this project.` : !viaTavya && /access rights|Repository not found|Permission denied/i.test(output)
     ? aliasHint(repository.sshUrl) ?? GENERIC_HINT : GENERIC_HINT}`);
 }
 
@@ -121,7 +132,7 @@ export async function clone(api: Api, ref: string, directory: string | undefined
   fs.mkdirSync(root, { recursive: true });
   const workspace = Workspace.create(root, api.server, manifest);
   if (options.gitViaTavya) workspace.gitViaTavya = true;
-  for (const repository of manifest.repositories) await cloneRepository(workspace.checkout(repository.name), repository, out, options.gitViaTavya);
+  for (const repository of manifest.repositories) await cloneRepository(workspace.checkout(repository.name), repository, out, Boolean(options.gitViaTavya), api.server);
   const report = await syncData(api, workspace, out, { resources: options.resources, secrets: options.secrets, force: false });
   const where = path.relative(process.cwd(), workspace.workdir) || '.';
   out.result({ root, workdir: workspace.workdir, manifest, ...report },
@@ -147,7 +158,7 @@ export async function pull(api: Api, workspace: Workspace, out: Output, options:
     const dir = workspace.checkout(repository.name);
     if (!isRepository(dir)) {
       repositories[repository.name] = workspace.nested(repository.name) ? NOT_HERE
-        : await cloneRepository(dir, repository, out, workspace.gitViaTavya) ? 'cloned' : 'skipped';
+        : await cloneRepository(dir, repository, out, Boolean(workspace.gitViaTavya), workspace.server) ? 'cloned' : 'skipped';
       continue;
     }
     let fetched = await git(dir, ['fetch', '--quiet', 'origin', repository.branch]);

@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { HostedGit, registerHostedGit } from '../world/hosted-git.js';
 import { WorldReferenceKeys, unreadableReferenceWarning } from '../world/reference-keys.js';
 import type { Client } from '@temporalio/client';
 import type { Store } from '../store/db.js';
@@ -89,6 +90,14 @@ export async function createExecutionServices(input: {
   // so the lifecycle sweep can expire them (src/store/conversation-exports.ts).
   if (bootstrap) await backfillConversationExports(store, objectStore, p.objects)
     .catch((error) => console.warn(`[conversation-exports] backfill failed: ${error instanceof Error ? error.message : String(error)}`));
+  // Repositories tavya hosts: served by the gateway, credentials minted here too.
+  const hostedGit = new HostedGit({ store, objects: objectStore, broker, cacheDir: path.join(p.home, 'cache', 'hosted-git'),
+    storageAvailable: async (organizationId, bytes) => {
+      const location = (await store.listStorageLocations(organizationId)).find((candidate) => candidate.kind === 'managed');
+      const available = location ? (await store.storageLocationUsage(location.id)).availableBytes : undefined;
+      return available === undefined || available >= bytes;
+    } });
+  registerHostedGit(hostedGit);
   const snapshotEngine = new ObjectSnapshotEngine(objectStore, broker, storageLocations);
   // Remote sandboxes reach the resource repositories at the public URL.
   const resources = new ProjectResourceService(store, worlds, snapshotEngine, broker,
@@ -144,5 +153,5 @@ export async function createExecutionServices(input: {
   useModelLogins(logins);
   const configHomes = new ConfigHomeManager(p.configHomes, logins);
   return { worlds, adapters, profiles, tokens, providerConnections, objectStore, storageLocations,
-    resources, checkpoints, runners, worldAccess, payments, paymentRegistry, configHomes };
+    resources, checkpoints, runners, worldAccess, payments, paymentRegistry, configHomes, hostedGit };
 }

@@ -33,6 +33,7 @@ import { ServiceConnections, ConnectionError } from '../integrations/service-con
 import { OPEN_CONNECTION } from '../integrations/connection-requests.js';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
@@ -80,6 +81,9 @@ import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
 import { validGitBranch } from '../util/git-ref.js';
+import { HOSTED_GIT_ROUTE, hostedRepositoryUrl, isHostedRepository, isValidHostedName } from '../domain/hosted-repository.js';
+import { materializeGitCredential } from '../world/git-credential.js';
+type Repository = import('../domain/types.js').Repository;
 import { FileAccessError, FileNotFoundError, ProjectFiles, projectRepositoryCredential, splitPath, type FileNode, type FileView, type OpenedFile } from '../world/project-files.js';
 import { createFileShare, currentFileShare, projectFileShares, publicFileShare, publicFilesHtml, revokeFileShare, type FileShare } from './file-sharing.js';
 import { cliVersionOf, olderVersion } from '../domain/cli-version.js';
@@ -182,6 +186,8 @@ export interface GatewayDeps {
   worldAccess?: import('../world/access.js').WorldAccessService;
   objects?: ObjectStore;
   resources?: import('../world/resources.js').ProjectResourceService;
+  /** Repositories tavya hosts, served at /git/ (world/hosted-git.ts). */
+  hostedGit?: import('../world/hosted-git.js').HostedGit;
   /** Releases chunked task checkpoints when their project is deleted. */
   checkpoints?: import('../world/checkpoint.js').WorldCheckpointService;
   /** The project Files reader (wiki features/project-files); built lazily when absent (tests). */
@@ -1773,6 +1779,10 @@ export class Gateway {
     // (GrantLimits), not by the address it came from.
     if (p.startsWith(REPOSITORY_ROUTE) && this.deps.resources?.repositoryServer)
       return this.deps.resources.repositoryServer.handle(req, res, p.slice(REPOSITORY_ROUTE.length) + url.search);
+    // Repositories tavya hosts: Git clients with a token as the password, never a session.
+    if (p.startsWith(HOSTED_GIT_ROUTE) && this.deps.hostedGit)
+      return this.deps.hostedGit.handle(req, res, p.slice(HOSTED_GIT_ROUTE.length) + url.search,
+        (token, repository, access) => this.hostedGitAllows(token, repository, access));
     const sensitiveNavigation = /^\/api\/tasks\/[^/]+\/(desktop|preview\/)/.test(p);
     if (p.startsWith('/api/') && (!['GET', 'HEAD', 'OPTIONS'].includes(req.method ?? 'GET') || sensitiveNavigation)
       && !this.sameOriginRequest(req)) return this.json(res, 403, { error: 'cross-origin request forbidden' });
@@ -2360,6 +2370,8 @@ export class Gateway {
         explanationsEnabled: EXPLANATIONS_ENABLED,
         cellId: this.deps.cellId ?? 'local',
         hosted: this.deps.hosted ?? false,
+        // Repositories tavya hosts can be made here (world/hosted-git.ts).
+        hostsRepositories: Boolean(this.deps.hostedGit),
         hostLocal: this.hostLocal,
         siteName: (await this.siteName),
         skin: skinOf((await this.deps.store.getSettings('global', 'appearance'))),
@@ -3286,6 +3298,9 @@ export class Gateway {
           if (provider && typeof provider.disconnect === 'function') await provider.disconnect(organizationId);
         }
         await this.deps.githubApp?.disconnectOrganization(organizationId);
+        // Repositories tavya hosts for it: their packs and caches (its key is shredded below too).
+        for (const repository of (await store.listRepositories(organizationId)).filter(isHostedRepository))
+          await this.deps.hostedGit?.remove(repository);
         // Its key for tavya's included model, at OpenRouter (wiki features/included-model).
         if (this.deps.broker) await removeIncludedModelKey(store, this.deps.broker, organizationId);
         for (const connection of (await this.deps.providerConnections?.list(organizationId)) ?? [])
@@ -3607,10 +3622,31 @@ export class Gateway {
         }
       }
       const createOrganizationRepository = p.match(/^\/api\/organizations\/([^/]+)\/repositories\/create$/);
+      const repositoryRequest = createOrganizationRepository && method === 'POST' ? await this.body(req) : undefined;
+      if (createOrganizationRepository && repositoryRequest?.provider === 'tavya') {
+        // A repository tavya hosts: no GitHub account involved.
+        const b = repositoryRequest;
+        const organizationId = createOrganizationRepository[1]!;
+        if (!this.deps.hostedGit) return this.json(res, 503, { error: 'this installation does not host repositories' });
+        const name = String(b.name ?? '').trim();
+        if (!isValidHostedName(name)) return this.json(res, 400, { error: 'Use letters, digits, ".", "-" and "_" for the name' });
+        if ((await store.listRepositories(organizationId)).some((repository) => repository.provider === 'tavya' && repository.name.toLowerCase() === name.toLowerCase()))
+          return this.json(res, 409, { error: `There is already a repository named ${name}` });
+        const id = newId('repo');
+        const defaultBranch = typeof b.defaultBranch === 'string' && validGitBranch(b.defaultBranch) ? b.defaultBranch : 'main';
+        const repository = await store.upsertRepository({ id, organizationId, provider: 'tavya', owner: organizationId, name,
+          sshUrl: hostedRepositoryUrl(id, name), defaultBranch, private: true });
+        try { await this.deps.hostedGit.create(repository); }
+        catch (error) {
+          await store.deleteRepository(repository.id).catch(() => undefined);
+          return this.json(res, 502, { error: error instanceof Error ? error.message : String(error) });
+        }
+        return this.json(res, 200, repository);
+      }
       if (createOrganizationRepository && method === 'POST') {
         const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.githubApp || !await this.deps.githubApp.configured()) return this.json(res, 503, { error: 'Set up and install the GitHub App first' });
-        const b = await this.body(req);
+        const b = repositoryRequest!;
         const connection = (await store.getGitConnection(String(b.gitConnectionId ?? '')));
         if (!connection || connection.organizationId !== createOrganizationRepository[1])
           return this.json(res, 404, { error: 'GitHub connection not found in this organization' });
@@ -3626,6 +3662,58 @@ export class Gateway {
           const status = typeof (error as { status?: unknown })?.status === 'number' ? (error as { status: number }).status : 400;
           return this.json(res, status, { error: error instanceof Error ? error.message : String(error) });
         }
+      }
+      // A repository tavya hosts: deleted (once no project uses it), or moved to
+      // GitHub, every branch and tag, taking its place in every project using it.
+      const organizationRepository = p.match(/^\/api\/organizations\/([^/]+)\/repositories\/([^/]+)(\/move-to-github)?$/);
+      if (organizationRepository && ((method === 'DELETE' && !organizationRepository[3]) || (method === 'POST' && organizationRepository[3]))) {
+        const repository = await store.getRepository(organizationRepository[2]!);
+        if (!repository || repository.organizationId !== organizationRepository[1]) return this.json(res, 404, { error: 'repository not found' });
+        if (!isHostedRepository(repository) || !this.deps.hostedGit)
+          return this.json(res, 400, { error: 'Only repositories tavya hosts are deleted or moved here' });
+        const projectIds = await store.projectIdsForRepository(repository.id);
+        if (method === 'DELETE') {
+          if (projectIds.length) {
+            const names = (await Promise.all(projectIds.map((id) => store.getProject(id)))).map((project) => project?.name).filter(Boolean);
+            return this.json(res, 409, { error: `Detach it from ${names.join(', ')} first` });
+          }
+          await this.deps.hostedGit.remove(repository);
+          await store.deleteRepository(repository.id);
+          return this.json(res, 200, { deleted: true });
+        }
+        const subject = requireHumanSubject(callerIdentity);
+        if (!this.deps.githubApp || !await this.deps.githubApp.configured()) return this.json(res, 503, { error: 'Set up and install the GitHub App first' });
+        const b = await this.body(req);
+        const connection = await store.getGitConnection(String(b.gitConnectionId ?? ''));
+        if (!connection || connection.organizationId !== repository.organizationId)
+          return this.json(res, 404, { error: 'GitHub connection not found in this organization' });
+        // A task's world knows the repository by its tavya: URL, and lands there.
+        let running = 0;
+        for (const projectId of projectIds)
+          running += (await store.listTasks(projectId)).filter((task) => task.lastView && !['done', 'cancelled', 'failed'].includes(task.lastView.status ?? '')).length;
+        if (running) return this.json(res, 409, { error: `Finish or stop the ${running} task${running === 1 ? '' : 's'} using it first` });
+        let moved: Repository;
+        try {
+          moved = await this.deps.githubApp.createRepository(connection.id, subject.userId,
+            { name: String(b.name ?? repository.name), private: b.private !== false, autoInit: false, defaultBranch: repository.defaultBranch },
+            { accountId: subject.externalIdentities?.githubAccountId });
+        } catch (error) {
+          const status = typeof (error as { status?: unknown })?.status === 'number' ? (error as { status: number }).status : 400;
+          return this.json(res, status, { error: error instanceof Error ? error.message : String(error) });
+        }
+        const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-move-'));
+        try {
+          const credential = await this.deps.githubApp.brokerCredentials(moved);
+          await this.deps.hostedGit.exportTo(repository, moved.sshUrl, materializeGitCredential(scratch, credential).env);
+        } catch (error) {
+          return this.json(res, 502, { error: `Created ${moved.owner}/${moved.name} on GitHub, but could not copy the repository there: ${error instanceof Error ? error.message : String(error)}` });
+        } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+        await store.replaceProjectRepository(repository.id, moved.id);
+        await this.deps.hostedGit.remove(repository);
+        await store.deleteRepository(repository.id);
+        await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'repository.moved-to-github', `repository:${moved.id}`,
+          { from: repository.id, to: `${moved.owner}/${moved.name}`, projects: projectIds, ...identityAuditDetail(callerIdentity) });
+        return this.json(res, 200, moved);
       }
       const organizationProjects = p.match(/^\/api\/organizations\/([^/]+)\/projects$/);
       if (organizationProjects) {
@@ -10542,6 +10630,24 @@ export class Gateway {
       out.push(project);
     }
     return out;
+  }
+
+  /** Whether a token a Git client sent (a person's CLI login or personal
+   * token, or an agent's task token) may read or write a repository tavya
+   * hosts. As GitHub repositories mirror tavya roles (wiki
+   * features/github-repository-access): in a project using it, project:read
+   * reads and task:create writes; across the organization, repository:read and
+   * repository:write. The same token, presented as a bearer, as the API sees it. */
+  private async hostedGitAllows(token: string, repository: Repository, access: 'read' | 'write'): Promise<boolean> {
+    const request = { headers: { authorization: `Bearer ${token}` } } as http.IncomingMessage;
+    const organizationId = repository.organizationId;
+    for (const projectId of [...await this.deps.store.projectIdsForRepository(repository.id), undefined]) {
+      const capability = projectId ? (access === 'write' ? 'task:create' : 'project:read') : `repository:${access}`;
+      const session = await this.auth(request, projectId, organizationId).catch(() => undefined);
+      if (session?.apiToken && (await this.deps.tokens.check(session.apiToken, capability, { organizationId, ...(projectId ? { projectId } : {}) })).ok)
+        return true;
+    }
+    return false;
   }
 
   private async auth(req: http.IncomingMessage, projectId?: string, organizationId?: string): Promise<Session | undefined> {

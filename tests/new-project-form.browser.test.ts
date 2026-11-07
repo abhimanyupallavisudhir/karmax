@@ -9,7 +9,7 @@ afterAll(closeConsoleBrowser);
 
 const site = { id: 'r1', owner: 'acme', name: 'site', sshUrl: 'git@github.com:acme/site.git', defaultBranch: 'main' };
 
-async function form(options: { github?: boolean; hosted?: boolean; refuseCreate?: boolean; repositories?: unknown[];
+async function form(options: { github?: boolean; hosted?: boolean; hostsRepositories?: boolean; refuseCreate?: boolean; repositories?: unknown[];
   connection?: Record<string, unknown>; logins?: string[]; refreshed?: unknown[] } = {}) {
   const github = options.github ?? true;
   const projects: Array<Record<string, unknown>> = [{ id: 'p', organizationId: 'o', name: 'Workspace', config: {} }];
@@ -27,6 +27,8 @@ async function form(options: { github?: boolean; hosted?: boolean; refuseCreate?
     }
     if (method === 'POST' && path === '/api/organizations/o/repositories/create' && options.refuseCreate)
       return { status: 422, json: { error: 'Repository creation failed: name already exists on this account' } };
+    if (method === 'POST' && path === '/api/organizations/o/repositories/create' && body.provider === 'tavya')
+      return { id: 'repo_new1', provider: 'tavya', owner: 'o', name: body.name, sshUrl: `tavya:repo_new1/${body.name}.git`, defaultBranch: 'main' };
     if (method === 'POST' && path === '/api/organizations/o/repositories/create')
       return { id: 'r2', owner: 'acme', name: body.name, sshUrl: `git@github.com:acme/${body.name}.git`, defaultBranch: 'main' };
     if (method === 'POST' && path === '/api/organizations/o/github/refresh')
@@ -34,7 +36,8 @@ async function form(options: { github?: boolean; hosted?: boolean; refuseCreate?
     if (method === 'POST' && path === '/api/projects/n/secrets') return { imported: ['API_KEY'] };
     if (method === 'PUT' && path === '/api/projects/n/environment') return { spec: body };
     return undefined;
-  }, { projects, meta: options.hosted ? { hosted: true, hostLocal: false } : {} }) });
+  }, { projects, meta: { ...(options.hosted ? { hosted: true, hostLocal: false } : {}),
+    ...(options.hostsRepositories ? { hostsRepositories: true } : {}) } }) });
   await ui.run('boot()');
   await ui.page.locator('#rail').waitFor();
   await ui.run('newProject()');
@@ -44,6 +47,35 @@ async function form(options: { github?: boolean; hosted?: boolean; refuseCreate?
 }
 
 describe('New project form', () => {
+  it('without GitHub, keeps the project\'s code in a repository tavya hosts, named after it', async () => {
+    const { ui, dialog } = await form({ github: false, hosted: true, hostsRepositories: true });
+    const choice = dialog.getByRole('radio', { name: /Create new repo/ });
+    await choice.waitFor();
+    expect(await choice.isChecked()).toBe(true);
+    await dialog.getByRole('textbox', { name: 'Project name' }).fill('Clients/Fresh Ideas');
+    await expect.poll(() => dialog.locator('.np-default-label').innerText()).toMatch(/^Create new repo fresh-ideas/);
+    await dialog.getByRole('button', { name: 'Create project' }).click();
+    await expect.poll(() => ui.calls.find((call) => call.path === '/api/organizations/o/projects')?.body)
+      .toEqual({ name: 'Clients/Fresh Ideas', config: {}, repos: ['tavya:repo_new1/fresh-ideas.git'] });
+    expect(ui.calls.find((call) => call.path === '/api/organizations/o/repositories/create')?.body)
+      .toEqual({ provider: 'tavya', name: 'fresh-ideas' });
+    expect(ui.errors).toEqual([]);
+    await ui.close();
+  });
+
+  it('creates a tavya repository from the picker as tavya/<name>, beside GitHub\'s', async () => {
+    const { ui, dialog } = await form({ hostsRepositories: true });
+    await dialog.getByRole('radio', { name: 'Choose other repositories' }).check();
+    const input = dialog.locator('#np-repo-input');
+    await input.fill('tavya/notes');
+    await dialog.page().getByRole('option', { name: 'New repo tavya/notes' }).click();
+    await expect.poll(() => dialog.locator('.git-repo').allInnerTexts()).toEqual([expect.stringContaining('notes')]);
+    expect(await dialog.locator('.git-repo-copy').getAttribute('data-url')).toMatch(/\/git\/repo_new1\/notes\.git$/);
+    expect(ui.calls.find((call) => call.path === '/api/organizations/o/repositories/create')?.body).toEqual({ provider: 'tavya', name: 'notes' });
+    expect(ui.errors).toEqual([]);
+    await ui.close();
+  });
+
   it('opens on the name and the GitHub repository named after it, with the rest collapsed', async () => {
     const { ui, dialog } = await form();
     const choice = dialog.getByRole('radio', { name: /GitHub repo/ });

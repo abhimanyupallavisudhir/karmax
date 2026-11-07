@@ -165,7 +165,10 @@ export interface ProjectMembership {
 export interface Repository {
   id: string;
   organizationId: string;
-  provider: 'github';
+  /** `tavya`: hosted by tavya itself (domain/hosted-repository.ts): `sshUrl` is
+   * its stable `tavya:<id>/<name>.git`, `owner` its organization's id, and it
+   * has no GitHub connection. */
+  provider: 'github' | 'tavya';
   providerId?: string;
   owner: string;
   name: string;
