@@ -114,6 +114,8 @@ def read_claude_code(text: str, *, source_uri: str | None = None, **_: Any) -> d
                 "attachment",
                 "cost-state",
                 "custom-title",
+                # Which side of a session's connector isolation it is latched to; re-stamped on resume.
+                "isolation-latch",
                 "last-prompt",
                 "mode",
                 "permission-mode",
