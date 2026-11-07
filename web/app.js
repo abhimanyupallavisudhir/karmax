@@ -5639,6 +5639,9 @@ function connectWs() {
       }
       // The fork happened (its first turn copied the session): what it inherited is cut there.
       if (ev.type === 'session.forked') S.forkHistory = {};
+      // A message of mine that waited carried the work on in a new task (after Confirm).
+      if (ev.type === 'conversation.pending') for (const { messageId, task } of ev.payload?.continued || [])
+        if (S.view?.pendingMessages?.some((p) => p.mine && p.message.id === messageId)) toast(`Continued in #${task.num ?? task.id}`);
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
         refreshTask(ev.type);
@@ -13436,13 +13439,16 @@ function inheritedConversationHtml(v, t, opened) {
 // Messages said while the task could not take them (wiki features/queued-messages):
 // shown where they were said, marked with a clock until the agent gets them.
 // Their sender may take one back into the box to edit it, or to Continue.
-function pendingMessagesHtml(v, t, entries) {
-  const tip = 'Not sent yet. The agent gets it as soon as it can take messages.';
+// A message is never lost: where there is no box to take it back into (the
+// task ended), it stays, with its copy button.
+function pendingMessagesHtml(v, t, entries, canUnsend) {
+  const ended = ['done', 'cancelled', 'failed'].includes(v.status);
+  const tip = ended ? 'Not sent: the task ended before its agent could take it.' : 'Not sent yet. The agent gets it as soon as it can take messages.';
   const said = new Set(entries.filter((entry) => entry.type === 'message').map((entry) => entry.message.id));
   return (v.pendingMessages || []).filter((p) => p.role === t.role && !said.has(p.message.id)).map((p) => {
     const html = renderConversationEntry({ type: 'message', message: p.message }, v);
     const mark = `<button type="button" class="info-dot pending-mark" title="${esc(tip)}" aria-label="${esc(tip)}">${ICON.clock}</button>`;
-    const unsend = p.mine ? `<button type="button" class="btn sm ghost unsend-pending" data-pending-id="${esc(p.message.id)}" title="Take it back to edit">Unsend</button>` : '';
+    const unsend = p.mine && canUnsend ? `<button type="button" class="btn sm ghost unsend-pending" data-pending-id="${esc(p.message.id)}" title="Take it back to edit">Unsend</button>` : '';
     return html.replace('<div class="msg ', `<div data-pending="${esc(p.message.id)}" class="msg pending `)
       .replace('<span class="msg-meta-gap"></span>', `${mark}<span class="msg-meta-gap"></span>${unsend}`);
   }).join('');
@@ -13498,7 +13504,7 @@ function conversationPane(v, t) {
     : row(item.entry, item === land ? ' data-land' : item === question ? ' data-land-question' : '')).join('')
     || (historyStatus || inherited ? '' : '<div class="msg system">No messages yet</div>'));
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
-  const pending = pendingMessagesHtml(v, t, entries);
+  const pending = pendingMessagesHtml(v, t, entries, canFollowUp);
   const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
         <div class="prompt-field">

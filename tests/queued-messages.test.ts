@@ -39,7 +39,7 @@ async function fixture(stage = 'setup', actions: unknown[] = [{ name: 'cancel', 
   (await store.saveView(task.id, view()));
   const followUps = () => signals.filter(([name]) => name === 'followUp').map(([, message]) => (message as { id: string; text: string }));
   const settled = async () => { for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve)); };
-  return { store, api, task, tokenFor, followUps, view, settled };
+  return { store, api, task, tokenFor, followUps, view, settled, authorization };
 }
 
 const DO_ACTIONS = [
@@ -114,17 +114,47 @@ describe('queued messages', () => {
     expect(f.followUps()).toEqual([]);
   });
 
-  it('after Confirm a kept message waits for its sender to Continue, never sent on their behalf', async () => {
+  it('confirmed before it was delivered, a person’s kept message continues the work in a new task, and what followed goes there', async () => {
     const f = await fixture('pr');
     const owner = await f.tokenFor('user:owner');
-    const kept = (await f.api.postTaskMessage(owner, f.task.id, { text: 'and then the docs' })).message!;
-    expect(kept.queued).toBe(true);
+    const grant = await f.authorization.taskGrant('user:owner', f.task.projectId, { level: 'maintainer', scope: 'projects', projectIds: [f.task.projectId] });
+    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: { ...grant, principal: 'user:owner' } }));
+    (await f.store.kvSet(`session:${f.task.id}:do`, 'source-session'));
+    const first = (await f.api.postTaskMessage(owner, f.task.id, { text: 'and then the docs' })).message!;
+    const second = (await f.api.postTaskMessage(owner, f.task.id, { text: 'with examples' })).message!;
+    expect([first.queued, second.queued]).toEqual([true, true]);
+    // Confirmed and landing on its own: the page's box reads Continue.
     (await f.store.saveView(f.task.id, f.view({ stage: 'merge', status: 'waiting', waitingFor: { kind: 'github' }, actions: [], updatedAt: 2 })));
+    await expect.poll(async () => (await f.store.listTasks(f.task.projectId)).length).toBe(2);
     await f.settled();
     expect(f.followUps()).toEqual([]);
+    const next = (await f.store.listTasks(f.task.projectId)).find((task) => task.id !== f.task.id)!;
+    expect(next.title).toBe('and then the docs');
+    expect(next.params['agent:do']).toMatchObject({ resumeFrom: { taskId: f.task.id, role: 'do' } });
+    expect((await f.api.getTaskView(owner, f.task.id))?.pendingMessages).toBeUndefined();
+    const events = await f.store.eventsOfType(f.task.id, 'conversation.pending');
+    expect(events.at(-1)?.payload).toMatchObject({ continued: [{ messageId: first.id, task: { id: next.id } }] });
+    // What was said after it waits for the new task, still its sender’s.
+    await expect.poll(async () => JSON.parse((await f.store.kvGet(`pending-messages:${next.id}`)) ?? '[]')).toEqual(
+      [expect.objectContaining({ role: 'do', by: 'user:owner', message: expect.objectContaining({ id: second.id, text: 'with examples' }) })]);
+  });
+
+  it('a kept message is never continued with authority its sender has lost; it stays to be taken back', async () => {
+    const f = await fixture('pr');
+    const owner = await f.tokenFor('user:owner');
+    const grant = await f.authorization.taskGrant('user:owner', f.task.projectId, { level: 'maintainer', scope: 'projects', projectIds: [f.task.projectId] });
+    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: { ...grant, principal: 'user:owner' } }));
+    const kept = (await f.api.postTaskMessage(owner, f.task.id, { text: 'and then the docs' })).message!;
+    // Removed from the project after saying it: Continue is refused, and nothing is lost.
+    (await f.authorization.revoke('system:test', 'user:owner', projectScope(f.task.projectId)));
+    (await f.store.saveView(f.task.id, f.view({ stage: 'merge', status: 'waiting', waitingFor: { kind: 'github' }, actions: [], updatedAt: 2 })));
+    await f.settled();
+    expect((await f.store.listTasks(f.task.projectId)).length).toBe(1);
     const view = await f.api.getTaskView(owner, f.task.id);
     expect(view?.actions).toContainEqual(expect.objectContaining({ name: 'followUp', label: 'Continue' }));
     expect(view?.pendingMessages?.[0]?.message.id).toBe(kept.id);
+    // Still on screen for the people who can read the task.
+    expect((await f.api.getTaskView(await f.tokenFor('user:other'), f.task.id))?.pendingMessages?.[0]?.message.text).toBe('and then the docs');
   });
 
   it('a finished task takes no messages and offers no box', async () => {

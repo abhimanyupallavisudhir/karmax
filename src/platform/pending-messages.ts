@@ -1,4 +1,5 @@
 import type { Message, TaskView } from '../domain/types.js';
+import type { Capability } from './capabilities.js';
 
 /**
  * Messages waiting for their task to take them (wiki features/queued-messages).
@@ -17,6 +18,10 @@ export interface PendingMessage {
   role: string;
   /** Who sent it: only they may take it back. */
   by: string;
+  /** A person's authority when they sent it. If the task's proposal is
+   * confirmed before it is delivered, the message continues the work in a new
+   * task as it would have then — with no more than this, nor than they hold now. */
+  authority?: { caps: Capability[]; organizationId?: string };
 }
 
 /** A message as its sender gets it back: `queued` until its task takes it. */

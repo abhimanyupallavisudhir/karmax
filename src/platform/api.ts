@@ -6867,7 +6867,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     if (signal === SIG.followUp) {
       const message: Message = { id: `u${randomUUID()}`, role: 'user', text: text ?? '', ts: Date.now(),
         ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}), ...addressed };
-      return this.sendOrQueueFollowUp(scopedTask, role, message, caller.principal, receivedAt);
+      return this.sendOrQueueFollowUp(scopedTask, role, message, caller, receivedAt);
     }
     const heldView = scopedTask?.lastView;
     // The same decision again, before the workflow has acted on the first one
@@ -7192,11 +7192,11 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     return parsePending(await this.deps.store.kvGet(pendingMessagesKey(taskId)));
   }
 
-  private async writePending(taskId: string, queue: PendingMessage[]): Promise<void> {
+  private async writePending(taskId: string, queue: PendingMessage[], continued: Array<{ messageId: string; task: TaskLink }> = []): Promise<void> {
     if (queue.length) (await this.deps.store.kvSet(pendingMessagesKey(taskId), JSON.stringify(queue)));
     else (await this.deps.store.kvDelete(pendingMessagesKey(taskId)));
     // Every open page shows the queue as it is now.
-    const event = { taskId, type: 'conversation.pending', ts: Date.now(), payload: { pending: pendingForView(queue) } };
+    const event = { taskId, type: 'conversation.pending', ts: Date.now(), payload: { pending: pendingForView(queue), ...(continued.length ? { continued } : {}) } };
     const seq = (await this.deps.store.appendEvent(event));
     this.deps.bus?.emit({ ...event, seq });
   }
@@ -7206,7 +7206,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
    * (wiki features/queued-messages). Messages already waiting go first, so the
    * agent reads everything in the order it was said.
    */
-  private async sendOrQueueFollowUp(task: TaskRecord, role: string | undefined, message: Message, by: string,
+  private async sendOrQueueFollowUp(task: TaskRecord, role: string | undefined, message: Message, caller: ScopedToken,
     receivedAt?: { monoMs: number; wallMs: number }): Promise<SentMessage> {
     const conversation = role ?? MAIN_AGENT;
     // Only the decision is serialized with the queue: a message the task
@@ -7226,7 +7226,10 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
         // Another agent's conversation, or a workflow without an agent: as before.
         return { send: current };
       }
-      (await this.writePending(task.id, [...queue, { message, role: conversation, by }]));
+      // A person's authority goes with it, for a Continue it may become.
+      const authority = speakingUser(caller)
+        ? { authority: { caps: caller.caps, ...(caller.organizationId ? { organizationId: caller.organizationId } : {}) } } : {};
+      (await this.writePending(task.id, [...queue, { message, role: conversation, by: caller.principal, ...authority }]));
       return { queued: { ...message, queued: true as const } };
     });
     if ('send' in decided) return this.dispatchFollowUp(decided.send, role, message, receivedAt);
@@ -7237,17 +7240,29 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
 
   /** Deliver the messages kept for a task while it takes them, oldest first. */
   async flushPendingMessages(taskId: string): Promise<void> {
+    let continuation: { task: TaskRecord; rest: PendingMessage[] } | undefined;
     await this.withPendingLock(taskId, async () => {
       let queue = await this.readPending(taskId);
       const before = queue.length;
+      const continued: Array<{ messageId: string; task: TaskLink }> = [];
       while (queue.length) {
         const task = (await this.deps.store.getTask(taskId));
         const next = queue[0]!;
         const followUp = task && this.openFollowUp(task, task.lastView, next.role);
-        // After Confirm a person's message carries the work on in a new task:
-        // that is theirs to send (Continue), never done on their behalf.
-        if (!task || !followUp || followUp.label === CONTINUE_ACTION().label) break;
+        if (!task || !followUp) break;
         try {
+          if (followUp.label === CONTINUE_ACTION().label) {
+            // Confirmed meanwhile: the message carries the work on in a new
+            // task, as it would have had it been sent now (wiki
+            // features/continue-after-confirm). Whatever was said after it goes
+            // there too, in order.
+            const created = await this.continueAsSender(task, next);
+            if (!created) break;
+            continued.push({ messageId: next.message.id, task: taskLink(created) });
+            continuation = { task: created, rest: queue.slice(1) };
+            queue = [];
+            break;
+          }
           await this.dispatchFollowUp(task, next.role === MAIN_AGENT ? undefined : next.role, next.message);
         } catch (error) {
           console.warn(`[karmax] could not deliver a queued message to ${taskId}:`, error);
@@ -7255,8 +7270,31 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
         }
         queue = queue.slice(1);
       }
-      if (queue.length !== before) await this.writePending(taskId, queue);
+      if (queue.length !== before) await this.writePending(taskId, queue, continued);
     }).catch((error) => console.warn(`[karmax] queued messages of ${taskId}:`, error));
+    if (continuation?.rest.length) {
+      const { task, rest } = continuation;
+      await this.withPendingLock(task.id, async () =>
+        this.writePending(task.id, [...(await this.readPending(task.id)), ...rest]))
+        .catch((error) => console.warn(`[karmax] could not carry queued messages on to ${task.id}:`, error));
+      void this.flushPendingMessages(task.id);
+    }
+  }
+
+  /** Continue a confirmed task from a kept message, as its sender: with what
+   * they could do when they sent it, less anything they have lost since. Only a
+   * person's message continues; anyone else's stays kept. */
+  private async continueAsSender(task: TaskRecord, entry: PendingMessage): Promise<TaskRecord | undefined> {
+    if (!entry.authority || !entry.by.startsWith('user:') || !this.deps.authorization) return undefined;
+    const organizationId = entry.authority.organizationId ?? (await this.deps.store.getProject(task.projectId))?.organizationId;
+    const now = await this.deps.authorization.capabilitiesAsync(entry.by, task.projectId, organizationId);
+    const caps = entry.authority.caps.filter((cap) => allows(now, cap));
+    const { token } = await this.deps.tokens.mintPrincipal(entry.by, caps, task.projectId, 10 * 60_000, organizationId);
+    try {
+      const { message } = entry;
+      return await this.continueTask(token, task.id, { text: message.text,
+        ...(message.images?.length ? { images: message.images } : {}), ...(message.files?.length ? { files: message.files } : {}) });
+    } finally { await this.deps.tokens.revoke(token).catch(() => undefined); }
   }
 
   private async flushAllPendingMessages(): Promise<void> {
