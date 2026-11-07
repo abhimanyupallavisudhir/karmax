@@ -222,6 +222,7 @@ const APPROVAL_DECISION_TYPES = ['credential.approval-resolved', 'connection.res
 const APPROVAL_DISMISSAL_TYPES = ['credential.approval-dismissed', 'permission.approval-dismissed',
   'authorization.approval-dismissed', 'connection.dismissed', 'repository-access.approval-dismissed'];
 const APPROVAL_DECISIONS = sqlList(APPROVAL_DECISION_TYPES);
+const APPROVAL_DISMISSALS = sqlList(APPROVAL_DISMISSAL_TYPES);
 const APPROVAL_SILENCERS = sqlList([...APPROVAL_DECISION_TYPES, ...APPROVAL_DISMISSAL_TYPES]);
 
 /**
@@ -5740,12 +5741,14 @@ export class Store {
     return ids.length;
   }
 
-  /** Approval asks on a task that no `*.approval-resolved` event has answered. */
-  private async hasPendingApprovals(taskId: string, includeDismissed = false): Promise<boolean> {
+  /** Approval asks on a task that still ask someone: neither answered nor
+   * ignored since they were (last) raised. A request passed on to other people
+   * is raised again, so an earlier Ignore no longer silences it. */
+  private async hasPendingApprovals(taskId: string): Promise<boolean> {
     return Boolean((await this.db.prepare(`SELECT 1 FROM events e
       WHERE e.taskId=? AND e.type IN (${APPROVAL_ASKS})
         AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-          AND r.type IN (${includeDismissed ? APPROVAL_DECISIONS : APPROVAL_SILENCERS})
+          AND r.type IN (${APPROVAL_SILENCERS}) AND r.seq > e.seq
           AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId'))
       LIMIT 1`).get(taskId)));
   }
@@ -5781,7 +5784,13 @@ export class Store {
 
     // ── Discharge: drop what the task no longer needs from anybody ───────────
     if (APPROVAL_DECISION_TYPES.includes(ev.type) || APPROVAL_DISMISSAL_TYPES.includes(ev.type)) {
-      if (!(await this.hasPendingApprovals(task.id))) (await this.deleteInbox("taskId=? AND kind='approval-requested'", [task.id]));
+      if (!(await this.hasPendingApprovals(task.id))) {
+        (await this.deleteInbox("taskId=? AND kind='approval-requested'", [task.id]));
+        // Ignoring a request silences the request, not the task: if the task is
+        // parked on a person, that is still an ask (LVPM #8 waited at Needs input
+        // for days, in nobody's For me, after its app request was ignored).
+        if (APPROVAL_DISMISSAL_TYPES.includes(ev.type)) (await this.raiseHold(task.id, eventSeq, ev.ts));
+      }
       return;
     }
     // A failed task keeps its approval asks: its requests stay pending, since
@@ -5848,10 +5857,10 @@ export class Store {
       // (A sub-task escalated to its parent asks its parent's agent, not people.)
       // The lifecycle states that are an ask: the task is parked ON a human.
       // While an approval is outstanding that approval IS the ask, and it was
-      // already routed to exactly the people who can answer it.
-      // A dismissed approval is still the reason for this hold; a lifecycle tick
-      // must not turn it into a fresh escalation notification.
-      if ((await this.hasPendingApprovals(task.id, true))) return;
+      // already routed to exactly the people who can answer it. An ignored one
+      // asks nobody, so it does not stand in for the hold: no workflow waits on
+      // an ignored request (`requestHoldsTask`), so the hold is the task's own.
+      if ((await this.hasPendingApprovals(task.id))) return;
       kind = ev.payload.stage === 'review' ? 'review-requested' : 'escalated';
       actionable = true;
       users = (await this.escalationAudience(task));
@@ -5932,32 +5941,55 @@ export class Store {
         SELECT e.taskId FROM events e
         WHERE e.type IN (${APPROVAL_ASKS})
           AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-            AND r.type IN (${APPROVAL_SILENCERS})
+            AND r.type IN (${APPROVAL_SILENCERS}) AND r.seq > e.seq
             AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId')))`, []));
     }
     (await this.backfillEscalations());
     return dropped;
   }
 
-  /** The opening counterpart of the discharge above: a task escalated by a build
-   * that raised no ask for it is listed now. Quietly — the inbox shows it, but
-   * nobody is emailed about an escalation that may be weeks old. */
+  /** The opening counterpart of the discharge above: a task parked on a person
+   * (escalated, or waiting on a human) by a build that raised no ask for it is
+   * listed now. Quietly — the inbox shows it, but nobody is emailed about an ask
+   * that may be weeks old. */
   private async backfillEscalations(): Promise<void> {
-    const rows = (await this.db.prepare(`SELECT id FROM tasks WHERE json_extract(lastView, '$.stage')='escalated'
+    const rows = (await this.db.prepare(`SELECT id FROM tasks WHERE (json_extract(lastView, '$.stage')='escalated'
+        OR json_extract(lastView, '$.waitingFor.kind')='human')
       AND COALESCE(json_extract(lastView, '$.status'), '') NOT IN ('done', 'failed', 'cancelled')
       AND COALESCE(json_extract(lastView, '$.waitingFor.kind'), '') <> 'parent'
       AND id NOT IN (SELECT taskId FROM inbox WHERE actionable=1)`).all()) as Array<{ id: string }>;
     for (const row of rows) {
-      const task = (await this.getTaskShallow(String(row.id)));
-      const project = task && (await this.getProject(task.projectId));
-      if (!task || !project?.organizationId) continue;
-      const latest = (await this.db.prepare('SELECT MAX(seq) seq FROM events WHERE taskId=?').get(task.id)) as { seq?: number | string | null } | undefined;
-      const createdAt = Number(task.lastView?.updatedAt) || Date.now();
-      for (const userId of new Set(await this.escalationAudience(task)))
-        (await this.db.prepare(`INSERT OR IGNORE INTO inbox
-          (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt)
-          VALUES (?, ?, ?, ?, ?, 'escalated', ?, 1, 1, ?)`).run(newId('inbox'), project.organizationId, userId,
-            Number(latest?.seq ?? 0), task.id, urgencyRank(DEFAULT_URGENCY.escalated), createdAt));
+      const latest = (await this.db.prepare('SELECT MAX(seq) seq FROM events WHERE taskId=?').get(String(row.id))) as { seq?: number | string | null } | undefined;
+      (await this.raiseHold(String(row.id), Number(latest?.seq ?? 0)));
+    }
+  }
+
+  /**
+   * List a task that is parked on a person and asks nobody, as its lifecycle
+   * tick would: to its escalation audience, as a review request in Review and
+   * an escalation otherwise. Quietly (no email or push): it restates a hold the
+   * person may already know of. A live approval is already the ask, and a
+   * person who already has an actionable row on the task keeps that one.
+   */
+  private async raiseHold(taskId: string, eventSeq: number, at?: number): Promise<void> {
+    const state = (await this.db.prepare(`SELECT json_extract(lastView, '$.stage') stage,
+      json_extract(lastView, '$.status') status, json_extract(lastView, '$.waitingFor.kind') waiting,
+      json_extract(lastView, '$.updatedAt') updatedAt FROM tasks WHERE id=?`).get(taskId)) as
+      { stage?: string | null; status?: string | null; waiting?: string | null; updatedAt?: number | string | null } | undefined;
+    if (!state || ['done', 'failed', 'cancelled'].includes(String(state.status ?? ''))) return;
+    if (state.waiting === 'parent' || (state.waiting !== 'human' && state.stage !== 'escalated')) return;
+    if ((await this.hasPendingApprovals(taskId))) return;
+    const task = (await this.getTaskShallow(taskId));
+    const project = task && (await this.getProject(task.projectId));
+    if (!task || !project?.organizationId) return;
+    const kind: InboxItem['kind'] = state.stage === 'review' ? 'review-requested' : 'escalated';
+    const createdAt = at ?? (Number(state.updatedAt) || Date.now());
+    for (const userId of new Set(await this.escalationAudience(task))) {
+      if ((await this.db.prepare('SELECT 1 FROM inbox WHERE userId=? AND taskId=? AND actionable=1').get(userId, taskId))) continue;
+      (await this.db.prepare(`INSERT OR IGNORE INTO inbox
+        (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?)`).run(newId('inbox'), project.organizationId, userId,
+          eventSeq, taskId, kind, urgencyRank(DEFAULT_URGENCY[kind]), createdAt));
     }
   }
 
@@ -10603,8 +10635,9 @@ export class Store {
       viewSnapshots, publicationFences, turnSessions, permissionRequests,
       events: Number((await this.db.prepare(`DELETE FROM events WHERE seq IN
         (SELECT e.seq FROM events e WHERE e.ts<?
-          -- An ignored ask is still pending, so only a decision lets it age out.
-          AND (e.type NOT IN (${APPROVAL_ASKS})
+          -- An ignored ask is still pending, so only a decision lets it (and
+          -- the Ignore that keeps it silent) age out.
+          AND (e.type NOT IN (${APPROVAL_ASKS}, ${APPROVAL_DISMISSALS})
             OR EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
               AND r.type IN (${APPROVAL_DECISIONS})
               AND json_extract(r.payload, '$.requestId')=json_extract(e.payload, '$.requestId')))

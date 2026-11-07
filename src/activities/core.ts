@@ -104,6 +104,7 @@ import {
 } from '../integrations/github-actions.js';
 import { isGithubWorkflowPermissionRejection, type GitHubRepositoryPermission } from '../integrations/github-app.js';
 import { mergeCapableUsers } from '../integrations/github-merge-rights.js';
+import { connectionHoldsTask } from '../integrations/connection-requests.js';
 import { cloudGitSource, type CloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, PaymentRegistry, BudgetService, paymentPromptContext } from '../autonomy/payments.js';
 import { defaultParticipant, participantAuthorization } from '../platform/agent-authority.js';
@@ -5193,7 +5194,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     async pendingServiceConnections(taskId: string): Promise<number> {
       return (await store.kvEntries('service-connection:')).filter(row => {
         const c = JSON.parse(row.value);
-        return c.taskId === taskId && (['requested', 'connecting'].includes(c.status) || !c.notifiedAt);
+        return c.taskId === taskId && connectionHoldsTask(c);
       }).length;
     },
 

@@ -212,11 +212,14 @@ describe('connection gateway flow', () => {
     const pending = (await service.request(org, 'notion', taskId, 'do', 'Read Notion'));
     const dismiss = (token?: string) => request(`/api/connections/${pending.id}/dismiss?organizationId=${org}`, { method: 'POST', body: {}, token });
     expect((await dismiss(agent)).status).toBe(403);
+    signal.mockClear();
     const response = await dismiss();
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ status: 'requested', dismissed: { by: 'user:alice' } });
     expect((await service.pending(taskId))).toEqual(expect.arrayContaining([expect.objectContaining({ id: pending.id, dismissed: expect.any(Object) })]));
     expect((await store.eventsOfType(taskId, 'connection.dismissed'))).toEqual([expect.objectContaining({ payload: { requestId: pending.id } })]);
+    // A task waiting on its requests checks them again: an ignored one holds nothing.
+    expect(signal).toHaveBeenCalledWith('connectionsChanged');
     (await service.disconnect(org, pending.id, 'alice'));
   });
   it('announces each change of a task\'s request on the task, once, however it changed', async () => {

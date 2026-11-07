@@ -154,6 +154,9 @@ export const SIG = {
   collaborationRequested: 'collaborationRequested',
   collaborationSettled: 'collaborationSettled',
   resourceResolved: 'resourceResolved',
+  /** One of the task's app-connection requests changed without a message for
+   * its agent (it was ignored): a task waiting on its requests checks again. */
+  connectionsChanged: 'connectionsChanged',
   providerChanged: 'providerChanged',
   confirm: 'confirm',
   openPr: 'openPr',
