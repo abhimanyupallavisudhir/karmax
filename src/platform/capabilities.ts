@@ -201,7 +201,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
     capabilities: [
       ['settings:read', 'View global settings', 'Read global workflow and platform defaults.'],
       ['settings:write', 'Edit global settings', 'Change global workflow and platform defaults.'],
-      ['subscription:gift', 'Gift subscriptions', 'Grant or remove complimentary organization plans.'],
+      ['subscription:gift', 'Gift subscriptions and set prices', 'Grant or remove complimentary plans and packs, or set an organization\'s compute markup.'],
       ['authorization:read', 'View authorization', 'Read profiles, grants, defaults, and the audit log.'],
       ['authorization:write', 'Manage authorization', 'Change profiles, grants, and authorization defaults.'],
       ['user:read', 'View user accounts', 'List human accounts and their access grants.'],

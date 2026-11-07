@@ -130,6 +130,13 @@ describe('Plan & billing', () => {
     expect(operator).toMatch(/value="2" class="plan-gift-count" aria-label="Gifted compute packs"/);
     // A gifted plan is not for sale.
     expect(operator).not.toContain('billing-checkout');
+    // The organization's compute markup: empty is the default, which the placeholder shows.
+    const price = { markupPercent: null, multiplier: 2, defaultMarkupPercent: 100 };
+    expect(markup(entitlements(), status({ canGift: true, computePrice: price })))
+      .toMatch(/id="billing-compute-markup" type="number" min="0" max="1000" step="1" value="" placeholder="100"/);
+    expect(markup(entitlements(), status({ canGift: true, computePrice: { ...price, markupPercent: 30, multiplier: 1.3 } })))
+      .toMatch(/id="billing-compute-markup"[^>]*value="30"/);
+    expect(member).not.toContain('billing-compute-markup');
   });
 
   it('lets a gifted plan buy packs at checkout, and a gifted Individual buy Team', () => {

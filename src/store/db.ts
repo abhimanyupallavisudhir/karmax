@@ -84,12 +84,16 @@ import {
 } from '../domain/types.js';
 import { resourceDriver } from '../domain/resource-drivers.js';
 import {
+  COMPUTE_MARKUP_MAX_PERCENT,
+  COMPUTE_PRICE_MULTIPLIER,
   computeChargeMicros,
+  type ComputePriceChange,
   EntitlementError,
   isHostedPlanId,
   organizationEntitlements,
   type HostedPlanId,
   type OrganizationEntitlements,
+  usageChargeMicros,
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
 import type { TaskTemplateContent } from '../domain/task-templates.js';
@@ -1102,6 +1106,10 @@ export class Store {
       CREATE TABLE IF NOT EXISTS compute_pack_gifts (
         organizationId TEXT PRIMARY KEY, packs INTEGER NOT NULL,
         grantedBy TEXT NOT NULL, grantedAt INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS compute_price_changes (
+        organizationId TEXT NOT NULL, effectiveFrom INTEGER NOT NULL, markupPercent INTEGER,
+        grantedBy TEXT NOT NULL, PRIMARY KEY (organizationId, effectiveFrom)
       );
       CREATE TABLE IF NOT EXISTS subscription_billing_checkouts (
         provider TEXT NOT NULL, checkoutId TEXT NOT NULL, organizationId TEXT NOT NULL,
@@ -2400,6 +2408,64 @@ export class Store {
     await this.setPackGift('compute_pack_gifts', organizationId, packs, grantedBy);
   }
 
+  /** The operator's changes to an organization's compute price, oldest
+   * first (none: the default, COMPUTE_PRICE_MULTIPLIER). */
+  async computePriceChanges(organizationId: string): Promise<ComputePriceChange[]> {
+    return (await this.computePriceChangesByOrganization(organizationId)).get(organizationId) ?? [];
+  }
+
+  /** computePriceChanges of every organization (or one), by organization. */
+  async computePriceChangesByOrganization(organizationId?: string): Promise<Map<string, ComputePriceChange[]>> {
+    const rows = (await this.db.prepare(`SELECT organizationId, effectiveFrom, markupPercent FROM compute_price_changes
+      ${organizationId ? 'WHERE organizationId=? ' : ''}ORDER BY organizationId, effectiveFrom`)
+      .all(...(organizationId ? [organizationId] : []))) as Array<Record<string, unknown>>;
+    const out = new Map<string, ComputePriceChange[]>();
+    for (const row of rows) {
+      const list = out.get(String(row.organizationId)) ?? [];
+      list.push({ from: Number(row.effectiveFrom), markupPercent: row.markupPercent == null ? null : Number(row.markupPercent) });
+      out.set(String(row.organizationId), list);
+    }
+    return out;
+  }
+
+  /** The organization's compute price now: its markup (null: the default),
+   * the multiplier that makes, and who set it when. */
+  async computePrice(organizationId: string, now = Date.now()): Promise<{ markupPercent: number | null; multiplier: number;
+    defaultMarkupPercent: number; grantedBy?: string; grantedAt?: number }> {
+    const row = (await this.db.prepare(`SELECT effectiveFrom, markupPercent, grantedBy FROM compute_price_changes
+      WHERE organizationId=? AND effectiveFrom<=? ORDER BY effectiveFrom DESC LIMIT 1`).get(organizationId, now)) as Record<string, unknown> | undefined;
+    const markupPercent = row?.markupPercent == null ? null : Number(row.markupPercent);
+    return { markupPercent, multiplier: markupPercent == null ? COMPUTE_PRICE_MULTIPLIER : 1 + markupPercent / 100,
+      defaultMarkupPercent: Math.round((COMPUTE_PRICE_MULTIPLIER - 1) * 100),
+      ...(row ? { grantedBy: String(row.grantedBy), grantedAt: Number(row.effectiveFrom) } : {}) };
+  }
+
+  /** The multiplier on the organization's compute at `at`. */
+  async computePriceMultiplier(organizationId: string, at = Date.now()): Promise<number> {
+    return (await this.computePrice(organizationId, at)).multiplier;
+  }
+
+  /** Mark the organization's compute up by `markupPercent` from `at` on (null:
+   * back to the default). Use before `at` keeps the price it had.
+   * SubscriptionBillingService.setComputeMarkup is the caller. */
+  async setComputeMarkup(organizationId: string, markupPercent: number | null, grantedBy: string, at = Date.now()): Promise<void> {
+    await this.db.transaction(async () => {
+      if (markupPercent !== null && (!Number.isSafeInteger(markupPercent) || markupPercent < 0 || markupPercent > COMPUTE_MARKUP_MAX_PERCENT))
+        throw new Error(`compute markup must be a whole percent from 0 to ${COMPUTE_MARKUP_MAX_PERCENT}`);
+      if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
+      (await this.db.lock(`usage:${organizationId}`));
+      const current = await this.computePrice(organizationId, at);
+      if (current.markupPercent === markupPercent) return;
+      // Nothing booked can be repriced: a change takes effect no earlier than the last one.
+      const latest = Number(((await this.db.prepare('SELECT MAX(effectiveFrom) AS latest FROM compute_price_changes WHERE organizationId=?')
+        .get(organizationId)) as { latest?: unknown } | undefined)?.latest ?? 0) || 0;
+      (await this.db.prepare(`INSERT INTO compute_price_changes (organizationId, effectiveFrom, markupPercent, grantedBy)
+        VALUES (?, ?, ?, ?) ON CONFLICT(organizationId, effectiveFrom) DO UPDATE SET markupPercent=excluded.markupPercent, grantedBy=excluded.grantedBy`)
+        .run(organizationId, Math.max(at, latest), markupPercent, grantedBy));
+      this.notifyOrganizationEntitlementsChanged(organizationId);
+    });
+  }
+
   private async setPackGift(table: 'storage_pack_gifts' | 'compute_pack_gifts', organizationId: string, packs: number, grantedBy: string): Promise<void> {
     await this.db.transaction(async () => {
       if (!Number.isSafeInteger(packs) || packs < 0) throw new Error('gifted packs must be a non-negative integer');
@@ -2711,6 +2777,7 @@ export class Store {
       subscription_gifts: (await selectRows(this.db, 'subscription_gifts', 'organizationId=?', [organizationId])),
       storage_pack_gifts: (await selectRows(this.db, 'storage_pack_gifts', 'organizationId=?', [organizationId])),
       compute_pack_gifts: (await selectRows(this.db, 'compute_pack_gifts', 'organizationId=?', [organizationId])),
+      compute_price_changes: (await selectRows(this.db, 'compute_price_changes', 'organizationId=?', [organizationId])),
       subscription_billing_accounts: (await selectRows(this.db, 'subscription_billing_accounts', 'organizationId=?', [organizationId])),
       subscription_billing_checkouts: (await selectRows(this.db, 'subscription_billing_checkouts', 'organizationId=?', [organizationId])),
       subscription_billing_locks: (await selectRows(this.db, 'subscription_billing_locks', 'organizationId=?', [organizationId])),
@@ -2993,6 +3060,7 @@ export class Store {
       (await this.db.prepare('DELETE FROM subscription_gifts WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM storage_pack_gifts WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM compute_pack_gifts WHERE organizationId=?').run(organizationId));
+      (await this.db.prepare('DELETE FROM compute_price_changes WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_billing_accounts WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_billing_checkouts WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_billing_locks WHERE organizationId=?').run(organizationId));
@@ -8883,22 +8951,27 @@ export class Store {
    * usageSummary: everything charged to the compute credit. `organizationId`
    * narrows it to one organization. */
   async managedComputeCosts(from: number, to: number, organizationId?: string): Promise<Array<{
-    organizationId: string; provider: string; costMicros: number; seconds: number }>> {
+    organizationId: string; provider: string; costMicros: number; chargedMicros: number; seconds: number }>> {
     const rows = (await this.db.prepare(`SELECT organizationId, provider, kind, quantity, costMicros, startedAt, endedAt FROM usage_events
       WHERE fundingSource='managed' AND kind IN ('world.active','world.disk','agent.cost')${organizationId ? ' AND organizationId=?' : ''}
         AND startedAt<? AND ((endedAt>startedAt AND endedAt>?) OR (endedAt<=startedAt AND startedAt>=?))`)
       .all(...(organizationId ? [organizationId] : []), to, from, from)) as Array<Record<string, unknown>>;
-    const totals = new Map<string, { organizationId: string; provider: string; costMicros: number; seconds: number }>();
+    const prices = await this.computePriceChangesByOrganization(organizationId);
+    const totals = new Map<string, { organizationId: string; provider: string; costMicros: number; chargedMicros: number; seconds: number }>();
     for (const row of rows) {
       const startedAt = Number(row.startedAt), endedAt = Number(row.endedAt), duration = endedAt - startedAt;
       const share = duration > 0 ? Math.max(0, Math.min(endedAt, to) - Math.max(startedAt, from)) / duration : 1;
       const key = `${row.organizationId}\u0000${row.provider}`;
-      const entry = totals.get(key) ?? { organizationId: String(row.organizationId), provider: String(row.provider), costMicros: 0, seconds: 0 };
+      const entry = totals.get(key) ?? { organizationId: String(row.organizationId), provider: String(row.provider), costMicros: 0, chargedMicros: 0, seconds: 0 };
       entry.costMicros += Number(row.costMicros) * share;
+      // What tavya charges for it: at the organization's price when it ran.
+      entry.chargedMicros += usageChargeMicros(prices.get(String(row.organizationId)) ?? [],
+        { costMicros: Number(row.costMicros), startedAt, endedAt }, from, to);
       if (row.kind === 'world.active') entry.seconds += Number(row.quantity) * share;
       totals.set(key, entry);
     }
-    return [...totals.values()].map((entry) => ({ ...entry, costMicros: Math.round(entry.costMicros), seconds: Math.round(entry.seconds) }));
+    return [...totals.values()].map((entry) => ({ ...entry, costMicros: Math.round(entry.costMicros),
+      chargedMicros: Math.round(entry.chargedMicros), seconds: Math.round(entry.seconds) }));
   }
 
   /** What tavya's included model spent for an organization (wiki
@@ -8970,15 +9043,16 @@ export class Store {
       const existing = (await this.db.prepare('SELECT * FROM compute_holds WHERE id=?').get(input.id)) as Record<string, unknown> | undefined;
       if (existing && existing.organizationId !== input.organizationId) throw new Error('compute hold belongs to another organization');
       const month = monthWindow(now);
-      const used = (await this.managedComputeCosts(month.from, month.to, input.organizationId)).reduce((total, row) => total + row.costMicros, 0);
+      const used = (await this.managedComputeCosts(month.from, month.to, input.organizationId)).reduce((total, row) => total + row.chargedMicros, 0);
       const held = (await this.computeHeldCostMicros(input.organizationId, now, input.id));
+      const multiplier = await this.computePriceMultiplier(input.organizationId, now);
       const startedAt = existing ? Number(existing.startedAt) : now;
       const row = { ...existing, ...input, startedAt, endsAt: now, closedAt: null };
       const booked = (await this.computeBookedUntil(input.organizationId, [input.taskId ?? ''])).get(input.taskId ?? '');
       // What this work has run since its last booked usage is owed whatever happens next.
       const owed = heldCost(row, booked);
-      const free = creditMicros - computeChargeMicros(used + held + owed);
-      const perMs = computeChargeMicros(input.activeMicrosPerHour + input.diskMicrosPerHour) / 3_600_000;
+      const free = creditMicros - used - computeChargeMicros(held + owed, multiplier);
+      const perMs = computeChargeMicros(input.activeMicrosPerHour + input.diskMicrosPerHour, multiplier) / 3_600_000;
       const fits = perMs > 0 ? now + Math.max(0, free) / perMs : Infinity;
       const endsAt = Math.floor(Math.min(input.until, fits));
       if (free <= 0 || endsAt < input.minUntil) return undefined;

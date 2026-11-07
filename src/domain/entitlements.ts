@@ -71,9 +71,45 @@ export const FREE_COMPUTER = Object.freeze({ cpu: 2, memoryMb: 4096, diskGb: 40 
  * one number behind every compute price tavya shows. */
 export const COMPUTE_PRICE_MULTIPLIER = 2;
 
-/** What tavya charges for compute the provider prices at `costMicros`. */
-export function computeChargeMicros(costMicros: number): number {
-  return Math.round(Math.max(0, Number(costMicros) || 0) * COMPUTE_PRICE_MULTIPLIER);
+/** The most an operator may mark one organization's compute up, in percent
+ * of the provider's price (COMPUTE_PRICE_MULTIPLIER − 1 is the default). */
+export const COMPUTE_MARKUP_MAX_PERCENT = 1_000;
+
+/** What tavya charges for compute the provider prices at `costMicros`, at
+ * `multiplier` (the organization's, computePriceMultiplier; else the default). */
+export function computeChargeMicros(costMicros: number, multiplier = COMPUTE_PRICE_MULTIPLIER): number {
+  return Math.round(Math.max(0, Number(costMicros) || 0) * multiplier);
+}
+
+/** An operator's change to one organization's compute price: from `from` on,
+ * the provider's price marked up by `markupPercent` (null: the default). */
+export interface ComputePriceChange { from: number; markupPercent: number | null }
+
+/** The multiplier `changes` (ascending by `from`) put in effect at `at`. */
+export function computeMultiplierAt(changes: readonly ComputePriceChange[], at: number): number {
+  let markup: number | null = null;
+  for (const change of changes) if (change.from <= at) markup = change.markupPercent; else break;
+  return markup == null ? COMPUTE_PRICE_MULTIPLIER : 1 + markup / 100;
+}
+
+/** What tavya charges for usage the provider priced at `costMicros` over
+ * [startedAt, endedAt) (an instant when endedAt ≤ startedAt), counting only
+ * its part inside [from, to), each slice at the price then in effect: a
+ * price change applies from when it was made, never to earlier use.
+ * Unrounded, for summing. */
+export function usageChargeMicros(changes: readonly ComputePriceChange[], usage: { costMicros: number; startedAt: number; endedAt: number },
+  from = -Infinity, to = Infinity): number {
+  const cost = Math.max(0, Number(usage.costMicros) || 0);
+  const duration = usage.endedAt - usage.startedAt;
+  if (!(duration > 0)) return usage.startedAt >= from && usage.startedAt < to ? cost * computeMultiplierAt(changes, usage.startedAt) : 0;
+  const start = Math.max(usage.startedAt, from), end = Math.min(usage.endedAt, to);
+  let charged = 0;
+  for (let at = start; at < end;) {
+    const next = Math.min(end, changes.find((change) => change.from > at)?.from ?? Infinity);
+    charged += cost * (next - at) / duration * computeMultiplierAt(changes, at);
+    at = next;
+  }
+  return charged;
 }
 
 /** Launch-plan catalog and pricing source of truth. */

@@ -73,7 +73,18 @@ it('gifts, changes, and removes plans from the organization billing screen throu
     expect(provider.calls).toHaveLength(0);
     // The card re-renders after each save; typing before that is thrown away.
     await expect.poll(() => plan.locator('.billing-gift-packs[data-kind="compute"]').isEnabled()).toBe(true);
+    // The organization's compute markup: from now on, and empty goes back to the default.
+    expect(await page.getByRole('spinbutton', { name: 'Compute markup' }).getAttribute('placeholder')).toBe('100');
+    await page.getByRole('spinbutton', { name: 'Compute markup' }).fill('30');
+    await plan.locator('.billing-compute-markup').click();
+    await expect.poll(async () => (await store.computePrice(recipient.id)).multiplier).toBe(1.3);
+    await expect.poll(() => page.getByRole('spinbutton', { name: 'Compute markup' }).inputValue()).toBe('30');
+    await expect.poll(() => plan.locator('.billing-compute-markup').isEnabled()).toBe(true);
     if (process.env.KARMAX_REVIEW_SCREENSHOT) await page.locator('#org-plan').screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT });
+    await page.getByRole('spinbutton', { name: 'Compute markup' }).fill('');
+    await plan.locator('.billing-compute-markup').click();
+    await expect.poll(async () => (await store.computePrice(recipient.id)).markupPercent).toBeNull();
+    await expect.poll(() => plan.locator('.billing-compute-markup').isEnabled()).toBe(true);
     await page.getByRole('spinbutton', { name: 'Gifted storage packs' }).fill('0');
     await plan.locator('.billing-gift-packs[data-kind="storage"]').click();
     await expect.poll(async () => (await store.organizationEntitlements(recipient.id)).giftedStoragePacks).toBe(0);
