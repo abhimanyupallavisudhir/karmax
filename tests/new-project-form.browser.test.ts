@@ -63,6 +63,29 @@ describe('New project form', () => {
     await ui.close();
   });
 
+  it('without GitHub, says tavya will store the code and offers to connect GitHub, once', async () => {
+    const { ui, dialog } = await form({ github: false, hosted: true, hostsRepositories: true });
+    const notice = dialog.getByRole('note');
+    await expect.poll(() => notice.innerText()).toMatch(/No GitHub account connected\. \S+ will store your code\./);
+    // Why GitHub is better is the tip's to say, not the dialog's.
+    expect(await notice.locator('[data-tip], [title]').first().evaluate((element) => element.getAttribute('data-tip') || element.getAttribute('title')))
+      .toMatch(/best experience/i);
+    await notice.getByRole('button', { name: 'Connect GitHub', exact: true }).click();
+    await expect.poll(() => ui.calls.some((call) => call.method === 'POST' && call.path === '/api/organizations/o/github/install-url')).toBe(true);
+    // Choosing other repositories shows the GitHub row, which says the same with its own Connect.
+    await dialog.getByRole('radio', { name: 'Choose other repositories' }).check();
+    expect(await notice.isVisible()).toBe(false);
+    expect(await dialog.locator('.np-github').innerText()).toMatch(/No GitHub account connected\. \S+ will store your code\./);
+    expect(await dialog.getByRole('button', { name: 'Connect GitHub', exact: true }).count()).toBe(1);
+    await ui.close();
+
+    // With GitHub connected the code goes to GitHub: nothing to say.
+    const connected = await form({ hostsRepositories: true });
+    await connected.dialog.getByRole('radio', { name: /Create new GitHub repo/ }).waitFor();
+    expect(await connected.dialog.getByRole('note').count()).toBe(0);
+    await connected.ui.close();
+  });
+
   it('creates a tavya repository from the picker as tavya/<name>, beside GitHub\'s', async () => {
     const { ui, dialog } = await form({ hostsRepositories: true });
     await dialog.getByRole('radio', { name: 'Choose other repositories' }).check();

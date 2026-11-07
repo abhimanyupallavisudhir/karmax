@@ -21367,13 +21367,21 @@ function wireRepositoryPicker(input, { repositories, gitConnections = [], create
 }
 // The GitHub row's value and actions: the organization's connected accounts,
 // or the step that connects them. `ids` name its buttons.
+// Without GitHub an organization's code is kept on tavya (wiki
+// features/hosted-repositories). Where that is decided, it is said, with
+// GitHub one click away.
+const codeOnTavya = ({ githubApp, gitConnections, githubLoadError }) =>
+  !!S.meta?.hostsRepositories && !!githubApp?.configured && !githubLoadError && !gitConnections?.length;
+const noGithubText = () => `<span class="no-github-text">No GitHub account connected. ${esc(siteName())} will store your code.</span>`;
+const noGithubTip = () => policyTip(`For the best experience, connect GitHub: pull requests, GitHub Actions and collaborators outside ${siteName()}. A repository moves to GitHub anytime from its project’s settings.`);
 function githubAccessView({ githubApp, gitConnections, githubLoadError }, organizationId, ids) {
   const organizationLink = `${globalRoute('organization', organizationById(organizationId))}#settings-code`;
   const needsUpdate = gitConnections.some((connection) => connection.permissionStatus && !connection.permissionStatus.ready);
   return githubLoadError ? { value: `<span id="${ids.error}"></span>`, actions: '' }
     : !githubApp.configured ? { value: `<span class="setting-muted">Not set up</span>${S.installationAccess ? '' : policyTip('Your administrator needs to set up GitHub first.')}`,
       actions: S.installationAccess ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-github">Set up</a>` : '' }
-    : !gitConnections.length ? { value: '<span class="setting-muted">Not connected</span>', actions: `<button class="btn sm primary" id="${ids.connect}" type="button">Connect GitHub</button>` }
+    : !gitConnections.length ? { value: codeOnTavya({ githubApp, gitConnections, githubLoadError }) ? `<span class="no-github">${noGithubText()} ${noGithubTip()}</span>` : '<span class="setting-muted">Not connected</span>',
+      actions: `<button class="btn sm primary" id="${ids.connect}" type="button">Connect GitHub</button>` }
     : { value: `${gitConnections.map((connection) => `<b>${esc(connection.accountLogin)}</b>`).join('<span class="setting-sep">·</span>')}${needsUpdate ? '<span class="chip setting-warn" title="Approve GitHub’s updated access in organization settings">Needs update</span>' : ''}`,
       actions: `<button class="icon-btn" id="${ids.refresh}" type="button" title="Refresh repository list" aria-label="Refresh repository list">↻</button><a class="btn sm" data-spa href="${organizationLink}">Manage</a>` };
 }
@@ -27040,6 +27048,7 @@ function newProject(options) {
     <div class="new-project-head"><b id="new-project-title">New project</b><button class="icon-btn new-project-close" type="button" aria-label="Close">×</button></div>
     <label class="form-row"><span>Project name ${policyTip('Use / to put it in folders, e.g. Clients/Website.')}</span><input id="new-project-name" aria-label="Project name" placeholder="e.g. Work/Clients/Website" required autocomplete="off" spellcheck="false" value="${esc(folder ? `${folder}/` : '')}"></label>
     <div class="np-default" hidden></div>
+    <div class="np-no-github" role="note" hidden></div>
     <div class="np-section np-repos"><div class="np-h">Git &amp; GitHub</div><div class="np-git"><div class="np-loading">Loading…</div></div></div>
     <details class="np-fold"><summary>Secrets</summary>
       <textarea class="np-secrets" aria-label="Secrets" rows="3" spellcheck="false" autocomplete="off" placeholder="KEY=value, one per line, or paste a .env"></textarea>
@@ -27089,18 +27098,32 @@ function newProject(options) {
     if (!chosen.create.name) return [];
     return [chosen.hosted ? `tavya:repo_new/${chosen.create.name}.git` : `git@github.com:${chosen.slug}.git`];
   };
+  // While the code goes to tavya, it says so (the GitHub row, hidden then, would).
+  const renderNoGithub = () => {
+    const notice = $in('.np-no-github');
+    const show = usingDefault() && !!defaultRepository()?.hosted && codeOnTavya(github);
+    if (show && !notice.childElementCount) {
+      notice.innerHTML = `<span class="tf-ready-mark" aria-hidden="true">!</span>${noGithubText()}<button class="np-no-github-connect" type="button" id="np-no-github-connect">Connect GitHub</button>${noGithubTip()}`;
+      notice.querySelector('#np-no-github-connect').addEventListener('click', async () => {
+        try { await connectOrganizationGithub(organizationId, async () => { useDefault = true; await loadGithub(); }); }
+        catch (error) { toast(error.message, true); }
+      });
+    }
+    notice.hidden = !show;
+  };
   const renderDefault = () => {
     const row = $in('.np-default');
     const chosen = defaultRepository();
     row.hidden = !chosen;
     $in('.np-repos').hidden = usingDefault();
+    renderNoGithub();
     if (!chosen) return renderInstall();
     const kind = chosen.existing ? 'existing' : chosen.blocked ? 'blocked' : 'create';
     const label = chosen.hosted ? (kind === 'existing' ? 'Work on existing repo' : 'Create new repo')
       : kind === 'existing' ? 'Work on existing GitHub repo' : 'Create new GitHub repo';
     const blank = '<span class="np-default-blank">project-name</span>';
     const slug = chosen.blocked ? '' : chosen.existing || chosen.create.name ? esc(chosen.slug) : chosen.hosted ? blank : `${esc(chosen.owner)}/${blank}`;
-    const where = chosen.hosted ? policyTip(`Kept on ${siteName()}. Move it to GitHub anytime from the project’s settings.`) : '';
+    const where = chosen.hosted && !codeOnTavya(github) ? policyTip(`Kept on ${siteName()}. Move it to GitHub anytime from the project’s settings.`) : '';
     const labelHtml = `${label}${slug ? ` <code>${slug}</code>` : ''}${where}`;
     if (row.dataset.kind === kind) { row.querySelector('.np-default-label').innerHTML = labelHtml; return renderInstall(); }
     row.dataset.kind = kind;

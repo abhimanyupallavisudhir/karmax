@@ -442,6 +442,20 @@ describe('Project settings', () => {
     await ui.close();
   });
 
+  it('says a project without GitHub keeps its code on tavya, beside the one Connect GitHub', async () => {
+    const project = { id: 'p', organizationId: 'o', name: 'Workspace', config: { repos: ['tavya:repo_abc/notes.git'] } };
+    const ui = await settings({ projects: [project], api: ({ method, path: route }) => method !== 'GET' ? undefined
+      : route === '/api/meta' ? { siteName: 'Fixture', hosted: true, hostLocal: false, hostsRepositories: true, consoleRevision: 'one', agent: { provider: 'mock' }, worldProviders: [] }
+        : route === '/api/projects' ? [project] : route === '/api/projects/p' ? project
+          : route.endsWith('/organizations/o/repositories') ? [{ id: 'repo_abc', provider: 'tavya', owner: 'o', name: 'notes', sshUrl: 'tavya:repo_abc/notes.git' }]
+            : route.endsWith('/github/app') ? { configured: true } : undefined });
+    const row = ui.page.locator('#project-github-access');
+    await expect.poll(() => row.innerText()).toMatch(/No GitHub account connected\. Fixture will store your code\./);
+    expect(await row.getByRole('button', { name: 'Connect GitHub', exact: true }).count()).toBe(1);
+    expect(await ui.page.getByRole('button', { name: 'Connect GitHub', exact: true }).count()).toBe(1);
+    await ui.close();
+  });
+
   it('resets the actual scroll container when switching settings panes', async () => {
     const ui = await settings();
     const scroller = ui.page.locator('.main').first();
