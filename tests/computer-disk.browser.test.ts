@@ -67,7 +67,9 @@ it('shows Out of disk with Bigger disk up to the ceiling, and explains a disable
     wireActions(window.__view);
   `);
   await render(22_528);
-  expect(await ui.page.locator('#main .chip').textContent()).toBe('Out of disk');
+  const status = ui.page.locator('#main .status');
+  expect(await status.textContent()).toBe('Out of disk');
+  expect(await status.evaluate((node) => node.classList.contains('failed'))).toBe(true);
   const bigger = ui.page.getByRole('button', { name: 'Bigger disk' });
   expect(await bigger.isEnabled()).toBe(true);
   expect(await bigger.getAttribute('title')).toBe('Grow the disk from 22 to 29 GB');
