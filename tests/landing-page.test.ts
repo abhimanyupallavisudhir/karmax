@@ -92,35 +92,28 @@ describe('public landing page', () => {
     await ui.close();
   });
 
-  it('opens on its line and a task list drawn with the console\'s parts', async () => {
+  it('opens on its line, then the launch film, playing silently on the first screen', async () => {
     const ui = await landing({ viewport: { width: 1440, height: 900 } });
     const { page } = ui;
     expect(await page.locator('#landing-title').innerText()).toBe('The agentic to-do list that finishes itself.');
     expect(await page.locator('.lp-lede').innerText()).toBe('Write down what needs doing. Agents do it on their own computers, in parallel, and you review the result.');
-    // The list holds every kind of work, each with its agent's status, as the console's rows do.
-    const rows = await page.locator('.lp-row').evaluateAll((items) => items.map((item: any) => [item.querySelector('code').textContent, item.querySelector('.lp-chip').textContent]));
-    expect(rows).toEqual([['personal-website', 'Done'], ['tavya', 'Working'], ['takehomev2', 'Working'], ['admin_docs', 'Needs input'], ['legibench3', 'In review']]);
-    // It starts on the first screen, under the line and its buttons.
-    expect((await page.locator('.lp-list').boundingBox())!.y).toBeLessThan(900);
     expect(await page.locator('.lp-hero .landing-start').innerText()).toBe('Get started');
-    expect(ui.errors).toEqual([]);
-    await ui.close();
-  });
-
-  it('plays the film only when asked, with sound, and stops it when closed', async () => {
-    const ui = await landing();
-    const { page } = ui;
-    const film = page.locator('#lp-film video');
+    const film = page.locator('#lp-film');
     expect(await film.getAttribute('src')).toBe('/media/tavya-launch.mp4');
     expect(await film.getAttribute('poster')).toBe('/media/tavya-launch-poster.jpg');
-    expect(await film.evaluate((video: any) => ({ preload: video.preload, paused: video.paused, controls: video.controls, muted: video.muted })))
-      .toEqual({ preload: 'none', paused: true, controls: true, muted: false });
-    expect(await page.locator('#lp-film').isVisible()).toBe(false);
-    await page.locator('#lp-film-open').click();
-    expect(await page.locator('#lp-film').isVisible()).toBe(true);
-    await page.locator('.lp-film-close').click();
-    expect(await page.locator('#lp-film').isVisible()).toBe(false);
-    expect(await film.evaluate((video: any) => video.paused)).toBe(true);
+    expect(await film.evaluate((video: any) => ({ muted: video.muted, loop: video.loop, inline: video.playsInline, controls: video.controls })))
+      .toEqual({ muted: true, loop: true, inline: true, controls: false });
+    // It is the hero's picture: right under the line and its button, starting on the first screen.
+    const order = await page.evaluate(() => [...document.querySelectorAll('#landing-title, .lp-hero .landing-start, #lp-film, .lp-steps')].map((el) => el.id || el.className.split(' ')[0]));
+    expect(order).toEqual(['landing-title', 'landing-hero-start', 'lp-film', 'lp-steps']);
+    expect((await film.boundingBox())!.y).toBeLessThan(900 * 0.75);
+    expect(await page.locator('.lp-list, dialog').count()).toBe(0);
+    // Watch with sound: from the top, with sound and the player's controls.
+    await page.locator('#lp-sound').click();
+    expect(await film.evaluate((video: any) => ({ muted: video.muted, loop: video.loop, controls: video.controls, early: video.currentTime < 1 })))
+      .toEqual({ muted: false, loop: false, controls: true, early: true });
+    expect(await page.locator('#lp-sound').isVisible()).toBe(false);
+    expect(ui.errors).toEqual([]);
     await ui.close();
   });
 
@@ -148,7 +141,7 @@ describe('public landing page', () => {
     // Pictures are described once (the dark copy is hidden from assistive technology).
     expect(await page.locator('.lp-step img.lp-light').evaluateAll((images) => images.every((img: any) => img.alt.length > 10))).toBe(true);
     expect(await page.locator('.lp-shot img.lp-dark').evaluateAll((images) => images.every((img: any) => img.getAttribute('aria-hidden') === 'true'))).toBe(true);
-    for (const retired of ['vscode was a fancy text editor.', 'Leave the permanent underclass today.', 'Watch with sound'])
+    for (const retired of ['vscode was a fancy text editor.', 'Leave the permanent underclass today.'])
       expect(await page.locator('.landing-page').innerText()).not.toContain(retired);
     await ui.close();
   });
@@ -232,12 +225,12 @@ describe('public landing page', () => {
     }
     expect(await navHeight()).toBe(58);
     await ui.close();
-    // Nothing moves on its own: the film waits to be asked for, with or without reduced motion.
+    // With reduced motion the film waits to be played.
     const still = await consolePage({ viewport: { width: 1280, height: 900 } });
     await still.page.emulateMedia({ reducedMotion: 'reduce' });
     await still.run(`S.meta = { siteName: 'tavya' }; renderLanding()`);
-    expect(await still.page.locator('#lp-film video').evaluate((video: any) => video.paused)).toBe(true);
-    expect(await still.page.locator('.lp-list').evaluate((element) => getComputedStyle(element).opacity)).toBe('1');
+    await still.page.waitForTimeout(600);
+    expect(await still.page.locator('#lp-film').evaluate((video: any) => video.paused)).toBe(true);
     await still.close();
   });
 
