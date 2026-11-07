@@ -24,7 +24,7 @@ it('a Developer\'s agent messages any task of its project, and does nothing else
   const mine = await create(project.id, 'Mine');
   const theirs = await create(project.id, 'Theirs');
   const foreign = await create(elsewhere.id, 'Foreign');
-  const view = { title: 'x', workflow: 'software-dev', stage: 'do', status: 'active', messages: [], actions: [], state: {}, updatedAt: 1 };
+  const view = { title: 'x', workflow: 'software-dev', stage: 'do', status: 'active', messages: [], actions: [{ name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true }], state: {}, updatedAt: 1 };
   for (const task of [theirs, foreign]) await store.saveView(task.id, { ...view, taskId: task.id } as any);
 
   const tokens = new TokenAuthority(store);
@@ -84,7 +84,7 @@ it("an agent acting for a person speaks as its task, never as the person", async
   const parent = await create('Parent');
   const child = await create('Child');
   await store.saveView(child.id, { title: 'Child', workflow: 'software-dev', stage: 'do', status: 'active',
-    messages: [], actions: [], state: {}, updatedAt: 1, taskId: child.id } as any);
+    messages: [], actions: [{ name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true }], state: {}, updatedAt: 1, taskId: child.id } as any);
   const tokens = new TokenAuthority(store);
   const person = (await tokens.mintPrincipal('user:owner', await authz.capabilities('user:owner', project.id), project.id)).token;
   // How a task the person queued mints its agent's token.

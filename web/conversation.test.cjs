@@ -258,7 +258,7 @@ eval(extractFn('presenceDetail'));
 eval(extractFn('conversationWaitNotice'));
 eval(extractFn('contentKey'));
 eval(extractFn('conversationFullscreenButton'));
-for (const fn of ['hasMessageForm', 'agentEntryText', 'liveFormIndex', 'conversationEntryKey', 'conversationFoldHtml', 'loadForkHistory', 'inheritedConversationHtml', 'conversationSearchKey', 'conversationSearchOpen', 'conversationSearchBar', 'conversationPane']) eval(extractFn(fn));
+for (const fn of ['hasMessageForm', 'agentEntryText', 'liveFormIndex', 'conversationEntryKey', 'conversationFoldHtml', 'loadForkHistory', 'inheritedConversationHtml', 'conversationSearchKey', 'conversationSearchOpen', 'conversationSearchBar', 'pendingMessagesHtml', 'conversationPane']) eval(extractFn(fn));
 global.fmtKeys = (keys) => keys;
 eval(extractFn('conversationBar'));
 for (const fn of ['humanWaitDetail', 'conversationOutline', 'foldDuration', 'foldPreview', 'conversationFoldHead']) eval(extractFn(fn));
@@ -442,6 +442,24 @@ S.taskEvents = [annotation];
 ok(conversationPane({ ...revisionView, status: 'active', waitingFor: undefined }, laterTranscript)
   .indexOf('Choose a deployment target.') < conversationPane({ ...revisionView, status: 'active', waitingFor: undefined }, laterTranscript)
   .indexOf('Later follow-up'), 'resolved revision-stamped request survives a bounded history reload in order');
+
+// A message that waited is never lost (wiki features/queued-messages): it shows
+// with its clock and copy button; Unsend only where there is a box to take it into.
+{
+  global.ICON.clock = '<svg data-icon="clock"></svg>';
+  const stubbedCopy = global.messageCopyButton;
+  global.messageCopyButton = (text) => `<button class="msg-copy" data-copy-msg="${text}"></button>`;
+  const kept = { message: { id: 'u9', role: 'user', text: 'Write it as CSV', ts: 1710000040000 }, role: 'do', mine: true };
+  const live = pendingMessagesHtml({ ...revisionView, status: 'active', pendingMessages: [kept] }, { role: 'do' }, [], true);
+  ok(live.includes('data-pending="u9"') && live.includes('Write it as CSV') && live.includes('Not sent yet.') && live.includes('unsend-pending'),
+    'a kept message shows as not sent, with Unsend for its sender');
+  const ended = pendingMessagesHtml({ ...revisionView, status: 'cancelled', pendingMessages: [kept] }, { role: 'do' }, [], false);
+  ok(ended.includes('Write it as CSV') && ended.includes('the task ended') && !ended.includes('unsend-pending') && ended.includes('data-copy-msg="Write it as CSV"'),
+    'when its task ended first it stays on screen, copyable, without Unsend into a box that is gone');
+  ok(!pendingMessagesHtml({ ...revisionView, pendingMessages: [kept] }, { role: 'do' }, [{ type: 'message', message: kept.message }], true),
+    'once delivered it shows only as said');
+  global.messageCopyButton = stubbedCopy;
+}
 
 forkFormsChecked.then(() => {
   console.log(`\n${pass} passed, ${fail} failed`);

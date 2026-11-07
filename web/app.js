@@ -5640,12 +5640,16 @@ function connectWs() {
       }
       // The fork happened (its first turn copied the session): what it inherited is cut there.
       if (ev.type === 'session.forked') S.forkHistory = {};
+      // A message of mine that waited carried the work on in a new task (after Confirm).
+      if (ev.type === 'conversation.pending') for (const { messageId, task } of ev.payload?.continued || [])
+        if (S.view?.pendingMessages?.some((p) => p.mine && p.message.id === messageId)) toast(`Continued in #${task.num ?? task.id}`);
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
         refreshTask(ev.type);
       } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.startsWith('connection.') || ev.type.endsWith('.approval-dismissed')
         // A draft sub-task saved, queued or started: only the server's summaries know it.
-        || ev.type === 'subtask.created' || ev.type === 'subtask.queued' || ev.type === 'subtask.started') {
+        || ev.type === 'subtask.created' || ev.type === 'subtask.queued' || ev.type === 'subtask.started'
+        || ev.type === 'conversation.pending') {
         // Mid-turn metadata changes must not clear output or patch lifecycle state.
         refreshTask(ev.type);
       } else if (ev.type !== 'agent.output') scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
@@ -13485,6 +13489,24 @@ function inheritedConversationHtml(v, t, opened) {
   }).join('');
 }
 
+// Messages said while the task could not take them (wiki features/queued-messages):
+// shown where they were said, marked with a clock until the agent gets them.
+// Their sender may take one back into the box to edit it, or to Continue.
+// A message is never lost: where there is no box to take it back into (the
+// task ended), it stays, with its copy button.
+function pendingMessagesHtml(v, t, entries, canUnsend) {
+  const ended = ['done', 'cancelled', 'failed'].includes(v.status);
+  const tip = ended ? 'Not sent: the task ended before its agent could take it.' : 'Not sent yet. The agent gets it as soon as it can take messages.';
+  const said = new Set(entries.filter((entry) => entry.type === 'message').map((entry) => entry.message.id));
+  return (v.pendingMessages || []).filter((p) => p.role === t.role && !said.has(p.message.id)).map((p) => {
+    const html = renderConversationEntry({ type: 'message', message: p.message }, v);
+    const mark = `<button type="button" class="info-dot pending-mark" title="${esc(tip)}" aria-label="${esc(tip)}">${ICON.clock}</button>`;
+    const unsend = p.mine && canUnsend ? `<button type="button" class="btn sm ghost unsend-pending" data-pending-id="${esc(p.message.id)}" title="Take it back to edit">Unsend</button>` : '';
+    return html.replace('<div class="msg ', `<div data-pending="${esc(p.message.id)}" class="msg pending `)
+      .replace('<span class="msg-meta-gap"></span>', `${mark}<span class="msg-meta-gap"></span>${unsend}`);
+  }).join('');
+}
+
 function conversationPane(v, t) {
   if (!t) return '<div class="empty"><div class="big">No conversations yet</div>Agents appear here once the workflow starts one.</div>';
   const entries = conversationEntries(t);
@@ -13535,6 +13557,7 @@ function conversationPane(v, t) {
     : row(item.entry, item === land ? ' data-land' : item === question ? ' data-land-question' : '')).join('')
     || (historyStatus || inherited ? '' : '<div class="msg system">No messages yet</div>'));
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
+  const pending = pendingMessagesHtml(v, t, entries, canFollowUp);
   const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
         <div class="prompt-field">
@@ -13548,7 +13571,7 @@ function conversationPane(v, t) {
       </div></div>`
     : '';
   return `${conversationSearchBar(v, t)}
-    <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}${conversationWaitNotice(v)}${conversationError(v)}${conversationApprovalRequests()}${conversationPullRequestAsks(v)}${conversationReviewInfo(v, resourceRequestIndex >= 0)}</div></div>
+    <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${pending}${live}${conversationWaitNotice(v)}${conversationError(v)}${conversationApprovalRequests()}${conversationPullRequestAsks(v)}${conversationReviewInfo(v, resourceRequestIndex >= 0)}</div></div>
     ${fu}`;
 }
 
@@ -16683,6 +16706,7 @@ function showSentReply(v, role, result, repaint = true) {
 function wireFollowups(v) {
   if (!S.followupImages) S.followupImages = {};
   if (!S.followupFiles) S.followupFiles = {};
+  $('#main').querySelectorAll('.unsend-pending').forEach((btn) => btn.addEventListener('click', () => unsendPending(v, btn)));
   $('#main').querySelectorAll('.followup-box').forEach((box) => {
     const role = box.dataset.role;
     const ta = box.querySelector('.followup-input');
@@ -16749,7 +16773,12 @@ function wireFollowups(v) {
           followContinuation(v, result);
           return;
         }
-        showSentReply(v, role, result, false);
+        const queued = !!result?.message?.queued;
+        if (queued) {
+          const { queued: _queued, ...message } = result.message;
+          S.view.pendingMessages = [...(S.view.pendingMessages || []).filter((p) => p.message.id !== message.id),
+            { message, role, mine: true }];
+        } else showSentReply(v, role, result, false);
         // Clear the persisted draft + image store FIRST, so neither the re-render
         // below nor a background refresh can repopulate the box from them. The box
         // content is sourced from S.followupDrafts on every render, so this — not
@@ -16771,7 +16800,7 @@ function wireFollowups(v) {
         // after a reply; f composes again. The repaint then focuses the thread.
         const active = document.activeElement;
         if (active?.closest?.('.followup-box')?.dataset.role === role) active.blur();
-        toast(shared && to && (to.length > 1 || to[0] !== 'agent:do')
+        toast(queued ? 'Queued' : shared && to && (to.length > 1 || to[0] !== 'agent:do')
           ? `Sent to ${to.map((selector) => recipientLabel(selector, v)).join(', ')}` : 'Follow-up sent');
         showSentReply(v, role, null);
       } catch (e) { toast(e.message, true); }
@@ -16785,6 +16814,27 @@ function wireFollowups(v) {
     // ⌘/Ctrl-Enter sends, matching the rest of the console's compose affordances.
     ta.addEventListener('keydown', (e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); send(); } });
   });
+}
+
+// Take a queued message back into its box: its text and attachments, ahead of
+// anything already typed there.
+async function unsendPending(v, btn) {
+  btn.disabled = true;
+  try {
+    const { message, role } = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/messages/${encodeURIComponent(btn.dataset.pendingId)}`, { method: 'DELETE' });
+    const key = `${v.taskId}/${role}`;
+    const typed = S.followupDrafts[key] || '';
+    S.followupDrafts[key] = typed ? `${message.text}\n\n${typed}` : message.text;
+    (S.followupImages[key] ||= []).unshift(...(message.images || []));
+    (S.followupFiles[key] ||= []).unshift(...(message.files || []));
+    if (S.view?.taskId === v.taskId) S.view.pendingMessages = (S.view.pendingMessages || []).filter((p) => p.message.id !== message.id);
+    renderTaskPage();
+    const sel = window.CSS && CSS.escape ? CSS.escape(role) : role;
+    $('#main').querySelector(`.followup-box[data-role="${sel}"] .followup-input`)?.focus();
+  } catch (e) {
+    toast(e.message, true);
+    refreshTask('conversation.pending');
+  }
 }
 
 function updateLiveBubble(role) {

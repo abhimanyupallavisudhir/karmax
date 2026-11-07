@@ -450,7 +450,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/\/artifacts(?:\/promote)?$/.test(p) || /^\/api\/artifacts\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/preview-leases$/.test(p) || /^\/api\/preview-leases\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/signal$/.test(p) || /^\/api\/tasks\/[^/]+\/agents\/[^/]+\/stop$/.test(p)) return 'task:signal';
-  if (/^\/api\/tasks\/[^/]+\/messages$/.test(p)) return 'task:conversation:message';
+  if (/^\/api\/tasks\/[^/]+\/messages(?:\/[^/]+)?$/.test(p)) return 'task:conversation:message';
   if (/\/escalate$/.test(p)) return 'task:escalate';
   if (p.startsWith('/api/tasks/')) return read ? 'task:read' : method === 'DELETE' ? 'task:delete' : 'task:edit';
   if (p === '/api/skills') return 'skill:write';
@@ -5911,6 +5911,10 @@ export class Gateway {
       const stopAgentMatch = p.match(/^\/api\/tasks\/([^/]+)\/agents\/([^/]+)\/stop$/);
       if (stopAgentMatch && method === 'POST')
         return this.json(res, 200, { ok: true, ...(await api.stopAgent(token, stopAgentMatch[1]!, decodeURIComponent(stopAgentMatch[2]!))) });
+      // Take back a message that is still waiting for its task (wiki features/queued-messages).
+      const unsendMatch = p.match(/^\/api\/tasks\/([^/]+)\/messages\/([^/]+)$/);
+      if (unsendMatch && method === 'DELETE')
+        return this.json(res, 200, { ok: true, ...(await api.unsendMessage(token, unsendMatch[1]!, decodeURIComponent(unsendMatch[2]!))) });
       const messageMatch = p.match(/^\/api\/tasks\/([^/]+)\/messages$/);
       if (messageMatch && method === 'POST') {
         const b = await this.body(req);

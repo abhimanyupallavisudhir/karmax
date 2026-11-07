@@ -165,7 +165,7 @@ describe('continue after Confirm', () => {
     const owner = await f.tokenFor('user:owner');
     // Landing waits on a person: the message goes to the agent, as that wait says.
     await f.store.saveView(f.source.id, { ...f.landed, stage: 'merge', status: 'waiting',
-      waitingFor: { kind: 'human', audience: ['@creator'], detail: 'Send guidance to the Do agent.' }, actions: [] });
+      waitingFor: { kind: 'human', audience: ['@creator'], detail: 'Send guidance to the Do agent.' }, actions: [{ name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true }] });
     expect((await f.api.getTaskView(owner, f.source.id))?.actions.some((action) => action.label === 'Continue')).toBe(false);
     expect((await f.api.postTaskMessage(owner, f.source.id, { text: 'Fix the lockfile' })).continuedIn).toBeUndefined();
     expect(f.signals).toHaveLength(1);

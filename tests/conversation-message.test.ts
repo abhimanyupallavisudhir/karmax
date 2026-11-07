@@ -32,7 +32,7 @@ describe('conversation message events', () => {
       stage: 'do',
       status: 'active',
       messages: [{ id: 'm0', role: 'user', text: 'start', ts: 1 }],
-      actions: [],
+      actions: [{ name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true }],
       state: {},
       updatedAt: 1,
     }));
@@ -84,7 +84,7 @@ describe('conversation message events', () => {
     }));
     (await store.saveView(task.id, {
       taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'active',
-      messages: [], actions: [], state: {}, updatedAt: 1,
+      messages: [], actions: [{ name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true }], state: {}, updatedAt: 1,
     }));
     const signal = vi.fn(async () => undefined);
     const api = new KarmaxApi({ store, client: { workflow: { getHandle: () => ({ signal }) } } as any, taskQueue: 'test', tokens });

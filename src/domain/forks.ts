@@ -48,8 +48,9 @@ export function continuesInNewTask(
 }
 
 /** What `message_agent` tells the agent that sent a message. */
-export function continuedReply(continuedIn?: { id: string; num?: number }): string {
+export function continuedReply(continuedIn?: { id: string; num?: number }, queued?: boolean): string {
   return continuedIn
     ? `That task's proposal is confirmed, so its agent continues in a new task: ${continuedIn.num != null ? `#${continuedIn.num} ` : ''}(${continuedIn.id}).`
-    : 'message delivered';
+    : queued ? 'message queued: that task is between stages, and its agent gets it as soon as it can take messages'
+      : 'message delivered';
 }
