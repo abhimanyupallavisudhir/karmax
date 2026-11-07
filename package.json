@@ -56,7 +56,7 @@
     "@temporalio/worker": "^1.24.0",
     "@temporalio/workflow": "^1.24.0",
     "better-auth": "^1.7.14",
-    "e2b": "^2.51.0",
+    "e2b": "^2.62.2",
     "esbuild": "0.28.1",
     "imapflow": "^1.5.0",
     "kysely": "0.28.17",
