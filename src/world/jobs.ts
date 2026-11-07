@@ -190,6 +190,28 @@ export async function jobStatuses(world: World, ids: string[], opts: { tailLines
   return ids.map((id) => out.get(id) ?? { id, state: 'missing', log: '' });
 }
 
+/** A job's state and what it wrote since byte `from` of its log, in one
+ * round trip, with the world's clock (epoch ms) when it was read. The state is
+ * read first, so the output of a job seen exited is complete. */
+export async function followJob(world: World, id: string, from: number, opts: { root?: string } = {})
+  : Promise<{ state: JobState; exitCode?: number; output: string; now: number }> {
+  if (!isJobId(id)) return { state: 'missing', output: '', now: Date.now() };
+  const result = await world.exec('bash', ['-c', `${ALIVE}
+d=${jobRoot(opts.root)}/$1
+if [ ! -d "$d" ]; then s=missing; elif alive "$d" && [ ! -f "$d/exit" ]; then s=running; elif [ -f "$d/exit" ]; then s="exited $(cat "$d/exit")"; else s=lost; fi
+echo "$s $(date +%s%3N)"
+[ ! -f "$d/log" ] || tail -c +$(($2 + 1)) "$d/log"`, 'karmax-job-follow', id, String(Math.max(0, Math.floor(from)))],
+  { cwd: world.handle.root, timeoutMs: 30_000 });
+  if (result.code !== 0) throw new Error(`could not read job status: ${(result.stderr || result.stdout).trim().slice(0, 300) || `exit ${result.code}`}`);
+  const newline = result.stdout.indexOf('\n');
+  const [state, ...rest] = (newline < 0 ? result.stdout : result.stdout.slice(0, newline)).trim().split(' ');
+  const numbers = rest.map(Number);
+  const now = Number.isFinite(numbers.at(-1)) && numbers.at(-1)! > 1e12 ? numbers.at(-1)! : Date.now();
+  const output = newline < 0 ? '' : result.stdout.slice(newline + 1);
+  if (state === 'exited') return { state, exitCode: numbers[0], output, now };
+  return { state: state === 'running' || state === 'missing' ? state : 'lost', output, now };
+}
+
 /** Every job ever started in this world. */
 export async function listJobs(world: World): Promise<string[]> {
   const result = await world.exec('bash', ['-c', `ls -1 ${JOB_ROOT} 2>/dev/null || true`], { cwd: world.handle.root, timeoutMs: 30_000 });

@@ -9,7 +9,7 @@ import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
-import { repositoryName } from '../src/world/resource-repository.js';
+import { repositoryName, repositoryObjectKey } from '../src/world/resource-repository.js';
 import { legacyRevision } from './helpers/legacy-resources.js';
 
 const DAY = 24 * 3_600_000;
@@ -58,7 +58,7 @@ it('forgets a day-old snapshot no version names, keeps the rest, and prunes its 
   expect(await f.packBytes()).toBeLessThan(before - 250_000);
   expect((await f.resources.verifyRevision(f.project.id, f.attachment.id, kept.id)).status).toBe('complete');
   // Nothing left to do.
-  expect(await f.resources.maintainRepositories(Date.now() + 2 * DAY)).toEqual({ forgotten: 0, pruned: 0, converted: 0 });
+  expect(await f.resources.maintainRepositories(Date.now() + 2 * DAY)).toEqual({ forgotten: 0, pruned: 0, converted: 0, keyed: 0 });
 });
 
 it('converts versions saved before restic in place, current first, and releases their chunks', async () => {
@@ -228,3 +228,28 @@ it('dropping a save’s leftover snapshot never fails the save: upkeep forgets i
   expect(await f.snapshots()).not.toContain(again.snapshot);
   expect(await f.snapshots()).toContain(kept.rootDigest);
 }, 120_000);
+
+it('gives a repository made before fast keys one, once, and restic opens it with that key alone', async () => {
+  const f = await fixture();
+  const revision = await f.resources.importFiles(f.attachment.id, [{ path: 'a.txt', data: Buffer.from('fast') }]);
+  const repository = repositoryName(f.attachment.id);
+  // Made now, it has one beside the key `restic init` made.
+  const made = (await f.store.listRepositoryFiles(repository, 'keys')).map((file) => file.name);
+  const fast = await f.store.kvGet(`restic-fast-key:${repository}`);
+  expect(made).toHaveLength(2);
+  expect(made).toContain(fast);
+  // A repository from before: its fast key is not there yet.
+  await f.store.deleteRepositoryFile(repository, 'keys', fast!);
+  await f.store.kvDelete(`restic-fast-key:${repository}`);
+  expect(await f.resources.maintainRepositories()).toMatchObject({ keyed: 1 });
+  expect(await f.resources.maintainRepositories()).toMatchObject({ keyed: 0 });
+  const added = await f.store.kvGet(`restic-fast-key:${repository}`);
+  expect(added).toMatch(/^[0-9a-f]{64}$/);
+  const key = JSON.parse((await f.objects.get(repositoryObjectKey(repository, 'keys', added!))).toString('utf8'));
+  expect(key).toMatchObject({ kdf: 'scrypt', N: 1024, r: 8, p: 1, username: 'tavya' });
+  // With the key `restic init` made gone, restic still opens the repository:
+  // the fast key holds the same master key, under the same password.
+  const slow = made.find((name) => name !== fast)!;
+  await f.store.deleteRepositoryFile(repository, 'keys', slow);
+  expect((await f.resources.verifyRevision(f.project.id, f.attachment.id, revision.id)).status).toBe('complete');
+});
