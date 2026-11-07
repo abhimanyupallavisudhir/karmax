@@ -13588,11 +13588,11 @@ function conversationPane(v, t) {
   }
   const resourceRequestIndex = v.stage === 'review' && requestedInput
     ? entries.findLastIndex((entry) => entry.type === 'input-request' && entry.request.text === requestedInput) : -1;
-  // A form is live in the latest agent message that has one, until a person answers.
-  const formIndex = canFollowUp && followUp.enabled ? liveFormIndex(entries) : -1;
+  // Every form nobody has answered yet stays live while the person may reply.
+  const forms = canFollowUp && followUp.enabled ? messageFormStates(entries) : new Map();
   const row = (entry, attrs = '') => renderConversationEntry(
     entry === entries[resourceRequestIndex] ? { ...entry, resourceReview: true }
-      : entry === entries[formIndex] ? { ...entry, formLive: true } : entry, v)
+      : forms.has(entry) ? { ...entry, formLive: true, forms: forms.get(entry) } : entry, v)
     .replace(' ', ` data-conversation-key="${esc(conversationEntryKey(entry))}"${attrs} `);
   const working = t.shared ? v.participants.some((p) => p.state === 'running') : v.agentTurn?.role === t.role;
   const outline = conversationOutline(entries, { live: working, asking: !!humanWaitDetail(v) });
@@ -14199,10 +14199,12 @@ function renderAgentMessageBody(text, v = S.view, math = mathjaxEnabled(), form 
 
 // ── message forms ────────────────────────────────────────────────────────────
 // An agent asks for input with a ```form fence (web/markdown.js parseForm) and
-// the conversation draws it as a form. The latest one nobody has answered yet,
-// in a conversation the person may reply to, is live; what they submit is sent
-// as their ordinary reply — the same follow-up as typing it — so the agent
-// reads "- Region: eu-west" exactly as if it had been typed.
+// the conversation draws it as a form. Every one nobody has answered yet, in a
+// conversation the person may reply to, is live — however far the conversation
+// has moved on; what they submit is sent as their ordinary reply — the same
+// follow-up as typing it — so the agent reads "- Region: eu-west" exactly as if
+// it had been typed. A form is answered when a later reply of the person's
+// reads as its answer (messageFormStates): the conversation is the record.
 //
 // A form with `save` first makes that request from this browser, as the person
 // and with their authority (so it can only change what they could change in
@@ -14270,12 +14272,13 @@ function decodeHtml(html) {
   return area.value;
 }
 
-/** The forms in a rendered agent message, drawn live or read-only (`ctx`: {key, live}). */
+/** The forms in a rendered agent message, drawn live or read-only (`ctx`: formContext). */
 function withMessageForms(html, ctx, v = S.view) {
   if (!html.includes('lang-form')) return html;
   let index = 0;
   return html.replace(FORM_BLOCK, (block, code) => {
-    const key = `${v?.taskId || 'task'}/${ctx?.key || 'message'}/${index++}`;
+    const at = index++;
+    const key = `${v?.taskId || 'task'}/${ctx?.key || 'message'}/${at}`;
     const parsed = KarmaxMarkdown.parseForm(decodeHtml(code));
     const target = parsed.form?.save ? settingsTarget(parsed.form.save) : null;
     const problem = parsed.error || (parsed.form.save && !target ? 'This form would change something outside settings, so it was not shown.' : '')
@@ -14283,9 +14286,10 @@ function withMessageForms(html, ctx, v = S.view) {
     // The agent's mistake stays readable: what went wrong, with its source folded.
     if (problem) return `<details class="ask-form-problem"><summary>${esc(problem)}</summary>${block}</details>`;
     const form = parsed.form;
-    const live = !!ctx?.live && !S.answeredForms?.has(key);
-    // What wireMessageForms submits: the form as read, by its key on the page.
-    if (live) (S.formSpecs ||= new Map()).set(key, form);
+    const live = !!ctx?.live && !ctx.answered?.has(at) && !S.answeredForms?.has(key);
+    // What wireMessageForms submits: the form as read, by its key on the page —
+    // with what it asks, when the conversation has moved on since it was asked.
+    if (live) (S.formSpecs ||= new Map()).set(key, ctx.moved ? { ...form, quote: formSubject(form) } : form);
     const secret = form.fields.some((field) => field.type === 'secret');
     const note = target ? `${secret ? ICON.lock : ''}<span>${secret ? 'Saved to' : 'Saves to'} <b>${esc(target.label)}</b>${secret ? ', not into the conversation' : ''}</span>` : '';
     return KarmaxMarkdown.renderForm(form, { key, live, values: S.formDrafts?.[key] || {}, note, error: S.formErrors?.[key] || '' });
@@ -14300,18 +14304,67 @@ function agentEntryText(entry) {
   if (entry.type === 'message') return entry.message?.role === 'agent' ? entry.message.text : '';
   return entry.type === 'activity' && entry.activity?.kind === 'message' ? entry.activity.title : '';
 }
-/** The entry whose forms are live: the last with a form, unless a person has spoken since. */
-function liveFormIndex(entries) {
-  for (let index = entries.length - 1; index >= 0; index--) {
-    const entry = entries[index];
-    if (entry.type === 'message' && entry.message?.role === 'user' && messageOrigin(entry.message) === 'person') return -1;
-    if (hasMessageForm(agentEntryText(entry))) return index;
+/** A person's message, if it is one. */
+function personMessageText(entry) {
+  return entry.type === 'message' && entry.message?.role === 'user' && messageOrigin(entry.message) === 'person' ? entry.message.text || '' : null;
+}
+/** The forms in an agent's text, in order (null where one cannot be read). */
+function messageFormsIn(text) {
+  return [...String(text).matchAll(/^[ \t]*```form[ \t]*\n([\s\S]*?)\n[ \t]*```/gm)].map((match) => KarmaxMarkdown.parseForm(match[1]).form || null);
+}
+/** What a form asks, in a line: quoted above an answer given after the conversation moved on. */
+function formSubject(form) {
+  const field = form.fields[0];
+  const subject = form.title || form.fields.map((f) => f.label).filter(Boolean).join(' · ')
+    || (form.quick ? field.options.map((o) => o.label).join(' / ') : '');
+  return subject.length > 120 ? `${subject.slice(0, 119)}…` : subject;
+}
+/** Whether a person's reply reads as this form's answer (as messageFormAnswer writes it, or typed alike). */
+function answersForm(form, text) {
+  const reply = String(text).replace(/^(?:>.*\n)+\n?/, '').trim();
+  if (!reply) return false;
+  if (form.quick) {
+    const said = reply.toLowerCase();
+    return form.fields[0].options.some((o) => [o.label, o.value, `${o.label} (${o.value})`].some((t) => t.toLowerCase() === said));
   }
-  return -1;
+  const labels = form.fields.map((field) => field.label || field.name);
+  const lines = reply.split('\n').filter((line) => line.startsWith('- '));
+  return lines.length > 0 && lines.every((line) => labels.some((label) => line.startsWith(`- ${label}:`)));
+}
+/**
+ * Every entry with forms → `{answered, moved}`: which of its forms a later reply
+ * of the person's answers (each reply answers the latest open form it reads as
+ * the answer to), and whether anything was said after it.
+ */
+function messageFormStates(entries) {
+  const states = new Map();
+  const open = [];
+  let lastSaid = -1;
+  entries.forEach((entry, at) => {
+    const said = personMessageText(entry);
+    if (said != null) {
+      lastSaid = at;
+      const match = open.findLast(({ form }) => answersForm(form, said));
+      if (match) { match.state.answered.add(match.index); open.splice(open.indexOf(match), 1); }
+      return;
+    }
+    const text = agentEntryText(entry);
+    if (text) lastSaid = at;
+    if (!hasMessageForm(text)) return;
+    const state = { answered: new Set(), at };
+    states.set(entry, state);
+    messageFormsIn(text).forEach((form, index) => { if (form) open.push({ state, index, form }); });
+  });
+  for (const state of states.values()) state.moved = state.at < lastSaid;
+  return states;
 }
 /** What names a form on the page: its entry, and the form's place in it. */
 function formEntryKey(entry) {
   return entry.type === 'activity' ? `activity:${entry.activityRef}` : entry.sourceKey || entry.message?.id || 'message';
+}
+/** How an entry's forms are drawn (withMessageForms' `ctx`). */
+function formContext(entry) {
+  return { key: formEntryKey(entry), live: !!entry.formLive, answered: entry.forms?.answered, moved: !!entry.forms?.moved };
 }
 
 /** The values a person entered, by field name, as the form's fields say. */
@@ -14334,7 +14387,8 @@ function messageFormAnswer(form, values, target) {
     const option = field.options.find((o) => o.value === value);
     return !option ? value : option.label === option.value ? option.label : `${option.label} (${option.value})`;
   };
-  if (form.quick) return optionText(form.fields[0], values[form.fields[0].name]);
+  const quoted = (answer) => form.quote ? `> ${form.quote}\n\n${answer}` : answer;
+  if (form.quick) return quoted(optionText(form.fields[0], values[form.fields[0].name]));
   const shown = (field) => {
     const value = values[field.name];
     if (field.type === 'secret') return value ? 'saved' : '';
@@ -14345,7 +14399,7 @@ function messageFormAnswer(form, values, target) {
   const lines = form.fields.map((field) => [field.label || field.name, shown(field), field.type === 'paragraph'])
     .filter(([, text]) => text !== '')
     .map(([label, text, long]) => long && text.includes('\n') ? `- ${label}:\n\n${text.split('\n').map((line) => `  ${line}`).join('\n')}` : `- ${label}: ${text}`);
-  return `${lines.join('\n')}${target ? `\n\nSaved to ${target.label}.` : ''}`;
+  return quoted(`${lines.join('\n')}${target ? `\n\nSaved to ${target.label}.` : ''}`);
 }
 
 /** `{{name}}` in a save's body → that field's value (a whole "{{name}}" keeps the value's type). */
@@ -14460,13 +14514,13 @@ function renderConversationEntry(entry, v = S.view) {
   if (entry.type === 'input-request') {
     const escalate = v.waitingFor?.kind === 'human' || v.waitingFor?.kind === 'parent'
       ? `<button class="btn sm ghost escalate-request" title="Pass this to someone who can answer">Escalate…</button>` : '';
-    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div>${v.waitingFor?.reason === 'error' ? taskErrorHtml(entry.request.text) : `<div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math, { key: formEntryKey(entry), live: !!entry.formLive })}</div>`}${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div>${v.waitingFor?.reason === 'error' ? taskErrorHtml(entry.request.text) : `<div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math, formContext(entry))}</div>`}${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
   }
   if (entry.type === 'message') {
     const m = entry.message;
     const shared = sharedConversation(v);
     const role = shared ? messageSpeaker(m, v) : m.role === 'user' ? (messageOrigin(m) === 'platform' ? siteName() : 'You') : m.role === 'agent' ? 'Agent' : 'System';
-    const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v, math, { key: formEntryKey(entry), live: !!entry.formLive }) : renderMessageBody(m.text, math);
+    const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v, math, formContext(entry)) : renderMessageBody(m.text, math);
     const otherAgent = shared && m.role === 'agent' && m.author && m.author !== 'do' ? ' other-agent' : '';
     const platform = m.role === 'user' && messageOrigin(m) === 'platform' ? ' platform' : '';
     // A form's answer goes back to the agent that asked (in a shared conversation).
@@ -14481,7 +14535,7 @@ function renderConversationEntry(entry, v = S.view) {
   const speaker = entry.speaker ? participantLabelOf(entry.speaker, v) : 'Agent';
   if (a.kind === 'message') {
     const asker = sharedConversation(v) && entry.formLive ? ` data-form-author="agent:${esc(entry.speaker || 'do')}"` : '';
-    return `<div class="msg agent${entry.speaker && entry.speaker !== 'do' ? ' other-agent' : ''}"${asker}><div class="msg-meta"><span class="role">${esc(speaker)}</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v, math, { key: formEntryKey(entry), live: !!entry.formLive })}</div>${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent${entry.speaker && entry.speaker !== 'do' ? ' other-agent' : ''}"${asker}><div class="msg-meta"><span class="role">${esc(speaker)}</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v, math, formContext(entry))}</div>${explainMessageAffordance(entry, v)}</div>`;
   }
   const icons = { reasoning: '◇', command: '›_', file: '±', tool: '⚙', search: '⌕', subagent: '⑂', status: '·', turn: '●', error: '!' };
   const detail = a.detail
