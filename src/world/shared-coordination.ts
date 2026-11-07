@@ -99,10 +99,19 @@ export class SharedWorldCoordination {
     };
   }
 
-  /** Whether any process pins `worldId`: a lock on its access file. Only the
-   * inode is compared, so a coincidence answers "in use", the safe answer. */
-  async hasAccess(worldId: string): Promise<boolean> {
-    const filename = this.filename(worldId, 'access');
+  /** Whether any process pins `worldId`: a lock on its access file. */
+  hasAccess(worldId: string): Promise<boolean> {
+    return this.locked(this.filename(worldId, 'access'));
+  }
+
+  /** Whether any process runs an operation on `worldId` (or waits for one). */
+  hasOperation(worldId: string): Promise<boolean> {
+    return this.locked(this.filename(worldId, 'operation'));
+  }
+
+  /** Whether any process holds or awaits a lock on `filename`. Only the inode
+   * is compared, so a coincidence answers "in use", the safe answer. */
+  private async locked(filename: string): Promise<boolean> {
     let inode: string;
     try { inode = (await fs.promises.stat(filename, { bigint: true })).ino.toString(); }
     catch (error) {

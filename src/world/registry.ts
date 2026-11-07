@@ -106,6 +106,15 @@ export class WorldRegistry {
     return this.shared ? this.shared.hasAccess(worldId) : this.activeAccessCount(worldId) > 0;
   }
 
+  /** Whether anything on this host still works in `worldId`: an operation
+   * (a setup, restore, wake or park) running or waiting, or an access pinned
+   * to it, in this process or, with shared coordination, any other. What
+   * holds a runner lease its world's handle does not name (runners.ts). */
+  async inUse(worldId: string): Promise<boolean> {
+    if (this.operations.busy(worldId) || this.activeAccessCount(worldId) > 0) return true;
+    return this.shared ? (await this.shared.hasOperation(worldId)) || (await this.shared.hasAccess(worldId)) : false;
+  }
+
   withoutRecovery<T>(operation: () => Promise<T>): Promise<T> {
     return this.recoveryDisabled.run(true, operation);
   }
