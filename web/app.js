@@ -763,6 +763,7 @@ function renderRouteLoadingPage(title, label = 'Loading…') {
     <b>${esc(title || 'Opening')}</b>
     <span class="global-search-loading">${esc(label)}</span>
   </div>`;
+  syncDocumentTitle();
 }
 
 async function applyRoute() {
@@ -5859,6 +5860,37 @@ function applyDocumentBrand() {
     `${siteName()} is the agentic to-do list that finishes itself: agents work in parallel on their own computers; you review the result. Use your Claude or ChatGPT plan.`);
 }
 
+// The browser tab names the console page on screen, most specific part first so a
+// narrow tab still tells pages apart, and leads with the bell's count so a tab in
+// the background shows that something waits on you. Derived from state and the
+// DOM alone, so every paint can call it.
+function consolePageTitle() {
+  const form = $('#tf-page');
+  if (form) return [form.dataset.title || 'New task'];
+  const loading = $('#main > .route-loading b')?.textContent;
+  if (loading) return [loading];
+  const project = projectById(S.projectId)?.name;
+  const org = currentOrg()?.name;
+  if (S.selected) {
+    const task = S.view?.taskId === S.selected ? { ...taskRecord(S.selected), ...S.view } : taskRecord(S.selected);
+    const name = projectById(task?.projectId)?.name || project;
+    return [task?.title || 'Task', task?.num != null ? `${name || ''} #${task.num}`.trim() : name];
+  }
+  const fileName = String(S.filesPath || '').split('/').filter(Boolean).pop();
+  return {
+    home: [org], inbox: ['Inbox'], insights: ['Insights', org], orgwiki: ['Wiki', org], organization: ['Settings', org],
+    installation: ['Installation'], profile: ['Profile'],
+    tasks: [project], queue: ['Queues', project], activity: ['Activity', project],
+    files: [fileName || 'Files', project], wiki: ['Wiki', project], settings: ['Settings', project],
+  }[S.tab] || [];
+}
+function syncDocumentTitle() {
+  if (!$('#main')) return; // public pages and sign-in set their own
+  const unread = inboxUnreadCount();
+  const title = [...consolePageTitle(), siteName()].filter(Boolean).join(' · ');
+  document.title = unread ? `(${unread}) ${title}` : title;
+}
+
 // The gateway resolves /brand/* against the instance-wide icon setting, so the
 // mark carries no client state — which is also what lets it render on the
 // pre-auth login screens. The counter only busts the HTTP cache after a switch.
@@ -6721,6 +6753,7 @@ function renderMain() {
   if (context) context.textContent = S.selected ? ''
     : PROJECT_SCOPED_TABS.includes(S.tab) ? projectById(S.projectId)?.name || ''
     : ['home', 'insights', 'orgwiki', 'organization'].includes(S.tab) ? currentOrg()?.name || '' : '';
+  syncDocumentTitle();
   // A preload begun on the task list must not survive a trip through settings,
   // where the defaults it captured may have just been edited.
   if (!isTaskListTab()) taskFormDefaultRequests.clear();
@@ -9457,8 +9490,25 @@ function taskFormTitle(draft) {
   return !draft ? 'New task' : p.triggerState === 'armed' || isSeries(p) ? 'Edit task' : restingAvatar(draft) ? 'Edit Avatār' : 'Edit draft';
 }
 
+// The browser tab's name for a task form page: what it edits, else what the page is.
+function taskFormTabTitle(draft, title) {
+  return title || draft?.title || (draft ? 'Draft' : 'New task');
+}
+
+// The tab is named for the form page while it is open, and for the page beneath
+// once it goes — however it goes (closed, run, saved, navigated away from).
+function watchTaskFormTitle(root) {
+  syncDocumentTitle();
+  const watch = new MutationObserver(() => {
+    if (root.querySelector('#tf-page')) return;
+    watch.disconnect();
+    syncDocumentTitle();
+  });
+  watch.observe(root, { childList: true });
+}
+
 function taskFormLoadingPage(project, draft, title) {
-  return `<div class="task-form-page" id="tf-page" tabindex="-1" aria-busy="true">
+  return `<div class="task-form-page" id="tf-page" tabindex="-1" aria-busy="true" data-title="${esc(taskFormTabTitle(draft, title))}">
     <div class="tf-head"><div class="tf-head-inner">
       <button class="icon-btn" id="tf-close" data-shortcut="nav.close" title="Back (Esc)">←</button>
       <h2>${title ? esc(title) : taskFormTitle(draft)}</h2>
@@ -9612,6 +9662,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // feedback while keeping the not-yet-hydrated controls safely non-interactive.
   const formTitle = templateEdit ? (templateEdit.template ? 'Edit template' : 'New template') : store?.name || '';
   root.innerHTML = taskFormLoadingPage(proj, draft, formTitle);
+  watchTaskFormTitle(root);
   // Closing a draft's own page returns to where the task was opened from —
   // unless a navigation is what closed it.
   const leavePage = (navigating) => {
@@ -9672,7 +9723,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     ? renderField(f, values[f.name], inherited[f.name], false, undefined, { authority: { html: mainAuthorityHtml, summary: authorizationSummary(selectedAuthorization, authorizationProjects) } })
     : renderField(f, values[f.name], inherited[f.name]);
   root.innerHTML = `
-    <div class="task-form-page" id="tf-page" tabindex="-1">
+    <div class="task-form-page" id="tf-page" tabindex="-1" data-title="${esc(taskFormTabTitle(draft, formTitle))}">
       <div class="tf-head">
         <div class="tf-head-inner">
           <button class="icon-btn" id="tf-close" data-shortcut="nav.close" title="${editInPlace ? 'Back (Esc) — your changes are kept' : 'Back (Esc) — your work is kept as a draft'}">←</button>
@@ -10581,6 +10632,7 @@ function renderTaskLoadingPage(rec, error, notStarted = false) {
       ? `<div class="task-load-error"><b>Couldn’t load this task</b><span title="${esc(error)}">${esc(plainError(error))}</span><button class="btn sm" id="task-load-retry">Try again</button></div>`
       : '<span class="global-search-loading">Loading task…</span>'}</div>
   </div>`;
+  syncDocumentTitle();
   $('#tp-back')?.addEventListener('click', plainClick(closeTask));
   $('#task-load-retry')?.addEventListener('click', () => openTask(rec?.id || S.selected, S.taskTab, !!S.viewingAttempt));
 }
@@ -11589,6 +11641,7 @@ function renderTaskPage() {
         <aside class="tp-rail" id="tp-rail" aria-label="Task details">${taskRail(v, rec)}</aside>
       </div>
     </div>`);
+  syncDocumentTitle();
   $('#tp-back').addEventListener('click', plainClick(closeTask));
   // The tabs are real links (Ctrl/⌘-click or middle-click opens the pinned tab in
   // a new browser tab); a plain click switches in place without a refetch.
@@ -13544,11 +13597,11 @@ function conversationPane(v, t) {
   }
   const resourceRequestIndex = v.stage === 'review' && requestedInput
     ? entries.findLastIndex((entry) => entry.type === 'input-request' && entry.request.text === requestedInput) : -1;
-  // A form is live in the latest agent message that has one, until a person answers.
-  const formIndex = canFollowUp && followUp.enabled ? liveFormIndex(entries) : -1;
+  // Every form nobody has answered yet stays live while the person may reply.
+  const forms = canFollowUp && followUp.enabled ? messageFormStates(entries) : new Map();
   const row = (entry, attrs = '') => renderConversationEntry(
     entry === entries[resourceRequestIndex] ? { ...entry, resourceReview: true }
-      : entry === entries[formIndex] ? { ...entry, formLive: true } : entry, v)
+      : forms.has(entry) ? { ...entry, formLive: true, forms: forms.get(entry) } : entry, v)
     .replace(' ', ` data-conversation-key="${esc(conversationEntryKey(entry))}"${attrs} `);
   const working = t.shared ? v.participants.some((p) => p.state === 'running') : v.agentTurn?.role === t.role;
   const outline = conversationOutline(entries, { live: working, asking: !!humanWaitDetail(v) });
@@ -14155,10 +14208,12 @@ function renderAgentMessageBody(text, v = S.view, math = mathjaxEnabled(), form 
 
 // ── message forms ────────────────────────────────────────────────────────────
 // An agent asks for input with a ```form fence (web/markdown.js parseForm) and
-// the conversation draws it as a form. The latest one nobody has answered yet,
-// in a conversation the person may reply to, is live; what they submit is sent
-// as their ordinary reply — the same follow-up as typing it — so the agent
-// reads "- Region: eu-west" exactly as if it had been typed.
+// the conversation draws it as a form. Every one nobody has answered yet, in a
+// conversation the person may reply to, is live — however far the conversation
+// has moved on; what they submit is sent as their ordinary reply — the same
+// follow-up as typing it — so the agent reads "- Region: eu-west" exactly as if
+// it had been typed. A form is answered when a later reply of the person's
+// reads as its answer (messageFormStates): the conversation is the record.
 //
 // A form with `save` first makes that request from this browser, as the person
 // and with their authority (so it can only change what they could change in
@@ -14226,12 +14281,13 @@ function decodeHtml(html) {
   return area.value;
 }
 
-/** The forms in a rendered agent message, drawn live or read-only (`ctx`: {key, live}). */
+/** The forms in a rendered agent message, drawn live or read-only (`ctx`: formContext). */
 function withMessageForms(html, ctx, v = S.view) {
   if (!html.includes('lang-form')) return html;
   let index = 0;
   return html.replace(FORM_BLOCK, (block, code) => {
-    const key = `${v?.taskId || 'task'}/${ctx?.key || 'message'}/${index++}`;
+    const at = index++;
+    const key = `${v?.taskId || 'task'}/${ctx?.key || 'message'}/${at}`;
     const parsed = KarmaxMarkdown.parseForm(decodeHtml(code));
     const target = parsed.form?.save ? settingsTarget(parsed.form.save) : null;
     const problem = parsed.error || (parsed.form.save && !target ? 'This form would change something outside settings, so it was not shown.' : '')
@@ -14239,9 +14295,10 @@ function withMessageForms(html, ctx, v = S.view) {
     // The agent's mistake stays readable: what went wrong, with its source folded.
     if (problem) return `<details class="ask-form-problem"><summary>${esc(problem)}</summary>${block}</details>`;
     const form = parsed.form;
-    const live = !!ctx?.live && !S.answeredForms?.has(key);
-    // What wireMessageForms submits: the form as read, by its key on the page.
-    if (live) (S.formSpecs ||= new Map()).set(key, form);
+    const live = !!ctx?.live && !ctx.answered?.has(at) && !S.answeredForms?.has(key);
+    // What wireMessageForms submits: the form as read, by its key on the page —
+    // with what it asks, when the conversation has moved on since it was asked.
+    if (live) (S.formSpecs ||= new Map()).set(key, ctx.moved ? { ...form, quote: formSubject(form) } : form);
     const secret = form.fields.some((field) => field.type === 'secret');
     const note = target ? `${secret ? ICON.lock : ''}<span>${secret ? 'Saved to' : 'Saves to'} <b>${esc(target.label)}</b>${secret ? ', not into the conversation' : ''}</span>` : '';
     return KarmaxMarkdown.renderForm(form, { key, live, values: S.formDrafts?.[key] || {}, note, error: S.formErrors?.[key] || '' });
@@ -14256,18 +14313,67 @@ function agentEntryText(entry) {
   if (entry.type === 'message') return entry.message?.role === 'agent' ? entry.message.text : '';
   return entry.type === 'activity' && entry.activity?.kind === 'message' ? entry.activity.title : '';
 }
-/** The entry whose forms are live: the last with a form, unless a person has spoken since. */
-function liveFormIndex(entries) {
-  for (let index = entries.length - 1; index >= 0; index--) {
-    const entry = entries[index];
-    if (entry.type === 'message' && entry.message?.role === 'user' && messageOrigin(entry.message) === 'person') return -1;
-    if (hasMessageForm(agentEntryText(entry))) return index;
+/** A person's message, if it is one. */
+function personMessageText(entry) {
+  return entry.type === 'message' && entry.message?.role === 'user' && messageOrigin(entry.message) === 'person' ? entry.message.text || '' : null;
+}
+/** The forms in an agent's text, in order (null where one cannot be read). */
+function messageFormsIn(text) {
+  return [...String(text).matchAll(/^[ \t]*```form[ \t]*\n([\s\S]*?)\n[ \t]*```/gm)].map((match) => KarmaxMarkdown.parseForm(match[1]).form || null);
+}
+/** What a form asks, in a line: quoted above an answer given after the conversation moved on. */
+function formSubject(form) {
+  const field = form.fields[0];
+  const subject = form.title || form.fields.map((f) => f.label).filter(Boolean).join(' · ')
+    || (form.quick ? field.options.map((o) => o.label).join(' / ') : '');
+  return subject.length > 120 ? `${subject.slice(0, 119)}…` : subject;
+}
+/** Whether a person's reply reads as this form's answer (as messageFormAnswer writes it, or typed alike). */
+function answersForm(form, text) {
+  const reply = String(text).replace(/^(?:>.*\n)+\n?/, '').trim();
+  if (!reply) return false;
+  if (form.quick) {
+    const said = reply.toLowerCase();
+    return form.fields[0].options.some((o) => [o.label, o.value, `${o.label} (${o.value})`].some((t) => t.toLowerCase() === said));
   }
-  return -1;
+  const labels = form.fields.map((field) => field.label || field.name);
+  const lines = reply.split('\n').filter((line) => line.startsWith('- '));
+  return lines.length > 0 && lines.every((line) => labels.some((label) => line.startsWith(`- ${label}:`)));
+}
+/**
+ * Every entry with forms → `{answered, moved}`: which of its forms a later reply
+ * of the person's answers (each reply answers the latest open form it reads as
+ * the answer to), and whether anything was said after it.
+ */
+function messageFormStates(entries) {
+  const states = new Map();
+  const open = [];
+  let lastSaid = -1;
+  entries.forEach((entry, at) => {
+    const said = personMessageText(entry);
+    if (said != null) {
+      lastSaid = at;
+      const match = open.findLast(({ form }) => answersForm(form, said));
+      if (match) { match.state.answered.add(match.index); open.splice(open.indexOf(match), 1); }
+      return;
+    }
+    const text = agentEntryText(entry);
+    if (text) lastSaid = at;
+    if (!hasMessageForm(text)) return;
+    const state = { answered: new Set(), at };
+    states.set(entry, state);
+    messageFormsIn(text).forEach((form, index) => { if (form) open.push({ state, index, form }); });
+  });
+  for (const state of states.values()) state.moved = state.at < lastSaid;
+  return states;
 }
 /** What names a form on the page: its entry, and the form's place in it. */
 function formEntryKey(entry) {
   return entry.type === 'activity' ? `activity:${entry.activityRef}` : entry.sourceKey || entry.message?.id || 'message';
+}
+/** How an entry's forms are drawn (withMessageForms' `ctx`). */
+function formContext(entry) {
+  return { key: formEntryKey(entry), live: !!entry.formLive, answered: entry.forms?.answered, moved: !!entry.forms?.moved };
 }
 
 /** The values a person entered, by field name, as the form's fields say. */
@@ -14290,7 +14396,8 @@ function messageFormAnswer(form, values, target) {
     const option = field.options.find((o) => o.value === value);
     return !option ? value : option.label === option.value ? option.label : `${option.label} (${option.value})`;
   };
-  if (form.quick) return optionText(form.fields[0], values[form.fields[0].name]);
+  const quoted = (answer) => form.quote ? `> ${form.quote}\n\n${answer}` : answer;
+  if (form.quick) return quoted(optionText(form.fields[0], values[form.fields[0].name]));
   const shown = (field) => {
     const value = values[field.name];
     if (field.type === 'secret') return value ? 'saved' : '';
@@ -14301,7 +14408,7 @@ function messageFormAnswer(form, values, target) {
   const lines = form.fields.map((field) => [field.label || field.name, shown(field), field.type === 'paragraph'])
     .filter(([, text]) => text !== '')
     .map(([label, text, long]) => long && text.includes('\n') ? `- ${label}:\n\n${text.split('\n').map((line) => `  ${line}`).join('\n')}` : `- ${label}: ${text}`);
-  return `${lines.join('\n')}${target ? `\n\nSaved to ${target.label}.` : ''}`;
+  return quoted(`${lines.join('\n')}${target ? `\n\nSaved to ${target.label}.` : ''}`);
 }
 
 /** `{{name}}` in a save's body → that field's value (a whole "{{name}}" keeps the value's type). */
@@ -14416,13 +14523,13 @@ function renderConversationEntry(entry, v = S.view) {
   if (entry.type === 'input-request') {
     const escalate = v.waitingFor?.kind === 'human' || v.waitingFor?.kind === 'parent'
       ? `<button class="btn sm ghost escalate-request" title="Pass this to someone who can answer">Escalate…</button>` : '';
-    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div>${v.waitingFor?.reason === 'error' ? taskErrorHtml(entry.request.text) : `<div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math, { key: formEntryKey(entry), live: !!entry.formLive })}</div>`}${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div>${v.waitingFor?.reason === 'error' ? taskErrorHtml(entry.request.text) : `<div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math, formContext(entry))}</div>`}${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
   }
   if (entry.type === 'message') {
     const m = entry.message;
     const shared = sharedConversation(v);
     const role = shared ? messageSpeaker(m, v) : m.role === 'user' ? (messageOrigin(m) === 'platform' ? siteName() : 'You') : m.role === 'agent' ? 'Agent' : 'System';
-    const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v, math, { key: formEntryKey(entry), live: !!entry.formLive }) : renderMessageBody(m.text, math);
+    const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v, math, formContext(entry)) : renderMessageBody(m.text, math);
     const otherAgent = shared && m.role === 'agent' && m.author && m.author !== 'do' ? ' other-agent' : '';
     const platform = m.role === 'user' && messageOrigin(m) === 'platform' ? ' platform' : '';
     // A form's answer goes back to the agent that asked (in a shared conversation).
@@ -14437,7 +14544,7 @@ function renderConversationEntry(entry, v = S.view) {
   const speaker = entry.speaker ? participantLabelOf(entry.speaker, v) : 'Agent';
   if (a.kind === 'message') {
     const asker = sharedConversation(v) && entry.formLive ? ` data-form-author="agent:${esc(entry.speaker || 'do')}"` : '';
-    return `<div class="msg agent${entry.speaker && entry.speaker !== 'do' ? ' other-agent' : ''}"${asker}><div class="msg-meta"><span class="role">${esc(speaker)}</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v, math, { key: formEntryKey(entry), live: !!entry.formLive })}</div>${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent${entry.speaker && entry.speaker !== 'do' ? ' other-agent' : ''}"${asker}><div class="msg-meta"><span class="role">${esc(speaker)}</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v, math, formContext(entry))}</div>${explainMessageAffordance(entry, v)}</div>`;
   }
   const icons = { reasoning: '◇', command: '›_', file: '±', tool: '⚙', search: '⌕', subagent: '⑂', status: '·', turn: '●', error: '!' };
   const detail = a.detail
@@ -24593,6 +24700,7 @@ function wireGlobalSettings(organizationId) {
 // once you open its task (markTaskAsksRead) or the notice itself.
 function updateBell() {
   syncNotificationAlerts();
+  syncDocumentTitle();
   const badge = $('#bell-badge');
   if (!badge) return;
   const n = inboxUnreadCount();

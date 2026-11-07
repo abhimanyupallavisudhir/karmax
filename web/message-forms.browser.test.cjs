@@ -1,5 +1,5 @@
-// An agent's form, end to end in the console: the latest unanswered one is
-// live; what a person submits is sent as their ordinary reply; a quick
+// An agent's form, end to end in the console: every unanswered one is live,
+// however far the conversation has moved on; what a person submits is sent as their ordinary reply; a quick
 // question answers in one click; a form that saves writes the setting from the
 // person's browser and tells the agent only that it was saved — the secret
 // never enters the conversation; a form that would leak a secret or write
@@ -158,6 +158,40 @@ const outside = `${fence({ fields: [{ name: 'who' }], save: { method: 'POST', pa
       assert.deepEqual(errors, []);
       await context.close();
     }
+    // ── a form stays answerable after the conversation moves on ──
+    {
+      const pace = `${fence({ label: 'First forecast', options: ['All at once', 'Gradually'] })}`;
+      const history = () => [
+        { id: 'a1', role: 'agent', text: `${secure}\n\n${pace}`, ts: T0 },
+        { id: 'm1', role: 'user', author: 'user:u', text: 'Aren’t you going to use my Claude subscription?', ts: T0 + 1000 },
+        { id: 'a2', role: 'agent', text: 'Yes — the key is only for the fallback.', ts: T0 + 2000 },
+      ];
+      const messages = history();
+      const { context, page, errors, sent } = await open(messages);
+      // A person spoke and the agent answered, yet neither form was answered: both stay live.
+      assert.equal(await page.locator('#ck-thread form.ask-form.live').count(), 2, 'unanswered forms stay live');
+      await page.locator('#ck-thread form.ask-form.live.quick button.ask-choice', { hasText: 'Gradually' }).click();
+      await page.locator('#ck-thread .msg.user', { hasText: 'Gradually' }).waitFor();
+      // The answer says which question it answers, since the conversation has moved on.
+      assert.deepEqual(signals(sent).map((s) => s.text), ['> First forecast\n\nGradually']);
+      assert.equal(await page.locator('#ck-thread form.ask-form.live').count(), 1, 'only the answered form is read-only');
+      assert.ok(await page.locator('#ck-thread form.ask-form.live input[data-secret]').isEnabled());
+      if (shots) await page.screenshot({ path: `${shots}/form-after-conversation-moved-on.png` });
+      assert.deepEqual(errors, []);
+      await context.close();
+      // Opened afresh, the conversation itself says which forms were answered: a
+      // form answered in an earlier visit (or typed out) stays read-only.
+      const again = await open([...history(),
+        { id: 'm2', role: 'user', author: 'user:u', text: '> First forecast\n\nGradually', ts: T0 + 3000 },
+        { id: 'a3', role: 'agent', text: deploy, ts: T0 + 4000 },
+        { id: 'm3', role: 'user', author: 'user:u', text: '- Region: US East (us-east-1)\n- Deploy right away: No', ts: T0 + 5000 }]);
+      assert.equal(await again.page.locator('#ck-thread form.ask-form').count(), 3);
+      assert.deepEqual(await again.page.locator('#ck-thread form.ask-form.live').evaluateAll((forms) => forms.map((f) => f.querySelector('input[data-secret]') ? 'secret' : 'other')),
+        ['secret'], 'the secure form is still open; the quick and deploy forms were answered');
+      assert.deepEqual(again.errors, []);
+      await again.context.close();
+    }
+
     if (shots) for (const scheme of ['light', 'dark']) {
       const { context, page } = await open([{ id: 'm0', role: 'user', author: 'user:u', text: 'Deploy the site', ts: T0 },
         { id: 'a1', role: 'agent', text: deploy, ts: T0 + 1 }], scheme);
