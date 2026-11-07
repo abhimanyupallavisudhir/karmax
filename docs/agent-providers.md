@@ -190,6 +190,14 @@ both binaries.
   conversion of real 2.1.319 sessions without warnings; the live Claude turns
   (Messages API, Agent SDK on a subscription, native fork, the permission seam,
   a whole `live-agent` task) with the same results as on 2.1.318.
+- Live check after landing (7b9bdb63 deployed 06:47 UTC): Live `claude` #13
+  (`claude-permission`, 2 passed), `agent` #14 (1 passed) and `e2b` #15 (7 passed) matched
+  the 2.1.318 runs. A resumed production turn on the stale E2B template ran
+  2.1.319 from `~/.npm/_npx/…/claude-code` beside the template's Codex 0.153.4,
+  with `karmax_control`, the browser MCP and a permission request working. Its
+  session held `isolation-latch` records (`{side, sessionId}`, re-stamped on
+  resume; in 2.1.318's record table too, first seen in a real session here),
+  which panagent warned on; it is now skipped silently.
 
 ## November 6, 2026 Codex upgrade audit
 
