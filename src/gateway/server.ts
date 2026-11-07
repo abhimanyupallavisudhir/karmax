@@ -64,7 +64,7 @@ import { DEFAULT_MCP_CONNECTIONS, defaultModel, defaultEffort, organizationProfi
 import { repositoryBranchDefaults } from '../platform/branch-defaults.js';
 import { projectRepositorySource, sameRepository } from '../world/repository-identity.js';
 import { QRY_AGENT_QUEUE, accountCoordinatorId, agentQueueId } from '../coordinators/names.js';
-import { COMPUTE_PRICE_MULTIPLIER, computeChargeMicros, hostedMonthlyPriceCents } from '../domain/entitlements.js';
+import { COMPUTE_PRICE_MULTIPLIER, hostedMonthlyPriceCents } from '../domain/entitlements.js';
 import { computeCredit, computeMonth, startComputeTrial } from '../world/managed-compute.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
 import { SIG as WORKFLOW_SIG } from '../workflows/names.js';
@@ -266,7 +266,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/insights$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/entitlements$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/status$/.test(p)) return 'organization:read';
-  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:gift|gift-storage|gift-compute)$/.test(p)) return 'subscription:gift';
+  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:gift|gift-storage|gift-compute|compute-markup)$/.test(p)) return 'subscription:gift';
   if (/^\/api\/organizations\/[^/]+\/subscription\/(?:checkout|portal|change|cancel|resume|seats|sync-seats|storage-packs|compute-packs|auto-top-up|reconcile)$/.test(p))
     return 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/payments\/stripe\/platform$/.test(p)) return read ? 'settings:read' : 'settings:write';
@@ -2820,7 +2820,7 @@ export class Gateway {
                 return { ...account, running: use.machines, runningCpus: use.cpu, diskGb: use.diskGb,
                   waiting: (await waiters(store)).filter((waiter) => accountKey(MANAGED_COMPUTE, account.provider) in waiter.accounts).length,
                   organizations: rows.length,
-                  costMicros, chargedMicros: computeChargeMicros(costMicros), seconds: rows.reduce((total, row) => total + row.seconds, 0) };
+                  costMicros, chargedMicros: rows.reduce((total, row) => total + row.chargedMicros, 0), seconds: rows.reduce((total, row) => total + row.seconds, 0) };
               })) });
           }
           if (provider && managedCompute[2] && method === 'POST') return this.json(res, 200, await connections.test(MANAGED_COMPUTE, provider));
@@ -3033,7 +3033,7 @@ export class Gateway {
           queuedAgentRuns,
         });
       }
-      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|resume|seats|sync-seats|storage-packs|compute-packs|auto-top-up|reconcile|gift|gift-storage|gift-compute)$/);
+      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|resume|seats|sync-seats|storage-packs|compute-packs|auto-top-up|reconcile|gift|gift-storage|gift-compute|compute-markup)$/);
       if (subscription) {
         const organizationId = subscription[1]!;
         const action = subscription[2]!;
@@ -3051,6 +3051,19 @@ export class Gateway {
           return this.json(res, 200, { ...(await billing.current(organizationId)), autoTopUp, canManage, canGift });
         }
         if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
+        if (action === 'compute-markup') {
+          try {
+            const body = await this.body(req);
+            const key = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : '';
+            const actor = actorPrincipal(callerIdentity.actor);
+            const result = await billing.setComputeMarkup(organizationId, body.markupPercent, actor, key);
+            await this.deps.authorization?.audit(actor, 'subscription.compute-markup', `organization:${organizationId}`,
+              { markupPercent: body.markupPercent, requestKey: key, ...identityAuditDetail(callerIdentity) });
+            return this.json(res, 200, result);
+          } catch (error) {
+            return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+          }
+        }
         if (action === 'gift-storage' || action === 'gift-compute') {
           try {
             const body = await this.body(req);

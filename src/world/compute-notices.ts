@@ -47,9 +47,10 @@ export async function parkedManagedDisks(store: Store, organizationId: string): 
 }
 
 /** When parked disks that cost `perHour` (provider micros) are hibernated,
- * counted from when the credit was spent. */
-export function hibernateAt(since: number, perHour: number): number {
-  const capMs = perHour > 0 ? COMPUTE_SPENT.overrunCapMicros / computeChargeMicros(perHour) * 3_600_000 : Infinity;
+ * counted from when the credit was spent; `multiplier` is the organization's
+ * price on them. */
+export function hibernateAt(since: number, perHour: number, multiplier?: number): number {
+  const capMs = perHour > 0 ? COMPUTE_SPENT.overrunCapMicros / computeChargeMicros(perHour, multiplier) * 3_600_000 : Infinity;
   return since + Math.max(COMPUTE_SPENT.minGraceMs, Math.min(COMPUTE_SPENT.graceMs, capMs));
 }
 
@@ -94,7 +95,8 @@ export async function notifyComputeCredit(deps: {
     const disks = await parkedManagedDisks(store, organization.id);
     // Disks parked after the credit was spent get their grace from then.
     if (disks.length && state.hibernateAt === undefined)
-      state.hibernateAt = hibernateAt(Math.max(state.since, now - COMPUTE_SPENT.confirmMs), disks.reduce((total, disk) => total + disk.diskMicrosPerHour, 0));
+      state.hibernateAt = hibernateAt(Math.max(state.since, now - COMPUTE_SPENT.confirmMs), disks.reduce((total, disk) => total + disk.diskMicrosPerHour, 0),
+        await store.computePriceMultiplier(organization.id, now));
     let stage: ComputeNoticeStage | undefined;
     let hibernated = 0;
     if (disks.length && state.hibernateAt !== undefined && now >= state.hibernateAt && deps.hibernate) {

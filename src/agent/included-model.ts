@@ -3,7 +3,8 @@
  * tavya pays for, so a new organization can run tasks before it connects a
  * login or key of its own. What it uses is charged to the same credit as
  * tavya's computers (the plan's, packs, top-ups and the free trial), at
- * COMPUTE_PRICE_MULTIPLIER × what the model's provider charged.
+ * COMPUTE_PRICE_MULTIPLIER (or the organization's own markup) × what the
+ * model's provider charged.
  *
  * It runs on OpenRouter. The operator saves an OpenRouter management key; each
  * organization gets its own OpenRouter key from it, whose spending limit
@@ -202,7 +203,7 @@ export async function includedModelView(store: Store, broker: CredentialBroker, 
   const rows = (await store.managedComputeCosts(month.from, month.to)).filter((row) => row.provider === 'openrouter');
   const costMicros = rows.reduce((total, row) => total + row.costMicros, 0);
   return { ...settings, agentModel: includedAgentModel(settings), keyConfigured: await broker.hasHandle(MANAGEMENT_HANDLE),
-    organizations: rows.length, costMicros, chargedMicros: costMicros * COMPUTE_PRICE_MULTIPLIER };
+    organizations: rows.length, costMicros, chargedMicros: rows.reduce((total, row) => total + row.chargedMicros, 0) };
 }
 
 async function record(store: Store, organizationId: string): Promise<KeyRecord | undefined> {
@@ -210,9 +211,10 @@ async function record(store: Store, organizationId: string): Promise<KeyRecord |
 }
 
 /** The most the organization's key may have spent, in USD at OpenRouter's
- * prices: what it spent so far plus what its credit has left. */
-function limitFor(usageUsd: number, availableMicros: number): number {
-  return Math.floor((usageUsd + Math.max(0, availableMicros) / COMPUTE_PRICE_MULTIPLIER / 1e6) * 10_000) / 10_000;
+ * prices: what it spent so far plus what its credit has left (at tavya's
+ * prices, `multiplier` × OpenRouter's). */
+function limitFor(usageUsd: number, availableMicros: number, multiplier = COMPUTE_PRICE_MULTIPLIER): number {
+  return Math.floor((usageUsd + Math.max(0, availableMicros) / multiplier / 1e6) * 10_000) / 10_000;
 }
 
 /** The organization's OpenRouter key for a turn on the included model, its
@@ -224,19 +226,20 @@ export async function includedModelKey(store: Store, broker: CredentialBroker, o
   if (credit.availableMicros != null && credit.availableMicros < INCLUDED_MODEL_MIN_MICROS)
     throw await outOfCompute(store, organizationId, 'openrouter', now);
   const available = credit.availableMicros ?? Number.MAX_SAFE_INTEGER;
+  const multiplier = await store.computePriceMultiplier(organizationId, now);
   let existing = await record(store, organizationId);
   if (existing && !(await broker.hasHandle(keyHandle(organizationId)))) existing = undefined;
   if (!existing) {
-    const created = await openRouter(broker, 'POST', '/keys', { name: `tavya ${organizationId}`, limit: limitFor(0, available) });
+    const created = await openRouter(broker, 'POST', '/keys', { name: `tavya ${organizationId}`, limit: limitFor(0, available, multiplier) });
     const hash = String(created?.data?.hash ?? ''), key = String(created?.key ?? '');
     if (!hash || !key) throw new Error('OpenRouter did not return the new key');
     await broker.registerHandle(keyHandle(organizationId), key, organizationScope(organizationId));
-    await store.kvSet(keyRecord(organizationId), JSON.stringify({ hash, limitUsd: limitFor(0, available) } satisfies KeyRecord));
+    await store.kvSet(keyRecord(organizationId), JSON.stringify({ hash, limitUsd: limitFor(0, available, multiplier) } satisfies KeyRecord));
     return key;
   }
   const current = (await openRouter(broker, 'GET', `/keys/${existing.hash}`))?.data ?? {};
   await bookUsage(store, organizationId, Number(current.usage) || 0, now);
-  const limitUsd = limitFor(Number(current.usage) || 0, (await computeCredit(store, organizationId, now)).availableMicros ?? available);
+  const limitUsd = limitFor(Number(current.usage) || 0, (await computeCredit(store, organizationId, now)).availableMicros ?? available, multiplier);
   if (limitUsd !== existing.limitUsd || current.disabled) {
     await openRouter(broker, 'PATCH', `/keys/${existing.hash}`, { limit: limitUsd, disabled: false });
     await store.kvSet(keyRecord(organizationId), JSON.stringify({ ...existing, limitUsd } satisfies KeyRecord));

@@ -11,7 +11,8 @@ import { accountRoom } from './account-room.js';
 /** Managed compute: tasks of an organization without its own provider account
  * run on the installation's (src/world/connections.ts MANAGED_COMPUTE), and
  * what they use is charged to the organization's monthly compute credit at
- * tavya's prices (COMPUTE_PRICE_MULTIPLIER × the provider's own). Wiki
+ * tavya's prices (COMPUTE_PRICE_MULTIPLIER × the provider's own, or the
+ * organization's own markup from when the operator set it). Wiki
  * features/managed-compute. */
 
 /** This month's compute is spent (or the plan has none). Like a provider limit
@@ -88,8 +89,8 @@ export async function trialCredit(store: Store, organizationId: string, month: {
   const drawnBy = async (at: number) => {
     const to = Math.min(at, trial.endsAt);
     if (to <= trial.startsAt) return 0;
-    const used = computeChargeMicros((await store.managedComputeCosts(trial.startsAt, to, organizationId))
-      .reduce((total, row) => total + row.costMicros, 0));
+    const used = (await store.managedComputeCosts(trial.startsAt, to, organizationId))
+      .reduce((total, row) => total + row.chargedMicros, 0);
     return Math.min(trial.creditMicros, used);
   };
   const usedMicros = await drawnBy(trial.endsAt);
@@ -121,12 +122,13 @@ export async function computeCredit(store: Store, organizationId: string, now = 
   const creditMicros = entitlements.computeCreditMicros;
   const topUpMicros = creditMicros == null ? 0 : (await topUpBalance(store, organizationId, creditMicros, now));
   const trial = creditMicros == null ? undefined : await trialCredit(store, organizationId, month, now);
-  const heldMicros = creditMicros == null ? 0 : computeChargeMicros(await store.computeHeldCostMicros(organizationId, now));
-  const usedMicros = computeChargeMicros(costMicros);
+  const heldMicros = creditMicros == null ? 0 : computeChargeMicros(await store.computeHeldCostMicros(organizationId, now),
+    await store.computePriceMultiplier(organizationId, now));
+  const usedMicros = costs.reduce((total, row) => total + row.chargedMicros, 0);
   return { ...month, creditMicros, topUpMicros, ...(trial ? { trial } : {}), usedMicros, heldMicros,
     availableMicros: creditMicros == null ? null : creditMicros + topUpMicros + (trial?.monthMicros ?? 0) - usedMicros - heldMicros, costMicros,
     seconds: costs.reduce((total, row) => total + row.seconds, 0),
-    byProvider: costs.map((row) => ({ provider: row.provider, usedMicros: computeChargeMicros(row.costMicros), seconds: row.seconds }))
+    byProvider: costs.map((row) => ({ provider: row.provider, usedMicros: row.chargedMicros, seconds: row.seconds }))
       .sort((a, b) => b.usedMicros - a.usedMicros) };
 }
 
@@ -151,8 +153,8 @@ export async function topUpBalance(store: Store, organizationId: string, allowan
     let draw = row?.drawnMicros;
     if (draw === undefined) {
       const balance = paid.filter((topUp) => topUp.settledAt! < next).reduce((total, topUp) => total + topUp.creditMicros, 0) - drawn;
-      const used = computeChargeMicros((await store.managedComputeCosts(monthStart(key), next, organizationId))
-        .reduce((total, cost) => total + cost.costMicros, 0));
+      const used = (await store.managedComputeCosts(monthStart(key), next, organizationId))
+        .reduce((total, cost) => total + cost.chargedMicros, 0);
       // What that month drew from the free trial is not the top-ups'.
       const trial = await trialCredit(store, organizationId, { from: monthStart(key), to: next }, next);
       draw = Math.max(0, Math.min(balance, used - (row?.allowanceMicros ?? allowanceMicros)
@@ -219,7 +221,8 @@ export async function assertComputeCredit(store: Store, organizationId: string, 
   let needed = 1;
   if (machine) {
     const rate = await machineRate(store, { organizationId, provider, ...machine }, now);
-    needed = Math.max(1, computeChargeMicros((rate.activeMicrosPerHour + rate.diskMicrosPerHour) * COMPUTE_HOLD.minStartMs / 3_600_000));
+    needed = Math.max(1, computeChargeMicros((rate.activeMicrosPerHour + rate.diskMicrosPerHour) * COMPUTE_HOLD.minStartMs / 3_600_000,
+      await store.computePriceMultiplier(organizationId, now)));
   }
   if (credit.availableMicros >= needed) return;
   (await store.kvSet(`compute-short:${organizationId}`, JSON.stringify({ at: now, neededMicros: needed })));
@@ -301,7 +304,8 @@ export async function holdManagedCompute(store: Store, request: ComputeHoldReque
   const endsAt = held?.endsAt ?? (existing && !existing.closedAt ? existing.endsAt : undefined);
   if (endsAt === undefined || endsAt < now + COMPUTE_HOLD.windowMs)
     (await store.kvSet(`compute-short:${request.organizationId}`, JSON.stringify({ at: now,
-      neededMicros: computeChargeMicros((rate.activeMicrosPerHour + rate.diskMicrosPerHour) * COMPUTE_HOLD.windowMs / 3_600_000) })));
+      neededMicros: computeChargeMicros((rate.activeMicrosPerHour + rate.diskMicrosPerHour) * COMPUTE_HOLD.windowMs / 3_600_000,
+        await store.computePriceMultiplier(request.organizationId, now)) })));
   if (endsAt !== undefined) return endsAt;
   throw exhausted(await computeCredit(store, request.organizationId, now), request.provider);
 }

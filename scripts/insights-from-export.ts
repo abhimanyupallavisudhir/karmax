@@ -52,6 +52,7 @@ await insert('resource_snapshot_chunks', (data.chunk_bytes ?? []).map((row: any,
   storageLocationId: row.storageLocationId, refs: 1, bytes: row.bytes })));
 await insert('promoted_artifacts', data.promoted_artifacts);
 await insert('compute_pack_gifts', data.compute_pack_gifts);
+await insert('compute_price_changes', data.compute_price_changes);
 await insert('storage_pack_gifts', data.storage_pack_gifts);
 await insert('compute_topups', data.compute_topups);
 await insert('compute_holds', data.compute_holds);
