@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { rememberSubscriptionCatalog } from './catalog.js';
 import type { Store } from '../store/db.js';
-import { COMPUTE_PACK, HOSTED_PLANS, STORAGE_PACK, hostedMonthlyPriceCents, hostedStorageQuotaBytes, isHostedPlanId,
+import { COMPUTE_MARKUP_MAX_PERCENT, COMPUTE_PACK, HOSTED_PLANS, STORAGE_PACK, hostedMonthlyPriceCents, hostedStorageQuotaBytes, isHostedPlanId,
   type HostedPlanId } from '../domain/entitlements.js';
 import { managedStorageLocationId } from '../store/storage-locations.js';
 import type { SubscriptionRuntimeConfig } from '../launch/settings.js';
@@ -401,6 +401,7 @@ export class SubscriptionBillingService {
       billedMonthlyPriceCents,
       storagePacks: account?.storagePacks ?? 0, storagePack, storagePackGift, giftedStoragePacks: storagePackGift?.packs ?? 0,
       computePacks: account?.computePacks ?? 0, computePack, computePackGift, giftedComputePacks: computePackGift?.packs ?? 0,
+      computePrice: await this.store.computePrice(organizationId),
       activeUsers: members, teamSeats,
       // People a paid Team still has to bill seats for (Bill seats); none
       // where nothing bills them (a gifted Team, or one the operator set).
@@ -470,6 +471,24 @@ export class SubscriptionBillingService {
       if (!(await this.store.getOrganization(organizationId))) throw new Error('organization not found');
       return this.idempotent(organizationId, `gift-compute:${packs}`, key, async () => {
         await this.store.setComputePackGift(organizationId, packs, grantedBy);
+        return this.current(organizationId);
+      });
+    });
+  }
+
+  /** The organization's own compute price, as a markup in whole percent on
+   * the provider's price (null: back to the default), from now on: use
+   * already made keeps the price it ran at. Hosted only, like gifts. */
+  async setComputeMarkup(organizationId: string, markupPercent: unknown, grantedBy: string, key: string) {
+    if (!this.hosted) throw new Error('compute prices are only set on hosted installations');
+    this.requireKey(key);
+    if (markupPercent !== null && (typeof markupPercent !== 'number' || !Number.isSafeInteger(markupPercent)
+      || markupPercent < 0 || markupPercent > COMPUTE_MARKUP_MAX_PERCENT))
+      throw new Error(`compute markup must be a whole percent from 0 to ${COMPUTE_MARKUP_MAX_PERCENT}, or null for the default`);
+    return this.store.transaction(async () => {
+      if (!(await this.store.getOrganization(organizationId))) throw new Error('organization not found');
+      return this.idempotent(organizationId, `compute-markup:${markupPercent}`, key, async () => {
+        await this.store.setComputeMarkup(organizationId, markupPercent, grantedBy);
         return this.current(organizationId);
       });
     });

@@ -1,5 +1,5 @@
 import type { Store } from '../store/db.js';
-import { computeChargeMicros, COMPUTE_PRICE_MULTIPLIER, STORAGE_PACK } from '../domain/entitlements.js';
+import { type ComputePriceChange, STORAGE_PACK, usageChargeMicros } from '../domain/entitlements.js';
 import type { AccountPool } from '../domain/computer-limits.js';
 import { usageCostUsd } from '../scheduling/costs.js';
 import {
@@ -14,7 +14,7 @@ import {
  *
  *   compute  `usage_events` world.active / world.disk: list cost (what the
  *            provider bills), what managed compute charged to credit (list ×
- *            COMPUTE_PRICE_MULTIPLIER), by provider, funding, project, task and
+ *            the organization's price then), by provider, funding, project, task and
  *            machine size; the month's credit against cumulative charges; where
  *            provider "Any" routed new computers (`world.routed`); and, for
  *            operators, each managed account's peak use against its budget.
@@ -53,13 +53,13 @@ const dayStart = (window: InsightWindow, index: number) => (window.firstDay + in
 /** Split [start, end) over the window's days, in proportion to time (a row
  * that lasted an hour across midnight counts half on each day). A row with no
  * duration falls on its start. */
-function spread(window: InsightWindow, start: number, end: number, add: (index: number, share: number) => void): void {
+function spread(window: InsightWindow, start: number, end: number, add: (index: number, share: number, from: number, to: number) => void): void {
   const first = localDay(window, start) - window.firstDay;
-  if (!(end > start)) { if (first >= 0 && first < window.days) add(first, 1); return; }
+  if (!(end > start)) { if (first >= 0 && first < window.days) add(first, 1, -Infinity, Infinity); return; }
   const last = localDay(window, end - 1) - window.firstDay;
   for (let index = Math.max(0, first); index <= Math.min(window.days - 1, last); index++) {
-    const overlap = Math.min(end, dayStart(window, index + 1), window.now) - Math.max(start, dayStart(window, index));
-    if (overlap > 0) add(index, overlap / (end - start));
+    const from = Math.max(start, dayStart(window, index)), to = Math.min(end, dayStart(window, index + 1), window.now);
+    if (to > from) add(index, (to - from) / (end - start), from, to);
   }
 }
 
@@ -195,12 +195,13 @@ async function computeRows(store: Store, organizationId: string | null, from: nu
     metadata: parseJson(row.metadata), startedAt: Number(row.startedAt), endedAt: Number(row.endedAt) }));
 }
 
-/** One row's measures, scaled by the share of it that falls in a bucket. */
-function measure(row: UsageRow, share: number): ComputeMoney {
+/** One row's measures, scaled by the share of it that falls in a bucket
+ * ([from, to)); managed compute charged at the organization's price then. */
+function measure(row: UsageRow, share: number, prices: readonly ComputePriceChange[], from: number, to: number): ComputeMoney {
   const managed = row.fundingSource === 'managed';
   const listMicros = row.costMicros * share;
   const seconds = row.quantity * share;
-  return { listMicros, chargedMicros: managed ? listMicros * COMPUTE_PRICE_MULTIPLIER : 0,
+  return { listMicros, chargedMicros: managed ? usageChargeMicros(prices, row, from, to) : 0,
     activeSeconds: row.kind === 'world.active' ? seconds : 0,
     diskGbHours: row.kind === 'world.disk' ? (seconds / 3600) * (Number(row.metadata.diskGb) || 0) : 0 };
 }
@@ -218,6 +219,7 @@ export async function computeInsights(store: Store, organizationId: string, wind
   budgets?: Array<{ provider: string; pool?: AccountPool }>;
 }): Promise<ComputeInsights> {
   const rows = await computeRows(store, organizationId, window.previousFrom, window.now + 1);
+  const prices = await store.computePriceChanges(organizationId);
   const totals = { ...emptyMoney(), managed: emptyMoney(), own: emptyMoney() };
   const previous = emptyMoney();
   const daily = Array.from({ length: window.days }, () => ({ ...emptyMoney(), byProvider: {} as Record<string, number>,
@@ -239,22 +241,23 @@ export async function computeInsights(store: Store, organizationId: string, wind
     const funding: ComputeFundingKind = row.fundingSource === 'managed' ? 'managed' : 'own';
     if (row.startedAt < window.from) {
       const part = Math.min(1, row.endedAt > row.startedAt ? Math.max(0, (Math.min(row.endedAt, window.from) - row.startedAt) / (row.endedAt - row.startedAt)) : 1);
-      add(previous, measure(row, part));
+      add(previous, measure(row, part, prices, -Infinity, window.from));
     }
     const size = row.kind === 'world.active' ? machineSizeLabel(row.metadata) : (row.taskId && sizeOfTask.get(row.taskId)) || 'Unknown size';
     let inside = 0;
-    spread(window, row.startedAt, row.endedAt, (index, share) => {
+    const value = emptyMoney();
+    spread(window, row.startedAt, row.endedAt, (index, share, from, to) => {
       inside += share;
-      const value = measure(row, share);
+      const slice = measure(row, share, prices, from, to);
+      add(value, slice);
       const day = daily[index]!;
-      add(day, value);
-      day.byProvider[row.provider] = (day.byProvider[row.provider] ?? 0) + value.listMicros;
-      day.byFunding[funding] += value.listMicros;
-      day.byProject[row.projectId ?? ''] = (day.byProject[row.projectId ?? ''] ?? 0) + value.listMicros;
-      day.bySize[size] = (day.bySize[size] ?? 0) + value.listMicros;
+      add(day, slice);
+      day.byProvider[row.provider] = (day.byProvider[row.provider] ?? 0) + slice.listMicros;
+      day.byFunding[funding] += slice.listMicros;
+      day.byProject[row.projectId ?? ''] = (day.byProject[row.projectId ?? ''] ?? 0) + slice.listMicros;
+      day.bySize[size] = (day.bySize[size] ?? 0) + slice.listMicros;
     });
     if (!inside) continue;
-    const value = measure(row, inside);
     add(totals, value); add(totals[funding], value);
     add(group(groups.providers, `${row.provider}\u0000${funding}`, () => ({ key: row.provider, label: row.provider, funding })), value);
     add(group(groups.projects, row.projectId ?? '', () => ({ key: row.projectId ?? '',
@@ -269,7 +272,7 @@ export async function computeInsights(store: Store, organizationId: string, wind
   const ranked = (map: Map<string, ComputeBreakdownRow>, limit = Infinity) => [...map.values()].map(roundMoney)
     .sort((a, b) => b.listMicros - a.listMicros || b.activeSeconds - a.activeSeconds).slice(0, limit);
   const result: ComputeInsights = {
-    multiplier: COMPUTE_PRICE_MULTIPLIER,
+    multiplier: await store.computePriceMultiplier(organizationId, window.now),
     totals: { ...roundMoney(totals), managed: roundMoney(totals.managed), own: roundMoney(totals.own) },
     previous: roundMoney(previous),
     daily: daily.map((day) => ({ ...roundMoney(day), byProvider: roundValues(day.byProvider), byFunding: roundValues(day.byFunding),
@@ -299,17 +302,16 @@ async function creditView(store: Store, organizationId: string, now: number): Pr
   const daysInMonth = Math.round((credit.to - credit.from) / DAY);
   const today = Math.min(daysInMonth - 1, Math.floor((now - credit.from) / DAY));
   const perDay = Array.from({ length: today + 1 }, () => 0);
+  const prices = await store.computePriceChanges(organizationId);
   for (const row of await computeRows(store, organizationId, credit.from, credit.to, true)) {
     const start = Math.max(row.startedAt, credit.from), end = Math.min(row.endedAt, credit.to);
     const duration = row.endedAt - row.startedAt;
-    if (!(duration > 0)) { const index = Math.floor((row.startedAt - credit.from) / DAY); if (perDay[index] !== undefined) perDay[index] += row.costMicros; continue; }
-    for (let index = Math.floor((start - credit.from) / DAY); index <= Math.min(today, Math.floor((end - 1 - credit.from) / DAY)); index++) {
-      const overlap = Math.min(end, credit.from + (index + 1) * DAY) - Math.max(start, credit.from + index * DAY);
-      if (overlap > 0) perDay[index]! += row.costMicros * overlap / duration;
-    }
+    if (!(duration > 0)) { const index = Math.floor((row.startedAt - credit.from) / DAY); if (perDay[index] !== undefined) perDay[index] += usageChargeMicros(prices, row); continue; }
+    for (let index = Math.floor((start - credit.from) / DAY); index <= Math.min(today, Math.floor((end - 1 - credit.from) / DAY)); index++)
+      perDay[index]! += usageChargeMicros(prices, row, credit.from + index * DAY, credit.from + (index + 1) * DAY);
   }
   let running = 0;
-  const cumulative = perDay.map((micros) => (running += micros, computeChargeMicros(running)));
+  const cumulative = perDay.map((micros) => (running += micros, Math.round(running)));
   const packMicros = entitlements.computePacks * entitlements.computePackCreditMicros;
   const giftMicros = entitlements.giftedComputePacks * entitlements.computePackCreditMicros;
   return { month: new Date(credit.from).toISOString().slice(0, 7), from: credit.from, to: credit.to,

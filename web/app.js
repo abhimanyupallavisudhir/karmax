@@ -25981,8 +25981,9 @@ function planBillingMarkup(e, state) {
     choices = `<div class="plan-choices">${card(catalog.individual)}${card(catalog.team)}</div>
       ${packsOnly ? '' : `<div class="plan-terms">${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')} ${checkoutTermsTip()}</div>`}`;
   }
-  // The operator's complimentary plan and packs.
-  const gifts = state?.canGift ? `<details class="plan-operator"><summary>Gifts</summary><div class="setting-rows">
+  // The operator's complimentary plan and packs, and this organization's compute price.
+  const computePrice = state?.computePrice;
+  const gifts = state?.canGift ? `<details class="plan-operator"><summary>Operator</summary><div class="setting-rows">
     <div class="setting-row"><span class="setting-label">Plan ${policyTip('Free access until removed. Paid billing, if any, continues separately. A gifted Team covers this many people; its owner buys more seats beside the gift.')}</span><span class="setting-value">
       <select id="billing-gift-plan" aria-label="Gift plan">${Object.values(catalog).filter((plan) => plan.id !== 'free').map((plan) => `<option value="${esc(plan.id)}" ${state.gift?.plan === plan.id ? 'selected' : ''}>${esc(plan.name)}</option>`).join('')}</select>
       <input id="billing-gift-seats" type="number" min="1" max="10000" step="1" value="${esc(state.gift?.seats ?? Math.max(1, members))}" class="plan-gift-count" aria-label="Gifted seats" ${state.gift?.plan === 'individual' ? 'hidden' : ''}><span class="setting-muted billing-gift-seats-unit" ${state.gift?.plan === 'individual' ? 'hidden' : ''}>seats</span></span>
@@ -25993,6 +25994,9 @@ function planBillingMarkup(e, state) {
     <div class="setting-row"><span class="setting-label">${esc(planPackName('compute', state.computePack ?? { creditMicros: e.computePackCreditMicros }))} compute packs ${policyTip(`${planDollars(state.computePack?.creditMicros ?? e.computePackCreditMicros)} of compute a month each, on any plan, until set to 0. Nothing is billed.`)}</span><span class="setting-value">
       <input id="billing-gift-compute" type="number" min="0" max="1000" step="1" value="${esc(state.giftedComputePacks || 0)}" class="plan-gift-count" aria-label="Gifted compute packs"></span>
       <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="compute">Save</button></span></div>
+    ${computePrice ? `<div class="setting-row"><span class="setting-label">Compute markup ${policyTip(`Over what providers charge, for this organization's computers and included model. Applies from now on. Empty: the default, ${computePrice.defaultMarkupPercent}%.`)}</span><span class="setting-value">
+      <input id="billing-compute-markup" type="number" min="0" max="1000" step="1" value="${computePrice.markupPercent ?? ''}" placeholder="${esc(computePrice.defaultMarkupPercent)}" class="plan-gift-count" aria-label="Compute markup"><span class="setting-muted">%</span></span>
+      <span class="setting-actions"><button class="btn sm billing-compute-markup">Save</button></span></div>` : ''}
   </div></details>` : '';
   return `${head}${noteHtml}<div class="setting-rows ruled plan-limits">${peopleRow}${agentsRow}${storageRow}${computeRow}${topUpRow}</div>${choices}${gifts}
     ${subscribed || packsOnly ? `<p class="plan-foot setting-muted">Separate from the cards agents pay with. <a href="/legal/billing" data-public>Billing terms</a></p>` : ''}`;
@@ -26113,6 +26117,12 @@ async function hydratePlanAndBilling(organizationId) {
     const packs = Number($(kind === 'compute' ? '#billing-gift-compute' : '#billing-gift-packs').value);
     if (!Number.isInteger(packs) || packs < 0 || packs > 1000) throw new Error('Enter a whole number from 0 to 1000');
     await post(kind === 'compute' ? 'gift-compute' : 'gift-storage', { packs }); toast(packs ? 'Packs gifted' : 'Gifted packs removed');
+  });
+  act('.billing-compute-markup', async () => {
+    const value = $('#billing-compute-markup').value.trim();
+    const markupPercent = value === '' ? null : Number(value);
+    if (markupPercent !== null && (!Number.isInteger(markupPercent) || markupPercent < 0 || markupPercent > 1000)) throw new Error('Enter a whole percent from 0 to 1000, or leave it empty for the default');
+    await post('compute-markup', { markupPercent }); toast(markupPercent === null ? 'Default markup' : `Markup ${markupPercent}%`);
   });
 }
 
