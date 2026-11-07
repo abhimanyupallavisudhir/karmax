@@ -133,7 +133,7 @@ describe.each(BACKENDS)('an organization\'s compute markup (%s)', (name) => {
     // A retry with the same key changes nothing more.
     await billing.setComputeMarkup(f.organization.id, 30, 'user:operator', 'markup-key-1');
     expect(await f.store.computePriceChanges(f.organization.id)).toHaveLength(1);
-    expect((await billing.setComputeMarkup(f.organization.id, null, 'user:operator', 'markup-key-2')).computePrice.markupPercent).toBeNull();
+    expect((await billing.setComputeMarkup(f.organization.id, null, 'user:operator', 'markup-key-2')).computePrice?.markupPercent).toBeNull();
     expect(routeCapability('POST', `/api/organizations/${f.organization.id}/subscription/compute-markup`)).toBe('subscription:gift');
 
     if (backend === 'postgres') return;
