@@ -68,7 +68,7 @@ function constant(name) {
       };
     });
     await page.addScriptTag({ content: [
-      constant('URGENCY_LEVELS'), 'const systemNotifications = new Map();',
+      constant('URGENCY_LEVELS'), 'const systemNotifications = new Map();', 'function syncDocumentTitle() {}',
       ...['updateBell', 'syncNotificationAlerts', 'urgencyRank', 'inboxUnreadCount', 'taskHasUnreadAsk', 'inboxRowLabel', 'inboxTitle', 'urgencyChip',
         'inboxNotices', 'inboxNoticesHtml', 'wireInboxNotices', 'isNewTabClick', 'wireRowLink', 'markInboxItemRead', 'slugify', 'projectSlug', 'projectPath', 'orgSlug', 'projectLabel',
         'rowKey', 'cursorRows', 'applyCursor', 'moveCursor', 'openListRow', 'isSeries', 'rowTime', 'fmtWhen', 'rowWhen', 'rowQuickQuestion', 'rowAskHtml', 'accountWaitReason', 'statusTone', 'statusHtml', 'viewStatusHtml', 'taskRow'].map(fn),

@@ -763,6 +763,7 @@ function renderRouteLoadingPage(title, label = 'Loading…') {
     <b>${esc(title || 'Opening')}</b>
     <span class="global-search-loading">${esc(label)}</span>
   </div>`;
+  syncDocumentTitle();
 }
 
 async function applyRoute() {
@@ -5857,6 +5858,37 @@ function applyDocumentBrand() {
     `${siteName()} is the agentic to-do list that finishes itself: agents work in parallel on their own computers; you review the result. Use your Claude or ChatGPT plan.`);
 }
 
+// The browser tab names the console page on screen, most specific part first so a
+// narrow tab still tells pages apart, and leads with the bell's count so a tab in
+// the background shows that something waits on you. Derived from state and the
+// DOM alone, so every paint can call it.
+function consolePageTitle() {
+  const form = $('#tf-page');
+  if (form) return [form.dataset.title || 'New task'];
+  const loading = $('#main > .route-loading b')?.textContent;
+  if (loading) return [loading];
+  const project = projectById(S.projectId)?.name;
+  const org = currentOrg()?.name;
+  if (S.selected) {
+    const task = S.view?.taskId === S.selected ? { ...taskRecord(S.selected), ...S.view } : taskRecord(S.selected);
+    const name = projectById(task?.projectId)?.name || project;
+    return [task?.title || 'Task', task?.num != null ? `${name || ''} #${task.num}`.trim() : name];
+  }
+  const fileName = String(S.filesPath || '').split('/').filter(Boolean).pop();
+  return {
+    home: [org], inbox: ['Inbox'], insights: ['Insights', org], orgwiki: ['Wiki', org], organization: ['Settings', org],
+    installation: ['Installation'], profile: ['Profile'],
+    tasks: [project], queue: ['Queues', project], activity: ['Activity', project],
+    files: [fileName || 'Files', project], wiki: ['Wiki', project], settings: ['Settings', project],
+  }[S.tab] || [];
+}
+function syncDocumentTitle() {
+  if (!$('#main')) return; // public pages and sign-in set their own
+  const unread = inboxUnreadCount();
+  const title = [...consolePageTitle(), siteName()].filter(Boolean).join(' · ');
+  document.title = unread ? `(${unread}) ${title}` : title;
+}
+
 // The gateway resolves /brand/* against the instance-wide icon setting, so the
 // mark carries no client state — which is also what lets it render on the
 // pre-auth login screens. The counter only busts the HTTP cache after a switch.
@@ -6719,6 +6751,7 @@ function renderMain() {
   if (context) context.textContent = S.selected ? ''
     : PROJECT_SCOPED_TABS.includes(S.tab) ? projectById(S.projectId)?.name || ''
     : ['home', 'insights', 'orgwiki', 'organization'].includes(S.tab) ? currentOrg()?.name || '' : '';
+  syncDocumentTitle();
   // A preload begun on the task list must not survive a trip through settings,
   // where the defaults it captured may have just been edited.
   if (!isTaskListTab()) taskFormDefaultRequests.clear();
@@ -9448,8 +9481,25 @@ function taskFormTitle(draft) {
   return !draft ? 'New task' : p.triggerState === 'armed' || isSeries(p) ? 'Edit task' : restingAvatar(draft) ? 'Edit Avatār' : 'Edit draft';
 }
 
+// The browser tab's name for a task form page: what it edits, else what the page is.
+function taskFormTabTitle(draft, title) {
+  return title || draft?.title || (draft ? 'Draft' : 'New task');
+}
+
+// The tab is named for the form page while it is open, and for the page beneath
+// once it goes — however it goes (closed, run, saved, navigated away from).
+function watchTaskFormTitle(root) {
+  syncDocumentTitle();
+  const watch = new MutationObserver(() => {
+    if (root.querySelector('#tf-page')) return;
+    watch.disconnect();
+    syncDocumentTitle();
+  });
+  watch.observe(root, { childList: true });
+}
+
 function taskFormLoadingPage(project, draft, title) {
-  return `<div class="task-form-page" id="tf-page" tabindex="-1" aria-busy="true">
+  return `<div class="task-form-page" id="tf-page" tabindex="-1" aria-busy="true" data-title="${esc(taskFormTabTitle(draft, title))}">
     <div class="tf-head"><div class="tf-head-inner">
       <button class="icon-btn" id="tf-close" data-shortcut="nav.close" title="Back (Esc)">←</button>
       <h2>${title ? esc(title) : taskFormTitle(draft)}</h2>
@@ -9603,6 +9653,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // feedback while keeping the not-yet-hydrated controls safely non-interactive.
   const formTitle = templateEdit ? (templateEdit.template ? 'Edit template' : 'New template') : store?.name || '';
   root.innerHTML = taskFormLoadingPage(proj, draft, formTitle);
+  watchTaskFormTitle(root);
   // Closing a draft's own page returns to where the task was opened from —
   // unless a navigation is what closed it.
   const leavePage = (navigating) => {
@@ -9663,7 +9714,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     ? renderField(f, values[f.name], inherited[f.name], false, undefined, { authority: { html: mainAuthorityHtml, summary: authorizationSummary(selectedAuthorization, authorizationProjects) } })
     : renderField(f, values[f.name], inherited[f.name]);
   root.innerHTML = `
-    <div class="task-form-page" id="tf-page" tabindex="-1">
+    <div class="task-form-page" id="tf-page" tabindex="-1" data-title="${esc(taskFormTabTitle(draft, formTitle))}">
       <div class="tf-head">
         <div class="tf-head-inner">
           <button class="icon-btn" id="tf-close" data-shortcut="nav.close" title="${editInPlace ? 'Back (Esc) — your changes are kept' : 'Back (Esc) — your work is kept as a draft'}">←</button>
@@ -10572,6 +10623,7 @@ function renderTaskLoadingPage(rec, error, notStarted = false) {
       ? `<div class="task-load-error"><b>Couldn’t load this task</b><span title="${esc(error)}">${esc(plainError(error))}</span><button class="btn sm" id="task-load-retry">Try again</button></div>`
       : '<span class="global-search-loading">Loading task…</span>'}</div>
   </div>`;
+  syncDocumentTitle();
   $('#tp-back')?.addEventListener('click', plainClick(closeTask));
   $('#task-load-retry')?.addEventListener('click', () => openTask(rec?.id || S.selected, S.taskTab, !!S.viewingAttempt));
 }
@@ -11580,6 +11632,7 @@ function renderTaskPage() {
         <aside class="tp-rail" id="tp-rail" aria-label="Task details">${taskRail(v, rec)}</aside>
       </div>
     </div>`);
+  syncDocumentTitle();
   $('#tp-back').addEventListener('click', plainClick(closeTask));
   // The tabs are real links (Ctrl/⌘-click or middle-click opens the pinned tab in
   // a new browser tab); a plain click switches in place without a refetch.
@@ -24580,6 +24633,7 @@ function wireGlobalSettings(organizationId) {
 // once you open its task (markTaskAsksRead) or the notice itself.
 function updateBell() {
   syncNotificationAlerts();
+  syncDocumentTitle();
   const badge = $('#bell-badge');
   if (!badge) return;
   const n = inboxUnreadCount();
