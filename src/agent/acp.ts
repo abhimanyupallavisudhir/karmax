@@ -107,7 +107,8 @@ function openCodeModel(profile: AgentProfile): string | undefined {
   return profile.modelProvider ? `${provider}/${profile.model}` : profile.model;
 }
 
-function openCodeConfig(profile: AgentProfile, hasApiKey: boolean, systemPrompt: string): Record<string, unknown> {
+function openCodeConfig(profile: AgentProfile, hasApiKey: boolean, systemPrompt: string,
+  modelOptions?: Record<string, unknown>): Record<string, unknown> {
   const model = openCodeModel(profile);
   const provider = credentialProvider(profile);
   const config: Record<string, unknown> = {
@@ -149,14 +150,25 @@ function openCodeConfig(profile: AgentProfile, hasApiKey: boolean, systemPrompt:
     // Explicit env interpolation avoids relying on each AI SDK package's
     // conventional variable name (Google alone has several). The secret remains
     // process-local and the provider implementation remains OpenCode's official one.
+    // Options the key comes with (OpenRouter routing on tavya's included key)
+    // apply to the model as OpenCode names it within its provider.
+    const id = model?.startsWith(`${provider}/`) ? model.slice(provider.length + 1) : undefined;
     config.provider = {
       [provider]: {
         options: { apiKey: `{env:${apiKeyEnv(provider)}}` },
+        ...(modelOptions && id ? { models: { [id]: { options: modelOptions } } } : {}),
       },
     };
   }
   return config;
 }
+
+/** The most output (thinking included) OpenCode lets one model call write;
+ * OpenCode's own default is 32,000, and it never asks more than the model's
+ * limit. At high effort Claude Haiku 5.5 thought past 32,000 tokens in 3 of 8
+ * harder tasks of tavya's model evaluation (up to 57,498) and DeepSeek V4.1
+ * Flash in 1 of 36 runs: the call stopped at the cap with nothing written. */
+export const OPENCODE_OUTPUT_TOKEN_MAX = 64_000;
 
 /** Above this, OpenCode reads the system prompt from a file (`{file:…}`): an
  * environment variable such as OPENCODE_CONFIG_CONTENT is capped at 128 KiB by
@@ -183,7 +195,9 @@ function harnessSpec(input: TurnInput, systemPrompt = input.systemPrompt): Harne
 
   if (provider === 'opencode') {
     env.OPENCODE_DISABLE_AUTOUPDATE = '1';
-    env.OPENCODE_CONFIG_CONTENT = JSON.stringify(openCodeConfig(input.profile, !!env[credentialEnv], systemPrompt));
+    env.OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX = String(OPENCODE_OUTPUT_TOKEN_MAX);
+    env.OPENCODE_CONFIG_CONTENT = JSON.stringify(openCodeConfig(input.profile, !!env[credentialEnv], systemPrompt,
+      input.resolvedAuth?.apiKey ? input.resolvedAuth.modelOptions : undefined));
     return { command: process.env.KARMAX_OPENCODE_CMD ?? 'opencode', args: ['acp'], env };
   }
   if (provider === 'kimi') {

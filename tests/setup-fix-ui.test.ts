@@ -49,7 +49,7 @@ describe('what a person does about a task that cannot start', () => {
     const pricey = await ui.run<any[]>(`readinessGaps({ agents: [{ provider: 'opencode', model: 'openrouter/openai/gpt-6.1-sol', ready: true, cost: 7.9 },
       { provider: 'opencode', model: 'openrouter/xiaomi/mimo-v2.6-flash', ready: true, cost: 0.4 }], compute: { ready: true } })`);
     expect(pricey).toEqual([{ label: 'costs 7.9× the included model', href: '/org/settings#settings-plan', warn: true, lead: 'On your credit:',
-      tip: expect.stringMatching(/^openai\/gpt-6\.1-sol runs on your compute credit at about 7\.9 times the included model’s price a task\./) }]);
+      tip: expect.stringMatching(/^openai\/gpt-6\.1-sol runs on your compute credit at about 7\.9 times what a task on the included model costs\./) }]);
     expect((await ui.run<string>(`readinessNoticeHtml(readinessGaps({ agents: [{ provider: 'opencode', model: 'openrouter/openai/gpt-6.1-sol', ready: true, cost: 12.4 }],
       compute: { ready: true }, storage: { full: true, usedBytes: 1, quotaBytes: 1 } }))`)).replace(/<[^>]+>/g, ''))
       .toBe('!On your credit: costs 12× the included model·Storage is full: Add storage');

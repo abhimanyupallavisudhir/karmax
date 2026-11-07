@@ -122,6 +122,7 @@ import { enumerateCredentials, normalizePolicy, resolveCredentials } from '../pl
 import { errorStatus } from './error-status.js';
 import { projectReadiness, usableAgentCredentials, type ReadinessDeps } from '../platform/readiness.js';
 import { includedModel, includedModelView, removeIncludedModelKey, saveIncludedModel, seedIncludedModelDefaults } from '../agent/included-model.js';
+import type { Effort } from '../agent/effort.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems, itemHandle, relatedVaultItems, searchVaultItems, weakensProtection } from '../autonomy/vault-items.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
@@ -2775,7 +2776,7 @@ export class Gateway {
         return this.json(res, 200, { ...view, canManage: write || (await this.deps.tokens.check(token, 'settings:write')).ok });
       }
       // tavya's included model (wiki features/included-model): GET its
-      // settings and this month's use; PUT {managementKey?, model?, enabled?}
+      // settings and this month's use; PUT {managementKey?, model?, effort?, enabled?}
       // (the OpenRouter management key write-only).
       if (p === '/api/settings/included-model') {
         if (!this.deps.broker) return this.json(res, 503, { error: 'the vault is unavailable' });
@@ -2786,6 +2787,7 @@ export class Gateway {
           const saved = await saveIncludedModel(store, this.deps.broker, {
             ...(b.managementKey ? { managementKey: String(b.managementKey) } : {}),
             ...(b.model !== undefined ? { model: String(b.model) } : {}),
+            ...(b.effort !== undefined ? { effort: String(b.effort ?? '') } : {}),
             ...(b.enabled !== undefined ? { enabled: b.enabled !== false } : {}) });
           this.modelCatalog.invalidate();
           await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'included-model.save', 'installation:included-model',
@@ -4313,15 +4315,18 @@ export class Gateway {
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       // Whether this project's tasks can start: an agent login for each named
-      // agent (`agent=<harness>[:<model>]`, repeatable) and a computer.
+      // agent (`agent=<harness>[:<model>[:<effort>]]`, repeatable) and a computer.
       const projectReadinessMatch = p.match(/^\/api\/projects\/([^/]+)\/readiness$/);
       if (projectReadinessMatch && method === 'GET') {
         const project = (await store.getProject(projectReadinessMatch[1]!));
         if (!project) return this.json(res, 404, { error: 'no project' });
         const agents = url.searchParams.getAll('agent').slice(0, 8).map((value) => {
           const at = value.indexOf(':');
-          return at < 0 ? { provider: value } : { provider: value.slice(0, at), ...(value.slice(at + 1) ? { model: value.slice(at + 1) } : {}) };
-        }).filter((agent): agent is { provider: Provider; model?: string } => isAgentProvider(agent.provider));
+          if (at < 0) return { provider: value };
+          // A trailing effort name is the effort; model ids' own suffixes (`:free`) are not efforts.
+          const [, model, effort] = value.slice(at + 1).match(/^(.*?)(?::(low|medium|high|xhigh|max))?$/)!;
+          return { provider: value.slice(0, at), ...(model ? { model } : {}), ...(effort ? { effort: effort as Effort } : {}) };
+        }).filter((agent): agent is { provider: Provider; model?: string; effort?: Effort } => isAgentProvider(agent.provider));
         return this.json(res, 200, (await projectReadiness(this.readinessDeps(),
           { organizationId: project.organizationId ?? 'org_personal', projectId: project.id }, agents)));
       }

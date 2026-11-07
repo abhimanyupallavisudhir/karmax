@@ -136,7 +136,12 @@ export interface TurnInput {
   /** Max tool/agent iterations for this turn. */
   maxTurns?: number;
   /** Credentials resolved JIT by the broker (never journaled); preferred over env. */
-  resolvedAuth?: { apiKey?: string; configHome?: string; oauthToken?: string };
+  resolvedAuth?: {
+    apiKey?: string; configHome?: string; oauthToken?: string;
+    /** OpenCode options for the model on this key: the provider routing tavya's
+     *  included model requires (wiki features/included-model). */
+    modelOptions?: Record<string, unknown>;
+  };
   /** Extra env for the agent subprocess, resolved JIT (never journaled) — e.g. the
    *  git profile's GIT_SSH_COMMAND / GH_TOKEN (wiki plans/PLAN-git-config §4B), so an agent
    *  that pushes or runs `gh` does so as the project's git account. */

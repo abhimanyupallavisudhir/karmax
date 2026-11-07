@@ -18,19 +18,29 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
 import { COMPUTE_PRICE_MULTIPLIER } from '../domain/entitlements.js';
 import type { AgentProfile } from '../domain/types.js';
+import { EFFORTS, type Effort } from './effort.js';
 import type { Store } from '../store/db.js';
 import { ComputeCreditExhausted, computeCredit, outOfCompute } from '../world/managed-compute.js';
 
-/** Xiaomi MiMo-V2.6-Pro: the best intelligence per dollar on tavya's own
- * workload (2026-11-06). tavya's agents read far more than they write: 10.05 B
- * input tokens, nearly all cached, to 21.5 M output over 360 shipped tasks in
- * 30 days, so the cached-input price decides what a task costs, not the
- * output-heavy cost per task Artificial Analysis charts. At $0.435 / $0.87 /
- * $0.0036 per million input / output / cached tokens it scores 46.3 on the AA
- * Intelligence Index (Terminal-Bench 4.0: 34.9) for about $0.76 of such a task;
- * DeepSeek V4.1 Flash scores 39.5 for about $0.59, GPT-6.1 Sol 47.8 (medium)
- * for about $6 (its cached input is $0.10). */
-export const INCLUDED_MODEL_DEFAULT = 'xiaomi/mimo-v2.6-pro';
+/** DeepSeek V4.1 Flash at max effort (2026-11-07). On tavya's model
+ * evaluation (wiki features/included-model: OpenCode as tavya runs it, three
+ * real karmax fixes and six new-user tasks, each graded by a hidden test, two
+ * runs each) it passed 17 of 18 on INCLUDED_MODEL_OPTIONS' providers (the
+ * miss: OpenCode's output cap, now raised: OPENCODE_OUTPUT_TOKEN_MAX) for $0.021 a
+ * task at OpenRouter's prices. GPT-6.1 Terra (medium) and Sol (medium) passed
+ * all 18 for 2.8× and 5.1× that: they spend 2–3× fewer tokens, at 7–20× the
+ * price. Claude Haiku 5.5 (high) costs about as much, but needed that cap
+ * raised more often, and costs 5× past 100k tokens of context; MiMo-V2.6-Pro,
+ * the previous default, missed 4 of 14 and was the slowest. */
+export const INCLUDED_MODEL_DEFAULT = 'deepseek/deepseek-v4.1-flash-1017';
+export const INCLUDED_MODEL_DEFAULT_EFFORT = 'max';
+
+/** OpenRouter routing every turn on tavya's key asks for, whichever model the
+ * organization picked: only providers that keep no prompts (zero data
+ * retention), and no 4-bit build of an open model (closed models' providers
+ * report no quantization, "unknown"). An open model is served by dozens of
+ * providers, and OpenRouter otherwise picks the cheapest. */
+export const INCLUDED_MODEL_OPTIONS = { provider: { zdr: true, quantizations: ['fp8', 'bf16', 'fp16', 'fp32', 'unknown'] } };
 
 /** Below this much credit (at tavya's prices) a turn on the included model
  * does not start. */
@@ -43,8 +53,10 @@ const keyHandle = (organizationId: string) => `included-model:organization:${org
 const apiBase = () => (process.env.KARMAX_OPENROUTER_API_URL ?? 'https://openrouter.ai/api/v1').replace(/\/$/, '');
 
 export interface IncludedModelSettings {
-  /** The OpenRouter model id, e.g. xiaomi/mimo-v2.6-pro. */
+  /** The OpenRouter model id, e.g. deepseek/deepseek-v4.1-flash-1017. */
   model: string;
+  /** The reasoning effort Task defaults give it; none: the model's own. */
+  effort?: string;
   enabled: boolean;
 }
 
@@ -67,7 +79,8 @@ export const includedAgentModel = (settings: Pick<IncludedModelSettings, 'model'
 async function readSettings(store: Store): Promise<IncludedModelSettings | undefined> {
   try {
     const value = JSON.parse((await store.kvGet(CONFIG_KEY)) ?? 'null') as Partial<IncludedModelSettings> | null;
-    return value?.model ? { model: String(value.model), enabled: value.enabled !== false } : undefined;
+    return value?.model ? { model: String(value.model), ...(value.effort ? { effort: String(value.effort) } : {}),
+      enabled: value.enabled !== false } : undefined;
   } catch { return undefined; }
 }
 
@@ -87,10 +100,24 @@ export function isIncludedModel(profile: Pick<AgentProfile, 'provider' | 'model'
   return !!settings && profile.provider === 'opencode' && /^openrouter\/[^/]+\/./.test(profile.model ?? '');
 }
 
-/** The share of a typical tavya task's tokens at each price, from production
- * (see INCLUDED_MODEL_DEFAULT): per input token, 5% uncached and 95% read
- * from the cache, and 0.2% as many output tokens. */
-const TASK_MIX = { prompt: 0.05, cache: 0.95, completion: 0.002 };
+/** What a task cost on tavya's model evaluation (2026-11-07), USD at
+ * OpenRouter's prices, averaged over the seven tasks every model ran twice;
+ * keyed `<model>:<effort>`. A price alone misleads: GPT-6.1's tokens cost
+ * 7–20× DeepSeek's, but it spends 2–3× fewer of them. */
+export const MEASURED_TASK_USD: Readonly<Record<string, number>> = {
+  'deepseek/deepseek-v4.1-flash-1017:max': 0.0209,
+  'anthropic/claude-haiku-5.5:high': 0.0167,
+  'openai/gpt-6-luna:max': 0.0208,
+  'xiaomi/mimo-v2.6-pro:': 0.0413,
+  'openai/gpt-6.1-terra:medium': 0.0582,
+  'openai/gpt-6.1-terra:high': 0.0802,
+  'openai/gpt-6.1-sol:medium': 0.1069,
+};
+
+/** Otherwise, the share of a task's tokens at each price, from the same
+ * evaluation: per input token, 9% uncached and 91% read from the cache, and
+ * 3.4% as many output tokens (reasoning included). */
+const TASK_MIX = { prompt: 0.09, cache: 0.91, completion: 0.034 };
 const PRICES_TTL_MS = 6 * 60 * 60_000;
 let prices: { at: number; byId: Map<string, { prompt: number; completion: number; cache?: number }> } | undefined;
 
@@ -109,16 +136,21 @@ async function openRouterPrices(now = Date.now()) {
   return byId;
 }
 
-/** About how many times the included model's price a typical task on
- * `agentModel` (`openrouter/<id>`) costs; undefined when either price is unknown. */
-export async function includedModelRelativeCost(settings: IncludedModelSettings, agentModel: string): Promise<number | undefined> {
+/** About how many times the included model's cost a typical task on
+ * `agentModel` (`openrouter/<id>`) at `effort` costs: measured where both
+ * were (MEASURED_TASK_USD), else from their prices; undefined when a price is
+ * unknown. */
+export async function includedModelRelativeCost(settings: IncludedModelSettings, agentModel: string, effort?: string): Promise<number | undefined> {
   const id = agentModel.replace(/^openrouter\//, '');
-  if (id === settings.model) return 1;
+  if (id === settings.model && (effort ?? '') === (settings.effort ?? '')) return 1;
+  const measured = (model: string, level?: string) => MEASURED_TASK_USD[`${model}:${level ?? ''}`];
+  const base = measured(settings.model, settings.effort), other = measured(id, effort);
+  if (base && other) return other / base;
   const byId = await openRouterPrices().catch(() => undefined);
   const cost = (price?: { prompt: number; completion: number; cache?: number }) => price
     && TASK_MIX.prompt * price.prompt + TASK_MIX.cache * (price.cache ?? price.prompt) + TASK_MIX.completion * price.completion;
-  const base = cost(byId?.get(settings.model)), other = cost(byId?.get(id));
-  return base && other !== undefined ? other / base : undefined;
+  const baseCost = cost(byId?.get(settings.model)), otherCost = cost(byId?.get(id));
+  return baseCost && otherCost !== undefined ? otherCost / baseCost : undefined;
 }
 
 /** Tests: forget cached prices. */
@@ -135,22 +167,30 @@ async function openRouter(broker: CredentialBroker, method: string, path: string
 }
 
 /** Save the installation's settings (operator; PUT /api/settings/included-model).
- * A new model moves Task defaults that named the old one along with it. */
+ * A new model or effort moves the Task defaults that named the old one along. */
 export async function saveIncludedModel(store: Store, broker: CredentialBroker,
-  input: { managementKey?: string; model?: string; enabled?: boolean }): Promise<IncludedModelSettings> {
+  input: { managementKey?: string; model?: string; effort?: string; enabled?: boolean }): Promise<IncludedModelSettings> {
   const previous = await readSettings(store);
   const model = (input.model ?? previous?.model ?? INCLUDED_MODEL_DEFAULT).trim();
-  if (!/^[a-z0-9][\w.-]*\/[\w.:~-]+$/i.test(model)) throw new Error('model must be an OpenRouter model id such as xiaomi/mimo-v2.6-pro');
+  if (!/^[a-z0-9][\w.-]*\/[\w.:~-]+$/i.test(model)) throw new Error(`model must be an OpenRouter model id such as ${INCLUDED_MODEL_DEFAULT}`);
+  // Effort: as given ('' for the model's own), else kept while the model is,
+  // else the default model's.
+  const effort = input.effort !== undefined ? input.effort.trim()
+    : previous?.model === model ? previous.effort ?? '' : model === INCLUDED_MODEL_DEFAULT ? INCLUDED_MODEL_DEFAULT_EFFORT : '';
+  if (effort && !(EFFORTS as readonly string[]).includes(effort)) throw new Error(`effort must be one of ${EFFORTS.join(', ')}`);
   const key = input.managementKey?.trim();
   if (key) await broker.registerHandle(MANAGEMENT_HANDLE, key, INSTALLATION_SCOPE);
   else if (!(await broker.hasHandle(MANAGEMENT_HANDLE))) throw new Error('an OpenRouter management key is required');
-  const settings = { model, enabled: input.enabled ?? previous?.enabled ?? true };
+  const settings: IncludedModelSettings = { model, ...(effort ? { effort } : {}), enabled: input.enabled ?? previous?.enabled ?? true };
   await store.kvSet(CONFIG_KEY, JSON.stringify(settings));
-  if (previous && previous.model !== model) {
+  if (previous && (previous.model !== model || (previous.effort ?? '') !== effort)) {
     const from = includedAgentModel(previous), to = includedAgentModel(settings);
     for (const profile of await store.listProfiles())
-      if (profile.provider === 'opencode' && profile.model === from && profile.id.startsWith('organization:'))
-        await store.upsertProfile({ ...profile, model: to });
+      if (profile.provider === 'opencode' && profile.model === from && (profile.effort ?? '') === (previous.effort ?? '')
+        && profile.id.startsWith('organization:')) {
+        const { effort: _old, ...rest } = profile;
+        await store.upsertProfile({ ...rest, model: to, ...(effort ? { effort: effort as Effort } : {}) });
+      }
   }
   return settings;
 }
@@ -273,6 +313,7 @@ export async function seedIncludedModelDefaults(store: Store, broker: Credential
     if (await store.getProfile(id)) continue;
     const inherited = await roleDefaultProfile(store, role.name);
     await store.upsertProfile({ id, name: role.label, role: role.name, provider: 'opencode', model: includedAgentModel(settings),
+      ...(settings.effort ? { effort: settings.effort as Effort } : {}),
       mcpConnections: inherited?.mcpConnections ?? [...DEFAULT_MCP_CONNECTIONS],
       ...(inherited?.maxTurns ? { maxTurns: inherited.maxTurns } : {}) });
   }

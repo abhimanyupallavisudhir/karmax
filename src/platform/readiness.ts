@@ -87,7 +87,7 @@ export async function usableAgentCredentials(deps: ReadinessDeps,
 
 export async function projectReadiness(deps: ReadinessDeps,
   scope: { organizationId: string; projectId?: string },
-  agents: Array<Pick<AgentProfile, 'provider' | 'model'>> = []): Promise<Readiness> {
+  agents: Array<Pick<AgentProfile, 'provider' | 'model' | 'effort'>> = []): Promise<Readiness> {
   const { all, layers } = await agentCredentials(deps, scope);
   const credentials = resolveCredentials(all, layers);
   const inOrganization = resolveCredentials(all, { global: layers.global });
@@ -108,7 +108,7 @@ export async function projectReadiness(deps: ReadinessDeps,
       const own = serves(agent, credentials);
       const credit = !own && isIncludedModel(agent, included);
       const ready = own || credit || managedModelRailAvailable(deps.hosted, policy!, agent);
-      const cost = credit ? await includedModelRelativeCost(included!, agent.model!) : undefined;
+      const cost = credit ? await includedModelRelativeCost(included!, agent.model!, agent.effort) : undefined;
       return { ...agent, ready, ...(ready ? {} : { need: need(agent) }), ...(cost !== undefined ? { cost: Math.round(cost * 10) / 10 } : {}) };
     })),
     agentLogin: credentials.length > 0,

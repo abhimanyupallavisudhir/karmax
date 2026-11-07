@@ -10,7 +10,7 @@ import type { AddressInfo } from 'node:net';
 import { Store } from '../src/store/db.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
-import { INCLUDED_MODEL_DEFAULT, includedModel, includedModelKey, includedModelRelativeCost, resetIncludedModelPrices, includedModelOutOfCredit, includedModelView, isIncludedModel,
+import { INCLUDED_MODEL_DEFAULT, INCLUDED_MODEL_OPTIONS, includedModel, includedModelKey, includedModelRelativeCost, resetIncludedModelPrices, includedModelOutOfCredit, includedModelView, isIncludedModel,
   removeIncludedModelKey, saveIncludedModel, seedIncludedModelDefaults, syncIncludedModelUsage } from '../src/agent/included-model.js';
 import { ComputeCreditExhausted, computeCredit, computeMonth, startComputeTrial } from '../src/world/managed-compute.js';
 import { organizationProfileId } from '../src/agent/profiles.js';
@@ -30,6 +30,7 @@ beforeAll(async () => {
       const send = (status: number, value: unknown) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)); };
       // OpenRouter's public model list (no key), as far as prices go.
       if (req.method === 'GET' && req.url === '/models') return send(200, { data: [
+        { id: 'deepseek/deepseek-v4.1-flash-1017', pricing: { prompt: '0.00000015', completion: '0.0000006', input_cache_read: '0.000000003' } },
         { id: 'xiaomi/mimo-v2.6-pro', pricing: { prompt: '0.000000435', completion: '0.00000087', input_cache_read: '0.0000000036' } },
         { id: 'openai/gpt-6.1-sol', pricing: { prompt: '0.000002', completion: '0.00001', input_cache_read: '0.0000001' } },
         { id: 'xiaomi/mimo-v2.6-flash', pricing: { prompt: '0.00000014', completion: '0.00000028', input_cache_read: '0.0000000028' } } ] });
@@ -71,22 +72,29 @@ async function fixture(options: { hosted?: boolean; configure?: boolean } = {}) 
 }
 
 describe('included model settings', () => {
-  it('needs an OpenRouter management key, defaults to MiMo-V2.6-Pro and is hosted only', async () => {
+  it('needs an OpenRouter management key, defaults to DeepSeek V4.1 Flash at max effort and is hosted only', async () => {
     const f = await fixture({ configure: false });
     expect(await includedModel(f.store, f.broker)).toBeUndefined();
     await expect(saveIncludedModel(f.store, f.broker, {})).rejects.toThrow(/management key is required/);
     await expect(saveIncludedModel(f.store, f.broker, { managementKey: 'k', model: 'not a model' })).rejects.toThrow(/OpenRouter model id/);
-    expect(await saveIncludedModel(f.store, f.broker, { managementKey: 'mgmt-key' })).toEqual({ model: INCLUDED_MODEL_DEFAULT, enabled: true });
-    expect(INCLUDED_MODEL_DEFAULT).toBe('xiaomi/mimo-v2.6-pro');
-    expect(await includedModel(f.store, f.broker)).toEqual({ model: INCLUDED_MODEL_DEFAULT, enabled: true });
-    expect(await includedModelView(f.store, f.broker, computeMonth(T))).toMatchObject({ agentModel: 'openrouter/xiaomi/mimo-v2.6-pro',
-      keyConfigured: true, organizations: 0 });
+    await expect(saveIncludedModel(f.store, f.broker, { managementKey: 'k', effort: 'extreme' })).rejects.toThrow(/effort must be one of/);
+    const settings = { model: 'deepseek/deepseek-v4.1-flash-1017', effort: 'max', enabled: true };
+    expect(await saveIncludedModel(f.store, f.broker, { managementKey: 'mgmt-key' })).toEqual(settings);
+    expect(INCLUDED_MODEL_DEFAULT).toBe(settings.model);
+    expect(await includedModel(f.store, f.broker)).toEqual(settings);
+    expect(await includedModelView(f.store, f.broker, computeMonth(T))).toMatchObject({ agentModel: 'openrouter/deepseek/deepseek-v4.1-flash-1017',
+      effort: 'max', keyConfigured: true, organizations: 0 });
     expect(JSON.stringify(await includedModelView(f.store, f.broker, computeMonth(T)))).not.toContain('mgmt-key');
-    expect(isIncludedModel({ provider: 'opencode', model: 'openrouter/xiaomi/mimo-v2.6-pro' }, await includedModel(f.store))).toBe(true);
-    expect(isIncludedModel({ provider: 'claude', model: 'openrouter/xiaomi/mimo-v2.6-pro' }, await includedModel(f.store))).toBe(false);
+    expect(isIncludedModel({ provider: 'opencode', model: 'openrouter/deepseek/deepseek-v4.1-flash-1017' }, await includedModel(f.store))).toBe(true);
+    expect(isIncludedModel({ provider: 'claude', model: 'openrouter/deepseek/deepseek-v4.1-flash-1017' }, await includedModel(f.store))).toBe(false);
     // Any OpenRouter model runs on the credit; other vendors need their own key.
     expect(isIncludedModel({ provider: 'opencode', model: 'openrouter/openai/gpt-6.1-sol' }, await includedModel(f.store))).toBe(true);
     expect(isIncludedModel({ provider: 'opencode', model: 'openai/gpt-6.1-sol' }, await includedModel(f.store))).toBe(false);
+    // Another model starts at its own effort unless one is given; '' is the model's own.
+    expect(await saveIncludedModel(f.store, f.broker, { model: 'z-ai/glm-5.3-flash' })).toEqual({ model: 'z-ai/glm-5.3-flash', enabled: true });
+    expect(await saveIncludedModel(f.store, f.broker, { effort: 'high' })).toMatchObject({ model: 'z-ai/glm-5.3-flash', effort: 'high' });
+    expect(await saveIncludedModel(f.store, f.broker, { model: 'z-ai/glm-5.3-flash' })).toMatchObject({ effort: 'high' });
+    expect(await saveIncludedModel(f.store, f.broker, { effort: '' })).toEqual({ model: 'z-ai/glm-5.3-flash', enabled: true });
     // Switched off, nothing offers it.
     await saveIncludedModel(f.store, f.broker, { enabled: false });
     expect(await includedModel(f.store, f.broker)).toBeUndefined();
@@ -95,18 +103,24 @@ describe('included model settings', () => {
     expect(await includedModel(self.store, self.broker)).toBeUndefined();
   });
 
-  it('makes a new organization\'s Task defaults run on it, and moves them along when the model changes', async () => {
+  it('makes a new organization\'s Task defaults run on it, and moves them along when the model or effort changes', async () => {
     const f = await fixture();
     expect(await seedIncludedModelDefaults(f.store, f.broker, f.organization.id)).toBe(true);
     const doAgent = await f.store.getProfile(organizationProfileId(f.organization.id, 'do'));
-    expect(doAgent).toMatchObject({ provider: 'opencode', model: 'openrouter/xiaomi/mimo-v2.6-pro', role: 'do' });
-    expect(doAgent?.effort).toBeUndefined();
+    expect(doAgent).toMatchObject({ provider: 'opencode', model: 'openrouter/deepseek/deepseek-v4.1-flash-1017', effort: 'max', role: 'do' });
     // A default the organization changed is its own.
     await f.store.upsertProfile({ ...doAgent!, provider: 'claude', model: 'claude-opus-5-5' });
+    const reviewer = await f.store.getProfile(organizationProfileId(f.organization.id, 'confirm'));
+    await f.store.upsertProfile({ ...reviewer!, effort: 'low' });
+    await saveIncludedModel(f.store, f.broker, { effort: 'high' });
+    expect(await f.store.getProfile(organizationProfileId(f.organization.id, 'responder')))
+      .toMatchObject({ model: 'openrouter/deepseek/deepseek-v4.1-flash-1017', effort: 'high' });
+    expect(await f.store.getProfile(organizationProfileId(f.organization.id, 'confirm'))).toMatchObject({ effort: 'low' });
     await saveIncludedModel(f.store, f.broker, { model: 'z-ai/glm-5.3-flash' });
     expect(await f.store.getProfile(organizationProfileId(f.organization.id, 'do'))).toMatchObject({ provider: 'claude' });
-    expect(await f.store.getProfile(organizationProfileId(f.organization.id, 'responder')))
-      .toMatchObject({ provider: 'opencode', model: 'openrouter/z-ai/glm-5.3-flash' });
+    const responder = await f.store.getProfile(organizationProfileId(f.organization.id, 'responder'));
+    expect(responder).toMatchObject({ provider: 'opencode', model: 'openrouter/z-ai/glm-5.3-flash' });
+    expect(responder?.effort).toBeUndefined();
   });
 });
 
@@ -175,20 +189,25 @@ describe('readiness', () => {
     const f = await fixture();
     const project = await f.store.createProject('Cloud', { worldProvider: 'e2b' }, f.organization.id);
     const readiness = await projectReadiness({ store: f.store, hosted: true, broker: f.broker }, { organizationId: f.organization.id, projectId: project.id },
-      [{ provider: 'opencode', model: 'openrouter/xiaomi/mimo-v2.6-pro' }, { provider: 'claude', model: 'claude-opus-5-5' }]);
+      [{ provider: 'opencode', model: 'openrouter/deepseek/deepseek-v4.1-flash-1017', effort: 'max' }, { provider: 'claude', model: 'claude-opus-5-5' }]);
     expect(readiness.agents.map((agent) => agent.ready)).toEqual([true, false]);
     expect(readiness.agents[0]).toMatchObject({ cost: 1 });
   });
 
-  it('says how many times the included model\'s price another OpenRouter model costs a task', async () => {
+  it('says how many times the included model\'s cost a task on another OpenRouter model costs: measured where it was, else from prices', async () => {
     resetIncludedModelPrices();
     const f = await fixture();
     const project = await f.store.createProject('Cloud', { worldProvider: 'e2b' }, f.organization.id);
     const ask = () => projectReadiness({ store: f.store, hosted: true, broker: f.broker }, { organizationId: f.organization.id, projectId: project.id },
-      [{ provider: 'opencode', model: 'openrouter/openai/gpt-6.1-sol' }, { provider: 'opencode', model: 'openrouter/xiaomi/mimo-v2.6-flash' }]);
-    // A typical task: 5% uncached input, 95% cached, 0.2% as much output — GPT-6.1 Sol's $0.10 cached input dominates.
-    expect((await ask()).agents.map((agent) => [agent.ready, agent.cost])).toEqual([[true, 8], [true, 0.4]]);
-    expect(await includedModelRelativeCost({ model: 'xiaomi/mimo-v2.6-pro', enabled: true }, 'openrouter/unknown/model')).toBeUndefined();
+      [{ provider: 'opencode', model: 'openrouter/openai/gpt-6.1-sol', effort: 'medium' }, { provider: 'opencode', model: 'openrouter/openai/gpt-6.1-sol' },
+        { provider: 'opencode', model: 'openrouter/xiaomi/mimo-v2.6-flash' }]);
+    // Measured: GPT-6.1 Sol (medium) spends fewer tokens than its price says.
+    // Unmeasured (Sol at its own effort, MiMo Flash): from prices and the evaluation's token mix.
+    expect((await ask()).agents.map((agent) => [agent.ready, agent.cost])).toEqual([[true, 5.1], [true, 16.7], [true, 0.7]]);
+    const settings = { model: INCLUDED_MODEL_DEFAULT, effort: 'max', enabled: true };
+    expect(await includedModelRelativeCost(settings, 'openrouter/deepseek/deepseek-v4.1-flash-1017', 'max')).toBe(1);
+    expect(await includedModelRelativeCost(settings, 'openrouter/openai/gpt-6.1-terra', 'medium')).toBeCloseTo(2.78, 2);
+    expect(await includedModelRelativeCost(settings, 'openrouter/unknown/model')).toBeUndefined();
   });
 });
 
@@ -198,7 +217,7 @@ describe('admission', () => {
     const project = await f.store.createProject('Cloud', { worldProvider: 'e2b' }, f.organization.id);
     const task = await f.store.createTask({ projectId: project.id, title: 'Run', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'Run' } as any });
     const base = { organizationId: f.organization.id, projectId: project.id, taskId: task.id, provider: 'openrouter',
-      model: 'openrouter/xiaomi/mimo-v2.6-pro', fundingSource: 'managed' as const };
+      model: 'openrouter/deepseek/deepseek-v4.1-flash-1017', fundingSource: 'managed' as const };
     await expect(f.store.admitAgentUsage({ ...base, id: 'adm_legacy' })).rejects.toThrow(/spend cap/);
     expect(await f.store.admitAgentUsage({ ...base, id: 'adm_1', included: true })).toEqual({ reused: false });
   });
@@ -218,7 +237,7 @@ describe('a turn on the included model', () => {
     cleanups.push(() => world.destroy());
     const adapters = new Map([['opencode', { provider: 'opencode', runTurn: adapter }]]) as any;
     const core = makeCoreActivities({ store: f.store, worlds, adapters, broker: f.broker, profiles: new ProfileResolver(f.store, 'claude') } as any);
-    const agents = { do: { provider: 'opencode', model: 'openrouter/xiaomi/mimo-v2.6-pro' } };
+    const agents = { do: { provider: 'opencode', model: 'openrouter/deepseek/deepseek-v4.1-flash-1017', effort: 'max' } };
     const input = { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'just-do', agents };
     const run = () => core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: `${task.id}#0`, agentSlotGranted: true,
       agentAdmissionManaged: true, worldHandle: world.handle, messages: [{ id: 'm0', role: 'user', text: 'work', ts: 0 }], task: input } as any);
@@ -236,7 +255,9 @@ describe('a turn on the included model', () => {
     expect(await f.core.resolveCredentialOrder({ taskId: f.task.id, projectId: f.project.id, provider: 'opencode', role: 'do', task: f.input as any }))
       .toEqual([]);
     await f.run();
-    expect(seen).toEqual({ apiKey: 'sk-or-hash1' });
+    // Only providers that keep no prompts, and no 4-bit builds.
+    expect(seen).toEqual({ apiKey: 'sk-or-hash1', modelOptions: INCLUDED_MODEL_OPTIONS });
+    expect(INCLUDED_MODEL_OPTIONS.provider).toMatchObject({ zdr: true });
     const credit = await computeCredit(f.store, f.organization.id);
     expect(credit.usedMicros).toBe(500_000);
     const costs = await f.store.db.prepare("SELECT taskId, costMicros, fundingSource, metadata FROM usage_events WHERE kind='agent.cost'").all() as any[];

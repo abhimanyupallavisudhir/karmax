@@ -392,13 +392,14 @@ describe('remote OpenCode pieces', () => {
     expect(() => remoteAgentCommand('kimi', 'kimi', ['acp'])).toThrow(/no remote/);
     const env = remoteAgentEnv('opencode', '/w/.karmax-injection/agent/opencode/api', {
       KARMAX_TOKEN: 't', OPENCODE_CONFIG_CONTENT: '{}', OPENCODE_DISABLE_AUTOUPDATE: '1', ANTHROPIC_API_KEY: 'k',
-      KARMAX_VAULT_KEY: 'never', XDG_DATA_HOME: '/host/data', DATABASE_URL: 'work-only',
+      OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX: '64000', KARMAX_VAULT_KEY: 'never', XDG_DATA_HOME: '/host/data', DATABASE_URL: 'work-only',
     }, ['ANTHROPIC_API_KEY']);
     expect(env).toEqual({
       XDG_DATA_HOME: '/w/.karmax-injection/agent/opencode/api/data',
       XDG_CONFIG_HOME: '/w/.karmax-injection/agent/opencode/api/config',
       OPENCODE_CONFIG_DIR: '/w/.karmax-injection/agent/opencode/api/config/opencode',
       KARMAX_TOKEN: 't', OPENCODE_CONFIG_CONTENT: '{}', OPENCODE_DISABLE_AUTOUPDATE: '1', ANTHROPIC_API_KEY: 'k',
+      OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX: '64000',
     });
   });
 

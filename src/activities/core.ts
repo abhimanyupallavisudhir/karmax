@@ -42,7 +42,7 @@ import { World, WorldHandle, WorldKind, WorldSpec, type WorldRepo, worldWorkingD
 import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
 import { managedModelCostCeiling, managedModelRailAvailable } from '../agent/managed-models.js';
-import { includedModel, includedModelKey, includedModelOutOfCredit, isIncludedModel, syncIncludedModelUsage } from '../agent/included-model.js';
+import { INCLUDED_MODEL_OPTIONS, includedModel, includedModelKey, includedModelOutOfCredit, isIncludedModel, syncIncludedModelUsage } from '../agent/included-model.js';
 import {
   apiKeyEnv,
   assertRunnableProvider,
@@ -53,7 +53,7 @@ import {
   MODEL_PROVIDERS,
   modelProviderFromModel,
 } from '../agent/provider-registry.js';
-import { AgentAdapter, type TurnResult, type AdapterTurn } from '../agent/types.js';
+import { AgentAdapter, type TurnResult, type AdapterTurn, type TurnInput } from '../agent/types.js';
 import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
 import { TaskSecrets, cardRef, handleRef, paymentCardDetails, recordSecretRefs, secretScope, taskRef } from '../autonomy/task-secrets.js';
 import { gateFollowUps } from './follow-up-gate.js';
@@ -3046,7 +3046,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
       // JIT-resolve credentials via the broker (never journaled). Every current
       // turn receives its selection from the general Credentials policy.
-      let resolvedAuth: { apiKey?: string; configHome?: string; oauthToken?: string } | undefined;
+      let resolvedAuth: TurnInput['resolvedAuth'];
       // The login this turn spends (its credential key), for the quota scheduler.
       let schedulingAccount: string | undefined;
       // The coordinator's pool spans organizations; a leased home or key is used
@@ -3117,7 +3117,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const included = !args.accountConfigHome && !args.accountApiKeyHandle && !!deps.broker
         && isIncludedModel(profile, await includedModel(store, deps.broker));
       if (included) {
-        try { resolvedAuth = { apiKey: await includedModelKey(store, deps.broker!, organizationId) }; }
+        try { resolvedAuth = { apiKey: await includedModelKey(store, deps.broker!, organizationId), modelOptions: INCLUDED_MODEL_OPTIONS }; }
         catch (error) { throw capacityFailure(error) ?? error; }
       }
       if (

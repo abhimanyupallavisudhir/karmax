@@ -9408,7 +9408,7 @@ function readinessGaps(readiness, projectId) {
   for (const agent of (readiness.agents || []).filter((a) => a.ready && a.cost >= 1.5)) {
     const times = agent.cost >= 10 ? Math.round(agent.cost) : Math.round(agent.cost * 10) / 10;
     gaps.push({ label: `costs ${times}× the included model`, href: plan0, warn: true, lead: 'On your credit:',
-      tip: `${agent.model.replace(/^openrouter\//, '')} runs on your compute credit at about ${times} times the included model’s price a task. With your own login or API key, its provider bills you instead.` });
+      tip: `${agent.model.replace(/^openrouter\//, '')} runs on your compute credit at about ${times} times what a task on the included model costs. With your own login or API key, its provider bills you instead.` });
   }
   for (const need of needs.values()) {
     const name = ACCOUNT_PROVIDER_LABELS[need.provider] || need.provider;
@@ -9457,7 +9457,7 @@ function wireTaskReadiness(page, projectId) {
   const refresh = async () => {
     const agents = [...page.querySelectorAll('.agent-field')].map((box) => {
       const spec = readAgentSpec(box);
-      return spec.provider ? `${spec.provider}${spec.model ? `:${spec.model}` : ''}` : '';
+      return spec.provider ? `${spec.provider}${spec.model ? `:${spec.model}${spec.effort ? `:${spec.effort}` : ''}` : ''}` : '';
     }).filter(Boolean);
     const query = new URLSearchParams(agents.map((agent) => ['agent', agent])).toString();
     if (query === asked) return;
@@ -25689,7 +25689,7 @@ function includedModelRow(settings) {
   const state = !settings ? null : settings.enabled && settings.keyConfigured ? ['On', 'done'] : ['Off', ''];
   return `<div class="computer-providers included-model"><div class="computer-provider"><b>Included model</b>
     ${policyTip(`A model ${siteName()} pays for, so new organizations run tasks without a login of their own. Charged to their compute credit at twice OpenRouter’s price.`)}
-    ${state ? `<span class="chip ${state[1]}">${state[0]}</span><span class="setting-muted">${esc(settings.model)}</span>
+    ${state ? `<span class="chip ${state[1]}">${state[0]}</span><span class="setting-muted">${esc(settings.model)}${settings.effort ? ` · ${esc(settings.effort)}` : ''}</span>
       <span class="setting-muted managed-month" title="${esc(`This month, for ${settings.organizations} organization${settings.organizations === 1 ? '' : 's'}: OpenRouter’s price, then what organizations were charged.`)}">${money(settings.costMicros)} → ${money(settings.chargedMicros)}</span>` : ''}
     <span class="label-row-fill"></span>
     ${settings ? '<button class="icon-btn included-model-edit" type="button" title="Edit included model" aria-label="Edit included model">✎</button>'
@@ -25702,7 +25702,9 @@ function openIncludedModelDialog(settings, onSaved) {
     <div class="settings-grid">
       <label class="form-row"><span>Management key ${policyTip('Create one on openrouter.ai under Management keys')}</span>
         <input class="included-key" type="password" autocomplete="off" placeholder="${settings?.keyConfigured ? 'Saved · leave blank to keep' : 'sk-or-v1-…'}"></label>
-      <label class="form-row"><span>Model</span><input class="included-model-id" value="${esc(settings?.model || 'xiaomi/mimo-v2.6-pro')}" placeholder="xiaomi/mimo-v2.6-pro"></label>
+      <label class="form-row"><span>Model</span><input class="included-model-id" value="${esc(settings?.model || 'deepseek/deepseek-v4.1-flash-1017')}" placeholder="deepseek/deepseek-v4.1-flash-1017"></label>
+      <label class="form-row"><span>Effort</span><select class="included-effort">${['', 'low', 'medium', 'high', 'xhigh', 'max'].map((effort) =>
+        `<option value="${effort}" ${effort === (settings ? settings.effort || '' : 'max') ? 'selected' : ''}>${effort || 'Model’s default'}</option>`).join('')}</select></label>
       <label class="switch"><input class="toggle included-enabled" type="checkbox" ${settings?.enabled === false ? '' : 'checked'}>Offer to organizations</label></div>
     <div class="modal-actions"><span class="label-row-fill"></span><button class="btn included-cancel" type="button">Cancel</button><button class="btn primary included-save" type="button">Save</button></div></div>`;
   const close = () => { document.removeEventListener('keydown', keydown); overlay.remove(); };
@@ -25714,7 +25716,7 @@ function openIncludedModelDialog(settings, onSaved) {
     const button = event.currentTarget; button.disabled = true;
     const managementKey = overlay.querySelector('.included-key').value.trim();
     const body = { ...(managementKey ? { managementKey } : {}), model: overlay.querySelector('.included-model-id').value.trim(),
-      enabled: overlay.querySelector('.included-enabled').checked };
+      effort: overlay.querySelector('.included-effort').value, enabled: overlay.querySelector('.included-enabled').checked };
     try { await api('/api/settings/included-model', { method: 'PUT', body: JSON.stringify(body) }); }
     catch (error) { toast(error.message, true); button.disabled = false; return; }
     close(); toast('Included model saved'); onSaved?.();

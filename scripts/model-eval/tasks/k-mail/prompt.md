@@ -1,0 +1,3 @@
+Agent mail bug: emails that reach an agent's mailbox through Cloudflare Email Routing come through with their quoted-printable encoding not decoded — soft line breaks (`=` at the end of a line) are left in the text, and a long link wrapped at 76 characters arrives cut off at the `=`. Mail sent directly (without the relay) is fine.
+
+Cloudflare adds ARC/DKIM signature headers to the messages it forwards; their `h=` tag lists the signed header names (e.g. `h=from:to:content-transfer-encoding:mime-version:content-type`). I suspect that's confusing our MIME parsing. Please fix it and add a regression test.
