@@ -2304,45 +2304,32 @@ html[data-theme="dark"] .legal-shell { color-scheme: dark; }
 .landing-text-link { display: inline-flex; align-items: center; min-height: 40px; padding: 0 12px; color: var(--l-ink-2); font-size: 15px; transition: color .15s ease; }
 .landing-text-link:hover, .landing-footer a:hover { color: var(--l-ink); }
 /* Buttons: the console's pills, ink filled for the one thing to do. */
-.landing-sign-in, .landing-start, .lp-ghost, .lp-film-open {
+.landing-sign-in, .landing-start, .lp-ghost {
   display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 40px; padding: 0 18px;
   border-radius: 999px; font: inherit; font-size: 15px; font-weight: 600; white-space: nowrap; cursor: pointer;
   transition: background .15s ease, border-color .15s ease, color .15s ease;
 }
-.landing-sign-in, .lp-ghost, .lp-film-open { border: 1px solid var(--btn-line); background: var(--l-surface); color: var(--l-ink); }
+.landing-sign-in, .lp-ghost { border: 1px solid var(--btn-line); background: var(--l-surface); color: var(--l-ink); }
 .landing-sign-in { margin-left: 8px; }
-.landing-sign-in:hover, .lp-ghost:hover, .lp-film-open:hover { border-color: var(--l-ink-3); }
+.landing-sign-in:hover, .lp-ghost:hover { border-color: var(--l-ink-3); }
 .landing-start { border: 1px solid transparent; background: var(--l-primary); color: var(--l-primary-ink); }
 .landing-start:hover { background: var(--l-primary-hover); }
 .lp-large { min-height: 46px; padding: 0 24px; font-size: 16px; }
-.lp-film-open { min-height: 46px; padding: 0 20px 0 16px; font-size: 16px; }
-.lp-film-open svg { width: 16px; height: 16px; fill: currentColor; }
-.lp-film-open small { color: var(--l-ink-3); font-size: var(--fs-13); font-weight: 500; font-variant-numeric: tabular-nums; }
 .lp-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
 
-/* Hero: the line, then the list itself (the console's rows, drawn in HTML). */
+/* Hero: the line, then the launch film in a quiet frame. */
 .lp-hero { width: var(--lp-wide); margin: 0 auto; padding: 96px 0 0; text-align: center; }
 .lp-hero h1 { max-width: 15ch; margin: 0 auto; font-size: clamp(40px, 6.4vw, 72px); line-height: 1.02; font-weight: 680; letter-spacing: -.035em;
   font-variation-settings: "opsz" 32; font-optical-sizing: none; text-wrap: balance; }
 .lp-lede { max-width: 36em; margin: 22px auto 30px; color: var(--l-ink-2); font-size: clamp(17px, 2vw, 19px); line-height: 1.55; text-wrap: pretty; }
-.lp-list { max-width: 760px; margin: 64px auto 0; border: 1px solid var(--l-line); border-radius: calc(var(--r) + 4px); background: var(--l-surface-2); box-shadow: var(--l-frame-shadow); text-align: left; overflow: hidden; }
-.lp-list-head { display: flex; align-items: baseline; justify-content: space-between; padding: 14px 18px 12px; border-bottom: 1px solid var(--l-line); }
-.lp-list-head span { font-size: var(--fs-14); font-weight: 600; }
-.lp-list-head small { color: var(--l-ink-3); font-size: var(--fs-13); font-variant-numeric: tabular-nums; }
-.lp-list ol { display: grid; gap: 8px; padding: 10px; }
-.lp-row { display: grid; grid-template-columns: minmax(0, 1fr) 120px; align-items: center; gap: 18px; padding: 13px 16px; border: 1px solid var(--l-line); border-radius: var(--r); background: var(--l-surface); }
-.lp-row b { display: block; overflow: hidden; font-size: var(--fs-15); font-weight: 550; white-space: nowrap; text-overflow: ellipsis; }
-.lp-row-main > span { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
-.lp-row code { color: var(--l-ink-3); font-family: var(--font-mono); font-size: var(--fs-12); }
-.lp-chip { padding: 1px 8px; border-radius: 999px; font-size: var(--fs-12); font-style: normal; font-weight: 600; }
-.lp-chip:is([data-status="working"], [data-status="review"]) { background: var(--l-accent-weak); color: var(--l-accent); }
-.lp-chip[data-status="input"] { background: var(--working-weak); color: var(--working); }
-/* A touch of ink in the green, so small text on its tint stays ≥ 4.5:1 in every look. */
-.lp-chip[data-status="done"] { background: var(--l-merged-weak); color: color-mix(in srgb, var(--l-merged) 82%, var(--l-ink)); }
-.lp-bar { position: relative; height: 5px; border-radius: 999px; background: var(--l-line); overflow: hidden; }
-.lp-bar i { position: absolute; inset: 0 auto 0 0; width: calc(var(--p) * 100%); border-radius: inherit; background: var(--l-accent); opacity: .55; }
-.lp-bar[data-status="input"] i { background: var(--working); opacity: .8; }
-.lp-bar[data-status="done"] i { background: var(--l-merged); opacity: .8; }
+.lp-film { position: relative; max-width: 960px; margin: 56px auto 0; border: 1px solid var(--l-line); border-radius: calc(var(--r) + 6px); background: #0d0c13; box-shadow: var(--l-frame-shadow); overflow: hidden; }
+.lp-film video { display: block; width: 100%; height: auto; aspect-ratio: 16 / 9; }
+.lp-sound { position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%); display: inline-flex; white-space: nowrap; align-items: center; gap: 8px; min-height: 40px; padding: 0 16px 0 13px;
+  border: 0; border-radius: 999px; background: rgba(255, 255, 255, .92); color: #16161d; font: inherit; font-size: 15px; font-weight: 600; cursor: pointer;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .28); }
+.lp-sound:hover { background: #fff; }
+.lp-sound svg { width: 15px; height: 15px; fill: currentColor; }
+.lp-sound small { color: #5c5c6b; font-size: var(--fs-13); font-weight: 500; font-variant-numeric: tabular-nums; }
 
 /* Sections: a plain heading, then their parts on the page's own surface. */
 .lp-steps, .lp-features { width: var(--lp-wide); margin: 0 auto; padding: 120px 0 0; }
@@ -2383,12 +2370,6 @@ html[data-theme="dark"] .lp-light { display: none; }
 .lp-end-mark .mark { width: 64px; height: 64px; border-radius: 16px; box-shadow: 0 6px 20px rgba(0, 0, 0, .16); }
 .lp-end h2 { font-size: clamp(34px, 5vw, 56px); line-height: 1.04; font-weight: 680; letter-spacing: -.035em; font-variation-settings: "opsz" 32; font-optical-sizing: none; }
 
-/* The film, when asked for. */
-.lp-film { width: min(1100px, calc(100% - 32px)); padding: 0; border: 0; border-radius: calc(var(--r) + 4px); background: #000; overflow: hidden; }
-.lp-film::backdrop { background: rgba(0, 0, 0, .72); }
-.lp-film video { display: block; width: 100%; height: auto; }
-.lp-film-close { position: absolute; top: 10px; right: 10px; z-index: 1; width: 36px; height: 36px; border: 0; border-radius: 999px; background: rgba(0, 0, 0, .55); color: #fff; font-size: 22px; line-height: 1; cursor: pointer; }
-
 .landing-footer { width: var(--lp-wide); min-height: 88px; margin: 0 auto; display: flex; align-items: center; flex-wrap: wrap; gap: 8px 22px;
   border-top: 1px solid var(--l-line); color: var(--l-ink-3); font-size: 14px; }
 .landing-footer p { margin: 0 auto 0 0; }
@@ -2407,8 +2388,9 @@ html[data-theme="dark"] .lp-light { display: none; }
   .landing-sign-in { margin-left: 0; }
   .landing-sign-in, .landing-start { padding: 0 14px; }
   .lp-hero { padding-top: 56px; }
-  .lp-list { margin-top: 44px; }
-  .lp-row { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .lp-film { margin-top: 36px; border-radius: var(--r); }
+  .lp-sound { bottom: 10px; min-height: 36px; font-size: 14px; }
+  .lp-sound small { display: none; }
   .lp-steps ol, .lp-grid { grid-template-columns: minmax(0, 1fr); }
   .lp-steps, .lp-features { padding-top: 80px; }
   .lp-end { padding: 96px 0 80px; }

@@ -27998,19 +27998,9 @@ function openPublicAuth(path, render) {
 
 // ── public landing ───────────────────────────────────────────────────────────
 // The landing wears the console's look (light or dark, default or classic), like
-// Docs and Pricing: a task list drawn with the console's own parts, then how a task
-// goes, then what surrounds it, each pictured by a screenshot of the console in the
+// Docs and Pricing: the launch film, then how a task goes, then what surrounds it, each pictured by a screenshot of the console in the
 // visitor's look (web/media/landing/<name>-light|dark.webp, design/landing-v3).
 const LANDING_FILM = { src: '/media/tavya-launch.mp4', poster: '/media/tavya-launch-poster.jpg', length: '0:59' };
-// The hero list: the kinds of work one list holds. [title, project, status]
-const LANDING_ROWS = [
-  ['Update my CV to include tavya under my list of projects', 'personal-website', 'done'],
-  ['Do a pass of tavya’s SEO', 'tavya', 'working'],
-  ['Fill in slides.md with the experimental results', 'takehomev2', 'working'],
-  ['Book me the cheapest direct flight to London on January 3', 'admin_docs', 'input'],
-  ['Does figure 5 hold at the level of model families?', 'legibench3', 'review'],
-];
-const LANDING_STATUS = { working: 'Working', input: 'Needs input', review: 'In review', done: 'Done' };
 // How a task goes. [still, title, line, picture's description]
 const LANDING_STEPS = [
   ['write', 'Write it down', 'In plain words, in any project. Pick the agent and model, or keep your defaults.', 'The new-task form with a prompt written in plain words'],
@@ -28062,14 +28052,11 @@ function renderLanding() {
         <p class="lp-lede">Write down what needs doing. Agents do it on their own computers, in parallel, and you review the result.</p>
         <div class="lp-actions">
           <a class="landing-start lp-large" id="landing-hero-start" href="/signup">Get started</a>
-          <button class="lp-film-open" id="lp-film-open" type="button">${play}Watch the film <small>${LANDING_FILM.length}</small></button>
         </div>
-        <figure class="lp-list" aria-label="A task list: code, research, a website and an errand, each with its agent’s status">
-          <div class="lp-list-head"><span>Active</span><small>${LANDING_ROWS.length} tasks</small></div>
-          <ol>${LANDING_ROWS.map(([title, project, status], i) => `
-            <li class="lp-row"><div class="lp-row-main"><b>${esc(title)}</b><span><code>${esc(project)}</code><i class="lp-chip" data-status="${status}">${LANDING_STATUS[status]}</i></span></div>
-              <span class="lp-bar" data-status="${status}" aria-hidden="true"><i style="--p:${({ done: 1, review: .8, input: .62, working: .34 + i * .04 })[status]}"></i></span></li>`).join('')}
-          </ol>
+        <figure class="lp-film">
+          <video id="lp-film" src="${LANDING_FILM.src}" poster="${LANDING_FILM.poster}" width="1920" height="1080" muted loop playsinline disableremoteplayback preload="metadata"
+            aria-label="${site}’s launch film, ${LANDING_FILM.length}"></video>
+          <button class="lp-sound" id="lp-sound" type="button">${play}Watch with sound <small>${LANDING_FILM.length}</small></button>
         </figure>
       </section>
 
@@ -28099,11 +28086,6 @@ function renderLanding() {
       </section>
     </main>
 
-    <dialog class="lp-film" id="lp-film" aria-label="${site}’s launch film, ${LANDING_FILM.length}">
-      <button class="lp-film-close" type="button" aria-label="Close">×</button>
-      <video src="${LANDING_FILM.src}" poster="${LANDING_FILM.poster}" width="1920" height="1080" controls playsinline preload="none"></video>
-    </dialog>
-
     <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${site}</span></a><p>Just do things.</p><a href="/docs">Docs</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="${github}">GitHub ↗</a></footer>
   </div>`;
 
@@ -28115,20 +28097,27 @@ function renderLanding() {
   window.onpopstate = () => boot();
 }
 
-// The film waits in a dialog: it loads and plays, with sound, only when asked;
-// closing it stops it.
+// The film plays silently, looping, while it is on screen (never with reduced
+// motion); "Watch with sound" starts it from the top with sound and controls.
 function wireLandingFilm() {
-  const dialog = $('#lp-film');
-  const video = dialog?.querySelector('video');
-  if (!dialog || !video) return;
-  $('#lp-film-open')?.addEventListener('click', () => {
-    dialog.showModal();
-    video.currentTime = 0;
-    video.play().catch(() => {});
+  const film = $('#lp-film');
+  const sound = $('#lp-sound');
+  if (!film || !sound) return;
+  let watching = false;
+  if (!matchMedia('(prefers-reduced-motion: reduce)').matches && 'IntersectionObserver' in window) {
+    new IntersectionObserver(([entry]) => {
+      if (watching) return;
+      if (entry.isIntersecting) film.play().catch(() => {});
+      else film.pause();
+    }, { threshold: 0.35 }).observe(film);
+  }
+  sound.addEventListener('click', () => {
+    watching = true;
+    Object.assign(film, { muted: false, loop: false, controls: true, currentTime: 0 });
+    film.play().catch(() => {});
+    sound.hidden = true;
+    film.focus({ preventScroll: true });
   });
-  dialog.querySelector('.lp-film-close').addEventListener('click', () => dialog.close());
-  dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.close(); });
-  dialog.addEventListener('close', () => video.pause());
 }
 
 // Sign in and create account are one page, at /login and /signup alike: the
