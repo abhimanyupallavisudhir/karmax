@@ -71,14 +71,14 @@ it('lands on the organization home, For me across projects, Active one click awa
     await step('the root lands on the organization home, For me', async () => {
       await page.goto(app!.url);
       await page.waitForURL(/\/personal$/);
-      await page.locator(`[data-id="${review.id}"] .chip.attention`).waitFor();
+      await page.locator(`[data-id="${review.id}"] .status.attention`).waitFor();
     });
     // A new project starts empty: the default view recommends the task store instead.
     const listed = await rows();
     expect(listed).toEqual([review.id, draft.id].sort());
     expect(await page.locator('#main .task-row[data-draft]').count()).toBe(1);
     expect(await page.locator('.store-recs .store-row[data-store-task="project-wiki"]').count()).toBe(1);
-    expect(await page.locator(`[data-id="${review.id}"] .chip.attention`).innerText()).toBe('Needs review');
+    expect(await page.locator(`[data-id="${review.id}"] .status.attention`).innerText()).toBe('Needs review');
     expect(await page.locator(`[data-id="${review.id}"] .task-project`).innerText()).toBe('website');
     // The search panel stands clear of the list: no tighter above the first row than rows are to each other.
     const gaps = await page.evaluate<{ panel: number; rows: number }>(`(() => {

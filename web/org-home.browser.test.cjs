@@ -77,10 +77,10 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.equal(await page.locator('#save-view').count(), 0, 'a search that is already a view offers no Save view');
     assert.equal(await page.locator('#expand-task').innerText(), 'New task…', 'one New task field, which opens the form');
     assert.equal(await page.locator('#new-task-project').count(), 0, 'the form, not the field, picks the project');
-    const review = page.locator('[data-id="t1"] .chip.attention');
+    const review = page.locator('[data-id="t1"] .status.attention');
     assert.equal(await review.innerText(), 'Needs review');
     assert.equal(await review.getAttribute('title'), 'Waiting for your review', 'the reason is explained in a tooltip');
-    assert.equal(await page.locator('[data-id="t6"] .chip.attention').innerText(), 'Needs approval', 'an ask outranks a mention');
+    assert.equal(await page.locator('[data-id="t6"] .status.attention').innerText(), 'Needs approval', 'an ask outranks a mention');
     assert.equal(await page.locator('[data-id="t4"] .task-project').innerText(), 'mobile-app', 'rows name their project by slug');
     assert.equal(await page.locator('[data-id="t1"] .row-link').getAttribute('href'), '/org/website/tasks/1', 'rows link to their project permalink');
     assert.equal(await page.locator('#brand-home').getAttribute('href'), '/org', 'the logo links home');

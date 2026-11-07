@@ -111,7 +111,7 @@ test('an Avatar saved without running rests as ✦ Avatar, with Fork instead of 
   assert.equal(context.restingAvatar({ params: { avatar: { callableBy: ['@project'] }, draft: true }, lastView: {} }), false);
   assert.equal(context.restingAvatar({ params: { draft: true } }), false);
   const row = fn('taskRow');
-  assert.match(row, /avatar \? avatarChip : '<span class="chip">draft<\/span>'/);
+  assert.match(row, /avatar \? avatarChip : statusHtml\('Draft', 'draft'\)/);
   assert.match(row, /data-fork-avatar="\$\{t\.id\}">\$\{ICON\.fork\}Fork<\/button>/);
 });
 

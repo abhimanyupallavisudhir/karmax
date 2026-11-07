@@ -33,7 +33,7 @@ function harness({ tasks, groups, attempts, agents, failure, mode = 'agent' }) {
     S: { projectId: 'project', views: [] }, ACTIVE_VIEW: 'active', ACTIVE_VIEW_QUERY: '-is:archived', BUILTIN_VIEWS: [],
     esc: v => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'),
     viewIdForQuery: () => 'active', queryToolbarHtml: () => '', wireQueryToolbar() {},
-    effectiveQuery: q => q, stageLabel: () => 'Done', workflowLabel: () => 'Software',
+    effectiveQuery: q => q, stageLabel: () => 'Done', statusTone: () => 'done', statusHtml: label => `<span class="status">${label}</span>`, workflowLabel: () => 'Software',
     awaitingApproval: t => !!t?.params?.draft && !!t.params._awaitingApproval,
     priorityFlag: () => '', tagChips: () => '', agentRoleLabel: role => role,
     projectById: () => undefined, projectSlug: () => '', projectLabel: () => '',

@@ -651,6 +651,8 @@ a { color: var(--accent); text-decoration: none; }
 .task-num { font-family: var(--font-ui); font-variant-numeric: tabular-nums; font-size: var(--fs-12); color: var(--ink-3); font-weight: 500; }
 .task-sub { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: var(--fs-12); color: var(--ink-3); margin-top: 3px; }
 .task-sub > .chip { white-space: nowrap; }
+/* A row's line under its title is as tall with tags as without. */
+.task-main > .task-sub { min-height: 22px; }
 /* A phone gives the title the row: the dot and stage chip already say where it is. */
 @media (max-width: 700px) { .task-row > .task-right > .pipeline { display: none; } }
 /* …and the whole title: on a phone it wraps instead of ending in "…". */
@@ -700,9 +702,13 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .pipeline .seg:last-child { border-radius: 0 3px 3px 0; }
 .pipeline .seg.done { background: var(--accent); opacity: 0.45; }
 .pipeline .seg.current { background: var(--accent); }
+/* The current stage in its status's colour (statusTone). */
 .pipeline .seg.current.working { animation: pulse 1.4s ease-in-out infinite; }
-.pipeline .seg.current.waiting { background: var(--working); }
-.pipeline .seg.current.blocked { background: var(--danger); }
+@media (prefers-reduced-motion: reduce) { .pipeline .seg.current.working { animation: none; } }
+.pipeline .seg.current.human { background: var(--working); }
+.pipeline .seg.current.waiting { background: var(--ink-3); }
+.pipeline .seg.current.failed { background: var(--danger); }
+.pipeline .seg.current:is(.stopped, .draft) { background: var(--line-strong); }
 .pipeline .seg.merged { background: var(--merged); opacity: 1; }
 /* 'escalated' = blocked, awaiting a human — flag the whole track, don't fake a position. */
 .pipeline.escalated .seg { background: var(--danger); opacity: 0.32; }
@@ -922,7 +928,7 @@ a.git-repo-name:hover { color:var(--accent); }
 .task-sub > .chip::first-letter, .task-title > .chip::first-letter, .run-row > .chip::first-letter,
 .chip.active::first-letter, .chip.waiting::first-letter, .chip.blocked::first-letter,
 .chip.failed::first-letter, .chip.done::first-letter, .chip.cancelled::first-letter,
-.chip.attention::first-letter, .chip.approval-needed::first-letter { text-transform: uppercase; }
+.chip.approval-needed::first-letter { text-transform: uppercase; }
 .chip.active { background: var(--accent-weak); color: var(--accent); border-color: transparent; }
 .chip.waiting { background: var(--working-weak); color: var(--working); border-color: transparent; }
 .chip.blocked, .chip.failed { background: var(--danger-weak); color: var(--danger); border-color: transparent; }
@@ -932,9 +938,22 @@ a.git-repo-name:hover { color:var(--accent); }
 .chip.live::before { content: ''; display: inline-block; width: 6px; height: 6px; margin-right: 5px; vertical-align: 1px;
   border-radius: 50%; background: currentColor; animation: pulse 1.4s ease-in-out infinite; }
 @media (prefers-reduced-motion: reduce) { .chip.live::before { animation: none; } }
-/* Why a row is in "For me": the ask waiting on you. */
-.chip.attention { background: var(--accent-weak); color: var(--accent); border-color: transparent; font-weight: 600; }
-.chip.attention.escalated { background: var(--working-weak); color: var(--working); }
+/* A task's status (statusHtml): a glyph and its label, no pill — pills are
+   tags. The glyph's colour says who has the ball: an agent (accent), a person
+   (amber), nobody yet — time, quota, a job (grey) — or a finished state.
+   Filled glyphs knock their mark out in the card's colour. */
+.status { display: inline-flex; align-items: center; gap: 5px; font-family: var(--font-ui); font-size: var(--fs-12); line-height: 16px;
+  font-weight: 500; color: var(--ink-2); white-space: nowrap; --status: var(--ink-3); }
+.status > svg { flex: none; color: var(--status); }
+.status .mark { fill: none; stroke: var(--surface); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.status .mark-dot { fill: var(--surface); }
+.status-label::first-letter { text-transform: uppercase; }
+.status.working { --status: var(--accent); }
+.status.human { --status: var(--working); color: var(--ink); font-weight: 600; }
+.status.done { --status: var(--merged); }
+.status.failed { --status: var(--danger); color: var(--danger); font-weight: 600; }
+.status.stopped, .status.draft { color: var(--ink-3); }
+.status + .status { margin-left: 2px; }
 /* The organization home names each row's project. */
 /* A row's project: a plain monospace slug, not a chip — it says where a task
    lives, not how it is going, so it never looks like a status. */
@@ -1385,6 +1404,7 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
 .subtask-title .task-num, .fork-title .task-num { flex: none; font-size: var(--fs-11); }
 .subtask-copy .chip, .fork-state .chip { padding: 0 6px; font-size: var(--fs-10); line-height: 16px; }
 .subtask-copy .chip + .chip, .fork-state .chip + .chip { margin-left: 4px; }
+.subtask-copy .status, .fork-state .status { font-size: var(--fs-11); }
 .subtask-arrow, .fork-arrow { color: var(--ink-3); font-size: 16px; line-height: 1; transition: transform .12s, color .12s; }
 .subtask-row:hover .subtask-arrow, .fork-row:hover .fork-arrow { color: var(--accent); transform: translateX(2px); }
 /* Forks of forks nest under the task they were forked from. */

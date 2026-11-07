@@ -37,7 +37,7 @@ global.taskUrl = (id, rec) => `/acme/web/tasks/${rec?.num ?? id}`;
 
 // The real stage vocabulary, not a stub: a child must read exactly as it does in
 // the task list and on its own page.
-for (const name of ['taskRecord', 'numLabel', 'parentTaskContext', 'stageLabel', 'waitingLabel', 'accountWaitReason', 'waitingText', 'subTaskState', 'subTaskStateHtml', 'subTasksSection', 'pullRequestLanes', 'listState', 'patchLifecycleView', 'pendingCancellationView', 'patchSubTaskSummaryFromEvent', 'subTaskSummaryEventNeedsRefresh']) eval(extractFn(name));
+for (const name of ['taskRecord', 'numLabel', 'parentTaskContext', 'stageLabel', 'waitingLabel', 'accountWaitReason', 'waitingText', 'statusTone', 'statusHtml', 'subTaskState', 'subTaskStateHtml', 'subTasksSection', 'pullRequestLanes', 'listState', 'patchLifecycleView', 'pendingCancellationView', 'patchSubTaskSummaryFromEvent', 'subTaskSummaryEventNeedsRefresh']) eval(extractFn(name));
 
 let pass = 0, fail = 0;
 const ok = (condition, message) => {
@@ -59,7 +59,7 @@ ok(prCrumb.includes('pull request “docs”') && !prCrumb.includes('Parent task
 
 ok(subTaskState(S.tasks[1]).label === 'Working', 'active work reads as it does in the task list');
 ok(subTaskState(S.tasks[2]).complete === true, 'done work contributes to completion');
-ok(subTaskState(S.tasks[3]).label === 'Escalated' && subTaskState(S.tasks[3]).tone === 'blocked', 'blocked work is called out');
+ok(subTaskState(S.tasks[3]).label === 'Escalated' && subTaskState(S.tasks[3]).tone === 'human', 'escalated work is called out as waiting on a person');
 
 // Faithfulness: every state a real child passes through (tasks #429, #456) gets
 // the same label the task list gives it, never a second invented vocabulary that
@@ -67,17 +67,19 @@ ok(subTaskState(S.tasks[3]).label === 'Escalated' && subTaskState(S.tasks[3]).to
 // "In progress" for a child that is landing or needs a person).
 const state = (lastView, extra = {}) => subTaskState({ lastView, ...extra });
 const cases = [
-  [{ stage: 'do', status: 'waiting', waitingFor: { kind: 'agentSlot', detail: 'Starting agent' } }, 'Working', 'waiting'],
+  // The tone follows who has the ball, as the label says it (statusTone): a
+  // passing wait inside a stage is still that stage, working.
+  [{ stage: 'do', status: 'waiting', waitingFor: { kind: 'agentSlot', detail: 'Starting agent' } }, 'Working', 'working'],
   [{ stage: 'do', status: 'waiting', waitingFor: { kind: 'timer', until: 1 } }, 'Waiting until 4:00 PM', 'waiting'],
-  [{ stage: 'do', status: 'waiting', waitingFor: { kind: 'human', detail: 'Approve the sandbox keys' } }, 'Needs input', 'waiting'],
+  [{ stage: 'do', status: 'waiting', waitingFor: { kind: 'human', detail: 'Approve the sandbox keys' } }, 'Needs input', 'human'],
   [{ stage: 'do', status: 'waiting', waitingFor: { kind: 'subtask' } }, 'Waiting for sub-tasks', 'waiting'],
-  [{ stage: 'review', status: 'waiting', waitingFor: { kind: 'parent' } }, 'Review', 'waiting'],
-  [{ stage: 'review', status: 'active' }, 'Review', 'active'],
-  [{ stage: 'merge', status: 'active' }, 'Landing', 'active'],
-  [{ stage: 'merge', status: 'waiting', waitingFor: { kind: 'github', detail: 'waiting for required checks' } }, 'Landing', 'waiting'],
+  [{ stage: 'review', status: 'waiting', waitingFor: { kind: 'parent' } }, 'Review', 'working'],
+  [{ stage: 'review', status: 'active' }, 'Review', 'working'],
+  [{ stage: 'merge', status: 'active' }, 'Landing', 'working'],
+  [{ stage: 'merge', status: 'waiting', waitingFor: { kind: 'github', detail: 'waiting for required checks' } }, 'Landing', 'working'],
   [{ stage: 'done', status: 'done' }, 'Done', 'done'],
   [{ stage: 'failed', status: 'failed' }, 'Failed', 'failed'],
-  [{ stage: 'cancelled', status: 'cancelled' }, 'Cancelled', 'cancelled'],
+  [{ stage: 'cancelled', status: 'cancelled' }, 'Cancelled', 'stopped'],
   [{ stage: 'setup', status: 'active', state: { draft: true } }, 'Draft', 'draft'],
 ];
 for (const [view, label, tone] of cases) {
@@ -100,8 +102,8 @@ ok(panel.includes('>1/3<') && panel.includes('title="1 of 3 done"') && !panel.in
 ok((panel.match(/class="subtask-row"/g) || []).length === 3, 'every child is one large navigation row');
 ok(/<a class="subtask-row" data-open="child-a" data-spa href="\/acme\/web\/tasks\/11"/.test(panel), 'and a link to the child, so it opens in a new tab too');
 ok(!/In progress|Ready to return|Needs direction/.test(panel), 'no second state vocabulary beside the real one');
-ok(panel.includes('<span class="chip active">Working</span>') && panel.includes('<span class="chip blocked">Escalated</span>'), 'each row carries its task-list label, as a status chip');
-ok(!panel.includes('subtask-state'), 'one status signal per row: no dot beside the chip');
+ok(/<span class="status working">.*?>Working<\/span>/.test(panel) && /<span class="status human">.*?>Escalated<\/span>/.test(panel), 'each row carries its task-list label and status');
+ok(!panel.includes('subtask-state'), 'one status signal per row: no dot beside the status');
 ok(panel.includes('aria-label="Open Polish navigation — Working"'), 'the accessible name carries the same label');
 
 // A finished child is archived out of the live task list, and a replaced parent
@@ -120,7 +122,7 @@ const summaries = {
 };
 const archived = subTasksSection(summaries);
 ok((archived.match(/class="subtask-row"/g) || []).length === 3, 'children missing from the run and the live list still appear');
-ok(archived.includes('Land the migration') && archived.includes('<span class="chip done">Done</span>'),
+ok(archived.includes('Land the migration') && /<span class="status done">.*?>Done<\/span>/.test(archived),
   'an archived child shows its real finished state, not setup');
 ok(archived.includes('>Cancelled<') && !archived.includes('>Setup<'), 'no child falls back to the setup placeholder');
 ok(archived.includes('>1/3<'), 'archived children count towards completion');
@@ -135,7 +137,7 @@ const approval = subTasksSection({ taskId: 'parent', workflow: 'software-dev', s
   { id: 'needs-key', num: 16, title: 'Paddle storage packs', workflow: 'software-dev',
     lastView: { stage: 'do', status: 'waiting', waitingFor: { kind: 'timer', until: 1 }, approvalRequests: 2 } },
 ] });
-ok(approval.includes('Waiting until 4:00 PM') && approval.includes('Approval needed'), 'a child waiting on an approval shows it in the parent');
+ok(approval.includes('Waiting until 4:00 PM') && approval.includes('>Needs approval<'), 'a child waiting on an approval shows it in the parent');
 
 // pramana#102: a pull request of the task is part of it (shown under Branches),
 // never a sub-task — even when the task's run no longer lists it among its own.

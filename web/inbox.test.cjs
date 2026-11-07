@@ -43,7 +43,7 @@ global.formatBytes = (n) => `${n} B`;
 
 eval(extractConst('URGENCY_LEVELS').replace('const URGENCY_LEVELS =', 'global.URGENCY_LEVELS ='));
 for (const name of ['urgencyRank', 'inboxUnreadCount', 'taskHasUnreadAsk', 'inboxRowLabel', 'inboxTitle', 'urgencyChip', 'updateBell',
-  'inboxNotices', 'inboxNoticesHtml', 'slugify', 'projectSlug', 'projectPath', 'orgSlug', 'projectLabel']) eval(extractFn(name));
+  'inboxNotices', 'statusHtml', 'inboxNoticesHtml', 'slugify', 'projectSlug', 'projectPath', 'orgSlug', 'projectLabel']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;

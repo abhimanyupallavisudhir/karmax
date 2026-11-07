@@ -41,7 +41,7 @@ global.subTaskState = (rec) => ({
 });
 global.taskUrl = (id) => `/tasks/${id}`;
 
-for (const name of ['taskForkSourceIds', 'agentForkPool', 'agentForkTree', 'subTaskStateHtml', 'forkTreeHtml', 'agentForksSection',
+for (const name of ['taskForkSourceIds', 'agentForkPool', 'agentForkTree', 'statusHtml', 'subTaskStateHtml', 'forkTreeHtml', 'agentForksSection',
   'forkSourceTree', 'forkSourcesSection']) eval(extractFn(name));
 
 let pass = 0, fail = 0;

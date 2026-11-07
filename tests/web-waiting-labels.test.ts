@@ -55,6 +55,9 @@ vm.runInContext(
     extractFunction('conversationInputRequest'),
     extractConst('PARKED_WAITS'),
     extractFunction('stageLabel'),
+    extractFunction('statusTone'),
+    extractFunction('statusHtml'),
+    extractFunction('viewStatusHtml'),
     extractFunction('runSubRow'),
     extractFunction('runPageRow'),
     extractFunction('conversationPresence'),
@@ -363,8 +366,9 @@ describe('waiting labels in task summaries', () => {
         waitingFor: { kind: 'agentSlot', detail: 'Starting agent' },
       },
     };
-    expect(runSubRow(run)).toContain('<span class="chip waiting">Working</span>');
-    expect(runPageRow(run)).toContain('<span class="chip waiting">Working</span>');
+    // A passing wait inside a stage (an agent slot) still reads as working.
+    expect(runSubRow(run)).toMatch(/<span class="status working">.*?>Working<\/span>/);
+    expect(runPageRow(run)).toMatch(/<span class="status working">.*?>Working<\/span>/);
   });
 
   it('uses the truthful startup state in agent conversations', () => {
