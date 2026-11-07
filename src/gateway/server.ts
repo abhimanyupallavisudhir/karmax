@@ -7437,7 +7437,10 @@ export class Gateway {
                 return this.json(res, 200, result);
               }
               if (action === 'dismiss' && method === 'POST') {
-                return this.json(res, 200, (await service.dismiss(org, id, `user:${userId}`)));
+                const dismissed = (await service.dismiss(org, id, `user:${userId}`));
+                if (dismissed.taskId) (await this.deps.api.connectionsChanged(dismissed.taskId).catch((error) =>
+                  console.warn(`[connections] could not wake ${dismissed.taskId} after an ignored request`, error)));
+                return this.json(res, 200, dismissed);
               }
             }
           }

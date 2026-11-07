@@ -785,6 +785,14 @@ export class KarmaxApi {
     }
   }
 
+  /** One of a task's app-connection requests was ignored: a task waiting on its
+   * requests checks them again, and goes on to its own ask if none still holds
+   * it. Best effort — a task that is not waiting has nothing to wake. */
+  async connectionsChanged(taskId: string): Promise<void> {
+    try { await (await this.workflowHandle(taskId)).signal(SIG.connectionsChanged); }
+    catch (error) { if (!(error instanceof WorkflowNotFoundError) && !(error instanceof NotFoundError)) throw error; }
+  }
+
   async publishTaskBranch(token: string): Promise<{ branch: string; pushed: string[] }> {
     const { task, handle } = (await this.collaborationTask(token, 'publish_task_branch'));
     const access = await this.openCollaborationWorld(task.id, handle);

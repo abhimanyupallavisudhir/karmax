@@ -200,6 +200,7 @@ export const stopAgentSignal = defineSignal<[{ key: string; by?: string; byLabel
 export const collaborationRequestedSignal = defineSignal<[string]>('collaborationRequested');
 export const collaborationSettledSignal = defineSignal<[string, Message]>('collaborationSettled');
 export const resourceResolvedSignal = defineSignal(SIG.resourceResolved);
+export const connectionsChangedSignal = defineSignal(SIG.connectionsChanged);
 export const providerChangedSignal = defineSignal(SIG.providerChanged);
 export const confirmSignal = defineSignal('confirm');
 /** Explicit transition into PR preparation. Only the platform supplies a human
@@ -2165,6 +2166,10 @@ async function softwareDevImpl(
   setHandler(resourceResolvedSignal, () => {
     resourceResolutionEpoch++;
   });
+  // No history before this signal existed carries it, so the wait below may
+  // read it unpatched: replay sees the epoch unchanged, as it was.
+  let connectionEpoch = 0;
+  setHandler(connectionsChangedSignal, () => { connectionEpoch++; });
   if (fairLanding) setHandler(providerChangedSignal, async () => {
     providerChangeEpoch++;
     await landingWatcher?.signal('providerChanged').catch(() => undefined);
@@ -5145,14 +5150,18 @@ Inspect the complete current diff and specifically compare its delta from the re
     }
 
     if (patched('service-connections-wait-v1')) {
+      // Taken before each check, so a change during it wakes the wait at once.
+      let checkedEpoch = connectionEpoch;
       while (await core.pendingServiceConnections(taskId) && !cancelled && !mainUnread()) {
         status = 'waiting';
         waitingFor = { kind: 'human', detail: 'Connect the requested app in Approval Requests to continue.' };
         openPrInert = true;
         await publish();
-        if (patched('service-connections-signal-wait-v1')) await waitServing(() => cancelled || mainUnread());
+        const epoch = checkedEpoch;
+        if (patched('service-connections-signal-wait-v1')) await waitServing(() => cancelled || mainUnread() || connectionEpoch !== epoch);
         else await condition(() => cancelled || msgs.length > seen, '30 seconds');
         openPrInert = false;
+        checkedEpoch = connectionEpoch;
       }
       if (cancelled) return await abort();
       if (mainUnread()) { status = 'active'; waitingFor = undefined; continue; }
