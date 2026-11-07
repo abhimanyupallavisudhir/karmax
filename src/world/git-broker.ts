@@ -17,6 +17,11 @@ import { canonicalRepositoryIdentity } from './repository-identity.js';
 import { BRAND } from '../domain/brand.js';
 import { isTransportError } from '../agent/limits.js';
 import { mirroredClone, type MirroredClone } from './git-mirror.js';
+import { parseHostedUrl } from '../domain/hosted-repository.js';
+
+/** A remote the broker reaches with a credential of its own: SSH-shaped (GitHub's
+ * own is rewritten to HTTPS) or a repository tavya hosts (`tavya:`). */
+const brokerRemote = (source: string): boolean => /^(?:ssh:\/\/|git@)/.test(source) || Boolean(parseHostedUrl(source));
 
 /** Clone options for the broker's throwaway repositories. `git fetch` and
  * `git commit` start `git maintenance run --auto`, which current Git detaches;
@@ -78,7 +83,7 @@ export async function brokerEnrollRepository(
 ): Promise<WorldRepo> {
   if (spec.name !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(spec.name))
     throw new Error('invalid checkout name');
-  if (!/^(?:ssh:\/\/|git@)/.test(spec.source)) throw new Error('dynamic repository enrollment requires an SSH remote');
+  if (!brokerRemote(spec.source)) throw new Error('dynamic repository enrollment requires an SSH remote');
   if (!validGitBranch(spec.branch)) throw new Error(`invalid task branch "${spec.branch}"`);
   if (!validGitBranch(spec.base)) throw new Error(`invalid repository base branch "${spec.base}"`);
   if (spec.target && !validGitBranch(spec.target)) throw new Error(`invalid repository target branch "${spec.target}"`);
@@ -449,7 +454,7 @@ async function verifyPublishedBranch(world: World, repo: WorldRepo, auth: GitBro
   expected: string): Promise<boolean> {
   if (!/^[a-f0-9]{40}$|^[a-f0-9]{64}$/.test(expected) || !validGitBranch(repo.branch)) return false;
   const source = worldRepoSource(repo);
-  if (!/^(?:ssh:\/\/|git@)/.test(source)) return false;
+  if (!brokerRemote(source)) return false;
   const ref = `refs/heads/${repo.branch}`;
   const tip = await world.exec('git', ['rev-parse', '--verify', ref], { cwd: repo.root });
   if (tip.code !== 0 || tip.stdout.trim() !== expected) return false;
@@ -718,7 +723,7 @@ async function authorityBundle(temp: string, repo: WorldRepo, branch: string, au
   if (local && (await git(local, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])).code === 0)
     return createGitBundle(args => git(local, args, { timeoutMs: 10 * 60_000 }), `refs/heads/${branch}`, bundlePath, known);
   const source = worldRepoSource(repo);
-  if (!/^(?:ssh:\/\/|git@)/.test(source)) throw new Error('Git broker requires an SSH remote');
+  if (!brokerRemote(source)) throw new Error('Git broker requires an SSH remote');
   const credential = await resolveCredential(auth, repo);
   const { env } = materializeGitCredential(temp, credential);
   let scratch;
@@ -924,7 +929,7 @@ async function withTransferredRepo<T>(
 ): Promise<T> {
   if (branch && !validGitBranch(branch)) throw new Error('invalid broker clone branch');
   const source = worldRepoSource(repo);
-  if (!/^(?:ssh:\/\/|git@)/.test(source)) throw new Error('Git broker requires an SSH remote');
+  if (!brokerRemote(source)) throw new Error('Git broker requires an SSH remote');
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-broker-'));
   let operationFailed = false;
   let scratch: MirroredClone | undefined;

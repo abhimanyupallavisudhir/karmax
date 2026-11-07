@@ -1,3 +1,4 @@
+import { isHostedRepository, repositoryBrokerCredentials } from './hosted-git.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -101,7 +102,8 @@ export interface ProjectFilesDeps {
 }
 
 /** The credential the host reads a project's repository (or its wiki) with:
- * the organization's GitHub App; hosted refuses without it; a self-host reads
+ * tavya's own for a repository it hosts, else the organization's GitHub App;
+ * hosted refuses without it; a self-host reads
  * with the host's own Git setup, as its worlds are provisioned. */
 export function projectRepositoryCredential(store: Store, options: { hosted?: boolean;
   githubApp?: { brokerCredentials(repository: import('../domain/types.js').Repository): Promise<GitBrokerCredential> } }) {
@@ -109,7 +111,8 @@ export function projectRepositoryCredential(store: Store, options: { hosted?: bo
     const repositories = [...(await store.listProjectRepositories(projectId)).map((linked) => linked.repository),
       ...[(await store.projectWiki(projectId))?.repository].filter((wiki): wiki is NonNullable<typeof wiki> => Boolean(wiki))];
     const repository = repositories.find((candidate) => safeSame(candidate.sshUrl, sshUrl));
-    if (options.githubApp && repository?.gitConnectionId) return options.githubApp.brokerCredentials(repository);
+    if (repository && (isHostedRepository(repository) || (options.githubApp && repository.gitConnectionId)))
+      return repositoryBrokerCredentials(repository, options.githubApp);
     if (options.hosted) throw new Error('Connect GitHub in organization settings, then try again.');
     return {};
   };

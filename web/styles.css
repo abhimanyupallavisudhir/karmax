@@ -867,6 +867,16 @@ a.git-repo-name:hover { color:var(--accent); }
 .np-h { margin-bottom:6px; }
 .np-default { display:grid; gap:6px; margin:-4px 0 14px; }
 .np-default-row { display:flex; align-items:center; gap:8px; cursor:pointer; color:var(--ink-2); font-size:var(--fs-13); }
+/* No GitHub: the code is kept on tavya — in a setting row, one paragraph with its tip at the end. */
+.no-github { display:inline; }
+.no-github .info-dot { vertical-align:baseline; }
+/* No GitHub: the code is kept on tavya. One line, as the task form's readiness notice. */
+.np-no-github { display:flex; flex-wrap:wrap; align-items:center; gap:4px 6px; margin:-6px 0 14px; padding:7px 10px;
+  border-radius:8px; background:var(--working-weak); color:var(--working); font-size:var(--fs-13); }
+.np-no-github[hidden] { display:none; }
+.np-no-github .tf-ready-mark { background:var(--working); color:var(--surface); }
+.np-no-github-connect { padding:0; border:0; background:none; color:inherit; font:inherit; font-weight:600; cursor:pointer;
+  text-decoration:underline; text-underline-offset:2px; }
 .np-default-row input { flex:none; margin:0; accent-color:var(--accent); }
 .np-default-row code { padding:1px 6px; border-radius:5px; background:var(--surface-2); color:var(--ink); font:12px var(--font-mono); }
 .np-default-blank { color:var(--ink-3); }

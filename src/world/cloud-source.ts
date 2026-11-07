@@ -1,3 +1,4 @@
+import { parseHostedUrl } from '../domain/hosted-repository.js';
 import { expandPath } from '../util/expand.js';
 import { git, gitOrThrow, isGitRepo } from './git.js';
 
@@ -43,6 +44,8 @@ export async function cloudGitSource(input: string): Promise<CloudGitSource> {
  * relative URLs intentionally return undefined: they cannot cross machines. */
 export function sshSource(value: string): string | undefined {
   const source = value.trim();
+  // A repository tavya hosts keeps its stable `tavya:` URL; the world rewrites it.
+  if (parseHostedUrl(source)) return source;
   if (/^(?:ssh:\/\/|git@)[^\s]+$/i.test(source)) return source;
   if (!/^https?:\/\//i.test(source)) return undefined;
   try {

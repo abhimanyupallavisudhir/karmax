@@ -17,6 +17,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import { sameRepository } from '../world/repository-identity.js';
+import { parseHostedUrl, type HostedRepositoryState } from '../domain/hosted-repository.js';
 import { pinTarget, workingFolder, worldCheckoutNames } from '../domain/world-location.js';
 import { isPostgresTarget, openSqlDatabase, type SqlDatabase } from './sql.js';
 import { watchAuthorityWrites } from './authorization-epoch.js';
@@ -835,6 +836,10 @@ export class Store {
         bytes INTEGER NOT NULL,
         PRIMARY KEY(organizationId, chunkId)
       );
+      CREATE TABLE IF NOT EXISTS hosted_repositories (
+        repositoryId TEXT PRIMARY KEY, organizationId TEXT NOT NULL, head TEXT NOT NULL, refs TEXT NOT NULL,
+        packs TEXT NOT NULL, bytes INTEGER NOT NULL, version INTEGER NOT NULL, updatedAt INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS resource_repository_files (
         repository TEXT NOT NULL, attachmentId TEXT NOT NULL, organizationId TEXT NOT NULL, storageLocationId TEXT,
         kind TEXT NOT NULL, name TEXT NOT NULL, bytes INTEGER NOT NULL, content TEXT,
@@ -1224,6 +1229,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_conversation_exports_project ON conversation_exports(projectId);
       CREATE INDEX IF NOT EXISTS idx_resource_repository_files_location ON resource_repository_files(storageLocationId);
       CREATE INDEX IF NOT EXISTS idx_resource_repository_files_organization ON resource_repository_files(organizationId);
+      CREATE INDEX IF NOT EXISTS idx_hosted_repositories_organization ON hosted_repositories(organizationId);
       CREATE INDEX IF NOT EXISTS idx_resource_repository_files_attachment ON resource_repository_files(attachmentId);
       CREATE INDEX IF NOT EXISTS idx_executions_task ON executions(taskId, startedAt);
       CREATE INDEX IF NOT EXISTS idx_execution_frames ON execution_frames(executionId, seq);
@@ -1979,7 +1985,11 @@ export class Store {
     // default, so resolve those as PR delivery without rewriting an in-flight
     // workflow's already-recorded input. Self-hosted projects retain local-only
     // delivery and its `none` default.
-    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && (config.remote === undefined || config.remote === 'none'))
+    // A project on repositories tavya hosts has no pull requests to open: it
+    // lands by merging and pushing the target itself (world/hosted-git.ts).
+    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && config.repos?.length && config.repos.every((repo) => parseHostedUrl(repo)))
+      config.remote = 'push';
+    else if (process.env.KARMAX_DEPLOYMENT === 'hosted' && (config.remote === undefined || config.remote === 'none'))
       config.remote = 'pr';
     return config;
   }
@@ -2757,6 +2767,7 @@ export class Store {
       conversation_exports: (await selectRows(this.db, 'conversation_exports', 'organizationId=?', [organizationId])),
       resource_repository_files: (await selectRows(this.db, 'resource_repository_files', 'organizationId=?', [organizationId]))
         .map(({ content: _lock, ...row }) => row),
+      hosted_repositories: (await selectRows(this.db, 'hosted_repositories', 'organizationId=?', [organizationId])),
       executions: (await selectRows(this.db, 'executions', 'organizationId=?', [organizationId])),
       execution_frames: (await rowsFor(this.db, 'execution_frames', 'executionId', executionIds)),
       preview_leases: (await selectRows(this.db, 'preview_leases', 'organizationId=?', [organizationId]))
@@ -3086,6 +3097,7 @@ export class Store {
       (await this.db.prepare('DELETE FROM world_provider_connections WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM resource_snapshot_chunks WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM resource_repository_files WHERE organizationId=?').run(organizationId));
+      (await this.db.prepare('DELETE FROM hosted_repositories WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM storage_upload_reservations WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM storage_locations WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM delivery_preferences WHERE organizationId=?').run(organizationId));
@@ -3698,7 +3710,10 @@ export class Store {
   async upsertRepository(input: Omit<Repository, 'id' | 'createdAt' | 'updatedAt'> & { id?: string }): Promise<Repository> {
     return this.db.transaction(async () => {
 
-    if (!/^git@github\.com:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\.git$/.test(input.sshUrl)) throw new Error('repository must use a GitHub SSH URL');
+    if (input.provider === 'tavya') {
+      if (parseHostedUrl(input.sshUrl)?.name !== input.name || input.owner !== input.organizationId)
+        throw new Error('a tavya repository is named by its id and name (tavya:<id>/<name>.git) and owned by its organization');
+    } else if (!/^git@github\.com:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\.git$/.test(input.sshUrl)) throw new Error('repository must use a GitHub SSH URL');
     // Found-or-created by provider id or name, which no constraint covers alone.
     (await this.lockOrganization(input.organizationId));
     const byProvider = input.providerId ? await this.db.prepare(
@@ -3755,6 +3770,35 @@ export class Store {
     for (const projectId of projects) (await this.syncProjectRepositoryConfig(projectId));
   
     });
+  }
+
+  // ─── Repositories tavya hosts (world/hosted-git.ts) ─────────────────────────
+
+  async getHostedRepository(repositoryId: string): Promise<HostedRepositoryState | undefined> {
+    const row = (await this.db.prepare('SELECT * FROM hosted_repositories WHERE repositoryId=?').get(repositoryId)) as any;
+    return row ? { repositoryId: String(row.repositoryId), organizationId: String(row.organizationId), head: String(row.head),
+      refs: JSON.parse(row.refs), packs: JSON.parse(row.packs), bytes: Number(row.bytes), version: Number(row.version),
+      updatedAt: Number(row.updatedAt) } : undefined;
+  }
+
+  /** A new, empty repository's row; an existing one is left as it is. */
+  async createHostedRepository(input: { repositoryId: string; organizationId: string; head: string }): Promise<void> {
+    (await this.db.prepare(`INSERT INTO hosted_repositories (repositoryId, organizationId, head, refs, packs, bytes, version, updatedAt)
+      VALUES (?, ?, ?, '{}', '[]', 0, 0, ?) ON CONFLICT(repositoryId) DO NOTHING`)
+      .run(input.repositoryId, input.organizationId, input.head, Date.now()));
+  }
+
+  /** Move a repository to its next state if it is still at `version`: false when another push came first. */
+  async updateHostedRepository(repositoryId: string, version: number,
+    next: Pick<HostedRepositoryState, 'head' | 'refs' | 'packs' | 'bytes'>): Promise<boolean> {
+    const result = (await this.db.prepare(`UPDATE hosted_repositories SET head=?, refs=?, packs=?, bytes=?, version=?, updatedAt=?
+      WHERE repositoryId=? AND version=?`).run(next.head, JSON.stringify(next.refs), JSON.stringify(next.packs), next.bytes,
+      version + 1, Date.now(), repositoryId, version));
+    return Number(result.changes) === 1;
+  }
+
+  async deleteHostedRepository(repositoryId: string): Promise<void> {
+    (await this.db.prepare('DELETE FROM hosted_repositories WHERE repositoryId=?').run(repositoryId));
   }
 
   async setRepositoryDeployKeys(input: { repositoryId: string; cloneKeyId: string; writeKeyId: string; cloneHandle: string; writeHandle: string }): Promise<void> {
@@ -3881,6 +3925,20 @@ export class Store {
     this.notifyAccessChanged(`project:${input.projectId}`);
     return { ...input, baseBranch, targetBranch, order };
   
+    });
+  }
+
+  /** Put `to` wherever projects use `from`, with the same branches and place (a repository moved to GitHub). */
+  async replaceProjectRepository(from: string, to: string): Promise<string[]> {
+    return this.db.transaction(async () => {
+      const projects = await this.projectIdsForRepository(from);
+      for (const projectId of projects) (await this.lockedProject(projectId));
+      (await this.db.prepare('UPDATE project_repositories SET repositoryId=? WHERE repositoryId=?').run(to, from));
+      for (const projectId of projects) {
+        (await this.syncProjectRepositoryConfig(projectId));
+        this.notifyAccessChanged(`project:${projectId}`);
+      }
+      return projects;
     });
   }
 
@@ -4018,6 +4076,7 @@ export class Store {
     const wanted = new Map(catalog
       .filter((repository) => sources.some((source) => sameRepository(source, repository.sshUrl)))
       .map((repository) => [repository.id, repository]));
+    assertOneRepositoryHost([...wanted.values()]);
     for (const attachment of (await this.listProjectRepositories(projectId)))
       if (!wanted.has(attachment.repositoryId)) (await this.db.prepare('DELETE FROM project_repositories WHERE projectId=? AND repositoryId=?').run(projectId, attachment.repositoryId));
     let order = 0;
@@ -4038,6 +4097,7 @@ export class Store {
     const project = (await this.lockedProject(projectId));
     if (!project) return;
     const linked = (await this.listProjectRepositories(projectId));
+    assertOneRepositoryHost(linked.map(({ repository }) => repository));
     const first = linked[0];
     const base = first?.baseBranch ?? first?.repository.defaultBranch;
     const target = first?.targetBranch ?? base;
@@ -7646,6 +7706,9 @@ export class Store {
     if (location.kind === 'managed') {
       retainedBytes += Number(((await this.db.prepare('SELECT COALESCE(SUM(bytes), 0) bytes FROM promoted_artifacts WHERE organizationId=?')
         .get(location.organizationId)) as any)?.bytes ?? 0);
+      // Repositories tavya hosts (world/hosted-git.ts): their stored packs.
+      retainedBytes += Number(((await this.db.prepare('SELECT COALESCE(SUM(bytes), 0) bytes FROM hosted_repositories WHERE organizationId=?')
+        .get(location.organizationId)) as { bytes?: number } | undefined)?.bytes ?? 0);
       // A checkpoint queued for deletion no longer counts: its object goes with
       // the next lifecycle sweep.
       retainedBytes += Number(((await this.db.prepare(`SELECT COALESCE(SUM(CAST(json_extract(manifest, '$.filesystemDelta.bytes') AS INTEGER)), 0) bytes
@@ -9500,6 +9563,14 @@ export class Store {
         if (parts[2] === 'manifests') return exists("SELECT 1 FROM resource_revisions WHERE json_extract(sealedRef, '$.objectKey')=?", key);
         return false;
       }
+      case 'git': {
+        // git/<organization>/<repository>/<pack>/<part>.bin (world/hosted-git.ts)
+        const [, organization, repository, pack] = parts;
+        if (!organization || !repository || !pack || parts.length !== 5) return false;
+        const row = (await this.db.prepare('SELECT packs FROM hosted_repositories WHERE repositoryId=? AND organizationId=?')
+          .get(repository, organization)) as { packs?: string } | undefined;
+        return !!row?.packs && (JSON.parse(row.packs) as Array<{ id: string }>).some((each) => each.id === pack);
+      }
       case 'checkpoints': return exists("SELECT 1 FROM world_checkpoints WHERE json_extract(manifest, '$.filesystemDelta.objectKey')=?", key);
       case 'artifacts': return exists('SELECT 1 FROM promoted_artifacts WHERE objectKey=?', key);
       case 'conversation-exports': return exists('SELECT 1 FROM conversation_exports WHERE objectKey=?', key);
@@ -11199,6 +11270,13 @@ function rowToGitConnection(r: any): GitConnection {
   return { id: r.id, organizationId: r.organizationId, provider: r.provider,
     installationId: r.installationId, accountLogin: r.accountLogin, accountType: r.accountType ?? undefined,
     createdAt: r.createdAt, suspendedAt: r.suspendedAt ?? undefined };
+}
+
+/** A project lands on GitHub through pull requests and on tavya by merging
+ * itself (effectiveProjectConfig): one project cannot do both. */
+function assertOneRepositoryHost(repositories: Repository[]): void {
+  if (repositories.some((repository) => repository.provider === 'tavya') && repositories.some((repository) => repository.provider !== 'tavya'))
+    throw new Error('A project’s repositories are either all on tavya or all on GitHub: move the tavya ones to GitHub first');
 }
 
 function rowToRepository(r: any): Repository {

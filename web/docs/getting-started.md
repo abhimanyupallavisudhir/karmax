@@ -1,6 +1,6 @@
 # Getting started
 
-tavya is a to-do list for agents. You write tasks; agents do them on their own cloud computers and hand the result back for review, usually as a pull request.
+tavya is a to-do list for agents. You write tasks; agents do them on their own cloud computers and hand the result back for review.
 
 ## 1. Create an account
 
@@ -12,13 +12,15 @@ Your first organization comes with **$5 of free compute for 14 days**. It pays f
 
 In the organization's **Settings**:
 
-- **Projects**: connect GitHub, so agents can work on your repositories and open pull requests.
+- **Projects**: optionally connect GitHub, so agents can work on your GitHub repositories and open pull requests. Without it, your code lives in repositories tavya hosts.
 - **Agents**: tasks start on tavya's included model (DeepSeek V4.1 Flash, served only by providers that keep no copy of your prompts). Any other model on OpenRouter also runs on your compute; the task form says when one costs more. Or sign in with a Claude or ChatGPT subscription, or add an API key: those are billed by their providers, not from your compute. Pick the model in **Task defaults** or on each task.
 - **Computers**: tasks run on tavya's computers, charged to your trial or plan, or on your own E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud account ([Cloud computers](/docs/computers)).
 
 ## 3. Create a project
 
-Press **+** next to **Projects** in the sidebar and name it. With GitHub connected, the project works on the GitHub repository of the same name, and tavya creates it if it doesn't exist yet. Or pick **Choose other repositories** to add others, or none. A project is one task list with its own settings, data and wiki.
+Press **+** next to **Projects** in the sidebar and name it. The project works on the repository of the same name, and tavya creates it if it doesn't exist yet: on GitHub when you connected it, else on tavya itself. Or pick **Choose other repositories** to add others, or none. A project is one task list with its own settings, data and wiki.
+
+A repository tavya hosts is an ordinary Git repository: clone it with `git clone https://tavya.io/git/…` (the project's settings copy the address) and sign in with a personal token (**Profile → Apps and tokens**) as the password, or use [`tavya clone`](/docs/cli). **Move to GitHub** in the project's settings copies it, every branch, to a new GitHub repository that takes its place.
 
 ## 4. Create a task
 

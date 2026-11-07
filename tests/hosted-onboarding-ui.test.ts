@@ -6,8 +6,8 @@ afterAll(closeConsoleBrowser);
 type Status = Record<string, any>;
 const status = (overrides: Status = {}): Status => ({
   organizationId: 'o', visible: true, display: 'expanded', complete: false, replay: false,
-  completedRequired: 2, totalRequired: 4,
-  steps: { github: { complete: true }, agentLogin: { complete: false },
+  completedRequired: 1, totalRequired: 3,
+  steps: { github: { complete: true, blocking: false }, agentLogin: { complete: false },
     compute: { complete: true, managed: false, own: true }, optional: {}, project: { complete: false } },
   ...overrides,
 });
@@ -32,21 +32,22 @@ describe('hosted onboarding UI', () => {
     const ui = await hosted();
     const steps = guide(ui).locator('.onboarding-step');
     await steps.first().waitFor();
+    // GitHub is optional: a project's code can live on tavya itself.
     expect(await steps.locator('.onboarding-step-title').allInnerTexts()).toEqual([
-      'Connect GitHub', 'Add agent logins', 'Get computers for your agents',
-      'Connect apps and payment cards\nOptional', 'Create your first project', // sentence case, like every label
+      'Add agent logins', 'Get computers for your agents', 'Create your first project',
+      'Connect GitHub\nOptional', 'Connect apps and payment cards\nOptional', // sentence case, like every label
     ]);
-    expect(await steps.nth(3).innerText()).toContain('This never blocks setup.');
+    expect(await steps.nth(4).innerText()).toContain('This never blocks setup.');
     expect(await guide(ui).locator('.onboarding-foot').innerText()).toContain('Optional items do not count toward completion.');
     // Completed steps show a tick instead of their number.
-    expect(await steps.locator('.onboarding-check').allInnerTexts()).toEqual(['✓', '2', '✓', '4', '5']);
+    expect(await steps.locator('.onboarding-check').allInnerTexts()).toEqual(['1', '✓', '3', '✓', '5']);
     await ui.close();
   });
 
   it('offers a paid plan or the organization’s own compute as two ways to finish one required step', async () => {
     let compute = { complete: false, managed: false, own: false };
     const ui = await hosted({ onboarding: () => status({ steps: { ...status().steps, compute } }) });
-    const step = guide(ui).locator('.onboarding-step').nth(2);
+    const step = guide(ui).locator('.onboarding-step').nth(1);
     await step.waitFor();
     expect(await step.locator('.onboarding-optional').count()).toBe(0); // required, neither option is "optional"
     const options = step.locator('.onboarding-option');
@@ -54,7 +55,7 @@ describe('hosted onboarding UI', () => {
     expect((await step.locator('.onboarding-or').innerText()).toLowerCase()).toBe('or');
     expect(await options.locator('a.btn').evaluateAll((links) => links.map((link) => [link.textContent?.trim(), link.getAttribute('href')])))
       .toEqual([['View plans', '/org/settings#settings-plan'], ['Connect', '/org/settings#settings-computers']]);
-    expect(await step.locator('.onboarding-check').innerText()).toBe('3');
+    expect(await step.locator('.onboarding-check').innerText()).toBe('2');
 
     // Either option alone completes the step; the one taken is ticked and offers management.
     compute = { complete: true, managed: true, own: false };
@@ -68,9 +69,9 @@ describe('hosted onboarding UI', () => {
     const ui = await hosted();
     const actions = await guide(ui).locator('.onboarding-step a.btn').evaluateAll((links) =>
       links.map((link) => [link.textContent?.trim(), link.getAttribute('href')]));
-    expect(actions.map(([, href]) => href)).toEqual(['/org/settings#settings-code', '/org/settings#settings-agents',
-      '/org/settings#settings-plan', '/org/settings#settings-computers', '/org/settings#settings-payments']);
-    expect(actions[3]![0]).toBe('Manage'); // a completed option offers management, not setup
+    expect(actions.map(([, href]) => href)).toEqual(['/org/settings#settings-agents', '/org/settings#settings-plan',
+      '/org/settings#settings-computers', '/org/settings#settings-code', '/org/settings#settings-payments']);
+    expect(actions[2]![0]).toBe('Manage'); // a completed option offers management, not setup
     await guide(ui).locator('.onboarding-step a[href$="#settings-agents"]').click();
     await expect.poll(() => ui.run<string>('location.pathname + location.hash')).toBe('/org/settings#settings-agents');
     await guide(ui).locator('#onboarding-new-project').click();
@@ -80,7 +81,7 @@ describe('hosted onboarding UI', () => {
 
   it('gives the optional apps-and-cards step a single action', async () => {
     const ui = await hosted();
-    const optional = guide(ui).locator('.onboarding-step').nth(3);
+    const optional = guide(ui).locator('.onboarding-step').nth(4);
     const actions = optional.locator('.btn');
     expect(await actions.count()).toBe(1);
     expect(await actions.getAttribute('href')).toBe('/org/settings#settings-payments');
@@ -115,22 +116,22 @@ describe('hosted onboarding UI', () => {
     await selfHosted.close();
 
     let display = 'expanded';
-    let completed = 2;
+    let completed = 1;
     const ui = await hosted({ onboarding: (call) => {
       if (call.method === 'PUT') display = call.body.display;
       return status({ display, visible: display !== 'closed', completedRequired: completed });
     } });
     const progress = guide(ui).getByRole('progressbar');
-    expect(await progress.getAttribute('aria-valuenow')).toBe('2');
-    expect(await progress.getAttribute('aria-label')).toBe('2 of 4 required setup steps complete');
-    // Progress made elsewhere (a GitHub connection in another tab) shows up without a reload.
-    completed = 3;
-    await expect.poll(() => progress.getAttribute('aria-valuenow'), { timeout: 8_000 }).toBe('3');
+    expect(await progress.getAttribute('aria-valuenow')).toBe('1');
+    expect(await progress.getAttribute('aria-label')).toBe('1 of 3 required setup steps complete');
+    // Progress made elsewhere (an agent login added in another tab) shows up without a reload.
+    completed = 2;
+    await expect.poll(() => progress.getAttribute('aria-valuenow'), { timeout: 8_000 }).toBe('2');
 
     await guide(ui).getByRole('button', { name: 'Minimize setup guide' }).click();
     const reopen = guide(ui).getByRole('button', { name: 'Open setup guide' });
     await reopen.waitFor();
-    expect(await reopen.innerText()).toContain('3 of 4 required steps');
+    expect(await reopen.innerText()).toContain('2 of 3 required steps');
     await reopen.click();
     await guide(ui).getByRole('button', { name: 'Close setup guide' }).click();
     await expect.poll(() => guide(ui).isHidden()).toBe(true);
@@ -156,7 +157,7 @@ describe('hosted onboarding UI', () => {
   });
 
   it('keeps window controls together in the header, not a Minimize button in the footer', async () => {
-    const ui = await hosted({ onboarding: () => status({ replay: true, completedRequired: 4 }) });
+    const ui = await hosted({ onboarding: () => status({ replay: true, completedRequired: 3 }) });
     const controls = await guide(ui).locator('.onboarding-head button').evaluateAll((buttons) =>
       buttons.map((button) => button.getAttribute('aria-label')));
     expect(controls).toEqual(['Minimize setup guide', 'Close setup guide']);

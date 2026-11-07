@@ -5930,7 +5930,7 @@ function onboardingStep(number, key, title, detail, action) {
   const step = S.onboarding?.steps?.[key] || {};
   return `<li class="onboarding-step ${step.complete ? 'complete' : ''}">
     <span class="onboarding-check" aria-hidden="true">${step.complete ? '✓' : number}</span>
-    <div class="onboarding-step-copy"><div class="onboarding-step-title">${esc(title)}${key === 'optional' ? '<span class="onboarding-optional">Optional</span>' : ''}</div>
+    <div class="onboarding-step-copy"><div class="onboarding-step-title">${esc(title)}${key === 'optional' || step.blocking === false ? '<span class="onboarding-optional">Optional</span>' : ''}</div>
       ${detail ? `<p>${detail}</p>` : ''}${action}</div>
   </li>`;
 }
@@ -6010,15 +6010,15 @@ function renderOnboarding() {
     <div class="onboarding-progress" role="progressbar" aria-valuemin="0" aria-valuemax="${state.totalRequired}" aria-valuenow="${state.completedRequired}" aria-label="${state.completedRequired} of ${state.totalRequired} required setup steps complete"><span style="width:${Math.round(state.completedRequired / state.totalRequired * 100)}%"></span></div>
     <p class="onboarding-intro">A few real connections turn this workspace into a place your agents can work.</p>
     <ol class="onboarding-list">
-      ${onboardingStep(1, 'github', 'Connect GitHub', `Import repositories and let ${siteNameMarkup()} work through reviewed pull requests.`, `<a class="btn sm" data-spa href="${settings}#settings-code">${state.steps.github.complete ? 'Manage GitHub' : 'Connect GitHub'}</a>`)}
-      ${onboardingStep(2, 'agentLogin', 'Add agent logins', 'Connect at least one usable Codex, Claude, or API-key account.', `<a class="btn sm" data-spa href="${settings}#settings-agents">${state.steps.agentLogin.complete ? 'Manage agent logins' : 'Add agent login'}</a>`)}
-      ${onboardingStep(3, 'compute', 'Get computers for your agents', '', `<div class="onboarding-options">
+      ${onboardingStep(1, 'agentLogin', 'Add agent logins', 'Connect at least one usable Codex, Claude, or API-key account.', `<a class="btn sm" data-spa href="${settings}#settings-agents">${state.steps.agentLogin.complete ? 'Manage agent logins' : 'Add agent login'}</a>`)}
+      ${onboardingStep(2, 'compute', 'Get computers for your agents', '', `<div class="onboarding-options">
         ${onboardingOption(compute.managed, 'Buy a paid plan', `Includes ${siteNameMarkup()}’s computers`, `${settings}#settings-plan`, compute.managed ? 'Manage plan' : 'View plans')}
         <span class="onboarding-or">or</span>
         ${onboardingOption(compute.own, 'Connect your own compute', 'E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud', `${settings}#settings-computers`, compute.own ? 'Manage' : 'Connect')}
       </div>`)}
-      ${onboardingStep(4, 'optional', 'Connect apps and payment cards', 'Connect services and give agents approved access to passwords and purchases. This never blocks setup.', `<a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault || optional.card ? 'Manage apps &amp; cards' : 'Set up apps &amp; cards'}</a>`)}
-      ${onboardingStep(5, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
+      ${onboardingStep(3, 'project', 'Create your first project', `Start a real task list. Its code can live on ${siteNameMarkup()} or on GitHub.`, `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
+      ${onboardingStep(4, 'github', 'Connect GitHub', `Work on your GitHub repositories through reviewed pull requests.`, `<a class="btn sm" data-spa href="${settings}#settings-code">${state.steps.github.complete ? 'Manage GitHub' : 'Connect GitHub'}</a>`)}
+      ${onboardingStep(5, 'optional', 'Connect apps and payment cards', 'Connect services and give agents approved access to passwords and purchases. This never blocks setup.', `<a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault || optional.card ? 'Manage apps &amp; cards' : 'Set up apps &amp; cards'}</a>`)}
     </ol>
     <div class="onboarding-foot">${state.replay && state.completedRequired === state.totalRequired ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span></div>
   </section>`;
@@ -21074,7 +21074,47 @@ function openNewGithubRepositoryDialog(organizationId, gitConnections, opener, c
 }
 // A repository source as people name it: owner/name for GitHub, the path or URL
 // otherwise. The exact source stays on hover.
+// Move a repository tavya hosts to GitHub: a new repository in one of the
+// organization's GitHub accounts gets every branch and tag, and takes its place
+// in every project using it.
+function openMoveToGithubDialog(organizationId, repository, gitConnections, opener, moved) {
+  const host = document.createElement('div');
+  host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-repository-dialog" role="dialog" aria-modal="true" aria-labelledby="move-repository-title">
+    <div class="new-repository-head"><b id="move-repository-title">Move ${esc(repository.name)} to GitHub</b><button class="icon-btn new-repository-close" type="button" aria-label="Close">×</button></div>
+    <div class="new-repository-identity">
+      <label class="form-row"><span>GitHub account</span><select id="move-repository-connection">${gitConnections.map((connection) => `<option value="${esc(connection.id)}">${esc(connection.accountLogin)}</option>`).join('')}</select></label>
+      <span class="new-repository-slash" aria-hidden="true">/</span>
+      <label class="form-row"><span>Repository name</span><input id="move-repository-name" required autocomplete="off" value="${esc(repository.name)}"></label>
+    </div>
+    <label class="switch new-repository-private"><input id="move-repository-private" type="checkbox" checked><span>Private repository</span></label>
+    <div class="form-error" role="alert" hidden></div>
+    <div class="new-repository-actions"><button class="btn new-repository-cancel" type="button">Cancel</button><button class="btn primary" type="submit">Move</button></div>
+  </form></div>`;
+  document.body.appendChild(host);
+  const close = () => { host.remove(); opener?.focus?.(); };
+  host.querySelector('.new-repository-close').addEventListener('click', close);
+  host.querySelector('.new-repository-cancel').addEventListener('click', close);
+  host.querySelector('form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const button = host.querySelector('button[type="submit"]');
+    const error = host.querySelector('.form-error');
+    button.disabled = true; button.textContent = 'Moving…'; error.hidden = true;
+    try {
+      const result = await api(`/api/organizations/${encodeURIComponent(organizationId)}/repositories/${encodeURIComponent(repository.id)}/move-to-github`, {
+        method: 'POST', body: JSON.stringify({ gitConnectionId: host.querySelector('#move-repository-connection').value,
+          name: host.querySelector('#move-repository-name').value.trim(), private: host.querySelector('#move-repository-private').checked }) });
+      close(); await moved(result);
+    } catch (cause) {
+      error.textContent = plainError(cause); error.hidden = false;
+      button.disabled = false; button.textContent = 'Move';
+    }
+  });
+  host.querySelector('#move-repository-name').focus();
+}
+
 function repositorySourceView(source) {
+  const tavya = /^tavya:(repo_[a-z0-9]+)\/([\w.-]+?)(?:\.git)?$/.exec(source);
+  if (tavya) return { kind: 'tavya', id: tavya[1], name: tavya[2], key: `tavya/${tavya[2]}`.toLowerCase() };
   const github = /^(?:git@github\.com:|(?:ssh:\/\/git@|https?:\/\/)(?:ssh\.)?github\.com(?::\d+)?\/)([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i.exec(source);
   if (github) return { kind: 'github', owner: github[1], name: github[2], key: `${github[1]}/${github[2]}`.toLowerCase() };
   return { kind: /^(?:\/|~|\.{1,2}\/)/.test(source) ? 'local' : 'git', name: source, key: source };
@@ -21082,17 +21122,42 @@ function repositorySourceView(source) {
 const folderIcon = () => '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M1.5 3.5A1.5 1.5 0 0 1 3 2h3.2l1.5 1.5H13A1.5 1.5 0 0 1 14.5 5v7.5A1.5 1.5 0 0 1 13 14H3a1.5 1.5 0 0 1-1.5-1.5v-9ZM3 3.5v9h10V5H7.1L5.6 3.5H3Z"/></svg>';
 const gitIcon = () => '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M5 2.5a1.5 1.5 0 0 0-.75 2.8v5.4a1.5 1.5 0 1 0 1.5 0V8.6c.4.25.9.4 1.5.4h2.1a1.5 1.5 0 1 0 0-1.5H7.25c-.83 0-1.5-.67-1.5-1.5v-.7A1.5 1.5 0 0 0 5 2.5Z"/></svg>';
 
-// One repository of a project's list, as Git & GitHub shows it.
-function gitRepoRow(source, repositories) {
+// Repositories tavya hosts itself (wiki features/hosted-repositories): one more
+// account a new repository can go to, typed as "tavya/<name>", where this
+// installation hosts them.
+const TAVYA_ACCOUNT = { id: 'tavya', accountLogin: 'tavya', accountType: 'Organization', hosted: true };
+const withTavyaAccount = (createIn) => S.meta?.hostsRepositories ? [...createIn, TAVYA_ACCOUNT] : createIn;
+const repositorySlug = (repository) => repository.provider === 'tavya' ? `tavya/${repository.name}` : `${repository.owner}/${repository.name}`;
+const tavyaCloneUrl = (view) => `${location.origin}/git/${view.id}/${view.name}.git`;
+function createTavyaRepository(organizationId, name, signal) {
+  return api(`/api/organizations/${encodeURIComponent(organizationId)}/repositories/create`, { method: 'POST',
+    body: JSON.stringify({ provider: 'tavya', name }), ...(signal ? { signal } : {}) });
+}
+
+// One repository of a project's list, as Git & GitHub shows it. A repository
+// tavya hosts offers its clone URL, and moving to GitHub where `move` allows it.
+function gitRepoRow(source, repositories, { move = false } = {}) {
   const view = repositorySourceView(source);
   const name = view.kind === 'github'
     ? `<a class="git-repo-name" href="https://github.com/${esc(view.owner)}/${esc(view.name)}" target="_blank" rel="noopener noreferrer" title="${esc(source)}"><span>${esc(view.owner)}/</span>${esc(view.name)}</a>`
-    : `<span class="git-repo-name mono" title="${esc(source)}">${esc(source)}</span>`;
+    : view.kind === 'tavya'
+      ? `<span class="git-repo-name" title="${esc(`On ${siteName()}: git clone ${tavyaCloneUrl(view)}`)}">${esc(view.name)}</span>`
+      : `<span class="git-repo-name mono" title="${esc(source)}">${esc(source)}</span>`;
+  const hosted = view.kind === 'tavya'
+    ? `<button class="icon-btn git-repo-copy" type="button" data-url="${esc(tavyaCloneUrl(view))}" title="Copy clone URL" aria-label="Copy clone URL of ${esc(view.name)}">⧉</button>${move ? `<button class="btn sm ghost git-repo-move" type="button" title="Copy it to a new GitHub repository, which takes its place">Move to GitHub</button>` : ''}`
+    : '';
   // A fork's pull requests go to the repository it was forked from.
   const upstream = view.kind === 'github'
     && repositories.find((repository) => `${repository.owner}/${repository.name}`.toLowerCase() === view.key)?.upstream;
   const proposes = upstream ? `<span class="setting-muted git-repo-upstream" title="Pull requests go to ${esc(upstream.owner)}/${esc(upstream.name)} after Review">→ ${esc(upstream.owner)}/${esc(upstream.name)}</span>` : '';
-  return `<div class="git-repo" data-source="${esc(source)}"><span class="git-repo-icon">${view.kind === 'github' ? githubMark() : view.kind === 'local' ? folderIcon() : gitIcon()}</span>${name}${proposes}<button class="icon-btn git-repo-remove" type="button" title="Remove" aria-label="Remove ${esc(view.kind === 'github' ? `${view.owner}/${view.name}` : source)}">×</button></div>`;
+  return `<div class="git-repo" data-source="${esc(source)}"><span class="git-repo-icon">${view.kind === 'github' ? githubMark() : view.kind === 'local' ? folderIcon() : gitIcon()}</span>${name}${proposes}${hosted}<button class="icon-btn git-repo-remove" type="button" title="Remove" aria-label="Remove ${esc(view.kind === 'github' ? `${view.owner}/${view.name}` : view.kind === 'tavya' ? view.name : source)}">×</button></div>`;
+}
+/** A repository row's copy button puts its clone URL on the clipboard. */
+function wireRepositoryCopy(box) {
+  box.querySelectorAll('.git-repo-copy').forEach((button) => button.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(button.dataset.url); toast('Clone URL copied'); }
+    catch { toast(button.dataset.url); }
+  }));
 }
 // What the add-a-repository field accepts. Hosted projects may only use
 // repositories the organization's GitHub reaches.
@@ -21155,8 +21220,9 @@ function wireRepositoryPicker(input, { repositories, gitConnections = [], create
   const { pickOnly } = repositoryInput(repositories);
   let options = [];
   let active = -1;
-  const slugOf = (repository) => `${repository.owner}/${repository.name}`;
-  const ownAccount = (owner) => gitConnections.find((connection) => connection.accountLogin?.toLowerCase() === owner.toLowerCase());
+  const slugOf = repositorySlug;
+  const ownAccount = (owner) => owner.toLowerCase() === 'tavya'
+    || gitConnections.find((connection) => connection.accountLogin?.toLowerCase() === owner.toLowerCase());
   const build = () => {
     const typed = input.value.trim();
     const needle = typed.toLowerCase();
@@ -21176,7 +21242,7 @@ function wireRepositoryPicker(input, { repositories, gitConnections = [], create
       const [owner, name] = slug ? slug.split('/') : typed.includes('/') ? [] : [defaultGitConnection(createIn, githubLogin)?.accountLogin, typed];
       const connection = owner && createIn.find((each) => each.accountLogin?.toLowerCase() === owner.toLowerCase());
       const valid = /^[A-Za-z0-9._-]+$/.test(name || '') && connection && !/^\.+$/.test(name);
-      if (!typed) next.push({ kind: 'create', name: '', label: 'New repo…' });
+      if (!typed && !defaultGitConnection(createIn, githubLogin)?.hosted) next.push({ kind: 'create', name: '', label: 'New repo…' });
       else if (valid && !exists(`${connection.accountLogin}/${name}`))
         next.push({ kind: 'create', name, connectionId: connection.id, label: `New repo ${connection.accountLogin}/${name}` });
     }
@@ -21211,7 +21277,9 @@ function wireRepositoryPicker(input, { repositories, gitConnections = [], create
     active = input.value.trim() && options.length ? 0 : -1;
     menu.innerHTML = options.map((option, index) => {
       const body = option.kind === 'repository'
-        ? `<span class="repo-opt-icon">${githubMark()}</span><span class="repo-opt-name"><span>${esc(option.repository.owner)}/</span>${esc(option.repository.name)}</span>${option.repository.upstream ? `<span class="repo-opt-note">→ ${esc(option.repository.upstream.owner)}/${esc(option.repository.upstream.name)}</span>` : ''}`
+        ? option.repository.provider === 'tavya'
+          ? `<span class="repo-opt-icon">${gitIcon()}</span><span class="repo-opt-name"><span>tavya/</span>${esc(option.repository.name)}</span>`
+          : `<span class="repo-opt-icon">${githubMark()}</span><span class="repo-opt-name"><span>${esc(option.repository.owner)}/</span>${esc(option.repository.name)}</span>${option.repository.upstream ? `<span class="repo-opt-note">→ ${esc(option.repository.upstream.owner)}/${esc(option.repository.upstream.name)}</span>` : ''}`
         : `<span class="repo-opt-icon repo-opt-mark" aria-hidden="true"></span><span class="repo-opt-name">${esc(option.label)}</span>`;
       return `<div class="combo-opt repo-opt repo-opt-${option.kind}" role="option" id="${esc(input.id)}-option-${index}" data-index="${index}" aria-selected="false">${body}</div>`;
     }).join('');
@@ -21299,13 +21367,21 @@ function wireRepositoryPicker(input, { repositories, gitConnections = [], create
 }
 // The GitHub row's value and actions: the organization's connected accounts,
 // or the step that connects them. `ids` name its buttons.
+// Without GitHub an organization's code is kept on tavya (wiki
+// features/hosted-repositories). Where that is decided, it is said, with
+// GitHub one click away.
+const codeOnTavya = ({ githubApp, gitConnections, githubLoadError }) =>
+  !!S.meta?.hostsRepositories && !!githubApp?.configured && !githubLoadError && !gitConnections?.length;
+const noGithubText = () => `<span class="no-github-text">No GitHub account connected. ${esc(siteName())} will store your code.</span>`;
+const noGithubTip = () => policyTip(`For the best experience, connect GitHub: pull requests, GitHub Actions and collaborators outside ${siteName()}. A repository moves to GitHub anytime from its project’s settings.`);
 function githubAccessView({ githubApp, gitConnections, githubLoadError }, organizationId, ids) {
   const organizationLink = `${globalRoute('organization', organizationById(organizationId))}#settings-code`;
   const needsUpdate = gitConnections.some((connection) => connection.permissionStatus && !connection.permissionStatus.ready);
   return githubLoadError ? { value: `<span id="${ids.error}"></span>`, actions: '' }
     : !githubApp.configured ? { value: `<span class="setting-muted">Not set up</span>${S.installationAccess ? '' : policyTip('Your administrator needs to set up GitHub first.')}`,
       actions: S.installationAccess ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-github">Set up</a>` : '' }
-    : !gitConnections.length ? { value: '<span class="setting-muted">Not connected</span>', actions: `<button class="btn sm primary" id="${ids.connect}" type="button">Connect GitHub</button>` }
+    : !gitConnections.length ? { value: codeOnTavya({ githubApp, gitConnections, githubLoadError }) ? `<span class="no-github">${noGithubText()} ${noGithubTip()}</span>` : '<span class="setting-muted">Not connected</span>',
+      actions: `<button class="btn sm primary" id="${ids.connect}" type="button">Connect GitHub</button>` }
     : { value: `${gitConnections.map((connection) => `<b>${esc(connection.accountLogin)}</b>`).join('<span class="setting-sep">·</span>')}${needsUpdate ? '<span class="chip setting-warn" title="Approve GitHub’s updated access in organization settings">Needs update</span>' : ''}`,
       actions: `<button class="icon-btn" id="${ids.refresh}" type="button" title="Refresh repository list" aria-label="Refresh repository list">↻</button><a class="btn sm" data-spa href="${organizationLink}">Manage</a>` };
 }
@@ -21329,13 +21405,14 @@ function renderProjectRepositories(box, proj, { repositories, gitConnections, gi
   const sources = proj.config.repos || [];
   const attached = new Set(sources.map((source) => repositorySourceView(source).key));
   const { canAdd, placeholder } = repositoryInput(repositories);
-  const createIn = creatableGitConnections(gitConnections, githubLogins);
-  const canCreate = githubApp.configured && createIn.length > 0;
+  const onGithub = githubApp.configured ? creatableGitConnections(gitConnections, githubLogins) : [];
+  const createIn = withTavyaAccount(onGithub);
+  const canCreate = createIn.length > 0;
   const access = githubAccessView({ githubApp, gitConnections, githubLoadError }, proj.organizationId,
     { error: 'project-github-error', connect: 'project-connect-github', refresh: 'project-refresh-github' });
   const identity = `<b>You</b>${githubLogin && githubApp.userAuthorized ? `<span class="setting-sep">·</span><span class="setting-muted">${esc(githubLogin)}</span>` : ''}`;
   box.innerHTML = `<div class="git-repos">
-      <div id="project-repository-fields">${sources.map((source) => gitRepoRow(source, repositories)).join('')}</div>
+      <div id="project-repository-fields">${sources.map((source) => gitRepoRow(source, repositories, { move: onGithub.length > 0 })).join('')}</div>
       <div class="git-repo-add" id="project-repository-add-form"${!canAdd && !canCreate ? ' hidden' : ''}>${repositoryPickerHtml('project-repository-input', { placeholder: canCreate ? 'Find or create a repository' : placeholder, disabled: !canAdd && !canCreate })}</div>
     </div>
     <div class="setting-rows ruled git-facts">
@@ -21360,14 +21437,25 @@ function renderProjectRepositories(box, proj, { repositories, gitConnections, gi
   };
   box.querySelectorAll('.git-repo').forEach((item) => item.querySelector('.git-repo-remove').addEventListener('click', () =>
     save(sources.filter((source) => source !== item.dataset.source))));
+  wireRepositoryCopy(box);
+  box.querySelectorAll('.git-repo-move').forEach((button) => button.addEventListener('click', () => {
+    const repository = repositories.find((candidate) => candidate.sshUrl === button.closest('.git-repo').dataset.source);
+    if (repository) openMoveToGithubDialog(proj.organizationId, repository, onGithub, button, async () => {
+      toast('Moved to GitHub'); await loadProjects(); await rerender();
+    });
+  }));
+  const attachCreated = async (repository) => {
+    await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) });
+    toast('Repository created and attached'); await loadProjects(); await rerender();
+  };
   wireRepositoryPicker($('#project-repository-input'), {
     repositories, gitConnections, createIn, githubLogin, canCreate,
     attachedKeys: () => attached,
     add: async (source) => { if (await save([...sources, source])) $('#project-repository-input')?.focus(); },
-    create: canCreate ? ({ name, connectionId }, opener) => openNewGithubRepositoryDialog(proj.organizationId, createIn, opener, async (repository) => {
-      await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) });
-      toast('Repository created and attached'); await loadProjects(); await rerender();
-    }, { name, connectionId }) : null,
+    create: canCreate ? async ({ name, connectionId }, opener) => {
+      if (connectionId !== TAVYA_ACCOUNT.id) return openNewGithubRepositoryDialog(proj.organizationId, onGithub, opener, attachCreated, { name, connectionId });
+      try { await attachCreated(await createTavyaRepository(proj.organizationId, name)); } catch (error) { toast(error.message, true); }
+    } : null,
     fork: githubApp.configured && gitConnections.length ? (slug, opener) => openForkRepositoryDialog(proj.organizationId, opener, githubApp, slug, async (fork) => {
       await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: fork.id }) });
       toast('Fork attached'); await loadProjects(); await rerender();
@@ -26960,6 +27048,7 @@ function newProject(options) {
     <div class="new-project-head"><b id="new-project-title">New project</b><button class="icon-btn new-project-close" type="button" aria-label="Close">×</button></div>
     <label class="form-row"><span>Project name ${policyTip('Use / to put it in folders, e.g. Clients/Website.')}</span><input id="new-project-name" aria-label="Project name" placeholder="e.g. Work/Clients/Website" required autocomplete="off" spellcheck="false" value="${esc(folder ? `${folder}/` : '')}"></label>
     <div class="np-default" hidden></div>
+    <div class="np-no-github" role="note" hidden></div>
     <div class="np-section np-repos"><div class="np-h">Git &amp; GitHub</div><div class="np-git"><div class="np-loading">Loading…</div></div></div>
     <details class="np-fold"><summary>Secrets</summary>
       <textarea class="np-secrets" aria-label="Secrets" rows="3" spellcheck="false" autocomplete="off" placeholder="KEY=value, one per line, or paste a .env"></textarea>
@@ -26983,8 +27072,15 @@ function newProject(options) {
   // says why (`blocked`: whose personal account it is) and how to fix it.
   const defaultRepository = () => {
     const { repositories, gitConnections, githubApp, githubLoadError, githubLogin, githubLogins } = github;
-    if (!organizationId || githubLoadError || !githubApp.configured || !gitConnections.length) return null;
+    if (!organizationId) return null;
     const name = githubRepositoryName($in('#new-project-name').value);
+    // Without GitHub, the project's code lives on tavya: a repository named after it.
+    if ((githubLoadError || !githubApp.configured || !gitConnections.length) && S.meta?.hostsRepositories) {
+      const existing = name ? repositories.find((repository) => repository.provider === 'tavya' && repository.name.toLowerCase() === name) : null;
+      if (existing) return { existing, slug: existing.name, hosted: true };
+      return { create: { connectionId: TAVYA_ACCOUNT.id, name }, owner: '', slug: name, hosted: true };
+    }
+    if (githubLoadError || !githubApp.configured || !gitConnections.length) return null;
     const createIn = creatableGitConnections(gitConnections, githubLogins);
     const connection = defaultGitConnection(createIn, githubLogin);
     const owned = (repository) => gitConnections.some((each) => each.accountLogin?.toLowerCase() === repository.owner.toLowerCase());
@@ -26998,18 +27094,37 @@ function newProject(options) {
   const projectRepositories = () => {
     if (!usingDefault()) return [...repos];
     const chosen = defaultRepository();
-    return chosen.existing ? [chosen.existing.sshUrl] : chosen.create.name ? [`git@github.com:${chosen.slug}.git`] : [];
+    if (chosen.existing) return [chosen.existing.sshUrl];
+    if (!chosen.create.name) return [];
+    return [chosen.hosted ? `tavya:repo_new/${chosen.create.name}.git` : `git@github.com:${chosen.slug}.git`];
+  };
+  // While the code goes to tavya, it says so (the GitHub row, hidden then, would).
+  const renderNoGithub = () => {
+    const notice = $in('.np-no-github');
+    const show = usingDefault() && !!defaultRepository()?.hosted && codeOnTavya(github);
+    if (show && !notice.childElementCount) {
+      notice.innerHTML = `<span class="tf-ready-mark" aria-hidden="true">!</span>${noGithubText()}<button class="np-no-github-connect" type="button" id="np-no-github-connect">Connect GitHub</button>${noGithubTip()}`;
+      notice.querySelector('#np-no-github-connect').addEventListener('click', async () => {
+        try { await connectOrganizationGithub(organizationId, async () => { useDefault = true; await loadGithub(); }); }
+        catch (error) { toast(error.message, true); }
+      });
+    }
+    notice.hidden = !show;
   };
   const renderDefault = () => {
     const row = $in('.np-default');
     const chosen = defaultRepository();
     row.hidden = !chosen;
     $in('.np-repos').hidden = usingDefault();
+    renderNoGithub();
     if (!chosen) return renderInstall();
     const kind = chosen.existing ? 'existing' : chosen.blocked ? 'blocked' : 'create';
-    const label = kind === 'existing' ? 'Work on existing GitHub repo' : 'Create new GitHub repo';
-    const slug = chosen.blocked ? '' : chosen.existing || chosen.create.name ? esc(chosen.slug) : `${esc(chosen.owner)}/<span class="np-default-blank">project-name</span>`;
-    const labelHtml = `${label}${slug ? ` <code>${slug}</code>` : ''}`;
+    const label = chosen.hosted ? (kind === 'existing' ? 'Work on existing repo' : 'Create new repo')
+      : kind === 'existing' ? 'Work on existing GitHub repo' : 'Create new GitHub repo';
+    const blank = '<span class="np-default-blank">project-name</span>';
+    const slug = chosen.blocked ? '' : chosen.existing || chosen.create.name ? esc(chosen.slug) : chosen.hosted ? blank : `${esc(chosen.owner)}/${blank}`;
+    const where = chosen.hosted && !codeOnTavya(github) ? policyTip(`Kept on ${siteName()}. Move it to GitHub anytime from the project’s settings.`) : '';
+    const labelHtml = `${label}${slug ? ` <code>${slug}</code>` : ''}${where}`;
     if (row.dataset.kind === kind) { row.querySelector('.np-default-label').innerHTML = labelHtml; return renderInstall(); }
     row.dataset.kind = kind;
     // Two choices, one always picked: the repository named after the project, or
@@ -27044,8 +27159,9 @@ function newProject(options) {
     const box = $in('.np-git');
     const { repositories, gitConnections, githubApp, githubLogin, githubLogins } = github;
     const { canAdd, placeholder } = repositoryInput(repositories);
-    const createIn = creatableGitConnections(gitConnections, githubLogins);
-    const canCreate = !!(githubApp.configured && createIn.length);
+    const onGithub = githubApp.configured ? creatableGitConnections(gitConnections, githubLogins) : [];
+    const createIn = organizationId ? withTavyaAccount(onGithub) : onGithub;
+    const canCreate = createIn.length > 0;
     const access = organizationId ? githubAccessView(github, organizationId, { error: 'np-github-error', connect: 'np-connect-github', refresh: 'np-refresh-github' }) : null;
     box.innerHTML = `<div class="git-repos">${repos.map((source) => gitRepoRow(source, repositories)).join('')}
         <div class="git-repo-add">${repositoryPickerHtml('np-repo-input', { placeholder: canCreate ? 'Find or create a repository' : placeholder, disabled: !canAdd && !canCreate })}</div></div>
@@ -27065,7 +27181,10 @@ function newProject(options) {
       repositories, gitConnections, createIn, githubLogin, canCreate,
       attachedKeys: () => new Set(repos.map((source) => repositorySourceView(source).key)),
       add: (source) => { repos.push(source); renderGit(); renderInstall(); $in('#np-repo-input').focus(); },
-      create: canCreate ? ({ name, connectionId }, opener) => openNewGithubRepositoryDialog(organizationId, createIn, opener, attach, { name, connectionId }) : null,
+      create: canCreate ? async ({ name, connectionId }, opener) => {
+        if (connectionId !== TAVYA_ACCOUNT.id) return openNewGithubRepositoryDialog(organizationId, onGithub, opener, attach, { name, connectionId });
+        try { attach(await createTavyaRepository(organizationId, name)); } catch (error) { toast(error.message, true); }
+      } : null,
       fork: githubApp.configured && gitConnections.length ? (slug, opener) => openForkRepositoryDialog(organizationId, opener, githubApp, slug, attach) : null,
     });
     $in('#np-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(organizationId, loadGithub); } catch (error) { toast(error.message, true); } });
@@ -27086,7 +27205,7 @@ function newProject(options) {
     if (closed) return;
     renderGit(); renderDefault();
   };
-  $in('#new-project-name').addEventListener('input', () => { if (github.githubApp.configured) renderDefault(); });
+  $in('#new-project-name').addEventListener('input', () => { if (github.githubApp.configured || S.meta?.hostsRepositories) renderDefault(); });
   $in('form').addEventListener('input', () => { $in('.new-project-error').hidden = true; });
 
   const controller = new AbortController();
@@ -27115,7 +27234,7 @@ function newProject(options) {
     // Nothing named for the project is dropped on the way: a repository it
     // cannot have stops Create, saying why.
     const unnamed = usingDefault() && defaultRepository().create?.name === '';
-    const pending = unnamed ? 'A GitHub repo name needs Latin letters or digits. Rename the project, or choose other repositories.'
+    const pending = unnamed ? `A ${defaultRepository().hosted ? '' : 'GitHub '}repo name needs Latin letters or digits. Rename the project, or choose other repositories.`
       : !usingDefault() ? await picker?.commit() : null;
     if (pending) { error.textContent = pending; error.hidden = false; return; }
     button.disabled = true; button.textContent = 'Creating…';
@@ -27126,8 +27245,9 @@ function newProject(options) {
       // refuses stops here, before any project exists.
       const chosen = usingDefault() ? defaultRepository() : null;
       if (chosen?.create) {
-        const repository = await api(`/api/organizations/${encodeURIComponent(organizationId)}/repositories/create`, { method: 'POST',
-          body: JSON.stringify({ gitConnectionId: chosen.create.connectionId, name: chosen.create.name, private: true }), signal: controller.signal });
+        const repository = chosen.hosted ? await createTavyaRepository(organizationId, chosen.create.name, controller.signal)
+          : await api(`/api/organizations/${encodeURIComponent(organizationId)}/repositories/create`, { method: 'POST',
+            body: JSON.stringify({ gitConnectionId: chosen.create.connectionId, name: chosen.create.name, private: true }), signal: controller.signal });
         github = { ...github, repositories: [...github.repositories, repository] };
         sources = [repository.sshUrl];
       }

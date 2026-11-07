@@ -130,14 +130,15 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await page.locator('#acct-name').fill('work');
       await page.locator('#acct-key').fill('sk-journey');
       await page.locator('#acct-add').click();
-      await step('the agent key counts', () => expect.poll(completed, { timeout: 15_000 }).toBe('2 of 4 required steps'));
+      await step('the agent key counts', () => expect.poll(completed, { timeout: 15_000 }).toBe('2 of 3 required steps'));
 
       // GitHub is connected on github.com: its installation callback records
-      // the connection and sends the browser back to the console.
+      // the connection and sends the browser back to the console. It is
+      // optional (a project's code can live on tavya), so it does not count.
       await g.store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
         installationId: 'journey-installation', accountLogin: 'nadia', accountType: 'User' });
       await page.goto(`${g.url}/${organization.slug}/settings?github=ready&organizationId=${organization.id}`);
-      await step('GitHub counts', () => expect.poll(completed, { timeout: 15_000 }).toBe('3 of 4 required steps'));
+      await step('GitHub is optional', () => expect.poll(completed, { timeout: 15_000 }).toBe('2 of 3 required steps'));
 
       await page.locator('#onboarding-expand').click();
       await page.locator('#onboarding-new-project').click();
@@ -145,7 +146,7 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await page.locator('.new-project-dialog').getByRole('button', { name: 'Create project' }).click();
       await step('the new project opens', () => page.waitForURL((url) => url.pathname === `/${organization.slug}/first-project`));
       await step('setup completes', () => expect.poll(() => page.evaluate((id) => fetch(`/api/user/onboarding?organizationId=${id}`)
-        .then((response) => response.json()), organization.id)).toMatchObject({ complete: true, completedRequired: 4 }));
+        .then((response) => response.json()), organization.id)).toMatchObject({ complete: true, completedRequired: 3 }));
       await step('the guide steps aside', () => page.locator('#hosted-onboarding .onboarding-card').waitFor({ state: 'detached' }));
       // The step that finished setup navigated; the person is still told so.
       await step('setup completion is confirmed', () => page.locator('#hosted-onboarding .onboarding-complete').getByText('Setup complete').waitFor());

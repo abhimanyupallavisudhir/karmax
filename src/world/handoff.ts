@@ -1,3 +1,4 @@
+import { repositoryBrokerCredentials } from './hosted-git.js';
 import { checkoutBranches, expectedTaskRemoteHeads, recordTaskPublication } from './publication.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -192,7 +193,7 @@ export class WorldHandoffService {
       if (repo.localPath) return {};
       const repository = linked.find((entry) => sameRepository(entry.repository.sshUrl, worldRepoSource(repo)))?.repository;
       if (!repository) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
-      return this.githubApp.brokerCredentials(repository);
+      return repositoryBrokerCredentials(repository, this.githubApp);
     };
 
     const released = (await this.store.worldState(taskId)) === 'released';
@@ -225,7 +226,7 @@ export class WorldHandoffService {
         : linked.find((entry) => sameRepository(entry.repository.sshUrl, worldRepoSource(repo)))?.repository;
       if (!repo.localPath && !record) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
       const source = repo.localPath ?? repo.repo;
-      const credential = record ? await this.githubApp.brokerCredentials(record) : {};
+      const credential = record ? await repositoryBrokerCredentials(record, this.githubApp) : {};
       const materialized = gitEnvironment(root, credential);
       const env = materialized.env;
       const destination = path.join(root, safeName(repo.name));
@@ -354,11 +355,11 @@ export class WorldHandoffService {
     if (!handle) throw new Error('task has no recoverable world');
     if (!this.worlds.get(handle.kind).capabilities?.remote) throw new Error('local projects already use their on-disk world directly');
     const linked = (await this.store.listProjectRepositories(project.id));
-    if (input.git && !linked.length) throw new Error('project has no GitHub repositories');
+    if (input.git && !linked.length) throw new Error('project has no repositories');
     const auth: GitBrokerAuth = async (repo) => {
       const repository = linked.find((entry) => sameRepository(entry.repository.sshUrl, worldRepoSource(repo)))?.repository;
       if (!repository) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
-      return this.githubApp.brokerCredentials(repository);
+      return repositoryBrokerCredentials(repository, this.githubApp);
     };
     const existingLease = typeof handle.meta?.worldLeaseId === 'string' ? (await this.store.worldLease(handle.meta.worldLeaseId)) : undefined;
     let acquiredLeaseId: string | undefined;

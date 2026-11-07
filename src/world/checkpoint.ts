@@ -1,3 +1,4 @@
+import { hostedCloneCredential, isHostedRepository } from './hosted-git.js';
 import { isAnyProvider, machineShape, normalizeComputer } from '../domain/computer.js';
 import { providerLabel } from '../domain/computer-limits.js';
 import { BRAND } from '../domain/brand.js';
@@ -417,9 +418,12 @@ export class WorldCheckpointService {
         ?? enrolled?.repository.defaultBranch ?? project.config.defaultBase ?? 'main';
       return [source, { base, target: repo.target ?? previous?.target ?? enrolled?.targetBranch ?? base }];
     }));
-    const credentialEntries = this.githubApp ? await Promise.all(repositories.flatMap((repository, index) => repository
-      ? [this.githubApp!.repositoryCloneToken(repository).then((token) => [sources[index]!, token] as const)]
-      : [])) : [];
+    // A repository tavya hosts is cloned with a read grant of its own, at the public address its `tavya:` URL means.
+    let hostedGitBase: string | undefined;
+    const credentialEntries = await Promise.all(repositories.flatMap((repository, index) => !repository ? []
+      : isHostedRepository(repository)
+        ? [hostedCloneCredential(repository).then(({ token, base }) => { hostedGitBase = base; return [sources[index]!, token] as const; })]
+        : this.githubApp ? [this.githubApp.repositoryCloneToken(repository).then((token) => [sources[index]!, token] as const)] : []));
     const cloneCredentials = credentialEntries.length ? Object.fromEntries(credentialEntries) : undefined;
     // Restoring PROVISIONS A REAL SANDBOX, so it must pass through the same
     // durable admission as createWorld (activities/core.ts): the runner lease is
@@ -472,7 +476,7 @@ export class WorldCheckpointService {
           sourceAuthority: repo.sourceAuthority ?? previousFor(repo, index)?.sourceAuthority,
           gitIdentity: repo.gitIdentity,
         })), base: project.config.defaultBase ?? 'main', target: project.config.defaultTarget,
-        branch: pinnedHeads ? undefined : primary?.branch, ...(cloneCredentials ? { gitCredentials: { httpsTokens: cloneCredentials } } : {}),
+        branch: pinnedHeads ? undefined : primary?.branch, ...(cloneCredentials ? { gitCredentials: { httpsTokens: cloneCredentials, ...(hostedGitBase ? { hostedGitBase } : {}) } } : {}),
         ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
         network: executionConfig.network, environment: environment.environment, resources: executionConfig.resources });
     } catch (error) {

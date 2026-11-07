@@ -1,3 +1,4 @@
+import { parseHostedUrl } from '../domain/hosted-repository.js';
 import { concurrentMap } from '../util/concurrent-map.js';
 import { missingBaseAdjustment } from './branch-fallback.js';
 import { remoteName, worldCheckoutNames } from '../domain/world-location.js';
@@ -89,15 +90,16 @@ function credentialAskpassFile(home: string, index: number): string {
   return path.posix.join(home, `.ssh/karmax-auth-askpass-${index}`);
 }
 
-function githubHttpsAuthPrefix(home: string, index: number): string {
+function githubHttpsAuthPrefix(home: string, index: number, hostedGitBase?: string): string {
+  const rewrites: Array<[string, string]> = [['url.https://github.com/.insteadOf', 'git@github.com:'],
+    ['url.https://github.com/.insteadOf', 'ssh://git@ssh.github.com:443/'],
+    // A repository tavya hosts: its stable `tavya:` URL is this server's.
+    ...(hostedGitBase ? [[`url.${hostedGitBase}.insteadOf`, 'tavya:'] as [string, string]] : [])];
   return [
     'GIT_TERMINAL_PROMPT=0',
     `GIT_ASKPASS=${quote(credentialAskpassFile(home, index))}`,
-    'GIT_CONFIG_COUNT=2',
-    `GIT_CONFIG_KEY_0=${quote('url.https://github.com/.insteadOf')}`,
-    `GIT_CONFIG_VALUE_0=${quote('git@github.com:')}`,
-    `GIT_CONFIG_KEY_1=${quote('url.https://github.com/.insteadOf')}`,
-    `GIT_CONFIG_VALUE_1=${quote('ssh://git@ssh.github.com:443/')}`,
+    `GIT_CONFIG_COUNT=${rewrites.length}`,
+    ...rewrites.flatMap(([key, value], at) => [`GIT_CONFIG_KEY_${at}=${quote(key)}`, `GIT_CONFIG_VALUE_${at}=${quote(value)}`]),
     '',
   ].join(' ');
 }
@@ -140,7 +142,7 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
     const tokenIndex = token ? uniqueTokens.indexOf(token) : -1;
     const auth = keyIndex >= 0
       ? `GIT_SSH_COMMAND=${quote(`ssh -i ${credentialFile(options.home, keyIndex)} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`)} `
-      : tokenIndex >= 0 ? githubHttpsAuthPrefix(options.home, tokenIndex) : '';
+      : tokenIndex >= 0 ? githubHttpsAuthPrefix(options.home, tokenIndex, spec.gitCredentials?.hostedGitBase) : '';
     await cloneWithRetry(target, `${auth}git clone -q --origin origin ${quote(source)} ${quote(repoRoot)}`, repoRoot);
     const localPath = spec.copySources?.[index];
     const sourceAuthority = recorded?.sourceAuthority ?? spec.repositoryAuthorities?.[source] ?? 'project';
@@ -315,7 +317,7 @@ async function configureRepo(target: ProvisionTarget, root: string, spec: WorldS
 }
 
 function isSshRemote(value: string): boolean {
-  return /^(?:ssh:\/\/|git@)[^\s]+/.test(value);
+  return /^(?:ssh:\/\/|git@)[^\s]+/.test(value) || Boolean(parseHostedUrl(value));
 }
 
 function quote(value: string): string {
