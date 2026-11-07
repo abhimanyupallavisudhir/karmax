@@ -4523,7 +4523,9 @@ function plainTaskError(text) {
   // would take for a model's billing): what happened in one line; what to do is
   // the buttons beside it.
   const spent = /Out of compute: this month's (\$[\d.,]+) of compute is used up( or held)?/i.exec(body);
+  const trial = /Out of compute: your (\$[\d.,]+) free trial (is used up or held|ended|is used up)/i.exec(body);
   const summary = /Out of compute: .*come with a paid plan/i.test(body) ? `${siteName()}’s computers come with a paid plan.`
+    : trial ? `Your ${trial[1]} free trial ${trial[2] === 'ended' ? 'has ended' : trial[2] === 'is used up or held' ? 'is used up or held by work running now' : 'is used up'}.`
     : spent ? `This month’s ${spent[1]} of compute is used up${spent[2] ? ' or held by work running now' : ''}.`
     : storageFull(body) ? 'Your organization’s storage is full. Free some space, or add a 100 GB pack in Plan & billing.'
     : /context window|prompt is too long|maximum context length/i.test(body)
@@ -4560,14 +4562,19 @@ function setupFixes(text, projectId) {
   const raw = String(text || '');
   const settings = globalRoute('organization');
   const plan = `${settings}#settings-plan`, computers = `${settings}#settings-computers`;
-  const own = { label: 'Use your own account', href: computers };
+  // The included model draws on the same credit: there, one's own is a model login or key.
+  const own = /Settings → Agents/.test(raw) ? { label: 'Use your own login', href: `${settings}#settings-agents` }
+    : { label: 'Use your own account', href: computers };
   // Never bought a plan, or spent this month's compute: more on the plan, or one's own account.
-  if (/\bOut of compute\b/.test(raw)) return [{ label: /come with a paid plan/.test(raw) ? 'Choose a plan' : 'Add compute', href: plan }, own];
+  if (/\bOut of compute\b/.test(raw)) return [{ label: /come with a paid plan|free trial/.test(raw) ? 'Choose a plan' : 'Add compute', href: plan }, own];
   if (/No computer (?:is connected|this organization can use fits)/.test(raw)) return [{ label: 'Connect a computer', href: computers }];
   // Every one of tavya's computers busy: one's own account starts it now.
   if (/Every computer this task can use is full|of \S+'s [\w. ]+ computers are in use|\S+'s [\w. ]+ computers are using|uses its share of/.test(raw)
     && !/This organization's \S+ account/.test(raw)) return [own];
   if (storageFull(raw)) return [{ label: 'Add storage', href: plan }];
+  // The plan's own limits: agents at once, people, the Free plan's computer size.
+  if (/Waiting for \S+ plan capacity|allows \d+ organization users?, but this organization has/.test(raw)) return [{ label: 'Change plan', href: plan }];
+  if (/on the Free plan: choose a plan/.test(raw)) return [{ label: 'Choose a plan', href: plan }];
   if (/No usable \S+ credential|has no usable .* credential|^No \S+ credential\b|Every allowed credential needs attention/i.test(raw))
     return [{ label: 'Manage accounts', href: `${settings}#settings-agents` }];
   // Switched on for the project (a lower scope wins), whichever scope switched it off.
@@ -9409,6 +9416,14 @@ function readinessGaps(readiness, projectId) {
     const need = agent.need || { provider: agent.provider };
     needs.set(`${need.provider}:${need.off || ''}`, need);
   }
+  // A model on the compute credit (any OpenRouter model, with no login or key
+  // of the organization's own) that costs much more than the included one.
+  const plan0 = `${settings}#settings-plan`;
+  for (const agent of (readiness.agents || []).filter((a) => a.ready && a.cost >= 1.5)) {
+    const times = agent.cost >= 10 ? Math.round(agent.cost) : Math.round(agent.cost * 10) / 10;
+    gaps.push({ label: `costs ${times}× the included model`, href: plan0, warn: true, lead: 'On your credit:',
+      tip: `${agent.model.replace(/^openrouter\//, '')} runs on your compute credit at about ${times} times what a task on the included model costs. With your own login or API key, its provider bills you instead.` });
+  }
   for (const need of needs.values()) {
     const name = ACCOUNT_PROVIDER_LABELS[need.provider] || need.provider;
     gaps.push(need.off === 'project'
@@ -9432,7 +9447,7 @@ function readinessGaps(readiness, projectId) {
     : [{ label: 'Connect a computer', href: computers, tip: 'There is nowhere for this task to run yet.' }]));
   // Full storage does not stop a task, but nothing new it saves is kept.
   const storage = readiness.storage;
-  if (storage?.full) gaps.push({ label: 'Add storage', href: plan, warn: true,
+  if (storage?.full) gaps.push({ label: 'Add storage', href: plan, warn: true, lead: 'Storage is full:',
     tip: `Storage is full (${formatBytes(storage.usedBytes)} of ${formatBytes(storage.quotaBytes)}). New project data isn’t saved until you free some or add a 100 GB pack.` });
   return gaps;
 }
@@ -9440,10 +9455,13 @@ function readinessNoticeHtml(gaps) {
   if (!gaps.length) return '';
   const link = (gap) => `<a data-spa href="${esc(gap.href)}" title="${esc(gap.tip)}">${esc(gap.label)}</a>`;
   const sep = '<span class="tf-ready-sep" aria-hidden="true">·</span>';
-  const blocking = gaps.filter((gap) => !gap.warn), warnings = gaps.filter((gap) => gap.warn);
+  const blocking = gaps.filter((gap) => !gap.warn);
+  // Warnings, each kind under its own lead ("Storage is full:", "On your credit:").
+  const leads = [...new Set(gaps.filter((gap) => gap.warn).map((gap) => gap.lead))];
   return `<span class="tf-ready-mark" aria-hidden="true">!</span>${[
     blocking.length ? `<span>Can’t start yet:</span> ${blocking.map(link).join(sep)}` : '',
-    warnings.length ? `<span>Storage is full:</span> ${warnings.map(link).join(sep)}` : ''].filter(Boolean).join(sep)}`;
+    ...leads.map((lead) => `<span>${esc(lead)}</span> ${gaps.filter((gap) => gap.warn && gap.lead === lead).map(link).join(sep)}`)]
+    .filter(Boolean).join(sep)}`;
 }
 // Keeps the task form's readiness notice in step with the agents it names.
 function wireTaskReadiness(page, projectId) {
@@ -9453,7 +9471,7 @@ function wireTaskReadiness(page, projectId) {
   const refresh = async () => {
     const agents = [...page.querySelectorAll('.agent-field')].map((box) => {
       const spec = readAgentSpec(box);
-      return spec.provider ? `${spec.provider}${spec.model ? `:${spec.model}` : ''}` : '';
+      return spec.provider ? `${spec.provider}${spec.model ? `:${spec.model}${spec.effort ? `:${spec.effort}` : ''}` : ''}` : '';
     }).filter(Boolean);
     const query = new URLSearchParams(agents.map((agent) => ['agent', agent])).toString();
     if (query === asked) return;
@@ -24425,7 +24443,7 @@ function inboxRowLabel(item) {
     const n = Number(item.subject.computers || 0), computers = `${n} parked computer${n === 1 ? '' : 's'}`;
     if (item.subject.stage === 'hibernated') return `Out of compute — ${computers} hibernated`;
     if (item.subject.hibernateAt) return `Out of compute — ${computers} hibernate ${new Date(item.subject.hibernateAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
-    return `Out of compute — renews ${new Date(item.subject.renewsAt).toLocaleDateString()}`;
+    return item.subject.trial ? 'Free trial over — choose a plan' : `Out of compute — renews ${new Date(item.subject.renewsAt).toLocaleDateString()}`;
   }
   if (item.subject?.kind === 'storage') return item.subject.stage === 'deleted'
     ? 'Stored data deleted to fit the limit'
@@ -25636,7 +25654,7 @@ function installationView() {
       <div id="proc-panel" style="margin-top:12px"></div>
       <div class="settings-section-title" id="installation-limits"><div>Service limits ${policyTip(`Shared accounts and this server against their plans`)}</div></div>
       <div class="card service-limits" id="service-limits-card"><span class="task-sub">Loading…</span></div>
-      <div class="settings-section-title" id="installation-compute"><div>Managed compute ${policyTip(`${siteName()}’s own provider accounts. Organizations without their own account run on them, charged to their plan’s monthly compute at twice the provider’s price.`)}</div></div>
+      <div class="settings-section-title" id="installation-compute"><div>Managed compute ${policyTip(`${siteName()}’s own provider accounts. Organizations without their own account run on them, and on the included model, charged to their plan’s monthly compute at twice the provider’s price.`)}</div></div>
       <div class="card" id="managed-compute-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity ${policyTip(`Admission limits shared by all agent work`)}</div></div>${hostCapacityCard()}
       <div class="settings-section-title" id="installation-github"><div>GitHub</div></div>${installationGithubCard()}
@@ -25654,7 +25672,7 @@ function installationView() {
 // One row per provider: whether organizations are offered it, how many of its
 // machines run now against the account's limit, and this month's provider cost
 // against what organizations were charged.
-function managedComputeMarkup(view) {
+function managedComputeMarkup(view, extra = '') {
   const money = (micros) => `$${(Number(micros || 0) / 1e6).toFixed(2)}`;
   const accountOf = (id) => (view.providers || []).find((candidate) => candidate.provider === id);
   const row = ([id, info]) => {
@@ -25674,9 +25692,52 @@ function managedComputeMarkup(view) {
   const providers = Object.entries(COMPUTER_PROVIDERS);
   const connected = providers.filter(([id]) => accountOf(id));
   const unconnected = providers.filter(([id]) => !accountOf(id));
-  return `${connected.length ? `<div class="computer-providers">${connected.map(row).join('')}</div>` : ''}
+  return `${connected.length ? `<div class="computer-providers">${connected.map(row).join('')}</div>` : ''}${extra}
     ${unconnected.length ? `<details class="inst-fold managed-off"><summary>Not connected <span class="setting-muted">${unconnected.length}</span></summary>
       <div class="computer-providers">${unconnected.map(row).join('')}</div></details>` : ''}`;
+}
+// tavya's included model (wiki features/included-model): one OpenRouter
+// account, a key per organization, charged to the compute credit.
+function includedModelRow(settings) {
+  const money = (micros) => `$${(Number(micros || 0) / 1e6).toFixed(2)}`;
+  const state = !settings ? null : settings.enabled && settings.keyConfigured ? ['On', 'done'] : ['Off', ''];
+  return `<div class="computer-providers included-model"><div class="computer-provider"><b>Included model</b>
+    ${policyTip(`A model ${siteName()} pays for, so new organizations run tasks without a login of their own. Charged to their compute credit at twice OpenRouter’s price.`)}
+    ${state ? `<span class="chip ${state[1]}">${state[0]}</span><span class="setting-muted">${esc(settings.model)}${settings.effort ? ` · ${esc(settings.effort)}` : ''}</span>
+      <span class="setting-muted managed-month" title="${esc(`This month, for ${settings.organizations} organization${settings.organizations === 1 ? '' : 's'}: OpenRouter’s price, then what organizations were charged.`)}">${money(settings.costMicros)} → ${money(settings.chargedMicros)}</span>` : ''}
+    <span class="label-row-fill"></span>
+    ${settings ? '<button class="icon-btn included-model-edit" type="button" title="Edit included model" aria-label="Edit included model">✎</button>'
+      : '<button class="btn sm included-model-edit" type="button">Connect</button>'}</div></div>`;
+}
+function openIncludedModelDialog(settings, onSaved) {
+  const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-card computer-dialog" role="dialog" aria-modal="true" aria-label="Included model">
+    <div class="modal-head"><b>Included model</b>${policyTip('Runs on OpenRouter. Each organization gets its own key, limited to its compute credit.')}<span class="label-row-fill"></span><button class="icon-btn included-close" type="button" aria-label="Close">×</button></div>
+    <div class="settings-grid">
+      <label class="form-row"><span>Management key ${policyTip('Create one on openrouter.ai under Management keys')}</span>
+        <input class="included-key" type="password" autocomplete="off" placeholder="${settings?.keyConfigured ? 'Saved · leave blank to keep' : 'sk-or-v1-…'}"></label>
+      <label class="form-row"><span>Model</span><input class="included-model-id" value="${esc(settings?.model || 'deepseek/deepseek-v4.1-flash-1017')}" placeholder="deepseek/deepseek-v4.1-flash-1017"></label>
+      <label class="form-row"><span>Effort</span><select class="included-effort">${['', 'low', 'medium', 'high', 'xhigh', 'max'].map((effort) =>
+        `<option value="${effort}" ${effort === (settings ? settings.effort || '' : 'max') ? 'selected' : ''}>${effort || 'Model’s default'}</option>`).join('')}</select></label>
+      <label class="switch"><input class="toggle included-enabled" type="checkbox" ${settings?.enabled === false ? '' : 'checked'}>Offer to organizations</label></div>
+    <div class="modal-actions"><span class="label-row-fill"></span><button class="btn included-cancel" type="button">Cancel</button><button class="btn primary included-save" type="button">Save</button></div></div>`;
+  const close = () => { document.removeEventListener('keydown', keydown); overlay.remove(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  overlay.querySelector('.included-close').addEventListener('click', close);
+  overlay.querySelector('.included-cancel').addEventListener('click', close);
+  overlay.querySelector('.included-save').addEventListener('click', async (event) => {
+    const button = event.currentTarget; button.disabled = true;
+    const managementKey = overlay.querySelector('.included-key').value.trim();
+    const body = { ...(managementKey ? { managementKey } : {}), model: overlay.querySelector('.included-model-id').value.trim(),
+      effort: overlay.querySelector('.included-effort').value, enabled: overlay.querySelector('.included-enabled').checked };
+    try { await api('/api/settings/included-model', { method: 'PUT', body: JSON.stringify(body) }); }
+    catch (error) { toast(error.message, true); button.disabled = false; return; }
+    close(); toast('Included model saved'); onSaved?.();
+  });
+  document.addEventListener('keydown', keydown);
+  document.body.appendChild(overlay);
+  overlay.querySelector(settings?.keyConfigured ? '.included-model-id' : '.included-key').focus();
 }
 /** "3 of 50 running · 6 of 24 CPU · 400 of 1,024 GB · 2 waiting": what is in use against the account's budget, and its queue. */
 function managedRunning(account) {
@@ -25691,9 +25752,12 @@ async function wireManagedComputeCard() {
   let view;
   try { view = await api('/api/settings/managed-compute'); }
   catch (error) { if (card.isConnected) paneError(card, error, () => wireManagedComputeCard()); return; }
+  // The included model shares the compute credit: its row sits beside the computers.
+  const included = await api('/api/settings/included-model').then((value) => value.settings, () => undefined);
   if (!card.isConnected) return;
-  card.innerHTML = managedComputeMarkup(view);
-  card.querySelectorAll('.computer-provider').forEach((row) => {
+  card.innerHTML = managedComputeMarkup(view, includedModelRow(included));
+  card.querySelector('.included-model-edit')?.addEventListener('click', () => openIncludedModelDialog(included, wireManagedComputeCard));
+  card.querySelectorAll('.computer-provider[data-provider]').forEach((row) => {
     const provider = row.dataset.provider;
     const account = (view.providers || []).find((candidate) => candidate.provider === provider);
     const open = () => openComputerDialog(provider, account, null, wireManagedComputeCard, { managed: true });
@@ -25852,18 +25916,23 @@ function planBillingMarkup(e, state) {
   if (e.compute) {
     // Top-up credit lasts until used; holds are what computers running now have reserved.
     const topUp = Number(e.compute.topUpMicros || 0), held = Number(e.compute.heldMicros || 0);
-    const credit = Number(e.computeCreditMicros || 0) + topUp;
+    // A new organization's free trial: drawn first, usable until it ends.
+    const trial = e.compute.trial, trialLive = Number(trial?.leftMicros || 0) > 0;
+    const credit = Number(e.computeCreditMicros || 0) + topUp + Number(trial?.monthMicros || 0);
     const pack = state?.computePack || { creditMicros: e.computePackCreditMicros, monthlyPriceCents: 1000 };
     const providers = (e.compute.providers || []).map((id) => COMPUTER_PROVIDERS[id]?.name || id).join(', ');
     const computeUnit = `${planPackName('compute', pack)} pack`;
-    const parts = [`${planDollars(e.includedComputeCreditMicros)} with ${e.planName}`,
+    const parts = [trial ? `${planDollars(trial.creditMicros)} free trial ${trialLive ? 'until' : 'ended'} ${day(trial.endsAt)}` : '',
+      e.includedComputeCreditMicros || !trial ? `${planDollars(e.includedComputeCreditMicros)} with ${e.planName}` : '',
       e.computePacks ? `${e.computePacks} × ${computeUnit}${e.computePacks === 1 ? '' : 's'}` : '',
       e.giftedComputePacks ? `${e.giftedComputePacks} × ${computeUnit}${e.giftedComputePacks === 1 ? '' : 's'} gifted` : '',
       topUp ? `${planDollars(topUp)} topped up, kept until used` : ''].filter(Boolean).join(' + ');
-    const tip = `Cloud computers ${siteName()} runs for you (${providers}), at twice the provider’s price: a 2 CPU · 2 GB E2B computer is about $0.27 an hour. Resets ${day(e.compute.to)}. Computers on your own provider accounts aren’t counted. ${credit ? `${parts}.` : ''}${held ? ` ${planDollars(held)} is held for computers running now.` : ''}`;
+    // The included model draws on it too (its use is the `openrouter` row).
+    const model = (e.compute.byProvider || []).find((row) => row.provider === 'openrouter');
+    const tip = `Cloud computers ${siteName()} runs for you (${providers})${e.compute.includedModel ? ' and its included model' : ''}, at twice the provider’s price: a 2 CPU · 2 GB E2B computer is about $0.27 an hour. Resets ${day(e.compute.to)}. Your own provider accounts and logins aren’t counted. ${credit ? `${parts}.` : ''}${model ? ` ${planDollars(model.usedMicros)} of it on the included model.` : ''}${held ? ` ${planDollars(held)} is held for computers running now.` : ''}`;
     const canCompute = canPacks && state?.computePack?.available;
     computeRow = `<div class="setting-row plan-limit" data-limit="compute"><span class="setting-label">Compute ${policyTip(tip.trim())}</span>
-      <span class="setting-value">${credit ? `${planMeter(Number(e.compute.usedMicros || 0) + held, credit)}<span><b>${esc(planDollars(e.compute.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(credit))} this month</span></span>`
+      <span class="setting-value">${credit ? `${planMeter(Number(e.compute.usedMicros || 0) + held, credit)}<span><b>${esc(planDollars(e.compute.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(credit))} ${trialLive && !e.computeCreditMicros && !topUp ? `· free until ${esc(day(trial.endsAt))}` : 'this month'}</span></span>`
         : '<span class="setting-muted">With a paid plan</span>'}</span>
       ${canCompute ? `<span class="setting-actions">${planStepper('compute', ending ? 0 : Number(state.computePacks || 0), `Each ${computeUnit} adds ${planPackName('compute', pack)} of compute a month for ${planMoney(pack.monthlyPriceCents)}/month`, giftCheckout, computeUnit)}</span>` : ''}</div>`;
     // Auto top-up: once offered (its billing terms approved), or while on.
@@ -27970,6 +28039,7 @@ function renderPricing() {
       `${per(formatBytes(plan.storageBytes), plan.additionalActiveUserStorageBytes ? formatBytes(plan.additionalActiveUserStorageBytes) : '')} storage`,
       ...(compute ? [plan.computeCreditMicros
         ? `${per(credit(plan.computeCreditMicros), plan.additionalActiveUserComputeCreditMicros ? credit(plan.additionalActiveUserComputeCreditMicros) : '')} of compute a month`
+        : plan.id === 'free' && S.launch?.trial ? `${credit(S.launch.trial.creditMicros)} of compute free for ${S.launch.trial.days} days`
         : 'Your own cloud computer account'] : [])];
     const priceLine = plan.id === 'free' ? money(0, plan.currency)
       : `${money(plan.monthlyBasePriceCents, plan.currency)}<small> / month${isTeam ? ` + ${money(plan.monthlyAdditionalActiveUserPriceCents, plan.currency)} per extra person` : ''}</small>`;

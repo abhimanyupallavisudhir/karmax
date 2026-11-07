@@ -1,6 +1,6 @@
 import { ProviderCapacityFull } from '../agent/limits.js';
 import { BRAND } from '../domain/brand.js';
-import { COMPUTE_TERMS, computeChargeMicros } from '../domain/entitlements.js';
+import { COMPUTE_TERMS, COMPUTE_TRIAL, computeChargeMicros } from '../domain/entitlements.js';
 import { providerDefaults, type AccountPool } from '../domain/computer-limits.js';
 import { flyComputeDollarsPerSecond, flyGuest, flyVolumeDollarsPerSecond } from './fly.js';
 import { costMicrosPerSecond } from './runners.js';
@@ -43,11 +43,14 @@ export interface ComputeCredit {
   /** Top-up credit left from earlier months and bought this month: it lasts
    * until used, and is used after the month's own credit. */
   topUpMicros: number;
+  /** The free trial, while it lasts and the month it ended in: what it adds
+   * to this month (`monthMicros`), drawn before the month's own credit. */
+  trial?: TrialCredit;
   /** Charged so far this month, at tavya's prices. */
   usedMicros: number;
   /** Held for work running now and not yet booked (compute holds). */
   heldMicros: number;
-  /** What new work may still use: credit + top-ups − used − held. */
+  /** What new work may still use: credit + top-ups + trial − used − held. */
   availableMicros: number | null;
   /** What the provider charged for it (the operator's cost). */
   costMicros: number;
@@ -59,6 +62,48 @@ export interface ComputeCredit {
 export function computeMonth(now: number): { from: number; to: number } {
   const date = new Date(now);
   return { from: Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1), to: Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1) };
+}
+
+/** A free trial's credit (COMPUTE_TRIAL), at tavya's prices. */
+export interface TrialCredit {
+  creditMicros: number;
+  startsAt: number;
+  endsAt: number;
+  /** Drawn so far: managed use from its start, up to its credit. */
+  usedMicros: number;
+  /** What is still usable: nothing once it has ended. */
+  leftMicros: number;
+  /** What it adds to the month asked about: what that month drew from it, and
+   * what is left. */
+  monthMicros: number;
+}
+
+/** The organization's trial as seen from `month` at `now`. Managed use from
+ * its start draws on it first, until it is used up or ends, so a month's own
+ * credit counts only the rest. */
+export async function trialCredit(store: Store, organizationId: string, month: { from: number; to: number },
+  now = Date.now()): Promise<TrialCredit | undefined> {
+  const trial = await store.computeTrial(organizationId);
+  if (!trial) return undefined;
+  const drawnBy = async (at: number) => {
+    const to = Math.min(at, trial.endsAt);
+    if (to <= trial.startsAt) return 0;
+    const used = computeChargeMicros((await store.managedComputeCosts(trial.startsAt, to, organizationId))
+      .reduce((total, row) => total + row.costMicros, 0));
+    return Math.min(trial.creditMicros, used);
+  };
+  const usedMicros = await drawnBy(trial.endsAt);
+  const leftMicros = now < trial.endsAt ? trial.creditMicros - usedMicros : 0;
+  const monthMicros = (await drawnBy(month.to)) - (await drawnBy(month.from)) + leftMicros;
+  return { creditMicros: trial.creditMicros, startsAt: trial.startsAt, endsAt: trial.endsAt, usedMicros, leftMicros, monthMicros };
+}
+
+/** Start the free trial of a new organization's owner (COMPUTE_TRIAL), once
+ * per person: hosted only. */
+export async function startComputeTrial(store: Store, organizationId: string, userId: string, now = Date.now()): Promise<boolean> {
+  if (!store.hosted) return false;
+  return store.startComputeTrial({ userId, organizationId, creditMicros: COMPUTE_TRIAL.creditMicros,
+    startsAt: now, endsAt: now + COMPUTE_TRIAL.days * 24 * 60 * 60_000 });
 }
 
 const monthKey = (at: number) => new Date(at).toISOString().slice(0, 7);
@@ -75,10 +120,11 @@ export async function computeCredit(store: Store, organizationId: string, now = 
   const costMicros = costs.reduce((total, row) => total + row.costMicros, 0);
   const creditMicros = entitlements.computeCreditMicros;
   const topUpMicros = creditMicros == null ? 0 : (await topUpBalance(store, organizationId, creditMicros, now));
+  const trial = creditMicros == null ? undefined : await trialCredit(store, organizationId, month, now);
   const heldMicros = creditMicros == null ? 0 : computeChargeMicros(await store.computeHeldCostMicros(organizationId, now));
   const usedMicros = computeChargeMicros(costMicros);
-  return { ...month, creditMicros, topUpMicros, usedMicros, heldMicros,
-    availableMicros: creditMicros == null ? null : creditMicros + topUpMicros - usedMicros - heldMicros, costMicros,
+  return { ...month, creditMicros, topUpMicros, ...(trial ? { trial } : {}), usedMicros, heldMicros,
+    availableMicros: creditMicros == null ? null : creditMicros + topUpMicros + (trial?.monthMicros ?? 0) - usedMicros - heldMicros, costMicros,
     seconds: costs.reduce((total, row) => total + row.seconds, 0),
     byProvider: costs.map((row) => ({ provider: row.provider, usedMicros: computeChargeMicros(row.costMicros), seconds: row.seconds }))
       .sort((a, b) => b.usedMicros - a.usedMicros) };
@@ -107,7 +153,10 @@ export async function topUpBalance(store: Store, organizationId: string, allowan
       const balance = paid.filter((topUp) => topUp.settledAt! < next).reduce((total, topUp) => total + topUp.creditMicros, 0) - drawn;
       const used = computeChargeMicros((await store.managedComputeCosts(monthStart(key), next, organizationId))
         .reduce((total, cost) => total + cost.costMicros, 0));
-      draw = Math.max(0, Math.min(balance, used - (row?.allowanceMicros ?? allowanceMicros)));
+      // What that month drew from the free trial is not the top-ups'.
+      const trial = await trialCredit(store, organizationId, { from: monthStart(key), to: next }, next);
+      draw = Math.max(0, Math.min(balance, used - (row?.allowanceMicros ?? allowanceMicros)
+        - (trial ? trial.monthMicros - trial.leftMicros : 0)));
       if (close && now >= next + MONTH_SETTLE_MS)
         (await store.setComputeCreditMonth(organizationId, key, { allowanceMicros: row?.allowanceMicros ?? allowanceMicros, drawnMicros: draw }));
     }
@@ -130,14 +179,26 @@ export async function closeComputeMonths(store: Store, now = Date.now()): Promis
 
 const dollars = (micros: number) => `$${(micros / 1e6).toFixed(2)}`;
 
+const day = (at: number) => new Date(at).toISOString().slice(0, 10);
+
 function exhausted(credit: ComputeCredit, provider: string): ComputeCreditExhausted {
-  const own = `connect your own ${providerName(provider)} account in Settings → Computers`;
-  if (!credit.creditMicros && !credit.topUpMicros) return new ComputeCreditExhausted(
-    `Out of compute: ${BRAND}'s computers come with a paid plan. Choose one in Plan & billing, or ${own}.`);
-  const renews = new Date(credit.to).toISOString().slice(0, 10);
-  const spent = credit.heldMicros > 0 && credit.usedMicros < credit.creditMicros! + credit.topUpMicros
-    ? `this month's ${dollars(credit.creditMicros! + credit.topUpMicros)} of compute is used up or held by work running now`
-    : `this month's ${dollars(credit.creditMicros! + credit.topUpMicros)} of compute is used up`;
+  // The included model (wiki features/included-model) draws on the same credit.
+  const own = provider === 'openrouter' ? 'connect your own agent login or API key in Settings → Agents'
+    : `connect your own ${providerName(provider)} account in Settings → Computers`;
+  if (!credit.creditMicros && !credit.topUpMicros) {
+    const trial = credit.trial;
+    if (!trial) return new ComputeCreditExhausted(
+      `Out of compute: ${BRAND}'s computers come with a paid plan. Choose one in Plan & billing, or ${own}.`);
+    const state = trial.leftMicros > 0 ? `is used up or held by work running now (it ends on ${day(trial.endsAt)})`
+      : trial.usedMicros < trial.creditMicros ? `ended on ${day(trial.endsAt)}` : 'is used up';
+    return new ComputeCreditExhausted(`Out of compute: your ${dollars(trial.creditMicros)} free trial ${state}. `
+      + `Choose a plan in Plan & billing, or ${own}.`);
+  }
+  const renews = day(credit.to);
+  const total = credit.creditMicros! + credit.topUpMicros + (credit.trial?.monthMicros ?? 0);
+  const spent = credit.heldMicros > 0 && credit.usedMicros < total
+    ? `this month's ${dollars(total)} of compute is used up or held by work running now`
+    : `this month's ${dollars(total)} of compute is used up`;
   return new ComputeCreditExhausted(`Out of compute: ${spent}. `
     + `Add a $10 pack or turn on auto top-up in Plan & billing, or ${own}. It renews on ${renews}.`);
 }
@@ -233,7 +294,8 @@ export async function holdManagedCompute(store: Store, request: ComputeHoldReque
   if (entitlements.computeCreditMicros == null) return Infinity;
   const existing = await store.computeHold(request.id);
   const rate = await machineRate(store, request, now);
-  const creditMicros = entitlements.computeCreditMicros + (await topUpBalance(store, request.organizationId, entitlements.computeCreditMicros, now));
+  const creditMicros = entitlements.computeCreditMicros + (await topUpBalance(store, request.organizationId, entitlements.computeCreditMicros, now))
+    + ((await trialCredit(store, request.organizationId, computeMonth(now), now))?.monthMicros ?? 0);
   const held = await store.holdCompute({ ...request, ...rate, until: now + COMPUTE_HOLD.windowMs,
     minUntil: existing && !existing.closedAt ? 0 : now + COMPUTE_HOLD.minStartMs }, creditMicros, now);
   const endsAt = held?.endsAt ?? (existing && !existing.closedAt ? existing.endsAt : undefined);

@@ -314,7 +314,9 @@ describe('hosted onboarding status API', () => {
       eligible: true,
       visible: true,
       complete: false,
-      completedRequired: 0,
+      // The creator's first organization comes with the free trial of tavya's computers.
+      completedRequired: 1,
+      steps: { compute: { complete: true, managed: true, own: false } },
     });
   });
 
@@ -332,7 +334,7 @@ describe('hosted onboarding status API', () => {
     expect(github.lookups).toEqual([organization.slug]);
     const status = await (await onboarding(organization.id)).json() as any;
     expect(status.steps.github.complete).toBe(true);
-    expect(status.completedRequired).toBe(1);
+    expect(status.completedRequired).toBe(2); // GitHub, and the free trial's computers
   });
 
   it('does not mark GitHub done for an organization that has no installation', async () => {
@@ -350,7 +352,7 @@ describe('hosted onboarding status API', () => {
     expect(await store.listGitConnections(organization.id)).toEqual([]);
     const status = await (await onboarding(organization.id)).json() as any;
     expect(status.steps.github.complete).toBe(false);
-    expect(status.completedRequired).toBe(0);
+    expect(status.completedRequired).toBe(1); // the free trial's computers
     // Another organization's connection is not this one's either.
     await store.upsertGitConnection({ organizationId: 'org_personal', provider: 'github',
       installationId: 'personal-only', accountLogin: 'alice', accountType: 'User' });

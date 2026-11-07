@@ -899,6 +899,12 @@ export class Store {
         amountCents INTEGER NOT NULL, subscriptionId TEXT, transactionId TEXT, error TEXT,
         requestedAt INTEGER NOT NULL, settledAt INTEGER
       );
+      -- A person's one free trial (wiki features/managed-compute § Trial): kept
+      -- when the organization is deleted, so deleting one does not earn another.
+      CREATE TABLE IF NOT EXISTS compute_trials (
+        userId TEXT PRIMARY KEY, organizationId TEXT NOT NULL, creditMicros INTEGER NOT NULL,
+        startsAt INTEGER NOT NULL, endsAt INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS compute_credit_months (
         organizationId TEXT NOT NULL, month TEXT NOT NULL, allowanceMicros INTEGER NOT NULL, drawnMicros INTEGER,
         PRIMARY KEY (organizationId, month)
@@ -2364,6 +2370,23 @@ export class Store {
     const row = (await this.db.prepare(`SELECT packs, grantedBy, grantedAt FROM ${table} WHERE organizationId=?`)
       .get(organizationId)) as { packs: number | string; grantedBy: string; grantedAt: number | string } | undefined;
     return row ? { packs: Number(row.packs), grantedBy: row.grantedBy, grantedAt: Number(row.grantedAt) } : null;
+  }
+
+  /** Start `userId`'s free trial in `organizationId`, unless that person has
+   * had one (in any organization, even a deleted one). True when started. */
+  async startComputeTrial(input: { userId: string; organizationId: string; creditMicros: number; startsAt: number; endsAt: number }): Promise<boolean> {
+    const result = (await this.db.prepare(`INSERT INTO compute_trials (userId, organizationId, creditMicros, startsAt, endsAt)
+      VALUES (?, ?, ?, ?, ?) ON CONFLICT(userId) DO NOTHING`)
+      .run(input.userId, input.organizationId, input.creditMicros, input.startsAt, input.endsAt));
+    const started = Number(result.changes ?? 0) > 0;
+    if (started) this.notifyOrganizationEntitlementsChanged(input.organizationId);
+    return started;
+  }
+
+  /** The free trial an organization's owner started in it, if any. */
+  async computeTrial(organizationId: string): Promise<{ userId: string; creditMicros: number; startsAt: number; endsAt: number } | undefined> {
+    const row = (await this.db.prepare('SELECT * FROM compute_trials WHERE organizationId=?').get(organizationId)) as Record<string, unknown> | undefined;
+    return row ? { userId: String(row.userId), creditMicros: Number(row.creditMicros), startsAt: Number(row.startsAt), endsAt: Number(row.endsAt) } : undefined;
   }
 
   /** Gift `packs` storage packs (0 removes the gift). Billing's
@@ -8719,7 +8742,10 @@ export class Store {
 
   async admitAgentUsage(input: { id: string; organizationId: string; projectId: string; taskId: string;
     provider: string; model?: string; fundingSource: 'managed' | 'byok' | 'customer';
-    reservedCostMicros?: number; now?: number; retryOf?: string | string[] }): Promise<{ reused: boolean }> {
+    reservedCostMicros?: number; now?: number; retryOf?: string | string[];
+    /** tavya's included model: the organization's compute credit bounds it
+     * (its key's limit, src/agent/included-model.ts), not an owner's spend cap. */
+    included?: boolean }): Promise<{ reused: boolean }> {
     return this.db.transaction(async () => {
 
     const now = input.now ?? Date.now();
@@ -8743,7 +8769,7 @@ export class Store {
       throw new Error(`model provider ${input.provider} is not allowed by the organization`);
     if (input.model && policy.allowedModels.length && !policy.allowedModels.includes(input.model))
       throw new Error(`model ${input.model} is not allowed by the organization`);
-    if (input.fundingSource === 'managed') {
+    if (input.fundingSource === 'managed' && !input.included) {
       if (!policy.managedSpendCapMicros) throw new Error('managed model usage is disabled until an organization owner sets a spend cap');
       if (!policy.managedModelProviders.includes(input.provider))
         throw new Error(`managed ${input.provider} usage is not enabled for this organization`);
@@ -8765,7 +8791,7 @@ export class Store {
         }
       }
       const assertManagedCapacity = async () => {
-        if (input.fundingSource !== 'managed') return;
+        if (input.fundingSource !== 'managed' || input.included) return;
         const month = monthWindow(now);
         const spent = (await this.usageSummary(input.organizationId, month.from, month.to)).byFundingSource.managed ?? 0;
         const reserved = Number(((await this.db.prepare(`SELECT COALESCE(SUM(reservedCostMicros), 0) n FROM usage_admissions
@@ -8852,12 +8878,14 @@ export class Store {
 
   /** What managed compute cost the provider, per organization and provider,
    * in [from, to): rows of the installation's own accounts (fundingSource
-   * 'managed'), machine time and disk, prorated to the window like
-   * usageSummary. `organizationId` narrows it to one organization. */
+   * 'managed'), machine time and disk, and the model tavya pays for
+   * (`agent.cost`, wiki features/included-model), prorated to the window like
+   * usageSummary: everything charged to the compute credit. `organizationId`
+   * narrows it to one organization. */
   async managedComputeCosts(from: number, to: number, organizationId?: string): Promise<Array<{
     organizationId: string; provider: string; costMicros: number; seconds: number }>> {
     const rows = (await this.db.prepare(`SELECT organizationId, provider, kind, quantity, costMicros, startedAt, endedAt FROM usage_events
-      WHERE fundingSource='managed' AND kind IN ('world.active','world.disk')${organizationId ? ' AND organizationId=?' : ''}
+      WHERE fundingSource='managed' AND kind IN ('world.active','world.disk','agent.cost')${organizationId ? ' AND organizationId=?' : ''}
         AND startedAt<? AND ((endedAt>startedAt AND endedAt>?) OR (endedAt<=startedAt AND startedAt>=?))`)
       .all(...(organizationId ? [organizationId] : []), to, from, from)) as Array<Record<string, unknown>>;
     const totals = new Map<string, { organizationId: string; provider: string; costMicros: number; seconds: number }>();
@@ -8871,6 +8899,30 @@ export class Store {
       totals.set(key, entry);
     }
     return [...totals.values()].map((entry) => ({ ...entry, costMicros: Math.round(entry.costMicros), seconds: Math.round(entry.seconds) }));
+  }
+
+  /** What tavya's included model spent for an organization (wiki
+   * features/included-model): its OpenRouter key reports its whole spend
+   * (`totalMicros`, at the provider's price), and what is new since the last
+   * reading is booked as managed `agent.cost`, to `taskId` when a turn on it
+   * just ended. Under the organization's usage lock, so two readings never
+   * book the same spend twice. Returns the micros booked. */
+  async bookIncludedModelUsage(input: { organizationId: string; provider: string; totalMicros: number; at: number;
+    taskId?: string; projectId?: string }): Promise<number> {
+    return this.db.transaction(async () => {
+      (await this.db.lock(`usage:${input.organizationId}`));
+      const key = `included-model:booked:${input.organizationId}`;
+      const booked = Number((await this.kvGet(key)) ?? 0) || 0;
+      const delta = Math.round(input.totalMicros) - booked;
+      if (delta <= 0) return 0;
+      (await this.recordUsage({ id: `usage:${input.provider}:${input.organizationId}:${Math.round(input.totalMicros)}`,
+        organizationId: input.organizationId, ...(input.projectId ? { projectId: input.projectId } : {}),
+        ...(input.taskId ? { taskId: input.taskId } : {}), provider: input.provider, kind: 'agent.cost', quantity: 0, unit: 'request',
+        costMicros: delta, startedAt: input.at, endedAt: input.at, fundingSource: 'managed', costClassification: 'incurred',
+        metadata: { costBasis: 'included-model-key-usage', totalMicros: Math.round(input.totalMicros) } }));
+      (await this.kvSet(key, String(Math.round(input.totalMicros))));
+      return delta;
+    });
   }
 
   /** Compute holds (wiki features/managed-compute § Holds): what managed

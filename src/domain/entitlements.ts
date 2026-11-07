@@ -54,6 +54,18 @@ export const COMPUTE_TERMS = Object.freeze({
   minGraceHours: 1,
 });
 
+/** A new organization's free trial (wiki features/managed-compute § Trial):
+ * credit for tavya's computers and its included model, usable for its first
+ * `days` and drawn before any other credit. Once per person: the owner who
+ * created the organization. Unused trial credit expires. */
+export const COMPUTE_TRIAL = Object.freeze({ creditMicros: 5_000_000, days: 14 });
+
+/** The biggest computer of tavya's an organization that has paid for nothing
+ * (no plan, pack, gift or top-up: the free trial at most) may have, so the
+ * trial is not spent in minutes on one big machine, nor worth abusing. Its
+ * own provider accounts are not limited. */
+export const FREE_COMPUTER = Object.freeze({ cpu: 2, memoryMb: 4096, diskGb: 40 });
+
 /** Managed compute is charged at the provider's own list price times this:
  * it covers the payment provider's fee, idle capacity and abuse, and is the
  * one number behind every compute price tavya shows. */

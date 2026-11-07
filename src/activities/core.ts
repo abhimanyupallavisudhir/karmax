@@ -42,6 +42,7 @@ import { World, WorldHandle, WorldKind, WorldSpec, type WorldRepo, worldWorkingD
 import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
 import { managedModelCostCeiling, managedModelRailAvailable } from '../agent/managed-models.js';
+import { INCLUDED_MODEL_OPTIONS, includedModel, includedModelKey, includedModelOutOfCredit, isIncludedModel, syncIncludedModelUsage } from '../agent/included-model.js';
 import {
   apiKeyEnv,
   assertRunnableProvider,
@@ -52,7 +53,7 @@ import {
   MODEL_PROVIDERS,
   modelProviderFromModel,
 } from '../agent/provider-registry.js';
-import { AgentAdapter, type TurnResult, type AdapterTurn } from '../agent/types.js';
+import { AgentAdapter, type TurnResult, type AdapterTurn, type TurnInput } from '../agent/types.js';
 import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
 import { TaskSecrets, cardRef, handleRef, paymentCardDetails, recordSecretRefs, secretScope, taskRef } from '../autonomy/task-secrets.js';
 import { gateFollowUps } from './follow-up-gate.js';
@@ -2758,8 +2759,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
       const keys = ordered.map((c) => c.key);
-      if (!keys.length && profile && managedModelRailAvailable(store.hosted,
-        await store.getOrganizationUsagePolicy(organizationId), profile)) return [];
+      // A model tavya pays for needs no credential of the organization's own:
+      // the legacy rail's environment key, or the included model (wiki
+      // features/included-model), whose key the turn makes itself.
+      if (!keys.length && profile && (managedModelRailAvailable(store.hosted,
+        await store.getOrganizationUsagePolicy(organizationId), profile)
+        || isIncludedModel(profile, await includedModel(store, deps.broker)))) return [];
       // An empty compatible set must not fall through to an ambient/profile
       // credential and bypass an explicit disable. A non-existent allow-list
       // entry makes the coordinator deny the turn with a credential action;
@@ -3041,7 +3046,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
       // JIT-resolve credentials via the broker (never journaled). Every current
       // turn receives its selection from the general Credentials policy.
-      let resolvedAuth: { apiKey?: string; configHome?: string; oauthToken?: string } | undefined;
+      let resolvedAuth: TurnInput['resolvedAuth'];
       // The login this turn spends (its credential key), for the quota scheduler.
       let schedulingAccount: string | undefined;
       // The coordinator's pool spans organizations; a leased home or key is used
@@ -3105,12 +3110,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       const usagePolicy = (await store.getOrganizationUsagePolicy(organizationId));
       const managedInstallationRail = managedModelRailAvailable(store.hosted, usagePolicy, profile);
+      // The included model (wiki features/included-model): with nothing of the
+      // organization's own leased, the turn runs on the organization's own
+      // OpenRouter key, its limit set to what the credit has left (refused,
+      // Out of compute, when that is too little to start).
+      const included = !args.accountConfigHome && !args.accountApiKeyHandle && !!deps.broker
+        && isIncludedModel(profile, await includedModel(store, deps.broker));
+      if (included) {
+        try { resolvedAuth = { apiKey: await includedModelKey(store, deps.broker!, organizationId), modelOptions: INCLUDED_MODEL_OPTIONS }; }
+        catch (error) { throw capacityFailure(error) ?? error; }
+      }
       if (
         organizationId !== 'org_personal'
         && profile.provider !== 'mock'
         && !args.accountConfigHome
         && !args.accountApiKeyHandle
         && !managedInstallationRail
+        && !included
       ) {
         throw new Error(`organization ${organizationId} has no usable ${credentialProvider(profile)} credential; connect an organization login or API key`);
       }
@@ -3701,7 +3717,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ? ((args.accountApiKeyHandle || args.accountConfigHome || args.accountCredentialKind === 'login') ? 'byok' : 'managed')
         : 'customer';
       const modelProvider = canonicalModelProvider(args.accountCredentialProvider ?? credentialProvider(profile));
-      const managedReservationMicros = fundingSource === 'managed'
+      // The included model's cost is read back from its key after the turn
+      // (syncIncludedModelUsage); its limit, not a reservation, bounds it.
+      const managedReservationMicros = fundingSource === 'managed' && !included
         ? managedModelCostCeiling(modelProvider, profile.model) : undefined;
       // What ran: tokens per task differ several-fold between efforts of one model.
       const usageMetadata = { role: args.role, model: profile.model, ...(profile.effort ? { effort: profile.effort } : {}) };
@@ -3721,7 +3739,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 ...(usage.models ? { models: usage.models } : {}),
                 ...(schedulingAccount ? { account: schedulingAccount } : {}) } });
           }
-          if (fundingSource === 'managed') {
+          if (fundingSource === 'managed' && !included) {
             const actualized = managedModelActualCost(modelProvider, profile.model, usage, managedReservationMicros!);
             completedUsageEvents.push({ id: `usage:cost:${usageAdmissionId}`, organizationId, projectId: args.task.projectId,
               taskId: args.taskId, worldId: args.worldHandle.id, provider: modelProvider,
@@ -3735,6 +3753,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // its durable replacement exists, and a duplicate retry sees completed.
           (await store.finishUsageAdmission(usageAdmissionId, completed, Date.now(), completedUsageEvents));
           const firstFinish = !usageAdmissionFinished && completed !== undefined;
+          if (firstFinish && included) (await syncIncludedModelUsage(store, deps.broker!, organizationId,
+            { taskId: args.taskId, projectId: args.task.projectId }).catch((error) =>
+            console.warn(`[karmax] could not read ${args.taskId}'s included model usage:`, error instanceof Error ? error.message : error)));
           usageAdmissionFinished = completed !== undefined;
           // The quota scheduler's ledgers: what this tree and this login spent (wiki features/quota-scheduling).
           if (firstFinish && usage) {
@@ -3791,7 +3812,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             taskId: args.taskId, provider: modelProvider, model: profile.model, fundingSource,
             ...(activityAttempt > 1 ? { retryOf: Array.from({ length: activityAttempt - 1 },
               (_, index) => admissionIdFor(turnId, index + 1)) } : {}),
-            reservedCostMicros: managedReservationMicros }));
+            reservedCostMicros: managedReservationMicros, ...(included ? { included: true } : {}) }));
           // A rejected admission does not own the existing reservation and must
           // not release it in finally (it may belong to a different live turn).
           usageAdmissionId = admissionId;
@@ -4199,6 +4220,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           const probe = deps.probeUsage ?? (({ provider, configHome }) => provider === 'codex'
             ? probeCodexUsage({ configHome }) : probeClaudeUsage({ configHome }));
           turnError = await confirmSandboxFailure(err, async () => (login ? probe(login) : undefined), Date.now());
+        }
+        // On the included model, a turn that stopped because the credit ran
+        // out (its key's limit) waits for more like work on tavya's computers.
+        if (included) {
+          const spent = await includedModelOutOfCredit(store, deps.broker!, organizationId,
+            { taskId: args.taskId, projectId: args.task.projectId }).catch(() => undefined);
+          if (spent) throw capacityFailure(spent) ?? spent;
         }
         const failure = classifyTurnError(turnError, profile.provider);
         // Provider limits and policy rejections are authoritative; anything else

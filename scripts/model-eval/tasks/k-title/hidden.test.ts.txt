@@ -1,0 +1,26 @@
+import { it, expect } from 'vitest';
+import { derivedTaskTitle } from '../src/domain/task-title.js';
+
+it('ends a long derived title at a whole word with an ellipsis', () => {
+  const line = 'Task titles in the task list etc. should reflect the first words of the current task contents';
+  expect(derivedTaskTitle({ prompt: line })).toBe('Task titles in the task list etc. should reflect the first words of the current…');
+  expect(derivedTaskTitle({ prompt: `\n  ${line}\nsecond line` })).toBe('Task titles in the task list etc. should reflect the first words of the current…');
+});
+
+it('keeps titles that fit as they are', () => {
+  expect(derivedTaskTitle({ prompt: 'Fix   the login bug\nmore' })).toBe('Fix the login bug');
+  const eighty = 'a'.repeat(30) + ' ' + 'b'.repeat(49);
+  expect(eighty.length).toBe(80);
+  expect(derivedTaskTitle({ prompt: eighty })).toBe(eighty);
+  expect(derivedTaskTitle({ prompt: '   ' })).toBe('Task');
+});
+
+it('stays within 80 characters and never ends mid-word when a word boundary exists', () => {
+  const words = 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau';
+  const title = derivedTaskTitle({ prompt: words });
+  expect(title.length).toBeLessThanOrEqual(80);
+  expect(title.endsWith('…')).toBe(true);
+  const body = title.slice(0, -1).trimEnd();
+  expect(words.startsWith(body)).toBe(true);
+  expect(words[body.length]).toBe(' ');
+});

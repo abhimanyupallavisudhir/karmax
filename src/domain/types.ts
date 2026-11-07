@@ -273,6 +273,8 @@ export interface ComputeNotice {
   /** When its parked managed computers are hibernated, and how many. */
   hibernateAt?: number;
   computers?: number;
+  /** Only free-trial credit, which does not renew. */
+  trial?: boolean;
 }
 
 /** A login only a person can restore: its sign-in lapses soon, or already did. */

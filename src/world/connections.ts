@@ -1,7 +1,8 @@
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
 import { isAnyProvider, type MachineShape } from '../domain/computer.js';
-import { accountFeatures, assertComputerFits, computerLimits, type ComputerFeatures, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
+import { FREE_COMPUTER_HINT, accountFeatures, assertComputerFits, capLimits, computerLimits, type ComputerFeatures, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
+import { FREE_COMPUTER } from '../domain/entitlements.js';
 import type { WorldProviderConnection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { probeDaytonaLimits, probeE2BLimits } from './provider-limits.js';
@@ -103,7 +104,19 @@ export class WorldProviderConnectionService {
     // A disabled own account takes no new computers, so managed compute is offered beside it.
     const mine = new Set(own.filter((value) => value.enabled).map((value) => value.provider));
     const managed = (await this.managedConnections()).filter((value) => !mine.has(value.provider));
-    return [...own, ...managed.map((value) => managedView(value))];
+    const cap = await this.freeCap(organizationId);
+    return [...own, ...managed.map((value) => managedView(value, cap))];
+  }
+
+  /** FREE_COMPUTER, for an organization that has paid for nothing: its plan
+   * gives no compute credit (no paid plan, pack or gift) and it bought no
+   * top-up. The free trial alone keeps tavya's computers small. */
+  async freeCap(organizationId: string): Promise<ComputerLimits | undefined> {
+    if (!this.store.hosted || organizationId === MANAGED_COMPUTE) return undefined;
+    const entitlements = await this.store.organizationEntitlements(organizationId).catch(() => undefined);
+    if (!entitlements || entitlements.computeCreditMicros !== 0) return undefined;
+    if ((await this.store.computeTopUps(organizationId)).some((topUp) => topUp.state === 'paid')) return undefined;
+    return FREE_COMPUTER;
   }
 
   private async listOwn(organizationId: string): Promise<WorldProviderConnectionView[]> {
@@ -152,8 +165,12 @@ export class WorldProviderConnectionService {
   async limits(organizationId: string | undefined, provider: string): Promise<EffectiveComputerLimits> {
     if (isAnyProvider(provider)) return organizationId ? anyLimits(await this.reachable(organizationId)) : { source: {} };
     let value = organizationId ? await this.store.getWorldProviderConnection(organizationId, provider) : undefined;
-    if (!value?.enabled && organizationId && await this.funding(organizationId, provider) === 'managed')
+    if (!value?.enabled && organizationId && await this.funding(organizationId, provider) === 'managed') {
       value = await this.store.getWorldProviderConnection(MANAGED_COMPUTE, provider);
+      const limits = computerLimits(provider, value?.measuredLimits, value?.config.limits);
+      const cap = await this.freeCap(organizationId);
+      return cap ? capLimits(limits, cap) : limits;
+    }
     return computerLimits(provider, value?.measuredLimits, value?.config.limits);
   }
 
@@ -370,11 +387,15 @@ function needsProbe(value: WorldProviderConnection): boolean {
 }
 
 /** Each size, the largest any reachable account allows ("Any"'s ceiling). */
-export function anyLimits(views: Array<{ limits: ComputerLimits }>): EffectiveComputerLimits {
+export function anyLimits(views: Array<{ limits: ComputerLimits & { source?: EffectiveComputerLimits['source'] } }>): EffectiveComputerLimits {
   const out: EffectiveComputerLimits = { source: {} };
   for (const key of ['cpu', 'memoryMb', 'diskGb'] as const) {
     const values = views.map((view) => view.limits[key]).filter((value): value is number => value != null);
-    if (values.length === views.length && values.length) { out[key] = Math.max(...values); out.source[key] = 'provider'; }
+    if (values.length === views.length && values.length) {
+      out[key] = Math.max(...values);
+      // The Free plan's cap when every account at that size is capped by it.
+      out.source[key] = views.every((view) => view.limits[key] !== out[key] || view.limits.source?.[key] === 'plan') ? 'plan' : 'provider';
+    }
   }
   return out;
 }
@@ -397,22 +418,23 @@ function assertSomeFits(spec: ComputerFitSpec, all: Array<{ provider: string; li
   const most = anyLimits(views);
   const gb = (mb: number) => (Number.isInteger(mb / 1024) ? String(mb / 1024) : (mb / 1024).toFixed(1));
   if (spec.diskGb != null && most.diskGb != null && spec.diskGb > most.diskGb)
-    throw new Error(`Disk can be at most ${most.diskGb} GB on the computers this organization can use`);
+    throw new Error(`Disk can be at most ${most.diskGb} GB${most.source?.diskGb === 'plan' ? ` ${FREE_COMPUTER_HINT}` : ' on the computers this organization can use'}`);
   if (spec.memoryMb != null && most.memoryMb != null && spec.memoryMb > most.memoryMb)
-    throw new Error(`Memory can be at most ${gb(most.memoryMb)} GB on the computers this organization can use`);
+    throw new Error(`Memory can be at most ${gb(most.memoryMb)} GB${most.source?.memoryMb === 'plan' ? ` ${FREE_COMPUTER_HINT}` : ' on the computers this organization can use'}`);
   if (spec.cpu != null && most.cpu != null && spec.cpu > most.cpu)
-    throw new Error(`CPU can be at most ${most.cpu} on the computers this organization can use`);
+    throw new Error(`CPU can be at most ${most.cpu}${most.source?.cpu === 'plan' ? ` ${FREE_COMPUTER_HINT}` : ' on the computers this organization can use'}`);
   throw new Error(`No one computer this organization can use is that big: ${failures.join('; ')}`);
 }
 
 /** Managed compute as an organization sees it: the provider, its limits and
  * features; never the installation's key, templates or capacity. */
-function managedView(value: WorldProviderConnectionView): WorldProviderConnectionView {
+function managedView(value: WorldProviderConnectionView, cap?: ComputerLimits): WorldProviderConnectionView {
   return { id: `managed:${value.provider}`, organizationId: MANAGED_COMPUTE, provider: value.provider, name: providerName(value.provider),
     credentialHandle: '', config: value.config.region ? { region: value.config.region } : {}, enabled: true,
     status: value.status === 'error' ? 'error' : 'ready', createdAt: value.createdAt, updatedAt: value.updatedAt,
     // The installation's budget (its CPUs and machines at once) is its own business.
-    credentialConfigured: true, limits: withoutPool(value.limits), features: value.features, managed: true } as WorldProviderConnectionView;
+    credentialConfigured: true, limits: cap ? capLimits(withoutPool(value.limits), cap) : withoutPool(value.limits),
+    features: value.features, managed: true } as WorldProviderConnectionView;
 }
 
 function withoutPool(limits: EffectiveComputerLimits): EffectiveComputerLimits {

@@ -1,0 +1,1 @@
+When a task has no title, we name it after the first line of its prompt, cut to 80 characters — but the cut often lands in the middle of a word ("…the first words of the curr"). Make a derived title that is too long end after its last whole word, followed by "…", and still be at most 80 characters including the "…". Titles that already fit should stay exactly as they are.

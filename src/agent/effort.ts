@@ -13,6 +13,7 @@
  * 5.4-mini) support low/medium/high/xhigh; older reasoning models top out at high.
  */
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 /**
  * The single Claude default model id, shared by `defaultModel('claude')` (which

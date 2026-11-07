@@ -34,6 +34,12 @@ const screens = {
   'plan-free': [{ ...base, plan: 'free', planName: 'Free', currentMonthlyPriceCents: 0, maxMembers: 1, maxActiveAgentRuns: 5, storageQuotaBytes: 5 * GB,
     includedStorageBytes: 5 * GB, storageUsedBytes: 3.4 * GB, computeCreditMicros: 0, includedComputeCreditMicros: 0, compute: compute(0, 0) },
   { managed: true, providerConfigured: true, plan: 'free', billedPlan: 'free', status: 'none', catalog, canManage: true, ...packs }],
+  // A new organization's free trial: $5 for 14 days, $1.30 of it used (computers and the included model).
+  'plan-free-trial': [{ ...base, plan: 'free', planName: 'Free', currentMonthlyPriceCents: 0, maxMembers: 1, maxActiveAgentRuns: 5, storageQuotaBytes: 5 * GB,
+    includedStorageBytes: 5 * GB, storageUsedBytes: 0.2 * GB, computeCreditMicros: 0, includedComputeCreditMicros: 0,
+    compute: { ...compute(1.3e6, 0), includedModel: 'xiaomi/mimo-v2.6-pro', byProvider: [{ provider: 'e2b', usedMicros: 0.9e6 }, { provider: 'openrouter', usedMicros: 0.4e6 }],
+      trial: { creditMicros: 5e6, startsAt: Date.UTC(2026, 9, 6), endsAt: Date.UTC(2026, 9, 20), usedMicros: 1.3e6, leftMicros: 3.7e6, monthMicros: 5e6 } } },
+  { managed: true, providerConfigured: true, plan: 'free', billedPlan: 'free', status: 'none', catalog, canManage: true, ...packs }],
   'plan-individual': [{ ...base, plan: 'individual', planName: 'Individual', currentMonthlyPriceCents: 2300, maxMembers: 1, maxActiveAgentRuns: 10,
     activeAgentRuns: 3, queuedAgentRuns: 1, storageQuotaBytes: 150 * GB, includedStorageBytes: 50 * GB, storagePacks: 1, storageUsedBytes: 56 * GB,
     computeCreditMicros: 15e6, includedComputeCreditMicros: 5e6, computePacks: 1, compute: compute(12.4e6, 15e6) },
@@ -107,14 +113,15 @@ const managedCompute = { providers: [
     const policyLinks = () => '<a href="#">Terms</a> and <a href="#">Billing terms</a>';
     ${constant('COMPUTER_PROVIDERS')}
     const PLAN_ACTIVE = ['active', 'trialing', 'past_due'];
-    ${['formatBytes', 'policyTip', 'policyAcceptanceMarkup', 'planMoney', 'planDollars', 'planMeter', 'planPackName', 'planStepper', 'checkoutTermsTip', 'planBillingMarkup', 'managedRunning', 'managedComputeMarkup'].map(fn).join('\n')}` });
+    ${['formatBytes', 'policyTip', 'policyAcceptanceMarkup', 'planMoney', 'planDollars', 'planMeter', 'planPackName', 'planStepper', 'checkoutTermsTip', 'planBillingMarkup', 'managedRunning', 'managedComputeMarkup', 'includedModelRow'].map(fn).join('\n')}` });
   for (const [name, [e, state]] of Object.entries(screens)) {
     await page.evaluate(([e, state]) => { document.querySelector('#shot').innerHTML = planBillingMarkup(e, state); document.querySelector('.plan-operator')?.setAttribute('open', ''); }, [e, state]);
     await page.locator('.main-inner').screenshot({ path: path.join(out, `${name}.png`) });
   }
   await page.evaluate((view) => {
     document.querySelector('.settings-section-title div').textContent = 'Managed compute';
-    document.querySelector('#shot').innerHTML = managedComputeMarkup(view);
+    document.querySelector('#shot').innerHTML = managedComputeMarkup(view, includedModelRow({ model: 'xiaomi/mimo-v2.6-pro', enabled: true,
+      keyConfigured: true, organizations: 12, costMicros: 3.4e6, chargedMicros: 6.8e6 }));
   }, managedCompute);
   await page.locator('.main-inner').screenshot({ path: path.join(out, 'installation-managed-compute.png') });
   await browser.close();

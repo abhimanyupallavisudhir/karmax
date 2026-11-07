@@ -25,7 +25,7 @@
  * snapshot when that fails.
  */
 import type { Provider } from '../domain/types.js';
-import { claudeMessagesEffort, codexReasoningEffort, type Effort } from './effort.js';
+import { EFFORTS, claudeMessagesEffort, codexReasoningEffort, type Effort } from './effort.js';
 import type { ModelCatalog } from './models.js';
 import bundled from './model-benchmarks.json' with { type: 'json' };
 import bundledTokens from './model-task-tokens.json' with { type: 'json' };
@@ -95,7 +95,6 @@ interface RawModel {
   median_time_to_first_answer_token?: unknown;
 }
 
-const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 const positive = (value: unknown): number | undefined =>
   typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
 

@@ -85,6 +85,11 @@ describe('project readiness: can a task here start?', () => {
     await broker.registerHandle('openrouter:org_personal:work', 'sk-or-test', INSTALLATION_SCOPE);
     const key = 'key:handle:openrouter:org_personal:work';
     expect((await readiness(argon)).agents[0]).toMatchObject({ ready: true });
+    // A trailing effort is the agent's effort; a model id's own suffix is not.
+    expect((await readiness(`${argon}:max`)).agents[0]).toMatchObject({ model: 'openrouter/google/gemini-4-argon', effort: 'max', ready: true });
+    expect((await readiness('opencode:openrouter/google/gemini-4-argon:free')).agents[0])
+      .toMatchObject({ model: 'openrouter/google/gemini-4-argon:free' });
+    expect((await readiness('opencode:openrouter/google/gemini-4-argon:free')).agents[0].effort).toBeUndefined();
     // Google's own id needs Google's key: an OpenRouter key does not run it.
     expect((await readiness('opencode:google/gemini-4-argon')).agents[0]).toMatchObject({ ready: false, need: { provider: 'google' } });
 

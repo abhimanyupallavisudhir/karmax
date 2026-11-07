@@ -65,7 +65,7 @@ import { repositoryBranchDefaults } from '../platform/branch-defaults.js';
 import { projectRepositorySource, sameRepository } from '../world/repository-identity.js';
 import { QRY_AGENT_QUEUE, accountCoordinatorId, agentQueueId } from '../coordinators/names.js';
 import { COMPUTE_PRICE_MULTIPLIER, computeChargeMicros, hostedMonthlyPriceCents } from '../domain/entitlements.js';
-import { computeCredit, computeMonth } from '../world/managed-compute.js';
+import { computeCredit, computeMonth, startComputeTrial } from '../world/managed-compute.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
 import { SIG as WORKFLOW_SIG } from '../workflows/names.js';
 import { findFreePortFrom } from '../util/ports.js';
@@ -121,6 +121,8 @@ import { worldRepos, worldWorkingDirectory, worldWorkingRelativePath, type World
 import { enumerateCredentials, normalizePolicy, resolveCredentials } from '../platform/credentials.js';
 import { errorStatus } from './error-status.js';
 import { projectReadiness, usableAgentCredentials, type ReadinessDeps } from '../platform/readiness.js';
+import { includedModel, includedModelView, removeIncludedModelKey, saveIncludedModel, seedIncludedModelDefaults } from '../agent/included-model.js';
+import type { Effort } from '../agent/effort.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems, itemHandle, relatedVaultItems, searchVaultItems, weakensProtection } from '../autonomy/vault-items.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
@@ -2645,11 +2647,13 @@ export class Gateway {
         const facts = {
           // This organization's own repository access; signing in with GitHub alone gives it none.
           github: (await store.listGitConnections(organizationId)).some((connection) => !connection.suspendedAt),
-          agentLogin: enabledCredentials.length > 0,
+          // tavya's included model needs no login of the organization's own.
+          agentLogin: enabledCredentials.length > 0 || !!(await includedModel(store, this.deps.broker)),
           ownCompute: (await Promise.all(clouds.map(async (connection) => !!connection?.enabled
             && !!await this.deps.broker?.hasHandle(connection.credentialHandle)))).some(Boolean),
           managedCompute: (await this.deps.subscriptions?.hasPaidSubscription(organizationId) ?? false)
-            || ((await store.organizationEntitlements(organizationId)).computeCreditMicros ?? 0) > 0,
+            || await computeCredit(store, organizationId).then((credit) =>
+              (credit.creditMicros ?? 0) + credit.topUpMicros + (credit.trial?.monthMicros ?? 0) > 0),
           vault: (await new VaultItems(store, this.deps.broker, undefined, organizationId).list())
             .some((item) => item.type === 'login' && item.fields.includes('password')),
           card: (await store.listOrganizationCards(organizationId)).length > 0,
@@ -2770,6 +2774,26 @@ export class Gateway {
         }
         const view = method === 'GET' ? (await service.view()) : (await service.run());
         return this.json(res, 200, { ...view, canManage: write || (await this.deps.tokens.check(token, 'settings:write')).ok });
+      }
+      // tavya's included model (wiki features/included-model): GET its
+      // settings and this month's use; PUT {managementKey?, model?, effort?, enabled?}
+      // (the OpenRouter management key write-only).
+      if (p === '/api/settings/included-model') {
+        if (!this.deps.broker) return this.json(res, 503, { error: 'the vault is unavailable' });
+        if (method === 'GET') return this.json(res, 200, { settings: await includedModelView(store, this.deps.broker, computeMonth(Date.now())) });
+        if (method !== 'PUT') return this.json(res, 405, { error: 'method not allowed' });
+        const b = await this.body(req);
+        try {
+          const saved = await saveIncludedModel(store, this.deps.broker, {
+            ...(b.managementKey ? { managementKey: String(b.managementKey) } : {}),
+            ...(b.model !== undefined ? { model: String(b.model) } : {}),
+            ...(b.effort !== undefined ? { effort: String(b.effort ?? '') } : {}),
+            ...(b.enabled !== undefined ? { enabled: b.enabled !== false } : {}) });
+          this.modelCatalog.invalidate();
+          await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'included-model.save', 'installation:included-model',
+            { ...saved, keyChanged: Boolean(b.managementKey), ...identityAuditDetail(callerIdentity) });
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        return this.json(res, 200, { settings: await includedModelView(store, this.deps.broker, computeMonth(Date.now())) });
       }
       // Managed compute (wiki features/managed-compute): the installation's
       // own provider accounts, which organizations without their own use and
@@ -2921,7 +2945,11 @@ export class Gateway {
         (await this.deps.authorization?.bootstrapOrganizationOwner(actorPrincipal(callerIdentity.actor), subject.userId, organization.id));
         (await this.deps.resources?.storageLocationService()?.ensureManaged(organization.id));
         (await this.linkOwnGithubInstallation(subject.userId, organization));
-        if (this.deps.hosted) (await this.enableHostedOnboarding(subject.userId, organization.id));
+        if (this.deps.hosted) {
+          (await this.enableHostedOnboarding(subject.userId, organization.id));
+          (await startComputeTrial(store, organization.id, subject.userId));
+          (await seedIncludedModelDefaults(store, this.deps.broker, organization.id));
+        }
         return this.json(res, 200, organization);
       }
       if (p === '/api/invitations/accept' && method === 'POST') {
@@ -2990,7 +3018,8 @@ export class Gateway {
         const managedLocation = (await store.listStorageLocations(organizationId)).find((location) => location.kind === 'managed');
         const managedProviders = ((await this.deps.providerConnections?.managedConnections()) ?? []).map((value) => value.provider);
         const compute = entitlements.deployment === 'hosted' && managedProviders.length
-          ? { ...(await computeCredit(store, organizationId)), providers: managedProviders } : null;
+          ? { ...(await computeCredit(store, organizationId)), providers: managedProviders,
+            includedModel: (await includedModel(store, this.deps.broker))?.model ?? null } : null;
         return this.json(res, 200, {
           ...entitlements,
           gift: await this.deps.subscriptions?.currentGift(organizationId) ?? null,
@@ -3244,6 +3273,8 @@ export class Gateway {
           if (provider && typeof provider.disconnect === 'function') await provider.disconnect(organizationId);
         }
         await this.deps.githubApp?.disconnectOrganization(organizationId);
+        // Its key for tavya's included model, at OpenRouter (wiki features/included-model).
+        if (this.deps.broker) await removeIncludedModelKey(store, this.deps.broker, organizationId);
         for (const connection of (await this.deps.providerConnections?.list(organizationId)) ?? [])
           if (!connection.managed) (await this.deps.providerConnections?.delete(organizationId, connection.provider));
         const storageLocations = this.deps.resources?.storageLocationService();
@@ -4284,15 +4315,18 @@ export class Gateway {
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       // Whether this project's tasks can start: an agent login for each named
-      // agent (`agent=<harness>[:<model>]`, repeatable) and a computer.
+      // agent (`agent=<harness>[:<model>[:<effort>]]`, repeatable) and a computer.
       const projectReadinessMatch = p.match(/^\/api\/projects\/([^/]+)\/readiness$/);
       if (projectReadinessMatch && method === 'GET') {
         const project = (await store.getProject(projectReadinessMatch[1]!));
         if (!project) return this.json(res, 404, { error: 'no project' });
         const agents = url.searchParams.getAll('agent').slice(0, 8).map((value) => {
           const at = value.indexOf(':');
-          return at < 0 ? { provider: value } : { provider: value.slice(0, at), ...(value.slice(at + 1) ? { model: value.slice(at + 1) } : {}) };
-        }).filter((agent): agent is { provider: Provider; model?: string } => isAgentProvider(agent.provider));
+          if (at < 0) return { provider: value };
+          // A trailing effort name is the effort; model ids' own suffixes (`:free`) are not efforts.
+          const [, model, effort] = value.slice(at + 1).match(/^(.*?)(?::(low|medium|high|xhigh|max))?$/)!;
+          return { provider: value.slice(0, at), ...(model ? { model } : {}), ...(effort ? { effort: effort as Effort } : {}) };
+        }).filter((agent): agent is { provider: Provider; model?: string; effort?: Effort } => isAgentProvider(agent.provider));
         return this.json(res, 200, (await projectReadiness(this.readinessDeps(),
           { organizationId: project.organizationId ?? 'org_personal', projectId: project.id }, agents)));
       }
@@ -9153,12 +9187,20 @@ export class Gateway {
     };
     // OpenCode runs on a model vendor's API key, so it lists that vendor's
     // models whether or not an `opencode` binary exists here (hosted: none).
-    const keyVendors = [...new Set(creds.filter((c) => c.kind === 'key').map((c) => canonicalModelProvider(c.provider)))]
-      .filter((vendor) => (MODEL_PROVIDERS as readonly string[]).includes(vendor));
+    // With the included model on, every OpenRouter model can run on the credit.
+    const included = await includedModel(this.deps.store, this.deps.broker);
+    const keyVendors = [...new Set([...creds.filter((c) => c.kind === 'key').map((c) => canonicalModelProvider(c.provider)),
+      ...(included ? ['openrouter'] : [])])].filter((vendor) => (MODEL_PROVIDERS as readonly string[]).includes(vendor));
     const [claude, codex, opencodeLogins, opencodeKeys] = await Promise.all([
       settled('claude'), settled('codex'), settled('opencode'), openCodeKeyModels(keyVendors).catch(() => []),
     ]);
-    const opencode = mergeModels([opencodeLogins, opencodeKeys]);
+    // tavya's included model, first: it runs on the compute credit, with no
+    // login or key of the organization's own (wiki features/included-model).
+    const includedEntry = included ? [{ id: `openrouter/${included.model}`,
+      displayName: `${(await openCodeKeyModels(['openrouter']).catch(() => []))
+        .find((model) => model.id === `openrouter/${included.model}`)?.displayName ?? included.model} · included`,
+      description: 'Included: charged to your compute credit, no login needed' }] : [];
+    const opencode = mergeModels([includedEntry, opencodeLogins, opencodeKeys]);
     // Discovery is best-effort (offline/old CLI/expired login). Keep the existing
     // safe presets so forms never degrade to an empty, non-actionable picker.
     const value: ModelCatalog = {
@@ -10593,7 +10635,11 @@ export class Gateway {
       (await this.deps.resources?.storageLocationService()?.ensureManaged(organization.id));
       (await inheritPersonalGithubProfile(this.deps.store, this.deps.broker, userId));
       (await this.linkOwnGithubInstallation(userId, organization));
-      if (this.deps.hosted) (await this.enableHostedOnboarding(userId, organization.id));
+      if (this.deps.hosted) {
+        (await this.enableHostedOnboarding(userId, organization.id));
+        (await startComputeTrial(this.deps.store, organization.id, userId));
+        (await seedIncludedModelDefaults(this.deps.store, this.deps.broker, organization.id));
+      }
       return true;
     } catch (e) {
       console.error('[signup] personal workspace provisioning failed:', e instanceof Error ? e.message : e);

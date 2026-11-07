@@ -889,7 +889,7 @@ export function remoteAgentEnv(provider: Provider, home: string, source: Record<
     'CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS',
     'ANTHROPIC_BASE_URL', 'OPENAI_BASE_URL', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
     // OpenCode's turn configuration (system prompt by `{file:}` reference).
-    ...(provider === 'opencode' ? ['OPENCODE_CONFIG_CONTENT', 'OPENCODE_DISABLE_AUTOUPDATE'] : []),
+    ...(provider === 'opencode' ? ['OPENCODE_CONFIG_CONTENT', 'OPENCODE_DISABLE_AUTOUPDATE', 'OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX'] : []),
     ...forward.filter((name) => /^[A-Z_][A-Z0-9_]*$/.test(name)),
   ])) {
     if (key in homeEnv) continue;

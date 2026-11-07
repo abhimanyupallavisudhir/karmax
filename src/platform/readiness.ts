@@ -14,6 +14,7 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ConfigHomeManager } from '../autonomy/config-homes.js';
 import { credentialProvider, credentialServesProfile, mockAgentEnabled } from '../agent/provider-registry.js';
 import { managedModelRailAvailable } from '../agent/managed-models.js';
+import { includedModel, includedModelRelativeCost, isIncludedModel } from '../agent/included-model.js';
 import { enumerateCredentials, resolveCredentials, type Credential } from './credentials.js';
 import { gatherCredentialSources, readPolicyLayers } from './credential-sources.js';
 import { ComputeRouter, type RouterConnections } from '../world/compute-router.js';
@@ -38,8 +39,11 @@ export interface AgentNeed {
 
 export interface Readiness {
   /** One entry per asked-about agent: whether some enabled login or key (or a
-   * model tavya pays for) can run it. */
-  agents: Array<{ provider: string; model?: string; ready: boolean; need?: AgentNeed }>;
+   * model tavya pays for: the included model, wiki features/included-model) can run it. */
+  /** `cost`: an agent that runs on the compute credit (an OpenRouter model,
+   * no login or key of the organization's own serving it) costs about this
+   * many times the included model a task (wiki features/included-model). */
+  agents: Array<{ provider: string; model?: string; ready: boolean; need?: AgentNeed; cost?: number }>;
   /** Any enabled login or key at all. */
   agentLogin: boolean;
   compute: {
@@ -83,11 +87,13 @@ export async function usableAgentCredentials(deps: ReadinessDeps,
 
 export async function projectReadiness(deps: ReadinessDeps,
   scope: { organizationId: string; projectId?: string },
-  agents: Array<Pick<AgentProfile, 'provider' | 'model'>> = []): Promise<Readiness> {
+  agents: Array<Pick<AgentProfile, 'provider' | 'model' | 'effort'>> = []): Promise<Readiness> {
   const { all, layers } = await agentCredentials(deps, scope);
   const credentials = resolveCredentials(all, layers);
   const inOrganization = resolveCredentials(all, { global: layers.global });
   const policy = agents.length ? await deps.store.getOrganizationUsagePolicy(scope.organizationId) : undefined;
+  // tavya's included model runs on the organization's credit, not a login of its own.
+  const included = agents.length ? await includedModel(deps.store, deps.broker) : undefined;
   const serves = (agent: Pick<AgentProfile, 'provider' | 'model'>, pool: Credential[]) =>
     pool.some((credential) => credentialServesProfile(agent, credential, all));
   const need = (agent: Pick<AgentProfile, 'provider' | 'model'>): AgentNeed => {
@@ -97,11 +103,14 @@ export async function projectReadiness(deps: ReadinessDeps,
     return { provider };
   };
   return {
-    agents: agents.map((agent) => {
-      const ready = agent.provider === 'mock' ? mockAgentEnabled()
-        : serves(agent, credentials) || managedModelRailAvailable(deps.hosted, policy!, agent);
-      return { ...agent, ready, ...(ready ? {} : { need: need(agent) }) };
-    }),
+    agents: await Promise.all(agents.map(async (agent) => {
+      if (agent.provider === 'mock') { const ready = mockAgentEnabled(); return { ...agent, ready, ...(ready ? {} : { need: need(agent) }) }; }
+      const own = serves(agent, credentials);
+      const credit = !own && isIncludedModel(agent, included);
+      const ready = own || credit || managedModelRailAvailable(deps.hosted, policy!, agent);
+      const cost = credit ? await includedModelRelativeCost(included!, agent.model!, agent.effort) : undefined;
+      return { ...agent, ready, ...(ready ? {} : { need: need(agent) }), ...(cost !== undefined ? { cost: Math.round(cost * 10) / 10 } : {}) };
+    })),
     agentLogin: credentials.length > 0,
     compute: await computeReadiness(deps, scope.organizationId),
     ...(await storageReadiness(deps, scope.organizationId)),

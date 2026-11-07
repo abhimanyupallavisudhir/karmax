@@ -118,7 +118,8 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await signUp(page, 'Nadia New', 'nadia@example.test');
       const guide = page.locator('#hosted-onboarding .onboarding-card');
       await step('the setup guide opens', () => guide.waitFor());
-      expect(await guide.locator('.onboarding-progress').getAttribute('aria-valuenow')).toBe('0');
+      // A new person's first organization comes with the free trial of tavya's computers.
+      expect(await guide.locator('.onboarding-progress').getAttribute('aria-valuenow')).toBe('1');
       // A step's link tucks the guide into its progress pill while the person works.
       const completed = () => page.locator('#onboarding-expand small').innerText();
       const [user] = (await g.identity.listUsers()).filter((candidate) => candidate.email === 'nadia@example.test');
@@ -129,15 +130,7 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await page.locator('#acct-name').fill('work');
       await page.locator('#acct-key').fill('sk-journey');
       await page.locator('#acct-add').click();
-      await step('the agent key counts', () => expect.poll(completed, { timeout: 15_000 }).toBe('1 of 4 required steps'));
-
-      await page.locator('#onboarding-expand').click();
-      await guide.getByRole('link', { name: 'Connect', exact: true }).click();
-      await page.locator('#org-computers .computer-add > summary').click();
-      await page.locator('#org-computers .computer-add [data-provider="e2b"]').click();
-      await page.locator('.computer-dialog .computer-key').fill('e2b_journey');
-      await page.locator('.computer-dialog .computer-save').click();
-      await step('the E2B key counts', () => expect.poll(completed, { timeout: 15_000 }).toBe('2 of 4 required steps'));
+      await step('the agent key counts', () => expect.poll(completed, { timeout: 15_000 }).toBe('2 of 4 required steps'));
 
       // GitHub is connected on github.com: its installation callback records
       // the connection and sends the browser back to the console.

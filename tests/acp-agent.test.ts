@@ -24,6 +24,7 @@ record({ env: {
   KIMI_MODEL_NAME: process.env.KIMI_MODEL_NAME,
   KIMI_MODEL_BASE_URL: process.env.KIMI_MODEL_BASE_URL,
   OPENCODE_CONFIG_CONTENT: process.env.OPENCODE_CONFIG_CONTENT,
+  OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX: process.env.OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX,
   XDG_DATA_HOME: process.env.XDG_DATA_HOME,
   XAI_API_KEY: process.env.XAI_API_KEY,
   GROK_HOME: process.env.GROK_HOME,
@@ -160,6 +161,7 @@ describe('generic ACP agent adapter', () => {
   async function run(opts: {
     hugeOutput?: boolean;
     subscription?: boolean;
+    modelOptions?: Record<string, unknown>;
     secretEnv?: Record<string, string>;
     session?: string;
     fork?: boolean;
@@ -195,7 +197,8 @@ describe('generic ACP agent adapter', () => {
       messages: [{ id: 'm', role: 'user', text: 'make it beautiful', ts: 0, ...(image ? { images: [image] } : {}) }],
       systemPrompt: opts.systemPrompt ?? 'Work carefully.',
       role: 'do',
-      resolvedAuth: { ...(opts.subscription ? {} : { apiKey: 'secret-kimi-key' }), configHome: path.join(dir, 'home') },
+      resolvedAuth: { ...(opts.subscription ? {} : { apiKey: 'secret-kimi-key' }), configHome: path.join(dir, 'home'),
+        ...(opts.modelOptions ? { modelOptions: opts.modelOptions } : {}) },
       secretEnv: opts.secretEnv,
       extraEnv: { KARMAX_TOKEN: 'scoped-token' },
       agentMcp: [{ name: 'extra', command: process.execPath, args: ['server.js'] }],
@@ -365,6 +368,22 @@ describe('generic ACP agent adapter', () => {
       model: 'google/custom-design-model',
       provider: { google: { options: { apiKey: '{env:GEMINI_API_KEY}' } } },
     });
+  });
+
+  it('gives the model the options its key comes with (OpenRouter routing on tavya’s included key)', async () => {
+    const { records } = await run({ model: 'openrouter/deepseek/deepseek-v4.1-flash-1017', modelProvider: 'openrouter',
+      modelOptions: { provider: { zdr: true } } });
+    // Room for a model thinking at high effort (OpenCode's own cap is 32,000).
+    expect(records[0].env.OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX).toBe('64000');
+    expect(JSON.parse(records[0].env.OPENCODE_CONFIG_CONTENT)).toMatchObject({
+      model: 'openrouter/deepseek/deepseek-v4.1-flash-1017',
+      provider: { openrouter: { options: { apiKey: '{env:OPENROUTER_API_KEY}' },
+        models: { 'deepseek/deepseek-v4.1-flash-1017': { options: { provider: { zdr: true } } } } } },
+    });
+    // A subscription (no key) is not given them.
+    const subscription = await run({ model: 'openrouter/deepseek/deepseek-v4.1-flash-1017', modelProvider: 'openrouter',
+      modelOptions: { provider: { zdr: true } }, subscription: true });
+    expect(JSON.stringify(JSON.parse(subscription.records[0].env.OPENCODE_CONFIG_CONTENT).provider ?? {})).not.toContain('zdr');
   });
 
   it('uses Kimi Code’s documented ephemeral model channel for vault API keys', async () => {
