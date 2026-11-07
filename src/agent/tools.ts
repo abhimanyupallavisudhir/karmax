@@ -1664,8 +1664,8 @@ export function platformToolHandlers(
     },
     async message_agent(args) {
       const taskId = encodeURIComponent(String(args?.task_id ?? ''));
-      const sent = await platformRequest('POST', `/api/tasks/${taskId}/messages`, { role: args?.role ?? 'do', text: args?.message }) as { continuedIn?: { id: string; num?: number } } | undefined;
-      return continuedReply(sent?.continuedIn);
+      const sent = await platformRequest('POST', `/api/tasks/${taskId}/messages`, { role: args?.role ?? 'do', text: args?.message }) as { continuedIn?: { id: string; num?: number }; message?: { queued?: boolean } } | undefined;
+      return continuedReply(sent?.continuedIn, sent?.message?.queued);
     },
     async request_agent_action(args) {
       return JSON.stringify(await platformRequest('POST', '/api/agent/collaboration/request', {

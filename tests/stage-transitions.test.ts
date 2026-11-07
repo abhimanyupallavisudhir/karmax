@@ -81,7 +81,8 @@ async function fixture(refreshCredentialHealth?: (...args: any[]) => Promise<voi
     stage: 'do',
     status: 'active',
     messages: [{ id: 'm0', role: 'user', text: 'work', ts: 0 }],
-    actions: [],
+    // As Do publishes it: a message reaches its agent at once.
+    actions: [{ name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true }],
     state: { turnsSeen: 1 },
     base: 'main',
     targetBranch: 'main',

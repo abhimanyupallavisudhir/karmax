@@ -98,6 +98,7 @@ import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { avatarAllows, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled, avatarPrincipal, avatarRoleOf, forkedAvatar,
   normalizeAvatarSetting, AVATAR_ROLE_LABELS, type AvatarRole } from './avatars.js';
 import { CapabilityError, NotFoundError, TaskStartedError, ValidationError } from './errors.js';
+import { acceptsQueuedMessages, parsePending, pendingForView, pendingMessagesKey, PENDING_MESSAGES_PREFIX, QUEUED_FOLLOW_UP_ACTION, type PendingMessage, type SentMessage } from './pending-messages.js';
 import type { AccountLeaseAnswer, AccountQueueView } from '../coordinators/account.js';
 import type { SchedulingQueueTask, SchedulingQueueView } from '../scheduling/view.js';
 import { assertAgentSpec, childComputer, subTaskParams } from './agent-params.js';
@@ -118,6 +119,8 @@ export { CapabilityError, NotFoundError, ValidationError } from './errors.js';
 /** Signals a person or agent may send to a task; a workflow may offer more as
  *  declared actions (`TaskView.actions`, kind 'signal'). */
 const PUBLIC_TASK_SIGNALS = new Set<string>([SIG.followUp, SIG.confirm, SIG.openPr, SIG.cancel, SIG.retry]);
+/** Workflows whose tasks have an agent to keep messages for (wiki features/queued-messages). */
+const QUEUEING_WORKFLOWS = new Set<string>(['software-dev', 'goal', 'just-do']);
 
 /**
  * The dispatcher hook (SPEC §3.3). A triggered task is stored-not-started and
@@ -518,6 +521,13 @@ export class KarmaxApi {
     deps.bus?.onAny((event) => {
       void this.routeCollaborationEvent(event).catch(() => {
         // Settlement is durable and startup reconciliation retries notification.
+      });
+      // A stage change may let a task take the messages kept for it.
+      if (event.type === 'view.updated') void this.flushPendingMessages(event.taskId);
+    });
+    queueMicrotask(() => {
+      void this.flushAllPendingMessages().catch(() => {
+        // Temporal may still be coming up; the task's next view change retries.
       });
     });
     queueMicrotask(() => {
@@ -3702,7 +3712,7 @@ export class KarmaxApi {
     opts?: { live?: boolean },
   ): Promise<TaskView | undefined> {
     const rec = await this.deps.store.taskMetadataAsync(taskId);
-    (await this.require(token, 'get_task', { projectId: rec?.projectId, taskId }));
+    const viewer = (await this.require(token, 'get_task', { projectId: rec?.projectId, taskId }));
     const snapshot = () => this.deps.store.taskSnapshotAsync(taskId);
     // Cosmetic notes and the queue-time effective agent snapshot live outside the
     // workflow history, so mirror both onto whichever view we return. Keeping the
@@ -3750,6 +3760,7 @@ export class KarmaxApi {
       const forkSummaries = await this.deps.store.forkTaskSummaries(taskId);
       const forkSourceSummaries = await this.deps.store.forkSourceTaskSummaries(taskId);
       const accepted = (await this.acceptedAction(taskId, view));
+      const pending = parsePending(await this.deps.store.kvGet(pendingMessagesKey(taskId)));
       const parentTaskId = view.parentTaskId ?? task?.parentTaskId;
       let parent = parentTaskId ? await this.deps.store.taskMetadataAsync(parentTaskId) : undefined;
       // A parent elsewhere is named only to a caller who may read it.
@@ -3766,9 +3777,8 @@ export class KarmaxApi {
         notes: task?.notes,
         ...(agents ? { agents } : {}),
         ...(task ? { stageTransitions: (await this.availableStageTransitions(task, view, group)) } : {}),
-        ...(view.status === 'failed' && RECOVERABLE_WORKFLOWS.has(view.workflow)
-          ? { actions: FAILED_RECOVERY_ACTIONS(view.pointOfNoReturnPassed) }
-          : { actions: this.lifecycleActions(view, task) }),
+        actions: this.messageActions(view, task),
+        ...(pending.length ? { pendingMessages: pendingForView(pending, viewer.principal) } : {}),
         ...((await this.deps.store.kvGet(`project-transfer-history:${taskId}`))
           ? { actions: [], stageTransitions: [] } : {}),
         ...(accepted ? { acceptedAction: accepted, status: 'active' as const, waitingFor: undefined,
@@ -6548,7 +6558,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     }));
   }
 
-  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt?: { monoMs: number; wallMs: number }): Promise<Message | undefined> {
+  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt?: { monoMs: number; wallMs: number }): Promise<SentMessage | undefined> {
     return this.deliverSignal('signal_task', token, taskId, signal, text, role, images, files, attemptChoice, receivedAt);
   }
 
@@ -6574,7 +6584,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
   async postTaskMessage(token: string, taskId: string, input: {
     text: string; to?: string[]; agents?: Record<string, AgentSpec>;
     images?: ImageRef[]; files?: FileRef[]; urgency?: Urgency;
-  }): Promise<{ message?: Message; notified: string[]; continuedIn?: TaskLink }> {
+  }): Promise<{ message?: SentMessage; notified: string[]; continuedIn?: TaskLink }> {
     const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     const caller = (await this.require(token, 'message_agent', { projectId: task.projectId, taskId }));
@@ -6646,7 +6656,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const userId = speakingUser(caller);
     const authorFields: Partial<Message> = ownAgent && shared ? { role: 'agent', author: speakerKey } : await this.speaker(caller);
     const callsAgents = to === undefined || to.some((selector) => selector.startsWith(AGENT_SELECTOR));
-    let message: Message | undefined;
+    let message: SentMessage | undefined;
     if (shared || callsAgents) {
       // Own-agent messages are its words, not input to itself; everything else is
       // a follow-up the workflow routes by `to`.
@@ -6715,7 +6725,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     }
   }
 
-  async messageAgent(token: string, taskId: string, text: string, role?: string): Promise<{ message?: Message; continuedIn?: TaskLink }> {
+  async messageAgent(token: string, taskId: string, text: string, role?: string): Promise<{ message?: SentMessage; continuedIn?: TaskLink }> {
     const task = (await this.deps.store.getTask(taskId));
     const caller = task ? (await this.require(token, 'message_agent', { projectId: task.projectId, taskId })) : undefined;
     if (task && caller && (!role || role === MAIN_AGENT) && this.continues(caller, task))
@@ -6832,7 +6842,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
 
   private async deliverSignal(tool: 'signal_task' | 'message_agent', token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt?: { monoMs: number; wallMs: number },
     /** Shared-conversation fields of a follow-up: who says it and to whom. */
-    addressed?: Partial<Pick<Message, 'role' | 'author' | 'authorLabel' | 'to'>>): Promise<Message | undefined> {
+    addressed?: Partial<Pick<Message, 'role' | 'author' | 'authorLabel' | 'to'>>): Promise<SentMessage | undefined> {
     receivedAt ??= (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
     const scopedTask = (await this.deps.store.getTask(taskId));
     const caller = (await this.require(token, tool, { projectId: scopedTask?.projectId, taskId }));
@@ -6853,6 +6863,11 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     if (attemptChoice?.saveOtherAttemptsDefault) {
       (await this.require(token, 'project:settings:write', { projectId: scopedTask?.projectId, taskId }));
       if (!attemptChoice.otherAttempts) throw new ValidationError('choose keep or cancel before saving a default');
+    }
+    if (signal === SIG.followUp) {
+      const message: Message = { id: `u${randomUUID()}`, role: 'user', text: text ?? '', ts: Date.now(),
+        ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}), ...addressed };
+      return this.sendOrQueueFollowUp(scopedTask, role, message, caller, receivedAt);
     }
     const heldView = scopedTask?.lastView;
     // The same decision again, before the workflow has acted on the first one
@@ -6976,17 +6991,6 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
         await this.recoverFailedTask(taskId);
         return;
       }
-      if (signal === SIG.followUp) {
-        const now = Date.now();
-        const msg: Message = { id: `u${randomUUID()}`, role: 'user', text: text ?? '', ts: now, ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}), ...addressed };
-        const messages = terminal.messages.map((m) => ({ ...m }));
-        const transcripts = terminal.transcripts?.map((t) => ({ ...t, messages: t.messages.map((m) => ({ ...m })) }));
-        const target = role && role !== 'do' ? transcripts?.find((t) => t.role === role)?.messages : messages;
-        (target ?? messages).push(msg);
-        (await this.deps.store.saveView(taskId, { ...terminal, messages, transcripts, actions: FAILED_RECOVERY_ACTIONS(terminal.pointOfNoReturnPassed) }));
-        (await this.publishConversationMessage(taskId, role, msg));
-        return msg;
-      }
       if (signal === SIG.cancel) {
         if (terminal.pointOfNoReturnPassed) throw new Error('cannot cancel a task after its merge point of no return');
         (await this.saveSettledView(taskId, {
@@ -7028,42 +7032,6 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       return message;
     }
 
-    // A cross-cutting human hold is not a second decision gate. Supplying agent
-    // input releases it immediately. Replacing from the persisted checkpoint
-    // also repairs already-parked v1.5/v1.6 executions whose hold condition only
-    // listened for Retry.
-    // In a shared conversation a message for other agents or people is not the
-    // main agent's input: the workflow's hold calls them and keeps holding.
-    const forMainAgent = !addressed?.to || addressed.to.includes(`${AGENT_SELECTOR}${MAIN_AGENT}`);
-    if (signal === SIG.followUp && scopedTask && heldView && heldOrigin && forMainAgent) {
-      const holdRole = this.humanHoldRole(heldView);
-      if (!holdRole)
-        throw new Error(`the ${stageName(heldOrigin)} hold has no agent conversation to follow up; use Resume ${stageName(heldOrigin)}`);
-      if (role && role !== holdRole)
-        throw new Error(`this hold is waiting on the ${holdRole} agent, not ${role}; send the follow-up to ${holdRole} or resume ${stageName(heldOrigin)}`);
-      const now = Date.now();
-      const followUp: Message = {
-        id: `u${randomUUID()}`,
-        role: 'user',
-        text: text ?? '',
-        ts: now,
-        ...(images?.length ? { images } : {}),
-        ...(files?.length ? { files } : {}),
-        ...addressed,
-      };
-      const nextView = this.withConversationMessage(heldView, holdRole, followUp);
-      await this.stopTaskActivity(scopedTask, heldView, `Human supplied input for the ${stageName(heldOrigin)} hold`);
-      // Review feedback has its normal meaning: return the task to Do. A Merge
-      // hold can also deliberately fall back to Do when the current explicit-PR
-      // workflow has no Merge agent; resume the conversation that actually
-      // received the message, not a mechanical stage that cannot consume it.
-      const resumeStage = heldOrigin === 'review' || (heldOrigin === 'merge' && holdRole === 'do')
-        ? 'do'
-        : heldOrigin;
-      await this.startTransitionReplacement(scopedTask, nextView, resumeStage);
-      (await this.publishConversationMessage(taskId, holdRole, followUp));
-      return followUp;
-    }
 
     // Confirming a Review-origin hold approves that preserved Review exactly
     // once. Current workflows already opened the PR before Review, so they resume
@@ -7133,32 +7101,8 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     }
 
     const handle = (await this.workflowHandle(taskId));
-    let followUp: Message | undefined;
     try {
-      if (signal === SIG.followUp) {
-        const now = Date.now();
-        followUp = {
-          id: `u${randomUUID()}`,
-          role: 'user',
-          text: text ?? '',
-          ts: now,
-          ...(images?.length ? { images } : {}),
-          ...(files?.length ? { files } : {}),
-          ...addressed,
-        };
-        // `role` (the addressed agent) is optional — single-agent workflows ignore it
-        // and route every follow-up to their sole conversation.
-        const trace = (await installationTiming(this.deps.store, { taskId, requestIds: [`${taskId}:${followUp.id}`] }, async row => {
-          (await this.deps.store.appendEvent({ taskId, type: 'timing', ts: row.wallMs, payload: { ...row } }));
-        }));
-        (await trace.mark('request.received', { requestId: `${taskId}:${followUp.id}` }, receivedAt));
-        await trace.measure('workflow.dispatch', () => handle.signal(SIG.followUp, followUp, role));
-        // A signal mutates workflow memory immediately, but workflows deliberately
-        // publish their full cached view only at lifecycle boundaries. Journal the
-        // accepted message separately so every open conversation can render it
-        // mid-turn without changing replay-sensitive workflow command histories.
-        (await this.publishConversationMessage(taskId, role, followUp));
-      } else if (signal === SIG.openPr && caller.humanSubject) {
+      if (signal === SIG.openPr && caller.humanSubject) {
         // The same verified reviewer may defer confirmation whether acting
         // through a browser or a delegated agent. task:signal was checked above;
         // Review revalidates the selected reviewer before accepting this intent.
@@ -7201,6 +7145,234 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       }
       throw e;
     }
+    return undefined;
+  }
+
+  /** The actions a task's page and API callers see: the workflow's, and a
+   * follow-up kept for later while the task is between stages that take
+   * messages (wiki features/queued-messages). */
+  private messageActions(view: TaskView, task?: TaskRecord): TaskView['actions'] {
+    const actions = this.projectedActions(view, task);
+    if (!task || actions.some((action) => action.name === 'followUp') || !this.queuesMessages(task, view)) return actions;
+    const cancel = actions.findIndex((action) => action.name === 'cancel' || action.name === 'finish');
+    const queued = QUEUED_FOLLOW_UP_ACTION();
+    return cancel < 0 ? [...actions, queued] : [...actions.slice(0, cancel), queued, ...actions.slice(cancel)];
+  }
+
+  private projectedActions(view: TaskView, task?: TaskRecord): TaskView['actions'] {
+    return view.status === 'failed' && RECOVERABLE_WORKFLOWS.has(view.workflow)
+      ? FAILED_RECOVERY_ACTIONS(view.pointOfNoReturnPassed)
+      : this.lifecycleActions(view, task);
+  }
+
+  /** A task with an agent that is still going: a message can wait for it. */
+  private queuesMessages(task: TaskRecord, view: TaskView | undefined): boolean {
+    return QUEUEING_WORKFLOWS.has(task.workflow) && !task.params?.command && acceptsQueuedMessages(view);
+  }
+
+  /** The follow-up the task takes now in `role`'s conversation, if any. */
+  private openFollowUp(task: TaskRecord, view: TaskView | undefined, role: string): TaskView['actions'][number] | undefined {
+    if (!view) return undefined;
+    const followUp = this.projectedActions(view, task).find((action) => action.name === 'followUp');
+    return followUp && (!followUp.roles?.length || followUp.roles.includes(role as AgentRole)) ? followUp : undefined;
+  }
+
+  /** Serialize every change to one task's queue (and its delivery) in this process. */
+  private pendingLocks = new Map<string, Promise<unknown>>();
+  private withPendingLock<T>(taskId: string, work: () => Promise<T>): Promise<T> {
+    const prior = this.pendingLocks.get(taskId) ?? Promise.resolve();
+    const next = prior.then(work, work);
+    const settled = next.catch(() => undefined);
+    this.pendingLocks.set(taskId, settled);
+    void settled.then(() => { if (this.pendingLocks.get(taskId) === settled) this.pendingLocks.delete(taskId); });
+    return next;
+  }
+
+  private async readPending(taskId: string): Promise<PendingMessage[]> {
+    return parsePending(await this.deps.store.kvGet(pendingMessagesKey(taskId)));
+  }
+
+  private async writePending(taskId: string, queue: PendingMessage[], continued: Array<{ messageId: string; task: TaskLink }> = []): Promise<void> {
+    if (queue.length) (await this.deps.store.kvSet(pendingMessagesKey(taskId), JSON.stringify(queue)));
+    else (await this.deps.store.kvDelete(pendingMessagesKey(taskId)));
+    // Every open page shows the queue as it is now.
+    const event = { taskId, type: 'conversation.pending', ts: Date.now(), payload: { pending: pendingForView(queue), ...(continued.length ? { continued } : {}) } };
+    const seq = (await this.deps.store.appendEvent(event));
+    this.deps.bus?.emit({ ...event, seq });
+  }
+
+  /**
+   * Deliver a follow-up now if the task takes one, else keep it until it can
+   * (wiki features/queued-messages). Messages already waiting go first, so the
+   * agent reads everything in the order it was said.
+   */
+  private async sendOrQueueFollowUp(task: TaskRecord, role: string | undefined, message: Message, caller: ScopedToken,
+    receivedAt?: { monoMs: number; wallMs: number }): Promise<SentMessage> {
+    const conversation = role ?? MAIN_AGENT;
+    // Only the decision is serialized with the queue: a message the task
+    // takes now is handed over at once, never behind another's delivery.
+    const decided = await this.withPendingLock(task.id, async (): Promise<{ send: TaskRecord } | { queued: SentMessage }> => {
+      const current = (await this.deps.store.getTask(task.id)) ?? task;
+      const queue = await this.readPending(task.id);
+      const view = current.lastView;
+      const offered = !!view && this.projectedActions(view, current).some((action) => action.name === 'followUp');
+      const queues = conversation === MAIN_AGENT && this.queuesMessages(current, view);
+      // The task takes it now (behind any message still kept, which go first).
+      // A follow-up offered only to another agent (a hold on Merge) says so.
+      if (offered && !(queues && queue.length)) return { send: current };
+      if (!queues) {
+        if (QUEUEING_WORKFLOWS.has(current.workflow) && !current.params?.command && !acceptsQueuedMessages(view))
+          throw new ValidationError('this task has finished and takes no more messages');
+        // Another agent's conversation, or a workflow without an agent: as before.
+        return { send: current };
+      }
+      // A person's authority goes with it, for a Continue it may become.
+      const authority = speakingUser(caller)
+        ? { authority: { caps: caller.caps, ...(caller.organizationId ? { organizationId: caller.organizationId } : {}) } } : {};
+      (await this.writePending(task.id, [...queue, { message, role: conversation, by: caller.principal, ...authority }]));
+      return { queued: { ...message, queued: true as const } };
+    });
+    if ('send' in decided) return this.dispatchFollowUp(decided.send, role, message, receivedAt);
+    // It may have become ready while this was written.
+    void this.flushPendingMessages(task.id);
+    return decided.queued;
+  }
+
+  /** Deliver the messages kept for a task while it takes them, oldest first. */
+  async flushPendingMessages(taskId: string): Promise<void> {
+    let continuation: { task: TaskRecord; rest: PendingMessage[] } | undefined;
+    await this.withPendingLock(taskId, async () => {
+      let queue = await this.readPending(taskId);
+      const before = queue.length;
+      const continued: Array<{ messageId: string; task: TaskLink }> = [];
+      while (queue.length) {
+        const task = (await this.deps.store.getTask(taskId));
+        const next = queue[0]!;
+        const followUp = task && this.openFollowUp(task, task.lastView, next.role);
+        if (!task || !followUp) break;
+        try {
+          if (followUp.label === CONTINUE_ACTION().label) {
+            // Confirmed meanwhile: the message carries the work on in a new
+            // task, as it would have had it been sent now (wiki
+            // features/continue-after-confirm). Whatever was said after it goes
+            // there too, in order.
+            const created = await this.continueAsSender(task, next);
+            if (!created) break;
+            continued.push({ messageId: next.message.id, task: taskLink(created) });
+            continuation = { task: created, rest: queue.slice(1) };
+            queue = [];
+            break;
+          }
+          await this.dispatchFollowUp(task, next.role === MAIN_AGENT ? undefined : next.role, next.message);
+        } catch (error) {
+          console.warn(`[karmax] could not deliver a queued message to ${taskId}:`, error);
+          break;
+        }
+        queue = queue.slice(1);
+      }
+      if (queue.length !== before) await this.writePending(taskId, queue, continued);
+    }).catch((error) => console.warn(`[karmax] queued messages of ${taskId}:`, error));
+    if (continuation?.rest.length) {
+      const { task, rest } = continuation;
+      await this.withPendingLock(task.id, async () =>
+        this.writePending(task.id, [...(await this.readPending(task.id)), ...rest]))
+        .catch((error) => console.warn(`[karmax] could not carry queued messages on to ${task.id}:`, error));
+      void this.flushPendingMessages(task.id);
+    }
+  }
+
+  /** Continue a confirmed task from a kept message, as its sender: with what
+   * they could do when they sent it, less anything they have lost since. Only a
+   * person's message continues; anyone else's stays kept. */
+  private async continueAsSender(task: TaskRecord, entry: PendingMessage): Promise<TaskRecord | undefined> {
+    if (!entry.authority || !entry.by.startsWith('user:') || !this.deps.authorization) return undefined;
+    const organizationId = entry.authority.organizationId ?? (await this.deps.store.getProject(task.projectId))?.organizationId;
+    const now = await this.deps.authorization.capabilitiesAsync(entry.by, task.projectId, organizationId);
+    const caps = entry.authority.caps.filter((cap) => allows(now, cap));
+    const { token } = await this.deps.tokens.mintPrincipal(entry.by, caps, task.projectId, 10 * 60_000, organizationId);
+    try {
+      const { message } = entry;
+      return await this.continueTask(token, task.id, { text: message.text,
+        ...(message.images?.length ? { images: message.images } : {}), ...(message.files?.length ? { files: message.files } : {}) });
+    } finally { await this.deps.tokens.revoke(token).catch(() => undefined); }
+  }
+
+  private async flushAllPendingMessages(): Promise<void> {
+    for (const { key } of (await this.deps.store.kvEntries(PENDING_MESSAGES_PREFIX)))
+      await this.flushPendingMessages(key.slice(PENDING_MESSAGES_PREFIX.length));
+  }
+
+  /** Take back a message that has not been delivered yet. Only its sender may. */
+  async unsendMessage(token: string, taskId: string, messageId: string): Promise<{ message: Message; role: string }> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    const caller = (await this.require(token, 'message_agent', { projectId: task.projectId, taskId }));
+    return this.withPendingLock(taskId, async () => {
+      const queue = await this.readPending(taskId);
+      const entry = queue.find((candidate) => candidate.message.id === messageId);
+      if (!entry) throw new NotFoundError('that message was already delivered');
+      if (entry.by !== caller.principal) throw new CapabilityError('only its sender can take back a message');
+      (await this.writePending(taskId, queue.filter((candidate) => candidate !== entry)));
+      return { message: entry.message, role: entry.role };
+    });
+  }
+
+  /** Hand a follow-up to the task: the one path for a message sent at once
+   * and for one kept until the task could take it. */
+  private async dispatchFollowUp(task: TaskRecord, role: string | undefined, followUp: Message,
+    receivedAt?: { monoMs: number; wallMs: number }): Promise<Message> {
+    const taskId = task.id;
+    const view = task.lastView;
+    if (view?.status === 'failed' && RECOVERABLE_WORKFLOWS.has(view.workflow)) {
+      const messages = view.messages.map((m) => ({ ...m }));
+      const transcripts = view.transcripts?.map((t) => ({ ...t, messages: t.messages.map((m) => ({ ...m })) }));
+      const target = role && role !== 'do' ? transcripts?.find((t) => t.role === role)?.messages : messages;
+      (target ?? messages).push(followUp);
+      (await this.deps.store.saveView(taskId, { ...view, messages, transcripts, actions: FAILED_RECOVERY_ACTIONS(view.pointOfNoReturnPassed) }));
+      (await this.publishConversationMessage(taskId, role, followUp));
+      return followUp;
+    }
+    const heldOrigin = view?.status === 'waiting' && view.waitingFor?.kind === 'human' && view.state?.humanPauseOrigin
+      ? view.state.humanPauseOrigin as Stage : undefined;
+    // A cross-cutting human hold is not a second decision gate. Supplying agent
+    // input releases it immediately. Replacing from the persisted checkpoint
+    // also repairs already-parked v1.5/v1.6 executions whose hold condition only
+    // listened for Retry.
+    // In a shared conversation a message for other agents or people is not the
+    // main agent's input: the workflow's hold calls them and keeps holding.
+    const forMainAgent = !followUp.to || followUp.to.includes(`${AGENT_SELECTOR}${MAIN_AGENT}`);
+    if (view && heldOrigin && forMainAgent) {
+      const holdRole = this.humanHoldRole(view);
+      if (!holdRole)
+        throw new Error(`the ${stageName(heldOrigin)} hold has no agent conversation to follow up; use Resume ${stageName(heldOrigin)}`);
+      if (role && role !== holdRole)
+        throw new Error(`this hold is waiting on the ${holdRole} agent, not ${role}; send the follow-up to ${holdRole} or resume ${stageName(heldOrigin)}`);
+      const nextView = this.withConversationMessage(view, holdRole, followUp);
+      await this.stopTaskActivity(task, view, `Human supplied input for the ${stageName(heldOrigin)} hold`);
+      // Review feedback has its normal meaning: return the task to Do. A Merge
+      // hold can also deliberately fall back to Do when the current explicit-PR
+      // workflow has no Merge agent; resume the conversation that actually
+      // received the message, not a mechanical stage that cannot consume it.
+      const resumeStage = heldOrigin === 'review' || (heldOrigin === 'merge' && holdRole === 'do')
+        ? 'do'
+        : heldOrigin;
+      await this.startTransitionReplacement(task, nextView, resumeStage);
+      (await this.publishConversationMessage(taskId, holdRole, followUp));
+      return followUp;
+    }
+    const handle = (await this.workflowHandle(taskId));
+    // `role` (the addressed agent) is optional — single-agent workflows ignore it
+    // and route every follow-up to their sole conversation.
+    const trace = (await installationTiming(this.deps.store, { taskId, requestIds: [`${taskId}:${followUp.id}`] }, async row => {
+      (await this.deps.store.appendEvent({ taskId, type: 'timing', ts: row.wallMs, payload: { ...row } }));
+    }));
+    (await trace.mark('request.received', { requestId: `${taskId}:${followUp.id}` }, receivedAt));
+    await trace.measure('workflow.dispatch', () => handle.signal(SIG.followUp, followUp, role));
+    // A signal mutates workflow memory immediately, but workflows deliberately
+    // publish their full cached view only at lifecycle boundaries. Journal the
+    // accepted message separately so every open conversation can render it
+    // mid-turn without changing replay-sensitive workflow command histories.
+    (await this.publishConversationMessage(taskId, role, followUp));
     return followUp;
   }
 
