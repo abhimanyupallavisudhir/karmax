@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { assemblePrompt } from '../src/agent/prompt.js';
 import type { AgentProfile, TaskInput } from '../src/domain/types.js';
-import { coordinatorSetting, normalizeCoordinatorSetting, coordinatorCheckIn, wakeIntervalText,
+import { coordinatorSetting, normalizeCoordinatorSetting, coordinatorCheckIn, coordinatorRetryMinutes, wakeIntervalText,
   DEFAULT_COORDINATOR_WAKE_HOURS } from '../src/domain/coordinator.js';
 import { storeBackends } from './helpers/store-backends.js';
 
@@ -40,6 +40,15 @@ describe('the co-ordinator setting', () => {
     expect(wakeIntervalText(1)).toBe('1 hour');
     expect(wakeIntervalText(0.5)).toBe('30 minutes');
     expect(coordinatorCheckIn({ wakeHours: 2.5 })).toContain('it has been 2.5 hours since you stopped');
+  });
+});
+
+describe('the co-ordinator retry backoff', () => {
+  it('starts at 15 minutes and doubles with each failure in a row, up to a week', () => {
+    expect([1, 2, 3, 4, 5].map(coordinatorRetryMinutes)).toEqual([15, 30, 60, 120, 240]);
+    expect(coordinatorRetryMinutes(0)).toBe(15);
+    expect(coordinatorRetryMinutes(11)).toBe(7 * 24 * 60);
+    expect(coordinatorRetryMinutes(2_000)).toBe(7 * 24 * 60);
   });
 });
 
@@ -106,14 +115,14 @@ describe.each(storeBackends)('a co-ordinator failing ($name)', ({ open }) => {
     expect((await f.inbox()).filter((item) => item.actionable)).toEqual([]);
   });
 
-  it('lists failed co-ordinators with when they failed, for the revival sweep', async () => {
+  it('lists failed co-ordinators with when they failed and their failures in a row, for the revival sweep', async () => {
     const f = (await fixture({ coordinator: { wakeHours: 2 } }));
     expect((await f.store.failedCoordinators())).toEqual([]);
     const before = Date.now();
-    (await f.publish({ stage: 'failed', status: 'failed' }));
+    (await f.publish({ stage: 'failed', status: 'failed', state: { coordinatorFailures: 3 } }));
     const failed = (await f.store.failedCoordinators());
     expect(failed).toHaveLength(1);
-    expect(failed[0]).toMatchObject({ id: f.task.id, wakeHours: 2 });
+    expect(failed[0]).toMatchObject({ id: f.task.id, failures: 3 });
     expect(failed[0]!.failedAt).toBeGreaterThanOrEqual(before);
   });
 });
@@ -133,12 +142,14 @@ describe('making a permanent co-ordinator', () => {
     const owner = (await tokens.mintPrincipal('user:owner', await authorization.capabilities('user:owner', project.id, 'org_personal'),
       project.id, undefined, 'org_personal')).token;
     const started: any[] = [];
+    const updates: any[] = [];
     const client = { workflow: {
-      getHandle: () => ({ query: async () => [], signal: async () => undefined, executeUpdate: async () => ({}) }),
+      getHandle: () => ({ query: async () => [], signal: async () => undefined,
+        executeUpdate: async (_name: string, opts: { args: unknown[] }) => { updates.push(opts.args[0]); return { applied: Object.keys(opts.args[0] as object) }; } }),
       start: async (_type: string, opts: { args: unknown[] }) => { started.push(opts.args[0]); return { firstExecutionRunId: `run-${started.length}` }; },
     } } as any;
     const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, authorization });
-    return { store, project, api, owner, started };
+    return { store, project, api, owner, started, updates };
   }
 
   it('starts its run knowing it is one, its work always landing branch by branch', async () => {
@@ -146,6 +157,8 @@ describe('making a permanent co-ordinator', () => {
     const task = await f.api.createTask(f.owner, { projectId: f.project.id, prompt: 'Run the firm',
       params: { coordinator: { wakeHours: '1.5' }, multiPr: false } });
     expect(task.params.coordinator).toEqual({ wakeHours: 1.5 });
+    // Its params say what it does, whatever was sent.
+    expect(task.params.multiPr).toBe(true);
     expect(f.started).toHaveLength(1);
     expect(f.started[0].coordinator).toEqual({ wakeHours: 1.5 });
     expect(f.started[0].project.multiPr).toBe(true);
@@ -168,23 +181,77 @@ describe('making a permanent co-ordinator', () => {
     expect(plain.params.coordinator).toBeUndefined();
   });
 
-  it('restarts a co-ordinator whose run failed once its interval has passed, and only then', async () => {
+  async function failedCoordinator(f: Awaited<ReturnType<typeof fixture>>, failures: number) {
     const fs = await import('node:fs');
     const os = await import('node:os');
-    const f = await fixture();
     const task = await f.api.createTask(f.owner, { projectId: f.project.id, prompt: 'Run the firm', draft: true,
       params: { coordinator: { wakeHours: 2 } } });
     const worldPath = fs.mkdtempSync(path.join(os.tmpdir(), 'coordinator-world-'));
     await f.store.saveView(task.id, { taskId: task.id, title: task.title, workflow: 'software-dev', stage: 'failed', status: 'failed',
-      error: 'workflow failed: boom', worldPath, branch: `tavya/${task.id}`, base: 'main', messages: [], actions: [], state: { failedFrom: 'do' },
-      updatedAt: 7 } as any);
-    const failedAt = Date.now();
-    expect(await f.api.reviveFailedCoordinators(failedAt + 60 * 60_000)).toEqual([]);
+      error: 'workflow failed: boom', worldPath, branch: `tavya/${task.id}`, base: 'main', messages: [], actions: [],
+      state: { failedFrom: 'do', coordinatorFailures: failures }, updatedAt: 7 } as any);
+    return { task, worldPath, failedAt: Date.now() };
+  }
+
+  it('restarts a co-ordinator whose run failed after its backoff, and only then', async () => {
+    const f = await fixture();
+    const { task, worldPath, failedAt } = await failedCoordinator(f, 1);
+    expect(await f.api.reviveFailedCoordinators(failedAt + 14 * 60_000)).toEqual([]);
     expect(f.started).toHaveLength(0);
-    expect(await f.api.reviveFailedCoordinators(failedAt + 2 * 60 * 60_000 + 1_000)).toEqual([task.id]);
+    expect(await f.api.reviveFailedCoordinators(failedAt + 15 * 60_000 + 1_000)).toEqual([task.id]);
     expect(f.started).toHaveLength(1);
-    expect(f.started[0].coordinator).toEqual({ wakeHours: 2 });
+    expect(f.started[0].coordinator).toEqual({ wakeHours: 2, failures: 1 });
     expect(f.started[0].recovery.world.root).toBe(worldPath);
     expect((await f.store.eventsOfType(task.id, 'coordinator.revived'))).toHaveLength(1);
+  });
+
+  it('waits longer the more times in a row it has failed', async () => {
+    const f = await fixture();
+    const { task, failedAt } = await failedCoordinator(f, 3);
+    expect(await f.api.reviveFailedCoordinators(failedAt + 59 * 60_000)).toEqual([]);
+    expect(await f.api.reviveFailedCoordinators(failedAt + 60 * 60_000 + 1_000)).toEqual([task.id]);
+    expect(f.started[0].coordinator.failures).toBe(3);
+  });
+
+  it('backs off when it cannot even be restarted', async () => {
+    const fs = await import('node:fs');
+    const f = await fixture();
+    const { task, worldPath, failedAt } = await failedCoordinator(f, 1);
+    fs.rmSync(worldPath, { recursive: true });
+    expect(await f.api.reviveFailedCoordinators(failedAt + 16 * 60_000)).toEqual([]);
+    expect((await f.store.eventsOfType(task.id, 'coordinator.revival-failed'))).toHaveLength(1);
+    // Its failure count stands at 1 and one attempt failed: 30 minutes from that attempt.
+    await f.api.reviveFailedCoordinators(failedAt + 40 * 60_000);
+    expect((await f.store.eventsOfType(task.id, 'coordinator.revival-failed'))).toHaveLength(1);
+    await f.api.reviveFailedCoordinators(failedAt + 47 * 60_000);
+    expect((await f.store.eventsOfType(task.id, 'coordinator.revival-failed'))).toHaveLength(2);
+  });
+
+  it('changes a running co-ordinator\'s interval through its workflow and its params', async () => {
+    const f = await fixture();
+    const task = await f.api.createTask(f.owner, { projectId: f.project.id, prompt: 'Run the firm', params: { coordinator: { wakeHours: 24 } } });
+    const result = await f.api.updateParams(f.owner, task.id, { coordinator: { wakeHours: '0.5' } });
+    expect(result.applied).toContain('coordinator');
+    expect(f.updates).toEqual([{ coordinator: { wakeHours: 0.5 } }]);
+    expect((await f.store.getTask(task.id))!.params.coordinator).toEqual({ wakeHours: 0.5 });
+  });
+
+  it('refuses a bad interval, stopping being one, and an ordinary task', async () => {
+    const f = await fixture();
+    const task = await f.api.createTask(f.owner, { projectId: f.project.id, prompt: 'Run the firm', params: { coordinator: { wakeHours: 24 } } });
+    await expect(f.api.updateParams(f.owner, task.id, { coordinator: { wakeHours: 0 } })).rejects.toThrow(/wakeHours/);
+    await expect(f.api.updateParams(f.owner, task.id, { coordinator: false })).rejects.toThrow(/stays one/);
+    const plain = await f.api.createTask(f.owner, { projectId: f.project.id, prompt: 'Fix a bug' });
+    await expect(f.api.updateParams(f.owner, plain.id, { coordinator: { wakeHours: 2 } })).rejects.toThrow(/queued as a permanent co-ordinator/);
+    expect(f.updates).toEqual([]);
+    expect((await f.store.getTask(task.id))!.params.coordinator).toEqual({ wakeHours: 24 });
+  });
+
+  it('changes a failed co-ordinator\'s interval without its finished workflow', async () => {
+    const f = await fixture();
+    const { task } = await failedCoordinator(f, 1);
+    await f.api.updateParams(f.owner, task.id, { coordinator: { wakeHours: 6 } });
+    expect(f.updates).toEqual([]);
+    expect((await f.store.getTask(task.id))!.params.coordinator).toEqual({ wakeHours: 6 });
   });
 });

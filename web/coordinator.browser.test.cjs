@@ -17,12 +17,13 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
       params: { prompt: 'Grow the product', coordinator: { wakeHours: 24 } },
       lastView: { taskId: 'ceo', title: 'Run the firm', workflow: 'software-dev', stage: 'do', status: 'waiting',
         waitingFor: { kind: 'timer', summary: 'Checks in', detail: 'Checks in again within 24 hours', until: Date.now() + 3_600_000 },
-        messages: [], actions: [], state: {} } };
+        editableParams: ['coordinator'], messages: [], actions: [], state: {} } };
     const schema = [{ name: 'software-dev', params: [
       { name: 'prompt', type: 'text', label: 'Prompt', scopes: ['task'], bind: 'prompt' },
       { name: 'multiPr', type: 'boolean', label: 'Allow several branches per task', scopes: ['task'], bind: 'project', default: true },
     ], stages: [{ key: 'do', label: 'Working' }] }];
     const creates = [];
+    const edits = [];
     await fakeConsole(context, { project, tasks: [running], schema, async api(p, request) {
       const method = request.method();
       if (p === '/api/projects/p/avatars') return { availability: { organization: true, project: 'inherit', effective: true }, avatars: [] };
@@ -32,6 +33,8 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
         return { id: 'task_new', projectId: 'p', title: 'New', workflow: 'software-dev', params: body.params || {} };
       }
       if (p.startsWith('/api/tasks/task_new')) return { id: 'task_new', projectId: 'p', params: {} };
+      if (p === '/api/tasks/ceo' && method === 'GET') return running.lastView;
+      if (p === '/api/tasks/ceo/params' && method === 'PATCH') { edits.push(request.postDataJSON()); return { applied: ['coordinator'] }; }
     } });
     context.setDefaultTimeout(8000);
     const page = await context.newPage();
@@ -58,6 +61,19 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     await box.check();
     assert.equal(await hours.isVisible(), true);
     assert.equal(await hours.inputValue(), '24', 'pre-filled with 24 hours');
+    // A co-ordinator always uses several branches: the toggle says so.
+    const several = page.locator('[data-field="multiPr"]');
+    assert.equal(await several.isChecked(), true);
+    assert.equal(await several.isDisabled(), true, 'forced on while it is a co-ordinator');
+    assert.equal(await page.locator('[data-row="multiPr"] .field-reset:visible').count(), 0, 'and nothing offers to reset it');
+    await box.uncheck();
+    assert.equal(await several.isDisabled(), false, 'unticked, the choice is back');
+    await several.uncheck();
+    await box.check();
+    assert.equal(await several.isChecked(), true, 'ticked, it is on again');
+    await box.uncheck();
+    assert.equal(await several.isChecked(), false, 'and unticking restores what was chosen');
+    await box.check();
     await hours.fill('1.5');
     assert.equal(await page.locator('.tf-coordinator .info-dot').count(), 1, 'what it does is a tooltip');
     if (shots) {
@@ -70,8 +86,19 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     const run = creates.find((body) => body.params?.coordinator);
     assert.ok(run, 'the task is created with the setting');
     assert.deepEqual(run.params.coordinator, { wakeHours: 1.5 });
+
+    // ── Parameters: its interval can be changed once it has started ──
+    await page.goto('http://console.test/org/workspace/tasks/ceo/parameters');
+    const interval = page.locator('#tp-params [data-field="coordinator"]');
+    await interval.waitFor();
+    assert.equal(await interval.inputValue(), '24');
+    await interval.fill('0.5');
+    await page.locator('#params-save').click();
+    for (let i = 0; i < 40 && !edits.length; i++) await page.waitForTimeout(100);
+    assert.deepEqual(edits[0], { params: { coordinator: { wakeHours: 0.5 } } });
+    if (shots) await page.locator('#tp-params').screenshot({ path: `${shots}/coordinator-params.png` });
     assert.deepEqual(errors, []);
-    console.log('ok — coordinator form row, interval and list chip');
+    console.log('ok — coordinator form row, forced branches, interval, list chip and Parameters edit');
   } finally {
     await browser.close();
   }

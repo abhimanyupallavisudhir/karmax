@@ -4792,17 +4792,19 @@ export class Store {
       .map(rowToTask);
   }
 
-  /** Permanent co-ordinators whose run failed outright, with when it failed
-   * (wiki features/coordinator): each is restarted once its interval passed. */
-  async failedCoordinators(): Promise<Array<{ id: string; wakeHours: number; failedAt: number }>> {
-    const rows = (await this.db.prepare(`SELECT id, params, statusChangedAt FROM tasks
+  /** Permanent co-ordinators whose run failed outright, with when it failed and
+   * how many times in a row it has (wiki features/coordinator): each is
+   * restarted once its backoff has passed. */
+  async failedCoordinators(): Promise<Array<{ id: string; failedAt: number; failures: number }>> {
+    const rows = (await this.db.prepare(`SELECT id, params, statusChangedAt, json_extract(lastView, '$.state.coordinatorFailures') AS failures FROM tasks
       WHERE json_extract(params, '$.coordinator') IS NOT NULL AND json_extract(lastView, '$.status') = 'failed'
-      ORDER BY createdAt`).all()) as Array<{ id: string; params: unknown; statusChangedAt?: number | string | null }>;
+      ORDER BY createdAt`).all()) as Array<{ id: string; params: unknown; statusChangedAt?: number | string | null; failures?: number | string | null }>;
     return rows.flatMap((row) => {
       const setting = coordinatorSetting(typeof row.params === 'string' ? JSON.parse(row.params) : row.params as Record<string, unknown>);
       // Before the column was kept, a failure counts as long ago.
       const failedAt = Number(row.statusChangedAt ?? 0);
-      return setting ? [{ id: row.id, wakeHours: setting.wakeHours, failedAt: Number.isFinite(failedAt) ? failedAt : 0 }] : [];
+      const failures = Number(row.failures ?? 0);
+      return setting ? [{ id: row.id, failedAt: Number.isFinite(failedAt) ? failedAt : 0, failures: Number.isFinite(failures) ? failures : 0 }] : [];
     });
   }
 
@@ -5879,7 +5881,7 @@ export class Store {
     const escalated = ev.type === 'view.updated' && ev.payload.stage === 'escalated' && !finished;
     // A permanent co-ordinator that fails — its run, or a stage it could not
     // get past — is a critical ask: the project stops being run (wiki
-    // features/coordinator). It retries on its own within its interval.
+    // features/coordinator). It retries on its own, backing off.
     const coordinatorFailed = ev.type === 'view.updated' && !!coordinatorSetting(task.params)
       && (status === 'failed' || status === 'blocked' || escalated);
 
