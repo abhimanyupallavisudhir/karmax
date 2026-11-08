@@ -80,7 +80,8 @@ it('Parameters name the person or the agent (linked to its task) that created a 
       const line = page.locator('#tf-page .tp-creator');
       await line.waitFor();
       expect((await line.innerText()).replace(/\s+/g, ' ')).toMatch(new RegExp(`^Created by Agent of #${plannerNum} Plan the launch `));
-      if (shots) await page.waitForFunction(() => document.getAnimations().every((a) => a.playState !== 'running'));
+      if (shots) await page.waitForFunction(() => (globalThis as unknown as { document: { getAnimations(): Array<{ playState: string }> } })
+        .document.getAnimations().every((animation) => animation.playState !== 'running'));
       await shoot(page, 'agent-draft');
     });
     expect(errors).toEqual([]);
