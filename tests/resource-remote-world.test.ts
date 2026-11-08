@@ -399,6 +399,49 @@ it('restores many single-file resources with one job, one restic each, through t
   expect(fs.statSync(path.join(world.handle.root, 'data/files/0.json')).mode & 0o200).not.toBe(0);
 }, REAL_RESTIC_MS);
 
+// CI #2705 (2026-11-08): a resource's restored event was stamped 181 ms before its
+// restoring event. restoreMany put the world's clock on this host's by an offset
+// it re-measured on every poll, and each poll's offset carries that poll's round
+// trip, so an item started in one poll and finished in the next got two offsets.
+// Here every finish arrives a poll after its start, and each poll's round trip
+// looks 2 s shorter than the one before.
+it('keeps each restore\'s end after its start when the polls\' round trips differ', async () => {
+  const f = await fixture();
+  const files = await singleFiles(f, 4);
+  const { task, world } = await f.sandbox('Uneven polls');
+  const exec = world.exec.bind(world);
+  let polls = 0;
+  world.exec = async (...args) => {
+    const result = await exec(...args);
+    if ((args[1] as string[] | undefined)?.[2] !== 'karmax-job-follow' || result.code !== 0) return result;
+    const newline = result.stdout.indexOf('\n');
+    if (newline < 0) return result;
+    let head = result.stdout.slice(0, newline);
+    let output = result.stdout.slice(newline + 1);
+    // Hold back every finish reported in the same poll as a start (whole lines,
+    // so the next poll reads them from the same offset).
+    const firstDone = output.search(/^done /m);
+    if (firstDone > 0 && /^start /m.test(output.slice(0, firstDone))) {
+      output = output.slice(0, firstDone);
+      head = head.replace(/^exited \d+/, 'running');
+    }
+    const parts = head.split(' ');
+    parts[parts.length - 1] = String(Number(parts.at(-1)) + 2000 * polls++);
+    return { ...result, stdout: `${parts.join(' ')}\n${output}` };
+  };
+
+  world.handle = await f.resources.materialize(f.project.id, task.id, world, 1);
+
+  const events = await f.store.eventsOfTypes(task.id, ['world.resource-restoring', 'world.resource-restored']);
+  for (const { attachment } of files) {
+    const own = events.filter((event) => (event.payload as { attachmentId?: string }).attachmentId === attachment.id);
+    expect(own.map((event) => event.type)).toEqual(['world.resource-restoring', 'world.resource-restored']);
+    expect(own[1]!.ts).toBeGreaterThanOrEqual(own[0]!.ts);
+    expect((own[1]!.payload as { durationMs: number }).durationMs).toBeGreaterThanOrEqual(0);
+  }
+  expect(polls).toBeGreaterThan(1);
+}, REAL_RESTIC_MS);
+
 it('fails the leases of resources it never restored when one restore fails', async () => {
   const f = await fixture();
   const files = await singleFiles(f, 4);

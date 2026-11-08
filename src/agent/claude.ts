@@ -632,6 +632,18 @@ export class ClaudeAdapter implements AgentAdapter {
     const settleGraceMs = Number.isFinite(parsedGrace) && parsedGrace >= 0 && parsedGrace <= 2_147_483_647
       ? parsedGrace : 300_000;
     let settleDeadline: number | undefined;
+    // Closing the input does not end the harness: Claude Code (2.1.319) stays alive
+    // while a background shell or sub-agent runs, so a dev server left running held the
+    // turn open forever and the task showed Working (forecasting #2). Once the input
+    // is closed the harness gets this long to exit on its own; then it is stopped and
+    // the turn ends with what it reported. A harness that wakes within it still throws
+    // AgentChannelLost below.
+    const exitGrace = process.env.KARMAX_AGENT_EXIT_GRACE_MS?.trim();
+    const parsedExitGrace = exitGrace ? Number(exitGrace) : NaN;
+    const exitGraceMs = Number.isFinite(parsedExitGrace) && parsedExitGrace >= 0 && parsedExitGrace <= 2_147_483_647
+      ? parsedExitGrace : 30_000;
+    let exitTimer: ReturnType<typeof setTimeout> | undefined;
+    let harnessStopped = false;
     // Backgrounded shells still running when the input closed. Closing it stops
     // them (or leaves them to finish unobserved), so their results are lost.
     let stoppedShells: string[] = [];
@@ -654,6 +666,7 @@ export class ClaudeAdapter implements AgentAdapter {
       if (!harnessStillWorking()) {
         stoppedShells = backgroundShellDescriptions(subagents);
         await injector.close();
+        exitTimer ??= setTimeout(() => { harnessStopped = true; onAbort(); }, exitGraceMs);
         return;
       }
       settleTimer = setTimeout(() => { if (harnessIdle) void settleInput(); },
@@ -1100,7 +1113,8 @@ export class ClaudeAdapter implements AgentAdapter {
       // A cancellation aborts the SDK subprocess mid-stream — the query iterator
       // throws an AbortError. The workflow already handled the cancel, so swallow
       // it (return the partial output); rethrow anything else as a real failure.
-      if (!ctx.signal?.aborted) {
+      // A harness we stopped after its exit grace ends the turn like one that exited.
+      if (!ctx.signal?.aborted && !(harnessStopped && successfulResult && !(e instanceof AgentChannelLost))) {
         if (firstSdkEvent) {
           try { await boundedStartupProbe(() => diagnoseStartup('error'), 5000, undefined); }
           catch { /* retain the original startup failure */ }
@@ -1114,6 +1128,7 @@ export class ClaudeAdapter implements AgentAdapter {
       if (hb) clearInterval(hb);
       if (followPoll) clearInterval(followPoll);
       if (settleTimer) clearTimeout(settleTimer);
+      if (exitTimer) clearTimeout(exitTimer);
       (await injector.close()); // release the input stream so the SDK subprocess can't wedge open
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
       if (remoteHome && input.resolvedAuth?.configHome) {

@@ -394,13 +394,18 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     const started = new Set<number>();
     const failures = new Map<number, string>();
     let first: Error | undefined;
+    // The world's clock to this host's, measured once: each poll's reading also
+    // carries that poll's round trip, so re-measuring it per poll gave an item
+    // started in one poll and finished in the next two offsets, and its end
+    // could come before its start (CI #2705).
+    let shift: number | undefined;
     try {
       let from = 0;
       let pending = '';
       for (let wait = FIRST_POLL_MS; ; wait = Math.min(wait * 2, POLL_MS)) {
         await options.checkContinue?.();
         const status = await followJob(world, job, from, { root: SYSTEM_JOB_ROOT });
-        const shift = Date.now() - status.now;
+        shift ??= Date.now() - status.now;
         from += Buffer.byteLength(status.output);
         const text = pending + status.output;
         const end = text.lastIndexOf('\n');
