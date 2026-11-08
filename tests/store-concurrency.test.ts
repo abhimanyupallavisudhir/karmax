@@ -374,6 +374,43 @@ describe.skipIf(!url)('deadlocks between concurrent PostgreSQL transactions', ()
     }
   });
 
+  it('never leaves a scope\'s first write without its keyring when a shred commits around it', async () => {
+    const [a, b] = await pair();
+    const kek = { current: LocalKek.fromText('store-concurrency-vault-key-material-01'), others: [] };
+    const one = await DatabaseVault.open(a.db, { kek });
+    const two = await DatabaseVault.open(b.db, { kek });
+    const scope = organizationScope('org_first_write');
+    // The scope has no keyring yet. A quarantined copy that a third connection
+    // holds parks the shred between deleting the scope's entries and deleting
+    // its keyring: the window in which a first write once created both.
+    await a.db.prepare(`INSERT INTO vault_quarantine (id, handle, scope, record, reason, createdAt)
+      VALUES ('held', 'old', ?, '{}', 'test', ?)`).run(scope, Date.now());
+    const holder = await admin!.connect();
+    /** Whether a statement matching `query` comes to wait on a lock within 10 s. */
+    const waiting = async (query: RegExp, settled = () => false) => {
+      for (const deadline = Date.now() + 10_000; Date.now() < deadline && !settled(); await new Promise(resolve => setTimeout(resolve, 20))) {
+        const rows = (await admin!.query(`SELECT query FROM pg_stat_activity WHERE wait_event_type = 'Lock'`)).rows;
+        if (rows.some(row => query.test(String(row.query)))) return true;
+      }
+      return false;
+    };
+    try {
+      await holder.query('BEGIN');
+      await holder.query(`SELECT 1 FROM vault_quarantine WHERE id = 'held' FOR UPDATE`);
+      const shred = one.destroyScope(scope);
+      expect(await waiting(/DELETE FROM vault_quarantine/)).toBe(true);
+      let written = false;
+      const write = two.put('first', 'v1', scope).finally(() => { written = true; });
+      // Either the write finishes inside the window, or it waits for the shred.
+      await waiting(/pg_advisory_xact_lock/, () => written);
+      await holder.query('COMMIT');
+      expect((await Promise.allSettled([shred, write])).map(result => result.status)).toEqual(['fulfilled', 'fulfilled']);
+    } finally { await holder.query('ROLLBACK').catch(() => undefined); holder.release(); }
+    const ring = await a.db.prepare('SELECT 1 AS present FROM vault_keyrings WHERE scope=?').get(scope);
+    expect(ring).toBeTruthy();
+    expect(await two.reveal('first')).toBe('v1');
+  });
+
   it('reports the deadlock instead of re-running an attempt that wrote outside the database', async () => {
     const before = storeMetricsSnapshot();
     const { results, runs } = await deadlock(true);

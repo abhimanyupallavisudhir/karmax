@@ -20,10 +20,22 @@ import { KEK_ID, KEYRING, SECRET_LIMIT, isScoped, kekCanaryRecord, mintDataKey, 
  * Concurrency: every entry write is a compare-and-swap on the row's `version`,
  * retried on conflict. A write share-locks its scope's keyring row (PostgreSQL
  * `FOR SHARE`); rotating or shredding a scope locks it exclusively, so no write
- * can land under a data key being retired. Lock order (STORE_LOCK_ORDER): any
- * advisory key the caller holds (`vault:<orgId>`), then the keyring row, then
- * entry rows. SQLite serializes transactions.
+ * can land under a data key being retired; creating or shredding a keyring
+ * also takes the scope's advisory key (`keyringKey`). Lock order
+ * (STORE_LOCK_ORDER): any advisory key the caller holds (`vault:<orgId>`), then
+ * `vault-keyring:<scope>`, then the keyring row, then entry rows. SQLite
+ * serializes transactions.
  */
+/**
+ * The advisory key a scope's keyring is created and shredded under. A keyring
+ * row lock cannot cover a scope that has none yet: a shred would find nothing
+ * to lock, and a first write could create the keyring and its entry between
+ * the shred's deletion of the scope's entries and of its keyring, leaving an
+ * entry no key opens. So a shred holds this key throughout, and a write that
+ * finds no keyring takes it before creating one (`vault-keyring:<scope>` in
+ * STORE_LOCK_ORDER).
+ */
+const keyringKey = (scope: VaultScope) => `vault-keyring:${scope}`;
 const QUARANTINE_RETENTION_MS = 30 * 86_400_000;
 const ATTEMPTS = 8;
 
@@ -171,7 +183,13 @@ export class DatabaseVault implements SecretVault {
   }
   /** @internal The scope's current data key, creating its keyring on first use. */
   async writableKey(scope: VaultScope): Promise<{ kid: string; key: Buffer; raw: string }> {
-    const locked = await this.lockRing(scope, 'SHARE');
+    let locked = await this.lockRing(scope, 'SHARE');
+    if (!locked) {
+      // No row to lock yet: wait out a shred of the scope, which holds this
+      // key throughout, then look again (`keyringKey`).
+      await this.db.lock(keyringKey(scope));
+      locked = await this.lockRing(scope, 'SHARE');
+    }
     if (!locked) {
       const ring: Keyring = { format: KEYRING, scope, current: '', keys: {} };
       const created = mintDataKey(ring, this.kek.current, this.known());
@@ -364,6 +382,7 @@ export class DatabaseVault implements SecretVault {
     validateScope(scope);
     if (scope === INSTALLATION_SCOPE) throw new Error('the installation scope cannot be destroyed');
     return this.write(async () => {
+      await this.db.lock(keyringKey(scope));
       await this.lockRing(scope, 'UPDATE');
       const entries = Number((await this.db.prepare('DELETE FROM vault_entries WHERE scope = ?').run(scope)).changes);
       const quarantined = Number((await this.db.prepare('DELETE FROM vault_quarantine WHERE scope = ?').run(scope)).changes);
