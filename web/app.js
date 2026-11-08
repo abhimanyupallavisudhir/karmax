@@ -1163,7 +1163,9 @@ function numberedTaskTitle(task) {
 
 function principalLabel(principal) {
   if (!principal) return 'Unassigned';
-  if (principal.kind === 'user') return S.users.find((u) => u.id === principal.userId)?.name || principal.userId;
+  // Members carry their names; the installation's directory may be unreadable (hosted).
+  if (principal.kind === 'user') return S.organizationMembers.find((m) => m.userId === principal.userId)?.user?.name
+    || S.users.find((u) => u.id === principal.userId)?.name || principal.userId;
   if (principal.kind === 'team') return S.teams.find((t) => t.id === principal.teamId)?.name || principal.teamId;
   if (principal.kind === 'avatar') return S.avatars?.find((a) => a.id === principal.avatarId)?.name || principal.avatarId;
   return `Task agent · ${agentRoleLabel(principal.role)}`;
@@ -9735,6 +9737,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         <div class="tf-columns parameter-fields" id="tf-body" data-project-id="${esc(projectId)}">
           <div class="tf-main">
             ${templateEdit ? '' : '<div class="tf-ready" id="tf-ready" role="status" hidden></div>'}
+            ${draft?.id && !templateEdit ? taskCreatorHtml({ taskId: draft.id, creator: recordCreator(draft) }) : ''}
             ${promptField ? renderField(promptField, values[promptField.name], inherited[promptField.name], true) : ''}
             ${agentFields.map((f) => `<section class="tf-section tf-${esc(f.type)}">${agentSectionHtml(f)}</section>`).join('')}
             ${otherFields.length ? `<section class="tf-section tf-where">${renderFields(otherFields, values, inherited)}</section>` : ''}
@@ -15002,9 +15005,47 @@ function parametersTab(v) {
   // The rest mirrors the task form: its agents, where it runs, when it starts,
   // and the logins it may use.
   return `
+    ${taskCreatorHtml(v)}
     ${paramsSection(v)}
     <div class="label-row tp-creds-head"><label>Accounts</label>${policyTip('The Claude and Codex accounts this task runs on, first available first. Drag to reorder; switch one off to skip it, for this task only.')}<span class="label-row-fill"></span></div>
     <div id="cred-editor-task" data-live-key="${esc(v.taskId)}">Loading…</div>`;
+}
+
+// Who created the task (TaskView.creator), first on Parameters: a person, an
+// agent — linked to its task —, an Avatār or tavya's own automation, and the
+// app it came through (a CLI login, an MCP app, a personal token) when it was
+// not the console.
+// A task not started yet has no view: its creator comes from its list record,
+// the task behind an agent or Avatār named when the reader has it loaded.
+function recordCreator(rec) {
+  if (!rec?.createdBy && !rec?.createdVia) return undefined;
+  const by = rec.createdBy;
+  const source = taskRecord(by?.kind === 'task-agent' ? by.taskId : by?.kind === 'avatar' ? by.avatarId : null);
+  return { ...(by ? { createdBy: by } : {}), ...(rec.createdVia ? { via: rec.createdVia } : {}),
+    ...(source ? { task: { id: source.id, projectId: source.projectId, num: source.num, title: source.title } } : {}) };
+}
+const SYSTEM_CREATOR_LABEL = { 'system:triggers': 'Trigger', 'system:github-recovery': 'GitHub recovery' };
+function taskCreatorHtml(v) {
+  const c = v?.creator;
+  if (!c?.createdBy && !c?.via) return '';
+  const by = c.createdBy;
+  const linked = (label) => (c.task
+    ? `<a data-spa href="${esc(taskUrl(c.task.id, c.task))}">${esc(label)}</a>` : esc(label));
+  const source = c.task ? numberedTaskTitle(c.task) : '';
+  const who = by?.kind === 'task-agent'
+    ? (source ? `${esc(agentRoleLabel(by.role))} of ${linked(source)}` : esc(agentRoleLabel(by.role)))
+    : by?.kind === 'avatar' ? `Avatār ${linked(source || principalLabel(by))}`
+    : by?.kind === 'user' && by.userId === S.user?.id ? 'You'
+    : by ? esc(principalLabel(by))
+    : c.via?.kind === 'system' ? esc(siteName()) : 'Someone';
+  const via = c.via?.kind === 'system'
+    ? { label: SYSTEM_CREATOR_LABEL[c.via.principal] || siteName(), tip: `Started by ${siteName()}` }
+    : c.via ? { label: c.via.name, tip: { cli: 'Signed-in CLI', mcp: 'Connected app (MCP)', token: 'Personal access token' }[c.via.kind] || c.via.kind }
+    : null;
+  const at = taskRecord(v.taskId)?.createdAt;
+  return `<div class="tp-creator" data-row="__creator"><span class="tp-creator-label">Created by</span>
+    <span class="tp-creator-who">${who}</span>${via ? ` <span class="tp-creator-via" title="${esc(via.tip)}">via ${esc(via.label)}</span>` : ''}${at
+    ? ` <time class="tp-creator-at" datetime="${esc(new Date(at).toISOString())}" title="${esc(new Date(at).toLocaleString())}">${esc(fmtAgo(at))}</time>` : ''}</div>`;
 }
 
 // The server state each async-hydrated Parameters section is built from (see

@@ -4169,6 +4169,14 @@ html[data-theme="dark"] .github-signin-btn:active,
 .pf-ro { padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); color: var(--ink-2); white-space: pre-wrap; overflow-wrap: anywhere; }
 .ab-frozen, .pf-fieldset { border: 0; padding: 0; margin: 0; min-inline-size: auto; display: grid; gap: 8px; }
 .ab-frozen > *, .pf-fieldset > * { opacity: .7; }
+/* Who created the task: one quiet line above its parameters. */
+.tp-creator { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; padding: 2px 0 10px; font-size: var(--fs-13); color: var(--ink-2); }
+.tp-creator-label { font-size: var(--fs-12); font-weight: 600; color: var(--ink-3); }
+.tp-creator-who { color: var(--ink); font-weight: 500; overflow-wrap: anywhere; }
+.tp-creator-who a { color: inherit; text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 2px; }
+.tp-creator-who a:hover { text-decoration-color: currentColor; }
+.tp-creator-via, .tp-creator-at { color: var(--ink-3); }
+.tp-creator-at::before { content: '·'; margin-right: 8px; }
 .tp-creds-head { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--line); }
 .tp-creds-head label { font-size: var(--fs-12); font-weight: 600; color: var(--ink-2); }
 .agent-authority #tp-auth { display: grid; gap: 8px; }

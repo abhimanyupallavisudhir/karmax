@@ -28,6 +28,23 @@ export type PrincipalRef =
   | { kind: 'avatar'; avatarId: string }
   | { kind: 'task-agent'; taskId: string; role: string };
 
+/** The credential a task was created with, beside its creator (`createdBy`):
+ * an app grant of the person — a CLI device login, an MCP client's OAuth
+ * consent or a personal access token (src/auth/app-grants.ts) — or tavya's own
+ * automation (a trigger, GitHub recovery), named by its system principal. */
+export type TaskCreatedVia =
+  | { kind: 'cli' | 'mcp' | 'token'; grantId: string; name: string }
+  | { kind: 'system'; principal: string };
+
+/** A task's creator as a reader sees it (TaskView.creator). `task` is the task
+ *  whose agent — or the Avatār — created it, named only to a reader who may
+ *  read that task. */
+export interface TaskCreator {
+  createdBy?: PrincipalRef;
+  via?: TaskCreatedVia;
+  task?: { id: string; projectId: string; num?: number; title: string };
+}
+
 /** Project access may also target the entire containing organization. This is
  * deliberately project-specific; @all is not a valid task assignee. */
 export type ProjectPrincipalRef = PrincipalRef | { kind: 'organization'; organizationId: string };
@@ -1208,6 +1225,9 @@ export interface TaskRecord {
   parentTaskId?: string;
   /** Immutable creator provenance. */
   createdBy?: PrincipalRef;
+  /** The credential the creator used, when it was not a console sign-in or a
+   *  task's own token (those are already told by `createdBy`). */
+  createdVia?: TaskCreatedVia;
   /** One accountable actor; assignment never grants project access. */
   assignee?: PrincipalRef;
   /** Optional executing agent while a human remains accountable. */
@@ -1960,6 +1980,8 @@ export interface TaskView {
   /** The parent's list identity, which outlives the parent in the live task list. */
   /** `pullRequest`: this is that task's pull request of this checkout (SPEC §11.1), not its sub-task. */
   parentTask?: { id: string; num?: number; title: string; pullRequest?: string };
+  /** Who created the task and with what credential, resolved for the reader. */
+  creator?: TaskCreator;
   error?: string;
   /**
    * What the task is currently parked on, if anything (SPEC §6.2). Surfaced so the
