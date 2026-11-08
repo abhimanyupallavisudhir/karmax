@@ -52,6 +52,7 @@ import {
   TeamMembership,
   ProjectMembership,
   PrincipalRef,
+  TaskCreatedVia,
   ProjectPrincipalRef,
   ConfirmationPolicy,
   Avatar,
@@ -695,7 +696,7 @@ export class Store {
         title TEXT NOT NULL, workflow TEXT NOT NULL, workflowVersion TEXT NOT NULL,
         params TEXT NOT NULL, createdAt INTEGER NOT NULL, ord INTEGER NOT NULL,
         parentTaskId TEXT, lastView TEXT, completedAt INTEGER, statusChangedAt INTEGER, createdBy TEXT, assignee TEXT,
-        delegate TEXT, confirmationPolicy TEXT
+        delegate TEXT, confirmationPolicy TEXT, createdVia TEXT
       );
       CREATE TABLE IF NOT EXISTS organizations (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
@@ -1507,6 +1508,7 @@ export class Store {
       (await this.db.exec('ALTER TABLE tasks ADD COLUMN notes TEXT'));
     }
     if (!cols.some((c) => c.name === 'createdBy')) (await this.db.exec('ALTER TABLE tasks ADD COLUMN createdBy TEXT'));
+    if (!cols.some((c) => c.name === 'createdVia')) (await this.db.exec('ALTER TABLE tasks ADD COLUMN createdVia TEXT'));
     if (!cols.some((c) => c.name === 'assignee')) (await this.db.exec('ALTER TABLE tasks ADD COLUMN assignee TEXT'));
     if (!cols.some((c) => c.name === 'delegate')) (await this.db.exec('ALTER TABLE tasks ADD COLUMN delegate TEXT'));
     if (!cols.some((c) => c.name === 'confirmationPolicy')) (await this.db.exec('ALTER TABLE tasks ADD COLUMN confirmationPolicy TEXT'));
@@ -4176,6 +4178,7 @@ export class Store {
     params: TaskParams;
     parentTaskId?: string;
     createdBy?: PrincipalRef;
+    createdVia?: TaskCreatedVia;
     assignee?: PrincipalRef;
     delegate?: PrincipalRef;
     confirmationPolicy?: ConfirmationPolicy;
@@ -4243,14 +4246,15 @@ export class Store {
       order: ord,
       parentTaskId: input.parentTaskId,
       createdBy: input.createdBy,
+      ...(input.createdVia ? { createdVia: input.createdVia } : {}),
       assignee: input.assignee,
       delegate: input.delegate,
       confirmationPolicy: input.confirmationPolicy,
     };
     (await this.db
       .prepare(
-        `INSERT INTO tasks (id, num, projectId, listId, title, workflow, executionWorkflow, workflowVersion, params, createdAt, ord, parentTaskId, lastView, notes, intentId, attemptNumber, createdBy, assignee, delegate, confirmationPolicy)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO tasks (id, num, projectId, listId, title, workflow, executionWorkflow, workflowVersion, params, createdAt, ord, parentTaskId, lastView, notes, intentId, attemptNumber, createdBy, assignee, delegate, confirmationPolicy, createdVia)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         t.id,
@@ -4273,6 +4277,7 @@ export class Store {
         jsonOrNull(t.assignee),
         jsonOrNull(t.delegate),
         jsonOrNull(t.confirmationPolicy),
+        jsonOrNull(t.createdVia),
       ));
     // Alternate attempts inherit the logical task's selection times; simply
     // retrying an execution must not make its credentials more frequent/recent.
@@ -4352,7 +4357,7 @@ export class Store {
     const rows = (await this.db.prepare(`SELECT
         t.id, t.num, t.projectId, t.listId, t.title, t.workflow,
         t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.statusChangedAt, t.ord,
-        t.parentTaskId, t.createdBy, t.assignee, t.delegate,
+        t.parentTaskId, t.createdBy, t.createdVia, t.assignee, t.delegate,
         t.confirmationPolicy, t.intentId, t.attemptNumber, t.notes,
         CASE WHEN t.lastView IS NULL THEN NULL ELSE json_remove(
           t.lastView, '$.messages', '$.transcripts', '$.reviewInfo'
@@ -4440,7 +4445,7 @@ export class Store {
     const params = [projectId, ...(ids ?? [])];
     const projection = includeConversation ? 't.*' : `t.id, t.num, t.projectId, t.listId, t.title, t.workflow,
       t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.statusChangedAt, t.ord, t.parentTaskId,
-      t.createdBy, t.assignee, t.delegate, t.confirmationPolicy, t.intentId, t.attemptNumber, t.notes,
+      t.createdBy, t.createdVia, t.assignee, t.delegate, t.confirmationPolicy, t.intentId, t.attemptNumber, t.notes,
       json_remove(t.lastView, '$.messages', '$.transcripts', '$.reviewInfo') AS lastView`;
     const rows = await this.readRows<any>(`SELECT ${projection},
       COALESCE(t.num, root.num) AS resolvedNum${attempts ? ', CASE WHEN i.principalAttemptId=t.id THEN 0 ELSE 1 END AS otherAttempt' : ''} ${from}
@@ -4597,7 +4602,7 @@ export class Store {
   async taskMetadataAsync(id: string): Promise<TaskRecord | undefined> {
     const [row] = await this.readRows<any>(`SELECT t.id, t.num, t.projectId, t.listId, t.title, t.workflow,
       t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.statusChangedAt, t.ord, t.parentTaskId,
-      t.createdBy, t.assignee, t.delegate, t.confirmationPolicy, t.intentId, t.attemptNumber,
+      t.createdBy, t.createdVia, t.assignee, t.delegate, t.confirmationPolicy, t.intentId, t.attemptNumber,
       t.notes, t.lastView, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
       LEFT JOIN tasks root ON root.id=t.intentId WHERE t.id=?`, [id]);
     return row ? rowToTask(row) : undefined;
@@ -11498,6 +11503,7 @@ function rowToTask(r: any): TaskRecord {
     order: r.ord,
     parentTaskId: r.parentTaskId ?? undefined,
     createdBy: parseJsonOptional<PrincipalRef>(r.createdBy),
+    ...(r.createdVia ? { createdVia: parseJsonOptional<TaskCreatedVia>(r.createdVia) } : {}),
     assignee: parseJsonOptional<PrincipalRef>(r.assignee),
     delegate: parseJsonOptional<PrincipalRef>(r.delegate),
     confirmationPolicy: parseJsonOptional<ConfirmationPolicy>(r.confirmationPolicy),
