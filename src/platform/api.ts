@@ -92,6 +92,7 @@ import { enrollWorldRepositories } from '../world/repository-enrollment.js';
 import { ensureTaskBranchAncestry } from '../world/task-branch.js';
 import type { WorldAccessService } from '../world/access.js';
 import type { RunnerPoolService } from '../world/runners.js';
+import { machineWaits, withMachineWait, type MachineWait } from '../world/machine-wait.js';
 import { VaultItems, type CredentialAccessRequest, type VaultItemPolicy, type VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
 import { connectionRequestsVia, passOnConnectionRequest } from '../integrations/connection-requests.js';
 import type { ServiceConnection } from '../integrations/service-connections.js';
@@ -3755,7 +3756,7 @@ export class KarmaxApi {
         const { world, worldPath, worldAvailable, worldDesktop, worldProvider, ...history } = view;
         view = history;
       }
-      view = await this.withLiveAccountWait(taskId, view);
+      view = await this.withLiveWait(taskId, view);
       const rawAgents = await this.deps.store.kvGetAsync(agentSnapshotKey(taskId));
       let agents: Record<string, AgentSpec> | undefined;
       try { const parsed = rawAgents ? JSON.parse(rawAgents) : undefined;
@@ -3763,8 +3764,9 @@ export class KarmaxApi {
       } catch { /* Same malformed-snapshot fallback as readAgentSnapshot. */ }
       const task = await this.deps.store.taskMetadataAsync(taskId);
       const group = await this.deps.store.attemptCommitAsync(taskId);
+      const childWaits = await machineWaits(this.deps.store).catch(() => new Map<string, MachineWait>());
       const subTaskSummaries = await Promise.all((await this.deps.store.childTaskSummaries(taskId)).map(async (child) =>
-        child.lastView ? { ...child, lastView: await this.withLiveAccountWait(child.id, child.lastView) } : child));
+        child.lastView ? { ...child, lastView: await this.withLiveWait(child.id, child.lastView, childWaits) } : child));
       const forkSummaries = await this.deps.store.forkTaskSummaries(taskId);
       const forkSourceSummaries = await this.deps.store.forkSourceTaskSummaries(taskId);
       const accepted = (await this.acceptedAction(taskId, view));
@@ -3903,6 +3905,19 @@ export class KarmaxApi {
    * waiting view takes the coordinator's current answer. Executions that
    * recorded only "account" get their reason this way too.
    */
+  /**
+   * What a waiting task waits for now, which its published view may not know:
+   * a machine (its runner lease is queued, whichever activity or request
+   * asked for it; src/world/machine-wait.ts), else a model login's current
+   * reason (withLiveAccountWait). `waits`: every machine wait, read once for a list.
+   */
+  async withLiveWait<V extends Pick<TaskView, 'status' | 'waitingFor'>>(taskId: string, view: V,
+    waits?: Map<string, MachineWait>): Promise<V> {
+    const machine = (waits ?? await machineWaits(this.deps.store).catch(() => undefined))?.get(taskId);
+    const shown = withMachineWait(view, machine);
+    return shown !== view ? shown : this.withLiveAccountWait(taskId, view);
+  }
+
   async withLiveAccountWait<V extends Pick<TaskView, 'waitingFor'>>(taskId: string, view: V): Promise<V> {
     if (view.waitingFor?.kind !== 'account') return view;
     try {

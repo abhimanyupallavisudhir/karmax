@@ -1,4 +1,5 @@
 import { computerDefaults, saveOrganizationComputer, saveProjectComputer, splitComputerValues } from '../platform/computer-settings.js';
+import { machineWaits, type MachineWait } from '../world/machine-wait.js';
 import { REPOSITORY_ROUTE } from '../world/resource-repository.js';
 import { clientAddress, ClientRequestLimits } from './client-address.js';
 import { keepAuthorized, socketLifetime } from './socket-lifetime.js';
@@ -1164,9 +1165,9 @@ export class Gateway {
     return counts;
   }
 
-  /** A list row parked on a model login says why it waits now, as the task's page does (KarmaxApi.withLiveAccountWait). */
-  private async liveAccountWait(taskId: string, view: TaskView | undefined): Promise<TaskView | undefined> {
-    return view ? this.deps.api.withLiveAccountWait(taskId, view) : view;
+  /** A list row says what it waits for now — a machine, or why a model login is not given yet — as the task's page does (KarmaxApi.withLiveWait). */
+  private async liveWait(taskId: string, view: TaskView | undefined, waits: Map<string, MachineWait>): Promise<TaskView | undefined> {
+    return view ? this.deps.api.withLiveWait(taskId, view, waits) : view;
   }
 
   private async withApprovalRequests(view: TaskView | undefined, taskId: string,
@@ -5357,8 +5358,9 @@ export class Gateway {
             });
             const organizationId = (await store.getProject(projectId))?.organizationId;
             const counts: ApprovalCounts = organizationId ? (await this.approvalCounts(organizationId)) : new Map();
+            const waits = await machineWaits(store).catch(() => new Map<string, MachineWait>());
             return this.json(res, 200, { ...result, tasks: (await __asyncCollections.map(result.tasks, async task => ({ ...task,
-              lastView: (await this.withApprovalRequests(await this.liveAccountWait(task.id, task.lastView), task.id, counts)) }))) });
+              lastView: (await this.withApprovalRequests(await this.liveWait(task.id, task.lastView, waits), task.id, counts)) }))) });
           }
           const all = await api.listTaskSummaries(token, projectId);
           // Archived tasks are hidden from the default list (SPEC §11 housekeeping).
@@ -5387,9 +5389,10 @@ export class Gateway {
           // (including stageTransitions) are resolved by the single-task endpoint.
           const organizationId = (await store.getProject(projectId))?.organizationId;
           const approvalCounts: ApprovalCounts = organizationId ? (await this.approvalCounts(organizationId)) : new Map();
+          const waits = await machineWaits(store).catch(() => new Map<string, MachineWait>());
           const listed = (await __asyncCollections.map(page, async (t) => ({
             ...t,
-            lastView: trimListView((await this.withApprovalRequests(await this.liveAccountWait(t.id, t.lastView), t.id, approvalCounts))),
+            lastView: trimListView((await this.withApprovalRequests(await this.liveWait(t.id, t.lastView, waits), t.id, approvalCounts))),
           })));
           if (limit > 0) return this.json(res, 200, { tasks: listed, total: filtered.length, offset });
           return this.json(res, 200, listed);

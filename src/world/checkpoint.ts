@@ -21,6 +21,7 @@ import { newId } from '../util/id.js';
 import { activateProjectRuntime, selectProjectEnvironment, snapshotProjectRuntime } from './project-runtime.js';
 import { destroyWorldServices } from './services.js';
 import { RunnerPoolService } from './runners.js';
+import { leaseWaitDeadline } from './machine-wait.js';
 import { computeNeeds, rankComputeOptions, type ComputeRouter } from './compute-router.js';
 import { sameRepository } from './repository-identity.js';
 import { clearCheckpointStale } from './checkpoint-staleness.js';
@@ -37,6 +38,8 @@ export const CHECKPOINT_KEY_HANDLE = 'checkpoint:encryption-key';
 
 /** How a restoring activity keeps its runner-lease wait alive and cancellable. */
 export interface RestoreOptions { signal?: AbortSignal; heartbeat?: () => void;
+  /** When to stop waiting for a runner lease (machine-wait.ts leaseWaitDeadline). */
+  waitUntil?: number;
   /** Why "Any" chose this provider, recorded on the restored world. */
   routed?: string }
 
@@ -60,7 +63,8 @@ export interface RestoreOptions { signal?: AbortSignal; heartbeat?: () => void;
 function ambientActivityHooks(): RestoreOptions {
   try {
     const ctx = activityContext.current();
-    return { signal: ctx.cancellationSignal, heartbeat: () => ctx.heartbeat({ waitingFor: 'world-capacity' }) };
+    return { signal: ctx.cancellationSignal, heartbeat: () => ctx.heartbeat({ waitingFor: 'world-capacity' }),
+      waitUntil: leaseWaitDeadline(ctx.info) };
   } catch {
     return {};
   }
@@ -457,7 +461,7 @@ export class WorldCheckpointService {
       ? await this.runners.acquire({ project, taskId: checkpoint.worldId, worldId: checkpoint.worldId,
         provider: selected, priority: Number((await this.store.getTask(checkpoint.worldId))?.params.priority ?? 0),
         resources: executionConfig.resources,
-        signal: hooks.signal, heartbeat: hooks.heartbeat })
+        signal: hooks.signal, heartbeat: hooks.heartbeat, waitUntil: hooks.waitUntil ?? ambientActivityHooks().waitUntil })
       : undefined;
     let world: World;
     try {

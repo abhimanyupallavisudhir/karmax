@@ -30,6 +30,7 @@ import { COMPUTE_HOLD, holdManagedCompute, outOfCompute, type ComputeHoldRequest
 import { MANAGED_COMPUTE } from '../world/connections.js';
 import { capacityCause, ComputeRouter, type RouterConnections } from '../world/compute-router.js';
 import { accountKey, dequeue, enqueue, wakeFullKey } from '../world/compute-queue.js';
+import { MachineQueued, leaseWaitDeadline } from '../world/machine-wait.js';
 import { AgentChannelLost, AgentToolsUnavailable, toolsUnavailableActivity, toolsUnavailableNotice, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { clearBranchUnpublished, markBranchUnpublished, markCheckpointStale } from '../world/checkpoint-staleness.js';
@@ -226,7 +227,11 @@ function capacityFailure(error: unknown): ApplicationFailure | undefined {
   for (let cause = error, depth = 0; cause && depth < 8; cause = (cause as { cause?: unknown }).cause, depth++) {
     if (cause instanceof ProviderCapacityFull || (cause as { name?: string }).name === 'ProviderCapacityFull') {
       const message = (cause as Error).message;
-      return ApplicationFailure.create({ message, type: 'world-capacity', nonRetryable: true, cause: cause instanceof Error ? cause : undefined });
+      // A runner lease still queued at its activity's deadline (machine-wait.ts):
+      // the activity tries again at once, keeping its place, before its
+      // workflow waits for a machine on its own schedule.
+      const queued = cause instanceof MachineQueued;
+      return ApplicationFailure.create({ message, type: 'world-capacity', nonRetryable: !queued, cause: cause instanceof Error ? cause : undefined });
     }
   }
   return undefined;
@@ -1571,9 +1576,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const project = (await store.getProject(projectId));
     if (!project) throw new Error('cloud world has no owning project');
     const ctx = activityContext.current();
-    const acquired = await timed('world.runner.wait', async () => deps.runners!.acquire({ project, taskId, worldId: handle.id, provider: handle.kind,
-      priority: (await store.taskPriority(taskId)), signal: ctx.cancellationSignal,
-      heartbeat: () => ctx.heartbeat({ waitingFor: 'world-capacity' }) }));
+    let acquired: { leaseId: string; runnerPoolId: string };
+    try {
+      acquired = await timed('world.runner.wait', async () => deps.runners!.acquire({ project, taskId, worldId: handle.id, provider: handle.kind,
+        priority: (await store.taskPriority(taskId)), signal: ctx.cancellationSignal, waitUntil: leaseWaitDeadline(ctx.info),
+        heartbeat: () => ctx.heartbeat({ waitingFor: 'world-capacity' }) }));
+    } catch (error) {
+      // Still queued when its activity must move on: a wait for a machine, not a timeout.
+      if (error instanceof MachineQueued) throw capacityFailure(error);
+      throw error;
+    }
     // Admission waits outside the world's lock, so another opener may have
     // been admitted alongside this one (task #779: both in one millisecond).
     // The first to publish owns the world; this one gives its lease back, as
@@ -2486,7 +2498,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (remote && project && deps.runners) {
           try {
             acquired = await timed('world.runner.wait', async () => deps.runners!.acquire({ project, taskId: args.taskId, worldId: args.taskId, provider: kind,
-              resources: executionConfig?.resources, work: true,
+              resources: executionConfig?.resources, work: true, waitUntil: ctx ? leaseWaitDeadline(ctx.info) : undefined,
               priority: Number((await store.getTask(args.taskId))?.params.priority ?? 0), signal: activitySignal,
               heartbeat }));
           } catch (error) {

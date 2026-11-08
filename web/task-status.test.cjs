@@ -20,7 +20,7 @@ function fn(name) {
 }
 const ctx = vm.createContext({ esc: (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'), ACCOUNT_PROVIDER_LABELS: { claude: 'Claude' } });
 vm.runInContext([src.match(/const PARKED_WAITS = [^\n]*/)[0],
-  ...['accountWaitReason', 'waitingLabel', 'waitDeadline', 'waitingText', 'stageLabel', 'statusTone', 'statusHtml', 'viewStatusHtml'].map(fn)].join('\n'), ctx);
+  ...['accountWaitReason', 'waitingLabel', 'waitDeadline', 'waitingText', 'stageLabel', 'statusTone', 'statusHtml', 'waitTitle', 'viewStatusHtml', 'stageIndicator', 'conversationWaitNotice'].map(fn)].join('\n'), ctx);
 const label = (html) => [...html.matchAll(/class="status-label">([^<]*)</g)].map((m) => m[1]);
 
 test('the colour says who has the ball', () => {
@@ -80,4 +80,21 @@ test('a project is marked with a box, not a checklist', () => {
   assert.ok(icon, 'ICON.project exists');
   assert.ok(icon.includes('m3.3 7 8.7 5 8.7-5'), 'the box’s lid');
   assert.ok(!icon.includes('m3 6 1.5 1.5'), 'no checkmarks');
+});
+
+test('a wait for a machine is one line, its place in the queue in it and what is full in its tooltip', () => {
+  const detail = 'All 25 computers this organization may run at once are in use (E2B · organization BYOK). 3 tasks are ahead of this one.';
+  const v = { stage: 'do', status: 'waiting', waitingFor: { kind: 'retry', summary: 'Waiting for a machine', detail, provider: 'e2b', ahead: 3 } };
+  assert.equal(ctx.waitingText(v.waitingFor), 'Waiting for a machine · 3 ahead');
+  assert.equal(ctx.waitingText({ ...v.waitingFor, ahead: 0 }), 'Waiting for a machine', 'first in line');
+  assert.equal(ctx.statusTone(v), 'waiting', 'nobody has to act');
+  const html = ctx.viewStatusHtml(v);
+  assert.deepEqual(label(html), ['Waiting for a machine · 3 ahead']);
+  assert.match(html, /title="All 25 computers this organization may run at once are in use \(E2B · organization BYOK\)\. 3 tasks are ahead of this one\."/);
+  assert.match(ctx.stageIndicator(v, 't'), /title="All 25 computers/, 'the stage indicator too');
+  // In the conversation: the same one line, the detail on hover.
+  const notice = ctx.conversationWaitNotice({ ...v, taskId: 't' });
+  assert.match(notice, /^<div class="msg system wait-notice" role="status" title="All 25 computers[^"]*">Waiting for a machine · 3 ahead<\/div>$/);
+  // Other waits keep their plain status.
+  assert.doesNotMatch(ctx.viewStatusHtml({ stage: 'do', status: 'active' }), /title=/);
 });

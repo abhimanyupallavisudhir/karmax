@@ -1971,6 +1971,9 @@ export interface TaskView {
      * is resumed at the latest; `retry`: when a stage that failed on
      * infrastructure runs again (epoch ms). */
     until?: number;
+    /** A wait for a machine (`retry`, summary "Waiting for a machine"): the
+     * tasks admitted before it in its queue (src/world/machine-wait.ts). */
+    ahead?: number;
     /** `human`: how loudly the ask was raised; omitted means the inbox kind's default. */
     urgency?: Urgency;
     /** `human`: why people are asked. `input` (default) is an agent's question;

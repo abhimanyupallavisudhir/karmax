@@ -169,6 +169,28 @@ it('leaves the compute queue as soon as its machine is granted, not once its wor
   expect(queuedWhileOpening).toEqual([]);
 });
 
+// 2026-11-04: Confirm woke a parked world inside a 5-minute activity while the
+// pool was full; the lease wait outlived the activity and the landing timed
+// out without saying why. A wake now waits at most half its activity's time,
+// then gives up as a machine wait the workflow shows and retries.
+it('waits for its machine only as long as its activity allows, then says it waits for a machine', async () => {
+  const f = await fixture();
+  const scheduled = Date.now();
+  vi.spyOn(Context, 'current').mockReturnValue({ heartbeat() {}, cancellationSignal: new AbortController().signal,
+    info: { attempt: 1, workflowExecution: { runId: 'run', workflowId: 'other' }, activityId: 'a',
+      currentAttemptScheduledTimestampMs: scheduled, startToCloseTimeoutMs: 300_000 } } as any);
+  const { MachineQueued } = await import('../src/world/machine-wait.js');
+  f.runners.acquire.mockImplementation(async () => {
+    throw new MachineQueued('All 5 computers this organization may run at once are in use (E2B · organization BYOK). 2 tasks are ahead of this one.');
+  });
+  await f.store.setWorldState((await f.store.currentWorld(f.task.id))!, 'parked');
+  const failure: any = await f.core.commitWork((await f.store.currentWorld(f.task.id)) as WorldHandle, 'woken').then(() => undefined, (e) => e);
+  expect(f.runners.acquire).toHaveBeenCalledWith(expect.objectContaining({ waitUntil: scheduled + 150_000 }));
+  // The workflow waits for a machine on 'world-capacity'; the activity retries first, keeping its place.
+  expect(failure).toMatchObject({ type: 'world-capacity', nonRetryable: false });
+  expect(failure.message).toMatch(/2 tasks are ahead of this one/);
+});
+
 // Task #779 (2026-11-01 04:19:15): two activities opened its parked world at
 // once. Each saw no active lease named in the world's handle, each asked for
 // one, both were admitted in the same millisecond, and the second to publish
