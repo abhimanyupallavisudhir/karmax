@@ -7839,6 +7839,12 @@ export class Store {
         file.content ?? null, Date.now()));
   }
 
+  /** Every restic repository that was created (has its config). */
+  async resticRepositoryNames(): Promise<string[]> {
+    return ((await this.db.prepare("SELECT repository FROM resource_repository_files WHERE kind='config' ORDER BY repository").all()) as Array<{ repository: string }>)
+      .map((row) => row.repository);
+  }
+
   /** Which of `snapshots` some restic revision of the attachment names (as its
    * whole snapshot or as one of its parts): an on-demand resource's versions
    * share the snapshots of the parts they did not change. */
