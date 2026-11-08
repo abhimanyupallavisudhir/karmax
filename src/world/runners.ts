@@ -228,29 +228,50 @@ export class RunnerPoolService {
    * took: a lease taken before that generation existed, which it does not name
    * and nothing borrows, is a setup attempt that died with its worker (a
    * deploy). Left active it reads as another user of the world, which then
-   * never parks, so never moves to a new size (pramana#39). */
-  async reconcileWorldLeases(now = Date.now()): Promise<number> {
+   * never parks, so never moves to a new size (pramana#39).
+   *
+   * A world's extra lease — one its handle does not name, while the lease it
+   * names is live or the world is degraded (a passive world's go by the rule
+   * above) — is released once
+   * nothing holds it (2026-11-04: task #779's ready world kept a second lease
+   * 3.5 days and never parked; task #817's degraded world, 23 that dead
+   * restores took). Leases a handle never names are held legitimately by a
+   * terminal, review action or command (`executions`), a preview or desktop
+   * (`preview_leases`), dedicated or transient access (an access pin), and a
+   * setup or restore in flight (the world's operation); `inUse` reports the
+   * last two, from every process of the host. No rule releases a lease so held.
+   */
+  async reconcileWorldLeases(now = Date.now(), inUse: (worldId: string) => Promise<boolean> = async () => true): Promise<number> {
     let released = 0;
     for (const lease of (await this.store.unreleasedWorldLeases())) {
+      const worldId = String(lease.worldId);
       const task = (await this.store.taskMetadata(String(lease.taskId)));
-      const world = (await this.store.currentWorld(String(lease.worldId)));
-      const snapshot = (await this.store.worldStateSnapshot(String(lease.worldId)));
+      const world = (await this.store.currentWorld(worldId));
+      const snapshot = (await this.store.worldStateSnapshot(worldId));
       const passiveWorld = ['parked', 'hibernated', 'released'].includes(snapshot?.state ?? '');
       const terminal = !task || ['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? 'active');
       const stale = Number(lease.acquiredAt ?? lease.createdAt) <= now - STALE_PARKED_LEASE_MS;
-      const borrowed = (await this.store.worldLeaseHasLiveAccessor(String(lease.id), now));
+      const named = world?.meta?.worldLeaseId;
+      const unnamed = !!world && named !== lease.id;
+      // Asked last, once, and only of a candidate: it reads the host's lock table.
+      let held: Promise<boolean> | undefined;
+      const unheld = async () => !(await (held ??= (async () => (await this.store.worldLeaseHasLiveAccessor(String(lease.id), now))
+        || (await inUse(worldId)))()));
       const terminalWorkflowLease = terminal
-        && (!world || world.meta?.worldLeaseId === lease.id || (lease.state === 'active' && stale && !borrowed));
+        && (!world || named === lease.id || (lease.state === 'active' && stale && await unheld()));
       const stalePassiveLease = lease.state === 'active'
         && passiveWorld
         && stale
-        && !borrowed;
-      const deadSetupLease = !!world && !!snapshot
-        && world.meta?.worldLeaseId !== lease.id
+        && await unheld();
+      const deadSetupLease = unnamed && !!snapshot
         && Number(lease.createdAt) < snapshot.createdAt
         && stale
-        && !borrowed;
-      if (!terminalWorkflowLease && !stalePassiveLease && !deadSetupLease) continue;
+        && await unheld();
+      const extraLease = lease.state === 'active' && unnamed && stale
+        && (snapshot?.state === 'degraded'
+          || (typeof named === 'string' && (await this.store.worldLease(named))?.state === 'active'))
+        && await unheld();
+      if (!terminalWorkflowLease && !stalePassiveLease && !deadSetupLease && !extraLease) continue;
       // Reconciliation fixes an internal reservation leak; it must not bill the
       // tenant for wall time in which the provider world was already parked.
       (await this.store.releaseWorldLease(String(lease.id)));
@@ -317,7 +338,7 @@ export class WorldLifecycleManager {
   private failing = new Map<string, string>();
 
   private async sweepOnce(now: number): Promise<number> {
-    await this.step('runner leases', async () => this.runners?.reconcileWorldLeases(now));
+    await this.step('runner leases', async () => this.runners?.reconcileWorldLeases(now, (worldId) => this.worlds.inUse(worldId)));
     await this.step('checkpoint garbage', async () => this.checkpoints.collectGarbage?.());
     if (this.objects instanceof DeferredDeleteObjectStore) await this.objects.purgeDue(now).catch(() => undefined);
     await this.step('provider usage', () => this.reconcileProviderUsage(now));

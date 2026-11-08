@@ -1558,14 +1558,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   }
 
   async function ensureRunnerLease(handleInput: WorldHandle, taskId: string): Promise<WorldHandle> {
+    return (await leaseWorld(handleInput, taskId)).handle;
+  }
+
+  /** The world's handle with an active lease named in it; `taken` when this
+   * call took and published that lease (rather than finding one). */
+  async function leaseWorld(handleInput: WorldHandle, taskId: string): Promise<{ handle: WorldHandle; taken?: string }> {
     const handle = ((await store.currentWorld(handleInput.id)) ?? handleInput) as WorldHandle;
-    if (!isRemote(handle.kind) || !deps.runners) return handle;
+    if (!isRemote(handle.kind) || !deps.runners) return { handle };
     // A finished task's world was torn down on purpose. Leasing it would mark it
     // ready again and let recovery rebuild it (task #552: about 230 leases an
     // hour for eleven hours, for another task forking its agent).
     if ((await store.worldState(handle.id)) === 'released') throw new Error(`task ${handle.id}'s world was released when the task ended`);
     const existing = typeof handle.meta?.worldLeaseId === 'string' ? (await store.worldLease(handle.meta.worldLeaseId)) : undefined;
-    if (existing?.state === 'active') return handle;
+    if (existing?.state === 'active') return { handle };
     const projectId = String(handle.meta?.projectId ?? (await store.taskProjectIdAsync(taskId)) ?? '');
     const project = (await store.getProject(projectId));
     if (!project) throw new Error('cloud world has no owning project');
@@ -1580,14 +1586,24 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (error instanceof MachineQueued) throw capacityFailure(error);
       throw error;
     }
-    const next = (await store.updateWorldMeta(handle, { worldLeaseId: acquired.leaseId, runnerPoolId: acquired.runnerPoolId }));
+    // Admission waits outside the world's lock, so another opener may have
+    // been admitted alongside this one (task #779: both in one millisecond).
+    // The first to publish owns the world; this one gives its lease back, as
+    // a reservation that never ran a machine (not the billed release path).
+    const publication = await store.publishWorldLease(handle, acquired.leaseId, acquired.runnerPoolId)
+      .catch(async (error) => { (await store.releaseWorldLease(acquired.leaseId)); throw error; });
+    if (!publication.published) {
+      (await store.releaseWorldLease(acquired.leaseId));
+      return { handle: publication.handle as WorldHandle };
+    }
+    const next = publication.handle;
     (await store.setWorldState(next, 'ready'));
     (await record(taskId, 'world.lease-acquired', { leaseId: acquired.leaseId, runnerPoolId: acquired.runnerPoolId }));
     // It has its machine: it waits for room no longer, even while its world
     // opens (restoring project data can take an hour; pramana#149 kept the
     // queue's first place meanwhile and everyone behind it waited).
     await dequeue(store, taskId).catch(() => undefined);
-    return next as WorldHandle;
+    return { handle: next as WorldHandle, taken: acquired.leaseId };
   }
 
   /** The authority one task turn acts with: the stored task authorization (or
@@ -1708,10 +1724,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (recover) await restoreHibernated(handle, taskId);
       for (;;) {
         const parked = (await store.worldState(handle.id)) === 'parked';
-        const before = ((await store.currentWorld(handle.id)) ?? handle) as WorldHandle;
-        const leased = await ensureRunnerLease(handle, taskId);
-        const lease = leased.meta?.worldLeaseId;
-        const woke = parked && typeof lease === 'string' && lease !== before.meta?.worldLeaseId ? lease : undefined;
+        // Only a lease this call took: an opener that lost the race to wake
+        // it must not give back the winner's when its own open fails.
+        const { taken } = await leaseWorld(handle, taskId);
+        const woke = parked ? taken : undefined;
         const world = await (worlds.withOperation ? worlds.withOperation(handle.id, () => open(woke)) : open(woke));
         // One pull request of a task's world (SPEC §11.1): the task's world,
         // narrowed to that pull request's worktree.

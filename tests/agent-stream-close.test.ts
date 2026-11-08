@@ -47,6 +47,8 @@ interface Harness {
   /** Invoke an in-process `karmax_control` tool the way the harness does — over the
    *  control channel, which is dead once stdin has ended. */
   control(name: string, input: Record<string, unknown>): Promise<string>;
+  /** Resolves when the adapter stops the harness process (the SDK's abortController). */
+  readonly stopped: Promise<void>;
 }
 
 /** Install a scripted fake harness as the SDK's `query`, and return a handle on it. */
@@ -55,8 +57,14 @@ function fakeHarness(script: (h: Harness) => AsyncGenerator<any>, { echo = true 
   sdk.query = (args: any) => {
     const controls = controlClient(args.options.mcpServers.karmax_control);
     let inputClosed = false;
+    const signal: AbortSignal = args.options.abortController.signal;
+    const stopped = new Promise<void>((resolve) => {
+      if (signal.aborted) resolve();
+      else signal.addEventListener('abort', () => resolve(), { once: true });
+    });
     const h: Harness = {
       get inputClosed() { return inputClosed; },
+      stopped,
       async control(name, input) {
         if (inputClosed) throw new Error('Stream closed');
         return (await controls).call(name, input);
@@ -116,6 +124,7 @@ async function runTurn(reviewInfos: ReviewInfo[], extra: Partial<PlatformToolCon
 
 afterEach(() => {
   delete process.env.KARMAX_AGENT_BG_SETTLE_MS;
+  delete process.env.KARMAX_AGENT_EXIT_GRACE_MS;
 });
 
 describe('Claude Agent-SDK input stream vs. the harness control channel', () => {
@@ -429,6 +438,35 @@ describe('Claude Agent-SDK input stream vs. the harness control channel', () => 
     expect(turn.pendingBackgroundShells).toBe(1);
     expect(turn.stoppedBackgroundShells).toEqual(['Re-render full video']);
   });
+
+  // forecasting #2 (2026-11-08): the agent left a local preview server running in the
+  // background, answered, and went idle. The grace expired and the input closed, but
+  // Claude Code 2.1.319 does not exit while a background shell runs — it waits for the
+  // shell, and a server never ends — so the turn showed "Working" indefinitely.
+  // Closing the input is not enough: the harness gets a short bound to exit, then is stopped.
+  it('stops a harness that stays alive after its input closed, waiting on a never-ending shell', async () => {
+    process.env.KARMAX_AGENT_BG_SETTLE_MS = '0';
+    process.env.KARMAX_AGENT_EXIT_GRACE_MS = '50';
+    const h = fakeHarness(async function* (harness) {
+      yield { type: 'system', subtype: 'init', session_id: 'sess-12' };
+      yield { type: 'system', subtype: 'task_started', task_id: 'sh-preview', description: 'Run local preview server' };
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'Everything is live.' }] } };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-12' };
+      yield { type: 'system', subtype: 'session_state_changed', state: 'idle' };
+      // Like the real harness: alive until killed, then the SDK iterator throws.
+      await harness.stopped;
+      const abort = new Error('Claude Code process aborted by user');
+      abort.name = 'AbortError';
+      throw abort;
+    });
+
+    const turn = await runTurn([]);
+    expect(h.current!.inputClosed).toBe(true);
+    expect(turn.termination.kind).toBe('success');
+    expect(turn.output).toContain('Everything is live.');
+    expect(turn.pendingBackgroundShells).toBe(1);
+    expect(turn.stoppedBackgroundShells).toEqual(['Run local preview server']);
+  }, 5000);
 
   it('bounds the wait — a deliberately long-lived background shell cannot wedge the turn', async () => {
     // A dev server the task left running never settles. After the grace we close anyway

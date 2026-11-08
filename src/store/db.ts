@@ -7846,6 +7846,12 @@ export class Store {
         file.content ?? null, Date.now()));
   }
 
+  /** Every restic repository that was created (has its config). */
+  async resticRepositoryNames(): Promise<string[]> {
+    return ((await this.db.prepare("SELECT repository FROM resource_repository_files WHERE kind='config' ORDER BY repository").all()) as Array<{ repository: string }>)
+      .map((row) => row.repository);
+  }
+
   /** Which of `snapshots` some restic revision of the attachment names (as its
    * whole snapshot or as one of its parts): an on-demand resource's versions
    * share the snapshots of the parts they did not change. */
@@ -8052,6 +8058,28 @@ export class Store {
       .run(JSON.stringify(next), Date.now(), handle.id, handle.generation ?? 1));
     return next;
   
+    });
+  }
+
+  /** Name `leaseId` as the world's lease, unless its handle already names
+   * another active one: then that one stays, and the caller holds a duplicate
+   * it must give back (`published: false`). Checking and writing under one
+   * world lock is what keeps two openers that were admitted together from
+   * each overwriting the other's lease (task #779). */
+  async publishWorldLease(handle: WorldHandleRef, leaseId: string, runnerPoolId: string): Promise<{ handle: WorldHandleRef; published: boolean }> {
+    return this.db.transaction(async () => {
+    (await this.db.lock(`world:${handle.id}`));
+
+    const current = (await this.currentWorld(handle.id));
+    if (!current || (current.generation ?? 1) !== (handle.generation ?? 1)) throw new Error('cannot update a stale world generation');
+    const named = current.meta?.worldLeaseId;
+    if (typeof named === 'string' && named !== leaseId && (await this.worldLease(named))?.state === 'active')
+      return { handle: current, published: false };
+    const next = { ...current, meta: { ...current.meta, worldLeaseId: leaseId, runnerPoolId } };
+    (await this.db.prepare('UPDATE world_instances SET handle=?, updatedAt=? WHERE worldId=? AND generation=?')
+      .run(JSON.stringify(next), Date.now(), handle.id, handle.generation ?? 1));
+    return { handle: next, published: true };
+
     });
   }
 

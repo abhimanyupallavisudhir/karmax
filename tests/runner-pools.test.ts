@@ -1,4 +1,7 @@
 import * as __asyncCollections from '../src/util/async-collections.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { RunnerPoolService, WorldLifecycleManager } from '../src/world/runners.js';
@@ -180,11 +183,23 @@ describe('runner capacity and world lifecycle', () => {
     (await store.db.prepare('UPDATE world_instances SET createdAt=? WHERE worldId=?').run(now - 8 * 60_000, task.id));
     // Taken once the world existed: an access to it (an artifact, a terminal) or
     // a setup of its next generation still in flight. Neither is dead.
+    // Neither is dead while it holds the world (here, a terminal).
     const later = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'hetzner' });
     await at(later.leaseId, now - 5 * 60_000);
+    (await store.createExecution({ id: 'terminal', organizationId: organization.id, projectId: project.id,
+      taskId: task.id, worldId: task.id, generation: 1, kind: 'terminal', label: 'Terminal', server: false,
+      openUrls: [], runnerLeaseId: later.leaseId, state: 'running', heartbeatAt: now, startedAt: now - 5 * 60_000 }));
+    const worlds = new WorldRegistry();
+    const sweep = () => new WorldLifecycleManager(store, worlds, {} as any, 1_000, undefined, runners).sweep(now);
 
-    await new WorldLifecycleManager(store, new WorldRegistry(), {} as any, 1_000, undefined, runners).sweep(now);
+    // While something works in the world, an unnamed lease may be its: an
+    // access opened before a recovery made this generation looks just the same.
+    const unpin = await worlds.holdAccess(task.id);
+    await sweep();
+    expect((await store.worldLease(dead.leaseId))?.state).toBe('active');
+    unpin();
 
+    await sweep();
     expect((await store.worldLease(dead.leaseId))?.state).toBe('released');
     expect((await store.worldLease(own.leaseId))?.state).toBe('active');
     expect((await store.worldLease(later.leaseId))?.state).toBe('active');
@@ -869,6 +884,196 @@ describe('runner capacity and world lifecycle', () => {
     expect((await store.worldLease(lease.leaseId))?.state).toBe('released');
   });
 });
+
+// A world's extra leases (2026-11-04). Two leaks held E2B capacity for good
+// because no rule applied: task #779's ready world had a second lease, admitted
+// in the same millisecond as the one its handle names, which then kept the
+// world from ever parking (3.5 days, released by hand); task #817's degraded
+// world had 23 leases its nested restores took, newer than its snapshot. A lease
+// nothing names is not necessarily dead, though: terminals, review actions,
+// previews, desktops, dedicated access and a setup or restore in flight all hold
+// one their world's handle never names. Each of those must survive.
+describe('a world\'s extra leases', () => {
+  const now = Date.now();
+  const STALE = now - 5 * 60_000;
+
+  async function world(state: 'ready' | 'degraded', options: { owner?: 'active' | 'released'; worlds?: WorldRegistry } = {}) {
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Extra leases', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Cloud', { worldProvider: 'e2b' }, organization.id));
+    const task = (await createTask(store, project.id, 'Working'));
+    (await store.createRunnerPool({ id: `${organization.id}:managed-e2b`, organizationId: organization.id, name: 'E2B', provider: 'e2b',
+      mode: 'customer', capacity: { activeWorlds: 40, cpu: 80, memoryMb: 81_920, gpu: 0 }, enabled: true }));
+    const runners = new RunnerPoolService(store);
+    const age = async (leaseId: string, time = STALE) => (await store.db.prepare(
+      'UPDATE world_leases SET createdAt=?, acquiredAt=? WHERE id=?').run(time, time, leaseId));
+    const own = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'e2b' });
+    await age(own.leaseId, now - 60 * 60_000);
+    if (options.owner === 'released') (await store.releaseWorldLease(own.leaseId));
+    const handle = (await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
+      root: '/workspace', workspaceRoot: '/workspace', branch: `tavya/${task.id}`, base: 'main',
+      meta: { projectId: project.id, worldLeaseId: own.leaseId } }, project.id)) as any;
+    // Made before any extra lease, so the dead-setup rule never applies.
+    (await store.db.prepare('UPDATE world_instances SET createdAt=?, updatedAt=? WHERE worldId=?').run(now - 50 * 60_000, now - 50 * 60_000, task.id));
+    (await store.setWorldState(handle, state));
+    const worlds = options.worlds ?? new WorldRegistry();
+    const extra = async (time = STALE) => {
+      const lease = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'e2b' });
+      await age(lease.leaseId, time);
+      return lease.leaseId;
+    };
+    const sweep = () => new WorldLifecycleManager(store, worlds, {} as any, 1_000, undefined, runners).sweep(now);
+    const state_ = async (leaseId: string) => (await store.worldLease(leaseId))?.state;
+    return { store, organization, project, task, runners, handle, own: own.leaseId, worlds, extra, sweep, state: state_ };
+  }
+
+  it('releases a second lease on a ready world whose handle names another, live one (task #779)', async () => {
+    const w = await world('ready');
+    const leaked = await w.extra();
+    await w.sweep();
+    expect(await w.state(leaked)).toBe('released');
+    expect(await w.state(w.own)).toBe('active');
+    // Its park check now sees the world's own lease alone, so it parks again.
+    expect(await w.store.activeWorldLeaseCount(w.task.id)).toBe(1);
+  });
+
+  it('releases the leases dead restores left on a degraded world, newer than its snapshot (task #817)', async () => {
+    const w = await world('degraded', { owner: 'released' });
+    const leaked = await __asyncCollections.map(Array.from({ length: 23 }), () => w.extra());
+    await w.sweep();
+    for (const lease of leaked) expect(await w.state(lease)).toBe('released');
+    expect(await w.store.activeWorldLeaseCount(w.task.id)).toBe(0);
+  });
+
+  it('keeps an extra lease while nothing says whom it belongs to on a ready world without a live lease of its own', async () => {
+    // A world is ready but its handle names no live lease: the unnamed lease
+    // may be the only thing running it, so it is not "extra".
+    const w = await world('ready', { owner: 'released' });
+    const lease = await w.extra();
+    await w.sweep();
+    expect(await w.state(lease)).toBe('active');
+  });
+
+  it('keeps a lease admitted moments ago, before its opener could record what holds it', async () => {
+    for (const state of ['ready', 'degraded'] as const) {
+      const w = await world(state);
+      const lease = await w.extra(now - 30_000);
+      await w.sweep();
+      expect(await w.state(lease)).toBe('active');
+    }
+  });
+
+  for (const kind of ['terminal', 'review-action', 'command'] as const) {
+    it(`keeps the lease of a running ${kind} execution (unpublished, as long-lived as its process)`, async () => {
+      for (const state of ['ready', 'degraded'] as const) {
+        const w = await world(state);
+        const lease = await w.extra(now - 6 * 60 * 60_000);
+        (await w.store.createExecution({ id: `execution-${kind}`, organizationId: w.organization.id, projectId: w.project.id,
+          taskId: w.task.id, worldId: w.task.id, generation: 1, kind, label: kind, server: kind === 'review-action',
+          openUrls: [], runnerLeaseId: lease, state: 'running', heartbeatAt: now, startedAt: now - 6 * 60 * 60_000 }));
+        await w.sweep();
+        expect(await w.state(lease)).toBe('active');
+        expect(await w.state(w.own)).toBe('active');
+      }
+    });
+  }
+
+  for (const [label, port] of [['preview', 3000], ['desktop', 6080]] as const) {
+    it(`keeps the lease of a live ${label} (unpublished, up to a day)`, async () => {
+      for (const state of ['ready', 'degraded'] as const) {
+        const w = await world(state);
+        const lease = await w.extra(now - 60 * 60_000);
+        (await w.store.createPreviewLease({ id: `${label}-live`, organizationId: w.organization.id, projectId: w.project.id,
+          taskId: w.task.id, worldId: w.task.id, generation: 1, port, public: false, provider: 'e2b',
+          runnerLeaseId: lease, createdBy: 'owner', createdAt: now - 60 * 60_000, expiresAt: now + 60_000 }));
+        await w.sweep();
+        expect(await w.state(lease)).toBe('active');
+      }
+    });
+  }
+
+  it('keeps the lease of dedicated access (a desktop, a local checkout\'s publish) for as long as it is open', async () => {
+    const worlds = accessRegistry();
+    const w = await world('ready', { worlds });
+    const access = await new WorldAccessService(w.store, worlds, w.runners).open(w.task.id, w.handle, { dedicated: true });
+    expect(access.runnerLeaseId).toBeDefined();
+    (await w.store.db.prepare('UPDATE world_leases SET createdAt=?, acquiredAt=? WHERE id=?').run(STALE, STALE, access.runnerLeaseId));
+    await w.sweep();
+    expect(await w.state(access.runnerLeaseId!)).toBe('active');
+    await access.release(false);
+    expect(await w.state(access.runnerLeaseId!)).toBe('released');
+    expect(await w.state(w.own)).toBe('active');
+  });
+
+  it('keeps the lease of any access pinned to the world (an artifact, an MCP read) while it is open', async () => {
+    const w = await world('degraded', { owner: 'released' });
+    const lease = await w.extra();
+    const unpin = await w.worlds.holdAccess(w.task.id);
+    await w.sweep();
+    expect(await w.state(lease)).toBe('active');
+    unpin();
+    await w.sweep();
+    expect(await w.state(lease)).toBe('released');
+  });
+
+  it('keeps the lease of a setup or restore in flight, however long it runs, and frees it once that died', async () => {
+    const w = await world('degraded', { owner: 'released' });
+    // A restore took its lease, then provisions and restores project data
+    // (an hour for some projects) under the world's operation, naming the
+    // lease only in the generation it registers at the end.
+    const lease = await w.extra(now - 45 * 60_000);
+    let finish!: () => void;
+    const restoring = w.worlds.withOperation(w.task.id, () => new Promise<void>((resolve) => { finish = resolve; }));
+    await w.sweep();
+    expect(await w.state(lease)).toBe('active');
+    finish();
+    await restoring;
+    // It died without naming or releasing it (a worker restart, a deploy).
+    await w.sweep();
+    expect(await w.state(lease)).toBe('released');
+  });
+
+  it('sees a setup, restore or access another process of the host holds (shared world coordination)', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-coordination-'));
+    try {
+      const lifecycle = new WorldRegistry({ coordinationDirectory: directory });
+      const worker = new WorldRegistry({ coordinationDirectory: directory });
+      const w = await world('degraded', { owner: 'released', worlds: lifecycle });
+      const restore = await w.extra(now - 45 * 60_000);
+      let finish!: () => void;
+      const restoring = worker.withOperation(w.task.id, () => new Promise<void>((resolve) => { finish = resolve; }));
+      await vi.waitFor(async () => expect(await lifecycle.inUse(w.task.id)).toBe(true));
+      await w.sweep();
+      expect(await w.state(restore)).toBe('active');
+      finish();
+      await restoring;
+      const unpin = await worker.holdAccess(w.task.id);
+      await w.sweep();
+      expect(await w.state(restore)).toBe('active');
+      unpin();
+      await w.sweep();
+      expect(await w.state(restore)).toBe('released');
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('never releases the lease the world\'s handle names', async () => {
+    const w = await world('degraded');
+    await w.sweep();
+    expect(await w.state(w.own)).toBe('active');
+  });
+});
+
+/** A registry whose remote provider opens a stand-in sandbox. */
+function accessRegistry(): WorldRegistry {
+  const worlds = new WorldRegistry();
+  worlds.register({ kind: 'e2b', capabilities: { remote: true }, parkable: true,
+    open: async (handle: any) => ({ handle, listFiles: async () => [], readFile: async () => '', readFileBuffer: async () => Buffer.alloc(0),
+      writeFile: async () => {}, exec: async () => ({ stdout: '', stderr: '', code: 0 }),
+      startProcess: async () => { throw new Error('unused'); }, openPty: async () => { throw new Error('unused'); },
+      destroy: async () => {} }),
+    park: async (handle: any) => handle, status: async () => 'ready' } as any);
+  return worlds;
+}
 
 async function createTask(store: Store, projectId: string, title: string) {
   return (await store.createTask({ projectId, title, workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: title } as any }));
