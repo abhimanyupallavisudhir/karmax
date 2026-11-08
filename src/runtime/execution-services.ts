@@ -32,6 +32,7 @@ import { Vault } from '../autonomy/vault.js';
 import { recordDataEpoch } from '../config/data-epoch.js';
 import { TASK_QUEUE } from '../temporal/config.js';
 import { taskEnded } from '../world/task-ended.js';
+import { configureErrorReports } from '../platform/error-reports.js';
 
 /** Shared service construction for the gateway and a supervised activity process.
  * Only the installation bootstrap seeds profiles, imports environment credentials,
@@ -44,6 +45,9 @@ export async function createExecutionServices(input: {
   provider: Provider; bootstrap?: boolean; coordinationDirectory?: string;
 }) {
   const { store, client, broker, githubApp, p, deployment, provider, bootstrap = false, coordinationDirectory } = input;
+  // Unexpected errors in this process go to the installation's error-report
+  // project, if it has one (wiki features/error-reports).
+  configureErrorReports(store, { role: bootstrap ? 'gateway' : 'worker' });
   const worlds = new WorldRegistry({ coordinationDirectory });
   worlds.register(new WorktreeProvider(p.worlds));
   const adapters = buildAdapters();

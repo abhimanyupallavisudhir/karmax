@@ -1,4 +1,5 @@
 import { buildVersionedBundle } from './packages/bundle.js';
+import { reportError } from './platform/error-reports.js';
 import { authHosts } from './auth/origins.js';
 import { temporalConnectionFromEnv } from './temporal/connection-env.js';
 import { createExecutionServices } from './runtime/execution-services.js';
@@ -74,6 +75,7 @@ const VERSION = '1.0.0';
 function installProcessGuards(): void {
   process.on('unhandledRejection', (reason) => {
     console.error('  ⚠ unhandled rejection (app kept running):', reason instanceof Error ? reason.stack ?? reason.message : reason);
+    reportError({ kind: 'rejection', error: reason, where: 'gateway process' });
   });
 }
 
