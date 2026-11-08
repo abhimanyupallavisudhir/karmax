@@ -7899,9 +7899,9 @@ function stageLabel(v) {
 }
 
 // A task's status reads as a glyph and its label — never a pill, so it can't
-// be mistaken for a tag — and its colour says who has the ball: an agent
-// working (accent), a person asked for something (amber), the task waiting on
-// time, quota, a job or other tasks (grey), or a finished state.
+// be mistaken for a tag — and its colour says whose move it is: a person's
+// (amber), or the task's own, working or waiting on time, quota, a job or other
+// tasks (accent; the glyph tells the two apart), or a finished state.
 function statusTone(view) {
   const v = view || {};
   if (v.state?.draft) return 'draft';
@@ -7915,7 +7915,7 @@ function statusTone(view) {
   if (w?.kind === 'human') return w.reason === 'error' ? 'failed' : 'human';
   if (w?.kind === 'confirm') return 'human';
   if (w?.kind === 'account') return accountWaitReason(w) === 'login' ? 'human' : 'waiting';
-  // Grey only when the label says what it waits for (stageLabel); a passing
+  // A clock only when the label says what it waits for (stageLabel); a passing
   // wait inside a stage (an agent slot, CI) still reads as that stage, working.
   if (w?.kind === 'retry' || (v.stage === 'do' && PARKED_WAITS.has(w?.kind))) return 'waiting';
   return 'working';

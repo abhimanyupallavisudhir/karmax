@@ -26,6 +26,14 @@ const STATUS = {
   'Tinted pill + glyph': '.status { padding: 2px 8px 2px 6px; border-radius: 999px; background: color-mix(in srgb, var(--status) 14%, transparent); }',
 };
 
+// What a wait looks like: grey said "inert" like a draft; the shipped clock
+// takes the accent of a task carrying on by itself.
+const WAITING = {
+  'Grey clock (before)': '.status.waiting { --status: var(--ink-3); }',
+  'Accent clock (shipped)': '',
+  'Muted accent': '.status.waiting { --status: color-mix(in srgb, var(--accent) 55%, var(--ink-3)); }',
+};
+
 async function shot(browser, scheme, prepare, clip, file, scale = 1) {
   const context = await browser.newContext({ serviceWorkers: 'block', viewport: { width: 1280, height: 1180 }, colorScheme: scheme, deviceScaleFactor: scale });
   await statusConsole(context);
@@ -77,6 +85,13 @@ async function sheet(browser, cells, file) {
       styles.push({ name, file, width: 520 });
     }
     await sheet(browser, styles, path.join(OUT, `status-styles-${scheme}.png`));
+    const waits = [];
+    for (const [name, css] of Object.entries(WAITING)) {
+      const file = path.join(tmp, `waiting-${scheme}-${waits.length}.png`);
+      await shot(browser, scheme, (page) => css && page.addStyleTag({ content: css }), { x: 260, y: 262, width: 520, height: 820 }, file);
+      waits.push({ name, file, width: 520 });
+    }
+    await sheet(browser, waits, path.join(OUT, `waiting-tone-${scheme}.png`));
   }
   await browser.close();
   fs.rmSync(tmp, { recursive: true, force: true });
