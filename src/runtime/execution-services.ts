@@ -57,10 +57,18 @@ export async function createExecutionServices(input: {
     async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), undefined, referenceKeys));
   worlds.register(new DaytonaWorldProvider(undefined, undefined, undefined, undefined,
     async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), undefined, undefined, referenceKeys));
-  worlds.register(flyWorldProvider(async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), referenceKeys, store));
-  worlds.register(hetznerWorldProvider(async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), referenceKeys, store));
-  worlds.register(awsWorldProvider(async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), referenceKeys, store));
-  worlds.register(gcpWorldProvider(async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), referenceKeys, store));
+  for (const vmProvider of [flyWorldProvider, hetznerWorldProvider, awsWorldProvider, gcpWorldProvider]) {
+    const provider = vmProvider(async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), referenceKeys, store);
+    // A VM found stopped under a caller is started again only inside the
+    // world's transition lock, and only for a world someone is meant to use:
+    // the same holds the lifecycle sweep's stray-wake check reads (runners.ts).
+    provider.coordinate({
+      operation: (worldId, work) => worlds.withOperation(worldId, work),
+      wanted: async (worldId) => (await store.worldState(worldId)) === 'ready'
+        || (await store.activeWorldLeaseCount(worldId)) > 0 || (await worlds.hasActiveAccess(worldId)),
+    });
+    worlds.register(provider);
+  }
   if (bootstrap) {
     const unreadable: (string | undefined)[] = [];
     for (const state of ['ready', 'parked', 'hibernated', 'degraded'] as const) {

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import type { Duplex } from 'node:stream';
@@ -13,7 +14,7 @@ import { provisionGitCredentials, provisionGitRepos, runOrThrow, provisionTimeou
 import { taskBranch } from '../../domain/brand.js';
 import { timed } from '../../timing/index.js';
 import { ProviderOutage } from '../../agent/limits.js';
-import { generateSshKeyPair, quote, SshTransport, VmTransportError, type SshEndpoint } from './ssh.js';
+import { generateSshKeyPair, quote, SshTransport, VmTransportError, type SshEndpoint, type SshRecovery } from './ssh.js';
 import { VmWorld } from './world.js';
 import { VM_HOME, VM_USER, vmProvisionFailure, vmProvisionScript, vmProvisionStamp } from './provision.js';
 import type { FinalUsage } from './runs.js';
@@ -97,6 +98,16 @@ export interface VmUsageLedger {
   kvDelete(key: string): void | Promise<void>;
 }
 
+/** What a VM provider asks of the platform before it starts a machine on its own (`heal`). */
+export interface VmCoordination {
+  /** Run a world transition exclusively, as every open and park is (WorldRegistry.withOperation). */
+  operation?: <T>(worldId: string, work: () => Promise<T>) => Promise<T>;
+  /** Whether anyone is meant to be using the world: a machine stopped under a
+   * world nobody uses stays stopped (it was parked; a leftover caller must not
+   * wake it). Unset: always. */
+  wanted?: (worldId: string) => Promise<boolean>;
+}
+
 /** How long a deleted world's last usage is offered to the feed: every sweep
  * books it (by id, once) well within this, even after a provider outage. */
 const FINAL_USAGE_KEPT_MS = 3 * 86_400_000;
@@ -123,6 +134,13 @@ export class VmWorldProvider implements WorldProvider {
   private states = new Map<string, WorldLifecycleState>();
   private transports = new Map<string, SshTransport>();
   private destroyed = new WeakSet<WorldHandle>();
+  /** The latest handle each world was opened with: what a heal wakes it as. */
+  private handles = new Map<string, WorldHandle>();
+  /** One heal per world at a time; every failing call waits for it. */
+  private healing = new Map<string, Promise<boolean>>();
+  /** The world whose heal this async context runs: its own commands never heal. */
+  private healScope = new AsyncLocalStorage<string>();
+  private coordination: VmCoordination = {};
 
   constructor(readonly driver: VmDriver, private resolveConnection: Resolver, private referenceKeys?: WorldReferenceKeys,
     private options: {
@@ -132,10 +150,18 @@ export class VmWorldProvider implements WorldProvider {
       user?: string;
       home?: string;
       provision?: { stamp: string; script: string; sudo: boolean };
+      /** Test seams: SSH's handshake timeout and reconnect waits (ssh.ts). */
+      connectTimeoutMs?: number;
+      reconnectDelaysMs?: number[];
       /** Keeps what a world used last, read just before it is deleted, until the usage feed books it. */
       ledger?: VmUsageLedger;
     } = {}) {
     this.kind = driver.kind;
+  }
+
+  /** How a heal fits with the rest of the platform (execution-services.ts). */
+  coordinate(coordination: VmCoordination): void {
+    this.coordination = coordination;
   }
 
   async create(spec: WorldSpec): Promise<World> {
@@ -154,6 +180,10 @@ export class VmWorldProvider implements WorldProvider {
     // delete it rather than adopt it, so one task never bills for two.
     for (const stale of await this.driver.list(connection, labels.karmaxHome))
       if (stale.taskId === spec.taskId && stale.generation === labels.karmaxGeneration) await stale.destroy();
+    // Nor reach the new machine through a connection an earlier attempt or
+    // generation left in this process: it has the old machine's keys.
+    this.dropTransport(spec.taskId);
+    this.handles.delete(spec.taskId);
     const host = generateSshKeyPair('karmax-host');
     const client = generateSshKeyPair(`karmax-${spec.taskId}`);
     const keys: VmBootKeys = { hostPrivateKey: host.privateKey, authorizedKey: client.publicKey };
@@ -190,6 +220,7 @@ export class VmWorldProvider implements WorldProvider {
           ? { warnings: [...(allocation.warnings ?? []), ...provisioned.warnings] } : {}),
       };
       this.states.set(spec.taskId, 'ready');
+      this.handles.set(spec.taskId, handle);
       return this.world(handle, connection, sealed, transport);
     } catch (error) {
       this.dropTransport(spec.taskId);
@@ -201,51 +232,132 @@ export class VmWorldProvider implements WorldProvider {
   async open(handle: WorldHandle, options?: WorldOpenOptions): Promise<World> {
     const sealed = this.reference(handle);
     const connection = await this.connection(connectionScope(sealed));
-    let transport = this.transports.get(handle.id);
-    if (!transport || this.states.get(handle.id) === 'parked') {
-      const state = await this.driver.state(connection, sealed);
-      if (state === 'missing') throw Object.assign(new Error(`the ${this.driver.name} machine of this world no longer exists`), { status: 404 });
-      if (state !== 'ready' && options?.wake === false) throw new WorldNotRunningError();
-      transport = this.transportFor(handle.id, connection, sealed);
-      if (state !== 'ready') {
-        const shape = await this.shapeOf(handle, connection);
-        // Who wakes a stopped machine, for when one is found running while its
-        // world is parked (the lifecycle sweep's stray-wake check).
-        console.info(`[${this.kind}] waking ${handle.id} from ${state}: ${wakeCaller()}`);
-        try {
-          await timed(`${this.kind}.start`, () => this.driver.start(connection, sealed, shape, keysOf(sealed)));
-          transport.reset();
-          const reachable = () => timed(`${this.kind}.reachable`, () => waitReachable(transport!, this.options.reachableMs ?? REACHABLE_MS));
-          try { await reachable(); }
-          catch (error) {
-            // A machine that never answers is broken, not busy; the world is its volume.
-            if (!(error instanceof MachineUnreachable) || !this.driver.replace) throw error;
-            console.warn(`[${this.kind}] ${handle.id}: the woken machine never answered SSH, so it is replaced`);
-            await timed(`${this.kind}.replace`, () => this.driver.replace!(connection, sealed, shape, keysOf(sealed)));
-            transport.reset();
-            await reachable();
-          }
-          await this.ensureProvisioned(transport);
-        } catch (error) {
-          // A wake that fails leaves the world as it found it, parked: not a
-          // machine billing for nothing until someone notices.
-          this.dropTransport(handle.id);
-          await this.driver.stop(connection, sealed).catch(() => undefined);
-          this.states.set(handle.id, 'parked');
-          throw error;
-        }
-      } else {
-        // Running, but this process has not reached it yet: another one may
-        // have just woken it, and it is still booting. Answers at once if not.
-        await timed(`${this.kind}.reachable`, () => waitReachable(transport!, this.options.reachableMs ?? REACHABLE_MS));
-      }
+    this.handles.set(handle.id, handle);
+    const cached = this.transports.get(handle.id);
+    // Only a live connection vouches for a machine. What this process
+    // remembers does not: another one (the lifecycle sweep, a park, the
+    // console) may have stopped it since, and a world opened on that memory
+    // failed every turn for hours (pramana#137, 2026-11-08).
+    if (cached?.connected && this.states.get(handle.id) !== 'parked') {
       this.states.set(handle.id, 'ready');
-      const world = this.world(handle, connection, sealed, transport);
-      await this.replayHooks(world, transport);
-      return world;
+      return this.world(handle, connection, sealed, cached);
+    }
+    const state = await this.driver.state(connection, sealed);
+    if (state === 'missing') throw this.gone();
+    if (state !== 'ready' && options?.wake === false) throw new WorldNotRunningError();
+    const transport = this.transportFor(handle.id, connection, sealed);
+    // Who wakes a stopped machine, for when one is found running while its
+    // world is parked (the lifecycle sweep's stray-wake check).
+    if (state !== 'ready') console.info(`[${this.kind}] waking ${handle.id} from ${state}: ${wakeCaller()}`);
+    await this.bringUp(handle, connection, sealed, transport, state);
+    const world = this.world(handle, connection, sealed, transport);
+    await this.replayHooks(world, transport);
+    return world;
+  }
+
+  /**
+   * Make the machine answer SSH: start a stopped one; wait for a running one
+   * (another process may have just woken it, and it is still booting) and
+   * restart it if it never answers — a machine that runs but does not answer
+   * is broken, not busy, and the world is its volume. A start that fails
+   * leaves the world as it found it, parked: not a machine billing for
+   * nothing until someone notices.
+   */
+  private async bringUp(handle: WorldHandle, connection: ResolvedWorldProviderConnection, sealed: Record<string, string>,
+    transport: SshTransport, state: WorldLifecycleState | undefined): Promise<void> {
+    const reachable = () => timed(`${this.kind}.reachable`, () => waitReachable(transport, this.options.reachableMs ?? REACHABLE_MS));
+    let started = state !== 'ready';
+    try {
+      if (started) {
+        const shape = await this.shapeOf(handle, connection);
+        await timed(`${this.kind}.start`, () => this.driver.start(connection, sealed, shape, keysOf(sealed)));
+        transport.reset();
+      }
+      try { await reachable(); }
+      catch (error) {
+        if (!(error instanceof MachineUnreachable)) throw error;
+        console.warn(`[${this.kind}] ${handle.id}: the ${started ? 'woken' : 'running'} machine never answered SSH, so it is ${this.driver.replace ? 'replaced' : 'restarted'}`);
+        started = true;
+        await this.restart(handle, connection, sealed);
+        transport.reset();
+        await reachable();
+      }
+      if (started) await this.ensureProvisioned(transport);
+    } catch (error) {
+      // Only a machine this call started is stopped again: a running one may
+      // be another process's, and failing to reach it once proves nothing.
+      if (started) {
+        this.dropTransport(handle.id);
+        await this.driver.stop(connection, sealed).catch(() => undefined);
+        this.states.set(handle.id, 'parked');
+      }
+      throw error;
     }
     this.states.set(handle.id, 'ready');
-    return this.world(handle, connection, sealed, transport);
+  }
+
+  /** A new machine on the volume where the driver can make one, else a stop and start. */
+  private async restart(handle: WorldHandle, connection: ResolvedWorldProviderConnection, sealed: Record<string, string>): Promise<void> {
+    const shape = await this.shapeOf(handle, connection);
+    if (this.driver.replace) {
+      await timed(`${this.kind}.replace`, () => this.driver.replace!(connection, sealed, shape, keysOf(sealed)));
+      return;
+    }
+    await timed(`${this.kind}.stop`, () => this.driver.stop(connection, sealed));
+    await timed(`${this.kind}.start`, () => this.driver.start(connection, sealed, shape, keysOf(sealed)));
+  }
+
+  /**
+   * The answer to a transport that cannot reach its machine (`SshRecovery`):
+   * ask the cloud what the machine is, rather than retrying blind or trusting
+   * this process's memory. Stopped under a world someone uses (the sweep
+   * stopped it in the same second a turn leased it, pramana#137; a provider
+   * stopped it for maintenance; it crashed): start it, as an open would.
+   * Gone: say so, so the world is recovered from its checkpoint. Running but
+   * deaf through every reconnect: restart it. The same rule for every caller
+   * — a turn, a checkpoint, a review, a sub-task's branch — and every cloud.
+   */
+  private heal(id: string, connection: ResolvedWorldProviderConnection, sealed: Record<string, string>,
+    transport: SshTransport): SshRecovery {
+    return async ({ error, exhausted }) => {
+      const handle = this.handles.get(id);
+      // A world still being made, or a heal's own commands: the caller's retries decide.
+      if (!handle || this.healScope.getStore() === id) return false;
+      const operation = this.coordination.operation ?? (<T>(_id: string, work: () => Promise<T>) => work());
+      // Exclusive with every other transition of the world (an open, a park,
+      // the sweep's stop); joined only once inside it, so a caller that holds
+      // the transition never waits for a heal that waits for it.
+      return operation(id, async () => {
+        const running = this.healing.get(id);
+        if (running) return running;
+        const healed = this.healScope.run(id, async () => {
+          if (this.transports.get(id) !== transport) return false; // parked or destroyed meanwhile
+          const state = await this.driver.state(connection, sealed).catch(() => undefined);
+          if (state === 'missing') throw this.gone({ cause: error });
+          if (state === undefined) return false; // the cloud does not answer either: the caller's waits, then world-infra
+          if (state !== 'ready') {
+            if (this.coordination.wanted && !(await this.coordination.wanted(id))) {
+              this.states.set(id, 'parked');
+              throw Object.assign(new WorldNotRunningError(), { cause: error });
+            }
+            console.warn(`[${this.kind}] ${id}: its machine stopped while in use (${error.message}), so it is started again: ${wakeCaller()}`);
+          } else {
+            if (!exhausted) return false;
+            console.warn(`[${this.kind}] ${id}: its running machine has not answered SSH through every reconnect (${error.message})`);
+          }
+          await this.bringUp(handle, connection, sealed, transport, state);
+          await this.replayHooks(this.world(handle, connection, sealed, transport), transport);
+          return true;
+        });
+        this.healing.set(id, healed);
+        try { return await healed; }
+        finally { if (this.healing.get(id) === healed) this.healing.delete(id); }
+      });
+    };
+  }
+
+  private gone(options?: { cause?: unknown }): Error {
+    return Object.assign(new Error(`the ${this.driver.name} machine of this world no longer exists`, options), { status: 404 });
   }
 
   async park(handle: WorldHandle): Promise<WorldHandle> {
@@ -271,6 +383,7 @@ export class VmWorldProvider implements WorldProvider {
     this.dropTransport(handle.id);
     await this.destroyBooked(connection, scope, sealed, () => this.driver.destroy(connection, sealed));
     this.states.delete(handle.id);
+    this.handles.delete(handle.id);
     this.destroyed.add(handle);
   }
 
@@ -448,9 +561,15 @@ export class VmWorldProvider implements WorldProvider {
   private transportFor(id: string, connection: ResolvedWorldProviderConnection, sealed: Record<string, string>): SshTransport {
     let transport = this.transports.get(id);
     if (!transport) {
+      let recover: SshRecovery = async () => false;
       transport = new SshTransport(async () => ({ ...(await this.driver.endpoint(connection, sealed)),
-        hostKey: sealed.hostKey!, username: this.options.user ?? VM_USER, privateKey: sealed.sshKey! }),
-      this.options.socket ? { socket: this.options.socket } : {});
+        hostKey: sealed.hostKey!, username: this.options.user ?? VM_USER, privateKey: sealed.sshKey! }), {
+        ...(this.options.socket ? { socket: this.options.socket } : {}),
+        ...(this.options.connectTimeoutMs ? { connectTimeoutMs: this.options.connectTimeoutMs } : {}),
+        ...(this.options.reconnectDelaysMs ? { reconnectDelaysMs: this.options.reconnectDelaysMs } : {}),
+        recover: (failure) => recover(failure),
+      });
+      recover = this.heal(id, connection, sealed, transport);
       this.transports.set(id, transport);
     }
     return transport;

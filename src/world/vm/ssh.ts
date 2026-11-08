@@ -27,10 +27,13 @@ export interface SshEndpoint {
 export class VmTransportError extends Error {
   readonly code = 'ECONNRESET';
   readonly retryable: boolean;
-  constructor(message: string, options?: { cause?: unknown; retryable?: boolean }) {
+  /** No connection could be made at all (not one that dropped). */
+  readonly unreachable: boolean;
+  constructor(message: string, options?: { cause?: unknown; retryable?: boolean; unreachable?: boolean }) {
     super(message, options);
     this.name = 'VmTransportError';
     this.retryable = options?.retryable ?? true;
+    this.unreachable = options?.unreachable ?? false;
   }
 }
 
@@ -81,6 +84,19 @@ const CONNECT_TIMEOUT_MS = 30_000;
  * a VM whose sshd stalls under load within seconds. Longer outages are the
  * caller's (world-infra: Temporal's retries, then the workflow's). */
 const RECONNECT_DELAYS_MS = [1_000, 3_000, 10_000];
+/** Recoveries one call may ride out: a machine stopped under it, then once more. */
+const MAX_RECOVERIES = 2;
+
+/**
+ * The transport's question to whoever owns the machine, after a failure it
+ * would retry: is there something to do about it? The owner asks the cloud.
+ * Resolves true once it has started or restarted the machine (try again now),
+ * false when there is nothing to do yet (the machine runs: wait and dial
+ * again); throws what the failure really is when retrying is pointless (the
+ * machine is gone, or stopped and wanted by nobody). `exhausted`: the waits
+ * are over, so a running machine that still does not answer is broken.
+ */
+export type SshRecovery = (failure: { error: VmTransportError; exhausted: boolean }) => Promise<boolean>;
 
 /**
  * Every command runs under this wrapper ($1 id, $2 command, $3 receipts the
@@ -152,7 +168,12 @@ export class SshTransport {
     connectTimeoutMs?: number;
     keepaliveMs?: number;
     reconnectDelaysMs?: number[];
+    /** Asked after every failure the transport would retry (`SshRecovery`). */
+    recover?: SshRecovery;
   } = {}) {}
+
+  /** Whether a connection is open now (it may still have died unnoticed). */
+  get connected(): boolean { return this.live !== undefined; }
 
   /** Dial (or reuse) the connection. */
   async connection(): Promise<Client> {
@@ -166,10 +187,16 @@ export class SshTransport {
   }
 
   private async dial(): Promise<Client> {
-    const endpoint = await this.endpoint();
-    const sock = await (this.options.socket ?? defaultSocket)(endpoint).catch((error) => {
+    // A cloud that finds no running machine to name (Hetzner, AWS, Google
+    // Cloud) says so here: unreachable, like a machine that does not answer.
+    const endpoint = await this.endpoint().catch((error) => {
       throw error instanceof VmTransportError ? error
-        : new VmTransportError(`could not reach the VM at ${endpoint.host}:${endpoint.port}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+        : new VmTransportError(error instanceof Error ? error.message : String(error), { cause: error, unreachable: true });
+    });
+    const sock = await (this.options.socket ?? defaultSocket)(endpoint).catch((error) => {
+      throw new VmTransportError(error instanceof VmTransportError ? error.message
+        : `could not reach the VM at ${endpoint.host}:${endpoint.port}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error, unreachable: true });
     });
     const expected = Buffer.from(endpoint.hostKey.trim().split(/\s+/)[1] ?? '', 'base64');
     if (!expected.length) throw new Error('VM host key is missing');
@@ -185,11 +212,11 @@ export class SshTransport {
       };
       client.on('ready', () => { ready = true; this.live = client; resolve(client); });
       client.on('error', (error) => {
-        if (!ready) reject(new VmTransportError(`could not reach the VM over SSH: ${error.message}`, { cause: error }));
+        if (!ready) reject(new VmTransportError(`could not reach the VM over SSH: ${error.message}`, { cause: error, unreachable: true }));
         forget();
       });
       client.on('close', () => {
-        if (!ready) reject(new VmTransportError('the VM closed the SSH connection before it was ready'));
+        if (!ready) reject(new VmTransportError('the VM closed the SSH connection before it was ready', { unreachable: true }));
         forget();
       });
       client.connect({
@@ -209,14 +236,39 @@ export class SshTransport {
 
   /** Do `operation` again after a retryable transport failure, dialing anew. */
   private async reconnecting<T>(operation: () => Promise<T>): Promise<T> {
-    const delays = this.options.reconnectDelaysMs ?? RECONNECT_DELAYS_MS;
-    for (let attempt = 0; ; attempt++) {
+    const retries = this.retries();
+    for (;;) {
       try { return await operation(); }
-      catch (error) {
-        if (!(error instanceof VmTransportError) || !error.retryable || this.closed || attempt >= delays.length) throw error;
-        await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
-      }
+      catch (error) { await retries.after(error); }
     }
+  }
+
+  /**
+   * What follows a failed attempt, for one call: throw, or return once it is
+   * worth trying again. A connection that could not be made at all is first
+   * put to `recover`, which asks the cloud what the machine is (stopped under
+   * us, gone, or running): a machine it started or restarted is tried again
+   * at once, with the full schedule again; otherwise the next wait. A dropped
+   * connection just dials again. Failures that outlast the schedule are not
+   * the transport's to judge alone: `recover` has the last word (`exhausted`).
+   */
+  private retries(): { after(error: unknown): Promise<void> } {
+    const delays = this.options.reconnectDelaysMs ?? RECONNECT_DELAYS_MS;
+    let attempt = 0, recoveries = 0;
+    return {
+      after: async (error) => {
+        if (!(error instanceof VmTransportError) || !error.retryable || this.closed) throw error;
+        const exhausted = attempt >= delays.length;
+        if (this.options.recover && recoveries < MAX_RECOVERIES && (error.unreachable || exhausted)
+          && await this.options.recover({ error, exhausted })) {
+          recoveries++;
+          attempt = 0;
+          return;
+        }
+        if (exhausted) throw error;
+        await new Promise((resolve) => setTimeout(resolve, delays[attempt++]));
+      },
+    };
   }
 
   /** One channel, once: failures before the command starts are retryable. */
@@ -379,8 +431,8 @@ export class SshTransport {
    * dropped connection resumes the read from the byte it reached. */
   async *readStream(remotePath: string, range: { start?: number; end?: number } = {}): AsyncGenerator<Buffer> {
     let position = range.start ?? 0;
-    const delays = this.options.reconnectDelaysMs ?? RECONNECT_DELAYS_MS;
-    for (let failures = 0; ; ) {
+    const retries = this.retries();
+    for (;;) {
       let session: Promise<SFTPWrapper> | undefined;
       try {
         session = this.sftp();
@@ -406,9 +458,8 @@ export class SshTransport {
           stream.destroy();
         }
       } catch (error) {
-        if (!(error instanceof VmTransportError) || !error.retryable || this.closed || failures >= delays.length) throw error;
-        this.forgetSftp(session);
-        await new Promise((resolve) => setTimeout(resolve, delays[failures++]));
+        if (error instanceof VmTransportError) this.forgetSftp(session);
+        await retries.after(error);
       }
     }
   }

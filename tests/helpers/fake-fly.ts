@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import type { Duplex } from 'node:stream';
+import { Duplex } from 'node:stream';
 import type { SshEndpoint } from '../../src/world/vm/ssh.js';
 import { startLocalSshd, type LocalSshd } from './local-sshd.js';
 
@@ -29,6 +29,14 @@ export class FakeFly {
   /** Fly's eventual consistency: this many GETs of a just-created machine answer 404. */
   notFoundAfterCreate = 0;
   private unseen = new Map<string, number>();
+  /** What Fly's edge does for an app whose machine does not answer: refuse,
+   * or (as production does) take the TLS connection and never speak SSH, so
+   * the client waits for its handshake until it times out (pramana#137). */
+  silentEdge = false;
+  /** Machines that run but whose sshd never answers (a hung VM). */
+  deaf = new Set<string>();
+  /** Every connection the edge has handed out, per machine. */
+  private connections = new Map<string, Set<Duplex>>();
   readonly root = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-fly-'));
   /** The VM home every machine sees: a symlink to its volume while it runs. */
   readonly home = path.join(this.root, 'home');
@@ -157,7 +165,22 @@ export class FakeFly {
     machine.events.push({ type: 'start', status: 'started', timestamp: Date.now() });
   }
 
-  private async halt(machine: { state: string; events: any[]; sshd?: LocalSshd }): Promise<void> {
+  /** The machine hangs: its connections die and new ones get no answer, until it restarts. */
+  deafen(machineId: string): void {
+    this.deaf.add(machineId);
+    for (const socket of this.connections.get(machineId) ?? []) socket.destroy();
+  }
+
+  /** Stop a machine behind karmax's back (another process, Fly itself). */
+  async stopOutOfBand(machineId: string): Promise<void> {
+    await this.halt(this.machines.get(machineId)!);
+  }
+
+  private async halt(machine: { id?: string; state: string; events: any[]; sshd?: LocalSshd }): Promise<void> {
+    if (machine.id) {
+      this.deaf.delete(machine.id);
+      for (const socket of this.connections.get(machine.id) ?? []) socket.destroy();
+    }
     await machine.sshd?.stop();
     machine.sshd = undefined;
     if (machine.state === 'started') machine.events.push({ type: 'exit', status: 'stopped', timestamp: Date.now() });
@@ -170,9 +193,17 @@ export class FakeFly {
     if (endpoint.port !== 443 || endpoint.tls?.servername !== endpoint.host) throw new Error('not through the TLS edge');
     if (!this.apps.get(app)?.ips.includes('shared_v4')) throw new Error(`${endpoint.host} has no address`);
     const machine = [...this.machines.values()].find((value) => value.app === app && value.sshd);
-    if (!machine) throw Object.assign(new Error('connection refused'), { code: 'ECONNREFUSED' });
+    if (!machine || this.deaf.has(machine.id)) {
+      if (!this.silentEdge && !machine) throw Object.assign(new Error('connection refused'), { code: 'ECONNREFUSED' });
+      return new Duplex({ read() {}, write(_chunk, _encoding, done) { done(); } }); // accepted, and never a byte back
+    }
     return new Promise((resolve, reject) => {
-      const socket = net.connect(machine.sshd!.endpoint.port, '127.0.0.1', () => resolve(socket));
+      const socket = net.connect(machine.sshd!.endpoint.port, '127.0.0.1', () => {
+        const open = this.connections.get(machine.id) ?? new Set<Duplex>();
+        this.connections.set(machine.id, open.add(socket));
+        socket.once('close', () => open.delete(socket));
+        resolve(socket);
+      });
       socket.on('error', reject);
     });
   };
