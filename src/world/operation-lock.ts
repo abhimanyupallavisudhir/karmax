@@ -10,6 +10,11 @@ export class WorldOperationLock {
 
   constructor(private shared?: { operation<T>(worldId: string, work: () => Promise<T>): Promise<T> }) {}
 
+  /** Whether an operation on `worldId` runs or waits in this process. */
+  busy(worldId: string): boolean {
+    return this.tails.has(worldId);
+  }
+
   async run<T>(worldId: string, operation: () => Promise<T>): Promise<T> {
     const inherited = this.scopes.getStore();
     if (inherited?.get(worldId)?.active) return operation();

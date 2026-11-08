@@ -168,3 +168,38 @@ it('leaves the compute queue as soon as its machine is granted, not once its wor
   await f.core.commitWork((await f.store.currentWorld(f.task.id)) as WorldHandle, 'woken');
   expect(queuedWhileOpening).toEqual([]);
 });
+
+// Task #779 (2026-11-01 04:19:15): two activities opened its parked world at
+// once. Each saw no active lease named in the world's handle, each asked for
+// one, both were admitted in the same millisecond, and the second to publish
+// overwrote the first's `worldLeaseId`. The lease it overwrote was named by
+// nothing, kept the world from ever parking (its park check counts every other
+// lease as a user) and held E2B capacity for 3.5 days until released by hand.
+it('publishes one lease when two openers wake a parked world at once, and gives back the other', async () => {
+  const f = await fixture();
+  await f.store.setWorldState((await f.store.currentWorld(f.task.id))!, 'parked');
+  await f.store.updateWorldMeta((await f.store.currentWorld(f.task.id))!, { worldLeaseId: null });
+  // Both admissions are in flight before either publishes.
+  const acquire = f.runners.acquire.getMockImplementation()!;
+  let arrived = 0;
+  let admitBoth!: () => void;
+  const bothArrived = new Promise<void>((resolve) => { admitBoth = resolve; });
+  f.runners.acquire.mockImplementation(async (input: any) => {
+    if (++arrived === 2) admitBoth();
+    await bothArrived;
+    return acquire(input);
+  });
+  const handle = (await f.store.currentWorld(f.task.id)) as WorldHandle;
+  await Promise.all([f.core.commitWork(handle, 'first opener'), f.core.commitWork(handle, 'second opener')]);
+
+  expect(f.runners.acquire).toHaveBeenCalledTimes(2);
+  const named = (await f.store.currentWorld(f.task.id))?.meta?.worldLeaseId;
+  expect(f.leases).toContain(named);
+  expect((await f.store.worldLease(String(named)))?.state).toBe('active');
+  expect(await f.store.activeWorldLeaseCount(f.task.id)).toBe(1);
+  const lost = f.leases.find((id) => id !== named)!;
+  expect((await f.store.worldLease(lost))?.state).toBe('released');
+  // Only the published lease is reported as the world's.
+  const acquired = (await f.store.eventsSince(f.task.id, 0)).filter((event) => event.type === 'world.lease-acquired');
+  expect(acquired.map((event) => (event.payload as { leaseId: string }).leaseId)).toEqual([named]);
+});

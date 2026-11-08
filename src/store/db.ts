@@ -8054,6 +8054,28 @@ export class Store {
     });
   }
 
+  /** Name `leaseId` as the world's lease, unless its handle already names
+   * another active one: then that one stays, and the caller holds a duplicate
+   * it must give back (`published: false`). Checking and writing under one
+   * world lock is what keeps two openers that were admitted together from
+   * each overwriting the other's lease (task #779). */
+  async publishWorldLease(handle: WorldHandleRef, leaseId: string, runnerPoolId: string): Promise<{ handle: WorldHandleRef; published: boolean }> {
+    return this.db.transaction(async () => {
+    (await this.db.lock(`world:${handle.id}`));
+
+    const current = (await this.currentWorld(handle.id));
+    if (!current || (current.generation ?? 1) !== (handle.generation ?? 1)) throw new Error('cannot update a stale world generation');
+    const named = current.meta?.worldLeaseId;
+    if (typeof named === 'string' && named !== leaseId && (await this.worldLease(named))?.state === 'active')
+      return { handle: current, published: false };
+    const next = { ...current, meta: { ...current.meta, worldLeaseId: leaseId, runnerPoolId } };
+    (await this.db.prepare('UPDATE world_instances SET handle=?, updatedAt=? WHERE worldId=? AND generation=?')
+      .run(JSON.stringify(next), Date.now(), handle.id, handle.generation ?? 1));
+    return { handle: next, published: true };
+
+    });
+  }
+
   /** The worlds that hold a machine or disk at their provider (running,
    * parked or lost), with their tasks, in these projects: what each task holds. */
   async heldWorlds(projectIds: string[]): Promise<Array<{ handle: WorldHandleRef; state: string; updatedAt: number;
