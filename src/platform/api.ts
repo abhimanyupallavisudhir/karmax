@@ -56,6 +56,7 @@ import { ANY_PROVIDER, applyComputer, assertInFlightComputerEdit, computerOf, co
   type ComputerSpec, type MachineShape, worldMachine } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { splitSharedSettings } from '../domain/shared-settings.js';
+import { coordinatorSetting, normalizeCoordinatorSetting } from '../domain/coordinator.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM, applyRepoBranches, normalizeRepoBranches, repositoryBranchDefaults } from './branch-defaults.js';
 import { withTimeout } from '../util/timeout.js';
 import path from 'node:path';
@@ -482,6 +483,27 @@ function subTaskParentEnded(parent: TaskRecord): string | undefined {
   if (view && (['done', 'cancelled', 'failed'].includes(view.status) || ['done', 'cancelled'].includes(view.stage)))
     return `its parent task has ${view.status === 'failed' ? 'failed' : 'ended'}`;
   return undefined;
+}
+
+/** Validate a task's permanent co-ordinator setting (`params.coordinator`,
+ * wiki features/coordinator), normalized in place. Only a top-level Software
+ * dev task that runs once can be one: it never finishes. */
+function assertCoordinatorSetting(params: Record<string, unknown>, workflow: string, parentTaskId?: string): void {
+  const setting = normalizeCoordinatorSetting(params.coordinator);
+  if (!setting) { delete params.coordinator; return; }
+  params.coordinator = setting;
+  if (workflow !== 'software-dev') throw new ValidationError('Only a Software dev task can be a permanent co-ordinator');
+  if (parentTaskId) throw new ValidationError("A sub-task can't be a permanent co-ordinator");
+  if (params.repeatable === true) throw new ValidationError("A repeatable task can't be a permanent co-ordinator: it never finishes");
+}
+
+/** A permanent co-ordinator's run: it knows it is one, and its own work always
+ * lands branch by branch, never as the proposal that finishes a task. */
+function withCoordinator(input: TaskInput, params: Record<string, unknown>): void {
+  const setting = coordinatorSetting(params);
+  if (!setting || input.parentTaskId || input.shippedFrom) return;
+  input.coordinator = setting;
+  input.project = { ...input.project, multiPr: true };
 }
 
 export class KarmaxApi {
@@ -1625,6 +1647,7 @@ export class KarmaxApi {
     // authorization, credentials and GitHub account: nobody grants it again
     // (src/platform/avatars.ts). Everything else is granted by the caller.
     const mainAvatar = (await this.assertAvatarSetting(caller, project, args.params ?? {}));
+    if (args.params) assertCoordinatorSetting(args.params, workflow);
     const organizationId = project.organizationId ?? 'org_personal';
     const orgVault = (await this.deps.store.getSettings(`organization:${organizationId}`, 'vault')) ?? {};
     const projectVault = (await this.deps.store.getSettings(project.id, 'vault')) ?? {};
@@ -1983,6 +2006,7 @@ export class KarmaxApi {
     });
     input.createdAt = task.createdAt;
     input.workflow = workflow;
+    withCoordinator(input, task.params);
     input.grant = authorization.capabilities;
     input.grantPrincipal = mainAvatar ? avatarPrincipal(mainAvatar.id) : caller.principal;
     input.delegationId = delegation?.id;
@@ -2311,6 +2335,7 @@ export class KarmaxApi {
       || transferLock && JSON.parse(transferLock).expiresAt > Date.now()
       || await this.deps.store.kvGet(`project-transfer-history:${task.id}`))
       throw new ValidationError('Project moved or is moving. Reload and start a new task.');
+    withCoordinator(input, task.params);
     return { startType, input, version: manifest.version };
   }
 
@@ -3655,6 +3680,7 @@ export class KarmaxApi {
     };
     const base: Record<string, unknown> = opts.replace ? { ...meta, ...params } : { ...task.params, ...params };
     if (project) (await this.assertAvatarSetting(caller, project, base, taskId));
+    assertCoordinatorSetting(base, task.workflow, task.parentTaskId);
     // Validate the edited triggers before anything is written: a rejected edit
     // (a cycle, a dangling or self dependency) must leave the task as it was,
     // still armed. Saving first left it un-armed with the bad triggers stored,
@@ -6519,6 +6545,32 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
   /** Restart a terminally failed software-dev execution without running Setup.
    * Setup's createWorld deliberately replaces stale worktrees; doing that here
    * would erase the exact dirty work a recovery exists to preserve. */
+  /** When each failed co-ordinator was last tried, so one that cannot be
+   * recovered is tried once an interval rather than every sweep. */
+  private readonly coordinatorRevivals = new Map<string, number>();
+
+  /** Restart every permanent co-ordinator whose run failed outright, once its
+   * interval has passed since it failed (wiki features/coordinator), as its
+   * Retry would. Its failure was a critical ask meanwhile. Returns those restarted. */
+  async reviveFailedCoordinators(now = Date.now()): Promise<string[]> {
+    const revived: string[] = [];
+    for (const { id, wakeHours, failedAt } of (await this.deps.store.failedCoordinators())) {
+      const interval = wakeHours * 3_600_000;
+      if (now < failedAt + interval || now < (this.coordinatorRevivals.get(id) ?? 0) + interval) continue;
+      this.coordinatorRevivals.set(id, now);
+      try {
+        await this.recoverFailedTask(id);
+        revived.push(id);
+        this.coordinatorRevivals.delete(id);
+        (await this.deps.store.appendEvent({ taskId: id, type: 'coordinator.revived', ts: now, payload: { failedAt, wakeHours } }));
+      } catch (error) {
+        (await this.deps.store.appendEvent({ taskId: id, type: 'coordinator.revival-failed', ts: now,
+          payload: { error: String(error instanceof Error ? error.message : error).slice(0, 800) } }).catch(() => undefined));
+      }
+    }
+    return revived;
+  }
+
   private async recoverFailedTask(taskId: string): Promise<void> {
     const task = (await this.deps.store.getTask(taskId));
     const view = task?.lastView;

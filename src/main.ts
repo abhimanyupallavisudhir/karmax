@@ -582,6 +582,11 @@ async function main() {
   const serviceLimitsTimer = new AsyncInterval(() => serviceLimits.run(), 15 * 60_000);
   serviceLimitsTimer.unref();
   startupJobs.push(() => serviceLimitsTimer.run());
+  // A permanent co-ordinator whose run failed outright is restarted once its
+  // interval has passed (wiki features/coordinator): it never stays down.
+  const coordinatorRevival = new AsyncInterval(() => api.reviveFailedCoordinators().then(() => undefined), 5 * 60_000);
+  coordinatorRevival.unref();
+  startupJobs.push(() => coordinatorRevival.run());
   // Reconcile missed notification close events without delaying the first API response.
   const inboxCleanup = new AsyncInterval(() => store.pruneStaleInbox().then(() => undefined), 3600_000);
   inboxCleanup.unref();
