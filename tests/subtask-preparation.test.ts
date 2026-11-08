@@ -132,7 +132,7 @@ it('prepareChildTask heartbeats the save\'s progress and creates nothing when it
     throw new ResourceKeptChangingError('raw_data', ['server.log'], 1);
   });
   const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
-    profiles: new ProfileResolver(store, 'mock'), resources: { snapshotForks } as any });
+    profiles: new ProfileResolver(store, 'mock'), resources: { snapshotForks, openingWith: (_open: unknown, work: () => Promise<unknown>) => work() } as any });
   const failure = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id, title: 'Child', prompt: 'work',
     base: 'main', target: 'main', parentBranch: handle.branch, project: {}, profiles: {} } as any).then(() => undefined, (e) => e);
   // Saving again at once would find the writer still running: the agent is told instead.
