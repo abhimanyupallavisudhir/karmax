@@ -1299,8 +1299,17 @@ export class Store {
           END LOOP;
           RETURN NULL;
         END'`);
-      for (const [table, ns] of Object.entries(SEQ_KEYS))
+      // Only when the default differs: ALTER TABLE takes an ACCESS EXCLUSIVE
+      // lock, which waits behind any open reader of the table — a pg_dump
+      // backup holds one for minutes — until the statement timeout fails the
+      // boot (2026-11-08, during a deploy's pre-update backup).
+      for (const [table, ns] of Object.entries(SEQ_KEYS)) {
+        const current = (await this.db.prepare(`SELECT pg_get_expr(d.adbin, d.adrelid) AS expr FROM pg_attrdef d
+          JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+          WHERE d.adrelid = ?::regclass AND a.attname = 'seq'`).get(table)) as { expr?: string } | undefined;
+        if (current?.expr?.replace(/::text/g, '') === `karmax_seq('${table}', ${ns})`) continue;
         await this.db.exec(`ALTER TABLE ${table} ALTER COLUMN seq SET DEFAULT karmax_seq('${table}', ${ns})`);
+      }
     }
     if (!(await this.kvGet('migration:github-pr-observations'))) {
       await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)

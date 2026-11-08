@@ -94,3 +94,45 @@ it('delays deleting managed objects in an S3 store and deletes local ones at onc
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+// 2026-11-08: boot asked each cloud world's `status`, and a VM world's asks the
+// cloud in a fresh process, one world after another. ~330 worlds kept boot past
+// the healthcheck and tavya.io was unreachable for an hour. Boot only opens
+// each reference, locally, and still names the ones that will not open.
+it('checks every cloud world reference at boot without asking a provider', async () => {
+  const { VmWorldProvider } = await import('../src/world/vm/provider.js');
+  const { WorldReferenceKeys } = await import('../src/world/reference-keys.js');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-execution-services-'));
+  vi.stubEnv('KARMAX_HOME', home);
+  vi.stubEnv('KARMAX_OBJECT_STORE', 'local');
+  vi.stubEnv('E2B_API_KEY', '');
+  vi.stubEnv('DAYTONA_API_KEY', '');
+  const probe = vi.spyOn(VmWorldProvider.prototype, 'probe');
+  const status = vi.spyOn(VmWorldProvider.prototype, 'status');
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  const p = ensurePaths(home);
+  const store = await Store.create(':memory:');
+  try {
+    const broker = new CredentialBroker(new Vault(p.vault));
+    const githubApp = await GitHubAppService.create(store, broker);
+    const keys = await WorldReferenceKeys.create(broker);
+    const world = (id: string, kind: string, state: string, sealedProviderRef?: string) => store.db
+      .prepare('INSERT INTO world_instances (worldId, generation, handle, state, createdAt, updatedAt) VALUES (?, 1, ?, ?, 1, 1)')
+      .run(id, JSON.stringify({ version: 2, kind, provider: kind, id, root: '/home/user', ...(sealedProviderRef ? { sealedProviderRef } : {}) }), state);
+    await world('task_parked_vm', 'hetzner', 'parked', keys.seal({ sshKey: 'k', hostKey: 'h', server: '1', volume: '2' }));
+    await world('task_hibernated_vm', 'fly', 'hibernated', keys.seal({ sshKey: 'k', hostKey: 'h', app: 'a', machine: 'm' }));
+    await world('task_lost_key', 'e2b', 'hibernated', 'KWR2.0123456789abcdef.body');
+
+    await createExecutionServices({ store, broker, githubApp, p, client: {} as Client,
+      deployment: { hosted: false, hostLocal: true }, provider: 'mock', bootstrap: true });
+
+    expect(probe).not.toHaveBeenCalled();
+    expect(status).not.toHaveBeenCalled();
+    const warnings = warn.mock.calls.map((call) => String(call[0]));
+    expect(warnings.find((line) => /world reference\(s\) cannot be opened/.test(line))).toMatch(/^1 world reference\(s\)/);
+  } finally {
+    probe.mockRestore(); status.mockRestore(); warn.mockRestore();
+    await store.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

@@ -363,6 +363,10 @@ export class E2BWorldProvider implements WorldProvider {
     return 'ready'; // after a process restart the durable provider is authoritative on connect
   }
 
+  openReference(handle: WorldHandle): void {
+    this.refOf(handle);
+  }
+
   /** Reconciliation probe: asks the control plane, never connect() — connecting
    * to an auto-resume sandbox would silently resume (and bill) a paused world. */
   async probe(handle: WorldHandle): Promise<WorldLifecycleState | undefined> {

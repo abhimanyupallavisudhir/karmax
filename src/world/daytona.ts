@@ -287,6 +287,10 @@ export class DaytonaWorldProvider implements WorldProvider {
     return this.states.get(this.sandboxId(handle)) ?? 'ready';
   }
 
+  openReference(handle: WorldHandle): void {
+    this.reference(handle);
+  }
+
   /** Reconciliation probe: `get()` reads the sandbox record without starting
    * it, so probing a stopped/archived world stays free of side effects. */
   async probe(handle: WorldHandle): Promise<WorldLifecycleState | undefined> {
