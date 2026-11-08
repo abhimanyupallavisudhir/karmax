@@ -1163,7 +1163,9 @@ function numberedTaskTitle(task) {
 
 function principalLabel(principal) {
   if (!principal) return 'Unassigned';
-  if (principal.kind === 'user') return S.users.find((u) => u.id === principal.userId)?.name || principal.userId;
+  // Members carry their names; the installation's directory may be unreadable (hosted).
+  if (principal.kind === 'user') return S.organizationMembers.find((m) => m.userId === principal.userId)?.user?.name
+    || S.users.find((u) => u.id === principal.userId)?.name || principal.userId;
   if (principal.kind === 'team') return S.teams.find((t) => t.id === principal.teamId)?.name || principal.teamId;
   if (principal.kind === 'avatar') return S.avatars?.find((a) => a.id === principal.avatarId)?.name || principal.avatarId;
   return `Task agent · ${agentRoleLabel(principal.role)}`;
@@ -5455,6 +5457,8 @@ const LIST_RELOAD_EVENTS = new Set([
   'authorization.approval-dismissed',
   'repository-access.approval-requested',
   'repository-access.approval-resolved',
+  // A task started or stopped waiting for a machine (its runner lease): rows read it from the server.
+  'world.machine-wait',
 ]);
 
 // view.updated already contains the compact fields shown by list rows. Apply that
@@ -5650,7 +5654,7 @@ function connectWs() {
       } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.startsWith('connection.') || ev.type.endsWith('.approval-dismissed')
         // A draft sub-task saved, queued or started: only the server's summaries know it.
         || ev.type === 'subtask.created' || ev.type === 'subtask.queued' || ev.type === 'subtask.started'
-        || ev.type === 'conversation.pending') {
+        || ev.type === 'conversation.pending' || ev.type === 'world.machine-wait') {
         // Mid-turn metadata changes must not clear output or patch lifecycle state.
         refreshTask(ev.type);
       } else if (ev.type !== 'agent.output') scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
@@ -7899,9 +7903,9 @@ function stageLabel(v) {
 }
 
 // A task's status reads as a glyph and its label — never a pill, so it can't
-// be mistaken for a tag — and its colour says who has the ball: an agent
-// working (accent), a person asked for something (amber), the task waiting on
-// time, quota, a job or other tasks (grey), or a finished state.
+// be mistaken for a tag — and its colour says whose move it is: a person's
+// (amber), or the task's own, working or waiting on time, quota, a job or other
+// tasks (accent; the glyph tells the two apart), or a finished state.
 function statusTone(view) {
   const v = view || {};
   if (v.state?.draft) return 'draft';
@@ -7915,7 +7919,7 @@ function statusTone(view) {
   if (w?.kind === 'human') return w.reason === 'error' ? 'failed' : 'human';
   if (w?.kind === 'confirm') return 'human';
   if (w?.kind === 'account') return accountWaitReason(w) === 'login' ? 'human' : 'waiting';
-  // Grey only when the label says what it waits for (stageLabel); a passing
+  // A clock only when the label says what it waits for (stageLabel); a passing
   // wait inside a stage (an agent slot, CI) still reads as that stage, working.
   if (w?.kind === 'retry' || (v.stage === 'do' && PARKED_WAITS.has(w?.kind))) return 'waiting';
   return 'working';
@@ -7939,12 +7943,19 @@ function statusHtml(label, tone, options) {
   const t = glyphs[tone] ? tone : 'working';
   return `<span class="status ${t}${className ? ` ${className}` : ''}"${title ? ` title="${esc(title)}"` : ''}><svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">${glyphs[t]}</svg><span class="status-label">${esc(label)}</span></span>`;
 }
+// What a wait for a machine leaves out of its one line: what is full, where,
+// and its place. Shown on hover, never as a second line.
+function waitTitle(v) {
+  const w = v?.waitingFor;
+  return v?.status === 'waiting' && w?.kind === 'retry' && w.summary === 'Waiting for a machine' && typeof w.detail === 'string' ? w.detail.trim() : '';
+}
+
 /** A task view's status, with its pending approval folded in: one fact, said once. */
 function viewStatusHtml(view) {
   const v = view || {};
   const tone = statusTone(v);
   const label = stageLabel(v);
-  if (!v.approvalRequests) return statusHtml(label, tone);
+  if (!v.approvalRequests) return statusHtml(label, tone, { title: waitTitle(v) });
   // A generic hold on a person that is really an approval says so; otherwise
   // the approval is a second ask beside what the task is doing.
   if (tone === 'human' && /^Needs input\b/.test(label)) return statusHtml(label.replace(/^Needs input/, 'Needs approval'), 'human');
@@ -7957,7 +7968,7 @@ function viewStatusHtml(view) {
 function stageIndicator(v, taskId, compact = false) {
   const moves = v.stageTransitions || [];
   const label = stageLabel(v);
-  if (!moves.length) return statusHtml(label, statusTone(v));
+  if (!moves.length) return statusHtml(label, statusTone(v), { title: waitTitle(v) });
   return `<label class="stage-picker${compact ? ' compact' : ''}" title="Move this attempt to another stage">
     <span class="sr-only">Move ${esc(label)} stage</span>
     <select data-stage-move="${esc(taskId)}" aria-label="Move attempt from ${esc(label)}">
@@ -9735,6 +9746,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         <div class="tf-columns parameter-fields" id="tf-body" data-project-id="${esc(projectId)}">
           <div class="tf-main">
             ${templateEdit ? '' : '<div class="tf-ready" id="tf-ready" role="status" hidden></div>'}
+            ${draft?.id && !templateEdit ? taskCreatorHtml({ taskId: draft.id, creator: recordCreator(draft) }) : ''}
             ${promptField ? renderField(promptField, values[promptField.name], inherited[promptField.name], true) : ''}
             ${agentFields.map((f) => `<section class="tf-section tf-${esc(f.type)}">${agentSectionHtml(f)}</section>`).join('')}
             ${otherFields.length ? `<section class="tf-section tf-where">${renderFields(otherFields, values, inherited)}</section>` : ''}
@@ -15002,9 +15014,47 @@ function parametersTab(v) {
   // The rest mirrors the task form: its agents, where it runs, when it starts,
   // and the logins it may use.
   return `
+    ${taskCreatorHtml(v)}
     ${paramsSection(v)}
     <div class="label-row tp-creds-head"><label>Accounts</label>${policyTip('The Claude and Codex accounts this task runs on, first available first. Drag to reorder; switch one off to skip it, for this task only.')}<span class="label-row-fill"></span></div>
     <div id="cred-editor-task" data-live-key="${esc(v.taskId)}">Loading…</div>`;
+}
+
+// Who created the task (TaskView.creator), first on Parameters: a person, an
+// agent — linked to its task —, an Avatār or tavya's own automation, and the
+// app it came through (a CLI login, an MCP app, a personal token) when it was
+// not the console.
+// A task not started yet has no view: its creator comes from its list record,
+// the task behind an agent or Avatār named when the reader has it loaded.
+function recordCreator(rec) {
+  if (!rec?.createdBy && !rec?.createdVia) return undefined;
+  const by = rec.createdBy;
+  const source = taskRecord(by?.kind === 'task-agent' ? by.taskId : by?.kind === 'avatar' ? by.avatarId : null);
+  return { ...(by ? { createdBy: by } : {}), ...(rec.createdVia ? { via: rec.createdVia } : {}),
+    ...(source ? { task: { id: source.id, projectId: source.projectId, num: source.num, title: source.title } } : {}) };
+}
+const SYSTEM_CREATOR_LABEL = { 'system:triggers': 'Trigger', 'system:github-recovery': 'GitHub recovery' };
+function taskCreatorHtml(v) {
+  const c = v?.creator;
+  if (!c?.createdBy && !c?.via) return '';
+  const by = c.createdBy;
+  const linked = (label) => (c.task
+    ? `<a data-spa href="${esc(taskUrl(c.task.id, c.task))}">${esc(label)}</a>` : esc(label));
+  const source = c.task ? numberedTaskTitle(c.task) : '';
+  const who = by?.kind === 'task-agent'
+    ? (source ? `${esc(agentRoleLabel(by.role))} of ${linked(source)}` : esc(agentRoleLabel(by.role)))
+    : by?.kind === 'avatar' ? `Avatār ${linked(source || principalLabel(by))}`
+    : by?.kind === 'user' && by.userId === S.user?.id ? 'You'
+    : by ? esc(principalLabel(by))
+    : c.via?.kind === 'system' ? esc(siteName()) : 'Someone';
+  const via = c.via?.kind === 'system'
+    ? { label: SYSTEM_CREATOR_LABEL[c.via.principal] || siteName(), tip: `Started by ${siteName()}` }
+    : c.via ? { label: c.via.name, tip: { cli: 'Signed-in CLI', mcp: 'Connected app (MCP)', token: 'Personal access token' }[c.via.kind] || c.via.kind }
+    : null;
+  const at = taskRecord(v.taskId)?.createdAt;
+  return `<div class="tp-creator" data-row="__creator"><span class="tp-creator-label">Created by</span>
+    <span class="tp-creator-who">${who}</span>${via ? ` <span class="tp-creator-via" title="${esc(via.tip)}">via ${esc(via.label)}</span>` : ''}${at
+    ? ` <time class="tp-creator-at" datetime="${esc(new Date(at).toISOString())}" title="${esc(new Date(at).toLocaleString())}">${esc(fmtAgo(at))}</time>` : ''}</div>`;
 }
 
 // The server state each async-hydrated Parameters section is built from (see
@@ -15222,9 +15272,10 @@ function waitingText(w) {
   // A paused agent's ask carries the time it carries on without an answer.
   if (w?.kind === 'human') return Number.isFinite(w.until) ? `Needs input until ${waitDeadline(w.until)}` : 'Needs input';
   if (w?.kind === 'timer') return Number.isFinite(w.until) ? `Waiting until ${waitDeadline(w.until)}` : 'Waiting';
-  // A full provider limit: what it waits for, and when it tries again.
+  // A full provider limit: what it waits for, and when it tries again; a
+  // queued machine, its place in the queue (what is full is its tooltip, waitTitle).
   if (w?.kind === 'retry' && typeof w.summary === 'string' && w.summary.trim())
-    return `${w.summary.trim().slice(0, 48)}${Number.isFinite(w.until) ? `, trying at ${waitDeadline(w.until)}` : ''}`;
+    return `${w.summary.trim().slice(0, 48)}${w.ahead > 0 ? ` · ${w.ahead} ahead` : ''}${Number.isFinite(w.until) ? `, trying at ${waitDeadline(w.until)}` : ''}`;
   if (w?.kind === 'retry') return Number.isFinite(w.until) ? `Retrying at ${waitDeadline(w.until)}` : 'Retrying';
   if (w?.kind === 'account') {
     const who = w.provider ? ACCOUNT_PROVIDER_LABELS[w.provider] || w.provider : '';
@@ -15265,6 +15316,9 @@ function waitDeadline(until) {
 // The generic header label alone would hide that diagnosis.
 function conversationWaitNotice(v) {
   const w = v.waitingFor;
+  // A wait for a machine is one line; what is full and where is its tooltip.
+  const machine = waitTitle(v);
+  if (machine) return `<div class="msg system wait-notice" role="status" title="${esc(machine)}">${esc(waitingText(w))}</div>`;
   const reason = w?.kind === 'account' ? accountWaitReason(w) : '';
   if (reason === 'held')
     return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))} <button type="button" class="btn sm ghost" data-run-now="${esc(v.taskId)}" title="${esc(RUN_NOW_TIP)}">Run now</button></div>`;

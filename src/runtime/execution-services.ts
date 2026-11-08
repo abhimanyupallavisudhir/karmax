@@ -78,7 +78,11 @@ export async function createExecutionServices(input: {
     for (const state of ['ready', 'parked', 'hibernated', 'degraded'] as const) {
       for (const { handle } of await store.listWorldInstances(state)) {
         if (!(CLOUD_WORLD_PROVIDERS as readonly string[]).includes(handle.kind)) continue;
-        try { await worlds.get(handle.kind).status?.(handle as import('../world/types.js').WorldHandle); }
+        // Only whether its reference opens, locally. VM worlds' `status` asks
+        // the cloud in a fresh process (b8c7251a), and asking for each of
+        // ~330 worlds in turn kept boot past the healthcheck: tavya.io was
+        // unreachable for an hour on 2026-11-08.
+        try { worlds.get(handle.kind).openReference?.(handle as import('../world/types.js').WorldHandle); }
         catch { unreadable.push(handle.sealedProviderRef); }
       }
     }

@@ -63,7 +63,8 @@ printf 308
 `, { mode: 0o755 });
   const run = (args: string[], fail = '', input = '', env: Record<string, string> = {}) => spawnSync('sh', [path.join(deploy, 'karmax'), ...args], {
     encoding: 'utf8', input, timeout: 30_000,
-    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_LOG: log, FAKE_FAIL: fail, ...env },
+    // `sleep` is a no-op here, so the readiness deadline (wall-clock) is short.
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_LOG: log, FAKE_FAIL: fail, KARMAX_READY_TIMEOUT_SECONDS: '1', ...env },
   });
   const calls = () => fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]) : [];
   const edgeRequests = () => fs.existsSync(curls) ? fs.readFileSync(curls, 'utf8').trim().split('\n') : [];

@@ -37,7 +37,7 @@ import {
 } from '../coordinators/names.js';
 import { templateContent, templateName, templateParams, templateAuthorization } from '../domain/task-templates.js';
 import { derivedTaskTitle, isDerivedTaskTitle } from '../domain/task-title.js';
-import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget, type Avatar, type InheritedConversation } from '../domain/types.js';
+import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget, type Avatar, type InheritedConversation, type TaskCreatedVia, type TaskCreator } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries } from '../domain/triggers.js';
 import { STORE_TASKS, runsOnInstall, storeTaskNeeds, storeTaskRepeatable, takenFromStore, type StoreNeed, type StoreTask } from '../domain/task-store.js';
 import { applyTriggerContext, normalizeEventInput, validateFollow, type EventFilter, type EventFollow, type ProjectEvent, type ProjectEventClaim,
@@ -92,6 +92,7 @@ import { enrollWorldRepositories } from '../world/repository-enrollment.js';
 import { ensureTaskBranchAncestry } from '../world/task-branch.js';
 import type { WorldAccessService } from '../world/access.js';
 import type { RunnerPoolService } from '../world/runners.js';
+import { machineWaits, withMachineWait, type MachineWait } from '../world/machine-wait.js';
 import { VaultItems, type CredentialAccessRequest, type VaultItemPolicy, type VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
 import { connectionRequestsVia, passOnConnectionRequest } from '../integrations/connection-requests.js';
 import type { ServiceConnection } from '../integrations/service-connections.js';
@@ -1055,6 +1056,38 @@ export class KarmaxApi {
     return creator;
   }
 
+  /** Who created `task` and with what, as the reader may see it
+   * (TaskView.creator): the task whose agent — or the Avatār — created it is
+   * named only to a reader who may read that task. */
+  private async taskCreatorView(token: string, task: TaskRecord | undefined): Promise<TaskCreator | undefined> {
+    const { createdBy, createdVia } = task ?? {};
+    if (!task || (!createdBy && !createdVia)) return undefined;
+    const sourceId = createdBy?.kind === 'task-agent' ? createdBy.taskId : createdBy?.kind === 'avatar' ? createdBy.avatarId : undefined;
+    let source = sourceId ? await this.deps.store.taskMetadataAsync(sourceId) : undefined;
+    if (source && source.projectId !== task.projectId)
+      source = await this.requireAsPerson(token, 'get_task', { projectId: source.projectId, taskId: source.id }).then(() => source, () => undefined);
+    return {
+      ...(createdBy ? { createdBy } : {}),
+      ...(createdVia ? { via: createdVia } : {}),
+      ...(source ? { task: { id: source.id, projectId: source.projectId, ...(source.num != null ? { num: source.num } : {}), title: source.title } } : {}),
+    };
+  }
+
+  /** The credential a task is being created with, recorded beside its creator
+   * (TaskRecord.createdVia): the person's app grant — a CLI login, an MCP
+   * client or a personal access token — or tavya's own automation. Nothing for
+   * a console sign-in, nor for a task's own agent, whose task `createdBy` names. */
+  private async creationVia(caller: ScopedToken): Promise<{ createdVia?: TaskCreatedVia }> {
+    const createdVia = await this.creationCredential(caller);
+    return createdVia ? { createdVia } : {};
+  }
+  private async creationCredential(caller: ScopedToken): Promise<TaskCreatedVia | undefined> {
+    if (caller.taskId && caller.taskId !== '*') return undefined;
+    if (caller.kind === 'system') return { kind: 'system', principal: caller.principal };
+    const grant = caller.identitySessionId ? await new AppGrants(this.deps.store).get(caller.identitySessionId) : undefined;
+    return grant ? { kind: grant.kind, grantId: grant.id, name: grant.name } : undefined;
+  }
+
   /**
    * Validate each agent resume source, then authorize every
    * `agent:<role>.resumeFrom.taskId` against the **source** task, not just the
@@ -1698,6 +1731,7 @@ export class KarmaxApi {
 
     const title = args.title?.trim() || derivedTaskTitle(resolved);
     const createdBy = await this.taskCreator(caller, project.id);
+    const createdVia = await this.creationCredential(caller);
     // Pin the connected account when the task is created. Switching the user's
     // active account later must not silently change an existing task's commit or
     // pull-request actor.
@@ -1756,6 +1790,7 @@ export class KarmaxApi {
           return field ? resolved[field.name] : undefined;
         })(),
         createdBy,
+        ...(createdVia ? { createdVia } : {}),
         assignee: args.assignee,
         delegate: args.delegate,
         confirmationPolicy,
@@ -1871,6 +1906,7 @@ export class KarmaxApi {
         let alt = (await this.deps.store.createTask({ projectId: task.projectId, listId: task.listId, title: task.title,
           workflow: task.workflow, workflowVersion: task.workflowVersion, params: { ...copied, draft: true, archived: false },
           parentTaskId: task.parentTaskId, intentId: task.intentId, createdBy: task.createdBy,
+          ...(task.createdVia ? { createdVia: task.createdVia } : {}),
           assignee: task.assignee, delegate: task.delegate, confirmationPolicy: task.confirmationPolicy }));
         if (delegation) {
           const alternateDelegation = (await this.deps.tokens.deriveHumanDelegation(delegation.id, {
@@ -2396,6 +2432,7 @@ export class KarmaxApi {
       params: { ...params, ...(computer ? { computer } : {}), prompt, draft: true },
       parentTaskId,
       createdBy: ownAgent ? parentAgent : (await this.taskCreator(caller, parent.projectId)) ?? parentAgent,
+      ...(ownAgent ? {} : await this.creationVia(caller)),
       assignee: parentAgent,
     }));
     const event = { taskId: parentTaskId, type: 'subtask.created', ts: Date.now(), payload: { childTaskId: child.id, title, draft: true } };
@@ -3180,6 +3217,7 @@ export class KarmaxApi {
       params: shaped.params,
       parentTaskId: series.parentTaskId,
       createdBy: (await this.taskCreator(caller, series.projectId)) ?? series.createdBy,
+      ...(await this.creationVia(caller)),
       assignee: series.assignee,
       delegate: series.delegate,
       confirmationPolicy: series.confirmationPolicy,
@@ -3755,7 +3793,7 @@ export class KarmaxApi {
         const { world, worldPath, worldAvailable, worldDesktop, worldProvider, ...history } = view;
         view = history;
       }
-      view = await this.withLiveAccountWait(taskId, view);
+      view = await this.withLiveWait(taskId, view);
       const rawAgents = await this.deps.store.kvGetAsync(agentSnapshotKey(taskId));
       let agents: Record<string, AgentSpec> | undefined;
       try { const parsed = rawAgents ? JSON.parse(rawAgents) : undefined;
@@ -3763,8 +3801,9 @@ export class KarmaxApi {
       } catch { /* Same malformed-snapshot fallback as readAgentSnapshot. */ }
       const task = await this.deps.store.taskMetadataAsync(taskId);
       const group = await this.deps.store.attemptCommitAsync(taskId);
+      const childWaits = await machineWaits(this.deps.store).catch(() => new Map<string, MachineWait>());
       const subTaskSummaries = await Promise.all((await this.deps.store.childTaskSummaries(taskId)).map(async (child) =>
-        child.lastView ? { ...child, lastView: await this.withLiveAccountWait(child.id, child.lastView) } : child));
+        child.lastView ? { ...child, lastView: await this.withLiveWait(child.id, child.lastView, childWaits) } : child));
       const forkSummaries = await this.deps.store.forkTaskSummaries(taskId);
       const forkSourceSummaries = await this.deps.store.forkSourceTaskSummaries(taskId);
       const accepted = (await this.acceptedAction(taskId, view));
@@ -3774,8 +3813,10 @@ export class KarmaxApi {
       // A parent elsewhere is named only to a caller who may read it.
       if (parent && parent.projectId !== task?.projectId)
         parent = await this.require(token, 'get_task', { projectId: parent.projectId, taskId: parent.id }).then(() => parent, () => undefined);
+      const creator = await this.taskCreatorView(token, task);
       return {
         ...view,
+        ...(creator ? { creator } : {}),
         ...(subTaskSummaries.length ? { subTaskSummaries } : {}),
         ...(forkSummaries.length ? { forkSummaries } : {}),
         ...(forkSourceSummaries.length ? { forkSourceSummaries } : {}),
@@ -3862,17 +3903,18 @@ export class KarmaxApi {
     (await this.require(token, 'get_task'));
     const record = (await this.deps.store.getTask(taskId));
     if (!record?.params?.draft) return undefined;
-    return (await this.projectDraftView(record, group));
+    return (await this.projectDraftView(record, group, token));
   }
 
   async getDraftViewAsync(token: string, taskId: string): Promise<TaskView | undefined> {
     (await this.require(token, 'get_task'));
     const record = await this.deps.store.taskMetadataAsync(taskId);
     (await this.require(token, 'get_task', { projectId: record?.projectId, taskId }));
-    return record?.params?.draft ? (await this.projectDraftView(record, {})) : undefined;
+    return record?.params?.draft ? (await this.projectDraftView(record, {}, token)) : undefined;
   }
 
-  private async projectDraftView(record: TaskRecord, group?: { committedAttemptId?: string }): Promise<TaskView> {
+  private async projectDraftView(record: TaskRecord, group?: { committedAttemptId?: string }, token?: string): Promise<TaskView> {
+    const creator = token ? await this.taskCreatorView(token, record) : undefined;
     const view: TaskView = {
       taskId: record.id,
       title: record.title,
@@ -3886,6 +3928,7 @@ export class KarmaxApi {
       actions: [],
       state: { draft: true },
       updatedAt: record.createdAt,
+      ...(creator ? { creator } : {}),
     };
     view.stageTransitions = (await this.availableStageTransitions(record, view, group));
     return view;
@@ -3903,6 +3946,19 @@ export class KarmaxApi {
    * waiting view takes the coordinator's current answer. Executions that
    * recorded only "account" get their reason this way too.
    */
+  /**
+   * What a waiting task waits for now, which its published view may not know:
+   * a machine (its runner lease is queued, whichever activity or request
+   * asked for it; src/world/machine-wait.ts), else a model login's current
+   * reason (withLiveAccountWait). `waits`: every machine wait, read once for a list.
+   */
+  async withLiveWait<V extends Pick<TaskView, 'status' | 'waitingFor'>>(taskId: string, view: V,
+    waits?: Map<string, MachineWait>): Promise<V> {
+    const machine = (waits ?? await machineWaits(this.deps.store).catch(() => undefined))?.get(taskId);
+    const shown = withMachineWait(view, machine);
+    return shown !== view ? shown : this.withLiveAccountWait(taskId, view);
+  }
+
   async withLiveAccountWait<V extends Pick<TaskView, 'waitingFor'>>(taskId: string, view: V): Promise<V> {
     if (view.waitingFor?.kind !== 'account') return view;
     try {
@@ -3962,6 +4018,7 @@ export class KarmaxApi {
       parentTaskId: source.parentTaskId,
       intentId: group.intentId,
       createdBy: await this.taskCreator(caller, source.projectId),
+      ...(await this.creationVia(caller)),
       assignee: source.assignee,
       delegate: source.delegate,
       confirmationPolicy: source.confirmationPolicy,
@@ -8785,6 +8842,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
         _authorization: { ...authorization, principal: caller.principal },
       },
       createdBy: await this.taskCreator(caller, project.id),
+      ...(await this.creationVia(caller)),
     }));
     const workflowDelegation = (await this.deps.tokens.delegateHuman(token, {
       taskId: task.id, projectId: task.projectId, organizationId: project.organizationId,

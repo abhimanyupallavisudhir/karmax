@@ -483,6 +483,10 @@ export interface WorldProvider {
   /** Delete through the control plane without resuming the sandbox. */
   destroy?(handle: WorldHandle): Promise<void>;
   status?(handle: WorldHandle): Promise<WorldLifecycleState>;
+  /** Open the world's sealed provider reference, locally: throws when the
+   * current keys cannot. Never asks the provider (the boot check runs it for
+   * every cloud world, 2026-11-08). */
+  openReference?(handle: WorldHandle): void;
   /** Ask the provider's control plane for the sandbox's authoritative state
    * without resuming or otherwise mutating it. `status` reports the local
    * in-process view; `probe` reconciles against the remote source of truth.

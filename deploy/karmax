@@ -279,10 +279,12 @@ preview_tls_ready() {
 
 wait_ready() {
   note 'Waiting for the Karmax control plane to become ready…'
-  attempt=0
+  # A deadline, as long as the image's healthcheck start period: a large
+  # installation boots for minutes (2026-11-08), and counting attempts made
+  # the wait depend on how long each `docker exec` took.
+  deadline=$(( $(date +%s) + ${KARMAX_READY_TIMEOUT_SECONDS:-600} ))
   until dc exec -T app node -e "fetch('http://127.0.0.1:4505/api/health/ready',{signal:AbortSignal.timeout(5000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; do
-    attempt=$((attempt + 1))
-    if [ "$attempt" -ge 90 ]; then
+    if [ "$(date +%s)" -ge "$deadline" ]; then
       dc ps
       dc logs --tail=100 app temporal >&2 || true
       echo 'karmax: Karmax did not become ready; the diagnostic logs are above' >&2
@@ -304,8 +306,8 @@ edge_answers() {
   [ "$code" = 200 ]
 }
 
-# Compose starts Caddy only once the app is healthy, so the app can be ready
-# while Caddy is still loading. Plain HTTP needs neither DNS nor a certificate:
+# Compose starts Caddy alongside the app, so the app can be ready while Caddy
+# is still loading. Plain HTTP needs neither DNS nor a certificate:
 # Caddy redirects it to HTTPS as soon as it serves this domain.
 edge_serves() {
   domain=$(env_value KARMAX_DOMAIN)

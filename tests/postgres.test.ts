@@ -59,6 +59,26 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  // 2026-11-08: every boot re-set the seq defaults with ALTER TABLE, whose
+  // ACCESS EXCLUSIVE lock waited behind a deploy's pg_dump until the statement
+  // timeout failed the boot. An unchanged default takes no lock.
+  it('opens beside a reader of events, as a pg_dump backup holds one', async () => {
+    await (await Store.create(url!)).close();
+    const reader = await admin!.connect();
+    try {
+      await reader.query('BEGIN');
+      await reader.query('SELECT 1 FROM events LIMIT 1');
+      const opened = Store.create(url!);
+      const outcome = await Promise.race([opened.then(() => 'opened'),
+        new Promise((resolve) => setTimeout(() => resolve('blocked'), 5_000))]);
+      expect(outcome).toBe('opened');
+      await (await opened).close();
+    } finally {
+      await reader.query('ROLLBACK');
+      reader.release();
+    }
+  });
+
   it('looks up one identity user by primary key', async () => {
     const named = async () => (await admin!.query(`SELECT count(*)::int AS n FROM pg_stat_activity
       WHERE datname = current_database() AND application_name = 'karmax'`)).rows[0].n as number;

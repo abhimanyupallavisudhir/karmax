@@ -20,6 +20,10 @@ import { taskProvider } from './task-provider.js';
 import { assertComputeCredit, assertManagedRoom } from './managed-compute.js';
 import { MANAGED_COMPUTE, worldAccountLimits } from './connections.js';
 import { WAKE_RELOCATE_AFTER_MS, wakeFullKey } from './compute-queue.js';
+import { MACHINE_WAIT_EVENT, MachineQueued, forgetPlace, keepPlace, keptPlace, machineWaits, type MachineWait } from './machine-wait.js';
+
+/** How often a queued lease re-reads its place, to tell live pages when it moves up. */
+const PLACE_CHECK_MS = 10_000;
 
 /** What a machine of this config takes from its account's budget. */
 const roomShape = (config: Parameters<typeof machineShape>[0]): { cpu?: number; diskGb?: number } => {
@@ -107,6 +111,12 @@ export class RunnerPoolService {
      * managed compute credit is spent. Waking a world to save or publish its
      * work is not. */
     work?: boolean;
+    /** Stop waiting at this time (epoch ms) if still queued, with a
+     * MachineQueued its workflow shows as a wait for a machine; the place in
+     * the queue is kept for the next try (machine-wait.ts). Callers inside an
+     * activity pass `leaseWaitDeadline`, so a wait never outlives the activity
+     * (2026-11-04: Confirm timed out waking a parked world). */
+    waitUntil?: number;
     heartbeat?: () => void; signal?: AbortSignal; pollMs?: number }): Promise<{ leaseId: string; runnerPoolId: string }> {
     if (input.signal?.aborted)
       throw input.signal.reason ?? new Error('runner lease cancelled');
@@ -134,10 +144,28 @@ export class RunnerPoolService {
     const projectSpent = (await this.store.usageSummary(input.project.organizationId!, month.from, month.to, input.project.id)).costMicros;
     if (input.project.config.monthlyBudgetMicros != null && projectSpent >= input.project.config.monthlyBudgetMicros)
       throw new Error('project monthly cloud budget is exhausted');
+    const kept = await keptPlace(this.store, input.taskId, input.worldId);
     const requested = (await this.store.requestWorldLease({ runnerPoolId: pool.id, organizationId: input.project.organizationId!,
       projectId: input.project.id, taskId: input.taskId, worldId: input.worldId,
       cpu: config.resources?.cpu, memoryMb: config.resources?.memoryMb,
-      gpu: config.resources?.gpu, priority: input.priority }));
+      gpu: config.resources?.gpu, priority: input.priority, ...(kept !== undefined ? { since: kept } : {}) }));
+    if (requested.acquired) {
+      if (kept !== undefined) await forgetPlace(this.store, input.taskId, input.worldId);
+      return { leaseId: requested.id, runnerPoolId: pool.id };
+    }
+    // Queued: the task says it waits for a machine (machine-wait.ts) until admitted.
+    let shown: MachineWait | undefined;
+    const show = async (wait: MachineWait | undefined) => {
+      if (wait?.ahead === shown?.ahead && Boolean(wait) === Boolean(shown)) return;
+      const ended = !wait;
+      shown = wait;
+      await this.store.appendEvent({ type: MACHINE_WAIT_EVENT, taskId: input.taskId, ts: Date.now(),
+        payload: { projectId: input.project.id, waiting: !ended,
+          ...(wait ? { provider: wait.provider, ahead: wait.ahead, detail: wait.detail, runnerPoolId: wait.runnerPoolId } : {}) } }).catch(() => undefined);
+    };
+    const place = async () => (await machineWaits(this.store).catch(() => undefined))?.get(input.taskId);
+    let checked = Date.now();
+    await show(await place());
     try {
       for (;;) {
         const lease = (await this.store.worldLease(requested.id));
@@ -146,14 +174,22 @@ export class RunnerPoolService {
         if (lease.acquiredAt) break;
         if (input.signal?.aborted)
           throw input.signal.reason ?? new Error('runner lease cancelled');
+        if (input.waitUntil !== undefined && Date.now() >= input.waitUntil) {
+          const wait = await place();
+          await keepPlace(this.store, input.taskId, input.worldId, Number(lease.queuedSince ?? lease.createdAt));
+          throw new MachineQueued(wait?.detail ?? `Waiting for room in ${pool.name}.`);
+        }
         // A heartbeat can throw when Temporal has already timed this activity
         // out. Treat that exactly like cancellation: the retry must not inherit
         // an invisible reservation from an activity that no longer exists.
         input.heartbeat?.();
-        await new Promise((resolve) => setTimeout(resolve, Math.max(100, input.pollMs ?? 1_000)));
+        await new Promise((resolve) => setTimeout(resolve, Math.max(100, Math.min(input.pollMs ?? 1_000,
+          input.waitUntil !== undefined ? Math.max(0, input.waitUntil - Date.now()) : Number.POSITIVE_INFINITY))));
+        if (Date.now() - checked >= PLACE_CHECK_MS) { checked = Date.now(); const wait = await place(); if (wait) await show(wait); }
       }
       if (input.signal?.aborted)
         throw input.signal.reason ?? new Error('runner lease cancelled');
+      if (kept !== undefined) await forgetPlace(this.store, input.taskId, input.worldId);
       return { leaseId: requested.id, runnerPoolId: pool.id };
     } catch (error) {
       // This reservation has not been published into the durable world handle,
@@ -161,6 +197,8 @@ export class RunnerPoolService {
       // billed release path: a failed admission wait never ran a sandbox.
       (await this.store.releaseWorldLease(requested.id));
       throw error;
+    } finally {
+      await show(undefined);
     }
   }
 

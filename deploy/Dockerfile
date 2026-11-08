@@ -38,7 +38,10 @@ USER karmax
 
 EXPOSE 4505
 VOLUME ["/var/lib/karmax"]
-HEALTHCHECK --interval=20s --timeout=5s --start-period=30s --retries=3 \
+# A boot opens every cloud world's reference, runs migrations and probes the
+# coordinators: minutes on a large installation. Failures inside the start
+# period do not count, and the first passing check ends it.
+HEALTHCHECK --interval=20s --timeout=5s --start-period=10m --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:4505/api/health/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 # The gateway's heap comes from the container's memory budget (RT-35;

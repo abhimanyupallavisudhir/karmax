@@ -52,6 +52,7 @@ import {
   TeamMembership,
   ProjectMembership,
   PrincipalRef,
+  TaskCreatedVia,
   ProjectPrincipalRef,
   ConfirmationPolicy,
   Avatar,
@@ -111,6 +112,9 @@ import { taskForkSourceIds } from '../domain/forks.js';
 
 /** How many dismissals a person's preferences keep (the newest). */
 const MAX_DISMISSED = 500;
+/** The order queued runner leases are admitted in: priority, then who asked
+ * first (a caller that gave up at its deadline and asked again keeps its place). */
+const QUEUE_ORDER = 'priority DESC, COALESCE(queuedSince, createdAt), createdAt';
 
 // Shared by Store instances in this process, never by another gateway/worker.
 const PROCESS_EVENT_ORIGIN = crypto.randomUUID();
@@ -692,7 +696,7 @@ export class Store {
         title TEXT NOT NULL, workflow TEXT NOT NULL, workflowVersion TEXT NOT NULL,
         params TEXT NOT NULL, createdAt INTEGER NOT NULL, ord INTEGER NOT NULL,
         parentTaskId TEXT, lastView TEXT, completedAt INTEGER, statusChangedAt INTEGER, createdBy TEXT, assignee TEXT,
-        delegate TEXT, confirmationPolicy TEXT
+        delegate TEXT, confirmationPolicy TEXT, createdVia TEXT
       );
       CREATE TABLE IF NOT EXISTS organizations (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
@@ -881,7 +885,7 @@ export class Store {
         projectId TEXT NOT NULL, taskId TEXT NOT NULL, worldId TEXT NOT NULL,
         cpu INTEGER NOT NULL, memoryMb INTEGER NOT NULL, gpu INTEGER NOT NULL,
         priority INTEGER NOT NULL, state TEXT NOT NULL, createdAt INTEGER NOT NULL,
-        acquiredAt INTEGER, releasedAt INTEGER
+        acquiredAt INTEGER, releasedAt INTEGER, queuedSince INTEGER
       );
       CREATE TABLE IF NOT EXISTS service_usage_counts (
         meter TEXT NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0,
@@ -1295,8 +1299,17 @@ export class Store {
           END LOOP;
           RETURN NULL;
         END'`);
-      for (const [table, ns] of Object.entries(SEQ_KEYS))
+      // Only when the default differs: ALTER TABLE takes an ACCESS EXCLUSIVE
+      // lock, which waits behind any open reader of the table — a pg_dump
+      // backup holds one for minutes — until the statement timeout fails the
+      // boot (2026-11-08, during a deploy's pre-update backup).
+      for (const [table, ns] of Object.entries(SEQ_KEYS)) {
+        const current = (await this.db.prepare(`SELECT pg_get_expr(d.adbin, d.adrelid) AS expr FROM pg_attrdef d
+          JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+          WHERE d.adrelid = ?::regclass AND a.attname = 'seq'`).get(table)) as { expr?: string } | undefined;
+        if (current?.expr?.replace(/::text/g, '') === `karmax_seq('${table}', ${ns})`) continue;
         await this.db.exec(`ALTER TABLE ${table} ALTER COLUMN seq SET DEFAULT karmax_seq('${table}', ${ns})`);
+      }
     }
     if (!(await this.kvGet('migration:github-pr-observations'))) {
       await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
@@ -1359,6 +1372,10 @@ export class Store {
     const savedViewCols = await this.db.prepare('PRAGMA table_info(saved_views)').all() as { name: string }[];
     if (!savedViewCols.some(column => column.name === 'organizationId')) await this.db.exec('ALTER TABLE saved_views ADD COLUMN organizationId TEXT');
     await this.db.exec('CREATE INDEX IF NOT EXISTS idx_saved_views_organization ON saved_views(organizationId)');
+    // A lease's place in its queue when its caller asked before and kept it (src/world/machine-wait.ts placeSince).
+    const leaseCols = await this.db.prepare('PRAGMA table_info(world_leases)').all() as { name: string }[];
+    if (!leaseCols.some(column => column.name === 'queuedSince')) await this.db.exec('ALTER TABLE world_leases ADD COLUMN queuedSince INTEGER');
+    await this.db.exec('CREATE INDEX IF NOT EXISTS idx_world_leases_state ON world_leases(state, taskId)');
     const candidateCols = await this.db.prepare('PRAGMA table_info(resource_candidates)').all() as { name: string }[];
     if (!candidateCols.some(column => column.name === 'error')) await this.db.exec('ALTER TABLE resource_candidates ADD COLUMN error TEXT');
     const cols = (await this.db.prepare('PRAGMA table_info(tasks)').all()) as any[];
@@ -1500,6 +1517,7 @@ export class Store {
       (await this.db.exec('ALTER TABLE tasks ADD COLUMN notes TEXT'));
     }
     if (!cols.some((c) => c.name === 'createdBy')) (await this.db.exec('ALTER TABLE tasks ADD COLUMN createdBy TEXT'));
+    if (!cols.some((c) => c.name === 'createdVia')) (await this.db.exec('ALTER TABLE tasks ADD COLUMN createdVia TEXT'));
     if (!cols.some((c) => c.name === 'assignee')) (await this.db.exec('ALTER TABLE tasks ADD COLUMN assignee TEXT'));
     if (!cols.some((c) => c.name === 'delegate')) (await this.db.exec('ALTER TABLE tasks ADD COLUMN delegate TEXT'));
     if (!cols.some((c) => c.name === 'confirmationPolicy')) (await this.db.exec('ALTER TABLE tasks ADD COLUMN confirmationPolicy TEXT'));
@@ -4169,6 +4187,7 @@ export class Store {
     params: TaskParams;
     parentTaskId?: string;
     createdBy?: PrincipalRef;
+    createdVia?: TaskCreatedVia;
     assignee?: PrincipalRef;
     delegate?: PrincipalRef;
     confirmationPolicy?: ConfirmationPolicy;
@@ -4236,14 +4255,15 @@ export class Store {
       order: ord,
       parentTaskId: input.parentTaskId,
       createdBy: input.createdBy,
+      ...(input.createdVia ? { createdVia: input.createdVia } : {}),
       assignee: input.assignee,
       delegate: input.delegate,
       confirmationPolicy: input.confirmationPolicy,
     };
     (await this.db
       .prepare(
-        `INSERT INTO tasks (id, num, projectId, listId, title, workflow, executionWorkflow, workflowVersion, params, createdAt, ord, parentTaskId, lastView, notes, intentId, attemptNumber, createdBy, assignee, delegate, confirmationPolicy)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO tasks (id, num, projectId, listId, title, workflow, executionWorkflow, workflowVersion, params, createdAt, ord, parentTaskId, lastView, notes, intentId, attemptNumber, createdBy, assignee, delegate, confirmationPolicy, createdVia)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         t.id,
@@ -4266,6 +4286,7 @@ export class Store {
         jsonOrNull(t.assignee),
         jsonOrNull(t.delegate),
         jsonOrNull(t.confirmationPolicy),
+        jsonOrNull(t.createdVia),
       ));
     // Alternate attempts inherit the logical task's selection times; simply
     // retrying an execution must not make its credentials more frequent/recent.
@@ -4345,7 +4366,7 @@ export class Store {
     const rows = (await this.db.prepare(`SELECT
         t.id, t.num, t.projectId, t.listId, t.title, t.workflow,
         t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.statusChangedAt, t.ord,
-        t.parentTaskId, t.createdBy, t.assignee, t.delegate,
+        t.parentTaskId, t.createdBy, t.createdVia, t.assignee, t.delegate,
         t.confirmationPolicy, t.intentId, t.attemptNumber, t.notes,
         CASE WHEN t.lastView IS NULL THEN NULL ELSE json_remove(
           t.lastView, '$.messages', '$.transcripts', '$.reviewInfo'
@@ -4433,7 +4454,7 @@ export class Store {
     const params = [projectId, ...(ids ?? [])];
     const projection = includeConversation ? 't.*' : `t.id, t.num, t.projectId, t.listId, t.title, t.workflow,
       t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.statusChangedAt, t.ord, t.parentTaskId,
-      t.createdBy, t.assignee, t.delegate, t.confirmationPolicy, t.intentId, t.attemptNumber, t.notes,
+      t.createdBy, t.createdVia, t.assignee, t.delegate, t.confirmationPolicy, t.intentId, t.attemptNumber, t.notes,
       json_remove(t.lastView, '$.messages', '$.transcripts', '$.reviewInfo') AS lastView`;
     const rows = await this.readRows<any>(`SELECT ${projection},
       COALESCE(t.num, root.num) AS resolvedNum${attempts ? ', CASE WHEN i.principalAttemptId=t.id THEN 0 ELSE 1 END AS otherAttempt' : ''} ${from}
@@ -4590,7 +4611,7 @@ export class Store {
   async taskMetadataAsync(id: string): Promise<TaskRecord | undefined> {
     const [row] = await this.readRows<any>(`SELECT t.id, t.num, t.projectId, t.listId, t.title, t.workflow,
       t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.statusChangedAt, t.ord, t.parentTaskId,
-      t.createdBy, t.assignee, t.delegate, t.confirmationPolicy, t.intentId, t.attemptNumber,
+      t.createdBy, t.createdVia, t.assignee, t.delegate, t.confirmationPolicy, t.intentId, t.attemptNumber,
       t.notes, t.lastView, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
       LEFT JOIN tasks root ON root.id=t.intentId WHERE t.id=?`, [id]);
     return row ? rowToTask(row) : undefined;
@@ -8532,7 +8553,9 @@ export class Store {
   }
 
   async requestWorldLease(input: { runnerPoolId: string; organizationId: string; projectId: string; taskId: string;
-    worldId: string; cpu?: number; memoryMb?: number; gpu?: number; priority?: number }): Promise<{ id: string; acquired: boolean }> {
+    worldId: string; cpu?: number; memoryMb?: number; gpu?: number; priority?: number;
+    /** Its place in the queue, when its caller asked before and kept it (machine-wait.ts placeSince). */
+    since?: number }): Promise<{ id: string; acquired: boolean }> {
     return this.db.transaction(async () => {
     // A pool belongs to one organization, so this one key covers the pool's
     // capacity and the organization's active-world and start-rate limits.
@@ -8588,9 +8611,10 @@ export class Store {
         if (recent >= policy.maxRemoteStartsPerMinute) throw new AdmissionBackpressureError('organization remote sandbox start rate limit exceeded');
       }
       (await this.db.prepare(`INSERT INTO world_leases (id, runnerPoolId, organizationId, projectId, taskId, worldId,
-        cpu, memoryMb, gpu, priority, state, createdAt, acquiredAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        cpu, memoryMb, gpu, priority, state, createdAt, acquiredAt, queuedSince) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(id, pool.id, input.organizationId, input.projectId, input.taskId, input.worldId, resources.cpu,
-          resources.memoryMb, resources.gpu, input.priority ?? 0, acquired ? 'active' : 'queued', now, acquired ? now : null));
+          resources.memoryMb, resources.gpu, input.priority ?? 0, acquired ? 'active' : 'queued', now, acquired ? now : null,
+          input.since !== undefined && input.since < now ? input.since : null));
       (await this.db.exec('COMMIT'));
       return { id, acquired };
     } catch (error) {
@@ -8616,9 +8640,9 @@ export class Store {
 
     const queued = filter.runnerPoolId
       ? (await this.db.prepare(`SELECT * FROM world_leases WHERE runnerPoolId=? AND state='queued'
-          ORDER BY priority DESC, createdAt`).all(filter.runnerPoolId)) as any[]
+          ORDER BY ${QUEUE_ORDER}`).all(filter.runnerPoolId)) as any[]
       : (await this.db.prepare(`SELECT * FROM world_leases WHERE organizationId=? AND state='queued'
-          ORDER BY priority DESC, createdAt`).all(filter.organizationId)) as any[];
+          ORDER BY ${QUEUE_ORDER}`).all(filter.organizationId)) as any[];
     const activated: string[] = [];
     for (const candidate of queued) {
       const pool = (await this.getRunnerPool(candidate.runnerPoolId));
@@ -8720,7 +8744,12 @@ export class Store {
 
   async listWorldLeases(runnerPoolId: string): Promise<any[]> {
     return (await this.db.prepare(`SELECT * FROM world_leases WHERE runnerPoolId=? AND state!='released'
-      ORDER BY CASE state WHEN 'active' THEN 0 ELSE 1 END, priority DESC, createdAt`).all(runnerPoolId)) as any[];
+      ORDER BY CASE state WHEN 'active' THEN 0 ELSE 1 END, ${QUEUE_ORDER}`).all(runnerPoolId)) as any[];
+  }
+
+  /** Every lease waiting for admission, in the order admission takes them. */
+  async queuedWorldLeases(): Promise<any[]> {
+    return (await this.db.prepare(`SELECT * FROM world_leases WHERE state='queued' ORDER BY ${QUEUE_ORDER}`).all()) as any[];
   }
 
   async worldLeasesForTask(taskId: string): Promise<any[]> {
@@ -11483,6 +11512,7 @@ function rowToTask(r: any): TaskRecord {
     order: r.ord,
     parentTaskId: r.parentTaskId ?? undefined,
     createdBy: parseJsonOptional<PrincipalRef>(r.createdBy),
+    ...(r.createdVia ? { createdVia: parseJsonOptional<TaskCreatedVia>(r.createdVia) } : {}),
     assignee: parseJsonOptional<PrincipalRef>(r.assignee),
     delegate: parseJsonOptional<PrincipalRef>(r.delegate),
     confirmationPolicy: parseJsonOptional<ConfirmationPolicy>(r.confirmationPolicy),
