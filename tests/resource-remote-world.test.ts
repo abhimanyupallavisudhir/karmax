@@ -28,7 +28,7 @@ import type { World } from '../src/world/types.js';
 const REAL_RESTIC_MS = 120_000;
 
 const cleanups: Array<() => Promise<void> | void> = [];
-afterEach(async () => { vi.restoreAllMocks(); for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
+afterEach(async () => { vi.restoreAllMocks(); vi.unstubAllEnvs(); for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
 /**
  * A world that says it is a remote sandbox (an E2B one) but runs its commands
@@ -325,66 +325,96 @@ it('fetches and saves parts of an on-demand resource in a remote world, keeping 
   expect(verified.files.map((file) => file.path).sort()).toEqual([...pages.map((page) => page.path), 'README', 'big/blob.bin', 'mt/a.txt', 'mt/b.txt'].sort());
 }, REAL_RESTIC_MS);
 
-// personal-website #7: 489 single-file resources, each restore ~7 s whatever
-// its size, restored one by one: world setup outlived its 30-minute limit on
-// every attempt and the task failed. They restore several at a time now; the
-// first alone, so restic is installed in the world once.
-it('restores many single-file resources into a remote world several at a time, each once', async () => {
-  const f = await fixture();
-  const files = await Promise.all(Array.from({ length: 9 }, async (_, i) => {
+/** Count every restic the world runs: the binary it fetched becomes a wrapper
+ * that notes each run (with the key hint it was given) before running it. */
+function countResticRuns(world: World): () => Array<{ hint: string }> {
+  const bin = path.join(world.handle.root, '.karmax-injection/bin');
+  const runs = path.join(world.handle.root, '..', `restic-runs-${crypto.randomBytes(4).toString('hex')}`);
+  const timer = setInterval(() => {
+    const name = `restic-${RESTIC_VERSION}`;
+    if (!fs.existsSync(path.join(bin, name)) || fs.existsSync(path.join(bin, `.real-${name}`))) return;
+    fs.renameSync(path.join(bin, name), path.join(bin, `.real-${name}`));
+    fs.writeFileSync(path.join(bin, name), `#!/bin/sh\necho "\${RESTIC_KEY_HINT:--}" >> '${runs}'\nexec '${path.join(bin, `.real-${name}`)}' "$@"\n`, { mode: 0o755 });
+  }, 2);
+  cleanups.push(() => { clearInterval(timer); fs.rmSync(runs, { force: true }); });
+  return () => (fs.existsSync(runs) ? fs.readFileSync(runs, 'utf8').split('\n').filter(Boolean) : []).map((hint) => ({ hint }));
+}
+
+async function singleFiles(f: Awaited<ReturnType<typeof fixture>>, count: number) {
+  return Promise.all(Array.from({ length: count }, async (_, i) => {
     const attachment = await f.store.createResourceAttachment({ organizationId: f.project.organizationId!, projectId: f.project.id,
       name: `File ${i}`, driver: 'object-tree@1', target: { kind: 'path', path: `data/files/${i}.json` }, access: i % 2 ? 'read' : 'write',
       isolation: 'fork', source: { shape: 'file' }, credentialHandles: [], publish: i % 2 ? 'discard' : 'review' });
     const data = crypto.randomBytes(500 + i);
-    await f.resources.importFiles(attachment.id, [{ path: `${i}.json`, data }]);
-    return { attachment, data };
+    const revision = await f.resources.importFiles(attachment.id, [{ path: `${i}.json`, data }]);
+    return { attachment, data, revision };
   }));
+}
+
+// personal-website #7: 489 single-file resources, each restore ~7 s whatever
+// its size (about ten commands into the world, and restic opening its
+// repository), restored one by one: world setup outlived its 30-minute limit
+// on every attempt. Now one job in the world restores them all, a restic per
+// resource opening its repository with a fast key, so the commands karmax
+// sends into the world no longer grow with the number of resources.
+it('restores many single-file resources with one job, one restic each, through their fast keys', async () => {
+  const f = await fixture();
+  const files = await singleFiles(f, 12);
   const { task, world } = await f.sandbox('Many files');
-  const restore = f.resources.restic.restore.bind(f.resources.restic);
-  let running = 0;
-  const overlaps: number[] = [];
-  vi.spyOn(f.resources.restic, 'restore').mockImplementation(async (...args) => {
-    overlaps.push(++running);
-    try { return await restore(...args); } finally { running--; }
-  });
+  const runs = countResticRuns(world);
+  let commands = 0;
+  const exec = world.exec.bind(world);
+  world.exec = async (...args) => { commands++; return exec(...args); };
 
   world.handle = await f.resources.materialize(f.project.id, task.id, world, 1);
 
   for (const { attachment, data } of files)
     expect(fs.readFileSync(path.join(world.handle.root, (attachment.target as { path: string }).path))).toEqual(data);
-  // One restic per resource, the first alone, never more than the bound at once.
-  expect(overlaps).toHaveLength(files.length);
-  expect(overlaps[0]).toBe(1);
-  expect(Math.max(...overlaps)).toBeGreaterThan(1);
-  expect(Math.max(...overlaps)).toBeLessThanOrEqual(6);
-  // restic was fetched into the world once.
-  const fetches = fs.readdirSync(path.join(world.handle.root, '.karmax-injection/bin')).filter((name) => name.startsWith('.restic-'));
-  expect(fetches).toEqual([]);
+  // The bound: one restic per resource, run by a single platform job, each
+  // pointed at its repository's fast key.
+  expect(runs()).toHaveLength(files.length);
+  for (const run of runs()) expect(run.hint).toMatch(/^[0-9a-f]{64}$/);
+  expect(fs.readdirSync(path.join(world.handle.root, SYSTEM_JOB_ROOT))).toHaveLength(1);
+  // Six commands to install restic, exclude the files from git and start the
+  // job, then one per poll (100 ms, doubling to 2 s), however many resources:
+  // ~10 per resource before (120 here).
+  expect(commands).toBeLessThanOrEqual(20);
+  // Nothing of the plan (grants, passwords) is left in the world.
+  expect(fs.readdirSync(path.join(world.handle.root, '.karmax-injection')).filter((name) => name.startsWith('restore-'))).toEqual([]);
+  expect(await listJobs(world)).toEqual([]);
   // The same record as before: an event pair and an active lease per resource.
   const events = await f.store.eventsOfTypes(task.id, ['world.resource-restoring', 'world.resource-restored']);
-  for (const { attachment } of files)
-    expect(events.filter((event) => (event.payload as { attachmentId?: string }).attachmentId === attachment.id).map((event) => event.type))
-      .toEqual(['world.resource-restoring', 'world.resource-restored']);
+  for (const { attachment, revision } of files) {
+    const own = events.filter((event) => (event.payload as { attachmentId?: string }).attachmentId === attachment.id);
+    expect(own.map((event) => event.type)).toEqual(['world.resource-restoring', 'world.resource-restored']);
+    expect(own[0]!.payload).toEqual({ attachmentId: attachment.id, revisionId: revision.id, bytes: revision.bytes, files: revision.files });
+    expect(own[1]!.payload).toEqual({ attachmentId: attachment.id, revisionId: revision.id, durationMs: own[1]!.ts - own[0]!.ts });
+    expect(own[1]!.ts).toBeGreaterThanOrEqual(own[0]!.ts);
+  }
   const leases = await f.store.listResourceLeases(world.handle.id);
   expect(leases.filter((lease) => files.some(({ attachment }) => attachment.id === lease.attachmentId)).map((lease) => lease.state))
     .toEqual(files.map(() => 'active'));
-  // Read-only resources are still made read-only.
+  // Read-only resources are still made read-only, the others not.
   expect(fs.statSync(path.join(world.handle.root, 'data/files/1.json')).mode & 0o222).toBe(0);
+  expect(fs.statSync(path.join(world.handle.root, 'data/files/0.json')).mode & 0o200).not.toBe(0);
 }, REAL_RESTIC_MS);
 
 it('fails the leases of resources it never restored when one restore fails', async () => {
   const f = await fixture();
-  for (let i = 0; i < 4; i++) {
-    const attachment = await f.store.createResourceAttachment({ organizationId: f.project.organizationId!, projectId: f.project.id,
-      name: `File ${i}`, driver: 'object-tree@1', target: { kind: 'path', path: `data/files/${i}.json` }, access: 'write',
-      isolation: 'fork', source: { shape: 'file' }, credentialHandles: [], publish: 'review' });
-    await f.resources.importFiles(attachment.id, [{ path: `${i}.json`, data: Buffer.from(String(i)) }]);
-  }
-  const { task, world } = await f.sandbox('First fails');
-  const restore = vi.spyOn(f.resources.restic, 'restore').mockRejectedValue(new Error('restoring the resource failed: boom'));
-  await expect(f.resources.materialize(f.project.id, task.id, world, 1)).rejects.toThrow(/boom/);
-  // The first failed alone, so no other restore started; none of the four is left pending or active.
-  expect(restore).toHaveBeenCalledTimes(1);
-  const leases = (await f.store.listResourceLeases(world.handle.id)).filter((lease) => lease.attachmentId !== f.attachment.id);
-  expect(leases.map((lease) => lease.state)).toEqual(['failed', 'failed', 'failed', 'failed']);
+  const files = await singleFiles(f, 4);
+  // The second resource's version is gone from its repository.
+  const broken = f.resources.restic.of(files[1]!.attachment, files[1]!.revision);
+  await f.store.deleteRepositoryFile(broken.name, 'snapshots', files[1]!.revision.rootDigest!);
+  const { task, world } = await f.sandbox('Second fails');
+  vi.stubEnv('KARMAX_WORLD_RESTORES_AT_ONCE', '1');
+  await expect(f.resources.materialize(f.project.id, task.id, world, 1)).rejects.toThrow(/restoring the resource failed/);
+  const leases = await f.store.listResourceLeases(world.handle.id);
+  const stateOf = (i: number) => leases.find((lease) => lease.attachmentId === files[i]!.attachment.id)?.state;
+  // The first was restored; the second failed, and no other one started after it.
+  expect([0, 1, 2, 3].map(stateOf)).toEqual(['active', 'failed', 'failed', 'failed']);
+  const events = await f.store.eventsOfTypes(task.id, ['world.resource-restoring', 'world.resource-restored']);
+  expect(events.map((event) => [event.type, files.findIndex(({ attachment }) => attachment.id === (event.payload as { attachmentId: string }).attachmentId)]))
+    .toEqual([['world.resource-restoring', 0], ['world.resource-restored', 0], ['world.resource-restoring', 1]]);
+  expect(fs.existsSync(path.join(world.handle.root, 'data/files/0.json'))).toBe(true);
+  expect(fs.existsSync(path.join(world.handle.root, 'data/files/2.json'))).toBe(false);
 }, REAL_RESTIC_MS);

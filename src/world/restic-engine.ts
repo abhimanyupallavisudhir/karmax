@@ -2,12 +2,14 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { forEachConcurrent } from '../util/async-batch.js';
 import { readPolicies, skipExcludes } from './resource-policy.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ResourceAttachment, ResourceChangeSummary, ResourceRevision } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import type { ObjectStore } from '../store/objects.js';
-import { SYSTEM_JOB_ROOT, jobStatuses, startJob, stopJobs } from './jobs.js';
+import { SYSTEM_JOB_ROOT, followJob, jobStatuses, startJob, stopJobs } from './jobs.js';
+import { fastKeyFile, isFastKey, openKeyFile, type ResticKeyFile } from './restic-keys.js';
 import { REPOSITORY_ROUTE, RepositoryTokens, parseRepositoryName, repositoryName, repositoryObjectKey, repositoryPassword,
   type RepositoryAccess } from './resource-repository.js';
 import { RESTIC_VERSION, hostResticBinary, resticFailure, runHostRestic, streamHostRestic, worldResticBinary, type ResticRun } from './restic.js';
@@ -164,6 +166,18 @@ const CONNECTIONS = 8;
  * every upload in memory, in slots all worlds share. */
 const EDGE_CONNECTIONS = 32;
 const RESTORE_CONNECTIONS = 16;
+/** Restores one world-setup job runs at once ({@link ResticResources.restoreMany}).
+ * Each is mostly waiting on a dozen round trips an ocean long, and with a fast
+ * key (restic-keys.ts) takes ~27 MB and next to no CPU; a world restoring
+ * through the slow key takes ~57 MB and ~0.4 s of CPU each. */
+const WORLD_RESTORES_AT_ONCE = 16;
+/** {@link WORLD_RESTORES_AT_ONCE}, or `KARMAX_WORLD_RESTORES_AT_ONCE` (tests). */
+function worldRestoresAtOnce(): number {
+  const configured = Number(process.env.KARMAX_WORLD_RESTORES_AT_ONCE);
+  return Number.isInteger(configured) && configured > 0 ? configured : WORLD_RESTORES_AT_ONCE;
+}
+/** kv `restic-fast-key:<repository>`: the repository's fast key (restic-keys.ts). */
+const FAST_KEY_PREFIX = 'restic-fast-key:';
 /** A save that finds files changed under it saves again, this many times. */
 const SETTLE_ROUNDS = 5;
 /** And waits this long before saving again, doubled each round (2, 4, 8, 16 s:
@@ -317,6 +331,109 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
       fs.rmSync(place.path, { recursive: true, force: true });
       fs.renameSync(path.join(scratch, entries[0]!), place.path);
       fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * Restore many snapshots, each into its own place, as world setup does with
+   * a project's resources. In a remote world it is one platform job that runs
+   * {@link WORLD_RESTORES_AT_ONCE} restics at a time and reports each start
+   * and end on its output, which one command reads back per poll: restoring
+   * them one job at a time cost ~10 commands into the world per resource,
+   * each a round trip to the provider, and personal-website #7's 489 small
+   * files took an hour (wiki features/resource-storage). Locally (a worktree,
+   * a container's bind mount) restic runs on this host, `hostConcurrency` at a
+   * time. `started`/`finished` are told of each item as it goes (`at`: when,
+   * on this host's clock). After a failure no further item starts, the ones
+   * running finish, and the first failure is thrown.
+   */
+  async restoreMany(world: World, items: RestoreItem[], options: { key: string; hostConcurrency: number;
+    checkContinue?: () => Promise<void>; started(index: number, at: number): Promise<void>;
+    finished(index: number, at: number, error?: Error): Promise<void> }): Promise<void> {
+    if (!items.length) return;
+    if (!isRemoteWorldKind(world.handle.kind)) {
+      await forEachConcurrent(items.map((item, index) => ({ item, index })), async ({ item, index }) => {
+        await options.checkContinue?.();
+        await options.started(index, Date.now());
+        try {
+          for (const [n, snapshot] of item.snapshots.entries())
+            await this.restore({ world, path: item.path, file: item.file }, item.repository, snapshot,
+              { key: `${options.key}:${index}:${n}`, checkContinue: options.checkContinue });
+          if (item.readOnly) {
+            const made = await world.exec('bash', ['-c', 'test ! -e "$1" || chmod -R a-w -- "$1"', 'read-only', item.path], { cwd: world.handle.root });
+            if (made.code !== 0) throw new Error(`could not make ${item.path} read-only: ${made.stderr.trim()}`);
+          }
+        } catch (error) {
+          await options.finished(index, Date.now(), error instanceof Error ? error : new Error(String(error)));
+          throw error;
+        }
+        await options.finished(index, Date.now());
+      }, options.hostConcurrency);
+      return;
+    }
+    const base = this.deps.endpoints.world(world.handle);
+    if (!base) throw new Error('this world cannot reach the resource store (no public URL is configured)');
+    const binary = await this.worldBinary(world, base, items[0]!.repository);
+    // The plan holds every item's grant and password: written mode 600 beside
+    // the job, read once by it and deleted, never on a command line or in the
+    // job's saved command.
+    const dir = path.posix.join(world.handle.root, `.karmax-injection/restore-${crypto.randomBytes(6).toString('hex')}`);
+    let plan = `N=${items.length}\n`;
+    for (const [i, item] of items.entries()) {
+      const env = await this.env(item.repository, base, 'read', false);
+      plan += `R[${i}]=${quote(env.RESTIC_REPOSITORY!)} T[${i}]=${quote(env.RESTIC_REST_PASSWORD!)} P[${i}]=${quote(env.RESTIC_PASSWORD!)}`
+        + ` H[${i}]=${quote(env.RESTIC_KEY_HINT ?? '')} S[${i}]=${quote(item.snapshots.join(' '))} D[${i}]=${quote(item.path)}`
+        + ` F[${i}]=${item.file ? 1 : 0} W[${i}]=${item.readOnly ? 1 : 0}\n`;
+    }
+    const written = await world.exec('bash', ['-c', 'umask 077; mkdir -p -- "$1" && cat > "$1/plan"', 'restore-plan', dir],
+      { cwd: world.handle.root, input: plan, timeoutMs: 60_000 });
+    if (written.code !== 0) throw new Error(`could not prepare the restore: ${(written.stderr || written.stdout).trim().slice(0, 300)}`);
+    const command = `bash -c ${quote(RESTORE_MANY)} restore-many ${quote(dir)} ${quote(binary)} ${worldRestoresAtOnce()} ${RESTORE_CONNECTIONS}`;
+    const { job, forget } = await this.worldJob(world, options.key, command,
+      async () => ({ RESTIC_CACHE_DIR: path.posix.join(world.handle.root, CACHE_DIR) }));
+    const started = new Set<number>();
+    const failures = new Map<number, string>();
+    let first: Error | undefined;
+    try {
+      let from = 0;
+      let pending = '';
+      for (let wait = FIRST_POLL_MS; ; wait = Math.min(wait * 2, POLL_MS)) {
+        await options.checkContinue?.();
+        const status = await followJob(world, job, from, { root: SYSTEM_JOB_ROOT });
+        const shift = Date.now() - status.now;
+        from += Buffer.byteLength(status.output);
+        const text = pending + status.output;
+        const end = text.lastIndexOf('\n');
+        pending = text.slice(end + 1);
+        for (const line of end < 0 ? [] : text.slice(0, end).split('\n')) {
+          const [what, index, value, code] = line.split(' ');
+          const i = Number(index);
+          if (!Number.isInteger(i) || i < 0 || i >= items.length) continue;
+          if (what === 'start' && !started.has(i)) { started.add(i); await options.started(i, Number(value) + shift); }
+          else if (what === 'error') failures.set(i, Buffer.from(value ?? '', 'base64').toString('utf8'));
+          else if (what === 'done' && started.has(i)) {
+            const failed = Number(code) !== 0
+              ? resticFailure({ code: Number(code), stdout: failures.get(i) ?? '', stderr: failures.get(i) ?? '' }, 'restoring the resource') : undefined;
+            first ??= failed;
+            await options.finished(i, Number(value) + shift, failed);
+          }
+        }
+        if (status.state === 'exited') {
+          await forget();
+          if (first) throw first;
+          if (status.exitCode !== 0) throw new Error(`restoring the resources failed (exit ${status.exitCode}): ${pending.trim().slice(-300)}`);
+          return;
+        }
+        if (status.state !== 'running') {
+          await forget();
+          throw new Error('restic stopped without finishing (the sandbox was restarted); it resumes from what it stored when retried');
+        }
+        await new Promise((resolve) => setTimeout(resolve, wait));
+      }
+    } catch (error) {
+      // Cancelled: the job stops with the activity that waited on it.
+      if (await forget()) await stopJobs(world, [job], SYSTEM_JOB_ROOT).catch(() => undefined);
+      throw error;
     }
   }
 
@@ -776,6 +893,65 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     return { binary, env: await this.env(repository, base, 'read', false), expiresAt };
   }
 
+  /** The repository's fast key (restic-keys.ts), which restic is pointed at. */
+  private async fastKey(repository: Repository): Promise<string | undefined> {
+    const name = await this.deps.store.kvGet(`${FAST_KEY_PREFIX}${repository.name}`);
+    return name && await this.deps.store.repositoryFile(repository.name, 'keys', name) ? name : undefined;
+  }
+
+  /** Give the repository a fast key beside the key `restic init` made: the
+   * same master key under the same password, at a cost of ~1 ms to open
+   * instead of ~0.5 s of CPU (restic-keys.ts says why that is as safe).
+   * Opening the existing key costs this host that ~0.5 s once. False when it
+   * already has one. */
+  async addFastKey(repository: Repository): Promise<boolean> {
+    if (await this.fastKey(repository)) return false;
+    const password = await repositoryPassword(this.deps.broker, repository.attachment);
+    const objects = await this.deps.objects(repository.attachment, repository.storageLocationId);
+    const keys: Array<{ name: string; key: ResticKeyFile }> = [];
+    for (const file of await this.deps.store.listRepositoryFiles(repository.name, 'keys')) {
+      try { keys.push({ name: file.name, key: JSON.parse((await objects.get(repositoryObjectKey(repository.name, 'keys', file.name))).toString('utf8')) }); }
+      catch { /* not a key file this can read */ }
+    }
+    // Cheap ones first: one this host added and lost track of is adopted.
+    keys.sort((a, b) => Number(isFastKey(b.key)) - Number(isFastKey(a.key)));
+    let master: Buffer | undefined;
+    for (const { name, key } of keys) {
+      master = await openKeyFile(key, password).catch(() => undefined);
+      if (master && isFastKey(key)) { await this.deps.store.kvSet(`${FAST_KEY_PREFIX}${repository.name}`, name); return true; }
+      if (master) break;
+    }
+    if (!master) throw new Error('no key of the repository opens with its password');
+    const { name, body } = await fastKeyFile(master, password);
+    const key = repositoryObjectKey(repository.name, 'keys', name);
+    await objects.put(key, body);
+    // As the repository server records an upload: the file row accounts for the object from now on.
+    await this.deps.store.transaction(async () => {
+      await this.deps.store.recordRepositoryFile({ repository: repository.name, attachmentId: repository.attachment.id,
+        organizationId: repository.attachment.organizationId, ...(repository.storageLocationId ? { storageLocationId: repository.storageLocationId } : {}),
+        kind: 'keys', name, bytes: body.length });
+      await this.deps.store.deletePendingObjectWrite(key);
+    });
+    await this.deps.store.kvSet(`${FAST_KEY_PREFIX}${repository.name}`, name);
+    return true;
+  }
+
+  /** Upkeep: a fast key for every repository made before they existed, until
+   * `until` (each costs this host ~0.5 s of CPU, once). */
+  async addFastKeys(named: (name: string) => Promise<Repository | undefined>, until: number): Promise<number> {
+    const keyed = new Set((await this.deps.store.kvEntries(FAST_KEY_PREFIX)).map(({ key }) => key.slice(FAST_KEY_PREFIX.length)));
+    let added = 0;
+    for (const name of await this.deps.store.resticRepositoryNames()) {
+      if (Date.now() >= until) break;
+      if (keyed.has(name)) continue;
+      const repository = await named(name);
+      if (!repository) continue;
+      try { if (await this.addFastKey(repository)) added++; }
+      catch (error) { console.warn(`resource repository ${name}: no fast key: ${error instanceof Error ? error.message : String(error)}`); }
+    }
+    return added;
+  }
+
   /** Delete the data no snapshot uses. Upkeep only, when no save holds the
    * repository; locks left by a process that died expire on the server. */
   async prune(attachment: Repository): Promise<void> {
@@ -798,6 +974,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     }
     this.initialized.delete(repository.name);
     await this.deps.store.kvDelete(`restic-prune:${repository.name}`);
+    await this.deps.store.kvDelete(`${FAST_KEY_PREFIX}${repository.name}`);
   }
 
   /** Create the repository once. Concurrent saves of a new resource wait for
@@ -820,6 +997,8 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
           await this.removeRepository(attachment);
           const run = await this.onHost(attachment, 'admin', false, ['init', '--json'], { key: 'host', create: true });
           if (run.code !== 0) throw resticFailure(run, 'creating the resource repository');
+          // Without one it works as well, only every restic opening it is slower (upkeep adds one later).
+          await this.addFastKey(attachment).catch((error) => console.warn(`resource repository ${attachment.name}: no fast key: ${error instanceof Error ? error.message : String(error)}`));
         } finally { await this.deps.store.kvCompareAndSet(claimKey, mine, undefined); }
         continue;
       }
@@ -904,8 +1083,11 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
 
   private async env(repository: Repository, base: string, access: RepositoryAccess, quota: boolean, create = false): Promise<Record<string, string>> {
     const token = await this.deps.tokens.mint({ repository: repository.name, access, quota, expiresAt: Date.now() + TOKEN_HOURS * 3_600_000 });
+    const hint = create ? undefined : await this.fastKey(repository);
     return { RESTIC_REPOSITORY: `rest:${base.replace(/\/+$/, '')}${REPOSITORY_ROUTE}${repository.name}/`, RESTIC_REST_USERNAME: 'tavya',
-      RESTIC_REST_PASSWORD: token, RESTIC_PASSWORD: await repositoryPassword(this.deps.broker, repository.attachment, create), RESTIC_PROGRESS_FPS: '0.5' };
+      RESTIC_REST_PASSWORD: token, RESTIC_PASSWORD: await repositoryPassword(this.deps.broker, repository.attachment, create), RESTIC_PROGRESS_FPS: '0.5',
+      // Tried first: opening the repository then costs ~1 ms instead of ~0.5 s.
+      ...(hint ? { RESTIC_KEY_HINT: hint } : {}) };
   }
 
   private async onHost(attachment: Repository, access: RepositoryAccess, quota: boolean, args: string[],
@@ -939,29 +1121,8 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     const binary = await this.worldBinary(world, base, attachment);
     const command = `set -e\n${options.prefix ? `${options.prefix}\n` : ''}${options.cwd ? `cd -- ${quote(options.cwd)}\n` : ''}`
       + `${quote(binary)} ${args.map(quote).join(' ')}${options.suffix ?? ''}`;
-    const recordKey = `restic-job:${world.handle.id}:${options.key}`;
-    const digest = crypto.createHash('sha256').update(command).digest('hex');
-    let recorded = await this.deps.store.kvGet(recordKey);
-    let job: string | undefined;
-    let earlier: string | undefined;
-    try {
-      const value = JSON.parse(recorded ?? '{}') as { job?: string; generation?: number; digest?: string };
-      if (value.generation === (world.handle.generation ?? 1) && value.job
-        && (await jobStatuses(world, [value.job], { root: SYSTEM_JOB_ROOT }))[0]?.state === 'running') {
-        if (value.digest === digest) job = value.job; else earlier = value.job;
-      }
-    } catch { /* none */ }
-    // An attempt whose worker died left its restic running, with other
-    // arguments: two would compete for the sandbox and write the same files.
-    if (earlier) await stopJobs(world, [earlier], SYSTEM_JOB_ROOT);
-    if (!job) {
-      const env = { ...await this.env(attachment, base, access, quota),
-        RESTIC_CACHE_DIR: path.posix.join(world.handle.root, CACHE_DIR) };
-      job = (await startJob(world, { command, cwd: world.handle.root, env, root: SYSTEM_JOB_ROOT })).id;
-      recorded = JSON.stringify({ job, generation: world.handle.generation ?? 1, digest, at: Date.now() });
-      await this.deps.store.kvSet(recordKey, recorded);
-    }
-    const forget = () => this.deps.store.kvCompareAndSet(recordKey, recorded, undefined).catch(() => false);
+    const { job, forget } = await this.worldJob(world, options.key, command,
+      async () => ({ ...await this.env(attachment, base, access, quota), RESTIC_CACHE_DIR: path.posix.join(world.handle.root, CACHE_DIR) }));
     try {
       for (let wait = FIRST_POLL_MS; ; wait = Math.min(wait * 2, POLL_MS)) {
         await options.checkContinue?.();
@@ -987,6 +1148,37 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
       if (await forget()) await stopJobs(world, [job], SYSTEM_JOB_ROOT).catch(() => undefined);
       throw error;
     }
+  }
+
+  /** Start `command` as a platform job in a remote world, or find the one an
+   * earlier attempt started (kv `restic-job:<world>:<key>`): the same command
+   * still running is waited for again; another one is stopped, since two
+   * would compete for the sandbox and write the same files. `forget` clears
+   * the record once the caller is done with the job. */
+  private async worldJob(world: World, key: string, command: string, env: () => Promise<Record<string, string>>)
+    : Promise<{ job: string; forget: () => Promise<boolean> }> {
+    const recordKey = `restic-job:${world.handle.id}:${key}`;
+    const digest = crypto.createHash('sha256').update(command).digest('hex');
+    let recorded = await this.deps.store.kvGet(recordKey);
+    let job: string | undefined;
+    let earlier: string | undefined;
+    try {
+      const value = JSON.parse(recorded ?? '{}') as { job?: string; generation?: number; digest?: string };
+      if (value.generation === (world.handle.generation ?? 1) && value.job
+        && (await jobStatuses(world, [value.job], { root: SYSTEM_JOB_ROOT }))[0]?.state === 'running') {
+        if (value.digest === digest) job = value.job; else earlier = value.job;
+      }
+    } catch { /* none */ }
+    // An attempt whose worker died left its restic running, with other
+    // arguments: two would compete for the sandbox and write the same files.
+    if (earlier) await stopJobs(world, [earlier], SYSTEM_JOB_ROOT);
+    if (!job) {
+      job = (await startJob(world, { command, cwd: world.handle.root, env: await env(), root: SYSTEM_JOB_ROOT })).id;
+      recorded = JSON.stringify({ job, generation: world.handle.generation ?? 1, digest, at: Date.now() });
+      await this.deps.store.kvSet(recordKey, recorded);
+    }
+    const forget = () => this.deps.store.kvCompareAndSet(recordKey, recorded, undefined).catch(() => false);
+    return { job: job!, forget };
   }
 
   /** restic in a remote world: fetched once from this server, with a grant for
@@ -1016,6 +1208,55 @@ chmod +x "$t"; mv -f "$t" ${quote(relative)}`, 'restic-fetch', url, binary.sha25
     return absolute;
   }
 }
+
+/** One place {@link ResticResources.restoreMany} restores: `snapshots` in
+ * turn into `path` (an absolute world path), or, `file`, the one file the
+ * snapshot holds put at `path`; then made read-only if `readOnly`. */
+export interface RestoreItem { repository: Repository; snapshots: string[]; path: string; file?: boolean; readOnly?: boolean }
+
+/** `restore-many DIR RESTIC MAX CONNECTIONS`: restores the items of DIR/plan
+ * (bash arrays: repository R, grant T, password P, key hint H, snapshots S,
+ * destination D, single file F, read-only W), MAX at a time. Prints
+ * `start <i> <ms>`, `error <i> <base64 of restic's last output>` and
+ * `done <i> <ms> <code>`; after a failure starts nothing more. */
+const RESTORE_MANY = [
+  'set -u; d=$1; restic=$2; max=$3; connections=$4',
+  '. "$d/plan"; rm -f -- "$d/plan"',
+  `trap 'rm -rf -- "$d"' EXIT`,
+  'now() { date +%s%3N; }',
+  'one() {',
+  '  local i=$1 t s e',
+  '  if [ "${F[$i]}" = 1 ]; then t="$d/$i.d"; rm -rf -- "$t"; else t=${D[$i]}; mkdir -p -- "$t" || return 1; fi',
+  '  for s in ${S[$i]}; do',
+  '    ( export RESTIC_REPOSITORY="${R[$i]}" RESTIC_REST_USERNAME=tavya RESTIC_REST_PASSWORD="${T[$i]}" RESTIC_PASSWORD="${P[$i]}"',
+  '      [ -z "${H[$i]}" ] || export RESTIC_KEY_HINT="${H[$i]}"',
+  '      exec "$restic" restore "$s" --target "$t" --no-lock --json -o "rest.connections=$connections" ) || return $?',
+  '  done',
+  '  if [ "${F[$i]}" = 1 ]; then',
+  '    shopt -s dotglob nullglob; e=("$t"/*)',
+  '    [ ${#e[@]} -eq 1 ] || { echo "expected one file" >&2; return 3; }',
+  '    mkdir -p -- "$(dirname -- "${D[$i]}")" && rm -rf -- "${D[$i]}" && mv -f -- "${e[0]}" "${D[$i]}" && rm -rf -- "$t" || return 1',
+  '  fi',
+  '  [ "${W[$i]}" = 0 ] || [ ! -e "${D[$i]}" ] || chmod -R a-w -- "${D[$i]}"',
+  '}',
+  'run() {',
+  '  local i=$1 c',
+  '  echo "start $i $(now)"',
+  '  one "$i" > "$d/$i.out" 2>&1; c=$?',
+  '  if [ "$c" -ne 0 ]; then : > "$d/failed"; echo "error $i $(tail -c 2000 "$d/$i.out" | base64 | tr -d \'\\n\')"; fi',
+  '  rm -f -- "$d/$i.out"',
+  '  echo "done $i $(now) $c"',
+  '}',
+  'running=0',
+  'for ((i = 0; i < N; i++)); do',
+  '  [ ! -e "$d/failed" ] || break',
+  '  if [ "$running" -ge "$max" ]; then wait -n; running=$((running - 1)); fi',
+  '  [ ! -e "$d/failed" ] || break',
+  '  run "$i" & running=$((running + 1))',
+  'done',
+  'wait',
+  '[ ! -e "$d/failed" ]',
+].join('\n');
 
 /** Move every entry of `$1` that `$2` lacks into it, descending into folders
  * both have: what is already in `$2` stays as it is. */
