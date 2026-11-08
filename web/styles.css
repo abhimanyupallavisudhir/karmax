@@ -706,7 +706,6 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .pipeline .seg.current.working { animation: pulse 1.4s ease-in-out infinite; }
 @media (prefers-reduced-motion: reduce) { .pipeline .seg.current.working { animation: none; } }
 .pipeline .seg.current.human { background: var(--working); }
-.pipeline .seg.current.waiting { background: var(--ink-3); }
 .pipeline .seg.current.failed { background: var(--danger); }
 .pipeline .seg.current:is(.stopped, .draft) { background: var(--line-strong); }
 .pipeline .seg.merged { background: var(--merged); opacity: 1; }
@@ -949,8 +948,10 @@ a.git-repo-name:hover { color:var(--accent); }
   border-radius: 50%; background: currentColor; animation: pulse 1.4s ease-in-out infinite; }
 @media (prefers-reduced-motion: reduce) { .chip.live::before { animation: none; } }
 /* A task's status (statusHtml): a glyph and its label, no pill — pills are
-   tags. The glyph's colour says who has the ball: an agent (accent), a person
-   (amber), nobody yet — time, quota, a job (grey) — or a finished state.
+   tags. The glyph's colour says whose move it is: a person's (amber), nobody's
+   because the task carries on by itself (accent: working, or a clock while it
+   waits for time, quota or a job), or nobody's because it is over (green,
+   red; grey only for what is not alive: a draft, a cancelled task).
    Filled glyphs knock their mark out in the card's colour. */
 .status { display: inline-flex; align-items: center; gap: 5px; font-family: var(--font-ui); font-size: var(--fs-12); line-height: 16px;
   font-weight: 500; color: var(--ink-2); white-space: nowrap; --status: var(--ink-3); }
@@ -958,7 +959,7 @@ a.git-repo-name:hover { color:var(--accent); }
 .status .mark { fill: none; stroke: var(--surface); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .status .mark-dot { fill: var(--surface); }
 .status-label::first-letter { text-transform: uppercase; }
-.status.working { --status: var(--accent); }
+.status:is(.working, .waiting) { --status: var(--accent); }
 .status.human { --status: var(--working); color: var(--ink); font-weight: 600; }
 .status.done { --status: var(--merged); }
 .status.failed { --status: var(--danger); color: var(--danger); font-weight: 600; }

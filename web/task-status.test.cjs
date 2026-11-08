@@ -70,7 +70,9 @@ test('no task status is drawn as a pill any more', () => {
   for (const legacy of ['chip ${status}', 'chip approval-needed">approval needed', 'chip approval-needed">Approval needed', 'class="chip attention', 'awaitingApprovalChip'])
     assert.ok(!src.includes(legacy), `still renders ${legacy}`);
   assert.match(css, /\.status\.human \{ --status: var\(--working\)/, 'a person’s turn is amber in every look');
-  assert.match(css, /\.pipeline \.seg\.current\.waiting \{ background: var\(--ink-3\)/, 'the stage bar takes the same tones');
+  assert.match(css, /\.status:is\(\.working, \.waiting\) \{ --status: var\(--accent\)/, 'a task carrying on by itself is accent, waiting or not');
+  assert.doesNotMatch(css, /\.status\.waiting \{[^}]*ink-3|\.seg\.current\.waiting \{ background: var\(--ink-3\)/, 'waiting is never grey like a draft');
+  assert.match(css, /\.pipeline \.seg\.current\.working \{ animation: pulse/, 'only working pulses: a wait is the same colour, still');
 });
 
 test('a project is marked with a box, not a checklist', () => {
