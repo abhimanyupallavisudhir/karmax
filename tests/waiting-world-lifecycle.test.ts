@@ -456,7 +456,8 @@ describe('resource work on a world the provider cannot start', () => {
     const full = () => Object.assign(new ProviderCapacityFull("Hetzner refused a new server: this Hetzner project's limit on public IP addresses is full"),
       { cause: new Error('Hetzner POST /servers failed (403): {"error":{"code":"resource_limit_exceeded"}}') });
     const resources = { settleReview: async () => { throw full(); }, takeDeliveries: async () => { throw full(); },
-      integratePublished: async () => { throw full(); }, stageCandidates: async () => { throw full(); } };
+      integratePublished: async () => { throw full(); }, stageCandidates: async () => { throw full(); },
+      openingWith: (_open: unknown, work: () => Promise<unknown>) => work() };
     const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
       profiles: new ProfileResolver(store, 'mock'), resources: resources as any });
     for (const run of [() => core.settleResourceReview('task'), () => core.refreshResourceForks('task'),
@@ -478,7 +479,8 @@ describe('resource work on a world another operation keeps busy', () => {
     const store = await Store.create(':memory:');
     const busy = () => new WorldBusy(20 * 60_000);
     const resources = { settleReview: async () => { throw busy(); }, takeDeliveries: async () => { throw busy(); },
-      integratePublished: async () => { throw busy(); }, stageCandidates: async () => { throw busy(); } };
+      integratePublished: async () => { throw busy(); }, stageCandidates: async () => { throw busy(); },
+      openingWith: (_open: unknown, work: () => Promise<unknown>) => work() };
     const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
       profiles: new ProfileResolver(store, 'mock'), resources: resources as any });
     for (const run of [() => core.settleResourceReview('task'), () => core.refreshResourceForks('task'),

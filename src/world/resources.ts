@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import crypto from 'node:crypto';
 import { ProviderOutage } from '../agent/limits.js';
 import { transferResourceChunk } from './resource-transfer.js';
@@ -386,6 +387,8 @@ export { WorldNotRunningError };
 
 export class ProjectResourceService {
   private publishLocks = new Map<string, Promise<void>>();
+  /** How the work in progress opens worlds (`openingWith`); else the registry. */
+  private openers = new AsyncLocalStorage<(handle: WorldHandle) => Promise<World>>();
   /** The restic repositories resources are saved in, and the server restic reaches them at. */
   readonly restic: ResticResources;
   readonly repositoryServer: ResourceRepositoryServer;
@@ -879,7 +882,7 @@ export class ProjectResourceService {
   }
 
   async scrubSecrets(handle: WorldHandle, liveWorld?: World): Promise<void> {
-    const world = liveWorld ?? await this.worlds.open(handle).catch(() => undefined);
+    const world = liveWorld ?? await this.openWorld(handle).catch(() => undefined);
     if (!world) return;
     for (const key of this.writtenSecrets.keys()) if (key.startsWith(writtenPrefix(handle))) this.writtenSecrets.delete(key);
     for (const key of this.grants.keys()) if (key.startsWith(`${handle.id}\0`)) this.grants.delete(key);
@@ -893,7 +896,7 @@ export class ProjectResourceService {
 
   async release(handle: WorldHandle, liveWorld?: World): Promise<void> {
     await this.scrubSecrets(handle, liveWorld);
-    const world = liveWorld ?? await this.worlds.open(handle).catch(() => undefined);
+    const world = liveWorld ?? await this.openWorld(handle).catch(() => undefined);
     const serviceHandles = handle.meta?.serviceEnvironmentHandles;
     if (serviceHandles && typeof serviceHandles === 'object')
       for (const value of Object.values(serviceHandles as Record<string, unknown>))
@@ -1486,6 +1489,25 @@ export class ProjectResourceService {
     return { entries: found, truncated };
   }
 
+  /**
+   * Run `work` with every world it opens opened by `open`: a workflow's
+   * activity passes its leased open, so resource work that wakes a parked
+   * world (a sub-task's delivery before the next turn, a save at Confirm) is
+   * admitted, held and parked again like a turn, instead of starting a
+   * machine nothing accounts for or parks — which the lifecycle sweep then
+   * stopped as a stray, under the turn that followed (pramana#137).
+   */
+  openingWith<T>(open: (handle: WorldHandle) => Promise<World>, work: () => Promise<T>): Promise<T> {
+    return this.openers.run(open, work);
+  }
+
+  private async openWorld(handle: WorldHandle, options?: WorldOpenOptions): Promise<World> {
+    const open = this.openers.getStore();
+    // Not waking it is never a lease's business.
+    if (open && options?.wake !== false) return open(handle);
+    return options ? this.worlds.open(handle, options) : this.worlds.open(handle);
+  }
+
   private async currentTaskWorld(taskId: string, open?: WorldOpenOptions) {
     const task = (await this.store.getTask(taskId));
     if (!task) throw new Error('calling task not found');
@@ -1494,7 +1516,7 @@ export class ProjectResourceService {
     const handle = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
     if (!handle) throw new Error('calling task has no active world');
     (await this.store.assertCurrentWorld(handle));
-    return { task, project, handle, world: await (open ? this.worlds.open(handle, open) : this.worlds.open(handle)) };
+    return { task, project, handle, world: await this.openWorld(handle, open) };
   }
 
   private async requiredCandidate(taskId: string, candidateId: string): Promise<ResourceCandidate> {
@@ -1798,7 +1820,7 @@ export class ProjectResourceService {
           if (candidate?.state === 'pending' && candidate.taskId === taskId && revisionId) {
             Object.assign(report, { path: candidate.sourcePath!, revisionId });
             const revision = (await this.store.getResourceRevision(revisionId))!;
-            const world = await this.worlds.open(handle);
+            const world = await this.openWorld(handle);
             const target = path.posix.resolve(worldWorkingDirectory(handle), candidate.sourcePath!);
             const present = await world.exec('bash', ['-c', 'test -e "$1" && echo present || echo absent', 'probe', target], { cwd: handle.root });
             if (present.stdout.trim() !== 'absent') throw new ResourceConflictError(candidate.sourcePath!, [candidate.sourcePath!], 'a sub-task');
@@ -1975,7 +1997,7 @@ export class ProjectResourceService {
    * them to the project's current baseline. */
   async checkpoint(handle: WorldHandle, checkContinue?: () => Promise<void>, onProgress?: (progress: ResourceSaveProgress) => void)
     : Promise<Array<{ attachmentId: string; revisionId: string }>> {
-    const world = await this.worlds.open(handle);
+    const world = await this.openWorld(handle);
     const refs: Array<{ attachmentId: string; revisionId: string }> = [];
     for (const lease of (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))) {
       await checkContinue?.();
@@ -2592,7 +2614,7 @@ export class ProjectResourceService {
       .find((candidate) => candidate.attachmentId === attachmentId && candidate.state === 'active');
     if (!lease) throw new Error('task has no active lease for resource');
     if (attachment.target.kind !== 'path') throw new Error('resource has no filesystem state to publish');
-    return { attachment, lease, handle, target: resourceAbsolutePath(handle, attachment), world: await this.worlds.open(handle) };
+    return { attachment, lease, handle, target: resourceAbsolutePath(handle, attachment), world: await this.openWorld(handle) };
   }
 
   private async requiredAttachment(id: string): Promise<ResourceAttachment> {

@@ -6,6 +6,8 @@ import { forcesRepeatable } from '../src/domain/triggers.js';
 import type { TaskRecord, TaskTrigger } from '../src/domain/types.js';
 import type { ProjectEvent, TriggerContext } from '../src/domain/project-events.js';
 import { storeBackends } from './helpers/store-backends.js';
+import { ERROR_REPORTS_KEY, ErrorReporter } from '../src/platform/error-reports.js';
+import { ERROR_FIXER_TRIGGER } from '../src/platform/error-fixer.js';
 
 class FakeClock {
   time = 1_000_000;
@@ -172,6 +174,23 @@ describe.each(storeBackends)('project event dispatch ($name)', ({ open }) => {
     await deliver(s, await record());
     expect(fires).toHaveLength(2);
     expect(told).toHaveLength(1);
+  });
+
+  // wiki features/error-reports: an outage raising many different errors
+  // starts one fixer, which hears of the rest while it works.
+  it('starts one fixer for tavya\'s own errors and tells it the rest', async () => {
+    told.length = 0;
+    const series = await armedTask([ERROR_FIXER_TRIGGER]);
+    await store.kvSet(ERROR_REPORTS_KEY, JSON.stringify({ projectId }));
+    const reporter = new ErrorReporter(store, { now: clock.now });
+    const s = await scheduler();
+    const first = (await reporter.report({ kind: 'request', error: new Error('first bug') }))!;
+    await deliver(s, first);
+    expect(fires).toMatchObject([{ taskId: series.id, mode: 'clone', trigger: { source: 'tavya', type: 'tavya.error' } }]);
+    const runId = (await store.getProjectEventClaim(first.id, series.id))!.runId!;
+    for (const bug of ['second bug', 'third bug']) await deliver(s, (await reporter.report({ kind: 'sweep', error: new Error(bug) }))!);
+    expect(fires).toHaveLength(1);
+    expect(told.map((entry) => [entry.runId, entry.trigger.payload.message])).toEqual([[runId, 'second bug'], [runId, 'third bug']]);
   });
 
   it('holds runs past the hourly limit until the hour has passed', async () => {

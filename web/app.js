@@ -25997,7 +25997,7 @@ function installationView() {
   return `<div class="organization-settings installation-settings"><div class="settings-header"><h1 class="page-title">Installation ${policyTip(`Settings for every organization and the machine running ${siteName()}. Only operators see them.`)}</h1></div>
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections">
-      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-limits">Service limits</a><a href="#installation-compute">Managed compute</a><a href="#installation-capacity">Host capacity</a>
+      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-errors">Error reports</a><a href="#installation-limits">Service limits</a><a href="#installation-compute">Managed compute</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
       <a href="#installation-access">Phone access</a>${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}
     </nav><div class="settings-content">
@@ -26005,6 +26005,8 @@ function installationView() {
       <div class="settings-section-title" id="installation-health"><div>Health ${policyTip(`Load, agent turns and every process ${siteName()} runs. Memory and disk are under Service limits.`)}</div></div>
       <div id="host-diag"><div class="card"><span class="task-sub">Loading…</span></div></div>
       <div id="proc-panel" style="margin-top:12px"></div>
+      <div class="settings-section-title" id="installation-errors"><div>Error reports ${policyTip(`Unexpected errors of ${siteName()}’s own start a task in this project that finds the cause and fixes it. One runs at a time; it hears of further errors while it works.`)}</div></div>
+      <div class="card" id="error-reports-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-limits"><div>Service limits ${policyTip(`Shared accounts and this server against their plans`)}</div></div>
       <div class="card service-limits" id="service-limits-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-compute"><div>Managed compute ${policyTip(`${siteName()}’s own provider accounts. Organizations without their own account run on them, and on the included model, charged to their plan’s monthly compute at twice the provider’s price.`)}</div></div>
@@ -26479,8 +26481,39 @@ async function hydratePlanAndBilling(organizationId) {
   });
 }
 
+// ── Error reports (Installation; wiki features/error-reports) ────────────────
+// Which project unexpected errors go to, and the task there that fixes them.
+function errorReportsMarkup(settings) {
+  const projects = inSidebarOrder((S.projects || []).filter((project) => project.organizationId === S.organizationId));
+  const options = [`<option value="">Off</option>`, ...projects.map((project) =>
+    `<option value="${esc(project.id)}" ${settings.projectId === project.id ? 'selected' : ''}>${esc(projectPath(project) || project.name)}</option>`)];
+  const fixer = settings.fixerTaskId && settings.projectId
+    ? `<a class="setting-muted" href="${esc(taskUrl(settings.fixerTaskId, { projectId: settings.projectId }))}" title="The task that fixes reported errors">Fixer ↗</a>` : '';
+  return `<div class="setting-rows"><div class="setting-row"><label class="setting-label" for="error-reports-project">Send to</label>
+    <span class="setting-value"><select id="error-reports-project" aria-label="Project error reports go to">${options.join('')}</select></span>
+    <span class="setting-actions">${fixer}</span></div></div>`;
+}
+async function wireErrorReportsCard() {
+  const card = $('#error-reports-card');
+  if (!card) return;
+  let settings;
+  try { settings = (await api('/api/settings/error-reports')).settings || {}; }
+  catch (error) { if (card.isConnected) paneError(card, error, () => wireErrorReportsCard()); return; }
+  if (!card.isConnected) return;
+  card.innerHTML = errorReportsMarkup(settings);
+  card.querySelector('#error-reports-project').addEventListener('change', async (event) => {
+    const control = event.currentTarget; control.disabled = true;
+    try {
+      await api('/api/settings/error-reports', { method: 'PUT', body: JSON.stringify({ projectId: control.value || null }) });
+      toast(control.value ? 'Error reports on' : 'Error reports off');
+    } catch (error) { toast(error.message || String(error), false); }
+    await wireErrorReportsCard();
+  });
+}
+
 function wireInstallationSettings() {
   wireInstallationUsers();
+  wireErrorReportsCard();
   wireSettingsNavigation();
   wireAppearanceCard();
   refreshHostDiag();

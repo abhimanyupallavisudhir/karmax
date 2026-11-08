@@ -126,6 +126,8 @@ import { worldRepos, worldWorkingDirectory, worldWorkingRelativePath, type World
 import { enumerateCredentials, normalizePolicy, resolveCredentials } from '../platform/credentials.js';
 import { errorStatus } from './error-status.js';
 import { projectReadiness, usableAgentCredentials, type ReadinessDeps } from '../platform/readiness.js';
+import { reportError } from '../platform/error-reports.js';
+import { errorReportSettings, saveErrorReportSettings } from '../platform/error-fixer.js';
 import { includedModel, includedModelView, removeIncludedModelKey, saveIncludedModel, seedIncludedModelDefaults } from '../agent/included-model.js';
 import type { Effort } from '../agent/effort.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
@@ -1433,7 +1435,7 @@ export class Gateway {
       const finish = this.operationalMetrics!.begin(req.url ?? '/');
       res.once('finish', () => finish(res.statusCode));
       res.once('close', () => finish(res.writableFinished ? res.statusCode : 499));
-      void this.handle(req, res).catch((e) => this.fail(res, e));
+      void this.handle(req, res).catch((e) => this.fail(res, e, req));
     });
     this.server = server;
 
@@ -2787,6 +2789,20 @@ export class Gateway {
         }
         const view = method === 'GET' ? (await service.view()) : (await service.run());
         return this.json(res, 200, { ...view, canManage: write || (await this.deps.tokens.check(token, 'settings:write')).ok });
+      }
+      // Error reports (wiki features/error-reports): GET where they go and the
+      // task that fixes them; PUT {projectId} sends them there and makes that
+      // task if the project has none, {projectId: null} turns them off.
+      if (p === '/api/settings/error-reports') {
+        if (method === 'GET') return this.json(res, 200, { settings: await errorReportSettings(store) });
+        if (method !== 'PUT') return this.json(res, 405, { error: 'method not allowed' });
+        const b = await this.body(req);
+        if (b.projectId !== null && typeof b.projectId !== 'string') return this.json(res, 400, { error: 'projectId must be a project id or null' });
+        if (b.projectId && !(await store.getProject(b.projectId))) return this.json(res, 404, { error: `no project ${b.projectId}` });
+        const settings = await saveErrorReportSettings(store, api, token, b.projectId || null);
+        await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'error-reports.save', 'installation:error-reports',
+          { ...settings, ...identityAuditDetail(callerIdentity) });
+        return this.json(res, 200, { settings });
       }
       // tavya's included model (wiki features/included-model): GET its
       // settings and this month's use; PUT {managementKey?, model?, effort?, enabled?}
@@ -11096,12 +11112,18 @@ export class Gateway {
   private badRequest(res: http.ServerResponse, e: unknown) {
     return this.json(res, errorStatus(e, 400), { error: e instanceof Error ? e.message : String(e) });
   }
-  private fail(res: http.ServerResponse, e: unknown) {
+  private fail(res: http.ServerResponse, e: unknown, req?: http.IncomingMessage) {
+    const status = errorStatus(e, e instanceof AttachmentError && /too large/i.test(e.message) ? 413 : 500);
+    // A 500 is a request nothing expected to fail: a bug to fix (wiki
+    // features/error-reports). Other 5xx name a cause of their own (busy, a
+    // provider down) and are answered as such.
+    if (status === 500) reportError({ kind: 'request', error: e,
+      where: `${req?.method ?? 'request'} ${routeTemplate((req?.url ?? '').split('?')[0] ?? '')}` });
     // Too late for an answer of its own: end the response, so the client is
     // not left waiting for the socket to time out.
     if (res.headersSent) { res.destroy(); return; }
     try {
-      this.json(res, errorStatus(e, e instanceof AttachmentError && /too large/i.test(e.message) ? 413 : 500),
+      this.json(res, status,
         { error: e instanceof URIError ? 'malformed address: a %-escape in it is not valid' : String((e as Error)?.message ?? e),
           ...grantRefusal(e), ...(e instanceof AuthorizationGrantError ? e.gap : {}) });
     } catch {
@@ -11534,4 +11556,10 @@ async function cleanupExpiredResourceUploads(store: Store,
     } catch { continue; } // preserve metadata so a temporarily unavailable customer bucket can be retried
     await discardResourceUpload(store, upload, objects, resources.storageLocationService());
   }
+}
+
+/** A request's path with its ids taken out, so one route's failures group as one. */
+function routeTemplate(path: string): string {
+  return path.split('/').map((segment) => /^[a-z]{2,12}_[a-z0-9]{8,}$/i.test(segment) || /^\d+$/.test(segment)
+    || /^[0-9a-f-]{16,}$/i.test(segment) ? ':id' : segment).join('/').slice(0, 200);
 }

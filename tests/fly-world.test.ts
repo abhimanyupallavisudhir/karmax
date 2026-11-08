@@ -192,3 +192,106 @@ describe.skipIf(!sshdAvailable)('Fly.io worlds (fake Machines API, real sshd)', 
     expect(disk[0]).toMatchObject({ diskGb: 100, activeMs: 3_600_000, costMicros: Math.round(100 * 0.15 / 720 * 1e6) });
   });
 });
+
+// pramana#137 (2026-11-08): the lifecycle sweep, in the gateway, stopped a Fly
+// world's machine in the same second a turn leased it; the worker had opened
+// that world before and trusted its own memory, so every turn, review and
+// checkpoint for 2.5 hours failed "could not reach the VM over SSH: Timed out
+// while waiting for handshake" (Fly's edge takes the connection of a stopped
+// machine and never answers). Whatever stops a machine, a caller who still
+// uses its world gets it running again, and one nobody uses stays stopped.
+describe.skipIf(!sshdAvailable)('Fly.io worlds whose machine stops or hangs under them', () => {
+  let fly: FakeFly;
+  let stamp: string;
+  const vm = (extra: ConstructorParameters<typeof VmWorldProvider>[3] = {}) =>
+    new VmWorldProvider(new FlyDriver(fly.fetch, 10, { image: async () => 'ghcr.io/owner/karmax-vm:v1' }), async () => connection(fly.token), undefined, {
+      socket: fly.socket, user: os.userInfo().username, home: fly.home,
+      provision: { stamp, script: `echo provisioned > ${stamp}`, sudo: false },
+      connectTimeoutMs: 1_000, reconnectDelaysMs: [50, 50, 50], ...extra,
+    });
+  const machine = () => [...fly.machines.values()][0]!;
+  const starts = () => fly.requests.filter((request) => request.method === 'POST' && request.path.endsWith('/start')).length;
+
+  beforeEach(() => {
+    fly = new FakeFly();
+    fly.silentEdge = true;
+    stamp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'vm-stamp-')), 'provisioned');
+  });
+  afterEach(async () => { await fly.close(); });
+
+  it('starts a machine another process stopped, for a world opened before and for one opened after (pramana#137)', async () => {
+    const worker = vm();
+    const gateway = vm();
+    const world = await worker.create({ taskId: 'task_137', base: 'main', generation: 1, organizationId: 'org_a' });
+    const handle = world.handle as WorldHandle;
+    await world.writeFile('kept.txt', 'on the volume');
+    // The gateway's sweep stops it: the worker's connection dies with the machine.
+    await gateway.stopStray(handle);
+    expect(machine().state).toBe('stopped');
+    // A world already in use carries on.
+    expect((await world.exec('sh', ['-c', 'cat kept.txt'])).stdout).toBe('on the volume');
+    expect(machine().state).toBe('started');
+    // Stopped again; a new open asks the cloud instead of trusting what this process remembers.
+    await gateway.stopStray(handle);
+    const reopened = await worker.open(handle);
+    expect((await reopened.exec('sh', ['-c', 'echo again'])).stdout).toBe('again\n');
+    expect(machine().state).toBe('started');
+  }, 60_000);
+
+  it('starts the machine once for every caller that finds it stopped', async () => {
+    const worker = vm();
+    const world = await worker.create({ taskId: 'task_many', base: 'main', generation: 1, organizationId: 'org_a' });
+    await vm().stopStray(world.handle as WorldHandle);
+    const before = starts();
+    const outputs = await Promise.all(Array.from({ length: 6 }, (_, index) => world.exec('sh', ['-c', `echo ${index}`])));
+    expect(outputs.map((output) => output.stdout)).toEqual(['0\n', '1\n', '2\n', '3\n', '4\n', '5\n']);
+    expect(starts() - before).toBe(1);
+  }, 60_000);
+
+  it('starts it inside the world\'s transition lock, and only for a world someone uses', async () => {
+    const worker = vm();
+    const world = await worker.create({ taskId: 'task_wanted', base: 'main', generation: 1, organizationId: 'org_a' });
+    const transitions: string[] = [];
+    let wanted = false;
+    worker.coordinate({
+      operation: async (worldId, work) => { transitions.push(worldId); return work(); },
+      wanted: async () => wanted,
+    });
+    // Parked by someone else, and nobody holds it: a leftover caller must not wake it.
+    await fly.stopOutOfBand(machine().id);
+    await expect(world.exec('sh', ['-c', 'echo stray'])).rejects.toMatchObject({ name: 'WorldNotRunningError' });
+    expect(machine().state).toBe('stopped');
+    // A turn leases it: now it is wanted, and the next command starts it.
+    wanted = true;
+    expect((await world.exec('sh', ['-c', 'echo leased'])).stdout).toBe('leased\n');
+    expect(machine().state).toBe('started');
+    expect(transitions).toContain('task_wanted');
+  }, 60_000);
+
+  it('restarts a running machine that stops answering SSH', async () => {
+    const worker = vm({ reachableMs: 1_500 });
+    const world = await worker.create({ taskId: 'task_hung', base: 'main', generation: 1, organizationId: 'org_a' });
+    await world.writeFile('kept.txt', 'still here');
+    fly.deafen(machine().id);
+    expect((await world.exec('sh', ['-c', 'cat kept.txt'])).stdout).toBe('still here');
+    expect(machine().state).toBe('started');
+    expect(fly.deaf.size).toBe(0);
+  }, 60_000);
+
+  it('says the machine is gone, so the world is recovered from its checkpoint, instead of timing out', async () => {
+    const worker = vm();
+    const world = await worker.create({ taskId: 'task_gone', base: 'main', generation: 1, organizationId: 'org_a' });
+    await new FlyDriver(fly.fetch, 10).destroy(connection(fly.token), { app: machine().app });
+    await expect(world.exec('true', [])).rejects.toMatchObject({ status: 404, message: expect.stringMatching(/no longer exists/) });
+  }, 60_000);
+
+  it('never wakes a world this process parked', async () => {
+    const worker = vm();
+    const world = await worker.create({ taskId: 'task_parked', base: 'main', generation: 1, organizationId: 'org_a' });
+    await worker.park(world.handle as WorldHandle);
+    const before = starts();
+    await expect(world.exec('true', [])).rejects.toThrow(/VM connection closed/);
+    expect(machine().state).toBe('stopped');
+    expect(starts()).toBe(before);
+  }, 60_000);
+});

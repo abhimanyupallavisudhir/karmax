@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { reportError } from '../platform/error-reports.js';
 import { Worker as Guardian } from 'node:worker_threads';
 import type { WorkerManager } from './worker-pool.js';
 import type { ExternalWorkflowRef } from '../packages/bundle.js';
@@ -63,6 +64,7 @@ export function serveWorkerProcess(create: () => Promise<WorkerProcessRuntime>, 
   // uncaught exceptions still use Node's normal crash/restart behavior.
   process.on('unhandledRejection', reason => {
     console.error('unhandled rejection (worker kept running):', reason instanceof Error ? reason.stack ?? reason.message : reason);
+    reportError({ kind: 'rejection', error: reason, where: 'worker process' });
   });
   const guardian = watchParent();
   let runtime: WorkerProcessRuntime | undefined;
