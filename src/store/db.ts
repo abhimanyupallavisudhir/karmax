@@ -276,6 +276,7 @@ export const STORE_LOCK_ORDER = [
   'project:<projectId>', 'task-num:<projectId>', // project tags/views/members; task numbers and order
   'world:<worldId>', 'execution:<id>',
   'vault:<orgId>', // an organization's vault item index, credential requests and connector outbox
+  'vault-keyring:<scope>', // creating or shredding a vault scope's keyring (vault-database.ts)
   'kv:<key>', 'wiki:<orgId>:<path>', 'permission-requests:<orgId>:<taskId>', 'service-connections:<orgId>:<taskId>', // one value rewritten from its previous value
 ] as const;
 // Row locks follow every advisory key. A refresh write-back (refresh-lease.ts)
@@ -286,7 +287,9 @@ export const STORE_LOCK_ORDER = [
 // share-locks its scope's vault_keyrings row, then swaps vault_entries rows;
 // rotating or shredding a scope (key rotation, organization deletion, account
 // erasure) locks that keyring row FOR UPDATE first, so no write lands under a
-// data key being retired.
+// data key being retired. A scope with no keyring row has nothing to lock, so
+// a shred and a write creating the keyring both take `vault-keyring:<scope>`;
+// the write takes it only when it found no keyring row, so holds none of it.
 
 /** Advisory lock namespaces registering in-flight seqs per table (PostgreSQL); see migrate(). */
 const SEQ_KEYS = { events: 1802661240, audit_log: 1802661340 } as const;
