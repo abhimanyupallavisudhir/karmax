@@ -7671,7 +7671,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   return `
     <div class="task-row ${archived ? 'archived' : ''}${taskHasUnreadAsk(t.id) ? ' unread' : ''}" data-id="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
       <div class="task-main">
-        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
+        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}${t.params?.coordinator ? ` ${coordinatorChip(t)}` : ''}</div>
         <div class="task-sub">
           ${where}${why}
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
@@ -8272,7 +8272,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['run'], query 
     const open = expanded.has(t.id);
     return `<div class="pick-row" data-nav data-task="${t.id}">
       <div class="task-main">
-        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">Archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">Repeatable</span>' : ''}${t.params?.avatar ? ` ${avatarChip}` : ''}</div>
+        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">Archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">Repeatable</span>' : ''}${t.params?.avatar ? ` ${avatarChip}` : ''}${t.params?.coordinator ? ` ${coordinatorChip(t)}` : ''}</div>
         <div class="task-sub">${organizationWide && t.projectId !== S.projectId ? projectLabel(t) : ''}${statusHtml(chipLabel, tone)}${priorityFlag(t)}${tagChips(t, false)}</div>
       </div>
       ${mode === 'agent' ? `<span class="pk-caret">${open ? '▾' : '▸'}</span>` : ''}
@@ -9757,6 +9757,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
             </div>`}
             <section class="tf-section tf-triggers">${triggersSection(values, draft?.id)}</section>
             ${templateEdit ? '' : `<section class="tf-section tf-avatar">${avatarSectionHtml(values.avatar)}</section>`}
+            ${coordinatorSelectable(fields) ? `<section class="tf-section tf-coordinator">${coordinatorSectionHtml(values.coordinator)}</section>` : ''}
           </div>
           <aside class="tf-side">
             <div class="form-row" data-row="__org">
@@ -10017,6 +10018,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     // An Avatar only once its risk was acknowledged: auto-save never makes one.
     const avatar = avatarCommitted ? readAvatarSection($('#tf-body')) : undefined;
     if (avatar) body.avatar = avatar;
+    const coordinator = readCoordinatorSection($('#tf-body'));
+    if (coordinator) body.coordinator = coordinator;
     // Where it came from in the Task store, which counts what the project took.
     if (values.template) body.template = values.template;
     // The wiki-context row. Always sent — even empty,
@@ -10546,6 +10549,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   };
   const submitCommitted = async (draftMode) => (await commitAvatar()) && submit(draftMode);
   $('#tf-save-avatar')?.addEventListener('click', () => submitCommitted(true));
+  wireCoordinatorSection(root);
   $('#tf-draft')?.addEventListener('click', () => submitCommitted(true));
   $('#tf-queue').addEventListener('click', () => submitCommitted(false));
   // A repeatable store task installs; unticked, it runs once.
@@ -15271,7 +15275,8 @@ function waitingText(w) {
   }
   // A paused agent's ask carries the time it carries on without an answer.
   if (w?.kind === 'human') return Number.isFinite(w.until) ? `Needs input until ${waitDeadline(w.until)}` : 'Needs input';
-  if (w?.kind === 'timer') return Number.isFinite(w.until) ? `Waiting until ${waitDeadline(w.until)}` : 'Waiting';
+  // A permanent co-ordinator's rest says when it checks in.
+  if (w?.kind === 'timer') return Number.isFinite(w.until) ? `${w.summary === 'Checks in' ? 'Checks in at' : 'Waiting until'} ${waitDeadline(w.until)}` : 'Waiting';
   // A full provider limit: what it waits for, and when it tries again; a
   // queued machine, its place in the queue (what is full is its tooltip, waitTitle).
   if (w?.kind === 'retry' && typeof w.summary === 'string' && w.summary.trim())
@@ -15984,9 +15989,12 @@ function paramsSection(v) {
     perRepo ? repoBranchesFrozenRow(perRepo, paramCurrentValue(perRepo, v, rec), lock) : '',
     ...whereFields.filter((f) => f !== perRepo && (pair.length < 2 || !pair.includes(f))).map(rowFor),
   ].join('');
-  const triggers = Array.isArray(rec?.params?.triggers) && rec.params.triggers.length
+  const triggers = (Array.isArray(rec?.params?.triggers) && rec.params.triggers.length
     ? `<div class="form-row pf-frozen" data-row="__triggers"><div class="label-row"><label>Triggers</label>${lock}<span class="label-row-fill"></span></div>
-        <div class="pf-ro">${esc(triggerSummary(rec.params.triggers))}</div></div>` : '';
+        <div class="pf-ro">${esc(triggerSummary(rec.params.triggers))}</div></div>` : '')
+    + (rec?.params?.coordinator
+      ? `<div class="form-row pf-frozen" data-row="__coordinator"><div class="label-row"><label>Permanent co-ordinator</label>${lock}<span class="label-row-fill"></span></div>
+        <div class="pf-ro">Checks in ${esc(coordinatorIntervalText(rec.params.coordinator))}</div></div>` : '');
   const footer = editable.size
     ? `<div class="params-save-bar" data-save-state="${editDraft?.dirtyNames?.length ? 'dirty' : 'saved'}">
         <span class="save-state" id="params-save-status" role="status" data-state="${editDraft?.dirtyNames?.length ? 'dirty' : ''}">${editDraft?.dirtyNames?.length ? 'Unsaved changes' : ''}</span>
@@ -19113,6 +19121,46 @@ function readAvatarSection(root) {
     // Every role ticked is no restriction.
     ...(roles.length < AVATAR_ROLE_CHOICES.length ? { roles } : {}) };
 }
+// ── Permanent co-ordinator (wiki features/coordinator) ─────────────────────
+// The task form's last row: a task that runs the project like its CEO, and
+// the longest it rests after it stops (`params.coordinator.wakeHours`).
+const COORDINATOR_DEFAULT_HOURS = 24;
+const COORDINATOR_TIP = 'Runs the project like its CEO: creates and steers other tasks, lands its own changes as separate pull requests, and never finishes. Whenever it stops, it checks in again within this many hours. If it fails, you get a critical notification.';
+// Only a Software dev task can be one (it lands work and makes sub-tasks).
+function coordinatorSelectable(fields) {
+  return (fields || []).some((f) => f.name === 'multiPr');
+}
+function coordinatorSectionHtml(value) {
+  const setting = value === true ? {} : value && typeof value === 'object' ? value : null;
+  const hours = Number(setting?.wakeHours) > 0 ? Number(setting.wakeHours) : COORDINATOR_DEFAULT_HOURS;
+  return `<div class="form-row" data-row="__coordinator">
+    <div class="tf-coordinator-line">
+      <label class="tf-coordinator-toggle"><input type="checkbox" class="toggle" id="tf-coordinator" ${setting ? 'checked' : ''}> Permanent co-ordinator</label>${policyTip(COORDINATOR_TIP)}
+      <label class="tf-coordinator-wake" ${setting ? '' : 'hidden'}>Checks in every
+        <input type="number" id="tf-coordinator-hours" min="0.02" max="8760" step="any" inputmode="decimal" value="${esc(String(hours))}" aria-label="Check-in interval (hours)"> h</label>
+    </div>
+  </div>`;
+}
+function readCoordinatorSection(root) {
+  if (!root?.querySelector('#tf-coordinator')?.checked) return undefined;
+  const raw = String(root.querySelector('#tf-coordinator-hours')?.value ?? '').trim().replace(',', '.');
+  const hours = Number(raw);
+  return { wakeHours: raw && Number.isFinite(hours) && hours > 0 ? hours : COORDINATOR_DEFAULT_HOURS };
+}
+function wireCoordinatorSection(root) {
+  const box = root?.querySelector('#tf-coordinator');
+  box?.addEventListener('change', () => {
+    const wake = root.querySelector('.tf-coordinator-wake');
+    if (wake) wake.hidden = !box.checked;
+  });
+}
+// "every 24 h", "every 30 min": a co-ordinator's interval, read-only.
+function coordinatorIntervalText(setting) {
+  const hours = Number(setting?.wakeHours) > 0 ? Number(setting.wakeHours) : COORDINATOR_DEFAULT_HOURS;
+  return hours < 1 ? `every ${Math.round(hours * 60)} min` : `every ${+hours.toFixed(2)} h`;
+}
+const coordinatorChip = (t) => `<span class="chip coordinator-chip" title="Permanent co-ordinator: checks in ${esc(coordinatorIntervalText(t.params.coordinator))}">Co-ordinator</span>`;
+
 // Making a task an Avatar says what it risks, until "Don't show this again".
 const AVATAR_NOTICE_KEY = 'tavya.avatarNoticeDismissed';
 function confirmAvatar() {

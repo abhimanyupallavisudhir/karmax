@@ -3753,6 +3753,15 @@ html[data-theme="dark"] .github-signin-btn:active,
 .tf-avatar-forks { grid-column: 1 / -1; display: inline-flex; align-items: center; gap: 6px; width: max-content; font-size: var(--fs-12); font-weight: 600; color: var(--ink-2); cursor: pointer; }
 .tf-avatar-forks input { width: auto; margin: 0; padding: 0; }
 .avatar-chip { color: var(--accent); }
+/* Permanent co-ordinator (wiki features/coordinator): the form's last row,
+   shaped like the Avatār's; its interval sits on the same line. */
+.tf-coordinator .form-row { display: flex; flex-direction: column; gap: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
+.tf-coordinator-line { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; }
+.tf-coordinator-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-12); font-weight: 600; color: var(--ink-2); cursor: pointer; }
+.tf-coordinator-wake { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; font-size: var(--fs-12); color: var(--ink-2); }
+.tf-coordinator-wake[hidden] { display: none; }
+.tf-coordinator-wake input { width: 72px; margin: 0; padding: 3px 6px; text-align: right; }
+.coordinator-chip { color: var(--accent); }
 .avatar-notice-overlay { position: fixed; inset: 0; z-index: 90; display: grid; place-items: center; padding: 20px; background: rgb(0 0 0 / .35); }
 .avatar-notice { width: min(480px, calc(100vw - 28px)); display: flex; flex-direction: column; gap: 12px; padding: 18px; }
 .avatar-notice h2 { margin: 0; font-size: var(--fs-15); }

@@ -109,6 +109,7 @@ import { withPullRequestStates } from '../integrations/github-pr.js';
 import { lifecycleEventPayload } from '../domain/view-publication.js';
 import { listState } from '../domain/list-state.js';
 import { taskForkSourceIds } from '../domain/forks.js';
+import { coordinatorSetting } from '../domain/coordinator.js';
 
 /** How many dismissals a person's preferences keep (the newest). */
 const MAX_DISMISSED = 500;
@@ -4794,6 +4795,20 @@ export class Store {
       .map(rowToTask);
   }
 
+  /** Permanent co-ordinators whose run failed outright, with when it failed
+   * (wiki features/coordinator): each is restarted once its interval passed. */
+  async failedCoordinators(): Promise<Array<{ id: string; wakeHours: number; failedAt: number }>> {
+    const rows = (await this.db.prepare(`SELECT id, params, statusChangedAt FROM tasks
+      WHERE json_extract(params, '$.coordinator') IS NOT NULL AND json_extract(lastView, '$.status') = 'failed'
+      ORDER BY createdAt`).all()) as Array<{ id: string; params: unknown; statusChangedAt?: number | string | null }>;
+    return rows.flatMap((row) => {
+      const setting = coordinatorSetting(typeof row.params === 'string' ? JSON.parse(row.params) : row.params as Record<string, unknown>);
+      // Before the column was kept, a failure counts as long ago.
+      const failedAt = Number(row.statusChangedAt ?? 0);
+      return setting ? [{ id: row.id, wakeHours: setting.wakeHours, failedAt: Number.isFinite(failedAt) ? failedAt : 0 }] : [];
+    });
+  }
+
   /** Runs spawned from a series (repeatable template), newest first.
    *  Filtered in SQL — this is reachable unpaginated from an HTTP request, so the
    *  old whole-table scan + JS filter was a per-request full transcript hydration. */
@@ -5865,6 +5880,11 @@ export class Store {
     // `escalated` and no `waitingFor`: it is blocked on a person all the same
     // (legibench3#18 escalated this way and told nobody).
     const escalated = ev.type === 'view.updated' && ev.payload.stage === 'escalated' && !finished;
+    // A permanent co-ordinator that fails — its run, or a stage it could not
+    // get past — is a critical ask: the project stops being run (wiki
+    // features/coordinator). It retries on its own within its interval.
+    const coordinatorFailed = ev.type === 'view.updated' && !!coordinatorSetting(task.params)
+      && (status === 'failed' || status === 'blocked' || escalated);
 
     // ── Discharge: drop what the task no longer needs from anybody ───────────
     if (APPROVAL_DECISION_TYPES.includes(ev.type) || APPROVAL_DISMISSAL_TYPES.includes(ev.type)) {
@@ -5937,6 +5957,9 @@ export class Store {
         : [];
       // An ask that resolves to nobody still reaches someone who can act.
       if (!users.length) users = (await this.escalationAudience(task));
+    } else if (coordinatorFailed) {
+      kind = 'escalated'; actionable = true;
+      users = (await this.escalationAudience(task));
     } else if (ev.type === 'view.updated' && (ev.payload.waitingFor === 'human' || escalated && ev.payload.waitingFor !== 'parent')) {
       // (A sub-task escalated to its parent asks its parent's agent, not people.)
       // The lifecycle states that are an ask: the task is parked ON a human.
@@ -5957,7 +5980,8 @@ export class Store {
     // lifecycle ticks that restate it carry none. So an explicit level always
     // wins, and silence leaves whatever the ask was already raised at — never
     // demoting an agent's "critical" back to the kind's default on the next tick.
-    const requested = ev.payload.urgency === undefined ? undefined : normalizeUrgency(ev.payload.urgency);
+    const requested = coordinatorFailed ? 'critical' as const
+      : ev.payload.urgency === undefined ? undefined : normalizeUrgency(ev.payload.urgency);
     for (const userId of new Set(users)) {
       const preferences = (await this.getDeliveryPreferences(userId, project.organizationId));
       if (!actionable && !preferences.routine) continue;
