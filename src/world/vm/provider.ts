@@ -313,6 +313,10 @@ export class VmWorldProvider implements WorldProvider {
     return probed ?? 'ready';
   }
 
+  openReference(handle: WorldHandle): void {
+    this.reference(handle);
+  }
+
   async probe(handle: WorldHandle): Promise<WorldLifecycleState | undefined> {
     const sealed = this.reference(handle);
     try { return await this.driver.state(await this.connection(connectionScope(sealed)), sealed); }
