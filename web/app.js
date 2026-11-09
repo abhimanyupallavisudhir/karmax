@@ -8929,7 +8929,7 @@ const CRON_FIELDS = [
   { id: 'cron-dow', label: 'Day of week', hint: '0–6 (Sun–Sat)' },
 ];
 
-function triggersSection(values, selfId) {
+function triggersSection(values, selfId, { followUp = false } = {}) {
   const existing = Array.isArray(values.triggers) ? values.triggers : [];
   const sched = existing.find((t) => t.kind === 'schedule' && t.cron);
   const at = existing.find((t) => t.kind === 'schedule' && t.at !== undefined);
@@ -8948,7 +8948,7 @@ function triggersSection(values, selfId) {
   // whether each start is a fresh run (a schedule forces that on).
   return `
     <div class="form-row" data-row="__triggers">
-      <div class="label-row"><label>Triggers</label>${policyTip('Start this task after other tasks finish, on a schedule, or both (it waits for all of them). Leave empty to start now.')}<span class="label-row-fill"></span></div>
+      ${followUp ? '' : `<div class="label-row"><label>Triggers</label>${policyTip('Start this task after other tasks finish, on a schedule, or both (it waits for all of them). Leave empty to start now.')}<span class="label-row-fill"></span></div>`}
       <div class="triggers-block">
         <span class="tb-label">After</span>
         <div class="chip-input" id="dep-box">
@@ -8959,10 +8959,10 @@ function triggersSection(values, selfId) {
         <div class="cron-grid">${gridCells}</div>
         <label class="tb-label" for="trig-at">Or once at</label>
         <input id="trig-at" type="datetime-local" value="${atVal}">
-        <label class="tb-label" for="ev-type">On event ${policyTip('Start when something happens: a GitHub issue is labelled, a webhook or chat message arrives, another task emits an event. Each event starts its own run and the run receives the event.')}</label>
-        ${eventTriggerHtml(existing.find((t) => t.kind === 'event'))}
+        <label class="tb-label" for="ev-type">On event ${policyTip(followUp ? 'Follow up when something happens: a GitHub issue is labelled, a webhook or chat message arrives, another task emits an event.' : 'Start when something happens: a GitHub issue is labelled, a webhook or chat message arrives, another task emits an event. Each event starts its own run and the run receives the event.')}</label>
+        ${eventTriggerHtml(existing.find((t) => t.kind === 'event'), { followUp })}
         <label class="tb-repeat"><input type="checkbox" class="toggle" id="trig-repeatable" ${values.repeatable ? 'checked' : ''}>
-          Repeatable ${policyTip('Each run is kept: a trigger (or “Run again”) spawns a fresh run instead of running this task once.')}</label>
+          ${followUp ? `Repeat ${policyTip('Fire on every match, not only the first.')}` : `Repeatable ${policyTip('Each run is kept: a trigger (or “Run again”) spawns a fresh run instead of running this task once.')}`}</label>
       </div>
     </div>`;
 }
@@ -8987,17 +8987,17 @@ function eventConditionParts(expected) {
   return ['eq', expected === null ? 'null' : String(expected ?? '')];
 }
 
-function eventTriggerHtml(trigger) {
+function eventTriggerHtml(trigger, { followUp = false } = {}) {
   const conditions = Object.entries(trigger?.where || {}).filter(([, v]) => !(v && typeof v === 'object' && 'exists' in v))
     .map(([path, expected]) => eventConditionHtml(path, ...eventConditionParts(expected))).join('');
   const mode = trigger?.concurrency ? trigger.concurrency.mode || 'skip' : '';
-  return `<div class="ev-trigger" id="ev-trigger"${trigger ? '' : ' data-fresh="1"'}>
+  return `<div class="ev-trigger" id="ev-trigger"${trigger || followUp ? '' : ' data-fresh="1"'}>
     <input id="ev-type" list="ev-types" placeholder="github.issues.labeled" value="${esc(trigger?.type || '')}" autocomplete="off" spellcheck="false">
     <datalist id="ev-types"></datalist><datalist id="ev-paths"></datalist>
     <div id="ev-conds">${conditions}</div>
     <div class="ev-more" ${trigger ? '' : 'hidden'}>
       <button type="button" class="btn sm" id="ev-add-cond">＋ Only when…</button>
-      <select id="ev-mode" aria-label="If its run is still going" title="If an earlier run is still going">
+      <select id="ev-mode" aria-label="If its run is still going" title="If an earlier run is still going" ${followUp ? 'hidden' : ''}>
         <option value="" ${mode === '' ? 'selected' : ''}>Always start a run</option>
         <option value="skip" ${mode === 'skip' ? 'selected' : ''}>Skip while one runs</option>
         <option value="queue" ${mode === 'queue' ? 'selected' : ''}>Wait for it</option>
@@ -15277,8 +15277,13 @@ function waitingText(w) {
   }
   // A paused agent's ask carries the time it carries on without an answer.
   if (w?.kind === 'human') return Number.isFinite(w.until) ? `Needs input until ${waitDeadline(w.until)}` : 'Needs input';
-  // A permanent co-ordinator's rest says when it checks in.
-  if (w?.kind === 'timer') return Number.isFinite(w.until) ? `${w.summary === 'Checks in' ? 'Checks in at' : 'Waiting until'} ${waitDeadline(w.until)}` : 'Waiting';
+  // A permanent co-ordinator's rest says when it checks in; a task with
+  // follow-up triggers, what it waits for.
+  if (w?.kind === 'timer') {
+    if (!Number.isFinite(w.until)) return 'Waiting';
+    if (typeof w.summary === 'string' && w.summary.startsWith('Waiting for')) return `${w.summary.slice(0, 56)} until ${waitDeadline(w.until)}`;
+    return `${w.summary === 'Checks in' ? 'Checks in at' : 'Waiting until'} ${waitDeadline(w.until)}`;
+  }
   // A full provider limit: what it waits for, and when it tries again; a
   // queued machine, its place in the queue (what is full is its tooltip, waitTitle).
   if (w?.kind === 'retry' && typeof w.summary === 'string' && w.summary.trim())
@@ -16016,7 +16021,7 @@ function paramsSection(v) {
   const renderKey = JSON.stringify([v.taskId, v.workflow, terminal, fields.map(({ participant: _p, ...f }) => f), [...editable], inheritedAll,
     fields.filter((f) => !editable.has(f.name)).map((f) => paramCurrentValue(f, v, rec)),
     TERMINAL_STAGES.includes(v.stage) || !!v.pointOfNoReturnPassed,
-    authorizationLiveKey(v.taskId), paymentsLiveKey(v), v.computerChange || null]);
+    authorizationLiveKey(v.taskId), paymentsLiveKey(v), v.computerChange || null, followUpsKey(v, rec)]);
   // A workflow without an agent field still shows the task's own authority.
   const authorityOnly = mainAgent ? '' : `<section class="tp-section"><div class="form-row" data-row="__authorization">
     ${agentAuthorityHtml('tp-main', null, { ...mainAuthorityParams(v), open: !!S.mainAuthorityOpen?.[v.taskId] })}</div></section>`;
@@ -16024,7 +16029,29 @@ function paramsSection(v) {
     ${authorityOnly}
     ${agentFields.map((f) => `<section class="tp-section tp-${esc(f.type)}">${rowFor(f)}</section>`).join('')}
     ${where || triggers ? `<section class="tp-section tp-where">${where}${triggers}</section>` : ''}
+    ${followUpPanel(v, rec)}
     ${footer}</div>`;
+}
+
+// When a started task hears about something later (wiki features/follow-up-triggers).
+// Open on a finished task too: that is when firing forks it.
+function followUpPanel(v, rec) {
+  if (!rec || !['software-dev', 'goal', 'just-do'].includes(v.workflow) || v.status === 'cancelled'
+    || rec.params?.command || rec.params?.draft || rec.params?.triggerState === 'armed') return '';
+  const shown = followUpTriggersOf(rec).filter((t) => !t.whileRunning);
+  const repeat = !!shown.find((t) => t.kind === 'event')?.recurring;
+  return `<details class="tp-follow-ups" id="tp-follow-ups" ${shown.length ? 'open' : ''}>
+    <summary>Follow-up triggers${shown.length ? `<span class="pf-summary">${esc(triggerSummary(shown))}</span>` : ''}${policyTip('Tell the agent when other tasks finish, at a time, or when something happens. If it is busy it hears when it can; if the task is done, a fork carries on.')}</summary>
+    ${triggersSection({ triggers: shown, repeatable: repeat }, v.taskId, { followUp: true })}
+    <div class="params-save-bar" data-save-state="saved"><span class="save-state" id="fu-status" role="status"></span><button class="btn sm primary" id="fu-save" disabled>Save follow-up triggers</button></div>
+  </details>`;
+}
+function followUpTriggersOf(rec) {
+  return Array.isArray(rec?.params?.followUpTriggers) ? rec.params.followUpTriggers : [];
+}
+// A form being edited is not replaced under the person because the list changed.
+function followUpsKey(v, rec) {
+  return S.followUpsEdited?.[v.taskId] ?? JSON.stringify(followUpTriggersOf(rec));
 }
 
 // An agent's state changes often while a task runs; its chip is repainted in
@@ -16188,6 +16215,7 @@ function wireParams(v) {
     wireAgentFields(root, { projectId, organizationId, inheritedAuthority: () => taskAuthorityOf(taskRecord(v.taskId)) });
     const main = root.querySelector('#tp-auth, #tp-auth-frozen')?.closest('.agent-authority');
     main?.addEventListener('toggle', () => { (S.mainAuthorityOpen ||= {})[v.taskId] = main.open; }, { signal: wiring.signal });
+    wireFollowUpTriggers(v, wiring.signal);
   }
   const saveBtn = document.getElementById('params-save');
   if (!saveBtn) return;
@@ -16257,6 +16285,45 @@ function wireParams(v) {
     } catch (e) {
       draft.saving = false;
       draft.sync();
+      toast(e.message, true);
+    }
+  });
+}
+
+function wireFollowUpTriggers(v, signal) {
+  const panel = document.getElementById('tp-follow-ups');
+  const saveBtn = document.getElementById('fu-save');
+  if (!panel || !saveBtn) return;
+  const status = document.getElementById('fu-status');
+  const rec = () => taskRecord(v.taskId);
+  const shown = () => followUpTriggersOf(rec()).filter((t) => !t.whileRunning);
+  wireDepPicker({ triggers: shown() }, v.taskId);
+  wireScheduleBuilder();
+  wireEventTrigger(rec()?.projectId || S.projectId);
+  const read = () => collectTriggers(shown());
+  let saved = JSON.stringify(read());
+  const sync = () => {
+    const dirty = JSON.stringify(read()) !== saved;
+    (S.followUpsEdited ||= {});
+    if (dirty) S.followUpsEdited[v.taskId] ??= JSON.stringify(followUpTriggersOf(rec()));
+    else delete S.followUpsEdited[v.taskId];
+    setParamSaveState(panel, saveBtn, status, dirty ? 'dirty' : 'saved');
+  };
+  panel.addEventListener('input', sync, { signal });
+  panel.addEventListener('change', sync, { signal });
+  saveBtn.addEventListener('click', async () => {
+    setParamSaveState(panel, saveBtn, status, 'saving');
+    try {
+      const whileRunning = followUpTriggersOf(rec()).filter((t) => t.whileRunning);
+      await api(`/api/tasks/${v.taskId}/params`, { method: 'PATCH', body: JSON.stringify({ params: { followUpTriggers: [...read(), ...whileRunning] } }) });
+      const fresh = await api(`/api/tasks/${v.taskId}/follow-up-triggers`);
+      if (rec()) rec().params = { ...rec().params, followUpTriggers: fresh.triggers };
+      saved = JSON.stringify(read());
+      toast('Follow-up triggers saved');
+      sync();
+      setTimeout(refreshTask, 250);
+    } catch (e) {
+      sync();
       toast(e.message, true);
     }
   });

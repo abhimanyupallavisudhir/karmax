@@ -38,9 +38,10 @@ import {
 import { templateContent, templateName, templateParams, templateAuthorization } from '../domain/task-templates.js';
 import { derivedTaskTitle, isDerivedTaskTitle } from '../domain/task-title.js';
 import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget, type Avatar, type InheritedConversation, type TaskCreatedVia, type TaskCreator } from '../domain/types.js';
-import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries } from '../domain/triggers.js';
+import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries,
+  normalizeFollowUpTriggers, validateFollowUpTriggers, followUpTriggerSummary, followUpsAfterFiring, type FollowUpTrigger, type TaskTrigger, isTrigger } from '../domain/triggers.js';
 import { STORE_TASKS, runsOnInstall, storeTaskNeeds, storeTaskRepeatable, takenFromStore, type StoreNeed, type StoreTask } from '../domain/task-store.js';
-import { applyTriggerContext, normalizeEventInput, validateFollow, type EventFilter, type EventFollow, type ProjectEvent, type ProjectEventClaim,
+import { applyTriggerContext, followUpMessage, normalizeEventInput, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventInput, type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
 import { newId } from '../util/id.js';
 import { IncomingWebhooks, WebhookConfigError, webhookDeliveryKey, type IncomingWebhook, type WebhookPatch } from '../integrations/incoming-webhooks.js';
@@ -191,6 +192,8 @@ export interface TriggerArmer {
   validationErrors?(task: TaskRecord): string[] | Promise<string[]>;
   /** A project event was recorded in this process (the inbox; see triggers). */
   projectEventRecorded?(event: ProjectEvent): void;
+  /** Listen for a started task's follow-up triggers (none: stop listening). */
+  armFollowUps?(task: TaskRecord): unknown;
 }
 
 // Human-facing stage names. `do` is the replay-stable internal key; a person
@@ -254,8 +257,6 @@ const QUERY_TIMEOUT_MS = 3000;
  * "clicked queue, nothing happened, pile of tasks stuck at setup" failure mode).
  */
 const START_TIMEOUT_MS = 12_000;
-/** Follows one task may hold (wiki features/events-and-automations). */
-const MAX_FOLLOWS_PER_TASK = 50;
 /** How many tasks of a fork lineage, and how many conversation events of each,
  *  a forked conversation shows before its own (`taskForkHistory`). */
 const FORK_HISTORY_DEPTH = 8;
@@ -1550,6 +1551,8 @@ export class KarmaxApi {
       draft?: boolean;
       /** Job-shaped permission profile for every agent spawned by this workflow. */
       authorizationProfile?: string;
+      /** Who the task is for, when it is made on their behalf (a follow-up trigger's fork keeps its source's). */
+      createdBy?: PrincipalRef;
       /** Canonical level plus its project-list / organization / global scope. */
       authorization?: AuthorizationSelection;
       /** Draft auto-save may preserve an over-broad selection as an explicitly
@@ -1755,7 +1758,7 @@ export class KarmaxApi {
     if (!args.draft) (await this.assertRepositoriesValid(manifest, project, resolved));
 
     const title = args.title?.trim() || derivedTaskTitle(resolved);
-    const createdBy = await this.taskCreator(caller, project.id);
+    const createdBy = args.createdBy ?? (await this.taskCreator(caller, project.id));
     const createdVia = await this.creationCredential(caller);
     // Pin the connected account when the task is created. Switching the user's
     // active account later must not silently change an existing task's commit or
@@ -1770,6 +1773,8 @@ export class KarmaxApi {
     // old task-level policy only for API/backward compatibility; the UI never
     // creates one and new workflows publish their current audience with the wait.
     const confirmationPolicy = args.confirmationPolicy;
+    if (Object.hasOwn(taskOverrides, 'followUpTriggers'))
+      taskOverrides.followUpTriggers = (await this.checkedFollowUpTriggers(taskOverrides.followUpTriggers, project.id)) as unknown as ValueMap[string];
     // A repeatable "series" (Model A) — forced on by a cron/recurring trigger.
     const repeatable = !!taskOverrides.repeatable || forcesRepeatable(normalizeTriggers(taskOverrides));
     // Persist only the task's OWN overrides (sparse), not the resolved snapshot.
@@ -2045,6 +2050,7 @@ export class KarmaxApi {
     }
     (await dispatchEnd());
     (await this.saveAgentSnapshot(task.id, manifest, input));
+    (await this.armer?.armFollowUps?.(task));
     // Waited for only briefly (#396 review item 10): a hung GitHub must not hold
     // the create until the client times out and retries it into a duplicate.
     // A later answer is still journaled; only `warnings` misses it.
@@ -2627,7 +2633,9 @@ export class KarmaxApi {
       (await this.deps.store.getProject(task.projectId))?.organizationId);
     if (started) (await this.saveAgentSnapshot(task.id, started.manifest, input));
     (await this.consumeDiscardProgress(taskId));
-    return (await this.deps.store.getTask(taskId))!;
+    const queued = (await this.deps.store.getTask(taskId))!;
+    (await this.armer?.armFollowUps?.(queued));
+    return queued;
   }
 
   /**
@@ -3232,9 +3240,10 @@ export class KarmaxApi {
     if (!series) throw new NotFoundError(`no task ${seriesId}`);
     (await this.assertStoredGrantQueueable(token, caller, series));
     // A run an event started carries that event (wiki features/events-and-automations).
-    const shaped = trigger
-      ? applyTriggerContext(series.title, { ...cloneParamsWithoutTriggers(series.params), runOf: seriesId }, trigger)
-      : { title: series.title, params: { ...cloneParamsWithoutTriggers(series.params), runOf: seriesId } };
+    // Each run listens for the series' follow-up triggers; the series never runs.
+    const followUpTriggers = normalizeFollowUpTriggers(series.params);
+    const inherited = { ...cloneParamsWithoutTriggers(series.params), ...(followUpTriggers.length ? { followUpTriggers } : {}), runOf: seriesId };
+    const shaped = trigger ? applyTriggerContext(series.title, inherited, trigger) : { title: series.title, params: inherited };
     let run = (await this.deps.store.createTask({
       projectId: series.projectId,
       listId: series.listId,
@@ -3265,6 +3274,8 @@ export class KarmaxApi {
     const started = this.resolveStart(run.workflow, run.workflowVersion,
       (await this.deps.store.getProject(run.projectId))?.organizationId);
     if (started) (await this.saveAgentSnapshot(run.id, started.manifest, input));
+    run = (await this.deps.store.getTask(run.id)) ?? run;
+    (await this.armer?.armFollowUps?.(run));
     return run;
   }
 
@@ -3280,12 +3291,13 @@ export class KarmaxApi {
    * (a repeatable series — cron, or any recurring trigger). Re-arms the task on a
    * start failure so a fire is never silently lost.
    */
-  async fireTriggeredTask(token: string, taskId: string, mode: 'self' | 'clone', trigger?: TriggerContext): Promise<{ startedTaskId: string }> {
+  async fireTriggeredTask(token: string, taskId: string, mode: 'self' | 'clone' | 'followUp', trigger?: TriggerContext, cause?: TaskTrigger): Promise<{ startedTaskId: string; told?: true }> {
     const armed = (await this.deps.store.getTask(taskId));
     const caller = (await this.require(token, 'create_task', { projectId: armed?.projectId, taskId }));
     if (!armed) throw new NotFoundError(`no task ${taskId}`);
 
     if (mode === 'clone') return { startedTaskId: (await this.spawnRun(token, taskId, trigger)).id };
+    if (mode === 'followUp') return this.fireFollowUp(taskId, trigger, cause);
 
     // Under the task's lock, from its latest params: an edit of the armed task
     // either lands before (and starts with it) or is refused (writeUnstartedParams).
@@ -3436,46 +3448,91 @@ export class KarmaxApi {
   }
 
   /** A run started by an event follows what the event is about: the issue's
-   *  comments, the chat thread's replies reach it as messages. */
+   *  comments, the chat thread's replies reach it as messages, while it runs. */
   private async followTriggerSubject(task: TaskRecord, trigger: TriggerContext | undefined): Promise<void> {
-    if (!trigger?.subject || (await this.deps.store.taskFollows(task.id)).some((follow) => follow.subject === trigger.subject && !follow.type && !follow.source && !follow.where)) return;
-    (await this.deps.store.addTaskFollow({ id: newId('fol'), taskId: task.id, projectId: task.projectId, subject: trigger.subject, createdAt: Date.now() }));
+    const subject = trigger?.subject;
+    if (!subject) return;
+    const added = await this.deps.store.updateFollowUpTriggers(task.id, (current) => current.some((t) => t.kind === 'event' && t.subject === subject && t.type === '*') ? current
+      : [...current, { id: newId('fol'), kind: 'event', type: '*', subject, recurring: true, whileRunning: true }]);
+    if (added.length) (await this.armer?.armFollowUps?.((await this.deps.store.getTask(task.id)) ?? task));
+  }
+
+  /** Who may set a task's follow-up triggers, beyond `task:edit`: firing one
+   *  can fork the task with the task's authority, so someone who could not
+   *  start it with that authority cannot arrange for it either. Its own agent
+   *  already acts with it. */
+  private async assertMayFollowUp(token: string, caller: ScopedToken, task: TaskRecord): Promise<void> {
+    if (!QUEUEING_WORKFLOWS.has(task.workflow) || task.params?.command) throw new ValidationError('this task has no agent to follow up');
+    if (task.lastView?.status === 'cancelled') throw new ValidationError('this task was cancelled, so nothing can follow it up');
+    if (caller.kind === 'agent' && caller.taskId === task.id) return;
+    (await this.assertStoredGrantQueueable(token, caller, task));
+  }
+
+  /** A list from anyone, made safe to store: each trigger has an id (the given
+   *  one is kept, so an edit does not re-issue them) and can fire. */
+  private async checkedFollowUpTriggers(raw: unknown, projectId: string, taskId?: string): Promise<FollowUpTrigger[]> {
+    if (!Array.isArray(raw)) throw new ValidationError('`followUpTriggers` must be a list of triggers');
+    if (raw.some((trigger) => !isTrigger(trigger))) throw new ValidationError('each follow-up trigger needs a `kind` of event, schedule or dependency');
+    const triggers = (raw as FollowUpTrigger[]).map((trigger) => ({ ...trigger, id: typeof trigger.id === 'string' && trigger.id ? trigger.id : newId('fol') }));
+    const organizationId = (await this.deps.store.getProject(projectId))?.organizationId ?? 'org_personal';
+    // A dependency in another organization does not exist for it (its outcome is that tenant's data).
+    const exists = async (id: string) => { const project = await this.deps.store.taskMetadata(id).then((t) => t && this.deps.store.getProject(t.projectId));
+      return !!project && (project.organizationId ?? 'org_personal') === organizationId; };
+    const errors = await validateFollowUpTriggers(triggers, { ...(taskId ? { taskId } : {}), exists });
+    if (errors.length) throw new ValidationError(errors.join('; '));
+    return triggers;
+  }
+
+  private async saveFollowUpTriggers(taskId: string, triggers: FollowUpTrigger[]): Promise<void> {
+    (await this.deps.store.updateFollowUpTriggers(taskId, () => triggers, { clearPending: true }));
+    (await this.armer?.armFollowUps?.((await this.deps.store.getTask(taskId))!));
+  }
+
+  /** Add one follow-up trigger, leaving the task's others alone. */
+  async addFollowUpTrigger(token: string, taskId: string, trigger: unknown): Promise<FollowUpTrigger> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    const caller = (await this.require(token, 'edit_task', { projectId: task.projectId, taskId }));
+    (await this.assertMayFollowUp(token, caller, task));
+    const [added] = await this.checkedFollowUpTriggers([trigger], task.projectId, taskId);
+    const list = await this.checkedFollowUpTriggers([...normalizeFollowUpTriggers(task.params), added], task.projectId, taskId);
+    (await this.saveFollowUpTriggers(taskId, list));
+    return added!;
+  }
+
+  async removeFollowUpTrigger(token: string, taskId: string, triggerId: string): Promise<void> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    (await this.require(token, 'edit_task', { projectId: task.projectId, taskId }));
+    const current = normalizeFollowUpTriggers(task.params);
+    if (!current.some((trigger) => trigger.id === triggerId)) throw new NotFoundError(`no follow-up trigger ${triggerId} on task ${taskId}`);
+    (await this.saveFollowUpTriggers(taskId, current.filter((trigger) => trigger.id !== triggerId)));
+  }
+
+  async listFollowUpTriggers(token: string, taskId: string): Promise<FollowUpTrigger[]> {
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'get_task', { projectId: task?.projectId ?? '__missing__', taskId }));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    return normalizeFollowUpTriggers(task.params);
   }
 
   /**
-   * Follow project events (wiki features/events-and-automations): each match
-   * reaches the task's conversation as a message. A message ends a pause, so an
-   * agent waits for an event by following it `once` and pausing. Following reads
-   * the project's events and messages the task, so it needs both rights.
+   * A follow-up trigger fired: say so to the task. Every firing goes through
+   * the queue, durably, first: whether it reaches the agent now, waits, or
+   * forks the finished task is `flushPendingMessages`' one decision, so a
+   * restart mid-way loses nothing. A one-shot is used up before the delivery,
+   * so a fork made from it does not inherit it.
    */
-  async followProjectEvents(token: string, taskId: string, input: { type?: string; source?: string; subject?: string; where?: EventFilter;
-    includeSelf?: boolean; once?: boolean }): Promise<EventFollow> {
-    const task = (await this.deps.store.getTask(taskId));
-    (await this.require(token, 'list_events', { projectId: task?.projectId ?? '__missing__', taskId }));
-    (await this.require(token, 'message_agent', { projectId: task?.projectId ?? '__missing__', taskId }));
-    if (!task) throw new NotFoundError(`no task ${taskId}`);
-    const errors = validateFollow(input);
-    if (errors.length) throw new ValidationError(errors.join('; '));
-    if ((await this.deps.store.taskFollows(taskId)).length >= MAX_FOLLOWS_PER_TASK)
-      throw new ValidationError(`a task follows at most ${MAX_FOLLOWS_PER_TASK} kinds of event; unfollow one first`);
-    const pick = <K extends keyof typeof input>(key: K) => (input[key] === undefined || input[key] === false ? {} : { [key]: input[key] });
-    return this.deps.store.addTaskFollow({ id: newId('fol'), taskId, projectId: task.projectId,
-      ...pick('type'), ...pick('source'), ...pick('subject'), ...pick('where'), ...pick('includeSelf'), ...pick('once'), createdAt: Date.now() });
-  }
-
-  async listTaskFollows(token: string, taskId: string): Promise<EventFollow[]> {
-    const task = (await this.deps.store.getTask(taskId));
-    (await this.require(token, 'list_events', { projectId: task?.projectId ?? '__missing__', taskId }));
-    if (!task) throw new NotFoundError(`no task ${taskId}`);
-    return this.deps.store.taskFollows(taskId);
-  }
-
-  async unfollowProjectEvents(token: string, taskId: string, followId: string): Promise<void> {
-    const task = (await this.deps.store.getTask(taskId));
-    (await this.require(token, 'message_agent', { projectId: task?.projectId ?? '__missing__', taskId }));
-    const follow = (await this.deps.store.getTaskFollow(followId));
-    if (!task || follow?.taskId !== taskId) throw new NotFoundError(`no follow ${followId} on task ${taskId}`);
-    (await this.deps.store.deleteTaskFollow(followId));
+  private async fireFollowUp(taskId: string, context: TriggerContext | undefined, cause: TaskTrigger | undefined): Promise<{ startedTaskId: string; told: true }> {
+    const message: Message = { id: `u${randomUUID()}`, role: 'user', text: followUpMessage(cause, context), ts: Date.now(), authorLabel: 'Follow-up trigger' };
+    await this.withPendingLock(taskId, async () =>
+      this.writePending(taskId, [...(await this.readPending(taskId)), { message, role: MAIN_AGENT, by: 'system:triggers', fromTrigger: { ...(context ? { context } : {}) } }]));
+    const firedId = (cause as FollowUpTrigger | undefined)?.id;
+    const before = normalizeFollowUpTriggers((await this.deps.store.getTask(taskId))?.params).length;
+    const left = await this.deps.store.updateFollowUpTriggers(taskId, (current) => followUpsAfterFiring(current, firedId), { clearPending: true });
+    if (left.length !== before) (await this.armer?.armFollowUps?.((await this.deps.store.getTask(taskId))!));
+    await this.flushPendingMessages(taskId);
+    return { startedTaskId: taskId, told: true };
   }
 
   /** Newest first, each with what it did for every armed task it reached. */
@@ -3855,6 +3912,7 @@ export class KarmaxApi {
         ...(agents ? { agents } : {}),
         ...(task ? { stageTransitions: (await this.availableStageTransitions(task, view, group)) } : {}),
         actions: this.messageActions(view, task),
+        ...this.waitingOnFollowUps(view, task),
         ...(pending.length ? { pendingMessages: pendingForView(pending, viewer.principal) } : {}),
         ...((await this.deps.store.kvGet(`project-transfer-history:${taskId}`))
           ? { actions: [], stageTransitions: [] } : {}),
@@ -6889,11 +6947,15 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
    * the proposal is still landing), keeps its settings and authorization, and
    * starts from the message. It shows as a fork of this task.
    */
-  async continueTask(token: string, taskId: string, input: { text: string; images?: ImageRef[]; files?: FileRef[] }): Promise<TaskRecord> {
+  async continueTask(token: string, taskId: string, input: { text: string; images?: ImageRef[]; files?: FileRef[] },
+    /** A follow-up trigger, not someone, is carrying the done task on: it may be
+     * any finished task with an agent, and the trigger's context and what is
+     * left of its triggers go with the new task. */
+    triggered?: { context?: TriggerContext; followUpTriggers: FollowUpTrigger[] }): Promise<TaskRecord> {
     const source = (await this.deps.store.getTask(taskId));
     (await this.require(token, 'fork_agent', { projectId: source?.projectId, taskId }));
     if (!source) throw new NotFoundError(`no task ${taskId}`);
-    if (!continuesInNewTask(source, source.lastView))
+    if (!(triggered ? source.lastView?.status === 'done' : continuesInNewTask(source, source.lastView)))
       throw new ValidationError('only a task whose proposal was confirmed continues in a new task; message its agent instead');
     if (!input.text.trim() && !input.images?.length && !input.files?.length) throw new ValidationError('a message needs text or an attachment');
     const params: ValueMap = stripPlatformMetadata(cloneParamsWithoutTriggers({ ...source.params } as ValueMap));
@@ -6902,8 +6964,10 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     // A budget is money for the task it is set on: the source's (often just the
     // defaults it started with) carries on only for someone who may set one.
     // Anyone else's continuation spends under today's defaults, and asks above them.
-    if (!(await this.deps.tokens.check(token, 'payment:write', { projectId: source.projectId, taskId })).ok)
+    if (triggered || !(await this.deps.tokens.check(token, 'payment:write', { projectId: source.projectId, taskId })).ok)
       delete params.paymentPolicy;
+    if (triggered?.context) params.trigger = triggered.context as unknown as ValueMap[string];
+    if (triggered?.followUpTriggers.length) params.followUpTriggers = triggered.followUpTriggers as unknown as ValueMap[string];
     const field = params['agent:do'] === undefined && params['agent:unified'] !== undefined ? 'agent:unified' : 'agent:do';
     const { resumeFrom: _previous, ...agent } = (params[field] ?? {}) as Partial<AgentSpec>;
     params[field] = { ...agent, resumeFrom: { taskId, role: MAIN_AGENT } };
@@ -6918,6 +6982,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       ...(previous.authorization ? { authorization: previous.authorization } : {}),
       credentialGrants: previous.credentialGrants,
       credentialPolicies: previous.credentialPolicies,
+      ...(triggered && source.createdBy ? { createdBy: source.createdBy } : {}),
     });
   }
 
@@ -7300,6 +7365,14 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     return followUp && (!followUp.roles?.length || followUp.roles.includes(role as AgentRole)) ? followUp : undefined;
   }
 
+  /** A timed pause on a task with follow-up triggers is a wait for them: say which. */
+  private waitingOnFollowUps(view: TaskView, task: TaskRecord | undefined): Pick<TaskView, 'waitingFor'> | undefined {
+    const waiting = view.waitingFor;
+    const triggers = normalizeFollowUpTriggers(task?.params).filter((trigger) => !trigger.whileRunning);
+    if (view.status !== 'waiting' || waiting?.kind !== 'timer' || waiting.summary || !triggers.length) return undefined;
+    return { waitingFor: { ...waiting, summary: `Waiting for ${followUpTriggerSummary(triggers)}` } };
+  }
+
   /** Serialize every change to one task's queue (and its delivery) in this process. */
   private pendingLocks = new Map<string, Promise<unknown>>();
   private withPendingLock<T>(taskId: string, work: () => Promise<T>): Promise<T> {
@@ -7370,11 +7443,24 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       const continued: Array<{ messageId: string; task: TaskLink }> = [];
       while (queue.length) {
         const task = (await this.deps.store.getTask(taskId));
-        const next = queue[0]!;
-        const followUp = task && this.openFollowUp(task, task.lastView, next.role);
-        if (!task || !followUp) break;
+        // Done: no message can reach this task any more, so a trigger's goes
+        // first, ahead of any person's left waiting, and forks it.
+        const followUpFor = (entry: PendingMessage) => task && this.openFollowUp(task, task.lastView, entry.role);
+        const waiting = !followUpFor(queue[0]!) && task?.lastView?.status === 'done' ? queue.find((entry) => entry.fromTrigger) : undefined;
+        const next = waiting ?? queue[0]!;
+        const followUp = followUpFor(next);
+        const done = task?.lastView?.status === 'done';
+        if (!task || (!followUp && !(next.fromTrigger && done))) break;
+        if (next.fromTrigger && followUp?.label === CONTINUE_ACTION().label && !done) break; // Still landing.
         try {
-          if (followUp.label === CONTINUE_ACTION().label) {
+          if (next.fromTrigger && done) {
+            const created = await this.forkFromFollowUp(task, next);
+            continued.push({ messageId: next.message.id, task: taskLink(created) });
+            continuation = { task: created, rest: queue.filter((entry) => entry !== next) };
+            queue = [];
+            break;
+          }
+          if (followUp!.label === CONTINUE_ACTION().label) {
             // Confirmed meanwhile: the message carries the work on in a new
             // task, as it would have had it been sent now (wiki
             // features/continue-after-confirm). Whatever was said after it goes
@@ -7382,16 +7468,18 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
             const created = await this.continueAsSender(task, next);
             if (!created) break;
             continued.push({ messageId: next.message.id, task: taskLink(created) });
-            continuation = { task: created, rest: queue.slice(1) };
+            continuation = { task: created, rest: queue.filter((entry) => entry !== next) };
             queue = [];
             break;
           }
           await this.dispatchFollowUp(task, next.role === MAIN_AGENT ? undefined : next.role, next.message);
         } catch (error) {
           console.warn(`[karmax] could not deliver a queued message to ${taskId}:`, error);
+          // A done task's view never changes again, so nothing else would try this fork again.
+          if (next.fromTrigger && task.lastView?.status === 'done') this.retryForkLater(taskId);
           break;
         }
-        queue = queue.slice(1);
+        queue = queue.filter((entry) => entry !== next);
       }
       if (queue.length !== before) await this.writePending(taskId, queue, continued);
     }).catch((error) => console.warn(`[karmax] queued messages of ${taskId}:`, error));
@@ -7402,6 +7490,35 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
         .catch((error) => console.warn(`[karmax] could not carry queued messages on to ${task.id}:`, error));
       void this.flushPendingMessages(task.id);
     }
+  }
+
+  private forkRetries = new Map<string, number>();
+  /** A fork that could not be created (the engine was down, say) is tried again
+   *  a few times, then waits for the next boot's flush of every kept queue. */
+  private retryForkLater(taskId: string): void {
+    const attempts = (this.forkRetries.get(taskId) ?? 0) + 1;
+    if (attempts > 6) { this.forkRetries.delete(taskId); return; }
+    this.forkRetries.set(taskId, attempts);
+    setTimeout(() => void this.flushPendingMessages(taskId), attempts * 60_000).unref?.();
+  }
+
+  /** A trigger fired at a done task: its agent carries on in a new task, with
+   *  the task's authority (it was checked when the trigger was set) and without
+   *  its budget (money is per task; a fork spends under the current defaults).
+   *  What is left of the triggers moves to the fork, so a chain of them keeps
+   *  to one line of work instead of branching off the original every time. */
+  private async forkFromFollowUp(task: TaskRecord, entry: PendingMessage): Promise<TaskRecord> {
+    const { token } = await this.deps.tokens.mintPrincipal('system:triggers', ['*'], undefined, 10 * 60_000);
+    try {
+      const fork = await this.continueTask(token, task.id, { text: entry.message.text }, {
+        ...(entry.fromTrigger?.context ? { context: entry.fromTrigger.context } : {}),
+        followUpTriggers: normalizeFollowUpTriggers(task.params),
+      });
+      (await this.deps.store.updateFollowUpTriggers(task.id, () => [], { clearPending: true }));
+      (await this.armer?.armFollowUps?.((await this.deps.store.getTask(task.id))!));
+      this.forkRetries.delete(task.id);
+      return fork;
+    } finally { await this.deps.tokens.revoke(token).catch(() => undefined); }
   }
 
   /** Continue a confirmed task from a kept message, as its sender: with what
@@ -7677,6 +7794,13 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
         paymentPolicy = (await this.checkedTaskPaymentPolicy(token, task, patch.paymentPolicy));
       delete patch.paymentPolicy;
     }
+    // Not the workflow's and not frozen by it: they matter most after it has ended.
+    let followUpTriggers: FollowUpTrigger[] | undefined;
+    if (Object.hasOwn(patch, 'followUpTriggers')) {
+      (await this.assertMayFollowUp(token, caller, task));
+      followUpTriggers = await this.checkedFollowUpTriggers(patch.followUpTriggers, task.projectId, taskId);
+      delete patch.followUpTriggers;
+    }
     this.assertBranchParams(patch);
     // A permanent co-ordinator's interval changes at any time; being one doesn't.
     const coordinatorEdit = Object.hasOwn(patch, 'coordinator');
@@ -7780,6 +7904,10 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       if (paymentPolicy !== undefined) {
         (await this.deps.store.patchTaskParams(taskId, { paymentPolicy }));
         result.applied = [...result.applied, 'paymentPolicy'];
+      }
+      if (followUpTriggers) {
+        (await this.saveFollowUpTriggers(taskId, followUpTriggers));
+        result.applied = [...result.applied, 'followUpTriggers'];
       }
       (await this.updateAgentSnapshot(taskId, patch, result.applied));
       if (result.applied.includes('target') && typeof patch.target === 'string')
