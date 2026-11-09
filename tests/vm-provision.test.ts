@@ -1,6 +1,9 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { vmProvisionFailure, vmProvisionScript } from '../src/world/vm/provision.js';
+import { vmBootScript, volumeTmpScript, vmProvisionFailure, vmProvisionScript } from '../src/world/vm/provision.js';
 
 /**
  * The provisioning script every Fly/Hetzner machine without karmax's image
@@ -32,6 +35,14 @@ describe('VM provisioning script', () => {
       'libffi-dev', 'libpq-dev', 'imagemagick', 'gh', 'wget', 'git'])
       expect(script).toMatch(new RegExp(`[ \\\\]${pkg.replace(/[.+]/g, '\\$&')}( |\\\\|\\n)`));
     expect(script).toContain('break-system-packages = true');
+  });
+
+  // f53f650e6ca76f9f: Fly's 8 GB root disk, kept by persist_rootfs, held 1.1 GB
+  // of npm's cache from earlier provisioning versions when it filled.
+  it('leaves no download cache on the root disk, after its last install', () => {
+    const last = Math.max(script.lastIndexOf('npm install'), script.lastIndexOf('apt-get install'), script.lastIndexOf('playwright install'));
+    expect(script.indexOf('npm cache clean --force')).toBeGreaterThan(last);
+    expect(script.indexOf('apt-get clean')).toBeGreaterThan(last);
   });
 
   it('names the step that failed when run, also through retry', () => {
@@ -92,5 +103,61 @@ describe('vmProvisionFailure', () => {
 
   it('falls back to the end of the log when nothing reads as an error', () => {
     expect(vmProvisionFailure('one\ntwo\nbroken\n', 3)).toBe('the script exited with status 3:\none\ntwo\nbroken');
+  });
+});
+
+/** Mounting needs a mount namespace of our own; CI images may forbid one. */
+const namespaces = spawnSync('unshare', ['-rm', 'true']).status === 0;
+
+/**
+ * f53f650e6ca76f9f (2026-11-09): a VM world's /tmp was on its small root disk,
+ * which tavya never measures. The session holder keeps every process's state
+ * there, so a full /tmp failed "could not start the process in the VM (status
+ * 1)", and Bigger disk would have grown the volume, not the disk that was full.
+ */
+describe('VM /tmp on the world\'s volume', () => {
+  it('is part of every boot, after the volume is mounted and before sshd lets anyone in', () => {
+    for (const foreground of [false, true]) {
+      const boot = vmBootScript({ foreground });
+      const at = boot.indexOf(volumeTmpScript('/home/user'));
+      expect(at).toBeGreaterThan(boot.indexOf('mount /home/user'));
+      expect(at).toBeLessThan(boot.indexOf('touch "$K/booted"'));
+    }
+  });
+
+  it.skipIf(!namespaces)('puts /tmp on the volume, emptied at each boot, and leaves a machine without a volume alone', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vm-tmp-'));
+    try {
+      const home = path.join(dir, 'home'), tmp = path.join(dir, 'tmp');
+      fs.mkdirSync(home); fs.mkdirSync(tmp);
+      fs.writeFileSync(path.join(tmp, 'on-root-disk'), '');
+      fs.mkdirSync(path.join(tmp, 'pytest-of-user'));
+      fs.mkdirSync(path.join(tmp, 'systemd-private-abc-chrony.service-x'));
+      const boot = volumeTmpScript(home, tmp);
+      // In a namespace of its own: the volume is a filesystem of its own (a
+      // tmpfs here), holding the last boot's /tmp; then two boots' scripts run,
+      // the second as a repeat within the same boot.
+      const run = spawnSync('unshare', ['-rm', 'sh', '-ec', `
+        mount -t tmpfs volume ${home}
+        mkdir ${home}/.karmax-tmp && touch ${home}/.karmax-tmp/last-boot
+        ${boot}
+        stat -c %a ${tmp}; ls -A ${tmp}; echo ---
+        touch ${tmp}/this-boot
+        ${boot}
+        ls -A ${tmp}; ls -A ${home}/.karmax-tmp; echo ---
+        [ "$(stat -c %d ${tmp})" = "$(stat -c %d ${home})" ] && echo on-volume; echo ---
+        umount ${tmp}; ls -A ${tmp}
+      `], { encoding: 'utf8' });
+      expect(run.stderr).toBe('');
+      expect(run.stdout.split('---\n').map((part) => part.trim())).toEqual(['1777', 'this-boot\nthis-boot', 'on-volume',
+        // The root disk's /tmp was emptied, not just hidden; services' private ones stay.
+        'systemd-private-abc-chrony.service-x']);
+      // No volume of its own (an image builder): /tmp stays where it is.
+      const builderTmp = path.join(dir, 'builder-tmp');
+      fs.mkdirSync(builderTmp);
+      fs.writeFileSync(path.join(builderTmp, 'kept'), '');
+      const alone = spawnSync('unshare', ['-rm', 'sh', '-ec', `${volumeTmpScript(dir, builderTmp)}\nls -A ${builderTmp}`], { encoding: 'utf8' });
+      expect([alone.stdout.trim(), alone.stderr]).toEqual(['kept', '']);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });

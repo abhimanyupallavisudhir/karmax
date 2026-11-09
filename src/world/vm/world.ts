@@ -13,7 +13,8 @@ import { quote, type SshChannel, type SshTransport, VmTransportError } from './s
 
 const SESSION_SCRIPT = fs.readFileSync(fileURLToPath(new URL('./session.sh', import.meta.url)), 'utf8');
 const SESSION_HASH = crypto.createHash('sha256').update(SESSION_SCRIPT).digest('hex').slice(0, 12);
-/** Session state lives on the machine's own disk: no process outlives a park. */
+/** Session state lives in /tmp, which the boot empties (no process outlives a
+ * park) and puts on the world's volume (`vmBootScript`). */
 const SESSIONS = '/tmp/karmax-sessions';
 // Same bounds as E2B and Daytona: a stream that keeps dropping is not a blip.
 const REATTACH_LIMIT = 3;
@@ -229,17 +230,22 @@ export class VmWorld implements World {
   }
 
   /** Run one `session.sh` operation to completion. */
-  async session(args: string[], input?: string): Promise<{ stdout: string; code: number }> {
+  async session(args: string[], input?: string): Promise<{ stdout: string; stderr: string; code: number }> {
     const script = await this.script();
     const result = await this.transport.exec(`sh ${[script, ...args].map(quote).join(' ')}`,
       { timeoutMs: 60_000, ...(input !== undefined ? { input } : {}) });
-    return { stdout: result.stdout.toString('utf8'), code: result.code };
+    return { stdout: result.stdout.toString('utf8'), stderr: result.stderr.toString('utf8'), code: result.code };
   }
 
   private async startSession(mode: 'pty' | 'pipe', cols: number, rows: number, launch: string): Promise<VmSession> {
     const dir = path.posix.join(SESSIONS, crypto.randomBytes(9).toString('base64url'));
     const started = await this.session(['start', dir, mode, String(cols), String(rows)], launch);
-    if (started.code !== 0) throw new Error(`could not start the process in the VM (status ${started.code})`);
+    // The holder's own words ("mkdir: … No space left on device"): the status
+    // alone named no cause, and a full disk read as the agent's error.
+    if (started.code !== 0) {
+      const reason = started.stderr.trim().split('\n').slice(-3).join('; ').slice(0, 500);
+      throw new Error(`could not start the process in the VM (status ${started.code})${reason ? `: ${reason}` : ''}`);
+    }
     const session = new VmSession(this, dir, await this.script());
     session.follow();
     return session;

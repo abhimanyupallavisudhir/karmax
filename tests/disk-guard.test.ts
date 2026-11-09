@@ -94,6 +94,8 @@ describe('out of disk', () => {
       'Claude provider invalid_request: OAuth access token could not be refreshed: the disk that holds the Claude Code config directory, or the disk quota on it, is full; delete files you no longer need on that disk and try again',
       'Failed to refresh OAuth token: the disk that holds the Claude Code config directory (~/.claude by default), or your disk quota on it, is full. Delete files you no longer need on that disk and retry',
       "Disk full: this computer's volume holding /tmp/claude-1000 (Claude Code's temporary directory) has 3 MB free",
+      // A VM world's session holder (f53f650e6ca76f9f).
+      "Failed to spawn Claude Code process: could not start the process in the VM (status 1): cat: write error: No space left on device",
     ]) expect(isDiskFullMessage(message)).toBe(true);
     for (const message of ['exited with code 127', 'Error: spawn ENOENT', 'disk usage is fine', 'rate limited', 'the disk is fully encrypted'])
       expect(isDiskFullMessage(message)).toBe(false);
