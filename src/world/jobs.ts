@@ -63,6 +63,28 @@ export function jobDirectory(world: Pick<World, 'handle'>, id: string, root = JO
   return path.posix.join(world.handle.root.replace(/\\/g, '/'), root, id);
 }
 
+/**
+ * Bash defining `now_ms`, which prints the world's clock in epoch
+ * milliseconds. It reads bash's own `EPOCHREALTIME` (5.0+, microseconds, with
+ * the locale's decimal separator), not a `date` format extension: `%N` and
+ * `%3N` are GNU's, and uutils' date (Ubuntu 26's coreutils) strips the leading
+ * zeros of the nanoseconds before keeping three digits, so at 0.086 s
+ * `date +%s%3N` reads 862 ms and the clock runs backwards (CI #2739, #2740). Without
+ * `EPOCHREALTIME` it falls back to whole seconds of `date +%s`, which every
+ * date has. A wall clock: say how long something took with {@link WORLD_TICKS_MS}.
+ */
+export const WORLD_NOW_MS = 'now_ms() { local t=${EPOCHREALTIME:-}; t=${t//[!0-9]/};'
+  + ' if [ ${#t} -gt 6 ]; then echo $((10#$t / 1000)); else echo $(($(date +%s) * 1000)); fi; }';
+
+/**
+ * Bash defining `ticks_ms`, a clock in milliseconds that never goes back
+ * (Linux's /proc/uptime, in hundredths of a second, which no clock step or
+ * NTP correction moves), else `now_ms`. Only differences mean anything:
+ * `$(( $(ticks_ms) - began ))`, kept from going below 0 for the fallback.
+ */
+export const WORLD_TICKS_MS = `${WORLD_NOW_MS}
+ticks_ms() { local u _; if { read -r u _ < /proc/uptime; } 2>/dev/null; then u=\${u//[!0-9]/}; echo $((10#$u * 10)); else now_ms; fi; }`;
+
 // `alive DIR` — true while the job's session leader is the very process that
 // was started (a recycled pid has a different start tick).
 const ALIVE = `alive() { p=$(cat "$1/pid" 2>/dev/null) || return 1; [ -n "$p" ] || return 1
@@ -197,9 +219,10 @@ export async function followJob(world: World, id: string, from: number, opts: { 
   : Promise<{ state: JobState; exitCode?: number; output: string; now: number }> {
   if (!isJobId(id)) return { state: 'missing', output: '', now: Date.now() };
   const result = await world.exec('bash', ['-c', `${ALIVE}
+${WORLD_NOW_MS}
 d=${jobRoot(opts.root)}/$1
 if [ ! -d "$d" ]; then s=missing; elif alive "$d" && [ ! -f "$d/exit" ]; then s=running; elif [ -f "$d/exit" ]; then s="exited $(cat "$d/exit")"; else s=lost; fi
-echo "$s $(date +%s%3N)"
+echo "$s $(now_ms)"
 [ ! -f "$d/log" ] || tail -c +$(($2 + 1)) "$d/log"`, 'karmax-job-follow', id, String(Math.max(0, Math.floor(from)))],
   { cwd: world.handle.root, timeoutMs: 30_000 });
   if (result.code !== 0) throw new Error(`could not read job status: ${(result.stderr || result.stdout).trim().slice(0, 300) || `exit ${result.code}`}`);

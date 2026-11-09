@@ -2,11 +2,11 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import type { World } from '../src/world/types.js';
 import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
-import { startJob, jobStatuses, stopJobs, startJobWaiter, listJobs, describeJobs, isJobId } from '../src/world/jobs.js';
+import { startJob, jobStatuses, stopJobs, startJobWaiter, listJobs, describeJobs, isJobId, WORLD_TICKS_MS } from '../src/world/jobs.js';
 import { platformToolHandlers, TOOL_SCHEMAS, SDK_CONTROL_TOOL_NAMES } from '../src/agent/tools.js';
 import type { AgentWait } from '../src/domain/types.js';
 
@@ -23,6 +23,37 @@ const named = (name: string) => fs.readdirSync('/proc').filter((e) => /^\d+$/.te
   try { return procStat(e)[0] !== 'Z' && fs.readFileSync(`/proc/${e}/cmdline`, 'utf8').split('\0')[0] === name; } catch { return false; }
 });
 const marker = () => `karmax-test-${Math.random().toString(36).slice(2, 10)}`;
+
+// CI #2739: uutils' date (Ubuntu 26) reads `date +%s%3N` up to 0.9 s late near
+// a second's start. The world's clock comes from bash itself, and only whole
+// seconds from `date` where bash is older than 5.0.
+describe('world clocks', () => {
+  const run = (script: string, env: NodeJS.ProcessEnv = process.env) =>
+    execFileSync('bash', ['-c', `set -u\n${WORLD_TICKS_MS}\n${script}`], { encoding: 'utf8', env }).trim().split('\n').map(Number);
+
+  it('reads epoch milliseconds without any date format extension', () => {
+    const shims = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-date-'));
+    try {
+      // A date that only knows %s: anything else fails the reading.
+      fs.writeFileSync(path.join(shims, 'date'), '#!/bin/bash\n[ "$*" = +%s ] || exit 9\nexec /bin/date +%s\n', { mode: 0o755 });
+      const env = { ...process.env, PATH: `${shims}:${process.env.PATH}` };
+      const before = Date.now();
+      const [precise, fallback] = run('now_ms; unset EPOCHREALTIME; now_ms', env);
+      const after = Date.now();
+      expect(precise).toBeGreaterThanOrEqual(before - 5);
+      expect(precise).toBeLessThanOrEqual(after + 5);
+      expect(fallback! % 1000).toBe(0);
+      expect(fallback).toBeGreaterThan(before - 2000);
+      expect(fallback).toBeLessThanOrEqual(after);
+    } finally { fs.rmSync(shims, { recursive: true, force: true }); }
+  });
+
+  it('measures durations on a clock that never goes back', () => {
+    const [a, b] = run('a=$(ticks_ms); sleep 0.2; echo "$a"; ticks_ms');
+    expect(b! - a!).toBeGreaterThanOrEqual(180);
+    expect(b! - a!).toBeLessThan(5000);
+  });
+});
 
 describe('durable jobs (real worktree world)', () => {
   let home: string;

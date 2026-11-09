@@ -442,6 +442,45 @@ it('keeps each restore\'s end after its start when the polls\' round trips diffe
   expect(polls).toBeGreaterThan(1);
 }, REAL_RESTIC_MS);
 
+// CI #2739 (2026-11-09, an Ubuntu 26 runner): a restored event was again stamped
+// before its restoring event, by 406 ms. The world's clock came from
+// `date +%s%3N`, and uutils' date (Ubuntu 26's coreutils; 0.12 still does it)
+// strips the leading zeros of the nanoseconds before keeping three digits:
+// at 0.086 s it prints 862 ms. Here the world's `date` is worse — every
+// millisecond reading is a second before the last, as a clock stepped back
+// would be — and each restore is still dated from its start, for as long as it took.
+it('dates each restore\'s end after its start whatever the world\'s date prints', async () => {
+  const f = await fixture();
+  const files = await singleFiles(f, 4);
+  const { task, world } = await f.sandbox('Backward date');
+  const shims = path.join(world.handle.root, '..', `date-shim-${crypto.randomBytes(4).toString('hex')}`);
+  fs.mkdirSync(shims);
+  const readings = path.join(shims, 'readings');
+  fs.writeFileSync(path.join(shims, 'date'), `#!/bin/bash
+case "$*" in
+  *%3N*|*%N*) n=$(( $(cat '${readings}' 2>/dev/null || echo 0) + 1 )); echo $n > '${readings}'
+    echo $(( $(command date +%s) * 1000 - n * 1000 )) ;;
+  *) exec /bin/date "$@" ;;
+esac
+`, { mode: 0o755 });
+  cleanups.push(() => fs.rmSync(shims, { recursive: true, force: true }));
+  const exec = world.exec.bind(world);
+  world.exec = async (command, args, options) =>
+    exec(command, args, { ...options, env: { ...options?.env, PATH: `${shims}:${process.env.PATH}` } });
+
+  world.handle = await f.resources.materialize(f.project.id, task.id, world, 1);
+
+  const events = await f.store.eventsOfTypes(task.id, ['world.resource-restoring', 'world.resource-restored']);
+  for (const { attachment } of files) {
+    const own = events.filter((event) => (event.payload as { attachmentId?: string }).attachmentId === attachment.id);
+    expect(own.map((event) => event.type)).toEqual(['world.resource-restoring', 'world.resource-restored']);
+    expect(own[1]!.ts).toBeGreaterThanOrEqual(own[0]!.ts);
+    expect((own[1]!.payload as { durationMs: number }).durationMs).toBe(own[1]!.ts - own[0]!.ts);
+    // On this host's clock, give or take the first poll's round trip.
+    expect(Math.abs(own[0]!.ts - Date.now())).toBeLessThan(60_000);
+  }
+}, REAL_RESTIC_MS);
+
 it('fails the leases of resources it never restored when one restore fails', async () => {
   const f = await fixture();
   const files = await singleFiles(f, 4);

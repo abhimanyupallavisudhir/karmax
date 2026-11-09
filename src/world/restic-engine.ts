@@ -8,7 +8,7 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ResourceAttachment, ResourceChangeSummary, ResourceRevision } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import type { ObjectStore } from '../store/objects.js';
-import { SYSTEM_JOB_ROOT, followJob, jobStatuses, startJob, stopJobs } from './jobs.js';
+import { SYSTEM_JOB_ROOT, WORLD_TICKS_MS, followJob, jobStatuses, startJob, stopJobs } from './jobs.js';
 import { fastKeyFile, isFastKey, openKeyFile, type ResticKeyFile } from './restic-keys.js';
 import { REPOSITORY_ROUTE, RepositoryTokens, parseRepositoryName, repositoryName, repositoryObjectKey, repositoryPassword,
   type RepositoryAccess } from './resource-repository.js';
@@ -343,18 +343,21 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
    * each a round trip to the provider, and personal-website #7's 489 small
    * files took an hour (wiki features/resource-storage). Locally (a worktree,
    * a container's bind mount) restic runs on this host, `hostConcurrency` at a
-   * time. `started`/`finished` are told of each item as it goes (`at`: when,
-   * on this host's clock). After a failure no further item starts, the ones
-   * running finish, and the first failure is thrown.
+   * time. `started` is told when each item starts (`at`, on this host's
+   * clock) and `finished` how long it took, measured on a clock that never
+   * goes back, so its end is never before its start. After a failure no
+   * further item starts, the ones running finish, and the first failure is
+   * thrown.
    */
   async restoreMany(world: World, items: RestoreItem[], options: { key: string; hostConcurrency: number;
     checkContinue?: () => Promise<void>; started(index: number, at: number): Promise<void>;
-    finished(index: number, at: number, error?: Error): Promise<void> }): Promise<void> {
+    finished(index: number, tookMs: number, error?: Error): Promise<void> }): Promise<void> {
     if (!items.length) return;
     if (!isRemoteWorldKind(world.handle.kind)) {
       await forEachConcurrent(items.map((item, index) => ({ item, index })), async ({ item, index }) => {
         await options.checkContinue?.();
         await options.started(index, Date.now());
+        const began = performance.now();
         try {
           for (const [n, snapshot] of item.snapshots.entries())
             await this.restore({ world, path: item.path, file: item.file }, item.repository, snapshot,
@@ -364,10 +367,10 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
             if (made.code !== 0) throw new Error(`could not make ${item.path} read-only: ${made.stderr.trim()}`);
           }
         } catch (error) {
-          await options.finished(index, Date.now(), error instanceof Error ? error : new Error(String(error)));
+          await options.finished(index, performance.now() - began, error instanceof Error ? error : new Error(String(error)));
           throw error;
         }
-        await options.finished(index, Date.now());
+        await options.finished(index, performance.now() - began);
       }, options.hostConcurrency);
       return;
     }
@@ -394,10 +397,10 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     const started = new Set<number>();
     const failures = new Map<number, string>();
     let first: Error | undefined;
-    // The world's clock to this host's, measured once: each poll's reading also
-    // carries that poll's round trip, so re-measuring it per poll gave an item
-    // started in one poll and finished in the next two offsets, and its end
-    // could come before its start (CI #2705).
+    // The world's clock to this host's, measured once (each poll's reading
+    // also carries that poll's round trip), for when each item started. When it
+    // ended is not read from a clock but added: how long it took, which the job
+    // measures on one that never goes back (CI #2705, #2739).
     let shift: number | undefined;
     try {
       let from = 0;
@@ -420,7 +423,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
             const failed = Number(code) !== 0
               ? resticFailure({ code: Number(code), stdout: failures.get(i) ?? '', stderr: failures.get(i) ?? '' }, 'restoring the resource') : undefined;
             first ??= failed;
-            await options.finished(i, Number(value) + shift, failed);
+            await options.finished(i, Math.max(0, Number(value)) || 0, failed);
           }
         }
         if (status.state === 'exited') {
@@ -1222,13 +1225,14 @@ export interface RestoreItem { repository: Repository; snapshots: string[]; path
 /** `restore-many DIR RESTIC MAX CONNECTIONS`: restores the items of DIR/plan
  * (bash arrays: repository R, grant T, password P, key hint H, snapshots S,
  * destination D, single file F, read-only W), MAX at a time. Prints
- * `start <i> <ms>`, `error <i> <base64 of restic's last output>` and
- * `done <i> <ms> <code>`; after a failure starts nothing more. */
+ * `start <i> <epoch ms>`, `error <i> <base64 of restic's last output>` and
+ * `done <i> <ms it took> <code>` (a monotonic clock's difference, so never
+ * negative: an end is its start plus that); after a failure starts nothing more. */
 const RESTORE_MANY = [
   'set -u; d=$1; restic=$2; max=$3; connections=$4',
   '. "$d/plan"; rm -f -- "$d/plan"',
   `trap 'rm -rf -- "$d"' EXIT`,
-  'now() { date +%s%3N; }',
+  WORLD_TICKS_MS,
   'one() {',
   '  local i=$1 t s e',
   '  if [ "${F[$i]}" = 1 ]; then t="$d/$i.d"; rm -rf -- "$t"; else t=${D[$i]}; mkdir -p -- "$t" || return 1; fi',
@@ -1245,12 +1249,13 @@ const RESTORE_MANY = [
   '  [ "${W[$i]}" = 0 ] || [ ! -e "${D[$i]}" ] || chmod -R a-w -- "${D[$i]}"',
   '}',
   'run() {',
-  '  local i=$1 c',
-  '  echo "start $i $(now)"',
+  '  local i=$1 c b t',
+  '  echo "start $i $(now_ms)"; b=$(ticks_ms)',
   '  one "$i" > "$d/$i.out" 2>&1; c=$?',
   '  if [ "$c" -ne 0 ]; then : > "$d/failed"; echo "error $i $(tail -c 2000 "$d/$i.out" | base64 | tr -d \'\\n\')"; fi',
   '  rm -f -- "$d/$i.out"',
-  '  echo "done $i $(now) $c"',
+  '  t=$(( $(ticks_ms) - b )); [ "$t" -ge 0 ] || t=0',
+  '  echo "done $i $t $c"',
   '}',
   'running=0',
   'for ((i = 0; i < N; i++)); do',
