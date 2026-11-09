@@ -221,7 +221,8 @@ describe.skipIf(!sshdAvailable)('VM world over SSH', () => {
     fs.chmodSync(sessions, 0o500); // as a full disk refuses the session's directory
     try {
       await expect(world.startProcess({ command: 'true' }))
-        .rejects.toThrow(/^could not start the process in the VM \(status 1\): mkdir: .*karmax-sessions\/.*Permission denied/);
+        // GNU mkdir names the directory; uutils' (Ubuntu 26) does not.
+        .rejects.toThrow(/^could not start the process in the VM \(status 1\): mkdir: .*Permission denied/);
     } finally { fs.chmodSync(sessions, 0o700); }
   });
 
