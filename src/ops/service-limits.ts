@@ -18,6 +18,7 @@ import type { GitConnection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import type { WorkerHeap } from '../temporal/worker-process.js';
 import { readReconciliation } from '../store/object-reconciliation.js';
+import { GITHUB_CALLS_METER, GITHUB_SAVED_METER, githubCallLabel } from '../integrations/github-http.js';
 import {
   agentMailUsage, cloudflareR2Usage, cloudflareWorkersUsage, composioUsage, daytonaUsage, e2bUsage, githubUsage,
   hostUsage, managedStorageUsage, NotConnected, NotNeeded, type ProbeReading, type ProbeResult,
@@ -501,7 +502,14 @@ export class ServiceLimitsService {
         for (const organization of await store.listOrganizations())
           for (const connection of await store.listGitConnections(organization.id))
             if (!connection.suspendedAt && !connections.has(connection.installationId)) connections.set(connection.installationId, connection);
-        return githubUsage({ connections: [...connections.values()].slice(0, 50), rateLimit: (c) => app.rateLimit(c, signal) });
+        const today = isoDay(now);
+        return githubUsage({ connections: [...connections.values()].slice(0, 50), rateLimit: (c) => app.rateLimit(c, signal),
+          callsToday: async (login) => {
+            const label = githubCallLabel(login);
+            const routes = await store.serviceUsageByPrefix(`${GITHUB_CALLS_METER}${label}|`, today);
+            return { saved: await store.serviceUsageSince(`${GITHUB_SAVED_METER}${label}`, today),
+              routes: Object.fromEntries(Object.entries(routes).map(([meter, n]) => [meter.slice(meter.indexOf('|') + 1), n])) };
+          } });
       },
       host: async () => {
         let disk: { used: number; total: number } | undefined;

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { drainGithubCallCounts } from '../src/integrations/github-http.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -313,5 +314,26 @@ describe('GitHub access to a project\'s repositories follows access in tavya', (
     expect(github.role(WIKI, 'dharmaarthamaxxer-damx')).toBeUndefined();
     // Someone outside every project that uses it is given nothing.
     await expect(access.syncRepository((await enroll(OTHER, '1424186357')).id, 'dev')).resolves.toEqual([]);
+  });
+
+  // Every pull-request call checks that its creator can see the repository;
+  // for the repository's owner that listed collaborators and invitations on
+  // every 30-second landing poll, for nothing.
+  it('asks GitHub nothing when the person asked for owns the repository', async () => {
+    const before = github.calls.length;
+    await expect(access.syncRepository(code.id, 'owner')).resolves.toEqual([
+      { userId: 'owner', login: OWNER, state: 'owner' },
+    ]);
+    expect(github.calls.slice(before)).toEqual([]);
+  });
+
+  it('counts the installation\'s calls under its account, by route', async () => {
+    await join('dev', 'dharmaarthamaxxer-damx', 'developer');
+    drainGithubCallCounts();
+    await access.syncRepository(code.id, 'dev');
+    const counted = drainGithubCallCounts();
+    expect(counted.get(`github.calls:${OWNER}|GET /repos/:owner/:repo/collaborators`)).toBe(1);
+    expect(counted.get(`github.calls:${OWNER}|GET /repos/:owner/:repo/invitations`)).toBe(1);
+    expect(counted.get('github.calls:app|POST /app/installations/:id/access_tokens')).toBe(1);
   });
 });

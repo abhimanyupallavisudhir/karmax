@@ -15,6 +15,7 @@
 import { createHash } from 'node:crypto';
 import type { TaskPullRequest, TaskView } from '../domain/types.js';
 import { taskIdOfBranch, BRAND } from '../domain/brand.js';
+import { githubFetch } from './github-http.js';
 
 export interface GithubPullRequest {
   number: number;
@@ -287,7 +288,7 @@ export class GithubPrApi {
   readonly actor?: GithubPrActor;
 
   constructor(private token: string | GithubTokenProvider, options: GithubPrApiOptions = {}) {
-    this.fetcher = options.fetch ?? fetch;
+    this.fetcher = githubFetch(options.fetch);
     this.apiBase = (options.apiBase ?? 'https://api.github.com').replace(/\/$/, '');
     if (options.actor) this.actor = options.actor;
   }

@@ -59,6 +59,7 @@ export { mergeQueueDomains, remotePolicyOf, landingAuthorityOf, samePosition, ME
 // Multi-PR Review bookkeeping (SPEC §11.1) and the world's checkout list. Both
 // are pure data transforms over the handle, so they are sandbox-safe too.
 export { reviewCheckouts, allCheckoutsApproved, approveAll } from '../domain/checkouts.js';
+export { githubWatchDelayMs } from '../domain/github-polling.js';
 export type { CheckoutApprovals } from '../domain/checkouts.js';
 export { worldRepos } from '../world/types.js';
 import { worldRepos } from '../world/types.js';

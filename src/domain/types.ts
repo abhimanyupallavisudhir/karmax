@@ -1117,6 +1117,10 @@ export interface GitHubMergeAuthorization {
   /** Per-PR ownership is authoritative for current multi-repository workflows;
    * `landingOwner` remains as the single-PR/replay compatibility summary. */
   participants?: GithubLandingParticipant[];
+  /** With `rateBudget` only (the landing watcher): the tightest GitHub hourly
+   * budget this look's calls saw, so the watcher can wait for the reset. The
+   * watcher strips it before comparing or returning the observation. */
+  rateLimit?: { limit: number; remaining: number; resetAt: number };
 }
 
 /** Human authorization is intent-scoped; integration validation is bound to a

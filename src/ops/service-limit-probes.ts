@@ -250,7 +250,9 @@ export async function agentMailUsage(input: { fetch: typeof fetch; apiKey: strin
 // ─── GitHub App: the busiest installation's hourly REST limit ────────────────
 
 export async function githubUsage(input: { connections: GitConnection[];
-  rateLimit: (connection: GitConnection) => Promise<{ limit: number; remaining: number; resetAt: number }> }): Promise<ProbeResult> {
+  rateLimit: (connection: GitConnection) => Promise<{ limit: number; remaining: number; resetAt: number }>;
+  /** What an account's REST calls were today, counted by tavya (github-http.ts). */
+  callsToday?: (login: string) => Promise<{ saved: number; routes: Record<string, number> }> }): Promise<ProbeResult> {
   if (!input.connections.length) throw new NotConnected();
   const results = await Promise.allSettled(input.connections.map(async (connection) => ({ connection, ...(await input.rateLimit(connection)) })));
   const read = results.flatMap((result) => result.status === 'fulfilled' && result.value.limit > 0 ? [result.value] : []);
@@ -260,8 +262,14 @@ export async function githubUsage(input: { connections: GitConnection[];
   }
   const busiest = read.reduce((a, b) => (b.limit - b.remaining) / b.limit > (a.limit - a.remaining) / a.limit ? b : a);
   const unread = results.length - read.length;
+  // GraphQL has a budget of its own, so it is not what spends this one.
+  const calls = await input.callsToday?.(busiest.connection.accountLogin).catch(() => undefined);
+  const top = Object.entries(calls?.routes ?? {}).filter(([route]) => route !== 'POST /graphql')
+    .sort((a, b) => b[1] - a[1]).slice(0, 2).map(([route, n]) => `${route} ×${n.toLocaleString('en-US')}`);
+  const spent = [top.length ? `today: ${top.join(', ')}` : '',
+    calls?.saved ? `${calls.saved.toLocaleString('en-US')} unchanged (free)` : ''].filter(Boolean).join('; ');
   return { readings: { 'github.api': { used: busiest.limit - busiest.remaining, limit: busiest.limit,
-    detail: `${busiest.connection.accountLogin}${read.length > 1 ? `, busiest of ${read.length} installations` : ''}${unread ? ` (${unread} unreadable)` : ''}` } } };
+    detail: `${busiest.connection.accountLogin}${read.length > 1 ? `, busiest of ${read.length} installations` : ''}${unread ? ` (${unread} unreadable)` : ''}${spent ? ` · ${spent}` : ''}` } } };
 }
 
 // ─── This server ─────────────────────────────────────────────────────────────
