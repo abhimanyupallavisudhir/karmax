@@ -506,6 +506,34 @@ describe('software-dev pipeline: follow-ups, confirmation modes and recovery (re
     await handle.result();
   }, 180_000);
 
+  // pramana (2026-11-09, task_mw7ofs473f32255012): the compute waker's Retry
+  // ended each round within 15–30 s, yet each round charged its planned wait
+  // (up to 5 min) to the day, which was spent in 16 hours.
+  it('counts its day of waiting for room in real time, however often Retry cuts a round short', async () => {
+    const repo = await h.makeRepo('app-capacity-clock');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [{ ...input({ taskId, repo, title: 'Capacity clock', resolveAgentEnabled: false,
+        prompt: '@capacityfull 5 Hetzner refused a new server: the CPU limit is full\n@review done' }), capacityWaitLimitMs: 60_000 }],
+    });
+    // Planned rounds of 30 s, 1, 2 and 5 min: 8.5 min of "waiting" in a few seconds.
+    for (let round = 0; round < 4; round++) {
+      await expect.poll(async () => (await view(handle)).waitingFor?.summary, { timeout: 30_000, interval: 200 }).toBe('Waiting for a machine');
+      const waiting = await view(handle);
+      await handle.signal('retry');
+      await expect.poll(async () => (await view(handle)).waitingFor?.until, { timeout: 15_000, interval: 200 }).not.toBe(waiting.waitingFor.until);
+    }
+    // Still waiting for room, not asking: only seconds have passed.
+    await expect.poll(async () => (await view(handle)).waitingFor?.summary, { timeout: 30_000, interval: 200 }).toBe('Waiting for a machine');
+    await handle.signal('retry');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    expect((await view(handle)).error).toBeUndefined();
+    await handle.signal('cancel');
+    await handle.result();
+  }, 120_000);
+
   // pramana (2026-11-09, task_mw7ofs473f32255012): after its day of waiting for
   // room, a full Hetzner CPU limit was waited out again as an outage (five
   // more tries) and asked as "infrastructure: … (still failing after 5 waits)".
