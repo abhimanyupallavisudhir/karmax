@@ -4114,13 +4114,16 @@ html[data-theme="dark"] .github-signin-btn:active,
 .agent-block .af-resume-toggle { margin: 0; }
 .agent-authority { border-top: 1px dashed var(--line); padding-top: 6px; min-width: 0; }
 .agent-authority[hidden] { display: none; }
-.agent-authority > summary {
+.tp-follow-ups { border-top: 1px dashed var(--line); padding-top: 6px; margin-top: 10px; min-width: 0; }
+.tp-follow-ups .params-save-bar { position: static; margin-top: 8px; padding-top: 4px; background: none; }
+.tp-follow-ups > summary .pf-summary { color: var(--ink-3); font-weight: 400; margin-left: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-authority > summary, .tp-follow-ups > summary {
   display: flex; align-items: baseline; gap: 10px; cursor: pointer; list-style: none;
   font-size: var(--fs-12); color: var(--ink-2); user-select: none; padding: 2px 0;
 }
-.agent-authority > summary::-webkit-details-marker { display: none; }
-.agent-authority > summary::before { content: '▸'; color: var(--ink-3); font-size: var(--fs-10); width: 8px; transition: transform .12s; }
-.agent-authority[open] > summary::before { transform: rotate(90deg); }
+.agent-authority > summary::-webkit-details-marker, .tp-follow-ups > summary::-webkit-details-marker { display: none; }
+.agent-authority > summary::before, .tp-follow-ups > summary::before { content: '▸'; color: var(--ink-3); font-size: var(--fs-10); width: 8px; transition: transform .12s; }
+.agent-authority[open] > summary::before, .tp-follow-ups[open] > summary::before { transform: rotate(90deg); }
 .agent-authority .aa-title { font-weight: 600; }
 .agent-authority .aa-summary { color: var(--ink-3); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-authority .aa-body { display: grid; gap: 8px; padding: 8px 0 2px 18px; }

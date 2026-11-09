@@ -422,7 +422,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/events$/.test(p)) return read ? 'task:event:read' : 'task:create';
   if (p === '/api/events' && !read) return 'task:create';
   if (/^\/api\/project-events\/[^/]+$/.test(p)) return 'task:event:read';
-  if (/^\/api\/tasks\/[^/]+\/follows(?:\/[^/]+)?$/.test(p)) return read ? 'task:event:read' : 'task:conversation:message';
+  if (/^\/api\/tasks\/[^/]+\/follow-up-triggers(?:\/[^/]+)?$/.test(p)) return read ? 'task:read' : 'task:edit';
   if (/^\/api\/projects\/[^/]+\/(?:task-store|automations)(?:\/[^/]+)?$/.test(p)) return read ? 'task:read' : 'task:create';
   if (/^\/api\/projects\/[^/]+\/webhooks$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/webhooks\/[^/]+(?:\/rotate)?$/.test(p)) return 'project:settings:write';
@@ -5481,17 +5481,13 @@ export class Gateway {
           return this.json(res, 201, await api.runStoreTask(token, storeMatch[1]!, storeMatch[2], overrides));
         }
       }
-      const followsMatch = p.match(/^\/api\/tasks\/([^/]+)\/follows(?:\/([^/]+))?$/);
-      if (followsMatch) {
-        const taskId = followsMatch[1]!;
-        if (!followsMatch[2] && method === 'GET') return this.json(res, 200, { follows: await api.listTaskFollows(token, taskId) });
-        if (!followsMatch[2] && method === 'POST') {
-          const b = await this.body(req);
-          return this.json(res, 201, await api.followProjectEvents(token, taskId, { type: b.type, source: b.source, subject: b.subject,
-            where: b.where, includeSelf: b.includeSelf === true, once: b.once === true }));
-        }
-        if (followsMatch[2] && method === 'DELETE') {
-          await api.unfollowProjectEvents(token, taskId, followsMatch[2]);
+      const followUpsMatch = p.match(/^\/api\/tasks\/([^/]+)\/follow-up-triggers(?:\/([^/]+))?$/);
+      if (followUpsMatch) {
+        const taskId = followUpsMatch[1]!;
+        if (!followUpsMatch[2] && method === 'GET') return this.json(res, 200, { triggers: await api.listFollowUpTriggers(token, taskId) });
+        if (!followUpsMatch[2] && method === 'POST') return this.json(res, 201, await api.addFollowUpTrigger(token, taskId, await this.body(req)));
+        if (followUpsMatch[2] && method === 'DELETE') {
+          await api.removeFollowUpTrigger(token, taskId, followUpsMatch[2]);
           return this.json(res, 200, { ok: true });
         }
       }

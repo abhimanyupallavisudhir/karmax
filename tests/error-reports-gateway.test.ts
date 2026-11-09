@@ -87,13 +87,13 @@ describe('error reports through the gateway', () => {
     expect(await (await call(tokenFor.reader!, 'GET', '/api/settings/error-reports')).json()).toEqual({ settings });
 
     expect((await call(tokenFor.operator!, 'GET', '/api/no-such-route')).status).toBe(404);
-    const failed = await call(tokenFor.operator!, 'GET', `/api/tasks/${settings.fixerTaskId}/follows`);
+    const failed = await call(tokenFor.operator!, 'GET', `/api/tasks/${settings.fixerTaskId}/follow-up-triggers`);
     expect(failed.status).toBe(500);
     const reports = async () => (await store.listProjectEvents(ops.id)).filter((event) => event.type === ERROR_EVENT_TYPE);
     await expect.poll(reports).toHaveLength(1);
     const [report] = await reports();
     expect(report).toMatchObject({ source: 'tavya', payload: { kind: 'request', name: 'TypeError', process: 'gateway',
-      where: 'GET /api/tasks/:id/follows', message: "Cannot read properties of undefined (reading 'id')" } });
+      where: 'GET /api/tasks/:id/follow-up-triggers', message: "Cannot read properties of undefined (reading 'id')" } });
 
     expect((await call(tokenFor.operator!, 'PUT', '/api/settings/error-reports', { projectId: null })).status).toBe(200);
     expect(await (await call(tokenFor.operator!, 'GET', '/api/settings/error-reports')).json()).toEqual({ settings: {} });
