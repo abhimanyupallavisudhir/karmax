@@ -583,9 +583,12 @@ export class ProjectResourceService {
       await this.store.appendEvent({ taskId, type: 'world.resource-restoring', ts: at,
         payload: { attachmentId: entry.attachment.id, revisionId: entry.revisionId, bytes: entry.revision.bytes, files: entry.revision.files } });
     };
-    const restored = async (entry: Restore, at: number, madeReadOnly: boolean) => {
-      await this.store.appendEvent({ taskId, type: 'world.resource-restored', ts: at,
-        payload: { attachmentId: entry.attachment.id, revisionId: entry.revisionId, durationMs: at - (begun.get(entry) ?? at) } });
+    // Dated as its start plus how long it took, on a clock that never goes
+    // back: a second wall-clock reading could be earlier (CI #2705, #2739, #2740).
+    const restored = async (entry: Restore, tookMs: number, madeReadOnly: boolean) => {
+      const durationMs = Math.max(0, Math.round(tookMs));
+      await this.store.appendEvent({ taskId, type: 'world.resource-restored', ts: begun.has(entry) ? begun.get(entry)! + durationMs : Date.now(),
+        payload: { attachmentId: entry.attachment.id, revisionId: entry.revisionId, durationMs } });
       await settle(entry.attachment, entry.lease, entry.target, entry.revisionId, madeReadOnly);
       unsettled.delete(entry);
     };
@@ -599,13 +602,14 @@ export class ProjectResourceService {
       try {
         options.signal?.throwIfAborted();
         await announce(entry, Date.now());
+        const began = performance.now();
         const relativeOf = (file: string) => fileShaped(attachment) ? target : target === '.' ? file : `${target}/${file}`;
         await timed('resource.restore', () => this.engine.restore(revision, async (file, data, offset) => {
           options.signal?.throwIfAborted();
           await timed('resource.transfer', () => transferResourceChunk(world, relativeOf(file), data, offset,
             { compress: compression, signal: options.signal }));
         }, options), { itemId: attachment.id });
-        await restored(entry, Date.now(), false);
+        await restored(entry, performance.now() - began, false);
       } catch (error) {
         await failed(entry);
         throw error;
@@ -622,9 +626,9 @@ export class ProjectResourceService {
       }), { key: `restore:${generation}`, hostConcurrency: HOST_RESTORES_AT_ONCE,
         checkContinue: async () => { options.signal?.throwIfAborted(); },
         started: (index, at) => announce(restic[index]!, at),
-        finished: async (index, at, error) => {
+        finished: async (index, tookMs, error) => {
           if (error) await failed(restic[index]!);
-          else await restored(restic[index]!, at, true);
+          else await restored(restic[index]!, tookMs, true);
         } }), { worldKind: world.handle.kind, operation: `${restic.length} resources` });
       await forEachConcurrent(restores.filter((entry) => entry.revision.engine !== RESTIC_ENGINE), legacyOne, HOST_RESTORES_AT_ONCE);
     } catch (error) {
@@ -654,12 +658,14 @@ export class ProjectResourceService {
     const held = (await this.heldBefore(taskId, attachment.id)).filter((name) => parts[name]);
     if (held.length) {
       const startedAt = Date.now();
+      const began = performance.now();
       await this.store.appendEvent({ taskId, type: 'world.resource-restoring', ts: startedAt, payload: { attachmentId: attachment.id, revisionId,
         bytes: held.reduce((sum, name) => sum + parts[name]!.bytes, 0), files: held.reduce((sum, name) => sum + parts[name]!.files, 0) } });
       for (const name of held) await timed('resource.restore', () => this.restic.restore({ world, path: absolute }, repository, parts[name]!.snapshot,
         { key: `restore:${leaseId}:${name}`, checkContinue: async () => { signal?.throwIfAborted(); } }), { itemId: attachment.id });
-      await this.store.appendEvent({ taskId, type: 'world.resource-restored', ts: Date.now(),
-        payload: { attachmentId: attachment.id, revisionId, durationMs: Date.now() - startedAt } });
+      const durationMs = Math.round(performance.now() - began);
+      await this.store.appendEvent({ taskId, type: 'world.resource-restored', ts: startedAt + durationMs,
+        payload: { attachmentId: attachment.id, revisionId, durationMs } });
     }
     await this.writeDataFiles(world, attachment, target, repository, parts, held);
     // For the agent's prompt: what there is, and how much of it is here.

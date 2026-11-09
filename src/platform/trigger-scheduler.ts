@@ -11,14 +11,18 @@ import {
   dependencyMet,
   nextCronFire,
   validateTriggers,
+  normalizeFollowUpTriggers,
+  isRecurring,
+  isSeries,
   LIFECYCLE_EVENT,
   type DependencyTrigger,
   type EventTrigger,
+  type FollowUpTrigger,
   type ScheduleTrigger,
 } from '../domain/triggers.js';
 import {
-  DEFAULT_MAX_RUNS_PER_HOUR, MAX_EVENT_HOPS, followMatches, followMessage, renderTemplate, triggerContext, triggerMessage,
-  type EventFollow, type ProjectEvent, type ProjectEventClaim, type ProjectEventClaimState, type TriggerContext,
+  DEFAULT_MAX_RUNS_PER_HOUR, MAX_EVENT_HOPS, renderTemplate, triggerContext, triggerMessage,
+  type ProjectEvent, type ProjectEventClaim, type ProjectEventClaimState, type TriggerContext,
 } from '../domain/project-events.js';
 
 /**
@@ -69,6 +73,14 @@ import {
  * cannot start yet (dependencies, a queued concurrency slot, the hourly limit,
  * a failed start) is `deferred` and retried by the inbox sweep, oldest event
  * first; the sweep also offers events another process recorded.
+ *
+ * **Follow-up triggers are the same machine pointed at a started task** (wiki
+ * features/follow-up-triggers): an entry with `followUp` set listens for what
+ * `params.followUpTriggers` names, and firing it says something to the task
+ * (`fire(…, 'followUp', …)`) rather than starting one. Dependencies keep their
+ * meaning as prerequisites, schedules and claims work unchanged; what differs
+ * is that each trigger, not the whole task, is one-shot or recurring. Entries
+ * stay armed through Done, which is when firing forks; only cancellation ends them.
  */
 
 export interface TriggerSchedulerDeps {
@@ -78,8 +90,9 @@ export interface TriggerSchedulerDeps {
    * Start an armed task because a trigger fired. `self` starts the armed task
    * itself (one-shot); `clone` spawns a fresh copy that runs now and leaves the
    * armed template in place (recurring — cron, or a re-arming event trigger).
+   * `followUp` says it to a started task instead; `cause` is the trigger that fired.
    */
-  fire: (taskId: string, mode: 'self' | 'clone', trigger?: TriggerContext) => Promise<unknown>;
+  fire: (taskId: string, mode: 'self' | 'clone' | 'followUp', trigger?: TriggerContext, cause?: TaskTrigger) => Promise<unknown>;
   /** Give an unfinished run a further event of its concurrency key (`tell`). */
   tell?: (runId: string, trigger: TriggerContext, text?: string) => Promise<unknown>;
   /** An event started a run or was told to one (a chat bot answers in its thread). */
@@ -113,10 +126,10 @@ export function createTriggerTell(api: Pick<KarmaxApi, 'postTaskMessage'>, token
 /** The dispatcher outlives principal-token TTLs. Give each start its own bounded
  * credential and release it once the API operation completes. */
 export function createTriggerFire(api: Pick<KarmaxApi, 'fireTriggeredTask'>, tokens: TokenAuthority): TriggerSchedulerDeps['fire'] {
-  return async (taskId, mode, trigger) => {
+  return async (taskId, mode, trigger, cause) => {
     const { token } = (await tokens.mintPrincipal('system:triggers', ['*'], undefined, 10 * 60_000));
     try {
-      return await api.fireTriggeredTask(token, taskId, mode, trigger);
+      return await api.fireTriggeredTask(token, taskId, mode, trigger, cause);
     } finally {
       (await tokens.revoke(token));
     }
@@ -141,6 +154,8 @@ interface ArmedEntry {
   fired: boolean;
   retryTimer?: unknown;
   retryDelay: number;
+  /** A started task's follow-up triggers, not a task waiting to start. */
+  followUp?: boolean;
 }
 
 // Node's setTimeout caps at ~24.8 days; re-arm long waits in chunks below this.
@@ -163,9 +178,6 @@ const STALE_PENDING_MS = 10 * 60_000;
 /** A failed start is retried no sooner than this. */
 const FAILED_START_RETRY_MS = 60_000;
 const FAILED_START = 'could not start';
-/** A follower hears at most this many events an hour; the rest are skipped. */
-const MAX_FOLLOW_MESSAGES_PER_HOUR = 60;
-
 export class TriggerScheduler {
   private armed = new Map<string, ArmedEntry>();
   private eventTail: Promise<void> = Promise.resolve();
@@ -202,8 +214,9 @@ export class TriggerScheduler {
       // Do not retain high-volume output or perform attribution reads unless
       // an already-armed trigger could consume this event. Capture entry
       // identities now: an old queued event cannot activate a later re-arm.
+      if (ev.type === LIFECYCLE_EVENT && this.armed.get(ev.taskId)?.followUp) this.enqueue(() => this.settleFollowUps(ev.taskId), 'follow-up triggers');
       const candidates = [...this.armed.values()].filter(entry => !entry.fired && entry.triggers.some(trigger =>
-        trigger.kind === 'event' ? eventMatchesEventTrigger(trigger, ev)
+        trigger.kind === 'event' ? this.heardOnBus(entry, trigger, ev)
           : trigger.kind === 'dependency' && ev.type === LIFECYCLE_EVENT));
       if (!candidates.length) return;
       // Lifecycle edges must not overtake one another while attribution reads
@@ -212,6 +225,10 @@ export class TriggerScheduler {
       this.eventTail = next.catch(error => this.log(`trigger event failed: ${String(error)}`));
       return next;
     });
+    // Before the follow-up triggers are read: a follow is one, once drained.
+    const drained = await this.deps.store.drainLegacyTaskFollows();
+    if (drained) this.log(`moved ${drained} legacy follow(s) into follow-up triggers`);
+    if (this.epoch !== epoch) return;
     for (const task of (await this.deps.store.listArmedTasks())) {
       // A stored task can have become invalid since it was armed — most often a
       // dependency task that has since been deleted. Boot must never die on one
@@ -221,6 +238,15 @@ export class TriggerScheduler {
         (await this.arm(task));
       } catch (e) {
         this.log(`refusing to arm ${task.id}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    if (this.epoch !== epoch) return;
+    for (const task of (await this.deps.store.listFollowUpTasks())) {
+      try {
+        if (this.epoch !== epoch) return;
+        (await this.armFollowUps(task));
+      } catch (e) {
+        this.log(`refusing to arm follow-ups of ${task.id}: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
     if (this.epoch !== epoch) return;
@@ -336,9 +362,52 @@ export class TriggerScheduler {
     if (this.epoch !== epoch || this.versions.get(task.id) !== version) return;
     if (errs.length) throw new Error(`invalid trigger(s): ${errs.join('; ')}`);
     this.disarm(task.id); // idempotent re-arm
+    await this.register(task, triggers);
+  }
+
+  /**
+   * Arm (or re-arm) a started task's follow-up triggers, or take it off the
+   * dispatcher when it has none it can act on. Unlike `arm` this validates
+   * nothing: they were validated when set, and one that became unsatisfiable
+   * (its dependency was deleted) simply never fires.
+   */
+  async armFollowUps(task: TaskRecord): Promise<void> {
+    const status = task.lastView?.status;
+    const ended = ['done', 'failed', 'cancelled'].includes(status ?? '');
+    const triggers = normalizeFollowUpTriggers(task.params).filter((trigger) => !(trigger.whileRunning && ended));
+    // Not started yet, or it never runs itself: its runs listen for it.
+    if (!triggers.length || task.params?.triggerState === 'armed' || task.params?.draft || isSeries(task.params) || status === 'cancelled') {
+      if (this.armed.get(task.id)?.followUp) this.disarm(task.id);
+      return;
+    }
+    this.disarm(task.id);
+    // Kept in memory until it ends, or for ever if it never fires: only what matching needs.
+    await this.register({ ...task, lastView: undefined }, triggers, true);
+  }
+
+  /** A task's lifecycle moved: cancellation ends its follow-ups, and an end
+   *  ends those that were only for while it ran. */
+  private async settleFollowUps(taskId: string): Promise<void> {
+    if (!this.armed.get(taskId)?.followUp) return;
+    const task = await this.deps.store.taskMetadata(taskId);
+    const status = task?.lastView?.status;
+    if (!task || status === 'cancelled') {
+      if (task) await this.deps.store.updateFollowUpTriggers(taskId, () => [], { clearPending: true });
+      this.disarm(taskId);
+      return;
+    }
+    if (!['done', 'failed'].includes(status ?? '')) return;
+    const held = normalizeFollowUpTriggers(task.params);
+    if (!held.some((trigger) => trigger.whileRunning)) return;
+    const params = await this.deps.store.updateFollowUpTriggers(taskId, (current) => current.filter((trigger) => !trigger.whileRunning));
+    await this.armFollowUps({ ...task, params: { ...task.params, followUpTriggers: params } as TaskRecord['params'] });
+  }
+
+  private async register(task: TaskRecord, triggers: TaskTrigger[], followUp?: boolean): Promise<void> {
     const entry: ArmedEntry = {
       task,
       triggers,
+      followUp,
       satisfiedDeps: new Set(),
       activationPending: task.params?.triggerPending === true,
       activationInFlight: false,
@@ -413,7 +482,7 @@ export class TriggerScheduler {
       let firedNow = false;
       for (const trig of entry.triggers) {
         if (entry.fired || firedNow) break;
-        if (trig.kind === 'event' && eventMatchesEventTrigger(trig, ev)) {
+        if (trig.kind === 'event' && this.heardOnBus(entry, trig, ev)) {
           (await this.markActivationPending(entry));
           firedNow = this.evaluate(entry, trig);
         }
@@ -511,76 +580,45 @@ export class TriggerScheduler {
   }
 
   private async dispatchProjectEvent(event: ProjectEvent): Promise<void> {
-    for (const entry of this.armed.values()) {
+    // Those armed when it arrived: a run this event just started has already got it.
+    for (const entry of Array.from(this.armed.values())) {
       if (entry.fired || entry.task.projectId !== event.projectId || this.armed.get(entry.task.id) !== entry) continue;
       const trigger = this.projectEventTrigger(entry, event);
-      if (trigger) await this.offerProjectEvent(entry, trigger, event);
+      if (trigger && !(entry.followUp && await this.deps.store.projectEventReached(event.id, entry.task.id))) await this.offerProjectEvent(entry, trigger, event);
     }
-    // After the starts: a run this event just started already has it.
-    await this.offerToFollowers(event);
     await this.deps.store.markProjectEventDispatched(event.id, this.now());
   }
 
-  // ─── Follows: events delivered into a task's conversation ──────────────────
-
-  /** Each unfinished task following a matching event hears of it once, as a
-   *  message; the `(event, task)` claim makes a redelivery or a second process
-   *  a no-op. A message ends a pause, so this is also how a task waits. */
-  private async offerToFollowers(event: ProjectEvent): Promise<void> {
-    if (!this.deps.tell) return;
-    const offered = new Set<string>();
-    for (const follow of await this.deps.store.liveTaskFollows(event.projectId)) {
-      if (offered.has(follow.taskId) || !followMatches(follow, event, follow.emitter)) continue;
-      offered.add(follow.taskId);
-      if (await this.deps.store.projectEventReached(event.id, follow.taskId)) continue;
-      const verdict = await this.deps.store.transaction(async () => {
-        const decided = await this.followVerdict(follow.taskId, event);
-        const claimed = await this.deps.store.claimProjectEvent({ eventId: event.id, taskId: follow.taskId, state: decided.state,
-          reason: decided.reason, receivedAt: event.receivedAt, updatedAt: this.now() });
-        return claimed ? decided : undefined;
-      });
-      if (verdict?.state === 'pending') await this.deliverToFollower(follow, event);
-    }
-  }
-
-  private async followVerdict(taskId: string, event: ProjectEvent): Promise<{ state: ProjectEventClaimState; reason?: string }> {
-    if (event.hops > MAX_EVENT_HOPS) return { state: 'skipped', reason: `stopped a loop: more than ${MAX_EVENT_HOPS} event-to-run steps` };
-    if (await this.deps.store.projectEventsToldSince(taskId, this.now() - 3600_000) >= MAX_FOLLOW_MESSAGES_PER_HOUR)
-      return { state: 'skipped', reason: `the task already heard ${MAX_FOLLOW_MESSAGES_PER_HOUR} events this hour` };
-    return { state: 'pending' };
-  }
-
-  private async deliverToFollower(follow: EventFollow, event: ProjectEvent): Promise<void> {
-    try {
-      await this.deps.tell!(follow.taskId, triggerContext(event), followMessage(triggerContext(event), follow));
-      await this.deps.store.updateProjectEventClaim(event.id, follow.taskId, ['pending'],
-        { state: 'told', runId: follow.taskId, reason: null, updatedAt: this.now() });
-      if (follow.once) await this.deps.store.deleteTaskFollow(follow.id);
-      this.announce(event, follow.taskId, 'told');
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      await this.deps.store.updateProjectEventClaim(event.id, follow.taskId, ['pending'],
-        { state: 'deferred', reason: `${FAILED_START}: ${message}`.slice(0, 300), updatedAt: this.now() });
-    }
-  }
-
-  /** A deferred delivery to a follower: retry it while the task still follows a match. */
-  private async retryFollowerClaim(claim: ProjectEventClaim): Promise<void> {
-    const task = await this.deps.store.taskMetadata(claim.taskId);
-    const event = await this.deps.store.getProjectEvent(claim.eventId);
-    const emitter = String(task?.params?.runOf ?? claim.taskId);
-    const follow = event && (await this.deps.store.taskFollows(claim.taskId)).find((candidate) => followMatches(candidate, event, emitter));
-    const status = (task as { lastView?: { status?: string } } | undefined)?.lastView?.status;
-    if (!event || !follow || !task || ['done', 'failed', 'cancelled'].includes(status ?? '')) {
-      await this.settleClaim(claim, 'skipped', 'the task no longer follows this event');
-      return;
-    }
-    if (await this.deps.store.updateProjectEventClaim(claim.eventId, claim.taskId, ['deferred'], { state: 'pending', updatedAt: this.now() }))
-      await this.deliverToFollower(follow, event);
-  }
-
   private projectEventTrigger(entry: ArmedEntry, event: ProjectEvent): EventTrigger | undefined {
-    return entry.triggers.find((t): t is EventTrigger => t.kind === 'event' && projectEventMatchesTrigger(t, event));
+    return entry.triggers.find((t): t is EventTrigger => t.kind === 'event' && projectEventMatchesTrigger(t, event)
+      && !(entry.followUp && this.emittedBy(entry.task, event)));
+  }
+
+  /** A task never hears what it, or the series it is a run of, emitted. */
+  private emittedBy(task: TaskRecord, event: ProjectEvent): boolean {
+    return event.source === `task:${task.id}` || event.source === `task:${String(task.params?.runOf ?? task.id)}`;
+  }
+
+  /** Does a task event match, leaving aside a follow-up on the task's own events? */
+  private heardOnBus(entry: ArmedEntry, trigger: EventTrigger, ev: KarmaxEvent): boolean {
+    return eventMatchesEventTrigger(trigger, ev) && !(entry.followUp && ev.taskId === entry.task.id);
+  }
+
+  /** Whether this firing leaves the trigger armed: a series' or a recurring follow-up's. */
+  private repeats(entry: ArmedEntry, trigger: TaskTrigger): boolean {
+    return entry.followUp ? isRecurring(trigger) : !!entry.task.params?.repeatable;
+  }
+
+  /** A one-shot start trigger has fired: the task is started, so its follow-up triggers begin. */
+  private async hearFollowUpsAfterStart(taskId: string): Promise<void> {
+    this.disarm(taskId);
+    const task = await this.deps.store.taskMetadata(taskId);
+    if (task) await this.armFollowUps(task);
+  }
+
+  /** A follow-up one-shot stops matching the moment it fires; the API uses it up. */
+  private spendOneShot(entry: ArmedEntry, trigger: TaskTrigger): void {
+    entry.triggers = entry.triggers.filter((candidate) => candidate !== trigger);
   }
 
   private async sweep(): Promise<void> {
@@ -595,7 +633,6 @@ export class TriggerScheduler {
     for (const claim of await this.deps.store.projectEventClaimsInState('deferred')) {
       if (claim.reason?.startsWith(FAILED_START) && now - claim.updatedAt < FAILED_START_RETRY_MS) continue;
       const entry = this.armed.get(claim.taskId);
-      if (!entry && (await this.deps.store.taskFollows(claim.taskId)).length) { await this.retryFollowerClaim(claim); continue; }
       if (!entry || entry.fired) {
         const task = await this.deps.store.taskMetadata(claim.taskId);
         if (task?.params?.triggerState !== 'armed')
@@ -635,7 +672,7 @@ export class TriggerScheduler {
       return claimed ? decided : undefined;
     });
     if (verdict?.state === 'pending' && verdict.tell) await this.tellEventRun(entry, event, verdict.tell, concurrencyKey);
-    else if (verdict?.state === 'pending') await this.startEventRun(entry, event, concurrencyKey);
+    else if (verdict?.state === 'pending') await this.startEventRun(entry, trigger, event, concurrencyKey);
   }
 
   private async projectEventVerdict(entry: ArmedEntry, trigger: EventTrigger, event: ProjectEvent, concurrencyKey: string | undefined):
@@ -643,9 +680,9 @@ export class TriggerScheduler {
     if (event.hops > MAX_EVENT_HOPS) return { state: 'skipped', reason: `stopped a loop: more than ${MAX_EVENT_HOPS} event-to-run steps` };
     // A reply in a thread, a comment on an issue: the run already working on it
     // follows it and hears it there, so a second run would duplicate it.
-    const following = event.subject ? (await this.deps.store.liveTaskFollows(event.projectId))
-      .find((follow) => follow.emitter === entry.task.id && follow.taskId !== entry.task.id && followMatches(follow, event, follow.emitter)) : undefined;
-    if (following) return { state: 'skipped', reason: `its run ${following.taskId} follows this` };
+    const following = event.subject && !entry.followUp ? [...this.armed.values()].find((candidate) => candidate.followUp
+      && candidate.task.params?.runOf === entry.task.id && candidate.triggers.some((t) => t.kind === 'event' && !!(t as FollowUpTrigger).whileRunning && projectEventMatchesTrigger(t, event))) : undefined;
+    if (following) return { state: 'skipped', reason: `its run ${following.task.id} follows this` };
     const dependencies = entry.triggers.filter((t): t is DependencyTrigger => t.kind === 'dependency');
     if (!dependencies.every((t) => dependencyMet(t, entry.satisfiedDeps))) return { state: 'deferred', reason: 'waiting for its dependencies' };
     const slot = concurrencyKey !== undefined ? await this.deps.store.projectEventSlot(entry.task.id, concurrencyKey) : undefined;
@@ -659,7 +696,9 @@ export class TriggerScheduler {
         : { state: 'skipped', reason: 'a run for it was already unfinished' };
     }
     const limit = trigger.maxPerHour ?? DEFAULT_MAX_RUNS_PER_HOUR;
-    if (await this.deps.store.projectEventRunsSince(entry.task.id, this.now() - 3600_000) >= limit)
+    const lately = entry.followUp ? this.deps.store.projectEventsToldSince(entry.task.id, this.now() - 3600_000)
+      : this.deps.store.projectEventRunsSince(entry.task.id, this.now() - 3600_000);
+    if (await lately >= limit)
       return { state: 'deferred', reason: `waiting for its limit of ${limit} runs an hour` };
     return { state: 'pending' };
   }
@@ -685,25 +724,31 @@ export class TriggerScheduler {
       .catch((error) => this.log(`announcing event ${event.id} failed: ${error instanceof Error ? error.message : String(error)}`)));
   }
 
-  private async startEventRun(entry: ArmedEntry, event: ProjectEvent, concurrencyKey: string | undefined): Promise<void> {
+  private async startEventRun(entry: ArmedEntry, trigger: EventTrigger, event: ProjectEvent, concurrencyKey: string | undefined): Promise<void> {
     const taskId = entry.task.id;
-    const repeatable = !!entry.task.params?.repeatable;
+    const repeatable = this.repeats(entry, trigger);
     if (!repeatable) {
-      entry.fired = true;
-      for (const timer of entry.timers) this.clearTimer(timer);
-      entry.timers = [];
+      if (entry.followUp) this.spendOneShot(entry, trigger);
+      else {
+        entry.fired = true;
+        for (const timer of entry.timers) this.clearTimer(timer);
+        entry.timers = [];
+      }
     }
     try {
-      const started = await this.deps.fire(taskId, repeatable ? 'clone' : 'self', triggerContext(event, concurrencyKey));
-      const runId = (started as { startedTaskId?: string } | undefined)?.startedTaskId;
+      const started = await this.deps.fire(taskId, entry.followUp ? 'followUp' : repeatable ? 'clone' : 'self', triggerContext(event, concurrencyKey), trigger);
+      const { startedTaskId: runId, told } = (started ?? {}) as { startedTaskId?: string; told?: boolean };
       await this.deps.store.updateProjectEventClaim(event.id, taskId, ['pending'],
-        { state: 'started', runId: runId ?? null, reason: null, updatedAt: this.now() });
-      if (!repeatable && this.armed.get(taskId) === entry) this.disarm(taskId);
-      this.log(`event ${event.type} started ${repeatable ? `a run of ${taskId}` : taskId}`);
-      if (runId) this.announce(event, runId, 'started');
+        { state: told ? 'told' : 'started', runId: runId ?? null, reason: null, updatedAt: this.now() });
+      if (!repeatable && !entry.followUp && this.armed.get(taskId) === entry) await this.hearFollowUpsAfterStart(taskId);
+      this.log(`event ${event.type} ${entry.followUp ? 'followed up' : 'started'} ${repeatable && !entry.followUp ? `a run of ${taskId}` : taskId}`);
+      if (runId) this.announce(event, runId, told ? 'told' : 'started');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (!repeatable && this.armed.get(taskId) === entry) entry.fired = false;
+      if (!repeatable && this.armed.get(taskId) === entry) {
+        if (entry.followUp) entry.triggers.push(trigger);
+        else entry.fired = false;
+      }
       await this.deps.store.updateProjectEventClaim(event.id, taskId, ['pending'],
         { state: 'deferred', reason: `${FAILED_START}: ${message}`.slice(0, 300), updatedAt: this.now() });
       this.log(`event ${event.type} could not start ${taskId}: ${message}`);
@@ -775,15 +820,17 @@ export class TriggerScheduler {
       entry.activationPending = false;
       entry.activationInFlight = true;
     }
-    const repeatable = !!entry.task.params?.repeatable;
+    const repeatable = this.repeats(entry, trig);
     const taskId = entry.task.id;
     if (!repeatable) {
-      entry.fired = true;
-      for (const timer of entry.timers) this.clearTimer(timer);
-      entry.timers = [];
+      if (entry.followUp) this.spendOneShot(entry, trig);
+      else {
+        entry.fired = true;
+        for (const timer of entry.timers) this.clearTimer(timer);
+        entry.timers = [];
+      }
     }
-    this.track(this.deps
-      .fire(taskId, repeatable ? 'clone' : 'self')
+    this.track((entry.followUp ? this.deps.fire(taskId, 'followUp', undefined, trig) : this.deps.fire(taskId, repeatable ? 'clone' : 'self'))
       .then(async () => {
         if (this.armed.get(taskId) !== entry) return;
         entry.retryDelay = INITIAL_RETRY_MS;
@@ -795,8 +842,8 @@ export class TriggerScheduler {
           if (repeatable && entry.activationPending) this.evaluate(entry);
           else (await this.setActivationPending(entry, false));
         }
-        if (!repeatable) this.disarm(taskId);
-        this.log(`trigger fired for ${taskId} (${trig.kind}, ${repeatable ? 'run' : 'self'})`);
+        if (!repeatable && !entry.followUp) await this.hearFollowUpsAfterStart(taskId);
+        this.log(`trigger fired for ${taskId} (${trig.kind}, ${entry.followUp ? 'follow-up' : repeatable ? 'run' : 'self'})`);
       })
       .catch((e) => {
         // A stop, cancel, or edit supersedes this in-flight attempt. Its late
@@ -807,6 +854,7 @@ export class TriggerScheduler {
           entry.activationPending = true; // durable marker was deliberately retained
         }
         this.log(`trigger fire failed for ${taskId}: ${e instanceof Error ? e.message : String(e)}`);
+        if (entry.followUp && !repeatable) entry.triggers.push(trig);
         entry.fired = false;
         this.retry(entry);
       }));
@@ -823,6 +871,13 @@ export class TriggerScheduler {
       try {
         const task = await this.deps.store.taskMetadata(taskId);
         if (this.armed.get(taskId) !== entry) return;
+        if (entry.followUp) {
+          if (!task) return this.disarm(taskId);
+          entry.task = task;
+          (await this.refreshDependencies(entry));
+          this.evaluate(entry);
+          return;
+        }
         if (task?.params?.triggerState !== 'armed') return this.disarm(taskId);
         const errors = (await this.validationErrors(task));
         if (errors.length) throw new Error(`invalid trigger(s): ${errors.join('; ')}`);

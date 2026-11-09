@@ -45,6 +45,36 @@ describe('project events start runs (real gateway + Temporal)', () => {
     return (await response.json()) as TaskRecord;
   };
 
+  it('a follow-up trigger reaches a running agent, then forks the task once it is done', async () => {
+    const task = await createSeries({ title: 'Watch deploys', workflow: 'just-do', prompt: '@write note.txt :: first',
+      params: { confirm: { layers: [{ kind: 'human' }] }, followUpTriggers: [{ kind: 'event', type: 'deploy.*', recurring: true }] } });
+    await expect.poll(async () => ((await view(task.id)) as any)?.waitingFor?.kind, { timeout: 60_000 }).toBe('human');
+
+    const emit = async (key: string, env: string) => (await h.store.recordProjectEvent({ organizationId: 'org_personal', projectId, source: 'webhook:hk', type: 'deploy.finished',
+      key, occurredAt: Date.now(), receivedAt: Date.now(), origin: 'external', hops: 0, payload: { env } })).event;
+    scheduler.projectEventRecorded(await emit('d-1', 'staging'));
+    await scheduler.drain();
+    await expect.poll(async () => JSON.stringify((await view(task.id))?.messages ?? []), { timeout: 30_000 }).toContain('A follow-up trigger fired');
+    expect(JSON.stringify((await view(task.id))?.messages)).toContain('staging');
+
+    // It came back to Do; let it reach Review again, then finish.
+    await expect.poll(async () => ((await view(task.id)) as any)?.waitingFor?.kind, { timeout: 60_000 }).toBe('human');
+    await h.client.workflow.getHandle(task.id).signal('confirm');
+    await expect.poll(async () => (await h.store.getTask(task.id))?.lastView?.status, { timeout: 60_000 }).toBe('done');
+
+    scheduler.projectEventRecorded(await emit('d-2', 'prod'));
+    await scheduler.drain();
+    const forks = async () => (await h.store.listTasks(projectId)).filter((candidate) => (candidate.params['agent:do'] as any)?.resumeFrom?.taskId === task.id
+      || (candidate.params['agent:unified'] as any)?.resumeFrom?.taskId === task.id);
+    await expect.poll(async () => (await forks()).length, { timeout: 30_000 }).toBe(1);
+    const [fork] = await forks();
+    expect(fork!.params.prompt).toMatch(/^A follow-up trigger fired/);
+    expect(fork!.params.prompt).toContain('prod');
+    // The next one is about the fork's work now, not the finished original's.
+    expect((await h.store.getTask(task.id))!.params.followUpTriggers).toBeUndefined();
+    expect(fork!.params.followUpTriggers).toMatchObject([{ type: 'deploy.*' }]);
+  }, 180_000);
+
   it('turns a signed webhook delivery into a run that carries the event', async () => {
     const series = await createSeries({ title: 'Fix {{title}}', prompt: 'Investigate the alert.',
       params: { triggers: [{ kind: 'event', type: 'sentry.alert', where: { level: { in: ['error', 'fatal'] } }, recurring: true }] } });
@@ -111,11 +141,11 @@ describe('project events start runs (real gateway + Temporal)', () => {
     await scheduler.drain();
     await expect.poll(async () => (await runsOf(series.id)).length, { timeout: 30_000 }).toBe(1);
     const [run] = await runsOf(series.id);
-    expect(await h.store.taskFollows(run!.id)).toMatchObject([{ subject: issue }]);
+    expect((await h.store.getTask(run!.id))!.params.followUpTriggers).toMatchObject([{ kind: 'event', type: '*', subject: issue, whileRunning: true }]);
     await expect.poll(async () => (await view(run!.id))?.status, { timeout: 30_000 }).not.toBe(undefined);
 
-    const follows = (await (await fetch(`${base}/api/tasks/${run!.id}/follows`, { headers: auth() })).json()) as { follows: unknown[] };
-    expect(follows.follows).toHaveLength(1);
+    const listed = (await (await fetch(`${base}/api/tasks/${run!.id}/follow-up-triggers`, { headers: auth() })).json()) as { triggers: unknown[] };
+    expect(listed.triggers).toHaveLength(1);
     scheduler.projectEventRecorded((await github('github.issue_comment.created', 'gh-31-2',
       { issue: { number: 31 }, comment: { body: 'Please also cover the settings page.' } })).event);
     await scheduler.drain();

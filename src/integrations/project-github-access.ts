@@ -204,16 +204,20 @@ export class ProjectGithubAccess {
     }
     if (onlyUserId && !wanted.size) return [];
     if (!wanted.size && !Object.keys(granted).length) return [];
+    // The owner needs nothing, so asking only about them asks GitHub nothing:
+    // every pull-request call checks its creator's access this way.
+    const outcomes: RepositoryAccessOutcome[] = [];
+    const owner = wanted.get(repository.owner.toLowerCase());
+    if (owner) {
+      outcomes.push({ userId: owner.userId, login: owner.login, state: 'owner' });
+      wanted.delete(repository.owner.toLowerCase());
+      if (!wanted.size && (onlyUserId || !Object.keys(granted).some((key) => key !== repository.owner.toLowerCase()))) return outcomes;
+    }
     const collaborators = new Map((await githubApp.repositoryCollaborators(repository))
       .map((collaborator) => [collaborator.login.toLowerCase(), collaborator.role]));
     const invitations = new Map((await githubApp.repositoryInvitations(repository))
       .map((invitation) => [invitation.login.toLowerCase(), invitation]));
-    const outcomes: RepositoryAccessOutcome[] = [];
     for (const [key, want] of wanted) {
-      if (key === repository.owner.toLowerCase()) {
-        outcomes.push({ userId: want.userId, login: want.login, state: 'owner' });
-        continue;
-      }
       try {
         outcomes.push(await this.grant(repository, want, collaborators.get(key), invitations.get(key), granted[key]));
       } catch (error) {
@@ -223,7 +227,7 @@ export class ProjectGithubAccess {
     }
     if (onlyUserId) return outcomes;
     for (const [key, grant] of Object.entries(granted)) {
-      if (wanted.has(key)) continue;
+      if (wanted.has(key) || (owner && key === repository.owner.toLowerCase())) continue;
       try {
         await this.revoke(repository, grant, collaborators.has(key), invitations.get(key)?.id);
       } catch (error) {

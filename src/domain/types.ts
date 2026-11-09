@@ -5,9 +5,9 @@
 
 // ─── Identity ────────────────────────────────────────────────────────────────
 
-import type { TaskTrigger, TriggerState } from './triggers.js';
+import type { FollowUpTrigger, TaskTrigger, TriggerState } from './triggers.js';
 import type { HostedPlanId } from './entitlements.js';
-export type { TaskTrigger, TriggerState } from './triggers.js';
+export type { FollowUpTrigger, TaskTrigger, TriggerState } from './triggers.js';
 
 /**
  * The coding harness that executes a turn. OpenCode is driven through stable
@@ -1117,6 +1117,10 @@ export interface GitHubMergeAuthorization {
   /** Per-PR ownership is authoritative for current multi-repository workflows;
    * `landingOwner` remains as the single-PR/replay compatibility summary. */
   participants?: GithubLandingParticipant[];
+  /** With `rateBudget` only (the landing watcher): the tightest GitHub hourly
+   * budget this look's calls saw, so the watcher can wait for the reset. The
+   * watcher strips it before comparing or returning the observation. */
+  rateLimit?: { limit: number; remaining: number; resetAt: number };
 }
 
 /** Human authorization is intent-scoped; integration validation is bound to a
@@ -1290,6 +1294,10 @@ export interface TaskParams {
    * does — the same tier as `draft`.
    */
   triggers?: TaskTrigger[];
+  /** When a started task's agent should hear something more: a message if it
+   *  can take one, kept until it can, a fork once it is done (wiki
+   *  features/follow-up-triggers). */
+  followUpTriggers?: FollowUpTrigger[];
   /** Set by the dispatcher: `armed` = waiting on a trigger, `fired` = already started. */
   triggerState?: TriggerState;
   /**

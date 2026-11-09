@@ -106,6 +106,7 @@ import {
 } from '../integrations/github-actions.js';
 import { isGithubWorkflowPermissionRejection, type GitHubRepositoryPermission } from '../integrations/github-app.js';
 import { mergeCapableUsers } from '../integrations/github-merge-rights.js';
+import { observeGithubRateLimits } from '../integrations/github-http.js';
 import { connectionHoldsTask } from '../integrations/connection-requests.js';
 import { cloudGitSource, type CloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, PaymentRegistry, BudgetService, paymentPromptContext } from '../autonomy/payments.js';
@@ -5665,7 +5666,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       /** submit-fallback only: walk every pull request up to its merge without
        * merging, and answer `planned` when each one would merge now. */
       readyCheck?: boolean;
+      /** Report the tightest GitHub budget this look's calls saw (`rateLimit`). */
+      rateBudget?: boolean;
     }): Promise<GitHubMergeAuthorization> {
+      if (options?.rateBudget) {
+        const { value, tightest } = await observeGithubRateLimits(() =>
+          activities.mergeGithubPrs(handle, prs, { ...options, rateBudget: false }));
+        return tightest ? { ...value, rateLimit: { limit: tightest.limit, remaining: tightest.remaining, resetAt: tightest.resetAt } } : value;
+      }
       // A PR-policy task may legitimately make no changes. There is nothing
       // external to authorize in that case, so do not manufacture a human gate.
       if (!prs.length) return { status: 'merged', prs };

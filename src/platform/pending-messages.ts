@@ -1,5 +1,6 @@
 import type { Message, TaskView } from '../domain/types.js';
 import type { Capability } from './capabilities.js';
+import type { TriggerContext } from '../domain/project-events.js';
 
 /**
  * Messages waiting for their task to take them (wiki features/queued-messages).
@@ -22,6 +23,10 @@ export interface PendingMessage {
    * confirmed before it is delivered, the message continues the work in a new
    * task as it would have then — with no more than this, nor than they hold now. */
   authority?: { caps: Capability[]; organizationId?: string };
+  /** Said by a follow-up trigger (`src/domain/triggers.ts` FollowUpTrigger).
+   * It waits for the task to take it and, unlike a person's, forks the task
+   * only once it is done: a proposal still landing is left to land. */
+  fromTrigger?: { context?: TriggerContext };
 }
 
 /** A message as its sender gets it back: `queued` until its task takes it. */

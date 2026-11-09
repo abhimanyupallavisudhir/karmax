@@ -257,6 +257,24 @@ describe('probes against provider responses', () => {
     await expect(githubUsage({ connections: [], rateLimit: async () => ({ limit: 1, remaining: 1, resetAt: 0 }) })).rejects.toBeInstanceOf(NotConnected);
   });
 
+  it('GitHub: what the busiest installation spent its calls on today', async () => {
+    const connection = { id: 'c', organizationId: 'o', provider: 'github' as const, installationId: '1', accountLogin: 'busy', createdAt: 0 };
+    const asked: string[] = [];
+    const result = await githubUsage({ connections: [connection], rateLimit: async () => ({ limit: 5_000, remaining: 900, resetAt: 0 }),
+      callsToday: async (login) => {
+        asked.push(login);
+        return { saved: 2_500, routes: { 'GET /repos/:owner/:repo/collaborators': 1_800, 'POST /graphql': 9_000,
+          'GET /repos/:owner/:repo/pulls/:id': 700, 'GET /repos/:owner/:repo': 12 } };
+      } });
+    expect(asked).toEqual(['busy']);
+    // GraphQL has its own budget, so it is not what spent this one.
+    expect(result.readings['github.api']!.detail).toBe('busy · today: GET /repos/:owner/:repo/collaborators ×1,800, '
+      + 'GET /repos/:owner/:repo/pulls/:id ×700; 2,500 unchanged (free)');
+    const quiet = await githubUsage({ connections: [connection], rateLimit: async () => ({ limit: 5_000, remaining: 4_990, resetAt: 0 }),
+      callsToday: async () => ({ saved: 0, routes: {} }) });
+    expect(quiet.readings['github.api']!.detail).toBe('busy');
+  });
+
   it('this server: disk, memory, worker heap and database connections', () => {
     expect(hostUsage({ disk: { used: 85e9, total: 193e9 }, memory: { total: 8e9, available: 3e9 },
       heap: { usedBytes: 1.2e9, limitBytes: 2e9, at: NOW }, database: { used: 18, max: 100 } }).readings).toEqual({
@@ -379,6 +397,14 @@ for (const backend of ['sqlite', ...(postgresUrl ? ['postgres'] : [])]) describe
     expect(await store.serviceUsageSince('composio.tool-calls', '2026-09-01')).toBe(4);
     await store.pruneServiceUsage('2026-10-01');
     expect(await store.serviceUsageSince('composio.tool-calls', '2026-09-01')).toBe(3);
+
+    // GitHub calls, by account and route (src/integrations/github-http.ts).
+    await store.countServiceUsage('github.calls:acme|GET /repos/:owner/:repo/pulls/:id', NOW, 5);
+    await store.countServiceUsage('github.calls:acme|POST /graphql', NOW, 2);
+    await store.countServiceUsage('github.calls:acme|POST /graphql', NOW - DAY, 7);
+    await store.countServiceUsage('github.calls:acme-two|POST /graphql', NOW, 1);
+    expect(await store.serviceUsageByPrefix('github.calls:acme|', new Date(NOW).toISOString().slice(0, 10))).toEqual({
+      'github.calls:acme|GET /repos/:owner/:repo/pulls/:id': 5, 'github.calls:acme|POST /graphql': 2 });
 
     // A preview hostname counts once toward Let's Encrypt, however often Caddy asks.
     const project = await store.createProject('Previews');
