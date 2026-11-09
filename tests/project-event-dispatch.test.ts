@@ -54,9 +54,9 @@ describe.each(storeBackends)('project event dispatch ($name)', ({ open }) => {
   };
 
   /** A fire that, like the API, records a run for a series. */
-  const fire = async (taskId: string, mode: 'self' | 'clone', trigger?: TriggerContext) => {
+  const fire = async (taskId: string, mode: 'self' | 'clone' | 'followUp', trigger?: TriggerContext) => {
     if (failNext > 0) { failNext--; throw new Error('engine unavailable'); }
-    fires.push({ taskId, mode, trigger });
+    fires.push({ taskId, mode: mode as Fire['mode'], trigger });
     if (mode === 'clone') {
       const series = (await store.getTask(taskId))!;
       const run = await store.createTask({ projectId: series.projectId, title: 'run', workflow: 'software-dev', workflowVersion: '1.27.0',
@@ -271,38 +271,20 @@ describe.each(storeBackends)('project event dispatch ($name)', ({ open }) => {
     expect(fires.filter((f) => f.taskId === series.id).map((f) => f.trigger?.eventId).sort()).toEqual([early.id, later.id].sort());
   });
 
-  describe('follows', () => {
-    const plainTask = async () => store.createTask({ projectId, title: 'worker', workflow: 'software-dev', workflowVersion: '1.29.0', params: { prompt: 'p' } });
-    const follow = (taskId: string, over: Record<string, unknown>) => store.addTaskFollow({ id: `fol_${++seq}`, taskId, projectId, createdAt: clock.time, ...over });
-
-    it('delivers a matching event to a following task once, and a wait (once) ends at the first match', async () => {
-      told.length = 0;
-      const task = await plainTask();
-      const wait = await follow(task.id, { type: 'deploy.*', where: { env: 'prod' }, once: true });
-      const s = await scheduler();
-      await deliver(s, await record({ type: 'deploy.finished', source: 'webhook:hk_1', payload: { env: 'staging' } }));
-      expect(told).toEqual([]);
-      const prod = await record({ type: 'deploy.finished', source: 'webhook:hk_1', payload: { env: 'prod' } });
-      await deliver(s, prod);
-      await deliver(s, prod); // a redelivery
-      expect(told).toMatchObject([{ runId: task.id, trigger: { eventId: prod.id, type: 'deploy.finished' } }]);
-      expect(told[0]!.text).toMatch(/^The event you were waiting for arrived: `deploy.finished`/);
-      expect(await store.getProjectEventClaim(prod.id, task.id)).toMatchObject({ state: 'told', runId: task.id });
-      expect(await store.getTaskFollow(wait.id)).toBeUndefined();
-      await deliver(s, await record({ type: 'deploy.finished', source: 'webhook:hk_1', payload: { env: 'prod' } }));
-      expect(told).toHaveLength(1);
-      expect(fires).toEqual([]);
-    });
-
-    it('a run hears what is said about its subject, and its series starts no second run for it', async () => {
-      told.length = 0;
+  describe('a run hearing what is said about its subject', () => {
+    it('hears it as a follow-up, and its series starts no second run for it', async () => {
       const issue = 'https://github.com/o/r/issues/7';
       const series = await armedTask([{ kind: 'event', type: 'github.*', recurring: true }]);
-      const s = new TriggerScheduler({ store, bus, tell, now: clock.now, setTimer: clock.set, clearTimer: clock.clear, reconcileMs: 0, inboxSweepMs: 0,
-        // Like the API: a run follows the subject of the event that started it.
+      const followUps: Array<{ taskId: string; eventId?: string }> = [];
+      const s: TriggerScheduler = new TriggerScheduler({ store, bus, now: clock.now, setTimer: clock.set, clearTimer: clock.clear, reconcileMs: 0, inboxSweepMs: 0,
         fire: async (taskId, mode, trigger) => {
+          if (mode === 'followUp') { followUps.push({ taskId, eventId: trigger?.eventId }); return { startedTaskId: taskId, told: true }; }
+          // Like the API: a run follows the subject of the event that started it.
           const started = await fire(taskId, mode, trigger);
-          if (trigger?.subject) await follow(started.startedTaskId, { subject: trigger.subject });
+          if (trigger?.subject) {
+            await store.updateFollowUpTriggers(started.startedTaskId, () => [{ id: 'sub', kind: 'event', type: '*', subject: trigger.subject!, recurring: true, whileRunning: true }]);
+            await s.armFollowUps((await store.getTask(started.startedTaskId))!);
+          }
           return started;
         } });
       schedulers.push(s);
@@ -310,50 +292,25 @@ describe.each(storeBackends)('project event dispatch ($name)', ({ open }) => {
       const labeled = await record({ subject: issue });
       await deliver(s, labeled);
       const runId = (await store.getProjectEventClaim(labeled.id, series.id))!.runId!;
-      expect(told).toEqual([]); // the event that started it is not repeated to it
+      expect(followUps).toEqual([]); // the event that started it is not repeated to it
 
       const comment = await record({ type: 'github.issue_comment.created', subject: issue, payload: { comment: { body: 'also the footer' } } });
       await deliver(s, comment);
       expect(fires).toHaveLength(1);
-      expect(told).toMatchObject([{ runId, trigger: { eventId: comment.id } }]);
-      expect(told[0]!.text).toMatch(/^An event you follow arrived \(fol_\d+\): `github.issue_comment.created`/);
+      expect(followUps).toEqual([{ taskId: runId, eventId: comment.id }]);
       expect(await store.getProjectEventClaim(comment.id, series.id)).toMatchObject({ state: 'skipped', reason: `its run ${runId} follows this` });
       // The App's own comment is not news to the run; another issue is another run.
       await deliver(s, await record({ type: 'github.issue_comment.created', subject: issue, origin: 'self' }));
       await deliver(s, await record({ subject: 'https://github.com/o/r/issues/8' }));
-      expect(told).toHaveLength(1);
+      expect(followUps).toHaveLength(1);
       expect(fires).toHaveLength(2);
       // A finished run hears nothing more; the next event on its issue is new work.
-      await store.saveView(runId, { status: 'done' } as any);
+      await store.saveView(runId, { status: 'done' } as any, undefined, undefined, undefined, { lifecycleEvent: false });
+      await bus.emit({ taskId: runId, type: 'view.updated', ts: clock.time, payload: { status: 'done' } } as any);
+      await s.drain();
       await deliver(s, await record({ type: 'github.issue_comment.created', subject: issue }));
-      expect(told).toHaveLength(1);
+      expect(followUps).toHaveLength(1);
       expect(fires).toHaveLength(3);
-    });
-
-    it('never tells a task its own emits, and retries a delivery that failed', async () => {
-      told.length = 0;
-      const series = await armedTask([{ kind: 'event', type: 'nothing.here', recurring: true }]);
-      const run = await store.createTask({ projectId, title: 'run', workflow: 'software-dev', workflowVersion: '1.29.0', params: { prompt: 'p', runOf: series.id } });
-      await follow(run.id, { type: 'feed.*' });
-      const s = await scheduler();
-      await deliver(s, await record({ type: 'feed.item', source: `task:${series.id}`, origin: 'task' }));
-      expect(told).toEqual([]);
-      tellFailures = 1;
-      const item = await record({ type: 'feed.item', source: 'task:task_other', origin: 'task' });
-      await deliver(s, item);
-      expect(await store.getProjectEventClaim(item.id, run.id)).toMatchObject({ state: 'deferred' });
-      clock.advance(60_000);
-      await s.sweepProjectEvents();
-      expect(told).toMatchObject([{ runId: run.id, trigger: { eventId: item.id } }]);
-      expect(await store.getProjectEventClaim(item.id, run.id)).toMatchObject({ state: 'told' });
-      // A task that stopped following is not retried.
-      tellFailures = 1;
-      const later = await record({ type: 'feed.item', source: 'task:task_other', origin: 'task' });
-      await deliver(s, later);
-      await store.saveView(run.id, { status: 'done' } as any);
-      clock.advance(60_000);
-      await s.sweepProjectEvents();
-      expect(await store.getProjectEventClaim(later.id, run.id)).toMatchObject({ state: 'skipped' });
     });
   });
 

@@ -593,27 +593,21 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
-    name: 'follow_events',
-    description: 'Follow project events: each matching event reaches the task\'s conversation as a message. To wait for an event, '
-      + 'follow it with once: true, then pause; the message ends the pause. A run started by an event already follows its subject.',
+    name: 'add_follow_up_trigger',
+    description: 'Hear about something later. When it happens you get a message; if your task cannot take one it waits until it can, and if your task is done a fork of it carries on. To wait for it, add it and pause: the message ends the pause. Set a task\'s whole list with platform_request PATCH /api/tasks/<id>/params {"params":{"followUpTriggers":[…]}}; a person edits the same list on the Parameters page.',
     parameters: {
       type: 'object',
       properties: {
         task_id: { type: 'string', description: 'Usually your own task.' },
-        type: { type: 'string', description: 'A type or family, e.g. "github.issue_comment.*".' },
-        source: { type: 'string', description: 'e.g. "github", "webhook:<hookId>", "task:<taskId>".' },
-        subject: { type: 'string', description: 'An exact subject, e.g. an issue or pull request URL.' },
-        where: { type: 'object', description: 'Payload filter, as in an event trigger.' },
-        include_self: { type: 'boolean', description: 'Also hear what the tavya GitHub App itself did.' },
-        once: { type: 'boolean', description: 'Stop following after the first match (a wait).' },
+        trigger: { type: 'object', description: 'Same shapes as a task\'s start triggers, plus `subject`: {kind:"event", type:"github.issues.*", source?, subject?, where?, includeSelf?, recurring?}; {kind:"schedule", cron:"0 9 * * *" or at:<epoch ms>}; {kind:"dependency", tasks:[id], on?, mode?}. One-shot unless recurring (a cron always recurs); dependencies are prerequisites of the rest. whileRunning:true drops it when the task ends instead of forking.' },
       },
-      required: ['task_id'],
+      required: ['task_id', 'trigger'],
     },
   },
   {
-    name: 'unfollow_events',
-    description: 'Stop following project events: one follow by id, or all of the task\'s follows.',
-    parameters: { type: 'object', properties: { task_id: { type: 'string' }, follow_id: { type: 'string' } }, required: ['task_id'] },
+    name: 'remove_follow_up_trigger',
+    description: 'Remove one follow-up trigger, by the id add_follow_up_trigger returned.',
+    parameters: { type: 'object', properties: { task_id: { type: 'string' }, trigger_id: { type: 'string' } }, required: ['task_id', 'trigger_id'] },
   },
   {
     name: 'get_task',
@@ -1509,17 +1503,12 @@ export function platformToolHandlers(
         type: args?.type, key: args?.key, subject: args?.subject, payload: args?.payload,
       }));
     },
-    async follow_events(args) {
-      return JSON.stringify(await platformRequest('POST', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/follows`, {
-        type: args?.type, source: args?.source, subject: args?.subject, where: args?.where, includeSelf: args?.include_self, once: args?.once,
-      }));
+    async add_follow_up_trigger(args) {
+      return JSON.stringify(await platformRequest('POST', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/follow-up-triggers`, args?.trigger));
     },
-    async unfollow_events(args) {
-      const taskId = encodeURIComponent(String(args?.task_id ?? ''));
-      const follows = args?.follow_id ? [{ id: String(args.follow_id) }]
-        : ((await platformRequest('GET', `/api/tasks/${taskId}/follows`)) as { follows: Array<{ id: string }> }).follows;
-      for (const follow of follows) await platformRequest('DELETE', `/api/tasks/${taskId}/follows/${encodeURIComponent(follow.id)}`);
-      return JSON.stringify({ unfollowed: follows.map((follow) => follow.id) });
+    async remove_follow_up_trigger(args) {
+      await platformRequest('DELETE', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/follow-up-triggers/${encodeURIComponent(String(args?.trigger_id ?? ''))}`);
+      return JSON.stringify({ removed: String(args?.trigger_id ?? '') });
     },
     async get_task(args) {
       return agentTaskView(await platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}`), args?.fields);
