@@ -277,10 +277,12 @@ export function triggerMessage(trigger: TriggerContext): string {
   return triggerPromptSection(trigger).replace(/^This run was started by the event/, 'While you work on this, another event arrived:');
 }
 
-/** The message a following task receives for a matching event. */
-export function followMessage(trigger: TriggerContext, follow: Pick<EventFollow, 'id' | 'once'>): string {
-  const how = follow.once ? 'the event you were waiting for arrived' : `an event you follow arrived (${follow.id})`;
-  return triggerPromptSection(trigger).replace(/^This run was started by the event/, `${how[0]!.toUpperCase()}${how.slice(1)}:`);
+/** What a task's agent reads when one of its follow-up triggers fires. */
+export function followUpMessage(cause: { kind?: string; type?: string; cron?: string; tasks?: string[] } | undefined, trigger: TriggerContext | undefined): string {
+  if (trigger) return triggerPromptSection(trigger).replace(/^This run was started by the event/, 'A follow-up trigger fired: the event');
+  if (cause?.kind === 'schedule') return `A follow-up trigger fired: the time you scheduled${cause.cron ? ` (\`${cause.cron}\`, UTC)` : ''} has come.`;
+  if (cause?.kind === 'dependency') return `A follow-up trigger fired: the task${cause.tasks?.length === 1 ? ' you were waiting for has' : 's you were waiting for have'} finished (${cause.tasks?.join(', ') ?? ''}).`;
+  return `A follow-up trigger fired: the event \`${cause?.type ?? 'unknown'}\` occurred.`;
 }
 
 /**
@@ -321,53 +323,20 @@ function trimValue(value: unknown, textLimit: number, listLimit: number, depth: 
   return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, trimValue(item, textLimit, listLimit, depth + 1)]));
 }
 
-// ─── Follows: events delivered into a task's conversation ────────────────────
+// ─── Legacy follows ──────────────────────────────────────────────────────────
 
-/**
- * A task follows project events (wiki features/events-and-automations): each
- * match reaches its conversation as a message, so its agent hears about it
- * while it works — and, because a message ends a pause, waiting for an event
- * is following it and pausing. A run started by an event follows its subject
- * (an issue's comments reach the run working on that issue).
- */
+/** A row of the retired `task_follows` table, drained into
+ *  `params.followUpTriggers` at boot (they were only ever heard while the task
+ *  ran, so they arrive as `whileRunning` triggers). */
 export interface EventFollow {
   id: string;
   taskId: string;
   projectId: string;
-  /** `*` (default), a type, or a family (`github.issue_comment.*`). */
   type?: string;
   source?: string;
-  /** An exact subject: the issue, pull request or chat thread. */
   subject?: string;
   where?: EventFilter;
   includeSelf?: boolean;
-  /** Stop following after the first delivery (a wait). */
   once?: boolean;
   createdAt: number;
-}
-
-/** `emitter` is the task id the follower's own emits carry (a run emits as its series). */
-export function followMatches(follow: Pick<EventFollow, 'taskId' | 'type' | 'source' | 'subject' | 'where' | 'includeSelf'>, event: ProjectEvent,
-  emitter = follow.taskId): boolean {
-  if (!eventTypeMatches(follow.type || '*', event.type) || !eventSourceMatches(follow.source, event.source)) return false;
-  if (follow.subject && event.subject !== follow.subject) return false;
-  if (event.origin === 'self' && !follow.includeSelf) return false;
-  // A task never hears its own emits.
-  if (event.source === `task:${follow.taskId}` || event.source === `task:${emitter}`) return false;
-  return filterMatches(event.payload, follow.where);
-}
-
-export function validateFollow(input: { type?: unknown; source?: unknown; subject?: unknown; where?: unknown }): string[] {
-  const errors: string[] = [];
-  if (input.type !== undefined && input.type !== '*') {
-    const type = String(input.type);
-    if (!validEventType(type.endsWith('.*') ? type.slice(0, -2) : type)) errors.push(`invalid event type: "${type}"`);
-  }
-  if (input.source !== undefined && (typeof input.source !== 'string' || !input.source)) errors.push('`source` must be text');
-  if (input.subject !== undefined && (typeof input.subject !== 'string' || !input.subject || input.subject.length > MAX_SUBJECT_LENGTH))
-    errors.push('`subject` must be text');
-  errors.push(...validateFilter(input.where));
-  if (input.type === undefined && input.source === undefined && input.subject === undefined && input.where === undefined)
-    errors.push('follow at least a type, a source or a subject');
-  return errors;
 }

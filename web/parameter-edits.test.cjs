@@ -37,6 +37,7 @@ async function main() {
   const record = { params: {} };
   let elements, complete, requests = [];
   const context = vm.createContext({
+    wireFollowUpTriggers: () => {},
     S: state, CSS: { escape: (x) => x }, sameJson, Object, structuredClone, AbortController, SAVE_STATE_TEXT,
     document: { getElementById: (id) => elements[id] || null },
     wireAgentFields() {}, taskRecord: () => record,

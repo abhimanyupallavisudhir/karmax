@@ -67,6 +67,8 @@ export interface EventTrigger {
   taskId?: string;
   /** Restrict project events to a source: `github`, `webhook:<id>`, `webhook` (any webhook), … */
   source?: string;
+  /** Project events only: an exact subject (an issue, pull request or chat thread). */
+  subject?: string;
   /** Payload filter: dotted path → value or operator (`in`, `contains`, `matches`, `exists`). */
   where?: EventFilter;
   /** Re-arm after firing instead of disarming (default one-shot). */
@@ -84,6 +86,24 @@ export interface EventTrigger {
 }
 
 export type TaskTrigger = DependencyTrigger | ScheduleTrigger | EventTrigger;
+
+/**
+ * A **follow-up trigger**: the shapes that can start a task, on a task that has
+ * started. Where a start trigger says when the task begins, this says when its
+ * agent should hear something more: `params.followUpTriggers` (wiki
+ * features/follow-up-triggers). What firing does depends on the task, not on
+ * the trigger — a message if it can take one, kept until it can if it cannot,
+ * and a fork once it is done.
+ */
+export type FollowUpTrigger = TaskTrigger & {
+  /** Platform-assigned, so one trigger can be removed or consumed. */
+  id: string;
+  /** Only while the task runs: its end drops the trigger instead of forking.
+   *  What a run started by an event gets for that event's subject. */
+  whileRunning?: boolean;
+};
+
+export const MAX_FOLLOW_UP_TRIGGERS = 50;
 
 /** Lifecycle marker stored on a triggered task's params. */
 export type TriggerState = 'armed' | 'fired';
@@ -104,6 +124,48 @@ export function isTrigger(t: unknown): t is TaskTrigger {
   if (!t || typeof t !== 'object') return false;
   const k = (t as TaskTrigger).kind;
   return k === 'dependency' || k === 'schedule' || k === 'event';
+}
+
+/** A task's follow-up triggers. One written without an id (a draft's params)
+ *  answers to its position until the platform gives it one. */
+export function normalizeFollowUpTriggers(params: unknown): FollowUpTrigger[] {
+  const raw = (params as { followUpTriggers?: unknown } | undefined)?.followUpTriggers;
+  const list = Array.isArray(raw) ? raw.filter(isTrigger) as FollowUpTrigger[] : [];
+  return list.map((trigger, index) => (trigger.id ? trigger : { ...trigger, id: `f${index}` }));
+}
+
+/** What is left once `id` has fired: a one-shot is used up, and dependencies,
+ *  being prerequisites, go with the last activator that needed them. */
+export function followUpsAfterFiring(triggers: FollowUpTrigger[], id: string | undefined): FollowUpTrigger[] {
+  const fired = triggers.find((trigger) => trigger.id === id);
+  if (!fired || isRecurring(fired)) return triggers;
+  const remaining = triggers.filter((trigger) => trigger !== fired);
+  return remaining.some((trigger) => trigger.kind !== 'dependency') ? remaining : [];
+}
+
+/** Why a task's follow-up triggers cannot be saved (empty ⇒ valid). `exists`
+ *  says whether a dependency is a task the setter's organization can see. */
+export async function validateFollowUpTriggers(triggers: FollowUpTrigger[], ctx: { taskId?: string; exists?: (taskId: string) => boolean | Promise<boolean> } = {}): Promise<string[]> {
+  const errs: string[] = [];
+  if (triggers.length > MAX_FOLLOW_UP_TRIGGERS) errs.push(`a task has at most ${MAX_FOLLOW_UP_TRIGGERS} follow-up triggers; remove one first`);
+  // A dependency here is not a start gate, so two tasks may await each other.
+  const { exists } = ctx;
+  errs.push(...(await validateTriggers(triggers, { taskId: ctx.taskId,
+    ...(exists ? { dependenciesOf: async (id: string) => ((await exists(id)) ? [] : undefined) } : {}) })));
+  for (const trigger of triggers) {
+    if (trigger.kind !== 'event') continue;
+    if (trigger.concurrency !== undefined) errs.push('a follow-up trigger takes no `concurrency`: it reaches this task, not a run');
+    if (trigger.subject !== undefined && (typeof trigger.subject !== 'string' || !trigger.subject || trigger.subject.length > 2000))
+      errs.push('`subject` must be text');
+  }
+  return errs;
+}
+
+/** What a task's follow-up triggers wait for, for a wait's label. */
+export function followUpTriggerSummary(triggers: FollowUpTrigger[]): string {
+  return triggers.map((t) => t.kind === 'event' ? (t.type === '*' ? (t.subject ?? 'an event') : t.type)
+    : t.kind === 'schedule' ? (t.cron ? `cron ${t.cron}` : 'a time')
+      : (t.tasks?.length === 1 ? 'a task' : `${t.tasks?.length ?? 0} tasks`)).join(', ');
 }
 
 /** Does this task want to be gated behind a trigger (vs starting immediately)? */
@@ -216,7 +278,7 @@ export const LIFECYCLE_EVENT = 'view.updated';
  *  project-event `source` never matches task events, nor does a bare `*`: the
  *  bus carries every agent's live output, and each candidate costs store reads. */
 export function eventMatchesEventTrigger(t: EventTrigger, ev: KarmaxEvent): boolean {
-  if (!t.type || t.type === '*' || t.source || !eventTypeMatches(t.type, ev.type)) return false;
+  if (!t.type || t.type === '*' || t.source || t.subject || !eventTypeMatches(t.type, ev.type)) return false;
   if (t.taskId && ev.taskId !== t.taskId) return false;
   return filterMatches(ev.payload, t.where);
 }
@@ -225,6 +287,7 @@ export function eventMatchesEventTrigger(t: EventTrigger, ev: KarmaxEvent): bool
 export function projectEventMatchesTrigger(t: EventTrigger, ev: ProjectEvent): boolean {
   if (!t.type || !eventTypeMatches(t.type, ev.type) || !eventSourceMatches(t.source, ev.source)) return false;
   if (t.taskId && ev.source !== `task:${t.taskId}`) return false;
+  if (t.subject && ev.subject !== t.subject) return false;
   if (ev.origin === 'self' && !t.includeSelf) return false;
   return filterMatches(ev.payload, t.where);
 }
@@ -290,7 +353,7 @@ export function isSeries(params: { repeatable?: unknown; draft?: unknown } | und
 /** Params for a run spawned from a series: the original minus trigger + series metadata. */
 export function cloneParamsWithoutTriggers<T extends Record<string, unknown>>(params: T): T {
   // A clone is a new task: none of its source's lifecycle state, archived included, comes along.
-  const { triggers: _t, triggerState: _s, triggerLastFiredAt: _lf, triggerPending: _tp, draft: _d, archived: _a, repeatable: _r, runOf: _ro, trigger: _tc, ...rest } = params as Record<string, unknown>;
+  const { triggers: _t, followUpTriggers: _f, triggerState: _s, triggerLastFiredAt: _lf, triggerPending: _tp, draft: _d, archived: _a, repeatable: _r, runOf: _ro, trigger: _tc, ...rest } = params as Record<string, unknown>;
   return rest as T;
 }
 

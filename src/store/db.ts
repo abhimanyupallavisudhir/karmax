@@ -99,6 +99,7 @@ import {
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
 import type { TaskTemplateContent } from '../domain/task-templates.js';
+import { normalizeFollowUpTriggers, type FollowUpTrigger } from '../domain/triggers.js';
 import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, type EventFollow, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventClaimState } from '../domain/project-events.js';
 import { paymentMerchantMatches } from '../util/payment-merchant.js';
@@ -1073,8 +1074,8 @@ export class Store {
         origin TEXT NOT NULL, hops INTEGER NOT NULL, dispatchedAt INTEGER,
         UNIQUE (projectId, source, eventKey)
       );
-      -- Tasks following project events: each match reaches the task's
-      -- conversation as a message (src/domain/project-events.ts EventFollow).
+      -- Retired: follows became params.followUpTriggers (2026-11). Rows from
+      -- before are drained at boot (Store.drainLegacyTaskFollows); nothing writes it.
       CREATE TABLE IF NOT EXISTS task_follows (
         id TEXT PRIMARY KEY, taskId TEXT NOT NULL, projectId TEXT NOT NULL, filter TEXT NOT NULL,
         once INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL
@@ -10385,36 +10386,48 @@ export class Store {
     return row?.id ? String(row.id) : undefined;
   }
 
-  async addTaskFollow(follow: EventFollow): Promise<EventFollow> {
-    const { id, taskId, projectId, once, createdAt, ...filter } = follow;
-    await this.db.transaction(async () => {
-      await this.db.prepare('INSERT INTO task_follows (id, taskId, projectId, filter, once, createdAt) VALUES (?,?,?,?,?,?)')
-        .run(id, taskId, projectId, JSON.stringify(filter), once ? 1 : 0, createdAt);
+  /** Rewrite a task's follow-up triggers under its lock; an empty list removes the param. */
+  async updateFollowUpTriggers(taskId: string, change: (current: FollowUpTrigger[]) => FollowUpTrigger[],
+    options: { clearPending?: boolean } = {}): Promise<FollowUpTrigger[]> {
+    return this.transaction(async () => {
+      await this.lockTask(taskId);
+      const task = await this.taskMetadata(taskId);
+      if (!task) return [];
+      const next = change(normalizeFollowUpTriggers(task.params));
+      const params = { ...(task.params as Record<string, unknown>) };
+      if (next.length) params.followUpTriggers = next;
+      else delete params.followUpTriggers;
+      if (options.clearPending) delete params.triggerPending;
+      await this.updateTaskParams(taskId, params as TaskRecord['params']);
+      return next;
     });
-    return follow;
   }
 
-  /** Follows of tasks in a project that is not finished (the dispatcher's candidates). */
-  async liveTaskFollows(projectId: string): Promise<Array<EventFollow & { emitter: string }>> {
-    const rows = await this.db.prepare(`SELECT f.*, COALESCE(json_extract(t.params, '$.runOf'), t.id) emitter
-      FROM task_follows f JOIN tasks t ON t.id=f.taskId
-      WHERE f.projectId=? AND COALESCE(json_extract(t.lastView, '$.status'), 'active') NOT IN ('done', 'failed', 'cancelled')
-      ORDER BY f.createdAt`).all(projectId);
-    return rows.map((row: any) => ({ ...taskFollowFromRow(row), emitter: String(row.emitter) }));
+  /** Tasks with follow-up triggers (the dispatcher arms them at boot). */
+  async listFollowUpTasks(): Promise<TaskRecord[]> {
+    return ((await this.db.prepare(`SELECT id, num, projectId, listId, title, workflow,
+      executionWorkflow, workflowVersion, params, createdAt, ord, parentTaskId,
+      createdBy, assignee, delegate, confirmationPolicy, intentId, attemptNumber,
+      notes, lastView FROM tasks
+      WHERE json_extract(params, '$.followUpTriggers') IS NOT NULL ORDER BY createdAt`).all()) as any[])
+      .map(rowToTask);
   }
 
-  async taskFollows(taskId: string): Promise<EventFollow[]> {
-    const rows = await this.db.prepare('SELECT * FROM task_follows WHERE taskId=? ORDER BY createdAt').all(taskId);
-    return rows.map(taskFollowFromRow);
-  }
-
-  async getTaskFollow(id: string): Promise<EventFollow | undefined> {
-    const row = await this.db.prepare('SELECT * FROM task_follows WHERE id=?').get(id);
-    return row ? taskFollowFromRow(row) : undefined;
-  }
-
-  async deleteTaskFollow(id: string): Promise<boolean> {
-    return this.db.transaction(async () => Number((await this.db.prepare('DELETE FROM task_follows WHERE id=?').run(id)).changes) === 1);
+  /** Move the retired `task_follows` rows into `params.followUpTriggers`: only
+   *  for tasks still running, and as triggers for while they run, which is all
+   *  a follow ever was. Once at each boot; nothing writes the table any more. */
+  async drainLegacyTaskFollows(): Promise<number> {
+    const rows = await this.db.prepare('SELECT * FROM task_follows ORDER BY createdAt').all() as any[];
+    for (const row of rows) {
+      const follow = taskFollowFromRow(row);
+      const task = await this.taskMetadata(follow.taskId);
+      if (task && !['done', 'failed', 'cancelled'].includes(task.lastView?.status ?? ''))
+        await this.updateFollowUpTriggers(follow.taskId, (current) => current.some((trigger) => trigger.id === follow.id) ? current : [...current, {
+          id: follow.id, kind: 'event', type: follow.type ?? '*', ...(follow.source ? { source: follow.source } : {}), ...(follow.subject ? { subject: follow.subject } : {}),
+          ...(follow.where ? { where: follow.where } : {}), ...(follow.includeSelf ? { includeSelf: true } : {}), ...(follow.once ? {} : { recurring: true }), whileRunning: true }]);
+      await this.db.prepare('DELETE FROM task_follows WHERE id=?').run(follow.id);
+    }
+    return rows.length;
   }
 
   /** Whether this event already reached this task (as its run's start or a message). */
@@ -10427,9 +10440,6 @@ export class Store {
   async pruneProjectEvents(before: number): Promise<number> {
     return this.db.transaction(async () => {
       await this.db.prepare(`DELETE FROM project_event_claims WHERE receivedAt<?`).run(before);
-      // A finished task hears nothing more; one deleted is gone.
-      await this.db.prepare(`DELETE FROM task_follows WHERE taskId NOT IN (SELECT id FROM tasks WHERE
-        COALESCE(json_extract(lastView, '$.status'), 'active') NOT IN ('done', 'failed', 'cancelled'))`).run();
       return Number((await this.db.prepare(`DELETE FROM project_events WHERE id IN
         (SELECT id FROM project_events WHERE receivedAt<? ORDER BY receivedAt LIMIT 10000)`).run(before)).changes);
     });

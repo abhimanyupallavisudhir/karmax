@@ -51,8 +51,8 @@ export interface PlatformOps {
   /** Record a project event; armed tasks whose event trigger matches start runs. */
   emitEvent(a: { projectId: string; type: string; key?: string; subject?: string; payload?: Record<string, unknown> }): Promise<unknown>;
   /** Follow project events: each match reaches the task's conversation as a message. */
-  followEvents(taskId: string, a: { type?: string; source?: string; subject?: string; where?: Record<string, unknown>; includeSelf?: boolean; once?: boolean }): Promise<unknown>;
-  unfollowEvents(taskId: string, followId?: string): Promise<unknown>;
+  addFollowUpTrigger(taskId: string, trigger: Record<string, unknown>): Promise<unknown>;
+  removeFollowUpTrigger(taskId: string, triggerId: string): Promise<unknown>;
   getTask(taskId: string): Promise<unknown>;
   queueTask(taskId: string): Promise<{ id?: string; parentTaskId?: string; params?: Record<string, unknown> }>;
   listTasks(projectId: string): Promise<{ id: string; title: string; workflow: string }[]>;
@@ -127,11 +127,10 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     // error for a task that already existed.
     createTask: (a) => api.createTask(getToken(), a),
     emitEvent: ({ projectId, ...event }) => api.emitProjectEvent(getToken(), projectId, event),
-    followEvents: (taskId, a) => api.followProjectEvents(getToken(), taskId, a as Parameters<KarmaxApi['followProjectEvents']>[2]),
-    unfollowEvents: async (taskId, followId) => {
-      const follows = followId ? [{ id: followId }] : await api.listTaskFollows(getToken(), taskId);
-      for (const follow of follows) await api.unfollowProjectEvents(getToken(), taskId, follow.id);
-      return { unfollowed: follows.map((follow) => follow.id) };
+    addFollowUpTrigger: (taskId, trigger) => api.addFollowUpTrigger(getToken(), taskId, trigger),
+    removeFollowUpTrigger: async (taskId, triggerId) => {
+      await api.removeFollowUpTrigger(getToken(), taskId, triggerId);
+      return { removed: triggerId };
     },
     getTask: (id) => api.getTaskView(getToken(), id) as Promise<unknown>,
     queueTask: (id) => api.queueTask(getToken(), id),
@@ -234,11 +233,10 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
       return task;
     },
     emitEvent: ({ projectId, ...event }) => req(`/api/projects/${encodeURIComponent(projectId)}/events`, { method: 'POST', body: JSON.stringify(event) }),
-    followEvents: (taskId, a) => req(`/api/tasks/${encodeURIComponent(taskId)}/follows`, { method: 'POST', body: JSON.stringify(a) }),
-    unfollowEvents: async (taskId, followId) => {
-      const follows = followId ? [{ id: followId }] : ((await req(`/api/tasks/${encodeURIComponent(taskId)}/follows`)) as { follows: Array<{ id: string }> }).follows;
-      for (const follow of follows) await req(`/api/tasks/${encodeURIComponent(taskId)}/follows/${encodeURIComponent(follow.id)}`, { method: 'DELETE' });
-      return { unfollowed: follows.map((follow) => follow.id) };
+    addFollowUpTrigger: (taskId, trigger) => req(`/api/tasks/${encodeURIComponent(taskId)}/follow-up-triggers`, { method: 'POST', body: JSON.stringify(trigger) }),
+    removeFollowUpTrigger: async (taskId, triggerId) => {
+      await req(`/api/tasks/${encodeURIComponent(taskId)}/follow-up-triggers/${encodeURIComponent(triggerId)}`, { method: 'DELETE' });
+      return { removed: triggerId };
     },
     getTask: (id) => req(`/api/tasks/${id}`),
     queueTask: (id) => req(`/api/tasks/${id}/queue`, { method: 'POST', body: '{}' }) as Promise<{ id?: string }>,
@@ -641,22 +639,17 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       payload: z.record(z.string(), z.unknown()).optional().describe('JSON object, at most 64 KB.'),
     },
   }, async (a) => wrap(async () => (await ops.emitEvent(a))));
-  server.registerTool('follow_events', {
-    description: 'Follow project events: each matching event reaches the task\'s conversation as a message. To wait for an event, follow it with once:true, then pause — the message ends the pause. A run started by an event already follows its subject (an issue\'s comments, a chat thread\'s replies).',
+  server.registerTool('add_follow_up_trigger', {
+    description: 'Hear about something later. When it happens the agent gets a message; if the task cannot take one it waits until it can, and if the task is done a fork of it carries on. To wait for it, add it and pause: the message ends the pause.',
     inputSchema: {
       taskId: z.string().describe('Usually your own task.'),
-      type: z.string().optional().describe('A type or family, e.g. "github.issue_comment.*" or "deploy.finished".'),
-      source: z.string().optional().describe('e.g. "github", "webhook:<hookId>", "task:<taskId>".'),
-      subject: z.string().optional().describe('An exact subject, e.g. an issue or pull request URL.'),
-      where: z.record(z.string(), z.unknown()).optional().describe('Payload filter, as in an event trigger: {"path.to.field": value | {in|contains|matches|exists}}.'),
-      includeSelf: z.boolean().optional().describe('Also hear what the tavya GitHub App itself did.'),
-      once: z.boolean().optional().describe('Stop following after the first match (a wait).'),
+      trigger: z.record(z.string(), z.unknown()).describe('Same shapes as a task\'s start triggers, plus `subject`: {kind:"event", type:"github.issues.*", source?, subject?, where?, includeSelf?, recurring?}; {kind:"schedule", cron:"0 9 * * *" or at:<epoch ms>}; {kind:"dependency", tasks:[id], on?, mode?}. One-shot unless recurring (a cron always recurs); dependencies are prerequisites of the rest. whileRunning:true drops it when the task ends instead of forking.'),
     },
-  }, async ({ taskId, ...a }) => wrap(async () => (await ops.followEvents(taskId, a))));
-  server.registerTool('unfollow_events', {
-    description: 'Stop following project events: one follow by id, or all of the task\'s follows.',
-    inputSchema: { taskId: z.string(), followId: z.string().optional() },
-  }, async (a) => wrap(async () => (await ops.unfollowEvents(a.taskId, a.followId))));
+  }, async ({ taskId, trigger }) => wrap(async () => (await ops.addFollowUpTrigger(taskId, trigger))));
+  server.registerTool('remove_follow_up_trigger', {
+    description: 'Remove one follow-up trigger, by the id add_follow_up_trigger returned.',
+    inputSchema: { taskId: z.string(), triggerId: z.string() },
+  }, async (a) => wrap(async () => (await ops.removeFollowUpTrigger(a.taskId, a.triggerId))));
   server.registerTool('list_events', { description: `Read durable ${BRAND} events for a task after an optional sequence number.`, inputSchema: { taskId: z.string(), since: z.number().int().nonnegative().default(0) } }, async (a) => wrap(async () => (await ops.listEvents(a.taskId, a.since))));
   server.registerTool('list_github_actions_runs', {
     description: 'List GitHub Actions workflow runs for a repository attached to the calling task’s project. The GitHub credential remains in the control plane.',
