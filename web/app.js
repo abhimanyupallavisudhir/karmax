@@ -7882,6 +7882,8 @@ function stageLabel(v) {
   if (v.state?.draft) return 'Draft';
   // A full disk stopped the task: say so, not "blocked" (wiki features/computers).
   if (v.outOfDisk) return 'Out of disk';
+  // A co-ordinator that failed says when it tries again.
+  if (v.status === 'blocked' && v.waitingFor?.reason === 'error' && Number.isFinite(v.waitingFor.until)) return `Retries at ${waitDeadline(v.waitingFor.until)}`;
   // A human hold is a public software-dev stage, even though the workflow keeps
   // its replay-safe Do/Review/Landing checkpoint internally so a follow-up knows
   // where to resume. Direct provider blockers may supply a concise specific
@@ -11477,7 +11479,7 @@ function patchTaskPage(main, html) {
   const oldParams = main.querySelector('#tp-params');
   const newParams = template.content.querySelector('#tp-params');
   if (oldParams && newParams && oldParams.dataset.renderKey === newParams.dataset.renderKey) {
-    const fields = paramFields(S.view).filter((f) => (S.view.editableParams || []).includes(f.name));
+    const fields = paramFields(S.view).filter((f) => editableParamNames(S.view).includes(f.name));
     const current = collectParamEdits(oldParams, fields);
     const incoming = collectParamEdits(newParams, fields);
     const draft = S.paramEditDrafts[S.view.taskId];
@@ -15901,7 +15903,15 @@ function paramFields(v) {
     ...schemaFor(v.workflow).filter((f) => f.scopes.includes('task')),
     ...keys.map((key) => ({ name: `agent:${key}`, type: 'agent', role: key, scopes: ['task'], calledAgent: true,
       label: agentParticipantLabel(key), participant: participants?.find((p) => p.key === key) })),
+    ...(rec?.params?.coordinator ? [{ name: 'coordinator', type: 'coordinator', label: 'Permanent co-ordinator', scopes: ['task'] }] : []),
   ];
+}
+
+// What can be edited now: nothing once a task has finished, except that a
+// co-ordinator whose run failed is still going to retry (wiki features/coordinator).
+function editableParamNames(v) {
+  if (!TERMINAL_STAGES.includes(v.stage)) return v.editableParams || [];
+  return v.status === 'failed' && taskRecord(v.taskId)?.params?.coordinator ? ['coordinator'] : [];
 }
 
 /** The task's own authority, which agents without their own start from. */
@@ -15925,7 +15935,7 @@ function paramsSection(v) {
   // what ran. Keep terminal-task parameters visible, but defensively ignore any
   // stale editable window left on an older persisted view.
   const terminal = TERMINAL_STAGES.includes(v.stage);
-  const editable = new Set(terminal ? [] : (v.editableParams || []));
+  const editable = new Set(editableParamNames(v));
   const editDraft = S.paramEditDrafts?.[v.taskId];
   const inheritedAll = S.paramDefaults || {};
   const frozenTitle = terminal
@@ -15964,6 +15974,7 @@ function paramsSection(v) {
       const label = (isEditable ? fieldLabel(f) : frozenLabel(f)).replace('</label>', `</label>${computerPendingChip(v.computerChange)}`);
       return `<div class="${isEditable ? 'pf-edit-row' : 'pf-frozen'}" data-row="${esc(f.name)}"><div class="form-row">${label}${block}</div></div>`;
     }
+    if (f.type === 'coordinator') return coordinatorParamRow(f, own, isEditable, frozenLabel);
     if (isEditable) return `<div class="pf-edit-row" data-row="${esc(f.name)}">${renderField(f, own, inherited)}</div>`;
     // A frozen route keeps its shape (who, in order, and each agent's block).
     if (f.type === 'confirmer' || f.type === 'responder') {
@@ -15989,12 +16000,9 @@ function paramsSection(v) {
     perRepo ? repoBranchesFrozenRow(perRepo, paramCurrentValue(perRepo, v, rec), lock) : '',
     ...whereFields.filter((f) => f !== perRepo && (pair.length < 2 || !pair.includes(f))).map(rowFor),
   ].join('');
-  const triggers = (Array.isArray(rec?.params?.triggers) && rec.params.triggers.length
+  const triggers = Array.isArray(rec?.params?.triggers) && rec.params.triggers.length
     ? `<div class="form-row pf-frozen" data-row="__triggers"><div class="label-row"><label>Triggers</label>${lock}<span class="label-row-fill"></span></div>
-        <div class="pf-ro">${esc(triggerSummary(rec.params.triggers))}</div></div>` : '')
-    + (rec?.params?.coordinator
-      ? `<div class="form-row pf-frozen" data-row="__coordinator"><div class="label-row"><label>Permanent co-ordinator</label>${lock}<span class="label-row-fill"></span></div>
-        <div class="pf-ro">Checks in ${esc(coordinatorIntervalText(rec.params.coordinator))}</div></div>` : '');
+        <div class="pf-ro">${esc(triggerSummary(rec.params.triggers))}</div></div>` : '';
   const footer = editable.size
     ? `<div class="params-save-bar" data-save-state="${editDraft?.dirtyNames?.length ? 'dirty' : 'saved'}">
         <span class="save-state" id="params-save-status" role="status" data-state="${editDraft?.dirtyNames?.length ? 'dirty' : ''}">${editDraft?.dirtyNames?.length ? 'Unsaved changes' : ''}</span>
@@ -16133,6 +16141,7 @@ function collectParamEdits(root, fields) {
     if (!el) continue;
     let val;
     if (f.type === 'boolean') val = el.checked;
+    else if (f.type === 'coordinator') val = coordinatorHoursValue(el.value);
     else if (f.type === 'list') val = el.value.split('\n').map((s) => s.trim()).filter(Boolean);
     else if (f.type === 'number') val = el.value === '' ? undefined : Number(el.value);
     else val = el.value.trim() === '' ? undefined : el.value.trim();
@@ -16183,7 +16192,7 @@ function wireParams(v) {
   const saveBtn = document.getElementById('params-save');
   if (!saveBtn) return;
   const status = document.getElementById('params-save-status');
-  const fields = paramFields(v).filter((f) => (v.editableParams || []).includes(f.name));
+  const fields = paramFields(v).filter((f) => editableParamNames(v).includes(f.name));
   const existing = S.paramEditDrafts[v.taskId];
   const currentAtRender = collectParamEdits(root, fields);
   // Rebase untouched controls onto the newest server render, while preserving
@@ -19125,7 +19134,7 @@ function readAvatarSection(root) {
 // The task form's last row: a task that runs the project like its CEO, and
 // the longest it rests after it stops (`params.coordinator.wakeHours`).
 const COORDINATOR_DEFAULT_HOURS = 24;
-const COORDINATOR_TIP = 'Runs the project like its CEO: creates and steers other tasks, lands its own changes as separate pull requests, and never finishes. Whenever it stops, it checks in again within this many hours. If it fails, you get a critical notification.';
+const COORDINATOR_TIP = 'Runs the project like its CEO: creates and steers other tasks, lands its own changes as separate pull requests, and never finishes. Whenever it stops, it checks in again within this many hours. If it fails, you get a critical notification and it retries, waiting longer each time.';
 // Only a Software dev task can be one (it lands work and makes sub-tasks).
 function coordinatorSelectable(fields) {
   return (fields || []).some((f) => f.name === 'multiPr');
@@ -19143,16 +19152,40 @@ function coordinatorSectionHtml(value) {
 }
 function readCoordinatorSection(root) {
   if (!root?.querySelector('#tf-coordinator')?.checked) return undefined;
-  const raw = String(root.querySelector('#tf-coordinator-hours')?.value ?? '').trim().replace(',', '.');
+  return coordinatorHoursValue(root.querySelector('#tf-coordinator-hours')?.value) ?? { wakeHours: COORDINATOR_DEFAULT_HOURS };
+}
+// The setting an hours box holds, decimals with a point or a comma; undefined when empty or not a number.
+function coordinatorHoursValue(value) {
+  const raw = String(value ?? '').trim().replace(',', '.');
   const hours = Number(raw);
-  return { wakeHours: raw && Number.isFinite(hours) && hours > 0 ? hours : COORDINATOR_DEFAULT_HOURS };
+  return raw && Number.isFinite(hours) && hours > 0 ? { wakeHours: hours } : undefined;
 }
 function wireCoordinatorSection(root) {
   const box = root?.querySelector('#tf-coordinator');
-  box?.addEventListener('change', () => {
+  if (!box) return;
+  const several = root.querySelector('[data-field="multiPr"]');
+  // A co-ordinator always uses several branches; unticking gives back the choice.
+  let chosen = several?.checked;
+  const apply = () => {
     const wake = root.querySelector('.tf-coordinator-wake');
     if (wake) wake.hidden = !box.checked;
-  });
+    if (!several) return;
+    if (!several.disabled) chosen = several.checked;
+    several.checked = box.checked || chosen;
+    several.disabled = box.checked;
+    several.closest('.switch')?.toggleAttribute('data-forced', box.checked);
+    if (several.parentElement) several.parentElement.title = box.checked ? 'Always on for a permanent co-ordinator' : '';
+  };
+  box.addEventListener('change', apply);
+  apply();
+}
+// The Parameters tab's row: the interval, changeable all the task's life.
+function coordinatorParamRow(field, value, editable, frozenLabel) {
+  if (!editable) return `<div class="form-row pf-frozen" data-row="coordinator">${frozenLabel(field)}<div class="pf-ro">Checks in ${esc(coordinatorIntervalText(value))}</div></div>`;
+  const hours = Number(value?.wakeHours) > 0 ? Number(value.wakeHours) : COORDINATOR_DEFAULT_HOURS;
+  return `<div class="pf-edit-row" data-row="coordinator"><div class="form-row"><div class="label-row"><label>${esc(field.label)}</label></div>
+    <label class="tf-coordinator-wake pf-coordinator-wake">Checks in every
+      <input type="number" data-field="coordinator" min="0.02" max="8760" step="any" inputmode="decimal" value="${esc(String(hours))}" aria-label="Check-in interval (hours)"> h</label></div></div>`;
 }
 // "every 24 h", "every 30 min": a co-ordinator's interval, read-only.
 function coordinatorIntervalText(setting) {

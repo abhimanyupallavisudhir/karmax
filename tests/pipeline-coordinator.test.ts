@@ -91,19 +91,59 @@ describe('software-dev: a permanent co-ordinator', () => {
     }
   }, 180_000);
 
-  it('retries on its own within its interval after a failure', async () => {
-    const { taskId, handle } = await start('coordinator-failure', '@fail the market moved', { wakeHours: 1 / 60, waitMinuteMs: 4_000, resolveAgentEnabled: false });
+  it('backs off between retries of a failure that persists, and says when the next is', async () => {
+    // A minute of 100 ms: 1.5 s, then 3 s, then 6 s.
+    const { handle } = await start('coordinator-backoff', '@fail the market moved', { wakeHours: 1 / 60, waitMinuteMs: 100, resolveAgentEnabled: false });
     try {
-      await expect.poll(async () => (await view(handle)).status, { timeout: 60_000, interval: 200 }).toBe('blocked');
-      // Nobody pressed Retry: it ran the stage again, and failed again.
+      const seen = new Map<number, { at: number; until: number }>();
       await expect.poll(async () => {
-        const statuses = (await h.store.eventsOfType(taskId, 'view.updated')).map((e: any) => e.payload.status);
-        const first = statuses.indexOf('blocked');
-        return first >= 0 && statuses.slice(first).includes('active') && statuses.lastIndexOf('blocked') > statuses.indexOf('active', first);
-      }, { timeout: 60_000, interval: 250 }).toBe(true);
+        const v = await view(handle);
+        const failures = v.state?.coordinatorFailures ?? 0;
+        if (v.status === 'blocked' && failures && !seen.has(failures)) seen.set(failures, { at: Date.now(), until: v.waitingFor.until });
+        return seen.size;
+      }, { timeout: 60_000, interval: 50 }).toBeGreaterThanOrEqual(3);
+      const wait = (failures: number) => seen.get(failures)!.until - seen.get(failures)!.at;
+      expect(wait(1)).toBeLessThanOrEqual(1_500);
+      expect(wait(2)).toBeGreaterThan(wait(1));
+      expect(wait(3)).toBeGreaterThan(wait(2));
+      // It is the backoff, not its one-minute (100 ms × 60 = 6 s) check-in, that spaces them.
+      expect(seen.get(2)!.at - seen.get(1)!.at).toBeGreaterThanOrEqual(1_200);
+      expect(seen.get(3)!.at - seen.get(2)!.at).toBeGreaterThanOrEqual(2_400);
     } finally {
       await handle.signal('cancel');
       await handle.result();
     }
   }, 180_000);
+
+  it('forgets its failures once it gets through and rests', async () => {
+    const { handle } = await start('coordinator-recovers', '@failonce a passing fault', { wakeHours: 24, waitMinuteMs: 50, resolveAgentEnabled: false });
+    try {
+      await expect.poll(async () => (await view(handle)).state?.coordinatorFailures, { timeout: 60_000, interval: 50 }).toBe(1);
+      await expect.poll(async () => { const v = await view(handle); return `${v.status}/${v.waitingFor?.kind}/${v.state?.coordinatorFailures}`; },
+        { timeout: 60_000, interval: 50 }).toBe('waiting/timer/0');
+    } finally {
+      await handle.signal('cancel');
+      await handle.result();
+    }
+  }, 180_000);
+
+  it('takes a changed interval while it rests, and re-times the rest', async () => {
+    // Asked to rest 240 s; edited to 4 s, it checks in at once from then on.
+    const { handle } = await start('coordinator-edit', '@say Planned the week.', { wakeHours: 1, waitMinuteMs: 4_000 });
+    try {
+      await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 30_000, interval: 100 }).toBe('timer');
+      const resting = await view(handle);
+      expect(resting.editableParams).toContain('coordinator');
+      expect(resting.waitingFor.detail).toBe('Checks in again within 1 hour');
+      const longUntil = resting.waitingFor.until;
+      const result = await handle.executeUpdate('updateParams', { args: [{ coordinator: { wakeHours: 1 / 60 } }] }) as { applied: string[] };
+      expect(result.applied).toContain('coordinator');
+      await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 10_000, interval: 100 }).toBe('Checks in again within 1 minute');
+      expect((await view(handle)).waitingFor.until).toBeLessThan(longUntil);
+      await expect.poll(() => checkIns(handle), { timeout: 30_000, interval: 200 }).toBeGreaterThanOrEqual(1);
+    } finally {
+      await handle.signal('cancel');
+      await handle.result();
+    }
+  }, 120_000);
 });

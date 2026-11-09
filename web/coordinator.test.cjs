@@ -20,7 +20,7 @@ function context() {
     policyTip: (text) => `<button class="info-dot" title="${text}">ⓘ</button>`,
   });
   vm.runInContext([constant('COORDINATOR_DEFAULT_HOURS'), constant('COORDINATOR_TIP'), fn('coordinatorSelectable'),
-    fn('coordinatorSectionHtml'), fn('readCoordinatorSection'), fn('coordinatorIntervalText')].join('\n'), ctx);
+    fn('coordinatorSectionHtml'), fn('coordinatorHoursValue'), fn('readCoordinatorSection'), fn('coordinatorIntervalText')].join('\n'), ctx);
   return ctx;
 }
 
@@ -55,6 +55,13 @@ test('reading the row: nothing unticked; the hours, decimals and commas included
   assert.deepEqual(read('0.5'), { wakeHours: 0.5 });
   assert.deepEqual(read('2,5'), { wakeHours: 2.5 });
   assert.deepEqual(read(''), { wakeHours: 24 });
+});
+
+test('the Parameters tab reads its interval the same way, and refuses empty', () => {
+  const { coordinatorHoursValue } = context();
+  assert.deepEqual(JSON.parse(JSON.stringify(coordinatorHoursValue('2,5'))), { wakeHours: 2.5 });
+  assert.equal(coordinatorHoursValue(''), undefined);
+  assert.equal(coordinatorHoursValue('soon'), undefined);
 });
 
 test('offered only where the workflow lands branches, and said read-only as an interval', () => {

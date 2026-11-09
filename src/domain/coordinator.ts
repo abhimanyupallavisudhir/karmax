@@ -19,6 +19,18 @@ export const DEFAULT_COORDINATOR_WAKE_HOURS = 24;
 export const MIN_COORDINATOR_WAKE_HOURS = 1 / 60;
 /** A year: the bound of a sensible check-in. */
 export const MAX_COORDINATOR_WAKE_HOURS = 24 * 365;
+/** The wait before the first retry of a failure: long enough for what its own
+ * retries and Resolve could not clear, short enough not to leave a firm unrun. */
+export const COORDINATOR_RETRY_FIRST_MINUTES = 15;
+/** The longest wait between retries, so a co-ordinator that broke still comes back. */
+export const COORDINATOR_RETRY_MAX_MINUTES = 7 * 24 * 60;
+
+/** How long to wait before retrying, `failures` being how many times in a row
+ * it has now failed: 15 minutes, doubling up to a week. Independent of the
+ * check-in interval, which is about its work rather than its faults. */
+export function coordinatorRetryMinutes(failures: number): number {
+  return Math.min(COORDINATOR_RETRY_FIRST_MINUTES * 2 ** Math.max(0, failures - 1), COORDINATOR_RETRY_MAX_MINUTES);
+}
 
 /** The setting a task's params carry, normalized; absent: not a co-ordinator.
  * Lenient, for readers of stored params (an invalid stored interval falls back
