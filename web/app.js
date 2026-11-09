@@ -15280,9 +15280,9 @@ function waitingText(w) {
   // A permanent co-ordinator's rest says when it checks in; a task with
   // follow-up triggers, what it waits for.
   if (w?.kind === 'timer') {
-    const head = typeof w.summary === 'string' && w.summary.trim() ? w.summary.trim().slice(0, 56) : 'Waiting';
-    if (!Number.isFinite(w.until)) return head;
-    return `${head === 'Checks in' ? 'Checks in at' : `${head} until`} ${waitDeadline(w.until)}`;
+    if (!Number.isFinite(w.until)) return 'Waiting';
+    if (typeof w.summary === 'string' && w.summary.startsWith('Waiting for')) return `${w.summary.slice(0, 56)} until ${waitDeadline(w.until)}`;
+    return `${w.summary === 'Checks in' ? 'Checks in at' : 'Waiting until'} ${waitDeadline(w.until)}`;
   }
   // A full provider limit: what it waits for, and when it tries again; a
   // queued machine, its place in the queue (what is full is its tooltip, waitTitle).
