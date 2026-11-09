@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CODEX_VERSION } from '../../agent/codex-history.js';
 import { OPENCODE_PACKAGE } from '../../agent/acp-packages.js';
@@ -63,6 +64,7 @@ fi
 # A volume grown while the machine was off grows its filesystem now.
 source=$(findmnt -no SOURCE ${VM_HOME} 2> /dev/null) && [ -n "$source" ] && resize2fs "$source" > /dev/null 2>&1
 chown ${VM_USER}:${VM_USER} ${VM_HOME}
+${volumeTmpScript(VM_HOME)}
 [ -e ${VM_HOME}/.profile ] || { cp -rn /etc/skel/. ${VM_HOME}/ 2> /dev/null; chown -R ${VM_USER}:${VM_USER} ${VM_HOME}/.bashrc ${VM_HOME}/.profile ${VM_HOME}/.bash_logout 2> /dev/null; }
 chmod 600 "$K/ssh_host_ed25519_key"
 mkdir -p /etc/ssh/sshd_config.d /run/sshd
@@ -90,6 +92,29 @@ ${options.foreground
     ? "trap 'kill $sshd 2> /dev/null; exit 0' TERM INT\nwhile :; do /usr/sbin/sshd -D -e & sshd=$!; wait $sshd; sleep 1; done"
     : '(systemctl restart ssh || systemctl restart sshd || /usr/sbin/sshd) > /dev/null 2>&1'}
 `;
+}
+
+/**
+ * /tmp on the world's volume, as on E2B, where one disk holds both. What a
+ * world writes there (pytest's and agents' temporary files, worktrees, the
+ * session holder's state) then counts against the disk its task chose, which
+ * tavya measures, keeps a ballast on, warns about and grows; the root disk
+ * (Fly's 8 GB rootfs, which `persist_rootfs` keeps across restarts with
+ * nothing emptying its /tmp) holds only the system (f53f650e6ca76f9f: 3.9 GB of
+ * a Fly world's tests' temporary files filled it, and no process could start).
+ * Emptied at every boot, as /tmp is, so no process's state outlives a park:
+ * the root disk's own /tmp first (a bind mount would hide it, not free it),
+ * keeping systemd's PrivateTmp directories of services already running. A
+ * machine without a volume of its own (an image builder) keeps its /tmp; so
+ * does a boot whose /tmp is already there (idempotent).
+ */
+export function volumeTmpScript(home: string, tmp = '/tmp'): string {
+  const dir = path.posix.join(home, '.karmax-tmp');
+  return `if [ "$(stat -c %d ${quote(home)})" != "$(stat -c %d ${quote(tmp)})" ]; then
+  find ${quote(tmp)} -mindepth 1 -maxdepth 1 ! -name 'systemd-private-*' -exec rm -rf {} + 2> /dev/null
+  { rm -rf ${quote(dir)} && mkdir ${quote(dir)} && chmod 1777 ${quote(dir)} && mount --bind ${quote(dir)} ${quote(tmp)}; } \\
+    || echo "could not put ${tmp} on the world's volume" >&2
+fi`;
 }
 
 /** What every boot needs on the machine: its keys, its volume's device, and
@@ -216,6 +241,11 @@ ${smokeTest().trim()}
 KARMAX_SMOKE
 chmod -R a+rX /opt/karmax
 PLAYWRIGHT_BROWSERS_PATH=/opt/karmax/browsers node /opt/karmax/smoke.mjs
+# Download caches serve only this run. On Fly's 8 GB root disk, which
+# persist_rootfs keeps, every provisioning version added its packages to npm's
+# (1.1 GB of a full disk, f53f650e6ca76f9f); this also clears earlier ones.
+npm cache clean --force > /dev/null 2>&1 || true
+apt-get clean
 cat > /etc/profile.d/karmax.sh << 'EOF'
 export PATH=/opt/karmax/bin:$PATH
 export PLAYWRIGHT_BROWSERS_PATH=/opt/karmax/browsers

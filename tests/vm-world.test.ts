@@ -213,6 +213,18 @@ describe.skipIf(!sshdAvailable)('VM world over SSH', () => {
     expect((await world.exec('sh', ['-c', `pgrep -f "slee[p] ${seconds}" | wc -l`])).stdout.trim()).toBe('0');
   });
 
+  // f53f650e6ca76f9f: "could not start the process in the VM (status 1)" named
+  // no cause, so a VM whose disk was full stopped its task as an agent error.
+  it('says why the VM could not start a process', async () => {
+    const sessions = '/tmp/karmax-sessions';
+    fs.mkdirSync(sessions, { recursive: true, mode: 0o700 });
+    fs.chmodSync(sessions, 0o500); // as a full disk refuses the session's directory
+    try {
+      await expect(world.startProcess({ command: 'true' }))
+        .rejects.toThrow(/^could not start the process in the VM \(status 1\): mkdir: .*karmax-sessions\/.*Permission denied/);
+    } finally { fs.chmodSync(sessions, 0o700); }
+  });
+
   it('runs background processes with output, exit status and kill', async () => {
     const done = await world.startProcess({ command: 'echo started; echo oops >&2; exit 4' });
     let output = '';
