@@ -521,10 +521,11 @@ export class VmWorldProvider implements WorldProvider {
 
   /** /tmp on the world's volume (`volumeTmpScript`) on a machine whose boot
    * script predates it: each keeps the one it was made with. Right after a
-   * start, before anything runs in it; idempotent. */
+   * start, before anything runs in it; idempotent. The first one may delete
+   * gigabytes of an old /tmp (f53f650e6ca76f9f: 3.9 GB), hence the time. */
   private async volumeTmp(transport: SshTransport): Promise<void> {
     if (!(this.options.provision ?? { sudo: true }).sudo) return;
-    const result = await transport.exec(`sudo -n sh -c ${quote(volumeTmpScript(this.home()))}`, { timeoutMs: 60_000 }).catch((error) => error as Error);
+    const result = await transport.exec(`sudo -n sh -c ${quote(volumeTmpScript(this.home()))}`, { timeoutMs: 5 * 60_000 }).catch((error) => error as Error);
     const problem = result instanceof Error ? result.message : result.code !== 0 ? result.stderr.toString().trim() : '';
     if (problem) console.warn(`[${this.kind}] could not put /tmp on the world's volume: ${problem}`);
   }
