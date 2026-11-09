@@ -57,6 +57,7 @@ import { ANY_PROVIDER, applyComputer, assertInFlightComputerEdit, computerOf, co
   type ComputerSpec, type MachineShape, worldMachine } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { splitSharedSettings } from '../domain/shared-settings.js';
+import { coordinatorRetryMinutes, coordinatorSetting, normalizeCoordinatorSetting } from '../domain/coordinator.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM, applyRepoBranches, normalizeRepoBranches, repositoryBranchDefaults } from './branch-defaults.js';
 import { withTimeout } from '../util/timeout.js';
 import path from 'node:path';
@@ -483,6 +484,29 @@ function subTaskParentEnded(parent: TaskRecord): string | undefined {
   if (view && (['done', 'cancelled', 'failed'].includes(view.status) || ['done', 'cancelled'].includes(view.stage)))
     return `its parent task has ${view.status === 'failed' ? 'failed' : 'ended'}`;
   return undefined;
+}
+
+/** Validate a task's permanent co-ordinator setting (`params.coordinator`,
+ * wiki features/coordinator), normalized in place. Only a top-level Software
+ * dev task that runs once can be one: it never finishes. Its work always lands
+ * branch by branch, so that is what its params say. */
+function assertCoordinatorSetting(params: Record<string, unknown>, workflow: string, parentTaskId?: string): void {
+  const setting = normalizeCoordinatorSetting(params.coordinator);
+  if (!setting) { delete params.coordinator; return; }
+  params.coordinator = setting;
+  if (workflow !== 'software-dev') throw new ValidationError('Only a Software dev task can be a permanent co-ordinator');
+  if (parentTaskId) throw new ValidationError("A sub-task can't be a permanent co-ordinator");
+  if (params.repeatable === true) throw new ValidationError("A repeatable task can't be a permanent co-ordinator: it never finishes");
+  params.multiPr = true;
+}
+
+/** A permanent co-ordinator's run: it knows it is one, and its own work always
+ * lands branch by branch, never as the proposal that finishes a task. */
+function withCoordinator(input: TaskInput, params: Record<string, unknown>): void {
+  const setting = coordinatorSetting(params);
+  if (!setting || input.parentTaskId || input.shippedFrom) return;
+  input.coordinator = setting;
+  input.project = { ...input.project, multiPr: true };
 }
 
 export class KarmaxApi {
@@ -1628,6 +1652,7 @@ export class KarmaxApi {
     // authorization, credentials and GitHub account: nobody grants it again
     // (src/platform/avatars.ts). Everything else is granted by the caller.
     const mainAvatar = (await this.assertAvatarSetting(caller, project, args.params ?? {}));
+    if (args.params) assertCoordinatorSetting(args.params, workflow);
     const organizationId = project.organizationId ?? 'org_personal';
     const orgVault = (await this.deps.store.getSettings(`organization:${organizationId}`, 'vault')) ?? {};
     const projectVault = (await this.deps.store.getSettings(project.id, 'vault')) ?? {};
@@ -1988,6 +2013,7 @@ export class KarmaxApi {
     });
     input.createdAt = task.createdAt;
     input.workflow = workflow;
+    withCoordinator(input, task.params);
     input.grant = authorization.capabilities;
     input.grantPrincipal = mainAvatar ? avatarPrincipal(mainAvatar.id) : caller.principal;
     input.delegationId = delegation?.id;
@@ -2317,6 +2343,7 @@ export class KarmaxApi {
       || transferLock && JSON.parse(transferLock).expiresAt > Date.now()
       || await this.deps.store.kvGet(`project-transfer-history:${task.id}`))
       throw new ValidationError('Project moved or is moving. Reload and start a new task.');
+    withCoordinator(input, task.params);
     return { startType, input, version: manifest.version };
   }
 
@@ -3712,6 +3739,7 @@ export class KarmaxApi {
     };
     const base: Record<string, unknown> = opts.replace ? { ...meta, ...params } : { ...task.params, ...params };
     if (project) (await this.assertAvatarSetting(caller, project, base, taskId));
+    assertCoordinatorSetting(base, task.workflow, task.parentTaskId);
     // Validate the edited triggers before anything is written: a rejected edit
     // (a cycle, a dangling or self dependency) must leave the task as it was,
     // still armed. Saving first left it un-armed with the bad triggers stored,
@@ -6577,6 +6605,33 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
   /** Restart a terminally failed software-dev execution without running Setup.
    * Setup's createWorld deliberately replaces stale worktrees; doing that here
    * would erase the exact dirty work a recovery exists to preserve. */
+  /** Revivals of a failed co-ordinator that could not be started, so that
+   * trying again backs off too. In memory: a restart only tries once more. */
+  private readonly coordinatorRevivals = new Map<string, { at: number; attempts: number }>();
+
+  /** Restart every permanent co-ordinator whose run failed outright, once its
+   * backoff has passed since it failed (wiki features/coordinator), as its
+   * Retry would. Its failure was a critical ask meanwhile. Returns those restarted. */
+  async reviveFailedCoordinators(now = Date.now()): Promise<string[]> {
+    const revived: string[] = [];
+    for (const { id, failedAt, failures } of (await this.deps.store.failedCoordinators())) {
+      const tried = this.coordinatorRevivals.get(id);
+      const wait = coordinatorRetryMinutes(failures + (tried?.attempts ?? 0)) * 60_000;
+      if (now < Math.max(failedAt, tried?.at ?? 0) + wait) continue;
+      this.coordinatorRevivals.set(id, { at: now, attempts: (tried?.attempts ?? 0) + 1 });
+      try {
+        await this.recoverFailedTask(id);
+        revived.push(id);
+        this.coordinatorRevivals.delete(id);
+        (await this.deps.store.appendEvent({ taskId: id, type: 'coordinator.revived', ts: now, payload: { failedAt, failures } }));
+      } catch (error) {
+        (await this.deps.store.appendEvent({ taskId: id, type: 'coordinator.revival-failed', ts: now,
+          payload: { error: String(error instanceof Error ? error.message : error).slice(0, 800) } }).catch(() => undefined));
+      }
+    }
+    return revived;
+  }
+
   private async recoverFailedTask(taskId: string): Promise<void> {
     const task = (await this.deps.store.getTask(taskId));
     const view = task?.lastView;
@@ -6589,6 +6644,9 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     // that made the old run terminal, so resume on the current bundled version
     // and persist that new pin only after Temporal accepts the replacement.
     const { startType, input, version } = await this.buildStart(task, true);
+    // A co-ordinator's run continues its streak of failures (its retry backoff).
+    const failures = Number(view.state?.coordinatorFailures ?? 0);
+    if (input.coordinator && failures > 0) input.coordinator = { ...input.coordinator, failures };
     const savedWorld = view.state?.recoveryWorld as any;
     let world = savedWorld?.root && savedWorld?.branch ? savedWorld : undefined;
 
@@ -7311,7 +7369,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
   private waitingOnFollowUps(view: TaskView, task: TaskRecord | undefined): Pick<TaskView, 'waitingFor'> | undefined {
     const waiting = view.waitingFor;
     const triggers = normalizeFollowUpTriggers(task?.params).filter((trigger) => !trigger.whileRunning);
-    if (view.status !== 'waiting' || waiting?.kind !== 'timer' || !triggers.length) return undefined;
+    if (view.status !== 'waiting' || waiting?.kind !== 'timer' || waiting.summary || !triggers.length) return undefined;
     return { waitingFor: { ...waiting, summary: `Waiting for ${followUpTriggerSummary(triggers)}` } };
   }
 
@@ -7744,6 +7802,14 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       delete patch.followUpTriggers;
     }
     this.assertBranchParams(patch);
+    // A permanent co-ordinator's interval changes at any time; being one doesn't.
+    const coordinatorEdit = Object.hasOwn(patch, 'coordinator');
+    if (coordinatorEdit) {
+      if (!coordinatorSetting(task.params)) throw new ValidationError("Only a task queued as a permanent co-ordinator has a check-in interval");
+      const setting = normalizeCoordinatorSetting(patch.coordinator);
+      if (!setting) throw new ValidationError("A permanent co-ordinator stays one: cancel it to stop it");
+      patch.coordinator = setting;
+    }
     // A running task may resize its computer, not swap it for another one.
     const project = (await this.deps.store.getProject(task.projectId));
     const computerBefore = project && Object.prototype.hasOwnProperty.call(patch, 'computer')
@@ -7794,6 +7860,8 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       // platform's (computerResizable), so it never reaches a workflow — an
       // older one, started before the Computer existed, would refuse it.
       const { computer: _computer, ...workflowPatch } = patch;
+      // A run that failed has no workflow to ask: its next run reads the params.
+      if (task.lastView?.status === 'failed') delete workflowPatch.coordinator;
       const result = Object.keys(workflowPatch).length
         ? (await (await this.workflowHandle(taskId)).executeUpdate('updateParams', { args: [workflowPatch] })) as { applied: string[] }
         : { applied: [] as string[] };
@@ -7805,6 +7873,10 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
           else delete current[key];
         }
         (await this.deps.store.patchTaskParams(taskId, { _agentAuthorization: current }));
+      }
+      if (coordinatorEdit) {
+        (await this.deps.store.patchTaskParams(taskId, { coordinator: patch.coordinator }));
+        result.applied = [...new Set([...result.applied, 'coordinator'])];
       }
       // The workflow accepted the edit window; the Computer itself is read from
       // the task's params by whatever makes its next machine (runners.ts sweep,

@@ -167,6 +167,7 @@ import {
 } from '../coordinators/names.js';
 import { lifecycleReplacementKey, lifecycleReplacementMatches } from '../platform/lifecycle-replacement.js';
 import { BRAND } from '../domain/brand.js';
+import { ERROR_EVENT_TYPE, reportError } from '../platform/error-reports.js';
 import { screenEnvironment, skippedEnvNotice, type SkippedEnv } from '../util/work-env.js';
 
 /** How often staging records its progress as a task event. */
@@ -681,6 +682,23 @@ async function commitInto(world: World, root: string, head: string, source: stri
   if (!source || source === root) return;
   if ((await world.exec('git', ['cat-file', '-e', `${head}^{commit}`], { cwd: root })).code === 0) return;
   await world.exec('git', ['fetch', '-q', '--no-tags', source, head], { cwd: root });
+}
+
+/**
+ * Report a task stopped by a failure (wiki features/error-reports), unless it
+ * was already stopped on the same error, the failure is the organization's to
+ * fix (a credential, a hard limit: its audience is only the admins), or the
+ * task is itself fixing a reported error (it would report itself in a loop).
+ */
+function reportEscalation(task: { id: string; projectId: string; params: Record<string, unknown>; lastView?: TaskView }, view: TaskView): void {
+  const before = task.lastView;
+  if (before?.status === 'blocked' && before.error === view.error) return;
+  const audience = (view.waitingFor as { audience?: string[] } | undefined)?.audience;
+  if (audience?.length === 1 && audience[0] === '@admins') return;
+  if ((task.params?.trigger as { type?: string } | undefined)?.type === ERROR_EVENT_TYPE) return;
+  reportError({ kind: 'escalation', error: Object.assign(new Error(String(view.error)), { name: 'Escalation' }),
+    where: `stage ${view.stage}`, taskId: task.id, projectId: task.projectId,
+    detail: { ...(audience ? { audience } : {}), ...(view.waitingFor?.kind ? { waitingFor: view.waitingFor.kind } : {}) } });
 }
 
 export function makeCoreActivities(deps: CoreActivityDeps) {
@@ -1746,6 +1764,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     } finally { releaseAccess?.(); }
   }
 
+  /** Resource work of this workflow: any world it opens is opened as the
+   * task's own turns open theirs (admitted, leased, parked when it waits). */
+  function leasedResources<T>(work: (resources: import('../world/resources.js').ProjectResourceService) => Promise<T>): Promise<T | undefined> {
+    const resources = deps.resources;
+    if (!resources) return Promise.resolve(undefined);
+    return resources.openingWith((handle) => openWorld(handle, handle.id), () => work(resources));
+  }
+
   /**
    * A hibernated world has no machine: it comes back from its checkpoint where
    * its task can run now (checkpoint.ts restoreWhereTaskRuns: Any routes it),
@@ -2106,7 +2132,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     }
     // The parent's copies of its writable resources, saved for the child to
     // start from, as its branch was pushed above.
-    const resourceRevisions = parentHandle && deps.resources && !args.pullRequest ? await deps.resources.snapshotForks(parentHandle, work) : {};
+    const resourceRevisions = parentHandle && deps.resources && !args.pullRequest ? (await leasedResources((resources) => resources.snapshotForks(parentHandle, work)))! : {};
     let idempotencyKey: string | undefined;
     try {
       const { info } = activityContext.current();
@@ -5237,7 +5263,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async beginResourceReview(taskId: string, reviewId: string): Promise<void> {
-      await deps.resources?.beginReview(taskId, reviewId);
+      await leasedResources((resources) => resources.beginReview(taskId, reviewId));
     },
 
     /** `keepOwn`: files this task and a newer version changed differently keep
@@ -5252,7 +5278,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         catch { /* activity completion/cancellation */ }
       }, 5_000);
       try {
-        await deps.resources?.settleReview(taskId, {
+        await leasedResources((resources) => resources.settleReview(taskId, {
           ...(choice.keepOwn ? { keepOwn: true } : {}),
           checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); },
           // Publishing a changed resource is a save too: Review shows how far it has got.
@@ -5262,7 +5288,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             reported = Date.now();
             void record(taskId, 'staging.progress', { ...next }).catch(() => undefined);
           },
-        });
+        }));
       } catch (error) {
         // Saving again cannot resolve a conflict: the task's people must.
         // Its guide is what the agent needs to combine them.
@@ -5283,8 +5309,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         catch { /* activity completion/cancellation */ }
       }, 5_000);
       try {
-        return (await deps.resources?.takeDeliveries(taskId, {
-          checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); } })) ?? [];
+        return (await leasedResources((resources) => resources.takeDeliveries(taskId, {
+          checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); } }))) ?? [];
       } catch (error) { throw providerUnavailable(error); } finally { clearInterval(pulse); }
     },
 
@@ -5298,8 +5324,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         catch { /* activity completion/cancellation */ }
       }, 5_000);
       try {
-        return (await deps.resources?.integratePublished(taskId, {
-          checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); } })) ?? [];
+        return (await leasedResources((resources) => resources.integratePublished(taskId, {
+          checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); } }))) ?? [];
       } catch (error) { throw providerUnavailable(error); } finally { clearInterval(pulse); }
     },
 
@@ -5318,7 +5344,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       try {
         const info = context?.info;
         const maximumAttempts = info?.retryPolicy?.maximumAttempts ?? 0;
-        const result = await deps.resources?.stageCandidates(taskId, {
+        const result = await leasedResources((resources) => resources.stageCandidates(taskId, {
           final: !info || (maximumAttempts > 0 && info.attempt >= maximumAttempts),
           checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); },
           // Review shows how far a multi-GB save has got, so it never looks stuck.
@@ -5328,7 +5354,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             reported = Date.now();
             void record(taskId, 'staging.progress', { ...next }).catch(() => undefined);
           },
-        });
+        }));
         return { staged: result?.staged.length ?? 0, failed: result?.failed.length ?? 0 };
       } catch (error) { throw providerUnavailable(error); } finally { clearInterval(pulse); }
     },
@@ -5350,8 +5376,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       try { context = activityContext.current(); } catch { /* direct tests */ }
       const pulse = setInterval(() => { try { context?.heartbeat({ taskId, operation: 'saving-pull-request-data' }); } catch { /* done */ } }, 5_000);
       try {
-        return { ok: true, data: await deps.resources.snapshotForPullRequest(taskId, key,
-          { checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); } }) };
+        return { ok: true, data: (await leasedResources((resources) => resources.snapshotForPullRequest(taskId, key,
+          { checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); } })))! };
       } catch (error) {
         // A conflict, or a version it could not take in: the agent's to resolve before opening again.
         if (error instanceof ResourceConflictError)
@@ -5363,7 +5389,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     /** Publish the data a pull request carries, once it is approved. */
     async publishPullRequestData(taskId: string, key: string): Promise<{ ok: true } | { ok: false; reason: string }> {
-      try { await deps.resources?.publishPullRequestData(taskId, key); return { ok: true }; }
+      try { await leasedResources((resources) => resources.publishPullRequestData(taskId, key)); return { ok: true }; }
       catch (error) {
         if (error instanceof Error && /newer version|snapshot of .* is gone/.test(error.message)) return { ok: false, reason: error.message };
         throw error;
@@ -7487,8 +7513,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           (await trace.mark(`queue.observed.${after?.state ?? 'released'}`));
         }
       }
+      // A failure that stops the task for someone is an error tavya could not
+      // recover from: reported once, when the task first stops on it.
+      const failedNow = view.status === 'blocked' && typeof view.error === 'string' && view.error
+        ? (await store.taskMetadata(taskId)) : undefined;
       // The publication below is this write's lifecycle event (and its fence).
       if (!(await store.saveView(taskId, view, conversationReference, order, retain, { lifecycleEvent: false }))) return;
+      if (failedNow) reportEscalation(failedNow, view);
       await notifyChildSettlement(store, deps.client, view);
       if (view.status === 'done' || view.status === 'cancelled' || view.status === 'failed') {
         let runId: string | undefined;

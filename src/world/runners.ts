@@ -1,3 +1,5 @@
+import { WorldBusy } from './shared-coordination.js';
+import { reportError } from '../platform/error-reports.js';
 import { branchUnpublished, checkpointStale } from './checkpoint-staleness.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
@@ -331,7 +333,12 @@ export class WorldLifecycleManager {
       this.failing.delete(name);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (this.failing.get(name) !== message) console.warn(`[world lifecycle] ${name}: ${message}`);
+      if (this.failing.get(name) !== message) {
+        console.warn(`[world lifecycle] ${name}: ${message}`);
+        // Another operation holding the world is a wait, not a fault.
+        if (!(error instanceof WorldBusy)) reportError({ kind: 'sweep', error, where: `lifecycle ${name.replace(/ (task|kx)[-_]\S+/g, ' <world>')}`,
+          ...(/ (task_[a-z0-9]+)/.exec(name) ? { taskId: / (task_[a-z0-9]+)/.exec(name)![1] } : {}) });
+      }
       this.failing.set(name, message);
     }
   }

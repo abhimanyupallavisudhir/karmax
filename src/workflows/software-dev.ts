@@ -41,6 +41,7 @@ import {
 } from '../domain/participants.js';
 import { resetAtFromHint } from '../agent/limits.js';
 import { innermostMessage } from '../domain/failure-text.js';
+import { coordinatorSetting, coordinatorCheckIn, coordinatorRetryMinutes, wakeIntervalText } from '../domain/coordinator.js';
 import { isCapacityFailure, isInfraFailure, limitFailureClassification, CAPACITY_WAIT_MS, CAPACITY_WAIT_LIMIT_MS, INFRA_BACKOFF_MS, WORLD_WAIT_MS, WORLD_WAIT_LIMIT_MS } from './failures.js';
 import {
   TaskInput,
@@ -846,6 +847,17 @@ async function softwareDevImpl(
   // has no agent of its own; its Review follows its own (inherited) routes.
   const shippedBranch = !repositoryless && minor >= 30 && !!input.shippedFrom;
   const managedByParent = !!input.parentTaskId && !shippedBranch;
+  // A permanent co-ordinator (wiki features/coordinator): it never finishes —
+  // its own work lands branch by branch — and whenever it stops, other than
+  // for a pause or a job, it is woken again within its interval. Carried in
+  // the input from its first run, so no execution recorded without it changes.
+  let permanentCoordinator = !managedByParent && !shippedBranch ? coordinatorSetting({ coordinator: input.coordinator }) : undefined;
+  // Moves when its interval is edited, so a rest under way is re-timed.
+  let coordinatorEpoch = 0;
+  // How many times in a row it has failed: its retries back off with this,
+  // and reaching a rest clears it. Published, so a run started after this one
+  // failed goes on from here.
+  let coordinatorFailures = input.coordinator?.failures ?? 0;
   const agentTurns = minor >= 6 ? cancellationAwareTurns : turns;
   // Activity retry options are recorded with the ScheduleActivityTask command, so
   // bounding the coordinator's unlimited default is a versioned behavior change.
@@ -1233,7 +1245,8 @@ async function softwareDevImpl(
   const isConsumed = (name: string): boolean => (name === 'target' ? targetLocked : consumed.has(name));
   const paramEditable = (name: string): boolean =>
     !cancelled && editableInFlight(input.paramWindows?.[name], { consumed: isConsumed(name), pointOfNoReturnPassed });
-  const editableParamsNow = (): string[] => Object.keys(input.paramWindows ?? {}).filter(paramEditable);
+  const editableParamsNow = (): string[] => [...Object.keys(input.paramWindows ?? {}).filter(paramEditable),
+    ...(permanentCoordinator && !cancelled ? ['coordinator'] : [])];
 
   // The role behind an `agent:<role>` param (or undefined for a non-agent field).
   const agentRoleOf = (name: string): string | undefined => (name.startsWith('agent:') ? name.slice('agent:'.length) : undefined);
@@ -1307,6 +1320,8 @@ async function softwareDevImpl(
         if (!plan.ok) throw ApplicationFailure.nonRetryable(plan.reason, 'ParamLocked', name);
         continue;
       }
+      // Its interval is the platform-validated setting, editable all its life.
+      if (name === 'coordinator' && permanentCoordinator && !cancelled) continue;
       if (!paramEditable(name))
         throw ApplicationFailure.nonRetryable(
           name === 'confirm'
@@ -1346,6 +1361,12 @@ async function softwareDevImpl(
       responderEpoch++;
       responderRounds = 0;
       applied.push('responder');
+    }
+    if (permanentCoordinator && patch.coordinator) {
+      permanentCoordinator = coordinatorSetting({ coordinator: patch.coordinator });
+      liveInput.coordinator = permanentCoordinator;
+      coordinatorEpoch++;
+      applied.push('coordinator');
     }
     for (const name of Object.keys(patch)) {
       const role = agentRoleOf(name);
@@ -1548,6 +1569,7 @@ async function softwareDevImpl(
         ...(terminalOrigin ? { cancelledFrom: terminalOrigin } : {}),
         ...(failedFrom ? { failedFrom } : {}),
         ...(humanPauseActive ? { humanPauseOrigin: recoveryStage } : {}),
+        ...(permanentCoordinator ? { coordinatorFailures } : {}),
         ...(interlocksLandingTransitions && lifecycleTransitionBlocked ? { lifecycleTransitionBlocked: true } : {}),
       },
       ...(!repositoryless ? { branch: recordWorld?.branch, base, targetBranch: target } : {}),
@@ -2774,11 +2796,18 @@ async function softwareDevImpl(
       // length before parking and treat a new message as the retry it plainly is:
       // the resumed stage re-runs with the follow-up already in the conversation.
       const seenAtEscalation = msgs.length;
+      // A permanent co-ordinator retries on its own, waiting longer each time
+      // it fails in a row (wiki features/coordinator); each failure is a critical ask.
+      const retryAt = permanentCoordinator
+        ? Date.now() + coordinatorRetryMinutes(++coordinatorFailures) * (input.waitMinuteMs ?? 60_000) : undefined;
+      if (retryAt !== undefined && waitingFor) waitingFor = { ...waitingFor, until: retryAt };
       await publish();
       for (;;) {
-        await waitServing(() =>
+        const woke = await waitServing(() =>
           retryRequested || cancelled || manualEscalationRequested || halted()
-          || (followUpWakesEscalation && mainUnreadSince(seenAtEscalation)));
+          || (followUpWakesEscalation && mainUnreadSince(seenAtEscalation)),
+        retryAt === undefined ? undefined : Math.max(0, retryAt - Date.now()));
+        if (!woke) retryRequested = true;
         if (!manualEscalationRequested || cancelled || !manual) break;
         manualEscalationRequested = false;
         try {
@@ -3769,6 +3798,52 @@ async function softwareDevImpl(
     }
   }
 
+  /** A permanent co-ordinator's longest rest (ms); undefined for any other task. */
+  function coordinatorRestMs(): number | undefined {
+    return permanentCoordinator ? permanentCoordinator.wakeHours * 60 * (input.waitMinuteMs ?? 60_000) : undefined;
+  }
+
+  /** Wait for `ready`, and for a permanent co-ordinator at most its interval
+   * (the interval in force: an edit re-times the wait from when it began): a
+   * rest that ran out wakes it with a check-in. True unless it ran out. */
+  async function waitOrCheckIn(ready: () => boolean): Promise<boolean> {
+    coordinatorFailures = 0; // it got here: it is healthy
+    const restingSince = Date.now();
+    for (;;) {
+      const epoch = coordinatorEpoch;
+      const restMs = coordinatorRestMs();
+      const woke = await waitServing(() => ready() || coordinatorEpoch !== epoch,
+        restMs === undefined ? undefined : Math.max(0, restingSince + restMs - Date.now()));
+      if (coordinatorEpoch !== epoch && !ready()) {
+        if (waitingFor?.kind === 'timer' && waitingFor.summary === 'Checks in') {
+          waitingFor = coordinatorRestWait(restingSince);
+          await publish();
+        }
+        continue;
+      }
+      if (!woke && permanentCoordinator && !cancelled)
+        msgs.push({ id: `check-in-${msgs.length}`, role: 'user', text: coordinatorCheckIn(permanentCoordinator), ts: Date.now() });
+      return woke;
+    }
+  }
+
+  /** What a resting co-ordinator says it is waiting for. */
+  function coordinatorRestWait(restingSince: number) {
+    return { kind: 'timer' as const, summary: 'Checks in', detail: `Checks in again within ${wakeIntervalText(permanentCoordinator!.wakeHours)}`,
+      until: restingSince + coordinatorRestMs()! };
+  }
+
+  /** A permanent co-ordinator's turn ended asking nothing: it rests until its
+   * next check-in, a message to it, or Open PR. Nobody is asked or notified. */
+  async function coordinatorRest(): Promise<void> {
+    stage = 'do';
+    status = 'waiting';
+    waitingFor = coordinatorRestWait(Date.now());
+    await publish();
+    await waitOrCheckIn(() => cancelled || prRequested || mainUnread());
+    waitingFor = undefined;
+  }
+
   /** After the main agent was stopped: it waits, like a terminal after Ctrl+C,
    * for the next message to it (or Open PR). True when the task was cancelled. */
   async function waitAfterStop(): Promise<boolean> {
@@ -3779,7 +3854,7 @@ async function softwareDevImpl(
     const audience = lastStoppedBy?.startsWith('user:') ? [lastStoppedBy] : ['@creator'];
     waitingFor = { kind: 'human', audience, detail: 'Stopped. Send a message to continue.' };
     await publish();
-    await waitServing(() => cancelled || prRequested || mainUnreadSince(mark));
+    await waitOrCheckIn(() => cancelled || prRequested || mainUnreadSince(mark));
     waitingFor = undefined;
     status = 'active';
     return cancelled;
@@ -4511,7 +4586,8 @@ Inspect the complete current diff and specifically compare its delta from the re
       base: adoption.project.defaultBase ?? base,
       target: adoption.project.defaultTarget ?? adoption.project.defaultBase ?? target,
     } : undefined;
-    return { ...next, ...(adopted ? { project: adopted.project } : {}), base: adopted?.base ?? base, goalMode, responder: liveResponder, recovery: {
+    return { ...next, ...(adopted ? { project: adopted.project } : {}), base: adopted?.base ?? base, goalMode, responder: liveResponder,
+      ...(permanentCoordinator ? { coordinator: { ...permanentCoordinator, failures: coordinatorFailures } } : {}), recovery: {
       resumeStage: 'do', messages: [], world: world as TaskRecoveryCheckpoint['world'], session, sessionHome, seen, target: adopted?.target ?? target,
       prs, reviewInfo, checkoutApprovals, landing, repairValidationPending,
       continued: {
@@ -4621,7 +4697,8 @@ Inspect the complete current diff and specifically compare its delta from the re
    * the people it answers; it does not ask them (pramana#91). */
   function goesOnAfter(turn: AgentTurnResult): boolean {
     if (turn.raise || turn.wait?.needsInput) return false;
-    return !!(turn.wait || interruptedPause || turn.openPrRequested || prRequested || turn.waitForSubtasks
+    // A permanent co-ordinator rests until its next check-in: it asks nobody.
+    return !!(permanentCoordinator || turn.wait || interruptedPause || turn.openPrRequested || prRequested || turn.waitForSubtasks
       || turn.subTasks?.length || outstanding.size);
   }
 
@@ -4735,9 +4812,10 @@ Inspect the complete current diff and specifically compare its delta from the re
       : { kind: 'human', audience: ['@creator'], detail: `Paused during ${recoveryStage}` };
     retryRequested = false;
     await publish();
-    if (responsiveHumanHold)
-      await waitServing(() => !!humanPauseWake || cancelled);
-    else
+    if (responsiveHumanHold) {
+      // A permanent co-ordinator's hold still ends at its next check-in.
+      await waitOrCheckIn(() => !!humanPauseWake || cancelled);
+    } else
       await condition(() => retryRequested || cancelled);
     pauseWake = humanPauseWake;
     waitingFor = undefined;
@@ -5069,6 +5147,20 @@ Inspect the complete current diff and specifically compare its delta from the re
       : turn.completed;
     const finishing = turnFinished || (!providerTerminalCompletion && turn.needsInput) || turn.raise;
 
+    // A permanent co-ordinator never finishes (wiki features/coordinator):
+    // open_pr — or a person's Open PR — opens a pull request for every branch
+    // with new work, each reviewed and landed on its own, whatever its
+    // sub-tasks are doing, and the task goes on.
+    if (permanentCoordinator && prRequested) {
+      prRequested = false;
+      const refusals = shipsBranches ? await openRemainingPullRequests() : [];
+      if (refusals.length || !shipsBranches) {
+        msgs.push({ id: `pr-refused-${msgs.length}`, role: 'user', ts: Date.now(),
+          text: refusals.length ? `These branches could not open their pull requests:\n${refusals.join('\n')}\nResolve this, then call open_pr again.`
+            : 'This task has no repositories to open pull requests for: a permanent co-ordinator never finishes.' });
+        continue;
+      }
+    }
     // While children are still running, the parent doesn't leave the Do loop:
     // except for its pull requests (v1.30), which hold only this task's end,
     // unless the agent waits for them.
@@ -5110,8 +5202,22 @@ Inspect the complete current diff and specifically compare its delta from the re
             // durable view is read again while the task waits. A wake does not
             // wait for a read in flight.
             const woken = condition(wake).then(() => undefined, () => undefined);
-            for (let delay = CHILD_SETTLEMENT_RECHECK_MS; !(await condition(wake, delay));
-              delay = Math.min(delay * 2, CHILD_SETTLEMENT_RECHECK_MAX_MS)) {
+            // A permanent co-ordinator waiting on its sub-tasks still checks in.
+            if (permanentCoordinator) coordinatorFailures = 0;
+            const restingSince = Date.now();
+            for (let delay = CHILD_SETTLEMENT_RECHECK_MS;; delay = Math.min(delay * 2, CHILD_SETTLEMENT_RECHECK_MAX_MS)) {
+              // Read afresh each round: its interval can be edited while it waits.
+              const restMs = coordinatorRestMs();
+              const restUntil = restMs === undefined ? undefined : restingSince + restMs;
+              const epoch = coordinatorEpoch;
+              const fired = await condition(() => wake() || coordinatorEpoch !== epoch,
+                restUntil === undefined ? delay : Math.max(0, Math.min(delay, restUntil - Date.now())));
+              if (fired && coordinatorEpoch === epoch) break;
+              if (fired) continue; // its interval changed: time the rest again
+              if (restUntil !== undefined && Date.now() >= restUntil) {
+                msgs.push({ id: `check-in-${msgs.length}`, role: 'user', text: coordinatorCheckIn(permanentCoordinator!), ts: Date.now() });
+                break;
+              }
               const scope = new CancellationScope({ cancellable: true });
               const read = scope.run(() => coreChild.settledChildTasks(taskId, [...outstanding])).catch(() => []);
               const children = await Promise.race([read, woken]);
@@ -5120,7 +5226,8 @@ Inspect the complete current diff and specifically compare its delta from the re
                 if (outstanding.has(child.taskId)) settled.push({ childTaskId: child.taskId, stage: child.stage });
             }
           } else {
-            await waitServing(() => wake() || droppedChildHandles > drops);
+            // A permanent co-ordinator waiting on its sub-tasks still checks in.
+            if (!(await waitOrCheckIn(() => wake() || droppedChildHandles > drops))) break;
             chosen = wake();
           }
         }
@@ -5327,6 +5434,24 @@ Inspect the complete current diff and specifically compare its delta from the re
         && !turn.raise
         && patched('software-dev-front-held-repair-auto-pr-v1');
       if (autoSubmitFrontHeldRepair) prRequested = true;
+      // A permanent co-ordinator never finishes: a turn that asks nothing
+      // rests until its next check-in (its Open PR was taken above).
+      if (permanentCoordinator) {
+        // An ask goes the ordinary way, still woken within the interval.
+        if (!turn.raise || !explicitPrCycle) {
+          if (turn.raise) {
+            status = 'waiting';
+            waitingFor = { kind: 'human', audience: ['@creator'], detail: turn.raise.detail?.trim() || turn.output?.trim() || 'The agent needs your input.' };
+            await publish();
+            await waitOrCheckIn(() => cancelled || prRequested || mainUnread());
+            waitingFor = undefined;
+          } else await coordinatorRest();
+          if (cancelled) return await abort();
+          stage = 'do';
+          status = 'active';
+          continue;
+        }
+      }
       if (explicitPrCycle) {
         // Ending a Do turn is not a shipping decision. Unless the agent called
         // open_pr, park in Do for ordinary input; a follow-up resumes the same
@@ -5396,7 +5521,7 @@ Inspect the complete current diff and specifically compare its delta from the re
                 };
               }
               await publish();
-              await waitServing(() => prRequested || cancelled || mainUnread()
+              await waitOrCheckIn(() => prRequested || cancelled || mainUnread()
                 || (mutableInputResponder && responderEpoch !== routeEpoch));
               waitingFor = undefined;
               if (mutableInputResponder && responderEpoch !== routeEpoch) continue;
@@ -5410,7 +5535,8 @@ Inspect the complete current diff and specifically compare its delta from the re
           }
           waitingFor = undefined;
           if (cancelled) return await abort();
-          if (!prRequested) {
+          // A permanent co-ordinator's Open PR is taken at its next turn's end.
+          if (!prRequested || permanentCoordinator) {
             stage = 'do';
             status = 'active';
             continue;
@@ -6693,6 +6819,7 @@ Inspect the complete current diff and specifically compare its delta from the re
   /** Say why the run failed, and where Retry picks it up, before it closes. */
   async function publishFailure(e: unknown) {
     failedFrom = multiAgent && stage === 'escalated' && escalatedFrom ? escalatedFrom : stage;
+    if (permanentCoordinator) coordinatorFailures++;
     stage = 'failed';
     status = 'failed';
     waitingFor = undefined;

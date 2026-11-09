@@ -6,6 +6,7 @@ import { WorldHandle, worldRepos, worldWorkingDirectory } from '../world/types.j
 import { agentRoleDef, manifest } from '../contrib/manifests.js';
 import { untrustedBlock } from '../domain/untrusted.js';
 import { BRAND } from '../domain/brand.js';
+import { coordinatorBrief, coordinatorSetting } from '../domain/coordinator.js';
 
 /**
  * Prompt assembly (SPEC §5.4). Fills the role template (owned by the profile)
@@ -123,6 +124,9 @@ export function assemblePrompt(args: AssembleArgs): string {
 
 Input routing for this task: its ordinary Waiting-for-input Responder is an agent. When you need a decision or information that this Responder can supply, do not call escalate_to_human. End the turn without open_pr and make your final response the concrete question; ${BRAND} will send it to the Responder and return the answer to this same Do conversation. Use escalate_to_human only for what only a person can give (an approval, a secret, an action in the real world, a personal decision).`;
   }
+  // A permanent co-ordinator runs the project (wiki features/coordinator).
+  const coordinator = args.role === 'do' && !args.task.parentTaskId ? coordinatorSetting({ coordinator: args.task.coordinator }) : undefined;
+  if (coordinator) preamble += coordinatorBrief(coordinator, BRAND);
   if (args.role === 'do' && args.task.parentTaskId) preamble += describeSiblings(args.task.parentTaskId, args.siblings ?? []);
   const target = args.task.target ?? args.world.target ?? args.world.base;
   if (args.role === 'do' && (target !== args.world.base || args.task.agents?.do?.resumeFrom)) {

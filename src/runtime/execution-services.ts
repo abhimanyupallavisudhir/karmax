@@ -32,6 +32,7 @@ import { Vault } from '../autonomy/vault.js';
 import { recordDataEpoch } from '../config/data-epoch.js';
 import { TASK_QUEUE } from '../temporal/config.js';
 import { taskEnded } from '../world/task-ended.js';
+import { configureErrorReports } from '../platform/error-reports.js';
 
 /** Shared service construction for the gateway and a supervised activity process.
  * Only the installation bootstrap seeds profiles, imports environment credentials,
@@ -44,6 +45,9 @@ export async function createExecutionServices(input: {
   provider: Provider; bootstrap?: boolean; coordinationDirectory?: string;
 }) {
   const { store, client, broker, githubApp, p, deployment, provider, bootstrap = false, coordinationDirectory } = input;
+  // Unexpected errors in this process go to the installation's error-report
+  // project, if it has one (wiki features/error-reports).
+  configureErrorReports(store, { role: bootstrap ? 'gateway' : 'worker' });
   const worlds = new WorldRegistry({ coordinationDirectory });
   worlds.register(new WorktreeProvider(p.worlds));
   const adapters = buildAdapters();
@@ -57,10 +61,18 @@ export async function createExecutionServices(input: {
     async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), undefined, referenceKeys));
   worlds.register(new DaytonaWorldProvider(undefined, undefined, undefined, undefined,
     async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), undefined, undefined, referenceKeys));
-  worlds.register(flyWorldProvider(async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), referenceKeys, store));
-  worlds.register(hetznerWorldProvider(async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), referenceKeys, store));
-  worlds.register(awsWorldProvider(async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), referenceKeys, store));
-  worlds.register(gcpWorldProvider(async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), referenceKeys, store));
+  for (const vmProvider of [flyWorldProvider, hetznerWorldProvider, awsWorldProvider, gcpWorldProvider]) {
+    const provider = vmProvider(async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), referenceKeys, store);
+    // A VM found stopped under a caller is started again only inside the
+    // world's transition lock, and only for a world someone is meant to use:
+    // the same holds the lifecycle sweep's stray-wake check reads (runners.ts).
+    provider.coordinate({
+      operation: (worldId, work) => worlds.withOperation(worldId, work),
+      wanted: async (worldId) => (await store.worldState(worldId)) === 'ready'
+        || (await store.activeWorldLeaseCount(worldId)) > 0 || (await worlds.hasActiveAccess(worldId)),
+    });
+    worlds.register(provider);
+  }
   if (bootstrap) {
     const unreadable: (string | undefined)[] = [];
     for (const state of ['ready', 'parked', 'hibernated', 'degraded'] as const) {

@@ -38,7 +38,7 @@ async function main() {
   let elements, complete, requests = [];
   const context = vm.createContext({
     wireFollowUpTriggers: () => {},
-    S: state, CSS: { escape: (x) => x }, sameJson, Object, structuredClone, AbortController, SAVE_STATE_TEXT,
+    S: state, CSS: { escape: (x) => x }, sameJson, Object, structuredClone, AbortController, SAVE_STATE_TEXT, TERMINAL_STAGES: ['done', 'cancelled', 'failed'],
     document: { getElementById: (id) => elements[id] || null },
     wireAgentFields() {}, taskRecord: () => record,
     schemaFor: () => [{ name: 'target', label: 'Target', type: 'string', scopes: ['task'] }],
@@ -47,7 +47,7 @@ async function main() {
     readModelField: () => ({ provider: 'claude', model: '', effort: '' }),
   });
   vm.runInContext(['paintSaveState', 'collectParamEdits', 'paramDirtyNames', 'setParamSaveState', 'wireParams', 'readMcpPicker', 'readAgentSpec', 'readAgentBlock',
-    'paramFields', 'agentParticipantLabel', 'taskAuthorityOf'].map(fn).join('\n'), context);
+    'paramFields', 'editableParamNames', 'agentParticipantLabel', 'taskAuthorityOf'].map(fn).join('\n'), context);
   const render = (value) => {
     const root = new Element(), button = new Element(), field = new Element(), bar = new Element();
     field.value = value;

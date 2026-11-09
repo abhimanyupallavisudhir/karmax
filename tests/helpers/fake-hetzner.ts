@@ -237,7 +237,11 @@ export class FakeHetzner {
     server.status = 'running';
   }
 
+  /** Every connection the network has handed out, per server: a server that goes off takes them down. */
+  private connections = new Map<number, Set<Duplex>>();
+
   private async halt(server: FakeServer): Promise<void> {
+    for (const socket of this.connections.get(server.id) ?? []) socket.destroy();
     await server.sshd?.stop();
     server.sshd = undefined;
     server.status = 'off';
@@ -248,10 +252,20 @@ export class FakeHetzner {
     const server = [...this.servers.values()].find((value) => value.ip === endpoint.host && value.sshd);
     if (!server || endpoint.port !== 2222) throw Object.assign(new Error('connection refused'), { code: 'ECONNREFUSED' });
     return new Promise((resolve, reject) => {
-      const socket = net.connect(server.sshd!.endpoint.port, '127.0.0.1', () => resolve(socket));
+      const socket = net.connect(server.sshd!.endpoint.port, '127.0.0.1', () => {
+        const open = this.connections.get(server.id) ?? new Set<Duplex>();
+        this.connections.set(server.id, open.add(socket));
+        socket.once('close', () => open.delete(socket));
+        resolve(socket);
+      });
       socket.on('error', reject);
     });
   };
+
+  /** Power a server off behind karmax's back (another process, Hetzner maintenance). */
+  async powerOffOutOfBand(serverId: number): Promise<void> {
+    await this.halt(this.servers.get(serverId)!);
+  }
 
   async close(): Promise<void> {
     for (const server of this.servers.values()) await this.halt(server);

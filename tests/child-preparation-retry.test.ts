@@ -78,7 +78,7 @@ it('records the parent\'s resource versions a child starts from', async () => {
     workflowExecution: { workflowId: parent.id, runId: 'run-1' } } }) as any);
   const snapshotForks = vi.fn(async () => ({ resource_raw: 'revision_parent_copy' }));
   const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
-    profiles: new ProfileResolver(store, 'mock'), resources: { snapshotForks } as any });
+    profiles: new ProfileResolver(store, 'mock'), resources: { snapshotForks, openingWith: (_open: unknown, work: () => Promise<unknown>) => work() } as any });
   try {
     const child = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id, title: 'Child', prompt: 'work',
       base: 'main', target: 'main', parentBranch: `karmax/${parent.id}`, project: {}, profiles: {} } as any);

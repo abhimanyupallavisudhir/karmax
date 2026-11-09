@@ -93,7 +93,7 @@ async function fixture(initial: Record<string, string | Buffer>) {
     .find((candidate) => candidate.attachmentId === data.id && candidate.state === 'active')!;
   /** What a merge left for the world's agent. */
   const mergeFolder = (world: World) => path.join(world.handle.root, '.karmax-injection/resource-merge', data.id);
-  return { store, resources, data, first, task, subTask, worldFor, write, remove, inWorld, current, published, publish, lease, mergeFolder };
+  return { store, worlds, resources, data, first, task, subTask, worldFor, write, remove, inWorld, current, published, publish, lease, mergeFolder };
 }
 
 describe('combining publications of one resource', () => {
@@ -192,6 +192,24 @@ describe('combining publications of one resource', () => {
 
     await f.publish(worker.task.id, 'worker');
     expect(await f.published()).toEqual({ 'index.txt': 'v1', 'out/a.txt': 'a', 'out/b.txt': 'b' });
+  }, 180_000);
+
+  // pramana#137: a sub-task's delivery woke its parent's parked VM with no
+  // lease, before the parent's next turn; the lifecycle sweep then stopped it
+  // as a stray, under that turn. A workflow's resource work opens worlds the
+  // way its turns do: through the opener its activity supplies.
+  it('opens the world a delivery goes into through the opener the work runs with', async () => {
+    const f = await fixture({ 'index.txt': 'v1' });
+    const parent = await f.task('Integrator');
+    const child = await f.subTask('W2 OCR', parent);
+    await f.write(child.world, 'ocr/page-1.txt', 'ocr 1');
+    await f.publish(child.task.id, 'w2');
+    const opened: string[] = [];
+    const taken = await f.resources.openingWith(async (handle) => { opened.push(handle.id); return f.worlds.open(handle); },
+      () => f.resources.takeDeliveries(parent.task.id));
+    expect(taken.map(({ added, conflicts }) => ({ added, conflicts }))).toEqual([{ added: 1, conflicts: undefined }]);
+    expect(f.inWorld(parent.world)).toMatchObject({ 'ocr/page-1.txt': 'ocr 1' });
+    expect(new Set(opened)).toEqual(new Set([parent.task.id]));
   }, 180_000);
 
   it('starts sub-tasks from the parent\'s copy and hands their output to it; the parent publishes once', async () => {

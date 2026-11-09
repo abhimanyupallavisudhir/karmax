@@ -2161,6 +2161,11 @@ export interface TaskInput {
   /** Platform-internal one-shot reset used when a progressed task is moved back
    * to Draft. The next Setup recreates its branch from base. */
   discardProgress?: boolean;
+  /** A permanent co-ordinator (`params.coordinator`, wiki features/coordinator):
+   * it never finishes, lands its work branch by branch, and is woken again at
+   * most `wakeHours` after it stops. `failures`: how many times in a row it had
+   * failed when this run was started (a run that follows a failed one). */
+  coordinator?: { wakeHours: number; failures?: number };
 }
 
 /** Plain serializable world handle + conversation state needed to resume a failed

@@ -480,4 +480,26 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
     await vmProvider(driver).create({ taskId: 'task_cheap', base: 'main', generation: 1, organizationId: 'org_h' });
     expect(serversMade()[1]).toMatchObject({ server_type: 'cpx31', image: id });
   });
+
+  // pramana#137's failure on Hetzner: a server that goes off, or is deleted,
+  // under a world still in use (another process parked it, Hetzner
+  // maintenance, its paid hour ended) is brought back by the next command —
+  // a deleted server used to fail before SSH was even tried ("the Hetzner
+  // server of this world is not running"), past every retry.
+  it('brings back a server that went off or was deleted under a world still in use', async () => {
+    const world = await provider.create({ taskId: 'task_gone_off', base: 'main', generation: 1, organizationId: 'org_h' });
+    await world.writeFile('kept.txt', 'on the volume');
+    const handle = world.handle as WorldHandle;
+    await hetzner.powerOffOutOfBand([...hetzner.servers.values()][0]!.id);
+    expect((await world.exec('sh', ['-c', 'cat kept.txt'])).stdout).toBe('on the volume');
+    expect([...hetzner.servers.values()].map((server) => server.status)).toEqual(['running']);
+    // Parked by another process past the paid hour: the server is deleted, the volume stays.
+    await vmProvider(driver).park(handle);
+    [...hetzner.servers.values()][0]!.created = new Date(Date.now() - 57 * 60_000).toISOString();
+    await provider.housekeep('org_h');
+    expect(hetzner.servers.size).toBe(0);
+    expect((await world.exec('sh', ['-c', 'cat kept.txt'])).stdout).toBe('on the volume');
+    expect([...hetzner.servers.values()].map((server) => server.status)).toEqual(['running']);
+  }, 60_000);
+
 });

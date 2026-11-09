@@ -7671,7 +7671,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   return `
     <div class="task-row ${archived ? 'archived' : ''}${taskHasUnreadAsk(t.id) ? ' unread' : ''}" data-id="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
       <div class="task-main">
-        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
+        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}${t.params?.coordinator ? ` ${coordinatorChip(t)}` : ''}</div>
         <div class="task-sub">
           ${where}${why}
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
@@ -7882,6 +7882,8 @@ function stageLabel(v) {
   if (v.state?.draft) return 'Draft';
   // A full disk stopped the task: say so, not "blocked" (wiki features/computers).
   if (v.outOfDisk) return 'Out of disk';
+  // A co-ordinator that failed says when it tries again.
+  if (v.status === 'blocked' && v.waitingFor?.reason === 'error' && Number.isFinite(v.waitingFor.until)) return `Retries at ${waitDeadline(v.waitingFor.until)}`;
   // A human hold is a public software-dev stage, even though the workflow keeps
   // its replay-safe Do/Review/Landing checkpoint internally so a follow-up knows
   // where to resume. Direct provider blockers may supply a concise specific
@@ -8272,7 +8274,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['run'], query 
     const open = expanded.has(t.id);
     return `<div class="pick-row" data-nav data-task="${t.id}">
       <div class="task-main">
-        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">Archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">Repeatable</span>' : ''}${t.params?.avatar ? ` ${avatarChip}` : ''}</div>
+        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">Archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">Repeatable</span>' : ''}${t.params?.avatar ? ` ${avatarChip}` : ''}${t.params?.coordinator ? ` ${coordinatorChip(t)}` : ''}</div>
         <div class="task-sub">${organizationWide && t.projectId !== S.projectId ? projectLabel(t) : ''}${statusHtml(chipLabel, tone)}${priorityFlag(t)}${tagChips(t, false)}</div>
       </div>
       ${mode === 'agent' ? `<span class="pk-caret">${open ? '▾' : '▸'}</span>` : ''}
@@ -9757,6 +9759,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
             </div>`}
             <section class="tf-section tf-triggers">${triggersSection(values, draft?.id)}</section>
             ${templateEdit ? '' : `<section class="tf-section tf-avatar">${avatarSectionHtml(values.avatar)}</section>`}
+            ${coordinatorSelectable(fields) ? `<section class="tf-section tf-coordinator">${coordinatorSectionHtml(values.coordinator)}</section>` : ''}
           </div>
           <aside class="tf-side">
             <div class="form-row" data-row="__org">
@@ -10017,6 +10020,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     // An Avatar only once its risk was acknowledged: auto-save never makes one.
     const avatar = avatarCommitted ? readAvatarSection($('#tf-body')) : undefined;
     if (avatar) body.avatar = avatar;
+    const coordinator = readCoordinatorSection($('#tf-body'));
+    if (coordinator) body.coordinator = coordinator;
     // Where it came from in the Task store, which counts what the project took.
     if (values.template) body.template = values.template;
     // The wiki-context row. Always sent — even empty,
@@ -10546,6 +10551,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   };
   const submitCommitted = async (draftMode) => (await commitAvatar()) && submit(draftMode);
   $('#tf-save-avatar')?.addEventListener('click', () => submitCommitted(true));
+  wireCoordinatorSection(root);
   $('#tf-draft')?.addEventListener('click', () => submitCommitted(true));
   $('#tf-queue').addEventListener('click', () => submitCommitted(false));
   // A repeatable store task installs; unticked, it runs once.
@@ -11473,7 +11479,7 @@ function patchTaskPage(main, html) {
   const oldParams = main.querySelector('#tp-params');
   const newParams = template.content.querySelector('#tp-params');
   if (oldParams && newParams && oldParams.dataset.renderKey === newParams.dataset.renderKey) {
-    const fields = paramFields(S.view).filter((f) => (S.view.editableParams || []).includes(f.name));
+    const fields = paramFields(S.view).filter((f) => editableParamNames(S.view).includes(f.name));
     const current = collectParamEdits(oldParams, fields);
     const incoming = collectParamEdits(newParams, fields);
     const draft = S.paramEditDrafts[S.view.taskId];
@@ -15271,9 +15277,12 @@ function waitingText(w) {
   }
   // A paused agent's ask carries the time it carries on without an answer.
   if (w?.kind === 'human') return Number.isFinite(w.until) ? `Needs input until ${waitDeadline(w.until)}` : 'Needs input';
+  // A permanent co-ordinator's rest says when it checks in; a task with
+  // follow-up triggers, what it waits for.
   if (w?.kind === 'timer') {
     const head = typeof w.summary === 'string' && w.summary.trim() ? w.summary.trim().slice(0, 56) : 'Waiting';
-    return Number.isFinite(w.until) ? `${head} until ${waitDeadline(w.until)}` : head;
+    if (!Number.isFinite(w.until)) return head;
+    return `${head === 'Checks in' ? 'Checks in at' : `${head} until`} ${waitDeadline(w.until)}`;
   }
   // A full provider limit: what it waits for, and when it tries again; a
   // queued machine, its place in the queue (what is full is its tooltip, waitTitle).
@@ -15899,7 +15908,15 @@ function paramFields(v) {
     ...schemaFor(v.workflow).filter((f) => f.scopes.includes('task')),
     ...keys.map((key) => ({ name: `agent:${key}`, type: 'agent', role: key, scopes: ['task'], calledAgent: true,
       label: agentParticipantLabel(key), participant: participants?.find((p) => p.key === key) })),
+    ...(rec?.params?.coordinator ? [{ name: 'coordinator', type: 'coordinator', label: 'Permanent co-ordinator', scopes: ['task'] }] : []),
   ];
+}
+
+// What can be edited now: nothing once a task has finished, except that a
+// co-ordinator whose run failed is still going to retry (wiki features/coordinator).
+function editableParamNames(v) {
+  if (!TERMINAL_STAGES.includes(v.stage)) return v.editableParams || [];
+  return v.status === 'failed' && taskRecord(v.taskId)?.params?.coordinator ? ['coordinator'] : [];
 }
 
 /** The task's own authority, which agents without their own start from. */
@@ -15923,7 +15940,7 @@ function paramsSection(v) {
   // what ran. Keep terminal-task parameters visible, but defensively ignore any
   // stale editable window left on an older persisted view.
   const terminal = TERMINAL_STAGES.includes(v.stage);
-  const editable = new Set(terminal ? [] : (v.editableParams || []));
+  const editable = new Set(editableParamNames(v));
   const editDraft = S.paramEditDrafts?.[v.taskId];
   const inheritedAll = S.paramDefaults || {};
   const frozenTitle = terminal
@@ -15962,6 +15979,7 @@ function paramsSection(v) {
       const label = (isEditable ? fieldLabel(f) : frozenLabel(f)).replace('</label>', `</label>${computerPendingChip(v.computerChange)}`);
       return `<div class="${isEditable ? 'pf-edit-row' : 'pf-frozen'}" data-row="${esc(f.name)}"><div class="form-row">${label}${block}</div></div>`;
     }
+    if (f.type === 'coordinator') return coordinatorParamRow(f, own, isEditable, frozenLabel);
     if (isEditable) return `<div class="pf-edit-row" data-row="${esc(f.name)}">${renderField(f, own, inherited)}</div>`;
     // A frozen route keeps its shape (who, in order, and each agent's block).
     if (f.type === 'confirmer' || f.type === 'responder') {
@@ -16150,6 +16168,7 @@ function collectParamEdits(root, fields) {
     if (!el) continue;
     let val;
     if (f.type === 'boolean') val = el.checked;
+    else if (f.type === 'coordinator') val = coordinatorHoursValue(el.value);
     else if (f.type === 'list') val = el.value.split('\n').map((s) => s.trim()).filter(Boolean);
     else if (f.type === 'number') val = el.value === '' ? undefined : Number(el.value);
     else val = el.value.trim() === '' ? undefined : el.value.trim();
@@ -16201,7 +16220,7 @@ function wireParams(v) {
   const saveBtn = document.getElementById('params-save');
   if (!saveBtn) return;
   const status = document.getElementById('params-save-status');
-  const fields = paramFields(v).filter((f) => (v.editableParams || []).includes(f.name));
+  const fields = paramFields(v).filter((f) => editableParamNames(v).includes(f.name));
   const existing = S.paramEditDrafts[v.taskId];
   const currentAtRender = collectParamEdits(root, fields);
   // Rebase untouched controls onto the newest server render, while preserving
@@ -19178,6 +19197,70 @@ function readAvatarSection(root) {
     // Every role ticked is no restriction.
     ...(roles.length < AVATAR_ROLE_CHOICES.length ? { roles } : {}) };
 }
+// ── Permanent co-ordinator (wiki features/coordinator) ─────────────────────
+// The task form's last row: a task that runs the project like its CEO, and
+// the longest it rests after it stops (`params.coordinator.wakeHours`).
+const COORDINATOR_DEFAULT_HOURS = 24;
+const COORDINATOR_TIP = 'Runs the project like its CEO: creates and steers other tasks, lands its own changes as separate pull requests, and never finishes. Whenever it stops, it checks in again within this many hours. If it fails, you get a critical notification and it retries, waiting longer each time.';
+// Only a Software dev task can be one (it lands work and makes sub-tasks).
+function coordinatorSelectable(fields) {
+  return (fields || []).some((f) => f.name === 'multiPr');
+}
+function coordinatorSectionHtml(value) {
+  const setting = value === true ? {} : value && typeof value === 'object' ? value : null;
+  const hours = Number(setting?.wakeHours) > 0 ? Number(setting.wakeHours) : COORDINATOR_DEFAULT_HOURS;
+  return `<div class="form-row" data-row="__coordinator">
+    <div class="tf-coordinator-line">
+      <label class="tf-coordinator-toggle"><input type="checkbox" class="toggle" id="tf-coordinator" ${setting ? 'checked' : ''}> Permanent co-ordinator</label>${policyTip(COORDINATOR_TIP)}
+      <label class="tf-coordinator-wake" ${setting ? '' : 'hidden'}>Checks in every
+        <input type="number" id="tf-coordinator-hours" min="0.02" max="8760" step="any" inputmode="decimal" value="${esc(String(hours))}" aria-label="Check-in interval (hours)"> h</label>
+    </div>
+  </div>`;
+}
+function readCoordinatorSection(root) {
+  if (!root?.querySelector('#tf-coordinator')?.checked) return undefined;
+  return coordinatorHoursValue(root.querySelector('#tf-coordinator-hours')?.value) ?? { wakeHours: COORDINATOR_DEFAULT_HOURS };
+}
+// The setting an hours box holds, decimals with a point or a comma; undefined when empty or not a number.
+function coordinatorHoursValue(value) {
+  const raw = String(value ?? '').trim().replace(',', '.');
+  const hours = Number(raw);
+  return raw && Number.isFinite(hours) && hours > 0 ? { wakeHours: hours } : undefined;
+}
+function wireCoordinatorSection(root) {
+  const box = root?.querySelector('#tf-coordinator');
+  if (!box) return;
+  const several = root.querySelector('[data-field="multiPr"]');
+  // A co-ordinator always uses several branches; unticking gives back the choice.
+  let chosen = several?.checked;
+  const apply = () => {
+    const wake = root.querySelector('.tf-coordinator-wake');
+    if (wake) wake.hidden = !box.checked;
+    if (!several) return;
+    if (!several.disabled) chosen = several.checked;
+    several.checked = box.checked || chosen;
+    several.disabled = box.checked;
+    several.closest('.switch')?.toggleAttribute('data-forced', box.checked);
+    if (several.parentElement) several.parentElement.title = box.checked ? 'Always on for a permanent co-ordinator' : '';
+  };
+  box.addEventListener('change', apply);
+  apply();
+}
+// The Parameters tab's row: the interval, changeable all the task's life.
+function coordinatorParamRow(field, value, editable, frozenLabel) {
+  if (!editable) return `<div class="form-row pf-frozen" data-row="coordinator">${frozenLabel(field)}<div class="pf-ro">Checks in ${esc(coordinatorIntervalText(value))}</div></div>`;
+  const hours = Number(value?.wakeHours) > 0 ? Number(value.wakeHours) : COORDINATOR_DEFAULT_HOURS;
+  return `<div class="pf-edit-row" data-row="coordinator"><div class="form-row"><div class="label-row"><label>${esc(field.label)}</label></div>
+    <label class="tf-coordinator-wake pf-coordinator-wake">Checks in every
+      <input type="number" data-field="coordinator" min="0.02" max="8760" step="any" inputmode="decimal" value="${esc(String(hours))}" aria-label="Check-in interval (hours)"> h</label></div></div>`;
+}
+// "every 24 h", "every 30 min": a co-ordinator's interval, read-only.
+function coordinatorIntervalText(setting) {
+  const hours = Number(setting?.wakeHours) > 0 ? Number(setting.wakeHours) : COORDINATOR_DEFAULT_HOURS;
+  return hours < 1 ? `every ${Math.round(hours * 60)} min` : `every ${+hours.toFixed(2)} h`;
+}
+const coordinatorChip = (t) => `<span class="chip coordinator-chip" title="Permanent co-ordinator: checks in ${esc(coordinatorIntervalText(t.params.coordinator))}">Co-ordinator</span>`;
+
 // Making a task an Avatar says what it risks, until "Don't show this again".
 const AVATAR_NOTICE_KEY = 'tavya.avatarNoticeDismissed';
 function confirmAvatar() {
@@ -26062,7 +26145,7 @@ function installationView() {
   return `<div class="organization-settings installation-settings"><div class="settings-header"><h1 class="page-title">Installation ${policyTip(`Settings for every organization and the machine running ${siteName()}. Only operators see them.`)}</h1></div>
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections">
-      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-limits">Service limits</a><a href="#installation-compute">Managed compute</a><a href="#installation-capacity">Host capacity</a>
+      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-errors">Error reports</a><a href="#installation-limits">Service limits</a><a href="#installation-compute">Managed compute</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
       <a href="#installation-access">Phone access</a>${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}
     </nav><div class="settings-content">
@@ -26070,6 +26153,8 @@ function installationView() {
       <div class="settings-section-title" id="installation-health"><div>Health ${policyTip(`Load, agent turns and every process ${siteName()} runs. Memory and disk are under Service limits.`)}</div></div>
       <div id="host-diag"><div class="card"><span class="task-sub">Loading…</span></div></div>
       <div id="proc-panel" style="margin-top:12px"></div>
+      <div class="settings-section-title" id="installation-errors"><div>Error reports ${policyTip(`Unexpected errors of ${siteName()}’s own start a task in this project that finds the cause and fixes it. One runs at a time; it hears of further errors while it works.`)}</div></div>
+      <div class="card" id="error-reports-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-limits"><div>Service limits ${policyTip(`Shared accounts and this server against their plans`)}</div></div>
       <div class="card service-limits" id="service-limits-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-compute"><div>Managed compute ${policyTip(`${siteName()}’s own provider accounts. Organizations without their own account run on them, and on the included model, charged to their plan’s monthly compute at twice the provider’s price.`)}</div></div>
@@ -26544,8 +26629,39 @@ async function hydratePlanAndBilling(organizationId) {
   });
 }
 
+// ── Error reports (Installation; wiki features/error-reports) ────────────────
+// Which project unexpected errors go to, and the task there that fixes them.
+function errorReportsMarkup(settings) {
+  const projects = inSidebarOrder((S.projects || []).filter((project) => project.organizationId === S.organizationId));
+  const options = [`<option value="">Off</option>`, ...projects.map((project) =>
+    `<option value="${esc(project.id)}" ${settings.projectId === project.id ? 'selected' : ''}>${esc(projectPath(project) || project.name)}</option>`)];
+  const fixer = settings.fixerTaskId && settings.projectId
+    ? `<a class="setting-muted" href="${esc(taskUrl(settings.fixerTaskId, { projectId: settings.projectId }))}" title="The task that fixes reported errors">Fixer ↗</a>` : '';
+  return `<div class="setting-rows"><div class="setting-row"><label class="setting-label" for="error-reports-project">Send to</label>
+    <span class="setting-value"><select id="error-reports-project" aria-label="Project error reports go to">${options.join('')}</select></span>
+    <span class="setting-actions">${fixer}</span></div></div>`;
+}
+async function wireErrorReportsCard() {
+  const card = $('#error-reports-card');
+  if (!card) return;
+  let settings;
+  try { settings = (await api('/api/settings/error-reports')).settings || {}; }
+  catch (error) { if (card.isConnected) paneError(card, error, () => wireErrorReportsCard()); return; }
+  if (!card.isConnected) return;
+  card.innerHTML = errorReportsMarkup(settings);
+  card.querySelector('#error-reports-project').addEventListener('change', async (event) => {
+    const control = event.currentTarget; control.disabled = true;
+    try {
+      await api('/api/settings/error-reports', { method: 'PUT', body: JSON.stringify({ projectId: control.value || null }) });
+      toast(control.value ? 'Error reports on' : 'Error reports off');
+    } catch (error) { toast(error.message || String(error), false); }
+    await wireErrorReportsCard();
+  });
+}
+
 function wireInstallationSettings() {
   wireInstallationUsers();
+  wireErrorReportsCard();
   wireSettingsNavigation();
   wireAppearanceCard();
   refreshHostDiag();
