@@ -78,7 +78,7 @@ import { worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js'
 import { pullRequestHandle, pullRequestView, isPullRequestView, proposalCheckouts } from '../world/pr-view.js';
 import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
 import { brokerFinalizeMerge, brokerPublishBranch, brokerPushBranches, describeGitPushError, describePublishFailures,
-  isGithubPushProtectionRejection, isNonFastForwardPush, type GitBrokerAuth } from '../world/git-broker.js';
+  isBranchContentRejection, isNonFastForwardPush, type GitBrokerAuth } from '../world/git-broker.js';
 import { enrollWorldRepositories } from '../world/repository-enrollment.js';
 import { materializeGitCredential } from '../world/git-credential.js';
 import { hostedCloneCredential, isHostedRepository, repositoryBrokerCredentials } from '../world/hosted-git.js';
@@ -169,6 +169,7 @@ import {
 import { lifecycleReplacementKey, lifecycleReplacementMatches } from '../platform/lifecycle-replacement.js';
 import { BRAND } from '../domain/brand.js';
 import { ERROR_EVENT_TYPE, reportError } from '../platform/error-reports.js';
+import { isCapacityEscalation } from '../domain/escalation.js';
 import { screenEnvironment, skippedEnvNotice, type SkippedEnv } from '../util/work-env.js';
 
 /** How often staging records its progress as a task event. */
@@ -688,14 +689,17 @@ async function commitInto(world: World, root: string, head: string, source: stri
 /**
  * Report a task stopped by a failure (wiki features/error-reports), unless it
  * was already stopped on the same error, the failure is the organization's to
- * fix (a credential, a hard limit: its audience is only the admins), or the
- * task is itself fixing a reported error (it would report itself in a loop).
+ * fix (a credential, a hard limit: its audience is only the admins), a
+ * provider account's limit stayed full for its whole wait for a machine
+ * (people's to free or raise), or the task is itself fixing a reported error
+ * (it would report itself in a loop).
  */
 function reportEscalation(task: { id: string; projectId: string; params: Record<string, unknown>; lastView?: TaskView }, view: TaskView): void {
   const before = task.lastView;
   if (before?.status === 'blocked' && before.error === view.error) return;
   const audience = (view.waitingFor as { audience?: string[] } | undefined)?.audience;
   if (audience?.length === 1 && audience[0] === '@admins') return;
+  if (isCapacityEscalation(view.error)) return;
   if ((task.params?.trigger as { type?: string } | undefined)?.type === ERROR_EVENT_TYPE) return;
   reportError({ kind: 'escalation', error: Object.assign(new Error(String(view.error)), { name: 'Escalation' }),
     where: `stage ${view.stage}`, taskId: task.id, projectId: task.projectId,
@@ -5496,9 +5500,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               nonRetryable: true,
             });
           }
-          // Push protection found a secret in the branch's history: only the
+          // Push protection found a secret in the branch's history, or the
+          // branch adds more data than may be published (pramana: 1.2 GB of
+          // data committed, escalated to the parent as an error): only the
           // agent's rewrite of its commits can publish it, as for a conflict.
-          if (isGithubPushProtectionRejection(pushError)) {
+          if (isBranchContentRejection(pushError)) {
             throw ApplicationFailure.create({
               message: `Could not publish ${repo.name}/${repo.branch}: ${pushError}`,
               type: 'task-branch-conflict',

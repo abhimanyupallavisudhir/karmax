@@ -506,6 +506,30 @@ describe('software-dev pipeline: follow-ups, confirmation modes and recovery (re
     await handle.result();
   }, 180_000);
 
+  // pramana (2026-11-09, task_mw7ofs473f32255012): after its day of waiting for
+  // room, a full Hetzner CPU limit was waited out again as an outage (five
+  // more tries) and asked as "infrastructure: … (still failing after 5 waits)".
+  it('asks at once, saying it had no machine for a day, when its wait for room is spent', async () => {
+    const repo = await h.makeRepo('app-capacity-spent');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [{ ...input({ taskId, repo, title: 'Capacity spent', resolveAgentEnabled: false,
+        prompt: '@capacityfull 99 Hetzner refused a new server: the CPU limit is full\n@review done' }), capacityWaitLimitMs: 1 }],
+    });
+    await expect.poll(async () => (await view(handle)).waitingFor?.summary, { timeout: 30_000, interval: 200 }).toBe('Waiting for a machine');
+    await handle.signal('retry');
+    await expect.poll(async () => (await view(handle)).status, { timeout: 30_000, interval: 200 }).toBe('blocked');
+    const blocked = await view(handle);
+    expect(blocked.error).toMatch(/^No machine for a day: .*the CPU limit is full/);
+    expect(blocked.error).not.toMatch(/infrastructure|still failing/);
+    // Blocked within seconds of the Retry: no outage wait (30 s, then longer) ran first.
+    expect((await h.store.eventsSince(taskId, 0)).some((e) => e.type === 'resolve.auto')).toBe(false);
+    await handle.signal('cancel');
+    await handle.result();
+  }, 120_000);
+
   // legibench3#18: a session converted from a 44 MB Codex history was larger than
   // Claude's context, so every retry and follow-up resumed it into the same refusal.
   it('restarts Do on a fresh session when its session outgrew the model\'s context', async () => {
