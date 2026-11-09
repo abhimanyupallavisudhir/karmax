@@ -39,6 +39,7 @@ import { claimWorkerOwnership, duplicateInstanceMessage, registerAppInstance } f
 import { AuthorizationService } from './platform/authorization.js';
 import { IdentityService, type GitHubAuthorization } from './auth/identity.js';
 import { siteNameOf, BRAND } from './domain/brand.js';
+import { startGithubUsageFlush } from './integrations/github-http.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SECRET_HANDLE,
   GITHUB_APP_CLIENT_SECRET_HANDLE } from './integrations/github-app.js';
 import { GitHubDeploymentMonitor } from './integrations/github-deployment-monitor.js';
@@ -213,6 +214,8 @@ async function main() {
   const githubApp = (await GitHubAppService.create(store, broker, { appId: process.env.KARMAX_GITHUB_APP_ID,
     appSlug: process.env.KARMAX_GITHUB_APP_SLUG, clientId: process.env.KARMAX_GITHUB_CLIENT_ID,
     publicApp: deployment.hosted }));
+  // What this process's GitHub calls were, for Installation → Service limits.
+  const githubCalls = startGithubUsageFlush((meter, n) => store.countServiceUsage(meter, Date.now(), n));
   const sharedGithubOauth = await githubApp.oauthCredentials();
   // A separately managed OAuth App remains a compatibility fallback only. Once
   // the deployment GitHub App exists, it is the single OAuth client.
@@ -856,7 +859,7 @@ async function main() {
       retentionTimer.stop(), serviceLimitsTimer.stop(), computeQueueTimer.stop(), inboxCleanup.stop(), credentialAttentionTimer.stop(), subscriptionEntitlementTimer.stop(),
       subscriptionSeatTimer.stop(),
       reconcileSweep.stop(), deploymentSweep.stop(),
-      triggerScheduler.stop(), mailPoller.stop(), worldLifecycle.stop(), delivery.stop(),
+      triggerScheduler.stop(), mailPoller.stop(), worldLifecycle.stop(), delivery.stop(), githubCalls.stop(),
     ]);
     await step(entitlementQueues.stop());
     projectGithubAccess.stop();

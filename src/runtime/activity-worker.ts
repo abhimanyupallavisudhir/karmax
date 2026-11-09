@@ -16,6 +16,7 @@ import { sweepTurnKeys } from '../autonomy/vault-items.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { AuthorizationService } from '../platform/authorization.js';
 import { GitHubAppService } from '../integrations/github-app.js';
+import { startGithubUsageFlush } from '../integrations/github-http.js';
 import { createExecutionServices } from './execution-services.js';
 import { assertDataEpoch } from '../config/data-epoch.js';
 import type { ExternalWorkflowRef } from '../packages/bundle.js';
@@ -39,6 +40,7 @@ export async function createActivityWorkerRuntime(): Promise<WorkerProcessRuntim
   const release = await admitWorkerProcess(p.home);
   let store: Store | undefined;
   let closeClient: (() => Promise<void>) | undefined;
+  let githubCalls: { stop(): Promise<void> } | undefined;
   let closed = false;
   const close = async () => {
     if (closed) return;
@@ -46,6 +48,7 @@ export async function createActivityWorkerRuntime(): Promise<WorkerProcessRuntim
     // Close both independent resources even if either fails. Retain ownership
     // until cleanup completes; the outer supervisor bounds a stuck shutdown.
     try {
+      await githubCalls?.stop().catch(() => undefined);
       const results = await Promise.allSettled([closeClient?.(), store?.close()]);
       const failed = results.find(result => result.status === 'rejected');
       if (failed?.status === 'rejected') throw failed.reason;
@@ -76,6 +79,9 @@ export async function createActivityWorkerRuntime(): Promise<WorkerProcessRuntim
       appId: process.env.KARMAX_GITHUB_APP_ID, appSlug: process.env.KARMAX_GITHUB_APP_SLUG,
       clientId: process.env.KARMAX_GITHUB_CLIENT_ID, publicApp: deployment.hosted,
     });
+    // What this process's GitHub calls were, for Installation → Service limits.
+    const counted = store;
+    githubCalls = startGithubUsageFlush((meter, n) => counted.countServiceUsage(meter, Date.now(), n));
     const services = await createExecutionServices({ store, client, broker, githubApp, p, deployment,
       provider: defaultProvider().provider, coordinationDirectory: path.join(p.state, 'world-coordination') });
     const { worlds, adapters, profiles, tokens, checkpoints, runners, payments,

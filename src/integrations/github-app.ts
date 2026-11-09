@@ -14,6 +14,7 @@ import { observeDeploymentWorkflowRun } from './github-deployment-monitor.js';
 import { boundEventPayload } from '../domain/project-events.js';
 import { taskIdOfBranch, BRAND } from '../domain/brand.js';
 import { RefreshLeases } from '../autonomy/refresh-lease.js';
+import { githubFetch, labelGithubToken } from './github-http.js';
 
 export const GITHUB_APP_PRIVATE_KEY_HANDLE = 'github-app:private-key';
 export const GITHUB_APP_WEBHOOK_SECRET_HANDLE = 'github-app:webhook-secret';
@@ -419,7 +420,7 @@ export class GitHubAppService {
       appSlug: options.appSlug?.trim() || (await store.kvGet(GITHUB_APP_SLUG_KEY)),
       clientId: options.clientId?.trim() || (await store.kvGet(GITHUB_APP_CLIENT_ID_KEY)),
     };
-    this.fetcher = options.fetch ?? fetch;
+    this.fetcher = githubFetch(options.fetch);
     this.apiBase = (options.apiBase ?? 'https://api.github.com').replace(/\/$/, '');
   }
 
@@ -1377,6 +1378,7 @@ export class GitHubAppService {
       const parsed = Date.parse(created.expires_at ?? '');
       const expiresAt = Number.isFinite(parsed) ? parsed : Date.now() + 3600_000;
       if (this.tokenMints.get(cacheKey) === mint) this.tokenCache.set(cacheKey, { token: created.token, expiresAt });
+      labelGithubToken(created.token, connection.accountLogin || `installation-${connection.installationId}`);
       return created.token;
     }).finally(() => { if (this.tokenMints.get(cacheKey) === mint) this.tokenMints.delete(cacheKey); });
     this.tokenMints.set(cacheKey, mint);
@@ -1891,7 +1893,9 @@ export class GitHubAppService {
   }
 
   private async appRequest<T>(pathname: string, init: RequestInit = {}): Promise<T> {
-    return this.request(pathname, await this.appJwt(), init);
+    const jwt = await this.appJwt();
+    labelGithubToken(jwt, 'app');
+    return this.request(pathname, jwt, init);
   }
 
   /** Injectable so tests do not actually wait out a rate-limit backoff. */

@@ -8822,6 +8822,13 @@ export class Store {
     return Number(row?.n ?? 0);
   }
 
+  /** Each counted meter starting with `prefix`, summed from `fromDay` (YYYY-MM-DD, UTC) on. */
+  async serviceUsageByPrefix(prefix: string, fromDay: string): Promise<Record<string, number>> {
+    const rows = (await this.db.prepare(`SELECT meter, SUM(count) AS n FROM service_usage_counts
+      WHERE substr(meter, 1, ?) = ? AND day>=? GROUP BY meter`).all(prefix.length, prefix, fromDay)) as Array<{ meter: string; n: number }>;
+    return Object.fromEntries(rows.map((row) => [row.meter, Number(row.n)]));
+  }
+
   async pruneServiceUsage(beforeDay: string): Promise<void> {
     return this.db.transaction(async () => {
       (await this.db.prepare('DELETE FROM service_usage_counts WHERE day<?').run(beforeDay));

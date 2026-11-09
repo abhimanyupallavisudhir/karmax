@@ -8,6 +8,7 @@
  */
 import net from 'node:net';
 import { BRAND } from '../domain/brand.js';
+import { githubFetch } from './github-http.js';
 
 export type GithubActionsStatus =
   | 'completed' | 'action_required' | 'cancelled' | 'failure' | 'neutral'
@@ -180,7 +181,7 @@ export class GithubActionsApi {
   private sleep: (ms: number) => Promise<void>;
 
   constructor(private token: string | GithubActionsTokenProvider, options: GithubActionsApiOptions = {}) {
-    this.fetcher = options.fetch ?? fetch;
+    this.fetcher = githubFetch(options.fetch);
     this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.apiBase = (options.apiBase ?? 'https://api.github.com').replace(/\/$/, '');
     this.maxLogDownloadBytes = positiveBound(options.maxLogDownloadBytes, DEFAULT_MAX_LOG_DOWNLOAD, 64 * 1024, 64 * 1024 * 1024);
