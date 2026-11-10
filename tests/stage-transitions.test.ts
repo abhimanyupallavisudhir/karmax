@@ -1283,6 +1283,9 @@ describe('task stage transitions', () => {
       audience: ['@owners'], reason: 'Read foreign work.' })).rejects.toThrow(/task organization/);
     const requested = await f.api.requestPermission(agent, { capabilities: [], projectIds: [second.id],
       audience: ['user:limited'], reason: 'Expand project scope only.' });
+    // Task #904: it waits on what it asked, in words (not "Permission requested: ; add projects: <id>").
+    expect((await f.store.getTask(f.task.id))!.lastView?.waitingFor?.detail)
+      .toBe('Permission requested: access to Second — Expand project scope only.');
     const limited = (await f.tokens.mintPrincipal('user:limited', ['*'], f.project.id, undefined, 'org_personal')).token;
     await expect(f.api.resolvePermissionRequest(limited, {
       organizationId: 'org_personal', requestId: requested.requestId!, action: 'approve',

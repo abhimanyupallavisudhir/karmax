@@ -5068,7 +5068,7 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
         await this.stopTaskActivity(task, view, `Waiting for permission approval ${request.id}`);
         await this.startTransitionReplacement(task, view, view.stage, true, {
           audience: request.audience,
-          detail: `Permission requested: ${request.capabilities.join(', ')}${request.projectIds?.length ? `; add projects: ${request.projectIds.join(', ')}` : ''} — ${request.reason}`,
+          detail: `${await this.permissionAsk(request)} — ${request.reason}`,
         });
       }
       for (const grantorId of taskRecipients) await this.askTaskToGrant(grantorId, task, request, project.organizationId);
@@ -5083,6 +5083,18 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
       audience: request.audience,
       canGrant: grantorSelectors(grantors),
     };
+  }
+
+  /** What a permission request asks, in words: its capabilities and the
+   * projects it adds, by name ("Permission requested: x; access to Smoke checks"). */
+  private async permissionAsk(request: Pick<PermissionRequest, 'capabilities' | 'projectIds'>): Promise<string> {
+    const projects = await Promise.all((request.projectIds ?? []).map(async (id) =>
+      (await this.deps.store.getProject(id))?.name ?? id));
+    const parts = [
+      ...(request.capabilities.length ? [request.capabilities.join(', ')] : []),
+      ...(projects.length ? [`access to ${projects.join(', ')}`] : []),
+    ];
+    return `Permission requested: ${parts.join('; ')}`;
   }
 
   /** Call each Avatār to decide a permission request. */
