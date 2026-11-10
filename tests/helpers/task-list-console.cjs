@@ -53,8 +53,10 @@ const stages = [
 ];
 const STAGE_GROUPS = [['do', 'Do'], ['review', 'Review'], ['merge', 'Landing'], ['done', 'Done'], ['failed', 'Failed'], ['cancelled', 'Cancelled'], ['setup', 'Draft']];
 
-async function listConsole(context) {
+/** `taskList`: the installation's layout (Installation → Appearance → Task list), '' one line. */
+async function listConsole(context, { taskList = '' } = {}) {
   await fakeConsole(context, { project: projects[0], tasks, schema: [{ name: 'software-dev', stages }], async api(p, req, url) {
+    if (p === '/api/meta') return { siteName: 'Fixture', hostLocal: true, consoleRevision: 'one', agent: { provider: 'mock' }, worldProviders: [], taskList };
     if (p === '/api/projects') return projects;
     const project = projects.find((x) => p === `/api/projects/${x.id}`);
     if (project) return project;

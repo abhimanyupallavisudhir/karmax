@@ -5,6 +5,10 @@
 // it in words; stage bar and age line up; a row's Archive/Delete show on the
 // row you point at. Labels follow the title and wrap beneath it, never
 // clipped; a narrow list drops the stage bar, a phone wraps the title.
+// That is the default; an operator can choose another layout for everyone
+// (Installation → Appearance → Task list): Status first (two lines led by the
+// glyph), Ruled (two lines, the glyph beside the status's words) or Cards (a
+// card per task) — the same rows, laid out by `html[data-task-list]`.
 // Run: node web/task-list-layout.browser.test.cjs
 const assert = require('node:assert/strict');
 const { launch } = require('../tests/helpers/fake-console.cjs');
@@ -12,13 +16,13 @@ const { listConsole } = require('../tests/helpers/task-list-console.cjs');
 
 (async () => {
   const browser = await launch();
-  const open = async (url, viewport = { width: 1280, height: 900 }) => {
+  const open = async (url, viewport = { width: 1440, height: 900 }, taskList = '') => {
     const context = await browser.newContext({ serviceWorkers: 'block', viewport });
-    await listConsole(context);
+    await listConsole(context, { taskList });
     context.setDefaultTimeout(8000);
     const page = await context.newPage();
     const errors = [];
-    page.on('pageerror', (error) => errors.push(error.message));
+    page.on('pageerror', (error) => { errors.push(error.message); if (process.env.DEBUG) console.error(error.stack); });
     await page.goto(`http://console.test${url}`);
     await page.locator('.task-row[data-id="t41"]').waitFor();
     await page.evaluate(() => document.fonts.ready);
@@ -114,6 +118,66 @@ const { listConsole } = require('../tests/helpers/task-list-console.cjs');
       assert.ok(state.top >= title.bottom, 'status beneath the title');
       assert.ok(Math.abs(state.top - when.top) <= 6, 'status and age on one line');
       assert.ok((await box(page, '[data-id="t41"]')).right <= 390, 'nothing runs off the screen');
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+    {
+      // The two-line layouts: the title, then the status (and its labels) beneath it.
+      for (const layout of ['status-first', 'ruled', 'cards']) {
+        const { page, context, errors } = await open('/org/website?q=-is%3Aarchived', undefined, layout);
+        assert.equal(await page.evaluate(() => document.documentElement.dataset.taskList), layout, `${layout}: applied from the installation`);
+        const [title, state, labels] = [await box(page, '[data-id="t37"] .task-title'), await box(page, '[data-id="t37"] > .task-state'), await box(page, '[data-id="t37"] .task-sub')];
+        assert.ok(state.top >= title.bottom - 1, `${layout}: the status is beneath the title`);
+        assert.ok(Math.abs(labels.top - state.top) <= 6 && labels.left > state.left, `${layout}: its labels follow the status`);
+        const lead = await page.locator('[data-id="t37"] > .task-lead').evaluate((el) => getComputedStyle(el).display);
+        const wordsGlyph = await page.locator('[data-id="t37"] > .task-state svg').first().evaluate((el) => getComputedStyle(el).display);
+        if (layout === 'status-first') {
+          assert.notEqual(lead, 'none', 'status first leads with the glyph');
+          assert.equal(wordsGlyph, 'none', 'and says it once');
+        } else {
+          assert.equal(lead, 'none', `${layout}: no glyph column`);
+          assert.notEqual(wordsGlyph, 'none', `${layout}: the glyph is beside the status's words`);
+          assert.notEqual(await page.locator('[data-expand="t29"]').evaluate((el) => getComputedStyle(el).display), 'none', `${layout}: a series keeps its caret`);
+        }
+        const [a, b] = [await box(page, '[data-id="t41"]'), await box(page, '[data-id="t40"]')];
+        const border = await page.locator('[data-id="t41"]').evaluate((el) => getComputedStyle(el).borderTopWidth);
+        if (layout === 'cards') {
+          assert.ok(b.top - a.bottom >= 8 && border === '1px', 'cards stand apart, each with its border');
+          assert.equal(await page.locator('[data-id="t38"] [data-archive]').evaluate((el) => getComputedStyle(el).opacity), '1', 'a card shows its buttons');
+        } else {
+          assert.ok(b.top - a.bottom === 1 && border === '0px', `${layout}: one ruled surface`);
+        }
+        assert.deepEqual(errors, []);
+        await context.close();
+      }
+      // On a phone: the title takes the row, status and age share the next line.
+      const { page, context } = await open('/org/website?q=-is%3Aarchived', { width: 390, height: 844 }, 'cards');
+      const [title, state, when] = [await box(page, '[data-id="t41"] .task-title'), await box(page, '[data-id="t41"] > .task-state'), await box(page, '[data-id="t41"] .row-when')];
+      assert.ok(state.top >= title.bottom - 1 && Math.abs(state.top - when.top) <= 6, 'status and age on one line beneath the title');
+      assert.ok((await box(page, '[data-id="t41"]')).right <= 390, 'nothing runs off the screen');
+      await context.close();
+    }
+    {
+      // The operator picks the layout in Installation → Appearance; it applies at once, for everyone.
+      const { page, context, errors } = await open('/org/website?q=-is%3Aarchived');
+      const saved = [];
+      await page.route('**/api/settings/global/appearance', (route) => {
+        if (route.request().method() === 'PUT') { saved.push(route.request().postDataJSON()); return route.fulfill({ json: { ok: true } }); }
+        return route.fulfill({ json: { icon: 'diamond' } });
+      });
+      await page.route('**/api/settings/installation', (route) => route.fulfill({ json: { canManage: true, siteName: 'Fixture' } }));
+      await page.route('**/api/settings/service-limits', (route) => route.fulfill({ json: { services: [], canManage: true } }));
+      await page.goto('http://console.test/installation');
+      const choice = page.locator('#appearance-card .task-list-choice');
+      await choice.waitFor();
+      assert.deepEqual(await choice.locator('[data-choice]').allInnerTexts(), ['One line', 'Status first', 'Ruled', 'Cards']);
+      assert.equal(await choice.locator('[aria-pressed="true"]').innerText(), 'One line', 'one line is the default');
+      await choice.locator('[data-choice="cards"]').click();
+      await page.waitForFunction(() => document.documentElement.dataset.taskList === 'cards');
+      assert.deepEqual(saved, [{ values: { taskList: 'cards' } }]);
+      await choice.locator('[data-choice=""]').click();
+      await page.waitForFunction(() => !document.documentElement.hasAttribute('data-task-list'));
+      assert.deepEqual(saved.at(-1), { values: { taskList: '' } });
       assert.deepEqual(errors, []);
       await context.close();
     }

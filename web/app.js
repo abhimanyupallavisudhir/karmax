@@ -5969,6 +5969,7 @@ function siteNameMarkup() { return esc(siteName()); }
 
 function applyDocumentBrand() {
   applySkin(S.meta?.skin);
+  applyTaskList(S.meta?.taskList);
   document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute('content', siteName());
   document.querySelector('meta[name="description"]')?.setAttribute('content',
     `${siteName()} is the agentic to-do list that finishes itself: agents work in parallel on their own computers; you review the result. Use your Claude or ChatGPT plan.`);
@@ -22191,7 +22192,9 @@ function appearanceCard() {
     '<span class="brand-current" id="brand-current"></span>',
     '<button class="btn sm" type="button" id="brand-change" aria-expanded="false" aria-controls="brand-picker">Change</button>')}
       ${instRow(`Style ${policyTip('How the console looks for everyone. Classic is the earlier indigo look. Each person still picks light or dark in their profile.')}`,
-    instSegmented('skin-choice', SKINS.map((skin) => [skin.id, skin.label]), document.documentElement.getAttribute('data-skin') || '', 'Style'))}</div>
+    instSegmented('skin-choice', SKINS.map((skin) => [skin.id, skin.label]), document.documentElement.getAttribute('data-skin') || '', 'Style'))}
+      ${instRow(`Task list ${policyTip('How every task list lays out its rows, for everyone. One line: a task per line, its status in a column. Status first: two lines, led by the status. Ruled: two lines on one surface. Cards: a card per task.')}`,
+    instSegmented('task-list-choice', TASK_LISTS.map((layout) => [layout.id, layout.label]), document.documentElement.getAttribute('data-task-list') || '', 'Task list'))}</div>
       <div class="brand-picker" id="brand-picker" hidden>
         ${BRAND_ICON_CHOICES.map((c) => `<button type="button" class="brand-option" data-icon="${esc(c.id)}" aria-pressed="false">
           <img src="/brand/${esc(c.id)}/icon-192.png" alt="" /><span>${esc(c.label)}</span>
@@ -22226,26 +22229,29 @@ async function wireAppearanceCard() {
   }
   catch { $('#appearance-card').style.display = 'none'; return; }
   mark(current);
-  // The style applies at once and saves on choice, like the logo.
-  const skins = $('#appearance-card .skin-choice');
-  if (skins) {
-    wireInstSegmented(skins.parentElement);
-    skins.addEventListener('change', async () => {
-      const previous = S.meta?.skin || '';
-      const skin = skins.dataset.value || '';
-      applySkin(skin);
+  // The style and the task list apply at once and save on choice, like the logo.
+  const choose = (cls, key, choices, apply, noun) => {
+    const group = $(`#appearance-card .${cls}`);
+    if (!group) return;
+    wireInstSegmented(group.parentElement);
+    group.addEventListener('change', async () => {
+      const previous = S.meta?.[key] || '';
+      const value = group.dataset.value || '';
+      apply(value);
       try {
-        await api('/api/settings/global/appearance', { method: 'PUT', body: JSON.stringify({ values: { skin } }) });
-        if (S.meta) S.meta.skin = skin;
-        toast(`${SKINS.find((choice) => choice.id === skin)?.label || 'Default'} style`);
+        await api('/api/settings/global/appearance', { method: 'PUT', body: JSON.stringify({ values: { [key]: value } }) });
+        if (S.meta) S.meta[key] = value;
+        toast(`${choices.find((choice) => choice.id === value)?.label || choices[0].label} ${noun}`);
       } catch (e) {
-        applySkin(previous);
-        skins.dataset.value = skins.dataset.unsavedValue = previous;
-        skins.querySelectorAll('[data-choice]').forEach((button) => button.setAttribute('aria-pressed', String(button.dataset.choice === previous)));
+        apply(previous);
+        group.dataset.value = group.dataset.unsavedValue = previous;
+        group.querySelectorAll('[data-choice]').forEach((button) => button.setAttribute('aria-pressed', String(button.dataset.choice === previous)));
         toast(e.message, true);
       }
     });
-  }
+  };
+  choose('skin-choice', 'skin', SKINS, applySkin, 'style');
+  choose('task-list-choice', 'taskList', TASK_LISTS, applyTaskList, 'task list');
   const nameInput = $('#site-name');
   if (nameInput) nameInput.value = installation.siteName || siteName();
   $('#site-name-save')?.addEventListener('click', async () => {
@@ -27481,6 +27487,9 @@ async function createOrganization() {
 
 // ── theme ────────────────────────────────────────────────────────────────────
 const SKINS = [{ id: '', label: 'Default' }, { id: 'classic', label: 'Classic' }];
+/** How task lists lay out their rows (Installation → Appearance → Task list,
+ * src/domain/brand.ts TASK_LISTS): '' one line per task, columns aligned. */
+const TASK_LISTS = [{ id: '', label: 'One line' }, { id: 'status-first', label: 'Status first' }, { id: 'ruled', label: 'Ruled' }, { id: 'cards', label: 'Cards' }];
 /** 'light', 'dark', or '' to follow the system. */
 function setTheme(next) {
   if (next) document.documentElement.setAttribute('data-theme', next);
@@ -27493,6 +27502,7 @@ function setTheme(next) {
   // The installation's look arrives with /api/meta; until then, the one it had
   // last time, so a classic installation never flashes the default look.
   try { applySkin(localStorage.getItem('karmax-skin') || ''); } catch {}
+  try { applyTaskList(localStorage.getItem('karmax-task-list') || ''); } catch {}
 })();
 /** The installation's look (Installation → Appearance → Style): '' is the
  * default, 'classic' the earlier indigo console. Every colour, radius and type
@@ -27502,6 +27512,14 @@ function applySkin(skin) {
   if (value) document.documentElement.setAttribute('data-skin', value);
   else document.documentElement.removeAttribute('data-skin');
   try { localStorage.setItem('karmax-skin', value); } catch {}
+}
+/** The installation's task list layout (`html[data-task-list]`, web/styles.css
+ * "task row"); none is the default, one line per task. */
+function applyTaskList(layout) {
+  const value = TASK_LISTS.some((choice) => choice.id === layout) ? layout : '';
+  if (value) document.documentElement.setAttribute('data-task-list', value);
+  else document.documentElement.removeAttribute('data-task-list');
+  try { localStorage.setItem('karmax-task-list', value); } catch {}
 }
 
 // ── projects ─────────────────────────────────────────────────────────────────

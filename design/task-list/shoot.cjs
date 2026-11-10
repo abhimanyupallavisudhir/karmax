@@ -3,7 +3,8 @@
 // list, For me, the organization home, grouped by stage, and For me rows that
 // ask for decisions (tests/helpers/ux-console.cjs); light and dark, a laptop
 // and a phone.
-// Usage: OUT=/tmp/task-list/after node design/task-list/shoot.cjs [name-filter]
+// TASK_LIST=status-first|ruled|cards shoots another layout (Installation → Appearance → Task list).
+// Usage: OUT=/tmp/task-list/after [TASK_LIST=cards] node design/task-list/shoot.cjs [name-filter]
 const fs = require('node:fs');
 const path = require('node:path');
 const { launch } = require('../../tests/helpers/fake-console.cjs');
@@ -29,7 +30,7 @@ const SIZES = { desk: { width: 1280, height: 900 }, laptop: { width: 1024, heigh
     if (ONLY && !ONLY.test(shot)) continue;
     if (scheme === 'dark' && size !== 'desk') continue;
     const context = await browser.newContext({ serviceWorkers: 'block', viewport, colorScheme: scheme });
-    await fixture(context);
+    await fixture(context, { taskList: process.env.TASK_LIST || '' });
     const page = await context.newPage();
     page.on('pageerror', (e) => console.error(shot, 'pageerror', e.message));
     await page.goto(`http://console.test${url}`);
