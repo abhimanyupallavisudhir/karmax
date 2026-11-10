@@ -258,6 +258,12 @@ export function watchesJobs(view: Pick<TaskView, 'waitingFor'>): boolean {
   return view.waitingFor?.kind === 'job' || Boolean(view.waitingFor?.jobs?.length);
 }
 
+/** Whether a task in this state leaves its world idle: waiting, with no turn
+ * about to run in it and no job of its agent's running there. */
+export function leavesWorldIdle(view: Pick<TaskView, 'status' | 'waitingFor'>): boolean {
+  return (view.status === 'waiting' || view.status === 'blocked') && !hasLiveWorldWork(view) && !watchesJobs(view);
+}
+
 /** These waits still own live work or are about to enter a turn (a retry after
  * an infrastructure failure is seconds to minutes away). Waiting for compute
  * credit is not: only a person (a pack, auto top-up, the next month) ends it,

@@ -853,7 +853,9 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'notify',
     description:
       'Tell or call people and agents of this task without ending your turn. ' +
-      'Notify a person only when you need them to do something; never for updates on your work. People (user:<id>, @team:<slug>, @creator, ' +
+      'Notify a person only when you need them to do something; never for updates on your work. ' +
+      'It leaves their list once they have read it: when you cannot go on without them, ask instead (pause with needs_input, or escalate_to_human). ' +
+      'People (user:<id>, @team:<slug>, @creator, ' +
       '@owners, @project, @maintainers, @admins, @all) and Avatārs (avatar:<task id>) are notified now; agents of this task ' +
       '(agent:do for the main agent, agent:responder, agent:confirm, agent:agent-<n>) are called when your turn ends, in order. ' +
       'The message is said in the task conversation. `agents` calls new agents in, after `to`; each becomes the next ' +
