@@ -41,7 +41,7 @@ import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
 import type { ChildTaskSummary, KarmaxEvent, Organization, TaskView, WorldProviderConnection } from '../domain/types.js';
-import { BRAND_FILES, brandIconOf, isBrandIcon, isSkin, siteNameError, siteNameOf, skinOf, BRAND } from '../domain/brand.js';
+import { BRAND_FILES, brandIconOf, isBrandIcon, isSkin, isTaskList, siteNameError, siteNameOf, skinOf, taskListOf, BRAND } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { ProjectTransfers, ProjectTransferError } from '../platform/project-transfer.js';
 import { AttachmentStore, AttachmentError, MAX_FILE_BYTES, MAX_IMAGE_BYTES } from '../store/attachments.js';
@@ -2402,6 +2402,7 @@ export class Gateway {
         hostLocal: this.hostLocal,
         siteName: (await this.siteName),
         skin: skinOf((await this.deps.store.getSettings('global', 'appearance'))),
+        taskList: taskListOf((await this.deps.store.getSettings('global', 'appearance'))),
         worldProviders: this.deps.worlds.catalog(),
         // Which inbox delivery channels actually have an adapter wired. The console
         // used to render Email/Slack switches unconditionally and toast "saved" for
@@ -9092,9 +9093,10 @@ export class Gateway {
           }
           if (wf === 'appearance') {
             const v = b.values ?? {};
-            if (!('icon' in v) && !('skin' in v)) return this.json(res, 400, { error: 'Choose a logo or a style' });
+            if (!('icon' in v) && !('skin' in v) && !('taskList' in v)) return this.json(res, 400, { error: 'Choose a logo, a style or a task list layout' });
             if ('icon' in v && !isBrandIcon(v.icon)) return this.json(res, 400, { error: 'Unknown brand icon' });
             if ('skin' in v && !isSkin(v.skin)) return this.json(res, 400, { error: 'Unknown style' });
+            if ('taskList' in v && !isTaskList(v.taskList)) return this.json(res, 400, { error: 'Unknown task list layout' });
           }
           const values = hostedSettingsValues(b.values ?? {}, this.deps.hosted === true);
           // Appearance is installation identity rather than a replace-all task
