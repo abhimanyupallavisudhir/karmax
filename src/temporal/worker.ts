@@ -1,6 +1,6 @@
 import { Worker, NativeConnection, Runtime, DefaultLogger, WorkflowBundle } from '@temporalio/worker';
 import { Context } from '@temporalio/activity';
-import { ApplicationFailure } from '@temporalio/common';
+import { ApplicationFailure, IllegalStateError } from '@temporalio/common';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { TASK_QUEUE, TemporalConn } from './config.js';
@@ -70,7 +70,11 @@ function ensureQuietRuntime() {
   if (runtimeInstalled) return;
   // Keep worker logs quiet by default; KARMAX_TEMPORAL_LOG=debug to see them.
   const level = (process.env.KARMAX_TEMPORAL_LOG ?? 'WARN').toUpperCase() as any;
-  Runtime.install({ logger: new DefaultLogger(level) });
+  // The Runtime is one per process. Another copy of this module (a test file
+  // re-importing it, wiki ops/ci "Temporal dev server gone mid-shard") or an
+  // earlier connection may already have made it: use that one.
+  try { Runtime.install({ logger: new DefaultLogger(level) }); }
+  catch (error) { if (!(error instanceof IllegalStateError)) throw error; }
   runtimeInstalled = true;
 }
 
