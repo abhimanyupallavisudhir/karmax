@@ -28,7 +28,7 @@ function browser() {
   const timers = [];
   const state = { organizationId: 'org', organizations: [{ id: 'org' }], inbox: [], activity: [], tab: 'inbox' };
   let response = [];
-  const ctx = vm.createContext({
+  const ctx = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0,
     document: { hidden: false }, resourceReviewCache: new Map(), resourceInventoryCache: new Map(), reviewArtifactUrls: new Map(),
     S: state, Map, Set, URGENCY_LEVELS: ['low', 'normal', 'high', 'critical'],
     location: { protocol: 'https:', host: 'example.test' },

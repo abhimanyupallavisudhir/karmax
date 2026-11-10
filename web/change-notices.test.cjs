@@ -13,7 +13,7 @@ function page(state = {}) {
   const calls = [];
   const note = (name) => (...args) => { calls.push(args.length ? [name, ...args] : [name]); };
   const timers = [];
-  const ctx = vm.createContext({
+  const ctx = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0,
     S: { tab: 'tasks', projectId: 'p', organizationId: 'o', selected: null, inbox: [], view: null, attemptGroup: null, ...state },
     api: Object.assign(async (url) => { calls.push([url]); return {}; }, { defaults: new Map([['kept', 1]]) }), calls,
     scheduleInboxReload: note('inbox'), refreshTask: note('task'), scheduleHomeRefresh: note('home'), scheduleTaskListReload: note('list'),
@@ -85,7 +85,7 @@ test('the socket hands notices over, drops them while hidden like events, and na
   const notices = [];
   const urls = [];
   const document = { hidden: false };
-  const ctx = vm.createContext({ S: { clientId: 'tab_abcdefgh', projectId: 'p', tab: 'tasks', tasks: [], taskEvents: [], activity: [], meta: {} },
+  const ctx = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0, S: { clientId: 'tab_abcdefgh', projectId: 'p', tab: 'tasks', tasks: [], taskEvents: [], activity: [], meta: {} },
     location: { protocol: 'https:', host: 'example.test' }, WebSocket: function (url) { urls.push(url); }, document,
     applyChangeNotice: (notice) => notices.push(notice), patchTaskListFromEvent: () => { throw new Error('a notice is not an event'); } });
   vm.runInContext(`${fn('connectWs')}\n${fn('isCrossProjectList')}\n${fn('inboxEventChanges')}`, ctx);
@@ -105,7 +105,7 @@ test('coming back to the page reads again after a long absence, even when nothin
   const calls = [];
   const timers = [];
   const document = { hidden: false };
-  const ctx = vm.createContext({ S: { selected: null, tab: 'home', liveUpdatesStale: false, onboarding: null }, document,
+  const ctx = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0, S: { selected: null, tab: 'home', liveUpdatesStale: false, onboarding: null }, document,
     Date: { now: () => now }, api: { defaults: new Map() }, resourceReviewCache: new Map(), resourceInventoryCache: new Map(),
     checkWsLiveness: (force) => calls.push(`ping ${force}`), reconnectWs: () => calls.push('reconnect'),
     loadInbox: async () => { calls.push('inbox'); }, scheduleHomeRefresh: () => calls.push('home'), refreshTasks: () => calls.push('list'),
@@ -127,7 +127,7 @@ test('coming back to the page reads again after a long absence, even when nothin
 test('the inbox changing re-reads the list on screen, and reads what arrived about the open task first', async () => {
   const calls = [];
   let response = [{ id: 'a', kind: 'mentioned', unread: true, urgency: 'normal', taskId: 't' }];
-  const ctx = vm.createContext({ S: { organizations: [{ id: 'o' }], tab: 'home', selected: null, inbox: [] }, Map, document: { hidden: false },
+  const ctx = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0, S: { organizations: [{ id: 'o' }], tab: 'home', selected: null, inbox: [] }, Map, document: { hidden: false },
     api: async () => response, urgencyRank: () => 1, inboxArrivals: (seen, items) => (seen ? items.filter((item) => item.unread && !seen.has(item.id)) : []),
     announceInbox: (items) => calls.push(`announce ${items.map((item) => item.id).join(',')}`), updateBell: () => {}, refreshForMeCounts: () => {},
     scheduleHomeRefresh: () => calls.push('bell page'), refreshListQuietly: () => calls.push('list'),

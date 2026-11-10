@@ -6,7 +6,7 @@ const src = fs.readFileSync(`${__dirname}/app.js`, 'utf8');
 const fn = (name) => { const start = src.search(new RegExp(`^(?:async )?function ${name}\\(`, 'm')); return src.slice(start, src.indexOf('\n}', start) + 2); };
 test('RQ-11: hidden tabs defer websocket work until visibility returns', () => {
   let inboxReloads = 0;
-  const ctx = vm.createContext({ S: { meta: {}, inbox: [] }, document: { hidden: true }, location: { protocol: 'http:', host: 'test' }, WebSocket: function () {},
+  const ctx = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0, S: { meta: {}, inbox: [] }, document: { hidden: true }, location: { protocol: 'http:', host: 'test' }, WebSocket: function () {},
     scheduleInboxReload: () => inboxReloads++ });
   vm.runInContext(`${fn('connectWs')}\n${fn('inboxEventChanges')}`, ctx); ctx.connectWs();
   const hear = (event) => ctx.S.ws.onmessage({ data: JSON.stringify(event) });
@@ -19,7 +19,7 @@ test('RQ-11: hidden tabs defer websocket work until visibility returns', () => {
 // which is when none of them is needed any more.
 test('a hidden tab still hears what asks for its person, and only that', () => {
   let inboxReloads = 0;
-  const ctx = vm.createContext({ S: { meta: {}, inbox: [] }, document: { hidden: true }, location: { protocol: 'http:', host: 'test' }, WebSocket: function () {},
+  const ctx = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0, S: { meta: {}, inbox: [] }, document: { hidden: true }, location: { protocol: 'http:', host: 'test' }, WebSocket: function () {},
     scheduleInboxReload: () => inboxReloads++, applyChangeNotice: () => { throw new Error('a hidden page re-reads nothing else'); } });
   vm.runInContext(`${fn('connectWs')}\n${fn('inboxEventChanges')}`, ctx); ctx.connectWs();
   const hear = (event) => ctx.S.ws.onmessage({ data: JSON.stringify(event) });
@@ -38,7 +38,7 @@ test('a hidden tab still hears what asks for its person, and only that', () => {
 });
 test('RQ-12/UI-9: minimized onboarding does not poll', () => {
   let timers = 0;
-  const ctx = vm.createContext({ S: { onboarding: { display: 'minimized' } }, document: { hidden: false }, clearTimeout: () => {}, setTimeout: () => timers++ });
+  const ctx = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0, S: { onboarding: { display: 'minimized' } }, document: { hidden: false }, clearTimeout: () => {}, setTimeout: () => timers++ });
   vm.runInContext(fn('pollOnboarding'), ctx); ctx.pollOnboarding(); assert.equal(timers, 0);
 });
 test('RQ-10: retained payment controls are not fetched during every render', () => {
@@ -47,7 +47,7 @@ test('RQ-10: retained payment controls are not fetched during every render', () 
 });
 test('RQ-13: unchanged resource inventories survive view refreshes', async () => {
   let reads = 0;
-  const ctx = vm.createContext({ resourceReviewCache: new Map(), resourceInventoryCache: new Map(), api: async () => { reads++; return []; } });
+  const ctx = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0, resourceReviewCache: new Map(), resourceInventoryCache: new Map(), api: async () => { reads++; return []; } });
   vm.runInContext(fn('loadResourceReview'), ctx);
   await ctx.loadResourceReview({ taskId: 't', stage: 'review', updatedAt: 1 }, false, true);
   await ctx.loadResourceReview({ taskId: 't', stage: 'review', updatedAt: 2 }, false, true);
