@@ -765,8 +765,8 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     'fill_credential',
     {
       description:
-        `Type a vault credential into the page open in your browser WITHOUT the secret entering your context — ${BRAND} resolves and types it over CDP after verifying the page origin matches the credential's domains. Call once per field (username, password, then totp for a one-time code). The ${BRAND} browser MCP already runs a Chrome that exposes this DevTools endpoint, so just drive the page normally — no manual Chrome launch needed. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.`,
-      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.enum(['username', 'password', 'totp']).optional(), selector: z.string() },
+        `Type a vault credential into the page open in your browser WITHOUT the secret entering your context — ${BRAND} resolves and types it over CDP after verifying the page origin matches the credential's domains. Call once per field (username, password, then totp for a one-time code); an API key's secret or an SSH key's privateKey can be typed into a field (e.g. a CI secret form) the same way. The ${BRAND} browser MCP already runs a Chrome that exposes this DevTools endpoint, so just drive the page normally — no manual Chrome launch needed. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.`,
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.enum(['username', 'password', 'totp', 'secret', 'privateKey']).optional(), selector: z.string() },
     },
     async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/fill', a))),
   );
@@ -785,7 +785,9 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       description:
         'Save a credential into the user\'s vault so it outlives this task. Two uses: (1) a credential you just created (registered account, generated password, captured TOTP seed, minted API/SSH key); (2) ROTATION — after you change a password on a site, immediately update the granted item\'s secrets here (pass its id; metadata is ignored), or everyone is locked out with the stale value. Secrets are write-only: login → {password, totp}, api-key → {secret}, ssh-key → {privateKey}, env → {env}, note → {note}. Rotation is allowed for any item this task may use; full edits only for items this task created.',
       inputSchema: {
-        id: z.string().optional(), type: z.enum(['login', 'api-key', 'ssh-key', 'env', 'note']), label: z.string(),
+        id: z.string().optional(),
+        type: z.enum(['login', 'api-key', 'ssh-key', 'env', 'note']).optional().describe('Required to create. An item keeps its type: to update one, omit it.'),
+        label: z.string().optional().describe('Required to create.'),
         domains: z.array(z.string()).optional(), username: z.string().optional(), envVar: z.string().optional(),
         secrets: z.record(z.string(), z.string()).optional(),
       },

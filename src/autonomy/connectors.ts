@@ -15,7 +15,8 @@ import { CredentialBroker } from './broker.js';
 import { organizationScope } from './vault-keys.js';
 import { connectorOutboxKey, readConnectorWrites, type PendingConnectorWrite } from './connector-writes.js';
 import { GitProfiles } from './git-profiles.js';
-import { ITEM_FIELDS, VaultItems, VaultItemType, VaultFieldName, VaultItemPolicy } from './vault-items.js';
+import { ITEM_FIELDS, VaultItems, VaultItemType, VaultFieldName, VaultItemPolicy, type VaultItem } from './vault-items.js';
+import { ConflictError, ValidationError } from '../platform/errors.js';
 import { unlockAgeIdentity, validateNativeAgeIdentity } from './age-identity.js';
 import { hostOf, passEntryMetadata } from './pass-path.js';
 import { passSecrets, updatePassSecret, createPassItem, parsePassItem } from './pass-format.js';
@@ -1886,7 +1887,10 @@ export class Connectors {
           raced++;
           return;
         }
-        const saved = (await this.items.save({
+        // One entry the vault refuses (its type changed in the store, an empty
+        // note…) is that entry's failure, not the whole sync's.
+        let saved: VaultItem;
+        try { saved = (await this.items.save({
           id: existing?.id,
           type: ext.type,
           label: existing && !existing.provenance.source.startsWith('connector:') ? existing.label : ext.label,
@@ -1904,7 +1908,10 @@ export class Connectors {
             sourceRevision: ext.revision,
             ...(isPass ? { passNotesVersion: 2 } : { connectorFormatVersion: 1 }),
           },
-        }));
+        })); } catch (e) {
+          if (!(e instanceof ValidationError || e instanceof ConflictError)) throw e;
+          failures.push({ externalId: ext.externalId, error: (e as Error).message }); return;
+        }
         if (opts.acceptRemote) (await this.store.kvSet(this.pendingKey(saved.id), JSON.stringify({ fields: {}, generation: randomUUID() })));
         itemIds.push(saved.id);
       });

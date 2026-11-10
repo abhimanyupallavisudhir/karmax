@@ -11,6 +11,7 @@ import { CredentialBroker } from './broker.js';
 import { organizationScope } from './vault-keys.js';
 import { deleteItemConnectorWrites } from './connector-writes.js';
 import { Capability, allows } from '../platform/capabilities.js';
+import { ConflictError, NotFoundError, ValidationError } from '../platform/errors.js';
 import { newId } from '../util/id.js';
 import type { Urgency } from '../domain/types.js';
 import type { Via } from '../platform/sub-task-asks.js';
@@ -498,11 +499,18 @@ export class VaultItems {
    * Create/update an item. Sparse-update semantics throughout: secret fields
    * are write-only (a provided non-empty string replaces the vault entry;
    * absent leaves it untouched — mirrors GitProfiles.save), and on update an
-   * omitted metadata field keeps its stored value (clear with '' / []).
+   * omitted metadata field keeps its stored value (clear with '' / []), and so
+   * does an omitted `type`: an item's type is fixed at creation, since grants,
+   * fields and write-back targets all follow from it.
+   *
+   * Everything refused here is the caller's to fix, so it is thrown typed
+   * (400/404/409 through `errorStatus`), never as a bare Error the gateway
+   * would answer as an unexpected 500.
    */
   async save(args: {
     id?: string;
-    type: VaultItemType;
+    /** Required to create; on update omit it (or repeat the stored type). */
+    type?: VaultItemType;
     label?: string;
     domains?: string[];
     username?: string;
@@ -518,28 +526,35 @@ export class VaultItems {
     // Chosen once: a re-run transaction must write the same handles, not orphan the first attempt's.
     const freshId = newId('vi');
     return this.store.transaction(async () => {
-    if (!ITEM_FIELDS[args.type]) throw new Error(`unknown vault item type "${args.type}"`);
+    if (args.type !== undefined && !Object.hasOwn(ITEM_FIELDS, args.type))
+      throw new ValidationError(`unknown vault item type "${args.type}" (one of ${Object.keys(ITEM_FIELDS).join(', ')})`);
     await this.lockVault();
     const prior = args.id ? (await this.get(args.id)) : undefined;
-    if (args.id && !prior) throw new Error(`no vault item ${args.id}`);
-    if (prior && prior.type !== args.type) throw new Error(`vault item ${prior.id} is a ${prior.type}, not a ${args.type}`);
+    if (args.id && !prior) throw new NotFoundError(`no vault item ${args.id}`);
+    if (prior && args.type !== undefined && prior.type !== args.type)
+      throw new ConflictError(`vault item ${prior.id} is a ${prior.type}, not a ${args.type}: an item's type cannot change. Omit type to update it, or save a new ${args.type} item`);
+    const type = args.type ?? prior?.type;
+    if (!type) throw new ValidationError(`a new vault item needs a type (one of ${Object.keys(ITEM_FIELDS).join(', ')})`);
     const label = args.label?.trim() || prior?.label;
-    if (!label) throw new Error('a vault item needs a label');
-    if (!prior && (await this.list()).length >= 1000) throw new Error('organization vault item quota reached (1000)');
-    if (Buffer.byteLength(JSON.stringify(args), 'utf8') > 65_536) throw new Error('vault item exceeds size limit (64 KiB)');
-    if (args.type === 'note' && !args.replaceSecrets && args.secrets?.note !== undefined && !args.secrets.note.trim())
-      throw new Error('a standalone note cannot be empty');
-    if (args.type === 'session') {
-      if (args.secrets?.session?.trim()) parseSavedSession(args.secrets.session);
+    if (!label) throw new ValidationError('a vault item needs a label');
+    if (!prior && (await this.list()).length >= 1000) throw new ConflictError('organization vault item quota reached (1000)');
+    if (Buffer.byteLength(JSON.stringify(args), 'utf8') > 65_536) throw new ValidationError('vault item exceeds size limit (64 KiB)');
+    if (type === 'note' && !args.replaceSecrets && args.secrets?.note !== undefined && !args.secrets.note.trim())
+      throw new ValidationError('a standalone note cannot be empty');
+    if (type === 'session') {
+      if (args.secrets?.session?.trim()) {
+        try { parseSavedSession(args.secrets.session); }
+        catch (e) { throw new ValidationError(e instanceof Error ? e.message : String(e)); }
+      }
       const domains = args.domains ?? prior?.domains ?? [];
-      if (!domains.length) throw new Error('a saved session needs the site\'s domain');
-      for (const domain of domains) { const error = sessionDomainError(domain); if (error) throw new Error(error); }
+      if (!domains.length) throw new ValidationError('a saved session needs the site\'s domain');
+      for (const domain of domains) { const error = sessionDomainError(domain); if (error) throw new ValidationError(error); }
     }
     // Every granted turn exports it, so a bad name would fail them all. A stored
     // legacy name may be re-sent unchanged (envFor skips it) so other edits work.
     const envVar = args.envVar !== undefined ? args.envVar.trim() : prior?.envVar;
     if (envVar && envVar !== prior?.envVar && !isEnvName(envVar))
-      throw new Error('The env var name may contain only letters, digits and _, and cannot start with a digit (e.g. DEPLOY_KEY)');
+      throw new ValidationError('The env var name may contain only letters, digits and _, and cannot start with a digit (e.g. DEPLOY_KEY)');
     const id = prior?.id ?? freshId;
     const fields = new Set<VaultFieldName>(prior?.fields ?? []);
     if (args.replaceSecrets) for (const field of fields) {
@@ -548,7 +563,7 @@ export class VaultItems {
         fields.delete(field);
       }
     }
-    for (const field of ITEM_FIELDS[args.type]) {
+    for (const field of ITEM_FIELDS[type]) {
       const value = args.secrets?.[field];
       // Pass notes are a complete snapshot, including an empty replacement.
       if (field === 'note' && value !== undefined) {
@@ -567,13 +582,13 @@ export class VaultItems {
     const tags = args.tags !== undefined ? list(args.tags) : prior?.tags;
     const item: VaultItem = {
       id,
-      type: args.type,
+      type,
       label,
       ...(domains?.length ? { domains } : {}),
       ...(username ? { username } : {}),
       ...(tags?.length ? { tags } : {}),
       ...(envVar ? { envVar } : {}),
-      ...(args.type === 'session' && (args.exclusive ?? prior?.exclusive) ? { exclusive: true } : {}),
+      ...(type === 'session' && (args.exclusive ?? prior?.exclusive) ? { exclusive: true } : {}),
       fields: [...fields],
       policy: {
         use: args.policy?.use ?? prior?.policy.use ?? 'auto',
@@ -940,7 +955,7 @@ export class VaultItems {
         ? (await this.findByDomain(args.domain))[0]
         : undefined;
     if (!item) {
-      if (!args.itemId && !args.domain) throw new Error('itemId or domain required');
+      if (!args.itemId && !args.domain) throw new ValidationError('itemId or domain required');
       const parked = (await this.park({ ...args, mode, kind, itemId: undefined, ...(args.itemId ? { name: args.itemId } : {}) }));
       (await this.store.appendAudit({ principalId: `task:${args.taskId}`, action: 'vault.requested', detail: { domain: args.domain, itemId: args.itemId, mode, kind, status: 'not_in_vault' } }));
       return { status: 'not_in_vault', reason: args.itemId ? `no vault item ${args.itemId}` : `no vault item matches ${args.domain}`, requestId: parked.id,
@@ -1022,8 +1037,8 @@ export class VaultItems {
       await this.lockVault();
       const all = (await this.requests());
       const req = all.find((r) => r.id === requestId);
-      if (!req) throw new Error(`no credential request ${requestId}`);
-      if (req.status !== 'pending') throw new Error(`request ${requestId} is already ${req.status}`);
+      if (!req) throw new NotFoundError(`no credential request ${requestId}`);
+      if (req.status !== 'pending') throw new ConflictError(`request ${requestId} is already ${req.status}`);
       req.audience = audience;
       req.via = via;
       delete req.dismissed;
@@ -1046,12 +1061,12 @@ export class VaultItems {
     await this.lockVault();
     const all = (await this.requests());
     const req = all.find((r) => r.id === requestId);
-    if (!req) throw new Error(`no credential request ${requestId}`);
-    if (req.status !== 'pending') throw new Error(`request ${requestId} is already ${req.status}`);
+    if (!req) throw new NotFoundError(`no credential request ${requestId}`);
+    if (req.status !== 'pending') throw new ConflictError(`request ${requestId} is already ${req.status}`);
     if (args.action !== 'deny') {
       const itemId = req.itemId ?? args.itemId;
       const item = itemId ? (await this.get(itemId)) : undefined;
-      if (!item) throw new Error('bind this request to a vault item first (add the item, then resolve with its itemId)');
+      if (!item) throw new ValidationError('bind this request to a vault item first (add the item, then resolve with its itemId)');
       req.itemId = item.id;
       (await this.addPass(req.taskId, item.id, req.mode));
       if (args.action === 'task' || args.action === 'always') (await this.extend(req.taskId, `use-credential:item:${item.id}`, args.by));
@@ -1074,8 +1089,8 @@ export class VaultItems {
     await this.lockVault();
     const all = (await this.requests());
     const req = all.find((r) => r.id === requestId);
-    if (!req) throw new Error(`no credential request ${requestId}`);
-    if (req.status !== 'pending') throw new Error(`request ${requestId} is already ${req.status}`);
+    if (!req) throw new NotFoundError(`no credential request ${requestId}`);
+    if (req.status !== 'pending') throw new ConflictError(`request ${requestId} is already ${req.status}`);
     req.dismissed ??= { by, at: Date.now() };
     (await this.saveRequests(all));
     (await this.store.appendAudit({ principalId: by, action: 'vault.request.dismissed', detail: { requestId, taskId: req.taskId } }));
