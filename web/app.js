@@ -4933,10 +4933,17 @@ function installShellListeners() {
   installTagRouter();
   installInfoDotTips();
   installRunNow();
-  // A background repaint deferred to protect an open menu / text-selection gets
-  // flushed once that interaction releases (setTimeout lets focus + selection
-  // settle first). selectionchange fires constantly, so it only pokes the flush
-  // when something is actually waiting.
+  installRepaintGuard();
+  window.addEventListener('popstate', () => { closeTaskFormPage(); applyRoute(); });
+}
+
+// A background repaint waits while a press, an open menu or a text selection
+// is in the list (interactionInFlight), and is flushed once it releases
+// (setTimeout lets focus + selection settle first). selectionchange fires
+// constantly, so it only pokes the flush when something is actually waiting.
+function installRepaintGuard() {
+  if (installRepaintGuard.installed) return;
+  installRepaintGuard.installed = true;
   document.addEventListener('pointerdown', (event) => {
     const main = $('#main');
     if (main?.contains(event.target)) mainPointerDown = true;
@@ -4952,7 +4959,6 @@ function installShellListeners() {
   document.addEventListener('pointercancel', releaseMainPointer, true);
   document.addEventListener('focusout', () => setTimeout(flushBgRender, 0));
   document.addEventListener('selectionchange', () => { if (bgRenderQueued) setTimeout(flushBgRender, 0); });
-  window.addEventListener('popstate', () => { closeTaskFormPage(); applyRoute(); });
 }
 
 async function loadProjects(request = api('/api/projects')) {
