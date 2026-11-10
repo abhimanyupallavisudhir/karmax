@@ -6,6 +6,7 @@ import { TaskView, TaskRecord } from '../domain/types.js';
 import { withTimeout } from '../util/timeout.js';
 import { innermostMessage } from '../domain/failure-text.js';
 import { notifyChildSettlement } from './child-settlement.js';
+import { lifecycleReplacementInFlight, lifecycleReplacementKey } from './lifecycle-replacement.js';
 
 const TERMINAL = ['done', 'failed', 'cancelled'];
 
@@ -147,6 +148,20 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
             }
           }
           return;
+        }
+        // A closed run is not the task's end while the platform replaces it
+        // (an approval wait, a stage move, a restore): the old run winds down
+        // with its terminal frame suppressed, and its successor starts moments
+        // later. Settling it in that gap marked the task done, which withdrew
+        // the permission request the successor was about to wait on (#904).
+        // Read in the order the replacement writes (pin the successor, then
+        // clear the marker): an absent marker means the pin is already there.
+        if (lifecycleReplacementInFlight((await store.kvGet(lifecycleReplacementKey(t.id))), desc.runId)) return;
+        const pinned = (await store.getTask(t.id))?.params?._workflowRunId;
+        if (typeof pinned === 'string' && pinned && desc.runId && pinned !== desc.runId) {
+          const successor = await withTimeout(client.workflow.getHandle(t.id, pinned).describe(), DESCRIBE_TIMEOUT_MS)
+            .catch(() => undefined);
+          if (successor?.status.name === 'RUNNING') return;
         }
         let closeReason: string | undefined;
         if (name === 'TERMINATED' || name === 'FAILED') {

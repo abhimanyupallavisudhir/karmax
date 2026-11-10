@@ -4935,10 +4935,17 @@ function installShellListeners() {
   installTagRouter();
   installInfoDotTips();
   installRunNow();
-  // A background repaint deferred to protect an open menu / text-selection gets
-  // flushed once that interaction releases (setTimeout lets focus + selection
-  // settle first). selectionchange fires constantly, so it only pokes the flush
-  // when something is actually waiting.
+  installRepaintGuard();
+  window.addEventListener('popstate', () => { closeTaskFormPage(); applyRoute(); });
+}
+
+// A background repaint waits while a press, an open menu or a text selection
+// is in the list (interactionInFlight), and is flushed once it releases
+// (setTimeout lets focus + selection settle first). selectionchange fires
+// constantly, so it only pokes the flush when something is actually waiting.
+function installRepaintGuard() {
+  if (installRepaintGuard.installed) return;
+  installRepaintGuard.installed = true;
   document.addEventListener('pointerdown', (event) => {
     const main = $('#main');
     if (main?.contains(event.target)) mainPointerDown = true;
@@ -4954,7 +4961,6 @@ function installShellListeners() {
   document.addEventListener('pointercancel', releaseMainPointer, true);
   document.addEventListener('focusout', () => setTimeout(flushBgRender, 0));
   document.addEventListener('selectionchange', () => { if (bgRenderQueued) setTimeout(flushBgRender, 0); });
-  window.addEventListener('popstate', () => { closeTaskFormPage(); applyRoute(); });
 }
 
 async function loadProjects(request = api('/api/projects')) {
@@ -23493,16 +23499,25 @@ function requestReasonLine(request, reason, inTask) {
   return parts.length ? `<div class="task-sub">${parts.join(' — ')}</div>` : '';
 }
 
+// "Give the agent this permission?", "…these 2 permissions and projects?",
+// "…access to this project?" — a request may add projects and nothing else.
+function permissionAskTitle(request) {
+  const caps = request.capabilities.length;
+  const projects = request.projectIds?.length || 0;
+  if (!caps) return `Give the agent access to ${projects === 1 ? 'this project' : `these ${projects} projects`}?`;
+  return `Give the agent ${caps === 1 ? 'this permission' : `these ${caps} permissions`}${projects ? ' and projects' : ''}?`;
+}
+
 function permissionRequestRows(requests, { historyLimit = 20, inTask = false } = {}) {
   const pending = requests.filter((request) => request.status === 'pending');
   const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
   const pendingHtml = pending.map((request) => `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-preq="${esc(request.id)}">
     <div class="approval-request-main">
-      <div class="approval-request-title">Give the agent ${request.capabilities.length === 1 ? 'this permission' : `these ${request.capabilities.length} permissions`}${request.projectIds?.length ? ' and projects' : ''}?
+      <div class="approval-request-title">${permissionAskTitle(request)}
         ${request.dismissed ? ignoredChip() : ''}
       </div>
-      <div class="approval-request-caps">${request.capabilities.map((capability) =>
-        `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
+      ${request.capabilities.length ? `<div class="approval-request-caps">${request.capabilities.map((capability) =>
+        `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>` : ''}
       ${request.projectIds?.length ? `<div class="approval-request-projects">Add projects: ${request.projectIds.map((id) => `<span class="chip mono">${esc(projectById(id)?.name || id)}</span>`).join(' ')}</div>` : ''}
       ${requestReasonLine(request, request.reason, inTask)}
       ${subTaskAskLine(request)}
@@ -23520,7 +23535,7 @@ function permissionRequestRows(requests, { historyLimit = 20, inTask = false } =
   const history = recent.length
     ? `<div class="approval-history"><div class="section-h">Recent permission decisions</div>${recent.map((request) =>
       `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : request.status === 'withdrawn' ? '' : 'done'}"${request.withdrawn ? ` title="${esc(`Withdrawn: ${request.withdrawn.reason}`)}"` : ''}>${esc(request.status)}</span>
-        <span class="mono">${request.capabilities.map(esc).join(', ')}${request.projectIds?.length ? `; add projects: ${request.projectIds.map(esc).join(', ')}` : ''}</span>
+        <span class="mono">${[...request.capabilities, ...(request.projectIds || []).map((id) => `+ ${projectById(id)?.name || id}`)].map(esc).join(', ')}</span>
         <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
     : '';
   return pendingHtml + history;

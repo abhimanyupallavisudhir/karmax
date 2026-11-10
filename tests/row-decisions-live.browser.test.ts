@@ -49,6 +49,8 @@ async function openList(page: Page, requests: Pending[], { slowLoads = 0, slowAn
       searchResult: { tasks: [task], reasons: { [task.id]: ['approval-requested'] } } });
     toast = () => {};
     loadInbox = async () => {};
+    // A press holds off repaints until its click, as in the console.
+    installRepaintGuard();
     // The list as renderMain paints it: every row rebuilt, then wired.
     renderMain = () => { document.getElementById('main').innerHTML = taskRow(task); wireRowAsks(); };
     // A refresh reads the requests again, as the server would report them.
@@ -65,6 +67,21 @@ async function openList(page: Page, requests: Pending[], { slowLoads = 0, slowAn
     renderMain();
   `), TASK);
   return resolved;
+}
+
+// Click as a person does: press where the button is. A repaint every 60 ms
+// replaces the row's buttons with identical ones in the same place, so the
+// press lands on whichever is there, and the press holds off repaints until
+// its click (installRepaintGuard). Playwright's own click waits for one element
+// to stay put and, on a loaded CI runner, a repaint replaced it every time
+// (CI #2787: "element was detached from the DOM" until its timeout).
+async function press(page: Page, selector: string) {
+  // A repaint between finding the button and measuring it detaches it: measure again.
+  let box: Awaited<ReturnType<ReturnType<Page['locator']>['boundingBox']>> = null;
+  for (const deadline = Date.now() + 5000; !box && Date.now() < deadline;)
+    box = await page.locator(selector).boundingBox().catch(() => null);
+  if (!box) throw new Error(`${selector} is not on screen`);
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
 }
 
 const pendingRequests = (): Pending[] => [
@@ -105,8 +122,7 @@ it('answers each of several asks from the row while the agent works', async () =
   await page.locator('[data-vreq="vreq_one"]').waitFor();
   await page.evaluate(() => (globalThis as any).agentWorks());
   for (const id of ['vreq_one', 'vreq_github', 'vreq_r2']) {
-    const allow = page.locator(`[data-vreq="${id}"] [data-vreq-act="task"]`);
-    await allow.click();
+    await press(page, `[data-vreq="${id}"] [data-vreq-act="task"]`);
     await expect.poll(() => resolved.includes(id)).toBe(true);
     await page.locator(`[data-vreq="${id}"]`).waitFor({ state: 'detached' });
   }
@@ -123,7 +139,7 @@ it('keeps an answer on its way pressed through repaints, then drops it from the 
   const resolved = await openList(page, pendingRequests(), { slowAnswer: 800 });
   await page.locator('[data-vreq="vreq_one"]').waitFor();
   await page.evaluate(() => (globalThis as any).agentWorks());
-  await page.locator('[data-vreq="vreq_one"] [data-vreq-act="task"]').click();
+  await press(page, '[data-vreq="vreq_one"] [data-vreq-act="task"]');
   // The list repaints many times before the server answers: the ask never offers itself again.
   const states = await page.evaluate(async () => {
     const seen: string[] = [];
