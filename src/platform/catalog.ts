@@ -301,7 +301,7 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/vault/available?query= (non-secret metadata for credentials granted to the calling task; with query, the best matches in the whole vault, each marked granted or not)',
     'GET|POST /api/vault/items (typed credential items; list/save responses never contain secrets)', 'POST /api/vault/items/:id/reveal (credential:write administration; audited)', 'DELETE /api/vault/items/:id',
     'POST /api/vault/import/bitwarden (one-time plaintext Bitwarden JSON export; idempotent by Bitwarden item id; encrypted immediately and the request body is not retained as a file)',
-    'POST /api/vault/store (agent write-back of a newly created credential; body {id?, type, label, domains?, username?, secrets?})',
+    'POST /api/vault/store (agent write-back of a newly created credential; body {id?, type, label, domains?, username?, secrets?}; on update by id, type and label may be omitted and type never changes)',
     'POST /api/vault/resolve (plaintext reveal, per-item grant + policy gated; field totp returns the current code under blind use; body {itemId?|domain?, field?})',
     'POST /api/vault/fill (zero-exposure fill into the calling task\'s own browser; body {itemId?|domain?, field?, selector})',
     'GET /api/vault/requests?taskId=&status=', 'POST /api/vault/requests (escalate for access or report a wrong secret; body {itemId?|domain?, field?, mode?, kind?: access|reset, why, urgency?}; approval is high urgency by default)',
