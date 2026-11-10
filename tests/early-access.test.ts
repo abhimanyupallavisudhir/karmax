@@ -61,6 +61,7 @@ describe('early access over HTTP', async () => {
   const member = (await tokens.mintPrincipal('system:member', ['organization:read', 'task:*'], project.id)).token;
   let base = '';
   let close: () => Promise<void>;
+  const json = async (response: Promise<Response>) => (await (await response).json()) as any;
   const request = (url: string, method = 'GET', token = operator, body?: unknown) => fetch(`${base}${url}`, {
     method, headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
@@ -82,12 +83,12 @@ describe('early access over HTTP', async () => {
     const access = `/api/organizations/${organizationId}/early-access`;
     expect(await (await request(access)).json()).toEqual({ enabled: false, features: [], canManage: true });
     expect(await (await request(access, 'PUT', operator, { enabled: true })).json()).toMatchObject({ enabled: true, features: ['canvas'] });
-    expect((await (await request('/api/settings/feature-flags')).json()).earlyAccessOrganizations).toBe(1);
+    expect((await json(request('/api/settings/feature-flags'))).earlyAccessOrganizations).toBe(1);
     // The console learns each organization's features with the organization list.
     const organizations = await (await request('/api/organizations')).json() as Array<{ id: string; features?: string[] }>;
     expect(organizations.find((organization) => organization.id === organizationId)?.features).toEqual(['canvas']);
     expect((await request('/api/settings/feature-flags', 'PUT', operator, { name: 'canvas', stage: 'off' })).status).toBe(200);
-    expect((await (await request(access)).json()).features).toEqual([]);
+    expect((await json(request(access))).features).toEqual([]);
     // Members read; only administrators and operators change anything.
     expect(await (await request(access, 'GET', member)).json()).toMatchObject({ enabled: true, canManage: false });
     expect((await request(access, 'PUT', member, { enabled: false })).status).toBe(403);
