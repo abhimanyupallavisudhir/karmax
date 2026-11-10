@@ -34,7 +34,7 @@ import { editableInFlight } from '../platform/mutability.js';
 import { renderConfirmPrompt, CONFIRM_PROMPT_DEFAULT } from '../domain/confirm-prompt.js';
 import { renderRespondPrompt, RESPOND_PROMPT_DEFAULT } from '../domain/respond-prompt.js';
 import { confirmLayersOf } from '../domain/confirm.js';
-import { failureAudience, failureCause, type FailureCause } from '../domain/escalation.js';
+import { failureAudience, failureCause, NO_MACHINE_FOR_A_DAY, type FailureCause } from '../domain/escalation.js';
 import {
   MAIN_AGENT, addressedTo, agentSelector, calledAgents, enqueueAgents, isParticipantKey, messageAuthor,
   participantLabel, participantRole, reviewerKey, selectorAgent,
@@ -323,6 +323,9 @@ export interface SoftwareDevInput extends TaskInput {
   subagentWaitMs?: number;
   /** Length of one `pause` minute (ms). Overridable so tests don't wait real minutes. */
   waitMinuteMs?: number;
+  /** How long a stage waits for room in a full provider limit before asking
+   * (CAPACITY_WAIT_LIMIT_MS, a day). Overridable so tests don't wait a day. */
+  capacityWaitLimitMs?: number;
   /** Test/embedding override for GitHub policy polling. Production uses the
    * durable 30-second poll from the domain contract. */
   githubPollMs?: number;
@@ -373,6 +376,8 @@ const OPEN_PR_WAITS_FOR_WORLD = 'software-dev-open-pr-waits-for-world-v1';
 const RESOURCES_WAIT_FOR_WORLD = 'resources-wait-for-world-v1';
 /** A stage whose provider limit is full waits for room for a day (failures.ts CAPACITY_WAIT_MS). */
 const STAGES_WAIT_FOR_CAPACITY = 'stages-wait-for-capacity-v1';
+/** …for a day of wall-clock time, and once it is spent asks at once instead of waiting out outage retries too. */
+const CAPACITY_WAIT_ENDS_IN_ASK = 'stages-capacity-wait-ends-in-ask-v1';
 /** A pause a message interrupted goes on after the turn that answered it. */
 const PAUSE_GOES_ON = 'pause-goes-on-after-interruption-v1';
 /** A task whose branches all landed as their own pull requests still reviews
@@ -2504,6 +2509,8 @@ async function softwareDevImpl(
       let infraRetries = 0;
       let capacityWaited = 0;
       let capacityRounds = 0;
+      /** When this stage first met a full limit: its day of waiting is wall-clock time. */
+      let capacitySince: number | undefined;
       let freshContext = false;
       for (; attempt <= MAX_RESOLVE_ATTEMPTS; attempt++) {
         limitReportedToCoordinator = false;
@@ -2578,7 +2585,15 @@ async function softwareDevImpl(
           // wakes the park early.
           // A provider limit that is full frees only as other tasks' machines
           // stop: wait for room, trying again every few minutes, for a day.
-          if (isCapacityFailure(err) && capacityWaited < CAPACITY_WAIT_LIMIT_MS && patched(STAGES_WAIT_FOR_CAPACITY)) {
+          // The day is wall-clock time since the first refusal. It used to add
+          // up each round's planned wait, but a Retry (a person's, or the
+          // compute waker's every 15–30 s) ends a round early: pramana's day
+          // was spent in 16 hours, then waited out again as an outage below.
+          const capacityLimit = input.capacityWaitLimitMs ?? CAPACITY_WAIT_LIMIT_MS;
+          const capacityClock = isCapacityFailure(err) && patched(CAPACITY_WAIT_ENDS_IN_ASK);
+          if (capacityClock) capacitySince ??= Date.now();
+          const capacitySpent = capacityClock ? Date.now() - capacitySince! >= capacityLimit : capacityWaited >= capacityLimit;
+          if (isCapacityFailure(err) && !capacitySpent && patched(STAGES_WAIT_FOR_CAPACITY)) {
             const wait = CAPACITY_WAIT_MS[Math.min(capacityRounds++, CAPACITY_WAIT_MS.length - 1)]!;
             capacityWaited += wait;
             attempt--; // waiting for room is not a resolve attempt
@@ -2595,6 +2610,16 @@ async function softwareDevImpl(
             retryRequested = false;
             await publish();
             continue;
+          }
+          // The day is spent: ask at once, saying so. It used to fall through
+          // to the outage waits below, five more over twenty minutes, and ask
+          // as "infrastructure: … (still failing after 5 waits)", hiding the
+          // day it had waited (pramana, 2026-11-09).
+          if (capacityClock && capacitySpent) {
+            cause = 'infrastructure';
+            lastError = `${NO_MACHINE_FOR_A_DAY}: ${innermostMessage(err)}`;
+            error = lastError;
+            break;
           }
           if (isInfraFailure(err)) {
             if (infraRetries < INFRA_BACKOFF_MS.length) {

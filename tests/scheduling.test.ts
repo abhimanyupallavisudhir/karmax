@@ -253,6 +253,12 @@ describe('what the scheduler learns', () => {
       'claude-opus-5-5': { inputTokens: 0, outputTokens: 1e6 }, 'claude-sonnet-5': { inputTokens: 0, outputTokens: 1e6 } } })).toBeCloseTo(30, 6);
   });
 
+  // Claude Code 2.1.321: Fable 5.2 lists below Fable 5.1 ($8/$40, cache reads $0.20).
+  it('prices Fable 5.2 at its own rates, not Fable 5.1\'s', () => {
+    expect(usageCostUsd({ inputTokens: 1e6, outputTokens: 1e6, cacheReadTokens: 1e6, cacheWriteTokens: 1e6 }, 'claude-fable-5-2')).toBeCloseTo(8 + 40 + 0.2 + 10, 6);
+    expect(usageCostUsd({ inputTokens: 1e6, outputTokens: 1e6, cacheReadTokens: 1e6, cacheWriteTokens: 1e6 }, 'claude-fable-5-1')).toBeCloseTo(10 + 50 + 0.25 + 12.5, 6);
+  });
+
   it('keeps a tree\'s spend and burn rate, and learns a login\'s capacity from its readings against its spend', async () => {
     const store = kv();
     await recordTurnSpend(store, { root: 'T', organizationId: 'org', credential: 'login:org:claude:x', usd: 10, minutes: 20, at: 1 });

@@ -41,6 +41,7 @@ import { RESTIC_ENGINE, ROOT_PART, ResticResources, isParted, isPartsCapture, pa
   type ChangeSet, type Repository, type ResticCapture, type ResticPlace } from './restic-engine.js';
 import { pullRequestOf } from '../domain/pull-requests.js';
 import { ResourceConflictError } from './resource-conflict.js';
+import type { SetupTime } from './setup-clock.js';
 import { applyMerged, clearMerge, conflictKind, mergeFiles, type FileMerge } from './resource-file-merge.js';
 import { policyFor, readPolicies, type PolicyRule } from './resource-policy.js';
 import { installTool, mergeParts, partChanges, readFetched, readGrant, readManifest, removeGrants, saveParts, topLevel,
@@ -490,7 +491,7 @@ export class ProjectResourceService {
   /** Materialize all enabled project defaults into a newly-created generation.
    * The caller must select the agent workdir before resolving path targets. */
   async materialize(projectId: string, taskId: string, world: World, generation = world.handle.generation ?? 1,
-    revisions: Record<string, string | undefined> = {}, options: { signal?: AbortSignal } = {}): Promise<WorldHandle> {
+    revisions: Record<string, string | undefined> = {}, options: { signal?: AbortSignal; clock?: SetupTime } = {}): Promise<WorldHandle> {
     const ephemeralPaths = new Set<string>(Array.isArray(world.handle.meta?.ephemeralPaths)
       ? world.handle.meta!.ephemeralPaths as string[] : []);
     const projections: Record<string, { target: string; revisionId?: string; access: string; onDemand?: true; name?: string;
@@ -597,7 +598,7 @@ export class ProjectResourceService {
       (await this.store.updateResourceLease(entry.lease.id, 'failed'));
     };
     // A version saved before restic, until it is converted (convertLegacyRevisions).
-    const legacyOne = async (entry: Restore) => {
+    const legacyOne = async (entry: Restore, progress: () => void) => {
       const { attachment, target, revision } = entry;
       try {
         options.signal?.throwIfAborted();
@@ -608,6 +609,7 @@ export class ProjectResourceService {
           options.signal?.throwIfAborted();
           await timed('resource.transfer', () => transferResourceChunk(world, relativeOf(file), data, offset,
             { compress: compression, signal: options.signal }));
+          progress();
         }, options), { itemId: attachment.id });
         await restored(entry, performance.now() - began, false);
       } catch (error) {
@@ -615,9 +617,8 @@ export class ProjectResourceService {
         throw error;
       }
     };
-    try {
-      if (excluded.length) await ensureWorldExcluded(world, excluded);
-      const restic = restores.filter((entry) => entry.revision.engine === RESTIC_ENGINE);
+    const restic = restores.filter((entry) => entry.revision.engine === RESTIC_ENGINE);
+    const restoreAll = async (progress: () => void) => {
       await timed('resource.restore-many', () => this.restic.restoreMany(world, restic.map((entry) => {
         const ref = storedRef(entry.revision);
         return { repository: this.restic.of(entry.attachment, entry.revision), path: path.posix.join(world.handle.root, entry.target),
@@ -626,11 +627,19 @@ export class ProjectResourceService {
       }), { key: `restore:${generation}`, hostConcurrency: HOST_RESTORES_AT_ONCE,
         checkContinue: async () => { options.signal?.throwIfAborted(); },
         started: (index, at) => announce(restic[index]!, at),
+        progress,
         finished: async (index, tookMs, error) => {
           if (error) await failed(restic[index]!);
           else await restored(restic[index]!, tookMs, true);
         } }), { worldKind: world.handle.kind, operation: `${restic.length} resources` });
-      await forEachConcurrent(restores.filter((entry) => entry.revision.engine !== RESTIC_ENGINE), legacyOne, HOST_RESTORES_AT_ONCE);
+      await forEachConcurrent(restores.filter((entry) => entry.revision.engine !== RESTIC_ENGINE), (entry) => legacyOne(entry, progress),
+        HOST_RESTORES_AT_ONCE);
+    };
+    try {
+      if (excluded.length) await ensureWorldExcluded(world, excluded);
+      // Restoring takes as long as the data needs, not world setup's budget,
+      // as long as it keeps moving (setup-clock.ts; pramana #191: 31 GB).
+      await (options.clock && restores.length ? options.clock.offClock(restoreAll) : restoreAll(() => {}));
     } catch (error) {
       // Those never started (or cut short) hold a lease nothing will use.
       await failLeases(this.store, [...unsettled]);

@@ -1202,7 +1202,7 @@ const NODES = [
 // Grok Build are not admitted by the server, so their models run through OpenCode.
 const AGENT_PROVIDERS = ['claude', 'codex', 'opencode'];
 const MODELS = {
-  claude: ['default', 'opus[1m]', { id: 'claude-opus-5-5', displayName: 'Opus 5.5' }, { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, { id: 'claude-sonnet-5-5', displayName: 'Sonnet 5.5' }, { id: 'claude-haiku-5-5', displayName: 'Haiku 5.5' }, 'sonnet', 'haiku'],
+  claude: ['default', 'opus[1m]', { id: 'claude-opus-5-5', displayName: 'Opus 5.5' }, { id: 'claude-fable-5-2', displayName: 'Fable 5.2' }, { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, { id: 'claude-sonnet-5-5', displayName: 'Sonnet 5.5' }, { id: 'claude-haiku-5-5', displayName: 'Haiku 5.5' }, 'sonnet', 'haiku'],
   codex: ['gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
 };

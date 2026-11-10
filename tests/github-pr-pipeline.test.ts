@@ -844,6 +844,68 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await handle.result();
   }, 120_000);
 
+  // pramana (2026-11-09, task_mw7ofs473f32255012): a branch adding 1.2 GB of
+  // data could not be pushed, and Open PR stopped the task for its parent as
+  // an error. What a branch contains is its agent's to change, as for a secret.
+  it('returns a branch too large to publish to the Do agent as a branch repair', async () => {
+    const repo = await repoWithOrigin('too-large');
+    const origin = remoteBySlug.get(SLUG)!;
+    fs.writeFileSync(path.join(origin, 'hooks', 'pre-receive'), [
+      '#!/bin/sh',
+      'while read old new ref; do',
+      '  if git ls-tree -r --name-only "$new" | grep -qx data.bin; then',
+      '    echo "error: File data.bin is 150.00 MB; this exceeds GitHub\'s file size limit of 100.00 MB" >&2',
+      '    echo "error: GH001: Large files detected. You may want to try Git Large File Storage - https://git-lfs.github.com." >&2',
+      '    exit 1',
+      '  fi',
+      'done',
+    ].join('\n') + '\n', { mode: 0o755 });
+    const project = (await h.store.createProject('Too large', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '77',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Too large', workflow: 'software-dev',
+      workflowVersion: '1.13.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } }));
+    const repairs: string[] = [];
+    publicationTurn = async (input, ctx) => {
+      const cwd = worldRepos(input.world.handle)[0]!.root;
+      if (!repairs.length && !/branch repair/.test(input.messages.at(-1)?.text ?? '')) {
+        fs.writeFileSync(path.join(cwd, 'data.bin'), 'pretend 150 MB\n');
+        await gitOrThrow(cwd, ['add', '-A']);
+        await gitOrThrow(cwd, ['commit', '-qm', 'proposal']);
+      } else {
+        repairs.push(input.messages.at(-1)!.text);
+        await gitOrThrow(cwd, ['rm', '-q', 'data.bin']);
+        fs.writeFileSync(path.join(cwd, 'fetch-data.sh'), 'regenerates data.bin\n');
+        await gitOrThrow(cwd, ['add', '-A']);
+        await gitOrThrow(cwd, ['commit', '--amend', '--no-edit', '-q']);
+      }
+      ctx.openPr();
+      return { termination: { kind: 'success' as const, status: 'completed' }, output: 'Ready for review' };
+    };
+    const handle = await h.client.workflow.start('softwareDev@1.13.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id,
+      args: [{ taskId: task.id, projectId: project.id, title: task.title, prompt: 'Propose',
+        base: 'main', target: 'main', project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' } }],
+    });
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return `${current.stage}/${current.status}/${current.prs?.length ?? 0}`;
+    }, { timeout: 30_000 }).toBe('review/waiting/1');
+    expect(repairs).toHaveLength(1);
+    expect(repairs[0]).toMatch(/Open PR needs a branch repair/);
+    expect(repairs[0]).toMatch(/is too large to publish: GitHub refused it: File data\.bin is 150\.00 MB/);
+    expect(repairs[0]).toMatch(/remove those files from every commit/);
+    expect((await h.store.eventsOfType(task.id, 'resolve.auto'))).toHaveLength(0);
+    const head = (await git(origin, ['rev-parse', `tavya/${task.id}`])).stdout.trim();
+    expect((await git(origin, ['ls-tree', '-r', '--name-only', head])).stdout.split('\n')).not.toContain('data.bin');
+    await handle.signal('cancel');
+    await handle.result();
+  }, 120_000);
+
   it('v1.22 restores a cancelled Review by reopening the same exact PR before Review', async () => {
     const repo = await repoWithOrigin('cancelled-review-restore');
     const project = (await h.store.createProject('Cancelled Review restore', { repos: [repo], remote: 'pr' }));
@@ -930,8 +992,8 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     const repo = await repoWithOrigin('github-ci-repair');
     const project = (await h.store.createProject('GitHub CI repair', { repos: [repo], remote: 'pr' }));
     const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: '43', accountLogin: 'acme', accountType: 'Organization' }));
-    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '78',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '77',
       owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
     (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
     const task = (await h.store.createTask({ projectId: project.id, title: 'Repair failing CI', workflow: 'software-dev',
