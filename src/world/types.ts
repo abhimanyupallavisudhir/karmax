@@ -223,12 +223,6 @@ export interface WorldCheckoutSpec {
   target?: string;
 }
 
-/**
- * The repos of a world, tolerant of older handles that predate `repos[]`: falls
- * back to a single synthesized entry from the top-level fields. The single
- * source of truth for "which repos does this world contain" across merge,
- * destroy, and prompt assembly.
- */
 /** The commit a checkout was provisioned from, if one is recorded. Before
  * tavya.error 958f82cb12d718a9 a checkpoint of a checkout without one saved its
  * base's NAME instead ("master"), and a restore put it into the world. A name
@@ -240,6 +234,12 @@ export function recordedBase(repo: Pick<WorldRepo, 'baseSha'>): string | undefin
   return repo.baseSha && /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(repo.baseSha) ? repo.baseSha : undefined;
 }
 
+/**
+ * The repos of a world, tolerant of older handles that predate `repos[]`: falls
+ * back to a single synthesized entry from the top-level fields. The single
+ * source of truth for "which repos does this world contain" across merge,
+ * destroy, and prompt assembly.
+ */
 export function worldRepos(handle: WorldHandle): WorldRepo[] {
   if (handle.repos?.length) return handle.repos;
   if (handle.repo) {
