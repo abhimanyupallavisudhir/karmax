@@ -134,8 +134,11 @@ it('destroys an unpublished world if cancellation arrives during resource restor
   const worlds = new WorldRegistry();
   worlds.register({ kind: 'e2b', capabilities: { remote: true }, create: async () => world } as any);
   const resources = { materialize: vi.fn(async (...args: any[]) => {
-    expect(args[5].signal).toBe(cancellation.signal);
+    // The restore's signal follows the activity's cancellation (through setup's clock).
+    const signal = args[5].signal as AbortSignal;
+    expect(signal.aborted).toBe(false);
     cancellation.abort(new Error('cancel restore'));
+    expect(signal.aborted).toBe(true);
     return world.handle;
   }), release: vi.fn(async () => {}) };
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-cancel-restore-'));

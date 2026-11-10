@@ -31,6 +31,7 @@ import { MANAGED_COMPUTE } from '../world/connections.js';
 import { capacityCause, ComputeRouter, type RouterConnections } from '../world/compute-router.js';
 import { accountKey, dequeue, enqueue, wakeFullKey } from '../world/compute-queue.js';
 import { MachineQueued, leaseWaitDeadline } from '../world/machine-wait.js';
+import { SetupClock } from '../world/setup-clock.js';
 import { AgentChannelLost, AgentToolsUnavailable, toolsUnavailableActivity, toolsUnavailableNotice, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { clearBranchUnpublished, markBranchUnpublished, markCheckpointStale } from '../world/checkpoint-staleness.js';
@@ -2231,11 +2232,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let ctx: ReturnType<typeof activityContext.current> | undefined;
       try {
         ctx = activityContext.current();
-        activitySignal = ctx.cancellationSignal;
         heartbeat = () => ctx!.heartbeat({ waitingFor: 'world-capacity' });
       } catch {
         // Direct activity unit tests have no ambient Temporal context.
       }
+      // Setup's own time: 30 minutes for everything but restoring the
+      // project's data, which takes as long as it keeps moving (pramana #191:
+      // a 31 GB restore outlived the 30 minutes setup had in all, on every
+      // attempt). Its signal stands for the activity's everywhere below.
+      const clock = new SetupClock({ parent: ctx?.cancellationSignal });
+      activitySignal = clock.signal;
       // Temporal delivers activity cancellation at heartbeat boundaries. Keep
       // that boundary live while a provider allocates and provisions the
       // sandbox (again for each provider "Any" tries).
@@ -2252,8 +2258,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       };
       try {
       const trace = (await installationTiming(store, { taskId: args.taskId }, async row => (await record(args.taskId, 'timing', { ...row }))));
-      try { trace.signal = activityContext.current().cancellationSignal; } catch { /* direct fixture */ }
-      return (await withTiming(trace, () => trace.measure('world.prepare', async () => {
+      trace.signal = clock.signal;
+      // Out of time, setup fails at once as infrastructure, whether or not
+      // the step it is in notices: as Temporal's own timeout once abandoned it.
+      return await clock.bound(withTiming(trace, () => trace.measure('world.prepare', async () => {
       const projectId = args.projectId ?? (await store.getTask(args.taskId))?.projectId;
       const project = projectId ? (await store.getProject(projectId)) : undefined;
       // The workflow passes the provider its task had when it started. A new
@@ -2292,7 +2300,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             while ((await sourceBusy())) {
               let context: ReturnType<typeof activityContext.current> | undefined;
               try { context = activityContext.current(); } catch { /* direct activity test */ }
-              context?.cancellationSignal.throwIfAborted();
+              activitySignal?.throwIfAborted();
               context?.heartbeat({ waitingFor: 'fork-source', taskId: forkSource.taskId });
               await new Promise((resolve) => setTimeout(resolve, 2_000));
             }
@@ -2529,7 +2537,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (remote && project && deps.runners) {
           try {
             acquired = await timed('world.runner.wait', async () => deps.runners!.acquire({ project, taskId: args.taskId, worldId: args.taskId, provider: kind,
-              resources: executionConfig?.resources, work: true, waitUntil: ctx ? leaseWaitDeadline(ctx.info) : undefined,
+              resources: executionConfig?.resources, work: true, waitUntil: ctx ? Math.min(leaseWaitDeadline(ctx.info) ?? Infinity, clock.leaseWaitUntil) : undefined,
               priority: Number((await store.getTask(args.taskId))?.params.priority ?? 0), signal: activitySignal,
               heartbeat }));
           } catch (error) {
@@ -2640,7 +2648,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   .map((resource) => [resource.attachmentId, resource.revisionId])) };
               activitySignal?.throwIfAborted();
               world.handle = await timed('world.resources', () => deps.resources!.materialize(projectId, args.taskId, world, generation, revisions,
-                { signal: activitySignal }));
+                { signal: activitySignal, clock }));
             }
             if (projectId) {
               activitySignal?.throwIfAborted();
@@ -2725,7 +2733,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         throw capacityFailure(error) ?? error;
       }
       })));
-      } finally { stopCancellationHeartbeat(); }
+      } catch (error) {
+        const expired = clock.expired;
+        if (expired) throw ApplicationFailure.create({ message: expired.message, type: 'world-infra', nonRetryable: false, cause: expired });
+        throw error;
+      } finally { stopCancellationHeartbeat(); clock.dispose(); }
     },
 
     /** The effective provider for a role's turn (task override → seeded profile),
