@@ -85,7 +85,7 @@ it('keeps a working task’s asks on screen while its view moves on', async () =
   const seen = await page.evaluate(async () => {
     const samples: boolean[] = [];
     for (let i = 0; i < 40; i++) {
-      samples.push(!!document.querySelector('[data-vreq="vreq_one"] [data-vreq-act="task"]'));
+      samples.push(!!(globalThis as any).document.querySelector('[data-vreq="vreq_one"] [data-vreq-act="task"]'));
       await new Promise((done) => setTimeout(done, 25));
     }
     return samples;
@@ -128,7 +128,7 @@ it('keeps an answer on its way pressed through repaints, then drops it from the 
   const states = await page.evaluate(async () => {
     const seen: string[] = [];
     for (let i = 0; i < 24; i++) {
-      const buttons = [...document.querySelectorAll<HTMLButtonElement>('[data-vreq="vreq_one"] button')];
+      const buttons: { disabled: boolean }[] = [...(globalThis as any).document.querySelectorAll('[data-vreq="vreq_one"] button')];
       seen.push(!buttons.length ? 'gone' : buttons.every((button) => button.disabled) ? 'pressed' : 'open');
       await new Promise((done) => setTimeout(done, 50));
     }
