@@ -86,3 +86,41 @@ it('reconnects at once when the browser comes back online', async () => {
     await expect.poll(() => ui.page.locator('#main').textContent()).toContain('Needs input');
   } finally { await ui.close(); }
 });
+
+/**
+ * A hidden tab used to drop every event, the ones that ask for its person
+ * included: the count in the tab's title, the notification and its sound came
+ * only once they looked at the tab again — when none of them was needed.
+ */
+it('a background tab still counts and announces what asks for its person', async () => {
+  const sockets: WebSocketRoute[] = [];
+  let inbox: unknown[] = [];
+  const ui = await consolePage({ webSocket: (route) => { sockets.push(route); route.onMessage(() => {}); },
+    api: signedIn(({ method, path }) => (method === 'GET' && path.startsWith('/api/inbox?') ? inbox : undefined)) });
+  try {
+    await ui.run(`(async () => {
+      window.announced = [];
+      window.Notification = class { static permission = 'granted'; constructor(title, options) { window.announced.push(title + ' — ' + options.body); } close() {} };
+      S.organizations = [{ id: 'o', name: 'Organization', slug: 'org' }];
+      S.projects = [{ id: 'p', organizationId: 'o', name: 'Workspace', config: {} }];
+      S.organizationId = 'o'; S.projectId = 'p'; S.tab = 'tasks'; S.selected = null;
+      await loadInbox();
+      connectWs();
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    })()`);
+    await expect.poll(() => sockets.length).toBe(1);
+    const before = ui.calls.length;
+    inbox = [{ id: 'i1', organizationId: 'o', taskId: 't1', kind: 'escalated', urgency: 'high', unread: true, actionable: true,
+      task: { id: 't1', num: 7, title: 'Pick the launch date', projectId: 'p' } }];
+    // Work the hidden page does not show changes nothing; an ask is fetched and announced.
+    sockets[0]!.send(JSON.stringify({ type: 'agent.activity', taskId: 't1', projectId: 'p', payload: {} }));
+    sockets[0]!.send(JSON.stringify({ type: 'task.escalated', taskId: 't1', projectId: 'p', payload: {} }));
+    await expect.poll(() => ui.page.title()).toMatch(/^\(1\) /);
+    expect(await ui.run('window.announced')).toEqual(['Pick the launch date — HIGH · #7 · escalated']);
+    // Only the inbox was read: the list and the sidebar wait until someone looks.
+    expect(ui.calls.slice(before).map((call) => call.path.split('?')[0])).toEqual(['/api/inbox']);
+    expect(await ui.run('S.liveUpdatesStale')).toBe(true);
+    expect(ui.errors).toEqual([]);
+  } finally { await ui.close(); }
+});

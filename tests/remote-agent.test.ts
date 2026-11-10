@@ -442,7 +442,8 @@ describe('remote subscription agents', () => {
     expect(await ending({ signal: 'SIGKILL' })).toEqual({ args: [null, 'SIGKILL'], lost: undefined });
     const cause = new Error('[unavailable] upstream connect error or disconnect/reset before headers');
     const { args, lost } = await ending({ lost: cause });
-    expect(args).toEqual([null, null]);
+    // Never neither: the Agent SDK waits for ever on an exit without a code or a signal.
+    expect(args).toEqual([null, 'SIGHUP']);
     expect(lost?.message).toBe(`lost the connection to the agent in the sandbox; it may still be running there (${cause.message})`);
     expect(lost?.cause).toBe(cause);
     expect(isTransportError(lost)).toBe(true);
