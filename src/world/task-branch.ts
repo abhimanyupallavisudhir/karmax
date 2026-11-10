@@ -1,5 +1,5 @@
 import type { World, WorldRepo } from './types.js';
-import { worldRepos, worldRepoTarget } from './types.js';
+import { recordedBase, worldRepos, worldRepoTarget } from './types.js';
 import { BRAND } from '../domain/brand.js';
 
 export interface TaskBranchAncestryResult {
@@ -32,7 +32,8 @@ export async function ensureTaskBranchAncestry(
   const plans: Array<{ repo: WorldRepo; head: string; baseSha: string; targetSha: string }> = [];
 
   for (const repo of worldRepos(world.handle)) {
-    if (!repo.baseSha) continue;
+    const baseSha = recordedBase(repo);
+    if (!baseSha) continue;
     const ref = `refs/heads/${repo.branch}`;
     const head = await world.exec('git', ['rev-parse', '--verify', `${ref}^{commit}`], { cwd: repo.root });
     if (head.code !== 0) {
@@ -40,17 +41,17 @@ export async function ensureTaskBranchAncestry(
       continue;
     }
     const headSha = head.stdout.trim();
-    const base = await world.exec('git', ['cat-file', '-e', `${repo.baseSha}^{commit}`], { cwd: repo.root });
+    const base = await world.exec('git', ['cat-file', '-e', `${baseSha}^{commit}`], { cwd: repo.root });
     if (base.code !== 0) {
-      errors[repo.name] = ancestryViolation(repo, 'its recorded base commit is no longer available in the checkout');
+      errors[repo.name] = ancestryViolation(repo, baseSha, 'its recorded base commit is no longer available in the checkout');
       continue;
     }
-    const containsBase = await world.exec('git', ['merge-base', '--is-ancestor', repo.baseSha, ref], { cwd: repo.root });
+    const containsBase = await world.exec('git', ['merge-base', '--is-ancestor', baseSha, ref], { cwd: repo.root });
     if (containsBase.code === 0) continue;
 
     const status = await world.exec('git', ['status', '--porcelain'], { cwd: repo.root });
     if (status.code !== 0 || status.stdout.trim()) {
-      errors[repo.name] = ancestryViolation(repo,
+      errors[repo.name] = ancestryViolation(repo, baseSha,
         status.code === 0
           ? `the checkout has uncommitted changes, so ${BRAND} cannot safely repair its ancestry`
           : `the checkout could not be inspected: ${status.stderr || status.stdout}`);
@@ -60,19 +61,19 @@ export async function ensureTaskBranchAncestry(
     const target = worldRepoTarget(repo, liveTarget);
     const resolvedTarget = await resolveTarget(world, repo, target);
     if (!resolvedTarget) {
-      errors[repo.name] = ancestryViolation(repo,
+      errors[repo.name] = ancestryViolation(repo, baseSha,
         `selected target "${target}" is not available locally; fetch it and merge it into the provisioned task branch`);
       continue;
     }
     const containsTarget = await world.exec('git', ['merge-base', '--is-ancestor', resolvedTarget, ref], { cwd: repo.root });
     if (containsTarget.code !== 0) {
-      errors[repo.name] = ancestryViolation(repo,
+      errors[repo.name] = ancestryViolation(repo, baseSha,
         `the candidate does not descend from selected target "${target}" either; merge that target into the original task branch without resetting it`);
       continue;
     }
-    const related = await world.exec('git', ['merge-base', repo.baseSha, resolvedTarget], { cwd: repo.root });
+    const related = await world.exec('git', ['merge-base', baseSha, resolvedTarget], { cwd: repo.root });
     if (related.code !== 0 || !related.stdout.trim()) {
-      errors[repo.name] = ancestryViolation(repo,
+      errors[repo.name] = ancestryViolation(repo, baseSha,
         `selected target "${target}" has unrelated history; ${BRAND} will not join the histories automatically`);
       continue;
     }
@@ -81,17 +82,17 @@ export async function ensureTaskBranchAncestry(
       rootCommits(world, repo, resolvedTarget),
     ]);
     if (!candidateRoots || !targetRoots) {
-      errors[repo.name] = ancestryViolation(repo, `${BRAND} could not inspect the candidate history roots`);
+      errors[repo.name] = ancestryViolation(repo, baseSha, `${BRAND} could not inspect the candidate history roots`);
       continue;
     }
     const acceptedRoots = new Set(targetRoots);
     const foreignRoots = candidateRoots.filter((root) => !acceptedRoots.has(root));
     if (foreignRoots.length) {
-      errors[repo.name] = ancestryViolation(repo,
+      errors[repo.name] = ancestryViolation(repo, baseSha,
         `the candidate contains history unrelated to the selected target; ${BRAND} will not admit it through ancestry repair`);
       continue;
     }
-    plans.push({ repo, head: headSha, baseSha: repo.baseSha, targetSha: resolvedTarget });
+    plans.push({ repo, head: headSha, baseSha, targetSha: resolvedTarget });
   }
 
   // Validate every checkout before moving any branch. A multi-repository task
@@ -108,7 +109,7 @@ export async function ensureTaskBranchAncestry(
       '-m', `${BRAND}: preserve provisioned task ancestry`,
     ], { cwd: repo.root });
     if (commit.code !== 0 || !commit.stdout.trim()) {
-      errors[repo.name] = ancestryViolation(repo,
+      errors[repo.name] = ancestryViolation(repo, plan.baseSha,
         `${BRAND} could not create the content-neutral ancestry repair: ${commit.stderr || commit.stdout}`);
       break;
     }
@@ -121,7 +122,7 @@ export async function ensureTaskBranchAncestry(
     const ref = `refs/heads/${repo.branch}`;
     const updated = await world.exec('git', ['update-ref', ref, plan.next, plan.head], { cwd: repo.root });
     if (updated.code !== 0) {
-      errors[repo.name] = ancestryViolation(repo,
+      errors[repo.name] = ancestryViolation(repo, plan.baseSha,
         `the task branch moved while ${BRAND} was checking it; inspect the concurrent change and retry`);
       break;
     }
@@ -150,8 +151,9 @@ async function resolveTarget(world: World, repo: WorldRepo, target: string): Pro
   return undefined;
 }
 
-function ancestryViolation(repo: WorldRepo, detail: string): string {
-  const recorded = repo.baseSha ? repo.baseSha.slice(0, 12) : 'unknown';
-  return `local recorded-base ancestry violation for branch "${repo.branch}" (base ${recorded}): ${detail}. `
-    + `${BRAND} did not publish this branch; reconnecting GitHub will not help. Preserve the initially provisioned HEAD as an ancestor, integrate the selected target normally, then retry.`;
+function ancestryViolation(repo: WorldRepo, base: string, detail: string): string {
+  return `local recorded-base ancestry violation for branch "${repo.branch}" (base ${base.slice(0, 12)}): ${detail}. `
+    + `${BRAND} did not publish this branch. In ${repo.name}, run \`git merge ${base}\` on the task branch `
+    + '(an ordinary merge that keeps the provisioned commit as an ancestor, never a reset or rebase), '
+    + 'integrate the selected target normally, verify, then retry. Reconnecting GitHub will not help.';
 }

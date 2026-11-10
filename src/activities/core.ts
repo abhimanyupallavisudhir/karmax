@@ -76,7 +76,7 @@ import { authorizingAvatar, avatarAllows, avatarAuthorizationCapabilities, avata
 import { DELEGATED_PROFILE, delegatedFromParent } from '../platform/delegation.js';
 import { baseTaskAuthority, delegationReaching, taskAuthorityNow, tokenScopeOf } from '../platform/task-authority.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
-import { worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js';
+import { recordedBase, worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js';
 import { pullRequestHandle, pullRequestView, isPullRequestView, proposalCheckouts } from '../world/pr-view.js';
 import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
 import { brokerFinalizeMerge, brokerPublishBranch, brokerPushBranches, describeGitPushError, describePublishFailures,
@@ -1497,9 +1497,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const lines = listed.code === 0 ? listed.stdout.split('\n').map((line) => line.trim()) : [];
     const present = candidates.filter((ref) => lines.includes(ref));
     if (present.length) return present;
-    if (repo.baseSha) {
-      const ancestor = await world.exec('git', ['merge-base', '--is-ancestor', repo.baseSha, repo.branch], { cwd: repo.root });
-      if (ancestor.code === 0) return [repo.baseSha];
+    const baseSha = recordedBase(repo);
+    if (baseSha) {
+      const ancestor = await world.exec('git', ['merge-base', '--is-ancestor', baseSha, repo.branch], { cwd: repo.root });
+      if (ancestor.code === 0) return [baseSha];
     }
     return [base];
   }

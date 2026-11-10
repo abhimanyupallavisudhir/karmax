@@ -104,7 +104,7 @@ import { WorldRegistry } from '../world/registry.js';
 import { worldHandleForView } from '../world/resolve.js';
 import { LocalObjectStore, type ObjectStore } from '../store/objects.js';
 import { ConversationExportExpired, createCodexConversationExport, readCodexConversationExport } from '../store/conversation-exports.js';
-import type { AccessMode, AccessStatus, VaultFieldName, VaultItem } from '../autonomy/vault-items.js';
+import type { AccessMode, AccessStatus, VaultFieldName, VaultItem, VaultItemType } from '../autonomy/vault-items.js';
 import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js';
 import { newId } from '../util/id.js';
 import { DurableEventFanout, type FanoutAudience } from './fanout.js';
@@ -7704,7 +7704,7 @@ export class Gateway {
           if (refused) return this.json(res, 403, { error: refused });
           const saved = (await vault.save({
             id: b.id ? String(b.id) : undefined,
-            type: b.type,
+            type: vaultItemType(b.type),
             label: String(b.label ?? ''),
             domains,
             username: b.username ? String(b.username) : undefined,
@@ -7779,7 +7779,7 @@ export class Gateway {
             }
             saved = (await vault.save({
               id: prior?.id,
-              type: b.type,
+              type: vaultItemType(b.type),
               label: String(b.label ?? ''),
               domains: Array.isArray(b.domains) ? b.domains.map(String) : undefined,
               username: b.username ? String(b.username) : undefined,
@@ -7874,11 +7874,16 @@ export class Gateway {
         // current code computed broker-side from the stored seed.
         if (p === '/api/vault/fill' && method === 'POST') {
           const b = await this.body(req);
-          const field = String(b.field ?? 'password');
-          const item = (await findItem(b, field === 'username' ? undefined : field));
-          if (!item) return this.json(res, 200, (await missing(b, field === 'totp' ? 'totp' : 'password')));
-          if (item.type !== 'login' || !['username', 'password', 'totp'].includes(field))
-            return this.json(res, 400, { error: 'browser fill supports only login fields: username, password, totp' });
+          const asked = b.field ? String(b.field) : undefined;
+          const item = (await findItem(b, asked === 'username' ? undefined : asked ?? 'password'));
+          if (!item) return this.json(res, 200, (await missing(b, (asked && asked !== 'username' ? asked : 'password') as VaultFieldName)));
+          // A key is pasted into a page as often as a password is typed (a CI
+          // secret, a provider's settings): refusing it made agents copy keys
+          // into login items just to fill them (tavya.error 4d9a1394a8db6a67).
+          const fillable = BROWSER_FILL_FIELDS[item.type] ?? [];
+          const field = asked ?? fillable.find((f) => f !== 'username') ?? 'password';
+          if (!fillable.includes(field))
+            return this.json(res, 400, { error: `browser fill types ${Object.entries(BROWSER_FILL_FIELDS).map(([type, fields]) => `${type}: ${fields.join(', ')}`).join('; ')} — "${item.label}" is a ${item.type}` });
           if (field !== 'username' && !item.fields.includes(field as VaultFieldName)) return this.json(res, 200, (await missing(b, field as VaultFieldName, item)));
           // The page origin is checked against the item's domains; an item without
           // any cannot be typed safely, but its one-time code can still be read.
@@ -11160,6 +11165,19 @@ export class Gateway {
       res.destroy();
     }
   }
+}
+
+/** What `/api/vault/fill` may type into a page, per item type. */
+const BROWSER_FILL_FIELDS: Partial<Record<VaultItemType, string[]>> = {
+  login: ['username', 'password', 'totp'],
+  'api-key': ['secret'],
+  'ssh-key': ['privateKey'],
+};
+
+/** A request's vault item `type`: absent on an update, which keeps the stored
+ * one; anything else is checked by `VaultItems.save`. */
+function vaultItemType(value: unknown): VaultItemType | undefined {
+  return value === undefined || value === null || value === '' ? undefined : String(value) as VaultItemType;
 }
 
 /** A task's live view may be unavailable (no running workflow), and routes
