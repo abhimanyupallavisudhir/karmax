@@ -262,14 +262,20 @@ export async function setProjectWikiRemote(root: string, remote: string, credent
  * acknowledging the write. `publish` is resolved inside the repository lane so
  * its short-lived credential and the fetch/merge/push are contiguous with the
  * commit. A task-branch edit must not use this helper: it lands through the
- * task's ordinary Review/Merge path instead. */
+ * task's ordinary Review/Merge path instead.
+ *
+ * The mutation is awaited before anything is published: KarmaxApi's are async,
+ * and calling one without awaiting it published the previous commit, then left
+ * a refused edit ("an entry already exists") as a rejection nothing handled
+ * until the push had finished (tavya-error 898a8a05d25ae93e). A refused
+ * mutation is the caller's own error, never a publish failure. */
 export async function mutateAndPublishProjectWiki<T>(
   root: string,
-  mutation: () => T,
+  mutation: () => T | Promise<T>,
   publish: () => Promise<{ remote: string; credential: GitCredential } | undefined>,
 ): Promise<T> {
   return serializeProjectWikiOperation(root, async () => {
-    const result = mutation();
+    const result = await mutation();
     try {
       const target = await publish();
       if (target) await reconcileProjectWikiRemote(root, target.remote, target.credential);
