@@ -8,7 +8,7 @@ import { Store } from '../src/store/db.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE } from '../src/integrations/github-app.js';
-import { ensureProjectWikiRepository, setProjectWikiRemote } from '../src/wiki/repository.js';
+import { ensureProjectWikiRepository, mutateAndPublishProjectWiki, setProjectWikiRemote } from '../src/wiki/repository.js';
 import { paths } from '../src/config/paths.js';
 import { Gateway } from '../src/gateway/server.js';
 import { KarmaxApi } from '../src/platform/api.js';
@@ -149,6 +149,99 @@ describe('project wiki remote provisioning', () => {
       expect(credentialRequests).toEqual([
         repository.id, repository.id, repository.id, repository.id,
       ]);
+    } finally {
+      (await store.close());
+    }
+  });
+
+  /** Rejections nothing handled while `run` was in flight, after one macrotask
+   *  so Node has had its chance to report them. */
+  async function unhandledDuring(run: () => Promise<unknown>): Promise<unknown[]> {
+    const seen: unknown[] = [];
+    const listener = (reason: unknown) => { seen.push(reason); };
+    process.on('unhandledRejection', listener);
+    try {
+      await run().catch(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    } finally { process.off('unhandledRejection', listener); }
+    return seen;
+  }
+
+  it('publishes an async mutation only after it has committed, and never a refused one', async () => {
+    const root = ensureProjectWikiRepository(paths().content, 'async-mutation');
+    const bare = path.join(home, 'async-mutation.git');
+    execFileSync('git', ['init', '--bare', '-q', '-b', 'main', bare]);
+    await setProjectWikiRemote(root, bare, { env: {} });
+
+    // KarmaxApi's mutations are async (the Store is): the commit lands after an
+    // await. Publishing must wait for it, or GitHub gets the previous commit.
+    const page = await mutateAndPublishProjectWiki(root, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      fs.mkdirSync(path.join(root, 'late'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'late', 'SKILL.md'), 'late\n');
+      execFileSync('git', ['-C', root, 'add', 'late']);
+      execFileSync('git', ['-C', root, 'commit', '-q', '-m', 'late']);
+      return 'late';
+    }, async () => ({ remote: bare, credential: { env: {} } }));
+    expect(page).toBe('late');
+    expect(execFileSync('git', ['--git-dir', bare, 'show', 'main:late/SKILL.md'], { encoding: 'utf8' })).toBe('late\n');
+
+    // A refused mutation (create over an existing entry) is the caller's error,
+    // as is: no publish, not a publish failure, and never an unhandled rejection
+    // (tavya-error 898a8a05d25ae93e).
+    let published = 0;
+    let refusal: unknown;
+    const unhandled = await unhandledDuring(async () => {
+      try {
+        await mutateAndPublishProjectWiki(root, async () => {
+          await Promise.resolve();
+          throw new Error('an entry already exists at "late"');
+        }, async () => { published++; return undefined; });
+      } catch (error) { refusal = error; }
+    });
+    expect(unhandled).toEqual([]);
+    expect((refusal as Error)?.message).toBe('an entry already exists at "late"');
+    expect(published).toBe(0);
+  });
+
+  it('answers a refused interface create with its own error, unpublished and handled', async () => {
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Widgets', {}, organization.id));
+    const bare = path.join(home, 'refused-create.git');
+    execFileSync('git', ['init', '--bare', '-q', '-b', 'main', bare]);
+    const sshUrl = 'git@github.com:acme/refused-wiki.git';
+    const repository = (await store.upsertRepository({
+      organizationId: organization.id, provider: 'github', providerId: 'refused-create',
+      owner: 'acme', name: 'refused-wiki', sshUrl, defaultBranch: 'main', private: true,
+    }));
+    (await store.setProjectWikiRepository(project.id, repository.id));
+    const root = ensureProjectWikiRepository(paths().content, project.id);
+    execFileSync('git', ['-C', root, 'config', `url.${bare}.insteadOf`, sshUrl]);
+    let credentialRequests = 0;
+    const githubApp = { brokerCredentials: async () => { credentialRequests++; return { env: {} }; } };
+    const tokens = new TokenAuthority();
+    const token = (await tokens.mintPrincipal('user:owner', ['project:read', 'skill:write'],
+      project.id, 60_000, organization.id)).token;
+    const api = new KarmaxApi({ store, client: {} as any, taskQueue: 'tq', tokens,
+      contentDir: paths().content, githubApp } as any);
+    try {
+      await api.saveWikiPageResolved(token, 'project', project.id,
+        { path: 'series-concept-and-tone', content: 'First.', create: true });
+      expect(credentialRequests).toBe(1);
+
+      let refusal: unknown;
+      const unhandled = await unhandledDuring(async () => {
+        try {
+          await api.saveWikiPageResolved(token, 'project', project.id,
+            { path: 'series-concept-and-tone', content: 'Second.', create: true });
+        } catch (error) { refusal = error; }
+      });
+      expect(unhandled).toEqual([]);
+      expect((refusal as Error)?.message).toBe('an entry already exists at "series-concept-and-tone"');
+      expect(credentialRequests).toBe(1);
+      expect(execFileSync('git', ['--git-dir', bare, 'show', 'main:series-concept-and-tone/SKILL.md'],
+        { encoding: 'utf8' })).toBe('First.');
     } finally {
       (await store.close());
     }
