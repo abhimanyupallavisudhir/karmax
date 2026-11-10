@@ -155,6 +155,52 @@ OpenCode. Profiles and task parameters do not have a second “Credential
 provider” setting.
 
 
+## November 10, 2026 Claude Code upgrade audit
+
+Claude Agent SDK is now **0.3.322** (Claude Code **2.1.322**, from 0.3.319 /
+2.1.319). 2.1.320 was never released (no tag and no npm package; the SDK changelog
+names a 0.3.320 that npm also lacks), so the range is 2.1.321 and 2.1.322. The
+watcher started this run because 2.1.321 added a model. Read both changelogs,
+diffed `sdk.d.ts` (it changed only in comments), and compared the model ids,
+effort strings and message/record types compiled into both binaries.
+
+- **New model: Claude Fable 5.2** (`claude-fable-5-2`, 2.1.321): the new default
+  Fable, 1M context natively, 128K output, $8/$40 per Mtok, cache writes $10 and
+  reads $0.20 (`tier_8_40_cache_read_0_20` in the binary). tavya now offers it
+  (`CLAUDE_MODEL_PRESETS`, the console's offline list) and prices it on its own
+  (`src/scheduling/costs.ts`; Fable 5.1 keeps $10/$50). Its effort levels and
+  output cap fall out of `effort.ts`'s family/generation rule unchanged. The
+  binary also carries `claude-mythos-5-2` (same tier) without announcing it, as
+  with Mythos 5.1: it is not offered.
+- **Saved Fable 5.1 picks move to `fable`** (2.1.321): this affects only the CLI's
+  own saved setting. tavya passes the exact model id, so `claude-fable-5-1` stays
+  5.1.
+- **No new effort level, and no new transcript record type**: the
+  `"last-wins"` metadata table is unchanged. New message types are
+  `system/ui_notify` and `ui_notify_cancel`, which mods (`$.ui.notify`) push to a
+  headless host. tavya runs no mods and ignores unknown system subtypes.
+  `progress` frames gain `connector_file_progress` data.
+- **`claude -p` NFS fix** (2.1.321): losing transcript lines to a full NFS
+  export or used-up quota now exits 1 with an error, in text and json output only.
+  tavya drives stream-json through the SDK. Its own disk-full wordings
+  (`isDiskFullMessage`) are byte-identical in both binaries.
+- Unchanged for tavya: the SDK's `canUseTool` `decisionReason` and hook fixes;
+  `resume` reading `initialize` during boot (resume and fork are re-proven by
+  `harness-compatibility`); queued subagent reports sharing one model call in
+  **auto** mode (tavya runs `bypassPermissions`); `AskUserQuestion` refusing an
+  `afkTimeoutMs` input (tavya never sets it); headless sessions reloading mods in
+  `.claude/skills` on change; MCP OAuth no longer sending secrets across hosts on
+  a redirect (a security fix, though not one in a GitHub advisory); the TLS
+  `EPROTO` mid-reply fix.
+- Verified: typecheck; the agent suites (366 passed), `harness-compatibility` on
+  the real 2.1.322 binary (tools, effort, resume, fork, metering incl.
+  sub-agents, mid-turn replay); the live Claude turns: Messages API, Agent SDK on
+  a subscription, native fork, the permission seam and a whole `live-agent` task.
+  Results were the same as on 2.1.319: with `ANTHROPIC_API_KEY` set, native fork
+  fails only on the documented Messages-API fallback. The real `/usage` panel
+  still parses. panagent's tests passed with its native Claude tests on 2.1.322,
+  and 11 real 2.1.322 sessions converted without a warning.
+
 ## November 7, 2026 Claude Code upgrade audit
 
 Claude Agent SDK is now **0.3.319** (Claude Code **2.1.319**, from 0.3.318 /

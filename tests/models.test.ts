@@ -34,6 +34,13 @@ describe('provider model discovery', () => {
     }
   });
 
+  // Claude Code 2.1.321: the new default Fable.
+  it('keeps Fable 5.2 selectable when discovery is partial or unavailable', () => {
+    for (const discovered of [[], [{ id: 'sonnet' }]]) {
+      expect(claudeModelCatalog(discovered)).toContainEqual({ id: 'claude-fable-5-2', displayName: 'Fable 5.2' });
+    }
+  });
+
   // Claude Code 2.1.284 / 2.1.293: the new default Sonnet and Haiku.
   it('keeps Sonnet 5.5 and Haiku 5.5 selectable when discovery is partial or unavailable', () => {
     for (const discovered of [[], [{ id: 'sonnet' }]]) {
