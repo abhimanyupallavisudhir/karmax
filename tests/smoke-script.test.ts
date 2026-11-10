@@ -79,6 +79,12 @@ describe('smoke suite', () => {
     expect(authed.map((call) => `${call.method} ${call.route}`)).toEqual(expect.arrayContaining([
       'POST /api/projects/proj_smoke/tasks', 'POST /api/tasks/task_smoke/signal', 'POST /api/tasks/task_smoke/archive']));
     expect(calls.find((call) => call.route === '/api/tasks/task_smoke/signal')?.body).toEqual({ signal: 'cancel' });
+    const params = { 'agent:do': { provider: 'claude', model: 'claude-haiku-5-5', mcpConnections: [] } };
+    const named = fakeTavya();
+    expect(failures(await runSmoke({ url: 'https://s.example', task: true, fetch: named.fetchImpl },
+      { ...env, SMOKE_TASK_PARAMS: JSON.stringify(params) }, quiet))).toEqual([]);
+    expect(named.calls.find((call) => call.route === '/api/projects/proj_smoke/tasks')?.body.params).toEqual(params);
+    expect(calls.find((call) => call.route === '/api/projects/proj_smoke/tasks')?.body.params).toBeUndefined();
   });
 
   it('fails a task that never answers, and one asked for without credentials', async () => {

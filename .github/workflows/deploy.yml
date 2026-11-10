@@ -181,6 +181,7 @@ jobs:
           URL: ${{ env.DEPLOY_ENVIRONMENT == 'staging' && vars.STAGING_URL || vars.PRODUCTION_URL || 'https://tavya.io' }}
           SMOKE_TOKEN: ${{ env.DEPLOY_ENVIRONMENT == 'staging' && secrets.STAGING_SMOKE_TOKEN || secrets.PRODUCTION_SMOKE_TOKEN }}
           SMOKE_PROJECT_ID: ${{ env.DEPLOY_ENVIRONMENT == 'staging' && vars.STAGING_SMOKE_PROJECT_ID || vars.PRODUCTION_SMOKE_PROJECT_ID }}
+          SMOKE_TASK_PARAMS: ${{ env.DEPLOY_ENVIRONMENT == 'staging' && vars.STAGING_SMOKE_TASK_PARAMS || vars.PRODUCTION_SMOKE_TASK_PARAMS }}
         run: |
           # A real task too, wherever a smoke account is configured.
           if [ -n "$SMOKE_TOKEN" ] && [ -n "$SMOKE_PROJECT_ID" ]; then task=--task; else task=; fi

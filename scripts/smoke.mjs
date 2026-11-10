@@ -11,7 +11,8 @@
 // show in a browser: each script is parsed here), the public docs and the API.
 // With SMOKE_TOKEN (a personal token of a member of the smoke project) and
 // SMOKE_PROJECT_ID it also runs a real task end to end: a world on the
-// project's computer, one turn of the project's agent, which must answer a sum
+// project's computer, one turn of the project's agent (or the agent and
+// computer SMOKE_TASK_PARAMS names, as task params JSON), which must answer a sum
 // it was not told. The task is then cancelled and archived.
 //
 // Dependency-free on purpose: CI runs it from a bare checkout.
@@ -65,6 +66,11 @@ export async function runSmoke(options, env = process.env, log = console.log) {
   const fetchImpl = options.fetch ?? fetch;
   const token = env.SMOKE_TOKEN?.trim();
   const projectId = env.SMOKE_PROJECT_ID?.trim();
+  // The task's parameters, e.g. a cheap model without browser tools; else the project's defaults.
+  let taskParams;
+  if (env.SMOKE_TASK_PARAMS?.trim()) {
+    try { taskParams = JSON.parse(env.SMOKE_TASK_PARAMS); } catch { fail('SMOKE_TASK_PARAMS is not JSON'); }
+  }
   const results = [];
   const step = async (name, run) => {
     const started = Date.now();
@@ -143,6 +149,7 @@ export async function runSmoke(options, env = process.env, log = console.log) {
       const created = await request('POST', `/api/projects/${encodeURIComponent(projectId)}/tasks`, {
         title: `Smoke check ${new Date().toISOString().slice(0, 16)}Z${options.revision ? ` ${options.revision.slice(0, 8)}` : ''}`,
         prompt: `This is an automated check of tavya. Reply with only the value of ${a} + ${b}, then end your turn. Do not use any tools.`,
+        ...(taskParams ? { params: taskParams } : {}),
       }, true);
       expectStatus(created, 200, 'creating the task');
       const taskId = created.json().id;
