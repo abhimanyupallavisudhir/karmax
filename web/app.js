@@ -26692,8 +26692,9 @@ async function wireErrorReportsCard() {
 const ROLLOUT_STAGES = [['off', 'Off'], ['early', 'Early access'], ['on', 'Everyone']];
 function earlyAccessMarkup(view) {
   const count = Number(view.earlyAccessOrganizations || 0);
-  const audience = `<div class="setting-row setting-muted early-access-audience">${count} organization${count === 1 ? '' : 's'} opted in</div>`;
-  if (!view.flags?.length) return `<div class="setting-rows"><div class="setting-row setting-muted">Nothing is rolling out</div>${audience}</div>`;
+  const opted = `${count} organization${count === 1 ? '' : 's'} opted in`;
+  if (!view.flags?.length) return `<div class="setting-rows"><div class="setting-row setting-muted">Nothing is rolling out · ${opted}</div></div>`;
+  const audience = `<div class="setting-row setting-muted early-access-audience">${opted}</div>`;
   return `<div class="setting-rows">${view.flags.map((flag) => `<div class="setting-row"><span class="setting-label">${esc(flag.title)} ${policyTip(flag.description)}</span>
     <span class="setting-value"><select data-feature-flag="${esc(flag.name)}" aria-label="${esc(flag.title)}" ${view.canManage ? '' : 'disabled'}>${ROLLOUT_STAGES.map(([stage, label]) =>
       `<option value="${stage}" ${flag.stage === stage ? 'selected' : ''}>${label}</option>`).join('')}</select></span></div>`).join('')}${audience}</div>`;
