@@ -30,3 +30,15 @@ export function failureCause(input: { types?: string[]; stage?: string; credenti
   if (input.stage === 'setup') return 'project';
   return 'task';
 }
+
+/** How a stage's escalation begins when its provider account's limit stayed
+ * full through its whole wait for a machine (software-dev withResolve,
+ * failures.ts CAPACITY_WAIT_LIMIT_MS). Only the account's other machines
+ * stopping, a smaller Computer or a higher limit frees it: people's to choose,
+ * never a defect of tavya's, so it is not reported as an error
+ * (activities/core.ts reportEscalation). */
+export const NO_MACHINE_FOR_A_DAY = 'No machine for a day';
+
+export function isCapacityEscalation(error: string | undefined): boolean {
+  return typeof error === 'string' && error.startsWith(NO_MACHINE_FOR_A_DAY);
+}

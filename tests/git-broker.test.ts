@@ -5,7 +5,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { brokerEnrollRepository, brokerFinalizeMerge, brokerImportTaskBranch, brokerPublishBranch, brokerPushBranches, brokerRefreshUpstream,
-  isGithubPushProtectionRejection } from '../src/world/git-broker.js';
+  isBranchContentRejection, isGithubPushProtectionRejection } from '../src/world/git-broker.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
 import { acquireFileLock } from '../src/util/file-lock.js';
 import { mirroredClone } from '../src/world/git-mirror.js';
@@ -489,6 +489,50 @@ describe('cloud Git broker', () => {
       expect(error).toContain('https://github.com/acme/app/security/secret-scanning/unblock-secret/2rXq3StripeExample');
       expect(error).not.toMatch(/non-fast-forward|could not inspect|advanced/i);
       expect(isGithubPushProtectionRejection(error)).toBe(true);
+      expect(await remoteTip()).toBe('');
+    });
+
+    // pramana (2026-11-09): a branch adding 1.2 GB of data was refused by the
+    // 1 GiB handoff limit and stopped its task for a person as an error. Only
+    // its agent can take the data out, so the account must say what to take.
+    it('names the largest files of a branch too large to hand off, as content its author must change', async () => {
+      const { world, env, remoteTip } = await refusingRemote('karmax-broker-too-large-');
+      await world.writeFile('data/scrape.csv', crypto.randomBytes(256 * 1024).toString('hex'));
+      await world.writeFile('notes.md', 'small\n');
+      await gitOrThrow(world.handle.root, ['add', '-A']);
+      await gitOrThrow(world.handle.root, ['commit', '-q', '-m', 'data']);
+      const previous = process.env.KARMAX_MAX_GIT_BUNDLE_MB;
+      process.env.KARMAX_MAX_GIT_BUNDLE_MB = '0.1';
+      try {
+        const result = await brokerPublishBranch(world, env);
+        expect(result).toMatchObject({ pushed: [], skipped: ['source'] });
+        const error = result.errors!.source!;
+        expect(error).toMatch(/Branch "tavya\/refused" of "source" is too large to publish: its commits add [\d.]+ MB of Git objects, more than the 0\.1 MB/);
+        expect(error).toMatch(/Largest files it adds: data\/scrape\.csv \(0\.5 MB\), notes\.md \(0\.1 MB\)/);
+        expect(error).toMatch(/remove those files from every commit/);
+        expect(result.unreachable).toBeUndefined();
+        expect(isBranchContentRejection(error)).toBe(true);
+      } finally {
+        if (previous === undefined) delete process.env.KARMAX_MAX_GIT_BUNDLE_MB;
+        else process.env.KARMAX_MAX_GIT_BUNDLE_MB = previous;
+      }
+      expect(await remoteTip()).toBe('');
+    });
+
+    it("reads GitHub's large-file refusal as content its author must change", async () => {
+      const { world, env, commit, refuse, remoteTip } = await refusingRemote('karmax-broker-gh001-');
+      await commit('big.bin');
+      refuse([
+        'error: Trace: 2c4d9bd3a1f2e3c4b5a6',
+        'error: See https://gh.io/lfs for more information.',
+        "error: File data/big.bin is 150.00 MB; this exceeds GitHub's file size limit of 100.00 MB",
+        'error: GH001: Large files detected. You may want to try Git Large File Storage - https://git-lfs.github.com.',
+      ].join('\n'));
+      const result = await brokerPublishBranch(world, env);
+      const error = result.errors!.source!;
+      expect(error).toMatch(/is too large to publish: GitHub refused it: File data\/big\.bin is 150\.00 MB, over GitHub's 100 MB limit for one file/);
+      expect(isBranchContentRejection(error)).toBe(true);
+      expect(isBranchContentRejection('GitHub refused the push of "x" (pre-receive hook declined). GitHub said: Changes must be made through a pull request.')).toBe(false);
       expect(await remoteTip()).toBe('');
     });
 
