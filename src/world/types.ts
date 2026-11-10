@@ -75,7 +75,8 @@ export interface WorldRepo {
   /** Whether `target` is an explicit or resolved per-repository policy. A non-pinned target
    * is retained for inspection but merge receives the task's live target. */
   targetPinned?: boolean;
-  /** Immutable commit from which this attempt started. */
+  /** Immutable commit from which this attempt started. Read it through
+   * {@link recordedBase}: checkpoints once saved a base's name here. */
   baseSha?: string;
   /** Setup corrected a missing base; retained for durable task metadata and notices. */
   branchAdjustment?: BranchAdjustment;
@@ -228,6 +229,17 @@ export interface WorldCheckoutSpec {
  * source of truth for "which repos does this world contain" across merge,
  * destroy, and prompt assembly.
  */
+/** The commit a checkout was provisioned from, if one is recorded. Before
+ * tavya.error 958f82cb12d718a9 a checkpoint of a checkout without one saved its
+ * base's NAME instead ("master"), and a restore put it into the world. A name
+ * is no custody anchor: it means a different commit in each repository and
+ * moves as work lands, so a guard on it refused every publication once
+ * anything landed on the base. Such a record says only that the provisioned
+ * commit is unknown. */
+export function recordedBase(repo: Pick<WorldRepo, 'baseSha'>): string | undefined {
+  return repo.baseSha && /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(repo.baseSha) ? repo.baseSha : undefined;
+}
+
 export function worldRepos(handle: WorldHandle): WorldRepo[] {
   if (handle.repos?.length) return handle.repos;
   if (handle.repo) {
