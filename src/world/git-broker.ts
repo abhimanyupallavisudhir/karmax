@@ -4,7 +4,8 @@ import { conflictMarkerFiles as scanConflictMarkers } from './conflict-markers.j
 import { timed } from '../timing/index.js';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
-import { createGitBundle, knownGitCommits, downloadGitBundle, uploadGitBundle, type GitBundle } from './git-transfer.js';
+import { createGitBundle, knownGitCommits, downloadGitBundle, uploadGitBundle, GitBundleTooLarge, largestAddedFiles,
+  type AddedFile, type GitBundle } from './git-transfer.js';
 import { validGitBranch } from '../util/git-ref.js';
 import os from 'node:os';
 import path from 'node:path';
@@ -231,6 +232,10 @@ export function describePublishFailures(result: GitBrokerPublishResult): string 
 const NON_FAST_FORWARD = /non-fast-forward|fetch first|stale info/i;
 const REMOTE_REJECTED = /\[remote rejected\][^\n(]*\(([^\n]+)\)/;
 const PUSH_PROTECTION = /\bGH0(?:09|13)\b[\s\S]*(?:push protection|secrets detected)|GitHub push protection refused/i;
+/** GitHub's own size refusals: a file over 100 MB (GH001) or a push over 2 GB. */
+const GITHUB_TOO_LARGE = /\bGH001\b|exceeds GitHub's file size limit|pack exceeds maximum allowed size/i;
+/** The phrase every account of a branch too large to publish carries. */
+const TOO_LARGE = /\bis too large to publish\b/;
 const GIT_AUTHORIZATION = /authentication failed|permission denied|could not read from remote repository|repository not found|http basic: access denied|403\b|401\b/i;
 
 /** Turn Git's provider prose into errors that identify the failing safety layer.
@@ -240,6 +245,7 @@ const GIT_AUTHORIZATION = /authentication failed|permission denied|could not rea
 export function describeGitPushError(repo: WorldRepo, detail: string): string {
   const compact = detail.trim().replace(/\s+/g, ' ').slice(0, 500);
   if (PUSH_PROTECTION.test(detail)) return describePushProtection(repo, detail);
+  if (GITHUB_TOO_LARGE.test(detail)) return describeTooLarge(repo, githubSizeRefusal(detail));
   const refused = REMOTE_REJECTED.exec(detail);
   if (refused) {
     const said = remoteLines(detail).filter(line => /^error:/i.test(line))
@@ -267,6 +273,38 @@ export function isNonFastForwardPush(detail: string): boolean {
  * describeGitPushError's account of it. Only rewriting the branch fixes it. */
 export function isGithubPushProtectionRejection(detail: string): boolean {
   return PUSH_PROTECTION.test(detail);
+}
+
+/** A push refused for what the branch contains — a secret, or more data than
+ * may be published (GitHub's file and push limits, this installation's
+ * handoff limit) — in Git's output or in the accounts below. No retry,
+ * credential or person fixes it: only whoever writes the branch, by taking
+ * that content out of every commit that adds it. */
+export function isBranchContentRejection(detail: string): boolean {
+  return PUSH_PROTECTION.test(detail) || GITHUB_TOO_LARGE.test(detail) || TOO_LARGE.test(detail);
+}
+
+function megabytes(bytes: number): string {
+  return bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(1)} GB` : `${Math.max(0.1, bytes / 1024 ** 2).toFixed(1)} MB`;
+}
+
+/** GitHub's words about which files were too large ("File x is 150.00 MB; …"). */
+function githubSizeRefusal(detail: string): string {
+  const files = remoteLines(detail).map(line => line.replace(/^error:\s*/i, ''))
+    .filter(line => /^File .+ is [\d.]+ [KMG]B\b/.test(line)).map(line => line.replace(/;.*$/, ''));
+  const pack = /pack exceeds maximum allowed size[^\n]*/i.exec(detail)?.[0];
+  return files.length ? `GitHub refused it: ${files.slice(0, 5).join('; ')}${files.length > 5 ? `; and ${files.length - 5} more` : ''}, `
+    + 'over GitHub\'s 100 MB limit for one file'
+    : `GitHub refused it: ${pack ?? 'large files detected'}`;
+}
+
+/** What the agent needs to make a branch small enough to publish. */
+function describeTooLarge(repo: WorldRepo, why: string, largest: AddedFile[] = []): string {
+  return `Branch "${repo.branch}" of "${repo.name}" is too large to publish: ${why}.`
+    + `${largest.length ? ` Largest files it adds: ${largest.map(file => `${file.path} (${megabytes(file.bytes)})`).join(', ')}.` : ''}`
+    + ' Large data does not belong in Git: remove those files from every commit that adds them (rebase or amend the task branch;'
+    + ' deleting them in a new commit is not enough), ignore them in .gitignore, and keep data as project data'
+    + ' (propose_project_resource) or regenerate it; then publish again. Reconnecting GitHub or retrying will not fix this.';
 }
 
 function remoteLines(detail: string): string[] {
@@ -883,7 +921,17 @@ async function importWorldBranch(world: World, repo: WorldRepo, receiver: string
     const bundle = await createGitBundle(args => world.exec('git', args,
       { cwd: repo.root, timeoutMs: 10 * 60_000 }), `refs/heads/${repo.branch}`, transferName, known);
     const bundlePath = path.join(temp, 'world.bundle');
-    if (bundle.path) await downloadGitBundle(world, transferRel, bundlePath);
+    if (bundle.path) {
+      try { await downloadGitBundle(world, transferRel, bundlePath); }
+      catch (error) {
+        if (!(error instanceof GitBundleTooLarge)) throw error;
+        const largest = await largestAddedFiles(args => world.exec('git', args, { cwd: repo.root, timeoutMs: 5 * 60_000 }),
+          (script, args) => world.exec('sh', ['-c', script, 'sh', ...args], { cwd: repo.root, timeoutMs: 5 * 60_000 }),
+          bundle.sha, known);
+        throw new Error(describeTooLarge(repo, `its commits add ${megabytes(error.bytes)} of Git objects, `
+          + `more than the ${megabytes(error.limitBytes)} a branch may add at once`, largest), { cause: error });
+      }
+    }
     const fetched = await git(receiver, ['fetch', bundle.path ? bundlePath : '.', `+${bundle.ref}:${destinationRef}`],
       { timeoutMs: 10 * 60_000 });
     if (fetched.code !== 0) throw new Error(`bundle import failed: ${fetched.stderr || fetched.stdout}`);

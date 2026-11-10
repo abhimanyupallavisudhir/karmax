@@ -60,6 +60,17 @@ export async function createGitBundle(run: GitRunner, branch: string, file: stri
   }
 }
 
+/** A Git handoff larger than this installation moves at once
+ * (`KARMAX_MAX_GIT_BUNDLE_MB`, 1 GiB when hosted). The bundle holds only the
+ * objects the receiver lacks, so for a branch leaving a world it measures what
+ * the branch's own commits add: content its author must change, not an outage. */
+export class GitBundleTooLarge extends Error {
+  constructor(readonly bytes: number, readonly limitBytes: number) {
+    super(`Git bundle (${bytes} bytes) exceeds configured ${limitBytes / (1024 * 1024)} MiB policy`);
+    this.name = 'GitBundleTooLarge';
+  }
+}
+
 function checkSize(bytes: number): void {
   if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error('Invalid Git bundle size');
   const configured = process.env.KARMAX_MAX_GIT_BUNDLE_MB
@@ -67,8 +78,31 @@ function checkSize(bytes: number): void {
   if (configured === undefined) return;
   const limit = Number(configured);
   if (!Number.isFinite(limit) || limit <= 0) throw new Error('KARMAX_MAX_GIT_BUNDLE_MB must be a positive number');
-  if (bytes > limit * 1024 * 1024)
-    throw new Error(`Git bundle (${bytes} bytes) exceeds configured ${limit} MiB policy`);
+  if (bytes > limit * 1024 * 1024) throw new GitBundleTooLarge(bytes, limit * 1024 * 1024);
+}
+
+export interface AddedFile { path: string; bytes: number }
+export type ShellRunner = (script: string, args: string[]) => Promise<ExecResult>;
+
+/** The largest files `tip` adds over `known` (the receiver's commits), each
+ * path once at its largest version: what to take out of a branch too large to
+ * move. One pipeline where the repository is; best effort (empty on failure). */
+export async function largestAddedFiles(run: GitRunner, shell: ShellRunner, tip: string, known: string[], count = 5): Promise<AddedFile[]> {
+  try {
+    const sha = await gitTransferCheck(run(['rev-parse', '--verify', `${tip}^{commit}`]));
+    if (!oid.test(sha)) return [];
+    const exclusions = (await presentCommits(run, known)).map(commit => `^${commit}`);
+    // Only literal object ids reach the script, as positional arguments.
+    const listed = await shell('git rev-list --objects "$@" | git cat-file --batch-check=\'%(objecttype) %(objectsize) %(rest)\' '
+      + '| sed -n \'s/^blob //p\' | sort -k1,1nr | head -n 200', [sha, ...exclusions]);
+    if (listed.code !== 0) return [];
+    const largest = new Map<string, number>();
+    for (const line of listed.stdout.split('\n')) {
+      const match = /^(\d+) (.+)$/.exec(line);
+      if (match && !largest.has(match[2]!)) largest.set(match[2]!, Number(match[1]));
+    }
+    return [...largest].slice(0, count).map(([path, bytes]) => ({ path, bytes }));
+  } catch { return []; }
 }
 
 export async function downloadGitBundle(world: World, relative: string, destination: string, signal = activitySignal()): Promise<void> {

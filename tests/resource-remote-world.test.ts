@@ -18,10 +18,11 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
-import { SYSTEM_JOB_ROOT, listJobs } from '../src/world/jobs.js';
+import { SYSTEM_JOB_ROOT, jobStatuses, listJobs } from '../src/world/jobs.js';
 import { RESTIC_VERSION } from '../src/world/restic.js';
 import { ensureIdentity, gitOrThrow } from '../src/world/git.js';
 import type { World } from '../src/world/types.js';
+import { SetupClock } from '../src/world/setup-clock.js';
 
 /** Each test runs real restic several times, as jobs in worlds: ~10-25 s on a
  * 2-CPU host, and CI runners are up to twice as slow. */
@@ -499,4 +500,58 @@ it('fails the leases of resources it never restored when one restore fails', asy
     .toEqual([['world.resource-restoring', 0], ['world.resource-restored', 0], ['world.resource-restoring', 1]]);
   expect(fs.existsSync(path.join(world.handle.root, 'data/files/0.json'))).toBe(true);
   expect(fs.existsSync(path.join(world.handle.root, 'data/files/2.json'))).toBe(false);
+}, REAL_RESTIC_MS);
+
+/** Put `script` in front of every `restic restore` the world runs, once restic is installed there. */
+function shimResticRestore(world: World, script: string) {
+  const bin = path.join(world.handle.root, '.karmax-injection/bin');
+  const name = `restic-${RESTIC_VERSION}`;
+  const timer = setInterval(() => {
+    if (!fs.existsSync(path.join(bin, name)) || fs.existsSync(path.join(bin, `.real-${name}`))) return;
+    fs.renameSync(path.join(bin, name), path.join(bin, `.real-${name}`));
+    fs.writeFileSync(path.join(bin, name), `#!/bin/bash\nif [ "$1" = restore ]; then\n${script}\nfi\nexec '${path.join(bin, `.real-${name}`)}' "$@"\n`, { mode: 0o755 });
+  }, 2);
+  cleanups.push(() => clearInterval(timer));
+}
+
+const status = (bytes: number) => `{"message_type":"status","percent_done":${bytes / 1000},"total_files":1,"files_restored":0,"total_bytes":1000,"bytes_restored":${bytes}}`;
+
+// pramana #191 (2026-11-09): world setup restores a resource as long as the
+// restore keeps moving (setup-clock.ts), so it must see the restore move: the
+// bytes and files each restic says it has restored, not only starts and ends.
+it('tells world setup each time a restore in a remote world moves', async () => {
+  const f = await fixture();
+  const [file] = await singleFiles(f, 1);
+  const { task, world } = await f.sandbox('Moving restore');
+  shimResticRestore(world, `echo '${status(100)}'; sleep 1; echo '${status(400)}'; sleep 1; echo '${status(900)}'; sleep 1`);
+  vi.stubEnv('KARMAX_RESTORE_PROGRESS_MS', '100');
+  let moves = 0;
+  const clock = { offClock: <T>(work: (progress: () => void) => Promise<T>) => work(() => { moves++; }) };
+
+  world.handle = await f.resources.materialize(f.project.id, task.id, world, 1, {}, { clock });
+
+  expect(fs.readFileSync(path.join(world.handle.root, (file!.attachment.target as { path: string }).path))).toEqual(file!.data);
+  // Its start and end, and at least two of its three status lines.
+  expect(moves).toBeGreaterThanOrEqual(4);
+}, REAL_RESTIC_MS);
+
+it('stops a restore that stops moving, and fails its lease', async () => {
+  const f = await fixture();
+  const [file] = await singleFiles(f, 1);
+  const { task, world } = await f.sandbox('Stuck restore');
+  shimResticRestore(world, `echo '${status(100)}'; exec sleep 600`);
+  vi.stubEnv('KARMAX_RESTORE_PROGRESS_MS', '100');
+  const clock = new SetupClock({ stallMs: 3_000, tickMs: 50 });
+  cleanups.push(() => clock.dispose());
+
+  await expect(f.resources.materialize(f.project.id, task.id, world, 1, {}, { signal: clock.signal, clock }))
+    .rejects.toThrow(/aborted|made no progress/i);
+
+  expect(clock.expired?.message).toMatch(/restoring the project's data made no progress/);
+  // The job in the world, its restic included, is stopped.
+  const jobs = fs.readdirSync(path.join(world.handle.root, SYSTEM_JOB_ROOT));
+  expect(jobs.length).toBeGreaterThan(0);
+  for (const status of await jobStatuses(world, jobs, { root: SYSTEM_JOB_ROOT })) expect(status.state).not.toBe('running');
+  const lease = (await f.store.listResourceLeases(world.handle.id)).find((l) => l.attachmentId === file!.attachment.id);
+  expect(lease?.state).toBe('failed');
 }, REAL_RESTIC_MS);

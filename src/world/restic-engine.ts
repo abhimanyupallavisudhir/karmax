@@ -171,6 +171,16 @@ const RESTORE_CONNECTIONS = 16;
  * key (restic-keys.ts) takes ~27 MB and next to no CPU; a world restoring
  * through the slow key takes ~57 MB and ~0.4 s of CPU each. */
 const WORLD_RESTORES_AT_ONCE = 16;
+/** How often world setup reads how far its restores have got (restoreMany). */
+const RESTORE_PROGRESS_MS = 30_000;
+/** {@link RESTORE_PROGRESS_MS}, or `KARMAX_RESTORE_PROGRESS_MS` (tests). */
+function restoreProgressMs(): number {
+  const configured = Number(process.env.KARMAX_RESTORE_PROGRESS_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : RESTORE_PROGRESS_MS;
+}
+/** restic writes a status line about six times a second with --json; one
+ * every 5 s says as much to a reader every 30 s, in a fraction of the file. */
+const RESTORE_STATUS_FPS = '0.2';
 /** {@link WORLD_RESTORES_AT_ONCE}, or `KARMAX_WORLD_RESTORES_AT_ONCE` (tests). */
 function worldRestoresAtOnce(): number {
   const configured = Number(process.env.KARMAX_WORLD_RESTORES_AT_ONCE);
@@ -347,21 +357,24 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
    * clock) and `finished` how long it took, measured on a clock that never
    * goes back, so its end is never before its start. After a failure no
    * further item starts, the ones running finish, and the first failure is
-   * thrown.
+   * thrown. `progress` is told whenever a restore moves (starts, restores
+   * more bytes or files, ends): world setup gives restoring as long as it
+   * keeps moving (setup-clock.ts).
    */
   async restoreMany(world: World, items: RestoreItem[], options: { key: string; hostConcurrency: number;
     checkContinue?: () => Promise<void>; started(index: number, at: number): Promise<void>;
-    finished(index: number, tookMs: number, error?: Error): Promise<void> }): Promise<void> {
+    finished(index: number, tookMs: number, error?: Error): Promise<void>; progress?: () => void }): Promise<void> {
     if (!items.length) return;
     if (!isRemoteWorldKind(world.handle.kind)) {
       await forEachConcurrent(items.map((item, index) => ({ item, index })), async ({ item, index }) => {
         await options.checkContinue?.();
         await options.started(index, Date.now());
+        options.progress?.();
         const began = performance.now();
         try {
           for (const [n, snapshot] of item.snapshots.entries())
             await this.restore({ world, path: item.path, file: item.file }, item.repository, snapshot,
-              { key: `${options.key}:${index}:${n}`, checkContinue: options.checkContinue });
+              { key: `${options.key}:${index}:${n}`, checkContinue: options.checkContinue, onProgress: () => options.progress?.() });
           if (item.readOnly) {
             const made = await world.exec('bash', ['-c', 'test ! -e "$1" || chmod -R a-w -- "$1"', 'read-only', item.path], { cwd: world.handle.root });
             if (made.code !== 0) throw new Error(`could not make ${item.path} read-only: ${made.stderr.trim()}`);
@@ -393,9 +406,27 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     if (written.code !== 0) throw new Error(`could not prepare the restore: ${(written.stderr || written.stdout).trim().slice(0, 300)}`);
     const command = `bash -c ${quote(RESTORE_MANY)} restore-many ${quote(dir)} ${quote(binary)} ${worldRestoresAtOnce()} ${RESTORE_CONNECTIONS}`;
     const { job, forget } = await this.worldJob(world, options.key, command,
-      async () => ({ RESTIC_CACHE_DIR: path.posix.join(world.handle.root, CACHE_DIR) }));
+      async () => ({ RESTIC_CACHE_DIR: path.posix.join(world.handle.root, CACHE_DIR), RESTIC_PROGRESS_FPS: RESTORE_STATUS_FPS }));
     const started = new Set<number>();
+    const ended = new Set<number>();
     const failures = new Map<number, string>();
+    // How far each running restore has got (bytes plus files), from the last
+    // status line its restic wrote: read every RESTORE_PROGRESS_MS, one command.
+    const reached = new Map<number, number>();
+    let progressRead = performance.now();
+    const readProgress = async () => {
+      progressRead = performance.now();
+      const read = await world.exec('bash', ['-c', READ_RESTORE_PROGRESS, 'restore-progress', dir], { cwd: world.handle.root, timeoutMs: 30_000 })
+        .catch(() => undefined);
+      for (const line of read?.code === 0 ? read.stdout.split('\n') : []) {
+        const match = /^(\d+) (\{.*)$/.exec(line);
+        const status = match ? progressOf(match[2]!) : undefined;
+        if (!status) continue;
+        const i = Number(match![1]);
+        const value = status.bytes + status.files;
+        if (value > (reached.get(i) ?? -1)) { reached.set(i, value); options.progress?.(); }
+      }
+    };
     let first: Error | undefined;
     // The world's clock to this host's, measured once (each poll's reading
     // also carries that poll's round trip), for when each item started. When it
@@ -417,9 +448,11 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
           const [what, index, value, code] = line.split(' ');
           const i = Number(index);
           if (!Number.isInteger(i) || i < 0 || i >= items.length) continue;
-          if (what === 'start' && !started.has(i)) { started.add(i); await options.started(i, Number(value) + shift); }
+          if (what === 'start' && !started.has(i)) { started.add(i); options.progress?.(); await options.started(i, Number(value) + shift); }
           else if (what === 'error') failures.set(i, Buffer.from(value ?? '', 'base64').toString('utf8'));
           else if (what === 'done' && started.has(i)) {
+            ended.add(i);
+            options.progress?.();
             const failed = Number(code) !== 0
               ? resticFailure({ code: Number(code), stdout: failures.get(i) ?? '', stderr: failures.get(i) ?? '' }, 'restoring the resource') : undefined;
             first ??= failed;
@@ -436,6 +469,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
           await forget();
           throw new Error('restic stopped without finishing (the sandbox was restarted); it resumes from what it stored when retried');
         }
+        if (options.progress && started.size > ended.size && performance.now() - progressRead >= restoreProgressMs()) await readProgress();
         await new Promise((resolve) => setTimeout(resolve, wait));
       }
     } catch (error) {
@@ -1267,6 +1301,10 @@ const RESTORE_MANY = [
   'wait',
   '[ ! -e "$d/failed" ]',
 ].join('\n');
+
+/** Each running restore of {@link RESTORE_MANY} (`$1/<index>.out`, restic's
+ * output) as `<index> <its last line>`. */
+const READ_RESTORE_PROGRESS = `for f in "$1"/*.out; do [ -e "$f" ] || continue; n=\${f##*/}; printf '%s ' "\${n%.out}"; tail -n 1 -- "$f"; echo; done`;
 
 /** Move every entry of `$1` that `$2` lacks into it, descending into folders
  * both have: what is already in `$2` stays as it is. */
