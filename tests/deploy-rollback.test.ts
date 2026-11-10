@@ -9,7 +9,8 @@ const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 const operator = fs.readFileSync(new URL('../deploy/karmax', import.meta.url), 'utf8');
 
-function update(previousEpoch: string | undefined, targetEpoch: string, ready = false, failure = '', flags: string[] = [], env = '') {
+function update(previousEpoch: string | undefined, targetEpoch: string, ready = false, failure = '', flags: string[] = [], env = '',
+  imageLabel?: string) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-rollback-')); roots.push(root);
   const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   git('init', '-q', '-b', 'master');
@@ -40,6 +41,16 @@ dc() {
   case "$*" in *psql*) [ "${failure}" != role ]; return ;; esac
   [ "${failure}" != build ] || [ "$*" != "build --pull app" ]
 }
+# Release images: the running app's image id, the label CI wrote, tagging.
+docker() {
+  printf 'docker %s\\n' "$*" >> "$ROOT_DIR/images"
+  case "$*" in
+    "image inspect --format {{.Id}} karmax-app") echo sha256:running ;;
+    *"org.opencontainers.image.revision"*) echo "${imageLabel ?? '$TARGET_SHA'}" ;;
+    "image inspect "*) [ "${failure}" != missing-image ] ;;
+    pull*) return 1 ;;
+  esac
+}
 cmd_backup_candidate() { destination="$DEPLOY_DIR/backups/fixture"; mkdir -p "$destination"; [ "${failure}" != backup ]; }
 ready_calls=0
 wait_ready() { ready_calls=$((ready_calls + 1)); [ "${ready ? '1' : '0'}" = 1 ] || [ "$ready_calls" -gt 1 ]; }
@@ -56,9 +67,12 @@ cmd_update "$@"
 `;
   const file = path.join(root, 'deploy/fixture-updater'); fs.writeFileSync(file, script);
   const after = flags[0] === '--after';
-  const result = spawnSync('sh', [file, ...(after ? [target, ...flags.slice(1)] : [...flags, target])], { cwd: root, encoding: 'utf8' });
-  const operations = fs.existsSync(path.join(root, 'operations')) ? fs.readFileSync(path.join(root, 'operations'), 'utf8') : '';
-  return { ...result, operations, head: git('rev-parse', 'HEAD'), previous, target,
+  const result = spawnSync('sh', [file, ...(after ? [target, ...flags.slice(1)] : [...flags, target])], { cwd: root, encoding: 'utf8',
+    env: { ...process.env, TARGET_SHA: target } });
+  const read = (name: string) => fs.existsSync(path.join(root, name)) ? fs.readFileSync(path.join(root, name), 'utf8') : '';
+  const operations = read('operations');
+  return { ...result, operations, images: read('images'), releaseRecord: read('deploy/.release-image').trim(),
+    head: git('rev-parse', 'HEAD'), previous, target,
     env: fs.readFileSync(path.join(root, 'deploy/.turnkey.env'), 'utf8') };
 }
 
@@ -248,4 +262,43 @@ it('leaves a healthy app running when only the edge breaks across data epochs', 
   expect(result.stderr).toContain('app left running');
   expect(result.operations).not.toContain('stop app');
   expect(result.head).toBe(result.target);
+});
+
+// Build once, deploy everywhere: CI's image for the commit runs instead of a
+// build here, and a rollback re-tags what ran before instead of rebuilding it.
+const releaseImage = `ghcr.io/owner/karmax-app@sha256:${'d'.repeat(64)}`;
+it('deploys the release image CI built for the commit instead of building the app', () => {
+  const result = update('2\n', '2\n', true, '', ['--image', releaseImage]);
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.images).toContain('docker tag sha256:running karmax-app:previous');
+  expect(result.images).toContain(`docker tag ${releaseImage} karmax-app`);
+  expect(result.operations).toContain('build postgresql caddy');
+  expect(result.operations).not.toContain('build --pull app');
+  // Checked before the switch: the replay check and backup ran the release image.
+  expect(result.operations.indexOf('build postgresql caddy')).toBeLessThan(result.operations.indexOf('replay-check'));
+  expect(result.releaseRecord).toBe(releaseImage);
+  expect(result.head).toBe(result.target);
+});
+it('refuses a release image built from another commit before changing anything', () => {
+  const result = update('2\n', '2\n', true, '', ['--image', releaseImage], '', 'e'.repeat(40));
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain(`was built from ${'e'.repeat(40)}, not`);
+  expect(result.operations).toBe('');
+  expect(result.head).toBe(result.previous);
+  expect(update('2\n', '2\n', true, 'missing-image', ['--image', releaseImage]).stderr).toContain('could not be pulled');
+  const tagged = update('2\n', '2\n', true, '', ['--image', 'ghcr.io/owner/karmax-app:latest']);
+  expect(tagged.status).toBe(1);
+  expect(tagged.stderr).toContain('named by its digest');
+});
+it('rolls a failed release image back to the image that ran, without rebuilding it', () => {
+  const result = update('2\n', '2\n', false, '', ['--image', releaseImage]);
+  expect(result.stderr).toContain('production was restored');
+  expect(result.images).toContain('docker tag karmax-app:previous karmax-app');
+  expect(result.operations).not.toMatch(/build (--pull )?app/);
+  expect(result.releaseRecord).toBe('');
+  expect(result.head).toBe(result.previous);
+  // A gate that stops before the switch puts the running image's tag back too.
+  const stopped = update('2\n', '2\n', true, 'backup', ['--image', releaseImage]);
+  expect(stopped.stderr).toContain('could not be backed up');
+  expect(stopped.images).toContain('docker tag karmax-app:previous karmax-app');
 });

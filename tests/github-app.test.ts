@@ -796,6 +796,28 @@ describe('GitHub App integration', () => {
         branch: 'main', headSha: 'merged-sha', originatingTaskId: task.id,
       }),
     })]);
+    // The release workflows run after CI, on a schedule or on a dispatch, never
+    // on a push; a failure of one on the default branch still needs a repair.
+    for (const [index, [name, event]] of [['Deploy', 'workflow_run'], ['Promote', 'schedule'],
+      ['Production check', 'schedule'], ['Promote', 'workflow_dispatch']].entries()) {
+      const release = await deliver('workflow_run', `release-${index}`, {
+        installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
+        workflow_run: { event, head_repository: { id: 99 }, id: 710 + index, name, run_attempt: 1, conclusion: 'failure',
+          head_branch: 'main', head_sha: `release-sha-${index}`, html_url: `https://github.com/acme/app/actions/runs/${710 + index}` },
+      });
+      expect(release.projectEvents).toEqual([expect.objectContaining({ type: 'github.workflow.failed',
+        payload: expect.objectContaining({ workflow: name, runId: 710 + index }) })]);
+    }
+    // Any other workflow started that way, or a release one on another branch, is not.
+    for (const [index, run] of [{ name: 'Live', event: 'schedule', head_branch: 'main' },
+      { name: 'Deploy', event: 'workflow_run', head_branch: 'feature' },
+      { name: 'Deploy', event: 'pull_request', head_branch: 'main' }].entries()) {
+      const other = await deliver('workflow_run', `not-release-${index}`, {
+        installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
+        workflow_run: { head_repository: { id: 99 }, id: 720 + index, run_attempt: 1, conclusion: 'failure', head_sha: 'other', ...run },
+      });
+      expect(other.projectEvents).toBeUndefined();
+    }
     const successfulCi = await deliver('workflow_run', 'workflow-ci-success', {
       installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
       workflow_run: { event: 'push', head_repository: { id: 99 }, id: 702, name: 'CI', status: 'completed', conclusion: 'success',

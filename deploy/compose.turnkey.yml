@@ -157,6 +157,8 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      # deploy/karmax sets it to the checked-out commit.
+      args: { KARMAX_REVISION: "${KARMAX_REVISION:-}" }
     restart: unless-stopped
     mem_limit: ${KARMAX_APP_MEM_LIMIT:-4g}
     logging: *bounded-logs

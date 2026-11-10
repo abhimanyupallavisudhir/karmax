@@ -16,10 +16,16 @@ run="$UPDATES/$key"
 case "$command" in
   start)
     updater=${4:-}
+    # Optional: the release image CI built for this commit, named by digest.
+    image=${5:-}
     [ -f "$updater" ] || { echo 'validated updater is missing' >&2; exit 2; }
+    if [ -n "$image" ] && ! printf '%s\n' "$image" | grep -Eq '^[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}$'; then
+      echo 'invalid release image' >&2; exit 2
+    fi
     umask 077
     mkdir -p "$UPDATES"
     mkdir "$run" || { echo "update $key already exists" >&2; exit 1; }
+    [ -z "$image" ] || printf '%s\n' "$image" > "$run/image"
     cp "$updater" "$run/karmax"
     cp "$0" "$run/runner"
     chmod 700 "$run/karmax" "$run/runner"
@@ -33,11 +39,13 @@ case "$command" in
     # checks out the release the image copies with its modes and runs as the
     # app user: under 077 every source it changed became unreadable to the app,
     # and so did the rollback's. Its secrets set their own umask.
-    ( flock -n 9 || exit 73; umask 022; KARMAX_DEPLOY_DIR="$DEPLOY_DIR" "$run/karmax" update "$sha" ) 9>"$UPDATES/host.lock" || code=$?
+    set -- "$sha"
+    [ ! -f "$run/image" ] || set -- "$sha" --image "$(cat "$run/image")"
+    ( flock -n 9 || exit 73; umask 022; KARMAX_DEPLOY_DIR="$DEPLOY_DIR" "$run/karmax" update "$@" ) 9>"$UPDATES/host.lock" || code=$?
     if [ "$code" -eq 0 ]; then printf 'success\n' > "$run/status.next"
     else printf 'failed:%s\n' "$code" > "$run/status.next"; fi
     mv "$run/status.next" "$run/status"
     exit "$code"
     ;;
-  *) echo 'usage: update-runner.sh start SHA KEY UPDATER' >&2; exit 2;;
+  *) echo 'usage: update-runner.sh start SHA KEY UPDATER [IMAGE]' >&2; exit 2;;
 esac

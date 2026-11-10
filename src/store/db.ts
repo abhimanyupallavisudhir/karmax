@@ -3135,6 +3135,7 @@ export class Store {
       (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`authorization:requests:${organizationId}`));
       (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`avatars:organization:${organizationId}`));
       (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`conversation-sharing:organization:${organizationId}`));
+      (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`early-access:organization:${organizationId}`));
       (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`organization-usage-policy:${organizationId}`));
       (await this.db.prepare('DELETE FROM kv WHERE k IN (?, ?, ?)').run(
         `credpolicy:organization:${organizationId}`,

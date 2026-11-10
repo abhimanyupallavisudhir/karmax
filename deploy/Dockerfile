@@ -35,6 +35,12 @@ COPY vendor ./vendor
 # VM-world provisioning runs the browser environment's render smoke test (src/world/vm/provision.ts).
 COPY environments/browser/smoke.mjs ./environments/browser/smoke.mjs
 USER karmax
+# Last, so a new commit rebuilds nothing above. The commit this image was built
+# from: readiness reports it, and a deploy refuses an image labelled with any
+# other (deploy/karmax update --image).
+ARG KARMAX_REVISION=
+ENV KARMAX_REVISION=$KARMAX_REVISION
+LABEL org.opencontainers.image.revision=$KARMAX_REVISION
 
 EXPOSE 4505
 VOLUME ["/var/lib/karmax"]
