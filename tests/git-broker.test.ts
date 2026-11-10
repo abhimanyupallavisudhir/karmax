@@ -556,6 +556,71 @@ describe('cloud Git broker', () => {
     });
   });
 
+  describe('the recorded base a publication checks', () => {
+    async function advancedOrigin(prefix: string) {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+      cleanups.push(root);
+      const source = path.join(root, 'source');
+      const remote = path.join(root, 'remote.git');
+      fs.mkdirSync(source);
+      await gitOrThrow(source, ['init', '-q', '-b', 'main']);
+      await ensureIdentity(source);
+      fs.writeFileSync(path.join(source, 'README.md'), '# base\n');
+      await gitOrThrow(source, ['add', '-A']);
+      await gitOrThrow(source, ['commit', '-q', '-m', 'base']);
+      const provisioned = (await git(source, ['rev-parse', 'HEAD'])).stdout.trim();
+      await gitOrThrow(root, ['clone', '-q', '--bare', source, remote]);
+      const world = await new WorktreeProvider(path.join(root, 'worlds')).create({ taskId: 'recorded-base', repo: source, base: 'main' });
+      world.handle.repo = 'git@example:remote.git';
+      world.handle.repos![0]!.repo = 'git@example:remote.git';
+      await world.writeFile('feature.txt', 'task work\n');
+      await gitOrThrow(world.handle.root, ['add', '-A']);
+      await gitOrThrow(world.handle.root, ['commit', '-q', '-m', 'task work']);
+      // Another pull request lands on origin's main after the task began.
+      const other = path.join(root, 'other');
+      await gitOrThrow(root, ['clone', '-q', remote, other]);
+      await ensureIdentity(other);
+      fs.writeFileSync(path.join(other, 'other.txt'), 'landed meanwhile\n');
+      await gitOrThrow(other, ['add', '-A']);
+      await gitOrThrow(other, ['commit', '-q', '-m', 'landed meanwhile']);
+      await gitOrThrow(other, ['push', '-q', 'origin', 'main']);
+      const env = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.file://${root}/.insteadOf`, GIT_CONFIG_VALUE_0: 'git@example:' };
+      return { world, env, remote, provisioned };
+    }
+
+    // tavya.error 958f82cb12d718a9: a checkpoint recorded the base's NAME as
+    // the provisioned commit, a restore put it in the world, and "main" then
+    // meant origin's newer main in the broker's clone: every publication was
+    // refused once anything landed on main, and the task stopped for a person.
+    it('never takes a branch name for the provisioned commit', async () => {
+      const { world, env, remote } = await advancedOrigin('karmax-broker-base-name-');
+      world.handle.repos![0]!.baseSha = 'main';
+      const result = await brokerPushBranches(world, env);
+      expect(result.errors).toBeUndefined();
+      expect(result.pushed).toEqual(['source']);
+      expect((await git(remote, ['rev-parse', `refs/heads/${world.handle.branch}`])).stdout.trim())
+        .toBe((await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim());
+    });
+
+    it("hands a branch that lost its provisioned commit back to its author, with the command that restores it", async () => {
+      const { world, env, remote, provisioned } = await advancedOrigin('karmax-broker-base-lost-');
+      // The agent rebuilt its work on a commit that does not contain the
+      // provisioned base (an orphan here), instead of merging.
+      await gitOrThrow(world.handle.root, ['checkout', '-q', '--orphan', 'rebuilt']);
+      await gitOrThrow(world.handle.root, ['commit', '-q', '-m', 'rebuilt work']);
+      await gitOrThrow(world.handle.root, ['branch', '-f', world.handle.branch, 'HEAD']);
+      await gitOrThrow(world.handle.root, ['checkout', '-q', world.handle.branch]);
+      world.handle.repos![0]!.baseSha = provisioned;
+      const result = await brokerPushBranches(world, env);
+      expect(result.pushed).toEqual([]);
+      const error = result.errors?.source ?? '';
+      expect(error).toMatch(/recorded-base ancestry violation/);
+      expect(error).toContain(`git merge ${provisioned}`);
+      expect(isBranchContentRejection(error)).toBe(true);
+      expect((await git(remote, ['rev-parse', '--verify', '--quiet', `refs/heads/${world.handle.branch}`])).code).not.toBe(0);
+    });
+  });
+
   it('replaces a rebased task branch only when its recorded remote-head lease still matches', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-broker-lease-'));
     cleanups.push(root);

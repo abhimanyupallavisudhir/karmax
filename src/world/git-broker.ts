@@ -10,7 +10,7 @@ import { validGitBranch } from '../util/git-ref.js';
 import os from 'node:os';
 import path from 'node:path';
 import type { World, WorldGitIdentity, WorldRepo } from './types.js';
-import { sharesHostRefDatabase, worldRepos, worldRepoSource, worldRepoTarget } from './types.js';
+import { recordedBase, sharesHostRefDatabase, worldRepos, worldRepoSource, worldRepoTarget } from './types.js';
 import { ensureIdentity, git, isGitRepo } from './git.js';
 import { finalizeMergeRepo, scratchWorktreeHome, type MergeResult } from './merge.js';
 import { materializeGitCredential, type GitCredential } from './git-credential.js';
@@ -281,7 +281,8 @@ export function isGithubPushProtectionRejection(detail: string): boolean {
  * credential or person fixes it: only whoever writes the branch, by taking
  * that content out of every commit that adds it. */
 export function isBranchContentRejection(detail: string): boolean {
-  return PUSH_PROTECTION.test(detail) || GITHUB_TOO_LARGE.test(detail) || TOO_LARGE.test(detail);
+  return PUSH_PROTECTION.test(detail) || GITHUB_TOO_LARGE.test(detail) || TOO_LARGE.test(detail)
+    || RECORDED_BASE_VIOLATION.test(detail);
 }
 
 function megabytes(bytes: number): string {
@@ -337,10 +338,16 @@ function describePushProtection(repo: WorldRepo, detail: string): string {
     + 'Reconnect GitHub will not fix this.';
 }
 
-function recordedBaseViolation(repo: WorldRepo): string {
-  return `local recorded-base ancestry violation for branch "${repo.branch}"`
-    + `${repo.baseSha ? ` (base ${repo.baseSha.slice(0, 12)})` : ''}: the branch no longer descends from the commit provisioned for this task. `
-    + `${BRAND} did not publish it; reconnecting GitHub will not help. Restore the provisioned HEAD as an ancestor and integrate the selected target normally.`;
+const RECORDED_BASE_VIOLATION = /\blocal recorded-base ancestry violation\b/;
+
+/** The branch dropped the commit its task was provisioned from (an agent's
+ * reset or rebase). Only its author can restore it, with an ordinary merge
+ * that keeps the work and brings back whatever of the base it lost. */
+function recordedBaseViolation(repo: WorldRepo, base: string): string {
+  return `local recorded-base ancestry violation for branch "${repo.branch}" (base ${base.slice(0, 12)}): `
+    + `the branch no longer descends from commit ${base}, which this task was provisioned from. ${BRAND} did not publish it. `
+    + `In ${repo.name}, run \`git merge ${base}\` on the task branch (an ordinary merge, never a reset or rebase), `
+    + 'resolve any conflicts keeping the task\'s work, verify, then publish again. Reconnecting GitHub will not help.';
 }
 
 /**
@@ -363,10 +370,10 @@ export async function brokerPublishBranch(
   const result = await publishRepositories(worldRepos(world.handle), async repo => {
     // Idle capture can restore the provisioned commit from the base without
     // creating a task ref. Explicit publication still transports every branch.
-    if (options.omitUnchangedBase && repo.baseSha && !expectedRemoteHeads[repo.name]) {
+    if (options.omitUnchangedBase && recordedBase(repo) && !expectedRemoteHeads[repo.name]) {
       const tip = await world.exec('git', ['rev-parse', '--verify', `refs/heads/${repo.branch}`], { cwd: repo.root });
       if (tip.code !== 0) throw new Error(`could not resolve task branch ${repo.branch}: ${tip.stderr || tip.stdout}`);
-      if (tip.stdout.trim() === repo.baseSha) return 'omitted';
+      if (tip.stdout.trim() === recordedBase(repo)) return 'omitted';
     }
     // Worktree-backed worlds already share refs with their source repository.
     // Trying to bundle/fetch the live branch back into that same repository
@@ -421,9 +428,10 @@ async function verifySharedWorktreeBranch(world: World, repo: WorldRepo, localRe
   if (localTip.code !== 0) throw new Error(`local task branch "${repo.branch}" is unavailable: ${localTip.stderr || localTip.stdout}`);
   if (worldTip.stdout.trim() !== localTip.stdout.trim())
     throw new Error(`world and local task branch "${repo.branch}" disagree`);
-  if (repo.baseSha) {
-    const ancestor = await git(localRepo, ['merge-base', '--is-ancestor', repo.baseSha, ref]);
-    if (ancestor.code !== 0) throw new Error(recordedBaseViolation(repo));
+  const base = recordedBase(repo);
+  if (base) {
+    const ancestor = await git(localRepo, ['merge-base', '--is-ancestor', base, ref]);
+    if (ancestor.code !== 0) throw new Error(recordedBaseViolation(repo, base));
   }
 }
 
@@ -534,8 +542,9 @@ async function fastForwardWorldFromOrigin(
   const contained = await git(clone, ['merge-base', '--is-ancestor', branchRef, trackingRef]);
   if (contained.code !== 0 && !merge) return false;
   // A remote rewritten without the world's base would be no task's work to merge.
-  if (contained.code !== 0 && repo.baseSha
-    && (await git(clone, ['merge-base', '--is-ancestor', repo.baseSha, trackingRef])).code !== 0) return false;
+  const base = recordedBase(repo);
+  if (contained.code !== 0 && base
+    && (await git(clone, ['merge-base', '--is-ancestor', base, trackingRef])).code !== 0) return false;
 
   const transferRef = `refs/karmax/remote-ahead/${cryptoSafeName(repo.branch)}`;
   const incomingRef = 'refs/karmax/remote-ahead';
@@ -616,9 +625,10 @@ async function importBranchToLocal(world: World, repo: WorldRepo, localRepo: str
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-land-'));
   try {
     await importWorldBranch(world, repo, localRepo, staging, temp);
-    if (repo.baseSha) {
-      const ancestor = await git(localRepo, ['merge-base', '--is-ancestor', repo.baseSha, staging]);
-      if (ancestor.code !== 0) throw new Error(recordedBaseViolation(repo));
+    const base = recordedBase(repo);
+    if (base) {
+      const ancestor = await git(localRepo, ['merge-base', '--is-ancestor', base, staging]);
+      if (ancestor.code !== 0) throw new Error(recordedBaseViolation(repo, base));
     }
     const updated = await git(localRepo, ['fetch', '.', `+${staging}:refs/heads/${repo.branch}`]);
     if (updated.code !== 0) throw new Error(`could not update local task branch "${repo.branch}": ${updated.stderr || updated.stdout}`);
@@ -730,7 +740,7 @@ async function brokerFetchRef(world: World, destinationRepo: WorldRepo, branch: 
   const bundleRelative = inCheckout(world, destinationRepo, bundleName);
   try {
     const known = await knownGitCommits(args => world.exec('git', args, { cwd: destinationRepo.root }),
-      destinationRepo.baseSha ? [destinationRepo.baseSha] : [], [destinationRef]);
+      [recordedBase(destinationRepo)].filter((sha): sha is string => !!sha), [destinationRef]);
     const bundle = await authorityBundle(temp, destinationRepo, branch, auth,
       known, sharesHostRefDatabase(world.handle.kind), preferOrigin);
     if (bundle.path) await uploadGitBundle(world, bundle.path, bundleRelative);
@@ -915,7 +925,7 @@ async function importWorldBranch(world: World, repo: WorldRepo, receiver: string
   if (!validGitBranch(repo.branch)) throw new Error('Git broker rejected an invalid task branch');
   const transferName = `.karmax-transfer-${crypto.randomUUID()}.bundle`;
   const transferRel = inCheckout(world, repo, transferName);
-  const known = await knownGitCommits(args => git(receiver, args), repo.baseSha ? [repo.baseSha] : [],
+  const known = await knownGitCommits(args => git(receiver, args), [recordedBase(repo)].filter((sha): sha is string => !!sha),
     [destinationRef, `refs/remotes/origin/${repo.branch}`]);
   try {
     const bundle = await createGitBundle(args => world.exec('git', args,
@@ -992,9 +1002,10 @@ async function withTransferredRepo<T>(
       .catch((error) => { throw new Error(`authenticated clone failed: ${error instanceof Error ? error.message : String(error)}`); });
     const clone = scratch.clone;
     await timed('git-broker.import-world', () => importWorldBranch(world, repo, clone, `refs/heads/${repo.branch}`, temp));
-    if (repo.baseSha) {
-      const ancestor = await git(clone, ['merge-base', '--is-ancestor', repo.baseSha, repo.branch]);
-      if (ancestor.code !== 0) throw new Error(recordedBaseViolation(repo));
+    const base = recordedBase(repo);
+    if (base) {
+      const ancestor = await git(clone, ['merge-base', '--is-ancestor', base, `refs/heads/${repo.branch}`]);
+      if (ancestor.code !== 0) throw new Error(recordedBaseViolation(repo, base));
     }
     return await timed('git-broker.operation', () => use(clone, env));
   } catch (error) {
