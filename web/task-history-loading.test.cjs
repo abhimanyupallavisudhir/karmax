@@ -19,7 +19,7 @@ async function main() {
   const paints = [];
   const view = { taskId: 'task', messages: [{ role: 'user', text: 'review' }] };
   const event = { seq: 10, type: 'agent.activity', payload: { role: 'do', kind: 'message', title: 'Findings' } };
-  const c = vm.createContext({
+  const c = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0,
     document: { hidden: false }, resourceReviewCache: new Map(), resourceInventoryCache: new Map(),
     S: { tasks: [], organizationId: 'org' }, term: null,
     DEFAULT_EXPLANATION_SETTINGS: {},

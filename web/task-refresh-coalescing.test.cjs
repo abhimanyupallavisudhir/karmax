@@ -7,7 +7,7 @@ const start = src.indexOf('async function refreshTask(');
 const fn = src.slice(start, src.indexOf('\n}', start) + 2) + '\n' + src.slice(src.indexOf('function isSeries('), src.indexOf('\n}', src.indexOf('function isSeries(')) + 2);
 test('RQ-2/UI-6: lifecycle bursts share a read and retain one trailing refresh', async () => {
   const reads = [], releases = [];
-  const ctx = vm.createContext({ S: { selected: 't', projectId: 'p', tasks: [] },
+  const ctx = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0, S: { selected: 't', projectId: 'p', tasks: [] },
     taskRecord: () => ({}), projectById: () => ({}), pendingCancellationView: v => v, renderTaskPage: () => {},
     api: url => { reads.push(url); return url === '/api/tasks/t' ? new Promise(r => releases.push(r)) : Promise.resolve([]); } });
   vm.runInContext(fn, ctx);
@@ -24,7 +24,7 @@ test('a lifecycle refresh re-resolves the widgets bound to the view', async () =
   // The Overview's Progress section (stage, changed files) is resolved from the
   // view server-side; a stage change arrives only as `view.updated`.
   const reads = [];
-  const ctx = vm.createContext({ S: { selected: 't', projectId: 'p', tasks: [] },
+  const ctx = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0, S: { selected: 't', projectId: 'p', tasks: [] },
     taskRecord: () => ({}), projectById: () => ({}), pendingCancellationView: v => v, renderTaskPage: () => {},
     api: url => { reads.push(url); return Promise.resolve(url === '/api/tasks/t' ? { taskId: 't', stage: 'review' } : [{ widgets: [] }]); } });
   vm.runInContext(fn, ctx);
@@ -37,7 +37,7 @@ test('a lifecycle refresh re-resolves the widgets bound to the view', async () =
 test('LT-17: a sibling attempt\'s lifecycle refreshes the attempt cards, coalesced', async () => {
   const reads = [], releases = [];
   const src2 = (name) => { const at = src.search(new RegExp(`^(?:async )?function ${name}\\(`, 'm')); return src.slice(at, src.indexOf('\n}', at) + 2); };
-  const ctx = vm.createContext({ S: { projectId: 'p', selected: 'a', tab: 'tasks', tasks: [], taskEvents: [], activity: [], meta: {},
+  const ctx = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0, S: { projectId: 'p', selected: 'a', tab: 'tasks', tasks: [], taskEvents: [], activity: [], meta: {},
       attemptGroup: { principalAttemptId: 'a', attempts: [{ id: 'a' }, { id: 'b' }] } },
     location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
     patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, subTaskSummaryEventNeedsRefresh: () => false, LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false, scheduleTaskListReload: () => {},

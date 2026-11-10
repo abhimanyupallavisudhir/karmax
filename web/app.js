@@ -5597,6 +5597,7 @@ function connectWs() {
     let ev;
     try { ev = JSON.parse(m.data); } catch { return; }
     if (ev.type === 'pong') return;
+    noteRowAskEvent(ev);
     if (ev.type === 'timing.setting') { applyTimingSetting(ev.enabled); return; }
     if (ev.type === 'timing' && !S.meta?.timingEnabled) return;
     if (document.hidden) { S.liveUpdatesStale = true; return; }
@@ -5692,6 +5693,8 @@ function connectWs() {
     setWsOnline(true);
     syncLiveWatch();
     if (wsHadDropped) checkConsoleRevision();
+    // Approval events may have been missed: every list row reloads its asks.
+    if (wsHadDropped) rowAskEpoch++;
     if (wsHadDropped && document.hidden) S.liveUpdatesStale = true;
     else if (wsHadDropped) {
       loadInbox().catch(() => {});
@@ -7689,10 +7692,23 @@ function taskRow(t, { showTags = true, project = false } = {}) {
 // buttons and handlers (so a decision made here is the same decision), and a
 // row whose question has one-click answers shows those: most asks are answered
 // without opening the task. Decisions load per task, only for rows that ask
-// for one, and again whenever the row's pending count changes.
+// for one, and again when what the task asks may have changed: its pending
+// count, an approval event of its own, or a reconnected stream. Not on every
+// view update: a working agent moves its view on several times a second, and
+// the asks of #904 blinked out and reloaded faster than anyone could click them.
+// While they reload the row keeps showing the ones it has, so nothing jumps.
 const rowDecisions = new Map(); // taskId → { key, credential, permission, authorization, repository, items }
 const rowDecisionLoads = new Map();
-function rowDecisionKey(t) { return `${t.lastView?.pendingDecisions ?? ''}:${t.lastView?.updatedAt ?? ''}`; }
+const rowAskVersions = new Map(); // taskId → its approval events seen
+let rowAskEpoch = 0; // a stream that dropped may have missed some
+const rowAnswering = new Set(); // request ids whose answer is on its way
+const rowAnswered = new Set(); // and answered: gone from the row before its reload says so
+function rowDecisionKey(t) { return `${t.lastView?.pendingDecisions ?? ''}:${rowAskVersions.get(t.id) ?? 0}:${rowAskEpoch}`; }
+const ROW_ASK_EVENT = /\.approval-(?:requested|resolved|dismissed)$|^connection\.(?:requested|resolved|updated|dismissed)$/;
+function noteRowAskEvent(ev) {
+  if (ev.taskId && ROW_ASK_EVENT.test(ev.type || '')) rowAskVersions.set(ev.taskId, (rowAskVersions.get(ev.taskId) ?? 0) + 1);
+}
+function rowDecisionId(row) { return row.dataset.vreq || row.dataset.preq || row.dataset.areq || row.dataset.raccess; }
 function rowOrganizationId(t) {
   return projectById(t.projectId)?.organizationId || S.searchResult?.projects?.find((p) => p.id === t.projectId)?.organizationId || S.organizationId;
 }
@@ -7721,9 +7737,10 @@ function rowAskHtml(t) {
   }
   if (ask?.kind !== 'approval-requested') return '';
   const loaded = rowDecisions.get(t.id);
-  if (!loaded || loaded.key !== rowDecisionKey(t)) return `<div class="row-ask" data-row-decisions="${esc(t.id)}" data-loading></div>`;
+  if (!loaded) return `<div class="row-ask" data-row-decisions="${esc(t.id)}" data-loading></div>`;
+  const stale = loaded.key !== rowDecisionKey(t);
   const signedIn = typeof S.user === 'string' ? S.user : S.user?.id;
-  const pending = (list) => (list || []).filter((request) => request.status === 'pending' && !request.dismissed);
+  const pending = (list) => (list || []).filter((request) => request.status === 'pending' && !request.dismissed && !rowAnswered.has(request.id));
   const itemLabel = (id) => loaded.items.find((item) => item.id === id)?.label || 'a saved credential';
   const decisions = [
     ...pending(loaded.credential).map((request) => {
@@ -7749,7 +7766,12 @@ function rowAskHtml(t) {
       <span class="row-ask-actions"><button type="button" class="btn sm primary" data-raccess-act="approve">Give access</button><button type="button" class="btn sm" data-raccess-act="deny">Deny</button></span></div>`),
   ];
   if (!decisions.length) return '';
-  return `<div class="row-ask" data-row-decisions="${esc(t.id)}">${decisions.slice(0, 2).join('')}${decisions.length > 2 ? `<span class="task-sub">${decisions.length - 2} more — open the task</span>` : ''}</div>`;
+  // An answer on its way keeps its buttons pressed through a repaint.
+  const shown = decisions.slice(0, 2).map((html) => {
+    const id = html.match(/data-(?:vreq|preq|areq|raccess)="([^"]*)"/)?.[1];
+    return id && rowAnswering.has(id) ? html.replace(/<button /g, '<button disabled ') : html;
+  });
+  return `<div class="row-ask" data-row-decisions="${esc(t.id)}"${stale ? ' data-stale' : ''}>${shown.join('')}${decisions.length > 2 ? `<span class="task-sub">${decisions.length - 2} more — open the task</span>` : ''}</div>`;
 }
 async function loadRowDecisions(t) {
   const key = rowDecisionKey(t);
@@ -7775,25 +7797,61 @@ function wireRowAsks(root = $('#main')) {
     await Promise.all([loadInbox().catch(() => {}), refreshTasks()]);
     if (isCrossProjectList()) scheduleHomeRefresh();
   };
-  root.querySelectorAll('[data-row-decisions][data-loading]').forEach((box) => {
+  // Show a row's asks as they are now: its box, re-drawn only when that changes
+  // anything, and never under a press (the repaint after it will).
+  const redraw = (id) => {
+    const live = root.querySelector(`[data-row-decisions="${CSS.escape(id)}"]`);
+    const t = taskOf(id);
+    if (!live || !t) return;
+    if (mainPointerDown) { bgRenderQueued = true; return; }
+    const html = rowAskHtml(t) || '';
+    const next = document.createElement('template');
+    next.innerHTML = html;
+    const box = next.content.firstElementChild;
+    if (box && !box.hasAttribute('data-loading') && live.innerHTML === box.innerHTML) {
+      live.toggleAttribute('data-stale', box.hasAttribute('data-stale'));
+      live.removeAttribute('data-loading');
+    } else {
+      live.outerHTML = html;
+    }
+    wireRowAsks(root);
+  };
+  root.querySelectorAll('[data-row-decisions][data-loading], [data-row-decisions][data-stale]').forEach((box) => {
     const t = taskOf(box.dataset.rowDecisions);
     if (!t) return;
-    loadRowDecisions(t).then(() => {
-      const live = root.querySelector(`[data-row-decisions="${CSS.escape(t.id)}"][data-loading]`);
-      if (!live) return;
-      live.outerHTML = rowAskHtml(t) || '';
-      wireRowAsks(root);
-    });
+    const key = rowDecisionKey(t);
+    if (rowDecisionLoads.get(t.id)?.key === key) return; // already on its way, and its end redraws
+    loadRowDecisions(t).then(() => redraw(t.id));
   });
   root.querySelectorAll('[data-row-decisions]:not([data-loading]):not([data-wired])').forEach((box) => {
     box.dataset.wired = '1';
-    const t = taskOf(box.dataset.rowDecisions);
+    const taskId = box.dataset.rowDecisions;
+    const t = taskOf(taskId);
     const organizationId = t ? rowOrganizationId(t) : S.organizationId;
-    const done = async () => { rowDecisions.delete(box.dataset.rowDecisions); await resolved(); };
-    wireCredentialRequestActions(box, organizationId, done);
-    wirePermissionRequestActions(box, organizationId, done);
-    wireAuthorizationRequestActions(box, organizationId, done);
-    wireRepositoryAccessRequestActions(box, organizationId, done);
+    // Pressed, the answer stays pressed until it lands; landed, it leaves the row at once.
+    box.addEventListener('click', (event) => {
+      const pressed = event.target.closest('button');
+      const row = pressed?.closest('.row-decision');
+      if (!row || pressed.disabled || !rowDecisionId(row)) return;
+      rowAnswering.add(rowDecisionId(row));
+      // One answer per ask: its handler disables the button pressed, this the others.
+      row.querySelectorAll('button').forEach((button) => { if (button !== pressed) button.disabled = true; });
+    }, true);
+    const failed = (row) => {
+      rowAnswering.delete(rowDecisionId(row));
+      row.querySelectorAll('button').forEach((button) => { button.disabled = false; });
+    };
+    const done = async (_result, row) => {
+      const id = row && rowDecisionId(row);
+      if (id) { rowAnswering.delete(id); rowAnswered.add(id); }
+      // Its own event and the task's new count reload what is left.
+      redraw(taskId);
+      await resolved();
+    };
+    wireCredentialRequestActions(box, organizationId, done, failed);
+    wirePermissionRequestActions(box, organizationId, done, failed);
+    wireAuthorizationRequestActions(box, organizationId, done, failed);
+    wireRepositoryAccessRequestActions(box, organizationId, done, failed);
   });
   root.querySelectorAll('[data-row-quick]:not([data-wired])').forEach((box) => {
     box.dataset.wired = '1';
@@ -23430,7 +23488,7 @@ function repositoryAccessRequestRows(requests, { historyLimit = 20 } = {}) {
   return pendingHtml + history;
 }
 
-function wireRepositoryAccessRequestActions(root, organizationId, onResolved) {
+function wireRepositoryAccessRequestActions(root, organizationId, onResolved, onFailed) {
   if (!root) return;
   root.querySelectorAll('[data-raccess]').forEach((row) => row.querySelectorAll('[data-raccess-act]').forEach((button) =>
     button.addEventListener('click', async () => {
@@ -23441,12 +23499,12 @@ function wireRepositoryAccessRequestActions(root, organizationId, onResolved) {
         });
         const act = button.dataset.raccessAct;
         toast(act === 'dismiss' ? 'Request ignored' : act === 'deny' ? 'Denied' : result.retried ? 'Access given — task continuing' : 'Access given');
-        await onResolved?.(result);
-      } catch (error) { button.disabled = false; toast(error.message, true); }
+        await onResolved?.(result, row);
+      } catch (error) { button.disabled = false; onFailed?.(row); toast(error.message, true); }
     })));
 }
 
-function wireAuthorizationRequestActions(root, organizationId, onResolved) {
+function wireAuthorizationRequestActions(root, organizationId, onResolved, onFailed) {
   if (!root) return;
   root.querySelectorAll('[data-areq]').forEach((row) => row.querySelectorAll('[data-areq-act]').forEach((button) =>
     button.addEventListener('click', async () => {
@@ -23457,12 +23515,12 @@ function wireAuthorizationRequestActions(root, organizationId, onResolved) {
         });
         toast(button.dataset.areqAct === 'dismiss' ? 'Request ignored' : button.dataset.areqAct === 'deny' ? 'Authorization denied'
           : result.queued ? 'Approved — task queued' : 'Authorization approved');
-        await onResolved?.(result);
-      } catch (error) { button.disabled = false; toast(error.message, true); }
+        await onResolved?.(result, row);
+      } catch (error) { button.disabled = false; onFailed?.(row); toast(error.message, true); }
     })));
 }
 
-function wirePermissionRequestActions(root, organizationId, onResolved) {
+function wirePermissionRequestActions(root, organizationId, onResolved, onFailed) {
   if (!root) return;
   root.querySelectorAll('[data-preq]').forEach((row) => row.querySelectorAll('[data-preq-act]').forEach((button) =>
     button.addEventListener('click', async () => {
@@ -23476,15 +23534,16 @@ function wirePermissionRequestActions(root, organizationId, onResolved) {
         toast(button.dataset.preqAct === 'dismiss' ? decision : result.resume?.resumed ? `${decision} — task resumed automatically`
           : `${decision}${result.resume?.reason ? ` — ${result.resume.reason}` : ''}`,
         button.dataset.preqAct !== 'dismiss' && !result.resume?.resumed && !!result.resume?.reason);
-        await onResolved?.(result);
+        await onResolved?.(result, row);
       } catch (error) {
         button.disabled = false;
+        onFailed?.(row);
         toast(error.message, true);
       }
     })));
 }
 
-function wireCredentialRequestActions(root, organizationId, onResolved) {
+function wireCredentialRequestActions(root, organizationId, onResolved, onFailed) {
   if (!root) return;
   const oq = `?organizationId=${encodeURIComponent(organizationId || '')}`;
   // Beside the vault (Passwords & payments), "Add to vault" opens its folded
@@ -23530,16 +23589,17 @@ function wireCredentialRequestActions(root, organizationId, onResolved) {
       });
       if (button.dataset.vreqAct === 'dismiss') {
         toast('Request ignored');
-        await onResolved?.(result);
+        await onResolved?.(result, row);
         return;
       }
       credentialRequestBindings.delete(row.dataset.vreq);
       const decision = button.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted';
       toast(result.resume?.resumed ? `${decision} — task resumed automatically`
         : `${decision}${result.resume?.reason ? ` — ${result.resume.reason}` : ''}`, !result.resume?.resumed && !!result.resume?.reason);
-      await onResolved?.(result);
+      await onResolved?.(result, row);
     } catch (error) {
       button.disabled = false;
+      onFailed?.(row);
       toast(error.message, true);
     }
   })));
