@@ -57,7 +57,7 @@ const fallback = normalizeComboOption('default');
 ok(fallback.value === 'default' && fallback.label === 'default', 'continues to support string fallbacks');
 
 S.modelCatalog = {};
-for (const model of ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5']) {
+for (const model of ['claude-opus-5-5', 'claude-fable-5-2', 'claude-sonnet-5-5', 'claude-haiku-5-5']) {
   ok(modelOptions('claude').some(m => m.id === model), `offline picker includes ${model}`);
   ok(effortLevelsFor('claude', model).join() === EFFORT_ORDER.join(), `offline effort control works for ${model}`);
 }
