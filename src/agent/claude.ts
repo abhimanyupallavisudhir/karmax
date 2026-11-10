@@ -1155,6 +1155,7 @@ export class ClaudeAdapter implements AgentAdapter {
       if (followPoll) clearInterval(followPoll);
       if (settleTimer) clearTimeout(settleTimer);
       if (exitTimer) clearTimeout(exitTimer);
+      messages.close();
       (await injector.close()); // release the input stream so the SDK subprocess can't wedge open
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
       if (remoteHome && input.resolvedAuth?.configHome) {

@@ -51,20 +51,23 @@ export async function* withClaudeStartupDeadline<T>(stream: AsyncIterable<T>, ab
  * `next()` still unanswered `ms` later rejects with that reason. Messages
  * already on their way are not cut off: the bound runs only while the reader
  * waits. A stream given up on is not asked to return, which would wait on the
- * same pending `next()`.
+ * same pending `next()`. `close` is for a reader that stops reading some
+ * other way: nothing is expected of the stream after it.
  */
-export function endBoundedStream<T>(stream: AsyncIterable<T>, ms: number): { stream: AsyncIterable<T>; expectEnd(reason: () => unknown): void } {
+export function endBoundedStream<T>(stream: AsyncIterable<T>, ms: number): { stream: AsyncIterable<T>; expectEnd(reason: () => unknown): void; close(): void } {
   const iterator = stream[Symbol.asyncIterator]();
   let reason: (() => unknown) | undefined;
   let waiting: { reject(error: unknown): void; timer?: ReturnType<typeof setTimeout> } | undefined;
   let givenUp = false;
+  let closed = false;
   const bound = () => {
     const reader = waiting;
-    if (!reader || !reason || reader.timer) return;
+    if (closed || !reader || !reason || reader.timer) return;
     reader.timer = setTimeout(() => { givenUp = true; reader.reject(reason!()); }, ms);
   };
   return {
     expectEnd(why) { reason ??= why; bound(); },
+    close() { closed = true; clearTimeout(waiting?.timer); },
     stream: { [Symbol.asyncIterator]: () => ({
       next: () => new Promise<IteratorResult<T>>((resolve, reject) => {
         const reader: NonNullable<typeof waiting> = { reject };
