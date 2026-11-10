@@ -15,7 +15,7 @@ import type { WorldCheckpoint, WorldHandleRef } from '../domain/types.js';
 import type { ObjectStore } from '../store/objects.js';
 import type { Store } from '../store/db.js';
 import type { World, WorldHandle, WorldKind, WorldRepo } from './types.js';
-import { sharesHostRefDatabase, worldRepos, worldRepoSource } from './types.js';
+import { recordedBase, sharesHostRefDatabase, worldRepos, worldRepoSource } from './types.js';
 import type { WorldRegistry } from './registry.js';
 import { newId } from '../util/id.js';
 import { activateProjectRuntime, selectProjectEnvironment, snapshotProjectRuntime } from './project-runtime.js';
@@ -158,7 +158,8 @@ export class WorldCheckpointService {
         checkoutPath: repo.root === world.handle.root ? '.' : repo.name,
         ...(repo.localPath ? { localPath: repo.localPath } : {}),
         ...(repo.sourceAuthority ? { sourceAuthority: repo.sourceAuthority } : {}),
-        ...(name.code === 0 && email.code === 0 ? { gitIdentity: { name: name.stdout.trim(), email: email.stdout.trim() } } : {}), baseSha: repo.baseSha ?? handle.base,
+        ...(name.code === 0 && email.code === 0 ? { gitIdentity: { name: name.stdout.trim(), email: email.stdout.trim() } } : {}),
+        ...(recordedBase(repo) ? { baseSha: recordedBase(repo) } : {}),
         branch: repo.branch, headSha: head.code === 0 ? head.stdout.trim() : undefined,
         base: repo.base, ...(repo.target ? { target: repo.target } : {}),
         ...(repo.targetPinned !== undefined ? { targetPinned: repo.targetPinned } : {}),
@@ -500,7 +501,14 @@ export class WorldCheckpointService {
             + `could not be restored: ${manifestRepo.branch} starts from ${lost} here, with this checkpoint's uncommitted files on top. `
             + 'Commits made after its last successful push are lost; redo them if they mattered.'];
           restoredRepo.branch = manifestRepo.branch;
-          restoredRepo.baseSha = manifestRepo.baseSha;
+          // The provisioned commit carries over. A checkpoint that does not
+          // know it (or saved a base's name) restores a world provisioned from
+          // the commit it restored; this clone's own base is newer than the
+          // branch and would refuse its publication.
+          const restoredHead = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: restoredRepo.root });
+          restoredRepo.baseSha = recordedBase(manifestRepo)
+            ?? (restoredHead.code === 0 ? restoredHead.stdout.trim() : undefined);
+          if (!restoredRepo.baseSha) delete restoredRepo.baseSha;
         }
         const role = manifestRepo?.role ?? previous?.role;
         if (role) restoredRepo.role = role;

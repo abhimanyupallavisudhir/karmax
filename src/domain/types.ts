@@ -362,7 +362,10 @@ export interface WorldCheckpoint {
     localPath?: string;
     sourceAuthority?: 'project' | 'origin';
     gitIdentity?: { name: string; email: string };
-    baseSha: string;
+    /** The commit the checkout was provisioned from; absent when unknown.
+     * Older checkpoints may hold the base's name here: read it through
+     * `recordedBase` (src/world/types.ts), never as a commit. */
+    baseSha?: string;
     branch: string;
     headSha?: string;
     /** Per-checkout branch policy. This matters for platform companions such as
