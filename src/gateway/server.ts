@@ -108,6 +108,7 @@ import type { AccessMode, AccessStatus, VaultFieldName, VaultItem } from '../aut
 import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js';
 import { newId } from '../util/id.js';
 import { DurableEventFanout, type FanoutAudience } from './fanout.js';
+import { ChangeNotices, changeNoticeFor, clientId, writtenScope } from './change-notices.js';
 import { affects, authorityChanged, authoritySeq, changedSince, onAuthorityChange, type AuthorityChange, type AuthoritySubject } from '../store/authorization-epoch.js';
 import { AGENT_MAIL_MAX_BYTES, MAIL_FROM_HEADER, MAIL_SIGNATURE_HEADER, MAIL_TO_HEADER, verifyMail } from '../edge/agent-mail-signature.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
@@ -700,6 +701,8 @@ const GIT_PASS_AUTO_SYNC_BACKSTOP_MS = 15 * 60_000;
 const SOCKET_DECISION_TTL_MS = 5_000;
 /** How often an event socket finds its organizations again without a local change (grants another process wrote). */
 const SOCKET_REACH_REFRESH_MS = 30_000;
+/** The console tab a request came from; that tab's own socket is not told of its writes. */
+const CONSOLE_CLIENT_HEADER = 'x-tavya-client';
 /** A browser's event socket can die without a close (sleep, network change,
  * NAT expiry). Each side checks the other this often: the gateway with protocol
  * pings, the console with an application `ping` it can see answered. */
@@ -793,6 +796,7 @@ export class Gateway {
   }
   private identityTokens = new Map<string, { apiToken: string; fingerprint: string; expiresAt: number; userId: string }>();
   private fanout!: DurableEventFanout;
+  private changes = new ChangeNotices();
   /** Remotes verified during this gateway process. Persisted links are retried
    * once after every restart so interrupted first pushes self-heal. */
   private wikiWork = new Set<Promise<void>>();
@@ -1070,6 +1074,26 @@ export class Gateway {
     if (lifetime.closed) return;
     const subscription = this.fanout.on(deliver, () => ws.close(1013, 'Client fell behind; reconnect to refresh'), routed);
     lifetime.add(subscription);
+    // Writes no event describes (change-notices.ts): to the connections of
+    // whoever may read what was written, except the tab that wrote it. A
+    // person's own state (their inbox) reaches only their own connections.
+    const tab = clientId(url.searchParams.get('client'));
+    const self = scoped ? resolveCallerIdentity(scoped, auth.userId).humanSubject?.userId : auth.userId;
+    lifetime.add(this.changes.on(async (notice) => {
+      if (ws.readyState !== WebSocketClient.OPEN || (notice.client && notice.client === tab)) return;
+      if (notice.personal) { if (notice.personal !== self) return; }
+      else {
+        const organizations = subscription.reads();
+        if (!notice.organizationId || (organizations !== 'all' && !organizations.has(notice.organizationId))) return;
+        if (scoped?.projectId && notice.projectId !== scoped.projectId) return;
+        // What a project holds is its readers'; an organization-wide write
+        // (a project made, a view saved) is told to its people, not to tokens.
+        if (notice.projectId ? !(await mayRead(notice.projectId, notice.taskId ?? '').catch(() => false)) : !person) return;
+      }
+      if (ws.readyState !== WebSocketClient.OPEN || ws.bufferedAmount > 2 * 1024 * 1024) return;
+      const { personal, client: _client, ...scope } = notice;
+      try { ws.send(JSON.stringify({ type: 'changed', ...scope, ...(personal ? { own: true } : {}) })); } catch { /* closing */ }
+    }));
     // A change to what the socket stands on drops its decisions and finds its
     // organizations again (a failed lookup keeps the previous ones); so does a
     // slow timer, for grants another process wrote.
@@ -2484,6 +2508,16 @@ export class Gateway {
     // below require the same verified account subject for browsers and delegates.
     const decision = await this.routeDecision(token, authRecord, session, method, p, url, requestedScope);
     const required = decision.required;
+    // A request that wrote says so to the pages that show what it addressed
+    // (change-notices.ts): once it has answered, so a re-read finds the write.
+    if (method !== 'GET' && method !== 'HEAD') res.once('finish', () => {
+      void (async () => {
+        const notice = changeNoticeFor({ method, path: p, status: res.statusCode, capability: required,
+          scope: await writtenScope(requestedScope, authRecord, store),
+          userId: callerIdentity.humanSubject?.userId, client: req.headers[CONSOLE_CLIENT_HEADER] });
+        if (notice) this.changes.publish(notice);
+      })().catch(() => { /* a page that missed it reads again when it next comes into view */ });
+    });
     if (decision.required) {
       const { checked } = decision;
       const auditedIdentity = resolveCallerIdentity(checked.record ?? authRecord, session.userId);

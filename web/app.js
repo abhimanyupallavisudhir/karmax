@@ -199,6 +199,9 @@ const S = {
   searchRefusal: '', // …because the server refused it (4xx), in the server's words
   searchPending: false, // a new query is being evaluated; the list labels its interim local preview
   wsOnline: true, // live socket up; false shows the floating "Reconnecting" pill
+  // This tab, to the gateway: its requests carry it and its live socket names
+  // it, so the tab that made a write is not told of it again (see applyChangeNotice).
+  clientId: `tab_${(globalThis.crypto?.randomUUID?.() || `${Date.now()}${Math.random()}`).replace(/[^A-Za-z0-9]/g, '').slice(0, 32)}`,
   orgProjectId: null, // which project S.tags/S.views were loaded for (staleness guard)
   schema: [],
   paramDefaults: {},
@@ -4039,7 +4042,8 @@ function api(path, opts = {}) {
 async function fetchApi(path, opts = {}) {
   const res = await feedbackFetch(path, {
     ...opts,
-    headers: { 'content-type': 'application/json', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}), ...(opts.headers || {}) },
+    headers: { 'content-type': 'application/json', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}),
+      ...(S.clientId ? { 'x-tavya-client': S.clientId } : {}), ...(opts.headers || {}) },
   });
   if (res.status === 401) {
     S.token = null;
@@ -4722,18 +4726,31 @@ async function checkConsoleRevision() {
   return false;
 }
 
+// A page that was out of sight heard nothing: events and change notices are
+// dropped while hidden, and a phone or a sleeping laptop freezes the page and
+// may lose the socket without a close. So coming back reads again whatever is
+// on screen — when something was dropped, and after any absence long enough
+// for the socket to have died unnoticed — and asks the socket to prove itself
+// quickly instead of showing the old state until the next liveness tick.
+const AWAY_REFRESH_MS = 15_000;
+const RESUME_PONG_WAIT_MS = 3_000;
+let hiddenSince = 0;
 function resumeVisibleUpdates() {
-  if (document.hidden) return;
+  if (document.hidden) { hiddenSince ||= Date.now(); return; }
+  const away = hiddenSince ? Date.now() - hiddenSince : 0;
+  hiddenSince = 0;
   checkWsLiveness(true);
-  if (S.liveUpdatesStale) {
+  if (away >= AWAY_REFRESH_MS) setTimeout(() => { if (wsPingSentAt && Date.now() - wsPingSentAt >= RESUME_PONG_WAIT_MS) reconnectWs(); }, RESUME_PONG_WAIT_MS);
+  if (S.liveUpdatesStale || away >= AWAY_REFRESH_MS) {
     S.liveUpdatesStale = false;
+    api.defaults?.clear();
     resourceReviewCache.clear(); resourceInventoryCache.clear();
     loadInbox().catch(() => {});
     if (S.selected) { S.liveOutput = {}; refreshTask(); refreshTaskHistory(S.selected); }
     else if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks();
     else if (isCrossProjectList()) scheduleHomeRefresh();
     else if (S.tab === 'activity') seedActivity();
-  }
+  } else readAsksOnScreen();
   checkConsoleRevision();
   if (S.tab === 'installation') { refreshHostDiag(); refreshProcPanel(); }
   if (S.onboarding?.display === 'expanded') refreshOnboarding();
@@ -4743,6 +4760,8 @@ function watchConsoleRevision() {
   if (consoleRevisionTimer) return;
   consoleRevisionTimer = setInterval(checkConsoleRevision, 60_000);
   document.addEventListener('visibilitychange', resumeVisibleUpdates);
+  // Back at this window: what arrived for the task on screen has now been seen.
+  window.addEventListener('focus', readAsksOnScreen);
 }
 
 // ── boot ─────────────────────────────────────────────────────────────────────
@@ -5016,13 +5035,32 @@ async function loadInbox() {
     api(`/api/inbox?organizationId=${encodeURIComponent(organization.id)}`)));
   if (S.inboxLoadEpoch !== epoch) return;
   const seen = S.announcedInbox;
+  const before = S.inboxState;
   S.inbox = inboxes.flat();
+  S.inboxState = inboxState(S.inbox);
   S.announcedInbox = new Map(S.inbox.map((item) => [item.id, urgencyRank(item.urgency)]));
+  // What arrives about the task in front of the person is read as it arrives,
+  // and is not announced to someone already looking at it.
+  readAsksOnScreen();
   announceInbox(inboxArrivals(seen, S.inbox));
   updateBell();
+  // Nobody is looking: the sidebar and the list are read again when they are.
+  if (document.hidden) { S.liveUpdatesStale = true; return; }
   refreshForMeCounts();
-  // The bell's page lists what the inbox says waits on you.
+  // The bell's page lists what the inbox says waits on you; every other list
+  // marks what is new and holds the For me view, so it follows the inbox too.
   if (S.tab === 'inbox' && !S.selected) scheduleHomeRefresh();
+  else if (before !== undefined && before !== S.inboxState) refreshListQuietly();
+}
+// What the lists draw from the inbox: which asks exist and which are unread.
+function inboxState(items) {
+  return items.map((item) => `${item.id}:${item.kind}:${item.unread ? 1 : 0}`).sort().join(' ');
+}
+// Re-run the list on screen behind the person's back (no loading state).
+function refreshListQuietly() {
+  if (S.selected) return;
+  if (isCrossProjectList()) scheduleHomeRefresh();
+  else if (S.tab === 'tasks') scheduleSearch(true);
 }
 
 function inboxEventChanges(ev) {
@@ -5582,6 +5620,69 @@ function scheduleTaskListReload() {
   }, 350);
 }
 
+// ── writes made elsewhere ────────────────────────────────────────────────────
+// Someone wrote through the API — in another tab, on another device, a
+// colleague, an agent — and most writes record no task event (archive, tags,
+// priority, notes, a saved view, reading an inbox ask). The gateway says which
+// task, project and organization each write addressed (src/gateway/
+// change-notices.ts), and this page reads again what it shows of them. It
+// never hears of its own writes, which it applied itself. A notice names no
+// content: one too many costs a read, and the loaders coalesce bursts.
+function applyChangeNotice(notice) {
+  // Reads kept "until this tab's next write" are as stale after anyone else's.
+  api.defaults?.clear();
+  // My own state changed on another of my tabs or devices: what I have read,
+  // or a preference that follows me (a dismissed recommendation).
+  if (notice.own) {
+    if (notice.area === 'inbox') scheduleInboxReload();
+    else if (notice.area === 'user') api('/api/user/preferences').then((preferences) => {
+      S.preferences = preferences;
+      if (isTaskListTab() && !S.selected) bgRenderMain();
+    }).catch(() => {});
+    // Something of mine that belongs to no organization yet: one I just made.
+    else scheduleStructureReload(notice);
+    return;
+  }
+  const { taskId, projectId, organizationId } = notice;
+  if (taskId && (S.inbox || []).some((item) => item.taskId === taskId)) scheduleInboxReload();
+  if (S.selected && taskId && changeTouchesOpenTask(taskId)) refreshTask('changed attempt');
+  if (isCrossProjectList()) {
+    if (S.tab === 'inbox' || organizationId === S.organizationId) scheduleHomeRefresh();
+  } else if (projectId && projectId === S.projectId) scheduleTaskListReload();
+  // A draft made or deleted elsewhere is for me too: the sidebar counts them.
+  if (organizationId === S.organizationId) refreshForMeCounts(800);
+  // Not a task's: the project or organization itself (a project made or
+  // renamed, tags, saved views). Pages with forms are left as they are.
+  if (!taskId) scheduleStructureReload(notice);
+}
+// The open task, its sub-tasks, its parent and its other attempts are all on its page.
+function changeTouchesOpenTask(taskId) {
+  return taskId === S.selected
+    || (S.view?.subTaskSummaries || []).some((summary) => summary.id === taskId)
+    || (S.attemptGroup?.attempts || []).some((attempt) => attempt.id === taskId)
+    || taskRecord(S.selected)?.parentTaskId === taskId;
+}
+let structureReload = null;
+function scheduleStructureReload(notice) {
+  const pending = structureReload ||= { projects: new Set(), organizations: new Set(), timer: null };
+  if (notice.projectId) pending.projects.add(notice.projectId);
+  if (notice.organizationId) pending.organizations.add(notice.organizationId);
+  pending.timer ||= setTimeout(async () => {
+    structureReload = null;
+    try {
+      await Promise.all([loadProjects(), loadOrganizations()]);
+      renderRail();
+      // Lists and the task page draw the project's tags and the saved views.
+      let repaint = false;
+      if (pending.projects.has(S.projectId)) repaint = await loadOrg();
+      if (S.tab === 'home' && pending.organizations.has(S.organizationId)) { await loadOrgViews(); repaint = true; }
+      if (!repaint) return;
+      if (S.selected) scheduleTaskPageRender();
+      else if (isTaskListTab()) bgRenderMain();
+    } catch { /* the next notice or navigation reads again */ }
+  }, 500);
+}
+
 function connectWs() {
   if (connectWs.retryTimer) clearTimeout(connectWs.retryTimer);
   if (S.ws) {
@@ -5590,7 +5691,7 @@ function connectWs() {
   }
   wsPingSentAt = 0;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws${S.clientId ? `?client=${S.clientId}` : ''}`);
   S.ws = ws;
   ws.onmessage = (m) => {
     wsHeardAt = Date.now(); wsPingSentAt = 0;
@@ -5599,7 +5700,16 @@ function connectWs() {
     if (ev.type === 'pong') return;
     if (ev.type === 'timing.setting') { applyTimingSetting(ev.enabled); return; }
     if (ev.type === 'timing' && !S.meta?.timingEnabled) return;
-    if (document.hidden) { S.liveUpdatesStale = true; return; }
+    if (document.hidden) {
+      // Out of sight, the page waits to be looked at before it reads anything
+      // again — except what asks for the person: a notification matters most
+      // when they are elsewhere, so the inbox (the tab title's count, the
+      // alert and its sound) is kept current.
+      S.liveUpdatesStale = true;
+      if (ev.type === 'changed' ? ev.own && ev.area === 'inbox' : inboxEventChanges(ev)) scheduleInboxReload();
+      return;
+    }
+    if (ev.type === 'changed') { applyChangeNotice(ev); return; }
     // Streamed text chunks are the live bubble's, not activity (LT-5).
     if (S.tab === 'activity' && !liveOnlyEvent(ev.type) && (!ev.projectId || ev.projectId === S.projectId)) {
       S.activity.unshift(ev);
@@ -24918,6 +25028,7 @@ function markTaskAsksRead(taskId) {
   const items = (S.inbox || []).filter((item) => item.unread && item.taskId === taskId);
   if (!items.length) return;
   for (const item of items) item.unread = false;
+  S.inboxState = inboxState(S.inbox);
   // An inbox fetch already in flight predates this; it must not mark them unread again.
   S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
   updateBell();
@@ -24925,8 +25036,17 @@ function markTaskAsksRead(taskId) {
   for (const item of items) byOrganization.set(item.organizationId, [...(byOrganization.get(item.organizationId) || []), item]);
   for (const [organizationId, unread] of byOrganization) {
     api(`/api/inbox?organizationId=${encodeURIComponent(organizationId)}`, { method: 'PATCH', body: JSON.stringify({ ids: unread.map((item) => item.id) }) })
-      .catch(() => { for (const item of unread) item.unread = true; updateBell(); });
+      // A read mention has left For me: the sidebar's counts, and the list if
+      // the person is already back on it, were read before this landed.
+      .then(() => { refreshForMeCounts(); refreshListQuietly(); },
+        () => { for (const item of unread) item.unread = true; S.inboxState = inboxState(S.inbox); updateBell(); });
   }
+}
+// An ask is read once its task is in front of the person: when they open it,
+// and when it arrives (or they come back) while the task is on screen. A task
+// left open in a background tab or an unfocused window has shown them nothing.
+function readAsksOnScreen() {
+  if (S.selected && !document.hidden && document.hasFocus()) markTaskAsksRead(S.selected);
 }
 // How loudly an ask asks (domain/types.ts). Ascending, so the index is the sort
 // rank; an unrecognized level reads as 'normal' rather than sinking to the floor.
