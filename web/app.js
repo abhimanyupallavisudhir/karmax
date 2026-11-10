@@ -93,6 +93,8 @@ const ICON = {
   copy: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
   edit: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg>',
   attach: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.4 11.6-8.9 8.9a6 6 0 0 1-8.5-8.5l9.4-9.4a4 4 0 0 1 5.7 5.7l-9.5 9.5a2 2 0 0 1-2.8-2.8l8.8-8.8"/></svg>',
+  // A row's Delete: shown on the row you point at, like Archive.
+  trash: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/></svg>',
   // Sidebar tree vocabulary: a plain chevron folds a folder (rotated 90° when
   // open) and a box marks a project — the container of its tasks, repositories,
   // wiki and files. (A checklist read as one task's todo list; a folder would
@@ -7190,20 +7192,23 @@ function tasksView() {
   const notices = inboxNoticesHtml();
   const store = isStoreQuery(S.search);
   let body;
+  // Rows sit on one surface, ruled between (`.task-list`): a list, not a stack of cards.
+  const list = (rows) => (rows ? `<div class="task-list">${rows}</div>` : '');
   if (store) {
     body = storeViewHtml();
   } else if (groups) {
     body = r.hierarchical
       ? [
-        ...(groups.find((g) => g.key === '__untagged__')?.tasks || []).map((t) => row(t, { showTags: false })),
+        list((groups.find((g) => g.key === '__untagged__')?.tasks || []).map((t) => row(t, { showTags: false })).join('')),
         ...groups.filter((g) => g.key !== '__untagged__').map((g) => tagGroupHtml(g)),
       ].join('')
-      : groups.map((g) => {
+      // One list, its groups headed inside it, so their columns line up.
+      : list(groups.map((g) => {
         const gt = g.tasks;
         return `<h2 class="task-group-heading">${esc(g.label)} <span class="task-group-count">${gt.length} task${gt.length === 1 ? '' : 's'}</span></h2>${gt.map((t) => row(t)).join('')}`;
-      }).join('');
+      }).join(''));
   } else {
-    body = flat.map((t) => row(t)).join('');
+    body = list(flat.map((t) => row(t)).join(''));
   }
   // Every empty list is one muted line; the query it ran is in the search box.
   const empty = S.searchFailed
@@ -7241,7 +7246,7 @@ function tasksView() {
       </div>
       <div class="organizer-row">${viewsBar()}${queryToolbarHtml(S.search || '', 'q', trailing)}</div>
     </div>
-    ${notices}${store ? body : body || empty}${storeRecsHtml()}`;
+    ${notices ? `<div class="task-list">${notices}</div>` : ''}${store ? body : body || empty}${storeRecsHtml()}`;
 }
 
 // The organization home's project filter: a `project:` clause in the query, so
@@ -7388,7 +7393,7 @@ function storeViewHtml() {
   if (!items) return '';
   const words = (S.search || '').replace(/(^|\s)-?[\w.#-]+:\S*/g, ' ').toLowerCase().split(/\s+/).filter(Boolean);
   const shown = items.filter((item) => words.every((word) => `${item.name} ${item.summary}`.toLowerCase().includes(word)));
-  return shown.length ? shown.map(storeRowHtml).join('') : `<div class="card queue-empty">No matching tasks</div>`;
+  return shown.length ? `<div class="task-list">${shown.map(storeRowHtml).join('')}</div>` : `<div class="card queue-empty">No matching tasks</div>`;
 }
 // The Task store view is not a search of tasks: it loads the store (a promise
 // in place of the search). The default view loads it alongside, to recommend from.
@@ -7435,7 +7440,7 @@ function storeRecsHtml() {
   ].filter(Boolean).join('<span aria-hidden="true">·</span>');
   return `<section class="store-recs">
       <h2 class="task-group-heading"><span>Recommended from the <a href="${esc(store)}" data-store-view>Task store</a></span><button class="btn sm ghost" id="store-recs-dismiss">Dismiss</button></h2>
-      ${ready.map(storeRowHtml).join('')}${more ? `<div class="store-recs-more">${more}</div>` : ''}
+      ${ready.length ? `<div class="task-list">${ready.map(storeRowHtml).join('')}</div>` : ''}${more ? `<div class="store-recs-more">${more}</div>` : ''}
     </section>`;
 }
 function wireTaskStore() {
@@ -7622,7 +7627,7 @@ function tagGroupHtml(group, keep = () => true, depth = 0) {
       <span class="tag-section-count">${count} task${count === 1 ? '' : 's'}</span>${edit}
     </h${level}>
     ${description}
-    <div class="tag-section-tasks">${ownTasks.map((t) => taskRow(t, { showTags: false })).join('')}</div>
+    ${ownTasks.length ? `<div class="tag-section-tasks task-list">${ownTasks.map((t) => taskRow(t, { showTags: false })).join('')}</div>` : ''}
     <div class="tag-section-children">${children}</div>
   </section>`;
 }
@@ -7692,16 +7697,18 @@ function seriesRow(t, where = '') {
   if (t.params?.triggers?.length) bits.push(triggerSummary(t.params.triggers));
   bits.push(`${runs.length} run${runs.length === 1 ? '' : 's'}`);
   const runsHtml = expanded ? runs.map(runSubRow).join('') : '';
+  const summary = bits.join('  ·  ');
   return `
     <div class="task-row series-row" data-series="${t.id}">
-      <button class="icon-btn series-caret" data-expand="${t.id}" title="Show runs">${expanded ? '▾' : '▸'}</button>
+      <button class="icon-btn series-caret task-lead" data-expand="${t.id}" title="Show runs" aria-expanded="${expanded}">${expanded ? '▾' : '▸'}</button>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">repeatable</span></div>
-        <div class="task-sub">${where}<span style="color:var(--ink-3)">${esc(bits.join('  ·  '))}</span></div>
+        <div class="task-sub">${where}</div>
       </div>
+      <div class="task-state" title="${esc(summary)}"><span class="task-state-more">${esc(summary)}</span></div>
       <div class="task-right">
         <button class="btn sm" data-runagain="${t.id}">Run again</button>
-        <button class="btn sm danger" data-delseries="${t.id}">Delete</button>
+        <button class="icon-btn danger" data-delseries="${t.id}" title="Delete" aria-label="Delete">${ICON.trash}</button>
       </div>
     </div>${runsHtml}`;
 }
@@ -7710,11 +7717,12 @@ function runSubRow(r) {
   const v = r.lastView || {};
   return `
     <div class="task-row run-row" data-id="${r.id}">
+      ${statusHtml('', statusTone(v), { className: 'task-lead' })}
       <div class="task-main">
-        <div class="task-title">${esc(r.title)} ${viewStatusHtml(v)}</div>
-        <div class="task-sub"><span style="color:var(--ink-3)">${new Date(r.createdAt).toLocaleString()}</span></div>
+        <div class="task-title">${esc(r.title)}</div>
       </div>
-      <div class="task-right">${pipeline(v)}</div>
+      <div class="task-state">${viewStatusHtml(v)}</div>
+      <div class="task-right">${pipeline(v)}${rowWhen(r)}</div>
     </div>`;
 }
 
@@ -7727,21 +7735,28 @@ function awaitingApprovalStatus() {
 function restingAvatar(t) { return !!t?.params?.avatar && !!t.params.draft && !t.lastView; }
 const avatarChip = '<span class="chip avatar-chip" title="Avatār: its forks act with its authorization">✦ Avatār</span>';
 
+// A list row reads across in columns: its status glyph (`.task-lead`, a status
+// whose label is the status column's), the title with where it lives and its
+// labels, the status in words, then stage and age. Whose move it is reads down
+// the list's left edge.
 function taskRow(t, { showTags = true, project = false } = {}) {
   const isDraft = t.params?.draft;
   const archived = t.params?.archived;
   const where = project ? projectLabel(t) : '';
   if (isSeries(t.params) && !archived) return seriesRow(t, where);
   if (t.params?.triggerState === 'armed' && !archived) {
+    const trigger = triggerSummary(t.params.triggers);
     return `
     <div class="task-row" data-armed="${t.id}">
+      ${statusHtml('', 'waiting', { className: 'task-lead' })}
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub">${where}${statusHtml('Waiting for trigger', 'waiting')}<span style="color:var(--ink-3)">${esc(triggerSummary(t.params.triggers))}</span></div>
+        <div class="task-sub">${where}</div>
       </div>
+      <div class="task-state" title="${esc(`Waiting for trigger · ${trigger}`)}">${statusHtml('Waiting for trigger', 'waiting')}<span class="task-state-more">${esc(trigger)}</span></div>
       <div class="task-right">
         <button class="btn sm" data-runnow="${t.id}">Run now</button>
-        <button class="btn sm danger" data-canceltrig="${t.id}">Cancel</button>
+        <button class="icon-btn" data-canceltrig="${t.id}" title="Cancel the trigger — keep it as a draft" aria-label="Cancel trigger">${ICON.close}</button>
       </div>
     </div>`;
   }
@@ -7754,15 +7769,17 @@ function taskRow(t, { showTags = true, project = false } = {}) {
     const avatar = restingAvatar(t);
     return `
     <div class="task-row" data-draft="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
+      ${statusHtml('', awaiting ? 'human' : 'draft', { className: 'task-lead' })}
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub">${where}${awaiting ? awaitingApprovalStatus() : avatar ? avatarChip : statusHtml('Draft', 'draft')}${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
+        <div class="task-sub">${where}${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
+      <div class="task-state">${awaiting ? awaitingApprovalStatus() : avatar ? avatarChip : statusHtml('Draft', 'draft')}</div>
       <div class="task-right">
         ${rowWhen(t)}
         ${avatar ? `<button class="btn sm" data-fork-avatar="${t.id}">${ICON.fork}Fork</button>`
           : awaiting ? '' : `<button class="btn sm" data-queue="${t.id}">Run task</button>`}
-        <button class="btn sm danger" data-deldraft="${t.id}">Delete</button>
+        <button class="icon-btn danger" data-deldraft="${t.id}" title="Delete" aria-label="Delete">${ICON.trash}</button>
       </div>
     </div>`;
   }
@@ -7778,19 +7795,19 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   const archiveBtn = archived
     ? `<button class="icon-btn" data-unarchive="${t.id}" data-shortcut="list.archive" title="Unarchive — restore to the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg></button>`
     : `<button class="icon-btn" data-archive="${t.id}" data-shortcut="list.archive" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`;
+  // The lead is the most pressing of the row's statuses: an ask of a person
+  // (its reason, or a pending approval) over what the task itself is doing.
+  const lead = why || (v.approvalRequests && !v.state?.draft) ? 'human' : tone;
   return `
     <div class="task-row ${archived ? 'archived' : ''}${taskHasUnreadAsk(t.id) ? ' unread' : ''}" data-id="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
+      ${statusHtml('', lead, { className: 'task-lead' })}
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}${t.params?.coordinator ? ` ${coordinatorChip(t)}` : ''}</div>
-        <div class="task-sub">
-          ${where}${why}
-          ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
-          ${ownAsk && tone === 'human' ? '' : why ? statusHtml(stageLabel(v), tone) : viewStatusHtml(v)}
-          ${priorityFlag(t)}${showTags ? tagChips(t) : ''}
-        </div>
-        ${ownAsk ? rowAskHtml(t) : ''}
+        <div class="task-sub">${where}${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
-      <div class="task-right">${rowWhen(t)}${pipeline(v)}${archiveBtn}</div>
+      <div class="task-state">${why}${ownAsk && tone === 'human' ? '' : why ? statusHtml(stageLabel(v), tone) : viewStatusHtml(v)}</div>
+      <div class="task-right">${pipeline(v)}${rowWhen(t)}${archiveBtn}</div>
+      ${ownAsk ? rowAskHtml(t) : ''}
     </div>`;
 }
 
@@ -25105,10 +25122,12 @@ function inboxNoticesHtml() {
     const where = (projectId && projectLabel({ projectId }))
       || (organization ? `<span class="task-project" title="${esc(organization.name)}"><span class="task-project-org">${esc(orgSlug(organization))}</span></span>` : '');
     return `<div class="task-row inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(inboxTitle(item))}">
+      ${statusHtml('', 'human', { className: 'task-lead' })}
       <div class="task-main">
         <div class="task-title">${esc(inboxTitle(item))}</div>
-        <div class="task-sub">${where}${statusHtml(inboxRowLabel(item), 'human', { className: `attention ${item.kind}` })}</div>
+        <div class="task-sub">${where}</div>
       </div>
+      <div class="task-state">${statusHtml(inboxRowLabel(item), 'human', { className: `attention ${item.kind}` })}</div>
       <div class="task-right">${urgencyChip(item.urgency)}</div>
     </div>`;
   }).join('');

@@ -52,6 +52,7 @@ global.attentionChip = () => '';
 global.projectLabel = () => '';
 global.taskHasUnreadAsk = () => false;
 global.markTaskAsksRead = () => {};
+global.ICON = { fork: '', trash: '', close: '' };
 for (const name of ['rowTime', 'fmtWhen', 'rowWhen', 'awaitingApproval', 'awaitingApprovalStatus', 'restingAvatar', 'taskRow', 'taskFormTitle',
   'statusTone', 'statusHtml', 'viewStatusHtml', 'accountWaitReason']) eval(extractFn(name));
 global.PARKED_WAITS = eval(src.match(/const PARKED_WAITS = ([^\n]*);/)[1]);

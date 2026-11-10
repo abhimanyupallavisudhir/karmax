@@ -628,16 +628,88 @@ a { color: var(--accent); text-decoration: none; }
 .composer :is(.new-task-field, .new-task-template):focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
 /* ── task row ───────────────────────────────────────────────── */
+/* A list is one surface ruled between its rows (`.task-list`), not a stack of
+   cards. A row reads across in columns that line up down the whole list (each
+   row is a subgrid of the list's): the status glyph — whose move it is, down
+   the left edge — then the title with its labels, the status in words, and
+   stage, age and the row's own buttons. The columns fit their widest row. */
+.task-list {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) fit-content(16rem) auto; gap: 1px 12px;
+  background: var(--line); border: 1px solid var(--line); border-radius: var(--r);
+  overflow: hidden; margin-bottom: 12px; container: task-list / inline-size;
+}
 .task-row {
   display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px;
   padding: 13px 16px; border: 1px solid var(--line); border-radius: var(--r);
-  background: var(--surface); margin-bottom: 8px; cursor: pointer; transition: border-color .12s, transform .04s;
+  background: var(--surface); margin-bottom: 8px; cursor: pointer; transition: border-color .12s, background-color .12s, transform .04s;
 }
 .task-row:hover { border-color: var(--line-strong); }
-.task-row:has(> .series-caret) { grid-template-columns: auto minmax(0, 1fr) auto; }
 .task-row:active { transform: translateY(1px); }
+.task-list > .task-row { grid-column: 1 / -1; border: 0; border-radius: 0; margin: 0; }
+.task-list > .task-row:hover { background: var(--surface-2); }
+.task-list > .task-row:active { transform: none; }
+/* Every row's first line is as tall as a small button, so a draft's Run task
+   and a task's title share a line; a decision opens beneath the title. */
+.task-row:has(> .task-lead) {
+  --row-line: 28px;
+  grid-template-columns: 16px minmax(0, 1fr) auto auto; align-items: start; column-gap: 12px; padding: 8px 14px 8px 16px;
+}
+.task-list > .task-row:has(> .task-lead) { grid-template-columns: subgrid; }
+.task-row > .task-lead, .task-row:has(> .task-lead) > :is(.task-state, .task-right) { min-height: var(--row-line); }
+.task-row > .task-lead { display: flex; align-items: center; }
+.task-row > .task-lead > svg { width: 16px; height: 16px; }
+.task-row > .task-lead > .status-label { display: none; }
+.task-row > .series-caret.task-lead { width: 24px; height: var(--row-line); margin: 0 -4px; padding: 0; justify-content: center; }
+/* Its labels follow the title, and go beneath it when the line is full. */
+.task-row:has(> .task-lead) > .task-main { display: flex; flex-wrap: wrap; align-items: center; gap: 0 12px; }
+.task-row:has(> .task-lead) .task-title { flex: 0 1 auto; line-height: var(--row-line); }
+.task-row:has(> .task-lead) > .task-main > .task-sub { min-width: 0; min-height: 0; margin: 0; gap: 4px 8px; }
+.task-row:has(> .task-lead) > .task-main > .task-sub:empty { display: none; }
+/* A decision a row asks for opens beneath its title, across the row. */
+.task-row:has(> .task-lead) > .row-ask { grid-column: 2 / -1; margin: 0 0 6px; }
+.task-state { display: flex; align-items: center; gap: 4px 10px; min-width: 0; overflow: hidden; font-size: var(--fs-12); color: var(--ink-3); }
+/* The glyph leads the row; here the status is its words. */
+.task-state > .status > svg { display: none; }
+.task-state > .status { min-width: 0; }
+.task-state .status-label, .task-state-more { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-state-more { min-width: 0; }
+.task-row:has(> .task-lead) > .task-right { justify-content: flex-end; gap: 10px; }
+.task-row:has(> .task-lead) > .task-right > .icon-btn { width: 28px; height: 28px; }
+.task-row:has(> .task-lead) > .task-right > .btn { height: var(--row-line); padding-block: 0; white-space: nowrap; }
+.task-row > .task-right > .icon-btn.danger:hover { color: var(--danger); }
+.task-row:has(> .task-lead) .row-when { min-width: 2.6em; text-align: right; }
+/* Its own buttons show on the row you point at or move to; a touch screen
+   has no pointing, so there they always show. */
+@media (hover: hover) {
+  .task-list > .task-row > .task-right > .icon-btn { opacity: 0; transition: opacity .12s; }
+  .task-list > .task-row:is(:hover, :focus-within, .cursor) > .task-right > .icon-btn { opacity: 1; }
+}
+/* A narrower list drops the stage bar (the status says the stage) before the
+   title gets cramped; a phone-wide one wraps the title across the row, with
+   the status and age on one line beneath. */
+@container task-list (max-width: 820px) {
+  .task-list > .task-row > .task-right > .pipeline { display: none; }
+  .task-list > .task-row:has(> .task-lead) .task-title { white-space: normal; overflow-wrap: anywhere; line-height: 1.4; padding: 4px 0; }
+  .task-list > .task-row > .task-state { max-width: 11rem; padding: 5px 0; }
+  .task-list > .task-row > .task-state .status-label { white-space: normal; }
+}
+@container task-list (max-width: 600px) {
+  .task-list > .task-row:has(> .task-lead) { grid-template-columns: 16px minmax(0, 1fr) auto; row-gap: 0; padding: 8px 12px 8px 14px; }
+  .task-list > .task-row:has(> .task-lead) > .task-main { grid-column: 2 / -1; display: block; }
+  .task-list > .task-row:has(> .task-lead) > .task-state { grid-column: 2; }
+  .task-list > .task-row:has(> .task-lead) > .task-right { grid-column: 3; }
+  .task-list > .task-row:has(> .task-lead) > .task-main > .task-sub { padding-bottom: 4px; }
+}
+/* A series' runs, open beneath it: sunk a step. */
+.task-list > .task-row.run-row { display: grid; padding: 6px 14px 6px 16px; background: var(--surface-2); }
+.task-list > .task-row.run-row::before { content: none; }
+.task-list > .task-row.run-row:hover { background: color-mix(in srgb, var(--surface-2), var(--ink) 4%); }
+.task-list > .task-row.run-row .task-title { font-weight: 500; }
+/* No Archive of its own: its age lines up with the rows' above it. */
+.task-list > .task-row.run-row > .task-right { padding-right: 38px; }
 .task-row.archived { opacity: 0.55; }
 .task-row.sel { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+.task-list > .task-row.sel { background: var(--accent-weak); box-shadow: none; }
 .status-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
 .status-dot.active { background: var(--accent); box-shadow: 0 0 0 4px var(--accent-weak); }
 .status-dot.waiting { background: var(--working); box-shadow: 0 0 0 4px var(--working-weak); }
@@ -647,6 +719,7 @@ a { color: var(--accent); text-decoration: none; }
 .status-dot.cancelled { background: var(--ink-3); }
 .task-main { min-width: 0; }
 .task-title { font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task-title > .task-num { margin-right: 2px; }
 /* Human-facing sequential task id (SPEC §10.6): a quiet monospace tag before the title. */
 .task-num { font-family: var(--font-ui); font-variant-numeric: tabular-nums; font-size: var(--fs-12); color: var(--ink-3); font-weight: 500; }
 .task-sub { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: var(--fs-12); color: var(--ink-3); margin-top: 3px; }
@@ -2247,6 +2320,9 @@ a.ins-task-title:hover { color: var(--accent); }
 
 /* keyboard navigation: list cursor, digit hints on action buttons, "?" help */
 .task-row.cursor, .queue-item.cursor { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+/* In a list the row under the keyboard cursor is tinted: a ring would be clipped by the list's edge. */
+.task-list > .task-row.cursor { background: var(--accent-weak); box-shadow: none; }
+.task-list > .task-row.unread.cursor { box-shadow: inset 3px 0 0 var(--accent); }
 .task-row.unread.cursor { box-shadow: inset 3px 0 0 var(--accent), 0 0 0 3px var(--accent-weak); }
 .task-row:focus-visible, .queue-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .kbd { margin-left: 7px; font-family: var(--font-mono); font-size: var(--fs-10); line-height: 1.5; color: var(--ink-3); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
@@ -3038,8 +3114,6 @@ html[data-theme="dark"] .github-signin-btn:active,
 }
 
 /* ── Series row + runs (list + series page) ───────────────────────────────────── */
-/* One more cell than a task row: the expand caret before the status dot. */
-.series-row { grid-template-columns: auto auto 1fr auto; }
 .series-row .series-caret { margin-right: 2px; color: var(--ink-3); background: transparent; border: 0; cursor: pointer; }
 .run-row { position: relative; padding-left: 40px; background: var(--surface-2); }
 .run-row .task-title { font-size: var(--fs-13); font-weight: 500; }
@@ -3244,6 +3318,11 @@ html[data-theme="dark"] .github-signin-btn:active,
   font-size: 20px; font-weight: 650; line-height: 1.3; letter-spacing: -.015em;
 }
 .task-group-count { color: var(--ink-3); font-size: var(--fs-11); font-weight: 400; letter-spacing: 0; }
+/* Inside a list a group is headed by a band across it. */
+.task-list > .task-group-heading {
+  grid-column: 1 / -1; margin: 0; padding: 7px 16px; border: 0; background: var(--surface-2);
+  font-size: var(--fs-13); font-weight: 600; letter-spacing: 0; line-height: 1.4;
+}
 
 /* Hierarchical group:tag sections read like a Markdown document: aligned headings
    establish the hierarchy through type scale alone, followed by an ordinary intro
