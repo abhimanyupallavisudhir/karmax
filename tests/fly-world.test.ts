@@ -15,17 +15,32 @@ const connection = (token: string): ResolvedWorldProviderConnection => ({ organi
   config: { region: 'fra', organization: 'personal' } });
 
 describe('Fly.io sizes and prices', () => {
-  it('picks the smallest Fly guest that covers a Computer', () => {
-    expect(flyGuest({ cpu: 2, memoryMb: 2048 })).toEqual({ cpu_kind: 'shared', cpus: 2, memory_mb: 2048 });
-    expect(flyGuest({ cpu: 1, memoryMb: 3000 })).toEqual({ cpu_kind: 'shared', cpus: 2, memory_mb: 3072 });
-    expect(flyGuest({ cpu: 4, memoryMb: 16_384 })).toEqual({ cpu_kind: 'shared', cpus: 8, memory_mb: 16_384 });
+  it('gives a Computer its CPUs as whole Fly CPUs, never shared ones', () => {
+    // A shared vCPU is guaranteed 6.25% of a core, and Fly caps a shared-cpu-2x's volume at
+    // 16 MiB/s (performance-2x: 64 MiB/s): "2 CPU" restored pramana's data ~10× slower than any
+    // other provider's 2 CPUs, and its 31 GB never fit in setup's 30 minutes (#191/#192).
+    expect(flyGuest({ cpu: 2, memoryMb: 2048 })).toEqual({ cpu_kind: 'performance', cpus: 2, memory_mb: 4096 });
+    expect(flyGuest({ cpu: 2, memoryMb: 4096 })).toEqual({ cpu_kind: 'performance', cpus: 2, memory_mb: 4096 });
+    expect(flyGuest({ cpu: 1, memoryMb: 3000 })).toEqual({ cpu_kind: 'performance', cpus: 1, memory_mb: 3072 });
+    expect(flyGuest({ cpu: 4, memoryMb: 16_384 })).toEqual({ cpu_kind: 'performance', cpus: 4, memory_mb: 16_384 });
+    expect(flyGuest({ cpu: 3, memoryMb: 4096 })).toEqual({ cpu_kind: 'performance', cpus: 4, memory_mb: 8192 });
     expect(flyGuest({ cpu: 2, memoryMb: 32_768 })).toEqual({ cpu_kind: 'performance', cpus: 4, memory_mb: 32_768 });
+    for (const cpu of [1, 2, 4, 8, 16]) for (const memoryMb of [512, 2048, 4096, 8192, 16_384]) {
+      const guest = flyGuest({ cpu, memoryMb });
+      expect(guest.cpu_kind).toBe('performance');
+      expect(guest.cpus).toBeGreaterThanOrEqual(cpu);
+      expect(guest.memory_mb).toBeGreaterThanOrEqual(memoryMb);
+      // A machine's recorded shape gives back the same guest at its next start.
+      expect(flyGuest({ cpu: guest.cpus, memoryMb: guest.memory_mb })).toEqual(guest);
+    }
     expect(() => flyGuest({ cpu: 32, memoryMb: 4096 })).toThrow(/at most 16 CPUs/);
   });
 
   it('prices a machine by Fly’s published formula', () => {
     // docs.fly.io/about/pricing: shared-cpu-2x with 2 GB is $13.39 per 30-day month in iad.
     expect(flyComputeDollarsPerSecond({ cpu_kind: 'shared', cpus: 2, memory_mb: 2048 }, 'iad') * 30 * 86_400).toBeCloseTo(13.39, 2);
+    // performance-2x with 4 GB is $66.00 (checked 2026-11-10).
+    expect(flyComputeDollarsPerSecond({ cpu_kind: 'performance', cpus: 2, memory_mb: 4096 }, 'iad') * 30 * 86_400).toBeCloseTo(66, 2);
   });
 
   it('reads billable runs from a machine’s event log, ignoring one still running', () => {
@@ -45,7 +60,7 @@ describe('Fly.io sizes and prices', () => {
 
   it('refuses a disk larger than a Fly volume can be', () => {
     expect(() => new FlyDriver().shape({ diskGb: 600 })).toThrow(/at most 500 GB/);
-    expect(new FlyDriver().shape(undefined)).toEqual({ cpu: 2, memoryMb: 2048, diskGb: 20 });
+    expect(new FlyDriver().shape(undefined)).toEqual({ cpu: 2, memoryMb: 4096, diskGb: 20 });
   });
 });
 
@@ -71,7 +86,7 @@ describe.skipIf(!sshdAvailable)('Fly.io worlds (fake Machines API, real sshd)', 
     expect([...fly.apps.values()][0]!.ips).toEqual(['shared_v4']);
     expect([...fly.volumes.values()].map((volume) => [volume.size_gb, volume.region])).toEqual([[100, 'fra']]);
     const machine = [...fly.machines.values()][0]!;
-    expect(machine.config.guest).toEqual({ cpu_kind: 'shared', cpus: 2, memory_mb: 4096, persist_rootfs: 'always' });
+    expect(machine.config.guest).toEqual({ cpu_kind: 'performance', cpus: 2, memory_mb: 4096, persist_rootfs: 'always' });
     // The published image when there is one (a connection's own Advanced → Image wins).
     expect(machine.config.image).toBe('ghcr.io/owner/karmax-vm:v1');
     expect(machine.config.metadata).toMatchObject({ karmaxTaskId: 'task_fly', karmaxGeneration: '1', karmaxOrganizationId: 'org_a',
@@ -97,7 +112,7 @@ describe.skipIf(!sshdAvailable)('Fly.io worlds (fake Machines API, real sshd)', 
     const usage = await provider.listUsageEvents('org_a');
     const runs = usage.events.filter((event) => event.kind !== 'disk');
     expect(runs).toHaveLength(1);
-    expect(runs[0]).toMatchObject({ taskId: 'task_park', organizationId: 'org_a', cpu: 2, memoryMb: 2048 });
+    expect(runs[0]).toMatchObject({ taskId: 'task_park', organizationId: 'org_a', cpu: 2, memoryMb: 4096 });
     expect(runs[0]!.costMicros).toBeGreaterThanOrEqual(0);
   });
 
@@ -113,8 +128,22 @@ describe.skipIf(!sshdAvailable)('Fly.io worlds (fake Machines API, real sshd)', 
     await provider.park(handle);
     const resized = { ...handle, meta: { ...handle.meta, computer: { cpu: 4, memoryMb: 8192, diskGb: 150 } } };
     const woken = await provider.open(resized);
-    expect([...fly.machines.values()][0]!.config.guest).toMatchObject({ cpu_kind: 'shared', cpus: 4, memory_mb: 8192 });
+    expect([...fly.machines.values()][0]!.config.guest).toMatchObject({ cpu_kind: 'performance', cpus: 4, memory_mb: 8192 });
     expect((await woken.readFile('data.bin')).length).toBe(1000);
+  });
+
+  it('moves a world made on shared CPUs to whole CPUs at its next start', async () => {
+    const world = await provider.create({ taskId: 'task_shared', base: 'main', generation: 1, organizationId: 'org_a',
+      resources: { cpu: 2, memoryMb: 4096, diskGb: 100 } });
+    await world.writeFile('data.bin', 'kept');
+    const handle = world.handle as WorldHandle;
+    await provider.park(handle);
+    // As every Fly world made before 2026-11-10 was.
+    const machine = [...fly.machines.values()][0]!;
+    machine.config.guest = { ...machine.config.guest, cpu_kind: 'shared', cpus: 2, memory_mb: 4096 };
+    const woken = await provider.open(handle);
+    expect([...fly.machines.values()][0]!.config.guest).toEqual({ cpu_kind: 'performance', cpus: 2, memory_mb: 4096, persist_rootfs: 'always' });
+    expect(await woken.readFile('data.bin')).toBe('kept');
   });
 
   it('lists its machines for the orphan reaper, and destroys a world with its volume', async () => {

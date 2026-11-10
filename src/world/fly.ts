@@ -41,15 +41,21 @@ const REGION_MULTIPLIER: Record<string, number> = {
 
 export interface FlyGuest { cpu_kind: 'shared' | 'performance'; cpus: number; memory_mb: number }
 
-/** The smallest Fly guest that covers a shape: shared CPUs carry up to 2 GB
- * each, performance CPUs 2–8 GB each; memory comes in 256 MB steps. */
+/**
+ * The smallest Fly guest that covers a shape, always of performance CPUs
+ * (2–8 GB each; memory in 1 GB steps): a Computer's CPUs are whole CPUs on
+ * every provider. A shared vCPU is not one: Fly guarantees it 6.25% of a core
+ * (docs.fly.io/machines/cpu-performance), and sizes a volume's bandwidth by the
+ * guest (docs.fly.io/volumes/overview): shared-cpu-2x 16 MiB/s, which wrote
+ * 11.4 MiB/s when measured, against performance-2x's 64 MiB/s. Restoring
+ * pramana's 31 GB of data on a "2 CPU" shared-cpu-2x took longer than setup's
+ * 30 minutes (#191/#192, 2026-11-09), a 500 MB restore 3.2× as long as on
+ * performance-2x (wiki incidents/lessons).
+ */
 export function flyGuest(shape: { cpu: number; memoryMb: number }): FlyGuest {
-  const steps = [1, 2, 4, 8, 16];
-  const memory = Math.ceil(shape.memoryMb / 256) * 256;
-  for (const cpus of steps.filter((value) => value <= 8 && value >= shape.cpu))
-    if (memory <= cpus * 2048) return { cpu_kind: 'shared', cpus, memory_mb: Math.max(memory, cpus * 256) };
-  for (const cpus of steps.filter((value) => value >= shape.cpu))
-    if (memory <= cpus * 8192) return { cpu_kind: 'performance', cpus, memory_mb: Math.max(Math.ceil(memory / 1024) * 1024, cpus * 2048) };
+  const memory = Math.ceil(shape.memoryMb / 1024) * 1024;
+  for (const cpus of [1, 2, 4, 8, 16].filter((value) => value >= shape.cpu))
+    if (memory <= cpus * 8192) return { cpu_kind: 'performance', cpus, memory_mb: Math.max(memory, cpus * 2048) };
   throw new Error(`Fly machines have at most 16 CPUs and 128 GB of memory, not ${shape.cpu} CPU · ${Math.round(shape.memoryMb / 1024)} GB`);
 }
 
