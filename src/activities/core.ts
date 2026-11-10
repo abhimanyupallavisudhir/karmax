@@ -4,6 +4,7 @@ import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
 import { conversationFor, participantLabel, workDigest } from '../domain/participants.js';
 import { forkSourceRole } from '../domain/forks.js';
 import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { buildVersionedBundle } from '../packages/bundle.js';
 import type { WorkflowBundle } from '@temporalio/worker';
 import { concurrentMap } from '../util/concurrent-map.js';
@@ -21,7 +22,7 @@ import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
 import { prepareConnections } from '../mcp/connections/runtime.js';
 import { checkoutBranches, expectedTaskRemoteHeads } from '../world/publication.js';
-import { applyConversationPatch, conversationPage, hasLiveWorldWork, watchesJobs, lifecycleEventPayload, transcriptOf, type PublishedView, type TurnConversationBase, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
+import { applyConversationPatch, conversationPage, leavesWorldIdle, lifecycleEventPayload, transcriptOf, type PublishedView, type TurnConversationBase, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import { ServiceError, WorkflowNotFoundError, WorkflowUpdateFailedError, isGrpcServiceError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
@@ -704,6 +705,8 @@ function reportEscalation(task: { id: string; projectId: string; params: Record<
 
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
+  /** What a running agent turn holds until it ends, however it ends. */
+  const turnHolds = new AsyncLocalStorage<Array<() => void>>();
   const isRemote = (kind: WorldKind) => worlds.get(kind).capabilities?.remote === true;
   /** For a Reviewer choosing between attempts: the other attempts, and how to
    * compare them without leaving its own conversation. */
@@ -1964,8 +1967,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const recorded = (view.world ?? view.state.recoveryWorld) as WorldHandle | undefined;
     const waitingWorld = recorded && await ownWorld(recorded);
     // A job wait needs the world running: parking would freeze the job.
-    if ((view.status !== 'waiting' && view.status !== 'blocked') || hasLiveWorldWork(view) || watchesJobs(view)
-      || !waitingWorld || !worlds.get(waitingWorld.kind).parkable) return;
+    if (!leavesWorldIdle(view) || !waitingWorld || !worlds.get(waitingWorld.kind).parkable) return;
+    // A branch's pull request (SPEC §11.1) waits in its task's world, where the
+    // task's agent may be working: that world is idle only when the task
+    // leaves it idle too. Parking it on the pull request's wait alone stopped
+    // the machine under a running agent (pramana#137, 2026-11-09). What
+    // happens to the world is recorded on the task whose world it is.
+    const sharedWith = isPullRequestView(recorded) && waitingWorld.id !== taskId ? waitingWorld.id : undefined;
+    const worldTask = sharedWith ?? taskId;
+    const worldEvent = (type: string, payload: Record<string, unknown>) =>
+      record(worldTask, type, sharedWith ? { ...payload, pullRequest: taskId } : payload);
     let ctx: ReturnType<typeof activityContext.current> | undefined;
     try { ctx = activityContext.current(); } catch { /* direct tests */ }
     // Carry the publication cursor in the opaque fence so retries and the
@@ -1985,6 +1996,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         return false;
       }
       if (await worlds.hasActiveAccess?.(waitingWorld.id)) return false;
+      if (sharedWith) {
+        const owner = (await store.taskMetadata(sharedWith))?.lastView;
+        if (!owner || !leavesWorldIdle(owner)) return false;
+      }
       const current = (await store.currentWorld(waitingWorld.id)) as WorldHandle | undefined;
       if ((await store.worldState(waitingWorld.id)) === 'released') return false;
       if (current && (current.kind !== waitingWorld.kind
@@ -2030,12 +2045,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             }
             if (!(await valid())) return;
             const checkpoint = await parkingTrace.measure('lifecycle.checkpoint', () => deps.checkpoints!.checkpoint(waitingWorld, { checkContinue, reuseClean: true }));
-            (await record(taskId, 'checkpoint.created', { checkpointId: checkpoint.id,
+            (await worldEvent('checkpoint.created', { checkpointId: checkpoint.id,
               generation: checkpoint.generation, bytes: checkpoint.filesystemDelta?.bytes ?? 0 }));
           } catch (error) {
             if (error === deferred) return;
             if (ctx?.cancellationSignal.aborted) throw error;
-            (await record(taskId, 'checkpoint.warning', { warning: error instanceof Error ? error.message : String(error),
+            (await worldEvent('checkpoint.warning', { warning: error instanceof Error ? error.message : String(error),
               ...(error instanceof CheckpointRefusedError && error.files.length ? { files: error.files } : {}) }));
             // The world still parks, but hibernation must not trust an older checkpoint.
             await markCheckpointStale(store, waitingWorld, error instanceof Error ? error.message : String(error));
@@ -2044,7 +2059,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
         if (!(await valid())) return;
         // A parked world's browser is not checkpointed: keep its sessions, then free them.
-        await settleSessions(taskId, async () => browserOutlivesTurns(waitingWorld.kind) ? openWorld(waitingWorld, taskId) : undefined, true);
+        await settleSessions(worldTask, async () => browserOutlivesTurns(waitingWorld.kind) ? openWorld(waitingWorld, taskId) : undefined, true);
         if (!(await valid())) return;
         await parkingTrace.measure('lifecycle.park', () => withTiming(parkingTrace, () => worlds.park(waitingWorld)));
       }
@@ -2058,7 +2073,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           (await store.updateWorldMeta(current, { worldLeaseId: null }));
         }
         (await store.setWorldState(((await store.currentWorld(waitingWorld.id)) ?? waitingWorld) as WorldHandle, 'parked'));
-        (await record(taskId, 'world.parked', { provider: waitingWorld.kind, reason: view.waitingFor?.kind ?? view.stage }));
+        (await worldEvent('world.parked', { provider: waitingWorld.kind, reason: view.waitingFor?.kind ?? view.stage }));
       }
     };
     try {
@@ -2073,7 +2088,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     } catch (error) {
       if (ctx?.cancellationSignal.aborted) throw error;
       if (retryFailure) throw error; // Separate maintenance retries without republishing status.
-      (await record(taskId, 'world.warning', { warning: `could not park waiting world: ${error instanceof Error ? error.message : String(error)}` }));
+      (await worldEvent('world.warning', { warning: `could not park waiting world: ${error instanceof Error ? error.message : String(error)}` }));
     }
   }
 
@@ -2920,6 +2935,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let world: World;
       try {
         world = await timed('world.open', () => openWorld(args.worldHandle, args.taskId));
+        // The turn is a use of its world from here to its end: whatever parks,
+        // hibernates or stops a world asks first whether it is in use
+        // (pramana#137, 2026-11-09: a park stopped the machine under the agent).
+        const release = await worlds.holdAccess?.(world.handle.id);
+        const holds = turnHolds.getStore();
+        if (holds && release) holds.push(release); else release?.();
       } catch (error) {
         // Reconnecting/resuming a cloud sandbox is part of the turn's transport
         // boundary. A control-plane outage here is no more agent-actionable than
@@ -7645,6 +7666,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     async newTaskId(): Promise<string> {
       return newId('task');
     },
+  };
+  const agentTurn = activities.runAgentTurn;
+  activities.runAgentTurn = async (args) => {
+    const holds: Array<() => void> = [];
+    try { return await turnHolds.run(holds, () => agentTurn(args)); }
+    finally { for (const release of holds) release(); }
   };
   return activities;
 }

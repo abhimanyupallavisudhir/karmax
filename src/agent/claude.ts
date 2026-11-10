@@ -13,7 +13,7 @@ import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, SDK_CONTROL_TOOL_SCHEMAS, platform
 import { CLAUDE_DEFAULT_MODEL, claudeMaxTokens, claudeMessagesEffort } from './effort.js';
 import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
-import { createFollowUpInjector, toSdkUserMessage, followUpContent, withClaudeStartupDeadline } from './sdk-stream.js';
+import { createFollowUpInjector, toSdkUserMessage, followUpContent, withClaudeStartupDeadline, endBoundedStream } from './sdk-stream.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
@@ -57,6 +57,13 @@ import { BRAND } from '../domain/brand.js';
 export const MESSAGES_API_TOOLS = TOOL_SCHEMAS.map((t) => ({
   name: t.name, description: t.description, input_schema: t.parameters,
 }));
+
+/** A duration in milliseconds from the environment, else `fallback`. */
+function envMs(name: string, fallback: number): number {
+  const value = process.env[name]?.trim();
+  const parsed = value ? Number(value) : NaN;
+  return Number.isFinite(parsed) && parsed >= 0 && parsed <= 2_147_483_647 ? parsed : fallback;
+}
 
 export class ClaudeAdapter implements AgentAdapter {
   readonly provider = 'claude' as const;
@@ -416,8 +423,8 @@ export class ClaudeAdapter implements AgentAdapter {
       ? await timed('bootstrap.home', () => seedRemoteAgentHome(runtimeWorld, 'claude', configHome ?? '', input.session,
         input.profile.mcpConnections === undefined ? undefined : 'none', step => startupActivity('updated', step), input.toolsOptional))
       : undefined;
-    // The SDK only sees a codeless exit when the sandbox stream drops; the
-    // process knows the agent may still be running there (task 348).
+    // The SDK sees a hangup when the sandbox stream drops; the process knows
+    // the agent may still be running there (task 348).
     let remoteProcess: RemoteSpawnedProcess | undefined;
     let localStderr = '';
     let localStderrBytes = 0;
@@ -572,7 +579,16 @@ export class ClaudeAdapter implements AgentAdapter {
     // option terminates the subprocess when aborted, mirroring the codex CLI
     // adapter's child.kill() and the Messages-API path's fetch(signal).
     const abortController = new AbortController();
-    const onAbort = () => { try { abortController.abort(); } catch { /* already aborted */ } };
+    // Once the harness has exited, or been told to stop, the SDK's stream is
+    // due to end. One that does not is given up on after the exit grace
+    // (`endBoundedStream`, below, once there is a stream), for the reason
+    // first given.
+    let streamDue: (() => unknown) | undefined;
+    let expectStreamEnd = (reason: () => unknown) => { streamDue ??= reason; };
+    const onAbort = () => {
+      try { abortController.abort(); } catch { /* already aborted */ }
+      expectStreamEnd(() => Object.assign(new Error('The agent was stopped, but the Agent SDK\'s stream did not end'), { name: 'AbortError' }));
+    };
     if (ctx.signal?.aborted) onAbort();
     ctx.signal?.addEventListener?.('abort', onAbort, { once: true });
     // Heartbeat on a timer while the SDK streams. Temporal delivers a pending
@@ -627,10 +643,7 @@ export class ClaudeAdapter implements AgentAdapter {
     // first outstanding: one never-ending shell must not use it up for the rest of
     // the turn (videos #1 — a stuck waiter left a render started 25 minutes later
     // with no grace at all).
-    const grace = process.env.KARMAX_AGENT_BG_SETTLE_MS?.trim();
-    const parsedGrace = grace ? Number(grace) : NaN;
-    const settleGraceMs = Number.isFinite(parsedGrace) && parsedGrace >= 0 && parsedGrace <= 2_147_483_647
-      ? parsedGrace : 300_000;
+    const settleGraceMs = envMs('KARMAX_AGENT_BG_SETTLE_MS', 300_000);
     let settleDeadline: number | undefined;
     // Closing the input does not end the harness: Claude Code (2.1.319) stays alive
     // while a background shell or sub-agent runs, so a dev server left running held the
@@ -638,10 +651,7 @@ export class ClaudeAdapter implements AgentAdapter {
     // is closed the harness gets this long to exit on its own; then it is stopped and
     // the turn ends with what it reported. A harness that wakes within it still throws
     // AgentChannelLost below.
-    const exitGrace = process.env.KARMAX_AGENT_EXIT_GRACE_MS?.trim();
-    const parsedExitGrace = exitGrace ? Number(exitGrace) : NaN;
-    const exitGraceMs = Number.isFinite(parsedExitGrace) && parsedExitGrace >= 0 && parsedExitGrace <= 2_147_483_647
-      ? parsedExitGrace : 30_000;
+    const exitGraceMs = envMs('KARMAX_AGENT_EXIT_GRACE_MS', 30_000);
     let exitTimer: ReturnType<typeof setTimeout> | undefined;
     let harnessStopped = false;
     // Backgrounded shells still running when the input closed. Closing it stops
@@ -765,6 +775,9 @@ export class ClaudeAdapter implements AgentAdapter {
               env: remoteEnv,
               signal: o.signal,
             });
+            const spawned = remoteProcess;
+            spawned.once('exit', () => expectStreamEnd(() => spawned.lost
+              ?? new Error('The agent\'s process in the sandbox ended, but the Agent SDK\'s stream did not')));
             return remoteProcess as any;
           }
           const custody = createCustodyEnv({ ...o.env, ...subscriptionAuthEnv });
@@ -780,6 +793,7 @@ export class ClaudeAdapter implements AgentAdapter {
           // cover the spawn→return edge so an asynchronous ENOENT never becomes an
           // unhandled EventEmitter error in the host process.
           child.on('error', () => {});
+          child.once('exit', () => expectStreamEnd(() => new Error('The agent\'s process ended, but the Agent SDK\'s stream did not')));
           child.stderr?.on('data', (chunk: Buffer) => {
             localStderrBytes += chunk.length;
             localStderr = (localStderr + chunk.toString()).slice(-64 * 1024);
@@ -801,6 +815,11 @@ export class ClaudeAdapter implements AgentAdapter {
         },
       },
     });
+    // At least a second: the stream of a process that exited normally ends a
+    // moment after it, never before.
+    const messages = endBoundedStream<any>(iterator, Math.max(exitGraceMs, 1_000));
+    expectStreamEnd = messages.expectEnd;
+    if (streamDue) messages.expectEnd(streamDue);
     let publishedSession = false;
     // The main agent's text block being generated; undefined between blocks.
     let streamingText: string | undefined;
@@ -817,7 +836,7 @@ export class ClaudeAdapter implements AgentAdapter {
           remote, resumed: !!input.session, ...snapshot }) });
     };
     try {
-      for await (const message of withClaudeStartupDeadline<any>(iterator, onAbort, () => diagnoseStartup('timeout'))) {
+      for await (const message of withClaudeStartupDeadline<any>(messages.stream, onAbort, () => diagnoseStartup('timeout'))) {
         meter.observe(message);
         if (firstSdkEvent) {
           firstSdkEvent = false;
@@ -1114,7 +1133,14 @@ export class ClaudeAdapter implements AgentAdapter {
       // throws an AbortError. The workflow already handled the cancel, so swallow
       // it (return the partial output); rethrow anything else as a real failure.
       // A harness we stopped after its exit grace ends the turn like one that exited.
-      if (!ctx.signal?.aborted && !(harnessStopped && successfulResult && !(e instanceof AgentChannelLost))) {
+      // So does a sandbox lost once the agent had answered everything and gone
+      // idle, its turn held open only for background work: that work went
+      // with the sandbox, and the agent is told so. Lost any earlier, the
+      // turn is retried and resumes the session (remoteProcess.lost below).
+      const lostAfterTurn = !!remoteProcess?.lost && !!successfulResult && harnessIdle && !unanswered.size
+        && !(e instanceof AgentChannelLost) && !(e instanceof ProviderFailure);
+      if (lostAfterTurn && !stoppedShells.length) stoppedShells = backgroundShellDescriptions(subagents);
+      if (!ctx.signal?.aborted && !lostAfterTurn && !(harnessStopped && successfulResult && !(e instanceof AgentChannelLost))) {
         if (firstSdkEvent) {
           try { await boundedStartupProbe(() => diagnoseStartup('error'), 5000, undefined); }
           catch { /* retain the original startup failure */ }
