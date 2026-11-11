@@ -376,13 +376,13 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'fill_credential',
     description:
-      `Type a vault credential into the page open in your browser WITHOUT the secret ever entering your context: ${BRAND} resolves it and types it over CDP, verifying the page origin matches the credential's domains first. Focus the login page, then call this per field (username, password, then totp if the site asks for a code). The ${BRAND} browser MCP already runs a Chrome that exposes the DevTools endpoint, so just drive the page normally — no manual Chrome launch needed. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.`,
+      `Type a vault credential into the page open in your browser WITHOUT the secret ever entering your context: ${BRAND} resolves it and types it over CDP, verifying the page origin matches the credential's domains first. Focus the login page, then call this per field (username, password, then totp if the site asks for a code). An API key's secret or an SSH key's privateKey is typed into a field (e.g. a CI secret form) the same way: never copy a key into a login item to fill it. The ${BRAND} browser MCP already runs a Chrome that exposes the DevTools endpoint, so just drive the page normally — no manual Chrome launch needed. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.`,
     parameters: {
       type: 'object',
       properties: {
         item_id: { type: 'string' },
         domain: { type: 'string', description: 'Alternative to item_id: the site domain.' },
-        field: { type: 'string', enum: ['username', 'password', 'totp'], description: 'Default password. totp types the current one-time code.' },
+        field: { type: 'string', enum: ['username', 'password', 'totp', 'secret', 'privateKey'], description: 'Default: the item\'s secret (password, secret or privateKey). totp types the current one-time code.' },
         selector: { type: 'string', description: 'CSS selector of the input element to fill.' },
       },
       required: ['selector'],
@@ -409,8 +409,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       type: 'object',
       properties: {
         id: { type: 'string', description: 'Omit to create; set to update an item this task created.' },
-        type: { type: 'string', enum: ['login', 'api-key', 'ssh-key', 'env', 'note'] },
-        label: { type: 'string' },
+        type: { type: 'string', enum: ['login', 'api-key', 'ssh-key', 'env', 'note'], description: 'Required to create. An item keeps its type: to update one, omit it.' },
+        label: { type: 'string', description: 'Required to create.' },
         domains: { type: 'array', items: { type: 'string' } },
         username: { type: 'string' },
         env_var: { type: 'string', description: 'api-key/ssh-key: env var to inject it under in future task worlds.' },
@@ -419,7 +419,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
           description: 'Field → secret value. login: password, totp (base32 seed or otpauth:// URI), note; api-key: secret; ssh-key: privateKey; env: env (KEY=VALUE lines); note: note.',
         },
       },
-      required: ['type', 'label'],
+      required: [],
     },
   },
   {
@@ -853,7 +853,9 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'notify',
     description:
       'Tell or call people and agents of this task without ending your turn. ' +
-      'Notify a person only when you need them to do something; never for updates on your work. People (user:<id>, @team:<slug>, @creator, ' +
+      'Notify a person only when you need them to do something; never for updates on your work. ' +
+      'It leaves their list once they have read it: when you cannot go on without them, ask instead (pause with needs_input, or escalate_to_human). ' +
+      'People (user:<id>, @team:<slug>, @creator, ' +
       '@owners, @project, @maintainers, @admins, @all) and Avatārs (avatar:<task id>) are notified now; agents of this task ' +
       '(agent:do for the main agent, agent:responder, agent:confirm, agent:agent-<n>) are called when your turn ends, in order. ' +
       'The message is said in the task conversation. `agents` calls new agents in, after `to`; each becomes the next ' +

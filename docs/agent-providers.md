@@ -200,6 +200,24 @@ effort strings and message/record types compiled into both binaries.
   fails only on the documented Messages-API fallback. The real `/usage` panel
   still parses. panagent's tests passed with its native Claude tests on 2.1.322,
   and 11 real 2.1.322 sessions converted without a warning.
+- Live check after landing (cefb4dce deployed 04:22 UTC, Deploy #688): nothing
+  newly fails. Live `claude` #17 (`claude-permission`, 2 passed), `agent` #18
+  (1 passed) and `e2b` #19 (7 passed) matched the 2.1.319 runs (#13–#15). This
+  task's own production turn, resumed on the stale E2B template, ran SDK 0.3.322
+  and 2.1.322 from `~/.npm/_npx/…/claude-code` beside the template's Codex
+  0.153.4. `karmax_control` and the browser MCP both worked, and a capability
+  granted while the task waited (`github:actions:write`) reached the turn's
+  token. Its session (54 records from 2.1.319, 261 from 2.1.322) converted
+  without a warning in panagent and in karmax's vendored copy (byte-identical).
+  The task form on tavya.io lists Claude Fable 5.2 (`claude-fable-5-2`,
+  auto…max) above Fable 5.1, and the `fable` alias now reads "Fable 5.2".
+  Production's `app.js` is byte-identical to master's. Not new: of the 30
+  metadata types in the binary's record table (the same in 2.1.319 and 2.1.322),
+  panagent names 12 and would warn on the other 18 (`tag`, `pr-link`,
+  `worktree-state`, `content-replacement`, `relocated`, `fork-context-ref`, …)
+  if a session wrote them. None of tavya's sessions has written them so far.
+  They are deliberately not silenced in bulk, because `content-replacement`,
+  `relocated` and `fork-context-ref` may change what the conversation is.
 
 ## November 7, 2026 Claude Code upgrade audit
 

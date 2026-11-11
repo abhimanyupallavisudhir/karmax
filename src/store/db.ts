@@ -5501,14 +5501,17 @@ export class Store {
 
   /**
    * What needs this person in this organization now: task id → the kinds of the
-   * live asks routed to them, and when the newest arrived. An actionable row is
-   * a live ask by construction (it is deleted when discharged); a mention asks
-   * for attention until it is read. Routine `update` rows never do. Reads by
-   * the (userId, …) indexes.
+   * live asks routed to them, and when the newest arrived. A hold on the person
+   * (review, input, approval, assignment) is a live ask by construction: its
+   * row is deleted when it is discharged. A mention is a notification, whoever
+   * sent it and whatever it says: it counts until it is read (pramana#184 sat
+   * on For me as "Mentioned" after it was read, because a mention "that asks"
+   * was cleared only by speaking in the task). Routine `update` rows never
+   * count. Reads by the (userId, …) indexes.
    */
   async attentionAsks(userId: string, organizationId: string): Promise<Map<string, AttentionAsk>> {
     const rows = (await this.db.prepare(`SELECT taskId, kind, createdAt FROM inbox WHERE userId=? AND organizationId=?
-      AND kind<>'update' AND (actionable=1 OR unread=1) AND subject IS NULL ORDER BY urgency DESC, createdAt DESC`)
+      AND kind<>'update' AND (unread=1 OR (actionable=1 AND kind<>'mentioned')) AND subject IS NULL ORDER BY urgency DESC, createdAt DESC`)
       .all(userId, organizationId)) as Array<{ taskId: string; kind: string; createdAt: number }>;
     // A pull request's ask is its task's (SPEC §11.1): it is the task that waits on them.
     const headers = await this.taskHeaders(rows.map((row) => String(row.taskId)));
@@ -5922,10 +5925,11 @@ export class Store {
       if (task.assignee) users = (await this.expandPrincipal(task.assignee, task.projectId));
     } else if (ev.type === 'task.mentioned') {
       kind = 'mentioned';
-      // An @mention in a task's conversation is addressed to people: an ask, like
-      // a review request — unless it is a reply the task does not wait on
-      // (`ask: false`), news until read (#613). (Historical single-principal
-      // mentions stay routine.)
+      // An @mention in a task's conversation is addressed to people. It is
+      // delivered as an ask (their device alerts them) unless it is a reply the
+      // task does not wait on (`ask: false`, #613), which is routine news.
+      // Either way it is listed for them only until they read it
+      // (`attentionAsks`). (Historical single-principal mentions stay routine.)
       if (Array.isArray(ev.payload.recipients)) {
         actionable = ev.payload.ask !== false;
         users = (await this.humanAudience(task.id, ev.payload.recipients.map(String)));
@@ -6069,7 +6073,7 @@ export class Store {
         OR json_extract(lastView, '$.waitingFor.kind')='human')
       AND COALESCE(json_extract(lastView, '$.status'), '') NOT IN ('done', 'failed', 'cancelled')
       AND COALESCE(json_extract(lastView, '$.waitingFor.kind'), '') <> 'parent'
-      AND id NOT IN (SELECT taskId FROM inbox WHERE actionable=1)`).all()) as Array<{ id: string }>;
+      AND id NOT IN (SELECT taskId FROM inbox WHERE actionable=1 AND kind<>'mentioned')`).all()) as Array<{ id: string }>;
     for (const row of rows) {
       const latest = (await this.db.prepare('SELECT MAX(seq) seq FROM events WHERE taskId=?').get(String(row.id))) as { seq?: number | string | null } | undefined;
       (await this.raiseHold(String(row.id), Number(latest?.seq ?? 0)));
@@ -6081,7 +6085,8 @@ export class Store {
    * tick would: to its escalation audience, as a review request in Review and
    * an escalation otherwise. Quietly (no email or push): it restates a hold the
    * person may already know of. A live approval is already the ask, and a
-   * person who already has an actionable row on the task keeps that one.
+   * person who already has a hold's row on the task keeps that one; a mention
+   * is replaced, as a lifecycle tick replaces it (once read it lists nothing).
    */
   private async raiseHold(taskId: string, eventSeq: number, at?: number): Promise<void> {
     const state = (await this.db.prepare(`SELECT json_extract(lastView, '$.stage') stage,
@@ -6097,7 +6102,8 @@ export class Store {
     const kind: InboxItem['kind'] = state.stage === 'review' ? 'review-requested' : 'escalated';
     const createdAt = at ?? (Number(state.updatedAt) || Date.now());
     for (const userId of new Set(await this.escalationAudience(task))) {
-      if ((await this.db.prepare('SELECT 1 FROM inbox WHERE userId=? AND taskId=? AND actionable=1').get(userId, taskId))) continue;
+      if ((await this.db.prepare("SELECT 1 FROM inbox WHERE userId=? AND taskId=? AND actionable=1 AND kind<>'mentioned'").get(userId, taskId))) continue;
+      (await this.deleteInbox("userId=? AND taskId=? AND kind='mentioned'", [userId, taskId]));
       (await this.db.prepare(`INSERT OR IGNORE INTO inbox
         (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt)
         VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?)`).run(newId('inbox'), project.organizationId, userId,

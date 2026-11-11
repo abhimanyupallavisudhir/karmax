@@ -52,6 +52,7 @@ import { spawnReplacementProcess, worldLandedInCheckout } from './util/live-rest
 import { EntitlementQueueReconciler } from './platform/entitlement-queue-reconciler.js';
 import { beginRuntimeLifecycle, endRuntimeLifecycle } from './util/runtime-lifecycle.js';
 import type { WorldHandle } from './world/types.js';
+import type { KarmaxEvent } from './domain/types.js';
 
 const VERSION = '1.0.0';
 
@@ -885,7 +886,12 @@ async function main() {
   // Node invocation after the task has had time to settle in Temporal. Dev mode
   // already has tsx's watcher and must not spawn a second successor.
   let sourceRestartScheduled = false;
-  bus.onAny(async (event) => {
+  // The bus calls listeners synchronously and drops what they return, so this
+  // async one handles its own failure: a store read refused here must not
+  // become a rejection nothing handles (tavya-error 898a8a05d25ae93e's class).
+  bus.onAny((event) => { void restartAfterLiveSourceMerge(event).catch((error) =>
+    console.warn(`  • Could not check whether task ${event.taskId} changed the live checkout:`, error)); });
+  async function restartAfterLiveSourceMerge(event: KarmaxEvent): Promise<void> {
     if (sourceRestartScheduled || process.env.npm_lifecycle_event === 'dev'
       || event.type !== 'view.updated'
       || (event.payload as { status?: string } | undefined)?.status !== 'done') return;
@@ -897,7 +903,7 @@ async function main() {
     sourceRestartScheduled = true;
     console.log(`  • Task ${event.taskId} updated the live checkout; scheduling a graceful restart`);
     setTimeout(() => { void shutdown(true, `live-source-merge:${event.taskId}`); }, 1500).unref();
-  });
+  }
   // Capture precedes worker startup, but polling follows every subscriber.
   // Durable rows retain events emitted during coordinator/bootstrap recovery.
   if (separateWorker) eventRelay = await ForeignEventRelay.create(store, bus, {

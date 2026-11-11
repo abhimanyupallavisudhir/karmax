@@ -589,6 +589,26 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect((await meta()).skin).toBe('');
   });
 
+  it('switches the installation\'s task list layout, one line by default, and tells every console', async () => {
+    const meta = async () => (await (await fetch(`${base}/api/meta`)).json()) as any;
+    const put = (values: Record<string, unknown>, token?: string) => fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: token ? { authorization: `Bearer ${token}`, 'content-type': 'application/json' } : auth(), body: JSON.stringify({ values }),
+    });
+    expect((await meta()).taskList).toBe('');
+    for (const layout of ['status-first', 'ruled', 'cards']) {
+      expect((await put({ taskList: layout })).status).toBe(200);
+      expect((await meta()).taskList).toBe(layout);
+    }
+    // The look and the logo stay as they were.
+    expect(await (await fetch(`${base}/api/settings/global/appearance`, { headers: auth() })).json()).toMatchObject({ icon: 'diamond', skin: '', taskList: 'cards' });
+    expect((await put({ taskList: 'grid' })).status).toBe(400);
+    const dev = (await h.tokens.mintPrincipal('user:dev', ['task:*', 'project:read'])).token;
+    expect((await put({ taskList: '' }, dev)).status).toBe(403);
+    expect((await meta()).taskList).toBe('cards');
+    expect((await put({ taskList: '' })).status).toBe(200);
+    expect((await meta()).taskList).toBe('');
+  });
+
   it('omits the disabled Resolve agent from schemas and profiles', async () => {
     const schemas = (await (await fetch(`${base}/api/schema`, { headers: auth() })).json()) as any[];
     const softwareDev = schemas.find((s) => s.name === 'software-dev');

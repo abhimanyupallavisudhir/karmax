@@ -30,8 +30,8 @@ interface Subscriber {
   running: boolean;
   closed: boolean;
 }
-/** Unsubscribes when called; `audience` changes the organizations it is offered. */
-export type FanoutSubscription = (() => void) & { audience(organizations: FanoutAudience): void };
+/** Unsubscribes when called; `audience` changes the organizations it is offered, `reads` tells them. */
+export type FanoutSubscription = (() => void) & { audience(organizations: FanoutAudience): void; reads(): FanoutAudience };
 
 export class DurableEventFanout {
   private everyone = new Set<Subscriber>();
@@ -68,6 +68,7 @@ export class DurableEventFanout {
     this.index(subscriber, audience);
     return Object.assign(() => this.remove(subscriber), {
       audience: (organizations: FanoutAudience) => { if (!subscriber.closed) this.index(subscriber, organizations); },
+      reads: () => subscriber.audience,
     });
   }
 

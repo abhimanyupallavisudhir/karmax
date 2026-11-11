@@ -1,7 +1,8 @@
 // Automated accessibility checks (axe-core, WCAG 2.2 A/AA) on the console's main
 // pages — For me with its in-row decisions, a task asking for a credential, a
 // task with a question, settings, Insights, the profile — and the public site
-// (landing, docs, pricing, policies), in both looks, light and dark, and on a phone. Fails on any violation, so a contrast, label, name
+// (landing, docs, pricing, policies), in both looks, light and dark, and on a phone; the lists also in the other
+// task list layouts (Installation → Appearance → Task list). Fails on any violation, so a contrast, label, name
 // or target-size regression is caught before it ships.
 // Run: node tests/accessibility-check.cjs   (A11Y_REPORT=1 prints every violation; CI runs it from tests/accessibility.browser.test.ts)
 const assert = require('node:assert/strict');
@@ -28,6 +29,9 @@ const LOOKS = [
   { name: 'classic light', skin: 'classic', scheme: 'light' },
   { name: 'classic dark', skin: 'classic', scheme: 'dark' },
   { name: 'phone', skin: '', scheme: 'light', viewport: { width: 390, height: 844 } },
+  // The other task list layouts: only the pages that are lists.
+  ...['status-first', 'ruled', 'cards'].flatMap((taskList) => ['light', 'dark'].map((scheme) =>
+    ({ name: `${taskList} ${scheme}`, skin: '', scheme, taskList, pages: ['for me', 'inbox'], lists: true }))),
 ];
 
 (async () => {
@@ -38,15 +42,16 @@ const LOOKS = [
       const context = await browser.newContext({ serviceWorkers: 'block', viewport: look.viewport || { width: 1280, height: 820 }, colorScheme: look.scheme });
       await context.addInitScript((skin) => { try { localStorage.setItem('karmax-skin', skin); } catch {} }, look.skin);
       await uxConsole(context);
-      await context.route('**/api/meta', (route) => route.fulfill({ json: { siteName: 'Fixture', hostLocal: true, consoleRevision: 'one', agent: { provider: 'mock' }, worldProviders: [], skin: look.skin } }));
+      await context.route('**/api/meta', (route) => route.fulfill({ json: { siteName: 'Fixture', hostLocal: true, consoleRevision: 'one', agent: { provider: 'mock' }, worldProviders: [], skin: look.skin, taskList: look.taskList || '' } }));
       const page = await context.newPage();
-      for (const [name, url] of PAGES) {
+      for (const [name, url] of PAGES.filter(([name]) => !look.pages || look.pages.includes(name))) {
         await page.goto(`http://console.test${url}`);
         await page.locator('#main').waitFor();
         await page.waitForTimeout(1200);
         await check(page, look, name);
       }
       await context.close();
+      if (look.lists) continue;
       // The public site, signed out.
       const outside = await browser.newContext({ serviceWorkers: 'block', viewport: look.viewport || { width: 1280, height: 820 }, colorScheme: look.scheme, reducedMotion: 'reduce' });
       await outside.addInitScript((skin) => { try { localStorage.setItem('karmax-skin', skin); } catch {} }, look.skin);

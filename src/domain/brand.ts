@@ -45,6 +45,21 @@ export function skinOf(settings: Record<string, unknown> | undefined): Skin {
   return isSkin(settings?.skin) ? settings.skin : '';
 }
 
+/** How task lists lay out their rows (web/styles.css "task row"): '' is one
+ * line per task with aligned columns; 'status-first' two lines led by the
+ * status glyph; 'ruled' two lines on one ruled surface; 'cards' a card per
+ * task. Installation-wide, like the look. */
+export const TASK_LISTS = ['', 'status-first', 'ruled', 'cards'] as const;
+export type TaskList = (typeof TASK_LISTS)[number];
+
+export function isTaskList(value: unknown): value is TaskList {
+  return TASK_LISTS.includes(value as TaskList);
+}
+
+export function taskListOf(settings: Record<string, unknown> | undefined): TaskList {
+  return isTaskList(settings?.taskList) ? settings.taskList : '';
+}
+
 export function siteNameError(value: unknown): string | undefined {
   if (typeof value !== 'string' || !value.trim()) return 'Site name is required';
   if ([...value.trim()].length > MAX_SITE_NAME_LENGTH)

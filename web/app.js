@@ -93,6 +93,8 @@ const ICON = {
   copy: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
   edit: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg>',
   attach: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.4 11.6-8.9 8.9a6 6 0 0 1-8.5-8.5l9.4-9.4a4 4 0 0 1 5.7 5.7l-9.5 9.5a2 2 0 0 1-2.8-2.8l8.8-8.8"/></svg>',
+  // A row's Delete: shown on the row you point at, like Archive.
+  trash: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/></svg>',
   // Sidebar tree vocabulary: a plain chevron folds a folder (rotated 90° when
   // open) and a box marks a project — the container of its tasks, repositories,
   // wiki and files. (A checklist read as one task's todo list; a folder would
@@ -199,6 +201,9 @@ const S = {
   searchRefusal: '', // …because the server refused it (4xx), in the server's words
   searchPending: false, // a new query is being evaluated; the list labels its interim local preview
   wsOnline: true, // live socket up; false shows the floating "Reconnecting" pill
+  // This tab, to the gateway: its requests carry it and its live socket names
+  // it, so the tab that made a write is not told of it again (see applyChangeNotice).
+  clientId: `tab_${(globalThis.crypto?.randomUUID?.() || `${Date.now()}${Math.random()}`).replace(/[^A-Za-z0-9]/g, '').slice(0, 32)}`,
   orgProjectId: null, // which project S.tags/S.views were loaded for (staleness guard)
   schema: [],
   paramDefaults: {},
@@ -4039,7 +4044,8 @@ function api(path, opts = {}) {
 async function fetchApi(path, opts = {}) {
   const res = await feedbackFetch(path, {
     ...opts,
-    headers: { 'content-type': 'application/json', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}), ...(opts.headers || {}) },
+    headers: { 'content-type': 'application/json', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}),
+      ...(S.clientId ? { 'x-tavya-client': S.clientId } : {}), ...(opts.headers || {}) },
   });
   if (res.status === 401) {
     S.token = null;
@@ -4722,18 +4728,31 @@ async function checkConsoleRevision() {
   return false;
 }
 
+// A page that was out of sight heard nothing: events and change notices are
+// dropped while hidden, and a phone or a sleeping laptop freezes the page and
+// may lose the socket without a close. So coming back reads again whatever is
+// on screen — when something was dropped, and after any absence long enough
+// for the socket to have died unnoticed — and asks the socket to prove itself
+// quickly instead of showing the old state until the next liveness tick.
+const AWAY_REFRESH_MS = 15_000;
+const RESUME_PONG_WAIT_MS = 3_000;
+let hiddenSince = 0;
 function resumeVisibleUpdates() {
-  if (document.hidden) return;
+  if (document.hidden) { hiddenSince ||= Date.now(); return; }
+  const away = hiddenSince ? Date.now() - hiddenSince : 0;
+  hiddenSince = 0;
   checkWsLiveness(true);
-  if (S.liveUpdatesStale) {
+  if (away >= AWAY_REFRESH_MS) setTimeout(() => { if (wsPingSentAt && Date.now() - wsPingSentAt >= RESUME_PONG_WAIT_MS) reconnectWs(); }, RESUME_PONG_WAIT_MS);
+  if (S.liveUpdatesStale || away >= AWAY_REFRESH_MS) {
     S.liveUpdatesStale = false;
+    api.defaults?.clear();
     resourceReviewCache.clear(); resourceInventoryCache.clear();
     loadInbox().catch(() => {});
     if (S.selected) { S.liveOutput = {}; refreshTask(); refreshTaskHistory(S.selected); }
     else if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks();
     else if (isCrossProjectList()) scheduleHomeRefresh();
     else if (S.tab === 'activity') seedActivity();
-  }
+  } else readAsksOnScreen();
   checkConsoleRevision();
   if (S.tab === 'installation') { refreshHostDiag(); refreshProcPanel(); }
   if (S.onboarding?.display === 'expanded') refreshOnboarding();
@@ -4743,6 +4762,8 @@ function watchConsoleRevision() {
   if (consoleRevisionTimer) return;
   consoleRevisionTimer = setInterval(checkConsoleRevision, 60_000);
   document.addEventListener('visibilitychange', resumeVisibleUpdates);
+  // Back at this window: what arrived for the task on screen has now been seen.
+  window.addEventListener('focus', readAsksOnScreen);
 }
 
 // ── boot ─────────────────────────────────────────────────────────────────────
@@ -4914,10 +4935,17 @@ function installShellListeners() {
   installTagRouter();
   installInfoDotTips();
   installRunNow();
-  // A background repaint deferred to protect an open menu / text-selection gets
-  // flushed once that interaction releases (setTimeout lets focus + selection
-  // settle first). selectionchange fires constantly, so it only pokes the flush
-  // when something is actually waiting.
+  installRepaintGuard();
+  window.addEventListener('popstate', () => { closeTaskFormPage(); applyRoute(); });
+}
+
+// A background repaint waits while a press, an open menu or a text selection
+// is in the list (interactionInFlight), and is flushed once it releases
+// (setTimeout lets focus + selection settle first). selectionchange fires
+// constantly, so it only pokes the flush when something is actually waiting.
+function installRepaintGuard() {
+  if (installRepaintGuard.installed) return;
+  installRepaintGuard.installed = true;
   document.addEventListener('pointerdown', (event) => {
     const main = $('#main');
     if (main?.contains(event.target)) mainPointerDown = true;
@@ -4933,7 +4961,6 @@ function installShellListeners() {
   document.addEventListener('pointercancel', releaseMainPointer, true);
   document.addEventListener('focusout', () => setTimeout(flushBgRender, 0));
   document.addEventListener('selectionchange', () => { if (bgRenderQueued) setTimeout(flushBgRender, 0); });
-  window.addEventListener('popstate', () => { closeTaskFormPage(); applyRoute(); });
 }
 
 async function loadProjects(request = api('/api/projects')) {
@@ -5016,13 +5043,32 @@ async function loadInbox() {
     api(`/api/inbox?organizationId=${encodeURIComponent(organization.id)}`)));
   if (S.inboxLoadEpoch !== epoch) return;
   const seen = S.announcedInbox;
+  const before = S.inboxState;
   S.inbox = inboxes.flat();
+  S.inboxState = inboxState(S.inbox);
   S.announcedInbox = new Map(S.inbox.map((item) => [item.id, urgencyRank(item.urgency)]));
+  // What arrives about the task in front of the person is read as it arrives,
+  // and is not announced to someone already looking at it.
+  readAsksOnScreen();
   announceInbox(inboxArrivals(seen, S.inbox));
   updateBell();
+  // Nobody is looking: the sidebar and the list are read again when they are.
+  if (document.hidden) { S.liveUpdatesStale = true; return; }
   refreshForMeCounts();
-  // The bell's page lists what the inbox says waits on you.
+  // The bell's page lists what the inbox says waits on you; every other list
+  // marks what is new and holds the For me view, so it follows the inbox too.
   if (S.tab === 'inbox' && !S.selected) scheduleHomeRefresh();
+  else if (before !== undefined && before !== S.inboxState) refreshListQuietly();
+}
+// What the lists draw from the inbox: which asks exist and which are unread.
+function inboxState(items) {
+  return items.map((item) => `${item.id}:${item.kind}:${item.unread ? 1 : 0}`).sort().join(' ');
+}
+// Re-run the list on screen behind the person's back (no loading state).
+function refreshListQuietly() {
+  if (S.selected) return;
+  if (isCrossProjectList()) scheduleHomeRefresh();
+  else if (S.tab === 'tasks') scheduleSearch(true);
 }
 
 function inboxEventChanges(ev) {
@@ -5582,6 +5628,69 @@ function scheduleTaskListReload() {
   }, 350);
 }
 
+// ── writes made elsewhere ────────────────────────────────────────────────────
+// Someone wrote through the API — in another tab, on another device, a
+// colleague, an agent — and most writes record no task event (archive, tags,
+// priority, notes, a saved view, reading an inbox ask). The gateway says which
+// task, project and organization each write addressed (src/gateway/
+// change-notices.ts), and this page reads again what it shows of them. It
+// never hears of its own writes, which it applied itself. A notice names no
+// content: one too many costs a read, and the loaders coalesce bursts.
+function applyChangeNotice(notice) {
+  // Reads kept "until this tab's next write" are as stale after anyone else's.
+  api.defaults?.clear();
+  // My own state changed on another of my tabs or devices: what I have read,
+  // or a preference that follows me (a dismissed recommendation).
+  if (notice.own) {
+    if (notice.area === 'inbox') scheduleInboxReload();
+    else if (notice.area === 'user') api('/api/user/preferences').then((preferences) => {
+      S.preferences = preferences;
+      if (isTaskListTab() && !S.selected) bgRenderMain();
+    }).catch(() => {});
+    // Something of mine that belongs to no organization yet: one I just made.
+    else scheduleStructureReload(notice);
+    return;
+  }
+  const { taskId, projectId, organizationId } = notice;
+  if (taskId && (S.inbox || []).some((item) => item.taskId === taskId)) scheduleInboxReload();
+  if (S.selected && taskId && changeTouchesOpenTask(taskId)) refreshTask('changed attempt');
+  if (isCrossProjectList()) {
+    if (S.tab === 'inbox' || organizationId === S.organizationId) scheduleHomeRefresh();
+  } else if (projectId && projectId === S.projectId) scheduleTaskListReload();
+  // A draft made or deleted elsewhere is for me too: the sidebar counts them.
+  if (organizationId === S.organizationId) refreshForMeCounts(800);
+  // Not a task's: the project or organization itself (a project made or
+  // renamed, tags, saved views). Pages with forms are left as they are.
+  if (!taskId) scheduleStructureReload(notice);
+}
+// The open task, its sub-tasks, its parent and its other attempts are all on its page.
+function changeTouchesOpenTask(taskId) {
+  return taskId === S.selected
+    || (S.view?.subTaskSummaries || []).some((summary) => summary.id === taskId)
+    || (S.attemptGroup?.attempts || []).some((attempt) => attempt.id === taskId)
+    || taskRecord(S.selected)?.parentTaskId === taskId;
+}
+let structureReload = null;
+function scheduleStructureReload(notice) {
+  const pending = structureReload ||= { projects: new Set(), organizations: new Set(), timer: null };
+  if (notice.projectId) pending.projects.add(notice.projectId);
+  if (notice.organizationId) pending.organizations.add(notice.organizationId);
+  pending.timer ||= setTimeout(async () => {
+    structureReload = null;
+    try {
+      await Promise.all([loadProjects(), loadOrganizations()]);
+      renderRail();
+      // Lists and the task page draw the project's tags and the saved views.
+      let repaint = false;
+      if (pending.projects.has(S.projectId)) repaint = await loadOrg();
+      if (S.tab === 'home' && pending.organizations.has(S.organizationId)) { await loadOrgViews(); repaint = true; }
+      if (!repaint) return;
+      if (S.selected) scheduleTaskPageRender();
+      else if (isTaskListTab()) bgRenderMain();
+    } catch { /* the next notice or navigation reads again */ }
+  }, 500);
+}
+
 function connectWs() {
   if (connectWs.retryTimer) clearTimeout(connectWs.retryTimer);
   if (S.ws) {
@@ -5590,16 +5699,26 @@ function connectWs() {
   }
   wsPingSentAt = 0;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws${S.clientId ? `?client=${S.clientId}` : ''}`);
   S.ws = ws;
   ws.onmessage = (m) => {
     wsHeardAt = Date.now(); wsPingSentAt = 0;
     let ev;
     try { ev = JSON.parse(m.data); } catch { return; }
     if (ev.type === 'pong') return;
+    noteRowAskEvent(ev);
     if (ev.type === 'timing.setting') { applyTimingSetting(ev.enabled); return; }
     if (ev.type === 'timing' && !S.meta?.timingEnabled) return;
-    if (document.hidden) { S.liveUpdatesStale = true; return; }
+    if (document.hidden) {
+      // Out of sight, the page waits to be looked at before it reads anything
+      // again — except what asks for the person: a notification matters most
+      // when they are elsewhere, so the inbox (the tab title's count, the
+      // alert and its sound) is kept current.
+      S.liveUpdatesStale = true;
+      if (ev.type === 'changed' ? ev.own && ev.area === 'inbox' : inboxEventChanges(ev)) scheduleInboxReload();
+      return;
+    }
+    if (ev.type === 'changed') { applyChangeNotice(ev); return; }
     // Streamed text chunks are the live bubble's, not activity (LT-5).
     if (S.tab === 'activity' && !liveOnlyEvent(ev.type) && (!ev.projectId || ev.projectId === S.projectId)) {
       S.activity.unshift(ev);
@@ -5692,6 +5811,8 @@ function connectWs() {
     setWsOnline(true);
     syncLiveWatch();
     if (wsHadDropped) checkConsoleRevision();
+    // Approval events may have been missed: every list row reloads its asks.
+    if (wsHadDropped) rowAskEpoch++;
     if (wsHadDropped && document.hidden) S.liveUpdatesStale = true;
     else if (wsHadDropped) {
       loadInbox().catch(() => {});
@@ -5857,6 +5978,7 @@ function siteNameMarkup() { return esc(siteName()); }
 
 function applyDocumentBrand() {
   applySkin(S.meta?.skin);
+  applyTaskList(S.meta?.taskList);
   document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute('content', siteName());
   document.querySelector('meta[name="description"]')?.setAttribute('content',
     `${siteName()} is the agentic to-do list that finishes itself: agents work in parallel on their own computers; you review the result. Use your Claude or ChatGPT plan.`);
@@ -7080,20 +7202,23 @@ function tasksView() {
   const notices = inboxNoticesHtml();
   const store = isStoreQuery(S.search);
   let body;
+  // Rows sit on one surface, ruled between (`.task-list`): a list, not a stack of cards.
+  const list = (rows) => (rows ? `<div class="task-list">${rows}</div>` : '');
   if (store) {
     body = storeViewHtml();
   } else if (groups) {
     body = r.hierarchical
       ? [
-        ...(groups.find((g) => g.key === '__untagged__')?.tasks || []).map((t) => row(t, { showTags: false })),
+        list((groups.find((g) => g.key === '__untagged__')?.tasks || []).map((t) => row(t, { showTags: false })).join('')),
         ...groups.filter((g) => g.key !== '__untagged__').map((g) => tagGroupHtml(g)),
       ].join('')
-      : groups.map((g) => {
+      // One list, its groups headed inside it, so their columns line up.
+      : list(groups.map((g) => {
         const gt = g.tasks;
         return `<h2 class="task-group-heading">${esc(g.label)} <span class="task-group-count">${gt.length} task${gt.length === 1 ? '' : 's'}</span></h2>${gt.map((t) => row(t)).join('')}`;
-      }).join('');
+      }).join(''));
   } else {
-    body = flat.map((t) => row(t)).join('');
+    body = list(flat.map((t) => row(t)).join(''));
   }
   // Every empty list is one muted line; the query it ran is in the search box.
   const empty = S.searchFailed
@@ -7131,7 +7256,7 @@ function tasksView() {
       </div>
       <div class="organizer-row">${viewsBar()}${queryToolbarHtml(S.search || '', 'q', trailing)}</div>
     </div>
-    ${notices}${store ? body : body || empty}${storeRecsHtml()}`;
+    ${notices ? `<div class="task-list">${notices}</div>` : ''}${store ? body : body || empty}${storeRecsHtml()}`;
 }
 
 // The organization home's project filter: a `project:` clause in the query, so
@@ -7278,7 +7403,7 @@ function storeViewHtml() {
   if (!items) return '';
   const words = (S.search || '').replace(/(^|\s)-?[\w.#-]+:\S*/g, ' ').toLowerCase().split(/\s+/).filter(Boolean);
   const shown = items.filter((item) => words.every((word) => `${item.name} ${item.summary}`.toLowerCase().includes(word)));
-  return shown.length ? shown.map(storeRowHtml).join('') : `<div class="card queue-empty">No matching tasks</div>`;
+  return shown.length ? `<div class="task-list">${shown.map(storeRowHtml).join('')}</div>` : `<div class="card queue-empty">No matching tasks</div>`;
 }
 // The Task store view is not a search of tasks: it loads the store (a promise
 // in place of the search). The default view loads it alongside, to recommend from.
@@ -7325,7 +7450,7 @@ function storeRecsHtml() {
   ].filter(Boolean).join('<span aria-hidden="true">·</span>');
   return `<section class="store-recs">
       <h2 class="task-group-heading"><span>Recommended from the <a href="${esc(store)}" data-store-view>Task store</a></span><button class="btn sm ghost" id="store-recs-dismiss">Dismiss</button></h2>
-      ${ready.map(storeRowHtml).join('')}${more ? `<div class="store-recs-more">${more}</div>` : ''}
+      ${ready.length ? `<div class="task-list">${ready.map(storeRowHtml).join('')}</div>` : ''}${more ? `<div class="store-recs-more">${more}</div>` : ''}
     </section>`;
 }
 function wireTaskStore() {
@@ -7512,7 +7637,7 @@ function tagGroupHtml(group, keep = () => true, depth = 0) {
       <span class="tag-section-count">${count} task${count === 1 ? '' : 's'}</span>${edit}
     </h${level}>
     ${description}
-    <div class="tag-section-tasks">${ownTasks.map((t) => taskRow(t, { showTags: false })).join('')}</div>
+    ${ownTasks.length ? `<div class="tag-section-tasks task-list">${ownTasks.map((t) => taskRow(t, { showTags: false })).join('')}</div>` : ''}
     <div class="tag-section-children">${children}</div>
   </section>`;
 }
@@ -7582,16 +7707,18 @@ function seriesRow(t, where = '') {
   if (t.params?.triggers?.length) bits.push(triggerSummary(t.params.triggers));
   bits.push(`${runs.length} run${runs.length === 1 ? '' : 's'}`);
   const runsHtml = expanded ? runs.map(runSubRow).join('') : '';
+  const summary = bits.join('  ·  ');
   return `
     <div class="task-row series-row" data-series="${t.id}">
-      <button class="icon-btn series-caret" data-expand="${t.id}" title="Show runs">${expanded ? '▾' : '▸'}</button>
+      <button class="icon-btn series-caret task-lead" data-expand="${t.id}" title="Show runs" aria-expanded="${expanded}">${expanded ? '▾' : '▸'}</button>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">repeatable</span></div>
-        <div class="task-sub">${where}<span style="color:var(--ink-3)">${esc(bits.join('  ·  '))}</span></div>
+        <div class="task-sub">${where}</div>
       </div>
+      <div class="task-state" title="${esc(summary)}"><span class="task-state-more">${esc(summary)}</span></div>
       <div class="task-right">
         <button class="btn sm" data-runagain="${t.id}">Run again</button>
-        <button class="btn sm danger" data-delseries="${t.id}">Delete</button>
+        <button class="icon-btn danger" data-delseries="${t.id}" title="Delete" aria-label="Delete">${ICON.trash}</button>
       </div>
     </div>${runsHtml}`;
 }
@@ -7600,11 +7727,12 @@ function runSubRow(r) {
   const v = r.lastView || {};
   return `
     <div class="task-row run-row" data-id="${r.id}">
+      ${statusHtml('', statusTone(v), { className: 'task-lead' })}
       <div class="task-main">
-        <div class="task-title">${esc(r.title)} ${viewStatusHtml(v)}</div>
-        <div class="task-sub"><span style="color:var(--ink-3)">${new Date(r.createdAt).toLocaleString()}</span></div>
+        <div class="task-title">${esc(r.title)}</div>
       </div>
-      <div class="task-right">${pipeline(v)}</div>
+      <div class="task-state">${viewStatusHtml(v)}</div>
+      <div class="task-right">${pipeline(v)}${rowWhen(r)}</div>
     </div>`;
 }
 
@@ -7617,21 +7745,28 @@ function awaitingApprovalStatus() {
 function restingAvatar(t) { return !!t?.params?.avatar && !!t.params.draft && !t.lastView; }
 const avatarChip = '<span class="chip avatar-chip" title="Avatār: its forks act with its authorization">✦ Avatār</span>';
 
+// A list row reads across in columns: its status glyph (`.task-lead`, a status
+// whose label is the status column's), the title with where it lives and its
+// labels, the status in words, then stage and age. Whose move it is reads down
+// the list's left edge.
 function taskRow(t, { showTags = true, project = false } = {}) {
   const isDraft = t.params?.draft;
   const archived = t.params?.archived;
   const where = project ? projectLabel(t) : '';
   if (isSeries(t.params) && !archived) return seriesRow(t, where);
   if (t.params?.triggerState === 'armed' && !archived) {
+    const trigger = triggerSummary(t.params.triggers);
     return `
     <div class="task-row" data-armed="${t.id}">
+      ${statusHtml('', 'waiting', { className: 'task-lead' })}
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub">${where}${statusHtml('Waiting for trigger', 'waiting')}<span style="color:var(--ink-3)">${esc(triggerSummary(t.params.triggers))}</span></div>
+        <div class="task-sub">${where}</div>
       </div>
+      <div class="task-state" title="${esc(`Waiting for trigger · ${trigger}`)}">${statusHtml('Waiting for trigger', 'waiting')}<span class="task-state-more">${esc(trigger)}</span></div>
       <div class="task-right">
         <button class="btn sm" data-runnow="${t.id}">Run now</button>
-        <button class="btn sm danger" data-canceltrig="${t.id}">Cancel</button>
+        <button class="icon-btn" data-canceltrig="${t.id}" title="Cancel the trigger — keep it as a draft" aria-label="Cancel trigger">${ICON.close}</button>
       </div>
     </div>`;
   }
@@ -7644,15 +7779,17 @@ function taskRow(t, { showTags = true, project = false } = {}) {
     const avatar = restingAvatar(t);
     return `
     <div class="task-row" data-draft="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
+      ${statusHtml('', awaiting ? 'human' : 'draft', { className: 'task-lead' })}
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub">${where}${awaiting ? awaitingApprovalStatus() : avatar ? avatarChip : statusHtml('Draft', 'draft')}${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
+        <div class="task-sub">${where}${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
+      <div class="task-state">${awaiting ? awaitingApprovalStatus() : avatar ? avatarChip : statusHtml('Draft', 'draft')}</div>
       <div class="task-right">
         ${rowWhen(t)}
         ${avatar ? `<button class="btn sm" data-fork-avatar="${t.id}">${ICON.fork}Fork</button>`
           : awaiting ? '' : `<button class="btn sm" data-queue="${t.id}">Run task</button>`}
-        <button class="btn sm danger" data-deldraft="${t.id}">Delete</button>
+        <button class="icon-btn danger" data-deldraft="${t.id}" title="Delete" aria-label="Delete">${ICON.trash}</button>
       </div>
     </div>`;
   }
@@ -7668,19 +7805,19 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   const archiveBtn = archived
     ? `<button class="icon-btn" data-unarchive="${t.id}" data-shortcut="list.archive" title="Unarchive — restore to the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg></button>`
     : `<button class="icon-btn" data-archive="${t.id}" data-shortcut="list.archive" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`;
+  // The lead is the most pressing of the row's statuses: an ask of a person
+  // (its reason, or a pending approval) over what the task itself is doing.
+  const lead = why || (v.approvalRequests && !v.state?.draft) ? 'human' : tone;
   return `
     <div class="task-row ${archived ? 'archived' : ''}${taskHasUnreadAsk(t.id) ? ' unread' : ''}" data-id="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
+      ${statusHtml('', lead, { className: 'task-lead' })}
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}${t.params?.coordinator ? ` ${coordinatorChip(t)}` : ''}</div>
-        <div class="task-sub">
-          ${where}${why}
-          ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
-          ${ownAsk && tone === 'human' ? '' : why ? statusHtml(stageLabel(v), tone) : viewStatusHtml(v)}
-          ${priorityFlag(t)}${showTags ? tagChips(t) : ''}
-        </div>
-        ${ownAsk ? rowAskHtml(t) : ''}
+        <div class="task-sub">${where}${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
-      <div class="task-right">${rowWhen(t)}${pipeline(v)}${archiveBtn}</div>
+      <div class="task-state">${why}${ownAsk && tone === 'human' ? '' : why ? statusHtml(stageLabel(v), tone) : viewStatusHtml(v)}</div>
+      <div class="task-right">${pipeline(v)}${rowWhen(t)}${archiveBtn}</div>
+      ${ownAsk ? rowAskHtml(t) : ''}
     </div>`;
 }
 
@@ -7689,10 +7826,23 @@ function taskRow(t, { showTags = true, project = false } = {}) {
 // buttons and handlers (so a decision made here is the same decision), and a
 // row whose question has one-click answers shows those: most asks are answered
 // without opening the task. Decisions load per task, only for rows that ask
-// for one, and again whenever the row's pending count changes.
+// for one, and again when what the task asks may have changed: its pending
+// count, an approval event of its own, or a reconnected stream. Not on every
+// view update: a working agent moves its view on several times a second, and
+// the asks of #904 blinked out and reloaded faster than anyone could click them.
+// While they reload the row keeps showing the ones it has, so nothing jumps.
 const rowDecisions = new Map(); // taskId → { key, credential, permission, authorization, repository, items }
 const rowDecisionLoads = new Map();
-function rowDecisionKey(t) { return `${t.lastView?.pendingDecisions ?? ''}:${t.lastView?.updatedAt ?? ''}`; }
+const rowAskVersions = new Map(); // taskId → its approval events seen
+let rowAskEpoch = 0; // a stream that dropped may have missed some
+const rowAnswering = new Set(); // request ids whose answer is on its way
+const rowAnswered = new Set(); // and answered: gone from the row before its reload says so
+function rowDecisionKey(t) { return `${t.lastView?.pendingDecisions ?? ''}:${rowAskVersions.get(t.id) ?? 0}:${rowAskEpoch}`; }
+const ROW_ASK_EVENT = /\.approval-(?:requested|resolved|dismissed)$|^connection\.(?:requested|resolved|updated|dismissed)$/;
+function noteRowAskEvent(ev) {
+  if (ev.taskId && ROW_ASK_EVENT.test(ev.type || '')) rowAskVersions.set(ev.taskId, (rowAskVersions.get(ev.taskId) ?? 0) + 1);
+}
+function rowDecisionId(row) { return row.dataset.vreq || row.dataset.preq || row.dataset.areq || row.dataset.raccess; }
 function rowOrganizationId(t) {
   return projectById(t.projectId)?.organizationId || S.searchResult?.projects?.find((p) => p.id === t.projectId)?.organizationId || S.organizationId;
 }
@@ -7721,9 +7871,10 @@ function rowAskHtml(t) {
   }
   if (ask?.kind !== 'approval-requested') return '';
   const loaded = rowDecisions.get(t.id);
-  if (!loaded || loaded.key !== rowDecisionKey(t)) return `<div class="row-ask" data-row-decisions="${esc(t.id)}" data-loading></div>`;
+  if (!loaded) return `<div class="row-ask" data-row-decisions="${esc(t.id)}" data-loading></div>`;
+  const stale = loaded.key !== rowDecisionKey(t);
   const signedIn = typeof S.user === 'string' ? S.user : S.user?.id;
-  const pending = (list) => (list || []).filter((request) => request.status === 'pending' && !request.dismissed);
+  const pending = (list) => (list || []).filter((request) => request.status === 'pending' && !request.dismissed && !rowAnswered.has(request.id));
   const itemLabel = (id) => loaded.items.find((item) => item.id === id)?.label || 'a saved credential';
   const decisions = [
     ...pending(loaded.credential).map((request) => {
@@ -7749,7 +7900,12 @@ function rowAskHtml(t) {
       <span class="row-ask-actions"><button type="button" class="btn sm primary" data-raccess-act="approve">Give access</button><button type="button" class="btn sm" data-raccess-act="deny">Deny</button></span></div>`),
   ];
   if (!decisions.length) return '';
-  return `<div class="row-ask" data-row-decisions="${esc(t.id)}">${decisions.slice(0, 2).join('')}${decisions.length > 2 ? `<span class="task-sub">${decisions.length - 2} more — open the task</span>` : ''}</div>`;
+  // An answer on its way keeps its buttons pressed through a repaint.
+  const shown = decisions.slice(0, 2).map((html) => {
+    const id = html.match(/data-(?:vreq|preq|areq|raccess)="([^"]*)"/)?.[1];
+    return id && rowAnswering.has(id) ? html.replace(/<button /g, '<button disabled ') : html;
+  });
+  return `<div class="row-ask" data-row-decisions="${esc(t.id)}"${stale ? ' data-stale' : ''}>${shown.join('')}${decisions.length > 2 ? `<span class="task-sub">${decisions.length - 2} more — open the task</span>` : ''}</div>`;
 }
 async function loadRowDecisions(t) {
   const key = rowDecisionKey(t);
@@ -7775,25 +7931,61 @@ function wireRowAsks(root = $('#main')) {
     await Promise.all([loadInbox().catch(() => {}), refreshTasks()]);
     if (isCrossProjectList()) scheduleHomeRefresh();
   };
-  root.querySelectorAll('[data-row-decisions][data-loading]').forEach((box) => {
+  // Show a row's asks as they are now: its box, re-drawn only when that changes
+  // anything, and never under a press (the repaint after it will).
+  const redraw = (id) => {
+    const live = root.querySelector(`[data-row-decisions="${CSS.escape(id)}"]`);
+    const t = taskOf(id);
+    if (!live || !t) return;
+    if (mainPointerDown) { bgRenderQueued = true; return; }
+    const html = rowAskHtml(t) || '';
+    const next = document.createElement('template');
+    next.innerHTML = html;
+    const box = next.content.firstElementChild;
+    if (box && !box.hasAttribute('data-loading') && live.innerHTML === box.innerHTML) {
+      live.toggleAttribute('data-stale', box.hasAttribute('data-stale'));
+      live.removeAttribute('data-loading');
+    } else {
+      live.outerHTML = html;
+    }
+    wireRowAsks(root);
+  };
+  root.querySelectorAll('[data-row-decisions][data-loading], [data-row-decisions][data-stale]').forEach((box) => {
     const t = taskOf(box.dataset.rowDecisions);
     if (!t) return;
-    loadRowDecisions(t).then(() => {
-      const live = root.querySelector(`[data-row-decisions="${CSS.escape(t.id)}"][data-loading]`);
-      if (!live) return;
-      live.outerHTML = rowAskHtml(t) || '';
-      wireRowAsks(root);
-    });
+    const key = rowDecisionKey(t);
+    if (rowDecisionLoads.get(t.id)?.key === key) return; // already on its way, and its end redraws
+    loadRowDecisions(t).then(() => redraw(t.id));
   });
   root.querySelectorAll('[data-row-decisions]:not([data-loading]):not([data-wired])').forEach((box) => {
     box.dataset.wired = '1';
-    const t = taskOf(box.dataset.rowDecisions);
+    const taskId = box.dataset.rowDecisions;
+    const t = taskOf(taskId);
     const organizationId = t ? rowOrganizationId(t) : S.organizationId;
-    const done = async () => { rowDecisions.delete(box.dataset.rowDecisions); await resolved(); };
-    wireCredentialRequestActions(box, organizationId, done);
-    wirePermissionRequestActions(box, organizationId, done);
-    wireAuthorizationRequestActions(box, organizationId, done);
-    wireRepositoryAccessRequestActions(box, organizationId, done);
+    // Pressed, the answer stays pressed until it lands; landed, it leaves the row at once.
+    box.addEventListener('click', (event) => {
+      const pressed = event.target.closest('button');
+      const row = pressed?.closest('.row-decision');
+      if (!row || pressed.disabled || !rowDecisionId(row)) return;
+      rowAnswering.add(rowDecisionId(row));
+      // One answer per ask: its handler disables the button pressed, this the others.
+      row.querySelectorAll('button').forEach((button) => { if (button !== pressed) button.disabled = true; });
+    }, true);
+    const failed = (row) => {
+      rowAnswering.delete(rowDecisionId(row));
+      row.querySelectorAll('button').forEach((button) => { button.disabled = false; });
+    };
+    const done = async (_result, row) => {
+      const id = row && rowDecisionId(row);
+      if (id) { rowAnswering.delete(id); rowAnswered.add(id); }
+      // Its own event and the task's new count reload what is left.
+      redraw(taskId);
+      await resolved();
+    };
+    wireCredentialRequestActions(box, organizationId, done, failed);
+    wirePermissionRequestActions(box, organizationId, done, failed);
+    wireAuthorizationRequestActions(box, organizationId, done, failed);
+    wireRepositoryAccessRequestActions(box, organizationId, done, failed);
   });
   root.querySelectorAll('[data-row-quick]:not([data-wired])').forEach((box) => {
     box.dataset.wired = '1';
@@ -22092,7 +22284,9 @@ function appearanceCard() {
     '<span class="brand-current" id="brand-current"></span>',
     '<button class="btn sm" type="button" id="brand-change" aria-expanded="false" aria-controls="brand-picker">Change</button>')}
       ${instRow(`Style ${policyTip('How the console looks for everyone. Classic is the earlier indigo look. Each person still picks light or dark in their profile.')}`,
-    instSegmented('skin-choice', SKINS.map((skin) => [skin.id, skin.label]), document.documentElement.getAttribute('data-skin') || '', 'Style'))}</div>
+    instSegmented('skin-choice', SKINS.map((skin) => [skin.id, skin.label]), document.documentElement.getAttribute('data-skin') || '', 'Style'))}
+      ${instRow(`Task list ${policyTip('How every task list lays out its rows, for everyone. One line: a task per line, its status in a column. Status first: two lines, led by the status. Ruled: two lines on one surface. Cards: a card per task.')}`,
+    instSegmented('task-list-choice', TASK_LISTS.map((layout) => [layout.id, layout.label]), document.documentElement.getAttribute('data-task-list') || '', 'Task list'))}</div>
       <div class="brand-picker" id="brand-picker" hidden>
         ${BRAND_ICON_CHOICES.map((c) => `<button type="button" class="brand-option" data-icon="${esc(c.id)}" aria-pressed="false">
           <img src="/brand/${esc(c.id)}/icon-192.png" alt="" /><span>${esc(c.label)}</span>
@@ -22127,26 +22321,29 @@ async function wireAppearanceCard() {
   }
   catch { $('#appearance-card').style.display = 'none'; return; }
   mark(current);
-  // The style applies at once and saves on choice, like the logo.
-  const skins = $('#appearance-card .skin-choice');
-  if (skins) {
-    wireInstSegmented(skins.parentElement);
-    skins.addEventListener('change', async () => {
-      const previous = S.meta?.skin || '';
-      const skin = skins.dataset.value || '';
-      applySkin(skin);
+  // The style and the task list apply at once and save on choice, like the logo.
+  const choose = (cls, key, choices, apply, noun) => {
+    const group = $(`#appearance-card .${cls}`);
+    if (!group) return;
+    wireInstSegmented(group.parentElement);
+    group.addEventListener('change', async () => {
+      const previous = S.meta?.[key] || '';
+      const value = group.dataset.value || '';
+      apply(value);
       try {
-        await api('/api/settings/global/appearance', { method: 'PUT', body: JSON.stringify({ values: { skin } }) });
-        if (S.meta) S.meta.skin = skin;
-        toast(`${SKINS.find((choice) => choice.id === skin)?.label || 'Default'} style`);
+        await api('/api/settings/global/appearance', { method: 'PUT', body: JSON.stringify({ values: { [key]: value } }) });
+        if (S.meta) S.meta[key] = value;
+        toast(`${choices.find((choice) => choice.id === value)?.label || choices[0].label} ${noun}`);
       } catch (e) {
-        applySkin(previous);
-        skins.dataset.value = skins.dataset.unsavedValue = previous;
-        skins.querySelectorAll('[data-choice]').forEach((button) => button.setAttribute('aria-pressed', String(button.dataset.choice === previous)));
+        apply(previous);
+        group.dataset.value = group.dataset.unsavedValue = previous;
+        group.querySelectorAll('[data-choice]').forEach((button) => button.setAttribute('aria-pressed', String(button.dataset.choice === previous)));
         toast(e.message, true);
       }
     });
-  }
+  };
+  choose('skin-choice', 'skin', SKINS, applySkin, 'style');
+  choose('task-list-choice', 'taskList', TASK_LISTS, applyTaskList, 'task list');
   const nameInput = $('#site-name');
   if (nameInput) nameInput.value = installation.siteName || siteName();
   $('#site-name-save')?.addEventListener('click', async () => {
@@ -23330,16 +23527,25 @@ function requestReasonLine(request, reason, inTask) {
   return parts.length ? `<div class="task-sub">${parts.join(' — ')}</div>` : '';
 }
 
+// "Give the agent this permission?", "…these 2 permissions and projects?",
+// "…access to this project?" — a request may add projects and nothing else.
+function permissionAskTitle(request) {
+  const caps = request.capabilities.length;
+  const projects = request.projectIds?.length || 0;
+  if (!caps) return `Give the agent access to ${projects === 1 ? 'this project' : `these ${projects} projects`}?`;
+  return `Give the agent ${caps === 1 ? 'this permission' : `these ${caps} permissions`}${projects ? ' and projects' : ''}?`;
+}
+
 function permissionRequestRows(requests, { historyLimit = 20, inTask = false } = {}) {
   const pending = requests.filter((request) => request.status === 'pending');
   const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
   const pendingHtml = pending.map((request) => `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-preq="${esc(request.id)}">
     <div class="approval-request-main">
-      <div class="approval-request-title">Give the agent ${request.capabilities.length === 1 ? 'this permission' : `these ${request.capabilities.length} permissions`}${request.projectIds?.length ? ' and projects' : ''}?
+      <div class="approval-request-title">${permissionAskTitle(request)}
         ${request.dismissed ? ignoredChip() : ''}
       </div>
-      <div class="approval-request-caps">${request.capabilities.map((capability) =>
-        `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
+      ${request.capabilities.length ? `<div class="approval-request-caps">${request.capabilities.map((capability) =>
+        `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>` : ''}
       ${request.projectIds?.length ? `<div class="approval-request-projects">Add projects: ${request.projectIds.map((id) => `<span class="chip mono">${esc(projectById(id)?.name || id)}</span>`).join(' ')}</div>` : ''}
       ${requestReasonLine(request, request.reason, inTask)}
       ${subTaskAskLine(request)}
@@ -23357,7 +23563,7 @@ function permissionRequestRows(requests, { historyLimit = 20, inTask = false } =
   const history = recent.length
     ? `<div class="approval-history"><div class="section-h">Recent permission decisions</div>${recent.map((request) =>
       `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : request.status === 'withdrawn' ? '' : 'done'}"${request.withdrawn ? ` title="${esc(`Withdrawn: ${request.withdrawn.reason}`)}"` : ''}>${esc(request.status)}</span>
-        <span class="mono">${request.capabilities.map(esc).join(', ')}${request.projectIds?.length ? `; add projects: ${request.projectIds.map(esc).join(', ')}` : ''}</span>
+        <span class="mono">${[...request.capabilities, ...(request.projectIds || []).map((id) => `+ ${projectById(id)?.name || id}`)].map(esc).join(', ')}</span>
         <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
     : '';
   return pendingHtml + history;
@@ -23458,7 +23664,7 @@ function repositoryAccessRequestRows(requests, { historyLimit = 20 } = {}) {
   return pendingHtml + history;
 }
 
-function wireRepositoryAccessRequestActions(root, organizationId, onResolved) {
+function wireRepositoryAccessRequestActions(root, organizationId, onResolved, onFailed) {
   if (!root) return;
   root.querySelectorAll('[data-raccess]').forEach((row) => row.querySelectorAll('[data-raccess-act]').forEach((button) =>
     button.addEventListener('click', async () => {
@@ -23469,12 +23675,12 @@ function wireRepositoryAccessRequestActions(root, organizationId, onResolved) {
         });
         const act = button.dataset.raccessAct;
         toast(act === 'dismiss' ? 'Request ignored' : act === 'deny' ? 'Denied' : result.retried ? 'Access given — task continuing' : 'Access given');
-        await onResolved?.(result);
-      } catch (error) { button.disabled = false; toast(error.message, true); }
+        await onResolved?.(result, row);
+      } catch (error) { button.disabled = false; onFailed?.(row); toast(error.message, true); }
     })));
 }
 
-function wireAuthorizationRequestActions(root, organizationId, onResolved) {
+function wireAuthorizationRequestActions(root, organizationId, onResolved, onFailed) {
   if (!root) return;
   root.querySelectorAll('[data-areq]').forEach((row) => row.querySelectorAll('[data-areq-act]').forEach((button) =>
     button.addEventListener('click', async () => {
@@ -23485,12 +23691,12 @@ function wireAuthorizationRequestActions(root, organizationId, onResolved) {
         });
         toast(button.dataset.areqAct === 'dismiss' ? 'Request ignored' : button.dataset.areqAct === 'deny' ? 'Authorization denied'
           : result.queued ? 'Approved — task queued' : 'Authorization approved');
-        await onResolved?.(result);
-      } catch (error) { button.disabled = false; toast(error.message, true); }
+        await onResolved?.(result, row);
+      } catch (error) { button.disabled = false; onFailed?.(row); toast(error.message, true); }
     })));
 }
 
-function wirePermissionRequestActions(root, organizationId, onResolved) {
+function wirePermissionRequestActions(root, organizationId, onResolved, onFailed) {
   if (!root) return;
   root.querySelectorAll('[data-preq]').forEach((row) => row.querySelectorAll('[data-preq-act]').forEach((button) =>
     button.addEventListener('click', async () => {
@@ -23504,15 +23710,16 @@ function wirePermissionRequestActions(root, organizationId, onResolved) {
         toast(button.dataset.preqAct === 'dismiss' ? decision : result.resume?.resumed ? `${decision} — task resumed automatically`
           : `${decision}${result.resume?.reason ? ` — ${result.resume.reason}` : ''}`,
         button.dataset.preqAct !== 'dismiss' && !result.resume?.resumed && !!result.resume?.reason);
-        await onResolved?.(result);
+        await onResolved?.(result, row);
       } catch (error) {
         button.disabled = false;
+        onFailed?.(row);
         toast(error.message, true);
       }
     })));
 }
 
-function wireCredentialRequestActions(root, organizationId, onResolved) {
+function wireCredentialRequestActions(root, organizationId, onResolved, onFailed) {
   if (!root) return;
   const oq = `?organizationId=${encodeURIComponent(organizationId || '')}`;
   // Beside the vault (Passwords & payments), "Add to vault" opens its folded
@@ -23558,16 +23765,17 @@ function wireCredentialRequestActions(root, organizationId, onResolved) {
       });
       if (button.dataset.vreqAct === 'dismiss') {
         toast('Request ignored');
-        await onResolved?.(result);
+        await onResolved?.(result, row);
         return;
       }
       credentialRequestBindings.delete(row.dataset.vreq);
       const decision = button.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted';
       toast(result.resume?.resumed ? `${decision} — task resumed automatically`
         : `${decision}${result.resume?.reason ? ` — ${result.resume.reason}` : ''}`, !result.resume?.resumed && !!result.resume?.reason);
-      await onResolved?.(result);
+      await onResolved?.(result, row);
     } catch (error) {
       button.disabled = false;
+      onFailed?.(row);
       toast(error.message, true);
     }
   })));
@@ -24946,6 +25154,7 @@ function markTaskAsksRead(taskId) {
   const items = (S.inbox || []).filter((item) => item.unread && item.taskId === taskId);
   if (!items.length) return;
   for (const item of items) item.unread = false;
+  S.inboxState = inboxState(S.inbox);
   // An inbox fetch already in flight predates this; it must not mark them unread again.
   S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
   updateBell();
@@ -24953,8 +25162,17 @@ function markTaskAsksRead(taskId) {
   for (const item of items) byOrganization.set(item.organizationId, [...(byOrganization.get(item.organizationId) || []), item]);
   for (const [organizationId, unread] of byOrganization) {
     api(`/api/inbox?organizationId=${encodeURIComponent(organizationId)}`, { method: 'PATCH', body: JSON.stringify({ ids: unread.map((item) => item.id) }) })
-      .catch(() => { for (const item of unread) item.unread = true; updateBell(); });
+      // A read mention has left For me: the sidebar's counts, and the list if
+      // the person is already back on it, were read before this landed.
+      .then(() => { refreshForMeCounts(); refreshListQuietly(); },
+        () => { for (const item of unread) item.unread = true; S.inboxState = inboxState(S.inbox); updateBell(); });
   }
+}
+// An ask is read once its task is in front of the person: when they open it,
+// and when it arrives (or they come back) while the task is on screen. A task
+// left open in a background tab or an unfocused window has shown them nothing.
+function readAsksOnScreen() {
+  if (S.selected && !document.hidden && document.hasFocus()) markTaskAsksRead(S.selected);
 }
 // How loudly an ask asks (domain/types.ts). Ascending, so the index is the sort
 // rank; an unrecognized level reads as 'normal' rather than sinking to the floor.
@@ -25013,10 +25231,12 @@ function inboxNoticesHtml() {
     const where = (projectId && projectLabel({ projectId }))
       || (organization ? `<span class="task-project" title="${esc(organization.name)}"><span class="task-project-org">${esc(orgSlug(organization))}</span></span>` : '');
     return `<div class="task-row inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(inboxTitle(item))}">
+      ${statusHtml('', 'human', { className: 'task-lead' })}
       <div class="task-main">
         <div class="task-title">${esc(inboxTitle(item))}</div>
-        <div class="task-sub">${where}${statusHtml(inboxRowLabel(item), 'human', { className: `attention ${item.kind}` })}</div>
+        <div class="task-sub">${where}</div>
       </div>
+      <div class="task-state">${statusHtml(inboxRowLabel(item), 'human', { className: `attention ${item.kind}` })}</div>
       <div class="task-right">${urgencyChip(item.urgency)}</div>
     </div>`;
   }).join('');
@@ -27406,6 +27626,9 @@ async function createOrganization() {
 
 // ── theme ────────────────────────────────────────────────────────────────────
 const SKINS = [{ id: '', label: 'Default' }, { id: 'classic', label: 'Classic' }];
+/** How task lists lay out their rows (Installation → Appearance → Task list,
+ * src/domain/brand.ts TASK_LISTS): '' one line per task, columns aligned. */
+const TASK_LISTS = [{ id: '', label: 'One line' }, { id: 'status-first', label: 'Status first' }, { id: 'ruled', label: 'Ruled' }, { id: 'cards', label: 'Cards' }];
 /** 'light', 'dark', or '' to follow the system. */
 function setTheme(next) {
   if (next) document.documentElement.setAttribute('data-theme', next);
@@ -27418,6 +27641,7 @@ function setTheme(next) {
   // The installation's look arrives with /api/meta; until then, the one it had
   // last time, so a classic installation never flashes the default look.
   try { applySkin(localStorage.getItem('karmax-skin') || ''); } catch {}
+  try { applyTaskList(localStorage.getItem('karmax-task-list') || ''); } catch {}
 })();
 /** The installation's look (Installation → Appearance → Style): '' is the
  * default, 'classic' the earlier indigo console. Every colour, radius and type
@@ -27427,6 +27651,14 @@ function applySkin(skin) {
   if (value) document.documentElement.setAttribute('data-skin', value);
   else document.documentElement.removeAttribute('data-skin');
   try { localStorage.setItem('karmax-skin', value); } catch {}
+}
+/** The installation's task list layout (`html[data-task-list]`, web/styles.css
+ * "task row"); none is the default, one line per task. */
+function applyTaskList(layout) {
+  const value = TASK_LISTS.some((choice) => choice.id === layout) ? layout : '';
+  if (value) document.documentElement.setAttribute('data-task-list', value);
+  else document.documentElement.removeAttribute('data-task-list');
+  try { localStorage.setItem('karmax-task-list', value); } catch {}
 }
 
 // ── projects ─────────────────────────────────────────────────────────────────

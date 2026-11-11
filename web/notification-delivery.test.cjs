@@ -28,21 +28,21 @@ function browser() {
   const timers = [];
   const state = { organizationId: 'org', organizations: [{ id: 'org' }], inbox: [], activity: [], tab: 'inbox' };
   let response = [];
-  const ctx = vm.createContext({
+  const ctx = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0,
     document: { hidden: false }, resourceReviewCache: new Map(), resourceInventoryCache: new Map(), reviewArtifactUrls: new Map(),
     S: state, Map, Set, URGENCY_LEVELS: ['low', 'normal', 'high', 'critical'],
     location: { protocol: 'https:', host: 'example.test' },
     WebSocket: function () {},
     api: async () => { if (response instanceof Error) throw response; return response; },
     announceInbox: (items) => alerts.push(...items),
-    updateBell() {}, refreshForMeCounts() {}, bgRenderMain() {}, scheduleHomeRefresh() {}, homeEventChangesList: () => false, patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false,
+    updateBell() {}, refreshForMeCounts() {}, bgRenderMain() {}, scheduleHomeRefresh() {}, readAsksOnScreen() {}, refreshListQuietly() {}, homeEventChangesList: () => false, patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false,
     LIST_RELOAD_EVENTS: new Set(), setWsOnline() {}, checkConsoleRevision() {}, syncLiveWatch() {},
     refreshTasks: async () => {},
     setTimeout: (fn) => { timers.push(fn); return timers.length; },
   });
   // Module-level state connectWs reads: reconnect backoff and the vault-approvals repaint hook.
   vm.runInContext('let inboxRefreshTimer; let wsHadDropped = false; let wsRetryMs = 1500; let refreshVaultRequests = null;\n' +
-    ['urgencyRank', 'inboxArrivals', 'loadInbox', 'inboxEventChanges', 'scheduleInboxReload', 'connectWs', 'isCrossProjectList', 'forgetReviewArtifactUrls']
+    ['urgencyRank', 'inboxArrivals', 'loadInbox', 'inboxState', 'inboxEventChanges', 'scheduleInboxReload', 'connectWs', 'isCrossProjectList', 'forgetReviewArtifactUrls']
       .map(extractFn).join('\n'), ctx);
   return { ctx, state, alerts, timers, respond: (value) => { response = value; } };
 }

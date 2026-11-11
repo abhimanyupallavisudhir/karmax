@@ -231,6 +231,50 @@ describe('separate waiting-world maintenance', () => {
     expect(await f.store.worldStateSnapshot(f.restored.id)).toMatchObject({ generation: 2, state: 'parked' });
   });
 
+  // pramana#137 (2026-11-09): a branch's pull request reached Review while the
+  // task's agent was still working. The pull request's wait parked the world
+  // they share, which on a VM stops the machine and every process in it: the
+  // agent died mid-turn and the task answered nothing for hours.
+  async function withPullRequest() {
+    const f = await fixture('hetzner');
+    const pr = await f.store.createTask({ projectId: f.project.id, title: 'Pull request', workflow: 'software-dev', workflowVersion: '1.30.0',
+      params: { prompt: '', _shippedFrom: { taskId: f.task.id, checkout: 'docs' } }, parentTaskId: f.task.id });
+    const prView = { ...f.view, taskId: pr.id, title: pr.title, stage: 'review',
+      world: { ...f.handle, meta: { ...f.handle.meta, pullRequest: pr.id } } } as TaskView;
+    const parkFor = async () => {
+      const fence = await f.core.publishView(pr.id, prView, undefined, { separateLifecycle: true });
+      await f.core.parkWaitingWorld(pr.id, lifecyclePublication(prView), fence!);
+    };
+    return { ...f, pr, parkFor };
+  }
+
+  it("leaves the task's world running when a pull request waits for review while the task's agent works", async () => {
+    const f = await withPullRequest();
+    await f.store.saveView(f.task.id, { ...f.view, status: 'active', waitingFor: undefined,
+      agentTurn: { turnId: 'turn', role: 'do', provider: 'claude', state: 'running' } } as TaskView);
+    await f.parkFor();
+    expect(f.checkpoint).not.toHaveBeenCalled();
+    expect(f.park).not.toHaveBeenCalled();
+    expect(await f.store.worldState(f.task.id)).toBe('ready');
+
+    // About to start a turn, or its agent's job still running: the world is in use.
+    for (const waitingFor of [{ kind: 'agentSlot' as const, detail: 'Starting agent' }, { kind: 'job' as const, detail: 'Waiting for job-0000000a' }]) {
+      await f.store.saveView(f.task.id, { ...f.view, waitingFor } as TaskView);
+      await f.parkFor();
+    }
+    expect(f.park).not.toHaveBeenCalled();
+  });
+
+  it("parks the task's world for a pull request's wait once the task itself waits, and says so on the task", async () => {
+    const f = await withPullRequest();
+    await f.store.saveView(f.task.id, { ...f.view, waitingFor: { kind: 'timer', detail: 'Waiting 240 min', until: Date.now() + 60_000 } } as TaskView);
+    await f.parkFor();
+    expect(f.park).toHaveBeenCalledOnce();
+    expect(await f.store.worldState(f.task.id)).toBe('parked');
+    expect((await f.store.eventsOfType(f.task.id, 'world.parked')).at(-1)?.payload).toMatchObject({ provider: 'hetzner', pullRequest: f.pr.id });
+    expect(await f.store.eventsOfType(f.pr.id, 'world.parked')).toEqual([]);
+  });
+
   it('rechecks a publication changed while checkpointing', async () => {
     const f = (await fixture()), started = deferred(), finish = deferred();
     f.checkpoint.mockImplementation(async () => { started.resolve(); await finish.promise; return { id: 'checkpoint', generation: 1 }; });
