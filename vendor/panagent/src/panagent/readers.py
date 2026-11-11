@@ -380,7 +380,9 @@ def read_codex(text: str, *, source_uri: str | None = None, **_: Any) -> dict[st
                 )
             if payload.get("encrypted_content"):
                 warning(conv, "codex_encrypted_reasoning_unavailable", "Encrypted Codex reasoning is opaque and was not imported.")
-        elif payload_type not in {None, "ghost_snapshot", "compaction"}:
+        # additional_tools: the tool catalog the harness declared (GPT-6.1 rollouts), not conversation;
+        # whichever harness continues it declares its own tools.
+        elif payload_type not in {None, "ghost_snapshot", "compaction", "additional_tools"}:
             warning(
                 conv,
                 "codex_item_not_represented",
