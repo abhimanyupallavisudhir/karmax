@@ -1,64 +1,130 @@
 name: Deploy
 
-# Deployment is a separate post-merge concern. A failed production rollout must
-# not masquerade as a failed PR validation check, and only the exact master SHA
-# whose CI workflow completed successfully is eligible for promotion.
+# Every master commit whose CI passed comes here (wiki ops/release-and-deploy).
+# With a staging instance (repository variable STAGING_URL) it deploys there and
+# runs the smoke suite; Promote (promote.yml) later moves a commit that passed to
+# production by calling this workflow. Without one, a commit deploys straight to
+# production, as before staging existed. A dispatch deploys one commit to either
+# environment: the break-glass path when staging itself is broken.
+#
+# Every deploy runs the release image CI built for the commit (ci.yml, "Publish
+# the release image"), named by digest, so production runs the bytes staging
+# tested. Each environment's verdict is the commit status deploy/<environment>,
+# whose description names that image; Promote reads it.
 on:
   workflow_run:
     workflows: [CI]
     types: [completed]
     branches: [master]
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      image:
+        description: The release image by digest (default the commit's, from GHCR)
+        type: string
+        required: false
+        default: ''
   workflow_dispatch:
     inputs:
       sha:
-        description: Full master commit SHA to redeploy
+        description: Full master commit SHA to deploy
         required: true
         type: string
+      environment:
+        description: Where to deploy it
+        type: choice
+        options: [production, staging]
+        default: production
 
 permissions:
   contents: read
+  packages: read
+  statuses: write
 
 jobs:
   deploy:
-    name: deploy to production
+    name: deploy to ${{ inputs.environment || (vars.STAGING_URL != '' && 'staging' || 'production') }}
+    # Only a successful push to this repository's default branch deploys by
+    # itself; a dispatch or Promote names its commit, checked on the host.
     if: >-
-      ${{ github.event_name == 'workflow_dispatch' || (
+      ${{ github.event_name != 'workflow_run' || (
         github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.event == 'push' &&
         github.event.workflow_run.head_repository.full_name == github.repository &&
         github.event.workflow_run.head_branch == github.event.repository.default_branch
       ) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    environment: production
-    # GitHub retains the running deployment and coalesces pending requests to the
-    # newest validated master SHA. That is sufficient because every newer SHA
-    # contains its ancestors; the remote updater also refuses to move backwards.
+    timeout-minutes: 60
+    environment: ${{ inputs.environment || (vars.STAGING_URL != '' && 'staging' || 'production') }}
+    # One deploy and its smoke check at a time per environment. GitHub keeps the
+    # running one and coalesces pending ones to the newest, which is enough:
+    # every newer SHA contains its ancestors, and the updater never moves back.
     concurrency:
-      group: deploy-production
+      group: deploy-${{ inputs.environment || (vars.STAGING_URL != '' && 'staging' || 'production') }}
       cancel-in-progress: false
     env:
-      DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || inputs.sha }}
+      # A workflow_run's own head_sha is master's head when it was created, not
+      # the commit CI validated (wiki ops/release-and-deploy, "Proof of deploy").
+      DEPLOY_SHA: ${{ inputs.sha || github.event.workflow_run.head_sha }}
+      DEPLOY_ENVIRONMENT: ${{ inputs.environment || (vars.STAGING_URL != '' && 'staging' || 'production') }}
       RUN_KEY: ${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - name: Deploy the validated revision over SSH
-        env:
-          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
-          KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
-          TARGET: ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}
+      - name: Check the request
         run: |
           case "$DEPLOY_SHA" in
             ''|*[!0-9a-fA-F]*) echo "invalid deployment SHA: $DEPLOY_SHA" >&2; exit 1 ;;
           esac
           [ "${#DEPLOY_SHA}" -eq 40 ] || { echo "deployment SHA must be 40 hexadecimal characters" >&2; exit 1; }
           case "$RUN_KEY" in ''|*[!0-9-]*) echo 'invalid deployment run key' >&2; exit 1;; esac
+          case "$DEPLOY_ENVIRONMENT" in staging|production) ;; *) echo "unknown environment $DEPLOY_ENVIRONMENT" >&2; exit 1;; esac
+
+      - name: Name the release image
+        id: image
+        env:
+          REQUESTED: ${{ inputs.image }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          image=$REQUESTED
+          if [ -z "$image" ]; then
+            repository=$(printf 'ghcr.io/%s/karmax-app' "$OWNER" | tr '[:upper:]' '[:lower:]')
+            printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin >/dev/null
+            digest=$(docker buildx imagetools inspect "$repository:$DEPLOY_SHA" --format '{{json .Manifest}}' | jq -r .digest) || digest=''
+            docker logout ghcr.io >/dev/null
+            if [ -z "$digest" ] || [ "$digest" = null ]; then
+              echo "no release image for $DEPLOY_SHA: CI publishes one for every master commit (rerun its deploy artifacts job)" >&2; exit 1
+            fi
+            image="$repository@$digest"
+          fi
+          printf '%s\n' "$image" | grep -Eq '^[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}$' \
+            || { echo "a release image is named by its digest, not $image" >&2; exit 1; }
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "Release image: \`$image\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy the validated revision over SSH
+        id: deploy
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+          TARGET: ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}
+          RELEASE_IMAGE: ${{ steps.image.outputs.image }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
           # The host key is pinned above, so an unknown one is a failure rather
-          # than something to trust on first use.
-          ssh -o StrictHostKeyChecking=yes -o ConnectTimeout=30 "$TARGET" "
+          # than something to trust on first use. The token arrives on stdin,
+          # for one pull into a throwaway client configuration.
+          printf '%s' "$GH_TOKEN" | ssh -o StrictHostKeyChecking=yes -o ConnectTimeout=30 "$TARGET" "
             set -eu
             cd /opt/karmax
             # Execute the updater implementation from the exact validated SHA.
@@ -69,11 +135,14 @@ jobs:
             git merge-base --is-ancestor '$DEPLOY_SHA' refs/remotes/origin/master || {
               echo 'deployment SHA is not on master' >&2; exit 1;
             }
+            registry=\$(mktemp -d)
+            trap 'rm -f \"\$registry/config.json\" ./deploy/.karmax-update ./deploy/.karmax-runner; rmdir \"\$registry\"' EXIT
+            DOCKER_CONFIG=\$registry docker login ghcr.io -u '$ACTOR' --password-stdin >/dev/null
+            DOCKER_CONFIG=\$registry docker pull -q '$RELEASE_IMAGE' >/dev/null
             git show '$DEPLOY_SHA:deploy/karmax' > ./deploy/.karmax-update
             git show '$DEPLOY_SHA:deploy/update-runner.sh' > ./deploy/.karmax-runner
             chmod 700 ./deploy/.karmax-update ./deploy/.karmax-runner
-            trap 'rm -f ./deploy/.karmax-update ./deploy/.karmax-runner' EXIT
-            ./deploy/.karmax-runner start '$DEPLOY_SHA' '$RUN_KEY' ./deploy/.karmax-update
+            ./deploy/.karmax-runner start '$DEPLOY_SHA' '$RUN_KEY' ./deploy/.karmax-update '$RELEASE_IMAGE'
           "
           for attempt in $(seq 1 180); do
             state=$(ssh -o StrictHostKeyChecking=yes -o ConnectTimeout=30 "$TARGET" \
@@ -94,3 +163,44 @@ jobs:
           done
           echo "deployment is still running after $attempt polls; inspect its durable log and status" >&2
           exit 1
+
+      # The smoke suite of the deployed commit, run inside this job so no other
+      # deploy to the environment can start before it finishes.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+          persist-credentials: false
+          sparse-checkout: scripts
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22.16.0'
+
+      - name: Smoke-check the deployed instance
+        id: smoke
+        env:
+          URL: ${{ env.DEPLOY_ENVIRONMENT == 'staging' && vars.STAGING_URL || vars.PRODUCTION_URL || 'https://tavya.io' }}
+          SMOKE_TOKEN: ${{ env.DEPLOY_ENVIRONMENT == 'staging' && secrets.STAGING_SMOKE_TOKEN || secrets.PRODUCTION_SMOKE_TOKEN }}
+          SMOKE_PROJECT_ID: ${{ env.DEPLOY_ENVIRONMENT == 'staging' && vars.STAGING_SMOKE_PROJECT_ID || vars.PRODUCTION_SMOKE_PROJECT_ID }}
+          SMOKE_TASK_PARAMS: ${{ env.DEPLOY_ENVIRONMENT == 'staging' && vars.STAGING_SMOKE_TASK_PARAMS || vars.PRODUCTION_SMOKE_TASK_PARAMS }}
+        run: |
+          # A real task too, wherever a smoke account is configured.
+          if [ -n "$SMOKE_TOKEN" ] && [ -n "$SMOKE_PROJECT_ID" ]; then task=--task; else task=; fi
+          node scripts/smoke.mjs --url "$URL" --revision "$DEPLOY_SHA" $task
+
+      # Promote reads this: a commit is promotable once deploy/staging is a
+      # success naming its image.
+      - name: Record the verdict on the commit
+        if: ${{ !cancelled() && steps.deploy.outcome != 'skipped' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOYED: ${{ steps.deploy.outcome }}
+          SMOKED: ${{ steps.smoke.outcome }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$DEPLOYED" = success ] && [ "$SMOKED" = success ]; then state=success description=$IMAGE
+          elif [ "$DEPLOYED" = success ]; then state=failure description='Deployed; the smoke check failed'
+          else state=failure description='The deploy failed'; fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$DEPLOY_SHA" \
+            -f state="$state" -f context="deploy/$DEPLOY_ENVIRONMENT" -f description="$description" -f target_url="$RUN_URL" >/dev/null
+          echo "deploy/$DEPLOY_ENVIRONMENT: $state ($description)"

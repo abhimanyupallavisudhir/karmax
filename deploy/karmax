@@ -19,8 +19,10 @@ note() { echo "• $*"; }
 # new content (tavya.io served its 2026-10-02 Caddyfile until task #529). The
 # Caddyfile's digest is therefore a label on Caddy: every `up` recreates it,
 # binding the new file, whenever the Caddyfile changed.
+# The checked-out commit is the app image's KARMAX_REVISION build argument.
 dc() {
   KARMAX_CADDYFILE_SHA256=$(sha256sum "$DEPLOY_DIR/Caddyfile" 2>/dev/null | cut -d' ' -f1) \
+  KARMAX_REVISION=$(git -C "$ROOT_DIR" rev-parse --verify -q HEAD 2>/dev/null || true) \
     docker compose --project-directory "$DEPLOY_DIR" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
 }
 
@@ -175,6 +177,38 @@ build_images() {
   if [ "${1:-}" = --pull ]; then dc build --pull app && dc build postgresql caddy
   else dc build app postgresql caddy
   fi
+}
+
+# A release image is the app image CI built once for a commit, named by digest
+# (ghcr.io/…/karmax-app@sha256:…): staging and production run the same bytes.
+# Compose runs whatever carries the app service's image name, so deploying one
+# is tagging it with that name; PostgreSQL and Caddy are still built here (their
+# images change rarely and a rebuilt one is cached, so they are not recreated).
+RELEASE_IMAGE_FILE="$DEPLOY_DIR/.release-image"
+app_image() { printf '%s-app\n' "${COMPOSE_PROJECT_NAME:-karmax}"; }
+image_revision() {
+  docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$1" 2>/dev/null
+}
+valid_release_image() {
+  printf '%s\n' "$1" | grep -Eq '^[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}$'
+}
+# Present here and built from that commit, or the deployment stops.
+check_release_image() {
+  valid_release_image "$1" || die "a release image is named by its digest (…@sha256:<64 hex>), not $1"
+  docker image inspect "$1" >/dev/null 2>&1 || docker pull -q "$1" >/dev/null \
+    || die "release image $1 is not on this host and could not be pulled"
+  built_from=$(image_revision "$1")
+  [ "$built_from" = "$2" ] || die "release image $1 was built from ${built_from:-an unknown commit}, not $2"
+}
+use_release_image() { docker tag "$1" "$(app_image)" && dc build postgresql caddy; }
+# The image `up` runs: the recorded release image while it is this checkout's
+# commit, so restarting an instance never swaps tested bytes for a local build.
+recorded_release_image() {
+  [ -f "$RELEASE_IMAGE_FILE" ] || return 1
+  recorded=$(cat "$RELEASE_IMAGE_FILE")
+  valid_release_image "$recorded" || return 1
+  [ "$(image_revision "$recorded")" = "$(git -C "$ROOT_DIR" rev-parse --verify -q HEAD 2>/dev/null)" ] || return 1
+  printf '%s\n' "$recorded"
 }
 
 configure() {
@@ -364,8 +398,14 @@ cmd_up() {
   configure "${1:-}" "${2:-}"
   preview_tls_ready || die 'previews are not configured; nothing was started'
   dc config --quiet
-  note 'Building and starting PostgreSQL, Temporal, Karmax, and Caddy…'
-  dc up -d --build --remove-orphans
+  if release_image=$(recorded_release_image); then
+    note "Starting PostgreSQL, Temporal, Karmax ($release_image), and Caddy…"
+    use_release_image "$release_image" || die 'could not build PostgreSQL and Caddy'
+    dc up -d --remove-orphans
+  else
+    note 'Building and starting PostgreSQL, Temporal, Karmax, and Caddy…'
+    dc up -d --build --remove-orphans
+  fi
   wait_ready || die 'Karmax failed its readiness check'
   wait_edge_serving || die 'Caddy failed to start'
   print_finish
@@ -912,10 +952,13 @@ data_epoch() {
 cmd_update() {
   need_docker
   [ -f "$ENV_FILE" ] || die 'this instance is not configured'
-  accept_vault='' requested=''
-  for argument in "$@"; do
+  accept_vault='' requested='' release_image=''
+  while [ "$#" -gt 0 ]; do
+    argument=$1; shift
     case "$argument" in
       --accept-vault-findings) accept_vault=1 ;;
+      --image) [ "$#" -gt 0 ] || die '--image needs an image named by digest'; release_image=$1; shift ;;
+      --image=*) release_image=${argument#--image=} ;;
       -*) die "unknown update option: $argument" ;;
       *) [ -z "$requested" ] || die "update takes one revision, not $requested and $argument"; requested=$argument ;;
     esac
@@ -951,6 +994,23 @@ cmd_update() {
   previous_epoch=$(data_epoch "$previous") || die "invalid data epoch in $previous"
   target_epoch=$(data_epoch "$target") || die "invalid data epoch in $target"
   [ "$target_epoch" -ge "$previous_epoch" ] || die "refusing data epoch downgrade $previous_epoch -> $target_epoch"
+
+  # The release image must be this commit's before anything changes.
+  [ -z "$release_image" ] || check_release_image "$release_image" "$target"
+  # What the app runs now, kept under a tag so a rollback re-tags it instead of
+  # rebuilding the previous commit, and image pruning cannot take it.
+  previous_app_image=$(docker image inspect --format '{{.Id}}' "$(app_image)" 2>/dev/null || true)
+  [ -z "$previous_app_image" ] || docker tag "$previous_app_image" "$(app_image):previous" || previous_app_image=''
+  # The candidate's images: the release image, else built from the checkout.
+  candidate_images() {
+    if [ -n "$release_image" ]; then use_release_image "$release_image"; else build_images --pull; fi
+  }
+  # Back to what ran before: after a release image, the image that ran (built
+  # here or not); after a build, rebuilt from its source as always.
+  previous_images() {
+    if [ -n "$release_image" ] && [ -n "$previous_app_image" ]; then use_release_image "$(app_image):previous"
+    else build_images; fi
+  }
 
   # A domain migration can be staged in the environment without changing the
   # running service. The first validated update that understands these keys
@@ -1019,7 +1079,7 @@ cmd_update() {
   # Building does not replace the running container. It gives the one-off
   # snapshot process the candidate's backup implementation while production
   # continues serving the previous image.
-  if ! build_images --pull; then
+  if ! candidate_images; then
     git -C "$ROOT_DIR" checkout --detach "$previous"
     restore_migration
     cleanup_migration
@@ -1036,7 +1096,7 @@ cmd_update() {
     if ! dc run --rm --no-deps -T app npm run --silent replay-check; then
       git -C "$ROOT_DIR" checkout --detach "$previous"
       restore_migration
-      build_images || true
+      previous_images || true
       cleanup_migration
       migration_backup=''
       die "deployment $target stopped by the replay check, which lists above the running workflows it cannot replay or why it could not run; production remains at $previous. Fix the release, or rerun with KARMAX_SKIP_REPLAY_CHECK=1 only if those workflows may break"
@@ -1045,7 +1105,7 @@ cmd_update() {
   if ! cmd_backup_candidate; then
     git -C "$ROOT_DIR" checkout --detach "$previous"
     restore_migration
-    build_images || true
+    previous_images || true
     cleanup_migration
     migration_backup=''
     die "deployment $target could not be backed up; production remains at $previous"
@@ -1062,7 +1122,7 @@ cmd_update() {
   elif [ "$preflight" -ne 0 ]; then
     git -C "$ROOT_DIR" checkout --detach "$previous"
     restore_migration
-    build_images || true
+    previous_images || true
     cleanup_migration
     migration_backup=''
     [ "$preflight" -eq 3 ] \
@@ -1081,6 +1141,8 @@ cmd_update() {
     if [ "$edge_before" = 0 ] || wait_edge; then
       cleanup_migration
       migration_backup=''
+      if [ -n "$release_image" ]; then printf '%s\n' "$release_image" > "$RELEASE_IMAGE_FILE"
+      else rm -f "$RELEASE_IMAGE_FILE"; fi
       report_app_role || true
       reclaim_space
       note "Update complete at $target."
@@ -1105,7 +1167,7 @@ cmd_update() {
   note "Deployment $target failed; rolling back to $previous…"
   git -C "$ROOT_DIR" checkout --detach "$previous"
   restore_migration
-  if build_images && dc up -d --remove-orphans && wait_ready && { [ "$edge_before" = 0 ] || wait_edge; }; then
+  if previous_images && dc up -d --remove-orphans && wait_ready && { [ "$edge_before" = 0 ] || wait_edge; }; then
     cleanup_migration
     migration_backup=''
     die "deployment $target failed; production was restored to $previous"

@@ -217,6 +217,10 @@ jobs:
     name: deploy artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # Only this job publishes: the release image (below) goes to GHCR.
+    permissions:
+      contents: read
+      packages: write
     env:
       # Owner of the read-only Docker Hub pull token; empty on fork pull requests.
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -418,6 +422,28 @@ jobs:
           [ "$(caps)" = 'app=7516192768 caddy=268435456 karmax-database=268435456 pg-backup=536870912 postgresql=3221225472 temporal-namespace=536870912 temporal-schema=536870912 temporal=2147483648' ]
           { cat deploy/.env.example; echo KARMAX_APP_MEM_LIMIT=7g; } > "$RUNNER_TEMP/hosted.env"
           [ "$(docker compose --env-file "$RUNNER_TEMP/hosted.env" -f deploy/compose.hosted.yml config --format json | jq -r .services.app.mem_limit)" = 7516192768 ]
+
+      # Build once, deploy everywhere: the app image this job built and booted
+      # above is what staging and then production run (deploy.yml pulls it by
+      # digest; deploy/karmax checks its revision label). A push to master
+      # publishes it; a dispatch does too, to try a branch's image on staging.
+      - name: Publish the release image
+        if: steps.scope.outputs.artifacts == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+        run: |
+          image=$(printf 'ghcr.io/%s/karmax-app' "$OWNER" | tr '[:upper:]' '[:lower:]')
+          built_from=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' karmax-app)
+          [ "$built_from" = "$SHA" ] || { echo "the image was built from '$built_from', not $SHA" >&2; exit 1; }
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker tag karmax-app "$image:$SHA"
+          docker push "$image:$SHA"
+          digest=$(docker image inspect --format '{{ index .RepoDigests 0 }}' "$image:$SHA")
+          docker logout ghcr.io
+          echo "Release image: \`$digest\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Show the turnkey stack after a failure
         if: failure() && steps.scope.outputs.artifacts == 'true'

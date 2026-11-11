@@ -21040,6 +21040,34 @@ async function hydrateConversationSharing(scope, id) {
   } catch (error) { paneError(box, error, () => hydrateConversationSharing(scope, id)); }
 }
 
+// Early access (wiki features/early-access): features still rolling out reach
+// the organizations that turn this on first. The console gates one on
+// organizationById(S.organizationId)?.features, which /api/organizations fills.
+async function hydrateEarlyAccess(organizationId) {
+  const box = $('#organization-early-access');
+  if (!box) return;
+  const url = `/api/organizations/${encodeURIComponent(organizationId)}/early-access`;
+  try {
+    const access = await api(url);
+    if (!box.isConnected) return;
+    box.innerHTML = `<div class="setting-row"><span class="setting-label">Early access ${policyTip('Get new features before everyone else. They may still change.')}</span>
+      <span class="setting-value"><input type="checkbox" class="toggle" id="early-access-toggle" aria-label="Early access" ${access.enabled ? 'checked' : ''} ${access.canManage ? '' : 'disabled'}></span></div>`;
+    const input = box.querySelector('input');
+    input.onchange = async () => {
+      input.disabled = true;
+      try {
+        const saved = await api(url, { method: 'PUT', body: JSON.stringify({ enabled: input.checked }) });
+        const organization = organizationById(organizationId);
+        if (organization) organization.features = saved.features;
+        toast(saved.enabled ? 'Early access on' : 'Early access off');
+      } catch (error) {
+        input.checked = !input.checked;
+        toast(error.message, true);
+      } finally { input.disabled = false; }
+    };
+  } catch (error) { paneError(box, error, () => hydrateEarlyAccess(organizationId)); }
+}
+
 async function hydrateAvatarAvailability(scope, id) {
   const box = scope === 'project' ? $('#project-avatar-settings') : $('#organization-avatar-settings');
   if (!box) return;
@@ -26365,7 +26393,7 @@ function installationView() {
   return `<div class="organization-settings installation-settings"><div class="settings-header"><h1 class="page-title">Installation ${policyTip(`Settings for every organization and the machine running ${siteName()}. Only operators see them.`)}</h1></div>
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections">
-      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-errors">Error reports</a><a href="#installation-limits">Service limits</a><a href="#installation-compute">Managed compute</a><a href="#installation-capacity">Host capacity</a>
+      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-errors">Error reports</a><a href="#installation-early-access">Early access</a><a href="#installation-limits">Service limits</a><a href="#installation-compute">Managed compute</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
       <a href="#installation-access">Phone access</a>${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}
     </nav><div class="settings-content">
@@ -26375,6 +26403,8 @@ function installationView() {
       <div id="proc-panel" style="margin-top:12px"></div>
       <div class="settings-section-title" id="installation-errors"><div>Error reports ${policyTip(`Unexpected errors of ${siteName()}’s own start a task in this project that finds the cause and fixes it. One runs at a time; it hears of further errors while it works.`)}</div></div>
       <div class="card" id="error-reports-card"><span class="task-sub">Loading…</span></div>
+      <div class="settings-section-title" id="installation-early-access"><div>Early access ${policyTip('New features reach organizations that turned on Early access first, then everyone.')}</div></div>
+      <div class="card" id="early-access-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-limits"><div>Service limits ${policyTip(`Shared accounts and this server against their plans`)}</div></div>
       <div class="card service-limits" id="service-limits-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-compute"><div>Managed compute ${policyTip(`${siteName()}’s own provider accounts. Organizations without their own account run on them, and on the included model, charged to their plan’s monthly compute at twice the provider’s price.`)}</div></div>
@@ -26879,9 +26909,41 @@ async function wireErrorReportsCard() {
   });
 }
 
+const ROLLOUT_STAGES = [['off', 'Off'], ['early', 'Early access'], ['on', 'Everyone']];
+function earlyAccessMarkup(view) {
+  const count = Number(view.earlyAccessOrganizations || 0);
+  const opted = `${count} organization${count === 1 ? '' : 's'} opted in`;
+  if (!view.flags?.length) return `<div class="setting-rows"><div class="setting-row setting-muted">Nothing is rolling out · ${opted}</div></div>`;
+  const audience = `<div class="setting-row setting-muted early-access-audience">${opted}</div>`;
+  return `<div class="setting-rows">${view.flags.map((flag) => `<div class="setting-row"><span class="setting-label">${esc(flag.title)} ${policyTip(flag.description)}</span>
+    <span class="setting-value"><select data-feature-flag="${esc(flag.name)}" aria-label="${esc(flag.title)}" ${view.canManage ? '' : 'disabled'}>${ROLLOUT_STAGES.map(([stage, label]) =>
+      `<option value="${stage}" ${flag.stage === stage ? 'selected' : ''}>${label}</option>`).join('')}</select></span></div>`).join('')}${audience}</div>`;
+}
+async function wireEarlyAccessCard() {
+  const card = $('#early-access-card');
+  if (!card) return;
+  let view;
+  try { view = await api('/api/settings/feature-flags'); }
+  catch (error) { if (card.isConnected) paneError(card, error, () => wireEarlyAccessCard()); return; }
+  if (!card.isConnected) return;
+  card.innerHTML = earlyAccessMarkup(view);
+  for (const select of card.querySelectorAll('select[data-feature-flag]')) {
+    mirrorSegmented(select);
+    select.addEventListener('change', async () => {
+      select.disabled = true;
+      try {
+        await api('/api/settings/feature-flags', { method: 'PUT', body: JSON.stringify({ name: select.dataset.featureFlag, stage: select.value }) });
+        toast('Rollout saved');
+      } catch (error) { toast(error.message, true); }
+      await wireEarlyAccessCard();
+    });
+  }
+}
+
 function wireInstallationSettings() {
   wireInstallationUsers();
   wireErrorReportsCard();
+  wireEarlyAccessCard();
   wireSettingsNavigation();
   wireAppearanceCard();
   refreshHostDiag();
@@ -27178,7 +27240,8 @@ function organizationView() {
         <option value="members" ${org?.nameVisibility !== 'public' ? 'selected' : ''}>Members only</option>
         <option value="public" ${org?.nameVisibility === 'public' ? 'selected' : ''}>Everyone signed in</option>
       </select></span></div>
-      <div id="organization-conversation-sharing"><div class="setting-row setting-muted">Loading…</div></div></div></div>
+      <div id="organization-conversation-sharing"><div class="setting-row setting-muted">Loading…</div></div>
+      <div id="organization-early-access"><div class="setting-row setting-muted">Loading…</div></div></div></div>
     <div class="card" id="organization-roles"><div class="setting-muted">Loading roles…</div></div>
     <div class="settings-section-title" id="settings-code"><div>Resources</div></div>
     <div class="card"><div class="section-h">Git &amp; GitHub</div><div id="org-github">Loading…</div></div>
@@ -27303,6 +27366,7 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
     wireSettingsNavigation();
     hydrateSettingsAccess({ organizationId });
     hydrateConversationSharing('organization', organizationId);
+    hydrateEarlyAccess(organizationId);
     hydrateAvatarAvailability('organization', organizationId);
     setEventHandler($('#export-organization'), 'click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
     const renameOrganization = async () => {

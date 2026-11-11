@@ -9,8 +9,15 @@ import { paths } from '../config/paths.js';
 const pexec = promisify(execFile);
 export interface LaunchedServices { env: Record<string, string>; containers: string[]; warnings: string[] }
 
-export function serviceHomeLabel(home = paths().home): string {
-  return crypto.createHash('sha256').update(home).digest('hex').slice(0, 12);
+/**
+ * Which installation made a sandbox, VM or container: every provider's sweep
+ * lists, bills and reaps only those carrying its own label. Two installations
+ * with the same data home on one provider account (tavya.io and its staging
+ * instance, both /var/lib/karmax) would otherwise reap each other's worlds, so
+ * KARMAX_INSTANCE names one apart. Unset, the label is what it always was.
+ */
+export function serviceHomeLabel(home = paths().home, instance = process.env.KARMAX_INSTANCE?.trim()): string {
+  return crypto.createHash('sha256').update(instance ? `${instance}\0${home}` : home).digest('hex').slice(0, 12);
 }
 
 export async function launchWorldServices(world: World, taskId: string, services: ProjectService[],

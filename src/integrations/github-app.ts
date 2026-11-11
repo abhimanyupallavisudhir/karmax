@@ -50,6 +50,16 @@ export type GitHubAppPermissionLevel = 'write' | 'read';
  */
 /** The webhook events a new App subscribes to. An existing App's owner adds new
  *  ones in its settings (GitHub has no API for an App's event subscriptions). */
+/**
+ * The release workflows (.github/workflows/{deploy,promote,production-check}.yml;
+ * wiki ops/release-and-deploy): a failure of one on the default branch opens a
+ * recovery task like a failed push run, whatever started it.
+ */
+export const RELEASE_WORKFLOWS = new Set(['Deploy', 'Promote', 'Production check']);
+const RELEASE_WORKFLOW_EVENTS = new Set(['workflow_run', 'schedule', 'workflow_dispatch']);
+/** Of those, the ones that change a running instance: never rerun automatically. */
+const DEPLOYING_WORKFLOWS = new Set(['Deploy', 'Promote']);
+
 export const GITHUB_APP_EVENTS = ['push', 'pull_request', 'pull_request_review', 'check_run', 'merge_group', 'workflow_run',
   'issues', 'issue_comment', 'release', 'deployment_status'] as const;
 
@@ -1256,8 +1266,13 @@ export class GitHubAppService {
     if (event !== 'workflow_run' || payload.action !== 'completed') return [];
     const workflowRun = payload.workflow_run;
     const repositoryId = payload.repository?.id;
-    if (!repositoryId || workflowRun?.event !== 'push'
-      || workflowRun.head_repository?.id !== repositoryId) return [];
+    const name = String(workflowRun?.name ?? '');
+    // The release workflows never run on a push: Deploy follows CI, Promote and
+    // Production check follow a schedule or a dispatch. On the default branch
+    // those run the default branch's own workflow file, so they are as trusted.
+    const trustedEvent = workflowRun?.event === 'push'
+      || (RELEASE_WORKFLOWS.has(name) && RELEASE_WORKFLOW_EVENTS.has(String(workflowRun?.event ?? '')));
+    if (!repositoryId || !trustedEvent || workflowRun.head_repository?.id !== repositoryId) return [];
     const repository = (await this.store.listRepositories(organizationId)).find((candidate) =>
       candidate.providerId === String(repositoryId));
     if (!repository) return [];
@@ -1275,8 +1290,10 @@ export class GitHubAppService {
     const originatingTaskId = headRefs.map((ref) => taskIdOfBranch(ref.slice(ref.indexOf(':') + 1)))
       .find((id) => id && /^task_[A-Za-z0-9_-]+$/.test(id));
     const attempt = Math.max(1, Number(workflowRun?.run_attempt ?? 1) || 1);
-    if (await this.workflowFailureSettlesItself(repository, { runId, attempt, conclusion, headSha, branch,
-      workflowId: Number(workflowRun.workflow_id ?? 0) || 0, runNumber: Number(workflowRun.run_number ?? 0) || 0 }))
+    // A failed deploy is never retried behind anyone's back: rerunning it would
+    // take production through a second rollback if the failure is real.
+    if (!DEPLOYING_WORKFLOWS.has(name) && await this.workflowFailureSettlesItself(repository, { runId, attempt, conclusion,
+      headSha, branch, workflowId: Number(workflowRun.workflow_id ?? 0) || 0, runNumber: Number(workflowRun.run_number ?? 0) || 0 }))
       return [];
     const base = {
       repository: `${repository.owner}/${repository.name}`,

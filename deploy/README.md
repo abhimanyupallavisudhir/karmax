@@ -387,6 +387,7 @@ release their execution lease when finished.
 ./deploy/karmax backup              # deploy/backups/manual-<UTC timestamp>
 ./deploy/karmax prune-backups       # drop automatic snapshots past retention
 ./deploy/karmax update              # backup, validate commit ancestry, rebuild
+./deploy/karmax update SHA --image ghcr.io/…/karmax-app@sha256:…  # run CI's image for SHA instead of building
 ./deploy/karmax down                # preserves all volumes and certificates
 ./deploy/karmax restore BACKUP_DIR  # verified and signature-checked, explicit destructive prompt
 ./deploy/karmax rotate-vault-key    # replace the vault's key encryption key (resumable)
@@ -581,6 +582,29 @@ wiki's `ops/secrets-and-accounts`, whose pass-store copy is
 `pass show tavya/vi_murj15zj778a901db5.api-key | head -n 1 | tr -d '\n'`), and the
 signing fingerprint is recorded on the wiki's `ops/production-tavya`. Update the
 item after every `rotate-vault-key`.
+
+### Release images, staging and promotion
+
+CI builds the app image once per master commit, boots it, and publishes it as
+`ghcr.io/<owner>/karmax-app:<sha>`, labelled `org.opencontainers.image.revision`
+with that commit (the image's `KARMAX_REVISION`, which `/api/health/ready`
+reports). `update SHA --image <name>@sha256:<digest>` runs that image instead of
+building the app here: it refuses an image labelled with another commit, tags it
+as the app service's image, builds only PostgreSQL and Caddy, records it in
+`deploy/.release-image` (so a later `up` at the same commit restarts the same
+bytes), and on a failure re-tags the image that ran before instead of rebuilding
+it. Without `--image`, `update` builds from the checkout as always.
+
+`.github/workflows/deploy.yml` deploys every master commit whose CI passed: to
+the staging instance when the repository variable `STAGING_URL` is set, else to
+production. The same job runs `scripts/smoke.mjs` against what it deployed and
+records the verdict as the commit status `deploy/<environment>` (description:
+the image). `promote.yml` moves the newest commit that passed staging an hour
+ago to production, at most every four hours, with the image staging ran;
+`DEPLOYS_PAUSED=true` stops it, and a dispatch promotes now.
+`production-check.yml` runs the smoke suite every 15 minutes. Two installations
+that share provider accounts must name themselves apart with `KARMAX_INSTANCE`
+in `.turnkey.env`, or each one's sweep reaps the other's worlds.
 
 ### Replay check
 
