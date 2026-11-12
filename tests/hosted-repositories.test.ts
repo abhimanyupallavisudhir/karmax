@@ -18,6 +18,8 @@ import { Vault } from '../src/autonomy/vault.js';
 import { LocalObjectStore } from '../src/store/objects.js';
 import { HostedGit, hostedCloneUrl, registerHostedGit } from '../src/world/hosted-git.js';
 import type { Repository } from '../src/domain/types.js';
+import { paths } from '../src/config/paths.js';
+import { wikiRoot as projectWikiRoot } from '../src/wiki/wiki.js';
 
 /**
  * Repositories tavya hosts, through the gateway: made with the API, used with
@@ -38,6 +40,7 @@ let cookie: string;
 let organizationId: string;
 let close: () => Promise<void>;
 const previousDeployment = process.env.KARMAX_DEPLOYMENT;
+const previousGateway = process.env.KARMAX_GATEWAY_URL;
 /** The GitHub the move goes to: bare repositories on disk, by `owner/name`. */
 const github = new Map<string, string>();
 
@@ -62,6 +65,12 @@ beforeAll(async () => {
         name: input.name, sshUrl: `git@github.com:${connection!.accountLogin}/${input.name}.git`, defaultBranch: 'main', private: true,
         gitConnectionId: connection!.id });
     },
+    // A project wiki moving with its code: made like any repository (a retry would adopt it).
+    async ensureRepository(connectionId: string, userId: string, input: { name: string }) {
+      return github.has(`${(await store.getGitConnection(connectionId))!.accountLogin}/${input.name}`)
+        ? (await store.listRepositories(organizationId)).find((candidate) => candidate.provider === 'github' && candidate.name === input.name)!
+        : this.createRepository(connectionId, userId, input);
+    },
     async brokerCredentials(repository: Repository) {
       // The installation token's stand-in: the GitHub URL, rewritten to the repository on disk.
       return { env: { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${github.get(`${repository.owner}/${repository.name}`)}.insteadOf`,
@@ -76,6 +85,8 @@ beforeAll(async () => {
   });
   const running = await gateway.listen(port);
   url = running.url;
+  // Where the broker reaches tavya's Git (a project wiki's publication).
+  process.env.KARMAX_GATEWAY_URL = url;
   close = async () => { await running.close(); registerHostedGit(undefined); };
   const setup = await fetch(`${url}/api/setup`, { method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ name: 'Nadia', email: 'nadia@example.com', password: 'long-enough-password' }) });
@@ -89,6 +100,7 @@ afterAll(async () => {
   await store?.close();
   fs.rmSync(dir, { recursive: true, force: true });
   if (previousDeployment === undefined) delete process.env.KARMAX_DEPLOYMENT; else process.env.KARMAX_DEPLOYMENT = previousDeployment;
+  if (previousGateway === undefined) delete process.env.KARMAX_GATEWAY_URL; else process.env.KARMAX_GATEWAY_URL = previousGateway;
 });
 
 const cleanups: Array<() => void> = [];
@@ -190,6 +202,16 @@ describe('repositories tavya hosts, through the gateway', () => {
     await git(clone, ['push', '-q', 'origin', 'main']);
     await git(clone, ['push', '-q', 'origin', 'main:refs/heads/draft']);
 
+    // The project's wiki is on tavya with its code (tavya-error 1d0724aaf3e40071).
+    const wikiRoot = projectWikiRoot(paths().content, 'project', project.id);
+    let wiki: Repository | undefined;
+    for (let i = 0; i < 100 && !(wiki && (await store.getHostedRepository(wiki.id))?.refs['refs/heads/main']); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      wiki = (await store.projectWiki(project.id))?.repository;
+    }
+    expect(wiki).toMatchObject({ provider: 'tavya', name: `shop-wiki-${project.id.slice(-8)}` });
+    expect((await store.getHostedRepository(wiki!.id))!.refs['refs/heads/main']).toBe((await git(wikiRoot, ['rev-parse', 'main'])).stdout);
+
     const connection = await store.upsertGitConnection({ organizationId, provider: 'github', installationId: '1', accountLogin: 'nadia' });
     const moved = await call('POST', `/api/organizations/${organizationId}/repositories/${repository.id}/move-to-github`, { gitConnectionId: connection.id });
     expect(moved.status).toBe(200);
@@ -202,5 +224,13 @@ describe('repositories tavya hosts, through the gateway', () => {
     expect(await store.effectiveProjectConfig(project.id)).toMatchObject({ repos: ['git@github.com:nadia/shop.git'], remote: 'pr' });
     expect(await store.getRepository(repository.id)).toBeUndefined();
     expect(await store.getHostedRepository(repository.id)).toBeUndefined();
+    // Its wiki went along: one host per project.
+    const movedWiki = (await store.projectWiki(project.id))?.repository;
+    expect(movedWiki).toMatchObject({ provider: 'github', owner: 'nadia', name: wiki!.name, private: true });
+    expect((await git(github.get(`nadia/${wiki!.name}`)!, ['rev-parse', 'refs/heads/main'])).stdout)
+      .toBe((await git(wikiRoot, ['rev-parse', 'main'])).stdout);
+    expect((await git(wikiRoot, ['remote', 'get-url', 'origin'])).stdout).toBe(movedWiki!.sshUrl);
+    expect(await store.getRepository(wiki!.id)).toBeUndefined();
+    expect(await store.getHostedRepository(wiki!.id)).toBeUndefined();
   });
 });

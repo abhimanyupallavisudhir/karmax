@@ -8903,15 +8903,15 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     } finally { await remote.release(); }
   }
 
-  /** Resolve a fresh, repository-scoped App credential for one canonical wiki
-   * publish. No linked remote means the local repository remains authoritative. */
+  /** Resolve a fresh, repository-scoped credential (tavya's grant, or the
+   * GitHub App's) for one canonical wiki publish. No linked remote means the
+   * local repository remains authoritative. */
   private async projectWikiPublishTarget(projectId: string) {
     const repository = (await this.deps.store.projectWiki(projectId))?.repository;
     if (!repository) return undefined;
-    if (!this.deps.githubApp) throw new Error('the GitHub App is unavailable for this linked project wiki');
     return {
       remote: repository.sshUrl,
-      credential: await this.deps.githubApp.brokerCredentials(repository),
+      credential: await repositoryBrokerCredentials(repository, this.deps.githubApp),
     };
   }
 
