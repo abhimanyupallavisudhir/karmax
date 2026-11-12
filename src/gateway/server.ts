@@ -122,7 +122,8 @@ import { scanProjectResources } from '../world/resource-scan.js';
 import { credentialResource, resourceDriverCatalog, resourceSecretHandle, snapshotResource } from '../domain/resource-drivers.js';
 import { managedRepoPath } from '../world/worktree.js';
 import { paths } from '../config/paths.js';
-import { ensureProjectWikiRepositoryAsync, setProjectWikiRemote } from '../wiki/repository.js';
+import { ensureProjectWikiRepositoryAsync } from '../wiki/repository.js';
+import { ensureProjectWikiRemote, moveProjectWikiToGithub } from '../wiki/project-wiki-remote.js';
 import { worldRepos, worldWorkingDirectory, worldWorkingRelativePath, type WorldHandle } from '../world/types.js';
 import { enumerateCredentials, normalizePolicy, resolveCredentials } from '../platform/credentials.js';
 import { errorStatus } from './error-status.js';
@@ -3763,6 +3764,18 @@ export class Gateway {
         await store.replaceProjectRepository(repository.id, moved.id);
         await this.deps.hostedGit.remove(repository);
         await store.deleteRepository(repository.id);
+        // A project now wholly on GitHub takes its wiki there too: one host per
+        // project (no task of it is unfinished, checked above).
+        for (const projectId of projectIds) {
+          const project = await store.getProject(projectId);
+          if (!project) continue;
+          try {
+            await moveProjectWikiToGithub({ store, githubApp: this.deps.githubApp, siteName: await this.siteName }, project,
+              await ensureProjectWikiRepositoryAsync(paths().content, project.id), connection.id, subject.userId);
+          } catch (error) {
+            console.warn(`[karmax] could not move the wiki of ${project.id} to GitHub:`, error instanceof Error ? error.message : error);
+          }
+        }
         await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'repository.moved-to-github', `repository:${moved.id}`,
           { from: repository.id, to: `${moved.owner}/${moved.name}`, projects: projectIds, ...identityAuditDetail(callerIdentity) });
         return this.json(res, 200, moved);
@@ -9234,77 +9247,27 @@ export class Gateway {
     if (this.closing) return;
     if (!(await this.deps.store.projectWiki(project.id))) (await this.deps.store.setProjectWikiRepository(project.id));
     this.wikiLocalReady.add(project.id);
-    const current = (await this.deps.store.projectWiki(project.id))?.repository;
-    if (current && this.wikiRemotesReady.has(project.id)) return;
-    if (!this.deps.githubApp) return;
+    if (this.wikiRemotesReady.has(project.id) && (await this.deps.store.projectWiki(project.id))?.repository) return;
     if ((this.wikiRemoteRetryAfter.get(project.id) ?? 0) > Date.now()) return;
-    const githubApp = this.deps.githubApp;
-    // Already provisioned in a previous run: mint a short-lived installation
-    // token and wire the remote without touching the operator's user OAuth
-    // token. Re-running repository creation on every boot would re-hit the API
-    // with a possibly-expired user authorization.
-    if (current?.private && current.gitConnectionId) {
-      if (this.wikiRemotesProvisioning.has(project.id)) return;
-      this.wikiRemotesProvisioning.add(project.id);
-      this.trackWikiWork((async () => {
-        try {
-          await setProjectWikiRemote(root, current.sshUrl, await githubApp.brokerCredentials(current));
-          this.wikiRemotesReady.add(project.id);
-          this.wikiRemoteRetryAfter.delete(project.id);
-        } catch (error) {
-          this.wikiRemoteRetryAfter.set(project.id, Date.now() + 5 * 60_000);
-          console.warn(`[karmax] could not sync wiki remote for ${project.id}:`, error instanceof Error ? error.message : error);
-        } finally {
-          this.wikiRemotesProvisioning.delete(project.id);
-        }
-      })());
-      return;
-    }
-    const organizationId = project.organizationId ?? 'org_personal';
-    const candidates = [...new Set([
-      ...(userId ? [userId] : []),
-      ...(await this.deps.store.listOrganizationMemberships(organizationId))
-        .sort((a, b) => Number(b.role === 'owner') - Number(a.role === 'owner'))
-        .map((membership) => membership.userId),
-    ])];
-    const connections = (await this.deps.store.listGitConnections(organizationId));
-    const attachedConnectionIds = [...new Set((await this.deps.store.listProjectRepositories(project.id))
-      .map((candidate) => candidate.repository.gitConnectionId).filter((id): id is string => Boolean(id)))];
-    const connection = current?.gitConnectionId
-      ? connections.find((candidate) => candidate.id === current.gitConnectionId)
-      : attachedConnectionIds.length === 1
-      ? connections.find((candidate) => candidate.id === attachedConnectionIds[0])
-      : connections.length === 1 ? connections[0] : undefined;
-    if (!connection) return;
-    // Who it is made as: an organization's installation (with a person's
-    // authorization as fallback), or a personal account's own owner. Without
-    // that owner the wiki stays local until they are around.
-    const creator = typeof githubApp.repositoryCreator === 'function'
-      ? await githubApp.repositoryCreator(connection, candidates).catch(() => undefined) : undefined;
-    if (!creator) return;
     if (this.wikiRemotesProvisioning.has(project.id)) return;
+    // Published on the host the project's code is on: tavya's own Git or a
+    // private GitHub repository (src/wiki/project-wiki-remote.ts; a cloud
+    // world's set-up does the same and waits for it). In the background: an
+    // offline host must not hold up the request that asked.
     this.wikiRemotesProvisioning.add(project.id);
     this.trackWikiWork((async () => {
       try {
-        const base = project.name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 70) || 'project';
-        // Preserve the remote identity across project renames. The deterministic
-        // name is only for the first provisioning attempt.
-        const name = current?.name ?? `${base}-wiki-${project.id.slice(-8)}`;
-        const repository = await githubApp.ensureRepository(connection.id, creator.userId, {
-          name, description: `${(await this.siteName)} project wiki for ${project.name}`,
-          private: true, defaultBranch: 'main', autoInit: false,
-        });
-        // Link before the push so even a transient network failure keeps this
-        // platform-owned repository out of the ordinary project repo picker.
-        (await this.deps.store.setProjectWikiRepository(project.id, repository.id));
-        await setProjectWikiRemote(root, repository.sshUrl, await githubApp.brokerCredentials(repository));
-        this.wikiRemotesReady.add(project.id);
-        this.wikiRemoteRetryAfter.delete(project.id);
+        const published = await ensureProjectWikiRemote({ store: this.deps.store, githubApp: this.deps.githubApp,
+          siteName: await this.siteName }, project, root, { userId });
+        if (published.repository && !published.reason) {
+          this.wikiRemotesReady.add(project.id);
+          this.wikiRemoteRetryAfter.delete(project.id);
+        }
       } catch (error) {
         // An offline SSH endpoint should produce one bounded warning, not a retry
         // storm every time an old browser tab reloads project metadata.
         this.wikiRemoteRetryAfter.set(project.id, Date.now() + 5 * 60_000);
-        console.warn(`[karmax] could not create wiki remote for ${project.id}:`, error instanceof Error ? error.message : error);
+        console.warn(`[karmax] could not publish the wiki of ${project.id}:`, error instanceof Error ? error.message : error);
       } finally {
         this.wikiRemotesProvisioning.delete(project.id);
       }

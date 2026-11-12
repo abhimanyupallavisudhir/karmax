@@ -17,7 +17,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import { sameRepository } from '../world/repository-identity.js';
-import { parseHostedUrl, type HostedRepositoryState } from '../domain/hosted-repository.js';
+import { hostedRepositoryUrl, parseHostedUrl, type HostedRepositoryState } from '../domain/hosted-repository.js';
 import { pinTarget, workingFolder, worldCheckoutNames } from '../domain/world-location.js';
 import { isPostgresTarget, openSqlDatabase, type SqlDatabase } from './sql.js';
 import { watchAuthorityWrites } from './authorization-epoch.js';
@@ -3993,6 +3993,29 @@ export class Store {
 
   async repositoryIsProjectWiki(repositoryId: string): Promise<boolean> {
     return !!(await this.db.prepare('SELECT 1 FROM project_wikis WHERE repositoryId=? LIMIT 1').get(repositoryId));
+  }
+
+  /** The project's wiki repository, made on tavya and linked when it has none
+   * (src/wiki/project-wiki-remote.ts). One transaction under the organization's
+   * lock, so the gateway and several world set-ups racing link one repository;
+   * a retry after a crash adopts the unattached one it had made. */
+  async linkHostedProjectWiki(projectId: string, name: string): Promise<Repository> {
+    return this.db.transaction(async () => {
+      const project = await this.lockProjectOrganization(projectId);
+      if (!project) throw new Error(`no project ${projectId}`);
+      const current = (await this.projectWiki(projectId))?.repository;
+      if (current) return current;
+      const organizationId = project.organizationId ?? 'org_personal';
+      const named = (await this.listRepositories(organizationId))
+        .find((candidate) => candidate.provider === 'tavya' && candidate.name.toLowerCase() === name.toLowerCase());
+      if (named && ((await this.projectIdsForRepository(named.id)).length || (await this.repositoryIsProjectWiki(named.id))))
+        throw new Error(`the repository ${name} is already in use; rename it to give this project's wiki its name`);
+      const id = newId('repo');
+      const repository = named ?? await this.upsertRepository({ id, organizationId, provider: 'tavya', owner: organizationId, name,
+        sshUrl: hostedRepositoryUrl(id, name), defaultBranch: 'main', private: true });
+      await this.setProjectWikiRepository(projectId, repository.id);
+      return repository;
+    });
   }
 
   async setProjectWikiRepository(projectId: string, repositoryId?: string): Promise<void> {

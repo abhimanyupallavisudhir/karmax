@@ -20,6 +20,11 @@ import { readMirrored } from '../src/world/git-mirror.js';
 import { materializeGitCredential } from '../src/world/git-credential.js';
 import { newId } from '../src/util/id.js';
 import type { Repository } from '../src/domain/types.js';
+import { WorldRegistry } from '../src/world/registry.js';
+import { makeCoreActivities } from '../src/activities/core.js';
+import { ProfileResolver } from '../src/agent/profiles.js';
+import { ensureProjectWikiRepositoryAsync } from '../src/wiki/repository.js';
+import { ensureProjectWikiRemote } from '../src/wiki/project-wiki-remote.js';
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -345,5 +350,96 @@ describe('the Files tab', () => {
     const listed = await readMirrored(f.repository.sshUrl, env, { branch: 'main', scratch, scope: credential.mirrorScope },
       async (repository, commit) => (await must(repository, ['ls-tree', '--name-only', commit])).split('\n'));
     expect(listed).toEqual(['README.md']);
+  });
+});
+
+describe('the wiki of a project on tavya', () => {
+  /** A cloud world provider that records what it was asked to provision. */
+  function fakeCloud() {
+    const received: any[] = [];
+    const worlds = new WorldRegistry();
+    worlds.register({ kind: 'fake-cloud', capabilities: { remote: true },
+      async create(spec: any) {
+        received.push(spec);
+        return { handle: { kind: 'fake-cloud', id: spec.taskId, root: '/workspace', branch: `tavya/${spec.taskId}`, base: spec.base,
+          repos: spec.repos.map((repo: string, index: number) => ({ name: `r${index}`, repo, root: `/workspace/r${index}`,
+            branch: `tavya/${spec.taskId}`, base: spec.base })) }, async destroy() {} } as any;
+      },
+      async open() { throw new Error('unused'); }, async destroy() {} } as any);
+    return { worlds, received };
+  }
+
+  // tavya-error 1d0724aaf3e40071: every cloud task of a project whose code tavya
+  // hosts stopped at set-up, "the project wiki needs a private GitHub remote".
+  it('is published to tavya when a cloud world needs it, once, and the world clones it from there', async () => {
+    const f = await fixture();
+    await f.hosted.create(f.repository);
+    registerHostedGit(f.hosted);
+    const saved = { gateway: process.env.KARMAX_GATEWAY_URL, public: process.env.KARMAX_PUBLIC_URL };
+    process.env.KARMAX_GATEWAY_URL = f.base;
+    process.env.KARMAX_PUBLIC_URL = f.base;
+    cleanups.push(() => {
+      registerHostedGit(undefined);
+      for (const [key, value] of [['KARMAX_GATEWAY_URL', saved.gateway], ['KARMAX_PUBLIC_URL', saved.public]] as const)
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    });
+    const project = await f.store.createProject('Shop', { repos: [f.repository.sshUrl], worldProvider: 'fake-cloud' }, f.organization.id);
+    await f.store.attachProjectRepository({ projectId: project.id, repositoryId: f.repository.id });
+    const content = f.work('content');
+    const wikiRoot = await ensureProjectWikiRepositoryAsync(content, project.id);
+    const { worlds, received } = fakeCloud();
+    const core = makeCoreActivities({ store: f.store, worlds, adapters: new Map(), profiles: new ProfileResolver(f.store, 'mock'), contentDir: content });
+    const start = async (title: string) => {
+      const task = await f.store.createTask({ projectId: project.id, title, workflow: 'software-dev', workflowVersion: '1.27.0',
+        params: { prompt: 'x', base: 'main', target: 'main', _repositoryBranchesResolved: true } });
+      await core.createWorld({ taskId: task.id, repos: [f.repository.sshUrl], base: 'main', target: 'main', kind: 'fake-cloud' });
+      return received.at(-1);
+    };
+
+    const spec = await start('First');
+    const wiki = (await f.store.projectWiki(project.id))?.repository;
+    expect(wiki).toMatchObject({ provider: 'tavya', organizationId: f.organization.id, private: true, defaultBranch: 'main' });
+    expect(wiki!.name).toBe(`shop-wiki-${project.id.slice(-8)}`);
+    expect(spec.repos).toEqual([f.repository.sshUrl, wiki!.sshUrl]);
+    expect(spec.gitCredentials.httpsTokens[wiki!.sshUrl]).toEqual(expect.any(String));
+    expect(spec.gitCredentials.hostedGitBase).toBe(`${f.base}/git/`);
+    // tavya holds the canonical wiki's own history (no commit of its own on top).
+    expect((await f.store.getHostedRepository(wiki!.id))!.refs).toEqual({ 'refs/heads/main': await must(wikiRoot, ['rev-parse', 'main']) });
+    expect(await must(wikiRoot, ['remote', 'get-url', 'origin'])).toBe(wiki!.sshUrl);
+    // Kept out of the project's repository picker, like a GitHub wiki.
+    expect(await f.store.repositoryIsProjectWiki(wiki!.id)).toBe(true);
+
+    // The next world uses the same one.
+    const next = await start('Second');
+    expect(next.repos).toEqual([f.repository.sshUrl, wiki!.sshUrl]);
+    expect((await f.store.listRepositories(f.organization.id)).filter((repository) => repository.provider === 'tavya')).toHaveLength(2);
+  });
+
+  it('is made once when several take part at the same time', async () => {
+    const f = await fixture();
+    await f.hosted.create(f.repository);
+    registerHostedGit(f.hosted);
+    const saved = process.env.KARMAX_GATEWAY_URL;
+    process.env.KARMAX_GATEWAY_URL = f.base;
+    cleanups.push(() => { registerHostedGit(undefined); if (saved === undefined) delete process.env.KARMAX_GATEWAY_URL; else process.env.KARMAX_GATEWAY_URL = saved; });
+    const project = await f.store.createProject('Shop', {}, f.organization.id);
+    await f.store.attachProjectRepository({ projectId: project.id, repositoryId: f.repository.id });
+    const root = await ensureProjectWikiRepositoryAsync(f.work('content'), project.id);
+    const results = await Promise.all([0, 1, 2].map(() => ensureProjectWikiRemote({ store: f.store }, project, root)));
+    const ids = new Set(results.map((result) => result.repository?.id));
+    expect(ids.size).toBe(1);
+    expect((await f.store.projectWiki(project.id))?.repository?.id).toBe([...ids][0]);
+    expect((await f.store.listRepositories(f.organization.id)).filter((repository) => repository.provider === 'tavya')).toHaveLength(2);
+  });
+
+  it('says why when there is nowhere to publish it', async () => {
+    const f = await fixture();
+    const project = await f.store.createProject('Shop', {}, f.organization.id);
+    await f.store.attachProjectRepository({ projectId: project.id, repositoryId: f.repository.id });
+    const root = await ensureProjectWikiRepositoryAsync(f.work('content'), project.id);
+    registerHostedGit(undefined);
+    expect(await ensureProjectWikiRemote({ store: f.store }, project, root)).toEqual({
+      reason: expect.stringContaining('does not host repositories') });
+    expect((await f.store.projectWiki(project.id))?.repository).toBeUndefined();
   });
 });

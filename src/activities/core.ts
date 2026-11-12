@@ -136,6 +136,7 @@ import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
 import type { ObjectStore } from '../store/objects.js';
 import { conversationImportObjectKey } from '../store/conversation-imports.js';
 import { ensureProjectWikiRepositoryAsync, PROJECT_WIKI_BRANCH, setProjectWikiRemote } from '../wiki/repository.js';
+import { ensureProjectWikiRemote, projectWikiRemoteReady } from '../wiki/project-wiki-remote.js';
 import { ProjectGithubAccess } from '../integrations/project-github-access.js';
 import { RepositoryAccessRequests, withdrawRepositoryAccessRequests } from '../integrations/repository-access.js';
 import path from 'node:path';
@@ -1517,7 +1518,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const linked = projectId ? (await store.listProjectRepositories(projectId)) : [];
     const wiki = projectId ? (await store.projectWiki(projectId))?.repository : undefined;
     const catalog = project?.organizationId ? (await store.listRepositories(project.organizationId)) : [];
-    if (project?.organizationId && (linked.length || wiki || catalog.length) && (deps.githubApp || linked.some(({ repository }) => isHostedRepository(repository)))) {
+    if (project?.organizationId && (linked.length || wiki || catalog.length) && (deps.githubApp || isHostedRepository(wiki) || linked.some(({ repository }) => isHostedRepository(repository)))) {
       return async (worldRepo) => {
         const source = worldRepoSource(worldRepo);
         let repository = linked.find((candidate) => sameRepository(candidate.repository.sshUrl, source))?.repository
@@ -2388,11 +2389,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ? await ensureProjectWikiRepositoryAsync(deps.contentDir ?? paths().content, project.id)
         : undefined;
       if (project && !(await store.projectWiki(project.id))) (await store.setProjectWikiRepository(project.id));
-      const wikiRepository = project ? (await store.projectWiki(project.id))?.repository : undefined;
+      let wikiRepository = project ? (await store.projectWiki(project.id))?.repository : undefined;
       const developmentSources = forkDevelopmentSources((args.repos?.length ? args.repos : args.repo ? [args.repo] : [])
         .map((source) => source.trim()).filter(Boolean), forkCheckpoint, [wikiRoot, wikiRepository?.sshUrl]);
-      if (remote && developmentSources.length > 0 && project && (!wikiRepository || !wikiRepository.private))
-        throw new Error('the project wiki needs a private GitHub remote before a cloud world can be created');
+      // A cloud world clones the wiki from its remote: published here, on the
+      // host the project's code is on, rather than trusting that the gateway's
+      // background attempt already did (tavya-error 1d0724aaf3e40071: a project
+      // on tavya's own Git never had one).
+      if (remote && developmentSources.length > 0 && project && wikiRoot && !(await projectWikiRemoteReady(wikiRoot, wikiRepository))) {
+        const ensured = await timed('world.wiki-remote', () => ensureProjectWikiRemote({ store, githubApp: deps.githubApp }, project, wikiRoot));
+        wikiRepository = ensured.repository;
+        if (!(await projectWikiRemoteReady(wikiRoot, wikiRepository)))
+          throw new Error(`the project wiki has no repository a cloud world can clone it from: ${ensured.reason ?? 'its repository is not private'}`);
+      }
       const requestedSources = [
         ...developmentSources,
         ...(developmentSources.length > 0 && wikiRoot && (!remote || wikiRepository) ? [wikiRoot] : []),
