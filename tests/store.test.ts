@@ -1282,6 +1282,19 @@ describe.each(storeBackends)('Store ($name)', ({ name, open }) => {
     expect((await store.listArmedTasks()).map((t) => t.id)).toEqual([armed.id]);
     expect((await store.runsOf(plain.id)).map((t) => t.id)).toEqual([run.id]);
     expect((await store.runsOf(armed.id))).toEqual([]);
+    expect(Object.fromEntries(await store.runCounts([plain.id, armed.id]))).toEqual({ [plain.id]: 1, [armed.id]: 0 });
+    expect(await store.runCounts([])).toEqual(new Map());
+  });
+
+  it('lists a series\' runs without their conversations', async () => {
+    const project = (await store.createProject('Runs'));
+    const series = (await store.createTask({ projectId: project.id, title: 's', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p', repeatable: true } }));
+    const run = (await store.createTask({ projectId: project.id, title: 'r', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p', runOf: series.id, archived: true } }));
+    (await store.saveView(run.id, { taskId: run.id, title: 'r', workflow: 'just-do', stage: 'done', status: 'done',
+      messages: [{ id: 'm', text: 'long history', role: 'agent', ts: 1 }], state: {}, actions: [], updatedAt: 1 } as any));
+    const [listed] = await store.runsOf(series.id);
+    expect(listed).toMatchObject({ id: run.id, num: run.num, params: { archived: true }, lastView: { status: 'done' } });
+    expect(listed!.lastView?.messages).toBeUndefined();
   });
 
   it('prunes high-volume agent.output rows when a task settles (and only then)', async () => {
