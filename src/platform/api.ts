@@ -6282,6 +6282,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       ...(result.reasons ? { reasons: Object.fromEntries(Object.entries(result.reasons).filter(([id]) => ids.has(id))) } : {}),
       ...(result.pullRequestAsks ? { pullRequestAsks: Object.fromEntries(Object.entries(result.pullRequestAsks).filter(([id]) => ids.has(id))) } : {}),
       ...(result.updated ? { updated: Object.fromEntries(Object.entries(result.updated).filter(([id]) => ids.has(id))) } : {}),
+      ...(result.runCounts ? { runCounts: Object.fromEntries(Object.entries(result.runCounts).filter(([id]) => ids.has(id))) } : {}),
       projects: projects.map((project) => ({ id: project.id, name: project.name, slug: slugify(project.name), organizationId: project.organizationId ?? 'org_personal' })),
       tags,
     };
@@ -6351,7 +6352,10 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       ctx.seriesIds = new Set();
       for (const id of unread) if (isSeries((await this.deps.store.taskMetadataAsync(id))?.params)) ctx.seriesIds.add(id);
     }
-    return { result: evaluateQuery(tasks, q, { ...ctx, tags }), tags };
+    const result = evaluateQuery(tasks, q, { ...ctx, tags });
+    const series = result.tasks.filter((task) => isSeries(task.params)).map((task) => task.id);
+    if (series.length) result.runCounts = Object.fromEntries(await this.deps.store.runCounts(series));
+    return { result, tags };
   }
 
   /** The searchable-field registry the UI reads to build its filter/sort/group menus. */
