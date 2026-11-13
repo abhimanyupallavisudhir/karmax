@@ -1,10 +1,11 @@
 # Launch video
 
-Three versions live here:
+Four versions live here:
 
 | Version | Where | How it is made |
 | --- | --- | --- |
-| **First cut — the final version** (0:59, dark) | `first-cut/` | Stills of a clone composited frame by frame (`first-cut/README.md`). |
+| **Final** (1:00, dark) | `final/` | The first cut's look and score, every screen captured fresh from this folder's clone (`final/README.md`). |
+| First cut (0:59, dark) | `first-cut/` | Stills of a clone composited frame by frame (`first-cut/README.md`). |
 | Second (≈2:27, light) | this folder | One recorded take of the clone (below); `snappy.sh` makes it. |
 | Third (≈1:40, dark) | `third-cut/` | The first cut's compositor and style, new screens captured from this folder's clone (`third-cut/README.md`). |
 

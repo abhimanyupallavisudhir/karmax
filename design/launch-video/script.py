@@ -299,6 +299,14 @@ entry(r'^Fill in slides\.md with content from README\.md', [
     '@sleep 900000',
 ], pace=700)
 
+# ── The autonomous company: an agent sets up work that starts itself ──
+entry(r'^Whenever something breaks on the server', [
+    '@step read Read the deploy workflow and the server\'s log shipping :: journald → error tracker · alerts by webhook',
+    '@step think A repeatable task, triggered by the error tracker\'s webhook, with the error\'s details in its prompt.',
+    '@step tool tavya · create_task :: #183 Fix errors in deployment · repeatable · on errors.new',
+    '@say ' + esc("""Created Task **#183: Fix errors in deployment**. It will run whenever errors occur on your server."""),
+], pace=900)
+
 # ── Sub-tasks (the feature grid's still; created and deleted off camera) ──
 SUBTASKS = [
     ('Write the Show HN post and the Product Hunt listing', False),

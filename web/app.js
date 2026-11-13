@@ -5983,7 +5983,7 @@ function applyDocumentBrand() {
   applyTaskList(S.meta?.taskList);
   document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute('content', siteName());
   document.querySelector('meta[name="description"]')?.setAttribute('content',
-    `${siteName()} is the agentic to-do list that finishes itself: agents work in parallel on their own computers; you review the result. Use your Claude or ChatGPT plan.`);
+    `Do anything with agents. ${siteName()} gives each task its own agent and computer, with your accounts and card; you approve. Use your Claude or ChatGPT plan.`);
 }
 
 // The browser tab names the console page on screen, most specific part first so a
@@ -28901,26 +28901,37 @@ function openPublicAuth(path, render) {
 // The landing wears the console's look (light or dark, default or classic), like
 // Docs and Pricing: the launch film, then how a task goes, then what surrounds it, each pictured by a screenshot of the console in the
 // visitor's look (web/media/landing/<name>-light|dark.webp, design/landing-v3).
-const LANDING_FILM = { src: '/media/tavya-launch.mp4', poster: '/media/tavya-launch-poster.jpg', length: '0:59' };
+const LANDING_FILM = { src: '/media/tavya-launch.mp4', poster: '/media/tavya-launch-poster.jpg', length: '1:00' };
 // How a task goes. [still, title, line, picture's description]
 const LANDING_STEPS = [
-  ['write', 'Write it down', 'In plain words, in any project. Pick the agent and model, or keep your defaults.', 'The new-task form with a prompt written in plain words'],
-  ['work', 'An agent does it', 'On its own computer, with your repositories, a terminal and a browser. As many at once as you like.', 'A task’s agent at work: the steps it has taken so far'],
-  ['review', 'You review the result', 'Agents attach screenshots, reports and commands to check. Approve, and it lands.', 'A task in review, with the screenshots its agent attached'],
+  ['write', 'Write it down', 'In plain words, in any project.', 'The new-task form with a prompt written in plain words'],
+  ['work', 'An agent does it', 'On its own computer: your repos, a terminal, a browser.', 'A task’s agent at work: the steps it has taken so far'],
+  ['review', 'Review and approve', 'Or leave the review to an agent.', 'A task in review, with the screenshots its agent attached'],
 ];
-// What surrounds the work. [still, title, line or list, picture's description]
+// The autonomous company: what lets agents run a project. [still, title, line, picture's description]
+const LANDING_AUTONOMY = [
+  ['autonomous', 'Agents create, manage and approve tasks', 'Make a project fully autonomous, or hand any review to an agent.', 'The new-project form with “Fully autonomous project” switched on'],
+  ['automations', 'Work starts itself', 'On a schedule, an event, or when another task is done.', 'Repeatable tasks: fixing errors as they happen, dependency updates, wiki upkeep, a nightly dream'],
+];
+// The automations card's list, drawn with the console's parts: [title, when it runs].
+const LANDING_AUTOMATIONS = [
+  ['Fix errors in deployment', 'when the server reports an error'],
+  ['Update dependencies', 'when a dependency releases'],
+  ['Write the release notes', 'after the release task lands'],
+  ['Maintain the project wiki', 'every Monday'],
+  ['Dream', 'every night at 3:00'],
+];
+// What else every task gets. [still, title, line, picture's description]
 const LANDING_FEATURES = [
-  ['fan-out', 'Big jobs fan out', 'A task can split into sub-tasks, each with its own agent. One codebase review became 25.', 'A task’s sub-tasks, each done by its own agent'],
-  ['vault', 'Accounts, keys and a card', 'Agents sign up, sign in and pay, only with what you allow, and never see a password.', 'The vault: logins and keys agents may use'],
-  ['automations', 'The autonomous company', ['Agents can start, manage and approve tasks', 'Tasks can be triggered by webhooks and events', 'Tasks can run on schedules, or after other tasks'], 'Repeatable tasks, started by schedules and events'],
-  ['models', 'Any model, your subscription', 'Claude Code, Codex or OpenCode, on your Claude or ChatGPT plan, or an API key.', 'The model picker'],
-  ['errand', 'Not just code', 'Research, your website, and the errands in between. It asks before it uses your login.', 'An agent asking to use a saved login before booking a flight'],
-  ['phones', 'On your phone', 'Every task, its conversation and its review, wherever you are.', 'The task list and a task on a phone'],
+  ['fan-out', 'Big jobs fan out', 'A task splits into sub-tasks, each with its own agent.', 'A task’s sub-tasks, each done by its own agent'],
+  ['vault', 'Accounts, keys and a card', 'Agents sign up, sign in and pay, only with what you allow.', 'The vault: logins and keys agents may use'],
+  ['models', 'Any model, your subscription', 'Claude Code, Codex or OpenCode, on your plan or an API key.', 'The model picker'],
+  ['errand', 'Not just code', 'Papers. Websites. Images and video. Chores.', 'An agent asking to use a saved login before booking a flight'],
 ];
 
 // Each screenshot's size in CSS pixels (the files are 2×), so it shows at the console's own scale.
 const LANDING_SHOT_SIZES = { write: [756, 582], work: [652, 470], review: [633, 495], 'fan-out': [305, 520], vault: [960, 420],
-  automations: [1156, 237], models: [726, 380], errand: [652, 406], 'phone-list': [390, 844], 'phone-task': [390, 844] };
+  autonomous: [520, 432], models: [726, 380], errand: [652, 406] };
 
 function renderLanding() {
   const site = siteNameMarkup();
@@ -28929,11 +28940,11 @@ function renderLanding() {
     const [width, height] = LANDING_SHOT_SIZES[name];
     return ['light', 'dark'].map((look) => `<img class="lp-${look}" src="/media/landing/${name}-${look}.webp" alt="${look === 'light' ? esc(alt) : ''}"${look === 'dark' ? ' aria-hidden="true"' : ''} width="${width}" height="${height}" style="--w:${width}" loading="lazy" decoding="async">`).join('');
   };
-  const phones = (alt) => `<div class="lp-phones" role="img" aria-label="${esc(alt)}">${['list', 'task'].map((n) => `<span class="lp-phone">${shot(`phone-${n}`, '')}</span>`).join('')}</div>`;
+  const automations = () => `<ul class="lp-automations">${LANDING_AUTOMATIONS.map(([title, when]) => `<li><b>${esc(title)}</b><i>Repeatable</i><span>${esc(when)}</span></li>`).join('')}</ul>`;
   const play = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 4.6v10.8a.6.6 0 0 0 .9.5l8.6-5.4a.6.6 0 0 0 0-1L7.4 4.1a.6.6 0 0 0-.9.5z"/></svg>';
   const github = 'https://github.com/abhimanyupallavisudhir/krmax-issues/issues';
   document.body.classList.add('landing-active');
-  document.title = `${siteName()} — the agentic to-do list that finishes itself`;
+  document.title = `${siteName()} — do anything with agents`;
   $('#app').innerHTML = `<div class="landing-page">
     <a class="landing-skip" href="#landing-main">Skip to content</a>
     <header class="landing-nav" aria-label="Primary navigation"><div class="landing-nav-inner">
@@ -28949,8 +28960,8 @@ function renderLanding() {
 
     <main id="landing-main">
       <section class="lp-hero" aria-labelledby="landing-title">
-        <h1 id="landing-title">The agentic to-do list that finishes itself.</h1>
-        <p class="lp-lede">Write down what needs doing. Agents do it on their own computers, in parallel, and you review the result.</p>
+        <h1 id="landing-title">Do <em>anything</em> with agents.</h1>
+        <p class="lp-lede">Write it down. An agent does it.</p>
         <div class="lp-actions">
           <a class="landing-start lp-large" id="landing-hero-start" href="/signup">Get started</a>
         </div>
@@ -28968,12 +28979,20 @@ function renderLanding() {
         </ol>
       </section>
 
+      <section class="lp-auto" aria-labelledby="lp-auto-title">
+        <h2 id="lp-auto-title">Build the <em>autonomous company</em></h2>
+        <p class="lp-auto-lede">Let agents run the whole project.</p>
+        <div class="lp-auto-grid">${LANDING_AUTONOMY.map(([name, title, line, alt]) => `
+          <article class="lp-auto-card"><h3>${esc(title)}</h3><p>${esc(line)}</p><figure class="lp-shot"${name === 'automations' ? ` aria-label="${esc(alt)}"` : ''}>${name === 'automations' ? automations() : shot(name, alt)}</figure></article>`).join('')}
+        </div>
+      </section>
+
       <section class="lp-features" aria-labelledby="lp-features-title">
         <h2 id="lp-features-title">Everything a task needs</h2>
         <div class="lp-grid">${LANDING_FEATURES.map(([name, title, line, alt]) => `
           <article class="lp-feature"><h3>${esc(title)}</h3>
-            ${Array.isArray(line) ? `<ul>${line.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>` : `<p>${esc(line)}</p>`}
-            <figure class="lp-shot${name === 'phones' ? ' lp-shot-phones' : ''}"${name === 'fan-out' ? ' data-anchor="center"' : ''}>${name === 'phones' ? phones(alt) : shot(name, alt)}</figure></article>`).join('')}
+            <p>${esc(line)}</p>
+            <figure class="lp-shot"${name === 'fan-out' ? ' data-anchor="center"' : ''}>${shot(name, alt)}</figure></article>`).join('')}
         </div>
       </section>
 

@@ -48,14 +48,15 @@ export type PublicRoute =
   | { kind: 'not-found' }
   | { kind: 'console' };
 
-/** The landing's sections, as web/app.js (LANDING_STEPS, LANDING_FEATURES) tells them: [heading, its parts]. */
+/** The landing's sections, as web/app.js (LANDING_STEPS, LANDING_AUTONOMY, LANDING_FEATURES) tells them: [heading, its parts]. */
 const LANDING_SECTIONS: Array<[string, string[]]> = [
-  ['How a task goes', ['Write it down', 'An agent does it', 'You review the result']],
-  ['Everything a task needs', ['Big jobs fan out', 'Accounts, keys and a card', 'The autonomous company', 'Any model, your subscription', 'Not just code', 'On your phone']],
+  ['How a task goes', ['Write it down', 'An agent does it', 'Review and approve']],
+  ['Build the autonomous company', ['Agents create, manage and approve tasks', 'Work starts itself']],
+  ['Everything a task needs', ['Big jobs fan out', 'Accounts, keys and a card', 'Any model, your subscription', 'Not just code']],
 ];
 
 /** The tagline the landing and its title share. */
-export const LANDING_TAGLINE = 'the agentic to-do list that finishes itself';
+export const LANDING_TAGLINE = 'do anything with agents';
 
 const DEFAULT_DOC = 'getting-started';
 
@@ -137,14 +138,14 @@ export function publicPaths(ctx: Pick<PublicPageContext, 'staticDir' | 'launch'>
 function page(ctx: PublicPageContext, pathname: string): PublicPage | 'not-found' | undefined {
   const site = ctx.siteName;
   if (pathname === '/') {
-    const description = `${site} is ${LANDING_TAGLINE}: agents work in parallel on their own computers; you review the result. Use your Claude or ChatGPT plan.`;
+    const description = `Do anything with agents. ${site} gives each task its own agent and computer, with your accounts and card; you approve. Use your Claude or ChatGPT plan.`;
     const offers = ctx.launch.pricingCatalog.map((plan) => ({ '@type': 'Offer', name: plan.name,
       price: (plan.monthlyBasePriceCents / 100).toFixed(2), priceCurrency: plan.currency.toUpperCase(), url: `${ctx.origin}/pricing` }));
     return {
       path: '/', title: `${site} — ${LANDING_TAGLINE}`, name: `${site} — ${LANDING_TAGLINE}`, description,
-      body: `<h1>The agentic to-do list that finishes itself.</h1>
+      body: `<h1>Do anything with agents.</h1>
 <p>${esc(description)}</p>
-<p><a href="/media/tavya-launch.mp4">Watch the launch film (0:59)</a></p>
+<p><a href="/media/tavya-launch.mp4">Watch the launch film (1:00)</a></p>
 ${LANDING_SECTIONS.map(([heading, parts]) => `<h2>${esc(heading)}</h2>\n<ul>${parts.map((part) => `<li>${esc(part)}</li>`).join('')}</ul>`).join('\n')}
 <p><a href="/signup">Get started</a> · <a href="/login">Sign in</a></p>`,
       structuredData: { '@context': 'https://schema.org', '@graph': [

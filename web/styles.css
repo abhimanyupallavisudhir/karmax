@@ -2502,7 +2502,23 @@ html[data-theme="dark"] .legal-shell { color-scheme: dark; }
 .lp-feature ul { margin-top: 6px; }
 .lp-feature li { position: relative; margin-top: 4px; padding-left: 16px; }
 .lp-feature li::before { content: ""; position: absolute; left: 2px; top: .62em; width: 5px; height: 5px; border-radius: 50%; background: var(--l-ink-3); }
-.lp-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
+.lp-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; }
+/* The autonomous company: the one band across the page, its two parts larger than the features. */
+.lp-auto { margin-top: 120px; padding: 96px max(24px, calc((100% - 1120px) / 2)); background: var(--l-surface-2); border-block: 1px solid var(--l-line); text-align: center; }
+.lp-auto h2 { font-size: clamp(32px, 4.4vw, 52px); line-height: 1.05; font-weight: 680; letter-spacing: -.035em; font-variation-settings: "opsz" 32; font-optical-sizing: none; }
+.lp-auto h2 em, .lp-hero h1 em { font-style: italic; }
+.lp-auto-lede { max-width: 34em; margin: 18px auto 44px; color: var(--l-ink-2); font-size: clamp(17px, 2vw, 19px); line-height: 1.55; text-wrap: pretty; }
+.lp-auto-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; text-align: left; }
+.lp-auto-card { display: flex; flex-direction: column; padding: 28px 28px 0; border: 1px solid var(--l-line); border-radius: calc(var(--r) + 6px); background: var(--l-surface); box-shadow: var(--l-frame-shadow); overflow: hidden; }
+.lp-auto-card h3 { font-size: 22px; font-weight: 650; letter-spacing: -.02em; }
+.lp-auto-card p { margin-top: 8px; color: var(--l-ink-2); font-size: var(--fs-15); line-height: 1.55; }
+.lp-auto-card .lp-shot { flex: 1 0 auto; min-height: 300px; aspect-ratio: auto; margin: 22px -1px -1px; border-radius: var(--r) var(--r) 0 0; }
+.lp-automations { position: absolute; inset: 18px 18px auto; display: grid; gap: 8px; }
+.lp-automations li { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "title chip" "when chip"; align-items: center; gap: 2px 12px;
+  padding: 11px 14px; border: 1px solid var(--l-line); border-radius: var(--r); background: var(--l-surface); box-shadow: var(--l-frame-shadow); }
+.lp-automations b { grid-area: title; overflow: hidden; font-size: var(--fs-14); font-weight: 600; white-space: nowrap; text-overflow: ellipsis; }
+.lp-automations span { grid-area: when; color: var(--l-ink-3); font-size: var(--fs-13); }
+.lp-automations i { grid-area: chip; padding: 1px 8px; border-radius: 999px; background: var(--l-surface-2); color: var(--l-ink-2); font-size: var(--fs-12); font-style: normal; font-weight: 600; }
 .lp-feature { display: flex; flex-direction: column; padding: 22px 22px 0; border: 1px solid var(--l-line); border-radius: calc(var(--r) + 4px); background: var(--l-surface); overflow: hidden; }
 /* A screenshot: the console's own screen, cropped, in the visitor's look. */
 .lp-shot { position: relative; margin-top: 18px; aspect-ratio: 16 / 10; border: 1px solid var(--l-line); border-radius: var(--r); background: var(--l-surface-2); overflow: hidden; }
@@ -2510,7 +2526,7 @@ html[data-theme="dark"] .legal-shell { color-scheme: dark; }
 /* A card's picture fills what its words leave, so a row's pictures end together. */
 .lp-feature .lp-shot { flex: 1 0 auto; min-height: 220px; aspect-ratio: auto; margin: 18px -1px -1px; border-radius: var(--r) var(--r) 0 0; }
 /* At the console's own scale (a little smaller), from the top left, the frame cropping the rest. */
-.lp-shot img { position: absolute; top: 18px; left: 18px; width: calc(var(--w) * .82px); max-width: none; height: auto;
+.lp-shot img { position: absolute; top: 18px; left: 18px; width: calc(var(--w) * var(--k, .82) * 1px); max-width: none; height: auto;
   border: 1px solid var(--l-line); border-radius: 8px; box-shadow: var(--l-frame-shadow); }
 .lp-shot[data-anchor="center"] img { left: 50%; transform: translateX(-50%); }
 .lp-dark { display: none; }
@@ -2520,9 +2536,6 @@ html[data-theme="dark"] .lp-light { display: none; }
   html:not([data-theme="light"]) .lp-dark { display: block; }
   html:not([data-theme="light"]) .lp-light { display: none; }
 }
-.lp-phones { position: absolute; inset: 18px 0 0; display: flex; justify-content: center; gap: 14px; }
-.lp-phone { position: relative; width: 40%; border: 5px solid var(--l-ink); border-bottom: 0; border-radius: 26px 26px 0 0; background: var(--l-bg); overflow: hidden; }
-.lp-phone img { inset: 0 auto auto 0; width: 100%; border: 0; border-radius: 0; box-shadow: none; }
 
 /* The end: the mark, the brand's line, the one thing to do. */
 .lp-end { width: var(--lp-wide); margin: 0 auto; padding: 140px 0 120px; display: flex; flex-direction: column; align-items: center; gap: 22px; text-align: center; }
@@ -2537,6 +2550,7 @@ html[data-theme="dark"] .lp-light { display: none; }
 .landing-footer .landing-brand span { font-size: 16px; }
 
 @media (max-width: 960px) {
+  .lp-auto-grid { grid-template-columns: minmax(0, 1fr); }
   .lp-steps ol, .lp-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .lp-step:last-child { grid-column: 1 / -1; }
 }
