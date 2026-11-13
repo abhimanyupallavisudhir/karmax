@@ -127,8 +127,13 @@ const VAULT = [
     fs.writeFileSync(path.join(laptop, 'admin-docs/documents/passport.pdf'), '%PDF-1.4\n% demo\n');
     fs.writeFileSync(path.join(laptop, 'admin-docs/documents/loyalty-programmes.md'), '# Loyalty programmes\n\n- United MileagePlus: XX000000 (demo)\n');
     spawnSync('node', [tavya, 'add', 'documents'], { cwd: path.join(laptop, 'admin-docs'), env });
-    for (const id of ['triage-issues', 'build-planned-issues', 'repair-github-workflow'])
-      await api.post(`${APP}/api/projects/${projects.tavya}/task-store/${id}`, { data: {}, headers: { origin: APP } });
+    // The automations an autonomous company runs on (dependency updates and Dream are being built: mocked here).
+    for (const a of [
+      { title: 'Fix errors in deployment', prompt: 'An error was reported on the server: find its cause, fix it, and ship the fix.', params: { repeatable: true, triggers: [{ kind: 'event', type: 'errors.new', recurring: true }] } },
+      { title: 'Update dependencies', prompt: 'A dependency published a new version: bump it, adapt the code to what changed, run the tests, and open a pull request.', params: { repeatable: true, triggers: [{ kind: 'event', type: 'dependency.released', recurring: true }] } },
+      { title: 'Dream', prompt: 'Go over what happened since the last dream: tidy the wiki\'s memories, notice what keeps going wrong, and propose improvements.', params: { repeatable: true, triggers: [{ kind: 'schedule', cron: '0 3 * * *', recurring: true }] } },
+    ]) await api.post(`${APP}/api/projects/${projects.tavya}/tasks`, { data: a, headers: { origin: APP } });
+    await api.post(`${APP}/api/projects/${projects.tavya}/task-store/project-wiki`, { data: {}, headers: { origin: APP } });
 
     // The tasks the stills show, started at once.
     await start(driver, 'takehomev2', PROMPTS.work);
@@ -169,6 +174,21 @@ const VAULT = [
       // The autonomous company: tasks that start themselves.
       await go(page, '/personal/tavya?q=is%3Aseries%20-is%3Aarchived', 1800);
       await crop(page, 'automations', look, [page.locator('.task-title').first(), page.locator('.task-title').last()], { pad: 26, spanOf: page.locator('.task-title').first().locator('xpath=ancestor::*[contains(@class,"task-row") or self::li or self::article][1]') });
+      // The autonomous company: a new project made fully autonomous (task #918 builds the toggle: drawn here as it looks there).
+      await go(page, '/personal?q=-is%3Aarchived', 900);
+      await page.locator('#new-project').click();
+      await page.locator('#new-project-name').waitFor(); await sleep(400);
+      await page.locator('#new-project-name').fill('acme');
+      await page.evaluate(() => {
+        const actions = document.querySelector('.new-project-dialog .new-project-actions');
+        const row = document.createElement('label');
+        row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:14px 0;margin:4px 0 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);color:var(--ink);font-size:var(--fs-14)';
+        row.innerHTML = '<input type="checkbox" class="toggle" checked> Fully autonomous project <span style="color:var(--ink-3)">ⓘ</span>';
+        actions.parentElement.insertBefore(row, actions);
+      });
+      await sleep(500);
+      await crop(page, 'autonomous', look, [page.locator('.new-project-dialog')], { pad: 0 });
+      await page.keyboard.press('Escape'); await sleep(400);
       // Any model: the model picker.
       await newForm(page, 'tavya');
       await page.locator('#tf-page .model-field input[aria-label="Model"]').first().click(); await sleep(1200);
@@ -179,14 +199,6 @@ const VAULT = [
       await go(page, `/personal/admin_docs/tasks/${errand.num}`, 2500);
       await crop(page, 'errand', look, [page.locator('.msg.agent', { hasText: 'United login' }).last(), page.getByRole('button', { name: /^(Allow for this task|This task)$/ }).first()], { pad: 22 });
       await ctx.close();
-      // On your phone: the list and a task.
-      const phone = await context(look, { width: 390, height: 844 }, 3);
-      await go(phone.page, '/personal?q=-is%3Aarchived', 2000);
-      await phone.page.screenshot({ path: path.join(OUT, `phone-list-${look}.png`) });
-      await go(phone.page, `/personal/admin_docs/tasks/${errand.num}`, 2500);
-      await phone.page.screenshot({ path: path.join(OUT, `phone-task-${look}.png`) });
-      console.log('shot', `phone-*-${look}`);
-      await phone.ctx.close();
     }
   } catch (e) { failed = e; console.error('shoot failed:', e); await driver.screenshot({ path: path.join(OUT, 'failure.png') }).catch(() => {}); }
   await browser.close();

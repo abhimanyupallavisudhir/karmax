@@ -9584,7 +9584,7 @@ export class Gateway {
         headers: indexable && page ? {} : { 'x-robots-tag': 'noindex' },
         transform: async (data) => {
           // Replacer functions: a price ("$19") is not a replacement pattern.
-          const description = escapeHtml(page?.description ?? `${site} is the agentic to-do list that finishes itself: agents work in parallel on their own computers; you review the result. Use your Claude or ChatGPT plan.`);
+          const description = escapeHtml(page?.description ?? `Do anything with agents. ${site} gives each task its own agent and computer, with your accounts and card; you approve. Use your Claude or ChatGPT plan.`);
           let html = data.toString('utf8')
             .replace(/(<meta name="description" content=")[^"]*(" \/>)/, (_, open: string, close: string) => `${open}${description}${close}`)
             .replace(/(<meta name="apple-mobile-web-app-title" content=")[^"]*(" \/>)/, (_, open: string, close: string) => `${open}${siteName}${close}`)

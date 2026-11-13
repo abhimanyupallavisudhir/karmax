@@ -13,8 +13,8 @@ async function landing(options: { viewport?: { width: number; height: number } }
   return ui;
 }
 
-/** Screenshots each look shows: three steps, five features (the phones are two). */
-const LANDING_SHOTS = 3 + 5 + 2;
+/** Screenshots each look shows: three steps, the autonomous project form and four features (the automations are drawn). */
+const LANDING_SHOTS = 3 + 1 + 4;
 
 const signedOut = ({ path }: { path: string }) => path === '/api/meta' ? { siteName: 'tavya' }
   : path === '/api/launch' ? {} : path === '/api/session' ? { authRequired: true, authenticated: false } : undefined;
@@ -23,9 +23,9 @@ describe('public landing page', () => {
   it('names the installation in its title, header, film and footer', async () => {
     const ui = await landing();
     const { page } = ui;
-    expect(await page.title()).toBe('tavya — the agentic to-do list that finishes itself');
+    expect(await page.title()).toBe('tavya — do anything with agents');
     expect(await page.locator('.landing-nav .landing-brand span').textContent()).toBe('tavya');
-    expect(await page.locator('#lp-film').getAttribute('aria-label')).toBe('tavya’s launch film, 0:59');
+    expect(await page.locator('#lp-film').getAttribute('aria-label')).toBe('tavya’s launch film, 1:00');
     expect((await page.locator('.lp-end .landing-start').innerText()).replace(/\s+/g, ' ')).toBe('Get started with tavya');
     expect(await page.locator('.landing-footer .landing-brand span').textContent()).toBe('tavya');
     // The issue-tracker URL is a repository identifier, not branding.
@@ -95,8 +95,9 @@ describe('public landing page', () => {
   it('opens on its line, then the launch film, playing silently on the first screen', async () => {
     const ui = await landing({ viewport: { width: 1440, height: 900 } });
     const { page } = ui;
-    expect(await page.locator('#landing-title').innerText()).toBe('The agentic to-do list that finishes itself.');
-    expect(await page.locator('.lp-lede').innerText()).toBe('Write down what needs doing. Agents do it on their own computers, in parallel, and you review the result.');
+    expect(await page.locator('#landing-title').innerText()).toBe('Do anything with agents.');
+    expect(await page.locator('#landing-title em').innerText()).toBe('anything');
+    expect(await page.locator('.lp-lede').innerText()).toBe('Write it down. An agent does it.');
     expect(await page.locator('.lp-hero .landing-start').innerText()).toBe('Get started');
     const film = page.locator('#lp-film');
     expect(await film.getAttribute('src')).toBe('/media/tavya-launch.mp4');
@@ -120,12 +121,15 @@ describe('public landing page', () => {
   it('tells how a task goes, then what surrounds it, each pictured in the visitor\'s look', async () => {
     const ui = await landing();
     const { page } = ui;
-    expect(await page.locator('main h2').allInnerTexts()).toEqual(['How a task goes', 'Everything a task needs', 'Just do things.']);
-    expect(await page.locator('.lp-step h3').allInnerTexts()).toEqual(['Write it down', 'An agent does it', 'You review the result']);
+    expect(await page.locator('main h2').allInnerTexts()).toEqual(['How a task goes', 'Build the autonomous company', 'Everything a task needs', 'Just do things.']);
+    expect(await page.locator('.lp-step h3').allInnerTexts()).toEqual(['Write it down', 'An agent does it', 'Review and approve']);
+    // The autonomous company has the page's one band, between how a task goes and the rest.
+    expect(await page.locator('.lp-auto-card h3').allInnerTexts()).toEqual(['Agents create, manage and approve tasks', 'Work starts itself']);
+    // Each automation says when it runs: an event, another task, a schedule.
+    expect(await page.locator('.lp-automations span').allInnerTexts()).toEqual(['when the server reports an error', 'when a dependency releases',
+      'after the release task lands', 'every Monday', 'every night at 3:00']);
     expect(await page.locator('.lp-feature h3').allInnerTexts()).toEqual(['Big jobs fan out', 'Accounts, keys and a card',
-      'The autonomous company', 'Any model, your subscription', 'Not just code', 'On your phone']);
-    expect(await page.locator('.lp-feature li').allInnerTexts()).toEqual(['Agents can start, manage and approve tasks',
-      'Tasks can be triggered by webhooks and events', 'Tasks can run on schedules, or after other tasks']);
+      'Any model, your subscription', 'Not just code']);
     // Each screenshot comes in the light and the dark look; the page shows the one it wears.
     for (const [scheme, shown] of [['light', 'lp-light'], ['dark', 'lp-dark']] as const) {
       await page.emulateMedia({ colorScheme: scheme });
