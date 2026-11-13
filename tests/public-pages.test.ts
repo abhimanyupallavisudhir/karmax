@@ -71,7 +71,7 @@ describe('public pages for search engines and link previews (hosted)', () => {
     expect(app.offers.map((offer: { name: string; price: string }) => `${offer.name} ${offer.price}`)).toEqual(['Free 0.00', 'Individual 9.00', 'Team 19.00']);
     // Readers that run no script get the content and a link to every public page.
     expect(page.body).toMatch(/<div id="app"><div class="prerendered">[\s\S]*<h1>Do anything with agents\.<\/h1>/);
-    expect(page.body).toContain('<a href="/media/tavya-launch.mp4">Watch the launch film (1:04)</a>');
+    expect(page.body).toContain('<a href="/media/tavya-launch.mp4">Watch the launch film (1:02)</a>');
     expect(page.body).toContain('<h2>How a task goes</h2>');
     expect(page.body).toContain('<li>Review and approve</li>');
     expect(page.body).toContain('<h2>Build the autonomous company</h2>');

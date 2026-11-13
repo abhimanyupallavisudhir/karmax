@@ -25,7 +25,7 @@ describe('public landing page', () => {
     const { page } = ui;
     expect(await page.title()).toBe('tavya — do anything with agents');
     expect(await page.locator('.landing-nav .landing-brand span').textContent()).toBe('tavya');
-    expect(await page.locator('#lp-film').getAttribute('aria-label')).toBe('tavya’s launch film, 1:04');
+    expect(await page.locator('#lp-film').getAttribute('aria-label')).toBe('tavya’s launch film, 1:02');
     expect((await page.locator('.lp-end .landing-start').innerText()).replace(/\s+/g, ' ')).toBe('Get started with tavya');
     expect(await page.locator('.landing-footer .landing-brand span').textContent()).toBe('tavya');
     // The issue-tracker URL is a repository identifier, not branding.
@@ -157,7 +157,8 @@ describe('public landing page', () => {
       [item.querySelector('blockquote').textContent, item.querySelector('figcaption').textContent]));
     expect(quotes).toEqual([['Every man a CEO, and no one has a moat.', 'N.H.'],
       ['tavya is such an addictive toy man… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
-      ['Wow I can really just do anything…', 'R.S.']]);
+      ['I can really just do anything now.', 'R.S.']]);
+    expect(await page.locator('.lp-quote').nth(2).locator('blockquote em').textContent()).toBe('anything');
     // After everything a task needs, right before the end.
     const order = await page.evaluate(() => [...document.querySelectorAll('.lp-features, .lp-quotes, .lp-end')].map((el) => el.className.split(' ')[0]));
     expect(order).toEqual(['lp-features', 'lp-quotes', 'lp-end']);

@@ -28947,7 +28947,7 @@ function openPublicAuth(path, render) {
 // The landing wears the console's look (light or dark, default or classic), like
 // Docs and Pricing: the launch film, then how a task goes, then what surrounds it, each pictured by a screenshot of the console in the
 // visitor's look (web/media/landing/<name>-light|dark.webp, design/landing-v3).
-const LANDING_FILM = { src: '/media/tavya-launch.mp4', poster: '/media/tavya-launch-poster.jpg', length: '1:04' };
+const LANDING_FILM = { src: '/media/tavya-launch.mp4', poster: '/media/tavya-launch-poster.jpg', length: '1:02' };
 // How a task goes. [still, title, line, picture's description]
 const LANDING_STEPS = [
   ['write', 'Write it down', 'In plain words, in any project.', 'The new-task form with a prompt written in plain words'],
@@ -28975,11 +28975,11 @@ const LANDING_FEATURES = [
   ['errand', 'Not just code', 'Papers. Websites. Images and video. Chores.', 'An agent asking to use a saved login before booking a flight'],
 ];
 
-// What people say (the launch film's end card says the same). [quote, who]
+// What people say (the launch film's end card says the same). [quote (*…* emphasised), who]
 const LANDING_QUOTES = [
   ['Every man a CEO, and no one has a moat.', 'N.H.'],
   ['tavya is such an addictive toy man… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
-  ['Wow I can really just do anything…', 'R.S.'],
+  ['I can really just do *anything* now.', 'R.S.'],
 ];
 
 // Each screenshot's size in CSS pixels (the files are 2×), so it shows at the console's own scale.
@@ -29050,7 +29050,7 @@ function renderLanding() {
       </section>
 
       <section class="lp-quotes" aria-label="What people say">${LANDING_QUOTES.map(([quote, who]) => `
-        <figure class="lp-quote"><blockquote>${esc(quote)}</blockquote><figcaption>${esc(who)}</figcaption></figure>`).join('')}
+        <figure class="lp-quote"><blockquote>${esc(quote).replace(/\*([^*]+)\*/g, '<em>$1</em>')}</blockquote><figcaption>${esc(who)}</figcaption></figure>`).join('')}
       </section>
 
       <section class="lp-end" aria-labelledby="lp-end-title">
