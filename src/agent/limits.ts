@@ -219,8 +219,9 @@ export function isNetworkEdgeBlock(error: unknown): boolean {
 
 /** A network edge refused this computer (`isNetworkEdgeBlock`). Like an outage,
  * neither signing in again nor another login fixes it, so it is retried as
- * infrastructure: blocks of an address are usually lifted within minutes, and
- * a retry may run from another address. */
+ * infrastructure. On 2026-11-13 Anthropic's edge blocked a Hetzner VM and an
+ * E2B sandbox for a few minutes (10:15–10:19 UTC); a retry three minutes
+ * later worked, while three retries seconds apart had asked a person. */
 export class NetworkEdgeBlock extends ProviderOutage {
   constructor(provider: string | undefined, raw: string, options?: { cause?: unknown }) {
     const name = PROVIDER_NAMES[provider ?? ''] ?? 'The model provider';
