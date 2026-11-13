@@ -25,7 +25,7 @@ describe('public landing page', () => {
     const { page } = ui;
     expect(await page.title()).toBe('tavya — do anything with agents');
     expect(await page.locator('.landing-nav .landing-brand span').textContent()).toBe('tavya');
-    expect(await page.locator('#lp-film').getAttribute('aria-label')).toBe('tavya’s launch film, 1:00');
+    expect(await page.locator('#lp-film').getAttribute('aria-label')).toBe('tavya’s launch film, 1:04');
     expect((await page.locator('.lp-end .landing-start').innerText()).replace(/\s+/g, ' ')).toBe('Get started with tavya');
     expect(await page.locator('.landing-footer .landing-brand span').textContent()).toBe('tavya');
     // The issue-tracker URL is a repository identifier, not branding.
@@ -147,6 +147,20 @@ describe('public landing page', () => {
     expect(await page.locator('.lp-shot img.lp-dark').evaluateAll((images) => images.every((img: any) => img.getAttribute('aria-hidden') === 'true'))).toBe(true);
     for (const retired of ['vscode was a fancy text editor.', 'Leave the permanent underclass today.'])
       expect(await page.locator('.landing-page').innerText()).not.toContain(retired);
+    await ui.close();
+  });
+
+  it('says what people say, before the end', async () => {
+    const ui = await landing();
+    const { page } = ui;
+    const quotes = await page.locator('.lp-quote').evaluateAll((items) => items.map((item: any) =>
+      [item.querySelector('blockquote').textContent, item.querySelector('figcaption').textContent]));
+    expect(quotes).toEqual([['Every man a CEO, and no one has a moat.', 'N.H.'],
+      ['tavya is such an addictive toy man… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
+      ['Wow I can really just do anything…', 'R.S.']]);
+    // After everything a task needs, right before the end.
+    const order = await page.evaluate(() => [...document.querySelectorAll('.lp-features, .lp-quotes, .lp-end')].map((el) => el.className.split(' ')[0]));
+    expect(order).toEqual(['lp-features', 'lp-quotes', 'lp-end']);
     await ui.close();
   });
 

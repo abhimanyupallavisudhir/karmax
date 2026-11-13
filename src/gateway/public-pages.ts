@@ -55,6 +55,13 @@ const LANDING_SECTIONS: Array<[string, string[]]> = [
   ['Everything a task needs', ['Big jobs fan out', 'Accounts, keys and a card', 'Any model, your subscription', 'Not just code']],
 ];
 
+/** What people say, as web/app.js (LANDING_QUOTES) shows it: [quote, who]. */
+const LANDING_QUOTES: Array<[string, string]> = [
+  ['Every man a CEO, and no one has a moat.', 'N.H.'],
+  ['tavya is such an addictive toy man… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
+  ['Wow I can really just do anything…', 'R.S.'],
+];
+
 /** The tagline the landing and its title share. */
 export const LANDING_TAGLINE = 'do anything with agents';
 
@@ -145,8 +152,9 @@ function page(ctx: PublicPageContext, pathname: string): PublicPage | 'not-found
       path: '/', title: `${site} — ${LANDING_TAGLINE}`, name: `${site} — ${LANDING_TAGLINE}`, description,
       body: `<h1>Do anything with agents.</h1>
 <p>${esc(description)}</p>
-<p><a href="/media/tavya-launch.mp4">Watch the launch film (1:00)</a></p>
+<p><a href="/media/tavya-launch.mp4">Watch the launch film (1:04)</a></p>
 ${LANDING_SECTIONS.map(([heading, parts]) => `<h2>${esc(heading)}</h2>\n<ul>${parts.map((part) => `<li>${esc(part)}</li>`).join('')}</ul>`).join('\n')}
+${LANDING_QUOTES.map(([quote, who]) => `<blockquote>${esc(quote)} — ${esc(who)}</blockquote>`).join('\n')}
 <p><a href="/signup">Get started</a> · <a href="/login">Sign in</a></p>`,
       structuredData: { '@context': 'https://schema.org', '@graph': [
         { '@type': 'Organization', '@id': `${ctx.origin}/#organization`, name: site, url: `${ctx.origin}/`, logo: `${ctx.origin}/brand/icon-512.png` },

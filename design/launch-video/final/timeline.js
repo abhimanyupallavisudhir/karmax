@@ -375,21 +375,35 @@ scene(...next(7.0), (L, dur) => {
   return (lt) => { h(lt); p(lt); parts.forEach((f) => f(lt)); };
 });
 
-// 10 · End card.
-scene(...next(4.4), (L) => {
+// 10 · End card, with what people say.
+const QUOTES = [
+  ['Every man a CEO, and no one has a moat.', 'N.H.'],
+  ['tavya is such an addictive toy man… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
+  ['Wow I can really just do anything…', 'R.S.'],
+];
+scene(...next(8.0), (L) => {
   L.id = 'end';
-  const mark = el('img', 'mark', L); setSrc(mark, A + 'brand/icon-512.png'); mark.style.top = '250px';
-  const name = el('div', 'wordmark', L, 'tavya'); name.style.top = '440px';
-  const tag = el('div', 'tagline', L, 'Just do things.'); tag.style.top = '600px';
-  const cta = el('div', 'cta', L, 'tavya.io'); cta.style.top = '720px';
-  const note = el('div', 'tagline', L, 'Open to everyone, starting today.'); note.style.top = '840px'; note.style.fontSize = '26px';
+  const mark = el('img', 'mark', L); setSrc(mark, A + 'brand/icon-512.png'); mark.style.top = '96px'; mark.style.transformOrigin = '50% 50%';
+  const name = el('div', 'wordmark', L, 'tavya'); name.style.top = '262px';
+  const tag = el('div', 'tagline', L, 'Just do things.'); tag.style.top = '410px';
+  const cta = el('div', 'cta', L, 'tavya.io'); cta.style.top = '492px';
+  const quotes = QUOTES.map(([text, who], i) => {
+    const q = el('figure', 'quote', L, `<blockquote>${text}</blockquote><figcaption>— ${who}</figcaption>`);
+    q.style.left = `${120 + i * 572}px`; q.style.top = '640px';
+    return q;
+  });
+  const note = el('div', 'tagline', L, 'Open to everyone, starting today.'); note.style.top = '960px'; note.style.fontSize = '26px';
   return (lt) => {
     const q = ramp(lt, 0.0, 0.9, ease.outQuint);
-    mark.style.opacity = q; mark.style.transform = `scale(${0.8 + 0.2 * q})`;
+    mark.style.opacity = q; mark.style.transform = `scale(${(0.8 + 0.2 * q) * 0.8})`;
     const n = ramp(lt, 0.2, 0.9, ease.outQuint); name.style.opacity = n; name.style.transform = `translateY(${(1 - n) * 24}px)`;
-    const g = ramp(lt, 0.6, 1.2, ease.out); tag.style.opacity = g;
-    const c = ramp(lt, 1.0, 1.6, ease.outQuint); cta.style.opacity = c; cta.style.transform = `translateX(-50%) scale(${0.9 + 0.1 * c})`;
-    note.style.opacity = ramp(lt, 1.5, 2.1);
+    const g = ramp(lt, 0.5, 1.1, ease.out); tag.style.opacity = g;
+    const c = ramp(lt, 0.8, 1.4, ease.outQuint); cta.style.opacity = c; cta.style.transform = `translateX(-50%) scale(${0.9 + 0.1 * c})`;
+    quotes.forEach((el2, i) => {
+      const k = ramp(lt, 1.3 + i * 0.75, 1.9 + i * 0.75, ease.outQuint);
+      el2.style.opacity = k; el2.style.transform = `translateY(${(1 - k) * 30}px)`; el2.style.filter = `blur(${(1 - k) * 5}px)`;
+    });
+    note.style.opacity = ramp(lt, 3.6, 4.2);
   };
 }, { fadeOut: 0.6 });
 
@@ -413,5 +427,5 @@ window.DURATION = DURATION;
 window.FPS = FPS;
 window.SCENES = scenes.map((s) => [s.start, s.end]);
 // Cursor clicks (scene, offset) and the pills' arrivals: the score (../first-cut/music.py) ticks on each.
-window.CLICKS = [[6, 1.45], [6, 3.45], [6, 4.45], [7, 1.85], [7, 4.45], [1, 0.55], [1, 1.0], [1, 1.45], [9, 0.5], [9, 1.7], [9, 2.9], [9, 4.5]]
+window.CLICKS = [[6, 1.45], [6, 3.45], [6, 4.45], [7, 1.85], [7, 4.45], [1, 0.55], [1, 1.0], [1, 1.45], [9, 0.5], [9, 1.7], [9, 2.9], [9, 4.5], [10, 1.3], [10, 2.05], [10, 2.8]]
   .map(([i, d]) => scenes[i].start + d).sort((a, b) => a - b);
