@@ -147,22 +147,48 @@ describe('autonomous project', () => {
     expect(String(decider.params.prompt)).toMatch(/Approve my own release review/);
   });
 
-  it('sends a vault request to the Avatār only when it may approve one: an organization’s, not a project’s', async () => {
+  it('sends a vault request to the Avatār when it may approve it: a project’s Avatār for the project’s own items, an organization’s for all', async () => {
     for (const scope of ['project', 'organization'] as const) {
       const f = await fixture();
       await f.api.makeAutonomous(f.owner, f.project.id, scope);
-      const item = await new VaultItems(f.store, undefined, undefined, 'org_personal')
-        .save({ type: 'note', label: 'Stripe dashboard', domains: ['stripe.com'], policy: { use: 'ask', reveal: 'never' } });
+      const vault = new VaultItems(f.store, undefined, undefined, 'org_personal');
+      const shared = await vault.save({ type: 'note', label: 'Stripe dashboard', domains: ['stripe.com'], policy: { use: 'ask', reveal: 'never' } });
+      const own = await vault.save({ type: 'note', label: 'Shop admin', domains: ['shop.example'], ownerProjectId: f.project.id, policy: { use: 'ask', reveal: 'ask' } });
       const task = await f.api.createTask(f.owner, { projectId: f.project.id, prompt: 'Refund the order', draft: true });
       const agent = await agentToken(f, task.id, 'owner');
-      await f.api.routeCredentialRequest(agent, { id: 'vreq_1', taskId: task.id, itemId: item.id, mode: 'use', status: 'pending',
+      const deciders = async () => (await f.store.listTasks(f.project.id)).filter((candidate) => candidate.title.endsWith('decide credential request'));
+      await f.api.routeCredentialRequest(agent, { id: 'vreq_1', taskId: task.id, itemId: shared.id, mode: 'use', status: 'pending',
         why: 'to refund order 42', createdAt: Date.now() });
-      const deciders = (await f.store.listTasks(f.project.id)).filter((candidate) => candidate.title.endsWith('decide credential request'));
-      if (scope === 'project') { expect(deciders).toEqual([]); continue; }
-      expect(deciders).toHaveLength(1);
-      expect(String(deciders[0]!.params.prompt)).toMatch(/may use "Stripe dashboard" \(stripe\.com\)/);
-      expect(String(deciders[0]!.params.prompt)).toMatch(/POST \/api\/vault\/requests\/vreq_1\/resolve/);
+      if (scope === 'project') expect(await deciders()).toEqual([]);
+      else expect(String((await deciders())[0]!.params.prompt)).toMatch(/may use "Stripe dashboard" \(stripe\.com\)/);
+      await f.api.routeCredentialRequest(agent, { id: 'vreq_2', taskId: task.id, itemId: own.id, mode: 'reveal', status: 'pending',
+        why: 'to read the admin password', createdAt: Date.now() });
+      const decider = (await deciders()).find((candidate) => String(candidate.params.prompt).includes('vreq_2'))!;
+      expect(String(decider.params.prompt)).toMatch(/may see the plaintext of "Shop admin" \(shop\.example\)/);
+      expect(String(decider.params.prompt)).toMatch(/POST \/api\/vault\/requests\/vreq_2\/resolve/);
     }
+  });
+
+  it('sends a task’s app connection request to a project’s Avatār, which may connect it as the project’s own or decline it', async () => {
+    const f = await fixture();
+    await f.api.makeAutonomous(f.owner, f.project.id);
+    const task = await f.api.createTask(f.owner, { projectId: f.project.id, prompt: 'Answer the shop’s mail', draft: true });
+    const agent = await agentToken(f, task.id, 'dev');
+    await f.api.routeConnectionRequest(agent, { id: 'conn_1', organizationId: 'org_personal', toolkit: 'gmail', label: 'gmail', projectIds: [],
+      taskId: task.id, why: 'to answer customers', status: 'requested', createdAt: Date.now(), updatedAt: Date.now() });
+    const decider = (await f.store.listTasks(f.project.id)).find((candidate) => candidate.title.endsWith('decide app connection request'))!;
+    expect(decider.params).toMatchObject({ _avatarRole: 'confirm' });
+    const prompt = String(decider.params.prompt);
+    expect(prompt).toMatch(/gmail/);
+    expect(prompt).toMatch(/to answer customers/);
+    expect(prompt).toContain(`POST /api/connections/connect?projectId=${f.project.id}`);
+    expect(prompt).toContain(`"ownerProjectId":"${f.project.id}"`);
+    expect(prompt).toMatch(/POST \/api\/connections\/conn_1\/disconnect/);
+    // A connection someone already answered, or one of a project that is not autonomous, asks nobody.
+    const before = (await f.store.listTasks(f.project.id)).length;
+    await f.api.routeConnectionRequest(agent, { id: 'conn_2', organizationId: 'org_personal', toolkit: 'slack', label: 'slack', projectIds: [],
+      taskId: task.id, status: 'active', ownerId: 'owner', createdAt: Date.now(), updatedAt: Date.now() });
+    expect((await f.store.listTasks(f.project.id)).length).toBe(before);
   });
 
   it('is refused to someone who may not change the project’s settings, leaving nothing behind', async () => {

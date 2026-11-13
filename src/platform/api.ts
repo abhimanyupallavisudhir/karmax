@@ -12,6 +12,7 @@ import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store, slugify, type CollaborationRequest } from '../store/db.js';
 import { TokenAuthority, type HumanDelegationArgs, type ScopedToken } from './tokens.js';
 import { TOOL_CAPABILITY, Capability, ORGANIZATION_WIKI_WRITE_DENIED, allows } from './capabilities.js';
+import { ownerAuthority } from './owner-authority.js';
 import { AppGrants, sessionCapabilities } from '../auth/app-grants.js';
 import { WORKFLOW_TYPE, SIG, pinnedType, TASK_WORKFLOW_TASK_TIMEOUT } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
@@ -4965,9 +4966,12 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
   }
 
   /** An autonomous project's vault request goes to its Avatār when the Avatār
-   * may decide it (approving needs the vault's read access): a fork of it
-   * decides through POST /api/vault/requests/:id/resolve. People are still
-   * told, as for any request; whoever answers first decides. */
+   * may decide it — approving needs read authority over the item: the
+   * organization's (`credential:reveal`, an organization's Avatār), or for an
+   * item the project owns, its Project maintainer (a project's Avatār; see
+   * owner-authority.ts). A fork of it decides through
+   * POST /api/vault/requests/:id/resolve. People are still told, as for any
+   * request; whoever answers first decides. */
   async routeCredentialRequest(token: string, request: CredentialAccessRequest): Promise<void> {
     const task = (await this.deps.store.getTask(request.taskId));
     // A credential not in the vault yet, or one reported broken, is for the
@@ -4979,15 +4983,43 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
     const creator = (await this.deps.store.taskCreatorUserId(task.id));
     if (!creator || !(await avatarCallableBy(this.deps.store, avatar, creator))) return;
     const held = (await avatarAuthorizationCapabilities(this.deps.store, this.deps.authorization, avatar, task.projectId));
-    if (!['credential:write', 'credential:reveal'].every((capability) => allows(held, capability))) return;
     const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal';
-    const item = (await new VaultItems(this.deps.store, undefined, undefined, organizationId).get(request.itemId));
+    const item = (await new VaultItems(this.deps.store, undefined, undefined, organizationId, undefined, task.projectId).get(request.itemId));
+    if (!item || !ownerAuthority(held, 'reveal', item.ownerProjectId, task.projectId)) return;
     const what = item ? `"${item.label}"${item.domains?.length ? ` (${item.domains.join(', ')})` : ''}` : `vault item ${request.itemId}`;
     await this.callAvatar(token, avatar, 'confirm', `${avatar.name}: decide credential request`,
       `Decide whether task #${task.num ?? task.id} (${JSON.stringify(task.title)}) may ${request.mode === 'reveal' ? 'see the plaintext of' : 'use'} ${what}.
 ${request.why ? `${untrustedBlock('reason from the requesting agent', request.why)}\n` : ''}${request.via?.note ? `${untrustedBlock(`note from task ${request.via.taskId}, which it came through`, request.via.note)}\n` : ''}
-Read the task (get_task, get_conversation) before you decide. Resolve the request exactly once by calling platform_request with POST /api/vault/requests/${request.id}/resolve?organizationId=${organizationId} and body {"action":"once"} (this use only), {"action":"task"} (for the rest of this task) or {"action":"deny"}. Prefer the narrowest that does the job. Then briefly report the decision.`,
+Read the task (get_task, get_conversation) before you decide. Resolve the request exactly once by calling platform_request with POST /api/vault/requests/${request.id}/resolve?${item.ownerProjectId ? `projectId=${item.ownerProjectId}` : `organizationId=${organizationId}`} and body {"action":"once"} (this use only), {"action":"task"} (for the rest of this task) or {"action":"deny"}. Prefer the narrowest that does the job. Then briefly report the decision.`,
       { taskId: task.id, type: 'avatar.credential-dispatch-failed', payload: { requestId: request.id, avatarId: avatar.id } });
+  }
+
+  /** A task's app connection request in an autonomous project goes to its
+   * Avatār when the Avatār may manage the project's accounts (Project
+   * maintainer: owner-authority.ts): it may connect it as the project's own
+   * account, decline it, or leave it to people (a sign-in only a person can
+   * complete). People are still told; whoever answers first decides. */
+  async routeConnectionRequest(token: string, connection: ServiceConnection): Promise<void> {
+    if (connection.status !== 'requested' || connection.ownerId || connection.ownerProjectId || !connection.taskId) return;
+    const task = (await this.deps.store.getTask(connection.taskId));
+    if (!task) return;
+    const autonomy = await projectAutonomy(this.deps.store, task.projectId);
+    const avatar = autonomy ? (await this.deps.store.getAvatar(autonomy.avatarTaskId)) : undefined;
+    if (!avatar || !(await avatarEnabled(this.deps.store, avatar)) || !avatarAllows(avatar, 'confirm')) return;
+    const creator = (await this.deps.store.taskCreatorUserId(task.id));
+    if (!creator || !(await avatarCallableBy(this.deps.store, avatar, creator))) return;
+    const held = (await avatarAuthorizationCapabilities(this.deps.store, this.deps.authorization, avatar, task.projectId));
+    if (!ownerAuthority(held, 'manage', task.projectId, task.projectId)) return;
+    const app = connection.mcp ? `the MCP server ${JSON.stringify(connection.label)} (${connection.mcp.url})` : `the app ${JSON.stringify(connection.toolkit)} (Composio)`;
+    const q = `?projectId=${task.projectId}`;
+    await this.callAvatar(token, avatar, 'confirm', `${avatar.name}: decide app connection request`,
+      `Task #${task.num ?? task.id} (${JSON.stringify(task.title)}) asks to use ${app} through an app connection.
+${connection.why ? `${untrustedBlock('reason from the requesting agent', connection.why)}\n` : ''}${connection.via?.note ? `${untrustedBlock(`note from task ${connection.via.taskId}, which it came through`, connection.via.note)}\n` : ''}
+Read the task (get_task, get_conversation) before you decide. Then do one of these with platform_request:
+- Connect it as this project's own account (only this project's tasks can use it; its maintainers manage it): POST /api/connections/connect${q} with body ${JSON.stringify({ id: connection.id, ownerProjectId: task.projectId })}. If the answer has a "url", the account needs a sign-in: complete it in your browser with an account this project holds (for an MCP sign-in, then POST /api/connections/${connection.id}/callback${q} with the "state" and "code" of the page it returns to); if only a person can sign in, leave the request to people.
+- Decline it: POST /api/connections/${connection.id}/disconnect${q} with body {}.
+Prefer declining what the task does not need. Then briefly report the decision.`,
+      { taskId: task.id, type: 'avatar.connection-dispatch-failed', payload: { connectionId: connection.id, avatarId: avatar.id } });
   }
 
   /** Ask selected people, teams, or owner-configured Avatars to add exact
