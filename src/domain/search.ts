@@ -652,6 +652,9 @@ export interface EvalResult {
   /** For the same queries: task id → when it last changed for those people
    *  (`updated`'s sort key), which a task's own `statusChangedAt` cannot say. */
   updated?: Record<string, number>;
+  /** Series id → how many runs it has spawned, archived ones included, for every
+   *  live series listed: a list hides finished (archived) runs, so it cannot count them. */
+  runCounts?: Record<string, number>;
   total: number;
 }
 

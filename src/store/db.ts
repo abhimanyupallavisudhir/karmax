@@ -4835,13 +4835,28 @@ export class Store {
     });
   }
 
-  /** Runs spawned from a series (repeatable template), newest first.
-   *  Filtered in SQL — this is reachable unpaginated from an HTTP request, so the
-   *  old whole-table scan + JS filter was a per-request full transcript hydration. */
+  /** Runs spawned from a series (repeatable template), newest first, archived
+   *  ones included. Filtered in SQL, and without their conversations: a daily
+   *  series has hundreds of runs, and its lists need each one's status only. */
   async runsOf(seriesId: string): Promise<TaskRecord[]> {
-    return ((await this.db.prepare(`SELECT * FROM tasks
-      WHERE json_extract(params, '$.runOf') = ? ORDER BY createdAt DESC`).all(seriesId)) as any[])
+    return ((await this.db.prepare(`SELECT
+        id, num, projectId, listId, title, workflow, executionWorkflow, workflowVersion, params, createdAt,
+        statusChangedAt, ord, parentTaskId, createdBy, createdVia, assignee, delegate, confirmationPolicy,
+        intentId, attemptNumber, notes,
+        CASE WHEN lastView IS NULL THEN NULL ELSE json_remove(lastView, '$.messages', '$.transcripts', '$.reviewInfo') END AS lastView
+      FROM tasks WHERE json_extract(params, '$.runOf') = ? ORDER BY createdAt DESC`).all(seriesId)) as any[])
       .map(rowToTask);
+  }
+
+  /** How many runs each series has spawned, archived ones included (0 for none). */
+  async runCounts(seriesIds: string[]): Promise<Map<string, number>> {
+    const counts = new Map(seriesIds.map((id) => [id, 0]));
+    if (!seriesIds.length) return counts;
+    const rows = (await this.db.prepare(`SELECT json_extract(params, '$.runOf') AS series, COUNT(*) AS n FROM tasks
+      WHERE json_extract(params, '$.runOf') IN (${seriesIds.map(() => '?').join(',')})
+      GROUP BY json_extract(params, '$.runOf')`).all(...seriesIds)) as { series: string; n: number | string }[];
+    for (const row of rows) counts.set(row.series, Number(row.n));
+    return counts;
   }
 
   /** The status of some of a parent's children, without their conversations. */

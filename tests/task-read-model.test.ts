@@ -158,3 +158,24 @@ it('does not skip or duplicate logical tasks when order and principal attempts c
   expect(last.value?.[0]?.num).toBe(tasks[200]!.num);
   expect((await scan.next()).done).toBe(true);
 });
+
+it('counts every run of a listed series, archived runs included', async () => {
+  // A finished run archives itself, so the default list (`-is:archived`) never reads
+  // it: the series row's count must come from the store, not from the rows read.
+  store = (await Store.create());
+  (await store.claimPersonalOrganization('owner'));
+  const project = (await store.createProject('Series'));
+  const make = (title: string, params: Record<string, unknown>) => store.createTask({ projectId: project.id, title,
+    workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture', ...params } });
+  const series = await make('Daily', { repeatable: true, triggers: [{ kind: 'schedule', cron: '0 9 * * *' }] });
+  const idle = await make('Never ran', { repeatable: true, triggers: [{ kind: 'schedule', cron: '0 9 * * *' }] });
+  for (let i = 0; i < 3; i++) await make(`Daily ${i}`, { runOf: series.id, archived: true });
+  await make('Daily live', { runOf: series.id });
+  const tokens = new TokenAuthority();
+  const token = (await tokens.mintPrincipal('user:owner', ['*'], project.id)).token;
+  const api = new KarmaxApi({ store, tokens, client: {} as any, taskQueue: 'fixture' });
+  const result = await api.searchTasks(token, project.id, '-is:archived');
+  expect(result.runCounts).toEqual({ [series.id]: 4, [idle.id]: 0 });
+  const everywhere = await api.searchAuthorizedOrganization([project], '-is:archived', 'user:owner', { limit: 1 });
+  expect(Object.keys(everywhere.runCounts ?? {})).toEqual(everywhere.tasks.filter((t) => t.params?.repeatable).map((t) => t.id));
+});

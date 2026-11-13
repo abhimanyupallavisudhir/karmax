@@ -5332,6 +5332,8 @@ async function runSearch() {
     S.searchResult = filterDeletedFromSearchResult(r);
     S.searchFailed = false;
     S.searchPending = false;
+    // An open series re-reads its runs with the list: one may have finished (and archived).
+    for (const id of S.expandedSeries || []) if (r.runCounts?.[id] != null) loadSeriesRuns(id);
     return true;
   } catch (error) {
     // Distinguish "the server couldn't evaluate this" from "nothing matched".
@@ -7697,15 +7699,32 @@ function triggerSummary(triggers) {
     .join('  ·  ');
 }
 
+// A series' runs, newest first. Finished runs archive themselves, so the live
+// pool (S.tasks) holds only those still going: an expanded series reads all of
+// them from the server (loadSeriesRuns), each overlaid by its live copy.
+function seriesRuns(id) {
+  const runs = new Map((S.seriesRuns?.[id] || []).map((r) => [r.id, r]));
+  for (const r of S._runsBySeries?.[id] || []) runs.set(r.id, r);
+  return [...runs.values()].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+}
+
+// Read the runs of a series whose row is open, then redraw it.
+async function loadSeriesRuns(id) {
+  try { (S.seriesRuns ||= {})[id] = await api(`/api/tasks/${id}/runs`); } catch { return; }
+  if (S.expandedSeries?.has(id)) bgRenderMain();
+}
+
 // A repeatable series (Model A): one row that owns its runs. Shows a repeatable
 // badge, the schedule/next-trigger summary, the run count + latest status, and
 // expands to list the individual runs. `where` is its project label (taskRow's).
 function seriesRow(t, where = '') {
-  const runs = (S._runsBySeries?.[t.id] || []).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   const expanded = S.expandedSeries?.has(t.id);
+  const runs = expanded ? seriesRuns(t.id) : S._runsBySeries?.[t.id] || [];
+  // The search counts archived runs too; the live pool alone is only a preview.
+  const count = S.searchResult?.runCounts?.[t.id] ?? runs.length;
   const bits = [];
   if (t.params?.triggers?.length) bits.push(triggerSummary(t.params.triggers));
-  bits.push(`${runs.length} run${runs.length === 1 ? '' : 's'}`);
+  bits.push(`${count} run${count === 1 ? '' : 's'}`);
   const runsHtml = expanded ? runs.map(runSubRow).join('') : '';
   const summary = bits.join('  ·  ');
   return `
@@ -8775,7 +8794,11 @@ function wireTasksView() {
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.runagain}/run-again`, { method: 'POST', body: '{}' }); toast('New run started'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
   );
   $('#main').querySelectorAll('[data-expand]').forEach((b) =>
-    b.addEventListener('click', (ev) => { ev.stopPropagation(); S.expandedSeries ||= new Set(); const id = b.dataset.expand; S.expandedSeries.has(id) ? S.expandedSeries.delete(id) : S.expandedSeries.add(id); renderMain(); }),
+    b.addEventListener('click', (ev) => {
+      ev.stopPropagation(); S.expandedSeries ||= new Set(); const id = b.dataset.expand;
+      if (S.expandedSeries.has(id)) S.expandedSeries.delete(id); else { S.expandedSeries.add(id); loadSeriesRuns(id); }
+      renderMain();
+    }),
   );
   $('#main').querySelectorAll('[data-delseries]').forEach((b) =>
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); if (await deleteSeries(b.dataset.delseries)) refreshTasks(); }),
