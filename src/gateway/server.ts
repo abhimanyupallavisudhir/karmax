@@ -10280,7 +10280,11 @@ export class Gateway {
       await this.deps.api.tellParentOf(args.taskId, { credential: raised, label: item?.label ?? raised.domain ?? raised.name ?? 'credential' });
     }
     // An autonomous project's Avatār decides it when it may (wiki features/autonomy).
-    if (raised) await this.deps.api.routeCredentialRequest(token, raised);
+    // Best effort: people are told of the request either way, so a failure to call
+    // the Avatār in never refuses the agent's request.
+    if (raised && typeof this.deps.api?.routeCredentialRequest === 'function')
+      await this.deps.api.routeCredentialRequest(token, raised).catch((error: unknown) =>
+        console.warn(`[autonomy] could not route credential request ${raised.id} to the Avatār:`, error instanceof Error ? error.message : error));
     return decision;
   }
 
