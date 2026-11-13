@@ -287,9 +287,11 @@ describe('a new person on a hosted installation', () => {
     const [personal] = (await store.listOrganizations(session.user.id));
     const trial = await store.computeTrial(personal!.id);
     expect(trial).toMatchObject({ userId: session.user.id, creditMicros: 5_000_000 });
-    // The trial gets them computers, but they bought no plan: the setup guide must not say they did.
+    // The setup guide shows the trial, but it finishes no step: they bought no plan.
     const guide = await (await fetch(`${base}/api/user/onboarding?organizationId=${personal!.id}`, { headers: { cookie: cookie! } })).json() as any;
-    expect(guide.steps.compute).toEqual({ complete: true, managed: false, own: false, trial: { endsAt: trial!.endsAt } });
+    expect(guide.trial).toEqual({ creditMicros: 5_000_000, endsAt: trial!.endsAt, agents: false });
+    expect(guide.steps.compute).toEqual({ complete: false, managed: false, own: false });
+    expect(guide.completedRequired).toBe(0);
     // A second organization of the same person starts without one.
     const second = await fetch(`${base}/api/organizations`, { method: 'POST', headers: { cookie: cookie!, 'content-type': 'application/json', origin: base },
       body: JSON.stringify({ name: 'Side Gig' }) });

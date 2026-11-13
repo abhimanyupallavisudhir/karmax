@@ -6095,6 +6095,15 @@ function onboardingStep(number, key, title, detail, action) {
   </li>`;
 }
 
+/** The free trial lets a new organization work at once; the steps are the
+ * full experience, which outlasts it, so the trial finishes none of them. */
+function onboardingTrialHtml(trial) {
+  const amount = `$${Math.round(Number(trial.creditMicros) / 1e6)}`;
+  const until = new Date(trial.endsAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  return `<p class="onboarding-trial"><b>Free trial:</b> ${esc(amount)} of compute${trial.agents ? ' and agents' : ''} included until ${esc(until)}.</p>
+    <p class="onboarding-intro">For the full experience:</p>`;
+}
+
 /** One of the ways to finish a step; either one completes it. */
 function onboardingOption(done, title, hint, href, label) {
   return `<div class="onboarding-option ${done ? 'complete' : ''}">
@@ -6168,12 +6177,11 @@ function renderOnboarding() {
         <button class="icon-btn" id="onboarding-close" type="button" aria-label="Close setup guide" title="Close · restart anytime from your profile">${ICON.close}</button>
       </div></div>
     <div class="onboarding-progress" role="progressbar" aria-valuemin="0" aria-valuemax="${state.totalRequired}" aria-valuenow="${state.completedRequired}" aria-label="${state.completedRequired} of ${state.totalRequired} required setup steps complete"><span style="width:${Math.round(state.completedRequired / state.totalRequired * 100)}%"></span></div>
-    <p class="onboarding-intro">A few real connections turn this workspace into a place your agents can work.</p>
+    ${state.trial ? onboardingTrialHtml(state.trial) : '<p class="onboarding-intro">A few real connections turn this workspace into a place your agents can work.</p>'}
     <ol class="onboarding-list">
       ${onboardingStep(1, 'agentLogin', 'Add agent logins', 'Connect at least one usable Codex, Claude, or API-key account.', `<a class="btn sm" data-spa href="${settings}#settings-agents">${state.steps.agentLogin.complete ? 'Manage agent logins' : 'Add agent login'}</a>`)}
       ${onboardingStep(2, 'compute', 'Get computers for your agents', '', `<div class="onboarding-options">
-        ${onboardingOption(compute.managed, 'Buy a paid plan', `Includes ${siteNameMarkup()}’s computers${!compute.managed && compute.trial
-          ? ` · free until ${esc(new Date(compute.trial.endsAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }))}` : ''}`, `${settings}#settings-plan`, compute.managed ? 'Manage plan' : 'View plans')}
+        ${onboardingOption(compute.managed, 'Buy a paid plan', `Includes ${siteNameMarkup()}’s computers`, `${settings}#settings-plan`, compute.managed ? 'Manage plan' : 'View plans')}
         <span class="onboarding-or">or</span>
         ${onboardingOption(compute.own, 'Connect your own compute', 'E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud', `${settings}#settings-computers`, compute.own ? 'Manage' : 'Connect')}
       </div>`)}
@@ -9794,6 +9802,12 @@ function readinessGaps(readiness, projectId) {
     tip: `Storage is full (${formatBytes(storage.usedBytes)} of ${formatBytes(storage.quotaBytes)}). New project data isn’t saved until you free some or add a 100 GB pack.` });
   return gaps;
 }
+// An organization with no login of its own runs on tavya's included model by
+// default (wiki features/included-model § Default); say so, and how to get more.
+function basicModelNoteHtml(readiness) {
+  if (!readiness || readiness.agentLogin || !(readiness.agents || []).some((agent) => agent.included)) return '';
+  return `Default basic model. To use Claude or GPT, <a data-spa href="${esc(globalRoute('organization'))}#settings-agents" title="Add a Claude or ChatGPT login, or an API key">connect your logins</a>.`;
+}
 function readinessNoticeHtml(gaps) {
   if (!gaps.length) return '';
   const link = (gap) => `<a data-spa href="${esc(gap.href)}" title="${esc(gap.tip)}">${esc(gap.label)}</a>`;
@@ -9824,6 +9838,11 @@ function wireTaskReadiness(page, projectId) {
     const html = readinessNoticeHtml(readinessGaps(readiness, projectId));
     el.innerHTML = html;
     el.hidden = !html;
+    const basic = page.querySelector('#tf-basic-model');
+    if (basic) {
+      basic.innerHTML = basicModelNoteHtml(readiness);
+      basic.hidden = !basic.innerHTML;
+    }
   };
   let timer = null;
   const later = () => { clearTimeout(timer); timer = setTimeout(refresh, 250); };
@@ -9973,7 +9992,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
             ${templateEdit ? '' : '<div class="tf-ready" id="tf-ready" role="status" hidden></div>'}
             ${draft?.id && !templateEdit ? taskCreatorHtml({ taskId: draft.id, creator: recordCreator(draft) }) : ''}
             ${promptField ? renderField(promptField, values[promptField.name], inherited[promptField.name], true) : ''}
-            ${agentFields.map((f) => `<section class="tf-section tf-${esc(f.type)}">${agentSectionHtml(f)}</section>`).join('')}
+            ${agentFields.map((f) => `<section class="tf-section tf-${esc(f.type)}">${agentSectionHtml(f)}${f === agentFields.find((a) => a.type === 'agent') && !templateEdit
+              ? '<p class="tf-basic-model" id="tf-basic-model" hidden></p>' : ''}</section>`).join('')}
             ${otherFields.length ? `<section class="tf-section tf-where">${renderFields(otherFields, values, inherited)}</section>` : ''}
             ${promptField ? '' : `<div class="form-row" data-row="__images">
               <div class="label-row"><label>Attachments</label></div>

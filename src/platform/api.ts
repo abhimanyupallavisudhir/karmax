@@ -70,7 +70,8 @@ import { MAX_FILE_BYTES, MAX_FILES_BYTES_PER_MESSAGE, MAX_FILES_PER_MESSAGE, san
 import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES, BUILTIN_WIKI_PREFIX } from '../wiki/wiki.js';
 import { copyRemoteWiki, RemoteWikiSnapshots } from '../wiki/remote-snapshot.js';
 import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, removeProjectWikiRepository, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
-import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, profileVisibleTo, roleDefaultProfile } from '../agent/profiles.js';
+import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, profileVisibleTo } from '../agent/profiles.js';
+import { defaultAgentProfile } from './readiness.js';
 import { looksLikeConversationUrl, PanagentError, publicConversationShare } from '../agent/panagent.js';
 import { importConversationShare } from '../agent/conversation-sources.js';
 import { SHARE_APPS } from '../agent/conversation-shares.js';
@@ -463,6 +464,8 @@ export interface KarmaxApiDeps {
   /** Where checked conversation sources are kept (conversation imports). */
   objects?: import('../store/objects.js').ObjectStore;
   broker?: CredentialBroker;
+  /** The organizations' model logins: whether one can run a task's default agent. */
+  configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
   githubApp?: import('../integrations/github-app.js').GitHubAppService;
   /** Wake live gateway subscribers when platform-side actions append events. The
    * durable event table remains the source of truth when this is absent. */
@@ -2092,7 +2095,8 @@ export class KarmaxApi {
     // already-running Temporal execution keeps its recorded input unchanged.
     if (this.deps.hosted && (resolved.remote === undefined || resolved.remote === 'none'))
       resolved.remote = 'pr';
-    (await this.materializeUnifiedAgents(resolved, project.id));
+    (await this.materializeUnifiedAgents(resolved, project));
+    (await this.pinIncludedModelDefaults(manifest, resolved, project));
 
     // Auto-detect the repo's branch policy when base/target weren't set anywhere,
     // instead of guessing "main" (which would make hosted task views disagree
@@ -2126,12 +2130,12 @@ export class KarmaxApi {
   /** Turn the compact Agent setting into concrete per-role input. Profile defaults
    * live outside parameter settings, so this final materialization must happen
    * after the parameter overlays have selected the child scope's form shape. */
-  private async materializeUnifiedAgents(resolved: ValueMap, projectId: string): Promise<void> {
+  private async materializeUnifiedAgents(resolved: ValueMap, project: Project): Promise<void> {
     if (resolved.separateAgents !== false) return;
     let spec = resolved['agent:do'] as AgentSpec | undefined;
     if (!spec?.provider) {
       const resumeFrom = spec?.resumeFrom;
-      const profile = (await roleDefaultProfile(this.deps.store, 'do', projectId));
+      const { profile } = await this.defaultAgent('do', project);
       const provider = (profile?.provider ?? this.deps.defaultAgentProvider ?? defaultProvider().provider) as Provider;
       const model = profile?.model ?? defaultModel(provider);
       const effort = profile?.effort ?? defaultEffort(provider);
@@ -2147,6 +2151,34 @@ export class KarmaxApi {
     const { resumeFrom: _resumeFrom, ...shared } = spec;
     resolved['agent:merge'] = shared;
     if (RESOLVE_AGENT_ENABLED) resolved['agent:resolve'] = shared;
+  }
+
+  /** The role's default agent in `project`: its Task default, or the included
+   * model when the organization can't run that (wiki features/included-model § Default). */
+  private defaultAgent(role: string, project: Project) {
+    return defaultAgentProfile({ store: this.deps.store, hosted: this.deps.hosted === true, broker: this.deps.broker,
+      configHomes: this.deps.configHomes }, role, { organizationId: project.organizationId ?? 'org_personal', projectId: project.id },
+    (this.deps.defaultAgentProvider ?? defaultProvider().provider) as Provider);
+  }
+
+  /** A role that inherits a default its organization can't run is pinned to the
+   * included model at queue, so the run never waits for a login nobody chose,
+   * and a login connected later does not switch a running task's model. */
+  private async pinIncludedModelDefaults(manifest: WorkflowManifest, resolved: ValueMap, project: Project): Promise<void> {
+    for (const field of manifest.params) {
+      if (field.type !== 'agent' || !field.role) continue;
+      const spec = resolved[field.name] as AgentSpec | undefined;
+      if (spec?.provider) continue;
+      const { profile, included } = await this.defaultAgent(field.role, project);
+      if (!included || !profile) continue;
+      resolved[field.name] = {
+        ...spec,
+        provider: profile.provider,
+        ...(profile.model ? { model: profile.model } : {}),
+        ...(profile.effort ? { effort: profile.effort } : {}),
+        ...(spec?.mcpConnections === undefined && profile.mcpConnections !== undefined ? { mcpConnections: profile.mcpConnections } : {}),
+      };
+    }
   }
 
   /** Capture the exact provider/model/effort selection that the activity runtime

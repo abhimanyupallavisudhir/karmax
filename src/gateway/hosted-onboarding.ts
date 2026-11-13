@@ -6,22 +6,27 @@ export const parseHostedOnboardingDisplay = (value: unknown): HostedOnboardingDi
 
 export interface HostedOnboardingFacts {
   github: boolean;
+  /** A model login or API key of the organization's own (the included model is not one). */
   agentLogin: boolean;
   /** A compute provider account of the organization's own (E2B, Daytona, …). */
   ownCompute: boolean;
   /** tavya's computers paid for: a paid plan, or compute credit from packs, a gift or a top-up. */
   managedCompute: boolean;
-  /** tavya's computers for free: the new organization's trial, while it has credit left. */
-  computeTrial?: { endsAt: number };
+  /** The new organization's free trial, while it has credit left: `creditMicros`
+   * of tavya's computers — and its included model (`agents`), when that is on —
+   * until `endsAt`. It lets them work, but finishes no step: the guide is the
+   * full experience, which outlasts the trial. */
+  computeTrial?: { creditMicros: number; endsAt: number; agents: boolean };
   vault: boolean;
   card: boolean;
   project: boolean;
 }
 
-/** The facts every required step needs, in walkthrough order. GitHub is not
- * one: a project's code can live on tavya (wiki features/hosted-repositories). */
+/** The facts every required step needs, in walkthrough order. GitHub is one
+ * (owner, 2026-11-13), although a project's code can also live on tavya
+ * (wiki features/hosted-repositories). */
 export const hostedOnboardingRequired = (facts: HostedOnboardingFacts) =>
-  [facts.agentLogin, facts.ownCompute || facts.managedCompute || !!facts.computeTrial, facts.project];
+  [facts.agentLogin, facts.ownCompute || facts.managedCompute, facts.project, facts.github];
 
 export interface HostedOnboardingRecord {
   display: HostedOnboardingDisplay;
@@ -65,16 +70,15 @@ export function hostedOnboardingStatus(input: {
     display: input.record?.display ?? 'expanded' as HostedOnboardingDisplay,
     completedRequired: required.filter(Boolean).length,
     totalRequired: required.length,
+    ...(input.facts.computeTrial ? { trial: input.facts.computeTrial } : {}),
     steps: {
-      github: { complete: input.facts.github, blocking: false },
+      github: { complete: input.facts.github },
       agentLogin: { complete: input.facts.agentLogin },
       // One step, two ways to satisfy it: tavya's computers or the organization's own.
-      // A free trial gets them started, but is neither: it ticks the step, not an option.
       compute: {
-        complete: input.facts.ownCompute || input.facts.managedCompute || !!input.facts.computeTrial,
+        complete: input.facts.ownCompute || input.facts.managedCompute,
         managed: input.facts.managedCompute,
         own: input.facts.ownCompute,
-        ...(input.facts.computeTrial ? { trial: { endsAt: input.facts.computeTrial.endsAt } } : {}),
       },
       optional: {
         complete: input.facts.vault && input.facts.card,

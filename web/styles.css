@@ -1388,6 +1388,10 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
 .tf-ready { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin: 0 0 14px;
   padding: 8px 12px; border-radius: 8px; background: var(--working-weak); color: var(--working); font-size: var(--fs-13); }
 .tf-ready[hidden] { display: none; }
+/* The included model stands in for an organization's missing login. */
+.tf-basic-model { margin: 0 0 10px; color: var(--ink-3); font-size: var(--fs-12); }
+.tf-basic-model[hidden] { display: none; }
+.tf-basic-model a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
 .tf-ready a { color: var(--working); font-weight: 600; text-decoration: underline; text-underline-offset: 2px; }
 .tf-ready .tf-ready-mark { background: var(--working); color: var(--surface); }
 .tf-ready-mark { display: inline-grid; place-items: center; width: 16px; height: 16px; border-radius: 50%;
@@ -1863,6 +1867,9 @@ body:has(#tf-page, .ck-compose) .hosted-onboarding { display: none; }
 .onboarding-progress { height: 4px; overflow: hidden; margin: 14px 0 0; border-radius: 999px; background: var(--line); }
 .onboarding-progress > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width .2s ease; }
 .onboarding-intro { margin: 11px 0 14px; color: var(--ink-2); font-size: var(--fs-12); line-height: 1.5; }
+.onboarding-trial { margin: 14px 0 0; padding: 9px 11px; border-radius: 9px; background: var(--accent-weak); color: var(--ink); font-size: var(--fs-12); line-height: 1.45; }
+.onboarding-trial b { color: var(--accent); font-weight: 700; }
+.onboarding-trial + .onboarding-intro { margin-top: 12px; }
 .onboarding-list { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }
 .onboarding-step { position: relative; display: grid; grid-template-columns: 27px minmax(0, 1fr); gap: 10px; padding: 8px 0 11px; }
 .onboarding-step:not(:last-child)::after { content: ''; position: absolute; left: 13px; top: 35px; bottom: -1px; width: 1px; background: var(--line); }

@@ -8,13 +8,14 @@
  * coordinator's credential filter (`credentialServesProfile`, policy layers
  * resolved global → project) and the compute router's options.
  */
-import type { AgentProfile } from '../domain/types.js';
+import type { AgentProfile, Provider } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ConfigHomeManager } from '../autonomy/config-homes.js';
 import { credentialProvider, credentialServesProfile, mockAgentEnabled } from '../agent/provider-registry.js';
 import { managedModelRailAvailable } from '../agent/managed-models.js';
-import { includedModel, includedModelRelativeCost, isIncludedModel } from '../agent/included-model.js';
+import { includedAgentModel, includedModel, includedModelRelativeCost, isIncludedModel } from '../agent/included-model.js';
+import { DEFAULT_MCP_CONNECTIONS, defaultEffort, defaultModel, roleDefaultProfile } from '../agent/profiles.js';
 import { enumerateCredentials, resolveCredentials, type Credential } from './credentials.js';
 import { gatherCredentialSources, readPolicyLayers } from './credential-sources.js';
 import { ComputeRouter, type RouterConnections } from '../world/compute-router.js';
@@ -43,7 +44,8 @@ export interface Readiness {
   /** `cost`: an agent that runs on the compute credit (an OpenRouter model,
    * no login or key of the organization's own serving it) costs about this
    * many times the included model a task (wiki features/included-model). */
-  agents: Array<{ provider: string; model?: string; ready: boolean; need?: AgentNeed; cost?: number }>;
+  /** `included`: it is the included model itself. */
+  agents: Array<{ provider: string; model?: string; ready: boolean; need?: AgentNeed; cost?: number; included?: true }>;
   /** Any enabled login or key at all. */
   agentLogin: boolean;
   compute: {
@@ -109,7 +111,8 @@ export async function projectReadiness(deps: ReadinessDeps,
       const credit = !own && isIncludedModel(agent, included);
       const ready = own || credit || managedModelRailAvailable(deps.hosted, policy!, agent);
       const cost = credit ? await includedModelRelativeCost(included!, agent.model!, agent.effort) : undefined;
-      return { ...agent, ready, ...(ready ? {} : { need: need(agent) }), ...(cost !== undefined ? { cost: Math.round(cost * 10) / 10 } : {}) };
+      return { ...agent, ready, ...(ready ? {} : { need: need(agent) }), ...(cost !== undefined ? { cost: Math.round(cost * 10) / 10 } : {}),
+        ...(credit && agent.model === includedAgentModel(included!) ? { included: true } : {}) };
     })),
     agentLogin: credentials.length > 0,
     compute: await computeReadiness(deps, scope.organizationId),
@@ -141,4 +144,29 @@ async function computeReadiness(deps: ReadinessDeps, organizationId: string): Pr
   const credit = await computeCredit(deps.store, organizationId);
   const never = !credit.creditMicros && !credit.topUpMicros;
   return { ready: false, local: false, managed, own, outOfCredit, need: never ? 'plan' : 'credit' };
+}
+
+/** The agent a role runs by default in this scope: its Task default (project →
+ * organization → installation), unless nothing of the organization's own can
+ * run that and tavya's included model is on — then the included model, so a
+ * new organization's first task runs without a login, and connecting one
+ * brings its model back as the default (wiki features/included-model § Default).
+ * `included` says the default was replaced. An explicit choice is never
+ * replaced: only what a task inherits. */
+export async function defaultAgentProfile(deps: ReadinessDeps, role: string,
+  scope: { organizationId: string; projectId?: string }, fallbackProvider: Provider): Promise<{ profile?: AgentProfile; included?: true }> {
+  const profile = await roleDefaultProfile(deps.store, role, scope.projectId, scope.organizationId);
+  // Without the config homes the organization's logins can't be seen: never guess.
+  if (!deps.hosted || !deps.configHomes) return { profile };
+  const settings = await includedModel(deps.store, deps.broker);
+  if (!settings) return { profile };
+  const provider = (profile?.provider ?? fallbackProvider) as Provider;
+  const model = profile?.model ?? defaultModel(provider);
+  const effort = (profile?.effort ?? defaultEffort(provider)) as AgentProfile['effort'];
+  const [agent] = (await projectReadiness(deps, scope, [{ provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}) }])).agents;
+  if (agent?.ready) return { profile };
+  const { model: _model, effort: _effort, auth: _auth, allowedAccounts: _accounts, ...kept } = profile ?? { id: `${role}-default`, name: `${role} agent`, role } as AgentProfile;
+  return { included: true, profile: { ...kept, provider: 'opencode', model: includedAgentModel(settings),
+    ...(settings.effort ? { effort: settings.effort as AgentProfile['effort'] } : {}),
+    mcpConnections: profile?.mcpConnections ?? [...DEFAULT_MCP_CONNECTIONS] } };
 }

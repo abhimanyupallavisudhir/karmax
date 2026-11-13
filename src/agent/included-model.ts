@@ -302,23 +302,3 @@ export async function includedModelOutOfCredit(store: Store, broker: CredentialB
   return credit.availableMicros != null && credit.availableMicros < INCLUDED_MODEL_MIN_MICROS
     ? outOfCompute(store, organizationId, 'openrouter', now) : undefined;
 }
-
-/** A new organization's Task defaults: every agent role on the included model,
- * so its first task runs without a login of its own. It changes them like any
- * Task default; connecting a login does not change them by itself. */
-export async function seedIncludedModelDefaults(store: Store, broker: CredentialBroker | undefined, organizationId: string): Promise<boolean> {
-  const settings = await includedModel(store, broker);
-  if (!settings || !broker) return false;
-  const { allRoles } = await import('../contrib/manifests.js');
-  const { organizationProfileId, roleDefaultProfile, DEFAULT_MCP_CONNECTIONS } = await import('./profiles.js');
-  for (const role of allRoles()) {
-    const id = organizationProfileId(organizationId, role.name);
-    if (await store.getProfile(id)) continue;
-    const inherited = await roleDefaultProfile(store, role.name);
-    await store.upsertProfile({ id, name: role.label, role: role.name, provider: 'opencode', model: includedAgentModel(settings),
-      ...(settings.effort ? { effort: settings.effort as Effort } : {}),
-      mcpConnections: inherited?.mcpConnections ?? [...DEFAULT_MCP_CONNECTIONS],
-      ...(inherited?.maxTurns ? { maxTurns: inherited.maxTurns } : {}) });
-  }
-  return true;
-}

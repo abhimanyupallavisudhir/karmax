@@ -109,7 +109,7 @@ describe('hosted onboarding status API', () => {
       installationId: 'daytona-onboarding', accountLogin: 'alice', accountType: 'User' });
     await broker.registerHandle('openai:first', 'sk-test', INSTALLATION_SCOPE);
     await store.createProject('Daytona project', {}, 'org_personal');
-    expect(await (await request()).json()).toMatchObject({ complete: true, completedRequired: 3, totalRequired: 3 });
+    expect(await (await request()).json()).toMatchObject({ complete: true, completedRequired: 4, totalRequired: 4 });
   });
 
   it('completes the compute step with a paid plan instead of a compute account of the organization’s own', async () => {
@@ -118,7 +118,7 @@ describe('hosted onboarding status API', () => {
       installationId: 'paid-onboarding', accountLogin: 'alice', accountType: 'User' });
     await broker.registerHandle('openai:first', 'sk-test', INSTALLATION_SCOPE);
     await store.createProject('Paid project', {}, 'org_personal');
-    expect(await (await request()).json()).toMatchObject({ complete: false, completedRequired: 2, totalRequired: 3,
+    expect(await (await request()).json()).toMatchObject({ complete: false, completedRequired: 3, totalRequired: 4,
       steps: { compute: { complete: false, managed: false, own: false } } });
     await subscriptions.checkout('org_personal', 'individual', { success: 'https://test/s', cancel: 'https://test/c' }, 'onboarding-paid');
     // An unpaid checkout is not a plan yet.
@@ -126,7 +126,7 @@ describe('hosted onboarding status API', () => {
     await subscriptions.handleWebhook(Buffer.from(JSON.stringify({ id: 'onboarding-active', type: 'customer.subscription.updated',
       created: 100, data: { object: { id: 'sub_onboarding', customer: 'cus_org_personal', status: 'active',
         items: { data: [{ id: 'si', price: { id: 'price_individual' }, quantity: 1 }] } } } })));
-    expect(await (await request()).json()).toMatchObject({ complete: true, completedRequired: 3,
+    expect(await (await request()).json()).toMatchObject({ complete: true, completedRequired: 4,
       steps: { compute: { complete: true, managed: true, own: false } } });
   });
 
@@ -141,9 +141,9 @@ describe('hosted onboarding status API', () => {
     const { store, broker, providers, request } = await boot(true);
     const initial = await (await request()).json() as any;
     expect(initial).toMatchObject({ eligible: true, visible: true, complete: false,
-      display: 'expanded', completedRequired: 0, totalRequired: 3 });
-    // GitHub is optional: a project's code can live on tavya itself.
-    expect(initial.steps.github).toEqual({ complete: false, blocking: false });
+      display: 'expanded', completedRequired: 0, totalRequired: 4 });
+    // GitHub is required (owner, 2026-11-13); apps and cards stay optional.
+    expect(initial.steps.github).toEqual({ complete: false });
     expect(initial.steps.optional).toMatchObject({ blocking: false, complete: false, vault: false, card: false });
 
     const minimized = await (await request('PUT', { display: 'minimized' })).json() as any;
@@ -157,7 +157,7 @@ describe('hosted onboarding status API', () => {
     (await store.createProject('First project', {}, 'org_personal'));
 
     const completed = await (await request()).json() as any;
-    expect(completed).toMatchObject({ visible: false, complete: true, completedRequired: 3 });
+    expect(completed).toMatchObject({ visible: false, complete: true, completedRequired: 4 });
     // Optional passwords/cards remain honestly incomplete, but never hold back
     // overall onboarding completion.
     expect(completed.steps.optional).toMatchObject({ complete: false, blocking: false });
@@ -259,7 +259,7 @@ describe('hosted onboarding status API', () => {
     expect((await reset(userId)).status).toBe(200);
     for (let i = 0; i < 2; i++)
       expect(await (await request()).json()).toMatchObject({ complete: false, visible: true,
-        replay: true, display: 'expanded', completedRequired: 3 });
+        replay: true, display: 'expanded', completedRequired: 4 });
     expect((await store.kvGet(untouchedKey))).toBe(JSON.stringify({ display: 'minimized', completedAt: 123 }));
     expect((await store.listProjects())).toContainEqual(project);
     expect((await store.listGitConnections('org_personal'))[0]!.installationId).toBe('keep-installation');
@@ -315,10 +315,11 @@ describe('hosted onboarding status API', () => {
       eligible: true,
       visible: true,
       complete: false,
-      // The creator's first organization comes with the free trial of tavya's computers;
-      // that is not a bought plan.
-      completedRequired: 1,
-      steps: { compute: { complete: true, managed: false, own: false, trial: { endsAt: expect.any(Number) } } },
+      // The creator's first organization comes with a free trial: it lets them work at
+      // once, but is neither a bought plan nor a computer of their own, so no step is done.
+      completedRequired: 0,
+      trial: { creditMicros: 5_000_000, endsAt: expect.any(Number), agents: false },
+      steps: { compute: { complete: false, managed: false, own: false }, agentLogin: { complete: false } },
     });
   });
 
@@ -336,7 +337,7 @@ describe('hosted onboarding status API', () => {
     expect(github.lookups).toEqual([organization.slug]);
     const status = await (await onboarding(organization.id)).json() as any;
     expect(status.steps.github.complete).toBe(true);
-    expect(status.completedRequired).toBe(1); // the free trial's computers (GitHub is optional)
+    expect(status.completedRequired).toBe(1); // GitHub; the free trial finishes no step
   });
 
   it('does not mark GitHub done for an organization that has no installation', async () => {
@@ -354,7 +355,7 @@ describe('hosted onboarding status API', () => {
     expect(await store.listGitConnections(organization.id)).toEqual([]);
     const status = await (await onboarding(organization.id)).json() as any;
     expect(status.steps.github.complete).toBe(false);
-    expect(status.completedRequired).toBe(1); // the free trial's computers
+    expect(status.completedRequired).toBe(0); // the free trial finishes no step
     // Another organization's connection is not this one's either.
     await store.upsertGitConnection({ organizationId: 'org_personal', provider: 'github',
       installationId: 'personal-only', accountLogin: 'alice', accountType: 'User' });
@@ -395,27 +396,24 @@ describe('hosted onboarding completion semantics', () => {
     } finally { (await reopened.close()); }
   });
 
-  it('does not count GitHub or the optional password/card item toward the required total', () => {
-    const status = hostedOnboardingStatus({
-      hosted: true,
-      organizationId: 'org_1',
-      record: { display: 'expanded' },
-      facts: { github: false, agentLogin: true, ownCompute: true, managedCompute: false, vault: false, card: false, project: true },
-    });
-    expect(status).toMatchObject({ complete: true, completedRequired: 3, totalRequired: 3 });
-    expect(status.steps.github).toEqual({ complete: false, blocking: false });
+  it('counts GitHub toward the required total, but not the optional password/card item', () => {
+    const facts = { github: false, agentLogin: true, ownCompute: true, managedCompute: false, vault: false, card: false, project: true };
+    const status = hostedOnboardingStatus({ hosted: true, organizationId: 'org_1', record: { display: 'expanded' }, facts });
+    expect(status).toMatchObject({ complete: false, completedRequired: 3, totalRequired: 4 });
+    expect(status.steps.github).toEqual({ complete: false });
     expect(status.steps.optional).toMatchObject({ complete: false, blocking: false });
+    expect(hostedOnboardingStatus({ hosted: true, organizationId: 'org_1', record: { display: 'expanded' }, facts: { ...facts, github: true } }))
+      .toMatchObject({ complete: true, completedRequired: 4 });
   });
 
-  it('lets a free trial finish the compute step without claiming a paid plan', () => {
-    const facts = { github: false, agentLogin: true, ownCompute: false, managedCompute: false, vault: false, card: false, project: true };
-    const trial = hostedOnboardingStatus({ hosted: true, organizationId: 'org_1', record: { display: 'expanded' },
-      facts: { ...facts, computeTrial: { endsAt: 1_800_000_000_000 } } });
-    expect(trial.steps.compute).toEqual({ complete: true, managed: false, own: false, trial: { endsAt: 1_800_000_000_000 } });
-    expect(trial).toMatchObject({ complete: true, completedRequired: 3 });
-    // Without one (used up or ended), nothing gets them computers.
-    const none = hostedOnboardingStatus({ hosted: true, organizationId: 'org_1', record: { display: 'expanded' }, facts });
-    expect(none.steps.compute).toEqual({ complete: false, managed: false, own: false });
+  it('shows a free trial without counting it as any step', () => {
+    const facts = { github: true, agentLogin: true, ownCompute: false, managedCompute: false, vault: false, card: false, project: true };
+    const computeTrial = { creditMicros: 5_000_000, endsAt: 1_800_000_000_000, agents: true };
+    const trial = hostedOnboardingStatus({ hosted: true, organizationId: 'org_1', record: { display: 'expanded' }, facts: { ...facts, computeTrial } });
+    expect(trial).toMatchObject({ complete: false, visible: true, completedRequired: 3, totalRequired: 4, trial: computeTrial });
+    expect(trial.steps.compute).toEqual({ complete: false, managed: false, own: false });
+    // Without one (used up or ended), there is nothing to show.
+    expect(hostedOnboardingStatus({ hosted: true, organizationId: 'org_1', record: { display: 'expanded' }, facts }).trial).toBeUndefined();
   });
 
   it('requires an enrollment record (the hosted API repairs missing records)', () => {
