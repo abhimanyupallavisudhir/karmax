@@ -291,8 +291,21 @@ describe('events in the console', () => {
       await page.waitForTimeout(600); // the page's entrance animation
       await page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'store-tag-tasks-form.png'), fullPage: true });
     }
+    expect(await form.locator('.confirmer-field .cf-empty').isVisible()).toBe(true); // Auto-confirms: it changes no code
+
+    // What may change code is reviewed by an agent, which gives up after three rounds.
+    const deps2 = await open('/personal/factory/store/update-dependencies');
+    const depsForm = deps2.page.locator('#tf-page:not([aria-busy])');
+    await depsForm.waitFor();
+    expect(await depsForm.locator('.confirmer-field .cf-layer').evaluateAll((layers) => layers.map((layer) => layer.getAttribute('data-kind')))).toEqual(['agent']);
+    expect(await depsForm.locator('.confirmer-field .cf-max-revisions-input').inputValue()).toBe('3');
+    if (process.env.KARMAX_SCREENSHOT_DIR) {
+      await depsForm.locator('.confirmer-field').scrollIntoViewIfNeeded();
+      await deps2.page.waitForTimeout(600);
+      await deps2.page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'store-update-dependencies-review.png') });
+    }
     expect((await store.listTasks(project.id)).length).toBe(before);
-    expect(errors).toEqual([]);
+    expect([...errors, ...deps2.errors]).toEqual([]);
   });
 
   it('runs and installs a store task as changed in its form', async () => {

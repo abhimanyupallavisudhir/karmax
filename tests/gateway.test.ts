@@ -1847,8 +1847,11 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       const name = path.includes('/organizations/') ? 'Fresh via organization route' : 'Fresh via legacy route';
       const project: any = await post(path, { name });
       const tasks: any = await fetch(`${base}/api/projects/${project.id}/tasks`, { headers: auth() }).then((r) => r.json());
-      expect(tasks.map((task: any) => ({ title: task.title, template: task.params?.template, armed: task.params?.triggerState })), `new project via ${path}`)
-        .toEqual([{ title: 'Repair GitHub workflow {{workflow}}', template: 'repair-github-workflow', armed: 'armed' }]);
+      expect(tasks.map((task: any) => ({ title: task.title, template: task.params?.template, armed: task.params?.triggerState,
+        confirm: task.params?.confirm })), `new project via ${path}`)
+        .toEqual([{ title: 'Repair GitHub workflow {{workflow}}', template: 'repair-github-workflow', armed: 'armed',
+          // As the store installs it: an agent reviews its fix, nobody waits on it.
+          confirm: { layers: [{ kind: 'agent', maxRevisions: 3 }] } }]);
       const store: any = await fetch(`${base}/api/projects/${project.id}/task-store`, { headers: auth() }).then((r) => r.json());
       const entry = (id: string) => store.tasks.find((task: any) => task.id === id);
       expect(entry('repair-github-workflow').installed).toEqual([tasks[0].id]);

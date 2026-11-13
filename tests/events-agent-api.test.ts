@@ -109,6 +109,12 @@ describe('events through an agent\'s task token', () => {
       expect(listed.map((t: any) => t.id)).toEqual(['project-wiki', 'repair-github-workflow', 'build-planned-issues', 'triage-issues',
         'update-dependencies', 'tag-tasks', 'chat-requests']);
       expect(listed.every((t: any) => t.repeatable)).toBe(true);
+      // Nothing from the store waits for a person at Review: what may change
+      // code gets an agent Reviewer, the rest confirms itself.
+      const reviewer = { layers: [{ kind: 'agent', maxRevisions: 3 }] }, auto = { layers: [] };
+      expect(Object.fromEntries(listed.map((t: any) => [t.id, t.task.params.confirm]))).toEqual({ 'project-wiki': auto,
+        'repair-github-workflow': reviewer, 'build-planned-issues': reviewer, 'triage-issues': auto, 'update-dependencies': reviewer,
+        'tag-tasks': auto, 'chat-requests': reviewer });
       expect(Object.fromEntries(listed.map((t: any) => [t.id, t.missing]))).toEqual({ 'project-wiki': [], 'repair-github-workflow': ['github'],
         'build-planned-issues': ['github'], 'triage-issues': ['github'], 'update-dependencies': ['repository'], 'tag-tasks': [], 'chat-requests': ['chat'] });
       expect(listed[0]).toMatchObject({ name: 'Maintain the project wiki', runOnInstall: true });
@@ -183,8 +189,8 @@ describe('events through an agent\'s task token', () => {
       expect(depsPrompt).toContain('store:update-dependencies is:run is:open');
       expect(depsPrompt).toMatch(/Security first/);
       expect(depsPrompt).toMatch(/upgraded elsewhere/);
-      // Reviewed like any change: the store does not skip its Review.
-      expect(depsSeries.params.confirm).toBeUndefined();
+      // A change to the code is reviewed, by an agent: nobody waits on it weekly.
+      expect(depsSeries.params.confirm).toEqual({ layers: [{ kind: 'agent', maxRevisions: 3 }] });
 
       // It asks for a maintainer's authority (tagging other people's tasks is
       // task:edit), checked in authorization-summon.test.ts; its runs change

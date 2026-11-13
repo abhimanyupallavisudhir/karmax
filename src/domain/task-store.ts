@@ -28,6 +28,15 @@ export interface StoreTask {
 /** What a project must have for a store task to do anything. */
 export type StoreNeed = 'github' | 'chat' | 'repository';
 
+/**
+ * Store tasks run unattended, so none waits for a person at Review: one that
+ * changes no code confirms itself, and one that may change code is reviewed by
+ * an agent (the project's default Reviewer), which hands the Review to the
+ * task's people after three rounds of sending it back.
+ */
+export const AUTO_CONFIRM = { layers: [] } as const;
+export const AGENT_REVIEW = { layers: [{ kind: 'agent', maxRevisions: 3 }] } as const;
+
 export const REPAIR_TEMPLATE_ID = 'repair-github-workflow';
 
 export const RECOVERY_TRIGGER: EventTrigger = {
@@ -95,13 +104,13 @@ export const STORE_TASKS: readonly StoreTask[] = [
     runOnInstall: true,
     task: { title: 'Maintain the project wiki', workflow: 'software-dev',
       prompt: projectWikiPrompt(false), hostedPrompt: projectWikiPrompt(true),
-      params: { repeatable: true, triggers: [{ kind: 'schedule', cron: '0 6 * * 1', recurring: true }] } },
+      params: { repeatable: true, confirm: AUTO_CONFIRM, triggers: [{ kind: 'schedule', cron: '0 6 * * 1', recurring: true }] } },
   },
   {
     id: REPAIR_TEMPLATE_ID,
     name: 'Repair failed deploys',
     summary: 'When a GitHub workflow fails on the default branch after a merge, an agent finds out why and fixes it.',
-    task: { title: RECOVERY_TITLE, prompt: RECOVERY_PROMPT, params: { repeatable: true, triggers: [RECOVERY_TRIGGER] } },
+    task: { title: RECOVERY_TITLE, prompt: RECOVERY_PROMPT, params: { repeatable: true, confirm: AGENT_REVIEW, triggers: [RECOVERY_TRIGGER] } },
   },
   {
     id: 'build-planned-issues',
@@ -114,7 +123,7 @@ export const STORE_TASKS: readonly StoreTask[] = [
         'Read the whole issue and its comments first (`gh issue view <url> --comments`). If it is too unclear to build, ask on the issue and wait for the answer: comments on it reach you as messages.',
         'Reference the issue in the pull request (`Closes #<number>`).',
       ].join('\n'),
-      params: { repeatable: true, triggers: [{ kind: 'event', type: 'github.issues.labeled', where: { 'label.name': 'planned' }, recurring: true }] },
+      params: { repeatable: true, confirm: AGENT_REVIEW, triggers: [{ kind: 'event', type: 'github.issues.labeled', where: { 'label.name': 'planned' }, recurring: true }] },
     },
   },
   {
@@ -129,7 +138,7 @@ export const STORE_TASKS: readonly StoreTask[] = [
         'For each: label it by kind and area, link and close exact duplicates, ask its author for whatever is missing to act on it (steps to reproduce, expected behaviour), and say on it how it could be solved when you can tell.',
         'Do not add the “planned” label yourself: a person decides what gets built. End with a short summary of what you did and which issues look ready to plan.',
       ].join('\n'),
-      params: { repeatable: true, triggers: [{ kind: 'schedule', cron: '0 8 * * *', recurring: true }] },
+      params: { repeatable: true, confirm: AUTO_CONFIRM, triggers: [{ kind: 'schedule', cron: '0 8 * * *', recurring: true }] },
     },
   },
   {
@@ -138,17 +147,16 @@ export const STORE_TASKS: readonly StoreTask[] = [
     needs: ['repository'],
     summary: 'Every week an agent updates the project’s dependencies, security fixes first, and proposes them in a tested pull request.',
     task: { title: 'Update dependencies', prompt: UPDATE_DEPENDENCIES_PROMPT,
-      params: { repeatable: true, triggers: [{ kind: 'schedule', cron: '0 5 * * 2', recurring: true }] } },
+      params: { repeatable: true, confirm: AGENT_REVIEW, triggers: [{ kind: 'schedule', cron: '0 5 * * 2', recurring: true }] } },
   },
   {
     id: TAG_TASKS_TEMPLATE_ID,
     name: 'Tag tasks daily',
     summary: 'Every day an agent tags the project’s untagged tasks, so the list can be filtered and grouped by tag.',
     // Tagging other people's tasks is task:edit on the project, which a
-    // Developer holds for their own tasks only. It changes no repository, so
-    // there is nothing for a Review to look at.
+    // Developer holds for their own tasks only.
     task: { title: 'Tag tasks', prompt: TAG_TASKS_PROMPT, authorization: { level: 'maintainer' },
-      params: { repeatable: true, confirm: { layers: [] }, triggers: [{ kind: 'schedule', cron: '0 7 * * *', recurring: true }] } },
+      params: { repeatable: true, confirm: AUTO_CONFIRM, triggers: [{ kind: 'schedule', cron: '0 7 * * *', recurring: true }] } },
   },
   {
     id: 'chat-requests',
@@ -157,7 +165,7 @@ export const STORE_TASKS: readonly StoreTask[] = [
     task: {
       title: '{{text}}',
       prompt: 'Do what this chat message asks. Your final message is posted back to the chat.',
-      params: { repeatable: true, triggers: [{ kind: 'event', type: 'chat.mention', recurring: true }] },
+      params: { repeatable: true, confirm: AGENT_REVIEW, triggers: [{ kind: 'event', type: 'chat.mention', recurring: true }] },
     },
   },
 ];
