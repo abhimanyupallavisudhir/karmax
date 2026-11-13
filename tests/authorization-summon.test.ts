@@ -3,6 +3,7 @@ import { Store } from '../src/store/db.js';
 import { AuthorizationGrantError, AuthorizationService, organizationScope, projectScope } from '../src/platform/authorization.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
+import { allows } from '../src/platform/capabilities.js';
 import type { AuthorizationSelection, TaskView } from '../src/domain/types.js';
 
 /** Asking for more authorization than you have: who is summoned, and how an
@@ -47,6 +48,27 @@ async function fixture() {
   const maintainer: AuthorizationSelection = { level: 'maintainer', scope: 'projects', projectIds: [project.id] };
   return { store, organization, project, authorization, tokens, api, human, agentOf, parent, maintainer, terminated };
 }
+
+describe('a Task store entry that needs more than a Developer', () => {
+  // "Tag tasks daily" tags other people's tasks: task:edit on the project.
+  it('installs for a maintainer with that authority, and tells a Developer whom to ask', async () => {
+    const f = await fixture();
+    const refused = await f.api.runStoreTask(await f.human('dev'), f.project.id, 'tag-tasks').catch((error) => error);
+    expect(refused).toBeInstanceOf(AuthorizationGrantError);
+    expect(refused.message).toMatch(/Project maintainer/);
+    expect(refused.gap?.summon).toBe('@maintainers');
+    expect((await f.store.listTasks(f.project.id)).filter((task) => task.params?.template === 'tag-tasks')).toEqual([]);
+
+    const series = await f.api.runStoreTask(await f.human('maint'), f.project.id, 'tag-tasks');
+    const authority = (await f.store.getTask(series.id))!.params._authorization as { level?: string; projectIds?: string[]; capabilities: string[] };
+    expect(authority).toMatchObject({ level: 'maintainer', scope: 'projects', projectIds: [f.project.id] });
+    expect(allows(authority.capabilities, 'task:edit')).toBe(true);
+
+    // An entry that names no level gets the project's, as any task does.
+    const deps = await f.api.runStoreTask(await f.human('dev'), f.project.id, 'update-dependencies');
+    expect((await f.store.getTask(deps.id))!.params._authorization).toMatchObject({ level: 'developer' });
+  });
+});
 
 describe('summoning someone who can grant it', () => {
   it.each([

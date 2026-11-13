@@ -3432,8 +3432,10 @@ export class KarmaxApi {
     (await this.require(token, 'list_tasks', { projectId }));
     if (!(await this.deps.store.getProject(projectId))) throw new NotFoundError(`no project ${projectId}`);
     const tasks = (await this.deps.store.listTasks(projectId));
-    const has = {
-      github: (await this.deps.store.listProjectRepositories(projectId)).some((entry) => !!entry.repository.gitConnectionId),
+    const repositories = (await this.deps.store.listProjectRepositories(projectId));
+    const has: Record<StoreNeed, boolean> = {
+      repository: repositories.length > 0,
+      github: repositories.some((entry) => !!entry.repository.gitConnectionId),
       chat: this.deps.broker ? (await this.incomingWebhooks().list(projectId)).some((hook) => !!hook.kind) : false,
     };
     return STORE_TASKS.map(({ task: { hostedPrompt, ...task }, ...template }) => ({ ...template, task: { ...task, prompt: this.storePrompt({ task: { ...task, hostedPrompt } }) },
@@ -3459,7 +3461,11 @@ export class KarmaxApi {
     const template = STORE_TASKS.find((candidate) => candidate.id === templateId);
     if (!template) throw new NotFoundError(`no store task ${templateId}`);
     const { params, ...rest } = overrides;
-    return this.createTask(token, { projectId, title: template.task.title, ...(template.task.workflow ? { workflow: template.task.workflow } : {}), ...rest,
+    // The authority its agent needs, in this project; a caller who cannot grant
+    // it is told whom to ask, as for any task.
+    const level = template.task.authorization?.level;
+    return this.createTask(token, { projectId, title: template.task.title, ...(template.task.workflow ? { workflow: template.task.workflow } : {}),
+      ...(level ? { authorization: { level, scope: 'projects' as const, projectIds: [projectId] } } : {}), ...rest,
       params: { ...template.task.params, prompt: this.storePrompt(template), ...params, template: template.id } });
   }
 
