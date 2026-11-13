@@ -2545,6 +2545,13 @@ html[data-theme="dark"] .lp-light { display: none; }
 }
 
 /* The end: the mark, the brand's line, the one thing to do. */
+/* What people say: three quotes, a step off the page, before the end. */
+.lp-quotes { width: var(--lp-wide); margin: 0 auto; padding: 120px 0 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
+.lp-quote { display: flex; flex-direction: column; margin: 0; padding: 26px 26px 22px; border: 1px solid var(--l-line); border-radius: calc(var(--r) + 4px); background: var(--l-surface); }
+.lp-quote blockquote { margin: 0; font-size: 19px; font-weight: 550; line-height: 1.45; letter-spacing: -.012em; text-wrap: pretty; }
+.lp-quote blockquote::before { content: "“"; display: block; height: 26px; color: var(--l-ink-3); font: 700 44px/1 Georgia, serif; }
+.lp-quote figcaption { margin-top: auto; padding-top: 16px; color: var(--l-ink-3); font-size: var(--fs-14); font-weight: 600; }
+.lp-quote figcaption::before { content: "— "; }
 .lp-end { width: var(--lp-wide); margin: 0 auto; padding: 140px 0 120px; display: flex; flex-direction: column; align-items: center; gap: 22px; text-align: center; }
 .lp-end-mark .mark { width: 64px; height: 64px; border-radius: 16px; box-shadow: 0 6px 20px rgba(0, 0, 0, .16); }
 .lp-end h2 { font-size: clamp(34px, 5vw, 56px); line-height: 1.04; font-weight: 680; letter-spacing: -.035em; font-variation-settings: "opsz" 32; font-optical-sizing: none; }
@@ -2557,6 +2564,7 @@ html[data-theme="dark"] .lp-light { display: none; }
 .landing-footer .landing-brand span { font-size: 16px; }
 
 @media (max-width: 960px) {
+  .lp-quotes { grid-template-columns: minmax(0, 1fr); }
   .lp-auto-grid { grid-template-columns: minmax(0, 1fr); }
   .lp-steps ol, .lp-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .lp-step:last-child { grid-column: 1 / -1; }

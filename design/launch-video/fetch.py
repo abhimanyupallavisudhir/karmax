@@ -58,6 +58,17 @@ open(f'{D}/assets/815-prompt.md', 'w').write(get(f'/api/tasks/{t815}')['messages
 for i in range(8): artifact(t815, i, f'{D}/assets/815/{i}.png')
 artifact(find(821), 0, f'{D}/assets/seo/social-card.png')
 artifact(find(822), 1, f'{D}/assets/822/runbook.md')
+# The agent at work: the real run of the homepage redesign (personal-website), replayed row by row.
+# A row (all its phases) that names anything private, or another organization, is left out.
+def homepage_run():
+    site = next(p for p in projects if p['name'] == 'personal-website')
+    t = get(f"/api/projects/{site['id']}/search?q={urllib.parse.quote('khaki color look')}")['tasks'][0]
+    rows = [e for e in get(f"/api/tasks/{t['id']}/events?since=0&limit=2000") if e['type'] == 'agent.activity']
+    hidden = {e['payload'].get('id') for e in rows if PRIVATE.search(json.dumps(e)) or OTHER.search(json.dumps(e))}
+    keep = [{'ts': e['ts'], 'payload': e['payload']} for e in rows if e['payload'].get('id') not in hidden]
+    json.dump(keep, open(f'{D}/assets/homepage-run.json', 'w'))
+    print('homepage run', len(keep), 'rows', len(hidden), 'left out')
+homepage_run()
 os.makedirs(f'{D}/assets/deploy', exist_ok=True)
 open(f'{D}/assets/deploy/deploy.yml', 'w').write(open(os.path.join(HERE, '../../.github/workflows/deploy.yml')).read())
 
