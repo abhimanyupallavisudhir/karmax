@@ -5986,6 +5986,9 @@ export class Store {
         // remain a deterministic resolver for automated/delegated tasks.
         for (const member of (await this.listOrganizationMemberships(project.organizationId)))
           if (member.role === 'owner') users.push(member.userId);
+        // A project's own vault item is also its maintainers' to decide (owner-authority.ts).
+        if (ev.payload.ownerProjectId && ev.payload.ownerProjectId === task.projectId)
+          users.push(...(await this.humanAudience(task.id, ['@maintainers'])));
       }
     } else if (ev.type === 'permission.approval-requested' || ev.type === 'authorization.approval-requested'
       || ev.type === 'repository-access.approval-requested') {

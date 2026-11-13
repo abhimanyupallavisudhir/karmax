@@ -61,7 +61,7 @@ ok(vaultCards.includes('class="vault-search"'), 'settings manager offers credent
 ok(vaultCards.includes('data-vi-rotate'), 'settings manager retains secret rotation');
 ok(/i\.type === 'session' \? `<label class="vm-exclusive" title="\$\{esc\(SESSION_EXCLUSIVE_TIP\)\}"><input type="checkbox" class="vi-exclusive"/.test(vaultCards), 'a saved session can be limited to one task at a time');
 ok(vaultCards.includes("JSON.stringify({ id: item.id, type: item.type, label: item.label, exclusive: box.checked })"), 'the one-at-a-time toggle saves through the item API');
-ok(/i\.type === 'session' \? '' : `<button type="button" class="icon-btn vm-act" data-vi-rotate=/.test(vaultCards), 'a saved session is refreshed by signing in again, not by typing a secret');
+ok(/i\.type === 'session' \|\| i\.canManage === false \? '' : `<button type="button" class="icon-btn vm-act" data-vi-rotate=/.test(vaultCards), 'a saved session is refreshed by signing in again, not by typing a secret; an item the caller cannot manage offers no update');
 ok(vaultCards.includes('data-vi-reveal'), 'settings manager lets a vault administrator inspect a credential');
 ok(vaultCards.includes('/reveal'), 'settings manager uses the audited administrative reveal endpoint');
 ok(vaultCards.includes('Every reveal is recorded in the audit log'), 'settings manager explains that plaintext inspection is audited');

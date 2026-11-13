@@ -74,6 +74,16 @@ export class ProjectTransfers {
       (await rows('world_leases')).some(r => r.state !== 'released') || (await rows('usage_admissions')).some(r => r.state === 'active'));
     block('previews', 'Revoke live preview links before moving.', (await rows('preview_leases')).some(r => !r.revokedAt && r.expiresAt > Date.now()));
     block('cards', 'Remove project payment cards before moving.', (await s.db.prepare('SELECT 1 FROM cards WHERE scopeId=?').get(projectId)));
+    // A project's own vault items and app accounts are under its organization's
+    // data key and provider identity, which the destination cannot use.
+    block('vault', 'Move this project’s vault items to the organization, or delete them, before moving.',
+      (await s.kvEntries(`vault:items:${project.organizationId}`)).some(({ value }) => {
+        try { return (JSON.parse(value) as Array<{ ownerProjectId?: string }>).some((item) => item.ownerProjectId === projectId); } catch { return true; }
+      }));
+    block('connections', 'Disconnect this project’s app accounts before moving.',
+      (await s.kvEntries('service-connection:')).some(({ value }) => {
+        try { const c = JSON.parse(value) as { ownerProjectId?: string; status?: string }; return c.ownerProjectId === projectId && c.status !== 'disconnected'; } catch { return false; }
+      }));
     block('spending', 'Resolve pending spending requests before moving.', (await rows('payment_spend_requests')).some(r => ['authorizing', 'authorized', 'pending_approval', 'needs_funding'].includes(r.status)));
     block('deletion', 'Wait for deletion to finish before moving this project.',
       (await s.kvGet(`organization-deleting:${project.organizationId}`)) || (await s.kvGet(`organization-deleting:${destinationOrganizationId}`))

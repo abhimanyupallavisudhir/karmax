@@ -20789,7 +20789,7 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header">${scopeTitle('Project settings', proj.name)}</div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><a href="#project">Project</a><a href="#project-agents">Agents</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><a href="#project">Project</a><a href="#project-agents">Agents</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Passwords &amp; payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project"><div>Project</div></div>
     <div class="project-config-section" id="project-git"><div><h2>Git &amp; GitHub ${policyTip('Everyone in this project gets access to its repositories on GitHub automatically.')}</h2></div></div>
     <div class="card"><div id="project-repositories">Loading…</div></div>
@@ -20810,7 +20810,11 @@ function settingsView(proj) {
     <div class="card"><div class="section-h section-h-action"><span>Account order ${policyTip('Tasks in this project use the first available account. Drag to reorder; switch one off to skip it here.')}</span><a class="btn sm ghost organization-settings-link" data-spa href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage accounts</a></div><div id="cred-editor-project">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults</div></div>
     ${settingsForms('project', proj.id)}
-    <div class="settings-section-title" id="project-payments"><div>Payments</div></div>${paymentsCard('project')}
+    <div class="settings-section-title" id="project-payments"><div>Passwords &amp; payments</div></div>
+    <div class="card" id="project-connections"><div class="section-h">Connected apps ${policyTip('Apps this project’s tasks can use. Accounts you connect here belong to the project: its maintainers manage them, and only its tasks use them.')}</div>
+      <div id="project-native-connections">Loading connections…</div></div>
+    ${passwordsCard({ projectId: proj.id })}
+    ${paymentsCard('project')}
     <div class="settings-section-title" id="project-people"><div>People &amp; authorization</div></div>
     <div class="card"><div id="project-access">Loading…</div></div>
     <div class="card"><div id="project-conversation-sharing">Loading…</div></div>
@@ -22089,6 +22093,8 @@ function wireSettingsView(proj) {
   hydrateSettingsAccess({ projectId: proj.id });
   hydrateProjectAccess(proj);
   hydrateProjectEvents(proj);
+  wireVaultCards(proj.organizationId, { projectId: proj.id });
+  hydrateProjectConnections(proj);
   hydrateConversationSharing('project', proj.id);
   hydrateAvatarAvailability('project', proj.id);
   hydrateProjectSecrets(proj);
@@ -23836,7 +23842,9 @@ function connectionRows(connections, inTask = false) {
   const userId = typeof S.user === 'string' ? S.user : S.user?.id;
   return connections.map(c => {
     const own = c.ownerId === userId;
-    const canConnect = !c.ownerId || own;
+    // A project's account is its maintainers' to manage (the server says who).
+    const mine = c.ownerProjectId ? c.canManage !== false : own;
+    const canConnect = c.ownerProjectId ? mine : !c.ownerId || own;
     // The person's own connected accounts, newest first; Allow uses the one picked.
     const reusable = canConnect && c.status === 'requested' ? c.reusable || [] : [];
     const accountNames = connectionAccountNames(reusable);
@@ -23847,7 +23855,7 @@ function connectionRows(connections, inTask = false) {
       <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span>${open && c.dismissed ? ` ${ignoredChip()}` : ''}</div>
         ${c.why && inTask ? `<p class="task-sub">${esc(c.why)}</p>` : ''}
         ${open ? subTaskAskLine(c) : ''}
-        <p class="task-sub">${c.taskId ? 'This account may be used by the requesting task.' : 'Private until you share it with a project.'}</p>
+        <p class="task-sub">${c.ownerProjectId ? 'This project’s account: only its tasks use it.' : c.taskId ? 'This account may be used by the requesting task.' : 'Private until you share it with a project.'}</p>
         ${own && !inTask ? `<details data-unsaved><summary>Project access</summary><p class="task-sub">Selected projects may run app actions using this account, within the permissions you granted at sign-in.</p>
           ${projects.map(p => `<label class="connection-project"><input type="checkbox" value="${esc(p.id)}" ${c.projectIds.includes(p.id) ? 'checked' : ''}> ${esc(p.name)}</label>`).join('')}
           <button type="button" class="btn sm" data-connection-action="access" data-unsaved-save>Save access</button></details>` : ''}
@@ -23856,9 +23864,9 @@ function connectionRows(connections, inTask = false) {
         ${reusable.length > 1 ? `<select class="connection-account" data-connection-account aria-label="Account" title="Your connected accounts, newest first">${reusable.map((account, i) => `<option value="${esc(account.id)}">${esc(accountNames[i])}</option>`).join('')}</select>` : ''}
         ${reusable.length ? `<button type="button" class="btn sm primary" data-connection-action="allow" data-use-connection="${esc(reusable[0].id)}" title="Use your connected account — no new sign-in">Allow</button>` : ''}
         ${canConnect && ['requested', 'connecting', 'expired', 'disconnected'].includes(c.status) ? `<button type="button" class="btn sm${c.status === 'requested' && c.reusable?.length ? '' : ' primary'}" data-connection-action="connect">${c.status === 'expired' ? 'Reconnect' : c.status === 'requested' && c.reusable?.length ? 'Other account' : `Connect${inTask ? ' for this task' : ''}`}</button>` : ''}
-        ${own && c.status === 'connecting' ? '<button type="button" class="btn sm" data-connection-action="restart">Start again</button>' : ''}
-        ${own && !c.grantedConnectionId && ['active', 'connecting'].includes(c.status) ? '<button type="button" class="btn sm" data-connection-action="refresh">Check status</button>' : ''}
-        ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.grantedConnectionId ? 'Revoke' : c.ownerId ? 'Disconnect' : 'Decline'}</button>` : ''}
+        ${mine && c.status === 'connecting' ? '<button type="button" class="btn sm" data-connection-action="restart">Start again</button>' : ''}
+        ${mine && !c.grantedConnectionId && ['active', 'connecting'].includes(c.status) ? '<button type="button" class="btn sm" data-connection-action="refresh">Check status</button>' : ''}
+        ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.grantedConnectionId ? 'Revoke' : c.ownerId || c.ownerProjectId ? 'Disconnect' : 'Decline'}</button>` : ''}
         ${canConnect && inTask && open && !c.dismissed ? ignoreRequestButton('data-connection-action') : ''}
       </div></div>`;
   }).join('');
@@ -23888,9 +23896,10 @@ function connectionAccountNames(accounts) {
   return named.map((name, i) => named.indexOf(name) === named.lastIndexOf(name) ? name : `${accounts[i].label} · ${when(accounts[i], true)}`);
 }
 
-function wireConnectionActions(root, organizationId, refresh) {
+function wireConnectionActions(root, organizationId, refresh, query) {
   if (!root) return;
-  const oq = `?organizationId=${encodeURIComponent(organizationId || '')}`;
+  // A project's page acts within the project, where its maintainers manage its accounts.
+  const oq = query || `?organizationId=${encodeURIComponent(organizationId || '')}`;
   root.querySelectorAll('[data-connection-action]').forEach(button => button.addEventListener('click', async () => {
     const row = button.closest('[data-connection]'); const id = row.dataset.connection;
     const action = button.dataset.connectionAction;
@@ -23967,6 +23976,17 @@ async function hydrateNativeConnections(organizationId) {
   await wireMcpPicker(picker, query);
 }
 
+// A project's Connected apps: the accounts it owns, and those people shared with it.
+// An account connected here is the project's (its maintainers manage it).
+async function hydrateProjectConnections(proj) {
+  const root = document.getElementById('project-native-connections'); if (!root) return;
+  root.innerHTML = `${mcpPickerHtml([], [])}<div class="connected-app-list"></div>`;
+  const picker = root.querySelector('.mcp-picker');
+  picker.dataset.manager = 'true';
+  picker.dataset.ownerProject = proj.id;
+  await wireMcpPicker(picker, mcpScope(proj.id, proj.organizationId));
+}
+
 function connectionScope(query) {
   const params = new URLSearchParams(query);
   const projectId = params.get('projectId');
@@ -23974,12 +23994,14 @@ function connectionScope(query) {
   return { projectId, organizationId, query: `?organizationId=${encodeURIComponent(organizationId)}${projectId ? `&projectId=${encodeURIComponent(projectId)}` : ''}` };
 }
 
-async function openConnectorEditor(query, changed, app, existing) {
+async function openConnectorEditor(query, changed, app, existing, ownerProjectId) {
+  // From a project's Connected apps a new account is the project's own.
+  const forProject = !!ownerProjectId && !existing?.ownerId;
   const scope = connectionScope(query);
   const dialog = document.createElement('dialog'); dialog.className = 'mcp-dialog';
   dialog.setAttribute('aria-label', 'Connect app');
   dialog.innerHTML = `<div class="mcp-dialog-header"><h2>${esc(existing?.label || app?.name || 'Connect app')} <span class="chip">Composio</span></h2><button type="button" class="btn sm connector-close" aria-label="Close">✕</button></div>
-    <p class="task-sub">Sign in with your account, then choose which projects may use it.</p><div class="connector-account"></div>
+    <p class="task-sub">${forProject ? 'Sign in. The account becomes this project’s: only its tasks use it.' : 'Sign in with your account, then choose which projects may use it.'}</p><div class="connector-account"></div>
     <button class="btn primary connector-signin" type="button">${existing ? 'Reconnect' : 'Sign in'}</button>
     <button class="btn connector-check" type="button" hidden>Check status</button>
     <button class="btn primary connector-use" type="button" hidden>Use connection</button><p class="connector-message" role="status"></p>`;
@@ -24002,7 +24024,7 @@ async function openConnectorEditor(query, changed, app, existing) {
     wireConnectionActions(dialog.querySelector('.connector-account'), scope.organizationId, async () => {
       const items = await api(`/api/connections${scope.query}`);
       connection = items.find(c => c.id === connection.id); paint(); await changed();
-    });
+    }, scope.query);
     dialog.querySelector('.connector-signin').hidden = !own();
     dialog.querySelector('.connector-signin').textContent = connection ? 'Reconnect' : 'Sign in';
     dialog.querySelector('.connector-check').hidden = !connection || !own();
@@ -24017,7 +24039,8 @@ async function openConnectorEditor(query, changed, app, existing) {
     const popup = window.open('about:blank', '_blank'); if (popup) popup.opener = null;
     const button = dialog.querySelector('.connector-signin'); button.disabled = true;
     try {
-      const result = await api(`/api/connections/connect${scope.query}`, { method: 'POST', body: JSON.stringify({ id: connection?.id, toolkit: app?.slug, restart: !!connection }) });
+      const result = await api(`/api/connections/connect${scope.query}`, { method: 'POST', body: JSON.stringify({ id: connection?.id, toolkit: app?.slug, restart: !!connection,
+        ...(forProject ? { ownerProjectId } : {}) }) });
       connection = result.connection;
       paint();
       if (result.url) {
@@ -24048,19 +24071,21 @@ async function openConnectorEditor(query, changed, app, existing) {
   await changed();
 }
 
-function passwordsCard() {
-  return `<div class="card" id="vault-card">
-    <div class="section-h">Passwords</div>
+// The vault card: the organization's (with imports), or a project's — its own
+// credentials, which its maintainers manage, and the organization's it may use.
+function passwordsCard({ projectId } = {}) {
+  return `<div class="card" id="vault-card"${projectId ? ` data-project="${esc(projectId)}"` : ''}>
+    <div class="section-h">Passwords${projectId ? ` ${policyTip('This project’s credentials and the organization’s its tasks may use. Its maintainers manage, view and approve requests for the project’s own; only its tasks use them, and they are deleted with it.')}` : ''}</div>
     <div class="vault-risk" role="note">
       <span class="vault-risk-mark" aria-hidden="true">!</span>
-      <span>At your own risk: an agent can leak any password it may see or use. Prefer <a href="#settings-connections">MCP or Composio</a>. ${policyTip(VAULT_RISK_TIP)}</span>
+      <span>At your own risk: an agent can leak any password it may see or use. Prefer <a href="${projectId ? '#project-connections' : '#settings-connections'}">MCP or Composio</a>. ${policyTip(VAULT_RISK_TIP)}</span>
     </div>
     <button type="button" class="btn vault-manage-button" id="vault-manage-open" disabled>
       ${VAULT_TYPE_ICON['api-key']}<span>Vault credentials</span>
       <span class="vault-manage-count">Loading…</span><span class="vm-chevron" aria-hidden="true">›</span>
     </button>
 
-    <div class="section-sub vault-import-h">Import from a password manager
+    ${projectId ? '' : `<div class="section-sub vault-import-h">Import from a password manager
       ${policyTip(`${siteName()} copies the credentials you pick into its own encrypted vault: a snapshot, not a live link, so agents keep working when the password manager is offline and touch only what you chose.`)}</div>
     <div class="setting-rows ruled vault-import-rows">
       <div class="setting-row bitwarden-file-import"><span class="setting-label">Bitwarden export ${policyTip('A one-way import of a Bitwarden JSON export. Nothing is written back to Bitwarden.')}</span>
@@ -24068,7 +24093,7 @@ function passwordsCard() {
         <span class="setting-actions"><input class="bitwarden-file" type="file" accept=".json,application/json" hidden />
         <button class="btn sm" type="button" data-bitwarden-file>Import JSON…</button></span></div>
       <div class="connectors-list setting-rows">Loading…</div>
-    </div>
+    </div>`}
 
     <details class="vault-custom"><summary>Add one by hand</summary>
       <div style="margin-top:8px">
@@ -24095,11 +24120,13 @@ function vaultRequestsCard() {
     <div class="vault-requests-list">Loading…</div>
   </div>`;
 }
-async function wireVaultCards(organizationId) {
+async function wireVaultCards(organizationId, { projectId } = {}) {
   const box = $('#vault-card');
   if (!box) return;
-  // Vault items + requests are organization-scoped; every call carries the org.
-  const oq = organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : '';
+  // Vault items + requests are organization-scoped; every call carries the org,
+  // or within a project the project (its own and the organization's items).
+  const oq = projectId ? `?projectId=${encodeURIComponent(projectId)}`
+    : organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : '';
   const secretRows = () => {
     box.querySelectorAll('.totp-secret-control').forEach((control) => clearTotpQrPreview(control));
     const type = box.querySelector('.vi-type').value;
@@ -24126,6 +24153,11 @@ async function wireVaultCards(organizationId) {
   secretRows();
   box.querySelector('.vi-type').addEventListener('change', secretRows);
   let vaultItems = [];
+  // Whose it is, when that is not the page's own: the organization's on a
+  // project's page, a project's on the organization's.
+  const ownerBadge = (i) => projectId
+    ? (i.ownerProjectId ? '' : '<span class="vm-source vm-owner" title="The organization’s: its tasks here may use it; the organization manages it">organization</span>')
+    : (i.ownerProjectId ? `<span class="vm-source vm-owner" title="This project’s own: only its tasks use it">${esc(projectById(i.ownerProjectId)?.name || 'project')}</span>` : '');
   const sourceBadge = (src) => src?.startsWith('connector:') ? `<span class="vm-source" title="Mirrored from ${esc(src.slice(10))}">${esc(src.slice(10))}</span>`
     : src?.startsWith('import:') ? `<span class="vm-source" title="A one-way import from ${esc(src.slice(7))}: a snapshot that never writes back">${esc(src.slice(7))} import</span>`
     : src?.startsWith('task:') ? '<span class="vm-source" title="Saved by an agent">agent-made</span>' : '';
@@ -24187,7 +24219,8 @@ async function wireVaultCards(organizationId) {
     // The head: Select all over what is shown; "N selected" and the bulk bar once something is.
     const syncSelection = () => {
       for (const id of selected) if (!vaultItems.some((item) => item.id === id)) selected.delete(id);
-      const shown = rowsOf().filter((row) => !row.hidden);
+      // Only what the caller may manage can be ticked (a project's page shows the organization's too).
+      const shown = rowsOf().filter((row) => !row.hidden && !row.querySelector('.vault-manage-pick').disabled);
       const ticked = shown.filter((row) => selected.has(row.dataset.vi)).length;
       all.disabled = !shown.length;
       all.checked = !!shown.length && ticked === shown.length;
@@ -24198,7 +24231,7 @@ async function wireVaultCards(organizationId) {
         row.querySelector('.vault-manage-pick').checked = on;
       });
       overlay.querySelector('.vm-headlabel').textContent = selected.size ? `${selected.size} selected`
-        : shown.length === vaultItems.length ? 'Select all' : `Select ${shown.length} shown`;
+        : shown.length === vaultItems.filter((item) => item.canManage !== false).length ? 'Select all' : `Select ${shown.length} shown`;
       overlay.querySelector('.vm-bulk').hidden = !selected.size;
       overlay.querySelector('.vm-cols').hidden = !!selected.size;
       overlay.querySelector('.vm-total').textContent = vaultItems.length ? String(vaultItems.length) : '';
@@ -24232,20 +24265,20 @@ async function wireVaultCards(organizationId) {
     const paint = () => {
       list.innerHTML = vaultItems.length
         ? sortVaultItems(vaultItems).map((i) => `<div class="vm-row vault-manager-item" data-vi="${esc(i.id)}" data-type="${esc(i.type)}">
-          <input type="checkbox" class="vault-manage-pick" aria-label="Select ${esc(i.label)}" ${selected.has(i.id) ? 'checked' : ''} />
+          <input type="checkbox" class="vault-manage-pick" aria-label="Select ${esc(i.label)}" ${selected.has(i.id) ? 'checked' : ''} ${i.canManage === false ? 'disabled' : ''} />
           <span class="vm-icon" title="${esc(i.type)}" aria-hidden="true">${VAULT_TYPE_ICON[i.type] || VAULT_TYPE_ICON.login}</span>
           <span class="vm-main">
-            <span class="vm-label">${esc(i.label)}${sourceBadge(i.provenance?.source)}</span>
-            <span class="vm-meta">${esc(VAULT_TYPE_LABELS[i.type]?.replace(/s$/, '') || i.type)}${meta(i).map((part) => ` · <span class="mono">${esc(part)}</span>`).join('')}${i.type === 'session' ? `<label class="vm-exclusive" title="${esc(SESSION_EXCLUSIVE_TIP)}"><input type="checkbox" class="vi-exclusive" ${i.exclusive ? 'checked' : ''}>One task at a time</label>` : ''}</span>
+            <span class="vm-label">${esc(i.label)}${ownerBadge(i)}${sourceBadge(i.provenance?.source)}</span>
+            <span class="vm-meta">${esc(VAULT_TYPE_LABELS[i.type]?.replace(/s$/, '') || i.type)}${meta(i).map((part) => ` · <span class="mono">${esc(part)}</span>`).join('')}${i.type === 'session' ? `<label class="vm-exclusive" title="${esc(SESSION_EXCLUSIVE_TIP)}"><input type="checkbox" class="vi-exclusive" ${i.exclusive ? 'checked' : ''} ${i.canManage === false ? 'disabled' : ''}>One task at a time</label>` : ''}</span>
           </span>
           <span class="vm-cols">
-            <select class="vi-pol-use" aria-label="Blind use" title="${esc(POL_USE_TIP)}">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select>
-            <select class="vi-pol-reveal" aria-label="Agent sees" title="${esc(POL_REVEAL_TIP)}">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select>
+            <select class="vi-pol-use" aria-label="Blind use" title="${esc(POL_USE_TIP)}" ${i.canManage === false ? 'disabled' : ''}>${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select>
+            <select class="vi-pol-reveal" aria-label="Agent sees" title="${esc(POL_REVEAL_TIP)}" ${i.canManage === false ? 'disabled' : ''}>${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select>
           </span>
           <span class="vm-actions">
-            <button type="button" class="icon-btn vm-act" data-vi-reveal="${esc(i.id)}" aria-label="View" title="${i.canReveal === false ? 'Viewing secrets needs Super-administrator authorization' : 'View a stored field (audited)'}" ${(i.fields || []).length && i.canReveal !== false ? '' : 'disabled'}>${VAULT_ACTION_ICON.view}</button>
-            ${i.type === 'session' ? '' : `<button type="button" class="icon-btn vm-act" data-vi-rotate="${esc(i.id)}" aria-label="Update secret" title="Replace the stored secret (metadata unchanged)">${VAULT_ACTION_ICON.rotate}</button>`}
-            <button type="button" class="icon-btn vm-act danger" data-vi-del="${esc(i.id)}" aria-label="Delete" title="Delete">${VAULT_ACTION_ICON.delete}</button>
+            <button type="button" class="icon-btn vm-act" data-vi-reveal="${esc(i.id)}" aria-label="View" title="${i.canReveal === false ? (i.ownerProjectId ? 'Viewing it needs this project’s maintainers' : 'Viewing it needs the organization’s Super-administrators') : 'View a stored field (audited)'}" ${(i.fields || []).length && i.canReveal !== false ? '' : 'disabled'}>${VAULT_ACTION_ICON.view}</button>
+            ${i.type === 'session' || i.canManage === false ? '' : `<button type="button" class="icon-btn vm-act" data-vi-rotate="${esc(i.id)}" aria-label="Update secret" title="Replace the stored secret (metadata unchanged)">${VAULT_ACTION_ICON.rotate}</button>`}
+            ${i.canManage === false ? '' : `<button type="button" class="icon-btn vm-act danger" data-vi-del="${esc(i.id)}" aria-label="Delete" title="Delete">${VAULT_ACTION_ICON.delete}</button>`}
           </span>
           <div class="vault-reveal-panel" hidden>
             <select class="vi-reveal-field" aria-label="Stored field">${(i.fields || []).map((field) => `<option value="${esc(field)}">${esc(field)}</option>`).join('')}</select>
@@ -24414,7 +24447,7 @@ async function wireVaultCards(organizationId) {
     }
     overlay.querySelector('[data-vm-bulk-clear]').addEventListener('click', () => { selected.clear(); syncSelection(); search.focus(); });
     all.addEventListener('change', () => {
-      rowsOf().filter((row) => !row.hidden).forEach((row) => { if (all.checked) selected.add(row.dataset.vi); else selected.delete(row.dataset.vi); });
+      rowsOf().filter((row) => !row.hidden && !row.querySelector('.vault-manage-pick').disabled).forEach((row) => { if (all.checked) selected.add(row.dataset.vi); else selected.delete(row.dataset.vi); });
       syncSelection();
     });
     overlay.querySelector('.vm-types').addEventListener('click', (event) => {
@@ -24454,8 +24487,8 @@ async function wireVaultCards(organizationId) {
   // uploaded export to a temporary file.
   const bitwardenFile = box.querySelector('.bitwarden-file');
   const bitwardenButton = box.querySelector('[data-bitwarden-file]');
-  bitwardenButton.addEventListener('click', () => bitwardenFile.click());
-  bitwardenFile.addEventListener('change', async () => {
+  bitwardenButton?.addEventListener('click', () => bitwardenFile.click());
+  bitwardenFile?.addEventListener('change', async () => {
     const file = bitwardenFile.files?.[0];
     if (!file) return;
     if (file.size > 50 * 1024 * 1024) {
@@ -29440,7 +29473,7 @@ async function wireMcpPicker(picker, query = mcpScope()) {
       if (saved && !manager) { selected.add(saved.id); change(); }
       await reload();
       for (const other of document.querySelectorAll('.mcp-picker')) if (other !== picker && other.dataset.scope === query) wireMcpPicker(other, query);
-    }, app, existing);
+    }, app, existing, picker.dataset.ownerProject);
   }
   function expand(open) {
     menu.hidden = !open; input.setAttribute('aria-expanded', String(open));
@@ -29481,7 +29514,7 @@ async function wireMcpPicker(picker, query = mcpScope()) {
       const list = picker.parentElement.querySelector('.connected-app-list');
       const ownId = typeof S.user === 'string' ? S.user : S.user?.id;
       list.innerHTML = connections.map(c => `<div class="approval-request" data-connection="${esc(c.connector?.id || c.id)}"><span>${esc(c.label)} <span class="chip">${c.connector ? 'Composio' : 'MCP'} · ${c.connected ? 'connected' : 'needs connection'}</span></span><div class="approval-request-actions"><button type="button" class="btn sm" data-manage="${esc(c.id)}">Manage</button>
-        ${!c.connector || c.connector.ownerId === ownId ? `${c.connector || c.auth === 'oauth' ? `<button type="button" class="btn sm" data-reconnect="${esc(c.id)}">Reconnect</button>` : ''}<button type="button" class="btn sm" ${c.connector ? 'data-connection-action="disconnect"' : `data-native-disconnect="${esc(c.id)}"`}>Disconnect</button>` : ''}<span data-connection-result role="status"></span></div></div>`).join('');
+        ${!c.connector || c.connector.ownerId === ownId || c.connector.canManage ? `${c.connector || c.auth === 'oauth' ? `<button type="button" class="btn sm" data-reconnect="${esc(c.id)}">Reconnect</button>` : ''}<button type="button" class="btn sm" ${c.connector ? 'data-connection-action="disconnect"' : `data-native-disconnect="${esc(c.id)}"`}>Disconnect</button>` : ''}<span data-connection-result role="status"></span></div></div>`).join('');
       list.querySelectorAll('[data-manage]').forEach(button => button.onclick = () => { const c = connections.find(c => c.id === button.dataset.manage); c.connector ? connector(undefined, c.connector) : install(undefined, c); });
       list.querySelectorAll('[data-reconnect]').forEach(button => button.onclick = () => { const c = connections.find(c => c.id === button.dataset.reconnect); c.connector ? connector(undefined, c.connector) : openMcpEditor(query, reload, undefined, c, true); });
       list.querySelectorAll('[data-native-disconnect]').forEach(button => button.onclick = async () => {
@@ -29489,7 +29522,7 @@ async function wireMcpPicker(picker, query = mcpScope()) {
         try { await api(`/api/mcp/${button.dataset.nativeDisconnect}${query}`, { method: 'DELETE' }); await reload(); }
         catch (error) { toast(error.message, true); }
       });
-      wireConnectionActions(list, scope.organizationId, reload);
+      wireConnectionActions(list, scope.organizationId, reload, scope.query);
     }
     const registry = servers.filter(s => !connections.some(c => c.registry?.name === s.name));
     options.innerHTML = saved.map(c => `<div class="mcp-option-row"><button type="button" role="option" id="${options.id}-${index++}" aria-selected="${selected.has(c.id)}" aria-disabled="${!c.enabled && !selected.has(c.id)}" data-mcp-id="${esc(c.id)}"><span>${esc(c.label)}${c.connector ? '<small>Composio</small>' : c.id.startsWith('mcp_') ? '<small>MCP</small>' : ''}${!c.enabled ? '<small>Unavailable</small>' : c.connected === false ? '<small>Needs sign-in</small>' : ''}</span><span>${selected.has(c.id) ? '✓' : ''}</span></button>${!c.id.startsWith('browser:') ? `<button type="button" class="mcp-edit" data-edit="${esc(c.id)}" aria-label="Manage ${esc(c.label)}">Manage</button>` : ''}</div>`).join('')

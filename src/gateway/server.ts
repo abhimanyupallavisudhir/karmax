@@ -96,6 +96,7 @@ import { ARTIFICIAL_ANALYSIS_KEY_ENV, ArtificialAnalysis, toBenchmarks, type Mod
 import type { IdentityService } from '../auth/identity.js';
 import type { RepositoryFiles } from '../store/project-environment.js';
 import { AuthorizationGrantError, ORGANIZATION_GRANT_CEILING, type AuthorizationService } from '../platform/authorization.js';
+import { ORGANIZATION_OWNER_CAPABILITY, PROJECT_OWNER_CAPABILITY, type OwnerPower } from '../platform/owner-authority.js';
 import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, ORGANIZATION_WIKI_WRITE_DENIED, allows, type Capability } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { EXPLANATIONS_ENABLED, RESOLVE_AGENT_ENABLED } from '../config/features.js';
@@ -345,7 +346,10 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // which also lets a sub-task's parent decline one (src/platform/sub-task-asks.ts).
   if (/^\/api\/vault\/requests\/[^/]+\/resolve$/.test(p)) return 'credential:read';
   if (p === '/api/vault/import/bitwarden') return 'credential:write';
-  if (p.startsWith('/api/vault/items')) return read ? 'credential:read' : 'credential:write';
+  // A project's own items are its settings (owner-authority.ts): the handler
+  // then checks the item is that project's, or that the caller holds the
+  // organization's vault authority for it.
+  if (p.startsWith('/api/vault/items')) return read ? 'credential:read' : url?.searchParams.get('projectId') ? 'project:settings:write' : 'credential:write';
   // Connectors: describe is read; connect/sync/config/write-back are admin.
   if (p.startsWith('/api/vault/connectors')) return read ? 'credential:read' : 'credential:write';
   if (p.startsWith('/api/vault')) return 'credential:read';
@@ -7512,6 +7516,11 @@ export class Gateway {
         const projectId = task?.projectId ?? url.searchParams.get('projectId') ?? undefined;
         if (!task && projectId && ((await store.getProject(projectId))?.organizationId !== org || !(await this.deps.tokens.check(token, 'project:read', { projectId, organizationId: org })).ok)) return this.json(res, 403, { error: 'Project access denied' });
         const b = ['POST', 'PUT'].includes(method) ? await this.body(req) : {};
+        // A project's own accounts are its maintainers' — people and agents alike
+        // (owner-authority.ts): whoever may write that project's settings.
+        const maintains = async (owner: string | undefined) => !!owner
+          && (await this.deps.tokens.check(token, PROJECT_OWNER_CAPABILITY, { projectId: owner, organizationId: org })).ok;
+        const actingPrincipal = callerTaskId ? `task:${callerTaskId}` : ownerId;
         try {
           if (p === '/api/connections/config') {
             if (method === 'PUT') await service.configure(String(b.apiKey ?? ''));
@@ -7520,8 +7529,10 @@ export class Gateway {
           if (p === '/api/connections/catalog' && method === 'GET')
             return this.json(res, 200, await service.catalog(url.searchParams.get('search') ?? ''));
           if (p === '/api/connections' && method === 'GET') {
-            if (!taskId && !ownerId) requireOwner();
-            const listed = (await service.list(org, { ownerId, taskId, projectId }));
+            // A person lists their own accounts; anyone reading a project, the project's.
+            if (!taskId && !ownerId && !projectId) requireOwner();
+            const listed = await Promise.all((await service.list(org, { ownerId, taskId, projectId })).map(async (c) =>
+              ({ ...c, canManage: c.ownerProjectId ? await maintains(c.ownerProjectId) : !!ownerId && c.ownerId === ownerId })));
             // A person answering a task request may reuse their own connected account.
             if (!callerTaskId && ownerId && taskId) for (const c of listed as Array<typeof listed[number] & { reusable?: unknown }>)
               if (c.status === 'requested' && (!c.ownerId || c.ownerId === ownerId))
@@ -7547,10 +7558,26 @@ export class Gateway {
             }
             // A sub-task's new request comes through its parent, whose agent is told (src/platform/sub-task-asks.ts).
             if (c.via && c.status === 'requested' && c.taskId === task.id && !opened.has(c.id)) await api.tellParentOf(task.id, { connection: c });
+            // An autonomous project's Avatār may connect it for the project or decline it (wiki features/autonomy).
+            // Best effort: people are told of the request either way.
+            if (c.status === 'requested' && c.taskId === task.id && !opened.has(c.id) && typeof api.routeConnectionRequest === 'function')
+              await api.routeConnectionRequest(token, c).catch((error: unknown) =>
+                console.warn(`[autonomy] could not route connection request ${c.id} to the Avatār:`, error instanceof Error ? error.message : error));
             return this.json(res, 200, { status: c.status === 'denied' || c.status === 'disconnected' ? 'denied' : 'needs_connection',
               connection: service.view(c), detail: 'A Connect button is available in this task’s Approval Requests. Continue independent work; the task resumes after sign-in.' });
           }
           if (p === '/api/connections/connect' && method === 'POST') {
+            const target = b.id ? (await service.get(org, String(b.id))) : undefined;
+            const ownerProjectId = typeof b.ownerProjectId === 'string' && b.ownerProjectId ? b.ownerProjectId : target?.ownerProjectId;
+            if (ownerProjectId) {
+              // The project's account: its maintainers connect it, agents included.
+              if (!(await maintains(ownerProjectId))) return this.json(res, 403, { error: 'Only this project’s maintainers can connect its accounts' });
+              const origin = process.env.KARMAX_PUBLIC_URL ?? (hostLocal() ? url.origin : undefined);
+              const result = await service.connect(org, callerTaskId ? undefined : ownerId, { id: b.id, toolkit: b.toolkit, label: b.label, restart: b.restart === true,
+                ownerProjectId, redirect: origin ? new URL('/mcp-callback', origin).href : undefined });
+              if (result.connection.status === 'active') this.sweepConnections();
+              return this.json(res, 200, result);
+            }
             const userId = requireOwner();
             if (callerTaskId) return this.json(res, 403, { error: 'Connect accounts from the Connections or task page' });
             if (b.id) {
@@ -7585,10 +7612,33 @@ export class Gateway {
                   return this.json(res, 400, { error: 'arguments must be an object' });
                 return this.json(res, 200, await withTiming(trace, () => trace.measure('service.execution', () => service.execute(org, id, callerTaskId, projectId, String(b.tool ?? ''), b.arguments), undefined, undefined, toolFailed)));
               }
+            } else if (c.ownerProjectId) {
+              // The project's account is its maintainers', people and agents alike.
+              if (!(await maintains(c.ownerProjectId))) return this.json(res, 403, { error: 'Only this project’s maintainers can manage its accounts' });
+              if (action === 'callback' && method === 'POST') {
+                const result = await service.finishMcp(org, id, callerTaskId ? undefined : ownerId, b.state, b.code); this.sweepConnections();
+                return this.json(res, 200, result);
+              }
+              if (action === 'refresh' && method === 'POST') { const result = await service.refresh(org, id); this.sweepConnections(); return this.json(res, 200, service.view(result)); }
+              if (action === 'access' && method === 'PUT') return this.json(res, 200, await service.share(org, id, ownerId ?? '', []));
+              if (action === 'disconnect' && method === 'POST') { const result = await service.disconnect(org, id, actingPrincipal); this.sweepConnections(); return this.json(res, 200, result); }
+              if (action === 'dismiss' && method === 'POST') {
+                const dismissed = (await service.dismiss(org, id, actingPrincipal ? (callerTaskId ? actingPrincipal : `user:${actingPrincipal}`) : 'system'));
+                if (dismissed.taskId) (await this.deps.api.connectionsChanged(dismissed.taskId).catch(() => undefined));
+                return this.json(res, 200, dismissed);
+              }
             } else if (callerTaskId && action === 'disconnect' && method === 'POST' && !c.ownerId && c.taskId
               && OPEN_CONNECTION.includes(c.status) && (await store.getTask(c.taskId))?.parentTaskId === callerTaskId) {
               // A sub-task's request is its parent's to decline (src/platform/sub-task-asks.ts).
               return this.json(res, 200, await service.disconnect(org, id, `task:${callerTaskId}`));
+            } else if (callerTaskId && ['disconnect', 'dismiss'].includes(action) && method === 'POST' && !c.ownerId && c.taskId
+              && OPEN_CONNECTION.includes(c.status) && (await maintains((await store.getTask(c.taskId))?.projectId))) {
+              // A request of a project's task is also its maintainers' to decline or ignore —
+              // an autonomous project's Avatār among them (wiki features/autonomy).
+              if (action === 'disconnect') return this.json(res, 200, await service.disconnect(org, id, `task:${callerTaskId}`));
+              const dismissed = (await service.dismiss(org, id, `task:${callerTaskId}`));
+              (await this.deps.api.connectionsChanged(c.taskId).catch(() => undefined));
+              return this.json(res, 200, dismissed);
             } else {
               const userId = requireOwner();
               if (callerTaskId || (c.ownerId !== userId && !(['disconnect', 'dismiss'].includes(action) && !c.ownerId && c.taskId && (await this.deps.tokens.check(token, 'task:edit', { projectId: (await store.getTask(c.taskId))?.projectId, organizationId: org })).ok))) return this.json(res, 403, { error: 'Only the connection owner can manage this account' });
@@ -7632,7 +7682,22 @@ export class Gateway {
         // is authoritative and cannot be spoofed — auth() validated it against
         // membership; the query-param org only ever narrows within it.
         const organizationId = authRecord?.organizationId ?? requestedScope.organizationId ?? 'org_personal';
-        const vault = new VaultItems(store, this.deps.broker, undefined, organizationId, authRecord?.participant);
+        // The project the caller acts within — a task's own, or the one a person
+        // named — sees the organization's items and its own, no other project's.
+        const scopeProject = requestedScope.projectId ?? authRecord?.projectId;
+        const vault = new VaultItems(store, this.deps.broker, undefined, organizationId, authRecord?.participant, scopeProject);
+        // Authority over an item is its owner's (owner-authority.ts): the
+        // organization's vault capability, or for a project's own item writing
+        // that project's settings.
+        const ownerPower = async (owner: string | undefined, power: OwnerPower) =>
+          (await this.deps.tokens.check(token, ORGANIZATION_OWNER_CAPABILITY[power], { organizationId })).ok
+          || (!!owner && (await this.deps.tokens.check(token, PROJECT_OWNER_CAPABILITY, { projectId: owner, organizationId })).ok);
+        const ownerRefusal = async (owner: string | undefined, power: OwnerPower, doing: string) => {
+          if (await ownerPower(owner, power)) return undefined;
+          const refused = (await this.refusal(token, ORGANIZATION_OWNER_CAPABILITY[power], { organizationId }))
+            ?? `missing capability ${ORGANIZATION_OWNER_CAPABILITY[power]}`;
+          return `You cannot ${doing}: ${refused}${owner ? ' Its project’s maintainers may.' : ''}`;
+        };
         const caps = authRecord?.caps ?? [];
         // A human session's token is task-unscoped; per-task passes/extensions
         // only ever apply to real task-agent bearers.
@@ -7678,14 +7743,17 @@ export class Gateway {
             ...(suggestions.length ? { suggestions } : {}),
           };
         };
-        // Reading the vault regardless of item policy is Super-administrator authority.
-        const vaultReadRefusal = async (doing: string) => {
-          const refused = (await this.refusal(token, 'credential:reveal', { organizationId }));
-          return refused ? `You cannot ${doing}: ${refused}` : undefined;
-        };
+        // Reading an item regardless of its policy is its owner's read authority:
+        // the organization's Super-administrators, or a project's maintainers for its own.
         const editRefusal = async (prior: VaultItem | undefined, next: { policy?: any; domains?: string[] }) => {
           const weakens = prior ? weakensProtection(prior, next) : undefined;
-          return weakens ? (await vaultReadRefusal(weakens)) : undefined;
+          return weakens ? (await ownerRefusal(prior!.ownerProjectId, 'reveal', weakens)) : undefined;
+        };
+        /** A project of this organization, named as an owner. */
+        const ownerProject = async (value: unknown): Promise<string | null | undefined | Error> => {
+          if (value === null || value === '') return null;
+          if (typeof value !== 'string') return new Error('ownerProjectId must be a project id or null');
+          return (await store.getProject(value))?.organizationId === organizationId ? value : new Error(`no project ${value} in this organization`);
         };
 
         if (p === '/api/vault/import/bitwarden' && method === 'POST') {
@@ -7732,16 +7800,36 @@ export class Gateway {
           return this.json(res, 200, (await __asyncCollections.map((await __asyncCollections.filter((await vault.list()), async (item) => (await vault.covered(caps, callerTaskId, item)))), itemSummary)));
         }
         if (p === '/api/vault/items' && method === 'GET') {
-          const canReveal = (await this.deps.tokens.check(token, 'credential:reveal', { organizationId })).ok;
-          return this.json(res, 200, (await vault.listForSelection()).map((item) => ({ ...item, canReveal })));
+          // What the caller may do with each, by owner, so the console offers only that.
+          const powers = new Map<string, Promise<{ canManage: boolean; canReveal: boolean }>>();
+          const powersOf = (owner: string | undefined) => powers.get(owner ?? '') ?? powers.set(owner ?? '', (async () => ({
+            canManage: await ownerPower(owner, 'manage'), canReveal: await ownerPower(owner, 'reveal') }))()).get(owner ?? '')!;
+          return this.json(res, 200, await Promise.all((await vault.listForSelection()).map(async (item) => ({ ...item, ...(await powersOf(item.ownerProjectId)) }))));
         }
         if (p === '/api/vault/items' && method === 'POST') {
           const b = await this.body(req);
           const domains = Array.isArray(b.domains) ? b.domains.map(String) : typeof b.domains === 'string' ? b.domains.split(/[,\s]+/).filter(Boolean) : undefined;
-          const refused = (await editRefusal(b.id ? (await vault.get(String(b.id))) : undefined, { policy: b.policy, domains }));
+          const prior = b.id ? (await vault.get(String(b.id))) : undefined;
+          if (b.id && !prior) return this.json(res, 404, { error: `no vault item ${b.id}` });
+          // A new item belongs where it is made — a project's settings make the
+          // project's — unless the caller names an owner.
+          const named = Object.prototype.hasOwnProperty.call(b, 'ownerProjectId') ? (await ownerProject(b.ownerProjectId)) : undefined;
+          if (named instanceof Error) return this.json(res, 400, { error: named.message });
+          const owner = prior ? prior.ownerProjectId : named === undefined ? requestedScope.projectId : named ?? undefined;
+          const unmanaged = (await ownerRefusal(owner, 'manage', prior ? `change "${prior.label}"` : 'add a credential there'));
+          if (unmanaged) return this.json(res, 403, { error: unmanaged });
+          // Moving an item changes who sees, uses and decides it: the organization's call.
+          const moves = !!prior && named !== undefined && (named ?? undefined) !== prior.ownerProjectId;
+          if (moves) {
+            const refused = (await ownerRefusal(undefined, 'manage', `move "${prior!.label}"`))
+              ?? (named ? (await ownerRefusal(named, 'manage', `move "${prior!.label}" there`)) : undefined);
+            if (refused) return this.json(res, 403, { error: refused });
+          }
+          const refused = (await editRefusal(prior, { policy: b.policy, domains }));
           if (refused) return this.json(res, 403, { error: refused });
           const saved = (await vault.save({
             id: b.id ? String(b.id) : undefined,
+            ...(prior ? (moves ? { ownerProjectId: named ?? null } : {}) : owner ? { ownerProjectId: owner } : {}),
             type: vaultItemType(b.type),
             label: String(b.label ?? ''),
             domains,
@@ -7776,7 +7864,7 @@ export class Gateway {
         if (viReveal && method === 'POST') {
           const item = (await vault.get(viReveal[1]!));
           if (!item) return this.json(res, 404, { error: `no vault item ${viReveal[1]}` });
-          const refused = (await vaultReadRefusal(`reveal "${item.label}"`));
+          const refused = (await ownerRefusal(item.ownerProjectId, 'reveal', `reveal "${item.label}"`));
           if (refused) return this.json(res, 403, { error: refused });
           const b = await this.body(req);
           const field = String(b.field ?? defaultField(item.type)) as any;
@@ -7790,7 +7878,14 @@ export class Gateway {
         }
         const viDel = p.match(/^\/api\/vault\/items\/([^/]+)$/);
         if (viDel && method === 'DELETE') {
-          (await vault.delete(viDel[1]!));
+          const item = (await vault.get(viDel[1]!));
+          if (item) {
+            const refused = (await ownerRefusal(item.ownerProjectId, 'manage', `delete "${item.label}"`));
+            if (refused) return this.json(res, 403, { error: refused });
+            (await vault.delete(item.id));
+          } else if (scopeProject && (await new VaultItems(store, undefined, undefined, organizationId).get(viDel[1]!)))
+            // Another project's item is not this caller's to know of, let alone delete.
+            return this.json(res, 404, { error: `no vault item ${viDel[1]}` });
           return this.json(res, 200, { deleted: true });
         }
         // Agent write-back (§7 store_credential). Two distinct powers:
@@ -7807,7 +7902,19 @@ export class Gateway {
           if (!callerTaskId && !allows(caps, 'credential:write')) return this.json(res, 400, { error: 'a task-agent token is required' });
           const prior = b.id ? (await vault.get(String(b.id))) : undefined;
           if (b.id && !prior) return this.json(res, 404, { error: `no vault item ${b.id}` });
-          const ownItem = !prior || !callerTaskId || prior.provenance.taskId === callerTaskId || allows(caps, 'credential:write');
+          const ownItem = !prior || !callerTaskId || prior.provenance.taskId === callerTaskId || (await ownerPower(prior.ownerProjectId, 'manage'));
+          // A credential an agent stores belongs to its task's project (its
+          // maintainers decide and read it; it goes with the project), unless
+          // the caller names an owner it manages.
+          const taskProject = callerTaskId ? (await store.taskProjectIdAsync(callerTaskId)) : undefined;
+          let storedOwner = prior ? undefined : taskProject ?? requestedScope.projectId;
+          if (!prior && Object.prototype.hasOwnProperty.call(b, 'ownerProjectId')) {
+            const named = (await ownerProject(b.ownerProjectId));
+            if (named instanceof Error) return this.json(res, 400, { error: named.message });
+            storedOwner = named ?? undefined;
+            const refused = storedOwner === taskProject && storedOwner ? undefined : (await ownerRefusal(storedOwner, 'manage', 'store a credential there'));
+            if (refused) return this.json(res, 403, { error: refused });
+          }
           let saved;
           if (ownItem) {
             // An item this task created holds a secret it already knows.
@@ -7817,6 +7924,7 @@ export class Gateway {
             }
             saved = (await vault.save({
               id: prior?.id,
+              ...(storedOwner ? { ownerProjectId: storedOwner } : {}),
               type: vaultItemType(b.type),
               label: String(b.label ?? ''),
               domains: Array.isArray(b.domains) ? b.domains.map(String) : undefined,
@@ -7948,10 +8056,14 @@ export class Gateway {
           }
         }
         if (p === '/api/vault/requests' && method === 'GET') {
-          return this.json(res, 200, (await __asyncCollections.map((await vault.requests({
+          const requests = (await vault.requests({
             taskId: url.searchParams.get('taskId') ?? undefined,
             status: (url.searchParams.get('status') as any) ?? undefined,
-          })), async (request) => (await this.credentialRequestView(request, organizationId)))));
+          }));
+          // Within a project, its own tasks' requests only.
+          const shown = scopeProject ? (await __asyncCollections.filter(requests, async (request) =>
+            (await store.taskProjectIdAsync(request.taskId)) === scopeProject)) : requests;
+          return this.json(res, 200, (await __asyncCollections.map(shown, async (request) => (await this.credentialRequestView(request, organizationId)))));
         }
         // The pull model (§7): an agent escalates for an item it lacks.
         if (p === '/api/vault/requests' && method === 'POST') {
@@ -7977,12 +8089,16 @@ export class Gateway {
           const b = await this.body(req);
           const action = String(b.action ?? '');
           if (!['once', 'task', 'always', 'deny', 'dismiss'].includes(action)) return this.json(res, 400, { error: 'action must be once | task | always | deny | dismiss' });
+          const asking = (await vault.requests()).find((candidate) => candidate.id === vres[1]);
           const unwritable = (await this.refusal(token, 'credential:write', requestedScope));
           if (unwritable) {
-            const asking = (await vault.requests()).find((candidate) => candidate.id === vres[1]);
             const parentDeclines = action === 'deny' && !!callerTaskId && !!asking
               && (await store.getTask(asking.taskId))?.parentTaskId === callerTaskId;
-            if (!parentDeclines) return this.json(res, 403, { error: unwritable });
+            // A project's maintainers decide what its tasks ask for: they may
+            // refuse anything, and approve what the project owns (below).
+            const maintainsAsker = !!asking && (await this.deps.tokens.check(token, PROJECT_OWNER_CAPABILITY,
+              { projectId: await store.taskProjectIdAsync(asking.taskId), organizationId })).ok;
+            if (!parentDeclines && !maintainsAsker) return this.json(res, 403, { error: unwritable });
           }
           if (action === 'dismiss') {
             // Silencing an ask is for whoever it would notify, never the agent asking.
@@ -7999,9 +8115,13 @@ export class Gateway {
               return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
             }
           }
-          // Approving hands the requester the secret; anyone who manages credentials may refuse.
+          // Approving hands the requester the secret: its owner's read authority.
+          // Anyone who decides for the asking task may refuse.
           if (action !== 'deny') {
-            const refused = (await vaultReadRefusal('approve credential requests'));
+            const itemId = asking?.itemId ?? (b.itemId ? String(b.itemId) : undefined);
+            const item = itemId ? (await vault.get(itemId)) : undefined;
+            if (!item) return this.json(res, 400, { error: 'bind this request to a vault item first (add the item, then resolve with its itemId)' });
+            const refused = (await ownerRefusal(item.ownerProjectId, 'reveal', 'approve credential requests'));
             if (refused) return this.json(res, 403, { error: refused });
           }
           try {
@@ -8044,7 +8164,7 @@ export class Gateway {
             const exports = ['connect', 'write-back', 'retry-write-back', 'retry-writes'].includes(action ?? '')
               || (action === 'config' && b.writeBack === true) || (action === 'sync' && b.writeBack === true);
             if (exports) {
-              const refused = (await vaultReadRefusal(`connect a password store the vault is copied to`));
+              const refused = (await ownerRefusal(undefined, 'reveal', `connect a password store the vault is copied to`));
               if (refused) return this.json(res, 403, { error: refused });
             }
             try {
@@ -10233,6 +10353,11 @@ export class Gateway {
     if (resources.objectKeys.length && !this.deps.objects)
       throw new Error('object store is unavailable; project resources were not fully deleted');
     for (const key of resources.objectKeys) await this.deps.objects!.delete(key);
+    // What the project owns of the organization's credentials goes with it:
+    // its vault items, its app accounts (signed out at the provider), its tasks' requests.
+    const { deleteProjectCredentials } = await import('../autonomy/cleanup.js');
+    await deleteProjectCredentials(this.deps.store, this.deps.broker, project.organizationId ?? 'org_personal', projectId,
+      { connections: this.connections() });
     return resources;
   }
 
