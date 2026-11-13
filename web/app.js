@@ -7304,7 +7304,8 @@ async function loadTaskStore(projectId, { force = false } = {}) {
   return loading;
 }
 
-const STORE_NEEDS = { github: ['Needs GitHub', 'Connect a GitHub repository to this project first'], chat: ['Needs a chat bot', 'Connect a chat bot to this project first'] };
+const STORE_NEEDS = { github: ['Needs GitHub', 'Connect a GitHub repository to this project first'], chat: ['Needs a chat bot', 'Connect a chat bot to this project first'],
+  repository: ['Needs a repository', 'Add a repository to this project first'] };
 // What the project lacks for it, unless it already has it.
 function storeNeed(item) {
   return !(item.repeatable && item.installed?.length) && item.missing?.length ? STORE_NEEDS[item.missing[0]] : null;
@@ -7473,7 +7474,12 @@ function wireTaskStore() {
       if (run) { toast('Installed'); go(taskUrl(run.id, run)); }
       else if (item?.repeatable) { toast('Installed'); renderMain(); }
       else go(taskUrl(task.id, task));
-    } catch (e) { button.disabled = false; showTaskError(e, projectId); }
+    } catch (e) {
+      button.disabled = false;
+      // It needs more authority than this person can grant: its form asks whom to ask.
+      if (isAuthorizationGrantGap(e)) return go(storeTaskRoute(projectId, button.dataset.storeRun));
+      showTaskError(e, projectId);
+    }
   }));
 }
 
@@ -9896,7 +9902,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   });
   const projectOrganizationId = S.projects.find((project) => project.id === projectId)?.organizationId;
   const authorizationProjects = S.projects.filter((project) => project.organizationId === projectOrganizationId);
-  const storedAuthorization = draft?.params?._authorization || seed?.authorization || {};
+  const storedAuthorization = draft?.params?._authorization || seed?.authorization || store?.task?.authorization || {};
   const selectedAuthorization = normalizedAuthorization({
     level: storedAuthorization.level || storedAuthorization.profileId || 'developer',
     scope: storedAuthorization.scope || 'projects',
