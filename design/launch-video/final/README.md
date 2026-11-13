@@ -9,10 +9,10 @@ from this folder's demo clone. Owner's structure (2026-11-13):
 | 0 | Title: "Do *anything* with agents." | |
 | 1 | Every project. *One list.* | pills "Code, apps, websites", "Research", "Random admin work", one at a time |
 | 2 | Say *what needs doing.* | this film's own task typed: "Create a launch video for tavya.io…" |
-| 3 | Agents work on *their own computers.* | that task's steps arriving |
+| 3 | Agents work on *their own computers.* | that task's run streaming in: ~30 rows (wiki, snapshot, clone, capture, stills, a fix, render, measurements), scripted in `../script.py` |
 | 4 | Big jobs *fan out.* | #367's 25 sub-tasks |
 | 5 | Give agents *accounts, keys and a card.* | the vault |
-| 6 | Review the *result,* and approve. | large line "(or leave the review to an agent)"; the task's attached mp4 opened (its first frame drawn as this film's title card), then Confirm |
+| 6 | Review the *result,* and approve. | large line "(or leave the review to an agent)"; the task's attached mp4 opened (its first frame drawn as this film's title card), then Confirm; the run reads "Worked 2 h 40 min" (the mock's took seconds) |
 | 7 | Build the *autonomous company.* | large line "Agents can create, manage and approve tasks." over the autonomous-project toggle (task #918, mocked) and a review route turned to Agent; then "Tasks can auto-run on schedules, events or dependencies." over "Created Task #183: Fix errors in deployment…", then Update dependencies, Maintain the project wiki and Dream (mocked) |
 | 8 | Any model. *Your subscription.* | the model picker |
 | 9 | Not just *code.* | pills "Papers." "Websites." "Images and video." "Chores." with a paper (title page + a page with its figures), tavya.io, an AI image, a film still, the booked flight |
@@ -23,6 +23,7 @@ python3 ../fetch.py && bash ../build.sh                          # the clone (DE
 FILM=<previous film>.mp4 DIRECTOR=final/capture.cjs bash ../record.sh /tmp/demo/final-assets ['shot-regex']
 PAPER=paper.pdf IMAGE=image.png FILM=film.mp4 WEBSITE=landing.png ./extras.sh /tmp/demo/final-assets
 ./make.sh out.mp4 --workers 4                                    # or --stills 6,30 for single frames
+./scenes.sh previous.mp4 out.mp4 13.6:17.8 25.6:32.0            # re-render some whole scenes into an earlier render (same lengths, its audio)
 ./splice.sh previous.mp4 out.mp4 55.8                            # only the end card changed: re-render from its start
 ```
 

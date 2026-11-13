@@ -196,14 +196,32 @@ const AUTOMATIONS = [
     await typed('say', 'tavya', PROMPTS.video);
     const video = await findTask('tavya', 'Create a launch video');
     // 3 · Its agent at work: the steps as they arrive.
-    await go(`/personal/tavya/tasks/${video.num}`, 600);
-    await frames('work', 9, async (i) => { if (i) await sleep(1100); }, { thread: page.locator('#tp-body') });
+    await go(`/personal/tavya/tasks/${video.num}`, 300);
+    // Its rows as they stream in (about 30 over fifteen seconds); the thread follows the newest.
+    await frames('work', 26, async (i) => {
+      if (i) await sleep(380);
+      await page.evaluate(() => { const t = document.querySelector('#tp-body .ck-thread, #tp-body'); if (t) t.scrollTop = t.scrollHeight; });
+    }, { thread: page.locator('#tp-body') });
     // 1 · One list: everything under way.
     await go('/personal?q=-is%3Aarchived', 1800);
     await shot('home', { first: page.locator('.task-title') });
     // 6 · Review the result: the video it attached, then approve.
     await waitStage('tavya', 'Create a launch video', ['review']);
     await go(`/personal/tavya/tasks/${video.num}`, 2000);
+    // A real launch video takes hours; the mock's run took seconds. Show it as it would be.
+    await page.evaluate(() => {
+      const fmt = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const fix = () => {
+        for (const l of document.querySelectorAll('.fold-label')) if (l.textContent.startsWith('Worked ') && l.textContent !== 'Worked 2 h 40 min') l.textContent = 'Worked 2 h 40 min';
+        const you = document.querySelector('.msg.user time');
+        if (you && you.dataset.shifted !== you.getAttribute('datetime')) {
+          you.textContent = fmt.format(new Date(Date.parse(you.getAttribute('datetime')) - (2 * 3600 + 40 * 60 + 9) * 1000));
+          you.dataset.shifted = you.getAttribute('datetime');
+        }
+      };
+      fix(); new MutationObserver(fix).observe(document.body, { subtree: true, childList: true, characterData: true });
+    });
+    await sleep(400);
     const tile = page.getByRole('button', { name: 'Launch video' }).first();
     const confirm = page.getByRole('button', { name: /^Confirm/ }).first();
     await shot('review', { tile, confirm });
