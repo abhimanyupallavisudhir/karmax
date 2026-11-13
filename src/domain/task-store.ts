@@ -16,7 +16,9 @@ export interface StoreTask {
   summary: string;
   task: { title: string; prompt: string; workflow?: string; params: Record<string, unknown>;
     /** The prompt on hosted installations, where some steps do not apply. */
-    hostedPrompt?: string };
+    hostedPrompt?: string;
+    /** The authorization level its agent needs in the project (default: the project's). */
+    authorization?: { level: string } };
   /** What the project must have for it to do anything (default: what its triggers listen to). */
   needs?: StoreNeed[];
   /** A repeatable one's first run starts when it is installed, not at its first trigger. */
@@ -24,7 +26,16 @@ export interface StoreTask {
 }
 
 /** What a project must have for a store task to do anything. */
-export type StoreNeed = 'github' | 'chat';
+export type StoreNeed = 'github' | 'chat' | 'repository';
+
+/**
+ * Store tasks run unattended, so none waits for a person at Review: one that
+ * changes no code confirms itself, and one that may change code is reviewed by
+ * an agent (the project's default Reviewer), which hands the Review to the
+ * task's people after three rounds of sending it back.
+ */
+export const AUTO_CONFIRM = { layers: [] } as const;
+export const AGENT_REVIEW = { layers: [{ kind: 'agent', maxRevisions: 3 }] } as const;
 
 export const REPAIR_TEMPLATE_ID = 'repair-github-workflow';
 
@@ -59,6 +70,32 @@ const projectWikiPrompt = (hosted: boolean) => [
   'Report what you changed.',
 ].join('\n');
 
+export const UPDATE_DEPENDENCIES_TEMPLATE_ID = 'update-dependencies';
+
+const UPDATE_DEPENDENCIES_PROMPT = [
+  '## Update dependencies',
+  'Bring the dependencies of every repository of this project up to date, so each upgrade stays small and security fixes arrive soon.',
+  `1) If an earlier run of this task is still open (\`search_tasks\` with \`store:${UPDATE_DEPENDENCIES_TEMPLATE_ID} is:run is:open\`, other than you), stop and say so: its pull request goes first, and the next run takes whatever is newer.`,
+  '2) Find everything each repository depends on: package manifests and lockfiles (npm, pnpm, Yarn, pip, uv, Poetry, Cargo, Go modules, Bundler, Composer, Maven, Gradle, …), language and tool versions (`.nvmrc`, `.tool-versions`, `engines`), container base images and GitHub Actions.',
+  '3) Security first: run each ecosystem\'s audit (`npm audit`, `pip-audit`, `cargo audit`, `govulncheck`, …) and take the fixed version of every advisory.',
+  '4) Take every patch and minor release, refreshing the lockfiles. Take a major release only after reading its release notes and migration guide and adapting the code to it; one that needs more than a modest change stays out.',
+  '5) Leave alone what is pinned on purpose: a pin whose comment gives its reason, or anything the project wiki or another task of this project says is upgraded elsewhere.',
+  '6) Verify as CI would: a clean install, the build, typecheck, lint and the whole test suite. Revert an update you cannot make pass.',
+  '7) If nothing is out of date, change nothing. Otherwise the pull request lists each update (from → to, majors marked), the advisories fixed, and what stayed out and why.',
+].join('\n');
+
+export const TAG_TASKS_TEMPLATE_ID = 'tag-tasks';
+
+const TAG_TASKS_PROMPT = [
+  '## Tag this project\'s tasks',
+  'Tag every task of this project that has no tags yet (`search_tasks` with `is:untagged -is:draft`), so the task list can be filtered and grouped by tag.',
+  '1) First read the tag catalogue (`list_tags`) and how tagged tasks already use it (`search_tasks` with `is:tagged`).',
+  '2) Give each task the one to three tags that say what it is about (an area, feature or component) and, where it is clear, what kind of work it is (a bug, a feature, a chore). Its title usually says enough; read the task (`get_task`) only when it does not. A run of a repeatable task takes the tags of its series.',
+  '3) Prefer the tags that exist. Add one only for a theme several tasks share that no tag covers: a short lowercase name, or an `area/part` path under a tag that exists. Never tag what the list already shows: status, stage, priority, project, dates or who it waits for.',
+  '4) Only add tags (`tag_task`), never remove one: people\'s tags are theirs.',
+  '5) Report how many tasks you tagged and the tags you created, then call open_pr: no repository changes, so it just ends the run.',
+].join('\n');
+
 export const STORE_TASKS: readonly StoreTask[] = [
   {
     id: PROJECT_WIKI_TEMPLATE_ID,
@@ -67,13 +104,13 @@ export const STORE_TASKS: readonly StoreTask[] = [
     runOnInstall: true,
     task: { title: 'Maintain the project wiki', workflow: 'software-dev',
       prompt: projectWikiPrompt(false), hostedPrompt: projectWikiPrompt(true),
-      params: { repeatable: true, triggers: [{ kind: 'schedule', cron: '0 6 * * 1', recurring: true }] } },
+      params: { repeatable: true, confirm: AUTO_CONFIRM, triggers: [{ kind: 'schedule', cron: '0 6 * * 1', recurring: true }] } },
   },
   {
     id: REPAIR_TEMPLATE_ID,
     name: 'Repair failed deploys',
     summary: 'When a GitHub workflow fails on the default branch after a merge, an agent finds out why and fixes it.',
-    task: { title: RECOVERY_TITLE, prompt: RECOVERY_PROMPT, params: { repeatable: true, triggers: [RECOVERY_TRIGGER] } },
+    task: { title: RECOVERY_TITLE, prompt: RECOVERY_PROMPT, params: { repeatable: true, confirm: AGENT_REVIEW, triggers: [RECOVERY_TRIGGER] } },
   },
   {
     id: 'build-planned-issues',
@@ -86,7 +123,7 @@ export const STORE_TASKS: readonly StoreTask[] = [
         'Read the whole issue and its comments first (`gh issue view <url> --comments`). If it is too unclear to build, ask on the issue and wait for the answer: comments on it reach you as messages.',
         'Reference the issue in the pull request (`Closes #<number>`).',
       ].join('\n'),
-      params: { repeatable: true, triggers: [{ kind: 'event', type: 'github.issues.labeled', where: { 'label.name': 'planned' }, recurring: true }] },
+      params: { repeatable: true, confirm: AGENT_REVIEW, triggers: [{ kind: 'event', type: 'github.issues.labeled', where: { 'label.name': 'planned' }, recurring: true }] },
     },
   },
   {
@@ -101,8 +138,25 @@ export const STORE_TASKS: readonly StoreTask[] = [
         'For each: label it by kind and area, link and close exact duplicates, ask its author for whatever is missing to act on it (steps to reproduce, expected behaviour), and say on it how it could be solved when you can tell.',
         'Do not add the “planned” label yourself: a person decides what gets built. End with a short summary of what you did and which issues look ready to plan.',
       ].join('\n'),
-      params: { repeatable: true, triggers: [{ kind: 'schedule', cron: '0 8 * * *', recurring: true }] },
+      params: { repeatable: true, confirm: AUTO_CONFIRM, triggers: [{ kind: 'schedule', cron: '0 8 * * *', recurring: true }] },
     },
+  },
+  {
+    id: UPDATE_DEPENDENCIES_TEMPLATE_ID,
+    name: 'Update dependencies weekly',
+    needs: ['repository'],
+    summary: 'Every week an agent updates the project’s dependencies, security fixes first, and proposes them in a tested pull request.',
+    task: { title: 'Update dependencies', prompt: UPDATE_DEPENDENCIES_PROMPT,
+      params: { repeatable: true, confirm: AGENT_REVIEW, triggers: [{ kind: 'schedule', cron: '0 5 * * 2', recurring: true }] } },
+  },
+  {
+    id: TAG_TASKS_TEMPLATE_ID,
+    name: 'Tag tasks daily',
+    summary: 'Every day an agent tags the project’s untagged tasks, so the list can be filtered and grouped by tag.',
+    // Tagging other people's tasks is task:edit on the project, which a
+    // Developer holds for their own tasks only.
+    task: { title: 'Tag tasks', prompt: TAG_TASKS_PROMPT, authorization: { level: 'maintainer' },
+      params: { repeatable: true, confirm: AUTO_CONFIRM, triggers: [{ kind: 'schedule', cron: '0 7 * * *', recurring: true }] } },
   },
   {
     id: 'chat-requests',
@@ -111,7 +165,7 @@ export const STORE_TASKS: readonly StoreTask[] = [
     task: {
       title: '{{text}}',
       prompt: 'Do what this chat message asks. Your final message is posted back to the chat.',
-      params: { repeatable: true, triggers: [{ kind: 'event', type: 'chat.mention', recurring: true }] },
+      params: { repeatable: true, confirm: AGENT_REVIEW, triggers: [{ kind: 'event', type: 'chat.mention', recurring: true }] },
     },
   },
 ];

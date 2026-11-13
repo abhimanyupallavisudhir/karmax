@@ -7304,7 +7304,8 @@ async function loadTaskStore(projectId, { force = false } = {}) {
   return loading;
 }
 
-const STORE_NEEDS = { github: ['Needs GitHub', 'Connect a GitHub repository to this project first'], chat: ['Needs a chat bot', 'Connect a chat bot to this project first'] };
+const STORE_NEEDS = { github: ['Needs GitHub', 'Connect a GitHub repository to this project first'], chat: ['Needs a chat bot', 'Connect a chat bot to this project first'],
+  repository: ['Needs a repository', 'Add a repository to this project first'] };
 // What the project lacks for it, unless it already has it.
 function storeNeed(item) {
   return !(item.repeatable && item.installed?.length) && item.missing?.length ? STORE_NEEDS[item.missing[0]] : null;
@@ -7473,7 +7474,12 @@ function wireTaskStore() {
       if (run) { toast('Installed'); go(taskUrl(run.id, run)); }
       else if (item?.repeatable) { toast('Installed'); renderMain(); }
       else go(taskUrl(task.id, task));
-    } catch (e) { button.disabled = false; showTaskError(e, projectId); }
+    } catch (e) {
+      button.disabled = false;
+      // It needs more authority than this person can grant: its form asks whom to ask.
+      if (isAuthorizationGrantGap(e)) return go(storeTaskRoute(projectId, button.dataset.storeRun));
+      showTaskError(e, projectId);
+    }
   }));
 }
 
@@ -9896,7 +9902,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   });
   const projectOrganizationId = S.projects.find((project) => project.id === projectId)?.organizationId;
   const authorizationProjects = S.projects.filter((project) => project.organizationId === projectOrganizationId);
-  const storedAuthorization = draft?.params?._authorization || seed?.authorization || {};
+  const storedAuthorization = draft?.params?._authorization || seed?.authorization || store?.task?.authorization || {};
   const selectedAuthorization = normalizedAuthorization({
     level: storedAuthorization.level || storedAuthorization.profileId || 'developer',
     scope: storedAuthorization.scope || 'projects',
@@ -28974,12 +28980,12 @@ function openPublicAuth(path, render) {
 // The landing wears the console's look (light or dark, default or classic), like
 // Docs and Pricing: the launch film, then how a task goes, then what surrounds it, each pictured by a screenshot of the console in the
 // visitor's look (web/media/landing/<name>-light|dark.webp, design/landing-v3).
-const LANDING_FILM = { src: '/media/tavya-launch.mp4', poster: '/media/tavya-launch-poster.jpg', length: '1:00' };
+const LANDING_FILM = { src: '/media/tavya-launch.mp4', poster: '/media/tavya-launch-poster.jpg', length: '1:02' };
 // How a task goes. [still, title, line, picture's description]
 const LANDING_STEPS = [
   ['write', 'Write it down', 'In plain words, in any project.', 'The new-task form with a prompt written in plain words'],
   ['work', 'An agent does it', 'On its own computer: your repos, a terminal, a browser.', 'A task’s agent at work: the steps it has taken so far'],
-  ['review', 'Review and approve', 'Or leave the review to an agent.', 'A task in review, with the screenshots its agent attached'],
+  ['review', 'Review and approve', 'Or leave the review to an agent.', 'A task in review, with the video its agent attached'],
 ];
 // The autonomous company: what lets agents run a project. [still, title, line, picture's description]
 const LANDING_AUTONOMY = [
@@ -29002,8 +29008,15 @@ const LANDING_FEATURES = [
   ['errand', 'Not just code', 'Papers. Websites. Images and video. Chores.', 'An agent asking to use a saved login before booking a flight'],
 ];
 
+// What people say (the launch film's end card says the same). [quote (*…* emphasised), who]
+const LANDING_QUOTES = [
+  ['Every man a CEO, and no one has a moat.', 'N.H.'],
+  ['tavya is such an addictive toy… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
+  ['I can really just do *anything* now.', 'R.S.'],
+];
+
 // Each screenshot's size in CSS pixels (the files are 2×), so it shows at the console's own scale.
-const LANDING_SHOT_SIZES = { write: [756, 582], work: [652, 470], review: [633, 495], 'fan-out': [305, 520], vault: [960, 420],
+const LANDING_SHOT_SIZES = { write: [756, 583], work: [652, 470], review: [652, 419], 'fan-out': [305, 520], vault: [960, 420],
   autonomous: [520, 432], models: [726, 380], errand: [652, 406] };
 
 function renderLanding() {
@@ -29067,6 +29080,10 @@ function renderLanding() {
             <p>${esc(line)}</p>
             <figure class="lp-shot"${name === 'fan-out' ? ' data-anchor="center"' : ''}>${shot(name, alt)}</figure></article>`).join('')}
         </div>
+      </section>
+
+      <section class="lp-quotes" aria-label="What people say">${LANDING_QUOTES.map(([quote, who]) => `
+        <figure class="lp-quote"><blockquote>${esc(quote).replace(/\*([^*]+)\*/g, '<em>$1</em>')}</blockquote><figcaption>${esc(who)}</figcaption></figure>`).join('')}
       </section>
 
       <section class="lp-end" aria-labelledby="lp-end-title">

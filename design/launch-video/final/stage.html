@@ -95,6 +95,12 @@
   .ex.player .play { width: 0; height: 0; border-left: 13px solid #fff; border-top: 8px solid transparent; border-bottom: 8px solid transparent; }
   .ex.player .track { flex: 1; height: 4px; border-radius: 2px; background: rgba(255,255,255,.3); overflow: hidden; }
   .ex.player .track i { display: block; width: 34%; height: 100%; background: var(--gold); }
+  /* the end card's quotes */
+  .quote { position: absolute; width: 536px; min-height: 230px; margin: 0; padding: 30px 32px 26px; border-radius: 20px; opacity: 0;
+           background: linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.035)); border: 1px solid rgba(255,255,255,.12); }
+  .quote blockquote { margin: 0; font-size: 28px; font-weight: 500; line-height: 1.38; letter-spacing: -0.012em; color: var(--text); }
+  .quote blockquote::before { content: "“"; display: block; height: 34px; margin-bottom: 4px; font: 700 64px/1 Georgia, serif; color: var(--gold); }
+  .quote figcaption { margin-top: 18px; font: 600 20px 'Inter', sans-serif; color: var(--muted); }
 </style>
 </head>
 <body>

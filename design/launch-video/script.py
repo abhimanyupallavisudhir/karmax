@@ -188,14 +188,37 @@ A dry run against GitHub now reports Claude Code 2.1.318 and Codex 0.166.0 (tavy
 
 # ── The launch video (recursive) ─────────────────────────────────────────
 entry(r'^Create a launch video for tavya', [
-    '@step read Read tavya.io, the docs and the project wiki',
-    '@step think A launch video should show real work in real projects: rapid-fire tasks, agents that pay and sign up, review, triggers, the CLI, the wiki.',
-    '@step command node demo/launch-video/director.cjs :: recorded 11 scenes, 4 min 52 s',
-    '@step command python3 demo/launch-video/edit.py :: tavya-launch.mp4  1920×1080 · 60 fps',
+    '@step read Read wiki: ops/launch-video :: The owner\'s directions; what must never be on camera (friends\' projects)',
+    '@step tool tavya · read_wiki :: features/public-docs · features/settings-design',
+    '@step command git log --oneline -8 -- web/ src/gateway/public-pages.ts :: 6d15c6dc Autonomous projects and organizations\\n37f0fe43 A landing built on the launch film\\n…',
+    '@step think A launch video should show real work in real projects: one list, an agent at work on its own computer, review, an autonomous company, papers and chores.',
+    '@step command python3 design/launch-video/fetch.py :: tavya 762 · personal-website 6 · legibench3 24 · lvpm 11 · …\\nassets ready',
+    '@step command bash design/launch-video/build.sh :: 16 projects · 671 tasks · project wiki · vault stand-ins\\nbuilt: 105M',
+    '@step edit Write design/launch-video/final/capture.cjs',
+    '@step edit Write design/launch-video/final/timeline.js',
+    '@step edit Write design/launch-video/final/stage.html',
+    '@step command DIRECTOR=final/capture.cjs bash record.sh /tmp/demo/final-assets :: shot home · frames say 34 · frames work 26 · shot review · shot fanout · shot vault\\nframes auto-project 2 · frames auto-review 2 · shot auto-created · shot models · shot flight',
+    '@step tool chrome-devtools · navigate_page :: http://127.0.0.1:48950/personal/tavya/tasks/367',
+    '@step tool chrome-devtools · take_screenshot :: fanout.png 2880×1800',
+    '@step command pdftoppm -png -r 150 -f 4 -l 4 legibility.pdf ex-paper-4 :: ex-paper-4.png 1275×1650 (Figure 2, Figure 3)',
+    '@step command ./make.sh /tmp/stills --stills 6,30,43,55 :: t6.00.png t30.00.png t43.00.png t55.00.png',
+    '@step read Read /tmp/stills/t43.00.png',
+    '@step think The autonomous-company line shows its asterisks: the gold phrase spans words, so split the markup before the words.',
+    '@step edit Edit design/launch-video/final/timeline.js',
+    '@step command ./make.sh /tmp/stills --stills 43 :: t43.00.png',
+    '@step read Read /tmp/stills/t43.00.png',
+    '@step command ./make.sh out/tavya-launch.mp4 --workers 4 :: duration 62.00 s, 1860 frames, 4 workers\\nwrote out/tavya-launch.mp4.video.mp4',
+    '@step command python3 first-cut/music.py out.wav 0,3,8.2,13.6,… :: music 62.0 s, 112 BPM, swells on 11 cuts, 15 ticks',
+    '@step command ffprobe -show_entries format=duration out/tavya-launch.mp4 :: 62.001',
+    '@step command ffmpeg -i out/tavya-launch.mp4 -af volumedetect -f null - :: mean_volume: -14.7 dB · max_volume: -3.6 dB',
+    '@step command ffmpeg -vf fps=1/2,tile=5x6 sheet.png :: 31 frames, one every 2 s',
+    '@step read Read sheet.png',
+    '@step think Every scene in the order asked for; the music swells into each cut, and the pills tick as they arrive.',
     '@run mkdir -p launch && cp /tmp/demo/assets/launch-v1.mp4 launch/tavya-launch.mp4',
+    '@step command cp out/tavya-launch.mp4 launch/tavya-launch.mp4',
     '@openaction Launch video :: launch/tavya-launch.mp4',
-    '@say ' + esc('''The launch video is ready: 1080p at 60 fps, and it loops. Open it in the review panel.'''),
-], pace=1600)
+    '@say ' + esc('The launch video is ready: 1:02 at 1080p, every screen captured from a copy of your organization. Open it in the review panel.'),
+], pace=520)
 
 # ── admin_docs: a flight, with a vault login it must be allowed to use ────
 FLIGHT = 'United UA 901, Sun 3 Jan: San Francisco 4:10 pm → London Heathrow 10:30 am (+1)'
@@ -322,6 +345,8 @@ entry(r'^Get tavya ready for its public launch', [
 entry(r'^Write the Show HN post', ['@step edit Write launch/show-hn.md', '@summary Drafted.', '@say Drafted both.'])
 entry(r'^Docs: get started', ['@step edit Write docs/getting-started.md', '@summary Written.', '@say Written.'])
 entry(r'^Record the launch video', ['@sleep 900000'])
+# Its run is the real one, replayed by final/capture.cjs: the mock only keeps it working.
+entry(r'^Can you make my homepage design', ['@sleep 900000'])
 
 # ── Photos via the CLI ───────────────────────────────────────────────────
 entry(r'^Sort my photos', [

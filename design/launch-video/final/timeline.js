@@ -241,11 +241,11 @@ scene(...next(5.2), (L, dur) => {
   };
 });
 
-// 2 · Say what needs doing: this film's own task, typed.
+// 2 · Say what needs doing: the homepage redesign, typed.
 scene(...next(5.4), (L, dur) => {
   const N = seqFrames('say');
-  const h = headline(L, 'Say what *needs doing.*', 'In plain words, in any project. Pick the agent and model, or keep your defaults.');
-  const w = browserWindow(L, { screens: ['say/'] }); w.url(host('/personal/tavya'));
+  const h = headline(L, 'Say what *needs doing.*', null);
+  const w = browserWindow(L, { screens: ['say/'] }); w.url(host('/personal/personal-website'));
   w.show({ 'say/': 1 });
   return (lt) => {
     h(lt); enter(w, lt, dur);
@@ -256,11 +256,11 @@ scene(...next(5.4), (L, dur) => {
   };
 });
 
-// 3 · Its agent at work, on its own computer.
+// 3 · Its agent at work, on its own computer: the task's real run on tavya.io, replayed.
 scene(...next(4.2), (L, dur) => {
   const N = seqFrames('work');
-  const h = headline(L, 'Agents work on *their own computers.*', 'Your repos, a terminal, a browser. As many at once as you like.');
-  const w = browserWindow(L, { screens: ['work/'] }); w.url(host('/personal/tavya/tasks/820'));
+  const h = headline(L, 'Agents work on *their own computers.*', 'GitHub repos, large files and databases, project secrets, MCPs.');
+  const w = browserWindow(L, { screens: ['work/'] }); w.url(host(SHOTS.work?.url || '/personal/personal-website/tasks/7'));
   w.show({ 'work/': 1 });
   return (lt) => {
     h(lt); enter(w, lt, dur);
@@ -271,8 +271,8 @@ scene(...next(4.2), (L, dur) => {
 });
 
 // 4 · Big jobs fan out.
-scene(...next(3.8), (L, dur) => {
-  const h = headline(L, 'Big jobs *fan out.*', 'One codebase review became 25 sub-tasks, each with its own agent.');
+scene(...next(4.6), (L, dur) => {
+  const h = headline(L, 'Big jobs *fan out.*', 'Big tasks can spawn hundreds of sub-tasks with their own agents, all orchestrated by the parent agent.');
   const w = browserWindow(L, { screens: ['fanout'] }); w.url(host('/personal/tavya/tasks/367'));
   w.show({ fanout: 1 });
   return (lt) => {
@@ -356,40 +356,54 @@ scene(...next(3.6), (L, dur) => {
 });
 
 // 9 · Not just code: a paper, a website, an image, a film, a chore.
-scene(...next(7.0), (L, dur) => {
+scene(...next(4.4), (L, dur) => {
   const h = headline(L, 'Not just *code.*', null);
-  const p = pills(L, [['Papers.', 0.5], ['Websites.', 1.7], ['Images and video.', 2.9], ['Chores.', 4.5]]);
+  const p = pills(L, [['Papers.', 0.45], ['Websites.', 1.1], ['Images and video.', 1.75], ['Chores.', 2.4]]);
   const card = (cls, x, y, wpx, rot, t0, html) => {
     const c = el('div', `ex ${cls}`, L, html); c.style.left = `${x}px`; c.style.top = `${y}px`; c.style.width = `${wpx}px`;
     return (lt) => { const q = ramp(lt, t0, t0 + 0.6, ease.outQuint); c.style.opacity = q * (1 - ramp(lt, dur - 0.35, dur)); c.style.transform = `translateY(${(1 - q) * 70}px) rotate(${rot * q}deg) scale(${0.94 + 0.06 * q})`; };
   };
   const img = (src) => `<img src="${A}${src}">`;
   const parts = [
-    card('page', 90, 300, 300, -5, 0.55, img('ex-paper-1.png')),
-    card('page', 230, 330, 300, 3, 0.75, img('ex-paper-4.png')),
-    card('browser', 610, 285, 540, -1.5, 1.75, `<div class="chrome"><i></i><i></i><i></i><div class="url"><b>tavya.io</b></div></div>${img('ex-website.png')}`),
-    card('photo', 1230, 270, 590, 2, 2.95, img('ex-image.jpg')),
-    card('player', 1250, 715, 540, -2, 3.55, `${img('ex-film.jpg')}<div class="bar"><span class="play"></span><span class="track"><i></i></span><b>0:59</b></div>`),
-    card('chat', 640, 715, 540, 1.5, 4.55, img('ex-chore.png')),
+    card('page', 90, 300, 300, -5, 0.5, img('ex-paper-1.png')),
+    card('page', 230, 330, 300, 3, 0.65, img('ex-paper-4.png')),
+    card('browser', 610, 285, 540, -1.5, 1.15, `<div class="chrome"><i></i><i></i><i></i><div class="url"><b>tavya.io</b></div></div>${img('ex-website.png')}`),
+    card('photo', 1230, 270, 590, 2, 1.8, img('ex-image.jpg')),
+    card('player', 1250, 715, 540, -2, 2.1, `${img('ex-film.jpg')}<div class="bar"><span class="play"></span><span class="track"><i></i></span><b>0:59</b></div>`),
+    card('chat', 640, 715, 540, 1.5, 2.45, img('ex-chore.png')),
   ];
   return (lt) => { h(lt); p(lt); parts.forEach((f) => f(lt)); };
 });
 
-// 10 · End card.
-scene(...next(4.4), (L) => {
+// 10 · End card, with what people say.
+const QUOTES = [
+  ['Every man a CEO, and no one has a moat.', 'N.H.'],
+  ['tavya is such an addictive toy… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
+  ['I can really just do *anything* now.', 'R.S.'],
+];
+scene(...next(8.0), (L) => {
   L.id = 'end';
-  const mark = el('img', 'mark', L); setSrc(mark, A + 'brand/icon-512.png'); mark.style.top = '250px';
-  const name = el('div', 'wordmark', L, 'tavya'); name.style.top = '440px';
-  const tag = el('div', 'tagline', L, 'Just do things.'); tag.style.top = '600px';
-  const cta = el('div', 'cta', L, 'tavya.io'); cta.style.top = '720px';
-  const note = el('div', 'tagline', L, 'Open to everyone, starting today.'); note.style.top = '840px'; note.style.fontSize = '26px';
+  const mark = el('img', 'mark', L); setSrc(mark, A + 'brand/icon-512.png'); mark.style.top = '96px'; mark.style.transformOrigin = '50% 50%';
+  const name = el('div', 'wordmark', L, 'tavya'); name.style.top = '262px';
+  const tag = el('div', 'tagline', L, 'Just do things.'); tag.style.top = '410px';
+  const cta = el('div', 'cta', L, 'tavya.io'); cta.style.top = '492px';
+  const quotes = QUOTES.map(([text, who], i) => {
+    const q = el('figure', 'quote', L, `<blockquote>${text.replace(/\*([^*]+)\*/g, '<em>$1</em>')}</blockquote><figcaption>— ${who}</figcaption>`);
+    q.style.left = `${120 + i * 572}px`; q.style.top = '640px';
+    return q;
+  });
+  const note = el('div', 'tagline', L, 'Open to everyone, starting today.'); note.style.top = '960px'; note.style.fontSize = '26px';
   return (lt) => {
     const q = ramp(lt, 0.0, 0.9, ease.outQuint);
-    mark.style.opacity = q; mark.style.transform = `scale(${0.8 + 0.2 * q})`;
+    mark.style.opacity = q; mark.style.transform = `scale(${(0.8 + 0.2 * q) * 0.8})`;
     const n = ramp(lt, 0.2, 0.9, ease.outQuint); name.style.opacity = n; name.style.transform = `translateY(${(1 - n) * 24}px)`;
-    const g = ramp(lt, 0.6, 1.2, ease.out); tag.style.opacity = g;
-    const c = ramp(lt, 1.0, 1.6, ease.outQuint); cta.style.opacity = c; cta.style.transform = `translateX(-50%) scale(${0.9 + 0.1 * c})`;
-    note.style.opacity = ramp(lt, 1.5, 2.1);
+    const g = ramp(lt, 0.5, 1.1, ease.out); tag.style.opacity = g;
+    const c = ramp(lt, 0.8, 1.4, ease.outQuint); cta.style.opacity = c; cta.style.transform = `translateX(-50%) scale(${0.9 + 0.1 * c})`;
+    quotes.forEach((el2, i) => {
+      const k = ramp(lt, 1.3 + i * 0.75, 1.9 + i * 0.75, ease.outQuint);
+      el2.style.opacity = k; el2.style.transform = `translateY(${(1 - k) * 30}px)`; el2.style.filter = `blur(${(1 - k) * 5}px)`;
+    });
+    note.style.opacity = ramp(lt, 3.6, 4.2);
   };
 }, { fadeOut: 0.6 });
 
@@ -413,5 +427,5 @@ window.DURATION = DURATION;
 window.FPS = FPS;
 window.SCENES = scenes.map((s) => [s.start, s.end]);
 // Cursor clicks (scene, offset) and the pills' arrivals: the score (../first-cut/music.py) ticks on each.
-window.CLICKS = [[6, 1.45], [6, 3.45], [6, 4.45], [7, 1.85], [7, 4.45], [1, 0.55], [1, 1.0], [1, 1.45], [9, 0.5], [9, 1.7], [9, 2.9], [9, 4.5]]
+window.CLICKS = [[6, 1.45], [6, 3.45], [6, 4.45], [7, 1.85], [7, 4.45], [1, 0.55], [1, 1.0], [1, 1.45], [9, 0.45], [9, 1.1], [9, 1.75], [9, 2.4], [10, 1.3], [10, 2.05], [10, 2.8]]
   .map(([i, d]) => scenes[i].start + d).sort((a, b) => a - b);

@@ -147,6 +147,7 @@ async function prepare() {
 
 const PROMPTS = {
   video: 'Create a launch video for tavya.io that shows just how great it is',
+  homepage: 'Can you make my homepage design nicer and cleaner? I think it was designed by an OpenAI model which gives it the weird khaki color look.',
   cv: 'Update my CV to include tavya under my list of projects',
   seo: "Do a pass of tavya's SEO",
   slides: 'Fill in slides.md with content from README.md and the experimental results.',
@@ -192,18 +193,75 @@ const AUTOMATIONS = [
     await quick('tavya', PROMPTS.seo);
     await quick('takehomev2', PROMPTS.slides);
     await quick('admin_docs', PROMPTS.flight, 500);
-    // 2 · Say what needs doing: the launch video, typed (it then works, and is reviewed, in 3 and 6).
-    await typed('say', 'tavya', PROMPTS.video);
+    // The launch video starts now; it is reviewed in 6.
+    await quick('tavya', PROMPTS.video);
     const video = await findTask('tavya', 'Create a launch video');
-    // 3 · Its agent at work: the steps as they arrive.
-    await go(`/personal/tavya/tasks/${video.num}`, 600);
-    await frames('work', 9, async (i) => { if (i) await sleep(1100); }, { thread: page.locator('#tp-body') });
+    // 2 · Say what needs doing: the homepage redesign, typed.
+    await typed('say', 'personal-website', PROMPTS.homepage);
+    const site = await findTask('personal-website', 'Can you make my homepage design');
+    // 3 · Its agent at work: the real run of this task on tavya.io (fetch.py), its rows as they arrived.
+    if (want('work')) {
+      const run = JSON.parse(fs.readFileSync('/tmp/demo/assets/homepage-run.json', 'utf8'))
+        .filter((e) => e.payload.id !== 'claude-startup' && !(e.payload.kind === 'turn' && e.payload.phase === 'completed'));
+      // Up to where it says the design is verified, and checks it: still mid-run, with its commands on screen.
+      const last = run.findIndex((e) => e.payload.kind === 'message' && /verified/.test(e.payload.title)) + 3;
+      let upTo = 0, start = 0;
+      // The rows keep their real timings, the newest just now; the message that asked sits just before the first.
+      await context.route(`**/api/tasks/${site.id}/events*`, async (route) => {
+        const r = await route.fetch(), own = await r.json();
+        const kept = own.filter((e) => e.type !== 'agent.activity');
+        const seq0 = Math.max(0, ...own.map((e) => e.seq ?? 0)) + 1;
+        const shown = run.slice(0, upTo), now = Date.now(), end = shown.length ? shown[shown.length - 1].ts : now;
+        start = now - (end - run[0].ts);
+        const turn = own.find((e) => e.type === 'agent.activity')?.payload ?? {};
+        const rows = shown.map((e, i) => ({ seq: seq0 + i, type: 'agent.activity', taskId: site.id, ts: now - (end - e.ts),
+          payload: { ...e.payload, workflowRunId: turn.workflowRunId ?? e.payload.workflowRunId, turnId: turn.turnId ?? e.payload.turnId } }));
+        route.fulfill({ response: r, json: [...kept, ...rows] });
+      });
+      const viewUrl = new RegExp(`/api/tasks/${site.id}(\\?|$)`);
+      await context.route(viewUrl, async (route) => {
+        const r = await route.fetch(), view = await r.json();
+        const asked = (o) => { if (o && typeof o === 'object') for (const v of Object.values(o)) {
+          if (v && typeof v === 'object' && v.role === 'user' && typeof v.ts === 'number' && /khaki/.test(v.text || '')) v.ts = start - 9000;
+          else asked(v);
+        } };
+        if (start) asked(view);
+        route.fulfill({ response: r, json: view });
+      });
+      await frames('work', 26, async (i) => {
+        upTo = Math.round(14 + (last - 14) * Math.pow(i / 25, 1.1));
+        await go(`/personal/personal-website/tasks/${site.num}`, i ? 900 : 1500);
+        // Every step on show, as in the first cut: the commands are the point.
+        await page.evaluate(() => { for (const d of document.querySelectorAll('#tp-body details')) if (d.querySelector(':scope > summary.fold-head')) d.open = true; });
+        await sleep(200);
+        await page.evaluate(() => { const t = document.querySelector('#tp-body .ck-thread, #tp-body'); if (t) t.scrollTop = t.scrollHeight; });
+        await sleep(150);
+      }, { thread: page.locator('#tp-body') });
+      await context.unroute(viewUrl);
+      await context.unroute(`**/api/tasks/${site.id}/events*`);
+      manifest.work.url = `/personal/personal-website/tasks/${site.num}`;
+      fs.writeFileSync(path.join(OUT, 'shots.json'), JSON.stringify(manifest, null, 1));
+    }
     // 1 · One list: everything under way.
     await go('/personal?q=-is%3Aarchived', 1800);
     await shot('home', { first: page.locator('.task-title') });
     // 6 · Review the result: the video it attached, then approve.
     await waitStage('tavya', 'Create a launch video', ['review']);
     await go(`/personal/tavya/tasks/${video.num}`, 2000);
+    // A real launch video takes hours; the mock's run took seconds. Show it as it would be.
+    await page.evaluate(() => {
+      const fmt = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const fix = () => {
+        for (const l of document.querySelectorAll('.fold-label')) if (l.textContent.startsWith('Worked ') && l.textContent !== 'Worked 2 h 40 min') l.textContent = 'Worked 2 h 40 min';
+        const you = document.querySelector('.msg.user time');
+        if (you && you.dataset.shifted !== you.getAttribute('datetime')) {
+          you.textContent = fmt.format(new Date(Date.parse(you.getAttribute('datetime')) - (2 * 3600 + 40 * 60 + 9) * 1000));
+          you.dataset.shifted = you.getAttribute('datetime');
+        }
+      };
+      fix(); new MutationObserver(fix).observe(document.body, { subtree: true, childList: true, characterData: true });
+    });
+    await sleep(400);
     const tile = page.getByRole('button', { name: 'Launch video' }).first();
     const confirm = page.getByRole('button', { name: /^Confirm/ }).first();
     await shot('review', { tile, confirm });
