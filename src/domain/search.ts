@@ -37,8 +37,8 @@ export interface EvalContext {
    * userId → task id → the live asks routed to that person: their inbox kinds
    * (`review-requested`, `escalated`, `approval-requested`, `assigned`,
    * `mentioned`) and when the newest arrived. The API precomputes it from the
-   * inbox for the people a query's `for:` clauses name, so this module stays
-   * pure. Absent ⇒ nobody has an ask (drafts still count).
+   * inbox for the caller and the people a query's `for:` clauses name, so this
+   * module stays pure. Absent ⇒ nobody has an ask (drafts still count).
    */
   attention?: Map<string, Map<string, AttentionAsk>>;
   /** Lower-cased person name or email → userId, for `for:<name|email>` (the
@@ -649,6 +649,10 @@ export interface EvalResult {
   /** Of those, the ones only a task's pull requests make (task id → which and
    *  what), so a list says it is a pull request asking, not the task. */
   pullRequestAsks?: Record<string, Array<{ checkout: string; kind: string }>>;
+  /** In every list a signed-in person reads: task id → the kinds of the live
+   *  asks routed to them that the task itself makes (not its pull requests), so
+   *  any row can offer the answers they can give, whatever the query. */
+  mine?: Record<string, string[]>;
   /** For the same queries: task id → when it last changed for those people
    *  (`updated`'s sort key), which a task's own `statusChangedAt` cannot say. */
   updated?: Record<string, number>;
@@ -732,19 +736,24 @@ export function evaluateQuery(tasks: SearchTask[], query: TaskQuery, ctx: EvalCo
         .filter((ask, i) => byPullRequest.findIndex((other) => other.checkout === ask.checkout && other.kind === ask.kind) === i);
     }
   }
+  const callerAsks = ctx.userId ? ctx.attention?.get(ctx.userId) : undefined;
+  let mine: Record<string, string[]> | undefined;
+  if (callerAsks) {
+    mine = {};
+    for (const t of out) {
+      const asks = [callerAsks.get(t.id), t.intentId && t.intentId !== t.id ? callerAsks.get(t.intentId) : undefined];
+      const kinds = [...new Set(asks.flatMap((ask) => (ask?.kinds ?? [])
+        .filter((kind) => !ask?.pullRequests?.some((pr) => pr.kind === kind))))];
+      if (kinds.length) mine[t.id] = kinds;
+    }
+  }
   return { tasks: out, groups, ...(groupField?.type === 'tag' ? { hierarchical: true } : {}), ...(reasons ? { reasons, updated } : {}),
-    ...(pullRequestAsks ? { pullRequestAsks } : {}), total: out.length };
+    ...(pullRequestAsks ? { pullRequestAsks } : {}), ...(mine ? { mine } : {}), total: out.length };
 }
 
 /** Every value of every `for:` clause (negated ones too) — what the API resolves. */
 export function forClauseValues(query: TaskQuery): string[] {
   return (query.filters ?? []).filter((c) => fieldByKey(c.field)?.key === 'for').flatMap((c) => c.values);
-}
-
-/** Whether the query uses `is:folded`, which needs the caller's asks (the API resolves them). */
-export function queryFolds(query: TaskQuery): boolean {
-  return (query.filters ?? []).some((c) => fieldByKey(c.field)?.key === 'is'
-    && c.values.some((value) => value.toLowerCase() === 'folded'));
 }
 
 /** The users the query's positive `for:` clauses name. */

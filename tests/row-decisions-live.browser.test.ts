@@ -13,7 +13,7 @@ afterAll(async () => { await browser?.close(); });
 const TASK = 'task_live';
 type Pending = { id: string; itemId: string; status: string; mode: string };
 
-async function openList(page: Page, requests: Pending[], { slowLoads = 0, slowAnswer = 0 } = {}) {
+async function openList(page: Page, requests: Pending[], { slowLoads = 0, slowAnswer = 0, forMe = true } = {}) {
   const resolved: string[] = [];
   await page.route('http://rows.test/**', async (route) => {
     const url = new URL(route.request().url());
@@ -41,12 +41,15 @@ async function openList(page: Page, requests: Pending[], { slowLoads = 0, slowAn
   await page.addScriptTag({ content: fs.readFileSync('web/totp-qr.js', 'utf8') });
   await page.addScriptTag({ content: fs.readFileSync('web/markdown.js', 'utf8') });
   await page.addScriptTag({ content: app });
-  await page.evaluate((taskId) => (globalThis as any).eval(`
+  await page.evaluate(({ taskId, forMe }) => (globalThis as any).eval(`
     const task = { id: ${JSON.stringify(taskId)}, num: 904, title: 'Implement this', projectId: 'p',
       lastView: { taskId: ${JSON.stringify(taskId)}, stage: 'do', status: 'active', pendingDecisions: 3, updatedAt: 1 } };
     Object.assign(S, { user: { id: 'user' }, projects: [{ id: 'p', organizationId: 'org', name: 'P' }],
       organizationId: 'org', tab: 'tasks', meta: {},
-      searchResult: { tasks: [task], reasons: { [task.id]: ['approval-requested'] } } });
+      // What the server says of every list: the asks the row makes of the caller;
+      // and of For me alone, why each row is in it.
+      searchResult: { tasks: [task], mine: { [task.id]: ['approval-requested'] },
+        ...(${JSON.stringify(forMe)} ? { reasons: { [task.id]: ['approval-requested'] } } : {}) } });
     toast = () => {};
     loadInbox = async () => {};
     // A press holds off repaints until its click, as in the console.
@@ -65,7 +68,7 @@ async function openList(page: Page, requests: Pending[], { slowLoads = 0, slowAn
       bgRenderMain();
     }, 60);
     renderMain();
-  `), TASK);
+  `), { taskId: TASK, forMe });
   return resolved;
 }
 
@@ -89,6 +92,19 @@ const pendingRequests = (): Pending[] => [
   { id: 'vreq_github', itemId: 'github', status: 'pending', mode: 'use' },
   { id: 'vreq_r2', itemId: 'r2', status: 'pending', mode: 'reveal' },
 ];
+
+it('answers from a row in any list, not only For me', async () => {
+  // #925: the Active list said "Needs approval" with no way to answer from it.
+  const page = await browser.newPage();
+  page.setDefaultTimeout(5000);
+  const errors: string[] = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  const resolved = await openList(page, pendingRequests(), { forMe: false });
+  await press(page, '[data-vreq="vreq_one"] [data-vreq-act="task"]');
+  await expect.poll(() => resolved).toEqual(['vreq_one']);
+  expect(errors).toEqual([]);
+  await page.close();
+});
 
 it('keeps a working task’s asks on screen while its view moves on', async () => {
   const page = await browser.newPage();

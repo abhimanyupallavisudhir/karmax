@@ -71,6 +71,15 @@ describe('for: — what needs a person', () => {
     expect(evaluateQuery(tasks, parseQuery(''), ctx).reasons).toBeUndefined();
   });
 
+  it('says what each row asks of the caller in every list, not only for:me', () => {
+    const own = { 'review-me': ['review-requested'], 'child-asks-me': ['escalated'] };
+    expect(evaluateQuery(tasks, parseQuery(''), ctx).mine).toEqual(own);
+    expect(evaluateQuery(tasks, parseQuery('for:me'), ctx).mine).toEqual(own);
+    // A list for someone else still offers the caller's own asks, not theirs.
+    expect(evaluateQuery(tasks, parseQuery('for:bob'), ctx).mine).toEqual({ 'review-me': ['review-requested'] });
+    expect(evaluateQuery(tasks, parseQuery(''), { ...ctx, userId: undefined }).mine).toBeUndefined();
+  });
+
   it('matches an ask raised on the attempt behind a logical task', () => {
     const attempt = task('logical', { intentId: 'logical', id: 'attempt-2' });
     const result = evaluateQuery([attempt], parseQuery('for:me'),
@@ -172,6 +181,13 @@ describe('for: — asks a task\'s pull requests make', () => {
     const result = evaluateQuery(tasks, parseQuery('for:me'), { ...ctx, attention: asks });
     expect(result.reasons?.['agent-busy']).toEqual(['review-requested']);
     expect(result.pullRequestAsks).toEqual({ 'agent-busy': [{ checkout: 'docs', kind: 'review-requested' }] });
+  });
+  it("leaves out of the caller's own asks those only a pull request makes", () => {
+    const asks = new Map([[alice, new Map<string, AttentionAsk>([
+      ['agent-busy', { kinds: ['review-requested'], at: NOW, pullRequests: [{ checkout: 'docs', kind: 'review-requested' }] }],
+      ['review-me', { kinds: ['approval-requested', 'review-requested'], at: NOW, pullRequests: [{ checkout: 'docs', kind: 'review-requested' }] }],
+    ])]]);
+    expect(evaluateQuery(tasks, parseQuery('-is:archived'), { ...ctx, attention: asks }).mine).toEqual({ 'review-me': ['approval-requested'] });
   });
 });
 
