@@ -27640,8 +27640,8 @@ function repositoryCheckoutName(source) {
 const commandLines = (text) => text.split('\n').map((line) => line.trim()).filter(Boolean);
 
 /** What the "Fully autonomous" switches mean (wiki features/autonomy). */
-const AUTONOMOUS_TIP = 'Agents run it with nobody asked: a co-ordinator plans and steers the work, and agents answer questions and review, acting for an Avatār with full authority in this project.';
-const AUTONOMOUS_ORGANIZATION_TIP = 'Agents run it with nobody asked: it starts with a co-ordinator that creates and steers every project, and agents answer questions and review, acting for an Avatār with Super-administrator authority in this organization.';
+const AUTONOMOUS_TIP = 'Agents run it with nobody asked: a co-ordinator plans and steers the work, and an Avatār with full authority in this project answers questions, reviews work and decides requests. Spending starts at a $50 budget.';
+const AUTONOMOUS_ORGANIZATION_TIP = 'Agents run it with nobody asked: a co-ordinator creates and steers every project, and an Avatār with Super-administrator authority answers questions, reviews work and decides requests. Spending starts at a $50 budget.';
 
 // New project: the name, the project's GitHub repository, and folded Secrets
 // and Environment — what Project settings holds that a project needs to start.

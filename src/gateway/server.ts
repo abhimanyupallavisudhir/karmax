@@ -7899,7 +7899,7 @@ export class Gateway {
           const mode: AccessMode = field === 'totp' ? 'use' : 'reveal';
           const decision = (await vault.access(caps, callerTaskId, item, mode, { consume: true }));
           if (decision.status !== 'granted')
-            return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field, mode, why: b.why })));
+            return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { token, caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field, mode, why: b.why })));
           const value = field === 'totp'
             ? (await vault.totp(item, { taskId: callerTaskId, principal }))
             : (await vault.resolveField(item, field, { taskId: callerTaskId, principal, mode: 'reveal' }));
@@ -7928,7 +7928,7 @@ export class Gateway {
           if (!item.domains?.length) return this.json(res, 400, { error: `browser fill requires credential domains; "${item.label}" has none${field === 'totp' ? ' — read its code with get_credential {itemId, field: "totp"} and type it' : ''}` });
           const decision = (await vault.access(caps, callerTaskId, item, 'use'));
           if (decision.status !== 'granted')
-            return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field: b.field, mode: 'use', why: b.why })));
+            return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { token, caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field: b.field, mode: 'use', why: b.why })));
           if (field === 'username' && !item.username) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
           const resolveText = async () => {
             if (field === 'username') return item.username!;
@@ -7958,7 +7958,7 @@ export class Gateway {
           const b = await this.body(req);
           if (!callerTaskId) return this.json(res, 400, { error: 'a task-agent token is required to request credential access' });
           // The vault announces a new request on the task itself.
-          const decision = (await this.requestCredential(vault, {
+          const decision = (await this.requestCredential(token, vault, {
             taskId: callerTaskId,
             projectId: authRecord?.projectId,
             caps,
@@ -8103,7 +8103,7 @@ export class Gateway {
           const { captureSession, restoreSession, parseSavedSession, sessionDomainError, sessionState } = await import('../autonomy/browser-session.js');
           const holds = await import('../autonomy/session-holds.js');
           const raise = (decision: { status: AccessStatus; reason?: string }, item: VaultItem) =>
-            this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, mode: 'use', why: b.why });
+            this.autoRaiseCredential(vault, decision, { token, caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, mode: 'use', why: b.why });
           const busy = (item: VaultItem, heldBy: { taskId: string; num?: number; title?: string }) => this.json(res, 200, {
             status: 'busy', itemId: item.id, heldBy,
             reason: `${heldBy.num !== undefined ? `task #${heldBy.num}` : 'another task'} is signed in with "${item.label}", which works in one task at a time. Pause, then call use_session again; it frees up when that task's world parks or the task ends.`,
@@ -10259,11 +10259,11 @@ export class Gateway {
   private async autoRaiseCredential(
     vault: VaultItems,
     decision: { status: AccessStatus; reason?: string },
-    ctx: { caps: string[]; taskId?: string; projectId?: string; item: { id: string }; field?: unknown; mode: AccessMode; why?: unknown },
+    ctx: { token: string; caps: string[]; taskId?: string; projectId?: string; item: { id: string }; field?: unknown; mode: AccessMode; why?: unknown },
   ): Promise<Record<string, unknown>> {
     const base: Record<string, unknown> = { ...decision, itemId: ctx.item.id };
     if (decision.status !== 'needs_approval' || !ctx.taskId) return base;
-    const raised = (await this.requestCredential(vault, {
+    const raised = (await this.requestCredential(ctx.token, vault, {
       taskId: ctx.taskId, projectId: ctx.projectId, caps: ctx.caps,
       itemId: ctx.item.id, field: ctx.field as VaultFieldName | undefined, mode: ctx.mode,
       why: ctx.why != null ? String(ctx.why) : undefined,
@@ -10273,12 +10273,14 @@ export class Gateway {
 
   /** Every credential request an agent raises: a sub-task's comes through its
    * parent, whose agent is told (src/platform/sub-task-asks.ts). */
-  private async requestCredential(vault: VaultItems, args: Parameters<VaultItems['request']>[0] & { taskId: string }) {
+  private async requestCredential(token: string, vault: VaultItems, args: Parameters<VaultItems['request']>[0] & { taskId: string }) {
     const { raised, ...decision } = (await vault.request({ ...args, via: await this.deps.api.viaParent(args.taskId) }));
     if (raised?.via) {
       const item = raised.itemId ? await vault.get(raised.itemId) : undefined;
       await this.deps.api.tellParentOf(args.taskId, { credential: raised, label: item?.label ?? raised.domain ?? raised.name ?? 'credential' });
     }
+    // An autonomous project's Avatār decides it when it may (wiki features/autonomy).
+    if (raised) await this.deps.api.routeCredentialRequest(token, raised);
     return decision;
   }
 

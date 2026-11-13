@@ -11,6 +11,7 @@ import { avatarForRole } from '../src/platform/avatars.js';
 import { taskAuthorityNow } from '../src/platform/task-authority.js';
 import { AUTONOMY_WIKI_PATH, autonomyWikiPage } from '../src/domain/autonomous-projects.js';
 import { BRAND } from '../src/domain/brand.js';
+import { VaultItems } from '../src/autonomy/vault-items.js';
 
 /**
  * An autonomous project (wiki features/autonomy): nobody is asked anything.
@@ -38,24 +39,36 @@ async function fixture() {
     projectId ?? undefined, undefined, 'org_personal',
   )).token;
   const client = { workflow: {
-    getHandle: () => ({ executeUpdate: async () => ({}), query: async () => [], signal: async () => undefined }),
+    // A running task's workflow answers with its published view.
+    getHandle: (id: string) => ({ executeUpdate: async () => ({}), signal: async () => undefined, terminate: async () => undefined,
+      cancel: async () => undefined, describe: async () => ({ status: { name: "TERMINATED" } }), result: async () => undefined,
+      query: async () => (await store.getTask(id))?.lastView ?? [] }),
     start: async () => ({}),
   } } as any;
   const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, authorization, contentDir, worlds: new WorldRegistry() });
   return { store, project, authorization, tokens, tokenFor, api, owner: await tokenFor('owner', null) };
 }
 
+/** A task's agent, with what its creator holds in the project. */
+async function agentToken(f: Awaited<ReturnType<typeof fixture>>, taskId: string, userId: string) {
+  const caps = await f.authorization.capabilities(`user:${userId}`, f.project.id, 'org_personal');
+  return (await f.tokens.mint({ taskId, profileId: 'do', role: 'do', principal: `user:${userId}`, projectId: f.project.id,
+    organizationId: 'org_personal', ceiling: caps, grantorCaps: caps })).token;
+}
+
 const stored = (params: Record<string, unknown>) => params._authorization as { principal?: string; level?: string; scope?: string; projectIds?: string[]; capabilities?: string[] };
 
 describe('autonomous project', () => {
-  it('sets up an Avatār with the project’s full authority, agent Responder and Reviewer forking it, and a co-ordinator draft', async () => {
+  it('sets up a judging Avatār with the project’s full authority, agent Responder and Reviewer forking it, a $50 budget and a co-ordinator draft', async () => {
     const f = await fixture();
     const autonomy = await f.api.makeAutonomous(f.owner, f.project.id);
     expect(autonomy).toMatchObject({ scope: 'project', wikiPage: { scope: 'project', path: AUTONOMY_WIKI_PATH } });
 
     // The Avatār: the most a project grant reaches — Project maintainer here — and every vault credential.
     const avatar = (await f.store.getTask(autonomy.avatarTaskId))!;
-    expect(avatar.params.avatar).toEqual({ callableBy: ['@maintainers'] });
+    // Every task of the project may call it, but only to answer and review.
+    expect(avatar.params.avatar).toEqual({ callableBy: ['@project'], roles: ['responder', 'confirm'] });
+    expect(String(avatar.params.prompt)).toMatch(/Judge every request on its merits/);
     expect(avatar.params.draft).toBe(true);
     expect(stored(avatar.params)).toMatchObject({ level: 'maintainer', scope: 'projects', projectIds: [f.project.id] });
     expect(stored(avatar.params).capabilities).toEqual(expect.arrayContaining(['use-credential:*', 'review:approve', 'task:create']));
@@ -68,11 +81,18 @@ describe('autonomous project', () => {
     expect(common.responder).toMatchObject({ kind: 'agent', ...fork, prompt: expect.stringMatching(/No human works on this project/) });
     expect(common.confirm).toEqual({ layers: [{ kind: 'agent', ...fork, prompt: expect.stringMatching(/No human reviews this project/) }] });
 
-    // The co-ordinator: a permanent co-ordinator draft acting for the Avatār.
+    // $50 by default, in the project's payment defaults, until someone changes it.
+    expect(autonomy.budget).toEqual({ scope: 'project', amount: 5000, currency: 'usd' });
+    expect(await f.store.getSettings(f.project.id, 'payments')).toEqual({ budget: 5000, currency: 'usd' });
+
+    // The co-ordinator: a permanent co-ordinator draft holding the same authority, and that budget.
     const coordinator = (await f.store.getTask(autonomy.coordinatorTaskId))!;
     expect(coordinator.title).toBe('Co-ordinator');
-    expect(coordinator.params).toMatchObject({ draft: true, coordinator: { wakeHours: 24 }, multiPr: true, 'agent:do': fork });
-    expect(stored(coordinator.params)).toMatchObject({ principal: `avatar:${avatar.id}`, level: 'maintainer' });
+    expect(coordinator.params).toMatchObject({ draft: true, coordinator: { wakeHours: 24 }, multiPr: true,
+      paymentPolicy: { budget: 5000, currency: 'usd' } });
+    expect(coordinator.params['agent:do']).toBeUndefined();
+    expect(stored(coordinator.params)).toMatchObject({ principal: 'user:owner', level: 'maintainer', scope: 'projects', projectIds: [f.project.id] });
+    expect(stored(coordinator.params).capabilities).toContain('use-credential:*');
 
     // The project wiki's general prompt says there is no human.
     const page = (await f.api.readWiki(f.owner, 'project', f.project.id, AUTONOMY_WIKI_PATH) as any).page;
@@ -87,7 +107,7 @@ describe('autonomous project', () => {
     expect((await f.store.listAvatars(f.project.id))).toHaveLength(1);
   });
 
-  it('gives the tasks of the project a Responder and Reviewer that act for the Avatār, when their creator may call it', async () => {
+  it('gives every task of the project — a developer’s too — a Responder and Reviewer that act for the Avatār, which nobody may direct', async () => {
     const f = await fixture();
     const autonomy = await f.api.makeAutonomous(f.owner, f.project.id);
     const common = (await f.store.getSettings(f.project.id, '__common__'))!;
@@ -98,8 +118,51 @@ describe('autonomous project', () => {
         (await avatarForRole(f.store, { taskId: task.id, projectId: f.project.id, agents }, role))?.id));
     };
     expect(await actsFor(f.owner)).toEqual([autonomy.avatarTaskId, autonomy.avatarTaskId]);
-    // A developer may not call a maintainer-level Avatār: their tasks' Responder gets nothing of it.
-    expect(await actsFor(await f.tokenFor('dev'))).toEqual([undefined, undefined]);
+    const dev = await f.tokenFor('dev');
+    expect(await actsFor(dev)).toEqual([autonomy.avatarTaskId, autonomy.avatarTaskId]);
+    // …but nobody gets it as an agent they direct.
+    await expect(f.api.createTask(dev, { projectId: f.project.id, prompt: 'Do as I say', draft: true,
+      params: { 'agent:do': { resumeFrom: { taskId: autonomy.avatarTaskId, role: 'do' } } } })).rejects.toThrow(/can't be forked as a task’s agent/);
+  });
+
+  it('keeps a budget someone already chose', async () => {
+    const f = await fixture();
+    await f.store.setSettings(f.project.id, 'payments', { budget: 0, currency: 'eur' });
+    const autonomy = await f.api.makeAutonomous(f.owner, f.project.id);
+    expect(autonomy.budget).toBeUndefined();
+    expect(await f.store.getSettings(f.project.id, 'payments')).toEqual({ budget: 0, currency: 'eur' });
+  });
+
+  it('sends a permission request it can grant to the Avatār, which decides it in a fork of its own', async () => {
+    const f = await fixture();
+    const autonomy = await f.api.makeAutonomous(f.owner, f.project.id);
+    const task = await f.api.createTask(await f.tokenFor('dev'), { projectId: f.project.id, prompt: 'Merge the release', draft: true });
+    await f.store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'active',
+      messages: [], actions: [], state: {} } as any);
+    const agent = await agentToken(f, task.id, 'dev');
+    const asked = await f.api.requestPermission(agent, { capabilities: ['review:approve'], reason: 'Approve my own release review' });
+    expect(asked).toMatchObject({ status: 'needs_approval', audience: [`avatar:${autonomy.avatarTaskId}`] });
+    const decider = (await f.store.listTasks(f.project.id)).find((candidate) => candidate.title.endsWith('decide permission request'))!;
+    expect(decider.params).toMatchObject({ _avatarRole: 'confirm', 'agent:do': { resumeFrom: { taskId: autonomy.avatarTaskId } } });
+    expect(String(decider.params.prompt)).toMatch(/Approve my own release review/);
+  });
+
+  it('sends a vault request to the Avatār only when it may approve one: an organization’s, not a project’s', async () => {
+    for (const scope of ['project', 'organization'] as const) {
+      const f = await fixture();
+      await f.api.makeAutonomous(f.owner, f.project.id, scope);
+      const item = await new VaultItems(f.store, undefined, undefined, 'org_personal')
+        .save({ type: 'note', label: 'Stripe dashboard', domains: ['stripe.com'], policy: { use: 'ask', reveal: 'never' } });
+      const task = await f.api.createTask(f.owner, { projectId: f.project.id, prompt: 'Refund the order', draft: true });
+      const agent = await agentToken(f, task.id, 'owner');
+      await f.api.routeCredentialRequest(agent, { id: 'vreq_1', taskId: task.id, itemId: item.id, mode: 'use', status: 'pending',
+        why: 'to refund order 42', createdAt: Date.now() });
+      const deciders = (await f.store.listTasks(f.project.id)).filter((candidate) => candidate.title.endsWith('decide credential request'));
+      if (scope === 'project') { expect(deciders).toEqual([]); continue; }
+      expect(deciders).toHaveLength(1);
+      expect(String(deciders[0]!.params.prompt)).toMatch(/may use "Stripe dashboard" \(stripe\.com\)/);
+      expect(String(deciders[0]!.params.prompt)).toMatch(/POST \/api\/vault\/requests\/vreq_1\/resolve/);
+    }
   });
 
   it('is refused to someone who may not change the project’s settings, leaving nothing behind', async () => {
@@ -128,12 +191,15 @@ describe('autonomous organization', () => {
     const autonomy = await f.api.makeAutonomous(f.owner, f.project.id, 'organization');
     expect(autonomy.wikiPage).toEqual({ scope: 'organization', path: AUTONOMY_WIKI_PATH });
     const avatar = (await f.store.getTask(autonomy.avatarTaskId))!;
-    expect(avatar.params.avatar).toEqual({ callableBy: ['@superadmins'], forksMayBeAvatars: true });
+    expect(avatar.params.avatar).toEqual({ callableBy: ['@project'], roles: ['responder', 'confirm'] });
     expect(stored(avatar.params)).toMatchObject({ level: 'superadmin', scope: 'organization' });
     expect(stored(avatar.params).capabilities).toEqual(expect.arrayContaining(['project:create', 'payment:write', 'credential:reveal']));
     const coordinator = (await f.store.getTask(autonomy.coordinatorTaskId))!;
     expect(String(coordinator.params.prompt)).toMatch(/Run this whole organization/);
-    expect(stored(coordinator.params)).toMatchObject({ principal: `avatar:${avatar.id}`, level: 'superadmin' });
+    expect(stored(coordinator.params)).toMatchObject({ principal: 'user:owner', level: 'superadmin', scope: 'organization' });
+    // The organization's payment defaults carry the $50, so every project's tasks start from it.
+    expect(autonomy.budget).toEqual({ scope: 'organization', amount: 5000, currency: 'usd' });
+    expect(await f.store.getSettings('organization:org_personal', 'payments')).toMatchObject({ budget: 5000, currency: 'usd' });
     const now = await taskAuthorityNow(f.store, f.authorization, coordinator);
     expect(now.capabilities).toEqual(expect.arrayContaining(['project:create', 'organization:wiki:write']));
     const page = (await f.api.readWiki(f.owner, 'organization', 'org_personal', AUTONOMY_WIKI_PATH) as any).page;
