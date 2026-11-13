@@ -9936,6 +9936,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         </div>
       </div>
       ${awaitingApproval(draft) ? '<div class="tf-approval" id="tf-approval" hidden></div>' : ''}
+      ${draft?.params?.coordinator ? '<div class="tf-intro" id="tf-autonomy" role="note" hidden></div>' : ''}
       <div class="tf-scroll">
         <div class="tf-columns parameter-fields" id="tf-body" data-project-id="${esc(projectId)}">
           <div class="tf-main">
@@ -10415,6 +10416,15 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       ...(formImages.length ? { images: [...formImages] } : {}), ...(formFiles.length ? { files: [...formFiles] } : {}) } }));
     leavePage(navigating);
   };
+
+  // An autonomous project's co-ordinator, still a draft: what running it starts,
+  // and where to set the project up first (wiki features/autonomy).
+  if (draft?.params?.coordinator) api(`/api/projects/${encodeURIComponent(projectId)}/autonomy`).then(({ autonomy }) => {
+    const box = $('#tf-autonomy');
+    if (activeFormToken !== formToken || !box?.isConnected || autonomy?.coordinatorTaskId !== draft.id) return;
+    box.innerHTML = autonomyIntroHtml(autonomy, projectId);
+    box.hidden = false;
+  }).catch(() => {});
 
   // A task waiting for approval says what it asks for, and its approvers decide
   // here: approving runs it (armed while what it waits for is unfinished),
@@ -12452,23 +12462,28 @@ function reviewActionBtn(a, i) {
   return `<button class="btn sm review-action" data-idx="${i}" data-kind="${esc(a.kind)}" title="${title}">${label}</button>`;
 }
 
-function promptText(title, initial = '') {
+/** Ask for one line of text. With `options.toggle` ({label, tip}) it also offers
+ * an on/off switch and resolves `{ value, checked }` (null on cancel). */
+function promptText(title, initial = '', options = {}) {
   return new Promise(resolve => {
     const previousFocus = document.activeElement;
     const dialog = document.createElement('dialog');
     dialog.className = 'text-prompt';
     dialog.setAttribute('aria-label', title);
-    dialog.innerHTML = `<form method="dialog"><label class="form-row">${esc(title)}<input value="${esc(initial)}" autocomplete="off"></label>
+    const toggle = options.toggle;
+    dialog.innerHTML = `<form method="dialog"><label class="form-row">${esc(title)}<input class="text-prompt-value" value="${esc(initial)}" autocomplete="off"></label>
+      ${toggle ? `<label class="text-prompt-toggle"><input type="checkbox" class="toggle" aria-label="${esc(toggle.label)}"><span>${esc(toggle.label)}</span>${toggle.tip ? policyTip(toggle.tip) : ''}</label>` : ''}
       <div class="inline-form" style="justify-content:flex-end"><button type="button" class="btn">Cancel</button><button class="btn primary" value="submit">Continue</button></div></form>`;
     dialog.querySelector('[type="button"]').onclick = () => dialog.close();
     dialog.addEventListener('keydown', event => event.stopPropagation());
     dialog.addEventListener('close', () => {
-      const value = dialog.returnValue === 'submit' ? dialog.querySelector('input').value : null;
-      dialog.remove(); previousFocus?.focus(); resolve(value);
+      const value = dialog.returnValue === 'submit' ? dialog.querySelector('.text-prompt-value').value : null;
+      const checked = !!dialog.querySelector('.text-prompt-toggle input')?.checked;
+      dialog.remove(); previousFocus?.focus(); resolve(toggle ? (value === null ? null : { value, checked }) : value);
     }, { once: true });
     document.body.appendChild(dialog);
     dialog.showModal();
-    dialog.querySelector('input').select();
+    dialog.querySelector('.text-prompt-value').select();
   });
 }
 
@@ -23548,6 +23563,20 @@ function requestedCredentialIds(request) {
 
 // The approval requests of a task waiting for approval, as a band on its form:
 // what is asked, by whom and why, and Approve/Deny for those it was sent to.
+/** The band atop an autonomous project's co-ordinator while it is a draft:
+ * what it is, and that running it starts everything (wiki features/autonomy). */
+function autonomyIntroHtml(autonomy, projectId) {
+  const organization = autonomy.scope === 'organization';
+  const what = organization ? 'organization' : 'project';
+  const settings = organization ? globalRoute('organization') : projectRoute(projectId, 'settings');
+  const wiki = organization ? globalRoute('orgwiki') : projectRoute(projectId, 'wiki');
+  const link = (href, text) => `<a href="${esc(href)}" data-spa>${text}</a>`;
+  return `<div class="tf-intro-inner">
+    <div class="tf-intro-title">This is the co-ordinator: it manages the entire ${what}${organization ? ', every project in it' : ''}, and never stops.</div>
+    <div>${organization ? 'Add the organization’s goals below.' : 'Describe the project’s goal below.'} Feel free to save this as a draft and go fiddle with ${link(settings, 'settings')}, edit the information in the ${link(wiki, 'wiki')}, ${link(`${globalRoute('organization')}#settings-connections`, 'connect accounts')} etc. Running this task will start the autonomous ${what}.</div>
+  </div>`;
+}
+
 function approvalBannerHtml(requests, items = []) {
   const signedInUserId = typeof S.user === 'string' ? S.user : S.user?.id;
   return requests.map((request) => {
@@ -27546,17 +27575,20 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
   await Promise.all(panes.map((pane) => paint[pane]()));
 }
 async function createOrganization() {
-  const name = await promptText('Organization name');
+  const answer = await promptText('Organization name', '', { toggle: { label: 'Fully autonomous organization', tip: AUTONOMOUS_ORGANIZATION_TIP } });
+  const name = answer?.value?.trim();
   if (!name) { syncOrganizationSwitcher(); return; }
   try {
-    const organization = await api('/api/organizations', { method: 'POST', body: JSON.stringify({ name }) });
+    const organization = await api('/api/organizations', { method: 'POST', body: JSON.stringify({ name, ...(answer.checked ? { autonomous: true } : {}) }) });
     await loadOrganizations();
     S.organizationId = organization.id;
     S.projectId = null;
-    await Promise.all([loadCollaboration().catch(() => {}), loadInbox().catch(() => {})]);
+    await Promise.all([loadCollaboration().catch(() => {}), loadInbox().catch(() => {}), organization.project ? loadProjects() : null]);
     await refreshOnboarding();
     renderShell();
-    await go(globalRoute('organization'));
+    // An autonomous organization opens on its co-ordinator, which starts it.
+    await go(organization.autonomy ? `${projectBase(organization.project.id)}/tasks/${organization.autonomy.coordinatorTaskId}` : globalRoute('organization'));
+    if (organization.autonomyError) toast(`Organization created, but couldn’t make it autonomous: ${organization.autonomyError}`, true);
   } catch (error) { toast(error.message, true); syncOrganizationSwitcher(); }
 }
 
@@ -27607,6 +27639,10 @@ function repositoryCheckoutName(source) {
 }
 const commandLines = (text) => text.split('\n').map((line) => line.trim()).filter(Boolean);
 
+/** What the "Fully autonomous" switches mean (wiki features/autonomy). */
+const AUTONOMOUS_TIP = 'Agents run it with nobody asked: a co-ordinator plans and steers the work, and agents answer questions and review, acting for an Avatār with full authority in this project.';
+const AUTONOMOUS_ORGANIZATION_TIP = 'Agents run it with nobody asked: it starts with a co-ordinator that creates and steers every project, and agents answer questions and review, acting for an Avatār with Super-administrator authority in this organization.';
+
 // New project: the name, the project's GitHub repository, and folded Secrets
 // and Environment — what Project settings holds that a project needs to start.
 // With GitHub connected, the project works on the repository named after it
@@ -27633,6 +27669,7 @@ function newProject(options) {
       <div class="np-install"></div>
       <label class="form-row"><span>Boot ${policyTip('Runs as each task starts.')}</span><textarea class="np-boot" aria-label="Boot" rows="2" spellcheck="false" placeholder="npm run db:migrate"></textarea></label>
     </div></details>
+    <label class="np-autonomous"><input type="checkbox" class="toggle" id="np-autonomous" aria-label="Fully autonomous project"><span>Fully autonomous project</span>${policyTip(AUTONOMOUS_TIP)}</label>
     <div class="form-error new-project-error" role="alert" hidden></div>
     <div class="new-project-actions"><button class="btn new-project-cancel" type="button">Cancel</button><button class="btn primary" type="submit">Create project</button></div>
   </form></div>`;
@@ -27828,7 +27865,8 @@ function newProject(options) {
       }
       // Create with an EMPTY config so every field inherits from global settings.
       const endpoint = organizationId ? `/api/organizations/${encodeURIComponent(organizationId)}/projects` : '/api/projects';
-      project = await api(endpoint, { method: 'POST', body: JSON.stringify({ name, config: {}, ...(sources.length ? { repos: sources } : {}) }), signal: controller.signal });
+      project = await api(endpoint, { method: 'POST', body: JSON.stringify({ name, config: {}, ...(sources.length ? { repos: sources } : {}),
+        ...($in('#np-autonomous').checked ? { autonomous: true } : {}) }), signal: controller.signal });
     } catch (cause) {
       if (closed || cause?.name === 'AbortError') return;
       if (usingDefault()) renderDefault(); // a repository made before the failure now reads "existing"
@@ -27858,7 +27896,9 @@ function newProject(options) {
     host.remove();
     closed = true;
     await loadProjects();
-    await go(projectRoute(project.id));
+    // An autonomous project opens on its co-ordinator, which starts it.
+    await go(project.autonomy ? `${projectBase(project.id)}/tasks/${project.autonomy.coordinatorTaskId}` : projectRoute(project.id));
+    if (project.autonomyError) failed.push(`autonomy: ${project.autonomyError}`);
     if (failed.length) toast(`Project created, but couldn’t save ${failed.join('; ')}`, true, { label: 'Settings', href: projectRoute(project.id, 'settings') });
   });
   $('#modal-root').appendChild(host);

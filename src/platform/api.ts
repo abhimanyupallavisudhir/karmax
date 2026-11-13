@@ -1,4 +1,6 @@
 import * as __asyncCollections from '../util/async-collections.js';
+import { projectAutonomy, setUpAutonomy } from './autonomous-projects.js';
+import type { AutonomyScope, ProjectAutonomy } from '../domain/autonomous-projects.js';
 import { resolvePaymentPolicy, samePaymentPolicy, validatePaymentPolicy, withPolicyCurrency } from '../autonomy/payments.js';
 import { randomUUID } from 'node:crypto';
 import { timingEnabled, installationTiming, timingReport } from '../timing/index.js';
@@ -3354,6 +3356,20 @@ export class KarmaxApi {
    * trigger. A started task is cancelled instead: deleting it would pull its
    * record out from under a running workflow.
    */
+  /** Make a project run itself (wiki features/autonomy): an Avatār with the
+   * project's — or, `organization`, the organization's — full authority, the
+   * Responder and Reviewer forking it, a `default` wiki page saying there is
+   * no human, and a permanent co-ordinator draft whose agent forks it. */
+  async makeAutonomous(token: string, projectId: string, scope: AutonomyScope = 'project'): Promise<ProjectAutonomy> {
+    return setUpAutonomy({ api: this, store: this.deps.store, tokens: this.deps.tokens }, token, projectId, scope);
+  }
+
+  /** What `makeAutonomous` set up for a project, if anything. */
+  async autonomy(token: string, projectId: string): Promise<ProjectAutonomy | null> {
+    (await this.require(token, 'project:read', { projectId }));
+    return (await projectAutonomy(this.deps.store, projectId)) ?? null;
+  }
+
   async deleteTask(token: string, taskId: string): Promise<void> {
     const task = (await this.deps.store.getTask(taskId));
     (await this.require(token, 'delete_task', { projectId: task?.projectId ?? '__missing__', taskId }));

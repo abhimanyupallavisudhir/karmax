@@ -1,4 +1,5 @@
 import { computerDefaults, saveOrganizationComputer, saveProjectComputer, splitComputerValues } from '../platform/computer-settings.js';
+import { ORGANIZATION_COORDINATOR_PROJECT, type AutonomyScope, type ProjectAutonomy } from '../domain/autonomous-projects.js';
 import { machineWaits, type MachineWait } from '../world/machine-wait.js';
 import { REPOSITORY_ROUTE } from '../world/resource-repository.js';
 import { clientAddress, ClientRequestLimits } from './client-address.js';
@@ -419,6 +420,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/tasks\/[^/]+\/resources/.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/^\/api\/tasks\/[^/]+\/resource-candidates/.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/^\/api\/projects\/[^/]+\/readiness$/.test(p)) return 'task:read';
+  // Making a project run itself rewrites its Task defaults (wiki features/autonomy).
+  if (/^\/api\/projects\/[^/]+\/autonomy$/.test(p)) return read ? 'project:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/tasks/.test(p)) return read ? 'task:read' : 'task:create';
   // Project events: reading needs the event stream; emitting can start runs.
   if (/^\/api\/projects\/[^/]+\/events$/.test(p)) return read ? 'task:event:read' : 'task:create';
@@ -3015,7 +3018,16 @@ export class Gateway {
           (await startComputeTrial(store, organization.id, subject.userId));
           (await seedIncludedModelDefaults(store, this.deps.broker, organization.id));
         }
-        return this.json(res, 200, organization);
+        if (b.autonomous !== true) return this.json(res, 200, organization);
+        // An autonomous organization starts with a project its co-ordinator runs
+        // everything from, set up with the organization's whole authority.
+        let project = (await store.createProject(ORGANIZATION_COORDINATOR_PROJECT, normalizeConfig({}, false, this.deps.hosted === true), organization.id));
+        (await store.setProjectMembership(project.id, { kind: 'user', userId: subject.userId }, 'owner'));
+        await this.ensureProjectWiki(project, subject.userId);
+        await this.installDefaultTasks(project);
+        project = (await store.getProject(project.id)) ?? project;
+        const inOrganization = (await this.auth(req, undefined, organization.id))?.apiToken ?? token;
+        return this.json(res, 200, { ...organization, project, ...(await this.autonomous(inOrganization, project.id, 'organization')) });
       }
       if (p === '/api/invitations/accept' && method === 'POST') {
         const subject = requireHumanSubject(callerIdentity);
@@ -3804,7 +3816,7 @@ export class Gateway {
             { kind: 'user', userId: callerIdentity.humanSubject.userId }, 'owner'));
           await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
           await this.installDefaultTasks(project);
-          return this.json(res, 200, project);
+          return this.json(res, 200, b.autonomous === true ? { ...project, ...(await this.autonomous(token, project.id, 'project')) } : project);
         }
       }
       const runnerPools = p.match(/^\/api\/organizations\/([^/]+)\/runner-pools$/);
@@ -4329,7 +4341,19 @@ export class Gateway {
             { kind: 'user', userId: callerIdentity.humanSubject.userId }, 'owner'));
         await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
         await this.installDefaultTasks(project);
-        return this.json(res, 200, project);
+        return this.json(res, 200, b.autonomous === true ? { ...project, ...(await this.autonomous(token, project.id, 'project')) } : project);
+      }
+      const projectAutonomyRoute = p.match(/^\/api\/projects\/([^/]+)\/autonomy$/);
+      if (projectAutonomyRoute) {
+        const projectId = projectAutonomyRoute[1]!;
+        if (method === 'GET') return this.json(res, 200, { autonomy: await api.autonomy(token, projectId) });
+        if (method === 'POST') {
+          const b = await this.body(req);
+          if (b.scope !== undefined && b.scope !== 'project' && b.scope !== 'organization')
+            return this.json(res, 400, { error: 'scope must be "project" or "organization"' });
+          return this.json(res, 200, { autonomy: await api.makeAutonomous(token, projectId, b.scope ?? 'project') });
+        }
+        return this.json(res, 405, { error: 'Method not allowed.' });
       }
       const projectTransfer = p.match(/^\/api\/projects\/([^/]+)\/transfer$/);
       if (projectTransfer) {
@@ -9236,6 +9260,14 @@ export class Gateway {
 
   /** What every project comes with from the task store: the repair of failed
    *  deploys (src/integrations/github-events.ts). The project is made either way. */
+  /** Set a just-created project up to run itself (wiki features/autonomy). The
+   * project stays when that fails; the answer says why, for its creator to retry
+   * from the project (POST /api/projects/:id/autonomy). */
+  private async autonomous(token: string, projectId: string, scope: AutonomyScope): Promise<{ autonomy?: ProjectAutonomy; autonomyError?: string }> {
+    try { return { autonomy: await this.deps.api.makeAutonomous(token, projectId, scope) }; }
+    catch (error) { return { autonomyError: error instanceof Error ? error.message : String(error) }; }
+  }
+
   async installDefaultTasks(project: import('../domain/types.js').Project): Promise<void> {
     try { await this.githubEvents.ensureRecoveryTask(project.id, project.organizationId ?? 'org_personal'); }
     catch (error) { console.warn(`[karmax] could not install the repair task in ${project.id}:`, error instanceof Error ? error.message : error); }

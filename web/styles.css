@@ -1009,6 +1009,8 @@ a.git-repo-name:hover { color:var(--accent); }
 .np-github .setting-row { min-height:40px; }
 .np-github .setting-label { width:auto; min-width:64px; }
 .np-fold { margin-top:12px; padding-top:12px; border-top:1px solid var(--line); }
+.np-autonomous, .text-prompt-toggle { display:flex; align-items:center; gap:8px; margin-top:12px; color:var(--ink-2); font-size:var(--fs-13); cursor:pointer; }
+.np-autonomous { padding-top:12px; border-top:1px solid var(--line); }
 .np-fold > summary { display:flex; align-items:center; gap:6px; cursor:pointer; list-style:none; }
 .np-fold > summary::-webkit-details-marker { display:none; }
 .np-fold > summary::before { content:'›'; width:10px; color:var(--ink-3); font-size:16px; line-height:1; transition:transform .12s; }
@@ -1392,6 +1394,11 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
   background: var(--working-weak); font-size: var(--fs-11); font-weight: 700; }
 /* A task waiting for approval: what it asks for, and Approve/Deny, above its form. */
 .tf-approval { background: var(--working-weak); border-bottom: 1px solid var(--line); }
+.tf-intro { background: var(--working-weak); border-bottom: 1px solid var(--line); }
+.tf-intro[hidden] { display: none; }
+.tf-intro-inner { max-width: 1120px; margin: 0 auto; padding: 12px 28px; display: grid; gap: 4px; color: var(--ink-2); font-size: var(--fs-13); }
+.tf-intro-title { color: var(--ink); font-weight: 600; }
+.tf-intro a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
 .tf-approval[hidden] { display: none; }
 .tf-approval-row { max-width: 1120px; margin: 0 auto; padding: 11px 28px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
 .tf-approval-row + .tf-approval-row { border-top: 1px solid var(--line); }
@@ -1404,7 +1411,7 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
 .tf-approval-actions { display: flex; align-items: center; gap: 6px; }
 @media (max-width: 900px) {
   .tf-columns { grid-template-columns: 1fr; }
-  .tf-approval-row { padding-left: 16px; padding-right: 16px; }
+  .tf-approval-row, .tf-intro-inner { padding-left: 16px; padding-right: 16px; }
   .tf-head-inner, .tf-foot-inner, .tf-columns { padding-left: 16px; padding-right: 16px; }
   .tf-columns { padding-top: 18px; padding-bottom: 40px; }
   .tf-side { margin-top: 10px; border-top: 1px solid var(--line); }
