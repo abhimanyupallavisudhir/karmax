@@ -149,7 +149,7 @@ import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, knownProviderEndpoin
 import { avatarCallableBy } from '../platform/avatars.js';
 import { AccountErasureService, ErasureError } from '../privacy/account-erasure.js';
 import { hostedOnboardingKey, hostedOnboardingRequired, hostedOnboardingStatus, parseHostedOnboardingRecord,
-  parseHostedOnboardingDisplay } from './hosted-onboarding.js';
+  parseHostedOnboardingDisplay, type HostedOnboardingFacts } from './hosted-onboarding.js';
 import { CHECKOUT_DISCLOSURES, assertPaidLaunchReady, assertPolicyAcceptance,
   policyDocument, publicLaunchInfo } from '../launch/legal.js';
 
@@ -2698,7 +2698,8 @@ export class Gateway {
         }
         const enabledCredentials = await usableAgentCredentials(this.readinessDeps(), { organizationId });
         const clouds = await Promise.all(CLOUD_WORLD_PROVIDERS.map((provider) => store.getWorldProviderConnection(organizationId, provider)));
-        const facts = {
+        const credit = await computeCredit(store, organizationId);
+        const facts: HostedOnboardingFacts = {
           // This organization's own repository access; signing in with GitHub alone gives it none.
           github: (await store.listGitConnections(organizationId)).some((connection) => !connection.suspendedAt),
           // tavya's included model needs no login of the organization's own.
@@ -2706,8 +2707,8 @@ export class Gateway {
           ownCompute: (await Promise.all(clouds.map(async (connection) => !!connection?.enabled
             && !!await this.deps.broker?.hasHandle(connection.credentialHandle)))).some(Boolean),
           managedCompute: (await this.deps.subscriptions?.hasPaidSubscription(organizationId) ?? false)
-            || await computeCredit(store, organizationId).then((credit) =>
-              (credit.creditMicros ?? 0) + credit.topUpMicros + (credit.trial?.monthMicros ?? 0) > 0),
+            || (credit.creditMicros ?? 0) + credit.topUpMicros > 0,
+          ...(credit.trial && credit.trial.leftMicros > 0 ? { computeTrial: { endsAt: credit.trial.endsAt } } : {}),
           vault: (await new VaultItems(store, this.deps.broker, undefined, organizationId).list())
             .some((item) => item.type === 'login' && item.fields.includes('password')),
           card: (await store.listOrganizationCards(organizationId)).length > 0,

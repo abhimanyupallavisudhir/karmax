@@ -6172,7 +6172,8 @@ function renderOnboarding() {
     <ol class="onboarding-list">
       ${onboardingStep(1, 'agentLogin', 'Add agent logins', 'Connect at least one usable Codex, Claude, or API-key account.', `<a class="btn sm" data-spa href="${settings}#settings-agents">${state.steps.agentLogin.complete ? 'Manage agent logins' : 'Add agent login'}</a>`)}
       ${onboardingStep(2, 'compute', 'Get computers for your agents', '', `<div class="onboarding-options">
-        ${onboardingOption(compute.managed, 'Buy a paid plan', `Includes ${siteNameMarkup()}’s computers`, `${settings}#settings-plan`, compute.managed ? 'Manage plan' : 'View plans')}
+        ${onboardingOption(compute.managed, 'Buy a paid plan', `Includes ${siteNameMarkup()}’s computers${!compute.managed && compute.trial
+          ? ` · free until ${esc(new Date(compute.trial.endsAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }))}` : ''}`, `${settings}#settings-plan`, compute.managed ? 'Manage plan' : 'View plans')}
         <span class="onboarding-or">or</span>
         ${onboardingOption(compute.own, 'Connect your own compute', 'E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud', `${settings}#settings-computers`, compute.own ? 'Manage' : 'Connect')}
       </div>`)}

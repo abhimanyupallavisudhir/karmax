@@ -315,9 +315,10 @@ describe('hosted onboarding status API', () => {
       eligible: true,
       visible: true,
       complete: false,
-      // The creator's first organization comes with the free trial of tavya's computers.
+      // The creator's first organization comes with the free trial of tavya's computers;
+      // that is not a bought plan.
       completedRequired: 1,
-      steps: { compute: { complete: true, managed: true, own: false } },
+      steps: { compute: { complete: true, managed: false, own: false, trial: { endsAt: expect.any(Number) } } },
     });
   });
 
@@ -404,6 +405,17 @@ describe('hosted onboarding completion semantics', () => {
     expect(status).toMatchObject({ complete: true, completedRequired: 3, totalRequired: 3 });
     expect(status.steps.github).toEqual({ complete: false, blocking: false });
     expect(status.steps.optional).toMatchObject({ complete: false, blocking: false });
+  });
+
+  it('lets a free trial finish the compute step without claiming a paid plan', () => {
+    const facts = { github: false, agentLogin: true, ownCompute: false, managedCompute: false, vault: false, card: false, project: true };
+    const trial = hostedOnboardingStatus({ hosted: true, organizationId: 'org_1', record: { display: 'expanded' },
+      facts: { ...facts, computeTrial: { endsAt: 1_800_000_000_000 } } });
+    expect(trial.steps.compute).toEqual({ complete: true, managed: false, own: false, trial: { endsAt: 1_800_000_000_000 } });
+    expect(trial).toMatchObject({ complete: true, completedRequired: 3 });
+    // Without one (used up or ended), nothing gets them computers.
+    const none = hostedOnboardingStatus({ hosted: true, organizationId: 'org_1', record: { display: 'expanded' }, facts });
+    expect(none.steps.compute).toEqual({ complete: false, managed: false, own: false });
   });
 
   it('requires an enrollment record (the hosted API repairs missing records)', () => {

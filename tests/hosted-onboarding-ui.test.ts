@@ -65,6 +65,21 @@ describe('hosted onboarding UI', () => {
     await ui.close();
   });
 
+  it('shows a free trial as free computers, never as a bought plan', async () => {
+    const endsAt = new Date(2026, 10, 27, 12).getTime();
+    const ui = await hosted({ onboarding: () => status({ steps: { ...status().steps,
+      compute: { complete: true, managed: false, own: false, trial: { endsAt } } } }) });
+    const step = guide(ui).locator('.onboarding-step').nth(1);
+    await step.waitFor();
+    expect(await step.locator('.onboarding-check').innerText()).toBe('✓'); // the trial gets them started
+    const options = step.locator('.onboarding-option');
+    expect(await options.evaluateAll((rows) => rows.map((row) => row.classList.contains('complete')))).toEqual([false, false]);
+    expect(await options.locator('b').allInnerTexts()).toEqual(['Buy a paid plan', 'Connect your own compute']);
+    expect(await options.first().locator('small').innerText()).toMatch(/computers · free until Nov 27$/);
+    expect(await options.locator('a.btn').allInnerTexts()).toEqual(['View plans', 'Connect']);
+    await ui.close();
+  });
+
   it('links each step to its real settings section and opens the project flow in place', async () => {
     const ui = await hosted();
     const actions = await guide(ui).locator('.onboarding-step a.btn').evaluateAll((links) =>
