@@ -40,7 +40,7 @@ vi.mock('../src/world/bounded-exec.js', () => ({
 
 import { ClaudeAdapter } from '../src/agent/claude.js';
 import { CUSTODY_ENV } from '../src/agent/custody.js';
-import { AgentToolsUnavailable, ProviderFailure, isTransportError } from '../src/agent/limits.js';
+import { AgentToolsUnavailable, ProviderFailure, ProviderOutage, isTransportError } from '../src/agent/limits.js';
 import { remoteAgentHomeRelative } from '../src/agent/remote-process.js';
 import { localProviderCli } from '../src/agent/provider-cli.js';
 import { controlClient } from './helpers/control-server.js';
@@ -606,6 +606,26 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     const failure = await new ClaudeAdapter().runTurn(input, ctx).catch((e) => e);
     expect(failure).toBeInstanceOf(ProviderFailure);
     expect(failure.metadata).toMatchObject({ kind, permanence: 'hard', provider: 'claude', source: 'structured' });
+  });
+
+  // tavya-error 3263761e3afa5929 (2026-11-13): Anthropic's Cloudflare edge answered
+  // a sandbox with its HTML block page. Claude Code calls every 403 "Failed to
+  // authenticate", reduces the page to its <title> and tags it authentication_failed;
+  // the task stopped for a person as a sign-in failure although the login was fine.
+  it.each([
+    ['authentication_failed', 'Failed to authenticate. API Error: 403 Attention Required! | Cloudflare'],
+    ['authentication_failed', 'Failed to authenticate. API Error: 403 Access denied | api.anthropic.com used Cloudflare to restrict access'],
+    [undefined, 'Failed to authenticate. API Error: 403 Just a moment...'],
+  ])('retries a network edge block (%s, %s) instead of reporting a dead login', async (code, text) => {
+    sdkState.messages = [{ type: 'assistant', session_id: 's1', ...(code ? { error: code } : {}),
+      message: { content: [{ type: 'text', text }] } },
+    { type: 'result', subtype: 'success', is_error: true, errors: ['completed'], session_id: 's1' }];
+    const failure = await new ClaudeAdapter().runTurn(input, ctx).catch((e) => e);
+    expect(failure).toBeInstanceOf(ProviderOutage);
+    expect(failure).not.toBeInstanceOf(ProviderFailure);
+    expect(isTransportError(failure)).toBe(true);
+    expect(failure.message).toMatch(/blocked requests from this computer/);
+    expect(failure.message).toContain(text);
   });
 
   it.each(['overloaded', 'server_error', 'max_output_tokens'])(

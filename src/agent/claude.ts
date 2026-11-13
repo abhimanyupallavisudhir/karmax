@@ -26,7 +26,9 @@ import {
   ProviderFailure,
   apiThrottle,
   classifyLimitError,
+  isNetworkEdgeBlock,
   isTransportError,
+  NetworkEdgeBlock,
   providerErrorFromMessage,
   providerFailure,
   SandboxProviderFailure,
@@ -898,6 +900,11 @@ export class ClaudeAdapter implements AgentAdapter {
           // signal and routed the task to human escalation. Preserve the structured
           // error here, before the generic terminal-result handling can flatten it.
           const assistantError = (message as any).error ?? (message as any).message?.error;
+          // A network edge's block page answered instead of Anthropic. Claude Code
+          // tags any 403 `authentication_failed`, but the page judged this
+          // computer's address, not the login (tavya-error 3263761e3afa5929).
+          if (/^\s*(?:Failed to authenticate\.\s*)?API Error:/i.test(text) && isNetworkEdgeBlock(text))
+            throw new NetworkEdgeBlock('claude', text);
           if (assistantError === 'rate_limit') {
             const cls = classifyLimitError(text, { providerOrigin: true });
             throw providerFailure(text || 'Claude usage limit reached', {
