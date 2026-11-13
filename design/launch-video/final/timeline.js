@@ -378,7 +378,7 @@ scene(...next(4.4), (L, dur) => {
 // 10 · End card, with what people say.
 const QUOTES = [
   ['Every man a CEO, and no one has a moat.', 'N.H.'],
-  ['tavya is such an addictive toy man… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
+  ['tavya is such an addictive toy… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
   ['I can really just do *anything* now.', 'R.S.'],
 ];
 scene(...next(8.0), (L) => {

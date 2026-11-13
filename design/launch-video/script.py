@@ -207,17 +207,17 @@ entry(r'^Create a launch video for tavya', [
     '@step edit Edit design/launch-video/final/timeline.js',
     '@step command ./make.sh /tmp/stills --stills 43 :: t43.00.png',
     '@step read Read /tmp/stills/t43.00.png',
-    '@step command ./make.sh out/tavya-launch.mp4 --workers 4 :: duration 63.80 s, 1914 frames, 4 workers\\nwrote out/tavya-launch.mp4.video.mp4',
-    '@step command python3 first-cut/music.py out.wav 0,3,8.2,13.6,… :: music 63.8 s, 112 BPM, swells on 11 cuts, 15 ticks',
-    '@step command ffprobe -show_entries format=duration out/tavya-launch.mp4 :: 63.801',
+    '@step command ./make.sh out/tavya-launch.mp4 --workers 4 :: duration 62.00 s, 1860 frames, 4 workers\\nwrote out/tavya-launch.mp4.video.mp4',
+    '@step command python3 first-cut/music.py out.wav 0,3,8.2,13.6,… :: music 62.0 s, 112 BPM, swells on 11 cuts, 15 ticks',
+    '@step command ffprobe -show_entries format=duration out/tavya-launch.mp4 :: 62.001',
     '@step command ffmpeg -i out/tavya-launch.mp4 -af volumedetect -f null - :: mean_volume: -14.7 dB · max_volume: -3.6 dB',
-    '@step command ffmpeg -vf fps=1/2,tile=5x6 sheet.png :: 32 frames, one every 2 s',
+    '@step command ffmpeg -vf fps=1/2,tile=5x6 sheet.png :: 31 frames, one every 2 s',
     '@step read Read sheet.png',
     '@step think Every scene in the order asked for; the music swells into each cut, and the pills tick as they arrive.',
     '@run mkdir -p launch && cp /tmp/demo/assets/launch-v1.mp4 launch/tavya-launch.mp4',
     '@step command cp out/tavya-launch.mp4 launch/tavya-launch.mp4',
     '@openaction Launch video :: launch/tavya-launch.mp4',
-    '@say ' + esc('The launch video is ready: 1:04 at 1080p, every screen captured from a copy of your organization. Open it in the review panel.'),
+    '@say ' + esc('The launch video is ready: 1:02 at 1080p, every screen captured from a copy of your organization. Open it in the review panel.'),
 ], pace=520)
 
 # ── admin_docs: a flight, with a vault login it must be allowed to use ────

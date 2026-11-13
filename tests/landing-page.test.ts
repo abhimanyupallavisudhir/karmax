@@ -156,7 +156,7 @@ describe('public landing page', () => {
     const quotes = await page.locator('.lp-quote').evaluateAll((items) => items.map((item: any) =>
       [item.querySelector('blockquote').textContent, item.querySelector('figcaption').textContent]));
     expect(quotes).toEqual([['Every man a CEO, and no one has a moat.', 'N.H.'],
-      ['tavya is such an addictive toy man… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
+      ['tavya is such an addictive toy… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
       ['I can really just do anything now.', 'R.S.']]);
     expect(await page.locator('.lp-quote').nth(2).locator('blockquote em').textContent()).toBe('anything');
     // After everything a task needs, right before the end.

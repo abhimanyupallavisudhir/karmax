@@ -16,10 +16,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const LOOKS = ['light', 'dark'];
 let browser, api;
 
+// How a task goes: one task, the launch video, written down, at work, then in review.
 const PROMPTS = {
-  write: 'Update my CV to include tavya under my list of projects',
-  work: 'Fill in slides.md with content from README.md and the experimental results.',
-  review: fs.readFileSync('/tmp/demo/assets/815-prompt.md', 'utf8'),
+  video: 'Create a launch video for tavya.io that shows just how great it is',
   errand: 'Book me the cheapest direct flight to London on January 3 with reasonable timings. My passport, loyalty card numbers etc. are in this folder.',
 };
 
@@ -135,34 +134,44 @@ const VAULT = [
     ]) await api.post(`${APP}/api/projects/${projects.tavya}/tasks`, { data: a, headers: { origin: APP } });
     await api.post(`${APP}/api/projects/${projects.tavya}/task-store/project-wiki`, { data: {}, headers: { origin: APP } });
 
+    // The video the launch-video task attaches (script.py): the film, from its title card on, so its thumbnail is that card.
+    if (process.env.FILM) spawnSync('ffmpeg', ['-loglevel', 'error', '-y', '-ss', '1.6', '-i', process.env.FILM, '-c:v', 'libx264', '-crf', '28', '-c:a', 'aac', '/tmp/demo/assets/launch-v1.mp4']);
     // The tasks the stills show, started at once.
-    await start(driver, 'takehomev2', PROMPTS.work);
-    await start(driver, 'tavya', PROMPTS.review);
+    await start(driver, 'tavya', PROMPTS.video);
+    const video = await findTask('tavya', 'Create a launch video');
     await start(driver, 'admin_docs', PROMPTS.errand, 500);
-    await waitFor('takehomev2', 'Fill in slides.md', () => true);
-    await sleep(6000); // its steps arrive, then it keeps working
-    await waitFor('tavya', '## usability overhaul', (v) => v.stage === 'review');
+    await waitFor('tavya', 'Create a launch video', (v) => v.stage === 'review');
     const errand = await waitFor('admin_docs', 'Book me the cheapest', (v) => (v.stage === 'review' || v.waitingFor) && true);
     await sleep(4000);
 
     for (const look of LOOKS) {
       const { ctx, page } = await context(look);
       // 1 · Write it down: a task typed in plain words.
-      const ta = await newForm(page, 'personal-website');
-      await ta.fill(PROMPTS.write); await sleep(500);
+      const ta = await newForm(page, 'tavya');
+      await ta.fill(PROMPTS.video); await sleep(500);
       await crop(page, 'write', look, [page.locator('#tf-page .form-row').first(), page.locator('#tf-page [data-row="agent:do"]')], { pad: 18 });
       await page.keyboard.press('Escape'); await sleep(800);
       await dropDrafts();
-      // 2 · An agent does it: steps arriving while it works.
-      const work = await findTask('takehomev2', 'Fill in slides.md');
-      await go(page, `/personal/takehomev2/tasks/${work.num}`, 2500);
-      await crop(page, 'work', look, [page.locator('.msg.user').last(), page.locator('.fold-head', { hasText: 'Working' }).last()], { pad: 22, minH: 470, maxH: 560 });
-      // 3 · You review the result: the proof it attached.
-      const review = await findTask('tavya', '## usability overhaul');
-      await go(page, `/personal/tavya/tasks/${review.num}`, 2500);
-      const card = page.locator('.review-tiles, .review-card, #review-actions').filter({ visible: true }).first();
-      await card.scrollIntoViewIfNeeded(); await sleep(600);
-      await crop(page, 'review', look, [card, page.getByRole('button', { name: /Confirm/ }).first()], { pad: 22 });
+      // 2 · An agent does it: the same task again, caught a dozen steps in while it works.
+      await start(driver, 'tavya', PROMPTS.video);
+      const work = await findTask('tavya', 'Create a launch video');
+      await sleep(6000);
+      await go(page, `/personal/tavya/tasks/${work.num}`, 1500);
+      // Its steps from the first (the landing shows a shot's top left; the thread follows the newest).
+      await page.evaluate(() => { for (const el of document.querySelectorAll('#tp-body, #tp-body .ck-thread')) el.scrollTop = 0; });
+      await sleep(250);
+      const steps = page.locator('.fold-head').last();
+      await crop(page, 'work', look, [steps], { pad: 22, minH: 470, maxH: 560, spanOf: page.locator('.msg.user').last().locator('xpath=..') });
+      // 3 · You review the result: the video it attached. A real launch video takes hours; the mock's run took seconds.
+      // A shorter window, so Confirm sits just under the result instead of a screen below it.
+      await page.setViewportSize({ width: 1440, height: 800 });
+      await go(page, `/personal/tavya/tasks/${video.num}`, 2500);
+      await page.evaluate(() => { for (const l of document.querySelectorAll('.fold-label')) if (l.textContent.startsWith('Worked ')) l.textContent = 'Worked 2 h 40 min'; });
+      await sleep(400);
+      // The attached video at the top (the landing shows a shot's top left), Confirm under it.
+      const result = page.locator('.msg.agent.review-info').last();
+      await crop(page, 'review', look, [result, page.getByRole('button', { name: /Confirm/ }).first()], { pad: 22 });
+      await page.setViewportSize({ width: 1440, height: 900 });
       // Big jobs fan out: a review that became 25 sub-tasks.
       await go(page, '/personal/tavya/tasks/367', 2500);
       await crop(page, 'fan-out', look, [page.locator('.rail-sec.subtasks')], { pad: 10, maxH: 520 });

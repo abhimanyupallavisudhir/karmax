@@ -28952,7 +28952,7 @@ const LANDING_FILM = { src: '/media/tavya-launch.mp4', poster: '/media/tavya-lau
 const LANDING_STEPS = [
   ['write', 'Write it down', 'In plain words, in any project.', 'The new-task form with a prompt written in plain words'],
   ['work', 'An agent does it', 'On its own computer: your repos, a terminal, a browser.', 'A task’s agent at work: the steps it has taken so far'],
-  ['review', 'Review and approve', 'Or leave the review to an agent.', 'A task in review, with the screenshots its agent attached'],
+  ['review', 'Review and approve', 'Or leave the review to an agent.', 'A task in review, with the video its agent attached'],
 ];
 // The autonomous company: what lets agents run a project. [still, title, line, picture's description]
 const LANDING_AUTONOMY = [
@@ -28978,12 +28978,12 @@ const LANDING_FEATURES = [
 // What people say (the launch film's end card says the same). [quote (*…* emphasised), who]
 const LANDING_QUOTES = [
   ['Every man a CEO, and no one has a moat.', 'N.H.'],
-  ['tavya is such an addictive toy man… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
+  ['tavya is such an addictive toy… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
   ['I can really just do *anything* now.', 'R.S.'],
 ];
 
 // Each screenshot's size in CSS pixels (the files are 2×), so it shows at the console's own scale.
-const LANDING_SHOT_SIZES = { write: [756, 582], work: [652, 470], review: [633, 495], 'fan-out': [305, 520], vault: [960, 420],
+const LANDING_SHOT_SIZES = { write: [756, 583], work: [652, 470], review: [652, 419], 'fan-out': [305, 520], vault: [960, 420],
   autonomous: [520, 432], models: [726, 380], errand: [652, 406] };
 
 function renderLanding() {

@@ -58,7 +58,7 @@ const LANDING_SECTIONS: Array<[string, string[]]> = [
 /** What people say, as web/app.js (LANDING_QUOTES) shows it: [quote (*…* emphasised), who]. */
 const LANDING_QUOTES: Array<[string, string]> = [
   ['Every man a CEO, and no one has a moat.', 'N.H.'],
-  ['tavya is such an addictive toy man… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
+  ['tavya is such an addictive toy… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
   ['I can really just do *anything* now.', 'R.S.'],
 ];
 
