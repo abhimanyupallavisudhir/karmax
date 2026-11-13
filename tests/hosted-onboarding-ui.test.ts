@@ -102,7 +102,8 @@ describe('hosted onboarding UI', () => {
     await ui.run('boot()');
     await ui.page.locator('#rail').waitFor();
     expect(await guide(ui).isHidden()).toBe(true);
-    await ui.run(`promptText = async () => 'New'; createOrganization()`);
+    // With its autonomy switch the name prompt answers { value, checked }.
+    await ui.run(`promptText = async () => ({ value: 'New', checked: false }); createOrganization()`);
     // Visible before the four-second poll could have fetched it.
     await guide(ui).locator('.onboarding-card').waitFor({ timeout: 2_000 });
     expect(await guide(ui).locator('#onboarding-title').textContent()).toContain('Set up');

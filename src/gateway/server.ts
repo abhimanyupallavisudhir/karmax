@@ -1,4 +1,5 @@
 import { computerDefaults, saveOrganizationComputer, saveProjectComputer, splitComputerValues } from '../platform/computer-settings.js';
+import { ORGANIZATION_COORDINATOR_PROJECT, type AutonomyScope, type ProjectAutonomy } from '../domain/autonomous-projects.js';
 import { machineWaits, type MachineWait } from '../world/machine-wait.js';
 import { REPOSITORY_ROUTE } from '../world/resource-repository.js';
 import { clientAddress, ClientRequestLimits } from './client-address.js';
@@ -419,6 +420,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/tasks\/[^/]+\/resources/.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/^\/api\/tasks\/[^/]+\/resource-candidates/.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/^\/api\/projects\/[^/]+\/readiness$/.test(p)) return 'task:read';
+  // Making a project run itself rewrites its Task defaults (wiki features/autonomy).
+  if (/^\/api\/projects\/[^/]+\/autonomy$/.test(p)) return read ? 'project:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/tasks/.test(p)) return read ? 'task:read' : 'task:create';
   // Project events: reading needs the event stream; emitting can start runs.
   if (/^\/api\/projects\/[^/]+\/events$/.test(p)) return read ? 'task:event:read' : 'task:create';
@@ -3015,7 +3018,16 @@ export class Gateway {
           (await startComputeTrial(store, organization.id, subject.userId));
           (await seedIncludedModelDefaults(store, this.deps.broker, organization.id));
         }
-        return this.json(res, 200, organization);
+        if (b.autonomous !== true) return this.json(res, 200, organization);
+        // An autonomous organization starts with a project its co-ordinator runs
+        // everything from, set up with the organization's whole authority.
+        let project = (await store.createProject(ORGANIZATION_COORDINATOR_PROJECT, normalizeConfig({}, false, this.deps.hosted === true), organization.id));
+        (await store.setProjectMembership(project.id, { kind: 'user', userId: subject.userId }, 'owner'));
+        await this.ensureProjectWiki(project, subject.userId);
+        await this.installDefaultTasks(project);
+        project = (await store.getProject(project.id)) ?? project;
+        const inOrganization = (await this.auth(req, undefined, organization.id))?.apiToken ?? token;
+        return this.json(res, 200, { ...organization, project, ...(await this.autonomous(inOrganization, project.id, 'organization')) });
       }
       if (p === '/api/invitations/accept' && method === 'POST') {
         const subject = requireHumanSubject(callerIdentity);
@@ -3804,7 +3816,7 @@ export class Gateway {
             { kind: 'user', userId: callerIdentity.humanSubject.userId }, 'owner'));
           await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
           await this.installDefaultTasks(project);
-          return this.json(res, 200, project);
+          return this.json(res, 200, b.autonomous === true ? { ...project, ...(await this.autonomous(token, project.id, 'project')) } : project);
         }
       }
       const runnerPools = p.match(/^\/api\/organizations\/([^/]+)\/runner-pools$/);
@@ -4329,7 +4341,19 @@ export class Gateway {
             { kind: 'user', userId: callerIdentity.humanSubject.userId }, 'owner'));
         await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
         await this.installDefaultTasks(project);
-        return this.json(res, 200, project);
+        return this.json(res, 200, b.autonomous === true ? { ...project, ...(await this.autonomous(token, project.id, 'project')) } : project);
+      }
+      const projectAutonomyRoute = p.match(/^\/api\/projects\/([^/]+)\/autonomy$/);
+      if (projectAutonomyRoute) {
+        const projectId = projectAutonomyRoute[1]!;
+        if (method === 'GET') return this.json(res, 200, { autonomy: await api.autonomy(token, projectId) });
+        if (method === 'POST') {
+          const b = await this.body(req);
+          if (b.scope !== undefined && b.scope !== 'project' && b.scope !== 'organization')
+            return this.json(res, 400, { error: 'scope must be "project" or "organization"' });
+          return this.json(res, 200, { autonomy: await api.makeAutonomous(token, projectId, b.scope ?? 'project') });
+        }
+        return this.json(res, 405, { error: 'Method not allowed.' });
       }
       const projectTransfer = p.match(/^\/api\/projects\/([^/]+)\/transfer$/);
       if (projectTransfer) {
@@ -7875,7 +7899,7 @@ export class Gateway {
           const mode: AccessMode = field === 'totp' ? 'use' : 'reveal';
           const decision = (await vault.access(caps, callerTaskId, item, mode, { consume: true }));
           if (decision.status !== 'granted')
-            return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field, mode, why: b.why })));
+            return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { token, caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field, mode, why: b.why })));
           const value = field === 'totp'
             ? (await vault.totp(item, { taskId: callerTaskId, principal }))
             : (await vault.resolveField(item, field, { taskId: callerTaskId, principal, mode: 'reveal' }));
@@ -7904,7 +7928,7 @@ export class Gateway {
           if (!item.domains?.length) return this.json(res, 400, { error: `browser fill requires credential domains; "${item.label}" has none${field === 'totp' ? ' — read its code with get_credential {itemId, field: "totp"} and type it' : ''}` });
           const decision = (await vault.access(caps, callerTaskId, item, 'use'));
           if (decision.status !== 'granted')
-            return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field: b.field, mode: 'use', why: b.why })));
+            return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { token, caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field: b.field, mode: 'use', why: b.why })));
           if (field === 'username' && !item.username) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
           const resolveText = async () => {
             if (field === 'username') return item.username!;
@@ -7934,7 +7958,7 @@ export class Gateway {
           const b = await this.body(req);
           if (!callerTaskId) return this.json(res, 400, { error: 'a task-agent token is required to request credential access' });
           // The vault announces a new request on the task itself.
-          const decision = (await this.requestCredential(vault, {
+          const decision = (await this.requestCredential(token, vault, {
             taskId: callerTaskId,
             projectId: authRecord?.projectId,
             caps,
@@ -8079,7 +8103,7 @@ export class Gateway {
           const { captureSession, restoreSession, parseSavedSession, sessionDomainError, sessionState } = await import('../autonomy/browser-session.js');
           const holds = await import('../autonomy/session-holds.js');
           const raise = (decision: { status: AccessStatus; reason?: string }, item: VaultItem) =>
-            this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, mode: 'use', why: b.why });
+            this.autoRaiseCredential(vault, decision, { token, caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, mode: 'use', why: b.why });
           const busy = (item: VaultItem, heldBy: { taskId: string; num?: number; title?: string }) => this.json(res, 200, {
             status: 'busy', itemId: item.id, heldBy,
             reason: `${heldBy.num !== undefined ? `task #${heldBy.num}` : 'another task'} is signed in with "${item.label}", which works in one task at a time. Pause, then call use_session again; it frees up when that task's world parks or the task ends.`,
@@ -9236,6 +9260,14 @@ export class Gateway {
 
   /** What every project comes with from the task store: the repair of failed
    *  deploys (src/integrations/github-events.ts). The project is made either way. */
+  /** Set a just-created project up to run itself (wiki features/autonomy). The
+   * project stays when that fails; the answer says why, for its creator to retry
+   * from the project (POST /api/projects/:id/autonomy). */
+  private async autonomous(token: string, projectId: string, scope: AutonomyScope): Promise<{ autonomy?: ProjectAutonomy; autonomyError?: string }> {
+    try { return { autonomy: await this.deps.api.makeAutonomous(token, projectId, scope) }; }
+    catch (error) { return { autonomyError: error instanceof Error ? error.message : String(error) }; }
+  }
+
   async installDefaultTasks(project: import('../domain/types.js').Project): Promise<void> {
     try { await this.githubEvents.ensureRecoveryTask(project.id, project.organizationId ?? 'org_personal'); }
     catch (error) { console.warn(`[karmax] could not install the repair task in ${project.id}:`, error instanceof Error ? error.message : error); }
@@ -10227,11 +10259,11 @@ export class Gateway {
   private async autoRaiseCredential(
     vault: VaultItems,
     decision: { status: AccessStatus; reason?: string },
-    ctx: { caps: string[]; taskId?: string; projectId?: string; item: { id: string }; field?: unknown; mode: AccessMode; why?: unknown },
+    ctx: { token: string; caps: string[]; taskId?: string; projectId?: string; item: { id: string }; field?: unknown; mode: AccessMode; why?: unknown },
   ): Promise<Record<string, unknown>> {
     const base: Record<string, unknown> = { ...decision, itemId: ctx.item.id };
     if (decision.status !== 'needs_approval' || !ctx.taskId) return base;
-    const raised = (await this.requestCredential(vault, {
+    const raised = (await this.requestCredential(ctx.token, vault, {
       taskId: ctx.taskId, projectId: ctx.projectId, caps: ctx.caps,
       itemId: ctx.item.id, field: ctx.field as VaultFieldName | undefined, mode: ctx.mode,
       why: ctx.why != null ? String(ctx.why) : undefined,
@@ -10241,12 +10273,18 @@ export class Gateway {
 
   /** Every credential request an agent raises: a sub-task's comes through its
    * parent, whose agent is told (src/platform/sub-task-asks.ts). */
-  private async requestCredential(vault: VaultItems, args: Parameters<VaultItems['request']>[0] & { taskId: string }) {
+  private async requestCredential(token: string, vault: VaultItems, args: Parameters<VaultItems['request']>[0] & { taskId: string }) {
     const { raised, ...decision } = (await vault.request({ ...args, via: await this.deps.api.viaParent(args.taskId) }));
     if (raised?.via) {
       const item = raised.itemId ? await vault.get(raised.itemId) : undefined;
       await this.deps.api.tellParentOf(args.taskId, { credential: raised, label: item?.label ?? raised.domain ?? raised.name ?? 'credential' });
     }
+    // An autonomous project's Avatār decides it when it may (wiki features/autonomy).
+    // Best effort: people are told of the request either way, so a failure to call
+    // the Avatār in never refuses the agent's request.
+    if (raised && typeof this.deps.api?.routeCredentialRequest === 'function')
+      await this.deps.api.routeCredentialRequest(token, raised).catch((error: unknown) =>
+        console.warn(`[autonomy] could not route credential request ${raised.id} to the Avatār:`, error instanceof Error ? error.message : error));
     return decision;
   }
 

@@ -1,4 +1,6 @@
 import * as __asyncCollections from '../util/async-collections.js';
+import { autonomyRoute, projectAutonomy, setUpAutonomy } from './autonomous-projects.js';
+import type { AutonomyScope, ProjectAutonomy } from '../domain/autonomous-projects.js';
 import { resolvePaymentPolicy, samePaymentPolicy, validatePaymentPolicy, withPolicyCurrency } from '../autonomy/payments.js';
 import { randomUUID } from 'node:crypto';
 import { timingEnabled, installationTiming, timingReport } from '../timing/index.js';
@@ -3354,6 +3356,20 @@ export class KarmaxApi {
    * trigger. A started task is cancelled instead: deleting it would pull its
    * record out from under a running workflow.
    */
+  /** Make a project run itself (wiki features/autonomy): an Avatār with the
+   * project's — or, `organization`, the organization's — full authority, the
+   * Responder and Reviewer forking it, a `default` wiki page saying there is
+   * no human, and a permanent co-ordinator draft whose agent forks it. */
+  async makeAutonomous(token: string, projectId: string, scope: AutonomyScope = 'project'): Promise<ProjectAutonomy> {
+    return setUpAutonomy({ api: this, store: this.deps.store, tokens: this.deps.tokens }, token, projectId, scope);
+  }
+
+  /** What `makeAutonomous` set up for a project, if anything. */
+  async autonomy(token: string, projectId: string): Promise<ProjectAutonomy | null> {
+    (await this.require(token, 'project:read', { projectId }));
+    return (await projectAutonomy(this.deps.store, projectId)) ?? null;
+  }
+
   async deleteTask(token: string, taskId: string): Promise<void> {
     const task = (await this.deps.store.getTask(taskId));
     (await this.require(token, 'delete_task', { projectId: task?.projectId ?? '__missing__', taskId }));
@@ -4948,6 +4964,32 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
     }
   }
 
+  /** An autonomous project's vault request goes to its Avatār when the Avatār
+   * may decide it (approving needs the vault's read access): a fork of it
+   * decides through POST /api/vault/requests/:id/resolve. People are still
+   * told, as for any request; whoever answers first decides. */
+  async routeCredentialRequest(token: string, request: CredentialAccessRequest): Promise<void> {
+    const task = (await this.deps.store.getTask(request.taskId));
+    // A credential not in the vault yet, or one reported broken, is for the
+    // agent to create or fix itself (the wiki's autonomy page says so).
+    if (!task || request.status !== 'pending' || !request.itemId || request.kind === 'reset') return;
+    const autonomy = await projectAutonomy(this.deps.store, task.projectId);
+    const avatar = autonomy ? (await this.deps.store.getAvatar(autonomy.avatarTaskId)) : undefined;
+    if (!avatar || !(await avatarEnabled(this.deps.store, avatar)) || !avatarAllows(avatar, 'confirm')) return;
+    const creator = (await this.deps.store.taskCreatorUserId(task.id));
+    if (!creator || !(await avatarCallableBy(this.deps.store, avatar, creator))) return;
+    const held = (await avatarAuthorizationCapabilities(this.deps.store, this.deps.authorization, avatar, task.projectId));
+    if (!['credential:write', 'credential:reveal'].every((capability) => allows(held, capability))) return;
+    const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal';
+    const item = (await new VaultItems(this.deps.store, undefined, undefined, organizationId).get(request.itemId));
+    const what = item ? `"${item.label}"${item.domains?.length ? ` (${item.domains.join(', ')})` : ''}` : `vault item ${request.itemId}`;
+    await this.callAvatar(token, avatar, 'confirm', `${avatar.name}: decide credential request`,
+      `Decide whether task #${task.num ?? task.id} (${JSON.stringify(task.title)}) may ${request.mode === 'reveal' ? 'see the plaintext of' : 'use'} ${what}.
+${request.why ? `${untrustedBlock('reason from the requesting agent', request.why)}\n` : ''}${request.via?.note ? `${untrustedBlock(`note from task ${request.via.taskId}, which it came through`, request.via.note)}\n` : ''}
+Read the task (get_task, get_conversation) before you decide. Resolve the request exactly once by calling platform_request with POST /api/vault/requests/${request.id}/resolve?organizationId=${organizationId} and body {"action":"once"} (this use only), {"action":"task"} (for the rest of this task) or {"action":"deny"}. Prefer the narrowest that does the job. Then briefly report the decision.`,
+      { taskId: task.id, type: 'avatar.credential-dispatch-failed', payload: { requestId: request.id, avatarId: avatar.id } });
+  }
+
   /** Ask selected people, teams, or owner-configured Avatars to add exact
    * capabilities and/or project scope to this task. The deciding principal must independently hold
    * every capability it grants. */
@@ -5281,7 +5323,9 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
         && (await holdsAll((projectId) => avatarAuthorizationCapabilities(this.deps.store, authorization, avatar, projectId)))))
       .map((avatar) => ({ id: avatar.id, name: avatar.name, selector: `avatar:${avatar.id}` }));
     const { special, summon } = await this.summonable(task.projectId, organizationId, eligible);
-    const nearest = tasks[0]?.selector ?? summon;
+    // In an autonomous project nobody is summoned: its Avatār decides what it can.
+    const nearest = tasks[0]?.selector
+      ?? (await autonomyRoute(this.deps.store, task.projectId, avatars.map((avatar) => avatar.id))) ?? summon;
     return { tasks, users, teams, special, avatars, ...(nearest ? { default: nearest } : {}) };
   }
 
@@ -5453,8 +5497,11 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const eligibleUsers = new Set(targets.users.map((user) => user.id));
     const eligibleAvatars = new Set(targets.avatars.map((avatar) => avatar.id));
     const audience = [...new Set((input.audience ?? []).map(String).map((value) => value.trim()).filter(Boolean))];
-    // No audience: summon the lowest level that can grant it all, as the console offers first.
-    if (!audience.length && targets.summon) audience.push(targets.summon);
+    // No audience: an autonomous project's Avatār when it can grant it all, else
+    // summon the lowest level that can, as the console offers first.
+    const autonomous = audience.length ? undefined
+      : await autonomyRoute(this.deps.store, input.projectId, targets.avatars.map((avatar) => avatar.id));
+    if (!audience.length && (autonomous ?? targets.summon)) audience.push((autonomous ?? targets.summon)!);
     if (!audience.length || audience.length > 32) throw new ValidationError('choose between 1 and 32 eligible recipients');
     const recipients = new Set<string>();
     const avatarRecipients = new Set<string>();
