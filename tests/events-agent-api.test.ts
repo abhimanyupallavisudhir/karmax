@@ -106,11 +106,11 @@ describe('events through an agent\'s task token', () => {
     const storeOf = async () => json(await dev.request('GET', `/api/projects/${projectId}/task-store`)).tasks;
     try {
       const listed = await storeOf();
-      expect(listed.map((t: any) => t.id)).toEqual(['project-wiki', 'repair-github-workflow', 'build-planned-issues', 'triage-issues', 'chat-requests']);
-      expect(Object.fromEntries(listed.map((t: any) => [t.id, t.repeatable]))).toEqual({ 'project-wiki': true, 'repair-github-workflow': true,
-        'build-planned-issues': true, 'triage-issues': true, 'chat-requests': true });
+      expect(listed.map((t: any) => t.id)).toEqual(['project-wiki', 'repair-github-workflow', 'build-planned-issues', 'triage-issues',
+        'update-dependencies', 'tag-tasks', 'chat-requests']);
+      expect(listed.every((t: any) => t.repeatable)).toBe(true);
       expect(Object.fromEntries(listed.map((t: any) => [t.id, t.missing]))).toEqual({ 'project-wiki': [], 'repair-github-workflow': ['github'],
-        'build-planned-issues': ['github'], 'triage-issues': ['github'], 'chat-requests': ['chat'] });
+        'build-planned-issues': ['github'], 'triage-issues': ['github'], 'update-dependencies': ['repository'], 'tag-tasks': [], 'chat-requests': ['chat'] });
       expect(listed[0]).toMatchObject({ name: 'Maintain the project wiki', runOnInstall: true });
 
       // The wiki keeps itself current: installing it writes the wiki now, then weekly.
@@ -153,8 +153,55 @@ describe('events through an agent\'s task token', () => {
       const published = await maintainer.request('POST', '/api/organizations/org_personal/task-store', { taskId: reinstalled.id, name: 'Ours' })
         .catch((error: Error) => error.message);
       expect(String(published)).toMatch(/not found|missing capability/);
-      expect(await storeOf()).toHaveLength(5);
+      expect(await storeOf()).toHaveLength(7);
     } finally { dev.restore(); maintainer.restore(); }
+  });
+
+  it('updates dependencies weekly once the project has a repository, and tags tasks daily', async () => {
+    const dev = await agent('developer');
+    const maintainer = await agent('maintainer');
+    const storeOf = async () => json(await dev.request('GET', `/api/projects/${projectId}/task-store`)).tasks;
+    const entry = async (id: string) => (await storeOf()).find((t: any) => t.id === id);
+    const created: string[] = [];
+    try {
+      // Any repository will do (tavya hosts some): it is what gets updated.
+      expect((await entry('update-dependencies')).missing).toEqual(['repository']);
+      const organizationId = (await store.getProject(projectId))!.organizationId ?? 'org_personal';
+      const repository = await store.upsertRepository({ id: 'repo_deps1', organizationId, provider: 'tavya', owner: organizationId, name: 'app',
+        sshUrl: 'tavya:repo_deps1/app.git', defaultBranch: 'main', private: true });
+      await store.attachProjectRepository({ projectId, repositoryId: repository.id });
+      expect((await entry('update-dependencies')).missing).toEqual([]);
+      expect((await entry('build-planned-issues')).missing).toEqual(['github']);
+
+      const deps = json(await dev.request('POST', `/api/projects/${projectId}/task-store/update-dependencies`));
+      created.push(deps.id);
+      const depsSeries = (await store.getTask(deps.id))!;
+      expect(depsSeries).toMatchObject({ title: 'Update dependencies', params: { template: 'update-dependencies', repeatable: true,
+        triggerState: 'armed', triggers: [{ kind: 'schedule', cron: '0 5 * * 2', recurring: true }] } });
+      const depsPrompt = String(depsSeries.params.prompt);
+      // One run at a time: a run whose pull request is still open goes first.
+      expect(depsPrompt).toContain('store:update-dependencies is:run is:open');
+      expect(depsPrompt).toMatch(/Security first/);
+      expect(depsPrompt).toMatch(/upgraded elsewhere/);
+      // Reviewed like any change: the store does not skip its Review.
+      expect(depsSeries.params.confirm).toBeUndefined();
+
+      // It asks for a maintainer's authority (tagging other people's tasks is
+      // task:edit), checked in authorization-summon.test.ts; its runs change
+      // no repository, so nothing waits at Review.
+      expect(await entry('tag-tasks')).toMatchObject({ missing: [], task: { authorization: { level: 'maintainer' } } });
+      const tags = json(await maintainer.request('POST', `/api/projects/${projectId}/task-store/tag-tasks`));
+      created.push(tags.id);
+      const tagSeries = (await store.getTask(tags.id))!;
+      expect(tagSeries).toMatchObject({ title: 'Tag tasks', params: { template: 'tag-tasks', repeatable: true, triggerState: 'armed',
+        confirm: { layers: [] }, triggers: [{ kind: 'schedule', cron: '0 7 * * *', recurring: true }] } });
+      expect(String(tagSeries.params.prompt)).toContain('is:untagged -is:draft');
+      expect(String(tagSeries.params.prompt)).toMatch(/never remove one/);
+      expect((await entry('tag-tasks')).installed).toEqual([tags.id]);
+    } finally {
+      for (const id of created) await store.deleteTask(id);
+      dev.restore(); maintainer.restore();
+    }
   });
 
   it('takes a store task as changed, by its endpoint or as an ordinary task, a series per install', async () => {
