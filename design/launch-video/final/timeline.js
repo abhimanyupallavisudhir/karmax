@@ -241,11 +241,11 @@ scene(...next(5.2), (L, dur) => {
   };
 });
 
-// 2 · Say what needs doing: this film's own task, typed.
+// 2 · Say what needs doing: the homepage redesign, typed.
 scene(...next(5.4), (L, dur) => {
   const N = seqFrames('say');
   const h = headline(L, 'Say what *needs doing.*', 'In plain words, in any project. Pick the agent and model, or keep your defaults.');
-  const w = browserWindow(L, { screens: ['say/'] }); w.url(host('/personal/tavya'));
+  const w = browserWindow(L, { screens: ['say/'] }); w.url(host('/personal/personal-website'));
   w.show({ 'say/': 1 });
   return (lt) => {
     h(lt); enter(w, lt, dur);
@@ -256,11 +256,11 @@ scene(...next(5.4), (L, dur) => {
   };
 });
 
-// 3 · Its agent at work, on its own computer.
+// 3 · Its agent at work, on its own computer: the task's real run on tavya.io, replayed.
 scene(...next(4.2), (L, dur) => {
   const N = seqFrames('work');
   const h = headline(L, 'Agents work on *their own computers.*', 'Your repos, a terminal, a browser. As many at once as you like.');
-  const w = browserWindow(L, { screens: ['work/'] }); w.url(host('/personal/tavya/tasks/820'));
+  const w = browserWindow(L, { screens: ['work/'] }); w.url(host(SHOTS.work?.url || '/personal/personal-website/tasks/7'));
   w.show({ 'work/': 1 });
   return (lt) => {
     h(lt); enter(w, lt, dur);

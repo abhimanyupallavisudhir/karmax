@@ -345,6 +345,8 @@ entry(r'^Get tavya ready for its public launch', [
 entry(r'^Write the Show HN post', ['@step edit Write launch/show-hn.md', '@summary Drafted.', '@say Drafted both.'])
 entry(r'^Docs: get started', ['@step edit Write docs/getting-started.md', '@summary Written.', '@say Written.'])
 entry(r'^Record the launch video', ['@sleep 900000'])
+# Its run is the real one, replayed by final/capture.cjs: the mock only keeps it working.
+entry(r'^Can you make my homepage design', ['@sleep 900000'])
 
 # ── Photos via the CLI ───────────────────────────────────────────────────
 entry(r'^Sort my photos', [

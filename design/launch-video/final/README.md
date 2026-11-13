@@ -8,11 +8,11 @@ from this folder's demo clone. Owner's structure (2026-11-13):
 | --- | --- | --- |
 | 0 | Title: "Do *anything* with agents." | |
 | 1 | Every project. *One list.* | pills "Code, apps, websites", "Research", "Random admin work", one at a time |
-| 2 | Say *what needs doing.* | this film's own task typed: "Create a launch video for tavya.io…" |
-| 3 | Agents work on *their own computers.* | that task's run streaming in: ~30 rows (wiki, snapshot, clone, capture, stills, a fix, render, measurements), scripted in `../script.py` |
+| 2 | Say *what needs doing.* | the homepage redesign typed into personal-website: "Can you make my homepage design nicer and cleaner? … khaki color look." |
+| 3 | Agents work on *their own computers.* | that task's real run on tavya.io (`../fetch.py` saves its rows, minus anything private), replayed row by row with every step unfolded, up to "Design is verified on desktop and mobile" |
 | 4 | Big jobs *fan out.* | #367's 25 sub-tasks |
 | 5 | Give agents *accounts, keys and a card.* | the vault |
-| 6 | Review the *result,* and approve. | large line "(or leave the review to an agent)"; the task's attached mp4 opened (its first frame drawn as this film's title card), then Confirm; the run reads "Worked 2 h 40 min" (the mock's took seconds) |
+| 6 | Review the *result,* and approve. | the launch-video task (started before scene 2, scripted in `../script.py`); large line "(or leave the review to an agent)"; the task's attached mp4 opened (its first frame drawn as this film's title card), then Confirm; the run reads "Worked 2 h 40 min" (the mock's took seconds) |
 | 7 | Build the *autonomous company.* | large line "Agents can create, manage and approve tasks." over the autonomous-project toggle (task #918, mocked) and a review route turned to Agent; then "Tasks can auto-run on schedules, events or dependencies." over "Created Task #183: Fix errors in deployment…", then Update dependencies, Maintain the project wiki and Dream (mocked) |
 | 8 | Any model. *Your subscription.* | the model picker |
 | 9 | Not just *code.* | pills "Papers." "Websites." "Images and video." "Chores." with a paper (title page + a page with its figures), tavya.io, an AI image, a film still, the booked flight |
