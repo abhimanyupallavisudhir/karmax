@@ -4,11 +4,12 @@ import { makeCoreActivities } from '../src/activities/core.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { allows } from '../src/platform/capabilities.js';
-import { baseTaskAuthority, delegationReaching, taskAuthorityNow } from '../src/platform/task-authority.js';
+import { baseTaskAuthority, delegationReaching, taskAuthorityNow, taskSelection } from '../src/platform/task-authority.js';
+import { PermissionRequests } from '../src/platform/permission-requests.js';
 import { VaultItems } from '../src/autonomy/vault-items.js';
 import { resolvePaymentPolicy } from '../src/autonomy/payments.js';
 import { AuthorizationService, organizationScope, projectScope } from '../src/platform/authorization.js';
-import { KarmaxApi } from '../src/platform/api.js';
+import { KarmaxApi, previousTaskGrants } from '../src/platform/api.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import type { TaskView } from '../src/domain/types.js';
 
@@ -205,6 +206,98 @@ describe('routing a permission request to the nearest who can grant it', () => {
       expect(requested.audience).toEqual(['@admins']);
       await expect(f.api.requestPermission(asker, { capabilities: ['project:edit'], audience: [`task:${f.lead.id}`], reason: 'x' }))
         .rejects.toThrow(/cannot grant/);
+    } finally { await f.store.close(); }
+  });
+});
+
+/** A sub-task's record names no level of its own (`inherited-child`): it acts
+ * at the level of the task it is delegated from. Asking for more projects must
+ * add them to the sub-task, never treat that placeholder as a level (#933). */
+describe('a sub-task asking for access to more projects', () => {
+  async function fixture() {
+    const store = await Store.create(':memory:');
+    const organization = await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
+    const site = await store.createProject('Site', {}, organization.id);
+    const docs = await store.createProject('Docs', {}, organization.id);
+    const authorization = await AuthorizationService.create(store);
+    await authorization.bootstrapOrganizationOwner('system:test', 'owner', organization.id);
+    const tokens = new TokenAuthority(store);
+    const client = { workflow: { getHandle: (id: string) => ({
+      describe: async () => ({ runId: 'run', status: { name: 'RUNNING' } }),
+      terminate: async () => undefined,
+      executeUpdate: async () => undefined,
+      query: async (name: string) => {
+        const view = name === 'view' ? (await store.getTask(id))?.lastView : undefined;
+        if (!view) throw new Error('no live query');
+        return view;
+      },
+      signal: async () => undefined,
+    }), start: async () => ({}) } } as any;
+    const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, authorization });
+    const owner = (await tokens.mintPrincipal('user:owner', ['*'], undefined, undefined, organization.id)).token;
+    const parent = await store.createTask({ projectId: site.id, title: 'Parent', workflow: 'software-dev', workflowVersion: '1.30.0',
+      createdBy: { kind: 'user', userId: 'owner' }, params: { prompt: 'lead' } });
+    const delegation = (await tokens.delegateHuman(owner, { taskId: parent.id, projectIds: [site.id], organizationId: organization.id }))!;
+    const parentCaps = ['task:read', 'task:create', 'project:read', 'task:escalate'];
+    await store.updateTaskParams(parent.id, { ...parent.params, _authorization: { level: 'developer', profileId: 'developer',
+      scope: 'projects', projectIds: [site.id], organizationId: organization.id, capabilities: parentCaps, delegationId: delegation.id } });
+    const core = makeCoreActivities({ store, tokens, worlds: new WorldRegistry(), adapters: new Map(), profiles: new ProfileResolver(store, 'mock') });
+    const input = await core.prepareChildTask({ parentTaskId: parent.id, projectId: site.id, title: 'Child', prompt: 'work', project: {} });
+    for (const id of [parent.id, input.taskId]) await store.saveView(id, { taskId: id, title: 'T', workflow: 'software-dev',
+      stage: 'do', status: 'active', messages: [], actions: [], state: {}, updatedAt: 1 } as unknown as TaskView);
+    const child = (await store.getTask(input.taskId))!;
+    const childAgent = (await tokens.mint({ taskId: child.id, profileId: 'do', role: 'do', principal: `task:${parent.id}`,
+      projectIds: [site.id], organizationId: organization.id, delegationId: input.delegationId,
+      ceiling: parentCaps, grantorCaps: parentCaps })).token;
+    return { store, organization, site, docs, authorization, tokens, api, owner, parent, child, childAgent };
+  }
+
+  it('records its parent\'s level as the base, and approval adds the projects to the sub-task alone', async () => {
+    const f = await fixture();
+    try {
+      const asked = await f.api.requestPermission(f.childAgent, { projectIds: [f.docs.id], audience: ['@superadmins'], reason: 'Read docs.' });
+      expect(asked.status).toBe('needs_approval');
+      const [pending] = await new PermissionRequests(f.store, f.organization.id).requests({ taskId: f.child.id });
+      expect(pending!.baseAuthorization).toEqual({ level: 'developer', scope: 'projects', projectIds: [f.site.id] });
+
+      const decided = await f.api.resolvePermissionRequest(f.owner,
+        { organizationId: f.organization.id, requestId: asked.requestId!, action: 'approve' });
+      expect(decided.status).toBe('granted');
+
+      const child = (await f.store.getTask(f.child.id))!;
+      // Still delegated: it goes on following its parent.
+      expect((child.params._authorization as any).profileId).toBe('inherited-child');
+      const held = await baseTaskAuthority(f.store, f.authorization, child);
+      expect(held).toMatchObject({ scope: 'projects', projectIds: [f.site.id, f.docs.id] });
+      expect(allows(held.capabilities, 'project:read')).toBe(true);
+      // The parent is not widened.
+      expect(((await f.store.getTask(f.parent.id))!.params._authorization as any).projectIds).toEqual([f.site.id]);
+      // Its tokens can reach the added project: its human delegation covers it.
+      const scope = { projectIds: [f.site.id, f.docs.id], organizationId: f.organization.id,
+        delegationId: (child.params._authorization as any).delegationId };
+      const reached = await delegationReaching(f.store, f.tokens, child, scope);
+      expect(reached).toMatchObject({ projectIds: [f.site.id, f.docs.id] });
+      expect(await f.tokens.delegationCovers(reached.delegationId!, scope)).toBe(true);
+      // Its effective selection is its parent's level across both projects.
+      expect(previousTaskGrants(child).authorization).toBeUndefined();
+      expect(await taskSelection(f.store, f.authorization, child))
+        .toEqual({ level: 'developer', scope: 'projects', projectIds: [f.site.id, f.docs.id] });
+    } finally { await f.store.close(); }
+  });
+
+  it('approves a request recorded before, whose base names the inherited-child placeholder', async () => {
+    const f = await fixture();
+    try {
+      const request = await new PermissionRequests(f.store, f.organization.id).request({
+        taskId: f.child.id, projectId: f.site.id, role: 'do', capabilities: [], projectIds: [f.docs.id],
+        baseAuthorization: { level: 'inherited-child', scope: 'projects', projectIds: [f.site.id] },
+        audience: ['@creator'], recipients: ['owner'], reason: 'Read docs.', requestedBy: `task-agent:${f.child.id}:do`,
+      });
+      const decided = await f.api.resolvePermissionRequest(f.owner,
+        { organizationId: f.organization.id, requestId: request.id, action: 'approve' });
+      expect(decided.status).toBe('granted');
+      expect(await baseTaskAuthority(f.store, f.authorization, (await f.store.getTask(f.child.id))!))
+        .toMatchObject({ scope: 'projects', projectIds: [f.site.id, f.docs.id] });
     } finally { await f.store.close(); }
   });
 });

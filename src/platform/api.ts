@@ -85,7 +85,9 @@ import { AuthorizationRequests, type AuthorizationRequest } from './authorizatio
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { untrustedBlock } from '../domain/untrusted.js';
-import { taskAuthorityNow } from './task-authority.js';
+import { baseTaskAuthority, previousTaskGrants, taskAuthorityNow, taskGrants, tokenScopeOf } from './task-authority.js';
+import { delegatedFromParent } from './delegation.js';
+export { previousTaskGrants };
 import type { KarmaxBus } from '../contrib/bus.js';
 import type { WorldRegistry } from '../world/registry.js';
 import type { WorldHandle } from '../world/types.js';
@@ -2462,7 +2464,7 @@ export class KarmaxApi {
     // A fork of an Avatar the starter may call acts with the Avatar's authorization.
     if (stored.principal?.startsWith('avatar:') && (await forkedAvatar(this.deps.store, task.projectId,
       task.params?.['agent:do'], (await this.humanBehind(caller, task.id))))?.id === stored.principal.slice(7)) return;
-    const { authorization: selection } = previousTaskGrants(task);
+    const { authorization: selection } = (await this.taskGrants(task));
     if (!selection) return;
     const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal';
     const grantorCaps = (await this.authorizationGrantorCaps(token, caller, selection, organizationId));
@@ -2591,7 +2593,7 @@ export class KarmaxApi {
     // runs it; it is refused only if they cannot grant it all either.
     if ((storedAuthorization?.profileAttenuated || storedAuthorization?.missingCredentialGrants?.length)
       && !storedAuthorization.attenuationAccepted) {
-      const { authorization: selection, credentialGrants } = previousTaskGrants(task);
+      const { authorization: selection, credentialGrants } = (await this.taskGrants(task));
       if (!selection) throw new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
       task = (await this.setTaskAuthorization(token, taskId, selection,
         [...credentialGrants, ...(storedAuthorization.missingCredentialGrants ?? [])], undefined, { queue: true }));
@@ -3102,7 +3104,7 @@ export class KarmaxApi {
     const project = (await this.deps.store.getProject(task.projectId));
     if (!project) throw new NotFoundError(`no project ${task.projectId}`);
     const organizationId = project.organizationId ?? 'org_personal';
-    const inherited = previousTaskGrants(task);
+    const inherited = (await this.taskGrants(task));
     const selection = requested.authorization ?? inherited.authorization ?? (await this.authorizationDefault(project))
       ?? { level: 'developer', scope: 'projects' as const, projectIds: [task.projectId] };
     const grantorCaps = (await this.authorizationGrantorCaps(token, caller, selection, organizationId));
@@ -5097,7 +5099,7 @@ Prefer declining what the task does not need. Then briefly report the decision.`
     }
     const projectIds = requestedProjects.filter((id) => caller.projectId ? caller.projectId !== id
       : caller.projectIds?.length ? !caller.projectIds.includes(id) : false);
-    const baseAuthorization = projectIds.length ? previousTaskGrants(task).authorization : undefined;
+    const baseAuthorization = projectIds.length ? (await this.taskGrants(task)).authorization : undefined;
     if (projectIds.length && (!baseAuthorization || baseAuthorization.scope !== 'projects'))
       throw new ValidationError('project expansion requires a task with selected-project authorization');
     if (projectIds.length && caller.principal.startsWith('avatar:'))
@@ -5339,7 +5341,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const projectIds = [...new Set(input.projectIds ?? [])].filter((id) => caller.projectId ? caller.projectId !== id
       : caller.projectIds?.length ? !caller.projectIds.includes(id) : false);
     const missing = projectIds.length ? capabilities : capabilities.filter((capability) => !allows(caller.caps, capability));
-    const baseAuthorization = projectIds.length ? previousTaskGrants(task).authorization : undefined;
+    const baseAuthorization = projectIds.length ? (await this.taskGrants(task)).authorization : undefined;
     return { ...(await this.permissionGrantors(task, organizationId, missing, projectIds, baseAuthorization)), missing };
   }
 
@@ -5353,9 +5355,10 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
    */
   private async permissionGrantors(task: TaskRecord, organizationId: string, capabilities: Capability[],
     projectIds: string[], baseAuthorization?: AuthorizationSelection): Promise<PermissionGrantors> {
-    const taskCaps = (task.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities ?? [];
+    const taskCaps = delegatedFromParent(task) ? (await taskAuthorityNow(this.deps.store, this.deps.authorization, task)).capabilities
+      : (task.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities ?? [];
     const required = projectIds.length ? [...taskCaps, ...capabilities] : capabilities;
-    const scope = [...new Set([...(baseAuthorization?.projectIds ?? previousTaskGrants(task).authorization?.projectIds ?? [task.projectId]), ...projectIds])];
+    const scope = [...new Set([...(baseAuthorization?.projectIds ?? (await this.taskGrants(task)).authorization?.projectIds ?? [task.projectId]), ...projectIds])];
     const authorization = this.deps.authorization;
     const tasks: PermissionGrantors['tasks'] = [];
     const seen = new Set([task.id]);
@@ -5518,7 +5521,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const own = task.params?._authorization as Held | undefined;
     const other = isHeld(own) ? undefined
       : Object.entries(this.storedAgentAuthorizations(task)).find(([, entry]) => isHeld(entry));
-    const authorization = isHeld(own) ? previousTaskGrants(task).authorization
+    const authorization = isHeld(own) ? (await this.taskGrants(task)).authorization
       : other ? other[1].requested.authorization ?? selectionOf(other[1], task.projectId) : undefined;
     if (!authorization) throw new ValidationError('this task already has the authorization it asked for');
     const request = (await this.requestAuthorization(token, {
@@ -5811,6 +5814,11 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       retry: async (taskId) => (await this.workflowHandle(taskId)).signal(SIG.retry) });
   }
 
+  /** The grants a task acts with (task-authority.ts `taskGrants`): a sub-task's are its parent's. */
+  private taskGrants(task: TaskRecord): ReturnType<typeof taskGrants> {
+    return taskGrants(this.deps.store, this.deps.authorization, task);
+  }
+
   async resolvePermissionRequest(
     token: string,
     input: { organizationId: string; requestId: string; action: 'approve' | 'deny' | 'dismiss' },
@@ -5869,11 +5877,14 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     }
     if (input.action === 'approve' && !(task && (await this.permissionRequestSatisfied(task, request)))) {
       let expanded: AuthorizationSelection | undefined;
+      // A sub-task acts with its parent's authority as it is now, so its base
+      // moves with the parent's: what is approved for it is these projects.
+      const delegated = !!task && delegatedFromParent(task);
       if (request.projectIds?.length) {
         if (!task || !this.deps.authorization) throw new ValidationError('task authorization is unavailable');
-        const current = previousTaskGrants(task).authorization;
+        const current = (await this.taskGrants(task)).authorization;
         if (!current || current.scope !== 'projects'
-          || JSON.stringify(current) !== JSON.stringify(request.baseAuthorization))
+          || !delegated && JSON.stringify(current) !== JSON.stringify(request.baseAuthorization))
           throw new ValidationError('task authorization changed; submit a new project access request');
         expanded = { ...current, projectIds: [...new Set([...(current.projectIds ?? []), ...request.projectIds])] };
         (await this.deps.authorization.requestedCapabilities(task.projectId, expanded));
@@ -5881,7 +5892,8 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
         // Check durable human grants per project; delegated agents are limited
         // to their immediate bearer, never their backing human's authority.
         const existingCaps = [
-          ...((task.params?._authorization as { capabilities?: string[] })?.capabilities ?? []),
+          ...(delegated ? (await taskAuthorityNow(this.deps.store, this.deps.authorization, task)).capabilities
+            : (task.params?._authorization as { capabilities?: string[] })?.capabilities ?? []),
           ...(await service.extensionCaps(task.id)),
           ...(await new VaultItems(this.deps.store, this.deps.broker, undefined, input.organizationId).extensionCaps(task.id)),
         ];
@@ -5892,7 +5904,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
           if (!held) throw new CapabilityError(`you cannot grant ${capability} in project ${projectId}`);
         }
       }
-      const selectedProjects = task && previousTaskGrants(task).authorization?.projectIds;
+      const selectedProjects = task && (await this.taskGrants(task)).authorization?.projectIds;
       for (const capability of expanded ? [] : request.capabilities) {
         for (const projectId of selectedProjects?.length ? selectedProjects : [request.projectId]) {
           // Later capability requests also apply throughout an expanded scope.
@@ -5905,23 +5917,55 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
             throw new CapabilityError(`you cannot grant ${capability}: ${checked.reason ?? 'permission denied'} (project ${projectId})`);
         }
       }
-      if (expanded) await this.setTaskAuthorization(token, request.taskId, expanded, undefined, undefined,
+      if (expanded && delegated) await this.addSubTaskProjects(token, caller, task!, input.organizationId, request.projectIds!);
+      else if (expanded) await this.setTaskAuthorization(token, request.taskId, expanded, undefined, undefined,
         { acceptAttenuation: false, preserveCredentialGrants: true });
     }
     return this.finishPermissionDecision(service, request, input.action, caller.principal,
       input.action === 'approve' && !!task && (await this.permissionRequestSatisfied(task, request)), claim);
   }
 
+  /**
+   * Approving more projects for a sub-task adds them to it alone
+   * (`addedProjectIds`, task-authority.ts): it goes on acting with its
+   * parent's authority, across those projects too. Its human delegation
+   * becomes the approver's, reaching them all, as a task's does when its own
+   * authorization is widened (`setTaskAuthorization`).
+   */
+  private async addSubTaskProjects(token: string, caller: ScopedToken, task: TaskRecord, organizationId: string,
+    projectIds: string[]): Promise<void> {
+    const stored = task.params._authorization as { addedProjectIds?: string[] };
+    const authorization = { ...stored, addedProjectIds: [...new Set([...stored.addedProjectIds ?? [], ...projectIds])] };
+    const scope = (await baseTaskAuthority(this.deps.store, this.deps.authorization,
+      { ...task, params: { ...task.params, _authorization: authorization } }));
+    const pinned = typeof task.params._githubAccountId === 'string' ? task.params._githubAccountId : undefined;
+    const githubAccountId = pinned ?? (caller.kind === 'agent' ? caller.externalIdentities?.githubAccountId
+      : caller.humanSubject ? (await this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId)) : undefined);
+    const delegation = (await this.delegateTaskHuman(token, caller, { taskId: task.id,
+      ...tokenScopeOf(scope, task.projectId, organizationId),
+      ...(githubAccountId ? { externalIdentities: { githubAccountId } } : {}) }));
+    (await this.deps.store.patchTaskParams(task.id, { _authorization: { ...authorization,
+      ...(delegation ? { delegationId: delegation.id } : {}) } }));
+  }
+
   /** Only reconcile from the persisted grant, never from the requested level. */
   private async permissionRequestSatisfied(task: TaskRecord, request: PermissionRequest): Promise<boolean> {
-    const authorization = task.params?._authorization as { capabilities?: Capability[] } | undefined;
-    if (!authorization?.capabilities) return false;
     const service = new PermissionRequests(this.deps.store,
       (await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal');
+    if (delegatedFromParent(task)) {
+      // A sub-task holds what its parent holds now, across the projects added for it.
+      const held = (await baseTaskAuthority(this.deps.store, this.deps.authorization, task));
+      const caps = [...held.capabilities, ...(await service.extensionCaps(task.id, request.role))];
+      if (!request.capabilities.every((cap) => allows(caps, cap))) return false;
+      return !request.projectIds?.length || held.scope === 'organization' || held.scope === 'global'
+        || request.projectIds.every((id) => (held.scope === 'projects' ? held.projectIds ?? [] : [task.projectId]).includes(id));
+    }
+    const authorization = task.params?._authorization as { capabilities?: Capability[] } | undefined;
+    if (!authorization?.capabilities) return false;
     const caps = [...authorization.capabilities, ...(await service.extensionCaps(task.id, request.role))];
     if (!request.capabilities.every((cap) => allows(caps, cap))) return false;
     if (!request.projectIds?.length) return true;
-    const current = previousTaskGrants(task).authorization;
+    const current = (await this.taskGrants(task)).authorization;
     if (!current || !this.deps.authorization || !request.baseAuthorization) return false;
     const projects = [...new Set([...(request.baseAuthorization.projectIds ?? [task.projectId]), ...request.projectIds])];
     if (current.scope === 'projects' && !projects.every((id) => current.projectIds?.includes(id))) return false;
@@ -6175,7 +6219,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const role = args.role ?? 'do';
     if (!(await this.deps.store.kvGet(`session:${args.taskId}:${role}`)) && !(await this.getTaskView(token, args.taskId))?.messages?.length)
       throw new Error(`the ${role} agent has no conversation to fork`);
-    const previous = args.reauthorize ? previousTaskGrants(source) : undefined;
+    const previous = args.reauthorize ? (await this.taskGrants(source)) : undefined;
     return this.createTask(token, {
       projectId: source.projectId,
       title: args.title ?? `Fork of #${source.num ?? source.id} ${role}`,
@@ -7113,7 +7157,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     const { resumeFrom: _previous, ...agent } = (params[field] ?? {}) as Partial<AgentSpec>;
     params[field] = { ...agent, resumeFrom: { taskId, role: MAIN_AGENT } };
     params.prompt = input.text;
-    const previous = previousTaskGrants(source);
+    const previous = (await this.taskGrants(source));
     return this.createTask(token, {
       projectId: source.projectId,
       workflow: source.workflow,
@@ -9291,11 +9335,6 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
   }
 }
 
-/** The grants a task ended with, in the shape a new task is created with: the
- * stored `_authorization` selection (level/scope/projects — the elevated one if
- * a human approved a mid-task authorization request), its per-task vault
- * credential caps and the policies chosen for them. A legacy record that only
- * carries a `profileId` still maps to a level. */
 /** Can `caps` hand a vault credential grant to a task? Its own grant must
  * cover it, or it administers credentials (wiki plans/PLAN-passwords §6). */
 function canGrantCredential(caps: Capability[], grant: Capability): boolean {
@@ -9339,28 +9378,6 @@ export interface TaskLink { id: string; num?: number; title: string }
 
 function taskLink(task: TaskRecord): TaskLink {
   return { id: task.id, ...(task.num != null ? { num: task.num } : {}), title: task.title };
-}
-
-export function previousTaskGrants(task: TaskRecord): {
-  authorization?: AuthorizationSelection;
-  credentialGrants: string[];
-  credentialPolicies: VaultTaskPolicyOverrides;
-} {
-  const stored = task.params?._authorization as {
-    level?: string; profileId?: string; scope?: AuthorizationSelection['scope']; projectIds?: string[];
-    capabilities?: string[]; credentialPolicies?: VaultTaskPolicyOverrides;
-  } | undefined;
-  const level = stored?.level ?? stored?.profileId;
-  return {
-    ...(level ? { authorization: {
-      level,
-      scope: stored?.scope ?? 'projects',
-      ...(stored?.scope === 'organization' || stored?.scope === 'global' ? {}
-        : { projectIds: stored?.projectIds?.length ? stored.projectIds : [task.projectId] }),
-    } } : {}),
-    credentialGrants: (stored?.capabilities ?? []).filter((capability) => capability.startsWith('use-credential:')),
-    credentialPolicies: stored?.credentialPolicies ?? {},
-  };
 }
 
 function uniqueFileRefs(files: FileRef[]): FileRef[] {
