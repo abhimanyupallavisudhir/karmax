@@ -17,7 +17,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import { sameRepository } from '../world/repository-identity.js';
-import { hostedRepositoryUrl, parseHostedUrl, type HostedRepositoryState } from '../domain/hosted-repository.js';
+import { hostedRepositoryUrl, landsByPushOnTavya, parseHostedUrl, type HostedRepositoryState } from '../domain/hosted-repository.js';
 import { pinTarget, workingFolder, worldCheckoutNames } from '../domain/world-location.js';
 import { isPostgresTarget, openSqlDatabase, type SqlDatabase } from './sql.js';
 import { watchAuthorityWrites } from './authorization-epoch.js';
@@ -2011,7 +2011,7 @@ export class Store {
     // delivery and its `none` default.
     // A project on repositories tavya hosts has no pull requests to open: it
     // lands by merging and pushing the target itself (world/hosted-git.ts).
-    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && config.repos?.length && config.repos.every((repo) => parseHostedUrl(repo)))
+    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && landsByPushOnTavya(config.repos))
       config.remote = 'push';
     else if (process.env.KARMAX_DEPLOYMENT === 'hosted' && (config.remote === undefined || config.remote === 'none'))
       config.remote = 'pr';
