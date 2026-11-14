@@ -201,7 +201,7 @@ const S = {
   searchFailed: false, // last evaluation errored — distinct from "nothing matched"
   searchRefusal: '', // …because the server refused it (4xx), in the server's words
   searchPending: false, // a new query is being evaluated; the list labels its interim local preview
-  wsOnline: true, // live socket up; false shows the floating "Reconnecting" pill
+  wsOnline: true, // live socket up; false for 4 s shows the floating "Reconnecting" pill
   // This tab, to the gateway: its requests carry it and its live socket names
   // it, so the tab that made a write is not told of it again (see applyChangeNotice).
   clientId: `tab_${(globalThis.crypto?.randomUUID?.() || `${Date.now()}${Math.random()}`).replace(/[^A-Za-z0-9]/g, '').slice(0, 32)}`,
@@ -5837,7 +5837,7 @@ function connectWs() {
   // page showing stale state as if it were truth, and events missed during the
   // gap were never re-fetched. Surface the gap, and backfill on reconnect.
   ws.onopen = () => {
-    wsRetryMs = 1500;
+    wsRetryMs = 0;
     wsHeardAt = Date.now();
     setWsOnline(true);
     syncLiveWatch();
@@ -5855,10 +5855,13 @@ function connectWs() {
   };
   ws.onclose = () => {
     wsHadDropped = true; setWsOnline(false);
-    // Back off while the gateway is down (a restart, an expired session) instead
-    // of hammering it from every open tab at a fixed 1.5 s.
+    // Most drops are over by the time anyone sees them (a background tab the
+    // browser froze, a laptop that slept: the gateway let go of a socket that
+    // stopped answering), so the first retry is at once. Back off only while
+    // the gateway stays down (a restart, an expired session) instead of
+    // hammering it from every open tab.
     connectWs.retryTimer = setTimeout(connectWs, wsRetryMs);
-    wsRetryMs = Math.min(wsRetryMs * 2, 30_000);
+    wsRetryMs = Math.min(Math.max(wsRetryMs * 2, 1500), 30_000);
   };
 }
 
@@ -5874,7 +5877,7 @@ function syncLiveWatch() {
 }
 
 let wsHadDropped = false;
-let wsRetryMs = 1500; // reconnect delay; doubles per failed attempt up to 30 s, reset on open
+let wsRetryMs = 0; // reconnect delay: at once, then 1.5 s doubling per failed attempt up to 30 s; reset on open
 
 // A socket can die without a close — the laptop slept, the network changed —
 // and then looks open while every update goes missing, so labels froze until a
@@ -5907,9 +5910,16 @@ function watchWsLiveness() {
   // Back on a network: the old connection belonged to the previous one.
   window.addEventListener('online', () => { if (S.ws) reconnectWs(); });
 }
+// A gap the next connection closes at once is not worth a word: the page
+// re-reads what it missed. Only one that lasts says live updates are paused.
+const WS_OFFLINE_NOTICE_MS = 4_000;
+let wsOfflineNotice;
 function setWsOnline(online) {
+  if (online === S.wsOnline) return;
   S.wsOnline = online;
-  document.getElementById('ws-offline')?.classList.toggle('hidden', online);
+  clearTimeout(wsOfflineNotice);
+  if (online) document.getElementById('ws-offline')?.classList.add('hidden');
+  else wsOfflineNotice = setTimeout(() => document.getElementById('ws-offline')?.classList.remove('hidden'), WS_OFFLINE_NOTICE_MS);
 }
 
 let taskRefreshPromise = null;
