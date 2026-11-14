@@ -34,6 +34,12 @@ export function parseHostedUrl(url: string): { id: string; name: string } | unde
   return match ? { id: match[1]!, name: match[2]! } : undefined;
 }
 
+/** Repositories that can only land by push: all of them tavya's. Pull requests
+ * need GitHub, so on hosted this decides the remote policy over whatever a
+ * project, its settings or a task names (tavya-error 5b7a123b7e52ac15). */
+export const landsByPushOnTavya = (repos: readonly string[] | undefined): boolean =>
+  Boolean(repos?.length) && repos!.every((repo) => parseHostedUrl(repo) !== undefined);
+
 /** What `git clone` takes, at `base` (this installation's public URL). */
 export const hostedCloneUrl = (base: string, repository: Pick<Repository, 'id' | 'name'>): string =>
   `${base.replace(/\/$/, '')}${HOSTED_GIT_ROUTE}${repository.id}/${repository.name}.git`;
