@@ -6,8 +6,8 @@ afterAll(closeConsoleBrowser);
 type Status = Record<string, any>;
 const status = (overrides: Status = {}): Status => ({
   organizationId: 'o', visible: true, display: 'expanded', complete: false, replay: false,
-  completedRequired: 1, totalRequired: 3,
-  steps: { github: { complete: true, blocking: false }, agentLogin: { complete: false },
+  completedRequired: 2, totalRequired: 4,
+  steps: { github: { complete: true }, agentLogin: { complete: false },
     compute: { complete: true, managed: false, own: true }, optional: {}, project: { complete: false } },
   ...overrides,
 });
@@ -32,10 +32,10 @@ describe('hosted onboarding UI', () => {
     const ui = await hosted();
     const steps = guide(ui).locator('.onboarding-step');
     await steps.first().waitFor();
-    // GitHub is optional: a project's code can live on tavya itself.
+    // GitHub is required; only apps and cards are optional.
     expect(await steps.locator('.onboarding-step-title').allInnerTexts()).toEqual([
       'Add agent logins', 'Get computers for your agents', 'Create your first project',
-      'Connect GitHub\nOptional', 'Connect apps and payment cards\nOptional', // sentence case, like every label
+      'Connect GitHub', 'Connect apps and payment cards\nOptional', // sentence case, like every label
     ]);
     expect(await steps.nth(4).innerText()).toContain('This never blocks setup.');
     expect(await guide(ui).locator('.onboarding-foot').innerText()).toContain('Optional items do not count toward completion.');
@@ -62,6 +62,27 @@ describe('hosted onboarding UI', () => {
     await expect.poll(() => step.locator('.onboarding-check').innerText(), { timeout: 8_000 }).toBe('✓');
     expect(await options.evaluateAll((rows) => rows.map((row) => row.classList.contains('complete')))).toEqual([true, false]);
     expect(await options.locator('a.btn').allInnerTexts()).toEqual(['Manage plan', 'Connect']);
+    await ui.close();
+  });
+
+  it('heads the steps with the free trial, which finishes none of them', async () => {
+    const endsAt = new Date(2026, 10, 27, 12).getTime();
+    let trial: Status | undefined = { creditMicros: 5_000_000, endsAt, agents: true };
+    const ui = await hosted({ onboarding: () => status({ completedRequired: 1, ...(trial ? { trial } : {}), steps: { ...status().steps,
+      compute: { complete: false, managed: false, own: false } } }) });
+    await guide(ui).locator('.onboarding-trial').waitFor();
+    expect(await guide(ui).locator('.onboarding-trial').innerText()).toBe('Free trial: $5 of compute and agents included until Nov 27.');
+    expect(await guide(ui).locator('.onboarding-intro').innerText()).toBe('For the full experience:');
+    const step = guide(ui).locator('.onboarding-step').nth(1);
+    expect(await step.locator('.onboarding-check').innerText()).toBe('2');
+    expect(await step.locator('.onboarding-option.complete').count()).toBe(0);
+    expect(await step.locator('.onboarding-option small').first().innerText()).toMatch(/^Includes .+’s computers$/) // no trial date on the plan;
+    // Without the included model, only compute is included; without a trial, the usual intro.
+    trial = { creditMicros: 5_000_000, endsAt, agents: false };
+    await expect.poll(() => guide(ui).locator('.onboarding-trial').innerText(), { timeout: 8_000 }).toBe('Free trial: $5 of compute included until Nov 27.');
+    trial = undefined;
+    await expect.poll(() => guide(ui).locator('.onboarding-trial').count(), { timeout: 8_000 }).toBe(0);
+    expect(await guide(ui).locator('.onboarding-intro').innerText()).toMatch(/^A few real connections/);
     await ui.close();
   });
 
@@ -124,7 +145,7 @@ describe('hosted onboarding UI', () => {
     } });
     const progress = guide(ui).getByRole('progressbar');
     expect(await progress.getAttribute('aria-valuenow')).toBe('1');
-    expect(await progress.getAttribute('aria-label')).toBe('1 of 3 required setup steps complete');
+    expect(await progress.getAttribute('aria-label')).toBe('1 of 4 required setup steps complete');
     // Progress made elsewhere (an agent login added in another tab) shows up without a reload.
     completed = 2;
     await expect.poll(() => progress.getAttribute('aria-valuenow'), { timeout: 8_000 }).toBe('2');
@@ -132,7 +153,7 @@ describe('hosted onboarding UI', () => {
     await guide(ui).getByRole('button', { name: 'Minimize setup guide' }).click();
     const reopen = guide(ui).getByRole('button', { name: 'Open setup guide' });
     await reopen.waitFor();
-    expect(await reopen.innerText()).toContain('2 of 3 required steps');
+    expect(await reopen.innerText()).toContain('2 of 4 required steps');
     await reopen.click();
     await guide(ui).getByRole('button', { name: 'Close setup guide' }).click();
     await expect.poll(() => guide(ui).isHidden()).toBe(true);
@@ -158,7 +179,7 @@ describe('hosted onboarding UI', () => {
   });
 
   it('keeps window controls together in the header, not a Minimize button in the footer', async () => {
-    const ui = await hosted({ onboarding: () => status({ replay: true, completedRequired: 3 }) });
+    const ui = await hosted({ onboarding: () => status({ replay: true, completedRequired: 4 }) });
     const controls = await guide(ui).locator('.onboarding-head button').evaluateAll((buttons) =>
       buttons.map((button) => button.getAttribute('aria-label')));
     expect(controls).toEqual(['Minimize setup guide', 'Close setup guide']);

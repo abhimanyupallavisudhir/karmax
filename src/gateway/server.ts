@@ -129,10 +129,10 @@ import { ensureProjectWikiRemote, moveProjectWikiToGithub } from '../wiki/projec
 import { worldRepos, worldWorkingDirectory, worldWorkingRelativePath, type WorldHandle } from '../world/types.js';
 import { enumerateCredentials, normalizePolicy, resolveCredentials } from '../platform/credentials.js';
 import { errorStatus } from './error-status.js';
-import { projectReadiness, usableAgentCredentials, type ReadinessDeps } from '../platform/readiness.js';
+import { defaultAgentProfile, projectReadiness, usableAgentCredentials, type ReadinessDeps } from '../platform/readiness.js';
 import { reportError } from '../platform/error-reports.js';
 import { errorReportSettings, saveErrorReportSettings } from '../platform/error-fixer.js';
-import { includedModel, includedModelView, removeIncludedModelKey, saveIncludedModel, seedIncludedModelDefaults } from '../agent/included-model.js';
+import { includedModel, includedModelView, removeIncludedModelKey, saveIncludedModel } from '../agent/included-model.js';
 import type { Effort } from '../agent/effort.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems, itemHandle, relatedVaultItems, searchVaultItems, weakensProtection } from '../autonomy/vault-items.js';
@@ -150,7 +150,7 @@ import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, knownProviderEndpoin
 import { avatarCallableBy } from '../platform/avatars.js';
 import { AccountErasureService, ErasureError } from '../privacy/account-erasure.js';
 import { hostedOnboardingKey, hostedOnboardingRequired, hostedOnboardingStatus, parseHostedOnboardingRecord,
-  parseHostedOnboardingDisplay } from './hosted-onboarding.js';
+  parseHostedOnboardingDisplay, type HostedOnboardingFacts } from './hosted-onboarding.js';
 import { CHECKOUT_DISCLOSURES, assertPaidLaunchReady, assertPolicyAcceptance,
   policyDocument, publicLaunchInfo } from '../launch/legal.js';
 
@@ -2702,16 +2702,18 @@ export class Gateway {
         }
         const enabledCredentials = await usableAgentCredentials(this.readinessDeps(), { organizationId });
         const clouds = await Promise.all(CLOUD_WORLD_PROVIDERS.map((provider) => store.getWorldProviderConnection(organizationId, provider)));
-        const facts = {
+        const credit = await computeCredit(store, organizationId);
+        const facts: HostedOnboardingFacts = {
           // This organization's own repository access; signing in with GitHub alone gives it none.
           github: (await store.listGitConnections(organizationId)).some((connection) => !connection.suspendedAt),
-          // tavya's included model needs no login of the organization's own.
-          agentLogin: enabledCredentials.length > 0 || !!(await includedModel(store, this.deps.broker)),
+          // A login of its own: the trial's included model lets it work, but is not one.
+          agentLogin: enabledCredentials.length > 0,
           ownCompute: (await Promise.all(clouds.map(async (connection) => !!connection?.enabled
             && !!await this.deps.broker?.hasHandle(connection.credentialHandle)))).some(Boolean),
           managedCompute: (await this.deps.subscriptions?.hasPaidSubscription(organizationId) ?? false)
-            || await computeCredit(store, organizationId).then((credit) =>
-              (credit.creditMicros ?? 0) + credit.topUpMicros + (credit.trial?.monthMicros ?? 0) > 0),
+            || (credit.creditMicros ?? 0) + credit.topUpMicros > 0,
+          ...(credit.trial && credit.trial.leftMicros > 0 ? { computeTrial: { creditMicros: credit.trial.creditMicros,
+            endsAt: credit.trial.endsAt, agents: !!(await includedModel(store, this.deps.broker)) } } : {}),
           vault: (await new VaultItems(store, this.deps.broker, undefined, organizationId).list())
             .some((item) => item.type === 'login' && item.fields.includes('password')),
           card: (await store.listOrganizationCards(organizationId)).length > 0,
@@ -3020,7 +3022,6 @@ export class Gateway {
         if (this.deps.hosted) {
           (await this.enableHostedOnboarding(subject.userId, organization.id));
           (await startComputeTrial(store, organization.id, subject.userId));
-          (await seedIncludedModelDefaults(store, this.deps.broker, organization.id));
         }
         if (b.autonomous !== true) return this.json(res, 200, organization);
         // An autonomous organization starts with a project its co-ordinator runs
@@ -9588,8 +9589,9 @@ export class Gateway {
       if ((f.type !== 'agent' && f.type !== 'confirmer' && f.type !== 'responder') || !f.role) continue;
       const spec = (out[f.name] as any) || {};
       // The project's role-default overlay overrides the global one (SPEC §9), so a
-      // per-project model/provider default flows through to new tasks' inherited value.
-      const prof = (await roleDefaultProfile(this.deps.store, f.role, projectId, organizationId));
+      // per-project model/provider default flows through to new tasks' inherited value;
+      // one the organization can't run gives way to the included model.
+      const prof = (await this.defaultAgent(f.role, projectId, organizationId));
       const provider = spec.provider ?? prof?.provider ?? defaultProvider().provider;
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);
@@ -10946,13 +10948,20 @@ export class Gateway {
       if (this.deps.hosted) {
         (await this.enableHostedOnboarding(userId, organization.id));
         (await startComputeTrial(this.deps.store, organization.id, userId));
-        (await seedIncludedModelDefaults(this.deps.store, this.deps.broker, organization.id));
       }
       return true;
     } catch (e) {
       console.error('[signup] personal workspace provisioning failed:', e instanceof Error ? e.message : e);
       return false;
     }
+  }
+
+  /** The role's default agent here, as task creation will pin it (`defaultAgentProfile`). */
+  private async defaultAgent(role: string, projectId?: string, organizationId?: string) {
+    organizationId ??= projectId ? (await this.deps.store.getProject(projectId))?.organizationId : undefined;
+    if (!organizationId) return roleDefaultProfile(this.deps.store, role, projectId);
+    return (await defaultAgentProfile(this.readinessDeps(), role, { organizationId, ...(projectId ? { projectId } : {}) },
+      defaultProvider().provider)).profile;
   }
 
   private readinessDeps(): ReadinessDeps {

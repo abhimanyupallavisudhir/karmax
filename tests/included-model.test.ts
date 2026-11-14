@@ -11,10 +11,12 @@ import { Store } from '../src/store/db.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { INCLUDED_MODEL_DEFAULT, INCLUDED_MODEL_OPTIONS, includedModel, includedModelKey, includedModelRelativeCost, resetIncludedModelPrices, includedModelOutOfCredit, includedModelView, isIncludedModel,
-  removeIncludedModelKey, saveIncludedModel, seedIncludedModelDefaults, syncIncludedModelUsage } from '../src/agent/included-model.js';
+  removeIncludedModelKey, saveIncludedModel, syncIncludedModelUsage } from '../src/agent/included-model.js';
 import { ComputeCreditExhausted, computeCredit, computeMonth, startComputeTrial } from '../src/world/managed-compute.js';
 import { organizationProfileId } from '../src/agent/profiles.js';
-import { projectReadiness } from '../src/platform/readiness.js';
+import { defaultAgentProfile, projectReadiness } from '../src/platform/readiness.js';
+import { ConfigHomeManager } from '../src/autonomy/config-homes.js';
+import { organizationScope } from '../src/autonomy/vault-keys.js';
 
 /** OpenRouter's key-management API, as far as tavya uses it. */
 const keys = new Map<string, { key: string; limit: number | null; usage: number; disabled: boolean; name: string }>();
@@ -103,9 +105,12 @@ describe('included model settings', () => {
     expect(await includedModel(self.store, self.broker)).toBeUndefined();
   });
 
-  it('makes a new organization\'s Task defaults run on it, and moves them along when the model or effort changes', async () => {
+  it('moves Task defaults on it along when the model or effort changes', async () => {
     const f = await fixture();
-    expect(await seedIncludedModelDefaults(f.store, f.broker, f.organization.id)).toBe(true);
+    // An organization that chose it for every role.
+    for (const role of ['do', 'confirm', 'responder'])
+      await f.store.upsertProfile({ id: organizationProfileId(f.organization.id, role), name: role, role: role as any, provider: 'opencode',
+        model: 'openrouter/deepseek/deepseek-v4.1-flash-1017', effort: 'max' });
     const doAgent = await f.store.getProfile(organizationProfileId(f.organization.id, 'do'));
     expect(doAgent).toMatchObject({ provider: 'opencode', model: 'openrouter/deepseek/deepseek-v4.1-flash-1017', effort: 'max', role: 'do' });
     // A default the organization changed is its own.
@@ -208,6 +213,52 @@ describe('readiness', () => {
     expect(await includedModelRelativeCost(settings, 'openrouter/deepseek/deepseek-v4.1-flash-1017', 'max')).toBe(1);
     expect(await includedModelRelativeCost(settings, 'openrouter/openai/gpt-6.1-terra', 'medium')).toBeCloseTo(2.78, 2);
     expect(await includedModelRelativeCost(settings, 'openrouter/unknown/model')).toBeUndefined();
+  });
+});
+
+describe('the default agent', () => {
+  const included = { provider: 'opencode' as const, model: 'openrouter/deepseek/deepseek-v4.1-flash-1017', effort: 'max' as const };
+  async function scope(options: { hosted?: boolean; configure?: boolean } = {}) {
+    const f = await fixture(options);
+    const homes = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-included-homes-'));
+    cleanups.push(() => fs.rmSync(homes, { recursive: true, force: true }));
+    const project = await f.store.createProject('Cloud', { worldProvider: 'e2b' }, f.organization.id);
+    const deps = { store: f.store, hosted: options.hosted ?? true, broker: f.broker, configHomes: new ConfigHomeManager(homes) };
+    const ask = (role = 'do') => defaultAgentProfile(deps, role, { organizationId: f.organization.id, projectId: project.id }, 'claude');
+    return { ...f, project, ask };
+  }
+
+  it('is the included model while nothing of the organization\'s own runs its Task default, and that default once something does', async () => {
+    const f = await scope();
+    // A new organization: the installation's default (Claude) and no login.
+    expect(await f.ask()).toMatchObject({ included: true, profile: { ...included, role: 'do', mcpConnections: ['browser:chrome-devtools'] } });
+    expect((await f.ask('merge')).profile).toMatchObject(included);
+    // Its own Task default on Codex, with an OpenAI key of its own: that is what runs.
+    await f.store.upsertProfile({ id: organizationProfileId(f.organization.id, 'do'), name: 'Do', role: 'do', provider: 'codex', model: 'gpt-6.1-sol', mcpConnections: [] });
+    expect(await f.ask()).toMatchObject({ included: true, profile: { ...included, mcpConnections: [] } });
+    await f.broker.registerHandle(`openai:${f.organization.id}:main`, 'sk-test', organizationScope(f.organization.id));
+    const own = await f.ask();
+    expect(own.included).toBeUndefined();
+    expect(own.profile).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol' });
+  });
+
+  it('keeps a default that already runs on the credit, and changes nothing where there is no included model', async () => {
+    const f = await scope();
+    await f.store.upsertProfile({ id: organizationProfileId(f.organization.id, 'do'), name: 'Do', role: 'do', provider: 'opencode', model: 'openrouter/openai/gpt-6.1-sol' });
+    expect(await f.ask()).toEqual({ profile: expect.objectContaining({ model: 'openrouter/openai/gpt-6.1-sol' }) });
+    // Switched off, or never configured, or self-hosted: the Task default as it is.
+    await saveIncludedModel(f.store, f.broker, { enabled: false });
+    expect((await f.ask('merge')).included).toBeUndefined();
+    expect((await (await scope({ configure: false })).ask()).included).toBeUndefined();
+    expect((await (await scope({ hosted: false })).ask()).included).toBeUndefined();
+  });
+
+  it('says in readiness which agent is the included model itself', async () => {
+    const f = await scope();
+    const readiness = await projectReadiness({ store: f.store, hosted: true, broker: f.broker }, { organizationId: f.organization.id, projectId: f.project.id },
+      [included, { provider: 'opencode', model: 'openrouter/openai/gpt-6.1-sol' }]);
+    expect(readiness.agents.map((agent) => agent.included)).toEqual([true, undefined]);
+    expect(readiness.agentLogin).toBe(false);
   });
 });
 
