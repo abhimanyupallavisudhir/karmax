@@ -48,6 +48,8 @@
   "tests/armed-form-return-to-draft.browser.test.ts": 2,
   "tests/armed-form-started.browser.test.ts": 2.8,
   "tests/artifact-edge.test.ts": 0.7,
+  "tests/artifact-gallery.browser.test.ts": 11.5,
+  "tests/artifact-gallery.test.ts": 7.3,
   "tests/artifact-streaming.test.ts": 1.5,
   "tests/async-batch.test.ts": 0.1,
   "tests/async-database.test.ts": 1,

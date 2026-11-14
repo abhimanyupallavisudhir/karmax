@@ -86,7 +86,8 @@ import { validGitBranch } from '../util/git-ref.js';
 import { HOSTED_GIT_ROUTE, hostedRepositoryUrl, isHostedRepository, isValidHostedName } from '../domain/hosted-repository.js';
 import { materializeGitCredential } from '../world/git-credential.js';
 type Repository = import('../domain/types.js').Repository;
-import { FileAccessError, FileNotFoundError, ProjectFiles, projectRepositoryCredential, splitPath, type FileNode, type FileView, type OpenedFile } from '../world/project-files.js';
+import { projectArtifactGallery, type GalleryArtifact } from '../platform/artifact-gallery.js';
+import { FileAccessError, FileNotFoundError, ProjectFiles, projectRepositoryCredential, splitPath, worldFilesPath, type FileNode, type FileView, type OpenedFile } from '../world/project-files.js';
 import { createFileShare, currentFileShare, projectFileShares, publicFileShare, publicFilesHtml, revokeFileShare, type FileShare } from './file-sharing.js';
 import { cliVersionOf, olderVersion } from '../domain/cli-version.js';
 import { WorkspaceConflict, WorldNotRunningError } from '../world/resources.js';
@@ -277,6 +278,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // Insights are every member's view of the organization's work; money inside
   // them is included only for callers who also hold payment:read (handler).
   if (/^\/api\/organizations\/[^/]+\/insights$/.test(p)) return 'organization:read';
+  // Each project's artifacts are then filtered by task:read (and repository:read for their latest version).
+  if (/^\/api\/organizations\/[^/]+\/artifacts$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/entitlements$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/status$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/(?:gift|gift-storage|gift-compute|compute-markup)$/.test(p)) return 'subscription:gift';
@@ -408,6 +411,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The Files page: data under it also needs project:settings:read, checked there.
   if (/^\/api\/projects\/[^/]+\/files(?:\/raw|\/views)?$/.test(p)) return 'repository:read';
   if (/^\/api\/tasks\/[^/]+\/file-location$/.test(p)) return 'task:read';
+  if (/^\/api\/projects\/[^/]+\/artifacts$/.test(p)) return 'task:read';
   // Public links to a snapshot of a path: anyone who reads Files sees them; making or revoking one is its own capability.
   if (/^\/api\/projects\/[^/]+\/file-shares$/.test(p)) return read ? 'repository:read' : 'project:files:share';
   if (/^\/api\/organizations\/[^/]+\/cli-git-credentials$/.test(p)) return read ? 'organization:read' : 'organization:edit';
@@ -3933,6 +3937,13 @@ export class Gateway {
             ? { managedBudgets: managed.map((account) => ({ provider: account.provider, ...(account.limits?.pool ? { pool: account.limits.pool } : {}) })) } : {}),
         }));
       }
+      // Every project's artifact gallery, as one (each project the caller may read the tasks of).
+      const organizationArtifacts = p.match(/^\/api\/organizations\/([^/]+)\/artifacts$/);
+      if (organizationArtifacts && method === 'GET') {
+        const projects = await store.listOrganizationProjects(organizationArtifacts[1]!);
+        res.setHeader('cache-control', 'private, no-cache');
+        return this.json(res, 200, { artifacts: await this.artifactGallery(token, projects.map((project) => project.id)) });
+      }
       const usage = p.match(/^\/api\/organizations\/([^/]+)\/usage$/);
       if (usage && method === 'GET') {
         const now = Date.now();
@@ -5282,6 +5293,14 @@ export class Gateway {
           : { scope: 'project', id: projectId, canManage: (await this.deps.tokens.check(token, 'project:settings:write', scope)).ok };
         return this.json(res, 200, { enabled: policy.effective, canShare: (await this.deps.tokens.check(token, 'project:files:share', scope)).ok,
           settings, url: share ? shareUrl(share) : null, createdAt: share?.createdAt ?? null, kind: share?.kind ?? null });
+      }
+      // Files Review attached that nothing superseded (wiki features/project-files).
+      const projectArtifacts = p.match(/^\/api\/projects\/([^/]+)\/artifacts$/);
+      if (projectArtifacts && method === 'GET') {
+        const projectId = projectArtifacts[1]!;
+        if (!(await store.getProject(projectId))) return this.json(res, 404, { error: 'project not found' });
+        res.setHeader('cache-control', 'private, no-cache');
+        return this.json(res, 200, { artifacts: await this.artifactGallery(session.apiToken, [projectId]) });
       }
       // The project as a file tree (wiki features/project-files).
       const projectFiles = p.match(/^\/api\/projects\/([^/]+)\/files(\/raw|\/views)?$/);
@@ -10501,6 +10520,16 @@ export class Gateway {
       } });
   }
 
+  /** The artifact galleries of `projectIds` the caller may read the tasks of, as one, newest first. */
+  private async artifactGallery(token: string, projectIds: string[]): Promise<GalleryArtifact[]> {
+    const galleries = await Promise.all(projectIds.map(async (projectId) => {
+      if (!(await this.deps.tokens.check(token, 'task:read', { projectId })).ok) return [];
+      const repository = (await this.deps.tokens.check(token, 'repository:read', { projectId })).ok;
+      return projectArtifactGallery({ store: this.deps.store, files: this.projectFiles() }, projectId, { repository });
+    }));
+    return galleries.flat().sort((a, b) => b.at - a.at);
+  }
+
   /** What `?task=` (a number or id) or `?branch=` asks the Files page to show, or a refusal. */
   private async filesView(token: string, projectId: string, url: URL): Promise<FileView | { error: string; status: number }> {
     const taskKey = url.searchParams.get('task');
@@ -10518,18 +10547,7 @@ export class Gateway {
   /** Where a path an agent cited (absolute in its world, or relative to its
    * working folder) sits in its project's Files, relative to the world root. */
   private async citedFilePath(task: import('../domain/types.js').TaskRecord, cited: string): Promise<string> {
-    const value = String(cited).replace(/\\/g, '/');
-    if (!value) throw new Error('missing path');
-    const handle = ((await this.deps.store.currentWorld(task.id)) ?? task.lastView?.world) as WorldHandle | undefined;
-    let relative = value;
-    if (handle) {
-      const root = String(handle.root ?? '').replace(/\/+$/, '');
-      if (value.startsWith('/')) {
-        if (value !== root && !value.startsWith(`${root}/`)) throw new Error('That file is outside the task’s world.');
-        relative = value === root ? '' : value.slice(root.length + 1);
-      } else relative = worldWorkingRelativePath(handle, value);
-    }
-    return splitPath(relative === '.' ? '' : relative).join('/');
+    return worldFilesPath(((await this.deps.store.currentWorld(task.id)) ?? task.lastView?.world) as WorldHandle | undefined, cited);
   }
 
   /** Tasks whose world can be shown (running, parked or saved), newest first, for the view picker. */

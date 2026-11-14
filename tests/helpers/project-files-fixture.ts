@@ -89,7 +89,7 @@ export async function projectFilesFixture(cleanups: Array<() => Promise<void> | 
   const tokens = new TokenAuthority(store);
   const client = { workflow: { getHandle: () => ({}) } } as any;
   const api = new KarmaxApi({ store, tokens, client, worlds, taskQueue: 'test', resources });
-  const gateway = await Gateway.create({ api, store, tokens, client, worlds, taskQueue: 'test', resources, broker,
+  const gateway = await Gateway.create({ api, store, tokens, client, worlds, taskQueue: 'test', resources, broker, objects,
     bus: new KarmaxBus(), contributions: new ContributionRegistry(), overlays: new Overlays(), staticDir: 'web',
     agentInfo: { provider: 'mock', reason: 'project files test' } });
   const server = await gateway.listen(await findFreePortFrom(49_800));
@@ -109,6 +109,6 @@ export async function projectFilesFixture(cleanups: Array<() => Promise<void> | 
     json(): Promise<any>; text(): Promise<string>; arrayBuffer(): Promise<ArrayBuffer> }> =>
     fetch(`${server.url}/api/projects/${project.id}/files${raw ? '/raw' : ''}?path=${encodeURIComponent(query)}`,
       { headers: { authorization: `Bearer ${token}`, ...headers } });
-  return { owner, resources, dir, store, project, gateway, data, corpus, site, binary, server, get, tokenFor, viewer: await tokenFor(capsOf('viewer') as string[]) };
+  return { owner, objects, remotes, resources, dir, store, project, gateway, data, corpus, site, binary, server, get, tokenFor, viewer: await tokenFor(capsOf('viewer') as string[]) };
 }
 

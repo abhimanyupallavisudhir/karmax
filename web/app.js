@@ -122,6 +122,7 @@ const ICON = {
   // installation-wide tools at the foot (icons; the name is the aria-label and tooltip).
   home: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.2a2 2 0 0 1 .7-1.5l7-6a2 2 0 0 1 2.6 0l7 6a2 2 0 0 1 .7 1.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M9.5 21v-6.5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1V21"/></svg>',
   insights: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="m7 15 4-5 3.5 3L20 6.5"/></svg>',
+  files: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>',
   wiki: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3Z"/></svg>',
   settings: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z"/><circle cx="12" cy="12" r="3"/></svg>',
   // The inbox bell and the phone's sidebar toggle, drawn like the rail icons.
@@ -563,7 +564,7 @@ const PROJECT_TAB_COMMANDS = { tasks: 'nav.tasks', queue: 'nav.queue', files: 'n
 // The query a task list opens with: what needs the signed-in person.
 const DEFAULT_LIST_QUERY = 'for:me -is:archived';
 // Second-segment words that name an organization-level view rather than a project.
-const ORG_VIEWS = { insights: 'insights', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki' };
+const ORG_VIEWS = { insights: 'insights', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki', files: 'orgfiles' };
 
 // Parse an in-app URL — a path, optionally with its `?…` query string — into the
 // page it names. The tasks list's whole search state (free text, filters, group,
@@ -608,6 +609,9 @@ function parseRoute(url) {
   if (seg[1] === 'dashboard') return { name: 'global', org, tab: 'insights', legacy: true };
   // The inbox was once one organization's, with a tab per kind of notification.
   if (ORG_VIEWS[seg[1]] === 'inbox') return { name: 'global', tab: 'inbox', q, legacy: true };
+  // The organization's Files: a folder per project (/<org>/files/<project>/<path>), in a view as a project's.
+  if (ORG_VIEWS[seg[1]] === 'orgfiles') return { name: 'global', org, tab: 'orgfiles',
+    filesPath: rawSegments.slice(2).map((part) => decodeRoutePart(part, true)).join('/'), filesView: filesViewFromQuery(query) };
   if (ORG_VIEWS[seg[1]]) return { name: 'global', org, tab: ORG_VIEWS[seg[1]] };
   const tab = PROJECT_SCOPED_TABS.includes(seg[2]) ? seg[2] : 'tasks';
   const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
@@ -616,11 +620,15 @@ function parseRoute(url) {
   const wikiView = tab === 'wiki' ? wikiViewFromQuery(query) : '';
   const filesPath = tab === 'files' ? rawSegments.slice(3).map((part) => decodeRoutePart(part, true)).join('/') : null;
   // Which tree Files shows rides in the query, as the wiki's does: ?task=<n> or ?branch=<name>.
-  const filesView = tab === 'files' ? (query.get('task') ? `task:${query.get('task')}` : query.get('branch') ? `branch:${query.get('branch')}` : '') : '';
+  const filesView = tab === 'files' ? filesViewFromQuery(query) : '';
   // A Task store entry, opened to read before running or installing it.
   const storeKey = seg[2] === 'store' && seg[3] ? seg[3] : null;
   return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab, q, ...(taskFile ? { taskFile } : {}),
     ...(wikiView ? { wikiView } : {}), ...(storeKey ? { storeKey } : {}), ...(filesPath !== null ? { filesPath, filesView } : {}) };
+}
+
+function filesViewFromQuery(query) {
+  return query.get('task') ? `task:${query.get('task')}` : query.get('branch') ? `branch:${query.get('branch')}` : '';
 }
 
 // Which branch the project wiki shows is part of the page, so it lives in the
@@ -641,10 +649,17 @@ function wikiRoute(pid, view = '', entry = '') {
 
 // A place in the project's Files: /<org>/<project>/files/<path>, each name
 // escaped, in a view: '' (the branches tasks start from), 'task:<n>' or 'branch:<name>'.
-function filesRoute(pid, filePath = '', view = pid === S.projectId ? S.filesView || '' : '') {
+// On the organization's Files page the same place is /<org>/files/<project>/<path>.
+function filesRoute(pid, filePath = '', view = pid === filesProjectId() ? S.filesView || '' : '') {
   const parts = String(filePath).split('/').filter(Boolean);
-  return `${projectRoute(pid, 'files')}${parts.length ? `/${parts.map(encodeURIComponent).join('/')}` : ''}${filesViewQuery(view, '?')}`;
+  const base = S.tab === 'orgfiles' ? `${orgFilesRoute()}/${encodeURIComponent(projectSlug(projectById(pid)))}` : projectRoute(pid, 'files');
+  return `${base}${parts.length ? `/${parts.map(encodeURIComponent).join('/')}` : ''}${filesViewQuery(view, '?')}`;
 }
+// The organization's Files page (a folder per project, and every project's artifacts).
+function orgFilesRoute(org = currentOrg()) { return globalRoute('orgfiles', org); }
+// Whose files the page shows: the project tab's, or the folder open on the organization's page.
+function filesProjectId() { return S.tab === 'orgfiles' ? S.filesProjectId || null : S.projectId; }
+function isFilesTab(tab = S.tab) { return tab === 'files' || tab === 'orgfiles'; }
 function filesViewQuery(view, lead = '&') {
   const [kind, ...rest] = String(view || '').split(':');
   const value = rest.join(':');
@@ -700,7 +715,7 @@ function encodeQuery(q) {
 // An organization-level route (insights / settings / inbox) under the current
 // (or a given) org's slug. Internal tab key 'organization' → URL segment 'settings'.
 function globalRoute(tab, org = currentOrg()) {
-  const seg = tab === 'organization' ? 'settings' : tab === 'orgwiki' ? 'wiki' : tab;
+  const seg = tab === 'organization' ? 'settings' : tab === 'orgwiki' ? 'wiki' : tab === 'orgfiles' ? 'files' : tab;
   return `${orgBase(org)}/${seg}`;
 }
 
@@ -839,6 +854,20 @@ async function applyRoute() {
       if (dest !== location.pathname) return go(dest, { replace: true });
     }
     closeTaskDom();
+    if (r.tab === 'orgfiles') {
+      // A project's folder: its files, as on its own Files tab.
+      const [slug, ...rest] = String(r.filesPath || '').split('/').filter(Boolean);
+      const project = slug ? projectBySlug(slug, S.organizationId) : null;
+      if (slug && !project) { toast('Project not found', true); return go(orgFilesRoute(), { replace: true }); }
+      const pid = project?.id || null;
+      const filePath = rest.join('/');
+      // Coming back up focuses where you were: a folder in this project, or the project's own row.
+      S.filesFrom = S.tab === 'orgfiles' && (S.filesView || '') === (r.filesView || '')
+        ? (pid && pid === S.filesProjectId ? S.filesPath : !pid && S.filesProjectId && !S.filesPath ? projectSlug(projectById(S.filesProjectId)) : null) : null;
+      S.filesProjectId = pid;
+      S.filesPath = filePath;
+      S.filesView = pid ? r.filesView || '' : '';
+    }
     S.tab = r.tab;
     renderRail();
     // renderMain() already dispatches per-tab hydration (renderInsights,
@@ -6005,6 +6034,7 @@ function consolePageTitle() {
   const fileName = String(S.filesPath || '').split('/').filter(Boolean).pop();
   return {
     home: [org], inbox: ['Inbox'], insights: ['Insights', org], orgwiki: ['Wiki', org], organization: ['Settings', org],
+    orgfiles: [fileName || projectById(S.filesProjectId)?.name || 'Files', S.filesProjectId ? projectById(S.filesProjectId)?.name : org],
     installation: ['Installation'], profile: ['Profile'],
     tasks: [project], queue: ['Queues', project], activity: ['Activity', project],
     files: [fileName || 'Files', project], wiki: ['Wiki', project], settings: ['Settings', project],
@@ -6587,6 +6617,7 @@ function refreshForMeCounts(delay = 300) {
 const RAIL_ORG_NAV = [
   ['rail-home', 'Home', 'home', ['home'], () => homeRoute(), 'Home — every project, what needs you first', 'nav.home'],
   ['rail-insights', 'Insights', 'insights', ['insights'], () => globalRoute('insights'), 'Insights', 'nav.insights'],
+  ['rail-files', 'Files', 'files', ['orgfiles'], () => orgFilesRoute(), 'Files — every project’s repositories, data and artifacts', 'nav.orgfiles'],
   ['rail-wiki', 'Wiki', 'wiki', ['orgwiki'], () => globalRoute('orgwiki'), 'Wiki — organization-wide skills, memories, and the general agent prompt', 'nav.orgwiki'],
   ['rail-organization', 'Settings', 'settings', ['organization', 'global'], () => globalRoute('organization'), 'Organization settings', 'nav.global'],
 ];
@@ -6887,7 +6918,7 @@ function renderMain() {
   const context = $('#topbar-context');
   if (context) context.textContent = S.selected ? ''
     : PROJECT_SCOPED_TABS.includes(S.tab) ? projectById(S.projectId)?.name || ''
-    : ['home', 'insights', 'orgwiki', 'organization'].includes(S.tab) ? currentOrg()?.name || '' : '';
+    : ['home', 'insights', 'orgfiles', 'orgwiki', 'organization'].includes(S.tab) ? currentOrg()?.name || '' : '';
   syncDocumentTitle();
   // A preload begun on the task list must not survive a trip through settings,
   // where the defaults it captured may have just been edited.
@@ -6910,13 +6941,12 @@ function renderMain() {
   if ((S.tab === 'wiki' || S.tab === 'orgwiki') && S.wikiEditing && $('#wiki-path')) return;
   // The Files page shown is already this place: a background refresh must not
   // repaint (and re-highlight) an open file or lose its scroll.
-  if (S.tab === 'files' && filesPageShows(S.projectId, S.filesPath)) return;
+  if (isFilesTab() && filesPageShows(filesProjectId(), S.filesPath)) return;
   const proj = S.projects.find((p) => p.id === S.projectId);
   // Activity remains available by direct URL for debugging, but is deliberately
   // absent from user-facing navigation.
   const tabs = ['tasks', 'queue', 'files', 'wiki', 'settings'];
-  // On a phone "Project settings" is "Settings": the top bar names the project.
-  const labels = { tasks: 'Tasks', queue: 'Queues', files: 'Files', wiki: 'Wiki', settings: '<span class="tab-wide">Project settings</span><span class="tab-narrow">Settings</span>' };
+  const labels = { tasks: 'Tasks', queue: 'Queues', files: 'Files', wiki: 'Wiki', settings: 'Settings' };
   const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
@@ -6933,6 +6963,7 @@ function renderMain() {
   else if (S.tab === 'installation') content = installationView();
   else if (S.tab === 'wiki') content = wikiView(proj);
   else if (S.tab === 'files') content = filesView(proj);
+  else if (S.tab === 'orgfiles') content = S.filesProjectId ? filesView(projectById(S.filesProjectId)) : orgFilesView();
   else if (S.tab === 'orgwiki') content = wikiView(null);
   else if (S.tab === 'profile') content = profileView();
   else if (S.tab === 'settings') content = settingsView(proj);
@@ -6950,6 +6981,7 @@ function renderMain() {
   if (S.tab === 'queue') wireQueueView();
   if (S.tab === 'wiki') wireWikiView(proj);
   if (S.tab === 'files') wireFilesView(proj);
+  if (S.tab === 'orgfiles') { if (S.filesProjectId) wireFilesView(projectById(S.filesProjectId)); else wireOrgFilesView(); }
   if (S.tab === 'orgwiki') wireWikiView(null);
   if (S.tab === 'settings') wireSettingsView(proj);
   if (S.tab === 'global') wireGlobalSettings();
@@ -12590,7 +12622,7 @@ const ARTIFACT_TEXT_PREVIEW_BYTES = 10 * 1024 * 1024;
 // and seeks), never through a popup the browser could block after an await.
 // The URL is served under a `sandbox` policy, so an HTML page in the frame
 // runs with an opaque origin, as it would in its own tab.
-async function showArtifactViewer({ name, url, view, text, refresh, gallery }) {
+async function showArtifactViewer({ name, url, view, text, refresh, gallery, links: places }) {
   const previousFocus = document.activeElement;
   const dialog = document.createElement('dialog');
   dialog.setAttribute('aria-labelledby', 'artifact-reader-title');
@@ -12609,7 +12641,7 @@ async function showArtifactViewer({ name, url, view, text, refresh, gallery }) {
     current = item;
     dialog.className = `modal-card artifact-reader artifact-${item.view || 'file'}${gallery ? ' artifact-gallery' : ''}`;
     dialog.querySelector('#artifact-reader-title').textContent = item.name;
-    dialog.querySelector('.artifact-reader-tools').innerHTML = `${item.view === 'markdown' ? texToggleHtml() : ''}${item.view === 'pdf' || item.view === 'page'
+    dialog.querySelector('.artifact-reader-tools').innerHTML = `${item.links || ''}${item.view === 'markdown' ? texToggleHtml() : ''}${item.view === 'pdf' || item.view === 'page'
       ? '<a class="btn sm" data-new-tab target="_blank" rel="noopener" title="Open in a new tab">↗</a>' : ''}`;
     point(item.url);
     dialog.querySelector('[data-download]').download = item.name;
@@ -12672,9 +12704,11 @@ async function showArtifactViewer({ name, url, view, text, refresh, gallery }) {
       mount(item);
     } catch (error) { toast(error.message, true); }
   };
-  mount({ name, url, view, text, refresh });
+  mount({ name, url, view, text, refresh, links: places });
   dialog.querySelectorAll('[data-step]').forEach((button) => button.addEventListener('click', () => step(Number(button.dataset.step))));
   dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());
+  // A link to somewhere else in the console (a gallery file's task, its place in Files) leaves the viewer.
+  dialog.addEventListener('click', (event) => { if (event.target.closest?.('[data-viewer-leave]')) dialog.close(); });
   // A click outside the card lands on the dialog itself (its backdrop).
   dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.close(); });
   // Consume Escape before the shell dispatcher can also close the task behind us.
@@ -19568,10 +19602,25 @@ const FV = globalThis.KarmaxFileView;
 function filesApi(pid, filePath, raw = false, download = false, view = S.filesView) {
   return `/api/projects/${encodeURIComponent(pid)}/files${raw ? '/raw' : ''}?path=${encodeURIComponent(filePath)}${filesViewQuery(view)}${download ? '&download=1' : ''}`;
 }
-function filesState() { return (S.files ||= { cache: new Map(), sharing: new Map(), views: new Map() }); }
+function filesState() { return (S.files ||= { cache: new Map(), sharing: new Map(), views: new Map(), artifacts: new Map() }); }
 function filesPageShows(pid, filePath, view = S.filesView) {
   const page = $('#files-page');
-  return !!page && page.dataset.project === pid && page.dataset.path === (filePath || '') && page.dataset.view === (view || '');
+  return !!page && page.dataset.scope === (S.tab === 'orgfiles' ? 'org' : 'project') && page.dataset.project === (pid || '')
+    && page.dataset.path === (filePath || '') && page.dataset.view === (view || '');
+}
+// One folder up: within the project, else (on the organization's page) its list of projects.
+function filesUpRoute(pid, filePath) {
+  if (FV.parts(filePath).length) return filesRoute(pid, FV.parent(filePath));
+  return S.tab === 'orgfiles' && pid ? orgFilesRoute() : null;
+}
+function filesBarHtml({ pid, filePath, view, crumbs, tools = '' }) {
+  const up = filesUpRoute(pid, filePath);
+  return `<div class="files-bar">
+      ${pid ? `<button type="button" class="files-view-button" id="files-view" aria-haspopup="listbox" title="Show another branch, or a task’s files">${filesViewLabelHtml(pid, view)}</button>` : ''}
+      <a class="btn sm icon files-up${up ? '' : ' disabled'}" data-spa href="${esc(up || '#')}" aria-label="Up a folder" title="Up a folder (Backspace)"${up ? '' : ' aria-disabled="true" tabindex="-1"'}>${FV.ICONS.up}</a>
+      <div class="files-address" id="files-address" title="Click to type a path (g l)">${crumbs}</div>
+      ${tools}
+    </div>`;
 }
 
 function filesView(proj) {
@@ -19580,48 +19629,93 @@ function filesView(proj) {
   const parts = FV.parts(filePath);
   const sharing = filesState().sharing.get(proj.id);
   const view = S.filesView || '';
-  return `<div class="files-page" id="files-page" data-project="${esc(proj.id)}" data-path="${esc(filePath)}" data-view="${esc(view)}">
-    <div class="files-bar">
-      <button type="button" class="files-view-button" id="files-view" aria-haspopup="listbox" title="Show another branch, or a task’s files">${filesViewLabelHtml(proj.id, view)}</button>
-      <a class="btn sm icon files-up${parts.length ? '' : ' disabled'}" data-spa href="${esc(filesRoute(proj.id, FV.parent(filePath)))}" aria-label="Up a folder" title="Up a folder (Backspace)"${parts.length ? '' : ' aria-disabled="true" tabindex="-1"'}>${FV.ICONS.up}</a>
-      <div class="files-address" id="files-address" title="Click to type a path (g l)">${filesCrumbsHtml(proj, parts)}</div>
-      <span class="files-source" id="files-source"></span>
-      <button type="button" class="btn sm icon files-share" id="files-share" data-tool="Share" title="Share a public link" aria-label="Share"${sharing?.canShare && !view ? '' : ' hidden'}>${FV.ICONS.share}</button>
-    </div>
+  const scope = S.tab === 'orgfiles' ? 'org' : 'project';
+  return `<div class="files-page" id="files-page" data-scope="${scope}" data-project="${esc(proj.id)}" data-path="${esc(filePath)}" data-view="${esc(view)}">
+    ${scope === 'org' ? ORG_FILES_TITLE : ''}${filesBarHtml({ pid: proj.id, filePath, view, crumbs: filesCrumbsHtml(proj, parts), tools: `<span class="files-source" id="files-source"></span>
+      <button type="button" class="btn sm icon files-share" id="files-share" data-tool="Share" title="Share a public link" aria-label="Share"${sharing?.canShare && !view ? '' : ' hidden'}>${FV.ICONS.share}</button>` })}
     <div class="files-body" id="files-body"><div class="files-status" role="status" aria-busy="true">Loading…</div></div>
+    ${!parts.length && !view ? artifactGalleryShellHtml() : ''}
   </div>`;
 }
 
 function filesCrumbsHtml(proj, parts) {
-  const crumbs = [`<a class="files-crumb files-crumb-root" data-spa href="${esc(filesRoute(proj.id))}">${esc(projectSlug(proj))}</a>`];
+  // On the organization's page the path starts at the organization, then the project's folder.
+  const crumbs = S.tab === 'orgfiles'
+    ? [`<a class="files-crumb files-crumb-root" data-spa href="${esc(orgFilesRoute())}">${esc(orgSlug(currentOrg()))}</a>`,
+      `<span class="files-sep" aria-hidden="true">/</span><a class="files-crumb" data-spa href="${esc(filesRoute(proj.id))}"${parts.length ? '' : ' aria-current="page"'}>${esc(projectSlug(proj))}</a>`]
+    : [`<a class="files-crumb files-crumb-root" data-spa href="${esc(filesRoute(proj.id))}">${esc(projectSlug(proj))}</a>`];
   // (Each crumb keeps the view: filesRoute carries it.)
   parts.forEach((part, i) => crumbs.push(`<span class="files-sep" aria-hidden="true">/</span><a class="files-crumb" data-spa href="${esc(filesRoute(proj.id, parts.slice(0, i + 1).join('/')))}"${i === parts.length - 1 ? ' aria-current="page"' : ''}>${esc(part)}</a>`));
   return `<nav class="files-crumbs" aria-label="Path">${crumbs.join('')}</nav>`;
 }
 
+// The organization's projects in its Files (each project's folder), most recent first in the rail's order.
+function orgFilesProjects() {
+  return (S.projects || []).filter((p) => p.organizationId === S.organizationId);
+}
+
+// The organization's Files: a folder per project, and every project's artifacts.
+const ORG_FILES_TITLE = '<h1 class="page-title files-title">Organization files</h1>';
+function orgFilesView() {
+  const org = currentOrg();
+  return `<div class="files-page" id="files-page" data-scope="org" data-project="" data-path="" data-view="">
+    ${ORG_FILES_TITLE}${filesBarHtml({ pid: null, filePath: '', view: '', crumbs: `<nav class="files-crumbs" aria-label="Path"><a class="files-crumb files-crumb-root" data-spa href="${esc(orgFilesRoute())}" aria-current="page">${esc(orgSlug(org))}</a></nav>` })}
+    <div class="files-body" id="files-body"></div>
+    ${artifactGalleryShellHtml()}
+  </div>`;
+}
+
+function wireOrgFilesView() {
+  const bar = $('#files-address');
+  bar?.addEventListener('click', (event) => { if (!event.target.closest('a, input')) editFilesAddress(); });
+  installFilesKeys();
+  const node = { path: '', kind: 'directory', entries: orgFilesProjects().map((p) => ({ name: projectSlug(p), kind: 'directory' })) };
+  FV.render($('#files-body'), node, {
+    href: (where) => `${orgFilesRoute()}/${FV.parts(where).map(encodeURIComponent).join('/')}`, link: ' data-spa',
+    raw: () => '', from: S.filesFrom, emptyRoot: 'This organization has no projects yet.',
+  });
+  loadArtifactGallery({ organizationId: S.organizationId });
+}
+
 // The address bar becomes a text field: Enter goes there, Esc (or leaving it) puts the breadcrumbs back.
+// On the organization's page a path starts with the project's folder.
 function editFilesAddress() {
   const bar = $('#files-address');
   const page = $('#files-page');
   if (!bar || !page || bar.querySelector('input')) return bar?.querySelector('input')?.focus();
+  const org = page.dataset.scope === 'org';
   const pid = page.dataset.project;
-  const current = page.dataset.path || '';
+  const prefix = org && pid ? projectSlug(projectById(pid)) : '';
+  const current = FV.join(prefix, page.dataset.path || '');
   const crumbs = bar.innerHTML;
   bar.classList.add('editing');
-  bar.innerHTML = `<input id="files-path-input" class="files-path-input" spellcheck="false" autocomplete="off" aria-label="Path" list="files-path-options" value="${esc(current)}" placeholder="repository/folder/file"><datalist id="files-path-options"></datalist>`;
+  bar.innerHTML = `<input id="files-path-input" class="files-path-input" spellcheck="false" autocomplete="off" aria-label="Path" list="files-path-options" value="${esc(current)}" placeholder="${org ? 'project/' : ''}repository/folder/file"><datalist id="files-path-options"></datalist>`;
   const input = bar.querySelector('input');
   const options = bar.querySelector('datalist');
   let restored = false, timer = 0, asked = null;
   const restore = () => { if (restored) return; restored = true; bar.classList.remove('editing'); bar.innerHTML = crumbs; };
+  // Where a typed path is: its project and the path inside it.
+  const place = (value) => {
+    if (!org) return { pid, path: value };
+    const [slug, ...rest] = FV.parts(value);
+    return { pid: slug ? projectBySlug(slug, S.organizationId)?.id : null, slug, path: rest.join('/') };
+  };
   // Suggest what the folder being typed holds.
   const suggest = async () => {
     const value = input.value.replace(/^\/+/, '');
     const dir = value.includes('/') ? value.slice(0, value.lastIndexOf('/')) : '';
     if (dir === asked) return;
     asked = dir;
-    const node = await filesLoad(pid, dir).catch(() => null);
-    if (restored || asked !== dir || node?.kind !== 'directory') return;
-    options.innerHTML = (node.entries || []).slice(0, 200).map((entry) =>
+    let names;
+    if (org && !dir) names = orgFilesProjects().map((p) => ({ name: projectSlug(p), kind: 'directory' }));
+    else {
+      const where = place(dir);
+      const node = where.pid ? await filesLoad(where.pid, where.path).catch(() => null) : null;
+      if (node?.kind !== 'directory') return;
+      names = node.entries || [];
+    }
+    if (restored || asked !== dir) return;
+    options.innerHTML = names.slice(0, 200).map((entry) =>
       `<option value="${esc(FV.join(dir, entry.name))}${entry.kind === 'directory' ? '/' : ''}"></option>`).join('');
   };
   input.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(suggest, 120); });
@@ -19630,9 +19724,12 @@ function editFilesAddress() {
     if (event.key === 'Escape') { event.preventDefault(); restore(); }
     if (event.key === 'Enter') {
       event.preventDefault();
-      const target = FV.resolve('', input.value.trim());
+      const target = FV.resolve('', input.value.trim()) ?? '';
       restored = true;
-      go(filesRoute(pid, target ?? ''));
+      if (!org) return go(filesRoute(pid, target));
+      const where = place(target);
+      if (where.slug && !where.pid) { restored = false; return toast('No such project', true); }
+      go(where.pid ? filesRoute(where.pid, where.path, where.pid === pid ? S.filesView : '') : orgFilesRoute());
     }
   });
   input.addEventListener('blur', () => setTimeout(restore, 150));
@@ -19663,10 +19760,12 @@ function installFilesKeys() {
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Backspace' || event.metaKey || event.ctrlKey || event.altKey || event.defaultPrevented) return;
     const page = $('#files-page');
-    if (S.tab !== 'files' || !page || !page.dataset.path || document.querySelector('dialog[open]')) return;
+    if (!isFilesTab() || !page || document.querySelector('dialog[open]')) return;
     if (event.target.closest?.('input, textarea, select, [contenteditable], dialog, .modal-overlay')) return;
+    const up = filesUpRoute(page.dataset.project, page.dataset.path);
+    if (!up) return;
     event.preventDefault();
-    go(filesRoute(page.dataset.project, FV.parent(page.dataset.path)));
+    go(up);
   });
 }
 
@@ -19681,7 +19780,9 @@ async function wireFilesView(proj) {
   $('#files-share')?.addEventListener('click', () => openFilesShare(pid, filePath));
   $('#files-view')?.addEventListener('click', () => openFilesViewPicker(pid));
   installFilesKeys();
-  const shows = () => filesPageShows(pid, filePath) && S.tab === 'files';
+  const tab = S.tab;
+  const shows = () => filesPageShows(pid, filePath) && S.tab === tab;
+  if ($('#files-artifacts')) loadArtifactGallery({ projectId: pid });
   // Whether you may share here: asked once per project, then the button shows.
   const sharing = filesState().sharing;
   if (!sharing.has(pid)) {
@@ -19713,6 +19814,133 @@ async function wireFilesView(proj) {
     markdownTools: texToggleHtml(), wireTools: wireTexToggles,
     copy: (text) => copyToClipboard(text).then(() => toast('Copied')), errorText: plainError,
   });
+}
+
+// ── Files: artifacts (wiki features/project-files) ──
+// Every file a task's Review attached that nothing has superseded since: what
+// unfinished tasks attach now, and what done ones left (a file in a
+// repository as it is there now; gone once deleted there). Newest first;
+// opening one steps through them all in the Review viewer.
+const ARTIFACT_GALLERY_FIRST = 24;
+
+function artifactGalleryShellHtml() {
+  return `<section class="files-artifacts" id="files-artifacts" aria-labelledby="files-artifacts-title" hidden>
+    <h2 class="files-artifacts-title" id="files-artifacts-title">Artifacts ${policyTip('Files tasks attached for review: what running tasks attach now, and the latest of what finished ones left.')}</h2>
+    <div class="review-gallery files-gallery" id="files-gallery" role="list"></div>
+  </section>`;
+}
+
+// Read once a minute at most per scope; a task's Review changing reads again.
+async function artifactGallery(scope, fresh = false) {
+  const key = scope.organizationId ? `org:${scope.organizationId}` : `project:${scope.projectId}`;
+  const cache = filesState().artifacts;
+  const entry = cache.get(key);
+  if (!fresh && entry && Date.now() - entry.at < 60_000) return entry.promise;
+  const url = scope.organizationId ? `/api/organizations/${encodeURIComponent(scope.organizationId)}/artifacts` : `/api/projects/${encodeURIComponent(scope.projectId)}/artifacts`;
+  const next = { at: Date.now(), promise: api(url).then((r) => r.artifacts || []) };
+  next.promise.catch(() => { if (cache.get(key) === next) cache.delete(key); });
+  cache.set(key, next);
+  return next.promise;
+}
+
+async function loadArtifactGallery(scope) {
+  const section = $('#files-artifacts');
+  if (!section) return;
+  let items;
+  try { items = await artifactGallery(scope); } catch { return; }
+  if (!section.isConnected || !items.length) return;
+  const grid = section.querySelector('#files-gallery');
+  section.hidden = false;
+  const across = !!scope.organizationId;
+  let shown = 0;
+  const more = () => {
+    const next = items.slice(shown, shown === 0 ? ARTIFACT_GALLERY_FIRST : items.length);
+    grid.insertAdjacentHTML('beforeend', next.map((item, i) => artifactGalleryTile(item, shown + i, across)).join(''));
+    shown += next.length;
+    section.querySelector('.files-artifacts-more')?.remove();
+    if (shown < items.length) section.insertAdjacentHTML('beforeend', `<button type="button" class="btn sm files-artifacts-more">Show all ${items.length}</button>`);
+    section.querySelector('.files-artifacts-more')?.addEventListener('click', more);
+    grid.querySelectorAll('.gallery-tile:not([data-wired])').forEach((tile) => {
+      tile.dataset.wired = '1';
+      tile.addEventListener('click', async () => {
+        tile.disabled = true;
+        try { await openArtifactGallery(items, Number(tile.dataset.i)); }
+        catch (error) { toast(plainError(error.message), true); }
+        finally { if (tile.isConnected) tile.disabled = false; }
+      });
+    });
+    loadArtifactThumbnails(grid, items);
+  };
+  more();
+}
+
+function artifactGalleryTile(item, i, across) {
+  const kind = reviewTileKind(item.name);
+  const media = kind === 'image' || kind === 'video' ? `<span class="review-tile-media" data-thumb="${kind}" aria-hidden="true">${kind === 'video' ? '<span class="review-tile-play">▶</span>' : ''}</span>`
+    : `<span class="review-tile-media review-tile-file" aria-hidden="true">${esc(kind.slice(0, 4).toUpperCase())}</span>`;
+  const project = projectById(item.projectId);
+  const where = [across ? projectSlug(project) : '', item.num != null ? `#${item.num}` : ''].filter(Boolean).join(' ');
+  const hint = [item.path, item.num != null ? `#${item.num} ${item.title}` : item.title, item.state === 'active' ? 'Task still underway' : ''].filter(Boolean).join('\n');
+  return `<button type="button" class="review-tile gallery-tile" role="listitem" data-i="${i}" title="${esc(hint)}">
+    ${media}<span class="review-tile-label">${esc(item.label || item.name)}</span>
+    <span class="gallery-tile-meta">${item.state === 'active' ? '<span class="gallery-tile-live" aria-label="Task still underway"></span>' : ''}${esc(where)}</span></button>`;
+}
+
+// What the viewer opens for a gallery file: its task's Review action (a signed
+// URL), or the repository's current file.
+function resolveGalleryArtifact(item, fresh = false) {
+  if (item.source === 'repository') return Promise.resolve({ url: filesApi(item.projectId, item.path, true, false, ''), name: item.name, mediaType: item.mediaType,
+    ...(item.bytes != null ? { bytes: item.bytes } : {}) });
+  const actions = [];
+  actions[item.index] = { target: `gallery:${item.path}` };
+  return resolveReviewArtifact({ taskId: item.taskId, reviewInfo: { actions } }, item.index, fresh);
+}
+
+// Fill image and video tiles as they come into view.
+function loadArtifactThumbnails(grid, items) {
+  const slots = [...grid.querySelectorAll('.review-tile-media[data-thumb]:not([data-thumbed])')];
+  const fill = (slot) => {
+    slot.dataset.thumbed = '1';
+    const item = items[Number(slot.closest('.gallery-tile')?.dataset.i)];
+    if (!item) return;
+    // One that cannot load (its world asleep, a file gone) is a plain file tile.
+    const plain = () => { if (slot.dataset.thumb !== 'image') return; slot.classList.add('review-tile-file'); slot.textContent = (item.name.split('.').pop() || '').slice(0, 4).toUpperCase(); };
+    resolveGalleryArtifact(item).then((r) => {
+      if (!slot.isConnected || !r?.url) return;
+      const media = document.createElement(slot.dataset.thumb === 'video' ? 'video' : 'img');
+      if (media.tagName === 'VIDEO') { media.muted = true; media.preload = 'metadata'; media.playsInline = true; media.src = `${r.url}#t=0.1`; }
+      else { media.alt = ''; media.decoding = 'async'; media.src = r.url; }
+      media.addEventListener('error', () => { media.remove(); plain(); }, { once: true });
+      slot.prepend(media);
+    }, plain);
+  };
+  if (typeof IntersectionObserver !== 'function') return slots.forEach(fill);
+  const observer = new IntersectionObserver((entries) => entries.forEach((entry) => {
+    if (!entry.isIntersecting) return;
+    observer.unobserve(entry.target);
+    fill(entry.target);
+  }), { rootMargin: '200px' });
+  slots.forEach((slot) => { slot.dataset.thumbed = '0'; observer.observe(slot); });
+}
+
+// The Review viewer over the gallery, from item `at`: ← and → step through them all.
+async function openArtifactGallery(items, at) {
+  const load = async (i) => {
+    const item = items[i];
+    const resolved = await resolveGalleryArtifact(item);
+    return { ...(await artifactItem(resolved, () => resolveGalleryArtifact(item, true))), links: artifactGalleryLinks(item) };
+  };
+  const first = await load(at);
+  if (items.length < 2 && !first.view) return downloadArtifact(first);
+  return showArtifactViewer({ ...first, ...(items.length > 1 ? { gallery: { order: items.map((_, i) => i), at, load } } : {}) });
+}
+
+// Where a gallery file comes from: its task, and its place in Files when it has one.
+function artifactGalleryLinks(item) {
+  const task = `<a class="btn sm" data-spa data-viewer-leave href="${esc(`${projectBase(item.projectId)}/tasks/${encodeURIComponent(item.num ?? item.taskId)}`)}" title="${esc(item.title)}">#${esc(item.num ?? '')}</a>`;
+  const where = item.source === 'repository' ? filesRoute(item.projectId, item.path, '')
+    : item.state === 'active' && item.num != null ? filesRoute(item.projectId, item.path, `task:${item.num}`) : '';
+  return `${task}${where ? `<a class="btn sm" data-spa data-viewer-leave href="${esc(where)}" title="${esc(item.path)}">Show in Files</a>` : ''}`;
 }
 
 // ── Files: which tree (the view picker) ──
@@ -28101,7 +28329,8 @@ const HOST_COMMANDS = [
   { id: 'nav.settings', title: 'Go to project settings', key: 'g s', ...navCommand(() => tabRoute('settings')) },
   { id: 'nav.files', title: 'Go to project files', key: 'g f', ...navCommand(() => tabRoute('files')) },
   { id: 'nav.wiki', title: 'Go to project wiki', key: 'g w', ...navCommand(() => tabRoute('wiki')) },
-  { id: 'files.address', title: 'Type a path', key: 'g l', group: 'Files', available: () => S.tab === 'files' && !!$('#files-address'), run: () => editFilesAddress() },
+  { id: 'files.address', title: 'Type a path', key: 'g l', group: 'Files', available: () => isFilesTab() && !!$('#files-address'), run: () => editFilesAddress() },
+  { id: 'nav.orgfiles', title: 'Go to organization files', key: 'g F', ...navCommand(() => orgFilesRoute()) },
   { id: 'nav.orgwiki', title: 'Go to organization wiki', key: 'g W', ...navCommand(() => globalRoute('orgwiki')) },
   { id: 'nav.global', title: 'Go to organization settings', key: 'g S', ...navCommand(() => tabRoute('global')) },
   { id: 'nav.projects', title: 'Go to projects', key: 'g P', run: () => focusRail() },
