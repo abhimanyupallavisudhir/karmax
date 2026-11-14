@@ -2,7 +2,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { closeConsoleBrowser, consolePage } from './helpers/console-page.js';
 
 // Bodies passed to page.evaluate run in the page; this file has no DOM lib.
-declare const document: any, getComputedStyle: any;
+declare const document: any, getComputedStyle: any, innerWidth: number;
 
 afterAll(closeConsoleBrowser);
 
@@ -121,7 +121,8 @@ describe('public landing page', () => {
   it('tells how a task goes, then what surrounds it, each pictured in the visitor\'s look', async () => {
     const ui = await landing();
     const { page } = ui;
-    expect(await page.locator('main h2').allInnerTexts()).toEqual(['How a task goes', 'Build the autonomous company', 'Everything a task needs', 'Just do things.']);
+    expect(await page.locator('main h2').allInnerTexts()).toEqual(['How a task goes', 'Build the autonomous company', 'Everything a task needs', 'How it compares', 'Questions', 'Just do things.']);
+    expect(await page.locator('#lp-auto-title em').textContent()).toBe('autonomous company');
     expect(await page.locator('.lp-step h3').allInnerTexts()).toEqual(['Write it down', 'An agent does it', 'Review and approve']);
     // The autonomous company has the page's one band, between how a task goes and the rest.
     expect(await page.locator('.lp-auto-card h3').allInnerTexts()).toEqual(['Agents create, manage and approve tasks', 'Work starts itself']);
@@ -160,9 +161,61 @@ describe('public landing page', () => {
       ['I can really just do anything now.', 'R.S.']]);
     expect(await page.locator('.lp-quote').nth(2).locator('blockquote em').textContent()).toBe('anything');
     // After everything a task needs, right before the end.
-    const order = await page.evaluate(() => [...document.querySelectorAll('.lp-features, .lp-quotes, .lp-end')].map((el) => el.className.split(' ')[0]));
-    expect(order).toEqual(['lp-features', 'lp-quotes', 'lp-end']);
+    const order = await page.evaluate(() => [...document.querySelectorAll('.lp-features, .lp-compare, .lp-quotes, .lp-answers, .lp-end')].map((el) => el.className.split(' ')[0]));
+    expect(order).toEqual(['lp-features', 'lp-compare', 'lp-quotes', 'lp-answers', 'lp-end']);
     await ui.close();
+  });
+
+  it('sets itself beside the alternatives: a tick, a dash, or a few words', async () => {
+    const ui = await landing();
+    const { page } = ui;
+    const table = page.locator('.lp-compare table');
+    expect(await table.locator('thead th').allInnerTexts()).toEqual(['tavya', 'Claude Code', 'Codex', 'Devin', 'Cursor', 'Paperclip']);
+    // Our own column is every row's first, and the only one that is not a link to a page about the other.
+    expect(await table.locator('thead th a').evaluateAll((links) => links.map((link) => link.getAttribute('href')))).toEqual(
+      ['/compare/claude-code', '/compare/codex', '/compare/devin', '/compare/cursor', '/compare/paperclip']);
+    const row = (label: string) => table.locator('tbody tr', { has: page.locator('th', { hasText: label }) }).locator('td');
+    expect(await row('Open source').allInnerTexts()).toEqual(['✓', '—', 'CLI only', '—', '—', '✓']);
+    expect(await row('Open source').evaluateAll((cells) => cells.map((cell: any) => cell.className))).toEqual(['yes', 'no', 'part', 'no', 'no', 'yes']);
+    // A tick and a dash are read out as what they mean.
+    expect(await row('Open source').first().locator('span').getAttribute('aria-label')).toBe('Yes');
+    expect(await row('Open source').nth(1).locator('span').getAttribute('aria-label')).toBe('No');
+    expect(await table.locator('tbody tr').count()).toBeGreaterThanOrEqual(5);
+    expect((await page.locator('.lp-compare-foot').innerText()).replace(/\s+/g, ' ')).toBe('November 2026 · The comparison in full');
+    // The full comparison opens in place, like every public page.
+    expect(await page.locator('.lp-compare-foot a').getAttribute('href')).toBe('/compare');
+    expect(await page.locator('.lp-compare-foot a').evaluate((link: any) => 'public' in link.dataset)).toBe(true);
+    // On a phone the table scrolls sideways inside its frame; the page does not.
+    const phone = await landing({ viewport: { width: 390, height: 844 } });
+    const widths = await phone.page.evaluate(() => { const frame = document.querySelector('.lp-compare-scroll'); return [document.documentElement.scrollWidth <= innerWidth, frame.scrollWidth > frame.clientWidth]; });
+    expect(widths).toEqual([true, true]);
+    await phone.close();
+    await ui.close();
+  });
+
+  it('answers what a visitor asks before signing up, each question opening in place', async () => {
+    const ui = await landing();
+    const { page } = ui;
+    const questions = await page.locator('.lp-answer summary').allInnerTexts();
+    expect(questions).toEqual(expect.arrayContaining(['How is this different from Claude Code on the web or Codex cloud?', 'What about files Git ignores?',
+      'How are my logins, keys and card protected?', 'Is it open source?']));
+    // No free trial is known here (no launch information), so none is promised.
+    expect(questions).not.toContain('What does it cost to try?');
+    const ignored = page.locator('.lp-answer', { hasText: 'What about files Git ignores?' });
+    expect(await ignored.locator('p').isVisible()).toBe(false);
+    await ignored.locator('summary').click();
+    expect(await ignored.locator('p').innerText()).toMatch(/^They come along\. \.env values are kept as project secrets and written back for every task/);
+    // Its link opens a public page in place.
+    expect(await ignored.locator('a').evaluate((link: any) => [link.getAttribute('href'), 'public' in link.dataset, link.target])).toEqual(['/docs/ignored-files', true, '']);
+    expect(await page.locator('.landing-page').innerText()).not.toMatch(/\{\{\w+\}\}/);
+    await ui.close();
+    // Where the installation offers a free trial of compute, the first answer says how much.
+    const hosted = await consolePage();
+    await hosted.run(`S.meta = { siteName: 'tavya' }; S.launch = { trial: { creditMicros: 5000000, days: 14 }, managedCompute: ['e2b'] }; renderLanding()`);
+    const cost = hosted.page.locator('.lp-answer', { hasText: 'What does it cost to try?' });
+    await cost.locator('summary').click();
+    expect(await cost.locator('p').innerText()).toMatch(/^Nothing\. A new account gets \$5 of compute for 14 days and a built-in model/);
+    await hosted.close();
   });
 
   it('wears the console\'s look, light or dark, default or classic', async () => {
@@ -253,11 +306,11 @@ describe('public landing page', () => {
     await still.close();
   });
 
-  it('sends public GitHub links to the issue tracker, never the private repository', async () => {
+  it('sends its GitHub links to the source, which is open', async () => {
     const ui = await landing();
-    const github = (await ui.page.locator('a[href*="github.com"]').evaluateAll((links) => links.map((link) => link.getAttribute('href'))));
-    expect(github).toEqual(['https://github.com/abhimanyupallavisudhir/krmax-issues/issues',
-      'https://github.com/abhimanyupallavisudhir/krmax-issues/issues']);
+    const github = (await ui.page.locator('.landing-nav a[href*="github.com"], .landing-footer a[href*="github.com"]').evaluateAll((links) => links.map((link) => link.getAttribute('href'))));
+    expect(github).toEqual(['https://github.com/abhimanyupallavisudhir/karmax', 'https://github.com/abhimanyupallavisudhir/karmax']);
+    expect(await ui.page.locator('.landing-footer a').allInnerTexts()).toEqual(expect.arrayContaining(['Compare', 'About', 'Changelog']));
     await ui.close();
   });
 });

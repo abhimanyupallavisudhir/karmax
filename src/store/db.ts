@@ -11285,7 +11285,7 @@ const RESERVED_ROUTE_SLUGS = new Set([
 /** Top-level public pages (web/app.js boot: renderDocsPage, renderPricing,
  *  renderLegal*). Only an organization owns the first URL segment, so only an
  *  organization can be shadowed by them; a project at /<org>/docs is fine. */
-const RESERVED_ORGANIZATION_SLUGS = new Set(['docs', 'pricing', 'legal']);
+const RESERVED_ORGANIZATION_SLUGS = new Set(['docs', 'pricing', 'legal', 'compare', 'about', 'changelog']);
 
 /** Throw a user-facing error if `name` (or an explicit `slug`) resolves to a
  *  reserved routing word. Applied at the single creation choke points for

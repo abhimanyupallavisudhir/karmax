@@ -4810,9 +4810,10 @@ async function boot() {
   // personal workspace and consumes the one-time git-onboarding flag. The
   // emailed password-reset link lands signed out, so it is one of them.
   const legalSlug = location.pathname.match(/^\/legal\/([^/]+)$/)?.[1];
-  const docSlug = location.pathname.match(/^\/docs(?:\/([^/]+))?\/?$/);
+  const sitePath = location.pathname.replace(/\/$/, '');
+  const sitePage = /^\/(docs|compare)(\/[^/]+)?$/.test(sitePath) || sitePages().some((page) => page.path === sitePath);
   const publicPage = legalSlug ? () => renderLegalPage(legalSlug)
-    : docSlug ? () => renderDocsPage(docSlug[1])
+    : sitePage ? () => renderSitePage(sitePath)
     : { '/legal': renderLegalIndex, '/pricing': renderPricing,
       '/reset-password': () => renderResetPassword(new URLSearchParams(location.search).get('token') || '') }[location.pathname];
   // Independent first reads go together; each used to wait for the one before (RQ-9).
@@ -29061,16 +29062,12 @@ function legalFooter() {
 }
 
 // ── public docs ──────────────────────────────────────────────────────────────
-// A few pages of Markdown served beside the console (web/docs/<slug>.md), with
-// Pricing and the policies, under one sidebar. `{{origin}}` in a page is this
-// server, so the commands it shows work on a self-hosted installation too.
-const DOC_PAGES = [
-  { slug: 'getting-started', path: '/docs', title: 'Getting started' },
-  { slug: 'how-it-works', path: '/docs/how-it-works', title: 'How it works' },
-  { slug: 'computers', path: '/docs/computers', title: 'Cloud computers' },
-  { slug: 'chat-bots', path: '/docs/chat-bots', title: 'Chat bots' },
-  { slug: 'cli', path: '/docs/cli', title: 'tavya CLI' },
-];
+// Pages of Markdown served beside the console (web/site.js lists them: Docs and
+// guides, comparisons, About, the changelog), with Pricing and the policies,
+// under one sidebar. `{{origin}}` in a page is this server, so the commands it
+// shows work on a self-hosted installation too.
+const sitePages = () => globalThis.KarmaxSite?.pages || [];
+const PUBLIC_PATH = /^\/(docs|pricing|legal|compare|about|changelog)(\/|$)/;
 
 function docsAnchor(text) { return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''); }
 
@@ -29102,23 +29099,28 @@ function renderPublicShell(current, content) {
   const link = (href, label) => `<a href="${href}" data-public${href === current ? ' aria-current="page"' : ''}>${esc(label)}</a>`;
   $('#app').innerHTML = `<div class="legal-shell docs-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>${siteNameMarkup()}</span></a><a href="/">Open ${siteNameMarkup()}</a></header>
     <div class="docs-layout"><nav class="docs-nav" aria-label="Documentation">
-      <div class="docs-nav-group"><span>Docs</span>${DOC_PAGES.map((page) => link(page.path, page.title)).join('')}</div>
+      ${['Docs', 'Guides'].map((group) => `<div class="docs-nav-group"><span>${group}</span>${sitePages().filter((page) => page.group === group).map((page) => link(page.path, page.title)).join('')}</div>`).join('')}
+      <div class="docs-nav-group">${link('/compare', 'Compare')}${current.startsWith('/compare') ? `<div class="docs-nav-sub">${sitePages()
+        .filter((page) => page.path.startsWith('/compare/')).map((page) => link(page.path, page.title)).join('')}</div>` : ''}</div>
       <div class="docs-nav-group">${link('/pricing', 'Pricing')}</div>
       <div class="docs-nav-group">${link('/legal', 'Policies')}<div class="docs-nav-sub">${(S.launch?.policies || [])
         .map((policy) => link(`/legal/${policy.slug}`, policy.title)).join('')}</div></div>
+      <div class="docs-nav-group">${sitePages().filter((page) => page.group === 'Site').map((page) => link(page.path, page.title)).join('')}</div>
     </nav><div class="docs-content">${content}</div></div>${legalFooter()}</div>`;
   if (location.hash) document.getElementById(decodeURIComponent(location.hash.slice(1)))?.scrollIntoView();
   else window.scrollTo(0, 0);
   window.onpopstate = () => boot();
 }
 
-async function renderDocsPage(slug = 'getting-started') {
-  const page = DOC_PAGES.find((candidate) => candidate.slug === slug);
-  if (!page) { history.replaceState({}, '', '/docs'); return renderDocsPage(); }
+async function renderSitePage(path = '/docs') {
+  const page = sitePages().find((candidate) => candidate.path === path);
+  // A page that does not exist is its section's front page.
+  if (!page) { const front = path.startsWith('/compare') && path !== '/compare' ? '/compare' : '/docs'; history.replaceState({}, '', front); return renderSitePage(front); }
   document.title = `${page.title} · ${siteName()}`;
-  const response = await feedbackFetch(`/docs/${page.slug}.md`).catch(() => null);
+  const response = await feedbackFetch(`/${page.file}`).catch(() => null);
   if (location.pathname.replace(/\/$/, '') !== page.path) return; // navigated on meanwhile
-  const source = response?.ok ? await response.text() : `# ${page.title}\n\nThis page could not be loaded. Reload to try again.`;
+  const source = (response?.ok ? await response.text() : `# ${page.title}\n\nThis page could not be loaded. Reload to try again.`)
+    .replaceAll('{{comparison}}', () => globalThis.KarmaxSite.comparisonTable());
   const template = document.createElement('template');
   template.innerHTML = renderMarkdown(source.replaceAll('{{origin}}', location.origin));
   // Every section is linkable (the console points at them), links between
@@ -29128,7 +29130,7 @@ async function renderDocsPage(slug = 'getting-started') {
   for (const anchor of template.content.querySelectorAll('a[href^="/"], a[href^="#"]')) {
     anchor.removeAttribute('target');
     anchor.removeAttribute('rel');
-    if (/^\/(docs|pricing|legal)\b/.test(anchor.getAttribute('href'))) anchor.dataset.public = '';
+    if (PUBLIC_PATH.test(anchor.getAttribute('href'))) anchor.dataset.public = '';
   }
   for (const table of template.content.querySelectorAll('table')) {
     const wrap = document.createElement('div');
@@ -29239,39 +29241,8 @@ function openPublicAuth(path, render) {
 // Docs and Pricing: the launch film, then how a task goes, then what surrounds it, each pictured by a screenshot of the console in the
 // visitor's look (web/media/landing/<name>-light|dark.webp, design/landing-v3).
 const LANDING_FILM = { src: '/media/tavya-launch.mp4', poster: '/media/tavya-launch-poster.jpg', length: '1:02' };
-// How a task goes. [still, title, line, picture's description]
-const LANDING_STEPS = [
-  ['write', 'Write it down', 'In plain words, in any project.', 'The new-task form with a prompt written in plain words'],
-  ['work', 'An agent does it', 'On its own computer: your repos, a terminal, a browser.', 'A task’s agent at work: the steps it has taken so far'],
-  ['review', 'Review and approve', 'Or leave the review to an agent.', 'A task in review, with the video its agent attached'],
-];
-// The autonomous company: what lets agents run a project. [still, title, line, picture's description]
-const LANDING_AUTONOMY = [
-  ['autonomous', 'Agents create, manage and approve tasks', 'Make a project fully autonomous, or hand any review to an agent.', 'The new-project form with “Fully autonomous project” switched on'],
-  ['automations', 'Work starts itself', 'On a schedule, an event, or when another task is done.', 'Repeatable tasks: fixing errors as they happen, dependency updates, wiki upkeep, a nightly dream'],
-];
-// The automations card's list, drawn with the console's parts: [title, when it runs].
-const LANDING_AUTOMATIONS = [
-  ['Fix errors in deployment', 'when the server reports an error'],
-  ['Update dependencies', 'when a dependency releases'],
-  ['Write the release notes', 'after the release task lands'],
-  ['Maintain the project wiki', 'every Monday'],
-  ['Dream', 'every night at 3:00'],
-];
-// What else every task gets. [still, title, line, picture's description]
-const LANDING_FEATURES = [
-  ['fan-out', 'Big jobs fan out', 'A task splits into sub-tasks, each with its own agent.', 'A task’s sub-tasks, each done by its own agent'],
-  ['vault', 'Accounts, keys and a card', 'Agents sign up, sign in and pay, only with what you allow.', 'The vault: logins and keys agents may use'],
-  ['models', 'Any model, your subscription', 'Claude Code, Codex or OpenCode, on your plan or an API key.', 'The model picker'],
-  ['errand', 'Not just code', 'Papers. Websites. Images and video. Chores.', 'An agent asking to use a saved login before booking a flight'],
-];
-
-// What people say (the launch film's end card says the same). [quote (*…* emphasised), who]
-const LANDING_QUOTES = [
-  ['Every man a CEO, and no one has a moat.', 'N.H.'],
-  ['tavya is such an addictive toy… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
-  ['I can really just do *anything* now.', 'R.S.'],
-];
+// Its words (how a task goes, the autonomous company, what every task gets, how it
+// compares, what people say, the questions) are web/site.js's, which the gateway reads too.
 
 // Each screenshot's size in CSS pixels (the files are 2×), so it shows at the console's own scale.
 const LANDING_SHOT_SIZES = { write: [756, 583], work: [652, 470], review: [652, 419], 'fan-out': [305, 520], vault: [960, 420],
@@ -29279,14 +29250,35 @@ const LANDING_SHOT_SIZES = { write: [756, 583], work: [652, 470], review: [652, 
 
 function renderLanding() {
   const site = siteNameMarkup();
+  const { landing, compare, source } = globalThis.KarmaxSite;
+  const [stepsTitle, steps] = landing.steps;
+  const [autonomyTitle, autonomyLine, autonomy] = landing.autonomy;
+  const [featuresTitle, features] = landing.features;
+  // A heading whose last words are the point: "Build the *autonomous company*".
+  const pointed = (title, words) => esc(title).replace(new RegExp(`${words}$`), `<em>${words}</em>`);
   // A screenshot in the visitor's look: the light and dark one, CSS shows one.
   const shot = (name, alt) => {
     const [width, height] = LANDING_SHOT_SIZES[name];
     return ['light', 'dark'].map((look) => `<img class="lp-${look}" src="/media/landing/${name}-${look}.webp" alt="${look === 'light' ? esc(alt) : ''}"${look === 'dark' ? ' aria-hidden="true"' : ''} width="${width}" height="${height}" style="--w:${width}" loading="lazy" decoding="async">`).join('');
   };
-  const automations = () => `<ul class="lp-automations">${LANDING_AUTOMATIONS.map(([title, when]) => `<li><b>${esc(title)}</b><i>Repeatable</i><span>${esc(when)}</span></li>`).join('')}</ul>`;
+  const automations = () => `<ul class="lp-automations">${landing.automations.map(([title, when]) => `<li><b>${esc(title)}</b><i>Repeatable</i><span>${esc(when)}</span></li>`).join('')}</ul>`;
+  // How it compares: a tick, a dash, or a few words where it is neither.
+  const compared = (value) => (value === 'yes' ? '<td class="yes"><span aria-label="Yes">✓</span></td>'
+    : !value || value === 'no' ? '<td class="no"><span aria-label="No">—</span></td>' : `<td class="part">${esc(value)}</td>`);
+  const comparison = compare.rows.length ? `<section class="lp-compare" aria-labelledby="lp-compare-title">
+        <h2 id="lp-compare-title">${esc(compare.title)}</h2>
+        <div class="lp-compare-scroll" tabindex="0" role="region" aria-labelledby="lp-compare-title"><table>
+          <thead><tr><td></td>${compare.products.map((product) => `<th scope="col"${product.path ? '' : ' class="us"'}>${product.path ? `<a href="${esc(product.path)}" data-public>${esc(product.name)}</a>` : site}</th>`).join('')}</tr></thead>
+          <tbody>${compare.rows.map(([label, values]) => `<tr><th scope="row">${esc(label)}</th>${compare.products.map((product) => compared(values[product.id])).join('')}</tr>`).join('')}</tbody>
+        </table></div>
+        <p class="lp-compare-foot">${esc(compare.asOf)} · <a href="/compare" data-public>The comparison in full</a></p>
+      </section>` : '';
+  // The questions, with this installation's numbers; an answer's links to public pages stay in this tab.
+  const trial = S.launch?.trial && (S.launch.managedCompute || []).length ? { trialCredit: formatCatalogPrice(Number(S.launch.trial.creditMicros) / 10_000), trialDays: String(S.launch.trial.days) } : {};
+  const answer = (markdown) => renderMarkdown(markdown).replace(/<a href="(\/[^"]*)"[^>]*>/g, (_, href) => `<a href="${href}"${PUBLIC_PATH.test(href) ? ' data-public' : ''}>`);
+  const answers = globalThis.KarmaxSite.answers(trial);
   const play = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 4.6v10.8a.6.6 0 0 0 .9.5l8.6-5.4a.6.6 0 0 0 0-1L7.4 4.1a.6.6 0 0 0-.9.5z"/></svg>';
-  const github = 'https://github.com/abhimanyupallavisudhir/krmax-issues/issues';
+  installPublicLinks();
   document.body.classList.add('landing-active');
   document.title = `${siteName()} — do anything with agents`;
   $('#app').innerHTML = `<div class="landing-page">
@@ -29296,7 +29288,7 @@ function renderLanding() {
       <nav class="landing-nav-actions" aria-label="Site">
         <a href="/docs" class="landing-text-link">Docs</a>
         <a href="/pricing" class="landing-text-link">Pricing</a>
-        <a href="${github}" class="landing-text-link">GitHub</a>
+        <a href="${source}" class="landing-text-link">GitHub</a>
         <a class="landing-sign-in" id="landing-sign-in" href="/login">Sign in</a>
         <a class="landing-start" id="landing-start" href="/signup">Get started</a>
       </nav>
@@ -29317,32 +29309,41 @@ function renderLanding() {
       </section>
 
       <section class="lp-steps" aria-labelledby="lp-steps-title">
-        <h2 id="lp-steps-title">How a task goes</h2>
-        <ol>${LANDING_STEPS.map(([name, title, line, alt]) => `
+        <h2 id="lp-steps-title">${esc(stepsTitle)}</h2>
+        <ol>${steps.map(([name, title, line, alt]) => `
           <li class="lp-step"><h3>${esc(title)}</h3><p>${esc(line)}</p><figure class="lp-shot">${shot(name, alt)}</figure></li>`).join('')}
         </ol>
       </section>
 
       <section class="lp-auto" aria-labelledby="lp-auto-title">
-        <h2 id="lp-auto-title">Build the <em>autonomous company</em></h2>
-        <p class="lp-auto-lede">Let agents run the whole project.</p>
-        <div class="lp-auto-grid">${LANDING_AUTONOMY.map(([name, title, line, alt]) => `
+        <h2 id="lp-auto-title">${pointed(autonomyTitle, 'autonomous company')}</h2>
+        <p class="lp-auto-lede">${esc(autonomyLine)}</p>
+        <div class="lp-auto-grid">${autonomy.map(([name, title, line, alt]) => `
           <article class="lp-auto-card"><h3>${esc(title)}</h3><p>${esc(line)}</p><figure class="lp-shot"${name === 'automations' ? ` aria-label="${esc(alt)}"` : ''}>${name === 'automations' ? automations() : shot(name, alt)}</figure></article>`).join('')}
         </div>
       </section>
 
       <section class="lp-features" aria-labelledby="lp-features-title">
-        <h2 id="lp-features-title">Everything a task needs</h2>
-        <div class="lp-grid">${LANDING_FEATURES.map(([name, title, line, alt]) => `
+        <h2 id="lp-features-title">${esc(featuresTitle)}</h2>
+        <div class="lp-grid">${features.map(([name, title, line, alt]) => `
           <article class="lp-feature"><h3>${esc(title)}</h3>
             <p>${esc(line)}</p>
             <figure class="lp-shot"${name === 'fan-out' ? ' data-anchor="center"' : ''}>${shot(name, alt)}</figure></article>`).join('')}
         </div>
       </section>
 
-      <section class="lp-quotes" aria-label="What people say">${LANDING_QUOTES.map(([quote, who]) => `
+      ${comparison}
+
+      <section class="lp-quotes" aria-label="What people say">${landing.quotes.map(([quote, who]) => `
         <figure class="lp-quote"><blockquote>${esc(quote).replace(/\*([^*]+)\*/g, '<em>$1</em>')}</blockquote><figcaption>${esc(who)}</figcaption></figure>`).join('')}
       </section>
+
+      ${answers.length ? `<section class="lp-answers" aria-labelledby="lp-answers-title">
+        <h2 id="lp-answers-title">${esc(landing.answers[0])}</h2>
+        <div class="lp-answer-list">${answers.map(([question, text]) => `
+          <details class="lp-answer"><summary>${esc(question)}</summary>${answer(text)}</details>`).join('')}
+        </div>
+      </section>` : ''}
 
       <section class="lp-end" aria-labelledby="lp-end-title">
         <div class="lp-end-mark" aria-hidden="true">${brandMark()}</div>
@@ -29354,7 +29355,7 @@ function renderLanding() {
       </section>
     </main>
 
-    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${site}</span></a><p>Just do things.</p><a href="/docs">Docs</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="${github}">GitHub ↗</a></footer>
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${site}</span></a><p>Just do things.</p><a href="/docs">Docs</a><a href="/pricing">Pricing</a><a href="/compare" data-public>Compare</a><a href="/about" data-public>About</a><a href="/changelog" data-public>Changelog</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="${source}">GitHub ↗</a></footer>
   </div>`;
 
   const signIn = () => openPublicAuth('/login', renderLogin);

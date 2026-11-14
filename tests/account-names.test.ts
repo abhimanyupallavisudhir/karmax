@@ -42,7 +42,7 @@ describe('canonicalAccountName (CI-38b)', () => {
   it('refuses an organization named after a public page (docs, pricing, policies), which owns that URL', async () => {
     const store = await Store.create(':memory:');
     try {
-      for (const name of ['Docs', 'Pricing', 'Legal']) await expect(store.createOrganization({ name })).rejects.toThrow(/reserved/);
+      for (const name of ['Docs', 'Pricing', 'Legal', 'Compare', 'About', 'Changelog']) await expect(store.createOrganization({ name })).rejects.toThrow(/reserved/);
       // A project lives under its organization (/<org>/docs), so the name stays free there.
       const acme = await store.createOrganization({ name: 'Acme' });
       for (const name of ['docs', 'pricing', 'legal']) expect((await store.createProject(name, {}, acme.id)).name).toBe(name);
@@ -81,7 +81,7 @@ describe('reserved account names', () => {
   it('refuses an organization named after a public page (docs, pricing, policies), which owns that URL', async () => {
     const store = await Store.create(':memory:');
     try {
-      for (const name of ['Docs', 'Pricing', 'Legal']) await expect(store.createOrganization({ name })).rejects.toThrow(/reserved/);
+      for (const name of ['Docs', 'Pricing', 'Legal', 'Compare', 'About', 'Changelog']) await expect(store.createOrganization({ name })).rejects.toThrow(/reserved/);
       // A project lives under its organization (/<org>/docs), so the name stays free there.
       const acme = await store.createOrganization({ name: 'Acme' });
       for (const name of ['docs', 'pricing', 'legal']) expect((await store.createProject(name, {}, acme.id)).name).toBe(name);

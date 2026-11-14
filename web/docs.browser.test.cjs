@@ -6,6 +6,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
+require('./site.js');
+const site = globalThis.KarmaxSite;
 
 (async () => {
   const browser = await launch();
@@ -44,9 +46,13 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     assert.ok(!requests.includes('GET /api/session'), 'a public page does not read (and so provision) a session');
     assert.deepEqual(await nav(), [
       ['Getting started', '/docs'], ['How it works', '/docs/how-it-works'], ['Cloud computers', '/docs/computers'], ['Chat bots', '/docs/chat-bots'], ['tavya CLI', '/docs/cli'],
+      ...site.pages.filter((entry) => entry.group === 'Guides').map((entry) => [entry.title, entry.path]),
+      ['Compare', '/compare'],
       ['Pricing', '/pricing'],
       ['Policies', '/legal'], ['Terms of Service', '/legal/terms'], ['Privacy Policy', '/legal/privacy'],
-    ], 'one sidebar: the docs, then pricing, then every policy');
+      ['About tavya', '/about'], ['Changelog', '/changelog'],
+    ], 'one sidebar: the docs and guides, the comparison, pricing, every policy, then About and the changelog');
+    assert.ok(site.pages.filter((entry) => entry.group === 'Guides').length >= 5, 'the guides are listed');
     assert.equal(await current(), 'Getting started');
     assert.match(await page.title(), /Getting started · Fixture/);
     if (shots) await page.screenshot({ path: path.join(shots, 'docs-getting-started.png'), fullPage: true });
@@ -102,21 +108,44 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     assert.match(await page.locator('.docs-page').innerText(), /aws:RequestTag\/karmaxHome/, 'the AWS policy is on the page');
     if (shots) await page.screenshot({ path: path.join(shots, 'docs-computers.png'), fullPage: true });
 
-    for (const slug of ['', 'how-it-works', 'computers', 'chat-bots', 'cli']) {
-      await page.goto(`http://console.test/docs${slug ? `/${slug}` : ''}`);
-      await page.locator('.docs-page h1').waitFor();
-      const links = await page.locator('.docs-page a[href^="/"]').evaluateAll((as) => as.map((a) => a.getAttribute('href')));
-      for (const href of links) {
+    // Every page of Markdown (docs, guides, comparisons, About, the changelog) renders under its
+    // own heading, and each link in it goes to a page, and to a section that page has.
+    const byPath = new Map(site.pages.map((entry) => [entry.path, entry]));
+    for (const entry of site.pages) {
+      await page.goto(`http://console.test${entry.path}`);
+      await page.locator('.docs-page h1', { hasText: entry.title }).waitFor();
+      assert.match(await page.title(), new RegExp(`^${entry.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} · `));
+      assert.doesNotMatch(await page.locator('.docs-page').innerText(), /\{\{\w+\}\}/, `${entry.path} has no unfilled placeholder`);
+      const links = await page.locator('.docs-page a[href^="/"]').evaluateAll((as) => as.map((a) => [a.getAttribute('href'), 'public' in a.dataset]));
+      for (const [href, inPlace] of links) {
         const [route, hash] = href.split('#');
-        const known = ['/docs', '/docs/how-it-works', '/docs/computers', '/docs/chat-bots', '/docs/cli', '/pricing', '/legal', '/signup', '/login'].includes(route) || /^\/legal\/[a-z-]+$/.test(route);
-        assert.ok(known, `docs link ${href} goes to a page`);
-        if (hash && route.startsWith('/docs')) {
-          const md = fs.readFileSync(path.join(__dirname, 'docs', `${route.replace(/^\/docs\/?/, '') || 'getting-started'}.md`), 'utf8');
+        const known = byPath.has(route) || ['/pricing', '/legal', '/signup', '/login'].includes(route) || /^\/legal\/[a-z-]+$/.test(route);
+        assert.ok(known, `${entry.path}: link ${href} goes to a page`);
+        if (!['/signup', '/login'].includes(route)) assert.ok(inPlace, `${entry.path}: link ${href} opens in place`);
+        if (hash && byPath.has(route)) {
+          const md = fs.readFileSync(path.join(__dirname, byPath.get(route).file), 'utf8');
           const ids = [...md.matchAll(/^##+ (.+)$/gm)].map((m) => m[1].toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''));
-          assert.ok(ids.includes(hash), `docs link ${href} names a section`);
+          assert.ok(ids.includes(hash), `${entry.path}: link ${href} names a section`);
         }
       }
     }
+
+    // The comparison draws the landing's table, with the rows only it has, and its sidebar lists each product's page.
+    await page.goto('http://console.test/compare');
+    await page.locator('.docs-page table').waitFor();
+    assert.deepEqual(await page.locator('.docs-page table thead th').allInnerTexts(), ['', 'tavya', 'Claude Code', 'Codex', 'Devin', 'Cursor', 'Paperclip']);
+    assert.ok((await page.locator('.docs-page table tbody tr').count()) > site.compare.rows.length, 'the full comparison has more rows than the landing');
+    assert.deepEqual((await nav()).filter(([, href]) => href.startsWith('/compare/')).map(([, href]) => href),
+      site.pages.filter((entry) => entry.path.startsWith('/compare/')).map((entry) => entry.path), 'inside the comparison, the sidebar lists each one');
+    assert.equal(await current(), 'Compare');
+    await page.evaluate(() => { window.stillHere = true; });
+    await page.locator('.docs-page table thead a', { hasText: 'Devin' }).click();
+    await page.locator('.docs-page h1', { hasText: 'tavya vs Devin' }).waitFor();
+    assert.equal(await page.evaluate(() => [location.pathname, window.stillHere].join()), '/compare/devin,true', 'a comparison opens in place');
+    // An unknown comparison falls back to the comparison.
+    await page.goto('http://console.test/compare/nope');
+    await page.locator('.docs-page h1', { hasText: 'tavya compared' }).waitFor();
+    assert.equal(await page.evaluate(() => location.pathname), '/compare');
 
     // An unknown docs page falls back to the first one.
     await page.goto('http://console.test/docs/nope');

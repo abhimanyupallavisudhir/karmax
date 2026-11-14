@@ -1,22 +1,26 @@
 # tavya
 
-> tavya is a to-do list for managing AI agents instead of manually doing the work.
+> tavya is a to-do list where each task is done by an AI agent (Claude Code, Codex, or any model through OpenCode) on its own cloud computer; you review and approve the result.
 
-tavya gives agents isolated cloud worlds, lets people or agents own review and input stages, and uses explicit authorization for project management, credentials, and payments.
+tavya gives each task an isolated cloud computer with the project's repositories, data and secrets, lets people or agents own the review and input stages, and uses explicit authorization for project management, credentials and payments. Tasks can start sub-tasks, run on schedules or events, and use logins, keys and a card within limits a person sets. It is open source under the GNU AGPL-3.0.
+
+{{pages}}
+
+## Use it from an agent or a terminal
+
+- MCP server (streamable HTTP, OAuth sign-in): https://tavya.io/mcp, listed in the MCP Registry as `io.tavya/tavya`. It creates, searches and steers tasks, reads wikis and calls the API.
+- Command-line client: `npm install -g @tavya/cli`, then `tavya login https://tavya.io` ([tavya CLI](https://tavya.io/docs/cli)).
+- Every page above is also plain Markdown at the address given beside it; all of them in one file: https://tavya.io/llms-full.txt
 
 ## Links
 
-- [Issue tracker](https://github.com/abhimanyupallavisudhir/krmax-issues/issues)
-- [Getting started](https://tavya.io/docs)
-- [How it works](https://tavya.io/docs/how-it-works)
-- [Cloud computers](https://tavya.io/docs/computers)
-- [Chat bots](https://tavya.io/docs/chat-bots)
-- [tavya CLI](https://tavya.io/docs/cli) (Markdown: https://tavya.io/docs/cli.md)
 - [Pricing](https://tavya.io/pricing)
 - [Policies and trust](https://tavya.io/legal)
 - [Security](https://tavya.io/legal/security)
 - [Subprocessors](https://tavya.io/legal/subprocessors)
 - [Business DPA requests](https://tavya.io/legal/dpa)
+- [Source code](https://github.com/abhimanyupallavisudhir/karmax)
+- [Issue tracker](https://github.com/abhimanyupallavisudhir/krmax-issues/issues)
 
 ## Agent entry points
 

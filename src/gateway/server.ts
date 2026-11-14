@@ -12,7 +12,7 @@ import * as __asyncCollections from '../util/async-collections.js';
 import { GatewayMetrics, type MemorySource } from './metrics.js';
 import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
 import { assetExists, MATHJAX_SCRIPT_SOURCE, serveStaticAsset, staticAssetRevision, unpublishedAsset } from './static-assets.js';
-import { docPath, LANDING_TAGLINE, policySlugOf, publicBody, publicHead, publicPath, publicPaths, resolvePublicRoute, robotsTxt, sitemapXml, type PublicPageContext, type PublicRoute } from './public-pages.js';
+import { LANDING_TAGLINE, llmsFullText, llmsPageList, markdownSourcePage, policySlugOf, publicBody, publicEntries, publicHead, publicPath, resolvePublicRoute, robotsTxt, sitemapXml, type PublicPageContext, type PublicRoute } from './public-pages.js';
 import { SwrCache } from '../util/swr-cache.js';
 import { MAX_REVIEW_ARTIFACT_BYTES, savedReviewArtifact } from '../store/review-artifacts.js';
 import { readWorldFilePrefix } from '../world/file-prefix.js';
@@ -1962,10 +1962,7 @@ export class Gateway {
     if (p === '/api/launch' && method === 'GET') {
       const info = (await this.deps.paidLaunchSettings?.publicLaunchInfo((await this.siteName)))
         ?? publicLaunchInfo(process.env, undefined, (await this.siteName));
-      // Managed compute is priced only where the installation offers it.
-      const managedCompute = this.deps.store.hosted
-        ? ((await this.deps.providerConnections?.managedConnections().catch(() => [])) ?? []).map((value) => value.provider) : [];
-      return this.json(res, 200, { ...info, managedCompute });
+      return this.json(res, 200, { ...info, managedCompute: await this.managedComputeProviders() });
     }
     const legalMatch = p.match(/^\/api\/legal\/([^/]+)$/);
     if (legalMatch && method === 'GET') {
@@ -9694,6 +9691,13 @@ export class Gateway {
     res.end(body);
   }
 
+  /** The providers this installation runs computers on for its customers: managed
+   * compute is priced, and its free trial offered, only where there is one. */
+  private async managedComputeProviders(): Promise<string[]> {
+    return this.deps.store.hosted
+      ? ((await this.deps.providerConnections?.managedConnections().catch(() => [])) ?? []).map((value) => value.provider) : [];
+  }
+
   /** Everything the public pages are rendered from, for this request; the
    * policy document only for the policy page `pathname` names. */
   private async publicPageContext(req?: http.IncomingMessage, pathname = ''): Promise<PublicPageContext> {
@@ -9701,7 +9705,8 @@ export class Gateway {
     const launch = (await this.deps.paidLaunchSettings?.publicLaunchInfo(siteName)) ?? publicLaunchInfo(process.env, undefined, siteName);
     const slug = policySlugOf(pathname);
     const document = slug ? ((await this.deps.paidLaunchSettings?.policyDocument(slug, siteName)) ?? policyDocument(slug, process.env, undefined, siteName)) : undefined;
-    return { staticDir: this.deps.staticDir, siteName, launch, policy: (wanted) => (wanted === document?.slug ? document : undefined),
+    return { staticDir: this.deps.staticDir, siteName, launch, managedCompute: await this.managedComputeProviders(),
+      policy: (wanted) => (wanted === document?.slug ? document : undefined),
       origin: req ? this.publicUrl(req) : process.env.KARMAX_PUBLIC_URL?.replace(/\/$/, '') ?? '' };
   }
 
@@ -9713,8 +9718,14 @@ export class Gateway {
     if (p === '/robots.txt' || p === '/sitemap.xml') {
       const origin = req ? this.publicUrl(req) : '';
       if (p === '/sitemap.xml' && !indexable) return void res.writeHead(404).end('not found');
-      const body = p === '/robots.txt' ? robotsTxt(origin, indexable) : sitemapXml(origin, publicPaths((await this.publicPageContext(req))));
+      const body = p === '/robots.txt' ? robotsTxt(origin, indexable) : sitemapXml(origin, publicEntries((await this.publicPageContext(req))));
       res.writeHead(200, { 'content-type': MIME[path.extname(p)]!, 'cache-control': 'no-cache', 'content-length': String(Buffer.byteLength(body)) });
+      return void res.end(req?.method === 'HEAD' ? undefined : body);
+    }
+    if (p === '/llms-full.txt') {
+      const origin = req ? this.publicUrl(req) : '';
+      const body = llmsFullText(this.deps.staticDir, (await this.siteName), origin);
+      res.writeHead(200, { 'content-type': MIME['.txt']!, 'cache-control': 'no-cache', 'content-length': String(Buffer.byteLength(body)) });
       return void res.end(req?.method === 'HEAD' ? undefined : body);
     }
     const rel = p === '/' ? '/index.html' : p === '/billing/checkout' ? '/paddle-checkout.html' : p;
@@ -9722,12 +9733,12 @@ export class Gateway {
     if (unpublishedAsset(file)) return void res.writeHead(404).end('not found');
     if (!(await assetExists(this.deps.staticDir, file))) file = path.join(this.deps.staticDir, 'index.html'); // SPA fallback
     const name = path.basename(file);
-    // A docs page's Markdown source (agents read it) points search engines at the page.
-    const docSource = name !== 'index.html' && p.match(/^\/docs\/([^/]+)\.md$/)?.[1];
-    if (docSource) {
+    // A page's Markdown source (agents read it) points search engines at the page.
+    const sourceOf = name !== 'index.html' && p.endsWith('.md') ? markdownSourcePage(this.deps.staticDir, p) : undefined;
+    if (sourceOf) {
       const origin = req ? this.publicUrl(req) : '';
       return void (await serveStaticAsset(req, res, file, undefined,
-        { headers: { link: `<${origin}${docPath(docSource)}>; rel="canonical"` } }).catch(() => {
+        { headers: { link: `<${origin}${sourceOf}>; rel="canonical"` } }).catch(() => {
         if (!res.headersSent) res.writeHead(404).end('not found');
       }));
     }
@@ -9775,11 +9786,16 @@ export class Gateway {
     const brandLlms = async (data: Buffer) => {
       const siteName = (await this.siteName);
       const origin = req ? this.publicUrl(req) : process.env.KARMAX_PUBLIC_URL?.replace(/\/$/, '') ?? '';
+      const site = origin || 'https://tavya.io';
+      // The pages it lists are the ones this installation serves.
+      let pages = '';
+      try { pages = llmsPageList(this.deps.staticDir, site); } catch { /* a static directory without the site's pages lists none */ }
       return Buffer.from(data.toString('utf8')
         .replace(/^# tavya$/m, `# ${siteName}`)
         .replace(/^> tavya is /m, `> ${siteName} is `)
         .replace(/^tavya gives /m, `${siteName} gives `)
-        .replace(/https:\/\/tavya\.io/g, origin || 'https://tavya.io'));
+        .replace(/https:\/\/tavya\.io/g, site)
+        .replace(/^\{\{pages\}\}\n\n?/m, () => (pages ? `${pages}\n\n` : '')));
     };
     try {
       await serveStaticAsset(req, res, file, shell?.transform ?? (name === 'llms.txt' ? brandLlms : undefined),
