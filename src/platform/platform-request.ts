@@ -123,6 +123,7 @@ export const PLATFORM_REQUEST_EXCLUDED_PATHS = [
   '/api/signup',
   '/api/session',
   '/api/launch', // public policy/version + central hosted-plan catalog
+  '/api/site-analytics/', // the public pages' view beacon: a person's browser only, never an agent
   '/api/legal/', // public policy documents and pre-OAuth acceptance handoff
   '/api/sso/start',
   '/api/agent-mail/ingest', // inbound mail webhook, authenticated by a minted secret

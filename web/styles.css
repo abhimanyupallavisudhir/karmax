@@ -4996,3 +4996,29 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
   .row-ask-actions { margin-left: 0; }
   .task-search { min-width: 0; }
 }
+
+/* ── Installation → Site traffic (wiki features/site-analytics): the Insights
+   chart and tables, compact enough for a settings card ─────────────────── */
+.site-traffic .traffic-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.site-traffic .traffic-head .queue-empty { margin: 0; padding: 4px 0; }
+.traffic-stats { display: flex; flex-wrap: wrap; gap: 6px 28px; }
+.traffic-stat { min-width: 0; cursor: default; }
+.traffic-stat span { display: block; font-size: var(--fs-12); color: var(--ink-3); }
+.traffic-stat b { font-family: var(--font-ui); font-variant-numeric: tabular-nums; font-size: 22px; font-weight: 650; letter-spacing: -0.02em; }
+.traffic-chart { margin-top: 14px; }
+.traffic-legend { min-height: 18px; margin-bottom: 4px; }
+.traffic-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 28px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
+.traffic-part { min-width: 0; }
+.traffic-part .ins-card-h { margin-bottom: 6px; }
+.traffic-table td.ins-name { overflow: hidden; }
+.traffic-label { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.traffic-table .traffic-sub td { border-top: 0; padding-top: 1px; }
+.traffic-table .traffic-sub td.ins-name { padding-left: 14px; }
+.traffic-table .traffic-sub td, .traffic-table .traffic-more td { color: var(--ink-3); }
+.traffic-table .traffic-more td { font-size: var(--fs-11); cursor: help; }
+.traffic-table .ins-share { max-width: none; }
+@media (max-width: 760px) {
+  .traffic-grid { grid-template-columns: minmax(0, 1fr); }
+  .traffic-stats { gap: 6px 20px; }
+  .traffic-stat b { font-size: 18px; }
+}
