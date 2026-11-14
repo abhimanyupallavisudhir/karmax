@@ -40,6 +40,7 @@ import {
 } from '../coordinators/names.js';
 import { templateContent, templateName, templateParams, templateAuthorization } from '../domain/task-templates.js';
 import { derivedTaskTitle, isDerivedTaskTitle } from '../domain/task-title.js';
+import { landsByPushOnTavya } from '../domain/hosted-repository.js';
 import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget, type Avatar, type InheritedConversation, type TaskCreatedVia, type TaskCreator } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries,
   normalizeFollowUpTriggers, validateFollowUpTriggers, followUpTriggerSummary, followUpsAfterFiring, type FollowUpTrigger, type TaskTrigger, isTrigger } from '../domain/triggers.js';
@@ -2094,7 +2095,12 @@ export class KarmaxApi {
     // hosted GitHub world. Coerce legacy settings rows here so every newly
     // started task in an existing hosted project gets the new PR contract. An
     // already-running Temporal execution keeps its recorded input unchanged.
-    if (this.deps.hosted && (resolved.remote === undefined || resolved.remote === 'none'))
+    // Repositories tavya hosts have no pull requests: they land by push, as
+    // effectiveProjectConfig says, whatever a layer above names — this value
+    // overwrites the input's project policy (tavya-error 5b7a123b7e52ac15).
+    if (this.deps.hosted && landsByPushOnTavya(effectiveRepos(resolved, project.config)))
+      resolved.remote = 'push';
+    else if (this.deps.hosted && (resolved.remote === undefined || resolved.remote === 'none'))
       resolved.remote = 'pr';
     (await this.materializeUnifiedAgents(resolved, project));
     (await this.pinIncludedModelDefaults(manifest, resolved, project));
@@ -5978,7 +5984,8 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     if (!project) throw new NotFoundError(`no project ${task.projectId}`);
     const view = task.lastView;
     const pullRequests = (view?.prs?.length ? view.prs : view?.pr ? [view.pr] : []).filter((pr) => pr.state === 'open' && !pr.merged);
-    const policy = String(task.params?.remote ?? (await this.deps.store.effectiveProjectConfig(project)).remote ?? 'none');
+    const effective = (await this.deps.store.effectiveProjectConfig(project));
+    const policy = String(this.deps.hosted && landsByPushOnTavya(effective.repos) ? 'push' : task.params?.remote ?? effective.remote ?? 'none');
     const none = { taskId, required: false, repositories: [], pullRequests: [], canMerge: true, blocked: false, eligibleUserIds: [], audience: [] };
     if (!pullRequests.length && policy !== 'pr') return none;
     const wiki = (await this.deps.store.projectWiki(project.id))?.repository;
