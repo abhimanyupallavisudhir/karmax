@@ -37,6 +37,7 @@ import {
   ChildTaskSummary,
   ForkTaskSummary,
   ReviewInfo,
+  ReviewAction,
   KarmaxEvent,
   Tag,
   SavedView,
@@ -9574,6 +9575,41 @@ export class Store {
       .map((row) => ({ ...row, expiresAt: row.expiresAt ?? undefined }));
   }
 
+  /** A project's tasks whose Review attached something, compact: one row per
+   * logical task (its principal attempt), with its status, its Review actions
+   * and its world (where relative targets sit). For the artifact gallery. */
+  async reviewAttachmentTasks(projectId: string): Promise<Array<{ id: string; num?: number; title: string; status?: string;
+    stage?: string; actions: ReviewAction[]; world?: WorldHandleRef; createdAt: number; statusChangedAt?: number }>> {
+    const rows = (await this.db.prepare(`SELECT t.id, COALESCE(t.num, root.num) AS resolvedNum, t.title, t.createdAt, t.statusChangedAt,
+        json_extract(t.lastView, '$.status') AS status, json_extract(t.lastView, '$.stage') AS stage,
+        json_extract(t.lastView, '$.reviewInfo.actions') AS actions, json_extract(t.lastView, '$.world') AS world
+      FROM tasks t
+      JOIN task_intents i ON i.id=t.intentId AND i.principalAttemptId=t.id
+      JOIN tasks root ON root.id=i.id
+      WHERE t.projectId=? AND t.lastView IS NOT NULL AND ${notPullRequestSql(this.db.dialect)}
+        AND json_extract(t.lastView, '$.reviewInfo.actions') IS NOT NULL`).all(projectId)) as any[];
+    const parse = (value: unknown) => { try { return typeof value === 'string' ? JSON.parse(value) : value ?? undefined; } catch { return undefined; } };
+    return rows.map((row) => ({ id: row.id, ...(row.resolvedNum != null ? { num: Number(row.resolvedNum) } : {}), title: row.title,
+      ...(row.status ? { status: String(row.status) } : {}), ...(row.stage ? { stage: String(row.stage) } : {}),
+      actions: Array.isArray(parse(row.actions)) ? parse(row.actions) : [], ...(parse(row.world) ? { world: parse(row.world) } : {}),
+      createdAt: Number(row.createdAt), ...(row.statusChangedAt != null ? { statusChangedAt: Number(row.statusChangedAt) } : {}) }));
+  }
+
+  /** The saved Review copies of a project's tasks, and each task's index of
+   * them (`review-artifacts:<task>`: target hash → artifact id). */
+  async reviewArtifactsOf(projectId: string, taskIds: string[]): Promise<{ artifacts: Map<string, PromotedArtifact>; indexes: Map<string, Record<string, string>> }> {
+    const artifacts = new Map(((await this.db.prepare(`SELECT * FROM promoted_artifacts WHERE projectId=? AND id LIKE 'review-%'`).all(projectId)) as any[])
+      .map((row) => [row.id as string, { ...row, bytes: Number(row.bytes), createdAt: Number(row.createdAt),
+        expiresAt: row.expiresAt == null ? undefined : Number(row.expiresAt) } as PromotedArtifact]));
+    const indexes = new Map<string, Record<string, string>>();
+    for (let at = 0; at < taskIds.length; at += 200) {
+      const keys = taskIds.slice(at, at + 200).map((id) => `review-artifacts:${id}`);
+      const rows = (await this.db.prepare(`SELECT k, v FROM kv WHERE k IN (${keys.map(() => '?').join(', ')})`).all(...keys)) as Array<{ k: string; v: string }>;
+      for (const row of rows) { try { indexes.set(row.k.slice('review-artifacts:'.length), JSON.parse(row.v)); } catch { /* unreadable: no saved copies */ } }
+    }
+    return { artifacts, indexes };
+  }
+
   async deletePromotedArtifact(id: string): Promise<PromotedArtifact | undefined> {
     return this.db.transaction(async () => {
 
@@ -11241,7 +11277,7 @@ const RESERVED_ROUTE_SLUGS = new Set([
   // `for:me` is the signed-in person in every search (and /me is kept free)
   'me',
   // organization-level views — ORG_VIEWS (a project slug is the segment after the org)
-  'insights', 'dashboard', 'settings', 'inbox', 'wiki', 'profile',
+  'insights', 'dashboard', 'settings', 'inbox', 'wiki', 'files', 'profile',
   // project-level tabs
   'tasks', 'queue', 'activity',
 ]);

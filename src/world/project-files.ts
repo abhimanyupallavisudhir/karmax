@@ -12,7 +12,7 @@ import type { ProjectResourceService } from './resources.js';
 import type { GitBrokerCredential } from './git-broker.js';
 import type { ManifestEntry } from './checkpoint-chunks.js';
 import type { World, WorldHandle } from './types.js';
-import { isRemoteWorldKind, worldRepos, worldRepoSource } from './types.js';
+import { isRemoteWorldKind, worldRepos, worldRepoSource, worldWorkingRelativePath } from './types.js';
 import { MirroredCommitMissing, readMirrored } from './git-mirror.js';
 import { catBlob, git } from './git.js';
 import { materializeGitCredential } from './git-credential.js';
@@ -80,6 +80,9 @@ export type FileView = { kind: 'default' } | { kind: 'branch'; name: string } | 
 export interface FileReadOptions { data: boolean; pins?: FilePins; view?: FileView }
 
 export interface OpenedFile { node: FileNode; size: number; stream: Readable; done: Promise<void>; stop: () => void }
+
+/** Where a path stands in its repository's branch tasks start from (`repositoryPresence`). */
+export type RepositoryPresence = { state: 'present'; size?: number } | { state: 'deleted' | 'untracked' };
 
 export class FileNotFoundError extends Error {}
 export class FileAccessError extends Error {}
@@ -184,6 +187,53 @@ export class ProjectFiles {
       pins.data[mount.id] = mount.revisionId ?? null;
     }
     return { pins, node: await this.stat(projectId, relative, { data: options.data, pins }) };
+  }
+
+  /** Where each of `paths` stands in the repositories tasks start from:
+   * there now (`present`, a file, with its size), once there and since
+   * removed (`deleted`), or never committed (`untracked`). A path in no
+   * repository (the world root, a data mount) is left out, and so is a
+   * repository that cannot be read now. For the artifact gallery. */
+  async repositoryPresence(projectId: string, paths: string[]): Promise<Map<string, RepositoryPresence>> {
+    const layout = await this.projectLayout(projectId, {});
+    const result = new Map<string, RepositoryPresence>();
+    await Promise.all(layout.checkouts.map(async (checkout) => {
+      const inside = new Map<string, string>();
+      for (const wanted of paths) {
+        let segments: string[];
+        try { segments = splitPath(wanted); } catch { continue; }
+        if (segments.length <= checkout.segments.length || !startsWith(segments, checkout.segments)) continue;
+        if (layout.mounts.some((mount) => startsWith(segments, mount.segments))) continue;
+        inside.set(segments.slice(checkout.segments.length).join('/'), wanted);
+      }
+      if (!inside.size) return;
+      try {
+        await this.withRepository(projectId, checkout, async (mirror, commit) => {
+          const files = [...inside.keys()];
+          const missing = new Set(files);
+          for (let at = 0; at < files.length; at += 200) {
+            const listed = await git(mirror, ['--literal-pathspecs', 'ls-tree', '-z', '-l', commit, '--', ...files.slice(at, at + 200)]);
+            if (listed.code !== 0) throw new Error(listed.stderr || listed.stdout || 'git ls-tree failed');
+            for (const entry of parseTree(listed.stdout)) {
+              if (!inside.has(entry.name)) continue;
+              missing.delete(entry.name);
+              result.set(inside.get(entry.name)!, entry.kind === 'file' ? { state: 'present', ...(entry.size !== undefined ? { size: entry.size } : {}) } : { state: 'deleted' });
+            }
+          }
+          // What history once had and the tip has not was deleted; the rest never reached it.
+          const absent = [...missing];
+          const deleted = new Set<string>();
+          for (let at = 0; at < absent.length; at += 200) {
+            const logged = await git(mirror, ['--literal-pathspecs', 'log', '--no-renames', '--diff-filter=D', '--format=', '--name-only', '-z',
+              commit, '--', ...absent.slice(at, at + 200)]);
+            if (logged.code !== 0) throw new Error(logged.stderr || logged.stdout || 'git log failed');
+            for (const name of logged.stdout.split(/[\0\n]/)) if (name) deleted.add(name);
+          }
+          for (const file of absent) result.set(inside.get(file)!, { state: deleted.has(file) ? 'deleted' : 'untracked' });
+        });
+      } catch { /* unreadable now: its paths stay unknown */ }
+    }));
+    return result;
   }
 
   /** Branches each repository has, for the view picker. */
@@ -679,6 +729,23 @@ async function archive(mirror: string, commit: string, target: string): Promise<
 
 function safeSame(a: string, b: string): boolean {
   try { return sameRepository(a, b); } catch { return a === b; }
+}
+
+/** Where a path a task's agent wrote (absolute in its world, or relative to
+ * its working folder) sits in its project's Files: relative to the world
+ * root, which Files lays out alike. Outside the world throws. */
+export function worldFilesPath(handle: WorldHandle | undefined, cited: string): string {
+  const value = String(cited).replace(/\\/g, '/');
+  if (!value) throw new Error('missing path');
+  let relative = value;
+  if (handle) {
+    const root = String(handle.root ?? '').replace(/\/+$/, '');
+    if (value.startsWith('/')) {
+      if (value !== root && !value.startsWith(`${root}/`)) throw new Error('That file is outside the task’s world.');
+      relative = value === root ? '' : value.slice(root.length + 1);
+    } else relative = worldWorkingRelativePath(handle, value);
+  }
+  return splitPath(relative === '.' ? '' : relative).join('/');
 }
 
 /** `a//b/` → ['a', 'b']; `..` and `.` are refused, not resolved. */

@@ -4760,6 +4760,7 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
    One bar (up, address, where it comes from), then a folder's rows or a file. */
 .files-page { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .files-bar { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.files-page > .files-title { margin: 0 0 2px; }
 .files-page .btn.icon { width: 32px; height: 32px; padding: 0; justify-content: center; flex: none; }
 .files-page .btn.icon.disabled { opacity: .4; pointer-events: none; }
 .files-address {
@@ -4783,6 +4784,16 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
   color: var(--ink-2); font-size: var(--fs-12); white-space: nowrap; }
 .files-chip code { font-family: var(--font-mono); font-size: var(--fs-11); color: var(--ink-3); }
 .files-chip.data { color: var(--merged); border-color: color-mix(in srgb, var(--merged) 30%, var(--line)); }
+/* The artifact gallery under the project's (or organization's) tree. */
+.files-artifacts { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; min-width: 0; }
+.files-artifacts[hidden] { display: none; }
+.files-artifacts-title { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--ink); font-size: var(--fs-14); font-weight: 650; }
+.files-gallery { margin: 0; }
+.files-artifacts-more { align-self: flex-start; }
+.gallery-tile-meta { display: flex; align-items: center; gap: 6px; min-height: 1em; margin-top: -3px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  color: var(--ink-3); font-size: var(--fs-11); font-variant-numeric: tabular-nums; }
+.gallery-tile-meta:empty { display: none; }
+.gallery-tile-live { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
 .files-body { min-width: 0; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); overflow: hidden; }
 .files-status { display: flex; align-items: center; gap: 10px; padding: 18px 16px; color: var(--ink-2); font-size: var(--fs-13); }
 .files-status.muted { color: var(--ink-3); }
