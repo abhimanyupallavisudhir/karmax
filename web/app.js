@@ -23831,7 +23831,7 @@ function permissionRequestRows(requests, { historyLimit = 20, inTask = false } =
       <div class="approval-request-help">Requested from ${request.audience.map((selector) => {
         const grantor = selector.startsWith('task:') ? (request.grantorTasks || []).find((task) => task.id === selector.slice(5)) : undefined;
         return grantor ? credentialRequestTaskLink({ taskId: grantor.id, task: grantor }) : esc(selector);
-      }).join(', ')}. ${request.projectIds?.length ? `Allowing gives this task its ${esc(request.baseAuthorization?.level || 'current')} access in these projects too.` : 'Allowing gives only these, and only to this task.'}</div>
+      }).join(', ')}. ${request.projectIds?.length ? `Allowing gives this task its ${esc(request.baseAuthorization?.level && request.baseAuthorization.level !== 'inherited-child' ? request.baseAuthorization.level : 'current')} access in these projects too.` : 'Allowing gives only these, and only to this task.'}</div>
     </div>
     <div class="approval-request-actions">
       <button class="btn sm primary" data-preq-act="approve" title="Give this task’s agent these permissions">Allow</button>
