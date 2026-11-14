@@ -22,6 +22,10 @@ const quick = `Which database?\n\n${fence({ options: ['Postgres', 'SQLite'] })}`
 const secure = `I need an OpenAI key.\n\n${fence({ fields: [{ name: 'key', label: 'OpenAI API key', type: 'secret' }],
   save: { method: 'POST', path: '/api/projects/p/secrets', body: { name: 'OPENAI_API_KEY', value: '{{key}}' } } })}`;
 const leaky = `${fence({ fields: [{ name: 'key', type: 'secret' }], save: { method: 'PATCH', path: '/api/projects/p', body: { name: '{{key}}' } } })}`;
+// The included model's OpenRouter management key: an installation setting whose key is write-only.
+const includedModel = `${fence({ fields: [{ name: 'key', label: 'OpenRouter management key', type: 'secret' }],
+  save: { method: 'PUT', path: '/api/settings/included-model', body: { managementKey: '{{key}}' } }, submit: 'Turn on the included model' })}`;
+const leakyInstallation = `${fence({ fields: [{ name: 'key', type: 'secret' }], save: { method: 'PUT', path: '/api/settings/installation', body: { siteName: '{{key}}' } } })}`;
 const outside = `${fence({ fields: [{ name: 'who' }], save: { method: 'POST', path: '/api/organizations/o/members', body: { userId: '{{who}}', role: 'owner' } } })}`;
 
 (async () => {
@@ -35,7 +39,7 @@ const outside = `${fence({ fields: [{ name: 'who' }], save: { method: 'POST', pa
       const context = await browser.newContext({ serviceWorkers: 'block', viewport: { width: 1280, height: 900 }, colorScheme });
       const sent = [];
       const { sockets } = await fakeConsole(context, { project, tasks: [task], async api(p, request) {
-        if (request.method() === 'POST') {
+        if (request.method() !== 'GET') {
           const body = request.postDataJSON();
           sent.push({ path: p, body });
           if (p === '/api/tasks/t/signal') {
@@ -130,6 +134,21 @@ const outside = `${fence({ fields: [{ name: 'who' }], save: { method: 'POST', pa
       await context.close();
     }
 
+    // ── the included model's management key saves to Managed compute, write-only ──
+    {
+      const { context, page, errors, sent } = await open([{ id: 'a1', role: 'agent', text: includedModel, ts: T0 }]);
+      const form = page.locator('#ck-thread form.ask-form.live');
+      assert.match(await form.locator('.ask-note').innerText(), /Saved to Managed compute · Included model, not into the conversation/);
+      await form.getByLabel('OpenRouter management key').fill('sk-or-v1-mgmt');
+      await form.locator('.ask-submit').click();
+      await page.waitForFunction(() => !document.querySelector('#ck-thread form.ask-form.live'));
+      assert.deepEqual(sent.map((s) => s.path), ['/api/settings/included-model', '/api/tasks/t/signal']);
+      assert.deepEqual(sent[0].body, { managementKey: 'sk-or-v1-mgmt' });
+      assert.ok(!JSON.stringify(signals(sent)).includes('sk-or'), 'the secret is not in the reply');
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
     // ── a refused save says why, keeps the form, and sends nothing ──
     {
       const { context, page, sent } = await open([{ id: 'a1', role: 'agent', text: secure, ts: T0 }]);
@@ -149,11 +168,13 @@ const outside = `${fence({ fields: [{ name: 'who' }], save: { method: 'POST', pa
       const { context, page, errors, sent } = await open([
         { id: 'a1', role: 'agent', text: leaky, ts: T0 },
         { id: 'a2', role: 'agent', text: outside, ts: T0 + 1 },
+        { id: 'a3', role: 'agent', text: leakyInstallation, ts: T0 + 2 },
       ]);
       assert.equal(await page.locator('#ck-thread form.ask-form').count(), 0);
       const problems = await page.locator('#ck-thread details.ask-form-problem > summary').allInnerTexts();
       assert.deepEqual(problems, ['This form would save a secret where it can be read back, so it was not shown.',
-        'This form would change something outside settings, so it was not shown.']);
+        'This form would change something outside settings, so it was not shown.',
+        'This form would save a secret where it can be read back, so it was not shown.']);
       assert.equal(sent.length, 0);
       assert.deepEqual(errors, []);
       await context.close();
