@@ -7518,6 +7518,12 @@ function rowAsk(t) {
   const pullRequest = (S.searchResult?.pullRequestAsks?.[t.id] || []).find((ask) => ask.kind === kind)?.checkout;
   return { kind, ...(pullRequest ? { pullRequest } : {}) };
 }
+// The strongest ask a row's task itself makes of the signed-in person, in any
+// list (not only For me): what the answers drawn on the row are for.
+function rowOwnAsk(t) {
+  const kinds = S.searchResult?.mine?.[t.id] || [];
+  return Object.keys(ATTENTION_REASONS).find((kind) => kinds.includes(kind));
+}
 function attentionChip(t) {
   const ask = rowAsk(t);
   if (!ask) return '';
@@ -7842,12 +7848,13 @@ function taskRow(t, { showTags = true, project = false } = {}) {
       </div>
       <div class="task-state">${why}${ownAsk && tone === 'human' ? '' : why ? statusHtml(stageLabel(v), tone) : viewStatusHtml(v)}</div>
       <div class="task-right">${pipeline(v)}${rowWhen(t)}${archiveBtn}</div>
-      ${ownAsk ? rowAskHtml(t) : ''}
+      ${rowAskHtml(t)}
     </div>`;
 }
 
 // ── acting from a list ─────────────────────────────────────────────────────
-// A For me row that waits on a decision shows it, with the task page's own
+// A row that waits on your decision shows it, in every list (For me, Active,
+// a project's, a search), with the task page's own
 // buttons and handlers (so a decision made here is the same decision), and a
 // row whose question has one-click answers shows those: most asks are answered
 // without opening the task. Decisions load per task, only for rows that ask
@@ -7884,8 +7891,8 @@ function rowQuickQuestion(t) {
   return { field, question: field.label || before.replace(/[*_`#>]/g, '').trim() };
 }
 function rowAskHtml(t) {
-  const ask = rowAsk(t);
-  if (ask?.kind === 'escalated') {
+  const kind = rowOwnAsk(t);
+  if (kind === 'escalated') {
     const quick = rowQuickQuestion(t);
     if (!quick) return '';
     return `<div class="row-ask" data-row-quick="${esc(t.id)}">
@@ -7894,7 +7901,7 @@ function rowAskHtml(t) {
         `<button type="button" class="btn sm" data-row-answer="${esc(option.value)}"${option.hint ? ` title="${esc(option.hint)}"` : ''}>${esc(option.label)}</button>`).join('')}</span>
     </div>`;
   }
-  if (ask?.kind !== 'approval-requested') return '';
+  if (kind !== 'approval-requested') return '';
   const loaded = rowDecisions.get(t.id);
   if (!loaded) return `<div class="row-ask" data-row-decisions="${esc(t.id)}" data-loading></div>`;
   const stale = loaded.key !== rowDecisionKey(t);

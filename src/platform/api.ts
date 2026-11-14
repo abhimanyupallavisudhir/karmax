@@ -51,7 +51,7 @@ import { IncomingWebhooks, WebhookConfigError, webhookDeliveryKey, type Incoming
 import { isChatPlatform, type ChatPlatform } from '../integrations/chat-platforms.js';
 import { chatThreadKey, type ChatReplies } from '../integrations/chat-replies.js';
 import { pullRequestOf } from '../domain/pull-requests.js';
-import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates, queryFolds } from '../domain/search.js';
+import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
 import { assertComputerFits, providerLabel } from '../domain/computer-limits.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
@@ -6366,6 +6366,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       ...(result.groups ? { groups: prune(result.groups) } : {}),
       ...(result.reasons ? { reasons: Object.fromEntries(Object.entries(result.reasons).filter(([id]) => ids.has(id))) } : {}),
       ...(result.pullRequestAsks ? { pullRequestAsks: Object.fromEntries(Object.entries(result.pullRequestAsks).filter(([id]) => ids.has(id))) } : {}),
+      ...(result.mine ? { mine: Object.fromEntries(Object.entries(result.mine).filter(([id]) => ids.has(id))) } : {}),
       ...(result.updated ? { updated: Object.fromEntries(Object.entries(result.updated).filter(([id]) => ids.has(id))) } : {}),
       ...(result.runCounts ? { runCounts: Object.fromEntries(Object.entries(result.runCounts).filter(([id]) => ids.has(id))) } : {}),
       projects: projects.map((project) => ({ id: project.id, name: project.name, slug: slugify(project.name), organizationId: project.organizationId ?? 'org_personal' })),
@@ -6396,9 +6397,9 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       projects: new Map(projects.map((project) => [project.id, { name: project.name, slug: slugify(project.name) }])),
     };
     const forValues = forClauseValues(q);
-    // `is:folded` keeps the nested rows that need the caller, so it reads their asks too.
-    const folds = !!ctx.userId && queryFolds(q);
-    if (forValues.length || folds) {
+    // Every list reads the caller's own asks: `is:folded` keeps the nested rows
+    // that need them, and any row offers the answers they can give (`mine`).
+    if (forValues.length || ctx.userId) {
       const organizations = [...new Set(projects.map((project) => project.organizationId ?? 'org_personal'))];
       if (forValues.some((value) => value.toLowerCase() !== 'me' && !/^user:/i.test(value))) {
         ctx.people = new Map();
@@ -6409,7 +6410,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       }
       const users = new Set(forValues.map((value) => value.toLowerCase() === 'me' ? ctx.userId
         : /^user:/i.test(value) ? value.slice(5) : ctx.people?.get(value.trim().toLowerCase())).filter((id): id is string => !!id));
-      if (folds) users.add(ctx.userId!);
+      if (ctx.userId) users.add(ctx.userId);
       ctx.attention = new Map();
       for (const userId of users) {
         const asks = new Map<string, AttentionAsk>();

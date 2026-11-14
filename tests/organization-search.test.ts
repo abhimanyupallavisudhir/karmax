@@ -95,6 +95,15 @@ describe('organization task list', () => {
     } finally { await f.store.close(); }
   });
 
+  it('says what each row asks of the caller on every list, so any row can be answered', async () => {
+    const f = await fixture();
+    try {
+      const { body } = await f.call(f.ana, f.org.id, `q=${encodeURIComponent('-is:archived')}`);
+      expect(body.reasons).toBeUndefined();
+      expect(body.mine).toEqual({ [f.t2.id]: ['mentioned'] });
+    } finally { await f.store.close(); }
+  });
+
   it('counts a query per project without the rows, for the sidebar\'s For me numbers', async () => {
     const f = await fixture();
     try {
