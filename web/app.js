@@ -29099,13 +29099,13 @@ function renderPublicShell(current, content) {
   const link = (href, label) => `<a href="${href}" data-public${href === current ? ' aria-current="page"' : ''}>${esc(label)}</a>`;
   $('#app').innerHTML = `<div class="legal-shell docs-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>${siteNameMarkup()}</span></a><a href="/">Open ${siteNameMarkup()}</a></header>
     <div class="docs-layout"><nav class="docs-nav" aria-label="Documentation">
-      ${['Docs', 'Guides'].map((group) => `<div class="docs-nav-group"><span>${group}</span>${sitePages().filter((page) => page.group === group).map((page) => link(page.path, page.title)).join('')}</div>`).join('')}
+      ${['Docs', 'Guides'].map((group) => `<div class="docs-nav-group"><span>${group}</span>${sitePages().filter((page) => page.group === group).map((page) => link(page.path, page.label)).join('')}</div>`).join('')}
       <div class="docs-nav-group">${link('/compare', 'Compare')}${current.startsWith('/compare') ? `<div class="docs-nav-sub">${sitePages()
-        .filter((page) => page.path.startsWith('/compare/')).map((page) => link(page.path, page.title)).join('')}</div>` : ''}</div>
+        .filter((page) => page.path.startsWith('/compare/')).map((page) => link(page.path, page.label)).join('')}</div>` : ''}</div>
       <div class="docs-nav-group">${link('/pricing', 'Pricing')}</div>
       <div class="docs-nav-group">${link('/legal', 'Policies')}<div class="docs-nav-sub">${(S.launch?.policies || [])
         .map((policy) => link(`/legal/${policy.slug}`, policy.title)).join('')}</div></div>
-      <div class="docs-nav-group">${sitePages().filter((page) => page.group === 'Site').map((page) => link(page.path, page.title)).join('')}</div>
+      <div class="docs-nav-group">${sitePages().filter((page) => page.group === 'Site').map((page) => link(page.path, page.label)).join('')}</div>
     </nav><div class="docs-content">${content}</div></div>${legalFooter()}</div>`;
   if (location.hash) document.getElementById(decodeURIComponent(location.hash.slice(1)))?.scrollIntoView();
   else window.scrollTo(0, 0);

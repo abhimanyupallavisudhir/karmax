@@ -105,7 +105,8 @@ type LandingPart = [shot: string, title: string, line: string, alt: string];
 
 /** web/site.js: the pages beside the console and the landing's words, shared with web/app.js. */
 export interface Site {
-  pages: Array<{ path: string; file: string; title: string; group: string; updated?: string }>;
+  /** `label` is a page's name in the console's sidebar. */
+  pages: Array<{ path: string; file: string; title: string; group: string; updated?: string; label: string }>;
   landing: {
     steps: [string, LandingPart[]];
     autonomy: [string, string, LandingPart[]];

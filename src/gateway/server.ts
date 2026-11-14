@@ -12,6 +12,7 @@ import * as __asyncCollections from '../util/async-collections.js';
 import { GatewayMetrics, type MemorySource } from './metrics.js';
 import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
 import { assetExists, MATHJAX_SCRIPT_SOURCE, serveStaticAsset, staticAssetRevision, unpublishedAsset } from './static-assets.js';
+import { announceChangedPages, indexNowKeyFile } from './indexnow.js';
 import { LANDING_TAGLINE, llmsFullText, llmsPageList, markdownSourcePage, policySlugOf, publicBody, publicEntries, publicHead, publicPath, resolvePublicRoute, robotsTxt, sitemapXml, type PublicPageContext, type PublicRoute } from './public-pages.js';
 import { SwrCache } from '../util/swr-cache.js';
 import { MAX_REVIEW_ARTIFACT_BYTES, savedReviewArtifact } from '../store/review-artifacts.js';
@@ -1549,6 +1550,14 @@ export class Gateway {
     const directHost = bindHost === '0.0.0.0' || bindHost === '::' ? '127.0.0.1' : bindHost;
     this.loopbackUrl = `http://${directHost.includes(':') ? `[${directHost}]` : directHost}:${port}`;
     const publicUrl = process.env.KARMAX_PUBLIC_URL?.trim().replace(/\/$/, '') || `http://${directHost}:${port}`;
+    // A hosted installation with a public address tells search engines which
+    // of its public pages changed with this release (IndexNow). Best effort.
+    const announced = process.env.KARMAX_PUBLIC_URL?.trim().replace(/\/$/, '');
+    if (this.deps.hosted && announced?.startsWith('https://')) void (async () => {
+      const submitted = await announceChangedPages({ store: this.deps.store, origin: announced,
+        entries: publicEntries(await this.publicPageContext()), log: (message) => console.warn(`[search] ${message}`) });
+      if (submitted.length) console.log(`[search] announced ${submitted.length} changed public pages`);
+    })().catch((error) => console.warn('[search] announcing changed pages failed:', error instanceof Error ? error.message : error));
     // Webhooks give GitHub-backed stores low latency; this durable-state scan is
     // the recovery rail for missed deliveries, restarts, and non-GitHub remotes.
     this.sweepConnections();
@@ -9721,6 +9730,12 @@ export class Gateway {
       const body = p === '/robots.txt' ? robotsTxt(origin, indexable) : sitemapXml(origin, publicEntries((await this.publicPageContext(req))));
       res.writeHead(200, { 'content-type': MIME[path.extname(p)]!, 'cache-control': 'no-cache', 'content-length': String(Buffer.byteLength(body)) });
       return void res.end(req?.method === 'HEAD' ? undefined : body);
+    }
+    // IndexNow's proof that this installation owns its host: its key, at /<key>.txt.
+    const indexNow = await indexNowKeyFile(this.deps.store, p);
+    if (indexNow) {
+      res.writeHead(200, { 'content-type': MIME['.txt']!, 'cache-control': 'no-cache', 'x-robots-tag': 'noindex', 'content-length': String(indexNow.length) });
+      return void res.end(req?.method === 'HEAD' ? undefined : indexNow);
     }
     if (p === '/llms-full.txt') {
       const origin = req ? this.publicUrl(req) : '';

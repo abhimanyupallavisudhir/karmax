@@ -46,13 +46,13 @@ const site = globalThis.KarmaxSite;
     assert.ok(!requests.includes('GET /api/session'), 'a public page does not read (and so provision) a session');
     assert.deepEqual(await nav(), [
       ['Getting started', '/docs'], ['How it works', '/docs/how-it-works'], ['Cloud computers', '/docs/computers'], ['Chat bots', '/docs/chat-bots'], ['tavya CLI', '/docs/cli'],
-      ...site.pages.filter((entry) => entry.group === 'Guides').map((entry) => [entry.title, entry.path]),
+      ['Claude Code in the cloud', '/docs/claude-code-in-the-cloud'], ['Parallel agents', '/docs/parallel-agents'], ['Schedules and events', '/docs/scheduled-tasks'],
+      ['Agent review', '/docs/agent-review'], ['Agent payments', '/docs/agent-payments'], ['Files Git ignores', '/docs/ignored-files'], ['Self-hosting', '/docs/self-hosting'],
       ['Compare', '/compare'],
       ['Pricing', '/pricing'],
       ['Policies', '/legal'], ['Terms of Service', '/legal/terms'], ['Privacy Policy', '/legal/privacy'],
-      ['About tavya', '/about'], ['Changelog', '/changelog'],
+      ['About', '/about'], ['Changelog', '/changelog'],
     ], 'one sidebar: the docs and guides, the comparison, pricing, every policy, then About and the changelog');
-    assert.ok(site.pages.filter((entry) => entry.group === 'Guides').length >= 5, 'the guides are listed');
     assert.equal(await current(), 'Getting started');
     assert.match(await page.title(), /Getting started · Fixture/);
     if (shots) await page.screenshot({ path: path.join(shots, 'docs-getting-started.png'), fullPage: true });

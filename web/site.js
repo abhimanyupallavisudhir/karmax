@@ -3,34 +3,35 @@
 // (src/gateway/public-pages.ts) renders the same for search engines, link
 // previews and agents that run no script — so the two cannot disagree.
 (function (root) {
-  // A Markdown page: [path, file under web/, title (the file's `# heading`), sidebar group, last changed].
+  // A Markdown page: [path, file under web/, title (the file's `# heading`), sidebar group, last changed,
+  // its name in the sidebar where the title is too long for it].
   // `updated` is the sitemap's <lastmod>: change it when the page's content changes.
-  const page = (path, file, title, group, updated) => ({ path, file, title, group, updated });
+  const page = (path, file, title, group, updated, label = title) => ({ path, file, title, group, updated, label });
   const pages = [
-    page('/docs', 'docs/getting-started.md', 'Getting started', 'Docs', '2026-11-07'),
+    page('/docs', 'docs/getting-started.md', 'Getting started', 'Docs', '2026-11-14'),
     page('/docs/how-it-works', 'docs/how-it-works.md', 'How it works', 'Docs', '2026-11-14'),
     page('/docs/computers', 'docs/computers.md', 'Cloud computers', 'Docs', '2026-11-06'),
     page('/docs/chat-bots', 'docs/chat-bots.md', 'Chat bots', 'Docs', '2026-10-27'),
     page('/docs/cli', 'docs/cli.md', 'tavya CLI', 'Docs', '2026-10-18'),
-    page('/docs/claude-code-in-the-cloud', 'docs/claude-code-in-the-cloud.md', 'Run Claude Code in the cloud', 'Guides', '2026-11-14'),
-    page('/docs/parallel-agents', 'docs/parallel-agents.md', 'Run many agents in parallel', 'Guides', '2026-11-14'),
-    page('/docs/scheduled-tasks', 'docs/scheduled-tasks.md', 'Schedule tasks and react to events', 'Guides', '2026-11-14'),
-    page('/docs/agent-review', 'docs/agent-review.md', 'Let one agent review another', 'Guides', '2026-11-14'),
-    page('/docs/agent-payments', 'docs/agent-payments.md', 'Give an agent a card with a budget', 'Guides', '2026-11-14'),
+    page('/docs/claude-code-in-the-cloud', 'docs/claude-code-in-the-cloud.md', 'Run Claude Code in the cloud', 'Guides', '2026-11-14', 'Claude Code in the cloud'),
+    page('/docs/parallel-agents', 'docs/parallel-agents.md', 'Run many agents in parallel', 'Guides', '2026-11-14', 'Parallel agents'),
+    page('/docs/scheduled-tasks', 'docs/scheduled-tasks.md', 'Schedule tasks and react to events', 'Guides', '2026-11-14', 'Schedules and events'),
+    page('/docs/agent-review', 'docs/agent-review.md', 'Let one agent review another', 'Guides', '2026-11-14', 'Agent review'),
+    page('/docs/agent-payments', 'docs/agent-payments.md', 'Give an agent a card with a budget', 'Guides', '2026-11-14', 'Agent payments'),
     page('/docs/ignored-files', 'docs/ignored-files.md', 'Files Git ignores', 'Guides', '2026-11-14'),
-    page('/docs/self-hosting', 'docs/self-hosting.md', 'Host tavya yourself', 'Guides', '2026-11-14'),
+    page('/docs/self-hosting', 'docs/self-hosting.md', 'Host tavya yourself', 'Guides', '2026-11-14', 'Self-hosting'),
     page('/compare', 'compare/index.md', 'tavya compared', 'Compare', '2026-11-14'),
-    page('/compare/claude-code', 'compare/claude-code.md', 'tavya vs Claude Code on the web', 'Compare', '2026-11-14'),
-    page('/compare/codex', 'compare/codex.md', 'tavya vs Codex cloud', 'Compare', '2026-11-14'),
-    page('/compare/devin', 'compare/devin.md', 'tavya vs Devin', 'Compare', '2026-11-14'),
-    page('/compare/cursor', 'compare/cursor.md', 'tavya vs Cursor cloud agents', 'Compare', '2026-11-14'),
-    page('/compare/paperclip', 'compare/paperclip.md', 'tavya vs Paperclip', 'Compare', '2026-11-14'),
-    page('/compare/warp', 'compare/warp.md', 'tavya vs Warp Factories', 'Compare', '2026-11-14'),
-    page('/compare/manus', 'compare/manus.md', 'tavya vs Manus', 'Compare', '2026-11-14'),
-    page('/compare/openclaw', 'compare/openclaw.md', 'tavya vs OpenClaw', 'Compare', '2026-11-14'),
-    page('/compare/vibe-kanban', 'compare/vibe-kanban.md', 'tavya as a Vibe Kanban alternative', 'Compare', '2026-11-14'),
-    page('/compare/terragon', 'compare/terragon.md', 'tavya as a Terragon alternative', 'Compare', '2026-11-14'),
-    page('/about', 'about.md', 'About tavya', 'Site', '2026-11-14'),
+    page('/compare/claude-code', 'compare/claude-code.md', 'tavya vs Claude Code on the web', 'Compare', '2026-11-14', 'Claude Code on the web'),
+    page('/compare/codex', 'compare/codex.md', 'tavya vs Codex cloud', 'Compare', '2026-11-14', 'Codex cloud'),
+    page('/compare/devin', 'compare/devin.md', 'tavya vs Devin', 'Compare', '2026-11-14', 'Devin'),
+    page('/compare/cursor', 'compare/cursor.md', 'tavya vs Cursor cloud agents', 'Compare', '2026-11-14', 'Cursor'),
+    page('/compare/paperclip', 'compare/paperclip.md', 'tavya vs Paperclip', 'Compare', '2026-11-14', 'Paperclip'),
+    page('/compare/warp', 'compare/warp.md', 'tavya vs Warp Factories', 'Compare', '2026-11-14', 'Warp Factories'),
+    page('/compare/manus', 'compare/manus.md', 'tavya vs Manus', 'Compare', '2026-11-14', 'Manus'),
+    page('/compare/openclaw', 'compare/openclaw.md', 'tavya vs OpenClaw', 'Compare', '2026-11-14', 'OpenClaw'),
+    page('/compare/vibe-kanban', 'compare/vibe-kanban.md', 'tavya as a Vibe Kanban alternative', 'Compare', '2026-11-14', 'Vibe Kanban'),
+    page('/compare/terragon', 'compare/terragon.md', 'tavya as a Terragon alternative', 'Compare', '2026-11-14', 'Terragon'),
+    page('/about', 'about.md', 'About tavya', 'Site', '2026-11-14', 'About'),
     page('/changelog', 'changelog.md', 'Changelog', 'Site', '2026-11-14'),
   ];
 
