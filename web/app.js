@@ -14474,7 +14474,7 @@ function renderAgentMessageBody(text, v = S.view, math = mathjaxEnabled(), form 
 // secret field of a secret store, as a whole value: a secret typed into a form
 // is never shown in the conversation, kept in its history or read back.
 const FORM_BLOCK = /<pre class="md-code lang-form"><code>([\s\S]*?)<\/code><\/pre>/g;
-const SECRET_FIELD_KEY = /^(?:value|secret|secrets|key|apiKey|api_key|token|password|clientSecret|privateKey|totp)$/i;
+const SECRET_FIELD_KEY = /^(?:value|secret|secrets|key|apiKey|api_key|managementKey|token|password|clientSecret|privateKey|totp)$/i;
 // [method, path, what it is (from the path's ids and the body), a secret store?]
 const SETTINGS_TARGETS = [
   ['POST', /^\/api\/projects\/([^/]+)\/secrets$/, (m, b) => `${formLiteral(b.name) ? `${b.name} · ` : ''}${formProjectName(m[1])} secrets`, true],
@@ -14482,6 +14482,7 @@ const SETTINGS_TARGETS = [
   ['PATCH', /^\/api\/projects\/([^/]+)$/, (m) => `${formProjectName(m[1])} settings`],
   ['PUT', /^\/api\/settings\/project\/([^/]+)\/[^/]+$/, (m) => `${formProjectName(m[1])} task defaults`],
   ['PUT', /^\/api\/settings\/managed-compute\/([^/]+)$/, (m) => `Managed compute · ${formProviderName(m[1])}`, true],
+  ['PUT', /^\/api\/settings\/included-model$/, () => 'Managed compute · Included model', true],
   ['PUT', /^\/api\/settings\/[\w/-]+$/, () => 'Installation settings'],
   ['PATCH', /^\/api\/organizations\/([^/]+)$/, (m) => `${formOrganizationName(m[1])} settings`],
   ['POST', /^\/api\/organizations\/([^/]+)\/accounts$/, (m) => `${formOrganizationName(m[1])} agent accounts`, true],
