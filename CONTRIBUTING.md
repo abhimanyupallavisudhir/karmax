@@ -26,3 +26,10 @@ reviewer identity (a team or a reviewer account) in that file first: pull
 requests are opened as the owner account, and GitHub does not let an author
 approve their own, so requiring code owner review with the owner alone would
 block every such change.
+
+## Licence of contributions
+
+karmax is licensed under the [GNU AGPL, version 3](./LICENSE). By opening a pull
+request you agree that your contribution is licensed under it, and that the
+copyright holder may also offer the project, your contribution included, under
+other terms. Don't contribute code you have no right to license this way.
