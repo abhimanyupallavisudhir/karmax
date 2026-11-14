@@ -112,6 +112,7 @@ import { lifecycleEventPayload } from '../domain/view-publication.js';
 import { listState } from '../domain/list-state.js';
 import { taskForkSourceIds } from '../domain/forks.js';
 import { coordinatorSetting } from '../domain/coordinator.js';
+import type { SiteAnalyticsCount, SiteAnalyticsRow, SiteVisitorMark } from '../domain/site-analytics.js';
 
 /** How many dismissals a person's preferences keep (the newest). */
 const MAX_DISMISSED = 500;
@@ -897,6 +898,18 @@ export class Store {
         meter TEXT NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (meter, day)
       );
+      -- Web analytics of the public site (wiki features/site-analytics):
+      -- counts only, by UTC day; kind is view | visitor | signup | crawl.
+      CREATE TABLE IF NOT EXISTS site_analytics (
+        day TEXT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL, source TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, kind, path, source)
+      );
+      -- Who was already counted today: a hash under the day's salt, both
+      -- deleted within 48 hours, so nothing follows a person across days.
+      CREATE TABLE IF NOT EXISTS site_visitors (
+        day TEXT NOT NULL, mark TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY (day, mark, hash)
+      );
+      CREATE TABLE IF NOT EXISTS site_salts (day TEXT PRIMARY KEY, salt TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS usage_events (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT, taskId TEXT,
         worldId TEXT, provider TEXT NOT NULL, kind TEXT NOT NULL, quantity REAL NOT NULL,
@@ -8881,6 +8894,81 @@ export class Store {
     return this.db.transaction(async () => {
       (await this.db.prepare('DELETE FROM service_usage_counts WHERE day<?').run(beforeDay));
     });
+  }
+
+  // ── Site analytics (wiki features/site-analytics; src/platform/site-analytics.ts) ──
+
+  /** The salt of `day`'s visitor hashes: the first process to ask sets it, every other gets the same. */
+  async siteAnalyticsSalt(day: string, candidate: string): Promise<string> {
+    return this.db.transaction(async () => {
+      (await this.db.prepare('INSERT INTO site_salts (day, salt) VALUES (?, ?) ON CONFLICT(day) DO NOTHING').run(day, candidate));
+      const row = (await this.db.prepare('SELECT salt FROM site_salts WHERE day=?').get(day)) as { salt: string } | undefined;
+      return row?.salt ?? candidate;
+    });
+  }
+
+  /** Add a batch of counts, and count each visitor hash the day has not seen
+   * (once as a visitor, once more if they opened sign-up). Safe with several
+   * gateway processes: the hashes' primary key decides who is new, and every
+   * count is an atomic increment. */
+  async recordSiteAnalytics(batch: { counts: SiteAnalyticsCount[]; visitors: SiteVisitorMark[] }): Promise<void> {
+    const CHUNK = 200;
+    return this.db.transaction(async () => {
+      const totals = new Map<string, SiteAnalyticsCount>();
+      const add = (count: SiteAnalyticsCount) => {
+        const key = [count.day, count.kind, count.path, count.source].join('\n');
+        const entry = totals.get(key);
+        if (entry) entry.n += count.n; else totals.set(key, { ...count });
+      };
+      for (const count of batch.counts) add(count);
+      const marks = new Map(batch.visitors.map((visitor) => [[visitor.day, visitor.mark, visitor.hash].join('\n'), visitor]));
+      // A stable order, so concurrent writers take row locks in the same order.
+      const visitors = [...marks.keys()].sort();
+      for (let at = 0; at < visitors.length; at += CHUNK) {
+        const chunk = visitors.slice(at, at + CHUNK).map((key) => marks.get(key)!);
+        const inserted = (await this.db.prepare(`INSERT INTO site_visitors (day, mark, hash) VALUES ${chunk.map(() => '(?, ?, ?)').join(', ')}
+          ON CONFLICT DO NOTHING RETURNING day, mark, hash`).all(...chunk.flatMap((visitor) => [visitor.day, visitor.mark, visitor.hash]))) as Array<{ day: string; mark: string; hash: string }>;
+        for (const row of inserted) {
+          const visitor = marks.get([row.day, row.mark, row.hash].join('\n'))!;
+          add({ day: visitor.day, kind: visitor.mark === 'signup' ? 'signup' : 'visitor', path: visitor.path, source: visitor.source, n: 1 });
+        }
+      }
+      const counts = [...totals.keys()].sort().map((key) => totals.get(key)!);
+      for (let at = 0; at < counts.length; at += CHUNK) {
+        const chunk = counts.slice(at, at + CHUNK);
+        (await this.db.prepare(`INSERT INTO site_analytics (day, kind, path, source, count) VALUES ${chunk.map(() => '(?, ?, ?, ?, ?)').join(', ')}
+          ON CONFLICT(day, kind, path, source) DO UPDATE SET count = site_analytics.count + excluded.count`)
+          .run(...chunk.flatMap((count) => [count.day, count.kind, count.path, count.source, count.n])));
+      }
+    });
+  }
+
+  /** Delete the salts and visitor hashes of days before `beforeDay` (YYYY-MM-DD, UTC). */
+  async pruneSiteVisitors(beforeDay: string): Promise<void> {
+    return this.db.transaction(async () => {
+      (await this.db.prepare('DELETE FROM site_visitors WHERE day<?').run(beforeDay));
+      (await this.db.prepare('DELETE FROM site_salts WHERE day<?').run(beforeDay));
+    });
+  }
+
+  /** The counted rows of the days `fromDay` to `toDay` (inclusive, UTC). */
+  async siteAnalyticsRows(fromDay: string, toDay: string): Promise<SiteAnalyticsRow[]> {
+    const rows = (await this.db.prepare(`SELECT day, kind, path, source, count FROM site_analytics WHERE day>=? AND day<=?`)
+      .all(fromDay, toDay)) as Array<{ day: string; kind: SiteAnalyticsCount['kind']; path: string; source: string; count: number | string }>;
+    return rows.map((row) => ({ day: String(row.day), kind: row.kind, path: String(row.path), source: String(row.source), count: Number(row.count) }));
+  }
+
+  /** For each organization whose first task (not a draft, not a sub-task) was
+   * created, or first task confirmed, between `from` and `to` (epoch ms,
+   * inclusive): when. The sign-up funnel's last two steps. */
+  async organizationFirstTasks(from: number, to: number): Promise<{ started: number[]; confirmed: number[] }> {
+    const rows = (await this.db.prepare(`SELECT MIN(t.createdAt) AS started, MIN(t.completedAt) AS confirmed
+      FROM tasks t JOIN projects p ON p.id=t.projectId
+      WHERE t.parentTaskId IS NULL AND COALESCE(json_extract(t.params, '$.draft'), 0) = 0
+      GROUP BY COALESCE(p.organizationId, 'org_personal')`).all()) as Array<{ started: number | string | null; confirmed: number | string | null }>;
+    const within = (value: number | string | null) => value != null && Number(value) >= from && Number(value) <= to;
+    return { started: rows.filter((row) => within(row.started)).map((row) => Number(row.started)),
+      confirmed: rows.filter((row) => within(row.confirmed)).map((row) => Number(row.confirmed)) };
   }
 
   /** Seconds of `world.active` metered for one organization and provider that

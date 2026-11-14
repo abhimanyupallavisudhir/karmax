@@ -4805,6 +4805,24 @@ function interReady(capMs = 1000) {
   ]);
 }
 
+// Web analytics of the public site (wiki features/site-analytics): each public
+// page, sign-in or create-account page drawn — in-place navigation too — is
+// one view, counted by the gateway. No cookie, no storage, no third party.
+let siteViewFrom = '';
+function siteView(render) {
+  const path = location.pathname;
+  if (path === '/' || path === '/login' || path === '/signup' || PUBLIC_PATH.test(path)) {
+    // The page before, for a page swapped in place; else whatever linked here.
+    const body = JSON.stringify({ path: `${path}${location.search}`, referrer: siteViewFrom || document.referrer });
+    try {
+      if (!navigator.sendBeacon?.('/api/site-analytics/view', body))
+        fetch('/api/site-analytics/view', { method: 'POST', body, keepalive: true }).catch(() => {});
+    } catch { /* counting never stops a page */ }
+    siteViewFrom = location.href;
+  }
+  return render();
+}
+
 async function boot() {
   // Public pages need no session, and must not read one: that provisions a
   // personal workspace and consumes the one-time git-onboarding flag. The
@@ -4827,7 +4845,7 @@ async function boot() {
     interReady(),
   ]);
   applyDocumentBrand();
-  if (publicPage) return publicPage();
+  if (publicPage) return siteView(publicPage);
   // Better Auth redirects the confirmation link back here with ?verified=1 after
   // marking the address verified. Note it, strip it from the URL, and surface it
   // (a toast in-app, or a line on the sign-in card if the link was opened while
@@ -4865,9 +4883,8 @@ async function boot() {
     // The public root explains the product before asking for an account. Auth
     // callbacks, invitations and explicit auth routes still land directly on
     // the form they need, so a person following a link never has to hunt.
-    if (S.pendingInvite || S.justVerified || S.signInError || ['/login', '/mcp-callback', '/device', '/oauth/consent'].includes(location.pathname)) return renderLogin();
-    if (location.pathname === '/signup') return renderSignup();
-    return renderLanding();
+    return siteView(S.pendingInvite || S.justVerified || S.signInError || ['/login', '/mcp-callback', '/device', '/oauth/consent'].includes(location.pathname)
+      ? renderLogin : location.pathname === '/signup' ? renderSignup : renderLanding);
   }
   // Successful password/social auth returns to the public auth URL it started
   // from. Those URLs are not organizations; canonicalise before app routing.
@@ -18565,8 +18582,8 @@ const insFmtValue = (value, unit) => unit === 'h' ? insDuration(value * 3_600_00
   : unit === 'micros' ? insMoney(value) : unit === 'usd' ? insMoney(value * 1e6) : unit === 'bytes' ? insBytes(value) : String(Math.round(value));
 const insFmtTick = (value, unit) => unit === 'micros' ? insMoneyTick(value) : unit === 'usd' ? insMoneyTick(value * 1e6) : insFmtValue(value, unit);
 
-function insightChartSvg(data, lens, width) {
-  const series = insightSeries(data, lens);
+// `series` defaults to the lens's; another page's chart passes its own (with a `title`).
+function insightChartSvg(data, lens, width, series = insightSeries(data, lens)) {
   const n = data.daily.length;
   const H = 188, padL = 34, padR = 6, padT = 10, padB = 22;
   const plotW = Math.max(40, width - padL - padR), plotH = H - padT - padB;
@@ -18612,7 +18629,7 @@ function insightChartSvg(data, lens, width) {
       <text x="${padL + plotW}" y="${y(limit.value) - 4}" text-anchor="end">${esc(limitLabel)}</text></g>`
     : `<g class="ins-limit off"><title>${esc(limit.tip)}</title><text x="${padL + plotW}" y="${padT + 2}" text-anchor="end">${esc(limitLabel)} ↑</text></g>`;
   return { series, band, padL, x, y, H, limit, svg: `<svg class="ins-svg" width="${width}" height="${H}" viewBox="0 0 ${width} ${H}" role="img"
-    aria-label="${esc(`${INSIGHT_LENSES.find((l) => l.key === lens)?.label} per day, last ${n} days`)}">
+    aria-label="${esc(`${series.title || INSIGHT_LENSES.find((l) => l.key === lens)?.label} per day, last ${n} days`)}">
     ${grid}${bars}${line}${limitMark}${xLabels}${empty}<rect class="ins-hover" x="0" y="${padT}" width="${barW + 8}" height="${plotH}" rx="4" visibility="hidden"/>
     ${series.line ? `<circle class="ins-hover-dot" r="4" fill="${series.line.color}" visibility="hidden"/>` : ''}</svg>` };
 }
@@ -18645,6 +18662,11 @@ function drawInsightChart(box, data) {
     S.insightsSplit = { ...S.insightsSplit, [lens]: button.dataset.insSplit };
     drawInsightChart(box, S.insightsData);
   }));
+  drawInsightPlot(plot, data, chart, width);
+}
+
+// The chart in its plot, with the per-day tooltip on hover or tap.
+function drawInsightPlot(plot, data, chart, width) {
   plot.innerHTML = `${chart.svg}<div class="ins-tip" hidden></div>`;
   const svg = plot.querySelector('svg'), tip = plot.querySelector('.ins-tip');
   const hover = svg.querySelector('.ins-hover'), dot = svg.querySelector('.ins-hover-dot');
@@ -26714,7 +26736,7 @@ function installationView() {
   return `<div class="organization-settings installation-settings"><div class="settings-header"><h1 class="page-title">Installation ${policyTip(`Settings for every organization and the machine running ${siteName()}. Only operators see them.`)}</h1></div>
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections">
-      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-errors">Error reports</a><a href="#installation-limits">Service limits</a><a href="#installation-compute">Managed compute</a><a href="#installation-capacity">Host capacity</a>
+      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-traffic">Site traffic</a><a href="#installation-errors">Error reports</a><a href="#installation-limits">Service limits</a><a href="#installation-compute">Managed compute</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
       <a href="#installation-access">Phone access</a>${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}
     </nav><div class="settings-content">
@@ -26722,6 +26744,8 @@ function installationView() {
       <div class="settings-section-title" id="installation-health"><div>Health ${policyTip(`Load, agent turns and every process ${siteName()} runs. Memory and disk are under Service limits.`)}</div></div>
       <div id="host-diag"><div class="card"><span class="task-sub">Loading…</span></div></div>
       <div id="proc-panel" style="margin-top:12px"></div>
+      <div class="settings-section-title" id="installation-traffic"><div>Site traffic ${policyTip(`Visits to the public pages and sign-in, counted by ${siteName()} itself: no cookies, no IP addresses kept. Days are UTC.`)}</div></div>
+      <div class="card site-traffic" id="site-traffic-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-errors"><div>Error reports ${policyTip(`Unexpected errors of ${siteName()}’s own start a task in this project that finds the cause and fixes it. One runs at a time; it hears of further errors while it works.`)}</div></div>
       <div class="card" id="error-reports-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-limits"><div>Service limits ${policyTip(`Shared accounts and this server against their plans`)}</div></div>
@@ -27198,6 +27222,107 @@ async function hydratePlanAndBilling(organizationId) {
   });
 }
 
+// ── Site traffic (Installation; wiki features/site-analytics) ────────────────
+// Who visits the public site, from where, what they read, how many reach
+// sign-up, and which crawlers fetch it (GET /api/settings/site-analytics).
+const SITE_TRAFFIC_DAYS = [7, 30, 90];
+const SITE_FUNNEL = [
+  ['visitors', 'Visitors', 'People, each counted once a day'],
+  ['signups', 'Opened sign-up', 'Visitors who opened Sign in or Create account'],
+  ['accounts', 'Accounts', 'Accounts created'],
+  ['firstTasks', 'First task', 'Organizations that started their first task'],
+  ['firstConfirmed', 'First task done', 'Organizations whose first task was confirmed'],
+];
+const trafficInt = (n) => Number(n || 0).toLocaleString();
+function siteTrafficRange(days) {
+  const day = (ms) => new Date(ms).toISOString().slice(0, 10);
+  return { from: day(Date.now() - (days - 1) * 86_400_000), to: day(Date.now()) };
+}
+// The Insights chart, with visitors as bars and those who opened sign-up as a line.
+function siteTrafficSeries(data) {
+  return { title: 'Visitors', unit: 'people',
+    bars: [{ label: 'Visitors', color: 'var(--viz-1)', values: data.daily.map((day) => day.visitors) }],
+    line: { label: 'Opened sign-up', color: 'var(--viz-2)', values: data.daily.map((day) => day.signups) },
+    extra: (i) => [{ label: 'Page views', value: trafficInt(data.daily[i].views) }, { label: 'Accounts', value: trafficInt(data.daily[i].accounts) }] };
+}
+function siteTrafficMarkup(data, days) {
+  const t = data.totals;
+  const seg = `<div class="ins-seg" role="radiogroup" aria-label="Period">${SITE_TRAFFIC_DAYS.map((d) =>
+    `<button type="button" role="radio" aria-checked="${d === days}" class="${d === days ? 'on' : ''}" data-traffic-days="${d}">${d}d</button>`).join('')}</div>`;
+  if (!t.visitors && !t.views && !t.crawls && !t.accounts)
+    return `<div class="traffic-head"><div class="queue-empty">Nothing counted in the last ${days} days</div>${seg}</div>`;
+  const stat = ([key, label, tip], value) => `<div class="traffic-stat" title="${esc(tip)}" data-stat="${key}"><span>${esc(label)}</span><b>${trafficInt(value)}</b></div>`;
+  const share = (n, of) => `<span class="ins-share"><i style="width:${of ? Math.max(2, Math.round((n / of) * 100)) : 0}%;background:var(--viz-1)"></i></span>`;
+  const name = (text, title = text) => `<span class="traffic-label" title="${esc(title)}">${esc(text)}</span>`;
+  const more = (rest, cols, line) => rest.length
+    ? `<tr class="traffic-more"><td colspan="${cols}" title="${esc(rest.map(line).join('\n'))}">+${rest.length} more</td></tr>` : '';
+  const table = (heads, rows) => `<table class="ins-table traffic-table"><thead><tr>${heads.map(([label, tip, num], i) =>
+    // The section's title already names the first column.
+    `<th scope="col"${num ? ' class="num"' : ''}${tip ? ` title="${esc(tip)}"` : ''}>${i ? esc(label) : `<span class="sr-only">${esc(label)}</span>`}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table>`;
+  const part = (title, tip, body, count = '') => `<section class="traffic-part"><div class="ins-card-h"><span>${esc(title)} ${policyTip(tip)}</span>${count}</div>${body}</section>`;
+
+  const hostsOf = (group) => data.sources.hosts.filter((host) => host.group === group && host.source);
+  const sources = data.sources.groups.map((group) => {
+    const hosts = hostsOf(group.group);
+    return `<tr class="traffic-group"><td class="ins-name">${name(group.label)}${share(group.visitors, t.visitors)}</td><td class="num">${trafficInt(group.visitors)}</td></tr>
+      ${hosts.slice(0, 3).map((host) => `<tr class="traffic-sub"><td class="ins-name">${name(host.source)}</td><td class="num">${trafficInt(host.visitors)}</td></tr>`).join('')}
+      ${more(hosts.slice(3), 2, (host) => `${host.source}: ${host.visitors}`)}`;
+  }).join('');
+  const pages = data.pages.slice(0, 8).map((page) => `<tr><td class="ins-name">${name(page.path)}${share(page.views, data.pages[0].views)}</td>
+    <td class="num">${trafficInt(page.views)}</td><td class="num">${trafficInt(page.entries)}</td></tr>`).join('')
+    + more(data.pages.slice(8), 3, (page) => `${page.path}: ${page.views}`);
+  const crawlers = data.crawlers.slice(0, 8).map((crawler) => `<tr><td class="ins-name">${name(crawler.name,
+    crawler.pages.map((page) => `${page.path}: ${page.fetches}`).join('\n'))}${share(crawler.fetches, data.crawlers[0].fetches)}</td>
+    <td class="num">${trafficInt(crawler.fetches)}</td></tr>`).join('') + more(data.crawlers.slice(8), 2, (crawler) => `${crawler.name}: ${crawler.fetches}`);
+  const counts = Object.fromEntries(data.funnel.map((step) => [step.step, step.count]));
+  const funnel = SITE_FUNNEL.map(([key, label, tip]) => `<tr data-step="${key}"><td class="ins-name">${name(label, tip)}${share(counts[key] || 0, t.visitors)}</td>
+    <td class="num">${trafficInt(counts[key])}</td><td class="num">${key === 'visitors' || !t.visitors ? '' : `${Math.round(((counts[key] || 0) / t.visitors) * 1000) / 10}%`}</td></tr>`).join('');
+  const none = (text) => `<div class="ins-empty">${text}</div>`;
+  const stats = [SITE_FUNNEL[0], ['views', 'Page views', 'Public pages people read'], SITE_FUNNEL[1], SITE_FUNNEL[2]];
+  return `<div class="traffic-head"><div class="traffic-stats">${stats.map((entry) => stat(entry, t[entry[0]])).join('')}</div>${seg}</div>
+    <div class="traffic-chart"><div class="traffic-legend"></div><div class="ins-plot"></div></div>
+    <div class="traffic-grid">
+      ${part('Sources', 'Where each visitor’s first page of the day came from: the linking site, or the link’s utm_source or ref tag',
+        sources ? table([['Source'], ['Visitors', '', true]], sources) : none('No visitors yet'))}
+      ${part('Pages', 'Views of each page; Landed: visitors whose first page it was', pages
+        ? table([['Page'], ['Views', '', true], ['Landed', 'Visitors whose first page of the day it was', true]], pages) : none('No page views yet'))}
+      ${part('Crawlers', 'Search engines and AI assistants fetching public pages, Markdown, llms.txt, robots.txt and the sitemap. Hover a name for its pages.',
+        crawlers ? table([['Crawler'], ['Fetches', '', true]], crawlers) : none('No crawler yet'), `<b class="ins-count">${trafficInt(t.crawls)}</b>`)}
+      ${part('Funnel', 'Each step is counted on its own day. A sign-up is never linked to the visit it came from.',
+        table([['Step'], ['People', '', true], ['%', 'Of visitors', true]], funnel))}
+    </div>`;
+}
+async function wireSiteTrafficCard(days = S.siteTrafficDays || 30) {
+  const card = $('#site-traffic-card');
+  if (!card) return;
+  S.siteTrafficDays = days;
+  let data;
+  try {
+    const { from, to } = siteTrafficRange(days);
+    data = await api(`/api/settings/site-analytics?from=${from}&to=${to}`);
+  } catch (error) { if (card.isConnected) paneError(card, error, () => wireSiteTrafficCard(days)); return; }
+  if (!card.isConnected || S.siteTrafficDays !== days) return;
+  // An installation from before Site traffic answers something else: nothing counted.
+  if (!data?.totals || !Array.isArray(data.daily)) data = { totals: {}, daily: [] };
+  card.innerHTML = siteTrafficMarkup(data, days);
+  card.querySelectorAll('[data-traffic-days]').forEach((button) =>
+    button.addEventListener('click', () => wireSiteTrafficCard(Number(button.dataset.trafficDays))));
+  const plot = card.querySelector('.ins-plot');
+  if (!plot) return;
+  // Drawn in real pixels, so it is redrawn at a new width.
+  const draw = () => {
+    const width = Math.floor(plot.clientWidth);
+    if (!width || String(width) === plot.dataset.width) return;
+    plot.dataset.width = String(width);
+    const chart = insightChartSvg(data, null, width, siteTrafficSeries(data));
+    card.querySelector('.traffic-legend').innerHTML = insightLegendHtml(chart.series);
+    drawInsightPlot(plot, data, chart, width);
+  };
+  draw();
+  const observer = new ResizeObserver(() => (plot.isConnected ? draw() : observer.disconnect()));
+  observer.observe(plot);
+}
+
 // ── Error reports (Installation; wiki features/error-reports) ────────────────
 // Which project unexpected errors go to, and the task there that fixes them.
 function errorReportsMarkup(settings) {
@@ -27230,6 +27355,7 @@ async function wireErrorReportsCard() {
 
 function wireInstallationSettings() {
   wireInstallationUsers();
+  wireSiteTrafficCard();
   wireErrorReportsCard();
   wireSettingsNavigation();
   wireAppearanceCard();

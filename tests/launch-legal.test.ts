@@ -123,6 +123,13 @@ describe('paid-launch policies', () => {
     expect(JSON.stringify(policyDocument('terms'))).toContain('mandatory consumer rights');
   });
 
+  it('says how visits to the public site are counted (wiki features/site-analytics)', () => {
+    const privacy = policyDocument('privacy', {}, undefined, 'Tavya')!;
+    const visits = privacy.sections.flatMap((section) => section.bullets ?? []).find((bullet) => bullet.startsWith('Public site visits'));
+    expect(visits).toContain('counted in aggregate (page, referring site and day) by Tavya itself, without cookies and without storing IP addresses');
+    expect(visits).toContain('at most two days');
+  });
+
   it('distinguishes operator subprocessors, customer destinations and retained copies', () => {
     const privacy = JSON.stringify(policyDocument('privacy', {}, undefined, 'Tavya'));
     expect(privacy).toContain('MCP');

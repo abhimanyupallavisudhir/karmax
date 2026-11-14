@@ -3,6 +3,8 @@ import { ORGANIZATION_COORDINATOR_PROJECT, type AutonomyScope, type ProjectAuton
 import { machineWaits, type MachineWait } from '../world/machine-wait.js';
 import { REPOSITORY_ROUTE } from '../world/resource-repository.js';
 import { clientAddress, ClientRequestLimits } from './client-address.js';
+import { parseDay, SiteAnalytics, siteAnalyticsReport } from '../platform/site-analytics.js';
+import { beaconSource, crawlerOf } from '../domain/site-analytics.js';
 import { keepAuthorized, socketLifetime } from './socket-lifetime.js';
 import type { PasskeyCredential } from '../autonomy/passkey.js';
 import { ExecutionOutput } from './execution-output.js';
@@ -223,6 +225,8 @@ export interface GatewayDeps {
   /** Model benchmarks for the model picker (default: the bundled snapshot,
    *  refreshed daily when ARTIFICIAL_ANALYSIS_API_KEY is set). */
   artificialAnalysis?: ArtificialAnalysis;
+  /** Web analytics of the public site (default: counted into `store`). */
+  siteAnalytics?: SiteAnalytics;
 }
 
 /** Coarse HTTP operation → capability binding. KarmaxApi performs the same check
@@ -787,6 +791,10 @@ export class Gateway {
   private terminalTickets = new Map<string, { taskId: string; session: Session; expiresAt: number }>();
   private personDecisions = new Map<string, { caps: Promise<Capability[] | undefined>; until: number; seq: number; subject: AuthoritySubject }>();
   private requestLimits = new ClientRequestLimits();
+  /** Visits to the public site, and what crawlers fetch of it (wiki features/site-analytics). */
+  private siteAnalytics!: SiteAnalytics;
+  /** Which beacon paths are public pages, by the gateway's own routing: path → canonical path or null, briefly cached. */
+  private sitePaths = new Map<string, { page: string | null; until: number }>();
   private artifactUrlSigner?: ArtifactUrls;
   private get artifactUrls(): ArtifactUrls { return this.artifactUrlSigner ??= new ArtifactUrls(this.deps.broker); }
   /** Failed sign-ins per client address and per account. Better Auth's own
@@ -843,6 +851,7 @@ export class Gateway {
   }
 
   private async initialize(deps: GatewayDeps) {
+    this.siteAnalytics = deps.siteAnalytics ?? new SiteAnalytics(deps.store);
 
     this.appGrants = new AppGrants(deps.store);
     this.oauthRoutes = new OAuthRoutes({ store: deps.store, grants: this.appGrants, authorization: deps.authorization,
@@ -1563,6 +1572,7 @@ export class Gateway {
     this.sweepConnections();
     this.connectionTimer = setInterval(() => this.sweepConnections(), 5000);
     this.connectionTimer.unref();
+    this.siteAnalytics.start();
     (await this.enqueueGitPassBackstop());
     this.gitPassAutoSyncTimer = new AsyncInterval(() => this.enqueueGitPassBackstop(), GIT_PASS_AUTO_SYNC_BACKSTOP_MS);
     this.gitPassAutoSyncTimer.unref();
@@ -1573,6 +1583,7 @@ export class Gateway {
       close: async () => {
           this.closing = true;
           while (this.wikiWork.size) await Promise.allSettled([...this.wikiWork]);
+          await this.siteAnalytics.stop();
           if (this.connectionTimer) clearInterval(this.connectionTimer);
           this.stopLoginPoolSync?.();
           this.stopLoginPoolSync = undefined;
@@ -1968,6 +1979,8 @@ export class Gateway {
       }
       return this.json(res, 200, { authRequired: true });
     }
+    // A person's view of a public page, from the console (web/app.js siteView).
+    if (p === '/api/site-analytics/view' && method === 'POST') return this.siteView(req, res);
     if (p === '/api/launch' && method === 'GET') {
       const info = (await this.deps.paidLaunchSettings?.publicLaunchInfo((await this.siteName)))
         ?? publicLaunchInfo(process.env, undefined, (await this.siteName));
@@ -2844,6 +2857,24 @@ export class Gateway {
         }
         const view = method === 'GET' ? (await service.view()) : (await service.run());
         return this.json(res, 200, { ...view, canManage: write || (await this.deps.tokens.check(token, 'settings:write')).ok });
+      }
+      // Web analytics of the public site (wiki features/site-analytics):
+      // installation operators (settings:read, the route table) read what this
+      // and every other gateway process counted, written first if pending here.
+      if (p === '/api/settings/site-analytics') {
+        if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
+        const today = new Date().toISOString().slice(0, 10);
+        const to = url.searchParams.get('to') || today;
+        const toMs = parseDay(to);
+        const from = url.searchParams.get('from') || (toMs === undefined ? '' : new Date(toMs - 29 * 86_400_000).toISOString().slice(0, 10));
+        const fromMs = parseDay(from);
+        if (fromMs === undefined || toMs === undefined || fromMs > toMs)
+          return this.json(res, 400, { error: 'from and to must be days (YYYY-MM-DD), from on or before to' });
+        if (toMs - fromMs > 366 * 86_400_000) return this.json(res, 400, { error: 'at most a year at a time' });
+        await this.siteAnalytics.flush();
+        const identity = this.deps.identity as { userCreationTimes?: () => Promise<number[]> } | undefined;
+        return this.json(res, 200, await siteAnalyticsReport(store, { from, to,
+          ...(identity?.userCreationTimes ? { accountsCreated: () => identity.userCreationTimes!() } : {}) }));
       }
       // Error reports (wiki features/error-reports): GET where they go and the
       // task that fixes them; PUT {projectId} sends them there and makes that
@@ -9719,6 +9750,60 @@ export class Gateway {
       origin: req ? this.publicUrl(req) : process.env.KARMAX_PUBLIC_URL?.replace(/\/$/, '') ?? '' };
   }
 
+  // ── site analytics (wiki features/site-analytics) ──
+  /** POST {path, referrer}: a person's view of a public page, sent by the
+   * console when it draws one. Counted once `path` is a page the gateway
+   * serves as public (so a new public page needs no list here) or /login or
+   * /signup; a bot's or headless browser's is ignored (204 like a counted
+   * one). No cookie, no stored address. */
+  private async siteView(req: http.IncomingMessage, res: http.ServerResponse) {
+    const refuse = (status: number, error: string) => this.json(res, status, { error });
+    const ip = this.clientAddress(req);
+    if (!this.siteAnalytics.admit(ip)) return refuse(429, 'too many requests; try again later');
+    let publicHost = '';
+    try { publicHost = new URL(this.publicUrl(req)).host; } catch { /* a Host header that is no host */ }
+    const ownHosts = [String(req.headers.host ?? ''), publicHost].filter(Boolean);
+    const origin = req.headers.origin;
+    if (origin && !ownHosts.some((host) => { try { return new URL(origin).host === host; } catch { return false; } }))
+      return refuse(403, 'views are counted from this site only');
+    let body: { path?: unknown; referrer?: unknown };
+    try { body = JSON.parse((await this.rawBody(req, 2048)).toString('utf8')); }
+    catch (error) { return error instanceof AttachmentError ? refuse(413, 'too large') : refuse(400, 'expected {path, referrer}'); }
+    const { path: viewed, referrer = '' } = body ?? {};
+    if (typeof viewed !== 'string' || typeof referrer !== 'string' || !viewed.startsWith('/') || viewed.startsWith('//') || viewed.length > 1000)
+      return refuse(400, 'expected {path, referrer}');
+    const page = await this.sitePage(new URL(viewed, 'http://site.invalid').pathname);
+    if (!page) return refuse(400, 'not a public page');
+    this.siteAnalytics.view({ path: page, source: beaconSource(viewed, referrer, ownHosts), ip,
+      userAgent: String(req.headers['user-agent'] ?? '').slice(0, 512) });
+    res.writeHead(204, { 'cache-control': 'no-store' });
+    res.end();
+  }
+
+  /** The canonical path of the public page `pathname` is (or /login, /signup), by the gateway's own routing. */
+  private async sitePage(pathname: string): Promise<string | undefined> {
+    if (pathname === '/login' || pathname === '/signup') return pathname;
+    if (!publicPath(pathname) || pathname.length > 300) return undefined;
+    const now = Date.now();
+    const cached = this.sitePaths.get(pathname);
+    if (cached && cached.until > now) return cached.page ?? undefined;
+    let page: string | null = null;
+    try {
+      const route = resolvePublicRoute(await this.publicPageContext(undefined, pathname), pathname);
+      if (route.kind === 'page') page = route.page.path;
+    } catch { /* not a page we can serve */ }
+    if (this.sitePaths.size >= 1000) this.sitePaths.clear();
+    this.sitePaths.set(pathname, { page, until: now + 60_000 });
+    return page ?? undefined;
+  }
+
+  /** A known crawler fetched `path` of the public site. */
+  private countCrawl(req: http.IncomingMessage | undefined, path: string) {
+    if (req?.method !== 'GET') return;
+    const crawler = crawlerOf(req.headers['user-agent']);
+    if (crawler) this.siteAnalytics.crawl(crawler, path);
+  }
+
   // ── static SPA ──
   private async static(p: string, res: http.ServerResponse, req?: http.IncomingMessage) {
     // Only a hosted installation's public pages are for search engines; a
@@ -9728,6 +9813,7 @@ export class Gateway {
       const origin = req ? this.publicUrl(req) : '';
       if (p === '/sitemap.xml' && !indexable) return void res.writeHead(404).end('not found');
       const body = p === '/robots.txt' ? robotsTxt(origin, indexable) : sitemapXml(origin, publicEntries((await this.publicPageContext(req))));
+      this.countCrawl(req, p);
       res.writeHead(200, { 'content-type': MIME[path.extname(p)]!, 'cache-control': 'no-cache', 'content-length': String(Buffer.byteLength(body)) });
       return void res.end(req?.method === 'HEAD' ? undefined : body);
     }
@@ -9740,6 +9826,7 @@ export class Gateway {
     if (p === '/llms-full.txt') {
       const origin = req ? this.publicUrl(req) : '';
       const body = llmsFullText(this.deps.staticDir, (await this.siteName), origin);
+      this.countCrawl(req, p);
       res.writeHead(200, { 'content-type': MIME['.txt']!, 'cache-control': 'no-cache', 'content-length': String(Buffer.byteLength(body)) });
       return void res.end(req?.method === 'HEAD' ? undefined : body);
     }
@@ -9752,6 +9839,7 @@ export class Gateway {
     const sourceOf = name !== 'index.html' && p.endsWith('.md') ? markdownSourcePage(this.deps.staticDir, p) : undefined;
     if (sourceOf) {
       const origin = req ? this.publicUrl(req) : '';
+      this.countCrawl(req, p);
       return void (await serveStaticAsset(req, res, file, undefined,
         { headers: { link: `<${origin}${sourceOf}>; rel="canonical"` } }).catch(() => {
         if (!res.headersSent) res.writeHead(404).end('not found');
@@ -9774,6 +9862,7 @@ export class Gateway {
         return void res.end();
       }
       const page = route.kind === 'page' ? route.page : undefined;
+      if (page) this.countCrawl(req, page.path);
       const site = context?.siteName ?? (await this.siteName);
       const siteName = escapeHtml(site);
       // The card names the product, so a renamed installation shows none.
@@ -9798,6 +9887,7 @@ export class Gateway {
     // `llms.txt` is also public product copy. Keep its checked-in version a
     // useful default, then brand both its prose and same-origin links at the
     // edge so hosted and self-hosted installations describe themselves.
+    if (p === '/llms.txt') this.countCrawl(req, p);
     const brandLlms = async (data: Buffer) => {
       const siteName = (await this.siteName);
       const origin = req ? this.publicUrl(req) : process.env.KARMAX_PUBLIC_URL?.replace(/\/$/, '') ?? '';

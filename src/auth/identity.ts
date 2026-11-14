@@ -407,6 +407,12 @@ export class IdentityService {
       .map((u) => ({ ...u, createdAt: new Date(u.createdAt) }));
   }
 
+  /** When each account was created (epoch ms), for the sign-up funnel (wiki features/site-analytics). */
+  async userCreationTimes(): Promise<number[]> {
+    return ((await this.db.prepare('SELECT createdAt FROM user').all()) as Array<{ createdAt: unknown }>)
+      .map((row) => new Date(row.createdAt as string | number | Date).getTime()).filter(Number.isFinite);
+  }
+
   async userById(id: string): Promise<IdentityUser | undefined> {
     const row = await this.db.prepare('SELECT id, email, name, role, createdAt FROM user WHERE id=?').get(id) as any;
     return row ? { ...row, createdAt: new Date(row.createdAt) } : undefined;
