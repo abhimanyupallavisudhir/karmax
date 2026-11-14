@@ -39,7 +39,20 @@ describe('remote MCP server', () => {
     const client = await connect(tokens.access_token);
     try {
       expect(client.getServerVersion()?.name).toBe('tavya');
-      const names = (await client.listTools()).tools.map((tool) => tool.name);
+      const tools = (await client.listTools()).tools;
+      const names = tools.map((tool) => tool.name);
+      // Each tool says what it is called and whether it reads, changes or can remove: directories of
+      // MCP servers require it, and a client asks the person before a call accordingly.
+      for (const tool of tools) {
+        expect(tool.title, tool.name).toMatch(/^[A-Z]/);
+        expect(typeof tool.annotations?.readOnlyHint, tool.name).toBe('boolean');
+        expect(typeof tool.annotations?.destructiveHint, tool.name).toBe('boolean');
+        expect(tool.annotations!.readOnlyHint && tool.annotations!.destructiveHint, tool.name).toBe(false);
+      }
+      const hints = (name: string) => { const tool = tools.find((candidate) => candidate.name === name)!; return [tool.title, tool.annotations!.readOnlyHint, tool.annotations!.destructiveHint]; };
+      expect(hints('search_tasks')).toEqual(['Search tasks', true, false]);
+      expect(hints('create_task')).toEqual(['Create a task', false, false]);
+      expect(hints('platform_request')).toEqual(['Call the API', false, true]);
       expect(names).toEqual(expect.arrayContaining(['create_task', 'list_tasks', 'get_task', 'search_tasks', 'find_task',
         'signal_task', 'message_agent', 'tag_task', 'set_task_priority', 'get_conversation', 'read_wiki', 'search_wiki',
         'list_events', 'describe_platform', 'platform_request', 'list_connections']));
