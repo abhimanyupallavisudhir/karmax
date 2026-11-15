@@ -5667,6 +5667,23 @@ function siblingAttemptChangesSearch(ev) {
   return row ? patchLifecycleView({ ...row }, ev) : before !== state;
 }
 
+// A task waiting for its trigger has no execution, so a view of its own means
+// the trigger fired and it started. The scheduler's write sends no change
+// notice: without this, a page loaded before the start kept it waiting, and
+// opening it showed its form instead of the task and its asks (#936).
+function noteTriggerFired(taskId) {
+  let changed = false;
+  const fire = (t) => {
+    if (t?.id !== taskId || t.params?.triggerState !== 'armed' || isSeries(t.params)) return;
+    t.params = { ...t.params, triggerState: 'fired' };
+    changed = true;
+  };
+  const groups = (list) => (list || []).forEach((g) => { (g.tasks || []).forEach(fire); groups(g.children); });
+  [S.tasks, S.searchResult?.tasks, S.attemptGroup?.attempts].forEach((list) => (list || []).forEach(fire));
+  groups(S.searchResult?.groups);
+  return changed;
+}
+
 function patchTaskListFromEvent(ev) {
   if (ev.type !== 'view.updated' || !ev.taskId) return false;
   const task = S.tasks.find((candidate) => candidate.id === ev.taskId);
@@ -5805,7 +5822,8 @@ function connectWs() {
     const currentProject = !eventProject || eventProject === S.projectId;
     const siblingAttempt = ev.siblingAttempt || S.attemptGroup?.attempts?.some(a => a.id === ev.taskId)
       && S.attemptGroup.principalAttemptId !== ev.taskId;
-    const patchedList = currentProject && patchTaskListFromEvent(ev);
+    const fired = ev.type === 'view.updated' && !!ev.taskId && noteTriggerFired(ev.taskId);
+    const patchedList = currentProject && patchTaskListFromEvent(ev) || fired;
     if (ev.type === 'review.updated' || ev.type.startsWith('resource.')) {
       resourceReviewCache.delete(ev.taskId); resourceInventoryCache.delete(ev.taskId);
     }
@@ -7958,7 +7976,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
 // view update: a working agent moves its view on several times a second, and
 // the asks of #904 blinked out and reloaded faster than anyone could click them.
 // While they reload the row keeps showing the ones it has, so nothing jumps.
-const rowDecisions = new Map(); // taskId → { key, credential, permission, authorization, repository, items }
+const rowDecisions = new Map(); // taskId → { key, credential, permission, authorization, repository, connections, items }
 const rowDecisionLoads = new Map();
 const rowAskVersions = new Map(); // taskId → its approval events seen
 let rowAskEpoch = 0; // a stream that dropped may have missed some
@@ -7969,6 +7987,8 @@ const ROW_ASK_EVENT = /\.approval-(?:requested|resolved|dismissed)$|^connection\
 function noteRowAskEvent(ev) {
   if (ev.taskId && ROW_ASK_EVENT.test(ev.type || '')) rowAskVersions.set(ev.taskId, (rowAskVersions.get(ev.taskId) ?? 0) + 1);
 }
+/** Whether the signed-in person can connect an account for this request (connectionRows' rule). */
+function rowCanConnect(c, userId) { return c.ownerProjectId ? c.canManage !== false : !c.ownerId || c.ownerId === userId; }
 function rowDecisionId(row) { return row.dataset.vreq || row.dataset.preq || row.dataset.areq || row.dataset.raccess; }
 function rowOrganizationId(t) {
   return projectById(t.projectId)?.organizationId || S.searchResult?.projects?.find((p) => p.id === t.projectId)?.organizationId || S.organizationId;
@@ -8016,6 +8036,14 @@ function rowAskHtml(t) {
       return `<div class="row-decision" data-vreq="${esc(request.id)}"><span class="row-ask-q">${request.itemId ? esc(question) : `Use a sign-in for ${esc(request.domain || request.name || 'a site')}?`}</span>
         <span class="row-ask-actions">${answers || '<span class="task-sub">Open to choose</span>'}</span></div>`;
     }),
+    ...(loaded.connections || []).filter((c) => !c.dismissed && ['requested', 'connecting'].includes(c.status) && rowCanConnect(c, signedIn)).map((c) => {
+      // Signing in happens in a new tab, as on the task page; Allow reuses an account already connected.
+      const reusable = c.status === 'requested' ? c.reusable || [] : [];
+      return `<div class="row-decision" data-connection="${esc(c.id)}">
+      <span class="row-ask-q"${c.why ? ` title="${esc(c.why)}"` : ''}>Connect ${esc(c.label)}?</span>
+      <span class="row-ask-actions">${reusable.length ? `<button type="button" class="btn sm primary" data-connection-action="allow" data-use-connection="${esc(reusable[0].id)}" title="Use your connected ${esc(connectionAccountNames(reusable)[0])} account">Allow</button>` : ''}<button type="button" class="btn sm${reusable.length ? '' : ' primary'}" data-connection-action="connect"${reusable.length ? ' title="Sign in with another account"' : ''}>${reusable.length ? 'Other account' : 'Connect'}</button></span>
+      <span data-connection-result hidden></span></div>`;
+    }),
     ...pending(loaded.permission).map((request) => `<div class="row-decision" data-preq="${esc(request.id)}">
       <span class="row-ask-q" title="${esc(request.capabilities.join(', '))}">Give the agent ${request.capabilities.length === 1 ? `<code>${esc(request.capabilities[0])}</code>` : `${request.capabilities.length} permissions`}?</span>
       <span class="row-ask-actions"><button type="button" class="btn sm primary" data-preq-act="approve">Allow</button><button type="button" class="btn sm" data-preq-act="deny">Deny</button></span></div>`),
@@ -8040,12 +8068,13 @@ async function loadRowDecisions(t) {
   const organizationId = rowOrganizationId(t);
   const query = `taskId=${encodeURIComponent(t.id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
   const promise = (async () => {
-    const [credential, permission, authorization, repository] = await Promise.all([
+    const [credential, permission, authorization, repository, connections] = await Promise.all([
       api(`/api/vault/requests?${query}`).catch(() => []), api(`/api/permission-requests?${query}`).catch(() => []),
-      api(`/api/authorization-requests?${query}`).catch(() => []), api(`/api/repository-access-requests?${query}`).catch(() => [])]);
+      api(`/api/authorization-requests?${query}`).catch(() => []), api(`/api/repository-access-requests?${query}`).catch(() => []),
+      api(`/api/connections?${query}`).catch(() => [])]);
     const items = credential.some((request) => request.status === 'pending')
       ? await api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []) : [];
-    rowDecisions.set(t.id, { key, credential, permission, authorization, repository, items });
+    rowDecisions.set(t.id, { key, credential, permission, authorization, repository, connections: connections.filter((c) => c.taskId === t.id), items });
   })().finally(() => rowDecisionLoads.delete(t.id));
   rowDecisionLoads.set(t.id, { key, promise });
   return promise;
@@ -8113,6 +8142,8 @@ function wireRowAsks(root = $('#main')) {
     wirePermissionRequestActions(box, organizationId, done, failed);
     wireAuthorizationRequestActions(box, organizationId, done, failed);
     wireRepositoryAccessRequestActions(box, organizationId, done, failed);
+    // A connection settles when its sign-in does: its own events reload the row.
+    wireConnectionActions(box, organizationId, resolved);
   });
   root.querySelectorAll('[data-row-quick]:not([data-wired])').forEach((box) => {
     box.dataset.wired = '1';
@@ -11324,7 +11355,9 @@ function ensureTaskApprovals(taskId, { force = false } = {}) {
 // opens as its editable form.
 function showDraftPage(taskId) {
   const rec = taskRecord(taskId);
-  const unstarted = rec?.params?.draft || rec?.params?.triggerState === 'armed';
+  // A view of its own means its trigger fired, whatever an older read said.
+  const armed = rec?.params?.triggerState === 'armed' && !rec.lastView && S.view?.taskId !== taskId;
+  const unstarted = rec?.params?.draft || armed;
   if (S.selected !== taskId || !unstarted || rec.params.archived || $('#tf-page')) return false;
   // The URL leads: a late load must not reopen a draft the user just left.
   const key = parseRoute(currentPath())?.taskKey;
@@ -11368,7 +11401,9 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     await renderSeriesPage(rec);
     return;
   }
-  showDraftPage(taskId);
+  // A draft opens as its form at once. One waiting for its trigger only once
+  // the server says it has not started: it may have since this page read it.
+  if (rec?.params?.draft) showDraftPage(taskId);
   S.taskEvents = [];
   S.taskHistoryLoading = false;
   S.taskHistoryError = null;
@@ -11423,8 +11458,9 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     ]);
     const view = await api(`/api/tasks/${taskId}`);
     if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
-    // No execution yet (waiting for a trigger opens as its form, above).
-    if (!view) { if (!$('#tf-page')) renderTaskLoadingPage(rec, null, true); return; }
+    // No execution yet: a draft or a task waiting for its trigger is its form.
+    if (!view) { if (!showDraftPage(taskId) && !$('#tf-page')) renderTaskLoadingPage(rec, null, true); return; }
+    noteTriggerFired(taskId);
     S.view = pendingCancellationView(view, taskId);
     // The auto tab is resolved ONCE, now that the view is in hand — in the Confirm/
     // Review gate that's Check-in (the conversation that led here is the thing to

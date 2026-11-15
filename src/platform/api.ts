@@ -3994,6 +3994,9 @@ export class KarmaxApi {
     // (post-`updateParams` responses, review-action resolution). We also fall through to
     // a live query when there is no snapshot yet (a brand-new task, pre-first-publish).
     const snap = await snapshot();
+    // A draft, a task waiting for its trigger or a repeatable series has no
+    // execution to ask: none is the answer, and the console opens its form.
+    if (!snap && unstarted(rec)) return undefined;
     // softwareDev@1.0.0 could persist "waiting for account" immediately before
     // scheduling a turn, then clear it only in workflow memory after the grant.
     // It cannot add a publish at that point without breaking replay. Treat that

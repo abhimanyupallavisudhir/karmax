@@ -8,7 +8,7 @@ test('RQ-3/UI-7: foreign projects and known sibling attempts do not reload the c
   let reloads = 0;
   const ctx = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0, S: { projectId: 'p', selected: null, tab: 'tasks', tasks: [], taskEvents: [], activity: [], meta: {}, attemptGroup: { principalAttemptId: 'a', attempts: [{ id: 'a' }, { id: 'b' }] } },
     location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
-    patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, LIST_RELOAD_EVENTS: new Set(['subtask.created']), inboxEventChanges: () => false, scheduleTaskListReload: () => reloads++, siblingAttemptChangesSearch: () => false });
+    patchTaskListFromEvent: () => false, noteTriggerFired: () => false, patchSubTaskSummaryFromEvent: () => false, LIST_RELOAD_EVENTS: new Set(['subtask.created']), inboxEventChanges: () => false, scheduleTaskListReload: () => reloads++, siblingAttemptChangesSearch: () => false });
   vm.runInContext(`${fn('connectWs')}\n${fn('isCrossProjectList')}`, ctx); ctx.connectWs();
   for (const event of [{ taskId: 'foreign', projectId: 'other', type: 'view.updated' }, { taskId: 'foreign', projectId: 'other', type: 'subtask.created' }, { taskId: 'b', projectId: 'p', type: 'view.updated' }]) ctx.S.ws.onmessage({ data: JSON.stringify(event) });
   assert.equal(reloads, 0);
@@ -18,7 +18,7 @@ test('RQ-3: a non-principal attempt re-runs the search when it may change it, an
   const ctx = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0, S: { projectId: 'p', selected: null, tab: 'tasks', tasks: [{ id: 'a' }], taskEvents: [], activity: [], meta: {}, attemptGroup: null,
     searchResult: { tasks: [{ id: 'shown', otherAttempt: true, lastView: { stage: 'do', status: 'active' } }] } },
     location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
-    patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false,
+    patchTaskListFromEvent: () => false, noteTriggerFired: () => false, patchSubTaskSummaryFromEvent: () => false, LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false,
     scheduleTaskListReload: () => reloads++, scheduleSearch: () => searches++, pendingCancellationView: (view) => view, listState: () => '' });
   vm.runInContext(`${fn('connectWs')}\n${fn('isCrossProjectList')}\n${fn('patchLifecycleView')}\nconst attemptListStates = new Map();\n${fn('siblingAttemptChangesSearch')}`, ctx); ctx.connectWs();
   const send = (taskId, payload) => ctx.S.ws.onmessage({ data: JSON.stringify({ taskId, projectId: 'p', type: 'view.updated', siblingAttempt: true, payload }) });
