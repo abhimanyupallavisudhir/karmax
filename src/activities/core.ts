@@ -172,7 +172,7 @@ import {
 import { lifecycleReplacementKey, lifecycleReplacementMatches } from '../platform/lifecycle-replacement.js';
 import { BRAND } from '../domain/brand.js';
 import { ERROR_EVENT_TYPE, reportError } from '../platform/error-reports.js';
-import { isCapacityEscalation } from '../domain/escalation.js';
+import { isCapacityEscalation, isExpiredDelegationEscalation } from '../domain/escalation.js';
 import { screenEnvironment, skippedEnvNotice, type SkippedEnv } from '../util/work-env.js';
 
 /** How often staging records its progress as a task event. */
@@ -694,7 +694,8 @@ async function commitInto(world: World, root: string, head: string, source: stri
  * was already stopped on the same error, the failure is the organization's to
  * fix (a credential, a hard limit: its audience is only the admins), a
  * provider account's limit stayed full for its whole wait for a machine
- * (people's to free or raise), or the task is itself fixing a reported error
+ * (people's to free or raise), its permission to act for a person expired
+ * (theirs to renew), or the task is itself fixing a reported error
  * (it would report itself in a loop).
  */
 function reportEscalation(task: { id: string; projectId: string; params: Record<string, unknown>; lastView?: TaskView }, view: TaskView): void {
@@ -702,7 +703,7 @@ function reportEscalation(task: { id: string; projectId: string; params: Record<
   if (before?.status === 'blocked' && before.error === view.error) return;
   const audience = (view.waitingFor as { audience?: string[] } | undefined)?.audience;
   if (audience?.length === 1 && audience[0] === '@admins') return;
-  if (isCapacityEscalation(view.error)) return;
+  if (isCapacityEscalation(view.error) || isExpiredDelegationEscalation(view.error)) return;
   if ((task.params?.trigger as { type?: string } | undefined)?.type === ERROR_EVENT_TYPE) return;
   reportError({ kind: 'escalation', error: Object.assign(new Error(String(view.error)), { name: 'Escalation' }),
     where: `stage ${view.stage}`, taskId: task.id, projectId: task.projectId,
