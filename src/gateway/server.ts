@@ -86,7 +86,7 @@ import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
 import { validGitBranch } from '../util/git-ref.js';
-import { HOSTED_GIT_ROUTE, hostedRepositoryUrl, isHostedRepository, isValidHostedName } from '../domain/hosted-repository.js';
+import { HOSTED_GIT_ROUTE, hostedRepositoryUrl, isHostedRepository, isValidHostedName, landsByPushOnTavya } from '../domain/hosted-repository.js';
 import { materializeGitCredential } from '../world/git-credential.js';
 type Repository = import('../domain/types.js').Repository;
 import { projectArtifactGallery, type GalleryArtifact } from '../platform/artifact-gallery.js';
@@ -9227,6 +9227,12 @@ export class Gateway {
             globalVals = { ...globalVals, remote: 'pr' };
           if (projectVals.remote === 'none') projectVals = { ...projectVals, remote: 'pr' };
         }
+        // Repositories tavya hosts land by push, whatever a row says (KarmaxApi
+        // decides it the same way): what is inherited shows what tasks will do.
+        // Never as a saved value, which would outlive a move to GitHub.
+        const landsByPush = this.deps.hosted && !!project
+          && landsByPushOnTavya(effectiveRepos(resolveParams(m, { project: projectVals, global: globalVals }), project.config));
+        const pushed = (vals: Record<string, unknown>) => landsByPush ? { ...vals, remote: 'push' } : vals;
         // The Computer is the execution policy, not a settings row: project the
         // organization policy and the project override into each layer (§11).
         const computer = (await computerDefaults(store, organizationId ?? undefined, project));
@@ -9271,8 +9277,8 @@ export class Gateway {
           return hasComputer ? { ...rest, computer: value } : rest;
         };
         return this.json(res, 200, {
-          task: { own: {}, inherited: withComputer((await enrich(resolveParams(m, { project: projectVals, global: globalVals }), { ...globalVals, ...projectVals })), computer.task.inherited) },
-          project: { own: withComputer(projectVals, computer.project.own), inherited: withComputer((await enrich(resolveParams(m, { global: globalVals }), globalVals)), computer.project.inherited) },
+          task: { own: {}, inherited: pushed(withComputer((await enrich(resolveParams(m, { project: projectVals, global: globalVals }), { ...globalVals, ...projectVals })), computer.task.inherited)) },
+          project: { own: withComputer(projectVals, computer.project.own), inherited: pushed(withComputer((await enrich(resolveParams(m, { global: globalVals }), globalVals)), computer.project.inherited)) },
           global: { own: withComputer(globalVals, computer.global.own), inherited: withComputer((await enrich(resolveParams(m, {}), {})), computer.global.inherited) },
         });
       }
@@ -9446,6 +9452,9 @@ export class Gateway {
   }
 
   async installDefaultTasks(project: import('../domain/types.js').Project): Promise<void> {
+    // Repositories tavya hosts run no GitHub workflows to repair. Moved to
+    // GitHub, the project gets it with its first failure (recordFailures).
+    if (landsByPushOnTavya(project.config.repos)) return;
     try { await this.githubEvents.ensureRecoveryTask(project.id, project.organizationId ?? 'org_personal'); }
     catch (error) { console.warn(`[karmax] could not install the repair task in ${project.id}:`, error instanceof Error ? error.message : error); }
   }
@@ -11600,7 +11609,8 @@ function normalizeConfig(
   if (hosted) {
     if (config.remote === 'none')
       throw new ValidationError('Hosted GitHub projects cannot use remote policy "none"; use "pr" or the advanced direct-push policy.');
-    if (config.remote === undefined) config = { ...config, remote: 'pr' };
+    // An absent policy is the hosted default, decided where it is read
+    // (effectiveProjectConfig): `pr`, or `push` on repositories tavya hosts.
     const worldProvider = config.worldProvider ?? (defaultHostedProvider
       ? process.env.KARMAX_CLOUD_WORLD_PROVIDER?.trim() || 'any'
       : undefined);

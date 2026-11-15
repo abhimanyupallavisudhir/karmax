@@ -367,7 +367,7 @@ describe.each(storeBackends)('Store ($name)', ({ name, open }) => {
       base: 'main', _authorization: { capabilities: ['new'] }, nullable: null });
   });
 
-  it.skipIf(name !== 'SQLite')('defaults and migrates hosted projects to PR delivery while rejecting new local-only writes', async () => {
+  it.skipIf(name !== 'SQLite')('reads hosted projects as PR delivery (push on tavya\'s repositories) while rejecting new local-only writes', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-hosted-remote-'));
     const dbPath = path.join(dir, 'karmax.db');
     const previous = process.env.KARMAX_DEPLOYMENT;
@@ -377,14 +377,22 @@ describe.each(storeBackends)('Store ($name)', ({ name, open }) => {
       const oldDefault = (await legacy.createProject('Old default'));
       const oldNone = (await legacy.createProject('Old explicit none', { remote: 'none' }));
       (await legacy.setSettings(oldNone.id, '__common__', { remote: 'none', target: 'main' }));
+      // Until 2026-11-14 the hosted default was written down, also on repositories tavya hosts.
+      const onTavya = (await legacy.createProject('On tavya', { remote: 'pr', repos: ['tavya:repo_notes1/notes.git'] }));
       (await legacy.close());
 
       process.env.KARMAX_DEPLOYMENT = 'hosted';
       const hosted = (await Store.create(dbPath));
-      expect((await hosted.getProject(oldDefault.id))?.config.remote).toBe('pr');
+      // An absent policy is the hosted default where it is read, not written down.
+      expect((await hosted.getProject(oldDefault.id))?.config.remote).toBeUndefined();
+      expect((await hosted.effectiveProjectConfig(oldDefault.id)).remote).toBe('pr');
       expect((await hosted.getProject(oldNone.id))?.config.remote).toBe('pr');
       expect((await hosted.getSettings(oldNone.id, '__common__'))).toMatchObject({ remote: 'pr', target: 'main' });
-      expect((await hosted.createProject('New hosted')).config.remote).toBe('pr');
+      expect((await hosted.getProject(onTavya.id))?.config.remote).toBeUndefined();
+      expect((await hosted.effectiveProjectConfig(onTavya.id)).remote).toBe('push');
+      const created = (await hosted.createProject('New hosted'));
+      expect(created.config.remote).toBeUndefined();
+      expect((await hosted.effectiveProjectConfig(created.id)).remote).toBe('pr');
       await expect((async () => (await hosted.createProject('No local-only', { remote: 'none' })))()).rejects.toThrow(/hosted GitHub projects require/i);
       await expect((async () => (await hosted.updateProjectConfig(oldNone.id, { remote: 'none' })))()).rejects.toThrow(/hosted GitHub projects require/i);
       await expect((async () => (await hosted.setSettings(oldNone.id, '__common__', { remote: 'none' })))()).rejects.toThrow(/hosted GitHub projects require/i);

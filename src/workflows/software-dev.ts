@@ -398,6 +398,11 @@ const REVIEW_SETUP_FOLLOW_UP = 'software-dev-review-setup-follow-up-v1';
  * request landing rebuilds it, leaving that pull request's work out, and the
  * whole task landing empties it (it had been the last Review's snapshot). */
 const CHANGED_FILES_AFTER_LANDING = 'software-dev-changed-files-after-landing-v1';
+/** A message to the agent at a failed pull request returns the proposal to
+ * Do, where the agent reads it, as at a failed landing. It used to re-run the
+ * failing pull request only: on tavya.io (2026-11-14, caren/formatter #2) a
+ * person's two messages were never read while the same refusal repeated. */
+const PR_ESCALATION_MESSAGE_TO_DO = 'software-dev-pr-escalation-message-to-do-v1';
 const quietNotice = (m: Message): boolean => m.id.startsWith(QUIET_NOTICE);
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max)}…` : text;
 /** A turn can return while the agent's own in-harness sub-agents (Claude Agent SDK
@@ -475,6 +480,9 @@ const CHILD_SETTLEMENT_RECHECK_MAX_MS = 24 * 60 * 60 * 1000;
  * do that. Cancellation is caught and routed to a graceful `abort()`.
  */
 class Cancelled extends Error {}
+/** A failed stage a person answered with a message for the agent: back to Do. */
+class BackToDo extends Error {}
+const BACK_TO_DO = Symbol('back to Do');
 
 /** No usable credential for a turn — every allowed login/key needs human action
  *  (funding, re-auth, or re-enable). Escalates straight to a human (SPEC §5.2, #5). */
@@ -2497,7 +2505,7 @@ async function softwareDevImpl(
   async function withResolve<T>(stageName: string, fn: () => Promise<T>, manual?: {
     action: 'openPr' | 'confirm';
     finish: () => Promise<T>;
-  }): Promise<T> {
+  }, options: { messageReturnsToDo?: boolean } = {}): Promise<T> {
     // Usually identical to stageName, except the Confirm agent runs inside the
     // public Review stage. Preserve the actual UI stage for a later human retry.
     const resumeStage = stage;
@@ -2856,6 +2864,14 @@ async function softwareDevImpl(
       outOfDisk = false;
       if (cancelled) throw new Cancelled();
       if (halted()) { stage = resumeStage; status = 'active'; error = undefined; throw new Cancelled(); }
+      // A message for the agent, not a Retry: the agent reads it in Do.
+      if (options.messageReturnsToDo && !retryRequested && mainUnreadSince(seenAtEscalation)
+        && patched(PR_ESCALATION_MESSAGE_TO_DO)) {
+        stage = 'do';
+        status = 'active';
+        error = undefined;
+        throw new BackToDo();
+      }
       // A human/parent retry resumes the stage that failed. Leaving this as
       // `escalated` made the live view claim the task was still escalated while
       // its replacement agent turn was already running (task #240). This is a
@@ -2874,6 +2890,13 @@ async function softwareDevImpl(
    * its Hetzner world took to make, and was pressed again. */
   async function publishRetried(): Promise<void> {
     if (patched('software-dev-publish-retried-stage-v1')) await publish();
+  }
+
+  /** Opening the pull request, as `withResolve('pr', …)`; at its failure a
+   * person's message for the agent ends it with `BACK_TO_DO` (PR_ESCALATION_MESSAGE_TO_DO). */
+  async function openingPr<T>(fn: () => Promise<T>): Promise<T | typeof BACK_TO_DO> {
+    try { return await withResolve('pr', fn, undefined, { messageReturnsToDo: true }); }
+    catch (err) { if (err instanceof BackToDo) return BACK_TO_DO; throw err; }
   }
 
   /** Open PR's readiness check, which wakes a parked world. A provider can
@@ -5671,7 +5694,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         if (cancelled) return await abort();
         targetLocked = true;
         if (githubAuthoritativeMerge) {
-          const opened = await withResolve('pr', async () => {
+          const opened = await openingPr(async () => {
             try {
               return { prs: await core.openPr(world as any, target, {
                 title: input.title,
@@ -5685,6 +5708,11 @@ Inspect the complete current diff and specifically compare its delta from the re
               throw err;
             }
           });
+          if (opened === BACK_TO_DO) {
+            prRequested = false;
+            branchPreparedForPr = false;
+            continue;
+          }
           if (opened.repair) {
             msgs.push({ id: `pr-conflict-${msgs.length}`, role: 'user', ts: Date.now(),
               text: `Open PR needs a branch repair.\n${opened.repair}` });
@@ -5722,10 +5750,15 @@ Inspect the complete current diff and specifically compare its delta from the re
             + `resolve every conflict, run the relevant build and tests, and leave the worktree clean. Do not merge the target branch itself.`,
           );
           branchPreparedForPr = true;
-          const opened = await withResolve('pr', () => core.openPr(world as any, target, {
+          const opened = await openingPr(() => core.openPr(world as any, target, {
             title: input.title,
             summary: pullRequestSummary(reviewInfo?.summary, msgs, !patched('github-public-pr-summary-v1')),
           }));
+          if (opened === BACK_TO_DO) {
+            prRequested = false;
+            branchPreparedForPr = false;
+            continue;
+          }
           prs = opened ?? [];
           pr = prs[0];
           // Preparation may have committed conflict resolutions or cleanup after
@@ -5914,10 +5947,19 @@ Inspect the complete current diff and specifically compare its delta from the re
       );
       branchPreparedForPr = true;
     }
-    const opened = await withResolve('pr', () => core.openPr(world as any, target, {
+    const opened = await openingPr(() => core.openPr(world as any, target, {
       title: input.title,
       summary: pullRequestSummary(reviewInfo?.summary, msgs, !patched('github-public-pr-summary-v1')),
     }));
+    if (opened === BACK_TO_DO) {
+      // What the agent does with the message is new work: Review again.
+      if (recoveryStage === 'pr') recoveredLandingNeedsDo = true;
+      confirmed = false;
+      prRequested = false;
+      branchPreparedForPr = false;
+      checkoutApprovals = {};
+      continue proposalCycle;
+    }
     prs = opened ?? [];
     pr = prs[0];
     // No publish here: the merge stage below opens with one, and adding an

@@ -126,6 +126,9 @@ describe('repositories tavya hosts, through the gateway', () => {
 
     const project = (await call('POST', `/api/organizations/${organizationId}/projects`, { name: 'Notes', repos: [repository.sshUrl] })).body;
     expect((await store.effectiveProjectConfig(project.id))).toMatchObject({ repos: [repository.sshUrl], remote: 'push' });
+    // Task defaults show what its tasks do (the stored hosted default is `pr`).
+    const defaults = (await call('GET', `/api/defaults/${project.id}/software-dev`)).body;
+    expect([defaults.task.inherited.remote, defaults.project.inherited.remote, defaults.project.own.remote]).toEqual(['push', 'push', undefined]);
 
     const writer = await token('developer');
     const clone = path.join(workdir(), 'notes');
