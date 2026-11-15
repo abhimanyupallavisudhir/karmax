@@ -9837,7 +9837,8 @@ export class Gateway {
     const name = path.basename(file);
     // A page's Markdown source (agents read it) points search engines at the page.
     const origin = req ? this.publicUrl(req) : '';
-    const source = name !== 'index.html' && p.endsWith('.md') ? markdownSource(this.deps.staticDir, p, origin) : undefined;
+    // Only a listed page's: any other .md falls through to the file or the console.
+    const source = p.endsWith('.md') ? markdownSource(this.deps.staticDir, p, origin) : undefined;
     if (source) {
       this.countCrawl(req, p);
       res.writeHead(200, { 'content-type': MIME['.md']!, 'cache-control': 'no-cache', 'content-length': String(Buffer.byteLength(source.body)),

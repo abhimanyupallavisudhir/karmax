@@ -149,6 +149,20 @@ describe('public pages for search engines and link previews (hosted)', () => {
     }
   });
 
+  it('answers every page\'s Markdown at its own address with .md appended, as llms.txt lists it', async () => {
+    // Agents fetch "<page>.md" (the llms.txt convention); /docs.md and /compare.md once answered the console.
+    const llms = (await get('/llms.txt')).body;
+    for (const doc of markdownPages(web)) {
+      const file = await get(`${doc.path}.md`);
+      expect([file.status, file.headers['content-type'], file.headers.link], doc.path)
+        .toEqual([200, 'text/markdown; charset=utf-8', `<${base}${doc.path}>; rel="canonical"`]);
+      expect(file.body.startsWith(`# ${doc.title}\n`), doc.path).toBe(true);
+      expect(llms, doc.path).toContain(`(Markdown: ${base}${doc.path}.md)`);
+    }
+    // Only listed pages: an unknown .md is still not a page.
+    expect((await get('/compare/no-such-product.md')).headers['content-type']).not.toBe('text/markdown; charset=utf-8');
+  });
+
   it('lists every page for agents in llms.txt, and offers them all in one file', async () => {
     const llms = (await get('/llms.txt')).body;
     expect(llms).not.toContain('{{pages}}');

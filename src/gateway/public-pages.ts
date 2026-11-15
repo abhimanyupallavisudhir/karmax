@@ -167,9 +167,11 @@ export function docPages(staticDir: string): DocFile[] {
 }
 
 /** A page's Markdown source as a reader gets it (agents read it): the page it is the
- * source of, and its text with the comparison table and this installation's address filled in. */
+ * source of, and its text with the comparison table and this installation's address filled in.
+ * It answers at the page's address with `.md` appended (`/docs.md`, `/compare/devin.md`, the
+ * llms.txt convention) and at its file's (`/docs/getting-started.md`). */
 export function markdownSource(staticDir: string, pathname: string, origin: string): { page: string; body: string } | undefined {
-  const doc = markdownPages(staticDir).find((entry) => `/${entry.file}` === pathname);
+  const doc = markdownPages(staticDir).find((entry) => `${entry.path}.md` === pathname || `/${entry.file}` === pathname);
   return doc && { page: doc.path, body: doc.source.replaceAll('{{origin}}', origin) };
 }
 
@@ -349,7 +351,7 @@ export function llmsPageList(staticDir: string, origin: string): string {
   const groups = new Map<string, string[]>();
   for (const doc of markdownPages(staticDir)) {
     const lines = groups.get(doc.group) ?? [];
-    lines.push(`- [${doc.title}](${origin}${doc.path}): ${doc.lede} (Markdown: ${origin}/${doc.file})`);
+    lines.push(`- [${doc.title}](${origin}${doc.path}): ${doc.lede} (Markdown: ${origin}${doc.path}.md)`);
     groups.set(doc.group, lines);
   }
   return [...groups].map(([group, lines]) => `## ${headings[group] ?? group}\n\n${lines.join('\n')}`).join('\n\n');
