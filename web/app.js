@@ -29366,7 +29366,11 @@ function openPublicAuth(path, render) {
 // The landing wears the console's look (light or dark, default or classic), like
 // Docs and Pricing: the launch film, then how a task goes, then what surrounds it, each pictured by a screenshot of the console in the
 // visitor's look (web/media/landing/<name>-light|dark.webp, design/landing-v3).
-const LANDING_FILM = { src: '/media/tavya-launch.mp4', poster: '/media/tavya-launch-poster.jpg', length: '1:02' };
+// The film is one timeline in two cuts (design/launch-video/final): landscape, and portrait for a phone held upright.
+const LANDING_FILM = { length: '1:02', upright: '(max-width: 640px)',
+  landscape: { src: '/media/tavya-launch.mp4', poster: '/media/tavya-launch-poster.jpg', width: 1920, height: 1080 },
+  portrait: { src: '/media/tavya-launch-portrait.mp4', poster: '/media/tavya-launch-portrait-poster.jpg', width: 1080, height: 1350 } };
+const landingFilmCut = () => LANDING_FILM[matchMedia(LANDING_FILM.upright).matches ? 'portrait' : 'landscape'];
 // Its words (how a task goes, the autonomous company, what every task gets, how it
 // compares, what people say, the questions) are web/site.js's, which the gateway reads too.
 
@@ -29377,6 +29381,7 @@ const LANDING_SHOT_SIZES = { write: [756, 583], work: [652, 470], review: [652, 
 function renderLanding() {
   const site = siteNameMarkup();
   const { landing, compare, source } = globalThis.KarmaxSite;
+  const film = landingFilmCut();
   const [stepsTitle, steps] = landing.steps;
   const [autonomyTitle, autonomyLine, autonomy] = landing.autonomy;
   const [featuresTitle, features] = landing.features;
@@ -29428,7 +29433,7 @@ function renderLanding() {
           <a class="landing-start lp-large" id="landing-hero-start" href="/signup">Get started</a>
         </div>
         <figure class="lp-film">
-          <video id="lp-film" src="${LANDING_FILM.src}" poster="${LANDING_FILM.poster}" width="1920" height="1080" muted loop playsinline disableremoteplayback preload="metadata"
+          <video id="lp-film" src="${film.src}" poster="${film.poster}" width="${film.width}" height="${film.height}" muted loop playsinline disableremoteplayback preload="metadata"
             aria-label="${site}’s launch film, ${LANDING_FILM.length}"></video>
           <button class="lp-sound" id="lp-sound" type="button">${play}Watch with sound <small>${LANDING_FILM.length}</small></button>
         </figure>
@@ -29494,11 +29499,22 @@ function renderLanding() {
 
 // The film plays silently, looping, while it is on screen (never with reduced
 // motion); "Watch with sound" starts it from the top with sound and controls.
+// Turning the phone changes the cut, at the moment the film had reached.
 function wireLandingFilm() {
   const film = $('#lp-film');
   const sound = $('#lp-sound');
   if (!film || !sound) return;
   let watching = false;
+  const upright = matchMedia(LANDING_FILM.upright);
+  upright.addEventListener('change', function turned() {
+    if (!film.isConnected) return upright.removeEventListener('change', turned);
+    const { currentTime, paused } = film;
+    Object.assign(film, landingFilmCut());
+    film.addEventListener('loadedmetadata', () => {
+      film.currentTime = currentTime;
+      if (!paused) film.play().catch(() => {});
+    }, { once: true });
+  });
   if (!matchMedia('(prefers-reduced-motion: reduce)').matches && 'IntersectionObserver' in window) {
     new IntersectionObserver(([entry]) => {
       if (watching) return;

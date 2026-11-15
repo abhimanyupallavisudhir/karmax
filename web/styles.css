@@ -2496,7 +2496,7 @@ html[data-theme="dark"] .legal-shell { color-scheme: dark; }
   font-variation-settings: "opsz" 32; font-optical-sizing: none; text-wrap: balance; }
 .lp-lede { max-width: 36em; margin: 22px auto 30px; color: var(--l-ink-2); font-size: clamp(17px, 2vw, 19px); line-height: 1.55; text-wrap: pretty; }
 .lp-film { position: relative; max-width: 960px; margin: 56px auto 0; border: 1px solid var(--l-line); border-radius: calc(var(--r) + 6px); background: #0d0c13; box-shadow: var(--l-frame-shadow); overflow: hidden; }
-.lp-film video { display: block; width: 100%; height: auto; aspect-ratio: 16 / 9; }
+.lp-film video { display: block; width: 100%; height: auto; }
 .lp-sound { position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%); display: inline-flex; white-space: nowrap; align-items: center; gap: 8px; min-height: 40px; padding: 0 16px 0 13px;
   border: 0; border-radius: 999px; background: rgba(255, 255, 255, .92); color: #16161d; font: inherit; font-size: 15px; font-weight: 600; cursor: pointer;
   box-shadow: 0 6px 20px rgba(0, 0, 0, .28); }

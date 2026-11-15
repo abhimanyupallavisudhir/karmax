@@ -83,8 +83,10 @@ describe('public pages for search engines and link previews (hosted)', () => {
     expect(organization.description).toContain('gives each task its own agent and computer');
     // Inter downloads with the page, so the landing never paints a fallback face first.
     expect(page.body).toContain('<link rel="preload" href="/fonts/inter/InterVariable.woff2" as="font" type="font/woff2" crossorigin />');
-    const film = await get('/media/tavya-launch.mp4');
-    expect([film.status, film.headers['content-type'], film.headers['accept-ranges']]).toEqual([200, 'video/mp4', 'bytes']);
+    for (const cut of ['/media/tavya-launch.mp4', '/media/tavya-launch-portrait.mp4']) {
+      const film = await get(cut);
+      expect([film.status, film.headers['content-type'], film.headers['accept-ranges']]).toEqual([200, 'video/mp4', 'bytes']);
+    }
     for (const href of ['/docs', '/docs/how-it-works', '/docs/cli', '/pricing', '/legal']) expect(page.body).toContain(`<a href="${href}">`);
     expect((await get('/social-card.png')).headers['content-type']).toBe('image/png');
   });

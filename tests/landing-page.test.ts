@@ -118,6 +118,32 @@ describe('public landing page', () => {
     await ui.close();
   });
 
+  it('plays the portrait cut on a phone held upright, and the landscape one once it is turned', async () => {
+    const ui = await landing({ viewport: { width: 390, height: 844 } });
+    const { page } = ui;
+    const film = page.locator('#lp-film');
+    const cut = () => film.evaluate((video: any) => [video.getAttribute('src'), video.getAttribute('poster'), video.width, video.height]);
+    const shape = async () => { const box = (await film.boundingBox())!; return box.width / box.height; };
+    expect(await cut()).toEqual(['/media/tavya-launch-portrait.mp4', '/media/tavya-launch-portrait-poster.jpg', 1080, 1350]);
+    // The frame has the cut's shape before a byte of it arrives, and fills the column.
+    expect(await shape()).toBeCloseTo(1080 / 1350, 2);
+    expect((await film.boundingBox())!.width).toBeGreaterThan(390 - 40);
+    // Watching with sound, then turning the phone: the other cut of the same timeline, still with sound and controls.
+    await page.locator('#lp-sound').click();
+    await film.evaluate((video: any) => Object.defineProperty(video, 'currentTime', { get: () => 23, set: (to) => { video.dataset.sought = String(to); } }));
+    await page.setViewportSize({ width: 844, height: 390 });
+    await expect.poll(cut).toEqual(['/media/tavya-launch.mp4', '/media/tavya-launch-poster.jpg', 1920, 1080]);
+    // It goes on from where it was, once the new cut can seek (a browser that reads the file says so itself).
+    await film.dispatchEvent('loadedmetadata');
+    expect(await film.getAttribute('data-sought')).toBe('23');
+    expect(await shape()).toBeCloseTo(16 / 9, 2);
+    expect(await film.evaluate((video: any) => ({ muted: video.muted, loop: video.loop, controls: video.controls }))).toEqual({ muted: false, loop: false, controls: true });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect.poll(cut).toEqual(['/media/tavya-launch-portrait.mp4', '/media/tavya-launch-portrait-poster.jpg', 1080, 1350]);
+    expect(ui.errors).toEqual([]);
+    await ui.close();
+  });
+
   it('tells how a task goes, then what surrounds it, each pictured in the visitor\'s look', async () => {
     const ui = await landing();
     const { page } = ui;
