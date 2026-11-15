@@ -1,4 +1,4 @@
-# Launch video — final (1:04, dark)
+# Launch video — final (1:02, dark; landscape and portrait)
 
 The first cut's look (dark backdrop, headlines whose words arrive one by one with a gold
 phrase, a browser window with a camera) and its score, with every screen captured fresh
@@ -23,12 +23,38 @@ python3 ../fetch.py && bash ../build.sh                          # the clone (DE
 FILM=<previous film>.mp4 DIRECTOR=final/capture.cjs bash ../record.sh /tmp/demo/final-assets ['shot-regex']
 PAPER=paper.pdf IMAGE=image.png FILM=film.mp4 WEBSITE=landing.png ./extras.sh /tmp/demo/final-assets
 ./make.sh out.mp4 --workers 4                                    # or --stills 6,30 for single frames
+./make.sh portrait.mp4 --portrait --workers 4                    # the portrait cut (1080×1350), same timeline and score
+./web.sh out.mp4 ../../../web/media/tavya-launch                  # the landing's web encode (CRF 28) and poster
 ./scenes.sh previous.mp4 out.mp4 13.6:17.8 25.6:32.0            # re-render some whole scenes into an earlier render (same lengths, its audio)
 ./splice.sh previous.mp4 out.mp4 55.8                            # only the end card changed: re-render from its start
 ./restitch.sh previous.mp4 out.mp4 old:0:8.2 new:8.2:22.4 old:21.6:48.8 new:49.6:62   # scenes changed length: new pieces from this timeline, old ones from the earlier render, score regenerated
 ```
 
+## Portrait (1080×1350)
+
+The phone cut is the same stage rendered with `--portrait` (`stage.html?layout=portrait`;
+`LAYOUT=portrait` does the same for `scenes.sh`, `splice.sh` and `restitch.sh`, whose earlier
+render must then be a portrait one): the same scenes, timing, words, cursor, camera keyframes
+and score, laid out for a phone. `timeline.js` holds both layouts; `WIN` says where the browser
+window sits and how much of the 1440×900 screen it shows.
+
+- Headlines, pills and lines sit large in a band at the top (`.band`, 80 px headlines).
+- The window fills the width below at scale 1 (a 1032×900 viewport onto the screen), so with
+  the landscape camera the console's text is ~1.8× larger relative to the frame. The camera
+  aims as in landscape (`at()` measures against the viewport); the typed prompt zooms only as
+  far as keeps its lines whole (`fit()`, 1.4× instead of 1.6×).
+- The title card, "Not just code" (two columns, the chore below) and the end card (the three
+  quotes stacked) have their own arrangement. The review viewer still shows the landscape film.
+
+The stage loads the console's Inter (`web/fonts`), so a render looks the same on any machine.
+
+## Inputs
+
 `capture.cjs` starts every task in the same order whatever it shoots, so task numbers
 match between a full capture and a re-shoot. The AI image was made with gpt-image-2 on the
 project's OpenAI key; the paper is legibench3's (task_mvik4fo03779021f59, page 4 has its
-figures); the website is the landing's first screen (design/landing-v2/shoot.cjs).
+figures); the website is the landing's first screen (design/landing-v2/shoot.cjs; task #920's
+review "Landing: first screen"); the film still is 21 s into task #920's render (the resource's
+earlier revision, readable in Files with `?task=` #920). The generated image itself was not
+kept: the portrait cut's `IMAGE` is its card cut out of the 1:02 film at 53.5 s (left 1230,
+top 270, 590 wide, turned back 2°), so both cuts show the same picture.

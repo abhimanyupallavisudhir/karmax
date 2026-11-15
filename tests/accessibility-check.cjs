@@ -1,7 +1,7 @@
 // Automated accessibility checks (axe-core, WCAG 2.2 A/AA) on the console's main
 // pages — For me with its in-row decisions, a task asking for a credential, a
 // task with a question, settings, Insights, the profile — and the public site
-// (landing, docs, pricing, policies), in both looks, light and dark, and on a phone; the lists also in the other
+// (landing, docs, the comparison, About, pricing, policies), in both looks, light and dark, and on a phone; the lists also in the other
 // task list layouts (Installation → Appearance → Task list). Fails on any violation, so a contrast, label, name
 // or target-size regression is caught before it ships.
 // Run: node tests/accessibility-check.cjs   (A11Y_REPORT=1 prints every violation; CI runs it from tests/accessibility.browser.test.ts)
@@ -22,7 +22,7 @@ const PAGES = [
   ['profile', '/profile'],
 ];
 // Signed out: the landing at /, and the pages it links to.
-const PUBLIC_PAGES = [['landing', '/'], ['docs', '/docs'], ['pricing', '/pricing'], ['policies', '/legal']];
+const PUBLIC_PAGES = [['landing', '/'], ['docs', '/docs'], ['comparison', '/compare'], ['about', '/about'], ['pricing', '/pricing'], ['policies', '/legal']];
 const LOOKS = [
   { name: 'default light', skin: '', scheme: 'light' },
   { name: 'default dark', skin: '', scheme: 'dark' },

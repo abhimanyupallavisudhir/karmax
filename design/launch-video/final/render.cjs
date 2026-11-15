@@ -1,5 +1,6 @@
-// Renders stage.html frame by frame into an MP4 (H.264, 1080p).
-// Usage: ASSETS=/home/user/demo/assets node design/launch-video/final/render.cjs out.mp4 [--stills t1,t2,…] [--from s --to s] [--workers n]
+// Renders stage.html frame by frame into an MP4 (H.264): 1920×1080, or with --portrait
+// (or LAYOUT=portrait, which scenes.sh, splice.sh and restitch.sh pass through) 1080×1350.
+// Usage: ASSETS=/home/user/demo/assets node design/launch-video/final/render.cjs out.mp4 [--portrait] [--stills t1,t2,…] [--from s --to s] [--workers n]
 const { chromium } = require('playwright');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
@@ -9,15 +10,19 @@ const ASSETS = process.env.ASSETS || '/home/user/demo/assets';
 const args = process.argv.slice(2);
 const out = args[0];
 const opt = (name, d) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : d; };
+const PORTRAIT = args.includes('--portrait') || process.env.LAYOUT === 'portrait';
+const VIEW = PORTRAIT ? { width: 1080, height: 1350 } : { width: 1920, height: 1080 };
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tavya-video-'));
 for (const f of ['stage.html', 'timeline.js']) fs.copyFileSync(path.join(__dirname, f), path.join(root, f));
 fs.symlinkSync(ASSETS, path.join(root, 'assets'));
+fs.symlinkSync(path.resolve(__dirname, '../../../web/fonts'), path.join(root, 'fonts'));
 
 async function open(browser) {
-  const page = await browser.newPage({ viewport: { width: 1920, height: 1080 }, deviceScaleFactor: 1 });
+  const page = await browser.newPage({ viewport: VIEW, deviceScaleFactor: 1 });
   page.on('pageerror', (e) => console.error('pageerror', e.message));
-  await page.goto(`file://${root}/stage.html`);
+  await page.goto(`file://${root}/stage.html${PORTRAIT ? '?layout=portrait' : ''}`);
   await page.waitForFunction(() => window.DURATION > 0);
+  await page.evaluate(() => Promise.all([document.fonts.load('700 80px "Inter Display"'), document.fonts.load('600 20px Inter')]).then(() => document.fonts.ready));
   return page;
 }
 const frameAt = (page, t) => page.evaluate((t) => window.seek(t), t).then(() => page.screenshot({ type: 'png' }));

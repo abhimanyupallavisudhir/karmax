@@ -325,12 +325,20 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
 
 /** `tools` registers only that subset of the definitions below (the remote
  * `/mcp` server leaves out tools bound to a calling task). */
-export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: ReadonlySet<string>; name?: string } = {}): McpServer {
+export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: ReadonlySet<string>; name?: string;
+  /** What a client is told about each tool: its name for people and whether it reads, changes or can remove (MCP annotations). */
+  notes?: Readonly<Record<string, { title: string; readOnly?: true; destructive?: true }>> } = {}): McpServer {
   const server = new McpServer({ name: options.name ?? 'karmax-platform', version: '1.0.0' });
   if (options.tools) {
     const register = server.registerTool.bind(server), tools = options.tools;
-    server.registerTool = ((name: string, ...rest: unknown[]) => tools.has(name)
-      ? (register as (...args: unknown[]) => unknown)(name, ...rest) : undefined) as typeof server.registerTool;
+    server.registerTool = ((name: string, config: Record<string, unknown>, ...rest: unknown[]) => {
+      if (!tools.has(name)) return undefined;
+      const note = options.notes?.[name];
+      // Both hints are stated for every tool: a client that sees neither must assume the worst of a read.
+      const described = note ? { ...config, title: note.title, annotations: { title: note.title,
+        readOnlyHint: note.readOnly === true, destructiveHint: note.destructive === true } } : config;
+      return (register as (...args: unknown[]) => unknown)(name, described, ...rest);
+    }) as typeof server.registerTool;
   }
   const ok = (text: string) => ({ content: [{ type: 'text' as const, text }] });
   const wrap = async (fn: () => Promise<any>) => {

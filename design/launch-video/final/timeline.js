@@ -1,8 +1,18 @@
 // The final cut's timeline (the first cut's look, every screen captured fresh by
 // capture.cjs). seek(t) poses every element for time t (seconds).
-/* global document, window */
+// One timeline, two layouts: stage.html (1920×1080) or stage.html?layout=portrait
+// (1080×1350, for phones: headlines in a band at the top, the window filling the
+// width below with its text ~1.8× larger relative to the frame). Scenes, timing,
+// words and score are the same; only where things sit differs.
+/* global document, window, location */
 const A = 'assets/';
 const FPS = 30;
+const PORTRAIT = new URLSearchParams(location.search).get('layout') === 'portrait';
+document.documentElement.classList.toggle('portrait', PORTRAIT);
+// The browser window: where it sits (frame px), its scale, and its viewport onto the
+// 1440×900 screens (content px). In portrait the window is drawn at scale 1, so its text
+// is as many pixels tall as in landscape in a frame 1080 instead of 1920 wide.
+const WIN = PORTRAIT ? { x: 24, y: 386, scale: 1, vw: 1032, vh: 900 } : { x: 260, y: 212, scale: 1400 / 1440, vw: 1440, vh: 900 };
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const lerp = (a, b, p) => a + (b - a) * p;
 const ease = {
@@ -38,7 +48,7 @@ const setSrc = (img, src) => { if (img.getAttribute('src') !== src) { img.src = 
 
 // ── components ──────────────────────────────────────────────────────────────
 function headline(parent, title, sub) {
-  const h = el('div', 'headline', parent);
+  const h = el('div', 'headline', parent.band ?? parent);
   const h1 = el('h1', '', h);
   const words = [];
   for (const part of title.split(/(\*[^*]+\*)/)) {
@@ -63,12 +73,15 @@ function headline(parent, title, sub) {
 
 const CURSOR = `<svg viewBox="0 0 24 24" width="30" height="30"><path d="M4 2.5v17.2l4.6-4.3 3 6.8 2.9-1.3-3-6.6h6.3z" fill="#111" stroke="#fff" stroke-width="1.4" stroke-linejoin="round"/></svg>`;
 
-// A browser window showing 1440×900 screens with a camera (zoom z at focus fx, fy).
-function browserWindow(parent, { screens, x = 260, y = 212, scale = 1400 / 1440 }) {
+// A browser window showing 1440×900 screens through a WIN.vw×WIN.vh viewport, with a
+// camera (zoom z at focus fx, fy).
+function browserWindow(parent, { screens, x = WIN.x, y = WIN.y, scale = WIN.scale }) {
+  const { vw, vh } = WIN;
   const win = el('div', 'win', parent);
   const chrome = el('div', 'chrome', win, '<i></i><i></i><i></i>');
   const bar = el('div', 'url', chrome);
   const content = el('div', 'content', win);
+  content.style.width = `${vw}px`; content.style.height = `${vh}px`;
   const imgs = {};
   for (const s of screens) {
     const img = el('img', 'screen', content);
@@ -82,18 +95,20 @@ function browserWindow(parent, { screens, x = 260, y = 212, scale = 1400 / 1440 
   return {
     win, imgs,
     place(px = x, py = y, s = scale, opacity = 1, extra = '') {
-      win.style.left = `${px}px`; win.style.top = `${py}px`; win.style.width = '1440px';
+      win.style.left = `${px}px`; win.style.top = `${py}px`; win.style.width = `${vw}px`;
       win.style.transform = `scale(${s}) ${extra}`; win.style.opacity = opacity;
     },
     url(text) { bar.innerHTML = text; },
     show(weights) { for (const [k, img] of Object.entries(imgs)) img.style.opacity = weights[k] ?? 0; },
     seq(key, dir, frame) { setSrc(imgs[key], `${A}${dir}/${String(frame).padStart(4, '0')}.jpg`); },
     camera(z, fx, fy) {
-      const tx = clamp(720 - fx * z, 1440 - 1440 * z, 0);
-      const ty = clamp(450 - fy * z, 900 - 900 * z, 0);
+      const tx = clamp(vw / 2 - fx * z, vw - 1440 * z, 0);
+      const ty = clamp(vh / 2 - fy * z, vh - 900 * z, 0);
       cam = { z, tx, ty };
       for (const img of Object.values(imgs)) img.style.transform = `translate(${tx}px, ${ty}px) scale(${z})`;
     },
+    /** Where screen point (cx, cy) is in the viewport now, and the camera's zoom. */
+    view: (cx, cy) => [cx * cam.z + cam.tx, cy * cam.z + cam.ty, cam.z],
     // Cursor at content point (cx, cy); press 0..1 shrinks it; ripple p 0..1.
     pointer(cx, cy, visible = 1, press = 0) {
       const sx = cx * cam.z + cam.tx, sy = cy * cam.z + cam.ty;
@@ -128,8 +143,10 @@ const bx = (shot, key) => SHOTS[shot]?.boxes?.[key] ?? null;
 const at = (shot, key, z, dx = 0, dy = 0) => {
   const b = bx(shot, key);
   if (!b) return [z, 720, 450];
-  return [z, b.x + Math.min(b.w / 2, 0.42 * 1440 / z) + dx, b.y + Math.min(b.h / 2, 0.36 * 900 / z) + dy];
+  return [z, b.x + Math.min(b.w / 2, 0.42 * WIN.vw / z) + dx, b.y + Math.min(b.h / 2, 0.36 * WIN.vh / z) + dy];
 };
+/** at(), but in portrait never so close that the box is wider than the viewport (a prompt's lines stay whole). */
+const fit = (shot, key, z, dx, dy) => { const b = bx(shot, key); return at(shot, key, PORTRAIT && b ? Math.min(z, (WIN.vw - 24) / b.w) : z, dx, dy); };
 const mid = (shot, key, fallback = [720, 450]) => { const b = bx(shot, key); return b ? [b.x + b.w / 2, b.y + b.h / 2] : fallback; };
 const seqFrames = (name) => SHOTS[name]?.frames ?? 1;
 
@@ -137,6 +154,8 @@ const seqFrames = (name) => SHOTS[name]?.frames ?? 1;
 const scenes = [];
 function scene(start, end, build, { fadeIn = 0.35, fadeOut = 0.35 } = {}) {
   const layer = el('div', 'layer', stage);
+  // Portrait: headlines, pills and lines sit in their own band above the window.
+  if (PORTRAIT) layer.band = el('div', 'band', layer);
   const update = build(layer, end - start);
   scenes.push({ start, end, layer, update, fadeIn, fadeOut });
 }
@@ -144,7 +163,7 @@ const host = (path) => `<b>tavya.io</b>${path}`;
 const enter = (w, lt, dur, from = 60) => {
   const q = ramp(lt, 0.1, 0.85, ease.outQuint);
   const out = ramp(lt, dur - 0.35, dur, ease.in);
-  w.place(260, 212 + (1 - q) * from + out * 20, (1400 / 1440) * (0.97 + 0.03 * q), q * (1 - out),
+  w.place(WIN.x, WIN.y + (1 - q) * from + out * 20, WIN.scale * (0.97 + 0.03 * q), q * (1 - out),
     `perspective(2400px) rotateX(${(1 - q) * 8}deg)`);
 };
 let T = 0;
@@ -163,7 +182,7 @@ const showAt = (w, lt, list, x = 0.22) => {
 // ── this cut's parts ───────────────────────────────────────────────────────────
 /** Pills under a headline, each popping in at its own moment ([text, at]), with a brief glow. */
 function pills(parent, items, top = 128) {
-  const row = el('div', 'pills', parent); row.style.top = `${top}px`;
+  const row = el('div', 'pills', parent.band ?? parent); row.style.top = `${top}px`;
   const nodes = items.map(([text]) => el('span', 'pill', row, text));
   return (lt) => nodes.forEach((n, i) => {
     const t0 = items[i][1];
@@ -177,7 +196,7 @@ function pills(parent, items, top = 128) {
 }
 /** A prominent line under the headline that swaps: variants [{at, text}], words arriving one by one. */
 function lead(parent, variants, top = 126) {
-  const box = el('div', 'lead', parent); box.style.top = `${top}px`;
+  const box = el('div', 'lead', parent.band ?? parent); box.style.top = `${top}px`;
   const vs = variants.map((v) => {
     const line = el('div', 'lead-line', box);
     // *…* marks the gold phrase, which may span words.
@@ -192,7 +211,14 @@ function lead(parent, variants, top = 126) {
     }
     return { ...v, line, words };
   });
+  let fitted = !PORTRAIT;
   return (lt) => {
+    if (!fitted) {
+      fitted = true;
+      const hs = vs.map((v) => v.line.offsetHeight), max = Math.max(...hs);
+      box.style.height = `${max}px`;
+      vs.forEach((v, j) => { v.line.style.top = `${(max - hs[j]) / 2}px`; });
+    }
     let i = 0; vs.forEach((v, j) => { if (lt >= v.at) i = j; });
     vs.forEach((v, j) => {
       const out = j < i ? ramp(lt, vs[i].at - 0.3, vs[i].at, ease.in) : 0;
@@ -206,13 +232,20 @@ function lead(parent, variants, top = 126) {
     });
   };
 }
-/** The title card: mark, name, line. `still` poses it settled (for the film's own first frame). */
-function titleCard(L, tagline, still = false) {
+/** The title card: mark, name, line. `still` poses it settled (for the film's own first frame:
+ * the landscape film, also inside the portrait cut); `portrait` lays it out for 1080×1350. */
+function titleCard(L, tagline, still = false, portrait = false) {
   L.classList.add('introcard');
   const glow = el('div', 'glow', L);
   const mark = el('img', 'mark', L); setSrc(mark, A + 'brand/icon-512.png'); mark.style.top = '268px';
   const name = el('div', 'wordmark', L, 'tavya'); name.style.top = '466px';
   const tag = el('div', 'tagline', L, tagline); tag.style.top = '628px';
+  if (portrait) {
+    glow.style.top = '500px'; glow.style.width = glow.style.height = '820px'; glow.style.margin = '-410px';
+    Object.assign(mark.style, { top: '400px', width: '200px', height: '200px', marginLeft: '-100px', borderRadius: '46px' });
+    Object.assign(name.style, { top: '612px', fontSize: '150px' });
+    Object.assign(tag.style, { top: '818px', fontSize: '58px' });
+  }
   return (lt) => {
     const at = still ? 9 : lt;
     const q = ramp(at, 0.1, 1.1, ease.outQuint);
@@ -225,7 +258,7 @@ function titleCard(L, tagline, still = false) {
 const TAGLINE = 'Do <span class="gold">anything</span> with agents.';
 
 // 0 · Title card.
-scene(...next(3.0), (L) => { L.id = 'intro'; return titleCard(L, TAGLINE); }, { fadeIn: 0.01 });
+scene(...next(3.0), (L) => { L.id = 'intro'; return titleCard(L, TAGLINE, false, PORTRAIT); }, { fadeIn: 0.01 });
 
 // 1 · Every project, one list: the kinds of work, one at a time.
 scene(...next(5.2), (L, dur) => {
@@ -250,7 +283,7 @@ scene(...next(5.4), (L, dur) => {
   return (lt) => {
     h(lt); enter(w, lt, dur);
     w.seq('say/', 'say', Math.round(ramp(lt, 0.8, 3.6, (p) => p) * (N - 1)));
-    const [z, fx, fy] = kf(lt, [[0.3, [1, 720, 450]], [0.9, at('say', 'prompt', 1.6)], [4.0, at('say', 'prompt', 1.6)], [dur, [1.2, 720, 420]]]);
+    const [z, fx, fy] = kf(lt, [[0.3, [1, 720, 450]], [0.9, fit('say', 'prompt', 1.6)], [4.0, fit('say', 'prompt', 1.6)], [dur, [1.2, 720, 420]]]);
     w.camera(z, fx, fy);
     pointerAt(w, lt, [[0, 900, 600], [0.7, 640, 330], [dur, 640, 330]], [], ramp(lt, 0.3, 0.6) * (1 - ramp(lt, 1.0, 1.3)));
   };
@@ -312,9 +345,9 @@ scene(...next(6.4), (L, dur) => {
     const viewer = ramp(lt, 1.55, 1.75) * (1 - ramp(lt, 3.55, 3.75));
     const done = ramp(lt, 4.55, 4.8);
     w.show({ review: 1 - done, 'review-viewer': viewer * (1 - done), 'review-done': done });
-    if (pic) { mini.style.opacity = viewer * (1 - done); mini.style.transform = `translate(${pic.x}px, ${pic.y}px) scale(${pic.w / 1920})`; }
     const [z, fx, fy] = kf(lt, [[0.3, [1, 720, 450]], [1.2, [1.3, tile[0] + 120, tile[1] - 40]], [1.6, [1, 720, 450]], [3.6, [1, 720, 450]], [4.1, [1.3, confirm[0] + 160, confirm[1] - 90]], [dur, [1.32, confirm[0] + 160, confirm[1] - 90]]]);
     w.camera(z, fx, fy);
+    if (pic) { const [vx, vy, vz] = w.view(pic.x, pic.y); mini.style.opacity = viewer * (1 - done); mini.style.transform = `translate(${vx}px, ${vy}px) scale(${vz * pic.w / 1920})`; }
     pointerAt(w, lt, [[0, 1000, 700], [1.0, ...tile], [1.5, ...tile], [2.6, close[0] - 120, close[1] + 80], [3.4, ...close], [3.9, confirm[0] + 80, confirm[1] - 40], [4.4, ...confirm], [dur, confirm[0] + 30, confirm[1] + 30]], [1.45, 3.45, 4.45], ramp(lt, 0.5, 0.8));
   };
 });
@@ -359,18 +392,20 @@ scene(...next(3.6), (L, dur) => {
 scene(...next(4.4), (L, dur) => {
   const h = headline(L, 'Not just *code.*', null);
   const p = pills(L, [['Papers.', 0.45], ['Websites.', 1.1], ['Images and video.', 1.75], ['Chores.', 2.4]]);
-  const card = (cls, x, y, wpx, rot, t0, html) => {
+  // [x, y, width] per layout: landscape spreads them in two rows; portrait in two columns, the chore below.
+  const card = (cls, [x, y, wpx], rot, t0, html) => {
     const c = el('div', `ex ${cls}`, L, html); c.style.left = `${x}px`; c.style.top = `${y}px`; c.style.width = `${wpx}px`;
     return (lt) => { const q = ramp(lt, t0, t0 + 0.6, ease.outQuint); c.style.opacity = q * (1 - ramp(lt, dur - 0.35, dur)); c.style.transform = `translateY(${(1 - q) * 70}px) rotate(${rot * q}deg) scale(${0.94 + 0.06 * q})`; };
   };
   const img = (src) => `<img src="${A}${src}">`;
+  const pos = (landscape, portrait) => (PORTRAIT ? portrait : landscape);
   const parts = [
-    card('page', 90, 300, 300, -5, 0.5, img('ex-paper-1.png')),
-    card('page', 230, 330, 300, 3, 0.65, img('ex-paper-4.png')),
-    card('browser', 610, 285, 540, -1.5, 1.15, `<div class="chrome"><i></i><i></i><i></i><div class="url"><b>tavya.io</b></div></div>${img('ex-website.png')}`),
-    card('photo', 1230, 270, 590, 2, 1.8, img('ex-image.jpg')),
-    card('player', 1250, 715, 540, -2, 2.1, `${img('ex-film.jpg')}<div class="bar"><span class="play"></span><span class="track"><i></i></span><b>0:59</b></div>`),
-    card('chat', 640, 715, 540, 1.5, 2.45, img('ex-chore.png')),
+    card('page', pos([90, 300, 300], [48, 396, 250]), -5, 0.5, img('ex-paper-1.png')),
+    card('page', pos([230, 330, 300], [212, 416, 250]), 3, 0.65, img('ex-paper-4.png')),
+    card('browser', pos([610, 285, 540], [520, 388, 516]), -1.5, 1.15, `<div class="chrome"><i></i><i></i><i></i><div class="url"><b>tavya.io</b></div></div>${img('ex-website.png')}`),
+    card('photo', pos([1230, 270, 590], [44, 758, 480]), 2, 1.8, img('ex-image.jpg')),
+    card('player', pos([1250, 715, 540], [556, 776, 480]), -2, 2.1, `${img('ex-film.jpg')}<div class="bar"><span class="play"></span><span class="track"><i></i></span><b>0:59</b></div>`),
+    card('chat', pos([640, 715, 540], [270, 1092, 540]), 1.5, 2.45, img('ex-chore.png')),
   ];
   return (lt) => { h(lt); p(lt); parts.forEach((f) => f(lt)); };
 });
@@ -387,12 +422,18 @@ scene(...next(8.0), (L) => {
   const name = el('div', 'wordmark', L, 'tavya'); name.style.top = '262px';
   const tag = el('div', 'tagline', L, 'Just do things.'); tag.style.top = '410px';
   const cta = el('div', 'cta', L, 'tavya.io'); cta.style.top = '492px';
+  // Landscape: the quotes side by side; portrait: stacked in a column under the call to action.
+  const column = PORTRAIT ? el('div', 'quotes', L) : L;
   const quotes = QUOTES.map(([text, who], i) => {
-    const q = el('figure', 'quote', L, `<blockquote>${text.replace(/\*([^*]+)\*/g, '<em>$1</em>')}</blockquote><figcaption>— ${who}</figcaption>`);
-    q.style.left = `${120 + i * 572}px`; q.style.top = '640px';
+    const q = el('figure', 'quote', column, `<blockquote>${text.replace(/\*([^*]+)\*/g, '<em>$1</em>')}</blockquote><figcaption>— ${who}</figcaption>`);
+    if (!PORTRAIT) { q.style.left = `${120 + i * 572}px`; q.style.top = '640px'; }
     return q;
   });
   const note = el('div', 'tagline', L, 'Open to everyone, starting today.'); note.style.top = '960px'; note.style.fontSize = '26px';
+  if (PORTRAIT) {
+    mark.style.top = '64px'; name.style.top = '222px'; tag.style.top = '368px'; cta.style.top = '444px';
+    note.style.top = '1236px'; note.style.fontSize = '30px';
+  }
   return (lt) => {
     const q = ramp(lt, 0.0, 0.9, ease.outQuint);
     mark.style.opacity = q; mark.style.transform = `scale(${(0.8 + 0.2 * q) * 0.8})`;

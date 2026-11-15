@@ -161,4 +161,5 @@ jobs:
           version="$(node -p "require('./cli/package.json').version")"
           if npm view "@tavya/cli@${version}" version >/dev/null 2>&1; then echo "@tavya/cli@${version} is already on npm"; exit 0; fi
           chmod +x cli/dist/tavya.mjs
+          cp LICENSE cli/LICENSE # the package carries the licence it names
           cd cli && npm publish --access public --provenance

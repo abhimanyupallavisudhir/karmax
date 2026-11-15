@@ -14,13 +14,51 @@ import { BRAND } from '../domain/brand.js';
  * own bearer, so a tool can do exactly what that person's (or token's)
  * capabilities allow there, checked by the same route bindings as the console.
  */
-export const REMOTE_MCP_TOOLS: ReadonlySet<string> = new Set([
-  'create_task', 'list_tasks', 'get_task', 'search_tasks', 'find_task', 'list_tags', 'tag_task', 'set_task_priority',
-  'signal_task', 'stop_agent', 'message_agent', 'get_conversation', 'list_agents', 'fork_agent', 'list_events', 'reorder_queue',
-  'read_wiki', 'search_wiki', 'describe_platform', 'platform_request', 'list_connections', 'verify_resource_revision',
-  'list_world_providers', 'connect_world_provider', 'test_world_provider', 'disconnect_world_provider',
-  'get_execution_policy', 'set_execution_policy',
-]);
+/** What a client is told about a tool before it calls it (MCP tool annotations):
+ * a name for people, and whether it only reads, changes things, or can undo or
+ * remove work. Directories of MCP servers (Claude's among them) require both of
+ * every tool, and clients ask the person before a call accordingly. */
+export interface RemoteToolNote { title: string; readOnly?: true; destructive?: true }
+
+const reads = (title: string): RemoteToolNote => ({ title, readOnly: true });
+const changes = (title: string): RemoteToolNote => ({ title });
+const removes = (title: string): RemoteToolNote => ({ title, destructive: true });
+
+/** The tools `/mcp` offers: the platform's, minus those bound to a calling task. */
+export const REMOTE_MCP_TOOL_NOTES: Readonly<Record<string, RemoteToolNote>> = {
+  create_task: changes('Create a task'),
+  list_tasks: reads('List a project’s tasks'),
+  get_task: reads('Read a task'),
+  search_tasks: reads('Search tasks'),
+  find_task: reads('Find a task by its number'),
+  list_tags: reads('List tags'),
+  tag_task: changes('Tag a task'),
+  set_task_priority: changes('Set a task’s priority'),
+  // Confirm lands work and Cancel abandons it.
+  signal_task: removes('Act on a task (confirm, cancel, follow up)'),
+  stop_agent: removes('Stop an agent'),
+  message_agent: changes('Message a task’s agent'),
+  get_conversation: reads('Read a task’s conversation'),
+  list_agents: reads('List a task’s agents'),
+  fork_agent: changes('Fork an agent into a task'),
+  list_events: reads('Read a task’s events'),
+  reorder_queue: changes('Reorder a queue'),
+  read_wiki: reads('Read a wiki'),
+  search_wiki: reads('Search a wiki'),
+  describe_platform: reads('Describe the API'),
+  // Any /api route the caller is authorized for, deletions included.
+  platform_request: removes('Call the API'),
+  list_connections: reads('List connected apps'),
+  verify_resource_revision: reads('Verify a version of project data'),
+  list_world_providers: reads('List cloud computer providers'),
+  connect_world_provider: changes('Connect a cloud computer provider'),
+  test_world_provider: reads('Test a cloud computer provider'),
+  disconnect_world_provider: removes('Disconnect a cloud computer provider'),
+  get_execution_policy: reads('Read the execution policy'),
+  set_execution_policy: changes('Set the execution policy'),
+};
+
+export const REMOTE_MCP_TOOLS: ReadonlySet<string> = new Set(Object.keys(REMOTE_MCP_TOOL_NOTES));
 
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 
@@ -43,7 +81,7 @@ export async function serveRemoteMcp(req: http.IncomingMessage, res: http.Server
     return void res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32700, message: e instanceof Error ? e.message : 'Parse error' }, id: null }));
   }
   const server = createPlatformMcpServer(httpOps(options.apiBaseUrl, options.bearer, options.internalHeaders),
-    { tools: REMOTE_MCP_TOOLS, name: BRAND });
+    { tools: REMOTE_MCP_TOOLS, notes: REMOTE_MCP_TOOL_NOTES, name: BRAND });
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   res.once('close', () => { void transport.close(); void server.close(); });
   await server.connect(transport);
