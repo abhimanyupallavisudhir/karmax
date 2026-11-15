@@ -10727,12 +10727,48 @@ export class Store {
     return r ? JSON.parse(r.json) : undefined;
   }
 
+  /** A delegation's row whatever its state (revoked, expired): why it lapsed. */
+  async humanDelegationRow(id: string): Promise<{ record: Record<string, unknown>; revokedAt?: number } | undefined> {
+    const r = (await this.db.prepare('SELECT json, revokedAt FROM human_delegations WHERE id=?').get(id)) as any;
+    return r ? { record: JSON.parse(r.json), revokedAt: r.revokedAt == null ? undefined : Number(r.revokedAt) } : undefined;
+  }
+
   async revokeHumanDelegation(id: string): Promise<void> {
     return this.db.transaction(async () => {
 
+    const row = (await this.db.prepare('SELECT json FROM human_delegations WHERE id=? AND revokedAt IS NULL').get(id)) as any;
     (await this.db.prepare('UPDATE human_delegations SET revokedAt=? WHERE id=?').run(Date.now(), id));
+    if (row) (await this.handDerivedDelegationsUp(new Map([[id, JSON.parse(row.json) as Record<string, unknown>]])));
   
     });
+  }
+
+  /**
+   * The delegations derived from ones just revoked, and not revoked with them,
+   * are handed to their nearest ancestor that was not, or stand on their own.
+   * Revocation is by scope (a task, project, organization or person), and a
+   * delegation derived from another lies within it, so one the scope does not
+   * reach must not lapse because its source did: a run of a deleted series, an
+   * attempt or sub-task whose source task was deleted (task_mwhwdr1i47e5d65f20).
+   * It keeps the bounds it was issued within, its expiry among them.
+   */
+  private async handDerivedDelegationsUp(revoked: Map<string, Record<string, unknown>>): Promise<void> {
+    if (!revoked.size) return;
+    const reparent = this.db.prepare('UPDATE human_delegations SET json=? WHERE id=? AND revokedAt IS NULL');
+    for (const row of (await this.db.prepare('SELECT id, json FROM human_delegations WHERE revokedAt IS NULL').all()) as any[]) {
+      try {
+        const record = JSON.parse(row.json) as Record<string, unknown>;
+        let parent = record.parentDelegationId as string | undefined;
+        if (!parent || !revoked.has(parent)) continue;
+        const seen = new Set<string>();
+        while (parent && revoked.has(parent) && !seen.has(parent)) {
+          seen.add(parent);
+          parent = revoked.get(parent)!.parentDelegationId as string | undefined;
+        }
+        const { parentDelegationId: _gone, ...rest } = record;
+        (await reparent.run(JSON.stringify(parent ? { ...rest, parentDelegationId: parent } : rest), row.id));
+      } catch { /* malformed historical state is unusable, but must not block revocation */ }
+    }
   }
 
   async revokeHumanDelegationsForTask(taskId: string): Promise<number> {
@@ -10749,6 +10785,7 @@ export class Store {
     const update = this.db.prepare('UPDATE human_delegations SET revokedAt=? WHERE id=? AND revokedAt IS NULL');
     const narrow = this.db.prepare('UPDATE human_delegations SET json=? WHERE id=? AND revokedAt IS NULL');
     let revoked = 0;
+    const gone = new Map<string, Record<string, unknown>>();
     for (const row of (await this.db.prepare('SELECT id, json FROM human_delegations WHERE revokedAt IS NULL').all()) as any[]) {
       try {
         const record = JSON.parse(row.json) as Record<string, unknown>;
@@ -10767,9 +10804,10 @@ export class Store {
             (await narrow.run(JSON.stringify({ ...record, projectIds: others }), row.id));
           else revoke = true;
         }
-        if (revoke) revoked += Number((await update.run(Date.now(), row.id)).changes);
+        if (revoke && Number((await update.run(Date.now(), row.id)).changes)) { revoked++; gone.set(String(row.id), record); }
       } catch { /* malformed historical state is unusable, but must not block cleanup */ }
     }
+    (await this.handDerivedDelegationsUp(gone));
     return revoked;
   
     });
@@ -10861,6 +10899,21 @@ export class Store {
   async purgeHumanDelegations(now = Date.now()): Promise<number> {
     return this.db.transaction(async () => {
 
+    // Before this sweep forgets them: a live delegation whose source was
+    // revoked (or already purged) before revocation handed what was derived
+    // from it up is handed up now (handDerivedDelegationsUp).
+    const rows = (await this.db.prepare('SELECT id, json, revokedAt FROM human_delegations').all()) as any[];
+    const records = new Map<string, { record: Record<string, unknown>; revoked: boolean }>();
+    for (const row of rows) {
+      try { records.set(String(row.id), { record: JSON.parse(row.json), revoked: row.revokedAt != null }); } catch { /* unusable */ }
+    }
+    const lapsed = new Map<string, Record<string, unknown>>();
+    for (const [id, { record, revoked }] of records) if (revoked) lapsed.set(id, record);
+    for (const { record, revoked } of records.values()) {
+      const parent = record.parentDelegationId as string | undefined;
+      if (!revoked && parent && !records.has(parent)) lapsed.set(parent, {});
+    }
+    (await this.handDerivedDelegationsUp(lapsed));
     return Number((await this.db.prepare('DELETE FROM human_delegations WHERE expiresAt<=? OR revokedAt IS NOT NULL').run(now)).changes);
   
     });
