@@ -4805,14 +4805,33 @@ function interReady(capMs = 1000) {
   ]);
 }
 
+// Web analytics of the public site (wiki features/site-analytics): each public
+// page, sign-in or create-account page drawn — in-place navigation too — is
+// one view, counted by the gateway. No cookie, no storage, no third party.
+let siteViewFrom = '';
+function siteView(render) {
+  const path = location.pathname;
+  if (path === '/' || path === '/login' || path === '/signup' || PUBLIC_PATH.test(path)) {
+    // The page before, for a page swapped in place; else whatever linked here.
+    const body = JSON.stringify({ path: `${path}${location.search}`, referrer: siteViewFrom || document.referrer });
+    try {
+      if (!navigator.sendBeacon?.('/api/site-analytics/view', body))
+        fetch('/api/site-analytics/view', { method: 'POST', body, keepalive: true }).catch(() => {});
+    } catch { /* counting never stops a page */ }
+    siteViewFrom = location.href;
+  }
+  return render();
+}
+
 async function boot() {
   // Public pages need no session, and must not read one: that provisions a
   // personal workspace and consumes the one-time git-onboarding flag. The
   // emailed password-reset link lands signed out, so it is one of them.
   const legalSlug = location.pathname.match(/^\/legal\/([^/]+)$/)?.[1];
-  const docSlug = location.pathname.match(/^\/docs(?:\/([^/]+))?\/?$/);
+  const sitePath = location.pathname.replace(/\/$/, '');
+  const sitePage = /^\/(docs|compare)(\/[^/]+)?$/.test(sitePath) || sitePages().some((page) => page.path === sitePath);
   const publicPage = legalSlug ? () => renderLegalPage(legalSlug)
-    : docSlug ? () => renderDocsPage(docSlug[1])
+    : sitePage ? () => renderSitePage(sitePath)
     : { '/legal': renderLegalIndex, '/pricing': renderPricing,
       '/reset-password': () => renderResetPassword(new URLSearchParams(location.search).get('token') || '') }[location.pathname];
   // Independent first reads go together; each used to wait for the one before (RQ-9).
@@ -4826,7 +4845,7 @@ async function boot() {
     interReady(),
   ]);
   applyDocumentBrand();
-  if (publicPage) return publicPage();
+  if (publicPage) return siteView(publicPage);
   // Better Auth redirects the confirmation link back here with ?verified=1 after
   // marking the address verified. Note it, strip it from the URL, and surface it
   // (a toast in-app, or a line on the sign-in card if the link was opened while
@@ -4864,9 +4883,8 @@ async function boot() {
     // The public root explains the product before asking for an account. Auth
     // callbacks, invitations and explicit auth routes still land directly on
     // the form they need, so a person following a link never has to hunt.
-    if (S.pendingInvite || S.justVerified || S.signInError || ['/login', '/mcp-callback', '/device', '/oauth/consent'].includes(location.pathname)) return renderLogin();
-    if (location.pathname === '/signup') return renderSignup();
-    return renderLanding();
+    return siteView(S.pendingInvite || S.justVerified || S.signInError || ['/login', '/mcp-callback', '/device', '/oauth/consent'].includes(location.pathname)
+      ? renderLogin : location.pathname === '/signup' ? renderSignup : renderLanding);
   }
   // Successful password/social auth returns to the public auth URL it started
   // from. Those URLs are not organizations; canonicalise before app routing.
@@ -18564,8 +18582,8 @@ const insFmtValue = (value, unit) => unit === 'h' ? insDuration(value * 3_600_00
   : unit === 'micros' ? insMoney(value) : unit === 'usd' ? insMoney(value * 1e6) : unit === 'bytes' ? insBytes(value) : String(Math.round(value));
 const insFmtTick = (value, unit) => unit === 'micros' ? insMoneyTick(value) : unit === 'usd' ? insMoneyTick(value * 1e6) : insFmtValue(value, unit);
 
-function insightChartSvg(data, lens, width) {
-  const series = insightSeries(data, lens);
+// `series` defaults to the lens's; another page's chart passes its own (with a `title`).
+function insightChartSvg(data, lens, width, series = insightSeries(data, lens)) {
   const n = data.daily.length;
   const H = 188, padL = 34, padR = 6, padT = 10, padB = 22;
   const plotW = Math.max(40, width - padL - padR), plotH = H - padT - padB;
@@ -18611,7 +18629,7 @@ function insightChartSvg(data, lens, width) {
       <text x="${padL + plotW}" y="${y(limit.value) - 4}" text-anchor="end">${esc(limitLabel)}</text></g>`
     : `<g class="ins-limit off"><title>${esc(limit.tip)}</title><text x="${padL + plotW}" y="${padT + 2}" text-anchor="end">${esc(limitLabel)} ↑</text></g>`;
   return { series, band, padL, x, y, H, limit, svg: `<svg class="ins-svg" width="${width}" height="${H}" viewBox="0 0 ${width} ${H}" role="img"
-    aria-label="${esc(`${INSIGHT_LENSES.find((l) => l.key === lens)?.label} per day, last ${n} days`)}">
+    aria-label="${esc(`${series.title || INSIGHT_LENSES.find((l) => l.key === lens)?.label} per day, last ${n} days`)}">
     ${grid}${bars}${line}${limitMark}${xLabels}${empty}<rect class="ins-hover" x="0" y="${padT}" width="${barW + 8}" height="${plotH}" rx="4" visibility="hidden"/>
     ${series.line ? `<circle class="ins-hover-dot" r="4" fill="${series.line.color}" visibility="hidden"/>` : ''}</svg>` };
 }
@@ -18644,6 +18662,11 @@ function drawInsightChart(box, data) {
     S.insightsSplit = { ...S.insightsSplit, [lens]: button.dataset.insSplit };
     drawInsightChart(box, S.insightsData);
   }));
+  drawInsightPlot(plot, data, chart, width);
+}
+
+// The chart in its plot, with the per-day tooltip on hover or tap.
+function drawInsightPlot(plot, data, chart, width) {
   plot.innerHTML = `${chart.svg}<div class="ins-tip" hidden></div>`;
   const svg = plot.querySelector('svg'), tip = plot.querySelector('.ins-tip');
   const hover = svg.querySelector('.ins-hover'), dot = svg.querySelector('.ins-hover-dot');
@@ -26713,7 +26736,7 @@ function installationView() {
   return `<div class="organization-settings installation-settings"><div class="settings-header"><h1 class="page-title">Installation ${policyTip(`Settings for every organization and the machine running ${siteName()}. Only operators see them.`)}</h1></div>
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections">
-      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-errors">Error reports</a><a href="#installation-limits">Service limits</a><a href="#installation-compute">Managed compute</a><a href="#installation-capacity">Host capacity</a>
+      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-traffic">Site traffic</a><a href="#installation-errors">Error reports</a><a href="#installation-limits">Service limits</a><a href="#installation-compute">Managed compute</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
       <a href="#installation-access">Phone access</a>${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}
     </nav><div class="settings-content">
@@ -26721,6 +26744,8 @@ function installationView() {
       <div class="settings-section-title" id="installation-health"><div>Health ${policyTip(`Load, agent turns and every process ${siteName()} runs. Memory and disk are under Service limits.`)}</div></div>
       <div id="host-diag"><div class="card"><span class="task-sub">Loading…</span></div></div>
       <div id="proc-panel" style="margin-top:12px"></div>
+      <div class="settings-section-title" id="installation-traffic"><div>Site traffic ${policyTip(`Visits to the public pages and sign-in, counted by ${siteName()} itself: no cookies, no IP addresses kept. Days are UTC.`)}</div></div>
+      <div class="card site-traffic" id="site-traffic-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-errors"><div>Error reports ${policyTip(`Unexpected errors of ${siteName()}’s own start a task in this project that finds the cause and fixes it. One runs at a time; it hears of further errors while it works.`)}</div></div>
       <div class="card" id="error-reports-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-limits"><div>Service limits ${policyTip(`Shared accounts and this server against their plans`)}</div></div>
@@ -27197,6 +27222,107 @@ async function hydratePlanAndBilling(organizationId) {
   });
 }
 
+// ── Site traffic (Installation; wiki features/site-analytics) ────────────────
+// Who visits the public site, from where, what they read, how many reach
+// sign-up, and which crawlers fetch it (GET /api/settings/site-analytics).
+const SITE_TRAFFIC_DAYS = [7, 30, 90];
+const SITE_FUNNEL = [
+  ['visitors', 'Visitors', 'People, each counted once a day'],
+  ['signups', 'Opened sign-up', 'Visitors who opened Sign in or Create account'],
+  ['accounts', 'Accounts', 'Accounts created'],
+  ['firstTasks', 'First task', 'Organizations that started their first task'],
+  ['firstConfirmed', 'First task done', 'Organizations whose first task was confirmed'],
+];
+const trafficInt = (n) => Number(n || 0).toLocaleString();
+function siteTrafficRange(days) {
+  const day = (ms) => new Date(ms).toISOString().slice(0, 10);
+  return { from: day(Date.now() - (days - 1) * 86_400_000), to: day(Date.now()) };
+}
+// The Insights chart, with visitors as bars and those who opened sign-up as a line.
+function siteTrafficSeries(data) {
+  return { title: 'Visitors', unit: 'people',
+    bars: [{ label: 'Visitors', color: 'var(--viz-1)', values: data.daily.map((day) => day.visitors) }],
+    line: { label: 'Opened sign-up', color: 'var(--viz-2)', values: data.daily.map((day) => day.signups) },
+    extra: (i) => [{ label: 'Page views', value: trafficInt(data.daily[i].views) }, { label: 'Accounts', value: trafficInt(data.daily[i].accounts) }] };
+}
+function siteTrafficMarkup(data, days) {
+  const t = data.totals;
+  const seg = `<div class="ins-seg" role="radiogroup" aria-label="Period">${SITE_TRAFFIC_DAYS.map((d) =>
+    `<button type="button" role="radio" aria-checked="${d === days}" class="${d === days ? 'on' : ''}" data-traffic-days="${d}">${d}d</button>`).join('')}</div>`;
+  if (!t.visitors && !t.views && !t.crawls && !t.accounts)
+    return `<div class="traffic-head"><div class="queue-empty">Nothing counted in the last ${days} days</div>${seg}</div>`;
+  const stat = ([key, label, tip], value) => `<div class="traffic-stat" title="${esc(tip)}" data-stat="${key}"><span>${esc(label)}</span><b>${trafficInt(value)}</b></div>`;
+  const share = (n, of) => `<span class="ins-share"><i style="width:${of ? Math.max(2, Math.round((n / of) * 100)) : 0}%;background:var(--viz-1)"></i></span>`;
+  const name = (text, title = text) => `<span class="traffic-label" title="${esc(title)}">${esc(text)}</span>`;
+  const more = (rest, cols, line) => rest.length
+    ? `<tr class="traffic-more"><td colspan="${cols}" title="${esc(rest.map(line).join('\n'))}">+${rest.length} more</td></tr>` : '';
+  const table = (heads, rows) => `<table class="ins-table traffic-table"><thead><tr>${heads.map(([label, tip, num], i) =>
+    // The section's title already names the first column.
+    `<th scope="col"${num ? ' class="num"' : ''}${tip ? ` title="${esc(tip)}"` : ''}>${i ? esc(label) : `<span class="sr-only">${esc(label)}</span>`}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table>`;
+  const part = (title, tip, body, count = '') => `<section class="traffic-part"><div class="ins-card-h"><span>${esc(title)} ${policyTip(tip)}</span>${count}</div>${body}</section>`;
+
+  const hostsOf = (group) => data.sources.hosts.filter((host) => host.group === group && host.source);
+  const sources = data.sources.groups.map((group) => {
+    const hosts = hostsOf(group.group);
+    return `<tr class="traffic-group"><td class="ins-name">${name(group.label)}${share(group.visitors, t.visitors)}</td><td class="num">${trafficInt(group.visitors)}</td></tr>
+      ${hosts.slice(0, 3).map((host) => `<tr class="traffic-sub"><td class="ins-name">${name(host.source)}</td><td class="num">${trafficInt(host.visitors)}</td></tr>`).join('')}
+      ${more(hosts.slice(3), 2, (host) => `${host.source}: ${host.visitors}`)}`;
+  }).join('');
+  const pages = data.pages.slice(0, 8).map((page) => `<tr><td class="ins-name">${name(page.path)}${share(page.views, data.pages[0].views)}</td>
+    <td class="num">${trafficInt(page.views)}</td><td class="num">${trafficInt(page.entries)}</td></tr>`).join('')
+    + more(data.pages.slice(8), 3, (page) => `${page.path}: ${page.views}`);
+  const crawlers = data.crawlers.slice(0, 8).map((crawler) => `<tr><td class="ins-name">${name(crawler.name,
+    crawler.pages.map((page) => `${page.path}: ${page.fetches}`).join('\n'))}${share(crawler.fetches, data.crawlers[0].fetches)}</td>
+    <td class="num">${trafficInt(crawler.fetches)}</td></tr>`).join('') + more(data.crawlers.slice(8), 2, (crawler) => `${crawler.name}: ${crawler.fetches}`);
+  const counts = Object.fromEntries(data.funnel.map((step) => [step.step, step.count]));
+  const funnel = SITE_FUNNEL.map(([key, label, tip]) => `<tr data-step="${key}"><td class="ins-name">${name(label, tip)}${share(counts[key] || 0, t.visitors)}</td>
+    <td class="num">${trafficInt(counts[key])}</td><td class="num">${key === 'visitors' || !t.visitors ? '' : `${Math.round(((counts[key] || 0) / t.visitors) * 1000) / 10}%`}</td></tr>`).join('');
+  const none = (text) => `<div class="ins-empty">${text}</div>`;
+  const stats = [SITE_FUNNEL[0], ['views', 'Page views', 'Public pages people read'], SITE_FUNNEL[1], SITE_FUNNEL[2]];
+  return `<div class="traffic-head"><div class="traffic-stats">${stats.map((entry) => stat(entry, t[entry[0]])).join('')}</div>${seg}</div>
+    <div class="traffic-chart"><div class="traffic-legend"></div><div class="ins-plot"></div></div>
+    <div class="traffic-grid">
+      ${part('Sources', 'Where each visitor’s first page of the day came from: the linking site, or the link’s utm_source or ref tag',
+        sources ? table([['Source'], ['Visitors', '', true]], sources) : none('No visitors yet'))}
+      ${part('Pages', 'Views of each page; Landed: visitors whose first page it was', pages
+        ? table([['Page'], ['Views', '', true], ['Landed', 'Visitors whose first page of the day it was', true]], pages) : none('No page views yet'))}
+      ${part('Crawlers', 'Search engines and AI assistants fetching public pages, Markdown, llms.txt, robots.txt and the sitemap. Hover a name for its pages.',
+        crawlers ? table([['Crawler'], ['Fetches', '', true]], crawlers) : none('No crawler yet'), `<b class="ins-count">${trafficInt(t.crawls)}</b>`)}
+      ${part('Funnel', 'Each step is counted on its own day. A sign-up is never linked to the visit it came from.',
+        table([['Step'], ['People', '', true], ['%', 'Of visitors', true]], funnel))}
+    </div>`;
+}
+async function wireSiteTrafficCard(days = S.siteTrafficDays || 30) {
+  const card = $('#site-traffic-card');
+  if (!card) return;
+  S.siteTrafficDays = days;
+  let data;
+  try {
+    const { from, to } = siteTrafficRange(days);
+    data = await api(`/api/settings/site-analytics?from=${from}&to=${to}`);
+  } catch (error) { if (card.isConnected) paneError(card, error, () => wireSiteTrafficCard(days)); return; }
+  if (!card.isConnected || S.siteTrafficDays !== days) return;
+  // An installation from before Site traffic answers something else: nothing counted.
+  if (!data?.totals || !Array.isArray(data.daily)) data = { totals: {}, daily: [] };
+  card.innerHTML = siteTrafficMarkup(data, days);
+  card.querySelectorAll('[data-traffic-days]').forEach((button) =>
+    button.addEventListener('click', () => wireSiteTrafficCard(Number(button.dataset.trafficDays))));
+  const plot = card.querySelector('.ins-plot');
+  if (!plot) return;
+  // Drawn in real pixels, so it is redrawn at a new width.
+  const draw = () => {
+    const width = Math.floor(plot.clientWidth);
+    if (!width || String(width) === plot.dataset.width) return;
+    plot.dataset.width = String(width);
+    const chart = insightChartSvg(data, null, width, siteTrafficSeries(data));
+    card.querySelector('.traffic-legend').innerHTML = insightLegendHtml(chart.series);
+    drawInsightPlot(plot, data, chart, width);
+  };
+  draw();
+  const observer = new ResizeObserver(() => (plot.isConnected ? draw() : observer.disconnect()));
+  observer.observe(plot);
+}
+
 // ── Error reports (Installation; wiki features/error-reports) ────────────────
 // Which project unexpected errors go to, and the task there that fixes them.
 function errorReportsMarkup(settings) {
@@ -27229,6 +27355,7 @@ async function wireErrorReportsCard() {
 
 function wireInstallationSettings() {
   wireInstallationUsers();
+  wireSiteTrafficCard();
   wireErrorReportsCard();
   wireSettingsNavigation();
   wireAppearanceCard();
@@ -29061,16 +29188,12 @@ function legalFooter() {
 }
 
 // ── public docs ──────────────────────────────────────────────────────────────
-// A few pages of Markdown served beside the console (web/docs/<slug>.md), with
-// Pricing and the policies, under one sidebar. `{{origin}}` in a page is this
-// server, so the commands it shows work on a self-hosted installation too.
-const DOC_PAGES = [
-  { slug: 'getting-started', path: '/docs', title: 'Getting started' },
-  { slug: 'how-it-works', path: '/docs/how-it-works', title: 'How it works' },
-  { slug: 'computers', path: '/docs/computers', title: 'Cloud computers' },
-  { slug: 'chat-bots', path: '/docs/chat-bots', title: 'Chat bots' },
-  { slug: 'cli', path: '/docs/cli', title: 'tavya CLI' },
-];
+// Pages of Markdown served beside the console (web/site.js lists them: Docs and
+// guides, comparisons, About, the changelog), with Pricing and the policies,
+// under one sidebar. `{{origin}}` in a page is this server, so the commands it
+// shows work on a self-hosted installation too.
+const sitePages = () => globalThis.KarmaxSite?.pages || [];
+const PUBLIC_PATH = /^\/(docs|pricing|legal|compare|about|changelog)(\/|$)/;
 
 function docsAnchor(text) { return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''); }
 
@@ -29102,23 +29225,28 @@ function renderPublicShell(current, content) {
   const link = (href, label) => `<a href="${href}" data-public${href === current ? ' aria-current="page"' : ''}>${esc(label)}</a>`;
   $('#app').innerHTML = `<div class="legal-shell docs-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>${siteNameMarkup()}</span></a><a href="/">Open ${siteNameMarkup()}</a></header>
     <div class="docs-layout"><nav class="docs-nav" aria-label="Documentation">
-      <div class="docs-nav-group"><span>Docs</span>${DOC_PAGES.map((page) => link(page.path, page.title)).join('')}</div>
+      ${['Docs', 'Guides'].map((group) => `<div class="docs-nav-group"><span>${group}</span>${sitePages().filter((page) => page.group === group).map((page) => link(page.path, page.label)).join('')}</div>`).join('')}
+      <div class="docs-nav-group">${link('/compare', 'Compare')}${current.startsWith('/compare') ? `<div class="docs-nav-sub">${sitePages()
+        .filter((page) => page.path.startsWith('/compare/')).map((page) => link(page.path, page.label)).join('')}</div>` : ''}</div>
       <div class="docs-nav-group">${link('/pricing', 'Pricing')}</div>
       <div class="docs-nav-group">${link('/legal', 'Policies')}<div class="docs-nav-sub">${(S.launch?.policies || [])
         .map((policy) => link(`/legal/${policy.slug}`, policy.title)).join('')}</div></div>
+      <div class="docs-nav-group">${sitePages().filter((page) => page.group === 'Site').map((page) => link(page.path, page.label)).join('')}</div>
     </nav><div class="docs-content">${content}</div></div>${legalFooter()}</div>`;
   if (location.hash) document.getElementById(decodeURIComponent(location.hash.slice(1)))?.scrollIntoView();
   else window.scrollTo(0, 0);
   window.onpopstate = () => boot();
 }
 
-async function renderDocsPage(slug = 'getting-started') {
-  const page = DOC_PAGES.find((candidate) => candidate.slug === slug);
-  if (!page) { history.replaceState({}, '', '/docs'); return renderDocsPage(); }
+async function renderSitePage(path = '/docs') {
+  const page = sitePages().find((candidate) => candidate.path === path);
+  // A page that does not exist is its section's front page.
+  if (!page) { const front = path.startsWith('/compare') && path !== '/compare' ? '/compare' : '/docs'; history.replaceState({}, '', front); return renderSitePage(front); }
   document.title = `${page.title} · ${siteName()}`;
-  const response = await feedbackFetch(`/docs/${page.slug}.md`).catch(() => null);
+  const response = await feedbackFetch(`/${page.file}`).catch(() => null);
   if (location.pathname.replace(/\/$/, '') !== page.path) return; // navigated on meanwhile
-  const source = response?.ok ? await response.text() : `# ${page.title}\n\nThis page could not be loaded. Reload to try again.`;
+  const source = (response?.ok ? await response.text() : `# ${page.title}\n\nThis page could not be loaded. Reload to try again.`)
+    .replaceAll('{{comparison}}', () => globalThis.KarmaxSite.comparisonTable());
   const template = document.createElement('template');
   template.innerHTML = renderMarkdown(source.replaceAll('{{origin}}', location.origin));
   // Every section is linkable (the console points at them), links between
@@ -29128,7 +29256,7 @@ async function renderDocsPage(slug = 'getting-started') {
   for (const anchor of template.content.querySelectorAll('a[href^="/"], a[href^="#"]')) {
     anchor.removeAttribute('target');
     anchor.removeAttribute('rel');
-    if (/^\/(docs|pricing|legal)\b/.test(anchor.getAttribute('href'))) anchor.dataset.public = '';
+    if (PUBLIC_PATH.test(anchor.getAttribute('href'))) anchor.dataset.public = '';
   }
   for (const table of template.content.querySelectorAll('table')) {
     const wrap = document.createElement('div');
@@ -29239,39 +29367,8 @@ function openPublicAuth(path, render) {
 // Docs and Pricing: the launch film, then how a task goes, then what surrounds it, each pictured by a screenshot of the console in the
 // visitor's look (web/media/landing/<name>-light|dark.webp, design/landing-v3).
 const LANDING_FILM = { src: '/media/tavya-launch.mp4', poster: '/media/tavya-launch-poster.jpg', length: '1:02' };
-// How a task goes. [still, title, line, picture's description]
-const LANDING_STEPS = [
-  ['write', 'Write it down', 'In plain words, in any project.', 'The new-task form with a prompt written in plain words'],
-  ['work', 'An agent does it', 'On its own computer: your repos, a terminal, a browser.', 'A task’s agent at work: the steps it has taken so far'],
-  ['review', 'Review and approve', 'Or leave the review to an agent.', 'A task in review, with the video its agent attached'],
-];
-// The autonomous company: what lets agents run a project. [still, title, line, picture's description]
-const LANDING_AUTONOMY = [
-  ['autonomous', 'Agents create, manage and approve tasks', 'Make a project fully autonomous, or hand any review to an agent.', 'The new-project form with “Fully autonomous project” switched on'],
-  ['automations', 'Work starts itself', 'On a schedule, an event, or when another task is done.', 'Repeatable tasks: fixing errors as they happen, dependency updates, wiki upkeep, a nightly dream'],
-];
-// The automations card's list, drawn with the console's parts: [title, when it runs].
-const LANDING_AUTOMATIONS = [
-  ['Fix errors in deployment', 'when the server reports an error'],
-  ['Update dependencies', 'when a dependency releases'],
-  ['Write the release notes', 'after the release task lands'],
-  ['Maintain the project wiki', 'every Monday'],
-  ['Dream', 'every night at 3:00'],
-];
-// What else every task gets. [still, title, line, picture's description]
-const LANDING_FEATURES = [
-  ['fan-out', 'Big jobs fan out', 'A task splits into sub-tasks, each with its own agent.', 'A task’s sub-tasks, each done by its own agent'],
-  ['vault', 'Accounts, keys and a card', 'Agents sign up, sign in and pay, only with what you allow.', 'The vault: logins and keys agents may use'],
-  ['models', 'Any model, your subscription', 'Claude Code, Codex or OpenCode, on your plan or an API key.', 'The model picker'],
-  ['errand', 'Not just code', 'Papers. Websites. Images and video. Chores.', 'An agent asking to use a saved login before booking a flight'],
-];
-
-// What people say (the launch film's end card says the same). [quote (*…* emphasised), who]
-const LANDING_QUOTES = [
-  ['Every man a CEO, and no one has a moat.', 'N.H.'],
-  ['tavya is such an addictive toy… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
-  ['I can really just do *anything* now.', 'R.S.'],
-];
+// Its words (how a task goes, the autonomous company, what every task gets, how it
+// compares, what people say, the questions) are web/site.js's, which the gateway reads too.
 
 // Each screenshot's size in CSS pixels (the files are 2×), so it shows at the console's own scale.
 const LANDING_SHOT_SIZES = { write: [756, 583], work: [652, 470], review: [652, 419], 'fan-out': [305, 520], vault: [960, 420],
@@ -29279,14 +29376,35 @@ const LANDING_SHOT_SIZES = { write: [756, 583], work: [652, 470], review: [652, 
 
 function renderLanding() {
   const site = siteNameMarkup();
+  const { landing, compare, source } = globalThis.KarmaxSite;
+  const [stepsTitle, steps] = landing.steps;
+  const [autonomyTitle, autonomyLine, autonomy] = landing.autonomy;
+  const [featuresTitle, features] = landing.features;
+  // A heading whose last words are the point: "Build the *autonomous company*".
+  const pointed = (title, words) => esc(title).replace(new RegExp(`${words}$`), `<em>${words}</em>`);
   // A screenshot in the visitor's look: the light and dark one, CSS shows one.
   const shot = (name, alt) => {
     const [width, height] = LANDING_SHOT_SIZES[name];
     return ['light', 'dark'].map((look) => `<img class="lp-${look}" src="/media/landing/${name}-${look}.webp" alt="${look === 'light' ? esc(alt) : ''}"${look === 'dark' ? ' aria-hidden="true"' : ''} width="${width}" height="${height}" style="--w:${width}" loading="lazy" decoding="async">`).join('');
   };
-  const automations = () => `<ul class="lp-automations">${LANDING_AUTOMATIONS.map(([title, when]) => `<li><b>${esc(title)}</b><i>Repeatable</i><span>${esc(when)}</span></li>`).join('')}</ul>`;
+  const automations = () => `<ul class="lp-automations">${landing.automations.map(([title, when]) => `<li><b>${esc(title)}</b><i>Repeatable</i><span>${esc(when)}</span></li>`).join('')}</ul>`;
+  // How it compares: a tick, a dash, or a few words where it is neither.
+  const compared = (value) => (value === 'yes' ? '<td class="yes"><span aria-label="Yes">✓</span></td>'
+    : !value || value === 'no' ? '<td class="no"><span aria-label="No">—</span></td>' : `<td class="part">${esc(value)}</td>`);
+  const comparison = compare.rows.length ? `<section class="lp-compare" aria-labelledby="lp-compare-title">
+        <h2 id="lp-compare-title">${esc(compare.title)}</h2>
+        <div class="lp-compare-scroll" tabindex="0" role="region" aria-labelledby="lp-compare-title"><table>
+          <thead><tr><td></td>${compare.products.map((product) => `<th scope="col"${product.path ? '' : ' class="us"'}>${product.path ? `<a href="${esc(product.path)}" data-public>${esc(product.name)}</a>` : site}</th>`).join('')}</tr></thead>
+          <tbody>${compare.rows.map(([label, values]) => `<tr><th scope="row">${esc(label)}</th>${compare.products.map((product) => compared(values[product.id])).join('')}</tr>`).join('')}</tbody>
+        </table></div>
+        <p class="lp-compare-foot">${esc(compare.asOf)} · <a href="/compare" data-public>The comparison in full</a></p>
+      </section>` : '';
+  // The questions, with this installation's numbers; an answer's links to public pages stay in this tab.
+  const trial = S.launch?.trial && (S.launch.managedCompute || []).length ? { trialCredit: formatCatalogPrice(Number(S.launch.trial.creditMicros) / 10_000), trialDays: String(S.launch.trial.days) } : {};
+  const answer = (markdown) => renderMarkdown(markdown).replace(/<a href="(\/[^"]*)"[^>]*>/g, (_, href) => `<a href="${href}"${PUBLIC_PATH.test(href) ? ' data-public' : ''}>`);
+  const answers = globalThis.KarmaxSite.answers(trial);
   const play = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 4.6v10.8a.6.6 0 0 0 .9.5l8.6-5.4a.6.6 0 0 0 0-1L7.4 4.1a.6.6 0 0 0-.9.5z"/></svg>';
-  const github = 'https://github.com/abhimanyupallavisudhir/krmax-issues/issues';
+  installPublicLinks();
   document.body.classList.add('landing-active');
   document.title = `${siteName()} — do anything with agents`;
   $('#app').innerHTML = `<div class="landing-page">
@@ -29296,7 +29414,7 @@ function renderLanding() {
       <nav class="landing-nav-actions" aria-label="Site">
         <a href="/docs" class="landing-text-link">Docs</a>
         <a href="/pricing" class="landing-text-link">Pricing</a>
-        <a href="${github}" class="landing-text-link">GitHub</a>
+        <a href="${source}" class="landing-text-link">GitHub</a>
         <a class="landing-sign-in" id="landing-sign-in" href="/login">Sign in</a>
         <a class="landing-start" id="landing-start" href="/signup">Get started</a>
       </nav>
@@ -29317,32 +29435,41 @@ function renderLanding() {
       </section>
 
       <section class="lp-steps" aria-labelledby="lp-steps-title">
-        <h2 id="lp-steps-title">How a task goes</h2>
-        <ol>${LANDING_STEPS.map(([name, title, line, alt]) => `
+        <h2 id="lp-steps-title">${esc(stepsTitle)}</h2>
+        <ol>${steps.map(([name, title, line, alt]) => `
           <li class="lp-step"><h3>${esc(title)}</h3><p>${esc(line)}</p><figure class="lp-shot">${shot(name, alt)}</figure></li>`).join('')}
         </ol>
       </section>
 
       <section class="lp-auto" aria-labelledby="lp-auto-title">
-        <h2 id="lp-auto-title">Build the <em>autonomous company</em></h2>
-        <p class="lp-auto-lede">Let agents run the whole project.</p>
-        <div class="lp-auto-grid">${LANDING_AUTONOMY.map(([name, title, line, alt]) => `
+        <h2 id="lp-auto-title">${pointed(autonomyTitle, 'autonomous company')}</h2>
+        <p class="lp-auto-lede">${esc(autonomyLine)}</p>
+        <div class="lp-auto-grid">${autonomy.map(([name, title, line, alt]) => `
           <article class="lp-auto-card"><h3>${esc(title)}</h3><p>${esc(line)}</p><figure class="lp-shot"${name === 'automations' ? ` aria-label="${esc(alt)}"` : ''}>${name === 'automations' ? automations() : shot(name, alt)}</figure></article>`).join('')}
         </div>
       </section>
 
       <section class="lp-features" aria-labelledby="lp-features-title">
-        <h2 id="lp-features-title">Everything a task needs</h2>
-        <div class="lp-grid">${LANDING_FEATURES.map(([name, title, line, alt]) => `
+        <h2 id="lp-features-title">${esc(featuresTitle)}</h2>
+        <div class="lp-grid">${features.map(([name, title, line, alt]) => `
           <article class="lp-feature"><h3>${esc(title)}</h3>
             <p>${esc(line)}</p>
             <figure class="lp-shot"${name === 'fan-out' ? ' data-anchor="center"' : ''}>${shot(name, alt)}</figure></article>`).join('')}
         </div>
       </section>
 
-      <section class="lp-quotes" aria-label="What people say">${LANDING_QUOTES.map(([quote, who]) => `
+      ${comparison}
+
+      <section class="lp-quotes" aria-label="What people say">${landing.quotes.map(([quote, who]) => `
         <figure class="lp-quote"><blockquote>${esc(quote).replace(/\*([^*]+)\*/g, '<em>$1</em>')}</blockquote><figcaption>${esc(who)}</figcaption></figure>`).join('')}
       </section>
+
+      ${answers.length ? `<section class="lp-answers" aria-labelledby="lp-answers-title">
+        <h2 id="lp-answers-title">${esc(landing.answers[0])}</h2>
+        <div class="lp-answer-list">${answers.map(([question, text]) => `
+          <details class="lp-answer"><summary>${esc(question)}</summary>${answer(text)}</details>`).join('')}
+        </div>
+      </section>` : ''}
 
       <section class="lp-end" aria-labelledby="lp-end-title">
         <div class="lp-end-mark" aria-hidden="true">${brandMark()}</div>
@@ -29354,7 +29481,7 @@ function renderLanding() {
       </section>
     </main>
 
-    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${site}</span></a><p>Just do things.</p><a href="/docs">Docs</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="${github}">GitHub ↗</a></footer>
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${site}</span></a><p>Just do things.</p><a href="/docs">Docs</a><a href="/pricing">Pricing</a><a href="/compare" data-public>Compare</a><a href="/about" data-public>About</a><a href="/changelog" data-public>Changelog</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="${source}">GitHub ↗</a></footer>
   </div>`;
 
   const signIn = () => openPublicAuth('/login', renderLogin);

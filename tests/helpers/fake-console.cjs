@@ -9,7 +9,7 @@ const path = require('node:path');
 const { chromium } = require('playwright');
 
 const WEB = path.join(__dirname, '..', '..', 'web');
-const ASSETS = new Set(['/app.js', '/styles.css', '/markdown.js', '/file-view.js', '/totp-qr.js', '/register-service-worker.js', '/vendor/highlight.min.js']);
+const ASSETS = new Set(['/app.js', '/styles.css', '/markdown.js', '/file-view.js', '/site.js', '/totp-qr.js', '/register-service-worker.js', '/vendor/highlight.min.js']);
 const REPLY = Symbol('reply');
 
 const launch = () => chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH || undefined, args: ['--no-sandbox'] });
@@ -59,10 +59,10 @@ async function fakeConsole(context, { origin = 'http://console.test', project, t
   await context.route(`${origin}/**`, async (route) => {
     const request = route.request(), url = new URL(request.url()), p = url.pathname;
     if (!p.startsWith('/api/')) {
-      // The public docs fetch their pages as Markdown files beside the console.
-      const doc = /^\/docs\/[a-z-]+\.md$/.test(p) && fs.existsSync(path.join(WEB, p)) ? p.slice(1) : null;
+      // The public pages fetch their Markdown from files beside the console (docs, comparisons, About, the changelog).
+      const doc = /^\/(?:(?:docs|compare)\/)?[a-z-]+\.md$/.test(p) && fs.existsSync(path.join(WEB, p)) ? p.slice(1) : null;
       const file = doc || (ASSETS.has(p) ? p.slice(1) : 'index.html');
-      if (/^\/docs\/.*\.md$/.test(p) && !doc) return route.fulfill({ status: 404, body: 'not found' });
+      if (p.endsWith('.md') && !doc) return route.fulfill({ status: 404, body: 'not found' });
       return route.fulfill({ contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : file.endsWith('.md') ? 'text/markdown' : 'text/html',
         body: fs.readFileSync(path.join(WEB, file), 'utf8') });
     }

@@ -5,7 +5,7 @@
 // bootstrap API calls are stubbed as a signed-out visitor would see them.
 //
 //   npm run preview:landing                     # http://localhost:4173
-//   PORT=5000 SITE_NAME=tavya BRAND_ICON=royal-gold-arrow node scripts/preview-landing.mjs
+//   PORT=5000 SITE_NAME=tavya BRAND_ICON=royal-gold-arrow LAUNCH=launch.json node scripts/preview-landing.mjs
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -24,7 +24,8 @@ const types = {
 };
 const api = {
   '/api/meta': { siteName, hosted: true, version: 'preview' },
-  '/api/launch': {},
+  // LAUNCH=<file> previews with an installation's plans, trial and policies (a saved GET /api/launch).
+  '/api/launch': process.env.LAUNCH ? JSON.parse(fs.readFileSync(process.env.LAUNCH, 'utf8')) : {},
   '/api/session': { authRequired: true, authenticated: false },
 };
 
