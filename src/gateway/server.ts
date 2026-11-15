@@ -91,10 +91,10 @@ import { materializeGitCredential } from '../world/git-credential.js';
 type Repository = import('../domain/types.js').Repository;
 import { projectArtifactGallery, type GalleryArtifact } from '../platform/artifact-gallery.js';
 import { FileAccessError, FileNotFoundError, ProjectFiles, projectRepositoryCredential, splitPath, worldFilesPath, type FileNode, type FileView, type OpenedFile } from '../world/project-files.js';
-import { CHANGE_LIMITS, FileConflictError, ProjectFileChanges, type FileChange } from '../world/project-file-changes.js';
+import { CHANGE_LIMITS, FileConflictError, ProjectFileChanges, type FileChange, type FileKeeping } from '../world/project-file-changes.js';
 import { createFileShare, currentFileShare, projectFileShares, publicFileShare, publicFilesHtml, revokeFileShare, type FileShare } from './file-sharing.js';
 import { cliVersionOf, olderVersion } from '../domain/cli-version.js';
-import { WorkspaceConflict, WorldNotRunningError } from '../world/resources.js';
+import { ResourceTooLargeError, WorkspaceConflict, WorldNotRunningError } from '../world/resources.js';
 import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, openCodeKeyModels, mergeModels,
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
 import { ARTIFICIAL_ANALYSIS_KEY_ENV, ArtificialAnalysis, toBenchmarks, type ModelBenchmarks } from '../agent/model-benchmarks.js';
@@ -417,7 +417,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The Files page: data under it also needs project:settings:read, checked there.
   if (/^\/api\/projects\/[^/]+\/files(?:\/raw|\/views)?$/.test(p)) return 'repository:read';
   // Changing Files: who may write where (a task's world, a branch) is decided there.
-  if (/^\/api\/projects\/[^/]+\/files\/(?:changes|uploads)$/.test(p)) return 'repository:read';
+  if (/^\/api\/projects\/[^/]+\/files\/(?:changes|uploads|plan)$/.test(p)) return 'repository:read';
   if (/^\/api\/tasks\/[^/]+\/file-location$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/artifacts$/.test(p)) return 'task:read';
   // Public links to a snapshot of a path: anyone who reads Files sees them; making or revoking one is its own capability.
@@ -4656,33 +4656,9 @@ export class Gateway {
           try { entries = secretEntries(body, repositories); }
           catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
           if (!entries.length) return this.json(res, 400, { error: 'name/value or pasted env required' });
-          const saved: ResourceAttachment[] = [];
-          const kept: string[] = [];
           try {
-            for (const entry of entries) {
-              const existing = resources.find((resource) => sameSecretDestination(resource, entry, repositories));
-              // `overwrite: false` keeps a stored value: it has no older version to go back to.
-              if (existing && body.overwrite === false && existing.credentialHandles[0]) { kept.push(existing.name); continue; }
-              if (existing) {
-                // A new value becomes the resource's own secret; a stored
-                // handle may name someone else's (AU-40).
-                const handle = entry.value ? resourceSecretHandle(existing.id)
-                  : existing.credentialHandles[0] ?? resourceSecretHandle(existing.id);
-                if (entry.value) (await this.deps.broker.registerHandle(handle, entry.value, organizationScope(project.organizationId)));
-                saved.push((await store.updateResourceAttachment(existing.id, {
-                  target: entry.target, credentialHandles: [handle], enabled: true,
-                  ...(entry.value ? { source: withoutVaultProjection(existing.source) } : {}),
-                })));
-              } else {
-                if (!entry.value) continue;
-                const id = newId('resource'), handle = `resource:${id}:credential`;
-                (await this.deps.broker.registerHandle(handle, entry.value, organizationScope(project.organizationId)));
-                saved.push((await store.createResourceAttachment({ id, organizationId: project.organizationId,
-                  projectId: project.id, name: entry.name, driver: 'secret@1', target: entry.target,
-                  access: 'read', isolation: 'fork', source: { discovered: typeof body.env === 'string' },
-                  credentialHandles: [handle], publish: 'discard' })));
-              }
-            }
+            const { saved, kept } = await this.saveSecretEntries(project, resources, entries, repositories,
+              { overwrite: body.overwrite !== false, discovered: typeof body.env === 'string' });
             return this.json(res, 200, { imported: saved.map(redactResource), secrets: saved.map(redactResource), kept });
           } catch (error) {
             return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -5371,6 +5347,24 @@ export class Gateway {
         try { return this.json(res, 200, await this.stageFileUpload(req, projectId, session.apiToken)); }
         catch (error) { return this.json(res, (error as { status?: number }).status ?? 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
+      // Where uploads are best kept: Git, data or a secret (the upload dialog's recommendation).
+      const filePlan = p.match(/^\/api\/projects\/([^/]+)\/files\/plan$/);
+      if (filePlan && method === 'POST') {
+        const projectId = filePlan[1]!;
+        if (!(await store.getProject(projectId))) return this.json(res, 404, { error: 'project not found' });
+        const view = await this.filesView(session.apiToken, projectId, url);
+        if ('error' in view) return this.json(res, view.status, { error: view.error });
+        const body = await this.body(req, 4 * 1024 * 1024);
+        const items = (Array.isArray(body.items) ? body.items : []).slice(0, CHANGE_LIMITS.files)
+          .filter((item: any) => typeof item?.path === 'string').map((item: any) => ({ path: String(item.path), size: Number(item.size) || 0 }));
+        try {
+          return this.json(res, 200, { items: await this.fileChanges().plan(projectId, view, items),
+            canKeep: view.kind !== 'task' && (await this.deps.tokens.check(session.apiToken, 'project:settings:write', { projectId })).ok });
+        } catch (error) {
+          return this.json(res, error instanceof FileNotFoundError ? 404 : error instanceof FileAccessError ? 403 : 502,
+            { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
       const fileChanges = p.match(/^\/api\/projects\/([^/]+)\/files\/changes$/);
       if (fileChanges && method === 'POST') {
         const projectId = fileChanges[1]!;
@@ -5393,15 +5387,16 @@ export class Gateway {
             ? 'Changing a task’s files needs task:edit on it.' : undefined;
           if (refusal) return this.json(res, 403, { error: refusal });
           const data = (await this.deps.tokens.check(session.apiToken, 'project:settings:read', { projectId })).ok;
-          const result = await this.fileChanges().apply(projectId, view, changes, await this.commitAuthor(session), {
-            data, mayCommit: async (branch) => (await this.deps.tokens.check(session.apiToken, `merge-into:${branch}`, { projectId })).ok });
+          const result = await this.fileChanges(() => actorPrincipal(callerIdentity.actor)).apply(projectId, view, changes, await this.commitAuthor(session), {
+            data, mayCommit: async (branch) => (await this.deps.tokens.check(session.apiToken, `merge-into:${branch}`, { projectId })).ok,
+            mayKeep: async () => (await this.deps.tokens.check(session.apiToken, 'project:settings:write', { projectId })).ok });
           await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'files.change', `project:${projectId}`,
             { view, changes: changes.map((change) => ({ op: change.op, ...('path' in change ? { path: change.path } : { from: change.from, to: change.to }) })), commits: result.commits });
           return this.json(res, 200, result);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           return this.json(res, error instanceof FileNotFoundError ? 404 : error instanceof FileConflictError ? 409
-            : error instanceof FileAccessError ? 403 : 502, { error: message });
+            : error instanceof FileAccessError || error instanceof ResourceTooLargeError ? 403 : 502, { error: message });
         } finally {
           fs.rmSync(scratch, { recursive: true, force: true });
           for (const id of used) this.dropFileUpload(id);
@@ -10740,9 +10735,92 @@ export class Gateway {
     return galleries.flat().sort((a, b) => b.at - a.at);
   }
 
-  private fileChangesService?: ProjectFileChanges;
-  private fileChanges(): ProjectFileChanges {
-    return this.fileChangesService ??= new ProjectFileChanges({ files: this.projectFiles(),
+  /** Store secret entries for a project: a stored one at the same place is
+   * replaced unless `overwrite` is false (a secret has no older version to go
+   * back to); a new value becomes the resource's own secret (AU-40). */
+  private async saveSecretEntries(project: import('../domain/types.js').Project, resources: ResourceAttachment[], entries: SecretEntry[],
+    repositories: string[], options: { overwrite: boolean; discovered: boolean }): Promise<{ saved: ResourceAttachment[]; kept: string[] }> {
+    const saved: ResourceAttachment[] = [];
+    const kept: string[] = [];
+    const store = this.deps.store, broker = this.deps.broker!;
+    for (const entry of entries) {
+      const existing = resources.find((resource) => sameSecretDestination(resource, entry, repositories));
+      if (existing && !options.overwrite && existing.credentialHandles[0]) { kept.push(existing.name); continue; }
+      if (existing) {
+        const handle = entry.value ? resourceSecretHandle(existing.id)
+          : existing.credentialHandles[0] ?? resourceSecretHandle(existing.id);
+        if (entry.value) (await broker.registerHandle(handle, entry.value, organizationScope(project.organizationId!)));
+        saved.push((await store.updateResourceAttachment(existing.id, {
+          target: entry.target, credentialHandles: [handle], enabled: true,
+          ...(entry.value ? { source: withoutVaultProjection(existing.source) } : {}),
+        })));
+      } else {
+        if (!entry.value) continue;
+        const id = newId('resource'), handle = `resource:${id}:credential`;
+        (await broker.registerHandle(handle, entry.value, organizationScope(project.organizationId!)));
+        saved.push((await store.createResourceAttachment({ id, organizationId: project.organizationId!,
+          projectId: project.id, name: entry.name, driver: 'secret@1', target: entry.target,
+          access: 'read', isolation: 'fork', source: { discovered: options.discovered },
+          credentialHandles: [handle], publish: 'discard' })));
+      }
+    }
+    return { saved, kept };
+  }
+
+  /** The project's data and secrets as the Files page changes them (FileKeeping). */
+  private fileKeeping(principal: () => string): FileKeeping | undefined {
+    const resources = this.deps.resources, store = this.deps.store;
+    if (!resources || !this.deps.broker) return undefined;
+    return {
+      version: async (id) => (await store.getResourceAttachment(id))?.currentRevisionId ?? undefined,
+      restore: (id, target, maxBytes) => resources.restoreCurrentOnHost(id, target, maxBytes),
+      save: async (id, source, base) => {
+        const attachment = await store.getResourceAttachment(id);
+        if (!attachment) throw new FileNotFoundError('That data is gone.');
+        if ((attachment.currentRevisionId ?? undefined) !== base) throw new FileConflictError(`${attachment.name} changed meanwhile: try again.`);
+        const revision = await resources.importDirectory(id, source);
+        await store.appendAudit({ principalId: principal(), action: 'resource:revision', scopeKey: `project:${attachment.projectId}`,
+          detail: { resourceId: id, revisionId: revision.id, via: 'files' } });
+      },
+      create: async (projectId, place, shape, source) => {
+        const project = await store.getProject(projectId);
+        if (!project?.organizationId) throw new FileNotFoundError('project not found');
+        const taken = new Set((await store.listResourceAttachments(projectId, true)).map((resource) => resource.name));
+        const base = path.posix.basename(place.path) || 'data';
+        let name = base;
+        for (let n = 2; taken.has(name); n++) name = `${base}-${n}`;
+        const id = newId('resource');
+        await store.createResourceAttachment({ id, organizationId: project.organizationId, projectId, name, driver: 'volume@1',
+          target: { kind: 'path', path: place.path, repository: place.repository }, access: 'write', isolation: 'fork',
+          source: shape === 'file' ? { shape: 'file' } : {}, credentialHandles: [],
+          storageLocationId: await resources.storageLocationFor(project.organizationId), publish: 'review' });
+        try { await resources.importDirectory(id, source); }
+        catch (error) { await store.deleteResourceAttachment(id); throw error; }
+        await store.appendAudit({ principalId: principal(), action: 'resource:create', scopeKey: `project:${projectId}`,
+          detail: { resourceId: id, driver: 'volume@1', via: 'files' } });
+        return name;
+      },
+      secret: async (projectId, place, source) => {
+        const project = await store.getProject(projectId);
+        if (!project?.organizationId) throw new FileNotFoundError('project not found');
+        const bytes = fs.readFileSync(source);
+        const text = bytes.toString('utf8');
+        if (bytes.includes(0) || Buffer.from(text, 'utf8').length !== bytes.length) throw new FileAccessError(`${place.path} isn’t text: only text is kept as a secret.`);
+        const repositories = await projectRepositoryNames(project, store);
+        const entries = secretEntries(dotenvFile(path.posix.basename(place.path))
+          ? { env: text, file: place.path, repository: place.repository }
+          : { name: `${place.repository}/${place.path}`, value: text, file: place.path, repository: place.repository }, repositories);
+        if (!entries.length) throw new FileAccessError(`${place.path} holds no variables.`);
+        const existing = (await store.listResourceAttachments(project.id, true)).filter((resource) => resource.driver === 'secret@1' && !stagedResourceCandidate(resource));
+        // An upload is explicit: it replaces what is stored there.
+        const { saved } = await this.saveSecretEntries(project, existing, entries, repositories, { overwrite: true, discovered: false });
+        return saved.map((resource) => resource.name);
+      },
+    };
+  }
+
+  private fileChanges(principal = () => 'system'): ProjectFileChanges {
+    return new ProjectFileChanges({ files: this.projectFiles(), keeping: this.fileKeeping(principal),
       gitCredential: projectRepositoryCredential(this.deps.store, { hosted: this.deps.hosted, githubApp: this.deps.githubApp }),
       // Writing wakes a parked world (a person is at work in it); the idle sweep parks it again.
       openWorld: async (taskId, handle) => {
@@ -10805,17 +10883,20 @@ export class Gateway {
       const where = named(raw.path);
       if (!where) return { error: 'write needs a path', status: 400 };
       const expect = raw.expect === null ? null : typeof raw.expect === 'string' ? raw.expect : undefined;
+      if (raw.keep !== undefined && raw.keep !== 'data' && raw.keep !== 'secret') return { error: 'keep must be data or secret', status: 400 };
+      const keeping = { ...(raw.keep ? { keep: raw.keep as 'data' | 'secret' } : {}), ...(raw.keep === 'data' && named(raw.dataFolder) ? { dataFolder: String(raw.dataFolder) } : {}),
+        ...(expect !== undefined ? { expect } : {}) };
       if (typeof raw.text === 'string') {
         const source = path.join(scratch, String(index));
         fs.writeFileSync(source, raw.text);
-        return { op, path: where, source, ...(expect !== undefined ? { expect } : {}) };
+        return { op, path: where, source, ...keeping };
       }
       const upload = typeof raw.upload === 'string' ? this.fileUploads.get(raw.upload) : undefined;
       const principal = (await this.deps.tokens.verify(session.apiToken))?.principal ?? '';
       if (!upload || upload.projectId !== projectId || upload.principal !== principal)
         return { error: 'That upload is gone: upload the file again.', status: 400 };
       used.push(raw.upload);
-      return { op, path: where, source: upload.file, ...(expect !== undefined ? { expect } : {}) };
+      return { op, path: where, source: upload.file, ...keeping };
     }
     if (op === 'mkdir' || op === 'delete') {
       const where = named(raw.path);
@@ -10850,6 +10931,8 @@ export class Gateway {
       if (!(await this.sessionMay(session, 'task:edit', projectId, view.taskId))) return false;
       return this.projectFiles().writePlaces(projectId, view).then(() => node.source.kind !== 'data' || node.source.access === 'write', () => false);
     }
+    // Data shows its current version in every view: changing it is a settings write.
+    if (node.source.kind === 'data') return (await this.deps.tokens.check(session.apiToken, 'project:settings:write', { projectId })).ok;
     if (node.source.kind !== 'repository') return false;
     // A branch view writes only to repositories that have that branch.
     if (view.kind === 'branch' && node.source.branch !== view.name) return false;

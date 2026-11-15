@@ -16,8 +16,8 @@ import { capsOf, projectFilesFixture, sh } from './helpers/project-files-fixture
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
-async function fixture() {
-  const f = await projectFilesFixture(cleanups);
+async function fixture(files: Record<string, string> = {}) {
+  const f = await projectFilesFixture(cleanups, { files });
   const developer = await f.tokenFor(capsOf('developer') as string[]);
   const bare = path.join(f.remotes, f.owner, 'site.git');
   const post = (route: string, token: string, body: string | Buffer, query = '', type = 'application/json') =>
@@ -31,7 +31,10 @@ async function fixture() {
     (await (await post('uploads', token, bytes, '', 'application/octet-stream')).json() as any).upload as string;
   const show = (file: string, ref = 'main') => sh(bare, 'show', `${ref}:${file}`);
   const listed = (ref = 'main') => sh(bare, 'ls-tree', '-r', '--name-only', ref).trim().split('\n');
-  return { ...f, developer, bare, change, upload, show, listed };
+  const plan = async (token: string, items: Array<{ path: string; size: number }>, query = '') =>
+    (await post('plan', token, JSON.stringify({ items }), query)).json() as Promise<any>;
+  const read = async (file: string, token = developer) => (await f.get(file, token, true)).text();
+  return { ...f, developer, bare, change, upload, show, listed, plan, read };
 }
 
 it('commits uploads, edits, new folders, copies, moves and deletes straight to the branch', async () => {
@@ -92,7 +95,7 @@ it('refuses what is not a file in a repository, and people who may not land on t
   expect((await (await f.get('', f.developer)).json()).writable).toBe(false);
   expect((await f.change(f.developer, [{ op: 'write', path: 'x.txt', text: 'x' }])).status).toBe(403);
   expect((await f.change(f.developer, [{ op: 'delete', path: 'site' }])).status).toBe(403);
-  expect((await f.change(f.developer, [{ op: 'write', path: 'site/data/raw/new.txt', text: 'x' }])).body.error).toMatch(/Data is read-only here/);
+  expect((await f.change(f.developer, [{ op: 'write', path: 'site/data/raw/new.txt', text: 'x' }])).body.error).toMatch(/needs project settings access/);
   expect((await (await f.get('site/data/raw', f.developer)).json()).writable).toBe(false);
   expect((await f.change(f.developer, [{ op: 'write', path: 'site/.git/config', text: 'x' }])).status).toBe(403);
   expect((await f.change(f.developer, [{ op: 'delete', path: '../etc' }])).status).toBe(404);
@@ -178,6 +181,117 @@ it('changes a task’s world in place, and pastes between it and the default vie
   // A released world is read-only.
   await f.store.setWorldState(handle, 'released');
   expect((await f.change(f.developer, [{ op: 'delete', path: 'README.md' }], query)).body.error).toMatch(/read-only/);
+});
+
+it('recommends where each upload belongs: Git, data or a secret', async () => {
+  const f = await fixture({ '.gitignore': 'build/\n*.log\n', 'src/.gitignore': 'cache/\n' });
+  const maintainer = await f.tokenFor(capsOf('maintainer') as string[]);
+  const planned = await f.plan(maintainer, [
+    { path: 'site/notes.md', size: 10 },
+    { path: 'site/.env', size: 20 },
+    { path: 'site/.env.example', size: 20 },
+    { path: 'site/certs/server.pem', size: 900 },
+    { path: 'site/video.mp4', size: 60 * 1024 * 1024 },
+    { path: 'site/app.sqlite', size: 4096 },
+    { path: 'site/build/out.js', size: 10 },
+    { path: 'site/debug.log', size: 10 },
+    { path: 'site/src/cache/x.bin', size: 10 },
+    { path: 'site/data/raw/pages/c.txt', size: 3 },
+  ]);
+  expect(planned.canKeep).toBe(true);
+  expect(planned.items.map((item: any) => [item.path, item.keep, item.why ?? '', item.fixed ?? false])).toEqual([
+    ['site/notes.md', 'git', '', false],
+    ['site/.env', 'secret', 'Holds environment variables', false],
+    ['site/.env.example', 'git', '', false],
+    ['site/certs/server.pem', 'secret', 'Looks like credentials', false],
+    ['site/video.mp4', 'data', 'Over 50 MB', false],
+    ['site/app.sqlite', 'data', 'A database', false],
+    ['site/build/out.js', 'data', 'Git ignores it', false],
+    ['site/debug.log', 'data', 'Git ignores it', false],
+    ['site/src/cache/x.bin', 'data', 'Git ignores it', false],
+    ['site/data/raw/pages/c.txt', 'data', 'Inside data', true],
+  ]);
+  // Keeping data or secrets is a settings write: a developer is told, and keeps to Git.
+  expect((await f.plan(f.developer, [{ path: 'site/notes.md', size: 1 }])).canKeep).toBe(false);
+});
+
+it('keeps an upload as a secret or as new data instead of committing it', async () => {
+  const f = await fixture();
+  const maintainer = await f.tokenFor(capsOf('maintainer') as string[]);
+  const before = sh(f.bare, 'rev-parse', 'main').trim();
+  const env = await f.upload(maintainer, 'API_KEY=s3cret\nPORT=8080\n');
+  const pem = await f.upload(maintainer, '-----BEGIN KEY-----\nabc\n-----END KEY-----\n');
+  const a = await f.upload(maintainer, 'frame a');
+  const b = await f.upload(maintainer, 'frame b');
+  const model = await f.upload(maintainer, Buffer.alloc(1000, 7));
+  const kept = await f.change(maintainer, [
+    { op: 'write', path: 'site/.env', upload: env, keep: 'secret' },
+    { op: 'write', path: 'site/certs/server.pem', upload: pem, keep: 'secret' },
+    { op: 'write', path: 'site/assets/frames/a.txt', upload: a, keep: 'data', dataFolder: 'site/assets/frames' },
+    { op: 'write', path: 'site/assets/frames/deep/b.txt', upload: b, keep: 'data', dataFolder: 'site/assets/frames' },
+    { op: 'write', path: 'site/models/weights.bin', upload: model, keep: 'data' },
+    { op: 'write', path: 'site/readme-2.md', text: 'in Git\n' },
+  ]);
+  expect(kept.status).toBe(200);
+  expect(kept.body.secrets.sort()).toEqual(['site/.env:API_KEY', 'site/.env:PORT', 'site/certs/server.pem'].sort());
+  expect(kept.body.data).toEqual([{ name: 'frames', created: true }, { name: 'weights.bin', created: true }]);
+  // Only the Git file was committed; nothing secret reached the repository.
+  expect(sh(f.bare, 'rev-parse', 'main~1').trim()).toBe(before);
+  expect(f.listed()).toContain('readme-2.md');
+  expect(f.listed().some((file) => /\.env|server\.pem|frames|weights/.test(file))).toBe(false);
+  // Secrets are stored where a world puts them: the .env's variables as its lines.
+  const secrets = (await f.store.listResourceAttachments(f.project.id, true)).filter((resource) => resource.driver === 'secret@1');
+  expect(secrets.map((secret) => [secret.name, secret.target]).sort()).toEqual([
+    ['site/.env:API_KEY', { kind: 'environment', name: 'API_KEY', dotenv: { path: '.env', repository: 'site' } }],
+    ['site/.env:PORT', { kind: 'environment', name: 'PORT', dotenv: { path: '.env', repository: 'site' } }],
+    ['site/certs/server.pem', { kind: 'path', path: 'certs/server.pem', repository: 'site' }],
+  ].sort());
+  // Data shows in Files where it was uploaded: a folder of data, and one file of data.
+  const frames = await (await f.get('site/assets/frames', maintainer)).json();
+  expect(frames).toMatchObject({ source: { kind: 'data', name: 'frames' } });
+  expect(frames.entries.map((entry: any) => entry.name)).toEqual(['deep', 'a.txt']);
+  expect(await f.read('site/assets/frames/deep/b.txt', maintainer)).toBe('frame b');
+  const models = await (await f.get('site/models', maintainer)).json();
+  expect(models.entries).toEqual([{ name: 'weights.bin', kind: 'file', mount: 'data', size: 1000 }]);
+  expect(Buffer.from(await (await f.get('site/models/weights.bin', maintainer, true)).arrayBuffer()).equals(Buffer.alloc(1000, 7))).toBe(true);
+  // Binary is not kept as a secret; a developer keeps nothing outside Git.
+  const binary = await f.upload(maintainer, Buffer.from([1, 0, 2]));
+  expect((await f.change(maintainer, [{ op: 'write', path: 'site/x.key', upload: binary, keep: 'secret' }])).body.error).toMatch(/only text is kept as a secret/);
+  const theirs = await f.upload(f.developer, 'X=1');
+  expect((await f.change(f.developer, [{ op: 'write', path: 'site/.env', upload: theirs, keep: 'secret' }])).status).toBe(403);
+});
+
+it('replaces, adds and deletes files in data: each batch one new version', async () => {
+  const f = await fixture();
+  const maintainer = await f.tokenFor(capsOf('maintainer') as string[]);
+  const versions = async () => (await f.store.getResourceAttachment(f.data.id))!.currentRevisionId;
+  const first = await versions();
+  const page = await (await f.get('site/data/raw/pages/a.txt', maintainer)).json();
+  expect(page.writable).toBe(true);
+  expect((await (await f.get('site/data/raw', f.developer)).json()).writable).toBe(false);
+  const added = await f.upload(maintainer, 'gamma\n');
+  const result = await f.change(maintainer, [
+    { op: 'write', path: 'site/data/raw/pages/a.txt', text: 'alpha, replaced\n', expect: page.version },
+    { op: 'write', path: 'site/data/raw/pages/c.txt', upload: added },
+    { op: 'delete', path: 'site/data/raw/big.bin' },
+    { op: 'move', from: 'site/data/raw/pages/b.csv', to: 'site/data/raw/tables/b.csv' },
+  ]);
+  expect(result).toMatchObject({ status: 200, body: { commits: [], data: [{ name: 'raw_data' }] } });
+  const second = await versions();
+  expect(second).not.toBe(first);
+  expect((await f.store.getResourceRevision(second!))!.parentRevisionId).toBe(first);
+  expect(await f.read('site/data/raw/pages/a.txt', maintainer)).toBe('alpha, replaced\n');
+  expect(await f.read('site/data/raw/pages/c.txt', maintainer)).toBe('gamma\n');
+  expect(await f.read('site/data/raw/tables/b.csv', maintainer)).toBe('x,y\n1,2\n');
+  expect((await (await f.get('site/data/raw', maintainer)).json()).entries.map((entry: any) => entry.name)).toEqual(['pages', 'tables']);
+  // A stale save is refused; the resource itself is not removed from here.
+  const stale = await f.change(maintainer, [{ op: 'write', path: 'site/data/raw/pages/a.txt', text: 'lost', expect: page.version }]);
+  expect(stale).toMatchObject({ status: 409, body: { error: 'a.txt changed since you opened it.' } });
+  expect((await f.change(maintainer, [{ op: 'delete', path: 'site/data/raw' }])).body.error).toMatch(/is data: remove or move it in Settings/);
+  expect(await versions()).toBe(second);
+  // Copying from a repository into data reads it first, then saves one version.
+  expect((await f.change(maintainer, [{ op: 'copy', from: 'site/src/app.ts', to: 'site/data/raw/app.ts' }])).status).toBe(200);
+  expect(await f.read('site/data/raw/app.ts', maintainer)).toBe('export const answer = 42;\n');
 });
 
 it('says what a commit did, as a person would', () => {

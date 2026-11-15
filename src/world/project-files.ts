@@ -14,7 +14,7 @@ import type { ManifestEntry } from './checkpoint-chunks.js';
 import type { World, WorldHandle } from './types.js';
 import { isRemoteWorldKind, worldRepos, worldRepoSource, worldWorkingRelativePath } from './types.js';
 import { MirroredCommitMissing, readMirrored } from './git-mirror.js';
-import { catBlob, git } from './git.js';
+import { catBlob, git, gitWithInput } from './git.js';
 import { materializeGitCredential } from './git-credential.js';
 import { sameRepository } from './repository-identity.js';
 import { RESTIC_ENGINE, ROOT_PART, storedRef, type Repository as ResticRepository, type SnapshotEntry } from './restic-engine.js';
@@ -85,7 +85,10 @@ export interface FileReadOptions { data: boolean; pins?: FilePins; view?: FileVi
 export type WritePlaces =
   | { kind: 'world'; taskId: string; handle: WorldHandle; hidden: (rel: string) => boolean }
   | { kind: 'branch'; checkouts: Array<{ name: string; segments: string[]; role: 'development' | 'project-wiki'; sshUrl: string; branch: string }>;
-    mounts: string[][] };
+    mounts: DataPlace[] };
+
+/** A data resource where it is mounted: a folder of files, or one file. */
+export interface DataPlace { segments: string[]; id: string; name: string; shape: 'directory' | 'file' }
 
 export interface OpenedFile { node: FileNode; size: number; stream: Readable; done: Promise<void>; stop: () => void }
 
@@ -302,7 +305,46 @@ export class ProjectFiles {
     }
     const layout = await this.projectLayout(projectId, { view });
     return { kind: 'branch', checkouts: layout.checkouts.map(({ name, segments, role, sshUrl, branch }) => ({ name, segments, role, sshUrl, branch })),
-      mounts: layout.mounts.map((mount) => mount.segments) };
+      mounts: layout.mounts.map((mount) => ({ segments: mount.segments, id: mount.id, name: mount.name, shape: mount.shape === 'file' ? 'file' as const : 'directory' as const })) };
+  }
+
+  /** Which of `paths` (in repositories of the default or a branch view) the
+   * repository's own .gitignore files at that branch say Git ignores. Read
+   * from the host mirror: only the .gitignore files on the way to each path. */
+  async gitIgnored(projectId: string, view: FileView, paths: string[]): Promise<Set<string>> {
+    const ignored = new Set<string>();
+    if (view.kind === 'task') return ignored;
+    const layout = await this.projectLayout(projectId, { view });
+    await Promise.all(layout.checkouts.map(async (checkout) => {
+      const inside = new Map<string, string>();
+      for (const wanted of paths) {
+        let segments: string[];
+        try { segments = splitPath(wanted); } catch { continue; }
+        if (segments.length > checkout.segments.length && startsWith(segments, checkout.segments))
+          inside.set(segments.slice(checkout.segments.length).join('/'), wanted);
+      }
+      if (!inside.size) return;
+      await this.withRepository(projectId, checkout, async (mirror, commit) => {
+        const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-ignore-'));
+        try {
+          const folders = new Set(['']);
+          for (const rel of inside.keys()) { const parts = rel.split('/'); for (let at = 1; at < parts.length; at++) folders.add(parts.slice(0, at).join('/')); }
+          for (const folder of folders) {
+            const file = folder ? `${folder}/.gitignore` : '.gitignore';
+            const shown = await git(mirror, ['cat-file', '-p', `${commit}:${file}`]);
+            if (shown.code !== 0) continue;
+            fs.mkdirSync(path.join(scratch, folder), { recursive: true });
+            fs.writeFileSync(path.join(scratch, file), shown.stdout);
+          }
+          const init = await git(scratch, ['init', '-q']);
+          if (init.code !== 0) return;
+          const checked = await gitWithInput(scratch, ['-c', 'core.excludesFile=/dev/null', 'check-ignore', '--no-index', '-z', '--stdin'],
+            [...inside.keys()].map((rel) => `${rel}\0`).join(''));
+          for (const rel of checked.stdout.split('\0').filter(Boolean)) if (inside.has(rel)) ignored.add(inside.get(rel)!);
+        } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+      });
+    }));
+    return ignored;
   }
 
   /** What a live world never shows (and Files never writes): `.env` files and the project's secret files. */

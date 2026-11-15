@@ -1484,6 +1484,12 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
   /* The stage on the top line already says it; the dot keeps the toolbar one line. */
   .tp-bar .conversation-presence { padding: 2px 4px; }
   .tp-bar .conversation-presence .presence-label { display: none; }
+  /* Work locally hands a computer a command: not for a phone. The rest scroll sideways rather than wrap. */
+  .ck-tools #local-checkout { display: none; }
+  .tp-bar { flex-wrap: nowrap; }
+  .tp-bar .ck-tools { flex: 0 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  .tp-bar .ck-tools::-webkit-scrollbar { display: none; }
+  .tp-bar .ck-tools > * { flex: none; }
 }
 /* min-height:0 lets the thread SHRINK below its content (a flex item's default
    min-height is the content size) — without it a long conversation grows the
@@ -4827,6 +4833,21 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 .files-menu button:disabled { color: var(--ink-3); cursor: default; }
 .files-menu kbd { color: var(--ink-3); font-family: var(--font-mono); font-size: var(--fs-11); }
 .files-menu-sep { height: 1px; margin: 4px 6px; background: var(--line); }
+.files-upload-dialog { width: min(640px, calc(100vw - 32px)); }
+.files-upload-form h2 { margin: 0 0 12px; font-size: var(--fs-16, 16px); overflow-wrap: anywhere; }
+.files-upload-list { list-style: none; margin: 0; padding: 0; max-height: 52vh; overflow-y: auto; border: 1px solid var(--line); border-radius: var(--r); }
+.files-upload-row { display: flex; align-items: center; gap: 10px; padding: 8px 8px 8px 12px; }
+.files-upload-row + .files-upload-row { border-top: 1px solid color-mix(in srgb, var(--line) 60%, transparent); }
+.files-upload-row .files-icon { color: var(--ink-3); }
+.files-upload-name { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.files-upload-meta { color: var(--ink-3); font-size: var(--fs-11); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.files-upload-row.skipped .files-upload-name, .files-upload-row.skipped .files-icon { opacity: .45; text-decoration: line-through; }
+.files-upload-row.skipped .files-upload-keep { visibility: hidden; }
+.files-upload-keep button { position: relative; }
+.files-upload-keep button:disabled { opacity: .4; cursor: default; }
+.files-upload-rec { position: absolute; top: 3px; right: 3px; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
+.files-upload-actions { justify-content: flex-end; margin-top: 14px; }
+@media (max-width: 520px) { .files-upload-row { flex-wrap: wrap; } .files-upload-name { flex-basis: calc(100% - 60px); } }
 .files-edit-area { display: block; width: 100%; min-height: 62vh; padding: 12px 16px; border: 0; resize: vertical; background: var(--surface); color: var(--ink);
   font-family: var(--font-mono); font-size: var(--fs-12); line-height: 1.6; tab-size: 4; white-space: pre; outline: none; }
 .files-term { display: flex; flex-direction: column; min-width: 0; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); overflow: hidden; }
