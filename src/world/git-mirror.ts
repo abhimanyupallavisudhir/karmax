@@ -153,6 +153,13 @@ export class MirroredCommitMissing extends Error {
 /** Tips `readMirrored` last saw origin advertise, by mirror and branch. */
 const recentTips = new Map<string, { commit: string; branch: string; at: number }>();
 
+/** Forget the tip `readMirrored` trusts for `branch` (this process just
+ * pushed it), so the next read asks origin instead of showing the old one. */
+export function forgetMirroredTip(source: string, scope: string | undefined, branch: string): void {
+  if (!usesPersistentMirrors()) return;
+  recentTips.delete(`${persistentMirror(source, scope)}\n${branch}`);
+}
+
 function usesPersistentMirrors(): boolean { return maxBytes() > 0 && process.platform === 'linux'; }
 
 function persistentMirror(source: string, scope: string | undefined): string {

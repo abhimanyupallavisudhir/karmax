@@ -31,7 +31,8 @@ import { RESTIC_ENGINE, ROOT_PART, storedRef, type Repository as ResticRepositor
  * while it runs, and otherwise from its last save (each checkout's commit plus
  * the uncommitted files its checkpoint holds, and the data it had), so looking
  * never wakes a sandbox. Everything else is read on the host: Git from the
- * broker's mirror cache, data with restic. Nothing here writes.
+ * broker's mirror cache, data with restic. Nothing here writes: changes go
+ * through ProjectFileChanges (project-file-changes.ts), to `writePlaces`.
  */
 
 export type FileKind = 'directory' | 'file' | 'symlink' | 'submodule';
@@ -78,6 +79,13 @@ export interface FilePins { repositories: Record<string, string>; data: Record<s
 export type FileView = { kind: 'default' } | { kind: 'branch'; name: string } | { kind: 'task'; taskId: string };
 
 export interface FileReadOptions { data: boolean; pins?: FilePins; view?: FileView }
+
+/** Where a view's changes go: a task's world, or each repository's branch
+ * (data mounted there is read-only). */
+export type WritePlaces =
+  | { kind: 'world'; taskId: string; handle: WorldHandle; hidden: (rel: string) => boolean }
+  | { kind: 'branch'; checkouts: Array<{ name: string; segments: string[]; role: 'development' | 'project-wiki'; sshUrl: string; branch: string }>;
+    mounts: string[][] };
 
 export interface OpenedFile { node: FileNode; size: number; stream: Readable; done: Promise<void>; stop: () => void }
 
@@ -278,6 +286,30 @@ export class ProjectFiles {
       fs.writeFileSync(destination, Buffer.concat(chunks));
     }
     return true;
+  }
+
+  /** Where changes made in `view` go. A task whose world is gone is read-only. */
+  async writePlaces(projectId: string, view: FileView): Promise<WritePlaces> {
+    if (view.kind === 'task') {
+      const task = await this.deps.store.getTask(view.taskId);
+      if (!task || task.projectId !== projectId) throw new FileNotFoundError('No such task in this project.');
+      const handle = ((await this.deps.store.currentWorld(task.id)) ?? task.lastView?.world) as WorldHandle | undefined;
+      if (!handle) throw new FileAccessError('This task has no files yet.');
+      const state = await this.deps.store.worldState(handle.id);
+      if (state === 'released' || (!isRemoteWorldKind(handle.kind) && !(handle.root && fs.existsSync(handle.root))))
+        throw new FileAccessError('This task’s workspace is gone: its files are read-only.');
+      return { kind: 'world', taskId: task.id, handle, hidden: await this.hiddenInWorld(projectId) };
+    }
+    const layout = await this.projectLayout(projectId, { view });
+    return { kind: 'branch', checkouts: layout.checkouts.map(({ name, segments, role, sshUrl, branch }) => ({ name, segments, role, sshUrl, branch })),
+      mounts: layout.mounts.map((mount) => mount.segments) };
+  }
+
+  /** What a live world never shows (and Files never writes): `.env` files and the project's secret files. */
+  private async hiddenInWorld(projectId: string): Promise<(rel: string) => boolean> {
+    const project = await this.deps.workspaces.project(projectId);
+    const secrets = new Set(project.secrets.flatMap((secret) => [secret.file, secret.dotenv].filter((place): place is string => Boolean(place))));
+    return (rel: string) => secrets.has(rel) || path.posix.basename(rel) === '.env' || rel.split('/').some((segment) => HIDDEN_NAMES.has(segment));
   }
 
   // ── layouts ─────────────────────────────────────────────────────────────────
@@ -519,8 +551,7 @@ export class ProjectFiles {
     const display = segments.join('/');
     if (segments.some((segment) => HIDDEN_NAMES.has(segment))) throw new FileNotFoundError(`Nothing at ${display}`);
     const project = await this.deps.workspaces.project(projectId);
-    const secrets = new Set(project.secrets.flatMap((secret) => [secret.file, secret.dotenv].filter((place): place is string => Boolean(place))));
-    const hidden = (rel: string) => secrets.has(rel) || path.posix.basename(rel) === '.env';
+    const hidden = await this.hiddenInWorld(projectId);
     if (hidden(display)) throw new FileNotFoundError(`Nothing at ${display}`);
     const mounts = project.resources.map((resource) => ({ ...resource, segments: splitPath(resource.path) })).filter((mount) => mount.segments.length > 0);
     const dataMount = mounts.find((mount) => startsWith(segments, mount.segments));
@@ -540,7 +571,8 @@ export class ProjectFiles {
     const nodeOf = (stat: LiveStat): FileNode => {
       if (stat.missing || stat.outside) throw new FileNotFoundError(`Nothing at ${display}`);
       if (stat.kind === 'symlink') return withView({ path: display, kind: 'symlink', source: { kind: 'world' }, target: stat.target ?? '' });
-      if (stat.kind === 'file') return withView({ path: display, kind: 'file', source: { kind: 'world' }, size: stat.size ?? 0 });
+      if (stat.kind === 'file') return withView({ path: display, kind: 'file', source: { kind: 'world' }, size: stat.size ?? 0,
+        ...(stat.version ? { version: stat.version } : {}) });
       if (stat.kind !== 'directory') throw new FileAccessError(`${display} is not a file or folder.`);
       const marks = (name: string): FileEntry['mount'] => {
         const child = [...segments, name];
@@ -662,7 +694,7 @@ export class ProjectFiles {
 interface LiveWorld { live: true; handle: WorldHandle; taskId: string; view: FileViewInfo }
 
 interface LiveStat {
-  missing?: true; outside?: true; kind?: FileKind | 'other'; size?: number; target?: string; real?: string;
+  missing?: true; outside?: true; kind?: FileKind | 'other'; size?: number; target?: string; real?: string; version?: string;
   entries?: Array<{ name: string; kind: FileKind; size?: number }>;
 }
 
@@ -681,7 +713,7 @@ const inside = (p) => p === realRoot || p.startsWith(realRoot + path.sep);
 if (s.isSymbolicLink()) out({ kind: 'symlink', target: fs.readlinkSync(target) });
 if (!real || !inside(real)) out({ outside: true });
 const relReal = path.relative(realRoot, real).split(path.sep).join('/');
-if (s.isFile()) out({ kind: 'file', size: s.size, real: relReal });
+if (s.isFile()) out({ kind: 'file', size: s.size, real: relReal, version: Math.floor(s.mtimeMs) + '-' + s.size });
 if (!s.isDirectory()) out({ kind: 'other' });
 const entries = [];
 for (const entry of fs.readdirSync(real, { withFileTypes: true }).slice(0, 10000)) {

@@ -9098,6 +9098,16 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     } finally { await remote.release(); }
   }
 
+  /** The canonical wiki takes what was just pushed to its repository's
+   * default branch from outside it (the Files page): fetched and merged in
+   * its own lane, so the Wiki tab shows it at once. */
+  async followProjectWikiRemote(projectId: string): Promise<void> {
+    const target = await this.projectWikiPublishTarget(projectId);
+    if (!target) return;
+    const root = ensureProjectWikiRepository(this.deps.contentDir ?? paths().content, projectId);
+    await mutateAndPublishProjectWiki(root, () => undefined, async () => target);
+  }
+
   /** Resolve a fresh, repository-scoped credential (tavya's grant, or the
    * GitHub App's) for one canonical wiki publish. No linked remote means the
    * local repository remains authoritative. */

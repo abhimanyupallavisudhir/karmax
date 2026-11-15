@@ -91,6 +91,7 @@ import { materializeGitCredential } from '../world/git-credential.js';
 type Repository = import('../domain/types.js').Repository;
 import { projectArtifactGallery, type GalleryArtifact } from '../platform/artifact-gallery.js';
 import { FileAccessError, FileNotFoundError, ProjectFiles, projectRepositoryCredential, splitPath, worldFilesPath, type FileNode, type FileView, type OpenedFile } from '../world/project-files.js';
+import { CHANGE_LIMITS, FileConflictError, ProjectFileChanges, type FileChange } from '../world/project-file-changes.js';
 import { createFileShare, currentFileShare, projectFileShares, publicFileShare, publicFilesHtml, revokeFileShare, type FileShare } from './file-sharing.js';
 import { cliVersionOf, olderVersion } from '../domain/cli-version.js';
 import { WorkspaceConflict, WorldNotRunningError } from '../world/resources.js';
@@ -415,6 +416,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/workspace$/.test(p) || /^\/api\/projects\/[^/]+\/git-credential$/.test(p)) return 'repository:read';
   // The Files page: data under it also needs project:settings:read, checked there.
   if (/^\/api\/projects\/[^/]+\/files(?:\/raw|\/views)?$/.test(p)) return 'repository:read';
+  // Changing Files: who may write where (a task's world, a branch) is decided there.
+  if (/^\/api\/projects\/[^/]+\/files\/(?:changes|uploads)$/.test(p)) return 'repository:read';
   if (/^\/api\/tasks\/[^/]+\/file-location$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/artifacts$/.test(p)) return 'task:read';
   // Public links to a snapshot of a path: anyone who reads Files sees them; making or revoking one is its own capability.
@@ -759,6 +762,12 @@ function permissionRequestFor(checked: { ok: boolean; missing?: string; reason?:
     return { capabilities: [], projectIds: [target.projectId] };
   return undefined;
 }
+
+/** Runs in a world: `ok` when the folder exists inside the world root (links resolved). */
+const TERMINAL_CWD_PROBE = `const fs = require('node:fs'), path = require('node:path');
+const [root, dir] = JSON.parse(process.argv[1]);
+try { const r = fs.realpathSync(root), d = fs.realpathSync(dir);
+  if ((d === r || d.startsWith(r + path.sep)) && fs.statSync(d).isDirectory()) process.stdout.write('ok'); } catch {}`;
 
 interface Session {
   user: string;
@@ -1676,7 +1685,21 @@ export class Gateway {
       const checkout = wanted
         ? worldRepos(world.handle as import('../world/types.js').WorldHandle).find((r) => r.name === wanted)
         : undefined;
-      term = await world.openPty({ cols: 80, rows: 24, ...(checkout ? { cwd: checkout.root } : {}) });
+      // The Files page opens it in the folder it shows (`cwd`, relative to the
+      // world root); a path that is not a folder inside the world opens at the default.
+      const files = url.searchParams.get('cwd');
+      let cwd = checkout?.root;
+      if (files) {
+        try {
+          const segments = splitPath(files);
+          if (!segments.some((segment) => segment === '.karmax-injection' || segment === '.git')) {
+            const wantedDir = path.posix.join(world.handle.root, ...segments);
+            const probe = await world.exec('node', ['-e', TERMINAL_CWD_PROBE, JSON.stringify([world.handle.root, wantedDir])], { cwd: world.handle.root });
+            if (probe.code === 0 && probe.stdout.trim() === 'ok') cwd = wantedDir;
+          }
+        } catch { /* the default folder */ }
+      }
+      term = await world.openPty({ cols: 80, rows: 24, ...(cwd ? { cwd } : {}) });
       (await this.deps.store.setExecutionRunning(executionId));
       (await this.deps.store.appendExecutionFrame(executionId, 'Terminal opened.\n', 'system'));
     } catch (error) {
@@ -5339,6 +5362,51 @@ export class Gateway {
         res.setHeader('cache-control', 'private, no-cache');
         return this.json(res, 200, { artifacts: await this.artifactGallery(session.apiToken, [projectId]) });
       }
+      // Changing Files (wiki features/project-files): bytes are staged first
+      // (one upload per file, streamed), then one batch of changes names them.
+      const fileUploads = p.match(/^\/api\/projects\/([^/]+)\/files\/uploads$/);
+      if (fileUploads && method === 'POST') {
+        const projectId = fileUploads[1]!;
+        if (!(await store.getProject(projectId))) return this.json(res, 404, { error: 'project not found' });
+        try { return this.json(res, 200, await this.stageFileUpload(req, projectId, session.apiToken)); }
+        catch (error) { return this.json(res, (error as { status?: number }).status ?? 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const fileChanges = p.match(/^\/api\/projects\/([^/]+)\/files\/changes$/);
+      if (fileChanges && method === 'POST') {
+        const projectId = fileChanges[1]!;
+        if (!(await store.getProject(projectId))) return this.json(res, 404, { error: 'project not found' });
+        const view = await this.filesView(session.apiToken, projectId, url);
+        if ('error' in view) return this.json(res, view.status, { error: view.error });
+        const body = await this.body(req, 8 * 1024 * 1024);
+        const changes: FileChange[] = [];
+        const used: string[] = [];
+        const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-file-text-'));
+        try {
+          const list = Array.isArray(body.changes) ? body.changes : [];
+          if (!list.length || list.length > CHANGE_LIMITS.changes) return this.json(res, 400, { error: `changes must list 1 to ${CHANGE_LIMITS.changes} changes` });
+          for (const raw of list) {
+            const change = await this.fileChange(raw, projectId, session, scratch, changes.length, used);
+            if ('error' in change) return this.json(res, change.status, { error: change.error });
+            changes.push(change);
+          }
+          const refusal = view.kind === 'task' && !(await this.sessionMay(session, 'task:edit', projectId, view.taskId))
+            ? 'Changing a task’s files needs task:edit on it.' : undefined;
+          if (refusal) return this.json(res, 403, { error: refusal });
+          const data = (await this.deps.tokens.check(session.apiToken, 'project:settings:read', { projectId })).ok;
+          const result = await this.fileChanges().apply(projectId, view, changes, await this.commitAuthor(session), {
+            data, mayCommit: async (branch) => (await this.deps.tokens.check(session.apiToken, `merge-into:${branch}`, { projectId })).ok });
+          await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'files.change', `project:${projectId}`,
+            { view, changes: changes.map((change) => ({ op: change.op, ...('path' in change ? { path: change.path } : { from: change.from, to: change.to }) })), commits: result.commits });
+          return this.json(res, 200, result);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return this.json(res, error instanceof FileNotFoundError ? 404 : error instanceof FileConflictError ? 409
+            : error instanceof FileAccessError ? 403 : 502, { error: message });
+        } finally {
+          fs.rmSync(scratch, { recursive: true, force: true });
+          for (const id of used) this.dropFileUpload(id);
+        }
+      }
       // The project as a file tree (wiki features/project-files).
       const projectFiles = p.match(/^\/api\/projects\/([^/]+)\/files(\/raw|\/views)?$/);
       if (projectFiles && (method === 'GET' || method === 'HEAD')) {
@@ -5363,7 +5431,8 @@ export class Gateway {
         try {
           if (!projectFiles[2]) {
             res.setHeader('cache-control', 'private, no-cache');
-            return this.json(res, 200, await this.projectFiles().stat(projectId, relative, { data, view }));
+            const node = await this.projectFiles().stat(projectId, relative, { data, view });
+            return this.json(res, 200, { ...node, writable: await this.filesWritable(session, projectId, view, node) });
           }
           return await this.projectFiles().open(projectId, relative, { data, view },
             (file) => this.sendProjectFile(req, res, file, url.searchParams.has('download')));
@@ -10657,6 +10726,122 @@ export class Gateway {
       return projectArtifactGallery({ store: this.deps.store, files: this.projectFiles() }, projectId, { repository });
     }));
     return galleries.flat().sort((a, b) => b.at - a.at);
+  }
+
+  private fileChangesService?: ProjectFileChanges;
+  private fileChanges(): ProjectFileChanges {
+    return this.fileChangesService ??= new ProjectFileChanges({ files: this.projectFiles(),
+      gitCredential: projectRepositoryCredential(this.deps.store, { hosted: this.deps.hosted, githubApp: this.deps.githubApp }),
+      // Writing wakes a parked world (a person is at work in it); the idle sweep parks it again.
+      openWorld: async (taskId, handle) => {
+        if (this.deps.worldAccess) { const access = await this.deps.worldAccess.open(taskId, handle); return { world: access.world, release: () => access.release(false) }; }
+        return { world: await this.deps.worlds.open(handle), release: async () => {} };
+      },
+      afterPush: async (projectId, place) => {
+        if (place.role === 'project-wiki') await this.deps.api.followProjectWikiRemote(projectId);
+      } });
+  }
+
+  /** Bytes staged for a batch of changes, by upload id: one person's, for an hour. */
+  private readonly fileUploads = new Map<string, { file: string; projectId: string; principal: string; size: number; timer: NodeJS.Timeout }>();
+
+  /** `POST …/files/uploads`: the request body, streamed to a file on this host. */
+  private async stageFileUpload(req: http.IncomingMessage, projectId: string, token: string): Promise<{ upload: string; size: number }> {
+    const principal = (await this.deps.tokens.verify(token))?.principal ?? '';
+    const own = [...this.fileUploads.values()].filter((upload) => upload.principal === principal);
+    if (own.length >= 2000 || own.reduce((sum, upload) => sum + upload.size, 0) > CHANGE_LIMITS.bytes)
+      throw Object.assign(new Error('Too many uploads waiting: send the changes that use them first.'), { status: 429 });
+    const id = crypto.randomBytes(18).toString('base64url');
+    const dir = path.join(os.tmpdir(), 'karmax-file-uploads');
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const file = path.join(dir, id);
+    let size = 0;
+    const sink = fs.createWriteStream(file, { mode: 0o600 });
+    try {
+      for await (const chunk of req) {
+        size += (chunk as Buffer).length;
+        if (size > CHANGE_LIMITS.file) throw Object.assign(new Error('Files over 512 MB can’t be uploaded here.'), { status: 413 });
+        if (!sink.write(chunk)) await new Promise<void>((resolve) => sink.once('drain', () => resolve()));
+      }
+      await new Promise<void>((resolve, reject) => { sink.end(); sink.once('finish', resolve); sink.once('error', reject); });
+    } catch (error) {
+      sink.destroy();
+      fs.rmSync(file, { force: true });
+      throw error;
+    }
+    const timer = setTimeout(() => this.dropFileUpload(id), 60 * 60_000);
+    timer.unref();
+    this.fileUploads.set(id, { file, projectId, principal, size, timer });
+    return { upload: id, size };
+  }
+
+  private dropFileUpload(id: string): void {
+    const upload = this.fileUploads.get(id);
+    if (!upload) return;
+    clearTimeout(upload.timer);
+    this.fileUploads.delete(id);
+    fs.rmSync(upload.file, { force: true });
+  }
+
+  /** One change of a batch as the request gave it: `write` takes an `upload`
+   * id (or `text`), a paste from another view names it (`fromTask`/`fromBranch`/`fromDefault`). */
+  private async fileChange(raw: any, projectId: string, session: Session, scratch: string, index: number, used: string[])
+    : Promise<FileChange | { error: string; status: number }> {
+    const op = raw?.op;
+    const named = (value: unknown) => typeof value === 'string' && value.trim() ? value : undefined;
+    if (op === 'write') {
+      const where = named(raw.path);
+      if (!where) return { error: 'write needs a path', status: 400 };
+      const expect = raw.expect === null ? null : typeof raw.expect === 'string' ? raw.expect : undefined;
+      if (typeof raw.text === 'string') {
+        const source = path.join(scratch, String(index));
+        fs.writeFileSync(source, raw.text);
+        return { op, path: where, source, ...(expect !== undefined ? { expect } : {}) };
+      }
+      const upload = typeof raw.upload === 'string' ? this.fileUploads.get(raw.upload) : undefined;
+      const principal = (await this.deps.tokens.verify(session.apiToken))?.principal ?? '';
+      if (!upload || upload.projectId !== projectId || upload.principal !== principal)
+        return { error: 'That upload is gone: upload the file again.', status: 400 };
+      used.push(raw.upload);
+      return { op, path: where, source: upload.file, ...(expect !== undefined ? { expect } : {}) };
+    }
+    if (op === 'mkdir' || op === 'delete') {
+      const where = named(raw.path);
+      return where ? { op, path: where } : { error: `${op} needs a path`, status: 400 };
+    }
+    if (op === 'copy' || op === 'move') {
+      const from = named(raw.from), to = named(raw.to);
+      if (!from || !to) return { error: `${op} needs from and to`, status: 400 };
+      if (raw.fromTask === undefined && raw.fromBranch === undefined && !raw.fromDefault) return { op, from, to };
+      const source = new URL('http://localhost/');
+      if (raw.fromTask !== undefined) source.searchParams.set('task', String(raw.fromTask));
+      else if (raw.fromBranch !== undefined) source.searchParams.set('branch', String(raw.fromBranch));
+      const fromView = await this.filesView(session.apiToken, projectId, source);
+      if ('error' in fromView) return fromView;
+      if (op === 'move' && fromView.kind === 'task' && !(await this.sessionMay(session, 'task:edit', projectId, fromView.taskId)))
+        return { error: 'Moving a task’s files needs task:edit on it.', status: 403 };
+      return { op, from, to, fromView };
+    }
+    return { error: 'op must be write, mkdir, delete, copy or move', status: 400 };
+  }
+
+  /** Who a commit made on the Files page is by. */
+  private async commitAuthor(session: Session): Promise<{ name: string; email: string }> {
+    const user = session.userId ? await this.deps.identity?.userById(session.userId).catch(() => undefined) : undefined;
+    const email = user?.email || session.email;
+    return { name: user?.name || email || BRAND, email: email || `${BRAND}@localhost` };
+  }
+
+  /** Whether the caller may change what `node` is (a file) or holds (a folder), in `view`. */
+  private async filesWritable(session: Session, projectId: string, view: FileView, node: FileNode): Promise<boolean> {
+    if (view.kind === 'task') {
+      if (!(await this.sessionMay(session, 'task:edit', projectId, view.taskId))) return false;
+      return this.projectFiles().writePlaces(projectId, view).then(() => node.source.kind !== 'data' || node.source.access === 'write', () => false);
+    }
+    if (node.source.kind !== 'repository') return false;
+    // A branch view writes only to repositories that have that branch.
+    if (view.kind === 'branch' && node.source.branch !== view.name) return false;
+    return (await this.deps.tokens.check(session.apiToken, `merge-into:${node.source.branch}`, { projectId })).ok;
   }
 
   /** What `?task=` (a number or id) or `?branch=` asks the Files page to show, or a refusal. */
