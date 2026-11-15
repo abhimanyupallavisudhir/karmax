@@ -2457,6 +2457,48 @@ export class KarmaxApi {
    * prompt via `task:edit` — must themselves be able to grant every capability
    * in it; otherwise an administrator's draft is a privilege-escalation template.
    */
+  /**
+   * A person acting on a task (a Retry, a message, Run again on a series)
+   * renews its permission to act for them when it lapsed or is about to: the
+   * task's own delegation and each agent's. A delegation tavya minted must
+   * never strand a task (they last 30 days, and a turn mints from one), and
+   * the person it acts for, here now, is the consent it needs. Only that
+   * person, and only while they still hold the task's stored authority;
+   * anyone else leaves it as it is (the turn then says who renews it).
+   */
+  private async renewLapsedDelegations(token: string, caller: ScopedToken, task: TaskRecord): Promise<TaskRecord> {
+    if (caller.kind !== 'human' || caller.humanSubject?.presence !== 'interactive') return task;
+    type Entry = { delegationId?: string; principal?: string; scope?: AuthorizationSelection['scope']; projectIds?: string[]; organizationId?: string };
+    const own = task.params?._authorization as Entry | undefined;
+    const agents = this.storedAgentAuthorizations(task) as Record<string, Entry>;
+    const entries: Array<[string | undefined, Entry]> = [[undefined, own ?? {}], ...Object.entries(agents)];
+    const lapsing: Array<[string | undefined, Entry]> = [];
+    for (const [key, entry] of entries)
+      if (entry.delegationId && (await this.deps.tokens.delegationLapsing(entry.delegationId, task.id))) lapsing.push([key, entry]);
+    if (!lapsing.length) return task;
+    try { await this.assertStoredGrantQueueable(token, caller, task); } catch { return task; }
+    const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId;
+    const githubAccountId = typeof task.params?._githubAccountId === 'string' ? task.params._githubAccountId : undefined;
+    const renewed = new Map<string | undefined, string>();
+    for (const [key, entry] of lapsing) {
+      const delegation = await this.deps.tokens.renewHumanDelegation(token, { taskId: task.id, delegationId: entry.delegationId!,
+        humanUserId: entry.principal?.startsWith('user:') ? entry.principal.slice(5) : undefined,
+        scope: tokenScopeOf(entry, task.projectId, organizationId),
+        externalIdentities: githubAccountId ? { githubAccountId } : undefined });
+      if (delegation) renewed.set(key, delegation.id);
+    }
+    if (!renewed.size) return task;
+    const current = (await this.deps.store.getTask(task.id)) ?? task;
+    const patch: Record<string, unknown> = {};
+    if (renewed.has(undefined)) patch._authorization = { ...current.params._authorization as object, delegationId: renewed.get(undefined) };
+    const agentEntries = this.storedAgentAuthorizations(current);
+    let agentsChanged = false;
+    for (const [key, id] of renewed) if (key && agentEntries[key]) { agentEntries[key] = { ...agentEntries[key], delegationId: id }; agentsChanged = true; }
+    if (agentsChanged) patch._agentAuthorization = agentEntries;
+    await this.deps.store.patchTaskParams(task.id, patch);
+    return (await this.deps.store.getTask(task.id)) ?? current;
+  }
+
   private async assertStoredGrantQueueable(token: string, caller: ScopedToken, task: TaskRecord): Promise<void> {
     if (!this.deps.authorization || caller.kind === 'system') return;
     const stored = task.params?._authorization as { principal?: string; capabilities?: string[] } | undefined;
@@ -2758,12 +2800,24 @@ export class KarmaxApi {
       (await this.deps.store.patchTaskParams(target.id, { _agentAuthorization: agentAuthorizations }));
       target = (await this.deps.store.getTask(target.id))!;
     }
-    const sourceAuthorization = source.params?._authorization as { delegationId?: string } | undefined;
+    const sourceAuthorization = source.params?._authorization as {
+      delegationId?: string; scope?: AuthorizationSelection['scope']; projectIds?: string[]; organizationId?: string } | undefined;
     if (!sourceAuthorization?.delegationId) return target;
-    const parent = (await this.deps.tokens.deriveHumanDelegation(sourceAuthorization.delegationId, {
-      taskId: target.id, projectId: target.projectId,
-      organizationId: (await this.deps.store.getProject(target.projectId))?.organizationId,
+    const sourceDelegation = sourceAuthorization.delegationId;
+    // As far as the copy's tokens reach (`turnAuthority`): its authorization's
+    // scope, not only its project, or no turn of a run of an organization-wide
+    // series could ever mint.
+    const parent = (await this.deps.tokens.deriveHumanDelegation(sourceDelegation, {
+      taskId: target.id, ...tokenScopeOf(sourceAuthorization, target.projectId,
+        (await this.deps.store.getProject(target.projectId))?.organizationId),
+    }).catch(async (error: unknown) => {
+      // The source's lapsed (a series nobody ran by hand for 30 days): the copy
+      // keeps naming it, so its first turn says so and the person's Retry
+      // renews it (renewLapsedDelegations), instead of the copy never starting.
+      if (await this.deps.tokens.delegationLapsing(sourceDelegation, source.id)) return undefined;
+      throw error;
     }));
+    if (!parent) return target;
     (await this.deps.store.updateTaskParams(target.id, { ...target.params,
       _authorization: { ...(target.params._authorization as object), delegationId: parent.id },
       ...(parent.externalIdentities?.githubAccountId
@@ -3282,6 +3336,8 @@ export class KarmaxApi {
     const caller = (await this.require(token, 'create_task', { projectId: series?.projectId, taskId: seriesId }));
     if (!series) throw new NotFoundError(`no task ${seriesId}`);
     (await this.assertStoredGrantQueueable(token, caller, series));
+    // Run again by the person it acts for keeps the series' permission current.
+    const source = (await this.renewLapsedDelegations(token, caller, series));
     // A run an event started carries that event (wiki features/events-and-automations).
     // Each run listens for the series' follow-up triggers; the series never runs.
     const followUpTriggers = normalizeFollowUpTriggers(series.params);
@@ -3301,7 +3357,7 @@ export class KarmaxApi {
       delegate: series.delegate,
       confirmationPolicy: series.confirmationPolicy,
     }));
-    run = (await this.inheritTaskDelegation(series, run));
+    run = (await this.inheritTaskDelegation(source, run));
     (await this.persistTaskCredentialPolicies(run));
     (await this.followTriggerSubject(run, trigger));
     const { startType, input } = await this.buildStart(run, false, caller);
@@ -7325,6 +7381,8 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       (await this.require(token, 'project:settings:write', { projectId: scopedTask?.projectId, taskId }));
       if (!attemptChoice.otherAttempts) throw new ValidationError('choose keep or cancel before saving a default');
     }
+    // The person a task acts for, acting on it, renews a permission that lapsed.
+    if (signal !== SIG.cancel) (await this.renewLapsedDelegations(token, caller, scopedTask));
     // A run stopped on a pull request its project can no longer have: started
     // again from Working, as moving it back there does, before a Retry or a
     // message reaches it (staleTavyaPullRequestPolicy).

@@ -133,7 +133,7 @@ import { ensureProjectWikiRepositoryAsync } from '../wiki/repository.js';
 import { ensureProjectWikiRemote, moveProjectWikiToGithub } from '../wiki/project-wiki-remote.js';
 import { worldRepos, worldWorkingDirectory, worldWorkingRelativePath, type WorldHandle } from '../world/types.js';
 import { enumerateCredentials, normalizePolicy, resolveCredentials } from '../platform/credentials.js';
-import { errorStatus } from './error-status.js';
+import { clientWentAway, errorStatus } from './error-status.js';
 import { defaultAgentProfile, projectReadiness, usableAgentCredentials, type ReadinessDeps } from '../platform/readiness.js';
 import { reportError } from '../platform/error-reports.js';
 import { errorReportSettings, saveErrorReportSettings } from '../platform/error-fixer.js';
@@ -2172,7 +2172,7 @@ export class Gateway {
         return this.json(res, 202, { accepted: true, ...(first ? { event: first.event.id, duplicate: first.duplicate } : {}),
           ...(result.events.length > 1 ? { events: result.events.map(({ event, duplicate }) => ({ id: event.id, duplicate })) } : {}) });
       } catch (error) {
-        return this.fail(res, error);
+        return this.fail(res, error, req);
       }
     }
     // Agent mailbox inbound webhook (wiki plans/PLAN-passwords §8): authenticated by a
@@ -6063,7 +6063,7 @@ export class Gateway {
           return this.json(res, 200, await api.setAgentAuthority(token, agentAuthorityMatch[1]!, decodeURIComponent(agentAuthorityMatch[2]!),
             method === 'PUT' ? b.authority as AgentAuthority | undefined : undefined,
             { allowAttenuation: b.allowAttenuation === true, acceptAttenuation: b.acceptAttenuation === true }));
-        } catch (e) { return this.fail(res, e); }
+        } catch (e) { return this.fail(res, e, req); }
       }
       const workflowMatch = p.match(/^\/api\/tasks\/([^/]+)\/workflow$/);
       if (workflowMatch && method === 'PATCH') {
@@ -11629,6 +11629,10 @@ export class Gateway {
     return this.json(res, errorStatus(e, 400), { error: e instanceof Error ? e.message : String(e) });
   }
   private fail(res: http.ServerResponse, e: unknown, req?: http.IncomingMessage) {
+    // The client went away mid-request (a closed tab, a reload, lost signal):
+    // nobody is left to answer and nothing in tavya failed, so it is no bug to
+    // report. The metrics count it as a 499, like any request closed unanswered.
+    if (clientWentAway(e, req)) { res.destroy(); return; }
     const status = errorStatus(e, e instanceof AttachmentError && /too large/i.test(e.message) ? 413 : 500);
     // A 500 is a request nothing expected to fail: a bug to fix (wiki
     // features/error-reports). Other 5xx name a cause of their own (busy, a

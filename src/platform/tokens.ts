@@ -36,6 +36,24 @@ export interface HumanDelegation {
   expiresAt: number;
 }
 
+/** How long before it expires a person acting on a task renews its delegation. */
+export const DELEGATION_RENEW_WITHIN_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * A task's human delegation that lapsed on its own: it expired (they last
+ * 30 days), or it was withdrawn. Said so that whoever reads it knows what to
+ * do: the person it acts for renews it by acting on the task (a Retry, a
+ * message: `KarmaxApi.renewLapsedDelegations`).
+ */
+export class HumanDelegationLapsed extends Error {
+  constructor(readonly delegationId: string, readonly expiredAt?: number) {
+    super(`This task's permission to act for the person who authorized it ${expiredAt
+      ? `expired on ${new Date(expiredAt).toISOString().slice(0, 10)}` : 'was withdrawn'}. `
+      + 'It is renewed when that person presses Retry or sends the task a message.');
+    this.name = 'HumanDelegationLapsed';
+  }
+}
+
 export interface HumanDelegationArgs {
   taskId: string;
   projectId?: string;
@@ -175,6 +193,57 @@ export class TokenAuthority {
     return record;
   }
 
+  /** Why the delegation `id` no longer holds, when it lapsed on its own: it,
+   * or one it was derived from, expired or was withdrawn (revoked, purged, its
+   * person's account closed). Undefined when every link is live, so that what
+   * fails is a scope or identity the chain does not allow: never renewable. */
+  private async lapse(id: string): Promise<HumanDelegationLapsed | undefined> {
+    const seen = new Set<string>();
+    let expiredAt: number | undefined;
+    for (let next: string | undefined = id; next && !seen.has(next);) {
+      seen.add(next);
+      const row = this.store ? (await this.store.humanDelegationRow(next))
+        : this.delegations.has(next) ? { record: this.delegations.get(next) as unknown as Record<string, unknown>, revokedAt: undefined } : undefined;
+      const record = row?.record as unknown as HumanDelegation | undefined;
+      if (!record || row?.revokedAt || (await this.store?.kvGet(`account-closed:${record.humanUserId}`)))
+        return new HumanDelegationLapsed(id);
+      if (record.expiresAt <= Date.now()) expiredAt = Math.min(expiredAt ?? record.expiresAt, record.expiresAt);
+      next = record.parentDelegationId;
+    }
+    return expiredAt === undefined ? undefined : new HumanDelegationLapsed(id, expiredAt);
+  }
+
+  /** Whether the task `taskId` should have its delegation `id` renewed: it
+   * lapsed, or expires within `DELEGATION_RENEW_WITHIN_MS`. */
+  async delegationLapsing(id: string, taskId: string): Promise<boolean> {
+    const delegation = await this.delegation(id);
+    if (delegation) return delegation.taskId === taskId && delegation.expiresAt - Date.now() < DELEGATION_RENEW_WITHIN_MS;
+    return !!(await this.lapse(id));
+  }
+
+  /**
+   * Give a task a new delegation in place of `delegationId`, which lapsed or
+   * is about to (`delegationLapsing`), from the person it acts for, acting
+   * through an interactive session now. Same scope and pinned external
+   * identity, for this task (a copy of a series or attempt may name its
+   * source's, which lapsed before it could derive its own); a root of its
+   * own, since that person's presence is the consent.
+   * Undefined for anyone else, or when nothing needs renewing. The caller has
+   * checked that the person still holds the task's stored authority.
+   */
+  async renewHumanDelegation(token: string, args: { taskId: string; delegationId: string; humanUserId?: string;
+    scope: { projectId?: string; projectIds?: string[]; organizationId?: string }; externalIdentities?: ExternalIdentityClaims }): Promise<HumanDelegation | undefined> {
+    const caller = await this.verify(token);
+    if (caller?.kind !== 'human' || caller.humanSubject?.presence !== 'interactive') return undefined;
+    if (!(await this.delegationLapsing(args.delegationId, args.taskId))) return undefined;
+    const previous = (this.store ? (await this.store.humanDelegationRow(args.delegationId))?.record
+      : this.delegations.get(args.delegationId)) as unknown as HumanDelegation | undefined;
+    if (caller.humanSubject.userId !== (previous?.humanUserId ?? args.humanUserId)) return undefined;
+    const scope = previous ? { projectId: previous.projectId, projectIds: previous.projectIds, organizationId: previous.organizationId } : args.scope;
+    return (await this.issueDelegation({ ...scope, taskId: args.taskId, humanUserId: caller.humanSubject.userId,
+      externalIdentities: previous?.externalIdentities ?? args.externalIdentities }));
+  }
+
   /** Whether a token for this scope may carry the human delegation `id`. */
   async delegationCovers(id: string, scope: { projectId?: string; projectIds?: string[]; organizationId?: string }): Promise<boolean> {
     const delegation = await this.delegation(id);
@@ -272,8 +341,11 @@ export class TokenAuthority {
     if (parent) this.assertScopeWithin(parent, args);
     const delegationId = args.delegationId ?? parent?.delegationId;
     const delegation = delegationId ? (await this.delegation(delegationId)) : undefined;
-    if (delegationId && (!delegation || delegation.taskId !== args.taskId))
+    if (delegationId && (!delegation || delegation.taskId !== args.taskId)) {
+      const lapsed = delegation ? undefined : (await this.lapse(delegationId));
+      if (lapsed) throw lapsed;
       throw new Error('invalid, expired, or task-mismatched human delegation');
+    }
     if (delegation) this.assertScopeWithin(delegation, args);
     if (parent && delegation && (!parent.humanSubject
       || parent.humanSubject.userId !== delegation.humanUserId
@@ -529,6 +601,8 @@ export class TokenAuthority {
     if (this.store) return (await this.store.revokeHumanDelegationsForTask(taskId));
     let revoked = 0;
     for (const [id, record] of this.delegations) if (record.taskId === taskId) {
+      // What was derived from it is handed to its parent (Store.revokeHumanDelegations).
+      for (const child of this.delegations.values()) if (child.parentDelegationId === id) child.parentDelegationId = record.parentDelegationId;
       this.delegations.delete(id); revoked++;
     }
     return revoked;
