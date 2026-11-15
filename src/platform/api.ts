@@ -7213,6 +7213,19 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     } catch { return undefined; }
   }
 
+  /** A task stopped because its run asked for a pull request on repositories
+   * tavya hosts: its input predates 5c242ab3 (tavya-error 5b7a123b7e52ac15,
+   * tavya.io 2026-11-14), and a run replays the input it started with, so its
+   * Retry failed the same way forever. The project lands by push now. */
+  private async staleTavyaPullRequestPolicy(task: TaskRecord): Promise<boolean> {
+    const view = task.lastView;
+    if (!this.deps.hosted || view?.status !== 'blocked') return false;
+    const said = `${view.error ?? ''}\n${view.waitingFor?.detail ?? ''}`;
+    if (!/no repository in this world has a GitHub origin remote|none of this task's repositories is on GitHub/.test(said)) return false;
+    const project = (await this.deps.store.getProject(task.projectId));
+    return !!project && landsByPushOnTavya((await this.deps.store.effectiveProjectConfig(project)).repos);
+  }
+
   private async deliverSignal(tool: 'signal_task' | 'message_agent', token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt?: { monoMs: number; wallMs: number },
     /** Shared-conversation fields of a follow-up: who says it and to whom. */
     addressed?: Partial<Pick<Message, 'role' | 'author' | 'authorLabel' | 'to'>>): Promise<SentMessage | undefined> {
@@ -7236,6 +7249,15 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     if (attemptChoice?.saveOtherAttemptsDefault) {
       (await this.require(token, 'project:settings:write', { projectId: scopedTask?.projectId, taskId }));
       if (!attemptChoice.otherAttempts) throw new ValidationError('choose keep or cancel before saving a default');
+    }
+    // A run stopped on a pull request its project can no longer have: started
+    // again from Working, as moving it back there does, before a Retry or a
+    // message reaches it (staleTavyaPullRequestPolicy).
+    if ((signal === SIG.retry || signal === SIG.followUp) && (await this.staleTavyaPullRequestPolicy(scopedTask))) {
+      const view = await this.transitionSourceView(scopedTask);
+      await this.stopTaskActivity(scopedTask, view, 'Started again to land by push on repositories tavya hosts');
+      await this.startTransitionReplacement(scopedTask, view, 'do');
+      if (signal === SIG.retry) return undefined;
     }
     if (signal === SIG.followUp) {
       const message: Message = { id: `u${randomUUID()}`, role: 'user', text: text ?? '', ts: Date.now(),

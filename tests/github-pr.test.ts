@@ -2596,7 +2596,9 @@ describe('PR stage (remote policy "pr")', () => {
     await git(repo, ['add', '-A']);
     await git(repo, ['commit', '-q', '-m', 'init']);
     const handle = await core.createWorld({ taskId: 'task_pr2', repo, base: 'main', target: 'main', kind: 'worktree' });
-    await expect(core.openPr(handle, 'main', {})).rejects.toThrow(/GitHub origin/);
+    // It says what to change, and where: Remote policy in Project settings → Task defaults.
+    await expect(core.openPr(handle, 'main', {})).rejects.toThrow(
+      /none of this task's repositories is on GitHub\. In Project settings → Task defaults, set Remote policy to "Push after merging".*press Retry/);
     await core.destroyWorld(handle);
   });
 
