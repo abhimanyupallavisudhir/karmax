@@ -31,7 +31,7 @@ async function openList(page: Page, requests: Pending[], { slowLoads = 0, slowAn
     if (url.pathname === '/api/vault/requests') return route.fulfill({ json: requests });
     if (url.pathname === '/api/vault/items') return route.fulfill({ json: [
       { id: 'one', label: 'one.com' }, { id: 'github', label: 'GitHub' }, { id: 'r2', label: 'R2' }] });
-    if (['/api/permission-requests', '/api/authorization-requests', '/api/repository-access-requests'].includes(url.pathname))
+    if (['/api/permission-requests', '/api/authorization-requests', '/api/repository-access-requests', '/api/connections'].includes(url.pathname))
       return route.fulfill({ json: [] });
     return route.fulfill({ json: {} });
   });
