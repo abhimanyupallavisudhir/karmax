@@ -207,8 +207,18 @@ describe('public landing page', () => {
     expect(await row('Open source').first().locator('span').getAttribute('aria-label')).toBe('Yes');
     expect(await row('Open source').nth(1).locator('span').getAttribute('aria-label')).toBe('No');
     // What sets tavya apart leads: any model, work beyond code, the files Git ignores, workflows and autonomy.
-    expect(await table.locator('tbody th').allInnerTexts()).toEqual(['Choose any model', 'A cloud computer for every task', 'Work that is not code', 'Files Git ignores, and data in versions',
-      'App integrations', 'Review by any person or agent', 'Tasks that wait for other tasks', 'Agents run the whole project', 'Runs in your own cloud account', 'Open source']);
+    expect(await table.locator('tbody th').allInnerTexts()).toEqual(['Choose any model', 'A cloud computer for every task', 'Work that is not code',
+      '.env and key files, put back in place', 'Datasets and databases, in versions', 'App integrations', 'Review by any person or agent',
+      'Tasks that wait for other tasks', 'Tasks that run on hooks and events', 'Agents run the whole project', 'Supports your own cloud accounts', 'Open source']);
+    // A row says what each product does in words a passer-by follows: the kinds of work, where a file ends up.
+    const lists = async (label: string) => (await row(label).allInnerTexts()).map((text) => text.split('\n'));
+    expect((await lists('Work that is not code')).slice(0, 2)).toEqual([['Documents', 'Images, video', 'Purchases'], ['Documents']]);
+    // One thing to a line, however narrow the column: a list never breaks inside an item.
+    expect(await row('Work that is not code').first().evaluate((cell: any) => [cell.className, getComputedStyle(cell).whiteSpace])).toEqual(['part list', 'nowrap']);
+    expect(await row('.env and key files, put back in place').allInnerTexts()).toEqual(['✓', 'as variables', 'as variables', 'as variables, attachments', 'as variables', 'local runs only']);
+    expect(await row('Datasets and databases, in versions').allInnerTexts()).toEqual(['✓', 'uploads, no versions', '—', '—', '—', '—']);
+    expect(await row('Tasks that wait for other tasks').allInnerTexts()).toEqual(['✓', 'can be scripted manually', '—', 'can be scripted manually', '—', '✓']);
+    expect(await row('Tasks that run on hooks and events').allInnerTexts()).toEqual(['✓', '✓', '✓', '✓', '✓', '✓']);
     expect(await row('Choose any model').allInnerTexts()).toEqual(['✓', 'Claude only', 'OpenAI only', 'Fixed harness', 'Fixed harness', '✓']);
     // App integrations: each product lists what it has, one to a line; only tavya has a wallet.
     const integrations = (await row('App integrations').allInnerTexts()).map((text) => text.split('\n'));

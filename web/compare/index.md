@@ -6,7 +6,14 @@ How tavya compares with Claude Code on the web, Codex cloud, Devin, Cursor cloud
 
 {{comparison}}
 
-A tick means the vendor's documentation describes it. A dash means it does not offer it, or does not document it. A few words mean "in part". Under App integrations each product lists what it has: connected apps, saved website logins, stored passwords, secrets, a mailbox of the agent's own, and a wallet it can pay from. "Fixed harness" means the vendor's own agent with a choice of models. Each column links to a page with the details and the sources.
+A tick means the vendor's documentation describes it. A dash means it does not offer it, or does not document it. A few words mean "in part". Where a cell is a list, the product has those and not the rest. Each column links to a page with the details and the sources.
+
+- **Fixed harness**: the vendor's own agent, with a choice of models.
+- **Work that is not code**: the kinds of work the documentation presents as a use. Codex's are done in ChatGPT, which asks you before each purchase; tavya's agents pay from a card with a budget.
+- **.env and key files, put back in place**: tavya keeps them as secrets and writes each file back at its path for every task. "As variables" means you enter the values in a settings page and the task gets environment variables, not the files.
+- **Datasets and databases, in versions**: data too large for Git lives beside the code; a task works on its own copy, and its changes become the next version when it lands.
+- **App integrations**: connected apps, saved website logins, stored passwords, secrets, a mailbox of the agent's own, and a wallet it can pay from.
+- **Can be scripted manually**: there is no setting for it, but you can write a script that runs agents in order.
 
 ## What is the same everywhere
 

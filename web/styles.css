@@ -2577,6 +2577,7 @@ html[data-theme="dark"] .lp-light { display: none; }
 .lp-compare td.no { color: var(--l-ink-3); }
 .lp-compare td.part { color: var(--l-ink-2); font-size: var(--fs-13); line-height: 1.35; }
 .lp-compare td.part:nth-child(2) { color: var(--l-ink); font-weight: 600; }
+.lp-compare td.list { white-space: nowrap; }
 .lp-compare-foot { margin-top: 14px; color: var(--l-ink-3); font-size: var(--fs-14); text-align: center; }
 .lp-compare-foot a, .lp-answer a { color: var(--l-accent); text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--l-accent) 40%, transparent); text-underline-offset: 2px; }
 .lp-compare-foot a:hover, .lp-answer a:hover { text-decoration-color: currentColor; }

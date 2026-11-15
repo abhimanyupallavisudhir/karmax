@@ -118,19 +118,24 @@
     rows: [
       ['Choose any model', { tavya: 'yes', claude: 'Claude only', codex: 'OpenAI only', devin: 'Fixed harness', cursor: 'Fixed harness', paperclip: 'yes' }],
       ['A cloud computer for every task', { tavya: 'yes', claude: 'yes', codex: 'yes', devin: 'yes', cursor: 'yes', paperclip: 'optional' }],
-      ['Work that is not code', { tavya: 'yes', claude: 'yes', codex: 'through ChatGPT', devin: 'data and reports', cursor: 'alongside code', paperclip: 'yes' }],
-      ['Files Git ignores, and data in versions', { tavya: 'yes', claude: 'variables, uploads', codex: 'variables, a saved image', devin: 'secrets, a snapshot', cursor: 'secrets, a snapshot', paperclip: 'local files' }],
+      // The kinds of work each one's documentation presents as a use, beyond changing code.
+      ['Work that is not code', { tavya: ['Documents', 'Images, video', 'Purchases'], claude: ['Documents'], codex: ['Documents', 'Purchases'],
+        devin: ['Data and reports'], cursor: ['Chores in Slack, Linear'], paperclip: ['Documents', 'Images, video'] }],
+      // What Git leaves out: the secrets a project reads from files, and its data.
+      ['.env and key files, put back in place', { tavya: 'yes', claude: 'as variables', codex: 'as variables', devin: 'as variables, attachments', cursor: 'as variables', paperclip: 'local runs only' }],
+      ['Datasets and databases, in versions', { tavya: 'yes', claude: 'uploads, no versions', codex: 'no', devin: 'no', cursor: 'no', paperclip: 'no' }],
       ['App integrations', { tavya: ['Apps', 'Logins', 'Passwords', 'Secrets', 'Mailbox', 'Wallet'], claude: ['Apps', 'Secrets'], codex: ['Apps', 'Logins', 'Passwords', 'Secrets'],
         devin: ['Apps', 'Logins', 'Passwords', 'Secrets'], cursor: ['Apps', 'Secrets'], paperclip: ['Apps', 'Logins', 'Secrets', 'Mailbox'] }],
       ['Review by any person or agent', { tavya: 'yes', claude: 'Claude', codex: 'Codex', devin: 'Devin', cursor: 'Bugbot', paperclip: 'yes' }],
-      ['Tasks that wait for other tasks', { tavya: 'yes', claude: 'scripted', codex: 'no', devin: 'scripted', cursor: 'no', paperclip: 'yes' }],
+      ['Tasks that wait for other tasks', { tavya: 'yes', claude: 'can be scripted manually', codex: 'no', devin: 'can be scripted manually', cursor: 'no', paperclip: 'yes' }],
+      ['Tasks that run on hooks and events', { tavya: 'yes', claude: 'yes', codex: 'yes', devin: 'yes', cursor: 'yes', paperclip: 'yes' }],
       ['Agents run the whole project', { tavya: 'yes', claude: 'a coordinator; you merge', codex: 'a coordinator; you review', devin: 'a coordinator; agent approval', cursor: 'a coordinator; agent approval', paperclip: 'yes' }],
-      ['Runs in your own cloud account', { tavya: 'yes', claude: 'Team, Enterprise', codex: 'no', devin: 'yes', cursor: 'yes', paperclip: 'yes' }],
+      ['Supports your own cloud accounts', { tavya: 'yes', claude: 'Team, Enterprise', codex: 'no', devin: 'yes', cursor: 'yes', paperclip: 'yes' }],
       ['Open source', { tavya: 'yes', claude: 'no', codex: 'CLI only', devin: 'no', cursor: 'no', paperclip: 'yes' }],
     ],
     // What the comparison in full adds, including where the others are ahead.
     more: [
-      ['Sub-tasks, schedules and events', { tavya: 'yes', claude: 'yes', codex: 'yes', devin: 'yes', cursor: 'yes', paperclip: 'yes' }],
+      ['Sub-tasks and schedules', { tavya: 'yes', claude: 'yes', codex: 'yes', devin: 'yes', cursor: 'yes', paperclip: 'yes' }],
       ['Git hosts', { tavya: 'GitHub, or hosted by tavya', claude: 'GitHub', codex: 'GitHub, GitLab', devin: 'GitHub, GitLab, Bitbucket, Azure DevOps', cursor: 'GitHub, GitLab, Bitbucket, Azure DevOps', paperclip: 'not tied to one' }],
       ['Included in a plan you may already have', { tavya: 'no', claude: 'Claude plans', codex: 'ChatGPT plans', devin: 'no', cursor: 'Cursor plans', paperclip: 'free to self-host' }],
       ['A phone app', { tavya: 'in the browser', claude: 'yes', codex: 'yes', devin: 'yes', cursor: 'yes', paperclip: 'in the browser' }],
