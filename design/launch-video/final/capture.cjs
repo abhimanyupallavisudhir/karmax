@@ -293,7 +293,7 @@ const AUTOMATIONS = [
       await shot('vault', { dialog: page.locator('dialog[open], [role="dialog"]').filter({ visible: true }) });
       await page.keyboard.press('Escape');
     }
-    // 7a · An autonomous project (task #918 builds the toggle: drawn here as it looks there).
+    // 7a · An autonomous project (task #918's toggle; drawn as it looks there on a build without it).
     if (want('auto-project')) {
       await go('/personal?q=-is%3Aarchived', 900);
       await page.locator('#new-project').click();
@@ -301,6 +301,7 @@ const AUTOMATIONS = [
       await name.waitFor(); await sleep(400);
       await name.fill('acme');
       await page.evaluate(() => {
+        if (document.querySelector('#np-autonomous')) return;
         const actions = document.querySelector('.new-project-dialog .new-project-actions');
         const row = document.createElement('label');
         row.className = 'np-autonomous';
