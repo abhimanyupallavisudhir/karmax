@@ -5468,8 +5468,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const repos = worldRepos(world.handle);
       const targets = await githubPrTargets(world, handle);
       if (!targets.length) {
-        throw new Error('remote policy "pr" is on, but no repository in this world has a GitHub origin remote'
-          + ' — set the project\'s remote policy to "push"/"none", or give the repository a github.com origin');
+        throw new Error('This project\'s tasks open GitHub pull requests, but none of this task\'s repositories is on GitHub.'
+          + ' In Project settings → Task defaults, set Remote policy to "Push after merging", or move the repositories to GitHub; then press Retry.');
       }
       const task = (await store.getTask(handle.id));
       const workflowMinor = Number(String(task?.workflowVersion ?? '').split('.')[1] ?? 0);

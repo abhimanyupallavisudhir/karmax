@@ -1861,6 +1861,11 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       await gateway.installDefaultTasks(project);
       expect(await h.store.listTasks(project.id)).toEqual([]);
     }
+    // Repositories tavya hosts run no GitHub workflows: nothing to repair (it
+    // comes with the first failure once they move to GitHub).
+    const onTavya = await h.store.createProject('On tavya', { repos: ['tavya:repo_notes1/notes.git'] });
+    await gateway.installDefaultTasks(onTavya);
+    expect(await h.store.listTasks(onTavya.id)).toEqual([]);
   });
 
   it('takes repositories as people paste them: owner/name, a GitHub page or a clone URL', async () => {

@@ -4622,7 +4622,33 @@ function setupFixes(text, projectId) {
   if (/GitHub PR identity is not connected|Connect GitHub on your profile|reconnect GitHub on your profile/i.test(raw))
     return [{ label: 'Connect GitHub', href: '/profile' }];
   if (/connect GitHub in organization settings/i.test(raw)) return [{ label: 'Connect GitHub', href: `${settings}#settings-code` }];
-  return [];
+  // A login's quota is spent until it resets: another login runs it now.
+  if (/Out of quota until a login resets|Waiting for \S+ quota/.test(raw)) return [{ label: 'Add a login', href: `${settings}#settings-agents` }];
+  // Waiting its turn, or for room, on tavya's computers: one's own account starts it now.
+  if (/waiting ahead of this one for \S+'s |\S+'s? disks take \d+ of (?:their|its) \d+ GB/.test(raw)) return [own];
+  // Otherwise: the places it names.
+  return namedPlaces(raw, projectId);
+}
+/** Every settings place a message can name, linked: a message that tells a
+ * person where to change something takes them there. */
+function namedPlaces(text, projectId) {
+  const settings = globalRoute('organization');
+  const project = projectId ? projectRoute(projectId, 'settings') : '';
+  const places = [
+    [/Plan & billing/, 'Plan & billing', `${settings}#settings-plan`],
+    [/Settings \u2192 Computers?\b/, 'Computers', `${settings}#settings-computers`],
+    [/Settings \u2192 Agents\b/, 'Agents', `${settings}#settings-agents`],
+    [/Project settings \u2192 Task defaults/i, 'Task defaults', project && `${project}#project-defaults`],
+    [/Settings \u2192 Environment\b/, 'Environment', project && `${project}#project-environment`],
+    [/Settings \u2192 (?:Git & GitHub|Resources)\b|organization settings \u2192 GitHub/i, 'GitHub', `${settings}#settings-code`],
+    [/\bon your profile\b/, 'Profile', '/profile'],
+    [/\b[Pp]roject settings\b/, 'Project settings', project],
+    [/\b[Oo]rganization settings\b/, 'Organization settings', settings],
+  ];
+  const found = [];
+  for (const [pattern, label, href] of places)
+    if (href && pattern.test(text) && !found.some((place) => place.href === href || place.href.split('#')[0] === href)) found.push({ label, href });
+  return found.slice(0, 2);
 }
 function setupFix(text) { return setupFixes(text)[0] ?? null; }
 function setupFixHtml(text, projectId) {
@@ -4635,10 +4661,10 @@ function inlineErrorHtml(error) {
   const plain = plainError(error);
   return plain === raw ? esc(plain) : `<span title="${esc(raw)}">${esc(plain)}</span>`;
 }
-function taskErrorHtml(text) {
+function taskErrorHtml(text, projectId) {
   const { summary: said, detail, generic } = plainTaskError(text);
-  const summary = generic && !setupFix(text) && !/\bretry\b/i.test(said) ? `${said} Press Retry to try again.` : said;
-  return `<div class="msg-text">${esc(summary)}${setupFixHtml(text)}</div>${detail ? `<details class="error-details"><summary>Details</summary><pre>${esc(detail)}</pre></details>` : ''}`;
+  const summary = generic && !setupFixes(text, projectId).length && !/\bretry\b/i.test(said) ? `${said} Press Retry to try again.` : said;
+  return `<div class="msg-text">${esc(summary)}${setupFixHtml(text, projectId)}</div>${detail ? `<details class="error-details"><summary>Details</summary><pre>${esc(detail)}</pre></details>` : ''}`;
 }
 
 // Why a sign-in was refused, in words: a wrong password is only one reason.
@@ -13647,7 +13673,7 @@ function conversationReviewInfo(v, resourcesShown = false) {
 
 // A failure the workflow recorded, in the conversation where the work happened.
 function conversationError(v) {
-  return v.error ? `<div class="msg system error" role="alert"><div class="role">Something went wrong</div>${taskErrorHtml(v.error)}</div>` : '';
+  return v.error ? `<div class="msg system error" role="alert"><div class="role">Something went wrong</div>${taskErrorHtml(v.error, v.projectId)}</div>` : '';
 }
 
 // Expand in place so live messages, scroll position and unsent attachments survive.
@@ -14841,7 +14867,7 @@ function renderConversationEntry(entry, v = S.view) {
   if (entry.type === 'input-request') {
     const escalate = v.waitingFor?.kind === 'human' || v.waitingFor?.kind === 'parent'
       ? `<button class="btn sm ghost escalate-request" title="Pass this to someone who can answer">Escalate…</button>` : '';
-    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div>${v.waitingFor?.reason === 'error' ? taskErrorHtml(entry.request.text) : `<div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math, formContext(entry))}</div>`}${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div>${v.waitingFor?.reason === 'error' ? taskErrorHtml(entry.request.text, v.projectId) : `<div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math, formContext(entry))}</div>`}${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
   }
   if (entry.type === 'message') {
     const m = entry.message;

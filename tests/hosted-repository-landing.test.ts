@@ -40,9 +40,14 @@ describe('a task on repositories tavya hosts', () => {
     const tokens = new TokenAuthority();
     const token = (await tokens.mintPrincipal('user:creator', ['*'], project.id)).token;
     const inputs: TaskInput[] = [];
-    const client = { workflow: { start: async (_type: string, options: { args: [TaskInput] }) => { inputs.push(options.args[0]); } } } as any;
+    const signals: string[] = [];
+    const handle = (id: string) => ({ workflowId: id, signal: async (name: string) => { signals.push(name); },
+      result: async () => undefined, terminate: async () => undefined, query: async () => (await store.getTask(id))?.lastView,
+      describe: async () => ({ status: { name: 'COMPLETED' } }) });
+    const client = { workflow: { start: async (_type: string, options: { args: [TaskInput] }) => { inputs.push(options.args[0]); },
+      getHandle: (id: string) => handle(id) } } as any;
     const api = new KarmaxApi({ store, tokens, client, taskQueue: 'test', hosted: true });
-    return { store, api, token, project, inputs };
+    return { store, api, token, project, inputs, signals };
   }
 
   it.each([
@@ -60,8 +65,9 @@ describe('a task on repositories tavya hosts', () => {
     } finally { await f.store.close(); }
   });
 
-  // Every later start — a queued draft, a retry, a stage move — rebuilds the
-  // input the same way (buildStart), so a task stopped by this error recovers.
+  // Every later start — a queued draft, a stage move — rebuilds the input the
+  // same way (buildStart). A run replays the input it started with, so a task
+  // this error stopped starts again on its Retry or a message (below).
   it('lands by push when a draft is queued later', async () => {
     const f = await fixture();
     try {
@@ -69,6 +75,41 @@ describe('a task on repositories tavya hosts', () => {
       expect(f.inputs).toHaveLength(0);
       await f.api.queueTask(f.token, draft.id);
       expect(f.inputs[0]!.project.remote).toBe('push');
+    } finally { await f.store.close(); }
+  });
+
+  // tavya.io, 2026-11-14 (arjun-bhardwaj/upsc #4, caren/formatter #2 and #4):
+  // tasks started before the fix were left stopped on this error.
+  it.each(['retry', 'followUp'])('starts a task its run stopped on that pull request again from Working, on its %s', async (signal) => {
+    const f = await fixture();
+    try {
+      const task = await f.api.createTask(f.token, { projectId: f.project.id, workflow: 'software-dev', prompt: 'write notes' } as any);
+      const refusal = 'Activity task failed → remote policy "pr" is on, but no repository in this world has a GitHub origin remote'
+        + ' — set the project\'s remote policy to "push"/"none", or give the repository a github.com origin';
+      await f.store.saveView(task.id, { taskId: task.id, title: 'write notes', workflow: 'software-dev', stage: 'pr', status: 'blocked', error: refusal,
+        waitingFor: { kind: 'human', reason: 'error', audience: ['@creator'], detail: refusal }, messages: [], state: {},
+        actions: [{ name: 'retry', kind: 'signal', label: 'Retry', enabled: true }, { name: 'followUp', kind: 'signal', label: 'Send', enabled: true }],
+        updatedAt: Date.now() } as any);
+      await f.api.signalTask(f.token, task.id, signal, signal === 'followUp' ? 'I just want the code' : undefined);
+      expect(f.inputs).toHaveLength(2);
+      expect(f.inputs[1]!.project.remote).toBe('push');
+      expect(f.inputs[1]!.recovery).toMatchObject({ resumeStage: 'do' });
+      expect(f.signals).toContain('prepareLifecycleReplacement');
+      // A message goes on to the new run.
+      if (signal === 'followUp') expect(f.signals.at(-1)).toBe('followUp');
+    } finally { await f.store.close(); }
+  });
+
+  it('retries any other stopped task in its own run', async () => {
+    const f = await fixture('github');
+    try {
+      const task = await f.api.createTask(f.token, { projectId: f.project.id, workflow: 'software-dev', prompt: 'write notes' } as any);
+      await f.store.saveView(task.id, { taskId: task.id, title: 'write notes', workflow: 'software-dev', stage: 'pr', status: 'blocked',
+        error: 'GitHub API 502', waitingFor: { kind: 'human', reason: 'error', audience: ['@creator'], detail: 'GitHub API 502' }, messages: [], state: {},
+        actions: [{ name: 'retry', kind: 'signal', label: 'Retry', enabled: true }], updatedAt: Date.now() } as any);
+      await f.api.signalTask(f.token, task.id, 'retry');
+      expect(f.inputs).toHaveLength(1);
+      expect(f.signals).toEqual(['retry']);
     } finally { await f.store.close(); }
   });
 

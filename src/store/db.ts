@@ -579,13 +579,21 @@ export class Store {
           delete config[key];
         configChanged = true;
       }
-      // A hosted world's local merge is not a durable delivery destination.
-      // Migrate both an absent old default and an explicit old `none` choice.
-      // Workflow inputs already recorded in Temporal are unaffected; only new
-      // starts read this project/settings state.
-      if (process.env.KARMAX_DEPLOYMENT === 'hosted'
-        && (config.remote === undefined || config.remote === 'none')) {
+      // A hosted world's local merge is not a durable delivery destination:
+      // an explicit old `none` choice becomes `pr`. An absent one stays absent,
+      // which effectiveProjectConfig reads as the hosted default (`pr`, or `push`
+      // on repositories tavya hosts). Workflow inputs already recorded in
+      // Temporal are unaffected; only new starts read this project/settings state.
+      if (process.env.KARMAX_DEPLOYMENT === 'hosted' && config.remote === 'none') {
         config.remote = 'pr';
+        configChanged = true;
+      }
+      // A `pr` stored on repositories tavya hosts was that default written down
+      // (it was, until 2026-11-14): pull requests need GitHub, so it never
+      // applied, but Task defaults showed it as the project's own choice. Absent,
+      // the project opens pull requests again once its code moves to GitHub.
+      if (process.env.KARMAX_DEPLOYMENT === 'hosted' && config.remote === 'pr' && landsByPushOnTavya(config.repos)) {
+        delete config.remote;
         configChanged = true;
       }
       if (configChanged)
@@ -11552,7 +11560,9 @@ function writableProjectConfig(config: ProjectConfig): ProjectConfig {
   if (process.env.KARMAX_DEPLOYMENT !== 'hosted') return config;
   if (config.remote === 'none')
     throw new Error('hosted GitHub projects require remote policy "pr" or the advanced direct-push policy');
-  return config.remote === undefined ? { ...config, remote: 'pr' } : config;
+  // Absent is the hosted default, decided where it is read (effectiveProjectConfig):
+  // `pr`, or `push` on repositories tavya hosts.
+  return config;
 }
 
 function rowToProject(r: any): Project {
