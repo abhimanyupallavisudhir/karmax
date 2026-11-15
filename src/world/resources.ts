@@ -386,6 +386,11 @@ export class WorkspaceConflict extends Error {
 
 export { WorldNotRunningError };
 
+/** A data version too large to restore on the host to change a file of it. */
+export class ResourceTooLargeError extends Error {
+  constructor(name: string) { super(`${name} is too large to change here: change it in a task.`); }
+}
+
 export class ProjectResourceService {
   private publishLocks = new Map<string, Promise<void>>();
   /** How the work in progress opens worlds (`openingWith`); else the registry. */
@@ -947,6 +952,28 @@ export class ProjectResourceService {
     if (stat.isDirectory()) return this.importPath(attachmentId, root, '.');
     if (stat.isFile()) return this.importPath(attachmentId, path.dirname(root), path.basename(root));
     throw new Error('resource import source must be a regular file or directory');
+  }
+
+  /** The resource's current version, written into `target` on this host (a
+   * folder resource's files, or a file resource's one file named `name`), for
+   * the Files page to change and save back with `importDirectory`. Refuses a
+   * version larger than `maxBytes`: restoring it all to change one file
+   * would take too long here (a task changes such data instead). */
+  async restoreCurrentOnHost(attachmentId: string, target: string, maxBytes: number): Promise<{ revisionId?: string }> {
+    const attachment = (await this.requiredAttachment(attachmentId));
+    if (!isSnapshotDriver(attachment.driver)) throw new Error('only snapshot-backed resources hold files');
+    fs.mkdirSync(target, { recursive: true });
+    const revision = attachment.currentRevisionId ? await this.store.getResourceRevision(attachment.currentRevisionId) : undefined;
+    if (!revision) return {};
+    if (revision.engine !== RESTIC_ENGINE)
+      throw new Error(`${attachment.name} is still being converted to the current storage format; try again in an hour.`);
+    if ((revision.bytes ?? 0) > maxBytes) throw new ResourceTooLargeError(attachment.name);
+    const repository = this.restic.of(attachment, revision);
+    const ref = storedRef(revision);
+    // An on-demand version keeps each top-level folder in its own snapshot, each rooted at the resource.
+    for (const snapshot of ref.snapshot ? [ref.snapshot] : Object.values(ref.parts ?? {}).map((part) => part.snapshot))
+      await this.restic.restoreOnHost(repository, snapshot, target);
+    return { revisionId: revision.id };
   }
 
   /** Save `entry` of a directory on this host as the resource's new current version. */

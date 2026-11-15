@@ -179,3 +179,18 @@ async function validateGitDirectory(cwd: string): Promise<void> {
   if (path.dirname(path.dirname(directory)) !== common || path.basename(path.dirname(directory)) !== 'worktrees')
     throw new Error('foreign common Git directory');
 }
+
+/** `git` with `input` on its stdin, in a repository of tavya's own making (a
+ * scratch clone or index): no repository configuration is checked. */
+export function gitWithInput(cwd: string, args: string[], input: string, env: Record<string, string> = {}): Promise<GitResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.quotePath=false', ...args],
+      { cwd, env: { ...process.env, ...hostGitEnvironment(), ...env, GIT_TERMINAL_PROMPT: '0' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (code) => resolve({ code: code ?? 1, stdout, stderr }));
+    child.stdin.end(input);
+  });
+}

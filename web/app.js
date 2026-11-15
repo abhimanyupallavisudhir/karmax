@@ -14052,6 +14052,17 @@ function taskBar(v, tab) {
 }
 
 // The conversation's part of the toolbar.
+// A task's own Files and Wiki (its world, live or as last saved), beside Work locally.
+function taskPlacesLinks(v) {
+  if (!(v.world || v.worldAvailable || v.worldPath)) return '';
+  const record = taskRecord(v.taskId);
+  const pid = record?.projectId || S.projectId;
+  if (!pid) return '';
+  const view = `task:${record?.num ?? v.taskId}`;
+  return `<a class="btn tool" id="task-files" data-spa href="${esc(filesRoute(pid, '', view))}" data-tool="Files" title="This task’s files" aria-label="Files">${ICON.files}<span class="tool-label">Files</span></a>
+      <a class="btn tool" id="task-wiki" data-spa href="${esc(wikiRoute(pid, view))}" data-tool="Wiki" title="This task’s wiki" aria-label="Wiki">${ICON.wiki}<span class="tool-label">Wiki</span></a>`;
+}
+
 function conversationBar(v, t) {
   // Only subscription/CLI sessions carry a config home; API-key / stateless
   // sessions can't be forked from a terminal, so no command is shown. The session
@@ -14075,6 +14086,7 @@ function conversationBar(v, t) {
       <button class="btn tool" id="find-in-conversation" data-tool="Find" data-shortcut="task.find" title="Find in conversation (${esc(fmtKeys('meta+f'))})" aria-label="Find" aria-pressed="${conversationSearchOpen(v, t)}">${ICON.find}<span class="tool-label">Find</span></button>
       <button class="btn tool" id="share-task-conversation" data-tool="Share" data-role="${esc(t.role)}" title="Share this conversation" aria-label="Share">${ICON.share}<span class="tool-label">Share</span></button>
       <button class="btn tool" id="fork-task-agent" data-tool="Fork" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation" aria-label="Fork">${ICON.fork}<span class="tool-label">Fork</span></button>
+      ${taskPlacesLinks(v)}
       ${S.meta?.hosted ? `<button type="button" class="btn tool" id="local-checkout" data-tool="Work locally" title="Check out this task on your computer" aria-label="Work locally">${ICON.laptop}<span class="tool-label">Work locally</span></button>` : ''}
       ${copy}
       <button class="btn tool" id="save-task-template" data-tool="Save as template" title="Save this task’s form as a template, to start new tasks from" aria-label="Save as template">${ICON.template}<span class="tool-label">Save as template</span></button>
@@ -19896,13 +19908,6 @@ async function wireFilesView(proj) {
   try { node = await filesLoad(pid, filePath); }
   catch (error) {
     if (!shows()) return;
-    // A scratch task's world is still being made: say so, and look again shortly.
-    if (S.filesTermWanted && S.filesTermWanted === (S.filesView || '') && /no files yet/i.test(error.message)) {
-      $('#files-body').innerHTML = '<div class="files-status" role="status" aria-busy="true">Starting a workspace…</div>';
-      clearTimeout(wireFilesView.retry);
-      wireFilesView.retry = setTimeout(() => { if (shows()) wireFilesView(proj); }, 3000);
-      return;
-    }
     $('#files-body').innerHTML = `<div class="files-status error" role="alert"><span>${esc(plainError(error.message))}</span>
       <button class="btn sm" id="files-retry">Try again</button></div>`;
     $('#files-retry')?.addEventListener('click', () => { filesState().cache.clear(); $('#files-page').dataset.path = '\u0000'; renderMain(); });
@@ -19933,8 +19938,9 @@ async function wireFilesView(proj) {
 // upload files or a folder (u, a drop, or pasting files), and edit a text file
 // (e; ⌘S saves). Each action is one POST …/files/changes: in a task's view it
 // is written into its world, in a branch view it is one commit on that branch.
-// The terminal (Ctrl+`) is a task world's: in the default or a branch view it
-// starts a scratch task at that branch and opens there.
+// In the default or a branch view an upload first asks where each file belongs
+// (Git, data or a secret: POST …/files/plan), and asks you only when not all
+// of it is Git. In a task's view, the terminal (Ctrl+`) opens its world's shell.
 const FM_ICON = (() => {
   const svg = (body) => `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
   return {
@@ -20012,7 +20018,11 @@ function refreshFilesPage() {
 async function applyFileChanges(pid, changes, done = 'Done', { view = S.filesView, refresh = true } = {}) {
   const result = await api(filesChangesUrl(pid, view), { method: 'POST', body: JSON.stringify({ changes }) });
   const commit = result?.commits?.[0];
-  toast(commit ? `${done} · ${String(commit.commit).slice(0, 7)} on ${commit.branch}` : done);
+  // Where it went: a commit, data, secrets.
+  const kept = [commit ? `${String(commit.commit).slice(0, 7)} on ${commit.branch}` : '',
+    result?.data?.length ? `data: ${result.data.map((d) => d.name).join(', ')}` : '',
+    result?.secrets?.length ? `${result.secrets.length} secret${result.secrets.length === 1 ? '' : 's'}` : ''].filter(Boolean);
+  toast(kept.length ? `${done} · ${kept.join(' · ')}` : done);
   if (refresh) refreshFilesPage();
   return result;
 }
@@ -20117,6 +20127,19 @@ async function uploadFilesInto(pid, dir, items) {
   const top = new Set(items.map((item) => FV.parts(item.rel)[0]));
   const replacing = [...top].filter((name) => filesNamesHere().has(name));
   if (replacing.length && !confirm(`Replace ${replacing.length === 1 ? `“${replacing[0]}”` : `${replacing.length} items`}?`)) return;
+  // In a branch view, what is not for Git (secrets, large or ignored files) is asked about first.
+  if (!(S.filesView || '').startsWith('task:')) {
+    let planned;
+    try { planned = await api(`/api/projects/${encodeURIComponent(pid)}/files/plan${filesViewQuery(S.filesView, '?')}`,
+      { method: 'POST', body: JSON.stringify({ items: items.map((item) => ({ path: FV.join(dir, item.rel), size: item.file.size })) }) }); }
+    catch (error) { return filesFail(error); }
+    const byPath = new Map((planned.items || []).map((plan) => [plan.path, plan]));
+    items = items.map((item) => ({ ...item, plan: byPath.get(FV.join(dir, item.rel)) || { keep: 'git' } }));
+    if (items.some((item) => item.plan.keep !== 'git' && !item.plan.fixed)) {
+      items = await chooseUploadPlaces(dir, items, !!planned.canKeep);
+      if (!items?.length) return;
+    }
+  }
   const status = $('#files-progress');
   const total = items.reduce((sum, item) => sum + item.file.size, 0);
   let sent = 0;
@@ -20127,7 +20150,8 @@ async function uploadFilesInto(pid, dir, items) {
       show(`Uploading ${index + 1} of ${items.length}${total > 1_000_000 ? ` · ${Math.floor((sent / total) * 100)}%` : ''}`);
       const staged = await api(`/api/projects/${encodeURIComponent(pid)}/files/uploads`, { method: 'POST', body: item.file, headers: { 'content-type': 'application/octet-stream' } });
       sent += item.file.size;
-      changes.push({ op: 'write', path: FV.join(dir, item.rel), upload: staged.upload });
+      changes.push({ op: 'write', path: FV.join(dir, item.rel), upload: staged.upload,
+        ...(item.keep === 'data' || item.keep === 'secret' ? { keep: item.keep } : {}), ...(item.keep === 'data' && item.dataFolder ? { dataFolder: item.dataFolder } : {}) });
     }
     show('Saving…');
     for (let at = 0; at < changes.length; at += 1000)
@@ -20135,6 +20159,83 @@ async function uploadFilesInto(pid, dir, items) {
   } catch (error) { filesFail(error); }
   finally { show(''); }
 }
+// Where each upload goes, as tavya recommends: Git, data, or a secret. A
+// folder is one choice (Git or data); a secret is always a file of its own.
+// Without project settings access only Git is possible, and secrets are left out.
+const KEEP_LABELS = { git: 'Git', data: 'Data', secret: 'Secret' };
+const KEEP_TIPS = { git: 'Committed to the branch', data: 'Kept as project data, with versions; tasks get it in place', secret: 'Kept as a project secret, never in Git; tasks get it in place' };
+function uploadRows(dir, items) {
+  const rows = [], folders = new Map();
+  for (const item of items) {
+    const parts = FV.parts(item.rel);
+    if (parts.length > 1 && item.plan.keep !== 'secret') {
+      const name = parts[0];
+      let row = folders.get(name);
+      if (!row) { row = { name, folder: true, items: [], size: 0, keep: 'git' }; folders.set(name, row); rows.push(row); }
+      row.items.push(item); row.size += item.file.size;
+      if (item.plan.keep === 'data' && row.keep !== 'data') { row.keep = 'data'; row.why = item.plan.why; }
+    } else rows.push({ name: item.rel, folder: false, items: [item], size: item.file.size, keep: item.plan.keep, why: item.plan.why, fixed: item.plan.fixed });
+  }
+  return rows;
+}
+function chooseUploadPlaces(dir, items, canKeep) {
+  return new Promise((resolve) => {
+    const rows = uploadRows(dir, items);
+    for (const row of rows) {
+      row.recommended = row.keep;
+      // Nothing secret may reach Git: without settings access a secret is left out.
+      if (!canKeep && row.keep !== 'git' && !row.fixed) { row.keep = row.keep === 'secret' ? 'skip' : 'git'; }
+    }
+    const dialog = document.createElement('dialog');
+    dialog.className = 'modal-card files-upload-dialog';
+    dialog.setAttribute('aria-label', 'Upload');
+    const count = items.length;
+    const noAccess = 'Needs project settings access';
+    const rowHtml = (row, i) => {
+      const choices = row.fixed ? ['data'] : row.folder ? ['git', 'data'] : ['git', 'data', 'secret'];
+      return `<li class="files-upload-row${row.keep === 'skip' ? ' skipped' : ''}" data-i="${i}">
+        <span class="files-icon">${row.folder ? FV.ICONS.directory : FV.ICONS.file}</span>
+        <span class="files-upload-name"><span class="files-name" title="${esc(FV.join(dir, row.name))}">${esc(row.name)}${row.folder ? '/' : ''}</span>
+          <span class="files-upload-meta">${row.folder ? `${row.items.length} files · ` : ''}${esc(FV.formatBytes(row.size))}${row.recommended !== 'git' && row.why ? ` · ${esc(row.why)}` : ''}</span></span>
+        <span class="segmented sm files-upload-keep" role="radiogroup" aria-label="Keep ${esc(row.name)} in">${choices.map((keep) => {
+          const disabled = keep !== 'git' && !canKeep && !row.fixed;
+          return `<button type="button" role="radio" data-keep="${keep}" aria-checked="${row.keep === keep}" aria-pressed="${row.keep === keep}"${disabled ? ' disabled' : ''}
+            title="${esc(disabled ? noAccess : `${KEEP_TIPS[keep]}${keep === row.recommended ? ' (recommended)' : ''}`)}">${KEEP_LABELS[keep]}${keep === row.recommended ? '<span class="files-upload-rec" aria-hidden="true"></span>' : ''}</button>`;
+        }).join('')}</span>
+        <button type="button" class="icon-btn files-upload-skip" title="${row.keep === 'skip' ? 'Upload it' : 'Leave it out'}" aria-label="${row.keep === 'skip' ? 'Upload' : 'Leave out'} ${esc(row.name)}">${row.keep === 'skip' ? '↺' : '✕'}</button>
+      </li>`;
+    };
+    const paint = () => {
+      dialog.querySelector('.files-upload-list').innerHTML = rows.map(rowHtml).join('');
+      const left = rows.filter((row) => row.keep !== 'skip').reduce((n, row) => n + row.items.length, 0);
+      const go = dialog.querySelector('.files-upload-go');
+      go.disabled = !left;
+      go.textContent = left === count ? 'Upload' : `Upload ${left}`;
+    };
+    dialog.innerHTML = `<form method="dialog" class="files-upload-form"><h2>Upload ${count === 1 ? FV.parts(items[0].rel).pop() : `${count} files`}</h2>
+      <ul class="files-upload-list" role="list"></ul>
+      <div class="inline-form files-upload-actions"><button type="button" class="btn files-upload-cancel">Cancel</button><button class="btn primary files-upload-go" value="go">Upload</button></div></form>`;
+    dialog.addEventListener('click', (event) => {
+      const row = rows[Number(event.target.closest('.files-upload-row')?.dataset.i)];
+      if (!row) { if (event.target.closest('.files-upload-cancel')) dialog.close(); return; }
+      const choice = event.target.closest('[data-keep]:not(:disabled)');
+      if (choice) { row.keep = choice.dataset.keep; paint(); dialog.querySelector(`.files-upload-row[data-i="${rows.indexOf(row)}"] [data-keep="${row.keep}"]`)?.focus(); }
+      if (event.target.closest('.files-upload-skip')) { row.keep = row.keep === 'skip' ? (canKeep ? row.recommended : 'git') : 'skip'; paint(); }
+    });
+    dialog.addEventListener('keydown', (event) => event.stopPropagation());
+    dialog.addEventListener('close', () => {
+      dialog.remove();
+      if (dialog.returnValue !== 'go') return resolve(null);
+      resolve(rows.filter((row) => row.keep !== 'skip').flatMap((row) => row.items.map((item) => ({ ...item,
+        keep: row.fixed ? 'git' : row.keep, ...(row.folder && row.keep === 'data' ? { dataFolder: FV.join(dir, row.name) } : {}) }))));
+    }, { once: true });
+    document.body.appendChild(dialog);
+    paint();
+    dialog.showModal();
+    dialog.querySelector('.files-upload-go')?.focus();
+  });
+}
+
 function pickFilesToUpload(pid, folder) {
   const input = document.createElement('input');
   input.type = 'file';
@@ -20232,13 +20333,13 @@ function filesActionsHtml(node) {
   const view = S.filesView || '';
   const folder = node.kind === 'directory' && node.writable;
   const tool = (id, label, icon, shortcut, keys) => `<button type="button" class="btn sm icon" id="${id}" data-shortcut="${shortcut}" title="${esc(label)} (${keys})" aria-label="${esc(label)}">${icon}</button>`;
-  const terminal = view.startsWith('task:') ? node.writable : !!filesProjectId();
+  const terminal = view.startsWith('task:') && node.writable;
   return `<span class="files-progress" id="files-progress" role="status" hidden></span>
     ${folder ? tool('files-new-file', 'New file', FM_ICON.newFile, 'files.newFile', 'T') + tool('files-new-folder', 'New folder', FM_ICON.newFolder, 'files.newFolder', 'F')
       + tool('files-upload', 'Upload', FM_ICON.upload, 'files.upload', 'U') : ''}
     ${node.kind !== 'directory' && node.path ? `<button type="button" class="btn sm icon" id="files-more" title="More" aria-label="More" aria-haspopup="menu">${FM_ICON.more}</button>` : ''}
     ${terminal ? `<button type="button" class="btn sm icon${S.filesTermOpen ? ' active' : ''}" id="files-terminal" data-shortcut="files.terminal" aria-pressed="${!!S.filesTermOpen}"
-      title="${view.startsWith('task:') ? 'Terminal' : 'Terminal: opens in a new task at this branch'} (Ctrl+\`)" aria-label="Terminal">${FM_ICON.terminal}</button>` : ''}`;
+      title="Terminal (Ctrl+\`)" aria-label="Terminal">${FM_ICON.terminal}</button>` : ''}`;
 }
 
 function wireFileManager(pid, node) {
@@ -20249,10 +20350,8 @@ function wireFileManager(pid, node) {
   $('#files-upload')?.addEventListener('click', (event) => openFilesMenu(event.currentTarget, [
     { label: 'Files', run: () => pickFilesToUpload(pid, false) }, { label: 'A folder', run: () => pickFilesToUpload(pid, true) }]));
   $('#files-more')?.addEventListener('click', (event) => openFilesMenu(event.currentTarget, filesItemMenu(pid)));
-  $('#files-terminal')?.addEventListener('click', () => toggleFilesTerminal(pid));
+  $('#files-terminal')?.addEventListener('click', () => toggleFilesTerminal());
   installFileManagerKeys();
-  // A scratch task's world is ready: its terminal opens.
-  if (S.filesTermWanted && S.filesTermWanted === (S.filesView || '') && node.view?.id) { S.filesTermWanted = null; startFilesTerminal(node); }
   const body = $('#files-body');
   if (node.kind !== 'directory' || !body) return;
   const list = body.querySelector('.files-list');
@@ -20402,9 +20501,9 @@ function openFilesEditor(pid, node, text) {
 }
 
 // ── the terminal ──
-// A panel under the listing, kept open across folders. In a task's view it is
-// that world's shell, opened in the folder shown; elsewhere it starts a scratch
-// task at the view's branch and opens in its view once its world is ready.
+// A panel under the listing, kept open across folders: the task world's shell,
+// opened in the folder shown. Only a task's view has one (no machine stands
+// behind a branch).
 function filesTermPanelHtml() {
   if (!S.filesTermOpen) return '';
   const where = S.filesTerm?.cwd;
@@ -20419,11 +20518,10 @@ function wireFilesTerm() {
   const ft = S.filesTerm;
   if (!S.filesTermOpen) return;
   if (ft && termIsOpenFor(ft.taskId)) bindTermScreen($('#term-out'));
-  else if (!S.filesTermWanted) { const out = $('#term-out'); if (out) out.textContent = term ? '' : '[terminal closed]'; }
+  else { const out = $('#term-out'); if (out) out.textContent = term ? '' : '[terminal closed]'; }
 }
 function closeFilesTerminal() {
   S.filesTermOpen = false;
-  S.filesTermWanted = null;
   if (S.filesTerm && termIsOpenFor(S.filesTerm.taskId)) killTerminal();
   S.filesTerm = null;
   $('#files-term')?.remove();
@@ -20444,21 +20542,9 @@ function startFilesTerminal(node) {
   $('#files-terminal')?.setAttribute('aria-pressed', 'true');
   openTerminal(taskId, { cwd });
 }
-async function toggleFilesTerminal(pid) {
+function toggleFilesTerminal() {
   if (S.filesTermOpen) return closeFilesTerminal();
-  const node = S.filesNode, view = S.filesView || '';
-  if (view.startsWith('task:')) { if (node) startFilesTerminal(node); return; }
-  // No machine stands behind a branch: a scratch task at it gets one.
-  const branch = view.startsWith('branch:') ? view.slice(7) : '';
-  if (!confirm(`Open a terminal in a new task at ${branch || 'the default branch'}?`)) return;
-  try {
-    const task = await api('/api/tasks', { method: 'POST', body: JSON.stringify({ projectId: pid, title: `Terminal on ${branch || 'the default branch'}`,
-      workflow: 'script-exec', command: 'true', ...(branch ? { base: branch } : {}) }) });
-    S.filesTermWanted = `task:${task.num ?? task.id}`;
-    S.filesTermOpen = true;
-    S.filesTerm = null;
-    go(filesRoute(pid, filesFolder(node), S.filesTermWanted));
-  } catch (error) { filesFail(error); }
+  if ((S.filesView || '').startsWith('task:') && S.filesNode) startFilesTerminal(S.filesNode);
 }
 
 // ── Files: artifacts (wiki features/project-files) ──

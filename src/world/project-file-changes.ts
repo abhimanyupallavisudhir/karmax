@@ -6,9 +6,11 @@ import { spawn } from 'node:child_process';
 import type { GitBrokerCredential } from './git-broker.js';
 import type { World, WorldHandle } from './types.js';
 import { forgetMirroredTip, mirroredClone } from './git-mirror.js';
-import { git } from './git.js';
+import { git, gitWithInput } from './git.js';
 import { materializeGitCredential } from './git-credential.js';
-import { FileAccessError, FileNotFoundError, splitPath, type FileView, type ProjectFiles, type WritePlaces } from './project-files.js';
+import { exampleEnvironmentFile, likelySecret, sqliteDatabase } from '../domain/ignored-files.js';
+import { dotenvFile } from '../domain/dotenv.js';
+import { FileAccessError, FileNotFoundError, splitPath, type DataPlace, type FileView, type ProjectFiles, type WritePlaces } from './project-files.js';
 
 /**
  * Changing the project's Files (wiki features/project-files): what the file
@@ -23,15 +25,24 @@ import { FileAccessError, FileNotFoundError, splitPath, type FileView, type Proj
  *   tip once; an edit of a file someone changed since it was opened is refused
  *   (`expect`), never silently overwritten.
  *
- * Data mounted in a branch view is read-only here (a new version of a data
- * resource is made by a task, or imported in Settings); so are the project's
- * root, a repository's own folder and a data mount's.
+ * - data mounted there: each resource the batch touches gets ONE new version
+ *   (its current one restored on this host, changed, saved with restic; up to
+ *   DATA_EDIT_MAX, beyond which a task changes it).
+ *
+ * An upload may instead be kept as data (a new resource where it lands) or as
+ * a secret (a .env's variables become lines of that file in its repository;
+ * another file is kept whole), as `planUploads` recommends. The project's
+ * root and a repository's own folder are not changed here, nor is a data
+ * resource removed (Settings does that).
  */
 
 export type FileChange =
   /** `source`: a file on this host holding the bytes. `expect`: the version
    * replaced (an editor's save), or null for a file that must not exist yet. */
-  | { op: 'write'; path: string; source: string; expect?: string | null }
+  | { op: 'write'; path: string; source: string; expect?: string | null;
+    /** An upload kept out of Git: as data (in `dataFolder`, a new folder of
+     * data, when given), or as a secret. Branch views only. */
+    keep?: 'data' | 'secret'; dataFolder?: string }
   | { op: 'mkdir'; path: string }
   | { op: 'delete'; path: string }
   /** From this view, or `fromView` (a paste from another view or the default). */
@@ -44,6 +55,8 @@ export interface ApplyOptions {
   data: boolean;
   /** May the caller land work on `branch` (a branch view's commit)? */
   mayCommit?: (branch: string) => Promise<boolean>;
+  /** May the caller change the project's data and secrets (project:settings:write)? */
+  mayKeep?: () => Promise<boolean>;
 }
 
 export interface FileChangeAuthor { name: string; email: string }
@@ -51,7 +64,31 @@ export interface FileChangeAuthor { name: string; email: string }
 export interface FileChangeResult {
   /** Each commit pushed, in a branch view. */
   commits: Array<{ repository: string; branch: string; commit: string }>;
+  /** Each data resource given a new version, or made. */
+  data?: Array<{ name: string; created?: true }>;
+  /** Secrets stored (their names). */
+  secrets?: string[];
 }
+
+/** Where a kept file goes, inside its repository's folder. */
+export interface KeptPlace { repository: string; path: string }
+
+/** The project's data and secrets, as the Files page changes them. */
+export interface FileKeeping {
+  /** The resource's current version, if it has one. */
+  version(attachmentId: string): Promise<string | undefined>;
+  /** The resource's current version into `target` (refusing one over `maxBytes`). */
+  restore(attachmentId: string, target: string, maxBytes: number): Promise<{ revisionId?: string }>;
+  /** `source` (a folder, or a file-shaped resource's one file) as its new current version, if it is still `baseRevisionId`. */
+  save(attachmentId: string, source: string, baseRevisionId: string | undefined): Promise<void>;
+  /** A new data resource at `place`: `source` is its folder, or its one file. */
+  create(projectId: string, place: KeptPlace, shape: 'directory' | 'file', source: string): Promise<string>;
+  /** `source` kept as a secret at `place` (a .env: each variable). Returns the names stored. */
+  secret(projectId: string, place: KeptPlace, source: string): Promise<string[]>;
+}
+
+/** Restoring more than this to change one file takes too long here. */
+export const DATA_EDIT_MAX = 2 * 1024 ** 3;
 
 export interface ProjectFileChangesDeps {
   files: ProjectFiles;
@@ -60,6 +97,8 @@ export interface ProjectFileChangesDeps {
   openWorld?: (taskId: string, handle: WorldHandle) => Promise<{ world: World; release(): Promise<void> }>;
   /** After a push to `sshUrl` (the canonical wiki follows its repository). */
   afterPush?: (projectId: string, place: { sshUrl: string; role: 'development' | 'project-wiki'; branch: string }) => Promise<void>;
+  /** Data and secrets; without it they are read-only here. */
+  keeping?: FileKeeping;
 }
 
 /** What one batch may carry. */
@@ -67,12 +106,43 @@ export const CHANGE_LIMITS = { changes: 2000, files: 5000, bytes: 1024 * 1024 * 
 
 interface GitPlace { name: string; segments: string[]; role: 'development' | 'project-wiki'; sshUrl: string; branch: string }
 
+/** One change inside a data resource's folder (paths relative to it). */
+type DataOp =
+  | { op: 'write'; path: string; source: string }
+  | { op: 'delete' | 'mkdir'; path: string }
+  | { op: 'copy' | 'move'; from: string; to: string };
+
 /** One index operation inside a checkout. */
 type IndexOp =
   | { op: 'write'; path: string; source: string; expect?: string | null }
   | { op: 'delete'; path: string }
   | { op: 'copy'; from: string; to: string }
   | { op: 'mkdir'; path: string };
+
+/** Where an upload is best kept (the file manager's recommendation). */
+export type Keep = 'git' | 'data' | 'secret';
+export interface UploadPlan {
+  path: string;
+  keep: Keep;
+  /** Why, when it is not Git (shown on hover). */
+  why?: string;
+  /** Already in data: nothing else is possible. */
+  fixed?: true;
+}
+
+/** Files at least this large are better kept as data: GitHub refuses 100 MB and warns from 50. */
+export const LARGE_FILE_BYTES = 50 * 1024 * 1024;
+
+/** The recommendation for one file, from its name, size and whether Git ignores it. Pure. */
+export function planUpload(path: string, size: number, facts: { inData: boolean; ignored: boolean }): UploadPlan {
+  const name = path.split('/').pop() ?? path;
+  if (facts.inData) return { path, keep: 'data', why: 'Inside data', fixed: true };
+  if (likelySecret(name) && !exampleEnvironmentFile(name)) return { path, keep: 'secret', why: dotenvFile(name) ? 'Holds environment variables' : 'Looks like credentials' };
+  if (facts.ignored) return { path, keep: 'data', why: 'Git ignores it' };
+  if (size >= LARGE_FILE_BYTES) return { path, keep: 'data', why: 'Over 50 MB' };
+  if (sqliteDatabase(name)) return { path, keep: 'data', why: 'A database' };
+  return { path, keep: 'git' };
+}
 
 export class ProjectFileChanges {
   constructor(private readonly deps: ProjectFileChangesDeps) {}
@@ -99,11 +169,12 @@ export class ProjectFileChanges {
           if (change.op === 'move') sources.push({ view: fromView, path: change.from });
           continue;
         }
+        if (change.op === 'write' && change.keep && places.kind === 'world') throw new FileAccessError('In a task, an upload is a file of its world.');
         local.push(change.op === 'copy' || change.op === 'move' ? { op: change.op, from: change.from, to: change.to } : change);
       }
       const result = places.kind === 'world'
         ? await this.applyToWorld(projectId, places, local as LocalChange[])
-        : await this.applyToBranches(projectId, places, local as LocalChange[], author, scratch, options);
+        : await this.applyToBranches(projectId, view, places, local as LocalChange[], author, scratch, options);
       // A move from elsewhere removes what it took once it is safely written.
       for (const moved of sources) {
         const more = await this.apply(projectId, moved.view, [{ op: 'delete', path: moved.path }], author, options);
@@ -111,6 +182,20 @@ export class ProjectFileChanges {
       }
       return result;
     } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+  }
+
+  /** Where each upload (`path` where it lands, `size`) is best kept, in a
+   * branch view: in Git, as data, or as a secret (`planUpload`). */
+  async plan(projectId: string, view: FileView, items: Array<{ path: string; size: number }>): Promise<UploadPlan[]> {
+    const places = await this.deps.files.writePlaces(projectId, view);
+    if (places.kind === 'world') return items.map((item) => ({ path: item.path, keep: 'git' }));
+    const valid = items.filter((item) => { try { return splitPath(item.path).length > 0; } catch { return false; } });
+    const ignored = await this.deps.files.gitIgnored(projectId, view, valid.map((item) => item.path)).catch(() => new Set<string>());
+    return valid.map((item) => {
+      const segments = splitPath(item.path);
+      const inData = places.mounts.some((mount) => startsWith(segments, mount.segments));
+      return planUpload(segments.join('/'), Number(item.size) || 0, { inData, ignored: ignored.has(item.path) });
+    });
   }
 
   /** `from` (a file or a whole folder) of `view` as files on this host. */
@@ -191,42 +276,146 @@ export class ProjectFileChanges {
 
   // ── branches ──────────────────────────────────────────────────────────────
 
-  private async applyToBranches(projectId: string, places: Extract<WritePlaces, { kind: 'branch' }>, changes: LocalChange[],
+  private async applyToBranches(projectId: string, view: FileView, places: Extract<WritePlaces, { kind: 'branch' }>, changes: LocalChange[],
     author: FileChangeAuthor, scratch: string, options: ApplyOptions): Promise<FileChangeResult> {
     const byRepository = new Map<GitPlace, IndexOp[]>();
-    const where = (value: string): { place: GitPlace; inside: string } => {
+    const byData = new Map<DataPlace, DataOp[]>();
+    const created = new Map<string, { place: GitPlace; inside: string; files: Array<{ rel: string; source: string }>; shape: 'directory' | 'file' }>();
+    const secrets: Array<{ place: GitPlace; inside: string; source: string }> = [];
+    const where = (value: string): { kind: 'git'; place: GitPlace; inside: string } | { kind: 'data'; mount: DataPlace; inside: string } => {
       const segments = splitPath(value);
-      if (places.mounts.some((mount) => startsWith(segments, mount))) throw new FileAccessError('Data is read-only here: change it in a task.');
+      const mount = places.mounts.filter((candidate) => startsWith(segments, candidate.segments)).sort((a, b) => b.segments.length - a.segments.length)[0];
+      if (mount) return { kind: 'data', mount, inside: segments.slice(mount.segments.length).join('/') };
       const place = places.checkouts.filter((candidate) => startsWith(segments, candidate.segments) && segments.length > candidate.segments.length)
         .sort((a, b) => b.segments.length - a.segments.length)[0];
       if (!place) throw new FileAccessError(segments.length && places.checkouts.some((candidate) => candidate.segments.join('/') === segments.join('/'))
         ? 'A repository’s own folder can’t be changed here.' : 'Only files inside a repository can be changed here.');
       const inside = segments.slice(place.segments.length);
       if (inside.includes('.git')) throw new FileAccessError('Git’s own files can’t be changed.');
-      return { place, inside: inside.join('/') };
+      return { kind: 'git', place, inside: inside.join('/') };
     };
     const add = (place: GitPlace, op: IndexOp) => { const list = byRepository.get(place) ?? []; list.push(op); byRepository.set(place, list); };
+    const addData = (mount: DataPlace, op: DataOp) => {
+      // A data resource itself (its folder, or its one file) is removed or moved in Settings; a file resource is only replaced.
+      const touches = 'path' in op ? [op.path] : [op.from, op.to];
+      const allowed = mount.shape === 'file' ? op.op === 'write' && op.path === '' : touches.every(Boolean);
+      if (!allowed) throw new FileAccessError(`${mount.name} is data: remove or move it in Settings.`);
+      const list = byData.get(mount) ?? []; list.push(op); byData.set(mount, list);
+    };
     for (const change of changes) {
       if (change.op === 'copy' || change.op === 'move') {
         const from = where(change.from), to = where(change.to);
+        if (from.kind === 'data' && to.kind === 'data' && from.mount === to.mount) {
+          addData(to.mount, { op: change.op, from: from.inside, to: to.inside });
+          continue;
+        }
+        if (from.kind !== 'git' || to.kind !== 'git') throw new FileAccessError('Copy between data and a repository from another view.');
         add(to.place, { op: 'copy', from: from.inside, to: to.inside });
         if (change.op === 'move') add(from.place, { op: 'delete', path: from.inside });
-      } else if (change.op === 'write') {
-        const at = where(change.path);
-        add(at.place, { op: 'write', path: at.inside, source: change.source, ...(change.expect !== undefined ? { expect: change.expect } : {}) });
-      } else { const at = where((change as { path: string }).path); add(at.place, { op: change.op as 'mkdir' | 'delete', path: at.inside }); }
+        continue;
+      }
+      const at = where((change as { path: string }).path);
+      if (change.op === 'write' && change.keep && at.kind === 'git') {
+        if (change.keep === 'secret') { secrets.push({ place: at.place, inside: at.inside, source: change.source }); continue; }
+        // A new folder of data, or a file of data on its own.
+        const folder = change.dataFolder ? where(change.dataFolder) : undefined;
+        if (folder && (folder.kind !== 'git' || folder.place !== at.place || !at.inside.startsWith(`${folder.inside}/`)))
+          throw new FileAccessError(`${change.path} is not in ${change.dataFolder}.`);
+        const key = folder ? `${at.place.name}\n${folder.inside}` : `${at.place.name}\n${at.inside}`;
+        const group = created.get(key) ?? { place: at.place, inside: folder ? folder.inside : at.inside, files: [], shape: folder ? 'directory' as const : 'file' as const };
+        group.files.push({ rel: folder ? at.inside.slice(folder.inside.length + 1) : '', source: change.source });
+        created.set(key, group);
+        continue;
+      }
+      if (at.kind === 'data') {
+        if (change.op === 'write') {
+          // An editor's save checks the version it opened, as in Git.
+          if (change.expect !== undefined) await this.checkDataVersion(projectId, view, change.path, change.expect, options);
+          addData(at.mount, { op: 'write', path: at.inside, source: change.source });
+        } else addData(at.mount, { op: change.op, path: at.inside } as DataOp);
+        continue;
+      }
+      if (change.op === 'write') add(at.place, { op: 'write', path: at.inside, source: change.source, ...(change.expect !== undefined ? { expect: change.expect } : {}) });
+      else add(at.place, { op: change.op as 'mkdir' | 'delete', path: at.inside });
     }
-    // Every repository is allowed before any is changed.
+    // Everything is allowed before anything is changed.
     for (const place of byRepository.keys())
       if (options.mayCommit && !(await options.mayCommit(place.branch)))
         throw new FileAccessError(`Changing ${place.branch} needs permission to land work on it (merge-into:${place.branch}).`);
-    const commits: FileChangeResult['commits'] = [];
+    if (byData.size || created.size || secrets.length) {
+      if (!this.deps.keeping) throw new FileAccessError('Data and secrets can’t be changed on this server.');
+      if (options.mayKeep && !(await options.mayKeep())) throw new FileAccessError('Changing the project’s data and secrets needs project settings access (project:settings:write).');
+    }
+    const result: FileChangeResult = { commits: [] };
+    // Secrets first: nothing that holds them ever reaches Git.
+    for (const secret of secrets)
+      (result.secrets ??= []).push(...await this.deps.keeping!.secret(projectId, { repository: secret.place.name, path: secret.inside }, secret.source));
     let index = 0;
+    for (const group of created.values()) {
+      const dir = path.join(scratch, `new-data-${index++}`);
+      let source: string;
+      if (group.shape === 'file') { fs.mkdirSync(dir, { recursive: true }); source = path.join(dir, path.posix.basename(group.inside)); fs.copyFileSync(group.files[0]!.source, source); }
+      else {
+        source = dir;
+        for (const file of group.files) { const target = path.join(dir, ...file.rel.split('/')); fs.mkdirSync(path.dirname(target), { recursive: true }); fs.copyFileSync(file.source, target); }
+      }
+      const name = await this.deps.keeping!.create(projectId, { repository: group.place.name, path: group.inside }, group.shape, source);
+      (result.data ??= []).push({ name, created: true });
+    }
+    for (const [mount, ops] of byData) {
+      await this.changeData(mount, ops, path.join(scratch, `data-${index++}`));
+      (result.data ??= []).push({ name: mount.name });
+    }
     for (const [place, ops] of byRepository) {
       const commit = await this.commitTo(projectId, place, ops, author, path.join(scratch, `repository-${index++}`));
-      if (commit) commits.push({ repository: place.name, branch: place.branch, commit });
+      if (commit) result.commits.push({ repository: place.name, branch: place.branch, commit });
     }
-    return { commits };
+    return result;
+  }
+
+  private async checkDataVersion(projectId: string, view: FileView, where: string, expect: string | null, options: ApplyOptions): Promise<void> {
+    const current = await this.deps.files.stat(projectId, where, { data: options.data, view })
+      .catch((error) => { if (error instanceof FileNotFoundError) return undefined; throw error; });
+    if (expect === null && current) throw new FileConflictError(`${where.split('/').pop()} already exists.`);
+    if (expect && !current) throw new FileConflictError(`${where.split('/').pop()} was deleted since you opened it.`);
+    if (expect && current?.version !== expect) throw new FileConflictError(`${where.split('/').pop()} changed since you opened it.`);
+  }
+
+  /** One new version of a data resource: its current one, changed, saved. */
+  private async changeData(mount: DataPlace, ops: DataOp[], scratch: string): Promise<void> {
+    const keeping = this.deps.keeping!;
+    const root = path.join(scratch, 'data');
+    fs.mkdirSync(root, { recursive: true });
+    if (mount.shape === 'file') {
+      // A one-file resource is replaced whole: only which version it replaces matters.
+      const write = ops.at(-1) as Extract<DataOp, { op: 'write' }>;
+      const revisionId = await keeping.version(mount.id);
+      const file = path.join(root, mount.segments.at(-1)!);
+      fs.copyFileSync(write.source, file);
+      await keeping.save(mount.id, file, revisionId);
+      return;
+    }
+    const { revisionId } = await keeping.restore(mount.id, root, DATA_EDIT_MAX);
+    const staging = `.karmax-injection/file-changes/${crypto.randomBytes(8).toString('hex')}`;
+    const steps: Array<Record<string, unknown>> = [];
+    for (const [at, op] of ops.entries()) {
+      if (op.op === 'write') {
+        const tmp = `${staging}/${at}`;
+        fs.mkdirSync(path.join(root, staging), { recursive: true });
+        fs.copyFileSync(op.source, path.join(root, tmp));
+        steps.push({ op: 'write', path: op.path, tmp });
+      } else steps.push(op);
+    }
+    // The same rules as a task's world: never through a link out of the folder.
+    const run = await runNode(WORLD_CHANGES, JSON.stringify([root, staging, steps]), root);
+    fs.rmSync(path.join(root, '.karmax-injection'), { recursive: true, force: true });
+    let answer: { ok?: true; error?: string; conflict?: true; missing?: true } = {};
+    try { answer = JSON.parse(run.stdout); } catch { /* reported below */ }
+    if (!answer.ok) {
+      const message = `${mount.name}: ${answer.error || run.stderr.trim() || 'couldn’t change it'}`;
+      throw answer.conflict ? new FileConflictError(message) : answer.missing ? new FileNotFoundError(message) : new FileAccessError(message);
+    }
+    await keeping.save(mount.id, root, revisionId);
   }
 
   /** One commit of `ops` on `place`'s branch, pushed; rebuilt once on a newer tip. */
@@ -247,7 +436,7 @@ export class ProjectFileChanges {
         const clone = cloned.clone;
         const indexEnv = { ...env, GIT_INDEX_FILE: path.join(dir, 'index') };
         const run = async (args: string[], input?: string) => {
-          const result = input === undefined ? await git(clone, args, { env: indexEnv, timeoutMs: 10 * 60_000 }) : await gitInput(clone, args, input, indexEnv);
+          const result = input === undefined ? await git(clone, args, { env: indexEnv, timeoutMs: 10 * 60_000 }) : await gitWithInput(clone, args, input, indexEnv);
           if (result.code !== 0) throw new Error(firstLine(result.stderr || result.stdout || `git ${args[0]} failed`));
           return result.stdout;
         };
@@ -325,7 +514,7 @@ export class ProjectFileChanges {
 }
 
 type LocalChange =
-  | { op: 'write'; path: string; source: string; expect?: string | null }
+  | { op: 'write'; path: string; source: string; expect?: string | null; keep?: 'data' | 'secret'; dataFolder?: string }
   | { op: 'mkdir'; path: string }
   | { op: 'delete'; path: string }
   | { op: 'copy' | 'move'; from: string; to: string };
@@ -341,17 +530,15 @@ function parseIndex(output: string): IndexEntry[] {
   return entries;
 }
 
-/** `git` with `input` on stdin (index updates), in a scratch clone of our own. */
-function gitInput(cwd: string, args: string[], input: string, env: Record<string, string>): Promise<{ code: number; stdout: string; stderr: string }> {
+/** `node -e script arg` on this host, in `cwd`. */
+function runNode(script: string, arg: string, cwd: string): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.quotePath=false', ...args],
-      { cwd, env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: '0' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, ['-e', script, arg], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk; });
     child.stderr.on('data', (chunk) => { stderr += chunk; });
     child.on('error', reject);
     child.on('close', (code) => resolve({ code: code ?? 1, stdout, stderr }));
-    child.stdin.end(input);
   });
 }
 
@@ -395,7 +582,8 @@ function sameSource(places: WritePlaces, from: string, to: string): boolean {
   const owner = (value: string) => {
     let segments: string[];
     try { segments = splitPath(value); } catch { return undefined; }
-    if (places.mounts.some((mount) => startsWith(segments, mount))) return undefined;
+    const mount = places.mounts.filter((candidate) => startsWith(segments, candidate.segments)).sort((a, b) => b.segments.length - a.segments.length)[0];
+    if (mount) return mount;
     return places.checkouts.filter((candidate) => startsWith(segments, candidate.segments)).sort((a, b) => b.segments.length - a.segments.length)[0];
   };
   const source = owner(from);

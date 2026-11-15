@@ -197,7 +197,44 @@ it('manages a branch’s files: new, edit, upload, copy, cut, paste, rename, del
     expect(s.tree()).not.toContain('incoming/handbook.md');
   });
 
+  await step('an upload with a secret and a database asks where each goes', async () => {
+    await s.open('site');
+    await page.locator('.files-row', { hasText: 'README.md' }).waitFor();
+    const files = page.waitForEvent('filechooser');
+    await page.keyboard.press('Shift+U');
+    await (await files).setFiles([{ name: '.env', mimeType: 'text/plain', buffer: Buffer.from('API_KEY=s3cret\n') },
+      { name: 'notes-2.txt', mimeType: 'text/plain', buffer: Buffer.from('plain\n') },
+      { name: 'cache.sqlite', mimeType: 'application/octet-stream', buffer: Buffer.alloc(2048, 1) }]);
+    const dialog = page.locator('dialog.files-upload-dialog');
+    await dialog.waitFor();
+    const chosen = async () => dialog.locator('.files-upload-row').evaluateAll((rows: any[]) => rows.map((row) =>
+      [row.querySelector('.files-name').textContent, row.querySelector('[aria-pressed="true"]')?.dataset.keep]));
+    expect(await chosen()).toEqual([['.env', 'secret'], ['notes-2.txt', 'git'], ['cache.sqlite', 'data']]);
+    expect(await dialog.locator('.files-upload-row', { hasText: '.env' }).locator('.files-upload-meta').innerText()).toContain('Holds environment variables');
+    await s.shoot('manager-upload-dialog');
+    // Leave the notes out, then upload the rest.
+    await dialog.locator('.files-upload-row', { hasText: 'notes-2.txt' }).locator('.files-upload-skip').click();
+    expect(await dialog.locator('.files-upload-go').innerText()).toBe('Upload 2');
+    await dialog.locator('.files-upload-go').click();
+    await page.locator('.files-row.mount-data', { hasText: 'cache.sqlite' }).waitFor();
+    expect(s.tree().some((file) => /\.env$|cache\.sqlite|notes-2/.test(file))).toBe(false);
+    const secrets = (await s.store.listResourceAttachments(s.project.id, true)).filter((resource) => resource.driver === 'secret@1').map((resource) => resource.name);
+    expect(secrets).toContain('site/.env:API_KEY');
+  });
+
+  await step('a data file is edited and saved as a new version', async () => {
+    await s.open('site/data/raw/pages/a.txt');
+    await page.locator('.files-lc', { hasText: 'alpha' }).waitFor();
+    await page.keyboard.press('e');
+    const area = page.locator('#files-edit-area');
+    await area.waitFor();
+    await area.fill('alpha, edited in Files\n');
+    await area.press(`${mod}+s`);
+    await page.locator('.files-lc', { hasText: 'edited in Files' }).waitFor();
+  });
+
   await step('a row’s menu (right-click) and the folder’s menu', async () => {
+    await s.open('site/incoming');
     await page.locator('.files-link', { hasText: 'one.txt' }).click({ button: 'right' });
     expect(await page.locator('.files-menu button').allInnerTexts()).toEqual(expect.arrayContaining([expect.stringContaining('Rename')]));
     await s.shoot('manager-menu');
@@ -265,21 +302,22 @@ it('changes a task’s world and opens its terminal in the folder shown', async 
     await page.locator('#files-term').waitFor({ state: 'detached' });
   });
 
-  await step('in the default view the terminal starts a scratch task and opens in its view', async () => {
-    let asked: any = null;
-    await page.route('**/api/tasks', async (route) => {
-      if (route.request().method() !== 'POST') return route.fallback();
-      asked = route.request().postDataJSON();
-      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ id: task.id, num: task.num }) });
-    });
+  await step('the default view has no terminal: no machine stands behind a branch', async () => {
     await s.open('site');
-    await page.locator('#files-terminal').waitFor();
-    await page.locator('#files-terminal').click();
-    await page.waitForURL(new RegExp(`\\?task=${task.num}$`));
-    await page.locator('#files-term #term-out').waitFor();
-    expect(asked).toMatchObject({ projectId: s.project.id, workflow: 'script-exec', command: 'true', title: 'Terminal on the default branch' });
-    await page.unrouteAll({ behavior: 'ignoreErrors' });
-    await page.locator('#files-term-close').click();
+    await page.locator('#files-new-file').waitFor();
+    expect(await page.locator('#files-terminal').count()).toBe(0);
+  });
+
+  await step('the task’s page links to its Files and Wiki', async () => {
+    await page.goto(`${s.server.url}/personal/site-builder/tasks/${task.num}/checkin`);
+    const files = page.locator('#task-files');
+    await files.waitFor();
+    expect(await files.getAttribute('href')).toBe(`/personal/site-builder/files?task=${task.num}`);
+    expect(await page.locator('#task-wiki').getAttribute('href')).toBe(`/personal/site-builder/wiki?task=${task.num}`);
+    await s.shoot('manager-task-bar');
+    await files.click();
+    await page.waitForURL(new RegExp(`/files\\?task=${task.num}$`));
+    await page.locator('.files-row', { hasText: 'drafts' }).waitFor();
   });
   expect(s.errors).toEqual([]);
   expect(s.toastErrors).toEqual([]);
