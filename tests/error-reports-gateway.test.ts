@@ -1,10 +1,13 @@
 import fs from 'node:fs';
+import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { KarmaxBus } from '../src/contrib/bus.js';
 import { ContributionRegistry } from '../src/contrib/registry.js';
 import { Gateway, routeCapability } from '../src/gateway/server.js';
+import { clientWentAway } from '../src/gateway/error-status.js';
 import { ORGANIZATION_GRANT_CEILING } from '../src/platform/authorization.js';
 import { PLATFORM_API_CATALOG } from '../src/platform/catalog.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
@@ -12,7 +15,7 @@ import { Store } from '../src/store/db.js';
 import { Overlays } from '../src/store/overlays.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 import { WorldRegistry } from '../src/world/registry.js';
-import { configureErrorReports, ERROR_EVENT_TYPE } from '../src/platform/error-reports.js';
+import { configureErrorReports, ERROR_EVENT_TYPE, errorReporter } from '../src/platform/error-reports.js';
 import { ERROR_FIXER_TRIGGER } from '../src/platform/error-fixer.js';
 
 /**
@@ -97,5 +100,48 @@ describe('error reports through the gateway', () => {
 
     expect((await call(tokenFor.operator!, 'PUT', '/api/settings/error-reports', { projectId: null })).status).toBe(200);
     expect(await (await call(tokenFor.operator!, 'GET', '/api/settings/error-reports')).json()).toEqual({ settings: {} });
+  });
+
+  // tavya-error 9a1cd9333f3c057a (2026-11-15): a person closed the page while
+  // POST /review-action's body was on its way; Node failed the body with
+  // ECONNRESET "aborted", which was answered as a 500 and filed as a bug.
+  it('files no report when the client goes away before its request is read', async () => {
+    expect((await call(tokenFor.operator!, 'PUT', '/api/settings/error-reports', { projectId: ops.id })).status).toBe(200);
+    const reported = vi.spyOn(errorReporter()!, 'report');
+    const failed = vi.spyOn(Gateway.prototype as any, 'fail');
+    const { port } = new URL(base);
+    // Headers promise a body; part of it arrives, then the connection closes.
+    await new Promise<void>((resolve, reject) => {
+      const socket = net.connect(Number(port), '127.0.0.1', () => {
+        socket.write(`POST /api/tasks/task_gone/review-action HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer ${tokenFor.operator}\r\n`
+          + 'content-type: application/json\r\ncontent-length: 200\r\n\r\n{"index":');
+        setTimeout(() => { socket.destroy(); resolve(); }, 100);
+      });
+      socket.on('error', reject);
+    });
+    // The gateway meets the aborted body, and whatever it reports is recorded.
+    await expect.poll(() => failed.mock.calls.some(([, error]) => (error as Error)?.message === 'aborted')).toBe(true);
+    await Promise.all(reported.mock.results.map((result) => result.value));
+    expect(reported).not.toHaveBeenCalled();
+    failed.mockRestore();
+    reported.mockRestore();
+    const events = (await store.listProjectEvents(ops.id)).filter((event) => event.type === ERROR_EVENT_TYPE);
+    expect(events.map((event) => (event.payload as { message: string }).message)).not.toContain('aborted');
+    expect((await call(tokenFor.operator!, 'PUT', '/api/settings/error-reports', { projectId: null })).status).toBe(200);
+  });
+});
+
+describe('clientWentAway', () => {
+  const gone = { socket: { destroyed: true } } as unknown as http.IncomingMessage;
+  const here = { socket: { destroyed: false } } as unknown as http.IncomingMessage;
+  const reset = Object.assign(new Error('aborted'), { code: 'ECONNRESET' });
+  it('is a dropped connection failing the request, never the same code while the client still waits', () => {
+    expect(clientWentAway(reset, gone)).toBe(true);
+    expect(clientWentAway(Object.assign(new Error('Premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' }), gone)).toBe(true);
+    // An upstream tavya called reset its connection: the client is still there to be told.
+    expect(clientWentAway(reset, here)).toBe(false);
+    // A bug that happens to run after the client left is still a bug.
+    expect(clientWentAway(new TypeError("Cannot read properties of undefined (reading 'id')"), gone)).toBe(false);
+    expect(clientWentAway(reset, undefined)).toBe(false);
   });
 });
