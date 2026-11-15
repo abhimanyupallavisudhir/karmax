@@ -71,7 +71,11 @@ it('a waiting task that started elsewhere opens as its task, and its row offers 
       await listed();
       await fire(check, false);
       // The page's record still says it waits; the server says it runs.
-      await page.evaluate((num) => { history.pushState({ kx: 1 }, '', `${location.pathname}/tasks/${num}`); dispatchEvent(new PopStateEvent('popstate', { state: { kx: 1 } })); }, check.num);
+      await page.evaluate((num) => {
+        const w = globalThis as any;
+        w.history.pushState({ kx: 1 }, '', `${w.location.pathname}/tasks/${num}`);
+        w.dispatchEvent(new w.PopStateEvent('popstate', { state: { kx: 1 } }));
+      }, check.num);
       await page.getByText('Connect Search Console, please.').first().waitFor();
       expect(await page.locator('#tf-page').count()).toBe(0);
       expect(await page.locator('#tf-queue').count()).toBe(0);

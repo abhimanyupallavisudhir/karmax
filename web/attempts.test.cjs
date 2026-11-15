@@ -205,6 +205,7 @@ eval(extractFn('wireAttempts'));
   eval(extractFn('mergeTaskHistory'));
   eval(extractFn('refreshTaskHistory'));
   eval(extractFn('showDraftPage'));
+  eval(extractFn('noteTriggerFired'));
   eval(extractFn('openTask'));
   const staleOpen = openTask('attempt-1', 'checkin', true);
   await openTask('attempt-1', 'checkin', true);
