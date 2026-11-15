@@ -4803,6 +4803,38 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 .files-page > .files-title { margin: 0 0 2px; }
 .files-page .btn.icon { width: 32px; height: 32px; padding: 0; justify-content: center; flex: none; }
 .files-page .btn.icon.disabled { opacity: .4; pointer-events: none; }
+.files-page .btn.icon.active { color: var(--accent); border-color: var(--accent); background: var(--accent-weak); }
+/* The file manager: tools, selection, drop target, menus, the editor and the terminal. */
+.files-actions { display: inline-flex; align-items: center; gap: 6px; flex: none; }
+.files-actions:empty { display: none; }
+.files-progress { color: var(--ink-3); font-size: var(--fs-12); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.files-progress[hidden] { display: none; }
+.files-row.selected, .files-row.selected:hover { background: var(--accent-weak); }
+.files-row.selected .files-link { color: var(--ink); }
+.files-row.cut .files-link { opacity: .5; }
+.files-more { flex: none; display: inline-grid; place-items: center; width: 26px; height: 26px; margin-left: -6px; padding: 0; border: 0; border-radius: 6px;
+  background: transparent; color: var(--ink-3); cursor: pointer; opacity: 0; }
+.files-row:hover .files-more, .files-row:focus-within .files-more, .files-row.selected .files-more { opacity: 1; }
+.files-more:hover { background: var(--surface-3, var(--line)); color: var(--ink); }
+@media (hover: none) { .files-more { opacity: 1; } }
+.files-body.dropping { outline: 2px dashed var(--accent); outline-offset: -4px; background: var(--accent-weak); }
+.files-menu { position: fixed; z-index: 1000; min-width: 190px; padding: 4px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--surface); box-shadow: var(--shadow); }
+.files-menu button { display: flex; align-items: center; gap: 16px; width: 100%; padding: 6px 10px; border: 0; border-radius: 5px;
+  background: transparent; color: var(--ink); font: inherit; font-size: var(--fs-13); text-align: left; cursor: pointer; }
+.files-menu button span { flex: 1; }
+.files-menu button:hover:not(:disabled), .files-menu button:focus-visible { background: var(--surface-2); outline: none; }
+.files-menu button:disabled { color: var(--ink-3); cursor: default; }
+.files-menu kbd { color: var(--ink-3); font-family: var(--font-mono); font-size: var(--fs-11); }
+.files-menu-sep { height: 1px; margin: 4px 6px; background: var(--line); }
+.files-edit-area { display: block; width: 100%; min-height: 62vh; padding: 12px 16px; border: 0; resize: vertical; background: var(--surface); color: var(--ink);
+  font-family: var(--font-mono); font-size: var(--fs-12); line-height: 1.6; tab-size: 4; white-space: pre; outline: none; }
+.files-term { display: flex; flex-direction: column; min-width: 0; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); overflow: hidden; }
+.files-term-head { display: flex; align-items: center; gap: 8px; padding: 6px 8px 6px 12px; border-bottom: 1px solid var(--line); background: var(--surface-2);
+  color: var(--ink-2); font-size: var(--fs-12); font-weight: 600; }
+.files-term-where { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-3); font-family: var(--font-mono); font-weight: 400; }
+pre.files-term-screen { height: 300px; max-height: none; margin: 0; border: 0; border-radius: 0; }
+pre.files-term-screen:focus { box-shadow: inset 0 0 0 2px var(--accent-weak); }
 .files-address {
   flex: 1; min-width: 0; height: 36px; display: flex; align-items: center; padding: 0 12px;
   border: 1px solid var(--line); border-radius: var(--r-field); background: var(--surface); cursor: text;

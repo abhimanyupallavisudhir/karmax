@@ -12486,14 +12486,15 @@ function bindTermScreen(out) {
   };
 }
 
-function openTerminal(taskId) {
+function openTerminal(taskId, { cwd } = {}) {
   if (term && term.ws) { try { term.ws.close(); } catch {} }           // one check-in shell at a time
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   // A multi-PR task has several checkouts in the one world, so check-in picks
   // which branch to land in. It is just a cwd — no second world, and the remote
-  // case costs nothing extra for exactly that reason (SPEC §11.1).
-  const checkout = document.getElementById('term-checkout')?.value;
-  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}${checkout ? `&checkout=${encodeURIComponent(checkout)}` : ''}`);
+  // case costs nothing extra for exactly that reason (SPEC §11.1). The Files
+  // page opens it in the folder it shows (`cwd`, from the world root).
+  const checkout = cwd === undefined ? document.getElementById('term-checkout')?.value : '';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}${checkout ? `&checkout=${encodeURIComponent(checkout)}` : ''}${cwd ? `&cwd=${encodeURIComponent(cwd)}` : ''}`);
   term = { taskId, ws, screen: makeTermScreen(), pending: '' };
   ws.onclose = () => {
     if (!term || term.ws !== ws) return;                               // superseded by a newer session
@@ -19664,9 +19665,10 @@ function filesView(proj) {
   const view = S.filesView || '';
   const scope = S.tab === 'orgfiles' ? 'org' : 'project';
   return `<div class="files-page" id="files-page" data-scope="${scope}" data-project="${esc(proj.id)}" data-path="${esc(filePath)}" data-view="${esc(view)}">
-    ${scope === 'org' ? ORG_FILES_TITLE : ''}${filesBarHtml({ pid: proj.id, filePath, view, crumbs: filesCrumbsHtml(proj, parts), tools: `<span class="files-source" id="files-source"></span>
+    ${scope === 'org' ? ORG_FILES_TITLE : ''}${filesBarHtml({ pid: proj.id, filePath, view, crumbs: filesCrumbsHtml(proj, parts), tools: `<span class="files-actions" id="files-actions"></span><span class="files-source" id="files-source"></span>
       <button type="button" class="btn sm icon files-share" id="files-share" data-tool="Share" title="Share a public link" aria-label="Share"${sharing?.canShare && !view ? '' : ' hidden'}>${FV.ICONS.share}</button>` })}
     <div class="files-body" id="files-body"><div class="files-status" role="status" aria-busy="true">Loading…</div></div>
+    ${filesTermPanelHtml()}
     ${!parts.length && !view ? artifactGalleryShellHtml() : ''}
   </div>`;
 }
@@ -19825,16 +19827,27 @@ async function wireFilesView(proj) {
       if (state.canShare && !S.filesView && filesPageShows(pid, $('#files-page')?.dataset.path ?? '')) $('#files-share')?.removeAttribute('hidden');
     }, () => sharing.delete(pid));
   }
+  wireFilesTerm();
+  // Until this place loads, nothing acts on the one before it.
+  S.filesNode = null;
   let node;
   try { node = await filesLoad(pid, filePath); }
   catch (error) {
     if (!shows()) return;
+    // A scratch task's world is still being made: say so, and look again shortly.
+    if (S.filesTermWanted && S.filesTermWanted === (S.filesView || '') && /no files yet/i.test(error.message)) {
+      $('#files-body').innerHTML = '<div class="files-status" role="status" aria-busy="true">Starting a workspace…</div>';
+      clearTimeout(wireFilesView.retry);
+      wireFilesView.retry = setTimeout(() => { if (shows()) wireFilesView(proj); }, 3000);
+      return;
+    }
     $('#files-body').innerHTML = `<div class="files-status error" role="alert"><span>${esc(plainError(error.message))}</span>
       <button class="btn sm" id="files-retry">Try again</button></div>`;
     $('#files-retry')?.addEventListener('click', () => { filesState().cache.clear(); $('#files-page').dataset.path = '\u0000'; renderMain(); });
     return;
   }
   if (!shows()) return;
+  S.filesNode = node;
   $('#files-source').innerHTML = FV.sourceHtml(node.source);
   if (node.view) { S.filesViewInfo = { ...S.filesViewInfo, [`${pid}\n${S.filesView}`]: node.view }; $('#files-view').innerHTML = filesViewLabelHtml(pid, S.filesView); }
   // Arriving from a subfolder: its row gets the focus, so ↑/↓ carry on from there.
@@ -19846,7 +19859,544 @@ async function wireFilesView(proj) {
     markdown: (el, text, after) => mountMarkdownSurface(el, (math) => renderMarkdown(text, { math }), after),
     markdownTools: texToggleHtml(), wireTools: wireTexToggles,
     copy: (text) => copyToClipboard(text).then(() => toast('Copied')), errorText: plainError,
+    ...(node.kind === 'file' && node.writable ? { textTools: filesEditButtonHtml(), onText: (body, text) => wireFilesEditButton(pid, node, body, text) } : {}),
   });
+  wireFileManager(pid, node);
+}
+
+// ── Files: the file manager (wiki features/project-files) ──
+// Where the view may be changed (node.writable): select rows (⌘/Ctrl- or
+// Shift-click, Space, ⌘A), cut, copy and paste them (⌘X ⌘C ⌘V, between views
+// too), delete (Delete), rename (F2), make a text file (T) or a folder (F),
+// upload files or a folder (u, a drop, or pasting files), and edit a text file
+// (e; ⌘S saves). Each action is one POST …/files/changes: in a task's view it
+// is written into its world, in a branch view it is one commit on that branch.
+// The terminal (Ctrl+`) is a task world's: in the default or a branch view it
+// starts a scratch task at that branch and opens there.
+const FM_ICON = (() => {
+  const svg = (body) => `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
+  return {
+    newFile: svg('<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z"/><path d="M14 3v6h6"/><path d="M12 12v6M9 15h6"/>'),
+    newFolder: svg('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M12 10v6M9 13h6"/>'),
+    upload: svg('<path d="M12 15V3"/><path d="m7 8 5-5 5 5"/><path d="M5 21h14"/>'),
+    edit: svg('<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>'),
+    more: svg('<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>'),
+    terminal: svg('<path d="m4 17 6-6-6-6"/><path d="M12 19h8"/>'),
+  };
+})();
+
+function filesSelection() { return (S.filesSel ||= { dir: null, names: new Set(), anchor: null }); }
+// What was cut or copied: kept for this tab (a reload keeps it, as a desktop's clipboard would).
+function filesClip() {
+  if (S.filesClip === undefined) { try { S.filesClip = JSON.parse(sessionStorage.getItem('tavya-files-clip') || 'null'); } catch { S.filesClip = null; } }
+  return S.filesClip;
+}
+function setFilesClip(clip) {
+  S.filesClip = clip;
+  try { if (clip) sessionStorage.setItem('tavya-files-clip', JSON.stringify(clip)); else sessionStorage.removeItem('tavya-files-clip'); } catch { /* private mode */ }
+}
+// The folder the page shows (a file's own folder when a file is open).
+function filesFolder(node = S.filesNode) { return !node ? '' : node.kind === 'directory' ? node.path : FV.parent(node.path); }
+function filesChangesUrl(pid, view = S.filesView) {
+  return `/api/projects/${encodeURIComponent(pid)}/files/changes${filesViewQuery(view, '?')}`;
+}
+// What an action applies to: the selected rows, else the focused one, else the open file.
+function filesTargets() {
+  const node = S.filesNode;
+  if (!node) return [];
+  if (node.kind !== 'directory') return node.path ? [{ path: node.path, kind: node.kind }] : [];
+  const sel = filesSelection();
+  const rows = [...document.querySelectorAll('#files-body .files-row')];
+  let chosen = sel.dir === node.path ? rows.filter((row) => sel.names.has(row.dataset.name)) : [];
+  if (!chosen.length) { const focused = document.activeElement?.closest?.('#files-body .files-row'); if (focused) chosen = [focused]; }
+  return chosen.map((row) => ({ path: FV.join(node.path, row.dataset.name), kind: row.dataset.kind, mount: row.dataset.mount || '' }));
+}
+// Draw the selection (and what is cut) on the rows.
+function paintFilesSelection() {
+  const node = S.filesNode, sel = filesSelection(), clip = filesClip();
+  document.querySelectorAll('#files-body .files-row').forEach((row) => {
+    const where = FV.join(node?.path || '', row.dataset.name);
+    const selected = sel.dir === node?.path && sel.names.has(row.dataset.name);
+    row.classList.toggle('selected', selected);
+    // Said with the row's name to a screen reader (a list has no aria-selected).
+    const said = row.querySelector('.files-selected-note');
+    if (selected && !said) row.querySelector('.files-link')?.insertAdjacentHTML('beforeend', '<span class="sr-only files-selected-note">, selected</span>');
+    else if (!selected) said?.remove();
+    row.classList.toggle('cut', !!(clip?.cut && clip.pid === filesProjectId() && clip.view === (S.filesView || '') && clip.paths.includes(where)));
+  });
+}
+function selectFilesRow(name, { toggle = false, range = false } = {}) {
+  const node = S.filesNode, sel = filesSelection();
+  if (sel.dir !== node.path) { sel.dir = node.path; sel.names = new Set(); sel.anchor = null; }
+  if (range && sel.anchor) {
+    const names = [...document.querySelectorAll('#files-body .files-row')].map((row) => row.dataset.name);
+    const [a, b] = [names.indexOf(sel.anchor), names.indexOf(name)].sort((x, y) => x - y);
+    if (a >= 0 && b >= 0) { if (!toggle) sel.names = new Set(); names.slice(a, b + 1).forEach((n) => sel.names.add(n)); }
+  } else if (toggle) { if (sel.names.has(name)) sel.names.delete(name); else sel.names.add(name); sel.anchor = name; }
+  else { sel.names = new Set([name]); sel.anchor = name; }
+  paintFilesSelection();
+}
+function clearFilesSelection() { const sel = filesSelection(); sel.names = new Set(); sel.anchor = null; paintFilesSelection(); }
+
+// Re-read the place shown (after a change), keeping the terminal.
+function refreshFilesPage() {
+  filesState().cache.clear();
+  const page = $('#files-page');
+  if (page) page.dataset.path = '\u0000';
+  renderMain();
+}
+
+// One batch of changes to the view shown; a commit, when it made one, is named.
+async function applyFileChanges(pid, changes, done = 'Done', { view = S.filesView, refresh = true } = {}) {
+  const result = await api(filesChangesUrl(pid, view), { method: 'POST', body: JSON.stringify({ changes }) });
+  const commit = result?.commits?.[0];
+  toast(commit ? `${done} · ${String(commit.commit).slice(0, 7)} on ${commit.branch}` : done);
+  if (refresh) refreshFilesPage();
+  return result;
+}
+const filesFail = (error) => toast(error?.message || String(error), true);
+
+// "name copy.ext", "name copy 2.ext", … — the first free name in `taken`.
+function freeFileName(name, taken) {
+  if (!taken.has(name)) return name;
+  const dot = name.lastIndexOf('.');
+  const [stem, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ''];
+  for (let n = 1; ; n++) { const next = `${stem} copy${n > 1 ? ` ${n}` : ''}${ext}`; if (!taken.has(next)) return next; }
+}
+function filesNamesHere() { return new Set((S.filesNode?.kind === 'directory' ? S.filesNode.entries || [] : []).map((entry) => entry.name)); }
+// The fields that name where a paste comes from, when not the view it goes to.
+function filesFromView(view) {
+  const [kind, ...rest] = String(view || '').split(':');
+  const value = rest.join(':');
+  return kind === 'task' ? { fromTask: value } : kind === 'branch' ? { fromBranch: value } : { fromDefault: true };
+}
+
+function copyFilesTargets(cut, event) {
+  const targets = filesTargets().filter((target) => !(cut && target.mount));
+  if (!targets.length) return false;
+  setFilesClip({ pid: filesProjectId(), view: S.filesView || '', paths: targets.map((target) => target.path), cut });
+  event?.clipboardData?.setData('text/plain', targets.map((target) => target.path).join('\n'));
+  paintFilesSelection();
+  const what = targets.length === 1 ? FV.parts(targets[0].path).pop() : `${targets.length} items`;
+  toast(`${cut ? 'Cut' : 'Copied'} ${what}`);
+  return true;
+}
+
+async function pasteFiles(pid) {
+  const clip = filesClip(), node = S.filesNode;
+  if (!clip || !node?.writable) return;
+  if (clip.pid !== pid) return toast('Paste within the project you copied from', true);
+  const dir = filesFolder(node), view = S.filesView || '';
+  const taken = filesNamesHere();
+  const changes = [];
+  for (const from of clip.paths) {
+    if (clip.cut && clip.view === view && FV.parent(from) === dir) continue; // already here
+    const name = freeFileName(FV.parts(from).pop(), taken);
+    taken.add(name);
+    changes.push({ op: clip.cut ? 'move' : 'copy', from, to: FV.join(dir, name), ...(clip.view !== view ? filesFromView(clip.view) : {}) });
+  }
+  if (!changes.length) return;
+  try {
+    await applyFileChanges(pid, changes, clip.cut ? 'Moved' : 'Pasted');
+    if (clip.cut) setFilesClip(null);
+  } catch (error) { filesFail(error); }
+}
+
+async function deleteFilesTargets(pid) {
+  const targets = filesTargets().filter((target) => !target.mount);
+  if (!targets.length || !S.filesNode?.writable) return;
+  const what = targets.length === 1 ? `“${FV.parts(targets[0].path).pop()}”` : `${targets.length} items`;
+  // A branch keeps what a commit removed; a task's world does not.
+  if (!confirm(`Delete ${what}?${(S.filesView || '').startsWith('task:') ? ' This can’t be undone.' : ''}`)) return;
+  const node = S.filesNode;
+  try {
+    await applyFileChanges(pid, targets.map((target) => ({ op: 'delete', path: target.path })), 'Deleted', { refresh: node.kind === 'directory' });
+    clearFilesSelection();
+    if (node.kind !== 'directory') { filesState().cache.clear(); go(filesRoute(pid, FV.parent(node.path))); }
+  } catch (error) { filesFail(error); }
+}
+
+async function renameFilesTarget(pid) {
+  const [target] = filesTargets();
+  const node = S.filesNode;
+  if (!target || target.mount || !node?.writable) return;
+  const old = FV.parts(target.path).pop();
+  const name = (await promptText('Rename', old))?.trim();
+  if (!name || name === old) return;
+  if (name.includes('/')) return toast('A name can’t contain “/”', true);
+  const to = FV.join(FV.parent(target.path), name);
+  const folder = node.kind === 'directory';
+  try {
+    await applyFileChanges(pid, [{ op: 'move', from: target.path, to }], 'Renamed', { refresh: folder });
+    if (!folder) { filesState().cache.clear(); go(filesRoute(pid, to)); }
+  } catch (error) { filesFail(error); }
+}
+
+async function newFilesItem(pid, folder) {
+  const node = S.filesNode;
+  if (node?.kind !== 'directory' || !node.writable) return;
+  const name = (await promptText(folder ? 'New folder' : 'New file', folder ? 'New folder' : 'untitled.txt'))?.trim();
+  if (!name) return;
+  if (name.includes('/') && folder) return toast('A name can’t contain “/”', true);
+  const where = FV.join(node.path, name);
+  try {
+    if (folder) return await applyFileChanges(pid, [{ op: 'mkdir', path: where }], 'Created');
+    await applyFileChanges(pid, [{ op: 'write', path: where, text: '', expect: null }], 'Created', { refresh: false });
+    filesState().cache.clear();
+    S.filesEditOnOpen = where;
+    go(filesRoute(pid, where));
+  } catch (error) { filesFail(error); }
+}
+
+// ── uploads: files and folders, from a picker, a drop or a paste ──
+// Each file's bytes are staged (POST …/files/uploads), then one batch writes them.
+async function uploadFilesInto(pid, dir, items) {
+  if (!items.length) return;
+  const top = new Set(items.map((item) => FV.parts(item.rel)[0]));
+  const replacing = [...top].filter((name) => filesNamesHere().has(name));
+  if (replacing.length && !confirm(`Replace ${replacing.length === 1 ? `“${replacing[0]}”` : `${replacing.length} items`}?`)) return;
+  const status = $('#files-progress');
+  const total = items.reduce((sum, item) => sum + item.file.size, 0);
+  let sent = 0;
+  const show = (text) => { if (status) { status.hidden = !text; status.textContent = text; } };
+  try {
+    const changes = [];
+    for (const [index, item] of items.entries()) {
+      show(`Uploading ${index + 1} of ${items.length}${total > 1_000_000 ? ` · ${Math.floor((sent / total) * 100)}%` : ''}`);
+      const staged = await api(`/api/projects/${encodeURIComponent(pid)}/files/uploads`, { method: 'POST', body: item.file, headers: { 'content-type': 'application/octet-stream' } });
+      sent += item.file.size;
+      changes.push({ op: 'write', path: FV.join(dir, item.rel), upload: staged.upload });
+    }
+    show('Saving…');
+    for (let at = 0; at < changes.length; at += 1000)
+      await applyFileChanges(pid, changes.slice(at, at + 1000), `Uploaded ${items.length === 1 ? FV.parts(items[0].rel).pop() : `${items.length} files`}`, { refresh: at + 1000 >= changes.length });
+  } catch (error) { filesFail(error); }
+  finally { show(''); }
+}
+function pickFilesToUpload(pid, folder) {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.multiple = true;
+  if (folder) input.webkitdirectory = true;
+  const dir = filesFolder();
+  input.addEventListener('change', () => {
+    const items = [...input.files].map((file) => ({ file, rel: file.webkitRelativePath || file.name }));
+    uploadFilesInto(pid, dir, items);
+  });
+  input.click();
+}
+// What a drop holds, folders walked (DataTransferItem.webkitGetAsEntry).
+async function droppedFiles(dataTransfer) {
+  const entries = [...(dataTransfer.items || [])].map((item) => item.webkitGetAsEntry?.()).filter(Boolean);
+  if (!entries.length) return [...(dataTransfer.files || [])].map((file) => ({ file, rel: file.name }));
+  const out = [];
+  const walk = async (entry, prefix) => {
+    if (entry.isFile) { out.push({ file: await new Promise((done, fail) => entry.file(done, fail)), rel: FV.join(prefix, entry.name) }); return; }
+    const reader = entry.createReader();
+    for (;;) {
+      const batch = await new Promise((done, fail) => reader.readEntries(done, fail));
+      if (!batch.length) break;
+      for (const child of batch) await walk(child, FV.join(prefix, entry.name));
+    }
+  };
+  for (const entry of entries) await walk(entry, '');
+  return out;
+}
+
+// ── menus ──
+function closeFilesMenu() { document.querySelector('.files-menu')?.remove(); }
+// A small menu at a point (a right-click) or under a button. Items: {label, keys?, run, disabled?} or '-'.
+function openFilesMenu(at, items) {
+  closeFilesMenu();
+  const menu = document.createElement('div');
+  menu.className = 'files-menu';
+  menu.setAttribute('role', 'menu');
+  menu.innerHTML = items.map((item, i) => item === '-' ? '<div class="files-menu-sep" role="separator"></div>'
+    : `<button type="button" role="menuitem" data-i="${i}"${item.disabled ? ' disabled' : ''}><span>${esc(item.label)}</span>${item.keys ? `<kbd>${esc(item.keys)}</kbd>` : ''}</button>`).join('');
+  document.body.appendChild(menu);
+  const box = at instanceof Element ? at.getBoundingClientRect() : { left: at.x, bottom: at.y, top: at.y };
+  const width = menu.offsetWidth, height = menu.offsetHeight;
+  menu.style.left = `${Math.max(4, Math.min(box.left, innerWidth - width - 4))}px`;
+  menu.style.top = `${box.bottom + height + 4 > innerHeight ? Math.max(4, box.top - height - 4) : box.bottom + 4}px`;
+  const buttons = [...menu.querySelectorAll('button:not(:disabled)')];
+  menu.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-i]');
+    if (!button) return;
+    closeFilesMenu();
+    items[Number(button.dataset.i)].run();
+  });
+  menu.addEventListener('keydown', (event) => {
+    event.stopPropagation();
+    if (event.key === 'Escape') { event.preventDefault(); closeFilesMenu(); (at instanceof Element ? at : null)?.focus?.(); }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      const i = buttons.indexOf(document.activeElement);
+      buttons[(i + (event.key === 'ArrowDown' ? 1 : buttons.length - 1)) % buttons.length]?.focus();
+    }
+  });
+  setTimeout(() => document.addEventListener('pointerdown', (event) => { if (!menu.contains(event.target)) closeFilesMenu(); }, { once: true }), 0);
+  buttons[0]?.focus();
+}
+const FILES_KEYS = { cut: `${modKeyLabel()}X`, copy: `${modKeyLabel()}C`, paste: `${modKeyLabel()}V`, del: 'Del', rename: 'F2' };
+function modKeyLabel() { return /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? '⌘' : 'Ctrl+'; }
+// What can be done to the targets (a row's menu, the open file's ⋯).
+function filesItemMenu(pid) {
+  const node = S.filesNode, targets = filesTargets();
+  const mounted = targets.some((target) => target.mount);
+  const writable = !!node?.writable;
+  return [
+    ...(targets.length === 1 && targets[0].kind !== 'directory' && node.kind === 'directory' ? [{ label: 'Open', run: () => go(filesRoute(pid, targets[0].path)) }] : []),
+    { label: 'Cut', keys: FILES_KEYS.cut, disabled: !writable || mounted, run: () => copyFilesTargets(true) },
+    { label: 'Copy', keys: FILES_KEYS.copy, run: () => copyFilesTargets(false) },
+    ...(node.kind === 'directory' ? [{ label: 'Paste', keys: FILES_KEYS.paste, disabled: !writable || !filesClip(), run: () => pasteFiles(pid) }] : []),
+    '-',
+    { label: 'Rename', keys: FILES_KEYS.rename, disabled: !writable || mounted || targets.length !== 1, run: () => renameFilesTarget(pid) },
+    { label: 'Delete', keys: FILES_KEYS.del, disabled: !writable || mounted, run: () => deleteFilesTargets(pid) },
+  ];
+}
+function filesFolderMenu(pid) {
+  return [
+    { label: 'New file', keys: 'T', run: () => newFilesItem(pid, false) },
+    { label: 'New folder', keys: 'F', run: () => newFilesItem(pid, true) },
+    { label: 'Upload files', keys: 'U', run: () => pickFilesToUpload(pid, false) },
+    { label: 'Upload a folder', run: () => pickFilesToUpload(pid, true) },
+    '-',
+    { label: 'Paste', keys: FILES_KEYS.paste, disabled: !filesClip(), run: () => pasteFiles(pid) },
+  ];
+}
+
+// ── the page's tools and rows ──
+function filesActionsHtml(node) {
+  const view = S.filesView || '';
+  const folder = node.kind === 'directory' && node.writable;
+  const tool = (id, label, icon, shortcut, keys) => `<button type="button" class="btn sm icon" id="${id}" data-shortcut="${shortcut}" title="${esc(label)} (${keys})" aria-label="${esc(label)}">${icon}</button>`;
+  const terminal = view.startsWith('task:') ? node.writable : !!filesProjectId();
+  return `<span class="files-progress" id="files-progress" role="status" hidden></span>
+    ${folder ? tool('files-new-file', 'New file', FM_ICON.newFile, 'files.newFile', 'T') + tool('files-new-folder', 'New folder', FM_ICON.newFolder, 'files.newFolder', 'F')
+      + tool('files-upload', 'Upload', FM_ICON.upload, 'files.upload', 'U') : ''}
+    ${node.kind !== 'directory' && node.path ? `<button type="button" class="btn sm icon" id="files-more" title="More" aria-label="More" aria-haspopup="menu">${FM_ICON.more}</button>` : ''}
+    ${terminal ? `<button type="button" class="btn sm icon${S.filesTermOpen ? ' active' : ''}" id="files-terminal" data-shortcut="files.terminal" aria-pressed="${!!S.filesTermOpen}"
+      title="${view.startsWith('task:') ? 'Terminal' : 'Terminal: opens in a new task at this branch'} (Ctrl+\`)" aria-label="Terminal">${FM_ICON.terminal}</button>` : ''}`;
+}
+
+function wireFileManager(pid, node) {
+  const actions = $('#files-actions');
+  if (actions) actions.innerHTML = filesActionsHtml(node);
+  $('#files-new-file')?.addEventListener('click', () => newFilesItem(pid, false));
+  $('#files-new-folder')?.addEventListener('click', () => newFilesItem(pid, true));
+  $('#files-upload')?.addEventListener('click', (event) => openFilesMenu(event.currentTarget, [
+    { label: 'Files', run: () => pickFilesToUpload(pid, false) }, { label: 'A folder', run: () => pickFilesToUpload(pid, true) }]));
+  $('#files-more')?.addEventListener('click', (event) => openFilesMenu(event.currentTarget, filesItemMenu(pid)));
+  $('#files-terminal')?.addEventListener('click', () => toggleFilesTerminal(pid));
+  installFileManagerKeys();
+  // A scratch task's world is ready: its terminal opens.
+  if (S.filesTermWanted && S.filesTermWanted === (S.filesView || '') && node.view?.id) { S.filesTermWanted = null; startFilesTerminal(node); }
+  const body = $('#files-body');
+  if (node.kind !== 'directory' || !body) return;
+  const list = body.querySelector('.files-list');
+  paintFilesSelection();
+  // ⌘/Ctrl-click toggles a row, Shift-click selects a range; a plain click opens it.
+  list?.addEventListener('click', (event) => {
+    const row = event.target.closest('.files-row');
+    if (!row || event.target.closest('.files-more')) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey) { event.preventDefault(); selectFilesRow(row.dataset.name, { toggle: event.metaKey || event.ctrlKey, range: event.shiftKey }); }
+  });
+  body.querySelectorAll('.files-row').forEach((row) => {
+    row.insertAdjacentHTML('beforeend', `<button type="button" class="files-more" title="More" aria-label="More for ${esc(row.dataset.name)}" aria-haspopup="menu" tabindex="-1">${FM_ICON.more}</button>`);
+  });
+  body.addEventListener('click', (event) => {
+    const more = event.target.closest('.files-more');
+    if (!more) return;
+    const name = more.closest('.files-row').dataset.name;
+    if (!filesSelection().names.has(name) || filesSelection().dir !== node.path) selectFilesRow(name);
+    openFilesMenu(more, filesItemMenu(pid));
+  });
+  body.addEventListener('contextmenu', (event) => {
+    if (event.target.closest('input, textarea')) return;
+    event.preventDefault();
+    const row = event.target.closest('.files-row');
+    if (row) {
+      if (!filesSelection().names.has(row.dataset.name) || filesSelection().dir !== node.path) selectFilesRow(row.dataset.name);
+      return openFilesMenu({ x: event.clientX, y: event.clientY }, filesItemMenu(pid));
+    }
+    clearFilesSelection();
+    if (node.writable) openFilesMenu({ x: event.clientX, y: event.clientY }, filesFolderMenu(pid));
+  });
+  if (!node.writable) return;
+  // Drop files or folders here (onto a folder's row: into it).
+  let depth = 0;
+  body.addEventListener('dragenter', (event) => { if (event.dataTransfer?.types?.includes('Files')) { depth++; body.classList.add('dropping'); } });
+  body.addEventListener('dragleave', () => { if (--depth <= 0) { depth = 0; body.classList.remove('dropping'); } });
+  body.addEventListener('dragover', (event) => { if (event.dataTransfer?.types?.includes('Files')) event.preventDefault(); });
+  body.addEventListener('drop', async (event) => {
+    if (!event.dataTransfer?.types?.includes('Files')) return;
+    event.preventDefault();
+    depth = 0; body.classList.remove('dropping');
+    const row = event.target.closest('.files-row.kind-directory');
+    const dir = row && !row.dataset.mount ? FV.join(node.path, row.dataset.name) : node.path;
+    uploadFilesInto(pid, dir, await droppedFiles(event.dataTransfer));
+  });
+}
+
+// Keys and the clipboard on the Files page (not while typing, in a dialog or the terminal).
+function filesKeysApply(event) {
+  if (!isFilesTab() || !$('#files-page') || !S.filesNode || document.querySelector('dialog[open], .files-menu')) return false;
+  if ($('#overlay-root')?.childElementCount || $('#modal-root')?.childElementCount) return false;
+  const t = event.target;
+  if (t?.closest?.('input, textarea, select, [contenteditable], .term-screen, #files-editor')) return false;
+  return true;
+}
+function installFileManagerKeys() {
+  if (installFileManagerKeys.done) return;
+  installFileManagerKeys.done = true;
+  document.addEventListener('keydown', (event) => {
+    if (event.defaultPrevented || !filesKeysApply(event)) return;
+    const pid = filesProjectId(), mod = event.metaKey || event.ctrlKey;
+    const row = event.target.closest?.('#files-body .files-row');
+    if ((event.key === 'Delete' || (event.key === 'Backspace' && event.metaKey)) && !event.altKey) { event.preventDefault(); deleteFilesTargets(pid); return; }
+    if (event.key === 'F2') { event.preventDefault(); renameFilesTarget(pid); return; }
+    if (mod && event.key.toLowerCase() === 'a' && S.filesNode.kind === 'directory' && !event.shiftKey) {
+      event.preventDefault();
+      const sel = filesSelection();
+      sel.dir = S.filesNode.path;
+      sel.names = new Set([...document.querySelectorAll('#files-body .files-row')].map((r) => r.dataset.name));
+      paintFilesSelection();
+      return;
+    }
+    if (event.key === ' ' && row && !mod) { event.preventDefault(); selectFilesRow(row.dataset.name, { toggle: true }); return; }
+    if (event.key === 'Escape' && filesSelection().names.size) clearFilesSelection();
+    if (event.key === 'ContextMenu' || (event.key === 'F10' && event.shiftKey)) {
+      event.preventDefault();
+      if (row) { if (!filesSelection().names.has(row.dataset.name)) selectFilesRow(row.dataset.name); openFilesMenu(row, filesItemMenu(pid)); }
+      else if (S.filesNode.writable && S.filesNode.kind === 'directory') openFilesMenu($('#files-actions') || document.body, filesFolderMenu(pid));
+    }
+  });
+  const textSelected = () => !!window.getSelection?.()?.toString();
+  document.addEventListener('copy', (event) => { if (filesKeysApply(event) && !textSelected() && copyFilesTargets(false, event)) event.preventDefault(); });
+  document.addEventListener('cut', (event) => { if (filesKeysApply(event) && !textSelected() && copyFilesTargets(true, event)) event.preventDefault(); });
+  document.addEventListener('paste', (event) => {
+    if (!filesKeysApply(event) || !S.filesNode?.writable) return;
+    const files = [...(event.clipboardData?.files || [])];
+    if (files.length) { event.preventDefault(); uploadFilesInto(filesProjectId(), filesFolder(), files.map((file) => ({ file, rel: file.name }))); return; }
+    if (filesClip() && S.filesNode.kind === 'directory') { event.preventDefault(); pasteFiles(filesProjectId()); }
+  });
+}
+
+// ── editing a text file ──
+function filesEditButtonHtml() {
+  return `<button type="button" class="btn sm icon" id="files-edit" data-shortcut="files.edit" title="Edit (E)" aria-label="Edit">${FM_ICON.edit}</button>`;
+}
+function wireFilesEditButton(pid, node, body, text) {
+  S.filesText = { path: node.path, text };
+  body.querySelector('#files-edit')?.addEventListener('click', () => openFilesEditor(pid, node, text));
+  if (S.filesEditOnOpen === node.path) { S.filesEditOnOpen = null; openFilesEditor(pid, node, text); }
+}
+function openFilesEditor(pid, node, text) {
+  const body = $('#files-body');
+  if (!body || body.querySelector('#files-editor')) return;
+  const name = FV.parts(node.path).pop();
+  body.innerHTML = `<div class="files-file files-editor" id="files-editor">
+    <div class="files-file-head"><span class="files-file-name">${esc(name)}</span><span class="files-file-meta" id="files-edit-state"></span><span class="files-spacer"></span>
+      <button type="button" class="btn sm" id="files-edit-cancel" title="Cancel (Esc)">Cancel</button>
+      <button type="button" class="btn sm primary" id="files-edit-save" data-submit title="Save (${modKeyLabel()}S)">Save</button></div>
+    <textarea class="files-edit-area" id="files-edit-area" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off" aria-label="Contents of ${esc(name)}"></textarea></div>`;
+  const area = body.querySelector('#files-edit-area');
+  area.value = text;
+  area.focus();
+  area.setSelectionRange(0, 0);
+  let version = node.version, saving = false;
+  const dirty = () => area.value !== text;
+  const state = body.querySelector('#files-edit-state');
+  const paint = () => { state.textContent = saving ? 'Saving…' : dirty() ? 'Edited' : ''; };
+  const guard = (event) => { if (dirty()) { event.preventDefault(); event.returnValue = ''; } };
+  addEventListener('beforeunload', guard);
+  const close = () => { removeEventListener('beforeunload', guard); refreshFilesPage(); };
+  const save = async (overwrite = false) => {
+    if (saving) return;
+    if (!dirty()) return close();
+    saving = true; paint();
+    try {
+      await applyFileChanges(pid, [{ op: 'write', path: node.path, text: area.value, ...(overwrite ? {} : { expect: version ?? null }) }], `Saved ${name}`, { refresh: false });
+      text = area.value;
+      close();
+    } catch (error) {
+      if (error.status === 409) toast(error.message, true, { label: 'Overwrite', fn: () => save(true) });
+      else filesFail(error);
+    } finally { saving = false; if (area.isConnected) paint(); }
+  };
+  area.addEventListener('input', paint);
+  area.addEventListener('keydown', (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') { event.preventDefault(); event.stopPropagation(); save(); return; }
+    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); if (!dirty() || confirm('Discard your changes?')) close(); return; }
+    // Tab indents (as in an editor); Esc, then Tab, leaves the field.
+    if (event.key === 'Tab' && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      event.preventDefault();
+      area.setRangeText('\t', area.selectionStart, area.selectionEnd, 'end');
+      paint();
+    }
+  });
+  body.querySelector('#files-edit-save').addEventListener('click', () => save());
+  body.querySelector('#files-edit-cancel').addEventListener('click', () => { if (!dirty() || confirm('Discard your changes?')) close(); });
+}
+
+// ── the terminal ──
+// A panel under the listing, kept open across folders. In a task's view it is
+// that world's shell, opened in the folder shown; elsewhere it starts a scratch
+// task at the view's branch and opens in its view once its world is ready.
+function filesTermPanelHtml() {
+  if (!S.filesTermOpen) return '';
+  const where = S.filesTerm?.cwd;
+  return `<section class="files-term" id="files-term" aria-label="Terminal">
+    <div class="files-term-head">${FM_ICON.terminal}<span>Terminal</span>${where != null ? `<code class="files-term-where">/${esc(where)}</code>` : ''}<span class="files-spacer"></span>
+      <button type="button" class="icon-btn" id="files-term-close" title="Close terminal (Ctrl+\`)" aria-label="Close terminal">✕</button></div>
+    <pre class="raw term-screen files-term-screen" id="term-out" tabindex="0" title="Type here: keys go to the shell. Esc leaves it."></pre>
+  </section>`;
+}
+function wireFilesTerm() {
+  $('#files-term-close')?.addEventListener('click', () => closeFilesTerminal());
+  const ft = S.filesTerm;
+  if (!S.filesTermOpen) return;
+  if (ft && termIsOpenFor(ft.taskId)) bindTermScreen($('#term-out'));
+  else if (!S.filesTermWanted) { const out = $('#term-out'); if (out) out.textContent = term ? '' : '[terminal closed]'; }
+}
+function closeFilesTerminal() {
+  S.filesTermOpen = false;
+  S.filesTermWanted = null;
+  if (S.filesTerm && termIsOpenFor(S.filesTerm.taskId)) killTerminal();
+  S.filesTerm = null;
+  $('#files-term')?.remove();
+  $('#files-terminal')?.classList.remove('active');
+  $('#files-terminal')?.setAttribute('aria-pressed', 'false');
+}
+function startFilesTerminal(node) {
+  const taskId = node.view?.id;
+  if (!taskId) return;
+  const cwd = filesFolder(node);
+  S.filesTermOpen = true;
+  S.filesTerm = { taskId, cwd };
+  const panel = $('#files-term');
+  if (panel) panel.outerHTML = filesTermPanelHtml();
+  else $('#files-body')?.insertAdjacentHTML('afterend', filesTermPanelHtml());
+  $('#files-term-close')?.addEventListener('click', () => closeFilesTerminal());
+  $('#files-terminal')?.classList.add('active');
+  $('#files-terminal')?.setAttribute('aria-pressed', 'true');
+  openTerminal(taskId, { cwd });
+}
+async function toggleFilesTerminal(pid) {
+  if (S.filesTermOpen) return closeFilesTerminal();
+  const node = S.filesNode, view = S.filesView || '';
+  if (view.startsWith('task:')) { if (node) startFilesTerminal(node); return; }
+  // No machine stands behind a branch: a scratch task at it gets one.
+  const branch = view.startsWith('branch:') ? view.slice(7) : '';
+  if (!confirm(`Open a terminal in a new task at ${branch || 'the default branch'}?`)) return;
+  try {
+    const task = await api('/api/tasks', { method: 'POST', body: JSON.stringify({ projectId: pid, title: `Terminal on ${branch || 'the default branch'}`,
+      workflow: 'script-exec', command: 'true', ...(branch ? { base: branch } : {}) }) });
+    S.filesTermWanted = `task:${task.num ?? task.id}`;
+    S.filesTermOpen = true;
+    S.filesTerm = null;
+    go(filesRoute(pid, filesFolder(node), S.filesTermWanted));
+  } catch (error) { filesFail(error); }
 }
 
 // ── Files: artifacts (wiki features/project-files) ──
@@ -28467,6 +29017,11 @@ const HOST_COMMANDS = [
   { id: 'nav.files', title: 'Go to project files', key: 'g f', ...navCommand(() => tabRoute('files')) },
   { id: 'nav.wiki', title: 'Go to project wiki', key: 'g w', ...navCommand(() => tabRoute('wiki')) },
   { id: 'files.address', title: 'Type a path', key: 'g l', group: 'Files', available: () => isFilesTab() && !!$('#files-address'), run: () => editFilesAddress() },
+  { id: 'files.newFile', title: 'New file', key: 'T', group: 'Files', available: () => isFilesTab() && !!$('#files-new-file'), run: () => $('#files-new-file')?.click() },
+  { id: 'files.newFolder', title: 'New folder', key: 'F', group: 'Files', available: () => isFilesTab() && !!$('#files-new-folder'), run: () => $('#files-new-folder')?.click() },
+  { id: 'files.upload', title: 'Upload files', key: 'U', group: 'Files', available: () => isFilesTab() && !!$('#files-upload'), run: () => pickFilesToUpload(filesProjectId(), false) },
+  { id: 'files.edit', title: 'Edit file', key: 'e', group: 'Files', available: () => isFilesTab() && !!$('#files-edit'), run: () => $('#files-edit')?.click() },
+  { id: 'files.terminal', title: 'Terminal', key: 'ctrl+`', group: 'Files', available: () => isFilesTab() && !!$('#files-terminal'), run: () => $('#files-terminal')?.click() },
   { id: 'nav.orgfiles', title: 'Go to organization files', key: 'g F', ...navCommand(() => orgFilesRoute()) },
   { id: 'nav.orgwiki', title: 'Go to organization wiki', key: 'g W', ...navCommand(() => globalRoute('orgwiki')) },
   { id: 'nav.global', title: 'Go to organization settings', key: 'g S', ...navCommand(() => tabRoute('global')) },
@@ -29078,7 +29633,9 @@ function openHelp() {
       + row('t', 'Terminal / conversation')
       + row('u', 'Back to the list')],
     ['Projects', rows(group('Projects'))],
-    ['Files', rows(group('Files')) + row('↑ / ↓', 'Move in a folder') + row('Backspace', 'Up a folder')],
+    ['Files', rows(group('Files')) + row('↑ / ↓', 'Move in a folder') + row('Backspace', 'Up a folder')
+      + row(`${fmtKeys('meta+c')} ${fmtKeys('meta+x')} ${fmtKeys('meta+v')}`, 'Copy, cut, paste') + row('Del', 'Delete') + row('F2', 'Rename')
+      + row(`Space · ${fmtKeys('meta+a')}`, 'Select · select all') + row(fmtKeys('meta+s'), 'Save an edit')],
     ['Settings', row('{ / }', 'Previous / next section')],
   ];
   root.innerHTML = `<div class="palette-scrim" id="help-scrim"><div class="palette help-panel" role="dialog" aria-label="Keyboard shortcuts">
