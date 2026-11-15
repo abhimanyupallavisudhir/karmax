@@ -5138,9 +5138,7 @@ Prefer declining what the task does not need. Then briefly report the decision.`
       resolved.forEach((userId) => recipients.add(userId));
     }
     const service = new PermissionRequests(this.deps.store, project.organizationId);
-    const role = caller.role
-      ?? (await this.deps.store.getProfile(caller.profileId))?.role
-      ?? caller.profileId.replace(/-default$/, '');
+    const role = (await this.callerRole(caller));
     const prior = new Set((await service.requests({ taskId: task.id, status: 'pending' })).map((request) => request.id));
     const request = (await service.request({
       taskId: task.id,
@@ -5203,6 +5201,85 @@ Prefer declining what the task does not need. Then briefly report the decision.`
       audience: request.audience,
       canGrant: grantorSelectors(grantors),
     };
+  }
+
+  /**
+   * Take back a request made with `request_permission` that is no longer
+   * needed: a task's own permission request (only that task's agents may), or
+   * an authorization request for a task held for it (whoever may route it: its
+   * creator). It leaves every inbox and can no longer be approved; a request
+   * already decided is returned as it is, and nothing granted is revoked.
+   */
+  async withdrawPermissionRequest(token: string, input: { requestId: string; reason?: string; organizationId?: string })
+    : Promise<PermissionRequest | AuthorizationRequest> {
+    const caller = (await this.require(token, 'withdraw_permission_request'));
+    const callerTask = caller.taskId !== '*' ? (await this.deps.store.getTask(caller.taskId)) : undefined;
+    const organizationId = input.organizationId
+      || (callerTask && (await this.deps.store.getProject(callerTask.projectId))?.organizationId);
+    if (!organizationId) throw new ValidationError('organizationId is required');
+    const reason = String(input.reason ?? '').trim() || 'No longer needed';
+    if ([...reason].length > 4_000) throw new ValidationError('reason must be at most 4000 characters');
+    const emit = async (event: { taskId: string; type: string; ts: number; payload: Record<string, unknown> }) => {
+      const seq = (await this.deps.store.appendEvent(event));
+      this.deps.bus?.emit({ ...event, seq });
+    };
+
+    const permissions = new PermissionRequests(this.deps.store, organizationId);
+    const permission = (await permissions.requests()).find((candidate) => candidate.id === input.requestId);
+    if (permission) {
+      (await this.require(token, 'withdraw_permission_request', { projectId: permission.projectId, taskId: permission.taskId, organizationId }));
+      if (caller.taskId !== permission.taskId) throw new CapabilityError('only the task that asked can withdraw its permission request');
+      if (permission.status !== 'pending') return permission;
+      const withdrawn = (await permissions.withdraw(permission.id, caller.principal, reason));
+      if (withdrawn.status !== 'withdrawn') return withdrawn;
+      await emit({ taskId: withdrawn.taskId, type: 'permission.approval-resolved', ts: Date.now(),
+        payload: { requestId: withdrawn.id, action: 'withdraw', resolvedBy: caller.principal, reason } });
+      // Another of the task's agents took back what this one asked for, and
+      // this one may be waiting for the answer: it hears that none is coming.
+      const role = (await this.callerRole(caller));
+      if (role !== withdrawn.role)
+        await this.resumeAfterCredentialDecision(withdrawn.taskId, `[${BRAND} permission decision]\n\n`
+          + `Your request for ${[...withdrawn.capabilities, ...(withdrawn.projectIds ?? []).map((id) => `project ${id}`)].join(', ')} `
+          + `was withdrawn by this task's ${role} agent, so nobody will decide it.\n`
+          + `${untrustedBlock('its reason', reason)}\nContinue without it, or ask again if you still need it.`, withdrawn.role);
+      return withdrawn;
+    }
+
+    const authorizations = new AuthorizationRequests(this.deps.store, organizationId);
+    const authorization = (await authorizations.requests()).find((candidate) => candidate.id === input.requestId);
+    if (!authorization) throw new NotFoundError(`no permission request ${input.requestId}`);
+    (await this.require(token, 'withdraw_permission_request', { projectId: authorization.projectId, organizationId }));
+    const target = (await this.deps.store.getTask(authorization.target.taskId));
+    if (!target || !(await this.routesAuthorizationOf(caller, target)))
+      throw new CapabilityError('only the task creator can withdraw its authorization request');
+    if (authorization.status !== 'pending') return authorization;
+    const withdrawn = (await authorizations.withdraw(authorization.id, caller.principal, reason));
+    if (!withdrawn) {
+      const now = (await authorizations.requests()).find((candidate) => candidate.id === authorization.id)!;
+      if (now.status !== 'pending') return now;
+      throw new ValidationError('a decision on this request is already in progress');
+    }
+    // A draft waiting for it to start is a draft again, as after a denial.
+    (await this.releaseApprovalWait(withdrawn));
+    await emit({ taskId: target.id, type: 'authorization.approval-resolved', ts: Date.now(),
+      payload: { requestId: withdrawn.id, action: 'withdraw', resolvedBy: caller.principal, reason } });
+    return withdrawn;
+  }
+
+  /** The agent role a token acts as, as a permission request records it. */
+  private async callerRole(caller: ScopedToken): Promise<string> {
+    return caller.role
+      ?? (await this.deps.store.getProfile(caller.profileId))?.role
+      ?? caller.profileId.replace(/-default$/, '');
+  }
+
+  /** Whoever created a task routes its authorization request (and may take it
+   * back): an agent for a task it created, a person — or an agent acting for
+   * that person — for the person's own. */
+  private async routesAuthorizationOf(caller: ScopedToken, task: TaskRecord): Promise<boolean> {
+    if (caller.taskId !== '*' && task.createdBy?.kind === 'task-agent' && task.createdBy.taskId === caller.taskId) return true;
+    const userId = caller.humanSubject?.userId;
+    return !!userId && (await this.deps.store.taskCreatorUserId(task.id)) === userId;
   }
 
   /** What a permission request asks, in words: its capabilities and the
@@ -5555,17 +5632,12 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const caller = (await this.require(token, 'create_task', { projectId: input.projectId }));
     const project = (await this.deps.store.getProject(input.projectId));
     if (!project?.organizationId) throw new NotFoundError('project organization not found');
-    // Whoever created the task routes its request, human or agent alike: an
-    // agent for a task it created, a person — or an agent acting for that
-    // person — for the person's own.
     if ((input.target as { kind?: string }).kind !== 'task') throw new ValidationError('target.kind must be task');
-    const requesterId = caller.humanSubject?.userId;
     const targetTask = (await this.deps.store.getTask(input.target.taskId));
     if (!targetTask || targetTask.projectId !== input.projectId) throw new NotFoundError('task not found in this project');
     if (['done', 'cancelled'].includes(targetTask.lastView?.status ?? ''))
       throw new ValidationError('this task has finished');
-    const createdIt = caller.taskId !== '*' && targetTask.createdBy?.kind === 'task-agent' && targetTask.createdBy.taskId === caller.taskId;
-    if (!createdIt && !(requesterId && (await this.deps.store.taskCreatorUserId(targetTask.id)) === requesterId))
+    if (!(await this.routesAuthorizationOf(caller, targetTask)))
       throw new CapabilityError('only the task creator can route its authorization request');
     const credentialGrants = input.credentialGrants?.length ? [...new Set(input.credentialGrants.map(String))] : undefined;
     const targets = (await this.authorizationEscalationTargets(token, {

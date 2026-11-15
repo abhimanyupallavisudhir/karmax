@@ -48,7 +48,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
         'create_task', 'save_skill', 'signal_task', 'reorder_queue', 'propose_workflow_edit',
         'search_tasks', 'list_tags', 'tag_task', 'set_task_priority',
         'find_task', 'list_agents', 'get_conversation', 'fork_agent', 'message_agent', 'request_agent_action', 'cancel_agent_action',
-        'escalate_to_human', 'request_permission', 'my_authorization',
+        'escalate_to_human', 'request_permission', 'withdraw_permission_request', 'my_authorization',
         'list_events', 'emit_event', 'add_follow_up_trigger', 'remove_follow_up_trigger', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'verify_resource_revision', 'propose_project_resource', 'describe_platform', 'platform_request', 'list_world_providers',
         'list_github_actions_runs', 'inspect_github_actions_run', 'manage_github_actions_run', 'dispatch_github_actions_workflow',
         'connect_world_provider', 'test_world_provider', 'disconnect_world_provider',
@@ -234,6 +234,21 @@ describe('platform MCP server (capability-checked tool calls)', () => {
       audience: ['@creator', '@team:operators'],
       reason: 'Inspect the outbound email configuration.',
     }]);
+  });
+
+  it('takes a permission request back by the id request_permission returned', async () => {
+    const seen: unknown[] = [];
+    const server = createPlatformMcpServer({
+      withdrawPermissionRequest: async (args: unknown) => { seen.push(args); return { status: 'withdrawn' }; },
+    } as any);
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverT);
+    const c = new Client({ name: 'withdraw-test', version: '1.0.0' });
+    await c.connect(clientT);
+    const result: any = await c.callTool({ name: 'withdraw_permission_request',
+      arguments: { requestId: 'preq_1', reason: 'Found another way.' } });
+    expect(result.isError).toBeFalsy();
+    expect(seen).toEqual([{ requestId: 'preq_1', reason: 'Found another way.' }]);
   });
 
   /**

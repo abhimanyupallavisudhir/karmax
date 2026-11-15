@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { AuthorizationGrantError, AuthorizationService, organizationScope, projectScope } from '../src/platform/authorization.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { allows } from '../src/platform/capabilities.js';
+import { tasksWithOpenRequests } from '../src/platform/settled-requests.js';
 import type { AuthorizationSelection, TaskView } from '../src/domain/types.js';
 
 /** Asking for more authorization than you have: who is summoned, and how an
@@ -273,5 +274,96 @@ describe('running a draft its creator could not fully authorize', () => {
     expect(task.params.draft).toBeFalsy();
     expect(task.params._authorization).toMatchObject({ level: 'developer', principal: 'user:owner', profileAttenuated: false });
     expect((task.params._authorization as { capabilities: string[] }).capabilities.length).toBeGreaterThan(0);
+  });
+});
+
+/** An agent that asked for something it no longer needs takes the ask back,
+ * so nobody is left with a decision that no longer matters. */
+describe('withdrawing a request', () => {
+  async function asking() {
+    const f = await fixture();
+    await f.store.saveView(f.parent.id, { taskId: f.parent.id, title: 'Parent', workflow: 'software-dev', stage: 'do',
+      status: 'active', messages: [], actions: [], state: {}, updatedAt: 1 } as TaskView);
+    const asked = await f.api.requestPermission(await f.agentOf(f.parent.id, ['task:escalate', 'task:read']), {
+      capabilities: ['organization:member:write'], reason: 'Invite the new contractor.' });
+    expect(asked).toMatchObject({ status: 'needs_approval', audience: ['@admins'] });
+    expect((await f.store.listInbox('admin', f.organization.id)).map((item) => item.kind)).toContain('approval-requested');
+    const roleOf = async (role: string) => (await f.tokens.mint({ taskId: f.parent.id, profileId: role, role,
+      principal: `task-agent:${f.parent.id}:${role}`, projectId: f.project.id, organizationId: f.organization.id,
+      ceiling: ['task:escalate', 'task:read'], grantorCaps: ['task:escalate', 'task:read'] })).token;
+    return { ...f, requestId: asked.requestId!, roleOf };
+  }
+
+  it('lets the asking agent take back its own: it leaves every inbox and can no longer be approved', async () => {
+    const f = await asking();
+    const resumed = vi.spyOn(f.api, 'resumeAfterCredentialDecision');
+    // A later turn of the same agent: a new token, the same task and role.
+    const withdrawn = await f.api.withdrawPermissionRequest(await f.roleOf('do'),
+      { requestId: f.requestId, reason: 'The owner invited them already.' });
+    expect(withdrawn).toMatchObject({ status: 'withdrawn',
+      withdrawn: { by: `task-agent:${f.parent.id}:do`, reason: 'The owner invited them already.' } });
+    expect((await f.store.eventsOfType(f.parent.id, 'permission.approval-resolved')).at(-1)?.payload).toMatchObject({
+      requestId: f.requestId, action: 'withdraw', reason: 'The owner invited them already.' });
+    expect((await f.store.listInbox('admin', f.organization.id)).filter((item) => item.kind === 'approval-requested')).toEqual([]);
+    expect((await tasksWithOpenRequests(f.store)).has(f.parent.id)).toBe(false);
+    await expect(f.api.resolvePermissionRequest(await f.human('admin'),
+      { organizationId: f.organization.id, requestId: f.requestId, action: 'approve' })).rejects.toThrow(/withdrawn/);
+    // It knows it withdrew it: nobody tells it so.
+    expect(resumed).not.toHaveBeenCalled();
+    // Again, or with no reason: it is returned as it is.
+    expect(await f.api.withdrawPermissionRequest(await f.roleOf('do'), { requestId: f.requestId }))
+      .toMatchObject({ status: 'withdrawn', withdrawn: { reason: 'The owner invited them already.' } });
+  });
+
+  it('tells the asking agent when another of its task\'s agents takes it back', async () => {
+    const f = await asking();
+    const resumed = vi.spyOn(f.api, 'resumeAfterCredentialDecision').mockResolvedValue({ resumed: true, messageId: 'm' });
+    const withdrawn = await f.api.withdrawPermissionRequest(await f.roleOf('responder'), { requestId: f.requestId });
+    expect(withdrawn).toMatchObject({ status: 'withdrawn', withdrawn: { reason: 'No longer needed' } });
+    expect(resumed).toHaveBeenCalledWith(f.parent.id, expect.stringMatching(/withdrawn by this task's responder agent/), 'do');
+  });
+
+  it('is only for the task that asked, and leaves a decided request as it was', async () => {
+    const f = await asking();
+    const other = await f.store.createTask({ projectId: f.project.id, title: 'Other', workflow: 'software-dev',
+      workflowVersion: '1.4.0', createdBy: { kind: 'user', userId: 'dev' }, params: { prompt: 'work' } });
+    await expect(f.api.withdrawPermissionRequest(await f.agentOf(other.id), { requestId: f.requestId }))
+      .rejects.toThrow(/only the task that asked/);
+    await expect(f.api.withdrawPermissionRequest(await f.human('admin'),
+      { requestId: f.requestId, organizationId: f.organization.id })).rejects.toThrow(/only the task that asked/);
+    await expect(f.api.withdrawPermissionRequest(await f.agentOf(f.parent.id), { requestId: 'preq_nope' }))
+      .rejects.toThrow(/no permission request/);
+
+    await f.api.resolvePermissionRequest(await f.human('admin'),
+      { organizationId: f.organization.id, requestId: f.requestId, action: 'deny' });
+    expect(await f.api.withdrawPermissionRequest(await f.roleOf('do'), { requestId: f.requestId }))
+      .toMatchObject({ status: 'denied' });
+  });
+
+  it('takes back what a held draft asked for: the draft stays a draft, and only its creator may', async () => {
+    const f = await fixture();
+    const agent = await f.agentOf(f.parent.id);
+    const draft = await f.api.createTask(agent, { projectId: f.project.id, workflow: 'just-do', prompt: 'deploy',
+      authorization: f.maintainer, draft: true, holdForAuthorization: true } as any);
+    const asked = await f.api.requestPermission(agent, { taskId: draft.id, reason: 'Deploys.' });
+    expect((await f.store.getTask(draft.id))!.params._awaitingApproval).toBe(asked.requestId);
+
+    const stranger = await f.store.createTask({ projectId: f.project.id, title: 'Other', workflow: 'software-dev',
+      workflowVersion: '1.4.0', createdBy: { kind: 'user', userId: 'dev' }, params: { prompt: 'work' } });
+    await expect(f.api.withdrawPermissionRequest(await f.agentOf(stranger.id), { requestId: asked.requestId! }))
+      .rejects.toThrow(/only the task creator/);
+
+    const withdrawn = await f.api.withdrawPermissionRequest(await f.agentOf(f.parent.id),
+      { requestId: asked.requestId!, reason: 'Someone else deployed.' });
+    expect(withdrawn).toMatchObject({ type: 'authorization', status: 'withdrawn',
+      withdrawn: { by: `task-agent:${f.parent.id}:do`, reason: 'Someone else deployed.' } });
+    const task = (await f.store.getTask(draft.id))!;
+    expect(task.params).toMatchObject({ draft: true, _awaitingApproval: null });
+    expect((await f.store.eventsOfType(draft.id, 'authorization.approval-resolved')).at(-1)?.payload)
+      .toMatchObject({ requestId: asked.requestId, action: 'withdraw' });
+    expect((await f.store.listInbox('maint', f.organization.id)).filter((item) => item.kind === 'approval-requested')).toEqual([]);
+    await expect(f.api.resolveAuthorizationRequest(await f.human('maint'),
+      { organizationId: f.organization.id, requestId: asked.requestId!, action: 'approve' })).rejects.toThrow(/withdrawn/);
+    expect((await f.store.getTask(draft.id))!.params._authorization).not.toMatchObject({ level: 'maintainer', attenuated: false });
   });
 });
