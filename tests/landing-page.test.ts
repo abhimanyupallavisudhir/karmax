@@ -206,7 +206,15 @@ describe('public landing page', () => {
     // A tick and a dash are read out as what they mean.
     expect(await row('Open source').first().locator('span').getAttribute('aria-label')).toBe('Yes');
     expect(await row('Open source').nth(1).locator('span').getAttribute('aria-label')).toBe('No');
-    expect(await table.locator('tbody tr').count()).toBeGreaterThanOrEqual(5);
+    // What sets tavya apart leads: any model, work beyond code, the files Git ignores, workflows and autonomy.
+    expect(await table.locator('tbody th').allInnerTexts()).toEqual(['Choose any model', 'A cloud computer for every task', 'Work that is not code', 'Files Git ignores, and data in versions',
+      'App integrations', 'Review by any person or agent', 'Tasks that wait for other tasks', 'Agents run the whole project', 'Runs in your own cloud account', 'Open source']);
+    expect(await row('Choose any model').allInnerTexts()).toEqual(['✓', 'Claude only', 'OpenAI only', 'Fixed harness', 'Fixed harness', '✓']);
+    // App integrations: each product lists what it has, one to a line; only tavya has a wallet.
+    const integrations = (await row('App integrations').allInnerTexts()).map((text) => text.split('\n'));
+    expect(integrations[0]).toEqual(['Apps', 'Logins', 'Passwords', 'Secrets', 'Mailbox', 'Wallet']);
+    expect(integrations[1]).toEqual(['Apps', 'Secrets']);
+    expect(integrations.slice(1).some((list) => list.includes('Wallet'))).toBe(false);
     expect((await page.locator('.lp-compare-foot').innerText()).replace(/\s+/g, ' ')).toBe('November 2026 · The comparison in full');
     // The full comparison opens in place, like every public page.
     expect(await page.locator('.lp-compare-foot a').getAttribute('href')).toBe('/compare');
@@ -234,6 +242,12 @@ describe('public landing page', () => {
     // Its link opens a public page in place.
     expect(await ignored.locator('a').evaluate((link: any) => [link.getAttribute('href'), 'public' in link.dataset, link.target])).toEqual(['/docs/ignored-files', true, '']);
     expect(await page.locator('.landing-page').innerText()).not.toMatch(/\{\{\w+\}\}/);
+    // Against the vendors' own cloud agents, the answer is a list of what tavya adds.
+    const different = page.locator('.lp-answer', { hasText: 'How is this different from Claude Code on the web or Codex cloud?' });
+    await different.locator('summary').click();
+    expect(await different.locator('li strong').allInnerTexts()).toEqual(['Any model.', 'More than code.', 'Your whole project.', 'Real accounts.', 'Workflows you set.', 'The autonomous company.', 'Yours to run.']);
+    expect(await different.locator('ul').evaluate((list: any) => getComputedStyle(list).listStyleType)).toBe('disc');
+    expect(await different.locator('a').getAttribute('href')).toBe('/compare');
     await ui.close();
     // Where the installation offers a free trial of compute, the first answer says how much.
     const hosted = await consolePage();

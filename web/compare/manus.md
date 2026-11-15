@@ -16,11 +16,13 @@ Agents with a cloud computer, a browser that stays signed in, an address for mai
 - **Phone**: a mobile app, and with Cue a phone number for the agent.
 - **Scale of one job**: hundreds of research agents from one request.
 
-## Where tavya is different
+## Where tavya is ahead
 
 - **Your choice of agent and model.** A task runs Claude Code, Codex or OpenCode, on your own Claude or ChatGPT plan or API key. Manus runs its own agent on its credits.
 - **Built around real projects.** Git repositories, pull requests, a merge queue, large data with versions, project secrets: an agent works where your work lives.
-- **Review you can set.** Each task passes a review route of people and agents before it lands; one agent can check another's work ([Let one agent review another](/docs/agent-review)).
+- **Reviewers you choose.** Each task passes a review route of people and agents before it lands, and an agent can answer the working agent's questions in your place ([Let one agent review another](/docs/agent-review)). In Manus you "make the final call".
+- **Tasks that wait for other tasks**, sub-tasks reviewed by their parent, and projects where agents answer, approve and land the work within a budget.
+- **A wallet with limits you can read.** A card has a budget per task, and anything above it waits for your approval ([Give an agent a card with a budget](/docs/agent-payments)). Cue lists a wallet for each agent; its documentation does not say how spending is limited. tavya also keeps passwords in a vault agents fill from without seeing.
 - **Teams.** People and agents share one set of permissions.
 - **Your own cloud account**: E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud.
 - **Open source**, under the GNU AGPL-3.0.
@@ -31,5 +33,5 @@ Choose Manus when the result is a deck, a video or a piece of research and you w
 
 ## Sources
 
-- [Introducing Manus 2.0](https://manus.im/blog/introducing-manus-2-0), [Wide Research](https://manus.im/docs/features/wide-research), [Automations](https://manus.im/docs/automations), [Cloud browser](https://manus.im/docs/features/cloud-browser)
+- [Introducing Manus 2.0](https://manus.im/blog/introducing-manus-2-0), [Wide Research](https://manus.im/docs/features/wide-research), [Automations](https://manus.im/docs/automations), [Cloud browser](https://manus.im/docs/features/cloud-browser), [What is new in Manus 2.0](https://help.manus.im/en/articles/17190150-what-is-new-in-manus-2-0)
 - [Manus membership pricing](https://help.manus.im/en/articles/11711111-what-is-the-current-membership-pricing-for-manus)

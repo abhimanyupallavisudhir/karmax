@@ -97,6 +97,7 @@ describe('public pages for search engines and link previews (hosted)', () => {
     expect(page.body).toContain(`<h2>${compare.title}</h2>`);
     expect(page.body).toContain('<th><a href="/compare/claude-code">Claude Code</a></th>');
     expect(page.body).toContain('<tr><th>Open source</th><td>yes</td><td>no</td><td>CLI only</td>');
+    expect(page.body).toContain('<tr><th>App integrations</th><td>Apps<br>Logins<br>Passwords<br>Secrets<br>Mailbox<br>Wallet</td><td>Apps<br>Secrets</td>');
     expect(page.body).toContain('<a href="/compare">The comparison in full</a>');
     expect(page.body).toContain(`<h2>${landing.answers[0]}</h2>`);
     expect(page.body).toMatch(/<h3>What about files Git ignores\?<\/h3>\n<p[^>]*>They come along\. <code[^>]*>\.env<\/code> values are kept as project secrets/);
@@ -120,6 +121,17 @@ describe('public pages for search engines and link previews (hosted)', () => {
     expect(hub.body).not.toContain('{{comparison}}');
     expect(hub.body).toMatch(/<th[^>]*><a href="\/compare\/devin"[^>]*>Devin<\/a><\/th>/);
     expect(hub.body).toContain('Git hosts');
+    // A cell that lists several things holds them one to a line, in the page and in its Markdown source.
+    expect(hub.body).toMatch(/<td[^>]*>Apps<br>Logins<br>Passwords<br>Secrets<br>Mailbox<br>Wallet<\/td>/);
+    expect((await get('/compare/index.md')).body).toContain('| App integrations | Apps<br>Logins<br>Passwords<br>Secrets<br>Mailbox<br>Wallet | Apps<br>Secrets |');
+    // Every comparison says where tavya is ahead, and where the other is.
+    expect(hub.body).toMatch(/<h2[^>]*>Where tavya is ahead<\/h2>/);
+    for (const product of ['claude-code', 'codex', 'devin', 'cursor', 'paperclip', 'warp', 'manus', 'openclaw']) {
+      const body = (await get(`/compare/${product}.md`)).body;
+      expect(body, product).toContain('\n## Where tavya is ahead\n');
+      expect(body, product).toMatch(/\n## Where .+ (is|are) ahead\n[\s\S]+\n## Where tavya is ahead\n/);
+      expect(body, product).not.toContain('Where tavya is different');
+    }
     const devin = await get('/compare/devin');
     expect([devin.status, title(devin.body), canonical(devin.body)]).toEqual([200, 'tavya vs Devin · tavya', `${base}/compare/devin`]);
     expect(title((await get('/about')).body)).toBe('About tavya · tavya');
@@ -128,7 +140,9 @@ describe('public pages for search engines and link previews (hosted)', () => {
     const missing = await get('/compare/no-such-product');
     expect([missing.status, missing.headers['x-robots-tag']]).toEqual([404, 'noindex']);
     expect((await get('/compare/')).headers.location).toBe('/compare');
-    // Each has its Markdown source, pointing at the page.
+    // Each has its Markdown source, pointing at the page, with this installation's address in place of the placeholder.
+    expect((await get('/about.md')).body).toContain(`\`${base}/mcp\``);
+    expect((await get('/about.md')).body).not.toMatch(/\{\{\w+\}\}/);
     for (const [source, of] of [['/compare/devin.md', '/compare/devin'], ['/compare/index.md', '/compare'], ['/about.md', '/about'], ['/changelog.md', '/changelog']]) {
       const file = await get(source!);
       expect([file.status, file.headers['content-type'], file.headers.link], source).toEqual([200, 'text/markdown; charset=utf-8', `<${base}${of}>; rel="canonical"`]);

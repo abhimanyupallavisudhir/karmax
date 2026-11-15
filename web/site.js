@@ -72,7 +72,15 @@
     // answer naming {{trialCredit}} or {{trialDays}} shows only where there is a free trial.
     answers: ['Questions', [
       ['How is this different from Claude Code on the web or Codex cloud?',
-        'Those run one vendor’s agent on that vendor’s computers. Here Claude Code, Codex and open models share one list: one agent can review another’s work, tasks start other tasks, agents sign in and pay within limits you set, and the computers can be your own cloud account. [Compare](/compare).'],
+        ['Those run one vendor’s agent on that vendor’s computers. Here:', '',
+          '- **Any model.** Claude Code, Codex and open models share one list, and one can review another’s work.',
+          '- **More than code.** Papers, websites, video and errands: a task needs no repository.',
+          '- **Your whole project.** `.env` files, credentials and large data come along, not only what is in Git.',
+          '- **Real accounts.** Agents sign in, receive mail and pay, within limits you set.',
+          '- **Workflows you set.** You choose who answers and who reviews, a person or an agent, and tasks wait for other tasks.',
+          '- **The autonomous company.** A project can run itself: agents create, review and approve the work within a budget.',
+          '- **Yours to run.** It is open source, and the computers can be your own cloud account.', '',
+          '[Compare](/compare).'].join('\n')],
       ['What does it cost to try?',
         'Nothing. A new account gets {{trialCredit}} of compute for {{trialDays}} days and a built-in model, so your first tasks need no card and no agent login. [Pricing](/pricing).'],
       ['Do I need a Claude or ChatGPT plan?',
@@ -93,7 +101,8 @@
   };
 
   // How tavya compares, on the landing and on /compare: a product does a thing
-  // ('yes'), does not ('no'), or does in part (a few words saying how).
+  // ('yes'), does not ('no'), does in part (a few words saying how), or has some
+  // of a list (the ones it has, one to a line).
   const compare = { title: 'How it compares', asOf: 'November 2026',
     // Checked against each vendor's own documentation in November 2026 (sources: web/compare/*.md).
     // 'no' also stands for "its documentation does not describe it".
@@ -107,17 +116,21 @@
     ],
     // The landing's rows.
     rows: [
-      ['Claude Code, Codex and open models in one list', { tavya: 'yes', claude: 'no', codex: 'no', devin: 'one agent, several models', cursor: 'one agent, several models', paperclip: 'yes' }],
+      ['Choose any model', { tavya: 'yes', claude: 'Claude only', codex: 'OpenAI only', devin: 'Fixed harness', cursor: 'Fixed harness', paperclip: 'yes' }],
       ['A cloud computer for every task', { tavya: 'yes', claude: 'yes', codex: 'yes', devin: 'yes', cursor: 'yes', paperclip: 'optional' }],
-      ['Sub-tasks, schedules and events', { tavya: 'yes', claude: 'yes', codex: 'yes', devin: 'yes', cursor: 'yes', paperclip: 'yes' }],
-      ['An inbox, logins and a card with a budget', { tavya: 'yes', claude: 'secrets', codex: 'logins', devin: 'logins', cursor: 'secrets', paperclip: 'secrets' }],
+      ['Work that is not code', { tavya: 'yes', claude: 'yes', codex: 'through ChatGPT', devin: 'data and reports', cursor: 'alongside code', paperclip: 'yes' }],
+      ['Files Git ignores, and data in versions', { tavya: 'yes', claude: 'variables, uploads', codex: 'variables, a saved image', devin: 'secrets, a snapshot', cursor: 'secrets, a snapshot', paperclip: 'local files' }],
+      ['App integrations', { tavya: ['Apps', 'Logins', 'Passwords', 'Secrets', 'Mailbox', 'Wallet'], claude: ['Apps', 'Secrets'], codex: ['Apps', 'Logins', 'Passwords', 'Secrets'],
+        devin: ['Apps', 'Logins', 'Passwords', 'Secrets'], cursor: ['Apps', 'Secrets'], paperclip: ['Apps', 'Logins', 'Secrets', 'Mailbox'] }],
+      ['Review by any person or agent', { tavya: 'yes', claude: 'Claude', codex: 'Codex', devin: 'Devin', cursor: 'Bugbot', paperclip: 'yes' }],
+      ['Tasks that wait for other tasks', { tavya: 'yes', claude: 'scripted', codex: 'no', devin: 'scripted', cursor: 'no', paperclip: 'yes' }],
+      ['Agents run the whole project', { tavya: 'yes', claude: 'a coordinator; you merge', codex: 'a coordinator; you review', devin: 'a coordinator; agent approval', cursor: 'a coordinator; agent approval', paperclip: 'yes' }],
       ['Runs in your own cloud account', { tavya: 'yes', claude: 'Team, Enterprise', codex: 'no', devin: 'yes', cursor: 'yes', paperclip: 'yes' }],
       ['Open source', { tavya: 'yes', claude: 'no', codex: 'CLI only', devin: 'no', cursor: 'no', paperclip: 'yes' }],
     ],
     // What the comparison in full adds, including where the others are ahead.
     more: [
-      ['An agent reviews the work before it lands', { tavya: 'any model', claude: 'Claude', codex: 'Codex', devin: 'Devin', cursor: 'Bugbot', paperclip: 'yes' }],
-      ['Results that are not code', { tavya: 'yes', claude: 'yes', codex: 'through ChatGPT', devin: 'reports', cursor: 'alongside code', paperclip: 'yes' }],
+      ['Sub-tasks, schedules and events', { tavya: 'yes', claude: 'yes', codex: 'yes', devin: 'yes', cursor: 'yes', paperclip: 'yes' }],
       ['Git hosts', { tavya: 'GitHub, or hosted by tavya', claude: 'GitHub', codex: 'GitHub, GitLab', devin: 'GitHub, GitLab, Bitbucket, Azure DevOps', cursor: 'GitHub, GitLab, Bitbucket, Azure DevOps', paperclip: 'not tied to one' }],
       ['Included in a plan you may already have', { tavya: 'no', claude: 'Claude plans', codex: 'ChatGPT plans', devin: 'no', cursor: 'Cursor plans', paperclip: 'free to self-host' }],
       ['A phone app', { tavya: 'in the browser', claude: 'yes', codex: 'yes', devin: 'yes', cursor: 'yes', paperclip: 'in the browser' }],
@@ -125,7 +138,7 @@
 
   // The comparison as a Markdown table: what `{{comparison}}` in a page stands for.
   const comparisonTable = () => {
-    const cell = (value) => (value === 'yes' ? '✓' : !value || value === 'no' ? '—' : value);
+    const cell = (value) => (value === 'yes' ? '✓' : !value || value === 'no' ? '—' : [value].flat().join('<br>'));
     return [`| | ${compare.products.map((product) => (product.path ? `[${product.name}](${product.path})` : `**${product.name}**`)).join(' | ')} |`,
       `|---|${compare.products.map(() => ':-:').join('|')}|`,
       ...[...compare.rows, ...compare.more].map(([label, values]) => `| ${label} | ${compare.products.map((product) => cell(values[product.id])).join(' | ')} |`)].join('\n');

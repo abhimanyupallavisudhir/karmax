@@ -29403,9 +29403,9 @@ function renderLanding() {
     return ['light', 'dark'].map((look) => `<img class="lp-${look}" src="/media/landing/${name}-${look}.webp" alt="${look === 'light' ? esc(alt) : ''}"${look === 'dark' ? ' aria-hidden="true"' : ''} width="${width}" height="${height}" style="--w:${width}" loading="lazy" decoding="async">`).join('');
   };
   const automations = () => `<ul class="lp-automations">${landing.automations.map(([title, when]) => `<li><b>${esc(title)}</b><i>Repeatable</i><span>${esc(when)}</span></li>`).join('')}</ul>`;
-  // How it compares: a tick, a dash, or a few words where it is neither.
+  // How it compares: a tick, a dash, a few words where it is neither, or a list of what it has, one to a line.
   const compared = (value) => (value === 'yes' ? '<td class="yes"><span aria-label="Yes">✓</span></td>'
-    : !value || value === 'no' ? '<td class="no"><span aria-label="No">—</span></td>' : `<td class="part">${esc(value)}</td>`);
+    : !value || value === 'no' ? '<td class="no"><span aria-label="No">—</span></td>' : `<td class="part">${[value].flat().map(esc).join('<br>')}</td>`);
   const comparison = compare.rows.length ? `<section class="lp-compare" aria-labelledby="lp-compare-title">
         <h2 id="lp-compare-title">${esc(compare.title)}</h2>
         <div class="lp-compare-scroll" tabindex="0" role="region" aria-labelledby="lp-compare-title"><table>

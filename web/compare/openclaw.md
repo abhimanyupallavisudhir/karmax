@@ -16,12 +16,13 @@ Both are open source, work with many models, do work that is not code, can drive
 - **Chat first.** You talk to it where you already talk to people.
 - **Model choice**, local models included, and an MIT licence.
 
-## Where tavya is different
+## Where tavya is ahead
 
 - **A task list, not a chat.** Every piece of work is a task with its own conversation, result and review, so many can run at once and nothing is lost in a thread.
 - **A separate computer for every task.** An agent works in an isolated cloud computer with only the project it was given. OpenClaw's documentation says sandboxing is off by default: its agent works on your own machine.
-- **Limits you set.** For each login you choose whether an agent may use it without asking and whether it may ever see it; payments have a budget per task; results wait for review ([Give an agent a card with a budget](/docs/agent-payments)).
-- **Projects and teams.** Repositories, pull requests, a merge queue, shared data, and one set of permissions for people and agents.
+- **Limits you set.** For each login you choose whether an agent may use it without asking and whether it may ever see it; results wait for review by the people or agents you name ([Let one agent review another](/docs/agent-review)).
+- **A mailbox and a wallet.** Agents receive mail at their own address and pay from a card with a budget per task; anything above it waits for your approval ([Give an agent a card with a budget](/docs/agent-payments)). OpenClaw watches a mailbox you give it.
+- **Projects and teams.** Repositories, pull requests, a merge queue, data in versions, tasks that wait for other tasks, and one set of permissions for people and agents.
 - **Nothing to keep running.** tavya is hosted; you can also [host it yourself](/docs/self-hosting).
 
 tavya answers in chat too: [Chat bots](/docs/chat-bots) connects Telegram, Slack, Discord and WhatsApp.

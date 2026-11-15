@@ -15,7 +15,7 @@ import { GatewayMetrics, type MemorySource } from './metrics.js';
 import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
 import { assetExists, MATHJAX_SCRIPT_SOURCE, serveStaticAsset, staticAssetRevision, unpublishedAsset } from './static-assets.js';
 import { announceChangedPages, indexNowKeyFile } from './indexnow.js';
-import { LANDING_TAGLINE, llmsFullText, llmsPageList, markdownSourcePage, policySlugOf, publicBody, publicEntries, publicHead, publicPath, resolvePublicRoute, robotsTxt, sitemapXml, type PublicPageContext, type PublicRoute } from './public-pages.js';
+import { LANDING_TAGLINE, llmsFullText, llmsPageList, markdownSource, policySlugOf, publicBody, publicEntries, publicHead, publicPath, resolvePublicRoute, robotsTxt, sitemapXml, type PublicPageContext, type PublicRoute } from './public-pages.js';
 import { SwrCache } from '../util/swr-cache.js';
 import { MAX_REVIEW_ARTIFACT_BYTES, savedReviewArtifact } from '../store/review-artifacts.js';
 import { readWorldFilePrefix } from '../world/file-prefix.js';
@@ -9836,14 +9836,13 @@ export class Gateway {
     if (!(await assetExists(this.deps.staticDir, file))) file = path.join(this.deps.staticDir, 'index.html'); // SPA fallback
     const name = path.basename(file);
     // A page's Markdown source (agents read it) points search engines at the page.
-    const sourceOf = name !== 'index.html' && p.endsWith('.md') ? markdownSourcePage(this.deps.staticDir, p) : undefined;
-    if (sourceOf) {
-      const origin = req ? this.publicUrl(req) : '';
+    const origin = req ? this.publicUrl(req) : '';
+    const source = name !== 'index.html' && p.endsWith('.md') ? markdownSource(this.deps.staticDir, p, origin) : undefined;
+    if (source) {
       this.countCrawl(req, p);
-      return void (await serveStaticAsset(req, res, file, undefined,
-        { headers: { link: `<${origin}${sourceOf}>; rel="canonical"` } }).catch(() => {
-        if (!res.headersSent) res.writeHead(404).end('not found');
-      }));
+      res.writeHead(200, { 'content-type': MIME['.md']!, 'cache-control': 'no-cache', 'content-length': String(Buffer.byteLength(source.body)),
+        link: `<${origin}${source.page}>; rel="canonical"` });
+      return void res.end(req?.method === 'HEAD' ? undefined : source.body);
     }
     // The shell answers for its URL: a public page gets its own title,
     // description, canonical URL, social tags and a plain rendering of its

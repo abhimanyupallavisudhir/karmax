@@ -100,7 +100,7 @@ function renderMarkdown(staticDir: string, source: string): string {
 }
 
 /** A cell of the comparison: the product does it, does not, or does in part (said in a few words). */
-type Compared = 'yes' | 'no' | string;
+type Compared = 'yes' | 'no' | string | string[];
 type LandingPart = [shot: string, title: string, line: string, alt: string];
 
 /** web/site.js: the pages beside the console and the landing's words, shared with web/app.js. */
@@ -166,9 +166,11 @@ export function docPages(staticDir: string): DocFile[] {
     .map((doc) => ({ ...doc, slug: doc.path === '/docs' ? DEFAULT_DOC : doc.path.slice('/docs/'.length) }));
 }
 
-/** The page a Markdown file under web/ is the source of, if it is one. */
-export function markdownSourcePage(staticDir: string, pathname: string): string | undefined {
-  return publicSite(staticDir).pages.find((entry) => `/${entry.file}` === pathname)?.path;
+/** A page's Markdown source as a reader gets it (agents read it): the page it is the
+ * source of, and its text with the comparison table and this installation's address filled in. */
+export function markdownSource(staticDir: string, pathname: string, origin: string): { page: string; body: string } | undefined {
+  const doc = markdownPages(staticDir).find((entry) => `/${entry.file}` === pathname);
+  return doc && { page: doc.path, body: doc.source.replaceAll('{{origin}}', origin) };
 }
 
 const money = (cents: number) => `$${(cents / 100).toFixed(cents % 100 ? 2 : 0)}`;
@@ -209,7 +211,7 @@ function landingBody(ctx: PublicPageContext, description: string): string {
   const [autonomyTitle, autonomyLine, autonomy] = landing.autonomy;
   const [featuresTitle, features] = landing.features;
   const [answersTitle] = landing.answers;
-  const cell = (value: string | undefined) => (value === 'yes' ? 'yes' : !value || value === 'no' ? 'no' : esc(value));
+  const cell = (value: Compared | undefined) => (value === 'yes' ? 'yes' : !value || value === 'no' ? 'no' : [value].flat().map(esc).join('<br>'));
   const comparison = compare.rows.length ? `<h2>${esc(compare.title)}</h2>
 <table><thead><tr><th></th>${compare.products.map((product) => `<th>${product.path ? `<a href="${esc(product.path)}">${esc(product.name)}</a>` : esc(product.name)}</th>`).join('')}</tr></thead>
 <tbody>${compare.rows.map(([label, values]) => `<tr><th>${esc(label)}</th>${compare.products.map((product) => `<td>${cell(values[product.id])}</td>`).join('')}</tr>`).join('')}</tbody></table>
