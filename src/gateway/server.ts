@@ -463,7 +463,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p.startsWith('/api/agent/github/actions')) return read ? 'github:actions:read' : 'github:actions:write';
   if (p === '/api/agent/resource-candidates') return 'task:review:write';
   if (p === '/api/agent/escalate' || p === '/api/agent/escalation-targets'
-    || p === '/api/agent/permission-requests') return 'task:escalate';
+    || p === '/api/agent/permission-requests' || /^\/api\/agent\/permission-requests\/[^/]+\/withdraw$/.test(p)) return 'task:escalate';
   if (p === '/api/permission-requests' || /^\/api\/permission-requests\/[^/]+\/resolve$/.test(p)) return 'task:read';
   if (p === '/api/repository-access-requests' || /^\/api\/repository-access-requests\/[^/]+\/resolve$/.test(p)) return 'task:read';
   if (p === '/api/agent/notify') return 'task:conversation:message';
@@ -6440,6 +6440,17 @@ export class Gateway {
         } catch (error) {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
+      }
+      const permissionWithdrawal = p.match(/^\/api\/agent\/permission-requests\/([^/]+)\/withdraw$/);
+      if (permissionWithdrawal && method === 'POST') {
+        const b = await this.body(req);
+        try {
+          return this.json(res, 200, await api.withdrawPermissionRequest(token, {
+            requestId: decodeURIComponent(permissionWithdrawal[1]!),
+            ...(b.reason ? { reason: String(b.reason) } : {}),
+            ...(url.searchParams.get('organizationId') ? { organizationId: url.searchParams.get('organizationId')! } : {}),
+          }));
+        } catch (error) { return this.badRequest(res, error); }
       }
       // The project these act in decides the caller's authority, so it must be
       // in the URL (`?projectId=`), where the gateway scopes the session to it.

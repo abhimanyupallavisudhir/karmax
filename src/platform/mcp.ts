@@ -7,7 +7,7 @@ import { URGENCY_LEVELS, type AgentSpec, type AuthorizationSelection, type Provi
 import {
   AGENT_ROLE_NAMES, PLATFORM_REQUEST_BODY_SCHEMA, PLATFORM_REQUEST_EXCLUDED_PATHS,
   PRIORITY_NAMES, compactSearch, compactOrganizationSearch, compactTags, normalizePlatformPath, normalizeRequestBody,
-  platformRequestPathError, FIELDS_PARAMETER, agentPlatformResponse, agentTaskView, CREATE_TASK_GRANTS, REQUEST_FOR_TASK, PERMISSION_ROUTING, QUEUE_TASK_DESCRIPTION, queuedTaskReply,
+  platformRequestPathError, FIELDS_PARAMETER, agentPlatformResponse, agentTaskView, CREATE_TASK_GRANTS, REQUEST_FOR_TASK, PERMISSION_ROUTING, WITHDRAW_PERMISSION_REQUEST, QUEUE_TASK_DESCRIPTION, queuedTaskReply,
   type CompactTask,
 } from './platform-request.js';
 import { BRAND } from '../domain/brand.js';
@@ -69,6 +69,7 @@ export interface PlatformOps {
   notify(a: { to?: string[]; message: string; urgency?: Urgency; agents?: AgentSpec[] }): Promise<unknown>;
   requestPermission(a: { capabilities?: string[]; projectIds?: string[]; taskId?: string; audience?: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
   requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
+  withdrawPermissionRequest(a: { requestId: string; reason?: string }): Promise<unknown>;
   cancelAgentAction(requestId: string): Promise<unknown>;
   reorderQueue(domain: string, taskId: string): Promise<void>;
   saveSkill(a: { name: string; content: string }): Promise<unknown>;
@@ -152,6 +153,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     notify: (a) => api.notify(getToken(), a),
     requestPermission: (a) => api.requestPermission(getToken(), a),
     requestAgentAction: (a) => api.requestAgentAction(getToken(), a),
+    withdrawPermissionRequest: (a) => api.withdrawPermissionRequest(getToken(), a),
     cancelAgentAction: (requestId) => api.cancelAgentAction(getToken(), requestId),
     reorderQueue: (domain, id) => api.reorderQueue(getToken(), domain, id),
     saveSkill: (a) => api.saveSkill(getToken(), a) as Promise<unknown>,
@@ -258,6 +260,9 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     notify: (a) => req('/api/agent/notify', { method: 'POST', body: JSON.stringify(a) }),
     requestPermission: (a) => req('/api/agent/permission-requests', { method: 'POST', body: JSON.stringify(a) }),
     requestAgentAction: (a) => req('/api/agent/collaboration/request', { method: 'POST', body: JSON.stringify(a) }),
+    withdrawPermissionRequest: (a) => req(`/api/agent/permission-requests/${encodeURIComponent(a.requestId)}/withdraw`, {
+      method: 'POST', body: JSON.stringify(a.reason ? { reason: a.reason } : {}),
+    }),
     cancelAgentAction: (requestId) => req(`/api/agent/collaboration/${encodeURIComponent(requestId)}/cancel`, {
       method: 'POST', body: '{}',
     }),
@@ -619,6 +624,17 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       },
     },
     async (a) => wrap(async () => (await ops.requestPermission(a))),
+  );
+  server.registerTool(
+    'withdraw_permission_request',
+    {
+      description: WITHDRAW_PERMISSION_REQUEST,
+      inputSchema: {
+        requestId: z.string().trim().min(1).describe('The requestId request_permission returned.'),
+        reason: z.string().trim().max(4_000).optional().describe('Why it is no longer needed (shown to the people asked).'),
+      },
+    },
+    async (a) => wrap(async () => (await ops.withdrawPermissionRequest(a))),
   );
   server.registerTool(
     'request_agent_action',

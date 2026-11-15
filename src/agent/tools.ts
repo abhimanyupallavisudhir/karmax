@@ -10,7 +10,7 @@ import { readWorldFilePrefix } from '../world/file-prefix.js';
 import { startJob, jobStatuses, describeJobs, listJobs, stopJobs, MAX_JOB_NAME } from '../world/jobs.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import {
-  PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES, CREATE_TASK_GRANTS, REQUEST_FOR_TASK, PERMISSION_ROUTING,
+  PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES, CREATE_TASK_GRANTS, REQUEST_FOR_TASK, PERMISSION_ROUTING, WITHDRAW_PERMISSION_REQUEST,
   QUEUE_TASK_DESCRIPTION, queuedTaskReply,
   compactSearch, compactOrganizationSearch, compactTags, normalizeRequestBody, platformRequestPathError,
   FIELDS_PARAMETER, agentPlatformResponse, agentTaskView,
@@ -938,6 +938,18 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'withdraw_permission_request',
+    description: WITHDRAW_PERMISSION_REQUEST,
+    parameters: {
+      type: 'object',
+      properties: {
+        request_id: { type: 'string', description: 'The requestId request_permission returned.' },
+        reason: { type: 'string', maxLength: 4_000, description: 'Why it is no longer needed (shown to the people asked).' },
+      },
+      required: ['request_id'],
+    },
+  },
+  {
     name: 'publish_task_branch',
     description: 'Publish this task’s clean, committed Git branch so another agent can import it. Commit first.',
     parameters: { type: 'object', properties: {} },
@@ -1705,6 +1717,11 @@ export function platformToolHandlers(
         reason: String(args?.reason ?? ''),
         ...(args?.urgency ? { urgency: String(args.urgency) } : {}),
       }));
+    },
+    async withdraw_permission_request(args) {
+      return JSON.stringify(await platformRequest('POST',
+        `/api/agent/permission-requests/${encodeURIComponent(String(args?.request_id ?? ''))}/withdraw`,
+        args?.reason ? { reason: String(args.reason) } : {}));
     },
     async publish_task_branch() {
       return JSON.stringify(await platformRequest('POST', '/api/agent/git/publish', {}));
