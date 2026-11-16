@@ -22,7 +22,7 @@ export const PLATFORM_API_CATALOG = {
       'GET /api/user/export', 'GET /api/user/paid-subscriptions', 'GET|PUT /api/user/default-organization', 'GET|PATCH /api/user/preferences', 'GET|PUT /api/user/onboarding', 'POST /api/user/onboarding/reset',
       'POST /api/user/account-deletion-request', 'POST /api/invitations/accept',
       'GET /api/projects/:projectId/avatars (the project\'s tasks marked Avatār, and whether you may call each; made and edited as tasks with params.avatar = {callableBy?, forksMayBeAvatars?})',
-      'PUT /api/organizations/:organizationId/usage-policy (funding/concurrency changes require owner delegation)',
+      'PUT /api/organizations/:organizationId/usage-policy (agent concurrency changes require owner delegation)',
       'GET|PATCH /api/inbox', 'GET|PUT /api/inbox/preferences',
       'GET|POST|PUT|DELETE /api/user/github-accounts|git-profiles',
       'POST /api/organizations/:organizationId/subscription/checkout|portal|change|cancel|resume|seats|sync-seats|storage-packs|compute-packs (owner only)',
