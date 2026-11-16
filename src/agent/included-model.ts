@@ -22,6 +22,9 @@ import type { AgentProfile } from '../domain/types.js';
 import { EFFORTS, type Effort } from './effort.js';
 import type { Store } from '../store/db.js';
 import { ComputeCreditExhausted, computeCredit, outOfCompute } from '../world/managed-compute.js';
+import { type ModelPrice, openRouterApiBase, openRouterPrices, resetModelPrices } from './model-prices.js';
+
+export { openRouterApiBase };
 
 /** DeepSeek V4.1 Flash at max effort (2026-11-07). On tavya's model
  * evaluation (wiki features/included-model: OpenCode as tavya runs it, three
@@ -51,7 +54,6 @@ const CONFIG_KEY = 'included-model:config';
 const MANAGEMENT_HANDLE = 'included-model:installation:openrouter:management-key';
 const keyRecord = (organizationId: string) => `included-model:key:${organizationId}`;
 const keyHandle = (organizationId: string) => `included-model:organization:${organizationId}:openrouter-key`;
-export const openRouterApiBase = () => (process.env.KARMAX_OPENROUTER_API_URL ?? 'https://openrouter.ai/api/v1').replace(/\/$/, '');
 
 export interface IncludedModelSettings {
   /** The OpenRouter model id, e.g. deepseek/deepseek-v4.1-flash-1017. */
@@ -119,23 +121,6 @@ export const MEASURED_TASK_USD: Readonly<Record<string, number>> = {
  * evaluation: per input token, 9% uncached and 91% read from the cache, and
  * 3.4% as many output tokens (reasoning included). */
 const TASK_MIX = { prompt: 0.09, cache: 0.91, completion: 0.034 };
-const PRICES_TTL_MS = 6 * 60 * 60_000;
-let prices: { at: number; byId: Map<string, { prompt: number; completion: number; cache?: number }> } | undefined;
-
-async function openRouterPrices(now = Date.now()) {
-  if (prices && now - prices.at < PRICES_TTL_MS) return prices.byId;
-  const response = await fetch(`${openRouterApiBase()}/models`, { signal: AbortSignal.timeout(10_000) });
-  if (!response.ok) throw new Error(`OpenRouter models: ${response.status}`);
-  const byId = new Map<string, { prompt: number; completion: number; cache?: number }>();
-  for (const model of ((await response.json()) as { data?: any[] }).data ?? []) {
-    const p = model?.pricing ?? {};
-    const prompt = Number(p.prompt), completion = Number(p.completion), cache = Number(p.input_cache_read);
-    if (typeof model?.id === 'string' && Number.isFinite(prompt) && Number.isFinite(completion))
-      byId.set(model.id, { prompt, completion, ...(Number.isFinite(cache) && p.input_cache_read !== undefined ? { cache } : {}) });
-  }
-  prices = { at: now, byId };
-  return byId;
-}
 
 /** About how many times the included model's cost a typical task on
  * `agentModel` (`openrouter/<id>`) at `effort` costs: measured where both
@@ -148,14 +133,14 @@ export async function includedModelRelativeCost(settings: IncludedModelSettings,
   const base = measured(settings.model, settings.effort), other = measured(id, effort);
   if (base && other) return other / base;
   const byId = await openRouterPrices().catch(() => undefined);
-  const cost = (price?: { prompt: number; completion: number; cache?: number }) => price
+  const cost = (price?: ModelPrice) => price
     && TASK_MIX.prompt * price.prompt + TASK_MIX.cache * (price.cache ?? price.prompt) + TASK_MIX.completion * price.completion;
   const baseCost = cost(byId?.get(settings.model)), otherCost = cost(byId?.get(id));
   return baseCost && otherCost !== undefined ? otherCost / baseCost : undefined;
 }
 
 /** Tests: forget cached prices. */
-export function resetIncludedModelPrices(): void { prices = undefined; }
+export function resetIncludedModelPrices(): void { resetModelPrices(); }
 
 async function openRouter(broker: CredentialBroker, method: string, path: string, body?: unknown): Promise<any> {
   const key = await broker.resolve(MANAGEMENT_HANDLE, { caps: [`use-credential:${MANAGEMENT_HANDLE}`] });

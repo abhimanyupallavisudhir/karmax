@@ -22,6 +22,9 @@ const DISCONNECTED_HOME = '.karmax-disconnected';
  * Gotcha (§7.3): spawn each agent with a SCRUBBED, fully isolated environment —
  * unset inherited API keys so they don't leak across profiles.
  */
+/** Where turns through a model gateway keep their harness's home. */
+const GATEWAY_HOMES = 'gateway-homes';
+
 export class ConfigHomeManager {
   /** `logins`: the credentials live in the vault and these homes cache them
    * (data epoch 6, `model-logins.ts`). Without it (tests, tools) the files are the login. */
@@ -101,7 +104,7 @@ export class ConfigHomeManager {
   list(organizationId = 'org_personal'): { provider: string; account: string; path: string; loggedIn: boolean; modelProvider?: string }[] {
     const root = this.organizationRoot(organizationId);
     return readHomesDirectory(root)
-      .filter((entry) => entry.isDirectory() && !(organizationId === 'org_personal' && entry.name === 'organizations'))
+      .filter((entry) => entry.isDirectory() && !(organizationId === 'org_personal' && (entry.name === 'organizations' || entry.name === GATEWAY_HOMES)))
       .filter((entry) => !fs.existsSync(path.join(root, entry.name, DISCONNECTED_HOME)))
       .map(({ name }) => {
       const [provider, ...rest] = name.split('-');
@@ -146,6 +149,20 @@ export class ConfigHomeManager {
     if (organizationId === 'org_personal') throw new Error('cannot remove the personal organization config-home namespace');
     await this.logins?.forgetOrganization(organizationId);
     fs.rmSync(this.organizationRoot(organizationId), { recursive: true, force: true });
+    fs.rmSync(path.join(this.root, GATEWAY_HOMES, sanitize(organizationId)), { recursive: true, force: true });
+  }
+
+  /** The Claude Code or Codex home of an organization's turns through a model
+   * gateway (wiki features/model-gateways): no login in it, never a login's
+   * home (whose history and settings are that login's) nor the operator's own.
+   * Its sessions stay here so the next turn resumes them. Not an account:
+   * `list` never shows it. */
+  gatewayHome(provider: 'claude' | 'codex', organizationId: string, gatewayUrl = process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505'): string {
+    const dir = path.join(this.root, GATEWAY_HOMES, sanitize(organizationId), provider);
+    const fresh = !fs.existsSync(dir);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (fresh) this.writeMcpConfig(dir, provider, { browser: 'none', platform: platformMcpSpec(gatewayUrl) });
+    return dir;
   }
 
   /** Bring a home's cached credential up to date with the vault before it is
@@ -244,6 +261,10 @@ export class ConfigHomeManager {
   allHomes(): Array<{ provider: string; path: string }> {
     if (!fs.existsSync(this.root)) return [];
     const homes = this.list().map(({ provider, path: home }) => ({ provider, path: home }));
+    const gateways = path.join(this.root, GATEWAY_HOMES);
+    for (const org of fs.existsSync(gateways) ? readHomesDirectory(gateways).filter((entry) => entry.isDirectory()) : [])
+      for (const provider of readHomesDirectory(path.join(gateways, org.name)).filter((entry) => entry.isDirectory()))
+        homes.push({ provider: provider.name, path: path.join(gateways, org.name, provider.name) });
     const organizations = path.join(this.root, 'organizations');
     if (!fs.existsSync(organizations)) return homes;
     for (const org of readHomesDirectory(organizations).filter((entry) => entry.isDirectory())) {

@@ -27,7 +27,7 @@ import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import { ServiceError, WorkflowNotFoundError, WorkflowUpdateFailedError, isGrpcServiceError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { COMPUTE_HOLD, holdManagedCompute, outOfCompute, type ComputeHoldRequest } from '../world/managed-compute.js';
+import { COMPUTE_HOLD, computeCredit, holdManagedCompute, outOfCompute, type ComputeHoldRequest } from '../world/managed-compute.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
 import { capacityCause, ComputeRouter, type RouterConnections } from '../world/compute-router.js';
 import { accountKey, dequeue, enqueue, wakeFullKey } from '../world/compute-queue.js';
@@ -44,8 +44,8 @@ import { WorldBusy } from '../world/shared-coordination.js';
 import { World, WorldHandle, WorldKind, WorldSpec, type WorldRepo, worldWorkingDirectory, type WorldDiagnosis } from '../world/types.js';
 import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
-import { managedModelCostCeiling, managedModelRailAvailable } from '../agent/managed-models.js';
-import { INCLUDED_MODEL_OPTIONS, includedModel, includedModelKey, includedModelOutOfCredit, isIncludedModel, syncIncludedModelUsage } from '../agent/included-model.js';
+import { INCLUDED_MODEL_MIN_MICROS, INCLUDED_MODEL_OPTIONS, includedModelKey, includedModelOutOfCredit, syncIncludedModelUsage } from '../agent/included-model.js';
+import { creditRail, issueGatewayToken, openRouterTurnAuth, proxyRoot, proxyTurnAuth, revokeGatewayToken, type CreditRail } from '../agent/model-gateways.js';
 import {
   apiKeyEnv,
   assertRunnableProvider,
@@ -116,7 +116,7 @@ import { defaultParticipant, participantAuthorization } from '../platform/agent-
 import { fillViaCdp } from '../autonomy/fill.js';
 import { fillCardInWorld, BILLING_FIELDS } from '../autonomy/card-fill.js';
 import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js';
-import { tokenToInject } from '../autonomy/config-homes.js';
+import { ConfigHomeManager, tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
 import { CodexHistoryError } from '../agent/codex-history.js';
 import { importWithPanagent, reuseNativeImport, stableImportSessionId, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
@@ -2867,12 +2867,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
       const keys = ordered.map((c) => c.key);
-      // A model tavya pays for needs no credential of the organization's own:
-      // the legacy rail's environment key, or the included model (wiki
-      // features/included-model), whose key the turn makes itself.
-      if (!keys.length && profile && (managedModelRailAvailable(store.hosted,
-        await store.getOrganizationUsagePolicy(organizationId), profile)
-        || isIncludedModel(profile, await includedModel(store, deps.broker)))) return [];
+      // A model the credit pays for needs no credential of the organization's
+      // own: the included model (wiki features/included-model), whose key the
+      // turn makes itself, or Claude Code / Codex through a model gateway
+      // (wiki features/model-gateways). Neither holds a login lease.
+      if (!keys.length && profile && (await creditRail(store, deps.broker, profile))) return [];
       // An empty compatible set must not fall through to an ambient/profile
       // credential and bypass an explicit disable. A non-existent allow-list
       // entry makes the coordinator deny the turn with a credential action;
@@ -3222,25 +3221,47 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }
         }
       }
-      const usagePolicy = (await store.getOrganizationUsagePolicy(organizationId));
-      const managedInstallationRail = managedModelRailAvailable(store.hosted, usagePolicy, profile);
-      // The included model (wiki features/included-model): with nothing of the
-      // organization's own leased, the turn runs on the organization's own
-      // OpenRouter key, its limit set to what the credit has left (refused,
-      // Out of compute, when that is too little to start).
-      const included = !args.accountConfigHome && !args.accountApiKeyHandle && !!deps.broker
-        && isIncludedModel(profile, await includedModel(store, deps.broker));
-      if (included) {
-        try { resolvedAuth = { apiKey: await includedModelKey(store, deps.broker!, organizationId), modelOptions: INCLUDED_MODEL_OPTIONS }; }
-        catch (error) { throw capacityFailure(error) ?? error; }
-      }
+      // On the credit (wiki features/included-model, features/model-gateways):
+      // with nothing of the organization's own leased (nor, for the personal
+      // organization of a self-hosted installation, its ambient login), the
+      // turn runs on the included model's OpenRouter key — OpenCode, or Claude
+      // Code / Codex at OpenRouter's endpoints — or through an operator
+      // gateway behind tavya's proxy. Refused, Out of compute, when too little
+      // credit is left to start.
+      const rail: CreditRail | undefined = !args.accountConfigHome && !args.accountApiKeyHandle && !!deps.broker
+        && !resolvedAuth && (organizationId !== 'org_personal' || store.hosted || !ambientCredential(profile.provider))
+        ? await creditRail(store, deps.broker, profile) : undefined;
+      // Spend read back from the organization's OpenRouter key (included model, OpenRouter rail).
+      const included = rail?.kind === 'included' || rail?.kind === 'openrouter';
+      // A token for tavya's proxy in front of an operator gateway, good for this turn.
+      let gatewayToken: string | undefined;
+      const gatewayHome = (provider: Provider) => (deps.configHomes ?? new ConfigHomeManager()).gatewayHome(provider as 'claude' | 'codex', organizationId);
+      try {
+        if (rail?.kind === 'included')
+          resolvedAuth = { apiKey: await includedModelKey(store, deps.broker!, organizationId), modelOptions: INCLUDED_MODEL_OPTIONS };
+        else if (rail?.kind === 'openrouter')
+          resolvedAuth = { configHome: gatewayHome(profile.provider), gateway: openRouterTurnAuth(profile.provider as 'claude' | 'codex', rail.model,
+            await includedModelKey(store, deps.broker!, organizationId)) };
+        else if (rail?.kind === 'gateway') {
+          if (store.hosted) {
+            const credit = await computeCredit(store, organizationId);
+            if (credit.availableMicros != null && credit.availableMicros < INCLUDED_MODEL_MIN_MICROS)
+              throw await outOfCompute(store, organizationId, rail.gateway.name);
+          }
+          const root = proxyRoot(isRemote(args.worldHandle.kind));
+          if (!root) throw ApplicationFailure.create({ nonRetryable: true, type: 'agent-error',
+            message: `The model gateway ${rail.gateway.name} is reached through this installation's public address, which is not set (KARMAX_PUBLIC_URL), so an agent in a cloud computer cannot use it.` });
+          gatewayToken = await issueGatewayToken(store, { gatewayId: rail.gateway.id, harness: profile.provider as 'claude' | 'codex',
+            organizationId, projectId: args.task.projectId, taskId: args.taskId });
+          resolvedAuth = { configHome: gatewayHome(profile.provider), gateway: proxyTurnAuth(rail.gateway, profile.provider as 'claude' | 'codex', rail.model, gatewayToken, root) };
+        }
+      } catch (error) { throw capacityFailure(error) ?? error; }
       if (
         organizationId !== 'org_personal'
         && profile.provider !== 'mock'
         && !args.accountConfigHome
         && !args.accountApiKeyHandle
-        && !managedInstallationRail
-        && !included
+        && !rail
       ) {
         throw new Error(`organization ${organizationId} has no usable ${credentialProvider(profile)} credential; connect an organization login or API key`);
       }
@@ -3831,10 +3852,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ? ((args.accountApiKeyHandle || args.accountConfigHome || args.accountCredentialKind === 'login') ? 'byok' : 'managed')
         : 'customer';
       const modelProvider = canonicalModelProvider(args.accountCredentialProvider ?? credentialProvider(profile));
-      // The included model's cost is read back from its key after the turn
-      // (syncIncludedModelUsage); its limit, not a reservation, bounds it.
-      const managedReservationMicros = fundingSource === 'managed' && !included
-        ? managedModelCostCeiling(modelProvider, profile.model) : undefined;
+      // A managed turn runs on the credit: on an OpenRouter key whose spend is
+      // read back after the turn (syncIncludedModelUsage), its limit bounding
+      // it, or through an operator gateway, whose proxy books each request and
+      // refuses the next once the credit is spent (wiki features/model-gateways).
       // What ran: tokens per task differ several-fold between efforts of one model.
       const usageMetadata = { role: args.role, model: profile.model, ...(profile.effort ? { effort: profile.effort } : {}) };
       const finishUsage = async (completed: boolean | undefined) => {
@@ -3853,18 +3874,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 ...(usage.models ? { models: usage.models } : {}),
                 ...(schedulingAccount ? { account: schedulingAccount } : {}) } });
           }
-          if (fundingSource === 'managed' && !included) {
-            const actualized = managedModelActualCost(modelProvider, profile.model, usage, managedReservationMicros!);
-            completedUsageEvents.push({ id: `usage:cost:${usageAdmissionId}`, organizationId, projectId: args.task.projectId,
-              taskId: args.taskId, worldId: args.worldHandle.id, provider: modelProvider,
-              kind: 'agent.cost', quantity: 0, unit: 'request', costMicros: actualized.costMicros,
-              fundingSource, costClassification: actualized.classification,
-              startedAt: Date.now(), endedAt: Date.now(), metadata: { ...usageMetadata,
-                ...actualized.metadata } });
-          }
-          // Completion and incurred/estimated cost actualization commit together:
-          // no concurrent admission can observe the reservation released before
-          // its durable replacement exists, and a duplicate retry sees completed.
+          // Completion and the turn's token report commit together; a duplicate
+          // retry sees completed.
           (await store.finishUsageAdmission(usageAdmissionId, completed, Date.now(), completedUsageEvents));
           const firstFinish = !usageAdmissionFinished && completed !== undefined;
           if (firstFinish && included) (await syncIncludedModelUsage(store, deps.broker!, organizationId,
@@ -3926,13 +3937,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             taskId: args.taskId, provider: modelProvider, model: profile.model, fundingSource,
             ...(activityAttempt > 1 ? { retryOf: Array.from({ length: activityAttempt - 1 },
               (_, index) => admissionIdFor(turnId, index + 1)) } : {}),
-            reservedCostMicros: managedReservationMicros, ...(included ? { included: true } : {}) }));
+          }));
           // A rejected admission does not own the existing reservation and must
           // not release it in finally (it may belong to a different live turn).
           usageAdmissionId = admissionId;
           // Record the admitted request immediately, before the provider call. Its
-          // stable id makes retries/duplicate delivery a no-op. The hard-cap debit
-          // remains only on the active admission row; it is not incurred cost.
+          // stable id makes retries/duplicate delivery a no-op.
           (await store.recordUsage({ id: `usage:request:${usageAdmissionId}`, organizationId,
             projectId: args.task.projectId, taskId: args.taskId, worldId: args.worldHandle.id,
             provider: modelProvider, kind: 'agent.request', quantity: 1, unit: 'request',
@@ -3993,7 +4003,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ...((args.agentTurnId ?? legacyAgentTurnId) ? { turnId: args.agentTurnId ?? legacyAgentTurnId } : {}) }));
         (await store.appendAudit({ principalId: `task:${args.taskId}`, action: 'mcp.selected', scopeKey: `project:${args.task.projectId}`, detail: { connections: profile.mcpConnections ?? [], role: args.role } }));
         let pullSecretEnv: (() => Promise<Record<string, string>>) | undefined;
-        secrets.add(token, resolvedAuth?.apiKey, resolvedAuth?.oauthToken);
+        secrets.add(token, resolvedAuth?.apiKey, resolvedAuth?.oauthToken, resolvedAuth?.gateway?.apiKey);
         // Git-profile credentials for the agent subprocess (wiki plans/PLAN-git-config
         // §4B): an agent that pushes or runs `gh` acts as the project's account.
         const skippedEnv: SkippedEnv[] = [];
@@ -4071,8 +4081,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         } }, {
           adapters: deps.adapters,
           onProviderStart: async () => {
-            // The estimate survives a killed worker that cannot run finally. A
-            // provider-reported result refines it; unknown usage stays estimated.
+            // What the provider reported so far survives a killed worker that cannot run finally.
             if (fundingSource === 'managed') await finishUsage(undefined);
             providerInvoked = true;
             providerStartedAt ??= Date.now();
@@ -4329,18 +4338,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // otherwise it stays with this task, which waits instead of escalating.
         let turnError = err;
         if (err instanceof SandboxProviderFailure) {
-          const login = resolvedAuth?.configHome && (profile.provider === 'claude' || profile.provider === 'codex')
+          const login = resolvedAuth?.configHome && !resolvedAuth.gateway && (profile.provider === 'claude' || profile.provider === 'codex')
             ? { provider: profile.provider, configHome: resolvedAuth.configHome } : undefined;
           const probe = deps.probeUsage ?? (({ provider, configHome }) => provider === 'codex'
             ? probeCodexUsage({ configHome }) : probeClaudeUsage({ configHome }));
           turnError = await confirmSandboxFailure(err, async () => (login ? probe(login) : undefined), Date.now());
         }
-        // On the included model, a turn that stopped because the credit ran
-        // out (its key's limit) waits for more like work on tavya's computers.
+        // On the credit, a turn that stopped because the credit ran out (its
+        // OpenRouter key's limit, or the gateway proxy's refusal) waits for
+        // more like work on tavya's computers.
         if (included) {
           const spent = await includedModelOutOfCredit(store, deps.broker!, organizationId,
             { taskId: args.taskId, projectId: args.task.projectId }).catch(() => undefined);
           if (spent) throw capacityFailure(spent) ?? spent;
+        }
+        if (rail?.kind === 'gateway' && store.hosted) {
+          const credit = await computeCredit(store, organizationId).catch(() => undefined);
+          if (credit?.availableMicros != null && credit.availableMicros < INCLUDED_MODEL_MIN_MICROS) {
+            const spent = await outOfCompute(store, organizationId, rail.gateway.name);
+            throw capacityFailure(spent) ?? spent;
+          }
         }
         const failure = classifyTurnError(turnError, profile.provider);
         // Provider limits and policy rejections are authoritative; anything else
@@ -4368,6 +4385,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       } finally {
         stopDiskWatch?.();
         stopComputeWatch?.();
+        // The proxy token dies with the turn (wiki features/model-gateways).
+        if (gatewayToken) await revokeGatewayToken(store, gatewayToken).catch(() => undefined);
         try {
           if (usageAdmissionId && !usageAdmissionFinished) {
             if (providerInvoked || result) await finishUsage(false);
@@ -7705,69 +7724,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   return activities;
 }
 
-type TokenCounters = {
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens?: number;
-  cacheWriteTokens?: number;
-  inputTokensIncludeCacheRead?: boolean;
-};
-type PriceableUsage = (TokenCounters & { models?: Record<string, TokenCounters> }) | undefined;
-
-/** Actualize an active managed reservation from provider token counters, each
- * model a turn used (a sub-agent may run on a cheaper one) at its own price. If
- * the installation has no complete price for the counters returned, retain the
- * admission ceiling as an explicitly estimated charge so completed requests
- * can never bypass the monthly hard cap. */
-function managedModelActualCost(provider: string, model: string | undefined, usage: PriceableUsage,
-  reservationMicros: number): { costMicros: number; classification: 'incurred' | 'estimated'; metadata: Record<string, unknown> } {
-  const raw = process.env.KARMAX_MANAGED_MODEL_PRICING;
-  let values: Record<string, unknown> = {};
-  try { values = raw ? JSON.parse(raw) as Record<string, unknown> : {}; } catch { /* estimate below */ }
-  const price = (model: string | undefined, counters: TokenCounters) => {
-    const keys = [`${provider}/${model ?? '*'}`, `${provider}/*`, provider];
-    const pricingKey = keys.find((key) => values[key] && typeof values[key] === 'object');
-    const pricing = pricingKey ? values[pricingKey] as Record<string, unknown> : undefined;
-    if (!pricing) return undefined;
-    const cacheReadTokens = Math.max(0, Number(counters.cacheReadTokens ?? 0));
-    const cacheWriteTokens = Math.max(0, Number(counters.cacheWriteTokens ?? 0));
-    const inputTokens = Math.max(0, Number(counters.inputTokens ?? 0));
-    const outputTokens = Math.max(0, Number(counters.outputTokens ?? 0));
-    const uncachedInputTokens = usage?.inputTokensIncludeCacheRead
-      ? Math.max(0, inputTokens - cacheReadTokens) : inputTokens;
-    const rate = (name: string, tokens: number): number | undefined => {
-      if (!tokens) return 0;
-      const value = Number(pricing[name]);
-      return Number.isFinite(value) && value >= 0 ? value : undefined;
-    };
-    const inputRate = rate('inputMicrosPerMillionTokens', uncachedInputTokens);
-    const outputRate = rate('outputMicrosPerMillionTokens', outputTokens);
-    const cacheReadRate = rate('cacheReadMicrosPerMillionTokens', cacheReadTokens);
-    const cacheWriteRate = rate('cacheWriteMicrosPerMillionTokens', cacheWriteTokens);
-    if (![inputRate, outputRate, cacheReadRate, cacheWriteRate].every((value) => value != null)) return undefined;
-    const costMicros = Math.ceil((uncachedInputTokens * inputRate! + outputTokens * outputRate!
-      + cacheReadTokens * cacheReadRate! + cacheWriteTokens * cacheWriteRate!) / 1_000_000);
-    return Number.isSafeInteger(costMicros)
-      ? { costMicros, pricingKey, uncachedInputTokens, outputTokens, cacheReadTokens, cacheWriteTokens } : undefined;
-  };
-  if (usage) {
-    const models = Object.entries(usage.models ?? {});
-    const priced = models.length ? models.map(([name, counters]) => [name, price(name, counters)] as const) : undefined;
-    if (priced?.every(([, cost]) => cost)) {
-      const costMicros = priced.reduce((sum, [, cost]) => sum + cost!.costMicros, 0);
-      if (Number.isSafeInteger(costMicros)) return { costMicros, classification: 'incurred', metadata: {
-        costBasis: 'configured-provider-token-pricing', models: Object.fromEntries(priced) } };
-    } else if (!priced) {
-      const cost = price(model, usage);
-      if (cost) {
-        const { costMicros, ...counted } = cost;
-        return { costMicros, classification: 'incurred', metadata: { costBasis: 'configured-provider-token-pricing', ...counted } };
-      }
-    }
+/** The host's own Claude or Codex sign-in or key: what a self-hosted
+ * installation's personal organization runs on before any model gateway. */
+function ambientCredential(provider: string): boolean {
+  if (provider === 'claude') {
+    if (process.env.ANTHROPIC_API_KEY) return true;
+    const home = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
+    return fs.existsSync(path.join(home, '.credentials.json')) || fs.existsSync(path.join(path.dirname(home), '.credentials.json'));
   }
-  return { costMicros: reservationMicros, classification: 'estimated', metadata: {
-    costBasis: 'admission-ceiling-estimate', estimateReason: usage ? 'incomplete-model-pricing' : 'provider-usage-unavailable',
-  } };
+  if (provider === 'codex')
+    return !!process.env.OPENAI_API_KEY || fs.existsSync(path.join(process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex'), 'auth.json'));
+  return false;
 }
 
 export type coreActivities = ReturnType<typeof makeCoreActivities>;

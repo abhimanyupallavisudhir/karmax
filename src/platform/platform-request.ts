@@ -132,6 +132,7 @@ export const PLATFORM_REQUEST_EXCLUDED_PATHS = [
   '/api/legal/', // public policy documents and pre-OAuth acceptance handoff
   '/api/sso/start',
   '/api/agent-mail/ingest', // inbound mail webhook, authenticated by a minted secret
+  '/api/model-gateway', // a model gateway's proxy: an agent harness's model requests, by a turn's token
   '/api/payments/stripe/', // Stripe OAuth callback + signature-verified webhook
   '/api/github/webhook', // GitHub webhook, HMAC-authenticated
   '/api/hooks/', // incoming webhooks, each authenticated by its hook's secret

@@ -127,6 +127,11 @@ export async function ensureLocalCodexSessionTools(configHome: string, session: 
   return session;
 }
 
+/** A model gateway's Codex model provider (wiki features/model-gateways), and
+ * the environment variable it reads its key from. */
+const GATEWAY_PROVIDER = 'tavya';
+const GATEWAY_KEY_ENV = 'TAVYA_MODEL_KEY';
+
 export class CodexAdapter implements AgentAdapter {
   readonly provider = 'codex' as const;
 
@@ -148,9 +153,12 @@ export class CodexAdapter implements AgentAdapter {
   async runTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
     ctx.emitActivity ??= () => {};
     const auth = input.resolvedAuth;
-    // Route on the PROFILE's resolved auth first: an API key → Responses API; a
-    // config home → the Codex CLI on a subscription. Only with no explicit profile
-    // auth do we fall back to the ambient environment.
+    // Route on the PROFILE's resolved auth first: a model gateway → the Codex
+    // CLI with the gateway as its model provider (wiki features/model-gateways);
+    // an API key → Responses API; a config home → the Codex CLI on a
+    // subscription. Only with no explicit profile auth do we fall back to the
+    // ambient environment.
+    if (auth?.gateway) return this.runSubscription(input, ctx);
     if (auth?.apiKey) return this.runResponsesApi(input, ctx);
     if (auth?.configHome) return this.runSubscription(input, ctx);
     if (process.env.OPENAI_API_KEY) return this.runResponsesApi(input, ctx);
@@ -172,10 +180,12 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   private async runSubscriptionWithRecovery(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
-    if (process.env.KARMAX_CODEX_USE_EXEC === '1' && !isRemoteAgentWorld(input.world)) return this.runCodexExec(input, ctx);
+    // A gateway turn has no ChatGPT login to refresh, and only the app-server takes its provider.
+    const gateway = !!input.resolvedAuth?.gateway;
+    if (process.env.KARMAX_CODEX_USE_EXEC === '1' && !isRemoteAgentWorld(input.world) && !gateway) return this.runCodexExec(input, ctx);
     const remote = isRemoteAgentWorld(input.world);
     const configHome = input.resolvedAuth?.configHome;
-    if (!remote || !configHome) return this.runCodexAppServer(input, ctx);
+    if (!remote || !configHome || gateway) return this.runCodexAppServer(input, ctx);
 
     let latestSession = input.session;
     let fork = input.fork;
@@ -459,9 +469,11 @@ export class CodexAdapter implements AgentAdapter {
     const workEnv = workEnvironment(input);
     const workConfig = { 'shell_environment_policy.set': workEnv };
     const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? localProviderCli('codex');
-    const model = input.profile.model ?? undefined;
+    const gateway = input.resolvedAuth?.gateway;
+    // The model as the gateway names it (OpenRouter: openai/gpt-6.1-sol); its effort by Codex's own name.
+    const model = gateway?.model ?? input.profile.model ?? undefined;
     (await (await currentTiming())?.mark('provider.selected', { provider: 'codex', model }));
-    const effort = codexReasoningEffort(model ?? 'gpt-5.5', input.profile.effort);
+    const effort = codexReasoningEffort(input.profile.model ?? 'gpt-5.5', input.profile.effort);
     const cwd = worldWorkingDirectory(runtimeWorld.handle);
     // CODEX_HOME = the leased config home (its auth.json holds the subscription
     // login). scrubbedEnv also strips OPENAI_API_KEY so a stray key can't shadow it.
@@ -485,6 +497,17 @@ export class CodexAdapter implements AgentAdapter {
     });
     if (remoteHome?.runtimeBin) env.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
     Object.assign(env, { OPENAI_API_KEY: '', CODEX_API_KEY: '', CODEX_ACCESS_TOKEN: '' });
+    // Through a model gateway: a Responses provider Codex reads its key for from
+    // the environment (never the command line, which other processes can read).
+    if (gateway) env[GATEWAY_KEY_ENV] = gateway.apiKey;
+    const gatewayFlags = gateway ? [
+      '-c', `model_provider=${JSON.stringify(GATEWAY_PROVIDER)}`,
+      '-c', `model_providers.${GATEWAY_PROVIDER}.name=${JSON.stringify(BRAND)}`,
+      '-c', `model_providers.${GATEWAY_PROVIDER}.base_url=${JSON.stringify(gateway.baseUrl)}`,
+      '-c', `model_providers.${GATEWAY_PROVIDER}.env_key=${JSON.stringify(GATEWAY_KEY_ENV)}`,
+      '-c', `model_providers.${GATEWAY_PROVIDER}.wire_api="responses"`,
+      '-c', `model_providers.${GATEWAY_PROVIDER}.supports_websockets=false`,
+    ] : [];
     const custody = remote ? undefined : createCustodyEnv(env);
     if (custody) env = custody.env;
 
@@ -493,8 +516,8 @@ export class CodexAdapter implements AgentAdapter {
     // Detached group is the fallback; the inherited custody marker crosses groups.
     const startupEnd = (await (await currentTiming())?.start('process.startup'));
     const child: any = remote
-      ? spawnRemoteAgentProcess({ world: runtimeWorld, provider: 'codex', command: cmd, args: ['app-server', ...mcpFlags], cwd, env, signal: ctx.signal })
-      : spawn(cmd, ['app-server', ...mcpFlags], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+      ? spawnRemoteAgentProcess({ world: runtimeWorld, provider: 'codex', command: cmd, args: ['app-server', ...mcpFlags, ...gatewayFlags], cwd, env, signal: ctx.signal })
+      : spawn(cmd, ['app-server', ...mcpFlags, ...gatewayFlags], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', taskId: input.world.handle.id, role: input.role, owner: process.pid, ...(custody ? { custodyId: custody.custodyId } : {}), startedAt: Date.now() });
     const client = new CodexAppServerClient(child.stdin!, child.stdout!);
     const platformHandlers = platformToolHandlers(input.world, ctx, () => workEnvironment(input));
@@ -824,7 +847,8 @@ export class CodexAdapter implements AgentAdapter {
       if (remote) child.startupComplete();
       (await startupEnd?.());
       // The account read and MCP startup are independent: wait for them together (LT-1).
-      const accountHealth = timed('provider.account-health', () => withTimeout(client.request('account/rateLimits/read', {}), 5_000))
+      // A gateway has no ChatGPT account to read.
+      const accountHealth = gateway ? Promise.resolve() : timed('provider.account-health', () => withTimeout(client.request('account/rateLimits/read', {}), 5_000))
         .then((limits) => { modelCredentialHealthy = true; reportCodexQuota(ctx, limits); }, () => {
           // Older app-servers may not expose this endpoint. They retain the
           // explicit MCP-name correlation above, but do not get the stronger
