@@ -839,6 +839,49 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       return (await ops.platformRequest('GET', `/api/organizations/${encodeURIComponent(a.organizationId)}/agent-mail${q.toString() ? `?${q}` : ''}`));
     }),
   );
+  // Clients outside a task (tavya's /mcp): the result comes back in the reply.
+  // In a task, karmax_control's generate_media saves it into the world instead.
+  if (options.tools?.has('generate_media')) server.registerTool(
+    'generate_media',
+    {
+      description:
+        `Generate an image, a video or speech with any model OpenRouter serves (Seedance, Veo, Kling, gpt-image, Nano Banana, ElevenLabs, …), paid from your ${BRAND} organization's credit — no account with the lab needed. Images and speech come back in this reply. A video returns a jobId: call again with jobId until it is completed, then download it from the URL given (with your ${BRAND} token). Models, prices, durations and voices: platform_request GET /api/media/models?kind=image|video|speech.`,
+      inputSchema: {
+        organizationId: z.string(),
+        kind: z.enum(['image', 'video', 'speech']).optional(),
+        prompt: z.string().optional().describe('What to make; for speech, the text to say.'),
+        model: z.string().optional(), aspectRatio: z.string().optional(), resolution: z.string().optional(),
+        count: z.number().int().min(1).max(10).optional(), duration: z.number().optional(), audio: z.boolean().optional(),
+        voice: z.string().optional(), instructions: z.string().optional(),
+        references: z.array(z.object({ url: z.string().describe('https: or base64 data: URL'),
+          role: z.enum(['first_frame', 'last_frame', 'reference']).optional() })).optional(),
+        jobId: z.string().optional().describe('A video job to check.'),
+      },
+    },
+    async ({ organizationId, jobId, ...request }) => {
+      const org = encodeURIComponent(organizationId);
+      try {
+        const result = (jobId
+          ? await ops.platformRequest('GET', `/api/organizations/${org}/media/${encodeURIComponent(jobId)}`)
+          : await ops.platformRequest('POST', `/api/organizations/${org}/media`, request)) as {
+          status: string; jobId?: string; model?: string; costUsd?: number; outputs?: number; error?: string;
+          files?: Array<{ mediaType: string; base64: string }> };
+        const { files, ...summary } = result;
+        const base = (process.env.KARMAX_PUBLIC_URL ?? '').replace(/\/$/, '');
+        const downloads = result.jobId && result.status === 'completed'
+          ? Array.from({ length: result.outputs ?? 1 }, (_, index) =>
+            `${base}/api/organizations/${org}/media/${encodeURIComponent(result.jobId!)}/content?index=${index}`) : undefined;
+        return { content: [
+          ...(files ?? []).map((file) => file.mediaType.startsWith('audio/')
+            ? { type: 'audio' as const, data: file.base64, mimeType: file.mediaType }
+            : { type: 'image' as const, data: file.base64, mimeType: file.mediaType }),
+          { type: 'text' as const, text: JSON.stringify({ ...summary, ...(downloads ? { downloads } : {}) }) },
+        ] };
+      } catch (error) {
+        return wrap(async () => { throw error; });
+      }
+    },
+  );
   server.registerTool(
     'enroll_passkey',
     {

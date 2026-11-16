@@ -324,6 +324,10 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/vault/session/save|use (signed-in browser sessions: save the site open in the task browser; restore it into another task\'s browser)',
   ],
   agentMail: [
+    'POST /api/organizations/:organizationId/media (generate an image, video or speech on the organization\'s credit, or its own OpenRouter key; body {kind: image|video|speech, prompt, model?, aspectRatio?, resolution?, size?, count?, duration?, audio?, seed?, voice?, instructions?, speed?, format?, references?: [{url, role?: first_frame|last_frame|reference}]}; image/speech → files [{mediaType, base64}], video → 202 {jobId})',
+    'GET /api/organizations/:organizationId/media/:jobId?content=1 (a video job: status, costUsd; with content=1 and completed, files [{mediaType, base64}])',
+    'GET /api/organizations/:organizationId/media/:jobId/content?index= (a completed video\'s bytes)',
+    'GET /api/media/models?kind=image|video|speech (OpenRouter\'s models for that kind: prices, durations, resolutions, voices; the default is marked)',
     'GET /api/organizations/:organizationId/agent-mail?since=&match=&limit= (per-organization agent inbox: address + messages, verification code/link extracted)',
     'GET /api/organizations/:organizationId/agent-mail/providers (mailbox backends + active provider)',
     'POST /api/organizations/:organizationId/agent-mail/connect (connect this organization mailbox; body {provider, domain?|apiKey?})',
