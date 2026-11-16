@@ -476,6 +476,17 @@ export function isResourceKill(message: string): boolean {
   );
 }
 
+/** OpenRouter refusing a key that has spent what it may: its own limit
+ * ("Key limit exceeded (total limit)", or daily, weekly, monthly), too little
+ * of that limit left for the request ("This request requires more credits …
+ * can only afford N"), or its account's credit ("Insufficient credits"). No
+ * retry frees it: a person raises the key's limit or adds credit. On tavya's
+ * included model that is tavya's own key, which follows the organization's
+ * compute credit (includedModelTurnFailure). */
+export function isSpentKeyRefusal(message: string): boolean {
+  return /\bkey limit exceeded\b|requires more credits|\bcan only afford\b|insufficient credits/i.test(message);
+}
+
 /** Detect + classify a usage/session-limit error from its message. Pure. */
 export function classifyLimitError(message: string, options: LimitClassifierOptions = {}): LimitClassification {
   const m = String(message ?? '');
@@ -492,7 +503,7 @@ export function classifyLimitError(message: string, options: LimitClassifierOpti
   // Stable human phrases retained for compatibility with old workflow histories and
   // with providers (notably subscription CLIs) that expose no machine error code.
   const knownHardCredit = /out of (?:usage )?credits?|insufficient (?:usage )?credits?/.test(lc)
-    || (!options.legacy && /credit balance is too low/.test(lc));
+    || (!options.legacy && (/credit balance is too low/.test(lc) || isSpentKeyRefusal(m)));
   const knownLimit =
     /you'?ve hit your|usage limit|usagelimitreached|session limit|weekly limit|rate.?limit|too many requests|\b429\b/.test(lc)
     // Codex's real CodexErrorInfo code (audit R-10); new histories only, so replay

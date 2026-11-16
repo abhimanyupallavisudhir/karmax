@@ -33,7 +33,7 @@ import { capacityCause, ComputeRouter, type RouterConnections } from '../world/c
 import { accountKey, dequeue, enqueue, wakeFullKey } from '../world/compute-queue.js';
 import { MachineQueued, leaseWaitDeadline } from '../world/machine-wait.js';
 import { SetupClock } from '../world/setup-clock.js';
-import { AgentChannelLost, AgentToolsUnavailable, toolsUnavailableActivity, toolsUnavailableNotice, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
+import { AgentChannelLost, AgentToolsUnavailable, toolsUnavailableActivity, toolsUnavailableNotice, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, isSpentKeyRefusal, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { clearBranchUnpublished, markBranchUnpublished, markCheckpointStale } from '../world/checkpoint-staleness.js';
 import { usageAdmissionId as admissionIdFor } from '../domain/turn-admission.js';
@@ -45,7 +45,8 @@ import { World, WorldHandle, WorldKind, WorldSpec, type WorldRepo, worldWorkingD
 import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
 import { managedModelCostCeiling, managedModelRailAvailable } from '../agent/managed-models.js';
-import { INCLUDED_MODEL_OPTIONS, includedModel, includedModelKey, includedModelOutOfCredit, isIncludedModel, syncIncludedModelUsage } from '../agent/included-model.js';
+import { INCLUDED_MODEL_OPTIONS, includedModel, includedModelKey, includedModelTurnFailure, isIncludedModel, syncIncludedModelUsage,
+  withoutOpenRouterLinks } from '../agent/included-model.js';
 import {
   apiKeyEnv,
   assertRunnableProvider,
@@ -2948,6 +2949,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         catch (error) { throw capacityFailure(error) ?? error; }
         computeHoldId = computeHold.id;
       }
+      // The included model (wiki features/included-model): with nothing of the
+      // organization's own leased, the turn runs on the organization's own
+      // OpenRouter key, its limit set to what the credit has left. Refused,
+      // Out of compute, when that is too little to start: before the world
+      // wakes, as the compute hold above.
+      const included = !args.accountConfigHome && !args.accountApiKeyHandle && !!deps.broker
+        && isIncludedModel(profile, await includedModel(store, deps.broker));
+      let includedKey: string | undefined;
+      if (included) {
+        try { includedKey = await includedModelKey(store, deps.broker!, organizationId); }
+        catch (error) { throw capacityFailure(error) ?? error; }
+      }
       const computeStop = new AbortController();
       let stopComputeWatch: (() => void) | undefined;
       let world: World;
@@ -3215,16 +3228,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       const usagePolicy = (await store.getOrganizationUsagePolicy(organizationId));
       const managedInstallationRail = managedModelRailAvailable(store.hosted, usagePolicy, profile);
-      // The included model (wiki features/included-model): with nothing of the
-      // organization's own leased, the turn runs on the organization's own
-      // OpenRouter key, its limit set to what the credit has left (refused,
-      // Out of compute, when that is too little to start).
-      const included = !args.accountConfigHome && !args.accountApiKeyHandle && !!deps.broker
-        && isIncludedModel(profile, await includedModel(store, deps.broker));
-      if (included) {
-        try { resolvedAuth = { apiKey: await includedModelKey(store, deps.broker!, organizationId), modelOptions: INCLUDED_MODEL_OPTIONS }; }
-        catch (error) { throw capacityFailure(error) ?? error; }
-      }
+      if (includedKey) resolvedAuth = { apiKey: includedKey, modelOptions: INCLUDED_MODEL_OPTIONS };
       if (
         organizationId !== 'org_personal'
         && profile.provider !== 'mock'
@@ -4294,6 +4298,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (token) (await deps.tokens?.revoke(token));
         // A provider error can quote the agent's output; it reaches workflow history.
         if (err instanceof Error) err.message = secrets.scrub(err.message);
+        // tavya's OpenRouter account (a key's page in its workspace) is no customer's.
+        const includedFailure = included ? (err instanceof Error ? err.message : String(err)) : undefined;
+        if (included && err instanceof Error) err.message = withoutOpenRouterLinks(err.message);
         // Its compute hold ran out (watchComputeHold): keep the stopped session,
         // so the turn the Out of compute wait starts once there is credit
         // continues it rather than starting this one over.
@@ -4326,11 +4333,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           turnError = await confirmSandboxFailure(err, async () => (login ? probe(login) : undefined), Date.now());
         }
         // On the included model, a turn that stopped because the credit ran
-        // out (its key's limit) waits for more like work on tavya's computers.
-        if (included) {
-          const spent = await includedModelOutOfCredit(store, deps.broker!, organizationId,
-            { taskId: args.taskId, projectId: args.task.projectId }).catch(() => undefined);
-          if (spent) throw capacityFailure(spent) ?? spent;
+        // out (its key's limit) waits for more like work on tavya's computers;
+        // one that its key's limit stopped while the credit had more goes on,
+        // the limit raised. Neither is the agent's error, nor a person's to
+        // fix (tavya-error 5aa54804d0ea52cc).
+        if (includedFailure !== undefined) {
+          const verdict = await includedModelTurnFailure(store, deps.broker!, organizationId,
+            { taskId: args.taskId, projectId: args.task.projectId }, includedFailure)
+            .catch(() => isSpentKeyRefusal(includedFailure) ? 'retry' as const : undefined);
+          if (verdict === 'retry') throw ApplicationFailure.create({ type: 'agent-infra', nonRetryable: false,
+            message: `The included model's spending limit was behind your compute credit; ${BRAND} raised it and continues the turn.`,
+            cause: err instanceof Error ? err : undefined });
+          if (verdict) throw capacityFailure(verdict) ?? verdict;
         }
         const failure = classifyTurnError(turnError, profile.provider);
         // Provider limits and policy rejections are authoritative; anything else

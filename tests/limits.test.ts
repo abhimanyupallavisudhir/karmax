@@ -17,6 +17,7 @@ import {
   confirmSandboxFailure,
   isNetworkEdgeBlock,
   ProviderOutage,
+  isSpentKeyRefusal,
 } from '../src/agent/limits.js';
 import type { UsageSnapshot } from '../src/agent/usage.js';
 
@@ -41,6 +42,24 @@ describe('classifyLimitError', () => {
     expect(classifyLimitError(message, { providerOrigin: true })).toEqual({ limited: false });
     expect(classifyProviderTurnError(new Error(message), 'codex').classification.limited).toBe(false);
     expect(isTransportError(message + ' request 503')).toBe(false);
+  });
+
+  // A key of the organization's own on OpenRouter (BYOK): spent until a person
+  // raises its limit or adds credit. tavya's included model is told apart
+  // before this (includedModelTurnFailure).
+  it.each([
+    'Key limit exceeded (total limit). Manage it using https://openrouter.ai/workspaces/default/keys/abc $6.31 of $6.31 used; does not reset.',
+    'Key limit exceeded (daily limit). Manage it using https://openrouter.ai/settings/keys',
+    'This request requires more credits, or fewer max_tokens. You requested up to 64000 tokens, but can only afford 1234.',
+    'Insufficient credits. Add more using https://openrouter.ai/settings/credits',
+  ])('classifies OpenRouter\'s refusal of a spent key as a hard quota: %s', (message) => {
+    expect(isSpentKeyRefusal(message)).toBe(true);
+    expect(classifyLimitError(message, { providerOrigin: true })).toMatchObject({ limited: true, hard: true, kind: 'quota' });
+    expect(classifyProviderTurnError(new ProviderStreamError(`opencode ACP turn failed: Internal error: ${message}`), 'opencode')
+      .classification).toMatchObject({ limited: true, hard: true });
+  });
+  it('does not read a project\'s own "limit exceeded" as a spent key', () => {
+    expect(isSpentKeyRefusal('Error: memory limit exceeded in worker')).toBe(false);
   });
 
   it('classifies a Claude session-limit string + extracts the reset hint', () => {
