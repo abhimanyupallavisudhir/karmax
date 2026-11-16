@@ -13,7 +13,7 @@ on:
         description: Live suite to run
         type: choice
         default: all
-        options: [all, models, agent, claude, e2b, daytona, vm, move, github]
+        options: [all, models, agent, claude, gateways, e2b, daytona, vm, move, github]
   schedule:
     - cron: '17 6 * * 1'
 
@@ -37,6 +37,7 @@ jobs:
       models: ${{ steps.plan.outputs.models }}
       agent: ${{ steps.plan.outputs.agent }}
       claude: ${{ steps.plan.outputs.claude }}
+      gateways: ${{ steps.plan.outputs.gateways }}
       e2b: ${{ steps.plan.outputs.e2b }}
       daytona: ${{ steps.plan.outputs.daytona }}
       vm: ${{ steps.plan.outputs.vm }}
@@ -51,6 +52,7 @@ jobs:
           LIVE_ANTHROPIC_API_KEY: ${{ secrets.LIVE_ANTHROPIC_API_KEY }}
           LIVE_OPENAI_API_KEY: ${{ secrets.LIVE_OPENAI_API_KEY }}
           LIVE_CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.LIVE_CLAUDE_CODE_OAUTH_TOKEN }}
+          LIVE_OPENROUTER_API_KEY: ${{ secrets.LIVE_OPENROUTER_API_KEY }}
           LIVE_E2B_API_KEY: ${{ secrets.LIVE_E2B_API_KEY }}
           LIVE_DAYTONA_API_KEY: ${{ secrets.LIVE_DAYTONA_API_KEY }}
           LIVE_OPENCODE_ANTHROPIC_API_KEY: ${{ secrets.LIVE_OPENCODE_ANTHROPIC_API_KEY }}
@@ -83,6 +85,7 @@ jobs:
           decide models LIVE_ANTHROPIC_API_KEY LIVE_OPENAI_API_KEY
           decide agent LIVE_OPENAI_API_KEY
           decide claude LIVE_CLAUDE_CODE_OAUTH_TOKEN
+          decide gateways LIVE_OPENROUTER_API_KEY
           decide e2b LIVE_E2B_API_KEY
           decide daytona LIVE_DAYTONA_API_KEY
           decide vm LIVE_FLY_API_TOKEN LIVE_HETZNER_API_TOKEN
@@ -156,6 +159,24 @@ jobs:
           KARMAX_LIVE_MISTRAL_SHARE: ${{ vars.LIVE_MISTRAL_SHARE }}
           KARMAX_LIVE_KIMI_SHARE: ${{ vars.LIVE_KIMI_SHARE }}
           KARMAX_LIVE_QWEN_SHARE: ${{ vars.LIVE_QWEN_SHARE }}
+
+  gateways:
+    name: model gateways (Claude Code and Codex via OpenRouter)
+    needs: plan
+    if: github.ref == 'refs/heads/master' && needs.plan.outputs.gateways == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: live
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install
+      # A few cents of Haiku and GPT-6 Luna; stops past KARMAX_LIVE_GATEWAY_BUDGET_USD.
+      - run: npx vitest run tests/model-gateways-live.test.ts
+        env:
+          KARMAX_RUN_LIVE: '1'
+          OPENROUTER_API_KEY: ${{ secrets.LIVE_OPENROUTER_API_KEY }}
 
   e2b:
     name: E2B sandboxes
