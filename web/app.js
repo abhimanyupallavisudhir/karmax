@@ -4624,6 +4624,12 @@ function setupFixes(text, projectId) {
   if (/connect GitHub in organization settings/i.test(raw)) return [{ label: 'Connect GitHub', href: `${settings}#settings-code` }];
   // A login's quota is spent until it resets: another login runs it now.
   if (/Out of quota until a login resets|Waiting for \S+ quota/.test(raw)) return [{ label: 'Add a login', href: `${settings}#settings-agents` }];
+  // GitHub refused to let tavya write: approved on GitHub (the message gives the address), managed here.
+  if (/GitHub refused to let \S+ write to|GitHub App workflow permission required/.test(raw)) {
+    const onGithub = /https:\/\/github\.com\/[\w./-]*?settings\/installations\/\d+/.exec(raw)?.[0];
+    return [...(onGithub ? [{ label: 'Approve on GitHub', href: onGithub, external: true }] : []),
+      { label: 'GitHub settings', href: `${settings}#settings-code` }];
+  }
   // Waiting its turn, or for room, on tavya's computers: one's own account starts it now.
   if (/waiting ahead of this one for \S+'s |\S+'s? disks take \d+ of (?:their|its) \d+ GB/.test(raw)) return [own];
   // Otherwise: the places it names.
@@ -4652,7 +4658,8 @@ function namedPlaces(text, projectId) {
 }
 function setupFix(text) { return setupFixes(text)[0] ?? null; }
 function setupFixHtml(text, projectId) {
-  return setupFixes(text, projectId).map((fix, index) => ` <a class="btn sm setup-fix${index ? ' ghost' : ''}" data-spa href="${esc(fix.href)}">${esc(fix.label)}</a>`).join('');
+  return setupFixes(text, projectId).map((fix, index) => ` <a class="btn sm setup-fix${index ? ' ghost' : ''}" ${fix.external
+    ? 'target="_blank" rel="noopener"' : 'data-spa'} href="${esc(fix.href)}">${esc(fix.label)}</a>`).join('');
 }
 // An error shown in place of what failed to load: the plain sentence, the
 // exact text on hover (for whoever reports it).
@@ -4693,7 +4700,10 @@ function toast(msg, err = false, action) {
     const btn = document.createElement(action.href ? 'a' : 'button');
     btn.className = 'toast-action';
     btn.textContent = action.label;
-    if (action.href) { btn.href = action.href; btn.dataset.spa = ''; }
+    if (action.href) {
+      btn.href = action.href;
+      if (action.external) { btn.target = '_blank'; btn.rel = 'noopener'; } else btn.dataset.spa = '';
+    }
     // Removed after the click, so a link it was still opens.
     btn.addEventListener('click', () => { setTimeout(() => t.remove()); action.fn?.(); });
     t.appendChild(btn);

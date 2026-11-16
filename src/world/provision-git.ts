@@ -10,6 +10,7 @@ import os from 'node:os';
 import type { WorldRepo, WorldSpec } from './types.js';
 import { git, isGitRepo } from './git.js';
 import { taskBranch, BRAND } from '../domain/brand.js';
+import { initialBaseCommand } from './initial-base.js';
 
 /** Minimal command/file surface a cloud sandbox exposes during trusted
  * provisioning. Adapters normalize the provider SDK's result shape and convert
@@ -159,8 +160,8 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
     if (empty) {
       if (targetBranch && targetBranch !== base)
         throw new Error(`repository "${source}": target branch "${targetBranch}" does not exist; choose an existing target before starting the task`);
-      await initializeEmptyRepository(target, repoRoot, base, auth, repoSpec);
-      warnings.push(`repo "${names[index]}": the repository was empty, so it was started with an empty first commit on "${base}"`);
+      await startEmptyRepository(target, repoRoot, base);
+      warnings.push(`repo "${names[index]}": the repository was empty, so the task starts from an empty first commit on "${base}", published with its first push`);
     } else if (!repoSpec.branch && !remoteRefExists) {
       const fallback = await runOrThrow(target, `git -C ${quote(repoRoot)} symbolic-ref refs/remotes/origin/HEAD`);
       const prefix = 'refs/remotes/origin/';
@@ -286,19 +287,15 @@ async function cloneWithRetry(target: ProvisionTarget, command: string, repoRoot
   }
 }
 
-/** Give an empty repository its base branch, as dynamic enrollment does
- * (git-broker.ts): a task branch and its pull request need a base commit on
- * the remote. A push refused because another world initialized the base after
- * our clone is harmless; the fetch adopts that base instead. */
-async function initializeEmptyRepository(target: ProvisionTarget, repoRoot: string, base: string, auth: string,
-  spec: WorldSpec): Promise<void> {
-  const repo = `git -C ${quote(repoRoot)}`;
-  const identity = `-c user.name=${quote(spec.gitIdentity?.name ?? BRAND)} -c user.email=${quote(spec.gitIdentity?.email ?? `${BRAND}@localhost`)}`;
-  await runOrThrow(target, `${repo} checkout -q --orphan ${quote(base)} && ${repo} ${identity} commit -q --allow-empty -m ${quote(`${BRAND}: initialize repository`)}`);
-  const pushed = await target.run(`${auth}${repo} push -q origin ${quote(`refs/heads/${base}:refs/heads/${base}`)}`, provisionTimeoutMs());
-  const fetched = await target.run(`${auth}${repo} fetch -q origin ${quote(`+refs/heads/${base}:refs/remotes/origin/${base}`)}`, provisionTimeoutMs());
-  if (fetched.code !== 0)
-    throw new Error(`could not initialize empty repository base "${base}": ${pushed.stderr || pushed.stdout || fetched.stderr || fetched.stdout}`);
+/** Give an empty repository's world its base branch: the initial commit
+ * (initial-base.ts) as `origin/<base>`, written in the world only. Setup's
+ * clone token is read-only, so nothing here may write to the remote; the
+ * trusted broker publishes this same commit before the task's first push. */
+async function startEmptyRepository(target: ProvisionTarget, repoRoot: string, base: string): Promise<void> {
+  const made = await runOrThrow(target, initialBaseCommand(repoRoot));
+  const sha = made.stdout.trim();
+  if (!/^[0-9a-f]{40,64}$/i.test(sha)) throw new Error(`could not start empty repository on "${base}": no initial commit`);
+  await runOrThrow(target, `git -C ${quote(repoRoot)} update-ref ${quote(`refs/remotes/origin/${base}`)} ${quote(sha)}`);
 }
 
 async function configureRepo(target: ProvisionTarget, root: string, spec: WorldSpec, branch: string,
