@@ -849,6 +849,8 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       inputSchema: {
         organizationId: z.string(),
         kind: z.enum(['text', 'image', 'video', 'speech']).optional(),
+        provider: z.enum(['openrouter', 'fal', 'unifically']).optional().describe('Default openrouter; fal (music, sound effects, 3D, upscaling, lip-sync…) and unifically (Suno…) where the operator turned them on: pass model and input.'),
+        input: z.record(z.string(), z.unknown()).optional().describe('fal/unifically: the model\'s own input object.'),
         prompt: z.string().optional().describe('The question or what to make; for speech, the text to say.'),
         model: z.string().optional(), maxCostUsd: z.number().optional(),
         system: z.string().optional(), maxTokens: z.number().int().optional(), effort: z.enum(['minimal', 'low', 'medium', 'high']).optional(),

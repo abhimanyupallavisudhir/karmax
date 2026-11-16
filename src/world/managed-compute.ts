@@ -211,14 +211,14 @@ function exhausted(credit: ComputeCredit, provider: string): ComputeCreditExhaus
  * ComputeCreditExhausted, naming the quote and what is left, when the credit
  * cannot cover it (wiki features/generate). */
 export async function holdGeneration(store: Store, request: { id: string; organizationId: string; taskId?: string; costMicros: number;
-  until: number; what: string }, now = Date.now()): Promise<boolean> {
+  until: number; what: string; provider?: string }, now = Date.now()): Promise<boolean> {
   if (!store.hosted) return false;
   const entitlements = await store.organizationEntitlements(request.organizationId);
   if (entitlements.computeCreditMicros == null) return false;
   const creditMicros = entitlements.computeCreditMicros + (await topUpBalance(store, request.organizationId, entitlements.computeCreditMicros, now))
     + ((await trialCredit(store, request.organizationId, computeMonth(now), now))?.monthMicros ?? 0);
   if (await store.holdSpend({ id: request.id, organizationId: request.organizationId, ...(request.taskId ? { taskId: request.taskId } : {}),
-    provider: 'openrouter', amountMicros: request.costMicros, until: request.until }, creditMicros, now)) return true;
+    provider: request.provider ?? 'openrouter', amountMicros: request.costMicros, until: request.until }, creditMicros, now)) return true;
   const credit = await computeCredit(store, request.organizationId, now);
   const charge = computeChargeMicros(request.costMicros, await store.computePriceMultiplier(request.organizationId, now));
   throw new ComputeCreditExhausted(`Out of compute: ${request.what} would cost up to ${dollars(charge)} of credit; `

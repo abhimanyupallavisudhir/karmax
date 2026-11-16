@@ -32,6 +32,8 @@ import { INCLUDED_MODEL_DEFAULT, INCLUDED_MODEL_MIN_MICROS, INCLUDED_MODEL_OPTIO
 import { computeCredit, holdGeneration, outOfCompute } from '../world/managed-compute.js';
 import { BRAND } from '../domain/brand.js';
 import { quote, type Quote } from './generation-price.js';
+import { TASK_PROVIDERS, TASK_PROVIDER_IMPLS, TASK_PROVIDER_INFO, TaskProviderError, TaskProviderUnavailable, downloadOutputs, outputFiles,
+  taskProviderKey, type Submitted, type TaskProviderId } from './generation-providers.js';
 
 export const GENERATION_KINDS = ['text', 'image', 'video', 'speech'] as const;
 export type GenerationKind = typeof GENERATION_KINDS[number];
@@ -62,7 +64,12 @@ export interface GenerationReference {
 }
 
 export interface GenerationRequest {
+  /** OpenRouter's kinds; with another provider, what the agent says it is (optional). */
   kind: GenerationKind;
+  /** openrouter (default), or a provider the operator turned on (generation-providers.ts). */
+  provider?: 'openrouter' | TaskProviderId;
+  /** Another provider: the model's own input, as its docs give it. */
+  input?: Record<string, unknown>;
   prompt: string;
   model?: string;
   /** Text: instructions for the model. */
@@ -97,6 +104,9 @@ export interface GenerationFile { mediaType: string; base64: string }
 
 export interface GenerationResult {
   kind: GenerationKind;
+  provider?: 'openrouter' | TaskProviderId;
+  /** Another provider's output as it gave it (URLs of its files included). */
+  output?: unknown;
   model: string;
   status: 'completed' | 'pending' | 'in_progress' | 'failed' | 'cancelled' | 'expired';
   /** Video: poll it with generationJob. */
@@ -133,13 +143,19 @@ export interface GenerationDeps {
 }
 
 interface JobRecord { organizationId: string; model: string; funding: GenerationResult['funding']; taskId?: string; projectId?: string;
-  holdId?: string; quoteUsd?: number; at: number }
+  holdId?: string; quoteUsd?: number; at: number; kind?: GenerationKind;
+  /** Another provider's job: which, its own id, where to poll it. */
+  provider?: TaskProviderId; job?: Submitted }
 const jobKey = (jobId: string) => `generation-job:${jobId}`;
 const MODEL_ID = /^[a-z0-9][\w.-]*\/[\w.:~-]+$/i;
 const MAX_PROMPT = 200_000;
 
 /** Check and normalize a request (the gateway's 400s). */
 export function parseGenerationRequest(body: Record<string, unknown>): GenerationRequest {
+  const provider = body.provider === undefined || body.provider === '' ? 'openrouter' : String(body.provider);
+  if (provider !== 'openrouter' && !(TASK_PROVIDERS as readonly string[]).includes(provider))
+    throw new GenerationRequestError(`provider must be one of openrouter, ${TASK_PROVIDERS.join(', ')}`);
+  if (provider !== 'openrouter') return parseTaskRequest(provider as TaskProviderId, body);
   const kind = String(body.kind ?? '') as GenerationKind;
   if (!(GENERATION_KINDS as readonly string[]).includes(kind)) throw new GenerationRequestError(`kind must be one of ${GENERATION_KINDS.join(', ')}`);
   const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
@@ -180,6 +196,21 @@ export function parseGenerationRequest(body: Record<string, unknown>): Generatio
   set('speed', number('speed', 0.25, 4)); set('format', format as GenerationRequest['format']);
   if (parsedReferences?.length) request.references = parsedReferences;
   return request;
+}
+
+/** A request to another provider: its model id and the model's own input
+ * (a bare prompt becomes `{prompt}`). */
+function parseTaskRequest(provider: TaskProviderId, body: Record<string, unknown>): GenerationRequest {
+  const model = typeof body.model === 'string' ? body.model.trim() : '';
+  if (!/^[\w.-]+(\/[\w.:~-]+)+$/.test(model)) throw new GenerationRequestError(`model is required: a ${TASK_PROVIDER_INFO[provider].name} model id, see ${TASK_PROVIDER_INFO[provider].models}`);
+  const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+  const input = body.input === undefined ? (prompt ? { prompt } : undefined) : body.input;
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new GenerationRequestError('input must be the model’s input object');
+  if (JSON.stringify(input).length > 5_000_000) throw new GenerationRequestError('input is larger than 5 MB');
+  const kind = (GENERATION_KINDS as readonly string[]).includes(String(body.kind)) ? String(body.kind) as GenerationKind : 'image';
+  const maxCost = body.maxCostUsd === undefined || body.maxCostUsd === null || body.maxCostUsd === '' ? undefined : Number(body.maxCostUsd);
+  if (maxCost !== undefined && (!Number.isFinite(maxCost) || maxCost < 0)) throw new GenerationRequestError('maxCostUsd must be a positive number');
+  return { kind, provider, model, prompt, input: input as Record<string, unknown>, ...(maxCost !== undefined ? { maxCostUsd: maxCost } : {}) };
 }
 
 /** The key a generation is paid with: the organization's own OpenRouter key
@@ -263,6 +294,7 @@ const describe = (request: GenerationRequest, model: string) =>
  * generationJob), after quoting it and holding the quote on the credit. */
 export async function generate(deps: GenerationDeps, organizationId: string, request: GenerationRequest,
   task?: { taskId: string; projectId?: string }): Promise<GenerationResult> {
+  if (request.provider && request.provider !== 'openrouter') return generateWithProvider(deps, organizationId, request.provider, request, task);
   const kind = request.kind;
   const model = request.model ?? (kind === 'text' ? (await includedModel(deps.store, deps.broker))?.model : undefined) ?? GENERATION_DEFAULT_MODELS[kind];
   const references = request.references?.length ?? 0;
@@ -373,6 +405,7 @@ async function jobRecord(store: Store, organizationId: string, jobId: string): P
  * (base64: a task's tool saves them into its world). */
 export async function generationJob(deps: GenerationDeps, organizationId: string, jobId: string, options: { content?: boolean } = {}): Promise<GenerationResult> {
   const record = await jobRecord(deps.store, organizationId, jobId);
+  if (record.provider) return providerJob(deps, organizationId, jobId, record, options);
   const { key, funding } = await keyFor(deps, organizationId);
   const response = await call(key, 'GET', `/videos/${encodeURIComponent(jobId)}`, undefined, 30_000);
   if (!response.ok) throw await failure(deps, organizationId, funding, response);
@@ -400,7 +433,16 @@ export async function generationJob(deps: GenerationDeps, organizationId: string
 
 /** A completed video's bytes, as OpenRouter serves them (to stream on). */
 export async function generationJobContent(deps: GenerationDeps, organizationId: string, jobId: string, index = 0): Promise<Response> {
-  await jobRecord(deps.store, organizationId, jobId);
+  const record = await jobRecord(deps.store, organizationId, jobId);
+  if (record.provider) {
+    const key = await taskProviderKey(deps.store, deps.broker, record.provider).catch((error) => { throw unavailable(error); });
+    const polled = await TASK_PROVIDER_IMPLS[record.provider].poll(key, record.model, record.job!);
+    const url = polled.status === 'completed' ? outputFiles(polled.output)[index] : undefined;
+    if (!url) throw new GenerationRequestError(`job ${jobId} has no file ${index}`, 404);
+    const response = await fetch(url, { signal: AbortSignal.timeout(300_000) });
+    if (!response.ok) throw new Error(`could not download the file (${response.status})`);
+    return response;
+  }
   const { key, funding } = await keyFor(deps, organizationId);
   const response = await call(key, 'GET', `/videos/${encodeURIComponent(jobId)}/content?index=${index}`, undefined, 300_000);
   if (!response.ok) throw await failure(deps, organizationId, funding, response);
@@ -426,4 +468,87 @@ export async function generationModels(kind: GenerationKind): Promise<Generation
     ...(entry.supported_aspect_ratios ? { aspectRatios: entry.supported_aspect_ratios } : {}),
     ...(entry.supported_voices ? { voices: entry.supported_voices.slice(0, 40) } : {}),
     ...(entry.id === GENERATION_DEFAULT_MODELS[kind] ? { default: true } : {}) }));
+}
+
+// ── Other providers (generation-providers.ts): quote, hold, submit; poll, settle ──
+
+const unavailable = (error: unknown) => error instanceof TaskProviderUnavailable ? new GenerationUnavailable(error.message) : error;
+const providerFailure = (provider: TaskProviderId, error: unknown) => error instanceof TaskProviderError
+  ? error.status === 402
+    ? new GenerationUnavailable(`${BRAND}'s ${TASK_PROVIDER_INFO[provider].name} balance has run out, not your credit: nothing was charged. Try again once the operator has topped it up.`)
+    : new GenerationRequestError(error.message, error.status)
+  : error;
+
+async function generateWithProvider(deps: GenerationDeps, organizationId: string, provider: TaskProviderId, request: GenerationRequest,
+  task?: { taskId: string; projectId?: string }): Promise<GenerationResult> {
+  const impl = TASK_PROVIDER_IMPLS[provider], model = request.model!, input = request.input ?? {};
+  const key = await taskProviderKey(deps.store, deps.broker, provider).catch((error) => { throw unavailable(error); });
+  const estimate = await impl.quote(key, model, input).catch((error) => { throw providerFailure(provider, error); });
+  if (request.maxCostUsd !== undefined && estimate.basis === 'price-list' && estimate.usd > request.maxCostUsd)
+    throw new GenerationRequestError(`this request on ${model} may cost up to $${estimate.usd.toFixed(3)}, above maxCostUsd $${request.maxCostUsd}`);
+  const quoted: Quote = request.maxCostUsd !== undefined && estimate.basis === 'ceiling' ? { usd: request.maxCostUsd, basis: 'ceiling' } : estimate;
+  const holdId = `generation:${crypto.randomUUID()}`;
+  const held = await holdGeneration(deps.store, { id: holdId, organizationId, provider, ...(task?.taskId ? { taskId: task.taskId } : {}),
+    costMicros: Math.ceil(quoted.usd * 1e6), until: Date.now() + HOLD_MS.video, what: `this request on ${model}` });
+  const base = { kind: request.kind, provider, model, funding: 'credit' as const, quoteUsd: Math.round(quoted.usd * 1e6) / 1e6, quoteBasis: quoted.basis };
+  let job: Submitted;
+  try { job = await impl.submit(key, model, input); }
+  catch (error) {
+    if (held) await deps.store.closeComputeHold(holdId).catch(() => undefined);
+    throw providerFailure(provider, error);
+  }
+  const jobId = `${provider}.${job.ref}`;
+  await deps.store.kvSet(jobKey(jobId), JSON.stringify({ organizationId, model, funding: 'credit', at: Date.now(), quoteUsd: base.quoteUsd,
+    kind: request.kind, provider, job, ...(held ? { holdId } : {}),
+    ...(task?.taskId ? { taskId: task.taskId } : {}), ...(task?.projectId ? { projectId: task.projectId } : {}) } satisfies JobRecord));
+  return { ...base, status: job.status === 'completed' ? 'in_progress' : job.status, jobId };
+}
+
+async function providerJob(deps: GenerationDeps, organizationId: string, jobId: string, record: JobRecord,
+  options: { content?: boolean }): Promise<GenerationResult> {
+  const provider = record.provider!, impl = TASK_PROVIDER_IMPLS[provider];
+  const key = await taskProviderKey(deps.store, deps.broker, provider).catch((error) => { throw unavailable(error); });
+  const polled = await impl.poll(key, record.model, record.job!).catch((error) => { throw providerFailure(provider, error); });
+  const result: GenerationResult = { kind: record.kind ?? 'image', provider, model: record.model, status: polled.status, jobId, funding: 'credit',
+    ...(record.quoteUsd !== undefined ? { quoteUsd: record.quoteUsd } : {}), ...(polled.error ? { error: polled.error } : {}) };
+  if (polled.status === 'pending' || polled.status === 'in_progress') return result;
+  // Ended: book what it cost (what the provider says; else, for a
+  // completed job, the quote) once, and release the hold.
+  const reported = await impl.cost(key, record.model, record.job!).catch(() => undefined);
+  const costUsd = reported ?? (polled.status === 'completed' ? record.quoteUsd ?? 0 : 0);
+  if (costUsd > 0) await deps.store.recordUsage({ id: `usage:generation:${jobId}`, organizationId, ...(record.projectId ? { projectId: record.projectId } : {}),
+    ...(record.taskId ? { taskId: record.taskId } : {}), provider, kind: 'agent.cost', quantity: 0, unit: 'request',
+    costMicros: Math.round(costUsd * 1e6), startedAt: record.at, endedAt: Date.now(), fundingSource: 'managed',
+    costClassification: reported !== undefined ? 'incurred' : 'estimated', metadata: { costBasis: reported !== undefined ? 'provider-reported' : 'quote', model: record.model } });
+  if (record.holdId) await deps.store.closeComputeHold(record.holdId).catch(() => undefined);
+  result.costUsd = costUsd;
+  if (polled.status !== 'completed') return result;
+  const urls = outputFiles(polled.output);
+  result.output = polled.output;
+  result.outputs = urls.length;
+  if (options.content) result.files = (await downloadOutputs(urls)).map(({ mediaType, base64 }) => ({ mediaType, base64 }));
+  return result;
+}
+
+/** Another provider's models (fal: its public catalogue, searchable; Unifically: with the operator's key). */
+export async function providerModels(deps: GenerationDeps, provider: TaskProviderId, search?: string): Promise<GenerationModel[]> {
+  if (provider === 'fal') {
+    const url = `${(process.env.KARMAX_FAL_API_URL ?? 'https://api.fal.ai/v1').replace(/\/$/, '')}/models?limit=50${search ? `&q=${encodeURIComponent(search)}` : ''}`;
+    const response = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) throw new Error(`fal.ai models: ${response.status}`);
+    const body = (await response.json()) as { models?: any[]; data?: any[] };
+    return (body.models ?? body.data ?? []).filter((entry) => typeof (entry?.endpoint_id ?? entry?.id) === 'string').map((entry) => ({
+      id: entry.endpoint_id ?? entry.id, name: entry.metadata?.display_name ?? entry.display_name ?? entry.name,
+      ...(entry.metadata?.category ?? entry.category ? { category: entry.metadata?.category ?? entry.category } : {}),
+      docs: `https://fal.ai/models/${entry.endpoint_id ?? entry.id}/api` }));
+  }
+  const key = await taskProviderKey(deps.store, deps.broker, provider).catch((error) => { throw unavailable(error); });
+  const response = await fetch(`${(process.env.KARMAX_UNIFICALLY_API_URL ?? 'https://api.unifically.com').replace(/\/$/, '')}/v1/models`,
+    { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(15_000) });
+  if (!response.ok) throw new Error(`Unifically models: ${response.status}`);
+  const words = (search ?? '').toLowerCase().split(/\s+/).filter(Boolean);
+  return (((await response.json()) as { data?: any[] }).data ?? [])
+    .filter((entry) => typeof entry?.id === 'string' && entry.category !== 'llm')
+    .filter((entry) => words.every((word) => `${entry.id} ${entry.display_name ?? ''}`.toLowerCase().includes(word)))
+    .map((entry) => ({ id: entry.id, name: entry.display_name, category: entry.category, docs: 'https://docs.unifically.com/llms.txt' }));
 }

@@ -14654,6 +14654,7 @@ const SETTINGS_TARGETS = [
   ['PUT', /^\/api\/settings\/included-model$/, () => 'Managed compute · Included model', true],
   ['POST', /^\/api\/settings\/model-gateways$/, () => 'Managed compute · Model gateways', true],
   ['PUT', /^\/api\/settings\/model-gateways\/[^/]+$/, () => 'Managed compute · Model gateways', true],
+  ['PUT', /^\/api\/settings\/generation-providers\/[^/]+$/, () => 'Managed compute · Generation', true],
   ['PUT', /^\/api\/settings\/[\w/-]+$/, () => 'Installation settings'],
   ['PATCH', /^\/api\/organizations\/([^/]+)$/, (m) => `${formOrganizationName(m[1])} settings`],
   ['POST', /^\/api\/organizations\/([^/]+)\/accounts$/, (m) => `${formOrganizationName(m[1])} agent accounts`, true],
@@ -27625,6 +27626,50 @@ function openModelGatewayDialog(gateway, onSaved) {
   document.body.appendChild(overlay);
   overlay.querySelector('.gateway-name').focus();
 }
+// Generation providers besides OpenRouter (wiki features/generate § Other
+// providers): fal.ai and Unifically, each with a key and a switch.
+function generationProviderRows(providers) {
+  const money = (micros) => `$${(Number(micros || 0) / 1e6).toFixed(2)}`;
+  const row = (provider) => `<div class="computer-provider generation-provider" data-generation-provider="${esc(provider.id)}">
+    <input class="toggle generation-provider-enabled" type="checkbox" ${provider.enabled ? 'checked' : ''} ${provider.keyConfigured ? '' : 'disabled'} aria-label="${esc(`Offer ${provider.name}`)}" title="${provider.enabled ? 'On' : 'Off'}">
+    <b>${esc(provider.name)}</b>${policyTip(provider.tip)}
+    ${provider.keyConfigured ? '' : '<span class="chip">No key</span>'}
+    <span class="setting-muted managed-month" title="This month: the provider’s price, then what organizations were charged.">${money(provider.costMicros)} → ${money(provider.chargedMicros)}</span>
+    <span class="label-row-fill"></span>
+    <button class="icon-btn generation-provider-edit" type="button" title="${esc(`${provider.name} key`)}" aria-label="${esc(`${provider.name} key`)}">✎</button></div>`;
+  return `<div class="computer-providers generation-providers"><div class="computer-provider"><b>Generation</b>
+    ${policyTip('Models agents can use through generate besides OpenRouter’s, on organizations’ credit. Each is off until switched on.')}</div>
+    ${(providers || []).map(row).join('')}</div>`;
+}
+function openGenerationProviderDialog(provider, onSaved) {
+  const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-card computer-dialog" role="dialog" aria-modal="true" aria-label="${esc(provider.name)}">
+    <div class="modal-head"><b>${esc(provider.name)}</b>${policyTip(provider.tip)}<span class="label-row-fill"></span><button class="icon-btn provider-close" type="button" aria-label="Close">×</button></div>
+    <div class="settings-grid"><label class="form-row"><span>API key</span><input class="provider-key" type="password" autocomplete="off" placeholder="${provider.keyConfigured ? 'Saved · leave blank to keep' : 'Key'}"></label>
+      <label class="switch"><input class="toggle provider-enabled" type="checkbox" ${provider.enabled ? 'checked' : ''}>Offer to organizations</label></div>
+    <div class="modal-actions">${provider.keyConfigured ? '<button class="btn danger provider-delete" type="button">Remove key</button>' : ''}<span class="label-row-fill"></span><button class="btn provider-cancel" type="button">Cancel</button><button class="btn primary provider-save" type="button">Save</button></div></div>`;
+  const close = () => { document.removeEventListener('keydown', keydown); overlay.remove(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  const path = `/api/settings/generation-providers/${encodeURIComponent(provider.id)}`;
+  overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  overlay.querySelector('.provider-close').addEventListener('click', close);
+  overlay.querySelector('.provider-cancel').addEventListener('click', close);
+  overlay.querySelector('.provider-delete')?.addEventListener('click', async (event) => {
+    event.currentTarget.disabled = true;
+    try { await api(path, { method: 'DELETE' }); } catch (error) { toast(error.message, true); event.currentTarget.disabled = false; return; }
+    close(); onSaved?.();
+  });
+  overlay.querySelector('.provider-save').addEventListener('click', async (event) => {
+    const button = event.currentTarget; button.disabled = true;
+    const apiKey = overlay.querySelector('.provider-key').value.trim();
+    try { await api(path, { method: 'PUT', body: JSON.stringify({ enabled: overlay.querySelector('.provider-enabled').checked, ...(apiKey ? { apiKey } : {}) }) }); }
+    catch (error) { toast(error.message, true); button.disabled = false; return; }
+    close(); toast(`${provider.name} saved`); onSaved?.();
+  });
+  document.addEventListener('keydown', keydown);
+  document.body.appendChild(overlay);
+  overlay.querySelector('.provider-key').focus();
+}
 /** "3 of 50 running · 6 of 24 CPU · 400 of 1,024 GB · 2 waiting": what is in use against the account's budget, and its queue. */
 function managedRunning(account) {
   const pool = account.limits?.pool || {};
@@ -27639,11 +27684,23 @@ async function wireManagedComputeCard() {
   try { view = await api('/api/settings/managed-compute'); }
   catch (error) { if (card.isConnected) paneError(card, error, () => wireManagedComputeCard()); return; }
   // The included model shares the compute credit: its row sits beside the computers.
-  const [included, gateways] = await Promise.all([
+  const [included, gateways, generationProviders] = await Promise.all([
     api('/api/settings/included-model').then((value) => value.settings, () => undefined),
-    api('/api/settings/model-gateways').then((value) => value.gateways || [], () => undefined)]);
+    api('/api/settings/model-gateways').then((value) => value.gateways || [], () => undefined),
+    api('/api/settings/generation-providers').then((value) => value.providers || [], () => undefined)]);
   if (!card.isConnected) return;
-  card.innerHTML = managedComputeMarkup(view, includedModelRow(included) + (gateways ? modelGatewaysRows(gateways) : ''));
+  card.innerHTML = managedComputeMarkup(view, includedModelRow(included) + (gateways ? modelGatewaysRows(gateways) : '')
+    + (generationProviders ? generationProviderRows(generationProviders) : ''));
+  card.querySelectorAll('.generation-provider[data-generation-provider]').forEach((row) => {
+    const provider = generationProviders.find((candidate) => candidate.id === row.dataset.generationProvider);
+    row.querySelector('.generation-provider-edit')?.addEventListener('click', () => openGenerationProviderDialog(provider, wireManagedComputeCard));
+    row.querySelector('.generation-provider-enabled')?.addEventListener('change', async (event) => {
+      const box = event.currentTarget; box.disabled = true;
+      try { await api(`/api/settings/generation-providers/${encodeURIComponent(provider.id)}`, { method: 'PUT', body: JSON.stringify({ enabled: box.checked }) }); }
+      catch (error) { toast(error.message, true); box.checked = !box.checked; }
+      box.disabled = false; box.title = box.checked ? 'On' : 'Off';
+    });
+  });
   card.querySelector('.included-model-edit')?.addEventListener('click', () => openIncludedModelDialog(included, wireManagedComputeCard));
   card.querySelector('.model-gateway-add')?.addEventListener('click', () => openModelGatewayDialog(null, wireManagedComputeCard));
   card.querySelectorAll('.model-gateway[data-gateway]').forEach((row) => {

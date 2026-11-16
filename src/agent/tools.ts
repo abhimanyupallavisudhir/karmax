@@ -473,12 +473,14 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'generate',
     description:
-      'Use any model OpenRouter serves, paid from your organization\'s credit (or its own OpenRouter key), with no account at the lab: text (ask another model: GPT, Gemini, DeepSeek, …; bulk work on a cheap one), an image (gpt-image, Nano Banana, Flux…), a video (Seedance, Veo, Kling…) or speech (ElevenLabs…). Before it runs, what it can cost at most is worked out from the model\'s price list and held on the credit; it is refused when the credit cannot cover that, or when it is above max_cost_usd. Text comes back in the result (and is saved at path if given); media is saved into this world at path. A video waits up to wait_minutes, else returns its job_id: call again with job_id and path to collect it. Models, prices, durations and voices: platform_request GET /api/generation-models?kind=text|image|video|speech.',
+      'Use any model OpenRouter serves (or fal.ai / Unifically, below), paid from your organization\'s credit (or its own OpenRouter key), with no account at the lab: text (ask another model: GPT, Gemini, DeepSeek, …; bulk work on a cheap one), an image (gpt-image, Nano Banana, Flux…), a video (Seedance, Veo, Kling…) or speech (ElevenLabs…). Before it runs, what it can cost at most is worked out from the model\'s price list and held on the credit; it is refused when the credit cannot cover that, or when it is above max_cost_usd. Text comes back in the result (and is saved at path if given); media is saved into this world at path. A video waits up to wait_minutes, else returns its job_id: call again with job_id and path to collect it. Models, prices, durations and voices: platform_request GET /api/generation-models?kind=text|image|video|speech.',
     parameters: {
       type: 'object',
       properties: {
         organization_id: { type: 'string', description: 'Your organization id (named in your prompt).' },
         kind: { type: 'string', enum: ['text', 'image', 'video', 'speech'] },
+        provider: { type: 'string', enum: ['openrouter', 'fal', 'unifically'], description: 'Default openrouter. fal: ~1,500 models OpenRouter lacks (music, sound effects, 3D, upscaling, lip-sync, background removal…); unifically: Suno and others. Each only where the operator turned it on. With these, pass model and input; kind is optional.' },
+        input: { type: 'object', description: 'fal/unifically: the model\'s own input object, as its docs give it (find models with platform_request GET /api/generation-models?provider=fal&q=music).' },
         prompt: { type: 'string', description: 'The question or what to make; for speech, the text to say.' },
         path: { type: 'string', description: 'Where to save it in this world, e.g. assets/hero.png (several images get -2, -3, … before the extension). Required for image, video and speech.' },
         model: { type: 'string', description: 'OpenRouter model id; default: a good, cheap one for the kind.' },
@@ -1519,8 +1521,9 @@ export function platformToolHandlers(
       const org = encodeURIComponent(String(args?.organization_id ?? ''));
       const target = String(args?.path ?? '').trim();
       const kind = args?.job_id ? 'video' : String(args?.kind ?? '');
-      if (!target && kind !== 'text') throw new Error('path is required: where to save it in this world');
-      type Result = { status: string; jobId?: string; model?: string; quoteUsd?: number; costUsd?: number; funding?: string; error?: string;
+      const otherProvider = !!args?.provider && args.provider !== 'openrouter';
+      if (!target && (kind !== 'text' || otherProvider)) throw new Error('path is required: where to save it in this world');
+      type Result = { status: string; jobId?: string; model?: string; quoteUsd?: number; costUsd?: number; funding?: string; error?: string; output?: unknown;
         text?: string; files?: Array<{ mediaType: string; base64: string }> };
       const job = (id: string) => `/api/organizations/${org}/generations/${encodeURIComponent(id)}?content=1`;
       let result: Result;
@@ -1535,7 +1538,7 @@ export function platformToolHandlers(
           return { url: `data:${mediaTypeOf(String(ref.path))};base64,${bytes.toString('base64')}`, ...role };
         }));
         result = await platformRequest('POST', `/api/organizations/${org}/generations`, {
-          kind: args?.kind, prompt: args?.prompt, model: args?.model, maxCostUsd: args?.max_cost_usd, system: args?.system,
+          kind: args?.kind, provider: args?.provider, input: args?.input, prompt: args?.prompt, model: args?.model, maxCostUsd: args?.max_cost_usd, system: args?.system,
           maxTokens: args?.max_tokens, effort: args?.effort, aspectRatio: args?.aspect_ratio, resolution: args?.resolution,
           count: args?.count, duration: args?.duration, audio: args?.audio, voice: args?.voice, instructions: args?.instructions,
           ...(references.length ? { references } : {}),
@@ -1565,7 +1568,9 @@ export function platformToolHandlers(
           saved.push(where);
         }
         ctx.emit(`generated ${saved.join(', ')}`);
-        return JSON.stringify({ ...summary, saved });
+        // Another provider's output says what each file is (clip ids, titles, durations…).
+        const output = result.output === undefined ? undefined : JSON.stringify(result.output);
+        return JSON.stringify({ ...summary, saved, ...(output ? { output: output.length > 4000 ? `${output.slice(0, 4000)}…` : result.output } : {}) });
       }
       if (result.status === 'pending' || result.status === 'in_progress')
         return JSON.stringify({ ...summary, job_id: result.jobId, next: 'Still rendering: call generate again with this job_id and path to collect it.' });
