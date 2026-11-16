@@ -425,7 +425,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The Files page: data under it also needs project:settings:read, checked there.
   if (/^\/api\/projects\/[^/]+\/files(?:\/raw|\/views)?$/.test(p)) return 'repository:read';
   // Changing Files: who may write where (a task's world, a branch) is decided there.
-  if (/^\/api\/projects\/[^/]+\/files\/(?:changes|uploads|plan)$/.test(p)) return 'repository:read';
+  if (/^\/api\/projects\/[^/]+\/files\/(?:changes|uploads(?:\/[^/]+)?|plan)$/.test(p)) return 'repository:read';
   if (/^\/api\/tasks\/[^/]+\/file-location$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/artifacts$/.test(p)) return 'task:read';
   // Public links to a snapshot of a path: anyone who reads Files sees them; making or revoking one is its own capability.
@@ -5386,6 +5386,15 @@ export class Gateway {
         if (!(await store.getProject(projectId))) return this.json(res, 404, { error: 'project not found' });
         try { return this.json(res, 200, await this.stageFileUpload(req, projectId, session.apiToken)); }
         catch (error) { return this.json(res, (error as { status?: number }).status ?? 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      // An upload given up on (cancelled, or the rest of its batch failed): its bytes go now, not in an hour.
+      const fileUpload = p.match(/^\/api\/projects\/([^/]+)\/files\/uploads\/([^/]+)$/);
+      if (fileUpload && method === 'DELETE') {
+        const upload = this.fileUploads.get(decodeURIComponent(fileUpload[2]!));
+        const principal = (await this.deps.tokens.verify(session.apiToken))?.principal ?? '';
+        if (upload && upload.projectId === fileUpload[1] && upload.principal === principal) this.dropFileUpload(decodeURIComponent(fileUpload[2]!));
+        res.writeHead(204);
+        return void res.end();
       }
       // Where uploads are best kept: Git, data or a secret (the upload dialog's recommendation).
       const filePlan = p.match(/^\/api\/projects\/([^/]+)\/files\/plan$/);
