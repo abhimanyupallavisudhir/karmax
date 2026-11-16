@@ -179,7 +179,7 @@ async function call(key: string, method: string, path: string, body?: unknown, t
 async function failure(deps: MediaDeps, organizationId: string, funding: MediaResult['funding'], response: Response): Promise<Error> {
   const text = await response.text().catch(() => '');
   let message = text.slice(0, 500);
-  try { message = String((JSON.parse(text) as any)?.error?.message ?? message); } catch { /* plain text */ }
+  try { message = String((JSON.parse(text) as { error?: { message?: string } })?.error?.message ?? message); } catch { /* plain text */ }
   if (response.status === 402 && funding === 'credit') return outOfCompute(deps.store, organizationId, 'openrouter');
   if (response.status >= 400 && response.status < 500) return new MediaRequestError(`OpenRouter: ${message || response.statusText}`, response.status === 404 ? 404 : 400);
   return new Error(`OpenRouter failed (${response.status}): ${message}`);
@@ -276,7 +276,7 @@ export async function mediaJob(deps: MediaDeps, organizationId: string, jobId: s
   const status = (job.status ?? 'pending') as MediaResult['status'];
   const result: MediaResult = { kind: 'video', model: record.model, status, jobId, funding: record.funding,
     ...(typeof job.usage?.cost === 'number' ? { costUsd: job.usage.cost } : {}),
-    ...(job.error ? { error: typeof job.error === 'string' ? job.error : String((job.error as any)?.message ?? JSON.stringify(job.error)) } : {}) };
+    ...(job.error ? { error: typeof job.error === 'string' ? job.error : String((job.error as { message?: string }).message ?? JSON.stringify(job.error)) } : {}) };
   if (status !== 'completed' && status !== 'failed') return result;
   const task = record.taskId ? { taskId: record.taskId, ...(record.projectId ? { projectId: record.projectId } : {}) } : undefined;
   await book(deps, organizationId, record.funding, task);

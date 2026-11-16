@@ -308,7 +308,7 @@ export const TOOL_CAPABILITY: Record<string, Capability> = {
   get_credential: 'credential:read', fill_credential: 'credential:read',
   list_connections: 'credential:read', request_connection: 'connection:use', search_connection_tools: 'credential:read', execute_connection_tool: 'connection:use',
   request_credential: 'credential:read', store_credential: 'vault:store',
-  check_agent_mail: 'credential:read', enroll_passkey: 'credential:read',
+  check_agent_mail: 'credential:read', enroll_passkey: 'credential:read', generate_media: 'connection:use',
   use_passkey: 'credential:read', save_passkey: 'vault:store',
   use_session: 'credential:read', save_session: 'vault:store',
   list_payments: 'payment:read', manage_payments: 'payment:write',
