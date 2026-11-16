@@ -5,10 +5,11 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { brokerEnrollRepository, brokerFinalizeMerge, brokerImportTaskBranch, brokerPublishBranch, brokerPushBranches, brokerRefreshUpstream,
-  isBranchContentRejection, isGithubPushProtectionRejection } from '../src/world/git-broker.js';
+  describeGitPushError, isBranchContentRejection, isGithubPushProtectionRejection, isGithubWriteRefusal } from '../src/world/git-broker.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
 import { acquireFileLock } from '../src/util/file-lock.js';
 import { mirroredClone } from '../src/world/git-mirror.js';
+import { initialBaseId, makeInitialBase } from '../src/world/initial-base.js';
 
 describe('cloud Git broker', () => {
   const cleanups: string[] = [];
@@ -149,8 +150,10 @@ describe('cloud Git broker', () => {
       source: sshRemote, name: 'empty', branch: parent.handle.branch, base: 'main', target: 'main',
       identity: { name: 'Karmax Test', email: 'karmax@example.com' },
     }, auth);
-    expect(enrolled).toMatchObject({ name: 'empty', branch: 'tavya/parent', base: 'main', sourceAuthority: 'origin' });
-    expect((await git(empty, ['rev-parse', '--verify', 'refs/heads/main'])).code).toBe(0);
+    expect(enrolled).toMatchObject({ name: 'empty', branch: 'tavya/parent', base: 'main', sourceAuthority: 'origin',
+      baseSha: await initialBaseId() });
+    // Enrolling writes nothing; the first publication brings the base along.
+    expect((await git(empty, ['for-each-ref', 'refs/heads'])).stdout).toBe('');
     expect((await git(enrolled.root, ['branch', '--show-current'])).stdout.trim()).toBe('tavya/parent');
     expect((await git(enrolled.root, ['config', '--get', 'remote.origin.url'])).stdout.trim()).toBe(sshRemote);
     expect(fs.readFileSync(path.join(enrolled.root, '.git', 'config'), 'utf8')).not.toContain(secret);
@@ -160,6 +163,7 @@ describe('cloud Git broker', () => {
     await gitOrThrow(enrolled.root, ['commit', '-q', '-m', 'parent work']);
     expect(await brokerPublishBranch(parent, auth)).toEqual({ pushed: ['first', 'second', 'empty'], skipped: [] });
     expect((await git(empty, ['rev-parse', '--verify', 'refs/heads/tavya/parent'])).code).toBe(0);
+    expect(await gitOrThrow(empty, ['rev-parse', 'refs/heads/main'])).toBe(await initialBaseId());
 
     const child = await provider.create({ taskId: 'child', repos: [first, second], base: 'main' });
     const childRepo = await brokerEnrollRepository(child, {
@@ -417,6 +421,86 @@ describe('cloud Git broker', () => {
    * branch had "advanced" and then that origin had no such branch, because a
    * secret-scanning refusal was read as a non-fast-forward. A pre-receive hook
    * reproduces GitHub's refusal with its GH013 text. */
+  describe('an empty repository\'s first commit (tavya-error 40d814688b2054c8)', () => {
+    /** A cloud world provisioned from an empty repository: its base is the
+     * initial commit, which exists only in the world. */
+    async function emptyRepositoryWorld(prefix: string, taskId = 'empty') {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); cleanups.push(root);
+      const remote = path.join(root, 'remote.git');
+      await gitOrThrow(root, ['init', '-q', '--bare', '-b', 'main', remote]);
+      const source = path.join(root, 'source');
+      await gitOrThrow(root, ['init', '-q', '-b', 'main', source]);
+      await gitOrThrow(source, ['update-ref', 'refs/heads/main', await makeInitialBase(source)]);
+      const env = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.file://${root}/.insteadOf`, GIT_CONFIG_VALUE_0: 'git@example:' };
+      const world = await new WorktreeProvider(path.join(root, 'worlds')).create({ taskId, repo: source, base: 'main' });
+      world.handle.kind = 'e2b';
+      Object.assign(world.handle.repos![0]!, { repo: 'git@example:remote.git', localPath: undefined, sourceAuthority: 'origin',
+        baseSha: await initialBaseId() });
+      await world.writeFile('work.txt', `${taskId}\n`);
+      await gitOrThrow(world.handle.root, ['add', '-A']);
+      await ensureIdentity(world.handle.root);
+      await gitOrThrow(world.handle.root, ['commit', '-q', '-m', 'work']);
+      return { root, remote, env, world };
+    }
+
+    it('publishes the base before the task branch, so it becomes the default branch', async () => {
+      const { remote, env, world } = await emptyRepositoryWorld('karmax-broker-initial-');
+      const pushes: string[] = [];
+      fs.writeFileSync(path.join(remote, 'hooks', 'pre-receive'),
+        `#!/bin/sh\nwhile read old new ref; do echo "$ref" >> "${path.join(remote, 'pushed')}"; done\n`, { mode: 0o755 });
+      expect(await brokerPushBranches(world, env)).toEqual({ pushed: ['source'], skipped: [] });
+      pushes.push(...fs.readFileSync(path.join(remote, 'pushed'), 'utf8').trim().split('\n'));
+      expect(pushes).toEqual(['refs/heads/main', 'refs/heads/tavya/empty']);
+      expect(await gitOrThrow(remote, ['rev-parse', 'refs/heads/main'])).toBe(await initialBaseId());
+      expect(await gitOrThrow(remote, ['merge-base', 'main', 'tavya/empty'])).toBe(await initialBaseId());
+      // Another task on the same repository agrees on the base.
+      const other = await emptyRepositoryWorld('karmax-broker-initial-other-', 'other');
+      expect(await brokerPushBranches(other.world, other.env)).toEqual({ pushed: ['source'], skipped: [] });
+    });
+
+    it('also before landing by push, which reads the target from origin', async () => {
+      const { remote, env, world } = await emptyRepositoryWorld('karmax-broker-initial-land-');
+      const landed = await brokerFinalizeMerge(world, 'main', { name: 'Lander', email: 'lander@example.com' }, env);
+      expect(landed).toMatchObject({ merged: true });
+      expect(await gitOrThrow(remote, ['rev-list', '--count', 'main'])).toBe('3');
+      expect((await git(remote, ['show', 'main:work.txt'])).stdout).toBe('empty\n');
+    });
+
+    it('leaves alone a base someone else published first', async () => {
+      const { root, remote, env, world } = await emptyRepositoryWorld('karmax-broker-initial-race-');
+      const theirs = path.join(root, 'theirs');
+      await gitOrThrow(root, ['init', '-q', '-b', 'main', theirs]); await ensureIdentity(theirs);
+      await gitOrThrow(theirs, ['commit', '--allow-empty', '-qm', 'their first']);
+      await gitOrThrow(theirs, ['push', '-q', remote, 'main']);
+      const their = await gitOrThrow(theirs, ['rev-parse', 'main']);
+      expect(await brokerPushBranches(world, env)).toEqual({ pushed: ['source'], skipped: [] });
+      expect(await gitOrThrow(remote, ['rev-parse', 'main'])).toBe(their);
+    });
+
+    it('says GitHub refused to let tavya write, not that a login expired', async () => {
+      // What GitHub answers a token without Contents: write (the production event's words).
+      const refused = "remote: Write access to repository not granted.\n"
+        + "fatal: unable to access 'https://github.com/radnyees/personal.git/': The requested URL returned error: 403";
+      const repo = { name: 'personal', branch: 'tavya/task', repo: 'git@github.com:radnyees/personal.git', root: '/w', base: 'main' };
+      const said = describeGitPushError(repo, refused);
+      expect(said).toMatch(/^GitHub refused to let tavya write to "personal"/);
+      expect(said).toContain('Contents: read and write');
+      expect(said).not.toMatch(/expired|Reconnect/);
+      expect(isGithubWriteRefusal(refused)).toBe(true);
+      expect(isGithubWriteRefusal(said)).toBe(true);
+      expect(isGithubWriteRefusal(' ! [rejected] main -> main (fetch first)')).toBe(false);
+    });
+
+    it('reports a refused publication of the base instead of pushing the task branch alone', async () => {
+      const { remote, env, world } = await emptyRepositoryWorld('karmax-broker-initial-refused-');
+      fs.writeFileSync(path.join(remote, 'hooks', 'pre-receive'), '#!/bin/sh\necho "no" >&2\nexit 1\n', { mode: 0o755 });
+      const result = await brokerPushBranches(world, env);
+      expect(result.skipped).toEqual(['source']);
+      expect(result.errors!.source).toContain('"main"');
+      expect((await git(remote, ['for-each-ref', 'refs/heads'])).stdout).toBe('');
+    });
+  });
+
   describe('server-side push refusals', () => {
     const GH013 = [
       'error: GH013: Repository rule violations found for refs/heads/tavya/refused.',

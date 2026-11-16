@@ -80,7 +80,7 @@ import { recordedBase, worldRepos, worldRepoSource, worldRepoTarget } from '../w
 import { pullRequestHandle, pullRequestView, isPullRequestView, proposalCheckouts } from '../world/pr-view.js';
 import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
 import { brokerFinalizeMerge, brokerPublishBranch, brokerPushBranches, describeGitPushError, describePublishFailures,
-  isBranchContentRejection, isNonFastForwardPush, type GitBrokerAuth } from '../world/git-broker.js';
+  isBranchContentRejection, isGithubWriteRefusal, isNonFastForwardPush, type GitBrokerAuth } from '../world/git-broker.js';
 import { enrollWorldRepositories } from '../world/repository-enrollment.js';
 import { materializeGitCredential } from '../world/git-credential.js';
 import { hostedCloneCredential, isHostedRepository, repositoryBrokerCredentials } from '../world/hosted-git.js';
@@ -5531,6 +5531,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             throw ApplicationFailure.create({
               message: `GitHub App workflow permission required for ${slug}. ${guidance}`,
               type: 'github-workflows-permission',
+              nonRetryable: true,
+            });
+          }
+          // GitHub refused to let tavya write at all (an installation without
+          // Contents: write, a repository it no longer covers): the
+          // repository's GitHub side must grant it, so say who and where
+          // (tavya-error 40d814688b2054c8 reached people as raw git output).
+          if (isGithubWriteRefusal(pushError)) {
+            const repository = await enrolledRepositoryForCheckout(handle, repo);
+            const fallback = `${BRAND}'s GitHub App needs Contents: read and write on ${slug}: approve it in organization settings → GitHub, then retry the task.`;
+            const guidance = repository && deps.githubApp
+              ? await deps.githubApp.writePermissionGuidance(repository).catch(() => fallback)
+              : fallback;
+            const said = /GitHub said: (.*)$/s.exec(pushError)?.[1]?.trim();
+            throw ApplicationFailure.create({
+              message: `GitHub refused to let ${BRAND} write to ${slug}. ${guidance}${said ? ` GitHub said: ${said}` : ''}`,
+              type: 'repository-access',
               nonRetryable: true,
             });
           }
