@@ -2932,12 +2932,30 @@ html[data-theme="dark"] .github-signin-btn:active,
   .tp-head.wide { padding: 6px 12px 8px; }
   .tp-head.wide h2 { font-size: 16px; }
   .tp-head.wide > .tp-topline { padding-left: 0; gap: 8px; }
+  /* A task is a page you go into: its header takes the app bar's place, and
+     ← (back to the list, where ☰ is) carries the bar's "something waits" dot. */
+  #app:has(.tp-topline) > .mobile-bar { display: none; }
+  :root:has(.tp-topline) { --shell-top: 0px; }
+  #tp-back { position: relative; }
+  body:has(#mobile-menu.has-unread) #tp-back::after {
+    content: ''; position: absolute; top: 6px; right: 6px; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--attention); box-shadow: 0 0 0 2px var(--surface);
+  }
+  /* The conversation gets the room: a tighter thread and message box, a box
+     with no resize grip (it grows as you type), no keyboard digits. */
+  .ck-thread { padding: 16px 16px 24px; }
+  .ck-compose { padding: 8px 12px; }
+  .ck-compose .prompt-field textarea.followup-input { resize: none; }
+  .btn .kbd { display: none; }
+  .tp-body[data-tab="checkin"] + .tp-foot { padding-bottom: 8px; }
+  .tp-body[data-tab="checkin"] + .tp-foot > .tp-foot-inner { padding: 0 12px; }
+  /* Above an installed app's home indicator. */
+  .tp-foot { padding-bottom: max(8px, env(safe-area-inset-bottom)); }
+  .tp-col:has(.tp-foot-inner:empty) .ck-compose { padding-bottom: max(8px, env(safe-area-inset-bottom)); }
   .tp-stage .pipeline { display: none; }
   .tp-bar { gap: 4px 6px; padding: 4px 8px 4px 12px; }
-  /* Scrolling down the page tucks its top away (wireChromeTuck): the app bar
-     slides up, the header and toolbar fold to nothing. */
-  .mobile-bar { transition: margin-top .2s ease; }
-  html.chrome-tucked #app:has(.task-page) > .mobile-bar { margin-top: -52px; }
+  /* Scrolling down the page tucks its top away (wireChromeTuck): the header
+     and toolbar fold to nothing. */
   .tp-chrome { display: grid; grid-template-rows: 1fr; transition: grid-template-rows .2s ease; }
   .tp-chrome-inner { min-height: 0; overflow: hidden; }
   .tp-chrome-inner:has(.tp-prs[open]) { overflow: visible; }
@@ -3261,6 +3279,10 @@ html[data-theme="dark"] .github-signin-btn:active,
 .prompt-field > .wiki-ref-editor > textarea { border: none; background: transparent; outline: none; box-shadow: none; resize: vertical; width: 100%; padding: 9px 12px; }
 .prompt-field > .img-chips { margin: 0; padding: 0 10px 9px; }
 .prompt-attach-row { display: flex; align-items: center; gap: 9px; padding: 0 12px 8px; color: var(--ink-3); font-size: var(--fs-11); }
+/* Send (and Stop) sit in the message box's bottom row, so the text takes the
+   box's whole width. */
+.followup-buttons { display: flex; gap: 6px; margin-left: auto; margin-right: -4px; }
+.followup-buttons .btn { padding: 5px 14px; font-size: var(--fs-13); }
 .attach-file-button {
   display: inline-flex; flex: none; align-items: center; width: max-content; cursor: pointer;
   color: var(--accent); font-size: var(--fs-12); font-weight: 600;

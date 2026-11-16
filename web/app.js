@@ -14032,18 +14032,31 @@ function conversationPane(v, t) {
   const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
         <div class="prompt-field">
-          <textarea class="followup-input" placeholder="${t.shared ? `${defaultRecipientFor(v) === 'agent:do' ? 'Message the agent' : `Reply to ${participantLabelOf(defaultRecipientFor(v).slice(6), v)}`} · @ to call an agent or person · [[ for wiki` : `${t.role === 'do' ? 'Message the agent' : `Message ${agentName}`} · [[ for wiki`}" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
+          <textarea class="followup-input"${narrowViewport() ? ' rows="1"' : ''} placeholder="${followupPlaceholder(v, t, agentName)}" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
           ${t.shared ? newAgentFormsHtml(v, `${v.taskId}/${t.role}`) : ''}
           <div class="img-chips attachment-chips followup-chips" style="display:none"></div>
-          <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label>${policyTip(`Drop or paste files here (25 MB each, 50 MB per message). Type ${t.shared ? '@ to bring in an agent or a person, ' : ''}[[ to add a wiki page.`)}</div>
+          <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label>${policyTip(`Drop or paste files here (25 MB each, 50 MB per message). Type ${t.shared ? '@ to bring in an agent or a person, ' : ''}[[ to add a wiki page.`)}
+            <span class="followup-buttons">
+              ${t.shared && stoppableAgent(v) ? stopAgentButton(stoppableAgent(v), 'btn followup-stop') : ''}
+              <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}${continues ? ' title="The approved PR lands as it is. The agent carries on in a new task."' : ''}>${continues ? 'Continue' : 'Send'}</button>
+            </span></div>
         </div>
-        ${t.shared && stoppableAgent(v) ? stopAgentButton(stoppableAgent(v), 'btn followup-stop') : ''}
-        <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}${continues ? ' title="The approved PR lands as it is. The agent carries on in a new task."' : ''}>${continues ? 'Continue' : 'Send'}</button>
       </div></div>`
     : '';
   return `${conversationSearchBar(v, t)}
     <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${pending}${live}${conversationWaitNotice(v)}${conversationError(v)}${conversationApprovalRequests()}${conversationPullRequestAsks(v)}${conversationReviewInfo(v, resourceRequestIndex >= 0)}</div></div>
     ${fu}`;
+}
+
+// Who a message goes to, and on a computer how to call others in. A phone's box
+// keeps to one line; the ⓘ beside Attach files says the same. HTML-escaped
+// (`agentName` comes escaped).
+function followupPlaceholder(v, t, agentName) {
+  const to = t.shared
+    ? (defaultRecipientFor(v) === 'agent:do' ? 'Message the agent' : `Reply to ${esc(participantLabelOf(defaultRecipientFor(v).slice(6), v))}`)
+    : (t.role === 'do' ? 'Message the agent' : `Message ${agentName}`);
+  if (narrowViewport()) return to;
+  return `${to}${t.shared ? ' · @ to call an agent or person' : ''} · [[ for wiki`;
 }
 
 // The task page's one toolbar, under the title: its two views, then — on the
@@ -16965,7 +16978,7 @@ function wireFollowupSizing(ta, key) {
   const grow = () => {
     remember();
     const scrollTop = ta.scrollTop;
-    // Measure at the natural two-row height so deleting text shrinks the box.
+    // Measure at the natural height (two rows; one on a phone) so deleting text shrinks the box.
     ta.style.height = 'auto';
     const style = getComputedStyle(ta);
     const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
@@ -28851,6 +28864,14 @@ function setTheme(next) {
   if (next) document.documentElement.setAttribute('data-theme', next);
   else document.documentElement.removeAttribute('data-theme');
   localStorage.setItem('karmax-theme', next);
+  syncThemeColor();
+}
+/** The browser's own bars (a phone's status bar and toolbar, an installed
+ * app's title bar) take the colour of the page's top bar, so the console sits
+ * in no coloured frame — in whichever theme and look it shows. */
+function syncThemeColor() {
+  const color = getComputedStyle(document.documentElement).getPropertyValue('--rail-bg').trim();
+  if (color) document.querySelectorAll('meta[name="theme-color"]').forEach((meta) => meta.setAttribute('content', color));
 }
 (function initTheme() {
   const t = localStorage.getItem('karmax-theme');
@@ -28859,6 +28880,8 @@ function setTheme(next) {
   // last time, so a classic installation never flashes the default look.
   try { applySkin(localStorage.getItem('karmax-skin') || ''); } catch {}
   try { applyTaskList(localStorage.getItem('karmax-task-list') || ''); } catch {}
+  // "System" follows the device's light or dark setting as it changes.
+  try { matchMedia('(prefers-color-scheme: dark)').addEventListener('change', syncThemeColor); } catch {}
 })();
 /** The installation's look (Installation → Appearance → Style): '' is the
  * default, 'classic' the earlier indigo console. Every colour, radius and type
@@ -28868,6 +28891,7 @@ function applySkin(skin) {
   if (value) document.documentElement.setAttribute('data-skin', value);
   else document.documentElement.removeAttribute('data-skin');
   try { localStorage.setItem('karmax-skin', value); } catch {}
+  syncThemeColor();
 }
 /** The installation's task list layout (`html[data-task-list]`, web/styles.css
  * "task row"); none is the default, one line per task. */
