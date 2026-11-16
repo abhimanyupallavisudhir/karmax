@@ -62,6 +62,14 @@ assert.match(oom.detail, /SIGKILL/); passed++;
 const retrying = plainTaskError('infrastructure: Activity task failed → Claude Agent SDK stream ended unexpectedly without a successful result event — retrying do in 30s (1/5)');
 eq(retrying.summary, 'The connection to the AI model dropped. Retry usually fixes this. tavya will try again in 30s (attempt 1 of 5).', 'retry is said in words');
 eq(plainTaskError('Activity task failed → Sandbox is probably not running anymore').summary, 'The task’s computer stopped responding. Retry usually fixes this.', 'sandbox');
+// Temporal's timeouts (tavya-error 33f6295a8ac41d4a) read as what they mean; the activity stays in Details.
+const stalled = plainTaskError('infrastructure: Activity runAgentTurn timed out → activity Heartbeat timeout (still failing after 5 waits)');
+eq(stalled.summary, 'A step of this task stopped responding. Retry usually fixes this.', 'heartbeat timeout');
+assert.match(stalled.detail, /runAgentTurn/); passed++;
+eq(plainTaskError('Activity task timed out → activity Heartbeat timeout').summary,
+  'A step of this task stopped responding. Retry usually fixes this.', 'older text too');
+eq(plainTaskError('infrastructure: Activity createWorld timed out → activity StartToClose timeout (still failing after 5 waits)').summary,
+  'A step of this task took longer than its time limit. Retry usually fixes this.', 'start-to-close timeout');
 eq(plainTaskError('… the conversation is larger than the model\'s context window even in a fresh session').summary,
   'The conversation grew too long for the AI model. Send a shorter message, or start a new task.', 'context window');
 eq(plainTaskError('Out of disk: this task\'s computer filled its 20 GB disk. Bigger disk fixes it (POST /api/tasks/task_1/bigger-disk). Last error: ENOSPC').summary,

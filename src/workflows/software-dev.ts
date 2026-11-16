@@ -40,7 +40,7 @@ import {
   participantLabel, participantRole, reviewerKey, selectorAgent,
 } from '../domain/participants.js';
 import { resetAtFromHint } from '../agent/limits.js';
-import { innermostMessage } from '../domain/failure-text.js';
+import { describeFailure, innermostMessage } from '../domain/failure-text.js';
 import { coordinatorSetting, coordinatorCheckIn, coordinatorRetryMinutes, wakeIntervalText } from '../domain/coordinator.js';
 import { isCapacityFailure, isInfraFailure, limitFailureClassification, CAPACITY_WAIT_MS, CAPACITY_WAIT_LIMIT_MS, INFRA_BACKOFF_MS, WORLD_WAIT_MS, WORLD_WAIT_LIMIT_MS } from './failures.js';
 import {
@@ -2531,7 +2531,7 @@ async function softwareDevImpl(
           // decision is task-local: never rotate accounts or ask Resolve to retry.
           if (failureHasType(err, 'agent-policy')) {
             cause = 'task';
-            lastError = describeError(err);
+            lastError = describeFailure(err);
             error = lastError;
             break;
           }
@@ -2540,7 +2540,7 @@ async function softwareDevImpl(
           // type has no historical command sequence, so no patch marker is needed.
           if (failureHasType(err, 'world-disk-full')) {
             cause = 'task';
-            lastError = describeError(err);
+            lastError = describeFailure(err);
             error = lastError;
             outOfDisk = true;
             break;
@@ -2560,7 +2560,7 @@ async function softwareDevImpl(
               continue;
             }
             cause = 'task';
-            lastError = `${describeError(err)} — the conversation is larger than the model's context window even in a fresh session; send a narrower follow-up or start a new task`;
+            lastError = `${describeFailure(err)} — the conversation is larger than the model's context window even in a fresh session; send a narrower follow-up or start a new task`;
             error = lastError;
             break;
           }
@@ -2573,7 +2573,7 @@ async function softwareDevImpl(
           if (failureHasType(err, 'github-workflows-permission')
             && patched('software-dev-human-github-workflow-permission-v1')) {
             cause = 'project';
-            lastError = describeError(err);
+            lastError = describeFailure(err);
             error = lastError;
             break;
           }
@@ -2581,7 +2581,7 @@ async function softwareDevImpl(
           // escalate straight to a human (#5).
           if (err instanceof CredentialDenied) {
             cause = 'organization';
-            lastError = describeError(err);
+            lastError = describeFailure(err);
             error = lastError;
             break;
           }
@@ -2633,7 +2633,7 @@ async function softwareDevImpl(
             if (infraRetries < INFRA_BACKOFF_MS.length) {
               const wait = INFRA_BACKOFF_MS[infraRetries++]!;
               attempt--; // an infra park is not a resolve attempt
-              error = `infrastructure: ${describeError(err)} — retrying ${stageName} in ${Math.round(wait / 1000)}s (${infraRetries}/${INFRA_BACKOFF_MS.length})`;
+              error = `infrastructure: ${describeFailure(err)} — retrying ${stageName} in ${Math.round(wait / 1000)}s (${infraRetries}/${INFRA_BACKOFF_MS.length})`;
               // Say plainly that nothing runs until the retry: a stage that read
               // "working" through 23 minutes of identical failures looked like it
               // would retry forever (legibench3#18). A waiting publication may
@@ -2654,11 +2654,11 @@ async function softwareDevImpl(
               continue;
             }
             cause = 'infrastructure';
-            lastError = `infrastructure: ${describeError(err)} (still failing after ${INFRA_BACKOFF_MS.length} waits)`;
+            lastError = `infrastructure: ${describeFailure(err)} (still failing after ${INFRA_BACKOFF_MS.length} waits)`;
             error = lastError;
             break; // → escalate to a human; Resolve can't fix infrastructure
           }
-          lastError = describeError(err);
+          lastError = describeFailure(err);
           error = lastError;
           const providerLimit = limitFailureClassification(err);
           cause = failureCause({ stage: stageName, hardLimit: !!providerLimit?.hard,
@@ -2760,7 +2760,7 @@ async function softwareDevImpl(
               // agent escape withResolve and terminally fail the Temporal execution
               // (tasks #130/#133/#150). Resolution machinery exhausting itself is a
               // human escalation, never an unhandled workflow failure.
-              lastError = `Resolve agent failed while handling the ${stageName} error: ${describeError(resolveErr)}`;
+              lastError = `Resolve agent failed while handling the ${stageName} error: ${describeFailure(resolveErr)}`;
               error = lastError;
               break;
             }
@@ -2854,7 +2854,7 @@ async function softwareDevImpl(
           return result;
         } catch (err) {
           if (cancelled || isCancellation(err)) throw err;
-          error = `Manual recovery failed: ${describeError(err)}`;
+          error = `Manual recovery failed: ${describeFailure(err)}`;
           await publish();
         }
       }
@@ -4068,7 +4068,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         noteShipmentSettled(childTaskId, (res as { stage: Stage }).stage);
       },
       (err) => {
-        settled.push({ childTaskId, stage: 'failed', detail: describeError(err) });
+        settled.push({ childTaskId, stage: 'failed', detail: describeFailure(err) });
         noteShipmentSettled(childTaskId, 'failed');
       },
     );
@@ -4462,7 +4462,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         const resumeStatus = status;
         status = 'waiting';
         waitingFor = { kind: 'retry', detail: `Retry ${waits + 1} of ${INFRA_BACKOFF_MS.length}`, until: Date.now() + wait };
-        error = `infrastructure: ${describeError(err)} — preparing sub-task "${request.title}" again in ${Math.round(wait / 1000)}s`;
+        error = `infrastructure: ${describeFailure(err)} — preparing sub-task "${request.title}" again in ${Math.round(wait / 1000)}s`;
         await publish();
         await condition(() => cancelled || retryRequested || halted(), wait);
         waitingFor = undefined;
@@ -5703,7 +5703,7 @@ Inspect the complete current diff and specifically compare its delta from the re
             } catch (err) {
               if (failureHasType(err, 'task-branch-conflict')
                 && patched('software-dev-publication-conflict-do-repair-v1')) {
-                return { repair: describeError(err) };
+                return { repair: describeFailure(err) };
               }
               throw err;
             }
@@ -6995,15 +6995,6 @@ function conflictGuide(err: any): string | undefined {
   return undefined;
 }
 
-function describeError(err: any): string {
-  const parts: string[] = [];
-  let e: any = err;
-  for (let depth = 0; e && depth < 6; depth++) {
-    if (e.message && !parts.includes(e.message)) parts.push(e.message);
-    e = e.cause;
-  }
-  return parts.join(' → ') || String(err);
-}
 
 /** Every typed classification along a failure's cause chain. */
 function failureTypes(err: unknown): string[] {
