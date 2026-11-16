@@ -24943,6 +24943,8 @@ function wireConnectionActions(root, organizationId, refresh, query) {
   }));
 }
 
+// Composio Instant (wiki features/service-connections § Paid tools).
+const INSTANT_TIP = 'Agents use paid tools (Exa, Tavily, Apollo, People Data Labs…) without anyone connecting an account: Composio pays from its wallet and each call is charged to the organization’s credit. First turn on Instant Toolkits in Composio’s dashboard and fund its wallet.';
 async function wireInstallationComposioCard() {
   const box = document.getElementById('installation-composio-card'); if (!box) return;
   try {
@@ -24952,8 +24954,15 @@ async function wireInstallationComposioCard() {
     box.innerHTML = config.canConfigure
       ? `<form data-composio-config class="setting-rows">${instRow(`API key ${policyTip(tip)}`,
         `<input class="setting-input" type="password" name="apiKey" placeholder="${config.configured ? 'Saved — paste to replace' : 'Composio project API key'}" autocomplete="new-password" required aria-label="Composio project API key">`,
-        '<button class="btn sm primary">Save key</button>')}</form>`
+        '<button class="btn sm primary">Save key</button>')}${config.configured ? instRow(`Paid tools ${policyTip(INSTANT_TIP)}`,
+        `<input class="toggle" type="checkbox" data-composio-instant ${config.instant ? 'checked' : ''} aria-label="Paid tools">`) : ''}</form>`
       : `<div class="setting-rows">${instRow(`API key ${policyTip(tip)}`, config.configured ? '<span class="chip done">Set</span>' : '<span class="chip">Not set up</span>')}</div>`;
+    box.querySelector('[data-composio-instant]')?.addEventListener('change', async (event) => {
+      const toggle = event.currentTarget; toggle.disabled = true;
+      try { await api('/api/connections/config', { method: 'PUT', body: JSON.stringify({ instant: toggle.checked }) }); }
+      catch (error) { toast(error.message, true); toggle.checked = !toggle.checked; }
+      toggle.disabled = false;
+    });
     box.querySelector('[data-composio-config]')?.addEventListener('submit', async event => {
       event.preventDefault();
       const form = event.currentTarget; const button = form.querySelector('button');

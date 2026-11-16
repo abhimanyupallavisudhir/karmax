@@ -7718,8 +7718,10 @@ export class Gateway {
         const actingPrincipal = callerTaskId ? `task:${callerTaskId}` : ownerId;
         try {
           if (p === '/api/connections/config') {
-            if (method === 'PUT') await service.configure(String(b.apiKey ?? ''));
-            if (method === 'GET' || method === 'PUT') return this.json(res, 200, { configured: await service.configured(), canConfigure: (await this.deps.tokens.check(token, 'settings:write')).ok });
+            if (method === 'PUT' && (b.apiKey !== undefined || b.instant === undefined)) await service.configure(String(b.apiKey ?? ''));
+            if (method === 'PUT' && b.instant !== undefined) await service.setInstant(b.instant === true);
+            if (method === 'GET' || method === 'PUT') return this.json(res, 200, { configured: await service.configured(), instant: await service.instantEnabled(),
+              canConfigure: (await this.deps.tokens.check(token, 'settings:write')).ok });
           }
           if (p === '/api/connections/catalog' && method === 'GET')
             return this.json(res, 200, await service.catalog(url.searchParams.get('search') ?? ''));
@@ -7758,6 +7760,9 @@ export class Gateway {
             if (c.status === 'requested' && c.taskId === task.id && !opened.has(c.id) && typeof api.routeConnectionRequest === 'function')
               await api.routeConnectionRequest(token, c).catch((error: unknown) =>
                 console.warn(`[autonomy] could not route connection request ${c.id} to the Avatār:`, error instanceof Error ? error.message : error));
+            // Paid through Composio Instant: usable now, nobody to ask.
+            if (c.status === 'active' && c.instant) return this.json(res, 200, { status: 'connected', connection: service.view(c),
+              detail: 'No account needed: Composio pays for each call and it is charged to your organization’s credit.' });
             return this.json(res, 200, { status: c.status === 'denied' || c.status === 'disconnected' ? 'denied' : 'needs_connection',
               connection: service.view(c), detail: 'A Connect button is available in this task’s Approval Requests. Continue independent work; the task resumes after sign-in.' });
           }
