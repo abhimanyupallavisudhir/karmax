@@ -51,7 +51,7 @@ const CONFIG_KEY = 'included-model:config';
 const MANAGEMENT_HANDLE = 'included-model:installation:openrouter:management-key';
 const keyRecord = (organizationId: string) => `included-model:key:${organizationId}`;
 const keyHandle = (organizationId: string) => `included-model:organization:${organizationId}:openrouter-key`;
-const apiBase = () => (process.env.KARMAX_OPENROUTER_API_URL ?? 'https://openrouter.ai/api/v1').replace(/\/$/, '');
+export const openRouterApiBase = () => (process.env.KARMAX_OPENROUTER_API_URL ?? 'https://openrouter.ai/api/v1').replace(/\/$/, '');
 
 export interface IncludedModelSettings {
   /** The OpenRouter model id, e.g. deepseek/deepseek-v4.1-flash-1017. */
@@ -124,7 +124,7 @@ let prices: { at: number; byId: Map<string, { prompt: number; completion: number
 
 async function openRouterPrices(now = Date.now()) {
   if (prices && now - prices.at < PRICES_TTL_MS) return prices.byId;
-  const response = await fetch(`${apiBase()}/models`, { signal: AbortSignal.timeout(10_000) });
+  const response = await fetch(`${openRouterApiBase()}/models`, { signal: AbortSignal.timeout(10_000) });
   if (!response.ok) throw new Error(`OpenRouter models: ${response.status}`);
   const byId = new Map<string, { prompt: number; completion: number; cache?: number }>();
   for (const model of ((await response.json()) as { data?: any[] }).data ?? []) {
@@ -159,7 +159,7 @@ export function resetIncludedModelPrices(): void { prices = undefined; }
 
 async function openRouter(broker: CredentialBroker, method: string, path: string, body?: unknown): Promise<any> {
   const key = await broker.resolve(MANAGEMENT_HANDLE, { caps: [`use-credential:${MANAGEMENT_HANDLE}`] });
-  const response = await fetch(`${apiBase()}${path}`, { method,
+  const response = await fetch(`${openRouterApiBase()}${path}`, { method,
     headers: { authorization: `Bearer ${key}`, ...(body ? { 'content-type': 'application/json' } : {}) },
     ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(20_000) });
   const text = await response.text();
