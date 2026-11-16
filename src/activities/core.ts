@@ -715,6 +715,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   /** What a running agent turn holds until it ends, however it ends. */
   const turnHolds = new AsyncLocalStorage<Array<() => void>>();
   const isRemote = (kind: WorldKind) => worlds.get(kind).capabilities?.remote === true;
+  // Whether an agent turn spends THIS host's memory and load. A cloud world
+  // (E2B, Daytona, a VM) runs the turn on its own machine on every rail: Claude,
+  // Codex and OpenCode start their harness there, on a login or an API key, and
+  // Claude's API-key rail is an HTTP loop in this worker whose tools run in the
+  // world. Only a world on this host (a worktree, a container) does. Host
+  // admission (slots, free memory, load) applies to exactly those turns
+  // (tavya-error 4b4c72ad37e1d771: hosted API-key turns waited on the control
+  // plane's memory, then escalated).
+  const turnRunsOnHost = (kind: WorldKind) => !isRemote(kind);
   /** For a Reviewer choosing between attempts: the other attempts, and how to
    * compare them without leaving its own conversation. */
   const siblingAttemptsContext = async (taskId: string): Promise<string> => {
@@ -2772,8 +2781,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return (await turnProfile(args.task, args.role)).profile.provider;
     },
 
-    /** Whether this turn consumes host model-process capacity. Remote subscription
-     * CLIs run inside their provider world; local turns and API rails run here. */
+    /** Whether this turn takes a slot of the agent queue: on hosted, every turn
+     * (the plan's entitlement); elsewhere, a turn that runs on this host. */
     async agentUsesHostCapacity(args: {
       role: AgentRole;
       task: TaskInput;
@@ -2788,25 +2797,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // request to an organization-scoped entitlement queue; private installs
       // retain the host-resource-only behavior below.
       if (store.hosted) return true;
-      if (!isRemote(args.worldHandle.kind)) return true;
-      if (args.accountCredentialKind === 'key') return true;
-      if (args.accountCredentialKind === 'login' || args.accountCredentialKind === 'ambient') return false;
-
-      // Replay compatibility for workflow histories recorded before credential
-      // metadata accompanied the lease. A broker handle is an API rail; a config
-      // home is a provider-hosted subscription rail.
-      if (args.accountApiKeyHandle && deps.broker) return true;
-      if (args.accountConfigHome) return false;
-
-      const profile = (await turnProfile(args.task, args.role)).profile;
-      const modelProvider = args.accountCredentialProvider
-        ? canonicalModelProvider(args.accountCredentialProvider)
-        : credentialProvider(profile);
-      return (
-        (profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY)
-        || (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY)
-        || (profile.provider === 'opencode' && !!process.env[apiKeyEnv(modelProvider)])
-      );
+      return turnRunsOnHost(args.worldHandle.kind);
     },
 
     /** The ordered, enabled credential keys for a turn's provider, per the credential
@@ -3939,10 +3930,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             costMicros: 0, fundingSource, costClassification: 'none', startedAt: Date.now(), endedAt: Date.now(),
             metadata: { ...usageMetadata, costBasis: 'request-count-only' } }));
         }
-        // Remote subscription CLIs consume provider-world CPU/RAM, not host
-        // capacity. API rails and local subprocesses retain the host admission
-        // queue; account-level concurrency is enforced separately for every rail.
-        if (!remoteSubscriptionRail) {
+        // Only a turn running on this host waits for its capacity (turnRunsOnHost);
+        // account-level concurrency is enforced separately for every rail.
+        if (turnRunsOnHost(args.worldHandle.kind)) {
           (await publishLegacyAgentState('waiting-slot'));
           // Current workflows carry a stable turn id, so the activity enrolls that
           // turn in the durable/reorderable coordinator before starting the model.
