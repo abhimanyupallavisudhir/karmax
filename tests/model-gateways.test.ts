@@ -289,7 +289,7 @@ describe('the proxy', () => {
       costMicros: 2_500_000, startedAt: Date.now() - 1000, endedAt: Date.now(), fundingSource: 'managed' });
     const spent = await f.call({ model: 'claude-opus-5-5' });
     expect(spent.status).toBe(402);
-    expect((await spent.json()).error.message).toMatch(/^Out of compute/);
+    expect(((await spent.json()) as any).error.message).toMatch(/^Out of compute/);
     await revokeGatewayToken(f.store, f.token);
     expect((await f.call({ model: 'claude-opus-5-5' })).status).toBe(401);
     expect(upstreamCalls).toHaveLength(0);

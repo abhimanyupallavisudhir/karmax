@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from 'vitest';
-import { Context } from '@temporalio/activity';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { ProviderFailure } from '../src/agent/limits.js';

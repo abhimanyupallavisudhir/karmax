@@ -49,7 +49,7 @@ export function catalogueModelId(model: string | undefined): string | undefined 
   if (id.includes('/')) return id;
   const alias = id === 'default' ? 'opus' : id;
   if (/^(opus|sonnet|haiku|fable)$/.test(alias)) return `~anthropic/claude-${alias}-latest`;
-  if (/^claude-/.test(id)) return `anthropic/${id.replace(/-\d{8}$/, '').replace(/-(\d+)-(\d+)$/, '-$1.$2')}`;
+  if (id.startsWith('claude-')) return `anthropic/${id.replace(/-\d{8}$/, '').replace(/-(\d+)-(\d+)$/, '-$1.$2')}`;
   if (/^(gpt-|o\d|codex-)/.test(id)) return `openai/${id}`;
   return undefined;
 }

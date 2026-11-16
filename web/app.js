@@ -27580,7 +27580,7 @@ function openModelGatewayDialog(gateway, onSaved) {
       <label class="form-row"><span>API key</span><input class="gateway-key" type="password" autocomplete="off" placeholder="${gateway?.keyConfigured ? 'Saved · leave blank to keep' : 'Key the gateway accepts'}"></label>
       <label class="form-row"><span>Models ${policyTip('As Claude Code or Codex names them, comma-separated')}</span>
         <input class="gateway-models" value="${esc((gateway?.models || []).join(', '))}" placeholder="claude-opus-5-5, claude-haiku-5-5, gpt-6.1-sol"></label>
-      <label class="form-row"><span>Price ${policyTip('× each model’s API list price; organizations pay this × their compute markup')}</span>
+      <label class="form-row"><span>Price × list ${policyTip('× each model’s API list price; organizations pay this × their compute markup')}</span>
         <input class="gateway-price" type="number" min="0.01" max="100" step="0.01" value="${esc(String(gateway?.priceMultiplier ?? 1))}"></label>
       <label class="switch"><input class="toggle gateway-enabled" type="checkbox" ${gateway?.enabled ? 'checked' : ''}>Offer to organizations</label></div>
     <div class="modal-actions">${gateway ? '<button class="btn danger gateway-delete" type="button">Delete</button>' : ''}<span class="label-row-fill"></span><button class="btn gateway-cancel" type="button">Cancel</button><button class="btn primary gateway-save" type="button">Save</button></div></div>`;
