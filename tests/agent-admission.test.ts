@@ -414,6 +414,54 @@ describe('agent turn admission', () => {
     await world.destroy();
   });
 
+  // tavya-error 4b4c72ad37e1d771 (2026-11-16): a hosted task's Do turn on an
+  // API key escalated after five infrastructure waits as "host still under low
+  // free memory". Its world was a cloud sandbox: the harness runs there (and
+  // Claude's Messages API is an HTTP loop in this worker), so the control
+  // plane's free memory says nothing about whether the turn can start.
+  it.each([
+    ['a cloud world', 'fake-remote', true],
+    ['a world on this host', 'memory', false],
+  ])('gates an API-key turn on host memory only in %s', async (_label, kind, runs) => {
+    vi.stubEnv('ANTHROPIC_API_KEY', 'fake-key');
+    vi.stubEnv('KARMAX_AGENT_MIN_FREE_MB', String(1024 * 1024 * 1024)); // never "enough"
+    vi.stubEnv('KARMAX_AGENT_MEM_WAIT_MS', '40');
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Host memory');
+    const task = await store.createTask({ projectId: project.id, title: 'Work', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'work' } as any });
+    const worlds = new WorldRegistry();
+    const memory = worlds.get('memory');
+    worlds.register({ kind: 'fake-remote', capabilities: { remote: true },
+      create: (spec: any) => memory.create(spec), open: (handle: any) => memory.open(handle),
+      async destroy() {} } as any);
+    const local = await worlds.create('memory', { taskId: task.id, base: 'main' });
+    const world = await worlds.open({ ...local.handle, kind: kind as any });
+    const runTurn = vi.fn(async () => ({ termination: { kind: 'success', status: 'end_turn' }, output: 'done' }));
+    const core = makeCoreActivities({ store, worlds,
+      adapters: new Map([['claude', { provider: 'claude', runTurn }]]) as any,
+      profiles: new ProfileResolver(store, 'claude') });
+    try {
+      const turn = core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: `${task.id}#0`,
+        agentSlotGranted: true, agentAdmissionManaged: true, worldHandle: world.handle,
+        messages: [{ id: 'm0', role: 'user', text: 'work', ts: 0 }],
+        task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {},
+          workflow: 'just-do', agents: { do: { provider: 'claude', model: 'test' } } },
+      } as any);
+      if (runs) {
+        await expect(turn).resolves.toMatchObject({ output: 'done' });
+        expect(runTurn).toHaveBeenCalledTimes(1);
+      } else {
+        await expect(turn).rejects.toMatchObject({ type: 'agent-infra', nonRetryable: false,
+          message: expect.stringContaining('low free memory') });
+        expect(runTurn).not.toHaveBeenCalled();
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      await local.destroy(); await store.close();
+    }
+  });
+
   it('classifies a remote sandbox reconnect timeout as retryable infrastructure', async () => {
     const store = (await Store.create(':memory:'));
     const worlds = new WorldRegistry();

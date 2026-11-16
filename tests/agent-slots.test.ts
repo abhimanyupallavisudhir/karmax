@@ -99,6 +99,44 @@ describe('admissionDecision (memory-gate decision — karmax#4)', () => {
     expect(slots.tighterFreeMb(100, 500)).toBe(100); // host is the tighter constraint
   });
 
+  // tavya-error 4b4c72ad37e1d771: tavya.io's app container (7168 MiB cap) read
+  // memory.max − memory.current = 500 MiB, "low free memory", while it held
+  // 1481 MiB of anonymous memory and 4341 MiB of inactive page cache the kernel
+  // reclaims on demand. Headroom counts that cache as free, as the kubelet's
+  // working set (usage − inactive_file) does.
+  it.each([
+    ['v2', { 'memory.max': '7516192768', 'memory.current': '6992392192',
+      'memory.stat': 'anon 1552715776\nfile 5329289216\nactive_file 777740288\ninactive_file 4551548928\n' }],
+    ['v1', { 'memory/memory.limit_in_bytes': '7516192768', 'memory/memory.usage_in_bytes': '6992392192',
+      'memory/memory.stat': 'cache 5329289216\ninactive_file 1\ntotal_inactive_file 4551548928\n' }],
+  ])('counts reclaimable page cache as free in a cgroup %s container', (_version, files) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-cgroup-'));
+    try {
+      for (const [name, body] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(root, name)), { recursive: true });
+        fs.writeFileSync(path.join(root, name), body);
+      }
+      const free = slots.cgroupFreeMb(root, 16 * 1024 ** 3)!;
+      expect(Math.round(free)).toBe(Math.round((7516192768 - 6992392192 + 4551548928) / 1024 ** 2)); // 4841 MiB
+      expect(slots.admissionDecision({ freeMemMb: free, loadavg1: 0, cores: 8 },
+        { minFreeMb: 512, maxLoadFactor: 1 }).memoryTight).toBe(false);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('reads no cgroup headroom without a limit below host RAM, and only limit − usage without memory.stat', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-cgroup-'));
+    try {
+      expect(slots.cgroupFreeMb(root, 16 * 1024 ** 3)).toBeUndefined(); // not in a cgroup
+      fs.writeFileSync(path.join(root, 'memory.max'), 'max\n');
+      fs.writeFileSync(path.join(root, 'memory.current'), String(1024 ** 3));
+      expect(slots.cgroupFreeMb(root, 16 * 1024 ** 3)).toBeUndefined(); // unlimited
+      fs.writeFileSync(path.join(root, 'memory.max'), String(32 * 1024 ** 3));
+      expect(slots.cgroupFreeMb(root, 16 * 1024 ** 3)).toBeUndefined(); // above host RAM
+      fs.writeFileSync(path.join(root, 'memory.max'), String(2 * 1024 ** 3));
+      expect(slots.cgroupFreeMb(root, 16 * 1024 ** 3)).toBe(1024); // no memory.stat: conservative
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('backs off with a retryable error when memory stays tight past the wait deadline', async () => {
     const prevMin = process.env.KARMAX_AGENT_MIN_FREE_MB;
     const prevWait = process.env.KARMAX_AGENT_MEM_WAIT_MS;
