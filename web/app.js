@@ -27312,6 +27312,7 @@ function limitAmount(value, unit, compact = false) {
   if (!Number.isFinite(n)) return '—';
   if (unit === 'bytes') return formatBytes(n);
   if (unit === 'hours') return `${n.toLocaleString('en-US', { maximumFractionDigits: 1 })} h`;
+  if (unit === 'usd') return `$${n.toLocaleString('en-US', compact && n >= 10_000 ? { notation: 'compact', maximumFractionDigits: 1 } : { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   return compact && n >= 100_000
     ? n.toLocaleString('en-US', { notation: 'compact', maximumFractionDigits: 1 })
     : n.toLocaleString('en-US', { maximumFractionDigits: 1 });

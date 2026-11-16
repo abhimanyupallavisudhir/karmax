@@ -51,7 +51,9 @@ export const INCLUDED_MODEL_OPTIONS = { provider: { zdr: true, quantizations: ['
 export const INCLUDED_MODEL_MIN_MICROS = 50_000;
 
 const CONFIG_KEY = 'included-model:config';
-const MANAGEMENT_HANDLE = 'included-model:installation:openrouter:management-key';
+/** The installation's OpenRouter management key (also read by Service limits for the account's balance). */
+export const INCLUDED_MODEL_MANAGEMENT_HANDLE = 'included-model:installation:openrouter:management-key';
+const MANAGEMENT_HANDLE = INCLUDED_MODEL_MANAGEMENT_HANDLE;
 const keyRecord = (organizationId: string) => `included-model:key:${organizationId}`;
 const keyHandle = (organizationId: string) => `included-model:organization:${organizationId}:openrouter-key`;
 

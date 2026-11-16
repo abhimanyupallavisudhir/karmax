@@ -28,8 +28,9 @@ import crypto from 'node:crypto';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ConfigHomeManager } from '../autonomy/config-homes.js';
 import type { Store } from '../store/db.js';
-import { INCLUDED_MODEL_DEFAULT, INCLUDED_MODEL_OPTIONS, includedModel, includedModelKey, openRouterApiBase, syncIncludedModelUsage } from './included-model.js';
-import { holdGeneration, outOfCompute } from '../world/managed-compute.js';
+import { INCLUDED_MODEL_DEFAULT, INCLUDED_MODEL_MIN_MICROS, INCLUDED_MODEL_OPTIONS, includedModel, includedModelKey, openRouterApiBase, syncIncludedModelUsage } from './included-model.js';
+import { computeCredit, holdGeneration, outOfCompute } from '../world/managed-compute.js';
+import { BRAND } from '../domain/brand.js';
 import { quote, type Quote } from './generation-price.js';
 
 export const GENERATION_KINDS = ['text', 'image', 'video', 'speech'] as const;
@@ -214,7 +215,15 @@ async function failure(deps: GenerationDeps, organizationId: string, funding: Ge
   const text = await response.text().catch(() => '');
   let message = text.slice(0, 500);
   try { message = String((JSON.parse(text) as { error?: { message?: string } })?.error?.message ?? message); } catch { /* plain text */ }
-  if (response.status === 402 && funding === 'credit') return outOfCompute(deps.store, organizationId, 'openrouter');
+  if (response.status === 402 && funding === 'credit') {
+    // Refused for money although the organization's credit is there: what ran
+    // out is tavya's own OpenRouter balance (Service limits warns the operator
+    // at 80% and 95% of it), not the customer's.
+    const credit = await computeCredit(deps.store, organizationId).catch(() => undefined);
+    if (credit?.availableMicros != null && credit.availableMicros < INCLUDED_MODEL_MIN_MICROS) return outOfCompute(deps.store, organizationId, 'openrouter');
+    return new GenerationUnavailable(`${BRAND}'s OpenRouter balance has run out, not your credit: nothing was charged. `
+      + 'Try again once the operator has topped it up, or connect your own OpenRouter API key in Settings → Agent logins.');
+  }
   if (response.status >= 400 && response.status < 500) return new GenerationRequestError(`OpenRouter: ${message || response.statusText}`, response.status === 404 ? 404 : 400);
   return new Error(`OpenRouter failed (${response.status}): ${message}`);
 }

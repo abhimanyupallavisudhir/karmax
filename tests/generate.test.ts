@@ -218,10 +218,14 @@ describe('media generation', () => {
     const broke = await fixture({ credit: false });
     await expect(generateMedia(broke.deps, broke.organization.id, { kind: 'image', prompt: 'x' })).rejects.toBeInstanceOf(ComputeCreditExhausted);
     expect(mediaCalls()).toHaveLength(0);
-    // The key's limit (which follows the credit) refuses mid-way: OpenRouter's 402.
+    // OpenRouter refuses for money while the organization's credit is there:
+    // tavya's own OpenRouter balance ran out, not the customer's credit.
     const f = await fixture();
-    refuse = { status: 402, message: 'Key limit exceeded' };
-    await expect(generateMedia(f.deps, f.organization.id, { kind: 'image', prompt: 'x' })).rejects.toBeInstanceOf(ComputeCreditExhausted);
+    refuse = { status: 402, message: 'Insufficient credits' };
+    const refused = await generateMedia(f.deps, f.organization.id, { kind: 'image', prompt: 'x' }).catch((error) => error);
+    expect(refused).toBeInstanceOf(MediaUnavailable);
+    expect(refused.message).toMatch(/OpenRouter balance has run out, not your credit: nothing was charged/);
+    expect((await computeCredit(f.store, f.organization.id)).heldMicros).toBe(0);
     refuse = { status: 400, message: 'duration must be one of 4, 5' };
     await expect(generateMedia(f.deps, f.organization.id, { kind: 'video', prompt: 'x', duration: 9 }))
       .rejects.toThrow(/OpenRouter: duration must be one of 4, 5/);
