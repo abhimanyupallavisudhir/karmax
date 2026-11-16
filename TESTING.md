@@ -84,7 +84,7 @@ shard and `deploy artifacts` pass. To reproduce a failing shard, run the same
 slice locally:
 
 ```bash
-npx vitest run --shard=2/8
+npx vitest run --shard=2/9
 ```
 
 A few files take minutes while most take under a second, so shards are
