@@ -138,6 +138,8 @@ import { defaultAgentProfile, projectReadiness, usableAgentCredentials, type Rea
 import { reportError } from '../platform/error-reports.js';
 import { errorReportSettings, saveErrorReportSettings } from '../platform/error-fixer.js';
 import { includedModel, includedModelView, removeIncludedModelKey, saveIncludedModel } from '../agent/included-model.js';
+import { deleteModelGateway, GATEWAY_PROXY_PATH, modelGatewaysView, saveModelGateway } from '../agent/model-gateways.js';
+import { proxyModelGateway } from './model-gateway-proxy.js';
 import type { Effort } from '../agent/effort.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems, itemHandle, relatedVaultItems, searchVaultItems, weakensProtection } from '../autonomy/vault-items.js';
@@ -369,6 +371,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The agent-mail inbound webhook authenticates with its own shared secret
   // (like the GitHub webhook), so it needs no capability.
   if (p === '/api/agent-mail/ingest') return 'none';
+  // A model gateway's proxy authenticates each request with its turn's token.
+  if (p === '/api/model-gateway' || p.startsWith('/api/model-gateway/')) return 'none';
   // Incoming webhooks authenticate each delivery with the hook's own secret.
   if (/^\/api\/hooks\/[^/]+$/.test(p)) return 'none';
   if (p === '/api/payments/stripe/callback' || p === '/api/payments/stripe/webhook') return 'none';
@@ -2179,6 +2183,12 @@ export class Gateway {
         return this.fail(res, error, req);
       }
     }
+    // A model gateway's proxy (wiki features/model-gateways): an agent's harness
+    // sends model requests with a token good for its turn, not a session.
+    if (p === GATEWAY_PROXY_PATH || p.startsWith(`${GATEWAY_PROXY_PATH}/`)) {
+      try { return await proxyModelGateway({ store: this.deps.store, broker: this.deps.broker }, req, res, (req.url ?? p).slice(GATEWAY_PROXY_PATH.length)); }
+      catch (error) { return this.fail(res, error, req); }
+    }
     // Agent mailbox inbound webhook (wiki plans/PLAN-passwords §8): authenticated by a
     // configured shared secret, not a karmax session — so it sits with the other
     // unauthenticated endpoints, before the session gate.
@@ -2936,6 +2946,42 @@ export class Gateway {
             { ...saved, keyChanged: Boolean(b.managementKey), ...identityAuditDetail(callerIdentity) });
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         return this.json(res, 200, { settings: await includedModelView(store, this.deps.broker, computeMonth(Date.now())) });
+      }
+      // Model gateways (wiki features/model-gateways): Anthropic- or
+      // OpenAI-compatible endpoints the operator adds, which run Claude Code and
+      // Codex on organizations' compute credit; each off until turned on. GET
+      // lists them with this month's use; POST adds one, PUT …/:id changes it,
+      // DELETE …/:id removes it (the key write-only).
+      const modelGatewayRoute = p.match(/^\/api\/settings\/model-gateways(?:\/([A-Za-z0-9_-]+))?$/);
+      if (modelGatewayRoute) {
+        if (!this.deps.broker) return this.json(res, 503, { error: 'the vault is unavailable' });
+        const id = modelGatewayRoute[1];
+        const view = async () => modelGatewaysView(store, this.deps.broker!, computeMonth(Date.now()));
+        if (!id && method === 'GET') return this.json(res, 200, { gateways: await view() });
+        if (id && method === 'DELETE') {
+          if (!(await deleteModelGateway(store, this.deps.broker, id))) return this.json(res, 404, { error: `no model gateway ${id}` });
+          this.modelCatalog.invalidate();
+          await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'model-gateway.delete', `installation:model-gateway:${id}`,
+            { ...identityAuditDetail(callerIdentity) });
+          return this.json(res, 200, { gateways: await view() });
+        }
+        if ((!id && method !== 'POST') || (id && method !== 'PUT')) return this.json(res, 405, { error: 'method not allowed' });
+        const b = await this.body(req);
+        let saved;
+        try {
+          saved = await saveModelGateway(store, this.deps.broker, id, {
+            ...(b.name !== undefined ? { name: String(b.name) } : {}),
+            ...(b.harnesses !== undefined ? { harnesses: Array.isArray(b.harnesses) ? b.harnesses.map(String) as any : [] } : {}),
+            ...(b.baseUrl !== undefined ? { baseUrl: String(b.baseUrl) } : {}),
+            ...(b.models !== undefined ? { models: Array.isArray(b.models) ? b.models.map(String) : String(b.models).split(/[\s,]+/) } : {}),
+            ...(b.priceMultiplier !== undefined ? { priceMultiplier: Number(b.priceMultiplier) } : {}),
+            ...(b.enabled !== undefined ? { enabled: b.enabled === true } : {}),
+            ...(b.apiKey ? { apiKey: String(b.apiKey) } : {}) });
+        } catch (error) { return this.json(res, (error as any)?.status ?? 400, { error: error instanceof Error ? error.message : String(error) }); }
+        this.modelCatalog.invalidate();
+        await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'model-gateway.save', `installation:model-gateway:${saved.id}`,
+          { ...saved, keyChanged: Boolean(b.apiKey), ...identityAuditDetail(callerIdentity) });
+        return this.json(res, id ? 200 : 201, { gateway: saved, gateways: await view() });
       }
       // Managed compute (wiki features/managed-compute): the installation's
       // own provider accounts, which organizations without their own use and
@@ -4030,22 +4076,12 @@ export class Gateway {
           const b = await this.body(req);
           const policy = b.policy && typeof b.policy === 'object' ? b.policy : {};
           const currentPolicy = (await store.getOrganizationUsagePolicy(organizationId));
-          const normalizedManagedProviders = (value: unknown): string[] | undefined => Array.isArray(value)
-            ? [...new Set(value.map((provider) => String(provider).trim()).filter(Boolean))].sort()
-            : undefined;
-          const requestedManagedProviders = normalizedManagedProviders((policy as any).managedModelProviders);
-          const managedProvidersChanged = Object.prototype.hasOwnProperty.call(policy, 'managedModelProviders')
-            && (requestedManagedProviders == null || JSON.stringify(requestedManagedProviders)
-              !== JSON.stringify(normalizedManagedProviders(currentPolicy.managedModelProviders)));
-          const ownerOnlyChange = ([
-            ['managedSpendCapMicros', currentPolicy.managedSpendCapMicros ?? null],
-            ['maxActiveAgentTurns', currentPolicy.maxActiveAgentTurns ?? null],
-          ] as const).some(([key, current]) => Object.prototype.hasOwnProperty.call(policy, key)
-            && (policy as any)[key] !== current) || managedProvidersChanged;
+          const ownerOnlyChange = Object.prototype.hasOwnProperty.call(policy, 'maxActiveAgentTurns')
+            && (policy as any).maxActiveAgentTurns !== (currentPolicy.maxActiveAgentTurns ?? null);
           if (ownerOnlyChange) {
             const subject = requireHumanSubject(callerIdentity);
             if ((await store.organizationMembership(organizationId, subject.userId))?.role !== 'owner')
-              return this.json(res, 403, { error: 'only an organization owner can change managed funding or agent concurrency guardrails' });
+              return this.json(res, 403, { error: 'only an organization owner can change agent concurrency guardrails' });
           }
           try { return this.json(res, 200, (await store.setOrganizationUsagePolicy(organizationId, policy))); }
           catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }

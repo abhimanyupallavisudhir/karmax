@@ -225,6 +225,8 @@ describe('platform catalog covers the gateway route table', () => {
     /\/(oauth\/)?callback$/,
     // Host TLS bootstrap for port previews; not part of the tenant API.
     /^\/api\/tls\//,
+    // A model gateway's proxy: an agent harness's model requests, by a turn's token.
+    /^\/api\/model-gateway$/,
   ];
 
   /**

@@ -141,6 +141,13 @@ export interface TurnInput {
     /** OpenCode options for the model on this key: the provider routing tavya's
      *  included model requires (wiki features/included-model). */
     modelOptions?: Record<string, unknown>;
+    /** Claude Code or Codex through a model gateway (wiki features/model-gateways):
+     *  the harness's model requests go to `baseUrl` with `apiKey` — OpenRouter's
+     *  endpoint and the organization's key, or tavya's proxy and a token for
+     *  this turn — for `model` as the gateway names it; `env` adds the harness's
+     *  own settings (Claude Code's model aliases). `configHome` is then a home
+     *  with no login in it. */
+    gateway?: import('./model-gateways.js').GatewayAuth;
   };
   /** Extra env for the agent subprocess, resolved JIT (never journaled) — e.g. the
    *  git profile's GIT_SSH_COMMAND / GH_TOKEN (wiki plans/PLAN-git-config §4B), so an agent

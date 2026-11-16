@@ -9891,13 +9891,14 @@ function readinessGaps(readiness, projectId) {
     const need = agent.need || { provider: agent.provider };
     needs.set(`${need.provider}:${need.off || ''}`, need);
   }
-  // A model on the compute credit (any OpenRouter model, with no login or key
-  // of the organization's own) that costs much more than the included one.
+  // A model on the compute credit (any OpenRouter model, or Claude/Codex
+  // through a model gateway, with no login or key of the organization's own)
+  // that costs much more than the included one.
   const plan0 = `${settings}#settings-plan`;
   for (const agent of (readiness.agents || []).filter((a) => a.ready && a.cost >= 1.5)) {
     const times = agent.cost >= 10 ? Math.round(agent.cost) : Math.round(agent.cost * 10) / 10;
     gaps.push({ label: `costs ${times}× the included model`, href: plan0, warn: true, lead: 'On your credit:',
-      tip: `${agent.model.replace(/^openrouter\//, '')} runs on your compute credit at about ${times} times what a task on the included model costs. With your own login or API key, its provider bills you instead.` });
+      tip: `${agent.model.replace(/^openrouter\//, '')} runs on your compute credit${agent.gateway ? ` through ${agent.gateway}` : ''} at about ${times} times what a task on the included model costs. With your own login or API key, its provider bills you instead.` });
   }
   for (const need of needs.values()) {
     const name = ACCOUNT_PROVIDER_LABELS[need.provider] || need.provider;
@@ -9930,7 +9931,7 @@ function readinessGaps(readiness, projectId) {
 // default (wiki features/included-model § Default); say so, and how to get more.
 function basicModelNoteHtml(readiness) {
   if (!readiness || readiness.agentLogin || !(readiness.agents || []).some((agent) => agent.included)) return '';
-  return `Default basic model. To use Claude or GPT, <a data-spa href="${esc(globalRoute('organization'))}#settings-agents" title="Add a Claude or ChatGPT login, or an API key">connect your logins</a>.`;
+  return `Default basic model. Claude and GPT run on your credit too, or <a data-spa href="${esc(globalRoute('organization'))}#settings-agents" title="Add a Claude or ChatGPT login, or an API key">on your own logins</a>.`;
 }
 function readinessNoticeHtml(gaps) {
   if (!gaps.length) return '';
@@ -14641,6 +14642,8 @@ const SETTINGS_TARGETS = [
   ['PUT', /^\/api\/settings\/project\/([^/]+)\/[^/]+$/, (m) => `${formProjectName(m[1])} task defaults`],
   ['PUT', /^\/api\/settings\/managed-compute\/([^/]+)$/, (m) => `Managed compute · ${formProviderName(m[1])}`, true],
   ['PUT', /^\/api\/settings\/included-model$/, () => 'Managed compute · Included model', true],
+  ['POST', /^\/api\/settings\/model-gateways$/, () => 'Managed compute · Model gateways', true],
+  ['PUT', /^\/api\/settings\/model-gateways\/[^/]+$/, () => 'Managed compute · Model gateways', true],
   ['PUT', /^\/api\/settings\/[\w/-]+$/, () => 'Installation settings'],
   ['PATCH', /^\/api\/organizations\/([^/]+)$/, (m) => `${formOrganizationName(m[1])} settings`],
   ['POST', /^\/api\/organizations\/([^/]+)\/accounts$/, (m) => `${formOrganizationName(m[1])} agent accounts`, true],
@@ -27543,6 +27546,74 @@ function openIncludedModelDialog(settings, onSaved) {
   document.body.appendChild(overlay);
   overlay.querySelector(settings?.keyConfigured ? '.included-model-id' : '.included-key').focus();
 }
+// Model gateways (wiki features/model-gateways): Anthropic- or OpenAI-compatible
+// endpoints the operator adds, which run Claude Code and Codex on the compute
+// credit; each off until switched on here.
+const GATEWAY_HARNESS_LABELS = { claude: 'Claude Code', codex: 'Codex' };
+function modelGatewaysRows(gateways) {
+  const money = (micros) => `$${(Number(micros || 0) / 1e6).toFixed(2)}`;
+  const row = (gateway) => `<div class="computer-provider model-gateway" data-gateway="${esc(gateway.id)}">
+    <input class="toggle model-gateway-enabled" type="checkbox" ${gateway.enabled ? 'checked' : ''} aria-label="${esc(`Offer ${gateway.name}`)}" title="${gateway.enabled ? 'On' : 'Off'}">
+    <b>${esc(gateway.name)}</b>
+    <span class="setting-muted" title="${esc(gateway.models.join(', '))}">${esc(gateway.harnesses.map((harness) => GATEWAY_HARNESS_LABELS[harness] || harness).join(' · '))} · ${esc(String(gateway.priceMultiplier))}× list</span>
+    ${gateway.keyConfigured ? '' : '<span class="chip failed">No key</span>'}
+    ${gateway.unpriced?.length ? `<span class="chip" title="${esc(`No API list price, so not used for: ${gateway.unpriced.join(', ')}`)}">${gateway.unpriced.length} unpriced</span>` : ''}
+    <span class="setting-muted managed-month" title="This month: the gateway’s price, then what organizations were charged.">${money(gateway.costMicros)} → ${money(gateway.chargedMicros)}</span>
+    <span class="label-row-fill"></span>
+    <button class="icon-btn model-gateway-edit" type="button" title="${esc(`Edit ${gateway.name}`)}" aria-label="${esc(`Edit ${gateway.name}`)}">✎</button></div>`;
+  return `<div class="computer-providers model-gateways"><div class="computer-provider"><b>Model gateways</b>
+    ${policyTip('Run Claude Code and Codex on organizations’ credit when they have no login of their own, cheapest first. You answer for each gateway’s terms; prompts, code and any secrets in them pass through it.')}
+    <span class="label-row-fill"></span><button class="btn sm model-gateway-add" type="button">Add</button></div>
+    ${(gateways || []).map(row).join('')}</div>`;
+}
+function openModelGatewayDialog(gateway, onSaved) {
+  const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
+  const harnesses = gateway?.harnesses || ['claude'];
+  overlay.innerHTML = `<div class="modal-card computer-dialog" role="dialog" aria-modal="true" aria-label="Model gateway">
+    <div class="modal-head"><b>${gateway ? esc(gateway.name) : 'Add model gateway'}</b>${policyTip('You answer for this gateway’s terms. Prompts, code and any secrets in them pass through it.')}<span class="label-row-fill"></span><button class="icon-btn gateway-close" type="button" aria-label="Close">×</button></div>
+    <div class="settings-grid">
+      <label class="form-row"><span>Name</span><input class="gateway-name" value="${esc(gateway?.name || '')}" placeholder="Company LiteLLM"></label>
+      <div class="form-row"><span>Serves</span><span>${Object.entries(GATEWAY_HARNESS_LABELS).map(([id, label]) =>
+        `<label class="switch"><input type="checkbox" class="gateway-harness" value="${id}" ${harnesses.includes(id) ? 'checked' : ''}>${esc(label)}</label>`).join(' ')}</span></div>
+      <label class="form-row"><span>Base URL ${policyTip('The address before /v1: Claude Code calls …/v1/messages, Codex …/v1/responses')}</span>
+        <input class="gateway-url" value="${esc(gateway?.baseUrl || '')}" placeholder="https://litellm.example.com"></label>
+      <label class="form-row"><span>API key</span><input class="gateway-key" type="password" autocomplete="off" placeholder="${gateway?.keyConfigured ? 'Saved · leave blank to keep' : 'Key the gateway accepts'}"></label>
+      <label class="form-row"><span>Models ${policyTip('As Claude Code or Codex names them, comma-separated')}</span>
+        <input class="gateway-models" value="${esc((gateway?.models || []).join(', '))}" placeholder="claude-opus-5-5, claude-haiku-5-5, gpt-6.1-sol"></label>
+      <label class="form-row"><span>Price × list ${policyTip('× each model’s API list price; organizations pay this × their compute markup')}</span>
+        <input class="gateway-price" type="number" min="0.01" max="100" step="0.01" value="${esc(String(gateway?.priceMultiplier ?? 1))}"></label>
+      <label class="switch"><input class="toggle gateway-enabled" type="checkbox" ${gateway?.enabled ? 'checked' : ''}>Offer to organizations</label></div>
+    <div class="modal-actions">${gateway ? '<button class="btn danger gateway-delete" type="button">Delete</button>' : ''}<span class="label-row-fill"></span><button class="btn gateway-cancel" type="button">Cancel</button><button class="btn primary gateway-save" type="button">Save</button></div></div>`;
+  const close = () => { document.removeEventListener('keydown', keydown); overlay.remove(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  overlay.querySelector('.gateway-close').addEventListener('click', close);
+  overlay.querySelector('.gateway-cancel').addEventListener('click', close);
+  overlay.querySelector('.gateway-delete')?.addEventListener('click', async (event) => {
+    if (!confirm(`Delete ${gateway.name} and its key?`)) return;
+    event.currentTarget.disabled = true;
+    try { await api(`/api/settings/model-gateways/${encodeURIComponent(gateway.id)}`, { method: 'DELETE' }); }
+    catch (error) { toast(error.message, true); event.currentTarget.disabled = false; return; }
+    close(); toast('Model gateway deleted'); onSaved?.();
+  });
+  overlay.querySelector('.gateway-save').addEventListener('click', async (event) => {
+    const button = event.currentTarget; button.disabled = true;
+    const apiKey = overlay.querySelector('.gateway-key').value.trim();
+    const body = { name: overlay.querySelector('.gateway-name').value.trim(), baseUrl: overlay.querySelector('.gateway-url').value.trim(),
+      harnesses: [...overlay.querySelectorAll('.gateway-harness:checked')].map((box) => box.value),
+      models: overlay.querySelector('.gateway-models').value.split(/[\s,]+/).filter(Boolean),
+      priceMultiplier: Number(overlay.querySelector('.gateway-price').value), enabled: overlay.querySelector('.gateway-enabled').checked,
+      ...(apiKey ? { apiKey } : {}) };
+    try {
+      await api(gateway ? `/api/settings/model-gateways/${encodeURIComponent(gateway.id)}` : '/api/settings/model-gateways',
+        { method: gateway ? 'PUT' : 'POST', body: JSON.stringify(body) });
+    } catch (error) { toast(error.message, true); button.disabled = false; return; }
+    close(); toast('Model gateway saved'); onSaved?.();
+  });
+  document.addEventListener('keydown', keydown);
+  document.body.appendChild(overlay);
+  overlay.querySelector('.gateway-name').focus();
+}
 /** "3 of 50 running · 6 of 24 CPU · 400 of 1,024 GB · 2 waiting": what is in use against the account's budget, and its queue. */
 function managedRunning(account) {
   const pool = account.limits?.pool || {};
@@ -27557,10 +27628,23 @@ async function wireManagedComputeCard() {
   try { view = await api('/api/settings/managed-compute'); }
   catch (error) { if (card.isConnected) paneError(card, error, () => wireManagedComputeCard()); return; }
   // The included model shares the compute credit: its row sits beside the computers.
-  const included = await api('/api/settings/included-model').then((value) => value.settings, () => undefined);
+  const [included, gateways] = await Promise.all([
+    api('/api/settings/included-model').then((value) => value.settings, () => undefined),
+    api('/api/settings/model-gateways').then((value) => value.gateways || [], () => undefined)]);
   if (!card.isConnected) return;
-  card.innerHTML = managedComputeMarkup(view, includedModelRow(included));
+  card.innerHTML = managedComputeMarkup(view, includedModelRow(included) + (gateways ? modelGatewaysRows(gateways) : ''));
   card.querySelector('.included-model-edit')?.addEventListener('click', () => openIncludedModelDialog(included, wireManagedComputeCard));
+  card.querySelector('.model-gateway-add')?.addEventListener('click', () => openModelGatewayDialog(null, wireManagedComputeCard));
+  card.querySelectorAll('.model-gateway[data-gateway]').forEach((row) => {
+    const gateway = gateways.find((candidate) => candidate.id === row.dataset.gateway);
+    row.querySelector('.model-gateway-edit')?.addEventListener('click', () => openModelGatewayDialog(gateway, wireManagedComputeCard));
+    row.querySelector('.model-gateway-enabled')?.addEventListener('change', async (event) => {
+      const box = event.currentTarget; box.disabled = true;
+      try { await api(`/api/settings/model-gateways/${encodeURIComponent(gateway.id)}`, { method: 'PUT', body: JSON.stringify({ enabled: box.checked }) }); }
+      catch (error) { toast(error.message, true); box.checked = !box.checked; }
+      box.disabled = false; box.title = box.checked ? 'On' : 'Off';
+    });
+  });
   card.querySelectorAll('.computer-provider[data-provider]').forEach((row) => {
     const provider = row.dataset.provider;
     const account = (view.providers || []).find((candidate) => candidate.provider === provider);

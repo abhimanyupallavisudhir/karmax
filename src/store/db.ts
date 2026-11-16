@@ -1932,7 +1932,6 @@ export class Store {
     if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
     const planLimit = (await this.organizationEntitlements(organizationId)).maxActiveAgentRuns ?? 10_000;
     const fallback: Omit<OrganizationUsagePolicy, 'effectiveMaxActiveAgentTurns'> = {
-      managedModelProviders: [],
       allowedModelProviders: [],
       allowedModels: [],
       maxAgentStartsPerMinute: this.hosted ? 60 : 10_000,
@@ -1943,11 +1942,13 @@ export class Store {
     let saved: Partial<OrganizationUsagePolicy> = {};
     if (raw) try { saved = JSON.parse(raw); } catch { saved = {}; }
     delete saved.effectiveMaxActiveAgentTurns;
+    // Retired with the environment-keyed managed model rail (wiki features/model-gateways).
+    delete (saved as Record<string, unknown>).managedModelProviders;
+    delete (saved as Record<string, unknown>).managedSpendCapMicros;
     const ownerLimit = Number.isSafeInteger(saved.maxActiveAgentTurns) && saved.maxActiveAgentTurns! > 0
       ? saved.maxActiveAgentTurns : undefined;
     const effectiveAgentLimit = ownerLimit == null ? planLimit : Math.min(ownerLimit, planLimit);
     return { ...fallback, ...saved,
-      managedModelProviders: [...(saved.managedModelProviders ?? [])],
       allowedModelProviders: [...(saved.allowedModelProviders ?? [])],
       allowedModels: [...(saved.allowedModels ?? [])],
       ...(ownerLimit == null ? {} : { maxActiveAgentTurns: ownerLimit }),
@@ -1968,8 +1969,6 @@ export class Store {
     if (this.hosted) delete effectivePatch.maxActiveWorlds;
     const next = { ...current, ...effectivePatch } as OrganizationUsagePolicy;
     delete (next as Partial<OrganizationUsagePolicy>).effectiveMaxActiveAgentTurns;
-    if (Object.prototype.hasOwnProperty.call(patch, 'managedSpendCapMicros')
-      && (patch as any).managedSpendCapMicros == null) delete next.managedSpendCapMicros;
     if (Object.prototype.hasOwnProperty.call(patch, 'maxActiveAgentTurns')
       && (patch as any).maxActiveAgentTurns == null) delete next.maxActiveAgentTurns;
     const normalized = (values: unknown, label: string): string[] => {
@@ -1979,7 +1978,6 @@ export class Store {
         throw new Error(`${label} contains an invalid value`);
       return out;
     };
-    next.managedModelProviders = normalized(next.managedModelProviders, 'managed model providers');
     next.allowedModelProviders = normalized(next.allowedModelProviders, 'allowed model providers');
     next.allowedModels = normalized(next.allowedModels, 'allowed models');
     for (const [key, value] of Object.entries({
@@ -1993,8 +1991,6 @@ export class Store {
     const planLimit = (await this.organizationEntitlements(organizationId)).maxActiveAgentRuns;
     if (next.maxActiveAgentTurns != null && planLimit != null)
       next.maxActiveAgentTurns = Math.min(next.maxActiveAgentTurns, planLimit);
-    if (next.managedSpendCapMicros != null && (!Number.isSafeInteger(next.managedSpendCapMicros) || next.managedSpendCapMicros < 1))
-      throw new Error('managed spend cap must be a positive integer');
     const persisted: Partial<OrganizationUsagePolicy> = { ...next };
     delete persisted.effectiveMaxActiveAgentTurns;
     if (this.hosted) delete persisted.maxActiveWorlds;
@@ -9143,10 +9139,7 @@ export class Store {
 
   async admitAgentUsage(input: { id: string; organizationId: string; projectId: string; taskId: string;
     provider: string; model?: string; fundingSource: 'managed' | 'byok' | 'customer';
-    reservedCostMicros?: number; now?: number; retryOf?: string | string[];
-    /** tavya's included model: the organization's compute credit bounds it
-     * (its key's limit, src/agent/included-model.ts), not an owner's spend cap. */
-    included?: boolean }): Promise<{ reused: boolean }> {
+    now?: number; retryOf?: string | string[] }): Promise<{ reused: boolean }> {
     return this.db.transaction(async () => {
 
     const now = input.now ?? Date.now();
@@ -9170,13 +9163,6 @@ export class Store {
       throw new Error(`model provider ${input.provider} is not allowed by the organization`);
     if (input.model && policy.allowedModels.length && !policy.allowedModels.includes(input.model))
       throw new Error(`model ${input.model} is not allowed by the organization`);
-    if (input.fundingSource === 'managed' && !input.included) {
-      if (!policy.managedSpendCapMicros) throw new Error('managed model usage is disabled until an organization owner sets a spend cap');
-      if (!policy.managedModelProviders.includes(input.provider))
-        throw new Error(`managed ${input.provider} usage is not enabled for this organization`);
-      if (!Number.isSafeInteger(input.reservedCostMicros) || input.reservedCostMicros! < 1)
-        throw new Error('managed model usage has no installation-configured per-request cost ceiling');
-    }
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
       for (const priorId of input.retryOf ? [input.retryOf].flat() : []) {
@@ -9191,29 +9177,17 @@ export class Store {
             .run(now, priorId);
         }
       }
-      const assertManagedCapacity = async () => {
-        if (input.fundingSource !== 'managed' || input.included) return;
-        const month = monthWindow(now);
-        const spent = (await this.usageSummary(input.organizationId, month.from, month.to)).byFundingSource.managed ?? 0;
-        const reserved = Number(((await this.db.prepare(`SELECT COALESCE(SUM(reservedCostMicros), 0) n FROM usage_admissions
-          WHERE organizationId=? AND fundingSource='managed' AND state='active'
-            AND NOT EXISTS (SELECT 1 FROM usage_events WHERE id='usage:cost:' || usage_admissions.id)`).get(input.organizationId)) as any).n);
-        if (spent + reserved + input.reservedCostMicros! > policy.managedSpendCapMicros!)
-          throw new Error('organization managed spend cap is exhausted');
-      };
       const existing = (await this.db.prepare('SELECT * FROM usage_admissions WHERE id=?').get(input.id)) as any;
       if (existing) {
         if (existing.organizationId !== input.organizationId || existing.projectId !== input.projectId
           || existing.taskId !== input.taskId || existing.provider !== input.provider
-          || existing.fundingSource !== input.fundingSource || (existing.model ?? undefined) !== input.model
-          || Number(existing.reservedCostMicros) !== Number(input.reservedCostMicros ?? 0))
+          || existing.fundingSource !== input.fundingSource || (existing.model ?? undefined) !== input.model)
           throw new Error('usage admission retry key belongs to different attributed work');
         if (existing.state === 'active') {
           (await this.db.exec('COMMIT'));
           return { reused: true };
         }
         if (existing.state === 'released') {
-          (await assertManagedCapacity());
           const active = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM usage_admissions
             WHERE organizationId=? AND kind='agent' AND state='active'`).get(input.organizationId)) as any).n);
           if (active >= policy.effectiveMaxActiveAgentTurns) throw new AdmissionBackpressureError('organization active model turn limit reached');
@@ -9224,7 +9198,6 @@ export class Store {
         (await this.db.exec('COMMIT'));
         throw new Error('this model turn was already completed; refusing duplicate provider admission');
       }
-      (await assertManagedCapacity());
       const minute = now - 60_000;
       const recent = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM usage_admissions
         WHERE organizationId=? AND kind='agent' AND createdAt>=?`).get(input.organizationId, minute)) as any).n);
@@ -9235,7 +9208,7 @@ export class Store {
       (await this.db.prepare(`INSERT INTO usage_admissions (id, organizationId, projectId, taskId, kind, provider, model,
         fundingSource, state, reservedCostMicros, createdAt) VALUES (?, ?, ?, ?, 'agent', ?, ?, ?, 'active', ?, ?)`)
         .run(input.id, input.organizationId, input.projectId, input.taskId, input.provider, input.model ?? null,
-          input.fundingSource, input.reservedCostMicros ?? 0, now));
+          input.fundingSource, 0, now));
       (await this.db.exec('COMMIT'));
       return { reused: false };
     } catch (error) {

@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from 'vitest';
-import { Context } from '@temporalio/activity';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { ProviderFailure } from '../src/agent/limits.js';
@@ -30,73 +29,6 @@ describe('agent turn admission', () => {
       } as any)).rejects.toMatchObject({ type: 'agent-infra', nonRetryable: false });
     } finally { await world.destroy(); await store.close(); }
   });
-
-  it.each(['failure', 'cancel', 'cancel-metered', 'timeout', 'post-turn', 'billing'])('retains managed cost and retries safely after %s', async mode => {
-    vi.stubEnv('ANTHROPIC_API_KEY', 'fake-managed-key');
-    vi.stubEnv('KARMAX_MANAGED_MODEL_REQUEST_CEILINGS', JSON.stringify({ 'anthropic/test-model': 100_000 }));
-    vi.stubEnv('KARMAX_MANAGED_MODEL_PRICING', mode === 'cancel-metered' ? JSON.stringify({ 'anthropic/test-model': { inputMicrosPerMillionTokens: 1_000_000, outputMicrosPerMillionTokens: 1_000_000 } }) : '');
-    const store = await Store.create(':memory:', { hosted: true });
-    const org = await store.createOrganization({ name: 'Failure billing', ownerUserId: 'owner' });
-    const project = await store.createProject('Failure billing', {}, org.id);
-    const task = await store.createTask({ projectId: project.id, title: 'Work', workflow: 'just-do',
-      workflowVersion: '1.0.0', params: { prompt: 'work' } as any });
-    await store.setOrganizationUsagePolicy(org.id, { managedSpendCapMicros: 1_000_000, managedModelProviders: ['anthropic'] });
-    const worlds = new WorldRegistry();
-    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
-    let attempt = 1;
-    let abort = new AbortController();
-    vi.spyOn(Context, 'current').mockImplementation(() => ({
-      info: { attempt, activityId: 'turn', workflowExecution: { runId: 'run' } },
-      cancellationSignal: abort.signal, heartbeat: () => {},
-    }) as any);
-    let costAtProviderStart = 0;
-    const runTurn = vi.fn(async () => {
-      costAtProviderStart = (await store.usageSummary(org.id)).estimatedCostMicros;
-      if (mode === 'failure') throw new Error('provider disconnected');
-      if (mode.startsWith('cancel') || mode === 'timeout') abort.abort(new Error(mode));
-      return { termination: { kind: 'success', status: 'end_turn' }, output: 'durable output',
-        ...(mode === 'cancel-metered' ? { usage: { inputTokens: 75, outputTokens: 25 } } : {}) };
-    });
-    const core = makeCoreActivities({ store, worlds,
-      adapters: new Map([['claude', { provider: 'claude', runTurn }]]) as any,
-      profiles: new ProfileResolver(store, 'claude') });
-    const append = store.appendEvent.bind(store);
-    vi.spyOn(store, 'appendEvent').mockImplementation(async event => {
-      if (mode === 'post-turn' && event.type === 'turn.result' && attempt === 1) throw new Error('result publication failed');
-      return append(event);
-    });
-    const finish = store.finishUsageAdmission.bind(store);
-    vi.spyOn(store, 'finishUsageAdmission').mockImplementation(async (...params) => {
-      if (mode === 'billing' && params[1] !== undefined && attempt === 1) throw new Error('billing write failed');
-      return finish(...params);
-    });
-    const args = { taskId: task.id, role: ['post-turn', 'billing'].includes(mode) ? 'confirm' : 'do', agentTurnId: `${task.id}#0`,
-      agentSlotGranted: true, agentAdmissionManaged: true, worldHandle: world.handle, messages: [],
-      task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'just-do',
-        agents: { do: { provider: 'claude', model: 'test-model' }, confirm: { provider: 'claude', model: 'test-model' } } } } as any;
-    try {
-      if (mode === 'post-turn' || mode === 'billing') await expect(core.runAgentTurn(args)).rejects.toMatchObject({ type: 'agent-infra', nonRetryable: false });
-      else await expect(core.runAgentTurn(args)).rejects.toThrow();
-      expect(costAtProviderStart).toBe(100_000);
-      expect(await store.usageSummary(org.id)).toMatchObject({
-        costMicros: mode === 'cancel-metered' ? 100 : 100_000,
-        incurredCostMicros: mode === 'cancel-metered' ? 100 : 0, activeReservationsMicros: 0 });
-      attempt = 2;
-      abort = new AbortController();
-      if (mode === 'post-turn' || mode === 'billing') {
-        await expect(core.runAgentTurn(args)).resolves.toMatchObject({ output: 'durable output' });
-        expect(runTurn).toHaveBeenCalledTimes(1);
-        expect(JSON.parse((await store.kvGet(`confirm-transcript:${task.id}`))!)).toHaveLength(1);
-        expect(await store.usageSummary(org.id)).toMatchObject({ estimatedCostMicros: 100_000 });
-      } else {
-        await expect(core.runAgentTurn(args)).rejects.toThrow();
-        expect(await store.usageSummary(org.id)).toMatchObject({ costMicros: mode === 'cancel-metered' ? 200 : 200_000, activeReservationsMicros: 0 });
-      }
-    } finally {
-      vi.restoreAllMocks(); vi.unstubAllEnvs();
-      await world.destroy(); await store.close();
-    }
-  }, 2_000);
 
   it('replaces a lost attempt without releasing its cost or rerunning a completed admission', async () => {
     const store = await Store.create(':memory:');
@@ -156,102 +88,6 @@ describe('agent turn admission', () => {
       expect((await store.db.prepare('SELECT state FROM usage_admissions WHERE id=?').get(id)))
         .toMatchObject({ state: 'active' });
     } finally { await world.destroy(); (await store.close()); }
-  });
-
-  it('actualizes a managed reservation from configured provider token pricing', async () => {
-    const previousCeilings = process.env.KARMAX_MANAGED_MODEL_REQUEST_CEILINGS;
-    const previousPricing = process.env.KARMAX_MANAGED_MODEL_PRICING;
-    const previousApiKey = process.env.ANTHROPIC_API_KEY;
-    process.env.ANTHROPIC_API_KEY = 'installation-managed-test-key';
-    process.env.KARMAX_MANAGED_MODEL_REQUEST_CEILINGS = JSON.stringify({ 'anthropic/test-model': 500_000 });
-    process.env.KARMAX_MANAGED_MODEL_PRICING = JSON.stringify({ 'anthropic/test-model': {
-      inputMicrosPerMillionTokens: 1_000_000, outputMicrosPerMillionTokens: 2_000_000,
-      cacheReadMicrosPerMillionTokens: 500_000,
-    } });
-    const store = (await Store.create(':memory:', { hosted: true }));
-    const organization = (await store.createOrganization({ name: 'Managed usage', ownerUserId: 'owner' }));
-    const project = (await store.createProject('Usage', {}, organization.id));
-    const task = (await store.createTask({ projectId: project.id, title: 'Use managed model', workflow: 'just-do',
-      workflowVersion: '1.0.0', params: { prompt: 'work' } as any }));
-    (await store.setOrganizationUsagePolicy(organization.id, { managedSpendCapMicros: 1_000_000,
-      managedModelProviders: ['anthropic'] }));
-    const worlds = new WorldRegistry();
-    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
-    const adapters = new Map([['claude', { provider: 'claude', async runTurn() {
-      return { termination: { kind: 'success', status: 'end_turn' }, output: 'done',
-        usage: { inputTokens: 1_000, outputTokens: 500, cacheReadTokens: 200,
-          inputTokensIncludeCacheRead: false, totalTokens: 1_700 } };
-    } }]]) as any;
-    const core = makeCoreActivities({ store, worlds, adapters, profiles: new ProfileResolver(store, 'claude') });
-    try {
-      expect(await core.resolveCredentialOrder({ taskId: task.id, projectId: project.id, provider: 'claude', role: 'do',
-        task: { taskId: task.id, projectId: project.id, agents: { do: { provider: 'claude', model: 'test-model' } } } as any,
-      })).toEqual([]);
-      await core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: `${task.id}#0`,
-        agentSlotGranted: true, agentAdmissionManaged: true, worldHandle: world.handle,
-        messages: [{ id: 'm0', role: 'user', text: 'work', ts: 0 }],
-        task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'just-do',
-          agents: { do: { provider: 'claude', model: 'test-model' } } },
-      } as any);
-      expect((await store.usageSummary(organization.id))).toMatchObject({ costMicros: 2_100,
-        incurredCostMicros: 2_100, estimatedCostMicros: 0, activeReservationsMicros: 0,
-        byFundingSource: { managed: 2_100 }, requests: { managed: 1 }, active: { agentTurns: 0 } });
-      expect((await store.db.prepare("SELECT costMicros, costClassification FROM usage_events WHERE kind='agent.request'").get()))
-        .toMatchObject({ costMicros: 0, costClassification: 'none' });
-      const cost = (await store.db.prepare("SELECT costMicros, costClassification, metadata FROM usage_events WHERE kind='agent.cost'").get()) as any;
-      expect(cost).toMatchObject({ costMicros: 2_100, costClassification: 'incurred' });
-      expect(JSON.parse(cost.metadata)).toMatchObject({ costBasis: 'configured-provider-token-pricing' });
-    } finally {
-      await world.destroy();
-      if (previousCeilings === undefined) delete process.env.KARMAX_MANAGED_MODEL_REQUEST_CEILINGS;
-      else process.env.KARMAX_MANAGED_MODEL_REQUEST_CEILINGS = previousCeilings;
-      if (previousPricing === undefined) delete process.env.KARMAX_MANAGED_MODEL_PRICING;
-      else process.env.KARMAX_MANAGED_MODEL_PRICING = previousPricing;
-      if (previousApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
-      else process.env.ANTHROPIC_API_KEY = previousApiKey;
-    }
-  });
-
-  it('labels an unpriceable successful managed request as an estimate, never incurred provider cost', async () => {
-    const previousCeilings = process.env.KARMAX_MANAGED_MODEL_REQUEST_CEILINGS;
-    const previousPricing = process.env.KARMAX_MANAGED_MODEL_PRICING;
-    const previousApiKey = process.env.ANTHROPIC_API_KEY;
-    process.env.ANTHROPIC_API_KEY = 'installation-managed-test-key';
-    process.env.KARMAX_MANAGED_MODEL_REQUEST_CEILINGS = JSON.stringify({ 'anthropic/unpriced': 400_000 });
-    delete process.env.KARMAX_MANAGED_MODEL_PRICING;
-    const store = (await Store.create(':memory:', { hosted: true }));
-    const organization = (await store.createOrganization({ name: 'Estimated usage', ownerUserId: 'owner' }));
-    const project = (await store.createProject('Usage', {}, organization.id));
-    const task = (await store.createTask({ projectId: project.id, title: 'Estimate', workflow: 'just-do',
-      workflowVersion: '1.0.0', params: { prompt: 'work' } as any }));
-    (await store.setOrganizationUsagePolicy(organization.id, { managedSpendCapMicros: 400_000,
-      managedModelProviders: ['anthropic'] }));
-    const worlds = new WorldRegistry();
-    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
-    const adapters = new Map([['claude', { provider: 'claude', async runTurn() {
-      return { termination: { kind: 'success', status: 'end_turn' }, output: 'done' };
-    } }]]) as any;
-    const core = makeCoreActivities({ store, worlds, adapters, profiles: new ProfileResolver(store, 'claude') });
-    try {
-      await core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: `${task.id}#0`,
-        agentSlotGranted: true, agentAdmissionManaged: true, worldHandle: world.handle,
-        messages: [{ id: 'm0', role: 'user', text: 'work', ts: 0 }],
-        task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'just-do',
-          agents: { do: { provider: 'claude', model: 'unpriced' } } },
-      } as any);
-      expect((await store.usageSummary(organization.id))).toMatchObject({ costMicros: 400_000,
-        incurredCostMicros: 0, estimatedCostMicros: 400_000, activeReservationsMicros: 0 });
-      expect((await store.db.prepare("SELECT costClassification FROM usage_events WHERE kind='agent.cost'").get()))
-        .toMatchObject({ costClassification: 'estimated' });
-    } finally {
-      await world.destroy();
-      if (previousCeilings === undefined) delete process.env.KARMAX_MANAGED_MODEL_REQUEST_CEILINGS;
-      else process.env.KARMAX_MANAGED_MODEL_REQUEST_CEILINGS = previousCeilings;
-      if (previousPricing === undefined) delete process.env.KARMAX_MANAGED_MODEL_PRICING;
-      else process.env.KARMAX_MANAGED_MODEL_PRICING = previousPricing;
-      if (previousApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
-      else process.env.ANTHROPIC_API_KEY = previousApiKey;
-    }
   });
 
   it('attributes provider-reported model usage at the trusted turn boundary', async () => {
@@ -319,39 +155,6 @@ describe('agent turn admission', () => {
       expect(JSON.parse(event.metadata)).toMatchObject({ inputTokens: 18, outputTokens: 71, cacheReadTokens: 3_500,
         cacheWriteTokens: 240, models: spent.models });
     } finally { await world.destroy(); await store.close(); }
-  });
-
-  it('prices each model a managed turn used at its own rate', async () => {
-    vi.stubEnv('ANTHROPIC_API_KEY', 'installation-managed-test-key');
-    vi.stubEnv('KARMAX_MANAGED_MODEL_REQUEST_CEILINGS', JSON.stringify({ 'anthropic/big': 500_000 }));
-    vi.stubEnv('KARMAX_MANAGED_MODEL_PRICING', JSON.stringify({
-      'anthropic/big': { inputMicrosPerMillionTokens: 4_000_000, outputMicrosPerMillionTokens: 20_000_000 },
-      'anthropic/small': { inputMicrosPerMillionTokens: 1_000_000, outputMicrosPerMillionTokens: 5_000_000 } }));
-    const store = (await Store.create(':memory:', { hosted: true }));
-    const organization = (await store.createOrganization({ name: 'Two models', ownerUserId: 'owner' }));
-    const project = (await store.createProject('Usage', {}, organization.id));
-    const task = (await store.createTask({ projectId: project.id, title: 'Delegate', workflow: 'just-do',
-      workflowVersion: '1.0.0', params: { prompt: 'work' } as any }));
-    (await store.setOrganizationUsagePolicy(organization.id, { managedSpendCapMicros: 1_000_000, managedModelProviders: ['anthropic'] }));
-    const worlds = new WorldRegistry();
-    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
-    const adapters = new Map([['claude', { provider: 'claude', async runTurn() {
-      return { termination: { kind: 'success', status: 'end_turn' }, output: 'done',
-        usage: { inputTokens: 2_000, outputTokens: 2_000, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 4_000,
-          models: { big: { inputTokens: 1_000, outputTokens: 1_000, cacheReadTokens: 0, cacheWriteTokens: 0 },
-            small: { inputTokens: 1_000, outputTokens: 1_000, cacheReadTokens: 0, cacheWriteTokens: 0 } } } };
-    } }]]) as any;
-    const core = makeCoreActivities({ store, worlds, adapters, profiles: new ProfileResolver(store, 'claude') });
-    try {
-      await core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: `${task.id}#0`,
-        agentSlotGranted: true, agentAdmissionManaged: true, worldHandle: world.handle,
-        messages: [{ id: 'm0', role: 'user', text: 'work', ts: 0 }],
-        task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'just-do',
-          agents: { do: { provider: 'claude', model: 'big' } } },
-      } as any);
-      // big: 1k × $4 + 1k × $20 = 24,000 µ$; small: 1k × $1 + 1k × $5 = 6,000 µ$ (not 24,000 at big's rate).
-      expect((await store.usageSummary(organization.id))).toMatchObject({ costMicros: 30_000, incurredCostMicros: 30_000 });
-    } finally { vi.unstubAllEnvs(); await world.destroy(); await store.close(); }
   });
 
   it('uses a blocking update and classifies coordinator failures as retryable infrastructure', async () => {

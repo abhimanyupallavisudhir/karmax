@@ -84,7 +84,7 @@ shard and `deploy artifacts` pass. To reproduce a failing shard, run the same
 slice locally:
 
 ```bash
-npx vitest run --shard=2/8
+npx vitest run --shard=2/9
 ```
 
 A few files take minutes while most take under a second, so shards are
@@ -160,6 +160,7 @@ environment's branch rule is the control.
 | `models` | `LIVE_ANTHROPIC_API_KEY`, `LIVE_OPENAI_API_KEY` (either) | `live-providers` |
 | `agent` | `LIVE_OPENAI_API_KEY` | `live-agent` |
 | `claude` | `LIVE_CLAUDE_CODE_OAUTH_TOKEN` (+ repository variables `LIVE_<PROVIDER>_SHARE`, one public share link each for CLAUDE, CHATGPT, GEMINI, DEEPSEEK, GROK, PERPLEXITY, POE, MISTRAL, KIMI, QWEN, for the share imports) | `claude-permission`, `conversation-shares-live` (reads each link the way the task form does; Cloudflare and Gemini's RPC decide what a server may read) |
+| `gateways` | `LIVE_OPENROUTER_API_KEY` | `model-gateways-live` (Claude Code via OpenRouter, and Claude Code and Codex through tavya's model-gateway proxy; wiki features/model-gateways; about $0.01 a run, capped by `KARMAX_LIVE_GATEWAY_BUDGET_USD`) |
 | `e2b` | `LIVE_E2B_API_KEY` | `cloud-live`, `e2b-workflow-live` (a task that pauses at Review, resumes and tears down), `e2b-computer-live` (a sized template really has its CPU, memory and disk) |
 | `daytona` | `LIVE_DAYTONA_API_KEY` (+ `LIVE_OPENCODE_ANTHROPIC_API_KEY` for OpenCode) | `daytona-live`, `daytona-environment-live`, `daytona-workflow-live`, `remote-acp-live`, `remote-acp-workflow-live` (OpenCode in a sandbox; skip without their model key) |
 | `vm` | `LIVE_FLY_API_TOKEN`, `LIVE_HETZNER_API_TOKEN` (either; + `LIVE_VM_OPENAI_API_KEY` for the agent turn) | `vm-world-live` (per provider: a 100 GB world, a real OpenCode turn, park and wake, growth to 150 GB; deletes everything. A Fly organization needs a payment method: its free trial stops machines at 5 minutes) |
