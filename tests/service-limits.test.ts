@@ -10,7 +10,7 @@ import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 import { AuthorizationService } from '../src/platform/authorization.js';
 import { Store } from '../src/store/db.js';
 import {
-  agentMailUsage, cloudflareR2Usage, cloudflareWorkersUsage, composioUsage, daytonaUsage, e2bUsage, githubUsage, hostUsage, NotConnected,
+  agentMailUsage, openRouterUsage, cloudflareR2Usage, cloudflareWorkersUsage, composioUsage, daytonaUsage, e2bUsage, githubUsage, hostUsage, NotConnected,
 } from '../src/ops/service-limit-probes.js';
 import { installationOperators, serviceLimitEmail, serviceLimitNotifier } from '../src/ops/service-limit-notices.js';
 import {
@@ -185,6 +185,22 @@ describe('probes against provider responses', () => {
     expect(result.readings).toEqual({ 'composio.tool-calls': { used: 81_234 }, 'composio.accounts': { used: 2 } });
     expect(stub.calls.map((call) => new URL(call.url).pathname)).toEqual(['/api/v3.1/connected_accounts', '/api/v3.1/connected_accounts']);
     expect(header(stub.calls[0]!, 'x-api-key')).toBe('ak_project');
+  });
+
+  it('OpenRouter: credits spent of all bought, in dollars, with what is left', async () => {
+    const stub = stubFetch(() => reply({ data: { total_credits: 16575, total_usage: 15736.7016 } }));
+    const result = await openRouterUsage({ fetch: stub.fetch, apiKey: 'sk-or-mgmt' });
+    expect(result.readings).toEqual({ 'openrouter.credits': { used: 15736.7016, limit: 16575, detail: '$838.30 left' } });
+    expect(stub.calls[0]!.url).toBe('https://openrouter.ai/api/v1/credits');
+    expect(header(stub.calls[0]!, 'authorization')).toBe('Bearer sk-or-mgmt');
+    await expect(openRouterUsage({ fetch: stubFetch(() => reply({}, 401)).fetch, apiKey: 'x' })).rejects.toThrow('OpenRouter refused the credential (401)');
+    await expect(openRouterUsage({ fetch: stubFetch(() => reply({ data: {} })).fetch, apiKey: 'x' })).rejects.toThrow('no credit balance');
+  });
+
+  it('OpenRouter: an alert names dollars', () => {
+    const alert: ServiceLimitAlert = { serviceId: 'openrouter', serviceName: 'OpenRouter', meterId: 'openrouter.credits', label: 'Credits spent',
+      unit: 'usd', used: 15_800, limit: 16_575, level: 95, period: '2026-11-16', fresh: true, link: 'https://openrouter.ai/settings/credits' } as ServiceLimitAlert;
+    expect(serviceLimitEmail([alert], 'tavya').text).toContain('Credits spent $15,800.00 of $16,575.00 (95%). Upgrade: https://openrouter.ai/settings/credits');
   });
 
   it('E2B: running sandboxes from X-Total-Running, else by paging', async () => {

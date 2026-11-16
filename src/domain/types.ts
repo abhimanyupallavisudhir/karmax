@@ -922,12 +922,9 @@ export interface OrganizationExecutionPolicy {
 }
 
 /** Trusted admission policy for hosted, organization-attributed work. Empty
- * allowlists mean "all connected BYOK providers/models"; they never authorize
- * an installation credential. Managed model rails require both an explicit
- * provider boundary and an owner-set spend cap. */
+ * allowlists mean "all providers/models". What runs on the compute credit
+ * (the included model, model gateways) is bounded by that credit. */
 export interface OrganizationUsagePolicy {
-  managedSpendCapMicros?: number;
-  managedModelProviders: string[];
   allowedModelProviders: string[];
   allowedModels: string[];
   maxAgentStartsPerMinute: number;

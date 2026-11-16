@@ -933,7 +933,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS compute_holds (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, taskId TEXT, worldId TEXT, provider TEXT NOT NULL,
         purpose TEXT NOT NULL, activeMicrosPerHour INTEGER NOT NULL, diskMicrosPerHour INTEGER NOT NULL,
-        startedAt INTEGER NOT NULL, endsAt INTEGER NOT NULL, closedAt INTEGER
+        startedAt INTEGER NOT NULL, endsAt INTEGER NOT NULL, closedAt INTEGER, amountMicros INTEGER
       );
       CREATE TABLE IF NOT EXISTS compute_topups (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, state TEXT NOT NULL, creditMicros INTEGER NOT NULL,
@@ -1495,6 +1495,9 @@ export class Store {
     // so it no longer scans the whole usage ledger at each start (PS-5).
     (await this.db.exec("CREATE INDEX IF NOT EXISTS idx_usage_unclassified ON usage_events(id) WHERE costMicros>0 AND costClassification='none'"));
     (await this.db.exec("UPDATE usage_events SET costClassification='incurred' WHERE costMicros>0 AND costClassification='none'"));
+    const computeHoldCols = (await this.db.prepare('PRAGMA table_info(compute_holds)').all()) as { name: string }[];
+    if (!computeHoldCols.some((c) => c.name === 'amountMicros'))
+      (await this.db.exec('ALTER TABLE compute_holds ADD COLUMN amountMicros INTEGER'));
     const usageAdmissionCols = (await this.db.prepare('PRAGMA table_info(usage_admissions)').all()) as { name: string }[];
     if (!usageAdmissionCols.some((c) => c.name === 'reservedCostMicros'))
       (await this.db.exec('ALTER TABLE usage_admissions ADD COLUMN reservedCostMicros INTEGER NOT NULL DEFAULT 0'));
@@ -1932,7 +1935,6 @@ export class Store {
     if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
     const planLimit = (await this.organizationEntitlements(organizationId)).maxActiveAgentRuns ?? 10_000;
     const fallback: Omit<OrganizationUsagePolicy, 'effectiveMaxActiveAgentTurns'> = {
-      managedModelProviders: [],
       allowedModelProviders: [],
       allowedModels: [],
       maxAgentStartsPerMinute: this.hosted ? 60 : 10_000,
@@ -1943,11 +1945,13 @@ export class Store {
     let saved: Partial<OrganizationUsagePolicy> = {};
     if (raw) try { saved = JSON.parse(raw); } catch { saved = {}; }
     delete saved.effectiveMaxActiveAgentTurns;
+    // Retired with the environment-keyed managed model rail (wiki features/model-gateways).
+    delete (saved as Record<string, unknown>).managedModelProviders;
+    delete (saved as Record<string, unknown>).managedSpendCapMicros;
     const ownerLimit = Number.isSafeInteger(saved.maxActiveAgentTurns) && saved.maxActiveAgentTurns! > 0
       ? saved.maxActiveAgentTurns : undefined;
     const effectiveAgentLimit = ownerLimit == null ? planLimit : Math.min(ownerLimit, planLimit);
     return { ...fallback, ...saved,
-      managedModelProviders: [...(saved.managedModelProviders ?? [])],
       allowedModelProviders: [...(saved.allowedModelProviders ?? [])],
       allowedModels: [...(saved.allowedModels ?? [])],
       ...(ownerLimit == null ? {} : { maxActiveAgentTurns: ownerLimit }),
@@ -1968,8 +1972,6 @@ export class Store {
     if (this.hosted) delete effectivePatch.maxActiveWorlds;
     const next = { ...current, ...effectivePatch } as OrganizationUsagePolicy;
     delete (next as Partial<OrganizationUsagePolicy>).effectiveMaxActiveAgentTurns;
-    if (Object.prototype.hasOwnProperty.call(patch, 'managedSpendCapMicros')
-      && (patch as any).managedSpendCapMicros == null) delete next.managedSpendCapMicros;
     if (Object.prototype.hasOwnProperty.call(patch, 'maxActiveAgentTurns')
       && (patch as any).maxActiveAgentTurns == null) delete next.maxActiveAgentTurns;
     const normalized = (values: unknown, label: string): string[] => {
@@ -1979,7 +1981,6 @@ export class Store {
         throw new Error(`${label} contains an invalid value`);
       return out;
     };
-    next.managedModelProviders = normalized(next.managedModelProviders, 'managed model providers');
     next.allowedModelProviders = normalized(next.allowedModelProviders, 'allowed model providers');
     next.allowedModels = normalized(next.allowedModels, 'allowed models');
     for (const [key, value] of Object.entries({
@@ -1993,8 +1994,6 @@ export class Store {
     const planLimit = (await this.organizationEntitlements(organizationId)).maxActiveAgentRuns;
     if (next.maxActiveAgentTurns != null && planLimit != null)
       next.maxActiveAgentTurns = Math.min(next.maxActiveAgentTurns, planLimit);
-    if (next.managedSpendCapMicros != null && (!Number.isSafeInteger(next.managedSpendCapMicros) || next.managedSpendCapMicros < 1))
-      throw new Error('managed spend cap must be a positive integer');
     const persisted: Partial<OrganizationUsagePolicy> = { ...next };
     delete persisted.effectiveMaxActiveAgentTurns;
     if (this.hosted) delete persisted.maxActiveWorlds;
@@ -9143,10 +9142,7 @@ export class Store {
 
   async admitAgentUsage(input: { id: string; organizationId: string; projectId: string; taskId: string;
     provider: string; model?: string; fundingSource: 'managed' | 'byok' | 'customer';
-    reservedCostMicros?: number; now?: number; retryOf?: string | string[];
-    /** tavya's included model: the organization's compute credit bounds it
-     * (its key's limit, src/agent/included-model.ts), not an owner's spend cap. */
-    included?: boolean }): Promise<{ reused: boolean }> {
+    now?: number; retryOf?: string | string[] }): Promise<{ reused: boolean }> {
     return this.db.transaction(async () => {
 
     const now = input.now ?? Date.now();
@@ -9170,13 +9166,6 @@ export class Store {
       throw new Error(`model provider ${input.provider} is not allowed by the organization`);
     if (input.model && policy.allowedModels.length && !policy.allowedModels.includes(input.model))
       throw new Error(`model ${input.model} is not allowed by the organization`);
-    if (input.fundingSource === 'managed' && !input.included) {
-      if (!policy.managedSpendCapMicros) throw new Error('managed model usage is disabled until an organization owner sets a spend cap');
-      if (!policy.managedModelProviders.includes(input.provider))
-        throw new Error(`managed ${input.provider} usage is not enabled for this organization`);
-      if (!Number.isSafeInteger(input.reservedCostMicros) || input.reservedCostMicros! < 1)
-        throw new Error('managed model usage has no installation-configured per-request cost ceiling');
-    }
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
       for (const priorId of input.retryOf ? [input.retryOf].flat() : []) {
@@ -9191,29 +9180,17 @@ export class Store {
             .run(now, priorId);
         }
       }
-      const assertManagedCapacity = async () => {
-        if (input.fundingSource !== 'managed' || input.included) return;
-        const month = monthWindow(now);
-        const spent = (await this.usageSummary(input.organizationId, month.from, month.to)).byFundingSource.managed ?? 0;
-        const reserved = Number(((await this.db.prepare(`SELECT COALESCE(SUM(reservedCostMicros), 0) n FROM usage_admissions
-          WHERE organizationId=? AND fundingSource='managed' AND state='active'
-            AND NOT EXISTS (SELECT 1 FROM usage_events WHERE id='usage:cost:' || usage_admissions.id)`).get(input.organizationId)) as any).n);
-        if (spent + reserved + input.reservedCostMicros! > policy.managedSpendCapMicros!)
-          throw new Error('organization managed spend cap is exhausted');
-      };
       const existing = (await this.db.prepare('SELECT * FROM usage_admissions WHERE id=?').get(input.id)) as any;
       if (existing) {
         if (existing.organizationId !== input.organizationId || existing.projectId !== input.projectId
           || existing.taskId !== input.taskId || existing.provider !== input.provider
-          || existing.fundingSource !== input.fundingSource || (existing.model ?? undefined) !== input.model
-          || Number(existing.reservedCostMicros) !== Number(input.reservedCostMicros ?? 0))
+          || existing.fundingSource !== input.fundingSource || (existing.model ?? undefined) !== input.model)
           throw new Error('usage admission retry key belongs to different attributed work');
         if (existing.state === 'active') {
           (await this.db.exec('COMMIT'));
           return { reused: true };
         }
         if (existing.state === 'released') {
-          (await assertManagedCapacity());
           const active = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM usage_admissions
             WHERE organizationId=? AND kind='agent' AND state='active'`).get(input.organizationId)) as any).n);
           if (active >= policy.effectiveMaxActiveAgentTurns) throw new AdmissionBackpressureError('organization active model turn limit reached');
@@ -9224,7 +9201,6 @@ export class Store {
         (await this.db.exec('COMMIT'));
         throw new Error('this model turn was already completed; refusing duplicate provider admission');
       }
-      (await assertManagedCapacity());
       const minute = now - 60_000;
       const recent = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM usage_admissions
         WHERE organizationId=? AND kind='agent' AND createdAt>=?`).get(input.organizationId, minute)) as any).n);
@@ -9235,7 +9211,7 @@ export class Store {
       (await this.db.prepare(`INSERT INTO usage_admissions (id, organizationId, projectId, taskId, kind, provider, model,
         fundingSource, state, reservedCostMicros, createdAt) VALUES (?, ?, ?, ?, 'agent', ?, ?, ?, 'active', ?, ?)`)
         .run(input.id, input.organizationId, input.projectId, input.taskId, input.provider, input.model ?? null,
-          input.fundingSource, input.reservedCostMicros ?? 0, now));
+          input.fundingSource, 0, now));
       (await this.db.exec('COMMIT'));
       return { reused: false };
     } catch (error) {
@@ -9344,7 +9320,7 @@ export class Store {
       .all(organizationId, now - COMPUTE_HOLD_SETTLE_MS, ...(exceptId ? [exceptId] : []))) as Array<Record<string, unknown>>;
     if (!holds.length) return 0;
     const booked = (await this.computeBookedUntil(organizationId, [...new Set(holds.map((hold) => String(hold.taskId ?? '')))]));
-    return Math.round(holds.reduce((total, hold) => total + heldCost(hold, booked.get(String(hold.taskId ?? ''))), 0));
+    return Math.round(holds.reduce((total, hold) => total + heldCost(hold, booked.get(String(hold.taskId ?? '')), now), 0));
   }
 
   /** When the provider's booked managed usage of each task ends, per kind. */
@@ -9383,7 +9359,7 @@ export class Store {
       const row = { ...existing, ...input, startedAt, endsAt: now, closedAt: null };
       const booked = (await this.computeBookedUntil(input.organizationId, [input.taskId ?? ''])).get(input.taskId ?? '');
       // What this work has run since its last booked usage is owed whatever happens next.
-      const owed = heldCost(row, booked);
+      const owed = heldCost(row, booked, now);
       const free = creditMicros - used - computeChargeMicros(held + owed, multiplier);
       const perMs = computeChargeMicros(input.activeMicrosPerHour + input.diskMicrosPerHour, multiplier) / 3_600_000;
       const fits = perMs > 0 ? now + Math.max(0, free) / perMs : Infinity;
@@ -9398,6 +9374,39 @@ export class Store {
           Math.round(input.activeMicrosPerHour), Math.round(input.diskMicrosPerHour), startedAt, keep));
       return { endsAt: keep, startedAt };
     });
+  }
+
+  /** Reserve a lump sum (a generation's quote: wiki features/generate),
+   * in provider cost micros, until `until` or until closed — when what it
+   * actually cost has been booked. Under the organization's usage lock, so
+   * two generations never both take its last dollars. Refused (false,
+   * nothing changed) when the credit cannot cover it. `creditMicros` as for
+   * holdCompute. */
+  async holdSpend(input: { id: string; organizationId: string; taskId?: string; provider: string; amountMicros: number; until: number },
+    creditMicros: number, now = Date.now()): Promise<boolean> {
+    return this.db.transaction(async () => {
+      (await this.db.lock(`usage:${input.organizationId}`));
+      const month = monthWindow(now);
+      const used = (await this.managedComputeCosts(month.from, month.to, input.organizationId)).reduce((total, row) => total + row.chargedMicros, 0);
+      const held = (await this.computeHeldCostMicros(input.organizationId, now, input.id));
+      const multiplier = await this.computePriceMultiplier(input.organizationId, now);
+      if (creditMicros - used - computeChargeMicros(held + input.amountMicros, multiplier) < 0) return false;
+      // A lump hold names no task for computeBookedUntil: a task's machine
+      // usage must not release it; only closing it does.
+      (await this.db.prepare(`INSERT INTO compute_holds (id, organizationId, taskId, worldId, provider, purpose,
+        activeMicrosPerHour, diskMicrosPerHour, startedAt, endsAt, closedAt, amountMicros) VALUES (?, ?, NULL, NULL, ?, 'generation', 0, 0, ?, ?, NULL, ?)
+        ON CONFLICT(id) DO UPDATE SET amountMicros=excluded.amountMicros, endsAt=excluded.endsAt, closedAt=NULL`)
+        .run(input.id, input.organizationId, input.provider, now, Math.floor(input.until), Math.round(input.amountMicros)));
+      return true;
+    });
+  }
+
+  /** What open lump-sum holds on `provider` reserve now, provider cost micros. */
+  async openSpendHoldsMicros(organizationId: string, provider: string, now = Date.now()): Promise<number> {
+    const row = (await this.db.prepare(`SELECT COALESCE(SUM(amountMicros), 0) n FROM compute_holds
+      WHERE organizationId=? AND provider=? AND amountMicros IS NOT NULL AND closedAt IS NULL AND endsAt>?`)
+      .get(organizationId, provider, now)) as { n?: number } | undefined;
+    return Number(row?.n ?? 0);
   }
 
   /** The work a hold covered ended at `at`: what it reserved past then is free. */
@@ -11510,7 +11519,9 @@ export interface ComputeHoldInput {
 
 /** What a hold row still reserves at `now`: its stretch past what the
  * provider has booked for its task, per kind, at its rates. */
-function heldCost(hold: Record<string, unknown>, booked: { active: number; disk: number } | undefined): number {
+function heldCost(hold: Record<string, unknown>, booked: { active: number; disk: number } | undefined, now: number): number {
+  // A lump sum (holdSpend) reserves all of it until closed or expired.
+  if (hold.amountMicros != null) return hold.closedAt == null && Number(hold.endsAt) > now ? Number(hold.amountMicros) : 0;
   const end = hold.closedAt != null ? Number(hold.closedAt) : Number(hold.endsAt);
   const start = Number(hold.startedAt);
   const span = (bookedUntil = 0) => Math.max(0, end - Math.max(start, bookedUntil)) / 3_600_000;

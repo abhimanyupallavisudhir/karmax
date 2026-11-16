@@ -6,6 +6,7 @@ const formatNumber = (value: number) => value.toLocaleString('en-US', { maximumF
 function amount(value: number, unit: string | undefined): string {
   if (unit === 'bytes') return value >= 1024 ** 3 ? `${(value / 1024 ** 3).toFixed(1)} GB` : `${Math.round(value / 1024 ** 2)} MB`;
   if (unit === 'hours') return `${formatNumber(value)} h`;
+  if (unit === 'usd') return `$${value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   return formatNumber(value);
 }
 

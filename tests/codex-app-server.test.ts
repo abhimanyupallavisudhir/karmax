@@ -10,7 +10,7 @@ const STUB = `#!/usr/bin/env node
 const fs = require('fs');
 const readline = require('readline');
 const out = process.env.STUB_REQUESTS_OUT;
-if (out) fs.appendFileSync(out, JSON.stringify({ kind: 'harness-env', openai: process.env.OPENAI_API_KEY, codex: process.env.CODEX_API_KEY, database: process.env.DATABASE_URL }) + '\\n');
+if (out) fs.appendFileSync(out, JSON.stringify({ kind: 'harness-env', openai: process.env.OPENAI_API_KEY, codex: process.env.CODEX_API_KEY, database: process.env.DATABASE_URL, gatewayKey: process.env.TAVYA_MODEL_KEY, argv: process.argv.slice(2) }) + '\\n');
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n');
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const msg = JSON.parse(line);
@@ -133,6 +133,7 @@ describe('CodexAdapter app-server security policy', () => {
   });
 
   let lastResult: any;
+  let auth: Record<string, unknown> | undefined;
   async function run(session?: string, mode?: string, fork = false, ctx: any = {}, secretEnv?: Record<string, string>): Promise<any[]> {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-codex-app-server-'));
     const stub = path.join(dir, 'codex-stub.cjs');
@@ -159,7 +160,7 @@ describe('CodexAdapter app-server security policy', () => {
         messages: [{ id: 'm', role: 'user', text: 'prepare the branch', ts: 0 }],
         systemPrompt: 'Prepare the branch for merge.',
         role: 'merge',
-        resolvedAuth: { configHome: dir }, secretEnv,
+        resolvedAuth: { configHome: dir, ...auth }, secretEnv,
         ...(session ? { session } : {}), ...(fork ? { fork: true } : {}),
       } as any,
       { emit() {}, emitActivity() {}, ...ctx } as any,
@@ -178,6 +179,22 @@ describe('CodexAdapter app-server security policy', () => {
     expect(records.find(r => r.kind === 'harness-env').codex).toBeFalsy();
     const method = mode === 'fresh' ? 'thread/start' : mode === 'fork' ? 'thread/fork' : 'thread/resume';
     expect(records.find(r => r.method === method).params.config['shell_environment_policy.set']).toEqual(secretEnv);
+  });
+
+  // Model gateways (wiki features/model-gateways): Codex itself, with a model provider for the gateway.
+  it('runs Codex through a model gateway as a Responses provider, its key in the environment only', async () => {
+    auth = { gateway: { baseUrl: 'https://openrouter.example/api/v1', apiKey: 'sk-or-org', model: 'openai/gpt-6.1-sol' } };
+    try {
+      const records = await run();
+      const harness = records.find((r) => r.kind === 'harness-env');
+      expect(harness.gatewayKey).toBe('sk-or-org');
+      expect(harness.openai).toBeFalsy();
+      expect(harness.argv.join(' ')).not.toContain('sk-or-org');
+      const flags = harness.argv.filter((_: string, index: number) => harness.argv[index - 1] === '-c');
+      expect(flags).toEqual(expect.arrayContaining(['model_provider="tavya"', 'model_providers.tavya.base_url="https://openrouter.example/api/v1"',
+        'model_providers.tavya.env_key="TAVYA_MODEL_KEY"', 'model_providers.tavya.wire_api="responses"']));
+      expect(records.find((r) => r.method === 'thread/start')?.params).toMatchObject({ model: 'openai/gpt-6.1-sol' });
+    } finally { auth = undefined; }
   });
 
   it('reports provider token usage for the requests this turn made', async () => {
