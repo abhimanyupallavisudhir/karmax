@@ -9891,8 +9891,11 @@ export class Gateway {
       start_url: '/',
       scope: '/',
       display: 'standalone',
-      background_color: '#f6f7f9',
-      theme_color: '#5b5bd6',
+      // The dark look's page colour: the splash and the installed app's bars
+      // match the console instead of an indigo frame (the page's own
+      // theme-color meta takes over once it loads).
+      background_color: '#0f0f12',
+      theme_color: '#0f0f12',
       icons: [
         { src: '/brand/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any maskable' },
         { src: '/brand/icon-192.png', sizes: '192x192', type: 'image/png' },
