@@ -17,7 +17,7 @@
  */
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
-import { COMPUTE_PRICE_MULTIPLIER } from '../domain/entitlements.js';
+import { COMPUTE_PRICE_MULTIPLIER, computeChargeMicros } from '../domain/entitlements.js';
 import type { AgentProfile } from '../domain/types.js';
 import { EFFORTS, type Effort } from './effort.js';
 import type { Store } from '../store/db.js';
@@ -210,8 +210,8 @@ export async function includedModelKey(store: Store, broker: CredentialBroker, o
   const credit = await computeCredit(store, organizationId, now);
   if (credit.availableMicros != null && credit.availableMicros < INCLUDED_MODEL_MIN_MICROS)
     throw await outOfCompute(store, organizationId, 'openrouter', now);
-  const available = credit.availableMicros ?? Number.MAX_SAFE_INTEGER;
   const multiplier = await store.computePriceMultiplier(organizationId, now);
+  const available = await keyRoom(store, organizationId, credit.availableMicros, multiplier, now) ?? Number.MAX_SAFE_INTEGER;
   let existing = await record(store, organizationId);
   if (existing && !(await broker.hasHandle(keyHandle(organizationId)))) existing = undefined;
   if (!existing) {
@@ -224,12 +224,22 @@ export async function includedModelKey(store: Store, broker: CredentialBroker, o
   }
   const current = (await openRouter(broker, 'GET', `/keys/${existing.hash}`))?.data ?? {};
   await bookUsage(store, organizationId, Number(current.usage) || 0, now);
-  const limitUsd = limitFor(Number(current.usage) || 0, (await computeCredit(store, organizationId, now)).availableMicros ?? available, multiplier);
+  const limitUsd = limitFor(Number(current.usage) || 0,
+    await keyRoom(store, organizationId, (await computeCredit(store, organizationId, now)).availableMicros, multiplier, now) ?? available, multiplier);
   if (limitUsd !== existing.limitUsd || current.disabled) {
     await openRouter(broker, 'PATCH', `/keys/${existing.hash}`, { limit: limitUsd, disabled: false });
     await store.kvSet(keyRecord(organizationId), JSON.stringify({ ...existing, limitUsd } satisfies KeyRecord));
   }
   return broker.resolve(keyHandle(organizationId), { caps: [`use-credential:${keyHandle(organizationId)}`] });
+}
+
+/** What the organization's key may still spend, at tavya's prices: the
+ * credit left plus what generations running on this key hold (wiki
+ * features/generate). Those holds reserve the credit for exactly what the key
+ * is about to be charged, so they must not close the key on it. */
+async function keyRoom(store: Store, organizationId: string, availableMicros: number | null, multiplier: number, now: number): Promise<number | undefined> {
+  if (availableMicros == null) return undefined;
+  return availableMicros + computeChargeMicros(await store.openSpendHoldsMicros(organizationId, 'openrouter', now), multiplier);
 }
 
 async function bookUsage(store: Store, organizationId: string, usageUsd: number, now: number, task?: { taskId: string; projectId?: string }) {
@@ -246,7 +256,8 @@ export async function syncIncludedModelUsage(store: Store, broker: CredentialBro
   const current = (await openRouter(broker, 'GET', `/keys/${existing.hash}`))?.data ?? {};
   const usageUsd = Number(current.usage) || 0;
   const booked = await bookUsage(store, organizationId, usageUsd, now, task);
-  const available = (await computeCredit(store, organizationId, now)).availableMicros;
+  const available = await keyRoom(store, organizationId, (await computeCredit(store, organizationId, now)).availableMicros,
+    await store.computePriceMultiplier(organizationId, now), now);
   if (available != null && available <= 0 && existing.limitUsd !== limitFor(usageUsd, 0)) {
     const limitUsd = limitFor(usageUsd, 0);
     await openRouter(broker, 'PATCH', `/keys/${existing.hash}`, { limit: limitUsd });

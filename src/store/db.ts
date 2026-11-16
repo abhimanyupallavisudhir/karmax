@@ -933,7 +933,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS compute_holds (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, taskId TEXT, worldId TEXT, provider TEXT NOT NULL,
         purpose TEXT NOT NULL, activeMicrosPerHour INTEGER NOT NULL, diskMicrosPerHour INTEGER NOT NULL,
-        startedAt INTEGER NOT NULL, endsAt INTEGER NOT NULL, closedAt INTEGER
+        startedAt INTEGER NOT NULL, endsAt INTEGER NOT NULL, closedAt INTEGER, amountMicros INTEGER
       );
       CREATE TABLE IF NOT EXISTS compute_topups (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, state TEXT NOT NULL, creditMicros INTEGER NOT NULL,
@@ -1495,6 +1495,9 @@ export class Store {
     // so it no longer scans the whole usage ledger at each start (PS-5).
     (await this.db.exec("CREATE INDEX IF NOT EXISTS idx_usage_unclassified ON usage_events(id) WHERE costMicros>0 AND costClassification='none'"));
     (await this.db.exec("UPDATE usage_events SET costClassification='incurred' WHERE costMicros>0 AND costClassification='none'"));
+    const computeHoldCols = (await this.db.prepare('PRAGMA table_info(compute_holds)').all()) as { name: string }[];
+    if (!computeHoldCols.some((c) => c.name === 'amountMicros'))
+      (await this.db.exec('ALTER TABLE compute_holds ADD COLUMN amountMicros INTEGER'));
     const usageAdmissionCols = (await this.db.prepare('PRAGMA table_info(usage_admissions)').all()) as { name: string }[];
     if (!usageAdmissionCols.some((c) => c.name === 'reservedCostMicros'))
       (await this.db.exec('ALTER TABLE usage_admissions ADD COLUMN reservedCostMicros INTEGER NOT NULL DEFAULT 0'));
@@ -9317,7 +9320,7 @@ export class Store {
       .all(organizationId, now - COMPUTE_HOLD_SETTLE_MS, ...(exceptId ? [exceptId] : []))) as Array<Record<string, unknown>>;
     if (!holds.length) return 0;
     const booked = (await this.computeBookedUntil(organizationId, [...new Set(holds.map((hold) => String(hold.taskId ?? '')))]));
-    return Math.round(holds.reduce((total, hold) => total + heldCost(hold, booked.get(String(hold.taskId ?? ''))), 0));
+    return Math.round(holds.reduce((total, hold) => total + heldCost(hold, booked.get(String(hold.taskId ?? '')), now), 0));
   }
 
   /** When the provider's booked managed usage of each task ends, per kind. */
@@ -9356,7 +9359,7 @@ export class Store {
       const row = { ...existing, ...input, startedAt, endsAt: now, closedAt: null };
       const booked = (await this.computeBookedUntil(input.organizationId, [input.taskId ?? ''])).get(input.taskId ?? '');
       // What this work has run since its last booked usage is owed whatever happens next.
-      const owed = heldCost(row, booked);
+      const owed = heldCost(row, booked, now);
       const free = creditMicros - used - computeChargeMicros(held + owed, multiplier);
       const perMs = computeChargeMicros(input.activeMicrosPerHour + input.diskMicrosPerHour, multiplier) / 3_600_000;
       const fits = perMs > 0 ? now + Math.max(0, free) / perMs : Infinity;
@@ -9371,6 +9374,39 @@ export class Store {
           Math.round(input.activeMicrosPerHour), Math.round(input.diskMicrosPerHour), startedAt, keep));
       return { endsAt: keep, startedAt };
     });
+  }
+
+  /** Reserve a lump sum (a generation's quote: wiki features/generate),
+   * in provider cost micros, until `until` or until closed — when what it
+   * actually cost has been booked. Under the organization's usage lock, so
+   * two generations never both take its last dollars. Refused (false,
+   * nothing changed) when the credit cannot cover it. `creditMicros` as for
+   * holdCompute. */
+  async holdSpend(input: { id: string; organizationId: string; taskId?: string; provider: string; amountMicros: number; until: number },
+    creditMicros: number, now = Date.now()): Promise<boolean> {
+    return this.db.transaction(async () => {
+      (await this.db.lock(`usage:${input.organizationId}`));
+      const month = monthWindow(now);
+      const used = (await this.managedComputeCosts(month.from, month.to, input.organizationId)).reduce((total, row) => total + row.chargedMicros, 0);
+      const held = (await this.computeHeldCostMicros(input.organizationId, now, input.id));
+      const multiplier = await this.computePriceMultiplier(input.organizationId, now);
+      if (creditMicros - used - computeChargeMicros(held + input.amountMicros, multiplier) < 0) return false;
+      // A lump hold names no task for computeBookedUntil: a task's machine
+      // usage must not release it; only closing it does.
+      (await this.db.prepare(`INSERT INTO compute_holds (id, organizationId, taskId, worldId, provider, purpose,
+        activeMicrosPerHour, diskMicrosPerHour, startedAt, endsAt, closedAt, amountMicros) VALUES (?, ?, NULL, NULL, ?, 'generation', 0, 0, ?, ?, NULL, ?)
+        ON CONFLICT(id) DO UPDATE SET amountMicros=excluded.amountMicros, endsAt=excluded.endsAt, closedAt=NULL`)
+        .run(input.id, input.organizationId, input.provider, now, Math.floor(input.until), Math.round(input.amountMicros)));
+      return true;
+    });
+  }
+
+  /** What open lump-sum holds on `provider` reserve now, provider cost micros. */
+  async openSpendHoldsMicros(organizationId: string, provider: string, now = Date.now()): Promise<number> {
+    const row = (await this.db.prepare(`SELECT COALESCE(SUM(amountMicros), 0) n FROM compute_holds
+      WHERE organizationId=? AND provider=? AND amountMicros IS NOT NULL AND closedAt IS NULL AND endsAt>?`)
+      .get(organizationId, provider, now)) as { n?: number } | undefined;
+    return Number(row?.n ?? 0);
   }
 
   /** The work a hold covered ended at `at`: what it reserved past then is free. */
@@ -11483,7 +11519,9 @@ export interface ComputeHoldInput {
 
 /** What a hold row still reserves at `now`: its stretch past what the
  * provider has booked for its task, per kind, at its rates. */
-function heldCost(hold: Record<string, unknown>, booked: { active: number; disk: number } | undefined): number {
+function heldCost(hold: Record<string, unknown>, booked: { active: number; disk: number } | undefined, now: number): number {
+  // A lump sum (holdSpend) reserves all of it until closed or expired.
+  if (hold.amountMicros != null) return hold.closedAt == null && Number(hold.endsAt) > now ? Number(hold.amountMicros) : 0;
   const end = hold.closedAt != null ? Number(hold.closedAt) : Number(hold.endsAt);
   const start = Number(hold.startedAt);
   const span = (bookedUntil = 0) => Math.max(0, end - Math.max(start, bookedUntil)) / 3_600_000;

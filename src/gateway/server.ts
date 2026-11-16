@@ -325,10 +325,10 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The agent mailbox is a credential surface, org-scoped by its path (the
   // token/session check enforces the tenant boundary from requestScope).
   if (/^\/api\/organizations\/[^/]+\/agent-mail(?:\/|$)/.test(p)) return read ? 'credential:read' : 'credential:write';
-  // Generating media spends the organization's credit through tavya's own
+  // Generating spends the organization's credit through tavya's own
   // OpenRouter connection: the capability of using a connected app.
-  if (/^\/api\/organizations\/[^/]+\/media(?:\/|$)/.test(p)) return 'connection:use';
-  if (p === '/api/media/models' && read) return 'none';
+  if (/^\/api\/organizations\/[^/]+\/generations(?:\/|$)/.test(p)) return 'connection:use';
+  if (p === '/api/generation-models' && read) return 'none';
   if (/^\/api\/projects\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'project:read' : 'skill:write';
   if (/^\/api\/projects\/[^/]+\/avatar-settings$/.test(p)) return read ? 'project:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/avatars(?:\/[^/]+)?$/.test(p)) return read ? 'project:read' : 'task:create';
@@ -8580,21 +8580,21 @@ export class Gateway {
         }
       }
 
-      // ── media generation on the credit (wiki features/media-generation) ──
-      // Images, video and speech from OpenRouter's models, paid with the
-      // organization's own OpenRouter key or, on tavya's, from its credit.
-      if (p === '/api/media/models' && method === 'GET') {
-        const media = await import('../agent/media.js');
+      // ── generation on the credit (wiki features/generate) ──
+      // Text, images, video and speech from OpenRouter's models, paid with
+      // the organization's own OpenRouter key or, on tavya's, from its credit.
+      if (p === '/api/generation-models' && method === 'GET') {
+        const generation = await import('../agent/generation.js');
         const kind = url.searchParams.get('kind') ?? '';
-        if (!(media.MEDIA_KINDS as readonly string[]).includes(kind))
-          return this.json(res, 400, { error: `kind must be one of ${media.MEDIA_KINDS.join(', ')}` });
-        return this.json(res, 200, { kind, models: await media.mediaModels(kind as typeof media.MEDIA_KINDS[number]) });
+        if (!(generation.GENERATION_KINDS as readonly string[]).includes(kind))
+          return this.json(res, 400, { error: `kind must be one of ${generation.GENERATION_KINDS.join(', ')}` });
+        return this.json(res, 200, { kind, models: await generation.generationModels(kind as typeof generation.GENERATION_KINDS[number]) });
       }
-      const orgMedia = p.match(/^\/api\/organizations\/([^/]+)\/media(?:\/([^/]+)(\/content)?)?$/);
-      if (orgMedia) {
-        const organizationId = decodeURIComponent(orgMedia[1]!);
-        const jobId = orgMedia[2] ? decodeURIComponent(orgMedia[2]) : undefined;
-        const media = await import('../agent/media.js');
+      const orgGeneration = p.match(/^\/api\/organizations\/([^/]+)\/generations(?:\/([^/]+)(\/content)?)?$/);
+      if (orgGeneration) {
+        const organizationId = decodeURIComponent(orgGeneration[1]!);
+        const jobId = orgGeneration[2] ? decodeURIComponent(orgGeneration[2]) : undefined;
+        const generation = await import('../agent/generation.js');
         const { ComputeCreditExhausted } = await import('../world/managed-compute.js');
         const deps = { store, broker: this.deps.broker, configHomes: this.deps.configHomes };
         const callerTaskId = authRecord.taskId && authRecord.taskId !== '*' ? authRecord.taskId : undefined;
@@ -8603,14 +8603,14 @@ export class Gateway {
           ? { taskId: callerTask.id, projectId: callerTask.projectId } : undefined;
         try {
           if (!jobId && method === 'POST') {
-            const result = await media.generateMedia(deps, organizationId, media.parseMediaRequest(await this.body(req)), task);
+            const result = await generation.generate(deps, organizationId, generation.parseGenerationRequest(await this.body(req)), task);
             return this.json(res, result.jobId ? 202 : 200, result);
           }
-          if (jobId && !orgMedia[3] && method === 'GET')
-            return this.json(res, 200, await media.mediaJob(deps, organizationId, jobId, { content: url.searchParams.get('content') === '1' }));
-          if (jobId && orgMedia[3] && method === 'GET') {
+          if (jobId && !orgGeneration[3] && method === 'GET')
+            return this.json(res, 200, await generation.generationJob(deps, organizationId, jobId, { content: url.searchParams.get('content') === '1' }));
+          if (jobId && orgGeneration[3] && method === 'GET') {
             const index = Math.max(0, Math.floor(Number(url.searchParams.get('index') ?? 0)) || 0);
-            const content = await media.mediaJobContent(deps, organizationId, jobId, index);
+            const content = await generation.generationJobContent(deps, organizationId, jobId, index);
             res.writeHead(200, { 'content-type': content.headers.get('content-type') ?? 'video/mp4',
               ...(content.headers.get('content-length') ? { 'content-length': content.headers.get('content-length')! } : {}),
               'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' });
@@ -8619,12 +8619,12 @@ export class Gateway {
             await pipeline(Readable.fromWeb(content.body as import('node:stream/web').ReadableStream<Uint8Array>), res).catch(() => { if (!res.writableEnded) res.destroy(); });
             return;
           }
-          return this.json(res, 405, { error: 'use POST /media, GET /media/:jobId or GET /media/:jobId/content' });
+          return this.json(res, 405, { error: 'use POST /generations, GET /generations/:jobId or GET /generations/:jobId/content' });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           if (error instanceof ComputeCreditExhausted) return this.json(res, 402, { error: message });
-          if (error instanceof media.MediaUnavailable) return this.json(res, 409, { error: message });
-          if (error instanceof media.MediaRequestError) return this.json(res, error.status, { error: message });
+          if (error instanceof generation.GenerationUnavailable) return this.json(res, 409, { error: message });
+          if (error instanceof generation.GenerationRequestError) return this.json(res, error.status, { error: message });
           throw error;
         }
       }

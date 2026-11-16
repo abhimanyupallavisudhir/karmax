@@ -840,17 +840,19 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     }),
   );
   // Clients outside a task (tavya's /mcp): the result comes back in the reply.
-  // In a task, karmax_control's generate_media saves it into the world instead.
-  if (options.tools?.has('generate_media')) server.registerTool(
-    'generate_media',
+  // In a task, karmax_control's generate saves it into the world instead.
+  if (options.tools?.has('generate')) server.registerTool(
+    'generate',
     {
       description:
-        `Generate an image, a video or speech with any model OpenRouter serves (Seedance, Veo, Kling, gpt-image, Nano Banana, ElevenLabs, …), paid from your ${BRAND} organization's credit — no account with the lab needed. Images and speech come back in this reply. A video returns a jobId: call again with jobId until it is completed, then download it from the URL given (with your ${BRAND} token). Models, prices, durations and voices: platform_request GET /api/media/models?kind=image|video|speech.`,
+        `Use any model OpenRouter serves, paid from your ${BRAND} organization's credit with no account at the lab: text (GPT, Gemini, DeepSeek, …), an image (gpt-image, Nano Banana, Flux…), a video (Seedance, Veo, Kling…) or speech (ElevenLabs…). What it can cost at most is worked out from the model's price list first and held on the credit; it is refused when the credit cannot cover that, or above maxCostUsd. Text, images and speech come back in this reply. A video returns a jobId: call again with jobId until it is completed, then download it from the URL given (with your ${BRAND} token). Models, prices, durations and voices: platform_request GET /api/generation-models?kind=text|image|video|speech.`,
       inputSchema: {
         organizationId: z.string(),
-        kind: z.enum(['image', 'video', 'speech']).optional(),
-        prompt: z.string().optional().describe('What to make; for speech, the text to say.'),
-        model: z.string().optional(), aspectRatio: z.string().optional(), resolution: z.string().optional(),
+        kind: z.enum(['text', 'image', 'video', 'speech']).optional(),
+        prompt: z.string().optional().describe('The question or what to make; for speech, the text to say.'),
+        model: z.string().optional(), maxCostUsd: z.number().optional(),
+        system: z.string().optional(), maxTokens: z.number().int().optional(), effort: z.enum(['minimal', 'low', 'medium', 'high']).optional(),
+        aspectRatio: z.string().optional(), resolution: z.string().optional(),
         count: z.number().int().min(1).max(10).optional(), duration: z.number().optional(), audio: z.boolean().optional(),
         voice: z.string().optional(), instructions: z.string().optional(),
         references: z.array(z.object({ url: z.string().describe('https: or base64 data: URL'),
@@ -862,16 +864,17 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       const org = encodeURIComponent(organizationId);
       try {
         const result = (jobId
-          ? await ops.platformRequest('GET', `/api/organizations/${org}/media/${encodeURIComponent(jobId)}`)
-          : await ops.platformRequest('POST', `/api/organizations/${org}/media`, request)) as {
-          status: string; jobId?: string; model?: string; costUsd?: number; outputs?: number; error?: string;
+          ? await ops.platformRequest('GET', `/api/organizations/${org}/generations/${encodeURIComponent(jobId)}`)
+          : await ops.platformRequest('POST', `/api/organizations/${org}/generations`, request)) as {
+          status: string; jobId?: string; model?: string; costUsd?: number; outputs?: number; error?: string; text?: string;
           files?: Array<{ mediaType: string; base64: string }> };
-        const { files, ...summary } = result;
+        const { files, text, ...summary } = result;
         const base = (process.env.KARMAX_PUBLIC_URL ?? '').replace(/\/$/, '');
         const downloads = result.jobId && result.status === 'completed'
           ? Array.from({ length: result.outputs ?? 1 }, (_, index) =>
-            `${base}/api/organizations/${org}/media/${encodeURIComponent(result.jobId!)}/content?index=${index}`) : undefined;
+            `${base}/api/organizations/${org}/generations/${encodeURIComponent(result.jobId!)}/content?index=${index}`) : undefined;
         return { content: [
+          ...(text !== undefined ? [{ type: 'text' as const, text }] : []),
           ...(files ?? []).map((file) => file.mediaType.startsWith('audio/')
             ? { type: 'audio' as const, data: file.base64, mimeType: file.mediaType }
             : { type: 'image' as const, data: file.base64, mimeType: file.mediaType }),

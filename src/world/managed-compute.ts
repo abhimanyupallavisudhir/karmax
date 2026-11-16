@@ -205,6 +205,27 @@ function exhausted(credit: ComputeCredit, provider: string): ComputeCreditExhaus
     + `Add a $10 pack or turn on auto top-up in Plan & billing, or ${own}. It renews on ${renews}.`);
 }
 
+/** Hold a generation's quote (provider cost micros) against the credit until
+ * `until` or until what it cost is booked (closeComputeHold). False when the
+ * organization's compute is unmetered (nothing to hold); refused with
+ * ComputeCreditExhausted, naming the quote and what is left, when the credit
+ * cannot cover it (wiki features/generate). */
+export async function holdGeneration(store: Store, request: { id: string; organizationId: string; taskId?: string; costMicros: number;
+  until: number; what: string }, now = Date.now()): Promise<boolean> {
+  if (!store.hosted) return false;
+  const entitlements = await store.organizationEntitlements(request.organizationId);
+  if (entitlements.computeCreditMicros == null) return false;
+  const creditMicros = entitlements.computeCreditMicros + (await topUpBalance(store, request.organizationId, entitlements.computeCreditMicros, now))
+    + ((await trialCredit(store, request.organizationId, computeMonth(now), now))?.monthMicros ?? 0);
+  if (await store.holdSpend({ id: request.id, organizationId: request.organizationId, ...(request.taskId ? { taskId: request.taskId } : {}),
+    provider: 'openrouter', amountMicros: request.costMicros, until: request.until }, creditMicros, now)) return true;
+  const credit = await computeCredit(store, request.organizationId, now);
+  const charge = computeChargeMicros(request.costMicros, await store.computePriceMultiplier(request.organizationId, now));
+  throw new ComputeCreditExhausted(`Out of compute: ${request.what} would cost up to ${dollars(charge)} of credit; `
+    + `${dollars(Math.max(0, credit.availableMicros ?? 0))} is left. Choose a cheaper model, a shorter or smaller one, `
+    + 'or add a $10 pack or auto top-up in Plan & billing.');
+}
+
 /** Why managed work on `provider` cannot go on: the credit as it stands. */
 export async function outOfCompute(store: Store, organizationId: string, provider: string, now = Date.now()): Promise<ComputeCreditExhausted> {
   return exhausted(await computeCredit(store, organizationId, now), provider);

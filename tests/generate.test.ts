@@ -1,7 +1,7 @@
-// Media generation on the compute credit (wiki features/media-generation):
-// images, video and speech from OpenRouter's models, paid with the
-// organization's own OpenRouter key or its key on tavya's account, whose spend
-// is booked to the credit.
+// Generation on the compute credit (wiki features/generate): text, images,
+// video and speech from OpenRouter's models, paid with the organization's own
+// OpenRouter key or its key on tavya's account; quoted from the model's price
+// list, the quote held on the credit, and settled at what it cost.
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -14,8 +14,10 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { organizationScope } from '../src/autonomy/vault-keys.js';
 import { saveIncludedModel } from '../src/agent/included-model.js';
 import { ComputeCreditExhausted, computeCredit, startComputeTrial } from '../src/world/managed-compute.js';
-import { MEDIA_DEFAULT_MODELS, MediaRequestError, MediaUnavailable, generateMedia, mediaJob, mediaJobContent, mediaModels,
-  parseMediaRequest, resetMediaCaches } from '../src/agent/media.js';
+import { GENERATION_DEFAULT_MODELS as MEDIA_DEFAULT_MODELS, GenerationRequestError as MediaRequestError, GenerationUnavailable as MediaUnavailable,
+  generate as generateMedia, generationJob as mediaJob, generationJobContent as mediaJobContent, generationModels as mediaModels,
+  parseGenerationRequest as parseMediaRequest, resetGenerationCaches as resetMediaCaches } from '../src/agent/generation.js';
+import { QUOTE_CEILING_USD, quoteImage, quoteSpeech, quoteText, quoteVideo, resetQuoteCache } from '../src/agent/generation-price.js';
 import { mediaPath, platformToolHandlers, SDK_CONTROL_TOOL_NAMES, TOOL_SCHEMAS } from '../src/agent/tools.js';
 import { routeCapability } from '../src/gateway/server.js';
 import { TOOL_CAPABILITY } from '../src/platform/capabilities.js';
@@ -48,7 +50,17 @@ beforeAll(async () => {
       if (url === '/models?output_modalities=speech') return send(200, { data: [
         { id: 'elevenlabs/eleven-flash-v2.5', name: 'Eleven Flash', pricing: { prompt: '0.00004' }, supported_voices: ['george', 'sarah'] }] });
       if (url === '/videos/models') return send(200, { data: [
-        { id: 'bytedance/seedance-2.0-fast', supported_durations: [4, 5], supported_resolutions: ['480p'], pricing_skus: { video_tokens: '0.0000042' } }] });
+        { id: 'bytedance/seedance-2.0-fast', supported_durations: [4, 5], supported_resolutions: ['480p'], pricing_skus: { video_tokens: '0.0000042' } },
+        // $0.40 a second, 8 s: $3.20 at OpenRouter's prices, $6.40 of credit.
+        { id: 'google/veo-3.1', supported_durations: [4, 6, 8], supported_resolutions: ['720p', '1080p'],
+          pricing_skus: { duration_seconds_with_audio: '0.40', duration_seconds_without_audio: '0.20' } },
+        // $1.00 a clip: $2.00 of credit.
+        { id: 'test/dollar', supported_durations: [5], supported_resolutions: ['720p'], pricing_skus: { cents_per_second_output: '20' } }] });
+      if (url === '/models') return send(200, { data: [
+        { id: 'deepseek/deepseek-v4.1-flash-1017', pricing: { prompt: '0.00000015', completion: '0.0000006',
+          overrides: [{ utc_days: ['monday'], prompt: '0.0000003', completion: '0.0000012' }] }, top_provider: { max_completion_tokens: 393216 } }] });
+      if (url.startsWith('/images/models/') && url.endsWith('/endpoints')) return send(200, { data: { endpoints: [
+        { pricing: [{ billable: 'output_image', unit: 'token', cost_usd: 0.000066 }] }] } });
       if (url === '/images/models') return send(200, { data: [
         { id: 'google/gemini-3.1-flash-image', supported_parameters: { aspect_ratio: { type: 'enum', values: ['1:1'] } } }] });
       // Key management, with the management key.
@@ -72,6 +84,10 @@ beforeAll(async () => {
         if (spender) spender.usage += 0.04 * (body.n ?? 1);
         return send(200, { created: 0, data: Array.from({ length: body.n ?? 1 }, () => ({ b64_json: PNG.toString('base64'), media_type: 'image/png' })),
           usage: { cost: 0.04 * (body.n ?? 1) } });
+      }
+      if (req.method === 'POST' && url === '/chat/completions') {
+        if (spender) spender.usage += 0.0001;
+        return send(200, { choices: [{ message: { content: 'Four.' }, finish_reason: 'stop' }], usage: { cost: 0.0001 } });
       }
       if (req.method === 'POST' && url === '/audio/speech') {
         if (spender) spender.usage += 0.001;
@@ -104,7 +120,7 @@ afterAll(async () => { delete process.env.KARMAX_OPENROUTER_API_URL; await new P
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
-  keys.clear(); jobs.clear(); calls.length = 0; refuse = undefined; resetMediaCaches();
+  keys.clear(); jobs.clear(); calls.length = 0; refuse = undefined; resetMediaCaches(); resetQuoteCache();
 });
 
 const T = Date.now();
@@ -121,11 +137,13 @@ async function fixture(options: { hosted?: boolean; included?: boolean; credit?:
   return { store, broker, organization, deps: { store, broker } };
 }
 
-const mediaCalls = () => calls.filter((call) => !call.path.startsWith('/keys') && !call.path.startsWith('/models'));
+const mediaCalls = () => calls.filter((call) => !call.path.startsWith('/keys') && !call.path.startsWith('/models') && !call.path.startsWith('/videos/models')
+  && !call.path.startsWith('/images/models'));
 
 describe('media requests', () => {
   it('are checked before anything is spent', () => {
-    expect(() => parseMediaRequest({ kind: 'sculpture', prompt: 'x' })).toThrow(/kind must be one of image, video, speech/);
+    expect(() => parseMediaRequest({ kind: 'sculpture', prompt: 'x' })).toThrow(/kind must be one of text, image, video, speech/);
+    expect(() => parseMediaRequest({ kind: 'text', prompt: 'x', effort: 'max' })).toThrow(/effort must be/);
     expect(() => parseMediaRequest({ kind: 'image', prompt: '  ' })).toThrow(/prompt is required/);
     expect(() => parseMediaRequest({ kind: 'image', prompt: 'x', model: 'not a model' })).toThrow(/OpenRouter model id/);
     expect(() => parseMediaRequest({ kind: 'image', prompt: 'x', count: 11 })).toThrow(/count must be an integer from 1 to 10/);
@@ -179,7 +197,7 @@ describe('media generation', () => {
     // Another organization cannot see the job.
     const other = await f.store.createOrganization({ name: 'Other', ownerUserId: 'owner' });
     await startComputeTrial(f.store, other.id, 'owner', T - 1000);
-    await expect(mediaJob(f.deps, other.id, 'gen-vid-1')).rejects.toMatchObject({ name: 'MediaRequestError', status: 404 });
+    await expect(mediaJob(f.deps, other.id, 'gen-vid-1')).rejects.toMatchObject({ name: 'GenerationRequestError', status: 404 });
     await expect(mediaJobContent(f.deps, other.id, 'gen-vid-1')).rejects.toBeInstanceOf(MediaRequestError);
   });
 
@@ -210,25 +228,25 @@ describe('media generation', () => {
   });
 
   it('lists each kind\'s models with what they support and cost, marking the default', async () => {
-    expect(await mediaModels('video')).toEqual([{ id: 'bytedance/seedance-2.0-fast', pricing: { video_tokens: '0.0000042' },
+    expect((await mediaModels('video')).filter((model) => model.id === 'bytedance/seedance-2.0-fast')).toEqual([{ id: 'bytedance/seedance-2.0-fast', pricing: { video_tokens: '0.0000042' },
       durations: [4, 5], resolutions: ['480p'], default: true }]);
     expect((await mediaModels('speech'))[0]).toMatchObject({ voices: ['george', 'sarah'], default: true });
     expect((await mediaModels('image'))[0]).toMatchObject({ parameters: { aspect_ratio: { values: ['1:1'] } }, default: true });
   });
 });
 
-describe('the generate_media tool', () => {
+describe('the generate tool', () => {
   const tool = (world: World, platformRequest: (method: string, path: string, body?: any) => Promise<unknown>) =>
-    platformToolHandlers(world as any, { platformRequest, emit: () => {} } as any).generate_media!;
+    platformToolHandlers(world as any, { platformRequest, emit: () => {} } as any).generate!;
 
   it('is a turn-local tool that needs connection:use, offered on tavya\'s /mcp too', () => {
-    expect(SDK_CONTROL_TOOL_NAMES.has('generate_media')).toBe(true);
-    expect(TOOL_SCHEMAS.find((schema) => schema.name === 'generate_media')?.parameters.required).toEqual(['organization_id', 'path']);
-    expect(TOOL_CAPABILITY.generate_media).toBe('connection:use');
-    expect(routeCapability('POST', '/api/organizations/org_1/media')).toBe('connection:use');
-    expect(routeCapability('GET', '/api/organizations/org_1/media/gen-vid-1/content')).toBe('connection:use');
-    expect(routeCapability('GET', '/api/media/models')).toBe('none');
-    expect(REMOTE_MCP_TOOLS.has('generate_media')).toBe(true);
+    expect(SDK_CONTROL_TOOL_NAMES.has('generate')).toBe(true);
+    expect(TOOL_SCHEMAS.find((schema) => schema.name === 'generate')?.parameters.required).toEqual(['organization_id', 'kind']);
+    expect(TOOL_CAPABILITY.generate).toBe('connection:use');
+    expect(routeCapability('POST', '/api/organizations/org_1/generations')).toBe('connection:use');
+    expect(routeCapability('GET', '/api/organizations/org_1/generations/gen-vid-1/content')).toBe('connection:use');
+    expect(routeCapability('GET', '/api/generation-models')).toBe('none');
+    expect(REMOTE_MCP_TOOLS.has('generate')).toBe(true);
   });
 
   it('names the files it saves after the path asked for', () => {
@@ -250,7 +268,7 @@ describe('the generate_media tool', () => {
       references: [{ path: 'in/logo.png' }, { url: 'https://a.example/b.png' }] }));
     expect(result).toEqual({ status: 'completed', model: 'm/x', costUsd: 0.04, paidFrom: 'credit', saved: ['out/pic.png', 'out/pic-2.png'] });
     expect(await world.readFileBuffer('out/pic-2.png')).toEqual(PNG);
-    expect(requests[0]).toMatchObject({ method: 'POST', requestPath: '/api/organizations/org_1/media', body: { kind: 'image', count: 2,
+    expect(requests[0]).toMatchObject({ method: 'POST', requestPath: '/api/organizations/org_1/generations', body: { kind: 'image', count: 2,
       references: [{ url: `data:image/png;base64,${Buffer.from('PNGDATA').toString('base64')}` }, { url: 'https://a.example/b.png' }] } });
   });
 
@@ -261,7 +279,7 @@ describe('the generate_media tool', () => {
     let polls = 0;
     const request = async (method: string, requestPath: string) => {
       if (method === 'POST') return { status: 'pending', jobId: 'gen-vid-9', model: 'v/x', funding: 'credit' };
-      expect(requestPath).toBe('/api/organizations/org_1/media/gen-vid-9?content=1');
+      expect(requestPath).toBe('/api/organizations/org_1/generations/gen-vid-9?content=1');
       return ++polls < 3 ? { status: 'in_progress', jobId: 'gen-vid-9', model: 'v/x' }
         : { status: 'completed', jobId: 'gen-vid-9', model: 'v/x', costUsd: 0.3, files: [{ mediaType: 'video/mp4', base64: MP4.toString('base64') }] };
     };
@@ -270,28 +288,28 @@ describe('the generate_media tool', () => {
     expect(await world.readFileBuffer('clip.mp4')).toEqual(MP4);
     polls = 0;
     expect(JSON.parse(await tool(world, request)({ organization_id: 'org_1', kind: 'video', prompt: 'p', path: 'clip2.mp4', wait_minutes: 0 })))
-      .toMatchObject({ status: 'pending', job_id: 'gen-vid-9', next: expect.stringMatching(/call generate_media again with this job_id/) });
+      .toMatchObject({ status: 'pending', job_id: 'gen-vid-9', next: expect.stringMatching(/call generate again with this job_id/) });
     expect(JSON.parse(await tool(world, request)({ organization_id: 'org_1', job_id: 'gen-vid-9', path: 'clip2.mp4' })))
       .toMatchObject({ status: 'completed', saved: ['clip2.mp4'] });
   });
 });
 
-describe('generate_media on tavya\'s /mcp', () => {
+describe('generate on tavya\'s /mcp', () => {
   it('answers with the image or audio itself, and a video\'s download address once rendered', async () => {
     const answers: Record<string, unknown> = {
-      'POST /api/organizations/org_1/media': { status: 'completed', kind: 'image', model: 'm/x', files: [{ mediaType: 'image/png', base64: 'AAAA' }] },
-      'GET /api/organizations/org_1/media/gen-vid-1': { status: 'completed', kind: 'video', jobId: 'gen-vid-1', outputs: 1 },
+      'POST /api/organizations/org_1/generations': { status: 'completed', kind: 'image', model: 'm/x', files: [{ mediaType: 'image/png', base64: 'AAAA' }] },
+      'GET /api/organizations/org_1/generations/gen-vid-1': { status: 'completed', kind: 'video', jobId: 'gen-vid-1', outputs: 1 },
     };
     const ops = { platformRequest: async (method: string, requestPath: string) => answers[`${method} ${requestPath}`] } as unknown as PlatformOps;
     const server = createPlatformMcpServer(ops, { tools: REMOTE_MCP_TOOLS });
-    const handler = (server as any)._registeredTools.generate_media.handler ?? (server as any)._registeredTools.generate_media.callback;
+    const handler = (server as any)._registeredTools.generate.handler ?? (server as any)._registeredTools.generate.callback;
     const image = await handler({ organizationId: 'org_1', kind: 'image', prompt: 'x' }, {});
     expect(image.content[0]).toEqual({ type: 'image', data: 'AAAA', mimeType: 'image/png' });
     expect(JSON.parse(image.content[1].text)).toEqual({ status: 'completed', kind: 'image', model: 'm/x' });
     const video = await handler({ organizationId: 'org_1', jobId: 'gen-vid-1' }, {});
-    expect(JSON.parse(video.content[0].text).downloads).toEqual(['/api/organizations/org_1/media/gen-vid-1/content?index=0']);
+    expect(JSON.parse(video.content[0].text).downloads).toEqual(['/api/organizations/org_1/generations/gen-vid-1/content?index=0']);
     // Inside a task, karmax_control's tool saves into the world instead.
-    expect((createPlatformMcpServer(ops) as any)._registeredTools.generate_media).toBeUndefined();
+    expect((createPlatformMcpServer(ops) as any)._registeredTools.generate).toBeUndefined();
   });
 });
 
@@ -332,24 +350,141 @@ describe('the media routes', () => {
     const call = (p: string, token: string, body?: unknown) => fetch(running.url + p, { method: body ? 'POST' : 'GET',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, ...(body ? { body: JSON.stringify(body) } : {}) });
 
-    const image = await call(`/api/organizations/${org}/media`, agent, { kind: 'image', prompt: 'a red circle' });
+    const image = await call(`/api/organizations/${org}/generations`, agent, { kind: 'image', prompt: 'a red circle' });
     expect(image.status).toBe(200);
     expect(await image.json()).toMatchObject({ status: 'completed', funding: 'own', files: [{ mediaType: 'image/png' }] });
-    expect((await call(`/api/organizations/${org}/media`, agent, { kind: 'image', prompt: '' })).status).toBe(400);
-    expect((await call(`/api/organizations/${org}/media`, reader, { kind: 'image', prompt: 'x' })).status).toBe(403);
-    expect((await call(`/api/organizations/${otherOrg}/media`, agent, { kind: 'image', prompt: 'x' })).status).toBe(403);
+    expect((await call(`/api/organizations/${org}/generations`, agent, { kind: 'image', prompt: '' })).status).toBe(400);
+    expect((await call(`/api/organizations/${org}/generations`, reader, { kind: 'image', prompt: 'x' })).status).toBe(403);
+    expect((await call(`/api/organizations/${otherOrg}/generations`, agent, { kind: 'image', prompt: 'x' })).status).toBe(403);
 
-    const started = await call(`/api/organizations/${org}/media`, agent, { kind: 'video', prompt: 'the flower sways' });
+    const started = await call(`/api/organizations/${org}/generations`, agent, { kind: 'video', prompt: 'the flower sways' });
     expect(started.status).toBe(202);
     const { jobId } = await started.json() as { jobId: string };
-    expect(JSON.parse((await store.kvGet(`media-job:${jobId}`))!)).toMatchObject({ organizationId: org, taskId: task.id, projectId: project });
-    expect(await (await call(`/api/organizations/${org}/media/${jobId}`, agent)).json()).toMatchObject({ status: 'pending' });
-    expect(await (await call(`/api/organizations/${org}/media/${jobId}`, agent)).json()).toMatchObject({ status: 'completed', outputs: 1 });
-    const content = await call(`/api/organizations/${org}/media/${jobId}/content?index=0`, agent);
+    expect(JSON.parse((await store.kvGet(`generation-job:${jobId}`))!)).toMatchObject({ organizationId: org, taskId: task.id, projectId: project });
+    expect(await (await call(`/api/organizations/${org}/generations/${jobId}`, agent)).json()).toMatchObject({ status: 'pending' });
+    expect(await (await call(`/api/organizations/${org}/generations/${jobId}`, agent)).json()).toMatchObject({ status: 'completed', outputs: 1 });
+    const content = await call(`/api/organizations/${org}/generations/${jobId}/content?index=0`, agent);
     expect(content.headers.get('content-type')).toBe('video/mp4');
     expect(Buffer.from(await content.arrayBuffer())).toEqual(MP4);
-    expect((await call(`/api/organizations/${org}/media/gen-vid-404`, agent)).status).toBe(404);
-    const models = await fetch(`${running.url}/api/media/models?kind=speech`, { headers: { authorization: `Bearer ${reader}` } });
+    expect((await call(`/api/organizations/${org}/generations/gen-vid-404`, agent)).status).toBe(404);
+    const models = await fetch(`${running.url}/api/generation-models?kind=speech`, { headers: { authorization: `Bearer ${reader}` } });
     expect(await models.json()).toMatchObject({ kind: 'speech', models: [{ id: 'elevenlabs/eleven-flash-v2.5' }] });
+  });
+});
+
+describe('quotes from OpenRouter\'s price lists', () => {
+  it('prices a video per second at its resolution, per video token, per megapixel, with minimums and input images, at the longest when no duration is given', () => {
+    // The live run of 2026-11-16: $0.015 charged.
+    expect(quoteVideo({ supported_durations: [3, 5], supported_resolutions: ['480p', '720p'],
+      pricing_skus: { cents_per_video_output_second_480p: '0.5', cents_per_video_output_second_720p: '1' } },
+    { prompt: 'x', duration: 3, resolution: '480p' })).toEqual({ usd: 0.015, basis: 'price-list' });
+    // Unsure of audio and resolution: the dearest SKU that may apply, at the longest duration.
+    const veo = { supported_durations: [4, 6, 8], supported_resolutions: ['720p', '1080p', '4K'],
+      pricing_skus: { duration_seconds_with_audio: '0.40', duration_seconds_with_audio_4k: '0.60', duration_seconds_without_audio: '0.20' } };
+    expect(quoteVideo(veo, { prompt: 'x' }).usd).toBeCloseTo(4.8);
+    expect(quoteVideo(veo, { prompt: 'x', resolution: '1080p', duration: 4 }).usd).toBeCloseTo(1.6);
+    // Seedance: tokens ≈ width × height × 24 fps × seconds / 1024.
+    expect(quoteVideo({ supported_durations: [4, 5], supported_resolutions: ['480p', '720p'], pricing_skus: { video_tokens: '0.0000042' } },
+      { prompt: 'x', duration: 5, resolution: '720p' }).usd).toBeCloseTo(1280 * 720 * 24 * 5 / 1024 * 0.0000042);
+    expect(quoteVideo({ pricing_skus: { cents_per_megapixel_second_precise: '3.5', cents_per_megapixel_second_creative: '5' } },
+      { prompt: 'x', duration: 10, resolution: '1080p' }).usd).toBeCloseTo(0.05 * 1920 * 1080 / 1e6 * 10);
+    expect(quoteVideo({ pricing_skus: { cents_per_second_output: '28', minimum_cents_per_generation: '56' } }, { prompt: 'x', duration: 1 }).usd).toBeCloseTo(0.56);
+    expect(quoteVideo({ supported_durations: [5], pricing_skus: { duration_seconds: '0.13', reference_images: '0.04' } },
+      { prompt: 'x', references: 2 }).usd).toBeCloseTo(0.73);
+    expect(quoteVideo({ pricing_skus: { something_new: '1' } }, { prompt: 'x' })).toEqual({ usd: QUOTE_CEILING_USD.video, basis: 'ceiling' });
+  });
+
+  it('prices images per image at the resolution asked for, or per token at a ceiling of output tokens, at the dearest provider', () => {
+    const flux = [{ pricing: [{ billable: 'output_image', unit: 'image', cost_usd: 0.041, variant: '768' },
+      { billable: 'output_image', unit: 'image', cost_usd: 0.1, variant: '2k' }] }];
+    expect(quoteImage(flux, { prompt: 'x', resolution: '768', count: 2 }).usd).toBeCloseTo(0.082);
+    expect(quoteImage(flux, { prompt: 'x' }).usd).toBeCloseTo(0.1);
+    // Gemini at 1K: measured $0.067; the quote bounds it.
+    const gemini = [{ pricing: [{ billable: 'output_image', unit: 'token', cost_usd: 0.000066 }] }];
+    const quoted = quoteImage(gemini, { prompt: 'x', resolution: '1K' }).usd;
+    expect(quoted).toBeGreaterThan(0.067);
+    expect(quoted).toBeLessThan(0.2);
+    expect(quoteImage([...gemini, { pricing: [{ billable: 'output_image', unit: 'image', cost_usd: 0.5 }] }], { prompt: 'x' }).usd).toBe(0.5);
+    expect(quoteImage([], { prompt: 'x', count: 3 })).toEqual({ usd: 3 * QUOTE_CEILING_USD.image, basis: 'ceiling' });
+  });
+
+  it('prices text at its dearest hour, the reply at max tokens; speech per character and per second', () => {
+    const deepseek = { pricing: { prompt: '0.00000015', completion: '0.0000006', overrides: [{ prompt: '0.0000003', completion: '0.0000012' }] },
+      top_provider: { max_completion_tokens: 1000 } };
+    expect(quoteText(deepseek, { prompt: 'x'.repeat(3000), maxTokens: 5000 }).usd).toBeCloseTo(1000 * 0.0000003 + 1000 * 0.0000012);
+    expect(quoteText(undefined, { prompt: 'x' })).toEqual({ usd: QUOTE_CEILING_USD.text, basis: 'ceiling' });
+    expect(quoteSpeech({ pricing: { prompt: '0.00004', completion: '0' } }, { prompt: 'x'.repeat(1000) }).usd).toBeCloseTo(0.04);
+    expect(quoteSpeech({ pricing: { prompt: '0', completion: '0.0025' } }, { prompt: 'x'.repeat(100) }).usd).toBeCloseTo(0.025);
+  });
+});
+
+describe('holding the quote on the credit', () => {
+  it('refuses before OpenRouter is called when the credit cannot cover the quote, or the quote is above maxCostUsd', async () => {
+    const f = await fixture(); // $5 of credit: $2.50 at OpenRouter's prices
+    const refused = await generateMedia(f.deps, f.organization.id, { kind: 'video', model: 'google/veo-3.1', prompt: 'x' }).catch((error) => error);
+    expect(refused).toBeInstanceOf(ComputeCreditExhausted);
+    expect(refused.message).toMatch(/would cost up to \$6\.40 of credit; \$5\.00 is left/);
+    await expect(generateMedia(f.deps, f.organization.id, { kind: 'video', model: 'test/dollar', prompt: 'x', maxCostUsd: 0.5 }))
+      .rejects.toThrow(/may cost up to \$1\.000, above maxCostUsd \$0\.5/);
+    expect(mediaCalls()).toHaveLength(0);
+    expect((await computeCredit(f.store, f.organization.id)).heldMicros).toBe(0);
+  });
+
+  it('holds each running video\'s quote so several cannot together spend past the credit, and settles each at its cost', async () => {
+    const f = await fixture();
+    const first = await generateMedia(f.deps, f.organization.id, { kind: 'video', model: 'test/dollar', prompt: 'a' }, { taskId: 'task_1' });
+    expect(first).toMatchObject({ quoteUsd: 1, quoteBasis: 'price-list', status: 'pending' });
+    await generateMedia(f.deps, f.organization.id, { kind: 'video', model: 'test/dollar', prompt: 'b' });
+    expect((await computeCredit(f.store, f.organization.id)).heldMicros).toBe(4_000_000);
+    // The key's limit leaves room for what is held: OpenRouter must not refuse the held videos.
+    expect([...keys.values()][0]!.limit).toBe(2.5);
+    await expect(generateMedia(f.deps, f.organization.id, { kind: 'video', model: 'test/dollar', prompt: 'c' })).rejects.toBeInstanceOf(ComputeCreditExhausted);
+    expect(mediaCalls().filter((call) => call.path === '/videos')).toHaveLength(2);
+    // The first finishes ($0.30: $0.60 of credit): its hold gives way to what it cost.
+    await mediaJob(f.deps, f.organization.id, first.jobId!);
+    expect(await mediaJob(f.deps, f.organization.id, first.jobId!)).toMatchObject({ status: 'completed', costUsd: 0.3, quoteUsd: 1 });
+    const credit = await computeCredit(f.store, f.organization.id);
+    expect(credit).toMatchObject({ usedMicros: 600_000, heldMicros: 2_000_000, availableMicros: 2_400_000 });
+    expect(await generateMedia(f.deps, f.organization.id, { kind: 'video', model: 'test/dollar', prompt: 'c' })).toMatchObject({ status: 'pending' });
+  });
+
+  it('holds an image, speech or text only while it runs, and releases the hold when OpenRouter refuses', async () => {
+    const f = await fixture();
+    expect(await generateMedia(f.deps, f.organization.id, { kind: 'image', prompt: 'x' })).toMatchObject({ quoteBasis: 'price-list' });
+    expect((await computeCredit(f.store, f.organization.id)).heldMicros).toBe(0);
+    refuse = { status: 400, message: 'bad prompt' };
+    await expect(generateMedia(f.deps, f.organization.id, { kind: 'image', prompt: 'x' })).rejects.toThrow(/bad prompt/);
+    refuse = { status: 400, message: 'bad video' };
+    await expect(generateMedia(f.deps, f.organization.id, { kind: 'video', model: 'test/dollar', prompt: 'x' })).rejects.toThrow(/bad video/);
+    expect((await computeCredit(f.store, f.organization.id)).heldMicros).toBe(0);
+  });
+
+  it('holds nothing on the organization\'s own key, but still applies maxCostUsd', async () => {
+    const f = await fixture({ ownKey: true, credit: false });
+    expect(await generateMedia(f.deps, f.organization.id, { kind: 'video', model: 'google/veo-3.1', prompt: 'x' })).toMatchObject({ funding: 'own', quoteUsd: 3.2 });
+    await expect(generateMedia(f.deps, f.organization.id, { kind: 'video', model: 'google/veo-3.1', prompt: 'x', maxCostUsd: 1 })).rejects.toThrow(/above maxCostUsd/);
+  });
+});
+
+describe('text', () => {
+  it('asks any OpenRouter model, defaulting to the included model, with private routing, and books what it cost', async () => {
+    const f = await fixture();
+    const result = await generateMedia(f.deps, f.organization.id, { kind: 'text', prompt: 'What is 2 + 2?', system: 'Be brief.', maxTokens: 100, effort: 'low' },
+      { taskId: 'task_t' });
+    expect(result).toMatchObject({ kind: 'text', model: 'deepseek/deepseek-v4.1-flash-1017', status: 'completed', text: 'Four.', costUsd: 0.0001, funding: 'credit' });
+    expect(mediaCalls()[0]).toMatchObject({ path: '/chat/completions', body: { model: 'deepseek/deepseek-v4.1-flash-1017', max_tokens: 100,
+      reasoning: { effort: 'low' }, provider: { zdr: true },
+      messages: [{ role: 'system', content: 'Be brief.' }, { role: 'user', content: 'What is 2 + 2?' }] } });
+    expect((await computeCredit(f.store, f.organization.id)).byProvider).toEqual([{ provider: 'openrouter', usedMicros: 200, seconds: 0 }]);
+  });
+
+  it('answers in the tool result, and saves to path when one is given', async () => {
+    const world = await new MemoryWorldProvider().create({ taskId: 'generate-text', base: 'main' });
+    const handler = platformToolHandlers(world as any, { platformRequest: async () => ({ status: 'completed', model: 'm/x', text: 'Four.', quoteUsd: 0.01 }),
+      emit: () => {} } as any).generate!;
+    expect(JSON.parse(await handler({ organization_id: 'org_1', kind: 'text', prompt: '2+2?' }))).toEqual({ status: 'completed', model: 'm/x', quoteUsd: 0.01, text: 'Four.' });
+    expect(JSON.parse(await handler({ organization_id: 'org_1', kind: 'text', prompt: '2+2?', path: 'answer.md' })).saved).toEqual(['answer.md']);
+    expect(await world.readFile('answer.md')).toBe('Four.');
+    await expect(handler({ organization_id: 'org_1', kind: 'image', prompt: 'x' })).rejects.toThrow(/path is required/);
   });
 });
