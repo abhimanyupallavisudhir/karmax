@@ -2399,8 +2399,6 @@ a.ins-task-title:hover { color: var(--accent); }
 .task-row.unread.cursor { box-shadow: inset 3px 0 0 var(--accent), 0 0 0 3px var(--accent-weak); }
 .task-row:focus-visible, .queue-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .kbd { margin-left: 7px; font-family: var(--font-mono); font-size: var(--fs-10); line-height: 1.5; color: var(--ink-3); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
-/* A touch screen with no keyboard has no shortcuts to show (the phone apps, phones in a browser). */
-@media (hover: none) and (pointer: coarse) { .kbd { display: none; } }
 .btn.primary .kbd, .btn.danger .kbd { color: inherit; border-color: currentColor; opacity: .7; }
 /* "?" help: sections flow into two columns on a wide screen, one on a phone. */
 .help-panel { width: min(780px, 94vw); max-height: 80vh; display: flex; flex-direction: column; }

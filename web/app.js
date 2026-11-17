@@ -14185,8 +14185,9 @@ function conversationPane(v, t) {
           <textarea class="followup-input"${narrowViewport() ? ' rows="1"' : ''} placeholder="${followupPlaceholder(v, t, agentName)}" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
           ${t.shared ? newAgentFormsHtml(v, `${v.taskId}/${t.role}`) : ''}
           <div class="img-chips attachment-chips followup-chips" style="display:none"></div>
-          <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label>${policyTip(`Drop or paste files here (25 MB each, 50 MB per message). Type ${t.shared ? '@ to bring in an agent or a person, ' : ''}[[ to add a wiki page.`)}${followUp.enabled ? micButtonHtml(`followup:${v.taskId}/${t.role}`) : ''}
+          <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label>${policyTip(`Drop or paste files here (25 MB each, 50 MB per message). Type ${t.shared ? '@ to bring in an agent or a person, ' : ''}[[ to add a wiki page.`)}
             <span class="followup-buttons">
+              ${followUp.enabled ? micButtonHtml(`followup:${v.taskId}/${t.role}`) : ''}
               ${t.shared && stoppableAgent(v) ? stopAgentButton(stoppableAgent(v), 'btn followup-stop') : ''}
               <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}${continues ? ' title="The approved PR lands as it is. The agent carries on in a new task."' : ''}>${continues ? 'Continue' : 'Send'}</button>
             </span></div>
