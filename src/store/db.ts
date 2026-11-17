@@ -6037,6 +6037,13 @@ export class Store {
     return ids.length;
   }
 
+  /** The people who asked to cancel a task (`task.cancel-requested` `by`). */
+  private async cancellersOf(taskId: string): Promise<string[]> {
+    return ((await this.db.prepare(`SELECT DISTINCT json_extract(payload, '$.by') AS by FROM events
+      WHERE taskId=? AND type='task.cancel-requested'`).all(taskId)) as Array<{ by: unknown }>)
+      .map((row) => row.by).filter((by): by is string => typeof by === 'string');
+  }
+
   /** Approval asks on a task that still ask someone: neither answered nor
    * ignored since they were (last) raised. A request passed on to other people
    * is raised again, so an earlier Ignore no longer silences it. */
@@ -6175,6 +6182,15 @@ export class Store {
     } else if (finished) {
       kind = 'update';
       for (const subscriber of (await this.subscribersFor(task.id))) users.push(...(await this.expandPrincipal(subscriber, task.projectId)));
+      // A task you cancelled yourself is not news to you.
+      if (status === 'cancelled') {
+        const cancellers = new Set((await this.cancellersOf(task.id)));
+        users = users.filter((userId) => !cancellers.has(userId));
+      }
+    } else if (ev.type === 'task.cancel-requested' && typeof ev.payload.by === 'string') {
+      // Recorded once the workflow accepted it, so the task may have ended first.
+      (await this.deleteInbox("taskId=? AND userId=? AND kind='update'", [task.id, ev.payload.by]));
+      return;
     }
     if (!kind) return;
     // The requester states urgency ONCE, on the event that raises the ask; the

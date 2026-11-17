@@ -7925,8 +7925,11 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
         await handle.signal(signal);
         // Interrupt expensive waiting-world maintenance after Temporal accepts
         // cancellation, without waiting for the workflow's next publication.
-        if (signal === SIG.cancel) await this.deps.store.appendEvent({ taskId,
-          type: 'task.cancel-requested', ts: Date.now(), payload: {} });
+        // Who asked, so their own cancellation is not news to them (the inbox).
+        if (signal === SIG.cancel) {
+          const by = speakingUser(caller);
+          await this.deps.store.appendEvent({ taskId, type: 'task.cancel-requested', ts: Date.now(), payload: by ? { by } : {} });
+        }
       }
       if (ACCEPTED_ACTIONS.has(signal)) {
         await this.deps.store.appendEvent({ taskId, type: 'task.transition-requested', ts: Date.now(), payload: { signal } });
