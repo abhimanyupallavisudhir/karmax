@@ -233,17 +233,20 @@ describe('chat bots', () => {
 describe('chat accounts linked to people', () => {
   let dir: string;
   let calls: Array<{ url: string; body?: any }>;
+  const override: Record<string, unknown> = {};
   const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
     calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
-    const answer = url.includes('getMe') ? { ok: true, result: { id: 42, username: 'tavya_bot' } }
-      : url.includes('sendMessage') ? { ok: true, result: { message_id: 900 } } : { ok: true };
+    const answer = Object.entries(override).find(([fragment]) => url.includes(fragment))?.[1]
+      ?? (url.includes('getMe') ? { ok: true, result: { id: 42, username: 'tavya_bot' } }
+      : url.includes('sendMessage') ? { ok: true, result: { message_id: 900 } } : { ok: true });
     return new Response(JSON.stringify(answer), { status: 200, headers: { 'content-type': 'application/json' } });
   }) as typeof fetch;
 
   async function fixture() {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-chat-link-'));
     calls = [];
+    for (const key of Object.keys(override)) delete override[key];
     const store = await Store.create(':memory:');
     const organization = await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
     const project = await store.createProject('Site', {}, organization.id);
@@ -308,6 +311,79 @@ describe('chat accounts linked to people', () => {
     await expect(f.api.pendingChatLink(await f.human('dev'), token)).rejects.toThrow(/used already, expired or is not valid/);
     expect(JSON.stringify(await f.store.kvEntries('chat-link'))).not.toContain(token);
     expect(await f.api.listChatLinks(await f.human('dev'))).toMatchObject([{ id: link.id, platform: 'telegram', platformName: 'Ada', bot: { name: 'Telegram bot' } }]);
+  });
+
+  it('a link token reaches only its person: a group is told to message the bot directly, and the link goes there', async () => {
+    const f = await fixture();
+    const { hook } = await f.connect();
+    const secret = calls.filter((call) => call.url.endsWith('/setWebhook')).at(-1)!.body.secret_token as string;
+    let update = 100;
+    const inGroup = (from: { id: number; first_name: string }, text: string) => f.api.receiveIncomingWebhook(hook.id, { method: 'POST', contentType: 'application/json',
+      raw: Buffer.from(JSON.stringify({ update_id: ++update, message: { message_id: 700 + update, text, from, chat: { id: -100, type: 'supergroup', title: 'Team' } } })),
+      headers: { 'x-telegram-bot-api-secret-token': secret }, query: new URLSearchParams() });
+    const sent = () => calls.filter((call) => call.url.endsWith('/sendMessage')).map((call) => call.body);
+
+    // Someone the bot does not know asks in a group: everyone there would see a
+    // link, so the group is told to message the bot instead, and no token exists.
+    expect((await inGroup(ada, '@tavya_bot fix the login page')).events).toEqual([]);
+    await vi.waitFor(() => expect(sent()).toHaveLength(1));
+    expect(sent()[0]).toMatchObject({ chat_id: '-100' });
+    expect(sent()[0].text).toBe('Message me directly to link your tavya account: https://t.me/tavya_bot');
+    expect(JSON.stringify(sent())).not.toContain('/link/chat');
+    expect(await f.store.kvEntries('chat-link-token:')).toEqual([]);
+    // …once while that would still hold, so the group is not spammed.
+    await inGroup(ada, '@tavya_bot hello?');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(sent()).toHaveLength(1);
+
+    // In a direct message the link goes to them alone.
+    const direct = await f.api.receiveIncomingWebhook(hook.id, { method: 'POST', contentType: 'application/json',
+      raw: Buffer.from(JSON.stringify({ update_id: ++update, message: { message_id: 800, text: 'hi', from: ada, chat: { id: 7, type: 'private' } } })),
+      headers: { 'x-telegram-bot-api-secret-token': secret }, query: new URLSearchParams() });
+    expect(direct.events).toEqual([]);
+    await vi.waitFor(() => expect(sent()).toHaveLength(2));
+    expect(sent()[1]).toMatchObject({ chat_id: '7' });
+    expect(f.linkSent()).toBeTruthy();
+  });
+
+  it('Slack: a channel mention gets its link where only the sender sees it; a failed whisper never falls back to the channel', async () => {
+    const f = await fixture();
+    const { hook } = await f.api.createIncomingWebhook(await f.human('maint'), f.project.id, { name: 'Slack bot', kind: 'slack',
+      credentials: { signingSecret: 'sss', botToken: 'xoxb-1' } }, { hookUrl: (id) => `https://tavya.example/api/hooks/${id}`, fetcher });
+    let n = 0;
+    const slack = (user: string, event: Record<string, unknown>) => {
+      const raw = JSON.stringify({ type: 'event_callback', event_id: `Ev${++n}`, event: { user, ts: `17000.${n}`, ...event } });
+      const at = String(Math.floor(Date.now() / 1000));
+      const signature = `v0=${crypto.createHmac('sha256', 'sss').update(`v0:${at}:${raw}`).digest('hex')}`;
+      return f.api.receiveIncomingWebhook(hook.id, { method: 'POST', contentType: 'application/json', raw: Buffer.from(raw),
+        headers: { 'x-slack-request-timestamp': at, 'x-slack-signature': signature }, query: new URLSearchParams() });
+    };
+    const posted = () => calls.filter((call) => call.url.endsWith('/chat.postMessage')).map((call) => call.body);
+    const whispered = () => calls.filter((call) => call.url.endsWith('/chat.postEphemeral')).map((call) => call.body);
+    calls = [];
+
+    expect((await slack('U7', { type: 'app_mention', channel: 'C1', text: '<@UBOT> fix it' })).events).toEqual([]);
+    await vi.waitFor(() => expect(whispered()).toHaveLength(1));
+    expect(whispered()[0]).toMatchObject({ channel: 'C1', user: 'U7', thread_ts: '17000.1' });
+    expect(whispered()[0].text).toMatch(/^Link your tavya account to ask me: https:\/\/tavya\.example\/link\/chat\?t=tvl_/);
+    expect(posted()).toEqual([]);
+
+    // A direct message is private: the link is posted there.
+    await slack('U8', { type: 'message', channel_type: 'im', channel: 'D8', text: 'hi' });
+    await vi.waitFor(() => expect(posted()).toHaveLength(1));
+    expect(posted()[0]).toMatchObject({ channel: 'D8' });
+    expect(posted()[0].text).toMatch(/\/link\/chat\?t=tvl_/);
+
+    // Slack refuses the whisper: nothing reaches the channel, and their next mention tries again.
+    override['chat.postEphemeral'] = { ok: false, error: 'user_not_in_channel' };
+    await slack('U9', { type: 'app_mention', channel: 'C1', text: '<@UBOT> hi' });
+    await vi.waitFor(() => expect(whispered()).toHaveLength(2));
+    await vi.waitFor(async () => expect(await new ChatLinks(f.store).offered(hook.id, 'U9')).toBe(false));
+    expect(posted()).toHaveLength(1);
+    delete override['chat.postEphemeral'];
+    await slack('U9', { type: 'app_mention', channel: 'C1', text: '<@UBOT> hi again' });
+    await vi.waitFor(() => expect(whispered()).toHaveLength(3));
+    expect(whispered()[2]).toMatchObject({ user: 'U9' });
   });
 
   it('a link token expires, and an agent cannot link one for its person', async () => {
@@ -464,6 +540,25 @@ describe('chat accounts linked to people', () => {
     expect(await f.api.listChatLinks(await f.human('dev'))).toEqual([]);
   });
 
+  it('a person’s links are read from their own index, which follows re-linking and removal', async () => {
+    const f = await fixture();
+    const { hook } = await f.connect();
+    const links = new ChatLinks(f.store);
+    const first = await links.redeem((await links.offer(hook, { id: '7', name: 'Ada' })).token, 'dev');
+    await links.redeem((await links.offer(hook, { id: '8', name: 'Grace' })).token, 'maint');
+    expect((await links.forUser('dev')).map((link) => link.id)).toEqual([first.id]);
+    // The same chat user linked to someone else leaves the first person's list.
+    const again = await links.redeem((await links.offer(hook, { id: '7', name: 'Ada' })).token, 'maint');
+    expect(await links.forUser('dev')).toEqual([]);
+    expect((await links.forUser('maint')).map((link) => link.platformUserId)).toEqual(['8', '7']);
+    await links.remove(again);
+    expect((await links.forUser('maint')).map((link) => link.platformUserId)).toEqual(['8']);
+    expect((await f.store.kvEntries('chat-link-user:')).map((row) => row.key)).toEqual([expect.stringMatching(/^chat-link-user:maint:/)]);
+    // A deleted bot takes its people's index rows too.
+    await f.api.deleteIncomingWebhook(await f.human('maint'), hook.id);
+    expect(await f.store.kvEntries('chat-link')).toEqual([]);
+  });
+
   it('a deleted project or organization takes its links and open link tokens', async () => {
     const f = await fixture();
     const { hook } = await f.connect();
@@ -471,10 +566,12 @@ describe('chat accounts linked to people', () => {
     await links.redeem((await links.offer(hook, { id: '7', name: 'Ada' })).token, 'dev');
     await links.offer(hook, { id: '8', name: 'Grace' });
     const other = await f.store.createProject('Other', {}, f.organization.id);
-    await links.redeem((await links.offer({ id: 'hook_other', projectId: other.id, organizationId: f.organization.id }, { id: '7' })).token, 'dev');
-    expect((await f.store.kvEntries('chat-link')).length).toBe(4);
+    const kept = await links.redeem((await links.offer({ id: 'hook_other', projectId: other.id, organizationId: f.organization.id }, { id: '7' })).token, 'dev');
+    // Two links (each with a row in its person's index) and an open offer (its token and the person's offer).
+    expect((await f.store.kvEntries('chat-link')).length).toBe(6);
     await f.store.deleteProject(f.project.id);
-    expect((await f.store.kvEntries('chat-link')).map((row) => row.key)).toEqual([`chat-link:hook_other:7`]);
+    expect((await f.store.kvEntries('chat-link')).map((row) => row.key)).toEqual([`chat-link-user:dev:${kept.id}`, `chat-link:hook_other:7`]);
+    expect((await links.forUser('dev')).map((link) => link.id)).toEqual([kept.id]);
     await f.store.deleteOrganization(f.organization.id);
     expect(await f.store.kvEntries('chat-link')).toEqual([]);
   });

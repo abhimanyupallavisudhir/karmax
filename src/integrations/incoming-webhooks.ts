@@ -270,6 +270,19 @@ export class IncomingWebhooks {
     return CHAT_ADAPTERS[hook.kind].reply(credentials, to, text, fetcher);
   }
 
+  /** Can this bot post in a shared channel so that only one person sees it? */
+  canWhisper(hook: IncomingWebhook): boolean {
+    return !!hook.kind && !!CHAT_ADAPTERS[hook.kind].whisper;
+  }
+
+  /** Post in a chat bot's channel where only `to.user` sees it. */
+  async whisper(hook: IncomingWebhook, to: { channel: string; thread?: string; user: string }, text: string, fetcher: typeof fetch = fetch): Promise<void> {
+    const credentials = await this.credentials(hook);
+    const adapter = hook.kind ? CHAT_ADAPTERS[hook.kind] : undefined;
+    if (!adapter?.whisper || !credentials) throw new WebhookConfigError('this chat bot cannot post privately');
+    await adapter.whisper(credentials, to, text, fetcher);
+  }
+
   private async credentials(hook: IncomingWebhook): Promise<ChatCredentials | undefined> {
     const handle = secretHandle(hook);
     if (!(await this.broker.hasHandle(handle))) return undefined;

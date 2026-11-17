@@ -62,24 +62,45 @@ export class ChatReplies {
   }
 
   /** What someone the bot does not know is told: a link to link their chat
-   *  account to their tavya account (src/integrations/chat-links.ts). Posted
-   *  at most once while that link works; a later message after it expired
-   *  gets a fresh one. `reply` false: the caller answers in the delivery itself
-   *  (Discord's command answer, seen only by them), so nothing is posted and
-   *  each answer carries a fresh link. */
+   *  account to their tavya account (src/integrations/chat-links.ts).
+   *
+   *  The link is a bearer secret: whoever opens it first links the sender's
+   *  chat account to themselves. So it goes only where the sender alone sees
+   *  it: a direct message, Slack's ephemeral message in a channel, or (`reply`
+   *  false) the caller's own answer in the delivery, which Discord shows only
+   *  to them. In a group the bot cannot whisper in (Telegram), the group is told
+   *  to message the bot directly, with no link, and the link goes there.
+   *
+   *  Each is said at most once while it holds, so a group is not spammed; a
+   *  later message after it lapsed gets a fresh one. */
   async decline(hook: IncomingWebhook, mention: ChatMention, reply: boolean): Promise<string | undefined> {
     const links = new ChatLinks(this.deps.store);
     const base = this.deps.publicUrl()?.replace(/\/+$/, '');
-    let text: string;
-    if (base) {
-      if (reply && await links.offered(hook.id, mention.author.id)) return undefined;
-      const { token } = await links.offer(hook, mention.author);
-      text = `Link your ${BRAND} account to ask me: ${base}/link/chat?t=${token}`;
-    } else {
+    if (!base) {
       if (!(await this.deps.store.kvClaim(`chat-declined:${hook.id}:${mention.author.id}`, '1'))) return undefined;
-      text = 'Only people this project allows can ask me.';
+      const text = 'Only people this project allows can ask me.';
+      if (reply) this.post(hook, mention, text);
+      return text;
     }
-    if (reply) this.post(hook, mention, text);
+    const whisper = reply && !mention.private && this.hooks.canWhisper(hook);
+    if (reply && !mention.private && !whisper) {
+      if (!(await links.hintOnce(hook, mention.author.id))) return undefined;
+      const direct = hook.kind === 'telegram' && hook.bot?.username ? `: https://t.me/${hook.bot.username}` : '.';
+      const text = `Message me directly to link your ${BRAND} account${direct}`;
+      this.post(hook, mention, text);
+      return text;
+    }
+    if (reply && await links.offered(hook.id, mention.author.id)) return undefined;
+    const { token } = await links.offer(hook, mention.author);
+    const text = `Link your ${BRAND} account to ask me: ${base}/link/chat?t=${token}`;
+    if (whisper) {
+      void this.hooks.whisper(hook, { channel: mention.channel.id, ...(mention.thread ? { thread: mention.thread } : {}), user: mention.author.id },
+        text, this.deps.fetcher ?? fetch).catch(async (error) => {
+        // Never fall back to the channel: take the offer back, so their next message tries again.
+        await links.withdraw(hook.id, mention.author.id, token);
+        this.deps.log?.(`chat reply on ${hook.kind} failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    } else if (reply) this.post(hook, mention, text);
     return text;
   }
 

@@ -3813,7 +3813,7 @@ export class KarmaxApi {
           }
           // A reply to the bot's own message belongs to the thread that message answered.
           const thread = mention.thread ? (await this.deps.store.kvGet(chatThreadKey(hook.id, mention.thread))) ?? mention.thread : undefined;
-          const { key, url, ...payload } = { ...mention, ...(thread ? { thread } : {}) };
+          const { key, url, private: _private, ...payload } = { ...mention, ...(thread ? { thread } : {}) };
           // The subject is the conversation, so a run started by a mention hears the replies in its thread.
           const subject = `${from.source}/${mention.channel.id}/${thread ?? key}`;
           events.push(await this.ingestProjectEvent({ ...from, ...(link ? { actsAs: link.userId } : {}) },
