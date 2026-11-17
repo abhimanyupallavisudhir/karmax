@@ -6,6 +6,11 @@ import { assertInFlightComputerEdit, HOST_WORLD_KINDS, isComputerless, LOCAL_WOR
 import { isRemoteWorldKind } from '../src/world/types.js';
 import { remoteWorldProvider, releaseWorldOnCompletion } from '../src/workflows/contract.js';
 import { costMicrosPerSecond } from '../src/world/runners.js';
+import { computerFlags } from '../src/cli/commands/tasks.js';
+import { applyComputer, isCloudProvider } from '../src/domain/computer.js';
+import { cloudProviders } from '../src/domain/computer-limits.js';
+import { assembleTaskInput } from '../src/platform/params.js';
+import { manifest } from '../src/contrib/manifests.js';
 
 describe('the none world provider (a task without a computer)', () => {
   it('is registered, local, unbillable and runs nothing on the host', async () => {
@@ -73,7 +78,24 @@ describe('the none world provider (a task without a computer)', () => {
     expect(() => assertInFlightComputerEdit({ provider: 'none' }, { provider: 'none' })).not.toThrow();
   });
 
+  it('is never where provider "Any" routes a task', () => {
+    expect(cloudProviders()).not.toContain('none');
+    expect(isCloudProvider('none')).toBe(false);
+  });
+
   it('is released like a local world on completion', () => {
     expect(releaseWorldOnCompletion({ kind: 'none', id: 't', root: '/x', branch: 'b', base: 'main' } as never)).toBe(false);
+  });
+
+  it('has no checkouts, whether the task or its project chose it', () => {
+    expect(applyComputer({ repos: ['/r'], worldProvider: 'e2b' }, { provider: 'none' })).toMatchObject({ repos: [], worldProvider: 'none' });
+    const input = assembleTaskInput(manifest('software-dev')!, { prompt: 'x' },
+      { taskId: 't', projectId: 'p', title: 'T', project: { repos: ['/r'], worldProvider: 'none' } as never });
+    expect(input.project.repos).toEqual([]);
+  });
+
+  it('is `tavya task new --computer none`, with no size', () => {
+    expect(computerFlags({ computer: 'none' })).toEqual({ provider: 'none' });
+    expect(() => computerFlags({ computer: 'none', cpu: '2' })).toThrow(/has no machine/);
   });
 });

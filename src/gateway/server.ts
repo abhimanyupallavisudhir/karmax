@@ -55,7 +55,7 @@ import { compactTaskView, platformRequestPathError } from '../platform/platform-
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { manifest } from '../contrib/manifests.js';
-import { LOCAL_WORLD_KINDS, machineShape, runsOnHost } from '../domain/computer.js';
+import { LOCAL_WORLD_KINDS, isComputerless, machineShape, runsOnHost } from '../domain/computer.js';
 import { projectSettingsFor, globalSettingsFor, settingsToProjectConfig, resolveParams, effectiveRepos } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { findProviderSession } from '../agent/fork.js';
@@ -667,11 +667,12 @@ export function toPublicPayload(value: unknown): unknown {
   for (const [key, item] of Object.entries(input)) {
     if (key === 'recoveryWorld' && isWorldHandle(item)) continue;
     if (taskView && key === 'world') continue;
-    if (taskView && key === 'worldPath' && handle && worldHandleIsRemote(handle)) continue;
+    if (taskView && key === 'worldPath' && handle && (worldHandleIsRemote(handle) || isComputerless(handle.kind))) continue;
     out[key] = toPublicPayload(item);
   }
   if (taskView) {
-    out.worldAvailable = Boolean(handle || input.worldPath);
+    // A task without a computer has no workspace: no terminal, files or previews.
+    out.worldAvailable = !(handle && isComputerless(handle.kind)) && Boolean(handle || input.worldPath);
     if (handle) {
       out.worldProvider = handle.provider ?? handle.kind;
       const handleMeta = handle.meta && typeof handle.meta === 'object'

@@ -161,7 +161,7 @@ export async function runChatCompletionsTurn(input: TurnInput, ctx: PlatformTool
             tools,
             ...reasoningBody(endpoint.vendor, input.profile.effort),
             // tavya's included model routes only to providers that keep no prompts.
-            ...(input.resolvedAuth?.modelOptions ?? {}),
+            ...input.resolvedAuth?.modelOptions,
             stream: true,
             stream_options: { include_usage: true },
           }),
