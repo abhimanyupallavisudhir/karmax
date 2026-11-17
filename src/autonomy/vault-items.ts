@@ -11,6 +11,7 @@ import { CredentialBroker } from './broker.js';
 import { organizationScope } from './vault-keys.js';
 import { deleteItemConnectorWrites } from './connector-writes.js';
 import { Capability, allows } from '../platform/capabilities.js';
+import { ConflictError, NotFoundError, ValidationError } from '../platform/errors.js';
 import { newId } from '../util/id.js';
 import type { Urgency } from '../domain/types.js';
 import type { Via } from '../platform/sub-task-asks.js';
@@ -105,6 +106,12 @@ export interface VaultItem {
   /** api-key: env var carrying the secret at spawn; ssh-key: env var carrying
    *  the materialized key file's path. Absent ⇒ not injected at spawn. */
   envVar?: string;
+  /** The project that owns it; absent: the organization. A project's items are
+   *  seen and used by that project's tasks only, and managed, read and decided
+   *  by its maintainers as well as by organization authority (owner-authority.ts).
+   *  The secrets stay under the organization's data key: the marker decides who,
+   *  not which key (wiki features/vault-encryption). */
+  ownerProjectId?: string;
   /** session: in at most one task's browser at a time, for sites that rotate
    *  their tokens on use and would sign the other copies out (session-holds.ts). */
   exclusive?: boolean;
@@ -194,7 +201,7 @@ export interface VaultItemStore {
    * its task in the same transaction (see `park`). Stores without them are
    * standalone vaults with no tasks to announce on. */
   appendEvent?(event: { taskId: string; type: string; ts: number; payload: Record<string, unknown> }): Promise<number>;
-  taskAttribution?(taskId: string): Promise<{ organizationId: string } | undefined>;
+  taskAttribution?(taskId: string): Promise<{ organizationId: string; projectId?: string } | undefined>;
 }
 
 // Items and access requests are ORGANIZATION resources (the tenant boundary):
@@ -401,6 +408,10 @@ export class VaultItems {
     /** The task agent acting (`responder`, `agent-3`…, from its token). An agent
      *  with its own authority uses its own per-item policy overrides. */
     private participant?: string,
+    /** The project the caller acts within: it sees the organization's items and
+     *  that project's own, never another project's. Absent: the whole
+     *  organization (organization authority and trusted machinery). */
+    private projectId?: string,
   ) {}
 
   /** The organization's item index, access requests and connector outbox are
@@ -410,7 +421,35 @@ export class VaultItems {
   }
 
   // ── items ──
+  /** The items this caller may see: all of the organization's, or within a
+   *  project the organization's and that project's own. */
   async list(): Promise<VaultItem[]> {
+    const items = await this.index();
+    return items.filter((item) => this.visibleIn(item, this.projectId));
+  }
+
+  /** Is `item` the organization's, or `projectId`'s own? (No project: everything.) */
+  private visibleIn(item: VaultItem, projectId: string | undefined): boolean {
+    return !projectId || !item.ownerProjectId || item.ownerProjectId === projectId;
+  }
+
+  /** The project of the task acting, when the store can say. */
+  private async taskProject(taskId: string): Promise<string | undefined> {
+    return (await this.store.taskAttribution?.(taskId))?.projectId
+      ?? (await (this.store as { getTask?(id: string): Promise<{ projectId?: string } | undefined> }).getTask?.(taskId))?.projectId;
+  }
+
+  /** May `taskId` (else this instance's project) see a project's own item? An
+   *  item of the organization is everyone's; a project's is its tasks' only.
+   *  Fails closed when the task's project cannot be told. */
+  private async reaches(item: VaultItem, taskId: string | undefined): Promise<boolean> {
+    if (!item.ownerProjectId) return true;
+    if (taskId) return (await this.taskProject(taskId)) === item.ownerProjectId;
+    return !this.projectId || this.projectId === item.ownerProjectId;
+  }
+
+  /** Every item of the organization, whoever owns it: the index writes rewrite. */
+  private async index(): Promise<VaultItem[]> {
     return this.store.transaction(async () => {
     let raw = (await this.store.kvGet(kvItems(this.organizationId)));
     if (!raw) return [];
@@ -498,17 +537,28 @@ export class VaultItems {
    * Create/update an item. Sparse-update semantics throughout: secret fields
    * are write-only (a provided non-empty string replaces the vault entry;
    * absent leaves it untouched — mirrors GitProfiles.save), and on update an
-   * omitted metadata field keeps its stored value (clear with '' / []).
+   * omitted metadata field keeps its stored value (clear with '' / []), and so
+   * does an omitted `type`: an item's type is fixed at creation, since grants,
+   * fields and write-back targets all follow from it.
+   *
+   * Everything refused here is the caller's to fix, so it is thrown typed
+   * (400/404/409 through `errorStatus`), never as a bare Error the gateway
+   * would answer as an unexpected 500.
    */
   async save(args: {
     id?: string;
-    type: VaultItemType;
+    /** Required to create; on update omit it (or repeat the stored type). */
+    type?: VaultItemType;
     label?: string;
     domains?: string[];
     username?: string;
     tags?: string[];
     envVar?: string;
     exclusive?: boolean;
+    /** The owning project; `null` hands it to the organization; omitted keeps
+     *  the stored owner (a new item: the organization). Who may set it is the
+     *  gateway's to check (owner-authority.ts). */
+    ownerProjectId?: string | null;
     policy?: Partial<VaultItemPolicy>;
     secrets?: Partial<Record<VaultFieldName, string>>;
     /** Internal connector snapshot: remove fields absent from the source. */
@@ -518,28 +568,35 @@ export class VaultItems {
     // Chosen once: a re-run transaction must write the same handles, not orphan the first attempt's.
     const freshId = newId('vi');
     return this.store.transaction(async () => {
-    if (!ITEM_FIELDS[args.type]) throw new Error(`unknown vault item type "${args.type}"`);
+    if (args.type !== undefined && !Object.hasOwn(ITEM_FIELDS, args.type))
+      throw new ValidationError(`unknown vault item type "${args.type}" (one of ${Object.keys(ITEM_FIELDS).join(', ')})`);
     await this.lockVault();
     const prior = args.id ? (await this.get(args.id)) : undefined;
-    if (args.id && !prior) throw new Error(`no vault item ${args.id}`);
-    if (prior && prior.type !== args.type) throw new Error(`vault item ${prior.id} is a ${prior.type}, not a ${args.type}`);
+    if (args.id && !prior) throw new NotFoundError(`no vault item ${args.id}`);
+    if (prior && args.type !== undefined && prior.type !== args.type)
+      throw new ConflictError(`vault item ${prior.id} is a ${prior.type}, not a ${args.type}: an item's type cannot change. Omit type to update it, or save a new ${args.type} item`);
+    const type = args.type ?? prior?.type;
+    if (!type) throw new ValidationError(`a new vault item needs a type (one of ${Object.keys(ITEM_FIELDS).join(', ')})`);
     const label = args.label?.trim() || prior?.label;
-    if (!label) throw new Error('a vault item needs a label');
-    if (!prior && (await this.list()).length >= 1000) throw new Error('organization vault item quota reached (1000)');
-    if (Buffer.byteLength(JSON.stringify(args), 'utf8') > 65_536) throw new Error('vault item exceeds size limit (64 KiB)');
-    if (args.type === 'note' && !args.replaceSecrets && args.secrets?.note !== undefined && !args.secrets.note.trim())
-      throw new Error('a standalone note cannot be empty');
-    if (args.type === 'session') {
-      if (args.secrets?.session?.trim()) parseSavedSession(args.secrets.session);
+    if (!label) throw new ValidationError('a vault item needs a label');
+    if (!prior && (await this.index()).length >= 1000) throw new ConflictError('organization vault item quota reached (1000)');
+    if (Buffer.byteLength(JSON.stringify(args), 'utf8') > 65_536) throw new ValidationError('vault item exceeds size limit (64 KiB)');
+    if (type === 'note' && !args.replaceSecrets && args.secrets?.note !== undefined && !args.secrets.note.trim())
+      throw new ValidationError('a standalone note cannot be empty');
+    if (type === 'session') {
+      if (args.secrets?.session?.trim()) {
+        try { parseSavedSession(args.secrets.session); }
+        catch (e) { throw new ValidationError(e instanceof Error ? e.message : String(e)); }
+      }
       const domains = args.domains ?? prior?.domains ?? [];
-      if (!domains.length) throw new Error('a saved session needs the site\'s domain');
-      for (const domain of domains) { const error = sessionDomainError(domain); if (error) throw new Error(error); }
+      if (!domains.length) throw new ValidationError('a saved session needs the site\'s domain');
+      for (const domain of domains) { const error = sessionDomainError(domain); if (error) throw new ValidationError(error); }
     }
     // Every granted turn exports it, so a bad name would fail them all. A stored
     // legacy name may be re-sent unchanged (envFor skips it) so other edits work.
     const envVar = args.envVar !== undefined ? args.envVar.trim() : prior?.envVar;
     if (envVar && envVar !== prior?.envVar && !isEnvName(envVar))
-      throw new Error('The env var name may contain only letters, digits and _, and cannot start with a digit (e.g. DEPLOY_KEY)');
+      throw new ValidationError('The env var name may contain only letters, digits and _, and cannot start with a digit (e.g. DEPLOY_KEY)');
     const id = prior?.id ?? freshId;
     const fields = new Set<VaultFieldName>(prior?.fields ?? []);
     if (args.replaceSecrets) for (const field of fields) {
@@ -548,7 +605,7 @@ export class VaultItems {
         fields.delete(field);
       }
     }
-    for (const field of ITEM_FIELDS[args.type]) {
+    for (const field of ITEM_FIELDS[type]) {
       const value = args.secrets?.[field];
       // Pass notes are a complete snapshot, including an empty replacement.
       if (field === 'note' && value !== undefined) {
@@ -565,15 +622,17 @@ export class VaultItems {
     const domains = args.domains !== undefined ? list(args.domains) : prior?.domains;
     const username = args.username !== undefined ? args.username.trim() : prior?.username;
     const tags = args.tags !== undefined ? list(args.tags) : prior?.tags;
+    const ownerProjectId = args.ownerProjectId === null ? undefined : args.ownerProjectId?.trim() || prior?.ownerProjectId;
     const item: VaultItem = {
       id,
-      type: args.type,
+      type,
       label,
+      ...(ownerProjectId ? { ownerProjectId } : {}),
       ...(domains?.length ? { domains } : {}),
       ...(username ? { username } : {}),
       ...(tags?.length ? { tags } : {}),
       ...(envVar ? { envVar } : {}),
-      ...(args.type === 'session' && (args.exclusive ?? prior?.exclusive) ? { exclusive: true } : {}),
+      ...(type === 'session' && (args.exclusive ?? prior?.exclusive) ? { exclusive: true } : {}),
       fields: [...fields],
       policy: {
         use: args.policy?.use ?? prior?.policy.use ?? 'auto',
@@ -590,7 +649,7 @@ export class VaultItems {
       // Also serves as an optimistic revision for in-flight connector pulls.
       updatedAt: Math.max(Date.now(), (prior?.updatedAt ?? 0) + 1),
     };
-    (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify([...(await this.list()).filter((i) => i.id !== id), item])));
+    (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify([...(await this.index()).filter((i) => i.id !== id), item])));
     // Key material may have changed — drop any materialized copies.
     fs.rmSync(this.keyDir(id), { recursive: true, force: true });
     return item;
@@ -607,7 +666,7 @@ export class VaultItems {
   async setExternalId(id: string, connectorOrExternalId: string, boundExternalId?: string): Promise<VaultItem> {
     return this.store.transaction(async () => {
     await this.lockVault();
-    const all = (await this.list());
+    const all = (await this.index());
     const item = all.find((i) => i.id === id);
     if (!item) throw new Error(`no vault item ${id}`);
     const connector = boundExternalId === undefined ? undefined : connectorOrExternalId;
@@ -631,7 +690,7 @@ export class VaultItems {
   async setPolicy(id: string, patch: Partial<VaultItemPolicy>): Promise<VaultItem> {
     return this.store.transaction(async () => {
     await this.lockVault();
-    const all = (await this.list());
+    const all = (await this.index());
     const item = all.find((i) => i.id === id);
     if (!item) throw new Error(`no vault item ${id}`);
     item.policy = { ...item.policy, ...patch };
@@ -649,7 +708,7 @@ export class VaultItems {
     (await deleteItemConnectorWrites(this.store, this.broker, this.organizationId, id));
     for (const field of item?.fields ?? []) (await this.broker?.deleteHandle(itemHandle(id, field)));
     fs.rmSync(this.keyDir(id), { recursive: true, force: true });
-    (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify((await this.list()).filter((i) => i.id !== id))));
+    (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify((await this.index()).filter((i) => i.id !== id))));
     (await this.store.kvDelete?.(kvUsagePrefix(this.organizationId) + id));
 
     });
@@ -781,6 +840,8 @@ export class VaultItems {
   }
 
   async covered(caps: Capability[], taskId: string | undefined, item: VaultItem): Promise<boolean> {
+    // A project's own item is its tasks' only, whatever a grant says.
+    if (!(await this.reaches(item, taskId))) return false;
     // A task owns credentials it creates. This is deliberately only grant
     // coverage: the item's use/reveal policy still applies, so a same-task
     // credential with reveal=ask remains approval-gated for plaintext access.
@@ -809,6 +870,7 @@ export class VaultItems {
     // `never` is absolute: it is checked before a one-shot pass so an approval
     // that was parked for another reason (a reset report, a mode the human did
     // not look at) can never be spent on plaintext.
+    if (!(await this.reaches(item, taskId))) return { status: 'denied', reason: `"${item.label}" belongs to another project; only its tasks use it` };
     const policyForTask = (await this.effectivePolicy(taskId, item));
     if (mode === 'reveal' && policyForTask.reveal === 'never') return { status: 'denied', reason: `"${item.label}" is never revealed in plaintext (${taskId ? 'task' : 'item'} policy)` };
     if (taskId && !opts.ambient && (await this.takePass(taskId, item.id, mode, opts.consume ?? false))) return { status: 'granted' };
@@ -940,7 +1002,7 @@ export class VaultItems {
         ? (await this.findByDomain(args.domain))[0]
         : undefined;
     if (!item) {
-      if (!args.itemId && !args.domain) throw new Error('itemId or domain required');
+      if (!args.itemId && !args.domain) throw new ValidationError('itemId or domain required');
       const parked = (await this.park({ ...args, mode, kind, itemId: undefined, ...(args.itemId ? { name: args.itemId } : {}) }));
       (await this.store.appendAudit({ principalId: `task:${args.taskId}`, action: 'vault.requested', detail: { domain: args.domain, itemId: args.itemId, mode, kind, status: 'not_in_vault' } }));
       return { status: 'not_in_vault', reason: args.itemId ? `no vault item ${args.itemId}` : `no vault item matches ${args.domain}`, requestId: parked.id,
@@ -1005,14 +1067,18 @@ export class VaultItems {
    * notifications all follow this event. */
   private async announce(req: CredentialAccessRequest, ts: number, urgency?: Urgency): Promise<void> {
     // A task of another tenant never hears of this organization's requests.
-    if (this.store.appendEvent && (await this.store.taskAttribution?.(req.taskId))?.organizationId === this.organizationId)
+    if (this.store.appendEvent && (await this.store.taskAttribution?.(req.taskId))?.organizationId === this.organizationId) {
+      // A project's own item is also its maintainers' to decide: they are asked too.
+      const ownerProjectId = req.itemId ? (await this.index()).find((item) => item.id === req.itemId)?.ownerProjectId : undefined;
       (await this.store.appendEvent({ taskId: req.taskId, type: 'credential.approval-requested', ts, payload: {
+        ...(ownerProjectId ? { ownerProjectId } : {}),
         requestId: req.id, status: 'approval-needed', mode: req.mode, kind: req.kind ?? 'access',
         ...(req.itemId ? { itemId: req.itemId } : {}), ...(req.domain ? { domain: req.domain } : {}),
         ...(req.name ? { name: req.name } : {}),
         ...(req.why ? { why: req.why } : {}), ...(urgency ? { urgency } : {}),
         ...(req.audience ? { audience: req.audience } : {}), ...(req.via ? { via: req.via } : {}),
       } }));
+    }
   }
 
   /** Address a sub-task's pending request to the people its parent named, with
@@ -1022,8 +1088,8 @@ export class VaultItems {
       await this.lockVault();
       const all = (await this.requests());
       const req = all.find((r) => r.id === requestId);
-      if (!req) throw new Error(`no credential request ${requestId}`);
-      if (req.status !== 'pending') throw new Error(`request ${requestId} is already ${req.status}`);
+      if (!req) throw new NotFoundError(`no credential request ${requestId}`);
+      if (req.status !== 'pending') throw new ConflictError(`request ${requestId} is already ${req.status}`);
       req.audience = audience;
       req.via = via;
       delete req.dismissed;
@@ -1046,12 +1112,15 @@ export class VaultItems {
     await this.lockVault();
     const all = (await this.requests());
     const req = all.find((r) => r.id === requestId);
-    if (!req) throw new Error(`no credential request ${requestId}`);
-    if (req.status !== 'pending') throw new Error(`request ${requestId} is already ${req.status}`);
+    if (!req) throw new NotFoundError(`no credential request ${requestId}`);
+    if (req.status !== 'pending') throw new ConflictError(`request ${requestId} is already ${req.status}`);
     if (args.action !== 'deny') {
       const itemId = req.itemId ?? args.itemId;
-      const item = itemId ? (await this.get(itemId)) : undefined;
-      if (!item) throw new Error('bind this request to a vault item first (add the item, then resolve with its itemId)');
+      const item = itemId ? (await this.index()).find((candidate) => candidate.id === itemId) : undefined;
+      if (!item || !this.visibleIn(item, this.projectId)) throw new ValidationError('bind this request to a vault item first (add the item, then resolve with its itemId)');
+      // A project's own item is never handed to another project's task.
+      if (!(await this.reaches(item, req.taskId)))
+        throw new ValidationError(`"${item.label}" belongs to another project: only that project's tasks may use it`);
       req.itemId = item.id;
       (await this.addPass(req.taskId, item.id, req.mode));
       if (args.action === 'task' || args.action === 'always') (await this.extend(req.taskId, `use-credential:item:${item.id}`, args.by));
@@ -1074,8 +1143,8 @@ export class VaultItems {
     await this.lockVault();
     const all = (await this.requests());
     const req = all.find((r) => r.id === requestId);
-    if (!req) throw new Error(`no credential request ${requestId}`);
-    if (req.status !== 'pending') throw new Error(`request ${requestId} is already ${req.status}`);
+    if (!req) throw new NotFoundError(`no credential request ${requestId}`);
+    if (req.status !== 'pending') throw new ConflictError(`request ${requestId} is already ${req.status}`);
     req.dismissed ??= { by, at: Date.now() };
     (await this.saveRequests(all));
     (await this.store.appendAudit({ principalId: by, action: 'vault.request.dismissed', detail: { requestId, taskId: req.taskId } }));
@@ -1097,6 +1166,17 @@ export class VaultItems {
       for (const req of ignored)
         (await this.store.appendAudit({ principalId: by, action: 'vault.request.dismissed', detail: { requestId: req.id, taskId } }));
       return ignored;
+    });
+  }
+
+  /** Forget every request of these tasks (their project is being deleted). */
+  async dropTaskRequests(taskIds: string[]): Promise<void> {
+    const gone = new Set(taskIds);
+    return this.store.transaction(async () => {
+      await this.lockVault();
+      const all = (await this.requests());
+      const kept = all.filter((request) => !gone.has(request.taskId));
+      if (kept.length !== all.length) (await this.saveRequests(kept));
     });
   }
 

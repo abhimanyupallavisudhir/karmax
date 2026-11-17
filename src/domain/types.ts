@@ -406,7 +406,10 @@ export interface WorldCheckpoint {
     localPath?: string;
     sourceAuthority?: 'project' | 'origin';
     gitIdentity?: { name: string; email: string };
-    baseSha: string;
+    /** The commit the checkout was provisioned from; absent when unknown.
+     * Older checkpoints may hold the base's name here: read it through
+     * `recordedBase` (src/world/types.ts), never as a commit. */
+    baseSha?: string;
     branch: string;
     headSha?: string;
     /** Per-checkout branch policy. This matters for platform companions such as
@@ -963,12 +966,9 @@ export interface OrganizationExecutionPolicy {
 }
 
 /** Trusted admission policy for hosted, organization-attributed work. Empty
- * allowlists mean "all connected BYOK providers/models"; they never authorize
- * an installation credential. Managed model rails require both an explicit
- * provider boundary and an owner-set spend cap. */
+ * allowlists mean "all providers/models". What runs on the compute credit
+ * (the included model, model gateways) is bounded by that credit. */
 export interface OrganizationUsagePolicy {
-  managedSpendCapMicros?: number;
-  managedModelProviders: string[];
   allowedModelProviders: string[];
   allowedModels: string[];
   maxAgentStartsPerMinute: number;
@@ -1648,9 +1648,12 @@ export interface ReviewAction {
   openUrls?: string[];
   /** `open` only: world-relative file path OR an absolute URL to open. */
   target?: string;
-  /** `payment` only: durable spend request and reviewer operation. */
+  /** The durable spend request a payment action (or its funding link) belongs to. */
   requestId?: string;
+  /** `payment` only: the reviewer operation. */
   operation?: 'approve' | 'deny';
+  /** Set when served: its spend request was already decided, so nobody is asked any more. */
+  resolved?: 'approved' | 'denied';
 }
 
 export interface ReviewInfo {

@@ -50,6 +50,16 @@ export type GitHubAppPermissionLevel = 'write' | 'read';
  */
 /** The webhook events a new App subscribes to. An existing App's owner adds new
  *  ones in its settings (GitHub has no API for an App's event subscriptions). */
+/**
+ * The release workflows (.github/workflows/{deploy,promote,production-check}.yml;
+ * wiki ops/release-and-deploy): a failure of one on the default branch opens a
+ * recovery task like a failed push run, whatever started it.
+ */
+export const RELEASE_WORKFLOWS = new Set(['Deploy', 'Promote', 'Production check']);
+const RELEASE_WORKFLOW_EVENTS = new Set(['workflow_run', 'schedule', 'workflow_dispatch']);
+/** Of those, the ones that change a running instance: never rerun automatically. */
+const DEPLOYING_WORKFLOWS = new Set(['Deploy', 'Promote']);
+
 export const GITHUB_APP_EVENTS = ['push', 'pull_request', 'pull_request_review', 'check_run', 'merge_group', 'workflow_run',
   'issues', 'issue_comment', 'release', 'deployment_status'] as const;
 
@@ -861,6 +871,12 @@ export class GitHubAppService {
    * account that already installed the App must then approve that expansion.
    * Keeping the two states separate makes the required human action explicit. */
   async workflowPermissionStatus(connection?: GitConnection): Promise<GitHubWorkflowPermissionStatus> {
+    return this.repositoryPermissionStatus('workflows', connection);
+  }
+
+  /** One repository permission at both GitHub approval layers: the App's
+   * registration, and what the installation's owner approved. */
+  async repositoryPermissionStatus(key: 'workflows' | 'contents', connection?: GitConnection): Promise<GitHubWorkflowPermissionStatus> {
     if (!await this.configured()) throw new Error('GitHub App is not configured');
     const app = await this.appRequest<GitHubAppPayload>('/app');
     const slug = String(app.slug ?? this.options.appSlug ?? '').trim();
@@ -870,12 +886,12 @@ export class GitHubAppService {
     const appSettingsUrl = app.owner?.type === 'Organization' && owner
       ? `https://github.com/organizations/${encodeURIComponent(owner)}/settings/apps/${encodeURIComponent(slug)}/permissions`
       : `https://github.com/settings/apps/${encodeURIComponent(slug)}/permissions`;
-    const appPermission = permissionLevel(app.permissions?.workflows);
+    const appPermission = permissionLevel(app.permissions?.[key]);
     if (!connection) return { app: appPermission, ready: appPermission === 'write', appSettingsUrl };
     const installation = await this.appRequest<GitHubInstallationPayload>(
       `/app/installations/${encodeURIComponent(connection.installationId)}`,
     );
-    const installationPermission = permissionLevel(installation.permissions?.workflows);
+    const installationPermission = permissionLevel(installation.permissions?.[key]);
     const installationSettingsUrl = installation.html_url?.startsWith('https://github.com/')
       ? installation.html_url
       : connection.accountType === 'Organization'
@@ -959,20 +975,34 @@ export class GitHubAppService {
 
   /** Human-readable recovery for Git's remote-rejection message. */
   async workflowPermissionGuidance(repository: Repository): Promise<string> {
+    return this.permissionGuidance(repository, 'workflows');
+  }
+
+  /** What to do when GitHub refused to let tavya write to a repository
+   * ("Write access to repository not granted"). */
+  async writePermissionGuidance(repository: Repository): Promise<string> {
+    return this.permissionGuidance(repository, 'contents');
+  }
+
+  private async permissionGuidance(repository: Repository, key: 'workflows' | 'contents'): Promise<string> {
+    const label = `${GITHUB_APP_PERMISSION_LABELS[key]}: read and write`;
     const connection = repository.gitConnectionId
       ? (await this.store.getGitConnection(repository.gitConnectionId))
       : undefined;
-    if (!connection) return 'Reconnect this repository through the GitHub App, then retry the task.';
-    const observed = await this.workflowPermissionStatus(connection);
+    if (!connection) return `Connect ${repository.owner}/${repository.name} through the ${BRAND} GitHub App in organization settings → GitHub, then retry the task.`;
+    const observed = await this.repositoryPermissionStatus(key, connection);
     if (observed.app !== 'write') {
-      return `The installation operator must grant the ${BRAND} GitHub App Workflows: read and write at ${observed.appSettingsUrl}. `
+      return `The installation operator must grant the ${BRAND} GitHub App ${label} at ${observed.appSettingsUrl}. `
         + `Then the owner of ${connection.accountLogin} must approve the updated App permission at ${observed.installationSettingsUrl}. Retry the task after both steps.`;
     }
     if (observed.installation !== 'write') {
-      return `The ${BRAND} GitHub App now requests Workflows: read and write, but ${connection.accountLogin} has not approved it. `
+      return `The ${BRAND} GitHub App now requests ${label}, but ${connection.accountLogin} has not approved it. `
         + `Approve the updated App permission at ${observed.installationSettingsUrl}, then retry the task.`;
     }
-    return 'GitHub reports Workflows: read and write as approved. Refresh the GitHub connection in organization settings and retry the task; if GitHub still rejects it, review the App installation on GitHub.';
+    if (key === 'contents')
+      return `GitHub reports ${label} as approved for ${connection.accountLogin}, yet refused the write: ${repository.owner}/${repository.name} may be archived, `
+        + `or the installation may no longer include it. Check it on GitHub and in organization settings → GitHub, then retry the task.`;
+    return `GitHub reports ${label} as approved. Refresh the GitHub connection in organization settings and retry the task; if GitHub still rejects it, review the App installation on GitHub.`;
   }
 
   async verifyWebhook(raw: Buffer, signature: string | undefined): Promise<boolean> {
@@ -1256,8 +1286,13 @@ export class GitHubAppService {
     if (event !== 'workflow_run' || payload.action !== 'completed') return [];
     const workflowRun = payload.workflow_run;
     const repositoryId = payload.repository?.id;
-    if (!repositoryId || workflowRun?.event !== 'push'
-      || workflowRun.head_repository?.id !== repositoryId) return [];
+    const name = String(workflowRun?.name ?? '');
+    // The release workflows never run on a push: Deploy follows CI, Promote and
+    // Production check follow a schedule or a dispatch. On the default branch
+    // those run the default branch's own workflow file, so they are as trusted.
+    const trustedEvent = workflowRun?.event === 'push'
+      || (RELEASE_WORKFLOWS.has(name) && RELEASE_WORKFLOW_EVENTS.has(String(workflowRun?.event ?? '')));
+    if (!repositoryId || !trustedEvent || workflowRun.head_repository?.id !== repositoryId) return [];
     const repository = (await this.store.listRepositories(organizationId)).find((candidate) =>
       candidate.providerId === String(repositoryId));
     if (!repository) return [];
@@ -1275,8 +1310,10 @@ export class GitHubAppService {
     const originatingTaskId = headRefs.map((ref) => taskIdOfBranch(ref.slice(ref.indexOf(':') + 1)))
       .find((id) => id && /^task_[A-Za-z0-9_-]+$/.test(id));
     const attempt = Math.max(1, Number(workflowRun?.run_attempt ?? 1) || 1);
-    if (await this.workflowFailureSettlesItself(repository, { runId, attempt, conclusion, headSha, branch,
-      workflowId: Number(workflowRun.workflow_id ?? 0) || 0, runNumber: Number(workflowRun.run_number ?? 0) || 0 }))
+    // A failed deploy is never retried behind anyone's back: rerunning it would
+    // take production through a second rollback if the failure is real.
+    if (!DEPLOYING_WORKFLOWS.has(name) && await this.workflowFailureSettlesItself(repository, { runId, attempt, conclusion,
+      headSha, branch, workflowId: Number(workflowRun.workflow_id ?? 0) || 0, runNumber: Number(workflowRun.run_number ?? 0) || 0 }))
       return [];
     const base = {
       repository: `${repository.owner}/${repository.name}`,

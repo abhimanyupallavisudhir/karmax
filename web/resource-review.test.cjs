@@ -40,9 +40,10 @@ function setup(api) {
     checkoutsSection: () => '', renderWidgetGroups: () => '', notesSection: () => '',
     conversationApprovalRequests: () => '', conversationPullRequestAsks: () => '', taskTranscripts: () => [{ role: 'do' }],
     parametersTab: () => 'parameters', timingTab: () => 'timing', micButtonHtml: () => '',
+    narrowViewport: () => false,
   });
   vm.runInContext(`${freshness}\n${tabs}\n${wire}`, context);
-  for (const name of ['humanWaitDetail', 'conversationTextKey', 'conversationInputRequest', 'safeHref', 'contentKey', 'conversationError', 'reviewActionBtn', 'conversationReviewInfo', 'conversationFullscreenButton', 'hasMessageForm', 'agentEntryText', 'personMessageText', 'messageFormsIn', 'formSubject', 'answersForm', 'messageFormStates', 'conversationEntryKey', 'conversationFoldHtml', 'loadForkHistory', 'inheritedConversationHtml', 'conversationSearchKey', 'conversationSearchOpen', 'conversationSearchBar', 'pendingMessagesHtml', 'conversationPane', 'messageOrigin', 'conversationOutline', 'foldDuration', 'foldPreview', 'conversationFoldHead', 'liveOutputFor', 'formEntryKey', 'formContext', 'withMessageForms', 'renderConversationEntry', 'presenceDetail', 'waitTitle', 'conversationWaitNotice']) {
+  for (const name of ['humanWaitDetail', 'conversationTextKey', 'conversationInputRequest', 'safeHref', 'contentKey', 'conversationError', 'reviewActionBtn', 'conversationReviewInfo', 'conversationFullscreenButton', 'hasMessageForm', 'agentEntryText', 'personMessageText', 'messageFormsIn', 'formSubject', 'answersForm', 'messageFormStates', 'conversationEntryKey', 'conversationFoldHtml', 'loadForkHistory', 'inheritedConversationHtml', 'conversationSearchKey', 'conversationSearchOpen', 'conversationSearchBar', 'pendingMessagesHtml', 'followupPlaceholder', 'conversationPane', 'messageOrigin', 'conversationOutline', 'foldDuration', 'foldPreview', 'conversationFoldHead', 'liveOutputFor', 'formEntryKey', 'formContext', 'withMessageForms', 'renderConversationEntry', 'presenceDetail', 'waitTitle', 'conversationWaitNotice']) {
     vm.runInContext(extract(name), context);
   }
   context.checkinTab = (v) => context.conversationPane(v, { role: 'do' });

@@ -118,8 +118,9 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await signUp(page, 'Nadia New', 'nadia@example.test');
       const guide = page.locator('#hosted-onboarding .onboarding-card');
       await step('the setup guide opens', () => guide.waitFor());
-      // A new person's first organization comes with the free trial of tavya's computers.
-      expect(await guide.locator('.onboarding-progress').getAttribute('aria-valuenow')).toBe('1');
+      // A new person's first organization comes with a free trial: shown, but no step is done by it.
+      expect(await guide.locator('.onboarding-trial').innerText()).toMatch(/^Free trial: \$5 of compute/);
+      expect(await guide.locator('.onboarding-progress').getAttribute('aria-valuenow')).toBe('0');
       // A step's link tucks the guide into its progress pill while the person works.
       const completed = () => page.locator('#onboarding-expand small').innerText();
       const [user] = (await g.identity.listUsers()).filter((candidate) => candidate.email === 'nadia@example.test');
@@ -130,15 +131,18 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await page.locator('#acct-name').fill('work');
       await page.locator('#acct-key').fill('sk-journey');
       await page.locator('#acct-add').click();
-      await step('the agent key counts', () => expect.poll(completed, { timeout: 15_000 }).toBe('2 of 3 required steps'));
+      await step('the agent key counts', () => expect.poll(completed, { timeout: 15_000 }).toBe('1 of 4 required steps'));
 
       // GitHub is connected on github.com: its installation callback records
-      // the connection and sends the browser back to the console. It is
-      // optional (a project's code can live on tavya), so it does not count.
+      // the connection and sends the browser back to the console.
       await g.store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
         installationId: 'journey-installation', accountLogin: 'nadia', accountType: 'User' });
       await page.goto(`${g.url}/${organization.slug}/settings?github=ready&organizationId=${organization.id}`);
-      await step('GitHub is optional', () => expect.poll(completed, { timeout: 15_000 }).toBe('2 of 3 required steps'));
+      await step('GitHub counts', () => expect.poll(completed, { timeout: 15_000 }).toBe('2 of 4 required steps'));
+      // A computer account of its own (the trial's computers are not one).
+      await consoleRequest(context, g.url, 'PUT', `/api/organizations/${organization.id}/world-providers/e2b`, { apiKey: 'e2b_journey' });
+      await page.reload();
+      await step('its own compute counts', () => expect.poll(completed, { timeout: 15_000 }).toBe('3 of 4 required steps'));
 
       await page.locator('#onboarding-expand').click();
       await page.locator('#onboarding-new-project').click();
@@ -146,7 +150,7 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await page.locator('.new-project-dialog').getByRole('button', { name: 'Create project' }).click();
       await step('the new project opens', () => page.waitForURL((url) => url.pathname === `/${organization.slug}/first-project`));
       await step('setup completes', () => expect.poll(() => page.evaluate((id) => fetch(`/api/user/onboarding?organizationId=${id}`)
-        .then((response) => response.json()), organization.id)).toMatchObject({ complete: true, completedRequired: 3 }));
+        .then((response) => response.json()), organization.id)).toMatchObject({ complete: true, completedRequired: 4 }));
       await step('the guide steps aside', () => page.locator('#hosted-onboarding .onboarding-card').waitFor({ state: 'detached' }));
       // The step that finished setup navigated; the person is still told so.
       await step('setup completion is confirmed', () => page.locator('#hosted-onboarding .onboarding-complete').getByText('Setup complete').waitFor());

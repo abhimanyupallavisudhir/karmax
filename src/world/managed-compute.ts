@@ -3,6 +3,7 @@ import { BRAND } from '../domain/brand.js';
 import { COMPUTE_TERMS, COMPUTE_TRIAL, computeChargeMicros } from '../domain/entitlements.js';
 import { providerDefaults, type AccountPool } from '../domain/computer-limits.js';
 import { flyComputeDollarsPerSecond, flyGuest, flyVolumeDollarsPerSecond } from './fly.js';
+import { agent37ComputeDollarsPerHour, agent37DiskDollarsPerHour } from './agent37.js';
 import { costMicrosPerSecond } from './runners.js';
 import type { Store } from '../store/db.js';
 import { providerName } from './connections.js';
@@ -205,6 +206,27 @@ function exhausted(credit: ComputeCredit, provider: string): ComputeCreditExhaus
     + `Add a $10 pack or turn on auto top-up in Plan & billing, or ${own}. It renews on ${renews}.`);
 }
 
+/** Hold a generation's quote (provider cost micros) against the credit until
+ * `until` or until what it cost is booked (closeComputeHold). False when the
+ * organization's compute is unmetered (nothing to hold); refused with
+ * ComputeCreditExhausted, naming the quote and what is left, when the credit
+ * cannot cover it (wiki features/generate). */
+export async function holdGeneration(store: Store, request: { id: string; organizationId: string; taskId?: string; costMicros: number;
+  until: number; what: string; provider?: string }, now = Date.now()): Promise<boolean> {
+  if (!store.hosted) return false;
+  const entitlements = await store.organizationEntitlements(request.organizationId);
+  if (entitlements.computeCreditMicros == null) return false;
+  const creditMicros = entitlements.computeCreditMicros + (await topUpBalance(store, request.organizationId, entitlements.computeCreditMicros, now))
+    + ((await trialCredit(store, request.organizationId, computeMonth(now), now))?.monthMicros ?? 0);
+  if (await store.holdSpend({ id: request.id, organizationId: request.organizationId, ...(request.taskId ? { taskId: request.taskId } : {}),
+    provider: request.provider ?? 'openrouter', amountMicros: request.costMicros, until: request.until }, creditMicros, now)) return true;
+  const credit = await computeCredit(store, request.organizationId, now);
+  const charge = computeChargeMicros(request.costMicros, await store.computePriceMultiplier(request.organizationId, now));
+  throw new ComputeCreditExhausted(`Out of compute: ${request.what} would cost up to ${dollars(charge)} of credit; `
+    + `${dollars(Math.max(0, credit.availableMicros ?? 0))} is left. Choose a cheaper model, a shorter or smaller one, `
+    + 'or add a $10 pack or auto top-up in Plan & billing.');
+}
+
 /** Why managed work on `provider` cannot go on: the credit as it stands. */
 export async function outOfCompute(store: Store, organizationId: string, provider: string, now = Date.now()): Promise<ComputeCreditExhausted> {
   return exhausted(await computeCredit(store, organizationId, now), provider);
@@ -257,6 +279,7 @@ export function listRate(provider: string, shape: { cpu: number; memoryMb: numbe
     case 'gcp': active = shape.cpu * 0.025 + memoryGb * 0.0034 + 0.005; disk = perGbMonth(0.12); break;
     case 'hetzner': active = shape.cpu * 0.02 + 0.001; disk = perGbMonth(0.05); break;
     case 'fly': active = flyComputeDollarsPerSecond(flyGuest(shape)) * 3600; disk = flyVolumeDollarsPerSecond(shape.diskGb) * 3600; break;
+    case 'agent37': active = agent37ComputeDollarsPerHour(shape); disk = agent37DiskDollarsPerHour(shape.diskGb); break;
     default: active = costMicrosPerSecond(provider, shape.cpu, shape.memoryMb, 0) * 3600 / 1e6;
   }
   return { activeMicrosPerHour: Math.ceil(active * 1e6), diskMicrosPerHour: Math.ceil(disk * 1e6) };

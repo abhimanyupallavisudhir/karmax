@@ -459,29 +459,22 @@ describe('runner capacity and world lifecycle', () => {
     await expect(runners.acquire({ project: oversized, taskId: oversizedTask.id, worldId: oversizedTask.id, provider: 'daytona' })).rejects.toThrow(/exceeds/);
   });
 
-  it('admits model usage idempotently with managed opt-in, allowlists, rate limits, and tenant attribution', async () => {
+  it('admits model usage idempotently with allowlists, rate limits, and tenant attribution', async () => {
     const store = (await Store.create(':memory:'));
     const organization = (await store.createOrganization({ name: 'Guarded', ownerUserId: 'owner' }));
     const project = (await store.createProject('Product', {}, organization.id));
     const first = (await createTask(store, project.id, 'First'));
     const second = (await createTask(store, project.id, 'Second'));
-
-    await expect((async () => (await store.admitAgentUsage({ id: 'turn-1', organizationId: organization.id, projectId: project.id,
-      taskId: first.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'managed', now: 1_000_000 })))()).rejects.toThrow(/disabled until an organization owner sets a spend cap/);
-    (await store.setOrganizationUsagePolicy(organization.id, { managedSpendCapMicros: 1_000_000,
-      managedModelProviders: ['openai'], allowedModelProviders: ['openai'], allowedModels: ['gpt-approved'],
+    (await store.setOrganizationUsagePolicy(organization.id, { allowedModelProviders: ['openai'], allowedModels: ['gpt-approved'],
       maxAgentStartsPerMinute: 2, maxActiveAgentTurns: 1 }));
     await expect((async () => (await store.admitAgentUsage({ id: 'wrong-model', organizationId: organization.id, projectId: project.id,
       taskId: first.id, provider: 'openai', model: 'gpt-other', fundingSource: 'byok', now: 1_000_000 })))()).rejects.toThrow(/not allowed/);
-    await expect((async () => (await store.admitAgentUsage({ id: 'unbounded-managed', organizationId: organization.id, projectId: project.id,
-      taskId: first.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'managed', now: 1_000_000 })))()).rejects.toThrow(/no installation-configured per-request cost ceiling/);
+    // A managed turn runs on the compute credit, which bounds it (wiki features/model-gateways): no owner spend cap.
     expect((await store.admitAgentUsage({ id: 'turn-1', organizationId: organization.id, projectId: project.id,
-      taskId: first.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'managed',
-      reservedCostMicros: 250_000, now: 1_000_000 })))
+      taskId: first.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'managed', now: 1_000_000 })))
       .toEqual({ reused: false });
     expect((await store.admitAgentUsage({ id: 'turn-1', organizationId: organization.id, projectId: project.id,
-      taskId: first.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'managed',
-      reservedCostMicros: 250_000, now: 1_000_001 })))
+      taskId: first.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'managed', now: 1_000_001 })))
       .toEqual({ reused: true });
     await expect((async () => (await store.admitAgentUsage({ id: 'turn-2', organizationId: organization.id, projectId: project.id,
       taskId: second.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'byok', now: 1_000_002 })))()).rejects.toThrow(/active model turn limit/);
@@ -491,8 +484,7 @@ describe('runner capacity and world lifecycle', () => {
       fundingSource: 'managed', costClassification: 'incurred', startedAt: 1_000_000, endedAt: 1_000_000 }));
     (await store.finishUsageAdmission('turn-1', true, 1_000_010));
     await expect((async () => (await store.admitAgentUsage({ id: 'turn-1', organizationId: organization.id, projectId: project.id,
-      taskId: first.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'managed',
-      reservedCostMicros: 250_000, now: 1_000_011 })))()).rejects.toThrow(/spend cap is exhausted|already completed/);
+      taskId: first.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'managed', now: 1_000_011 })))()).rejects.toThrow(/already completed/);
     expect((await store.admitAgentUsage({ id: 'turn-2', organizationId: organization.id, projectId: project.id,
       taskId: second.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'byok', now: 1_000_012 })))
       .toEqual({ reused: false });
@@ -506,44 +498,25 @@ describe('runner capacity and world lifecycle', () => {
     });
   });
 
-  it('keeps reservations separate, releases failures, and makes retries and completion idempotent', async () => {
+  it('releases failures, and makes retries and completion idempotent', async () => {
     const store = (await Store.create(':memory:'));
     const organization = (await store.createOrganization({ name: 'Retry safe', ownerUserId: 'owner' }));
     const project = (await store.createProject('Product', {}, organization.id));
     const task = (await createTask(store, project.id, 'Retry'));
-    (await store.setOrganizationUsagePolicy(organization.id, { managedSpendCapMicros: 250_000,
-      managedModelProviders: ['openai'] }));
+    (await store.setOrganizationUsagePolicy(organization.id, { maxActiveAgentTurns: 1 }));
     const admission = { id: 'stable-turn', organizationId: organization.id, projectId: project.id,
-      taskId: task.id, provider: 'openai', model: 'gpt-test', fundingSource: 'managed' as const,
-      reservedCostMicros: 250_000, now: 1_000_000 };
+      taskId: task.id, provider: 'openai', model: 'gpt-test', fundingSource: 'managed' as const, now: 1_000_000 };
     expect((await store.admitAgentUsage(admission))).toEqual({ reused: false });
-    (await store.recordUsage({ id: 'usage:request:stable-turn', organizationId: organization.id, projectId: project.id,
-      taskId: task.id, provider: 'openai', kind: 'agent.request', quantity: 1, unit: 'request',
-      costMicros: 0, fundingSource: 'managed', costClassification: 'none', startedAt: 1_000_000, endedAt: 1_000_000 }));
-    expect((await store.usageSummary(organization.id, 0, 2_000_000))).toMatchObject({
-      costMicros: 0, activeReservationsMicros: 250_000, events: 1,
-    });
-    const concurrent = (await createTask(store, project.id, 'Concurrent reservation'));
+    const concurrent = (await createTask(store, project.id, 'Concurrent'));
     await expect((async () => (await store.admitAgentUsage({ ...admission, id: 'concurrent-turn', taskId: concurrent.id,
-      now: 1_000_001 })))()).rejects.toThrow(/managed spend cap is exhausted/);
+      now: 1_000_001 })))()).rejects.toThrow(/active model turn limit/);
     (await store.finishUsageAdmission(admission.id, false, 1_000_001));
-    expect((await store.usageSummary(organization.id, 0, 2_000_000))).toMatchObject({
-      costMicros: 0, activeReservationsMicros: 0, events: 1,
-    });
+    expect((await store.usageSummary(organization.id, 0, 2_000_000))).toMatchObject({ active: { agentTurns: 0 } });
     expect((await store.admitAgentUsage({ ...admission, now: 1_000_002 }))).toEqual({ reused: true });
     expect((await store.admitAgentUsage({ ...admission, now: 1_000_003 }))).toEqual({ reused: true });
-    (await store.finishUsageAdmission(admission.id, true, 1_000_004, [{ id: 'usage:cost:stable-turn',
-      organizationId: organization.id, projectId: project.id, taskId: task.id, provider: 'openai',
-      kind: 'agent.cost', quantity: 0, unit: 'request', costMicros: 250_000,
-      fundingSource: 'managed', costClassification: 'estimated', startedAt: 1_000_004, endedAt: 1_000_004,
-      metadata: { costBasis: 'admission-ceiling-estimate' } }]));
+    (await store.finishUsageAdmission(admission.id, true, 1_000_004));
     await expect((async () => (await store.admitAgentUsage({ ...admission, now: 1_000_005 })))()).rejects.toThrow(/already completed/);
-    const next = (await createTask(store, project.id, 'After estimate'));
-    await expect((async () => (await store.admitAgentUsage({ ...admission, id: 'next-turn', taskId: next.id, now: 1_000_006 })))()).rejects.toThrow(/managed spend cap is exhausted/);
-    expect((await store.usageSummary(organization.id, 0, 2_000_000))).toMatchObject({
-      costMicros: 250_000, incurredCostMicros: 0, estimatedCostMicros: 250_000,
-      activeReservationsMicros: 0, events: 2, requests: { total: 1, managed: 1 }, active: { agentTurns: 0 },
-    });
+    expect((await store.usageSummary(organization.id, 0, 2_000_000))).toMatchObject({ activeReservationsMicros: 0, active: { agentTurns: 0 } });
   });
 
   it('keeps hosted remote execution BYOK by default and refuses centrally funded pools', async () => {

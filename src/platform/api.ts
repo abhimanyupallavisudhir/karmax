@@ -1,4 +1,7 @@
 import * as __asyncCollections from '../util/async-collections.js';
+import { withSpendResolutions } from './spend-review.js';
+import { autonomyRoute, projectAutonomy, setUpAutonomy } from './autonomous-projects.js';
+import type { AutonomyScope, ProjectAutonomy } from '../domain/autonomous-projects.js';
 import { resolvePaymentPolicy, samePaymentPolicy, validatePaymentPolicy, withPolicyCurrency } from '../autonomy/payments.js';
 import { randomUUID } from 'node:crypto';
 import { timingEnabled, installationTiming, timingReport } from '../timing/index.js';
@@ -10,6 +13,7 @@ import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store, slugify, type CollaborationRequest } from '../store/db.js';
 import { TokenAuthority, type HumanDelegationArgs, type ScopedToken } from './tokens.js';
 import { TOOL_CAPABILITY, Capability, ORGANIZATION_WIKI_WRITE_DENIED, allows, attenuate, heldBackCapabilities, withoutCapabilities } from './capabilities.js';
+import { ownerAuthority } from './owner-authority.js';
 import { AppGrants, sessionCapabilities } from '../auth/app-grants.js';
 import { WORKFLOW_TYPE, SIG, pinnedType, TASK_WORKFLOW_TASK_TIMEOUT } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
@@ -37,11 +41,12 @@ import {
 } from '../coordinators/names.js';
 import { templateContent, templateName, templateParams, templateAuthorization } from '../domain/task-templates.js';
 import { derivedTaskTitle, isDerivedTaskTitle } from '../domain/task-title.js';
+import { landsByPushOnTavya } from '../domain/hosted-repository.js';
 import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget, type Avatar, type InheritedConversation, type TaskCreatedVia, type TaskCreator } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries,
   normalizeFollowUpTriggers, validateFollowUpTriggers, followUpTriggerSummary, followUpsAfterFiring, type FollowUpTrigger, type TaskTrigger, isTrigger } from '../domain/triggers.js';
 import { STORE_TASKS, runsOnInstall, storeTaskNeeds, storeTaskRepeatable, takenFromStore, type StoreNeed, type StoreTask } from '../domain/task-store.js';
-import { EventRunRefused, applyTriggerContext, followUpMessage, normalizeEventInput, type ProjectEvent, type ProjectEventClaim,
+import { EventRunRefused, applyTriggerContext, followUpMessage, normalizeEventInput, type KeyedRun, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventInput, type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
 import { newId } from '../util/id.js';
 import { IncomingWebhooks, WebhookConfigError, webhookDeliveryKey, type IncomingWebhook, type LinkedPerson, type WebhookPatch } from '../integrations/incoming-webhooks.js';
@@ -49,9 +54,9 @@ import { isChatPlatform, type ChatPlatform } from '../integrations/chat-platform
 import { chatThreadKey, type ChatReplies } from '../integrations/chat-replies.js';
 import { ChatLinkError, ChatLinks, type ChatLink } from '../integrations/chat-links.js';
 import { pullRequestOf } from '../domain/pull-requests.js';
-import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates, queryFolds } from '../domain/search.js';
+import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
-import { assertComputerFits, providerLabel } from '../domain/computer-limits.js';
+import { assertComputerFits, diskGrowsAtStart, providerLabel } from '../domain/computer-limits.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
 import { taskProvider } from '../world/task-provider.js';
 import { ANY_PROVIDER, applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, isAnyProvider, isComputerless, machineShape, normalizeComputer, sameMachine,
@@ -69,7 +74,8 @@ import { MAX_FILE_BYTES, MAX_FILES_BYTES_PER_MESSAGE, MAX_FILES_PER_MESSAGE, san
 import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES, BUILTIN_WIKI_PREFIX } from '../wiki/wiki.js';
 import { copyRemoteWiki, RemoteWikiSnapshots } from '../wiki/remote-snapshot.js';
 import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, removeProjectWikiRepository, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
-import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, profileVisibleTo, roleDefaultProfile } from '../agent/profiles.js';
+import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, profileVisibleTo } from '../agent/profiles.js';
+import { defaultAgentProfile } from './readiness.js';
 import { looksLikeConversationUrl, PanagentError, publicConversationShare } from '../agent/panagent.js';
 import { importConversationShare } from '../agent/conversation-sources.js';
 import { SHARE_APPS } from '../agent/conversation-shares.js';
@@ -81,7 +87,9 @@ import { AuthorizationRequests, type AuthorizationRequest } from './authorizatio
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { untrustedBlock } from '../domain/untrusted.js';
-import { taskAuthorityNow } from './task-authority.js';
+import { baseTaskAuthority, previousTaskGrants, taskAuthorityNow, taskGrants, tokenScopeOf } from './task-authority.js';
+import { delegatedFromParent } from './delegation.js';
+export { previousTaskGrants };
 import type { KarmaxBus } from '../contrib/bus.js';
 import type { WorldRegistry } from '../world/registry.js';
 import type { WorldHandle } from '../world/types.js';
@@ -462,6 +470,8 @@ export interface KarmaxApiDeps {
   /** Where checked conversation sources are kept (conversation imports). */
   objects?: import('../store/objects.js').ObjectStore;
   broker?: CredentialBroker;
+  /** The organizations' model logins: whether one can run a task's default agent. */
+  configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
   githubApp?: import('../integrations/github-app.js').GitHubAppService;
   /** Wake live gateway subscribers when platform-side actions append events. The
    * durable event table remains the source of truth when this is absent. */
@@ -2113,9 +2123,15 @@ export class KarmaxApi {
     // hosted GitHub world. Coerce legacy settings rows here so every newly
     // started task in an existing hosted project gets the new PR contract. An
     // already-running Temporal execution keeps its recorded input unchanged.
-    if (this.deps.hosted && (resolved.remote === undefined || resolved.remote === 'none'))
+    // Repositories tavya hosts have no pull requests: they land by push, as
+    // effectiveProjectConfig says, whatever a layer above names — this value
+    // overwrites the input's project policy (tavya-error 5b7a123b7e52ac15).
+    if (this.deps.hosted && landsByPushOnTavya(effectiveRepos(resolved, project.config)))
+      resolved.remote = 'push';
+    else if (this.deps.hosted && (resolved.remote === undefined || resolved.remote === 'none'))
       resolved.remote = 'pr';
-    (await this.materializeUnifiedAgents(resolved, project.id));
+    (await this.materializeUnifiedAgents(resolved, project));
+    (await this.pinIncludedModelDefaults(manifest, resolved, project));
 
     // Auto-detect the repo's branch policy when base/target weren't set anywhere,
     // instead of guessing "main" (which would make hosted task views disagree
@@ -2149,12 +2165,12 @@ export class KarmaxApi {
   /** Turn the compact Agent setting into concrete per-role input. Profile defaults
    * live outside parameter settings, so this final materialization must happen
    * after the parameter overlays have selected the child scope's form shape. */
-  private async materializeUnifiedAgents(resolved: ValueMap, projectId: string): Promise<void> {
+  private async materializeUnifiedAgents(resolved: ValueMap, project: Project): Promise<void> {
     if (resolved.separateAgents !== false) return;
     let spec = resolved['agent:do'] as AgentSpec | undefined;
     if (!spec?.provider) {
       const resumeFrom = spec?.resumeFrom;
-      const profile = (await roleDefaultProfile(this.deps.store, 'do', projectId));
+      const { profile } = await this.defaultAgent('do', project);
       const provider = (profile?.provider ?? this.deps.defaultAgentProvider ?? defaultProvider().provider) as Provider;
       const model = profile?.model ?? defaultModel(provider);
       const effort = profile?.effort ?? defaultEffort(provider);
@@ -2170,6 +2186,34 @@ export class KarmaxApi {
     const { resumeFrom: _resumeFrom, ...shared } = spec;
     resolved['agent:merge'] = shared;
     if (RESOLVE_AGENT_ENABLED) resolved['agent:resolve'] = shared;
+  }
+
+  /** The role's default agent in `project`: its Task default, or the included
+   * model when the organization can't run that (wiki features/included-model § Default). */
+  private defaultAgent(role: string, project: Project) {
+    return defaultAgentProfile({ store: this.deps.store, hosted: this.deps.hosted === true, broker: this.deps.broker,
+      configHomes: this.deps.configHomes }, role, { organizationId: project.organizationId ?? 'org_personal', projectId: project.id },
+    (this.deps.defaultAgentProvider ?? defaultProvider().provider) as Provider);
+  }
+
+  /** A role that inherits a default its organization can't run is pinned to the
+   * included model at queue, so the run never waits for a login nobody chose,
+   * and a login connected later does not switch a running task's model. */
+  private async pinIncludedModelDefaults(manifest: WorkflowManifest, resolved: ValueMap, project: Project): Promise<void> {
+    for (const field of manifest.params) {
+      if (field.type !== 'agent' || !field.role) continue;
+      const spec = resolved[field.name] as AgentSpec | undefined;
+      if (spec?.provider) continue;
+      const { profile, included } = await this.defaultAgent(field.role, project);
+      if (!included || !profile) continue;
+      resolved[field.name] = {
+        ...spec,
+        provider: profile.provider,
+        ...(profile.model ? { model: profile.model } : {}),
+        ...(profile.effort ? { effort: profile.effort } : {}),
+        ...(spec?.mcpConnections === undefined && profile.mcpConnections !== undefined ? { mcpConnections: profile.mcpConnections } : {}),
+      };
+    }
   }
 
   /** Capture the exact provider/model/effort selection that the activity runtime
@@ -2446,6 +2490,48 @@ export class KarmaxApi {
    * prompt via `task:edit` — must themselves be able to grant every capability
    * in it; otherwise an administrator's draft is a privilege-escalation template.
    */
+  /**
+   * A person acting on a task (a Retry, a message, Run again on a series)
+   * renews its permission to act for them when it lapsed or is about to: the
+   * task's own delegation and each agent's. A delegation tavya minted must
+   * never strand a task (they last 30 days, and a turn mints from one), and
+   * the person it acts for, here now, is the consent it needs. Only that
+   * person, and only while they still hold the task's stored authority;
+   * anyone else leaves it as it is (the turn then says who renews it).
+   */
+  private async renewLapsedDelegations(token: string, caller: ScopedToken, task: TaskRecord): Promise<TaskRecord> {
+    if (caller.kind !== 'human' || caller.humanSubject?.presence !== 'interactive') return task;
+    type Entry = { delegationId?: string; principal?: string; scope?: AuthorizationSelection['scope']; projectIds?: string[]; organizationId?: string };
+    const own = task.params?._authorization as Entry | undefined;
+    const agents = this.storedAgentAuthorizations(task) as Record<string, Entry>;
+    const entries: Array<[string | undefined, Entry]> = [[undefined, own ?? {}], ...Object.entries(agents)];
+    const lapsing: Array<[string | undefined, Entry]> = [];
+    for (const [key, entry] of entries)
+      if (entry.delegationId && (await this.deps.tokens.delegationLapsing(entry.delegationId, task.id))) lapsing.push([key, entry]);
+    if (!lapsing.length) return task;
+    try { await this.assertStoredGrantQueueable(token, caller, task); } catch { return task; }
+    const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId;
+    const githubAccountId = typeof task.params?._githubAccountId === 'string' ? task.params._githubAccountId : undefined;
+    const renewed = new Map<string | undefined, string>();
+    for (const [key, entry] of lapsing) {
+      const delegation = await this.deps.tokens.renewHumanDelegation(token, { taskId: task.id, delegationId: entry.delegationId!,
+        humanUserId: entry.principal?.startsWith('user:') ? entry.principal.slice(5) : undefined,
+        scope: tokenScopeOf(entry, task.projectId, organizationId),
+        externalIdentities: githubAccountId ? { githubAccountId } : undefined });
+      if (delegation) renewed.set(key, delegation.id);
+    }
+    if (!renewed.size) return task;
+    const current = (await this.deps.store.getTask(task.id)) ?? task;
+    const patch: Record<string, unknown> = {};
+    if (renewed.has(undefined)) patch._authorization = { ...current.params._authorization as object, delegationId: renewed.get(undefined) };
+    const agentEntries = this.storedAgentAuthorizations(current);
+    let agentsChanged = false;
+    for (const [key, id] of renewed) if (key && agentEntries[key]) { agentEntries[key] = { ...agentEntries[key], delegationId: id }; agentsChanged = true; }
+    if (agentsChanged) patch._agentAuthorization = agentEntries;
+    await this.deps.store.patchTaskParams(task.id, patch);
+    return (await this.deps.store.getTask(task.id)) ?? current;
+  }
+
   private async assertStoredGrantQueueable(token: string, caller: ScopedToken, task: TaskRecord): Promise<void> {
     if (!this.deps.authorization || caller.kind === 'system') return;
     const stored = task.params?._authorization as { principal?: string; capabilities?: string[] } | undefined;
@@ -2453,7 +2539,7 @@ export class KarmaxApi {
     // A fork of an Avatar the starter may call acts with the Avatar's authorization.
     if (stored.principal?.startsWith('avatar:') && (await forkedAvatar(this.deps.store, task.projectId,
       task.params?.['agent:do'], (await this.humanBehind(caller, task.id))))?.id === stored.principal.slice(7)) return;
-    const { authorization: selection } = previousTaskGrants(task);
+    const { authorization: selection } = (await this.taskGrants(task));
     if (!selection) return;
     const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal';
     const grantorCaps = (await this.authorizationGrantorCaps(token, caller, selection, organizationId));
@@ -2582,7 +2668,7 @@ export class KarmaxApi {
     // runs it; it is refused only if they cannot grant it all either.
     if ((storedAuthorization?.profileAttenuated || storedAuthorization?.missingCredentialGrants?.length)
       && !storedAuthorization.attenuationAccepted) {
-      const { authorization: selection, credentialGrants } = previousTaskGrants(task);
+      const { authorization: selection, credentialGrants } = (await this.taskGrants(task));
       if (!selection) throw new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
       task = (await this.setTaskAuthorization(token, taskId, selection,
         [...credentialGrants, ...(storedAuthorization.missingCredentialGrants ?? [])], undefined, { queue: true }));
@@ -2747,12 +2833,24 @@ export class KarmaxApi {
       (await this.deps.store.patchTaskParams(target.id, { _agentAuthorization: agentAuthorizations }));
       target = (await this.deps.store.getTask(target.id))!;
     }
-    const sourceAuthorization = source.params?._authorization as { delegationId?: string } | undefined;
+    const sourceAuthorization = source.params?._authorization as {
+      delegationId?: string; scope?: AuthorizationSelection['scope']; projectIds?: string[]; organizationId?: string } | undefined;
     if (!sourceAuthorization?.delegationId) return target;
-    const parent = (await this.deps.tokens.deriveHumanDelegation(sourceAuthorization.delegationId, {
-      taskId: target.id, projectId: target.projectId,
-      organizationId: (await this.deps.store.getProject(target.projectId))?.organizationId,
+    const sourceDelegation = sourceAuthorization.delegationId;
+    // As far as the copy's tokens reach (`turnAuthority`): its authorization's
+    // scope, not only its project, or no turn of a run of an organization-wide
+    // series could ever mint.
+    const parent = (await this.deps.tokens.deriveHumanDelegation(sourceDelegation, {
+      taskId: target.id, ...tokenScopeOf(sourceAuthorization, target.projectId,
+        (await this.deps.store.getProject(target.projectId))?.organizationId),
+    }).catch(async (error: unknown) => {
+      // The source's lapsed (a series nobody ran by hand for 30 days): the copy
+      // keeps naming it, so its first turn says so and the person's Retry
+      // renews it (renewLapsedDelegations), instead of the copy never starting.
+      if (await this.deps.tokens.delegationLapsing(sourceDelegation, source.id)) return undefined;
+      throw error;
     }));
+    if (!parent) return target;
     (await this.deps.store.updateTaskParams(target.id, { ...target.params,
       _authorization: { ...(target.params._authorization as object), delegationId: parent.id },
       ...(parent.externalIdentities?.githubAccountId
@@ -3164,7 +3262,7 @@ export class KarmaxApi {
     const project = (await this.deps.store.getProject(task.projectId));
     if (!project) throw new NotFoundError(`no project ${task.projectId}`);
     const organizationId = project.organizationId ?? 'org_personal';
-    const inherited = previousTaskGrants(task);
+    const inherited = (await this.taskGrants(task));
     const selection = requested.authorization ?? inherited.authorization ?? (await this.authorizationDefault(project))
       ?? { level: 'developer', scope: 'projects' as const, projectIds: [task.projectId] };
     const grantorCaps = (await this.authorizationGrantorCaps(token, caller, selection, organizationId));
@@ -3344,6 +3442,8 @@ export class KarmaxApi {
     (await this.assertStoredGrantQueueable(token, caller, series));
     // A run a linked chat sender started acts as them (wiki planned/assistant §3).
     const asker = (await this.eventAsker(caller, trigger, series.projectId));
+    // Run again by the person it acts for keeps the series' permission current.
+    const source = (await this.renewLapsedDelegations(token, caller, series));
     // A run an event started carries that event (wiki features/events-and-automations).
     // Each run listens for the series' follow-up triggers; the series never runs.
     const followUpTriggers = normalizeFollowUpTriggers(series.params);
@@ -3363,7 +3463,7 @@ export class KarmaxApi {
       delegate: series.delegate,
       confirmationPolicy: series.confirmationPolicy,
     }));
-    run = asker ? (await this.actAsAsker(series, run, asker)) : (await this.inheritTaskDelegation(series, run));
+    run = asker ? (await this.actAsAsker(source, run, asker)) : (await this.inheritTaskDelegation(source, run));
     (await this.persistTaskCredentialPolicies(run));
     (await this.followTriggerSubject(run, trigger));
     const { startType, input } = await this.buildStart(run, false, caller);
@@ -3396,13 +3496,15 @@ export class KarmaxApi {
    * (a repeatable series — cron, or any recurring trigger). Re-arms the task on a
    * start failure so a fire is never silently lost.
    */
-  async fireTriggeredTask(token: string, taskId: string, mode: 'self' | 'clone' | 'followUp', trigger?: TriggerContext, cause?: TaskTrigger): Promise<{ startedTaskId: string; told?: true }> {
+  async fireTriggeredTask(token: string, taskId: string, mode: 'self' | 'clone' | 'followUp', trigger?: TriggerContext, cause?: TaskTrigger,
+    /** `followUp`: what to say instead of the trigger's own words. */
+    text?: string): Promise<{ startedTaskId: string; told?: true }> {
     const armed = (await this.deps.store.getTask(taskId));
     const caller = (await this.require(token, 'create_task', { projectId: armed?.projectId, taskId }));
     if (!armed) throw new NotFoundError(`no task ${taskId}`);
 
     if (mode === 'clone') return { startedTaskId: (await this.spawnRun(token, taskId, trigger)).id };
-    if (mode === 'followUp') return this.fireFollowUp(taskId, trigger, cause);
+    if (mode === 'followUp') return this.fireFollowUp(taskId, trigger, cause, text);
     // A one-off task stays its creator's; one a linked chat sender started does
     // only what both may do (wiki planned/assistant §3).
     const asker = (await this.eventAsker(caller, trigger, armed.projectId));
@@ -3463,6 +3565,20 @@ export class KarmaxApi {
    * trigger. A started task is cancelled instead: deleting it would pull its
    * record out from under a running workflow.
    */
+  /** Make a project run itself (wiki features/autonomy): an Avatār with the
+   * project's — or, `organization`, the organization's — full authority, the
+   * Responder and Reviewer forking it, a `default` wiki page saying there is
+   * no human, and a permanent co-ordinator draft whose agent forks it. */
+  async makeAutonomous(token: string, projectId: string, scope: AutonomyScope = 'project'): Promise<ProjectAutonomy> {
+    return setUpAutonomy({ api: this, store: this.deps.store, tokens: this.deps.tokens }, token, projectId, scope);
+  }
+
+  /** What `makeAutonomous` set up for a project, if anything. */
+  async autonomy(token: string, projectId: string): Promise<ProjectAutonomy | null> {
+    (await this.require(token, 'project:read', { projectId }));
+    return (await projectAutonomy(this.deps.store, projectId)) ?? null;
+  }
+
   async deleteTask(token: string, taskId: string): Promise<void> {
     const task = (await this.deps.store.getTask(taskId));
     (await this.require(token, 'delete_task', { projectId: task?.projectId ?? '__missing__', taskId }));
@@ -3506,6 +3622,8 @@ export class KarmaxApi {
     input: ProjectEventInput): Promise<{ event: ProjectEvent; duplicate: boolean }> {
     const normalized = normalizeEventInput(input, () => newId('key'));
     if ('error' in normalized) throw new ValidationError(normalized.error);
+    // A repeat of the key is counted on its event (`duplicate`), and the
+    // dispatcher's sweep offers it again to the tasks that keep one run per key.
     const { event, created } = (await this.deps.store.recordProjectEvent({
       ...from, ...normalized, occurredAt: normalized.occurredAt ?? Date.now(),
     }));
@@ -3525,8 +3643,10 @@ export class KarmaxApi {
     (await this.require(token, 'list_tasks', { projectId }));
     if (!(await this.deps.store.getProject(projectId))) throw new NotFoundError(`no project ${projectId}`);
     const tasks = (await this.deps.store.listTasks(projectId));
-    const has = {
-      github: (await this.deps.store.listProjectRepositories(projectId)).some((entry) => !!entry.repository.gitConnectionId),
+    const repositories = (await this.deps.store.listProjectRepositories(projectId));
+    const has: Record<StoreNeed, boolean> = {
+      repository: repositories.length > 0,
+      github: repositories.some((entry) => !!entry.repository.gitConnectionId),
       chat: this.deps.broker ? (await this.incomingWebhooks().list(projectId)).some((hook) => !!hook.kind) : false,
     };
     return STORE_TASKS.map(({ task: { hostedPrompt, ...task }, ...template }) => ({ ...template, task: { ...task, prompt: this.storePrompt({ task: { ...task, hostedPrompt } }) },
@@ -3552,7 +3672,11 @@ export class KarmaxApi {
     const template = STORE_TASKS.find((candidate) => candidate.id === templateId);
     if (!template) throw new NotFoundError(`no store task ${templateId}`);
     const { params, ...rest } = overrides;
-    return this.createTask(token, { projectId, title: template.task.title, ...(template.task.workflow ? { workflow: template.task.workflow } : {}), ...rest,
+    // The authority its agent needs, in this project; a caller who cannot grant
+    // it is told whom to ask, as for any task.
+    const level = template.task.authorization?.level;
+    return this.createTask(token, { projectId, title: template.task.title, ...(template.task.workflow ? { workflow: template.task.workflow } : {}),
+      ...(level ? { authorization: { level, scope: 'projects' as const, projectIds: [projectId] } } : {}), ...rest,
       params: { ...template.task.params, prompt: this.storePrompt(template), ...params, template: template.id } });
   }
 
@@ -3632,10 +3756,10 @@ export class KarmaxApi {
    * restart mid-way loses nothing. A one-shot is used up before the delivery,
    * so a fork made from it does not inherit it.
    */
-  private async fireFollowUp(taskId: string, context: TriggerContext | undefined, cause: TaskTrigger | undefined): Promise<{ startedTaskId: string; told: true }> {
+  private async fireFollowUp(taskId: string, context: TriggerContext | undefined, cause: TaskTrigger | undefined, text?: string): Promise<{ startedTaskId: string; told: true }> {
     // A chat reply from someone linked to their account is theirs (wiki planned/assistant §3).
     const asker = context?.eventId ? (await this.deps.store.getProjectEvent(context.eventId))?.actsAs : undefined;
-    const message: Message = { id: `u${randomUUID()}`, role: 'user', text: followUpMessage(cause, context), ts: Date.now(),
+    const message: Message = { id: `u${randomUUID()}`, role: 'user', text: text ?? followUpMessage(cause, context), ts: Date.now(),
       ...(asker ? await this.speaker({ kind: 'human', humanSubject: { userId: asker } }) : { authorLabel: 'Follow-up trigger' }) };
     await this.withPendingLock(taskId, async () =>
       this.writePending(taskId, [...(await this.readPending(taskId)), { message, role: MAIN_AGENT, by: 'system:triggers', fromTrigger: { ...(context ? { context } : {}) } }]));
@@ -4059,6 +4183,7 @@ export class KarmaxApi {
     const enrich = async (view: TaskView | undefined): Promise<TaskView | undefined> => {
       if (!view) return view;
       view = await this.deps.store.withPendingReviewInfoAsync(taskId, view);
+      view = await withSpendResolutions(this.deps.store, taskId, view);
       if (computerResizable(view) && !(view.editableParams ?? []).includes('computer'))
         view = { ...view, editableParams: [...(view.editableParams ?? []), 'computer'] };
       if (computerResizable(view)) {
@@ -4139,6 +4264,9 @@ export class KarmaxApi {
     // (post-`updateParams` responses, review-action resolution). We also fall through to
     // a live query when there is no snapshot yet (a brand-new task, pre-first-publish).
     const snap = await snapshot();
+    // A draft, a task waiting for its trigger or a repeatable series has no
+    // execution to ask: none is the answer, and the console opens its form.
+    if (!snap && unstarted(rec)) return undefined;
     // softwareDev@1.0.0 could persist "waiting for account" immediately before
     // scheduling a turn, then clear it only in workflow memory after the grant.
     // It cannot add a publish at that point without breaking replay. Treat that
@@ -5156,6 +5284,63 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
     }
   }
 
+  /** An autonomous project's vault request goes to its Avatār when the Avatār
+   * may decide it — approving needs read authority over the item: the
+   * organization's (`credential:reveal`, an organization's Avatār), or for an
+   * item the project owns, its Project maintainer (a project's Avatār; see
+   * owner-authority.ts). A fork of it decides through
+   * POST /api/vault/requests/:id/resolve. People are still told, as for any
+   * request; whoever answers first decides. */
+  async routeCredentialRequest(token: string, request: CredentialAccessRequest): Promise<void> {
+    const task = (await this.deps.store.getTask(request.taskId));
+    // A credential not in the vault yet, or one reported broken, is for the
+    // agent to create or fix itself (the wiki's autonomy page says so).
+    if (!task || request.status !== 'pending' || !request.itemId || request.kind === 'reset') return;
+    const autonomy = await projectAutonomy(this.deps.store, task.projectId);
+    const avatar = autonomy ? (await this.deps.store.getAvatar(autonomy.avatarTaskId)) : undefined;
+    if (!avatar || !(await avatarEnabled(this.deps.store, avatar)) || !avatarAllows(avatar, 'confirm')) return;
+    const creator = (await this.deps.store.taskCreatorUserId(task.id));
+    if (!creator || !(await avatarCallableBy(this.deps.store, avatar, creator))) return;
+    const held = (await avatarAuthorizationCapabilities(this.deps.store, this.deps.authorization, avatar, task.projectId));
+    const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal';
+    const item = (await new VaultItems(this.deps.store, undefined, undefined, organizationId, undefined, task.projectId).get(request.itemId));
+    if (!item || !ownerAuthority(held, 'reveal', item.ownerProjectId, task.projectId)) return;
+    const what = item ? `"${item.label}"${item.domains?.length ? ` (${item.domains.join(', ')})` : ''}` : `vault item ${request.itemId}`;
+    await this.callAvatar(token, avatar, 'confirm', `${avatar.name}: decide credential request`,
+      `Decide whether task #${task.num ?? task.id} (${JSON.stringify(task.title)}) may ${request.mode === 'reveal' ? 'see the plaintext of' : 'use'} ${what}.
+${request.why ? `${untrustedBlock('reason from the requesting agent', request.why)}\n` : ''}${request.via?.note ? `${untrustedBlock(`note from task ${request.via.taskId}, which it came through`, request.via.note)}\n` : ''}
+Read the task (get_task, get_conversation) before you decide. Resolve the request exactly once by calling platform_request with POST /api/vault/requests/${request.id}/resolve?${item.ownerProjectId ? `projectId=${item.ownerProjectId}` : `organizationId=${organizationId}`} and body {"action":"once"} (this use only), {"action":"task"} (for the rest of this task) or {"action":"deny"}. Prefer the narrowest that does the job. Then briefly report the decision.`,
+      { taskId: task.id, type: 'avatar.credential-dispatch-failed', payload: { requestId: request.id, avatarId: avatar.id } });
+  }
+
+  /** A task's app connection request in an autonomous project goes to its
+   * Avatār when the Avatār may manage the project's accounts (Project
+   * maintainer: owner-authority.ts): it may connect it as the project's own
+   * account, decline it, or leave it to people (a sign-in only a person can
+   * complete). People are still told; whoever answers first decides. */
+  async routeConnectionRequest(token: string, connection: ServiceConnection): Promise<void> {
+    if (connection.status !== 'requested' || connection.ownerId || connection.ownerProjectId || !connection.taskId) return;
+    const task = (await this.deps.store.getTask(connection.taskId));
+    if (!task) return;
+    const autonomy = await projectAutonomy(this.deps.store, task.projectId);
+    const avatar = autonomy ? (await this.deps.store.getAvatar(autonomy.avatarTaskId)) : undefined;
+    if (!avatar || !(await avatarEnabled(this.deps.store, avatar)) || !avatarAllows(avatar, 'confirm')) return;
+    const creator = (await this.deps.store.taskCreatorUserId(task.id));
+    if (!creator || !(await avatarCallableBy(this.deps.store, avatar, creator))) return;
+    const held = (await avatarAuthorizationCapabilities(this.deps.store, this.deps.authorization, avatar, task.projectId));
+    if (!ownerAuthority(held, 'manage', task.projectId, task.projectId)) return;
+    const app = connection.mcp ? `the MCP server ${JSON.stringify(connection.label)} (${connection.mcp.url})` : `the app ${JSON.stringify(connection.toolkit)} (Composio)`;
+    const q = `?projectId=${task.projectId}`;
+    await this.callAvatar(token, avatar, 'confirm', `${avatar.name}: decide app connection request`,
+      `Task #${task.num ?? task.id} (${JSON.stringify(task.title)}) asks to use ${app} through an app connection.
+${connection.why ? `${untrustedBlock('reason from the requesting agent', connection.why)}\n` : ''}${connection.via?.note ? `${untrustedBlock(`note from task ${connection.via.taskId}, which it came through`, connection.via.note)}\n` : ''}
+Read the task (get_task, get_conversation) before you decide. Then do one of these with platform_request:
+- Connect it as this project's own account (only this project's tasks can use it; its maintainers manage it): POST /api/connections/connect${q} with body ${JSON.stringify({ id: connection.id, ownerProjectId: task.projectId })}. If the answer has a "url", the account needs a sign-in: complete it in your browser with an account this project holds (for an MCP sign-in, then POST /api/connections/${connection.id}/callback${q} with the "state" and "code" of the page it returns to); if only a person can sign in, leave the request to people.
+- Decline it: POST /api/connections/${connection.id}/disconnect${q} with body {}.
+Prefer declining what the task does not need. Then briefly report the decision.`,
+      { taskId: task.id, type: 'avatar.connection-dispatch-failed', payload: { connectionId: connection.id, avatarId: avatar.id } });
+  }
+
   /** Ask selected people, teams, or owner-configured Avatars to add exact
    * capabilities and/or project scope to this task. The deciding principal must independently hold
    * every capability it grants. */
@@ -5187,7 +5372,7 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
     }
     const projectIds = requestedProjects.filter((id) => caller.projectId ? caller.projectId !== id
       : caller.projectIds?.length ? !caller.projectIds.includes(id) : false);
-    const baseAuthorization = projectIds.length ? previousTaskGrants(task).authorization : undefined;
+    const baseAuthorization = projectIds.length ? (await this.taskGrants(task)).authorization : undefined;
     if (projectIds.length && (!baseAuthorization || baseAuthorization.scope !== 'projects'))
       throw new ValidationError('project expansion requires a task with selected-project authorization');
     if (projectIds.length && caller.principal.startsWith('avatar:'))
@@ -5229,9 +5414,7 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
       resolved.forEach((userId) => recipients.add(userId));
     }
     const service = new PermissionRequests(this.deps.store, project.organizationId);
-    const role = caller.role
-      ?? (await this.deps.store.getProfile(caller.profileId))?.role
-      ?? caller.profileId.replace(/-default$/, '');
+    const role = (await this.callerRole(caller));
     const prior = new Set((await service.requests({ taskId: task.id, status: 'pending' })).map((request) => request.id));
     const request = (await service.request({
       taskId: task.id,
@@ -5279,7 +5462,7 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
         await this.stopTaskActivity(task, view, `Waiting for permission approval ${request.id}`);
         await this.startTransitionReplacement(task, view, view.stage, true, {
           audience: request.audience,
-          detail: `Permission requested: ${request.capabilities.join(', ')}${request.projectIds?.length ? `; add projects: ${request.projectIds.join(', ')}` : ''} — ${request.reason}`,
+          detail: `${await this.permissionAsk(request)} — ${request.reason}`,
         });
       }
       for (const grantorId of taskRecipients) await this.askTaskToGrant(grantorId, task, request, project.organizationId);
@@ -5294,6 +5477,97 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
       audience: request.audience,
       canGrant: grantorSelectors(grantors),
     };
+  }
+
+  /**
+   * Take back a request made with `request_permission` that is no longer
+   * needed: a task's own permission request (only that task's agents may), or
+   * an authorization request for a task held for it (whoever may route it: its
+   * creator). It leaves every inbox and can no longer be approved; a request
+   * already decided is returned as it is, and nothing granted is revoked.
+   */
+  async withdrawPermissionRequest(token: string, input: { requestId: string; reason?: string; organizationId?: string })
+    : Promise<PermissionRequest | AuthorizationRequest> {
+    const caller = (await this.require(token, 'withdraw_permission_request'));
+    const callerTask = caller.taskId !== '*' ? (await this.deps.store.getTask(caller.taskId)) : undefined;
+    const organizationId = input.organizationId
+      || (callerTask && (await this.deps.store.getProject(callerTask.projectId))?.organizationId);
+    if (!organizationId) throw new ValidationError('organizationId is required');
+    const reason = String(input.reason ?? '').trim() || 'No longer needed';
+    if ([...reason].length > 4_000) throw new ValidationError('reason must be at most 4000 characters');
+    const emit = async (event: { taskId: string; type: string; ts: number; payload: Record<string, unknown> }) => {
+      const seq = (await this.deps.store.appendEvent(event));
+      this.deps.bus?.emit({ ...event, seq });
+    };
+
+    const permissions = new PermissionRequests(this.deps.store, organizationId);
+    const permission = (await permissions.requests()).find((candidate) => candidate.id === input.requestId);
+    if (permission) {
+      (await this.require(token, 'withdraw_permission_request', { projectId: permission.projectId, taskId: permission.taskId, organizationId }));
+      if (caller.taskId !== permission.taskId) throw new CapabilityError('only the task that asked can withdraw its permission request');
+      if (permission.status !== 'pending') return permission;
+      const withdrawn = (await permissions.withdraw(permission.id, caller.principal, reason));
+      if (withdrawn.status !== 'withdrawn') return withdrawn;
+      await emit({ taskId: withdrawn.taskId, type: 'permission.approval-resolved', ts: Date.now(),
+        payload: { requestId: withdrawn.id, action: 'withdraw', resolvedBy: caller.principal, reason } });
+      // Another of the task's agents took back what this one asked for, and
+      // this one may be waiting for the answer: it hears that none is coming.
+      const role = (await this.callerRole(caller));
+      if (role !== withdrawn.role)
+        await this.resumeAfterCredentialDecision(withdrawn.taskId, `[${BRAND} permission decision]\n\n`
+          + `Your request for ${[...withdrawn.capabilities, ...(withdrawn.projectIds ?? []).map((id) => `project ${id}`)].join(', ')} `
+          + `was withdrawn by this task's ${role} agent, so nobody will decide it.\n`
+          + `${untrustedBlock('its reason', reason)}\nContinue without it, or ask again if you still need it.`, withdrawn.role);
+      return withdrawn;
+    }
+
+    const authorizations = new AuthorizationRequests(this.deps.store, organizationId);
+    const authorization = (await authorizations.requests()).find((candidate) => candidate.id === input.requestId);
+    if (!authorization) throw new NotFoundError(`no permission request ${input.requestId}`);
+    (await this.require(token, 'withdraw_permission_request', { projectId: authorization.projectId, organizationId }));
+    const target = (await this.deps.store.getTask(authorization.target.taskId));
+    if (!target || !(await this.routesAuthorizationOf(caller, target)))
+      throw new CapabilityError('only the task creator can withdraw its authorization request');
+    if (authorization.status !== 'pending') return authorization;
+    const withdrawn = (await authorizations.withdraw(authorization.id, caller.principal, reason));
+    if (!withdrawn) {
+      const now = (await authorizations.requests()).find((candidate) => candidate.id === authorization.id)!;
+      if (now.status !== 'pending') return now;
+      throw new ValidationError('a decision on this request is already in progress');
+    }
+    // A draft waiting for it to start is a draft again, as after a denial.
+    (await this.releaseApprovalWait(withdrawn));
+    await emit({ taskId: target.id, type: 'authorization.approval-resolved', ts: Date.now(),
+      payload: { requestId: withdrawn.id, action: 'withdraw', resolvedBy: caller.principal, reason } });
+    return withdrawn;
+  }
+
+  /** The agent role a token acts as, as a permission request records it. */
+  private async callerRole(caller: ScopedToken): Promise<string> {
+    return caller.role
+      ?? (await this.deps.store.getProfile(caller.profileId))?.role
+      ?? caller.profileId.replace(/-default$/, '');
+  }
+
+  /** Whoever created a task routes its authorization request (and may take it
+   * back): an agent for a task it created, a person — or an agent acting for
+   * that person — for the person's own. */
+  private async routesAuthorizationOf(caller: ScopedToken, task: TaskRecord): Promise<boolean> {
+    if (caller.taskId !== '*' && task.createdBy?.kind === 'task-agent' && task.createdBy.taskId === caller.taskId) return true;
+    const userId = caller.humanSubject?.userId;
+    return !!userId && (await this.deps.store.taskCreatorUserId(task.id)) === userId;
+  }
+
+  /** What a permission request asks, in words: its capabilities and the
+   * projects it adds, by name ("Permission requested: x; access to Smoke checks"). */
+  private async permissionAsk(request: Pick<PermissionRequest, 'capabilities' | 'projectIds'>): Promise<string> {
+    const projects = await Promise.all((request.projectIds ?? []).map(async (id) =>
+      (await this.deps.store.getProject(id))?.name ?? id));
+    const parts = [
+      ...(request.capabilities.length ? [request.capabilities.join(', ')] : []),
+      ...(projects.length ? [`access to ${projects.join(', ')}`] : []),
+    ];
+    return `Permission requested: ${parts.join('; ')}`;
   }
 
   /** Call each Avatār to decide a permission request. */
@@ -5431,7 +5705,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const projectIds = [...new Set(input.projectIds ?? [])].filter((id) => caller.projectId ? caller.projectId !== id
       : caller.projectIds?.length ? !caller.projectIds.includes(id) : false);
     const missing = projectIds.length ? capabilities : capabilities.filter((capability) => !allows(caller.caps, capability));
-    const baseAuthorization = projectIds.length ? previousTaskGrants(task).authorization : undefined;
+    const baseAuthorization = projectIds.length ? (await this.taskGrants(task)).authorization : undefined;
     return { ...(await this.permissionGrantors(task, organizationId, missing, projectIds, baseAuthorization)), missing };
   }
 
@@ -5445,9 +5719,10 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
    */
   private async permissionGrantors(task: TaskRecord, organizationId: string, capabilities: Capability[],
     projectIds: string[], baseAuthorization?: AuthorizationSelection): Promise<PermissionGrantors> {
-    const taskCaps = (task.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities ?? [];
+    const taskCaps = delegatedFromParent(task) ? (await taskAuthorityNow(this.deps.store, this.deps.authorization, task)).capabilities
+      : (task.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities ?? [];
     const required = projectIds.length ? [...taskCaps, ...capabilities] : capabilities;
-    const scope = [...new Set([...(baseAuthorization?.projectIds ?? previousTaskGrants(task).authorization?.projectIds ?? [task.projectId]), ...projectIds])];
+    const scope = [...new Set([...(baseAuthorization?.projectIds ?? (await this.taskGrants(task)).authorization?.projectIds ?? [task.projectId]), ...projectIds])];
     const authorization = this.deps.authorization;
     const tasks: PermissionGrantors['tasks'] = [];
     const seen = new Set([task.id]);
@@ -5491,7 +5766,9 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
         && (await holdsAll((projectId) => avatarAuthorizationCapabilities(this.deps.store, authorization, avatar, projectId)))))
       .map((avatar) => ({ id: avatar.id, name: avatar.name, selector: `avatar:${avatar.id}` }));
     const { special, summon } = await this.summonable(task.projectId, organizationId, eligible);
-    const nearest = tasks[0]?.selector ?? summon;
+    // In an autonomous project nobody is summoned: its Avatār decides what it can.
+    const nearest = tasks[0]?.selector
+      ?? (await autonomyRoute(this.deps.store, task.projectId, avatars.map((avatar) => avatar.id))) ?? summon;
     return { tasks, users, teams, special, avatars, ...(nearest ? { default: nearest } : {}) };
   }
 
@@ -5608,7 +5885,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const own = task.params?._authorization as Held | undefined;
     const other = isHeld(own) ? undefined
       : Object.entries(this.storedAgentAuthorizations(task)).find(([, entry]) => isHeld(entry));
-    const authorization = isHeld(own) ? previousTaskGrants(task).authorization
+    const authorization = isHeld(own) ? (await this.taskGrants(task)).authorization
       : other ? other[1].requested.authorization ?? selectionOf(other[1], task.projectId) : undefined;
     if (!authorization) throw new ValidationError('this task already has the authorization it asked for');
     const request = (await this.requestAuthorization(token, {
@@ -5642,17 +5919,12 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const caller = (await this.require(token, 'create_task', { projectId: input.projectId }));
     const project = (await this.deps.store.getProject(input.projectId));
     if (!project?.organizationId) throw new NotFoundError('project organization not found');
-    // Whoever created the task routes its request, human or agent alike: an
-    // agent for a task it created, a person — or an agent acting for that
-    // person — for the person's own.
     if ((input.target as { kind?: string }).kind !== 'task') throw new ValidationError('target.kind must be task');
-    const requesterId = caller.humanSubject?.userId;
     const targetTask = (await this.deps.store.getTask(input.target.taskId));
     if (!targetTask || targetTask.projectId !== input.projectId) throw new NotFoundError('task not found in this project');
     if (['done', 'cancelled'].includes(targetTask.lastView?.status ?? ''))
       throw new ValidationError('this task has finished');
-    const createdIt = caller.taskId !== '*' && targetTask.createdBy?.kind === 'task-agent' && targetTask.createdBy.taskId === caller.taskId;
-    if (!createdIt && !(requesterId && (await this.deps.store.taskCreatorUserId(targetTask.id)) === requesterId))
+    if (!(await this.routesAuthorizationOf(caller, targetTask)))
       throw new CapabilityError('only the task creator can route its authorization request');
     const credentialGrants = input.credentialGrants?.length ? [...new Set(input.credentialGrants.map(String))] : undefined;
     const targets = (await this.authorizationEscalationTargets(token, {
@@ -5663,8 +5935,11 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const eligibleUsers = new Set(targets.users.map((user) => user.id));
     const eligibleAvatars = new Set(targets.avatars.map((avatar) => avatar.id));
     const audience = [...new Set((input.audience ?? []).map(String).map((value) => value.trim()).filter(Boolean))];
-    // No audience: summon the lowest level that can grant it all, as the console offers first.
-    if (!audience.length && targets.summon) audience.push(targets.summon);
+    // No audience: an autonomous project's Avatār when it can grant it all, else
+    // summon the lowest level that can, as the console offers first.
+    const autonomous = audience.length ? undefined
+      : await autonomyRoute(this.deps.store, input.projectId, targets.avatars.map((avatar) => avatar.id));
+    if (!audience.length && (autonomous ?? targets.summon)) audience.push((autonomous ?? targets.summon)!);
     if (!audience.length || audience.length > 32) throw new ValidationError('choose between 1 and 32 eligible recipients');
     const recipients = new Set<string>();
     const avatarRecipients = new Set<string>();
@@ -5898,6 +6173,11 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       retry: async (taskId) => (await this.workflowHandle(taskId)).signal(SIG.retry) });
   }
 
+  /** The grants a task acts with (task-authority.ts `taskGrants`): a sub-task's are its parent's. */
+  private taskGrants(task: TaskRecord): ReturnType<typeof taskGrants> {
+    return taskGrants(this.deps.store, this.deps.authorization, task);
+  }
+
   async resolvePermissionRequest(
     token: string,
     input: { organizationId: string; requestId: string; action: 'approve' | 'deny' | 'dismiss' },
@@ -5956,11 +6236,14 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     }
     if (input.action === 'approve' && !(task && (await this.permissionRequestSatisfied(task, request)))) {
       let expanded: AuthorizationSelection | undefined;
+      // A sub-task acts with its parent's authority as it is now, so its base
+      // moves with the parent's: what is approved for it is these projects.
+      const delegated = !!task && delegatedFromParent(task);
       if (request.projectIds?.length) {
         if (!task || !this.deps.authorization) throw new ValidationError('task authorization is unavailable');
-        const current = previousTaskGrants(task).authorization;
+        const current = (await this.taskGrants(task)).authorization;
         if (!current || current.scope !== 'projects'
-          || JSON.stringify(current) !== JSON.stringify(request.baseAuthorization))
+          || !delegated && JSON.stringify(current) !== JSON.stringify(request.baseAuthorization))
           throw new ValidationError('task authorization changed; submit a new project access request');
         expanded = { ...current, projectIds: [...new Set([...(current.projectIds ?? []), ...request.projectIds])] };
         (await this.deps.authorization.requestedCapabilities(task.projectId, expanded));
@@ -5968,7 +6251,8 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
         // Check durable human grants per project; delegated agents are limited
         // to their immediate bearer, never their backing human's authority.
         const existingCaps = [
-          ...((task.params?._authorization as { capabilities?: string[] })?.capabilities ?? []),
+          ...(delegated ? (await taskAuthorityNow(this.deps.store, this.deps.authorization, task)).capabilities
+            : (task.params?._authorization as { capabilities?: string[] })?.capabilities ?? []),
           ...(await service.extensionCaps(task.id)),
           ...(await new VaultItems(this.deps.store, this.deps.broker, undefined, input.organizationId).extensionCaps(task.id)),
         ];
@@ -5979,7 +6263,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
           if (!held) throw new CapabilityError(`you cannot grant ${capability} in project ${projectId}`);
         }
       }
-      const selectedProjects = task && previousTaskGrants(task).authorization?.projectIds;
+      const selectedProjects = task && (await this.taskGrants(task)).authorization?.projectIds;
       for (const capability of expanded ? [] : request.capabilities) {
         for (const projectId of selectedProjects?.length ? selectedProjects : [request.projectId]) {
           // Later capability requests also apply throughout an expanded scope.
@@ -5992,23 +6276,55 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
             throw new CapabilityError(`you cannot grant ${capability}: ${checked.reason ?? 'permission denied'} (project ${projectId})`);
         }
       }
-      if (expanded) await this.setTaskAuthorization(token, request.taskId, expanded, undefined, undefined,
+      if (expanded && delegated) await this.addSubTaskProjects(token, caller, task!, input.organizationId, request.projectIds!);
+      else if (expanded) await this.setTaskAuthorization(token, request.taskId, expanded, undefined, undefined,
         { acceptAttenuation: false, preserveCredentialGrants: true });
     }
     return this.finishPermissionDecision(service, request, input.action, caller.principal,
       input.action === 'approve' && !!task && (await this.permissionRequestSatisfied(task, request)), claim);
   }
 
+  /**
+   * Approving more projects for a sub-task adds them to it alone
+   * (`addedProjectIds`, task-authority.ts): it goes on acting with its
+   * parent's authority, across those projects too. Its human delegation
+   * becomes the approver's, reaching them all, as a task's does when its own
+   * authorization is widened (`setTaskAuthorization`).
+   */
+  private async addSubTaskProjects(token: string, caller: ScopedToken, task: TaskRecord, organizationId: string,
+    projectIds: string[]): Promise<void> {
+    const stored = task.params._authorization as { addedProjectIds?: string[] };
+    const authorization = { ...stored, addedProjectIds: [...new Set([...stored.addedProjectIds ?? [], ...projectIds])] };
+    const scope = (await baseTaskAuthority(this.deps.store, this.deps.authorization,
+      { ...task, params: { ...task.params, _authorization: authorization } }));
+    const pinned = typeof task.params._githubAccountId === 'string' ? task.params._githubAccountId : undefined;
+    const githubAccountId = pinned ?? (caller.kind === 'agent' ? caller.externalIdentities?.githubAccountId
+      : caller.humanSubject ? (await this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId)) : undefined);
+    const delegation = (await this.delegateTaskHuman(token, caller, { taskId: task.id,
+      ...tokenScopeOf(scope, task.projectId, organizationId),
+      ...(githubAccountId ? { externalIdentities: { githubAccountId } } : {}) }));
+    (await this.deps.store.patchTaskParams(task.id, { _authorization: { ...authorization,
+      ...(delegation ? { delegationId: delegation.id } : {}) } }));
+  }
+
   /** Only reconcile from the persisted grant, never from the requested level. */
   private async permissionRequestSatisfied(task: TaskRecord, request: PermissionRequest): Promise<boolean> {
-    const authorization = task.params?._authorization as { capabilities?: Capability[] } | undefined;
-    if (!authorization?.capabilities) return false;
     const service = new PermissionRequests(this.deps.store,
       (await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal');
+    if (delegatedFromParent(task)) {
+      // A sub-task holds what its parent holds now, across the projects added for it.
+      const held = (await baseTaskAuthority(this.deps.store, this.deps.authorization, task));
+      const caps = [...held.capabilities, ...(await service.extensionCaps(task.id, request.role))];
+      if (!request.capabilities.every((cap) => allows(caps, cap))) return false;
+      return !request.projectIds?.length || held.scope === 'organization' || held.scope === 'global'
+        || request.projectIds.every((id) => (held.scope === 'projects' ? held.projectIds ?? [] : [task.projectId]).includes(id));
+    }
+    const authorization = task.params?._authorization as { capabilities?: Capability[] } | undefined;
+    if (!authorization?.capabilities) return false;
     const caps = [...authorization.capabilities, ...(await service.extensionCaps(task.id, request.role))];
     if (!request.capabilities.every((cap) => allows(caps, cap))) return false;
     if (!request.projectIds?.length) return true;
-    const current = previousTaskGrants(task).authorization;
+    const current = (await this.taskGrants(task)).authorization;
     if (!current || !this.deps.authorization || !request.baseAuthorization) return false;
     const projects = [...new Set([...(request.baseAuthorization.projectIds ?? [task.projectId]), ...request.projectIds])];
     if (current.scope === 'projects' && !projects.every((id) => current.projectIds?.includes(id))) return false;
@@ -6071,7 +6387,8 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     if (!project) throw new NotFoundError(`no project ${task.projectId}`);
     const view = task.lastView;
     const pullRequests = (view?.prs?.length ? view.prs : view?.pr ? [view.pr] : []).filter((pr) => pr.state === 'open' && !pr.merged);
-    const policy = String(task.params?.remote ?? (await this.deps.store.effectiveProjectConfig(project)).remote ?? 'none');
+    const effective = (await this.deps.store.effectiveProjectConfig(project));
+    const policy = String(this.deps.hosted && landsByPushOnTavya(effective.repos) ? 'push' : task.params?.remote ?? effective.remote ?? 'none');
     const none = { taskId, required: false, repositories: [], pullRequests: [], canMerge: true, blocked: false, eligibleUserIds: [], audience: [] };
     if (!pullRequests.length && policy !== 'pr') return none;
     const wiki = (await this.deps.store.projectWiki(project.id))?.repository;
@@ -6261,7 +6578,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const role = args.role ?? 'do';
     if (!(await this.deps.store.kvGet(`session:${args.taskId}:${role}`)) && !(await this.getTaskView(token, args.taskId))?.messages?.length)
       throw new Error(`the ${role} agent has no conversation to fork`);
-    const previous = args.reauthorize ? previousTaskGrants(source) : undefined;
+    const previous = args.reauthorize ? (await this.taskGrants(source)) : undefined;
     return this.createTask(token, {
       projectId: source.projectId,
       title: args.title ?? `Fork of #${source.num ?? source.id} ${role}`,
@@ -6491,7 +6808,9 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       ...(result.groups ? { groups: prune(result.groups) } : {}),
       ...(result.reasons ? { reasons: Object.fromEntries(Object.entries(result.reasons).filter(([id]) => ids.has(id))) } : {}),
       ...(result.pullRequestAsks ? { pullRequestAsks: Object.fromEntries(Object.entries(result.pullRequestAsks).filter(([id]) => ids.has(id))) } : {}),
+      ...(result.mine ? { mine: Object.fromEntries(Object.entries(result.mine).filter(([id]) => ids.has(id))) } : {}),
       ...(result.updated ? { updated: Object.fromEntries(Object.entries(result.updated).filter(([id]) => ids.has(id))) } : {}),
+      ...(result.runCounts ? { runCounts: Object.fromEntries(Object.entries(result.runCounts).filter(([id]) => ids.has(id))) } : {}),
       projects: projects.map((project) => ({ id: project.id, name: project.name, slug: slugify(project.name), organizationId: project.organizationId ?? 'org_personal' })),
       tags,
     };
@@ -6520,9 +6839,9 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       projects: new Map(projects.map((project) => [project.id, { name: project.name, slug: slugify(project.name) }])),
     };
     const forValues = forClauseValues(q);
-    // `is:folded` keeps the nested rows that need the caller, so it reads their asks too.
-    const folds = !!ctx.userId && queryFolds(q);
-    if (forValues.length || folds) {
+    // Every list reads the caller's own asks: `is:folded` keeps the nested rows
+    // that need them, and any row offers the answers they can give (`mine`).
+    if (forValues.length || ctx.userId) {
       const organizations = [...new Set(projects.map((project) => project.organizationId ?? 'org_personal'))];
       if (forValues.some((value) => value.toLowerCase() !== 'me' && !/^user:/i.test(value))) {
         ctx.people = new Map();
@@ -6533,7 +6852,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       }
       const users = new Set(forValues.map((value) => value.toLowerCase() === 'me' ? ctx.userId
         : /^user:/i.test(value) ? value.slice(5) : ctx.people?.get(value.trim().toLowerCase())).filter((id): id is string => !!id));
-      if (folds) users.add(ctx.userId!);
+      if (ctx.userId) users.add(ctx.userId);
       ctx.attention = new Map();
       for (const userId of users) {
         const asks = new Map<string, AttentionAsk>();
@@ -6561,7 +6880,10 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       ctx.seriesIds = new Set();
       for (const id of unread) if (isSeries((await this.deps.store.taskMetadataAsync(id))?.params)) ctx.seriesIds.add(id);
     }
-    return { result: evaluateQuery(tasks, q, { ...ctx, tags }), tags };
+    const result = evaluateQuery(tasks, q, { ...ctx, tags });
+    const series = result.tasks.filter((task) => isSeries(task.params)).map((task) => task.id);
+    if (series.length) result.runCounts = Object.fromEntries(await this.deps.store.runCounts(series));
+    return { result, tags };
   }
 
   /** The searchable-field registry the UI reads to build its filter/sort/group menus. */
@@ -7196,12 +7518,16 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       delete params.paymentPolicy;
     if (triggered?.context) params.trigger = triggered.context as unknown as ValueMap[string];
     if (triggered?.followUpTriggers.length) params.followUpTriggers = triggered.followUpTriggers as unknown as ValueMap[string];
+    // A task that holds a key of its series (one task per key, for good) is
+    // carried on as a run of that series still, and takes the key along.
+    const holdsKeys = (await this.deps.store.keyedRunsOfTask(taskId)).length > 0;
+    if (holdsKeys && source.params?.runOf) params.runOf = source.params.runOf as ValueMap[string];
     const field = params['agent:do'] === undefined && params['agent:unified'] !== undefined ? 'agent:unified' : 'agent:do';
     const { resumeFrom: _previous, ...agent } = (params[field] ?? {}) as Partial<AgentSpec>;
     params[field] = { ...agent, resumeFrom: { taskId, role: MAIN_AGENT } };
     params.prompt = input.text;
-    const previous = previousTaskGrants(source);
-    return this.createTask(token, {
+    const previous = (await this.taskGrants(source));
+    const continued = await this.createTask(token, {
       projectId: source.projectId,
       workflow: source.workflow,
       params,
@@ -7212,6 +7538,54 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       credentialPolicies: previous.credentialPolicies,
       ...(triggered && source.createdBy ? { createdBy: source.createdBy } : {}),
     });
+    if (holdsKeys) (await this.deps.store.moveKeyedRuns(taskId, continued.id));
+    return continued;
+  }
+
+  // ─── One task per key (EventTrigger concurrency mode `continue`) ──────────
+  // wiki features/events-and-automations § Keys. A series that keeps one task
+  // per key says which task holds each; whoever understands the cause corrects
+  // the grouping: a key given to another key's task (merged), or freed so its
+  // next event starts a task of its own (split).
+
+  private async keyedSeries(token: string, seriesId: string, write: boolean): Promise<{ series: TaskRecord; caller: ScopedToken }> {
+    const series = (await this.deps.store.getTask(seriesId));
+    // A run of the series may correct its series' keys: it is the one that knows.
+    const verified = (await this.deps.tokens.verify(token));
+    const callerTask = verified?.taskId && verified.taskId !== '*' ? (await this.deps.store.taskMetadata(verified.taskId)) : undefined;
+    const ownSeries = !!series && callerTask?.params?.runOf === series.id;
+    const caller = (await this.require(token, write && !ownSeries ? 'edit_task' : 'get_task', { projectId: series?.projectId ?? '__missing__', taskId: ownSeries ? callerTask!.id : seriesId }));
+    if (!series) throw new NotFoundError(`no task ${seriesId}`);
+    return { series, caller };
+  }
+
+  /** The keys a series keeps a task for, newest first, each with its task's state. */
+  async listKeyedRuns(token: string, seriesId: string): Promise<Array<KeyedRun & { task?: { id: string; number?: number; title: string; status: string } }>> {
+    (await this.keyedSeries(token, seriesId, false));
+    const runs = (await this.deps.store.listKeyedRuns(seriesId));
+    return Promise.all(runs.map(async (run) => {
+      const task = run.taskId ? (await this.deps.store.taskMetadata(run.taskId)) : undefined;
+      return { ...run, ...(task ? { task: { id: task.id, ...(task.num !== undefined ? { number: task.num } : {}), title: task.title, status: task.lastView?.status ?? 'active' } } : {}) };
+    }));
+  }
+
+  /** Give a key to a task of the series (merge it into that task's work). */
+  async assignKeyedRun(token: string, seriesId: string, key: string, taskId: string): Promise<KeyedRun> {
+    const { series } = (await this.keyedSeries(token, seriesId, true));
+    const task = (await this.deps.store.taskMetadata(taskId));
+    if (!task || task.projectId !== series.projectId) throw new NotFoundError(`no task ${taskId} in this project`);
+    if (task.lastView?.status === 'cancelled') throw new ValidationError('a cancelled task cannot hold a key');
+    if (typeof key !== 'string' || !key || key.length > 300) throw new ValidationError('name the key');
+    const existing = (await this.deps.store.keyedRun(seriesId, key));
+    return this.deps.store.saveKeyedRun({ seriesId, key, projectId: series.projectId,
+      organizationId: (await this.deps.store.getProject(series.projectId))?.organizationId ?? 'org_personal',
+      taskId, state: 'run', seen: existing?.seen ?? 1, reason: existing?.taskId && existing.taskId !== taskId ? `moved from ${existing.taskId}` : existing?.reason });
+  }
+
+  /** Free a key (split it off its task): its next event starts a task of its own. */
+  async releaseKeyedRun(token: string, seriesId: string, key: string): Promise<{ released: boolean }> {
+    (await this.keyedSeries(token, seriesId, true));
+    return { released: (await this.deps.store.deleteKeyedRun(seriesId, key)) };
   }
 
   /**
@@ -7256,6 +7630,19 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     } catch { return undefined; }
   }
 
+  /** A task stopped because its run asked for a pull request on repositories
+   * tavya hosts: its input predates 5c242ab3 (tavya-error 5b7a123b7e52ac15,
+   * tavya.io 2026-11-14), and a run replays the input it started with, so its
+   * Retry failed the same way forever. The project lands by push now. */
+  private async staleTavyaPullRequestPolicy(task: TaskRecord): Promise<boolean> {
+    const view = task.lastView;
+    if (!this.deps.hosted || view?.status !== 'blocked') return false;
+    const said = `${view.error ?? ''}\n${view.waitingFor?.detail ?? ''}`;
+    if (!/no repository in this world has a GitHub origin remote|none of this task's repositories is on GitHub/.test(said)) return false;
+    const project = (await this.deps.store.getProject(task.projectId));
+    return !!project && landsByPushOnTavya((await this.deps.store.effectiveProjectConfig(project)).repos);
+  }
+
   private async deliverSignal(tool: 'signal_task' | 'message_agent', token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt?: { monoMs: number; wallMs: number },
     /** Shared-conversation fields of a follow-up: who says it and to whom. */
     addressed?: Partial<Pick<Message, 'role' | 'author' | 'authorLabel' | 'to'>>): Promise<SentMessage | undefined> {
@@ -7279,6 +7666,17 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     if (attemptChoice?.saveOtherAttemptsDefault) {
       (await this.require(token, 'project:settings:write', { projectId: scopedTask?.projectId, taskId }));
       if (!attemptChoice.otherAttempts) throw new ValidationError('choose keep or cancel before saving a default');
+    }
+    // The person a task acts for, acting on it, renews a permission that lapsed.
+    if (signal !== SIG.cancel) (await this.renewLapsedDelegations(token, caller, scopedTask));
+    // A run stopped on a pull request its project can no longer have: started
+    // again from Working, as moving it back there does, before a Retry or a
+    // message reaches it (staleTavyaPullRequestPolicy).
+    if ((signal === SIG.retry || signal === SIG.followUp) && (await this.staleTavyaPullRequestPolicy(scopedTask))) {
+      const view = await this.transitionSourceView(scopedTask);
+      await this.stopTaskActivity(scopedTask, view, 'Started again to land by push on repositories tavya hosts');
+      await this.startTransitionReplacement(scopedTask, view, 'do');
+      if (signal === SIG.retry) return undefined;
     }
     if (signal === SIG.followUp) {
       const message: Message = { id: `u${randomUUID()}`, role: 'user', text: text ?? '', ts: Date.now(),
@@ -8127,6 +8525,8 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
           (await this.deliverWorkflowMessage(taskId, computerChangeNotice(change, resized.inPlace)).catch(() => undefined));
         else if (grown?.disk === 'grown' && live && caller.taskId !== taskId && !task.lastView?.outOfDisk)
           (await this.deliverWorkflowMessage(taskId, diskGrownNotice(grown.machine.diskGb)).catch(() => undefined));
+        else if (grown?.restart && live && caller.taskId !== taskId && !task.lastView?.outOfDisk)
+          (await this.deliverWorkflowMessage(taskId, diskAtStartNotice(grown.machine.diskGb)).catch(() => undefined));
       }
       // Read at each spend, so it applies from the next one.
       if (paymentPolicy !== undefined) {
@@ -8165,7 +8565,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
   /** Grow a running VM world's disk now (its CPU and memory follow at the next
    * start), recording what changed; undefined for providers that cannot. */
   private async resizeInPlace(taskId: string): Promise<{ inPlace: boolean;
-    grown?: { disk: 'grown' | 'unchanged'; machine: { diskGb: number } } }> {
+    grown?: { disk: 'grown' | 'unchanged'; restart?: boolean; machine: { diskGb: number } } }> {
     const world = (await this.deps.store.currentWorld(taskId));
     const provider = world && this.deps.worlds ? (() => { try { return this.deps.worlds!.get(world.kind); } catch { return undefined; } })() : undefined;
     if (!world || !provider?.resize) return { inPlace: false };
@@ -8246,7 +8646,8 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     if (task.lastView?.outOfDisk && caller.taskId !== taskId) {
       const world = await this.deps.store.currentWorld(taskId);
       const inPlace = Boolean(world && (() => { try { return this.deps.worlds?.get(world.kind).resize; } catch { return undefined; } })());
-      (await this.deliverWorkflowMessage(taskId, biggerDiskNotice(diskGb, current, inPlace)).catch(() => undefined));
+      (await this.deliverWorkflowMessage(taskId, world && inPlace && diskGrowsAtStart(world.kind)
+        ? biggerDiskAtStartNotice(diskGb) : biggerDiskNotice(diskGb, current, inPlace)).catch(() => undefined));
     }
     return { diskGb, maxDiskGb, applied };
   }
@@ -9119,15 +9520,25 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     } finally { await remote.release(); }
   }
 
-  /** Resolve a fresh, repository-scoped App credential for one canonical wiki
-   * publish. No linked remote means the local repository remains authoritative. */
+  /** The canonical wiki takes what was just pushed to its repository's
+   * default branch from outside it (the Files page): fetched and merged in
+   * its own lane, so the Wiki tab shows it at once. */
+  async followProjectWikiRemote(projectId: string): Promise<void> {
+    const target = await this.projectWikiPublishTarget(projectId);
+    if (!target) return;
+    const root = ensureProjectWikiRepository(this.deps.contentDir ?? paths().content, projectId);
+    await mutateAndPublishProjectWiki(root, () => undefined, async () => target);
+  }
+
+  /** Resolve a fresh, repository-scoped credential (tavya's grant, or the
+   * GitHub App's) for one canonical wiki publish. No linked remote means the
+   * local repository remains authoritative. */
   private async projectWikiPublishTarget(projectId: string) {
     const repository = (await this.deps.store.projectWiki(projectId))?.repository;
     if (!repository) return undefined;
-    if (!this.deps.githubApp) throw new Error('the GitHub App is unavailable for this linked project wiki');
     return {
       remote: repository.sshUrl,
-      credential: await this.deps.githubApp.brokerCredentials(repository),
+      credential: await repositoryBrokerCredentials(repository, this.deps.githubApp),
     };
   }
 
@@ -9378,11 +9789,6 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
   }
 }
 
-/** The grants a task ended with, in the shape a new task is created with: the
- * stored `_authorization` selection (level/scope/projects — the elevated one if
- * a human approved a mid-task authorization request), its per-task vault
- * credential caps and the policies chosen for them. A legacy record that only
- * carries a `profileId` still maps to a level. */
 /** Can `caps` hand a vault credential grant to a task? Its own grant must
  * cover it, or it administers credentials (wiki plans/PLAN-passwords §6). */
 function canGrantCredential(caps: Capability[], grant: Capability): boolean {
@@ -9426,28 +9832,6 @@ export interface TaskLink { id: string; num?: number; title: string }
 
 function taskLink(task: TaskRecord): TaskLink {
   return { id: task.id, ...(task.num != null ? { num: task.num } : {}), title: task.title };
-}
-
-export function previousTaskGrants(task: TaskRecord): {
-  authorization?: AuthorizationSelection;
-  credentialGrants: string[];
-  credentialPolicies: VaultTaskPolicyOverrides;
-} {
-  const stored = task.params?._authorization as {
-    level?: string; profileId?: string; scope?: AuthorizationSelection['scope']; projectIds?: string[];
-    capabilities?: string[]; credentialPolicies?: VaultTaskPolicyOverrides;
-  } | undefined;
-  const level = stored?.level ?? stored?.profileId;
-  return {
-    ...(level ? { authorization: {
-      level,
-      scope: stored?.scope ?? 'projects',
-      ...(stored?.scope === 'organization' || stored?.scope === 'global' ? {}
-        : { projectIds: stored?.projectIds?.length ? stored.projectIds : [task.projectId] }),
-    } } : {}),
-    credentialGrants: (stored?.capabilities ?? []).filter((capability) => capability.startsWith('use-credential:')),
-    credentialPolicies: stored?.credentialPolicies ?? {},
-  };
 }
 
 function uniqueFileRefs(files: FileRef[]): FileRef[] {
@@ -9498,6 +9882,18 @@ function computerChangeNotice(change: ComputerChange, inPlace = false): string {
     + (inPlace
       ? 'Its disk keeps everything, Git-ignored files included; only running processes do not carry over.'
       : 'You resume with every tracked file and uncommitted change; Git-ignored files (dependencies, build output) and running processes do not carry over.');
+}
+
+/** A full disk that grows when the machine restarts (Agent37): the task parks for it, keeping every file. */
+function biggerDiskAtStartNotice(diskGb: number): string {
+  return `[${BRAND} bigger disk] The disk was full. It grows to ${diskGb} GB when this task's machine restarts: `
+    + 'end your turn with pause(3) without jobs (stop any job first). Every file stays where you left it, Git-ignored ones included; running processes do not carry over.';
+}
+
+/** What an agent is told when its running computer's disk will grow at its next start. */
+function diskAtStartNotice(diskGb: number): string {
+  return `[${BRAND} computer change]\n\nThis task's disk becomes ${diskGb} GB when its machine next restarts: end your turn with `
+    + 'pause(3) without jobs when you need the room. Every file stays where you left it; only running processes do not carry over.';
 }
 
 /** What an agent is told when its running computer's disk grew under it. */

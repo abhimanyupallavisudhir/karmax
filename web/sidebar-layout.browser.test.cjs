@@ -55,7 +55,7 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     const order = await page.locator('#rail').evaluate((rail) => [...rail.querySelectorAll(
       '#brand-home, #rail-collapse, #org-switcher, .rail-org-nav a, .rail-heading, #project-search, .project-link, .rail-tools a, .rail-tools button, .rail-person a')]
       .map((el) => el.id || el.className.split(' ')[0]));
-    assert.deepEqual(order, ['brand-home', 'rail-collapse', 'org-switcher', 'rail-home', 'rail-insights', 'rail-wiki', 'rail-organization',
+    assert.deepEqual(order, ['brand-home', 'rail-collapse', 'org-switcher', 'rail-home', 'rail-insights', 'rail-files', 'rail-wiki', 'rail-organization',
       'label', 'project-search', 'project-link', 'project-link',
       'rail-docs', 'rail-palette', 'rail-help', 'rail-installation', 'rail-profile', 'bell'], `sidebar order: ${order.join(', ')}`);
 
@@ -67,7 +67,7 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     // The organization's places are rows with their names.
     const nav = await page.locator('.rail-org-nav a').evaluateAll((els) => els.map((el) => ({
       text: el.innerText.trim(), svg: !!el.querySelector('svg'), height: el.getBoundingClientRect().height })));
-    assert.deepEqual(nav.map((row) => row.text), ['Home', 'Insights', 'Wiki', 'Settings']);
+    assert.deepEqual(nav.map((row) => row.text), ['Home', 'Insights', 'Files', 'Wiki', 'Settings']);
     for (const row of nav) {
       assert.ok(row.svg, `${row.text} keeps its icon`);
       assert.ok(row.height >= 32, `${row.text} is a comfortable row (${row.height}px)`);

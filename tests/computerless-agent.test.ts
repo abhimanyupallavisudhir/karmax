@@ -126,7 +126,7 @@ describe('which models run without a computer', () => {
       const claude = { provider: 'claude' as const };
       const codex = { provider: 'codex' as const };
       const openrouter = { provider: 'opencode' as const, model: 'openrouter/deepseek/deepseek-v4.1-flash-1017' };
-      const hosted = { hosted: true, organizationId: 'org_personal', managedRail: false };
+      const hosted = { hosted: true, organizationId: 'org_personal' };
       // Hosted: every organization's computerless turn runs in the worker, whose keys are the operator's.
       for (const profile of [claude, codex, openrouter]) {
         expect(computerlessApiKey(profile, hosted)).toBeUndefined();
@@ -135,10 +135,8 @@ describe('which models run without a computer', () => {
       // Its own leased key, or the included model's per-organization key.
       expect(computerlessApiKey(claude, { ...hosted, resolvedAuth: { apiKey: 'sk-ant-org' } })).toBe('sk-ant-org');
       expect(computerlessApiKey(openrouter, { ...hosted, resolvedAuth: { apiKey: 'sk-or-org' } })).toBe('sk-or-org');
-      // The operator's model rail, switched on for this organization, metered and capped.
-      expect(computerlessApiKey(claude, { ...hosted, organizationId: 'org_acme', managedRail: true })).toBe('sk-ant-operator');
       // Self-hosted: the operator is the only customer.
-      const own = { hosted: false, organizationId: 'org_personal', managedRail: false };
+      const own = { hosted: false, organizationId: 'org_personal' };
       expect(computerlessApiKey(claude, own)).toBe('sk-ant-operator');
       expect(computerlessApiKey(codex, own)).toBe('sk-operator');
       expect(computerlessApiKey(openrouter, own)).toBe('sk-or-operator');

@@ -12,6 +12,8 @@ import { ARTIFACT_MIME } from './artifact-mime.js';
 export const MAX_REVIEW_ARTIFACT_BYTES = 100 * 1024 * 1024;
 const indexKey = (taskId: string) => `review-artifacts:${taskId}`;
 const hash = (value: string | Buffer) => crypto.createHash('sha256').update(value).digest('hex');
+/** A target's key in its task's index of saved copies (`review-artifacts:<task>`). */
+export const reviewTargetKey = (target: string) => hash(target);
 
 export async function savedReviewArtifact(store: Store, taskId: string, target: string) {
   const index = JSON.parse((await store.kvGet(indexKey(taskId))) ?? '{}') as Record<string, string>;

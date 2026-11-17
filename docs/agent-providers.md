@@ -155,6 +155,38 @@ OpenCode. Profiles and task parameters do not have a second “Credential
 provider” setting.
 
 
+## November 11, 2026 Codex upgrade audit
+
+Codex is now **0.167.1** (from 0.167.0; the only stable release in between). Its
+release notes are empty ("Full Changelog"). The compare holds two cherry-picks
+(#59832, #60040) and the version bump. Read both, diffed the generated app-server
+protocol, and compared the model slugs and effort levels compiled into both
+binaries.
+
+- **Nothing tavya uses changed.** The only change is `incremental_tools_legacy`,
+  a new feature that is under development, off by default, and since #60040 only
+  for the `amazon-bedrock` providers. With it, regular Responses requests declare
+  tools in history the way Responses Lite already does. The app-server protocol
+  generates identically (761 files). The models and effort levels are the same.
+  So there is no adapter change.
+- **The watcher had no reason to start this run.** Its payload has no `reasons`.
+  The "When to upgrade" policy (task #868) reached only the wiki: master's
+  `scripts/agent-cli-releases.mjs` still emits every release. Task #868's agent
+  was asked to land it (task #915).
+- **panagent: `additional_tools`.** Codex records the tool catalog it declared as
+  an `additional_tools` response item, on models that send tools incrementally.
+  0.167.0 already did this on GPT-6.1 Sol and Terra, though not on GPT-5.5. Every
+  converted GPT-6.1 rollout warned `codex_item_not_represented`. panagent now skips
+  the item silently, like `ghost_snapshot`: whichever harness continues the
+  conversation declares its own tools.
+- Verified: typecheck; the agent suites and the real-binary suites (Codex lineage,
+  imported ids, foreign provider, native MCP, models, harness compatibility);
+  panagent's pinned-Codex test on 0.167.1; real `codex exec` turns on GPT-5.5
+  (also on 0.167.0, the same), GPT-6.1 Sol and Terra, and a resumed one; and the
+  `live-providers` app-server tests (a turn and a mid-turn `turn/steer`, 2 passed)
+  on the real 0.167.1 app-server. Every new rollout converts without a warning
+  beyond the usual target-specific ones.
+
 ## November 10, 2026 Claude Code upgrade audit
 
 Claude Agent SDK is now **0.3.322** (Claude Code **2.1.322**, from 0.3.319 /
@@ -200,6 +232,24 @@ effort strings and message/record types compiled into both binaries.
   fails only on the documented Messages-API fallback. The real `/usage` panel
   still parses. panagent's tests passed with its native Claude tests on 2.1.322,
   and 11 real 2.1.322 sessions converted without a warning.
+- Live check after landing (cefb4dce deployed 04:22 UTC, Deploy #688): nothing
+  newly fails. Live `claude` #17 (`claude-permission`, 2 passed), `agent` #18
+  (1 passed) and `e2b` #19 (7 passed) matched the 2.1.319 runs (#13–#15). This
+  task's own production turn, resumed on the stale E2B template, ran SDK 0.3.322
+  and 2.1.322 from `~/.npm/_npx/…/claude-code` beside the template's Codex
+  0.153.4. `karmax_control` and the browser MCP both worked, and a capability
+  granted while the task waited (`github:actions:write`) reached the turn's
+  token. Its session (54 records from 2.1.319, 261 from 2.1.322) converted
+  without a warning in panagent and in karmax's vendored copy (byte-identical).
+  The task form on tavya.io lists Claude Fable 5.2 (`claude-fable-5-2`,
+  auto…max) above Fable 5.1, and the `fable` alias now reads "Fable 5.2".
+  Production's `app.js` is byte-identical to master's. Not new: of the 30
+  metadata types in the binary's record table (the same in 2.1.319 and 2.1.322),
+  panagent names 12 and would warn on the other 18 (`tag`, `pr-link`,
+  `worktree-state`, `content-replacement`, `relocated`, `fork-context-ref`, …)
+  if a session wrote them. None of tavya's sessions has written them so far.
+  They are deliberately not silenced in bulk, because `content-replacement`,
+  `relocated` and `fork-context-ref` may change what the conversation is.
 
 ## November 7, 2026 Claude Code upgrade audit
 
@@ -247,7 +297,8 @@ both binaries.
 
 ## November 6, 2026 Codex upgrade audit
 
-Codex is now **0.167.0** (from 0.166.0; the only stable release in between).
+Codex is now **0.167.0** (from 0.166.0; the only stable release in between; now
+0.167.1, above).
 Read the release notes and the linked PRs, diffed the generated app-server
 protocol and `codex-rs/features/src/lib.rs` at both tags, and compared the model
 slugs and effort levels compiled into both binaries.
@@ -284,7 +335,7 @@ slugs and effort levels compiled into both binaries.
 ## November 5, 2026 harness upgrade audit
 
 Claude Agent SDK is now **0.3.318** (Claude Code **2.1.318**, from 0.3.281 / 2.1.281)
-and Codex **0.166.0** (from 0.162.1; now 0.167.0, above). Reviewed every release's notes in between and
+and Codex **0.166.0** (from 0.162.1; now 0.167.1, above). Reviewed every release's notes in between and
 the SDK changelog; diffed the generated Codex app-server protocol.
 
 - **New models are selectable.** Claude Sonnet 5.5 (`claude-sonnet-5-5`, 2.1.284)

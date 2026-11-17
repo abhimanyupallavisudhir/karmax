@@ -10,7 +10,7 @@ import { validGitBranch } from '../util/git-ref.js';
 import os from 'node:os';
 import path from 'node:path';
 import type { World, WorldGitIdentity, WorldRepo } from './types.js';
-import { sharesHostRefDatabase, worldRepos, worldRepoSource, worldRepoTarget } from './types.js';
+import { recordedBase, sharesHostRefDatabase, worldRepos, worldRepoSource, worldRepoTarget } from './types.js';
 import { ensureIdentity, git, isGitRepo } from './git.js';
 import { finalizeMergeRepo, scratchWorktreeHome, type MergeResult } from './merge.js';
 import { materializeGitCredential, type GitCredential } from './git-credential.js';
@@ -19,6 +19,7 @@ import { BRAND } from '../domain/brand.js';
 import { isTransportError } from '../agent/limits.js';
 import { mirroredClone, type MirroredClone } from './git-mirror.js';
 import { parseHostedUrl } from '../domain/hosted-repository.js';
+import { isInitialBase, makeInitialBase } from './initial-base.js';
 
 /** A remote the broker reaches with a credential of its own: SSH-shaped (GitHub's
  * own is rewritten to HTTPS) or a repository tavya hosts (`tavya:`). */
@@ -128,23 +129,9 @@ export async function brokerEnrollRepository(
       `refs/remotes/origin/${spec.base}`,
       'refs/remotes/origin/HEAD',
     ]);
-    if (!baseSha) {
-      await ensureIdentity(clone);
-      const checkout = await git(clone, ['checkout', '-q', '--orphan', spec.base]);
-      if (checkout.code !== 0) throw new Error(`could not initialize empty repository base "${spec.base}": ${checkout.stderr || checkout.stdout}`);
-      const commit = await git(clone, [
-        ...identityArgs(spec.identity), 'commit', '--allow-empty', '-q', '-m', `${BRAND}: initialize repository`,
-      ]);
-      if (commit.code !== 0) throw new Error(`could not initialize empty repository: ${commit.stderr || commit.stdout}`);
-      const pushed = await git(clone, ['push', 'origin', `refs/heads/${spec.base}:refs/heads/${spec.base}`], { env });
-      if (pushed.code !== 0) {
-        // A concurrent initializer may have won after our empty clone. Adopt its
-        // commit instead of treating the harmless race as a broken attachment.
-        const fetched = await git(clone, ['fetch', 'origin', spec.base], { env });
-        if (fetched.code !== 0) throw new Error(`could not publish repository base "${spec.base}": ${pushed.stderr || pushed.stdout}`);
-        baseSha = await firstCommit(clone, [`refs/remotes/origin/${spec.base}`]);
-      } else baseSha = (await git(clone, ['rev-parse', 'HEAD'])).stdout.trim();
-    }
+    // An empty repository starts from the initial commit, written here only;
+    // the first publication brings it to origin (publishInitialBase).
+    if (!baseSha) baseSha = await makeInitialBase(clone);
     if (!baseSha) throw new Error(`repository has no resolvable base commit after initializing "${spec.base}"`);
 
     const bootstrapRef = 'refs/heads/karmax-enrollment-bootstrap';
@@ -236,6 +223,9 @@ const PUSH_PROTECTION = /\bGH0(?:09|13)\b[\s\S]*(?:push protection|secrets detec
 const GITHUB_TOO_LARGE = /\bGH001\b|exceeds GitHub's file size limit|pack exceeds maximum allowed size/i;
 /** The phrase every account of a branch too large to publish carries. */
 const TOO_LARGE = /\bis too large to publish\b/;
+/** GitHub refusing a credential it knows the right to write: a read-only
+ * token, an installation without Contents: write, a person without push access. */
+const GITHUB_WRITE_REFUSED = /Write access to repository not granted|Permission to \S+ denied to|The requested URL returned error: 403|\bcan't write to\b/i;
 const GIT_AUTHORIZATION = /authentication failed|permission denied|could not read from remote repository|repository not found|http basic: access denied|403\b|401\b/i;
 
 /** Turn Git's provider prose into errors that identify the failing safety layer.
@@ -257,11 +247,23 @@ export function describeGitPushError(repo: WorldRepo, detail: string): string {
       + `Fetch origin/${repo.branch} and integrate the remote work, or retry a ${BRAND}-owned rebase only after its exact prior PR head is recorded. `
       + `Reconnect GitHub will not fix this remote-state conflict.${compact ? ` Git said: ${compact}` : ''}`;
   }
+  if (GITHUB_WRITE_REFUSED.test(detail)) {
+    const said = remoteLines(detail).join(' ').slice(0, 300) || compact;
+    return `GitHub refused to let ${BRAND} write to "${repo.name}": it can't write to this repository. `
+      + `${BRAND}'s GitHub App needs Contents: read and write on it.${said ? ` GitHub said: ${said}` : ''}`;
+  }
   if (GIT_AUTHORIZATION.test(detail)) {
     return `GitHub repository transport authorization is missing or expired for "${repo.name}". `
       + `Reconnect or re-authorize the repository's GitHub App installation, then retry.${compact ? ` Git said: ${compact}` : ''}`;
   }
   return compact || 'git push failed';
+}
+
+/** True when GitHub refused to let the credential write to the repository, in
+ * Git's output or in describeGitPushError's account of it: a permission only
+ * the repository's GitHub side can grant, never the branch's content. */
+export function isGithubWriteRefusal(detail: string): boolean {
+  return GITHUB_WRITE_REFUSED.test(detail) && !PUSH_PROTECTION.test(detail) && !REMOTE_REJECTED.test(detail);
 }
 
 /** True when Git's push output is a non-fast-forward refusal (see NON_FAST_FORWARD). */
@@ -281,7 +283,8 @@ export function isGithubPushProtectionRejection(detail: string): boolean {
  * credential or person fixes it: only whoever writes the branch, by taking
  * that content out of every commit that adds it. */
 export function isBranchContentRejection(detail: string): boolean {
-  return PUSH_PROTECTION.test(detail) || GITHUB_TOO_LARGE.test(detail) || TOO_LARGE.test(detail);
+  return PUSH_PROTECTION.test(detail) || GITHUB_TOO_LARGE.test(detail) || TOO_LARGE.test(detail)
+    || RECORDED_BASE_VIOLATION.test(detail);
 }
 
 function megabytes(bytes: number): string {
@@ -337,10 +340,16 @@ function describePushProtection(repo: WorldRepo, detail: string): string {
     + 'Reconnect GitHub will not fix this.';
 }
 
-function recordedBaseViolation(repo: WorldRepo): string {
-  return `local recorded-base ancestry violation for branch "${repo.branch}"`
-    + `${repo.baseSha ? ` (base ${repo.baseSha.slice(0, 12)})` : ''}: the branch no longer descends from the commit provisioned for this task. `
-    + `${BRAND} did not publish it; reconnecting GitHub will not help. Restore the provisioned HEAD as an ancestor and integrate the selected target normally.`;
+const RECORDED_BASE_VIOLATION = /\blocal recorded-base ancestry violation\b/;
+
+/** The branch dropped the commit its task was provisioned from (an agent's
+ * reset or rebase). Only its author can restore it, with an ordinary merge
+ * that keeps the work and brings back whatever of the base it lost. */
+function recordedBaseViolation(repo: WorldRepo, base: string): string {
+  return `local recorded-base ancestry violation for branch "${repo.branch}" (base ${base.slice(0, 12)}): `
+    + `the branch no longer descends from commit ${base}, which this task was provisioned from. ${BRAND} did not publish it. `
+    + `In ${repo.name}, run \`git merge ${base}\` on the task branch (an ordinary merge, never a reset or rebase), `
+    + 'resolve any conflicts keeping the task\'s work, verify, then publish again. Reconnecting GitHub will not help.';
 }
 
 /**
@@ -363,10 +372,10 @@ export async function brokerPublishBranch(
   const result = await publishRepositories(worldRepos(world.handle), async repo => {
     // Idle capture can restore the provisioned commit from the base without
     // creating a task ref. Explicit publication still transports every branch.
-    if (options.omitUnchangedBase && repo.baseSha && !expectedRemoteHeads[repo.name]) {
+    if (options.omitUnchangedBase && recordedBase(repo) && !expectedRemoteHeads[repo.name]) {
       const tip = await world.exec('git', ['rev-parse', '--verify', `refs/heads/${repo.branch}`], { cwd: repo.root });
       if (tip.code !== 0) throw new Error(`could not resolve task branch ${repo.branch}: ${tip.stderr || tip.stdout}`);
-      if (tip.stdout.trim() === repo.baseSha) return 'omitted';
+      if (tip.stdout.trim() === recordedBase(repo)) return 'omitted';
     }
     // Worktree-backed worlds already share refs with their source repository.
     // Trying to bundle/fetch the live branch back into that same repository
@@ -421,9 +430,10 @@ async function verifySharedWorktreeBranch(world: World, repo: WorldRepo, localRe
   if (localTip.code !== 0) throw new Error(`local task branch "${repo.branch}" is unavailable: ${localTip.stderr || localTip.stdout}`);
   if (worldTip.stdout.trim() !== localTip.stdout.trim())
     throw new Error(`world and local task branch "${repo.branch}" disagree`);
-  if (repo.baseSha) {
-    const ancestor = await git(localRepo, ['merge-base', '--is-ancestor', repo.baseSha, ref]);
-    if (ancestor.code !== 0) throw new Error(recordedBaseViolation(repo));
+  const base = recordedBase(repo);
+  if (base) {
+    const ancestor = await git(localRepo, ['merge-base', '--is-ancestor', base, ref]);
+    if (ancestor.code !== 0) throw new Error(recordedBaseViolation(repo, base));
   }
 }
 
@@ -534,8 +544,9 @@ async function fastForwardWorldFromOrigin(
   const contained = await git(clone, ['merge-base', '--is-ancestor', branchRef, trackingRef]);
   if (contained.code !== 0 && !merge) return false;
   // A remote rewritten without the world's base would be no task's work to merge.
-  if (contained.code !== 0 && repo.baseSha
-    && (await git(clone, ['merge-base', '--is-ancestor', repo.baseSha, trackingRef])).code !== 0) return false;
+  const base = recordedBase(repo);
+  if (contained.code !== 0 && base
+    && (await git(clone, ['merge-base', '--is-ancestor', base, trackingRef])).code !== 0) return false;
 
   const transferRef = `refs/karmax/remote-ahead/${cryptoSafeName(repo.branch)}`;
   const incomingRef = 'refs/karmax/remote-ahead';
@@ -616,9 +627,10 @@ async function importBranchToLocal(world: World, repo: WorldRepo, localRepo: str
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-land-'));
   try {
     await importWorldBranch(world, repo, localRepo, staging, temp);
-    if (repo.baseSha) {
-      const ancestor = await git(localRepo, ['merge-base', '--is-ancestor', repo.baseSha, staging]);
-      if (ancestor.code !== 0) throw new Error(recordedBaseViolation(repo));
+    const base = recordedBase(repo);
+    if (base) {
+      const ancestor = await git(localRepo, ['merge-base', '--is-ancestor', base, staging]);
+      if (ancestor.code !== 0) throw new Error(recordedBaseViolation(repo, base));
     }
     const updated = await git(localRepo, ['fetch', '.', `+${staging}:refs/heads/${repo.branch}`]);
     if (updated.code !== 0) throw new Error(`could not update local task branch "${repo.branch}": ${updated.stderr || updated.stdout}`);
@@ -730,7 +742,7 @@ async function brokerFetchRef(world: World, destinationRepo: WorldRepo, branch: 
   const bundleRelative = inCheckout(world, destinationRepo, bundleName);
   try {
     const known = await knownGitCommits(args => world.exec('git', args, { cwd: destinationRepo.root }),
-      destinationRepo.baseSha ? [destinationRepo.baseSha] : [], [destinationRef]);
+      [recordedBase(destinationRepo)].filter((sha): sha is string => !!sha), [destinationRef]);
     const bundle = await authorityBundle(temp, destinationRepo, branch, auth,
       known, sharesHostRefDatabase(world.handle.kind), preferOrigin);
     if (bundle.path) await uploadGitBundle(world, bundle.path, bundleRelative);
@@ -764,6 +776,7 @@ async function authorityBundle(temp: string, repo: WorldRepo, branch: string, au
   if (!brokerRemote(source)) throw new Error('Git broker requires an SSH remote');
   const credential = await resolveCredential(auth, repo);
   const { env } = materializeGitCredential(temp, credential);
+  if (branch === repo.base) await publishInitialBase(repo, source, env, temp);
   let scratch;
   try { scratch = await mirroredClone(source, path.join(temp, 'repo'), env, { branch, scratch: temp, scope: mirrorScope(credential) }); }
   catch (error) { throw new Error(`could not fetch branch "${branch}": ${error instanceof Error ? error.message : String(error)}`); }
@@ -915,7 +928,7 @@ async function importWorldBranch(world: World, repo: WorldRepo, receiver: string
   if (!validGitBranch(repo.branch)) throw new Error('Git broker rejected an invalid task branch');
   const transferName = `.karmax-transfer-${crypto.randomUUID()}.bundle`;
   const transferRel = inCheckout(world, repo, transferName);
-  const known = await knownGitCommits(args => git(receiver, args), repo.baseSha ? [repo.baseSha] : [],
+  const known = await knownGitCommits(args => git(receiver, args), [recordedBase(repo)].filter((sha): sha is string => !!sha),
     [destinationRef, `refs/remotes/origin/${repo.branch}`]);
   try {
     const bundle = await createGitBundle(args => world.exec('git', args,
@@ -984,6 +997,7 @@ async function withTransferredRepo<T>(
   try {
     const credential = await resolveCredential(auth, repo);
     const { env } = materializeGitCredential(temp, credential);
+    await publishInitialBase(repo, source, env, temp);
     // The mirror supplies history; origin is asked only for its current tips
     // and the objects the mirror lacks (WD-17, LT-10). The task branch stays a
     // negotiation base, so an already-published checkpoint is not sent again.
@@ -992,9 +1006,10 @@ async function withTransferredRepo<T>(
       .catch((error) => { throw new Error(`authenticated clone failed: ${error instanceof Error ? error.message : String(error)}`); });
     const clone = scratch.clone;
     await timed('git-broker.import-world', () => importWorldBranch(world, repo, clone, `refs/heads/${repo.branch}`, temp));
-    if (repo.baseSha) {
-      const ancestor = await git(clone, ['merge-base', '--is-ancestor', repo.baseSha, repo.branch]);
-      if (ancestor.code !== 0) throw new Error(recordedBaseViolation(repo));
+    const base = recordedBase(repo);
+    if (base) {
+      const ancestor = await git(clone, ['merge-base', '--is-ancestor', base, `refs/heads/${repo.branch}`]);
+      if (ancestor.code !== 0) throw new Error(recordedBaseViolation(repo, base));
     }
     return await timed('git-broker.operation', () => use(clone, env));
   } catch (error) {
@@ -1009,6 +1024,27 @@ async function withTransferredRepo<T>(
       if (!operationFailed) throw cleanupError;
     }
   }
+}
+
+/** A task that started on an empty repository has the initial commit
+ * (initial-base.ts) as its base, which Setup could not publish: its clone
+ * token is read-only. Publish it to `repo.base` with the broker's credential
+ * before the first write to that repository, so the base exists before any
+ * task branch (GitHub makes the first branch pushed the default branch) and
+ * before a landing reads the target. Never moves a base that exists: if
+ * origin already has one, from another task or a person, it stays. One push
+ * per write, only for such tasks; once origin has it, it says up to date. */
+async function publishInitialBase(repo: WorldRepo, source: string, env: Record<string, string>, temp: string): Promise<void> {
+  if (!validGitBranch(repo.base) || !await isInitialBase(recordedBase(repo))) return;
+  const scratch = path.join(temp, 'initial-base');
+  const init = await git(temp, ['init', '-q', '--bare', scratch]);
+  if (init.code !== 0) throw new Error(`could not prepare the repository's first commit: ${init.stderr || init.stdout}`);
+  const sha = await makeInitialBase(scratch);
+  const pushed = await git(scratch, ['push', source, `${sha}:refs/heads/${repo.base}`], { env, timeoutMs: 5 * 60_000 });
+  const detail = pushed.stderr || pushed.stdout;
+  // Rejected only because origin's base exists and is not this commit: keep it.
+  if (pushed.code !== 0 && !/\[rejected\]/.test(detail))
+    throw new Error(describeGitPushError({ ...repo, branch: repo.base }, detail || 'push failed'));
 }
 
 async function resolveCredential(auth: GitBrokerAuth, repo: WorldRepo): Promise<GitBrokerCredential> {

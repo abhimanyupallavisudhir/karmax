@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { provisionGitCredentials, provisionGitRepos, type ProvisionTarget } from '../src/world/provision-git.js';
 import { worldRepoTarget } from '../src/world/types.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
+import { initialBaseId } from '../src/world/initial-base.js';
 
 const pexec = promisify(execFile);
 
@@ -281,51 +282,32 @@ describe('seeding a cloud world from its local checkout', () => {
     return { root, remote, env };
   }
 
-  it('initializes an empty repository on its base branch instead of failing setup', async () => {
+  it('starts an empty repository without writing to it, from the same first commit in every world', async () => {
     // solidAI #1/#2 (2026-10-11): a freshly created GitHub repository with no
-    // commits failed every start with "refs/remotes/origin/HEAD is not a symbolic ref".
-    const { root, remote, env } = await makeEmptyRemote('karmax-empty-repo-');
-    const world = path.join(root, 'world');
-    const result = await provisionGitRepos(hostTarget(env), {
-      taskId: 'empty', base: 'main', target: 'main', repo: 'git@example:remote.git',
+    // commits failed every start ("refs/remotes/origin/HEAD is not a symbolic ref").
+    // tavya-error 40d814688b2054c8 (2026-11-16): a cloud world clones with a
+    // read-only token, so Setup's push of the base was always refused:
+    // "remote: Write access to repository not granted ... error: 403".
+    const { root, remote, env } = await makeEmptyRemote('karmax-empty-readonly-');
+    const hook = path.join(remote, 'hooks', 'pre-receive');
+    fs.writeFileSync(hook, '#!/bin/sh\necho "Write access to repository not granted." >&2\nexit 1\n', { mode: 0o755 });
+    const provision = (taskId: string) => provisionGitRepos(hostTarget(env), {
+      taskId, base: 'main', target: 'main', repo: 'git@example:remote.git',
       gitIdentity: { name: 'Agent', email: 'agent@example.com' },
-    }, { ...OPTIONS, root: world, home: root });
+    }, { ...OPTIONS, root: path.join(root, taskId), home: root });
 
-    const remoteMain = await gitOrThrow(remote, ['rev-parse', 'refs/heads/main']);
-    expect(result.repos[0]).toMatchObject({ base: 'main', target: 'main', baseSha: remoteMain, branch: 'tavya/empty' });
-    expect(result.repos[0]!.branchAdjustment).toBeUndefined();
-    expect(await gitOrThrow(remote, ['rev-list', '--count', 'main'])).toBe('1');
-    expect(await gitOrThrow(remote, ['log', '-1', '--format=%an <%ae>', 'main'])).toBe('Agent <agent@example.com>');
-    expect(await gitOrThrow(world, ['rev-parse', 'HEAD'])).toBe(remoteMain);
-    expect(await gitOrThrow(world, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('tavya/empty');
-    expect(result.warnings.join('\n')).toContain('was empty');
-  });
-
-  it('adopts a base another world pushed to the empty repository first', async () => {
-    const { root, remote, env } = await makeEmptyRemote('karmax-empty-race-');
-    // The racing initializer lands between our (empty) clone and our push.
-    const winner = path.join(root, 'winner');
-    await gitOrThrow(root, ['init', '-q', '-b', 'main', winner]);
-    await ensureIdentity(winner);
-    fs.writeFileSync(path.join(winner, 'README.md'), '# first\n');
-    await gitOrThrow(winner, ['add', '-A']);
-    await gitOrThrow(winner, ['commit', '-q', '-m', 'first']);
-    const host = hostTarget(env);
-    const target: ProvisionTarget = {
-      ...host,
-      async run(command, timeoutMs) {
-        if (/ push /.test(command)) await gitOrThrow(winner, ['push', '-q', remote, 'main']);
-        return host.run(command, timeoutMs);
-      },
-    };
-    const world = path.join(root, 'world');
-    const result = await provisionGitRepos(target, {
-      taskId: 'race', base: 'main', repo: 'git@example:remote.git',
-    }, { ...OPTIONS, root: world, home: root });
-    const winnerMain = await gitOrThrow(winner, ['rev-parse', 'main']);
-    expect(await gitOrThrow(remote, ['rev-parse', 'main'])).toBe(winnerMain);
-    expect(result.repos[0]).toMatchObject({ base: 'main', baseSha: winnerMain });
-    expect(fs.readFileSync(path.join(world, 'README.md'), 'utf8')).toContain('first');
+    const [first, second] = [await provision('one'), await provision('two')];
+    expect((await git(remote, ['for-each-ref', 'refs/heads'])).stdout).toBe('');
+    const base = first.repos[0]!.baseSha!;
+    expect(base).toBe(await initialBaseId());
+    expect(second.repos[0]!.baseSha).toBe(base);
+    expect(first.repos[0]).toMatchObject({ base: 'main', target: 'main', branch: 'tavya/one' });
+    const world = path.join(root, 'one');
+    expect(await gitOrThrow(world, ['rev-parse', 'HEAD'])).toBe(base);
+    expect(await gitOrThrow(world, ['rev-parse', 'refs/remotes/origin/main'])).toBe(base);
+    expect(await gitOrThrow(world, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('tavya/one');
+    expect(await gitOrThrow(world, ['log', '-1', '--format=%an <%ae> %s'])).toBe('tavya <tavya@localhost> tavya: initialize repository');
+    expect(first.warnings.join('\n')).toContain('was empty');
   });
 
   it('still rejects a distinct missing target on an empty repository', async () => {

@@ -31,8 +31,8 @@ const code = [
   statement('const URGENCY_LEVELS = '), statement('const NOTIFY_DEFAULTS = '), statement('const systemNotifications = '), statement('const liveInboxItem = '),
   ...['urgencyRank', 'inboxUnreadCount', 'inboxRowLabel', 'notifyPrefs', 'inboxArrivals',
     'announceInbox', 'inboxTitle', 'showVisualNotification', 'showSystemNotification', 'syncNotificationAlerts', 'updateBell',
-    'markInboxItemReadLocally', 'markInboxItemRead', 'isNewTabClick', 'loadInbox'].map(fn),
-  'function refreshForMeCounts() {}', 'function syncDocumentTitle() {}',
+    'markInboxItemReadLocally', 'markInboxItemRead', 'isNewTabClick', 'loadInbox', 'inboxState'].map(fn),
+  'function refreshForMeCounts() {}', 'function syncDocumentTitle() {}', 'function readAsksOnScreen() {}', 'function refreshListQuietly() {}',
 ].join('\n');
 
 (async () => {

@@ -131,4 +131,61 @@ describe('what a person does about a task that cannot start', () => {
     expect(await ui.page.locator('.toast .toast-action').last().getAttribute('href')).toBe('/org/settings#settings-plan');
     await ui.close();
   });
+
+  it('takes a GitHub write refusal to where it is approved (tavya-error 40d814688b2054c8)', async () => {
+    const ui = await console_();
+    const refused = 'Activity task failed → GitHub refused to let tavya write to radnyees/personal. The tavya GitHub App now requests Contents: read and write, '
+      + 'but radnyees has not approved it. Approve the updated App permission at https://github.com/settings/installations/42, then retry the task. '
+      + 'GitHub said: Write access to repository not granted.';
+    expect(await ui.run<any[]>(`setupFixes(${JSON.stringify(refused)})`)).toEqual([
+      { label: 'Approve on GitHub', href: 'https://github.com/settings/installations/42', external: true },
+      { label: 'GitHub settings', href: '/org/settings#settings-code' }]);
+    // The same for the Workflows permission, past the operator's App settings to the owner's approval.
+    expect(await ui.run<any[]>(`setupFixes(${JSON.stringify('GitHub App workflow permission required for acme/app. The installation operator must grant the tavya GitHub App '
+      + 'Workflows: read and write at https://github.com/settings/apps/tavya/permissions. Then the owner of acme must approve the updated App permission at '
+      + 'https://github.com/organizations/acme/settings/installations/7. Retry the task after both steps.')})`))
+      .toEqual([{ label: 'Approve on GitHub', href: 'https://github.com/organizations/acme/settings/installations/7', external: true },
+        { label: 'GitHub settings', href: '/org/settings#settings-code' }]);
+    // Without GitHub's address: where tavya's GitHub connection is managed.
+    expect(await ui.run<any[]>(`setupFixes('GitHub refused to let tavya write to acme/app. Check it on GitHub and in organization settings → GitHub, then retry the task.')`))
+      .toEqual([{ label: 'GitHub settings', href: '/org/settings#settings-code' }]);
+    // On GitHub, so a new tab, never the console's own navigation.
+    await ui.run(`document.getElementById('main').innerHTML = taskErrorHtml(${JSON.stringify(refused)})`);
+    expect(await ui.page.locator('#main a.setup-fix').first().evaluate((link) =>
+      [link.textContent, link.getAttribute('href'), link.getAttribute('target'), link.hasAttribute('data-spa')]))
+      .toEqual(['Approve on GitHub', 'https://github.com/settings/installations/42', '_blank', false]);
+    await ui.run(`toast(${JSON.stringify(refused)}, true)`);
+    expect(await ui.page.locator('.toast .toast-action').last().evaluate((link) => [link.getAttribute('target'), link.hasAttribute('data-spa')]))
+      .toEqual(['_blank', false]);
+    await ui.close();
+  });
+
+  it('links every settings place an error names, and the waits people met on tavya.io (2026-11-14)', async () => {
+    const ui = await console_();
+    await ui.run(`S.projects = [{ id: 'p', name: 'Web', slug: 'web', organizationId: 'o' }]`);
+    const fixes = (text: string) => ui.run<any[]>(`setupFixes(${JSON.stringify(text)}, 'p')`);
+    // A project whose tasks open pull requests, on repositories not on GitHub (formerly a policy dump).
+    const remote = 'Activity task failed → This project\'s tasks open GitHub pull requests, but none of this task\'s repositories is on GitHub. '
+      + 'In Project settings → Task defaults, set Remote policy to "Push after merging", or move the repositories to GitHub; then press Retry.';
+    expect(await fixes(remote)).toEqual([{ label: 'Task defaults', href: '/org/web/settings#project-defaults' }]);
+    // Waiting its turn, or for room, on tavya's computers: one's own account starts it now.
+    for (const wait of ['3 tasks are waiting ahead of this one for tavya\'s Hetzner Cloud computers; waiting its turn.',
+      'A task is waiting ahead of this one for tavya\'s Fly.io computers; waiting its turn.',
+      'tavya\'s Hetzner Cloud computers\' disks take 980 of their 1024 GB (parked ones too); waiting for room.'])
+      expect(await fixes(wait)).toEqual([{ label: 'Use your own account', href: '/org/settings#settings-computers' }]);
+    // A login's quota is spent: another login runs it now.
+    expect(await fixes('Out of quota until a login resets')).toEqual([{ label: 'Add a login', href: '/org/settings#settings-agents' }]);
+    // Any place a message names, in the order it names them, once each.
+    expect(await fixes('Build it in Project settings → Environment for faster worlds')).toEqual([{ label: 'Project settings', href: '/org/web/settings' }]);
+    expect(await fixes('Set it up in Settings → Environment.')).toEqual([{ label: 'Environment', href: '/org/web/settings#project-environment' }]);
+    expect(await fixes('Reconnect GitHub on your profile, then Retry.')).toEqual([{ label: 'Connect GitHub', href: '/profile' }]);
+    expect(await fixes('Ask an admin to change this in organization settings.')).toEqual([{ label: 'Organization settings', href: '/org/settings' }]);
+    expect(await ui.run<any[]>(`setupFixes('Change it in project settings.')`)).toEqual([]);
+    // Shown on a stopped task, with no "Press Retry" in place of the fix.
+    await ui.run(`document.getElementById('main').innerHTML = taskErrorHtml(${JSON.stringify(remote)}, 'p')`);
+    expect(await ui.page.locator('#main a.setup-fix').evaluate((link) => [link.textContent, link.getAttribute('href')]))
+      .toEqual(['Task defaults', '/org/web/settings#project-defaults']);
+    expect(await ui.page.locator('#main .msg-text').innerText()).not.toContain('Press Retry to try again. Press Retry');
+    await ui.close();
+  });
 });

@@ -8,7 +8,7 @@ import { NoneWorldProvider } from './none.js';
 import { ContainerWorldProvider } from './container.js';
 import { E2BWorldProvider } from './e2b.js';
 import { DaytonaWorldProvider } from './daytona.js';
-import { awsWorldProvider, flyWorldProvider, gcpWorldProvider, hetznerWorldProvider } from './vm/providers.js';
+import { agent37WorldProvider, awsWorldProvider, flyWorldProvider, gcpWorldProvider, hetznerWorldProvider } from './vm/providers.js';
 
 /**
  * Selects a world provider by kind. `createWorld` dispatches to the configured
@@ -37,6 +37,7 @@ export class WorldRegistry {
     this.register(hetznerWorldProvider());
     this.register(awsWorldProvider());
     this.register(gcpWorldProvider());
+    this.register(agent37WorldProvider());
   }
 
   register(p: WorldProvider) {

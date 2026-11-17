@@ -15,6 +15,8 @@ import {
   ProviderStreamError,
   SandboxProviderFailure,
   confirmSandboxFailure,
+  isNetworkEdgeBlock,
+  ProviderOutage,
 } from '../src/agent/limits.js';
 import type { UsageSnapshot } from '../src/agent/usage.js';
 
@@ -351,6 +353,42 @@ describe('isResourceKill (OOM / signal-9 predicate — karmax#4)', () => {
 // Audit R-4 (2026-09-30): AD-7 made every limit a remote sandbox reported an
 // ordinary agent error, so a task on an exhausted login retried three times and
 // escalated instead of waiting. The host now checks the leased login itself.
+describe('network edge blocks (a CDN/WAF page instead of the provider\'s answer)', () => {
+  // tavya-error 3263761e3afa5929: what Claude Code reported for Cloudflare's block page.
+  const blocked = [
+    'Failed to authenticate. API Error: 403 Attention Required! | Cloudflare',
+    'API Error: 403 Access denied | api.anthropic.com used Cloudflare to restrict access',
+    'API Error: 403 Just a moment...',
+    'unexpected status 403 Forbidden: <!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title></head><body>Sorry, you have been blocked</body></html>, url: https://chatgpt.com/backend-api/codex/responses',
+    'unexpected status 403 Forbidden: error code: 1020',
+  ];
+  it.each(blocked)('is a network block, never a login or quota verdict: %s', (message) => {
+    expect(isNetworkEdgeBlock(message)).toBe(true);
+    expect(classifyLimitError(message, { providerOrigin: true })).toEqual({ limited: false });
+    expect(classifyProviderTurnError(new ProviderStreamError(message), 'claude').classification.limited).toBe(false);
+    expect(isTransportError(message)).toBe(true);
+    const typed = providerErrorFromMessage('claude', message);
+    expect(typed).toBeInstanceOf(ProviderOutage);
+    expect(typed.message).toMatch(/Anthropic's network blocked requests from this computer/);
+  });
+
+  it.each([
+    'Failed to authenticate. API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired."}}',
+    'API Error: 403 {"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization."}}',
+    'Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator.',
+    'npm ERR! 403 Forbidden - GET https://registry.npmjs.org/private-pkg',
+    'cloudflare wrangler deploy failed: Authentication error [code: 10000]',
+  ])('leaves the provider\'s own answers and unrelated text alone: %s', (message) => {
+    expect(isNetworkEdgeBlock(message)).toBe(false);
+  });
+
+  it('keeps a real sign-in failure a hard credential failure', () => {
+    const typed = providerErrorFromMessage('claude', 'Failed to authenticate. API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}');
+    expect(typed).toBeInstanceOf(ProviderFailure);
+    expect((typed as InstanceType<typeof ProviderFailure>).metadata).toMatchObject({ kind: 'credential', permanence: 'hard' });
+  });
+});
+
 describe('confirmSandboxFailure (limits reported from inside a sandbox)', () => {
   const quota = () => providerFailure('Claude usage limit reached', {
     kind: 'quota', permanence: 'transient', provider: 'claude', source: 'structured', window: '5h', resetHint: 'in 7200s',
@@ -389,8 +427,17 @@ describe('confirmSandboxFailure (limits reported from inside a sandbox)', () => 
     const signedOut = classifyProviderTurnError(await confirmSandboxFailure(new SandboxProviderFailure(auth), async () => ({ ok: false as const, at: now, reason: 'logged-out' }), now));
     expect(signedOut.classification).toMatchObject({ limited: true, hard: true });
     expect(signedOut.metadata?.scope).toBeUndefined();
-    const healthy = classifyProviderTurnError(await confirmSandboxFailure(new SandboxProviderFailure(auth), async () => snapshot(10, 10), now));
-    expect(healthy.classification).toMatchObject({ limited: true, hard: true, taskScoped: true });
+    // A login the host has just used is not signed out: whatever refused the
+    // sandbox (a network edge's block, a stale projected token) is retried as
+    // infrastructure, never put to a person as a sign-in to redo.
+    const healthy = await confirmSandboxFailure(new SandboxProviderFailure(auth), async () => snapshot(10, 10), now);
+    expect(healthy).toBeInstanceOf(ProviderOutage);
+    expect(classifyProviderTurnError(healthy).classification.limited).toBe(false);
+    expect(isTransportError(healthy)).toBe(true);
+    expect(healthy.message).toContain('Claude credential rejected (authentication_failed)');
+    // A probe that could not tell keeps the report to this task, as before.
+    const unknown = classifyProviderTurnError(await confirmSandboxFailure(new SandboxProviderFailure(auth), async () => { throw new Error('probe crashed'); }, now));
+    expect(unknown.classification).toMatchObject({ limited: true, hard: true, taskScoped: true });
   });
 
   it('leaves a sandbox failure that is not an account limit an ordinary error', async () => {

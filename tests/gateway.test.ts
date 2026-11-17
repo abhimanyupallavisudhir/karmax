@@ -190,7 +190,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
         expect(read.mock.calls.some(([file]) => String(file).includes(sessionId))).toBe(false);
       } finally { read.mockRestore(); }
       const sessions: any = await (await fetch(`${base}/api/tasks/${task.id}/sessions`, { headers: auth() })).json();
-      expect(sessions.do).toMatchObject({ id: sessionId, provider: 'codex', downloadable: true, requiredCodexVersion: '0.167.0' });
+      expect(sessions.do).toMatchObject({ id: sessionId, provider: 'codex', downloadable: true, requiredCodexVersion: '0.167.1' });
       const response = await fetch(`${base}${sessions.do.downloadUrl}`, { headers: auth() });
       expect(response.status).toBe(200);
       expect(response.headers.get('content-type')).toContain('application/x-ndjson');
@@ -587,6 +587,26 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       method: 'PUT', headers: auth(), body: JSON.stringify({ values: { skin: '', icon: 'diamond' } }),
     });
     expect((await meta()).skin).toBe('');
+  });
+
+  it('switches the installation\'s task list layout, one line by default, and tells every console', async () => {
+    const meta = async () => (await (await fetch(`${base}/api/meta`)).json()) as any;
+    const put = (values: Record<string, unknown>, token?: string) => fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: token ? { authorization: `Bearer ${token}`, 'content-type': 'application/json' } : auth(), body: JSON.stringify({ values }),
+    });
+    expect((await meta()).taskList).toBe('');
+    for (const layout of ['status-first', 'ruled', 'cards']) {
+      expect((await put({ taskList: layout })).status).toBe(200);
+      expect((await meta()).taskList).toBe(layout);
+    }
+    // The look and the logo stay as they were.
+    expect(await (await fetch(`${base}/api/settings/global/appearance`, { headers: auth() })).json()).toMatchObject({ icon: 'diamond', skin: '', taskList: 'cards' });
+    expect((await put({ taskList: 'grid' })).status).toBe(400);
+    const dev = (await h.tokens.mintPrincipal('user:dev', ['task:*', 'project:read'])).token;
+    expect((await put({ taskList: '' }, dev)).status).toBe(403);
+    expect((await meta()).taskList).toBe('cards');
+    expect((await put({ taskList: '' })).status).toBe(200);
+    expect((await meta()).taskList).toBe('');
   });
 
   it('omits the disabled Resolve agent from schemas and profiles', async () => {
@@ -1827,8 +1847,11 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       const name = path.includes('/organizations/') ? 'Fresh via organization route' : 'Fresh via legacy route';
       const project: any = await post(path, { name });
       const tasks: any = await fetch(`${base}/api/projects/${project.id}/tasks`, { headers: auth() }).then((r) => r.json());
-      expect(tasks.map((task: any) => ({ title: task.title, template: task.params?.template, armed: task.params?.triggerState })), `new project via ${path}`)
-        .toEqual([{ title: 'Repair GitHub workflow {{workflow}}', template: 'repair-github-workflow', armed: 'armed' }]);
+      expect(tasks.map((task: any) => ({ title: task.title, template: task.params?.template, armed: task.params?.triggerState,
+        confirm: task.params?.confirm })), `new project via ${path}`)
+        .toEqual([{ title: 'Repair GitHub workflow {{workflow}}', template: 'repair-github-workflow', armed: 'armed',
+          // As the store installs it: an agent reviews its fix, nobody waits on it.
+          confirm: { layers: [{ kind: 'agent', maxRevisions: 3 }] } }]);
       const store: any = await fetch(`${base}/api/projects/${project.id}/task-store`, { headers: auth() }).then((r) => r.json());
       const entry = (id: string) => store.tasks.find((task: any) => task.id === id);
       expect(entry('repair-github-workflow').installed).toEqual([tasks[0].id]);
@@ -1838,6 +1861,11 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       await gateway.installDefaultTasks(project);
       expect(await h.store.listTasks(project.id)).toEqual([]);
     }
+    // Repositories tavya hosts run no GitHub workflows: nothing to repair (it
+    // comes with the first failure once they move to GitHub).
+    const onTavya = await h.store.createProject('On tavya', { repos: ['tavya:repo_notes1/notes.git'] });
+    await gateway.installDefaultTasks(onTavya);
+    expect(await h.store.listTasks(onTavya.id)).toEqual([]);
   });
 
   it('takes repositories as people paste them: owner/name, a GitHub page or a clone URL', async () => {

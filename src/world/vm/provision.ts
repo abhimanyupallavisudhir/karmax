@@ -124,7 +124,7 @@ function bootFiles(keys: { hostPrivateKey: string; authorizedKey: string }, devi
     [`${VM_ETC}/ssh_host_ed25519_key`, keys.hostPrivateKey, '0600'],
     [`${VM_ETC}/authorized_keys`, `${keys.authorizedKey}\n`, '0644'],
     ...(device ? [[`${VM_ETC}/volume-device`, device, '0644'] as [string, string, string]] : []),
-    ['/var/lib/cloud/scripts/per-boot/karmax-boot.sh', vmBootScript({ foreground: false }), '0755'],
+    [VM_BOOT_SCRIPT, vmBootScript({ foreground: false }), '0755'],
   ];
 }
 
@@ -139,9 +139,16 @@ export function cloudInit(keys: { hostPrivateKey: string; authorizedKey: string 
 /** A startup script (Google Cloud, whose Debian images run one at every boot
  * instead of cloud-init): it writes the boot files, then runs the boot script. */
 export function startupScript(keys: { hostPrivateKey: string; authorizedKey: string }, device?: string): string {
-  const files = bootFiles(keys, device).map(([path, content, permissions]) =>
-    `mkdir -p ${quote(path.replace(/\/[^/]+$/, ''))} && printf %s ${quote(Buffer.from(content).toString('base64'))} | base64 -d > ${quote(path)} && chmod ${permissions} ${quote(path)}`);
-  return `#!/bin/sh\n# karmax VM boot files (src/world/vm/provision.ts)\nset -e\n${files.join('\n')}\nexec /var/lib/cloud/scripts/per-boot/karmax-boot.sh\n`;
+  return `#!/bin/sh\n# karmax VM boot files (src/world/vm/provision.ts)\nset -e\n${bootFilesScript(keys, device)}\nexec ${VM_BOOT_SCRIPT}\n`;
+}
+
+/** Where the boot files put the boot script. */
+export const VM_BOOT_SCRIPT = '/var/lib/cloud/scripts/per-boot/karmax-boot.sh';
+
+/** Shell lines that write the boot files (keys, volume device, boot script). */
+export function bootFilesScript(keys: { hostPrivateKey: string; authorizedKey: string }, device?: string): string {
+  return bootFiles(keys, device).map(([path, content, permissions]) =>
+    `mkdir -p ${quote(path.replace(/\/[^/]+$/, ''))} && printf %s ${quote(Buffer.from(content).toString('base64'))} | base64 -d > ${quote(path)} && chmod ${permissions} ${quote(path)}`).join('\n');
 }
 
 /** The render smoke test of `environments/browser`, read when a script is made:
@@ -216,7 +223,8 @@ if [ "$(dpkg --print-architecture)" = amd64 ] && ! command -v google-chrome > /d
   # the world's own apt commands never wait on Google. It is not re-added.
   rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
 fi
-if ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)' 2> /dev/null; then
+# Node 22 or later with its npm (Agent37's Ubuntu image has Node without npm).
+if ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)' 2> /dev/null || ! command -v npm > /dev/null; then
   arch=$(uname -m | sed 's/x86_64/x64/; s/aarch64/arm64/')
   retry sh -c "curl -fsSL https://nodejs.org/dist/v${node}/node-v${node}-linux-$arch.tar.xz | tar -xJ -C /usr/local --strip-components=1"
 fi

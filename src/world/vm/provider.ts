@@ -5,7 +5,7 @@ import type { Duplex } from 'node:stream';
 import type { WorldReferenceKeys } from '../reference-keys.js';
 import { connectionScope, fundingRef, type ResolvedWorldProviderConnection } from '../connections.js';
 import type { MachineShape } from '../../domain/computer.js';
-import { providerFeatures } from '../../domain/computer-limits.js';
+import { diskGrowsAtStart, providerFeatures } from '../../domain/computer-limits.js';
 import type { ProviderSandboxRef, ProviderUsagePage, ProviderUsageEvent, World, WorldDiagnosis, WorldHandle,
   WorldLifecycleState, WorldOpenOptions, WorldProvider, WorldSpec } from '../types.js';
 import { WorldNotRunningError } from '../types.js';
@@ -62,6 +62,9 @@ export interface VmDriver {
   }): Promise<VmAllocation>;
   /** Where sshd answers for this machine now (an address can change on wake). */
   endpoint(connection: ResolvedWorldProviderConnection, ref: Record<string, string>): Promise<Pick<SshEndpoint, 'host' | 'port' | 'tls'>>;
+  /** A byte stream to sshd, for a machine with no address of its own to dial
+   * (Agent37: through the provider's SSH tunnel). Absent: TCP (or TLS) to `endpoint`. */
+  socket?(connection: ResolvedWorldProviderConnection, ref: Record<string, string>): Promise<Duplex>;
   /** Wake a parked machine at `shape` (CPU and memory may have changed). */
   start(connection: ResolvedWorldProviderConnection, ref: Record<string, string>, shape: VmShape, keys: VmBootKeys): Promise<void>;
   /** A new machine on the same volume, for one that started but never answers SSH. */
@@ -449,14 +452,17 @@ export class VmWorldProvider implements WorldProvider {
     const connection = await this.connection(connectionScope(sealed));
     const made = (handle.meta?.machine as VmShape | undefined) ?? await this.driver.shape(handle.meta?.computer as MachineShape | undefined, connection);
     const next = await this.driver.shape({ cpu: to.cpu ?? made.cpu, memoryMb: to.memoryMb ?? made.memoryMb, diskGb: Math.max(to.diskGb ?? 0, made.diskGb) }, connection);
+    const bigger = next.diskGb > made.diskGb;
+    // A disk that grows only at a start (Agent37) waits for the next one: shapeOf asks for it then.
+    const deferred = bigger && diskGrowsAtStart(this.kind);
     // The volume's own size decides: an earlier resize may already have grown it.
-    const grown = next.diskGb > made.diskGb && await this.driver.growDisk(connection, sealed, next.diskGb);
+    const grown = bigger && !deferred && await this.driver.growDisk(connection, sealed, next.diskGb);
     // A running machine grows its filesystem now (the boot script does it on a stopped one).
     if (grown && await this.driver.state(connection, sealed).catch(() => undefined) === 'ready')
       await growFilesystem(this.transportFor(handle.id, connection, sealed), this.home()).catch(() => undefined);
     // Every start from now on is at this size (shapeOf), and nothing records
     // it again: holds, the World prompt and the task's chip read it.
-    return { disk: grown ? 'grown' : 'unchanged', restart: next.cpu !== made.cpu || next.memoryMb !== made.memoryMb,
+    return { disk: grown ? 'grown' : 'unchanged', restart: deferred || next.cpu !== made.cpu || next.memoryMb !== made.memoryMb,
       machine: { cpu: next.cpu, memoryMb: next.memoryMb, diskGb: next.diskGb } };
   }
 
@@ -582,7 +588,8 @@ export class VmWorldProvider implements WorldProvider {
       let recover: SshRecovery = async () => false;
       transport = new SshTransport(async () => ({ ...(await this.driver.endpoint(connection, sealed)),
         hostKey: sealed.hostKey!, username: this.options.user ?? VM_USER, privateKey: sealed.sshKey! }), {
-        ...(this.options.socket ? { socket: this.options.socket } : {}),
+        ...(this.options.socket ? { socket: this.options.socket }
+          : this.driver.socket ? { socket: () => this.driver.socket!(connection, sealed) } : {}),
         ...(this.options.connectTimeoutMs ? { connectTimeoutMs: this.options.connectTimeoutMs } : {}),
         ...(this.options.reconnectDelaysMs ? { reconnectDelaysMs: this.options.reconnectDelaysMs } : {}),
         recover: (failure) => recover(failure),

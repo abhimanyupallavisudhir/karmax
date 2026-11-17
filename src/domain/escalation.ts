@@ -42,3 +42,14 @@ export const NO_MACHINE_FOR_A_DAY = 'No machine for a day';
 export function isCapacityEscalation(error: string | undefined): boolean {
   return typeof error === 'string' && error.startsWith(NO_MACHINE_FOR_A_DAY);
 }
+
+/** How a task's human delegation that expired on its own says so
+ * (platform/tokens.ts HumanDelegationLapsed). The person it acts for renews
+ * it by acting on the task: theirs to do, not a defect of tavya's, so it is
+ * not reported as an error. One "withdrawn" is still reported: nothing tavya
+ * does should withdraw a live task's (wiki incidents/lessons, 8209137dc12067d1). */
+export const DELEGATION_EXPIRED = /permission to act for the person who authorized it expired on \d{4}-\d{2}-\d{2}\b/;
+
+export function isExpiredDelegationEscalation(error: string | undefined): boolean {
+  return typeof error === 'string' && DELEGATION_EXPIRED.test(error);
+}

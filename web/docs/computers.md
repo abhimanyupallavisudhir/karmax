@@ -10,8 +10,9 @@ Every task runs on its own cloud computer, unless it needs none (see None, below
 | Hetzner | up to 10 TB | disk kept, wakes in ~30–60 s | the lowest price (EU) |
 | AWS | up to 16 TB | disk kept, wakes in ~20–40 s | your own AWS account, any region |
 | Google Cloud | up to 64 TB | disk kept, wakes in ~20–40 s | your own Google Cloud project; machines of exactly the size you choose |
+| Agent37 | up to 100 GB | disk kept, wakes in ~10 s | the lowest price per hour; up to 4 CPU · 32 GB |
 
-On Fly.io, Hetzner, AWS and Google Cloud a computer's disk keeps everything, including files Git ignores, and grows while the task runs. They have no desktop and no outbound allowlist.
+On Fly.io, Hetzner, AWS, Google Cloud and Agent37 a computer's disk keeps everything, including files Git ignores. It grows while the task runs (on Agent37, when the computer next starts). They have no desktop and no outbound allowlist.
 
 On tavya's own accounts each computer has a size limit, shown as each field's maximum in the Computer form. For bigger machines, connect your own account.
 
@@ -76,3 +77,12 @@ tavya makes each computer in the project's `default` network: an E2 machine of e
 4. In tavya, **Settings → Computers → Google Cloud → Connect**: paste the key file, or drop it on the field. Under **Advanced**, choose the zone (default `europe-west3-a`).
 
 A new project may run only a few CPUs at once: ask for more under **IAM & Admin → Quotas** (`CPUs` in your region).
+
+## Agent37
+
+Each computer is an Agent37 `vm` instance: a whole virtual machine with its own kernel, so Docker works in it. Its disk is mounted as the home directory and kept while the computer is paused, when it costs only the disk. Agent37 bills by the minute from a prepaid wallet.
+
+1. Create an API key at [agent37.com/dashboard/cloud/api-keys](https://www.agent37.com/dashboard/cloud/api-keys), and top up the workspace's wallet (**Billing**).
+2. In tavya, **Settings → Computers → Agent37 → Connect**: paste the key. Under **Advanced**, choose the region: `eu` (France, the default), `us` or `ap-south` (Mumbai).
+
+tavya adds one SSH key of its own to the workspace (a workspace holds at most 20). How much can run at once depends on how much the workspace has been topped up in total; Agent37 raises it by itself as you top up.

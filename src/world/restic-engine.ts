@@ -515,6 +515,15 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     return captureOf(run.stdout);
   }
 
+  /** Restore a snapshot into `target`, a folder on this host (the Files
+   * page changing a data resource: restored, changed, saved as a new version). */
+  async restoreOnHost(repository: Repository, snapshot: string, target: string): Promise<void> {
+    fs.mkdirSync(target, { recursive: true });
+    const run = await this.onHost(repository, 'read', false, ['restore', snapshot, '--target', target, '--no-lock', '--json',
+      '-o', `rest.connections=${RESTORE_CONNECTIONS}`], { key: 'host' });
+    if (run.code !== 0) throw resticFailure(run, 'restoring the resource');
+  }
+
   /** Files of a snapshot, by path relative to the resource. */
   async files(attachment: Repository, snapshot: string): Promise<Array<{ path: string; bytes: number }>> {
     const run = await this.onHost(attachment, 'read', false, ['ls', '--json', '--no-lock', snapshot], { key: 'host' });

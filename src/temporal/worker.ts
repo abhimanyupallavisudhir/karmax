@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { TASK_QUEUE, TemporalConn } from './config.js';
 import { buildActivities, ActivityDeps } from '../activities/index.js';
 import { memoryBudget, separateWorkerMode, type HeapUsage, type MemoryBudget } from '../runtime/memory-budget.js';
+import { rememberTaskFailure } from '../platform/error-reports.js';
 
 export interface WorkerHandle {
   run(): Promise<void>;
@@ -65,25 +66,16 @@ export interface WorkerOpts {
   maxCachedWorkflows?: number;
 }
 
-/**
- * Install the process's Temporal Runtime, or keep the one already there. There
- * is one per process; a second module copy (a test file after another whose
- * dev server died mid-shard, wiki ops/ci) finds it installed. Failing then only
- * turned one failure into a cascade over every later file.
- */
-export function installRuntime(install: () => void): 'installed' | 'existing' {
-  try { install(); return 'installed'; } catch (error) {
-    if (error instanceof IllegalStateError) return 'existing';
-    throw error;
-  }
-}
-
 let runtimeInstalled = false;
 function ensureQuietRuntime() {
   if (runtimeInstalled) return;
   // Keep worker logs quiet by default; KARMAX_TEMPORAL_LOG=debug to see them.
   const level = (process.env.KARMAX_TEMPORAL_LOG ?? 'WARN').toUpperCase() as any;
-  installRuntime(() => Runtime.install({ logger: new DefaultLogger(level) }));
+  // The Runtime is one per process. Another copy of this module (a test file
+  // re-importing it, wiki ops/ci "Temporal dev server gone mid-shard") or an
+  // earlier connection may already have made it: use that one.
+  try { Runtime.install({ logger: new DefaultLogger(level) }); }
+  catch (error) { if (!(error instanceof IllegalStateError)) throw error; }
   runtimeInstalled = true;
 }
 
@@ -179,13 +171,22 @@ export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, op
     // truly wedged drain).
     shutdownGraceTime: opts.shutdownGraceTime ?? '1 second',
     interceptors: { activity: [() => ({ inbound: { execute: async (input, next) => {
+      // Where a task's failure was thrown, for its error report: the task
+      // itself only says what failed (wiki features/error-reports).
+      const failed = (error: unknown): never => {
+        try {
+          const workflowId = Context.current().info.workflowExecution?.workflowId;
+          if (workflowId) rememberTaskFailure(workflowId, error);
+        } catch { /* never the activity's problem */ }
+        throw error;
+      };
       // A heartbeating activity of a dead worker is retried at its heartbeat
       // timeout; one that does not heartbeat only at its start-to-close.
-      if (Context.current().info.heartbeatTimeoutMs) return next(input);
+      if (Context.current().info.heartbeatTimeoutMs) return next(input).catch(failed);
       let abandon!: (error: Error) => void;
       const abandoned = new Promise<never>((_, reject) => { abandon = reject; });
       running.add(abandon);
-      try { return await Promise.race([next(input), abandoned]); }
+      try { return await Promise.race([next(input).catch(failed), abandoned]); }
       finally { running.delete(abandon); }
     } } })] },
   });

@@ -1,7 +1,7 @@
 import type { Store } from '../store/db.js';
 import type { KarmaxApi } from '../platform/api.js';
 import type { TokenAuthority } from '../platform/tokens.js';
-import { RECOVERY_PROMPT, RECOVERY_TITLE, RECOVERY_TRIGGER, REPAIR_TEMPLATE_ID } from '../domain/task-store.js';
+import { REPAIR_TEMPLATE_ID, STORE_TASKS } from '../domain/task-store.js';
 import { normalizeTriggers } from '../domain/triggers.js';
 import { eventTypeMatches } from '../domain/project-events.js';
 import type { GithubProjectWebhookEvent, GithubWebhookResult } from './github-app.js';
@@ -73,8 +73,10 @@ export class GithubEvents {
     // The authority today's rail had: the whole project, as the system.
     const { token } = await this.deps.tokens.mintPrincipal('system:github-recovery', ['*'], projectId, 10 * 60_000, organizationId);
     try {
-      const task = await this.deps.api.createTask(token, { projectId, title: RECOVERY_TITLE, prompt: RECOVERY_PROMPT,
-        params: { repeatable: true, triggers: [RECOVERY_TRIGGER], template: REPAIR_TEMPLATE_ID } });
+      // Exactly what installing it from the store makes (its Review route too).
+      const repair = STORE_TASKS.find((entry) => entry.id === REPAIR_TEMPLATE_ID)!.task;
+      const task = await this.deps.api.createTask(token, { projectId, title: repair.title, prompt: repair.prompt,
+        params: { ...repair.params, template: REPAIR_TEMPLATE_ID } });
       await this.deps.store.kvSet(key, task.id);
     } catch (error) {
       await this.deps.store.kvDelete(key);

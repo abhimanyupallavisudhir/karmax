@@ -148,3 +148,16 @@ KARMAX_RUN_LIVE=1 OPENAI_API_KEY=… npx vitest run tests/live-agent.test.ts
   session uses Better Auth login. **Never** expose local Karmax through Funnel
   or a naked public tunnel; use the built-in private Tailscale Serve setup.
 - `KARMAX_HOME` overrides the data home (default `~/.karmax`).
+
+## License
+
+karmax is free software, licensed under the [GNU Affero General Public License, version 3](./LICENSE)
+(AGPL-3.0-only). You may use, study, change and share it; if you run a changed
+version as a service for others, you must offer them its source under the same
+licence. Copyright © 2026 Abhimanyu Pallavi Sudhir.
+
+Other licences apply to what it bundles or installs: [vendor/panagent](./vendor/panagent)
+is MIT, the fonts and the vendored highlight.js carry their own notices, and
+the agent harnesses it drives (Claude Code and its Agent SDK, Codex, OpenCode)
+are separate programs under their publishers' terms. For terms other than the
+AGPL, write to the copyright holder.

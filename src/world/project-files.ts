@@ -12,9 +12,9 @@ import type { ProjectResourceService } from './resources.js';
 import type { GitBrokerCredential } from './git-broker.js';
 import type { ManifestEntry } from './checkpoint-chunks.js';
 import type { World, WorldHandle } from './types.js';
-import { isRemoteWorldKind, worldRepos, worldRepoSource } from './types.js';
+import { isRemoteWorldKind, worldRepos, worldRepoSource, worldWorkingRelativePath } from './types.js';
 import { MirroredCommitMissing, readMirrored } from './git-mirror.js';
-import { catBlob, git } from './git.js';
+import { catBlob, git, gitWithInput } from './git.js';
 import { materializeGitCredential } from './git-credential.js';
 import { sameRepository } from './repository-identity.js';
 import { RESTIC_ENGINE, ROOT_PART, storedRef, type Repository as ResticRepository, type SnapshotEntry } from './restic-engine.js';
@@ -31,7 +31,8 @@ import { RESTIC_ENGINE, ROOT_PART, storedRef, type Repository as ResticRepositor
  * while it runs, and otherwise from its last save (each checkout's commit plus
  * the uncommitted files its checkpoint holds, and the data it had), so looking
  * never wakes a sandbox. Everything else is read on the host: Git from the
- * broker's mirror cache, data with restic. Nothing here writes.
+ * broker's mirror cache, data with restic. Nothing here writes: changes go
+ * through ProjectFileChanges (project-file-changes.ts), to `writePlaces`.
  */
 
 export type FileKind = 'directory' | 'file' | 'symlink' | 'submodule';
@@ -79,7 +80,20 @@ export type FileView = { kind: 'default' } | { kind: 'branch'; name: string } | 
 
 export interface FileReadOptions { data: boolean; pins?: FilePins; view?: FileView }
 
+/** Where a view's changes go: a task's world, or each repository's branch
+ * (data mounted there is read-only). */
+export type WritePlaces =
+  | { kind: 'world'; taskId: string; handle: WorldHandle; hidden: (rel: string) => boolean }
+  | { kind: 'branch'; checkouts: Array<{ name: string; segments: string[]; role: 'development' | 'project-wiki'; sshUrl: string; branch: string }>;
+    mounts: DataPlace[] };
+
+/** A data resource where it is mounted: a folder of files, or one file. */
+export interface DataPlace { segments: string[]; id: string; name: string; shape: 'directory' | 'file' }
+
 export interface OpenedFile { node: FileNode; size: number; stream: Readable; done: Promise<void>; stop: () => void }
+
+/** Where a path stands in its repository's branch tasks start from (`repositoryPresence`). */
+export type RepositoryPresence = { state: 'present'; size?: number } | { state: 'deleted' | 'untracked' };
 
 export class FileNotFoundError extends Error {}
 export class FileAccessError extends Error {}
@@ -186,6 +200,53 @@ export class ProjectFiles {
     return { pins, node: await this.stat(projectId, relative, { data: options.data, pins }) };
   }
 
+  /** Where each of `paths` stands in the repositories tasks start from:
+   * there now (`present`, a file, with its size), once there and since
+   * removed (`deleted`), or never committed (`untracked`). A path in no
+   * repository (the world root, a data mount) is left out, and so is a
+   * repository that cannot be read now. For the artifact gallery. */
+  async repositoryPresence(projectId: string, paths: string[]): Promise<Map<string, RepositoryPresence>> {
+    const layout = await this.projectLayout(projectId, {});
+    const result = new Map<string, RepositoryPresence>();
+    await Promise.all(layout.checkouts.map(async (checkout) => {
+      const inside = new Map<string, string>();
+      for (const wanted of paths) {
+        let segments: string[];
+        try { segments = splitPath(wanted); } catch { continue; }
+        if (segments.length <= checkout.segments.length || !startsWith(segments, checkout.segments)) continue;
+        if (layout.mounts.some((mount) => startsWith(segments, mount.segments))) continue;
+        inside.set(segments.slice(checkout.segments.length).join('/'), wanted);
+      }
+      if (!inside.size) return;
+      try {
+        await this.withRepository(projectId, checkout, async (mirror, commit) => {
+          const files = [...inside.keys()];
+          const missing = new Set(files);
+          for (let at = 0; at < files.length; at += 200) {
+            const listed = await git(mirror, ['--literal-pathspecs', 'ls-tree', '-z', '-l', commit, '--', ...files.slice(at, at + 200)]);
+            if (listed.code !== 0) throw new Error(listed.stderr || listed.stdout || 'git ls-tree failed');
+            for (const entry of parseTree(listed.stdout)) {
+              if (!inside.has(entry.name)) continue;
+              missing.delete(entry.name);
+              result.set(inside.get(entry.name)!, entry.kind === 'file' ? { state: 'present', ...(entry.size !== undefined ? { size: entry.size } : {}) } : { state: 'deleted' });
+            }
+          }
+          // What history once had and the tip has not was deleted; the rest never reached it.
+          const absent = [...missing];
+          const deleted = new Set<string>();
+          for (let at = 0; at < absent.length; at += 200) {
+            const logged = await git(mirror, ['--literal-pathspecs', 'log', '--no-renames', '--diff-filter=D', '--format=', '--name-only', '-z',
+              commit, '--', ...absent.slice(at, at + 200)]);
+            if (logged.code !== 0) throw new Error(logged.stderr || logged.stdout || 'git log failed');
+            for (const name of logged.stdout.split(/[\0\n]/)) if (name) deleted.add(name);
+          }
+          for (const file of absent) result.set(inside.get(file)!, { state: deleted.has(file) ? 'deleted' : 'untracked' });
+        });
+      } catch { /* unreadable now: its paths stay unknown */ }
+    }));
+    return result;
+  }
+
   /** Branches each repository has, for the view picker. */
   async branches(projectId: string): Promise<Array<{ name: string; role: 'development' | 'project-wiki'; default: string; branches: string[] }>> {
     const layout = await this.projectLayout(projectId, {});
@@ -228,6 +289,69 @@ export class ProjectFiles {
       fs.writeFileSync(destination, Buffer.concat(chunks));
     }
     return true;
+  }
+
+  /** Where changes made in `view` go. A task whose world is gone is read-only. */
+  async writePlaces(projectId: string, view: FileView): Promise<WritePlaces> {
+    if (view.kind === 'task') {
+      const task = await this.deps.store.getTask(view.taskId);
+      if (!task || task.projectId !== projectId) throw new FileNotFoundError('No such task in this project.');
+      const handle = ((await this.deps.store.currentWorld(task.id)) ?? task.lastView?.world) as WorldHandle | undefined;
+      if (!handle) throw new FileAccessError('This task has no files yet.');
+      const state = await this.deps.store.worldState(handle.id);
+      if (state === 'released' || (!isRemoteWorldKind(handle.kind) && !(handle.root && fs.existsSync(handle.root))))
+        throw new FileAccessError('This task’s workspace is gone: its files are read-only.');
+      return { kind: 'world', taskId: task.id, handle, hidden: await this.hiddenInWorld(projectId) };
+    }
+    const layout = await this.projectLayout(projectId, { view });
+    return { kind: 'branch', checkouts: layout.checkouts.map(({ name, segments, role, sshUrl, branch }) => ({ name, segments, role, sshUrl, branch })),
+      mounts: layout.mounts.map((mount) => ({ segments: mount.segments, id: mount.id, name: mount.name, shape: mount.shape === 'file' ? 'file' as const : 'directory' as const })) };
+  }
+
+  /** Which of `paths` (in repositories of the default or a branch view) the
+   * repository's own .gitignore files at that branch say Git ignores. Read
+   * from the host mirror: only the .gitignore files on the way to each path. */
+  async gitIgnored(projectId: string, view: FileView, paths: string[]): Promise<Set<string>> {
+    const ignored = new Set<string>();
+    if (view.kind === 'task') return ignored;
+    const layout = await this.projectLayout(projectId, { view });
+    await Promise.all(layout.checkouts.map(async (checkout) => {
+      const inside = new Map<string, string>();
+      for (const wanted of paths) {
+        let segments: string[];
+        try { segments = splitPath(wanted); } catch { continue; }
+        if (segments.length > checkout.segments.length && startsWith(segments, checkout.segments))
+          inside.set(segments.slice(checkout.segments.length).join('/'), wanted);
+      }
+      if (!inside.size) return;
+      await this.withRepository(projectId, checkout, async (mirror, commit) => {
+        const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-ignore-'));
+        try {
+          const folders = new Set(['']);
+          for (const rel of inside.keys()) { const parts = rel.split('/'); for (let at = 1; at < parts.length; at++) folders.add(parts.slice(0, at).join('/')); }
+          for (const folder of folders) {
+            const file = folder ? `${folder}/.gitignore` : '.gitignore';
+            const shown = await git(mirror, ['cat-file', '-p', `${commit}:${file}`]);
+            if (shown.code !== 0) continue;
+            fs.mkdirSync(path.join(scratch, folder), { recursive: true });
+            fs.writeFileSync(path.join(scratch, file), shown.stdout);
+          }
+          const init = await git(scratch, ['init', '-q']);
+          if (init.code !== 0) return;
+          const checked = await gitWithInput(scratch, ['-c', 'core.excludesFile=/dev/null', 'check-ignore', '--no-index', '-z', '--stdin'],
+            [...inside.keys()].map((rel) => `${rel}\0`).join(''));
+          for (const rel of checked.stdout.split('\0').filter(Boolean)) if (inside.has(rel)) ignored.add(inside.get(rel)!);
+        } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+      });
+    }));
+    return ignored;
+  }
+
+  /** What a live world never shows (and Files never writes): `.env` files and the project's secret files. */
+  private async hiddenInWorld(projectId: string): Promise<(rel: string) => boolean> {
+    const project = await this.deps.workspaces.project(projectId);
+    const secrets = new Set(project.secrets.flatMap((secret) => [secret.file, secret.dotenv].filter((place): place is string => Boolean(place))));
+    return (rel: string) => secrets.has(rel) || path.posix.basename(rel) === '.env' || rel.split('/').some((segment) => HIDDEN_NAMES.has(segment));
   }
 
   // ── layouts ─────────────────────────────────────────────────────────────────
@@ -469,8 +593,7 @@ export class ProjectFiles {
     const display = segments.join('/');
     if (segments.some((segment) => HIDDEN_NAMES.has(segment))) throw new FileNotFoundError(`Nothing at ${display}`);
     const project = await this.deps.workspaces.project(projectId);
-    const secrets = new Set(project.secrets.flatMap((secret) => [secret.file, secret.dotenv].filter((place): place is string => Boolean(place))));
-    const hidden = (rel: string) => secrets.has(rel) || path.posix.basename(rel) === '.env';
+    const hidden = await this.hiddenInWorld(projectId);
     if (hidden(display)) throw new FileNotFoundError(`Nothing at ${display}`);
     const mounts = project.resources.map((resource) => ({ ...resource, segments: splitPath(resource.path) })).filter((mount) => mount.segments.length > 0);
     const dataMount = mounts.find((mount) => startsWith(segments, mount.segments));
@@ -490,7 +613,8 @@ export class ProjectFiles {
     const nodeOf = (stat: LiveStat): FileNode => {
       if (stat.missing || stat.outside) throw new FileNotFoundError(`Nothing at ${display}`);
       if (stat.kind === 'symlink') return withView({ path: display, kind: 'symlink', source: { kind: 'world' }, target: stat.target ?? '' });
-      if (stat.kind === 'file') return withView({ path: display, kind: 'file', source: { kind: 'world' }, size: stat.size ?? 0 });
+      if (stat.kind === 'file') return withView({ path: display, kind: 'file', source: { kind: 'world' }, size: stat.size ?? 0,
+        ...(stat.version ? { version: stat.version } : {}) });
       if (stat.kind !== 'directory') throw new FileAccessError(`${display} is not a file or folder.`);
       const marks = (name: string): FileEntry['mount'] => {
         const child = [...segments, name];
@@ -612,7 +736,7 @@ export class ProjectFiles {
 interface LiveWorld { live: true; handle: WorldHandle; taskId: string; view: FileViewInfo }
 
 interface LiveStat {
-  missing?: true; outside?: true; kind?: FileKind | 'other'; size?: number; target?: string; real?: string;
+  missing?: true; outside?: true; kind?: FileKind | 'other'; size?: number; target?: string; real?: string; version?: string;
   entries?: Array<{ name: string; kind: FileKind; size?: number }>;
 }
 
@@ -631,7 +755,7 @@ const inside = (p) => p === realRoot || p.startsWith(realRoot + path.sep);
 if (s.isSymbolicLink()) out({ kind: 'symlink', target: fs.readlinkSync(target) });
 if (!real || !inside(real)) out({ outside: true });
 const relReal = path.relative(realRoot, real).split(path.sep).join('/');
-if (s.isFile()) out({ kind: 'file', size: s.size, real: relReal });
+if (s.isFile()) out({ kind: 'file', size: s.size, real: relReal, version: Math.floor(s.mtimeMs) + '-' + s.size });
 if (!s.isDirectory()) out({ kind: 'other' });
 const entries = [];
 for (const entry of fs.readdirSync(real, { withFileTypes: true }).slice(0, 10000)) {
@@ -679,6 +803,23 @@ async function archive(mirror: string, commit: string, target: string): Promise<
 
 function safeSame(a: string, b: string): boolean {
   try { return sameRepository(a, b); } catch { return a === b; }
+}
+
+/** Where a path a task's agent wrote (absolute in its world, or relative to
+ * its working folder) sits in its project's Files: relative to the world
+ * root, which Files lays out alike. Outside the world throws. */
+export function worldFilesPath(handle: WorldHandle | undefined, cited: string): string {
+  const value = String(cited).replace(/\\/g, '/');
+  if (!value) throw new Error('missing path');
+  let relative = value;
+  if (handle) {
+    const root = String(handle.root ?? '').replace(/\/+$/, '');
+    if (value.startsWith('/')) {
+      if (value !== root && !value.startsWith(`${root}/`)) throw new Error('That file is outside the task’s world.');
+      relative = value === root ? '' : value.slice(root.length + 1);
+    } else relative = worldWorkingRelativePath(handle, value);
+  }
+  return splitPath(relative === '.' ? '' : relative).join('/');
 }
 
 /** `a//b/` → ['a', 'b']; `..` and `.` are refused, not resolved. */

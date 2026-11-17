@@ -90,20 +90,20 @@ export function computerlessModelGap(profile: Pick<AgentProfile, 'provider' | 'm
  * environment is not the organization's: its keys are spent only where they
  * would be anyway —
  *  - a key resolved for the organization (`resolvedAuth.apiKey`: its own
- *    leased key, or the included model's per-organization key);
- *  - the operator's model rail when it is switched on for this organization
- *    (`managedRail`: metered and capped by its usage policy);
+ *    leased key, or the included model's per-organization key; a model
+ *    gateway or OpenRouter rail serves a Claude Code or Codex CLI, which needs
+ *    a computer, so it is not one);
  *  - a self-hosted installation's own organization, whose operator is its only
  *    customer (as `gatherCredentialSources` offers host credentials).
  * A leased login is a login, whatever the environment holds.
  */
 export function computerlessApiKey(profile: Pick<AgentProfile, 'provider' | 'model' | 'modelProvider'>, options: {
-  hosted: boolean; organizationId: string; managedRail: boolean;
+  hosted: boolean; organizationId: string;
   resolvedAuth?: { apiKey?: string; configHome?: string };
 }): string | undefined {
   if (options.resolvedAuth?.apiKey) return options.resolvedAuth.apiKey;
   if (options.resolvedAuth?.configHome) return undefined;
-  const hostKeys = options.managedRail || (!options.hosted && options.organizationId === 'org_personal');
+  const hostKeys = !options.hosted && options.organizationId === 'org_personal';
   const name = profile.provider === 'mock' ? '' : apiKeyEnv(credentialProvider(profile));
   return hostKeys && name ? process.env[name] || undefined : undefined;
 }

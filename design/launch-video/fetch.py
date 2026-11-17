@@ -25,7 +25,7 @@ from private import PRIVATE, PRIVATE_PROJECTS, TERMS  # noqa: E402
 json.dump(TERMS, open(f'{D}/prod/private-terms.json', 'w'))
 # Also: links to other organizations, e-mail addresses, people's surnames.
 OTHER = re.compile(r'tavya\.io/(?!personal|api|mcp|cli|docs|pricing|policies)[a-z0-9-]+|@[a-z0-9.-]+\.(com|org|io)|sudhir', re.I)
-SKIP = {'S3 storage integration tests', 'Fork contributions E2E'}
+SKIP = {'S3 storage integration tests', 'Fork contributions E2E', 'Smoke checks'}  # test projects
 
 projects = [p for p in get('/api/projects') if p['organizationId'] == 'org_personal' and p['name'] not in SKIP and p['name'] not in PRIVATE_PROJECTS and not PRIVATE.search(p['name'])]
 json.dump(projects, open(f'{D}/prod/projects.json', 'w'), indent=1)
@@ -58,17 +58,30 @@ open(f'{D}/assets/815-prompt.md', 'w').write(get(f'/api/tasks/{t815}')['messages
 for i in range(8): artifact(t815, i, f'{D}/assets/815/{i}.png')
 artifact(find(821), 0, f'{D}/assets/seo/social-card.png')
 artifact(find(822), 1, f'{D}/assets/822/runbook.md')
+# The agent at work: the real run of the homepage redesign (personal-website), replayed row by row.
+# A row (all its phases) that names anything private, or another organization, is left out.
+def homepage_run():
+    site = next(p for p in projects if p['name'] == 'personal-website')
+    t = get(f"/api/projects/{site['id']}/search?q={urllib.parse.quote('khaki color look')}")['tasks'][0]
+    rows = [e for e in get(f"/api/tasks/{t['id']}/events?since=0&limit=2000") if e['type'] == 'agent.activity']
+    hidden = {e['payload'].get('id') for e in rows if PRIVATE.search(json.dumps(e)) or OTHER.search(json.dumps(e))}
+    keep = [{'ts': e['ts'], 'payload': e['payload']} for e in rows if e['payload'].get('id') not in hidden]
+    json.dump(keep, open(f'{D}/assets/homepage-run.json', 'w'))
+    print('homepage run', len(keep), 'rows', len(hidden), 'left out')
+homepage_run()
 os.makedirs(f'{D}/assets/deploy', exist_ok=True)
 open(f'{D}/assets/deploy/deploy.yml', 'w').write(open(os.path.join(HERE, '../../.github/workflows/deploy.yml')).read())
 
 # Photos (Unsplash, via Picsum) under the names the album manifest expects.
 manifest = json.load(open(os.path.join(HERE, 'assets/photos.json')))
 os.makedirs(f'{D}/photos-original', exist_ok=True)
-for ph in manifest['photos']:
+for ph in ([] if os.environ.get('DEMO_NO_PHOTOS') else manifest['photos']):  # DEMO_NO_PHOTOS=1: films without the photos scene
     dest = f"{D}/photos-original/{ph['file']}"
     if not os.path.exists(dest):
-        urllib.request.urlretrieve(f"https://picsum.photos/id/{ph['picsum']}/1600/1067", dest)
+        try: urllib.request.urlretrieve(f"https://picsum.photos/id/{ph['picsum']}/1600/1067", dest)
+        except OSError as e: print(f"photos: {ph['file']} not fetched ({e}); only the photos scene needs them", file=sys.stderr)
 for dup in manifest['duplicates']:
-    open(f"{D}/photos-original/{dup['file']}", 'wb').write(open(f"{D}/photos-original/{dup['copyOf']}", 'rb').read())
+    if os.path.exists(f"{D}/photos-original/{dup['copyOf']}"):
+        open(f"{D}/photos-original/{dup['file']}", 'wb').write(open(f"{D}/photos-original/{dup['copyOf']}", 'rb').read())
 json.dump({ph['file']: ph['album'] for ph in manifest['photos']}, open(f'{D}/photo-albums.json', 'w'), indent=1)
 print('assets ready')

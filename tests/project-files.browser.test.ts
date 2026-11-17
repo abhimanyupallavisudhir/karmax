@@ -304,14 +304,17 @@ it('switches to a branch or a task with the picker, opens an agent’s cited fil
 // once it has stopped moving: the source chip beside it arrives on its own and narrows it.
 async function clickAddressEnd(page: Page) {
   const address = page.locator('#files-address');
-  let box = (await address.boundingBox())!;
+  // boundingBox() does not wait: while the view re-renders the bar can be briefly
+  // detached (null), so a missing box counts as not settled yet (CI #2830).
+  await address.waitFor();
+  let box = await address.boundingBox();
   for (let settled = 0; settled < 3;) {
     await page.waitForTimeout(50);
-    const next = (await address.boundingBox())!;
-    settled = next.width === box.width && next.x === box.x ? settled + 1 : 0;
+    const next = await address.boundingBox();
+    settled = next && box && next.width === box.width && next.x === box.x ? settled + 1 : 0;
     box = next;
   }
-  await address.click({ position: { x: box.width - 12, y: box.height / 2 } });
+  await address.click({ position: { x: box!.width - 12, y: box!.height / 2 } });
 }
 
 // The same axe-core gate the console's main pages pass (tests/accessibility-check.cjs).

@@ -76,11 +76,33 @@ export interface EventTrigger {
   /**
    * Project events only: at most one unfinished run per rendered key (`{{issue.number}}`;
    * empty = one per series). A further event is skipped, queued until that run
-   * ends, or told to that run as a message (`tell`, for an agent's run).
+   * ends, told to that run as a message (`tell`, for an agent's run), or, with
+   * `continue`, belongs to that run for good: one task per key, which hears a
+   * further event as a message while it works and carries on from it once it
+   * has finished (a repeat of a counted event: once per tenfold growth while it
+   * works; after it finished, once its change is live or, having changed
+   * nothing, once the count has grown tenfold).
    */
-  concurrency?: { key?: string; mode?: 'skip' | 'queue' | 'tell' };
+  concurrency?: { key?: string; mode?: 'skip' | 'queue' | 'tell' | 'continue';
+    /** `continue`: when a finished run's change counts as live, so that a repeat
+     *  means it did not hold: an event of this type (`app.deployed`) received
+     *  after it finished, the one whose payload `commits` names a commit the
+     *  run landed when it lists any. Without it: as soon as the run finished. */
+    after?: { type: string; source?: string } };
   /** Project events only: runs this trigger may start per hour (default 60); more wait. */
   maxPerHour?: number;
+  /** Project events only: unfinished runs of this series at once; more wait, the most-seen event first. */
+  maxRunning?: number;
+  /** Project events only: start a run this many minutes after the event first
+   *  came, so it starts knowing how often it happened and what came with it. */
+  settleMinutes?: number;
+  /**
+   * Project events only: before a run starts, a model reads the event (no
+   * machine, no tools) with this prompt and decides: start it, skip it (with
+   * its reason), or, with `continue`, hand it to the task of another key.
+   * Skipped keys are asked about again once they have grown tenfold.
+   */
+  gate?: { prompt: string; model?: string };
   /** Also fire on outside events that echo tavya's own actions (default: ignored). */
   includeSelf?: boolean;
 }
@@ -104,6 +126,9 @@ export type FollowUpTrigger = TaskTrigger & {
 };
 
 export const MAX_FOLLOW_UP_TRIGGERS = 50;
+export const CONCURRENCY_MODES: ReadonlyArray<string> = ['skip', 'queue', 'tell', 'continue'];
+export const MAX_SETTLE_MINUTES = 24 * 60;
+export const MAX_GATE_PROMPT = 8000;
 
 /** Lifecycle marker stored on a triggered task's params. */
 export type TriggerState = 'armed' | 'fired';
@@ -155,6 +180,8 @@ export async function validateFollowUpTriggers(triggers: FollowUpTrigger[], ctx:
   for (const trigger of triggers) {
     if (trigger.kind !== 'event') continue;
     if (trigger.concurrency !== undefined) errs.push('a follow-up trigger takes no `concurrency`: it reaches this task, not a run');
+    if (trigger.gate !== undefined || trigger.maxRunning !== undefined || trigger.settleMinutes !== undefined)
+      errs.push('a follow-up trigger takes no `gate`, `maxRunning` or `settleMinutes`: those decide when a run starts');
     if (trigger.subject !== undefined && (typeof trigger.subject !== 'string' || !trigger.subject || trigger.subject.length > 2000))
       errs.push('`subject` must be text');
   }
@@ -226,11 +253,24 @@ export async function validateTriggers(triggers: TaskTrigger[], ctx: TriggerVali
         errs.push(`invalid event type: "${t.type}"`);
       errs.push(...validateFilter(t.where));
       if (t.concurrency !== undefined && (typeof t.concurrency !== 'object' || t.concurrency === null
-        || (t.concurrency.mode !== undefined && !['skip', 'queue', 'tell'].includes(t.concurrency.mode))
+        || (t.concurrency.mode !== undefined && !CONCURRENCY_MODES.includes(t.concurrency.mode))
         || (t.concurrency.key !== undefined && typeof t.concurrency.key !== 'string')))
-        errs.push('event trigger `concurrency` takes an optional `key` and a `mode` of skip, queue or tell');
+        errs.push('event trigger `concurrency` takes an optional `key` and a `mode` of skip, queue, tell or continue');
+      else if (t.concurrency?.after !== undefined) {
+        const after = t.concurrency.after as { type?: unknown; source?: unknown } | null;
+        if (t.concurrency.mode !== 'continue') errs.push('`concurrency.after` belongs to the `continue` mode');
+        else if (!after || typeof after !== 'object' || !validEventType(after.type) || (after.source !== undefined && typeof after.source !== 'string'))
+          errs.push('`concurrency.after` names an event `type` (and optionally its `source`)');
+      }
       if (t.maxPerHour !== undefined && !(Number.isInteger(t.maxPerHour) && t.maxPerHour > 0))
         errs.push('event trigger `maxPerHour` must be a positive whole number');
+      if (t.maxRunning !== undefined && !(Number.isInteger(t.maxRunning) && t.maxRunning > 0))
+        errs.push('event trigger `maxRunning` must be a positive whole number');
+      if (t.settleMinutes !== undefined && !(typeof t.settleMinutes === 'number' && t.settleMinutes > 0 && t.settleMinutes <= MAX_SETTLE_MINUTES))
+        errs.push(`event trigger \`settleMinutes\` must be between 0 and ${MAX_SETTLE_MINUTES}`);
+      if (t.gate !== undefined && (!t.gate || typeof t.gate !== 'object' || typeof t.gate.prompt !== 'string' || !t.gate.prompt.trim()
+        || t.gate.prompt.length > MAX_GATE_PROMPT || (t.gate.model !== undefined && typeof t.gate.model !== 'string')))
+        errs.push(`event trigger \`gate\` takes a \`prompt\` (up to ${MAX_GATE_PROMPT} characters) and optionally a \`model\``);
     }
   }
   return errs;

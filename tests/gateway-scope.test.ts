@@ -191,26 +191,15 @@ describe('gateway request scope for bare-id routes', () => {
       body: JSON.stringify({ policy }),
     });
 
-    const denied = await put('admin-usage-session', { managedSpendCapMicros: 1_000_000 });
-    expect({ status: denied.status, body: await denied.json() }).toEqual({ status: 403,
-      body: { error: 'only an organization owner can change managed funding or agent concurrency guardrails' } });
     const deniedConcurrency = await put('admin-usage-session', { maxActiveAgentTurns: 3 });
     expect({ status: deniedConcurrency.status, body: await deniedConcurrency.json() }).toEqual({ status: 403,
-      body: { error: 'only an organization owner can change managed funding or agent concurrency guardrails' } });
-    const deniedManagedAdd = await put('admin-usage-session', { managedModelProviders: ['openai'] });
-    expect({ status: deniedManagedAdd.status, body: await deniedManagedAdd.json() }).toEqual({ status: 403,
-      body: { error: 'only an organization owner can change managed funding or agent concurrency guardrails' } });
-    expect((await put('owner-usage-session', { managedSpendCapMicros: 1_000_000,
-      managedModelProviders: ['openai'], maxActiveAgentTurns: 3 })).status).toBe(200);
-    const deniedManagedRemove = await put('admin-usage-session', { managedModelProviders: [] });
-    expect({ status: deniedManagedRemove.status, body: await deniedManagedRemove.json() }).toEqual({ status: 403,
-      body: { error: 'only an organization owner can change managed funding or agent concurrency guardrails' } });
+      body: { error: 'only an organization owner can change agent concurrency guardrails' } });
+    expect((await put('owner-usage-session', { maxActiveAgentTurns: 3 })).status).toBe(200);
     expect((await put('admin-usage-session', { allowedModelProviders: ['openai'],
       allowedModels: ['openai/gpt-5'], maxAgentStartsPerMinute: 12,
       maxRemoteStartsPerMinute: 6 })).status).toBe(200);
     const read = await fetch(endpoint, { headers: { authorization: 'Bearer owner-usage-session' } });
-    expect(await read.json()).toMatchObject({ managedSpendCapMicros: 1_000_000,
-      managedModelProviders: ['openai'], allowedModelProviders: ['openai'], allowedModels: ['openai/gpt-5'],
+    expect(await read.json()).toMatchObject({ allowedModelProviders: ['openai'], allowedModels: ['openai/gpt-5'],
       maxAgentStartsPerMinute: 12, maxRemoteStartsPerMinute: 6, maxActiveAgentTurns: 3 });
   });
 
@@ -364,6 +353,33 @@ describe('gateway request scope for bare-id routes', () => {
     expect(resolved.status).toBe(200);
     expect((await new PermissionRequests(store, (await store.getProject(mine))!.organizationId!).extensionCaps(task.id, 'do')))
       .toEqual(['settings:read']);
+  });
+
+  it('lets the asking agent withdraw its permission request with the capability it asked with', async () => {
+    const task = (await store.createTask({ projectId: mine, title: 'Read settings', workflow: 'software-dev',
+      workflowVersion: '1.9.0', params: { prompt: 'inspect' }, createdBy: { kind: 'user', userId: 'a' } }));
+    (await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do',
+      status: 'active', messages: [], actions: [], state: {}, updatedAt: Date.now() }));
+    liveView = (await store.getTask(task.id))!.lastView;
+    const organizationId = (await store.getProject(mine))!.organizationId;
+    const agentWith = async (ceiling: string[]) => (await tokens.mint({ taskId: task.id, profileId: 'do-default', role: 'do',
+      principal: 'user:a', projectId: mine, organizationId, ceiling, grantorCaps: ceiling })).token;
+    const agent = await agentWith(['task:escalate']);
+    const requested: any = await (await fetch(`${base}/api/agent/permission-requests`, { method: 'POST',
+      headers: { authorization: `Bearer ${agent}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ capabilities: ['settings:read'], audience: ['@creator'], reason: 'Inspect settings.' }) })).json();
+    expect(requested).toMatchObject({ status: 'needs_approval' });
+    const withdraw = (token: string, id: string) => fetch(`${base}/api/agent/permission-requests/${id}/withdraw`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ reason: 'Not needed after all.' }) });
+
+    expect((await withdraw(await agentWith(['task:read']), requested.requestId)).status).toBe(403);
+    expect((await withdraw(agent, 'preq_unknown')).status).toBe(404);
+    const withdrawn = await withdraw(agent, requested.requestId);
+    expect(withdrawn.status).toBe(200);
+    expect(await withdrawn.json()).toMatchObject({ id: requested.requestId, status: 'withdrawn',
+      withdrawn: { reason: 'Not needed after all.' } });
+    expect((await new PermissionRequests(store, organizationId!).requests({ taskId: task.id, status: 'pending' }))).toEqual([]);
   });
 
   it('dismisses a credential request: silent, still pending, and not by the asking agent', async () => {

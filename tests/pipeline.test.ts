@@ -559,6 +559,30 @@ describe('software-dev pipeline: landing, review and the merge queue (real Tempo
     expect((await git(repo, ['show', 'main:note.txt'])).stdout).toContain('two');
   }, 120_000);
 
+  it('a message to the agent at a failed pull request reaches it, instead of only retrying the pull request', async () => {
+    // tavya.io, 2026-11-14 (caren/formatter #2): a project on repositories tavya
+    // hosts named the `pr` policy, so opening the pull request failed; "I don't
+    // want to push to GitHub, I want the repo as a zip" and "where is my zip
+    // file" each re-ran the failing pull request and the agent never read them.
+    const repo = await h.makeRepo('escalated-pr-message');
+    const taskId = newId('task');
+    const base = input({ taskId, repo, title: 'Blocked pull request', prompt: '@write work.txt :: one\n@openpr', resolveAgentEnabled: false });
+    const handle = await h.client.workflow.start('softwareDev@1.30.0', {
+      taskQueue: TASK_QUEUE, workflowId: taskId,
+      args: [{ ...base, project: { ...base.project, remote: 'pr' } }],
+    });
+    await expect.poll(async () => `${(await view(handle)).stage}/${(await view(handle)).status}`, { timeout: 30_000 }).toBe('pr/blocked');
+    expect((await view(handle)).waitingFor?.detail).toMatch(/none of this task's repositories is on GitHub\. In Project settings → Task defaults, set Remote policy/);
+    const agentTurns = async () => (await view(handle)).messages.filter((m: any) => m.role === 'agent').length;
+    const turns = await agentTurns();
+    await handle.signal('followUp', { id: 'u-zip', role: 'user', ts: Date.now(), text: 'Don\'t push anywhere; zip it.\n@write zip.txt :: zipped' });
+    // The agent answers it, in Do, before anything is opened again.
+    await expect.poll(agentTurns, { timeout: 30_000 }).toBeGreaterThan(turns);
+    expect((await view(handle)).messages.some((m: any) => m.role === 'user' && m.id === 'u-zip')).toBe(true);
+    await handle.signal('cancel');
+    await handle.result().catch(() => undefined);
+  }, 120_000);
+
   it('Open PR from a needs-input pause that watches a job publishes without another turn', async () => {
     const repo = await h.makeRepo('open-pr-pause-job');
     const taskId = newId('task');

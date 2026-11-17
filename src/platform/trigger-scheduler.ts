@@ -21,8 +21,8 @@ import {
   type ScheduleTrigger,
 } from '../domain/triggers.js';
 import {
-  DEFAULT_MAX_RUNS_PER_HOUR, EventRunRefused, MAX_EVENT_HOPS, renderTemplate, triggerContext, triggerMessage,
-  type ProjectEvent, type ProjectEventClaim, type ProjectEventClaimState, type TriggerContext,
+  DEFAULT_MAX_RUNS_PER_HOUR, EventRunRefused, MAX_EVENT_HOPS, countCrossedThreshold, recurrenceMessage, renderTemplate, templateData, triggerContext, triggerMessage,
+  type KeyedRun, type ProjectEvent, type ProjectEventClaim, type ProjectEventClaimState, type TriggerContext,
 } from '../domain/project-events.js';
 
 /**
@@ -74,6 +74,14 @@ import {
  * a failed start) is `deferred` and retried by the inbox sweep, oldest event
  * first; the sweep also offers events another process recorded.
  *
+ * **A repeat of an event's key is counted, not dropped**, and offered again:
+ * nothing new starts for it, but a trigger that keeps one task per key
+ * (`concurrency.mode: 'continue'`) routes it to that task — said once per
+ * tenfold growth while the task works, and carrying the task on once it has
+ * finished and its change is live. Such a trigger may also wait before
+ * starting (`settleMinutes`), keep only so many runs at work (`maxRunning`,
+ * the most-seen event first) and ask a model whether to start at all (`gate`).
+ *
  * **Follow-up triggers are the same machine pointed at a started task** (wiki
  * features/follow-up-triggers): an entry with `followUp` set listens for what
  * `params.followUpTriggers` names, and firing it says something to the task
@@ -92,7 +100,10 @@ export interface TriggerSchedulerDeps {
    * armed template in place (recurring — cron, or a re-arming event trigger).
    * `followUp` says it to a started task instead; `cause` is the trigger that fired.
    */
-  fire: (taskId: string, mode: 'self' | 'clone' | 'followUp', trigger?: TriggerContext, cause?: TaskTrigger) => Promise<unknown>;
+  fire: (taskId: string, mode: 'self' | 'clone' | 'followUp', trigger?: TriggerContext, cause?: TaskTrigger, text?: string) => Promise<unknown>;
+  /** Ask a trigger's gate whether an event should start a run (`EventTrigger.gate`).
+   *  Without it, or when it fails, the event starts its run. */
+  gate?: (ask: GateRequest) => Promise<GateVerdict>;
   /** Give an unfinished run a further event of its concurrency key (`tell`). */
   tell?: (runId: string, trigger: TriggerContext, text?: string) => Promise<unknown>;
   /** An event started a run or was told to one (a chat bot answers in its thread). */
@@ -108,6 +119,22 @@ export interface TriggerSchedulerDeps {
   /** How often the project-event inbox is swept (default 15 s; `0` disables —
    *  tests call `sweepProjectEvents()` themselves). */
   inboxSweepMs?: number;
+}
+
+/** What a gate is asked: the event, and, for a trigger that keeps one task
+ *  per key, the keys that have a task it could join. */
+export interface GateRequest {
+  series: TaskRecord;
+  trigger: EventTrigger;
+  event: ProjectEvent;
+  keys: Array<{ key: string; taskId: string; title: string; status: string }>;
+}
+
+export interface GateVerdict {
+  decision: 'start' | 'skip' | 'merge';
+  reason?: string;
+  /** `merge`: the key whose task takes this event's key too. */
+  into?: string;
 }
 
 /** `tell`: the event reaches the run's agent as a message, with a bounded
@@ -127,10 +154,10 @@ export function createTriggerTell(api: Pick<KarmaxApi, 'postTaskMessage'>, token
 /** The dispatcher outlives principal-token TTLs. Give each start its own bounded
  * credential and release it once the API operation completes. */
 export function createTriggerFire(api: Pick<KarmaxApi, 'fireTriggeredTask'>, tokens: TokenAuthority): TriggerSchedulerDeps['fire'] {
-  return async (taskId, mode, trigger, cause) => {
+  return async (taskId, mode, trigger, cause, text) => {
     const { token } = (await tokens.mintPrincipal('system:triggers', ['*'], undefined, 10 * 60_000));
     try {
-      return await api.fireTriggeredTask(token, taskId, mode, trigger, cause);
+      return await api.fireTriggeredTask(token, taskId, mode, trigger, cause, text);
     } finally {
       (await tokens.revoke(token));
     }
@@ -179,7 +206,20 @@ const STALE_PENDING_MS = 10 * 60_000;
 /** A failed start is retried no sooner than this. */
 const FAILED_START_RETRY_MS = 60_000;
 const FAILED_START = 'could not start';
+const GATE_ASKED = 'being considered';
+const SETTLING = 'letting what comes with it arrive';
+/** How long after a change landed it counts as live when no event said so. */
+const LIVE_WITHOUT_WORD_MS = 24 * 3600 * 1000;
+
+type Verdict = { state: ProjectEventClaimState; reason?: string; tell?: string;
+  /** The key's task takes it: a message while it works, a continuation once it has finished. */
+  carryOn?: { taskId: string; text?: string };
+  /** The trigger's gate decides. */
+  ask?: true };
+
 export class TriggerScheduler {
+  /** Claims whose gate is being asked right now, `<event>:<task>`. */
+  private gating = new Set<string>();
   private armed = new Map<string, ArmedEntry>();
   private eventTail: Promise<void> = Promise.resolve();
   private pendingOperations = new Set<Promise<unknown>>();
@@ -587,7 +627,7 @@ export class TriggerScheduler {
       const trigger = this.projectEventTrigger(entry, event);
       if (trigger && !(entry.followUp && await this.deps.store.projectEventReached(event.id, entry.task.id))) await this.offerProjectEvent(entry, trigger, event);
     }
-    await this.deps.store.markProjectEventDispatched(event.id, this.now());
+    await this.deps.store.markProjectEventDispatched(event.id, this.now(), event.count);
   }
 
   private projectEventTrigger(entry: ArmedEntry, event: ProjectEvent): EventTrigger | undefined {
@@ -631,6 +671,7 @@ export class TriggerScheduler {
         ? { state: 'started', runId, reason: null, updatedAt: now }
         : { state: 'deferred', reason: 'its start was interrupted', updatedAt: now });
     }
+    const waiting: Array<{ claim: ProjectEventClaim; entry: ArmedEntry; trigger: EventTrigger; event: ProjectEvent }> = [];
     for (const claim of await this.deps.store.projectEventClaimsInState('deferred')) {
       if (claim.reason?.startsWith(FAILED_START) && now - claim.updatedAt < FAILED_START_RETRY_MS) continue;
       const entry = this.armed.get(claim.taskId);
@@ -643,7 +684,13 @@ export class TriggerScheduler {
       const event = await this.deps.store.getProjectEvent(claim.eventId);
       const trigger = event && this.projectEventTrigger(entry, event);
       if (!event || !trigger) { await this.settleClaim(claim, 'skipped', 'the task no longer reacts to this event'); continue; }
-      await this.offerProjectEvent(entry, trigger, event, claim);
+      waiting.push({ claim, entry, trigger, event });
+    }
+    // Oldest event first, except that what happened most goes first (a
+    // stable sort: events seen once keep their order).
+    waiting.sort((a, b) => b.event.count - a.event.count);
+    for (const { claim, entry, trigger, event } of waiting) {
+      if (this.armed.get(entry.task.id) === entry) await this.offerProjectEvent(entry, trigger, event, claim);
     }
   }
 
@@ -654,16 +701,24 @@ export class TriggerScheduler {
   /**
    * Decide what one event does for one armed task and record it atomically
    * (both stores serialize transactions), then start the run if it may start.
-   * `deferred` is the claim being retried; without it the pair must be new.
+   * `deferred` is the claim being retried; without it the pair is new, or the
+   * event came again: then it goes to its key's task, if the trigger keeps one.
    */
   private async offerProjectEvent(entry: ArmedEntry, trigger: EventTrigger, event: ProjectEvent, deferred?: ProjectEventClaim): Promise<void> {
     const taskId = entry.task.id;
-    const concurrencyKey = trigger.concurrency ? renderTemplate(trigger.concurrency.key ?? '', event.payload, 300) : undefined;
+    const concurrencyKey = trigger.concurrency ? renderTemplate(trigger.concurrency.key ?? '', templateData(event), 300) : undefined;
+    if (!deferred) {
+      const existing = await this.deps.store.getProjectEventClaim(event.id, taskId);
+      if (existing) {
+        if (concurrencyKey !== undefined && trigger.concurrency?.mode === 'continue' && !entry.followUp) await this.eventCameAgain(entry, trigger, event, concurrencyKey, existing);
+        return;
+      }
+    }
     const verdict = await this.deps.store.transaction(async () => {
-      const decided = await this.projectEventVerdict(entry, trigger, event, concurrencyKey);
+      const decided = await this.projectEventVerdict(entry, trigger, event, concurrencyKey, deferred);
       const now = this.now();
       if (deferred) {
-        if (decided.state === 'deferred' && decided.reason === deferred.reason) return undefined;
+        if (decided.state === 'deferred' && decided.reason === deferred.reason) return decided.ask ? decided : undefined;
         const moved = await this.deps.store.updateProjectEventClaim(event.id, taskId, ['deferred'],
           { state: decided.state, reason: decided.reason ?? null, concurrencyKey: concurrencyKey ?? null, updatedAt: now });
         return moved ? decided : undefined;
@@ -672,12 +727,14 @@ export class TriggerScheduler {
         concurrencyKey, receivedAt: event.receivedAt, updatedAt: now });
       return claimed ? decided : undefined;
     });
-    if (verdict?.state === 'pending' && verdict.tell) await this.tellEventRun(entry, event, verdict.tell, concurrencyKey);
+    if (verdict?.ask) this.askGate(entry, trigger, event, concurrencyKey);
+    else if (verdict?.state === 'pending' && verdict.carryOn) await this.carryOn(entry, trigger, event, concurrencyKey!, verdict.carryOn);
+    else if (verdict?.state === 'pending' && verdict.tell) await this.tellEventRun(entry, event, verdict.tell, concurrencyKey);
     else if (verdict?.state === 'pending') await this.startEventRun(entry, trigger, event, concurrencyKey);
   }
 
-  private async projectEventVerdict(entry: ArmedEntry, trigger: EventTrigger, event: ProjectEvent, concurrencyKey: string | undefined):
-    Promise<{ state: ProjectEventClaimState; reason?: string; tell?: string }> {
+  private async projectEventVerdict(entry: ArmedEntry, trigger: EventTrigger, event: ProjectEvent, concurrencyKey: string | undefined,
+    claim?: ProjectEventClaim): Promise<Verdict> {
     if (event.hops > MAX_EVENT_HOPS) return { state: 'skipped', reason: `stopped a loop: more than ${MAX_EVENT_HOPS} event-to-run steps` };
     // A reply in a thread, a comment on an issue: the run already working on it
     // follows it and hears it there, so a second run would duplicate it.
@@ -686,9 +743,22 @@ export class TriggerScheduler {
     if (following) return { state: 'skipped', reason: `its run ${following.task.id} follows this` };
     const dependencies = entry.triggers.filter((t): t is DependencyTrigger => t.kind === 'dependency');
     if (!dependencies.every((t) => dependencyMet(t, entry.satisfiedDeps))) return { state: 'deferred', reason: 'waiting for its dependencies' };
+    const mode = trigger.concurrency?.mode ?? 'skip';
+    const keeps = concurrencyKey !== undefined && mode === 'continue' && !entry.followUp;
+    // One task per key, for good: a further event of the key is that task's.
+    const kept = keeps ? await this.keyTask(entry.task.id, concurrencyKey!, event) : undefined;
+    if (kept) {
+      if (kept.task.lastView?.status === 'done') {
+        // What came before its change was live says nothing about whether it held.
+        const live = await this.finishedKeyReady(trigger, kept.run, kept.task, event, false);
+        if (!live.ready) return live.liveAt !== undefined ? { state: 'skipped', reason: 'it came before what its task changed went live' }
+          : { state: 'deferred', reason: 'waiting for what its task changed to go live' };
+      }
+      return { state: 'pending', carryOn: { taskId: kept.task.id } };
+    }
     const slot = concurrencyKey !== undefined ? await this.deps.store.projectEventSlot(entry.task.id, concurrencyKey) : undefined;
     if (slot) {
-      const mode = trigger.concurrency?.mode ?? 'skip';
+      if (keeps) return slot.runId ? { state: 'pending', carryOn: { taskId: slot.runId } } : { state: 'deferred', reason: 'waiting for its run to start' };
       if (mode === 'tell' && this.deps.tell) {
         return slot.runId ? { state: 'pending', tell: slot.runId } : { state: 'deferred', reason: 'waiting for its run to start' };
       }
@@ -696,12 +766,179 @@ export class TriggerScheduler {
         ? { state: 'deferred', reason: 'queued behind an unfinished run' }
         : { state: 'skipped', reason: 'a run for it was already unfinished' };
     }
+    if (!entry.followUp) {
+      if (trigger.settleMinutes && this.now() < event.receivedAt + trigger.settleMinutes * 60_000) return { state: 'deferred', reason: SETTLING };
+      if (trigger.gate && this.deps.gate && !claim?.gated) return { state: 'deferred', reason: GATE_ASKED, ask: true };
+      if (trigger.maxRunning) {
+        const running = await this.deps.store.unfinishedRunsOf(entry.task.id);
+        if (running >= trigger.maxRunning) return { state: 'deferred', reason: `queued: ${running} of its runs are at work` };
+      }
+    }
     const limit = trigger.maxPerHour ?? DEFAULT_MAX_RUNS_PER_HOUR;
     const lately = entry.followUp ? this.deps.store.projectEventsToldSince(entry.task.id, this.now() - 3600_000)
       : this.deps.store.projectEventRunsSince(entry.task.id, this.now() - 3600_000);
     if (await lately >= limit)
       return { state: 'deferred', reason: `waiting for its limit of ${limit} runs an hour` };
     return { state: 'pending' };
+  }
+
+  // ─── One task per key (`concurrency.mode: 'continue'`) ─────────────────────
+
+  /** The task that holds a key, if it still stands. A key whose task is gone
+   *  is free again; one whose task was cancelled was turned down by a person,
+   *  like one its gate skipped. */
+  private async keyTask(seriesId: string, key: string, event: ProjectEvent): Promise<{ run: KeyedRun; task: TaskRecord } | undefined> {
+    const run = await this.deps.store.keyedRun(seriesId, key);
+    if (!run?.taskId) return undefined;
+    const task = await this.deps.store.taskMetadataAsync(run.taskId);
+    if (!task) { await this.deps.store.deleteKeyedRun(seriesId, key); return undefined; }
+    if (task.lastView?.status === 'cancelled') {
+      await this.deps.store.saveKeyedRun({ ...run, taskId: undefined, state: 'skipped', reason: 'its task was cancelled', seen: event.count, liveAt: undefined });
+      return undefined;
+    }
+    return { run, task };
+  }
+
+  /**
+   * Whether a finished task should carry on for a further event of its key.
+   * One that landed a change does once the change is live: at once, or, when
+   * the trigger names what makes it live (`concurrency.after`, a deploy), after
+   * the event of that kind that names a commit it landed (or lists none), else
+   * a day after it landed.
+   * One that changed nothing found nothing to do: only a repeat that has grown
+   * tenfold since, or a different event of the key, is worth another look.
+   */
+  private async finishedKeyReady(trigger: EventTrigger, run: KeyedRun, task: TaskRecord, event: ProjectEvent, repeat: boolean): Promise<{ ready: boolean; liveAt?: number }> {
+    const landed = (task.lastView?.prs ?? []).filter((pr) => pr.merged && pr.headSha).map((pr) => pr.headSha!);
+    if (!landed.length) return { ready: !repeat || countCrossedThreshold(run.seen, event.count) };
+    const finishedAt = task.statusChangedAt ?? run.updatedAt;
+    const after = trigger.concurrency?.after;
+    let liveAt = run.liveAt ?? (after ? undefined : finishedAt);
+    if (liveAt === undefined && after) {
+      for (const candidate of await this.deps.store.projectEventsAfter(task.projectId, after.type, after.source, finishedAt)) {
+        const commits = candidate.payload.commits;
+        const names = !Array.isArray(commits) || landed.some((sha) => commits.some((commit) => typeof commit === 'string' && commit.length >= 7
+          && (sha.startsWith(commit) || commit.startsWith(sha))));
+        if (names) { liveAt = candidate.receivedAt; break; }
+      }
+      // No such event named it (none is sent, or it landed as another commit:
+      // a squash): a change is taken to be out a day after it landed.
+      if (liveAt === undefined && this.now() - finishedAt > LIVE_WITHOUT_WORD_MS) liveAt = finishedAt + LIVE_WITHOUT_WORD_MS;
+      if (liveAt !== undefined) await this.deps.store.updateKeyedRun(run.seriesId, run.key, { liveAt });
+    }
+    return { ready: liveAt !== undefined && event.lastSeenAt > liveAt, ...(liveAt !== undefined ? { liveAt } : {}) };
+  }
+
+  /**
+   * An event the series already answered came again (its count moved). Its
+   * key's task hears of it: once per tenfold growth while it works; once it
+   * has finished, when that means its change did not hold. A key that was
+   * turned down is put to the gate again once it has grown tenfold.
+   */
+  private async eventCameAgain(entry: ArmedEntry, trigger: EventTrigger, event: ProjectEvent, key: string, claim: ProjectEventClaim): Promise<void> {
+    if (claim.state === 'pending' || claim.state === 'deferred') return; // it starts knowing its count
+    const seriesId = entry.task.id;
+    const run = await this.deps.store.keyedRun(seriesId, key);
+    const kept = run?.taskId ? await this.keyTask(seriesId, key, event) : undefined;
+    if (!kept) {
+      // Turned down (by its gate, or its task was cancelled): asked again once it has grown tenfold.
+      // No key at all: it was split off its task, or its task is gone, so it starts over.
+      const current = run?.taskId ? await this.deps.store.keyedRun(seriesId, key) : run;
+      if (current && !countCrossedThreshold(current.seen, event.count)) return;
+      const reason = current ? 'it keeps coming' : 'its key is free again';
+      if (await this.deps.store.updateProjectEventClaim(event.id, seriesId, [claim.state], { state: 'deferred', reason, runId: null, gated: false, updatedAt: this.now() }))
+        await this.offerProjectEvent(entry, trigger, event, { ...claim, state: 'deferred', reason, runId: undefined, gated: false });
+      return;
+    }
+    const finished = kept.task.lastView?.status === 'done';
+    let liveAt: number | undefined;
+    if (finished) {
+      const ready = await this.finishedKeyReady(trigger, kept.run, kept.task, event, true);
+      if (!ready.ready) return;
+      liveAt = ready.liveAt;
+    } else if (!countCrossedThreshold(kept.run.seen, event.count)) return;
+    if (!(await this.deps.store.updateProjectEventClaim(event.id, seriesId, [claim.state], { state: 'pending', updatedAt: this.now() }))) return;
+    await this.carryOn(entry, trigger, event, key, { taskId: kept.task.id,
+      text: recurrenceMessage(triggerContext(event, key), { seen: kept.run.seen, finished, ...(liveAt !== undefined ? { liveAt } : {}) }) });
+  }
+
+  /** Give an event to its key's task (`pending` claim): a message if it can
+   *  take one, kept until it can, a continuation once it has finished. */
+  private async carryOn(entry: ArmedEntry, trigger: EventTrigger, event: ProjectEvent, key: string, to: { taskId: string; text?: string }): Promise<void> {
+    const seriesId = entry.task.id;
+    try {
+      await this.deps.fire(to.taskId, 'followUp', triggerContext(event, key), trigger, to.text);
+      await this.deps.store.updateProjectEventClaim(event.id, seriesId, ['pending'], { state: 'told', runId: to.taskId, reason: null, updatedAt: this.now() });
+      // Only what it has heard: a continuation made meanwhile already took the key along.
+      if (!(await this.deps.store.updateKeyedRun(seriesId, key, { seen: event.count })))
+        await this.keepKey(entry.task, key, { taskId: to.taskId, seen: event.count });
+      this.announce(event, to.taskId, 'told');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.deps.store.updateProjectEventClaim(event.id, seriesId, ['pending'],
+        { state: 'deferred', reason: `${FAILED_START}: ${message}`.slice(0, 300), updatedAt: this.now() });
+    }
+  }
+
+  private async keepKey(series: TaskRecord, key: string, value: { taskId?: string; seen: number; reason?: string }): Promise<void> {
+    await this.deps.store.saveKeyedRun({ seriesId: series.id, key, projectId: series.projectId,
+      organizationId: (await this.organizationOfTask(series.id, series)) ?? 'org_personal',
+      state: value.taskId ? 'run' : 'skipped', seen: value.seen, ...(value.taskId ? { taskId: value.taskId } : {}), ...(value.reason ? { reason: value.reason } : {}) });
+  }
+
+  // ─── Gate ──────────────────────────────────────────────────────────────────
+
+  /** Ask the trigger's gate about a `deferred` claim, off the dispatch queue
+   *  (a model answers in seconds; events must not wait behind it). */
+  private askGate(entry: ArmedEntry, trigger: EventTrigger, event: ProjectEvent, key: string | undefined): void {
+    const id = `${event.id}:${entry.task.id}`;
+    if (this.gating.has(id)) return;
+    this.gating.add(id);
+    const keeps = key !== undefined && trigger.concurrency?.mode === 'continue';
+    this.track((async () => {
+      let verdict: GateVerdict;
+      try {
+        const keys: GateRequest['keys'] = [];
+        if (keeps) for (const run of (await this.deps.store.listKeyedRuns(entry.task.id)).filter((candidate) => candidate.taskId && candidate.key !== key).slice(0, 40)) {
+          const task = await this.deps.store.taskMetadata(run.taskId!);
+          if (task && task.lastView?.status !== 'cancelled') keys.push({ key: run.key, taskId: task.id, title: task.title, status: task.lastView?.status ?? 'active' });
+        }
+        verdict = await this.deps.gate!({ series: entry.task, trigger, event, keys });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.log(`gate of ${entry.task.id} could not be asked about ${event.id}: ${message}`);
+        verdict = { decision: 'start', reason: `its gate could not be asked (${message.slice(0, 120)})` };
+      }
+      // Still marked as being asked until its verdict is applied: a sweep in between must not ask twice.
+      await this.enqueue(() => this.applyGate(entry, trigger, event.id, key, verdict), 'gate verdict');
+    })().finally(() => this.gating.delete(id)));
+  }
+
+  private async applyGate(entry: ArmedEntry, trigger: EventTrigger, eventId: string, key: string | undefined, verdict: GateVerdict): Promise<void> {
+    const seriesId = entry.task.id;
+    if (this.armed.get(seriesId) !== entry) return;
+    const claim = await this.deps.store.getProjectEventClaim(eventId, seriesId);
+    const event = await this.deps.store.getProjectEvent(eventId);
+    if (!event || claim?.state !== 'deferred') return;
+    const keeps = key !== undefined && trigger.concurrency?.mode === 'continue';
+    const why = (verdict.reason ?? '').replace(/\s+/g, ' ').trim().slice(0, 240);
+    if (verdict.decision === 'skip') {
+      const reason = `its gate: ${why || 'not worth a run'}`;
+      if (!(await this.deps.store.updateProjectEventClaim(eventId, seriesId, ['deferred'], { state: 'skipped', reason, updatedAt: this.now() }))) return;
+      if (keeps) await this.keepKey(entry.task, key!, { seen: event.count, reason });
+      this.log(`gate skipped ${event.type} ${event.key} for ${seriesId}: ${why}`);
+      return;
+    }
+    const into = verdict.decision === 'merge' && keeps && verdict.into && verdict.into !== key ? await this.keyTask(seriesId, verdict.into, event) : undefined;
+    if (into) {
+      if (!(await this.deps.store.updateProjectEventClaim(eventId, seriesId, ['deferred'], { state: 'pending', updatedAt: this.now() }))) return;
+      await this.keepKey(entry.task, key!, { taskId: into.task.id, seen: event.count, reason: `its gate: the same as ${verdict.into}${why ? ` (${why})` : ''}` });
+      await this.carryOn(entry, trigger, event, key!, { taskId: into.task.id });
+      return;
+    }
+    const approved = { ...claim, gated: true, reason: 'its gate said to start it' };
+    if (await this.deps.store.updateProjectEventClaim(eventId, seriesId, ['deferred'], { state: 'deferred', reason: approved.reason, gated: true, updatedAt: this.now() }))
+      await this.offerProjectEvent(entry, trigger, event, approved);
   }
 
   private async tellEventRun(entry: ArmedEntry, event: ProjectEvent, runId: string, concurrencyKey: string | undefined): Promise<void> {
@@ -741,6 +978,8 @@ export class TriggerScheduler {
       const { startedTaskId: runId, told } = (started ?? {}) as { startedTaskId?: string; told?: boolean };
       await this.deps.store.updateProjectEventClaim(event.id, taskId, ['pending'],
         { state: told ? 'told' : 'started', runId: runId ?? null, reason: null, updatedAt: this.now() });
+      if (runId && concurrencyKey !== undefined && trigger.concurrency?.mode === 'continue' && !entry.followUp)
+        await this.keepKey(entry.task, concurrencyKey, { taskId: runId, seen: event.count });
       if (!repeatable && !entry.followUp && this.armed.get(taskId) === entry) await this.hearFollowUpsAfterStart(taskId);
       this.log(`event ${event.type} ${entry.followUp ? 'followed up' : 'started'} ${repeatable && !entry.followUp ? `a run of ${taskId}` : taskId}`);
       if (runId) this.announce(event, runId, told ? 'told' : 'started');

@@ -42,6 +42,50 @@ export async function* withClaudeStartupDeadline<T>(stream: AsyncIterable<T>, ab
 }
 
 /**
+ * An SDK stream its reader can give up on. The stream ends when the agent's
+ * process does, but only by the SDK's own account of that process: one it
+ * misreads leaves `next()` pending for ever, and aborting does not help
+ * (pramana#137, 2026-11-09: a turn "working" for six hours after its machine
+ * was stopped, which Stop could not end). So once the reader has reason to
+ * expect the end (`expectEnd`: the process exited, or was told to stop), a
+ * `next()` still unanswered `ms` later rejects with that reason. Messages
+ * already on their way are not cut off: the bound runs only while the reader
+ * waits. A stream given up on is not asked to return, which would wait on the
+ * same pending `next()`. `close` is for a reader that stops reading some
+ * other way: nothing is expected of the stream after it.
+ */
+export function endBoundedStream<T>(stream: AsyncIterable<T>, ms: number): { stream: AsyncIterable<T>; expectEnd(reason: () => unknown): void; close(): void } {
+  const iterator = stream[Symbol.asyncIterator]();
+  let reason: (() => unknown) | undefined;
+  let waiting: { reject(error: unknown): void; timer?: ReturnType<typeof setTimeout> } | undefined;
+  let givenUp = false;
+  let closed = false;
+  const bound = () => {
+    const reader = waiting;
+    if (closed || !reader || !reason || reader.timer) return;
+    reader.timer = setTimeout(() => { givenUp = true; reader.reject(reason!()); }, ms);
+  };
+  return {
+    expectEnd(why) { reason ??= why; bound(); },
+    close() { closed = true; clearTimeout(waiting?.timer); },
+    stream: { [Symbol.asyncIterator]: () => ({
+      next: () => new Promise<IteratorResult<T>>((resolve, reject) => {
+        const reader: NonNullable<typeof waiting> = { reject };
+        const settled = () => { clearTimeout(reader.timer); if (waiting === reader) waiting = undefined; };
+        waiting = reader;
+        bound();
+        iterator.next().then((result) => { settled(); resolve(result); }, (error) => { settled(); reject(error); });
+      }),
+      return: async (value?: unknown): Promise<IteratorResult<T>> => {
+        if (!givenUp) await iterator.return?.(value);
+        else void Promise.resolve(iterator.return?.(value)).catch(() => undefined);
+        return { done: true, value: undefined };
+      },
+    }) },
+  };
+}
+
+/**
  * Streaming-input plumbing for the Claude Agent SDK's in-flight follow-up
  * injection (SPEC §5.6). The SDK's `query({ prompt })` accepts an
  * `AsyncIterable<SDKUserMessage>`; while that iterable stays open the session

@@ -62,6 +62,7 @@ function constant(name) {
       window.pipeline = () => '';
       window.attentionChip = () => '<span class="status human attention escalated"><span class="status-label">Input</span></span>';
       window.rowAsk = () => ({ kind: 'escalated' });
+      window.rowOwnAsk = () => 'escalated';
       window.renderMain = () => {
         $('#main').innerHTML = `<div class="task-list">${inboxNoticesHtml()}${taskRow({ id: 'reference', projectId: 'karmax', num: 284, title: 'Restore the deployment after a failed health check', lastView: { status: 'waiting', stage: 'review' } }, { showTags: false, project: true })}</div>`;
         wireInboxNotices();
@@ -150,7 +151,7 @@ function constant(name) {
     await page.setViewportSize({ width: 320, height: 700 });
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'no overflow on small phones');
     // The real loader: one badge over every organization, whichever page is open.
-    await page.addScriptTag({ content: ['loadInbox', 'inboxArrivals', 'scheduleHomeRefresh'].map(fn).join('\n') + '\nlet homeRefreshTimer = null; const HOME_REFRESH_MS = 10; function refreshForMeCounts() {}' });
+    await page.addScriptTag({ content: ['loadInbox', 'inboxState', 'inboxArrivals', 'scheduleHomeRefresh'].map(fn).join('\n') + '\nlet homeRefreshTimer = null; const HOME_REFRESH_MS = 10; function refreshForMeCounts() {} function readAsksOnScreen() {} function refreshListQuietly() {}' });
     await page.evaluate(() => {
       document.body.insertAdjacentHTML('afterbegin', '<a id="bell"><span id="bell-badge"></span></a>');
       S.organizations = [{ id: 'personal' }, { id: 'team' }];

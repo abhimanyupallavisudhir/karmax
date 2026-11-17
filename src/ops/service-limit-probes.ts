@@ -134,6 +134,18 @@ export async function composioUsage(input: { fetch: typeof fetch; apiKey: string
   } };
 }
 
+// ─── OpenRouter: the prepaid balance tavya's models and generations draw on ───
+
+/** Credits spent of all bought (USD). The management key reads the account's. */
+export async function openRouterUsage(input: { fetch: typeof fetch; apiKey: string; base?: string }): Promise<ProbeResult> {
+  const base = (input.base ?? 'https://openrouter.ai/api/v1').replace(/\/$/, '');
+  const body = await json(await input.fetch(`${base}/credits`, { headers: { authorization: `Bearer ${input.apiKey}` },
+    signal: AbortSignal.timeout(TIMEOUT_MS) }), 'OpenRouter');
+  const bought = Number(body?.data?.total_credits), spent = Number(body?.data?.total_usage);
+  if (!Number.isFinite(bought) || !Number.isFinite(spent)) throw new Error('OpenRouter sent no credit balance');
+  return { readings: { 'openrouter.credits': { used: spent, limit: bought, detail: `$${Math.max(0, bought - spent).toFixed(2)} left` } } };
+}
+
 // ─── E2B: running sandboxes on the account; hours are metered by tavya ────────
 
 export async function e2bUsage(input: { fetch: typeof fetch; apiKey: string; hours: number; base?: string }): Promise<ProbeResult> {

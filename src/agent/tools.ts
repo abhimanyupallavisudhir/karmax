@@ -10,7 +10,7 @@ import { readWorldFilePrefix } from '../world/file-prefix.js';
 import { startJob, jobStatuses, describeJobs, listJobs, stopJobs, MAX_JOB_NAME } from '../world/jobs.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import {
-  PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES, CREATE_TASK_GRANTS, REQUEST_FOR_TASK, PERMISSION_ROUTING,
+  PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES, CREATE_TASK_GRANTS, REQUEST_FOR_TASK, PERMISSION_ROUTING, WITHDRAW_PERMISSION_REQUEST,
   QUEUE_TASK_DESCRIPTION, queuedTaskReply,
   compactSearch, compactOrganizationSearch, compactTags, normalizeRequestBody, platformRequestPathError,
   FIELDS_PARAMETER, agentPlatformResponse, agentTaskView,
@@ -35,6 +35,23 @@ export interface ToolSchema {
 }
 
 const MAX_OUTPUT = 12_000;
+/** generate: input images read from the world, at most this large. */
+const MEDIA_REFERENCE_MAX_BYTES = 20_000_000;
+/** generate: how often a waiting video is polled (tests shorten it). */
+const mediaPollMs = () => Number(process.env.KARMAX_MEDIA_POLL_MS) || 15_000;
+const MEDIA_EXTENSIONS: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif',
+  'image/svg+xml': 'svg', 'audio/mpeg': 'mp3', 'audio/mp3': 'mp3', 'audio/pcm': 'pcm', 'audio/wav': 'wav', 'video/mp4': 'mp4', 'video/webm': 'webm' };
+const mediaTypeOf = (file: string) => Object.entries(MEDIA_EXTENSIONS)
+  .find(([, extension]) => file.toLowerCase().endsWith(`.${extension}`) || (extension === 'jpg' && /\.jpeg$/i.test(file)))?.[0] ?? 'application/octet-stream';
+/** Where generate saves file `index` of `count`: the path asked for,
+ * given the file's extension when it has none, and -2, -3, … for the rest. */
+export function mediaPath(target: string, mediaType: string, index: number, count: number): string {
+  const extension = MEDIA_EXTENSIONS[mediaType];
+  const dot = target.lastIndexOf('.'), slash = target.lastIndexOf('/');
+  const hasExtension = dot > slash + 1;
+  const stem = hasExtension ? target.slice(0, dot) : target, suffix = hasExtension ? target.slice(dot) : extension ? `.${extension}` : '';
+  return `${stem}${count > 1 && index > 0 ? `-${index + 1}` : ''}${suffix}`;
+}
 const truncate = (s: string) => (s.length > MAX_OUTPUT ? s.slice(0, MAX_OUTPUT) + '\n…(truncated)' : s);
 /** UTF-8 spends at most 3 bytes per UTF-16 unit, so this many bytes always decode past MAX_OUTPUT. */
 const READ_FILE_MAX_BYTES = MAX_OUTPUT * 4;
@@ -377,13 +394,13 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'fill_credential',
     description:
-      `Type a vault credential into the page open in your browser WITHOUT the secret ever entering your context: ${BRAND} resolves it and types it over CDP, verifying the page origin matches the credential's domains first. Focus the login page, then call this per field (username, password, then totp if the site asks for a code). The ${BRAND} browser MCP already runs a Chrome that exposes the DevTools endpoint, so just drive the page normally — no manual Chrome launch needed. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.`,
+      `Type a vault credential into the page open in your browser WITHOUT the secret ever entering your context: ${BRAND} resolves it and types it over CDP, verifying the page origin matches the credential's domains first. Focus the login page, then call this per field (username, password, then totp if the site asks for a code). An API key's secret or an SSH key's privateKey is typed into a field (e.g. a CI secret form) the same way: never copy a key into a login item to fill it. The ${BRAND} browser MCP already runs a Chrome that exposes the DevTools endpoint, so just drive the page normally — no manual Chrome launch needed. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.`,
     parameters: {
       type: 'object',
       properties: {
         item_id: { type: 'string' },
         domain: { type: 'string', description: 'Alternative to item_id: the site domain.' },
-        field: { type: 'string', enum: ['username', 'password', 'totp'], description: 'Default password. totp types the current one-time code.' },
+        field: { type: 'string', enum: ['username', 'password', 'totp', 'secret', 'privateKey'], description: 'Default: the item\'s secret (password, secret or privateKey). totp types the current one-time code.' },
         selector: { type: 'string', description: 'CSS selector of the input element to fill.' },
       },
       required: ['selector'],
@@ -410,8 +427,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       type: 'object',
       properties: {
         id: { type: 'string', description: 'Omit to create; set to update an item this task created.' },
-        type: { type: 'string', enum: ['login', 'api-key', 'ssh-key', 'env', 'note'] },
-        label: { type: 'string' },
+        type: { type: 'string', enum: ['login', 'api-key', 'ssh-key', 'env', 'note'], description: 'Required to create. An item keeps its type: to update one, omit it.' },
+        label: { type: 'string', description: 'Required to create.' },
         domains: { type: 'array', items: { type: 'string' } },
         username: { type: 'string' },
         env_var: { type: 'string', description: 'api-key/ssh-key: env var to inject it under in future task worlds.' },
@@ -420,7 +437,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
           description: 'Field → secret value. login: password, totp (base32 seed or otpauth:// URI), note; api-key: secret; ssh-key: privateKey; env: env (KEY=VALUE lines); note: note.',
         },
       },
-      required: ['type', 'label'],
+      required: [],
     },
   },
   {
@@ -452,6 +469,42 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         publish: { type: 'string', enum: ['discard', 'review'], description: 'Future changes to writable snapshot resources; defaults to review.' },
       },
       required: ['name'],
+    },
+  },
+  {
+    name: 'generate',
+    description:
+      'Use any model OpenRouter serves (or fal.ai / Unifically, below), paid from your organization\'s credit (or its own OpenRouter key), with no account at the lab: text (ask another model: GPT, Gemini, DeepSeek, …; bulk work on a cheap one), an image (gpt-image, Nano Banana, Flux…), a video (Seedance, Veo, Kling…) or speech (ElevenLabs…). Before it runs, what it can cost at most is worked out from the model\'s price list and held on the credit; it is refused when the credit cannot cover that, or when it is above max_cost_usd. Text comes back in the result (and is saved at path if given); media is saved into this world at path. A video waits up to wait_minutes, else returns its job_id: call again with job_id and path to collect it. Models, prices, durations and voices: platform_request GET /api/generation-models?kind=text|image|video|speech.',
+    parameters: {
+      type: 'object',
+      properties: {
+        organization_id: { type: 'string', description: 'Your organization id (named in your prompt).' },
+        kind: { type: 'string', enum: ['text', 'image', 'video', 'speech'] },
+        provider: { type: 'string', enum: ['openrouter', 'fal', 'unifically'], description: 'Default openrouter. fal: ~1,500 models OpenRouter lacks (music, sound effects, 3D, upscaling, lip-sync, background removal…); unifically: Suno and others. Each only where the operator turned it on. With these, pass model and input; kind is optional.' },
+        input: { type: 'object', description: 'fal/unifically: the model\'s own input object, as its docs give it (find models with platform_request GET /api/generation-models?provider=fal&q=music).' },
+        prompt: { type: 'string', description: 'The question or what to make; for speech, the text to say.' },
+        path: { type: 'string', description: 'Where to save it in this world, e.g. assets/hero.png (several images get -2, -3, … before the extension). Required for image, video and speech.' },
+        model: { type: 'string', description: 'OpenRouter model id; default: a good, cheap one for the kind.' },
+        max_cost_usd: { type: 'number', description: 'Refuse unless it can cost at most this much (USD at OpenRouter\'s prices).' },
+        system: { type: 'string', description: 'Text: instructions for the model.' },
+        max_tokens: { type: 'number', description: 'Text: the longest reply, reasoning included (default 8192).' },
+        effort: { type: 'string', enum: ['minimal', 'low', 'medium', 'high'], description: 'Text: reasoning effort, where the model reasons.' },
+        aspect_ratio: { type: 'string', description: 'e.g. 16:9, 1:1, 9:16.' },
+        resolution: { type: 'string', description: 'e.g. 1K, 2K (images); 480p, 720p, 1080p (video). Left out, a video is quoted at the model\'s highest.' },
+        count: { type: 'number', description: 'Images: how many (1–10).' },
+        duration: { type: 'number', description: 'Video: seconds (the model lists which it supports). Left out, it is quoted at the model\'s longest.' },
+        audio: { type: 'boolean', description: 'Video: with sound (default: the model\'s).' },
+        voice: { type: 'string', description: 'Speech: a voice the model offers (default: its first).' },
+        instructions: { type: 'string', description: 'Speech: tone, pace or emotion, where the model supports it.' },
+        references: {
+          type: 'array',
+          description: 'Input images: a file in this world or an https URL. For video, role first_frame/last_frame animates it; for an image, it is edited or followed; for text, the model sees it.',
+          items: { type: 'object', properties: { path: { type: 'string' }, url: { type: 'string' }, role: { type: 'string', enum: ['first_frame', 'last_frame', 'reference'] } } },
+        },
+        job_id: { type: 'string', description: 'Video: collect a job an earlier call started.' },
+        wait_minutes: { type: 'number', description: 'Video: how long to wait for it (default 10, at most 30).' },
+      },
+      required: ['organization_id', 'kind'],
     },
   },
   {
@@ -580,13 +633,13 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'emit_event',
     description: 'Record a project event. Tasks waiting on a matching event trigger start runs that receive it. '
-      + 'Re-emitting the same `key` does nothing, so a poller can report everything it sees each run.',
+      + 'Re-emitting the same `key` starts nothing new: it is counted on that event, so a poller can report everything it sees each run, and an error can be reported each time it happens.',
     parameters: {
       type: 'object',
       properties: {
         project_id: { type: 'string' },
         type: { type: 'string', description: 'Dotted words, e.g. "orders.created".' },
-        key: { type: 'string', description: 'Delivery key; repeats of one key collapse. Omit for a one-off.' },
+        key: { type: 'string', description: 'What the event is; repeats of one key are counted on one event. Omit for a one-off.' },
         subject: { type: 'string', description: 'A link or label for what the event is about.' },
         payload: { type: 'object', description: 'JSON object, at most 64 KB.' },
       },
@@ -854,7 +907,9 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'notify',
     description:
       'Tell or call people and agents of this task without ending your turn. ' +
-      'Notify a person only when you need them to do something; never for updates on your work. People (user:<id>, @team:<slug>, @creator, ' +
+      'Notify a person only when you need them to do something; never for updates on your work. ' +
+      'It leaves their list once they have read it: when you cannot go on without them, ask instead (pause with needs_input, or escalate_to_human). ' +
+      'People (user:<id>, @team:<slug>, @creator, ' +
       '@owners, @project, @maintainers, @admins, @all) and Avatārs (avatar:<task id>) are notified now; agents of this task ' +
       '(agent:do for the main agent, agent:responder, agent:confirm, agent:agent-<n>) are called when your turn ends, in order. ' +
       'The message is said in the task conversation. `agents` calls new agents in, after `to`; each becomes the next ' +
@@ -934,6 +989,18 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         urgency: URGENCY_PARAMETER,
       },
       required: ['reason'],
+    },
+  },
+  {
+    name: 'withdraw_permission_request',
+    description: WITHDRAW_PERMISSION_REQUEST,
+    parameters: {
+      type: 'object',
+      properties: {
+        request_id: { type: 'string', description: 'The requestId request_permission returned.' },
+        reason: { type: 'string', maxLength: 4_000, description: 'Why it is no longer needed (shown to the people asked).' },
+      },
+      required: ['request_id'],
     },
   },
   {
@@ -1104,6 +1171,8 @@ export const SDK_CONTROL_TOOL_NAMES = new Set([
   'stop_job',
   'request_spend',
   'fill_payment_card',
+  // Saves what it made into this turn's world.
+  'generate',
   'open_pr',
   'signal_completion',
   'resolve_decision',
@@ -1477,6 +1546,65 @@ export function platformToolHandlers(
       await ctx.createReviewInfo({ summary: `Project resource proposed: ${String(args.name ?? '')}. Included on confirmation unless excluded.`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
       return JSON.stringify(result);
     },
+    async generate(args) {
+      const org = encodeURIComponent(String(args?.organization_id ?? ''));
+      const target = String(args?.path ?? '').trim();
+      const kind = args?.job_id ? 'video' : String(args?.kind ?? '');
+      const otherProvider = !!args?.provider && args.provider !== 'openrouter';
+      if (!target && (kind !== 'text' || otherProvider)) throw new Error('path is required: where to save it in this world');
+      type Result = { status: string; jobId?: string; model?: string; quoteUsd?: number; costUsd?: number; funding?: string; error?: string; output?: unknown;
+        text?: string; files?: Array<{ mediaType: string; base64: string }> };
+      const job = (id: string) => `/api/organizations/${org}/generations/${encodeURIComponent(id)}?content=1`;
+      let result: Result;
+      if (args?.job_id) {
+        result = await platformRequest('GET', job(String(args.job_id))) as Result;
+      } else {
+        const references = await Promise.all(((Array.isArray(args?.references) ? args.references : []) as Array<{ path?: string; url?: string; role?: string }>).map(async (ref) => {
+          const role = ref?.role ? { role: String(ref.role) } : {};
+          if (!ref?.path) return { url: String(ref?.url ?? ''), ...role };
+          const bytes = await world.readFileBuffer(String(ref.path));
+          if (bytes.length > MEDIA_REFERENCE_MAX_BYTES) throw new Error(`${ref.path} is larger than ${MEDIA_REFERENCE_MAX_BYTES / 1e6} MB`);
+          return { url: `data:${mediaTypeOf(String(ref.path))};base64,${bytes.toString('base64')}`, ...role };
+        }));
+        result = await platformRequest('POST', `/api/organizations/${org}/generations`, {
+          kind: args?.kind, provider: args?.provider, input: args?.input, prompt: args?.prompt, model: args?.model, maxCostUsd: args?.max_cost_usd, system: args?.system,
+          maxTokens: args?.max_tokens, effort: args?.effort, aspectRatio: args?.aspect_ratio, resolution: args?.resolution,
+          count: args?.count, duration: args?.duration, audio: args?.audio, voice: args?.voice, instructions: args?.instructions,
+          ...(references.length ? { references } : {}),
+        }) as Result;
+      }
+      // A video renders for a minute or several: wait for it, up to the limit.
+      const deadline = Date.now() + Math.min(30, Math.max(0, Number(args?.wait_minutes ?? 10) || 0)) * 60_000;
+      while (result.jobId && (result.status === 'pending' || result.status === 'in_progress') && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, mediaPollMs()));
+        result = await platformRequest('GET', job(result.jobId)) as Result;
+      }
+      const summary = { status: result.status, model: result.model,
+        ...(result.quoteUsd !== undefined ? { quoteUsd: result.quoteUsd } : {}), ...(result.costUsd !== undefined ? { costUsd: result.costUsd } : {}),
+        ...(result.funding ? { paidFrom: result.funding === 'own' ? 'your OpenRouter key' : 'credit' } : {}),
+        ...(result.error ? { error: result.error } : {}) };
+      if (result.status === 'completed' && result.text !== undefined) {
+        if (target) { await world.writeFile(target, result.text); ctx.emit(`generated ${target}`); }
+        return JSON.stringify({ ...summary, ...(target ? { saved: [target] } : {}), text: result.text });
+      }
+      if (result.status === 'completed' && result.files?.length) {
+        const saved: string[] = [];
+        for (const [index, file] of result.files.entries()) {
+          const where = mediaPath(target, file.mediaType, index, result.files.length);
+          const bytes = Buffer.from(file.base64, 'base64');
+          if (world.writeFileBuffer) await world.writeFileBuffer(where, bytes);
+          else throw new Error('this world cannot store binary files');
+          saved.push(where);
+        }
+        ctx.emit(`generated ${saved.join(', ')}`);
+        // Another provider's output says what each file is (clip ids, titles, durations…).
+        const output = result.output === undefined ? undefined : JSON.stringify(result.output);
+        return JSON.stringify({ ...summary, saved, ...(output ? { output: output.length > 4000 ? `${output.slice(0, 4000)}…` : result.output } : {}) });
+      }
+      if (result.status === 'pending' || result.status === 'in_progress')
+        return JSON.stringify({ ...summary, job_id: result.jobId, next: 'Still rendering: call generate again with this job_id and path to collect it.' });
+      return JSON.stringify({ ...summary, ...(result.jobId ? { job_id: result.jobId } : {}), error: result.error ?? 'nothing was generated' });
+    },
     async check_agent_mail(args) {
       const q = new URLSearchParams();
       if (args?.match) q.set('match', String(args.match));
@@ -1732,6 +1860,11 @@ export function platformToolHandlers(
         reason: String(args?.reason ?? ''),
         ...(args?.urgency ? { urgency: String(args.urgency) } : {}),
       }));
+    },
+    async withdraw_permission_request(args) {
+      return JSON.stringify(await platformRequest('POST',
+        `/api/agent/permission-requests/${encodeURIComponent(String(args?.request_id ?? ''))}/withdraw`,
+        args?.reason ? { reason: String(args.reason) } : {}));
     },
     async publish_task_branch() {
       return JSON.stringify(await platformRequest('POST', '/api/agent/git/publish', {}));

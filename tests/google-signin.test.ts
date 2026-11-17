@@ -285,7 +285,13 @@ describe('a new person on a hosted installation', () => {
     const cookie = created.headers.get('set-cookie')?.split(';', 1)[0];
     const session = await (await fetch(`${base}/api/session`, { headers: { cookie: cookie! } })).json() as any;
     const [personal] = (await store.listOrganizations(session.user.id));
-    expect(await store.computeTrial(personal!.id)).toMatchObject({ userId: session.user.id, creditMicros: 5_000_000 });
+    const trial = await store.computeTrial(personal!.id);
+    expect(trial).toMatchObject({ userId: session.user.id, creditMicros: 5_000_000 });
+    // The setup guide shows the trial, but it finishes no step: they bought no plan.
+    const guide = await (await fetch(`${base}/api/user/onboarding?organizationId=${personal!.id}`, { headers: { cookie: cookie! } })).json() as any;
+    expect(guide.trial).toEqual({ creditMicros: 5_000_000, endsAt: trial!.endsAt, agents: false });
+    expect(guide.steps.compute).toEqual({ complete: false, managed: false, own: false });
+    expect(guide.completedRequired).toBe(0);
     // A second organization of the same person starts without one.
     const second = await fetch(`${base}/api/organizations`, { method: 'POST', headers: { cookie: cookie!, 'content-type': 'application/json', origin: base },
       body: JSON.stringify({ name: 'Side Gig' }) });

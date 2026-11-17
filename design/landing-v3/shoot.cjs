@@ -16,10 +16,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const LOOKS = ['light', 'dark'];
 let browser, api;
 
+// How a task goes: one task, the launch video, written down, at work, then in review.
 const PROMPTS = {
-  write: 'Update my CV to include tavya under my list of projects',
-  work: 'Fill in slides.md with content from README.md and the experimental results.',
-  review: fs.readFileSync('/tmp/demo/assets/815-prompt.md', 'utf8'),
+  video: 'Create a launch video for tavya.io that shows just how great it is',
   errand: 'Book me the cheapest direct flight to London on January 3 with reasonable timings. My passport, loyalty card numbers etc. are in this folder.',
 };
 
@@ -127,37 +126,52 @@ const VAULT = [
     fs.writeFileSync(path.join(laptop, 'admin-docs/documents/passport.pdf'), '%PDF-1.4\n% demo\n');
     fs.writeFileSync(path.join(laptop, 'admin-docs/documents/loyalty-programmes.md'), '# Loyalty programmes\n\n- United MileagePlus: XX000000 (demo)\n');
     spawnSync('node', [tavya, 'add', 'documents'], { cwd: path.join(laptop, 'admin-docs'), env });
-    for (const id of ['triage-issues', 'build-planned-issues', 'repair-github-workflow'])
-      await api.post(`${APP}/api/projects/${projects.tavya}/task-store/${id}`, { data: {}, headers: { origin: APP } });
+    // The automations an autonomous company runs on (dependency updates and Dream are being built: mocked here).
+    for (const a of [
+      { title: 'Fix errors in deployment', prompt: 'An error was reported on the server: find its cause, fix it, and ship the fix.', params: { repeatable: true, triggers: [{ kind: 'event', type: 'errors.new', recurring: true }] } },
+      { title: 'Update dependencies', prompt: 'A dependency published a new version: bump it, adapt the code to what changed, run the tests, and open a pull request.', params: { repeatable: true, triggers: [{ kind: 'event', type: 'dependency.released', recurring: true }] } },
+      { title: 'Dream', prompt: 'Go over what happened since the last dream: tidy the wiki\'s memories, notice what keeps going wrong, and propose improvements.', params: { repeatable: true, triggers: [{ kind: 'schedule', cron: '0 3 * * *', recurring: true }] } },
+    ]) await api.post(`${APP}/api/projects/${projects.tavya}/tasks`, { data: a, headers: { origin: APP } });
+    await api.post(`${APP}/api/projects/${projects.tavya}/task-store/project-wiki`, { data: {}, headers: { origin: APP } });
 
+    // The video the launch-video task attaches (script.py): the film, from its title card on, so its thumbnail is that card.
+    if (process.env.FILM) spawnSync('ffmpeg', ['-loglevel', 'error', '-y', '-ss', '1.6', '-i', process.env.FILM, '-c:v', 'libx264', '-crf', '28', '-c:a', 'aac', '/tmp/demo/assets/launch-v1.mp4']);
     // The tasks the stills show, started at once.
-    await start(driver, 'takehomev2', PROMPTS.work);
-    await start(driver, 'tavya', PROMPTS.review);
+    await start(driver, 'tavya', PROMPTS.video);
+    const video = await findTask('tavya', 'Create a launch video');
     await start(driver, 'admin_docs', PROMPTS.errand, 500);
-    await waitFor('takehomev2', 'Fill in slides.md', () => true);
-    await sleep(6000); // its steps arrive, then it keeps working
-    await waitFor('tavya', '## usability overhaul', (v) => v.stage === 'review');
+    await waitFor('tavya', 'Create a launch video', (v) => v.stage === 'review');
     const errand = await waitFor('admin_docs', 'Book me the cheapest', (v) => (v.stage === 'review' || v.waitingFor) && true);
     await sleep(4000);
 
     for (const look of LOOKS) {
       const { ctx, page } = await context(look);
       // 1 · Write it down: a task typed in plain words.
-      const ta = await newForm(page, 'personal-website');
-      await ta.fill(PROMPTS.write); await sleep(500);
+      const ta = await newForm(page, 'tavya');
+      await ta.fill(PROMPTS.video); await sleep(500);
       await crop(page, 'write', look, [page.locator('#tf-page .form-row').first(), page.locator('#tf-page [data-row="agent:do"]')], { pad: 18 });
       await page.keyboard.press('Escape'); await sleep(800);
       await dropDrafts();
-      // 2 · An agent does it: steps arriving while it works.
-      const work = await findTask('takehomev2', 'Fill in slides.md');
-      await go(page, `/personal/takehomev2/tasks/${work.num}`, 2500);
-      await crop(page, 'work', look, [page.locator('.msg.user').last(), page.locator('.fold-head', { hasText: 'Working' }).last()], { pad: 22, minH: 470, maxH: 560 });
-      // 3 · You review the result: the proof it attached.
-      const review = await findTask('tavya', '## usability overhaul');
-      await go(page, `/personal/tavya/tasks/${review.num}`, 2500);
-      const card = page.locator('.review-tiles, .review-card, #review-actions').filter({ visible: true }).first();
-      await card.scrollIntoViewIfNeeded(); await sleep(600);
-      await crop(page, 'review', look, [card, page.getByRole('button', { name: /Confirm/ }).first()], { pad: 22 });
+      // 2 · An agent does it: the same task again, caught a dozen steps in while it works.
+      await start(driver, 'tavya', PROMPTS.video);
+      const work = await findTask('tavya', 'Create a launch video');
+      await sleep(6000);
+      await go(page, `/personal/tavya/tasks/${work.num}`, 1500);
+      // Its steps from the first (the landing shows a shot's top left; the thread follows the newest).
+      await page.evaluate(() => { for (const el of document.querySelectorAll('#tp-body, #tp-body .ck-thread')) el.scrollTop = 0; });
+      await sleep(250);
+      const steps = page.locator('.fold-head').last();
+      await crop(page, 'work', look, [steps], { pad: 22, minH: 470, maxH: 560, spanOf: page.locator('.msg.user').last().locator('xpath=..') });
+      // 3 · You review the result: the video it attached. A real launch video takes hours; the mock's run took seconds.
+      // A shorter window, so Confirm sits just under the result instead of a screen below it.
+      await page.setViewportSize({ width: 1440, height: 800 });
+      await go(page, `/personal/tavya/tasks/${video.num}`, 2500);
+      await page.evaluate(() => { for (const l of document.querySelectorAll('.fold-label')) if (l.textContent.startsWith('Worked ')) l.textContent = 'Worked 2 h 40 min'; });
+      await sleep(400);
+      // The attached video at the top (the landing shows a shot's top left), Confirm under it.
+      const result = page.locator('.msg.agent.review-info').last();
+      await crop(page, 'review', look, [result, page.getByRole('button', { name: /Confirm/ }).first()], { pad: 22 });
+      await page.setViewportSize({ width: 1440, height: 900 });
       // Big jobs fan out: a review that became 25 sub-tasks.
       await go(page, '/personal/tavya/tasks/367', 2500);
       await crop(page, 'fan-out', look, [page.locator('.rail-sec.subtasks')], { pad: 10, maxH: 520 });
@@ -169,6 +183,21 @@ const VAULT = [
       // The autonomous company: tasks that start themselves.
       await go(page, '/personal/tavya?q=is%3Aseries%20-is%3Aarchived', 1800);
       await crop(page, 'automations', look, [page.locator('.task-title').first(), page.locator('.task-title').last()], { pad: 26, spanOf: page.locator('.task-title').first().locator('xpath=ancestor::*[contains(@class,"task-row") or self::li or self::article][1]') });
+      // The autonomous company: a new project made fully autonomous (task #918 builds the toggle: drawn here as it looks there).
+      await go(page, '/personal?q=-is%3Aarchived', 900);
+      await page.locator('#new-project').click();
+      await page.locator('#new-project-name').waitFor(); await sleep(400);
+      await page.locator('#new-project-name').fill('acme');
+      await page.evaluate(() => {
+        const actions = document.querySelector('.new-project-dialog .new-project-actions');
+        const row = document.createElement('label');
+        row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:14px 0;margin:4px 0 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);color:var(--ink);font-size:var(--fs-14)';
+        row.innerHTML = '<input type="checkbox" class="toggle" checked> Fully autonomous project <span style="color:var(--ink-3)">ⓘ</span>';
+        actions.parentElement.insertBefore(row, actions);
+      });
+      await sleep(500);
+      await crop(page, 'autonomous', look, [page.locator('.new-project-dialog')], { pad: 0 });
+      await page.keyboard.press('Escape'); await sleep(400);
       // Any model: the model picker.
       await newForm(page, 'tavya');
       await page.locator('#tf-page .model-field input[aria-label="Model"]').first().click(); await sleep(1200);
@@ -179,14 +208,6 @@ const VAULT = [
       await go(page, `/personal/admin_docs/tasks/${errand.num}`, 2500);
       await crop(page, 'errand', look, [page.locator('.msg.agent', { hasText: 'United login' }).last(), page.getByRole('button', { name: /^(Allow for this task|This task)$/ }).first()], { pad: 22 });
       await ctx.close();
-      // On your phone: the list and a task.
-      const phone = await context(look, { width: 390, height: 844 }, 3);
-      await go(phone.page, '/personal?q=-is%3Aarchived', 2000);
-      await phone.page.screenshot({ path: path.join(OUT, `phone-list-${look}.png`) });
-      await go(phone.page, `/personal/admin_docs/tasks/${errand.num}`, 2500);
-      await phone.page.screenshot({ path: path.join(OUT, `phone-task-${look}.png`) });
-      console.log('shot', `phone-*-${look}`);
-      await phone.ctx.close();
     }
   } catch (e) { failed = e; console.error('shoot failed:', e); await driver.screenshot({ path: path.join(OUT, 'failure.png') }).catch(() => {}); }
   await browser.close();

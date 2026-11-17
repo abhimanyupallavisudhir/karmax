@@ -54,6 +54,7 @@ import { spawnReplacementProcess, worldLandedInCheckout } from './util/live-rest
 import { EntitlementQueueReconciler } from './platform/entitlement-queue-reconciler.js';
 import { beginRuntimeLifecycle, endRuntimeLifecycle } from './util/runtime-lifecycle.js';
 import type { WorldHandle } from './world/types.js';
+import type { KarmaxEvent } from './domain/types.js';
 
 const VERSION = '1.0.0';
 
@@ -396,7 +397,7 @@ async function main() {
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows,
     authorization, defaultAgentProvider: provider, hosted: deployment.hosted, hostLocal: deployment.hostLocal,
     providerConnections, worlds,
-    worldAccess, runners, worldLifecycle, resources, objects: objectStore, broker, githubApp, bus, projectFiles,
+    worldAccess, runners, worldLifecycle, resources, objects: objectStore, broker, configHomes, githubApp, bus, projectFiles,
     refreshCredentialHealth: async (task, credentialProvider, options) => {
       if (!credentialProvider) return;
       const { retryCredentials } = await import('./agent/credential-health.js');
@@ -553,6 +554,7 @@ async function main() {
   const { closeComputeMonths } = await import('./world/managed-compute.js');
   // Every ten minutes: the grace of a huge parked disk can be a few hours.
   const { syncAllIncludedModelUsage } = await import('./agent/included-model.js');
+  const { pruneGatewayTokens } = await import('./agent/model-gateways.js');
   const computeNoticeTimer = new AsyncInterval(async () => {
     // What the included model's keys spent first, so the credit below is current.
     await syncAllIncludedModelUsage(store, broker);
@@ -560,7 +562,9 @@ async function main() {
     publicUrl: process.env.KARMAX_PUBLIC_URL, userEmail: async (userId) => (await identity.userById(userId))?.email ?? undefined,
     siteName: async () => siteNameOf((await store.getSettings('global', 'appearance'))),
     hibernate: (worlds) => worldLifecycle.hibernateForCompute(worlds) });
-    await closeComputeMonths(store); await store.pruneComputeHolds(); }, 10 * 60_000);
+    await closeComputeMonths(store); await store.pruneComputeHolds();
+    // Model-gateway proxy tokens of turns that never ended cleanly (wiki features/model-gateways).
+    await pruneGatewayTokens(store); }, 10 * 60_000);
   computeNoticeTimer.unref();
   startupJobs.push(() => computeNoticeTimer.run());
   // Auto top-up: settle top-ups under way and buy one where credit runs low.
@@ -741,17 +745,36 @@ async function main() {
     log: (m) => console.warn('  • ' + m) });
   api.setChatReplies(chatReplies);
   bus.onAny((event) => { if (event.type === 'view.updated') void chatReplies.observe(event).catch((e) => console.warn('  • chat reply failed:', String(e))); });
+  // A trigger's gate (wiki features/events-and-automations § Gate): one model
+  // reply on the organization's credit decides whether an event starts a run.
+  const { createTriggerGate } = await import('./platform/trigger-gate.js');
   const triggerScheduler = new TriggerScheduler({
     store,
     bus,
     fire: createTriggerFire(api, tokens),
     tell: createTriggerTell(api, tokens),
+    gate: createTriggerGate({
+      organizationOf: async (projectId) => (await store.getProject(projectId))?.organizationId ?? 'org_personal',
+      text: async (organizationId, request, task) => {
+        const generation = await import('./agent/generation.js');
+        return (await generation.generate({ store, broker, configHomes }, organizationId, { kind: 'text', effort: 'low', ...request }, task)).text;
+      },
+    }),
     announce: (event, runId, how) => chatReplies.announce(event, runId, how),
     log: (m) => console.log('  • ' + m),
   });
   api.setTriggerArmer(triggerScheduler);
   startupJobs.push(async () => {
-    if (!shuttingDown) await triggerScheduler.start();
+    if (shuttingDown) return;
+    // Error reports (wiki features/error-reports): the fixer saved before bugs
+    // had a task each gets today's trigger, and a new revision says what it shipped.
+    const { upgradeErrorFixer } = await import('./platform/error-fixer.js');
+    const { recordDeploy } = await import('./platform/error-reports.js');
+    await upgradeErrorFixer(store, async () => undefined).then((upgraded) => { if (upgraded) console.log('  • error reports: the fixer now keeps one task per bug'); })
+      .catch((error) => console.warn('  • error reports: could not upgrade the fixer:', error instanceof Error ? error.message : String(error)));
+    await triggerScheduler.start();
+    await recordDeploy(store).then((event) => { if (event) triggerScheduler.projectEventRecorded(event); })
+      .catch((error) => console.warn('  • could not record this deploy:', error instanceof Error ? error.message : String(error)));
   });
   worldLifecycle.start();
   delivery.start();
@@ -897,7 +920,12 @@ async function main() {
   // Node invocation after the task has had time to settle in Temporal. Dev mode
   // already has tsx's watcher and must not spawn a second successor.
   let sourceRestartScheduled = false;
-  bus.onAny(async (event) => {
+  // The bus calls listeners synchronously and drops what they return, so this
+  // async one handles its own failure: a store read refused here must not
+  // become a rejection nothing handles (tavya-error 898a8a05d25ae93e's class).
+  bus.onAny((event) => { void restartAfterLiveSourceMerge(event).catch((error) =>
+    console.warn(`  • Could not check whether task ${event.taskId} changed the live checkout:`, error)); });
+  async function restartAfterLiveSourceMerge(event: KarmaxEvent): Promise<void> {
     if (sourceRestartScheduled || process.env.npm_lifecycle_event === 'dev'
       || event.type !== 'view.updated'
       || (event.payload as { status?: string } | undefined)?.status !== 'done') return;
@@ -909,7 +937,7 @@ async function main() {
     sourceRestartScheduled = true;
     console.log(`  • Task ${event.taskId} updated the live checkout; scheduling a graceful restart`);
     setTimeout(() => { void shutdown(true, `live-source-merge:${event.taskId}`); }, 1500).unref();
-  });
+  }
   // Capture precedes worker startup, but polling follows every subscriber.
   // Durable rows retain events emitted during coordinator/bootstrap recovery.
   if (separateWorker) eventRelay = await ForeignEventRelay.create(store, bus, {

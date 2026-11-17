@@ -18,13 +18,14 @@ import type { GitConnection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import type { WorkerHeap } from '../temporal/worker-process.js';
 import { readReconciliation } from '../store/object-reconciliation.js';
+import { INCLUDED_MODEL_MANAGEMENT_HANDLE } from '../agent/included-model.js';
 import { GITHUB_CALLS_METER, GITHUB_SAVED_METER, githubCallLabel } from '../integrations/github-http.js';
 import {
-  agentMailUsage, cloudflareR2Usage, cloudflareWorkersUsage, composioUsage, daytonaUsage, e2bUsage, githubUsage,
+  agentMailUsage, openRouterUsage, cloudflareR2Usage, cloudflareWorkersUsage, composioUsage, daytonaUsage, e2bUsage, githubUsage,
   hostUsage, managedStorageUsage, NotConnected, NotNeeded, type ProbeReading, type ProbeResult,
 } from './service-limit-probes.js';
 
-export type MeterUnit = 'count' | 'bytes' | 'hours';
+export type MeterUnit = 'count' | 'bytes' | 'hours' | 'usd';
 /** The period a meter's usage accrues over; `now` is a gauge. */
 export type MeterWindow = 'day' | 'month' | 'week' | 'hour' | 'now';
 export type UsedSource = 'api' | 'count' | 'host';
@@ -81,6 +82,12 @@ export const SERVICE_CATALOG: ServiceSpec[] = [
       { id: 'composio.accounts', label: 'Connected accounts', unit: 'count', window: 'now', source: 'api',
         tip: 'Accounts people have connected. No Composio plan limits them.' },
     ] },
+  { id: 'openrouter', name: 'OpenRouter', plan: 'Prepaid',
+    link: { url: 'https://openrouter.ai/settings/credits', label: 'Add credits' },
+    tip: 'The included model, Claude Code and Codex on the credit, and generated text, images, video and speech are paid from this OpenRouter balance. When it runs out they stop for every organization. Turn on auto top-up at OpenRouter to refill it from a card.',
+    connect: 'Save the OpenRouter management key under Installation → Managed compute → Included model.',
+    meters: [{ id: 'openrouter.credits', label: 'Credits spent', unit: 'usd', window: 'now', source: 'api',
+      tip: 'Spent of all the credits bought on the account. A top-up raises the limit.' }] },
   { id: 'e2b', name: 'E2B', plan: 'Hobby',
     link: { url: 'https://console.e2b.dev/?tab=billing', label: 'Upgrade' },
     tip: 'Task sandboxes run on this E2B account. Hobby runs 20 at once and pauses each after an hour; Pro runs 100 for 24 hours.',
@@ -450,6 +457,11 @@ export class ServiceLimitsService {
         const apiKey = await secret(COMPOSIO_KEY_HANDLE);
         if (!apiKey) throw new NotConnected();
         return composioUsage({ fetch: fetcher, apiKey, toolCalls: await store.serviceUsageSince('composio.tool-calls', month) });
+      },
+      openrouter: async (fetcher) => {
+        const apiKey = await secret(INCLUDED_MODEL_MANAGEMENT_HANDLE);
+        if (!apiKey) throw new NotConnected();
+        return openRouterUsage({ fetch: fetcher, apiKey, base: this.env.KARMAX_OPENROUTER_API_URL });
       },
       e2b: async (fetcher) => {
         if (!this.deps.providerConnections) throw new NotConnected();

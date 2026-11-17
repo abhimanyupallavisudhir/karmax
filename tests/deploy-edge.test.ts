@@ -483,7 +483,7 @@ describe('previews on their own domain, under one wildcard certificate', () => {
     const script = read('karmax');
     const update = script.slice(script.indexOf('cmd_update() {'), script.indexOf('\n}\n', script.indexOf('cmd_update() {')));
     expect(update.indexOf('preview_tls_ready')).toBeGreaterThan(update.indexOf('ensure_secrets'));
-    expect(update.indexOf('preview_tls_ready')).toBeLessThan(update.indexOf('build_images --pull'));
+    expect(update.indexOf('preview_tls_ready')).toBeLessThan(update.indexOf('if ! candidate_images; then'));
     const doctor = script.slice(script.indexOf('cmd_doctor() {'), script.indexOf('\n}\n', script.indexOf('cmd_doctor() {')));
     expect(doctor).toContain('preview_tls_ready');
     // A changed Caddy image reaches the running edge only if updates build it.

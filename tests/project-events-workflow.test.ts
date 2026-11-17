@@ -75,6 +75,59 @@ describe('project events start runs (real gateway + Temporal)', () => {
     expect(fork!.params.followUpTriggers).toMatchObject([{ type: 'deploy.*' }]);
   }, 180_000);
 
+  // wiki features/events-and-automations § Keys: an error is an event keyed by
+  // which error it is. One task per key, for good.
+  it('keeps one task per error: repeats are counted, and the error coming back carries its finished task on', async () => {
+    const series = await createSeries({ title: 'Fix: {{summary ?? "an error"}}', workflow: 'just-do', prompt: '@write fix.txt :: fixed',
+      params: { repeatable: true, confirm: { layers: [] },
+        triggers: [{ kind: 'event', type: 'app.error', recurring: true, concurrency: { key: '{{$key}}', mode: 'continue' } }] } });
+    const report = async (times: number) => {
+      let last: { event: { id: string; count: number }; duplicate: boolean } | undefined;
+      for (let i = 0; i < times; i++) {
+        const response = await fetch(`${base}/api/projects/${projectId}/events`, { method: 'POST', headers: auth(),
+          body: JSON.stringify({ type: 'app.error', key: 'checkout-null', payload: { summary: 'checkout failed', customer: `c${i % 3}` }, distinct: ['customer'] }) });
+        expect(response.status, await response.clone().text()).toBeLessThan(300);
+        last = (await response.json()) as typeof last;
+      }
+      await scheduler.sweepProjectEvents();
+      await scheduler.drain();
+      return last!;
+    };
+    const keys = async () => ((await (await fetch(`${base}/api/tasks/${series.id}/keys`, { headers: auth() })).json()) as
+      { keys: Array<{ key: string; taskId?: string; state: string; seen: number; task?: { status: string } }> }).keys;
+
+    expect(await report(1)).toMatchObject({ duplicate: false, event: { count: 1 } });
+    await expect.poll(async () => (await runsOf(series.id)).length, { timeout: 30_000 }).toBe(1);
+    const [run] = await runsOf(series.id);
+    expect(run!.title).toBe('Fix: checkout failed');
+    // It keeps happening: counted on the one event, and no second task.
+    expect(await report(3)).toMatchObject({ duplicate: true, event: { count: 4 } });
+    expect(await runsOf(series.id)).toHaveLength(1);
+    await expect.poll(async () => (await h.store.getTask(run!.id))?.lastView?.status, { timeout: 60_000 }).toBe('done');
+    expect(await keys()).toMatchObject([{ key: 'checkout-null', taskId: run!.id, state: 'run', task: { status: 'done' } }]);
+    const event = (await (await fetch(`${base}/api/projects/${projectId}/events?type=app.error`, { headers: auth() })).json() as
+      Array<{ count: number; distinct?: Record<string, string[]> }>)[0]!;
+    expect(event).toMatchObject({ count: 4, distinct: { customer: ['c0', 'c1', 'c2'] } });
+
+    // Its task changed nothing, so a few more say nothing new; tenfold does:
+    // the same line of work carries on, as a run of the series, key and all.
+    await report(6);
+    await expect.poll(async () => (await runsOf(series.id)).length, { timeout: 30_000 }).toBe(2);
+    const carried = (await runsOf(series.id)).find((task) => task.id !== run!.id)!;
+    expect(carried.params.prompt).toMatch(/came again after it finished: 9 more times/);
+    expect((carried.params['agent:do'] as any)?.resumeFrom ?? (carried.params['agent:unified'] as any)?.resumeFrom).toMatchObject({ taskId: run!.id });
+    expect(await keys()).toMatchObject([{ key: 'checkout-null', taskId: carried.id, seen: 10 }]);
+
+    // A key freed from its task (a wrong grouping, split) starts a task of its own the next time.
+    const released = await fetch(`${base}/api/tasks/${series.id}/keys?key=checkout-null`, { method: 'DELETE', headers: auth() });
+    expect(await released.json()).toEqual({ released: true });
+    await report(1);
+    await expect.poll(async () => (await runsOf(series.id)).length, { timeout: 30_000 }).toBe(3);
+    const fresh = (await runsOf(series.id)).find((task) => task.id !== run!.id && task.id !== carried.id)!;
+    expect(fresh.params.prompt).toMatch(/^@write fix\.txt :: fixed/);
+    expect((await keys())[0]).toMatchObject({ key: 'checkout-null', taskId: fresh.id });
+  }, 240_000);
+
   it('turns a signed webhook delivery into a run that carries the event', async () => {
     const series = await createSeries({ title: 'Fix {{title}}', prompt: 'Investigate the alert.',
       params: { triggers: [{ kind: 'event', type: 'sentry.alert', where: { level: { in: ['error', 'fatal'] } }, recurring: true }] } });

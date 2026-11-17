@@ -1181,10 +1181,19 @@ export class RemoteSpawnedProcess extends EventEmitter {
     // Tolerate providers that forward Node's exit(code, signal) verbatim.
     const ending: WorldPtyTermination | undefined = typeof termination === 'string' ? { signal: termination }
       : termination && typeof termination === 'object' ? termination : undefined;
-    const signal = ending && 'signal' in ending ? ending.signal : null;
     if (ending && 'lost' in ending) this.lost = new Error(
       `lost the connection to the agent in the sandbox; it may still be running there (${ending.lost.message})`,
       { cause: ending.lost });
+    // A world that names neither a code nor a signal for a process we did not
+    // stop does not know how it ended either.
+    else if (code === null && !(ending && 'signal' in ending) && !this.killed) this.lost = new Error(
+      'lost the connection to the agent in the sandbox; it may still be running there (the process ended without an exit status)');
+    // A child process always ends with a code or a signal, and the Agent SDK
+    // relies on it: after an exit with neither it waits for an `exit` event
+    // that has already been emitted, so its stream never ended and no abort
+    // could end it (pramana#137, 2026-11-09: a turn "working" for six hours
+    // after its machine was stopped). A lost connection is a hangup.
+    const signal = ending && 'signal' in ending ? ending.signal : this.lost ? 'SIGHUP' : code === null ? 'SIGKILL' : null;
     // Only the launcher exits so before the agent has said anything.
     if (code === REMOTE_CLI_UNAVAILABLE && this.startup && !this.received.snapshot().length && this.packageSpec)
       this.unavailable = new RemoteAgentCliUnavailable(this.packageSpec);

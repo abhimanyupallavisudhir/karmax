@@ -33,7 +33,7 @@ global.taskRecord = () => undefined;
 global.projectById = (id) => id === 'project_1' ? { id, name: 'App' } : undefined;
 global.projectBase = () => '/personal/app';
 
-for (const name of ['policyTip', 'credentialRequestTaskLink', 'credentialChoices', 'credentialRequestRows', 'requestReasonLine', 'subTaskAskLine', 'permissionRequestRows', 'ignoredChip', 'ignoreRequestButton', 'defaultTaskTab']) eval(extractFn(name));
+for (const name of ['policyTip', 'credentialRequestTaskLink', 'credentialChoices', 'credentialRequestRows', 'requestReasonLine', 'subTaskAskLine', 'permissionAskTitle', 'permissionRequestRows', 'ignoredChip', 'ignoreRequestButton', 'defaultTaskTab']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
@@ -90,6 +90,12 @@ const scopeRows = permissionRequestRows([{ ...permission, capabilities: [], proj
   baseAuthorization: { level: 'developer' } }]);
 ok(scopeRows.includes('proj_second&lt;script&gt;') && !scopeRows.includes('<script>'), 'project scopes are visible and escaped');
 ok(scopeRows.includes('Allowing gives this task its developer access in these projects too.'), 'scope approval explains its full effect');
+// Task #904: a request that only adds a project read "these 0 permissions and projects?" over an empty chip row.
+ok(scopeRows.includes('Give the agent access to this project?') && !scopeRows.includes('approval-request-caps'),
+  'a project-only request asks for access to the project, with no empty capability row');
+ok(permissionAskTitle({ capabilities: [], projectIds: ['a', 'b'] }) === 'Give the agent access to these 2 projects?', 'several projects are counted');
+ok(permissionRows.includes('Give the agent these 2 permissions?'), 'a capability request counts its permissions');
+ok(permissionAskTitle({ capabilities: ['x'], projectIds: ['a'] }) === 'Give the agent this permission and projects?', 'both are named');
 
 ok(defaultTaskTab({ approvalRequests: 1, actions: [] }) === 'checkin', 'a task needing approval opens its conversation, where the request waits');
 ok(defaultTaskTab({ approvalRequests: 0, actions: [{ name: 'confirm', enabled: true }] }) === 'checkin', 'review-only tasks retain the Check-in default');

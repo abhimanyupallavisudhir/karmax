@@ -1,4 +1,4 @@
-import type { AgentSpec, TaskRecord } from '../domain/types.js';
+import type { AgentSpec, AuthorizationSelection, TaskRecord } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { VaultItems } from '../autonomy/vault-items.js';
 import { allows, attenuate, CHILD_TASK_CEILING, withoutCapabilities, type Capability } from './capabilities.js';
@@ -6,7 +6,8 @@ import { PermissionRequests } from './permission-requests.js';
 import { authorizingAvatar, avatarAllows, avatarAuthorizationCapabilities, avatarForRole, avatarRoleFor } from './avatars.js';
 import type { AuthorizationService } from './authorization.js';
 import type { TokenAuthority } from './tokens.js';
-import { delegatedFromParent } from './delegation.js';
+import { DELEGATED_PROFILE, delegatedFromParent, delegatingAncestors } from './delegation.js';
+import type { VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
 
 /** What a task may do and where (SPEC §8.2): its capabilities and the scope
  * its tokens are minted for. No scope ⇒ the task's own project. */
@@ -17,7 +18,9 @@ export interface TaskAuthority {
   organizationId?: string;
 }
 
-type StoredAuthorization = Partial<TaskAuthority> & { principal?: string; heldBack?: Capability[] };
+type StoredAuthorization = Partial<TaskAuthority> & { principal?: string; heldBack?: Capability[];
+  /** A sub-task's projects approved beyond its parent's scope (`request_permission`). */
+  addedProjectIds?: string[] };
 
 const scopeOf = (from: Partial<TaskAuthority> | undefined) => ({
   ...(from?.scope ? { scope: from.scope } : {}),
@@ -37,14 +40,84 @@ export async function baseTaskAuthority(store: Store, authorization: Authorizati
   const seen = options.seen ?? new Set<string>();
   const stored = task.params?._authorization as StoredAuthorization | undefined;
   const own = { capabilities: stored?.capabilities ?? options.grant ?? [], ...scopeOf(stored) };
-  if (!delegatedFromParent(task) || seen.has(task.parentTaskId)) return own;
+  if (!delegatedFromParent(task)) return own;
+  const added = (scope: TaskAuthority) => withProjects(scope, stored?.addedProjectIds, task.projectId);
+  if (seen.has(task.parentTaskId)) return added(own);
   const parentTask = await store.getTask(task.parentTaskId);
-  if (!parentTask) return own;
+  if (!parentTask) return added(own);
   const parent = await taskAuthorityNow(store, authorization, parentTask, { seen: new Set([...seen, task.id]) });
   const mergeBack = own.capabilities.filter((cap) => cap.startsWith('merge-into:') && allows(parent.capabilities, cap));
   // What a sub-task without a computer holds back, its parent's authority does not bring back.
-  return { capabilities: withoutCapabilities([...new Set([...attenuate(CHILD_TASK_CEILING, parent.capabilities), ...mergeBack])],
-    stored?.heldBack ?? []), ...scopeOf(parent) };
+  return added({ capabilities: withoutCapabilities([...new Set([...attenuate(CHILD_TASK_CEILING, parent.capabilities), ...mergeBack])],
+    stored?.heldBack ?? []), ...scopeOf(parent) });
+}
+
+/** A scope widened by more projects. An organization or global scope already
+ * holds them; no scope means the task's own project. */
+function withProjects(authority: TaskAuthority, projectIds: string[] | undefined, ownProjectId: string): TaskAuthority {
+  if (!projectIds?.length || authority.scope === 'organization' || authority.scope === 'global') return authority;
+  const base = authority.scope === 'projects' && authority.projectIds?.length ? authority.projectIds : [ownProjectId];
+  return { ...authority, scope: 'projects', projectIds: [...new Set([...base, ...projectIds])] };
+}
+
+/**
+ * The grants a task's own record carries, in the shape a new task is created
+ * with: the stored selection (level/scope/projects — the elevated one if a
+ * human approved a mid-task authorization request), its per-task vault
+ * credential caps and the policies chosen for them. A legacy record that only
+ * carries a `profileId` still maps to a level. A sub-task's record names no
+ * level (`inherited-child` is a placeholder), so it has none here:
+ * `taskGrants` gives the one it acts with.
+ */
+export function previousTaskGrants(task: TaskRecord): {
+  authorization?: AuthorizationSelection;
+  credentialGrants: string[];
+  credentialPolicies: VaultTaskPolicyOverrides;
+} {
+  const stored = task.params?._authorization as {
+    level?: string; profileId?: string; scope?: AuthorizationSelection['scope']; projectIds?: string[];
+    capabilities?: string[]; credentialPolicies?: VaultTaskPolicyOverrides;
+  } | undefined;
+  const level = stored?.level ?? stored?.profileId;
+  return {
+    ...(level && level !== DELEGATED_PROFILE ? { authorization: {
+      level,
+      scope: stored?.scope ?? 'projects',
+      ...(stored?.scope === 'organization' || stored?.scope === 'global' ? {}
+        : { projectIds: stored?.projectIds?.length ? stored.projectIds : [task.projectId] }),
+    } } : {}),
+    credentialGrants: (stored?.capabilities ?? []).filter((capability) => capability.startsWith('use-credential:')),
+    credentialPolicies: stored?.credentialPolicies ?? {},
+  };
+}
+
+/**
+ * The selection (level, scope, projects) a task acts with: its own, or for a
+ * sub-task the level of the task it is delegated from, across the scope it
+ * holds now (its parent's, with the projects approved for it since). None for
+ * a sub-task whose delegating tasks are gone.
+ */
+export async function taskSelection(store: Store, authorization: AuthorizationService | undefined,
+  task: TaskRecord): Promise<AuthorizationSelection | undefined> {
+  if (!delegatedFromParent(task)) return previousTaskGrants(task).authorization;
+  const root = (await delegatingAncestors(store, task.id)).at(-1);
+  const level = root && !delegatedFromParent(root) ? previousTaskGrants(root).authorization?.level : undefined;
+  if (!level) return undefined;
+  const held = await baseTaskAuthority(store, authorization, task);
+  return held.scope === 'organization' || held.scope === 'global' ? { level, scope: held.scope }
+    : { level, scope: 'projects', projectIds: held.scope === 'projects' && held.projectIds?.length ? held.projectIds : [task.projectId] };
+}
+
+/** `previousTaskGrants` with the selection a task acts with (`taskSelection`)
+ * and, for a sub-task, the vault credentials it holds through its parent. */
+export async function taskGrants(store: Store, authorization: AuthorizationService | undefined,
+  task: TaskRecord): Promise<ReturnType<typeof previousTaskGrants>> {
+  const own = previousTaskGrants(task);
+  if (!delegatedFromParent(task)) return own;
+  const selection = await taskSelection(store, authorization, task);
+  const held = await baseTaskAuthority(store, authorization, task);
+  return { ...own, ...(selection ? { authorization: selection } : {}),
+    credentialGrants: held.capabilities.filter((capability) => capability.startsWith('use-credential:')) };
 }
 
 /**

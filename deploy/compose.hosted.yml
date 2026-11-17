@@ -42,10 +42,6 @@ services:
       KARMAX_S3_ENDPOINT: ${KARMAX_S3_ENDPOINT:?set S3 endpoint}
       KARMAX_S3_BUCKET: ${KARMAX_S3_BUCKET:?set S3 bucket}
       KARMAX_S3_REGION: ${KARMAX_S3_REGION:-us-east-1}
-      # Optional installation authorization boundary for platform-funded model
-      # rails. Empty keeps managed model admission disabled regardless of org UI.
-      KARMAX_MANAGED_MODEL_REQUEST_CEILINGS: ${KARMAX_MANAGED_MODEL_REQUEST_CEILINGS:-}
-      KARMAX_MANAGED_MODEL_PRICING: ${KARMAX_MANAGED_MODEL_PRICING:-}
       KARMAX_S3_ACCESS_KEY_ID_FILE: /run/secrets/s3_access_key
       KARMAX_S3_SECRET_ACCESS_KEY_FILE: /run/secrets/s3_secret_key
       # The Cloudflare Worker sandboxes save resources through (wiki features/resource-storage).

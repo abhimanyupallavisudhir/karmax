@@ -25,6 +25,14 @@ export class ValidationError extends Error {
   status = 400;
 }
 
+/** The request contradicts the current state of what it names (an update
+ * that would change a vault item's type, a decision already taken). A 409:
+ * the caller's to resolve, never a server fault. */
+export class ConflictError extends Error {
+  code = 'conflict';
+  status = 409;
+}
+
 /**
  * A whole-form save meant for a draft or an armed task reached it after it
  * started (its trigger fired meanwhile): its params are now the workflow's,

@@ -90,6 +90,36 @@ describe('agent permission approval requests', () => {
     } finally { clock.mockRestore(); }
   });
 
+  it('lets a pending request be withdrawn, once, and never one decided or being decided', async () => {
+    const store = (await Store.create(':memory:'));
+    const service = new PermissionRequests(store, 'org_personal');
+    const ask = (capability: string) => service.request({ taskId: 'task', projectId: 'home', role: 'do',
+      capabilities: [capability], audience: ['@owners'], recipients: ['owner'],
+      reason: 'Inspect settings.', requestedBy: 'task-agent:task:do' });
+
+    const first = (await ask('settings:read'));
+    const withdrawn = (await service.withdraw(first.id, 'task-agent:task:do', 'Found another way.'));
+    expect(withdrawn).toMatchObject({ status: 'withdrawn',
+      withdrawn: { by: 'task-agent:task:do', reason: 'Found another way.', at: expect.any(Number) } });
+    expect((await service.requests({ status: 'pending' }))).toEqual([]);
+    await expect(service.resolve(first.id, { action: 'approve', by: 'user:owner' })).rejects.toThrow(/already withdrawn/);
+    expect((await service.extensionCaps('task'))).toEqual([]);
+    // Again: nothing changes, and the first reason stays.
+    expect((await service.withdraw(first.id, 'task-agent:task:do', 'Twice.')).withdrawn?.reason).toBe('Found another way.');
+    // The same ask afterwards is a new request, not the withdrawn one.
+    expect((await ask('settings:read')).id).not.toBe(first.id);
+
+    const granted = (await ask('settings:write'));
+    (await service.resolve(granted.id, { action: 'approve', by: 'user:owner' }));
+    expect((await service.withdraw(granted.id, 'task-agent:task:do', 'Too late.'))).toMatchObject({ status: 'granted' });
+    expect((await service.extensionCaps('task', 'do'))).toEqual(['settings:write']);
+
+    const deciding = (await ask('task:edit'));
+    expect((await service.claim(deciding.id))).toEqual(expect.any(String));
+    await expect(service.withdraw(deciding.id, 'task-agent:task:do', 'Racing.')).rejects.toThrow(/in progress/);
+    await expect(service.withdraw('preq_missing', 'task-agent:task:do', 'x')).rejects.toThrow(/no permission request/);
+  });
+
   it('rejects wildcard and unknown capability requests', async () => {
     const requests = new PermissionRequests((await Store.create(':memory:')), 'org_personal');
     const base = {

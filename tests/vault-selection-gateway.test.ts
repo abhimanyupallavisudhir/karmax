@@ -56,7 +56,7 @@ describe('credential selection ranking through HTTP', () => {
           body: JSON.stringify({ itemId: frequent.id, field, selector: '#pw' }),
         });
         expect(fill.status).toBe(400);
-        expect((await fill.json() as any).error).toMatch(/login fields|domains/);
+        expect((await fill.json() as any).error).toMatch(/browser fill types|domains/);
       }
 
       const task = await store.createTask({ projectId: project.id, title: 'Fill', workflow: 'just-do', workflowVersion: '1', params: { prompt: '' } });
