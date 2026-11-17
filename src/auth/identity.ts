@@ -1,5 +1,6 @@
 import { noteExternalEffect } from '../store/transaction-effects.js';
 import { identitySqliteDatabase } from '../store/identity-sqlite.js';
+import { keepLostConnectionsCaught } from '../store/async-sql.js';
 import { betterAuth } from 'better-auth';
 import { admin, genericOAuth } from 'better-auth/plugins';
 import { getMigrations } from 'better-auth/db/migration';
@@ -197,6 +198,7 @@ export class IdentityService {
     // listener that 'error' event crashes the process (DB-18). The pool
     // replaces the connection on the next query.
     this.pool?.on('error', error => console.error('[identity] idle PostgreSQL connection failed:', error.message));
+    if (this.pool) keepLostConnectionsCaught(this.pool);
     this.sqlite = this.pool ? undefined : identitySqliteDatabase(this.db);
     // Same durability pragmas the metadata store uses (src/store/db.ts): karmax
     // runs the gateway, the worker and every activity in one process, so a
