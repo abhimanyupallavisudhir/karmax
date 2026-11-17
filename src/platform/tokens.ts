@@ -2,6 +2,8 @@ import crypto from 'node:crypto';
 import { Capability, allows, attenuate, OWN_TASK_CAPABILITIES } from './capabilities.js';
 import type { TaskRecord } from '../domain/types.js';
 import type { Store } from '../store/db.js';
+import { DELEGATION_NO_EXPIRY } from '../domain/delegation-expiry.js';
+export { DELEGATION_NO_EXPIRY };
 
 export type TokenActor =
   | { kind: 'interactive-human'; userId: string }
@@ -40,8 +42,9 @@ export interface HumanDelegation {
 export const DELEGATION_RENEW_WITHIN_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
- * A task's human delegation that lapsed on its own: it expired (they last
- * 30 days), or it was withdrawn. Said so that whoever reads it knows what to
+ * A task's human delegation that lapsed on its own: it expired (one made
+ * before delegations stopped expiring, or with an explicit TTL), or it was
+ * withdrawn. Said so that whoever reads it knows what to
  * do: the person it acts for renews it by acting on the task (a Retry, a
  * message: `KarmaxApi.renewLapsedDelegations`).
  */
@@ -338,7 +341,7 @@ export class TokenAuthority {
     externalIdentities?: ExternalIdentityClaims; parentDelegationId?: string; ttlMs?: number; maxExpiresAt?: number;
   }): Promise<HumanDelegation> {
     const issuedAt = Date.now();
-    const expiresAt = Math.min(issuedAt + (args.ttlMs ?? 30 * 24 * 60 * 60 * 1000), args.maxExpiresAt ?? Number.MAX_SAFE_INTEGER);
+    const expiresAt = Math.min(args.ttlMs ? issuedAt + args.ttlMs : DELEGATION_NO_EXPIRY, args.maxExpiresAt ?? DELEGATION_NO_EXPIRY);
     const record: HumanDelegation = {
       id: `dlg_${crypto.randomBytes(12).toString('hex')}`, taskId: args.taskId, humanUserId: args.humanUserId,
       projectId: args.projectId, projectIds: args.projectIds?.length ? [...new Set(args.projectIds)] : undefined,

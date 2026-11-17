@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { AuthorizationService } from '../src/platform/authorization.js';
 import { KarmaxApi } from '../src/platform/api.js';
-import { HumanDelegationLapsed, TokenAuthority } from '../src/platform/tokens.js';
+import { DELEGATION_NO_EXPIRY, HumanDelegationLapsed, TokenAuthority } from '../src/platform/tokens.js';
+import { personGrantNow } from '../src/platform/task-authority.js';
+import { allows } from '../src/platform/capabilities.js';
 import type { TaskView } from '../src/domain/types.js';
 import { isDelegationLapseOfItsOwn } from '../src/domain/escalation.js';
 
@@ -291,5 +293,92 @@ describe('a task\'s human delegation', () => {
       await api.signalTask(await userToken('alice'), run.id, 'retry');
       expect(await delegationOf(run.id)).toBe(fresh.id);
     });
+  });
+});
+
+/**
+ * A task's permission to act for a person no longer runs out by the clock
+ * (#977, #982: every run of a series stopped a month after its person last
+ * touched it). What bounds it is live instead: a turn holds no more than the
+ * person who authorized it can do now.
+ */
+describe('a task\'s human delegation without expiry', () => {
+  let store: Store;
+  let tokens: TokenAuthority;
+  let organizationId: string;
+  let projectId: string;
+  beforeEach(async () => {
+    store = await Store.create(':memory:');
+    tokens = new TokenAuthority(store);
+    organizationId = (await store.createOrganization({ name: 'Acme', ownerUserId: 'alice' })).id;
+    projectId = (await store.createProject('Site', {}, organizationId)).id;
+  });
+  afterEach(async () => {
+    vi.useRealTimers();
+    await store.close();
+  });
+  const alice = async () => (await tokens.mintPrincipal('user:alice', ['task:read', 'task:create'], projectId, 60_000, organizationId)).token;
+  const turn = (taskId: string, delegationId: string) => tokens.mint({ taskId, profileId: 'do', role: 'do', principal: 'user:alice',
+    projectId, organizationId, ceiling: ['task:read'], grantorCaps: ['task:read'], delegationId });
+
+  it('still acts for its person a year later, and so does a run derived from it', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const series = await store.createTask({ projectId, title: 'Series', workflow: 'software-dev', workflowVersion: '1.30.0',
+      createdBy: { kind: 'user', userId: 'alice' }, params: { prompt: 'x' } });
+    const delegation = (await tokens.delegateHuman(await alice(), { taskId: series.id, projectId, organizationId }))!;
+    expect(delegation.expiresAt).toBe(DELEGATION_NO_EXPIRY);
+    vi.setSystemTime(Date.now() + 365 * 86_400_000);
+    expect((await turn(series.id, delegation.id)).record.humanSubject?.userId).toBe('alice');
+    const run = await store.createTask({ projectId, title: 'Run', workflow: 'software-dev', workflowVersion: '1.30.0',
+      createdBy: { kind: 'user', userId: 'alice' }, params: { prompt: 'x' } });
+    const derived = await tokens.deriveHumanDelegation(delegation.id, { taskId: run.id, projectId, organizationId });
+    expect((await turn(run.id, derived.id)).record.humanSubject?.userId).toBe('alice');
+  });
+
+  it('is made to last for those made before, expired or not, but not revoked ones', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const make = async (title: string) => {
+      const task = await store.createTask({ projectId, title, workflow: 'software-dev', workflowVersion: '1.30.0',
+        createdBy: { kind: 'user', userId: 'alice' }, params: { prompt: title } });
+      // As every delegation was made until 2026-11-17: for 30 days.
+      return { task, delegation: (await tokens.delegateHuman(await alice(), { taskId: task.id, projectId, organizationId, ttlMs: 30 * 86_400_000 }))! };
+    };
+    const lapsed = await make('Lapsed');
+    const live = await make('Live');
+    const revoked = await make('Revoked');
+    await tokens.revokeTaskDelegation(revoked.task.id);
+    vi.setSystemTime(Date.now() + 31 * 86_400_000);
+    await expect(turn(lapsed.task.id, lapsed.delegation.id)).rejects.toThrow(HumanDelegationLapsed);
+
+    expect(await store.extendDelegationsWithoutExpiry()).toBe(2);
+    vi.setSystemTime(Date.now() + 365 * 86_400_000);
+    expect((await turn(lapsed.task.id, lapsed.delegation.id)).record.humanSubject?.userId).toBe('alice');
+    expect((await turn(live.task.id, live.delegation.id)).record.humanSubject?.userId).toBe('alice');
+    await expect(turn(revoked.task.id, revoked.delegation.id)).rejects.toThrow(/withdrawn/);
+  });
+
+  it('acts with no more than its person can do now', async () => {
+    const authorization = await AuthorizationService.create(store);
+    await store.setOrganizationMembership(organizationId, 'bob', 'member');
+    await store.setProjectMembership(projectId, { kind: 'user', userId: 'bob' }, 'admin');
+    const selection = { level: 'maintainer', scope: 'projects' as const, projectIds: [projectId] };
+    const granted = (await authorization.taskGrant('user:bob', projectId, selection)).capabilities;
+    const stored = { ...selection, principal: 'user:bob', capabilities: granted };
+    expect(await personGrantNow(authorization, stored, projectId)).toEqual(granted);
+
+    // Lowered to a reviewer: the task loses what bob can no longer grant.
+    await store.setProjectMembership(projectId, { kind: 'user', userId: 'bob' }, 'reviewer');
+    const lowered = await personGrantNow(authorization, stored, projectId);
+    expect(lowered.length).toBeLessThan(granted.length);
+    expect(granted.filter((capability) => !allows(lowered, capability)).length).toBeGreaterThan(0);
+
+    // Removed from the organization: nothing of his is left to act with.
+    await store.removeProjectMembership(projectId, { kind: 'user', userId: 'bob' });
+    await store.removeOrganizationMembership(organizationId, 'bob');
+    expect(await personGrantNow(authorization, stored, projectId)).toEqual([]);
+
+    // Anyone else's grant (an Avatār's, a legacy one without a level) is left as it is.
+    expect(await personGrantNow(authorization, { ...stored, principal: 'avatar:x' }, projectId)).toEqual(granted);
+    expect(await personGrantNow(authorization, { principal: 'user:bob', capabilities: granted }, projectId)).toEqual(granted);
   });
 });

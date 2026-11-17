@@ -75,7 +75,7 @@ import { VaultItems, removeTurnKeys, turnKeyDirectory } from '../autonomy/vault-
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { authorizingAvatar, avatarAllows, avatarAuthorizationCapabilities, avatarForRole, avatarPrincipal, avatarRoleFor } from '../platform/avatars.js';
 import { DELEGATED_PROFILE, delegatedFromParent } from '../platform/delegation.js';
-import { baseTaskAuthority, delegationReaching, taskAuthorityNow, tokenScopeOf } from '../platform/task-authority.js';
+import { baseTaskAuthority, delegationReaching, personGrantNow, taskAuthorityNow, tokenScopeOf } from '../platform/task-authority.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
 import { recordedBase, worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js';
 import { pullRequestHandle, pullRequestView, isPullRequestView, proposalCheckouts } from '../world/pr-view.js';
@@ -1677,6 +1677,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       ?? (delegated ? { ...preparationTask?.params?._authorization as object, ...delegated } : preparationTask?.params?._authorization)) as {
       capabilities?: string[];
       principal?: string;
+      level?: string;
       scope?: 'projects' | 'organization' | 'global';
       projectIds?: string[];
       organizationId?: string;
@@ -1705,7 +1706,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       ? chosen ? attenuate(chosen.capabilities ?? [], avatarGrant) : avatarGrant
       : authorizingAvatarId
         ? attenuate(storedAuthorization?.capabilities ?? [], authorizingAvatarBackingCaps)
-        : storedAuthorization?.capabilities ?? args.task.grant ?? DEFAULT_GRANT;
+        // (A sub-task's came from its parent's authority now, already so bounded.)
+        : (await personGrantNow(deps.authorization, delegated ? undefined : storedAuthorization, args.task.projectId,
+          storedAuthorization?.capabilities ?? args.task.grant ?? DEFAULT_GRANT));
     const grant = [...new Set([
       ...principalGrant,
       ...(avatar ? [] : (await orgVaultItems.extensionCaps(args.taskId))),

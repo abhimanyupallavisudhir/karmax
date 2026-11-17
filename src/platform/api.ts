@@ -2494,7 +2494,8 @@ export class KarmaxApi {
    * A person acting on a task (a Retry, a message, Run again on a series)
    * renews its permission to act for them when it lapsed or is about to: the
    * task's own delegation and each agent's. A delegation tavya minted must
-   * never strand a task (they last 30 days, and a turn mints from one), and
+   * never strand a task (one from before delegations stopped expiring may
+   * have lapsed, and a turn mints from one), and
    * the person it acts for, here now, is the consent it needs. Only that
    * person, and only while they still hold the task's stored authority;
    * anyone else leaves it as it is (the turn then says who renews it).
@@ -2853,7 +2854,7 @@ export class KarmaxApi {
       taskId: target.id, ...tokenScopeOf(sourceAuthorization, target.projectId,
         (await this.deps.store.getProject(target.projectId))?.organizationId),
     }).catch(async (error: unknown) => {
-      // The source's lapsed (a series nobody ran by hand for 30 days): the copy
+      // The source's lapsed (one from before delegations stopped expiring): the copy
       // keeps naming it, so its first turn says so and the person's Retry
       // renews it (renewLapsedDelegations), instead of the copy never starting.
       if (await this.deps.tokens.delegationLapsing(sourceDelegation, source.id)) return undefined;
