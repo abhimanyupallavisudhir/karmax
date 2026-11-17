@@ -100,7 +100,7 @@ import {
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
 import type { TaskTemplateContent } from '../domain/task-templates.js';
-import { normalizeFollowUpTriggers, type FollowUpTrigger } from '../domain/triggers.js';
+import { normalizeFollowUpTriggers, taskUnstarted, type FollowUpTrigger } from '../domain/triggers.js';
 import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, EVENT_DISTINCT_VALUES, EVENT_OCCURRENCE_BYTES, EVENT_RECENT_OCCURRENCES,
   boundEventPayload, valuesAtPath, type EventFollow, type EventOccurrence, type KeyedRun, type ProjectEvent, type ProjectEventClaim, type ProjectEventRecord,
   type ProjectEventClaimState } from '../domain/project-events.js';
@@ -4661,20 +4661,21 @@ export class Store {
    * Write the shared Review route of a logical task. It is shared across attempts
    * (activities/core.ts) — never per-attempt — so this is the only writer.
    *
-   * The draft-only guard exists because the *task form* has no idea whether a live
-   * attempt's gate has already played. `inFlight` is the caller (KarmaxApi.updateParams)
+   * The unstarted-only guard exists because the *task form* has no idea whether a live
+   * attempt's gate has already played; one that has not started (a draft, a task
+   * waiting for its trigger, a series, whose runs each copy the route) has none. `inFlight` is the caller (KarmaxApi.updateParams)
    * saying the live workflow itself accepted the edit, which means it authoritatively
    * had not consumed the route yet: the route is `untilUsed`, not `queue` (SPEC §4.5/§5.5).
    */
   async setIntentConfirmer(intentId: string, field: string, confirmer: unknown, opts?: { inFlight?: boolean }) {
     return this.db.transaction(async () => {
-    // Whether every attempt is still a draft is decided under their rows.
+    // Whether every attempt is still unstarted is decided under their rows.
     if (this.db.dialect === 'postgres') (await this.db.prepare('SELECT id FROM tasks WHERE intentId = ? ORDER BY id FOR UPDATE').all(intentId));
     (await this.lockIntent(intentId));
 
     const attempts = (await this.attemptsOf(intentId));
     const group = (await this.attemptGroup(intentId));
-    if (!opts?.inFlight && attempts.some((a) => !a.params.draft)) {
+    if (!opts?.inFlight && attempts.some((a) => !taskUnstarted(a.params))) {
       // Full-form replacement includes disabled controls too. Re-sending the
       // existing shared value is harmless; only an actual divergence is locked.
       if (JSON.stringify(group?.confirmer) === JSON.stringify(confirmer)) return;

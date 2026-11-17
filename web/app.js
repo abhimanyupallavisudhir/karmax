@@ -457,6 +457,12 @@ function feedbackFetch(input, opts = {}) {
 // A live repeatable series: the row its runs nest under. A draft is not one,
 // even with Repeatable ticked: it shows (and runs) as a draft. Mirrors isSeries
 // in src/domain/triggers.ts.
+// Not started work of its own: a draft, a task waiting for its trigger, or a
+// series (its runs work, each a task of its own). Its form may still change
+// anything, who reviews it included (src/domain/triggers.ts taskUnstarted).
+function taskUnstarted(params) {
+  return !!params && (!!params.draft || params.triggerState === 'armed' || !!params.repeatable);
+}
 function isSeries(params) {
   return !!params?.repeatable && !params?.draft;
 }
@@ -10305,7 +10311,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     inheritedAuthority: mainAuthority });
   wireFieldResets($('#tf-body'), fields);
   const confirmerFrozen = !!draft?.id
-    && !!formAttemptGroup?.attempts?.some((a) => !a.params?.draft);
+    && !!formAttemptGroup?.attempts?.some((a) => !taskUnstarted(a.params));
   if (confirmerFrozen) {
     const confirmer = fields.find((f) => f.type === 'confirmer');
     const row = confirmer && $('#tf-body')?.querySelector(`[data-row="${CSS.escape(confirmer.name)}"]`);

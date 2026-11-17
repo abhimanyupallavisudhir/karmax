@@ -195,6 +195,13 @@ export function followUpTriggerSummary(triggers: FollowUpTrigger[]): string {
       : (t.tasks?.length === 1 ? 'a task' : `${t.tasks?.length ?? 0} tasks`)).join(', ');
 }
 
+/** A task that has not started work of its own: a draft, one waiting for its
+ *  trigger, or a repeatable series (only its runs work, each a task of its own).
+ *  Its params, review route included, may still change as a form's do. */
+export function taskUnstarted(params: { draft?: unknown; triggerState?: unknown; repeatable?: unknown } | undefined): boolean {
+  return !!params && (!!params.draft || params.triggerState === 'armed' || !!params.repeatable);
+}
+
 /** Does this task want to be gated behind a trigger (vs starting immediately)? */
 export function hasActiveTriggers(params: unknown): boolean {
   return normalizeTriggers(params).length > 0;
