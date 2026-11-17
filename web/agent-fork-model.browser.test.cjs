@@ -94,6 +94,18 @@ const assert = require('node:assert/strict');
     await page.waitForFunction(() => !document.querySelector('.af-resume-reuse-model').checked);
     assert.deepEqual(await read(), { ...original, ...pointer('confirm') }, 'missing metadata leaves the selection intact');
     assert.match(await page.locator('.toast.err').last().innerText(), /unavailable/);
+    // The Fork button opens the form with only the source ({resumeFrom}): the
+    // field shows the model the task inherits, not the harness's bare default,
+    // and that is what the fork keeps.
+    const inheritedAgent = { provider: 'opencode', model: 'openrouter/z-ai/glm-5', effort: 'high' };
+    await page.evaluate(({ source, inheritedAgent }) => {
+      const t = window.forkTest;
+      t.S.tasks = [source];
+      document.querySelector('#app').innerHTML = t.renderAgentField({ role: 'do' }, { resumeFrom: { taskId: source.id, role: 'do' } }, inheritedAgent);
+      t.wireAgentBox(document.querySelector('.agent-field'));
+    }, { source, inheritedAgent });
+    assert.doesNotMatch(await page.locator('.agent-field').innerText(), /Default model/);
+    assert.deepEqual(await read(), { ...inheritedAgent, ...pointer('do') }, 'a fork runs on the inherited agent');
     // Forking an Avatar one may call acts with its authorization: the agent's
     // Authorization row says so, and stops saying so once the fork is cleared.
     await page.evaluate(({ original }) => {
