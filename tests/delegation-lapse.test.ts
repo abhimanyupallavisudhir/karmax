@@ -4,7 +4,7 @@ import { AuthorizationService } from '../src/platform/authorization.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import { HumanDelegationLapsed, TokenAuthority } from '../src/platform/tokens.js';
 import type { TaskView } from '../src/domain/types.js';
-import { isExpiredDelegationEscalation } from '../src/domain/escalation.js';
+import { isDelegationLapseOfItsOwn } from '../src/domain/escalation.js';
 
 /**
  * A human delegation tavya minted for a task must never strand it with a
@@ -110,8 +110,8 @@ describe('a task\'s human delegation', () => {
     expect(failure).toBeInstanceOf(HumanDelegationLapsed);
     expect(String((failure as Error).message)).toMatch(/permission to act for .* expired on 2026-11-15.*Retry/);
     // The person's to renew, so not reported as tavya's error; one withdrawn still is.
-    expect(isExpiredDelegationEscalation(`Activity task failed → ${(failure as Error).message}`)).toBe(true);
-    expect(isExpiredDelegationEscalation(new HumanDelegationLapsed('dlg_x').message)).toBe(false);
+    expect(isDelegationLapseOfItsOwn(`Activity task failed → ${(failure as Error).message}`)).toBe(true);
+    expect(isDelegationLapseOfItsOwn(new HumanDelegationLapsed('dlg_x').message)).toBe(false);
   });
 
   // tavya-error dbf20980640bd94b, 2026-11-17: a series' delegation expired on
@@ -129,15 +129,39 @@ describe('a task\'s human delegation', () => {
     await store.purgeHumanDelegations();
     const lapse = async (delegationId: string) => String(((await turn(series.id, delegationId).catch((error: unknown) => error)) as Error).message);
     expect(await lapse(expired.id)).toMatch(/expired on 2026-11-16\b/);
-    expect(isExpiredDelegationEscalation(`Activity task failed → ${await lapse(expired.id)}`)).toBe(true);
+    expect(isDelegationLapseOfItsOwn(`Activity task failed → ${await lapse(expired.id)}`)).toBe(true);
     expect(await lapse(withdrawn.id)).toMatch(/was withdrawn/);
     // What is kept says nothing of the person or what they allowed.
     const kept = await store.db.prepare('SELECT json FROM human_delegations WHERE id IN (?, ?)').all(expired.id, withdrawn.id) as Array<{ json: string }>;
     expect(kept.map((row) => row.json)).toEqual(['{}', '{}']);
-    // Forgotten after a year: a lapse then says only what it can.
+    // Forgotten after a year: a lapse then says only what it can — that it lapsed, the
+    // person's to renew — never a withdrawal nothing shows, which is reported as tavya's error.
     vi.setSystemTime(new Date('2027-11-18T00:00:00Z'));
     await store.purgeHumanDelegations();
     expect(await store.db.prepare('SELECT id FROM human_delegations WHERE id IN (?, ?)').all(expired.id, withdrawn.id)).toEqual([]);
+    for (const id of [expired.id, withdrawn.id]) {
+      expect(await lapse(id)).toMatch(/permission to act for the person who authorized it has lapsed\. It is renewed when that person presses Retry/);
+      expect(isDelegationLapseOfItsOwn(`Activity task failed → ${await lapse(id)}`)).toBe(true);
+    }
+  });
+
+  // tavya-error dbf20980640bd94b again, 2026-11-17 12:56 UTC, after the tombstones deployed:
+  // "Repair GitHub workflow Promote" (#977) ran from a series whose delegation the sweep had
+  // deleted before there were tombstones. A missing row shows no withdrawal; a revoked row does.
+  it('says a delegation purged before tombstones has lapsed, and only a revoked one was withdrawn', async () => {
+    const series = await task('Repair GitHub workflow');
+    const purged = (await tokens.delegateHuman(await alice(), { taskId: series.id, projectId, organizationId }))!;
+    await store.db.prepare('DELETE FROM human_delegations WHERE id=?').run(purged.id);
+    const failure = await turn(series.id, purged.id).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(HumanDelegationLapsed);
+    expect((failure as Error).message).toMatch(/has lapsed\./);
+    expect(isDelegationLapseOfItsOwn(`Activity task failed → ${(failure as Error).message}`)).toBe(true);
+    const other = await task('Other');
+    const revoked = (await tokens.delegateHuman(await alice(), { taskId: other.id, projectId, organizationId }))!;
+    await store.revokeHumanDelegationsForTask(other.id);
+    const withdrawal = String(((await turn(other.id, revoked.id).catch((error: unknown) => error)) as Error).message);
+    expect(withdrawal).toMatch(/was withdrawn/);
+    expect(isDelegationLapseOfItsOwn(`Activity task failed → ${withdrawal}`)).toBe(false);
   });
 
   describe('renewed by the person it acts for', () => {

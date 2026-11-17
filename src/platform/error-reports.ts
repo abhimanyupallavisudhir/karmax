@@ -103,6 +103,11 @@ export function ownFrames(stack: string | undefined, limit = FINGERPRINT_FRAMES)
 /** The first frame of tavya's own code. */
 export function ownFrame(stack: string | undefined): string | undefined { return ownFrames(stack, 1)[0]; }
 
+/** Errors that say only what state a service tavya needs was in (tavya's
+ * database out of reach, or full), which every call site running then meets
+ * alike: each is one bug by its name, wherever and however it surfaced. */
+const CONDITIONS = new Set(['DatabaseUnavailableError', 'DatabaseCapacityError', 'DatabaseQueueTimeoutError']);
+
 /**
  * One bug, one fingerprint. Where the error was thrown says which bug it is
  * better than what it said: one throw site words its message per case ("the
@@ -111,6 +116,7 @@ export function ownFrame(stack: string | undefined): string | undefined { return
  * its name and those frames; only one without is its kind, name and message.
  */
 export function errorFingerprint(kind: string, name: string, message: string, stack?: string): string {
+  if (CONDITIONS.has(name)) return crypto.createHash('sha256').update(`condition\n${name}`).digest('hex').slice(0, 16);
   const frames = ownFrames(stack);
   return crypto.createHash('sha256').update((frames.length ? [name, ...frames] : [kind, name, normalizeErrorMessage(message)]).join('\n'))
     .digest('hex').slice(0, 16);

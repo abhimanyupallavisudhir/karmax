@@ -60,6 +60,21 @@ describe('error fingerprints', () => {
     expect(ownFrames(vault)).toEqual(['src/autonomy/vault.ts VaultStore.read', 'src/autonomy/broker.ts Broker.open']);
   });
 
+  it('are one bug for an error that says only that a service tavya needs was out of reach, whichever call site met it', () => {
+    // 2026-11-17 13:02 UTC: a deploy restarted PostgreSQL under the running app, and two
+    // call sites that happened to query it became two keys and two fixer tasks (#978, #979).
+    const reconcile = at('Store.kvEntries (/app/src/store/db.ts:11326:11)', 'ServiceConnections.reconcile (/app/src/integrations/service-connections.ts:694:22)');
+    const request = at('Store.getCollaborationRequest (/app/src/store/db.ts:7103:18)', 'Timeout._onTimeout (/app/src/platform/api.ts:8103:24)');
+    const outage = errorFingerprint('rejection', 'DatabaseUnavailableError', 'database unavailable: the database system is shutting down', reconcile);
+    expect(errorFingerprint('request', 'DatabaseUnavailableError', 'database unavailable: getaddrinfo ENOTFOUND postgresql', request)).toBe(outage);
+    expect(errorFingerprint('escalation', 'DatabaseUnavailableError', 'Activity task failed → database unavailable: Connection terminated unexpectedly')).toBe(outage);
+    // Running out of room is another condition than being out of reach, and a bug at those sites is still its own.
+    expect(errorFingerprint('rejection', 'DatabaseCapacityError', 'database request capacity exceeded', reconcile))
+      .toBe(errorFingerprint('request', 'DatabaseCapacityError', 'database request capacity exceeded', request));
+    expect(errorFingerprint('rejection', 'DatabaseCapacityError', 'x', reconcile)).not.toBe(outage);
+    expect(errorFingerprint('rejection', 'Error', 'the database system is shutting down', reconcile)).not.toBe(outage);
+  });
+
   it('never carry a credential the error text did', () => {
     const text = scrubSecrets('push to https://x-access-token:ghs_abcdefghijklmnop1234@github.com/o/r failed; header Bearer abcdefghijklmnopqrstuvwx; key sk-ant-api03-abcdefghijkl');
     expect(text).not.toMatch(/ghs_abcdefghijklmnop1234|abcdefghijklmnopqrstuvwx|sk-ant-api03/);

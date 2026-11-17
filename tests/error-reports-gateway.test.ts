@@ -140,6 +140,22 @@ describe('error reports through the gateway', () => {
     expect((await call(tokenFor.operator!, 'PUT', '/api/settings/error-reports', { projectId: null })).status).toBe(200);
   });
 
+  // 2026-11-17, day one of #965 on tavya.io: a report was dated by the task's view, which
+  // keeps changing after its failure; when its status last changed was never read.
+  it('dates a report by when the task\'s status changed, when its view changed since', async () => {
+    expect((await call(tokenFor.operator!, 'PUT', '/api/settings/error-reports', { projectId: ops.id })).status).toBe(200);
+    const project = await store.createProject('later');
+    const task = await store.createTask({ projectId: project.id, title: 'old', workflow: 'software-dev', workflowVersion: '1.30.0', params: { prompt: 'p' } });
+    const failedAt = Date.parse('2026-09-27T00:54:56Z');
+    await store.saveView(task.id, { taskId: task.id, title: 'old', workflow: 'software-dev', stage: 'do', status: 'blocked', error: 'Activity task failed → boom',
+      messages: [], actions: [], state: {}, updatedAt: failedAt + 3 * 86_400_000 } as any);
+    await store.db.prepare('UPDATE tasks SET statusChangedAt=? WHERE id=?').run(failedAt, task.id);
+    expect(await (await call(tokenFor.operator!, 'POST', '/api/error-reports', { taskId: task.id })).json()).toEqual({ reported: true });
+    const [reported] = (await store.listProjectEvents(ops.id)).filter((event) => event.type === ERROR_EVENT_TYPE && event.payload.taskId === task.id);
+    expect(reported).toMatchObject({ occurredAt: failedAt });
+    expect((await call(tokenFor.operator!, 'PUT', '/api/settings/error-reports', { projectId: null })).status).toBe(200);
+  });
+
   it('files no report when the client goes away before its request is read', async () => {
     expect((await call(tokenFor.operator!, 'PUT', '/api/settings/error-reports', { projectId: ops.id })).status).toBe(200);
     const reported = vi.spyOn(errorReporter()!, 'report');

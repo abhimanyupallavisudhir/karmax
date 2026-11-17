@@ -44,7 +44,7 @@ import { derivedTaskTitle, isDerivedTaskTitle } from '../domain/task-title.js';
 import { landsByPushOnTavya } from '../domain/hosted-repository.js';
 import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget, type Avatar, type InheritedConversation, type TaskCreatedVia, type TaskCreator } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries,
-  normalizeFollowUpTriggers, validateFollowUpTriggers, followUpTriggerSummary, followUpsAfterFiring, type FollowUpTrigger, type TaskTrigger, isTrigger } from '../domain/triggers.js';
+  normalizeFollowUpTriggers, validateFollowUpTriggers, followUpTriggerSummary, followUpsAfterFiring, taskUnstarted, type FollowUpTrigger, type TaskTrigger, isTrigger } from '../domain/triggers.js';
 import { STORE_TASKS, runsOnInstall, storeTaskNeeds, storeTaskRepeatable, takenFromStore, type StoreNeed, type StoreTask } from '../domain/task-store.js';
 import { EventRunRefused, applyTriggerContext, followUpMessage, normalizeEventInput, type KeyedRun, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventInput, type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
@@ -302,7 +302,7 @@ const acceptedActionKey = (taskId: string) => `accepted-action:${taskId}`;
  * put in a params bag. Mutates and returns `params`. */
 /** A draft, a task armed on a trigger, or a repeatable series: what has no workflow of its own yet. */
 function unstarted(task: Pick<TaskRecord, 'params'> | undefined): boolean {
-  return !!task && (!!task.params?.draft || task.params?.triggerState === 'armed' || !!task.params?.repeatable);
+  return !!task && taskUnstarted(task.params);
 }
 
 function stripPlatformMetadata<T extends Record<string, unknown>>(params: T): T {
@@ -8326,11 +8326,16 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
   private scheduleCollaborationNotification(requestId: string, attempt: number): void {
     if (this.collaborationNotificationRetries.has(requestId)) return;
     this.collaborationNotificationRetries.set(requestId, attempt);
-    const timer = setTimeout(async () => {
+    // Nothing awaits this timer: a failure anywhere in it (the database
+    // restarting, a signal refused) schedules the next attempt, never escapes.
+    // Re-sending is safe: the requester deduplicates by message id.
+    const timer = setTimeout(() => {
       this.collaborationNotificationRetries.delete(requestId);
-      const request = (await this.deps.store.getCollaborationRequest(requestId));
-      if (request && request.status !== 'pending' && !request.notifiedAt)
-        void this.notifyCollaborationRequest(request, attempt);
+      void (async () => {
+        const request = (await this.deps.store.getCollaborationRequest(requestId));
+        if (request && request.status !== 'pending' && !request.notifiedAt)
+          await this.notifyCollaborationRequest(request, attempt);
+      })().catch(() => this.scheduleCollaborationNotification(requestId, attempt + 1));
     }, Math.min(30_000, 500 * 2 ** Math.min(attempt, 6)));
     timer.unref?.();
   }

@@ -14,9 +14,47 @@ export class DatabaseQueueTimeoutError extends Error {
 
 /** A pool checkout that waited out `connectionTimeoutMillis` was never
  * executed: report it as the same retryable admission timeout as the queue. */
-function admissionTimeout(error: unknown): unknown {
-  return error instanceof Error && /timeout exceeded when trying to connect/i.test(error.message)
-    ? new DatabaseQueueTimeoutError() : error;
+/** The database was out of reach — restarting, shutting down, its name not
+ * resolving, the connection cut — so every statement that ran then failed
+ * alike, and none of the call sites is at fault: answered 503, and one bug to
+ * error reports however many places met it (`errorFingerprint`). Keeps the
+ * driver's words and `code` (ECONNREFUSED, 57P01, …). */
+export class DatabaseUnavailableError extends Error {
+  readonly status = 503;
+  readonly code?: string;
+  constructor(cause: Error) {
+    super(`database unavailable: ${cause.message}`);
+    this.name = 'DatabaseUnavailableError';
+    const code = (cause as { code?: unknown }).code;
+    if (typeof code === 'string') this.code = code;
+  }
+}
+
+/**
+ * pg-pool hears a connection's 'error' only while it is idle. One checked out
+ * (a transaction, an ORM's) whose server goes away — a restart, a shutdown —
+ * emits it to nobody: an uncaught exception, which ends the process (main.ts
+ * lets those crash). Its own statements fail anyway, and the pool discards it
+ * on release since it is no longer queryable; so every client has a listener.
+ */
+export function keepLostConnectionsCaught(pool: Pool): void {
+  pool.on('connect', client => { client.on('error', () => { /* its statements fail with it */ }); });
+}
+
+/** Socket errors on the way to the server, SQLSTATE class 08 (connection
+ * exception) and 57P01–57P03 (the server shutting down, crashed, starting up). */
+const UNREACHABLE = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'EHOSTUNREACH', 'ENETUNREACH']);
+function unreachable(error: Error): boolean {
+  const code = (error as { code?: unknown }).code;
+  if (typeof code === 'string') return UNREACHABLE.has(code) || /^08[0-9A-Z]{3}$/.test(code) || /^57P0[123]$/.test(code);
+  return /^Connection terminated\b/.test(error.message); // the driver's own word for a socket that closed
+}
+
+/** What a failed statement or connection says to its caller. */
+function databaseFailure(error: unknown): unknown {
+  if (!(error instanceof Error)) return error;
+  if (/timeout exceeded when trying to connect/i.test(error.message)) return new DatabaseQueueTimeoutError();
+  return unreachable(error) ? new DatabaseUnavailableError(error) : error;
 }
 
 interface TransactionScope { client: PoolClient; active: boolean; pending: number; failure?: unknown }
@@ -57,6 +95,7 @@ export class AsyncPostgres {
       statement_timeout: options.statementTimeoutMs ?? 15_000,
       types: { getTypeParser: (oid, format) => oid === 20 || oid === 1700 ? Number : types.getTypeParser(oid, format) } });
     this.pool.on('error', error => console.error('[postgres] idle connection failed:', error.message));
+    keepLostConnectionsCaught(this.pool);
   }
 
   get stats() { return { pending: this.pending, connections: this.pool.totalCount, waiting: this.pool.waitingCount }; }
@@ -88,12 +127,12 @@ export class AsyncPostgres {
         const result = await (scope?.client ?? this.pool).query<T>(translated.sql!, translated.forcedParams ?? params);
         return result;
       } catch (error) {
-        if (!scope) throw admissionTimeout(error);
+        if (!scope) throw databaseFailure(error);
         // PostgreSQL aborts the transaction after any statement error, even if
         // application code catches it. Never report a silently rolled-back
         // COMMIT as a successful transaction.
-        scope.failure = error;
-        throw error;
+        scope.failure = databaseFailure(error);
+        throw scope.failure;
       }
     };
     // The outer transaction already holds one admission slot. Bound its own
@@ -117,7 +156,7 @@ export class AsyncPostgres {
       return operation();
     }
     return this.admitted(async () => {
-      const client = await this.pool.connect().catch(error => { throw admissionTimeout(error); });
+      const client = await this.pool.connect().catch(error => { throw databaseFailure(error); });
       const scope: TransactionScope = { client, active: true, pending: 0 };
       let broken: Error | undefined;
       try {
@@ -132,7 +171,7 @@ export class AsyncPostgres {
         scope.active = false;
         try { await client.query('ROLLBACK'); }
         catch (rollback) { broken = rollback instanceof Error ? rollback : new Error(String(rollback)); }
-        throw error;
+        throw databaseFailure(error);
       } finally { client.release(broken); }
     });
   }

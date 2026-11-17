@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it } from 'vitest';
-import { AsyncPostgres } from '../src/store/async-sql.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { Pool } from 'pg';
+import { AsyncPostgres, DatabaseUnavailableError, keepLostConnectionsCaught } from '../src/store/async-sql.js';
 
 const url = process.env.KARMAX_TEST_POSTGRES_URL;
 describe.skipIf(!url)('native asynchronous PostgreSQL', () => {
@@ -100,5 +101,58 @@ describe.skipIf(!url)('native asynchronous PostgreSQL', () => {
     await slow;
     await expect(db.query('SELECT * FROM missing_async_fixture')).rejects.toThrow();
     expect(await db.query('SELECT 1 AS ok')).toEqual([{ ok: 1 }]);
+  });
+});
+
+// A database out of reach fails every call site alike: what each meets says so,
+// in one error the gateway answers 503 and error reports count as one bug.
+describe('a database out of reach', () => {
+  let db: AsyncPostgres;
+  afterEach(async () => { await db?.close(); });
+
+  it('is DatabaseUnavailableError, keeping what the driver said', async () => {
+    db = new AsyncPostgres('postgres://nobody:nothing@127.0.0.1:1/none', { max: 1 });
+    const refused = await db.query('SELECT 1').catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(DatabaseUnavailableError);
+    expect(refused).toMatchObject({ name: 'DatabaseUnavailableError', status: 503, code: 'ECONNREFUSED' });
+    expect((refused as Error).message).toMatch(/^database unavailable: .*ECONNREFUSED/);
+    await expect(db.transaction(async () => db.query('SELECT 1'))).rejects.toBeInstanceOf(DatabaseUnavailableError);
+  });
+
+  it.skipIf(!url)('never ends the process when it goes away under a connection someone holds', async () => {
+    // What an ORM's transaction does with a pool (the identity store's better-auth): check a client out.
+    const pool = new Pool({ connectionString: url!, max: 1 });
+    keepLostConnectionsCaught(pool);
+    const uncaught = vi.fn();
+    process.prependListener('uncaughtException', uncaught);
+    try {
+      const client = await pool.connect();
+      await expect(client.query('SELECT pg_terminate_backend(pg_backend_pid())')).rejects.toMatchObject({ code: '57P01' });
+      await new Promise(resolve => setTimeout(resolve, 200));
+      client.release();
+      expect((await pool.query('SELECT 1 AS one')).rows).toEqual([{ one: 1 }]);
+    } finally { process.removeListener('uncaughtException', uncaught); await pool.end(); }
+    expect(uncaught).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(!url)('is so when the server ends the connection, and nothing else is', async () => {
+    db = new AsyncPostgres(url!, { max: 1 });
+    // What a restart or shutdown does to a session: 57P01, "terminating connection due to administrator command".
+    await expect(db.query('SELECT pg_terminate_backend(pg_backend_pid())')).rejects.toMatchObject({ name: 'DatabaseUnavailableError', code: '57P01' });
+    // A transaction's connection is the pool's no longer: its socket closing must not be an
+    // uncaught 'error' event, which ends the process (main.ts lets uncaught exceptions crash).
+    const uncaught = vi.fn();
+    process.prependListener('uncaughtException', uncaught);
+    try {
+      await expect(db.transaction(async () => { await db.query('SELECT pg_terminate_backend(pg_backend_pid())'); }))
+        .rejects.toMatchObject({ name: 'DatabaseUnavailableError', code: '57P01' });
+      await new Promise(resolve => setTimeout(resolve, 200));
+    } finally { process.removeListener('uncaughtException', uncaught); }
+    expect(uncaught).not.toHaveBeenCalled();
+    // The pool replaces the connection, and a statement's own error stays its own.
+    expect(await db.query('SELECT 42 AS answer')).toEqual([{ answer: 42 }]);
+    const wrong = await db.query('SELECT * FROM no_such_table_here').catch((error: unknown) => error);
+    expect(wrong).not.toBeInstanceOf(DatabaseUnavailableError);
+    expect(wrong).toMatchObject({ code: '42P01' });
   });
 });
