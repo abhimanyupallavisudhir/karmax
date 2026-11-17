@@ -7,7 +7,8 @@ const html = `<!doctype html><html><head><link rel="stylesheet" href="/styles.cs
 <script type="module" src="/app.js"></script><script src="https://cdn.example/x.js"></script></head></html>`;
 
 /** A deployed tavya, answering what the suite asks; `override` breaks one route. */
-function fakeTavya(override: Record<string, () => Response> = {}, task: { answers?: boolean } = {}) {
+function fakeTavya(override: Record<string, () => Response> = {},
+  task: { answers?: boolean | 'wrong'; stage?: string } = {}) {
   const calls: Array<{ method: string; route: string; auth?: string; body?: any }> = [];
   let prompt = '';
   const fetchImpl = async (url: string, init: RequestInit) => {
@@ -30,10 +31,11 @@ function fakeTavya(override: Record<string, () => Response> = {}, task: { answer
     if (key === 'POST /api/projects/proj_smoke/tasks') { prompt = body.prompt; return json({ id: 'task_smoke' }); }
     if (key === 'GET /api/tasks/task_smoke/conversation') {
       const [, a, b] = prompt.match(/value of (\d+) \+ (\d+)/) ?? [];
-      const reply = task.answers === false ? 'I cannot.' : String(Number(a) + Number(b));
+      const sum = Number(a) + Number(b);
+      const reply = task.answers === false ? 'I cannot.' : task.answers === 'wrong' ? String(sum * 100 + 7) : String(sum);
       return json({ role: 'do', messages: [{ role: 'user', text: prompt }, { role: 'agent', text: reply }] });
     }
-    if (key === 'GET /api/tasks/task_smoke') return json({ stage: 'do', status: 'active' });
+    if (key === 'GET /api/tasks/task_smoke') return json({ stage: task.stage ?? 'do', status: task.stage === 'review' ? 'waiting' : 'active' });
     return json({ ok: true });
   };
   return { fetchImpl, calls };
@@ -95,6 +97,53 @@ describe('smoke suite', () => {
     expect(silent.calls.some((call) => call.route === '/api/tasks/task_smoke/archive')).toBe(true);
     const anonymous = await runSmoke({ url: 'https://s.example', task: true, fetch: fakeTavya().fetchImpl }, {}, quiet);
     expect(failures(anonymous)).toEqual(['task: a task check needs SMOKE_TOKEN and SMOKE_PROJECT_ID']);
+  });
+
+  it('asks a sum no model gets wrong, whose answer is not in the prompt', async () => {
+    // Production's smoke agent (Claude Haiku, low effort, no tools) answered 8393 + 5514 with 17907
+    // and 8267 + 8997 with 16915 (Promote runs 44083589841 and 44087210378): four-digit sums
+    // test the model's arithmetic, not tavya.
+    for (let i = 0; i < 30; i++) {
+      const { fetchImpl, calls } = fakeTavya();
+      const env = { SMOKE_TOKEN: 'tvp_smoke', SMOKE_PROJECT_ID: 'proj_smoke' };
+      expect(failures(await runSmoke({ url: 'https://s.example', task: true, fetch: fetchImpl }, env, quiet))).toEqual([]);
+      const prompt: string = calls.find((call) => call.route === '/api/projects/proj_smoke/tasks')?.body.prompt;
+      const [, a, b] = prompt.match(/value of (\d+) \+ (\d+)/)!;
+      expect(Number(a)).toBeGreaterThanOrEqual(2);
+      expect(Number(b)).toBeLessThanOrEqual(9);
+      // An echo of the prompt cannot pass: the answer is nowhere in it.
+      expect(prompt).not.toMatch(new RegExp(`(?<!\\d)${Number(a) + Number(b)}(?!\\d)`));
+    }
+  });
+
+  it('fails at once, quoting the reply, when the turn ends with a wrong answer', async () => {
+    const wrong = fakeTavya({}, { answers: 'wrong', stage: 'review' });
+    const env = { SMOKE_TOKEN: 'tvp_smoke', SMOKE_PROJECT_ID: 'proj_smoke' };
+    const started = Date.now();
+    const results = await runSmoke({ url: 'https://s.example', task: true, taskTimeoutMs: 60_000, fetch: wrong.fetchImpl }, env, quiet);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(failures(results)[0]).toMatch(/^task: task task_smoke answered "\d+07", not \d+ \(\d \+ \d\)/);
+    expect(wrong.calls.some((call) => call.route === '/api/tasks/task_smoke/archive')).toBe(true);
+    // Still working: no verdict before the turn ends (the reply may yet come), only the timeout.
+    const working = fakeTavya({}, { answers: 'wrong' });
+    const timedOut = await runSmoke({ url: 'https://s.example', task: true, taskTimeoutMs: 1, fetch: working.fetchImpl }, env, quiet);
+    expect(failures(timedOut)[0]).toMatch(/^task: task task_smoke did not answer/);
+  });
+
+  it('a reply containing the answer only inside a longer number is not the answer', async () => {
+    const env = { SMOKE_TOKEN: 'tvp_smoke', SMOKE_PROJECT_ID: 'proj_smoke' };
+    const padded = fakeTavya({ 'GET /api/tasks/task_smoke/conversation': () => Response.json({ messages: [] }) }, { stage: 'review' });
+    let prompt = '';
+    const fetchImpl = async (url: string, init: RequestInit) => {
+      if (new URL(url).pathname === '/api/projects/proj_smoke/tasks') prompt = JSON.parse(String(init.body)).prompt;
+      if (new URL(url).pathname === '/api/tasks/task_smoke/conversation') {
+        const [, a, b] = prompt.match(/value of (\d+) \+ (\d+)/)!;
+        return Response.json({ messages: [{ role: 'agent', text: `1${Number(a) + Number(b)}1` }] });
+      }
+      return padded.fetchImpl(url, init);
+    };
+    const results = await runSmoke({ url: 'https://s.example', task: true, taskTimeoutMs: 60_000, fetch: fetchImpl }, env, quiet);
+    expect(failures(results)[0]).toMatch(/^task: task task_smoke answered "1\d+1", not/);
   });
 
   it('lists the page assets from its own origin', () => {
