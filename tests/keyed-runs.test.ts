@@ -258,6 +258,52 @@ describe.each(storeBackends)('one task per key ($name)', ({ open }) => {
     expect(await store.keyedRun(fixer.id, 'checkout')).toMatchObject({ taskId: run, liveAt, seen: 11 });
   });
 
+  it('counts an occurrence when it happened: one only heard of after its change went live does not reopen its task', async () => {
+    const fixer = await series({ ...errors, concurrency: { key: '{{$key}}', mode: 'continue', after: { type: 'app.deployed' } } });
+    await start();
+    await occur('checkout');
+    const run = started[0]!.runId;
+    const failedAt = clock.time; // a task showed this error, and still shows it
+    clock.advance(HOUR);
+    await finish(run, landed);
+    clock.advance(MINUTE);
+    await store.recordProjectEvent({ organizationId: 'org_personal', projectId, source: 'user:usr_1', type: 'app.deployed', key: 'd1',
+      occurredAt: clock.time, receivedAt: clock.time, origin: 'external', hops: 0, payload: { commits: ['c0ffee'.padEnd(40, '0')] } });
+    // Days later someone reports what that task showed: it happened before the fix was out.
+    clock.advance(3 * 24 * HOUR);
+    const reported = (await store.recordProjectEvent({ organizationId: 'org_personal', projectId, source: 'user:usr_1', type: 'app.error', key: 'checkout',
+      occurredAt: failedAt, receivedAt: clock.time, origin: 'external', hops: 0, payload: { summary: 'checkout failed' } })).event;
+    await sweep();
+    // Heard now (what keeps it), happened then (what says whether the fix held).
+    expect(reported).toMatchObject({ count: 2, lastSeenAt: clock.time });
+    expect(reported.recent!.at(-1)).toMatchObject({ at: failedAt });
+    expect(heard).toEqual([]);
+    expect(started).toHaveLength(1);
+    // A clock ahead of ours is not believed: it is seen when it is heard.
+    const ahead = (await store.recordProjectEvent({ organizationId: 'org_personal', projectId, source: 'user:usr_1', type: 'app.error', key: 'checkout',
+      occurredAt: clock.time + 365 * 24 * HOUR, receivedAt: clock.time, origin: 'external', hops: 0, payload: {} })).event;
+    expect(ahead.recent!.at(-1)!.at).toBe(clock.time);
+    await sweep();
+    expect(heard).toHaveLength(1);
+    expect((await store.keyedRun(fixer.id, 'checkout'))!.taskId).toBe(run);
+  });
+
+  it('keeps what its gate said on the claim of a run it started', async () => {
+    await series({ ...errors, gate: { prompt: 'Only our own defects.' }, maxRunning: 1 });
+    gate = (ask) => ({ decision: 'start', reason: `${ask.event.key} is a defect in our own code` });
+    await start();
+    const first = await occur('push');
+    const second = await occur('pull');
+    expect(started.map((run) => run.trigger.key)).toEqual(['push']);
+    expect(await store.listProjectEventClaims(first.id)).toMatchObject([{ state: 'started', gated: true, gateReason: 'push is a defect in our own code' }]);
+    // Approved, then queued behind the run at work: it still says why it will start.
+    expect(await store.listProjectEventClaims(second.id)).toMatchObject([{ state: 'deferred', reason: 'queued: 1 of its runs are at work', gateReason: 'pull is a defect in our own code' }]);
+    await finish(started[0]!.runId);
+    await sweep();
+    expect(await store.listProjectEventClaims(second.id)).toMatchObject([{ state: 'started', gateReason: 'pull is a defect in our own code' }]);
+    expect(asked).toHaveLength(2);
+  });
+
   it('takes a change to be live a day after it landed when no event says so', async () => {
     await series({ ...errors, concurrency: { key: '{{$key}}', mode: 'continue', after: { type: 'app.deployed' } } });
     await start();
