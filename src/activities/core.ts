@@ -172,7 +172,7 @@ import {
 import { lifecycleReplacementKey, lifecycleReplacementMatches } from '../platform/lifecycle-replacement.js';
 import { BRAND } from '../domain/brand.js';
 import { ERROR_EVENT_TYPE, reportError, taskFailure } from '../platform/error-reports.js';
-import { isCapacityEscalation, isExpiredDelegationEscalation } from '../domain/escalation.js';
+import { isCapacityEscalation, isDelegationLapseOfItsOwn } from '../domain/escalation.js';
 import { screenEnvironment, skippedEnvNotice, type SkippedEnv } from '../util/work-env.js';
 
 /** How often staging records its progress as a task event. */
@@ -703,7 +703,7 @@ function reportEscalation(task: { id: string; projectId: string; params: Record<
   if (before?.status === 'blocked' && before.error === view.error) return;
   const audience = (view.waitingFor as { audience?: string[] } | undefined)?.audience;
   if (audience?.length === 1 && audience[0] === '@admins') return;
-  if (isCapacityEscalation(view.error) || isExpiredDelegationEscalation(view.error)) return;
+  if (isCapacityEscalation(view.error) || isDelegationLapseOfItsOwn(view.error)) return;
   if ((task.params?.trigger as { type?: string } | undefined)?.type === ERROR_EVENT_TYPE) return;
   // The task says what failed; the activity that failed says where (its stack),
   // which is what tells one bug from another.
