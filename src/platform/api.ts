@@ -45,7 +45,7 @@ import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageR
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries,
   normalizeFollowUpTriggers, validateFollowUpTriggers, followUpTriggerSummary, followUpsAfterFiring, type FollowUpTrigger, type TaskTrigger, isTrigger } from '../domain/triggers.js';
 import { STORE_TASKS, runsOnInstall, storeTaskNeeds, storeTaskRepeatable, takenFromStore, type StoreNeed, type StoreTask } from '../domain/task-store.js';
-import { applyTriggerContext, followUpMessage, normalizeEventInput, type ProjectEvent, type ProjectEventClaim,
+import { applyTriggerContext, followUpMessage, normalizeEventInput, type KeyedRun, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventInput, type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
 import { newId } from '../util/id.js';
 import { IncomingWebhooks, WebhookConfigError, webhookDeliveryKey, type IncomingWebhook, type WebhookPatch } from '../integrations/incoming-webhooks.js';
@@ -3390,13 +3390,15 @@ export class KarmaxApi {
    * (a repeatable series — cron, or any recurring trigger). Re-arms the task on a
    * start failure so a fire is never silently lost.
    */
-  async fireTriggeredTask(token: string, taskId: string, mode: 'self' | 'clone' | 'followUp', trigger?: TriggerContext, cause?: TaskTrigger): Promise<{ startedTaskId: string; told?: true }> {
+  async fireTriggeredTask(token: string, taskId: string, mode: 'self' | 'clone' | 'followUp', trigger?: TriggerContext, cause?: TaskTrigger,
+    /** `followUp`: what to say instead of the trigger's own words. */
+    text?: string): Promise<{ startedTaskId: string; told?: true }> {
     const armed = (await this.deps.store.getTask(taskId));
     const caller = (await this.require(token, 'create_task', { projectId: armed?.projectId, taskId }));
     if (!armed) throw new NotFoundError(`no task ${taskId}`);
 
     if (mode === 'clone') return { startedTaskId: (await this.spawnRun(token, taskId, trigger)).id };
-    if (mode === 'followUp') return this.fireFollowUp(taskId, trigger, cause);
+    if (mode === 'followUp') return this.fireFollowUp(taskId, trigger, cause, text);
 
     // Under the task's lock, from its latest params: an edit of the armed task
     // either lands before (and starts with it) or is refused (writeUnstartedParams).
@@ -3510,6 +3512,8 @@ export class KarmaxApi {
     input: ProjectEventInput): Promise<{ event: ProjectEvent; duplicate: boolean }> {
     const normalized = normalizeEventInput(input, () => newId('key'));
     if ('error' in normalized) throw new ValidationError(normalized.error);
+    // A repeat of the key is counted on its event (`duplicate`), and the
+    // dispatcher's sweep offers it again to the tasks that keep one run per key.
     const { event, created } = (await this.deps.store.recordProjectEvent({
       ...from, ...normalized, occurredAt: normalized.occurredAt ?? Date.now(),
     }));
@@ -3642,8 +3646,8 @@ export class KarmaxApi {
    * restart mid-way loses nothing. A one-shot is used up before the delivery,
    * so a fork made from it does not inherit it.
    */
-  private async fireFollowUp(taskId: string, context: TriggerContext | undefined, cause: TaskTrigger | undefined): Promise<{ startedTaskId: string; told: true }> {
-    const message: Message = { id: `u${randomUUID()}`, role: 'user', text: followUpMessage(cause, context), ts: Date.now(), authorLabel: 'Follow-up trigger' };
+  private async fireFollowUp(taskId: string, context: TriggerContext | undefined, cause: TaskTrigger | undefined, text?: string): Promise<{ startedTaskId: string; told: true }> {
+    const message: Message = { id: `u${randomUUID()}`, role: 'user', text: text ?? followUpMessage(cause, context), ts: Date.now(), authorLabel: 'Follow-up trigger' };
     await this.withPendingLock(taskId, async () =>
       this.writePending(taskId, [...(await this.readPending(taskId)), { message, role: MAIN_AGENT, by: 'system:triggers', fromTrigger: { ...(context ? { context } : {}) } }]));
     const firedId = (cause as FollowUpTrigger | undefined)?.id;
@@ -7284,12 +7288,16 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       delete params.paymentPolicy;
     if (triggered?.context) params.trigger = triggered.context as unknown as ValueMap[string];
     if (triggered?.followUpTriggers.length) params.followUpTriggers = triggered.followUpTriggers as unknown as ValueMap[string];
+    // A task that holds a key of its series (one task per key, for good) is
+    // carried on as a run of that series still, and takes the key along.
+    const holdsKeys = (await this.deps.store.keyedRunsOfTask(taskId)).length > 0;
+    if (holdsKeys && source.params?.runOf) params.runOf = source.params.runOf as ValueMap[string];
     const field = params['agent:do'] === undefined && params['agent:unified'] !== undefined ? 'agent:unified' : 'agent:do';
     const { resumeFrom: _previous, ...agent } = (params[field] ?? {}) as Partial<AgentSpec>;
     params[field] = { ...agent, resumeFrom: { taskId, role: MAIN_AGENT } };
     params.prompt = input.text;
     const previous = (await this.taskGrants(source));
-    return this.createTask(token, {
+    const continued = await this.createTask(token, {
       projectId: source.projectId,
       workflow: source.workflow,
       params,
@@ -7300,6 +7308,54 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       credentialPolicies: previous.credentialPolicies,
       ...(triggered && source.createdBy ? { createdBy: source.createdBy } : {}),
     });
+    if (holdsKeys) (await this.deps.store.moveKeyedRuns(taskId, continued.id));
+    return continued;
+  }
+
+  // ─── One task per key (EventTrigger concurrency mode `continue`) ──────────
+  // wiki features/events-and-automations § Keys. A series that keeps one task
+  // per key says which task holds each; whoever understands the cause corrects
+  // the grouping: a key given to another key's task (merged), or freed so its
+  // next event starts a task of its own (split).
+
+  private async keyedSeries(token: string, seriesId: string, write: boolean): Promise<{ series: TaskRecord; caller: ScopedToken }> {
+    const series = (await this.deps.store.getTask(seriesId));
+    // A run of the series may correct its series' keys: it is the one that knows.
+    const verified = (await this.deps.tokens.verify(token));
+    const callerTask = verified?.taskId && verified.taskId !== '*' ? (await this.deps.store.taskMetadata(verified.taskId)) : undefined;
+    const ownSeries = !!series && callerTask?.params?.runOf === series.id;
+    const caller = (await this.require(token, write && !ownSeries ? 'edit_task' : 'get_task', { projectId: series?.projectId ?? '__missing__', taskId: ownSeries ? callerTask!.id : seriesId }));
+    if (!series) throw new NotFoundError(`no task ${seriesId}`);
+    return { series, caller };
+  }
+
+  /** The keys a series keeps a task for, newest first, each with its task's state. */
+  async listKeyedRuns(token: string, seriesId: string): Promise<Array<KeyedRun & { task?: { id: string; number?: number; title: string; status: string } }>> {
+    (await this.keyedSeries(token, seriesId, false));
+    const runs = (await this.deps.store.listKeyedRuns(seriesId));
+    return Promise.all(runs.map(async (run) => {
+      const task = run.taskId ? (await this.deps.store.taskMetadata(run.taskId)) : undefined;
+      return { ...run, ...(task ? { task: { id: task.id, ...(task.num !== undefined ? { number: task.num } : {}), title: task.title, status: task.lastView?.status ?? 'active' } } : {}) };
+    }));
+  }
+
+  /** Give a key to a task of the series (merge it into that task's work). */
+  async assignKeyedRun(token: string, seriesId: string, key: string, taskId: string): Promise<KeyedRun> {
+    const { series } = (await this.keyedSeries(token, seriesId, true));
+    const task = (await this.deps.store.taskMetadata(taskId));
+    if (!task || task.projectId !== series.projectId) throw new NotFoundError(`no task ${taskId} in this project`);
+    if (task.lastView?.status === 'cancelled') throw new ValidationError('a cancelled task cannot hold a key');
+    if (typeof key !== 'string' || !key || key.length > 300) throw new ValidationError('name the key');
+    const existing = (await this.deps.store.keyedRun(seriesId, key));
+    return this.deps.store.saveKeyedRun({ seriesId, key, projectId: series.projectId,
+      organizationId: (await this.deps.store.getProject(series.projectId))?.organizationId ?? 'org_personal',
+      taskId, state: 'run', seen: existing?.seen ?? 1, reason: existing?.taskId && existing.taskId !== taskId ? `moved from ${existing.taskId}` : existing?.reason });
+  }
+
+  /** Free a key (split it off its task): its next event starts a task of its own. */
+  async releaseKeyedRun(token: string, seriesId: string, key: string): Promise<{ released: boolean }> {
+    (await this.keyedSeries(token, seriesId, true));
+    return { released: (await this.deps.store.deleteKeyedRun(seriesId, key)) };
   }
 
   /**

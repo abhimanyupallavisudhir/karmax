@@ -172,8 +172,21 @@ ensure_secrets() (
 # service is a stock image builds nothing for it. PostgreSQL's and Caddy's bases
 # are pinned and not re-pulled, so an unchanged image is never recreated.
 build_images() {
+  record_build_revision
   if [ "${1:-}" = --pull ]; then dc build --pull app && dc build postgresql caddy
   else dc build app postgresql caddy
+  fi
+}
+
+# The image has no .git, so the checkout says which revision it is built from
+# and which came before: the app reports its revision with every error and, at
+# its first boot, which commits this deploy shipped (src/util/build-revision.ts).
+# Never fails a build: without the file the app only knows less.
+record_build_revision() {
+  if git -C "$ROOT_DIR" log -n 2000 --format=%H > "$ROOT_DIR/src/build-revision.txt" 2>/dev/null; then
+    chmod 644 "$ROOT_DIR/src/build-revision.txt" 2>/dev/null || true # the app's user reads it, whatever the umask
+  else
+    rm -f "$ROOT_DIR/src/build-revision.txt"
   fi
 }
 
@@ -365,6 +378,7 @@ cmd_up() {
   preview_tls_ready || die 'previews are not configured; nothing was started'
   dc config --quiet
   note 'Building and starting PostgreSQL, Temporal, Karmax, and Caddy…'
+  record_build_revision
   dc up -d --build --remove-orphans
   wait_ready || die 'Karmax failed its readiness check'
   wait_edge_serving || die 'Caddy failed to start'

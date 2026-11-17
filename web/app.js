@@ -4668,10 +4668,36 @@ function inlineErrorHtml(error) {
   const plain = plainError(error);
   return plain === raw ? esc(plain) : `<span title="${esc(raw)}">${esc(plain)}</span>`;
 }
-function taskErrorHtml(text, projectId) {
+function taskErrorHtml(text, projectId, taskId) {
   const { summary: said, detail, generic } = plainTaskError(text);
-  const summary = generic && !setupFixes(text, projectId).length && !/\bretry\b/i.test(said) ? `${said} Press Retry to try again.` : said;
-  return `<div class="msg-text">${esc(summary)}${setupFixHtml(text, projectId)}</div>${detail ? `<details class="error-details"><summary>Details</summary><pre>${esc(detail)}</pre></details>` : ''}`;
+  const fixes = setupFixes(text, projectId).length;
+  const summary = generic && !fixes && !/\bretry\b/i.test(said) ? `${said} Press Retry to try again.` : said;
+  // An error a setting fixes is the person's to fix; any other can be reported.
+  return `<div class="msg-text">${esc(summary)}${setupFixHtml(text, projectId)}${fixes ? '' : reportErrorHtml(taskId)}</div>${detail ? `<details class="error-details"><summary>Details</summary><pre>${esc(detail)}</pre></details>` : ''}`;
+}
+
+// ── Report an error (wiki features/error-reports) ────────────────────────────
+// One click on an error tavya showed: it is counted on that bug, whose task
+// fixes it. Offered only where the installation sends reports somewhere.
+function reportErrorHtml(taskId) {
+  return S.meta?.errorReports && taskId
+    ? ` <button type="button" class="btn sm ghost report-error" data-report-error="${esc(taskId)}" title="Tell tavya this should not have happened">Report</button>` : '';
+}
+async function reportShownError(body, control) {
+  if (control) control.disabled = true;
+  try {
+    const { reported } = await api('/api/error-reports', { method: 'POST', body: JSON.stringify(body) });
+    if (control) control.textContent = reported ? 'Reported ✓' : 'Report';
+    else toast(reported ? 'Reported' : 'Reports are off here');
+  } catch (error) { if (control) control.disabled = false; toast(error.message || String(error), true); }
+}
+document.addEventListener('click', (event) => {
+  const control = event.target.closest?.('[data-report-error]');
+  if (control && !control.disabled) void reportShownError({ taskId: control.dataset.reportError }, control);
+});
+// A failure on tavya's side (a 5xx), as opposed to a refusal or a lost connection.
+function serverSideFailure(error) {
+  return Number(error?.status) >= 500 || /^HTTP 5\d\d$|^Internal Server Error$/i.test(String(error?.message ?? error ?? '').trim());
 }
 
 // Why a sign-in was refused, in words: a wrong password is only one reason.
@@ -4693,6 +4719,9 @@ function toast(msg, err = false, action) {
   t.appendChild(span);
   // An error a setting fixes (storage full, out of compute) links to it.
   if (err && !action) action = setupFix(String(msg?.message ?? msg ?? '')) ?? undefined;
+  // One on tavya's side can be reported (wiki features/error-reports).
+  if (err && !action && S.meta?.errorReports && serverSideFailure(msg))
+    action = { label: 'Report', fn: () => reportShownError({ message: String(msg?.message ?? msg), where: location.pathname.replace(/\/\d+(?=\/|$)/g, '/:n') }) };
   // An optional action (e.g. Undo) — gives the toast a clickable button and more
   // dwell time. Backward-compatible: existing toast(msg[, err]) calls are unchanged.
   // An action with an `href` is a link (so it opens in a new tab too) instead.
@@ -9366,9 +9395,12 @@ function eventTriggerHtml(trigger, { followUp = false } = {}) {
         <option value="skip" ${mode === 'skip' ? 'selected' : ''}>Skip while one runs</option>
         <option value="queue" ${mode === 'queue' ? 'selected' : ''}>Wait for it</option>
         <option value="tell" ${mode === 'tell' ? 'selected' : ''}>Tell the running one</option>
+        <option value="continue" ${mode === 'continue' ? 'selected' : ''} title="Later events reach the same task, even after it finished">One task for good</option>
       </select>
       <input id="ev-key" placeholder="per {{issue.number}}" value="${esc(trigger?.concurrency?.key || '')}" ${mode ? '' : 'hidden'}
         title="One run per value, e.g. {{issue.number}}; empty means one at a time" autocomplete="off" spellcheck="false">
+      <button type="button" class="btn sm" id="ev-add-gate" title="A model reads each event first and decides whether it starts a run" ${followUp || trigger?.gate ? 'hidden' : ''}>＋ Ask first…</button>
+      <textarea id="ev-gate" rows="2" placeholder="Start a run only for…" aria-label="What deserves a run" title="A model reads each event first and decides whether it starts a run" ${trigger?.gate ? '' : 'hidden'}>${esc(trigger?.gate?.prompt || '')}</textarea>
     </div>
   </div>`;
 }
@@ -9395,11 +9427,13 @@ function collectEventTrigger(existing) {
     where[path] = op === 'eq' ? eventValue(value) : op === 'in' ? { in: value.split(',').map(eventValue).filter((v) => v !== '') }
       : { [op]: value.trim() };
   });
-  const { where: _w, concurrency: _c, type: _t, kind: _k, recurring: _r, ...kept } = existing || {};
+  const { where: _w, concurrency: before, type: _t, kind: _k, recurring: _r, gate: asked, ...kept } = existing || {};
   const mode = $('#ev-mode')?.value || '';
   const key = ($('#ev-key')?.value || '').trim();
+  const gate = ($('#ev-gate')?.value || '').trim();
   return { kind: 'event', type, ...kept, ...(Object.keys(where).length ? { where } : {}),
-    ...(mode ? { concurrency: { ...(key ? { key } : {}), mode } } : {}),
+    ...(mode ? { concurrency: { ...(key ? { key } : {}), mode, ...(mode === 'continue' && before?.after ? { after: before.after } : {}) } } : {}),
+    ...(gate ? { gate: { ...asked, prompt: gate } } : {}),
     ...($('#trig-repeatable')?.checked ? { recurring: true } : {}) };
 }
 
@@ -9457,6 +9491,7 @@ function wireEventTrigger(projectId) {
     conds.dispatchEvent(new Event('change', { bubbles: true }));
   });
   $('#ev-mode').addEventListener('change', () => { $('#ev-key').hidden = !$('#ev-mode').value; });
+  $('#ev-add-gate').addEventListener('click', (event) => { event.currentTarget.hidden = true; const gate = $('#ev-gate'); gate.hidden = false; gate.focus(); });
 }
 
 // ── schedule: the 5 labelled cron cells ──────────────────────────────────────
@@ -13739,7 +13774,7 @@ function conversationReviewInfo(v, resourcesShown = false) {
 
 // A failure the workflow recorded, in the conversation where the work happened.
 function conversationError(v) {
-  return v.error ? `<div class="msg system error" role="alert"><div class="role">Something went wrong</div>${taskErrorHtml(v.error, v.projectId)}</div>` : '';
+  return v.error ? `<div class="msg system error" role="alert"><div class="role">Something went wrong</div>${taskErrorHtml(v.error, v.projectId, v.taskId)}</div>` : '';
 }
 
 // Expand in place so live messages, scroll position and unsent attachments survive.
@@ -14960,7 +14995,7 @@ function renderConversationEntry(entry, v = S.view) {
   if (entry.type === 'input-request') {
     const escalate = v.waitingFor?.kind === 'human' || v.waitingFor?.kind === 'parent'
       ? `<button class="btn sm ghost escalate-request" title="Pass this to someone who can answer">Escalate…</button>` : '';
-    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div>${v.waitingFor?.reason === 'error' ? taskErrorHtml(entry.request.text, v.projectId) : `<div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math, formContext(entry))}</div>`}${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div>${v.waitingFor?.reason === 'error' ? taskErrorHtml(entry.request.text, v.projectId, v.taskId) : `<div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math, formContext(entry))}</div>`}${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
   }
   if (entry.type === 'message') {
     const m = entry.message;
@@ -21889,7 +21924,7 @@ function projectEventsHtml(projectId, list, events) {
   const eventRow = (e) => `<details class="pe-event"><summary class="setting-row">
     <span class="setting-label"><code>${esc(e.type)}</code></span>
     <span class="setting-value">${eventSourceLabel(e.source, hooks)}${e.subject ? ` · ${/^https?:/.test(e.subject) ? `<a href="${esc(e.subject)}" target="_blank" rel="noopener">${esc(e.subject.replace(/^https?:\/\/(www\.)?/, '').slice(0, 60))}</a>` : esc(e.subject.slice(0, 60))}` : ''}<span class="setting-sep">·</span>${eventOutcome(e)}</span>
-    <span class="setting-actions setting-muted">${fmtAgo(e.receivedAt)}</span></summary>
+    <span class="setting-actions setting-muted">${e.count > 1 ? `<span title="Happened ${e.count} times, first ${esc(fmtAgo(e.receivedAt))}">×${e.count}</span> · ` : ''}${fmtAgo(e.count > 1 ? e.lastSeenAt : e.receivedAt)}</span></summary>
     <pre class="pe-payload">${esc(JSON.stringify(e.payload, null, 2))}</pre></details>`;
   return `<div class="section-h section-h-action"><span>Sources</span><span class="pe-add">
       <button class="btn sm ghost" data-pe-new="webhook">＋ Webhook</button><button class="btn sm ghost" data-pe-new="chat">＋ Chat bot</button></span></div>

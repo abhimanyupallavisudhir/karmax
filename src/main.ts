@@ -733,17 +733,36 @@ async function main() {
     log: (m) => console.warn('  • ' + m) });
   api.setChatReplies(chatReplies);
   bus.onAny((event) => { if (event.type === 'view.updated') void chatReplies.observe(event).catch((e) => console.warn('  • chat reply failed:', String(e))); });
+  // A trigger's gate (wiki features/events-and-automations § Gate): one model
+  // reply on the organization's credit decides whether an event starts a run.
+  const { createTriggerGate } = await import('./platform/trigger-gate.js');
   const triggerScheduler = new TriggerScheduler({
     store,
     bus,
     fire: createTriggerFire(api, tokens),
     tell: createTriggerTell(api, tokens),
+    gate: createTriggerGate({
+      organizationOf: async (projectId) => (await store.getProject(projectId))?.organizationId ?? 'org_personal',
+      text: async (organizationId, request, task) => {
+        const generation = await import('./agent/generation.js');
+        return (await generation.generate({ store, broker, configHomes }, organizationId, { kind: 'text', effort: 'low', ...request }, task)).text;
+      },
+    }),
     announce: (event, runId, how) => chatReplies.announce(event, runId, how),
     log: (m) => console.log('  • ' + m),
   });
   api.setTriggerArmer(triggerScheduler);
   startupJobs.push(async () => {
-    if (!shuttingDown) await triggerScheduler.start();
+    if (shuttingDown) return;
+    // Error reports (wiki features/error-reports): the fixer saved before bugs
+    // had a task each gets today's trigger, and a new revision says what it shipped.
+    const { upgradeErrorFixer } = await import('./platform/error-fixer.js');
+    const { recordDeploy } = await import('./platform/error-reports.js');
+    await upgradeErrorFixer(store, async () => undefined).then((upgraded) => { if (upgraded) console.log('  • error reports: the fixer now keeps one task per bug'); })
+      .catch((error) => console.warn('  • error reports: could not upgrade the fixer:', error instanceof Error ? error.message : String(error)));
+    await triggerScheduler.start();
+    await recordDeploy(store).then((event) => { if (event) triggerScheduler.projectEventRecorded(event); })
+      .catch((error) => console.warn('  • could not record this deploy:', error instanceof Error ? error.message : String(error)));
   });
   worldLifecycle.start();
   delivery.start();

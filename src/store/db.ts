@@ -101,7 +101,8 @@ import {
 import { newId } from '../util/id.js';
 import type { TaskTemplateContent } from '../domain/task-templates.js';
 import { normalizeFollowUpTriggers, type FollowUpTrigger } from '../domain/triggers.js';
-import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, type EventFollow, type ProjectEvent, type ProjectEventClaim,
+import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, EVENT_DISTINCT_VALUES, EVENT_OCCURRENCE_BYTES, EVENT_RECENT_OCCURRENCES,
+  boundEventPayload, valuesAtPath, type EventFollow, type EventOccurrence, type KeyedRun, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventClaimState } from '../domain/project-events.js';
 import { paymentMerchantMatches } from '../util/payment-merchant.js';
 import { previewHostname } from '../gateway/previews.js';
@@ -1098,7 +1099,17 @@ export class Store {
         source TEXT NOT NULL, type TEXT NOT NULL, eventKey TEXT NOT NULL, subject TEXT,
         occurredAt INTEGER NOT NULL, receivedAt INTEGER NOT NULL, payload TEXT NOT NULL,
         origin TEXT NOT NULL, hops INTEGER NOT NULL, dispatchedAt INTEGER,
+        count INTEGER NOT NULL DEFAULT 1, lastSeenAt INTEGER, recent TEXT, distinctValues TEXT,
+        dispatchedCount INTEGER NOT NULL DEFAULT 0,
         UNIQUE (projectId, source, eventKey)
+      );
+      -- A key's run (EventTrigger concurrency mode continue): the one task a
+      -- series keeps for a rendered key, for good. taskId NULL = turned down.
+      CREATE TABLE IF NOT EXISTS keyed_runs (
+        seriesId TEXT NOT NULL, runKey TEXT NOT NULL, projectId TEXT NOT NULL, organizationId TEXT NOT NULL,
+        taskId TEXT, state TEXT NOT NULL, reason TEXT, seen INTEGER NOT NULL DEFAULT 1, liveAt INTEGER,
+        createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+        PRIMARY KEY (seriesId, runKey)
       );
       -- Retired: follows became params.followUpTriggers (2026-11). Rows from
       -- before are drained at boot (Store.drainLegacyTaskFollows); nothing writes it.
@@ -1118,6 +1129,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS project_event_claims (
         eventId TEXT NOT NULL, taskId TEXT NOT NULL, state TEXT NOT NULL, reason TEXT,
         runId TEXT, concurrencyKey TEXT, receivedAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+        gated INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (eventId, taskId)
       );
       -- Hosted SaaS subscriptions are a separate ledger from agent spending
@@ -1403,6 +1415,20 @@ export class Store {
     const leaseCols = await this.db.prepare('PRAGMA table_info(world_leases)').all() as { name: string }[];
     if (!leaseCols.some(column => column.name === 'queuedSince')) await this.db.exec('ALTER TABLE world_leases ADD COLUMN queuedSince INTEGER');
     await this.db.exec('CREATE INDEX IF NOT EXISTS idx_world_leases_state ON world_leases(state, taskId)');
+    // Counted events and gated claims (wiki features/events-and-automations).
+    const projectEventCols = await this.db.prepare('PRAGMA table_info(project_events)').all() as { name: string }[];
+    if (!projectEventCols.some(column => column.name === 'count')) {
+      await this.db.exec('ALTER TABLE project_events ADD COLUMN count INTEGER NOT NULL DEFAULT 1');
+      await this.db.exec('ALTER TABLE project_events ADD COLUMN lastSeenAt INTEGER');
+      await this.db.exec('ALTER TABLE project_events ADD COLUMN recent TEXT');
+      await this.db.exec('ALTER TABLE project_events ADD COLUMN distinctValues TEXT');
+      // How many of its occurrences the dispatcher has been offered: all of them, for events from before.
+      await this.db.exec('ALTER TABLE project_events ADD COLUMN dispatchedCount INTEGER NOT NULL DEFAULT 0');
+      await this.db.exec('UPDATE project_events SET dispatchedCount=1 WHERE dispatchedAt IS NOT NULL');
+    }
+    const eventClaimCols = await this.db.prepare('PRAGMA table_info(project_event_claims)').all() as { name: string }[];
+    if (!eventClaimCols.some(column => column.name === 'gated')) await this.db.exec('ALTER TABLE project_event_claims ADD COLUMN gated INTEGER NOT NULL DEFAULT 0');
+    await this.db.exec('CREATE INDEX IF NOT EXISTS idx_keyed_runs_task ON keyed_runs(taskId)');
     const candidateCols = await this.db.prepare('PRAGMA table_info(resource_candidates)').all() as { name: string }[];
     if (!candidateCols.some(column => column.name === 'error')) await this.db.exec('ALTER TABLE resource_candidates ADD COLUMN error TEXT');
     const cols = (await this.db.prepare('PRAGMA table_info(tasks)').all()) as any[];
@@ -2146,6 +2172,7 @@ export class Store {
       (await deleteRows(this.db, 'inbox', 'id', authorizationInboxIds));
       (await this.db.prepare('DELETE FROM project_event_claims WHERE eventId IN (SELECT id FROM project_events WHERE projectId=?)').run(id));
       (await this.db.prepare('DELETE FROM project_events WHERE projectId=?').run(id));
+      (await this.db.prepare('DELETE FROM keyed_runs WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM task_follows WHERE projectId=?').run(id));
       // Incoming webhooks (src/integrations/incoming-webhooks.ts). CASE keeps
       // PostgreSQL from parsing every other kv value as JSON.
@@ -2826,6 +2853,7 @@ export class Store {
       payment_transactions: (await selectRows(this.db, 'payment_transactions', 'organizationId=?', [organizationId])),
       payment_events: (await selectRows(this.db, 'payment_events', 'organizationId=?', [organizationId])),
       project_events: (await selectRows(this.db, 'project_events', 'organizationId=?', [organizationId])),
+      keyed_runs: (await selectRows(this.db, 'keyed_runs', 'organizationId=?', [organizationId])),
       task_follows: (await rowsFor(this.db, 'task_follows', 'projectId', projectIds)),
       automation_templates: (await selectRows(this.db, 'automation_templates', 'organizationId=?', [organizationId])),
       project_event_claims: (await rowsFor(this.db, 'project_event_claims', 'eventId',
@@ -3103,6 +3131,7 @@ export class Store {
       (await deleteRows(this.db, 'cards', 'scopeId', [organizationId, ...projectIds]));
       (await this.db.prepare('DELETE FROM project_event_claims WHERE eventId IN (SELECT id FROM project_events WHERE organizationId=?)').run(organizationId));
       (await this.db.prepare('DELETE FROM project_events WHERE organizationId=?').run(organizationId));
+      (await this.db.prepare('DELETE FROM keyed_runs WHERE organizationId=?').run(organizationId));
       (await deleteRows(this.db, 'task_follows', 'projectId', projectIds));
       (await this.db.prepare('DELETE FROM automation_templates WHERE organizationId=?').run(organizationId));
       (await this.db.prepare(`DELETE FROM kv WHERE k LIKE 'incoming-webhook:%'
@@ -10485,19 +10514,48 @@ export class Store {
 
   // ─── Project event inbox (wiki features/events-and-automations) ──
 
-  /** Insert an outside occurrence once; a repeat of (project, source, key)
-   *  returns the stored row with `created: false`. */
-  async recordProjectEvent(input: Omit<ProjectEvent, 'id' | 'receivedAt'> & { receivedAt?: number }):
-    Promise<{ event: ProjectEvent; created: boolean }> {
+  /**
+   * Record an outside occurrence. The first of (project, source, key) is the
+   * event; a repeat is counted on it (`created: false`): its count and last
+   * time move, the repeat is kept among its latest, and the values at the
+   * `distinct` paths are tallied. `occurrences` records several at once (a
+   * recorder that batches them). A repeat is offered to the dispatcher again.
+   */
+  async recordProjectEvent(input: Omit<ProjectEvent, 'id' | 'receivedAt' | 'count' | 'lastSeenAt' | 'recent' | 'distinct'>
+    & { receivedAt?: number; occurrences?: number; distinct?: string[] }): Promise<{ event: ProjectEvent; created: boolean }> {
     return this.db.transaction(async () => {
+      // A repeat rewrites its row from what it read (its latest repeats, its tallies).
+      await this.db.lock(`project:${input.projectId}`);
       const id = newId('pev');
       const receivedAt = input.receivedAt ?? Date.now();
+      const occurrences = Math.max(1, Math.trunc(input.occurrences ?? 1));
+      const tally = (existing: Record<string, string[]>) => {
+        for (const path of input.distinct ?? []) {
+          const values = existing[path] ?? [];
+          for (const value of valuesAtPath(input.payload, path)) {
+            if ((typeof value !== 'string' && typeof value !== 'number') || values.length >= EVENT_DISTINCT_VALUES) continue;
+            const text = String(value).slice(0, 200);
+            if (!values.includes(text)) values.push(text);
+          }
+          if (values.length) existing[path] = values;
+        }
+        return Object.keys(existing).length ? JSON.stringify(existing) : null;
+      };
       const created = Number((await this.db.prepare(`INSERT OR IGNORE INTO project_events
-        (id, organizationId, projectId, source, type, eventKey, subject, occurredAt, receivedAt, payload, origin, hops)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, input.organizationId, input.projectId, input.source, input.type,
-        input.key, input.subject ?? null, input.occurredAt, receivedAt, JSON.stringify(input.payload), input.origin, input.hops)).changes) === 1;
-      const row = await this.db.prepare('SELECT * FROM project_events WHERE projectId=? AND source=? AND eventKey=?')
-        .get(input.projectId, input.source, input.key);
+        (id, organizationId, projectId, source, type, eventKey, subject, occurredAt, receivedAt, payload, origin, hops, count, lastSeenAt, distinctValues)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, input.organizationId, input.projectId, input.source, input.type,
+        input.key, input.subject ?? null, input.occurredAt, receivedAt, JSON.stringify(input.payload), input.origin, input.hops,
+        occurrences, receivedAt, tally({}))).changes) === 1;
+      let row = await this.db.prepare('SELECT * FROM project_events WHERE projectId=? AND source=? AND eventKey=?')
+        .get(input.projectId, input.source, input.key) as any;
+      if (!created) {
+        const before = projectEventFromRow(row);
+        const recent: EventOccurrence[] = [...(before.recent ?? []), { at: receivedAt, payload: boundEventPayload(input.payload, EVENT_OCCURRENCE_BYTES) }]
+          .slice(-EVENT_RECENT_OCCURRENCES);
+        await this.db.prepare('UPDATE project_events SET count=?, lastSeenAt=?, recent=?, distinctValues=? WHERE id=?')
+          .run(before.count + occurrences, Math.max(before.lastSeenAt, receivedAt), JSON.stringify(recent), tally({ ...before.distinct }), before.id);
+        row = await this.db.prepare('SELECT * FROM project_events WHERE id=?').get(before.id);
+      }
       return { event: projectEventFromRow(row), created };
     });
   }
@@ -10523,25 +10581,97 @@ export class Store {
     return rows.map(projectEventFromRow);
   }
 
-  /** Oldest first: events not yet offered to the armed tasks of their project. */
+  /** Oldest first: events not yet offered to the armed tasks of their project,
+   *  and those that came again since they were. */
   async undispatchedProjectEvents(limit = 100): Promise<ProjectEvent[]> {
-    const rows = await this.db.prepare(`SELECT * FROM project_events WHERE dispatchedAt IS NULL
+    const rows = await this.db.prepare(`SELECT * FROM project_events WHERE dispatchedAt IS NULL OR count > dispatchedCount
       ORDER BY receivedAt, id LIMIT ${Math.min(Math.max(Math.trunc(limit), 1), 500)}`).all();
     return rows.map(projectEventFromRow);
   }
 
-  async markProjectEventDispatched(id: string, at = Date.now()): Promise<void> {
+  /** `count` is how often the event had come when it was offered: one more
+   *  occurrence since, and it is offered again. */
+  async markProjectEventDispatched(id: string, at = Date.now(), count = 1): Promise<void> {
     await this.db.transaction(async () => {
-      await this.db.prepare('UPDATE project_events SET dispatchedAt=? WHERE id=? AND dispatchedAt IS NULL').run(at, id);
+      await this.db.prepare('UPDATE project_events SET dispatchedAt=COALESCE(dispatchedAt, ?), dispatchedCount=? WHERE id=? AND dispatchedCount<?').run(at, count, id, count);
     });
+  }
+
+  // ─── Keyed runs (EventTrigger concurrency mode `continue`) ──
+
+  async keyedRun(seriesId: string, key: string): Promise<KeyedRun | undefined> {
+    const row = await this.db.prepare('SELECT * FROM keyed_runs WHERE seriesId=? AND runKey=?').get(seriesId, key);
+    return row ? keyedRunFromRow(row) : undefined;
+  }
+
+  /** Newest first. */
+  async listKeyedRuns(seriesId: string): Promise<KeyedRun[]> {
+    return (await this.db.prepare('SELECT * FROM keyed_runs WHERE seriesId=? ORDER BY updatedAt DESC, runKey LIMIT 2000').all(seriesId)).map(keyedRunFromRow);
+  }
+
+  /** The keys a task holds (for a run that asks which keys are its own). */
+  async keyedRunsOfTask(taskId: string): Promise<KeyedRun[]> {
+    return (await this.db.prepare('SELECT * FROM keyed_runs WHERE taskId=? ORDER BY runKey').all(taskId)).map(keyedRunFromRow);
+  }
+
+  async saveKeyedRun(run: Omit<KeyedRun, 'createdAt' | 'updatedAt'> & { createdAt?: number; updatedAt?: number }): Promise<KeyedRun> {
+    return this.db.transaction(async () => {
+      const now = run.updatedAt ?? Date.now();
+      const existing = await this.db.prepare('SELECT createdAt FROM keyed_runs WHERE seriesId=? AND runKey=?').get(run.seriesId, run.key) as { createdAt?: number } | undefined;
+      if (existing) await this.db.prepare(`UPDATE keyed_runs SET taskId=?, state=?, reason=?, seen=?, liveAt=?, updatedAt=? WHERE seriesId=? AND runKey=?`)
+        .run(run.taskId ?? null, run.state, run.reason ?? null, run.seen, run.liveAt ?? null, now, run.seriesId, run.key);
+      else await this.db.prepare(`INSERT INTO keyed_runs (seriesId, runKey, projectId, organizationId, taskId, state, reason, seen, liveAt, createdAt, updatedAt)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(run.seriesId, run.key, run.projectId, run.organizationId, run.taskId ?? null, run.state,
+        run.reason ?? null, run.seen, run.liveAt ?? null, run.createdAt ?? now, now);
+      return (await this.keyedRun(run.seriesId, run.key))!;
+    });
+  }
+
+  /** Move what a key's task has heard (`seen`) or when its change went live;
+   *  false when the key is gone. Never its task: a continuation moves that. */
+  async updateKeyedRun(seriesId: string, key: string, patch: { seen?: number; liveAt?: number }): Promise<boolean> {
+    return this.db.transaction(async () => {
+      const sets = ['updatedAt=?'];
+      const args: unknown[] = [Date.now()];
+      if (patch.seen !== undefined) { sets.push('seen=?'); args.push(patch.seen); }
+      if (patch.liveAt !== undefined) { sets.push('liveAt=?'); args.push(patch.liveAt); }
+      return Number((await this.db.prepare(`UPDATE keyed_runs SET ${sets.join(', ')} WHERE seriesId=? AND runKey=?`).run(...args, seriesId, key)).changes) === 1;
+    });
+  }
+
+  async deleteKeyedRun(seriesId: string, key: string): Promise<boolean> {
+    return this.db.transaction(async () =>
+      Number((await this.db.prepare('DELETE FROM keyed_runs WHERE seriesId=? AND runKey=?').run(seriesId, key)).changes) === 1);
+  }
+
+  /** A task was carried on in another: its keys go with the work. */
+  async moveKeyedRuns(fromTaskId: string, toTaskId: string): Promise<number> {
+    return this.db.transaction(async () => Number((await this.db.prepare('UPDATE keyed_runs SET taskId=?, liveAt=NULL, updatedAt=? WHERE taskId=?')
+      .run(toTaskId, Date.now(), fromTaskId)).changes));
+  }
+
+  /** Runs of a series that have not finished: what `maxRunning` counts. */
+  async unfinishedRunsOf(seriesId: string): Promise<number> {
+    const row = await this.db.prepare(`SELECT COUNT(*) n FROM tasks WHERE json_extract(params, '$.runOf')=?
+      AND COALESCE(json_extract(lastView, '$.status'), 'active') NOT IN ('done', 'failed', 'cancelled')`).get(seriesId) as { n: number };
+    return Number(row?.n ?? 0);
+  }
+
+  /** The first event of a type (and source) recorded after `since`, oldest
+   *  first: what a finished key's task waits for to count as live. */
+  async projectEventsAfter(projectId: string, type: string, source: string | undefined, since: number): Promise<ProjectEvent[]> {
+    const rows = await this.db.prepare(`SELECT * FROM project_events WHERE projectId=? AND type=? AND receivedAt>?
+      ${source ? 'AND (source=? OR source LIKE ?)' : ''} ORDER BY receivedAt, id LIMIT 50`)
+      .all(projectId, type, since, ...(source ? [source, `${source.replace(/[%_]/g, '')}:%`] : []));
+    return rows.map(projectEventFromRow);
   }
 
   /** First writer wins: false when this (event, task) pair already has a claim. */
   async claimProjectEvent(claim: ProjectEventClaim): Promise<boolean> {
     return this.db.transaction(async () => Number((await this.db.prepare(`INSERT OR IGNORE INTO project_event_claims
-      (eventId, taskId, state, reason, runId, concurrencyKey, receivedAt, updatedAt) VALUES (?,?,?,?,?,?,?,?)`)
+      (eventId, taskId, state, reason, runId, concurrencyKey, receivedAt, updatedAt, gated) VALUES (?,?,?,?,?,?,?,?,?)`)
       .run(claim.eventId, claim.taskId, claim.state, claim.reason ?? null, claim.runId ?? null,
-        claim.concurrencyKey ?? null, claim.receivedAt, claim.updatedAt)).changes) === 1);
+        claim.concurrencyKey ?? null, claim.receivedAt, claim.updatedAt, claim.gated ? 1 : 0)).changes) === 1);
   }
 
   async getProjectEventClaim(eventId: string, taskId: string): Promise<ProjectEventClaim | undefined> {
@@ -10551,10 +10681,11 @@ export class Store {
 
   /** Compare-and-set on the claim's state, so two dispatchers never both act. */
   async updateProjectEventClaim(eventId: string, taskId: string, from: ProjectEventClaimState[],
-    next: { state: ProjectEventClaimState; reason?: string | null; runId?: string | null; concurrencyKey?: string | null; updatedAt?: number }): Promise<boolean> {
+    next: { state: ProjectEventClaimState; reason?: string | null; runId?: string | null; concurrencyKey?: string | null; updatedAt?: number; gated?: boolean }): Promise<boolean> {
     return this.db.transaction(async () => {
       const sets = ['state=?', 'updatedAt=?'];
       const args: unknown[] = [next.state, next.updatedAt ?? Date.now()];
+      if (next.gated !== undefined) { sets.push('gated=?'); args.push(next.gated ? 1 : 0); }
       for (const field of ['reason', 'runId', 'concurrencyKey'] as const) {
         if (next[field] !== undefined) { sets.push(`${field}=?`); args.push(next[field]); }
       }
@@ -10661,11 +10792,14 @@ export class Store {
     return !!row;
   }
 
+  /** Events not seen since `before` go, with their claims: one that keeps
+   *  coming stays, however long ago it first came. */
   async pruneProjectEvents(before: number): Promise<number> {
     return this.db.transaction(async () => {
-      await this.db.prepare(`DELETE FROM project_event_claims WHERE receivedAt<?`).run(before);
-      return Number((await this.db.prepare(`DELETE FROM project_events WHERE id IN
-        (SELECT id FROM project_events WHERE receivedAt<? ORDER BY receivedAt LIMIT 10000)`).run(before)).changes);
+      const deleted = Number((await this.db.prepare(`DELETE FROM project_events WHERE id IN
+        (SELECT id FROM project_events WHERE COALESCE(lastSeenAt, receivedAt)<? ORDER BY receivedAt LIMIT 10000)`).run(before)).changes);
+      await this.db.prepare(`DELETE FROM project_event_claims WHERE receivedAt<? AND eventId NOT IN (SELECT id FROM project_events)`).run(before);
+      return deleted;
     });
   }
 
@@ -11841,6 +11975,19 @@ function projectEventFromRow(row: any): ProjectEvent {
     occurredAt: Number(row.occurredAt), receivedAt: Number(row.receivedAt),
     payload: JSON.parse(String(row.payload)) as Record<string, unknown>,
     origin: String(row.origin) as ProjectEvent['origin'], hops: Number(row.hops),
+    count: Number(row.count ?? 1), lastSeenAt: Number(row.lastSeenAt ?? row.receivedAt),
+    ...(row.recent ? { recent: JSON.parse(String(row.recent)) as EventOccurrence[] } : {}),
+    ...(row.distinctValues ? { distinct: JSON.parse(String(row.distinctValues)) as Record<string, string[]> } : {}),
+  };
+}
+
+function keyedRunFromRow(row: any): KeyedRun {
+  return {
+    seriesId: String(row.seriesId), key: String(row.runKey), projectId: String(row.projectId), organizationId: String(row.organizationId),
+    ...(row.taskId ? { taskId: String(row.taskId) } : {}), state: String(row.state) as KeyedRun['state'],
+    ...(row.reason ? { reason: String(row.reason) } : {}), seen: Number(row.seen ?? 1),
+    ...(row.liveAt !== null && row.liveAt !== undefined ? { liveAt: Number(row.liveAt) } : {}),
+    createdAt: Number(row.createdAt), updatedAt: Number(row.updatedAt),
   };
 }
 
@@ -11849,6 +11996,7 @@ function projectEventClaimFromRow(row: any): ProjectEventClaim {
     eventId: String(row.eventId), taskId: String(row.taskId), state: String(row.state) as ProjectEventClaimState,
     ...(row.reason ? { reason: String(row.reason) } : {}), ...(row.runId ? { runId: String(row.runId) } : {}),
     ...(row.concurrencyKey !== null && row.concurrencyKey !== undefined ? { concurrencyKey: String(row.concurrencyKey) } : {}),
+    ...(Number(row.gated ?? 0) ? { gated: true } : {}),
     receivedAt: Number(row.receivedAt), updatedAt: Number(row.updatedAt),
   };
 }
