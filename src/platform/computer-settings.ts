@@ -1,7 +1,7 @@
 import type { Store } from '../store/db.js';
 import type { OrganizationExecutionPolicy, Project } from '../domain/types.js';
 import type { WorldProviderConnectionService } from '../world/connections.js';
-import { computerConfig, computerOf, machineShape, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
+import { LOCAL_WORLD_KINDS, runsOnHost, computerConfig, computerOf, machineShape, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
 
 /**
  * The Computer field in Task defaults (wiki features/computers). Its values are
@@ -10,8 +10,6 @@ import { computerConfig, computerOf, machineShape, normalizeComputer, type Compu
  * the gateway, runner admission and the MCP `set_execution_policy` tool all
  * read and write them. Task defaults is one more editor of that one value.
  */
-
-const LOCAL = ['worktree', 'container', 'memory'];
 
 /** Own/inherited Computer values per Task-defaults layer, for `/api/defaults`. */
 export async function computerDefaults(store: Store, organizationId: string | undefined, project: Project | undefined) {
@@ -27,8 +25,8 @@ export async function computerDefaults(store: Store, organizationId: string | un
 async function assertProvider(providerConnections: WorldProviderConnectionService | undefined, organizationId: string,
   provider: string | undefined, hosted: boolean): Promise<void> {
   if (!provider) return;
-  if (LOCAL.includes(provider)) {
-    if (hosted) throw new Error('hosted tasks run on a cloud computer (E2B, Daytona, Fly.io or Hetzner)');
+  if (LOCAL_WORLD_KINDS.includes(provider)) {
+    if (hosted && runsOnHost(provider)) throw new Error('hosted tasks run on a cloud computer (E2B, Daytona, Fly.io or Hetzner)');
     return;
   }
   if (providerConnections && !(await providerConnections.available(organizationId, provider)))

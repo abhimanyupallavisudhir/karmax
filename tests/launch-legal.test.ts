@@ -199,6 +199,17 @@ describe('paid-launch policies', () => {
     expect(policyDocument('billing')!.effectiveDate).toBe('November 17, 2026');
   });
 
+  it('says what the phone apps collect, and names FCM as a subprocessor, as a new policy version (2026-11-17.1)', () => {
+    const privacy = policyDocument('privacy')!;
+    const apps = privacy.sections.find((section) => section.heading === 'Phone apps')!;
+    const text = [...apps.paragraphs, ...(apps.bullets ?? [])].join(' ');
+    expect(text).toContain('stores the device’s push token');
+    expect(text).toContain('tavya receives and keeps no audio');
+    expect(text).toContain('never your password');
+    expect(JSON.stringify(policyDocument('subprocessors'))).toContain('Google (Firebase Cloud Messaging)');
+    expect(privacy.version).toBe('2026-11-17.1');
+  });
+
   it('states the free trial and the included model, as a new policy version (2026-11-06.1)', () => {
     const billing = policyDocument('billing')!.sections.find((section) => section.heading === 'Packs and managed compute')!.paragraphs.join(' ');
     expect(billing).toContain('a new organization gets a free trial of $5 of managed compute, usable for its first 14 days, once per person');

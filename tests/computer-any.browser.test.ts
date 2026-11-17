@@ -27,7 +27,8 @@ it('offers Any first, with what it reaches, its largest sizes and a region', asy
     fixture().innerHTML = computerBlockHtml('computer', undefined, { provider: 'any', flavor: 'headless', network: { unrestricted: true } });
   `);
   const block = ui.page.locator('#fixture .computer-field');
-  expect(await block.locator('.cf-provider option').allTextContents()).toEqual(['Any', 'E2B', 'Hetzner', 'AWS']);
+  // …and None last: no computer (wiki features/computerless-tasks).
+  expect(await block.locator('.cf-provider option').allTextContents()).toEqual(['Any', 'E2B', 'Hetzner', 'AWS', 'None']);
   expect(await block.locator('.cf-provider').inputValue()).toBe('any');
   // What Any reaches is one hover away, the organization's own account first.
   const reach = block.locator('.cf-reach');

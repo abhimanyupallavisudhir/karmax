@@ -11,7 +11,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
-import { PLATFORM_TOOL_SCHEMAS, SDK_CONTROL_TOOL_SCHEMAS, TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
+import { PLATFORM_TOOL_SCHEMAS, SDK_CONTROL_TOOL_SCHEMAS, TOOL_SCHEMAS, COMPUTERLESS_TOOL_SCHEMAS, computerlessToolHandlers, platformToolHandlers } from './tools.js';
+import { isComputerlessWorld, loginNeedsComputer } from './computerless.js';
 import { CONTROL_SERVER_NAME, controlMcpServerSpec, startControlBridge } from './control-bridge.js';
 import { codexReasoningEffort } from './effort.js';
 import { openaiUserContent, materializeImageFiles } from './images.js';
@@ -166,6 +167,15 @@ export class CodexAdapter implements AgentAdapter {
     throw new Error('CodexAdapter: no OPENAI_API_KEY and no Codex login found');
   }
 
+  /** A task without a computer: the Responses API loop with only tavya's own
+   * tools. A Codex login is its CLI, which needs a computer. */
+  async runComputerlessTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    ctx.emitActivity ??= () => {};
+    // Only the key the activity resolved for the organization (computerlessApiKey).
+    if (!input.resolvedAuth?.apiKey) throw loginNeedsComputer('codex');
+    return this.runResponsesApi(input, ctx);
+  }
+
   /** The ChatGPT-subscription rail: the app-server (live, steerable) by default, or
    *  the legacy one-shot `codex exec` when forced via `KARMAX_CODEX_USE_EXEC`. */
   private async runSubscription(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
@@ -277,12 +287,17 @@ export class CodexAdapter implements AgentAdapter {
     const baseUrl = process.env.KARMAX_OPENAI_BASE_URL ?? 'https://api.openai.com/v1';
     const model = input.profile.model ?? 'gpt-5.5';
     (await (await currentTiming())?.mark('provider.selected', { provider: 'codex', model }));
-    const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal, input.toolsOptional);
+    // Without a computer: tavya's own tools only, and no MCP server to start.
+    const computerless = isComputerlessWorld(input.world);
+    const mcp = computerless ? { tools: [], handlers: {}, unavailable: [], close: async () => {} }
+      : await apiMcpTools(input.world, input.agentMcp, ctx.signal, input.toolsOptional);
     if (mcp.unavailable.length) await ctx.emitActivity?.(toolsUnavailableActivity(mcp.unavailable));
     try {
-    const handlers = { ...platformToolHandlers(input.world, ctx, () => workEnvironment(input)), ...mcp.handlers };
+    const handlers: Record<string, (args: any) => Promise<string>> = computerless ? computerlessToolHandlers(input.world, ctx)
+      : { ...platformToolHandlers(input.world, ctx, () => workEnvironment(input)), ...mcp.handlers };
     // Responses API function tools are flat ({type:'function', name, ...}).
-    const tools = [...RESPONSES_API_TOOLS, ...mcp.tools.map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters }))];
+    const tools = computerless ? COMPUTERLESS_TOOL_SCHEMAS.map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters }))
+      : [...RESPONSES_API_TOOLS, ...mcp.tools.map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters }))];
 
     // On a fresh session, replay the full conversation so a login switch (which
     // drops the server-bound previous_response_id) doesn't lose context; when

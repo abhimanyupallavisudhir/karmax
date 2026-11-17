@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { GithubApiError, GithubPrApi, githubPrWebhookObservationKey, pullRequestWebhookEvent } from '../src/integrations/github-pr.js';
+import { GithubApiError, GithubPrApi, githubPrWebhookObservationKey, pullRequestWebhookEvent, refusedAsEmpty } from '../src/integrations/github-pr.js';
 
 /**
  * The GitHub pull-request client's decisions against a scripted API (CI-38h):
@@ -283,6 +283,23 @@ describe('GitHub PR client', () => {
     expect((await api.get(SLUG, 1).catch((error) => error)).message)
       .toBe('GitHub API 422: Validation Failed: No commits between main and karmax/t');
     expect((await api.get(SLUG, 2).catch((error) => error)).message).toBe('GitHub API 502: <html>Bad gateway</html>');
+  });
+
+  it('tells GitHub\'s refusal of an empty pull request from its other refusals', async () => {
+    const { api } = github(
+      on('GET', /^\/repos\/acme\/app\/pulls\?/, () => json(200, [])),
+      on('POST', '/repos/acme/app/pulls', () => json(422, { message: 'Validation Failed',
+        errors: [{ resource: 'PullRequest', code: 'custom', message: 'No commits between main and jane:tavya/t' }] })),
+      on('GET', '/repos/acme/app/pulls/2', () => json(422, { message: 'Validation Failed',
+        errors: [{ resource: 'PullRequest', code: 'invalid', field: 'base' }] })),
+      on('GET', '/repos/acme/app/pulls/3', () => json(500, { message: 'No commits between main and x' })),
+    );
+    const empty = await api.openOrUpdate(SLUG, { head: 'tavya/t', base: 'main', title: 't', body: '', headOwner: 'jane' })
+      .catch((error) => error);
+    expect(refusedAsEmpty(empty)).toBe(true);
+    expect(refusedAsEmpty(await api.get(SLUG, 2).catch((error) => error))).toBe(false);
+    expect(refusedAsEmpty(await api.get(SLUG, 3).catch((error) => error))).toBe(false);
+    expect(refusedAsEmpty(new Error('GitHub API 422: No commits between main and x'))).toBe(false);
   });
 });
 

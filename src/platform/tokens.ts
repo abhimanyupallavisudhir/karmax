@@ -46,9 +46,12 @@ export const DELEGATION_RENEW_WITHIN_MS = 7 * 24 * 60 * 60 * 1000;
  * message: `KarmaxApi.renewLapsedDelegations`).
  */
 export class HumanDelegationLapsed extends Error {
-  constructor(readonly delegationId: string, readonly expiredAt?: number) {
-    super(`This task's permission to act for the person who authorized it ${expiredAt
-      ? `expired on ${new Date(expiredAt).toISOString().slice(0, 10)}` : 'was withdrawn'}. `
+  /** `lapsed`: when it expired; `withdrawn` (revoked, or its person's account
+   *  closed); or `forgotten`, its row purged before purges kept how it lapsed
+   *  (2026-11-17) or over a year ago, which shows no withdrawal. */
+  constructor(readonly delegationId: string, readonly lapsed: number | 'withdrawn' | 'forgotten' = 'withdrawn') {
+    super(`This task's permission to act for the person who authorized it ${typeof lapsed === 'number'
+      ? `expired on ${new Date(lapsed).toISOString().slice(0, 10)}` : lapsed === 'withdrawn' ? 'was withdrawn' : 'has lapsed'}. `
       + 'It is renewed when that person presses Retry or sends the task a message.');
     this.name = 'HumanDelegationLapsed';
   }
@@ -194,20 +197,24 @@ export class TokenAuthority {
   }
 
   /** Why the delegation `id` no longer holds, when it lapsed on its own: it,
-   * or one it was derived from, expired or was withdrawn (revoked, purged, its
-   * person's account closed). Undefined when every link is live, so that what
+   * or one it was derived from, expired, was withdrawn (revoked, its person's
+   * account closed) or is no longer known (purged). Undefined when every link is live, so that what
    * fails is a scope or identity the chain does not allow: never renewable. */
   private async lapse(id: string): Promise<HumanDelegationLapsed | undefined> {
     const seen = new Set<string>();
     let expiredAt: number | undefined;
     for (let next: string | undefined = id; next && !seen.has(next);) {
       seen.add(next);
+      const held = this.delegations.get(next);
       const row = this.store ? (await this.store.humanDelegationRow(next))
-        : this.delegations.has(next) ? { record: this.delegations.get(next) as unknown as Record<string, unknown>, revokedAt: undefined } : undefined;
+        : held ? { record: held as unknown as Record<string, unknown>, expiresAt: held.expiresAt, revokedAt: undefined } : undefined;
       const record = row?.record as unknown as HumanDelegation | undefined;
-      if (!record || row?.revokedAt || (await this.store?.kvGet(`account-closed:${record.humanUserId}`)))
+      if (!row) return new HumanDelegationLapsed(id, expiredAt ?? 'forgotten');
+      if (row.revokedAt || (record && (await this.store?.kvGet(`account-closed:${record.humanUserId}`))))
         return new HumanDelegationLapsed(id);
-      if (record.expiresAt <= Date.now()) expiredAt = Math.min(expiredAt ?? record.expiresAt, record.expiresAt);
+      if (row.expiresAt <= Date.now()) expiredAt = Math.min(expiredAt ?? row.expiresAt, row.expiresAt);
+      // Purged after it expired: how it lapsed is all that is left of it.
+      if (!record) { if (expiredAt === undefined) return new HumanDelegationLapsed(id); break; }
       next = record.parentDelegationId;
     }
     return expiredAt === undefined ? undefined : new HumanDelegationLapsed(id, expiredAt);
@@ -303,6 +310,15 @@ export class TokenAuthority {
       throw new Error('authorized delegation requires an interactive human');
     return (await this.issueDelegation({ ...args, humanUserId: parent.humanSubject.userId,
       externalIdentities: args.externalIdentities ?? parent.externalIdentities }));
+  }
+
+  /** Pin a person as the human subject of a run they started from a chat bot
+   * (wiki planned/assistant §3). No bearer of theirs is present: trusted host
+   * code has established that they asked, through a chat account they linked
+   * to their tavya account (src/integrations/chat-links.ts), and has already
+   * cut the run's grant to what they hold. Never reachable from a request. */
+  async delegateLinkedPerson(userId: string, args: HumanDelegationArgs): Promise<HumanDelegation> {
+    return this.issueDelegation({ ...args, humanUserId: userId });
   }
 
   /** Derive a child-task delegation from durable parent provenance. This is used

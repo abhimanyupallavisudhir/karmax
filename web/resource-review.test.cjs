@@ -39,7 +39,7 @@ function setup(api) {
     conversationEntries: () => [], subTasksSection: () => '', forkSourcesSection: () => '', agentForksSection: () => '',
     checkoutsSection: () => '', renderWidgetGroups: () => '', notesSection: () => '',
     conversationApprovalRequests: () => '', conversationPullRequestAsks: () => '', taskTranscripts: () => [{ role: 'do' }],
-    parametersTab: () => 'parameters', timingTab: () => 'timing',
+    parametersTab: () => 'parameters', timingTab: () => 'timing', micButtonHtml: () => '',
     narrowViewport: () => false,
   });
   vm.runInContext(`${freshness}\n${tabs}\n${wire}`, context);

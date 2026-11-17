@@ -44,7 +44,8 @@ Workspaces (a project or task, assembled as its cloud world is)
 Tasks
   task new <title> [--prompt <text>]     Start a task (in the workspace's project, or --project)
            [--template <number|name>]    … from a template, as numbered by 'task templates'
-           [--computer any|<provider>]   … on a computer: any (tavya picks one with room) or e.g. aws,
+           [--computer any|none|<provider>]  … on a computer: any (tavya picks one with room), none
+                                         (no computer: only tavya's own tools; starts in seconds) or e.g. aws,
            [--cpu N] [--memory GB] [--disk GB] [--region eu|us]   and at least this size
            [--network full|basic]        … basic: registries, Git, AI APIs are enough
   task list|templates|show|open|logs [-f]|say   Follow and steer tasks; list the templates

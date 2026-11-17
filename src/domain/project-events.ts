@@ -34,9 +34,14 @@ export interface ProjectEvent {
   origin: ProjectEventOrigin;
   /** How many event→run→emit steps led here; bounded to stop loops. */
   hops: number;
+  /** The tavya person (user id) a run it starts acts as: a chat sender linked
+   *  to their account (src/integrations/chat-links.ts). Set only by the
+   *  platform when it ingests the event, never from its payload. */
+  actsAs?: string;
   /** How often this key has been recorded: a repeat is counted, not dropped. */
   count: number;
-  /** When it was last recorded (`receivedAt` is the first time). */
+  /** When it was last heard (`receivedAt` is the first time); what keeps it.
+   *  When it last happened is `lastHappenedAt`. */
   lastSeenAt: number;
   /** The latest repeats, newest last: what differed from the first (`payload`). */
   recent?: EventOccurrence[];
@@ -51,8 +56,17 @@ export interface ProjectEvent {
 export type ProjectEventRecord = Omit<ProjectEvent, 'id' | 'receivedAt' | 'count' | 'lastSeenAt' | 'recent' | 'distinct'>
   & { receivedAt?: number; occurrences?: number; distinct?: string[]; tally?: Record<string, string[]> };
 
-/** One repeat of an event's key, kept as a sample. */
+/** One repeat of an event's key, kept as a sample: \`at\` is when it happened
+ *  (its recorder's word, never later than when it was heard). */
 export interface EventOccurrence { at: number; payload: Record<string, unknown> }
+
+/** When the latest occurrence an event knows of happened, which is not when it
+ *  was last heard (\`lastSeenAt\`): a person may report today what a task
+ *  showed last week. Whether a fix held is judged by this. */
+export function lastHappenedAt(event: Pick<ProjectEvent, 'occurredAt' | 'receivedAt' | 'recent'>): number {
+  const first = Number.isFinite(event.occurredAt) ? Math.min(event.occurredAt, event.receivedAt) : event.receivedAt;
+  return Math.max(first, ...(event.recent ?? []).map((occurrence) => occurrence.at));
+}
 
 /** How many repeats an event keeps, how many values per tallied path, and how large a kept repeat may be. */
 export const EVENT_RECENT_OCCURRENCES = 3;
@@ -82,6 +96,8 @@ export interface ProjectEventClaim {
   concurrencyKey?: string;
   /** Its trigger's gate said to start it: it is not asked again while it waits. */
   gated?: boolean;
+  /** Why its gate let it start: kept through the waits after, onto the run it started. */
+  gateReason?: string;
   /** The event's receipt time: claims are retried oldest event first. */
   receivedAt: number;
   updatedAt: number;
@@ -99,6 +115,8 @@ export interface TriggerContext {
   payload: Record<string, unknown>;
   /** Rendered concurrency key, when the trigger declares one. */
   concurrencyKey?: string;
+  /** The event's `actsAs`, for the record; the platform reads it from the stored event. */
+  actsAs?: string;
   /** A counted event: how often it has happened, and when last. */
   count?: number;
   lastSeenAt?: number;
@@ -127,6 +145,11 @@ export interface KeyedRun {
   createdAt: number;
   updatedAt: number;
 }
+
+/** Thrown by a start that must never happen for this event (the person a
+ *  chat-started run would act as may no longer start tasks): the dispatcher
+ *  skips the event for that task instead of retrying it. */
+export class EventRunRefused extends Error {}
 
 export const MAX_EVENT_PAYLOAD_BYTES = 64 * 1024;
 export const MAX_EVENT_HOPS = 8;
@@ -353,6 +376,7 @@ export function triggerContext(event: ProjectEvent, concurrencyKey?: string): Tr
     hops: event.hops,
     payload: event.payload,
     ...(concurrencyKey ? { concurrencyKey } : {}),
+    ...(event.actsAs ? { actsAs: event.actsAs } : {}),
     ...(event.count > 1 ? { count: event.count, lastSeenAt: event.lastSeenAt, ...(event.recent?.length ? { recent: event.recent } : {}) } : {}),
     ...(event.distinct && Object.keys(event.distinct).length ? { distinct: event.distinct } : {}),
   };

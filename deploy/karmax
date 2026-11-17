@@ -23,7 +23,15 @@ note() { echo "• $*"; }
 # An image has no history, so the app is started with the commits that commit
 # is made of, newest first: at its first boot it says which of them the deploy
 # shipped (src/util/build-revision.ts, a `tavya.deployed` event).
+# Compose also recreates a container whose image ID changed, and BuildKit's
+# default provenance attestation is new at every build: a fully cached rebuild
+# of an unchanged Dockerfile got a new image ID, so every update recreated
+# PostgreSQL (with pg-backup) and Caddy under the running app, which lost its
+# database for ~15 s (tavya-error d035db8d7325aeb6, 2026-11-17; wiki
+# incidents/lessons). Without attestations an unchanged image keeps its ID.
+# (Compose 5.3's per-service `provenance: false` does not reach the bake build.)
 dc() {
+  BUILDX_NO_DEFAULT_ATTESTATIONS=1 \
   KARMAX_CADDYFILE_SHA256=$(sha256sum "$DEPLOY_DIR/Caddyfile" 2>/dev/null | cut -d' ' -f1) \
   KARMAX_REVISION=$(git -C "$ROOT_DIR" rev-parse --verify -q HEAD 2>/dev/null || true) \
   KARMAX_REVISION_HISTORY=$(git -C "$ROOT_DIR" log -n 500 --abbrev=12 --format=%h 2>/dev/null | tr '\n' ' ' || true) \
@@ -176,7 +184,8 @@ ensure_secrets() (
 # an image only when it is missing, so a changed Caddy.Dockerfile would never
 # reach a running edge otherwise). A rollback to a release whose postgresql
 # service is a stock image builds nothing for it. PostgreSQL's and Caddy's bases
-# are pinned and not re-pulled, so an unchanged image is never recreated.
+# are pinned and not re-pulled, and builds carry no attestations (dc), so an
+# unchanged image keeps its ID and its container is not recreated.
 build_images() {
   if [ "${1:-}" = --pull ]; then dc build --pull app && dc build postgresql caddy
   else dc build app postgresql caddy
@@ -187,7 +196,7 @@ build_images() {
 # (ghcr.io/…/karmax-app@sha256:…): staging and production run the same bytes.
 # Compose runs whatever carries the app service's image name, so deploying one
 # is tagging it with that name; PostgreSQL and Caddy are still built here (their
-# images change rarely and a rebuilt one is cached, so they are not recreated).
+# images change rarely, and a cached rebuild keeps its ID: see dc).
 RELEASE_IMAGE_FILE="$DEPLOY_DIR/.release-image"
 app_image() { printf '%s-app\n' "${COMPOSE_PROJECT_NAME:-karmax}"; }
 image_revision() {

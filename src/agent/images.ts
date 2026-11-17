@@ -139,3 +139,16 @@ export function materializeImageFiles(messages: Message[]): { files: string[]; c
     },
   };
 }
+
+/** The `content` of one user message for an OpenAI-compatible Chat Completions
+ * endpoint (`text` / `image_url` parts). A plain string without images. */
+export function chatUserContent(m: Message): string | any[] {
+  if (!m.images?.length) return m.text;
+  const blocks: any[] = [];
+  if (m.text) blocks.push({ type: 'text', text: m.text });
+  for (const ref of m.images) {
+    const got = attachments().readBase64(ref.id);
+    if (got) blocks.push({ type: 'image_url', image_url: { url: `data:${got.mediaType};base64,${got.base64}` } });
+  }
+  return blocks.length > (m.text ? 1 : 0) ? blocks : m.text;
+}

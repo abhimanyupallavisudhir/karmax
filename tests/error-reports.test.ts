@@ -16,7 +16,7 @@ import { STORE_TASKS } from '../src/domain/task-store.js';
 import { BRAND } from '../src/domain/brand.js';
 
 const stores: Store[] = [];
-afterEach(async () => { for (const store of stores.splice(0)) await store.close(); });
+afterEach(async () => { vi.restoreAllMocks(); for (const store of stores.splice(0)) await store.close(); });
 
 async function fixture() {
   const store = await Store.create(':memory:');
@@ -58,6 +58,21 @@ describe('error fingerprints', () => {
     expect(errorFingerprint('request', 'VaultError', 'x', vault))
       .not.toBe(errorFingerprint('request', 'VaultError', 'x', at('VaultStore.read (/app/src/autonomy/vault.ts:10:5)', 'Sweep.run (/app/src/world/runners.ts:1:1)')));
     expect(ownFrames(vault)).toEqual(['src/autonomy/vault.ts VaultStore.read', 'src/autonomy/broker.ts Broker.open']);
+  });
+
+  it('are one bug for an error that says only that a service tavya needs was out of reach, whichever call site met it', () => {
+    // 2026-11-17 13:02 UTC: a deploy restarted PostgreSQL under the running app, and two
+    // call sites that happened to query it became two keys and two fixer tasks (#978, #979).
+    const reconcile = at('Store.kvEntries (/app/src/store/db.ts:11326:11)', 'ServiceConnections.reconcile (/app/src/integrations/service-connections.ts:694:22)');
+    const request = at('Store.getCollaborationRequest (/app/src/store/db.ts:7103:18)', 'Timeout._onTimeout (/app/src/platform/api.ts:8103:24)');
+    const outage = errorFingerprint('rejection', 'DatabaseUnavailableError', 'database unavailable: the database system is shutting down', reconcile);
+    expect(errorFingerprint('request', 'DatabaseUnavailableError', 'database unavailable: getaddrinfo ENOTFOUND postgresql', request)).toBe(outage);
+    expect(errorFingerprint('escalation', 'DatabaseUnavailableError', 'Activity task failed → database unavailable: Connection terminated unexpectedly')).toBe(outage);
+    // Running out of room is another condition than being out of reach, and a bug at those sites is still its own.
+    expect(errorFingerprint('rejection', 'DatabaseCapacityError', 'database request capacity exceeded', reconcile))
+      .toBe(errorFingerprint('request', 'DatabaseCapacityError', 'database request capacity exceeded', request));
+    expect(errorFingerprint('rejection', 'DatabaseCapacityError', 'x', reconcile)).not.toBe(outage);
+    expect(errorFingerprint('rejection', 'Error', 'the database system is shutting down', reconcile)).not.toBe(outage);
   });
 
   it('never carry a credential the error text did', () => {
@@ -119,6 +134,30 @@ describe('the error reporter', () => {
     expect(all.every((event) => event.count === 3)).toBe(true);
   });
 
+  // 2026-11-17 07:31 UTC: a redeploy recreated PostgreSQL, and every count
+  // written in that minute was dropped ("could not write counted errors").
+  it('keeps what it could not write while the database is away, and writes it once it is back', async () => {
+    const { store, ops } = await fixture();
+    await store.kvSet(ERROR_REPORTS_KEY, JSON.stringify({ projectId: ops.id }));
+    let down = true;
+    const flaky = new Proxy(store, { get: (target, key) => key === 'recordProjectEvent'
+      ? async (...args: unknown[]) => { if (down) throw new Error('getaddrinfo ENOTFOUND postgresql'); return (target.recordProjectEvent as Function).apply(target, args); }
+      : typeof (target as any)[key] === 'function' ? (target as any)[key].bind(target) : (target as any)[key] });
+    const reporter = new ErrorReporter(flaky as Store, { now: () => 1_000_000, revision: 'r1', flushMs: 60_000 });
+    const lost = (message: string) => Object.assign(new Error(message), { name: 'Error', stack: undefined });
+    await expect(reporter.report({ kind: 'rejection', error: lost('connect ECONNREFUSED 172.18.0.2:5432'), organizationId: 'org_a' })).rejects.toThrow(/ENOTFOUND/);
+    for (let i = 0; i < 4; i++) await reporter.report({ kind: 'rejection', error: lost('connect ECONNREFUSED 172.18.0.2:5432'), organizationId: 'org_b' });
+    await expect(reporter.flush()).rejects.toThrow(/ENOTFOUND/);
+    await reporter.report({ kind: 'rejection', error: lost('connect ECONNREFUSED 172.18.0.2:5432') });
+    expect(await events(store, ops.id)).toEqual([]);
+    down = false;
+    await reporter.flush();
+    const [bug, ...others] = await events(store, ops.id);
+    expect(others).toEqual([]);
+    expect(bug).toMatchObject({ count: 6 });
+    expect(bug!.distinct).toMatchObject({ organizationId: ['org_a', 'org_b'], kind: ['rejection'] });
+  });
+
   it('counts a person\'s report of a task\'s error on the bug the platform reported it under', async () => {
     const { store, ops, customer } = await fixture();
     await store.kvSet(ERROR_REPORTS_KEY, JSON.stringify({ projectId: ops.id }));
@@ -140,6 +179,42 @@ describe('the error reporter', () => {
     await store.kvDelete(ERROR_REPORTS_KEY);
     reporter.invalidate();
     expect(await reportFromPerson(store, { by: 'user:usr_1', message: 'boom' })).toBe(false);
+  });
+});
+
+describe('a person\'s report of what a task shows', () => {
+  it('is an occurrence of when the task failed, under the revision then running if tavya knows it, else none', async () => {
+    const { store, ops, customer } = await fixture();
+    await store.kvSet(ERROR_REPORTS_KEY, JSON.stringify({ projectId: ops.id }));
+    let now = Date.parse('2026-11-17T07:09:26Z');
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    // The gateway's reporter, which a person's report goes through.
+    configureErrorReports(store, { revision: 'e387a8a8', role: 'gateway' });
+    // A task stopped in September, long before reports were on, and still shows it.
+    const failedAt = Date.parse('2026-09-26T21:40:00Z');
+    const old = 'Activity task failed → GitHub API 422: {"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"custom","message":"No commits between a and b"}]}';
+    expect(await reportFromPerson(store, { by: 'user:usr_1', task: { id: 'task_old', projectId: customer.id, error: old, stage: 'done', failedAt } })).toBe(true);
+    const [bug] = await events(store, ops.id);
+    expect(bug).toMatchObject({ occurredAt: failedAt, receivedAt: now });
+    expect(bug!.payload).toMatchObject({ kind: 'reported', occurredAt: new Date(failedAt).toISOString(), taskId: 'task_old' });
+    expect(bug!.payload.revision).toBeUndefined(); // not the revision running when it was reported
+    expect(bug!.distinct?.revision).toBeUndefined();
+    // One tavya reported itself: the person's report is that occurrence's, at its time and revision, wherever it is reported from.
+    const text = 'infrastructure: could not reach the VM over SSH: Timed out while waiting for handshake';
+    now = Date.parse('2026-11-17T08:00:00Z');
+    const worker = new ErrorReporter(store, { now: () => now, revision: 'rev-then', role: 'worker' });
+    const first = (await worker.report({ kind: 'escalation', error: Object.assign(new Error(text), { name: 'Escalation', stack: undefined }), taskId: 'task_new', projectId: customer.id }))!;
+    const escalatedAt = now;
+    now += 3 * 3_600_000;
+    expect(await reportFromPerson(store, { by: 'user:usr_1', task: { id: 'task_new', projectId: customer.id, error: text, stage: 'do', failedAt: now - 60_000 } })).toBe(true);
+    const counted = (await events(store, ops.id)).find((event) => event.id === first.id)!;
+    expect(counted).toMatchObject({ count: 2 });
+    expect(counted.recent!.at(-1)).toMatchObject({ at: escalatedAt, payload: { kind: 'reported', revision: 'rev-then' } });
+    expect(counted.distinct?.revision).toEqual(['rev-then']);
+    // In their own words it is of now and of what runs now.
+    expect(await reportFromPerson(store, { by: 'user:usr_1', message: 'HTTP 502', where: '/org/project' })).toBe(true);
+    const own = (await events(store, ops.id)).find((event) => event.payload.message === 'HTTP 502')!;
+    expect(own).toMatchObject({ lastSeenAt: now, payload: { revision: 'e387a8a8' } });
   });
 });
 

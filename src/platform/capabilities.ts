@@ -83,6 +83,43 @@ export const CHILD_TASK_CEILING: Capability[] = [
   'create-sub-task', 'create-review-info', 'signal-completion', 'save-skill',
 ];
 
+/**
+ * What a task without a computer holds back from its grant unless the person
+ * who creates it keeps one explicitly (wiki features/computerless-tasks, SPEC
+ * §8.2): the irreversible operations. Such a task acts with a person's
+ * authority while reading text it did not write (task output, event payloads,
+ * chat messages), so prompt injection could turn that authority against them.
+ * The agent asks for one with `request_permission`, naming it exactly (a card
+ * as `use-card:<id>`), and the person approves as for any other request.
+ */
+export const IRREVERSIBLE_CAPABILITIES: Capability[] = [
+  'task:delete', 'project:delete', 'organization:delete', 'organization:member:write', 'team:write',
+  'authorization:write', 'user:write', 'credential:reveal', 'payment:write', 'use-card:*',
+];
+
+/** Every grantable capability and family, legacy spellings included: what a
+ * grant attenuated by a ceiling built from it can keep. */
+const GRANTABLE: Capability[] = [...CAPABILITIES, 'use-credential:*',
+  'create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'];
+
+/** `grant` without `held` (exact capabilities or families). Wildcards in the
+ * grant expand to the concrete capabilities they cover, so `*` or `task:*`
+ * cannot carry a held-back one through. */
+export function withoutCapabilities(grant: Capability[], held: Capability[]): Capability[] {
+  if (!held.length) return [...grant];
+  const ceiling = GRANTABLE.filter((capability) => !held.some((pattern) => capMatches(pattern, capability) || capMatches(capability, pattern)));
+  return attenuate(ceiling, grant);
+}
+
+/** The irreversible capabilities a computerless task holds back: all of them
+ * but those its creator explicitly keeps. Unknown names are refused. */
+export function heldBackCapabilities(keep: Capability[] | undefined): Capability[] {
+  const kept = (keep ?? []).map((capability) => normalizeCapability(String(capability).trim()));
+  const unknown = kept.filter((capability) => !IRREVERSIBLE_CAPABILITIES.includes(capability));
+  if (unknown.length) throw new Error(`only irreversible capabilities can be kept: ${unknown.join(', ')} (one of ${IRREVERSIBLE_CAPABILITIES.join(', ')})`);
+  return IRREVERSIBLE_CAPABILITIES.filter((capability) => !kept.includes(capability));
+}
+
 export interface CapabilityDefinition {
   id: KnownCapability;
   label: string;
@@ -280,7 +317,8 @@ export function effectiveAllows(ceiling: Capability[], grantor: Capability[], re
 }
 
 /** The capabilities a tool requires to be invoked (used by the platform MCP). */
-export const TOOL_CAPABILITY: Record<string, Capability> = {
+/** What each platform tool requires: catalogue capabilities only (see routeCapability). */
+export const TOOL_CAPABILITY: Record<string, KnownCapability> = {
   create_task: 'task:create', queue_task: 'task:create', edit_task: 'task:edit', delete_task: 'task:delete', emit_event: 'task:create',
   create_sub_task: 'task:create', respond_to_sub_task: 'task:signal', wait_for_subtasks: 'task:read',
   raise_to_parent: 'task:signal', create_review_info: 'task:review:write', signal_completion: 'task:signal',

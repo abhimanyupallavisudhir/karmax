@@ -41,6 +41,8 @@ import { isRemoteAgentWorld, remoteAgentEnv, spawnRemoteAgentProcess, type Remot
 import { exportRemoteAcpSession, multiplexAcpChannel, prepareRemoteAcpTurn, remoteAcpSupported, type RemoteAcpTurn } from './remote-acp.js';
 import { worldWorkingDirectory } from '../world/types.js';
 import type { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './types.js';
+import { runChatCompletionsTurn } from './computerless.js';
+import { ClaudeAdapter } from './claude.js';
 import { BRAND } from '../domain/brand.js';
 import { ProviderStreamError, SandboxProviderFailure } from './limits.js';
 
@@ -370,6 +372,18 @@ export class AcpAdapter implements AgentAdapter {
     const unsubscribe = ctx.onSecretEnvChange?.(work.update);
     try { return await this.runAcpTurn(input, ctx, work.plugin); }
     finally { unsubscribe?.(); work.cleanup(); }
+  }
+
+  /** A task without a computer: OpenCode's model through its vendor's
+   * OpenAI-compatible Chat Completions API (tavya's included model on
+   * OpenRouter, or a key of the organization's own), or an Anthropic model
+   * through the Messages API — host-side, with only tavya's own tools. */
+  async runComputerlessTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    if (credentialProvider(input.profile) === 'anthropic') {
+      const model = modelProviderFromModel(input.profile.model) ? input.profile.model!.slice(input.profile.model!.indexOf('/') + 1) : input.profile.model;
+      return new ClaudeAdapter().runComputerlessTurn({ ...input, profile: { ...input.profile, provider: 'claude', ...(model ? { model } : {}) } }, ctx);
+    }
+    return runChatCompletionsTurn(input, ctx);
   }
 
   private async runAcpTurn(input: TurnInput, ctx: PlatformToolContext, workPlugin?: string): Promise<AdapterTurn> {

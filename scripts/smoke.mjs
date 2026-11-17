@@ -12,8 +12,10 @@
 // With SMOKE_TOKEN (a personal token of a member of the smoke project) and
 // SMOKE_PROJECT_ID it also runs a real task end to end: a world on the
 // project's computer, one turn of the project's agent (or the agent and
-// computer SMOKE_TASK_PARAMS names, as task params JSON), which must answer a sum
-// it was not told. The task is then cancelled and archived.
+// computer SMOKE_TASK_PARAMS names, as task params JSON), which must answer
+// what the prompt does not contain: a random code it is asked to repeat in
+// capital letters (not a sum: a small model gets those wrong, and the check is
+// of tavya, not of arithmetic). The task is then cancelled and archived.
 //
 // Dependency-free on purpose: CI runs it from a bare checkout.
 import { spawnSync } from 'node:child_process';
@@ -143,12 +145,11 @@ export async function runSmoke(options, env = process.env, log = console.log) {
       expectStatus(reply, 200, 'the smoke project');
     });
     await step('task', async () => {
-      const a = 1000 + Math.floor(Math.random() * 8000);
-      const b = 1000 + Math.floor(Math.random() * 8000);
-      const answer = String(a + b);
+      const code = Array.from({ length: 10 }, () => String.fromCharCode(97 + Math.floor(Math.random() * 26))).join('');
+      const answer = code.toUpperCase();
       const created = await request('POST', `/api/projects/${encodeURIComponent(projectId)}/tasks`, {
         title: `Smoke check ${new Date().toISOString().slice(0, 16)}Z${options.revision ? ` ${options.revision.slice(0, 8)}` : ''}`,
-        prompt: `This is an automated check of tavya. Reply with only the value of ${a} + ${b}, then end your turn. Do not use any tools.`,
+        prompt: `This is an automated check of tavya. Reply with only this code in capital letters: ${code}, then end your turn. Do not use any tools.`,
         ...(taskParams ? { params: taskParams } : {}),
       }, true);
       expectStatus(created, 200, 'creating the task');
@@ -159,18 +160,19 @@ export async function runSmoke(options, env = process.env, log = console.log) {
       try {
         for (;;) {
           const conversation = await request('GET', `/api/tasks/${taskId}/conversation?role=do`, undefined, true);
-          if (conversation.status === 200) {
-            const messages = conversation.json().messages ?? [];
-            if (messages.some((message) => message?.role === 'agent' && String(message?.text ?? '').includes(answer)))
-              return `task ${taskId} answered`;
-          }
+          const replies = conversation.status === 200
+            ? (conversation.json().messages ?? []).filter((message) => message?.role === 'agent').map((message) => String(message?.text ?? '')) : [];
+          if (replies.some((text) => text.includes(answer))) return `task ${taskId} answered`;
           const view = await request('GET', `/api/tasks/${taskId}`, undefined, true);
           if (view.status === 200) {
             const task = view.json();
             last = `stage ${task.stage}, status ${task.status}${task.waitingFor?.summary ? `, ${task.waitingFor.summary}` : ''}`;
             if (['failed', 'cancelled'].includes(task.status)) fail(`task ${taskId} ${task.status}: ${task.error ?? last}`);
+            // Its turn is over and it said something else: waiting longer changes nothing.
+            if (replies.length && task.status !== 'active')
+              fail(`task ${taskId} answered ${JSON.stringify(replies.at(-1).slice(0, 120))}, not ${answer} (${last})`);
           }
-          if (Date.now() > deadline) fail(`task ${taskId} did not answer ${a} + ${b} in time (${last})`);
+          if (Date.now() > deadline) fail(`task ${taskId} did not answer ${answer} in time (${last})`);
           await new Promise((resolve) => setTimeout(resolve, 5_000));
         }
       } finally {

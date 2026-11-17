@@ -65,11 +65,15 @@ archived() {
   echo "segment $wal was not archived" >&2; cat "$work/server.log" >&2; return 1
 }
 step 'a transaction before the target and one after it'
-psql -XqA -d karmax -c "INSERT INTO tasks VALUES ('kept'); INSERT INTO events (ts, payload) VALUES (1000, 'before')"
+# Markers long enough never to occur by chance in the encrypted bucket below:
+# a four-letter word does, in tens of megabytes of ciphertext (CI #2960).
+kept=kept-row-before-target-5b1e9d47
+before=event-before-target-c47a02e8
+psql -XqA -d karmax -c "INSERT INTO tasks VALUES ('$kept'); INSERT INTO events (ts, payload) VALUES (1000, '$before')"
 archived
 target=$(psql -XAt -d postgres -c "SELECT now()")
 sleep 1.2
-psql -XqA -d karmax -c "INSERT INTO tasks VALUES ('lost'); INSERT INTO events (ts, payload) VALUES (2000, 'after')"
+psql -XqA -d karmax -c "INSERT INTO tasks VALUES ('lost-row-after-target-91f0c3aa'); INSERT INTO events (ts, payload) VALUES (2000, 'event-after-target-3d6b7e21')"
 archived
 
 step 'status reports archiving and the base backup as current'
@@ -87,13 +91,13 @@ unix_socket_directories = '$work/sock'
 port = 55433
 EOF
 pg_ctl -D "$work/restore" -w -l "$work/restored.log" start >/dev/null
-[ "$(psql -XAt -p 55433 -d karmax -c "SELECT string_agg(id, ',' ORDER BY id) FROM tasks")" = kept ]
-[ "$(psql -XAt -p 55433 -d karmax -c "SELECT string_agg(payload, ',') FROM events")" = before ]
+[ "$(psql -XAt -p 55433 -d karmax -c "SELECT string_agg(id, ',' ORDER BY id) FROM tasks")" = "$kept" ]
+[ "$(psql -XAt -p 55433 -d karmax -c "SELECT string_agg(payload, ',') FROM events")" = "$before" ]
 [ "$(psql -XAt -p 55433 -d postgres -c 'SHOW archive_mode')" = off ]
 
 step 'the backup is unreadable without the private key'
 fail() { echo "FAILED: $*" >&2; exit 1; }
-if grep -rqa -e "'before'" -e 'kept' "$work/bucket"; then fail 'the bucket holds plaintext'; fi
+if grep -rqa -e "$before" -e "$kept" "$work/bucket"; then fail 'the bucket holds plaintext'; fi
 mkdir -m 700 "$work/nokey" "$work/other"
 if PGDATA=$work/nokey KARMAX_PG_BACKUP_PRIVATE_KEY=$KEYS/pg_backup_public_key "$script" restore 2>"$work/nokey.err"; then
   fail 'restored with a public key'

@@ -4,7 +4,9 @@ import { notPullRequestSql, pullRequestOf, type PullRequestOf } from '../domain/
 export interface TaskHeader { id: string; num?: number; title: string; projectId: string; status?: string; stage?: string;
   /** Set when the row is a pull request of its task (SPEC §11.1): the header is its task's. */
   pullRequest?: { taskId: string; checkout: string } }
-import { ANY_PROVIDER, applyComputer, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
+import { ANY_PROVIDER, applyComputer, normalizeComputer, LOCAL_WORLD_KINDS, runsOnHost, type ComputerSpec } from '../domain/computer.js';
+/** The local world kinds as an SQL list (`NOT IN (…)`): constants, never input. */
+const LOCAL_KINDS_SQL = LOCAL_WORLD_KINDS.map((kind) => `'${kind}'`).join(',');
 import { AdmissionBackpressureError } from '../domain/admission-error.js';
 import { utf8Tail } from '../util/utf8-tail.js';
 import * as __asyncCollections from '../util/async-collections.js';
@@ -64,6 +66,10 @@ import {
   InboxItem,
   CredentialNotice,
   DeliveryPreferences,
+  DeliveryChannel,
+  PushSubscriptionInput,
+  PushSubscriptionRecord,
+  Urgency,
   OrganizationIdentityPolicy,
   WorldCheckpoint,
   RunnerPool,
@@ -81,6 +87,7 @@ import {
   StorageLocation,
   StorageLocationUsage,
   DEFAULT_URGENCY,
+  PUSH_DEFAULT_URGENCIES,
   URGENCY_LEVELS,
   normalizeUrgency,
   urgencyRank,
@@ -100,7 +107,7 @@ import {
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
 import type { TaskTemplateContent } from '../domain/task-templates.js';
-import { normalizeFollowUpTriggers, type FollowUpTrigger } from '../domain/triggers.js';
+import { normalizeFollowUpTriggers, taskUnstarted, type FollowUpTrigger } from '../domain/triggers.js';
 import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, EVENT_DISTINCT_VALUES, EVENT_OCCURRENCE_BYTES, EVENT_RECENT_OCCURRENCES,
   boundEventPayload, valuesAtPath, type EventFollow, type EventOccurrence, type KeyedRun, type ProjectEvent, type ProjectEventClaim, type ProjectEventRecord,
   type ProjectEventClaimState } from '../domain/project-events.js';
@@ -298,6 +305,10 @@ export const STORE_LOCK_ORDER = [
 
 /** Advisory lock namespaces registering in-flight seqs per table (PostgreSQL); see migrate(). */
 const SEQ_KEYS = { events: 1802661240, audit_log: 1802661340 } as const;
+
+/** What the retention sweep leaves of a lapsed human delegation, and for how long. */
+const PURGED_DELEGATION = '{}';
+const PURGED_DELEGATION_KEPT_MS = 365 * 86_400_000;
 
 export class Store {
   /** Compound service mutations must include their reads in this boundary. */
@@ -1005,6 +1016,17 @@ export class Store {
         claimedAt INTEGER, lastError TEXT, createdAt INTEGER NOT NULL, deliveredAt INTEGER,
         UNIQUE (inboxId, channel)
       );
+      -- A person's devices receiving push: one row per browser subscription
+      -- (kind web: endpoint = the push service URL) or phone app (kind fcm:
+      -- endpoint = its FCM registration token, p256dh/auth empty), so a device
+      -- that a second person subscribes moves to them.
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id TEXT PRIMARY KEY, userId TEXT NOT NULL, endpoint TEXT NOT NULL UNIQUE,
+        p256dh TEXT NOT NULL, auth TEXT NOT NULL, label TEXT,
+        createdAt INTEGER NOT NULL, lastPushedAt INTEGER,
+        kind TEXT NOT NULL DEFAULT 'web', platform TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(userId);
       CREATE TABLE IF NOT EXISTS organization_identity_policy (
         organizationId TEXT PRIMARY KEY, oidcProviderId TEXT, verifiedDomains TEXT NOT NULL,
         enforceSso INTEGER NOT NULL, scimTokenId TEXT, scimTokenHash TEXT, updatedAt INTEGER NOT NULL
@@ -1098,7 +1120,7 @@ export class Store {
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
         source TEXT NOT NULL, type TEXT NOT NULL, eventKey TEXT NOT NULL, subject TEXT,
         occurredAt INTEGER NOT NULL, receivedAt INTEGER NOT NULL, payload TEXT NOT NULL,
-        origin TEXT NOT NULL, hops INTEGER NOT NULL, dispatchedAt INTEGER,
+        origin TEXT NOT NULL, hops INTEGER NOT NULL, dispatchedAt INTEGER, actsAs TEXT,
         count INTEGER NOT NULL DEFAULT 1, lastSeenAt INTEGER, recent TEXT, distinctValues TEXT,
         dispatchedCount INTEGER NOT NULL DEFAULT 0,
         UNIQUE (projectId, source, eventKey)
@@ -1130,6 +1152,7 @@ export class Store {
         eventId TEXT NOT NULL, taskId TEXT NOT NULL, state TEXT NOT NULL, reason TEXT,
         runId TEXT, concurrencyKey TEXT, receivedAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
         gated INTEGER NOT NULL DEFAULT 0,
+        gateReason TEXT,
         PRIMARY KEY (eventId, taskId)
       );
       -- Hosted SaaS subscriptions are a separate ledger from agent spending
@@ -1406,8 +1429,17 @@ export class Store {
     if (!providerCols.some(column => column.name === 'limits')) await this.db.exec('ALTER TABLE world_provider_connections ADD COLUMN limits TEXT');
     const preferenceCols = await this.db.prepare('PRAGMA table_info(user_preferences)').all() as { name: string }[];
     if (!preferenceCols.some(column => column.name === 'dismissed')) await this.db.exec('ALTER TABLE user_preferences ADD COLUMN dismissed TEXT');
+    // Phone apps' native push devices (wiki features/phone-apps) beside browsers.
+    const pushCols = await this.db.prepare('PRAGMA table_info(push_subscriptions)').all() as { name: string }[];
+    if (!pushCols.some(column => column.name === 'kind')) {
+      await this.db.exec("ALTER TABLE push_subscriptions ADD COLUMN kind TEXT NOT NULL DEFAULT 'web'");
+      await this.db.exec('ALTER TABLE push_subscriptions ADD COLUMN platform TEXT');
+    }
     const repositoryCols = await this.db.prepare('PRAGMA table_info(repositories)').all() as { name: string }[];
     if (!repositoryCols.some(column => column.name === 'upstream')) await this.db.exec('ALTER TABLE repositories ADD COLUMN upstream TEXT');
+    // The person a chat-started run acts as (src/integrations/chat-links.ts).
+    const actsAsCols = await this.db.prepare('PRAGMA table_info(project_events)').all() as { name: string }[];
+    if (!actsAsCols.some(column => column.name === 'actsAs')) await this.db.exec('ALTER TABLE project_events ADD COLUMN actsAs TEXT');
     const savedViewCols = await this.db.prepare('PRAGMA table_info(saved_views)').all() as { name: string }[];
     if (!savedViewCols.some(column => column.name === 'organizationId')) await this.db.exec('ALTER TABLE saved_views ADD COLUMN organizationId TEXT');
     await this.db.exec('CREATE INDEX IF NOT EXISTS idx_saved_views_organization ON saved_views(organizationId)');
@@ -1428,6 +1460,8 @@ export class Store {
     }
     const eventClaimCols = await this.db.prepare('PRAGMA table_info(project_event_claims)').all() as { name: string }[];
     if (!eventClaimCols.some(column => column.name === 'gated')) await this.db.exec('ALTER TABLE project_event_claims ADD COLUMN gated INTEGER NOT NULL DEFAULT 0');
+    // What its gate said about a run it let start (a skip says it in \`reason\`).
+    if (!eventClaimCols.some(column => column.name === 'gateReason')) await this.db.exec('ALTER TABLE project_event_claims ADD COLUMN gateReason TEXT');
     await this.db.exec('CREATE INDEX IF NOT EXISTS idx_keyed_runs_task ON keyed_runs(taskId)');
     const candidateCols = await this.db.prepare('PRAGMA table_info(resource_candidates)').all() as { name: string }[];
     if (!candidateCols.some(column => column.name === 'error')) await this.db.exec('ALTER TABLE resource_candidates ADD COLUMN error TEXT');
@@ -1936,7 +1970,7 @@ export class Store {
       environment: policy.environment ? { ...current.environment, ...policy.environment } : current.environment,
     };
     validateProjectExecutionConfig(next as ProjectConfig);
-    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && ['worktree', 'container', 'memory'].includes(next.worldProvider ?? 'e2b'))
+    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && runsOnHost(next.worldProvider ?? 'e2b'))
       throw new Error('hosted organizations require a remote world provider');
     for (const project of (await this.listProjects()).filter((candidate) => candidate.organizationId === organizationId)) {
       if (next.monthlyBudgetMicros != null && project.config.monthlyBudgetMicros != null
@@ -2096,7 +2130,7 @@ export class Store {
     const organizationBudget = (await this.getOrganizationExecutionPolicy(existing.organizationId ?? 'org_personal')).monthlyBudgetMicros;
     if (organizationBudget != null && effective.monthlyBudgetMicros != null && effective.monthlyBudgetMicros > organizationBudget)
       throw new Error('project cloud budget cannot exceed the organization budget');
-    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && ['worktree', 'container', 'memory'].includes(effective.worldProvider ?? 'e2b'))
+    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && runsOnHost(effective.worldProvider ?? 'e2b'))
       throw new Error('hosted projects require a remote world provider');
     (await this.db.prepare('UPDATE projects SET config = ? WHERE id = ?').run(JSON.stringify(config), id));
     return candidate;
@@ -2111,7 +2145,7 @@ export class Store {
     if (!existing) throw new Error(`no project ${id}`);
     const merged = writableProjectConfig({ ...existing.config, ...config });
     validateProjectExecutionConfig(merged);
-    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && ['worktree', 'container', 'memory'].includes(merged.worldProvider ?? 'e2b'))
+    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && runsOnHost(merged.worldProvider ?? 'e2b'))
       throw new Error('hosted projects require a remote world provider');
     (await this.db.prepare('UPDATE projects SET config = ? WHERE id = ?').run(JSON.stringify(merged), id));
     // An unpinned resource or secret location is relative to the working folder,
@@ -2178,6 +2212,9 @@ export class Store {
       // PostgreSQL from parsing every other kv value as JSON.
       (await this.db.prepare(`DELETE FROM kv WHERE k LIKE 'incoming-webhook:%'
         AND (CASE WHEN k LIKE 'incoming-webhook:%' THEN json_extract(v, '$.projectId') END)=?`).run(id));
+      // Chat accounts linked through its bots, and open link offers (src/integrations/chat-links.ts).
+      (await this.db.prepare(`DELETE FROM kv WHERE k LIKE 'chat-link%'
+        AND (CASE WHEN k LIKE 'chat-link%' THEN json_extract(v, '$.projectId') END)=?`).run(id));
       (await this.db.prepare('DELETE FROM preview_leases WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM executions WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM promoted_artifacts WHERE projectId=?').run(id));
@@ -2295,7 +2332,7 @@ export class Store {
     const activeWorlds = (await this.getOrganizationUsagePolicy(organizationId)).maxActiveWorlds;
     for (const pool of (await this.listRunnerPools(organizationId))) {
       // Only the capacity: an administrator's concurrent edit of the pool stands.
-      if (pool.mode === 'customer' && !['worktree', 'container', 'memory'].includes(pool.provider))
+      if (pool.mode === 'customer' && !LOCAL_WORLD_KINDS.includes(pool.provider))
         (await this.db.prepare('UPDATE runner_pools SET capacity=? WHERE id=?').run(JSON.stringify({ ...pool.capacity, activeWorlds }), pool.id));
     }
     (await this.reconcileWorldLeaseCapacity(organizationId));
@@ -3000,6 +3037,8 @@ export class Store {
       preferences: { defaultOrganizationId: ((await this.db.prepare('SELECT defaultOrganizationId FROM user_preferences WHERE userId=?')
         .get(userId)) as { defaultOrganizationId: string } | undefined)?.defaultOrganizationId ?? (await this.defaultOrganization(userId))?.id ?? null,
         ...(await this.userPreferences(userId)) },
+      // The devices receiving push, without their endpoint and keys (credentials, like tokens).
+      pushDevices: (await this.listPushSubscriptions(userId)).map(({ id, kind, label, createdAt, lastPushedAt }) => ({ id, kind, label, createdAt, lastPushedAt })),
       security: {
         secretsIncluded: false,
         omitted: ['password hashes', 'session tokens', 'OAuth tokens and state', 'credential values and handles',
@@ -3136,6 +3175,8 @@ export class Store {
       (await this.db.prepare('DELETE FROM automation_templates WHERE organizationId=?').run(organizationId));
       (await this.db.prepare(`DELETE FROM kv WHERE k LIKE 'incoming-webhook:%'
         AND (CASE WHEN k LIKE 'incoming-webhook:%' THEN json_extract(v, '$.organizationId') END)=?`).run(organizationId));
+      (await this.db.prepare(`DELETE FROM kv WHERE k LIKE 'chat-link%'
+        AND (CASE WHEN k LIKE 'chat-link%' THEN json_extract(v, '$.organizationId') END)=?`).run(organizationId));
       (await this.db.prepare('DELETE FROM payment_events WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM payment_transactions WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM payment_spend_requests WHERE organizationId=?').run(organizationId));
@@ -4654,20 +4695,21 @@ export class Store {
    * Write the shared Review route of a logical task. It is shared across attempts
    * (activities/core.ts) — never per-attempt — so this is the only writer.
    *
-   * The draft-only guard exists because the *task form* has no idea whether a live
-   * attempt's gate has already played. `inFlight` is the caller (KarmaxApi.updateParams)
+   * The unstarted-only guard exists because the *task form* has no idea whether a live
+   * attempt's gate has already played; one that has not started (a draft, a task
+   * waiting for its trigger, a series, whose runs each copy the route) has none. `inFlight` is the caller (KarmaxApi.updateParams)
    * saying the live workflow itself accepted the edit, which means it authoritatively
    * had not consumed the route yet: the route is `untilUsed`, not `queue` (SPEC §4.5/§5.5).
    */
   async setIntentConfirmer(intentId: string, field: string, confirmer: unknown, opts?: { inFlight?: boolean }) {
     return this.db.transaction(async () => {
-    // Whether every attempt is still a draft is decided under their rows.
+    // Whether every attempt is still unstarted is decided under their rows.
     if (this.db.dialect === 'postgres') (await this.db.prepare('SELECT id FROM tasks WHERE intentId = ? ORDER BY id FOR UPDATE').all(intentId));
     (await this.lockIntent(intentId));
 
     const attempts = (await this.attemptsOf(intentId));
     const group = (await this.attemptGroup(intentId));
-    if (!opts?.inFlight && attempts.some((a) => !a.params.draft)) {
+    if (!opts?.inFlight && attempts.some((a) => !taskUnstarted(a.params))) {
       // Full-form replacement includes disabled controls too. Re-sending the
       // existing shared value is harmless; only an actual divergence is locked.
       if (JSON.stringify(group?.confirmer) === JSON.stringify(confirmer)) return;
@@ -4681,7 +4723,7 @@ export class Store {
 
   async taskMetadata(id: string): Promise<TaskRecord | undefined> {
     const row = (await this.db.prepare(`SELECT id, num, projectId, listId, title, workflow,
-      executionWorkflow, workflowVersion, params, createdAt, ord, parentTaskId,
+      executionWorkflow, workflowVersion, params, createdAt, statusChangedAt, ord, parentTaskId,
       createdBy, assignee, delegate, confirmationPolicy, intentId, attemptNumber,
       notes, lastView FROM tasks WHERE id=?`).get(id)) as any;
     return row ? rowToTask(row) : undefined;
@@ -5712,12 +5754,7 @@ export class Store {
         id, organizationId, userId, createdAt * 1000, `credential:${notice.credentialKey}`,
         urgencyRank('critical'), createdAt, JSON.stringify(notice)));
       if (!Number(inserted.changes)) continue;
-      const preferences = (await this.getDeliveryPreferences(userId, organizationId));
-      const channels = [preferences.browser && 'browser', (preferences.emailUrgencies?.critical ?? preferences.email) && 'email', preferences.slack && 'slack']
-        .filter(Boolean) as string[];
-      for (const channel of channels) (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
-        (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
-        .run(newId('delivery'), id, channel, createdAt, createdAt));
+      (await this.queueDeliveries(id, userId, (await this.getDeliveryPreferences(userId, organizationId)), 'critical', createdAt));
     }
 
     });
@@ -5758,11 +5795,9 @@ export class Store {
           JSON.stringify({ kind: 'compute', ...notice })));
         if (!Number(inserted.changes)) continue;
         told++;
-        const preferences = (await this.getDeliveryPreferences(userId, organizationId));
-        for (const channel of [preferences.browser && 'browser', preferences.slack && 'slack'].filter(Boolean) as string[])
-          (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
-            (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
-            .run(newId('delivery'), id, channel, createdAt, createdAt));
+        // Email is the notifier's own (compute-notices.ts).
+        (await this.queueDeliveries(id, userId, (await this.getDeliveryPreferences(userId, organizationId)),
+          notice.stage === 'reminder' || notice.stage === 'hibernated' ? 'critical' : 'high', createdAt, { email: false }));
       }
       return told;
     });
@@ -5791,11 +5826,8 @@ export class Store {
           id, organizationId, userId, createdAt * 1000, `storage:${organizationId}`, urgencyRank(urgency), createdAt,
           JSON.stringify({ kind: 'storage', ...notice })));
         if (!Number(inserted.changes)) continue;
-        const preferences = (await this.getDeliveryPreferences(userId, organizationId));
-        for (const channel of [preferences.browser && 'browser', preferences.slack && 'slack'].filter(Boolean) as string[])
-          (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
-            (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
-            .run(newId('delivery'), id, channel, createdAt, createdAt));
+        // Email is the notifier's own (storage-notices.ts).
+        (await this.queueDeliveries(id, userId, (await this.getDeliveryPreferences(userId, organizationId)), urgency, createdAt, { email: false }));
       }
     });
   }
@@ -5825,18 +5857,89 @@ export class Store {
           id, entry.organizationId, entry.userId, createdAt * 1000, `service-limit:${entry.key}`, urgencyRank(entry.urgency), createdAt,
           JSON.stringify({ ...entry.subject, kind: 'service-limit' })));
         if (!Number(inserted.changes) || !entry.deliver) continue;
-        const preferences = (await this.getDeliveryPreferences(entry.userId, entry.organizationId));
-        for (const channel of [preferences.browser && 'browser', preferences.slack && 'slack'].filter(Boolean) as string[])
-          (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
-            (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
-            .run(newId('delivery'), id, channel, createdAt, createdAt));
+        // Email is the notifier's own (service-limits).
+        (await this.queueDeliveries(id, entry.userId, (await this.getDeliveryPreferences(entry.userId, entry.organizationId)),
+          entry.urgency, createdAt, { email: false }));
       }
     });
   }
 
   async getDeliveryPreferences(userId: string, organizationId: string): Promise<DeliveryPreferences> {
     const r = (await this.db.prepare('SELECT json FROM delivery_preferences WHERE userId=? AND organizationId=?').get(userId, organizationId)) as any;
-    return r ? JSON.parse(r.json) : { userId, organizationId, browser: true, email: false, slack: false, routine: true };
+    const stored: DeliveryPreferences = r ? JSON.parse(r.json) : { userId, organizationId, browser: true, email: false, slack: false, routine: true };
+    return { ...stored, pushUrgencies: { ...PUSH_DEFAULT_URGENCIES, ...stored.pushUrgencies } };
+  }
+
+  /**
+   * Queue an inbox item's deliveries for the channels its person chose at its
+   * urgency: the browser, email (unless the caller emails by itself), Slack,
+   * and push when they have a device subscribed.
+   */
+  private async queueDeliveries(inboxId: string, userId: string, preferences: DeliveryPreferences, urgency: Urgency,
+    at: number, options: { email?: boolean } = {}): Promise<void> {
+    const channels: DeliveryChannel[] = [];
+    if (preferences.browser) channels.push('browser');
+    if (options.email !== false && (preferences.emailUrgencies?.[urgency] ?? preferences.email)) channels.push('email');
+    if (preferences.slack) channels.push('slack');
+    if ((preferences.pushUrgencies?.[urgency] ?? PUSH_DEFAULT_URGENCIES[urgency])
+      && (await this.db.prepare('SELECT 1 FROM push_subscriptions WHERE userId=? LIMIT 1').get(userId))) channels.push('push');
+    for (const channel of channels) (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
+      (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
+      .run(newId('delivery'), inboxId, channel, at, at));
+  }
+
+  /** Subscribe a device to a person's pushes. An endpoint (a browser) or an
+   * FCM token (a phone app) is one device: the same one subscribed again keeps
+   * its row (fresh keys), and subscribed by someone else moves to them. A phone
+   * whose token rotated names its previous row in `replaces`, which goes if it
+   * is the caller's own. */
+  async savePushSubscription(userId: string, input: PushSubscriptionInput, now = Date.now()): Promise<PushSubscriptionRecord> {
+    const native = 'kind' in input && input.kind === 'fcm';
+    const address = native ? input.token : input.endpoint;
+    const [p256dh, auth] = native ? ['', ''] : [input.keys.p256dh, input.keys.auth];
+    const platform = native ? input.platform : null;
+    return this.db.transaction(async () => {
+      (await this.db.lock(`push-subscription:${address}`));
+      if (native && input.replaces)
+        (await this.db.prepare('DELETE FROM push_subscriptions WHERE id=? AND userId=? AND endpoint<>?').run(input.replaces, userId, address));
+      const existing = (await this.db.prepare('SELECT id, userId FROM push_subscriptions WHERE endpoint=?').get(address)) as PushSubscriptionRow | undefined;
+      const label = input.label?.trim().slice(0, 80) || null;
+      if (existing && String(existing.userId) === userId) {
+        (await this.db.prepare('UPDATE push_subscriptions SET p256dh=?, auth=?, label=?, kind=?, platform=? WHERE id=?')
+          .run(p256dh, auth, label, native ? 'fcm' : 'web', platform, existing.id));
+        return (await this.pushSubscription(String(existing.id)))!;
+      }
+      if (existing) (await this.db.prepare('DELETE FROM push_subscriptions WHERE id=?').run(existing.id));
+      const id = newId('push');
+      (await this.db.prepare(`INSERT INTO push_subscriptions (id, userId, endpoint, p256dh, auth, label, createdAt, kind, platform)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, userId, address, p256dh, auth, label, now, native ? 'fcm' : 'web', platform));
+      return (await this.pushSubscription(id))!;
+    });
+  }
+
+  private async pushSubscription(id: string): Promise<PushSubscriptionRecord | undefined> {
+    const row = (await this.db.prepare('SELECT * FROM push_subscriptions WHERE id=?').get(id)) as PushSubscriptionRow | undefined;
+    return row ? rowToPushSubscription(row) : undefined;
+  }
+
+  /** A person's devices, oldest first. */
+  async listPushSubscriptions(userId: string): Promise<PushSubscriptionRecord[]> {
+    return ((await this.db.prepare('SELECT * FROM push_subscriptions WHERE userId=? ORDER BY createdAt, id').all(userId)) as PushSubscriptionRow[])
+      .map(rowToPushSubscription);
+  }
+
+  /** Remove one of the person's own devices; false if they have none by that id. */
+  async deletePushSubscription(userId: string, id: string): Promise<boolean> {
+    return Number((await this.db.prepare('DELETE FROM push_subscriptions WHERE id=? AND userId=?').run(id, userId)).changes) > 0;
+  }
+
+  /** A push service said the subscription is gone (404/410): forget it. */
+  async expirePushSubscription(id: string): Promise<void> {
+    (await this.db.prepare('DELETE FROM push_subscriptions WHERE id=?').run(id));
+  }
+
+  async markPushed(id: string, at = Date.now()): Promise<void> {
+    (await this.db.prepare('UPDATE push_subscriptions SET lastPushedAt=? WHERE id=?').run(at, id));
   }
 
   async setDeliveryPreferences(preferences: DeliveryPreferences): Promise<DeliveryPreferences> {
@@ -6113,12 +6216,7 @@ export class Store {
         (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt)
         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(item.id, item.organizationId, item.userId, item.eventSeq,
           item.taskId, item.kind, urgencyRank(item.urgency), item.actionable ? 1 : 0, item.createdAt));
-      if (Number(inserted.changes)) {
-        const channels = [preferences.browser && 'browser', (preferences.emailUrgencies?.[item.urgency] ?? preferences.email) && 'email', preferences.slack && 'slack'].filter(Boolean) as string[];
-        for (const channel of channels) (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
-          (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
-          .run(newId('delivery'), item.id, channel, item.createdAt, item.createdAt));
-      }
+      if (Number(inserted.changes)) (await this.queueDeliveries(item.id, userId, preferences, item.urgency, item.createdAt));
     }
   
     });
@@ -6202,7 +6300,7 @@ export class Store {
     }
   }
 
-  async claimDelivery(now = Date.now()): Promise<{ id: string; inbox: InboxItem; channel: 'browser' | 'email' | 'slack'; attempts: number } | undefined> {
+  async claimDelivery(now = Date.now()): Promise<{ id: string; inbox: InboxItem; channel: DeliveryChannel; attempts: number } | undefined> {
     return this.db.transaction(async () => {
 
     (await this.db.exec('BEGIN IMMEDIATE'));
@@ -8692,7 +8790,7 @@ export class Store {
 
     const pool = (await this.getRunnerPool(input.runnerPoolId));
     if (!pool?.enabled || pool.organizationId !== input.organizationId) throw new Error('runner pool is unavailable');
-    const remote = !['worktree', 'container', 'memory'].includes(pool.provider);
+    const remote = !LOCAL_WORLD_KINDS.includes(pool.provider);
     // Only the pool RunnerPoolService keeps for managed compute is centrally
     // funded; any other pool claiming to be would resell the organization's
     // own account as the installation's (src/world/runners.ts).
@@ -8724,7 +8822,7 @@ export class Store {
       if (remote) {
         organizationActive = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
           JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.state='active'
-            AND p.provider NOT IN ('worktree','container','memory')`).get(input.organizationId)) as any).n);
+            AND p.provider NOT IN (${LOCAL_KINDS_SQL})`).get(input.organizationId)) as any).n);
       }
       const active = (await this.db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(cpu),0) cpu, COALESCE(SUM(memoryMb),0) memoryMb,
         COALESCE(SUM(gpu),0) gpu FROM world_leases WHERE runnerPoolId=? AND state='active'`).get(pool.id)) as any;
@@ -8735,7 +8833,7 @@ export class Store {
       if (remote && acquired) {
         const recent = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
           JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.acquiredAt>=?
-            AND p.provider NOT IN ('worktree','container','memory')`).get(input.organizationId, now - 60_000)) as any).n);
+            AND p.provider NOT IN (${LOCAL_KINDS_SQL})`).get(input.organizationId, now - 60_000)) as any).n);
         if (recent >= policy.maxRemoteStartsPerMinute) throw new AdmissionBackpressureError('organization remote sandbox start rate limit exceeded');
       }
       (await this.db.prepare(`INSERT INTO world_leases (id, runnerPoolId, organizationId, projectId, taskId, worldId,
@@ -8775,7 +8873,7 @@ export class Store {
     for (const candidate of queued) {
       const pool = (await this.getRunnerPool(candidate.runnerPoolId));
       if (!pool?.enabled || pool.organizationId !== candidate.organizationId) continue;
-      const remote = !['worktree', 'container', 'memory'].includes(pool.provider);
+      const remote = !LOCAL_WORLD_KINDS.includes(pool.provider);
       if (filter.remoteOnly && !remote) continue;
       if (remote && this.hosted && pool.mode === 'managed' && !isManagedComputePool(pool)) continue;
       const hostedCustomerWorld = remote && this.hosted && (pool.mode === 'customer' || pool.mode === 'managed');
@@ -8783,11 +8881,11 @@ export class Store {
       if (remote) {
         const organizationActive = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
           JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.state='active'
-            AND p.provider NOT IN ('worktree','container','memory')`).get(candidate.organizationId)) as any).n);
+            AND p.provider NOT IN (${LOCAL_KINDS_SQL})`).get(candidate.organizationId)) as any).n);
         if (organizationActive >= policy.maxActiveWorlds) continue;
         const recent = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
           JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.acquiredAt>=?
-            AND p.provider NOT IN ('worktree','container','memory')`).get(candidate.organizationId, Date.now() - 60_000)) as any).n);
+            AND p.provider NOT IN (${LOCAL_KINDS_SQL})`).get(candidate.organizationId, Date.now() - 60_000)) as any).n);
         if (recent >= policy.maxRemoteStartsPerMinute) continue;
       }
       const project = (await this.getProject(candidate.projectId));
@@ -8847,7 +8945,7 @@ export class Store {
       (await this.db.prepare("UPDATE world_leases SET state='released', releasedAt=? WHERE id=? AND state!='released'").run(Date.now(), id));
       const pool = (await this.getRunnerPool(lease.runnerPoolId));
       const hostedCustomerRemote = !!pool && this.hosted && pool.mode === 'customer'
-        && !['worktree', 'container', 'memory'].includes(pool.provider);
+        && !LOCAL_WORLD_KINDS.includes(pool.provider);
       const activated = hostedCustomerRemote
         ? (await this.promoteQueuedWorldLeases({ organizationId: lease.organizationId, remoteOnly: true }))
         : (await this.promoteQueuedWorldLeases({ runnerPoolId: lease.runnerPoolId }));
@@ -10544,15 +10642,19 @@ export class Store {
         return Object.keys(existing).length ? JSON.stringify(existing) : null;
       };
       const created = Number((await this.db.prepare(`INSERT OR IGNORE INTO project_events
-        (id, organizationId, projectId, source, type, eventKey, subject, occurredAt, receivedAt, payload, origin, hops, count, lastSeenAt, distinctValues)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, input.organizationId, input.projectId, input.source, input.type,
+        (id, organizationId, projectId, source, type, eventKey, subject, occurredAt, receivedAt, payload, origin, hops, count, lastSeenAt, distinctValues, actsAs)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, input.organizationId, input.projectId, input.source, input.type,
         input.key, input.subject ?? null, input.occurredAt, receivedAt, JSON.stringify(input.payload), input.origin, input.hops,
-        occurrences, receivedAt, tally({}))).changes) === 1;
+        occurrences, receivedAt, tally({}), input.actsAs ?? null)).changes) === 1;
       let row = await this.db.prepare('SELECT * FROM project_events WHERE projectId=? AND source=? AND eventKey=?')
         .get(input.projectId, input.source, input.key);
       if (!created) {
         const before = projectEventFromRow(row);
-        const recent: EventOccurrence[] = [...(before.recent ?? []), { at: receivedAt, payload: boundEventPayload(input.payload, EVENT_OCCURRENCE_BYTES) }]
+        // When it happened, as its recorder says (a person reporting what a task
+        // showed days ago), but never later than when it was heard: a sender's
+        // clock ahead of ours is not believed. \`lastSeenAt\` is when it was heard.
+        const at = Number.isFinite(input.occurredAt) ? Math.min(input.occurredAt, receivedAt) : receivedAt;
+        const recent: EventOccurrence[] = [...(before.recent ?? []), { at, payload: boundEventPayload(input.payload, EVENT_OCCURRENCE_BYTES) }]
           .slice(-EVENT_RECENT_OCCURRENCES);
         await this.db.prepare('UPDATE project_events SET count=?, lastSeenAt=?, recent=?, distinctValues=? WHERE id=?')
           .run(before.count + occurrences, Math.max(before.lastSeenAt, receivedAt), JSON.stringify(recent), tally({ ...before.distinct }), before.id);
@@ -10683,12 +10785,13 @@ export class Store {
 
   /** Compare-and-set on the claim's state, so two dispatchers never both act. */
   async updateProjectEventClaim(eventId: string, taskId: string, from: ProjectEventClaimState[],
-    next: { state: ProjectEventClaimState; reason?: string | null; runId?: string | null; concurrencyKey?: string | null; updatedAt?: number; gated?: boolean }): Promise<boolean> {
+    next: { state: ProjectEventClaimState; reason?: string | null; runId?: string | null; concurrencyKey?: string | null; updatedAt?: number; gated?: boolean;
+      gateReason?: string | null }): Promise<boolean> {
     return this.db.transaction(async () => {
       const sets = ['state=?', 'updatedAt=?'];
       const args: unknown[] = [next.state, next.updatedAt ?? Date.now()];
       if (next.gated !== undefined) { sets.push('gated=?'); args.push(next.gated ? 1 : 0); }
-      for (const field of ['reason', 'runId', 'concurrencyKey'] as const) {
+      for (const field of ['reason', 'runId', 'concurrencyKey', 'gateReason'] as const) {
         if (next[field] !== undefined) { sets.push(`${field}=?`); args.push(next[field]); }
       }
       return Number((await this.db.prepare(`UPDATE project_event_claims SET ${sets.join(', ')}
@@ -10873,9 +10976,13 @@ export class Store {
   }
 
   /** A delegation's row whatever its state (revoked, expired): why it lapsed. */
-  async humanDelegationRow(id: string): Promise<{ record: Record<string, unknown>; revokedAt?: number } | undefined> {
-    const r = (await this.db.prepare('SELECT json, revokedAt FROM human_delegations WHERE id=?').get(id)) as any;
-    return r ? { record: JSON.parse(r.json), revokedAt: r.revokedAt == null ? undefined : Number(r.revokedAt) } : undefined;
+  /** A delegation's row: \`record\` is absent once the retention sweep has
+   *  purged it (\`purgeHumanDelegations\`), which keeps how it lapsed. */
+  async humanDelegationRow(id: string): Promise<{ record?: Record<string, unknown>; expiresAt: number; revokedAt?: number } | undefined> {
+    const r = (await this.db.prepare('SELECT json, expiresAt, revokedAt FROM human_delegations WHERE id=?').get(id)) as any;
+    if (!r) return undefined;
+    const record = r.json === PURGED_DELEGATION ? undefined : JSON.parse(r.json) as Record<string, unknown>;
+    return { ...(record ? { record } : {}), expiresAt: Number(r.expiresAt), ...(r.revokedAt == null ? {} : { revokedAt: Number(r.revokedAt) }) };
   }
 
   async revokeHumanDelegation(id: string): Promise<void> {
@@ -11050,6 +11157,7 @@ export class Store {
     const rows = (await this.db.prepare('SELECT id, json, revokedAt FROM human_delegations').all()) as any[];
     const records = new Map<string, { record: Record<string, unknown>; revoked: boolean }>();
     for (const row of rows) {
+      if (row.json === PURGED_DELEGATION) continue; // purged: as good as gone
       try { records.set(String(row.id), { record: JSON.parse(row.json), revoked: row.revokedAt != null }); } catch { /* unusable */ }
     }
     const lapsed = new Map<string, Record<string, unknown>>();
@@ -11059,7 +11167,13 @@ export class Store {
       if (!revoked && parent && !records.has(parent)) lapsed.set(parent, {});
     }
     (await this.handDerivedDelegationsUp(lapsed));
-    return Number((await this.db.prepare('DELETE FROM human_delegations WHERE expiresAt<=? OR revokedAt IS NOT NULL').run(now)).changes);
+    // A lapsed delegation keeps only how it lapsed (its expiry, its revocation),
+    // nothing of the person or what they allowed, so that a task holding it can
+    // still say "expired on …" (theirs to renew) rather than "withdrawn" (a
+    // fault to look into). That too is forgotten after a year.
+    (await this.db.prepare('DELETE FROM human_delegations WHERE json=? AND COALESCE(revokedAt, expiresAt)<=?').run(PURGED_DELEGATION, now - PURGED_DELEGATION_KEPT_MS));
+    return Number((await this.db.prepare('UPDATE human_delegations SET json=? WHERE (expiresAt<=? OR revokedAt IS NOT NULL) AND json<>?')
+      .run(PURGED_DELEGATION, now, PURGED_DELEGATION)).changes);
   
     });
   }
@@ -11769,6 +11883,17 @@ function rowToRepository(r: any): Repository {
     createdAt: r.createdAt, updatedAt: r.updatedAt };
 }
 
+/** A `push_subscriptions` row as the driver returns it. */
+type PushSubscriptionRow = Record<string, unknown>;
+
+function rowToPushSubscription(r: PushSubscriptionRow): PushSubscriptionRecord {
+  const base = { id: String(r.id), userId: String(r.userId), ...(r.label ? { label: String(r.label) } : {}),
+    createdAt: Number(r.createdAt), ...(r.lastPushedAt == null ? {} : { lastPushedAt: Number(r.lastPushedAt) }) };
+  return r.kind === 'fcm'
+    ? { ...base, kind: 'fcm', token: String(r.endpoint), platform: r.platform === 'ios' ? 'ios' : 'android' }
+    : { ...base, kind: 'web', endpoint: String(r.endpoint), keys: { p256dh: String(r.p256dh), auth: String(r.auth) } };
+}
+
 function rowToInbox(r: any): InboxItem {
   return { id: r.id, organizationId: r.organizationId, userId: r.userId, eventSeq: r.eventSeq,
     taskId: r.taskId, kind: r.kind, urgency: URGENCY_LEVELS[Number(r.urgency ?? urgencyRank('normal'))] ?? 'normal',
@@ -11978,6 +12103,7 @@ function projectEventFromRow(row: any): ProjectEvent {
     occurredAt: Number(row.occurredAt), receivedAt: Number(row.receivedAt),
     payload: JSON.parse(String(row.payload)) as Record<string, unknown>,
     origin: String(row.origin) as ProjectEvent['origin'], hops: Number(row.hops),
+    ...(row.actsAs ? { actsAs: String(row.actsAs) } : {}),
     count: Number(row.count ?? 1), lastSeenAt: Number(row.lastSeenAt ?? row.receivedAt),
     ...(row.recent ? { recent: JSON.parse(String(row.recent)) as EventOccurrence[] } : {}),
     ...(row.distinctValues ? { distinct: JSON.parse(String(row.distinctValues)) as Record<string, string[]> } : {}),
@@ -11999,7 +12125,7 @@ function projectEventClaimFromRow(row: any): ProjectEventClaim {
     eventId: String(row.eventId), taskId: String(row.taskId), state: String(row.state) as ProjectEventClaimState,
     ...(row.reason ? { reason: String(row.reason) } : {}), ...(row.runId ? { runId: String(row.runId) } : {}),
     ...(row.concurrencyKey !== null && row.concurrencyKey !== undefined ? { concurrencyKey: String(row.concurrencyKey) } : {}),
-    ...(Number(row.gated ?? 0) ? { gated: true } : {}),
+    ...(Number(row.gated ?? 0) ? { gated: true } : {}), ...(row.gateReason ? { gateReason: String(row.gateReason) } : {}),
     receivedAt: Number(row.receivedAt), updatedAt: Number(row.updatedAt),
   };
 }

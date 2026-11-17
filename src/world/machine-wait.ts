@@ -1,4 +1,5 @@
 import type { Store } from '../store/db.js';
+import { LOCAL_WORLD_KINDS } from '../domain/computer.js';
 import type { RunnerPool, TaskView } from '../domain/types.js';
 import { ProviderCapacityFull } from '../agent/limits.js';
 
@@ -43,7 +44,7 @@ export class MachineQueued extends ProviderCapacityFull {
   }
 }
 
-const REMOTE = (provider: string) => !['worktree', 'container', 'memory'].includes(provider);
+const REMOTE = (provider: string) => !LOCAL_WORLD_KINDS.includes(provider);
 
 /** Who a queued lease waits behind: the organization's remote leases where
  * the plan's concurrency admits them (requestWorldLease), else its pool. */

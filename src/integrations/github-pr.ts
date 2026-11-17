@@ -220,6 +220,17 @@ export class GithubApiError extends Error {
   }
 }
 
+/**
+ * GitHub's refusal of a pull request that would contain nothing: 422 "No
+ * commits between <base> and <head>". GitHub decides what a pull request
+ * contains; a world's count of the branch's own commits can only overstate it
+ * (its copy of the base may be older than GitHub's), never hide work. So this
+ * refusal means there is nothing to propose: a skip, never a failure.
+ */
+export function refusedAsEmpty(error: unknown): boolean {
+  return error instanceof GithubApiError && error.status === 422 && /no commits between/i.test(error.message);
+}
+
 /** A REST error as people read it: GitHub's message and its items' messages,
  * else the start of the body. */
 async function githubApiError(response: Response): Promise<GithubApiError> {

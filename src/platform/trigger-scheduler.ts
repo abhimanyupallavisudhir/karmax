@@ -21,7 +21,7 @@ import {
   type ScheduleTrigger,
 } from '../domain/triggers.js';
 import {
-  DEFAULT_MAX_RUNS_PER_HOUR, MAX_EVENT_HOPS, countCrossedThreshold, recurrenceMessage, renderTemplate, templateData, triggerContext, triggerMessage,
+  DEFAULT_MAX_RUNS_PER_HOUR, EventRunRefused, MAX_EVENT_HOPS, countCrossedThreshold, lastHappenedAt, recurrenceMessage, renderTemplate, templateData, triggerContext, triggerMessage,
   type KeyedRun, type ProjectEvent, type ProjectEventClaim, type ProjectEventClaimState, type TriggerContext,
 } from '../domain/project-events.js';
 
@@ -143,7 +143,8 @@ export function createTriggerTell(api: Pick<KarmaxApi, 'postTaskMessage'>, token
   return async (runId, trigger, text) => {
     const { token } = (await tokens.mintPrincipal('system:triggers', ['*'], undefined, 10 * 60_000));
     try {
-      return await api.postTaskMessage(token, runId, { text: text ?? triggerMessage(trigger) });
+      // A linked chat sender's reply is theirs (wiki planned/assistant §3); the context comes from the stored event.
+      return await api.postTaskMessage(token, runId, { text: text ?? triggerMessage(trigger), ...(trigger.actsAs ? { onBehalfOf: trigger.actsAs } : {}) });
     } finally {
       (await tokens.revoke(token));
     }
@@ -825,7 +826,8 @@ export class TriggerScheduler {
       if (liveAt === undefined && this.now() - finishedAt > LIVE_WITHOUT_WORD_MS) liveAt = finishedAt + LIVE_WITHOUT_WORD_MS;
       if (liveAt !== undefined) await this.deps.store.updateKeyedRun(run.seriesId, run.key, { liveAt });
     }
-    return { ready: liveAt !== undefined && event.lastSeenAt > liveAt, ...(liveAt !== undefined ? { liveAt } : {}) };
+    // What happened before the change was out says nothing about it, however late it is heard of.
+    return { ready: liveAt !== undefined && lastHappenedAt(event) > liveAt, ...(liveAt !== undefined ? { liveAt } : {}) };
   }
 
   /**
@@ -845,8 +847,8 @@ export class TriggerScheduler {
       const current = run?.taskId ? await this.deps.store.keyedRun(seriesId, key) : run;
       if (current && !countCrossedThreshold(current.seen, event.count)) return;
       const reason = current ? 'it keeps coming' : 'its key is free again';
-      if (await this.deps.store.updateProjectEventClaim(event.id, seriesId, [claim.state], { state: 'deferred', reason, runId: null, gated: false, updatedAt: this.now() }))
-        await this.offerProjectEvent(entry, trigger, event, { ...claim, state: 'deferred', reason, runId: undefined, gated: false });
+      if (await this.deps.store.updateProjectEventClaim(event.id, seriesId, [claim.state], { state: 'deferred', reason, runId: null, gated: false, gateReason: null, updatedAt: this.now() }))
+        await this.offerProjectEvent(entry, trigger, event, { ...claim, state: 'deferred', reason, runId: undefined, gated: false, gateReason: undefined });
       return;
     }
     const finished = kept.task.lastView?.status === 'done';
@@ -935,9 +937,13 @@ export class TriggerScheduler {
       await this.carryOn(entry, trigger, event, key!, { taskId: into.task.id });
       return;
     }
-    const approved = { ...claim, gated: true, reason: 'its gate said to start it' };
-    if (await this.deps.store.updateProjectEventClaim(eventId, seriesId, ['deferred'], { state: 'deferred', reason: approved.reason, gated: true, updatedAt: this.now() }))
+    const gateReason = why || undefined;
+    const approved = { ...claim, gated: true, reason: 'its gate said to start it', ...(gateReason ? { gateReason } : {}) };
+    if (await this.deps.store.updateProjectEventClaim(eventId, seriesId, ['deferred'],
+      { state: 'deferred', reason: approved.reason, gated: true, gateReason: gateReason ?? null, updatedAt: this.now() })) {
+      this.log(`gate started ${event.type} ${event.key} for ${seriesId}${why ? `: ${why}` : ''}`);
       await this.offerProjectEvent(entry, trigger, event, approved);
+    }
   }
 
   private async tellEventRun(entry: ArmedEntry, event: ProjectEvent, runId: string, concurrencyKey: string | undefined): Promise<void> {
@@ -988,8 +994,10 @@ export class TriggerScheduler {
         if (entry.followUp) entry.triggers.push(trigger);
         else entry.fired = false;
       }
+      // A start refused for good is skipped, not retried every minute.
+      const refused = error instanceof EventRunRefused;
       await this.deps.store.updateProjectEventClaim(event.id, taskId, ['pending'],
-        { state: 'deferred', reason: `${FAILED_START}: ${message}`.slice(0, 300), updatedAt: this.now() });
+        { state: refused ? 'skipped' : 'deferred', reason: (refused ? message : `${FAILED_START}: ${message}`).slice(0, 300), updatedAt: this.now() });
       this.log(`event ${event.type} could not start ${taskId}: ${message}`);
     }
   }

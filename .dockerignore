@@ -2,6 +2,8 @@
 # The image copies only src, web and vendor; the rest is build-context weight.
 tests
 benchmarks
+# The phone apps (wiki features/phone-apps) build in .github/workflows/mobile.yml.
+mobile
 design
 docs
 # Standalone console tests run in CI, never in production.

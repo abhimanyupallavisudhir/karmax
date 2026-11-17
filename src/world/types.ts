@@ -15,13 +15,14 @@ import type { BranchAdjustment, WorldHandleRef } from '../domain/types.js';
 /** Provider registry id. Kept as an alias because it is persisted in workflow state. */
 export type WorldKind = string;
 
-/** Provider ids whose worlds live on the host filesystem: no metered remote
- * sandbox and no provider control plane to reconcile against. Exported as one
- * list because it is consulted from modules that must not construct a provider
- * registry (the Git broker, workflow-adjacent activities, the deterministic
- * workflow contract). Providers also declare it via `capabilities.remote`; use
- * that whenever a registry is already at hand. */
-export const LOCAL_WORLD_KINDS: readonly string[] = ['worktree', 'container', 'memory'];
+/** Provider ids with no metered remote sandbox and no provider control plane
+ * to reconcile against (the host's own worlds, and a task without a computer).
+ * One list, in src/domain/computer.ts, because it is consulted from modules
+ * that must not construct a provider registry (the Git broker, workflow-adjacent
+ * activities, the deterministic workflow contract). Providers also declare it
+ * via `capabilities.remote`; use that whenever a registry is already at hand. */
+export { LOCAL_WORLD_KINDS } from '../domain/computer.js';
+import { LOCAL_WORLD_KINDS } from '../domain/computer.js';
 
 export function isRemoteWorldKind(kind: string | undefined): boolean {
   return !!kind && !LOCAL_WORLD_KINDS.includes(kind);
@@ -435,6 +436,10 @@ export interface ProviderUsageEvent {
   /** The provider's own price for this execution, when it publishes one
    * (Fly's per-second formula, Hetzner's hourly price). Absent: karmax's rates. */
   costMicros?: number;
+  /** `owner`: not a charge, never booked. Who owned a world deleted lately,
+   * its shape and the days its last reading covered (`startedAt`–`endedAt`),
+   * kept so a ledger that settles later can still be read for it (Agent37). */
+  record?: 'owner';
 }
 
 /**

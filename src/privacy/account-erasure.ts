@@ -5,6 +5,7 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import { userScope } from '../autonomy/vault-keys.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
 import { AppGrants } from '../auth/app-grants.js';
+import { ChatLinks } from '../integrations/chat-links.js';
 
 export const closedAccountKey = (id: string) => `account-closed:${id}`;
 const caseKey = (id: string) => `account-erasure:${id}`;
@@ -219,7 +220,7 @@ export class AccountErasureService {
       const db = this.store.db, principal = `user:${userId}`;
       for (const org of await this.store.listOrganizations(userId)) await this.store.removeOrganizationMembership(org.id, userId);
       await db.prepare('DELETE FROM delivery_outbox WHERE inboxId IN (SELECT id FROM inbox WHERE userId=?)').run(userId);
-      for (const table of ['inbox', 'delivery_preferences', 'user_preferences', 'team_memberships', 'github_install_states', 'payment_oauth_states'])
+      for (const table of ['inbox', 'delivery_preferences', 'user_preferences', 'push_subscriptions', 'team_memberships', 'github_install_states', 'payment_oauth_states'])
         await db.prepare(`DELETE FROM ${table} WHERE userId=?`).run(userId);
       for (const table of ['project_memberships', 'task_subscribers']) await db.prepare(`DELETE FROM ${table} WHERE principalKey=?`).run(principal);
       await db.prepare('DELETE FROM principal_grants WHERE principalId=?').run(principal);
@@ -232,6 +233,7 @@ export class AccountErasureService {
       await this.store.kvDelete(`git:profiles:user:${userId}`);
       await this.store.kvDelete(`git:default-profile:user:${userId}`);
       await new AppGrants(this.store).revokeUser(userId); // CLI logins, MCP clients, personal tokens
+      await new ChatLinks(this.store).removeUser(userId); // chat accounts that acted as them
     });
   }
 

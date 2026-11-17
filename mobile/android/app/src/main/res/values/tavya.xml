@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Notification accent (brand gold); the small icon itself is white on transparent. -->
+    <color name="tavya_notification">#CC9024</color>
+    <!-- Brand background, used by the Android 12+ system splash. -->
+    <color name="tavya_brand_background">#181220</color>
+</resources>
