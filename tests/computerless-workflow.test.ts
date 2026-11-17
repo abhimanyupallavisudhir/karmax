@@ -1,11 +1,14 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { Worker } from '@temporalio/worker';
 import { bootHarness, type Harness } from './helpers/harness.js';
 import { newId } from '../src/util/id.js';
 import type { WorldHandle } from '../src/world/types.js';
 import { IRREVERSIBLE_CAPABILITIES } from '../src/platform/capabilities.js';
+import { projectReadiness } from '../src/platform/readiness.js';
 
 // Real Temporal, activities and gateway, the mock agent (wiki
 // features/computerless-tasks): a task whose Computer is None is an ordinary
@@ -98,6 +101,41 @@ describe('a task without a computer', () => {
     await h.client.workflow.getHandle(task.id).cancel().catch(() => undefined);
     } finally {
       for (const [name, value] of Object.entries(keys)) if (value !== undefined) process.env[name] = value;
+    }
+  }, 120_000);
+
+  it('on hosted, never spends the worker\'s own API key: with no key of the organization\'s, it is refused as readiness says, and no request goes out', async () => {
+    // The model API the worker's key would reach: nothing may arrive here.
+    const requests: string[] = [];
+    const modelApi = http.createServer((req, res) => { requests.push(req.url ?? ''); res.writeHead(500); res.end('must not be called'); });
+    await new Promise<void>((resolve) => modelApi.listen(0, '127.0.0.1', resolve));
+    const saved = { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY, KARMAX_ANTHROPIC_BASE_URL: process.env.KARMAX_ANTHROPIC_BASE_URL };
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-operator';
+    process.env.KARMAX_ANTHROPIC_BASE_URL = `http://127.0.0.1:${(modelApi.address() as AddressInfo).port}`;
+    const store = h.store as { hosted: boolean };
+    store.hosted = true;
+    try {
+      const project = await h.store.createProject(newId('Assistant'), { worldProvider: 'e2b', defaultBase: 'main' });
+      const agent = { provider: 'claude' as const, model: 'claude-opus-5-5' };
+      const readiness = await projectReadiness({ store: h.store, hosted: true, broker: h.broker }, { organizationId: 'org_personal', projectId: project.id },
+        [agent], { computerless: true });
+      const gap = readiness.agents[0]!.need?.computerless;
+      expect(readiness.agents[0]!.ready).toBe(false);
+      expect(gap).toMatch(/runs only on a computer/);
+      const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
+      const task = await h.api.createTask(token, { projectId: project.id, workflow: 'software-dev', params: {
+        computer: { provider: 'none' }, prompt: 'hello', 'agent:do': agent,
+      } });
+      await expect.poll(async () => {
+        const current = await view(task.id);
+        return JSON.stringify(current.messages) + JSON.stringify(current.error ?? '') + JSON.stringify(current.waitingFor ?? '');
+      }, { timeout: 60_000 }).toContain(gap!.slice(0, 60));
+      expect(requests).toEqual([]);
+      await h.client.workflow.getHandle(task.id).cancel().catch(() => undefined);
+    } finally {
+      store.hosted = false;
+      for (const [name, value] of Object.entries(saved)) if (value === undefined) delete process.env[name]; else process.env[name] = value;
+      await new Promise<void>((resolve) => modelApi.close(() => resolve()));
     }
   }, 120_000);
 });

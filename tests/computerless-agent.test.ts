@@ -6,10 +6,12 @@ import { CodexAdapter } from '../src/agent/codex.js';
 import { AcpAdapter } from '../src/agent/acp.js';
 import { MockAdapter } from '../src/agent/mock.js';
 import { runTurn } from '../src/agent/runtime.js';
-import { chatCompletionsEndpoint, ComputerlessModelUnsupported, computerlessModelGap } from '../src/agent/computerless.js';
+import { chatCompletionsEndpoint, ComputerlessModelUnsupported, computerlessApiKey, computerlessModelGap } from '../src/agent/computerless.js';
 import { COMPUTERLESS_TOOL_SCHEMAS, WORLD_TOOL_NAMES, computerlessToolHandlers } from '../src/agent/tools.js';
 import { assemblePrompt, NO_COMPUTER_WORLD } from '../src/agent/prompt.js';
 import { WorldRegistry } from '../src/world/registry.js';
+import { Store } from '../src/store/db.js';
+import { projectReadiness } from '../src/platform/readiness.js';
 import type { AgentAdapter, PlatformToolContext, TurnInput } from '../src/agent/types.js';
 import type { World } from '../src/world/types.js';
 
@@ -117,6 +119,53 @@ describe('which models run without a computer', () => {
     expect(chatCompletionsEndpoint('google/gemini-3-pro')).toBeUndefined();
   });
 
+  it('spend a key resolved for the organization; the worker\'s own environment keys only on a self-hosted install\'s own organization', () => {
+    const saved = { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY, OPENAI_API_KEY: process.env.OPENAI_API_KEY, OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY };
+    Object.assign(process.env, { ANTHROPIC_API_KEY: 'sk-ant-operator', OPENAI_API_KEY: 'sk-operator', OPENROUTER_API_KEY: 'sk-or-operator' });
+    try {
+      const claude = { provider: 'claude' as const };
+      const codex = { provider: 'codex' as const };
+      const openrouter = { provider: 'opencode' as const, model: 'openrouter/deepseek/deepseek-v4.1-flash-1017' };
+      const hosted = { hosted: true, organizationId: 'org_personal', managedRail: false };
+      // Hosted: every organization's computerless turn runs in the worker, whose keys are the operator's.
+      for (const profile of [claude, codex, openrouter]) {
+        expect(computerlessApiKey(profile, hosted)).toBeUndefined();
+        expect(computerlessApiKey(profile, { ...hosted, organizationId: 'org_acme' })).toBeUndefined();
+      }
+      // Its own leased key, or the included model's per-organization key.
+      expect(computerlessApiKey(claude, { ...hosted, resolvedAuth: { apiKey: 'sk-ant-org' } })).toBe('sk-ant-org');
+      expect(computerlessApiKey(openrouter, { ...hosted, resolvedAuth: { apiKey: 'sk-or-org' } })).toBe('sk-or-org');
+      // The operator's model rail, switched on for this organization, metered and capped.
+      expect(computerlessApiKey(claude, { ...hosted, organizationId: 'org_acme', managedRail: true })).toBe('sk-ant-operator');
+      // Self-hosted: the operator is the only customer.
+      const own = { hosted: false, organizationId: 'org_personal', managedRail: false };
+      expect(computerlessApiKey(claude, own)).toBe('sk-ant-operator');
+      expect(computerlessApiKey(codex, own)).toBe('sk-operator');
+      expect(computerlessApiKey(openrouter, own)).toBe('sk-or-operator');
+      expect(computerlessApiKey(claude, { ...own, organizationId: 'org_acme' })).toBeUndefined();
+      // A leased login is a login, whatever the environment holds.
+      expect(computerlessApiKey(claude, { ...own, resolvedAuth: { configHome: '/tmp/home' } })).toBeUndefined();
+    } finally {
+      for (const [name, value] of Object.entries(saved)) if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+  });
+
+  it('readiness agrees with the turn: on hosted the worker\'s environment keys make no agent ready', async () => {
+    const saved = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-operator';
+    try {
+      const store = await Store.create(':memory:');
+      const ask = (hosted: boolean) => projectReadiness({ store, hosted }, { organizationId: 'org_personal' },
+        [{ provider: 'claude', model: 'claude-opus-5-5' }], { computerless: true });
+      const hosted = (await ask(true)).agents[0]!;
+      expect(hosted.ready).toBe(false);
+      expect(hosted.need?.computerless).toMatch(/runs only on a computer/);
+      expect((await ask(false)).agents[0]!.ready).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = saved;
+    }
+  });
+
   it('a subscription login refuses before any request', async () => {
     const claude = new ClaudeAdapter().runComputerlessTurn(input({ resolvedAuth: { configHome: '/tmp/home' } }), context([]));
     await expect(claude).rejects.toBeInstanceOf(ComputerlessModelUnsupported);
@@ -161,6 +210,25 @@ describe('host-side loops of a task without a computer (stubbed model APIs)', ()
     await api.close();
   });
   beforeEach(() => api.script([]));
+
+  it('never spend the worker\'s environment keys: without a key resolved for the turn, each rail refuses before any request', async () => {
+    const saved = { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY, OPENAI_API_KEY: process.env.OPENAI_API_KEY, OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY };
+    Object.assign(process.env, { ANTHROPIC_API_KEY: 'sk-ant-operator', OPENAI_API_KEY: 'sk-operator', OPENROUTER_API_KEY: 'sk-or-operator' });
+    try {
+      await expect(new ClaudeAdapter().runComputerlessTurn(input(), context([]))).rejects.toBeInstanceOf(ComputerlessModelUnsupported);
+      await expect(new CodexAdapter().runComputerlessTurn(input({ profile: { id: 'p', name: 'p', provider: 'codex', model: 'gpt-5.5', role: 'do', capabilities: [] } }),
+        context([]))).rejects.toBeInstanceOf(ComputerlessModelUnsupported);
+      await expect(new AcpAdapter('opencode').runComputerlessTurn(input({
+        profile: { id: 'p', name: 'p', provider: 'opencode', model: 'openrouter/deepseek/deepseek-v4.1-flash-1017', role: 'do', capabilities: [] } }),
+        context([]))).rejects.toBeInstanceOf(ComputerlessModelUnsupported);
+      await expect(new AcpAdapter('opencode').runComputerlessTurn(input({
+        profile: { id: 'p', name: 'p', provider: 'opencode', model: 'anthropic/claude-haiku-5-5', role: 'do', capabilities: [] } }),
+        context([]))).rejects.toBeInstanceOf(ComputerlessModelUnsupported);
+      expect(api.seen).toEqual([]);
+    } finally {
+      for (const [name, value] of Object.entries(saved)) if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+  });
 
   it('Claude Messages API: offers only platform tools and round-trips a platform tool call', async () => {
     api.script([

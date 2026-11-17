@@ -19,7 +19,7 @@ import { enumerateCredentials, resolveCredentials, type Credential } from './cre
 import { gatherCredentialSources, readPolicyLayers } from './credential-sources.js';
 import { ComputeRouter, type RouterConnections } from '../world/compute-router.js';
 import { computeCredit } from '../world/managed-compute.js';
-import { computerlessModelGap } from '../agent/computerless.js';
+import { computerlessApiKey, computerlessModelGap } from '../agent/computerless.js';
 
 export interface ReadinessDeps {
   store: Store;
@@ -120,8 +120,11 @@ export async function projectReadiness(deps: ReadinessDeps,
       const cost = credit ? await includedModelRelativeCost(included!, agent.model!, agent.effort) : undefined;
       const costed = cost !== undefined ? { cost: Math.round(cost * 10) / 10 } : {};
       if (options.computerless) {
-        // Only an API key (its own, or one tavya pays for) runs without a computer.
-        const key = credit || managed || serves(agent, credentials.filter((credential) => credential.kind === 'key'));
+        // Only an API key runs without a computer: the organization's own, the
+        // included model's, or one the turn may take from this host
+        // (computerlessApiKey — never on hosted unless its model rail is on).
+        const key = credit || serves(agent, credentials.filter((credential) => credential.kind === 'key'))
+          || !!computerlessApiKey(agent, { hosted: deps.hosted, organizationId: scope.organizationId, managedRail: managed });
         const gap = computerlessModelGap(agent, { apiKey: key });
         return { ...agent, ready: !gap, ...(gap ? { need: { ...need(agent), computerless: gap } } : {}), ...costed };
       }

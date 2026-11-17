@@ -163,7 +163,8 @@ export class CodexAdapter implements AgentAdapter {
    * tools. A Codex login is its CLI, which needs a computer. */
   async runComputerlessTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
     ctx.emitActivity ??= () => {};
-    if (!input.resolvedAuth?.apiKey && (input.resolvedAuth?.configHome || !process.env.OPENAI_API_KEY)) throw loginNeedsComputer('codex');
+    // Only the key the activity resolved for the organization (computerlessApiKey).
+    if (!input.resolvedAuth?.apiKey) throw loginNeedsComputer('codex');
     return this.runResponsesApi(input, ctx);
   }
 

@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
 import { Store } from '../src/store/db.js';
 import { AuthorizationService, organizationScope, projectScope } from '../src/platform/authorization.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
-import { allows, heldBackCapabilities, IRREVERSIBLE_CAPABILITIES, withoutCapabilities } from '../src/platform/capabilities.js';
+import { allows, CAPABILITIES, heldBackCapabilities, IRREVERSIBLE_CAPABILITIES, TOOL_CAPABILITY, withoutCapabilities } from '../src/platform/capabilities.js';
 import { exactCapability } from '../src/platform/permission-requests.js';
 import { baseTaskAuthority, taskAuthorityNow } from '../src/platform/task-authority.js';
 import { summarizeCapabilities } from '../src/platform/authorization-summary.js';
@@ -162,5 +163,51 @@ describe('scope of the ceiling', () => {
     const f = await fixture();
     expect(allows(await f.authorization.capabilities('user:owner', f.project.id, f.organization.id), 'organization:delete')).toBe(true);
     expect(organizationScope(f.organization.id)).toContain(f.organization.id);
+  });
+});
+
+/**
+ * Every capability the gateway's routes or the platform tools can require.
+ * `routeCapability` returns only string literals, so its source is the
+ * complete list of what a route can ask for.
+ */
+function requirableCapabilities(): string[] {
+  const server = fs.readFileSync(new URL('../src/gateway/server.ts', import.meta.url), 'utf8');
+  const start = server.indexOf('export function routeCapability(');
+  const body = server.slice(start, server.indexOf('\n}\n', start));
+  const routes = [...body.matchAll(/'([^'\n]*)'/g)].map((match) => match[1]!)
+    .filter((literal) => /^[a-z][a-z-]*(:[a-z*-]+)*$/.test(literal) && literal !== 'none');
+  expect(routes).toContain('task:delete'); // the extraction found the route table
+  expect(routes.length).toBeGreaterThan(50);
+  return [...new Set([
+    ...routes,
+    ...Object.values(TOOL_CAPABILITY),
+    ...CAPABILITIES.filter((capability) => !capability.endsWith(':*')),
+    // Families, required only as concrete members.
+    'merge-into:main', 'merge-into:tavya/task_1', 'use-credential:cred_1', 'use-credential:item:vi_1', 'use-card:card_1',
+    // Legacy spellings stored profiles and tokens still carry.
+    'create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'read-task', 'create-task', 'edit-task',
+    'signal-task', 'reorder-queue', 'edit-workflow',
+  ])];
+}
+
+describe('holding back from a wildcard grant', () => {
+  const held = heldBackCapabilities(undefined);
+
+  it('a `*` grant loses only the held-back capabilities: everything a route or tool can require otherwise survives', () => {
+    const kept = withoutCapabilities(['*'], held);
+    const wrong = requirableCapabilities().filter((capability) => allows(kept, capability) === allows(held, capability));
+    expect(wrong).toEqual([]);
+    for (const capability of IRREVERSIBLE_CAPABILITIES) expect(allows(kept, capability.replace('*', 'card_1'))).toBe(false);
+  });
+
+  it('a namespace wildcard loses only its own held-back members', () => {
+    const grant = ['task:*', 'credential:*', 'payment:*'];
+    const kept = withoutCapabilities(grant, held);
+    const wrong = requirableCapabilities().filter((capability) =>
+      allows(kept, capability) !== (allows(grant, capability) && !allows(held, capability)));
+    expect(wrong).toEqual([]);
+    expect(allows(kept, 'task:create')).toBe(true);
+    expect(allows(kept, 'task:delete')).toBe(false);
   });
 });

@@ -1,5 +1,5 @@
 import { applyComputer, isAnyProvider, isCloudProvider, isComputerless, machineShape, normalizeComputer, withoutCheckoutsIfComputerless, worldMachine } from '../domain/computer.js';
-import { computerlessModelGap } from '../agent/computerless.js';
+import { computerlessApiKey, computerlessModelGap } from '../agent/computerless.js';
 import { taskEnded } from '../world/task-ended.js';
 import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
 import { conversationFor, participantLabel, workDigest } from '../domain/participants.js';
@@ -3237,10 +3237,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY) ||
         (profile.provider === 'opencode' && !!process.env[apiKeyEnv(credentialProvider(profile))])
       ));
-      // A subscription login is its CLI, which needs a computer: say so now,
+      // A task without a computer runs its agent here, in the worker, for any
+      // organization: it spends only a key resolved for this organization,
+      // never the worker's own environment on hosted (computerlessApiKey). A
+      // subscription login is its CLI, which needs a computer: say so now,
       // before the turn waits for a slot it could never use.
-      const computerlessGap = computerless ? computerlessModelGap(profile, { apiKey: apiRail }) : undefined;
-      if (computerlessGap) throw ApplicationFailure.create({ message: computerlessGap, type: 'agent-error', nonRetryable: true });
+      if (computerless) {
+        const apiKey = computerlessApiKey(profile, { hosted: store.hosted, organizationId,
+          managedRail: managedInstallationRail, resolvedAuth });
+        const gap = computerlessModelGap(profile, { apiKey: !!apiKey });
+        if (gap) throw ApplicationFailure.create({ message: gap, type: 'agent-error', nonRetryable: true });
+        if (apiKey) resolvedAuth = { ...resolvedAuth, apiKey };
+      }
       if (
         organizationId !== 'org_personal'
         && profile.provider !== 'mock'

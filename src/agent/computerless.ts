@@ -83,6 +83,31 @@ export function computerlessModelGap(profile: Pick<AgentProfile, 'provider' | 'm
   return undefined;
 }
 
+/**
+ * The API key a turn of a task without a computer spends, or undefined when
+ * there is none (the turn refuses; readiness says "Can't start yet"). Such a
+ * turn runs in the worker for every organization alike, so the worker's own
+ * environment is not the organization's: its keys are spent only where they
+ * would be anyway —
+ *  - a key resolved for the organization (`resolvedAuth.apiKey`: its own
+ *    leased key, or the included model's per-organization key);
+ *  - the operator's model rail when it is switched on for this organization
+ *    (`managedRail`: metered and capped by its usage policy);
+ *  - a self-hosted installation's own organization, whose operator is its only
+ *    customer (as `gatherCredentialSources` offers host credentials).
+ * A leased login is a login, whatever the environment holds.
+ */
+export function computerlessApiKey(profile: Pick<AgentProfile, 'provider' | 'model' | 'modelProvider'>, options: {
+  hosted: boolean; organizationId: string; managedRail: boolean;
+  resolvedAuth?: { apiKey?: string; configHome?: string };
+}): string | undefined {
+  if (options.resolvedAuth?.apiKey) return options.resolvedAuth.apiKey;
+  if (options.resolvedAuth?.configHome) return undefined;
+  const hostKeys = options.managedRail || (!options.hosted && options.organizationId === 'org_personal');
+  const name = profile.provider === 'mock' ? '' : apiKeyEnv(credentialProvider(profile));
+  return hostKeys && name ? process.env[name] || undefined : undefined;
+}
+
 /** Run one turn of a task without a computer through `adapter`'s host-side rail. */
 export async function runComputerlessTurn(adapter: AgentAdapter, input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
   if (!adapter.runComputerlessTurn) throw new ComputerlessModelUnsupported(`The ${adapter.provider} agent can't run without a computer. ${NEEDS_API}`);
@@ -114,8 +139,8 @@ export async function runChatCompletionsTurn(input: TurnInput, ctx: PlatformTool
   ctx.emitActivity ??= () => {};
   const endpoint = chatCompletionsEndpoint(input.profile.model);
   if (!endpoint) throw new ComputerlessModelUnsupported(computerlessModelGap(input.profile, { apiKey: true }) ?? NEEDS_API);
-  const envName = apiKeyEnv(credentialProvider(input.profile));
-  const apiKey = input.resolvedAuth?.apiKey ?? (input.resolvedAuth?.configHome || !envName ? undefined : process.env[envName]);
+  // Only the key the activity resolved for this organization (computerlessApiKey).
+  const apiKey = input.resolvedAuth?.apiKey;
   if (!apiKey) throw loginNeedsComputer('opencode');
   const label = `${endpoint.vendor} Chat Completions`;
   (await (await currentTiming())?.mark('provider.selected', { provider: input.profile.provider, model: input.profile.model }));

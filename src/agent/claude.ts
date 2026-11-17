@@ -92,9 +92,11 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   /** A task without a computer: the Messages API loop with only tavya's own
-   * tools. A Claude Code login is its CLI, which needs a computer. */
+   * tools, on the key the activity resolved for the organization
+   * (computerlessApiKey) — never the worker's environment. A Claude Code
+   * login is its CLI, which needs a computer. */
   async runComputerlessTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
-    if (!input.resolvedAuth?.apiKey && (input.resolvedAuth?.configHome || !ClaudeAdapter.hasApiKey())) throw loginNeedsComputer('claude');
+    if (!input.resolvedAuth?.apiKey) throw loginNeedsComputer('claude');
     return this.runMessagesApi(input, ctx);
   }
 
