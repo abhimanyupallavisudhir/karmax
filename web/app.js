@@ -16784,9 +16784,9 @@ function hasOpenPullRequest(v) {
 function taskActionLabel(v, action) {
   // Keep Cancel in older task views that still declare the post-landing label as Finish.
   if (action.name === 'finish') return 'Cancel';
-  if (action.name === 'openPr' && v?.stage === 'escalated') return action.label || 'Send to review';
+  if (action.name === 'openPr' && v?.stage === 'escalated') return action.label || 'Manually send to review';
   if (action.name === 'openPr')
-    return hasOpenPullRequest(v) ? 'Back to review' : 'Send to review';
+    return hasOpenPullRequest(v) ? 'Back to review' : 'Manually send to review';
   // Waiting for the person to open the upstream pull request: Confirm checks now.
   if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.kind === 'human' && v.waitingFor.reason === 'merge')
     return 'I opened it';
