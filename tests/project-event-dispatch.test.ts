@@ -4,7 +4,7 @@ import { KarmaxBus } from '../src/contrib/bus.js';
 import { TriggerScheduler } from '../src/platform/trigger-scheduler.js';
 import { forcesRepeatable } from '../src/domain/triggers.js';
 import type { TaskRecord, TaskTrigger } from '../src/domain/types.js';
-import type { ProjectEvent, TriggerContext } from '../src/domain/project-events.js';
+import type { ProjectEvent, ProjectEventRecord, TriggerContext } from '../src/domain/project-events.js';
 import { storeBackends } from './helpers/store-backends.js';
 import { ERROR_REPORTS_KEY, ErrorReporter } from '../src/platform/error-reports.js';
 import { ERROR_FIXER_TRIGGER } from '../src/platform/error-fixer.js';
@@ -82,7 +82,7 @@ describe.each(storeBackends)('project event dispatch ($name)', ({ open }) => {
   };
 
   let seq = 0;
-  const record = async (over: Partial<Omit<ProjectEvent, 'id' | 'receivedAt'>> = {}) => (await store.recordProjectEvent({
+  const record = async (over: Partial<ProjectEventRecord> = {}) => (await store.recordProjectEvent({
     organizationId: 'org_personal', projectId, source: 'github', type: 'github.issues.labeled', key: `delivery-${++seq}`,
     occurredAt: clock.time, receivedAt: clock.time, origin: 'external', hops: 0,
     payload: { label: { name: 'planned' }, issue: { number: seq, title: `Issue ${seq}` } }, ...over,

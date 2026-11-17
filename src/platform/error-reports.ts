@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import os from 'node:os';
-import type { ProjectEvent } from '../domain/project-events.js';
+import type { ProjectEvent, ProjectEventRecord } from '../domain/project-events.js';
 import { buildHistory, buildRevision } from '../util/build-revision.js';
 
 /**
@@ -57,8 +57,7 @@ interface ReportsStore {
   kvGet(key: string): Promise<string | undefined>;
   kvSet?(key: string, value: string): Promise<void> | void;
   getProject(id: string): Promise<{ id: string; organizationId?: string } | undefined>;
-  recordProjectEvent(input: Omit<ProjectEvent, 'id' | 'receivedAt' | 'count' | 'lastSeenAt' | 'recent' | 'distinct'>
-    & { receivedAt?: number; occurrences?: number; distinct?: string[]; tally?: Record<string, string[]> }): Promise<{ event: ProjectEvent; created: boolean }>;
+  recordProjectEvent(input: ProjectEventRecord): Promise<{ event: ProjectEvent; created: boolean }>;
 }
 
 /** How long a process counts repeats of a bug in memory before writing them. */

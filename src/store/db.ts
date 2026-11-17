@@ -102,7 +102,7 @@ import { newId } from '../util/id.js';
 import type { TaskTemplateContent } from '../domain/task-templates.js';
 import { normalizeFollowUpTriggers, type FollowUpTrigger } from '../domain/triggers.js';
 import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, EVENT_DISTINCT_VALUES, EVENT_OCCURRENCE_BYTES, EVENT_RECENT_OCCURRENCES,
-  boundEventPayload, valuesAtPath, type EventFollow, type EventOccurrence, type KeyedRun, type ProjectEvent, type ProjectEventClaim,
+  boundEventPayload, valuesAtPath, type EventFollow, type EventOccurrence, type KeyedRun, type ProjectEvent, type ProjectEventClaim, type ProjectEventRecord,
   type ProjectEventClaimState } from '../domain/project-events.js';
 import { paymentMerchantMatches } from '../util/payment-merchant.js';
 import { previewHostname } from '../gateway/previews.js';
@@ -10522,8 +10522,7 @@ export class Store {
    * recorder that batches them, with what they differed in as `tally`). A
    * repeat is offered to the dispatcher again.
    */
-  async recordProjectEvent(input: Omit<ProjectEvent, 'id' | 'receivedAt' | 'count' | 'lastSeenAt' | 'recent' | 'distinct'>
-    & { receivedAt?: number; occurrences?: number; distinct?: string[]; tally?: Record<string, string[]> }): Promise<{ event: ProjectEvent; created: boolean }> {
+  async recordProjectEvent(input: ProjectEventRecord): Promise<{ event: ProjectEvent; created: boolean }> {
     return this.db.transaction(async () => {
       // A repeat rewrites its row from what it read (its latest repeats, its tallies).
       await this.db.lock(`project:${input.projectId}`);
@@ -10549,7 +10548,7 @@ export class Store {
         input.key, input.subject ?? null, input.occurredAt, receivedAt, JSON.stringify(input.payload), input.origin, input.hops,
         occurrences, receivedAt, tally({}))).changes) === 1;
       let row = await this.db.prepare('SELECT * FROM project_events WHERE projectId=? AND source=? AND eventKey=?')
-        .get(input.projectId, input.source, input.key) as any;
+        .get(input.projectId, input.source, input.key);
       if (!created) {
         const before = projectEventFromRow(row);
         const recent: EventOccurrence[] = [...(before.recent ?? []), { at: receivedAt, payload: boundEventPayload(input.payload, EVENT_OCCURRENCE_BYTES) }]

@@ -44,6 +44,13 @@ export interface ProjectEvent {
   distinct?: Record<string, string[]>;
 }
 
+/** What a recorder hands the inbox: the event without what the inbox itself
+ *  keeps (its id, its counts), plus how many occurrences this records, the
+ *  payload paths to tally across repeats, and values already tallied by a
+ *  recorder that counted several occurrences before writing. */
+export type ProjectEventRecord = Omit<ProjectEvent, 'id' | 'receivedAt' | 'count' | 'lastSeenAt' | 'recent' | 'distinct'>
+  & { receivedAt?: number; occurrences?: number; distinct?: string[]; tally?: Record<string, string[]> };
+
 /** One repeat of an event's key, kept as a sample. */
 export interface EventOccurrence { at: number; payload: Record<string, unknown> }
 
