@@ -66,7 +66,7 @@ it.skipIf(!SHOTS)('shoots the store screenshots', async () => {
       const asking = title.startsWith('Which');
       if (asking) question = String(task.num);
       await g.store.saveView(task.id, { taskId: task.id, title, workflow: 'software-dev', stage, status,
-        ...(waiting ? { waitingFor: { kind: waiting } } : {}), actions: [{ name: 'followUp', label: 'Send', enabled: true }], state: {}, updatedAt: Date.now(),
+        ...(waiting ? { waitingFor: { kind: waiting } } : {}), actions: [{ name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true, args: [{ name: 'text', type: 'text', label: 'Message', required: true }] }], state: {}, updatedAt: Date.now(),
         messages: [{ id: 'm0', role: 'user', text: title, ts: Date.now() - 600_000 },
           ...(asking ? [{ id: 'a1', role: 'agent', ts: Date.now() - 60_000,
             text: 'I compared Plausible, PostHog and Google Analytics for the storefront.\n\n- **Plausible**: no cookies, so no consent banner; €19/month.\n- **PostHog**: funnels and session replay; free up to 1M events.\n- **Google Analytics**: free, but needs the consent banner.\n\nWhich should I set up?' }] : [])],
