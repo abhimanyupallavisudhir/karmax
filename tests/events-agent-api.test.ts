@@ -107,16 +107,16 @@ describe('events through an agent\'s task token', () => {
     try {
       const listed = await storeOf();
       expect(listed.map((t: any) => t.id)).toEqual(['project-wiki', 'repair-github-workflow', 'build-planned-issues', 'triage-issues',
-        'update-dependencies', 'tag-tasks', 'chat-requests']);
+        'update-dependencies', 'tag-tasks', 'fix-errors', 'chat-requests']);
       expect(listed.every((t: any) => t.repeatable)).toBe(true);
       // Nothing from the store waits for a person at Review: what may change
       // code gets an agent Reviewer, the rest confirms itself.
       const reviewer = { layers: [{ kind: 'agent', maxRevisions: 3 }] }, auto = { layers: [] };
       expect(Object.fromEntries(listed.map((t: any) => [t.id, t.task.params.confirm]))).toEqual({ 'project-wiki': auto,
         'repair-github-workflow': reviewer, 'build-planned-issues': reviewer, 'triage-issues': auto, 'update-dependencies': reviewer,
-        'tag-tasks': auto, 'chat-requests': reviewer });
+        'tag-tasks': auto, 'fix-errors': reviewer, 'chat-requests': reviewer });
       expect(Object.fromEntries(listed.map((t: any) => [t.id, t.missing]))).toEqual({ 'project-wiki': [], 'repair-github-workflow': ['github'],
-        'build-planned-issues': ['github'], 'triage-issues': ['github'], 'update-dependencies': ['repository'], 'tag-tasks': [], 'chat-requests': ['chat'] });
+        'build-planned-issues': ['github'], 'triage-issues': ['github'], 'update-dependencies': ['repository'], 'tag-tasks': [], 'fix-errors': ['repository'], 'chat-requests': ['chat'] });
       expect(listed[0]).toMatchObject({ name: 'Maintain the project wiki', runOnInstall: true });
 
       // The wiki keeps itself current: installing it writes the wiki now, then weekly.
@@ -159,7 +159,7 @@ describe('events through an agent\'s task token', () => {
       const published = await maintainer.request('POST', '/api/organizations/org_personal/task-store', { taskId: reinstalled.id, name: 'Ours' })
         .catch((error: Error) => error.message);
       expect(String(published)).toMatch(/not found|missing capability/);
-      expect(await storeOf()).toHaveLength(7);
+      expect(await storeOf()).toHaveLength(8);
     } finally { dev.restore(); maintainer.restore(); }
   });
 

@@ -83,6 +83,11 @@ describe('events in the console', () => {
     expect(await body.locator('#ev-key').isHidden()).toBe(true);
     await body.locator('#ev-mode').selectOption('tell');
     await body.locator('#ev-key').fill('{{issue.number}}');
+    // One task per issue for good, started only when a model finds the event worth one.
+    await body.locator('#ev-mode').selectOption('continue');
+    expect(await body.locator('#ev-gate').isHidden()).toBe(true);
+    await body.locator('#ev-add-gate').click();
+    await body.locator('#ev-gate').fill('Start only for issues a maintainer planned.');
     await body.locator('.tf-command > summary').click();
     await body.locator('textarea[data-field="command"]').fill('python scripts/plan.py');
     await body.locator('select[data-field="onCommandFailure"]').selectOption('agent');
@@ -93,7 +98,7 @@ describe('events in the console', () => {
       command: 'python scripts/plan.py', onCommandFailure: 'agent', repeatable: true,
       triggers: [{ kind: 'event', type: 'github.issues.labeled', recurring: true,
         where: { 'label.name': 'planned', 'issue.number': { in: [12, 13] } },
-        concurrency: { key: '{{issue.number}}', mode: 'tell' } }],
+        concurrency: { key: '{{issue.number}}', mode: 'continue' }, gate: { prompt: 'Start only for issues a maintainer planned.' } }],
     });
     expect(errors).toEqual([]);
   });
@@ -192,7 +197,7 @@ describe('events in the console', () => {
     // Only what can run now; the rest wait in the store, and the GitHub they lack is said once.
     expect(await recs.locator('[data-store-task]').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-store-task'))))
       .toEqual(['project-wiki', 'tag-tasks']);
-    expect(await recs.locator('.store-recs-more').innerText()).toMatch(/^5 more in the Task store\s*·\s*Connect GitHub$/);
+    expect(await recs.locator('.store-recs-more').innerText()).toMatch(/^6 more in the Task store\s*·\s*Connect GitHub$/);
     expect(await recs.locator('.store-recs-more a', { hasText: 'Connect GitHub' }).getAttribute('href')).toBe('/personal/factory/settings#project');
     expect(await recs.textContent()).not.toContain('Needs GitHub');
     if (process.env.KARMAX_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'store-recommended.png') });
@@ -408,7 +413,7 @@ describe('events in the console', () => {
     const row = (id: string) => page.locator(`.store-row[data-store-task="${id}"]`);
     await row('build-planned-issues').waitFor();
     expect(await page.locator('.view-chip[data-view="__store__"]').getAttribute('class')).toContain('active');
-    expect(await page.locator('.store-row').count()).toBe(7);
+    expect(await page.locator('.store-row').count()).toBe(8);
     // Without a GitHub repository there is nothing for it to hear yet.
     expect(await row('build-planned-issues').locator('[data-store-run]').isDisabled()).toBe(true);
     expect(await row('build-planned-issues').textContent()).toContain('Needs GitHub');
