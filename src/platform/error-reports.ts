@@ -51,6 +51,10 @@ export interface ErrorReportInput {
   detail?: Record<string, unknown>;
   /** Count it on this bug (a person reporting an error already reported). */
   fingerprint?: string;
+  /** When it happened, if not now: a person reporting what a task showed days ago. */
+  occurredAt?: number;
+  /** The revision that was running when it happened, if not this process's; null: not known. */
+  revision?: string | null;
 }
 
 interface ReportsStore {
@@ -187,9 +191,17 @@ export class ErrorReporter {
   private setting?: { at: number; projectId?: string };
   private lookup?: Promise<string | undefined>;
 
-  constructor(private store: ReportsStore, private options: { now?: () => number; revision?: string; role?: string; flushMs?: number } = {}) {}
+  /** Since when this process has run its revision. */
+  private readonly startedAt: number;
+
+  constructor(private store: ReportsStore, private options: { now?: () => number; revision?: string; role?: string; flushMs?: number; startedAt?: number } = {}) {
+    this.startedAt = options.startedAt ?? (options.now ? options.now() : Date.now() - process.uptime() * 1000);
+  }
 
   private now(): number { return this.options.now?.() ?? Date.now(); }
+
+  /** The revision that was running at `at` as far as this process knows: its own since it started, else not known. */
+  revisionAt(at: number): string | null { return at >= this.startedAt ? (this.options.revision ?? null) : null; }
 
   /** The project reports go to, if they are on. One lookup at a time, however
    *  many errors ask at once (a storm must not queue a read per error), and a
@@ -221,16 +233,36 @@ export class ErrorReporter {
     if (!projectId) return undefined;
     const error = described(input.error);
     const fingerprint = input.fingerprint ?? errorFingerprint(input.kind, error.name, error.message, error.stack);
+    const at = Math.min(input.occurredAt ?? this.now(), this.now());
     const held = this.buffered.get(fingerprint);
-    if (held) { held.occurrences++; held.input = input; held.described = error; held.at = this.now(); tallied(held.tally, input); return undefined; }
+    if (held) { held.occurrences++; held.input = input; held.described = error; held.at = Math.max(held.at, at); tallied(held.tally, input); return undefined; }
     if (this.known.has(fingerprint) && this.buffered.size < MAX_BUFFERED) {
-      this.buffered.set(fingerprint, { input, described: error, occurrences: 1, at: this.now(), tally: tallied({}, input) });
+      this.buffered.set(fingerprint, { input, described: error, occurrences: 1, at, tally: tallied({}, input) });
       this.schedule();
       return undefined;
     }
     this.known.add(fingerprint);
     if (this.known.size > 20_000) this.known.clear();
-    return this.write(projectId, fingerprint, input, error, 1, this.now());
+    try {
+      return await this.write(projectId, fingerprint, input, error, 1, at);
+    } catch (failure) {
+      this.keep(fingerprint, { input, described: error, occurrences: 1, at, tally: tallied({}, input) });
+      throw failure;
+    }
+  }
+
+  /** Put occurrences that could not be written back with what was counted
+   *  since, to be written by the next flush (a database restarting must not
+   *  lose them; at most MAX_BUFFERED bugs are held). */
+  private keep(fingerprint: string, unwritten: Buffered): void {
+    const held = this.buffered.get(fingerprint);
+    if (held) {
+      held.occurrences += unwritten.occurrences;
+      held.at = Math.max(held.at, unwritten.at);
+      for (const [path, values] of Object.entries(unwritten.tally))
+        for (const value of values) if (!(held.tally[path] ??= []).includes(value) && held.tally[path]!.length < 20) held.tally[path]!.push(value);
+    } else if (this.buffered.size < MAX_BUFFERED) this.buffered.set(fingerprint, unwritten);
+    this.schedule();
   }
 
   private schedule(): void {
@@ -247,8 +279,16 @@ export class ErrorReporter {
     this.buffered.clear();
     const projectId = pending.length ? await this.destination() : undefined;
     if (!projectId) return;
-    for (const [fingerprint, held] of pending)
-      await this.write(projectId, fingerprint, held.input, held.described, held.occurrences, held.at, held.tally);
+    let failed: unknown;
+    for (const [fingerprint, held] of pending) {
+      try {
+        await this.write(projectId, fingerprint, held.input, held.described, held.occurrences, held.at, held.tally);
+      } catch (error) {
+        failed ??= error;
+        this.keep(fingerprint, held);
+      }
+    }
+    if (failed !== undefined) throw failed;
   }
 
   private async write(projectId: string, fingerprint: string, input: ErrorReportInput, error: { name: string; message: string; stack?: string },
@@ -256,6 +296,7 @@ export class ErrorReporter {
     const project = await this.store.getProject(projectId);
     if (!project) return undefined;
     const text = scrubSecrets(error.message);
+    const revision = input.revision === undefined ? this.options.revision : input.revision ?? undefined;
     const summary = `${error.name === 'Error' ? '' : `${error.name}: `}${text.split('\n')[0]!}`.replace(/\s+/g, ' ').trim().slice(0, 120);
     const payload: Record<string, unknown> = {
       fingerprint, kind: input.kind, summary, name: error.name, message: text.slice(0, 4_000),
@@ -265,18 +306,20 @@ export class ErrorReporter {
       ...(input.projectId ? { projectId: input.projectId } : {}),
       ...(input.organizationId ? { organizationId: input.organizationId } : {}),
       ...(input.detail ? { detail: input.detail } : {}),
-      ...(this.options.revision ? { revision: this.options.revision } : {}),
+      ...(revision ? { revision } : {}),
       host: os.hostname(), ...(this.options.role ? { process: this.options.role } : {}),
       occurredAt: new Date(at).toISOString(),
     };
+    // `at` is when it happened, which a person's report of a task's error puts in the past.
     const { event, created } = await this.store.recordProjectEvent({
       organizationId: project.organizationId ?? 'org_personal', projectId, source: ERROR_EVENT_SOURCE, type: ERROR_EVENT_TYPE,
-      key: fingerprint, subject: `tavya-error:${fingerprint}`, occurredAt: at, receivedAt: at, payload, origin: 'external', hops: 0,
+      key: fingerprint, subject: `tavya-error:${fingerprint}`, occurredAt: at, receivedAt: this.now(), payload, origin: 'external', hops: 0,
       occurrences, distinct: TALLIED, ...(tally ? { tally } : {}),
     });
     // A person's report of this task's error counts on the same bug.
     if (input.taskId && input.kind === 'escalation')
-      await Promise.resolve(this.store.kvSet?.(taskErrorKey(input.taskId), JSON.stringify({ fingerprint, error: text.slice(0, 500) }))).catch(() => undefined);
+      await Promise.resolve(this.store.kvSet?.(taskErrorKey(input.taskId), JSON.stringify({ fingerprint, error: text.slice(0, 500), at,
+        ...(revision ? { revision } : {}) }))).catch(() => undefined);
     return created ? event : undefined;
   }
 }
@@ -306,27 +349,37 @@ export function reportError(input: ErrorReportInput): void {
  * An error a person saw and reported from the console. A task's error is
  * read from the task (never from the caller) and counts on the bug the
  * platform reported it under, if it did; anything else is the caller's own
- * words, marked as such. False when reports are off.
+ * words, marked as such. A task's error is an occurrence of when the task
+ * failed (`failedAt`: it may have shown it for weeks), under the revision
+ * running then if that is known, so that reporting it late never reads as the
+ * bug coming back after its fix. False when reports are off.
  */
-export async function reportFromPerson(store: ReportsStore, input: { by: string; task?: { id: string; projectId: string; error?: string; stage?: string };
+export async function reportFromPerson(store: ReportsStore, input: { by: string;
+  task?: { id: string; projectId: string; error?: string; stage?: string; failedAt?: number };
   message?: string; where?: string; note?: string; organizationId?: string }): Promise<boolean> {
   const current = reporter;
   if (!current || !(await current.destination())) return false;
   const text = (input.task?.error ?? input.message ?? '').trim().slice(0, 4_000);
   if (!text) return false;
   let fingerprint: string | undefined;
+  let when: { occurredAt: number; revision: string | null } | undefined;
   if (input.task?.error) {
     try {
-      const known = JSON.parse((await store.kvGet(taskErrorKey(input.task.id))) ?? '{}') as { fingerprint?: string; error?: string };
-      if (known.fingerprint && known.error && scrubSecrets(text).startsWith(known.error.slice(0, 200))) fingerprint = known.fingerprint;
+      const known = JSON.parse((await store.kvGet(taskErrorKey(input.task.id))) ?? '{}') as { fingerprint?: string; error?: string; at?: number; revision?: string };
+      if (known.fingerprint && known.error && scrubSecrets(text).startsWith(known.error.slice(0, 200))) {
+        fingerprint = known.fingerprint;
+        if (typeof known.at === 'number') when = { occurredAt: known.at, revision: known.revision ?? null };
+      }
     } catch { fingerprint = undefined; }
+    if (!when && input.task.failedAt !== undefined && Number.isFinite(input.task.failedAt))
+      when = { occurredAt: input.task.failedAt, revision: current.revisionAt(input.task.failedAt) };
   }
   await current.report({ kind: 'reported', error: Object.assign(new Error(text), { name: input.task?.error ? 'Escalation' : 'Reported', stack: undefined }),
     where: (input.task?.stage ? `stage ${input.task.stage}` : input.where?.slice(0, 200)) || undefined,
     ...(input.task ? { taskId: input.task.id, projectId: input.task.projectId } : {}),
     ...(input.organizationId ? { organizationId: input.organizationId } : {}),
     detail: { reportedBy: input.by, ...(input.note?.trim() ? { note: input.note.trim().slice(0, 1_000) } : {}), ...(input.task?.error ? {} : { inTheirWords: true }) },
-    ...(fingerprint ? { fingerprint } : {}) });
+    ...(fingerprint ? { fingerprint } : {}), ...(when ?? {}) });
   await current.flush();
   return true;
 }

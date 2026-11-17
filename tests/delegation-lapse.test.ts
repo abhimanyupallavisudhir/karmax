@@ -114,6 +114,32 @@ describe('a task\'s human delegation', () => {
     expect(isExpiredDelegationEscalation(new HumanDelegationLapsed('dlg_x').message)).toBe(false);
   });
 
+  // tavya-error dbf20980640bd94b, 2026-11-17: a series' delegation expired on
+  // its own, the hourly sweep deleted the row, and its next run's lapse read
+  // as "withdrawn" — reported as tavya's error, the person told something false.
+  it('still says it expired, not that it was withdrawn, once the retention sweep has purged it', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-17T19:29:16Z'));
+    const series = await task('Repair GitHub workflow');
+    const expired = (await tokens.delegateHuman(await alice(), { taskId: series.id, projectId, organizationId, ttlMs: 30 * 86_400_000 }))!;
+    const other = await task('Deleted');
+    const withdrawn = (await tokens.delegateHuman(await alice(), { taskId: other.id, projectId, organizationId, ttlMs: 30 * 86_400_000 }))!;
+    await store.revokeHumanDelegationsForTask(other.id);
+    vi.setSystemTime(new Date('2026-11-17T07:17:40Z'));
+    await store.purgeHumanDelegations();
+    const lapse = async (delegationId: string) => String(((await turn(series.id, delegationId).catch((error: unknown) => error)) as Error).message);
+    expect(await lapse(expired.id)).toMatch(/expired on 2026-11-16\b/);
+    expect(isExpiredDelegationEscalation(`Activity task failed → ${await lapse(expired.id)}`)).toBe(true);
+    expect(await lapse(withdrawn.id)).toMatch(/was withdrawn/);
+    // What is kept says nothing of the person or what they allowed.
+    const kept = await store.db.prepare('SELECT json FROM human_delegations WHERE id IN (?, ?)').all(expired.id, withdrawn.id) as Array<{ json: string }>;
+    expect(kept.map((row) => row.json)).toEqual(['{}', '{}']);
+    // Forgotten after a year: a lapse then says only what it can.
+    vi.setSystemTime(new Date('2027-11-18T00:00:00Z'));
+    await store.purgeHumanDelegations();
+    expect(await store.db.prepare('SELECT id FROM human_delegations WHERE id IN (?, ?)').all(expired.id, withdrawn.id)).toEqual([]);
+  });
+
   describe('renewed by the person it acts for', () => {
     async function blocked() {
       const authorization = await AuthorizationService.create(store);

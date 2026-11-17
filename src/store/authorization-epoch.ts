@@ -109,8 +109,9 @@ const SCOPED = new Map(([
   ['UPDATE human_delegations SET revokedAt=? WHERE id=? AND revokedAt IS NULL', (p) => ({ delegations: [text(p[1])] })],
   // A delegation narrowed, or handed up to another parent, touches itself.
   ['UPDATE human_delegations SET json=? WHERE id=? AND revokedAt IS NULL', (p) => ({ delegations: [text(p[1])] })],
-  // Purges delete rows that already authorize nothing (expired or revoked).
-  ['DELETE FROM human_delegations WHERE expiresAt<=? OR revokedAt IS NOT NULL', () => undefined],
+  // Purges empty or delete rows that already authorize nothing (expired or revoked).
+  ['UPDATE human_delegations SET json=? WHERE(expiresAt<=? OR revokedAt IS NOT NULL)AND json<>?', () => undefined],
+  ['DELETE FROM human_delegations WHERE json=? AND COALESCE(revokedAt,expiresAt)<=?', () => undefined],
   ['UPDATE preview_leases SET tlsRequestedAt=? WHERE hostname=? AND tlsRequestedAt IS NULL', () => undefined],
   // A person's access: their grants and memberships, and their groups'.
   ['INSERT INTO principal_grants(principalId,scopeKey,json)VALUES(?,?,?)ON CONFLICT(principalId,scopeKey)DO UPDATE SET json=excluded.json', (p) => ({ principals: [text(p[0])] })],

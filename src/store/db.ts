@@ -299,6 +299,10 @@ export const STORE_LOCK_ORDER = [
 /** Advisory lock namespaces registering in-flight seqs per table (PostgreSQL); see migrate(). */
 const SEQ_KEYS = { events: 1802661240, audit_log: 1802661340 } as const;
 
+/** What the retention sweep leaves of a lapsed human delegation, and for how long. */
+const PURGED_DELEGATION = '{}';
+const PURGED_DELEGATION_KEPT_MS = 365 * 86_400_000;
+
 export class Store {
   /** Compound service mutations must include their reads in this boundary. */
   transaction<T>(operation: () => Promise<T>): Promise<T> {
@@ -1130,6 +1134,7 @@ export class Store {
         eventId TEXT NOT NULL, taskId TEXT NOT NULL, state TEXT NOT NULL, reason TEXT,
         runId TEXT, concurrencyKey TEXT, receivedAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
         gated INTEGER NOT NULL DEFAULT 0,
+        gateReason TEXT,
         PRIMARY KEY (eventId, taskId)
       );
       -- Hosted SaaS subscriptions are a separate ledger from agent spending
@@ -1428,6 +1433,8 @@ export class Store {
     }
     const eventClaimCols = await this.db.prepare('PRAGMA table_info(project_event_claims)').all() as { name: string }[];
     if (!eventClaimCols.some(column => column.name === 'gated')) await this.db.exec('ALTER TABLE project_event_claims ADD COLUMN gated INTEGER NOT NULL DEFAULT 0');
+    // What its gate said about a run it let start (a skip says it in \`reason\`).
+    if (!eventClaimCols.some(column => column.name === 'gateReason')) await this.db.exec('ALTER TABLE project_event_claims ADD COLUMN gateReason TEXT');
     await this.db.exec('CREATE INDEX IF NOT EXISTS idx_keyed_runs_task ON keyed_runs(taskId)');
     const candidateCols = await this.db.prepare('PRAGMA table_info(resource_candidates)').all() as { name: string }[];
     if (!candidateCols.some(column => column.name === 'error')) await this.db.exec('ALTER TABLE resource_candidates ADD COLUMN error TEXT');
@@ -10552,7 +10559,11 @@ export class Store {
         .get(input.projectId, input.source, input.key);
       if (!created) {
         const before = projectEventFromRow(row);
-        const recent: EventOccurrence[] = [...(before.recent ?? []), { at: receivedAt, payload: boundEventPayload(input.payload, EVENT_OCCURRENCE_BYTES) }]
+        // When it happened, as its recorder says (a person reporting what a task
+        // showed days ago), but never later than when it was heard: a sender's
+        // clock ahead of ours is not believed. \`lastSeenAt\` is when it was heard.
+        const at = Number.isFinite(input.occurredAt) ? Math.min(input.occurredAt, receivedAt) : receivedAt;
+        const recent: EventOccurrence[] = [...(before.recent ?? []), { at, payload: boundEventPayload(input.payload, EVENT_OCCURRENCE_BYTES) }]
           .slice(-EVENT_RECENT_OCCURRENCES);
         await this.db.prepare('UPDATE project_events SET count=?, lastSeenAt=?, recent=?, distinctValues=? WHERE id=?')
           .run(before.count + occurrences, Math.max(before.lastSeenAt, receivedAt), JSON.stringify(recent), tally({ ...before.distinct }), before.id);
@@ -10683,12 +10694,13 @@ export class Store {
 
   /** Compare-and-set on the claim's state, so two dispatchers never both act. */
   async updateProjectEventClaim(eventId: string, taskId: string, from: ProjectEventClaimState[],
-    next: { state: ProjectEventClaimState; reason?: string | null; runId?: string | null; concurrencyKey?: string | null; updatedAt?: number; gated?: boolean }): Promise<boolean> {
+    next: { state: ProjectEventClaimState; reason?: string | null; runId?: string | null; concurrencyKey?: string | null; updatedAt?: number; gated?: boolean;
+      gateReason?: string | null }): Promise<boolean> {
     return this.db.transaction(async () => {
       const sets = ['state=?', 'updatedAt=?'];
       const args: unknown[] = [next.state, next.updatedAt ?? Date.now()];
       if (next.gated !== undefined) { sets.push('gated=?'); args.push(next.gated ? 1 : 0); }
-      for (const field of ['reason', 'runId', 'concurrencyKey'] as const) {
+      for (const field of ['reason', 'runId', 'concurrencyKey', 'gateReason'] as const) {
         if (next[field] !== undefined) { sets.push(`${field}=?`); args.push(next[field]); }
       }
       return Number((await this.db.prepare(`UPDATE project_event_claims SET ${sets.join(', ')}
@@ -10873,9 +10885,13 @@ export class Store {
   }
 
   /** A delegation's row whatever its state (revoked, expired): why it lapsed. */
-  async humanDelegationRow(id: string): Promise<{ record: Record<string, unknown>; revokedAt?: number } | undefined> {
-    const r = (await this.db.prepare('SELECT json, revokedAt FROM human_delegations WHERE id=?').get(id)) as any;
-    return r ? { record: JSON.parse(r.json), revokedAt: r.revokedAt == null ? undefined : Number(r.revokedAt) } : undefined;
+  /** A delegation's row: \`record\` is absent once the retention sweep has
+   *  purged it (\`purgeHumanDelegations\`), which keeps how it lapsed. */
+  async humanDelegationRow(id: string): Promise<{ record?: Record<string, unknown>; expiresAt: number; revokedAt?: number } | undefined> {
+    const r = (await this.db.prepare('SELECT json, expiresAt, revokedAt FROM human_delegations WHERE id=?').get(id)) as any;
+    if (!r) return undefined;
+    const record = r.json === PURGED_DELEGATION ? undefined : JSON.parse(r.json) as Record<string, unknown>;
+    return { ...(record ? { record } : {}), expiresAt: Number(r.expiresAt), ...(r.revokedAt == null ? {} : { revokedAt: Number(r.revokedAt) }) };
   }
 
   async revokeHumanDelegation(id: string): Promise<void> {
@@ -11050,6 +11066,7 @@ export class Store {
     const rows = (await this.db.prepare('SELECT id, json, revokedAt FROM human_delegations').all()) as any[];
     const records = new Map<string, { record: Record<string, unknown>; revoked: boolean }>();
     for (const row of rows) {
+      if (row.json === PURGED_DELEGATION) continue; // purged: as good as gone
       try { records.set(String(row.id), { record: JSON.parse(row.json), revoked: row.revokedAt != null }); } catch { /* unusable */ }
     }
     const lapsed = new Map<string, Record<string, unknown>>();
@@ -11059,7 +11076,13 @@ export class Store {
       if (!revoked && parent && !records.has(parent)) lapsed.set(parent, {});
     }
     (await this.handDerivedDelegationsUp(lapsed));
-    return Number((await this.db.prepare('DELETE FROM human_delegations WHERE expiresAt<=? OR revokedAt IS NOT NULL').run(now)).changes);
+    // A lapsed delegation keeps only how it lapsed (its expiry, its revocation),
+    // nothing of the person or what they allowed, so that a task holding it can
+    // still say "expired on …" (theirs to renew) rather than "withdrawn" (a
+    // fault to look into). That too is forgotten after a year.
+    (await this.db.prepare('DELETE FROM human_delegations WHERE json=? AND COALESCE(revokedAt, expiresAt)<=?').run(PURGED_DELEGATION, now - PURGED_DELEGATION_KEPT_MS));
+    return Number((await this.db.prepare('UPDATE human_delegations SET json=? WHERE (expiresAt<=? OR revokedAt IS NOT NULL) AND json<>?')
+      .run(PURGED_DELEGATION, now, PURGED_DELEGATION)).changes);
   
     });
   }
@@ -11999,7 +12022,7 @@ function projectEventClaimFromRow(row: any): ProjectEventClaim {
     eventId: String(row.eventId), taskId: String(row.taskId), state: String(row.state) as ProjectEventClaimState,
     ...(row.reason ? { reason: String(row.reason) } : {}), ...(row.runId ? { runId: String(row.runId) } : {}),
     ...(row.concurrencyKey !== null && row.concurrencyKey !== undefined ? { concurrencyKey: String(row.concurrencyKey) } : {}),
-    ...(Number(row.gated ?? 0) ? { gated: true } : {}),
+    ...(Number(row.gated ?? 0) ? { gated: true } : {}), ...(row.gateReason ? { gateReason: String(row.gateReason) } : {}),
     receivedAt: Number(row.receivedAt), updatedAt: Number(row.updatedAt),
   };
 }
