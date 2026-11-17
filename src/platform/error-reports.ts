@@ -58,7 +58,7 @@ interface ReportsStore {
   kvSet?(key: string, value: string): Promise<void> | void;
   getProject(id: string): Promise<{ id: string; organizationId?: string } | undefined>;
   recordProjectEvent(input: Omit<ProjectEvent, 'id' | 'receivedAt' | 'count' | 'lastSeenAt' | 'recent' | 'distinct'>
-    & { receivedAt?: number; occurrences?: number; distinct?: string[] }): Promise<{ event: ProjectEvent; created: boolean }>;
+    & { receivedAt?: number; occurrences?: number; distinct?: string[]; tally?: Record<string, string[]> }): Promise<{ event: ProjectEvent; created: boolean }>;
 }
 
 /** How long a process counts repeats of a bug in memory before writing them. */
@@ -166,7 +166,19 @@ export function taskFailure(taskId: string, errorText: string, now = Date.now())
 
 // ─── The reporter ────────────────────────────────────────────────────────────
 
-interface Buffered { input: ErrorReportInput; described: { name: string; message: string; stack?: string }; occurrences: number; at: number }
+interface Buffered { input: ErrorReportInput; described: { name: string; message: string; stack?: string }; occurrences: number; at: number;
+  /** What the occurrences counted here differed in (who, which kind): only the latest is written out in full. */
+  tally: Record<string, string[]> }
+
+/** Add an occurrence's tallied values (its organization, its kind) to what a buffer has seen. */
+function tallied(tally: Record<string, string[]>, input: ErrorReportInput): Record<string, string[]> {
+  for (const [path, value] of [['organizationId', input.organizationId], ['kind', input.kind]] as const) {
+    if (!value) continue;
+    const values = (tally[path] ??= []);
+    if (values.length < 20 && !values.includes(value)) values.push(value);
+  }
+  return tally;
+}
 
 export class ErrorReporter {
   /** Bugs this process has written: a further occurrence waits for the next flush. */
@@ -174,23 +186,31 @@ export class ErrorReporter {
   private buffered = new Map<string, Buffered>();
   private timer?: ReturnType<typeof setTimeout>;
   private setting?: { at: number; projectId?: string };
+  private lookup?: Promise<string | undefined>;
 
   constructor(private store: ReportsStore, private options: { now?: () => number; revision?: string; role?: string; flushMs?: number } = {}) {}
 
   private now(): number { return this.options.now?.() ?? Date.now(); }
 
-  /** The project reports go to, if they are on. */
+  /** The project reports go to, if they are on. One lookup at a time, however
+   *  many errors ask at once (a storm must not queue a read per error), and a
+   *  lookup that fails keeps the last answer instead of turning reports off. */
   async destination(): Promise<string | undefined> {
     if (this.setting && this.now() - this.setting.at < SETTING_CACHE_MS) return this.setting.projectId;
-    let projectId: string | undefined;
-    try { projectId = (JSON.parse((await this.store.kvGet(ERROR_REPORTS_KEY)) ?? '{}') as { projectId?: unknown }).projectId as string | undefined; }
-    catch { projectId = undefined; }
-    this.setting = { at: this.now(), ...(typeof projectId === 'string' && projectId ? { projectId } : {}) };
-    return this.setting.projectId;
+    this.lookup ??= (async () => {
+      try {
+        const projectId = (JSON.parse((await this.store.kvGet(ERROR_REPORTS_KEY)) ?? '{}') as { projectId?: unknown }).projectId;
+        this.setting = { at: this.now(), ...(typeof projectId === 'string' && projectId ? { projectId } : {}) };
+      } catch {
+        this.setting = { at: this.now(), ...(this.setting?.projectId ? { projectId: this.setting.projectId } : {}) };
+      } finally { this.lookup = undefined; }
+      return this.setting!.projectId;
+    })();
+    return this.lookup;
   }
 
   /** Forget the cached destination (the setting just changed in this process). */
-  invalidate(): void { this.setting = undefined; }
+  invalidate(): void { this.setting = undefined; this.lookup = undefined; }
 
   /**
    * Count one occurrence. The first of a bug in this process is written at
@@ -203,9 +223,9 @@ export class ErrorReporter {
     const error = described(input.error);
     const fingerprint = input.fingerprint ?? errorFingerprint(input.kind, error.name, error.message, error.stack);
     const held = this.buffered.get(fingerprint);
-    if (held) { held.occurrences++; held.input = input; held.described = error; held.at = this.now(); return undefined; }
+    if (held) { held.occurrences++; held.input = input; held.described = error; held.at = this.now(); tallied(held.tally, input); return undefined; }
     if (this.known.has(fingerprint) && this.buffered.size < MAX_BUFFERED) {
-      this.buffered.set(fingerprint, { input, described: error, occurrences: 1, at: this.now() });
+      this.buffered.set(fingerprint, { input, described: error, occurrences: 1, at: this.now(), tally: tallied({}, input) });
       this.schedule();
       return undefined;
     }
@@ -229,11 +249,11 @@ export class ErrorReporter {
     const projectId = pending.length ? await this.destination() : undefined;
     if (!projectId) return;
     for (const [fingerprint, held] of pending)
-      await this.write(projectId, fingerprint, held.input, held.described, held.occurrences, held.at);
+      await this.write(projectId, fingerprint, held.input, held.described, held.occurrences, held.at, held.tally);
   }
 
   private async write(projectId: string, fingerprint: string, input: ErrorReportInput, error: { name: string; message: string; stack?: string },
-    occurrences: number, at: number): Promise<ProjectEvent | undefined> {
+    occurrences: number, at: number, tally?: Record<string, string[]>): Promise<ProjectEvent | undefined> {
     const project = await this.store.getProject(projectId);
     if (!project) return undefined;
     const text = scrubSecrets(error.message);
@@ -252,8 +272,8 @@ export class ErrorReporter {
     };
     const { event, created } = await this.store.recordProjectEvent({
       organizationId: project.organizationId ?? 'org_personal', projectId, source: ERROR_EVENT_SOURCE, type: ERROR_EVENT_TYPE,
-      key: fingerprint, subject: `tavya-error:${fingerprint}`, occurredAt: at, payload, origin: 'external', hops: 0,
-      occurrences, distinct: TALLIED,
+      key: fingerprint, subject: `tavya-error:${fingerprint}`, occurredAt: at, receivedAt: at, payload, origin: 'external', hops: 0,
+      occurrences, distinct: TALLIED, ...(tally ? { tally } : {}),
     });
     // A person's report of this task's error counts on the same bug.
     if (input.taskId && input.kind === 'escalation')

@@ -174,7 +174,10 @@ export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, op
       // Where a task's failure was thrown, for its error report: the task
       // itself only says what failed (wiki features/error-reports).
       const failed = (error: unknown): never => {
-        try { rememberTaskFailure(Context.current().info.workflowExecution.workflowId, error); } catch { /* never the activity's problem */ }
+        try {
+          const workflowId = Context.current().info.workflowExecution?.workflowId;
+          if (workflowId) rememberTaskFailure(workflowId, error);
+        } catch { /* never the activity's problem */ }
         throw error;
       };
       // A heartbeating activity of a dead worker is retried at its heartbeat

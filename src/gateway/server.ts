@@ -5726,13 +5726,13 @@ export class Gateway {
         }
         if (method === 'POST') {
           const b = await this.body(req);
-          const result = await api.emitProjectEvent(token, projectId, { type: b.type, key: b.key, subject: b.subject, occurredAt: b.occurredAt, payload: b.payload });
+          const result = await api.emitProjectEvent(token, projectId, { type: b.type, key: b.key, subject: b.subject, occurredAt: b.occurredAt, payload: b.payload, distinct: b.distinct });
           return this.json(res, result.duplicate ? 200 : 201, result);
         }
       }
       if (p === '/api/events' && method === 'POST') {
         const b = await this.body(req);
-        const result = await api.emitProjectEvent(token, undefined, { type: b.type, key: b.key, subject: b.subject, occurredAt: b.occurredAt, payload: b.payload });
+        const result = await api.emitProjectEvent(token, undefined, { type: b.type, key: b.key, subject: b.subject, occurredAt: b.occurredAt, payload: b.payload, distinct: b.distinct });
         return this.json(res, result.duplicate ? 200 : 201, result);
       }
       // The task store (src/domain/task-store.ts); `automations` is its former name.

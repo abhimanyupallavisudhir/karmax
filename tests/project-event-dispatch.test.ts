@@ -176,21 +176,36 @@ describe.each(storeBackends)('project event dispatch ($name)', ({ open }) => {
     expect(told).toHaveLength(1);
   });
 
-  // wiki features/error-reports: an outage raising many different errors
-  // starts one fixer, which hears of the rest while it works.
-  it('starts one fixer for tavya\'s own errors and tells it the rest', async () => {
-    told.length = 0;
+  // wiki features/error-reports: each bug gets one task; an outage that
+  // raises one error thousands of times starts one, and one that raises many
+  // different errors starts three at a time, the most-seen first.
+  it('gives each of tavya\'s own errors one task, a few at a time', async () => {
     const series = await armedTask([ERROR_FIXER_TRIGGER]);
     await store.kvSet(ERROR_REPORTS_KEY, JSON.stringify({ projectId }));
     const reporter = new ErrorReporter(store, { now: clock.now });
     const s = await scheduler();
-    const first = (await reporter.report({ kind: 'request', error: new Error('first bug') }))!;
-    await deliver(s, first);
-    expect(fires).toMatchObject([{ taskId: series.id, mode: 'clone', trigger: { source: 'tavya', type: 'tavya.error' } }]);
-    const runId = (await store.getProjectEventClaim(first.id, series.id))!.runId!;
-    for (const bug of ['second bug', 'third bug']) await deliver(s, (await reporter.report({ kind: 'sweep', error: new Error(bug) }))!);
-    expect(fires).toHaveLength(1);
-    expect(told.map((entry) => [entry.runId, entry.trigger.payload.message])).toEqual([[runId, 'second bug'], [runId, 'third bug']]);
+    const bug = (name: string, times: number) => Promise.all(Array.from({ length: times }, () => reporter.report({ kind: 'request', error: new Error(name) })));
+    await bug('the same bug again and again', 3_000);
+    await bug('bug b', 2);
+    await bug('bug c', 40);
+    await bug('bug d', 7);
+    await bug('bug e', 1);
+    await reporter.flush();
+    await s.sweepProjectEvents();
+    // Nothing yet: it waits five minutes for what comes with an error.
+    expect(fires).toEqual([]);
+    clock.advance(5 * 60_000);
+    await s.sweepProjectEvents();
+    expect(fires.map((f) => [f.taskId, f.mode, f.trigger!.payload.message, f.trigger!.count ?? 1])).toEqual([
+      [series.id, 'clone', 'the same bug again and again', 3_000], [series.id, 'clone', 'bug c', 40], [series.id, 'clone', 'bug d', 7]]);
+    expect(fires[0]!.trigger).toMatchObject({ source: 'tavya', type: 'tavya.error' });
+    // The storm goes on: still those three tasks, and the rest wait their turn.
+    await bug('the same bug again and again', 500);
+    await reporter.flush();
+    await s.sweepProjectEvents();
+    expect(fires).toHaveLength(3);
+    const waiting = (await store.listProjectEvents(projectId)).filter((event) => ['bug b', 'bug e'].includes(String(event.payload.message)));
+    for (const event of waiting) expect(await store.getProjectEventClaim(event.id, series.id)).toMatchObject({ state: 'deferred', reason: 'queued: 3 of its runs are at work' });
   });
 
   it('holds runs past the hourly limit until the hour has passed', async () => {

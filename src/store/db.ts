@@ -10519,10 +10519,11 @@ export class Store {
    * event; a repeat is counted on it (`created: false`): its count and last
    * time move, the repeat is kept among its latest, and the values at the
    * `distinct` paths are tallied. `occurrences` records several at once (a
-   * recorder that batches them). A repeat is offered to the dispatcher again.
+   * recorder that batches them, with what they differed in as `tally`). A
+   * repeat is offered to the dispatcher again.
    */
   async recordProjectEvent(input: Omit<ProjectEvent, 'id' | 'receivedAt' | 'count' | 'lastSeenAt' | 'recent' | 'distinct'>
-    & { receivedAt?: number; occurrences?: number; distinct?: string[] }): Promise<{ event: ProjectEvent; created: boolean }> {
+    & { receivedAt?: number; occurrences?: number; distinct?: string[]; tally?: Record<string, string[]> }): Promise<{ event: ProjectEvent; created: boolean }> {
     return this.db.transaction(async () => {
       // A repeat rewrites its row from what it read (its latest repeats, its tallies).
       await this.db.lock(`project:${input.projectId}`);
@@ -10530,9 +10531,10 @@ export class Store {
       const receivedAt = input.receivedAt ?? Date.now();
       const occurrences = Math.max(1, Math.trunc(input.occurrences ?? 1));
       const tally = (existing: Record<string, string[]>) => {
-        for (const path of input.distinct ?? []) {
+        // `tally`: values of occurrences its recorder counted without writing each.
+        for (const path of new Set([...(input.distinct ?? []), ...Object.keys(input.tally ?? {})])) {
           const values = existing[path] ?? [];
-          for (const value of valuesAtPath(input.payload, path)) {
+          for (const value of [...valuesAtPath(input.payload, path), ...(input.tally?.[path] ?? [])]) {
             if ((typeof value !== 'string' && typeof value !== 'number') || values.length >= EVENT_DISTINCT_VALUES) continue;
             const text = String(value).slice(0, 200);
             if (!values.includes(text)) values.push(text);

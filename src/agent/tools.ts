@@ -630,13 +630,13 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'emit_event',
     description: 'Record a project event. Tasks waiting on a matching event trigger start runs that receive it. '
-      + 'Re-emitting the same `key` does nothing, so a poller can report everything it sees each run.',
+      + 'Re-emitting the same `key` starts nothing new: it is counted on that event, so a poller can report everything it sees each run, and an error can be reported each time it happens.',
     parameters: {
       type: 'object',
       properties: {
         project_id: { type: 'string' },
         type: { type: 'string', description: 'Dotted words, e.g. "orders.created".' },
-        key: { type: 'string', description: 'Delivery key; repeats of one key collapse. Omit for a one-off.' },
+        key: { type: 'string', description: 'What the event is; repeats of one key are counted on one event. Omit for a one-off.' },
         subject: { type: 'string', description: 'A link or label for what the event is about.' },
         payload: { type: 'object', description: 'JSON object, at most 64 KB.' },
       },
