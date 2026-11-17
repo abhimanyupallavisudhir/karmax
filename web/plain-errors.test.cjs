@@ -18,7 +18,8 @@ function extract(name, kind = 'function') {
 global.esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 eval(`${extract('CAPABILITY_ACTIONS', 'const')}; global.CAPABILITY_ACTIONS = CAPABILITY_ACTIONS;`);
 global.globalRoute = () => '/org/settings';
-for (const fn of ['permissionSentence', 'plainError', 'plainTaskError', 'toolsDidNotStart', 'storageFull', 'namedPlaces', 'setupFixes', 'setupFix', 'setupFixHtml', 'taskErrorHtml']) eval(`global.${fn} = ${extract(fn)}`);
+global.S = {};
+for (const fn of ['permissionSentence', 'plainError', 'plainTaskError', 'toolsDidNotStart', 'storageFull', 'namedPlaces', 'setupFixes', 'setupFix', 'setupFixHtml', 'reportErrorHtml', 'taskErrorHtml']) eval(`global.${fn} = ${extract(fn)}`);
 
 let passed = 0;
 const eq = (actual, expected, label) => { assert.strictEqual(actual, expected, label); passed++; };
@@ -95,5 +96,14 @@ eq(full.summary, "The task stopped: tavya's Hetzner Cloud computers are using 8 
 assert.ok(!taskErrorHtml("workflow failed: tavya's Hetzner Cloud computers are using 8 of their 10 CPUs; waiting for room.").includes('Press Retry'), 'its advice is not doubled'); passed++;
 eq(plainTaskError('workflow failed: could not seed the parent branch').summary, 'The task stopped: could not seed the parent branch.', 'any other crash keeps its cause');
 assert.ok(taskErrorHtml('workflow failed: could not seed the parent branch').includes('Press Retry to try again.'), 'and suggests Retry'); passed++;
+
+// An error tavya showed can be reported in one click (wiki features/error-reports),
+// where reports go somewhere; one a setting fixes is the person's own to fix.
+global.S.meta = { errorReports: true };
+assert.ok(taskErrorHtml('Activity task failed → something unexpected', undefined, 'task_1').includes('<button type="button" class="btn sm ghost report-error" data-report-error="task_1"'), 'a task error offers Report'); passed++;
+assert.ok(!taskErrorHtml('No computer is connected: connect one under Settings → Computers.', undefined, 'task_1').includes('report-error'), 'a setting is the fix, not a report'); passed++;
+assert.ok(!taskErrorHtml('Activity task failed → something unexpected').includes('report-error'), 'nothing to report without its task'); passed++;
+global.S.meta = {};
+assert.ok(!taskErrorHtml('Activity task failed → something unexpected', undefined, 'task_1').includes('report-error'), 'no Report where reports go nowhere'); passed++;
 
 console.log(`${passed} passed, 0 failed`);
