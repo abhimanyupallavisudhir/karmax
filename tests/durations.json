@@ -786,5 +786,8 @@
   "tests/world-setup-time.test.ts": 0.4,
   "tests/world-setup-timeout.test.ts": 3,
   "tests/world-teardown.test.ts": 0.9,
-  "tests/world.test.ts": 34.8
+  "tests/world.test.ts": 34.8,
+  "tests/keyed-runs.test.ts": 14,
+  "tests/trigger-gate.test.ts": 1,
+  "tests/error-report-button.browser.test.ts": 6
 }
