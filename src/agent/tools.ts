@@ -17,7 +17,8 @@ import {
 } from '../platform/platform-request.js';
 import { SUB_TASK_ACTIONS, URGENCY_LEVELS, type AgentWait, type SubTaskAction, type Urgency } from '../domain/types.js';
 import { BRAND } from '../domain/brand.js';
-import { CLOUD_WORLD_PROVIDERS } from '../domain/computer.js';
+import { CLOUD_WORLD_PROVIDERS, isComputerless } from '../domain/computer.js';
+import { NO_COMPUTER_MESSAGE } from '../world/none.js';
 
 /** The longest a single wait may last: a week, after which a parked world may hibernate. */
 export const MAX_WAIT_MINUTES = 7 * 24 * 60;
@@ -1113,6 +1114,28 @@ export const SDK_CONTROL_TOOL_SCHEMAS: ToolSchema[] = PLATFORM_TOOL_SCHEMAS.filt
   SDK_CONTROL_TOOL_NAMES.has(tool.name),
 );
 
+/** Tools that act in the task's world — its shell, files, jobs, branches,
+ * browser — or open its pull request. A task without a computer is offered
+ * none of them (wiki features/computerless-tasks): only tavya's own tools. */
+export const WORLD_TOOL_NAMES = new Set([
+  ...SDK_NATIVE_TOOLS,
+  'start_job', 'stop_job', 'create_branch', 'open_pr',
+  'publish_task_branch', 'import_task_branch', 'refresh_upstream',
+  'verify_resource_revision', 'propose_project_resource',
+  // They drive the browser in the world.
+  'fill_payment_card', 'fill_credential', 'save_session', 'use_session', 'enroll_passkey', 'save_passkey', 'use_passkey',
+]);
+
+/** Every tool a task without a computer has: tavya's platform tools only. */
+export const COMPUTERLESS_TOOL_SCHEMAS: ToolSchema[] = TOOL_SCHEMAS.filter((tool) => !WORLD_TOOL_NAMES.has(tool.name));
+
+/** The handlers of exactly {@link COMPUTERLESS_TOOL_SCHEMAS}: nothing that
+ * runs, reads or writes in a world can be called, whatever the model names. */
+export function computerlessToolHandlers(world: World, ctx: PlatformToolContext): Record<string, (args: any) => Promise<string>> {
+  const all = platformToolHandlers(world, ctx);
+  return Object.fromEntries(COMPUTERLESS_TOOL_SCHEMAS.flatMap((tool) => all[tool.name] ? [[tool.name, all[tool.name]!]] : []));
+}
+
 /** Returns name → executor for the platform tools, bound to a world + context. */
 export function platformToolHandlers(
   world: World,
@@ -1180,6 +1203,10 @@ export function platformToolHandlers(
       return `wrote ${args?.path}`;
     },
     async create_review_info(args) {
+      // Without a computer there is nothing to run and no file to open: links only.
+      if (isComputerless(world?.handle?.kind) && Array.isArray(args?.actions) && args.actions.some((action: any) =>
+        action?.kind !== 'open' || !/^https?:\/\//i.test(String(action?.target ?? ''))))
+        return `review info rejected: ${NO_COMPUTER_MESSAGE} Attach only open actions with an https:// URL, or a caption.`;
       // The runtime re-checks the accumulated total; either rejection goes back
       // to the agent as a correctable tool result, never a lost attachment.
       try {
@@ -1284,8 +1311,10 @@ export function platformToolHandlers(
       const requested = Array.isArray(args?.jobs) ? [...new Set(args.jobs.map((id: unknown) => String(id)))] as string[] : [];
       let jobs: string[] = [];
       let jobNames: string[] = [];
-      let unlisted: string[];
-      try {
+      let unlisted: string[] = [];
+      // Without a computer there are no jobs: a pause is a timer (or an ask).
+      if (isComputerless(world?.handle?.kind) && requested.length) return `error: ${NO_COMPUTER_MESSAGE}`;
+      if (!isComputerless(world?.handle?.kind)) try {
         if (requested.length) {
           const statuses = await jobStatuses(world, requested, { tailLines: 20 });
           const missing = statuses.filter((job) => job.state === 'missing').map((job) => job.id);

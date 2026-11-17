@@ -4,6 +4,7 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import { organizationScope } from '../autonomy/vault-keys.js';
 import { validEventType } from '../domain/project-events.js';
 import { newId } from '../util/id.js';
+import { ChatLinks, type ChatLink } from './chat-links.js';
 import { CHAT_ADAPTERS, CHAT_CREDENTIALS, ChatPlatformError, type ChatBotIdentity, type ChatCredentials, type ChatDelivery,
   type ChatInbound, type ChatPlatform } from './chat-platforms.js';
 
@@ -26,10 +27,14 @@ import { CHAT_ADAPTERS, CHAT_CREDENTIALS, ChatPlatformError, type ChatBotIdentit
  * are its vault secret, and each message that mentions the bot is one
  * `chat.mention` event (src/integrations/chat-platforms.ts).
  *
- * A bot takes requests only from the people its project allows (`allowed`, or
- * `anyone`): a run started by a mention acts with the project's authority, and
- * most bots can be messaged by anyone who finds them. Someone else is listed in
- * `asking`, so the project can let them in with one click.
+ * Who may ask a bot (wiki planned/assistant §3): a person who linked their chat
+ * account to their tavya account (src/integrations/chat-links.ts) asks as
+ * themselves. Everyone else is a **guest**: a bot takes guests' requests only
+ * from the people its project allows (`allowed`, or `anyone`), and their runs
+ * act with the bot's series' authority, i.e. as whoever connected it. Most bots
+ * can be messaged by anyone who finds them, so anyone else starts nothing: they
+ * are sent a link to link their account, and are listed in `asking`, so the
+ * project can let them in as a guest with one click.
  */
 
 export interface IncomingWebhook {
@@ -49,9 +54,10 @@ export interface IncomingWebhook {
   kind?: ChatPlatform;
   /** The bot's own name and id on its platform. */
   bot?: ChatBotIdentity;
-  /** A chat bot's people whose messages it takes (platform user ids). */
+  /** A chat bot's guests: people not linked to a tavya account whose messages
+   *  it takes (platform user ids). They act as the bot's series does. */
   allowed?: ChatPerson[];
-  /** Takes messages from anyone who can reach the bot. */
+  /** Takes guests' messages from anyone who can reach the bot. */
   anyone?: boolean;
   /** Recent senders it refused, newest first, for the project to allow. */
   asking?: ChatPerson[];
@@ -179,8 +185,9 @@ export class IncomingWebhooks {
   async update(id: string, patch: WebhookPatch): Promise<IncomingWebhook> {
     const hook = await this.require(id);
     const next = { ...hook };
-    if ((patch.allowed !== undefined || patch.anyone !== undefined || patch.dismiss !== undefined) && !hook.kind)
+    if ((patch.allowed !== undefined || patch.anyone !== undefined || patch.dismiss !== undefined || patch.unlink !== undefined) && !hook.kind)
       throw new WebhookConfigError('only a chat bot has people');
+    if (patch.unlink !== undefined && !Array.isArray(patch.unlink)) throw new WebhookConfigError('unlink is a list of link ids');
     if (patch.allowed !== undefined) {
       if (!Array.isArray(patch.allowed)) throw new WebhookConfigError('allowed is a list of {id, name?}');
       const people = new Map<string, ChatPerson>();
@@ -204,7 +211,19 @@ export class IncomingWebhooks {
       next.type = patch.type.trim();
     }
     await this.store.kvSet(`${KEY_PREFIX}${id}`, JSON.stringify(next));
+    if (patch.unlink?.length) {
+      const links = new ChatLinks(this.store);
+      const gone = new Set(patch.unlink.map(String));
+      for (const link of await links.forHook(id)) if (gone.has(link.id)) await links.remove(link);
+    }
     return next;
+  }
+
+  /** The people linked through a chat bot (shown with it; never stored on it). */
+  async linked(hook: IncomingWebhook): Promise<LinkedPerson[]> {
+    if (!hook.kind) return [];
+    return (await new ChatLinks(this.store).forHook(hook.id)).map(({ id, userId, platformUserId, platformName, createdAt }) =>
+      ({ id, userId, platformUserId, ...(platformName ? { platformName } : {}), createdAt }));
   }
 
   async rotate(id: string): Promise<{ hook: IncomingWebhook; secret: string }> {
@@ -219,10 +238,11 @@ export class IncomingWebhooks {
     const hook = await this.get(id);
     if (!hook) return;
     await this.store.kvDelete(`${KEY_PREFIX}${id}`);
+    await new ChatLinks(this.store).removeHook(id);
     if (await this.broker.hasHandle(secretHandle(hook))) await this.broker.deleteHandle(secretHandle(hook));
   }
 
-  /** May this person ask the bot for something? */
+  /** May this person ask the bot as a guest? */
   admits(hook: IncomingWebhook, personId: string): boolean {
     return hook.anyone === true || !!personId && (hook.allowed ?? []).some((person) => person.id === personId);
   }
@@ -248,6 +268,19 @@ export class IncomingWebhooks {
     const credentials = await this.credentials(hook);
     if (!hook.kind || !credentials) throw new WebhookConfigError('not a connected chat bot');
     return CHAT_ADAPTERS[hook.kind].reply(credentials, to, text, fetcher);
+  }
+
+  /** Can this bot post in a shared channel so that only one person sees it? */
+  canWhisper(hook: IncomingWebhook): boolean {
+    return !!hook.kind && !!CHAT_ADAPTERS[hook.kind].whisper;
+  }
+
+  /** Post in a chat bot's channel where only `to.user` sees it. */
+  async whisper(hook: IncomingWebhook, to: { channel: string; thread?: string; user: string }, text: string, fetcher: typeof fetch = fetch): Promise<void> {
+    const credentials = await this.credentials(hook);
+    const adapter = hook.kind ? CHAT_ADAPTERS[hook.kind] : undefined;
+    if (!adapter?.whisper || !credentials) throw new WebhookConfigError('this chat bot cannot post privately');
+    await adapter.whisper(credentials, to, text, fetcher);
   }
 
   private async credentials(hook: IncomingWebhook): Promise<ChatCredentials | undefined> {
@@ -284,8 +317,13 @@ export class IncomingWebhooks {
   }
 }
 
-/** A change to a hook; `allowed`, `anyone` and `dismiss` (ids off `asking`) are a chat bot's. */
-export interface WebhookPatch { name?: string; type?: string; allowed?: Array<{ id: string; name?: string }>; anyone?: boolean; dismiss?: string[] }
+/** A change to a hook; `allowed`, `anyone` (its guests), `dismiss` (ids off
+ *  `asking`) and `unlink` (link ids) are a chat bot's. */
+export interface WebhookPatch { name?: string; type?: string; allowed?: Array<{ id: string; name?: string }>; anyone?: boolean; dismiss?: string[];
+  unlink?: string[] }
+
+/** Someone linked through a chat bot, as the project sees them. */
+export type LinkedPerson = Pick<ChatLink, 'id' | 'userId' | 'platformUserId' | 'platformName' | 'createdAt'>;
 
 export class WebhookConfigError extends Error {
   constructor(message: string, public status = 400) { super(message); }

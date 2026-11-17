@@ -1,7 +1,7 @@
 import type { AgentSpec, TaskRecord } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { VaultItems } from '../autonomy/vault-items.js';
-import { allows, attenuate, CHILD_TASK_CEILING, type Capability } from './capabilities.js';
+import { allows, attenuate, CHILD_TASK_CEILING, withoutCapabilities, type Capability } from './capabilities.js';
 import { PermissionRequests } from './permission-requests.js';
 import { authorizingAvatar, avatarAllows, avatarAuthorizationCapabilities, avatarForRole, avatarRoleFor } from './avatars.js';
 import type { AuthorizationService } from './authorization.js';
@@ -17,7 +17,7 @@ export interface TaskAuthority {
   organizationId?: string;
 }
 
-type StoredAuthorization = Partial<TaskAuthority> & { principal?: string };
+type StoredAuthorization = Partial<TaskAuthority> & { principal?: string; heldBack?: Capability[] };
 
 const scopeOf = (from: Partial<TaskAuthority> | undefined) => ({
   ...(from?.scope ? { scope: from.scope } : {}),
@@ -42,7 +42,9 @@ export async function baseTaskAuthority(store: Store, authorization: Authorizati
   if (!parentTask) return own;
   const parent = await taskAuthorityNow(store, authorization, parentTask, { seen: new Set([...seen, task.id]) });
   const mergeBack = own.capabilities.filter((cap) => cap.startsWith('merge-into:') && allows(parent.capabilities, cap));
-  return { capabilities: [...new Set([...attenuate(CHILD_TASK_CEILING, parent.capabilities), ...mergeBack])], ...scopeOf(parent) };
+  // What a sub-task without a computer holds back, its parent's authority does not bring back.
+  return { capabilities: withoutCapabilities([...new Set([...attenuate(CHILD_TASK_CEILING, parent.capabilities), ...mergeBack])],
+    stored?.heldBack ?? []), ...scopeOf(parent) };
 }
 
 /**

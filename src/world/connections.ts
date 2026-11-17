@@ -1,6 +1,6 @@
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
-import { isAnyProvider, type MachineShape } from '../domain/computer.js';
+import { isAnyProvider, isComputerless, type MachineShape } from '../domain/computer.js';
 import { FREE_COMPUTER_HINT, accountFeatures, assertComputerFits, capLimits, computerLimits, type ComputerFeatures, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
 import { FREE_COMPUTER } from '../domain/entitlements.js';
 import type { WorldProviderConnection } from '../domain/types.js';
@@ -176,7 +176,8 @@ export class WorldProviderConnectionService {
 
   /** Refuse a size this organization's account cannot give, before any machine is made. */
   async assertFits(organizationId: string | undefined, provider: string | undefined, spec: ComputerFitSpec): Promise<void> {
-    if (!provider) return;
+    // No computer has no size to fit (wiki features/computerless-tasks).
+    if (!provider || isComputerless(provider)) return;
     if (isAnyProvider(provider)) return assertSomeFits(spec, organizationId ? await this.reachable(organizationId) : []);
     assertComputerFits(spec, await this.limits(organizationId, provider), provider);
   }

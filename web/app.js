@@ -1676,7 +1676,10 @@ const localWorldPath = (v) => (hostLocal() && v.worldPath) || '';
 // hibernateAfterDays, network}); the block shows the effective machine and a
 // form stores only what differs from what it inherits.
 const COMPUTER_PROVIDER_LABELS = { any: 'Any', e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', aws: 'AWS', gcp: 'Google Cloud',
-  worktree: 'This machine', container: 'Docker container' };
+  worktree: 'This machine', container: 'Docker container', none: 'None' };
+// No computer (wiki features/computerless-tasks): the agent runs on tavya with its own tools only.
+const NO_COMPUTER = 'none';
+const NO_COMPUTER_TIP = 'No computer: the agent can only use tavya itself. Starts in seconds and uses no compute.';
 const CLOUD_COMPUTERS = ['e2b', 'daytona', 'fly', 'hetzner', 'aws', 'gcp'];
 const COMPUTER_REGION_LABELS = { eu: 'EU', us: 'US' };
 // Provider "Any" (wiki features/compute-routing): the cloud accounts it can
@@ -1763,7 +1766,9 @@ function computerProviderOptions(current, inFlight = false) {
     .map((c) => c.provider);
   // "Any" first: tavya chooses among the cloud computers (hosted's default).
   const any = S.meta?.hosted || connected.some((provider) => CLOUD_COMPUTERS.includes(provider)) || current === 'any' ? ['any'] : [];
-  return [...new Set([...any, ...connected, ...local, ...(current ? [current] : [])])];
+  // None last: a running task neither gains nor loses its computer.
+  const none = inFlight ? [] : [NO_COMPUTER];
+  return [...new Set([...any, ...connected, ...local, ...none, ...(current ? [current] : [])])];
 }
 const gbOf = (mb) => (mb == null ? '' : String(Math.round((mb / 1024) * 100) / 100));
 function computerBlockHtml(name, value, inherited, opts = {}) {
@@ -1781,12 +1786,13 @@ function computerBlockHtml(name, value, inherited, opts = {}) {
   const tip = (key) => (size[key].title ? ` title="${esc(size[key].title)}"` : '');
   const body = `<div class="computer-controls">
       <span class="computer-pick"><select class="cf-provider" aria-label="Provider">${computerProviderOptions(provider, opts.inFlight).map((p) => `<option value="${esc(p)}" ${p === provider ? 'selected' : ''}>${esc(COMPUTER_PROVIDER_LABELS[p] || p)}</option>`).join('')}</select>
-      <span class="cf-reach"${provider === 'any' ? '' : ' hidden'}>${policyTip(`Any: ${computerReachText()}. ${ANY_TIP}`)}</span></span>
-      <label class="computer-size"${tip('cpu')}><input class="cf-cpu" type="number" min="1" ${sizeAttrs('cpu')} step="1" inputmode="numeric" value="${esc(v.cpu ?? '')}" aria-label="CPU"><span>CPU</span></label>
-      <label class="computer-size"${tip('memory')}><input class="cf-memory" type="number" min="0.5" ${sizeAttrs('memory')} step="0.5" inputmode="decimal" value="${esc(gbOf(v.memoryMb))}" aria-label="Memory in GB"><span>GB RAM</span></label>
-      <label class="computer-size"${tip('disk')}><input class="cf-disk" type="number" min="1" ${sizeAttrs('disk')} step="1" inputmode="numeric" value="${esc(v.diskGb ?? '')}" aria-label="Disk in GB"><span>GB disk</span></label>
+      <span class="cf-reach"${provider === 'any' ? '' : ' hidden'}>${policyTip(`Any: ${computerReachText()}. ${ANY_TIP}`)}</span>
+      <span class="cf-none"${provider === NO_COMPUTER ? '' : ' hidden'}>${policyTip(NO_COMPUTER_TIP)}</span></span>
+      <label class="computer-size"${tip('cpu')}${provider === NO_COMPUTER ? ' hidden' : ''}><input class="cf-cpu" type="number" min="1" ${sizeAttrs('cpu')} step="1" inputmode="numeric" value="${esc(v.cpu ?? '')}" aria-label="CPU"><span>CPU</span></label>
+      <label class="computer-size"${tip('memory')}${provider === NO_COMPUTER ? ' hidden' : ''}><input class="cf-memory" type="number" min="0.5" ${sizeAttrs('memory')} step="0.5" inputmode="decimal" value="${esc(gbOf(v.memoryMb))}" aria-label="Memory in GB"><span>GB RAM</span></label>
+      <label class="computer-size"${tip('disk')}${provider === NO_COMPUTER ? ' hidden' : ''}><input class="cf-disk" type="number" min="1" ${sizeAttrs('disk')} step="1" inputmode="numeric" value="${esc(v.diskGb ?? '')}" aria-label="Disk in GB"><span>GB disk</span></label>
     </div>
-    <details class="computer-more"${opts.open ? ' open' : ''}><summary>More</summary><div class="computer-more-grid">
+    <details class="computer-more"${opts.open ? ' open' : ''}${provider === NO_COMPUTER ? ' hidden' : ''}><summary>More</summary><div class="computer-more-grid">
       <label class="form-row"${features.desktop ? '' : ' hidden'}><span>Experience ${policyTip('Desktop adds a screen you can watch and take over.')}</span><select class="cf-flavor" ${fixed}>
         <option value="headless" ${v.flavor !== 'desktop' ? 'selected' : ''}>Headless</option><option value="desktop" ${v.flavor === 'desktop' ? 'selected' : ''}>Desktop</option></select></label>
       <label class="form-row"${provider === 'any' ? '' : ' hidden'}><span>Region ${policyTip('Where Any may put the computer, for data that must stay there.')}</span><select class="cf-region">
@@ -1870,6 +1876,8 @@ function readComputerBlock(box) {
   const memory = number('.cf-memory');
   // A provider without a desktop or an allowlist gets headless and normal
   // internet, even if the defaults it inherits ask for more.
+  // Without a computer there is nothing to size or wall in.
+  if (value('.cf-provider') === NO_COMPUTER) return { provider: NO_COMPUTER };
   const features = computerFeaturesFor(value('.cf-provider'));
   const out = {
     provider: value('.cf-provider') || undefined,
@@ -1923,6 +1931,13 @@ function syncComputerBlock(box) {
   if (row('.cf-region')) row('.cf-region').hidden = provider !== 'any';
   const reach = box.querySelector('.cf-reach');
   if (reach) reach.hidden = provider !== 'any';
+  // No computer: nothing to size, so only the provider (and its tip) shows.
+  const none = provider === NO_COMPUTER;
+  const noneTip = box.querySelector('.cf-none');
+  if (noneTip) noneTip.hidden = !none;
+  box.querySelectorAll('.computer-size').forEach((label) => { label.hidden = none; });
+  const more = box.querySelector('.computer-more');
+  if (more) more.hidden = none;
   if (row('.cf-flavor')) row('.cf-flavor').hidden = !features.desktop;
   const networks = computerNetworks(features);
   const networkSelect = box.querySelector('.cf-network');
@@ -4817,7 +4832,7 @@ async function boot() {
     // The public root explains the product before asking for an account. Auth
     // callbacks, invitations and explicit auth routes still land directly on
     // the form they need, so a person following a link never has to hunt.
-    if (S.pendingInvite || S.justVerified || S.signInError || ['/login', '/mcp-callback', '/device', '/oauth/consent'].includes(location.pathname)) return renderLogin();
+    if (S.pendingInvite || S.justVerified || S.signInError || ['/login', '/mcp-callback', '/device', '/oauth/consent', '/link/chat'].includes(location.pathname)) return renderLogin();
     if (location.pathname === '/signup') return renderSignup();
     return renderLanding();
   }
@@ -4830,6 +4845,7 @@ async function boot() {
   wireNativeApp().catch(() => {});
   if (location.pathname === '/mcp-callback') return finishMcpCallback();
   if (location.pathname === '/device') return renderDeviceApproval();
+  if (location.pathname === '/link/chat') return renderChatLink();
   if (location.pathname === '/oauth/consent') return renderOAuthConsent();
   const route = parseRoute(location.pathname);
   if (route.name === 'invite') {
@@ -6101,6 +6117,7 @@ function renderShell() {
           <div class="rail-new" role="group" aria-label="New task">
             <button class="btn primary rail-new-task" id="rail-new-task" type="button" data-shortcut="nav.newTaskDefault" title="${esc(commandHint('New task', 'nav.newTaskDefault'))}">${ICON.plus}<span>New task</span></button>
             <button class="btn primary rail-new-template" id="rail-new-template" type="button" data-shortcut="nav.newTask" aria-label="New task from template" title="${esc(commandHint('New task from template', 'nav.newTask'))}">${ICON.template}</button>
+            <button class="btn rail-ask" id="rail-ask" type="button" data-shortcut="nav.ask" aria-label="Ask ${esc(siteName())}" aria-haspopup="dialog" title="${esc(commandHint(`Ask ${siteName()} — no computer, starts in seconds`, 'nav.ask'))}">${ICON.chat}</button>
           </div>
           <nav class="rail-org-nav" aria-label="Organization">${RAIL_ORG_NAV.map(([id, label, icon, , , , command]) =>
             `<a class="rail-row" id="${id}" data-spa data-shortcut="${command}" href="#">${ICON[icon]}<span>${label}</span></a>`).join('')}</nav>
@@ -6128,6 +6145,7 @@ function renderShell() {
   $('#rail-palette').addEventListener('click', openPalette);
   $('#rail-new-task').addEventListener('click', () => openNewTaskForm());
   $('#rail-new-template').addEventListener('click', () => openTemplatePicker());
+  $('#rail-ask').addEventListener('click', () => askTavya());
   $('#rail-help').addEventListener('click', openHelp);
   $('#key-echo').addEventListener('animationend', () => echoKeys('')); // faded out
   wireVerificationBanner();
@@ -8629,6 +8647,59 @@ function openNewTaskForm(template, projectId = template?.projectId) {
     { projectId, ...(template ? { template } : {}) });
 }
 function newTaskTarget() { return S.tab === 'home' ? newTaskProjectId() : S.projectId; }
+
+// "Ask tavya" (wiki features/computerless-tasks): what you type starts a task
+// without a computer in the project new tasks go to, acting with your own
+// authority; its page opens with the message box ready. One conversation is one task.
+function askTavya(projectId) {
+  if (!projectId) return withNewTaskProject((chosen) => askTavya(chosen));
+  const previousFocus = document.activeElement;
+  const dialog = document.createElement('dialog');
+  dialog.className = 'text-prompt ask-dialog';
+  dialog.setAttribute('aria-label', `Ask ${siteName()}`);
+  const mic = micButtonHtml('ask');
+  dialog.innerHTML = `<form method="dialog"><div class="prompt-field"><textarea name="ask" rows="3" required maxlength="20000" aria-label="Ask ${esc(siteName())}"
+      placeholder="Ask ${esc(siteName())} anything: change a setting, find what waits on you, start a task…"></textarea>
+      ${mic ? `<div class="prompt-attach-row ask-mic">${mic}</div>` : ''}</div>
+    <div class="inline-form ask-foot"><span class="ask-where">${esc(projectById(projectId)?.name || '')}${policyTip(NO_COMPUTER_TIP)}</span>
+      <button class="btn primary" value="submit" title="Ask (Enter)">Ask</button></div></form>`;
+  const input = dialog.querySelector('textarea');
+  const form = dialog.querySelector('form');
+  let sending = false;
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (!text || sending) return;
+    sending = true;
+    dialog.querySelector('button[value="submit"]').disabled = true;
+    try {
+      const created = await api(`/api/projects/${encodeURIComponent(projectId)}/tasks`, { method: 'POST', body: JSON.stringify({
+        workflow: NEW_TASK_WORKFLOW, ownAuthority: true, params: { prompt: text, computer: { provider: NO_COMPUTER } } }) });
+      dialog.close();
+      await goToTask(created.id);
+      focusWhenReady('.followup-input');
+    } catch (error) {
+      toast(error.message, true);
+      sending = false;
+      dialog.querySelector('button[value="submit"]').disabled = false;
+    }
+  });
+  dialog.addEventListener('keydown', (event) => {
+    event.stopPropagation(); // the console's shortcuts stay outside, but for dictation
+    if (runDictationShortcut(event)) return;
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); form.requestSubmit(); }
+  });
+  dialog.addEventListener('close', () => { stopDictation(); dialog.remove(); if (!sending) previousFocus?.focus?.(); });
+  document.body.appendChild(dialog);
+  dialog.showModal();
+  input.focus();
+}
+/** Focus what a page is about to render (a task page's message box). */
+function focusWhenReady(selector, deadline = Date.now() + 8000) {
+  const el = document.querySelector(selector);
+  if (el && !el.disabled) { el.focus(); return; }
+  if (Date.now() < deadline) setTimeout(() => focusWhenReady(selector, deadline), 100);
+}
 function wireNewTaskComposer() {
   $('#expand-task')?.addEventListener('click', () => openNewTaskForm());
   $('#new-from-template')?.addEventListener('click', () => openTemplatePicker());
@@ -9539,7 +9610,7 @@ function readinessGaps(readiness, projectId) {
   const needs = new Map();
   for (const agent of (readiness.agents || []).filter((a) => !a.ready)) {
     const need = agent.need || { provider: agent.provider };
-    needs.set(`${need.provider}:${need.off || ''}`, need);
+    needs.set(`${need.provider}:${need.off || ''}:${need.computerless ? 'none' : ''}`, need);
   }
   // A model on the compute credit (any OpenRouter model, with no login or key
   // of the organization's own) that costs much more than the included one.
@@ -9551,6 +9622,12 @@ function readinessGaps(readiness, projectId) {
   }
   for (const need of needs.values()) {
     const name = ACCOUNT_PROVIDER_LABELS[need.provider] || need.provider;
+    // Without a computer only an API key (or the included model) runs the agent.
+    if (need.computerless) {
+      gaps.push({ label: /runs only on a computer/.test(need.computerless) ? `Add a ${name} API key` : 'Pick another model',
+        href: `${settings}#settings-agents`, tip: need.computerless });
+      continue;
+    }
     gaps.push(need.off === 'project'
       ? { label: `Turn on ${name}`, href: `${projectRoute(projectId, 'settings')}#project-agents`,
         tip: `Your ${name} account is switched off for this project.` }
@@ -9598,7 +9675,9 @@ function wireTaskReadiness(page, projectId) {
       const spec = readAgentSpec(box);
       return spec.provider ? `${spec.provider}${spec.model ? `:${spec.model}${spec.effort ? `:${spec.effort}` : ''}` : ''}` : '';
     }).filter(Boolean);
-    const query = new URLSearchParams(agents.map((agent) => ['agent', agent])).toString();
+    // A task without a computer needs no compute, and runs only on an API key or the included model.
+    const computerless = page.querySelector('.computer-field .cf-provider')?.value === NO_COMPUTER;
+    const query = new URLSearchParams([...agents.map((agent) => ['agent', agent]), ...(computerless ? [['computer', NO_COMPUTER]] : [])]).toString();
     if (query === asked) return;
     asked = query;
     const readiness = await api(`/api/projects/${encodeURIComponent(projectId)}/readiness?${query}`).catch(() => null);
@@ -14674,6 +14753,7 @@ function presenceDetail(v) {
 
 // A finished task's workspace was released, not never started.
 function noWorkspaceLabel(v) {
+  if (v.worldProvider === NO_COMPUTER) return 'No computer';
   return ['done', 'cancelled', 'failed'].includes(v.status) ? 'Workspace closed' : 'No workspace yet';
 }
 
@@ -20661,17 +20741,22 @@ const CHAT_URL_PASTED = {
 };
 const chatUrlTip = (kind) => `Paste into ${CHAT_URL_PASTED[kind][0]}: ${CHAT_URL_PASTED[kind][1]}`;
 
-// Who a chat bot takes requests from, and who asked without being allowed.
+// Who may ask a chat bot (wiki planned/assistant §3): people who linked their
+// chat account ask as themselves; guests, as whoever connected the bot.
 function chatPeopleHtml(h) {
   const who = (p) => esc(p.name || p.id);
+  const linked = (h.linked || []).map((l) => `<span class="chip pe-person pe-linked" title="${esc(`${CHAT_PLATFORM_LABELS[h.kind] || ''} id ${l.platformUserId}`)}">${esc(l.name || l.userId)}${l.platformName ? ` <span class="setting-muted">· ${esc(l.platformName)}</span>` : ''}<button class="file-chip-x" data-people-unlink="${esc(l.id)}" aria-label="Remove ${esc(l.name || l.userId)}" title="Remove">✕</button></span>`).join('');
   const allowed = (h.allowed || []).map((p) => `<span class="chip pe-person" title="${esc(p.id)}">${who(p)}<button class="file-chip-x" data-people-remove="${esc(p.id)}" aria-label="Remove ${who(p)}" title="Remove">✕</button></span>`).join('');
   const asking = (h.asking || []).map((p) => `<div class="setting-row pe-sub pe-asking" data-person="${esc(p.id)}">
     <span class="setting-label" title="${esc(p.id)}">${who(p)}</span>
     <span class="setting-value setting-muted">${p.text ? `“${esc(p.text.slice(0, 80))}”` : ''}${p.at ? `<span class="setting-sep">·</span>${fmtAgo(p.at)}` : ''}</span>
-    <span class="setting-actions"><button class="btn sm" data-people-allow>Allow</button><button class="btn sm ghost" data-people-dismiss aria-label="Dismiss" title="Dismiss">✕</button></span></div>`).join('');
-  return `<div class="setting-row pe-sub pe-people" data-people="${esc(h.id)}">
-    <span class="setting-label">Who can ask ${policyTip('Only their messages start tasks. Anyone else is told so and shows up here to allow.')}</span>
-    <span class="setting-value">${h.anyone ? '<span class="setting-muted">Anyone who can message the bot</span>' : allowed || '<span class="setting-muted">Nobody yet: message the bot, then allow yourself here</span>'}</span>
+    <span class="setting-actions"><button class="btn sm" data-people-allow title="Let them ask as a guest">Allow</button><button class="btn sm ghost" data-people-dismiss aria-label="Dismiss" title="Dismiss">✕</button></span></div>`).join('');
+  const linkedRow = linked ? `<div class="setting-row pe-sub pe-people-linked" data-people="${esc(h.id)}">
+    <span class="setting-label">Linked ${policyTip('Their messages start tasks as them, with no more than they may do in this project.')}</span>
+    <span class="setting-value">${linked}</span><span class="setting-actions"></span></div>` : '';
+  return `${linkedRow}<div class="setting-row pe-sub pe-people" data-people="${esc(h.id)}">
+    <span class="setting-label">Guests ${policyTip(`They act as ${h.connectedBy || 'whoever connected the bot'}. Anyone else is sent a link to link their account.`)}</span>
+    <span class="setting-value">${h.anyone ? '<span class="setting-muted">Anyone who can message the bot</span>' : allowed || '<span class="setting-muted">None</span>'}</span>
     <span class="setting-actions"><label class="pe-starts">Anyone <input type="checkbox" class="toggle" data-people-anyone ${h.anyone ? 'checked' : ''}></label></span></div>${asking}`;
 }
 
@@ -20715,7 +20800,7 @@ async function hydrateProjectEvents(proj) {
       if (!confirm(`Delete “${row.querySelector('.setting-label').textContent}”? It stops receiving events.`)) return;
       try { await api(`/api/webhooks/${row.dataset.hook}`, { method: 'DELETE' }); load(); } catch (e) { toast(e.message, true); }
     }));
-    // A chat bot's people rows follow its "Who can ask" row.
+    // A chat bot's people rows (Linked, Guests, then those asking) belong to the row marked data-people above them.
     const people = async (el, patch) => {
       let row = el.closest('.setting-row');
       while (row && !row.dataset.people) row = row.previousElementSibling;
@@ -20727,6 +20812,8 @@ async function hydrateProjectEvents(proj) {
     box.querySelectorAll('[data-people-anyone]').forEach((t) => t.addEventListener('change', () => people(t, () => ({ anyone: t.checked }))));
     box.querySelectorAll('[data-people-remove]').forEach((b) => b.addEventListener('click', () =>
       people(b, (h) => ({ allowed: (h.allowed || []).filter((p) => p.id !== b.dataset.peopleRemove) }))));
+    box.querySelectorAll('[data-people-unlink]').forEach((b) => b.addEventListener('click', () =>
+      people(b, () => ({ unlink: [b.dataset.peopleUnlink] }))));
     box.querySelectorAll('[data-people-allow]').forEach((b) => b.addEventListener('click', () => {
       const id = b.closest('[data-person]').dataset.person;
       people(b, (h) => {
@@ -25166,6 +25253,16 @@ function stopDictation() {
   if (field) field.placeholder = state.placeholder;
   paintMic(state.key);
 }
+/** Dictation's shortcut, for a field inside an overlay that keeps the console's
+ * other shortcuts out (the task form, Ask): true when it ran. */
+function runDictationShortcut(event) {
+  if (!(event.metaKey || event.ctrlKey) || !focusedMicKey()) return false;
+  const dictate = allCommands().find((command) => command.id === 'compose.voice');
+  if (!(dictate?.keys?.length === 1 && stepMatches(dictate.keys[0], event))) return false;
+  event.preventDefault();
+  dictate.run();
+  return true;
+}
 // The mic of the field being typed in, else the only one on screen.
 function focusedMicKey() {
   const own = document.activeElement?.closest?.('.prompt-field')?.querySelector('[data-mic]');
@@ -25882,6 +25979,7 @@ function profileView() {
     ${notificationsCard()}
     ${S.meta?.hosted ? '<div class="card"><div class="section-h">Paid subscriptions</div><div id="profile-paid-subscriptions" aria-live="polite"><span class="task-sub">Loading…</span></div></div>' : ''}
     ${u ? appGrantsCard() : ''}
+    ${u ? chatLinksCard() : ''}
     <div class="card" id="data-account">
       <div class="section-h">Data &amp; account</div>
       <div class="setting-rows">
@@ -26068,6 +26166,7 @@ function wireProfileView() {
   wireNotificationsCard();
   void hydrateProfilePaidSubscriptions();
   void hydrateAppGrants();
+  void hydrateChatLinks();
   hydrateProfileGithub();
   wireOrganizationCombo($('#default-organization'), () => S.defaultOrganizationId, async (organizationId) => {
     const preference = await api('/api/user/default-organization', {
@@ -28227,6 +28326,7 @@ const HOST_COMMANDS = [
   // `n` picks a template (0, the Task defaults, is Enter); `N` skips the picker.
   { id: 'nav.newTask', title: 'New task from template', key: 'n', group: 'General', run: () => openTemplatePicker() },
   { id: 'nav.newTaskDefault', title: 'New task', key: 'N', group: 'General', run: () => openNewTaskForm() },
+  { id: 'nav.ask', title: 'Ask tavya', key: 'A', group: 'General', run: () => askTavya() },
   { id: 'nav.search', title: 'Search tasks', key: '/', group: 'General', run: () => { if (!isTaskListTab()) switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
   { id: 'nav.home', title: 'Go home', key: 'g H', ...navCommand(() => homeRoute(currentOrg(), DEFAULT_LIST_QUERY)) },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', ...navCommand(() => tabRoute('tasks')) },
@@ -28727,10 +28827,7 @@ function bindKeys() {
       // modifier-bearing bindings (⌘K) still work while typing outside overlays
       else if ((e.metaKey || e.ctrlKey) && !overlayOpen) dispatchKey(e);
       // …and dictation inside one too (the task form): it acts on the field being typed in.
-      else if ((e.metaKey || e.ctrlKey) && focusedMicKey()) {
-        const dictate = allCommands().find((command) => command.id === 'compose.voice');
-        if (dictate?.keys?.length === 1 && stepMatches(dictate.keys[0], e)) { e.preventDefault(); dictate.run(); }
-      }
+      else if (e.metaKey || e.ctrlKey) runDictationShortcut(e);
       return;
     }
     // A checkbox, radio or slider keeps the named keys it uses (Space, Enter,
@@ -30253,6 +30350,57 @@ async function renderOAuthConsent() {
   $('#consent-allow').addEventListener('click', () => decide('approve'));
   $('#consent-deny').addEventListener('click', () => decide('deny'));
   $('#consent-allow').focus();
+}
+
+// ─── Chat accounts: /link/chat, Profile → Chat accounts (wiki planned/assistant §3)
+// A chat bot sends someone it does not know here; linking makes the runs their
+// messages start act as them. src/integrations/chat-links.ts.
+async function renderChatLink() {
+  document.title = `Link chat account · ${siteName()}`;
+  const t = new URLSearchParams(location.search).get('t') || '';
+  grantFrame('<p class="task-sub">Loading…</p>');
+  let offer;
+  try { offer = await api(`/api/chat-links/pending?t=${encodeURIComponent(t)}`); }
+  catch (error) { return grantDone('Link not valid', plainError(error)); }
+  const platform = CHAT_PLATFORM_LABELS[offer.platform] || 'chat';
+  const bot = offer.bot?.username ? (offer.bot.username.startsWith('+') ? offer.bot.username : `@${offer.bot.username}`) : offer.bot?.name || 'the bot';
+  grantFrame(`<h1 class="grant-title">Link ${esc(platform)} user ${esc(offer.platformName || offer.platformUserId)} to you?</h1>
+    <p class="grant-who"><span class="task-sub" title="${esc(`${platform} id ${offer.platformUserId}`)}">via ${esc(bot)}</span> ${policyTip('Their messages to this bot start tasks as you, with no more than you may do in its project. Link only your own account.')}</p>
+    <div class="grant-actions"><button class="btn primary" id="chat-link-yes">Link</button><button class="btn" id="chat-link-no">Cancel</button></div>
+    <p class="grant-msg" id="grant-msg" role="alert"></p>`);
+  $('#chat-link-yes').addEventListener('click', async () => {
+    $('#chat-link-yes').disabled = $('#chat-link-no').disabled = true;
+    try {
+      await api('/api/chat-links', { method: 'POST', body: JSON.stringify({ t }) });
+      history.replaceState({ kx: 1 }, '', '/link/chat');
+      grantDone('Linked', `Message ${bot} again.`);
+    } catch (error) { $('#grant-msg').textContent = plainError(error); $('#chat-link-yes').disabled = $('#chat-link-no').disabled = false; }
+  });
+  $('#chat-link-no').addEventListener('click', () => { history.replaceState({ kx: 1 }, '', '/link/chat'); grantDone('Not linked', 'You can close this tab.'); });
+  $('#chat-link-yes').focus();
+}
+
+function chatLinksCard() {
+  return `<div class="card" id="chat-links-card" hidden>
+    <div class="section-h">Chat accounts ${policyTip('Messages from these accounts to their bot start tasks as you.')}</div>
+    <div class="setting-rows" id="profile-chat-links"></div></div>`;
+}
+
+async function hydrateChatLinks() {
+  const card = $('#chat-links-card'), box = $('#profile-chat-links');
+  if (!card || !box) return;
+  let links;
+  try { links = (await api('/api/user/chat-links'))?.links || []; } catch { return; }
+  card.hidden = !links.length;
+  box.innerHTML = links.map((link) => `<div class="setting-row" data-chat-link="${esc(link.id)}">
+      <span class="setting-label" title="${esc(`${CHAT_PLATFORM_LABELS[link.platform] || ''} id ${link.platformUserId}`)}">${esc(CHAT_PLATFORM_LABELS[link.platform] || 'Chat')} · ${esc(link.platformName || link.platformUserId)}</span>
+      <span class="setting-value setting-muted">${esc(link.bot.username ? (link.bot.username.startsWith('+') ? link.bot.username : `@${link.bot.username}`) : link.bot.name)}</span>
+      <span class="setting-actions"><button class="btn sm ghost" data-chat-unlink aria-label="Remove" title="Remove">✕</button></span></div>`).join('');
+  box.querySelectorAll('[data-chat-unlink]').forEach((button) => button.addEventListener('click', async () => {
+    button.disabled = true;
+    try { await api(`/api/user/chat-links/${encodeURIComponent(button.closest('[data-chat-link]').dataset.chatLink)}`, { method: 'DELETE' }); await hydrateChatLinks(); }
+    catch (error) { button.disabled = false; toast(error.message, true); }
+  }));
 }
 
 function appGrantsCard() {

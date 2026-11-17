@@ -9,7 +9,7 @@ import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Clien
 import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store, slugify, type CollaborationRequest } from '../store/db.js';
 import { TokenAuthority, type HumanDelegationArgs, type ScopedToken } from './tokens.js';
-import { TOOL_CAPABILITY, Capability, ORGANIZATION_WIKI_WRITE_DENIED, allows } from './capabilities.js';
+import { TOOL_CAPABILITY, Capability, ORGANIZATION_WIKI_WRITE_DENIED, allows, attenuate, heldBackCapabilities, withoutCapabilities } from './capabilities.js';
 import { AppGrants, sessionCapabilities } from '../auth/app-grants.js';
 import { WORKFLOW_TYPE, SIG, pinnedType, TASK_WORKFLOW_TASK_TIMEOUT } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
@@ -41,20 +41,21 @@ import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageR
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries,
   normalizeFollowUpTriggers, validateFollowUpTriggers, followUpTriggerSummary, followUpsAfterFiring, type FollowUpTrigger, type TaskTrigger, isTrigger } from '../domain/triggers.js';
 import { STORE_TASKS, runsOnInstall, storeTaskNeeds, storeTaskRepeatable, takenFromStore, type StoreNeed, type StoreTask } from '../domain/task-store.js';
-import { applyTriggerContext, followUpMessage, normalizeEventInput, type ProjectEvent, type ProjectEventClaim,
+import { EventRunRefused, applyTriggerContext, followUpMessage, normalizeEventInput, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventInput, type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
 import { newId } from '../util/id.js';
-import { IncomingWebhooks, WebhookConfigError, webhookDeliveryKey, type IncomingWebhook, type WebhookPatch } from '../integrations/incoming-webhooks.js';
+import { IncomingWebhooks, WebhookConfigError, webhookDeliveryKey, type IncomingWebhook, type LinkedPerson, type WebhookPatch } from '../integrations/incoming-webhooks.js';
 import { isChatPlatform, type ChatPlatform } from '../integrations/chat-platforms.js';
 import { chatThreadKey, type ChatReplies } from '../integrations/chat-replies.js';
+import { ChatLinkError, ChatLinks, type ChatLink } from '../integrations/chat-links.js';
 import { pullRequestOf } from '../domain/pull-requests.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates, queryFolds } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
 import { assertComputerFits, providerLabel } from '../domain/computer-limits.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
 import { taskProvider } from '../world/task-provider.js';
-import { ANY_PROVIDER, applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, isAnyProvider, machineShape, normalizeComputer, sameMachine,
-  type ComputerSpec, type MachineShape, worldMachine } from '../domain/computer.js';
+import { ANY_PROVIDER, applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, isAnyProvider, isComputerless, machineShape, normalizeComputer, sameMachine,
+  type ComputerSpec, type MachineShape, worldMachine, LOCAL_WORLD_KINDS, runsOnHost } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { splitSharedSettings } from '../domain/shared-settings.js';
 import { coordinatorRetryMinutes, coordinatorSetting, normalizeCoordinatorSetting } from '../domain/coordinator.js';
@@ -1039,7 +1040,7 @@ export class KarmaxApi {
       ? (await this.deps.store.effectiveProjectConfig({ ...project, config: applyExecutionConfig(project.config, policy) }))
       : policy;
     const provider = typeof candidate.worldProvider === 'string' ? candidate.worldProvider : undefined;
-    if (provider && !['worktree', 'container', 'memory'].includes(provider)
+    if (provider && !LOCAL_WORLD_KINDS.includes(provider)
       && !(await this.deps.providerConnections?.available(input.organizationId, provider)))
       throw new Error(`${provider} is not connected and verified`);
     if (provider && policy.resources && typeof policy.resources === 'object')
@@ -1280,8 +1281,8 @@ export class KarmaxApi {
     } catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
     const provider = computer?.provider;
     if (provider) {
-      const local = ['worktree', 'container', 'memory'].includes(provider);
-      if (local && this.deps.hosted) throw new ValidationError('hosted tasks run on a cloud computer (E2B, Daytona, Fly.io or Hetzner)');
+      const local = LOCAL_WORLD_KINDS.includes(provider);
+      if (runsOnHost(provider) && this.deps.hosted) throw new ValidationError('hosted tasks run on a cloud computer (E2B, Daytona, Fly.io or Hetzner)');
       if (!local && this.deps.providerConnections
         && !(await this.deps.providerConnections.available(project.organizationId ?? 'org_personal', provider)))
         throw new ValidationError(`${provider} is not connected. Connect it under Settings → Computers first.`);
@@ -1297,6 +1298,13 @@ export class KarmaxApi {
       catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
     }
     return computer;
+  }
+
+  /** Whether a task with these params runs without a computer: its own
+   * Computer, else its project's and organization's default. */
+  private async computerlessParams(project: Project, params: Record<string, unknown>): Promise<boolean> {
+    const computer = normalizeComputer(params.computer);
+    return isComputerless(applyComputer(await this.deps.store.effectiveProjectConfig(project), computer).worldProvider);
   }
 
   /** Store a task's Computer in its one canonical, validated form. */
@@ -1556,6 +1564,12 @@ export class KarmaxApi {
       createdBy?: PrincipalRef;
       /** Canonical level plus its project-list / organization / global scope. */
       authorization?: AuthorizationSelection;
+      /** Act with the creator's own level and scope (their membership), not the
+       * project's default: how the console's "Ask" starts a task for its person. */
+      ownAuthority?: boolean;
+      /** A task without a computer holds back the irreversible capabilities
+       * (IRREVERSIBLE_CAPABILITIES); these are the ones its creator keeps. */
+      keepIrreversible?: Capability[];
       /** Draft auto-save may preserve an over-broad selection as an explicitly
        * unaccepted attenuated package. `acceptAttenuation` is the user's choice
        * to run with that limited package. */
@@ -1671,7 +1685,9 @@ export class KarmaxApi {
       authorization = granted;
       credentialPolicies = granted.credentialPolicies;
     } else {
-      const requestedAuthorization = args.authorization ?? args.authorizationProfile ?? (await this.authorizationDefault(project));
+      const own = args.ownAuthority && !args.authorization && caller.kind !== 'agent'
+        ? await this.deps.authorization?.selectionForPrincipal(caller.principal, organizationId) : undefined;
+      const requestedAuthorization = args.authorization ?? own ?? args.authorizationProfile ?? (await this.authorizationDefault(project));
       const grantorCaps = (await this.authorizationGrantorCaps(token, caller, requestedAuthorization, organizationId)
         .catch(async (error) => { throw error instanceof CapabilityError && args.authorization
           ? await this.authorizationGap(token, args.projectId, args.authorization, { kind: 'new-task' }, { canLimit: false }) : error; }));
@@ -1730,6 +1746,13 @@ export class KarmaxApi {
     taskOverrides.paymentPolicy ??= paymentDefaults;
     this.assertBranchParams(taskOverrides);
     (await this.normalizeTaskComputer(project, taskOverrides));
+    // A task without a computer holds back the irreversible capabilities its
+    // creator does not keep explicitly; its agent asks for one when it needs
+    // it (request_permission). Shown in its authorization like any limit.
+    let heldBack: Capability[] = [];
+    try { heldBack = (await this.computerlessParams(project, taskOverrides)) ? heldBackCapabilities(args.keepIrreversible) : []; }
+    catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
+    if (heldBack.length) authorization = { ...authorization, capabilities: withoutCapabilities(authorization.capabilities, heldBack) };
     // A `resumeFrom` pointer reads another task's conversation — authorize it
     // against that task's project before anything is created.
     (await this.validateAndAuthorizeResumeSources(token, taskOverrides, args.projectId));
@@ -1810,6 +1833,7 @@ export class KarmaxApi {
           profiles: args.profiles,
           draft: !!args.draft,
           _authorization: { ...authorization, profileAttenuated, principal: mainAvatar ? avatarPrincipal(mainAvatar.id) : caller.principal, credentialPolicies,
+            ...(heldBack.length ? { heldBack } : {}),
             ...(missingCredentialGrants.length ? { missingCredentialGrants } : {}),
             ...(limited ? { attenuationAccepted: acceptsTaskAttenuation } : {}) },
           ...(githubAccountId ? { _githubAccountId: githubAccountId } : {}),
@@ -2318,8 +2342,15 @@ export class KarmaxApi {
     });
     input.createdAt = task.createdAt;
     input.workflow = task.workflow;
-    const auth = _authorization as { capabilities?: string[]; principal?: string; profileId?: string; delegationId?: string } | undefined;
+    const auth = _authorization as { capabilities?: string[]; principal?: string; profileId?: string; delegationId?: string; heldBack?: string[] } | undefined;
     input.grant = auth?.capabilities ?? ['task:signal'];
+    // A task that became computerless after it was created (a draft's Computer
+    // edited, a project default changed) holds back what any such task does.
+    if (isComputerless(input.project.worldProvider) && auth && !auth.heldBack) {
+      const heldBack = heldBackCapabilities(undefined);
+      input.grant = withoutCapabilities(input.grant, heldBack);
+      (await this.deps.store.patchTaskParams(task.id, { _authorization: { ...auth, capabilities: input.grant, heldBack } }));
+    }
     input.grantPrincipal = auth?.principal ?? 'system:legacy-task';
     input.delegationId = auth?.delegationId;
     input.authorizationProfile = auth?.profileId ?? 'legacy';
@@ -2729,6 +2760,74 @@ export class KarmaxApi {
     return (await this.deps.store.getTask(target.id))!;
   }
 
+  // ─── Runs a linked chat sender starts (wiki planned/assistant §3) ─────────
+
+  /** What a person may do in a project now; nothing outside its organization. */
+  private async personCapabilities(userId: string, project: Project): Promise<Capability[]> {
+    // Without an authorization service the installation trusts its one person.
+    if (!this.deps.authorization) return ['*'];
+    const organizationId = project.organizationId ?? 'org_personal';
+    if (!(await this.deps.store.organizationMembership(organizationId, userId))) return [];
+    return this.deps.authorization.capabilitiesAsync(`user:${userId}`, project.id, organizationId);
+  }
+
+  /** The person a run the dispatcher starts for an event acts as: the stored
+   * event's `actsAs`, set at ingest from a linked chat account and never from
+   * a payload or the trigger context it was handed. Refused for good when they
+   * may no longer start tasks in the project. */
+  private async eventAsker(caller: ScopedToken, trigger: TriggerContext | undefined, projectId: string):
+    Promise<{ userId: string; capabilities: Capability[] } | undefined> {
+    if (caller.kind !== 'system' || !trigger?.eventId) return undefined;
+    const event = (await this.deps.store.getProjectEvent(trigger.eventId));
+    if (!event?.actsAs || event.projectId !== projectId) return undefined;
+    const project = (await this.deps.store.getProject(projectId));
+    const capabilities = project ? (await this.personCapabilities(event.actsAs, project)) : [];
+    if (!allows(capabilities, 'task:create')) throw new EventRunRefused('the person who asked cannot start tasks in this project');
+    return { userId: event.actsAs, capabilities };
+  }
+
+  /** A task's stored grants (its own and each agent's) cut to what `capabilities`
+   * allow: never widened. `ownProject`: also limited to the task's project, and
+   * without the human delegations they were made with. */
+  private narrowedToAsker(params: Record<string, unknown>, capabilities: Capability[], ownProject = false):
+    { _authorization: Record<string, unknown>; _agentAuthorization?: Record<string, StoredAgentAuthorization> } {
+    const narrow = <T extends Record<string, unknown>>(entry: T): T => {
+      const held = Array.isArray(entry.capabilities) ? entry.capabilities as Capability[] : [];
+      const kept = attenuate(held, capabilities);
+      const { scope, projectIds: _p, organizationId: _o, delegationId: _d, ...rest } = entry;
+      const lost = held.some((capability) => !allows(kept, capability)) || ownProject && !!scope;
+      return { ...(ownProject ? rest : entry), capabilities: kept, profileAttenuated: entry.profileAttenuated === true || lost } as unknown as T;
+    };
+    const agents = Object.entries(this.storedAgentAuthorizations({ params } as Pick<TaskRecord, 'params'>));
+    return {
+      _authorization: narrow((params._authorization ?? {}) as Record<string, unknown>),
+      ...(agents.length ? { _agentAuthorization: Object.fromEntries(agents.map(([key, entry]) =>
+        [key, narrow(entry as unknown as Record<string, unknown>) as unknown as StoredAgentAuthorization])) } : {}),
+    };
+  }
+
+  /** Make a series' fresh run act as the person who asked: the series' grants
+   * cut to what they hold in the project, for its project only, with their
+   * human delegation and GitHub account — so approvals, questions and For me
+   * reach them, as for a task they created. */
+  private async actAsAsker(series: TaskRecord, run: TaskRecord, asker: { userId: string; capabilities: Capability[] }): Promise<TaskRecord> {
+    const organizationId = (await this.deps.store.getProject(run.projectId))?.organizationId;
+    const githubAccountId = (await this.deps.githubApp?.activeUserAccountId(asker.userId));
+    const delegate = async () => (await this.deps.tokens.delegateLinkedPerson(asker.userId, { taskId: run.id, projectId: run.projectId,
+      organizationId, ...(githubAccountId ? { externalIdentities: { githubAccountId } } : {}) })).id;
+    const narrowed = this.narrowedToAsker(series.params as Record<string, unknown>, asker.capabilities, true);
+    const principal = `user:${asker.userId}`;
+    const agents = narrowed._agentAuthorization && Object.fromEntries(await __asyncCollections.map(Object.entries(narrowed._agentAuthorization),
+      async ([key, entry]) => [key, { ...entry, principal, ...((series.params._agentAuthorization as Record<string, StoredAgentAuthorization>)[key]?.delegationId
+        ? { delegationId: await delegate() } : {}) }] as const));
+    const { _githubAccountId: _connector, _agentAuthorization: _agents, ...params } = run.params as Record<string, unknown>;
+    (await this.deps.store.updateTaskParams(run.id, { ...params,
+      _authorization: { ...narrowed._authorization, principal, delegationId: await delegate() },
+      ...(agents ? { _agentAuthorization: agents } : {}),
+      ...(githubAccountId ? { _githubAccountId: githubAccountId } : {}) } as unknown as TaskRecord['params']));
+    return (await this.deps.store.getTask(run.id))!;
+  }
+
   /** Change the job-shaped grant on a task — before it starts, or in-flight while
    * it runs (SPEC §5.5). The selected profile is always re-attenuated against the
    * immediate bearer, so an agent cannot use a human principal recorded on the
@@ -2787,8 +2886,11 @@ export class KarmaxApi {
     const priorAuthorization = task.params?._authorization as {
       credentialPolicies?: VaultTaskPolicyOverrides; delegationId?: string; principal?: string;
       attenuationAccepted?: boolean; level?: string; scope?: string; projectIds?: string[]; capabilities?: string[];
-      missingCredentialGrants?: string[];
+      missingCredentialGrants?: string[]; heldBack?: Capability[];
     } | undefined;
+    // What a task without a computer held back stays held back at any level.
+    if (priorAuthorization?.heldBack?.length)
+      authorization.capabilities = withoutCapabilities(authorization.capabilities, priorAuthorization.heldBack);
     if (options.preserveCredentialGrants) for (const capability of priorAuthorization?.capabilities ?? []) {
       if (capability.startsWith('use-credential:') && !authorization.capabilities.includes(capability))
         authorization.capabilities.push(capability);
@@ -3240,6 +3342,8 @@ export class KarmaxApi {
     const caller = (await this.require(token, 'create_task', { projectId: series?.projectId, taskId: seriesId }));
     if (!series) throw new NotFoundError(`no task ${seriesId}`);
     (await this.assertStoredGrantQueueable(token, caller, series));
+    // A run a linked chat sender started acts as them (wiki planned/assistant §3).
+    const asker = (await this.eventAsker(caller, trigger, series.projectId));
     // A run an event started carries that event (wiki features/events-and-automations).
     // Each run listens for the series' follow-up triggers; the series never runs.
     const followUpTriggers = normalizeFollowUpTriggers(series.params);
@@ -3253,13 +3357,13 @@ export class KarmaxApi {
       workflowVersion: series.workflowVersion,
       params: shaped.params,
       parentTaskId: series.parentTaskId,
-      createdBy: (await this.taskCreator(caller, series.projectId)) ?? series.createdBy,
+      createdBy: asker ? { kind: 'user', userId: asker.userId } : (await this.taskCreator(caller, series.projectId)) ?? series.createdBy,
       ...(await this.creationVia(caller)),
       assignee: series.assignee,
       delegate: series.delegate,
       confirmationPolicy: series.confirmationPolicy,
     }));
-    run = (await this.inheritTaskDelegation(series, run));
+    run = asker ? (await this.actAsAsker(series, run, asker)) : (await this.inheritTaskDelegation(series, run));
     (await this.persistTaskCredentialPolicies(run));
     (await this.followTriggerSubject(run, trigger));
     const { startType, input } = await this.buildStart(run, false, caller);
@@ -3299,6 +3403,9 @@ export class KarmaxApi {
 
     if (mode === 'clone') return { startedTaskId: (await this.spawnRun(token, taskId, trigger)).id };
     if (mode === 'followUp') return this.fireFollowUp(taskId, trigger, cause);
+    // A one-off task stays its creator's; one a linked chat sender started does
+    // only what both may do (wiki planned/assistant §3).
+    const asker = (await this.eventAsker(caller, trigger, armed.projectId));
 
     // Under the task's lock, from its latest params: an edit of the armed task
     // either lands before (and starts with it) or is refused (writeUnstartedParams).
@@ -3308,6 +3415,7 @@ export class KarmaxApi {
       const shaped = trigger ? applyTriggerContext(task.title, task.params as Record<string, unknown>, trigger) : undefined;
       const fired: Record<string, unknown> = { ...(shaped?.params ?? task.params as Record<string, unknown>), triggerState: 'fired' };
       delete fired.triggerPending;
+      if (asker) Object.assign(fired, this.narrowedToAsker(fired, asker.capabilities));
       (await this.deps.store.updateTaskParams(taskId, fired as any));
       return { task, shaped, fired };
     }));
@@ -3394,7 +3502,7 @@ export class KarmaxApi {
 
   /** Record an occurrence whose sender the caller has already authenticated
    *  (a verified webhook, a GitHub delivery, a chat platform). */
-  async ingestProjectEvent(from: { organizationId: string; projectId: string; source: string; origin: ProjectEventOrigin; hops: number },
+  async ingestProjectEvent(from: { organizationId: string; projectId: string; source: string; origin: ProjectEventOrigin; hops: number; actsAs?: string },
     input: ProjectEventInput): Promise<{ event: ProjectEvent; duplicate: boolean }> {
     const normalized = normalizeEventInput(input, () => newId('key'));
     if ('error' in normalized) throw new ValidationError(normalized.error);
@@ -3525,7 +3633,10 @@ export class KarmaxApi {
    * so a fork made from it does not inherit it.
    */
   private async fireFollowUp(taskId: string, context: TriggerContext | undefined, cause: TaskTrigger | undefined): Promise<{ startedTaskId: string; told: true }> {
-    const message: Message = { id: `u${randomUUID()}`, role: 'user', text: followUpMessage(cause, context), ts: Date.now(), authorLabel: 'Follow-up trigger' };
+    // A chat reply from someone linked to their account is theirs (wiki planned/assistant §3).
+    const asker = context?.eventId ? (await this.deps.store.getProjectEvent(context.eventId))?.actsAs : undefined;
+    const message: Message = { id: `u${randomUUID()}`, role: 'user', text: followUpMessage(cause, context), ts: Date.now(),
+      ...(asker ? await this.speaker({ kind: 'human', humanSubject: { userId: asker } }) : { authorLabel: 'Follow-up trigger' }) };
     await this.withPendingLock(taskId, async () =>
       this.writePending(taskId, [...(await this.readPending(taskId)), { message, role: MAIN_AGENT, by: 'system:triggers', fromTrigger: { ...(context ? { context } : {}) } }]));
     const firedId = (cause as FollowUpTrigger | undefined)?.id;
@@ -3563,9 +3674,23 @@ export class KarmaxApi {
     }
   }
 
-  async listIncomingWebhooks(token: string, projectId: string): Promise<IncomingWebhook[]> {
+  async listIncomingWebhooks(token: string, projectId: string): Promise<WebhookView[]> {
     (await this.require(token, 'project:settings:read', { projectId }));
-    return this.incomingWebhooks().list(projectId);
+    const hooks = this.incomingWebhooks();
+    return __asyncCollections.map(await hooks.list(projectId), (hook) => this.webhookView(hooks, hook));
+  }
+
+  /** A hook as people see it: a chat bot with the people linked through it,
+   *  and who connected it (its guests act as them). */
+  private async webhookView(hooks: IncomingWebhooks, hook: IncomingWebhook): Promise<WebhookView> {
+    if (!hook.kind) return hook;
+    const named = async (userId: string) => (await this.deps.store.userDisplayName(userId)) || undefined;
+    const linked = await __asyncCollections.map(await hooks.linked(hook), async (person) => {
+      const name = await named(person.userId);
+      return { ...person, ...(name ? { name } : {}) };
+    });
+    const connector = hook.createdBy?.startsWith('user:') ? await named(hook.createdBy.slice(5)) : undefined;
+    return { ...hook, linked, ...(connector ? { connectedBy: connector } : {}) };
   }
 
   /** The secret is in the answer once; it is never shown again. A chat bot
@@ -3590,9 +3715,80 @@ export class KarmaxApi {
     return hook;
   }
 
-  async updateIncomingWebhook(token: string, hookId: string, patch: WebhookPatch): Promise<IncomingWebhook> {
+  async updateIncomingWebhook(token: string, hookId: string, patch: WebhookPatch): Promise<WebhookView> {
     (await this.ownedWebhook(token, hookId));
-    return this.webhookCall(() => this.incomingWebhooks().update(hookId, patch));
+    const hooks = this.incomingWebhooks();
+    return this.webhookView(hooks, await this.webhookCall(() => hooks.update(hookId, patch)));
+  }
+
+  // ─── Chat accounts linked to people (wiki planned/assistant §3) ──────────
+  // A person's own: the token's human subject. src/integrations/chat-links.ts.
+
+  /** The person a chat-link call is for. Linking lends their authority in the
+   *  bot's project to a chat account, so only they link — signed in, through
+   *  no limited app — never a task's agent acting for them. Listing and
+   *  removing their links only narrows, so that may. */
+  private async chatLinkPerson(token: string, linking = false): Promise<string> {
+    const caller = (await this.deps.tokens.verify(token));
+    if (!caller) throw new CapabilityError('sign in to link chat accounts');
+    if (linking) {
+      const grant = caller.identitySessionId ? (await new AppGrants(this.deps.store).get(caller.identitySessionId)) : undefined;
+      if (caller.kind !== 'human' || caller.actor?.kind !== 'interactive-human' || grant?.ceiling)
+        throw new CapabilityError('only the person themself can link a chat account to their account, signed in without a limited app');
+    }
+    const userId = caller.humanSubject?.userId;
+    if (!userId) throw new CapabilityError('chat accounts are linked to people; this caller acts for nobody');
+    return userId;
+  }
+
+  private async chatLinkView(link: ChatLink): Promise<ChatLinkView> {
+    const hook = await this.incomingWebhooks().get(link.hookId);
+    const { hookId: _h, projectId: _p, organizationId: _o, ...rest } = link;
+    return { ...rest, bot: { id: link.hookId, name: hook?.name ?? 'Deleted bot', ...(hook?.bot?.username ? { username: hook.bot.username } : {}) } };
+  }
+
+  /** What following a link token would link, for its person to confirm. */
+  async pendingChatLink(token: string, linkToken: string): Promise<Omit<ChatLinkView, 'id' | 'userId' | 'createdAt'> & { expiresAt: number; linkedToYou: boolean }> {
+    const userId = (await this.chatLinkPerson(token));
+    const offer = (await new ChatLinks(this.deps.store).pending(String(linkToken ?? '')));
+    const hook = offer ? (await this.incomingWebhooks().get(offer.hookId)) : undefined;
+    if (!offer || !hook) throw new NotFoundError('This link was used already, expired or is not valid. Message the bot again for a new one.');
+    const current = (await new ChatLinks(this.deps.store).find(offer.hookId, offer.platformUserId));
+    return { ...(offer.platform ? { platform: offer.platform } : {}), platformUserId: offer.platformUserId,
+      ...(offer.platformName ? { platformName: offer.platformName } : {}),
+      bot: { id: hook.id, name: hook.name, ...(hook.bot?.username ? { username: hook.bot.username } : {}) },
+      expiresAt: offer.expiresAt, linkedToYou: current?.userId === userId };
+  }
+
+  /** Link the token's chat user to the signed-in person, on that bot only. */
+  async linkChatAccount(token: string, linkToken: string): Promise<ChatLinkView> {
+    const userId = (await this.chatLinkPerson(token, true));
+    try {
+      const link = await new ChatLinks(this.deps.store).redeem(String(linkToken ?? ''), userId);
+      if (!(await this.incomingWebhooks().get(link.hookId))) {
+        await new ChatLinks(this.deps.store).remove(link);
+        throw new NotFoundError('That bot was deleted.');
+      }
+      return this.chatLinkView(link);
+    } catch (error) {
+      if (error instanceof ChatLinkError) throw error.status === 404 ? new NotFoundError(error.message) : new ValidationError(error.message);
+      throw error;
+    }
+  }
+
+  /** The person's chat accounts, on every bot. */
+  async listChatLinks(token: string): Promise<ChatLinkView[]> {
+    const userId = (await this.chatLinkPerson(token));
+    return __asyncCollections.map(await new ChatLinks(this.deps.store).forUser(userId), (link) => this.chatLinkView(link));
+  }
+
+  async deleteChatLink(token: string, linkId: string): Promise<{ deleted: true }> {
+    const userId = (await this.chatLinkPerson(token));
+    const links = new ChatLinks(this.deps.store);
+    const link = (await links.forUser(userId)).find((candidate) => candidate.id === linkId);
+    if (!link) throw new NotFoundError('no such link');
+    await links.remove(link);
+    return { deleted: true };
   }
 
   async rotateIncomingWebhook(token: string, hookId: string): Promise<{ hook: IncomingWebhook; secret: string }> {
@@ -3631,20 +3827,31 @@ export class KarmaxApi {
         events.push(await this.ingestProjectEvent(from, { type: hook.type, key: webhookDeliveryKey(delivery.headers, delivery.raw),
           payload: parseWebhookBody(delivery.raw, delivery.contentType) }));
       } else {
+        const links = new ChatLinks(this.deps.store);
+        // Discord takes its answer in the delivery's response, seen only by the sender; the others are posted to.
+        const privately = (text: string) => { inbound.answer = { status: 200, body: { type: 4, data: { content: text, flags: 64 } } }; };
         for (const mention of inbound.mentions) {
-          if (!hooks.admits(hook, mention.author.id)) {
+          // Someone who linked their chat account asks as themselves, if they
+          // may start tasks here; anyone else only as a guest the bot allows.
+          const link = await links.find(hook.id, mention.author.id);
+          if (link && !allows(await this.personCapabilities(link.userId, project!), 'task:create')) {
+            const told = await this.chatReplies?.refuse(hook, mention, link.userId, hook.kind !== 'discord');
+            if (hook.kind === 'discord') privately(told ?? 'Your account can’t start tasks in this project.');
+            continue;
+          }
+          if (!link && !hooks.admits(hook, mention.author.id)) {
             await hooks.noteAsking(hook.id, { id: mention.author.id, ...(mention.author.name ? { name: mention.author.name } : {}), text: mention.text });
-            // Discord takes its answer in the delivery's response; the others are posted to.
             const told = await this.chatReplies?.decline(hook, mention, hook.kind !== 'discord');
-            if (hook.kind === 'discord') inbound.answer = { status: 200, body: { type: 4, data: { content: told ?? 'Not allowed yet.', flags: 64 } } };
+            if (hook.kind === 'discord') privately(told ?? 'Not allowed yet.');
             continue;
           }
           // A reply to the bot's own message belongs to the thread that message answered.
           const thread = mention.thread ? (await this.deps.store.kvGet(chatThreadKey(hook.id, mention.thread))) ?? mention.thread : undefined;
-          const { key, url, ...payload } = { ...mention, ...(thread ? { thread } : {}) };
+          const { key, url, private: _private, ...payload } = { ...mention, ...(thread ? { thread } : {}) };
           // The subject is the conversation, so a run started by a mention hears the replies in its thread.
           const subject = `${from.source}/${mention.channel.id}/${thread ?? key}`;
-          events.push(await this.ingestProjectEvent(from, { type: 'chat.mention', key, subject, payload: { ...payload, ...(url ? { url } : {}) } }));
+          events.push(await this.ingestProjectEvent({ ...from, ...(link ? { actsAs: link.userId } : {}) },
+            { type: 'chat.mention', key, subject, payload: { ...payload, ...(url ? { url } : {}) } }));
         }
       }
       if (events.length || !inbound?.answer) await hooks.noteDelivery(hook.id);
@@ -4992,6 +5199,9 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
     let audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
     const grantors = await this.permissionGrantors(task, project.organizationId,
       projectIds.length ? capabilities : missing, projectIds, baseAuthorization);
+    // What a task without a computer held back is its person's to give back:
+    // its creator, when they hold it (wiki features/computerless-tasks).
+    if (!audience.length && !projectIds.length && (await this.heldBackForCreator(task, project.organizationId, missing))) audience = ['@creator'];
     // No audience: the nearest who can grant it (permissionGrantors), else the creator.
     if (!audience.length) audience = [grantors.default ?? '@creator'];
     // A sub-task's parent at work that cannot grant it either: it comes through
@@ -5199,6 +5409,17 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
   }
 
   /** Who can grant a task agent what it asks for (`GET /api/agent/escalation-targets?capabilities=`). */
+  /** Whether every capability asked for is one the task held back for having
+   * no computer, and its creator — a person — holds them all. */
+  private async heldBackForCreator(task: TaskRecord, organizationId: string, capabilities: Capability[]): Promise<boolean> {
+    const held = (task.params?._authorization as { heldBack?: Capability[] } | undefined)?.heldBack ?? [];
+    if (!held.length || !capabilities.length || !capabilities.every((capability) => allows(held, capability))) return false;
+    const creator = await this.deps.store.taskCreatorUserId(task.id);
+    if (!creator || !this.deps.authorization) return false;
+    const caps = await this.deps.authorization.capabilities(`user:${creator}`, task.projectId, organizationId);
+    return capabilities.every((capability) => allows(caps, capability));
+  }
+
   async permissionGrantorsFor(token: string, input: { capabilities?: string[]; projectIds?: string[] }): Promise<PermissionGrantors & { missing: Capability[] }> {
     const caller = (await this.require(token, 'request_permission'));
     if (caller.taskId === '*') throw new Error('this endpoint requires a task-agent token');
@@ -6766,6 +6987,10 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
   async postTaskMessage(token: string, taskId: string, input: {
     text: string; to?: string[]; agents?: Record<string, AgentSpec>;
     images?: ImageRef[]; files?: FileRef[]; urgency?: Urgency;
+    /** The platform delivering a person's words (a linked chat sender's reply,
+     *  wiki planned/assistant §3): the message is attributed to them. Honoured
+     *  only for a system caller; never read from a request. */
+    onBehalfOf?: string;
   }): Promise<{ message?: SentMessage; notified: string[]; continuedIn?: TaskLink }> {
     const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
@@ -6836,7 +7061,9 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const ownAgent = caller.kind === 'agent' && caller.taskId === taskId;
     const speakerKey = ownAgent ? (caller.participant ?? (caller.role && isParticipantKey(caller.role) ? caller.role : MAIN_AGENT)) : undefined;
     const userId = speakingUser(caller);
-    const authorFields: Partial<Message> = ownAgent && shared ? { role: 'agent', author: speakerKey } : await this.speaker(caller);
+    const authorFields: Partial<Message> = ownAgent && shared ? { role: 'agent', author: speakerKey }
+      : caller.kind === 'system' && input.onBehalfOf ? await this.speaker({ kind: 'human', humanSubject: { userId: input.onBehalfOf } })
+      : await this.speaker(caller);
     const callsAgents = to === undefined || to.some((selector) => selector.startsWith(AGENT_SELECTOR));
     let message: SentMessage | undefined;
     if (shared || callsAgents) {
@@ -7886,7 +8113,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       if (computerBefore) {
         (await this.deps.store.patchTaskParams(taskId, { computer: patch.computer }));
         const world = (await this.deps.store.currentWorld(taskId));
-        if (world && !world.meta?.computer && !['worktree', 'container', 'memory'].includes(world.kind))
+        if (world && !world.meta?.computer && !LOCAL_WORLD_KINDS.includes(world.kind))
           (await this.deps.store.updateWorldMeta(world, { computer: machineShape(computerBefore) }).catch(() => undefined));
         result.applied = [...new Set([...result.applied, 'computer'])];
         // A VM world's disk grows now, under the running agent (vm/provider.ts).
@@ -9324,3 +9551,9 @@ export interface HeldComputer {
 function speakingUser(caller: { kind: string; humanSubject?: { userId?: string } }): string | undefined {
   return caller.kind === 'agent' ? undefined : caller.humanSubject?.userId;
 }
+
+/** A hook as people see it; a chat bot lists the people linked through it. */
+export type WebhookView = IncomingWebhook & { linked?: Array<LinkedPerson & { name?: string }>; connectedBy?: string };
+
+/** A person's linked chat account, with the bot it was made with. */
+export type ChatLinkView = Omit<ChatLink, 'hookId' | 'projectId' | 'organizationId'> & { bot: { id: string; name: string; username?: string } };

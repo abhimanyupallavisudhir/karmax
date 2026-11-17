@@ -4,6 +4,8 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import type { KarmaxEvent, TaskRecord } from '../domain/types.js';
 import type { ProjectEvent } from '../domain/project-events.js';
 import { IncomingWebhooks, type IncomingWebhook } from './incoming-webhooks.js';
+import { ChatLinks } from './chat-links.js';
+import { BRAND } from '../domain/brand.js';
 import type { ChatMention } from './chat-platforms.js';
 
 /**
@@ -59,18 +61,60 @@ export class ChatReplies {
       `${task.id}:${moment}:${moment === 'input' || moment === 'review' ? event.ts : ''}`);
   }
 
-  /** What a person the bot does not take requests from is told: once per
-   *  person, with where the project lets them in. `reply` false: the caller
-   *  answers in the delivery itself (Discord's command answer), so nothing is posted. */
+  /** What someone the bot does not know is told: a link to link their chat
+   *  account to their tavya account (src/integrations/chat-links.ts).
+   *
+   *  The link is a bearer secret: whoever opens it first links the sender's
+   *  chat account to themselves. So it goes only where the sender alone sees
+   *  it: a direct message, Slack's ephemeral message in a channel, or (`reply`
+   *  false) the caller's own answer in the delivery, which Discord shows only
+   *  to them. In a group the bot cannot whisper in (Telegram), the group is told
+   *  to message the bot directly, with no link, and the link goes there.
+   *
+   *  Each is said at most once while it holds, so a group is not spammed; a
+   *  later message after it lapsed gets a fresh one. */
   async decline(hook: IncomingWebhook, mention: ChatMention, reply: boolean): Promise<string | undefined> {
-    if (!(await this.deps.store.kvClaim(`chat-declined:${hook.id}:${mention.author.id}`, '1'))) return undefined;
-    const settings = await this.projectUrl(hook.projectId, 'settings#project-events');
-    const text = `Only people this project allows can ask me. Someone on it can let you in${settings ? ` here: ${settings}` : '.'}`;
-    if (reply) {
-      void this.hooks.reply(hook, { channel: mention.channel.id, ...(mention.thread ? { thread: mention.thread } : {}) }, text, this.deps.fetcher ?? fetch)
-        .catch((error) => this.deps.log?.(`chat reply on ${hook.kind} failed: ${error instanceof Error ? error.message : String(error)}`));
+    const links = new ChatLinks(this.deps.store);
+    const base = this.deps.publicUrl()?.replace(/\/+$/, '');
+    if (!base) {
+      if (!(await this.deps.store.kvClaim(`chat-declined:${hook.id}:${mention.author.id}`, '1'))) return undefined;
+      const text = 'Only people this project allows can ask me.';
+      if (reply) this.post(hook, mention, text);
+      return text;
     }
+    const whisper = reply && !mention.private && this.hooks.canWhisper(hook);
+    if (reply && !mention.private && !whisper) {
+      if (!(await links.hintOnce(hook, mention.author.id))) return undefined;
+      const direct = hook.kind === 'telegram' && hook.bot?.username ? `: https://t.me/${hook.bot.username}` : '.';
+      const text = `Message me directly to link your ${BRAND} account${direct}`;
+      this.post(hook, mention, text);
+      return text;
+    }
+    if (reply && await links.offered(hook.id, mention.author.id)) return undefined;
+    const { token } = await links.offer(hook, mention.author);
+    const text = `Link your ${BRAND} account to ask me: ${base}/link/chat?t=${token}`;
+    if (whisper) {
+      void this.hooks.whisper(hook, { channel: mention.channel.id, ...(mention.thread ? { thread: mention.thread } : {}), user: mention.author.id },
+        text, this.deps.fetcher ?? fetch).catch(async (error) => {
+        // Never fall back to the channel: take the offer back, so their next message tries again.
+        await links.withdraw(hook.id, mention.author.id, token);
+        this.deps.log?.(`chat reply on ${hook.kind} failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    } else if (reply) this.post(hook, mention, text);
     return text;
+  }
+
+  /** A linked person who cannot start tasks in the bot's project is told so, once. */
+  async refuse(hook: IncomingWebhook, mention: ChatMention, userId: string, reply: boolean): Promise<string | undefined> {
+    if (!(await this.deps.store.kvClaim(`chat-refused:${hook.id}:${mention.author.id}:${userId}`, '1'))) return undefined;
+    const text = `Your ${BRAND} account can't start tasks in this project.`;
+    if (reply) this.post(hook, mention, text);
+    return text;
+  }
+
+  private post(hook: IncomingWebhook, mention: ChatMention, text: string): void {
+    void this.hooks.reply(hook, { channel: mention.channel.id, ...(mention.thread ? { thread: mention.thread } : {}) }, text, this.deps.fetcher ?? fetch)
+      .catch((error) => this.deps.log?.(`chat reply on ${hook.kind} failed: ${error instanceof Error ? error.message : String(error)}`));
   }
 
   private async say(conversation: Conversation, text: string, once: string): Promise<void> {

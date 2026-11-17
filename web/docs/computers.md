@@ -1,6 +1,6 @@
 # Cloud computers
 
-Every task runs on its own cloud computer. tavya can run it on its own accounts (charged to your plan's compute, or to the $5 free trial a new organization gets for its first 14 days), or on yours: connect an account under **Settings → Computers**, and your tasks use it at the provider's price, with nothing added.
+Every task runs on its own cloud computer, unless it needs none (see None, below). tavya can run it on its own accounts (charged to your plan's compute, or to the $5 free trial a new organization gets for its first 14 days), or on yours: connect an account under **Settings → Computers**, and your tasks use it at the provider's price, with nothing added.
 
 | | Disk | Paused | Good for |
 |---|---|---|---|
@@ -18,6 +18,10 @@ On tavya's own accounts each computer has a size limit, shown as each field's ma
 ## Any (the default)
 
 Leave a task's provider on **Any** and give it the size it needs (and, under **More**, a desktop, an outbound allowlist or a region). tavya then uses the first computer that fits and has room: your own accounts first, then its own by price. When one is full, it takes the next, and waits only when all are. A task keeps its computer once it has one; it moves only if you ask for more than that account allows. Choose a provider instead to run on it and nothing else. The task page shows where it runs and why.
+
+## None (no computer)
+
+Choose **None** for work that needs only tavya itself: change a setting, find what is waiting on you, start or steer other tasks, use a connected app. The agent runs on tavya with its own tools only (no shell, files or browser), so the task starts in seconds and uses no compute. It needs an API key or tavya's included model, not a Claude Code or Codex login. When the work does need a computer, it creates a task with one and follows it. Irreversible actions (deleting, members, permissions, payments) are held back until you approve each one. **Ask** in the sidebar (or **A**) starts one.
 
 ## AWS
 

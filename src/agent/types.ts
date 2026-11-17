@@ -217,6 +217,10 @@ export interface AgentAdapter {
   readonly provider: Provider;
   /** Run one turn. Call ctx methods when the agent uses platform tools. */
   runTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn>;
+  /** Run one turn of a task without a computer (its world is `none`): host-side,
+   * with only tavya's platform tools (src/agent/computerless.ts). Absent: this
+   * agent needs a computer. */
+  runComputerlessTurn?(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn>;
 }
 
 export interface TurnResult {

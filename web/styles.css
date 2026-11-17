@@ -447,6 +447,8 @@ a { color: var(--accent); text-decoration: none; }
 .rail-new .btn.rail-new-template { flex: none; width: 40px; min-height: 36px; padding: 0 2px 0 0; justify-content: center;
   border-radius: 0 var(--r-btn) var(--r-btn) 0; border-left: 1px solid color-mix(in srgb, var(--primary-ink) 30%, transparent); }
 .rail-new .btn:focus-visible { position: relative; z-index: 1; }
+/* Beside it, apart: ask tavya without a computer (askTavya). */
+.rail-new .btn.rail-ask { flex: none; width: 36px; min-height: 36px; margin-left: 6px; padding: 0; justify-content: center; }
 /* A place in the organization: icon and name, a full-width row. */
 .rail-row {
   display: flex; align-items: center; gap: 10px; min-height: 34px; padding: 0 10px;
@@ -3978,6 +3980,10 @@ html[data-theme="dark"] .github-signin-btn:active,
 
 .text-prompt { width:min(480px,92vw); padding:20px; border:1px solid var(--line); border-radius:12px; background:var(--surface); color:var(--ink); }
 .text-prompt::backdrop { background:rgba(0,0,0,.4); }
+.ask-dialog .prompt-field > textarea { min-height: 72px; box-sizing: border-box; font: inherit; padding: 10px 12px; color: var(--ink); }
+.ask-mic { justify-content: flex-end; }
+.ask-foot { justify-content: space-between; align-items: center; margin-top: 10px; }
+.ask-where { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: var(--fs-12); min-width: 0; }
 
 /* Organization storage: usage bar, over-limit note and what uses the space. */
 .storage-over { color: var(--danger); }
@@ -4289,8 +4295,8 @@ html[data-theme="dark"] .github-signin-btn:active,
 .computer-any .computer-reach { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* The provider and, for Any, what it can reach (ⓘ inside the select, before its arrow). */
 .computer-pick { position: relative; display: block; min-width: 0; }
-.computer-pick > .cf-reach { position: absolute; right: 26px; top: 50%; transform: translateY(-50%); display: inline-flex; }
-.computer-pick > .cf-reach[hidden] { display: none; }
+.computer-pick > .cf-reach, .computer-pick > .cf-none { position: absolute; right: 26px; top: 50%; transform: translateY(-50%); display: inline-flex; }
+.computer-pick > .cf-reach[hidden], .computer-pick > .cf-none[hidden] { display: none; }
 .computer-provider .chip[title] { cursor: help; }
 .computer-provider .computer-held-toggle { font: inherit; cursor: pointer; }
 .computer-held { display: grid; gap: 4px; margin: -4px 0 4px 18px; }

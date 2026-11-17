@@ -215,3 +215,47 @@ export async function readOpenAiResponse(res: Response, onText: TextListener): P
   }
   throw new StreamEndedEarly('turn interrupted before completion: the OpenAI Responses stream ended before its terminal event');
 }
+
+/** An OpenAI-compatible Chat Completions endpoint (OpenRouter, OpenAI,
+ * DeepSeek, …): `stream: true` → the non-streaming response object it adds up
+ * to — one choice whose message carries the text and the tool calls, its
+ * `finish_reason`, and `usage` (sent with `stream_options.include_usage`). */
+export async function readChatCompletion(res: Response, onText: TextListener, provider = 'Chat Completions'): Promise<any> {
+  const body = await eventStreamOrJson(res);
+  if ('json' in body) return body.json;
+  let content = '';
+  let finish: string | undefined;
+  let usage: unknown;
+  let id: string | undefined;
+  let model: string | undefined;
+  const calls: Array<{ id?: string; type: 'function'; function: { name: string; arguments: string } }> = [];
+  for await (const { data } of serverSentEvents(body.events)) {
+    if (data === '[DONE]') {
+      if (!finish) break;
+      const message: Record<string, unknown> = { role: 'assistant', content: content || null };
+      if (calls.length) message.tool_calls = calls.filter(Boolean);
+      return { id, model, choices: [{ index: 0, message, finish_reason: finish }], ...(usage ? { usage } : {}) };
+    }
+    const chunk = JSON.parse(data);
+    if (chunk.error) throw providerErrorFromMessage('opencode', `${provider} stream error: ${JSON.stringify(chunk.error).slice(0, 500)}`, 'structured');
+    id ??= chunk.id;
+    model ??= chunk.model;
+    if (chunk.usage) usage = chunk.usage;
+    const choice = chunk.choices?.[0];
+    if (!choice) continue;
+    const delta = choice.delta ?? {};
+    if (typeof delta.content === 'string' && delta.content) {
+      content += delta.content;
+      onText(content);
+    }
+    for (const call of delta.tool_calls ?? []) {
+      const index = Number(call.index ?? calls.length);
+      const current = calls[index] ??= { type: 'function', function: { name: '', arguments: '' } };
+      if (call.id) current.id = call.id;
+      if (call.function?.name) current.function.name += call.function.name;
+      if (call.function?.arguments) current.function.arguments += call.function.arguments;
+    }
+    if (choice.finish_reason) finish = choice.finish_reason;
+  }
+  throw new StreamEndedEarly(`turn interrupted before completion: the ${provider} stream ended before [DONE]`);
+}

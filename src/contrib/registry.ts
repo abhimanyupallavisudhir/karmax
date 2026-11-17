@@ -50,6 +50,7 @@ export class ContributionRegistry {
 export const CORE_COMMANDS: CommandDecl[] = [
   { id: 'nav.newTask', title: 'New task from template', keybinding: 'n' },
   { id: 'nav.newTaskDefault', title: 'New task', keybinding: 'N' },
+  { id: 'nav.ask', title: 'Ask tavya', keybinding: 'A' },
   { id: 'nav.search', title: 'Search', keybinding: '/' },
   { id: 'compose.voice', title: 'Dictate', keybinding: 'meta+shift+S' },
   { id: 'nav.home', title: 'Go home', keybinding: 'g H' },
