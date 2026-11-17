@@ -737,6 +737,7 @@
   "tests/worker-process-temporal.test.ts": 24.8,
   "tests/worker-process.test.ts": 4.1,
   "tests/worker-refresh.test.ts": 26.3,
+  "tests/worker-runtime.test.ts": 0.1,
   "tests/workflow-bundle-cache.test.ts": 44.8,
   "tests/workflow-check-exit.test.ts": 0.3,
   "tests/workflow-checks.test.ts": 4.5,
