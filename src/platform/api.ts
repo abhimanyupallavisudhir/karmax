@@ -55,7 +55,7 @@ import { chatThreadKey, type ChatReplies } from '../integrations/chat-replies.js
 import { pullRequestOf } from '../domain/pull-requests.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
-import { assertComputerFits, providerLabel } from '../domain/computer-limits.js';
+import { assertComputerFits, diskGrowsAtStart, providerLabel } from '../domain/computer-limits.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
 import { taskProvider } from '../world/task-provider.js';
 import { ANY_PROVIDER, applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, isAnyProvider, machineShape, normalizeComputer, sameMachine,
@@ -8241,6 +8241,8 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
           (await this.deliverWorkflowMessage(taskId, computerChangeNotice(change, resized.inPlace)).catch(() => undefined));
         else if (grown?.disk === 'grown' && live && caller.taskId !== taskId && !task.lastView?.outOfDisk)
           (await this.deliverWorkflowMessage(taskId, diskGrownNotice(grown.machine.diskGb)).catch(() => undefined));
+        else if (grown?.restart && live && caller.taskId !== taskId && !task.lastView?.outOfDisk)
+          (await this.deliverWorkflowMessage(taskId, diskAtStartNotice(grown.machine.diskGb)).catch(() => undefined));
       }
       // Read at each spend, so it applies from the next one.
       if (paymentPolicy !== undefined) {
@@ -8279,7 +8281,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
   /** Grow a running VM world's disk now (its CPU and memory follow at the next
    * start), recording what changed; undefined for providers that cannot. */
   private async resizeInPlace(taskId: string): Promise<{ inPlace: boolean;
-    grown?: { disk: 'grown' | 'unchanged'; machine: { diskGb: number } } }> {
+    grown?: { disk: 'grown' | 'unchanged'; restart?: boolean; machine: { diskGb: number } } }> {
     const world = (await this.deps.store.currentWorld(taskId));
     const provider = world && this.deps.worlds ? (() => { try { return this.deps.worlds!.get(world.kind); } catch { return undefined; } })() : undefined;
     if (!world || !provider?.resize) return { inPlace: false };
@@ -8360,7 +8362,8 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     if (task.lastView?.outOfDisk && caller.taskId !== taskId) {
       const world = await this.deps.store.currentWorld(taskId);
       const inPlace = Boolean(world && (() => { try { return this.deps.worlds?.get(world.kind).resize; } catch { return undefined; } })());
-      (await this.deliverWorkflowMessage(taskId, biggerDiskNotice(diskGb, current, inPlace)).catch(() => undefined));
+      (await this.deliverWorkflowMessage(taskId, world && inPlace && diskGrowsAtStart(world.kind)
+        ? biggerDiskAtStartNotice(diskGb) : biggerDiskNotice(diskGb, current, inPlace)).catch(() => undefined));
     }
     return { diskGb, maxDiskGb, applied };
   }
@@ -9595,6 +9598,18 @@ function computerChangeNotice(change: ComputerChange, inPlace = false): string {
     + (inPlace
       ? 'Its disk keeps everything, Git-ignored files included; only running processes do not carry over.'
       : 'You resume with every tracked file and uncommitted change; Git-ignored files (dependencies, build output) and running processes do not carry over.');
+}
+
+/** A full disk that grows when the machine restarts (Agent37): the task parks for it, keeping every file. */
+function biggerDiskAtStartNotice(diskGb: number): string {
+  return `[${BRAND} bigger disk] The disk was full. It grows to ${diskGb} GB when this task's machine restarts: `
+    + 'end your turn with pause(3) without jobs (stop any job first). Every file stays where you left it, Git-ignored ones included; running processes do not carry over.';
+}
+
+/** What an agent is told when its running computer's disk will grow at its next start. */
+function diskAtStartNotice(diskGb: number): string {
+  return `[${BRAND} computer change]\n\nThis task's disk becomes ${diskGb} GB when its machine next restarts: end your turn with `
+    + 'pause(3) without jobs when you need the room. Every file stays where you left it; only running processes do not carry over.';
 }
 
 /** What an agent is told when its running computer's disk grew under it. */

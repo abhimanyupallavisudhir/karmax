@@ -3,6 +3,7 @@ import { BRAND } from '../domain/brand.js';
 import { COMPUTE_TERMS, COMPUTE_TRIAL, computeChargeMicros } from '../domain/entitlements.js';
 import { providerDefaults, type AccountPool } from '../domain/computer-limits.js';
 import { flyComputeDollarsPerSecond, flyGuest, flyVolumeDollarsPerSecond } from './fly.js';
+import { agent37ComputeDollarsPerHour, agent37DiskDollarsPerHour } from './agent37.js';
 import { costMicrosPerSecond } from './runners.js';
 import type { Store } from '../store/db.js';
 import { providerName } from './connections.js';
@@ -278,6 +279,7 @@ export function listRate(provider: string, shape: { cpu: number; memoryMb: numbe
     case 'gcp': active = shape.cpu * 0.025 + memoryGb * 0.0034 + 0.005; disk = perGbMonth(0.12); break;
     case 'hetzner': active = shape.cpu * 0.02 + 0.001; disk = perGbMonth(0.05); break;
     case 'fly': active = flyComputeDollarsPerSecond(flyGuest(shape)) * 3600; disk = flyVolumeDollarsPerSecond(shape.diskGb) * 3600; break;
+    case 'agent37': active = agent37ComputeDollarsPerHour(shape); disk = agent37DiskDollarsPerHour(shape.diskGb); break;
     default: active = costMicrosPerSecond(provider, shape.cpu, shape.memoryMb, 0) * 3600 / 1e6;
   }
   return { activeMicrosPerHour: Math.ceil(active * 1e6), diskMicrosPerHour: Math.ceil(disk * 1e6) };

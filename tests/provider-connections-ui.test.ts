@@ -37,7 +37,7 @@ describe('organization Computers and usage UI', () => {
     expect(await rows.evaluateAll((elements) => elements.map((row) => [row.querySelector('b')!.textContent, row.querySelector('.chip')!.textContent])))
       .toEqual([['E2B', 'Connected'], ['Daytona', 'Failing']]);
     expect(await ui.page.locator('#org-computers .computer-add-menu [data-provider]').allTextContents())
-      .toEqual(['Fly.io', 'Hetzner', 'AWS', 'Google Cloud']);
+      .toEqual(['Fly.io', 'Hetzner', 'AWS', 'Google Cloud', 'Agent37']);
     expect(await rows.nth(1).locator('.chip').getAttribute('title')).toBe('Daytona connection failed: 401');
     await rows.nth(0).getByRole('button', { name: 'Test' }).click();
     await expect.poll(() => ui.calls.some((call) => call.method === 'POST' && call.path === '/api/organizations/o/world-providers/e2b/test')).toBe(true);
