@@ -52,6 +52,7 @@ export const CORE_COMMANDS: CommandDecl[] = [
   { id: 'nav.newTaskDefault', title: 'New task', keybinding: 'N' },
   { id: 'nav.ask', title: 'Ask tavya', keybinding: 'A' },
   { id: 'nav.search', title: 'Search', keybinding: '/' },
+  { id: 'compose.voice', title: 'Dictate', keybinding: 'meta+shift+S' },
   { id: 'nav.home', title: 'Go home', keybinding: 'g H' },
   { id: 'nav.tasks', title: 'Go to tasks', keybinding: 'g t' },
   { id: 'nav.queue', title: 'Go to queues', keybinding: 'g q' },
