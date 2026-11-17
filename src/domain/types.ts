@@ -313,8 +313,32 @@ export interface DeliveryPreferences {
   browser: boolean;
   email: boolean;
   emailUrgencies?: Partial<Record<Urgency, boolean>>;
+  /** Which levels are pushed to the person's devices (Web Push). Read back
+   * complete: a level never set takes {@link PUSH_DEFAULT_URGENCIES}. */
+  pushUrgencies?: Partial<Record<Urgency, boolean>>;
   slack: boolean;
   routine: boolean;
+}
+
+/** Like the console's system notifications: only what asks for attention
+ * interrupts a phone unless the person says otherwise. */
+export const PUSH_DEFAULT_URGENCIES: Record<Urgency, boolean> = { low: false, normal: false, high: true, critical: true };
+
+/** Where an inbox item is delivered besides the inbox itself. */
+export type DeliveryChannel = 'browser' | 'email' | 'slack' | 'push';
+
+/** One of a person's devices receiving Web Push (RFC 8030): the browser's
+ * subscription. `keys` (p256dh, auth) stay on the server. */
+export interface PushSubscriptionRecord {
+  id: string;
+  userId: string;
+  endpoint: string;
+  keys: { p256dh: string; auth: string };
+  /** What the person calls the device ("Chrome on Android"), set by the console. */
+  label?: string;
+  createdAt: number;
+  /** The last time a push service accepted a message for it. */
+  lastPushedAt?: number;
 }
 
 export interface OrganizationIdentityPolicy {
