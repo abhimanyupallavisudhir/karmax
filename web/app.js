@@ -4704,6 +4704,11 @@ document.addEventListener('click', (event) => {
   if (control && !control.disabled) void reportShownError({ taskId: control.dataset.reportError }, control);
 });
 // A failure on tavya's side (a 5xx), as opposed to a refusal or a lost connection.
+// The Report action of a failed request's toast (wiki features/error-reports); none where reports go nowhere.
+function reportAction(error) {
+  if (!S.meta?.errorReports || !serverSideFailure(error)) return undefined;
+  return { label: 'Report', fn: () => reportShownError({ message: String(error?.message ?? error), where: location.pathname.replace(/\/\d+(?=\/|$)/g, '/:n') }) };
+}
 function serverSideFailure(error) {
   return Number(error?.status) >= 500 || /^HTTP 5\d\d$|^Internal Server Error$/i.test(String(error?.message ?? error ?? '').trim());
 }
@@ -4725,11 +4730,8 @@ function toast(msg, err = false, action) {
   span.textContent = err ? plainError(msg) : msg;
   if (span.textContent !== String(msg)) span.title = String(msg); // the exact text, for whoever reports it
   t.appendChild(span);
-  // An error a setting fixes (storage full, out of compute) links to it.
-  if (err && !action) action = setupFix(String(msg?.message ?? msg ?? '')) ?? undefined;
-  // One on tavya's side can be reported (wiki features/error-reports).
-  if (err && !action && S.meta?.errorReports && serverSideFailure(msg))
-    action = { label: 'Report', fn: () => reportShownError({ message: String(msg?.message ?? msg), where: location.pathname.replace(/\/\d+(?=\/|$)/g, '/:n') }) };
+  // An error a setting fixes (storage full, out of compute) links to it; one on tavya's side can be reported.
+  if (err && !action) action = setupFix(String(msg?.message ?? msg ?? '')) ?? reportAction(msg);
   // An optional action (e.g. Undo) — gives the toast a clickable button and more
   // dwell time. Backward-compatible: existing toast(msg[, err]) calls are unchanged.
   // An action with an `href` is a link (so it opens in a new tab too) instead.
@@ -9408,7 +9410,7 @@ function eventTriggerHtml(trigger, { followUp = false } = {}) {
       <input id="ev-key" placeholder="per {{issue.number}}" value="${esc(trigger?.concurrency?.key || '')}" ${mode ? '' : 'hidden'}
         title="One run per value, e.g. {{issue.number}}; empty means one at a time" autocomplete="off" spellcheck="false">
       <button type="button" class="btn sm" id="ev-add-gate" title="A model reads each event first and decides whether it starts a run" ${followUp || trigger?.gate ? 'hidden' : ''}>＋ Ask first…</button>
-      <textarea id="ev-gate" rows="2" placeholder="Start a run only for…" aria-label="What deserves a run" title="A model reads each event first and decides whether it starts a run" ${trigger?.gate ? '' : 'hidden'}>${esc(trigger?.gate?.prompt || '')}</textarea>
+      ${trigger?.gate ? eventGateHtml(trigger.gate.prompt) : ''}
     </div>
   </div>`;
 }
@@ -9499,7 +9501,15 @@ function wireEventTrigger(projectId) {
     conds.dispatchEvent(new Event('change', { bubbles: true }));
   });
   $('#ev-mode').addEventListener('change', () => { $('#ev-key').hidden = !$('#ev-mode').value; });
-  $('#ev-add-gate').addEventListener('click', (event) => { event.currentTarget.hidden = true; const gate = $('#ev-gate'); gate.hidden = false; gate.focus(); });
+  $('#ev-add-gate').addEventListener('click', (event) => {
+    event.currentTarget.hidden = true;
+    event.currentTarget.insertAdjacentHTML('afterend', eventGateHtml(''));
+    $('#ev-gate').focus();
+  });
+}
+// A trigger's gate: there once asked for, so a form without one has no field for it.
+function eventGateHtml(prompt) {
+  return `<textarea id="ev-gate" rows="2" placeholder="Start a run only for…" aria-label="What deserves a run" title="A model reads each event first and decides whether it starts a run">${esc(prompt || '')}</textarea>`;
 }
 
 // ── schedule: the 5 labelled cron cells ──────────────────────────────────────

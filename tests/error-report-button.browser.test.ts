@@ -55,6 +55,7 @@ describe('reporting an error the console showed', () => {
     await action.click();
     await expect.poll(() => ui.calls.filter((call) => call.path === '/api/error-reports')).toEqual([
       { method: 'POST', path: '/api/error-reports', body: { message: 'HTTP 502', where: '/org/web/tasks/:n' } }]);
+    await ui.page.locator('#toasts .toast', { hasText: 'Reported' }).waitFor(); // said so, before the next toast is counted
     // A refusal is the person's to act on: no Report.
     await ui.run(`document.getElementById('toasts').innerHTML = ''; toast(Object.assign(new Error('a task needs a title'), { status: 400 }), true)`);
     expect(await ui.page.locator('#toasts .toast').count()).toBe(1);
