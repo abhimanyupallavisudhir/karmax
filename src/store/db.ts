@@ -1075,7 +1075,7 @@ export class Store {
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
         source TEXT NOT NULL, type TEXT NOT NULL, eventKey TEXT NOT NULL, subject TEXT,
         occurredAt INTEGER NOT NULL, receivedAt INTEGER NOT NULL, payload TEXT NOT NULL,
-        origin TEXT NOT NULL, hops INTEGER NOT NULL, dispatchedAt INTEGER,
+        origin TEXT NOT NULL, hops INTEGER NOT NULL, dispatchedAt INTEGER, actsAs TEXT,
         UNIQUE (projectId, source, eventKey)
       );
       -- Retired: follows became params.followUpTriggers (2026-11). Rows from
@@ -1374,6 +1374,9 @@ export class Store {
     if (!preferenceCols.some(column => column.name === 'dismissed')) await this.db.exec('ALTER TABLE user_preferences ADD COLUMN dismissed TEXT');
     const repositoryCols = await this.db.prepare('PRAGMA table_info(repositories)').all() as { name: string }[];
     if (!repositoryCols.some(column => column.name === 'upstream')) await this.db.exec('ALTER TABLE repositories ADD COLUMN upstream TEXT');
+    // The person a chat-started run acts as (src/integrations/chat-links.ts).
+    const projectEventCols = await this.db.prepare('PRAGMA table_info(project_events)').all() as { name: string }[];
+    if (!projectEventCols.some(column => column.name === 'actsAs')) await this.db.exec('ALTER TABLE project_events ADD COLUMN actsAs TEXT');
     const savedViewCols = await this.db.prepare('PRAGMA table_info(saved_views)').all() as { name: string }[];
     if (!savedViewCols.some(column => column.name === 'organizationId')) await this.db.exec('ALTER TABLE saved_views ADD COLUMN organizationId TEXT');
     await this.db.exec('CREATE INDEX IF NOT EXISTS idx_saved_views_organization ON saved_views(organizationId)');
@@ -2130,6 +2133,9 @@ export class Store {
       // PostgreSQL from parsing every other kv value as JSON.
       (await this.db.prepare(`DELETE FROM kv WHERE k LIKE 'incoming-webhook:%'
         AND (CASE WHEN k LIKE 'incoming-webhook:%' THEN json_extract(v, '$.projectId') END)=?`).run(id));
+      // Chat accounts linked through its bots, and open link offers (src/integrations/chat-links.ts).
+      (await this.db.prepare(`DELETE FROM kv WHERE k LIKE 'chat-link%'
+        AND (CASE WHEN k LIKE 'chat-link%' THEN json_extract(v, '$.projectId') END)=?`).run(id));
       (await this.db.prepare('DELETE FROM preview_leases WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM executions WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM promoted_artifacts WHERE projectId=?').run(id));
@@ -3086,6 +3092,8 @@ export class Store {
       (await this.db.prepare('DELETE FROM automation_templates WHERE organizationId=?').run(organizationId));
       (await this.db.prepare(`DELETE FROM kv WHERE k LIKE 'incoming-webhook:%'
         AND (CASE WHEN k LIKE 'incoming-webhook:%' THEN json_extract(v, '$.organizationId') END)=?`).run(organizationId));
+      (await this.db.prepare(`DELETE FROM kv WHERE k LIKE 'chat-link%'
+        AND (CASE WHEN k LIKE 'chat-link%' THEN json_extract(v, '$.organizationId') END)=?`).run(organizationId));
       (await this.db.prepare('DELETE FROM payment_events WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM payment_transactions WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM payment_spend_requests WHERE organizationId=?').run(organizationId));
@@ -10305,9 +10313,10 @@ export class Store {
       const id = newId('pev');
       const receivedAt = input.receivedAt ?? Date.now();
       const created = Number((await this.db.prepare(`INSERT OR IGNORE INTO project_events
-        (id, organizationId, projectId, source, type, eventKey, subject, occurredAt, receivedAt, payload, origin, hops)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, input.organizationId, input.projectId, input.source, input.type,
-        input.key, input.subject ?? null, input.occurredAt, receivedAt, JSON.stringify(input.payload), input.origin, input.hops)).changes) === 1;
+        (id, organizationId, projectId, source, type, eventKey, subject, occurredAt, receivedAt, payload, origin, hops, actsAs)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, input.organizationId, input.projectId, input.source, input.type,
+        input.key, input.subject ?? null, input.occurredAt, receivedAt, JSON.stringify(input.payload), input.origin, input.hops,
+        input.actsAs ?? null)).changes) === 1;
       const row = await this.db.prepare('SELECT * FROM project_events WHERE projectId=? AND source=? AND eventKey=?')
         .get(input.projectId, input.source, input.key);
       return { event: projectEventFromRow(row), created };
@@ -11596,6 +11605,7 @@ function projectEventFromRow(row: any): ProjectEvent {
     occurredAt: Number(row.occurredAt), receivedAt: Number(row.receivedAt),
     payload: JSON.parse(String(row.payload)) as Record<string, unknown>,
     origin: String(row.origin) as ProjectEvent['origin'], hops: Number(row.hops),
+    ...(row.actsAs ? { actsAs: String(row.actsAs) } : {}),
   };
 }
 

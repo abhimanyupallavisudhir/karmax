@@ -19,6 +19,7 @@ import { findFreePortFrom } from '../src/util/ports.js';
 import { GitHubAppService, GITHUB_APP_CLIENT_SECRET_HANDLE } from '../src/integrations/github-app.js';
 import { INSTALLATION_SCOPE, userScope } from '../src/autonomy/vault-keys.js';
 import { AppGrants } from '../src/auth/app-grants.js';
+import { ChatLinks } from '../src/integrations/chat-links.js';
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { vi.restoreAllMocks(); for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -101,6 +102,11 @@ it('cleans only personal access/settings and preserves shared work, history and 
   const cliLogin = await appGrants.issue(await appGrants.create({ userId: 'u_1', kind: 'cli', clientId: 'tavya-cli', name: 'laptop' }));
   const otherLogin = await appGrants.issue(await appGrants.create({ userId: 'uX1', kind: 'cli', clientId: 'tavya-cli', name: 'laptop' }));
   await appGrants.create({ userId: 'u_1', kind: 'token', clientId: 'personal-token', name: 'CI', expiresAt: Date.now() + 60_000 });
+  // Chat accounts linked to them stop acting as them; another person's stay.
+  const chatLinks = new ChatLinks(store);
+  const bot = { id: 'hook_1', projectId: project.id, organizationId: org.id };
+  await chatLinks.redeem((await chatLinks.offer(bot, { id: '7' })).token, 'u_1');
+  await chatLinks.redeem((await chatLinks.offer(bot, { id: '8' })).token, 'uX1');
   await store.kvSet('account-deletion:u_1', JSON.stringify({ userId: 'u_1', email: 'person@example.test' }));
   await broker.registerHandle('user-owned:unlisted', 'no cleanup step names this handle', userScope('u_1'));
   const record = await close();
@@ -129,6 +135,8 @@ it('cleans only personal access/settings and preserves shared work, history and 
   expect(await tokens.verify(agent.token)).toBeUndefined();
   expect(await tokens.verify(other.token)).toBeDefined();
   expect(await appGrants.list('u_1')).toEqual([]);
+  expect(await chatLinks.forUser('u_1')).toEqual([]);
+  expect(await chatLinks.forUser('uX1')).toHaveLength(1);
   expect(await store.kvEntries('app-grant-user:u_1:')).toEqual([]);
   expect(await appGrants.authenticate(cliLogin.accessToken)).toBeUndefined();
   expect(await appGrants.authenticate(otherLogin.accessToken)).toBeDefined();

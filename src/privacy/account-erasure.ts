@@ -5,6 +5,7 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import { userScope } from '../autonomy/vault-keys.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
 import { AppGrants } from '../auth/app-grants.js';
+import { ChatLinks } from '../integrations/chat-links.js';
 
 export const closedAccountKey = (id: string) => `account-closed:${id}`;
 const caseKey = (id: string) => `account-erasure:${id}`;
@@ -232,6 +233,7 @@ export class AccountErasureService {
       await this.store.kvDelete(`git:profiles:user:${userId}`);
       await this.store.kvDelete(`git:default-profile:user:${userId}`);
       await new AppGrants(this.store).revokeUser(userId); // CLI logins, MCP clients, personal tokens
+      await new ChatLinks(this.store).removeUser(userId); // chat accounts that acted as them
     });
   }
 

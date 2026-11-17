@@ -34,6 +34,10 @@ export interface ProjectEvent {
   origin: ProjectEventOrigin;
   /** How many event→run→emit steps led here; bounded to stop loops. */
   hops: number;
+  /** The tavya person (user id) a run it starts acts as: a chat sender linked
+   *  to their account (src/integrations/chat-links.ts). Set only by the
+   *  platform when it ingests the event, never from its payload. */
+  actsAs?: string;
 }
 
 /** What one event did for one armed task. `pending`: a run is being started
@@ -67,7 +71,14 @@ export interface TriggerContext {
   payload: Record<string, unknown>;
   /** Rendered concurrency key, when the trigger declares one. */
   concurrencyKey?: string;
+  /** The event's `actsAs`, for the record; the platform reads it from the stored event. */
+  actsAs?: string;
 }
+
+/** Thrown by a start that must never happen for this event (the person a
+ *  chat-started run would act as may no longer start tasks): the dispatcher
+ *  skips the event for that task instead of retrying it. */
+export class EventRunRefused extends Error {}
 
 export const MAX_EVENT_PAYLOAD_BYTES = 64 * 1024;
 export const MAX_EVENT_HOPS = 8;
@@ -255,6 +266,7 @@ export function triggerContext(event: ProjectEvent, concurrencyKey?: string): Tr
     hops: event.hops,
     payload: event.payload,
     ...(concurrencyKey ? { concurrencyKey } : {}),
+    ...(event.actsAs ? { actsAs: event.actsAs } : {}),
   };
 }
 
