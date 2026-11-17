@@ -80,6 +80,41 @@ setTimeout(() => {
   ok(src.includes('const alreadyStarted = createdWithAttempts && !hasPolicy()'), 'direct task creation skips the redundant attempt-group reload');
   ok(src.includes('await Promise.all((group?.attempts || [])'), 'alternate attempts queue in parallel when follow-up queueing is required');
 
-  console.log(`\n${passed} passed, ${failed} failed`);
-  process.exit(failed ? 1 : 0);
+  slowWrites().then(() => {
+    console.log(`\n${passed} passed, ${failed} failed`);
+    process.exit(failed ? 1 : 0);
+  });
 }, 230);
+
+// A write no gesture is bound to (begun after a file chooser, a drop, another
+// request) shows the trace once it is slow; a quick one and a read never do.
+async function slowWrites() {
+  eval(src.match(/const SLOW_WRITE_MS = \d+;/)[0].replace('const ', 'global.'));
+  const at = src.indexOf('function feedbackFetch(');
+  eval(src.slice(at, src.indexOf('\n}\n', at) + 2));
+  global.interactionOrigin = null;
+  const settleAfter = (ms) => () => new Promise((resolve) => setTimeout(() => resolve({ ok: true }), ms));
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const reset = async () => { await wait(1200); progress.hidden = true; progress.dataset.outcome = ''; };
+
+  await reset();
+  global.fetch = settleAfter(SLOW_WRITE_MS + 300);
+  const slow = feedbackFetch('/api/x', { method: 'POST' });
+  await wait(SLOW_WRITE_MS + 100);
+  ok(progress.hidden === false, 'a slow write with no gesture behind it shows the trace');
+  await slow;
+  await wait(700);
+  ok(progress.hidden === true, 'the trace goes when the slow write answers');
+
+  await reset();
+  global.fetch = settleAfter(50);
+  await feedbackFetch('/api/x', { method: 'PATCH' });
+  await wait(SLOW_WRITE_MS + 100);
+  ok(progress.hidden === true, 'a quick write never flashes the trace');
+
+  global.fetch = settleAfter(SLOW_WRITE_MS + 300);
+  const read = feedbackFetch('/api/x');
+  await wait(SLOW_WRITE_MS + 100);
+  ok(progress.hidden === true, 'a slow read in the background does not show the trace');
+  await read;
+}

@@ -106,6 +106,9 @@ import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, ORGANIZATION
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { EXPLANATIONS_ENABLED, RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { hostLocal } from '../config/deployment.js';
+import { releaseRevision } from '../config/revision.js';
+import { FEATURE_FLAGS } from '../config/feature-flags.js';
+import { enabledFeatures, hasEarlyAccess, isRolloutStage, rolloutStages, setEarlyAccess, setRolloutStage } from '../platform/early-access.js';
 import { apiKeyEnv, canonicalModelProvider, credentialAliases, isAgentProvider, isLoginProvider, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 import { WorldRegistry } from '../world/registry.js';
 import { worldHandleForView } from '../world/resolve.js';
@@ -242,6 +245,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/connections/config') return read ? 'credential:read' : 'settings:write';
   if (p.startsWith('/api/connections')) return p.endsWith('/execute') || p === '/api/connections/request' ? 'connection:use' : 'credential:read';
   if (/^\/api\/organizations\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'organization:read' : 'organization:edit';
+  if (/^\/api\/organizations\/[^/]+\/early-access$/.test(p)) return read ? 'organization:read' : 'organization:edit';
+  if (p === '/api/settings/feature-flags') return read ? 'settings:read' : 'settings:write';
   if (/^\/api\/projects\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/tasks\/[^/]+\/conversation-share$/.test(p)) return 'task:conversation:share';
   if (p === MCP_CLIENT_METADATA_PATH && read) return 'none';
@@ -428,7 +433,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The Files page: data under it also needs project:settings:read, checked there.
   if (/^\/api\/projects\/[^/]+\/files(?:\/raw|\/views)?$/.test(p)) return 'repository:read';
   // Changing Files: who may write where (a task's world, a branch) is decided there.
-  if (/^\/api\/projects\/[^/]+\/files\/(?:changes|uploads|plan)$/.test(p)) return 'repository:read';
+  if (/^\/api\/projects\/[^/]+\/files\/(?:changes|uploads(?:\/[^/]+)?|plan)$/.test(p)) return 'repository:read';
   if (/^\/api\/tasks\/[^/]+\/file-location$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/artifacts$/.test(p)) return 'task:read';
   // Public links to a snapshot of a path: anyone who reads Files sees them; making or revoking one is its own capability.
@@ -2493,14 +2498,18 @@ export class Gateway {
         errorReports: Boolean(await errorReporter()?.destination().catch(() => undefined)),
       });
     }
-    if (p === '/api/health/live' && method === 'GET') return this.json(res, 200, { ok: true, ts: Date.now() });
+    // The serving commit (public: the repository is) lets a deploy, the
+    // staging smoke suite and the production check prove what is live.
+    const revision = releaseRevision();
+    const revisionField = revision ? { revision } : {};
+    if (p === '/api/health/live' && method === 'GET') return this.json(res, 200, { ok: true, ...revisionField, ts: Date.now() });
     if (p === '/api/health/ready' && method === 'GET') {
       try {
         await withTimeout(this.deps.store.checkDatabaseAsync(), 2_000);
         await withTimeout(this.deps.client.workflowService.getSystemInfo({}), 2_000);
-        return this.json(res, 200, { ok: true, database: 'ready', temporal: 'ready', ts: Date.now() });
+        return this.json(res, 200, { ok: true, database: 'ready', temporal: 'ready', ...revisionField, ts: Date.now() });
       } catch {
-        return this.json(res, 503, { ok: false, ts: Date.now() });
+        return this.json(res, 503, { ok: false, ...revisionField, ts: Date.now() });
       }
     }
 
@@ -2638,6 +2647,40 @@ export class Gateway {
         } else if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
         return this.json(res, 200, { ...(organization ? { enabled: (await store.kvGet(key)) === 'enabled' } : (await sharingPolicy(store, id!))),
           canManage: (await this.deps.tokens.check(token, organization ? 'organization:edit' : 'project:settings:write', requestedScope)).ok });
+      }
+      // Early access (wiki features/early-access): the stage of each feature
+      // flag, set by the operator, and an organization's opt-in.
+      if (p === '/api/settings/feature-flags') {
+        if (method !== 'GET' && method !== 'PUT') return this.json(res, 405, { error: 'method not allowed' });
+        const write = method === 'PUT';
+        if (!(await this.deps.tokens.check(token, write ? 'settings:write' : 'settings:read')).ok)
+          return this.json(res, 403, { error: `Only a ${(await this.siteName)} installation operator can ${write ? 'change' : 'see'} feature rollouts` });
+        if (write) {
+          const body = await this.body(req);
+          if (typeof body.name !== 'string' || !Object.hasOwn(FEATURE_FLAGS, body.name)) return this.json(res, 400, { error: 'no such feature flag' });
+          if (!isRolloutStage(body.stage)) return this.json(res, 400, { error: 'stage is off, early or on' });
+          (await setRolloutStage(store, body.name, body.stage));
+        }
+        const stages = (await rolloutStages(store));
+        return this.json(res, 200, {
+          flags: Object.entries(FEATURE_FLAGS).map(([name, flag]) => ({ name, title: flag.title, description: flag.description,
+            stage: stages[name], shippedStage: flag.stage })),
+          earlyAccessOrganizations: (await store.kvEntries('early-access:organization:')).length,
+          canManage: write || (await this.deps.tokens.check(token, 'settings:write')).ok,
+        });
+      }
+      const earlyAccess = p.match(/^\/api\/organizations\/([^/]+)\/early-access$/);
+      if (earlyAccess) {
+        const organizationId = earlyAccess[1]!;
+        if (!(await store.getOrganization(organizationId))) return this.json(res, 404, { error: 'organization not found' });
+        if (method === 'PUT') {
+          const body = await this.body(req);
+          if (typeof body.enabled !== 'boolean') return this.json(res, 400, { error: 'enabled is true or false' });
+          (await setEarlyAccess(store, organizationId, body.enabled));
+        } else if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
+        return this.json(res, 200, { enabled: (await hasEarlyAccess(store, organizationId)),
+          features: (await enabledFeatures(store, organizationId)),
+          canManage: (await this.deps.tokens.check(token, 'organization:edit', { organizationId })).ok });
       }
       const conversationShare = p.match(/^\/api\/tasks\/([^/]+)\/conversation-share$/);
       if (conversationShare) {
@@ -3152,7 +3195,11 @@ export class Gateway {
           return (await store.listOrganizations(callerIdentity.humanSubject?.userId))
             .filter((organization) => !grantOrganization || organization.id === grantOrganization);
         };
-        return this.json(res, 200, (await store.withPreviousSlugs((await listed()))));
+        const organizations = (await store.withPreviousSlugs((await listed())));
+        // The features each has on (wiki features/early-access), for the console's featureOn().
+        if (!Object.keys(FEATURE_FLAGS).length) return this.json(res, 200, organizations);
+        return this.json(res, 200, (await __asyncCollections.map(organizations, async (organization) =>
+          ({ ...organization, features: (await enabledFeatures(store, organization.id)) }))));
       }
       if (p === '/api/organizations' && method === 'POST') {
         const subject = requireHumanSubject(callerIdentity);
@@ -5419,6 +5466,15 @@ export class Gateway {
         if (!(await store.getProject(projectId))) return this.json(res, 404, { error: 'project not found' });
         try { return this.json(res, 200, await this.stageFileUpload(req, projectId, session.apiToken)); }
         catch (error) { return this.json(res, (error as { status?: number }).status ?? 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      // An upload given up on (cancelled, or the rest of its batch failed): its bytes go now, not in an hour.
+      const fileUpload = p.match(/^\/api\/projects\/([^/]+)\/files\/uploads\/([^/]+)$/);
+      if (fileUpload && method === 'DELETE') {
+        const upload = this.fileUploads.get(decodeURIComponent(fileUpload[2]!));
+        const principal = (await this.deps.tokens.verify(session.apiToken))?.principal ?? '';
+        if (upload && upload.projectId === fileUpload[1] && upload.principal === principal) this.dropFileUpload(decodeURIComponent(fileUpload[2]!));
+        res.writeHead(204);
+        return void res.end();
       }
       // Where uploads are best kept: Git, data or a secret (the upload dialog's recommendation).
       const filePlan = p.match(/^\/api\/projects\/([^/]+)\/files\/plan$/);

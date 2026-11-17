@@ -2,35 +2,44 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { releaseRevision } from '../config/revision.js';
 
 /**
- * The revision this process runs and the commits before it, newest first.
- * An image has no `.git`, so `deploy/karmax` writes them to
- * `src/build-revision.txt` before it builds; a checkout (a self-host from
- * source, a test) asks git. Unknown is an empty list: callers then only know
- * less (an error report without its revision, no deploy event).
+ * The commits the running revision is made of, newest first, full or
+ * abbreviated (12 hex digits). An image has no `.git`, and a release image is
+ * built once and run everywhere, so whoever starts it names them:
+ * `deploy/karmax` passes its checkout's as `KARMAX_REVISION_HISTORY`. A
+ * checkout (a self-host from source, a test) asks git. Unknown is an empty
+ * list: a deploy is then reported without the commits it shipped.
  */
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const SHA = /^[0-9a-f]{40}$/;
-let cached: string[] | undefined;
+const COMMIT = /^[0-9a-f]{7,40}$/;
+/** As many as `deploy/karmax` names: one deploy rarely ships more. */
+export const HISTORY_COMMITS = 500;
 
-export function buildHistory(root = ROOT): string[] {
-  if (root === ROOT && cached) return cached;
-  let lines: string[] = [];
-  try { lines = fs.readFileSync(path.join(root, 'src', 'build-revision.txt'), 'utf8').split('\n'); }
-  catch {
+export function buildHistory(env: NodeJS.ProcessEnv = process.env, root = ROOT): string[] {
+  let names = (env.KARMAX_REVISION_HISTORY ?? '').split(/[\s,]+/);
+  if (!names.some(Boolean)) {
     try {
       if (fs.existsSync(path.join(root, '.git')))
-        lines = execFileSync('git', ['-C', root, 'log', '-n', '2000', '--format=%H'], { encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'] }).split('\n');
-    } catch { lines = []; }
+        names = execFileSync('git', ['-C', root, 'log', '-n', String(HISTORY_COMMITS), '--format=%H'],
+          { encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'] }).split('\n');
+    } catch { names = []; }
   }
-  const history = lines.map((line) => line.trim()).filter((line) => SHA.test(line));
-  if (root === ROOT) cached = history;
-  return history;
+  return names.map((name) => name.trim().toLowerCase()).filter((name) => COMMIT.test(name)).slice(0, HISTORY_COMMITS);
 }
 
-/** The running revision: what the environment names, else the build's own. */
-export function buildRevision(): string | undefined {
-  return [process.env.KARMAX_BUILD_REVISION, process.env.GITHUB_SHA, process.env.SOURCE_VERSION].map((value) => value?.trim()).find(Boolean)
-    ?? buildHistory()[0];
+/** Whether `name`, full or abbreviated, is the commit `revision`. */
+export function namesCommit(name: string, revision: string): boolean {
+  return name.length >= 7 && (revision.startsWith(name) || name.startsWith(revision));
+}
+
+/**
+ * The running revision: the release image's own (config/revision.ts), else
+ * what the environment names, else the checkout's.
+ */
+export function buildRevision(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return releaseRevision(env)
+    ?? [env.KARMAX_BUILD_REVISION, env.GITHUB_SHA, env.SOURCE_VERSION].map((value) => value?.trim()).find(Boolean)
+    ?? buildHistory(env).find((name) => name.length === 40);
 }

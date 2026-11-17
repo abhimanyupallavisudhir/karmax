@@ -9,6 +9,7 @@ import { projectEventMatchesTrigger, validateTriggers } from '../src/domain/trig
 import { applyTriggerContext, triggerContext, type ProjectEvent } from '../src/domain/project-events.js';
 import { DEPLOY_EVENT_TYPE, ERROR_EVENT_SOURCE, ERROR_EVENT_TYPE, ERROR_REPORTS_KEY, ErrorReporter, configureErrorReports, errorFingerprint,
   normalizeErrorMessage, ownFrame, ownFrames, recordDeploy, rememberTaskFailure, reportError, reportFromPerson, scrubSecrets } from '../src/platform/error-reports.js';
+import { buildHistory, buildRevision } from '../src/util/build-revision.js';
 import { ERROR_FIXER_PROMPT, ERROR_FIXER_TEMPLATE_ID, ERROR_FIXER_TITLE, ERROR_FIXER_TRIGGER, errorFixerKey, errorReportSettings, saveErrorReportSettings,
   upgradeErrorFixer } from '../src/platform/error-fixer.js';
 import { STORE_TASKS } from '../src/domain/task-store.js';
@@ -156,6 +157,32 @@ describe('a deploy', () => {
     expect(await recordDeploy(store, { history: [sha(5), sha(4), sha(3), sha(2), sha(1)] })).toBeUndefined();
     // An unknown revision (no build record) says nothing.
     expect(await recordDeploy(store, { history: [] })).toBeUndefined();
+  });
+
+  it('takes the revision from the image and the commits from whoever started it', async () => {
+    const { store, ops } = await fixture();
+    const sha = (n: number) => String(n).padStart(40, 'b');
+    const short = (n: number) => sha(n).slice(0, 12);
+    await store.kvSet(ERROR_REPORTS_KEY, JSON.stringify({ projectId: ops.id }));
+    await recordDeploy(store, { revision: sha(2), history: [short(2), short(1)] });
+    // deploy/karmax names abbreviated commits; the previous revision is found among them.
+    expect((await recordDeploy(store, { revision: sha(5), history: [short(5), short(4), short(3), short(2), short(1)] }))!.payload)
+      .toMatchObject({ revision: sha(5), previous: sha(2), commits: [short(5), short(4), short(3)] });
+    // A history that is not this revision's (a release image started by hand) is left out.
+    const bare = (await recordDeploy(store, { revision: sha(7), history: [short(5), short(4)] }))!;
+    expect(bare.payload).toMatchObject({ revision: sha(7), previous: sha(5) });
+    expect(bare.payload).not.toHaveProperty('commits');
+    // The same with no history at all.
+    expect((await recordDeploy(store, { revision: sha(8), history: [] }))!.payload).not.toHaveProperty('commits');
+  });
+
+  it('reads the history the environment names, else the checkout', () => {
+    const sha = 'c'.repeat(40);
+    expect(buildHistory({ KARMAX_REVISION_HISTORY: `${sha.slice(0, 12)} ABCDEF123456\n nonsense ${'d'.repeat(41)} ` }))
+      .toEqual([sha.slice(0, 12), 'abcdef123456']);
+    expect(buildRevision({ KARMAX_REVISION: sha, KARMAX_REVISION_HISTORY: 'abcdef123456' })).toBe(sha);
+    expect(buildRevision({ KARMAX_REVISION_HISTORY: 'abcdef123456' })).toBeUndefined(); // an abbreviation is not a revision
+    expect(buildHistory({})[0]).toMatch(/^[0-9a-f]{40}$/); // this checkout
   });
 });
 

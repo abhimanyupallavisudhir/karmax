@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import os from 'node:os';
 import type { ProjectEvent, ProjectEventRecord } from '../domain/project-events.js';
-import { buildHistory, buildRevision } from '../util/build-revision.js';
+import { buildHistory, buildRevision, namesCommit } from '../util/build-revision.js';
 
 /**
  * Error reports — every unexpected error is one counted event per bug in the
@@ -335,19 +335,20 @@ export async function reportFromPerson(store: ReportsStore, input: { by: string;
 
 /** kv: the revision that last booted here. */
 export const DEPLOYED_REVISION_KEY = 'deploy:revision';
-const DEPLOY_COMMITS = 500;
 
 /**
  * At boot: if this revision is not the one that ran before, say so in the
  * error-report project (`tavya.deployed`, source `tavya`) with the commits it
  * shipped. That is what tells the task that fixed a bug when its fix went
  * live, so that the bug coming again means the fix did not hold rather than
- * was not out yet.
+ * was not out yet. The commits come from whoever started this revision
+ * (build-revision.ts); a history that is not this revision's is left out, and
+ * the event then stands for "something was deployed".
  */
-export async function recordDeploy(store: ReportsStore & { kvSet(key: string, value: string): Promise<void> | void }, options: { history?: string[]; now?: number } = {}):
-  Promise<ProjectEvent | undefined> {
-  const history = options.history ?? buildHistory();
-  const revision = history[0];
+export async function recordDeploy(store: ReportsStore & { kvSet(key: string, value: string): Promise<void> | void },
+  options: { revision?: string; history?: string[]; now?: number } = {}): Promise<ProjectEvent | undefined> {
+  const named = options.history ?? buildHistory();
+  const revision = options.revision ?? (options.history ? options.history[0] : buildRevision());
   if (!revision) return undefined;
   const previous = await store.kvGet(DEPLOYED_REVISION_KEY);
   if (previous === revision) return undefined;
@@ -356,12 +357,14 @@ export async function recordDeploy(store: ReportsStore & { kvSet(key: string, va
   const project = projectId ? await store.getProject(projectId) : undefined;
   let recorded: ProjectEvent | undefined;
   if (project) {
-    const until = previous ? history.indexOf(previous) : -1;
+    const history = named[0] && namesCommit(named[0], revision) ? named : undefined;
+    const until = history && previous ? history.findIndex((name) => namesCommit(name, previous)) : -1;
     const now = options.now ?? Date.now();
     recorded = (await store.recordProjectEvent({ organizationId: project.organizationId ?? 'org_personal', projectId: project.id,
       source: ERROR_EVENT_SOURCE, type: DEPLOY_EVENT_TYPE, key: `deploy:${revision}:${now}`, subject: `tavya-revision:${revision}`,
       occurredAt: now, origin: 'external', hops: 0,
-      payload: { revision, ...(previous ? { previous } : {}), commits: (until >= 0 ? history.slice(0, until) : history).slice(0, DEPLOY_COMMITS), host: os.hostname() } })).event;
+      payload: { revision, ...(previous ? { previous } : {}),
+        ...(history ? { commits: until >= 0 ? history.slice(0, until) : history } : {}), host: os.hostname() } })).event;
   }
   await store.kvSet(DEPLOYED_REVISION_KEY, revision);
   return recorded;
