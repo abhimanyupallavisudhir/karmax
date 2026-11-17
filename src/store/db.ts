@@ -4722,7 +4722,7 @@ export class Store {
 
   async taskMetadata(id: string): Promise<TaskRecord | undefined> {
     const row = (await this.db.prepare(`SELECT id, num, projectId, listId, title, workflow,
-      executionWorkflow, workflowVersion, params, createdAt, ord, parentTaskId,
+      executionWorkflow, workflowVersion, params, createdAt, statusChangedAt, ord, parentTaskId,
       createdBy, assignee, delegate, confirmationPolicy, intentId, attemptNumber,
       notes, lastView FROM tasks WHERE id=?`).get(id)) as any;
     return row ? rowToTask(row) : undefined;
