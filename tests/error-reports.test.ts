@@ -161,7 +161,7 @@ describe('a deploy', () => {
 
   it('takes the revision from the image and the commits from whoever started it', async () => {
     const { store, ops } = await fixture();
-    const sha = (n: number) => String(n).padStart(40, 'b');
+    const sha = (n: number) => String(n).padEnd(40, 'b');
     const short = (n: number) => sha(n).slice(0, 12);
     await store.kvSet(ERROR_REPORTS_KEY, JSON.stringify({ projectId: ops.id }));
     await recordDeploy(store, { revision: sha(2), history: [short(2), short(1)] });
