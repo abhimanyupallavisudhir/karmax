@@ -2990,6 +2990,29 @@ export class Gateway {
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         return this.json(res, 200, { settings: await includedModelView(store, this.deps.broker, computeMonth(Date.now())) });
       }
+      // Generation providers besides OpenRouter (wiki features/generate §
+      // Other providers): fal.ai and Unifically, each with its key (write-only)
+      // and a switch. GET lists them with this month's use; PUT …/:id {apiKey?,
+      // enabled?}; DELETE …/:id removes the key and switches it off.
+      const generationProviderRoute = p.match(/^\/api\/settings\/generation-providers(?:\/([a-z]+))?$/);
+      if (generationProviderRoute) {
+        if (!this.deps.broker) return this.json(res, 503, { error: 'the vault is unavailable' });
+        const providers = await import('../agent/generation-providers.js');
+        const id = generationProviderRoute[1];
+        const view = async () => providers.taskProvidersView(store, this.deps.broker!, computeMonth(Date.now()));
+        if (!id && method === 'GET') return this.json(res, 200, { providers: await view() });
+        if (!id || !(providers.TASK_PROVIDERS as readonly string[]).includes(id)) return this.json(res, 404, { error: `no generation provider ${id ?? ''}` });
+        if (method === 'DELETE') await providers.removeTaskProvider(store, this.deps.broker, id as typeof providers.TASK_PROVIDERS[number]);
+        else if (method === 'PUT') {
+          const b = await this.body(req);
+          try { await providers.saveTaskProvider(store, this.deps.broker, id, { ...(b.apiKey ? { apiKey: String(b.apiKey) } : {}),
+            ...(b.enabled !== undefined ? { enabled: b.enabled === true } : {}) }); }
+          catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        } else return this.json(res, 405, { error: 'method not allowed' });
+        await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), `generation-provider.${method === 'DELETE' ? 'delete' : 'save'}`,
+          `installation:generation-provider:${id}`, { ...identityAuditDetail(callerIdentity) });
+        return this.json(res, 200, { providers: await view() });
+      }
       // Model gateways (wiki features/model-gateways): Anthropic- or
       // OpenAI-compatible endpoints the operator adds, which run Claude Code and
       // Codex on organizations' compute credit; each off until turned on. GET
@@ -7759,8 +7782,10 @@ export class Gateway {
         const actingPrincipal = callerTaskId ? `task:${callerTaskId}` : ownerId;
         try {
           if (p === '/api/connections/config') {
-            if (method === 'PUT') await service.configure(String(b.apiKey ?? ''));
-            if (method === 'GET' || method === 'PUT') return this.json(res, 200, { configured: await service.configured(), canConfigure: (await this.deps.tokens.check(token, 'settings:write')).ok });
+            if (method === 'PUT' && (b.apiKey !== undefined || b.instant === undefined)) await service.configure(String(b.apiKey ?? ''));
+            if (method === 'PUT' && b.instant !== undefined) await service.setInstant(b.instant === true);
+            if (method === 'GET' || method === 'PUT') return this.json(res, 200, { configured: await service.configured(), instant: await service.instantEnabled(),
+              canConfigure: (await this.deps.tokens.check(token, 'settings:write')).ok });
           }
           if (p === '/api/connections/catalog' && method === 'GET')
             return this.json(res, 200, await service.catalog(url.searchParams.get('search') ?? ''));
@@ -7799,6 +7824,9 @@ export class Gateway {
             if (c.status === 'requested' && c.taskId === task.id && !opened.has(c.id) && typeof api.routeConnectionRequest === 'function')
               await api.routeConnectionRequest(token, c).catch((error: unknown) =>
                 console.warn(`[autonomy] could not route connection request ${c.id} to the Avatār:`, error instanceof Error ? error.message : error));
+            // Paid through Composio Instant: usable now, nobody to ask.
+            if (c.status === 'active' && c.instant) return this.json(res, 200, { status: 'connected', connection: service.view(c),
+              detail: 'No account needed: Composio pays for each call and it is charged to your organization’s credit.' });
             return this.json(res, 200, { status: c.status === 'denied' || c.status === 'disconnected' ? 'denied' : 'needs_connection',
               connection: service.view(c), detail: 'A Connect button is available in this task’s Approval Requests. Continue independent work; the task resumes after sign-in.' });
           }
@@ -8649,6 +8677,11 @@ export class Gateway {
       // the organization's own OpenRouter key or, on tavya's, from its credit.
       if (p === '/api/generation-models' && method === 'GET') {
         const generation = await import('../agent/generation.js');
+        const provider = url.searchParams.get('provider') ?? 'openrouter';
+        if (provider === 'fal' || provider === 'unifically') {
+          try { return this.json(res, 200, { provider, models: await generation.providerModels({ store, broker: this.deps.broker }, provider, url.searchParams.get('q') ?? undefined) }); }
+          catch (error) { if (error instanceof generation.GenerationUnavailable) return this.json(res, 409, { error: error.message }); throw error; }
+        }
         const kind = url.searchParams.get('kind') ?? '';
         if (!(generation.GENERATION_KINDS as readonly string[]).includes(kind))
           return this.json(res, 400, { error: `kind must be one of ${generation.GENERATION_KINDS.join(', ')}` });
