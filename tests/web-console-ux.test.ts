@@ -189,9 +189,9 @@ describe('manual PR opening', () => {
 
     expect(helpers.taskActionLabel({ stage: 'escalated' }, { ...action, label: 'Commit changes, open & confirm PR' }))
       .toBe('Commit changes, open & confirm PR');
-    expect(helpers.taskActionLabel({}, action)).toBe('Send to review');
+    expect(helpers.taskActionLabel({}, action)).toBe('Manually send to review');
     expect(helpers.taskActionLabel({ pr: { state: 'open', merged: false } }, action)).toBe('Back to review');
-    expect(helpers.taskActionLabel({ prs: [{ state: 'closed', merged: false }] }, action)).toBe('Send to review');
+    expect(helpers.taskActionLabel({ prs: [{ state: 'closed', merged: false }] }, action)).toBe('Manually send to review');
     expect(helpers.hasOpenPullRequest({ prs: [{ state: 'open', merged: true }] })).toBe(false);
   });
 

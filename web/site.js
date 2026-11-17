@@ -10,7 +10,7 @@
   const pages = [
     page('/docs', 'docs/getting-started.md', 'Getting started', 'Docs', '2026-11-14'),
     page('/docs/how-it-works', 'docs/how-it-works.md', 'How it works', 'Docs', '2026-11-14'),
-    page('/docs/computers', 'docs/computers.md', 'Cloud computers', 'Docs', '2026-11-06'),
+    page('/docs/computers', 'docs/computers.md', 'Cloud computers', 'Docs', '2026-11-17'),
     page('/docs/chat-bots', 'docs/chat-bots.md', 'Chat bots', 'Docs', '2026-10-27'),
     page('/docs/cli', 'docs/cli.md', 'tavya CLI', 'Docs', '2026-10-18'),
     page('/docs/claude-code-in-the-cloud', 'docs/claude-code-in-the-cloud.md', 'Run Claude Code in the cloud', 'Guides', '2026-11-14', 'Claude Code in the cloud'),

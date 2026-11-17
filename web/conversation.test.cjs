@@ -358,6 +358,16 @@ const atReview = conversationReviewInfo({ taskId: 't', stage: 'review', reviewIn
 ok(atReview.includes('>Review<') && atReview.includes('id="review-resources"') && atReview.includes('id="review-resource-inventory"'), 'in Review the resources to save close the conversation');
 ok(atReview.includes('without signalling completion'), 'an agent that stopped without signalling completion is flagged');
 ok(!conversationReviewInfo({ taskId: 't', stage: 'review', reviewInfo: { caption: 'x' } }, true).includes('review-resources'), 'an input request already carrying the resources is not repeated');
+// A spend is asked once: decided, it shows its outcome instead of buttons (#960).
+const spend = (resolved) => conversationReviewInfo({ taskId: 't', reviewInfo: { summary: 'Approval needed to spend $10.00', actions: [
+  { kind: 'open', label: 'Report', target: 'r.md' },
+  { kind: 'payment', label: 'Approve spend', requestId: 'sr', operation: 'approve', ...(resolved ? { resolved } : {}) },
+  { kind: 'payment', label: 'Deny spend', requestId: 'sr', operation: 'deny', ...(resolved ? { resolved } : {}) },
+  { kind: 'open', label: 'Fund in Stripe', target: 'https://stripe.example/fund', requestId: 'sr', ...(resolved ? { resolved } : {}) }] } });
+ok(spend().includes('data-idx="1" data-kind="payment"') && spend().includes('Deny spend') && spend().includes('Fund in Stripe'), 'a waiting spend offers approve, deny and funding');
+ok(!spend('approved').includes('data-kind="payment"') && !spend('approved').includes('Fund in Stripe') && spend('approved').includes('Spend approved'), 'an approved spend shows its outcome, no buttons');
+ok(spend('denied').includes('Spend denied') && !spend('denied').includes('Spend approved'), 'a denied spend says so');
+ok(spend('approved').includes('data-idx="0"'), 'other review actions keep their indices');
 ok(conversationError({ error: 'boom <x>' }).includes('boom &lt;x&gt;') && conversationError({}) === '', 'a recorded failure shows once, escaped, in the conversation');
 
 

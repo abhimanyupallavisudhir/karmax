@@ -1716,9 +1716,9 @@ const localWorldPath = (v) => (hostLocal() && v.worldPath) || '';
 // Parameters tab. The value is sparse ({provider, cpu, memoryMb, diskGb, flavor,
 // hibernateAfterDays, network}); the block shows the effective machine and a
 // form stores only what differs from what it inherits.
-const COMPUTER_PROVIDER_LABELS = { any: 'Any', e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', aws: 'AWS', gcp: 'Google Cloud',
+const COMPUTER_PROVIDER_LABELS = { any: 'Any', e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', aws: 'AWS', gcp: 'Google Cloud', agent37: 'Agent37',
   worktree: 'This machine', container: 'Docker container' };
-const CLOUD_COMPUTERS = ['e2b', 'daytona', 'fly', 'hetzner', 'aws', 'gcp'];
+const CLOUD_COMPUTERS = ['e2b', 'daytona', 'fly', 'hetzner', 'aws', 'gcp', 'agent37'];
 const COMPUTER_REGION_LABELS = { eu: 'EU', us: 'US' };
 // Provider "Any" (wiki features/compute-routing): the cloud accounts it can
 // choose among — the organization's own, and the managed compute it may use.
@@ -1734,7 +1734,7 @@ const ANY_TIP = 'Runs on the first that fits and has room: your own accounts fir
 // What a machine gets when the Computer asks for nothing more (disk is total GB).
 const COMPUTER_DEFAULTS = { e2b: { cpu: 2, memoryMb: 2048, diskGb: 22 }, daytona: { cpu: 2, memoryMb: 4096, diskGb: 8 },
   fly: { cpu: 2, memoryMb: 2048, diskGb: 20 }, hetzner: { cpu: 2, memoryMb: 2048, diskGb: 20 }, aws: { cpu: 2, memoryMb: 2048, diskGb: 20 },
-  gcp: { cpu: 2, memoryMb: 2048, diskGb: 20 } };
+  gcp: { cpu: 2, memoryMb: 2048, diskGb: 20 }, agent37: { cpu: 2, memoryMb: 4096, diskGb: 20 } };
 // What a computer on the organization's provider account may be: the
 // connection's limits, learned from the provider (src/domain/computer-limits.ts).
 // For "Any", each size is the largest some reachable account allows.
@@ -6334,7 +6334,7 @@ function renderOnboarding() {
       ${onboardingStep(2, 'compute', 'Get computers for your agents', '', `<div class="onboarding-options">
         ${onboardingOption(compute.managed, 'Buy a paid plan', `Includes ${siteNameMarkup()}’s computers`, `${settings}#settings-plan`, compute.managed ? 'Manage plan' : 'View plans')}
         <span class="onboarding-or">or</span>
-        ${onboardingOption(compute.own, 'Connect your own compute', 'E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud', `${settings}#settings-computers`, compute.own ? 'Manage' : 'Connect')}
+        ${onboardingOption(compute.own, 'Connect your own compute', 'E2B, Daytona, Fly.io, Hetzner, AWS, Google Cloud or Agent37', `${settings}#settings-computers`, compute.own ? 'Manage' : 'Connect')}
       </div>`)}
       ${onboardingStep(3, 'project', 'Create your first project', `Start a real task list. Its code can live on ${siteNameMarkup()} or on GitHub.`, `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
       ${onboardingStep(4, 'github', 'Connect GitHub', `Work on your GitHub repositories through reviewed pull requests.`, `<a class="btn sm" data-spa href="${settings}#settings-code">${state.steps.github.complete ? 'Manage GitHub' : 'Connect GitHub'}</a>`)}
@@ -8103,7 +8103,9 @@ function rowAskHtml(t) {
       <span class="row-ask-q">Give <span class="mono">${esc(request.login)}</span> access to <span class="mono">${esc(request.slug)}</span>?</span>
       <span class="row-ask-actions"><button type="button" class="btn sm primary" data-raccess-act="approve">Give access</button><button type="button" class="btn sm" data-raccess-act="deny">Deny</button></span></div>`),
   ];
-  if (!decisions.length) return '';
+  // Out of date and with nothing to show, it still holds its place: the reload
+  // it asks for may bring a new ask (#955: the row's next request never showed).
+  if (!decisions.length) return stale ? `<div class="row-ask" data-row-decisions="${esc(t.id)}" data-stale></div>` : '';
   // An answer on its way keeps its buttons pressed through a repaint.
   const shown = decisions.slice(0, 2).map((html) => {
     const id = html.match(/data-(?:vreq|preq|areq|raccess)="([^"]*)"/)?.[1];
@@ -8116,6 +8118,7 @@ async function loadRowDecisions(t) {
   if (rowDecisionLoads.get(t.id)?.key === key) return rowDecisionLoads.get(t.id).promise;
   const organizationId = rowOrganizationId(t);
   const query = `taskId=${encodeURIComponent(t.id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
+  const load = { key };
   const promise = (async () => {
     const [credential, permission, authorization, repository, connections] = await Promise.all([
       api(`/api/vault/requests?${query}`).catch(() => []), api(`/api/permission-requests?${query}`).catch(() => []),
@@ -8123,9 +8126,12 @@ async function loadRowDecisions(t) {
       api(`/api/connections?${query}`).catch(() => [])]);
     const items = credential.some((request) => request.status === 'pending')
       ? await api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []) : [];
+    // A load overtaken by a newer one (its key changed meanwhile) leaves the newer one's answer alone.
+    if (rowDecisionLoads.get(t.id) !== load) return;
     rowDecisions.set(t.id, { key, credential, permission, authorization, repository, connections: connections.filter((c) => c.taskId === t.id), items });
-  })().finally(() => rowDecisionLoads.delete(t.id));
-  rowDecisionLoads.set(t.id, { key, promise });
+  })().finally(() => { if (rowDecisionLoads.get(t.id) === load) rowDecisionLoads.delete(t.id); });
+  load.promise = promise;
+  rowDecisionLoads.set(t.id, load);
   return promise;
 }
 /** Load what list rows ask, answer from them, and refresh the lists after a decision. */
@@ -9975,7 +9981,7 @@ function readinessGaps(readiness, projectId) {
   }
   const compute = readiness.compute;
   const plan = `${settings}#settings-plan`, computers = `${settings}#settings-computers`;
-  const providers = 'E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud';
+  const providers = 'E2B, Daytona, Fly.io, Hetzner, AWS, Google Cloud or Agent37';
   // Out of compute: never bought a plan (need: plan) or spent this month's (credit).
   const need = compute?.need ?? (compute?.outOfCredit ? 'credit' : 'computer');
   if (compute && !compute.ready) gaps.push(...(need === 'plan' ? [
@@ -12695,6 +12701,10 @@ function reviewTile(a, i) {
 }
 
 function reviewActionBtn(a, i) {
+  // A decided spend asks nothing more: its approve button becomes the outcome,
+  // its deny button and funding link go (#960).
+  if (a.resolved) return a.kind === 'payment' && a.operation === 'approve'
+    ? `<span class="review-resolved" role="status">${a.resolved === 'denied' ? '✕ Spend denied' : '✓ Spend approved'}</span>` : '';
   const isRun = a.kind === 'run';
   const isPayment = a.kind === 'payment';
   const icon = isPayment ? (a.operation === 'deny' ? '✕' : '✓') : isRun ? (a.server ? '▶' : '⚡') : '↗';
@@ -13032,8 +13042,9 @@ function wireReviewActions(v) {
         const resolve = () => api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index: idx }) });
         const r = await resolve();
         if (kind === 'payment') {
-          toast(r.result?.status === 'granted' ? `Spend approved${r.resumed ? ' — task continuing' : ''}` : r.result?.reason || 'Spend request updated',
-            r.result?.status === 'denied');
+          toast(r.alreadyResolved ? `Already ${r.result?.status === 'denied' ? 'denied' : 'approved'}`
+            : r.result?.status === 'granted' ? `Spend approved${r.resumed ? ' — task continuing' : ''}` : r.result?.reason || 'Spend request updated',
+            !r.alreadyResolved && r.result?.status === 'denied');
           await refreshTask();
           return;
         }
@@ -16818,9 +16829,9 @@ function hasOpenPullRequest(v) {
 function taskActionLabel(v, action) {
   // Keep Cancel in older task views that still declare the post-landing label as Finish.
   if (action.name === 'finish') return 'Cancel';
-  if (action.name === 'openPr' && v?.stage === 'escalated') return action.label || 'Send to review';
+  if (action.name === 'openPr' && v?.stage === 'escalated') return action.label || 'Manually send to review';
   if (action.name === 'openPr')
-    return hasOpenPullRequest(v) ? 'Back to review' : 'Send to review';
+    return hasOpenPullRequest(v) ? 'Back to review' : 'Manually send to review';
   // Waiting for the person to open the upstream pull request: Confirm checks now.
   if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.kind === 'human' && v.waitingFor.reason === 'merge')
     return 'I opened it';
@@ -18457,7 +18468,7 @@ const INSIGHT_FUNDING = {
   own: { label: 'Own accounts', color: 'var(--viz-1)', tip: 'Your own provider accounts: the provider bills you at its list price' },
   managed: { label: 'Managed', color: 'var(--viz-2)', tip: 'tavya\'s accounts: charged to your compute credit at twice list price' },
 };
-const INSIGHT_PROVIDERS = { e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', aws: 'AWS', gcp: 'Google Cloud' };
+const INSIGHT_PROVIDERS = { e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', aws: 'AWS', gcp: 'Google Cloud', agent37: 'Agent37' };
 const insProvider = (provider) => INSIGHT_PROVIDERS[provider] || provider;
 // The org-wide track reuses the task pipeline's stages; `resolve` (conflict
 // resolution) is part of landing.
@@ -28530,6 +28541,9 @@ const COMPUTER_PROVIDERS = {
   gcp: { name: 'Google Cloud', keys: '/docs/computers#google-cloud', keyLabel: 'Service account key', keyFile: true,
     tip: 'Paid by the second while it works; a paused computer costs only its disk. Machines of exactly the size you choose, disks up to 64 TB that grow in place.',
     advanced: [['region', 'Zone', 'europe-west3-a'], ['image', 'Image', 'karmax image, else Debian 12']] },
+  agent37: { name: 'Agent37', keys: 'https://www.agent37.com/dashboard/cloud/api-keys',
+    tip: 'The cheapest per hour: whole VMs of up to 4 CPU · 32 GB, disks up to 100 GB that keep everything through pauses and grow at the next start. Prepaid: top up its wallet.',
+    advanced: [['region', 'Region', 'eu (or us, ap-south)'], ['image', 'Template', 'agent37-ubuntu']] },
 };
 /** The dialog's key fields: one secret, a key in parts (AWS), or a key file (Google Cloud). */
 function computerKeyMarkup(info, connection) {
