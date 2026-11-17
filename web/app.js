@@ -29797,7 +29797,7 @@ async function hydrateChatLinks() {
   const card = $('#chat-links-card'), box = $('#profile-chat-links');
   if (!card || !box) return;
   let links;
-  try { ({ links } = await api('/api/user/chat-links')); } catch { return; }
+  try { links = (await api('/api/user/chat-links'))?.links || []; } catch { return; }
   card.hidden = !links.length;
   box.innerHTML = links.map((link) => `<div class="setting-row" data-chat-link="${esc(link.id)}">
       <span class="setting-label" title="${esc(`${CHAT_PLATFORM_LABELS[link.platform] || ''} id ${link.platformUserId}`)}">${esc(CHAT_PLATFORM_LABELS[link.platform] || 'Chat')} · ${esc(link.platformName || link.platformUserId)}</span>
