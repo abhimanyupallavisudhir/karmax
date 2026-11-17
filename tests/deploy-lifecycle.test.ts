@@ -25,6 +25,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify(args) + '\\n');
+if (args[0] === 'compose') fs.appendFileSync(process.env.FAKE_LOG + '.attestations', JSON.stringify([process.env.BUILDX_NO_DEFAULT_ATTESTATIONS ?? '', ...args]) + '\\n');
 if (process.env.FAKE_FAIL && args.join(' ').includes(process.env.FAKE_FAIL)) process.exit(17);
 if (args.includes('cp')) {
   const destination = args.at(-1);
@@ -67,8 +68,10 @@ printf 308
     env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_LOG: log, FAKE_FAIL: fail, KARMAX_READY_TIMEOUT_SECONDS: '1', ...env },
   });
   const calls = () => fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]) : [];
+  const composeAttestations = () => fs.existsSync(log + '.attestations')
+    ? fs.readFileSync(log + '.attestations', 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]) : [];
   const edgeRequests = () => fs.existsSync(curls) ? fs.readFileSync(curls, 'utf8').trim().split('\n') : [];
-  return { root, deploy, run, calls, edgeRequests, clear: () => fs.writeFileSync(log, '') };
+  return { root, deploy, run, calls, composeAttestations, edgeRequests, clear: () => fs.writeFileSync(log, '') };
 }
 
 it('names a backup taken without a destination as the operator\'s, so pruning keeps it', () => {
@@ -133,6 +136,20 @@ it('starts only after configuration validates, preserves secrets, and waits for 
   expect(result.stdout).toContain('Karmax is ready');
   expect(fs.readFileSync(path.join(h.deploy, '.turnkey.env'), 'utf8')).toContain('KEEP_SETTING=retained');
   expect(fs.readFileSync(path.join(h.deploy, '.secrets', 'vault_key'), 'utf8')).toBe('original-vault_key');
+});
+
+// BuildKit's default provenance attestation is new on every build, so a cached
+// rebuild of an unchanged Dockerfile got a new image ID and the next `up`
+// recreated PostgreSQL under the running app at every update (tavya-error
+// d035db8d7325aeb6, 2026-11-17). Every Compose call the operator script makes
+// (build, or up, which builds what is missing) builds without it.
+it('builds images without default attestations, so an unchanged image keeps its ID', () => {
+  const h = deployment();
+  const result = h.run(['up', 'example.com']);
+  expect(result.status, result.stderr).toBe(0);
+  const builds = h.composeAttestations().filter(([, ...args]) => args.includes('build') || args.includes('up') || args.includes('--build'));
+  expect(builds.some(([, ...args]) => args.join(' ').includes('up -d --build'))).toBe(true);
+  expect(builds.filter(([setting]) => setting !== '1')).toEqual([]);
 });
 
 // Compose starts Caddy only once the app is healthy, so the app's own readiness

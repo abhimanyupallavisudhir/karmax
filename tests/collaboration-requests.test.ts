@@ -117,6 +117,33 @@ describe('durable background collaboration requests', () => {
       .toHaveLength(1);
   });
 
+  // A retry's database read failed while PostgreSQL restarted (a deploy,
+  // 2026-11-17, tavya-error d035db8d7325aeb6): the timer's rejection escaped
+  // unhandled and the settled request was never announced until a restart.
+  it('keeps retrying a notification whose retry hit a database outage', async () => {
+    let refuse = 1;
+    const f = (await fixture((_taskId, args) => {
+      if (args[0] === 'collaborationSettled' && refuse-- > 0) throw new Error('Temporal unavailable');
+    }));
+    const request = await f.api.requestAgentAction(f.token, { taskId: f.target.id, action: 'publish_branch' });
+    const read = f.store.getCollaborationRequest.bind(f.store);
+    let outage = 1;
+    vi.spyOn(f.store, 'getCollaborationRequest').mockImplementation(async (id) => {
+      if (outage-- > 0) throw Object.assign(new Error('the database system is shutting down'), { code: '57P03' });
+      return read(id);
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const event = { taskId: f.target.id, type: 'push.branch', ts: Date.now(), payload: { branch: `tavya/${f.target.id}`, repos: ['app'] } };
+      f.bus.emit({ ...event, seq: (await f.store.appendEvent(event)) });
+      await expect.poll(async () => (await read(request.id))?.notifiedAt, { timeout: 10_000, interval: 100 }).toEqual(expect.any(Number));
+      expect(outage).toBeLessThan(0);
+      expect(unhandled).toEqual([]);
+    } finally { process.off('unhandledRejection', onUnhandled); }
+  }, 15_000);
+
   it('reports a target terminal failure without polling', async () => {
     const f = (await fixture());
     const request = await f.api.requestAgentAction(f.token, {

@@ -8326,11 +8326,16 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
   private scheduleCollaborationNotification(requestId: string, attempt: number): void {
     if (this.collaborationNotificationRetries.has(requestId)) return;
     this.collaborationNotificationRetries.set(requestId, attempt);
-    const timer = setTimeout(async () => {
+    // Nothing awaits this timer: a failure anywhere in it (the database
+    // restarting, a signal refused) schedules the next attempt, never escapes.
+    // Re-sending is safe: the requester deduplicates by message id.
+    const timer = setTimeout(() => {
       this.collaborationNotificationRetries.delete(requestId);
-      const request = (await this.deps.store.getCollaborationRequest(requestId));
-      if (request && request.status !== 'pending' && !request.notifiedAt)
-        void this.notifyCollaborationRequest(request, attempt);
+      void (async () => {
+        const request = (await this.deps.store.getCollaborationRequest(requestId));
+        if (request && request.status !== 'pending' && !request.notifiedAt)
+          await this.notifyCollaborationRequest(request, attempt);
+      })().catch(() => this.scheduleCollaborationNotification(requestId, attempt + 1));
     }, Math.min(30_000, 500 * 2 ** Math.min(attempt, 6)));
     timer.unref?.();
   }
