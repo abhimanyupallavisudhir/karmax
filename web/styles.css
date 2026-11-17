@@ -3976,9 +3976,8 @@ html[data-theme="dark"] .github-signin-btn:active,
 
 .text-prompt { width:min(480px,92vw); padding:20px; border:1px solid var(--line); border-radius:12px; background:var(--surface); color:var(--ink); }
 .text-prompt::backdrop { background:rgba(0,0,0,.4); }
-.ask-dialog textarea { width: 100%; min-height: 72px; resize: vertical; box-sizing: border-box; font: inherit; padding: 10px 12px;
-  border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); color: var(--ink); }
-.ask-dialog textarea:focus { outline: none; border-color: var(--accent); }
+.ask-dialog .prompt-field > textarea { min-height: 72px; box-sizing: border-box; font: inherit; padding: 10px 12px; color: var(--ink); }
+.ask-mic { justify-content: flex-end; }
 .ask-foot { justify-content: space-between; align-items: center; margin-top: 10px; }
 .ask-where { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: var(--fs-12); min-width: 0; }
 

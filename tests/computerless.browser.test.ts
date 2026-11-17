@@ -132,4 +132,40 @@ describe('a task without a computer, in the console', () => {
     expect(await dialog.count()).toBe(0);
     expect(errors).toEqual([]);
   });
+
+  it('Ask takes dictation like any message box: a mic in it, and its shortcut works inside the dialog', async () => {
+    const context = await browser.newContext({ serviceWorkers: 'block', viewport: { width: 1280, height: 1000 } });
+    // The browser's speech recognition, driven by the test (as tests/push-and-voice.browser.test.ts does).
+    await context.addInitScript(() => {
+      const w = globalThis as any;
+      w.__speech = [];
+      w.SpeechRecognition = w.webkitSpeechRecognition = class {
+        started = false; onresult: any; onend: any; onerror: any; lang = ''; interimResults = false; continuous = true;
+        constructor() { w.__speech.push(this); }
+        start() { this.started = true; }
+        stop() { if (!this.started) return; this.started = false; this.onend?.(); }
+      };
+    });
+    const page = await context.newPage();
+    const errors: string[] = [];
+    page.on('pageerror', (error) => errors.push(error.message));
+    await page.goto(`${base}/personal/assistant`);
+    await page.locator('#rail-ask').click();
+    const dialog = page.locator('dialog.ask-dialog');
+    const mic = dialog.locator('[data-mic]');
+    await mic.waitFor();
+    await mic.click();
+    await page.evaluate(() => (globalThis as any).__speech.at(-1).onresult({ results: [Object.assign([{ transcript: 'what waits on me' }], { isFinal: true })] }));
+    expect(await dialog.locator('textarea').inputValue()).toBe('what waits on me');
+    if (process.env.KARMAX_SHOTS) await dialog.screenshot({ path: path.join(process.env.KARMAX_SHOTS, 'ask-dictation.png') });
+    await mic.click(); // a second tap stops it
+    expect(await mic.getAttribute('aria-pressed')).toBe('false');
+    // The dictation shortcut reaches the dialog's mic though the dialog keeps other shortcuts to itself.
+    await dialog.locator('textarea').focus();
+    await page.keyboard.press('ControlOrMeta+Shift+S');
+    await expect.poll(() => mic.getAttribute('aria-pressed')).toBe('true');
+    expect(await page.evaluate(() => (globalThis as any).__speech.length)).toBe(2);
+    expect(errors).toEqual([]);
+    await context.close();
+  });
 });

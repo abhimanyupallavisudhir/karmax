@@ -8653,8 +8653,10 @@ function askTavya(projectId) {
   const dialog = document.createElement('dialog');
   dialog.className = 'text-prompt ask-dialog';
   dialog.setAttribute('aria-label', `Ask ${siteName()}`);
-  dialog.innerHTML = `<form method="dialog"><textarea name="ask" rows="3" required maxlength="20000" aria-label="Ask ${esc(siteName())}"
+  const mic = micButtonHtml('ask');
+  dialog.innerHTML = `<form method="dialog"><div class="prompt-field"><textarea name="ask" rows="3" required maxlength="20000" aria-label="Ask ${esc(siteName())}"
       placeholder="Ask ${esc(siteName())} anything: change a setting, find what waits on you, start a task…"></textarea>
+      ${mic ? `<div class="prompt-attach-row ask-mic">${mic}</div>` : ''}</div>
     <div class="inline-form ask-foot"><span class="ask-where">${esc(projectById(projectId)?.name || '')}${policyTip(NO_COMPUTER_TIP)}</span>
       <button class="btn primary" value="submit" title="Ask (Enter)">Ask</button></div></form>`;
   const input = dialog.querySelector('textarea');
@@ -8679,10 +8681,11 @@ function askTavya(projectId) {
     }
   });
   dialog.addEventListener('keydown', (event) => {
-    event.stopPropagation();
+    event.stopPropagation(); // the console's shortcuts stay outside, but for dictation
+    if (runDictationShortcut(event)) return;
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); form.requestSubmit(); }
   });
-  dialog.addEventListener('close', () => { dialog.remove(); if (!sending) previousFocus?.focus?.(); });
+  dialog.addEventListener('close', () => { stopDictation(); dialog.remove(); if (!sending) previousFocus?.focus?.(); });
   document.body.appendChild(dialog);
   dialog.showModal();
   input.focus();
@@ -25174,6 +25177,16 @@ function stopDictation() {
   if (field) field.placeholder = state.placeholder;
   paintMic(state.key);
 }
+/** Dictation's shortcut, for a field inside an overlay that keeps the console's
+ * other shortcuts out (the task form, Ask): true when it ran. */
+function runDictationShortcut(event) {
+  if (!(event.metaKey || event.ctrlKey) || !focusedMicKey()) return false;
+  const dictate = allCommands().find((command) => command.id === 'compose.voice');
+  if (!(dictate?.keys?.length === 1 && stepMatches(dictate.keys[0], event))) return false;
+  event.preventDefault();
+  dictate.run();
+  return true;
+}
 // The mic of the field being typed in, else the only one on screen.
 function focusedMicKey() {
   const own = document.activeElement?.closest?.('.prompt-field')?.querySelector('[data-mic]');
@@ -28562,10 +28575,7 @@ function bindKeys() {
       // modifier-bearing bindings (⌘K) still work while typing outside overlays
       else if ((e.metaKey || e.ctrlKey) && !overlayOpen) dispatchKey(e);
       // …and dictation inside one too (the task form): it acts on the field being typed in.
-      else if ((e.metaKey || e.ctrlKey) && focusedMicKey()) {
-        const dictate = allCommands().find((command) => command.id === 'compose.voice');
-        if (dictate?.keys?.length === 1 && stepMatches(dictate.keys[0], e)) { e.preventDefault(); dictate.run(); }
-      }
+      else if (e.metaKey || e.ctrlKey) runDictationShortcut(e);
       return;
     }
     // A checkbox, radio or slider keeps the named keys it uses (Space, Enter,
