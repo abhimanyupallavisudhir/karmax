@@ -19,6 +19,9 @@ const PERSONAL_TOKEN = 'ghp_personal';
 const prs: any[] = [];
 const calls: Array<{ method: string; path: string; auth: string; body?: any }> = [];
 let forkOrigin: string;
+/** The upstream already has the branch's commits (a maintainer took them by
+ *  other means), so GitHub refuses the pull request as empty. */
+let upstreamHasTheCommits = false;
 let originDir: string;
 
 async function forkHead(branch: string): Promise<string | undefined> {
@@ -54,6 +57,8 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
     if (auth !== `Bearer ${PERSONAL_TOKEN}`) return json(403, { message: 'Resource not accessible by integration' });
     const [owner, branch] = String(body.head).split(':');
     if (owner !== 'jane' || !branch) return json(422, { message: 'Validation Failed' });
+    if (upstreamHasTheCommits) return json(422, { message: 'Validation Failed', errors: [{ resource: 'PullRequest',
+      code: 'custom', message: `No commits between main and jane:${branch}` }] });
     return json(201, await openUpstreamPr(branch, body.title, body.body));
   }
   const one = u.pathname.match(/^\/repos\/acme\/widgets\/pulls\/(\d+)$/);
@@ -111,6 +116,7 @@ describe('software-dev 1.28 on a fork of someone else\'s repository', () => {
   beforeEach(() => {
     prs.length = 0;
     calls.length = 0;
+    upstreamHasTheCommits = false;
   });
 
   async function forkProject(name: string) {
@@ -231,6 +237,34 @@ describe('software-dev 1.28 on a fork of someone else\'s repository', () => {
       prs[0].merged_at = new Date().toISOString();
       prs[0].merged = true;
       expect((await handle.result()).stage).toBe('done');
+    } finally {
+      await profiles.delete('github');
+    }
+  }, 180_000);
+
+  // Production 2026-09-26 (#368–#376, the openPr path; reported again 2026-11-17):
+  // GitHub's 422 "No commits between" escalated a task to a person. The fork's
+  // copy of the base is synced only at Setup, so the local count can claim work
+  // the upstream already has; GitHub decides what a pull request contains.
+  it('finishes without a pull request when the upstream already has the branch\'s commits', async () => {
+    const profiles = new GitProfiles(h.store, h.broker, undefined, userGitScope('jane'));
+    await profiles.save({ name: 'github', userName: 'Jane', userEmail: 'jane@example.com',
+      github: { id: 'jane-github', login: 'jane' }, githubToken: PERSONAL_TOKEN });
+    try {
+      const { repo, project } = await forkProject('taken');
+      const { task, handle } = await start('taken', project, repo);
+      await expect.poll(async () => (await view(handle)).stage, { timeout: 60_000 }).toBe('review');
+
+      upstreamHasTheCommits = true;
+      await handle.signal('confirm');
+      // Before the fix this held for a person with GitHub's 422 as its text.
+      await expect.poll(async () => { const now = await view(handle); return now.waitingFor?.detail ?? now.stage; },
+        { timeout: 60_000 }).toBe('done');
+      expect((await handle.result()).stage).toBe('done');
+      expect(prs).toHaveLength(0);
+      expect((await h.store.eventsOfTypes(task.id, ['pr.skipped'])).map((event) => event.payload)
+        .filter((payload: any) => payload.slug === UPSTREAM))
+        .toEqual([expect.objectContaining({ reason: expect.stringMatching(/no commits between acme\/widgets:main and jane:tavya\//) })]);
     } finally {
       await profiles.delete('github');
     }

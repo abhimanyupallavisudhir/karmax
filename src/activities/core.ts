@@ -89,6 +89,7 @@ import {
   GithubPrApi,
   githubSlug,
   upstreamPullRequestUrl,
+  refusedAsEmpty,
   type GithubPrActor,
   type GithubPrApiOptions,
   type GithubPullRequest,
@@ -5639,11 +5640,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (error instanceof GithubApiError && error.status === 404 && api.actor)
             throw repositoryAccessFailure(api.actor, slug,
               api.actor.invitationUrl ? [] : await requestRepositoryAccess(handle, api.actor, slug));
-          // GitHub decides what the PR would contain. The local count can only
-          // overstate it (a fetch older than GitHub's target), never hide work,
-          // so its refusal of an empty proposal is a skip, not a failure.
-          if (!(error instanceof GithubApiError && error.status === 422 && /no commits between/i.test(error.message)))
-            throw error;
+          if (!refusedAsEmpty(error)) throw error;
           (await record(handle.id, 'pr.skipped', { repo: repo.name, reason: `GitHub has no commits between ${base} and ${repo.branch}` }));
           continue;
         }
@@ -5713,7 +5710,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         let pr = await api.findByHead(slug, repo.branch, headOwner);
         if (pr?.merged) pr = undefined;
         if (!pr && canWrite) {
-          const opening = await api.openOrUpdate(slug, { head: repo.branch, base, title, body, headOwner });
+          // The fork's copy of the base is synced only at Setup, so the
+          // upstream may already have these commits.
+          const opening = await api.openOrUpdate(slug, { head: repo.branch, base, title, body, headOwner })
+            .catch((error) => { if (refusedAsEmpty(error)) return undefined; throw error; });
+          if (!opening) {
+            (await record(handle.id, 'pr.skipped', { repo: repo.name, slug,
+              reason: `GitHub has no commits between ${slug}:${base} and ${headOwner}:${repo.branch}` }));
+            continue;
+          }
           pr = opening.pr;
           (await record(handle.id, opening.created ? 'pr.opened' : 'pr.updated',
             { ...upstreamRef(repo.name, slug, headRepository!, pr), base, branch: repo.branch }));
