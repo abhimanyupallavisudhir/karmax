@@ -13,6 +13,10 @@ import { Overlays } from '../src/store/overlays.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { generateVapidKeys } from '../src/collaboration/web-push.js';
+import crypto from 'node:crypto';
+import { CredentialBroker } from '../src/autonomy/broker.js';
+import { Vault } from '../src/autonomy/vault.js';
+import { NativePush } from '../src/collaboration/native-push.js';
 
 /**
  * A person's push subscriptions (wiki features/push-and-voice): one per device,
@@ -32,6 +36,11 @@ describe('push subscriptions through the gateway', () => {
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
     return { status: response.status, body: await response.json().catch(() => null) as any };
   };
+  // The installation's Firebase key, and Google's token endpoint accepting it (wiki features/phone-apps).
+  const firebaseKey = JSON.stringify({ type: 'service_account', project_id: 'tavya-push', client_email: 'push@tavya-push.iam.gserviceaccount.com',
+    private_key: crypto.generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs8', format: 'pem' }).toString() });
+  const googleFetch = (async () => Response.json({ access_token: 'ya29.t', expires_in: 3600 })) as unknown as typeof fetch;
+  let nativePush: NativePush;
   const keys = { p256dh: 'BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4', auth: 'BTBZMqHH6r4Tts7J_aSIgg' };
 
   /** A token that speaks for `userId`: an agent acting under that person's delegation. */
@@ -46,11 +55,12 @@ describe('push subscriptions through the gateway', () => {
     home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-push-'));
     fs.copyFileSync(new URL('../web/index.html', import.meta.url), path.join(home, 'index.html'));
     store = await Store.create(':memory:');
+    nativePush = new NativePush({ broker: new CredentialBroker(new Vault(path.join(home, 'vault'))), fetcher: googleFetch });
     const gateway = await Gateway.create({
       store, bus: new KarmaxBus(), tokens, contributions: new ContributionRegistry(), overlays: new Overlays(),
       client: {} as any, api: {} as any, taskQueue: 'test', staticDir: home,
       agentInfo: { provider: 'mock', reason: 'push test' }, worlds: new WorldRegistry(),
-      pushKeys: async () => vapid, deliveryChannels: ['browser', 'push'],
+      pushKeys: async () => vapid, nativePush, deliveryChannels: ['browser', 'push'],
     } as any);
     const running = await gateway.listen(await findFreePortFrom(48_700));
     base = running.url;
@@ -123,5 +133,40 @@ describe('push subscriptions through the gateway', () => {
     expect(saved.status).toBe(200);
     expect(saved.body.pushUrgencies).toEqual({ low: false, normal: true, high: true, critical: true });
     expect((await call('alice', 'PUT', `/api/inbox/preferences?organizationId=${org.id}`, { pushUrgencies: { urgent: true } })).status).toBe(400);
+  });
+
+  it('registers a phone app only once the installation has a Firebase key, and never reads its token back', async () => {
+    const meta = async () => ((await (await fetch(`${base}/api/meta`)).json()) as { nativePush?: boolean }).nativePush;
+    const phone = { kind: 'fcm', token: 'f'.repeat(40) + ':APA91b-alice', platform: 'android', label: 'tavya on Android' };
+    expect(await meta()).toBe(false);
+    expect((await call('alice', 'POST', '/api/user/push-subscriptions', phone)).status).toBe(409);
+
+    // An installation operator sets the key (this test's people hold every capability, so the binding is checked directly).
+    expect(routeCapability('PUT', '/api/settings/native-push')).toBe('settings:write');
+    expect(routeCapability('GET', '/api/settings/native-push')).toBe('settings:read');
+    expect((await call('robot', 'PUT', '/api/settings/native-push', { serviceAccount: '{"type":"service_account"}' })).status).toBe(400);
+    const saved = await call('robot', 'PUT', '/api/settings/native-push', { serviceAccount: firebaseKey });
+    expect(saved).toEqual({ status: 200, body: { configured: true, projectId: 'tavya-push', clientEmail: 'push@tavya-push.iam.gserviceaccount.com' } });
+    expect(JSON.stringify((await call('robot', 'GET', '/api/settings/native-push')).body)).not.toContain('PRIVATE KEY');
+    expect(await meta()).toBe(true);
+
+    const added = await call('alice', 'POST', '/api/user/push-subscriptions', phone);
+    expect(added.status).toBe(200);
+    expect(added.body).toEqual({ id: expect.any(String), kind: 'fcm', platform: 'android', label: 'tavya on Android', createdAt: expect.any(Number) });
+    for (const body of [{ ...phone, token: 'short' }, { ...phone, platform: 'windows' }, { ...phone, kind: 'carrier-pigeon' }])
+      expect((await call('alice', 'POST', '/api/user/push-subscriptions', body)).status, JSON.stringify(body)).toBe(400);
+
+    // Its token rotated: the new one replaces the old row, still Alice's alone.
+    const rotated = await call('alice', 'POST', '/api/user/push-subscriptions', { ...phone, token: 'g'.repeat(40), replaces: added.body.id });
+    const alices = (await call('alice', 'GET', '/api/user/push-subscriptions')).body;
+    expect(alices.filter((device: any) => device.kind === 'fcm').map((device: any) => device.id)).toEqual([rotated.body.id]);
+    expect(JSON.stringify(alices)).not.toContain('g'.repeat(40));
+    expect((await call('bob', 'GET', '/api/user/push-subscriptions')).body.some((device: any) => device.kind === 'fcm')).toBe(false);
+    expect((await call('bob', 'DELETE', `/api/user/push-subscriptions/${rotated.body.id}`)).status).toBe(404);
+
+    // Removing the key: the app's switch goes away, registration is refused again.
+    expect((await call('robot', 'DELETE', '/api/settings/native-push')).body).toEqual({ configured: false });
+    expect(await meta()).toBe(false);
+    expect((await call('alice', 'POST', '/api/user/push-subscriptions', phone)).status).toBe(409);
   });
 });

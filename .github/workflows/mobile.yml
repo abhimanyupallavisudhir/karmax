@@ -1,0 +1,387 @@
+name: Mobile
+
+# Native shells for Android and iOS (mobile/, Capacitor). Every push/PR that
+# touches mobile/ builds the Android debug APK; the iOS simulator build runs only
+# when iOS-relevant files changed (macOS minutes are the expensive ones) or on a
+# manual run. A manual run with `release` publishes to Play internal testing and
+# TestFlight, each job skipping with a notice while its secrets are missing.
+# Secrets and where they come from: mobile/README.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Publish (Play internal testing + TestFlight)
+        type: boolean
+        default: false
+      server_url:
+        description: Console URL the app loads (TAVYA_URL)
+        type: string
+        default: https://tavya.io
+      play_status:
+        description: Play release status (draft until the app's first release is rolled out in the Play Console)
+        type: choice
+        options: [completed, draft]
+        default: completed
+  push:
+    # Branches are covered by their pull request run.
+    branches: [master]
+    paths: ['mobile/**', '.github/workflows/mobile.yml']
+  pull_request:
+    paths: ['mobile/**', '.github/workflows/mobile.yml']
+
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes the running build. Manual runs (which
+# may be uploading a release) are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+env:
+  # Read by mobile/capacitor.config.ts at `cap sync` (https only, except a LAN dev server).
+  TAVYA_URL: ${{ inputs.server_url || 'https://tavya.io' }}
+  NODE_VERSION: '22'
+  JAVA_VERSION: '21'
+  # Added to github.run_number for the Android versionCode, so CI builds always
+  # outnumber anything uploaded by hand (Play requires a new, higher code each upload).
+  ANDROID_VERSION_CODE_OFFSET: '1000'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  changes:
+    name: what changed
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      ios: ${{ steps.filter.outputs.ios }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            ios:
+              - 'mobile/ios/**'
+              - 'mobile/package.json'
+              - 'mobile/package-lock.json'
+              - 'mobile/capacitor.config.ts'
+              - '.github/workflows/mobile.yml'
+
+  android:
+    name: android (debug APK)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+          cache-dependency-path: |
+            mobile/android/**/*.gradle*
+            mobile/android/gradle/wrapper/gradle-wrapper.properties
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - run: npm ci
+      - run: npx cap sync android
+      - name: Add google-services.json (push), if configured
+        env:
+          ANDROID_GOOGLE_SERVICES_JSON: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -n "$ANDROID_GOOGLE_SERVICES_JSON" ]; then
+            printf '%s' "$ANDROID_GOOGLE_SERVICES_JSON" | base64 -d > android/app/google-services.json
+          else
+            echo "::notice title=No Firebase config::ANDROID_GOOGLE_SERVICES_JSON is not set; this APK builds without push."
+          fi
+      - name: Build debug APK
+        working-directory: mobile/android
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tavya-debug-apk
+          path: mobile/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  ios:
+    name: ios (simulator build)
+    needs: changes
+    # `changes` is skipped on manual runs, so don't let that skip this job.
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.ios == 'true') }}
+    runs-on: macos-26
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - run: npm ci
+      # Swift Package Manager project (Capacitor 8 default): no CocoaPods step.
+      - run: npx cap sync ios
+      - run: xcodebuild -version
+      - name: Build for the simulator
+        working-directory: mobile/ios/App
+        run: |
+          xcodebuild -project App.xcodeproj -scheme App \
+            -sdk iphonesimulator -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            build CODE_SIGNING_ALLOWED=NO
+
+  android-release:
+    name: android release (Play internal testing)
+    needs: android
+    if: github.event_name == 'workflow_dispatch' && inputs.release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - name: Check release secrets
+        id: secrets
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          ANDROID_GOOGLE_SERVICES_JSON: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON }}
+        working-directory: .
+        run: |
+          missing=()
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS \
+                      ANDROID_KEY_PASSWORD PLAY_SERVICE_ACCOUNT_JSON ANDROID_GOOGLE_SERVICES_JSON; do
+            if [ -z "${!name}" ]; then missing+=("$name"); fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::notice title=Android release skipped::Missing secrets: ${missing[*]} (see mobile/README.md)"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.secrets.outputs.ready == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: steps.secrets.outputs.ready == 'true'
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+      - if: steps.secrets.outputs.ready == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - if: steps.secrets.outputs.ready == 'true'
+        run: npm ci
+      - if: steps.secrets.outputs.ready == 'true'
+        run: npx cap sync android
+      - name: Write signing key and Firebase config
+        if: steps.secrets.outputs.ready == 'true'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_GOOGLE_SERVICES_JSON: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON }}
+        run: |
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/upload.jks"
+          printf '%s' "$ANDROID_GOOGLE_SERVICES_JSON" | base64 -d > android/app/google-services.json
+      - name: Build signed release bundle
+        if: steps.secrets.outputs.ready == 'true'
+        working-directory: mobile/android
+        env:
+          # Read by mobile/android/app/build.gradle (signingConfigs.release, versionCode).
+          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/upload.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          TAVYA_VERSION_CODE=$((RUN_NUMBER + ANDROID_VERSION_CODE_OFFSET))
+          export TAVYA_VERSION_CODE
+          echo "versionCode $TAVYA_VERSION_CODE, versionName $(node -p "require('../package.json').version")"
+          ./gradlew bundleRelease --no-daemon --stacktrace
+          "$JAVA_HOME/bin/jarsigner" -verify app/build/outputs/bundle/release/app-release.aab
+      - if: steps.secrets.outputs.ready == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tavya-release-aab
+          path: mobile/android/app/build/outputs/bundle/release/app-release.aab
+          if-no-files-found: error
+      # r0adkll/upload-google-play over fastlane supply: one pinned JavaScript
+      # action calling the Play Developer API directly, no Ruby/Bundler toolchain
+      # or Fastfile to maintain for a single upload to one track.
+      # Google requires the very first upload of a new app to be made by hand in
+      # the Play Console (it creates the app and enrols Play App Signing); the API
+      # can only add later releases. Until the app's first release is rolled out,
+      # Play accepts only `draft` releases: run with play_status=draft then.
+      - name: Upload to Play internal testing
+        if: steps.secrets.outputs.ready == 'true'
+        uses: r0adkll/upload-google-play@e738b9dd8f2476ea806d921b64aacd24f34515a5 # v1.1.5
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: io.tavya.app
+          releaseFiles: mobile/android/app/build/outputs/bundle/release/app-release.aab
+          track: internal
+          status: ${{ inputs.play_status }}
+      - name: Remove signing key
+        if: always()
+        working-directory: .
+        run: rm -f "$RUNNER_TEMP/upload.jks"
+
+  ios-release:
+    name: ios release (TestFlight)
+    needs: ios
+    if: github.event_name == 'workflow_dispatch' && inputs.release
+    runs-on: macos-26
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - name: Check release secrets
+        id: secrets
+        env:
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+          APPSTORE_API_KEY_P8: ${{ secrets.APPSTORE_API_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          IOS_GOOGLE_SERVICE_INFO_PLIST: ${{ secrets.IOS_GOOGLE_SERVICE_INFO_PLIST }}
+        working-directory: .
+        run: |
+          missing=()
+          for name in APPSTORE_API_KEY_ID APPSTORE_API_ISSUER_ID APPSTORE_API_KEY_P8 \
+                      APPLE_TEAM_ID IOS_GOOGLE_SERVICE_INFO_PLIST; do
+            if [ -z "${!name}" ]; then missing+=("$name"); fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::notice title=iOS release skipped::Missing secrets: ${missing[*]} (see mobile/README.md)"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.secrets.outputs.ready == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: steps.secrets.outputs.ready == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - if: steps.secrets.outputs.ready == 'true'
+        run: npm ci
+      - if: steps.secrets.outputs.ready == 'true'
+        run: npx cap sync ios
+      - name: Write API key, Firebase config and export options
+        if: steps.secrets.outputs.ready == 'true'
+        env:
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_API_KEY_P8: ${{ secrets.APPSTORE_API_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          IOS_GOOGLE_SERVICE_INFO_PLIST: ${{ secrets.IOS_GOOGLE_SERVICE_INFO_PLIST }}
+        run: |
+          key="$RUNNER_TEMP/AuthKey_${APPSTORE_API_KEY_ID}.p8"
+          printf '%s' "$APPSTORE_API_KEY_P8" | base64 -d > "$key"
+          echo "API_KEY_PATH=$key" >> "$GITHUB_ENV"
+          # AppDelegate configures Firebase from the bundled Firebase folder.
+          printf '%s' "$IOS_GOOGLE_SERVICE_INFO_PLIST" | base64 -d > ios/App/App/Firebase/GoogleService-Info.plist
+          cp ios/ExportOptions.plist "$RUNNER_TEMP/ExportOptions.plist"
+          plutil -replace teamID -string "$APPLE_TEAM_ID" "$RUNNER_TEMP/ExportOptions.plist"
+          echo "MARKETING_VERSION=$(node -p "require('./package.json').version")" >> "$GITHUB_ENV"
+      # Automatic signing with cloud-managed certificates: the API key lets
+      # xcodebuild create the distribution certificate and profiles itself, so
+      # no certificate or profile is stored anywhere. The key needs the Admin
+      # role for cloud-managed distribution signing.
+      - name: Archive
+        if: steps.secrets.outputs.ready == 'true'
+        working-directory: mobile/ios/App
+        env:
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          xcodebuild archive -project App.xcodeproj -scheme App \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$API_KEY_PATH" \
+            -authenticationKeyID "$APPSTORE_API_KEY_ID" \
+            -authenticationKeyIssuerID "$APPSTORE_API_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Automatic \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" MARKETING_VERSION="$MARKETING_VERSION"
+      - name: Export IPA
+        if: steps.secrets.outputs.ready == 'true'
+        env:
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$API_KEY_PATH" \
+            -authenticationKeyID "$APPSTORE_API_KEY_ID" \
+            -authenticationKeyIssuerID "$APPSTORE_API_ISSUER_ID"
+          ls -l "$RUNNER_TEMP/export"
+      - if: steps.secrets.outputs.ready == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tavya-ipa
+          path: ${{ runner.temp }}/export/*.ipa
+          if-no-files-found: error
+      # Upload with the same export, destination=upload: xcodebuild sends the
+      # build to App Store Connect (TestFlight) with the API key. Chosen over
+      # `xcrun altool --upload-app`, which Apple marks deprecated, and its
+      # replacement `--upload-package`, which also needs the app's numeric Apple
+      # ID. notarytool only notarizes macOS software; it can't upload apps.
+      # The App Store Connect app record for io.tavya.app must exist first.
+      - name: Upload to TestFlight
+        if: steps.secrets.outputs.ready == 'true'
+        env:
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+        run: |
+          plutil -replace destination -string upload "$RUNNER_TEMP/ExportOptions.plist"
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportPath "$RUNNER_TEMP/upload" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$API_KEY_PATH" \
+            -authenticationKeyID "$APPSTORE_API_KEY_ID" \
+            -authenticationKeyIssuerID "$APPSTORE_API_ISSUER_ID"
+      - name: Remove API key
+        if: always()
+        working-directory: .
+        run: rm -f "$RUNNER_TEMP"/AuthKey_*.p8

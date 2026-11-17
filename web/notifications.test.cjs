@@ -46,6 +46,8 @@ eval(extractConst('SERVER_BEHAVIOURS', ';').replace('const SERVER_BEHAVIOURS =',
 // This browser can receive push when the test says so (navigator.serviceWorker + PushManager in a real one).
 let pushHere = false;
 global.pushSupported = () => pushHere;
+// A browser, not the phone app (wiki features/phone-apps).
+global.nativeApp = () => false;
 for (const name of ['urgencyRank', 'notifyPrefs', 'setNotifyPref', 'inboxArrivals', 'announceInbox',
   'notificationSoundPrefs', 'siteName', 'showSystemNotification', 'unlockNotificationAudio', 'inboxEventChanges', 'playNotificationSound', 'inboxRowLabel', 'inboxTitle', 'policyTip', 'notificationsCard']) eval(extractFn(name));
 

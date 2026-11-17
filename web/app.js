@@ -4812,6 +4812,8 @@ async function boot() {
   // create an account — with the address the invite was sent to.
   S.pendingInvite = location.pathname === '/invite' && !!new URLSearchParams(location.search).get('token');
   if (session.authRequired && !session.authenticated && !session.token) {
+    // The phone app signs in through the system browser (wiki features/phone-apps).
+    if (nativeApp()) return renderAppSignIn();
     // The public root explains the product before asking for an account. Auth
     // callbacks, invitations and explicit auth routes still land directly on
     // the form they need, so a person following a link never has to hunt.
@@ -4825,6 +4827,7 @@ async function boot() {
     history.replaceState({ kx: 1 }, '', '/');
   S.token = session.token || null; // Better Auth uses an HttpOnly same-origin cookie.
   S.user = session.user || null;
+  wireNativeApp().catch(() => {});
   if (location.pathname === '/mcp-callback') return finishMcpCallback();
   if (location.pathname === '/device') return renderDeviceApproval();
   if (location.pathname === '/oauth/consent') return renderOAuthConsent();
@@ -14235,7 +14238,7 @@ function renderAgentMessageBody(text, v = S.view, math = mathjaxEnabled(), form 
 // secret field of a secret store, as a whole value: a secret typed into a form
 // is never shown in the conversation, kept in its history or read back.
 const FORM_BLOCK = /<pre class="md-code lang-form"><code>([\s\S]*?)<\/code><\/pre>/g;
-const SECRET_FIELD_KEY = /^(?:value|secret|secrets|key|apiKey|api_key|token|password|clientSecret|privateKey|totp)$/i;
+const SECRET_FIELD_KEY = /^(?:value|secret|secrets|key|apiKey|api_key|token|password|clientSecret|privateKey|totp|serviceAccount)$/i;
 // [method, path, what it is (from the path's ids and the body), a secret store?]
 const SETTINGS_TARGETS = [
   ['POST', /^\/api\/projects\/([^/]+)\/secrets$/, (m, b) => `${formLiteral(b.name) ? `${b.name} · ` : ''}${formProjectName(m[1])} secrets`, true],
@@ -14243,6 +14246,7 @@ const SETTINGS_TARGETS = [
   ['PATCH', /^\/api\/projects\/([^/]+)$/, (m) => `${formProjectName(m[1])} settings`],
   ['PUT', /^\/api\/settings\/project\/([^/]+)\/[^/]+$/, (m) => `${formProjectName(m[1])} task defaults`],
   ['PUT', /^\/api\/settings\/managed-compute\/([^/]+)$/, (m) => `Managed compute · ${formProviderName(m[1])}`, true],
+  ['PUT', /^\/api\/settings\/native-push$/, () => 'Phone apps · Firebase key', true],
   ['PUT', /^\/api\/settings\/[\w/-]+$/, () => 'Installation settings'],
   ['PATCH', /^\/api\/organizations\/([^/]+)$/, (m) => `${formOrganizationName(m[1])} settings`],
   ['POST', /^\/api\/organizations\/([^/]+)\/accounts$/, (m) => `${formOrganizationName(m[1])} agent accounts`, true],
@@ -25019,6 +25023,66 @@ function wireInboxNotices() {
   });
 }
 
+// ── the phone apps (wiki features/phone-apps) ────────────────────────────────
+// The Android and iOS apps (mobile/) are this console in a WebView, plus what
+// a website does badly on a phone: speech recognition, push and the sign-in.
+// Their native code reaches the page as window.Capacitor; nothing here is
+// bundled into the app, so the console stays one codebase.
+function nativeApp() {
+  try { return typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.() === true; } catch { return false; }
+}
+function nativePlugin(name) {
+  if (!nativeApp()) return null;
+  const cap = window.Capacitor;
+  if (cap.isPluginAvailable && !cap.isPluginAvailable(name)) return null;
+  return cap.Plugins?.[name] || null;
+}
+function nativePlatform() { return nativeApp() ? window.Capacitor.getPlatform?.() || '' : ''; }
+
+// The platform's speech recognizer behind the browser's SpeechRecognition
+// interface, so dictation (toggleDictation) is the same code in a browser and
+// in the app. Android ends it after a pause, like the browser; iOS keeps
+// listening, so a pause after words ends it here.
+const NATIVE_SPEECH_PAUSE_MS = 2000;
+function nativeRecognitionClass() {
+  const plugin = nativePlugin('SpeechRecognition');
+  if (!plugin) return null;
+  return class NativeSpeechRecognition {
+    constructor() { this.lang = 'en-US'; this.interimResults = true; this.continuous = false; this.onresult = this.onerror = this.onend = null; this.listeners = []; }
+    start() {
+      this.run().catch((error) => {
+        if (this.ended) return;
+        const text = String(error?.message || error || '');
+        this.onerror?.({ error: error?.error || (/permission|denied|not allowed/i.test(text) ? 'not-allowed' : 'aborted'), message: text });
+        this.finish();
+      });
+    }
+    async run() {
+      let permission = await plugin.checkPermissions();
+      if (permission.speechRecognition !== 'granted') permission = await plugin.requestPermissions();
+      if (permission.speechRecognition !== 'granted') throw { error: 'not-allowed' };
+      this.listeners.push(await plugin.addListener('partialResults', ({ matches }) => {
+        if (this.ended || typeof matches?.[0] !== 'string') return;
+        this.onresult?.({ results: [[{ transcript: matches[0] }]] });
+        clearTimeout(this.pause);
+        if (!this.continuous) this.pause = setTimeout(() => this.stop(), NATIVE_SPEECH_PAUSE_MS);
+      }));
+      this.listeners.push(await plugin.addListener('listeningState', ({ status }) => { if (status === 'stopped') this.finish(); }));
+      // Stopped while asking for permission: nothing is left listening.
+      if (this.ended) { for (const listener of this.listeners) listener?.remove?.(); return; }
+      await plugin.start({ language: this.lang, partialResults: this.interimResults, popup: false, maxResults: 1 });
+    }
+    stop() { if (this.ended) return; plugin.stop().catch(() => {}); this.finish(); }
+    finish() {
+      if (this.ended) return;
+      this.ended = true;
+      clearTimeout(this.pause);
+      for (const listener of this.listeners) listener?.remove?.();
+      this.onend?.();
+    }
+  };
+}
+
 // ── voice input (wiki features/push-and-voice) ──────────────────────────────
 // A mic in a prompt field's bottom row: the browser's speech recognition types
 // into the field (interim words as they come), where they can be edited before
@@ -25026,7 +25090,10 @@ function wireInboxNotices() {
 // speech, typing or Esc stops it. Absent where the browser has no recognition.
 // Any prompt field gets one with micButtonHtml(key) in its `.prompt-attach-row`.
 function speechRecognitionClass() {
-  return typeof window === 'undefined' ? null : (window.SpeechRecognition || window.webkitSpeechRecognition || null);
+  if (typeof window === 'undefined') return null;
+  // In the phone app the platform's recognizer (the Android WebView has none of its own).
+  if (nativeApp()) return nativeRecognitionClass();
+  return window.SpeechRecognition || window.webkitSpeechRecognition || null;
 }
 function micButtonHtml(key) {
   if (typeof speechRecognitionClass() !== 'function') return '';
@@ -25079,7 +25146,8 @@ function toggleDictation(key) {
     write(state.heard);
   };
   recognition.onerror = (event) => {
-    const message = { 'not-allowed': 'Allow the microphone for this site to dictate.', 'service-not-allowed': 'Allow the microphone for this site to dictate.',
+    const blocked = nativeApp() ? `Allow the microphone and speech recognition for ${siteName()} in your phone’s settings to dictate.` : 'Allow the microphone for this site to dictate.';
+    const message = { 'not-allowed': blocked, 'service-not-allowed': blocked,
       'audio-capture': 'No microphone found.', network: 'Dictation needs a connection.' }[event.error];
     if (message) toast(message, true);
   };
@@ -25141,12 +25209,15 @@ if (typeof document !== 'undefined') document.addEventListener('keydown', (event
 // device a person turned push on for. Turning it on asks for the browser's
 // permission then, never before.
 function pushSupported() {
+  // In the phone app: native push, once the installation has its Firebase key (never a switch that cannot work).
+  if (nativeApp()) return !!S.meta?.nativePush && !!nativePlugin('PushNotifications');
   return typeof navigator !== 'undefined' && 'serviceWorker' in navigator && typeof window.PushManager !== 'undefined'
     && typeof Notification !== 'undefined' && !!S.meta?.deliveryChannels?.includes('push');
 }
 // "Chrome on Android": what a person recognises a device by in their list.
 function deviceLabel() {
   const ua = navigator.userAgent || '';
+  if (nativeApp()) return `${siteName()} on ${nativePlatform() === 'ios' ? (/iPad/.test(ua) ? 'iPad' : 'iPhone') : 'Android'}`;
   const browser = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Firefox\//.test(ua) ? 'Firefox'
     : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'Browser';
   const os = /Android/.test(ua) ? 'Android' : /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : /Mac OS X|Macintosh/.test(ua) ? 'Mac'
@@ -25164,11 +25235,13 @@ function madeWithKey(subscription, publicKey) {
 }
 // This browser's subscription, if it is one of the person's devices on the server and can carry our pushes.
 async function thisPushDevice(devices) {
+  if (nativeApp()) return devices.find((entry) => entry.id === nativePushDeviceId()) || null;
   const subscription = await (await pushRegistration())?.pushManager.getSubscription();
   const device = subscription && devices.find((entry) => entry.endpoint === subscription.endpoint);
   return device && madeWithKey(subscription, (await api('/api/push/key')).publicKey) ? device : null;
 }
 async function enablePush() {
+  if (nativeApp()) return enableNativePush();
   if (await Notification.requestPermission() !== 'granted') throw new Error('Allow notifications for this site to turn push on.');
   const { publicKey } = await api('/api/push/key');
   const registration = await pushRegistration();
@@ -25179,6 +25252,7 @@ async function enablePush() {
   return api('/api/user/push-subscriptions', { method: 'POST', body: JSON.stringify({ ...subscription.toJSON(), label: deviceLabel() }) });
 }
 async function disablePush(devices) {
+  if (nativeApp()) return disableNativePush();
   const subscription = await (await pushRegistration())?.pushManager.getSubscription();
   const device = subscription && devices.find((entry) => entry.endpoint === subscription.endpoint);
   if (device) await api(`/api/user/push-subscriptions/${encodeURIComponent(device.id)}`, { method: 'DELETE' });
@@ -25186,6 +25260,7 @@ async function disablePush(devices) {
 }
 // Signing out stops this device receiving that person's pushes (a shared computer).
 async function forgetPushDevice() {
+  if (nativeApp()) return disableNativePush().catch(() => {});
   if (!pushSupported()) return;
   try {
     const subscription = await (await navigator.serviceWorker.getRegistration())?.pushManager.getSubscription();
@@ -25195,21 +25270,125 @@ async function forgetPushDevice() {
     await subscription.unsubscribe();
   } catch {}
 }
-// A tapped push opens its page in this console, in place (web/service-worker.js).
+// A tapped push opens its page in this console, in place (web/service-worker.js; the app's own listener below).
+function openPushedUrl(path) {
+  try {
+    const url = new URL(path, location.origin);
+    if (url.origin === location.origin) go(`${url.pathname}${url.search}${url.hash}`);
+  } catch {}
+}
 if (typeof navigator !== 'undefined' && navigator.serviceWorker?.addEventListener)
   navigator.serviceWorker.addEventListener('message', (event) => {
-    if (event.data?.type !== 'push-open') return;
-    try {
-      const url = new URL(event.data.url, location.origin);
-      if (url.origin === location.origin) go(`${url.pathname}${url.search}${url.hash}`);
-    } catch {}
+    if (event.data?.type === 'push-open') openPushedUrl(event.data.url);
   });
-function pushDevicesHtml(devices, current) {
+
+// Native push in the phone app: FCM (APNs through FCM on iOS). The device's id
+// is kept here, since its FCM token is never read back from the server.
+const NATIVE_PUSH_DEVICE = 'karmax-native-push-device';
+function nativePushDeviceId() { try { return localStorage.getItem(NATIVE_PUSH_DEVICE) || ''; } catch { return ''; } }
+async function nativePushBlocked() {
+  return (await nativePlugin('PushNotifications')?.checkPermissions().catch(() => null))?.receive === 'denied';
+}
+// Register with FCM and resolve its token (the plugin answers with an event).
+function nativePushToken(plugin) {
+  return new Promise((resolve, reject) => {
+    let settled = false, handles = [];
+    const done = (settle, value) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      for (const handle of handles) handle?.remove?.();
+      settle(value);
+    };
+    const timer = setTimeout(() => done(reject, new Error('The phone did not answer; try again.')), 20_000);
+    Promise.all([plugin.addListener('registration', ({ value }) => done(resolve, value)),
+      plugin.addListener('registrationError', ({ error }) => done(reject, new Error(error || 'This phone could not register for push.')))])
+      .then((added) => { handles = added; if (settled) added.forEach((handle) => handle?.remove?.()); else return plugin.register(); })
+      .catch((error) => done(reject, error));
+  });
+}
+async function enableNativePush() {
+  const plugin = nativePlugin('PushNotifications');
+  let permission = await plugin.checkPermissions();
+  if (permission.receive !== 'granted' && permission.receive !== 'denied') permission = await plugin.requestPermissions();
+  if (permission.receive !== 'granted') throw new Error(`Allow notifications for ${siteName()} in your phone’s settings to turn push on.`);
+  const token = await nativePushToken(plugin);
+  const previous = nativePushDeviceId();
+  const device = await api('/api/user/push-subscriptions', { method: 'POST', body: JSON.stringify({ kind: 'fcm', token,
+    platform: nativePlatform() === 'ios' ? 'ios' : 'android', label: deviceLabel(), ...(previous ? { replaces: previous } : {}) }) });
+  try { localStorage.setItem(NATIVE_PUSH_DEVICE, device.id); } catch {}
+  return device;
+}
+async function disableNativePush() {
+  const id = nativePushDeviceId();
+  try { localStorage.removeItem(NATIVE_PUSH_DEVICE); } catch {}
+  if (id) await api(`/api/user/push-subscriptions/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch((error) => { if (error.status !== 404) throw error; });
+  await nativePlugin('PushNotifications')?.unregister().catch(() => {});
+}
+
+// Once per app start, signed in: a tapped notification opens its page, and a
+// phone with push on registers again, so a rotated FCM token replaces the old one.
+let nativeAppWired = false;
+async function wireNativeApp() {
+  if (nativeAppWired || !nativeApp()) return;
+  nativeAppWired = true;
+  const push = nativePlugin('PushNotifications');
+  if (!push) return;
+  await push.addListener('pushNotificationActionPerformed', ({ notification }) => openPushedUrl(notification?.data?.url));
+  if (S.meta?.nativePush && nativePushDeviceId() && (await push.checkPermissions()).receive === 'granted')
+    await enableNativePush().catch(() => {});
+}
+
+// Signing the app in: the system browser (Google and GitHub refuse sign-in
+// inside an app's WebView) runs the authorization code flow with PKCE for the
+// first-party client tavya-app and returns to io.tavya.app://signed-in; this
+// page then trades the code for its own session cookie (POST /oauth/app-session).
+const APP_CLIENT_ID = 'tavya-app';
+const APP_REDIRECT_URI = 'io.tavya.app://signed-in';
+function renderAppSignIn(error = '') {
+  document.body.classList.remove('landing-active');
+  document.title = `Sign in · ${siteName()}`;
+  $('#app').innerHTML = `<div class="login-wrap"><div class="login-card app-sign-in">
+    <div class="brand auth-brand">${brandMark()} ${siteNameMarkup()}</div>
+    <button class="btn primary" id="app-sign-in" type="button" title="Opens your browser. New here? Create your account there.">Sign in</button>
+    <p class="auth-err" id="app-sign-in-err" role="alert">${esc(error)}</p>
+  </div></div>`;
+  $('#app-sign-in').addEventListener('click', async (event) => {
+    event.currentTarget.disabled = true;
+    try { await appSignIn(); }
+    catch (error) { renderAppSignIn(plainError(error)); }
+  });
+}
+async function appSignIn() {
+  const random = (bytes) => base64url(crypto.getRandomValues(new Uint8Array(bytes)));
+  const verifier = random(32), state = random(16);
+  const challenge = base64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  const authorize = `${location.origin}/oauth/authorize?${new URLSearchParams({ response_type: 'code', client_id: APP_CLIENT_ID,
+    redirect_uri: APP_REDIRECT_URI, code_challenge: challenge, code_challenge_method: 'S256', state })}`;
+  let back;
+  try { back = new URL((await nativePlugin('TavyaSignIn').open({ url: authorize, callbackScheme: 'io.tavya.app' })).url); }
+  catch (error) {
+    if (error?.code === 'cancelled') return renderAppSignIn();
+    throw error;
+  }
+  // The answer must be to this attempt, from this installation (RFC 9207).
+  if (back.searchParams.get('state') !== state || (back.searchParams.get('iss') && back.searchParams.get('iss') !== location.origin))
+    throw new Error('That sign-in was for another attempt. Try again.');
+  if (back.searchParams.get('error')) {
+    if (back.searchParams.get('error') === 'access_denied') return renderAppSignIn();
+    throw new Error(back.searchParams.get('error_description') || 'Sign-in failed. Try again.');
+  }
+  const response = await fetch('/oauth/app-session', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ client_id: APP_CLIENT_ID, code: back.searchParams.get('code') || '', code_verifier: verifier,
+      redirect_uri: APP_REDIRECT_URI, name: deviceLabel() }) });
+  if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error_description || 'Sign-in failed. Try again.');
+  return boot();
+}
+function pushDevicesHtml(devices, current, blocked = false) {
   const others = devices.filter((device) => device.id !== current?.id);
   return `<div class="setting-row" id="push-device-row">
       <span class="setting-label nowrap"><label for="push-this-device">Push to this device</label> ${policyTip('Notifications reach this device even when the app is closed. The Push column chooses which.')}</span>
       <span class="setting-value"></span>
-      <span class="setting-actions"><input class="toggle" type="checkbox" id="push-this-device" ${current ? 'checked' : ''} ${Notification.permission === 'denied' ? 'disabled title="Notifications are blocked in this browser’s site settings."' : ''}/></span>
+      <span class="setting-actions"><input class="toggle" type="checkbox" id="push-this-device" ${current ? 'checked' : ''} ${blocked ? `disabled title="${esc(nativeApp() ? `Notifications are off for ${siteName()} in this phone’s settings.` : 'Notifications are blocked in this browser’s site settings.')}"` : ''}/></span>
     </div>${others.map((device) => `<div class="setting-row push-device">
       <span class="setting-label">${esc(device.label || 'Device')}</span>
       <span class="setting-value setting-muted">${device.lastPushedAt ? `Last push ${esc(fmtAgo(device.lastPushedAt))}` : `Added ${esc(fmtAgo(device.createdAt))}`}</span>
@@ -25223,15 +25402,16 @@ async function wirePushDevices() {
   const paint = async () => {
     devices = await api('/api/user/push-subscriptions');
     const current = await thisPushDevice(devices).catch(() => null);
+    const blocked = nativeApp() ? await nativePushBlocked() : Notification.permission === 'denied';
     if (!slot.isConnected) return;
-    slot.innerHTML = pushDevicesHtml(devices, current);
+    slot.innerHTML = pushDevicesHtml(devices, current, blocked);
     slot.querySelector('#push-this-device')?.addEventListener('change', async (event) => {
       const box = event.target;
       box.disabled = true;
       try { if (box.checked) await enablePush(); else await disablePush(devices); }
       catch (error) { toast(error.message, true); }
       // Granting push granted system notifications too.
-      if (Notification.permission === 'granted') $('#notify-permission')?.remove();
+      if (typeof Notification !== 'undefined' && Notification.permission === 'granted') $('#notify-permission')?.remove();
       await paint().catch((error) => toast(error.message, true));
     });
     slot.querySelectorAll('[data-push-forget]').forEach((button) => button.addEventListener('click', async () => {
@@ -25732,7 +25912,9 @@ function notificationsCard() {
   const sound = notificationSoundPrefs();
   const emailReady = S.meta?.deliveryChannels?.includes('email');
   // Push is a column wherever this installation sends it; the device switch below only where this browser can receive it.
-  const behaviours = NOTIFY_BEHAVIOURS.filter((behaviour) => behaviour.key !== 'push' || S.meta?.deliveryChannels?.includes('push'));
+  // In the phone app, push is offered only once it can reach the phone.
+  const behaviours = NOTIFY_BEHAVIOURS.filter((behaviour) => behaviour.key !== 'push'
+    || (S.meta?.deliveryChannels?.includes('push') && (!nativeApp() || S.meta?.nativePush)));
   const permission = typeof Notification === 'undefined' ? 'unsupported' : Notification.permission;
   const permissionNote = {
     denied: '<p class="notify-note">System notifications are blocked in this browser’s site settings.</p>',
@@ -26401,7 +26583,7 @@ function installationView() {
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections">
       <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-errors">Error reports</a><a href="#installation-limits">Service limits</a><a href="#installation-compute">Managed compute</a><a href="#installation-capacity">Host capacity</a>
-      <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
+      <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a><a href="#installation-phone-apps">Phone apps</a>
       <a href="#installation-access">Phone access</a>${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance</div></div>${appearanceCard()}
@@ -26420,6 +26602,7 @@ function installationView() {
       <div class="settings-section-title" id="installation-paid-launch"><div>Paid launch</div></div>${paidLaunchCard()}
       <div class="settings-section-title" id="installation-stripe"><div>Agent cards ${policyTip(`Optional: the Stripe Connect application behind the cards agents spend from. Not used for plan subscriptions.`)}</div></div>${stripePlatformCard()}
       <div class="settings-section-title" id="installation-email"><div>Email</div></div>${outboundEmailCard()}
+      <div class="settings-section-title" id="installation-phone-apps"><div>Phone apps ${policyTip(`The ${siteName()} apps for Android and iOS`)}</div></div><div class="card" id="native-push-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-access"><div>Phone access ${policyTip(`Open ${siteName()} from your phone over a private Tailscale network`)}</div></div>${phone}
       ${S.meta.hosted ? `<div class="settings-section-title" id="installation-users"><div>Users ${policyTip('Close a person’s account and erase their data. Closing removes sign-in and access, not shared work. Erasure reviews need a documented decision per item; replacing a name is not anonymisation.')}</div></div><div class="card" id="installation-users-card"><span class="task-sub">Loading…</span></div>` : ''}
     </div>
@@ -26497,6 +26680,63 @@ function openIncludedModelDialog(settings, onSaved) {
   document.body.appendChild(overlay);
   overlay.querySelector(settings?.keyConfigured ? '.included-model-id' : '.included-key').focus();
 }
+// ── Phone apps (Installation; wiki features/phone-apps) ─────────────────────
+// Native push needs the service account key of the Firebase project the apps
+// were built with; until it is set, the apps hide their push switch.
+async function wireNativePushCard() {
+  const card = $('#native-push-card');
+  if (!card) return;
+  let view;
+  try { view = await api('/api/settings/native-push'); }
+  catch (error) { if (card.isConnected) paneError(card, error, () => wireNativePushCard()); return; }
+  if (!card.isConnected) return;
+  card.innerHTML = `<div class="setting-rows"><div class="setting-row" id="native-push-row">
+    <span class="setting-label">Push ${policyTip('Notifications on the Android and iOS apps, sent through Firebase Cloud Messaging.')}</span>
+    <span class="setting-value">${view.configured ? `<span class="chip done">On</span> <span class="setting-muted" title="${esc(view.clientEmail || '')}">${esc(view.projectId || '')}</span>` : '<span class="chip">Off</span>'}</span>
+    <span class="setting-actions">${view.configured
+      ? `<button class="btn sm" type="button" data-native-push-edit>Replace key</button><button class="icon-btn" type="button" data-native-push-remove aria-label="Remove the Firebase key" title="Remove the Firebase key">${trashIcon()}</button>`
+      : '<button class="btn sm" type="button" data-native-push-edit>Connect</button>'}</span></div></div>`;
+  card.querySelector('[data-native-push-edit]')?.addEventListener('click', () => openNativePushDialog(wireNativePushCard));
+  card.querySelector('[data-native-push-remove]')?.addEventListener('click', async (event) => {
+    if (!confirm('Remove the Firebase key? Phones stop getting push until a key is set again.')) return;
+    event.currentTarget.disabled = true;
+    try { await api('/api/settings/native-push', { method: 'DELETE' }); toast('Firebase key removed'); }
+    catch (error) { toast(error.message, true); }
+    await wireNativePushCard();
+  });
+}
+function openNativePushDialog(onSaved) {
+  const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-card computer-dialog" role="dialog" aria-modal="true" aria-label="Firebase key">
+    <div class="modal-head"><b>Firebase key</b>${policyTip('Firebase console → Project settings → Service accounts → Generate new private key. Use the project the apps were built with.')}<span class="label-row-fill"></span><button class="icon-btn native-push-close" type="button" aria-label="Close">×</button></div>
+    <div class="settings-grid">
+      <label class="form-row"><span>Service account key</span>
+        <textarea class="secret-textarea native-push-key" rows="5" autocomplete="off" spellcheck="false" placeholder='{"type": "service_account", …}'></textarea></label>
+      <label class="btn sm native-push-file">Choose file<input type="file" accept=".json,application/json" hidden></label></div>
+    <div class="modal-actions"><span class="label-row-fill"></span><button class="btn native-push-cancel" type="button">Cancel</button><button class="btn primary native-push-save" type="button">Save</button></div></div>`;
+  const close = () => { document.removeEventListener('keydown', keydown); overlay.remove(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  const field = overlay.querySelector('.native-push-key');
+  overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  overlay.querySelector('.native-push-close').addEventListener('click', close);
+  overlay.querySelector('.native-push-cancel').addEventListener('click', close);
+  overlay.querySelector('.native-push-file input').addEventListener('change', async (event) => {
+    const file = event.target.files?.[0];
+    if (file) field.value = await file.text();
+  });
+  overlay.querySelector('.native-push-save').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    if (!field.value.trim()) { field.focus(); return; }
+    button.disabled = true;
+    try { await api('/api/settings/native-push', { method: 'PUT', body: JSON.stringify({ serviceAccount: field.value }) }); }
+    catch (error) { toast(error.message, true); button.disabled = false; return; }
+    close(); toast('Push to the apps is on'); onSaved?.();
+  });
+  document.addEventListener('keydown', keydown);
+  document.body.appendChild(overlay);
+  field.focus();
+}
+
 /** "3 of 50 running · 6 of 24 CPU · 400 of 1,024 GB · 2 waiting": what is in use against the account's budget, and its queue. */
 function managedRunning(account) {
   const pool = account.limits?.pool || {};
@@ -26764,8 +27004,9 @@ async function hydratePlanAndBilling(organizationId) {
   const box = $('#org-plan');
   if (!box) return;
   const base = `/api/organizations/${encodeURIComponent(organizationId)}`;
+  // The phone apps sell nothing (App Store 3.1.1, Play's payments policy): the plan and its limits, read-only, with no checkout.
   const [entitlements, state] = await Promise.all([api(`${base}/entitlements`).catch(() => null),
-    api(`${base}/subscription/status`).catch(() => null)]);
+    nativeApp() ? null : api(`${base}/subscription/status`).catch(() => null)]);
   if (!$('#org-plan') || S.organizationId !== organizationId) return;
   const giftsOpen = box.querySelector('.plan-operator')?.open;
   box.innerHTML = planBillingMarkup(entitlements, state?.managed ? state : null);
@@ -26923,6 +27164,7 @@ function wireInstallationSettings() {
   refreshProcPanel();
   wireServiceLimitsCard();
   wireManagedComputeCard();
+  wireNativePushCard();
   wireHostCapacityCard();
   $('#timing-enabled')?.addEventListener('change', async event => {
     const control = event.currentTarget; control.disabled = true;
@@ -29875,7 +30117,7 @@ function wireTiming(v) {
 // ─── App sign-ins: /device, OAuth consent, Account → Apps and tokens ────────
 // The gateway side is src/gateway/oauth-routes.ts. A limit only ever narrows
 // the person's own access (level and/or projects); the default is all of it.
-const GRANT_KIND_LABEL = { cli: 'CLI', mcp: 'App', token: 'Token' };
+const GRANT_KIND_LABEL = { cli: 'CLI', mcp: 'App', token: 'Token', app: 'Phone' };
 
 async function grantLimitOptions() {
   const [projects, organizations] = await Promise.all([
@@ -29992,9 +30234,11 @@ async function renderOAuthConsent() {
   try { [request, projects] = await Promise.all([api(`/api/oauth/authorizations/${encodeURIComponent(id)}`), grantLimitOptions()]); }
   catch (error) { return grantDone('Sign-in expired', error.message); }
   const client = request.client || {};
-  grantFrame(`<h1 class="grant-title">${esc(client.name || 'An app')}</h1>
-    <p class="grant-who">${grantClientChip(client)} <span class="task-sub" title="${esc(`Returns to ${request.redirectHost || ''}`)}">will act as you${client.kind === 'metadata' ? '' : ` · ${esc(request.redirectHost || '')}`}</span></p>
-    <div id="consent-limit">${grantLimitMarkup(request.levels || [], projects, request.requested || {})}</div>
+  // The phone app is the person's own console: no limit to choose.
+  const phone = client.id === APP_CLIENT_ID;
+  grantFrame(`<h1 class="grant-title">${phone ? `${siteNameMarkup()} on your phone` : esc(client.name || 'An app')}</h1>
+    <p class="grant-who">${grantClientChip(client)} <span class="task-sub" title="${esc(`Returns to ${request.redirectHost || ''}`)}">${phone ? 'Sign the app in as you' : `will act as you${client.kind === 'metadata' ? '' : ` · ${esc(request.redirectHost || '')}`}`}</span></p>
+    <div id="consent-limit">${phone ? '' : grantLimitMarkup(request.levels || [], projects, request.requested || {})}</div>
     <div class="grant-actions"><button class="btn primary" id="consent-allow">Allow</button><button class="btn" id="consent-deny">Deny</button></div>
     <p class="grant-msg" id="grant-msg" role="alert"></p>`);
   wireGrantLimit($('#consent-limit'), request.levels || [], projects);
@@ -30002,7 +30246,7 @@ async function renderOAuthConsent() {
     $('#consent-allow').disabled = $('#consent-deny').disabled = true;
     try {
       const result = await api(`/api/oauth/authorizations/${encodeURIComponent(id)}/${decision}`, { method: 'POST',
-        body: JSON.stringify(decision === 'approve' ? readGrantLimit($('#consent-limit')) : {}) });
+        body: JSON.stringify(decision === 'approve' && !phone ? readGrantLimit($('#consent-limit')) : {}) });
       location.assign(result.redirectUri);
     } catch (error) { $('#grant-msg').textContent = plainError(error); $('#consent-allow').disabled = $('#consent-deny').disabled = false; }
   };

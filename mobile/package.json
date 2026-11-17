@@ -1,0 +1,27 @@
+{
+  "name": "tavya-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Native Android and iOS shell for tavya (Capacitor). Loads the hosted console from server.url.",
+  "license": "UNLICENSED",
+  "scripts": {
+    "sync": "cap sync",
+    "sync:android": "cap sync android",
+    "sync:ios": "cap sync ios",
+    "assets": "capacitor-assets generate --ios --android --splashBackgroundColor '#181220' --splashBackgroundColorDark '#0e0a14'",
+    "android:debug": "cap sync android && cd android && ./gradlew assembleDebug"
+  },
+  "dependencies": {
+    "@capacitor-community/speech-recognition": "7.0.1",
+    "@capacitor/android": "8.6.2",
+    "@capacitor/cli": "8.6.2",
+    "@capacitor/core": "8.6.2",
+    "@capacitor/ios": "8.6.2",
+    "@capacitor/push-notifications": "8.1.3",
+    "@capacitor/splash-screen": "8.0.2"
+  },
+  "devDependencies": {
+    "@capacitor/assets": "4.0.0",
+    "typescript": "5.9.3"
+  }
+}
