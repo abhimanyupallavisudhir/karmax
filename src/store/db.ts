@@ -5894,7 +5894,7 @@ export class Store {
       (await this.db.lock(`push-subscription:${address}`));
       if (native && input.replaces)
         (await this.db.prepare('DELETE FROM push_subscriptions WHERE id=? AND userId=? AND endpoint<>?').run(input.replaces, userId, address));
-      const existing = (await this.db.prepare('SELECT id, userId FROM push_subscriptions WHERE endpoint=?').get(address)) as any;
+      const existing = (await this.db.prepare('SELECT id, userId FROM push_subscriptions WHERE endpoint=?').get(address)) as PushSubscriptionRow | undefined;
       const label = input.label?.trim().slice(0, 80) || null;
       if (existing && String(existing.userId) === userId) {
         (await this.db.prepare('UPDATE push_subscriptions SET p256dh=?, auth=?, label=?, kind=?, platform=? WHERE id=?')
@@ -5910,13 +5910,13 @@ export class Store {
   }
 
   private async pushSubscription(id: string): Promise<PushSubscriptionRecord | undefined> {
-    const row = (await this.db.prepare('SELECT * FROM push_subscriptions WHERE id=?').get(id)) as any;
+    const row = (await this.db.prepare('SELECT * FROM push_subscriptions WHERE id=?').get(id)) as PushSubscriptionRow | undefined;
     return row ? rowToPushSubscription(row) : undefined;
   }
 
   /** A person's devices, oldest first. */
   async listPushSubscriptions(userId: string): Promise<PushSubscriptionRecord[]> {
-    return ((await this.db.prepare('SELECT * FROM push_subscriptions WHERE userId=? ORDER BY createdAt, id').all(userId)) as any[])
+    return ((await this.db.prepare('SELECT * FROM push_subscriptions WHERE userId=? ORDER BY createdAt, id').all(userId)) as PushSubscriptionRow[])
       .map(rowToPushSubscription);
   }
 
@@ -11859,7 +11859,10 @@ function rowToRepository(r: any): Repository {
     createdAt: r.createdAt, updatedAt: r.updatedAt };
 }
 
-function rowToPushSubscription(r: any): PushSubscriptionRecord {
+/** A `push_subscriptions` row as the driver returns it. */
+type PushSubscriptionRow = Record<string, unknown>;
+
+function rowToPushSubscription(r: PushSubscriptionRow): PushSubscriptionRecord {
   const base = { id: String(r.id), userId: String(r.userId), ...(r.label ? { label: String(r.label) } : {}),
     createdAt: Number(r.createdAt), ...(r.lastPushedAt == null ? {} : { lastPushedAt: Number(r.lastPushedAt) }) };
   return r.kind === 'fcm'
