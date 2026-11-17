@@ -82,8 +82,10 @@ export interface VmDriver {
   same(a: Record<string, string>, b: Record<string, string>): boolean;
   /** What the cloud bills, as rows the feed books once each (stable ids).
    * `final`: only that world, about to be deleted, with what it still does
-   * ending at `final.at` (a deleted disk or machine is never listed again). */
-  usage?(connection: ResolvedWorldProviderConnection, home: string, since?: number, final?: FinalUsage): Promise<ProviderUsageEvent[]>;
+   * ending at `final.at` (a deleted disk or machine is never listed again).
+   * `deleted`: the rows `final` read for worlds deleted lately, for a cloud
+   * whose ledger settles after the delete (Agent37) to book the rest. */
+  usage?(connection: ResolvedWorldProviderConnection, home: string, since?: number, final?: FinalUsage, deleted?: ProviderUsageEvent[]): Promise<ProviderUsageEvent[]>;
   /** Periodic upkeep (deferred deletes, stale builders), once per sweep. */
   housekeep?(connection: ResolvedWorldProviderConnection, home: string): Promise<void>;
   diagnose?(connection: ResolvedWorldProviderConnection, ref: Record<string, string>, window: { since: number; now: number }): Promise<WorldDiagnosis | undefined>;
@@ -484,17 +486,19 @@ export class VmWorldProvider implements WorldProvider {
 
   async listUsageEvents(organizationId: string, since?: number): Promise<ProviderUsagePage> {
     if (!this.driver.usage) return { events: [] };
-    const events = await this.driver.usage(await this.connection(organizationId), serviceHomeLabel(), since);
     const ledger = this.options.ledger;
-    if (!ledger) return { events };
-    // Deleted worlds' last usage: the feed books each row once, by its id.
-    const seen = new Set(events.map((event) => event.id));
-    for (const { key, value } of await ledger.kvEntries(finalUsageKey(this.kind, organizationId))) {
+    // Deleted worlds' last usage, read just before each delete.
+    const deleted: ProviderUsageEvent[] = [];
+    for (const { key, value } of ledger ? await ledger.kvEntries(finalUsageKey(this.kind, organizationId)) : []) {
       let entry: { at?: number; events?: ProviderUsageEvent[] } = {};
       try { entry = JSON.parse(value); } catch {}
-      if (!(Number(entry.at) > Date.now() - FINAL_USAGE_KEPT_MS)) { await ledger.kvDelete(key); continue; }
-      for (const event of entry.events ?? []) if (!seen.has(event.id)) { seen.add(event.id); events.push(event); }
+      if (!(Number(entry.at) > Date.now() - FINAL_USAGE_KEPT_MS)) { await ledger!.kvDelete(key); continue; }
+      deleted.push(...(entry.events ?? []));
     }
+    const events = await this.driver.usage(await this.connection(organizationId), serviceHomeLabel(), since, undefined, deleted);
+    // The feed books each row once, by its id.
+    const seen = new Set(events.map((event) => event.id));
+    for (const event of deleted) if (!event.record && !seen.has(event.id)) { seen.add(event.id); events.push(event); }
     return { events };
   }
 
