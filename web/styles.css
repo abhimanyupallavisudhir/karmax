@@ -4825,7 +4825,7 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 .msg.system.wait-notice .setup-fix { font-style: normal; margin-left: 6px; vertical-align: baseline; }
 
 /* ── Files (wiki features/project-files) ────────────────────────────────────
-   One bar (up, address, where it comes from), then a folder's rows or a file. */
+   One bar (view, address, tools, where it comes from), then a folder's rows or a file. */
 .files-page { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .files-bar { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .files-page > .files-title { margin: 0 0 2px; }
@@ -4835,8 +4835,6 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 /* The file manager: tools, selection, drop target, menus, the editor and the terminal. */
 .files-actions { display: inline-flex; align-items: center; gap: 6px; flex: none; }
 .files-actions:empty { display: none; }
-.files-progress { color: var(--ink-3); font-size: var(--fs-12); white-space: nowrap; font-variant-numeric: tabular-nums; }
-.files-progress[hidden] { display: none; }
 .files-row.selected, .files-row.selected:hover { background: var(--accent-weak); }
 .files-row.selected .files-link { color: var(--ink); }
 .files-row.cut .files-link { opacity: .5; }
@@ -4855,6 +4853,28 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 .files-menu button:disabled { color: var(--ink-3); cursor: default; }
 .files-menu kbd { color: var(--ink-3); font-family: var(--font-mono); font-size: var(--fs-11); }
 .files-menu-sep { height: 1px; margin: 4px 6px; background: var(--line); }
+/* The Files tray: an upload (or a slow change) from its first moment to what landed. */
+.files-trays { position: fixed; right: 18px; bottom: 18px; z-index: 98; display: flex; flex-direction: column; gap: 8px;
+  width: min(340px, calc(100vw - 36px)); pointer-events: none; }
+.files-tray { pointer-events: auto; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface);
+  box-shadow: var(--shadow); font-size: var(--fs-13); animation: rise .2s ease; }
+.files-tray-head { display: flex; align-items: center; gap: 8px; }
+.files-tray-title { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.files-tray.done .files-tray-title::before { content: "✓"; margin-right: 6px; color: var(--merged, var(--accent)); }
+.files-tray.failed { border-color: color-mix(in srgb, var(--danger) 55%, var(--line)); }
+.files-tray.failed .files-tray-title { color: var(--danger); white-space: normal; }
+.files-tray-close { flex: none; display: inline-grid; place-items: center; width: 24px; height: 24px; margin: -4px -6px -4px 0; padding: 0;
+  border: 0; border-radius: 6px; background: none; color: var(--ink-3); cursor: pointer; }
+.files-tray-close:hover { background: var(--surface-2); color: var(--ink); }
+.files-tray-bar { position: relative; height: 4px; margin: 9px 0 6px; overflow: hidden; border-radius: 2px; background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.files-tray-bar > span { display: block; height: 100%; width: 0; border-radius: inherit; background: var(--accent); transition: width .25s ease; }
+.files-tray-bar.indeterminate > span { width: 38%; animation: action-trace 1.1s cubic-bezier(.45, 0, .2, 1) infinite; transition: none; }
+.files-tray-detail { color: var(--ink-3); font-size: var(--fs-12); font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.files-tray.failed .files-tray-detail, .files-tray.done .files-tray-detail { margin-top: 4px; white-space: normal; }
+.files-tray-detail:empty { display: none; }
+.files-tray-list { margin: 6px 0 0; padding: 0; list-style: none; max-height: 120px; overflow-y: auto; font-family: var(--font-mono); font-size: var(--fs-11); }
+.files-tray-list li { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (prefers-reduced-motion: reduce) { .files-tray-bar.indeterminate > span { animation-duration: 3s; } }
 .files-upload-dialog { width: min(640px, calc(100vw - 32px)); }
 .files-upload-form h2 { margin: 0 0 12px; font-size: var(--fs-16, 16px); overflow-wrap: anywhere; }
 .files-upload-list { list-style: none; margin: 0; padding: 0; max-height: 52vh; overflow-y: auto; border: 1px solid var(--line); border-radius: var(--r); }

@@ -85,6 +85,22 @@ it('commits uploads, edits, new folders, copies, moves and deletes straight to t
   expect((await f.change(f.developer, [{ op: 'delete', path: 'site/no-such' }])).status).toBe(404);
 });
 
+it('drops a staged upload its uploader gives up on, and only theirs', async () => {
+  const f = await fixture();
+  const other = (await f.tokens.mintPrincipal('user:bob', capsOf('developer') as string[], f.project.id)).token;
+  const drop = (token: string, id: string) => fetch(`${f.server.url}/api/projects/${f.project.id}/files/uploads/${encodeURIComponent(id)}`,
+    { method: 'DELETE', headers: { authorization: `Bearer ${token}` } });
+  const kept = await f.upload(f.developer, 'kept\n');
+  const dropped = await f.upload(f.developer, 'dropped\n');
+  // Someone else cannot drop it (and is not told whether it exists).
+  expect((await drop(other, kept)).status).toBe(204);
+  expect((await drop(f.developer, dropped)).status).toBe(204);
+  expect((await f.change(f.developer, [{ op: 'write', path: 'site/kept.txt', upload: kept }])).status).toBe(200);
+  expect(await f.change(f.developer, [{ op: 'write', path: 'site/dropped.txt', upload: dropped }]))
+    .toMatchObject({ status: 400, body: { error: 'That upload is gone: upload the file again.' } });
+  expect(f.show('kept.txt')).toBe('kept\n');
+});
+
 it('refuses what is not a file in a repository, and people who may not land on the branch', async () => {
   const f = await fixture();
   // A viewer reads but may not change (no merge-into).

@@ -75,7 +75,7 @@ describe('turnkey update deploys an exact validated revision', () => {
   // older backup's secrets directory.
   it('creates any missing secret before building an update or starting a restore', () => {
     expect(update.indexOf('ensure_secrets')).toBeGreaterThan(update.indexOf('checkout --detach "$target"'));
-    expect(update.indexOf('ensure_secrets')).toBeLessThan(update.indexOf('build_images --pull'));
+    expect(update.indexOf('ensure_secrets')).toBeLessThan(update.indexOf('if ! candidate_images; then'));
     const restore = script.split('cmd_restore() {')[1]?.split('\n}')[0] ?? '';
     expect(restore.indexOf('ensure_secrets')).toBeGreaterThan(restore.indexOf('mv "$staged_secrets" "$SECRETS_DIR"'));
     expect(restore.indexOf('ensure_secrets')).toBeLessThan(restore.lastIndexOf('dc up -d postgresql'));

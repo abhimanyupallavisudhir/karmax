@@ -104,7 +104,8 @@ const ICON = {
   plus: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
   // Toolbar actions (conversation head, tab rails): one stroke weight and size.
   template: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="7" x="3" y="3" rx="1"/><rect width="9" height="7" x="3" y="14" rx="1"/><rect width="5" height="7" x="16" y="14" rx="1"/></svg>',
-  share: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7"/><path d="m16 6-4-4-4 4"/><path d="M12 2v13"/></svg>',
+  // Share makes a public link, here and in Files (one icon: web/file-view.js).
+  share: globalThis.KarmaxFileView?.ICONS.share ?? '',
   find: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>',
   fork: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></svg>',
   terminal: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg>',
@@ -436,11 +437,18 @@ function finishActionFeedback(ticket, ok) {
   }, Math.max(0, 180 - elapsed));
 }
 
+// A write no gesture is bound to any more (it began after a file chooser, a
+// drop or another request) still shows the top trace once it takes a moment:
+// a slow save never looks like nothing happened.
+const SLOW_WRITE_MS = 500;
 function feedbackFetch(input, opts = {}) {
-  const ticket = interactionOrigin ? beginActionFeedback(interactionOrigin) : null;
+  let ticket = interactionOrigin ? beginActionFeedback(interactionOrigin) : null;
+  const write = !ticket && !['GET', 'HEAD'].includes(String(opts.method || 'GET').toUpperCase());
+  const slow = write ? setTimeout(() => { ticket = beginActionFeedback(null); }, SLOW_WRITE_MS) : 0;
+  const settle = (ok) => { clearTimeout(slow); if (ticket) finishActionFeedback(ticket, ok); };
   return fetch(input, opts).then(
-    (response) => { if (ticket) finishActionFeedback(ticket, response.ok); return response; },
-    (error) => { if (ticket) finishActionFeedback(ticket, false); throw error; },
+    (response) => { settle(response.ok); return response; },
+    (error) => { settle(false); throw error; },
   );
 }
 
@@ -19747,12 +19755,11 @@ function filesUpRoute(pid, filePath) {
   if (FV.parts(filePath).length) return filesRoute(pid, FV.parent(filePath));
   return S.tab === 'orgfiles' && pid ? orgFilesRoute() : null;
 }
-function filesBarHtml({ pid, filePath, view, crumbs, tools = '' }) {
-  const up = filesUpRoute(pid, filePath);
+// Going up is the address bar's crumbs (or Backspace): no separate Up button.
+function filesBarHtml({ pid, view, crumbs, tools = '' }) {
   return `<div class="files-bar">
       ${pid ? `<button type="button" class="files-view-button" id="files-view" aria-haspopup="listbox" title="Show another branch, or a task’s files">${filesViewLabelHtml(pid, view)}</button>` : ''}
-      <a class="btn sm icon files-up${up ? '' : ' disabled'}" data-spa href="${esc(up || '#')}" aria-label="Up a folder" title="Up a folder (Backspace)"${up ? '' : ' aria-disabled="true" tabindex="-1"'}>${FV.ICONS.up}</a>
-      <div class="files-address" id="files-address" title="Click to type a path (g l)">${crumbs}</div>
+      <div class="files-address" id="files-address" title="Click a folder to go there, or here to type a path (g l). Backspace goes up.">${crumbs}</div>
       ${tools}
     </div>`;
 }
@@ -19765,7 +19772,7 @@ function filesView(proj) {
   const view = S.filesView || '';
   const scope = S.tab === 'orgfiles' ? 'org' : 'project';
   return `<div class="files-page" id="files-page" data-scope="${scope}" data-project="${esc(proj.id)}" data-path="${esc(filePath)}" data-view="${esc(view)}">
-    ${scope === 'org' ? ORG_FILES_TITLE : ''}${filesBarHtml({ pid: proj.id, filePath, view, crumbs: filesCrumbsHtml(proj, parts), tools: `<span class="files-actions" id="files-actions"></span><span class="files-source" id="files-source"></span>
+    ${scope === 'org' ? ORG_FILES_TITLE : ''}${filesBarHtml({ pid: proj.id, view, crumbs: filesCrumbsHtml(proj, parts), tools: `<span class="files-actions" id="files-actions"></span><span class="files-source" id="files-source"></span>
       <button type="button" class="btn sm icon files-share" id="files-share" data-tool="Share" title="Share a public link" aria-label="Share"${sharing?.canShare && !view ? '' : ' hidden'}>${FV.ICONS.share}</button>` })}
     <div class="files-body" id="files-body"><div class="files-status" role="status" aria-busy="true">Loading…</div></div>
     ${filesTermPanelHtml()}
@@ -19794,7 +19801,7 @@ const ORG_FILES_TITLE = '<h1 class="page-title files-title">Organization files</
 function orgFilesView() {
   const org = currentOrg();
   return `<div class="files-page" id="files-page" data-scope="org" data-project="" data-path="" data-view="">
-    ${ORG_FILES_TITLE}${filesBarHtml({ pid: null, filePath: '', view: '', crumbs: `<nav class="files-crumbs" aria-label="Path"><a class="files-crumb files-crumb-root" data-spa href="${esc(orgFilesRoute())}" aria-current="page">${esc(orgSlug(org))}</a></nav>` })}
+    ${ORG_FILES_TITLE}${filesBarHtml({ pid: null, view: '', crumbs: `<nav class="files-crumbs" aria-label="Path"><a class="files-crumb files-crumb-root" data-spa href="${esc(orgFilesRoute())}" aria-current="page">${esc(orgSlug(org))}</a></nav>` })}
     <div class="files-body" id="files-body"></div>
     ${artifactGalleryShellHtml()}
   </div>`;
@@ -20041,16 +20048,20 @@ function refreshFilesPage() {
 }
 
 // One batch of changes to the view shown; a commit, when it made one, is named.
-async function applyFileChanges(pid, changes, done = 'Done', { view = S.filesView, refresh = true } = {}) {
-  const result = await api(filesChangesUrl(pid, view), { method: 'POST', body: JSON.stringify({ changes }) });
-  const commit = result?.commits?.[0];
-  // Where it went: a commit, data, secrets.
-  const kept = [commit ? `${String(commit.commit).slice(0, 7)} on ${commit.branch}` : '',
-    result?.data?.length ? `data: ${result.data.map((d) => d.name).join(', ')}` : '',
-    result?.secrets?.length ? `${result.secrets.length} secret${result.secrets.length === 1 ? '' : 's'}` : ''].filter(Boolean);
-  toast(kept.length ? `${done} · ${kept.join(' · ')}` : done);
+// Saying what it does (`busy`) shows in a tray if the server takes a moment.
+async function applyFileChanges(pid, changes, done = 'Done', { view = S.filesView, refresh = true, quiet = false, busy = 'Saving…' } = {}) {
+  const request = () => api(filesChangesUrl(pid, view), { method: 'POST', body: JSON.stringify({ changes }) });
+  const result = quiet ? await request() : await filesTrayWhile(busy, request);
+  if (!quiet) { const kept = fileChangesSummary(result); toast(kept ? `${done} · ${kept}` : done); }
   if (refresh) refreshFilesPage();
   return result;
+}
+// Where a batch went: a commit, data, secrets.
+function fileChangesSummary(result) {
+  const commit = result?.commits?.[0];
+  return [commit ? `${String(commit.commit).slice(0, 7)} on ${commit.branch}` : '',
+    result?.data?.length ? `data: ${result.data.map((d) => d.name).join(', ')}` : '',
+    result?.secrets?.length ? `${result.secrets.length} secret${result.secrets.length === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ');
 }
 const filesFail = (error) => toast(error?.message || String(error), true);
 
@@ -20095,7 +20106,7 @@ async function pasteFiles(pid) {
   }
   if (!changes.length) return;
   try {
-    await applyFileChanges(pid, changes, clip.cut ? 'Moved' : 'Pasted');
+    await applyFileChanges(pid, changes, clip.cut ? 'Moved' : 'Pasted', { busy: clip.cut ? 'Moving…' : 'Pasting…' });
     if (clip.cut) setFilesClip(null);
   } catch (error) { filesFail(error); }
 }
@@ -20108,7 +20119,7 @@ async function deleteFilesTargets(pid) {
   if (!confirm(`Delete ${what}?${(S.filesView || '').startsWith('task:') ? ' This can’t be undone.' : ''}`)) return;
   const node = S.filesNode;
   try {
-    await applyFileChanges(pid, targets.map((target) => ({ op: 'delete', path: target.path })), 'Deleted', { refresh: node.kind === 'directory' });
+    await applyFileChanges(pid, targets.map((target) => ({ op: 'delete', path: target.path })), 'Deleted', { refresh: node.kind === 'directory', busy: 'Deleting…' });
     clearFilesSelection();
     if (node.kind !== 'directory') { filesState().cache.clear(); go(filesRoute(pid, FV.parent(node.path))); }
   } catch (error) { filesFail(error); }
@@ -20125,7 +20136,7 @@ async function renameFilesTarget(pid) {
   const to = FV.join(FV.parent(target.path), name);
   const folder = node.kind === 'directory';
   try {
-    await applyFileChanges(pid, [{ op: 'move', from: target.path, to }], 'Renamed', { refresh: folder });
+    await applyFileChanges(pid, [{ op: 'move', from: target.path, to }], 'Renamed', { refresh: folder, busy: 'Renaming…' });
     if (!folder) { filesState().cache.clear(); go(filesRoute(pid, to)); }
   } catch (error) { filesFail(error); }
 }
@@ -20138,52 +20149,240 @@ async function newFilesItem(pid, folder) {
   if (name.includes('/') && folder) return toast('A name can’t contain “/”', true);
   const where = FV.join(node.path, name);
   try {
-    if (folder) return await applyFileChanges(pid, [{ op: 'mkdir', path: where }], 'Created');
-    await applyFileChanges(pid, [{ op: 'write', path: where, text: '', expect: null }], 'Created', { refresh: false });
+    if (folder) return await applyFileChanges(pid, [{ op: 'mkdir', path: where }], 'Created', { busy: 'Creating…' });
+    await applyFileChanges(pid, [{ op: 'write', path: where, text: '', expect: null }], 'Created', { refresh: false, busy: 'Creating…' });
     filesState().cache.clear();
     S.filesEditOnOpen = where;
     go(filesRoute(pid, where));
   } catch (error) { filesFail(error); }
 }
 
-// ── uploads: files and folders, from a picker, a drop or a paste ──
-// Each file's bytes are staged (POST …/files/uploads), then one batch writes them.
-async function uploadFilesInto(pid, dir, items) {
-  if (!items.length) return;
-  const top = new Set(items.map((item) => FV.parts(item.rel)[0]));
-  const replacing = [...top].filter((name) => filesNamesHere().has(name));
-  if (replacing.length && !confirm(`Replace ${replacing.length === 1 ? `“${replacing[0]}”` : `${replacing.length} items`}?`)) return;
-  // In a branch view, what is not for Git (secrets, large or ignored files) is asked about first.
-  if (!(S.filesView || '').startsWith('task:')) {
-    let planned;
-    try { planned = await api(`/api/projects/${encodeURIComponent(pid)}/files/plan${filesViewQuery(S.filesView, '?')}`,
-      { method: 'POST', body: JSON.stringify({ items: items.map((item) => ({ path: FV.join(dir, item.rel), size: item.file.size })) }) }); }
-    catch (error) { return filesFail(error); }
-    const byPath = new Map((planned.items || []).map((plan) => [plan.path, plan]));
-    items = items.map((item) => ({ ...item, plan: byPath.get(FV.join(dir, item.rel)) || { keep: 'git' } }));
-    if (items.some((item) => item.plan.keep !== 'git' && !item.plan.fixed)) {
-      items = await chooseUploadPlaces(dir, items, !!planned.canKeep);
-      if (!items?.length) return;
-    }
+// ── the Files tray: what Files is doing, until it is done ──
+// A card in the corner for every upload (and any change that takes a moment):
+// it appears the instant something starts, outlives re-renders and moving
+// around the console, fills as bytes leave, and ends with what landed (or what
+// didn't, by name). While one works, leaving the page asks first.
+const FILES_TRAY_CLOSE = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>';
+const filesTrays = new Set();
+function filesTray(title, { cancel } = {}) {
+  let stack = document.getElementById('files-trays');
+  if (!stack) {
+    stack = document.createElement('div');
+    stack.id = 'files-trays';
+    stack.className = 'files-trays';
+    document.body.appendChild(stack);
   }
-  const status = $('#files-progress');
-  const total = items.reduce((sum, item) => sum + item.file.size, 0);
-  let sent = 0;
-  const show = (text) => { if (status) { status.hidden = !text; status.textContent = text; } };
+  const box = document.createElement('div');
+  box.className = 'files-tray working';
+  box.setAttribute('role', 'status');
+  box.innerHTML = `<div class="files-tray-head"><span class="files-tray-title"></span>
+      <button type="button" class="files-tray-close" aria-label="Cancel" title="Cancel">${FILES_TRAY_CLOSE}</button></div>
+    <div class="files-tray-bar indeterminate" role="progressbar" aria-label="Progress"><span></span></div>
+    <div class="files-tray-detail"></div>`;
+  stack.appendChild(box);
+  const $t = (sel) => box.querySelector(sel);
+  let ended = false;
+  const tray = {
+    cancelled: false,
+    title(text) { $t('.files-tray-title').textContent = text; return tray; },
+    // A fraction (0–1) fills the bar; null makes it a moving trace (time unknown).
+    progress(fraction, detail = '') {
+      const bar = $t('.files-tray-bar');
+      bar.classList.toggle('indeterminate', fraction == null);
+      if (fraction == null) { bar.removeAttribute('aria-valuenow'); bar.firstElementChild.style.width = ''; }
+      else { const pct = Math.max(0, Math.min(100, fraction * 100)); bar.setAttribute('aria-valuenow', String(Math.round(pct))); bar.firstElementChild.style.width = `${pct.toFixed(1)}%`; }
+      $t('.files-tray-detail').textContent = detail;
+      return tray;
+    },
+    // Finished: a success leaves by itself; a failure (or what was left out) stays until closed.
+    end(text, { failed = false, items = [], why = '' } = {}) {
+      if (ended) return;
+      ended = true;
+      filesTrays.delete(tray);
+      box.classList.remove('working');
+      box.classList.add(failed ? 'failed' : 'done');
+      box.setAttribute('role', failed ? 'alert' : 'status');
+      $t('.files-tray-title').textContent = text;
+      $t('.files-tray-bar')?.remove();
+      $t('.files-tray-detail').textContent = why;
+      if (items.length) $t('.files-tray-detail').insertAdjacentHTML('afterend',
+        `<ul class="files-tray-list">${items.map((name) => `<li title="${esc(name)}">${esc(name)}</li>`).join('')}</ul>`);
+      const close = $t('.files-tray-close');
+      close.setAttribute('aria-label', 'Dismiss'); close.title = 'Dismiss';
+      if (!failed) setTimeout(() => box.remove(), 3500);
+    },
+    remove() { ended = true; filesTrays.delete(tray); box.remove(); },
+  };
+  $t('.files-tray-close').addEventListener('click', () => {
+    if (ended) return box.remove();
+    if (!cancel) return;
+    tray.cancelled = true;
+    cancel();
+    tray.remove();
+  });
+  if (!cancel) $t('.files-tray-close').hidden = true;
+  filesTrays.add(tray);
+  installFilesLeaveGuard();
+  return tray.title(title);
+}
+// A tray that shows only if the work takes long enough to notice.
+async function filesTrayWhile(title, work, delay = 400) {
+  let tray = null;
+  const timer = setTimeout(() => { tray = filesTray(title).progress(null); }, delay);
+  try { return await work(); }
+  finally { clearTimeout(timer); tray?.remove(); }
+}
+function installFilesLeaveGuard() {
+  if (installFilesLeaveGuard.done) return;
+  installFilesLeaveGuard.done = true;
+  window.addEventListener('beforeunload', (event) => {
+    if (!filesTrays.size) return;
+    event.preventDefault();
+    event.returnValue = '';
+  });
+}
+
+// ── uploads: files and folders, from a picker, a drop or a paste ──
+// Each file's bytes are staged (POST …/files/uploads, three at a time, with
+// progress), then one batch writes them. A file that can't be sent (changed
+// or removed after it was chosen, refused) is left out by name; the rest land.
+const UPLOAD_PARALLEL = 3;
+function stageFileUpload(pid, file, onProgress, signal) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    signal.addEventListener('abort', () => xhr.abort(), { once: true });
+    xhr.open('POST', `/api/projects/${encodeURIComponent(pid)}/files/uploads`);
+    xhr.setRequestHeader('content-type', 'application/octet-stream');
+    if (S.token) xhr.setRequestHeader('authorization', `Bearer ${S.token}`);
+    if (S.clientId) xhr.setRequestHeader('x-tavya-client', S.clientId);
+    xhr.upload.onprogress = (event) => onProgress(event.loaded);
+    xhr.onload = () => {
+      let out = {};
+      try { out = JSON.parse(xhr.responseText); } catch {}
+      if (xhr.status >= 200 && xhr.status < 300) return resolve(out);
+      reject(Object.assign(new Error(out?.error || `HTTP ${xhr.status}`), { status: xhr.status }));
+    };
+    // Nothing answered: the connection dropped, or the browser could not read the file.
+    xhr.onerror = () => reject(Object.assign(new Error('unsent'), { status: 0 }));
+    xhr.onabort = () => reject(Object.assign(new Error('cancelled'), { cancelled: true }));
+    xhr.send(file);
+  });
+}
+// Whether the browser can still read a chosen file (Chrome refuses one changed since).
+const fileReadable = (file) => file.slice(0, 1).arrayBuffer().then(() => true, () => false);
+
+// `items` ({file, rel, entry?}) may still be coming (a dropped folder being walked):
+// the tray shows from the first moment either way.
+// The server's bounds on one batch (CHANGE_LIMITS in src/world/project-file-changes.ts).
+const UPLOAD_LIMITS = { files: 2000, bytes: 1024 ** 3 };
+async function uploadFilesInto(pid, dir, itemsOrPromise) {
+  const controller = new AbortController();
+  const tray = filesTray('Preparing upload…', { cancel: () => controller.abort() }).progress(null);
+  // Bytes staged but not saved (cancelled, or the batch failed) are dropped at once, not in an hour.
+  const staged = new Map();
+  let saved = false;
+  let what = 'files';
+  // Where it goes is fixed now: moving to another view meanwhile must not move the upload.
+  const view = S.filesView || '';
   try {
-    const changes = [];
-    for (const [index, item] of items.entries()) {
-      show(`Uploading ${index + 1} of ${items.length}${total > 1_000_000 ? ` · ${Math.floor((sent / total) * 100)}%` : ''}`);
-      const staged = await api(`/api/projects/${encodeURIComponent(pid)}/files/uploads`, { method: 'POST', body: item.file, headers: { 'content-type': 'application/octet-stream' } });
-      sent += item.file.size;
-      changes.push({ op: 'write', path: FV.join(dir, item.rel), upload: staged.upload,
-        ...(item.keep === 'data' || item.keep === 'secret' ? { keep: item.keep } : {}), ...(item.keep === 'data' && item.dataFolder ? { dataFolder: item.dataFolder } : {}) });
+    let items = await itemsOrPromise;
+    if (tray.cancelled) return;
+    if (!items?.length) return tray.remove();
+    const top = [...new Set(items.map((item) => FV.parts(item.rel)[0]))];
+    what = top.length === 1 ? top[0] : `${items.length} files`;
+    tray.title(`Preparing ${what}…`);
+    const size = items.reduce((sum, item) => sum + item.file.size, 0);
+    if (items.length > UPLOAD_LIMITS.files || size > UPLOAD_LIMITS.bytes)
+      return tray.end(`${what} is too big to upload at once`, { failed: true,
+        why: `${items.length.toLocaleString()} files, ${FV.formatBytes(size)}: up to ${UPLOAD_LIMITS.files.toLocaleString()} files and ${FV.formatBytes(UPLOAD_LIMITS.bytes)} at a time. Upload it in parts.` });
+    const replacing = top.filter((name) => filesNamesHere().has(name));
+    if (replacing.length && !confirm(`Replace ${replacing.length === 1 ? `“${replacing[0]}”` : `${replacing.length} items`}?`)) return tray.remove();
+    // In a branch view, what is not for Git (secrets, large or ignored files) is asked about first.
+    if (!view.startsWith('task:')) {
+      const planned = await api(`/api/projects/${encodeURIComponent(pid)}/files/plan${filesViewQuery(view, '?')}`,
+        { method: 'POST', body: JSON.stringify({ items: items.map((item) => ({ path: FV.join(dir, item.rel), size: item.file.size })) }) });
+      if (tray.cancelled) return;
+      const byPath = new Map((planned.items || []).map((plan) => [plan.path, plan]));
+      items = items.map((item) => ({ ...item, plan: byPath.get(FV.join(dir, item.rel)) || { keep: 'git' } }));
+      if (items.some((item) => item.plan.keep !== 'git' && !item.plan.fixed)) {
+        items = await chooseUploadPlaces(dir, items, !!planned.canKeep);
+        if (!items?.length) return tray.remove();
+      }
     }
-    show('Saving…');
-    for (let at = 0; at < changes.length; at += 1000)
-      await applyFileChanges(pid, changes.slice(at, at + 1000), `Uploaded ${items.length === 1 ? FV.parts(items[0].rel).pop() : `${items.length} files`}`, { refresh: at + 1000 >= changes.length });
-  } catch (error) { filesFail(error); }
-  finally { show(''); }
+    const names = (list) => list.map((item) => FV.join(dir, item.rel));
+    const total = items.reduce((sum, item) => sum + item.file.size, 0);
+    const sent = new Map();
+    const started = Date.now();
+    const going = new Set();
+    const paint = () => {
+      const done = [...sent.values()].reduce((a, b) => a + b, 0);
+      const secs = done > 0 ? ((Date.now() - started) / 1000) * ((total - done) / done) : 0;
+      const left = done > 0 && secs >= 5 ? ` · ${secs < 90 ? `${Math.ceil(secs)} s` : `${Math.ceil(secs / 60)} min`} left` : '';
+      const now = items.length > 1 ? [...going].map((item) => FV.parts(item.rel).pop()).join(', ') : '';
+      tray.progress(total ? done / total : null, `${FV.formatBytes(done)} of ${FV.formatBytes(total)}${left}${now ? ` · ${now}` : ''}`);
+    };
+    tray.title(`Uploading ${what}`);
+    paint();
+    const unreadable = [], refused = [];
+    let fatal = null;
+    const queue = items.slice();
+    const sendOne = async (item) => {
+      going.add(item); paint();
+      for (let attempt = 0; ; attempt++) {
+        try {
+          staged.set(item, await stageFileUpload(pid, item.file, (loaded) => { sent.set(item, loaded); paint(); }, controller.signal));
+          sent.set(item, item.file.size);
+          break;
+        } catch (error) {
+          sent.set(item, 0);
+          if (error.cancelled) throw error;
+          if (error.status === 0 && !(await fileReadable(item.file))) {
+            // A dropped file can be read afresh; a picked one only by choosing it again.
+            const fresh = item.entry && attempt === 0 ? await new Promise((done) => item.entry.file(done, () => done(null))) : null;
+            if (fresh && await fileReadable(fresh)) { item.file = fresh; continue; }
+            unreadable.push(item);
+            break;
+          }
+          // The server said no to this file (too big, …): the rest go on.
+          if (error.status === 400 || error.status === 413) { refused.push({ item, why: error.message }); break; }
+          // A dropped connection or a busy server: twice more, then the upload stops.
+          if (attempt < 2 && (error.status === 0 || error.status >= 500)) { await new Promise((done) => setTimeout(done, 1000 * 3 ** attempt)); continue; }
+          throw error;
+        }
+      }
+      going.delete(item); paint();
+    };
+    const worker = async () => { while (queue.length && !fatal) { const item = queue.shift(); try { await sendOne(item); } catch (error) { fatal ||= error; } } };
+    await Promise.all(Array.from({ length: Math.min(UPLOAD_PARALLEL, items.length) }, worker));
+    if (tray.cancelled || fatal?.cancelled) return;
+    if (fatal) throw fatal.status === 0 ? new Error('The connection dropped. Upload again to finish.') : fatal;
+    const ready = items.filter((item) => staged.has(item));
+    const missed = [...names(unreadable), ...refused.map(({ item }) => FV.join(dir, item.rel))];
+    const missedWhy = unreadable.length
+      ? `${unreadable.length === 1 ? 'It' : 'They'} changed or moved after you chose ${unreadable.length === 1 ? 'it' : 'them'}. Choose ${unreadable.length === 1 ? 'it' : 'them'} again to upload.`
+      : refused[0]?.why || '';
+    if (!ready.length) return tray.end(`Couldn’t upload ${what}`, { failed: true, items: missed, why: missedWhy });
+    tray.title(`Saving ${what}…`).progress(null, `${ready.length} file${ready.length === 1 ? '' : 's'}`);
+    const changes = ready.map((item) => ({ op: 'write', path: FV.join(dir, item.rel), upload: staged.get(item).upload,
+      ...(item.keep === 'data' || item.keep === 'secret' ? { keep: item.keep } : {}), ...(item.keep === 'data' && item.dataFolder ? { dataFolder: item.dataFolder } : {}) }));
+    let kept = '';
+    // (The server drops what a batch names, saved or not.)
+    saved = true;
+    for (let at = 0; at < changes.length; at += 1000) {
+      const result = await applyFileChanges(pid, changes.slice(at, at + 1000), null, { view, refresh: at + 1000 >= changes.length, quiet: true });
+      kept ||= fileChangesSummary(result);
+    }
+    const landed = ready.length === 1 ? FV.parts(ready[0].rel).pop() : `${ready.length} files`;
+    if (missed.length) tray.end(`Uploaded ${landed} · ${missed.length} left out`, { failed: true, items: missed, why: missedWhy });
+    else tray.end(`Uploaded ${landed}`, { why: kept });
+  } catch (error) {
+    if (error?.cancelled || tray.cancelled) return;
+    tray.end(`Couldn’t upload ${what}`, { failed: true, why: plainError(error?.message || String(error)) });
+  } finally {
+    if (!saved) for (const { upload } of staged.values())
+      fetch(`/api/projects/${encodeURIComponent(pid)}/files/uploads/${encodeURIComponent(upload)}`,
+        { method: 'DELETE', headers: S.token ? { authorization: `Bearer ${S.token}` } : {} }).catch(() => {});
+  }
 }
 // Where each upload goes, as tavya recommends: Git, data, or a secret. A
 // folder is one choice (Git or data); a secret is always a file of its own.
@@ -20272,6 +20471,7 @@ function pickFilesToUpload(pid, folder) {
     const items = [...input.files].map((file) => ({ file, rel: file.webkitRelativePath || file.name }));
     uploadFilesInto(pid, dir, items);
   });
+  // (No change event when the chooser is dismissed: nothing to show then.)
   input.click();
 }
 // What a drop holds, folders walked (DataTransferItem.webkitGetAsEntry).
@@ -20280,7 +20480,8 @@ async function droppedFiles(dataTransfer) {
   if (!entries.length) return [...(dataTransfer.files || [])].map((file) => ({ file, rel: file.name }));
   const out = [];
   const walk = async (entry, prefix) => {
-    if (entry.isFile) { out.push({ file: await new Promise((done, fail) => entry.file(done, fail)), rel: FV.join(prefix, entry.name) }); return; }
+    // The entry stays with the file: a file that changes meanwhile can be read again from it.
+    if (entry.isFile) { out.push({ file: await new Promise((done, fail) => entry.file(done, fail)), rel: FV.join(prefix, entry.name), entry }); return; }
     const reader = entry.createReader();
     for (;;) {
       const batch = await new Promise((done, fail) => reader.readEntries(done, fail));
@@ -20360,8 +20561,7 @@ function filesActionsHtml(node) {
   const folder = node.kind === 'directory' && node.writable;
   const tool = (id, label, icon, shortcut, keys) => `<button type="button" class="btn sm icon" id="${id}" data-shortcut="${shortcut}" title="${esc(label)} (${keys})" aria-label="${esc(label)}">${icon}</button>`;
   const terminal = view.startsWith('task:') && node.writable;
-  return `<span class="files-progress" id="files-progress" role="status" hidden></span>
-    ${folder ? tool('files-new-file', 'New file', FM_ICON.newFile, 'files.newFile', 'T') + tool('files-new-folder', 'New folder', FM_ICON.newFolder, 'files.newFolder', 'F')
+  return `${folder ? tool('files-new-file', 'New file', FM_ICON.newFile, 'files.newFile', 'T') + tool('files-new-folder', 'New folder', FM_ICON.newFolder, 'files.newFolder', 'F')
       + tool('files-upload', 'Upload', FM_ICON.upload, 'files.upload', 'U') : ''}
     ${node.kind !== 'directory' && node.path ? `<button type="button" class="btn sm icon" id="files-more" title="More" aria-label="More" aria-haspopup="menu">${FM_ICON.more}</button>` : ''}
     ${terminal ? `<button type="button" class="btn sm icon${S.filesTermOpen ? ' active' : ''}" id="files-terminal" data-shortcut="files.terminal" aria-pressed="${!!S.filesTermOpen}"
@@ -20421,7 +20621,7 @@ function wireFileManager(pid, node) {
     depth = 0; body.classList.remove('dropping');
     const row = event.target.closest('.files-row.kind-directory');
     const dir = row && !row.dataset.mount ? FV.join(node.path, row.dataset.name) : node.path;
-    uploadFilesInto(pid, dir, await droppedFiles(event.dataTransfer));
+    uploadFilesInto(pid, dir, droppedFiles(event.dataTransfer));
   });
 }
 
@@ -22100,6 +22300,34 @@ async function hydrateConversationSharing(scope, id) {
       } finally { input.disabled = false; }
     };
   } catch (error) { paneError(box, error, () => hydrateConversationSharing(scope, id)); }
+}
+
+// Early access (wiki features/early-access): features still rolling out reach
+// the organizations that turn this on first. The console gates one on
+// organizationById(S.organizationId)?.features, which /api/organizations fills.
+async function hydrateEarlyAccess(organizationId) {
+  const box = $('#organization-early-access');
+  if (!box) return;
+  const url = `/api/organizations/${encodeURIComponent(organizationId)}/early-access`;
+  try {
+    const access = await api(url);
+    if (!box.isConnected) return;
+    box.innerHTML = `<div class="setting-row"><span class="setting-label">Early access ${policyTip('Get new features before everyone else. They may still change.')}</span>
+      <span class="setting-value"><input type="checkbox" class="toggle" id="early-access-toggle" aria-label="Early access" ${access.enabled ? 'checked' : ''} ${access.canManage ? '' : 'disabled'}></span></div>`;
+    const input = box.querySelector('input');
+    input.onchange = async () => {
+      input.disabled = true;
+      try {
+        const saved = await api(url, { method: 'PUT', body: JSON.stringify({ enabled: input.checked }) });
+        const organization = organizationById(organizationId);
+        if (organization) organization.features = saved.features;
+        toast(saved.enabled ? 'Early access on' : 'Early access off');
+      } catch (error) {
+        input.checked = !input.checked;
+        toast(error.message, true);
+      } finally { input.disabled = false; }
+    };
+  } catch (error) { paneError(box, error, () => hydrateEarlyAccess(organizationId)); }
 }
 
 async function hydrateAvatarAvailability(scope, id) {
@@ -27471,7 +27699,7 @@ function installationView() {
   return `<div class="organization-settings installation-settings"><div class="settings-header"><h1 class="page-title">Installation ${policyTip(`Settings for every organization and the machine running ${siteName()}. Only operators see them.`)}</h1></div>
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections">
-      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-traffic">Site traffic</a><a href="#installation-errors">Error reports</a><a href="#installation-limits">Service limits</a><a href="#installation-compute">Managed compute</a><a href="#installation-capacity">Host capacity</a>
+      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-traffic">Site traffic</a><a href="#installation-errors">Error reports</a><a href="#installation-early-access">Early access</a><a href="#installation-limits">Service limits</a><a href="#installation-compute">Managed compute</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
       <a href="#installation-access">Phone access</a>${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}
     </nav><div class="settings-content">
@@ -27483,6 +27711,8 @@ function installationView() {
       <div class="card site-traffic" id="site-traffic-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-errors"><div>Error reports ${policyTip(`Unexpected errors of ${siteName()}’s own start a task in this project that finds the cause and fixes it. One runs at a time; it hears of further errors while it works.`)}</div></div>
       <div class="card" id="error-reports-card"><span class="task-sub">Loading…</span></div>
+      <div class="settings-section-title" id="installation-early-access"><div>Early access ${policyTip('New features reach organizations that turned on Early access first, then everyone.')}</div></div>
+      <div class="card" id="early-access-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-limits"><div>Service limits ${policyTip(`Shared accounts and this server against their plans`)}</div></div>
       <div class="card service-limits" id="service-limits-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-compute"><div>Managed compute ${policyTip(`${siteName()}’s own provider accounts. Organizations without their own account run on them, and on the included model, charged to their plan’s monthly compute at twice the provider’s price.`)}</div></div>
@@ -28169,10 +28399,42 @@ async function wireErrorReportsCard() {
   });
 }
 
+const ROLLOUT_STAGES = [['off', 'Off'], ['early', 'Early access'], ['on', 'Everyone']];
+function earlyAccessMarkup(view) {
+  const count = Number(view.earlyAccessOrganizations || 0);
+  const opted = `${count} organization${count === 1 ? '' : 's'} opted in`;
+  if (!view.flags?.length) return `<div class="setting-rows"><div class="setting-row setting-muted">Nothing is rolling out · ${opted}</div></div>`;
+  const audience = `<div class="setting-row setting-muted early-access-audience">${opted}</div>`;
+  return `<div class="setting-rows">${view.flags.map((flag) => `<div class="setting-row"><span class="setting-label">${esc(flag.title)} ${policyTip(flag.description)}</span>
+    <span class="setting-value"><select data-feature-flag="${esc(flag.name)}" aria-label="${esc(flag.title)}" ${view.canManage ? '' : 'disabled'}>${ROLLOUT_STAGES.map(([stage, label]) =>
+      `<option value="${stage}" ${flag.stage === stage ? 'selected' : ''}>${label}</option>`).join('')}</select></span></div>`).join('')}${audience}</div>`;
+}
+async function wireEarlyAccessCard() {
+  const card = $('#early-access-card');
+  if (!card) return;
+  let view;
+  try { view = await api('/api/settings/feature-flags'); }
+  catch (error) { if (card.isConnected) paneError(card, error, () => wireEarlyAccessCard()); return; }
+  if (!card.isConnected) return;
+  card.innerHTML = earlyAccessMarkup(view);
+  for (const select of card.querySelectorAll('select[data-feature-flag]')) {
+    mirrorSegmented(select);
+    select.addEventListener('change', async () => {
+      select.disabled = true;
+      try {
+        await api('/api/settings/feature-flags', { method: 'PUT', body: JSON.stringify({ name: select.dataset.featureFlag, stage: select.value }) });
+        toast('Rollout saved');
+      } catch (error) { toast(error.message, true); }
+      await wireEarlyAccessCard();
+    });
+  }
+}
+
 function wireInstallationSettings() {
   wireInstallationUsers();
   wireSiteTrafficCard();
   wireErrorReportsCard();
+  wireEarlyAccessCard();
   wireSettingsNavigation();
   wireAppearanceCard();
   refreshHostDiag();
@@ -28472,7 +28734,8 @@ function organizationView() {
         <option value="members" ${org?.nameVisibility !== 'public' ? 'selected' : ''}>Members only</option>
         <option value="public" ${org?.nameVisibility === 'public' ? 'selected' : ''}>Everyone signed in</option>
       </select></span></div>
-      <div id="organization-conversation-sharing"><div class="setting-row setting-muted">Loading…</div></div></div></div>
+      <div id="organization-conversation-sharing"><div class="setting-row setting-muted">Loading…</div></div>
+      <div id="organization-early-access"><div class="setting-row setting-muted">Loading…</div></div></div></div>
     <div class="card" id="organization-roles"><div class="setting-muted">Loading roles…</div></div>
     <div class="settings-section-title" id="settings-code"><div>Resources</div></div>
     <div class="card"><div class="section-h">Git &amp; GitHub</div><div id="org-github">Loading…</div></div>
@@ -28597,6 +28860,7 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
     wireSettingsNavigation();
     hydrateSettingsAccess({ organizationId });
     hydrateConversationSharing('organization', organizationId);
+    hydrateEarlyAccess(organizationId);
     hydrateAvatarAvailability('organization', organizationId);
     setEventHandler($('#export-organization'), 'click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
     const renameOrganization = async () => {
