@@ -1,0 +1,61 @@
+name: Production check
+
+# Is tavya.io working right now, between deploys? Every 15 minutes the smoke
+# suite's public checks (scripts/smoke.mjs); once an hour, and on a dispatch,
+# also a real task in the smoke project (secret PRODUCTION_SMOKE_TOKEN,
+# variable PRODUCTION_SMOKE_PROJECT_ID). Staging, when there is one, gets the
+# public checks. A failure is a failed default-branch run, so tavya opens a
+# recovery task for it (src/integrations/github-app.ts, RELEASE_WORKFLOWS).
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-check
+  cancel-in-progress: false
+
+jobs:
+  production:
+    name: production
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22.16.0'
+      - env:
+          URL: ${{ vars.PRODUCTION_URL || 'https://tavya.io' }}
+          SMOKE_TOKEN: ${{ secrets.PRODUCTION_SMOKE_TOKEN }}
+          SMOKE_PROJECT_ID: ${{ vars.PRODUCTION_SMOKE_PROJECT_ID }}
+          SMOKE_TASK_PARAMS: ${{ vars.PRODUCTION_SMOKE_TASK_PARAMS }}
+          DISPATCHED: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          task=
+          if [ -n "$SMOKE_TOKEN" ] && [ -n "$SMOKE_PROJECT_ID" ] \
+            && { [ "$DISPATCHED" = true ] || [ "$(date -u +%M)" -lt 15 ]; }; then task=--task; fi
+          node scripts/smoke.mjs --url "$URL" $task
+
+  staging:
+    name: staging
+    if: vars.STAGING_URL != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22.16.0'
+      - env:
+          URL: ${{ vars.STAGING_URL }}
+        run: node scripts/smoke.mjs --url "$URL"

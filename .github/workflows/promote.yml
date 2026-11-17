@@ -1,0 +1,69 @@
+name: Promote
+
+# Moves a commit that passed staging to production (wiki ops/release-and-deploy,
+# "Promotion"). Every half hour it promotes the newest master commit that
+# passed staging at least PROMOTE_SOAK_MINUTES ago (default 60), at most every
+# PROMOTE_INTERVAL_MINUTES (default 240), unless DEPLOYS_PAUSED is true; all
+# three are repository variables. A dispatch promotes now: the named commit, or
+# the newest that passed staging, waiving soak, interval and pause, but never
+# staging. Production gets the image staging ran (scripts/promote.mjs).
+# Without a staging instance (no STAGING_URL) Deploy goes straight to
+# production and this does nothing.
+on:
+  schedule:
+    - cron: '17,47 * * * *'
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Master commit to promote (empty for the newest that passed staging)
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  packages: read
+  statuses: write
+
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+jobs:
+  choose:
+    name: choose a commit
+    if: vars.STAGING_URL != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.choose.outputs.sha }}
+      image: ${{ steps.choose.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22.16.0'
+      - id: choose
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROMOTE_BRANCH: ${{ github.event.repository.default_branch }}
+          PROMOTE_SHA: ${{ inputs.sha }}
+          PROMOTE_NOW: ${{ github.event_name == 'workflow_dispatch' }}
+          DEPLOYS_PAUSED: ${{ vars.DEPLOYS_PAUSED }}
+          PROMOTE_SOAK_MINUTES: ${{ vars.PROMOTE_SOAK_MINUTES }}
+          PROMOTE_INTERVAL_MINUTES: ${{ vars.PROMOTE_INTERVAL_MINUTES }}
+        run: node scripts/promote.mjs
+
+  production:
+    name: promote
+    needs: choose
+    if: needs.choose.outputs.sha != ''
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: production
+      sha: ${{ needs.choose.outputs.sha }}
+      image: ${{ needs.choose.outputs.image }}
+    secrets: inherit
