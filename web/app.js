@@ -8072,7 +8072,9 @@ function rowAskHtml(t) {
       <span class="row-ask-q">Give <span class="mono">${esc(request.login)}</span> access to <span class="mono">${esc(request.slug)}</span>?</span>
       <span class="row-ask-actions"><button type="button" class="btn sm primary" data-raccess-act="approve">Give access</button><button type="button" class="btn sm" data-raccess-act="deny">Deny</button></span></div>`),
   ];
-  if (!decisions.length) return '';
+  // Out of date and with nothing to show, it still holds its place: the reload
+  // it asks for may bring a new ask (#955: the row's next request never showed).
+  if (!decisions.length) return stale ? `<div class="row-ask" data-row-decisions="${esc(t.id)}" data-stale></div>` : '';
   // An answer on its way keeps its buttons pressed through a repaint.
   const shown = decisions.slice(0, 2).map((html) => {
     const id = html.match(/data-(?:vreq|preq|areq|raccess)="([^"]*)"/)?.[1];
@@ -8085,6 +8087,7 @@ async function loadRowDecisions(t) {
   if (rowDecisionLoads.get(t.id)?.key === key) return rowDecisionLoads.get(t.id).promise;
   const organizationId = rowOrganizationId(t);
   const query = `taskId=${encodeURIComponent(t.id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
+  const load = { key };
   const promise = (async () => {
     const [credential, permission, authorization, repository, connections] = await Promise.all([
       api(`/api/vault/requests?${query}`).catch(() => []), api(`/api/permission-requests?${query}`).catch(() => []),
@@ -8092,9 +8095,12 @@ async function loadRowDecisions(t) {
       api(`/api/connections?${query}`).catch(() => [])]);
     const items = credential.some((request) => request.status === 'pending')
       ? await api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []) : [];
+    // A load overtaken by a newer one (its key changed meanwhile) leaves the newer one's answer alone.
+    if (rowDecisionLoads.get(t.id) !== load) return;
     rowDecisions.set(t.id, { key, credential, permission, authorization, repository, connections: connections.filter((c) => c.taskId === t.id), items });
-  })().finally(() => rowDecisionLoads.delete(t.id));
-  rowDecisionLoads.set(t.id, { key, promise });
+  })().finally(() => { if (rowDecisionLoads.get(t.id) === load) rowDecisionLoads.delete(t.id); });
+  load.promise = promise;
+  rowDecisionLoads.set(t.id, load);
   return promise;
 }
 /** Load what list rows ask, answer from them, and refresh the lists after a decision. */
@@ -12650,6 +12656,10 @@ function reviewTile(a, i) {
 }
 
 function reviewActionBtn(a, i) {
+  // A decided spend asks nothing more: its approve button becomes the outcome,
+  // its deny button and funding link go (#960).
+  if (a.resolved) return a.kind === 'payment' && a.operation === 'approve'
+    ? `<span class="review-resolved" role="status">${a.resolved === 'denied' ? '✕ Spend denied' : '✓ Spend approved'}</span>` : '';
   const isRun = a.kind === 'run';
   const isPayment = a.kind === 'payment';
   const icon = isPayment ? (a.operation === 'deny' ? '✕' : '✓') : isRun ? (a.server ? '▶' : '⚡') : '↗';
@@ -12987,8 +12997,9 @@ function wireReviewActions(v) {
         const resolve = () => api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index: idx }) });
         const r = await resolve();
         if (kind === 'payment') {
-          toast(r.result?.status === 'granted' ? `Spend approved${r.resumed ? ' — task continuing' : ''}` : r.result?.reason || 'Spend request updated',
-            r.result?.status === 'denied');
+          toast(r.alreadyResolved ? `Already ${r.result?.status === 'denied' ? 'denied' : 'approved'}`
+            : r.result?.status === 'granted' ? `Spend approved${r.resumed ? ' — task continuing' : ''}` : r.result?.reason || 'Spend request updated',
+            !r.alreadyResolved && r.result?.status === 'denied');
           await refreshTask();
           return;
         }

@@ -6781,16 +6781,24 @@ export class Gateway {
             return this.json(res, 503, { error: 'payments are unavailable' });
           const { BudgetService } = await import('../autonomy/payments.js');
           const budget = new BudgetService(store, this.deps.paymentRegistry ?? this.deps.payments!);
+          const waiting = ['pending_approval', 'needs_funding'].includes(request.status);
           const principal = actorPrincipal(callerIdentity.actor);
+          // Either answers a request already decided with its outcome, changing nothing.
           const result = action.operation === 'deny'
             ? (await budget.deny(request.id, principal))
             : await budget.approve(request.id, principal);
+          // A page that still showed the buttons (another tab, a second click)
+          // tells the agent nothing twice (#960).
+          if (!waiting) return this.json(res, 200, { kind: 'payment', result, resumed: false, alreadyResolved: true });
           let resumed = false;
           if (result.status === 'granted') {
             resumed = await api.signalTask(token, taskId, 'followUp',
               `Payment request ${request.id} is approved and ready. Continue the purchase using the same request.`)
               .then(() => true, () => false);
           }
+          // Its buttons are settled now (withSpendResolutions): every open page re-reads.
+          // This POST sends no change notice (task:review:execute), so an event carries it.
+          await this.emitTaskEvent({ taskId, type: 'review.updated', ts: Date.now(), payload: { requestId: request.id } });
           return this.json(res, 200, { kind: 'payment', result, resumed });
         }
         const handle = worldHandleForView(view, taskId, task ? (await store.effectiveProjectConfig(task.projectId)) : undefined);

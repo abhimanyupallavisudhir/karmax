@@ -1604,9 +1604,12 @@ export interface ReviewAction {
   openUrls?: string[];
   /** `open` only: world-relative file path OR an absolute URL to open. */
   target?: string;
-  /** `payment` only: durable spend request and reviewer operation. */
+  /** The durable spend request a payment action (or its funding link) belongs to. */
   requestId?: string;
+  /** `payment` only: the reviewer operation. */
   operation?: 'approve' | 'deny';
+  /** Set when served: its spend request was already decided, so nobody is asked any more. */
+  resolved?: 'approved' | 'denied';
 }
 
 export interface ReviewInfo {

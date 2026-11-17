@@ -69,6 +69,43 @@ describe('request_spend through the agent loop (SPEC §7.6)', () => {
     const after = await get(`/api/cards?projectId=${projectId}`);
     expect(after.find((c: any) => c.id === cardId).available).toBe(0);
   });
+  it('shows a spend waiting for approval while the turn still runs, and settles its buttons once approved', async () => {
+    await post(`/api/cards/${cardId}/fund`, { amount: 10000 });
+    const t = await post(`/api/projects/${projectId}/tasks`, { workflow: 'just-do', params: {
+      prompt: '@spend 1200 :: a domain\n@sleep 6000', paymentPolicy: { cardIds: [cardId], budget: 0 } } });
+    // The ask reaches the page as it is made: the open page re-reads on `review.updated`,
+    // and what it reads already carries the buttons (#960: they needed a reload).
+    let during: any;
+    for (let i = 0; i < 80 && !during; i++) {
+      const v = await get(`/api/tasks/${t.id}`);
+      if (v.reviewInfo?.actions?.some((a: any) => a.kind === 'payment')) during = v;
+      else await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(during, 'the spend never showed while the turn ran').toBeTruthy();
+    expect(during.stage).toBe('do');
+    const asked = await get(`/api/tasks/${t.id}/events?since=0`);
+    const spendAt = asked.findIndex((e: any) => e.type === 'spend.requested');
+    expect(asked.slice(spendAt).some((e: any) => e.type === 'review.updated')).toBe(true);
+    const approve = during.reviewInfo.actions.findIndex((a: any) => a.kind === 'payment' && a.operation === 'approve');
+    const seen = asked.at(-1).seq;
+
+    const first = await post(`/api/tasks/${t.id}/review-action`, { index: approve });
+    expect(first.result.status).toBe('granted');
+    expect(first.resumed).toBe(true);
+    // Every tab hears it, and what they read no longer asks (#960: approved twice).
+    const after = await get(`/api/tasks/${t.id}/events?since=${seen}`);
+    expect(after.some((e: any) => e.type === 'review.updated')).toBe(true);
+    const settled = (await get(`/api/tasks/${t.id}`)).reviewInfo.actions.filter((a: any) => a.kind === 'payment');
+    expect(settled.map((a: any) => a.resolved)).toEqual(['approved', 'approved']);
+    // A second click (a stale page) changes nothing and tells the agent nothing.
+    const second = await post(`/api/tasks/${t.id}/review-action`, { index: approve });
+    expect(second).toMatchObject({ resumed: false, alreadyResolved: true });
+    const told = async () => (JSON.stringify(await get(`/api/tasks/${t.id}/conversation`)).match(/is approved and ready/g) ?? []).length;
+    for (let i = 0; i < 50 && !(await told()); i++) await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 1000));
+    expect(await told()).toBe(1);
+  }, 60_000);
+
   it('raises the task budget through HTTP and resumes the earliest payment without a separate approval', async () => {
     await post(`/api/cards/${cardId}/fund`, { amount: 10000 });
     const created = await post(`/api/projects/${projectId}/tasks`, { workflow: 'just-do', params: {

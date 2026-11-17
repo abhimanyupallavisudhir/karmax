@@ -2,7 +2,7 @@ import { currentTiming } from '../timing/index.js';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, TurnResult } from './types.js';
 import type { Transition } from '../resolve/transitions.js';
 import { assertReviewInfoTotal, mergeReviewActions, validateReviewInfoCall } from './review-info.js';
-import { AgentActivity, AgentWait, Provider, ReviewInfo, SubTaskRequest, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
+import { AgentActivity, AgentWait, Provider, ReviewAction, ReviewInfo, SubTaskRequest, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 import { jobStatuses } from '../world/jobs.js';
 import { worldRepos } from '../world/types.js';
 import { BRAND } from '../domain/brand.js';
@@ -414,22 +414,31 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       if (!deps.budget || !deps.spendCtx) return { status: 'denied', reason: 'payments not configured' };
       const outcome = await deps.budget.request(deps.spendCtx, args);
       await deps.onSpend?.(args, outcome);
-      // surface a pending spend at the Review gate so the human can fund/approve
+      // Surface a pending spend so a person can fund or approve it, published
+      // like create_review_info: at once, not when the turn ends (#960).
       if (outcome.status !== 'granted') {
         const note = spendReviewSummary(outcome, args);
-        const actions = outcome.requestId && (outcome.status === 'needs_approval' || outcome.status === 'needs_funding')
+        const actions: ReviewAction[] = outcome.requestId && (outcome.status === 'needs_approval' || outcome.status === 'needs_funding')
           ? [
-              { kind: 'payment' as const, label: outcome.status === 'needs_funding' ? 'Retry after funding' : 'Approve spend',
-                requestId: outcome.requestId, operation: 'approve' as const },
-              { kind: 'payment' as const, label: 'Deny spend', requestId: outcome.requestId, operation: 'deny' as const },
+              { kind: 'payment', label: outcome.status === 'needs_funding' ? 'Retry after funding' : 'Approve spend',
+                requestId: outcome.requestId, operation: 'approve' },
+              { kind: 'payment', label: 'Deny spend', requestId: outcome.requestId, operation: 'deny' },
+              // Its request goes with it, so it goes once the request is resolved.
               ...(outcome.fundingUrl
-                ? [{ kind: 'open' as const, label: 'Fund in Stripe', target: outcome.fundingUrl }]
+                ? [{ kind: 'open' as const, label: 'Fund in Stripe', target: outcome.fundingUrl, requestId: outcome.requestId }]
                 : []),
             ]
           : [];
-        reviewInfo = { ...reviewInfo, summary: note,
-          actions: [...(reviewInfo?.actions ?? []), ...actions] };
-        await journal();
+        const supplied: ReviewInfo = { summary: note, ...(actions.length ? { actions } : {}) };
+        const publication = reviewPublication.then(async () => {
+          const nextReviewInfo = { ...reviewInfo, summary: note, actions: [...(reviewInfo?.actions ?? []), ...actions] };
+          // The spend's own record is already saved: failing to show it must not fail the tool.
+          await Promise.resolve(deps.onReviewInfo?.(nextReviewInfo, supplied)).catch(() => {});
+          reviewInfo = nextReviewInfo;
+          await journal();
+        });
+        reviewPublication = publication.catch(() => {});
+        await publication;
       }
       return outcome;
     },

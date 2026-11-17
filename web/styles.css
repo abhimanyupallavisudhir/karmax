@@ -1597,6 +1597,7 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
 .review-info-line .role { flex-shrink: 0; }
 .review-info-caption { white-space: pre-wrap; }
 .review-info .review-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 5px; }
+.review-info .review-resolved { font-size: 12px; color: var(--ink-3); padding: 0 4px; }
 .review-info #review-action-out { max-height: 180px; overflow: auto; margin: 5px 0 0; }
 /* Review files: a gallery of thumbnails (images, videos) and file tiles. */
 .review-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 10px; width: 100%; margin: 4px 0 6px; }
