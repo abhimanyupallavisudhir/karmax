@@ -9,7 +9,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
-import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, SDK_CONTROL_TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
+import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, SDK_CONTROL_TOOL_SCHEMAS, COMPUTERLESS_TOOL_SCHEMAS, computerlessToolHandlers, platformToolHandlers } from './tools.js';
+import { isComputerlessWorld, loginNeedsComputer } from './computerless.js';
 import { CLAUDE_DEFAULT_MODEL, claudeMaxTokens, claudeMessagesEffort } from './effort.js';
 import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
@@ -90,6 +91,13 @@ export class ClaudeAdapter implements AgentAdapter {
     throw new Error('ClaudeAdapter: no ANTHROPIC_API_KEY and no Claude Code login found');
   }
 
+  /** A task without a computer: the Messages API loop with only tavya's own
+   * tools. A Claude Code login is its CLI, which needs a computer. */
+  async runComputerlessTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    if (!input.resolvedAuth?.apiKey && (input.resolvedAuth?.configHome || !ClaudeAdapter.hasApiKey())) throw loginNeedsComputer('claude');
+    return this.runMessagesApi(input, ctx);
+  }
+
   // ─── Anthropic Messages API (tool-use loop) ─────────────────────────────────
   private async runMessagesApi(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
     const apiKey = input.resolvedAuth?.apiKey ?? process.env.ANTHROPIC_API_KEY!;
@@ -99,12 +107,17 @@ export class ClaudeAdapter implements AgentAdapter {
     // but not effort-capable, so `claudeMessagesEffort` returned undefined for it).
     const model = input.profile.model ?? CLAUDE_DEFAULT_MODEL;
     (await (await currentTiming())?.mark('provider.selected', { provider: 'claude', model }));
-    const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal, input.toolsOptional);
+    // Without a computer: tavya's own tools only, and no MCP server to start.
+    const computerless = isComputerlessWorld(input.world);
+    const mcp = computerless ? { tools: [], handlers: {}, unavailable: [], close: async () => {} }
+      : await apiMcpTools(input.world, input.agentMcp, ctx.signal, input.toolsOptional);
     if (mcp.unavailable.length) await ctx.emitActivity?.(toolsUnavailableActivity(mcp.unavailable));
     const reportedUsage = new ReportedUsage();
     try {
-    const handlers = { ...platformToolHandlers(input.world, ctx, () => workEnvironment(input)), ...mcp.handlers };
-    const tools = [...MESSAGES_API_TOOLS, ...mcp.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }))];
+    const handlers: Record<string, (args: any) => Promise<string>> = computerless ? computerlessToolHandlers(input.world, ctx)
+      : { ...platformToolHandlers(input.world, ctx, () => workEnvironment(input)), ...mcp.handlers };
+    const tools = computerless ? COMPUTERLESS_TOOL_SCHEMAS.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }))
+      : [...MESSAGES_API_TOOLS, ...mcp.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }))];
 
     const messages: any[] = [];
     const userMsgs = input.messages.filter((m) => m.role !== 'system');

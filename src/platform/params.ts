@@ -1,6 +1,6 @@
 import { FieldSpec, FieldMutable, TaskInput, AgentSpec, ConfirmConfig, ResponderConfig, ProjectConfig, Project } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
-import { applyComputer, normalizeComputer } from '../domain/computer.js';
+import { applyComputer, normalizeComputer, withoutCheckoutsIfComputerless } from '../domain/computer.js';
 import { WorkflowManifest } from '../contrib/manifests.js';
 import { expandPath } from '../util/expand.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
@@ -233,6 +233,8 @@ export function assembleTaskInput(
   const windows: Record<string, FieldMutable> = {};
   for (const f of manifest.params) if (f.mutable && f.mutable !== 'queue') windows[f.name] = f.mutable;
   if (Object.keys(windows).length) input.paramWindows = windows;
+  // A task without a computer (its own, or its project's default) has no checkouts.
+  input.project = withoutCheckoutsIfComputerless(input.project);
   return input;
 }
 

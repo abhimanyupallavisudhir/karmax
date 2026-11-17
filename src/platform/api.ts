@@ -9,7 +9,7 @@ import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Clien
 import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store, slugify, type CollaborationRequest } from '../store/db.js';
 import { TokenAuthority, type HumanDelegationArgs, type ScopedToken } from './tokens.js';
-import { TOOL_CAPABILITY, Capability, ORGANIZATION_WIKI_WRITE_DENIED, allows } from './capabilities.js';
+import { TOOL_CAPABILITY, Capability, ORGANIZATION_WIKI_WRITE_DENIED, allows, heldBackCapabilities, withoutCapabilities } from './capabilities.js';
 import { AppGrants, sessionCapabilities } from '../auth/app-grants.js';
 import { WORKFLOW_TYPE, SIG, pinnedType, TASK_WORKFLOW_TASK_TIMEOUT } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
@@ -53,8 +53,8 @@ import { parseQuery } from '../domain/query-language.js';
 import { assertComputerFits, providerLabel } from '../domain/computer-limits.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
 import { taskProvider } from '../world/task-provider.js';
-import { ANY_PROVIDER, applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, isAnyProvider, machineShape, normalizeComputer, sameMachine,
-  type ComputerSpec, type MachineShape, worldMachine } from '../domain/computer.js';
+import { ANY_PROVIDER, applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, isAnyProvider, isComputerless, machineShape, normalizeComputer, sameMachine,
+  type ComputerSpec, type MachineShape, worldMachine, LOCAL_WORLD_KINDS, runsOnHost } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { splitSharedSettings } from '../domain/shared-settings.js';
 import { coordinatorRetryMinutes, coordinatorSetting, normalizeCoordinatorSetting } from '../domain/coordinator.js';
@@ -1039,7 +1039,7 @@ export class KarmaxApi {
       ? (await this.deps.store.effectiveProjectConfig({ ...project, config: applyExecutionConfig(project.config, policy) }))
       : policy;
     const provider = typeof candidate.worldProvider === 'string' ? candidate.worldProvider : undefined;
-    if (provider && !['worktree', 'container', 'memory'].includes(provider)
+    if (provider && !LOCAL_WORLD_KINDS.includes(provider)
       && !(await this.deps.providerConnections?.available(input.organizationId, provider)))
       throw new Error(`${provider} is not connected and verified`);
     if (provider && policy.resources && typeof policy.resources === 'object')
@@ -1279,8 +1279,8 @@ export class KarmaxApi {
     } catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
     const provider = computer?.provider;
     if (provider) {
-      const local = ['worktree', 'container', 'memory'].includes(provider);
-      if (local && this.deps.hosted) throw new ValidationError('hosted tasks run on a cloud computer (E2B, Daytona, Fly.io or Hetzner)');
+      const local = LOCAL_WORLD_KINDS.includes(provider);
+      if (runsOnHost(provider) && this.deps.hosted) throw new ValidationError('hosted tasks run on a cloud computer (E2B, Daytona, Fly.io or Hetzner)');
       if (!local && this.deps.providerConnections
         && !(await this.deps.providerConnections.available(project.organizationId ?? 'org_personal', provider)))
         throw new ValidationError(`${provider} is not connected. Connect it under Settings → Computers first.`);
@@ -1296,6 +1296,13 @@ export class KarmaxApi {
       catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
     }
     return computer;
+  }
+
+  /** Whether a task with these params runs without a computer: its own
+   * Computer, else its project's and organization's default. */
+  private async computerlessParams(project: Project, params: Record<string, unknown>): Promise<boolean> {
+    const computer = normalizeComputer(params.computer);
+    return isComputerless(applyComputer(await this.deps.store.effectiveProjectConfig(project), computer).worldProvider);
   }
 
   /** Store a task's Computer in its one canonical, validated form. */
@@ -1555,6 +1562,12 @@ export class KarmaxApi {
       createdBy?: PrincipalRef;
       /** Canonical level plus its project-list / organization / global scope. */
       authorization?: AuthorizationSelection;
+      /** Act with the creator's own level and scope (their membership), not the
+       * project's default: how the console's "Ask" starts a task for its person. */
+      ownAuthority?: boolean;
+      /** A task without a computer holds back the irreversible capabilities
+       * (IRREVERSIBLE_CAPABILITIES); these are the ones its creator keeps. */
+      keepIrreversible?: Capability[];
       /** Draft auto-save may preserve an over-broad selection as an explicitly
        * unaccepted attenuated package. `acceptAttenuation` is the user's choice
        * to run with that limited package. */
@@ -1670,7 +1683,9 @@ export class KarmaxApi {
       authorization = granted;
       credentialPolicies = granted.credentialPolicies;
     } else {
-      const requestedAuthorization = args.authorization ?? args.authorizationProfile ?? (await this.authorizationDefault(project));
+      const own = args.ownAuthority && !args.authorization && caller.kind !== 'agent'
+        ? await this.deps.authorization?.selectionForPrincipal(caller.principal, organizationId) : undefined;
+      const requestedAuthorization = args.authorization ?? own ?? args.authorizationProfile ?? (await this.authorizationDefault(project));
       const grantorCaps = (await this.authorizationGrantorCaps(token, caller, requestedAuthorization, organizationId)
         .catch(async (error) => { throw error instanceof CapabilityError && args.authorization
           ? await this.authorizationGap(token, args.projectId, args.authorization, { kind: 'new-task' }, { canLimit: false }) : error; }));
@@ -1729,6 +1744,13 @@ export class KarmaxApi {
     taskOverrides.paymentPolicy ??= paymentDefaults;
     this.assertBranchParams(taskOverrides);
     (await this.normalizeTaskComputer(project, taskOverrides));
+    // A task without a computer holds back the irreversible capabilities its
+    // creator does not keep explicitly; its agent asks for one when it needs
+    // it (request_permission). Shown in its authorization like any limit.
+    let heldBack: Capability[] = [];
+    try { heldBack = (await this.computerlessParams(project, taskOverrides)) ? heldBackCapabilities(args.keepIrreversible) : []; }
+    catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
+    if (heldBack.length) authorization = { ...authorization, capabilities: withoutCapabilities(authorization.capabilities, heldBack) };
     // A `resumeFrom` pointer reads another task's conversation — authorize it
     // against that task's project before anything is created.
     (await this.validateAndAuthorizeResumeSources(token, taskOverrides, args.projectId));
@@ -1809,6 +1831,7 @@ export class KarmaxApi {
           profiles: args.profiles,
           draft: !!args.draft,
           _authorization: { ...authorization, profileAttenuated, principal: mainAvatar ? avatarPrincipal(mainAvatar.id) : caller.principal, credentialPolicies,
+            ...(heldBack.length ? { heldBack } : {}),
             ...(missingCredentialGrants.length ? { missingCredentialGrants } : {}),
             ...(limited ? { attenuationAccepted: acceptsTaskAttenuation } : {}) },
           ...(githubAccountId ? { _githubAccountId: githubAccountId } : {}),
@@ -2317,8 +2340,15 @@ export class KarmaxApi {
     });
     input.createdAt = task.createdAt;
     input.workflow = task.workflow;
-    const auth = _authorization as { capabilities?: string[]; principal?: string; profileId?: string; delegationId?: string } | undefined;
+    const auth = _authorization as { capabilities?: string[]; principal?: string; profileId?: string; delegationId?: string; heldBack?: string[] } | undefined;
     input.grant = auth?.capabilities ?? ['task:signal'];
+    // A task that became computerless after it was created (a draft's Computer
+    // edited, a project default changed) holds back what any such task does.
+    if (isComputerless(input.project.worldProvider) && auth && !auth.heldBack) {
+      const heldBack = heldBackCapabilities(undefined);
+      input.grant = withoutCapabilities(input.grant, heldBack);
+      (await this.deps.store.patchTaskParams(task.id, { _authorization: { ...auth, capabilities: input.grant, heldBack } }));
+    }
     input.grantPrincipal = auth?.principal ?? 'system:legacy-task';
     input.delegationId = auth?.delegationId;
     input.authorizationProfile = auth?.profileId ?? 'legacy';
@@ -2786,8 +2816,11 @@ export class KarmaxApi {
     const priorAuthorization = task.params?._authorization as {
       credentialPolicies?: VaultTaskPolicyOverrides; delegationId?: string; principal?: string;
       attenuationAccepted?: boolean; level?: string; scope?: string; projectIds?: string[]; capabilities?: string[];
-      missingCredentialGrants?: string[];
+      missingCredentialGrants?: string[]; heldBack?: Capability[];
     } | undefined;
+    // What a task without a computer held back stays held back at any level.
+    if (priorAuthorization?.heldBack?.length)
+      authorization.capabilities = withoutCapabilities(authorization.capabilities, priorAuthorization.heldBack);
     if (options.preserveCredentialGrants) for (const capability of priorAuthorization?.capabilities ?? []) {
       if (capability.startsWith('use-credential:') && !authorization.capabilities.includes(capability))
         authorization.capabilities.push(capability);
@@ -4991,6 +5024,9 @@ When ready, call signal_task for task id ${task.id} with signal "followUp" and t
     let audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
     const grantors = await this.permissionGrantors(task, project.organizationId,
       projectIds.length ? capabilities : missing, projectIds, baseAuthorization);
+    // What a task without a computer held back is its person's to give back:
+    // its creator, when they hold it (wiki features/computerless-tasks).
+    if (!audience.length && !projectIds.length && (await this.heldBackForCreator(task, project.organizationId, missing))) audience = ['@creator'];
     // No audience: the nearest who can grant it (permissionGrantors), else the creator.
     if (!audience.length) audience = [grantors.default ?? '@creator'];
     // A sub-task's parent at work that cannot grant it either: it comes through
@@ -5198,6 +5234,17 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
   }
 
   /** Who can grant a task agent what it asks for (`GET /api/agent/escalation-targets?capabilities=`). */
+  /** Whether every capability asked for is one the task held back for having
+   * no computer, and its creator — a person — holds them all. */
+  private async heldBackForCreator(task: TaskRecord, organizationId: string, capabilities: Capability[]): Promise<boolean> {
+    const held = (task.params?._authorization as { heldBack?: Capability[] } | undefined)?.heldBack ?? [];
+    if (!held.length || !capabilities.length || !capabilities.every((capability) => allows(held, capability))) return false;
+    const creator = await this.deps.store.taskCreatorUserId(task.id);
+    if (!creator || !this.deps.authorization) return false;
+    const caps = await this.deps.authorization.capabilities(`user:${creator}`, task.projectId, organizationId);
+    return capabilities.every((capability) => allows(caps, capability));
+  }
+
   async permissionGrantorsFor(token: string, input: { capabilities?: string[]; projectIds?: string[] }): Promise<PermissionGrantors & { missing: Capability[] }> {
     const caller = (await this.require(token, 'request_permission'));
     if (caller.taskId === '*') throw new Error('this endpoint requires a task-agent token');
@@ -7885,7 +7932,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       if (computerBefore) {
         (await this.deps.store.patchTaskParams(taskId, { computer: patch.computer }));
         const world = (await this.deps.store.currentWorld(taskId));
-        if (world && !world.meta?.computer && !['worktree', 'container', 'memory'].includes(world.kind))
+        if (world && !world.meta?.computer && !LOCAL_WORLD_KINDS.includes(world.kind))
           (await this.deps.store.updateWorldMeta(world, { computer: machineShape(computerBefore) }).catch(() => undefined));
         result.applied = [...new Set([...result.applied, 'computer'])];
         // A VM world's disk grows now, under the running agent (vm/provider.ts).

@@ -29,6 +29,25 @@ export interface ComputerSpec {
   region?: ComputeRegion;
 }
 
+/** The provider of a task without a computer (wiki features/computerless-tasks):
+ * its agent runs host-side with only tavya's own tools, so nothing executes, no
+ * sandbox is made and nothing is billed as compute. */
+export const NO_COMPUTER = 'none';
+export function isComputerless(provider: string | undefined): boolean {
+  return provider === NO_COMPUTER;
+}
+
+/** World kinds whose code runs on this host (a worktree, a Docker container,
+ * the test memory world): never on hosted, which runs task code only remotely. */
+export const HOST_WORLD_KINDS: readonly string[] = ['worktree', 'container', 'memory'];
+/** World kinds with no metered remote sandbox and no provider control plane to
+ * reconcile against: the host's own, and a task without a computer. */
+export const LOCAL_WORLD_KINDS: readonly string[] = [...HOST_WORLD_KINDS, NO_COMPUTER];
+/** Whether a world of this kind runs task code on this host. */
+export function runsOnHost(kind: string | undefined): boolean {
+  return !!kind && HOST_WORLD_KINDS.includes(kind);
+}
+
 /** The provider value that asks tavya to choose (wiki features/compute-routing). */
 export const ANY_PROVIDER = 'any';
 export function isAnyProvider(provider: string | undefined): boolean {
@@ -149,17 +168,23 @@ export function computerConfig(spec: ComputerSpec | undefined): Partial<ProjectC
   return out;
 }
 
+/** A task without a computer has nowhere to check a repository out: its
+ * effective config has none, so its run is repository-less (no branch, no PR). */
+export function withoutCheckoutsIfComputerless<T extends Partial<ProjectConfig>>(config: T): T {
+  return isComputerless(config.worldProvider) && config.repos?.length ? { ...config, repos: [] } : config;
+}
+
 /** Layer a task's sparse computer onto its project's effective config. Nested
  * resource and environment keys merge; the network policy is atomic. */
 export function applyComputer<T extends Partial<ProjectConfig>>(config: T, spec: ComputerSpec | undefined): T {
   const patch = computerConfig(spec);
   if (!Object.keys(patch).length) return config;
-  return {
+  return withoutCheckoutsIfComputerless({
     ...config,
     ...patch,
     ...(patch.resources ? { resources: { ...config.resources, ...patch.resources } } : {}),
     ...(patch.environment ? { environment: { ...config.environment, ...patch.environment } } : {}),
-  };
+  });
 }
 
 /** The physical size of a machine, as recorded on a world when it is created. */
@@ -205,8 +230,6 @@ export function describeMachine(shape: MachineShape): string {
   ].join(' · ');
 }
 
-const LOCAL_PROVIDERS = new Set(['worktree', 'container', 'memory']);
-
 /** Reject an in-flight edit that would change more than the machine's size and
  * where it runs. A running task may move to another cloud provider (it moves at
  * its next idle park, through its checkpoint), unless that provider lacks
@@ -217,8 +240,13 @@ export function assertInFlightComputerEdit(current: ComputerSpec, next: Computer
   if (next.network !== undefined && JSON.stringify(next.network) !== JSON.stringify(current.network ?? { unrestricted: true }))
     throw new Error('a running task\'s outbound network can\'t change — only its provider, CPU, memory, disk and hibernation');
   // "Any" never moves a world that exists: it routes the next new one.
-  if (next.provider === undefined || next.provider === current.provider || isAnyProvider(next.provider)) return;
-  if (LOCAL_PROVIDERS.has(next.provider) || (current.provider && LOCAL_PROVIDERS.has(current.provider)))
+  if (next.provider === undefined || next.provider === current.provider) return;
+  // A task without a computer never grows one, nor loses the one it has: the
+  // work that needs a machine goes to a task it creates.
+  if (isComputerless(next.provider) || isComputerless(current.provider))
+    throw new Error('a running task can\'t gain or lose its computer: create a task with a computer for that work');
+  if (isAnyProvider(next.provider)) return;
+  if (LOCAL_WORLD_KINDS.includes(next.provider) || (current.provider && LOCAL_WORLD_KINDS.includes(current.provider)))
     throw new Error('a running task moves only between cloud providers');
   const features = providerFeatures(next.provider);
   if (current.flavor === 'desktop' && !features.desktop)

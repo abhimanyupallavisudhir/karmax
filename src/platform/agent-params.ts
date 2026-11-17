@@ -1,6 +1,6 @@
 import type { AgentSpec, Avatar, Project, ProjectConfig, SubTaskParams } from '../domain/types.js';
 import type { Store } from '../store/db.js';
-import { applyComputer, machineShape, normalizeComputer, type ComputerSpec, type MachineShape } from '../domain/computer.js';
+import { LOCAL_WORLD_KINDS, runsOnHost, applyComputer, machineShape, normalizeComputer, type ComputerSpec, type MachineShape } from '../domain/computer.js';
 import { manifest } from '../contrib/manifests.js';
 import { isAgentProvider } from '../agent/provider-registry.js';
 import { validateMcpSelection } from '../mcp/connections/store.js';
@@ -135,8 +135,8 @@ async function subTaskComputer(store: Store, project: Project, parentTaskId: str
   const organizationId = project.organizationId ?? 'org_personal';
   const provider = computer.provider;
   if (provider) {
-    const local = ['worktree', 'container', 'memory'].includes(provider);
-    if (local && store.hosted) throw new ValidationError('hosted tasks run on a cloud computer (E2B, Daytona, Fly.io or Hetzner)');
+    const local = LOCAL_WORLD_KINDS.includes(provider);
+    if (runsOnHost(provider) && store.hosted) throw new ValidationError('hosted tasks run on a cloud computer (E2B, Daytona, Fly.io or Hetzner)');
     if (!local && computers && !(await computers.available(organizationId, provider)))
       throw new ValidationError(`${provider} is not connected. Connect it under Settings → Computers first.`);
   }

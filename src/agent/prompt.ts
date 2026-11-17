@@ -1,4 +1,4 @@
-import { describeMachine, isVmWorldProvider, sameMachine, worldMachine, type MachineShape } from '../domain/computer.js';
+import { describeMachine, isComputerless, isVmWorldProvider, sameMachine, worldMachine, type MachineShape } from '../domain/computer.js';
 import { computerLimits, providerFeatures as computerFeatures, providerLabel, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
 import type { DiskSpace } from '../world/disk.js';
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
@@ -69,6 +69,28 @@ const TOOLS_PREAMBLE = `You are running inside ${BRAND}, an agent-orchestration 
 Do real work directly in the working directory (create/edit files, run commands), verify it, and report the result in your final response. If you are the Do agent and the work is ready for review, call open_pr as your final action. If you need input first, end your turn with the question (or call escalate_to_human for what only a person can give) instead; waiting for input and opening a PR are separate decisions.
 Forms: when a question has set answers or several parts, put a form in your message (a question, a needs_input or escalate_to_human message) instead of "reply A, B or C": a \`\`\`form fence holding JSON. {"label": "Which database?", "options": ["Postgres", "SQLite"]} is answered in one click; otherwise {"title"?, "fields": [{name, label, type?: text|paragraph|number|date|email|url|choice|toggle|secret, options?, multiple?, optional?, placeholder?, default?, hint?}], "submit"?}. The answer reaches you as the person's reply, one "- Label: value" line per field. For a secret or a setting (an API key, a project secret, a provider key), add "save": {method, path, body} — a settings write from the person's own browser with their authority, "{{field}}" in the body replaced by that field's value — so the secret never enters the conversation: you are told only "saved". E.g. {"fields": [{"name": "key", "label": "OpenAI API key", "type": "secret"}], "save": {"method": "POST", "path": "/api/projects/<projectId>/secrets", "body": {"name": "OPENAI_API_KEY", "value": "{{key}}"}}}. Saves go only to settings routes (secrets, environment, task defaults, project/organization/installation settings, agent accounts, computer providers, storage, vault items, MCP servers), and a secret field only as the whole value of a write-only secret field.`;
 
+/** Tools of TOOLS_PREAMBLE a task without a computer does not have (WORLD_TOOL_NAMES in tools.ts). */
+const WORLD_TOOL_LINES = /^- (start_job|stop_job|request_agent_action|cancel_agent_action|publish_task_branch|import_task_branch|refresh_upstream|open_pr|confirm_decision)\(/;
+
+/** What a task without a computer is (wiki features/computerless-tasks). */
+export const NO_COMPUTER_WORLD = `No computer: you run on ${BRAND} itself, with ${BRAND}'s own tools only. You have no shell, files, browser, jobs, branches or pull requests, and nothing you do runs code. `
+  + 'Work that needs a computer (running code, changing a repository, using a website) goes to a task you create with create_task, giving it one '
+  + '(params {"computer": {"provider": "any"}}): describe the work fully in its prompt, follow it (get_conversation, add_follow_up_trigger, message_agent) and report what it did. '
+  + 'Irreversible capabilities (deleting, members, teams, authorization, users, revealing credentials, payments and cards) are held back: when you need one, '
+  + 'ask for exactly it with request_permission (a card as use-card:<id>); my_authorization lists what is held back.';
+
+/** TOOLS_PREAMBLE for a task without a computer: its world tools dropped, and
+ * what it does instead of working in a directory. */
+function computerlessPreamble(preamble: string): string {
+  return preamble.split('\n').filter((line) => !WORLD_TOOL_LINES.test(line)).map((line) => line
+    .replace('Your work happens in a git world (working directory). ', 'This task has no computer. ')
+    .replace(/^- create_sub_task\(title, prompt, params\?, draft\?\): .*$/, '- create_sub_task(title, prompt, params?, draft?): spawn a child task the parent awaits. It acts with your authority, and runs without a computer like you unless params give it one, e.g. {"computer": {"provider": "any"}}. With draft: true it is only saved, and starts when you call queue_task(id).')
+    .replace(/^- create_review_info\(caption\?, actions\?\): .*$/, '- create_review_info(caption?, actions?): optional: a caption saying WHAT to verify (at most 280 characters), and "open" actions for https:// links only.')
+    .replace(/^- pause\(minutes, jobs\?, needs_input\?\): .*$/, '- pause(minutes, needs_input?): end this turn and be resumed when a message arrives or after `minutes`. pause is for waiting, not for asking: when you need an answer, end your turn with the question. With needs_input (message, audience, urgency as for escalate_to_human) the task shows Needs input meanwhile.')
+    .replace(/^Do real work directly in the working directory.*$/, 'Do what is asked with these tools, and report the result in your final response; it ends your turn, and the task waits for the next message. If you need input first, end your turn with the question (or call escalate_to_human for what only a person can give).'))
+    .join('\n');
+}
+
 // Minimal fallback if a role is undeclared and there's no `do` role registered.
 const FALLBACK_TEMPLATE = `{{toolsPreamble}}
 
@@ -119,6 +141,8 @@ export function assemblePrompt(args: AssembleArgs): string {
   const instructions = [args.globalInstructions, args.projectInstructions].filter(Boolean).join('\n\n');
   // A workflow may override the platform tools-preamble for its agents (SPEC §5.4).
   let preamble = (args.task.workflow && manifest(args.task.workflow)?.promptPreamble) || TOOLS_PREAMBLE;
+  const computerless = isComputerless(args.world.kind);
+  if (computerless) preamble = computerlessPreamble(preamble);
   if (args.role === 'do' && args.task.responder?.kind === 'agent') {
     preamble += `
 
@@ -129,7 +153,7 @@ Input routing for this task: its ordinary Waiting-for-input Responder is an agen
   if (coordinator) preamble += coordinatorBrief(coordinator, BRAND);
   if (args.role === 'do' && args.task.parentTaskId) preamble += describeSiblings(args.task.parentTaskId, args.siblings ?? []);
   const target = args.task.target ?? args.world.target ?? args.world.base;
-  if (args.role === 'do' && (target !== args.world.base || args.task.agents?.do?.resumeFrom)) {
+  if (args.role === 'do' && !computerless && (target !== args.world.base || args.task.agents?.do?.resumeFrom)) {
     preamble += `
 
 Git ancestry for recovered, forked, or retargeted work: "recorded base" is the immutable commit this task world was provisioned from; "target" is only the branch the proposal will merge into; current HEAD is the tip you are editing. Retargeting does not rewrite the recorded base. Keep the initially provisioned task HEAD as an ancestor: do not reset, recreate, or replace the task branch with a source/target branch. Integrate the selected target into the existing task branch and apply recovered changes as descendant commits. ${BRAND} checks this before publication and refuses unrelated or reparented history.`;
@@ -157,6 +181,13 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
   // Bindings another agent authored — the Do agent's transcript, its review
   // summary and file names, a failing stage's output — are quoted as data.
   for (const key of AGENT_AUTHORED_BINDINGS) if (values[key]) values[key] = untrustedBlock(key, values[key]);
+  // No working directory to name: the World section says there is no computer.
+  if (computerless) {
+    values.worldRepos = '';
+    const world = /Working directory: \{\{worldPath\}\}[^\n]*/;
+    const fill = (text: string) => text.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
+    return world.test(tpl) ? fill(tpl.replace(world, NO_COMPUTER_WORLD)) : `${fill(tpl)}\n\n# World\n${NO_COMPUTER_WORLD}`;
+  }
   return tpl.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
 }
 

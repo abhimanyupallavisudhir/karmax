@@ -1,4 +1,5 @@
 import { currentTiming } from '../timing/index.js';
+import { isComputerlessWorld, runComputerlessTurn } from './computerless.js';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, TurnResult } from './types.js';
 import type { Transition } from '../resolve/transitions.js';
 import { assertReviewInfoTotal, mergeReviewActions, validateReviewInfoCall } from './review-info.js';
@@ -474,7 +475,8 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     await observe(() => deps.onActivity?.({ id: 'turn', kind: 'turn', phase: 'started', title: 'Agent started working' }));
     if (observerFailed) throw observerError;
     await deps.onProviderStart?.();
-    turn = await adapter.runTurn(input, ctx);
+    // A task without a computer runs host-side with tavya's own tools only.
+    turn = isComputerlessWorld(input.world) ? await runComputerlessTurn(adapter, input, ctx) : await adapter.runTurn(input, ctx);
     deps.onProviderResult?.(turn);
     if (!deps.signal?.aborted) output.flush();
     await drainObservers();
