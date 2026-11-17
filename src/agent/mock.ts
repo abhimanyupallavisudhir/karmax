@@ -2,7 +2,15 @@ import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './typ
 import { parseTransition } from '../resolve/transitions.js';
 import { ProviderCapacityFull, providerErrorFromMessage } from './limits.js';
 import { worldRepoTarget, worldRepos, worldWorkingRelativePath } from '../world/types.js';
-import { platformToolHandlers } from './tools.js';
+import { computerlessToolHandlers, platformToolHandlers as allToolHandlers } from './tools.js';
+import type { World } from '../world/types.js';
+import { isComputerless } from '../domain/computer.js';
+
+/** The mock's tools, as a real adapter offers them: in a world, every
+ * platform tool; without a computer, tavya's own only. */
+function platformToolHandlers(world: World, ctx: PlatformToolContext) {
+  return isComputerless(world?.handle?.kind) ? computerlessToolHandlers(world, ctx) : allToolHandlers(world, ctx);
+}
 import { SUB_TASK_ACTIONS, type SubTaskAction } from '../domain/types.js';
 import { readFileSync } from 'node:fs';
 
@@ -90,6 +98,12 @@ const stickyShells = new Map<string, number>();
 
 export class MockAdapter implements AgentAdapter {
   readonly provider = 'mock' as const;
+
+  /** A task without a computer: the same directives, with only tavya's own
+   * tools (a `@run` meets the world's refusal). */
+  runComputerlessTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    return this.runTurn(input, ctx);
+  }
 
   async runTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
     ctx.emitActivity ??= () => {};

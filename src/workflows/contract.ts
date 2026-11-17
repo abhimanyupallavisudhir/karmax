@@ -63,6 +63,7 @@ export { githubWatchDelayMs } from '../domain/github-polling.js';
 export type { CheckoutApprovals } from '../domain/checkouts.js';
 export { worldRepos } from '../world/types.js';
 import { worldRepos } from '../world/types.js';
+import { LOCAL_WORLD_KINDS } from '../domain/computer.js';
 
 /** The line a landing adds to the work summary. The commit is the one that
  * landed in the world's primary repo, so with several repos it names that repo;
@@ -76,7 +77,7 @@ export function landedNote(world: import('../domain/types.js').WorldHandleRef | 
 
 /** Pure provider classification, safe in Temporal's deterministic sandbox. */
 export function remoteWorldProvider(provider: string | undefined): boolean {
-  return !!provider && !['worktree', 'container', 'memory'].includes(provider);
+  return !!provider && !LOCAL_WORLD_KINDS.includes(provider);
 }
 
 export function releaseWorldOnCompletion(handle: import('../domain/types.js').WorldHandleRef): boolean {

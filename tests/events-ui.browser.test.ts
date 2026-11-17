@@ -16,6 +16,7 @@ import { KarmaxApi } from '../src/platform/api.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { seedProfiles } from '../src/agent/profiles.js';
+import { ChatLinks } from '../src/integrations/chat-links.js';
 import type { Project } from '../src/domain/types.js';
 
 /**
@@ -154,7 +155,7 @@ describe('events in the console', () => {
     expect(await bot.locator('[data-hook-copy]').getAttribute('data-hook-copy')).toBe(`${base}/api/hooks/${hook.id}`);
     expect(await bot.locator('[data-hook-copy]').getAttribute('title')).toContain('Request URL');
     const people = box.locator(`[data-people="${hook.id}"]`);
-    expect(await people.textContent()).toContain('Nobody yet');
+    expect(await people.textContent()).toContain('None');
     const asking = box.locator('[data-person="U9"]');
     expect(await asking.textContent()).toContain('drop the tables');
 
@@ -163,7 +164,7 @@ describe('events in the console', () => {
     await expect.poll(async () => people.locator('.pe-person').allTextContents()).toEqual(['U9✕']);
     expect((await api.listIncomingWebhooks(token, project.id))[0]!.allowed).toEqual([{ id: 'U9' }]);
     await people.locator('[data-people-remove="U9"]').click();
-    await expect.poll(async () => people.textContent()).toContain('Nobody yet');
+    await expect.poll(async () => people.textContent()).toContain('None');
     await people.locator('[data-people-anyone]').check();
     await expect.poll(async () => people.textContent()).toContain('Anyone who can message the bot');
     expect((await api.listIncomingWebhooks(token, project.id))[0]).toMatchObject({ allowed: [], anyone: true });
@@ -182,6 +183,58 @@ describe('events in the console', () => {
     await reveal.waitFor();
     expect(await reveal.textContent()).toMatch(/Paste into your Slack app[\s\S]*Request URL/);
     expect(await reveal.locator('code').allTextContents()).toEqual([`${base}/api/hooks/hook_new`]);
+    await api.deleteIncomingWebhook(token, hook.id);
+    expect(errors).toEqual([]);
+  });
+
+  it('links a chat account from the bot’s link; the project and the person see it and remove it', async () => {
+    const token = (await tokens.mintPrincipal('user:test', ['*'], project.id)).token;
+    const fetcher = (async () => new Response(JSON.stringify({ ok: true, user_id: 'UBOT', user: 'tavya' }))) as unknown as typeof fetch;
+    const { hook } = await api.createIncomingWebhook(token, project.id, { name: 'Slack bot', kind: 'slack', credentials: { signingSecret: 'shh', botToken: 'xoxb-1' } },
+      { hookUrl: (id) => `${base}/api/hooks/${id}`, fetcher });
+    // What the bot sends someone it does not know.
+    const { token: link } = await new ChatLinks(store).offer(hook, { id: 'U7', name: 'Ada' });
+
+    const { page, errors } = await open(`/link/chat?t=${link}`);
+    const title = page.locator('.grant-title');
+    await expect.poll(async () => title.textContent()).toBe('Link Slack user Ada to you?');
+    expect(await page.locator('.grant-who').textContent()).toContain('via @tavya');
+    await page.locator('#chat-link-yes').click();
+    await expect.poll(async () => title.textContent()).toBe('Linked');
+    expect(new URL(page.url()).search).toBe('');
+    // The token worked once.
+    await page.goto(`${base}/link/chat?t=${link}`);
+    await expect.poll(async () => title.textContent()).toBe('Link not valid');
+
+    await page.goto(`${base}/personal/factory/settings#project-events`);
+    const box = page.locator('#project-events-box');
+    const linked = box.locator('.pe-people-linked');
+    await linked.waitFor();
+    expect(await linked.locator('.pe-linked').count()).toBe(1);
+    expect(await linked.locator('.pe-linked').textContent()).toContain('· Ada');
+    const guests = box.locator('.pe-people');
+    expect(await guests.locator('.setting-label').textContent()).toContain('Guests');
+    expect(await guests.locator('.setting-label .info-dot').getAttribute('title')).toMatch(/^They act as /);
+    await linked.locator('[data-people-unlink]').click();
+    await expect.poll(async () => box.locator('.pe-people-linked').count()).toBe(0);
+    expect((await api.listIncomingWebhooks(token, project.id)).find((entry) => entry.id === hook.id)!.linked).toEqual([]);
+
+    // Profile → Chat accounts lists the person's own, with remove; empty, it is not shown.
+    const again = await new ChatLinks(store).offer(hook, { id: 'U7', name: 'Ada' });
+    await page.goto(`${base}/link/chat?t=${again.token}`);
+    await page.locator('#chat-link-yes').click();
+    await expect.poll(async () => title.textContent()).toBe('Linked');
+    // This single-person installation has no accounts; the profile's account cards show for a signed-in person.
+    await page.route('**/api/session', async (route) => {
+      const session = await (await route.fetch()).json();
+      await route.fulfill({ json: { ...session, user: { id: 'me', name: 'Me', email: 'me@example.test' } } });
+    });
+    await page.goto(`${base}/profile`);
+    const card = page.locator('#chat-links-card');
+    await expect.poll(async () => card.isVisible()).toBe(true);
+    expect(await card.locator('[data-chat-link] .setting-label').textContent()).toBe('Slack · Ada');
+    await card.locator('[data-chat-unlink]').click();
+    await expect.poll(async () => card.isVisible()).toBe(false);
     await api.deleteIncomingWebhook(token, hook.id);
     expect(errors).toEqual([]);
   });

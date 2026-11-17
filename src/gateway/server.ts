@@ -44,7 +44,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
-import type { ChildTaskSummary, KarmaxEvent, Organization, TaskView, WorldProviderConnection } from '../domain/types.js';
+import type { ChildTaskSummary, KarmaxEvent, Organization, PushSubscriptionRecord, TaskView, WorldProviderConnection } from '../domain/types.js';
 import { BRAND_FILES, brandIconOf, isBrandIcon, isSkin, isTaskList, siteNameError, siteNameOf, skinOf, taskListOf, BRAND } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { ProjectTransfers, ProjectTransferError } from '../platform/project-transfer.js';
@@ -59,7 +59,7 @@ import { compactTaskView, platformRequestPathError } from '../platform/platform-
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { manifest } from '../contrib/manifests.js';
-import { machineShape } from '../domain/computer.js';
+import { LOCAL_WORLD_KINDS, isComputerless, machineShape, runsOnHost } from '../domain/computer.js';
 import { projectSettingsFor, globalSettingsFor, settingsToProjectConfig, resolveParams, effectiveRepos } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { findProviderSession } from '../agent/fork.js';
@@ -102,7 +102,7 @@ import type { IdentityService } from '../auth/identity.js';
 import type { RepositoryFiles } from '../store/project-environment.js';
 import { AuthorizationGrantError, ORGANIZATION_GRANT_CEILING, type AuthorizationService } from '../platform/authorization.js';
 import { ORGANIZATION_OWNER_CAPABILITY, PROJECT_OWNER_CAPABILITY, type OwnerPower } from '../platform/owner-authority.js';
-import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, ORGANIZATION_WIKI_WRITE_DENIED, allows, type Capability } from '../platform/capabilities.js';
+import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, ORGANIZATION_WIKI_WRITE_DENIED, allows, type Capability, type KnownCapability } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { EXPLANATIONS_ENABLED, RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { hostLocal } from '../config/deployment.js';
@@ -147,13 +147,14 @@ import type { Effort } from '../agent/effort.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems, itemHandle, relatedVaultItems, searchVaultItems, weakensProtection } from '../autonomy/vault-items.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
+import { pushEndpointAllowed, pushKeyBytes } from '../collaboration/web-push.js';
 import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { SETTLES_REQUESTS } from '../platform/settled-requests.js';
 import { AuthorizationRequests } from '../platform/authorization-requests.js';
 import { RepositoryAccessRequests } from '../integrations/repository-access.js';
 import { inheritPersonalGithubProfile } from '../autonomy/git-profiles.js';
-import { actorPrincipal, identityAuditDetail, requireHumanSubject,
+import { actorPrincipal, identityAuditDetail, requireHumanSubject, requireInteractiveHuman,
   resolveCallerIdentity } from '../platform/identity.js';
 import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, knownProviderEndpoint, normalizeExplanationSettings,
   requestExplanation, type ExplanationSettings } from '../agent/explanation.js';
@@ -225,6 +226,10 @@ export interface GatewayDeps {
   /** Inbox delivery channels with a registered adapter. The console disables the
    *  rest rather than offering a switch that silently cannot deliver. */
   deliveryChannels?: string[];
+  /** The installation's VAPID key pair for Web Push (src/collaboration/push-delivery.ts vaultVapidKeys). */
+  pushKeys?: () => Promise<import('../collaboration/web-push.js').VapidKeyPair>;
+  /** The phone apps' native push (FCM; src/collaboration/native-push.ts): usable once its Firebase key is set. */
+  nativePush?: import('../collaboration/native-push.js').NativePush;
   remoteAccess?: RemoteAccessController;
   /** Fetches OAuth client ID metadata documents (default: the outbound SSRF guard). */
   oauthMetadataFetch?: typeof fetch;
@@ -240,7 +245,10 @@ export interface GatewayDeps {
  * Returns the required capability, `'none'` for routes that intentionally need
  * no capability, or undefined for a route this catalog does not know — callers
  * apply the conservative fallback, and tests assert the catalog stays complete. */
-export function routeCapability(method: string, p: string, url?: URL): string | undefined {
+/** The capability a route requires. Typed as the catalogue, so a route can
+ * never require something a grant cannot name (or a `*` grant held back from
+ * a task without a computer could silently lose). */
+export function routeCapability(method: string, p: string, url?: URL): KnownCapability | 'none' | undefined {
   const read = method === 'GET';
   if (p === '/api/connections/config') return read ? 'credential:read' : 'settings:write';
   if (p.startsWith('/api/connections')) return p.endsWith('/execute') || p === '/api/connections/request' ? 'connection:use' : 'credential:read';
@@ -273,6 +281,11 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // organization credential grant and must remain editable after they join a
   // project only as a Developer (or before they join any project at all).
   if (/^\/api\/user\/(?:git-profiles|github-accounts)(?:\/|$)/.test(p)) return 'none';
+  // A person's own chat accounts (src/integrations/chat-links.ts): the handler
+  // takes the human subject; linking needs the person themself.
+  if (p === '/api/chat-links' || p === '/api/chat-links/pending' || /^\/api\/user\/chat-links(?:\/[^/]+)?$/.test(p)) return 'none';
+  // A person's own devices, and the public key they subscribe with.
+  if (p === '/api/push/key' || /^\/api\/user\/push-subscriptions(?:\/[^/]+)?$/.test(p)) return 'none';
   if (p === '/api/invitations/accept') return 'none';
   if (p.startsWith('/api/inbox')) return read ? 'inbox:read' : 'inbox:write';
   if (p === '/api/organization-directory' && read) return 'none';
@@ -655,7 +668,7 @@ function isWorldHandle(value: unknown): value is Record<string, unknown> & { kin
 
 function worldHandleIsRemote(handle: { kind: string; provider?: unknown }): boolean {
   const provider = typeof handle.provider === 'string' ? handle.provider : handle.kind;
-  return !['worktree', 'container', 'memory'].includes(provider);
+  return !LOCAL_WORLD_KINDS.includes(provider);
 }
 
 function isTaskView(value: Record<string, unknown>): boolean {
@@ -706,11 +719,12 @@ export function toPublicPayload(value: unknown): unknown {
   for (const [key, item] of Object.entries(input)) {
     if (key === 'recoveryWorld' && isWorldHandle(item)) continue;
     if (taskView && key === 'world') continue;
-    if (taskView && key === 'worldPath' && handle && worldHandleIsRemote(handle)) continue;
+    if (taskView && key === 'worldPath' && handle && (worldHandleIsRemote(handle) || isComputerless(handle.kind))) continue;
     out[key] = toPublicPayload(item);
   }
   if (taskView) {
-    out.worldAvailable = Boolean(handle || input.worldPath);
+    // A task without a computer has no workspace: no terminal, files or previews.
+    out.worldAvailable = !(handle && isComputerless(handle.kind)) && Boolean(handle || input.worldPath);
     if (handle) {
       out.worldProvider = handle.provider ?? handle.kind;
       const handleMeta = handle.meta && typeof handle.meta === 'object'
@@ -880,13 +894,17 @@ export class Gateway {
   private async initialize(deps: GatewayDeps) {
     this.siteAnalytics = deps.siteAnalytics ?? new SiteAnalytics(deps.store);
 
-    this.appGrants = new AppGrants(deps.store);
+    // A phone app's grant is a handle on its console session (wiki features/phone-apps).
+    const identity = deps.identity;
+    this.appGrants = new AppGrants(deps.store, identity ? { sessions: {
+      state: (id) => identity.sessionState(id), end: (id) => identity.endSession(id) } } : {});
     this.oauthRoutes = new OAuthRoutes({ store: deps.store, grants: this.appGrants, authorization: deps.authorization,
       oauth: new OAuthServer(deps.store, this.appGrants, { fetchMetadata: deps.oauthMetadataFetch }),
       hostLocal: () => this.hostLocal,
       bearerValid: async (token) => isAppBearer(token) ? !!(await this.appGrantAuth(token)) : !!(await deps.tokens.verify(token)),
       loopback: () => this.loopbackUrl ? { baseUrl: this.loopbackUrl, headers: { 'x-karmax-loopback': this.loopbackSecret } } : undefined,
-      userName: async (userId) => deps.identity?.userById(userId) });
+      userName: async (userId) => deps.identity?.userById(userId),
+      startAppSession: identity ? (userId, headers) => identity.startAppSession(userId, headers) : undefined });
     if (deps.identity) {
       // A principal token minted for an app grant names the grant as its session.
       deps.tokens.connectIdentitySessions((sessionId, userId) => sessionId.startsWith('grant_')
@@ -2494,6 +2512,8 @@ export class Gateway {
         google: this.deps.identity?.googleEnabled ?? false,
         github: this.deps.identity?.githubEnabled ?? false,
         modelBenchmarks: this.artificialAnalysis.available,
+        // The phone apps register for native push only once the installation's Firebase key is set (wiki features/phone-apps).
+        nativePush: (await this.deps.nativePush?.available()) ?? false,
         // Whether an error shown in the console can be reported (wiki features/error-reports).
         errorReports: Boolean(await errorReporter()?.destination().catch(() => undefined)),
       });
@@ -2780,6 +2800,26 @@ export class Gateway {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
       }
+      // Chat accounts linked to people (wiki planned/assistant §3).
+      if (p === '/api/chat-links/pending' && method === 'GET') {
+        requireHumanSubject(callerIdentity);
+        return this.json(res, 200, await api.pendingChatLink(token, url.searchParams.get('t') ?? ''));
+      }
+      if (p === '/api/chat-links' && method === 'POST') {
+        // A live session: a browser API token alone is not the person.
+        requireInteractiveHuman(callerIdentity);
+        const b = await this.body(req);
+        return this.json(res, 201, await api.linkChatAccount(token, String(b.t ?? '')));
+      }
+      if (p === '/api/user/chat-links' && method === 'GET') {
+        requireHumanSubject(callerIdentity);
+        return this.json(res, 200, { links: await api.listChatLinks(token) });
+      }
+      const chatLinkMatch = p.match(/^\/api\/user\/chat-links\/([^/]+)$/);
+      if (chatLinkMatch && method === 'DELETE') {
+        requireHumanSubject(callerIdentity);
+        return this.json(res, 200, await api.deleteChatLink(token, decodeURIComponent(chatLinkMatch[1]!)));
+      }
       // Report an error seen in the console (wiki features/error-reports): a
       // task's current error ({taskId}), or one in the caller's words
       // ({message, where}). It is counted on the bug's event; `reported: false`
@@ -2921,6 +2961,7 @@ export class Gateway {
           scope: summary.scope,
           capabilities: summary.held,
           missing: summary.missing,
+          ...(await this.heldBackOf(authRecord)),
           ...(target !== null ? { check: await this.routeCheck(req, authRecord, targetMethod, target) } : {}),
         });
       }
@@ -3005,6 +3046,32 @@ export class Gateway {
         await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'error-reports.save', 'installation:error-reports',
           { ...settings, ...identityAuditDetail(callerIdentity) });
         return this.json(res, 200, { settings });
+      }
+      // Native push for the phone apps (wiki features/phone-apps): GET whether
+      // the Firebase service account is set (never the key), PUT {serviceAccount}
+      // saves it once Google accepts it, DELETE removes it.
+      if (p === '/api/settings/native-push') {
+        const nativePush = this.deps.nativePush;
+        if (!nativePush) return this.json(res, 503, { error: 'the vault is unavailable' });
+        if (method === 'GET') return this.json(res, 200, await nativePush.view());
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          if (typeof b.serviceAccount !== 'string' || !b.serviceAccount.trim())
+            return this.json(res, 400, { error: 'serviceAccount must be the Firebase service account key file (JSON)' });
+          let view;
+          try { view = await nativePush.configure(b.serviceAccount); }
+          catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+          await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'native-push.save', 'installation:native-push',
+            { projectId: view.projectId, clientEmail: view.clientEmail, ...identityAuditDetail(callerIdentity) });
+          return this.json(res, 200, view);
+        }
+        if (method === 'DELETE') {
+          await nativePush.remove();
+          await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'native-push.delete', 'installation:native-push',
+            { ...identityAuditDetail(callerIdentity) });
+          return this.json(res, 200, await nativePush.view());
+        }
+        return this.json(res, 405, { error: 'method not allowed' });
       }
       // tavya's included model (wiki features/included-model): GET its
       // settings and this month's use; PUT {managementKey?, model?, effort?, enabled?}
@@ -3539,7 +3606,7 @@ export class Gateway {
           const b = await this.body(req);
           const policy = b.policy && typeof b.policy === 'object' ? b.policy : {};
           try {
-            if (policy.worldProvider && !['worktree', 'container', 'memory'].includes(String(policy.worldProvider))
+            if (policy.worldProvider && !LOCAL_WORLD_KINDS.includes(String(policy.worldProvider))
               && !(await this.deps.providerConnections?.available(organizationId, String(policy.worldProvider))))
               throw new Error(`${policy.worldProvider} is not connected and verified`);
             if (policy.resources && typeof policy.resources === 'object')
@@ -4055,7 +4122,7 @@ export class Gateway {
           });
           const provider = String(b.provider ?? 'e2b');
           const hostedCustomerWorld = this.deps.hosted === true
-            && !['worktree', 'container', 'memory'].includes(provider);
+            && !LOCAL_WORLD_KINDS.includes(provider);
           return this.json(res, 200, (await store.createRunnerPool({ organizationId, name: String(b.name ?? 'Runner pool'),
             provider, region: b.region ? String(b.region) : undefined,
             mode: b.mode === 'managed' ? 'managed' : 'customer', enabled: b.enabled !== false,
@@ -4074,7 +4141,7 @@ export class Gateway {
           const b = await this.body(req);
           try {
             const hostedCustomerWorld = this.deps.hosted === true && current.mode === 'customer'
-              && !['worktree', 'container', 'memory'].includes(current.provider);
+              && !LOCAL_WORLD_KINDS.includes(current.provider);
             return this.json(res, 200, (await store.createRunnerPool({ ...current,
               name: b.name == null ? current.name : String(b.name),
               region: b.region === null ? undefined : b.region == null ? current.region : String(b.region),
@@ -4224,15 +4291,67 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, (await store.getDeliveryPreferences(subject.userId, requestedScope.organizationId)));
         if (method === 'PUT') {
           const b = await this.body(req);
-          if (b.emailUrgencies !== undefined && (!b.emailUrgencies || typeof b.emailUrgencies !== 'object'
-            || Array.isArray(b.emailUrgencies) || Object.entries(b.emailUrgencies).some(([key, value]) =>
-              !['low', 'normal', 'high', 'critical'].includes(key) || typeof value !== 'boolean')))
-            return this.json(res, 400, { error: 'emailUrgencies must map urgency levels to booleans' });
+          const byUrgency = (value: unknown) => value === undefined || Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+            && Object.entries(value as object).every(([key, on]) => ['low', 'normal', 'high', 'critical'].includes(key) && typeof on === 'boolean');
+          for (const field of ['emailUrgencies', 'pushUrgencies'])
+            if (!byUrgency(b[field])) return this.json(res, 400, { error: `${field} must map urgency levels to booleans` });
           const previous = (await store.getDeliveryPreferences(subject.userId, requestedScope.organizationId));
           return this.json(res, 200, (await store.setDeliveryPreferences({ userId: subject.userId, organizationId: requestedScope.organizationId,
             emailUrgencies: b.emailUrgencies ?? previous.emailUrgencies,
+            pushUrgencies: { ...previous.pushUrgencies, ...b.pushUrgencies },
             browser: b.browser !== false, email: Boolean(b.email), slack: Boolean(b.slack), routine: b.routine !== false })));
         }
+      }
+
+      // Web Push (wiki features/push-and-voice): the key browsers subscribe
+      // with, and each person's own devices.
+      if (p === '/api/push/key' && method === 'GET') {
+        if (!this.deps.pushKeys) return this.json(res, 404, { error: 'Push notifications are not available on this installation.' });
+        return this.json(res, 200, { publicKey: (await this.deps.pushKeys()).publicKey });
+      }
+      const pushSubscription = p.match(/^\/api\/user\/push-subscriptions(?:\/([^/]+))?$/);
+      if (pushSubscription) {
+        const subject = requireHumanSubject(callerIdentity);
+        // Neither a browser's keys nor a phone's FCM token is read back: each is how the server reaches that device.
+        const shown = (device: PushSubscriptionRecord) => {
+          const { userId: _userId, ...rest } = device;
+          if (rest.kind === 'fcm') { const { token: _token, ...phone } = rest; return phone; }
+          const { keys: _keys, ...browser } = rest;
+          return browser;
+        };
+        if (!pushSubscription[1] && method === 'GET')
+          return this.json(res, 200, (await store.listPushSubscriptions(subject.userId)).map(shown));
+        if (!pushSubscription[1] && method === 'POST') {
+          const b = await this.body(req);
+          if (b.label !== undefined && typeof b.label !== 'string') return this.json(res, 400, { error: 'label must be text' });
+          // A phone app (wiki features/phone-apps): its FCM registration token.
+          if (b.kind === 'fcm') {
+            if (!(await this.deps.nativePush?.available()))
+              return this.json(res, 409, { error: 'Push to the phone app isn’t set up on this installation (Installation → Phone apps).' });
+            const token = typeof b.token === 'string' ? b.token : '';
+            if (!/^[A-Za-z0-9_:.-]{20,4096}$/.test(token)) return this.json(res, 400, { error: 'token must be an FCM registration token' });
+            if (b.platform !== 'android' && b.platform !== 'ios') return this.json(res, 400, { error: 'platform must be android or ios' });
+            if (b.replaces !== undefined && typeof b.replaces !== 'string') return this.json(res, 400, { error: 'replaces must be a device id' });
+            return this.json(res, 200, shown(await store.savePushSubscription(subject.userId,
+              { kind: 'fcm', token, platform: b.platform, label: b.label, ...(b.replaces ? { replaces: b.replaces } : {}) })));
+          }
+          if (b.kind !== undefined && b.kind !== 'web') return this.json(res, 400, { error: 'kind must be web or fcm' });
+          if (!this.deps.pushKeys) return this.json(res, 404, { error: 'Push notifications are not available on this installation.' });
+          const endpoint = typeof b.endpoint === 'string' ? b.endpoint : '';
+          if (endpoint.length > 2048 || !pushEndpointAllowed(endpoint))
+            return this.json(res, 400, { error: 'endpoint must be a browser push service URL (PushSubscription.endpoint)' });
+          try { pushKeyBytes(b.keys); } catch (error) {
+            return this.json(res, 400, { error: `keys: ${error instanceof Error ? error.message : String(error)}` });
+          }
+          return this.json(res, 200, shown(await store.savePushSubscription(subject.userId,
+            { endpoint, keys: { p256dh: String(b.keys.p256dh), auth: String(b.keys.auth) }, label: b.label })));
+        }
+        if (pushSubscription[1] && method === 'DELETE') {
+          if (!(await store.deletePushSubscription(subject.userId, decodeURIComponent(pushSubscription[1]))))
+            return this.json(res, 404, { error: 'No such device' });
+          return this.json(res, 200, { ok: true });
+        }
+        return this.json(res, 405, { error: 'method not allowed' });
       }
 
       // Multiple human accounts + karmax authorization. Better Auth owns the
@@ -4655,7 +4774,7 @@ export class Gateway {
             }
             const config = normalizeConfig(b.config, false, this.deps.hosted === true);
             const project = (await store.getProject(id));
-            if (config.worldProvider && !['worktree', 'container', 'memory'].includes(config.worldProvider) && project?.organizationId &&
+            if (config.worldProvider && !LOCAL_WORLD_KINDS.includes(config.worldProvider) && project?.organizationId &&
                 !(await this.deps.providerConnections?.available(project.organizationId, config.worldProvider))) {
               throw new Error(`${config.worldProvider} is not connected. Connect and verify it in Organization settings first.`);
             }
@@ -4740,7 +4859,8 @@ export class Gateway {
           return { provider: value.slice(0, at), ...(model ? { model } : {}), ...(effort ? { effort: effort as Effort } : {}) };
         }).filter((agent): agent is { provider: Provider; model?: string; effort?: Effort } => isAgentProvider(agent.provider));
         return this.json(res, 200, (await projectReadiness(this.readinessDeps(),
-          { organizationId: project.organizationId ?? 'org_personal', projectId: project.id }, agents)));
+          { organizationId: project.organizationId ?? 'org_personal', projectId: project.id }, agents,
+          { computerless: url.searchParams.get('computer') === 'none' })));
       }
       const projectExecution = p.match(/^\/api\/projects\/([^/]+)\/execution-policy$/);
       if (projectExecution) {
@@ -4757,7 +4877,7 @@ export class Gateway {
           try {
             const candidate = { ...project, config: applyExecutionOverride(project.config, override) };
             const effective = (await store.effectiveProjectConfig(candidate));
-            if (effective.worldProvider && !['worktree', 'container', 'memory'].includes(effective.worldProvider)
+            if (effective.worldProvider && !LOCAL_WORLD_KINDS.includes(effective.worldProvider)
               && !(await this.deps.providerConnections?.available(project.organizationId!, effective.worldProvider)))
               throw new Error(`${effective.worldProvider} is not connected and verified in Organization settings`);
             if (override.resources && typeof override.resources === 'object')
@@ -5879,7 +5999,8 @@ export class Gateway {
           const b = await this.body(req);
           return this.json(res, 200, await api.updateIncomingWebhook(token, hookId, { ...(b.name !== undefined ? { name: String(b.name) } : {}), ...(b.type !== undefined ? { type: String(b.type) } : {}),
             ...(b.allowed !== undefined ? { allowed: b.allowed } : {}), ...(b.anyone !== undefined ? { anyone: b.anyone === true } : {}),
-            ...(Array.isArray(b.dismiss) ? { dismiss: b.dismiss.map(String) } : {}) }));
+            ...(Array.isArray(b.dismiss) ? { dismiss: b.dismiss.map(String) } : {}),
+            ...(Array.isArray(b.unlink) ? { unlink: b.unlink.map(String) } : {}) }));
         }
         if (!webhookMatch[2] && method === 'DELETE') return this.json(res, 200, await api.deleteIncomingWebhook(token, hookId));
       }
@@ -11621,6 +11742,18 @@ export class Gateway {
     }
   }
 
+  /** What the calling task holds back because it has no computer and has not
+   * been granted since (wiki features/computerless-tasks), so its agent knows
+   * to ask with request_permission rather than try. */
+  private async heldBackOf(authRecord: { taskId?: string; caps: string[] }): Promise<{ heldBack?: string[] }> {
+    const taskId = authRecord.taskId && authRecord.taskId !== '*' ? authRecord.taskId : undefined;
+    const held = taskId ? ((await this.deps.store.getTask(taskId))?.params?._authorization as { heldBack?: string[] } | undefined)?.heldBack : undefined;
+    const still = (held ?? []).filter((capability) => capability.endsWith(':*')
+      ? !authRecord.caps.some((cap) => cap.startsWith(capability.slice(0, -1)))
+      : !allows(authRecord.caps, capability));
+    return still.length ? { heldBack: still } : {};
+  }
+
   /** The role's default agent here, as task creation will pin it (`defaultAgentProfile`). */
   private async defaultAgent(role: string, projectId?: string, organizationId?: string) {
     organizationId ??= projectId ? (await this.deps.store.getProject(projectId))?.organizationId : undefined;
@@ -12149,7 +12282,7 @@ function normalizeConfig(
     const worldProvider = config.worldProvider ?? (defaultHostedProvider
       ? process.env.KARMAX_CLOUD_WORLD_PROVIDER?.trim() || 'any'
       : undefined);
-    if (worldProvider && ['worktree', 'container', 'memory'].includes(worldProvider))
+    if (runsOnHost(worldProvider))
       throw new Error('hosted projects require a remote world provider');
     if (worldProvider) config = { ...config, worldProvider };
   }

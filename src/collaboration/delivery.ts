@@ -1,9 +1,9 @@
 import type { Store } from '../store/db.js';
-import type { InboxItem } from '../domain/types.js';
+import type { DeliveryChannel, InboxItem } from '../domain/types.js';
 
 export interface DeliveryEnvelope {
   inbox: InboxItem;
-  task?: { id: string; num?: number; title: string };
+  task?: { id: string; num?: number; title: string; projectId?: string; status?: string };
   user?: { id: string; name?: string; email?: string };
 }
 
@@ -50,7 +50,7 @@ export class WebhookDeliveryAdapter implements DeliveryAdapter {
 export class DeliveryDispatcher {
   private timer?: NodeJS.Timeout;
   private active?: Promise<number>;
-  constructor(private store: Store, private adapters: Partial<Record<'browser' | 'email' | 'slack', DeliveryAdapter>>,
+  constructor(private store: Store, private adapters: Partial<Record<DeliveryChannel, DeliveryAdapter>>,
     private user?: (id: string) => { id: string; name?: string; email?: string } | undefined | Promise<{ id: string; name?: string; email?: string } | undefined>, private intervalMs = 1_000) {}
 
   start(): void {
@@ -90,7 +90,8 @@ export class DeliveryDispatcher {
         if (!adapter) throw new Error(`${claim.channel} delivery is enabled but no adapter is configured`);
         const task = (await this.store.taskHeaders([claim.inbox.taskId])).get(claim.inbox.taskId);
         await adapter.deliver({ inbox: claim.inbox,
-          task: task ? { id: task.id, num: task.num, title: task.title } : undefined,
+          task: task ? { id: task.id, num: task.num, title: task.title, projectId: task.projectId,
+            ...(task.status ? { status: task.status } : {}) } : undefined,
           user: (await this.user?.(claim.inbox.userId)) });
         (await this.store.completeDelivery(claim.id));
         delivered++;

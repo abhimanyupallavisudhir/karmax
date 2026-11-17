@@ -80,8 +80,9 @@ const describeStatus = (view: TaskView) => {
   return [live.stage, live.status, live.waitingFor?.kind ? `waiting for ${live.waitingFor.kind}` : ''].filter(Boolean).join(' · ');
 };
 
-/** The Computer `task new` asks for: --computer any|<provider> (any: tavya
- * picks a computer that fits and has room), --cpu, --memory and --disk in GB,
+/** The Computer `task new` asks for: --computer any|none|<provider> (any: tavya
+ * picks a computer that fits and has room; none: no computer, the agent uses
+ * tavya itself only, wiki features/computerless-tasks), --cpu, --memory and --disk in GB,
  * --region eu|us, --network full|basic (basic: registries, Git hosts, AI and
  * cloud APIs are enough, so Any may also use computers limited to those).
  * The server validates it like the task form. */
@@ -93,6 +94,8 @@ export function computerFlags(flags: Record<string, any>): Record<string, unknow
     return parsed;
   };
   const memory = number('memory', flags.memory);
+  if (flags.computer === 'none' && ['cpu', 'memory', 'disk', 'region', 'network'].some((name) => flags[name] !== undefined))
+    throw new CliError('--computer none has no machine: leave out --cpu, --memory, --disk, --region and --network', EXIT.usage);
   if (flags.network !== undefined && !['full', 'basic'].includes(flags.network))
     throw new CliError('--network must be full or basic', EXIT.usage);
   const computer = Object.fromEntries(Object.entries({
@@ -108,7 +111,7 @@ export async function task(api: Api, args: string[], out: Output, flags: Record<
   switch (action) {
     case 'new': case 'create': {
       const title = rest.join(' ').trim();
-      if (!title) throw new CliError('usage: tavya task new <title> [--template <number|name>] [--prompt <text> | --prompt-file <file> | stdin] [--computer any|<provider>] [--cpu N] [--memory GB] [--disk GB] [--region eu|us] [--network full|basic]', EXIT.usage);
+      if (!title) throw new CliError('usage: tavya task new <title> [--template <number|name>] [--prompt <text> | --prompt-file <file> | stdin] [--computer any|none|<provider>] [--cpu N] [--memory GB] [--disk GB] [--region eu|us] [--network full|basic]', EXIT.usage);
       const target = await resolveProject(api, flags.project, workspace);
       // A template's own prompt stands unless one is given; without one, the title is the prompt.
       const template = flags.template ? await resolveTemplate(api, target.project.id, flags.template) : undefined;

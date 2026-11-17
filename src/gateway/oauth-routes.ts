@@ -30,11 +30,16 @@ export interface OAuthRouteDeps {
   /** Where this gateway answers `/api` itself, and the headers marking those calls. */
   loopback: () => { baseUrl: string; headers: Record<string, string> } | undefined;
   userName: (userId: string) => Promise<{ name?: string; email?: string } | undefined>;
+  /** A console session for the phone app's WebView, with its Set-Cookie headers (`IdentityService.startAppSession`). */
+  startAppSession?: (userId: string, headers: Headers) => Promise<{ sessionId: string; setCookie: string[] }>;
 }
+
+/** Where the phone app trades its sign-in code for a console session (wiki features/phone-apps). */
+export const APP_SESSION_PATH = '/oauth/app-session';
 
 /** The context the gateway resolved for an authenticated `/api` request. */
 export interface OAuthApiContext {
-  session: { user: string; userId?: string; email?: string; appGrant?: AppGrant };
+  session: { user: string; userId?: string; email?: string; appGrant?: AppGrant; identitySessionId?: string };
   record: ScopedToken;
   identity: CallerIdentity;
 }
@@ -86,6 +91,7 @@ export class OAuthRoutes {
       res.end(proof ?? 'not found');
       return true;
     }
+    if (p === APP_SESSION_PATH) return this.appSession(req, res);
     const metadata = p === '/.well-known/oauth-authorization-server';
     const resourceMetadata = p === '/.well-known/oauth-protected-resource' || p === '/.well-known/oauth-protected-resource/mcp';
     if (!metadata && !resourceMetadata && !CORS_PATHS.has(p) && p !== '/oauth/authorize') return false;
@@ -161,6 +167,41 @@ export class OAuthRoutes {
     return true;
   }
 
+  /**
+   * The phone app's WebView, back from the system browser with
+   * `io.tavya.app://signed-in?code=…`, posts the code and its PKCE verifier
+   * here and gets the console's own session cookie. Only from the console's
+   * origin and as JSON (which a cross-site form cannot send), so another site
+   * cannot sign a browser into someone else's account with a code it holds.
+   */
+  private async appSession(req: http.IncomingMessage, res: http.ServerResponse): Promise<boolean> {
+    if (req.method !== 'POST') { json(res, 405, { error: 'invalid_request', error_description: 'Use POST' }); return true; }
+    const issuer = this.issuer(req);
+    if (!issuer || !this.deps.startAppSession) {
+      json(res, 503, { error: 'temporarily_unavailable', error_description: 'Signing in the app needs the installation public URL (KARMAX_PUBLIC_URL).' });
+      return true;
+    }
+    if (req.headers.origin !== issuer) { json(res, 403, { error: 'invalid_request', error_description: 'Only the console itself may sign the app in' }); return true; }
+    if (!String(req.headers['content-type'] ?? '').includes('application/json')) {
+      json(res, 415, { error: 'invalid_request', error_description: 'Send JSON' });
+      return true;
+    }
+    const startAppSession = this.deps.startAppSession;
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(req.headers)) if (typeof value === 'string') headers.set(name, value);
+    try {
+      const params = await formParams(req);
+      const { setCookie, grant } = await this.deps.oauth.appSession(params, (userId) => startAppSession(userId, headers));
+      await this.deps.authorization?.audit(`user:${grant.userId}`, 'app-grant.app-signed-in', 'global', { grantId: grant.id, name: grant.name });
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', ...NO_STORE, 'set-cookie': setCookie });
+      res.end(JSON.stringify({ ok: true, grantId: grant.id }));
+    } catch (e) {
+      if (!(e instanceof OAuthError)) throw e;
+      json(res, e.status, { error: e.error, error_description: e.description }, NO_STORE);
+    }
+    return true;
+  }
+
   private resource(params: URLSearchParams, issuer: string): string | undefined {
     const resource = params.get('resource') ?? undefined;
     if (resource && !this.resources(issuer).includes(resource))
@@ -223,7 +264,7 @@ export class OAuthRoutes {
       return true;
     }
     if (p === '/api/user/app-grants' && method === 'GET') {
-      json(res, 200, { grants: (await this.deps.grants.list(subject.userId)).map((grant) => grantView(grant, ctx.session.appGrant?.id)),
+      json(res, 200, { grants: (await this.deps.grants.list(subject.userId)).map((grant) => grantView(grant, ctx.session.appGrant?.id, ctx.session.identitySessionId)),
         levels: await this.levels() });
       return true;
     }
@@ -278,7 +319,8 @@ export class OAuthRoutes {
       if (!issuer) { json(res, 503, { error: 'Signing in apps needs the installation public URL (KARMAX_PUBLIC_URL).' }); return true; }
       const approval = authorization[2] === 'deny' ? 'deny' as const : await this.approval(res, ctx, await jsonBody(req));
       if (!approval) return true;
-      const decided = await this.deps.oauth.decideAuthorization(id, approval, issuer);
+      const decided = await this.oauthCall(res, () => this.deps.oauth.decideAuthorization(id, approval, issuer));
+      if (decided === null) return true;
       if (decided) await this.audit(ctx, `app-grant.authorization-${authorization[2] === 'deny' ? 'denied' : 'approved'}`,
         approval === 'deny' ? {} : { scope: ceilingScope(approval.ceiling) });
       json(res, decided ? 200 : 404, decided ?? { error: 'This sign-in request expired. Start again from the app.' });
@@ -377,11 +419,12 @@ export class OAuthRoutes {
   }
 }
 
-function grantView(grant: AppGrant, currentGrantId?: string) {
+function grantView(grant: AppGrant, currentGrantId?: string, currentSessionId?: string) {
+  const current = grant.id === currentGrantId || (grant.kind === 'app' && !!grant.sessionId && grant.sessionId === currentSessionId);
   const { caps: _caps, ...ceiling } = grant.ceiling ?? {};
   return { id: grant.id, kind: grant.kind, name: grant.name, clientId: grant.clientId, scope: ceilingScope(grant.ceiling),
     ceiling, limitedByCreator: Boolean(grant.ceiling?.caps), createdAt: grant.createdAt, lastUsedAt: grant.lastUsedAt ?? null,
-    expiresAt: grant.expiresAt, createdBy: grant.createdBy?.kind ?? 'user', ...(grant.id === currentGrantId ? { current: true } : {}) };
+    expiresAt: grant.expiresAt, createdBy: grant.createdBy?.kind ?? 'user', ...(current ? { current: true } : {}) };
 }
 
 function parseCeiling(body: Record<string, unknown>): AppGrantCeiling | string {

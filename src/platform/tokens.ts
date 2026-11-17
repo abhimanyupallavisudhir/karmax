@@ -308,6 +308,15 @@ export class TokenAuthority {
       externalIdentities: args.externalIdentities ?? parent.externalIdentities }));
   }
 
+  /** Pin a person as the human subject of a run they started from a chat bot
+   * (wiki planned/assistant §3). No bearer of theirs is present: trusted host
+   * code has established that they asked, through a chat account they linked
+   * to their tavya account (src/integrations/chat-links.ts), and has already
+   * cut the run's grant to what they hold. Never reachable from a request. */
+  async delegateLinkedPerson(userId: string, args: HumanDelegationArgs): Promise<HumanDelegation> {
+    return this.issueDelegation({ ...args, humanUserId: userId });
+  }
+
   /** Derive a child-task delegation from durable parent provenance. This is used
    * by workflow activities after the short-lived parent bearer is gone. */
   async deriveHumanDelegation(parentDelegationId: string, args: {

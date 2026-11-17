@@ -21,7 +21,7 @@ import {
   type ScheduleTrigger,
 } from '../domain/triggers.js';
 import {
-  DEFAULT_MAX_RUNS_PER_HOUR, MAX_EVENT_HOPS, countCrossedThreshold, lastHappenedAt, recurrenceMessage, renderTemplate, templateData, triggerContext, triggerMessage,
+  DEFAULT_MAX_RUNS_PER_HOUR, EventRunRefused, MAX_EVENT_HOPS, countCrossedThreshold, lastHappenedAt, recurrenceMessage, renderTemplate, templateData, triggerContext, triggerMessage,
   type KeyedRun, type ProjectEvent, type ProjectEventClaim, type ProjectEventClaimState, type TriggerContext,
 } from '../domain/project-events.js';
 
@@ -143,7 +143,8 @@ export function createTriggerTell(api: Pick<KarmaxApi, 'postTaskMessage'>, token
   return async (runId, trigger, text) => {
     const { token } = (await tokens.mintPrincipal('system:triggers', ['*'], undefined, 10 * 60_000));
     try {
-      return await api.postTaskMessage(token, runId, { text: text ?? triggerMessage(trigger) });
+      // A linked chat sender's reply is theirs (wiki planned/assistant §3); the context comes from the stored event.
+      return await api.postTaskMessage(token, runId, { text: text ?? triggerMessage(trigger), ...(trigger.actsAs ? { onBehalfOf: trigger.actsAs } : {}) });
     } finally {
       (await tokens.revoke(token));
     }
@@ -993,8 +994,10 @@ export class TriggerScheduler {
         if (entry.followUp) entry.triggers.push(trigger);
         else entry.fired = false;
       }
+      // A start refused for good is skipped, not retried every minute.
+      const refused = error instanceof EventRunRefused;
       await this.deps.store.updateProjectEventClaim(event.id, taskId, ['pending'],
-        { state: 'deferred', reason: `${FAILED_START}: ${message}`.slice(0, 300), updatedAt: this.now() });
+        { state: refused ? 'skipped' : 'deferred', reason: (refused ? message : `${FAILED_START}: ${message}`).slice(0, 300), updatedAt: this.now() });
       this.log(`event ${event.type} could not start ${taskId}: ${message}`);
     }
   }

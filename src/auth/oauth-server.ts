@@ -15,6 +15,12 @@ import { AppGrantError, AppGrants, ceilingScope, digest, scopeCeiling, type AppG
  * may do is the gateway's job (it knows the approver's authority).
  */
 export const CLI_CLIENT_ID = 'tavya-cli';
+/** The phone apps (wiki features/phone-apps): a first-party public client that
+ * signs in through the system browser and returns to its private-use scheme
+ * (RFC 8252 §7.1), then trades the code for a console session in its WebView
+ * (`appSession`) — never for bearer tokens. */
+export const APP_CLIENT_ID = 'tavya-app';
+export const APP_REDIRECT_URI = 'io.tavya.app://signed-in';
 export const DEVICE_CODE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
 const DEVICE_TTL_MS = 15 * 60_000;
 const DEVICE_INTERVAL_S = 5;
@@ -83,6 +89,7 @@ export class OAuthServer {
   async client(clientId: string | undefined): Promise<OAuthClient | undefined> {
     if (!clientId) return undefined;
     if (clientId === CLI_CLIENT_ID) return { clientId, name: 'tavya CLI', redirectUris: [], kind: 'first-party', verified: true };
+    if (clientId === APP_CLIENT_ID) return { clientId, name: 'tavya app', redirectUris: [APP_REDIRECT_URI], kind: 'first-party', verified: true };
     if (clientId.startsWith('https://')) return this.metadataClient(clientId);
     const raw = await this.store.kvGet(clientKey(clientId));
     if (!raw) return undefined;
@@ -276,6 +283,10 @@ export class OAuthServer {
   async decideAuthorization(id: string, decision: Approval | 'deny', issuer: string): Promise<{ redirectUri: string } | undefined> {
     const raw = await this.store.kvGet(requestKey(id));
     const record = raw ? JSON.parse(raw) as AuthorizationRequest : undefined;
+    // The phone app is the person's own console: their whole access, approved by them, not by an agent or a limited token.
+    if (record?.clientId === APP_CLIENT_ID && decision !== 'deny'
+      && (decision.createdBy?.kind === 'agent' || Object.keys(decision.ceiling ?? {}).length))
+      throw new OAuthError('invalid_request', 'The phone app signs in with your whole access, approved by you; it cannot be limited.', 400, false);
     if (!raw || !record || record.expiresAt <= Date.now() || !(await this.store.kvCompareAndSet(requestKey(id), raw, undefined))) return undefined;
     const target = new URL(record.redirectUri);
     if (decision === 'deny') {
@@ -292,16 +303,21 @@ export class OAuthServer {
     return { redirectUri: target.href };
   }
 
-  private async exchangeCode(params: URLSearchParams, client: OAuthClient): Promise<TokenResponse> {
+  /**
+   * Check a presented authorization code: issued to this client and redirect,
+   * unexpired, unused, and bound to this PKCE verifier. A code presented again
+   * revokes whatever it bought (RFC 6749 §4.1.2). `spend` then marks it used
+   * by the grant it bought; it fails if another presentation won the race.
+   */
+  private async redeemCode(params: URLSearchParams, client: OAuthClient) {
     const code = params.get('code') ?? '';
     const key = codeKey(code);
     const raw = code ? await this.store.kvGet(key) : undefined;
     const record = raw ? JSON.parse(raw) as CodeRecord : undefined;
     if (!raw || !record || record.expiresAt <= Date.now()) throw new OAuthError('invalid_grant', 'Invalid or expired authorization code');
     if (record.usedBy) {
-      // A replayed code: whatever it bought is revoked (RFC 6749 §4.1.2).
       await this.grants.revoke(record.usedBy);
-      throw new OAuthError('invalid_grant', 'Authorization code already used; the tokens it issued were revoked');
+      throw new OAuthError('invalid_grant', 'Authorization code already used; what it signed in was signed out');
     }
     if (record.clientId !== client.clientId || params.get('redirect_uri') !== record.redirectUri)
       throw new OAuthError('invalid_grant', 'The code was issued to another client or redirect_uri');
@@ -309,13 +325,40 @@ export class OAuthServer {
     if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)
       || crypto.createHash('sha256').update(verifier).digest('base64url') !== record.codeChallenge)
       throw new OAuthError('invalid_grant', 'code_verifier does not match the code_challenge');
-    const grant = await this.grants.create({ userId: record.approval.userId, kind: 'mcp', clientId: client.clientId, name: client.name,
-      ceiling: record.approval.ceiling, resource: record.resource, createdBy: record.approval.createdBy });
-    if (!(await this.store.kvCompareAndSet(key, raw, JSON.stringify({ ...record, usedBy: grant.id })))) {
+    const spend = async (grant: AppGrant) => {
+      if (await this.store.kvCompareAndSet(key, raw, JSON.stringify({ ...record, usedBy: grant.id }))) return;
       await this.grants.revoke(grant.id);
       throw new OAuthError('invalid_grant', 'Authorization code already used');
-    }
+    };
+    return { record, spend };
+  }
+
+  private async exchangeCode(params: URLSearchParams, client: OAuthClient): Promise<TokenResponse> {
+    if (client.clientId === APP_CLIENT_ID)
+      throw new OAuthError('unauthorized_client', 'The tavya app trades its code for a console session at /oauth/app-session');
+    const { record, spend } = await this.redeemCode(params, client);
+    const grant = await this.grants.create({ userId: record.approval.userId, kind: 'mcp', clientId: client.clientId, name: client.name,
+      ceiling: record.approval.ceiling, resource: record.resource, createdBy: record.approval.createdBy });
+    await spend(grant);
     return this.tokenResponse(grant, await this.grants.issue(grant));
+  }
+
+  /**
+   * The phone app's code → a console session in its WebView (wiki
+   * features/phone-apps). `startSession` makes the identity provider's session
+   * for the person; the grant records it, so Profile → Apps and tokens lists the
+   * phone and revoking it there ends that session.
+   */
+  async appSession<T extends { sessionId: string }>(params: URLSearchParams, startSession: (userId: string) => Promise<T>): Promise<T & { grant: AppGrant }> {
+    const client = (await this.client(APP_CLIENT_ID))!;
+    if ((params.get('client_id') ?? APP_CLIENT_ID) !== APP_CLIENT_ID) throw new OAuthError('invalid_client', 'Only the tavya app signs in here', 400);
+    const { record, spend } = await this.redeemCode(params, client);
+    const session = await startSession(record.approval.userId);
+    const name = params.get('name')?.trim().slice(0, 100) || client.name;
+    const grant = await this.grants.create({ userId: record.approval.userId, kind: 'app', clientId: APP_CLIENT_ID, name,
+      sessionId: session.sessionId, createdBy: record.approval.createdBy });
+    await spend(grant);
+    return { ...session, grant };
   }
 
   // ── token and revocation endpoints ───────────────────────────────────────

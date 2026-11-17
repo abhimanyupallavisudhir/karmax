@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <title>tavya</title>
+    <!-- server.errorPath: shown by the native shell when server.url can't be loaded. -->
+    <script src="server-url.js"></script>
+    <style>
+      :root { color-scheme: dark; }
+      html, body { margin: 0; height: 100%; }
+      body {
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        gap: 16px; padding: env(safe-area-inset-top) 24px env(safe-area-inset-bottom);
+        box-sizing: border-box; text-align: center;
+        background: #181220; color: #ede8f5;
+        font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+      }
+      img { width: 96px; height: 96px; }
+      h1 { margin: 8px 0 0; font-size: 20px; font-weight: 600; overflow-wrap: anywhere; }
+      p { margin: 0; max-width: 320px; color: #b9b0c8; }
+      button {
+        margin-top: 8px; min-width: 160px; min-height: 44px; padding: 10px 24px;
+        border: 0; border-radius: 10px; background: #e3b344; color: #181220;
+        font: inherit; font-weight: 600; cursor: pointer;
+      }
+      button:active { background: #cc9024; }
+    </style>
+  </head>
+  <body>
+    <img src="tavya-mark.svg" alt="tavya" />
+    <h1 id="title">Can't reach tavya</h1>
+    <p>Check your connection and try again.</p>
+    <button id="retry" type="button">Retry</button>
+    <script>
+      (function () {
+        var url = window.TAVYA_SERVER_URL || 'https://tavya.io';
+        var host = url;
+        try { host = new URL(url).host; } catch (e) {}
+        document.getElementById('title').textContent = "Can't reach " + host;
+        document.getElementById('retry').addEventListener('click', function () {
+          location.replace(url);
+        });
+        // Try again by itself when the device comes back online.
+        window.addEventListener('online', function () { location.replace(url); });
+      })();
+    </script>
+  </body>
+</html>

@@ -2,6 +2,8 @@ import { noteExternalEffect } from '../store/transaction-effects.js';
 import { identitySqliteDatabase } from '../store/identity-sqlite.js';
 import { betterAuth } from 'better-auth';
 import { admin, genericOAuth } from 'better-auth/plugins';
+import { createAuthEndpoint } from 'better-auth/api';
+import { setSessionCookie } from 'better-auth/cookies';
 import { getMigrations } from 'better-auth/db/migration';
 import { Pool } from 'pg';
 import crypto from 'node:crypto';
@@ -98,6 +100,28 @@ export interface IdentityOptions {
 }
 
 /**
+ * The phone app's console session (wiki features/phone-apps): reachable only
+ * from the server (`SERVER_ONLY` keeps it off Better Auth's HTTP router), called
+ * by the gateway once the app's sign-in code and PKCE verifier checked out.
+ * Better Auth makes the session (its create hooks refuse a closed account) and
+ * sets its own signed cookie.
+ */
+const appSessionPlugin = {
+  id: 'tavya-app-session',
+  endpoints: {
+    tavyaAppSession: createAuthEndpoint('/tavya/app-session', { method: 'POST', metadata: { SERVER_ONLY: true } }, async (ctx) => {
+      const userId = String((ctx.body as { userId?: unknown } | undefined)?.userId ?? '');
+      const user = userId ? await ctx.context.internalAdapter.findUserById(userId) : null;
+      if (!user) return ctx.json({ message: 'no such account' }, { status: 404 });
+      const session = await ctx.context.internalAdapter.createSession(user.id);
+      if (!session) return ctx.json({ message: 'this account cannot sign in' }, { status: 403 });
+      await setSessionCookie(ctx, { session, user });
+      return ctx.json({ sessionId: session.id });
+    }),
+  },
+};
+
+/**
  * Authentication boundary. Better Auth owns passwords, hashing, cookies,
  * sessions, rate limits, and account records; karmax only consumes the verified
  * user id and applies its own project/task capability policy.
@@ -145,6 +169,35 @@ export class IdentityService {
     if (!session) return false;
     const expiry = typeof session.expiresAt === 'number' ? session.expiresAt : new Date(session.expiresAt).getTime();
     return expiry > Date.now();
+  }
+
+  /**
+   * A console session for the phone app's WebView (wiki features/phone-apps),
+   * made after its sign-in code was checked: the same session and cookie a
+   * password sign-in gives, so the console runs unchanged. Returns the
+   * session's id and the Set-Cookie headers to answer with.
+   */
+  async startAppSession(userId: string, headers: Headers): Promise<{ sessionId: string; setCookie: string[] }> {
+    const response = await this.auth.api.tavyaAppSession({ body: { userId }, headers, asResponse: true }) as Response;
+    const body = await response.json().catch(() => ({})) as { sessionId?: string; message?: string };
+    if (!response.ok || !body.sessionId) throw new Error(body.message || `could not start a session (${response.status})`);
+    return { sessionId: body.sessionId, setCookie: response.headers.getSetCookie() };
+  }
+
+  /** When a session was last refreshed and when it expires; undefined once it is gone. */
+  async sessionState(sessionId: string): Promise<{ updatedAt: number; expiresAt: number } | undefined> {
+    const row = await this.db.prepare('SELECT updatedAt, expiresAt FROM session WHERE id=?').get(sessionId) as
+      { updatedAt: number | string | Date; expiresAt: number | string | Date } | undefined;
+    const ms = (value: number | string | Date) => typeof value === 'number' ? value : new Date(value).getTime();
+    return row ? { updatedAt: ms(row.updatedAt), expiresAt: ms(row.expiresAt) } : undefined;
+  }
+
+  /** End one session (an app grant revoked in Profile): its cookie stops working everywhere at once. */
+  async endSession(sessionId: string): Promise<void> {
+    const row = await this.db.prepare('SELECT userId FROM session WHERE id=?').get(sessionId) as { userId: string } | undefined;
+    if (!row) return;
+    (await this.db.prepare('DELETE FROM session WHERE id=?').run(sessionId));
+    await this.sessionsRevoked?.(String(row.userId));
   }
 
   private constructor(dbFile: string, opts: IdentityOptions = {}) {
@@ -370,7 +423,7 @@ export class IdentityService {
       // additionally needs a rateLimit table whose schema Better Auth and
       // node:sqlite disagree about (bigint vs number).
       rateLimit: { enabled: true, window: 60, max: 100 },
-      plugins: [admin({ defaultRole: 'user', adminRoles: ['admin'] }),
+      plugins: [admin({ defaultRole: 'user', adminRoles: ['admin'] }), appSessionPlugin,
         ...(opts.oidc ? [genericOAuth({ config: [{ providerId: opts.oidc.providerId,
           discoveryUrl: opts.oidc.discoveryUrl, clientId: opts.oidc.clientId,
           clientSecret: opts.oidc.clientSecret, scopes: opts.oidc.scopes ?? ['openid', 'profile', 'email'],

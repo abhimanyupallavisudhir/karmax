@@ -1,0 +1,7 @@
+/build/*
+!/build/.npmkeep
+# Firebase config: written by CI from a secret (see mobile/README.md)
+google-services.json
+# Release signing material never lives in the repo
+*.jks
+*.keystore

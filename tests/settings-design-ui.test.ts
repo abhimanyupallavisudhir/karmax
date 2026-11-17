@@ -24,8 +24,9 @@ describe('settings, one row per setting', () => {
     expect(await choice('System').getAttribute('aria-pressed')).toBe('false');
     await choice('System').click();
     expect(await ui.run('document.documentElement.hasAttribute("data-theme")')).toBe(false);
-    // Markdown and math are toggles in the same card.
-    expect(await ui.page.locator('#profile-preferences input.toggle').count()).toBe(2);
+    // Markdown, math and (where the browser can speak) reading replies aloud are toggles in the same card.
+    expect(await ui.page.locator('#profile-preferences input.toggle').count()).toBe(3);
+    expect(await ui.page.locator('#profile-preferences #profile-read-aloud').count()).toBe(1);
     await ui.close();
   });
 

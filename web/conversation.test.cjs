@@ -262,6 +262,7 @@ eval(extractFn('conversationFullscreenButton'));
 for (const fn of ['hasMessageForm', 'agentEntryText', 'personMessageText', 'messageFormsIn', 'formSubject', 'answersForm', 'messageFormStates', 'conversationEntryKey', 'conversationFoldHtml', 'loadForkHistory', 'inheritedConversationHtml', 'conversationSearchKey', 'conversationSearchOpen', 'conversationSearchBar', 'pendingMessagesHtml', 'followupPlaceholder', 'conversationPane']) eval(extractFn(fn));
 global.narrowViewport = () => false;
 global.fmtKeys = (keys) => keys;
+global.micButtonHtml = () => '';
 eval(extractFn('taskPlacesLinks'));
 eval(extractFn('conversationBar'));
 for (const fn of ['humanWaitDetail', 'conversationOutline', 'foldDuration', 'foldPreview', 'conversationFoldHead']) eval(extractFn(fn));

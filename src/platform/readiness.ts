@@ -21,6 +21,7 @@ import { enumerateCredentials, resolveCredentials, type Credential } from './cre
 import { gatherCredentialSources, readPolicyLayers } from './credential-sources.js';
 import { ComputeRouter, type RouterConnections } from '../world/compute-router.js';
 import { computeCredit } from '../world/managed-compute.js';
+import { computerlessApiKey, computerlessModelGap } from '../agent/computerless.js';
 
 export interface ReadinessDeps {
   store: Store;
@@ -37,6 +38,9 @@ export interface ReadinessDeps {
 export interface AgentNeed {
   provider: string;
   off?: 'project' | 'organization';
+  /** A task without a computer can't run this agent on what the organization
+   * has (a login, not a key): why, in a sentence. */
+  computerless?: string;
 }
 
 export interface Readiness {
@@ -60,6 +64,8 @@ export interface Readiness {
     managed: boolean;
     /** A compute account of the organization's own. */
     own: boolean;
+    /** The task has no computer, so needs none (wiki features/computerless-tasks). */
+    none?: boolean;
     /** Why tavya's computers can't take a task, when that is all there is. */
     outOfCredit?: string;
     /** What would let a task start, when nothing can: a paid plan (tavya's
@@ -93,7 +99,10 @@ export async function usableAgentCredentials(deps: ReadinessDeps,
 
 export async function projectReadiness(deps: ReadinessDeps,
   scope: { organizationId: string; projectId?: string },
-  agents: Array<Pick<AgentProfile, 'provider' | 'model' | 'effort'>> = []): Promise<Readiness> {
+  agents: Array<Pick<AgentProfile, 'provider' | 'model' | 'effort'>> = [],
+  /** The task has no computer: its agents run on tavya with an API key or the
+   * included model only, and it needs no compute. */
+  options: { computerless?: boolean } = {}): Promise<Readiness> {
   const { all, layers } = await agentCredentials(deps, scope);
   const credentials = resolveCredentials(all, layers);
   const inOrganization = resolveCredentials(all, { global: layers.global });
@@ -112,6 +121,19 @@ export async function projectReadiness(deps: ReadinessDeps,
       if (agent.provider === 'mock') { const ready = mockAgentEnabled(); return { ...agent, ready, ...(ready ? {} : { need: need(agent) }) }; }
       const own = serves(agent, credentials);
       const rail = own ? undefined : await creditRail(deps.store, deps.broker, agent);
+      if (options.computerless) {
+        // Only an API key runs without a computer: the organization's own, the
+        // included model's, or one the turn may take from this host
+        // (computerlessApiKey — never on hosted). A gateway or OpenRouter rail
+        // serves a CLI, which needs a computer.
+        const onIncluded = rail?.kind === 'included';
+        const key = onIncluded || serves(agent, credentials.filter((credential) => credential.kind === 'key'))
+          || !!computerlessApiKey(agent, { hosted: deps.hosted, organizationId: scope.organizationId });
+        const gap = computerlessModelGap(agent, { apiKey: key });
+        const cost = onIncluded && included ? await relativeCost(included, rail!, agent) : undefined;
+        return { ...agent, ready: !gap, ...(gap ? { need: { ...need(agent), computerless: gap } } : {}),
+          ...(cost !== undefined ? { cost: Math.round(cost * 10) / 10 } : {}) };
+      }
       const ready = own || !!rail;
       const cost = rail && included ? await relativeCost(included, rail, agent) : undefined;
       return { ...agent, ready, ...(ready ? {} : { need: need(agent) }), ...(cost !== undefined ? { cost: Math.round(cost * 10) / 10 } : {}),
@@ -119,7 +141,7 @@ export async function projectReadiness(deps: ReadinessDeps,
         ...(rail?.kind === 'openrouter' ? { gateway: 'OpenRouter' } : rail?.kind === 'gateway' ? { gateway: rail.gateway.name } : {}) };
     })),
     agentLogin: credentials.length > 0,
-    compute: await computeReadiness(deps, scope.organizationId),
+    compute: options.computerless ? { ready: true, local: false, managed: false, own: false, none: true } : await computeReadiness(deps, scope.organizationId),
     ...(await storageReadiness(deps, scope.organizationId)),
   };
 }

@@ -39,9 +39,15 @@ global.esc = (value) => String(value ?? '');
 global.S = {};
 global.NOTIFY_BEHAVIOURS = undefined;
 
-eval(extractConst('URGENCY_LEVELS').replace('const URGENCY_LEVELS =', 'global.URGENCY_LEVELS ='));
+eval(extractConst('URGENCY_LEVELS', ';').replace('const URGENCY_LEVELS =', 'global.URGENCY_LEVELS ='));
 eval(extractConst('NOTIFY_BEHAVIOURS').replace('const NOTIFY_BEHAVIOURS =', 'global.NOTIFY_BEHAVIOURS ='));
 eval(extractConst('NOTIFY_DEFAULTS', '\n};').replace('const NOTIFY_DEFAULTS =', 'global.NOTIFY_DEFAULTS ='));
+eval(extractConst('SERVER_BEHAVIOURS', ';').replace('const SERVER_BEHAVIOURS =', 'global.SERVER_BEHAVIOURS ='));
+// This browser can receive push when the test says so (navigator.serviceWorker + PushManager in a real one).
+let pushHere = false;
+global.pushSupported = () => pushHere;
+// A browser, not the phone app (wiki features/phone-apps).
+global.nativeApp = () => false;
 for (const name of ['urgencyRank', 'notifyPrefs', 'setNotifyPref', 'inboxArrivals', 'announceInbox',
   'notificationSoundPrefs', 'siteName', 'showSystemNotification', 'unlockNotificationAudio', 'inboxEventChanges', 'playNotificationSound', 'inboxRowLabel', 'inboxTitle', 'policyTip', 'notificationsCard']) eval(extractFn(name));
 
@@ -158,6 +164,21 @@ for (const level of URGENCY_LEVELS) {
 }
 ok(card.indexOf('>Critical<') < card.indexOf('>Low<'), 'levels are listed loudest first, in sentence case');
 ok(card.includes('id="notifications"'), 'the card is linkable from the inbox');
+
+// Push: a column beside Email where the installation sends it, the person's levels
+// from the server; the device switch only where this browser can receive it.
+ok(!card.includes(':push"') && !card.includes('id="push-devices"'), 'no Push column where the installation does not send push');
+S.meta = { deliveryChannels: ['browser', 'push'] };
+S.organizationId = 'org';
+S.deliveryPreferences = { organizationId: 'org', pushUrgencies: { low: false, normal: false, high: true, critical: true } };
+const withPush = notificationsCard();
+ok(withPush.indexOf('data-notify="critical:email"') < withPush.indexOf('data-notify="critical:push"'), 'Push sits beside Email');
+ok(/data-notify="critical:push"[^>]*checked/.test(withPush) && !/data-notify="normal:push"[^>]*checked/.test(withPush), 'push levels come from the server');
+ok(withPush.includes('--notify-columns:5'), 'the grid makes room for the extra column');
+ok(!withPush.includes('id="push-devices"'), 'no device switch in a browser that cannot receive push');
+pushHere = true;
+ok(notificationsCard().includes('id="push-devices"'), 'a device switch where it can');
+S.meta = {}; S.deliveryPreferences = undefined; pushHere = false;
 ok(!card.includes('>Delivery<') && !card.includes('data-delivery='),
   'unimplemented delivery preferences are not shown as notification behaviour');
 ok(!card.includes('Outcome updates for tasks I follow'),

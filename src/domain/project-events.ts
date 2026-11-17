@@ -34,6 +34,10 @@ export interface ProjectEvent {
   origin: ProjectEventOrigin;
   /** How many event→run→emit steps led here; bounded to stop loops. */
   hops: number;
+  /** The tavya person (user id) a run it starts acts as: a chat sender linked
+   *  to their account (src/integrations/chat-links.ts). Set only by the
+   *  platform when it ingests the event, never from its payload. */
+  actsAs?: string;
   /** How often this key has been recorded: a repeat is counted, not dropped. */
   count: number;
   /** When it was last heard (`receivedAt` is the first time); what keeps it.
@@ -111,6 +115,8 @@ export interface TriggerContext {
   payload: Record<string, unknown>;
   /** Rendered concurrency key, when the trigger declares one. */
   concurrencyKey?: string;
+  /** The event's `actsAs`, for the record; the platform reads it from the stored event. */
+  actsAs?: string;
   /** A counted event: how often it has happened, and when last. */
   count?: number;
   lastSeenAt?: number;
@@ -139,6 +145,11 @@ export interface KeyedRun {
   createdAt: number;
   updatedAt: number;
 }
+
+/** Thrown by a start that must never happen for this event (the person a
+ *  chat-started run would act as may no longer start tasks): the dispatcher
+ *  skips the event for that task instead of retrying it. */
+export class EventRunRefused extends Error {}
 
 export const MAX_EVENT_PAYLOAD_BYTES = 64 * 1024;
 export const MAX_EVENT_HOPS = 8;
@@ -365,6 +376,7 @@ export function triggerContext(event: ProjectEvent, concurrencyKey?: string): Tr
     hops: event.hops,
     payload: event.payload,
     ...(concurrencyKey ? { concurrencyKey } : {}),
+    ...(event.actsAs ? { actsAs: event.actsAs } : {}),
     ...(event.count > 1 ? { count: event.count, lastSeenAt: event.lastSeenAt, ...(event.recent?.length ? { recent: event.recent } : {}) } : {}),
     ...(event.distinct && Object.keys(event.distinct).length ? { distinct: event.distinct } : {}),
   };

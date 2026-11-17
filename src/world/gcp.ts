@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { fetchServiceAccountToken, GoogleTokenError, parseGoogleServiceAccount, type GoogleServiceAccount } from '../integrations/google-service-account.js';
 import type { MachineShape } from '../domain/computer.js';
 import type { ComputerLimits } from '../domain/computer-limits.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
@@ -50,16 +51,11 @@ const QUOTA = new Set(['QUOTA_EXCEEDED', 'quotaExceeded']);
 
 type Fetch = typeof fetch;
 
-export interface GcpServiceAccount { client_email: string; private_key: string; project_id: string; token_uri?: string }
+export type GcpServiceAccount = GoogleServiceAccount;
 
 /** A service account key as Google downloads it (JSON). */
 export function gcpServiceAccount(apiKey: string): GcpServiceAccount {
-  let value: Partial<GcpServiceAccount> & { type?: string };
-  try { value = JSON.parse(apiKey.trim()); }
-  catch { throw new Error('a Google Cloud key is a service account key file (JSON)'); }
-  if (!value.client_email || !value.private_key || !value.project_id)
-    throw new Error('a Google Cloud key is a service account key file (JSON) with client_email, private_key and project_id');
-  return value as GcpServiceAccount;
+  return parseGoogleServiceAccount(apiKey, 'a Google Cloud key');
 }
 
 /** The E2 custom machine of exactly a shape, or the nearest larger one E2 allows. */
@@ -622,23 +618,16 @@ export class GcpDriver implements VmDriver {
     const key = this.key(connection);
     const held = this.tokens.get(key);
     if (held && held.expires > Date.now() + 60_000) return held.token;
-    const account = gcpServiceAccount(connection.apiKey);
-    const audience = account.token_uri ?? 'https://oauth2.googleapis.com/token';
-    const now = Math.floor(Date.now() / 1000);
-    const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
-    const unsigned = `${encode({ alg: 'RS256', typ: 'JWT' })}.${encode({ iss: account.client_email, scope: 'https://www.googleapis.com/auth/cloud-platform',
-      aud: audience, iat: now, exp: now + 3600 })}`;
-    const assertion = `${unsigned}.${crypto.sign('RSA-SHA256', Buffer.from(unsigned), account.private_key).toString('base64url')}`;
-    const response = await this.fetchImpl(audience, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion }).toString(), signal: AbortSignal.timeout(60_000) });
-    const answer = await response.json().catch(() => ({})) as { access_token?: string; expires_in?: number; error_description?: string; error?: string };
-    if (!response.ok || !answer.access_token) {
-      const message = `Google refused the service account key (${response.status}): ${answer.error_description ?? answer.error ?? 'no reason given'}`;
-      if (response.status >= 500) throw new GcpOutage(message);
-      throw new GcpError(message, response.status);
+    let fresh: { accessToken: string; expiresAt: number };
+    try {
+      fresh = await fetchServiceAccountToken(gcpServiceAccount(connection.apiKey), 'https://www.googleapis.com/auth/cloud-platform', this.fetchImpl);
+    } catch (error) {
+      if (!(error instanceof GoogleTokenError)) throw error;
+      if (error.status >= 500) throw new GcpOutage(error.message);
+      throw new GcpError(error.message, error.status);
     }
-    this.tokens.set(key, { token: answer.access_token, expires: Date.now() + (answer.expires_in ?? 3600) * 1000 });
-    return answer.access_token;
+    this.tokens.set(key, { token: fresh.accessToken, expires: fresh.expiresAt });
+    return fresh.accessToken;
   }
 
   private cached<T>(connection: ResolvedWorldProviderConnection, name: string, ms: number, make: () => Promise<T>): Promise<T> {

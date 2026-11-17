@@ -83,6 +83,7 @@ function formatBytes(value) {
 // the no-build-step console self-contained while still giving every button a
 // proper text alternative through its aria-label/title.
 const ICON = {
+  mic: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v5"/></svg>',
   stop: '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
   expand: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></svg>',
   collapse: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h5V3m13 5h-5V3M8 21v-5H3m13 5v-5h5"/></svg>',
@@ -1717,7 +1718,10 @@ const localWorldPath = (v) => (hostLocal() && v.worldPath) || '';
 // hibernateAfterDays, network}); the block shows the effective machine and a
 // form stores only what differs from what it inherits.
 const COMPUTER_PROVIDER_LABELS = { any: 'Any', e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', aws: 'AWS', gcp: 'Google Cloud', agent37: 'Agent37',
-  worktree: 'This machine', container: 'Docker container' };
+  worktree: 'This machine', container: 'Docker container', none: 'None' };
+// No computer (wiki features/computerless-tasks): the agent runs on tavya with its own tools only.
+const NO_COMPUTER = 'none';
+const NO_COMPUTER_TIP = 'No computer: the agent can only use tavya itself. Starts in seconds and uses no compute.';
 const CLOUD_COMPUTERS = ['e2b', 'daytona', 'fly', 'hetzner', 'aws', 'gcp', 'agent37'];
 const COMPUTER_REGION_LABELS = { eu: 'EU', us: 'US' };
 // Provider "Any" (wiki features/compute-routing): the cloud accounts it can
@@ -1804,7 +1808,9 @@ function computerProviderOptions(current, inFlight = false) {
     .map((c) => c.provider);
   // "Any" first: tavya chooses among the cloud computers (hosted's default).
   const any = S.meta?.hosted || connected.some((provider) => CLOUD_COMPUTERS.includes(provider)) || current === 'any' ? ['any'] : [];
-  return [...new Set([...any, ...connected, ...local, ...(current ? [current] : [])])];
+  // None last: a running task neither gains nor loses its computer.
+  const none = inFlight ? [] : [NO_COMPUTER];
+  return [...new Set([...any, ...connected, ...local, ...none, ...(current ? [current] : [])])];
 }
 const gbOf = (mb) => (mb == null ? '' : String(Math.round((mb / 1024) * 100) / 100));
 function computerBlockHtml(name, value, inherited, opts = {}) {
@@ -1822,12 +1828,13 @@ function computerBlockHtml(name, value, inherited, opts = {}) {
   const tip = (key) => (size[key].title ? ` title="${esc(size[key].title)}"` : '');
   const body = `<div class="computer-controls">
       <span class="computer-pick"><select class="cf-provider" aria-label="Provider">${computerProviderOptions(provider, opts.inFlight).map((p) => `<option value="${esc(p)}" ${p === provider ? 'selected' : ''}>${esc(COMPUTER_PROVIDER_LABELS[p] || p)}</option>`).join('')}</select>
-      <span class="cf-reach"${provider === 'any' ? '' : ' hidden'}>${policyTip(`Any: ${computerReachText()}. ${ANY_TIP}`)}</span></span>
-      <label class="computer-size"${tip('cpu')}><input class="cf-cpu" type="number" min="1" ${sizeAttrs('cpu')} step="1" inputmode="numeric" value="${esc(v.cpu ?? '')}" aria-label="CPU"><span>CPU</span></label>
-      <label class="computer-size"${tip('memory')}><input class="cf-memory" type="number" min="0.5" ${sizeAttrs('memory')} step="0.5" inputmode="decimal" value="${esc(gbOf(v.memoryMb))}" aria-label="Memory in GB"><span>GB RAM</span></label>
-      <label class="computer-size"${tip('disk')}><input class="cf-disk" type="number" min="1" ${sizeAttrs('disk')} step="1" inputmode="numeric" value="${esc(v.diskGb ?? '')}" aria-label="Disk in GB"><span>GB disk</span></label>
+      <span class="cf-reach"${provider === 'any' ? '' : ' hidden'}>${policyTip(`Any: ${computerReachText()}. ${ANY_TIP}`)}</span>
+      <span class="cf-none"${provider === NO_COMPUTER ? '' : ' hidden'}>${policyTip(NO_COMPUTER_TIP)}</span></span>
+      <label class="computer-size"${tip('cpu')}${provider === NO_COMPUTER ? ' hidden' : ''}><input class="cf-cpu" type="number" min="1" ${sizeAttrs('cpu')} step="1" inputmode="numeric" value="${esc(v.cpu ?? '')}" aria-label="CPU"><span>CPU</span></label>
+      <label class="computer-size"${tip('memory')}${provider === NO_COMPUTER ? ' hidden' : ''}><input class="cf-memory" type="number" min="0.5" ${sizeAttrs('memory')} step="0.5" inputmode="decimal" value="${esc(gbOf(v.memoryMb))}" aria-label="Memory in GB"><span>GB RAM</span></label>
+      <label class="computer-size"${tip('disk')}${provider === NO_COMPUTER ? ' hidden' : ''}><input class="cf-disk" type="number" min="1" ${sizeAttrs('disk')} step="1" inputmode="numeric" value="${esc(v.diskGb ?? '')}" aria-label="Disk in GB"><span>GB disk</span></label>
     </div>
-    <details class="computer-more"${opts.open ? ' open' : ''}><summary>More</summary><div class="computer-more-grid">
+    <details class="computer-more"${opts.open ? ' open' : ''}${provider === NO_COMPUTER ? ' hidden' : ''}><summary>More</summary><div class="computer-more-grid">
       <label class="form-row"${features.desktop ? '' : ' hidden'}><span>Experience ${policyTip('Desktop adds a screen you can watch and take over.')}</span><select class="cf-flavor" ${fixed}>
         <option value="headless" ${v.flavor !== 'desktop' ? 'selected' : ''}>Headless</option><option value="desktop" ${v.flavor === 'desktop' ? 'selected' : ''}>Desktop</option></select></label>
       <label class="form-row"${provider === 'any' ? '' : ' hidden'}><span>Region ${policyTip('Where Any may put the computer, for data that must stay there.')}</span><select class="cf-region">
@@ -1911,6 +1918,8 @@ function readComputerBlock(box) {
   const memory = number('.cf-memory');
   // A provider without a desktop or an allowlist gets headless and normal
   // internet, even if the defaults it inherits ask for more.
+  // Without a computer there is nothing to size or wall in.
+  if (value('.cf-provider') === NO_COMPUTER) return { provider: NO_COMPUTER };
   const features = computerFeaturesFor(value('.cf-provider'));
   const out = {
     provider: value('.cf-provider') || undefined,
@@ -1964,6 +1973,13 @@ function syncComputerBlock(box) {
   if (row('.cf-region')) row('.cf-region').hidden = provider !== 'any';
   const reach = box.querySelector('.cf-reach');
   if (reach) reach.hidden = provider !== 'any';
+  // No computer: nothing to size, so only the provider (and its tip) shows.
+  const none = provider === NO_COMPUTER;
+  const noneTip = box.querySelector('.cf-none');
+  if (noneTip) noneTip.hidden = !none;
+  box.querySelectorAll('.computer-size').forEach((label) => { label.hidden = none; });
+  const more = box.querySelector('.computer-more');
+  if (more) more.hidden = none;
   if (row('.cf-flavor')) row('.cf-flavor').hidden = !features.desktop;
   const networks = computerNetworks(features);
   const networkSelect = box.querySelector('.cf-network');
@@ -2036,7 +2052,7 @@ function renderField(f, own, inherited, withChips, alt, agentOpts) {
       // elsewhere with the default [[proj:tag:default]] / [[org:tag:default]]), so
       // the user sees (and can remove) what's inlined by default; [[ adds more.
       return `<div class="form-row" data-row="${esc(f.name)}">${label}<div class="prompt-field">${ta}<div class="img-chips attachment-chips" id="tf-chips" style="display:none"></div>
-        <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input id="tf-files" type="file" multiple hidden></label>${policyTip('Drop or paste files here (25 MB each, 50 MB per task). Type [[ to add a wiki page.')}</div>
+        <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input id="tf-files" type="file" multiple hidden></label>${policyTip('Drop or paste files here (25 MB each, 50 MB per task). Type [[ to add a wiki page.')}${micButtonHtml('prompt')}</div>
         <div class="prompt-context-row"><span class="pc-prefix">Context</span>${policyTip('Wiki pages the agent reads before it starts.')}<input type="hidden" id="tf-context"><span class="pc-chips" id="tf-context-chips"></span><textarea id="tf-context-add" class="prompt-context" rows="1" spellcheck="false" aria-label="Add wiki context" placeholder="type [[ to attach a wiki page, label, or folder"></textarea></div></div></div>`;
     return `<div class="form-row" data-row="${esc(f.name)}">${label}${ta}</div>`;
   }
@@ -4955,10 +4971,12 @@ async function boot() {
   // create an account — with the address the invite was sent to.
   S.pendingInvite = location.pathname === '/invite' && !!new URLSearchParams(location.search).get('token');
   if (session.authRequired && !session.authenticated && !session.token) {
+    // The phone app signs in through the system browser (wiki features/phone-apps).
+    if (nativeApp()) return renderAppSignIn();
     // The public root explains the product before asking for an account. Auth
     // callbacks, invitations and explicit auth routes still land directly on
     // the form they need, so a person following a link never has to hunt.
-    return siteView(S.pendingInvite || S.justVerified || S.signInError || ['/login', '/mcp-callback', '/device', '/oauth/consent'].includes(location.pathname)
+    return siteView(S.pendingInvite || S.justVerified || S.signInError || ['/login', '/mcp-callback', '/device', '/oauth/consent', '/link/chat'].includes(location.pathname)
       ? renderLogin : location.pathname === '/signup' ? renderSignup : renderLanding);
   }
   // Successful password/social auth returns to the public auth URL it started
@@ -4967,8 +4985,10 @@ async function boot() {
     history.replaceState({ kx: 1 }, '', '/');
   S.token = session.token || null; // Better Auth uses an HttpOnly same-origin cookie.
   S.user = session.user || null;
+  wireNativeApp().catch(() => {});
   if (location.pathname === '/mcp-callback') return finishMcpCallback();
   if (location.pathname === '/device') return renderDeviceApproval();
+  if (location.pathname === '/link/chat') return renderChatLink();
   if (location.pathname === '/oauth/consent') return renderOAuthConsent();
   const route = parseRoute(location.pathname);
   if (route.name === 'invite') {
@@ -6381,6 +6401,7 @@ function renderShell() {
           <div class="rail-new" role="group" aria-label="New task">
             <button class="btn primary rail-new-task" id="rail-new-task" type="button" data-shortcut="nav.newTaskDefault" title="${esc(commandHint('New task', 'nav.newTaskDefault'))}">${ICON.plus}<span>New task</span></button>
             <button class="btn primary rail-new-template" id="rail-new-template" type="button" data-shortcut="nav.newTask" aria-label="New task from template" title="${esc(commandHint('New task from template', 'nav.newTask'))}">${ICON.template}</button>
+            <button class="btn rail-ask" id="rail-ask" type="button" data-shortcut="nav.ask" aria-label="Ask ${esc(siteName())}" aria-haspopup="dialog" title="${esc(commandHint(`Ask ${siteName()} — no computer, starts in seconds`, 'nav.ask'))}">${ICON.chat}</button>
           </div>
           <nav class="rail-org-nav" aria-label="Organization">${RAIL_ORG_NAV.map(([id, label, icon, , , , command]) =>
             `<a class="rail-row" id="${id}" data-spa data-shortcut="${command}" href="#">${ICON[icon]}<span>${label}</span></a>`).join('')}</nav>
@@ -6408,6 +6429,7 @@ function renderShell() {
   $('#rail-palette').addEventListener('click', openPalette);
   $('#rail-new-task').addEventListener('click', () => openNewTaskForm());
   $('#rail-new-template').addEventListener('click', () => openTemplatePicker());
+  $('#rail-ask').addEventListener('click', () => askTavya());
   $('#rail-help').addEventListener('click', openHelp);
   $('#key-echo').addEventListener('animationend', () => echoKeys('')); // faded out
   wireVerificationBanner();
@@ -9034,6 +9056,59 @@ function openNewTaskForm(template, projectId = template?.projectId) {
     { projectId, ...(template ? { template } : {}) });
 }
 function newTaskTarget() { return S.tab === 'home' ? newTaskProjectId() : S.projectId; }
+
+// "Ask tavya" (wiki features/computerless-tasks): what you type starts a task
+// without a computer in the project new tasks go to, acting with your own
+// authority; its page opens with the message box ready. One conversation is one task.
+function askTavya(projectId) {
+  if (!projectId) return withNewTaskProject((chosen) => askTavya(chosen));
+  const previousFocus = document.activeElement;
+  const dialog = document.createElement('dialog');
+  dialog.className = 'text-prompt ask-dialog';
+  dialog.setAttribute('aria-label', `Ask ${siteName()}`);
+  const mic = micButtonHtml('ask');
+  dialog.innerHTML = `<form method="dialog"><div class="prompt-field"><textarea name="ask" rows="3" required maxlength="20000" aria-label="Ask ${esc(siteName())}"
+      placeholder="Ask ${esc(siteName())} anything: change a setting, find what waits on you, start a task…"></textarea>
+      ${mic ? `<div class="prompt-attach-row ask-mic">${mic}</div>` : ''}</div>
+    <div class="inline-form ask-foot"><span class="ask-where">${esc(projectById(projectId)?.name || '')}${policyTip(NO_COMPUTER_TIP)}</span>
+      <button class="btn primary" value="submit" title="Ask (Enter)">Ask</button></div></form>`;
+  const input = dialog.querySelector('textarea');
+  const form = dialog.querySelector('form');
+  let sending = false;
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (!text || sending) return;
+    sending = true;
+    dialog.querySelector('button[value="submit"]').disabled = true;
+    try {
+      const created = await api(`/api/projects/${encodeURIComponent(projectId)}/tasks`, { method: 'POST', body: JSON.stringify({
+        workflow: NEW_TASK_WORKFLOW, ownAuthority: true, params: { prompt: text, computer: { provider: NO_COMPUTER } } }) });
+      dialog.close();
+      await goToTask(created.id);
+      focusWhenReady('.followup-input');
+    } catch (error) {
+      toast(error.message, true);
+      sending = false;
+      dialog.querySelector('button[value="submit"]').disabled = false;
+    }
+  });
+  dialog.addEventListener('keydown', (event) => {
+    event.stopPropagation(); // the console's shortcuts stay outside, but for dictation
+    if (runDictationShortcut(event)) return;
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); form.requestSubmit(); }
+  });
+  dialog.addEventListener('close', () => { stopDictation(); dialog.remove(); if (!sending) previousFocus?.focus?.(); });
+  document.body.appendChild(dialog);
+  dialog.showModal();
+  input.focus();
+}
+/** Focus what a page is about to render (a task page's message box). */
+function focusWhenReady(selector, deadline = Date.now() + 8000) {
+  const el = document.querySelector(selector);
+  if (el && !el.disabled) { el.focus(); return; }
+  if (Date.now() < deadline) setTimeout(() => focusWhenReady(selector, deadline), 100);
+}
 function wireNewTaskComposer() {
   $('#expand-task')?.addEventListener('click', () => openNewTaskForm());
   $('#new-from-template')?.addEventListener('click', () => openTemplatePicker());
@@ -9958,7 +10033,7 @@ function readinessGaps(readiness, projectId) {
   const needs = new Map();
   for (const agent of (readiness.agents || []).filter((a) => !a.ready)) {
     const need = agent.need || { provider: agent.provider };
-    needs.set(`${need.provider}:${need.off || ''}`, need);
+    needs.set(`${need.provider}:${need.off || ''}:${need.computerless ? 'none' : ''}`, need);
   }
   // A model on the compute credit (any OpenRouter model, or Claude/Codex
   // through a model gateway, with no login or key of the organization's own)
@@ -9971,6 +10046,12 @@ function readinessGaps(readiness, projectId) {
   }
   for (const need of needs.values()) {
     const name = ACCOUNT_PROVIDER_LABELS[need.provider] || need.provider;
+    // Without a computer only an API key (or the included model) runs the agent.
+    if (need.computerless) {
+      gaps.push({ label: /runs only on a computer/.test(need.computerless) ? `Add a ${name} API key` : 'Pick another model',
+        href: `${settings}#settings-agents`, tip: need.computerless });
+      continue;
+    }
     gaps.push(need.off === 'project'
       ? { label: `Turn on ${name}`, href: `${projectRoute(projectId, 'settings')}#project-agents`,
         tip: `Your ${name} account is switched off for this project.` }
@@ -10024,7 +10105,9 @@ function wireTaskReadiness(page, projectId) {
       const spec = readAgentSpec(box);
       return spec.provider ? `${spec.provider}${spec.model ? `:${spec.model}${spec.effort ? `:${spec.effort}` : ''}` : ''}` : '';
     }).filter(Boolean);
-    const query = new URLSearchParams(agents.map((agent) => ['agent', agent])).toString();
+    // A task without a computer needs no compute, and runs only on an API key or the included model.
+    const computerless = page.querySelector('.computer-field .cf-provider')?.value === NO_COMPUTER;
+    const query = new URLSearchParams([...agents.map((agent) => ['agent', agent]), ...(computerless ? [['computer', NO_COMPUTER]] : [])]).toString();
     if (query === asked) return;
     asked = query;
     const readiness = await api(`/api/projects/${encodeURIComponent(projectId)}/readiness?${query}`).catch(() => null);
@@ -11878,6 +11961,9 @@ function settleConversation(thread, fresh, before) {
   const answer = thread.querySelector('[data-land]');
   if (!answer) return;
   const target = answer.dataset.conversationKey;
+  // A new answer while the task is open (not the one it opened on), once.
+  const spoken = S.spokenAnswers || (S.spokenAnswers = {});
+  if (last && target !== last.key && spoken[key] !== target) { spoken[key] = target; readAloud(answer); }
   const untouched = !!last && !!before && Math.abs(before.top - last.top) < 2;
   if (!fresh && (target === last?.key || !(before?.atBottom || untouched))) return;
   const question = thread.querySelector('[data-land-question]');
@@ -14101,6 +14187,7 @@ function conversationPane(v, t) {
           <div class="img-chips attachment-chips followup-chips" style="display:none"></div>
           <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label>${policyTip(`Drop or paste files here (25 MB each, 50 MB per message). Type ${t.shared ? '@ to bring in an agent or a person, ' : ''}[[ to add a wiki page.`)}
             <span class="followup-buttons">
+              ${followUp.enabled ? micButtonHtml(`followup:${v.taskId}/${t.role}`) : ''}
               ${t.shared && stoppableAgent(v) ? stopAgentButton(stoppableAgent(v), 'btn followup-stop') : ''}
               <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}${continues ? ' title="The approved PR lands as it is. The agent carries on in a new task."' : ''}>${continues ? 'Continue' : 'Send'}</button>
             </span></div>
@@ -14720,7 +14807,7 @@ function renderAgentMessageBody(text, v = S.view, math = mathjaxEnabled(), form 
 // secret field of a secret store, as a whole value: a secret typed into a form
 // is never shown in the conversation, kept in its history or read back.
 const FORM_BLOCK = /<pre class="md-code lang-form"><code>([\s\S]*?)<\/code><\/pre>/g;
-const SECRET_FIELD_KEY = /^(?:value|secret|secrets|key|apiKey|api_key|managementKey|token|password|clientSecret|privateKey|totp)$/i;
+const SECRET_FIELD_KEY = /^(?:value|secret|secrets|key|apiKey|api_key|managementKey|token|password|clientSecret|privateKey|totp|serviceAccount)$/i;
 // [method, path, what it is (from the path's ids and the body), a secret store?]
 const SETTINGS_TARGETS = [
   ['POST', /^\/api\/projects\/([^/]+)\/secrets$/, (m, b) => `${formLiteral(b.name) ? `${b.name} · ` : ''}${formProjectName(m[1])} secrets`, true],
@@ -14728,6 +14815,7 @@ const SETTINGS_TARGETS = [
   ['PATCH', /^\/api\/projects\/([^/]+)$/, (m) => `${formProjectName(m[1])} settings`],
   ['PUT', /^\/api\/settings\/project\/([^/]+)\/[^/]+$/, (m) => `${formProjectName(m[1])} task defaults`],
   ['PUT', /^\/api\/settings\/managed-compute\/([^/]+)$/, (m) => `Managed compute · ${formProviderName(m[1])}`, true],
+  ['PUT', /^\/api\/settings\/native-push$/, () => 'Phone apps · Firebase key', true],
   ['PUT', /^\/api\/settings\/included-model$/, () => 'Managed compute · Included model', true],
   ['POST', /^\/api\/settings\/model-gateways$/, () => 'Managed compute · Model gateways', true],
   ['PUT', /^\/api\/settings\/model-gateways\/[^/]+$/, () => 'Managed compute · Model gateways', true],
@@ -15159,6 +15247,7 @@ function presenceDetail(v) {
 
 // A finished task's workspace was released, not never started.
 function noWorkspaceLabel(v) {
+  if (v.worldProvider === NO_COMPUTER) return 'No computer';
   return ['done', 'cancelled', 'failed'].includes(v.status) ? 'Workspace closed' : 'No workspace yet';
 }
 
@@ -22164,17 +22253,22 @@ const CHAT_URL_PASTED = {
 };
 const chatUrlTip = (kind) => `Paste into ${CHAT_URL_PASTED[kind][0]}: ${CHAT_URL_PASTED[kind][1]}`;
 
-// Who a chat bot takes requests from, and who asked without being allowed.
+// Who may ask a chat bot (wiki planned/assistant §3): people who linked their
+// chat account ask as themselves; guests, as whoever connected the bot.
 function chatPeopleHtml(h) {
   const who = (p) => esc(p.name || p.id);
+  const linked = (h.linked || []).map((l) => `<span class="chip pe-person pe-linked" title="${esc(`${CHAT_PLATFORM_LABELS[h.kind] || ''} id ${l.platformUserId}`)}">${esc(l.name || l.userId)}${l.platformName ? ` <span class="setting-muted">· ${esc(l.platformName)}</span>` : ''}<button class="file-chip-x" data-people-unlink="${esc(l.id)}" aria-label="Remove ${esc(l.name || l.userId)}" title="Remove">✕</button></span>`).join('');
   const allowed = (h.allowed || []).map((p) => `<span class="chip pe-person" title="${esc(p.id)}">${who(p)}<button class="file-chip-x" data-people-remove="${esc(p.id)}" aria-label="Remove ${who(p)}" title="Remove">✕</button></span>`).join('');
   const asking = (h.asking || []).map((p) => `<div class="setting-row pe-sub pe-asking" data-person="${esc(p.id)}">
     <span class="setting-label" title="${esc(p.id)}">${who(p)}</span>
     <span class="setting-value setting-muted">${p.text ? `“${esc(p.text.slice(0, 80))}”` : ''}${p.at ? `<span class="setting-sep">·</span>${fmtAgo(p.at)}` : ''}</span>
-    <span class="setting-actions"><button class="btn sm" data-people-allow>Allow</button><button class="btn sm ghost" data-people-dismiss aria-label="Dismiss" title="Dismiss">✕</button></span></div>`).join('');
-  return `<div class="setting-row pe-sub pe-people" data-people="${esc(h.id)}">
-    <span class="setting-label">Who can ask ${policyTip('Only their messages start tasks. Anyone else is told so and shows up here to allow.')}</span>
-    <span class="setting-value">${h.anyone ? '<span class="setting-muted">Anyone who can message the bot</span>' : allowed || '<span class="setting-muted">Nobody yet: message the bot, then allow yourself here</span>'}</span>
+    <span class="setting-actions"><button class="btn sm" data-people-allow title="Let them ask as a guest">Allow</button><button class="btn sm ghost" data-people-dismiss aria-label="Dismiss" title="Dismiss">✕</button></span></div>`).join('');
+  const linkedRow = linked ? `<div class="setting-row pe-sub pe-people-linked" data-people="${esc(h.id)}">
+    <span class="setting-label">Linked ${policyTip('Their messages start tasks as them, with no more than they may do in this project.')}</span>
+    <span class="setting-value">${linked}</span><span class="setting-actions"></span></div>` : '';
+  return `${linkedRow}<div class="setting-row pe-sub pe-people" data-people="${esc(h.id)}">
+    <span class="setting-label">Guests ${policyTip(`They act as ${h.connectedBy || 'whoever connected the bot'}. Anyone else is sent a link to link their account.`)}</span>
+    <span class="setting-value">${h.anyone ? '<span class="setting-muted">Anyone who can message the bot</span>' : allowed || '<span class="setting-muted">None</span>'}</span>
     <span class="setting-actions"><label class="pe-starts">Anyone <input type="checkbox" class="toggle" data-people-anyone ${h.anyone ? 'checked' : ''}></label></span></div>${asking}`;
 }
 
@@ -22218,7 +22312,7 @@ async function hydrateProjectEvents(proj) {
       if (!confirm(`Delete “${row.querySelector('.setting-label').textContent}”? It stops receiving events.`)) return;
       try { await api(`/api/webhooks/${row.dataset.hook}`, { method: 'DELETE' }); load(); } catch (e) { toast(e.message, true); }
     }));
-    // A chat bot's people rows follow its "Who can ask" row.
+    // A chat bot's people rows (Linked, Guests, then those asking) belong to the row marked data-people above them.
     const people = async (el, patch) => {
       let row = el.closest('.setting-row');
       while (row && !row.dataset.people) row = row.previousElementSibling;
@@ -22230,6 +22324,8 @@ async function hydrateProjectEvents(proj) {
     box.querySelectorAll('[data-people-anyone]').forEach((t) => t.addEventListener('change', () => people(t, () => ({ anyone: t.checked }))));
     box.querySelectorAll('[data-people-remove]').forEach((b) => b.addEventListener('click', () =>
       people(b, (h) => ({ allowed: (h.allowed || []).filter((p) => p.id !== b.dataset.peopleRemove) }))));
+    box.querySelectorAll('[data-people-unlink]').forEach((b) => b.addEventListener('click', () =>
+      people(b, () => ({ unlink: [b.dataset.peopleUnlink] }))));
     box.querySelectorAll('[data-people-allow]').forEach((b) => b.addEventListener('click', () => {
       const id = b.closest('[data-person]').dataset.person;
       people(b, (h) => {
@@ -26634,6 +26730,416 @@ function wireInboxNotices() {
   });
 }
 
+// ── the phone apps (wiki features/phone-apps) ────────────────────────────────
+// The Android and iOS apps (mobile/) are this console in a WebView, plus what
+// a website does badly on a phone: speech recognition, push and the sign-in.
+// Their native code reaches the page as window.Capacitor; nothing here is
+// bundled into the app, so the console stays one codebase.
+function nativeApp() {
+  try { return typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.() === true; } catch { return false; }
+}
+function nativePlugin(name) {
+  if (!nativeApp()) return null;
+  const cap = window.Capacitor;
+  if (cap.isPluginAvailable && !cap.isPluginAvailable(name)) return null;
+  return cap.Plugins?.[name] || null;
+}
+function nativePlatform() { return nativeApp() ? window.Capacitor.getPlatform?.() || '' : ''; }
+
+// The platform's speech recognizer behind the browser's SpeechRecognition
+// interface, so dictation (toggleDictation) is the same code in a browser and
+// in the app. Android ends it after a pause, like the browser; iOS keeps
+// listening, so a pause after words ends it here.
+const NATIVE_SPEECH_PAUSE_MS = 2000;
+function nativeRecognitionClass() {
+  const plugin = nativePlugin('SpeechRecognition');
+  if (!plugin) return null;
+  return class NativeSpeechRecognition {
+    constructor() { this.lang = 'en-US'; this.interimResults = true; this.continuous = false; this.onresult = this.onerror = this.onend = null; this.listeners = []; }
+    start() {
+      this.run().catch((error) => {
+        if (this.ended) return;
+        const text = String(error?.message || error || '');
+        this.onerror?.({ error: error?.error || (/permission|denied|not allowed/i.test(text) ? 'not-allowed' : 'aborted'), message: text });
+        this.finish();
+      });
+    }
+    async run() {
+      let permission = await plugin.checkPermissions();
+      if (permission.speechRecognition !== 'granted') permission = await plugin.requestPermissions();
+      if (permission.speechRecognition !== 'granted') throw { error: 'not-allowed' };
+      this.listeners.push(await plugin.addListener('partialResults', ({ matches }) => {
+        if (this.ended || typeof matches?.[0] !== 'string') return;
+        this.onresult?.({ results: [[{ transcript: matches[0] }]] });
+        clearTimeout(this.pause);
+        if (!this.continuous) this.pause = setTimeout(() => this.stop(), NATIVE_SPEECH_PAUSE_MS);
+      }));
+      this.listeners.push(await plugin.addListener('listeningState', ({ status }) => { if (status === 'stopped') this.finish(); }));
+      // Stopped while asking for permission: nothing is left listening.
+      if (this.ended) { for (const listener of this.listeners) listener?.remove?.(); return; }
+      await plugin.start({ language: this.lang, partialResults: this.interimResults, popup: false, maxResults: 1 });
+    }
+    stop() { if (this.ended) return; plugin.stop().catch(() => {}); this.finish(); }
+    finish() {
+      if (this.ended) return;
+      this.ended = true;
+      clearTimeout(this.pause);
+      for (const listener of this.listeners) listener?.remove?.();
+      this.onend?.();
+    }
+  };
+}
+
+// ── voice input (wiki features/push-and-voice) ──────────────────────────────
+// A mic in a prompt field's bottom row: the browser's speech recognition types
+// into the field (interim words as they come), where they can be edited before
+// sending. One field listens at a time; a second tap, the browser's end of
+// speech, typing or Esc stops it. Absent where the browser has no recognition.
+// Any prompt field gets one with micButtonHtml(key) in its `.prompt-attach-row`.
+function speechRecognitionClass() {
+  if (typeof window === 'undefined') return null;
+  // In the phone app the platform's recognizer (the Android WebView has none of its own).
+  if (nativeApp()) return nativeRecognitionClass();
+  return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+}
+function micButtonHtml(key) {
+  if (typeof speechRecognitionClass() !== 'function') return '';
+  const on = S.dictation?.key === key;
+  return `<button type="button" class="mic-button${on ? ' listening' : ''}" data-mic="${esc(key)}" data-shortcut="compose.voice" aria-pressed="${on}"
+    aria-label="${on ? 'Stop dictating' : 'Dictate'}" title="${esc(commandHint(on ? 'Stop dictating' : 'Dictate', 'compose.voice'))}">${ICON.mic}</button>`;
+}
+// The field a mic types into: found again each time, since a refresh may have replaced it.
+function micField(key) {
+  const button = document.querySelector(`[data-mic="${CSS.escape(key)}"]`);
+  return { button, field: button?.closest('.prompt-field')?.querySelector('textarea') || null };
+}
+function paintMic(key) {
+  const { button } = micField(key);
+  if (!button) return;
+  const on = S.dictation?.key === key;
+  button.classList.toggle('listening', on);
+  button.setAttribute('aria-pressed', String(on));
+  button.setAttribute('aria-label', on ? 'Stop dictating' : 'Dictate');
+  button.title = commandHint(on ? 'Stop dictating' : 'Dictate', 'compose.voice');
+}
+function toggleDictation(key) {
+  if (S.dictation?.key === key) return stopDictation();
+  stopDictation();
+  const Recognition = speechRecognitionClass();
+  const { field } = micField(key);
+  if (!Recognition || !field || field.disabled) return;
+  window.speechSynthesis?.cancel(); // never transcribe our own voice
+  const recognition = new Recognition();
+  recognition.lang = document.documentElement.lang || navigator.language || 'en-US';
+  recognition.interimResults = true;
+  recognition.continuous = false; // a pause ends it
+  // Words go where the caret was, replacing any selection, spaced from their neighbours.
+  const value = field.value, start = field.selectionStart ?? value.length, end = field.selectionEnd ?? value.length;
+  const before = value.slice(0, start), after = value.slice(end);
+  const state = { key, recognition, placeholder: field.placeholder, heard: '' };
+  S.dictation = state;
+  const write = (text) => {
+    const target = micField(key).field;
+    if (!target || S.dictation !== state) return;
+    const lead = before && text && !/\s$/.test(before) ? ' ' : '';
+    const tail = after && text && !/^\s/.test(after) ? ' ' : '';
+    target.value = `${before}${lead}${text}${tail}${after}`;
+    const caret = before.length + lead.length + text.length;
+    target.setSelectionRange?.(caret, caret);
+    target.dispatchEvent(new Event('input', { bubbles: true })); // drafts, sizing, @ and [[ menus
+  };
+  recognition.onresult = (event) => {
+    state.heard = [...event.results].map((result) => result[0]?.transcript || '').join('').trim();
+    write(state.heard);
+  };
+  recognition.onerror = (event) => {
+    const blocked = nativeApp() ? `Allow the microphone and speech recognition for ${siteName()} in your phone’s settings to dictate.` : 'Allow the microphone for this site to dictate.';
+    const message = { 'not-allowed': blocked, 'service-not-allowed': blocked,
+      'audio-capture': 'No microphone found.', network: 'Dictation needs a connection.' }[event.error];
+    if (message) toast(message, true);
+  };
+  recognition.onend = () => { if (S.dictation === state) stopDictation(); };
+  field.placeholder = 'Listening…';
+  try { recognition.start(); } catch (error) { S.dictation = null; field.placeholder = state.placeholder; return toast(error.message, true); }
+  paintMic(key);
+  field.focus();
+}
+function stopDictation() {
+  const state = S.dictation;
+  if (!state) return;
+  S.dictation = null;
+  try { state.recognition.stop(); } catch {}
+  const { field } = micField(state.key);
+  if (field) field.placeholder = state.placeholder;
+  paintMic(state.key);
+}
+/** Dictation's shortcut, for a field inside an overlay that keeps the console's
+ * other shortcuts out (the task form, Ask): true when it ran. */
+function runDictationShortcut(event) {
+  if (!(event.metaKey || event.ctrlKey) || !focusedMicKey()) return false;
+  const dictate = allCommands().find((command) => command.id === 'compose.voice');
+  if (!(dictate?.keys?.length === 1 && stepMatches(dictate.keys[0], event))) return false;
+  event.preventDefault();
+  dictate.run();
+  return true;
+}
+// The mic of the field being typed in, else the only one on screen.
+function focusedMicKey() {
+  const own = document.activeElement?.closest?.('.prompt-field')?.querySelector('[data-mic]');
+  const shown = [...document.querySelectorAll('[data-mic]')].filter((button) => button.offsetParent);
+  return (own || (shown.length === 1 ? shown[0] : null))?.dataset.mic || null;
+}
+if (typeof document !== 'undefined') {
+  document.addEventListener('click', (event) => {
+    const button = event.target.closest?.('[data-mic]');
+    if (button) { event.preventDefault(); toggleDictation(button.dataset.mic); }
+  });
+  // Typing takes over from the mic: what was heard stays, editable.
+  document.addEventListener('keydown', (event) => {
+    if (!S.dictation || event.metaKey || event.ctrlKey || event.altKey) return;
+    if (event.key === 'Escape' || event.target.closest?.('.prompt-field')) stopDictation();
+  }, true);
+}
+
+// Read replies aloud (Profile, this device): each new answer that lands on the
+// open task is spoken. Starting to type, dictate or send stops it.
+function readAloudEnabled() {
+  try { return typeof speechSynthesis !== 'undefined' && localStorage.getItem('karmax-read-aloud') === '1'; } catch { return false; }
+}
+function readAloud(element) {
+  if (!readAloudEnabled() || !element) return;
+  const copy = element.cloneNode(true);
+  copy.querySelectorAll('.msg-meta, button, details:not([open]) > :not(summary), pre').forEach((node) => node.remove());
+  const text = copy.textContent.replace(/\s+/g, ' ').trim().slice(0, 4000);
+  if (!text) return;
+  speechSynthesis.cancel();
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = document.documentElement.lang || navigator.language || 'en-US';
+  speechSynthesis.speak(utterance);
+}
+if (typeof document !== 'undefined') document.addEventListener('keydown', (event) => {
+  if (typeof speechSynthesis !== 'undefined' && speechSynthesis.speaking && event.target.closest?.('.prompt-field, #ck-thread')) speechSynthesis.cancel();
+}, true);
+
+// ── Web Push on this device (wiki features/push-and-voice) ───────────────────
+// The server pushes inbox items at the levels of the Push column to every
+// device a person turned push on for. Turning it on asks for the browser's
+// permission then, never before.
+function pushSupported() {
+  // In the phone app: native push, once the installation has its Firebase key (never a switch that cannot work).
+  if (nativeApp()) return !!S.meta?.nativePush && !!nativePlugin('PushNotifications');
+  return typeof navigator !== 'undefined' && 'serviceWorker' in navigator && typeof window.PushManager !== 'undefined'
+    && typeof Notification !== 'undefined' && !!S.meta?.deliveryChannels?.includes('push');
+}
+// "Chrome on Android": what a person recognises a device by in their list.
+function deviceLabel() {
+  const ua = navigator.userAgent || '';
+  if (nativeApp()) return `${siteName()} on ${nativePlatform() === 'ios' ? (/iPad/.test(ua) ? 'iPad' : 'iPhone') : 'Android'}`;
+  const browser = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Firefox\//.test(ua) ? 'Firefox'
+    : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'Browser';
+  const os = /Android/.test(ua) ? 'Android' : /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : /Mac OS X|Macintosh/.test(ua) ? 'Mac'
+    : /Windows/.test(ua) ? 'Windows' : /CrOS/.test(ua) ? 'ChromeOS' : /Linux/.test(ua) ? 'Linux' : '';
+  return os ? `${browser} on ${os}` : browser;
+}
+async function pushRegistration() {
+  return (await navigator.serviceWorker.getRegistration()) || navigator.serviceWorker.register('/service-worker.js');
+}
+// A subscription made with another key (another installation, a replaced key) cannot carry ours.
+const base64url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+function madeWithKey(subscription, publicKey) {
+  const made = subscription?.options?.applicationServerKey;
+  return !made || base64url(made) === publicKey;
+}
+// This browser's subscription, if it is one of the person's devices on the server and can carry our pushes.
+async function thisPushDevice(devices) {
+  if (nativeApp()) return devices.find((entry) => entry.id === nativePushDeviceId()) || null;
+  const subscription = await (await pushRegistration())?.pushManager.getSubscription();
+  const device = subscription && devices.find((entry) => entry.endpoint === subscription.endpoint);
+  return device && madeWithKey(subscription, (await api('/api/push/key')).publicKey) ? device : null;
+}
+async function enablePush() {
+  if (nativeApp()) return enableNativePush();
+  if (await Notification.requestPermission() !== 'granted') throw new Error('Allow notifications for this site to turn push on.');
+  const { publicKey } = await api('/api/push/key');
+  const registration = await pushRegistration();
+  const key = Uint8Array.from(atob(publicKey.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
+  let subscription = await registration.pushManager.getSubscription();
+  if (subscription && !madeWithKey(subscription, publicKey)) { await subscription.unsubscribe(); subscription = null; }
+  subscription ||= await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+  return api('/api/user/push-subscriptions', { method: 'POST', body: JSON.stringify({ ...subscription.toJSON(), label: deviceLabel() }) });
+}
+async function disablePush(devices) {
+  if (nativeApp()) return disableNativePush();
+  const subscription = await (await pushRegistration())?.pushManager.getSubscription();
+  const device = subscription && devices.find((entry) => entry.endpoint === subscription.endpoint);
+  if (device) await api(`/api/user/push-subscriptions/${encodeURIComponent(device.id)}`, { method: 'DELETE' });
+  await subscription?.unsubscribe().catch(() => {});
+}
+// Signing out stops this device receiving that person's pushes (a shared computer).
+async function forgetPushDevice() {
+  if (nativeApp()) return disableNativePush().catch(() => {});
+  if (!pushSupported()) return;
+  try {
+    const subscription = await (await navigator.serviceWorker.getRegistration())?.pushManager.getSubscription();
+    if (!subscription) return;
+    const device = (await api('/api/user/push-subscriptions')).find((entry) => entry.endpoint === subscription.endpoint);
+    if (device) await api(`/api/user/push-subscriptions/${encodeURIComponent(device.id)}`, { method: 'DELETE' });
+    await subscription.unsubscribe();
+  } catch {}
+}
+// A tapped push opens its page in this console, in place (web/service-worker.js; the app's own listener below).
+function openPushedUrl(path) {
+  try {
+    const url = new URL(path, location.origin);
+    if (url.origin === location.origin) go(`${url.pathname}${url.search}${url.hash}`);
+  } catch {}
+}
+if (typeof navigator !== 'undefined' && navigator.serviceWorker?.addEventListener)
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    if (event.data?.type === 'push-open') openPushedUrl(event.data.url);
+  });
+
+// Native push in the phone app: FCM (APNs through FCM on iOS). The device's id
+// is kept here, since its FCM token is never read back from the server.
+const NATIVE_PUSH_DEVICE = 'karmax-native-push-device';
+function nativePushDeviceId() { try { return localStorage.getItem(NATIVE_PUSH_DEVICE) || ''; } catch { return ''; } }
+async function nativePushBlocked() {
+  return (await nativePlugin('PushNotifications')?.checkPermissions().catch(() => null))?.receive === 'denied';
+}
+// Register with FCM and resolve its token (the plugin answers with an event).
+function nativePushToken(plugin) {
+  return new Promise((resolve, reject) => {
+    let settled = false, handles = [];
+    const done = (settle, value) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      for (const handle of handles) handle?.remove?.();
+      settle(value);
+    };
+    const timer = setTimeout(() => done(reject, new Error('The phone did not answer; try again.')), 20_000);
+    Promise.all([plugin.addListener('registration', ({ value }) => done(resolve, value)),
+      plugin.addListener('registrationError', ({ error }) => done(reject, new Error(error || 'This phone could not register for push.')))])
+      .then((added) => { handles = added; if (settled) added.forEach((handle) => handle?.remove?.()); else return plugin.register(); })
+      .catch((error) => done(reject, error));
+  });
+}
+async function enableNativePush() {
+  const plugin = nativePlugin('PushNotifications');
+  let permission = await plugin.checkPermissions();
+  if (permission.receive !== 'granted' && permission.receive !== 'denied') permission = await plugin.requestPermissions();
+  if (permission.receive !== 'granted') throw new Error(`Allow notifications for ${siteName()} in your phone’s settings to turn push on.`);
+  const token = await nativePushToken(plugin);
+  const previous = nativePushDeviceId();
+  const device = await api('/api/user/push-subscriptions', { method: 'POST', body: JSON.stringify({ kind: 'fcm', token,
+    platform: nativePlatform() === 'ios' ? 'ios' : 'android', label: deviceLabel(), ...(previous ? { replaces: previous } : {}) }) });
+  try { localStorage.setItem(NATIVE_PUSH_DEVICE, device.id); } catch {}
+  return device;
+}
+async function disableNativePush() {
+  const id = nativePushDeviceId();
+  try { localStorage.removeItem(NATIVE_PUSH_DEVICE); } catch {}
+  if (id) await api(`/api/user/push-subscriptions/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch((error) => { if (error.status !== 404) throw error; });
+  await nativePlugin('PushNotifications')?.unregister().catch(() => {});
+}
+
+// Once per app start, signed in: a tapped notification opens its page, and a
+// phone with push on registers again, so a rotated FCM token replaces the old one.
+let nativeAppWired = false;
+async function wireNativeApp() {
+  if (nativeAppWired || !nativeApp()) return;
+  nativeAppWired = true;
+  const push = nativePlugin('PushNotifications');
+  if (!push) return;
+  await push.addListener('pushNotificationActionPerformed', ({ notification }) => openPushedUrl(notification?.data?.url));
+  if (S.meta?.nativePush && nativePushDeviceId() && (await push.checkPermissions()).receive === 'granted')
+    await enableNativePush().catch(() => {});
+}
+
+// Signing the app in: the system browser (Google and GitHub refuse sign-in
+// inside an app's WebView) runs the authorization code flow with PKCE for the
+// first-party client tavya-app and returns to io.tavya.app://signed-in; this
+// page then trades the code for its own session cookie (POST /oauth/app-session).
+const APP_CLIENT_ID = 'tavya-app';
+const APP_REDIRECT_URI = 'io.tavya.app://signed-in';
+function renderAppSignIn(error = '') {
+  document.body.classList.remove('landing-active');
+  document.title = `Sign in · ${siteName()}`;
+  $('#app').innerHTML = `<div class="login-wrap"><div class="login-card app-sign-in">
+    <div class="brand auth-brand">${brandMark()} ${siteNameMarkup()}</div>
+    <button class="btn primary" id="app-sign-in" type="button" title="Opens your browser. New here? Create your account there.">Sign in</button>
+    <p class="auth-err" id="app-sign-in-err" role="alert">${esc(error)}</p>
+  </div></div>`;
+  $('#app-sign-in').addEventListener('click', async (event) => {
+    event.currentTarget.disabled = true;
+    try { await appSignIn(); }
+    catch (error) { renderAppSignIn(plainError(error)); }
+  });
+}
+async function appSignIn() {
+  const random = (bytes) => base64url(crypto.getRandomValues(new Uint8Array(bytes)));
+  const verifier = random(32), state = random(16);
+  const challenge = base64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  const authorize = `${location.origin}/oauth/authorize?${new URLSearchParams({ response_type: 'code', client_id: APP_CLIENT_ID,
+    redirect_uri: APP_REDIRECT_URI, code_challenge: challenge, code_challenge_method: 'S256', state })}`;
+  let back;
+  try { back = new URL((await nativePlugin('TavyaSignIn').open({ url: authorize, callbackScheme: 'io.tavya.app' })).url); }
+  catch (error) {
+    if (error?.code === 'cancelled') return renderAppSignIn();
+    throw error;
+  }
+  // The answer must be to this attempt, from this installation (RFC 9207).
+  if (back.searchParams.get('state') !== state || (back.searchParams.get('iss') && back.searchParams.get('iss') !== location.origin))
+    throw new Error('That sign-in was for another attempt. Try again.');
+  if (back.searchParams.get('error')) {
+    if (back.searchParams.get('error') === 'access_denied') return renderAppSignIn();
+    throw new Error(back.searchParams.get('error_description') || 'Sign-in failed. Try again.');
+  }
+  const response = await fetch('/oauth/app-session', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ client_id: APP_CLIENT_ID, code: back.searchParams.get('code') || '', code_verifier: verifier,
+      redirect_uri: APP_REDIRECT_URI, name: deviceLabel() }) });
+  if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error_description || 'Sign-in failed. Try again.');
+  return boot();
+}
+function pushDevicesHtml(devices, current, blocked = false) {
+  const others = devices.filter((device) => device.id !== current?.id);
+  return `<div class="setting-row" id="push-device-row">
+      <span class="setting-label nowrap"><label for="push-this-device">Push to this device</label> ${policyTip('Notifications reach this device even when the app is closed. The Push column chooses which.')}</span>
+      <span class="setting-value"></span>
+      <span class="setting-actions"><input class="toggle" type="checkbox" id="push-this-device" ${current ? 'checked' : ''} ${blocked ? `disabled title="${esc(nativeApp() ? `Notifications are off for ${siteName()} in this phone’s settings.` : 'Notifications are blocked in this browser’s site settings.')}"` : ''}/></span>
+    </div>${others.map((device) => `<div class="setting-row push-device">
+      <span class="setting-label">${esc(device.label || 'Device')}</span>
+      <span class="setting-value setting-muted">${device.lastPushedAt ? `Last push ${esc(fmtAgo(device.lastPushedAt))}` : `Added ${esc(fmtAgo(device.createdAt))}`}</span>
+      <span class="setting-actions"><button type="button" class="icon-btn" data-push-forget="${esc(device.id)}" aria-label="Stop push to ${esc(device.label || 'this device')}" title="Stop push to ${esc(device.label || 'this device')}">${trashIcon()}</button></span>
+    </div>`).join('')}`;
+}
+async function wirePushDevices() {
+  const slot = $('#push-devices');
+  if (!slot || !pushSupported()) return;
+  let devices = [];
+  const paint = async () => {
+    devices = await api('/api/user/push-subscriptions');
+    const current = await thisPushDevice(devices).catch(() => null);
+    const blocked = nativeApp() ? await nativePushBlocked() : Notification.permission === 'denied';
+    if (!slot.isConnected) return;
+    slot.innerHTML = pushDevicesHtml(devices, current, blocked);
+    slot.querySelector('#push-this-device')?.addEventListener('change', async (event) => {
+      const box = event.target;
+      box.disabled = true;
+      try { if (box.checked) await enablePush(); else await disablePush(devices); }
+      catch (error) { toast(error.message, true); }
+      // Granting push granted system notifications too.
+      if (typeof Notification !== 'undefined' && Notification.permission === 'granted') $('#notify-permission')?.remove();
+      await paint().catch((error) => toast(error.message, true));
+    });
+    slot.querySelectorAll('[data-push-forget]').forEach((button) => button.addEventListener('click', async () => {
+      try { await api(`/api/user/push-subscriptions/${encodeURIComponent(button.dataset.pushForget)}`, { method: 'DELETE' }); }
+      catch (error) { toast(error.message, true); }
+      await paint().catch(() => {});
+    }));
+  };
+  await paint().catch((error) => toast(error.message, true));
+}
+
 // ── notification behaviour, per urgency ─────────────────────────────────────
 // Browser alerts are local to this device; email preferences are stored on the server.
 const NOTIFY_BEHAVIOURS = [
@@ -26641,7 +27147,10 @@ const NOTIFY_BEHAVIOURS = [
   { key: 'sound', label: 'Sound' },
   { key: 'visual', label: 'In app' },
   { key: 'email', label: 'Email' },
+  { key: 'push', label: 'Push' },
 ];
+// Email and Push are the person's, kept on the server per organization; the rest are this browser's.
+const SERVER_BEHAVIOURS = ['email', 'push'];
 // Sensible defaults: silence is the floor, and each level up interrupts a little
 // more. Nothing below high interrupts at all — an inbox that pings for routine
 // news is one people turn off entirely.
@@ -27079,12 +27588,18 @@ function profileView() {
           <span class="setting-value"></span>
           <span class="setting-actions"><input class="toggle" type="checkbox" id="profile-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /></span>
         </label>
+        ${typeof speechSynthesis === 'undefined' ? '' : `<label class="setting-row" for="profile-read-aloud">
+          <span class="setting-label">Read replies aloud ${policyTip('Speaks each new answer on the task you have open, on this device. Typing stops it.')}</span>
+          <span class="setting-value"></span>
+          <span class="setting-actions"><input class="toggle" type="checkbox" id="profile-read-aloud" ${readAloudEnabled() ? 'checked' : ''} /></span>
+        </label>`}
         ${profileWalkthroughRow(u?.id)}
       </div>
     </div>
     ${notificationsCard()}
     ${S.meta?.hosted ? '<div class="card"><div class="section-h">Paid subscriptions</div><div id="profile-paid-subscriptions" aria-live="polite"><span class="task-sub">Loading…</span></div></div>' : ''}
     ${u ? appGrantsCard() : ''}
+    ${u ? chatLinksCard() : ''}
     <div class="card" id="data-account">
       <div class="section-h">Data &amp; account</div>
       <div class="setting-rows">
@@ -27114,6 +27629,10 @@ function notificationsCard() {
   const prefs = notifyPrefs();
   const sound = notificationSoundPrefs();
   const emailReady = S.meta?.deliveryChannels?.includes('email');
+  // Push is a column wherever this installation sends it; the device switch below only where this browser can receive it.
+  // In the phone app, push is offered only once it can reach the phone.
+  const behaviours = NOTIFY_BEHAVIOURS.filter((behaviour) => behaviour.key !== 'push'
+    || (S.meta?.deliveryChannels?.includes('push') && (!nativeApp() || S.meta?.nativePush)));
   const permission = typeof Notification === 'undefined' ? 'unsupported' : Notification.permission;
   const permissionNote = {
     denied: '<p class="notify-note">System notifications are blocked in this browser’s site settings.</p>',
@@ -27125,19 +27644,24 @@ function notificationsCard() {
     visual: 'A banner inside the app.',
     email: emailReady ? 'Sent to your account email for this organization, even when the app is closed.'
       : S.installationAccess ? 'Email isn’t set up yet: Installation → Email.' : 'Your administrator hasn’t set up email.',
+    push: 'Sent to every device you turned push on for, even when the app is closed.',
+  };
+  const serverValue = (key, level) => {
+    const prefs = S.deliveryPreferences;
+    return key === 'email' ? prefs?.emailUrgencies?.[level] ?? prefs?.email : prefs?.pushUrgencies?.[level];
   };
   // Loudest first, the same order the inbox itself is in.
   const levels = [...URGENCY_LEVELS].reverse();
   return `<div class="card" id="notifications">
-    <div class="section-h">Notifications ${policyTip('Agents set an urgency when they need you; approvals arrive as high. Choose what each level does. Everything except email applies to this browser only.')}</div>
-    <div class="notify-grid">
-      <div class="notify-row notify-head"><span>Urgency</span>${NOTIFY_BEHAVIOURS.map((behaviour) =>
+    <div class="section-h">Notifications ${policyTip('Agents set an urgency when they need you; approvals arrive as high. Choose what each level does. Everything except email and push applies to this browser only.')}</div>
+    <div class="notify-grid" style="--notify-columns:${behaviours.length}">
+      <div class="notify-row notify-head"><span>Urgency</span>${behaviours.map((behaviour) =>
     behaviour.key === 'email' && !emailReady ? `<span class="notify-off">${behaviour.label} ${policyTip(headTip.email)}</span>`
       : `<span title="${esc(headTip[behaviour.key])}">${behaviour.label}</span>`).join('')}<span></span></div>
       ${levels.map((level) => `<div class="notify-row" data-notify-level="${level}">
         <span class="urgency-chip ${level}">${level.charAt(0).toUpperCase() + level.slice(1)}</span>
-        ${NOTIFY_BEHAVIOURS.map((behaviour) => `<span><input type="checkbox" data-notify="${level}:${behaviour.key}"
-          aria-label="${behaviour.label} for ${level} urgency" ${behaviour.key === 'email' && !emailReady ? `title="${esc(headTip.email)}"` : ''} ${(behaviour.key === 'email' ? S.deliveryPreferences?.emailUrgencies?.[level] ?? S.deliveryPreferences?.email : prefs[level][behaviour.key]) ? 'checked' : ''} ${behaviour.key === 'email' && (!emailReady || S.deliveryPreferences?.organizationId !== S.organizationId) ? 'disabled' : ''}/></span>`).join('')}
+        ${behaviours.map((behaviour) => { const server = SERVER_BEHAVIOURS.includes(behaviour.key); return `<span><input type="checkbox" data-notify="${level}:${behaviour.key}"
+          aria-label="${behaviour.label} for ${level} urgency" ${behaviour.key === 'email' && !emailReady ? `title="${esc(headTip.email)}"` : ''} ${(server ? serverValue(behaviour.key, level) : prefs[level][behaviour.key]) ? 'checked' : ''} ${server && (behaviour.key === 'email' && !emailReady || S.deliveryPreferences?.organizationId !== S.organizationId) ? 'disabled' : ''}/></span>`; }).join('')}
         <span><button class="btn sm" type="button" data-notify-test="${level}" title="Send a test ${level} notification">Test</button></span>
       </div>`).join('')}
     </div>
@@ -27148,6 +27672,7 @@ function notificationsCard() {
           <select id="notify-duration" aria-label="Duration">${[0.35, 1, 3, 5].map((duration) => `<option value="${duration}" ${sound.duration === duration ? 'selected' : ''}>${duration === 0.35 ? 'Brief' : `${duration} second${duration === 1 ? '' : 's'}`}</option>`).join('')}</select></span>
         <span class="setting-actions"><button class="btn sm" id="notify-preview" type="button" title="Play the sound">▶ Preview</button></span>
       </div>
+      ${pushSupported() ? '<div id="push-devices" class="setting-rows"></div>' : ''}
     </div>
     ${permissionNote}
   </div>`;
@@ -27162,7 +27687,12 @@ function wireNotificationsCard() {
       box.checked = prefs.emailUrgencies?.[box.dataset.notify.split(':')[0]] ?? prefs.email;
       box.disabled = !S.meta?.deliveryChannels?.includes('email');
     });
+    document.querySelectorAll('[data-notify$=":push"]').forEach((box) => {
+      box.checked = !!prefs.pushUrgencies?.[box.dataset.notify.split(':')[0]];
+      box.disabled = false;
+    });
   }).catch((error) => toast(error.message, true));
+  wirePushDevices();
   for (const id of ['notify-tone', 'notify-duration']) $('#' + id)?.addEventListener('change', () => {
     try { localStorage.setItem('karmax-notify-sound', JSON.stringify({ tone: $('#notify-tone').value, duration: Number($('#notify-duration').value) })); } catch {}
   });
@@ -27175,14 +27705,15 @@ function wireNotificationsCard() {
     requestAnimationFrame(() => $('#notifications')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
   $('#main').querySelectorAll('[data-notify]').forEach((box) => box.addEventListener('change', async () => {
     const [level, behaviour] = box.dataset.notify.split(':');
-    if (behaviour === 'email') {
-      const boxes = [...document.querySelectorAll('[data-notify$=":email"]')];
+    if (SERVER_BEHAVIOURS.includes(behaviour)) {
+      const boxes = [...document.querySelectorAll(`[data-notify$=":${behaviour}"]`)];
       boxes.forEach((input) => input.disabled = true);
       try {
         const prefs = S.deliveryPreferences;
-        const emailUrgencies = Object.fromEntries(URGENCY_LEVELS.map((key) => [key, prefs.emailUrgencies?.[key] ?? prefs.email]));
-        emailUrgencies[level] = box.checked;
-        const saved = await api(`/api/inbox/preferences?organizationId=${encodeURIComponent(organizationId)}`, { method: 'PUT', body: JSON.stringify({ ...prefs, emailUrgencies }) });
+        const field = `${behaviour}Urgencies`;
+        const levels = Object.fromEntries(URGENCY_LEVELS.map((key) => [key, behaviour === 'email' ? prefs.emailUrgencies?.[key] ?? prefs.email : !!prefs.pushUrgencies?.[key]]));
+        levels[level] = box.checked;
+        const saved = await api(`/api/inbox/preferences?organizationId=${encodeURIComponent(organizationId)}`, { method: 'PUT', body: JSON.stringify({ ...prefs, [field]: levels }) });
         if (S.organizationId === organizationId) S.deliveryPreferences = saved;
       } catch (error) { box.checked = !box.checked; toast(error.message, true); }
       finally { boxes.forEach((input) => input.disabled = false); }
@@ -27255,6 +27786,7 @@ function wireProfileView() {
   wireNotificationsCard();
   void hydrateProfilePaidSubscriptions();
   void hydrateAppGrants();
+  void hydrateChatLinks();
   hydrateProfileGithub();
   wireOrganizationCombo($('#default-organization'), () => S.defaultOrganizationId, async (organizationId) => {
     const preference = await api('/api/user/default-organization', {
@@ -27389,8 +27921,13 @@ function wireProfileView() {
     setMathjaxEnabled(e.target.checked);
     toast(`MathJax ${e.target.checked ? 'on' : 'off'}`);
   });
+  $('#profile-read-aloud')?.addEventListener('change', (e) => {
+    try { localStorage.setItem('karmax-read-aloud', e.target.checked ? '1' : '0'); } catch {}
+    if (!e.target.checked) speechSynthesis.cancel();
+  });
   $('#export-user-data')?.addEventListener('click', () => location.assign('/api/user/export'));
   $('#profile-logout')?.addEventListener('click', async () => {
+    await forgetPushDevice();
     try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
     location.reload();
   });
@@ -27766,7 +28303,7 @@ function installationView() {
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections">
       <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-traffic">Site traffic</a><a href="#installation-errors">Error reports</a><a href="#installation-early-access">Early access</a><a href="#installation-limits">Service limits</a><a href="#installation-compute">Managed compute</a><a href="#installation-capacity">Host capacity</a>
-      <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
+      <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a><a href="#installation-phone-apps">Phone apps</a>
       <a href="#installation-access">Phone access</a>${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance</div></div>${appearanceCard()}
@@ -27789,6 +28326,7 @@ function installationView() {
       <div class="settings-section-title" id="installation-paid-launch"><div>Paid launch</div></div>${paidLaunchCard()}
       <div class="settings-section-title" id="installation-stripe"><div>Agent cards ${policyTip(`Optional: the Stripe Connect application behind the cards agents spend from. Not used for plan subscriptions.`)}</div></div>${stripePlatformCard()}
       <div class="settings-section-title" id="installation-email"><div>Email</div></div>${outboundEmailCard()}
+      <div class="settings-section-title" id="installation-phone-apps"><div>Phone apps ${policyTip(`The ${siteName()} apps for Android and iOS`)}</div></div><div class="card" id="native-push-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-access"><div>Phone access ${policyTip(`Open ${siteName()} from your phone over a private Tailscale network`)}</div></div>${phone}
       ${S.meta.hosted ? `<div class="settings-section-title" id="installation-users"><div>Users ${policyTip('Close a person’s account and erase their data. Closing removes sign-in and access, not shared work. Erasure reviews need a documented decision per item; replacing a name is not anonymisation.')}</div></div><div class="card" id="installation-users-card"><span class="task-sub">Loading…</span></div>` : ''}
     </div>
@@ -27866,6 +28404,63 @@ function openIncludedModelDialog(settings, onSaved) {
   document.body.appendChild(overlay);
   overlay.querySelector(settings?.keyConfigured ? '.included-model-id' : '.included-key').focus();
 }
+// ── Phone apps (Installation; wiki features/phone-apps) ─────────────────────
+// Native push needs the service account key of the Firebase project the apps
+// were built with; until it is set, the apps hide their push switch.
+async function wireNativePushCard() {
+  const card = $('#native-push-card');
+  if (!card) return;
+  let view;
+  try { view = await api('/api/settings/native-push'); }
+  catch (error) { if (card.isConnected) paneError(card, error, () => wireNativePushCard()); return; }
+  if (!card.isConnected) return;
+  card.innerHTML = `<div class="setting-rows"><div class="setting-row" id="native-push-row">
+    <span class="setting-label">Push ${policyTip('Notifications on the Android and iOS apps, sent through Firebase Cloud Messaging.')}</span>
+    <span class="setting-value">${view.configured ? `<span class="chip done">On</span> <span class="setting-muted" title="${esc(view.clientEmail || '')}">${esc(view.projectId || '')}</span>` : '<span class="chip">Off</span>'}</span>
+    <span class="setting-actions">${view.configured
+      ? `<button class="btn sm" type="button" data-native-push-edit>Replace key</button><button class="icon-btn" type="button" data-native-push-remove aria-label="Remove the Firebase key" title="Remove the Firebase key">${trashIcon()}</button>`
+      : '<button class="btn sm" type="button" data-native-push-edit>Connect</button>'}</span></div></div>`;
+  card.querySelector('[data-native-push-edit]')?.addEventListener('click', () => openNativePushDialog(wireNativePushCard));
+  card.querySelector('[data-native-push-remove]')?.addEventListener('click', async (event) => {
+    if (!confirm('Remove the Firebase key? Phones stop getting push until a key is set again.')) return;
+    event.currentTarget.disabled = true;
+    try { await api('/api/settings/native-push', { method: 'DELETE' }); toast('Firebase key removed'); }
+    catch (error) { toast(error.message, true); }
+    await wireNativePushCard();
+  });
+}
+function openNativePushDialog(onSaved) {
+  const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-card computer-dialog" role="dialog" aria-modal="true" aria-label="Firebase key">
+    <div class="modal-head"><b>Firebase key</b>${policyTip('Firebase console → Project settings → Service accounts → Generate new private key. Use the project the apps were built with.')}<span class="label-row-fill"></span><button class="icon-btn native-push-close" type="button" aria-label="Close">×</button></div>
+    <div class="settings-grid">
+      <label class="form-row"><span>Service account key</span>
+        <textarea class="secret-textarea native-push-key" rows="5" autocomplete="off" spellcheck="false" placeholder='{"type": "service_account", …}'></textarea></label>
+      <label class="btn sm native-push-file">Choose file<input type="file" accept=".json,application/json" hidden></label></div>
+    <div class="modal-actions"><span class="label-row-fill"></span><button class="btn native-push-cancel" type="button">Cancel</button><button class="btn primary native-push-save" type="button">Save</button></div></div>`;
+  const close = () => { document.removeEventListener('keydown', keydown); overlay.remove(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  const field = overlay.querySelector('.native-push-key');
+  overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  overlay.querySelector('.native-push-close').addEventListener('click', close);
+  overlay.querySelector('.native-push-cancel').addEventListener('click', close);
+  overlay.querySelector('.native-push-file input').addEventListener('change', async (event) => {
+    const file = event.target.files?.[0];
+    if (file) field.value = await file.text();
+  });
+  overlay.querySelector('.native-push-save').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    if (!field.value.trim()) { field.focus(); return; }
+    button.disabled = true;
+    try { await api('/api/settings/native-push', { method: 'PUT', body: JSON.stringify({ serviceAccount: field.value }) }); }
+    catch (error) { toast(error.message, true); button.disabled = false; return; }
+    close(); toast('Push to the apps is on'); onSaved?.();
+  });
+  document.addEventListener('keydown', keydown);
+  document.body.appendChild(overlay);
+  field.focus();
+}
+
 // Model gateways (wiki features/model-gateways): Anthropic- or OpenAI-compatible
 // endpoints the operator adds, which run Claude Code and Codex on the compute
 // credit; each off until switched on here.
@@ -28270,8 +28865,9 @@ async function hydratePlanAndBilling(organizationId) {
   const box = $('#org-plan');
   if (!box) return;
   const base = `/api/organizations/${encodeURIComponent(organizationId)}`;
+  // The phone apps sell nothing (App Store 3.1.1, Play's payments policy): the plan and its limits, read-only, with no checkout.
   const [entitlements, state] = await Promise.all([api(`${base}/entitlements`).catch(() => null),
-    api(`${base}/subscription/status`).catch(() => null)]);
+    nativeApp() ? null : api(`${base}/subscription/status`).catch(() => null)]);
   if (!$('#org-plan') || S.organizationId !== organizationId) return;
   const giftsOpen = box.querySelector('.plan-operator')?.open;
   box.innerHTML = planBillingMarkup(entitlements, state?.managed ? state : null);
@@ -28563,6 +29159,7 @@ function wireInstallationSettings() {
   refreshProcPanel();
   wireServiceLimitsCard();
   wireManagedComputeCard();
+  wireNativePushCard();
   wireHostCapacityCard();
   $('#timing-enabled')?.addEventListener('change', async event => {
     const control = event.currentTarget; control.disabled = true;
@@ -29664,6 +30261,7 @@ const HOST_COMMANDS = [
   // `n` picks a template (0, the Task defaults, is Enter); `N` skips the picker.
   { id: 'nav.newTask', title: 'New task from template', key: 'n', group: 'General', run: () => openTemplatePicker() },
   { id: 'nav.newTaskDefault', title: 'New task', key: 'N', group: 'General', run: () => openNewTaskForm() },
+  { id: 'nav.ask', title: 'Ask tavya', key: 'A', group: 'General', run: () => askTavya() },
   { id: 'nav.search', title: 'Search tasks', key: '/', group: 'General', run: () => { if (!isTaskListTab()) switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
   { id: 'nav.home', title: 'Go home', key: 'g H', ...navCommand(() => homeRoute(currentOrg(), DEFAULT_LIST_QUERY)) },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', ...navCommand(() => tabRoute('tasks')) },
@@ -29687,6 +30285,8 @@ const HOST_COMMANDS = [
   { id: 'nav.profile', title: 'Go to your profile', key: 'g A', ...navCommand(() => profileRoute()) },
   { id: 'nav.notifications', title: 'Go to inbox', key: 'g N', ...navCommand(() => inboxRoute(DEFAULT_LIST_QUERY)) },
   { id: 'nav.vault', title: 'Go to passwords & payments', key: 'g V', ...navCommand(() => `${globalRoute('organization')}#settings-payments`) },
+  // Dictation in the prompt being typed (or the only one shown); works while typing.
+  { id: 'compose.voice', title: 'Dictate', key: 'meta+shift+S', group: 'Compose', available: () => !!focusedMicKey(), run: () => toggleDictation(focusedMicKey()) },
   { id: 'view.save', title: 'Save search as view', key: 'v s', group: 'Views', available: () => isTaskListTab() && !S.selected && canSaveViews(), run: () => saveCurrentView() },
   { id: 'nav.close', title: 'Close panel', key: null, run: () => closeTopOverlay() }, // Esc — handled by the dispatcher
 ];
@@ -30167,6 +30767,8 @@ function bindKeys() {
       if (e.key === 'Escape') { t.blur(); resetChord(); }
       // modifier-bearing bindings (⌘K) still work while typing outside overlays
       else if ((e.metaKey || e.ctrlKey) && !overlayOpen) dispatchKey(e);
+      // …and dictation inside one too (the task form): it acts on the field being typed in.
+      else if (e.metaKey || e.ctrlKey) runDictationShortcut(e);
       return;
     }
     // A checkbox, radio or slider keeps the named keys it uses (Space, Enter,
@@ -31601,7 +32203,7 @@ function wireTiming(v) {
 // ─── App sign-ins: /device, OAuth consent, Account → Apps and tokens ────────
 // The gateway side is src/gateway/oauth-routes.ts. A limit only ever narrows
 // the person's own access (level and/or projects); the default is all of it.
-const GRANT_KIND_LABEL = { cli: 'CLI', mcp: 'App', token: 'Token' };
+const GRANT_KIND_LABEL = { cli: 'CLI', mcp: 'App', token: 'Token', app: 'Phone' };
 
 async function grantLimitOptions() {
   const [projects, organizations] = await Promise.all([
@@ -31718,9 +32320,11 @@ async function renderOAuthConsent() {
   try { [request, projects] = await Promise.all([api(`/api/oauth/authorizations/${encodeURIComponent(id)}`), grantLimitOptions()]); }
   catch (error) { return grantDone('Sign-in expired', error.message); }
   const client = request.client || {};
-  grantFrame(`<h1 class="grant-title">${esc(client.name || 'An app')}</h1>
-    <p class="grant-who">${grantClientChip(client)} <span class="task-sub" title="${esc(`Returns to ${request.redirectHost || ''}`)}">will act as you${client.kind === 'metadata' ? '' : ` · ${esc(request.redirectHost || '')}`}</span></p>
-    <div id="consent-limit">${grantLimitMarkup(request.levels || [], projects, request.requested || {})}</div>
+  // The phone app is the person's own console: no limit to choose.
+  const phone = client.id === APP_CLIENT_ID;
+  grantFrame(`<h1 class="grant-title">${phone ? `${siteNameMarkup()} on your phone` : esc(client.name || 'An app')}</h1>
+    <p class="grant-who">${grantClientChip(client)} <span class="task-sub" title="${esc(`Returns to ${request.redirectHost || ''}`)}">${phone ? 'Sign the app in as you' : `will act as you${client.kind === 'metadata' ? '' : ` · ${esc(request.redirectHost || '')}`}`}</span></p>
+    <div id="consent-limit">${phone ? '' : grantLimitMarkup(request.levels || [], projects, request.requested || {})}</div>
     <div class="grant-actions"><button class="btn primary" id="consent-allow">Allow</button><button class="btn" id="consent-deny">Deny</button></div>
     <p class="grant-msg" id="grant-msg" role="alert"></p>`);
   wireGrantLimit($('#consent-limit'), request.levels || [], projects);
@@ -31728,13 +32332,64 @@ async function renderOAuthConsent() {
     $('#consent-allow').disabled = $('#consent-deny').disabled = true;
     try {
       const result = await api(`/api/oauth/authorizations/${encodeURIComponent(id)}/${decision}`, { method: 'POST',
-        body: JSON.stringify(decision === 'approve' ? readGrantLimit($('#consent-limit')) : {}) });
+        body: JSON.stringify(decision === 'approve' && !phone ? readGrantLimit($('#consent-limit')) : {}) });
       location.assign(result.redirectUri);
     } catch (error) { $('#grant-msg').textContent = plainError(error); $('#consent-allow').disabled = $('#consent-deny').disabled = false; }
   };
   $('#consent-allow').addEventListener('click', () => decide('approve'));
   $('#consent-deny').addEventListener('click', () => decide('deny'));
   $('#consent-allow').focus();
+}
+
+// ─── Chat accounts: /link/chat, Profile → Chat accounts (wiki planned/assistant §3)
+// A chat bot sends someone it does not know here; linking makes the runs their
+// messages start act as them. src/integrations/chat-links.ts.
+async function renderChatLink() {
+  document.title = `Link chat account · ${siteName()}`;
+  const t = new URLSearchParams(location.search).get('t') || '';
+  grantFrame('<p class="task-sub">Loading…</p>');
+  let offer;
+  try { offer = await api(`/api/chat-links/pending?t=${encodeURIComponent(t)}`); }
+  catch (error) { return grantDone('Link not valid', plainError(error)); }
+  const platform = CHAT_PLATFORM_LABELS[offer.platform] || 'chat';
+  const bot = offer.bot?.username ? (offer.bot.username.startsWith('+') ? offer.bot.username : `@${offer.bot.username}`) : offer.bot?.name || 'the bot';
+  grantFrame(`<h1 class="grant-title">Link ${esc(platform)} user ${esc(offer.platformName || offer.platformUserId)} to you?</h1>
+    <p class="grant-who"><span class="task-sub" title="${esc(`${platform} id ${offer.platformUserId}`)}">via ${esc(bot)}</span> ${policyTip('Their messages to this bot start tasks as you, with no more than you may do in its project. Link only your own account.')}</p>
+    <div class="grant-actions"><button class="btn primary" id="chat-link-yes">Link</button><button class="btn" id="chat-link-no">Cancel</button></div>
+    <p class="grant-msg" id="grant-msg" role="alert"></p>`);
+  $('#chat-link-yes').addEventListener('click', async () => {
+    $('#chat-link-yes').disabled = $('#chat-link-no').disabled = true;
+    try {
+      await api('/api/chat-links', { method: 'POST', body: JSON.stringify({ t }) });
+      history.replaceState({ kx: 1 }, '', '/link/chat');
+      grantDone('Linked', `Message ${bot} again.`);
+    } catch (error) { $('#grant-msg').textContent = plainError(error); $('#chat-link-yes').disabled = $('#chat-link-no').disabled = false; }
+  });
+  $('#chat-link-no').addEventListener('click', () => { history.replaceState({ kx: 1 }, '', '/link/chat'); grantDone('Not linked', 'You can close this tab.'); });
+  $('#chat-link-yes').focus();
+}
+
+function chatLinksCard() {
+  return `<div class="card" id="chat-links-card" hidden>
+    <div class="section-h">Chat accounts ${policyTip('Messages from these accounts to their bot start tasks as you.')}</div>
+    <div class="setting-rows" id="profile-chat-links"></div></div>`;
+}
+
+async function hydrateChatLinks() {
+  const card = $('#chat-links-card'), box = $('#profile-chat-links');
+  if (!card || !box) return;
+  let links;
+  try { links = (await api('/api/user/chat-links'))?.links || []; } catch { return; }
+  card.hidden = !links.length;
+  box.innerHTML = links.map((link) => `<div class="setting-row" data-chat-link="${esc(link.id)}">
+      <span class="setting-label" title="${esc(`${CHAT_PLATFORM_LABELS[link.platform] || ''} id ${link.platformUserId}`)}">${esc(CHAT_PLATFORM_LABELS[link.platform] || 'Chat')} · ${esc(link.platformName || link.platformUserId)}</span>
+      <span class="setting-value setting-muted">${esc(link.bot.username ? (link.bot.username.startsWith('+') ? link.bot.username : `@${link.bot.username}`) : link.bot.name)}</span>
+      <span class="setting-actions"><button class="btn sm ghost" data-chat-unlink aria-label="Remove" title="Remove">✕</button></span></div>`).join('');
+  box.querySelectorAll('[data-chat-unlink]').forEach((button) => button.addEventListener('click', async () => {
+    button.disabled = true;
+    try { await api(`/api/user/chat-links/${encodeURIComponent(button.closest('[data-chat-link]').dataset.chatLink)}`, { method: 'DELETE' }); await hydrateChatLinks(); }
+    catch (error) { button.disabled = false; toast(error.message, true); }
+  }));
 }
 
 function appGrantsCard() {
