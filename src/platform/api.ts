@@ -1,4 +1,5 @@
 import * as __asyncCollections from '../util/async-collections.js';
+import { withSpendResolutions } from './spend-review.js';
 import { autonomyRoute, projectAutonomy, setUpAutonomy } from './autonomous-projects.js';
 import type { AutonomyScope, ProjectAutonomy } from '../domain/autonomous-projects.js';
 import { resolvePaymentPolicy, samePaymentPolicy, validatePaymentPolicy, withPolicyCurrency } from '../autonomy/payments.js';
@@ -3970,6 +3971,7 @@ export class KarmaxApi {
     const enrich = async (view: TaskView | undefined): Promise<TaskView | undefined> => {
       if (!view) return view;
       view = await this.deps.store.withPendingReviewInfoAsync(taskId, view);
+      view = await withSpendResolutions(this.deps.store, taskId, view);
       if (computerResizable(view) && !(view.editableParams ?? []).includes('computer'))
         view = { ...view, editableParams: [...(view.editableParams ?? []), 'computer'] };
       if (computerResizable(view)) {
