@@ -124,7 +124,7 @@ const { chromium } = require('playwright');
     await page.goto('http://console.test/org/workspace');
     await page.locator('#expand-task').click();
     const head = page.locator('#tf-savestate');
-    await page.locator('#tf-body textarea').first().fill('Write the release notes');
+    await page.locator('#tf-notes').fill('Write the release notes');
     assert.equal(await head.textContent(), 'Unsaved changes');
     assert.equal(await head.getAttribute('data-state'), 'dirty');
     const mark = () => head.evaluate((el) => getComputedStyle(el, '::before').content);

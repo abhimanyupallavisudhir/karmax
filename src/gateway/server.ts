@@ -138,7 +138,7 @@ import { worldRepos, worldWorkingDirectory, worldWorkingRelativePath, type World
 import { enumerateCredentials, normalizePolicy, resolveCredentials } from '../platform/credentials.js';
 import { clientWentAway, errorStatus } from './error-status.js';
 import { defaultAgentProfile, projectReadiness, usableAgentCredentials, type ReadinessDeps } from '../platform/readiness.js';
-import { reportError } from '../platform/error-reports.js';
+import { errorReporter, reportError, reportFromPerson } from '../platform/error-reports.js';
 import { errorReportSettings, saveErrorReportSettings } from '../platform/error-fixer.js';
 import { includedModel, includedModelView, removeIncludedModelKey, saveIncludedModel } from '../agent/included-model.js';
 import { deleteModelGateway, GATEWAY_PROXY_PATH, modelGatewaysView, saveModelGateway } from '../agent/model-gateways.js';
@@ -264,6 +264,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
   if (p === '/api/users/erasure-cases' || /^\/api\/users\/[^/]+\/erasure(?:\/export)?$/.test(p)) return 'user:write';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
+  // Anyone signed in may report an error they saw (wiki features/error-reports);
+  // a task's is read from the task, which the handler checks they can see.
+  if (p === '/api/error-reports' && !read) return 'none';
   if (p === '/api/user/export' || p === '/api/user/default-organization' || p === '/api/user/preferences' || p === '/api/user/paid-subscriptions'
     || p === '/api/user/onboarding' || p === '/api/user/onboarding/reset' || p === '/api/user/account-deletion-request') return 'none';
   // A signed-in person always owns their own Git identity. It is not an
@@ -457,6 +460,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/events' && !read) return 'task:create';
   if (/^\/api\/project-events\/[^/]+$/.test(p)) return 'task:event:read';
   if (/^\/api\/tasks\/[^/]+\/follow-up-triggers(?:\/[^/]+)?$/.test(p)) return read ? 'task:read' : 'task:edit';
+  // A series' keys: a run of the series may correct them, so the API decides who may write.
+  if (/^\/api\/tasks\/[^/]+\/keys$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/(?:task-store|automations)(?:\/[^/]+)?$/.test(p)) return read ? 'task:read' : 'task:create';
   if (/^\/api\/projects\/[^/]+\/webhooks$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/webhooks\/[^/]+(?:\/rotate)?$/.test(p)) return 'project:settings:write';
@@ -2489,6 +2494,8 @@ export class Gateway {
         google: this.deps.identity?.googleEnabled ?? false,
         github: this.deps.identity?.githubEnabled ?? false,
         modelBenchmarks: this.artificialAnalysis.available,
+        // Whether an error shown in the console can be reported (wiki features/error-reports).
+        errorReports: Boolean(await errorReporter()?.destination().catch(() => undefined)),
       });
     }
     // The serving commit (public: the repository is) lets a deploy, the
@@ -2772,6 +2779,32 @@ export class Gateway {
         } catch (error) {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
+      }
+      // Report an error seen in the console (wiki features/error-reports): a
+      // task's current error ({taskId}), or one in the caller's words
+      // ({message, where}). It is counted on the bug's event; `reported: false`
+      // when this installation sends reports nowhere.
+      if (p === '/api/error-reports' && method === 'POST') {
+        const b = await this.body(req);
+        const by = actorPrincipal(callerIdentity.actor);
+        if (!this.errorReportAdmission.admit(by)) return this.json(res, 429, { error: 'too many reports; try again later' });
+        let task: { id: string; projectId: string; error?: string; stage?: string } | undefined;
+        if (typeof b.taskId === 'string' && b.taskId) {
+          // The caller must be able to read the task where it lives: its
+          // project and organization come from the record, never the request.
+          const found = await store.taskMetadata(b.taskId);
+          const project = found ? await store.getProject(found.projectId) : undefined;
+          if (!found || !(await this.deps.tokens.check(token, 'task:read',
+            { taskId: found.id, projectId: found.projectId, organizationId: project?.organizationId })).ok)
+            return this.json(res, 404, { error: `no task ${b.taskId}` });
+          const view = await api.getTaskView(token, found.id);
+          task = { id: found.id, projectId: found.projectId, ...(view?.error ? { error: String(view.error) } : {}), ...(view?.stage ? { stage: String(view.stage) } : {}) };
+        }
+        const organizationId = task ? (await store.getProject(task.projectId))?.organizationId : undefined;
+        const reported = await reportFromPerson(store, { by, ...(task ? { task } : {}), ...(organizationId ? { organizationId } : {}),
+          ...(typeof b.message === 'string' ? { message: b.message } : {}), ...(typeof b.where === 'string' ? { where: b.where } : {}),
+          ...(typeof b.note === 'string' ? { note: b.note } : {}) });
+        return this.json(res, 200, { reported });
       }
       // A person's console preferences, the same on every device they sign in on.
       if (p === '/api/user/preferences' && (method === 'GET' || method === 'PATCH')) {
@@ -5776,13 +5809,13 @@ export class Gateway {
         }
         if (method === 'POST') {
           const b = await this.body(req);
-          const result = await api.emitProjectEvent(token, projectId, { type: b.type, key: b.key, subject: b.subject, occurredAt: b.occurredAt, payload: b.payload });
+          const result = await api.emitProjectEvent(token, projectId, { type: b.type, key: b.key, subject: b.subject, occurredAt: b.occurredAt, payload: b.payload, distinct: b.distinct });
           return this.json(res, result.duplicate ? 200 : 201, result);
         }
       }
       if (p === '/api/events' && method === 'POST') {
         const b = await this.body(req);
-        const result = await api.emitProjectEvent(token, undefined, { type: b.type, key: b.key, subject: b.subject, occurredAt: b.occurredAt, payload: b.payload });
+        const result = await api.emitProjectEvent(token, undefined, { type: b.type, key: b.key, subject: b.subject, occurredAt: b.occurredAt, payload: b.payload, distinct: b.distinct });
         return this.json(res, result.duplicate ? 200 : 201, result);
       }
       // The task store (src/domain/task-store.ts); `automations` is its former name.
@@ -5806,6 +5839,19 @@ export class Gateway {
           await api.removeFollowUpTrigger(token, taskId, followUpsMatch[2]);
           return this.json(res, 200, { ok: true });
         }
+      }
+      // One task per key (wiki features/events-and-automations § Keys): which
+      // task holds each key of a series; PUT {key, taskId} gives a key to a
+      // task (merge), DELETE ?key= frees it (its next event starts its own).
+      const keysMatch = p.match(/^\/api\/tasks\/([^/]+)\/keys$/);
+      if (keysMatch) {
+        const seriesId = keysMatch[1]!;
+        if (method === 'GET') return this.json(res, 200, { keys: await api.listKeyedRuns(token, seriesId) });
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          return this.json(res, 200, { key: await api.assignKeyedRun(token, seriesId, String(b.key ?? ''), String(b.taskId ?? '')) });
+        }
+        if (method === 'DELETE') return this.json(res, 200, await api.releaseKeyedRun(token, seriesId, url.searchParams.get('key') ?? ''));
       }
       const projectEventMatch = p.match(/^\/api\/project-events\/([^/]+)$/);
       if (projectEventMatch && method === 'GET') return this.json(res, 200, await api.getProjectEvent(token, projectEventMatch[1]!));
@@ -11900,6 +11946,19 @@ export class Gateway {
   private badRequest(res: http.ServerResponse, e: unknown) {
     return this.json(res, errorStatus(e, 400), { error: e instanceof Error ? e.message : String(e) });
   }
+  /** Reports a person may file: 20 an hour each. Each is one write to a counted event. */
+  private errorReportAdmission = (() => {
+    const recent = new Map<string, number[]>();
+    return { admit: (by: string): boolean => {
+      const now = Date.now();
+      const kept = (recent.get(by) ?? []).filter((at) => now - at < 3600_000);
+      if (kept.length >= 20) { recent.set(by, kept); return false; }
+      kept.push(now);
+      recent.delete(by); recent.set(by, kept);
+      if (recent.size > 5_000) recent.delete(recent.keys().next().value!);
+      return true;
+    } };
+  })();
   private fail(res: http.ServerResponse, e: unknown, req?: http.IncomingMessage) {
     // The client went away mid-request (a closed tab, a reload, lost signal):
     // nobody is left to answer and nothing in tavya failed, so it is no bug to

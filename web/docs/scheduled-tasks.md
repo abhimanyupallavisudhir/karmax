@@ -45,6 +45,29 @@ curl -X POST {{origin}}/api/hooks/<id> \
 
 **Settings → Events** also lists recent events and what each did.
 
+A task's title and prompt can quote the event: `{{issue.title}}` is replaced by that field, and `{{area ?? "none"}}` says what to write when the event has none. `{{$key}}` is the event's key and `{{$count}}` how often it has come.
+
+## Fix errors as they happen
+
+An event has a **key** that says what it is. The same key again starts nothing new: it is counted on the event, which **Settings → Events** shows as **×40**. That makes an error an event whose key says which error it is:
+
+```
+curl -X POST {{origin}}/api/hooks/<id> \
+  -H "Authorization: Bearer <secret>" \
+  -H "Idempotency-Key: checkout-null-total" \
+  -H "Content-Type: application/json" \
+  -d '{"summary": "Checkout fails when the cart is empty", "stack": "…"}'
+```
+
+Install **Fix reported errors** from the Task store, and report your software's errors through a webhook whose event type is `app.error`, with the error's key as `Idempotency-Key`. Each error then gets one task:
+
+- It starts five minutes after the error first appears, and only if a quick look by a model finds it worth fixing. A skipped error says why in **Settings → Events**.
+- Repeats reach that task instead of starting another.
+- If the error comes back after its fix is out, the same task carries on. Emit an `app.deployed` event with the shipped `commits` to say when that is; without one, a fix counts as out a day after it merged.
+- At most three work at once, the most frequent error first.
+
+Under an event, **One task for good** gives any trigger this behaviour, and **＋ Ask first…** takes the question a model answers before a run starts.
+
 ## Start from a ready-made task
 
 The task list's **Task store** view holds repeatable tasks you can **Install**:
@@ -53,6 +76,7 @@ The task list's **Task store** view holds repeatable tasks you can **Install**:
 - **Update dependencies weekly**, as a tested pull request.
 - **Repair failed deploys**, when a GitHub workflow fails after a merge.
 - **Build planned issues**, when a GitHub issue is labelled "planned".
+- **Fix reported errors**, one task per error your software reports.
 - **Triage issues daily** and **Tag tasks daily**.
 
 A started task takes triggers too: **Follow-up triggers** on its **Parameters** tab tell its agent when other tasks finish, at a time, or when something happens.

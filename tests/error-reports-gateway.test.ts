@@ -102,6 +102,25 @@ describe('error reports through the gateway', () => {
     expect(await (await call(tokenFor.operator!, 'GET', '/api/settings/error-reports')).json()).toEqual({ settings: {} });
   });
 
+  it('lets anyone signed in report an error they saw, counted on one bug, a bounded number of times', async () => {
+    expect(routeCapability('POST', '/api/error-reports')).toBe('none');
+    // Off: there is nowhere to report to, and the console is told so.
+    const off = await call(tokenFor.tenantOwner!, 'POST', '/api/error-reports', { message: 'HTTP 502', where: '/tenant/app/tasks/:n' });
+    expect(await off.json()).toEqual({ reported: false });
+    expect(await (await fetch(`${base}/api/meta`)).json()).toMatchObject({ errorReports: false });
+    expect((await call(tokenFor.operator!, 'PUT', '/api/settings/error-reports', { projectId: ops.id })).status).toBe(200);
+    expect(await (await fetch(`${base}/api/meta`)).json()).toMatchObject({ errorReports: true });
+    for (let i = 0; i < 3; i++)
+      expect(await (await call(tokenFor.tenantOwner!, 'POST', '/api/error-reports', { message: 'HTTP 502', where: '/tenant/app/tasks/:n', note: 'while sending a message' })).json()).toEqual({ reported: true });
+    const reported = (await store.listProjectEvents(ops.id)).filter((event) => event.type === ERROR_EVENT_TYPE && event.payload.kind === 'reported');
+    expect(reported).toMatchObject([{ count: 3, source: 'tavya', payload: { name: 'Reported', message: 'HTTP 502', where: '/tenant/app/tasks/:n',
+      detail: { reportedBy: 'user:owner', inTheirWords: true, note: 'while sending a message' } } }]);
+    // A person may file 20 an hour (the report above that was refused as off counted too).
+    for (let i = 0; i < 16; i++) expect((await call(tokenFor.tenantOwner!, 'POST', '/api/error-reports', { message: 'HTTP 502' })).status).toBe(200);
+    expect((await call(tokenFor.tenantOwner!, 'POST', '/api/error-reports', { message: 'HTTP 502' })).status).toBe(429);
+    expect((await call(tokenFor.operator!, 'PUT', '/api/settings/error-reports', { projectId: null })).status).toBe(200);
+  });
+
   // tavya-error 9a1cd9333f3c057a (2026-11-15): a person closed the page while
   // POST /review-action's body was on its way; Node failed the body with
   // ECONNRESET "aborted", which was answered as a 500 and filed as a bug.

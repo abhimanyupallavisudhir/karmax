@@ -171,7 +171,7 @@ import {
 } from '../coordinators/names.js';
 import { lifecycleReplacementKey, lifecycleReplacementMatches } from '../platform/lifecycle-replacement.js';
 import { BRAND } from '../domain/brand.js';
-import { ERROR_EVENT_TYPE, reportError } from '../platform/error-reports.js';
+import { ERROR_EVENT_TYPE, reportError, taskFailure } from '../platform/error-reports.js';
 import { isCapacityEscalation, isExpiredDelegationEscalation } from '../domain/escalation.js';
 import { screenEnvironment, skippedEnvNotice, type SkippedEnv } from '../util/work-env.js';
 
@@ -705,7 +705,12 @@ function reportEscalation(task: { id: string; projectId: string; params: Record<
   if (audience?.length === 1 && audience[0] === '@admins') return;
   if (isCapacityEscalation(view.error) || isExpiredDelegationEscalation(view.error)) return;
   if ((task.params?.trigger as { type?: string } | undefined)?.type === ERROR_EVENT_TYPE) return;
-  reportError({ kind: 'escalation', error: Object.assign(new Error(String(view.error)), { name: 'Escalation' }),
+  // The task says what failed; the activity that failed says where (its stack),
+  // which is what tells one bug from another.
+  const cause = taskFailure(task.id, String(view.error));
+  const error = Object.assign(new Error(String(view.error)), { name: cause?.name && cause.name !== 'Error' ? cause.name : 'Escalation' });
+  if (cause) error.stack = cause.stack;
+  reportError({ kind: 'escalation', error,
     where: `stage ${view.stage}`, taskId: task.id, projectId: task.projectId,
     detail: { ...(audience ? { audience } : {}), ...(view.waitingFor?.kind ? { waitingFor: view.waitingFor.kind } : {}) } });
 }

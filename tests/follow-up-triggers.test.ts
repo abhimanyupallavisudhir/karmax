@@ -6,7 +6,7 @@ import { KarmaxApi } from '../src/platform/api.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { TriggerScheduler, createTriggerFire } from '../src/platform/trigger-scheduler.js';
 import { followUpsAfterFiring, normalizeFollowUpTriggers, validateFollowUpTriggers, type FollowUpTrigger } from '../src/domain/triggers.js';
-import { followUpMessage, type ProjectEvent, type TriggerContext } from '../src/domain/project-events.js';
+import { followUpMessage, type ProjectEvent, type ProjectEventRecord, type TriggerContext } from '../src/domain/project-events.js';
 
 /**
  * Follow-up triggers (wiki features/follow-up-triggers): the shapes that can
@@ -88,7 +88,7 @@ describe('dispatching follow-up triggers', () => {
     await store.saveView(task.id, { taskId: task.id, stage: 'do', status: 'active', messages: [], actions: [], updatedAt: 1 } as any, undefined, undefined, undefined, { lifecycleEvent: false });
     return (await store.getTask(task.id))!;
   };
-  const record = async (over: Partial<ProjectEvent> = {}) => (await store.recordProjectEvent({
+  const record = async (over: Partial<ProjectEventRecord> = {}) => (await store.recordProjectEvent({
     organizationId: 'org_personal', projectId, source: 'github', type: 'deploy.finished', key: `d-${++seq}`, occurredAt: clock.time, receivedAt: clock.time,
     origin: 'external', hops: 0, payload: { env: 'prod' }, ...over })).event;
   const deliver = async (ev: ProjectEvent) => { scheduler.projectEventRecorded(ev); await scheduler.drain(); };

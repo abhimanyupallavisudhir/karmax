@@ -3255,6 +3255,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .ev-more { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
 .ev-more[hidden], .ev-more [hidden] { display:none; }
 .ev-more #ev-key { width:180px; }
+.ev-more #ev-gate { flex:1 1 100%; min-height:44px; padding:6px 9px; background:var(--surface); font-size:var(--fs-12h); resize:vertical; }
 @media (max-width: 700px) {
   .triggers-block { grid-template-columns: minmax(0, 1fr); gap: 4px; }
   .triggers-block > :not(:first-child):is(.tb-label, .tb-repeat) { margin-top: 8px; }

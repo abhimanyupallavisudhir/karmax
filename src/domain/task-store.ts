@@ -96,6 +96,48 @@ const TAG_TASKS_PROMPT = [
   '5) Report how many tasks you tagged and the tags you created, then call open_pr: no repository changes, so it just ends the run.',
 ].join('\n');
 
+export const FIX_ERRORS_TEMPLATE_ID = 'fix-errors';
+
+/**
+ * One task per error, for good (wiki features/error-reports): an error is an
+ * event whose key says which error it is, so every repeat is counted on it.
+ * The first starts a task a few minutes later, if the gate finds it worth
+ * one; repeats reach that task, once per tenfold growth while it works, and
+ * carry it on if the error comes back after its fix is out. At most three
+ * work at once, the most-seen error first.
+ */
+export const FIX_ERRORS_TRIGGER: EventTrigger = {
+  kind: 'event', type: 'app.error', recurring: true,
+  concurrency: { key: '{{$key}}', mode: 'continue', after: { type: 'app.deployed' } },
+  settleMinutes: 5, maxRunning: 3, maxPerHour: 12,
+  gate: { prompt: [
+    'Start a task for an error that is a defect in this project\'s own code or configuration.',
+    'Skip one that is the caller\'s own doing (bad input, a missing permission, a request they cancelled), an outage of an outside service that has passed, or noise with nothing to fix.',
+    'Merge one whose cause is plainly the same as that of a task already listed.',
+  ].join('\n') },
+};
+
+export const FIX_ERRORS_TITLE = 'Fix: {{summary ?? "an error"}}';
+
+/** What every error fixer is told about being the one task for its error. */
+export const FIX_ERRORS_KEY_RULES = [
+  'You are the one task for this error, for good. Repeats are counted on its event (`platform_request GET /api/project-events/<eventId>`: `count`, `lastSeenAt`, `recent`, `distinct`) and reach you as messages: now and then while you work, and again if it comes back after your fix is out, which means the fix did not hold. Then carry on from what you know instead of starting over.',
+  'Errors are grouped by where they were thrown, which is sometimes wrong, and you are the one who finds out. `GET /api/tasks/<series>/keys` lists every error\'s key and its task (your series is this task\'s `runOf`). An error with another key but your cause: take it with `PUT /api/tasks/<series>/keys {"key": "<its key>", "taskId": "<your task id>"}` and tell its task, if it has one, to stop. An occurrence under your key that has another cause: `DELETE /api/tasks/<series>/keys?key=<key>` frees a key, so its next occurrence gets a task of its own.',
+].join('\n');
+
+const FIX_ERRORS_PROMPT = [
+  '## Fix an error this project\'s software reported',
+  'The event below is an error reported by this project\'s software: its message, where it happened and how often.',
+  '',
+  '1. **Gather the evidence first**: reproduce it, or read the logs and data it left, before changing anything.',
+  '2. **Decide whose it is.** If the cause is outside this project (the caller\'s own input, an outside service), say so in a few lines and finish without a change.',
+  '3. **Fix the class of failure, not this occurrence**: the root cause, the way an expert would, in full generality.',
+  '4. **Prove it.** Write a test that fails for this error first, then make it pass; run the related suites; verify end to end.',
+  '5. Open the pull request, and say in it what caused the error and how the fix was verified.',
+  '',
+  FIX_ERRORS_KEY_RULES,
+].join('\n');
+
 export const STORE_TASKS: readonly StoreTask[] = [
   {
     id: PROJECT_WIKI_TEMPLATE_ID,
@@ -157,6 +199,13 @@ export const STORE_TASKS: readonly StoreTask[] = [
     // Developer holds for their own tasks only.
     task: { title: 'Tag tasks', prompt: TAG_TASKS_PROMPT, authorization: { level: 'maintainer' },
       params: { repeatable: true, confirm: AUTO_CONFIRM, triggers: [{ kind: 'schedule', cron: '0 7 * * *', recurring: true }] } },
+  },
+  {
+    id: FIX_ERRORS_TEMPLATE_ID,
+    name: 'Fix reported errors',
+    needs: ['repository'],
+    summary: 'Report your software’s errors as `app.error` events keyed by error: each error gets one task that fixes its cause, repeats are counted on it, and it carries on if the error comes back.',
+    task: { title: FIX_ERRORS_TITLE, prompt: FIX_ERRORS_PROMPT, params: { repeatable: true, confirm: AGENT_REVIEW, triggers: [FIX_ERRORS_TRIGGER] } },
   },
   {
     id: 'chat-requests',

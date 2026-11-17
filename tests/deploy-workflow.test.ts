@@ -328,6 +328,14 @@ describe('build once, staging, promotion', () => {
     expect(operator).toContain('KARMAX_REVISION=$(git -C "$ROOT_DIR" rev-parse --verify -q HEAD');
   });
 
+  it('starts the app with the commits its revision is made of, since an image has no history', () => {
+    expect(operator).toContain('KARMAX_REVISION_HISTORY=$(git -C "$ROOT_DIR" log -n 500 --abbrev=12 --format=%h');
+    const compose = fs.readFileSync(path.join(repoRoot, 'deploy', 'compose.turnkey.yml'), 'utf8');
+    expect(compose).toContain('KARMAX_REVISION_HISTORY: ${KARMAX_REVISION_HISTORY:-}');
+    // Never baked in: one image runs on staging and production, and a new commit must not rebuild its layers.
+    expect(fs.readFileSync(path.join(repoRoot, 'deploy', 'Dockerfile'), 'utf8')).not.toContain('REVISION_HISTORY');
+  });
+
   it('deploys to staging when there is one, else to production, and is callable for production', () => {
     expect(workflow.on.workflow_call.inputs.environment.required).toBe(true);
     expect(workflow.on.workflow_dispatch.inputs.environment.options).toEqual(['production', 'staging']);

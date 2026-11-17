@@ -20,9 +20,13 @@ note() { echo "• $*"; }
 # Caddyfile's digest is therefore a label on Caddy: every `up` recreates it,
 # binding the new file, whenever the Caddyfile changed.
 # The checked-out commit is the app image's KARMAX_REVISION build argument.
+# An image has no history, so the app is started with the commits that commit
+# is made of, newest first: at its first boot it says which of them the deploy
+# shipped (src/util/build-revision.ts, a `tavya.deployed` event).
 dc() {
   KARMAX_CADDYFILE_SHA256=$(sha256sum "$DEPLOY_DIR/Caddyfile" 2>/dev/null | cut -d' ' -f1) \
   KARMAX_REVISION=$(git -C "$ROOT_DIR" rev-parse --verify -q HEAD 2>/dev/null || true) \
+  KARMAX_REVISION_HISTORY=$(git -C "$ROOT_DIR" log -n 500 --abbrev=12 --format=%h 2>/dev/null | tr '\n' ' ' || true) \
     docker compose --project-directory "$DEPLOY_DIR" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
 }
 
