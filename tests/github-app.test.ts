@@ -48,6 +48,12 @@ describe('GitHub App integration', () => {
     await expect(service.workflowPermissionGuidance(repository)).resolves.toMatch(/has not approved/i);
     installationPermissions.workflows = 'write';
     await expect(service.workflowPermissionStatus(connection)).resolves.toMatchObject({ app: 'write', installation: 'write', ready: true });
+    // A refused write (tavya-error 40d814688b2054c8) is explained the same way, for Contents.
+    installationPermissions.contents = 'read';
+    await expect(service.writePermissionGuidance(repository)).resolves
+      .toMatch(/requests Contents: read and write, but acme has not approved it\. Approve the updated App permission at https:\/\/github\.com\/organizations\/acme\/settings\/installations\/42/);
+    installationPermissions.contents = 'write';
+    await expect(service.writePermissionGuidance(repository)).resolves.toMatch(/acme\/app may be archived.*organization settings → GitHub/);
     await expect(service.permissionStatus(connection)).resolves.toMatchObject({
       ready: false,
       missingApp: expect.arrayContaining(['Actions', 'Repository administration', 'Merge queues']),

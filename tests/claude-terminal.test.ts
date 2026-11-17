@@ -40,7 +40,7 @@ vi.mock('../src/world/bounded-exec.js', () => ({
 
 import { ClaudeAdapter } from '../src/agent/claude.js';
 import { CUSTODY_ENV } from '../src/agent/custody.js';
-import { AgentToolsUnavailable, ProviderFailure, isTransportError } from '../src/agent/limits.js';
+import { AgentToolsUnavailable, ProviderFailure, ProviderOutage, isTransportError } from '../src/agent/limits.js';
 import { remoteAgentHomeRelative } from '../src/agent/remote-process.js';
 import { localProviderCli } from '../src/agent/provider-cli.js';
 import { controlClient } from './helpers/control-server.js';
@@ -253,6 +253,31 @@ describe('Claude Agent SDK terminal outcome contract', () => {
       ANTHROPIC_API_KEY: '', ANTHROPIC_AUTH_TOKEN: '',
       CLAUDE_CODE_OAUTH_TOKEN: oauthToken ?? '',
     });
+  });
+
+  // Model gateways (wiki features/model-gateways): Claude Code itself, pointed at the gateway.
+  const gateway = { baseUrl: 'https://proxy.example/api/model-gateway', apiKey: 'tmg_turn', model: 'anthropic/claude-opus-5.5',
+    env: { ANTHROPIC_DEFAULT_HAIKU_MODEL: '~anthropic/claude-haiku-latest' } };
+
+  it('runs Claude Code, not the Messages API, through a model gateway, with the gateway in its environment', async () => {
+    sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn' }];
+    await new ClaudeAdapter().runTurn({ ...input, profile: { ...input.profile, model: 'claude-opus-5-5', effort: 'high' },
+      resolvedAuth: { configHome: input.resolvedAuth.configHome, gateway },
+      secretEnv: { ANTHROPIC_BASE_URL: 'https://project.example', ANTHROPIC_AUTH_TOKEN: 'project-bearer' } }, ctx);
+    expect(sdkState.options.model).toBe('anthropic/claude-opus-5.5');
+    expect(sdkState.options.effort).toBe('high');
+    expect(sdkState.options.env).toMatchObject({ ANTHROPIC_BASE_URL: gateway.baseUrl, ANTHROPIC_AUTH_TOKEN: 'tmg_turn',
+      ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', ANTHROPIC_DEFAULT_HAIKU_MODEL: '~anthropic/claude-haiku-latest',
+      CLAUDE_CONFIG_DIR: input.resolvedAuth.configHome });
+    // The final local spawn keeps it, whatever the SDK passes back.
+    const output = path.join(os.tmpdir(), `karmax-gateway-env-${process.pid}.json`);
+    const child = sdkState.options.spawnClaudeCodeProcess({ command: process.execPath,
+      args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(output)}, JSON.stringify({ url: process.env.ANTHROPIC_BASE_URL, token: process.env.ANTHROPIC_AUTH_TOKEN, key: process.env.ANTHROPIC_API_KEY }))`],
+      cwd: os.tmpdir(), env: { ...sdkState.options.env, ANTHROPIC_API_KEY: 'reintroduced', ANTHROPIC_BASE_URL: 'https://elsewhere' },
+      signal: new AbortController().signal });
+    await new Promise((resolve) => child.once('close', resolve));
+    try { expect(JSON.parse(fs.readFileSync(output, 'utf8'))).toEqual({ url: gateway.baseUrl, token: 'tmg_turn', key: '' }); }
+    finally { fs.rmSync(output, { force: true }); }
   });
 
   it('the shipped Claude binary sees the subscription at the final local spawn boundary', async () => {
@@ -606,6 +631,26 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     const failure = await new ClaudeAdapter().runTurn(input, ctx).catch((e) => e);
     expect(failure).toBeInstanceOf(ProviderFailure);
     expect(failure.metadata).toMatchObject({ kind, permanence: 'hard', provider: 'claude', source: 'structured' });
+  });
+
+  // tavya-error 3263761e3afa5929 (2026-11-13): Anthropic's Cloudflare edge answered
+  // a sandbox with its HTML block page. Claude Code calls every 403 "Failed to
+  // authenticate", reduces the page to its <title> and tags it authentication_failed;
+  // the task stopped for a person as a sign-in failure although the login was fine.
+  it.each([
+    ['authentication_failed', 'Failed to authenticate. API Error: 403 Attention Required! | Cloudflare'],
+    ['authentication_failed', 'Failed to authenticate. API Error: 403 Access denied | api.anthropic.com used Cloudflare to restrict access'],
+    [undefined, 'Failed to authenticate. API Error: 403 Just a moment...'],
+  ])('retries a network edge block (%s, %s) instead of reporting a dead login', async (code, text) => {
+    sdkState.messages = [{ type: 'assistant', session_id: 's1', ...(code ? { error: code } : {}),
+      message: { content: [{ type: 'text', text }] } },
+    { type: 'result', subtype: 'success', is_error: true, errors: ['completed'], session_id: 's1' }];
+    const failure = await new ClaudeAdapter().runTurn(input, ctx).catch((e) => e);
+    expect(failure).toBeInstanceOf(ProviderOutage);
+    expect(failure).not.toBeInstanceOf(ProviderFailure);
+    expect(isTransportError(failure)).toBe(true);
+    expect(failure.message).toMatch(/blocked requests from this computer/);
+    expect(failure.message).toContain(text);
   });
 
   it.each(['overloaded', 'server_error', 'max_output_tokens'])(

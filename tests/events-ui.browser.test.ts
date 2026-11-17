@@ -191,8 +191,8 @@ describe('events in the console', () => {
     expect(await page.locator('.store-recs + *').count()).toBe(0);
     // Only what can run now; the rest wait in the store, and the GitHub they lack is said once.
     expect(await recs.locator('[data-store-task]').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-store-task'))))
-      .toEqual(['project-wiki']);
-    expect(await recs.locator('.store-recs-more').innerText()).toMatch(/^4 more in the Task store\s*·\s*Connect GitHub$/);
+      .toEqual(['project-wiki', 'tag-tasks']);
+    expect(await recs.locator('.store-recs-more').innerText()).toMatch(/^5 more in the Task store\s*·\s*Connect GitHub$/);
     expect(await recs.locator('.store-recs-more a', { hasText: 'Connect GitHub' }).getAttribute('href')).toBe('/personal/factory/settings#project');
     expect(await recs.textContent()).not.toContain('Needs GitHub');
     if (process.env.KARMAX_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'store-recommended.png') });
@@ -260,6 +260,52 @@ describe('events in the console', () => {
     await missing.page.locator('.store-row').first().waitFor();
     expect((await store.listTasks(project.id)).length).toBe(before);
     expect([...errors, ...fresh.errors, ...missing.errors]).toEqual([]);
+  });
+
+  it('opens the form of a store task that needs more authority than one click can grant', async () => {
+    const before = (await store.listTasks(project.id)).length;
+    const { page, errors } = await open('/personal/factory?q=is%3Astore');
+    // Dependencies need a repository to update; any kind will do.
+    const deps = page.locator('.store-row[data-store-task="update-dependencies"]');
+    await deps.waitFor();
+    expect(await deps.locator('.task-sub').textContent()).toBe('Needs a repository');
+    expect(await deps.locator('[data-store-run]').isDisabled()).toBe(true);
+    if (process.env.KARMAX_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'store-view.png') });
+
+    // Tagging other people's tasks takes a Project maintainer: someone who
+    // cannot grant it is refused (as the server does), and lands on its form,
+    // whose Install asks whom to ask.
+    await page.route('**/api/projects/*/task-store/tag-tasks', (route) => route.fulfill({ status: 403, contentType: 'application/json',
+      body: JSON.stringify({ error: 'you cannot grant the agent more authorization than you have: Project maintainer · Factory needs task:edit.',
+        code: 'authorization_grant_denied' }) }));
+    const tags = page.locator('.store-row[data-store-task="tag-tasks"]');
+    await tags.locator('[data-store-run]').click();
+    await expect.poll(() => page.url()).toMatch(/\/personal\/factory\/store\/tag-tasks$/);
+    const form = page.locator('#tf-page:not([aria-busy])');
+    await form.waitFor();
+    expect(await form.locator('.tf-head h2').textContent()).toBe('Tag tasks daily');
+    expect(await form.locator('.agent-authority .aa-summary').first().textContent()).toMatch(/Project maintainer/);
+    expect(await form.locator('#tf-queue').textContent()).toMatch(/^Install/);
+    expect(await page.locator('.toast.err').count()).toBe(0);
+    if (process.env.KARMAX_SCREENSHOT_DIR) {
+      await page.waitForTimeout(600); // the page's entrance animation
+      await page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'store-tag-tasks-form.png'), fullPage: true });
+    }
+    expect(await form.locator('.confirmer-field .cf-empty').isVisible()).toBe(true); // Auto-confirms: it changes no code
+
+    // What may change code is reviewed by an agent, which gives up after three rounds.
+    const deps2 = await open('/personal/factory/store/update-dependencies');
+    const depsForm = deps2.page.locator('#tf-page:not([aria-busy])');
+    await depsForm.waitFor();
+    expect(await depsForm.locator('.confirmer-field .cf-layer').evaluateAll((layers) => layers.map((layer) => layer.getAttribute('data-kind')))).toEqual(['agent']);
+    expect(await depsForm.locator('.confirmer-field .cf-max-revisions-input').inputValue()).toBe('3');
+    if (process.env.KARMAX_SCREENSHOT_DIR) {
+      await depsForm.locator('.confirmer-field').scrollIntoViewIfNeeded();
+      await deps2.page.waitForTimeout(600);
+      await deps2.page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'store-update-dependencies-review.png') });
+    }
+    expect((await store.listTasks(project.id)).length).toBe(before);
+    expect([...errors, ...deps2.errors]).toEqual([]);
   });
 
   it('runs and installs a store task as changed in its form', async () => {
@@ -362,7 +408,7 @@ describe('events in the console', () => {
     const row = (id: string) => page.locator(`.store-row[data-store-task="${id}"]`);
     await row('build-planned-issues').waitFor();
     expect(await page.locator('.view-chip[data-view="__store__"]').getAttribute('class')).toContain('active');
-    expect(await page.locator('.store-row').count()).toBe(5);
+    expect(await page.locator('.store-row').count()).toBe(7);
     // Without a GitHub repository there is nothing for it to hear yet.
     expect(await row('build-planned-issues').locator('[data-store-run]').isDisabled()).toBe(true);
     expect(await row('build-planned-issues').textContent()).toContain('Needs GitHub');

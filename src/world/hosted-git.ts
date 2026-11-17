@@ -139,11 +139,13 @@ export class HostedGit {
 
   /** A new repository: its row, and a first (empty) commit on its default
    * branch, so every clone has a base to branch from and a task world never
-   * has to initialize it. A repository that has commits is left as it is. */
-  async create(repository: Repository): Promise<void> {
+   * has to initialize it. A repository that has commits is left as it is.
+   * `empty` makes only the row: for a history pushed next (a project wiki's). */
+  async create(repository: Repository, options: { empty?: boolean } = {}): Promise<void> {
     if (!isHostedRepository(repository)) throw new Error('not a tavya repository');
     const head = `refs/heads/${repository.defaultBranch || 'main'}`;
     await this.deps.store.createHostedRepository({ repositoryId: repository.id, organizationId: repository.organizationId, head });
+    if (options.empty) return;
     await this.exclusive(repository.id, async () => {
       const before = await this.state(repository.id);
       if (Object.keys(before.refs).length) return;

@@ -129,9 +129,11 @@
           rows.push(mdSplitRow(lines[i])); i++;
         }
         const al = (x) => (aligns[x] ? ` style="text-align:${aligns[x]}"` : '');
-        const head = `<thead><tr>${headers.map((h, x) => `<th${al(x)}>${mdInline(h)}</th>`).join('')}</tr></thead>`;
+        // A cell is one line of source, so `<br>` is how it holds several (as on GitHub).
+        const cell = (text) => mdInline(text).replace(/&lt;br\s*\/?&gt;/gi, '<br>');
+        const head = `<thead><tr>${headers.map((h, x) => `<th${al(x)}>${cell(h)}</th>`).join('')}</tr></thead>`;
         const body = rows.length
-          ? `<tbody>${rows.map((r) => `<tr>${headers.map((_, x) => `<td${al(x)}>${mdInline(r[x] || '')}</td>`).join('')}</tr>`).join('')}</tbody>`
+          ? `<tbody>${rows.map((r) => `<tr>${headers.map((_, x) => `<td${al(x)}>${cell(r[x] || '')}</td>`).join('')}</tr>`).join('')}</tbody>`
           : '';
         out.push(`<table class="md-table">${head}${body}</table>`);
         continue;

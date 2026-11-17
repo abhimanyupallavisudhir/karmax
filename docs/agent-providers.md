@@ -155,6 +155,38 @@ OpenCode. Profiles and task parameters do not have a second “Credential
 provider” setting.
 
 
+## November 11, 2026 Codex upgrade audit
+
+Codex is now **0.167.1** (from 0.167.0; the only stable release in between). Its
+release notes are empty ("Full Changelog"). The compare holds two cherry-picks
+(#59832, #60040) and the version bump. Read both, diffed the generated app-server
+protocol, and compared the model slugs and effort levels compiled into both
+binaries.
+
+- **Nothing tavya uses changed.** The only change is `incremental_tools_legacy`,
+  a new feature that is under development, off by default, and since #60040 only
+  for the `amazon-bedrock` providers. With it, regular Responses requests declare
+  tools in history the way Responses Lite already does. The app-server protocol
+  generates identically (761 files). The models and effort levels are the same.
+  So there is no adapter change.
+- **The watcher had no reason to start this run.** Its payload has no `reasons`.
+  The "When to upgrade" policy (task #868) reached only the wiki: master's
+  `scripts/agent-cli-releases.mjs` still emits every release. Task #868's agent
+  was asked to land it (task #915).
+- **panagent: `additional_tools`.** Codex records the tool catalog it declared as
+  an `additional_tools` response item, on models that send tools incrementally.
+  0.167.0 already did this on GPT-6.1 Sol and Terra, though not on GPT-5.5. Every
+  converted GPT-6.1 rollout warned `codex_item_not_represented`. panagent now skips
+  the item silently, like `ghost_snapshot`: whichever harness continues the
+  conversation declares its own tools.
+- Verified: typecheck; the agent suites and the real-binary suites (Codex lineage,
+  imported ids, foreign provider, native MCP, models, harness compatibility);
+  panagent's pinned-Codex test on 0.167.1; real `codex exec` turns on GPT-5.5
+  (also on 0.167.0, the same), GPT-6.1 Sol and Terra, and a resumed one; and the
+  `live-providers` app-server tests (a turn and a mid-turn `turn/steer`, 2 passed)
+  on the real 0.167.1 app-server. Every new rollout converts without a warning
+  beyond the usual target-specific ones.
+
 ## November 10, 2026 Claude Code upgrade audit
 
 Claude Agent SDK is now **0.3.322** (Claude Code **2.1.322**, from 0.3.319 /
@@ -265,7 +297,8 @@ both binaries.
 
 ## November 6, 2026 Codex upgrade audit
 
-Codex is now **0.167.0** (from 0.166.0; the only stable release in between).
+Codex is now **0.167.0** (from 0.166.0; the only stable release in between; now
+0.167.1, above).
 Read the release notes and the linked PRs, diffed the generated app-server
 protocol and `codex-rs/features/src/lib.rs` at both tags, and compared the model
 slugs and effort levels compiled into both binaries.
@@ -302,7 +335,7 @@ slugs and effort levels compiled into both binaries.
 ## November 5, 2026 harness upgrade audit
 
 Claude Agent SDK is now **0.3.318** (Claude Code **2.1.318**, from 0.3.281 / 2.1.281)
-and Codex **0.166.0** (from 0.162.1; now 0.167.0, above). Reviewed every release's notes in between and
+and Codex **0.166.0** (from 0.162.1; now 0.167.1, above). Reviewed every release's notes in between and
 the SDK changelog; diffed the generated Codex app-server protocol.
 
 - **New models are selectable.** Claude Sonnet 5.5 (`claude-sonnet-5-5`, 2.1.284)

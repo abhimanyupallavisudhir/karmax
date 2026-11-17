@@ -30,6 +30,11 @@ export const PERMISSION_ROUTING = 'Audience selectors: task:<id>, avatar:<task i
   + 'else the lowest of @maintainers, @admins and @superadmins that can. platform_request(GET, "/api/agent/escalation-targets?capabilities=<a,b>") lists '
   + 'everyone who can, nearest first; the result names them too (canGrant). A sub-task already holds everything its parent does. ';
 
+/** withdraw_permission_request (both tool surfaces): take back what request_permission asked. */
+export const WITHDRAW_PERMISSION_REQUEST = 'Withdraw a pending request you made with request_permission (for this task, '
+  + 'or for a task you created) once you no longer need it: it leaves the inboxes of everyone asked and can no longer be approved. '
+  + 'A held draft stays a draft. A request already decided is returned as it is; nothing granted is taken away.';
+
 /** queue_task (both tool surfaces): start a draft. */
 export const QUEUE_TASK_DESCRIPTION = 'Start a draft task (one saved with create_task or create_sub_task `draft: true`). '
   + 'A draft sub-task of yours starts when your current turn ends, branching off your work as it is then; '
@@ -123,9 +128,11 @@ export const PLATFORM_REQUEST_EXCLUDED_PATHS = [
   '/api/signup',
   '/api/session',
   '/api/launch', // public policy/version + central hosted-plan catalog
+  '/api/site-analytics/', // the public pages' view beacon: a person's browser only, never an agent
   '/api/legal/', // public policy documents and pre-OAuth acceptance handoff
   '/api/sso/start',
   '/api/agent-mail/ingest', // inbound mail webhook, authenticated by a minted secret
+  '/api/model-gateway', // a model gateway's proxy: an agent harness's model requests, by a turn's token
   '/api/payments/stripe/', // Stripe OAuth callback + signature-verified webhook
   '/api/github/webhook', // GitHub webhook, HMAC-authenticated
   '/api/hooks/', // incoming webhooks, each authenticated by its hook's secret

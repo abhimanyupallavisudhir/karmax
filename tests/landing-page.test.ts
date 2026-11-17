@@ -2,7 +2,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { closeConsoleBrowser, consolePage } from './helpers/console-page.js';
 
 // Bodies passed to page.evaluate run in the page; this file has no DOM lib.
-declare const document: any, getComputedStyle: any;
+declare const document: any, getComputedStyle: any, innerWidth: number;
 
 afterAll(closeConsoleBrowser);
 
@@ -13,8 +13,8 @@ async function landing(options: { viewport?: { width: number; height: number } }
   return ui;
 }
 
-/** Screenshots each look shows: three steps, five features (the phones are two). */
-const LANDING_SHOTS = 3 + 5 + 2;
+/** Screenshots each look shows: three steps, the autonomous project form and four features (the automations are drawn). */
+const LANDING_SHOTS = 3 + 1 + 4;
 
 const signedOut = ({ path }: { path: string }) => path === '/api/meta' ? { siteName: 'tavya' }
   : path === '/api/launch' ? {} : path === '/api/session' ? { authRequired: true, authenticated: false } : undefined;
@@ -23,9 +23,9 @@ describe('public landing page', () => {
   it('names the installation in its title, header, film and footer', async () => {
     const ui = await landing();
     const { page } = ui;
-    expect(await page.title()).toBe('tavya — the agentic to-do list that finishes itself');
+    expect(await page.title()).toBe('tavya — do anything with agents');
     expect(await page.locator('.landing-nav .landing-brand span').textContent()).toBe('tavya');
-    expect(await page.locator('#lp-film').getAttribute('aria-label')).toBe('tavya’s launch film, 0:59');
+    expect(await page.locator('#lp-film').getAttribute('aria-label')).toBe('tavya’s launch film, 1:02');
     expect((await page.locator('.lp-end .landing-start').innerText()).replace(/\s+/g, ' ')).toBe('Get started with tavya');
     expect(await page.locator('.landing-footer .landing-brand span').textContent()).toBe('tavya');
     // The issue-tracker URL is a repository identifier, not branding.
@@ -95,8 +95,9 @@ describe('public landing page', () => {
   it('opens on its line, then the launch film, playing silently on the first screen', async () => {
     const ui = await landing({ viewport: { width: 1440, height: 900 } });
     const { page } = ui;
-    expect(await page.locator('#landing-title').innerText()).toBe('The agentic to-do list that finishes itself.');
-    expect(await page.locator('.lp-lede').innerText()).toBe('Write down what needs doing. Agents do it on their own computers, in parallel, and you review the result.');
+    expect(await page.locator('#landing-title').innerText()).toBe('Do anything with agents.');
+    expect(await page.locator('#landing-title em').innerText()).toBe('anything');
+    expect(await page.locator('.lp-lede').innerText()).toBe('Write it down. An agent does it.');
     expect(await page.locator('.lp-hero .landing-start').innerText()).toBe('Get started');
     const film = page.locator('#lp-film');
     expect(await film.getAttribute('src')).toBe('/media/tavya-launch.mp4');
@@ -117,15 +118,45 @@ describe('public landing page', () => {
     await ui.close();
   });
 
+  it('plays the portrait cut on a phone held upright, and the landscape one once it is turned', async () => {
+    const ui = await landing({ viewport: { width: 390, height: 844 } });
+    const { page } = ui;
+    const film = page.locator('#lp-film');
+    const cut = () => film.evaluate((video: any) => [video.getAttribute('src'), video.getAttribute('poster'), video.width, video.height]);
+    const shape = async () => { const box = (await film.boundingBox())!; return box.width / box.height; };
+    expect(await cut()).toEqual(['/media/tavya-launch-portrait.mp4', '/media/tavya-launch-portrait-poster.jpg', 1080, 1350]);
+    // The frame has the cut's shape before a byte of it arrives, and fills the column.
+    expect(await shape()).toBeCloseTo(1080 / 1350, 2);
+    expect((await film.boundingBox())!.width).toBeGreaterThan(390 - 40);
+    // Watching with sound, then turning the phone: the other cut of the same timeline, still with sound and controls.
+    await page.locator('#lp-sound').click();
+    await film.evaluate((video: any) => Object.defineProperty(video, 'currentTime', { get: () => 23, set: (to) => { video.dataset.sought = String(to); } }));
+    await page.setViewportSize({ width: 844, height: 390 });
+    await expect.poll(cut).toEqual(['/media/tavya-launch.mp4', '/media/tavya-launch-poster.jpg', 1920, 1080]);
+    // It goes on from where it was, once the new cut can seek (a browser that reads the file says so itself).
+    await film.dispatchEvent('loadedmetadata');
+    expect(await film.getAttribute('data-sought')).toBe('23');
+    expect(await shape()).toBeCloseTo(16 / 9, 2);
+    expect(await film.evaluate((video: any) => ({ muted: video.muted, loop: video.loop, controls: video.controls }))).toEqual({ muted: false, loop: false, controls: true });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect.poll(cut).toEqual(['/media/tavya-launch-portrait.mp4', '/media/tavya-launch-portrait-poster.jpg', 1080, 1350]);
+    expect(ui.errors).toEqual([]);
+    await ui.close();
+  });
+
   it('tells how a task goes, then what surrounds it, each pictured in the visitor\'s look', async () => {
     const ui = await landing();
     const { page } = ui;
-    expect(await page.locator('main h2').allInnerTexts()).toEqual(['How a task goes', 'Everything a task needs', 'Just do things.']);
-    expect(await page.locator('.lp-step h3').allInnerTexts()).toEqual(['Write it down', 'An agent does it', 'You review the result']);
+    expect(await page.locator('main h2').allInnerTexts()).toEqual(['How a task goes', 'Build the autonomous company', 'Everything a task needs', 'How it compares', 'Questions', 'Just do things.']);
+    expect(await page.locator('#lp-auto-title em').textContent()).toBe('autonomous company');
+    expect(await page.locator('.lp-step h3').allInnerTexts()).toEqual(['Write it down', 'An agent does it', 'Review and approve']);
+    // The autonomous company has the page's one band, between how a task goes and the rest.
+    expect(await page.locator('.lp-auto-card h3').allInnerTexts()).toEqual(['Agents create, manage and approve tasks', 'Work starts itself']);
+    // Each automation says when it runs: an event, another task, a schedule.
+    expect(await page.locator('.lp-automations span').allInnerTexts()).toEqual(['when the server reports an error', 'when a dependency releases',
+      'after the release task lands', 'every Monday', 'every night at 3:00']);
     expect(await page.locator('.lp-feature h3').allInnerTexts()).toEqual(['Big jobs fan out', 'Accounts, keys and a card',
-      'The autonomous company', 'Any model, your subscription', 'Not just code', 'On your phone']);
-    expect(await page.locator('.lp-feature li').allInnerTexts()).toEqual(['Agents can start, manage and approve tasks',
-      'Tasks can be triggered by webhooks and events', 'Tasks can run on schedules, or after other tasks']);
+      'Any model, your subscription', 'Not just code']);
     // Each screenshot comes in the light and the dark look; the page shows the one it wears.
     for (const [scheme, shown] of [['light', 'lp-light'], ['dark', 'lp-dark']] as const) {
       await page.emulateMedia({ colorScheme: scheme });
@@ -144,6 +175,97 @@ describe('public landing page', () => {
     for (const retired of ['vscode was a fancy text editor.', 'Leave the permanent underclass today.'])
       expect(await page.locator('.landing-page').innerText()).not.toContain(retired);
     await ui.close();
+  });
+
+  it('says what people say, before the end', async () => {
+    const ui = await landing();
+    const { page } = ui;
+    const quotes = await page.locator('.lp-quote').evaluateAll((items) => items.map((item: any) =>
+      [item.querySelector('blockquote').textContent, item.querySelector('figcaption').textContent]));
+    expect(quotes).toEqual([['Every man a CEO, and no one has a moat.', 'N.H.'],
+      ['tavya is such an addictive toy… it has replaced my evening PS-5 sessions for me.', 'D.A.'],
+      ['I can really just do anything now.', 'R.S.']]);
+    expect(await page.locator('.lp-quote').nth(2).locator('blockquote em').textContent()).toBe('anything');
+    // After everything a task needs, right before the end.
+    const order = await page.evaluate(() => [...document.querySelectorAll('.lp-features, .lp-compare, .lp-quotes, .lp-answers, .lp-end')].map((el) => el.className.split(' ')[0]));
+    expect(order).toEqual(['lp-features', 'lp-compare', 'lp-quotes', 'lp-answers', 'lp-end']);
+    await ui.close();
+  });
+
+  it('sets itself beside the alternatives: a tick, a dash, or a few words', async () => {
+    const ui = await landing();
+    const { page } = ui;
+    const table = page.locator('.lp-compare table');
+    expect(await table.locator('thead th').allInnerTexts()).toEqual(['tavya', 'Claude Code', 'Codex', 'Devin', 'Cursor', 'Paperclip']);
+    // Our own column is every row's first, and the only one that is not a link to a page about the other.
+    expect(await table.locator('thead th a').evaluateAll((links) => links.map((link) => link.getAttribute('href')))).toEqual(
+      ['/compare/claude-code', '/compare/codex', '/compare/devin', '/compare/cursor', '/compare/paperclip']);
+    const row = (label: string) => table.locator('tbody tr', { has: page.locator('th', { hasText: label }) }).locator('td');
+    expect(await row('Open source').allInnerTexts()).toEqual(['✓', '—', 'CLI only', '—', '—', '✓']);
+    expect(await row('Open source').evaluateAll((cells) => cells.map((cell: any) => cell.className))).toEqual(['yes', 'no', 'part', 'no', 'no', 'yes']);
+    // A tick and a dash are read out as what they mean.
+    expect(await row('Open source').first().locator('span').getAttribute('aria-label')).toBe('Yes');
+    expect(await row('Open source').nth(1).locator('span').getAttribute('aria-label')).toBe('No');
+    // What sets tavya apart leads: any model, work beyond code, the files Git ignores, workflows and autonomy.
+    expect(await table.locator('tbody th').allInnerTexts()).toEqual(['Choose any model', 'A cloud computer for every task', 'Work that is not code',
+      '.env and key files, put back in place', 'Datasets and databases, in versions', 'App integrations', 'Review by any person or agent',
+      'Tasks that wait for other tasks', 'Tasks that run on hooks and events', 'Agents run the whole project', 'Supports your own cloud accounts', 'Open source']);
+    // A row says what each product does in words a passer-by follows: the kinds of work, where a file ends up.
+    const lists = async (label: string) => (await row(label).allInnerTexts()).map((text) => text.split('\n'));
+    expect((await lists('Work that is not code')).slice(0, 2)).toEqual([['Documents', 'Images, video', 'Purchases'], ['Documents']]);
+    // One thing to a line, however narrow the column: a list never breaks inside an item.
+    expect(await row('Work that is not code').first().evaluate((cell: any) => [cell.className, getComputedStyle(cell).whiteSpace])).toEqual(['part list', 'nowrap']);
+    expect(await row('.env and key files, put back in place').allInnerTexts()).toEqual(['✓', 'as variables', 'as variables', 'as variables, attachments', 'as variables', 'local runs only']);
+    expect(await row('Datasets and databases, in versions').allInnerTexts()).toEqual(['✓', 'uploads, no versions', '—', '—', '—', '—']);
+    expect(await row('Tasks that wait for other tasks').allInnerTexts()).toEqual(['✓', 'can be scripted manually', '—', 'can be scripted manually', '—', '✓']);
+    expect(await row('Tasks that run on hooks and events').allInnerTexts()).toEqual(['✓', '✓', '✓', '✓', '✓', '✓']);
+    expect(await row('Choose any model').allInnerTexts()).toEqual(['✓', 'Claude only', 'OpenAI only', 'Fixed harness', 'Fixed harness', '✓']);
+    // App integrations: each product lists what it has, one to a line; only tavya has a wallet.
+    const integrations = (await row('App integrations').allInnerTexts()).map((text) => text.split('\n'));
+    expect(integrations[0]).toEqual(['Apps', 'Logins', 'Passwords', 'Secrets', 'Mailbox', 'Wallet']);
+    expect(integrations[1]).toEqual(['Apps', 'Secrets']);
+    expect(integrations.slice(1).some((list) => list.includes('Wallet'))).toBe(false);
+    expect((await page.locator('.lp-compare-foot').innerText()).replace(/\s+/g, ' ')).toBe('November 2026 · The comparison in full');
+    // The full comparison opens in place, like every public page.
+    expect(await page.locator('.lp-compare-foot a').getAttribute('href')).toBe('/compare');
+    expect(await page.locator('.lp-compare-foot a').evaluate((link: any) => 'public' in link.dataset)).toBe(true);
+    // On a phone the table scrolls sideways inside its frame; the page does not.
+    const phone = await landing({ viewport: { width: 390, height: 844 } });
+    const widths = await phone.page.evaluate(() => { const frame = document.querySelector('.lp-compare-scroll'); return [document.documentElement.scrollWidth <= innerWidth, frame.scrollWidth > frame.clientWidth]; });
+    expect(widths).toEqual([true, true]);
+    await phone.close();
+    await ui.close();
+  });
+
+  it('answers what a visitor asks before signing up, each question opening in place', async () => {
+    const ui = await landing();
+    const { page } = ui;
+    const questions = await page.locator('.lp-answer summary').allInnerTexts();
+    expect(questions).toEqual(expect.arrayContaining(['How is this different from Claude Code on the web or Codex cloud?', 'What about files Git ignores?',
+      'How are my logins, keys and card protected?', 'Is it open source?']));
+    // No free trial is known here (no launch information), so none is promised.
+    expect(questions).not.toContain('What does it cost to try?');
+    const ignored = page.locator('.lp-answer', { hasText: 'What about files Git ignores?' });
+    expect(await ignored.locator('p').isVisible()).toBe(false);
+    await ignored.locator('summary').click();
+    expect(await ignored.locator('p').innerText()).toMatch(/^They come along\. \.env values are kept as project secrets and written back for every task/);
+    // Its link opens a public page in place.
+    expect(await ignored.locator('a').evaluate((link: any) => [link.getAttribute('href'), 'public' in link.dataset, link.target])).toEqual(['/docs/ignored-files', true, '']);
+    expect(await page.locator('.landing-page').innerText()).not.toMatch(/\{\{\w+\}\}/);
+    // Against the vendors' own cloud agents, the answer is a list of what tavya adds.
+    const different = page.locator('.lp-answer', { hasText: 'How is this different from Claude Code on the web or Codex cloud?' });
+    await different.locator('summary').click();
+    expect(await different.locator('li strong').allInnerTexts()).toEqual(['Any model.', 'More than code.', 'Your whole project.', 'Real accounts.', 'Workflows you set.', 'The autonomous company.', 'Yours to run.']);
+    expect(await different.locator('ul').evaluate((list: any) => getComputedStyle(list).listStyleType)).toBe('disc');
+    expect(await different.locator('a').getAttribute('href')).toBe('/compare');
+    await ui.close();
+    // Where the installation offers a free trial of compute, the first answer says how much.
+    const hosted = await consolePage();
+    await hosted.run(`S.meta = { siteName: 'tavya' }; S.launch = { trial: { creditMicros: 5000000, days: 14 }, managedCompute: ['e2b'] }; renderLanding()`);
+    const cost = hosted.page.locator('.lp-answer', { hasText: 'What does it cost to try?' });
+    await cost.locator('summary').click();
+    expect(await cost.locator('p').innerText()).toMatch(/^Nothing\. A new account gets \$5 of compute for 14 days and a built-in model/);
+    await hosted.close();
   });
 
   it('wears the console\'s look, light or dark, default or classic', async () => {
@@ -234,11 +356,11 @@ describe('public landing page', () => {
     await still.close();
   });
 
-  it('sends public GitHub links to the issue tracker, never the private repository', async () => {
+  it('sends its GitHub links to the source, which is open', async () => {
     const ui = await landing();
-    const github = (await ui.page.locator('a[href*="github.com"]').evaluateAll((links) => links.map((link) => link.getAttribute('href'))));
-    expect(github).toEqual(['https://github.com/abhimanyupallavisudhir/krmax-issues/issues',
-      'https://github.com/abhimanyupallavisudhir/krmax-issues/issues']);
+    const github = (await ui.page.locator('.landing-nav a[href*="github.com"], .landing-footer a[href*="github.com"]').evaluateAll((links) => links.map((link) => link.getAttribute('href'))));
+    expect(github).toEqual(['https://github.com/abhimanyupallavisudhir/karmax', 'https://github.com/abhimanyupallavisudhir/karmax']);
+    expect(await ui.page.locator('.landing-footer a').allInnerTexts()).toEqual(expect.arrayContaining(['Compare', 'About', 'Changelog']));
     await ui.close();
   });
 });

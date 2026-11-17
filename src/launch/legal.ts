@@ -83,6 +83,7 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
         'Account data: name, email, login providers, memberships, preferences, sessions, and security events.',
         'Billing data: plan, price, renewal state, payment-provider customer/subscription references, acceptance evidence, refunds, and support history. The checkout payment provider handles subscription card details; tavya does not store full subscription payment-card numbers.',
         'Customer workspace data: repository files and metadata, prompts, tasks, messages, outputs, environment state, attachments, connected-service data, and audit events.',
+        'Public site visits: visits to the public pages and the sign-in page are counted in aggregate (page, referring site and day) by tavya itself, without cookies and without storing IP addresses or other identifiers. To count a visitor once a day, a one-way code made from the address and browser under a key that changes every day is kept for at most two days, then deleted with that key.',
       ] },
       { heading: 'How data is used', paragraphs: ['Data is used to provide and secure the service, execute customer instructions, authenticate users, administer subscriptions, respond to support and legal requests, prevent abuse, and maintain reliable operations. This draft does not authorize selling personal data or using private customer repository/workspace content to train general-purpose models.'] },
       { heading: 'Lawful bases and required information', paragraphs: [

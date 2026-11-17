@@ -6,7 +6,7 @@ import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import type { WorldDiagnosis } from '../src/world/types.js';
 import { withClaudeStartupDeadline } from '../src/agent/sdk-stream.js';
-import { AgentToolsUnavailable, providerFailure, ProviderOutage } from '../src/agent/limits.js';
+import { AgentToolsUnavailable, NetworkEdgeBlock, providerFailure, ProviderOutage, ProviderStreamError } from '../src/agent/limits.js';
 
 /**
  * Tasks 348 and 349 escalated to a human because a sandbox frozen by memory
@@ -195,6 +195,17 @@ describe('sandbox-caused turn failures', () => {
     const rejected = providerFailure('Codex credential rejected', { kind: 'credential', permanence: 'hard', provider: 'codex',
       diagnostic: { code: 'unauthorized', status: 401 } });
     const failure = new ProviderOutage('OpenAI is rejecting Codex model requests even though this ChatGPT login is valid', { cause: rejected });
+    const { error } = await failTurn(failure, undefined);
+    expect(error).toMatchObject({ type: 'agent-infra', nonRetryable: false, message: failure.message });
+  });
+
+  // tavya-error 3263761e3afa5929: Cloudflare's block page, which Claude Code reports
+  // as "Failed to authenticate", stopped a task for a person as a dead login.
+  it.each([
+    ['the Claude adapter\'s typed block', () => new NetworkEdgeBlock('claude', 'Failed to authenticate. API Error: 403 Attention Required! | Cloudflare')],
+    ['a block page in a provider stream', () => new ProviderStreamError('unexpected status 403 Forbidden: <html><head><title>Attention Required! | Cloudflare</title></head></html>')],
+  ])('retries a network edge block (%s) as infrastructure, never as a login to fix', async (_name, make) => {
+    const failure = make();
     const { error } = await failTurn(failure, undefined);
     expect(error).toMatchObject({ type: 'agent-infra', nonRetryable: false, message: failure.message });
   });

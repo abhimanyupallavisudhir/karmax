@@ -7,7 +7,7 @@ import { URGENCY_LEVELS, type AgentSpec, type AuthorizationSelection, type Provi
 import {
   AGENT_ROLE_NAMES, PLATFORM_REQUEST_BODY_SCHEMA, PLATFORM_REQUEST_EXCLUDED_PATHS,
   PRIORITY_NAMES, compactSearch, compactOrganizationSearch, compactTags, normalizePlatformPath, normalizeRequestBody,
-  platformRequestPathError, FIELDS_PARAMETER, agentPlatformResponse, agentTaskView, CREATE_TASK_GRANTS, REQUEST_FOR_TASK, PERMISSION_ROUTING, QUEUE_TASK_DESCRIPTION, queuedTaskReply,
+  platformRequestPathError, FIELDS_PARAMETER, agentPlatformResponse, agentTaskView, CREATE_TASK_GRANTS, REQUEST_FOR_TASK, PERMISSION_ROUTING, WITHDRAW_PERMISSION_REQUEST, QUEUE_TASK_DESCRIPTION, queuedTaskReply,
   type CompactTask,
 } from './platform-request.js';
 import { BRAND } from '../domain/brand.js';
@@ -69,6 +69,7 @@ export interface PlatformOps {
   notify(a: { to?: string[]; message: string; urgency?: Urgency; agents?: AgentSpec[] }): Promise<unknown>;
   requestPermission(a: { capabilities?: string[]; projectIds?: string[]; taskId?: string; audience?: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
   requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
+  withdrawPermissionRequest(a: { requestId: string; reason?: string }): Promise<unknown>;
   cancelAgentAction(requestId: string): Promise<unknown>;
   reorderQueue(domain: string, taskId: string): Promise<void>;
   saveSkill(a: { name: string; content: string }): Promise<unknown>;
@@ -152,6 +153,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     notify: (a) => api.notify(getToken(), a),
     requestPermission: (a) => api.requestPermission(getToken(), a),
     requestAgentAction: (a) => api.requestAgentAction(getToken(), a),
+    withdrawPermissionRequest: (a) => api.withdrawPermissionRequest(getToken(), a),
     cancelAgentAction: (requestId) => api.cancelAgentAction(getToken(), requestId),
     reorderQueue: (domain, id) => api.reorderQueue(getToken(), domain, id),
     saveSkill: (a) => api.saveSkill(getToken(), a) as Promise<unknown>,
@@ -258,6 +260,9 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     notify: (a) => req('/api/agent/notify', { method: 'POST', body: JSON.stringify(a) }),
     requestPermission: (a) => req('/api/agent/permission-requests', { method: 'POST', body: JSON.stringify(a) }),
     requestAgentAction: (a) => req('/api/agent/collaboration/request', { method: 'POST', body: JSON.stringify(a) }),
+    withdrawPermissionRequest: (a) => req(`/api/agent/permission-requests/${encodeURIComponent(a.requestId)}/withdraw`, {
+      method: 'POST', body: JSON.stringify(a.reason ? { reason: a.reason } : {}),
+    }),
     cancelAgentAction: (requestId) => req(`/api/agent/collaboration/${encodeURIComponent(requestId)}/cancel`, {
       method: 'POST', body: '{}',
     }),
@@ -325,12 +330,20 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
 
 /** `tools` registers only that subset of the definitions below (the remote
  * `/mcp` server leaves out tools bound to a calling task). */
-export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: ReadonlySet<string>; name?: string } = {}): McpServer {
+export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: ReadonlySet<string>; name?: string;
+  /** What a client is told about each tool: its name for people and whether it reads, changes or can remove (MCP annotations). */
+  notes?: Readonly<Record<string, { title: string; readOnly?: true; destructive?: true }>> } = {}): McpServer {
   const server = new McpServer({ name: options.name ?? 'karmax-platform', version: '1.0.0' });
   if (options.tools) {
     const register = server.registerTool.bind(server), tools = options.tools;
-    server.registerTool = ((name: string, ...rest: unknown[]) => tools.has(name)
-      ? (register as (...args: unknown[]) => unknown)(name, ...rest) : undefined) as typeof server.registerTool;
+    server.registerTool = ((name: string, config: Record<string, unknown>, ...rest: unknown[]) => {
+      if (!tools.has(name)) return undefined;
+      const note = options.notes?.[name];
+      // Both hints are stated for every tool: a client that sees neither must assume the worst of a read.
+      const described = note ? { ...config, title: note.title, annotations: { title: note.title,
+        readOnlyHint: note.readOnly === true, destructiveHint: note.destructive === true } } : config;
+      return (register as (...args: unknown[]) => unknown)(name, described, ...rest);
+    }) as typeof server.registerTool;
   }
   const ok = (text: string) => ({ content: [{ type: 'text' as const, text }] });
   const wrap = async (fn: () => Promise<any>) => {
@@ -613,6 +626,17 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     async (a) => wrap(async () => (await ops.requestPermission(a))),
   );
   server.registerTool(
+    'withdraw_permission_request',
+    {
+      description: WITHDRAW_PERMISSION_REQUEST,
+      inputSchema: {
+        requestId: z.string().trim().min(1).describe('The requestId request_permission returned.'),
+        reason: z.string().trim().max(4_000).optional().describe('Why it is no longer needed (shown to the people asked).'),
+      },
+    },
+    async (a) => wrap(async () => (await ops.withdrawPermissionRequest(a))),
+  );
+  server.registerTool(
     'request_agent_action',
     {
       description: `Ask another task agent to publish its branch in the background. Returns immediately with a durable request id; ${BRAND} injects completion or failure into this agent automatically. Continue other work and do not poll.`,
@@ -814,6 +838,52 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       if (a.limit !== undefined) q.set('limit', String(a.limit));
       return (await ops.platformRequest('GET', `/api/organizations/${encodeURIComponent(a.organizationId)}/agent-mail${q.toString() ? `?${q}` : ''}`));
     }),
+  );
+  // Clients outside a task (tavya's /mcp): the result comes back in the reply.
+  // In a task, karmax_control's generate saves it into the world instead.
+  if (options.tools?.has('generate')) server.registerTool(
+    'generate',
+    {
+      description:
+        `Use any model OpenRouter serves, paid from your ${BRAND} organization's credit with no account at the lab: text (GPT, Gemini, DeepSeek, …), an image (gpt-image, Nano Banana, Flux…), a video (Seedance, Veo, Kling…) or speech (ElevenLabs…). What it can cost at most is worked out from the model's price list first and held on the credit; it is refused when the credit cannot cover that, or above maxCostUsd. Text, images and speech come back in this reply. A video returns a jobId: call again with jobId until it is completed, then download it from the URL given (with your ${BRAND} token). Models, prices, durations and voices: platform_request GET /api/generation-models?kind=text|image|video|speech.`,
+      inputSchema: {
+        organizationId: z.string(),
+        kind: z.enum(['text', 'image', 'video', 'speech']).optional(),
+        prompt: z.string().optional().describe('The question or what to make; for speech, the text to say.'),
+        model: z.string().optional(), maxCostUsd: z.number().optional(),
+        system: z.string().optional(), maxTokens: z.number().int().optional(), effort: z.enum(['minimal', 'low', 'medium', 'high']).optional(),
+        aspectRatio: z.string().optional(), resolution: z.string().optional(),
+        count: z.number().int().min(1).max(10).optional(), duration: z.number().optional(), audio: z.boolean().optional(),
+        voice: z.string().optional(), instructions: z.string().optional(),
+        references: z.array(z.object({ url: z.string().describe('https: or base64 data: URL'),
+          role: z.enum(['first_frame', 'last_frame', 'reference']).optional() })).optional(),
+        jobId: z.string().optional().describe('A video job to check.'),
+      },
+    },
+    async ({ organizationId, jobId, ...request }) => {
+      const org = encodeURIComponent(organizationId);
+      try {
+        const result = (jobId
+          ? await ops.platformRequest('GET', `/api/organizations/${org}/generations/${encodeURIComponent(jobId)}`)
+          : await ops.platformRequest('POST', `/api/organizations/${org}/generations`, request)) as {
+          status: string; jobId?: string; model?: string; costUsd?: number; outputs?: number; error?: string; text?: string;
+          files?: Array<{ mediaType: string; base64: string }> };
+        const { files, text, ...summary } = result;
+        const base = (process.env.KARMAX_PUBLIC_URL ?? '').replace(/\/$/, '');
+        const downloads = result.jobId && result.status === 'completed'
+          ? Array.from({ length: result.outputs ?? 1 }, (_, index) =>
+            `${base}/api/organizations/${org}/generations/${encodeURIComponent(result.jobId!)}/content?index=${index}`) : undefined;
+        return { content: [
+          ...(text !== undefined ? [{ type: 'text' as const, text }] : []),
+          ...(files ?? []).map((file) => file.mediaType.startsWith('audio/')
+            ? { type: 'audio' as const, data: file.base64, mimeType: file.mediaType }
+            : { type: 'image' as const, data: file.base64, mimeType: file.mediaType }),
+          { type: 'text' as const, text: JSON.stringify({ ...summary, ...(downloads ? { downloads } : {}) }) },
+        ] };
+      } catch (error) {
+        return wrap(async () => { throw error; });
+      }
+    },
   );
   server.registerTool(
     'enroll_passkey',

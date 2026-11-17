@@ -17,11 +17,14 @@
  */
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
-import { COMPUTE_PRICE_MULTIPLIER } from '../domain/entitlements.js';
+import { COMPUTE_PRICE_MULTIPLIER, computeChargeMicros } from '../domain/entitlements.js';
 import type { AgentProfile } from '../domain/types.js';
 import { EFFORTS, type Effort } from './effort.js';
 import type { Store } from '../store/db.js';
 import { ComputeCreditExhausted, computeCredit, outOfCompute } from '../world/managed-compute.js';
+import { type ModelPrice, openRouterApiBase, openRouterPrices, resetModelPrices } from './model-prices.js';
+
+export { openRouterApiBase };
 
 /** DeepSeek V4.1 Flash at max effort (2026-11-07). On tavya's model
  * evaluation (wiki features/included-model: OpenCode as tavya runs it, three
@@ -48,10 +51,11 @@ export const INCLUDED_MODEL_OPTIONS = { provider: { zdr: true, quantizations: ['
 export const INCLUDED_MODEL_MIN_MICROS = 50_000;
 
 const CONFIG_KEY = 'included-model:config';
-const MANAGEMENT_HANDLE = 'included-model:installation:openrouter:management-key';
+/** The installation's OpenRouter management key (also read by Service limits for the account's balance). */
+export const INCLUDED_MODEL_MANAGEMENT_HANDLE = 'included-model:installation:openrouter:management-key';
+const MANAGEMENT_HANDLE = INCLUDED_MODEL_MANAGEMENT_HANDLE;
 const keyRecord = (organizationId: string) => `included-model:key:${organizationId}`;
 const keyHandle = (organizationId: string) => `included-model:organization:${organizationId}:openrouter-key`;
-const apiBase = () => (process.env.KARMAX_OPENROUTER_API_URL ?? 'https://openrouter.ai/api/v1').replace(/\/$/, '');
 
 export interface IncludedModelSettings {
   /** The OpenRouter model id, e.g. deepseek/deepseek-v4.1-flash-1017. */
@@ -119,23 +123,6 @@ export const MEASURED_TASK_USD: Readonly<Record<string, number>> = {
  * evaluation: per input token, 9% uncached and 91% read from the cache, and
  * 3.4% as many output tokens (reasoning included). */
 const TASK_MIX = { prompt: 0.09, cache: 0.91, completion: 0.034 };
-const PRICES_TTL_MS = 6 * 60 * 60_000;
-let prices: { at: number; byId: Map<string, { prompt: number; completion: number; cache?: number }> } | undefined;
-
-async function openRouterPrices(now = Date.now()) {
-  if (prices && now - prices.at < PRICES_TTL_MS) return prices.byId;
-  const response = await fetch(`${apiBase()}/models`, { signal: AbortSignal.timeout(10_000) });
-  if (!response.ok) throw new Error(`OpenRouter models: ${response.status}`);
-  const byId = new Map<string, { prompt: number; completion: number; cache?: number }>();
-  for (const model of ((await response.json()) as { data?: any[] }).data ?? []) {
-    const p = model?.pricing ?? {};
-    const prompt = Number(p.prompt), completion = Number(p.completion), cache = Number(p.input_cache_read);
-    if (typeof model?.id === 'string' && Number.isFinite(prompt) && Number.isFinite(completion))
-      byId.set(model.id, { prompt, completion, ...(Number.isFinite(cache) && p.input_cache_read !== undefined ? { cache } : {}) });
-  }
-  prices = { at: now, byId };
-  return byId;
-}
 
 /** About how many times the included model's cost a typical task on
  * `agentModel` (`openrouter/<id>`) at `effort` costs: measured where both
@@ -148,18 +135,18 @@ export async function includedModelRelativeCost(settings: IncludedModelSettings,
   const base = measured(settings.model, settings.effort), other = measured(id, effort);
   if (base && other) return other / base;
   const byId = await openRouterPrices().catch(() => undefined);
-  const cost = (price?: { prompt: number; completion: number; cache?: number }) => price
+  const cost = (price?: ModelPrice) => price
     && TASK_MIX.prompt * price.prompt + TASK_MIX.cache * (price.cache ?? price.prompt) + TASK_MIX.completion * price.completion;
   const baseCost = cost(byId?.get(settings.model)), otherCost = cost(byId?.get(id));
   return baseCost && otherCost !== undefined ? otherCost / baseCost : undefined;
 }
 
 /** Tests: forget cached prices. */
-export function resetIncludedModelPrices(): void { prices = undefined; }
+export function resetIncludedModelPrices(): void { resetModelPrices(); }
 
 async function openRouter(broker: CredentialBroker, method: string, path: string, body?: unknown): Promise<any> {
   const key = await broker.resolve(MANAGEMENT_HANDLE, { caps: [`use-credential:${MANAGEMENT_HANDLE}`] });
-  const response = await fetch(`${apiBase()}${path}`, { method,
+  const response = await fetch(`${openRouterApiBase()}${path}`, { method,
     headers: { authorization: `Bearer ${key}`, ...(body ? { 'content-type': 'application/json' } : {}) },
     ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(20_000) });
   const text = await response.text();
@@ -225,8 +212,8 @@ export async function includedModelKey(store: Store, broker: CredentialBroker, o
   const credit = await computeCredit(store, organizationId, now);
   if (credit.availableMicros != null && credit.availableMicros < INCLUDED_MODEL_MIN_MICROS)
     throw await outOfCompute(store, organizationId, 'openrouter', now);
-  const available = credit.availableMicros ?? Number.MAX_SAFE_INTEGER;
   const multiplier = await store.computePriceMultiplier(organizationId, now);
+  const available = await keyRoom(store, organizationId, credit.availableMicros, multiplier, now) ?? Number.MAX_SAFE_INTEGER;
   let existing = await record(store, organizationId);
   if (existing && !(await broker.hasHandle(keyHandle(organizationId)))) existing = undefined;
   if (!existing) {
@@ -239,12 +226,22 @@ export async function includedModelKey(store: Store, broker: CredentialBroker, o
   }
   const current = (await openRouter(broker, 'GET', `/keys/${existing.hash}`))?.data ?? {};
   await bookUsage(store, organizationId, Number(current.usage) || 0, now);
-  const limitUsd = limitFor(Number(current.usage) || 0, (await computeCredit(store, organizationId, now)).availableMicros ?? available, multiplier);
+  const limitUsd = limitFor(Number(current.usage) || 0,
+    await keyRoom(store, organizationId, (await computeCredit(store, organizationId, now)).availableMicros, multiplier, now) ?? available, multiplier);
   if (limitUsd !== existing.limitUsd || current.disabled) {
     await openRouter(broker, 'PATCH', `/keys/${existing.hash}`, { limit: limitUsd, disabled: false });
     await store.kvSet(keyRecord(organizationId), JSON.stringify({ ...existing, limitUsd } satisfies KeyRecord));
   }
   return broker.resolve(keyHandle(organizationId), { caps: [`use-credential:${keyHandle(organizationId)}`] });
+}
+
+/** What the organization's key may still spend, at tavya's prices: the
+ * credit left plus what generations running on this key hold (wiki
+ * features/generate). Those holds reserve the credit for exactly what the key
+ * is about to be charged, so they must not close the key on it. */
+async function keyRoom(store: Store, organizationId: string, availableMicros: number | null, multiplier: number, now: number): Promise<number | undefined> {
+  if (availableMicros == null) return undefined;
+  return availableMicros + computeChargeMicros(await store.openSpendHoldsMicros(organizationId, 'openrouter', now), multiplier);
 }
 
 async function bookUsage(store: Store, organizationId: string, usageUsd: number, now: number, task?: { taskId: string; projectId?: string }) {
@@ -261,7 +258,8 @@ export async function syncIncludedModelUsage(store: Store, broker: CredentialBro
   const current = (await openRouter(broker, 'GET', `/keys/${existing.hash}`))?.data ?? {};
   const usageUsd = Number(current.usage) || 0;
   const booked = await bookUsage(store, organizationId, usageUsd, now, task);
-  const available = (await computeCredit(store, organizationId, now)).availableMicros;
+  const available = await keyRoom(store, organizationId, (await computeCredit(store, organizationId, now)).availableMicros,
+    await store.computePriceMultiplier(organizationId, now), now);
   if (available != null && available <= 0 && existing.limitUsd !== limitFor(usageUsd, 0)) {
     const limitUsd = limitFor(usageUsd, 0);
     await openRouter(broker, 'PATCH', `/keys/${existing.hash}`, { limit: limitUsd });
@@ -301,24 +299,4 @@ export async function includedModelOutOfCredit(store: Store, broker: CredentialB
   const credit = await computeCredit(store, organizationId, now);
   return credit.availableMicros != null && credit.availableMicros < INCLUDED_MODEL_MIN_MICROS
     ? outOfCompute(store, organizationId, 'openrouter', now) : undefined;
-}
-
-/** A new organization's Task defaults: every agent role on the included model,
- * so its first task runs without a login of its own. It changes them like any
- * Task default; connecting a login does not change them by itself. */
-export async function seedIncludedModelDefaults(store: Store, broker: CredentialBroker | undefined, organizationId: string): Promise<boolean> {
-  const settings = await includedModel(store, broker);
-  if (!settings || !broker) return false;
-  const { allRoles } = await import('../contrib/manifests.js');
-  const { organizationProfileId, roleDefaultProfile, DEFAULT_MCP_CONNECTIONS } = await import('./profiles.js');
-  for (const role of allRoles()) {
-    const id = organizationProfileId(organizationId, role.name);
-    if (await store.getProfile(id)) continue;
-    const inherited = await roleDefaultProfile(store, role.name);
-    await store.upsertProfile({ id, name: role.label, role: role.name, provider: 'opencode', model: includedAgentModel(settings),
-      ...(settings.effort ? { effort: settings.effort as Effort } : {}),
-      mcpConnections: inherited?.mcpConnections ?? [...DEFAULT_MCP_CONNECTIONS],
-      ...(inherited?.maxTurns ? { maxTurns: inherited.maxTurns } : {}) });
-  }
-  return true;
 }

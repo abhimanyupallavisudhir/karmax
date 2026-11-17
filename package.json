@@ -2,7 +2,7 @@
   "name": "karmax",
   "version": "1.0.0",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "description": "An agent-orchestration platform centered on a todo list, on a durable-execution substrate (Temporal).",
   "engines": {
@@ -49,7 +49,7 @@
     "@daytona/sdk": "^0.218.0",
     "@e2b/desktop": "^2.3.1",
     "@modelcontextprotocol/sdk": "^1.32.1",
-    "@openai/codex": "0.167.0",
+    "@openai/codex": "0.167.1",
     "@temporalio/activity": "^1.24.0",
     "@temporalio/client": "^1.24.0",
     "@temporalio/common": "^1.24.0",

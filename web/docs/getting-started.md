@@ -47,6 +47,8 @@ Invite people from **Settings → People & authorization**. Everyone in a projec
 - [How it works](/docs/how-it-works): tasks, computers, data, the wiki, and what agents may do.
 - [Cloud computers](/docs/computers): the providers compared, and how to connect your own account.
 - [tavya CLI](/docs/cli): work on a project or a task from your own machine.
+- Guides: [run many agents in parallel](/docs/parallel-agents), [schedule tasks and react to events](/docs/scheduled-tasks), [let one agent review another](/docs/agent-review), [give an agent a card with a budget](/docs/agent-payments), [files Git ignores](/docs/ignored-files).
+- [tavya compared](/compare) with Claude Code on the web, Codex cloud, Devin and others.
 - Connect another agent (Claude Code, Codex, Cursor…) to tavya over MCP: `{{origin}}/mcp`.
 - **Ctrl+K** (**⌘K**) opens the command palette; **?** lists keyboard shortcuts.
 - **N** starts a new task; **n** starts one from a template, by its number. Save any task as a template with **Save as template**; manage them in **Task defaults**.

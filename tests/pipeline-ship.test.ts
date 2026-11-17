@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, onTestFailed } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -498,7 +498,14 @@ describe('software-dev: every branch of a task lands as its own pull request', (
     const repo = await h.makeRepo('ship-subtask-wiki');
     // Commit a page in this world's project-wiki checkout (a sibling of the code checkout).
     const note = (name: string) => `@run for d in ../*/; do case "$(git -C "$d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" in */wiki/project/*) mkdir -p "$d/memories/${name}" && printf 'from ${name}' > "$d/memories/${name}/MEMORY.md" && git -C "$d" add -A && git -C "$d" commit -qm ${name};; esac; done`;
+    // This test has timed out on slow CI runners (wiki ops/ci): the trail of
+    // what each step saw says where the time went when it fails.
+    const began = Date.now();
+    const trail: string[] = [];
+    const seen = (what: string) => { trail.push(`${((Date.now() - began) / 1000).toFixed(1)}s ${what}`); };
+    onTestFailed(() => { console.error(`sub-task wiki trail:\n  ${trail.join('\n  ')}`); });
     const { taskId, handle } = await start(repo, `${note('parent')}\n@subtask Child :: ${note('child')}\n@incomplete`);
+    seen('started');
     const wiki = ensureProjectWikiRepository(h.contentDir, (await h.store.getTask(taskId))!.projectId);
     const parentBranch = `tavya/${taskId}`;
     try {
@@ -506,16 +513,20 @@ describe('software-dev: every branch of a task lands as its own pull request', (
       await expect.poll(async () => (await view(handle)).subTasks?.length ?? 0, { timeout: 30_000 }).toBeGreaterThanOrEqual(1);
       const childId = (await view(handle)).subTasks[0] as string;
       const child = h.client.workflow.getHandle(childId);
+      seen(`sub-task ${childId}`);
       await expect.poll(async () => {
         const checkout = ((await view(child)).state?.recoveryWorld?.repos ?? []).find((r: any) => r.role === 'project-wiki');
         return checkout && [checkout.base, worldRepoTarget(checkout, '')];
       }, { timeout: 30_000 }).toEqual([parentBranch, parentBranch]);
+      seen('sub-task wiki stacked on the parent branch');
       // …and lands there once approved, wherever its own pull requests are.
       for (let n = 0; n < 20 && (await view(child)).stage !== 'done'; n++) {
         const v = await view(child);
+        seen(`round ${n}: sub-task ${v.stage}/${v.waitingFor?.kind ?? '-'}`);
         const open = v.subTasks?.length ? v.subTasks.map((id: string) => h.client.workflow.getHandle(id)) : [child];
         for (const pr of open) {
           const pv = await view(pr).catch(() => undefined);
+          if (pr !== child) seen(`  pull request ${pr.workflowId}: ${pv?.stage}/${pv?.waitingFor?.kind ?? '-'}`);
           if (pv?.stage === 'review' && pv.waitingFor?.kind === 'human') await pr.signal('confirm');
           if (pv?.stage === 'review' && pv.waitingFor?.kind === 'parent') await handle.signal('followUp', { id: `r${n}`, role: 'user', text: '@respond confirm', ts: 0 });
         }
@@ -528,11 +539,14 @@ describe('software-dev: every branch of a task lands as its own pull request', (
 
       // The parent finishes: its wiki goes to main through the parent's own
       // Review, carrying both pages — not as a pull request of its own.
+      seen('sub-task landed; parent opens its pull request');
       await handle.signal('followUp', { id: 'done', role: 'user', text: '@openpr', ts: 0 });
-      await expect.poll(async () => { const v = await view(handle); return `${v.stage}/${v.waitingFor?.kind}`; },
-        { timeout: 60_000 }).toBe('review/human');
+      await expect.poll(async () => { const v = await view(handle); const at = `${v.stage}/${v.waitingFor?.kind}`; seen(`parent ${at}`); return at; },
+        { timeout: 60_000, interval: 1000 }).toBe('review/human');
       await handle.signal('confirm');
+      seen('parent confirmed');
       expect((await handle.result()).stage).toBe('done');
+      seen('parent done');
       expect((await view(handle)).shipments ?? []).toHaveLength(0);
       expect((await git(wiki, ['show', 'main:memories/parent/MEMORY.md'])).stdout).toContain('from parent');
       expect((await git(wiki, ['show', 'main:memories/child/MEMORY.md'])).stdout).toContain('from child');

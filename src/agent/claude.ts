@@ -26,7 +26,9 @@ import {
   ProviderFailure,
   apiThrottle,
   classifyLimitError,
+  isNetworkEdgeBlock,
   isTransportError,
+  NetworkEdgeBlock,
   providerErrorFromMessage,
   providerFailure,
   SandboxProviderFailure,
@@ -86,10 +88,12 @@ export class ClaudeAdapter implements AgentAdapter {
     // before structured timeline events were introduced.
     ctx.emitActivity ??= () => {};
     const auth = input.resolvedAuth;
-    // Route on the turn's coordinator-resolved auth first:
-    // an API key → the Messages API (metered); a config home → the subscription
-    // login (Agent SDK). Only with no explicit lease material do we fall back to
-    // the ambient environment.
+    // Route on the turn's coordinator-resolved auth first: a model gateway →
+    // Claude Code pointed at it (wiki features/model-gateways); an API key →
+    // the Messages API (metered); a config home → the subscription login
+    // (Agent SDK). Only with no explicit lease material do we fall back to the
+    // ambient environment.
+    if (auth?.gateway) return this.runAgentSdk(input, ctx);
     if (auth?.apiKey) return this.runMessagesApi(input, ctx);
     if (auth?.configHome) return this.runAgentSdk(input, ctx);
     if (ClaudeAdapter.hasApiKey()) return this.runMessagesApi(input, ctx);
@@ -562,7 +566,17 @@ export class ClaudeAdapter implements AgentAdapter {
     // secrets are application credentials, never an override of that selection.
     // Keep explicit empty values: the SDK can merge ambient env back at the
     // final subprocess boundary. Runtime worlds bypass resource injection.
-    const subscriptionAuthEnv = {
+    // Through a model gateway, Claude Code sends its requests there with the
+    // gateway's credential as a bearer token (OpenRouter's documented setup:
+    // ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, an empty ANTHROPIC_API_KEY).
+    const gateway = input.resolvedAuth?.gateway;
+    const subscriptionAuthEnv: Record<string, string> = gateway ? {
+      ...gateway.env,
+      ANTHROPIC_BASE_URL: gateway.baseUrl,
+      ANTHROPIC_AUTH_TOKEN: gateway.apiKey,
+      ANTHROPIC_API_KEY: '',
+      CLAUDE_CODE_OAUTH_TOKEN: '',
+    } : {
       ANTHROPIC_API_KEY: '',
       ANTHROPIC_AUTH_TOKEN: '',
       CLAUDE_CODE_OAUTH_TOKEN: input.resolvedAuth?.oauthToken ?? '',
@@ -733,7 +747,8 @@ export class ClaudeAdapter implements AgentAdapter {
         // and never in the CLI, because the CLI always runs this preset). We keep
         // karmax's own task/tooling instructions by APPENDING them to the preset.
         systemPrompt: { type: 'preset', preset: 'claude_code', append: input.systemPrompt + unavailableNotice },
-        ...(input.profile.model ? { model: input.profile.model } : {}),
+        // The model as the gateway names it (OpenRouter: anthropic/claude-opus-5.5).
+        ...((gateway?.model ?? input.profile.model) ? { model: gateway?.model ?? input.profile.model } : {}),
         // Reasoning effort (SPEC §10.5); the SDK silently downgrades for models
         // that don't support the level, so no gating is needed here.
         ...(input.profile.effort ? { effort: input.profile.effort } : {}),
@@ -898,6 +913,11 @@ export class ClaudeAdapter implements AgentAdapter {
           // signal and routed the task to human escalation. Preserve the structured
           // error here, before the generic terminal-result handling can flatten it.
           const assistantError = (message as any).error ?? (message as any).message?.error;
+          // A network edge's block page answered instead of Anthropic. Claude Code
+          // tags any 403 `authentication_failed`, but the page judged this
+          // computer's address, not the login (tavya-error 3263761e3afa5929).
+          if (/^\s*(?:Failed to authenticate\.\s*)?API Error:/i.test(text) && isNetworkEdgeBlock(text))
+            throw new NetworkEdgeBlock('claude', text);
           if (assistantError === 'rate_limit') {
             const cls = classifyLimitError(text, { providerOrigin: true });
             throw providerFailure(text || 'Claude usage limit reached', {

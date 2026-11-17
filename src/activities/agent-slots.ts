@@ -67,11 +67,10 @@ interface LeaseRecord {
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // Effective free memory in MB, cgroup-aware. On a containerized host `os.freemem()`
-// reports the whole MACHINE, not this container's limit — so an agent can be
-// admitted "with 8 GB free" and then OOM-killed because the container itself is
-// out of memory. We also read the cgroup's own headroom and take the smaller of
-// the two. Detection is memoized so hosts without a cgroup limit don't stat sysfs
-// on every poll, and any read error falls back to the host figure.
+// reports the whole MACHINE (MemAvailable), not this container's limit — so an
+// agent can be admitted "with 8 GB free" and then OOM-killed because the container
+// itself is out of memory. We also read the cgroup's own headroom and take the
+// smaller of the two; any read error falls back to the host figure.
 function readCgroupInt(file: string): number | undefined {
   try {
     const raw = fs.readFileSync(file, 'utf8').trim();
@@ -82,32 +81,42 @@ function readCgroupInt(file: string): number | undefined {
     return undefined;
   }
 }
-function detectCgroupHeadroom(): () => number | undefined {
-  const read = (limitFile: string, usageFile: string) => (): number | undefined => {
-    const limit = readCgroupInt(limitFile);
-    const usage = readCgroupInt(usageFile);
-    // Ignore an absent or effectively-unlimited limit (>= host RAM): the host
-    // figure is the real constraint there.
-    if (limit === undefined || usage === undefined || limit >= os.totalmem()) return undefined;
-    return Math.max(0, limit - usage) / (1024 * 1024);
-  };
-  if (fs.existsSync('/sys/fs/cgroup/memory.max') && fs.existsSync('/sys/fs/cgroup/memory.current')) {
-    return read('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory.current'); // cgroup v2
+function readCgroupStat(file: string, key: string): number {
+  try {
+    const line = fs.readFileSync(file, 'utf8').split('\n').find((l) => l.startsWith(`${key} `));
+    const n = Number(line?.slice(key.length + 1));
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  } catch {
+    return 0;
   }
-  const v1limit = '/sys/fs/cgroup/memory/memory.limit_in_bytes';
-  const v1usage = '/sys/fs/cgroup/memory/memory.usage_in_bytes';
-  if (fs.existsSync(v1limit) && fs.existsSync(v1usage)) return read(v1limit, v1usage); // cgroup v1
-  return () => undefined;
 }
-let cgroupHeadroomMb: (() => number | undefined) | undefined;
+/** A cgroup's free memory in MB: its limit less its working set, or undefined
+ * when it has no limit below host RAM (then the host figure is the constraint).
+ * `memory.current` (v2) and `memory.usage_in_bytes` (v1) count the page cache,
+ * which grows to the limit on any file I/O and which the kernel reclaims before
+ * it OOM-kills anything: limit − usage read 500 MiB of a 7 GiB container that
+ * held 1.5 GiB of process memory (tavya-error 4b4c72ad37e1d771). The working set
+ * excludes the inactive file cache, as the kubelet's eviction signal and
+ * `docker stats` do; active file pages stay counted, so this errs on the tight
+ * side. */
+export function cgroupFreeMb(root = '/sys/fs/cgroup', hostTotalBytes = os.totalmem()): number | undefined {
+  const v2 = fs.existsSync(path.join(root, 'memory.max'));
+  const dir = v2 ? root : path.join(root, 'memory');
+  const limit = readCgroupInt(path.join(dir, v2 ? 'memory.max' : 'memory.limit_in_bytes'));
+  const usage = readCgroupInt(path.join(dir, v2 ? 'memory.current' : 'memory.usage_in_bytes'));
+  if (limit === undefined || usage === undefined || limit >= hostTotalBytes) return undefined;
+  // v1's hierarchical total includes child cgroups, like its usage does.
+  const inactiveFile = readCgroupStat(path.join(dir, 'memory.stat'), v2 ? 'inactive_file' : 'total_inactive_file');
+  const workingSet = Math.max(0, usage - inactiveFile);
+  return Math.max(0, limit - workingSet) / (1024 * 1024);
+}
 /** The tighter of host and cgroup free memory. Pure part, factored for testing. */
 export function tighterFreeMb(hostFreeMb: number, cgroupFreeMb: number | undefined): number {
   return cgroupFreeMb === undefined ? hostFreeMb : Math.min(hostFreeMb, cgroupFreeMb);
 }
 const freeMemMb = () => {
-  if (!cgroupHeadroomMb) cgroupHeadroomMb = detectCgroupHeadroom();
   let cg: number | undefined;
-  try { cg = cgroupHeadroomMb(); } catch { cg = undefined; }
+  try { cg = cgroupFreeMb(); } catch { cg = undefined; }
   return tighterFreeMb(os.freemem() / (1024 * 1024), cg);
 };
 const coreCount = () => os.cpus().length || 1;

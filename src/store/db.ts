@@ -17,7 +17,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import { sameRepository } from '../world/repository-identity.js';
-import { parseHostedUrl, type HostedRepositoryState } from '../domain/hosted-repository.js';
+import { hostedRepositoryUrl, landsByPushOnTavya, parseHostedUrl, type HostedRepositoryState } from '../domain/hosted-repository.js';
 import { pinTarget, workingFolder, worldCheckoutNames } from '../domain/world-location.js';
 import { isPostgresTarget, openSqlDatabase, type SqlDatabase } from './sql.js';
 import { watchAuthorityWrites } from './authorization-epoch.js';
@@ -37,6 +37,7 @@ import {
   ChildTaskSummary,
   ForkTaskSummary,
   ReviewInfo,
+  ReviewAction,
   KarmaxEvent,
   Tag,
   SavedView,
@@ -111,6 +112,7 @@ import { lifecycleEventPayload } from '../domain/view-publication.js';
 import { listState } from '../domain/list-state.js';
 import { taskForkSourceIds } from '../domain/forks.js';
 import { coordinatorSetting } from '../domain/coordinator.js';
+import type { SiteAnalyticsCount, SiteAnalyticsRow, SiteVisitorMark } from '../domain/site-analytics.js';
 
 /** How many dismissals a person's preferences keep (the newest). */
 const MAX_DISMISSED = 500;
@@ -578,13 +580,21 @@ export class Store {
           delete config[key];
         configChanged = true;
       }
-      // A hosted world's local merge is not a durable delivery destination.
-      // Migrate both an absent old default and an explicit old `none` choice.
-      // Workflow inputs already recorded in Temporal are unaffected; only new
-      // starts read this project/settings state.
-      if (process.env.KARMAX_DEPLOYMENT === 'hosted'
-        && (config.remote === undefined || config.remote === 'none')) {
+      // A hosted world's local merge is not a durable delivery destination:
+      // an explicit old `none` choice becomes `pr`. An absent one stays absent,
+      // which effectiveProjectConfig reads as the hosted default (`pr`, or `push`
+      // on repositories tavya hosts). Workflow inputs already recorded in
+      // Temporal are unaffected; only new starts read this project/settings state.
+      if (process.env.KARMAX_DEPLOYMENT === 'hosted' && config.remote === 'none') {
         config.remote = 'pr';
+        configChanged = true;
+      }
+      // A `pr` stored on repositories tavya hosts was that default written down
+      // (it was, until 2026-11-14): pull requests need GitHub, so it never
+      // applied, but Task defaults showed it as the project's own choice. Absent,
+      // the project opens pull requests again once its code moves to GitHub.
+      if (process.env.KARMAX_DEPLOYMENT === 'hosted' && config.remote === 'pr' && landsByPushOnTavya(config.repos)) {
+        delete config.remote;
         configChanged = true;
       }
       if (configChanged)
@@ -896,6 +906,18 @@ export class Store {
         meter TEXT NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (meter, day)
       );
+      -- Web analytics of the public site (wiki features/site-analytics):
+      -- counts only, by UTC day; kind is view | visitor | signup | crawl.
+      CREATE TABLE IF NOT EXISTS site_analytics (
+        day TEXT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL, source TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, kind, path, source)
+      );
+      -- Who was already counted today: a hash under the day's salt, both
+      -- deleted within 48 hours, so nothing follows a person across days.
+      CREATE TABLE IF NOT EXISTS site_visitors (
+        day TEXT NOT NULL, mark TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY (day, mark, hash)
+      );
+      CREATE TABLE IF NOT EXISTS site_salts (day TEXT PRIMARY KEY, salt TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS usage_events (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT, taskId TEXT,
         worldId TEXT, provider TEXT NOT NULL, kind TEXT NOT NULL, quantity REAL NOT NULL,
@@ -911,7 +933,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS compute_holds (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, taskId TEXT, worldId TEXT, provider TEXT NOT NULL,
         purpose TEXT NOT NULL, activeMicrosPerHour INTEGER NOT NULL, diskMicrosPerHour INTEGER NOT NULL,
-        startedAt INTEGER NOT NULL, endsAt INTEGER NOT NULL, closedAt INTEGER
+        startedAt INTEGER NOT NULL, endsAt INTEGER NOT NULL, closedAt INTEGER, amountMicros INTEGER
       );
       CREATE TABLE IF NOT EXISTS compute_topups (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, state TEXT NOT NULL, creditMicros INTEGER NOT NULL,
@@ -1473,6 +1495,9 @@ export class Store {
     // so it no longer scans the whole usage ledger at each start (PS-5).
     (await this.db.exec("CREATE INDEX IF NOT EXISTS idx_usage_unclassified ON usage_events(id) WHERE costMicros>0 AND costClassification='none'"));
     (await this.db.exec("UPDATE usage_events SET costClassification='incurred' WHERE costMicros>0 AND costClassification='none'"));
+    const computeHoldCols = (await this.db.prepare('PRAGMA table_info(compute_holds)').all()) as { name: string }[];
+    if (!computeHoldCols.some((c) => c.name === 'amountMicros'))
+      (await this.db.exec('ALTER TABLE compute_holds ADD COLUMN amountMicros INTEGER'));
     const usageAdmissionCols = (await this.db.prepare('PRAGMA table_info(usage_admissions)').all()) as { name: string }[];
     if (!usageAdmissionCols.some((c) => c.name === 'reservedCostMicros'))
       (await this.db.exec('ALTER TABLE usage_admissions ADD COLUMN reservedCostMicros INTEGER NOT NULL DEFAULT 0'));
@@ -1910,7 +1935,6 @@ export class Store {
     if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
     const planLimit = (await this.organizationEntitlements(organizationId)).maxActiveAgentRuns ?? 10_000;
     const fallback: Omit<OrganizationUsagePolicy, 'effectiveMaxActiveAgentTurns'> = {
-      managedModelProviders: [],
       allowedModelProviders: [],
       allowedModels: [],
       maxAgentStartsPerMinute: this.hosted ? 60 : 10_000,
@@ -1921,11 +1945,13 @@ export class Store {
     let saved: Partial<OrganizationUsagePolicy> = {};
     if (raw) try { saved = JSON.parse(raw); } catch { saved = {}; }
     delete saved.effectiveMaxActiveAgentTurns;
+    // Retired with the environment-keyed managed model rail (wiki features/model-gateways).
+    delete (saved as Record<string, unknown>).managedModelProviders;
+    delete (saved as Record<string, unknown>).managedSpendCapMicros;
     const ownerLimit = Number.isSafeInteger(saved.maxActiveAgentTurns) && saved.maxActiveAgentTurns! > 0
       ? saved.maxActiveAgentTurns : undefined;
     const effectiveAgentLimit = ownerLimit == null ? planLimit : Math.min(ownerLimit, planLimit);
     return { ...fallback, ...saved,
-      managedModelProviders: [...(saved.managedModelProviders ?? [])],
       allowedModelProviders: [...(saved.allowedModelProviders ?? [])],
       allowedModels: [...(saved.allowedModels ?? [])],
       ...(ownerLimit == null ? {} : { maxActiveAgentTurns: ownerLimit }),
@@ -1946,8 +1972,6 @@ export class Store {
     if (this.hosted) delete effectivePatch.maxActiveWorlds;
     const next = { ...current, ...effectivePatch } as OrganizationUsagePolicy;
     delete (next as Partial<OrganizationUsagePolicy>).effectiveMaxActiveAgentTurns;
-    if (Object.prototype.hasOwnProperty.call(patch, 'managedSpendCapMicros')
-      && (patch as any).managedSpendCapMicros == null) delete next.managedSpendCapMicros;
     if (Object.prototype.hasOwnProperty.call(patch, 'maxActiveAgentTurns')
       && (patch as any).maxActiveAgentTurns == null) delete next.maxActiveAgentTurns;
     const normalized = (values: unknown, label: string): string[] => {
@@ -1957,7 +1981,6 @@ export class Store {
         throw new Error(`${label} contains an invalid value`);
       return out;
     };
-    next.managedModelProviders = normalized(next.managedModelProviders, 'managed model providers');
     next.allowedModelProviders = normalized(next.allowedModelProviders, 'allowed model providers');
     next.allowedModels = normalized(next.allowedModels, 'allowed models');
     for (const [key, value] of Object.entries({
@@ -1971,8 +1994,6 @@ export class Store {
     const planLimit = (await this.organizationEntitlements(organizationId)).maxActiveAgentRuns;
     if (next.maxActiveAgentTurns != null && planLimit != null)
       next.maxActiveAgentTurns = Math.min(next.maxActiveAgentTurns, planLimit);
-    if (next.managedSpendCapMicros != null && (!Number.isSafeInteger(next.managedSpendCapMicros) || next.managedSpendCapMicros < 1))
-      throw new Error('managed spend cap must be a positive integer');
     const persisted: Partial<OrganizationUsagePolicy> = { ...next };
     delete persisted.effectiveMaxActiveAgentTurns;
     if (this.hosted) delete persisted.maxActiveWorlds;
@@ -2010,7 +2031,7 @@ export class Store {
     // delivery and its `none` default.
     // A project on repositories tavya hosts has no pull requests to open: it
     // lands by merging and pushing the target itself (world/hosted-git.ts).
-    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && config.repos?.length && config.repos.every((repo) => parseHostedUrl(repo)))
+    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && landsByPushOnTavya(config.repos))
       config.remote = 'push';
     else if (process.env.KARMAX_DEPLOYMENT === 'hosted' && (config.remote === undefined || config.remote === 'none'))
       config.remote = 'pr';
@@ -3996,6 +4017,29 @@ export class Store {
     return !!(await this.db.prepare('SELECT 1 FROM project_wikis WHERE repositoryId=? LIMIT 1').get(repositoryId));
   }
 
+  /** The project's wiki repository, made on tavya and linked when it has none
+   * (src/wiki/project-wiki-remote.ts). One transaction under the organization's
+   * lock, so the gateway and several world set-ups racing link one repository;
+   * a retry after a crash adopts the unattached one it had made. */
+  async linkHostedProjectWiki(projectId: string, name: string): Promise<Repository> {
+    return this.db.transaction(async () => {
+      const project = await this.lockProjectOrganization(projectId);
+      if (!project) throw new Error(`no project ${projectId}`);
+      const current = (await this.projectWiki(projectId))?.repository;
+      if (current) return current;
+      const organizationId = project.organizationId ?? 'org_personal';
+      const named = (await this.listRepositories(organizationId))
+        .find((candidate) => candidate.provider === 'tavya' && candidate.name.toLowerCase() === name.toLowerCase());
+      if (named && ((await this.projectIdsForRepository(named.id)).length || (await this.repositoryIsProjectWiki(named.id))))
+        throw new Error(`the repository ${name} is already in use; rename it to give this project's wiki its name`);
+      const id = newId('repo');
+      const repository = named ?? await this.upsertRepository({ id, organizationId, provider: 'tavya', owner: organizationId, name,
+        sshUrl: hostedRepositoryUrl(id, name), defaultBranch: 'main', private: true });
+      await this.setProjectWikiRepository(projectId, repository.id);
+      return repository;
+    });
+  }
+
   async setProjectWikiRepository(projectId: string, repositoryId?: string): Promise<void> {
     return this.db.transaction(async () => {
 
@@ -4813,13 +4857,28 @@ export class Store {
     });
   }
 
-  /** Runs spawned from a series (repeatable template), newest first.
-   *  Filtered in SQL — this is reachable unpaginated from an HTTP request, so the
-   *  old whole-table scan + JS filter was a per-request full transcript hydration. */
+  /** Runs spawned from a series (repeatable template), newest first, archived
+   *  ones included. Filtered in SQL, and without their conversations: a daily
+   *  series has hundreds of runs, and its lists need each one's status only. */
   async runsOf(seriesId: string): Promise<TaskRecord[]> {
-    return ((await this.db.prepare(`SELECT * FROM tasks
-      WHERE json_extract(params, '$.runOf') = ? ORDER BY createdAt DESC`).all(seriesId)) as any[])
+    return ((await this.db.prepare(`SELECT
+        id, num, projectId, listId, title, workflow, executionWorkflow, workflowVersion, params, createdAt,
+        statusChangedAt, ord, parentTaskId, createdBy, createdVia, assignee, delegate, confirmationPolicy,
+        intentId, attemptNumber, notes,
+        CASE WHEN lastView IS NULL THEN NULL ELSE json_remove(lastView, '$.messages', '$.transcripts', '$.reviewInfo') END AS lastView
+      FROM tasks WHERE json_extract(params, '$.runOf') = ? ORDER BY createdAt DESC`).all(seriesId)) as any[])
       .map(rowToTask);
+  }
+
+  /** How many runs each series has spawned, archived ones included (0 for none). */
+  async runCounts(seriesIds: string[]): Promise<Map<string, number>> {
+    const counts = new Map(seriesIds.map((id) => [id, 0]));
+    if (!seriesIds.length) return counts;
+    const rows = (await this.db.prepare(`SELECT json_extract(params, '$.runOf') AS series, COUNT(*) AS n FROM tasks
+      WHERE json_extract(params, '$.runOf') IN (${seriesIds.map(() => '?').join(',')})
+      GROUP BY json_extract(params, '$.runOf')`).all(...seriesIds)) as { series: string; n: number | string }[];
+    for (const row of rows) counts.set(row.series, Number(row.n));
+    return counts;
   }
 
   /** The status of some of a parent's children, without their conversations. */
@@ -5949,6 +6008,9 @@ export class Store {
         // remain a deterministic resolver for automated/delegated tasks.
         for (const member of (await this.listOrganizationMemberships(project.organizationId)))
           if (member.role === 'owner') users.push(member.userId);
+        // A project's own vault item is also its maintainers' to decide (owner-authority.ts).
+        if (ev.payload.ownerProjectId && ev.payload.ownerProjectId === task.projectId)
+          users.push(...(await this.humanAudience(task.id, ['@maintainers'])));
       }
     } else if (ev.type === 'permission.approval-requested' || ev.type === 'authorization.approval-requested'
       || ev.type === 'repository-access.approval-requested') {
@@ -8842,6 +8904,81 @@ export class Store {
     });
   }
 
+  // ── Site analytics (wiki features/site-analytics; src/platform/site-analytics.ts) ──
+
+  /** The salt of `day`'s visitor hashes: the first process to ask sets it, every other gets the same. */
+  async siteAnalyticsSalt(day: string, candidate: string): Promise<string> {
+    return this.db.transaction(async () => {
+      (await this.db.prepare('INSERT INTO site_salts (day, salt) VALUES (?, ?) ON CONFLICT(day) DO NOTHING').run(day, candidate));
+      const row = (await this.db.prepare('SELECT salt FROM site_salts WHERE day=?').get(day)) as { salt: string } | undefined;
+      return row?.salt ?? candidate;
+    });
+  }
+
+  /** Add a batch of counts, and count each visitor hash the day has not seen
+   * (once as a visitor, once more if they opened sign-up). Safe with several
+   * gateway processes: the hashes' primary key decides who is new, and every
+   * count is an atomic increment. */
+  async recordSiteAnalytics(batch: { counts: SiteAnalyticsCount[]; visitors: SiteVisitorMark[] }): Promise<void> {
+    const CHUNK = 200;
+    return this.db.transaction(async () => {
+      const totals = new Map<string, SiteAnalyticsCount>();
+      const add = (count: SiteAnalyticsCount) => {
+        const key = [count.day, count.kind, count.path, count.source].join('\n');
+        const entry = totals.get(key);
+        if (entry) entry.n += count.n; else totals.set(key, { ...count });
+      };
+      for (const count of batch.counts) add(count);
+      const marks = new Map(batch.visitors.map((visitor) => [[visitor.day, visitor.mark, visitor.hash].join('\n'), visitor]));
+      // A stable order, so concurrent writers take row locks in the same order.
+      const visitors = [...marks.keys()].sort();
+      for (let at = 0; at < visitors.length; at += CHUNK) {
+        const chunk = visitors.slice(at, at + CHUNK).map((key) => marks.get(key)!);
+        const inserted = (await this.db.prepare(`INSERT INTO site_visitors (day, mark, hash) VALUES ${chunk.map(() => '(?, ?, ?)').join(', ')}
+          ON CONFLICT DO NOTHING RETURNING day, mark, hash`).all(...chunk.flatMap((visitor) => [visitor.day, visitor.mark, visitor.hash]))) as Array<{ day: string; mark: string; hash: string }>;
+        for (const row of inserted) {
+          const visitor = marks.get([row.day, row.mark, row.hash].join('\n'))!;
+          add({ day: visitor.day, kind: visitor.mark === 'signup' ? 'signup' : 'visitor', path: visitor.path, source: visitor.source, n: 1 });
+        }
+      }
+      const counts = [...totals.keys()].sort().map((key) => totals.get(key)!);
+      for (let at = 0; at < counts.length; at += CHUNK) {
+        const chunk = counts.slice(at, at + CHUNK);
+        (await this.db.prepare(`INSERT INTO site_analytics (day, kind, path, source, count) VALUES ${chunk.map(() => '(?, ?, ?, ?, ?)').join(', ')}
+          ON CONFLICT(day, kind, path, source) DO UPDATE SET count = site_analytics.count + excluded.count`)
+          .run(...chunk.flatMap((count) => [count.day, count.kind, count.path, count.source, count.n])));
+      }
+    });
+  }
+
+  /** Delete the salts and visitor hashes of days before `beforeDay` (YYYY-MM-DD, UTC). */
+  async pruneSiteVisitors(beforeDay: string): Promise<void> {
+    return this.db.transaction(async () => {
+      (await this.db.prepare('DELETE FROM site_visitors WHERE day<?').run(beforeDay));
+      (await this.db.prepare('DELETE FROM site_salts WHERE day<?').run(beforeDay));
+    });
+  }
+
+  /** The counted rows of the days `fromDay` to `toDay` (inclusive, UTC). */
+  async siteAnalyticsRows(fromDay: string, toDay: string): Promise<SiteAnalyticsRow[]> {
+    const rows = (await this.db.prepare(`SELECT day, kind, path, source, count FROM site_analytics WHERE day>=? AND day<=?`)
+      .all(fromDay, toDay)) as Array<{ day: string; kind: SiteAnalyticsCount['kind']; path: string; source: string; count: number | string }>;
+    return rows.map((row) => ({ day: String(row.day), kind: row.kind, path: String(row.path), source: String(row.source), count: Number(row.count) }));
+  }
+
+  /** For each organization whose first task (not a draft, not a sub-task) was
+   * created, or first task confirmed, between `from` and `to` (epoch ms,
+   * inclusive): when. The sign-up funnel's last two steps. */
+  async organizationFirstTasks(from: number, to: number): Promise<{ started: number[]; confirmed: number[] }> {
+    const rows = (await this.db.prepare(`SELECT MIN(t.createdAt) AS started, MIN(t.completedAt) AS confirmed
+      FROM tasks t JOIN projects p ON p.id=t.projectId
+      WHERE t.parentTaskId IS NULL AND COALESCE(json_extract(t.params, '$.draft'), 0) = 0
+      GROUP BY COALESCE(p.organizationId, 'org_personal')`).all()) as Array<{ started: number | string | null; confirmed: number | string | null }>;
+    const within = (value: number | string | null) => value != null && Number(value) >= from && Number(value) <= to;
+    return { started: rows.filter((row) => within(row.started)).map((row) => Number(row.started)),
+      confirmed: rows.filter((row) => within(row.confirmed)).map((row) => Number(row.confirmed)) };
+  }
+
   /** Seconds of `world.active` metered for one organization and provider that
    * started since `since` (by start time, so idx_usage_org_time serves it). */
   async worldActiveSeconds(organizationId: string, provider: string, since: number): Promise<number> {
@@ -9006,10 +9143,7 @@ export class Store {
 
   async admitAgentUsage(input: { id: string; organizationId: string; projectId: string; taskId: string;
     provider: string; model?: string; fundingSource: 'managed' | 'byok' | 'customer';
-    reservedCostMicros?: number; now?: number; retryOf?: string | string[];
-    /** tavya's included model: the organization's compute credit bounds it
-     * (its key's limit, src/agent/included-model.ts), not an owner's spend cap. */
-    included?: boolean }): Promise<{ reused: boolean }> {
+    now?: number; retryOf?: string | string[] }): Promise<{ reused: boolean }> {
     return this.db.transaction(async () => {
 
     const now = input.now ?? Date.now();
@@ -9033,13 +9167,6 @@ export class Store {
       throw new Error(`model provider ${input.provider} is not allowed by the organization`);
     if (input.model && policy.allowedModels.length && !policy.allowedModels.includes(input.model))
       throw new Error(`model ${input.model} is not allowed by the organization`);
-    if (input.fundingSource === 'managed' && !input.included) {
-      if (!policy.managedSpendCapMicros) throw new Error('managed model usage is disabled until an organization owner sets a spend cap');
-      if (!policy.managedModelProviders.includes(input.provider))
-        throw new Error(`managed ${input.provider} usage is not enabled for this organization`);
-      if (!Number.isSafeInteger(input.reservedCostMicros) || input.reservedCostMicros! < 1)
-        throw new Error('managed model usage has no installation-configured per-request cost ceiling');
-    }
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
       for (const priorId of input.retryOf ? [input.retryOf].flat() : []) {
@@ -9054,29 +9181,17 @@ export class Store {
             .run(now, priorId);
         }
       }
-      const assertManagedCapacity = async () => {
-        if (input.fundingSource !== 'managed' || input.included) return;
-        const month = monthWindow(now);
-        const spent = (await this.usageSummary(input.organizationId, month.from, month.to)).byFundingSource.managed ?? 0;
-        const reserved = Number(((await this.db.prepare(`SELECT COALESCE(SUM(reservedCostMicros), 0) n FROM usage_admissions
-          WHERE organizationId=? AND fundingSource='managed' AND state='active'
-            AND NOT EXISTS (SELECT 1 FROM usage_events WHERE id='usage:cost:' || usage_admissions.id)`).get(input.organizationId)) as any).n);
-        if (spent + reserved + input.reservedCostMicros! > policy.managedSpendCapMicros!)
-          throw new Error('organization managed spend cap is exhausted');
-      };
       const existing = (await this.db.prepare('SELECT * FROM usage_admissions WHERE id=?').get(input.id)) as any;
       if (existing) {
         if (existing.organizationId !== input.organizationId || existing.projectId !== input.projectId
           || existing.taskId !== input.taskId || existing.provider !== input.provider
-          || existing.fundingSource !== input.fundingSource || (existing.model ?? undefined) !== input.model
-          || Number(existing.reservedCostMicros) !== Number(input.reservedCostMicros ?? 0))
+          || existing.fundingSource !== input.fundingSource || (existing.model ?? undefined) !== input.model)
           throw new Error('usage admission retry key belongs to different attributed work');
         if (existing.state === 'active') {
           (await this.db.exec('COMMIT'));
           return { reused: true };
         }
         if (existing.state === 'released') {
-          (await assertManagedCapacity());
           const active = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM usage_admissions
             WHERE organizationId=? AND kind='agent' AND state='active'`).get(input.organizationId)) as any).n);
           if (active >= policy.effectiveMaxActiveAgentTurns) throw new AdmissionBackpressureError('organization active model turn limit reached');
@@ -9087,7 +9202,6 @@ export class Store {
         (await this.db.exec('COMMIT'));
         throw new Error('this model turn was already completed; refusing duplicate provider admission');
       }
-      (await assertManagedCapacity());
       const minute = now - 60_000;
       const recent = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM usage_admissions
         WHERE organizationId=? AND kind='agent' AND createdAt>=?`).get(input.organizationId, minute)) as any).n);
@@ -9098,7 +9212,7 @@ export class Store {
       (await this.db.prepare(`INSERT INTO usage_admissions (id, organizationId, projectId, taskId, kind, provider, model,
         fundingSource, state, reservedCostMicros, createdAt) VALUES (?, ?, ?, ?, 'agent', ?, ?, ?, 'active', ?, ?)`)
         .run(input.id, input.organizationId, input.projectId, input.taskId, input.provider, input.model ?? null,
-          input.fundingSource, input.reservedCostMicros ?? 0, now));
+          input.fundingSource, 0, now));
       (await this.db.exec('COMMIT'));
       return { reused: false };
     } catch (error) {
@@ -9207,7 +9321,7 @@ export class Store {
       .all(organizationId, now - COMPUTE_HOLD_SETTLE_MS, ...(exceptId ? [exceptId] : []))) as Array<Record<string, unknown>>;
     if (!holds.length) return 0;
     const booked = (await this.computeBookedUntil(organizationId, [...new Set(holds.map((hold) => String(hold.taskId ?? '')))]));
-    return Math.round(holds.reduce((total, hold) => total + heldCost(hold, booked.get(String(hold.taskId ?? ''))), 0));
+    return Math.round(holds.reduce((total, hold) => total + heldCost(hold, booked.get(String(hold.taskId ?? '')), now), 0));
   }
 
   /** When the provider's booked managed usage of each task ends, per kind. */
@@ -9246,7 +9360,7 @@ export class Store {
       const row = { ...existing, ...input, startedAt, endsAt: now, closedAt: null };
       const booked = (await this.computeBookedUntil(input.organizationId, [input.taskId ?? ''])).get(input.taskId ?? '');
       // What this work has run since its last booked usage is owed whatever happens next.
-      const owed = heldCost(row, booked);
+      const owed = heldCost(row, booked, now);
       const free = creditMicros - used - computeChargeMicros(held + owed, multiplier);
       const perMs = computeChargeMicros(input.activeMicrosPerHour + input.diskMicrosPerHour, multiplier) / 3_600_000;
       const fits = perMs > 0 ? now + Math.max(0, free) / perMs : Infinity;
@@ -9261,6 +9375,39 @@ export class Store {
           Math.round(input.activeMicrosPerHour), Math.round(input.diskMicrosPerHour), startedAt, keep));
       return { endsAt: keep, startedAt };
     });
+  }
+
+  /** Reserve a lump sum (a generation's quote: wiki features/generate),
+   * in provider cost micros, until `until` or until closed — when what it
+   * actually cost has been booked. Under the organization's usage lock, so
+   * two generations never both take its last dollars. Refused (false,
+   * nothing changed) when the credit cannot cover it. `creditMicros` as for
+   * holdCompute. */
+  async holdSpend(input: { id: string; organizationId: string; taskId?: string; provider: string; amountMicros: number; until: number },
+    creditMicros: number, now = Date.now()): Promise<boolean> {
+    return this.db.transaction(async () => {
+      (await this.db.lock(`usage:${input.organizationId}`));
+      const month = monthWindow(now);
+      const used = (await this.managedComputeCosts(month.from, month.to, input.organizationId)).reduce((total, row) => total + row.chargedMicros, 0);
+      const held = (await this.computeHeldCostMicros(input.organizationId, now, input.id));
+      const multiplier = await this.computePriceMultiplier(input.organizationId, now);
+      if (creditMicros - used - computeChargeMicros(held + input.amountMicros, multiplier) < 0) return false;
+      // A lump hold names no task for computeBookedUntil: a task's machine
+      // usage must not release it; only closing it does.
+      (await this.db.prepare(`INSERT INTO compute_holds (id, organizationId, taskId, worldId, provider, purpose,
+        activeMicrosPerHour, diskMicrosPerHour, startedAt, endsAt, closedAt, amountMicros) VALUES (?, ?, NULL, NULL, ?, 'generation', 0, 0, ?, ?, NULL, ?)
+        ON CONFLICT(id) DO UPDATE SET amountMicros=excluded.amountMicros, endsAt=excluded.endsAt, closedAt=NULL`)
+        .run(input.id, input.organizationId, input.provider, now, Math.floor(input.until), Math.round(input.amountMicros)));
+      return true;
+    });
+  }
+
+  /** What open lump-sum holds on `provider` reserve now, provider cost micros. */
+  async openSpendHoldsMicros(organizationId: string, provider: string, now = Date.now()): Promise<number> {
+    const row = (await this.db.prepare(`SELECT COALESCE(SUM(amountMicros), 0) n FROM compute_holds
+      WHERE organizationId=? AND provider=? AND amountMicros IS NOT NULL AND closedAt IS NULL AND endsAt>?`)
+      .get(organizationId, provider, now)) as { n?: number } | undefined;
+    return Number(row?.n ?? 0);
   }
 
   /** The work a hold covered ended at `at`: what it reserved past then is free. */
@@ -9532,6 +9679,41 @@ export class Store {
   async listPromotedArtifacts(taskId: string): Promise<PromotedArtifact[]> {
     return ((await this.db.prepare('SELECT * FROM promoted_artifacts WHERE taskId=? ORDER BY createdAt DESC').all(taskId)) as any[])
       .map((row) => ({ ...row, expiresAt: row.expiresAt ?? undefined }));
+  }
+
+  /** A project's tasks whose Review attached something, compact: one row per
+   * logical task (its principal attempt), with its status, its Review actions
+   * and its world (where relative targets sit). For the artifact gallery. */
+  async reviewAttachmentTasks(projectId: string): Promise<Array<{ id: string; num?: number; title: string; status?: string;
+    stage?: string; actions: ReviewAction[]; world?: WorldHandleRef; createdAt: number; statusChangedAt?: number }>> {
+    const rows = (await this.db.prepare(`SELECT t.id, COALESCE(t.num, root.num) AS resolvedNum, t.title, t.createdAt, t.statusChangedAt,
+        json_extract(t.lastView, '$.status') AS status, json_extract(t.lastView, '$.stage') AS stage,
+        json_extract(t.lastView, '$.reviewInfo.actions') AS actions, json_extract(t.lastView, '$.world') AS world
+      FROM tasks t
+      JOIN task_intents i ON i.id=t.intentId AND i.principalAttemptId=t.id
+      JOIN tasks root ON root.id=i.id
+      WHERE t.projectId=? AND t.lastView IS NOT NULL AND ${notPullRequestSql(this.db.dialect)}
+        AND json_extract(t.lastView, '$.reviewInfo.actions') IS NOT NULL`).all(projectId)) as any[];
+    const parse = (value: unknown) => { try { return typeof value === 'string' ? JSON.parse(value) : value ?? undefined; } catch { return undefined; } };
+    return rows.map((row) => ({ id: row.id, ...(row.resolvedNum != null ? { num: Number(row.resolvedNum) } : {}), title: row.title,
+      ...(row.status ? { status: String(row.status) } : {}), ...(row.stage ? { stage: String(row.stage) } : {}),
+      actions: Array.isArray(parse(row.actions)) ? parse(row.actions) : [], ...(parse(row.world) ? { world: parse(row.world) } : {}),
+      createdAt: Number(row.createdAt), ...(row.statusChangedAt != null ? { statusChangedAt: Number(row.statusChangedAt) } : {}) }));
+  }
+
+  /** The saved Review copies of a project's tasks, and each task's index of
+   * them (`review-artifacts:<task>`: target hash → artifact id). */
+  async reviewArtifactsOf(projectId: string, taskIds: string[]): Promise<{ artifacts: Map<string, PromotedArtifact>; indexes: Map<string, Record<string, string>> }> {
+    const artifacts = new Map(((await this.db.prepare(`SELECT * FROM promoted_artifacts WHERE projectId=? AND id LIKE 'review-%'`).all(projectId)) as any[])
+      .map((row) => [row.id as string, { ...row, bytes: Number(row.bytes), createdAt: Number(row.createdAt),
+        expiresAt: row.expiresAt == null ? undefined : Number(row.expiresAt) } as PromotedArtifact]));
+    const indexes = new Map<string, Record<string, string>>();
+    for (let at = 0; at < taskIds.length; at += 200) {
+      const keys = taskIds.slice(at, at + 200).map((id) => `review-artifacts:${id}`);
+      const rows = (await this.db.prepare(`SELECT k, v FROM kv WHERE k IN (${keys.map(() => '?').join(', ')})`).all(...keys)) as Array<{ k: string; v: string }>;
+      for (const row of rows) { try { indexes.set(row.k.slice('review-artifacts:'.length), JSON.parse(row.v)); } catch { /* unreadable: no saved copies */ } }
+    }
+    return { artifacts, indexes };
   }
 
   async deletePromotedArtifact(id: string): Promise<PromotedArtifact | undefined> {
@@ -10555,12 +10737,48 @@ export class Store {
     return r ? JSON.parse(r.json) : undefined;
   }
 
+  /** A delegation's row whatever its state (revoked, expired): why it lapsed. */
+  async humanDelegationRow(id: string): Promise<{ record: Record<string, unknown>; revokedAt?: number } | undefined> {
+    const r = (await this.db.prepare('SELECT json, revokedAt FROM human_delegations WHERE id=?').get(id)) as any;
+    return r ? { record: JSON.parse(r.json), revokedAt: r.revokedAt == null ? undefined : Number(r.revokedAt) } : undefined;
+  }
+
   async revokeHumanDelegation(id: string): Promise<void> {
     return this.db.transaction(async () => {
 
+    const row = (await this.db.prepare('SELECT json FROM human_delegations WHERE id=? AND revokedAt IS NULL').get(id)) as any;
     (await this.db.prepare('UPDATE human_delegations SET revokedAt=? WHERE id=?').run(Date.now(), id));
+    if (row) (await this.handDerivedDelegationsUp(new Map([[id, JSON.parse(row.json) as Record<string, unknown>]])));
   
     });
+  }
+
+  /**
+   * The delegations derived from ones just revoked, and not revoked with them,
+   * are handed to their nearest ancestor that was not, or stand on their own.
+   * Revocation is by scope (a task, project, organization or person), and a
+   * delegation derived from another lies within it, so one the scope does not
+   * reach must not lapse because its source did: a run of a deleted series, an
+   * attempt or sub-task whose source task was deleted (task_mwhwdr1i47e5d65f20).
+   * It keeps the bounds it was issued within, its expiry among them.
+   */
+  private async handDerivedDelegationsUp(revoked: Map<string, Record<string, unknown>>): Promise<void> {
+    if (!revoked.size) return;
+    const reparent = this.db.prepare('UPDATE human_delegations SET json=? WHERE id=? AND revokedAt IS NULL');
+    for (const row of (await this.db.prepare('SELECT id, json FROM human_delegations WHERE revokedAt IS NULL').all()) as any[]) {
+      try {
+        const record = JSON.parse(row.json) as Record<string, unknown>;
+        let parent = record.parentDelegationId as string | undefined;
+        if (!parent || !revoked.has(parent)) continue;
+        const seen = new Set<string>();
+        while (parent && revoked.has(parent) && !seen.has(parent)) {
+          seen.add(parent);
+          parent = revoked.get(parent)!.parentDelegationId as string | undefined;
+        }
+        const { parentDelegationId: _gone, ...rest } = record;
+        (await reparent.run(JSON.stringify(parent ? { ...rest, parentDelegationId: parent } : rest), row.id));
+      } catch { /* malformed historical state is unusable, but must not block revocation */ }
+    }
   }
 
   async revokeHumanDelegationsForTask(taskId: string): Promise<number> {
@@ -10577,6 +10795,7 @@ export class Store {
     const update = this.db.prepare('UPDATE human_delegations SET revokedAt=? WHERE id=? AND revokedAt IS NULL');
     const narrow = this.db.prepare('UPDATE human_delegations SET json=? WHERE id=? AND revokedAt IS NULL');
     let revoked = 0;
+    const gone = new Map<string, Record<string, unknown>>();
     for (const row of (await this.db.prepare('SELECT id, json FROM human_delegations WHERE revokedAt IS NULL').all()) as any[]) {
       try {
         const record = JSON.parse(row.json) as Record<string, unknown>;
@@ -10595,9 +10814,10 @@ export class Store {
             (await narrow.run(JSON.stringify({ ...record, projectIds: others }), row.id));
           else revoke = true;
         }
-        if (revoke) revoked += Number((await update.run(Date.now(), row.id)).changes);
+        if (revoke && Number((await update.run(Date.now(), row.id)).changes)) { revoked++; gone.set(String(row.id), record); }
       } catch { /* malformed historical state is unusable, but must not block cleanup */ }
     }
+    (await this.handDerivedDelegationsUp(gone));
     return revoked;
   
     });
@@ -10689,6 +10909,21 @@ export class Store {
   async purgeHumanDelegations(now = Date.now()): Promise<number> {
     return this.db.transaction(async () => {
 
+    // Before this sweep forgets them: a live delegation whose source was
+    // revoked (or already purged) before revocation handed what was derived
+    // from it up is handed up now (handDerivedDelegationsUp).
+    const rows = (await this.db.prepare('SELECT id, json, revokedAt FROM human_delegations').all()) as any[];
+    const records = new Map<string, { record: Record<string, unknown>; revoked: boolean }>();
+    for (const row of rows) {
+      try { records.set(String(row.id), { record: JSON.parse(row.json), revoked: row.revokedAt != null }); } catch { /* unusable */ }
+    }
+    const lapsed = new Map<string, Record<string, unknown>>();
+    for (const [id, { record, revoked }] of records) if (revoked) lapsed.set(id, record);
+    for (const { record, revoked } of records.values()) {
+      const parent = record.parentDelegationId as string | undefined;
+      if (!revoked && parent && !records.has(parent)) lapsed.set(parent, {});
+    }
+    (await this.handDerivedDelegationsUp(lapsed));
     return Number((await this.db.prepare('DELETE FROM human_delegations WHERE expiresAt<=? OR revokedAt IS NOT NULL').run(now)).changes);
   
     });
@@ -11201,7 +11436,7 @@ const RESERVED_ROUTE_SLUGS = new Set([
   // `for:me` is the signed-in person in every search (and /me is kept free)
   'me',
   // organization-level views — ORG_VIEWS (a project slug is the segment after the org)
-  'insights', 'dashboard', 'settings', 'inbox', 'wiki', 'profile',
+  'insights', 'dashboard', 'settings', 'inbox', 'wiki', 'files', 'profile',
   // project-level tabs
   'tasks', 'queue', 'activity',
 ]);
@@ -11209,7 +11444,7 @@ const RESERVED_ROUTE_SLUGS = new Set([
 /** Top-level public pages (web/app.js boot: renderDocsPage, renderPricing,
  *  renderLegal*). Only an organization owns the first URL segment, so only an
  *  organization can be shadowed by them; a project at /<org>/docs is fine. */
-const RESERVED_ORGANIZATION_SLUGS = new Set(['docs', 'pricing', 'legal']);
+const RESERVED_ORGANIZATION_SLUGS = new Set(['docs', 'pricing', 'legal', 'compare', 'about', 'changelog']);
 
 /** Throw a user-facing error if `name` (or an explicit `slug`) resolves to a
  *  reserved routing word. Applied at the single creation choke points for
@@ -11285,7 +11520,9 @@ export interface ComputeHoldInput {
 
 /** What a hold row still reserves at `now`: its stretch past what the
  * provider has booked for its task, per kind, at its rates. */
-function heldCost(hold: Record<string, unknown>, booked: { active: number; disk: number } | undefined): number {
+function heldCost(hold: Record<string, unknown>, booked: { active: number; disk: number } | undefined, now: number): number {
+  // A lump sum (holdSpend) reserves all of it until closed or expired.
+  if (hold.amountMicros != null) return hold.closedAt == null && Number(hold.endsAt) > now ? Number(hold.amountMicros) : 0;
   const end = hold.closedAt != null ? Number(hold.closedAt) : Number(hold.endsAt);
   const start = Number(hold.startedAt);
   const span = (bookedUntil = 0) => Math.max(0, end - Math.max(start, bookedUntil)) / 3_600_000;
@@ -11476,7 +11713,9 @@ function writableProjectConfig(config: ProjectConfig): ProjectConfig {
   if (process.env.KARMAX_DEPLOYMENT !== 'hosted') return config;
   if (config.remote === 'none')
     throw new Error('hosted GitHub projects require remote policy "pr" or the advanced direct-push policy');
-  return config.remote === undefined ? { ...config, remote: 'pr' } : config;
+  // Absent is the hosted default, decided where it is read (effectiveProjectConfig):
+  // `pr`, or `push` on repositories tavya hosts.
+  return config;
 }
 
 function rowToProject(r: any): Project {

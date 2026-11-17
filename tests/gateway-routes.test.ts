@@ -213,6 +213,8 @@ describe('platform catalog covers the gateway route table', () => {
   const PRE_GATE = [
     /^\/api\/(login|logout|signup|setup|session|sso|auth)/,
     /^\/api\/(launch|legal)/,
+    // The public pages' view beacon: a person's browser counting a page view.
+    /^\/api\/site-analytics\//,
     // Provider webhooks/ingest: authenticated by signature or a minted secret,
     // answered before the session gate, and excluded from platform_request.
     /\/(webhooks?|ingest)$/,
@@ -223,6 +225,8 @@ describe('platform catalog covers the gateway route table', () => {
     /\/(oauth\/)?callback$/,
     // Host TLS bootstrap for port previews; not part of the tenant API.
     /^\/api\/tls\//,
+    // A model gateway's proxy: an agent harness's model requests, by a turn's token.
+    /^\/api\/model-gateway$/,
   ];
 
   /**

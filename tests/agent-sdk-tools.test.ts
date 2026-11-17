@@ -213,6 +213,24 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
     expect(sent.every((r) => !('urgency' in r.body))).toBe(true);
   });
 
+  it('takes a permission request back through the gateway', async () => {
+    const sent: any[] = [];
+    const handlers = platformToolHandlers({} as any, {
+      platformRequest: async (method: string, requestPath: string, body?: unknown) => {
+        sent.push({ method, requestPath, body }); return { status: 'withdrawn' };
+      },
+      createReviewInfo: () => {},
+      emit() {}, emitActivity() {},
+    } as any);
+    expect(TOOL_SCHEMAS.find((tool) => tool.name === 'withdraw_permission_request')!.parameters.required).toEqual(['request_id']);
+    await handlers.withdraw_permission_request!({ request_id: 'preq_1', reason: 'Found another way.' });
+    await handlers.withdraw_permission_request!({ request_id: 'areq/2' });
+    expect(sent).toEqual([
+      { method: 'POST', requestPath: '/api/agent/permission-requests/preq_1/withdraw', body: { reason: 'Found another way.' } },
+      { method: 'POST', requestPath: '/api/agent/permission-requests/areq%2F2/withdraw', body: {} },
+    ]);
+  });
+
   /** PL-7: skills are saved per organization (api.ts saveSkill), so the tool must
    *  not tell agents it writes installation-wide state — and the in-turn handler
    *  (remote Claude, ACP) must actually persist the content, not only name it. */

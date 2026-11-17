@@ -128,6 +128,11 @@ export async function confirmSandboxFailure(
   const inSeconds = (at?: number) => (at !== undefined && at > nowMs ? `in ${Math.ceil((at - nowMs) / 1000)}s` : undefined);
   if (classification.hard) {
     if (reading && !reading.ok && reading.reason === 'logged-out') return providerFailure(err.message, metadata);
+    // The host has just used this login, so what refused the sandbox was not the
+    // login (a network edge's block of its address, a stale projected token):
+    // retried as infrastructure, never put to a person as a sign-in to redo.
+    if (reading?.ok && metadata.kind === 'credential') return new ProviderOutage(`${err.message} (the login itself works: `
+      + `${BRAND} just used it, so the provider refused this computer, not the login; ${BRAND} will keep retrying)`, { cause: err.failure });
   } else if (reading?.ok) {
     const full = (w?: { pct: number; resetAt?: number }) => !!w && w.pct >= 100;
     const hit = metadata.window === 'model'
@@ -185,6 +190,44 @@ export class ProviderOutage extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
     this.name = 'ProviderOutage';
+  }
+}
+
+/** The provider's own name for messages. */
+const PROVIDER_NAMES: Record<string, string> = { claude: 'Anthropic', codex: 'OpenAI', opencode: 'The model provider', kimi: 'Moonshot', grok: 'xAI' };
+
+/**
+ * A network edge in front of the provider (its CDN/WAF: Cloudflare, for both
+ * Anthropic and OpenAI) or a proxy on the way answered instead of the provider,
+ * with a block or challenge page. Such a page judges the machine's network
+ * address or the request's shape, never the login, so it is not a credential
+ * or quota verdict even when the harness calls it one: Claude Code calls every
+ * 403 "Failed to authenticate", keeps only the page's <title> and tags it
+ * `authentication_failed` (tavya-error 3263761e3afa5929: "Failed to
+ * authenticate. API Error: 403 Attention Required! | Cloudflare" stopped a task
+ * for a person as a sign-in failure). Pure; for provider error text only.
+ */
+export function isNetworkEdgeBlock(error: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error ?? '');
+  // A provider API answers in JSON; an HTML page in its place is an intermediary's.
+  if (/<(?:!doctype\s+html|html)\b/i.test(text)) return true;
+  // Cloudflare's block and challenge pages, by the titles a harness keeps of them,
+  // and its plain-text answer to API clients ("error code: 1020").
+  return /attention required!\s*\|\s*cloudflare|\bused cloudflare to restrict access\b|\bjust a moment\.\.\.|\bcf-mitigated\b|\berror code:\s*10[0-9]{2}\b/i.test(text)
+    || /\b(?:api error|status(?: code)?|http(?:\/[\d.]+)?)\s*:?\s*(?:403|429|503)\b[^{]*\|\s*cloudflare\b/i.test(text);
+}
+
+/** A network edge refused this computer (`isNetworkEdgeBlock`). Like an outage,
+ * neither signing in again nor another login fixes it, so it is retried as
+ * infrastructure. On 2026-11-13 Anthropic's edge blocked a Hetzner VM and an
+ * E2B sandbox for a few minutes (10:15–10:19 UTC); a retry three minutes
+ * later worked, while three retries seconds apart had asked a person. */
+export class NetworkEdgeBlock extends ProviderOutage {
+  constructor(provider: string | undefined, raw: string, options?: { cause?: unknown }) {
+    const name = PROVIDER_NAMES[provider ?? ''] ?? 'The model provider';
+    super(`${name}'s network blocked requests from this computer (${raw.trim().slice(0, 300)}). `
+      + `This is not the login; ${BRAND} will keep retrying.`, options);
+    this.name = 'NetworkEdgeBlock';
   }
 }
 
@@ -347,6 +390,7 @@ function termsNear(tokens: string[], left: Set<string>, right: Set<string>, dist
 export function isTransportError(error: unknown): boolean {
   if (error instanceof ProviderOutage) return true;
   if (error instanceof ProviderPolicyFailure || isProviderPolicyRejection(error, { providerOrigin: true })) return false;
+  if (isNetworkEdgeBlock(error)) return true;
   const seen = new Set<unknown>();
   const inspect = (value: unknown): boolean => {
     if (value && typeof value === 'object') {
@@ -436,6 +480,8 @@ export function isResourceKill(message: string): boolean {
 export function classifyLimitError(message: string, options: LimitClassifierOptions = {}): LimitClassification {
   const m = String(message ?? '');
   if (isProviderPolicyRejection(m, options)) return { limited: false };
+  // A CDN's block page ("Access denied | … used Cloudflare …") is no account verdict.
+  if (!options.legacy && isNetworkEdgeBlock(m)) return { limited: false };
   const lc = m.toLowerCase();
   const tokens = words(lc);
 
@@ -565,6 +611,7 @@ export function providerErrorFromMessage(
   throttle?: ApiThrottle,
 ): Error {
   if (isProviderPolicyRejection(message, { providerOrigin: true })) return new ProviderPolicyFailure(message, provider);
+  if (isNetworkEdgeBlock(message)) return new NetworkEdgeBlock(provider, message);
   const cls = classifyLimitError(message, { providerOrigin: true });
   if (!cls.limited) return new Error(message);
   if (throttle && !cls.hard)

@@ -107,6 +107,8 @@ const SCOPED = new Map(([
   ['UPDATE scoped_tokens SET revokedAt=? WHERE revokedAt IS NULL AND tokenHash IN(SELECT tokenHash FROM scoped_token_projects WHERE projectId=?)', (p) => ({ projects: [text(p[1])] })],
   ['UPDATE human_delegations SET revokedAt=? WHERE id=?', (p) => ({ delegations: [text(p[1])] })],
   ['UPDATE human_delegations SET revokedAt=? WHERE id=? AND revokedAt IS NULL', (p) => ({ delegations: [text(p[1])] })],
+  // A delegation narrowed, or handed up to another parent, touches itself.
+  ['UPDATE human_delegations SET json=? WHERE id=? AND revokedAt IS NULL', (p) => ({ delegations: [text(p[1])] })],
   // Purges delete rows that already authorize nothing (expired or revoked).
   ['DELETE FROM human_delegations WHERE expiresAt<=? OR revokedAt IS NOT NULL', () => undefined],
   ['UPDATE preview_leases SET tlsRequestedAt=? WHERE hostname=? AND tlsRequestedAt IS NULL', () => undefined],

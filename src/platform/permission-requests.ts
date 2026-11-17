@@ -30,8 +30,10 @@ export interface PermissionRequest {
   requestedBy: string;
   status: 'pending' | 'granted' | 'denied' | 'withdrawn';
   dismissed?: { by: string; at: number };
-  /** The task settled while this was pending, so no decision can act (PL-10). */
-  withdrawn?: { at: number; reason: string };
+  /** No decision is wanted any more: the requesting task's agent took it back
+   * or the task settled while it was pending (PL-10). `by` is absent on
+   * requests withdrawn before it was recorded. */
+  withdrawn?: { by?: string; at: number; reason: string };
   resolution?: { action: 'approve' | 'deny'; by: string; at: number };
   createdAt: number;
   /** Human-facing metadata projected by the gateway, never persisted. */
@@ -310,6 +312,20 @@ export class PermissionRequests {
     });
   }
 
+  /** Take back a request nobody needs to decide any more: its task's agent
+   * asked for it and no longer wants it. One already decided is returned as
+   * it is; one being decided right now is refused. */
+  async withdraw(id: string, by: string, reason: string): Promise<PermissionRequest> {
+    return this.store.transaction(async () => {
+      const request = (await this.lockedRequest(id));
+      if (!request) throw new Error(`no permission request ${id}`);
+      if (request.status !== 'pending') return request;
+      (await this.assertUnclaimed(id));
+      (await this.markWithdrawn(request, by, reason));
+      return request;
+    });
+  }
+
   /** Withdraw every pending request of a task that has settled: a decision
    * could no longer reach its agent. Returns the requests it withdrew. */
   async withdrawForTask(taskId: string, reason: string): Promise<PermissionRequest[]> {
@@ -317,16 +333,20 @@ export class PermissionRequests {
       (await this.lockTaskRequests(taskId));
       const withdrawn: PermissionRequest[] = [];
       for (const request of (await this.requests({ taskId, status: 'pending' }))) {
-        request.status = 'withdrawn';
-        request.withdrawn = { at: Date.now(), reason };
-        (await this.save(request));
-        (await this.store.kvDelete(claimKey(request.id)));
-        (await this.store.appendAudit({ principalId: 'system:task-settled', action: 'permission.request.withdrawn',
-          scopeKey: `project:${request.projectId}`, detail: { requestId: request.id, taskId, reason } }));
+        (await this.markWithdrawn(request, 'system:task-settled', reason));
         withdrawn.push(request);
       }
       return withdrawn;
     });
+  }
+
+  private async markWithdrawn(request: PermissionRequest, by: string, reason: string): Promise<void> {
+    request.status = 'withdrawn';
+    request.withdrawn = { by, at: Date.now(), reason };
+    (await this.save(request));
+    (await this.store.kvDelete(claimKey(request.id)));
+    (await this.store.appendAudit({ principalId: by, action: 'permission.request.withdrawn',
+      scopeKey: `project:${request.projectId}`, detail: { requestId: request.id, taskId: request.taskId, reason } }));
   }
 
   /** Drop a request outright, with any decision claim on it. */

@@ -65,7 +65,15 @@ describe('the co-ordinator brief', () => {
     expect(prompt).toContain('create_task');
     expect(prompt).toContain('wakes you again within 6 hours to check in');
     expect(prompt).toContain('This task never finishes');
-    expect(prompt).toContain('open_pr() opens one for every branch with new work. Neither ends this task.');
+    expect(prompt).toContain('open_pr() one for every branch with new work; neither ends this task.');
+  });
+
+  it('tells it to run forever, so never to ship a change that only works once its own work is merged, deployed or restarted', () => {
+    const prompt = assemblePrompt({ profile, role: 'do', task: task({ coordinator: { wakeHours: 6 } }), world });
+    expect(prompt).toContain('Your purpose is to run for as long as the project exists, without stopping');
+    expect(prompt).toContain('So don\'t make changes yourself.');
+    expect(prompt).toContain('merged, deployed or this task restarted');
+    expect(prompt).toContain('put every such change in a task you create, and steer it from here');
   });
 
   it('is told to no other task, and to none of its other agents', () => {

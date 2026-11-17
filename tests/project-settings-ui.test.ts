@@ -461,7 +461,7 @@ describe('Project settings', () => {
     const scroller = ui.page.locator('.main').first();
     await scroller.evaluate((element) => { element.scrollTop = 600; });
     expect(await scroller.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
-    await ui.page.locator('.settings-layout a[href="#project-people"], .settings-layout a[href^="#project-"]').last().click();
+    await ui.page.locator('.settings-nav a[href="#project-people"]').click();
     await expect.poll(() => scroller.evaluate((element) => element.scrollTop)).toBe(0);
     await ui.close();
   });
