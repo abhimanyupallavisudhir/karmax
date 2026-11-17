@@ -168,7 +168,7 @@ it('a folder of thousands of files uploads (no cap), recommended as data, and la
     expect(s.tree().length).toBe(before + count);
     expect(sh(s.bare, 'log', '-1', '--format=%s', 'main').trim()).toBe(`Add or update ${count} files`);
   });
-});
+}, 180_000); // 2,500 uploads through a browser: about a minute on a CI runner.
 
 it('Cancel stops an upload: nothing lands, and what was already sent is dropped', async () => {
   const s = await setup();

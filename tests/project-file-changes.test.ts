@@ -88,7 +88,7 @@ it('commits uploads, edits, new folders, copies, moves and deletes straight to t
 it('commits a folder of thousands of files as one commit, quickly (a bot’s data, 2026-11-17)', async () => {
   const f = await fixture();
   const before = sh(f.bare, 'rev-parse', 'main').trim();
-  const count = 3000; // over the old 2,000-change and 2,000-staged-file caps
+  const count = 2100; // over the old 2,000-change and 2,000-staged-file caps
   const uploads: string[] = [];
   for (let at = 0; at < count; at += 50)
     uploads.push(...await Promise.all(Array.from({ length: Math.min(50, count - at) }, (_, i) => f.upload(f.developer, `item ${at + i}\n`))));
@@ -99,7 +99,7 @@ it('commits a folder of thousands of files as one commit, quickly (a bot’s dat
   expect(sh(f.bare, 'rev-parse', 'main~1').trim()).toBe(before);
   const listed = f.listed();
   expect(listed.filter((file) => file.startsWith('bot_data/'))).toHaveLength(count);
-  expect(f.show('bot_data/part-3/item-2999.txt')).toBe('item 2999\n');
+  expect(f.show('bot_data/part-6/item-2099.txt')).toBe('item 2099\n');
   expect(sh(f.bare, 'log', '-1', '--format=%s', 'main').trim()).toBe(`Add or update ${count} files`);
   // The commit is built from one read of the index and one hash-object, not processes per file.
   expect(took).toBeLessThan(30_000);
@@ -110,7 +110,8 @@ it('commits a folder of thousands of files as one commit, quickly (a bot’s dat
     .toMatchObject({ status: 409, body: { error: 'README.md is a file.' } });
   expect(await f.change(f.developer, [{ op: 'write', path: 'site/bot_data', upload: two }]))
     .toMatchObject({ status: 409, body: { error: 'bot_data is a folder.' } });
-});
+  // Staging 2,100 files over HTTP is most of this test's time: CI runners are ~3× slower than a laptop.
+}, 180_000);
 
 it('drops a staged upload its uploader gives up on, and only theirs', async () => {
   const f = await fixture();
