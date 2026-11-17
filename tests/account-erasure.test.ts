@@ -90,6 +90,8 @@ it('cleans only personal access/settings and preserves shared work, history and 
     await store.kvSet(`github-app:user:${id}:accounts`, '[{"id":"9"}]');
     await store.kvSet(`hosted:onboarding:${id}:${org.id}`, '{"display":"hidden"}');
     await store.setDeliveryPreferences({ userId: id, organizationId: org.id, browser: true, email: true, slack: false, routine: true });
+    await store.savePushSubscription(id, { endpoint: `https://fcm.googleapis.com/fcm/send/${id}`,
+      keys: { p256dh: 'BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4', auth: 'BTBZMqHH6r4Tts7J_aSIgg' } });
     await store.setPrincipalGrant(`user:${id}`, 'global', { profileId: 'developer' });
   }
   await store.recordPolicyAcceptance({ userId: 'u_1', email: 'person@example.test', context: 'signup', versions: { terms: 'test' } });
@@ -120,6 +122,9 @@ it('cleans only personal access/settings and preserves shared work, history and 
   expect(await store.organizationMembership(org.id, 'u_1')).toBeUndefined();
   expect(await store.organizationMembership(org.id, 'uX1')).toBeDefined();
   expect(await store.listPrincipalGrants('user:u_1')).toEqual([]);
+  // Their devices stop receiving pushes; another person's keep theirs.
+  expect(await store.listPushSubscriptions('u_1')).toEqual([]);
+  expect(await store.listPushSubscriptions('uX1')).toHaveLength(1);
   expect(await store.listPrincipalGrants('user:uX1')).toHaveLength(1);
   expect((await broker.listHandles()).some(h => h.includes(':u_1:'))).toBe(false);
   expect(await broker.hasHandle('github-app:user:uX1:account:9:authorization')).toBe(true);

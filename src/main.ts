@@ -45,6 +45,7 @@ import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SEC
 import { GitHubDeploymentMonitor } from './integrations/github-deployment-monitor.js';
 import { WorldLifecycleManager } from './world/runners.js';
 import { BrowserDeliveryAdapter, DeliveryDispatcher, WebhookDeliveryAdapter } from './collaboration/delivery.js';
+import { PushDeliveryAdapter, vaultVapidKeys } from './collaboration/push-delivery.js';
 import { hydrateEnvFile, hydrateSecretFiles, validateDeployment } from './config/deployment.js';
 import { WorldHandoffService } from './world/handoff.js';
 import { sweepOrphanedServiceContainers } from './world/services.js';
@@ -311,8 +312,13 @@ async function main() {
   const projectFiles = new ProjectFiles({ store, workspaces: new WorkspaceService(store, resources, handoffs), resources, checkpoints,
     gitCredential: projectRepositoryCredential(store, { hosted: deployment.hosted, githubApp }),
     openWorld: async (taskId, handle) => { const access = await worldAccess.open(taskId, handle); return { world: access.world, release: () => access.release(false) }; } });
+  // Web Push needs nothing configured: the VAPID key is made on first use and kept in the vault.
+  const pushKeys = vaultVapidKeys(broker);
   const delivery = new DeliveryDispatcher(store, {
     browser: new BrowserDeliveryAdapter(),
+    push: new PushDeliveryAdapter({ store, keys: pushKeys, publicUrl: process.env.KARMAX_PUBLIC_URL,
+      siteName: async () => siteNameOf((await store.getSettings('global', 'appearance'))),
+      log: (line) => console.warn(`[push] ${line}`) }),
     ...(process.env.KARMAX_EMAIL_DELIVERY_URL ? { email: new WebhookDeliveryAdapter(process.env.KARMAX_EMAIL_DELIVERY_URL, 'email') } : {}),
     ...(process.env.KARMAX_SLACK_DELIVERY_URL ? { slack: new WebhookDeliveryAdapter(process.env.KARMAX_SLACK_DELIVERY_URL, 'slack') } : {}),
   }, async (id) => {
@@ -454,8 +460,10 @@ async function main() {
     hostLocal: deployment.hostLocal,
     // Exactly the channels wired into the DeliveryDispatcher above, so the console
     // can disable a switch it cannot honour instead of reporting a false "saved".
+    pushKeys,
     deliveryChannels: [
       'browser',
+      'push',
       ...(process.env.KARMAX_EMAIL_DELIVERY_URL ? ['email'] : []),
       ...(process.env.KARMAX_SLACK_DELIVERY_URL ? ['slack'] : []),
     ],

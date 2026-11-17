@@ -63,6 +63,9 @@ import {
   InboxItem,
   CredentialNotice,
   DeliveryPreferences,
+  DeliveryChannel,
+  PushSubscriptionRecord,
+  Urgency,
   OrganizationIdentityPolicy,
   WorldCheckpoint,
   RunnerPool,
@@ -80,6 +83,7 @@ import {
   StorageLocation,
   StorageLocationUsage,
   DEFAULT_URGENCY,
+  PUSH_DEFAULT_URGENCIES,
   URGENCY_LEVELS,
   normalizeUrgency,
   urgencyRank,
@@ -982,6 +986,14 @@ export class Store {
         claimedAt INTEGER, lastError TEXT, createdAt INTEGER NOT NULL, deliveredAt INTEGER,
         UNIQUE (inboxId, channel)
       );
+      -- A person's devices receiving Web Push: one row per browser subscription
+      -- (endpoint), so a browser that a second person subscribes moves to them.
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id TEXT PRIMARY KEY, userId TEXT NOT NULL, endpoint TEXT NOT NULL UNIQUE,
+        p256dh TEXT NOT NULL, auth TEXT NOT NULL, label TEXT,
+        createdAt INTEGER NOT NULL, lastPushedAt INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(userId);
       CREATE TABLE IF NOT EXISTS organization_identity_policy (
         organizationId TEXT PRIMARY KEY, oidcProviderId TEXT, verifiedDomains TEXT NOT NULL,
         enforceSso INTEGER NOT NULL, scimTokenId TEXT, scimTokenHash TEXT, updatedAt INTEGER NOT NULL
@@ -2957,6 +2969,8 @@ export class Store {
       preferences: { defaultOrganizationId: ((await this.db.prepare('SELECT defaultOrganizationId FROM user_preferences WHERE userId=?')
         .get(userId)) as { defaultOrganizationId: string } | undefined)?.defaultOrganizationId ?? (await this.defaultOrganization(userId))?.id ?? null,
         ...(await this.userPreferences(userId)) },
+      // The devices receiving push, without their endpoint and keys (credentials, like tokens).
+      pushDevices: (await this.listPushSubscriptions(userId)).map(({ id, label, createdAt, lastPushedAt }) => ({ id, label, createdAt, lastPushedAt })),
       security: {
         secretsIncluded: false,
         omitted: ['password hashes', 'session tokens', 'OAuth tokens and state', 'credential values and handles',
@@ -5628,12 +5642,7 @@ export class Store {
         id, organizationId, userId, createdAt * 1000, `credential:${notice.credentialKey}`,
         urgencyRank('critical'), createdAt, JSON.stringify(notice)));
       if (!Number(inserted.changes)) continue;
-      const preferences = (await this.getDeliveryPreferences(userId, organizationId));
-      const channels = [preferences.browser && 'browser', (preferences.emailUrgencies?.critical ?? preferences.email) && 'email', preferences.slack && 'slack']
-        .filter(Boolean) as string[];
-      for (const channel of channels) (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
-        (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
-        .run(newId('delivery'), id, channel, createdAt, createdAt));
+      (await this.queueDeliveries(id, userId, (await this.getDeliveryPreferences(userId, organizationId)), 'critical', createdAt));
     }
 
     });
@@ -5674,11 +5683,9 @@ export class Store {
           JSON.stringify({ kind: 'compute', ...notice })));
         if (!Number(inserted.changes)) continue;
         told++;
-        const preferences = (await this.getDeliveryPreferences(userId, organizationId));
-        for (const channel of [preferences.browser && 'browser', preferences.slack && 'slack'].filter(Boolean) as string[])
-          (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
-            (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
-            .run(newId('delivery'), id, channel, createdAt, createdAt));
+        // Email is the notifier's own (compute-notices.ts).
+        (await this.queueDeliveries(id, userId, (await this.getDeliveryPreferences(userId, organizationId)),
+          notice.stage === 'reminder' || notice.stage === 'hibernated' ? 'critical' : 'high', createdAt, { email: false }));
       }
       return told;
     });
@@ -5707,11 +5714,8 @@ export class Store {
           id, organizationId, userId, createdAt * 1000, `storage:${organizationId}`, urgencyRank(urgency), createdAt,
           JSON.stringify({ kind: 'storage', ...notice })));
         if (!Number(inserted.changes)) continue;
-        const preferences = (await this.getDeliveryPreferences(userId, organizationId));
-        for (const channel of [preferences.browser && 'browser', preferences.slack && 'slack'].filter(Boolean) as string[])
-          (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
-            (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
-            .run(newId('delivery'), id, channel, createdAt, createdAt));
+        // Email is the notifier's own (storage-notices.ts).
+        (await this.queueDeliveries(id, userId, (await this.getDeliveryPreferences(userId, organizationId)), urgency, createdAt, { email: false }));
       }
     });
   }
@@ -5741,18 +5745,82 @@ export class Store {
           id, entry.organizationId, entry.userId, createdAt * 1000, `service-limit:${entry.key}`, urgencyRank(entry.urgency), createdAt,
           JSON.stringify({ ...entry.subject, kind: 'service-limit' })));
         if (!Number(inserted.changes) || !entry.deliver) continue;
-        const preferences = (await this.getDeliveryPreferences(entry.userId, entry.organizationId));
-        for (const channel of [preferences.browser && 'browser', preferences.slack && 'slack'].filter(Boolean) as string[])
-          (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
-            (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
-            .run(newId('delivery'), id, channel, createdAt, createdAt));
+        // Email is the notifier's own (service-limits).
+        (await this.queueDeliveries(id, entry.userId, (await this.getDeliveryPreferences(entry.userId, entry.organizationId)),
+          entry.urgency, createdAt, { email: false }));
       }
     });
   }
 
   async getDeliveryPreferences(userId: string, organizationId: string): Promise<DeliveryPreferences> {
     const r = (await this.db.prepare('SELECT json FROM delivery_preferences WHERE userId=? AND organizationId=?').get(userId, organizationId)) as any;
-    return r ? JSON.parse(r.json) : { userId, organizationId, browser: true, email: false, slack: false, routine: true };
+    const stored: DeliveryPreferences = r ? JSON.parse(r.json) : { userId, organizationId, browser: true, email: false, slack: false, routine: true };
+    return { ...stored, pushUrgencies: { ...PUSH_DEFAULT_URGENCIES, ...stored.pushUrgencies } };
+  }
+
+  /**
+   * Queue an inbox item's deliveries for the channels its person chose at its
+   * urgency: the browser, email (unless the caller emails by itself), Slack,
+   * and push when they have a device subscribed.
+   */
+  private async queueDeliveries(inboxId: string, userId: string, preferences: DeliveryPreferences, urgency: Urgency,
+    at: number, options: { email?: boolean } = {}): Promise<void> {
+    const channels: DeliveryChannel[] = [];
+    if (preferences.browser) channels.push('browser');
+    if (options.email !== false && (preferences.emailUrgencies?.[urgency] ?? preferences.email)) channels.push('email');
+    if (preferences.slack) channels.push('slack');
+    if ((preferences.pushUrgencies?.[urgency] ?? PUSH_DEFAULT_URGENCIES[urgency])
+      && (await this.db.prepare('SELECT 1 FROM push_subscriptions WHERE userId=? LIMIT 1').get(userId))) channels.push('push');
+    for (const channel of channels) (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
+      (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
+      .run(newId('delivery'), inboxId, channel, at, at));
+  }
+
+  /** Subscribe a device to a person's pushes. An endpoint is one browser: the
+   * same one subscribed again keeps its row (fresh keys), and subscribed by
+   * someone else moves to them. */
+  async savePushSubscription(userId: string, input: { endpoint: string; keys: { p256dh: string; auth: string }; label?: string },
+    now = Date.now()): Promise<PushSubscriptionRecord> {
+    return this.db.transaction(async () => {
+      (await this.db.lock(`push-subscription:${input.endpoint}`));
+      const existing = (await this.db.prepare('SELECT id, userId FROM push_subscriptions WHERE endpoint=?').get(input.endpoint)) as any;
+      const label = input.label?.trim().slice(0, 80) || null;
+      if (existing && String(existing.userId) === userId) {
+        (await this.db.prepare('UPDATE push_subscriptions SET p256dh=?, auth=?, label=? WHERE id=?')
+          .run(input.keys.p256dh, input.keys.auth, label, existing.id));
+        return (await this.pushSubscription(String(existing.id)))!;
+      }
+      if (existing) (await this.db.prepare('DELETE FROM push_subscriptions WHERE id=?').run(existing.id));
+      const id = newId('push');
+      (await this.db.prepare(`INSERT INTO push_subscriptions (id, userId, endpoint, p256dh, auth, label, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`).run(id, userId, input.endpoint, input.keys.p256dh, input.keys.auth, label, now));
+      return (await this.pushSubscription(id))!;
+    });
+  }
+
+  private async pushSubscription(id: string): Promise<PushSubscriptionRecord | undefined> {
+    const row = (await this.db.prepare('SELECT * FROM push_subscriptions WHERE id=?').get(id)) as any;
+    return row ? rowToPushSubscription(row) : undefined;
+  }
+
+  /** A person's devices, oldest first. */
+  async listPushSubscriptions(userId: string): Promise<PushSubscriptionRecord[]> {
+    return ((await this.db.prepare('SELECT * FROM push_subscriptions WHERE userId=? ORDER BY createdAt, id').all(userId)) as any[])
+      .map(rowToPushSubscription);
+  }
+
+  /** Remove one of the person's own devices; false if they have none by that id. */
+  async deletePushSubscription(userId: string, id: string): Promise<boolean> {
+    return Number((await this.db.prepare('DELETE FROM push_subscriptions WHERE id=? AND userId=?').run(id, userId)).changes) > 0;
+  }
+
+  /** A push service said the subscription is gone (404/410): forget it. */
+  async expirePushSubscription(id: string): Promise<void> {
+    (await this.db.prepare('DELETE FROM push_subscriptions WHERE id=?').run(id));
+  }
+
+  async markPushed(id: string, at = Date.now()): Promise<void> {
+    (await this.db.prepare('UPDATE push_subscriptions SET lastPushedAt=? WHERE id=?').run(at, id));
   }
 
   async setDeliveryPreferences(preferences: DeliveryPreferences): Promise<DeliveryPreferences> {
@@ -6025,12 +6093,7 @@ export class Store {
         (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt)
         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(item.id, item.organizationId, item.userId, item.eventSeq,
           item.taskId, item.kind, urgencyRank(item.urgency), item.actionable ? 1 : 0, item.createdAt));
-      if (Number(inserted.changes)) {
-        const channels = [preferences.browser && 'browser', (preferences.emailUrgencies?.[item.urgency] ?? preferences.email) && 'email', preferences.slack && 'slack'].filter(Boolean) as string[];
-        for (const channel of channels) (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
-          (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
-          .run(newId('delivery'), item.id, channel, item.createdAt, item.createdAt));
-      }
+      if (Number(inserted.changes)) (await this.queueDeliveries(item.id, userId, preferences, item.urgency, item.createdAt));
     }
   
     });
@@ -6112,7 +6175,7 @@ export class Store {
     }
   }
 
-  async claimDelivery(now = Date.now()): Promise<{ id: string; inbox: InboxItem; channel: 'browser' | 'email' | 'slack'; attempts: number } | undefined> {
+  async claimDelivery(now = Date.now()): Promise<{ id: string; inbox: InboxItem; channel: DeliveryChannel; attempts: number } | undefined> {
     return this.db.transaction(async () => {
 
     (await this.db.exec('BEGIN IMMEDIATE'));
@@ -11397,6 +11460,12 @@ function rowToRepository(r: any): Repository {
     private: Boolean(r.private), gitConnectionId: r.gitConnectionId ?? undefined,
     ...(r.upstream ? { upstream: JSON.parse(r.upstream) } : {}),
     createdAt: r.createdAt, updatedAt: r.updatedAt };
+}
+
+function rowToPushSubscription(r: any): PushSubscriptionRecord {
+  return { id: String(r.id), userId: String(r.userId), endpoint: String(r.endpoint),
+    keys: { p256dh: String(r.p256dh), auth: String(r.auth) }, ...(r.label ? { label: String(r.label) } : {}),
+    createdAt: Number(r.createdAt), ...(r.lastPushedAt == null ? {} : { lastPushedAt: Number(r.lastPushedAt) }) };
 }
 
 function rowToInbox(r: any): InboxItem {

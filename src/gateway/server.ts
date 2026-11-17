@@ -40,7 +40,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
-import type { ChildTaskSummary, KarmaxEvent, Organization, TaskView, WorldProviderConnection } from '../domain/types.js';
+import type { ChildTaskSummary, KarmaxEvent, Organization, PushSubscriptionRecord, TaskView, WorldProviderConnection } from '../domain/types.js';
 import { BRAND_FILES, brandIconOf, isBrandIcon, isSkin, siteNameError, siteNameOf, skinOf, BRAND } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { ProjectTransfers, ProjectTransferError } from '../platform/project-transfer.js';
@@ -133,6 +133,7 @@ import type { Effort } from '../agent/effort.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems, itemHandle, relatedVaultItems, searchVaultItems, weakensProtection } from '../autonomy/vault-items.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
+import { pushEndpointAllowed, pushKeyBytes } from '../collaboration/web-push.js';
 import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { SETTLES_REQUESTS } from '../platform/settled-requests.js';
@@ -211,6 +212,8 @@ export interface GatewayDeps {
   /** Inbox delivery channels with a registered adapter. The console disables the
    *  rest rather than offering a switch that silently cannot deliver. */
   deliveryChannels?: string[];
+  /** The installation's VAPID key pair for Web Push (src/collaboration/push-delivery.ts vaultVapidKeys). */
+  pushKeys?: () => Promise<import('../collaboration/web-push.js').VapidKeyPair>;
   remoteAccess?: RemoteAccessController;
   /** Fetches OAuth client ID metadata documents (default: the outbound SSRF guard). */
   oauthMetadataFetch?: typeof fetch;
@@ -255,6 +258,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // A person's own chat accounts (src/integrations/chat-links.ts): the handler
   // takes the human subject; linking needs the person themself.
   if (p === '/api/chat-links' || p === '/api/chat-links/pending' || /^\/api\/user\/chat-links(?:\/[^/]+)?$/.test(p)) return 'none';
+  // A person's own devices, and the public key they subscribe with.
+  if (p === '/api/push/key' || /^\/api\/user\/push-subscriptions(?:\/[^/]+)?$/.test(p)) return 'none';
   if (p === '/api/invitations/accept') return 'none';
   if (p.startsWith('/api/inbox')) return read ? 'inbox:read' : 'inbox:write';
   if (p === '/api/organization-directory' && read) return 'none';
@@ -3965,15 +3970,49 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, (await store.getDeliveryPreferences(subject.userId, requestedScope.organizationId)));
         if (method === 'PUT') {
           const b = await this.body(req);
-          if (b.emailUrgencies !== undefined && (!b.emailUrgencies || typeof b.emailUrgencies !== 'object'
-            || Array.isArray(b.emailUrgencies) || Object.entries(b.emailUrgencies).some(([key, value]) =>
-              !['low', 'normal', 'high', 'critical'].includes(key) || typeof value !== 'boolean')))
-            return this.json(res, 400, { error: 'emailUrgencies must map urgency levels to booleans' });
+          const byUrgency = (value: unknown) => value === undefined || Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+            && Object.entries(value as object).every(([key, on]) => ['low', 'normal', 'high', 'critical'].includes(key) && typeof on === 'boolean');
+          for (const field of ['emailUrgencies', 'pushUrgencies'])
+            if (!byUrgency(b[field])) return this.json(res, 400, { error: `${field} must map urgency levels to booleans` });
           const previous = (await store.getDeliveryPreferences(subject.userId, requestedScope.organizationId));
           return this.json(res, 200, (await store.setDeliveryPreferences({ userId: subject.userId, organizationId: requestedScope.organizationId,
             emailUrgencies: b.emailUrgencies ?? previous.emailUrgencies,
+            pushUrgencies: { ...previous.pushUrgencies, ...b.pushUrgencies },
             browser: b.browser !== false, email: Boolean(b.email), slack: Boolean(b.slack), routine: b.routine !== false })));
         }
+      }
+
+      // Web Push (wiki features/push-and-voice): the key browsers subscribe
+      // with, and each person's own devices.
+      if (p === '/api/push/key' && method === 'GET') {
+        if (!this.deps.pushKeys) return this.json(res, 404, { error: 'Push notifications are not available on this installation.' });
+        return this.json(res, 200, { publicKey: (await this.deps.pushKeys()).publicKey });
+      }
+      const pushSubscription = p.match(/^\/api\/user\/push-subscriptions(?:\/([^/]+))?$/);
+      if (pushSubscription) {
+        const subject = requireHumanSubject(callerIdentity);
+        const shown = ({ keys: _keys, userId: _userId, ...device }: PushSubscriptionRecord) => device;
+        if (!pushSubscription[1] && method === 'GET')
+          return this.json(res, 200, (await store.listPushSubscriptions(subject.userId)).map(shown));
+        if (!pushSubscription[1] && method === 'POST') {
+          if (!this.deps.pushKeys) return this.json(res, 404, { error: 'Push notifications are not available on this installation.' });
+          const b = await this.body(req);
+          const endpoint = typeof b.endpoint === 'string' ? b.endpoint : '';
+          if (endpoint.length > 2048 || !pushEndpointAllowed(endpoint))
+            return this.json(res, 400, { error: 'endpoint must be a browser push service URL (PushSubscription.endpoint)' });
+          try { pushKeyBytes(b.keys); } catch (error) {
+            return this.json(res, 400, { error: `keys: ${error instanceof Error ? error.message : String(error)}` });
+          }
+          if (b.label !== undefined && typeof b.label !== 'string') return this.json(res, 400, { error: 'label must be text' });
+          return this.json(res, 200, shown(await store.savePushSubscription(subject.userId,
+            { endpoint, keys: { p256dh: String(b.keys.p256dh), auth: String(b.keys.auth) }, label: b.label })));
+        }
+        if (pushSubscription[1] && method === 'DELETE') {
+          if (!(await store.deletePushSubscription(subject.userId, decodeURIComponent(pushSubscription[1]))))
+            return this.json(res, 404, { error: 'No such device' });
+          return this.json(res, 200, { ok: true });
+        }
+        return this.json(res, 405, { error: 'method not allowed' });
       }
 
       // Multiple human accounts + karmax authorization. Better Auth owns the
