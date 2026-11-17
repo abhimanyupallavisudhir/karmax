@@ -24,7 +24,7 @@ A repository tavya hosts is an ordinary Git repository: clone it with `git clone
 
 ## 4. Create a task
 
-Press **New task** at the top of the sidebar (or **N**), say what you want, and press **Ctrl+Enter** (**⌘+Enter** on a Mac). The same form chooses the agent and model, the computer's size, and who reviews the result.
+Press **New task** at the top of the sidebar (or **N**), say what you want, and press **Ctrl+Enter** (**⌘+Enter** on a Mac). To say it aloud instead, press the microphone in the box (or **Ctrl+Shift+S**, **⌘+Shift+S** on a Mac): your words appear as you speak, ready to edit. The task's message box has one too. The same form chooses the agent and model, the computer's size, and who reviews the result.
 
 Brief the agent as you would a colleague: the outcome you want, and how you will judge it.
 
@@ -33,6 +33,10 @@ Brief the agent as you would a colleague: the outcome you want, and how you will
 A task is a conversation. The agent says what it is doing; you can reply at any time, and it reads your message as it works. Type **@** to call in another agent or a person. **■** stops the agent.
 
 When an agent needs something (a decision, a password, a permission, a payment), the task shows **Needs input**, its project's number in the sidebar goes up, and the bell at the bottom of the sidebar counts it. Often it asks with a small form: answer there, or just reply.
+
+### Notifications
+
+**Profile → Notifications** chooses what each urgency does: a system notification, a sound or a banner while the console is open, an email, and a **Push** to your devices even when it is closed. Turn on **Push to this device** on each computer or phone that should receive them; your other devices are listed there and can be removed. On an iPhone or iPad, add tavya to the Home Screen first (Share → Add to Home Screen), then turn push on from the app.
 
 ## 6. Review
 

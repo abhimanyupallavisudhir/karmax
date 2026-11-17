@@ -83,6 +83,7 @@ function formatBytes(value) {
 // the no-build-step console self-contained while still giving every button a
 // proper text alternative through its aria-label/title.
 const ICON = {
+  mic: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v5"/></svg>',
   stop: '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
   expand: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></svg>',
   collapse: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h5V3m13 5h-5V3M8 21v-5H3m13 5v-5h5"/></svg>',
@@ -1994,7 +1995,7 @@ function renderField(f, own, inherited, withChips, alt, agentOpts) {
       // elsewhere with the default [[proj:tag:default]] / [[org:tag:default]]), so
       // the user sees (and can remove) what's inlined by default; [[ adds more.
       return `<div class="form-row" data-row="${esc(f.name)}">${label}<div class="prompt-field">${ta}<div class="img-chips attachment-chips" id="tf-chips" style="display:none"></div>
-        <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input id="tf-files" type="file" multiple hidden></label>${policyTip('Drop or paste files here (25 MB each, 50 MB per task). Type [[ to add a wiki page.')}</div>
+        <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input id="tf-files" type="file" multiple hidden></label>${policyTip('Drop or paste files here (25 MB each, 50 MB per task). Type [[ to add a wiki page.')}${micButtonHtml('prompt')}</div>
         <div class="prompt-context-row"><span class="pc-prefix">Context</span>${policyTip('Wiki pages the agent reads before it starts.')}<input type="hidden" id="tf-context"><span class="pc-chips" id="tf-context-chips"></span><textarea id="tf-context-add" class="prompt-context" rows="1" spellcheck="false" aria-label="Add wiki context" placeholder="type [[ to attach a wiki page, label, or folder"></textarea></div></div></div>`;
     return `<div class="form-row" data-row="${esc(f.name)}">${label}${ta}</div>`;
   }
@@ -11427,6 +11428,9 @@ function settleConversation(thread, fresh, before) {
   const answer = thread.querySelector('[data-land]');
   if (!answer) return;
   const target = answer.dataset.conversationKey;
+  // A new answer while the task is open (not the one it opened on), once.
+  const spoken = S.spokenAnswers || (S.spokenAnswers = {});
+  if (last && target !== last.key && spoken[key] !== target) { spoken[key] = target; readAloud(answer); }
   const untouched = !!last && !!before && Math.abs(before.top - last.top) < 2;
   if (!fresh && (target === last?.key || !(before?.atBottom || untouched))) return;
   const question = thread.querySelector('[data-land-question]');
@@ -13635,7 +13639,7 @@ function conversationPane(v, t) {
           <textarea class="followup-input" placeholder="${t.shared ? `${defaultRecipientFor(v) === 'agent:do' ? 'Message the agent' : `Reply to ${participantLabelOf(defaultRecipientFor(v).slice(6), v)}`} · @ to call an agent or person · [[ for wiki` : `${t.role === 'do' ? 'Message the agent' : `Message ${agentName}`} · [[ for wiki`}" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
           ${t.shared ? newAgentFormsHtml(v, `${v.taskId}/${t.role}`) : ''}
           <div class="img-chips attachment-chips followup-chips" style="display:none"></div>
-          <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label>${policyTip(`Drop or paste files here (25 MB each, 50 MB per message). Type ${t.shared ? '@ to bring in an agent or a person, ' : ''}[[ to add a wiki page.`)}</div>
+          <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label>${policyTip(`Drop or paste files here (25 MB each, 50 MB per message). Type ${t.shared ? '@ to bring in an agent or a person, ' : ''}[[ to add a wiki page.`)}${followUp.enabled ? micButtonHtml(`followup:${v.taskId}/${t.role}`) : ''}</div>
         </div>
         ${t.shared && stoppableAgent(v) ? stopAgentButton(stoppableAgent(v), 'btn followup-stop') : ''}
         <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}${continues ? ' title="The approved PR lands as it is. The agent carries on in a new task."' : ''}>${continues ? 'Continue' : 'Send'}</button>
@@ -25015,6 +25019,230 @@ function wireInboxNotices() {
   });
 }
 
+// ── voice input (wiki features/push-and-voice) ──────────────────────────────
+// A mic in a prompt field's bottom row: the browser's speech recognition types
+// into the field (interim words as they come), where they can be edited before
+// sending. One field listens at a time; a second tap, the browser's end of
+// speech, typing or Esc stops it. Absent where the browser has no recognition.
+// Any prompt field gets one with micButtonHtml(key) in its `.prompt-attach-row`.
+function speechRecognitionClass() {
+  return typeof window === 'undefined' ? null : (window.SpeechRecognition || window.webkitSpeechRecognition || null);
+}
+function micButtonHtml(key) {
+  if (typeof speechRecognitionClass() !== 'function') return '';
+  const on = S.dictation?.key === key;
+  return `<button type="button" class="mic-button${on ? ' listening' : ''}" data-mic="${esc(key)}" data-shortcut="compose.voice" aria-pressed="${on}"
+    aria-label="${on ? 'Stop dictating' : 'Dictate'}" title="${esc(commandHint(on ? 'Stop dictating' : 'Dictate', 'compose.voice'))}">${ICON.mic}</button>`;
+}
+// The field a mic types into: found again each time, since a refresh may have replaced it.
+function micField(key) {
+  const button = document.querySelector(`[data-mic="${CSS.escape(key)}"]`);
+  return { button, field: button?.closest('.prompt-field')?.querySelector('textarea') || null };
+}
+function paintMic(key) {
+  const { button } = micField(key);
+  if (!button) return;
+  const on = S.dictation?.key === key;
+  button.classList.toggle('listening', on);
+  button.setAttribute('aria-pressed', String(on));
+  button.setAttribute('aria-label', on ? 'Stop dictating' : 'Dictate');
+  button.title = commandHint(on ? 'Stop dictating' : 'Dictate', 'compose.voice');
+}
+function toggleDictation(key) {
+  if (S.dictation?.key === key) return stopDictation();
+  stopDictation();
+  const Recognition = speechRecognitionClass();
+  const { field } = micField(key);
+  if (!Recognition || !field || field.disabled) return;
+  window.speechSynthesis?.cancel(); // never transcribe our own voice
+  const recognition = new Recognition();
+  recognition.lang = document.documentElement.lang || navigator.language || 'en-US';
+  recognition.interimResults = true;
+  recognition.continuous = false; // a pause ends it
+  // Words go where the caret was, replacing any selection, spaced from their neighbours.
+  const value = field.value, start = field.selectionStart ?? value.length, end = field.selectionEnd ?? value.length;
+  const before = value.slice(0, start), after = value.slice(end);
+  const state = { key, recognition, placeholder: field.placeholder, heard: '' };
+  S.dictation = state;
+  const write = (text) => {
+    const target = micField(key).field;
+    if (!target || S.dictation !== state) return;
+    const lead = before && text && !/\s$/.test(before) ? ' ' : '';
+    const tail = after && text && !/^\s/.test(after) ? ' ' : '';
+    target.value = `${before}${lead}${text}${tail}${after}`;
+    const caret = before.length + lead.length + text.length;
+    target.setSelectionRange?.(caret, caret);
+    target.dispatchEvent(new Event('input', { bubbles: true })); // drafts, sizing, @ and [[ menus
+  };
+  recognition.onresult = (event) => {
+    state.heard = [...event.results].map((result) => result[0]?.transcript || '').join('').trim();
+    write(state.heard);
+  };
+  recognition.onerror = (event) => {
+    const message = { 'not-allowed': 'Allow the microphone for this site to dictate.', 'service-not-allowed': 'Allow the microphone for this site to dictate.',
+      'audio-capture': 'No microphone found.', network: 'Dictation needs a connection.' }[event.error];
+    if (message) toast(message, true);
+  };
+  recognition.onend = () => { if (S.dictation === state) stopDictation(); };
+  field.placeholder = 'Listening…';
+  try { recognition.start(); } catch (error) { S.dictation = null; field.placeholder = state.placeholder; return toast(error.message, true); }
+  paintMic(key);
+  field.focus();
+}
+function stopDictation() {
+  const state = S.dictation;
+  if (!state) return;
+  S.dictation = null;
+  try { state.recognition.stop(); } catch {}
+  const { field } = micField(state.key);
+  if (field) field.placeholder = state.placeholder;
+  paintMic(state.key);
+}
+// The mic of the field being typed in, else the only one on screen.
+function focusedMicKey() {
+  const own = document.activeElement?.closest?.('.prompt-field')?.querySelector('[data-mic]');
+  const shown = [...document.querySelectorAll('[data-mic]')].filter((button) => button.offsetParent);
+  return (own || (shown.length === 1 ? shown[0] : null))?.dataset.mic || null;
+}
+if (typeof document !== 'undefined') {
+  document.addEventListener('click', (event) => {
+    const button = event.target.closest?.('[data-mic]');
+    if (button) { event.preventDefault(); toggleDictation(button.dataset.mic); }
+  });
+  // Typing takes over from the mic: what was heard stays, editable.
+  document.addEventListener('keydown', (event) => {
+    if (!S.dictation || event.metaKey || event.ctrlKey || event.altKey) return;
+    if (event.key === 'Escape' || event.target.closest?.('.prompt-field')) stopDictation();
+  }, true);
+}
+
+// Read replies aloud (Profile, this device): each new answer that lands on the
+// open task is spoken. Starting to type, dictate or send stops it.
+function readAloudEnabled() {
+  try { return typeof speechSynthesis !== 'undefined' && localStorage.getItem('karmax-read-aloud') === '1'; } catch { return false; }
+}
+function readAloud(element) {
+  if (!readAloudEnabled() || !element) return;
+  const copy = element.cloneNode(true);
+  copy.querySelectorAll('.msg-meta, button, details:not([open]) > :not(summary), pre').forEach((node) => node.remove());
+  const text = copy.textContent.replace(/\s+/g, ' ').trim().slice(0, 4000);
+  if (!text) return;
+  speechSynthesis.cancel();
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = document.documentElement.lang || navigator.language || 'en-US';
+  speechSynthesis.speak(utterance);
+}
+if (typeof document !== 'undefined') document.addEventListener('keydown', (event) => {
+  if (typeof speechSynthesis !== 'undefined' && speechSynthesis.speaking && event.target.closest?.('.prompt-field, #ck-thread')) speechSynthesis.cancel();
+}, true);
+
+// ── Web Push on this device (wiki features/push-and-voice) ───────────────────
+// The server pushes inbox items at the levels of the Push column to every
+// device a person turned push on for. Turning it on asks for the browser's
+// permission then, never before.
+function pushSupported() {
+  return typeof navigator !== 'undefined' && 'serviceWorker' in navigator && typeof window.PushManager !== 'undefined'
+    && typeof Notification !== 'undefined' && !!S.meta?.deliveryChannels?.includes('push');
+}
+// "Chrome on Android": what a person recognises a device by in their list.
+function deviceLabel() {
+  const ua = navigator.userAgent || '';
+  const browser = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Firefox\//.test(ua) ? 'Firefox'
+    : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'Browser';
+  const os = /Android/.test(ua) ? 'Android' : /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : /Mac OS X|Macintosh/.test(ua) ? 'Mac'
+    : /Windows/.test(ua) ? 'Windows' : /CrOS/.test(ua) ? 'ChromeOS' : /Linux/.test(ua) ? 'Linux' : '';
+  return os ? `${browser} on ${os}` : browser;
+}
+async function pushRegistration() {
+  return (await navigator.serviceWorker.getRegistration()) || navigator.serviceWorker.register('/service-worker.js');
+}
+// A subscription made with another key (another installation, a replaced key) cannot carry ours.
+const base64url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+function madeWithKey(subscription, publicKey) {
+  const made = subscription?.options?.applicationServerKey;
+  return !made || base64url(made) === publicKey;
+}
+// This browser's subscription, if it is one of the person's devices on the server and can carry our pushes.
+async function thisPushDevice(devices) {
+  const subscription = await (await pushRegistration())?.pushManager.getSubscription();
+  const device = subscription && devices.find((entry) => entry.endpoint === subscription.endpoint);
+  return device && madeWithKey(subscription, (await api('/api/push/key')).publicKey) ? device : null;
+}
+async function enablePush() {
+  if (await Notification.requestPermission() !== 'granted') throw new Error('Allow notifications for this site to turn push on.');
+  const { publicKey } = await api('/api/push/key');
+  const registration = await pushRegistration();
+  const key = Uint8Array.from(atob(publicKey.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
+  let subscription = await registration.pushManager.getSubscription();
+  if (subscription && !madeWithKey(subscription, publicKey)) { await subscription.unsubscribe(); subscription = null; }
+  subscription ||= await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+  return api('/api/user/push-subscriptions', { method: 'POST', body: JSON.stringify({ ...subscription.toJSON(), label: deviceLabel() }) });
+}
+async function disablePush(devices) {
+  const subscription = await (await pushRegistration())?.pushManager.getSubscription();
+  const device = subscription && devices.find((entry) => entry.endpoint === subscription.endpoint);
+  if (device) await api(`/api/user/push-subscriptions/${encodeURIComponent(device.id)}`, { method: 'DELETE' });
+  await subscription?.unsubscribe().catch(() => {});
+}
+// Signing out stops this device receiving that person's pushes (a shared computer).
+async function forgetPushDevice() {
+  if (!pushSupported()) return;
+  try {
+    const subscription = await (await navigator.serviceWorker.getRegistration())?.pushManager.getSubscription();
+    if (!subscription) return;
+    const device = (await api('/api/user/push-subscriptions')).find((entry) => entry.endpoint === subscription.endpoint);
+    if (device) await api(`/api/user/push-subscriptions/${encodeURIComponent(device.id)}`, { method: 'DELETE' });
+    await subscription.unsubscribe();
+  } catch {}
+}
+// A tapped push opens its page in this console, in place (web/service-worker.js).
+if (typeof navigator !== 'undefined' && navigator.serviceWorker?.addEventListener)
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    if (event.data?.type !== 'push-open') return;
+    try {
+      const url = new URL(event.data.url, location.origin);
+      if (url.origin === location.origin) go(`${url.pathname}${url.search}${url.hash}`);
+    } catch {}
+  });
+function pushDevicesHtml(devices, current) {
+  const others = devices.filter((device) => device.id !== current?.id);
+  return `<div class="setting-row" id="push-device-row">
+      <span class="setting-label nowrap"><label for="push-this-device">Push to this device</label> ${policyTip('Notifications reach this device even when the app is closed. The Push column chooses which.')}</span>
+      <span class="setting-value"></span>
+      <span class="setting-actions"><input class="toggle" type="checkbox" id="push-this-device" ${current ? 'checked' : ''} ${Notification.permission === 'denied' ? 'disabled title="Notifications are blocked in this browser’s site settings."' : ''}/></span>
+    </div>${others.map((device) => `<div class="setting-row push-device">
+      <span class="setting-label">${esc(device.label || 'Device')}</span>
+      <span class="setting-value setting-muted">${device.lastPushedAt ? `Last push ${esc(fmtAgo(device.lastPushedAt))}` : `Added ${esc(fmtAgo(device.createdAt))}`}</span>
+      <span class="setting-actions"><button type="button" class="icon-btn" data-push-forget="${esc(device.id)}" aria-label="Stop push to ${esc(device.label || 'this device')}" title="Stop push to ${esc(device.label || 'this device')}">${trashIcon()}</button></span>
+    </div>`).join('')}`;
+}
+async function wirePushDevices() {
+  const slot = $('#push-devices');
+  if (!slot || !pushSupported()) return;
+  let devices = [];
+  const paint = async () => {
+    devices = await api('/api/user/push-subscriptions');
+    const current = await thisPushDevice(devices).catch(() => null);
+    if (!slot.isConnected) return;
+    slot.innerHTML = pushDevicesHtml(devices, current);
+    slot.querySelector('#push-this-device')?.addEventListener('change', async (event) => {
+      const box = event.target;
+      box.disabled = true;
+      try { if (box.checked) await enablePush(); else await disablePush(devices); }
+      catch (error) { toast(error.message, true); }
+      // Granting push granted system notifications too.
+      if (Notification.permission === 'granted') $('#notify-permission')?.remove();
+      await paint().catch((error) => toast(error.message, true));
+    });
+    slot.querySelectorAll('[data-push-forget]').forEach((button) => button.addEventListener('click', async () => {
+      try { await api(`/api/user/push-subscriptions/${encodeURIComponent(button.dataset.pushForget)}`, { method: 'DELETE' }); }
+      catch (error) { toast(error.message, true); }
+      await paint().catch(() => {});
+    }));
+  };
+  await paint().catch((error) => toast(error.message, true));
+}
+
 // ── notification behaviour, per urgency ─────────────────────────────────────
 // Browser alerts are local to this device; email preferences are stored on the server.
 const NOTIFY_BEHAVIOURS = [
@@ -25022,7 +25250,10 @@ const NOTIFY_BEHAVIOURS = [
   { key: 'sound', label: 'Sound' },
   { key: 'visual', label: 'In app' },
   { key: 'email', label: 'Email' },
+  { key: 'push', label: 'Push' },
 ];
+// Email and Push are the person's, kept on the server per organization; the rest are this browser's.
+const SERVER_BEHAVIOURS = ['email', 'push'];
 // Sensible defaults: silence is the floor, and each level up interrupts a little
 // more. Nothing below high interrupts at all — an inbox that pings for routine
 // news is one people turn off entirely.
@@ -25460,6 +25691,11 @@ function profileView() {
           <span class="setting-value"></span>
           <span class="setting-actions"><input class="toggle" type="checkbox" id="profile-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /></span>
         </label>
+        ${typeof speechSynthesis === 'undefined' ? '' : `<label class="setting-row" for="profile-read-aloud">
+          <span class="setting-label">Read replies aloud ${policyTip('Speaks each new answer on the task you have open, on this device. Typing stops it.')}</span>
+          <span class="setting-value"></span>
+          <span class="setting-actions"><input class="toggle" type="checkbox" id="profile-read-aloud" ${readAloudEnabled() ? 'checked' : ''} /></span>
+        </label>`}
         ${profileWalkthroughRow(u?.id)}
       </div>
     </div>
@@ -25495,6 +25731,8 @@ function notificationsCard() {
   const prefs = notifyPrefs();
   const sound = notificationSoundPrefs();
   const emailReady = S.meta?.deliveryChannels?.includes('email');
+  // Push is a column wherever this installation sends it; the device switch below only where this browser can receive it.
+  const behaviours = NOTIFY_BEHAVIOURS.filter((behaviour) => behaviour.key !== 'push' || S.meta?.deliveryChannels?.includes('push'));
   const permission = typeof Notification === 'undefined' ? 'unsupported' : Notification.permission;
   const permissionNote = {
     denied: '<p class="notify-note">System notifications are blocked in this browser’s site settings.</p>',
@@ -25506,19 +25744,24 @@ function notificationsCard() {
     visual: 'A banner inside the app.',
     email: emailReady ? 'Sent to your account email for this organization, even when the app is closed.'
       : S.installationAccess ? 'Email isn’t set up yet: Installation → Email.' : 'Your administrator hasn’t set up email.',
+    push: 'Sent to every device you turned push on for, even when the app is closed.',
+  };
+  const serverValue = (key, level) => {
+    const prefs = S.deliveryPreferences;
+    return key === 'email' ? prefs?.emailUrgencies?.[level] ?? prefs?.email : prefs?.pushUrgencies?.[level];
   };
   // Loudest first, the same order the inbox itself is in.
   const levels = [...URGENCY_LEVELS].reverse();
   return `<div class="card" id="notifications">
-    <div class="section-h">Notifications ${policyTip('Agents set an urgency when they need you; approvals arrive as high. Choose what each level does. Everything except email applies to this browser only.')}</div>
-    <div class="notify-grid">
-      <div class="notify-row notify-head"><span>Urgency</span>${NOTIFY_BEHAVIOURS.map((behaviour) =>
+    <div class="section-h">Notifications ${policyTip('Agents set an urgency when they need you; approvals arrive as high. Choose what each level does. Everything except email and push applies to this browser only.')}</div>
+    <div class="notify-grid" style="--notify-columns:${behaviours.length}">
+      <div class="notify-row notify-head"><span>Urgency</span>${behaviours.map((behaviour) =>
     behaviour.key === 'email' && !emailReady ? `<span class="notify-off">${behaviour.label} ${policyTip(headTip.email)}</span>`
       : `<span title="${esc(headTip[behaviour.key])}">${behaviour.label}</span>`).join('')}<span></span></div>
       ${levels.map((level) => `<div class="notify-row" data-notify-level="${level}">
         <span class="urgency-chip ${level}">${level.charAt(0).toUpperCase() + level.slice(1)}</span>
-        ${NOTIFY_BEHAVIOURS.map((behaviour) => `<span><input type="checkbox" data-notify="${level}:${behaviour.key}"
-          aria-label="${behaviour.label} for ${level} urgency" ${behaviour.key === 'email' && !emailReady ? `title="${esc(headTip.email)}"` : ''} ${(behaviour.key === 'email' ? S.deliveryPreferences?.emailUrgencies?.[level] ?? S.deliveryPreferences?.email : prefs[level][behaviour.key]) ? 'checked' : ''} ${behaviour.key === 'email' && (!emailReady || S.deliveryPreferences?.organizationId !== S.organizationId) ? 'disabled' : ''}/></span>`).join('')}
+        ${behaviours.map((behaviour) => { const server = SERVER_BEHAVIOURS.includes(behaviour.key); return `<span><input type="checkbox" data-notify="${level}:${behaviour.key}"
+          aria-label="${behaviour.label} for ${level} urgency" ${behaviour.key === 'email' && !emailReady ? `title="${esc(headTip.email)}"` : ''} ${(server ? serverValue(behaviour.key, level) : prefs[level][behaviour.key]) ? 'checked' : ''} ${server && (behaviour.key === 'email' && !emailReady || S.deliveryPreferences?.organizationId !== S.organizationId) ? 'disabled' : ''}/></span>`; }).join('')}
         <span><button class="btn sm" type="button" data-notify-test="${level}" title="Send a test ${level} notification">Test</button></span>
       </div>`).join('')}
     </div>
@@ -25529,6 +25772,7 @@ function notificationsCard() {
           <select id="notify-duration" aria-label="Duration">${[0.35, 1, 3, 5].map((duration) => `<option value="${duration}" ${sound.duration === duration ? 'selected' : ''}>${duration === 0.35 ? 'Brief' : `${duration} second${duration === 1 ? '' : 's'}`}</option>`).join('')}</select></span>
         <span class="setting-actions"><button class="btn sm" id="notify-preview" type="button" title="Play the sound">▶ Preview</button></span>
       </div>
+      ${pushSupported() ? '<div id="push-devices" class="setting-rows"></div>' : ''}
     </div>
     ${permissionNote}
   </div>`;
@@ -25543,7 +25787,12 @@ function wireNotificationsCard() {
       box.checked = prefs.emailUrgencies?.[box.dataset.notify.split(':')[0]] ?? prefs.email;
       box.disabled = !S.meta?.deliveryChannels?.includes('email');
     });
+    document.querySelectorAll('[data-notify$=":push"]').forEach((box) => {
+      box.checked = !!prefs.pushUrgencies?.[box.dataset.notify.split(':')[0]];
+      box.disabled = false;
+    });
   }).catch((error) => toast(error.message, true));
+  wirePushDevices();
   for (const id of ['notify-tone', 'notify-duration']) $('#' + id)?.addEventListener('change', () => {
     try { localStorage.setItem('karmax-notify-sound', JSON.stringify({ tone: $('#notify-tone').value, duration: Number($('#notify-duration').value) })); } catch {}
   });
@@ -25556,14 +25805,15 @@ function wireNotificationsCard() {
     requestAnimationFrame(() => $('#notifications')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
   $('#main').querySelectorAll('[data-notify]').forEach((box) => box.addEventListener('change', async () => {
     const [level, behaviour] = box.dataset.notify.split(':');
-    if (behaviour === 'email') {
-      const boxes = [...document.querySelectorAll('[data-notify$=":email"]')];
+    if (SERVER_BEHAVIOURS.includes(behaviour)) {
+      const boxes = [...document.querySelectorAll(`[data-notify$=":${behaviour}"]`)];
       boxes.forEach((input) => input.disabled = true);
       try {
         const prefs = S.deliveryPreferences;
-        const emailUrgencies = Object.fromEntries(URGENCY_LEVELS.map((key) => [key, prefs.emailUrgencies?.[key] ?? prefs.email]));
-        emailUrgencies[level] = box.checked;
-        const saved = await api(`/api/inbox/preferences?organizationId=${encodeURIComponent(organizationId)}`, { method: 'PUT', body: JSON.stringify({ ...prefs, emailUrgencies }) });
+        const field = `${behaviour}Urgencies`;
+        const levels = Object.fromEntries(URGENCY_LEVELS.map((key) => [key, behaviour === 'email' ? prefs.emailUrgencies?.[key] ?? prefs.email : !!prefs.pushUrgencies?.[key]]));
+        levels[level] = box.checked;
+        const saved = await api(`/api/inbox/preferences?organizationId=${encodeURIComponent(organizationId)}`, { method: 'PUT', body: JSON.stringify({ ...prefs, [field]: levels }) });
         if (S.organizationId === organizationId) S.deliveryPreferences = saved;
       } catch (error) { box.checked = !box.checked; toast(error.message, true); }
       finally { boxes.forEach((input) => input.disabled = false); }
@@ -25770,8 +26020,13 @@ function wireProfileView() {
     setMathjaxEnabled(e.target.checked);
     toast(`MathJax ${e.target.checked ? 'on' : 'off'}`);
   });
+  $('#profile-read-aloud')?.addEventListener('change', (e) => {
+    try { localStorage.setItem('karmax-read-aloud', e.target.checked ? '1' : '0'); } catch {}
+    if (!e.target.checked) speechSynthesis.cancel();
+  });
   $('#export-user-data')?.addEventListener('click', () => location.assign('/api/user/export'));
   $('#profile-logout')?.addEventListener('click', async () => {
+    await forgetPushDevice();
     try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
     location.reload();
   });
@@ -27747,6 +28002,8 @@ const HOST_COMMANDS = [
   { id: 'nav.profile', title: 'Go to your profile', key: 'g A', ...navCommand(() => profileRoute()) },
   { id: 'nav.notifications', title: 'Go to inbox', key: 'g N', ...navCommand(() => inboxRoute(DEFAULT_LIST_QUERY)) },
   { id: 'nav.vault', title: 'Go to passwords & payments', key: 'g V', ...navCommand(() => `${globalRoute('organization')}#settings-payments`) },
+  // Dictation in the prompt being typed (or the only one shown); works while typing.
+  { id: 'compose.voice', title: 'Dictate', key: 'meta+shift+S', group: 'Compose', available: () => !!focusedMicKey(), run: () => toggleDictation(focusedMicKey()) },
   { id: 'view.save', title: 'Save search as view', key: 'v s', group: 'Views', available: () => isTaskListTab() && !S.selected && canSaveViews(), run: () => saveCurrentView() },
   { id: 'nav.close', title: 'Close panel', key: null, run: () => closeTopOverlay() }, // Esc — handled by the dispatcher
 ];
@@ -28227,6 +28484,11 @@ function bindKeys() {
       if (e.key === 'Escape') { t.blur(); resetChord(); }
       // modifier-bearing bindings (⌘K) still work while typing outside overlays
       else if ((e.metaKey || e.ctrlKey) && !overlayOpen) dispatchKey(e);
+      // …and dictation inside one too (the task form): it acts on the field being typed in.
+      else if ((e.metaKey || e.ctrlKey) && focusedMicKey()) {
+        const dictate = allCommands().find((command) => command.id === 'compose.voice');
+        if (dictate?.keys?.length === 1 && stepMatches(dictate.keys[0], e)) { e.preventDefault(); dictate.run(); }
+      }
       return;
     }
     // A checkbox, radio or slider keeps the named keys it uses (Space, Enter,
