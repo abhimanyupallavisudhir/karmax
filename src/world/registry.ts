@@ -4,6 +4,7 @@ import { SharedWorldCoordination } from './shared-coordination.js';
 import { World, WorldHandle, WorldKind, WorldLifecycleState, WorldOpenOptions, WorldProvider, WorldSpec } from './types.js';
 import { WorktreeProvider } from './worktree.js';
 import { MemoryWorldProvider } from './memory.js';
+import { NoneWorldProvider } from './none.js';
 import { ContainerWorldProvider } from './container.js';
 import { E2BWorldProvider } from './e2b.js';
 import { DaytonaWorldProvider } from './daytona.js';
@@ -28,6 +29,7 @@ export class WorldRegistry {
     this.operations = new WorldOperationLock(this.shared);
     this.register(new WorktreeProvider());
     this.register(new MemoryWorldProvider());
+    this.register(new NoneWorldProvider());
     this.register(new ContainerWorldProvider());
     this.register(new E2BWorldProvider());
     this.register(new DaytonaWorldProvider());

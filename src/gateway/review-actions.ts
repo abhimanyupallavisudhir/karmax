@@ -1,4 +1,5 @@
 import { ExecutionOutput } from './execution-output.js';
+import { LOCAL_WORLD_KINDS } from '../domain/computer.js';
 import type { TaskSecrets } from '../autonomy/task-secrets.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
@@ -321,7 +322,7 @@ export class ReviewActionRunner {
 /** Localhost in a cloud world means that world's loopback, not the browser's.
  * Route it through karmax's authenticated preview proxy. */
 async function reviewUrl(store: Store, taskId: string, world: WorldHandle, value: string, leases: string[]): Promise<string> {
-  if (['worktree', 'container', 'memory'].includes(world.kind)) return value;
+  if (LOCAL_WORLD_KINDS.includes(world.kind)) return value;
   try {
     const port = loopbackPort(value);
     if (port === undefined) return value;

@@ -1676,7 +1676,10 @@ const localWorldPath = (v) => (hostLocal() && v.worldPath) || '';
 // hibernateAfterDays, network}); the block shows the effective machine and a
 // form stores only what differs from what it inherits.
 const COMPUTER_PROVIDER_LABELS = { any: 'Any', e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', aws: 'AWS', gcp: 'Google Cloud',
-  worktree: 'This machine', container: 'Docker container' };
+  worktree: 'This machine', container: 'Docker container', none: 'None' };
+// No computer (wiki features/computerless-tasks): the agent runs on tavya with its own tools only.
+const NO_COMPUTER = 'none';
+const NO_COMPUTER_TIP = 'No computer: the agent can only use tavya itself. Starts in seconds and uses no compute.';
 const CLOUD_COMPUTERS = ['e2b', 'daytona', 'fly', 'hetzner', 'aws', 'gcp'];
 const COMPUTER_REGION_LABELS = { eu: 'EU', us: 'US' };
 // Provider "Any" (wiki features/compute-routing): the cloud accounts it can
@@ -1763,7 +1766,9 @@ function computerProviderOptions(current, inFlight = false) {
     .map((c) => c.provider);
   // "Any" first: tavya chooses among the cloud computers (hosted's default).
   const any = S.meta?.hosted || connected.some((provider) => CLOUD_COMPUTERS.includes(provider)) || current === 'any' ? ['any'] : [];
-  return [...new Set([...any, ...connected, ...local, ...(current ? [current] : [])])];
+  // None last: a running task neither gains nor loses its computer.
+  const none = inFlight ? [] : [NO_COMPUTER];
+  return [...new Set([...any, ...connected, ...local, ...none, ...(current ? [current] : [])])];
 }
 const gbOf = (mb) => (mb == null ? '' : String(Math.round((mb / 1024) * 100) / 100));
 function computerBlockHtml(name, value, inherited, opts = {}) {
@@ -1781,12 +1786,13 @@ function computerBlockHtml(name, value, inherited, opts = {}) {
   const tip = (key) => (size[key].title ? ` title="${esc(size[key].title)}"` : '');
   const body = `<div class="computer-controls">
       <span class="computer-pick"><select class="cf-provider" aria-label="Provider">${computerProviderOptions(provider, opts.inFlight).map((p) => `<option value="${esc(p)}" ${p === provider ? 'selected' : ''}>${esc(COMPUTER_PROVIDER_LABELS[p] || p)}</option>`).join('')}</select>
-      <span class="cf-reach"${provider === 'any' ? '' : ' hidden'}>${policyTip(`Any: ${computerReachText()}. ${ANY_TIP}`)}</span></span>
-      <label class="computer-size"${tip('cpu')}><input class="cf-cpu" type="number" min="1" ${sizeAttrs('cpu')} step="1" inputmode="numeric" value="${esc(v.cpu ?? '')}" aria-label="CPU"><span>CPU</span></label>
-      <label class="computer-size"${tip('memory')}><input class="cf-memory" type="number" min="0.5" ${sizeAttrs('memory')} step="0.5" inputmode="decimal" value="${esc(gbOf(v.memoryMb))}" aria-label="Memory in GB"><span>GB RAM</span></label>
-      <label class="computer-size"${tip('disk')}><input class="cf-disk" type="number" min="1" ${sizeAttrs('disk')} step="1" inputmode="numeric" value="${esc(v.diskGb ?? '')}" aria-label="Disk in GB"><span>GB disk</span></label>
+      <span class="cf-reach"${provider === 'any' ? '' : ' hidden'}>${policyTip(`Any: ${computerReachText()}. ${ANY_TIP}`)}</span>
+      <span class="cf-none"${provider === NO_COMPUTER ? '' : ' hidden'}>${policyTip(NO_COMPUTER_TIP)}</span></span>
+      <label class="computer-size"${tip('cpu')}${provider === NO_COMPUTER ? ' hidden' : ''}><input class="cf-cpu" type="number" min="1" ${sizeAttrs('cpu')} step="1" inputmode="numeric" value="${esc(v.cpu ?? '')}" aria-label="CPU"><span>CPU</span></label>
+      <label class="computer-size"${tip('memory')}${provider === NO_COMPUTER ? ' hidden' : ''}><input class="cf-memory" type="number" min="0.5" ${sizeAttrs('memory')} step="0.5" inputmode="decimal" value="${esc(gbOf(v.memoryMb))}" aria-label="Memory in GB"><span>GB RAM</span></label>
+      <label class="computer-size"${tip('disk')}${provider === NO_COMPUTER ? ' hidden' : ''}><input class="cf-disk" type="number" min="1" ${sizeAttrs('disk')} step="1" inputmode="numeric" value="${esc(v.diskGb ?? '')}" aria-label="Disk in GB"><span>GB disk</span></label>
     </div>
-    <details class="computer-more"${opts.open ? ' open' : ''}><summary>More</summary><div class="computer-more-grid">
+    <details class="computer-more"${opts.open ? ' open' : ''}${provider === NO_COMPUTER ? ' hidden' : ''}><summary>More</summary><div class="computer-more-grid">
       <label class="form-row"${features.desktop ? '' : ' hidden'}><span>Experience ${policyTip('Desktop adds a screen you can watch and take over.')}</span><select class="cf-flavor" ${fixed}>
         <option value="headless" ${v.flavor !== 'desktop' ? 'selected' : ''}>Headless</option><option value="desktop" ${v.flavor === 'desktop' ? 'selected' : ''}>Desktop</option></select></label>
       <label class="form-row"${provider === 'any' ? '' : ' hidden'}><span>Region ${policyTip('Where Any may put the computer, for data that must stay there.')}</span><select class="cf-region">
@@ -1870,6 +1876,8 @@ function readComputerBlock(box) {
   const memory = number('.cf-memory');
   // A provider without a desktop or an allowlist gets headless and normal
   // internet, even if the defaults it inherits ask for more.
+  // Without a computer there is nothing to size or wall in.
+  if (value('.cf-provider') === NO_COMPUTER) return { provider: NO_COMPUTER };
   const features = computerFeaturesFor(value('.cf-provider'));
   const out = {
     provider: value('.cf-provider') || undefined,
@@ -1923,6 +1931,13 @@ function syncComputerBlock(box) {
   if (row('.cf-region')) row('.cf-region').hidden = provider !== 'any';
   const reach = box.querySelector('.cf-reach');
   if (reach) reach.hidden = provider !== 'any';
+  // No computer: nothing to size, so only the provider (and its tip) shows.
+  const none = provider === NO_COMPUTER;
+  const noneTip = box.querySelector('.cf-none');
+  if (noneTip) noneTip.hidden = !none;
+  box.querySelectorAll('.computer-size').forEach((label) => { label.hidden = none; });
+  const more = box.querySelector('.computer-more');
+  if (more) more.hidden = none;
   if (row('.cf-flavor')) row('.cf-flavor').hidden = !features.desktop;
   const networks = computerNetworks(features);
   const networkSelect = box.querySelector('.cf-network');
@@ -6099,6 +6114,7 @@ function renderShell() {
           <div class="rail-new" role="group" aria-label="New task">
             <button class="btn primary rail-new-task" id="rail-new-task" type="button" data-shortcut="nav.newTaskDefault" title="${esc(commandHint('New task', 'nav.newTaskDefault'))}">${ICON.plus}<span>New task</span></button>
             <button class="btn primary rail-new-template" id="rail-new-template" type="button" data-shortcut="nav.newTask" aria-label="New task from template" title="${esc(commandHint('New task from template', 'nav.newTask'))}">${ICON.template}</button>
+            <button class="btn rail-ask" id="rail-ask" type="button" data-shortcut="nav.ask" aria-label="Ask ${esc(siteName())}" aria-haspopup="dialog" title="${esc(commandHint(`Ask ${siteName()} — no computer, starts in seconds`, 'nav.ask'))}">${ICON.chat}</button>
           </div>
           <nav class="rail-org-nav" aria-label="Organization">${RAIL_ORG_NAV.map(([id, label, icon, , , , command]) =>
             `<a class="rail-row" id="${id}" data-spa data-shortcut="${command}" href="#">${ICON[icon]}<span>${label}</span></a>`).join('')}</nav>
@@ -6126,6 +6142,7 @@ function renderShell() {
   $('#rail-palette').addEventListener('click', openPalette);
   $('#rail-new-task').addEventListener('click', () => openNewTaskForm());
   $('#rail-new-template').addEventListener('click', () => openTemplatePicker());
+  $('#rail-ask').addEventListener('click', () => askTavya());
   $('#rail-help').addEventListener('click', openHelp);
   $('#key-echo').addEventListener('animationend', () => echoKeys('')); // faded out
   wireVerificationBanner();
@@ -8627,6 +8644,59 @@ function openNewTaskForm(template, projectId = template?.projectId) {
     { projectId, ...(template ? { template } : {}) });
 }
 function newTaskTarget() { return S.tab === 'home' ? newTaskProjectId() : S.projectId; }
+
+// "Ask tavya" (wiki features/computerless-tasks): what you type starts a task
+// without a computer in the project new tasks go to, acting with your own
+// authority; its page opens with the message box ready. One conversation is one task.
+function askTavya(projectId) {
+  if (!projectId) return withNewTaskProject((chosen) => askTavya(chosen));
+  const previousFocus = document.activeElement;
+  const dialog = document.createElement('dialog');
+  dialog.className = 'text-prompt ask-dialog';
+  dialog.setAttribute('aria-label', `Ask ${siteName()}`);
+  const mic = micButtonHtml('ask');
+  dialog.innerHTML = `<form method="dialog"><div class="prompt-field"><textarea name="ask" rows="3" required maxlength="20000" aria-label="Ask ${esc(siteName())}"
+      placeholder="Ask ${esc(siteName())} anything: change a setting, find what waits on you, start a task…"></textarea>
+      ${mic ? `<div class="prompt-attach-row ask-mic">${mic}</div>` : ''}</div>
+    <div class="inline-form ask-foot"><span class="ask-where">${esc(projectById(projectId)?.name || '')}${policyTip(NO_COMPUTER_TIP)}</span>
+      <button class="btn primary" value="submit" title="Ask (Enter)">Ask</button></div></form>`;
+  const input = dialog.querySelector('textarea');
+  const form = dialog.querySelector('form');
+  let sending = false;
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (!text || sending) return;
+    sending = true;
+    dialog.querySelector('button[value="submit"]').disabled = true;
+    try {
+      const created = await api(`/api/projects/${encodeURIComponent(projectId)}/tasks`, { method: 'POST', body: JSON.stringify({
+        workflow: NEW_TASK_WORKFLOW, ownAuthority: true, params: { prompt: text, computer: { provider: NO_COMPUTER } } }) });
+      dialog.close();
+      await goToTask(created.id);
+      focusWhenReady('.followup-input');
+    } catch (error) {
+      toast(error.message, true);
+      sending = false;
+      dialog.querySelector('button[value="submit"]').disabled = false;
+    }
+  });
+  dialog.addEventListener('keydown', (event) => {
+    event.stopPropagation(); // the console's shortcuts stay outside, but for dictation
+    if (runDictationShortcut(event)) return;
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); form.requestSubmit(); }
+  });
+  dialog.addEventListener('close', () => { stopDictation(); dialog.remove(); if (!sending) previousFocus?.focus?.(); });
+  document.body.appendChild(dialog);
+  dialog.showModal();
+  input.focus();
+}
+/** Focus what a page is about to render (a task page's message box). */
+function focusWhenReady(selector, deadline = Date.now() + 8000) {
+  const el = document.querySelector(selector);
+  if (el && !el.disabled) { el.focus(); return; }
+  if (Date.now() < deadline) setTimeout(() => focusWhenReady(selector, deadline), 100);
+}
 function wireNewTaskComposer() {
   $('#expand-task')?.addEventListener('click', () => openNewTaskForm());
   $('#new-from-template')?.addEventListener('click', () => openTemplatePicker());
@@ -9537,7 +9607,7 @@ function readinessGaps(readiness, projectId) {
   const needs = new Map();
   for (const agent of (readiness.agents || []).filter((a) => !a.ready)) {
     const need = agent.need || { provider: agent.provider };
-    needs.set(`${need.provider}:${need.off || ''}`, need);
+    needs.set(`${need.provider}:${need.off || ''}:${need.computerless ? 'none' : ''}`, need);
   }
   // A model on the compute credit (any OpenRouter model, with no login or key
   // of the organization's own) that costs much more than the included one.
@@ -9549,6 +9619,12 @@ function readinessGaps(readiness, projectId) {
   }
   for (const need of needs.values()) {
     const name = ACCOUNT_PROVIDER_LABELS[need.provider] || need.provider;
+    // Without a computer only an API key (or the included model) runs the agent.
+    if (need.computerless) {
+      gaps.push({ label: /runs only on a computer/.test(need.computerless) ? `Add a ${name} API key` : 'Pick another model',
+        href: `${settings}#settings-agents`, tip: need.computerless });
+      continue;
+    }
     gaps.push(need.off === 'project'
       ? { label: `Turn on ${name}`, href: `${projectRoute(projectId, 'settings')}#project-agents`,
         tip: `Your ${name} account is switched off for this project.` }
@@ -9596,7 +9672,9 @@ function wireTaskReadiness(page, projectId) {
       const spec = readAgentSpec(box);
       return spec.provider ? `${spec.provider}${spec.model ? `:${spec.model}${spec.effort ? `:${spec.effort}` : ''}` : ''}` : '';
     }).filter(Boolean);
-    const query = new URLSearchParams(agents.map((agent) => ['agent', agent])).toString();
+    // A task without a computer needs no compute, and runs only on an API key or the included model.
+    const computerless = page.querySelector('.computer-field .cf-provider')?.value === NO_COMPUTER;
+    const query = new URLSearchParams([...agents.map((agent) => ['agent', agent]), ...(computerless ? [['computer', NO_COMPUTER]] : [])]).toString();
     if (query === asked) return;
     asked = query;
     const readiness = await api(`/api/projects/${encodeURIComponent(projectId)}/readiness?${query}`).catch(() => null);
@@ -14671,6 +14749,7 @@ function presenceDetail(v) {
 
 // A finished task's workspace was released, not never started.
 function noWorkspaceLabel(v) {
+  if (v.worldProvider === NO_COMPUTER) return 'No computer';
   return ['done', 'cancelled', 'failed'].includes(v.status) ? 'Workspace closed' : 'No workspace yet';
 }
 
@@ -25106,6 +25185,16 @@ function stopDictation() {
   if (field) field.placeholder = state.placeholder;
   paintMic(state.key);
 }
+/** Dictation's shortcut, for a field inside an overlay that keeps the console's
+ * other shortcuts out (the task form, Ask): true when it ran. */
+function runDictationShortcut(event) {
+  if (!(event.metaKey || event.ctrlKey) || !focusedMicKey()) return false;
+  const dictate = allCommands().find((command) => command.id === 'compose.voice');
+  if (!(dictate?.keys?.length === 1 && stepMatches(dictate.keys[0], event))) return false;
+  event.preventDefault();
+  dictate.run();
+  return true;
+}
 // The mic of the field being typed in, else the only one on screen.
 function focusedMicKey() {
   const own = document.activeElement?.closest?.('.prompt-field')?.querySelector('[data-mic]');
@@ -27995,6 +28084,7 @@ const HOST_COMMANDS = [
   // `n` picks a template (0, the Task defaults, is Enter); `N` skips the picker.
   { id: 'nav.newTask', title: 'New task from template', key: 'n', group: 'General', run: () => openTemplatePicker() },
   { id: 'nav.newTaskDefault', title: 'New task', key: 'N', group: 'General', run: () => openNewTaskForm() },
+  { id: 'nav.ask', title: 'Ask tavya', key: 'A', group: 'General', run: () => askTavya() },
   { id: 'nav.search', title: 'Search tasks', key: '/', group: 'General', run: () => { if (!isTaskListTab()) switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
   { id: 'nav.home', title: 'Go home', key: 'g H', ...navCommand(() => homeRoute(currentOrg(), DEFAULT_LIST_QUERY)) },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', ...navCommand(() => tabRoute('tasks')) },
@@ -28495,10 +28585,7 @@ function bindKeys() {
       // modifier-bearing bindings (⌘K) still work while typing outside overlays
       else if ((e.metaKey || e.ctrlKey) && !overlayOpen) dispatchKey(e);
       // …and dictation inside one too (the task form): it acts on the field being typed in.
-      else if ((e.metaKey || e.ctrlKey) && focusedMicKey()) {
-        const dictate = allCommands().find((command) => command.id === 'compose.voice');
-        if (dictate?.keys?.length === 1 && stepMatches(dictate.keys[0], e)) { e.preventDefault(); dictate.run(); }
-      }
+      else if (e.metaKey || e.ctrlKey) runDictationShortcut(e);
       return;
     }
     // A checkbox, radio or slider keeps the named keys it uses (Space, Enter,

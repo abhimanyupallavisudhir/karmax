@@ -55,7 +55,7 @@ import { compactTaskView, platformRequestPathError } from '../platform/platform-
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { manifest } from '../contrib/manifests.js';
-import { machineShape } from '../domain/computer.js';
+import { LOCAL_WORLD_KINDS, isComputerless, machineShape, runsOnHost } from '../domain/computer.js';
 import { projectSettingsFor, globalSettingsFor, settingsToProjectConfig, resolveParams, effectiveRepos } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { findProviderSession } from '../agent/fork.js';
@@ -95,7 +95,7 @@ import { ARTIFICIAL_ANALYSIS_KEY_ENV, ArtificialAnalysis, toBenchmarks, type Mod
 import type { IdentityService } from '../auth/identity.js';
 import type { RepositoryFiles } from '../store/project-environment.js';
 import { AuthorizationGrantError, ORGANIZATION_GRANT_CEILING, type AuthorizationService } from '../platform/authorization.js';
-import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, ORGANIZATION_WIKI_WRITE_DENIED, allows, type Capability } from '../platform/capabilities.js';
+import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, ORGANIZATION_WIKI_WRITE_DENIED, allows, type Capability, type KnownCapability } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { EXPLANATIONS_ENABLED, RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { hostLocal } from '../config/deployment.js';
@@ -227,7 +227,10 @@ export interface GatewayDeps {
  * Returns the required capability, `'none'` for routes that intentionally need
  * no capability, or undefined for a route this catalog does not know — callers
  * apply the conservative fallback, and tests assert the catalog stays complete. */
-export function routeCapability(method: string, p: string, url?: URL): string | undefined {
+/** The capability a route requires. Typed as the catalogue, so a route can
+ * never require something a grant cannot name (or a `*` grant held back from
+ * a task without a computer could silently lose). */
+export function routeCapability(method: string, p: string, url?: URL): KnownCapability | 'none' | undefined {
   const read = method === 'GET';
   if (p === '/api/connections/config') return read ? 'credential:read' : 'settings:write';
   if (p.startsWith('/api/connections')) return p.endsWith('/execute') || p === '/api/connections/request' ? 'connection:use' : 'credential:read';
@@ -624,7 +627,7 @@ function isWorldHandle(value: unknown): value is Record<string, unknown> & { kin
 
 function worldHandleIsRemote(handle: { kind: string; provider?: unknown }): boolean {
   const provider = typeof handle.provider === 'string' ? handle.provider : handle.kind;
-  return !['worktree', 'container', 'memory'].includes(provider);
+  return !LOCAL_WORLD_KINDS.includes(provider);
 }
 
 function isTaskView(value: Record<string, unknown>): boolean {
@@ -675,11 +678,12 @@ export function toPublicPayload(value: unknown): unknown {
   for (const [key, item] of Object.entries(input)) {
     if (key === 'recoveryWorld' && isWorldHandle(item)) continue;
     if (taskView && key === 'world') continue;
-    if (taskView && key === 'worldPath' && handle && worldHandleIsRemote(handle)) continue;
+    if (taskView && key === 'worldPath' && handle && (worldHandleIsRemote(handle) || isComputerless(handle.kind))) continue;
     out[key] = toPublicPayload(item);
   }
   if (taskView) {
-    out.worldAvailable = Boolean(handle || input.worldPath);
+    // A task without a computer has no workspace: no terminal, files or previews.
+    out.worldAvailable = !(handle && isComputerless(handle.kind)) && Boolean(handle || input.worldPath);
     if (handle) {
       out.worldProvider = handle.provider ?? handle.kind;
       const handleMeta = handle.meta && typeof handle.meta === 'object'
@@ -2765,6 +2769,7 @@ export class Gateway {
           scope: summary.scope,
           capabilities: summary.held,
           missing: summary.missing,
+          ...(await this.heldBackOf(authRecord)),
           ...(target !== null ? { check: await this.routeCheck(req, authRecord, targetMethod, target) } : {}),
         });
       }
@@ -3294,7 +3299,7 @@ export class Gateway {
           const b = await this.body(req);
           const policy = b.policy && typeof b.policy === 'object' ? b.policy : {};
           try {
-            if (policy.worldProvider && !['worktree', 'container', 'memory'].includes(String(policy.worldProvider))
+            if (policy.worldProvider && !LOCAL_WORLD_KINDS.includes(String(policy.worldProvider))
               && !(await this.deps.providerConnections?.available(organizationId, String(policy.worldProvider))))
               throw new Error(`${policy.worldProvider} is not connected and verified`);
             if (policy.resources && typeof policy.resources === 'object')
@@ -3798,7 +3803,7 @@ export class Gateway {
           });
           const provider = String(b.provider ?? 'e2b');
           const hostedCustomerWorld = this.deps.hosted === true
-            && !['worktree', 'container', 'memory'].includes(provider);
+            && !LOCAL_WORLD_KINDS.includes(provider);
           return this.json(res, 200, (await store.createRunnerPool({ organizationId, name: String(b.name ?? 'Runner pool'),
             provider, region: b.region ? String(b.region) : undefined,
             mode: b.mode === 'managed' ? 'managed' : 'customer', enabled: b.enabled !== false,
@@ -3817,7 +3822,7 @@ export class Gateway {
           const b = await this.body(req);
           try {
             const hostedCustomerWorld = this.deps.hosted === true && current.mode === 'customer'
-              && !['worktree', 'container', 'memory'].includes(current.provider);
+              && !LOCAL_WORLD_KINDS.includes(current.provider);
             return this.json(res, 200, (await store.createRunnerPool({ ...current,
               name: b.name == null ? current.name : String(b.name),
               region: b.region === null ? undefined : b.region == null ? current.region : String(b.region),
@@ -4423,7 +4428,7 @@ export class Gateway {
             }
             const config = normalizeConfig(b.config, false, this.deps.hosted === true);
             const project = (await store.getProject(id));
-            if (config.worldProvider && !['worktree', 'container', 'memory'].includes(config.worldProvider) && project?.organizationId &&
+            if (config.worldProvider && !LOCAL_WORLD_KINDS.includes(config.worldProvider) && project?.organizationId &&
                 !(await this.deps.providerConnections?.available(project.organizationId, config.worldProvider))) {
               throw new Error(`${config.worldProvider} is not connected. Connect and verify it in Organization settings first.`);
             }
@@ -4508,7 +4513,8 @@ export class Gateway {
           return { provider: value.slice(0, at), ...(model ? { model } : {}), ...(effort ? { effort: effort as Effort } : {}) };
         }).filter((agent): agent is { provider: Provider; model?: string; effort?: Effort } => isAgentProvider(agent.provider));
         return this.json(res, 200, (await projectReadiness(this.readinessDeps(),
-          { organizationId: project.organizationId ?? 'org_personal', projectId: project.id }, agents)));
+          { organizationId: project.organizationId ?? 'org_personal', projectId: project.id }, agents,
+          { computerless: url.searchParams.get('computer') === 'none' })));
       }
       const projectExecution = p.match(/^\/api\/projects\/([^/]+)\/execution-policy$/);
       if (projectExecution) {
@@ -4525,7 +4531,7 @@ export class Gateway {
           try {
             const candidate = { ...project, config: applyExecutionOverride(project.config, override) };
             const effective = (await store.effectiveProjectConfig(candidate));
-            if (effective.worldProvider && !['worktree', 'container', 'memory'].includes(effective.worldProvider)
+            if (effective.worldProvider && !LOCAL_WORLD_KINDS.includes(effective.worldProvider)
               && !(await this.deps.providerConnections?.available(project.organizationId!, effective.worldProvider)))
               throw new Error(`${effective.worldProvider} is not connected and verified in Organization settings`);
             if (override.resources && typeof override.resources === 'object')
@@ -10851,6 +10857,18 @@ export class Gateway {
     }
   }
 
+  /** What the calling task holds back because it has no computer and has not
+   * been granted since (wiki features/computerless-tasks), so its agent knows
+   * to ask with request_permission rather than try. */
+  private async heldBackOf(authRecord: { taskId?: string; caps: string[] }): Promise<{ heldBack?: string[] }> {
+    const taskId = authRecord.taskId && authRecord.taskId !== '*' ? authRecord.taskId : undefined;
+    const held = taskId ? ((await this.deps.store.getTask(taskId))?.params?._authorization as { heldBack?: string[] } | undefined)?.heldBack : undefined;
+    const still = (held ?? []).filter((capability) => capability.endsWith(':*')
+      ? !authRecord.caps.some((cap) => cap.startsWith(capability.slice(0, -1)))
+      : !allows(authRecord.caps, capability));
+    return still.length ? { heldBack: still } : {};
+  }
+
   private readinessDeps(): ReadinessDeps {
     return { store: this.deps.store, hosted: this.deps.hosted === true, configHomes: this.deps.configHomes,
       broker: this.deps.broker, providerConnections: this.deps.providerConnections };
@@ -11340,7 +11358,7 @@ function normalizeConfig(
     const worldProvider = config.worldProvider ?? (defaultHostedProvider
       ? process.env.KARMAX_CLOUD_WORLD_PROVIDER?.trim() || 'any'
       : undefined);
-    if (worldProvider && ['worktree', 'container', 'memory'].includes(worldProvider))
+    if (runsOnHost(worldProvider))
       throw new Error('hosted projects require a remote world provider');
     if (worldProvider) config = { ...config, worldProvider };
   }

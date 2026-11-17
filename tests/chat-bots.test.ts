@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { allows, IRREVERSIBLE_CAPABILITIES } from '../src/platform/capabilities.js';
 import { Store } from '../src/store/db.js';
 import { KarmaxApi, WebhookAuthError } from '../src/platform/api.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
@@ -485,6 +486,26 @@ describe('chat accounts linked to people', () => {
     await f.authorization.revoke('system:test', 'user:dev', projectScope(f.project.id));
     await expect(f.api.fireTriggeredTask(await f.system(), maintainerSeries.id, 'clone', triggerContext(mention!.event)))
       .rejects.toBeInstanceOf(EventRunRefused);
+  });
+
+  it('a run of a series without a computer acts as its asker and still holds back the irreversible (wiki features/computerless-tasks)', async () => {
+    const f = await fixture();
+    const { hook, send } = await f.connect();
+    const series = await f.api.createTask(await f.human('owner'), { projectId: f.project.id, workflow: 'just-do', prompt: 'Answer the chat',
+      authorization: { level: 'maintainer', scope: 'projects', projectIds: [f.project.id] },
+      params: { repeatable: true, computer: { provider: 'none' }, triggers: [{ kind: 'event', type: 'chat.mention', recurring: true }] } } as any);
+    expect((series.params._authorization as any).heldBack).toEqual(IRREVERSIBLE_CAPABILITIES);
+    // A maintainer series holds task:*, project:delete and team:write but for the hold-back; the asker, an
+    // administrator, holds task:delete too. The run must not get any of them back through either.
+    expect(await f.authorization.capabilities('user:admin', f.project.id, f.organization.id)).toEqual(expect.arrayContaining([expect.stringMatching(/^(\*|task:\*|task:delete)$/)]));
+    await f.api.linkChatAccount(await f.human('admin'), (await new ChatLinks(f.store).offer(hook, { id: '9', name: 'Ida' })).token);
+    const { events: [mention] } = await send({ id: 9, first_name: 'Ida' }, 'what waits on me?');
+    const run = (await f.store.getTask((await f.api.fireTriggeredTask(await f.system(), series.id, 'clone', triggerContext(mention!.event))).startedTaskId))!;
+    expect(run.createdBy).toEqual({ kind: 'user', userId: 'admin' });
+    const grant = run.params._authorization as any;
+    expect(grant.heldBack).toEqual(IRREVERSIBLE_CAPABILITIES);
+    for (const capability of IRREVERSIBLE_CAPABILITIES) expect(allows(grant.capabilities, capability.replace('*', 'card_1'))).toBe(false);
+    expect(allows(grant.capabilities, 'task:create')).toBe(true);
   });
 
   it('a guest’s run acts as the series, as before', async () => {

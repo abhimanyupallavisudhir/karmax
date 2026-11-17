@@ -6,7 +6,7 @@ import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import type { Store } from '../store/db.js';
 import type { Project, RunnerPool, WorldHandleRef } from '../domain/types.js';
 import type { ProviderSandboxRef, WorldHandle } from './types.js';
-import { ANY_PROVIDER, describeMachine, isAnyProvider, machineShape, sameMachine, type MachineShape } from '../domain/computer.js';
+import { ANY_PROVIDER, LOCAL_WORLD_KINDS, describeMachine, isAnyProvider, machineShape, sameMachine, type MachineShape } from '../domain/computer.js';
 import { assertComputerFits, type AccountPool, type ComputerLimits } from '../domain/computer-limits.js';
 import { accountRoom } from './account-room.js';
 import { ProviderCapacityFull } from '../agent/limits.js';
@@ -66,7 +66,7 @@ export class RunnerPoolService {
       if (pool.provider !== provider) throw new Error(`configured runner pool uses ${pool.provider}, not ${provider}`);
       return pool;
     }
-    const remote = !['worktree', 'container', 'memory'].includes(provider);
+    const remote = !LOCAL_WORLD_KINDS.includes(provider);
     const hostedActiveWorlds = remote && this.store.hosted
       ? (await this.store.getOrganizationUsagePolicy(organizationId)).maxActiveWorlds
       : undefined;
@@ -1034,7 +1034,7 @@ function reconcileAfterMs(): number {
 }
 
 export function costMicrosPerSecond(provider: string, cpu: number, memoryMb: number, gpu: number): number {
-  if (['worktree', 'container', 'memory'].includes(provider)) return 0;
+  if (LOCAL_WORLD_KINDS.includes(provider)) return 0;
   const prefix = `KARMAX_${provider.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
   const meteredDefault = provider === 'e2b' || provider === 'daytona';
   const cpuDollars = Number(process.env[`${prefix}_CPU_DOLLARS_SECOND`] ?? (meteredDefault ? 0.000014 : 0)) * cpu;

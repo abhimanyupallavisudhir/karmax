@@ -4,7 +4,9 @@ import { notPullRequestSql, pullRequestOf, type PullRequestOf } from '../domain/
 export interface TaskHeader { id: string; num?: number; title: string; projectId: string; status?: string; stage?: string;
   /** Set when the row is a pull request of its task (SPEC §11.1): the header is its task's. */
   pullRequest?: { taskId: string; checkout: string } }
-import { ANY_PROVIDER, applyComputer, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
+import { ANY_PROVIDER, applyComputer, normalizeComputer, LOCAL_WORLD_KINDS, runsOnHost, type ComputerSpec } from '../domain/computer.js';
+/** The local world kinds as an SQL list (`NOT IN (…)`): constants, never input. */
+const LOCAL_KINDS_SQL = LOCAL_WORLD_KINDS.map((kind) => `'${kind}'`).join(',');
 import { AdmissionBackpressureError } from '../domain/admission-error.js';
 import { utf8Tail } from '../util/utf8-tail.js';
 import * as __asyncCollections from '../util/async-collections.js';
@@ -1900,7 +1902,7 @@ export class Store {
       environment: policy.environment ? { ...current.environment, ...policy.environment } : current.environment,
     };
     validateProjectExecutionConfig(next as ProjectConfig);
-    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && ['worktree', 'container', 'memory'].includes(next.worldProvider ?? 'e2b'))
+    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && runsOnHost(next.worldProvider ?? 'e2b'))
       throw new Error('hosted organizations require a remote world provider');
     for (const project of (await this.listProjects()).filter((candidate) => candidate.organizationId === organizationId)) {
       if (next.monthlyBudgetMicros != null && project.config.monthlyBudgetMicros != null
@@ -2064,7 +2066,7 @@ export class Store {
     const organizationBudget = (await this.getOrganizationExecutionPolicy(existing.organizationId ?? 'org_personal')).monthlyBudgetMicros;
     if (organizationBudget != null && effective.monthlyBudgetMicros != null && effective.monthlyBudgetMicros > organizationBudget)
       throw new Error('project cloud budget cannot exceed the organization budget');
-    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && ['worktree', 'container', 'memory'].includes(effective.worldProvider ?? 'e2b'))
+    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && runsOnHost(effective.worldProvider ?? 'e2b'))
       throw new Error('hosted projects require a remote world provider');
     (await this.db.prepare('UPDATE projects SET config = ? WHERE id = ?').run(JSON.stringify(config), id));
     return candidate;
@@ -2079,7 +2081,7 @@ export class Store {
     if (!existing) throw new Error(`no project ${id}`);
     const merged = writableProjectConfig({ ...existing.config, ...config });
     validateProjectExecutionConfig(merged);
-    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && ['worktree', 'container', 'memory'].includes(merged.worldProvider ?? 'e2b'))
+    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && runsOnHost(merged.worldProvider ?? 'e2b'))
       throw new Error('hosted projects require a remote world provider');
     (await this.db.prepare('UPDATE projects SET config = ? WHERE id = ?').run(JSON.stringify(merged), id));
     // An unpinned resource or secret location is relative to the working folder,
@@ -2265,7 +2267,7 @@ export class Store {
     const activeWorlds = (await this.getOrganizationUsagePolicy(organizationId)).maxActiveWorlds;
     for (const pool of (await this.listRunnerPools(organizationId))) {
       // Only the capacity: an administrator's concurrent edit of the pool stands.
-      if (pool.mode === 'customer' && !['worktree', 'container', 'memory'].includes(pool.provider))
+      if (pool.mode === 'customer' && !LOCAL_WORLD_KINDS.includes(pool.provider))
         (await this.db.prepare('UPDATE runner_pools SET capacity=? WHERE id=?').run(JSON.stringify({ ...pool.capacity, activeWorlds }), pool.id));
     }
     (await this.reconcileWorldLeaseCapacity(organizationId));
@@ -8665,7 +8667,7 @@ export class Store {
 
     const pool = (await this.getRunnerPool(input.runnerPoolId));
     if (!pool?.enabled || pool.organizationId !== input.organizationId) throw new Error('runner pool is unavailable');
-    const remote = !['worktree', 'container', 'memory'].includes(pool.provider);
+    const remote = !LOCAL_WORLD_KINDS.includes(pool.provider);
     // Only the pool RunnerPoolService keeps for managed compute is centrally
     // funded; any other pool claiming to be would resell the organization's
     // own account as the installation's (src/world/runners.ts).
@@ -8697,7 +8699,7 @@ export class Store {
       if (remote) {
         organizationActive = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
           JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.state='active'
-            AND p.provider NOT IN ('worktree','container','memory')`).get(input.organizationId)) as any).n);
+            AND p.provider NOT IN (${LOCAL_KINDS_SQL})`).get(input.organizationId)) as any).n);
       }
       const active = (await this.db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(cpu),0) cpu, COALESCE(SUM(memoryMb),0) memoryMb,
         COALESCE(SUM(gpu),0) gpu FROM world_leases WHERE runnerPoolId=? AND state='active'`).get(pool.id)) as any;
@@ -8708,7 +8710,7 @@ export class Store {
       if (remote && acquired) {
         const recent = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
           JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.acquiredAt>=?
-            AND p.provider NOT IN ('worktree','container','memory')`).get(input.organizationId, now - 60_000)) as any).n);
+            AND p.provider NOT IN (${LOCAL_KINDS_SQL})`).get(input.organizationId, now - 60_000)) as any).n);
         if (recent >= policy.maxRemoteStartsPerMinute) throw new AdmissionBackpressureError('organization remote sandbox start rate limit exceeded');
       }
       (await this.db.prepare(`INSERT INTO world_leases (id, runnerPoolId, organizationId, projectId, taskId, worldId,
@@ -8748,7 +8750,7 @@ export class Store {
     for (const candidate of queued) {
       const pool = (await this.getRunnerPool(candidate.runnerPoolId));
       if (!pool?.enabled || pool.organizationId !== candidate.organizationId) continue;
-      const remote = !['worktree', 'container', 'memory'].includes(pool.provider);
+      const remote = !LOCAL_WORLD_KINDS.includes(pool.provider);
       if (filter.remoteOnly && !remote) continue;
       if (remote && this.hosted && pool.mode === 'managed' && !isManagedComputePool(pool)) continue;
       const hostedCustomerWorld = remote && this.hosted && (pool.mode === 'customer' || pool.mode === 'managed');
@@ -8756,11 +8758,11 @@ export class Store {
       if (remote) {
         const organizationActive = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
           JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.state='active'
-            AND p.provider NOT IN ('worktree','container','memory')`).get(candidate.organizationId)) as any).n);
+            AND p.provider NOT IN (${LOCAL_KINDS_SQL})`).get(candidate.organizationId)) as any).n);
         if (organizationActive >= policy.maxActiveWorlds) continue;
         const recent = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
           JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.acquiredAt>=?
-            AND p.provider NOT IN ('worktree','container','memory')`).get(candidate.organizationId, Date.now() - 60_000)) as any).n);
+            AND p.provider NOT IN (${LOCAL_KINDS_SQL})`).get(candidate.organizationId, Date.now() - 60_000)) as any).n);
         if (recent >= policy.maxRemoteStartsPerMinute) continue;
       }
       const project = (await this.getProject(candidate.projectId));
@@ -8820,7 +8822,7 @@ export class Store {
       (await this.db.prepare("UPDATE world_leases SET state='released', releasedAt=? WHERE id=? AND state!='released'").run(Date.now(), id));
       const pool = (await this.getRunnerPool(lease.runnerPoolId));
       const hostedCustomerRemote = !!pool && this.hosted && pool.mode === 'customer'
-        && !['worktree', 'container', 'memory'].includes(pool.provider);
+        && !LOCAL_WORLD_KINDS.includes(pool.provider);
       const activated = hostedCustomerRemote
         ? (await this.promoteQueuedWorldLeases({ organizationId: lease.organizationId, remoteOnly: true }))
         : (await this.promoteQueuedWorldLeases({ runnerPoolId: lease.runnerPoolId }));

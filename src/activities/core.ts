@@ -1,4 +1,5 @@
-import { applyComputer, isAnyProvider, isCloudProvider, machineShape, normalizeComputer, worldMachine } from '../domain/computer.js';
+import { applyComputer, isAnyProvider, isCloudProvider, isComputerless, machineShape, normalizeComputer, withoutCheckoutsIfComputerless, worldMachine } from '../domain/computer.js';
+import { computerlessApiKey, computerlessModelGap } from '../agent/computerless.js';
 import { taskEnded } from '../world/task-ended.js';
 import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
 import { conversationFor, participantLabel, workDigest } from '../domain/participants.js';
@@ -142,7 +143,7 @@ import { fileURLToPath } from 'node:url';
 import { manifest, roleCeiling } from '../contrib/manifests.js';
 import { assembleTaskInput } from '../platform/params.js';
 import { childComputer, subTaskParams } from '../platform/agent-params.js';
-import { allows, attenuate, CHILD_TASK_CEILING } from '../platform/capabilities.js';
+import { allows, attenuate, CHILD_TASK_CEILING, IRREVERSIBLE_CAPABILITIES, withoutCapabilities } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, remotePolicyOf, landingAuthorityOf, type Repository, type TaskPullRequest,
   type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type UpstreamProposal, type SubTaskRequest, type SubTaskResponse, type TaskRecord, type WorldHandleRef, type AdoptedRepositories, type KeptWorkspace, type FileRef, type ImageRef } from '../domain/types.js';
 import { newId } from '../util/id.js';
@@ -2185,7 +2186,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const delegation = attenuate(CHILD_TASK_CEILING, currentGrant);
     const mergeBack = args.parentBranch && allows(currentGrant, `merge-into:${args.parentBranch}`)
       ? [`merge-into:${args.parentBranch}`] : [];
-    const grant = [...delegation, ...mergeBack];
+    // A sub-task without a computer holds back the irreversible capabilities,
+    // as any task without one does (wiki features/computerless-tasks).
+    const heldBack = isComputerless((computer && project ? applyComputer(project, computer) : project)?.worldProvider)
+      ? IRREVERSIBLE_CAPABILITIES : [];
+    const grant = withoutCapabilities([...delegation, ...mergeBack], heldBack);
     const parentAuthorization = parent?.params?._authorization as { delegationId?: string } | undefined;
     // The child's human delegation reaches as far as its tokens will: its parent's scope.
     const humanDelegation = parent && parentAuthorization?.delegationId && deps.tokens
@@ -2196,7 +2201,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     (await store.updateTaskParams(child.id, {
       ...child.params,
       _authorization: { profileId: DELEGATED_PROFILE, principal: `task:${args.parentTaskId}`,
-        capabilities: grant, attenuated: true, ...(humanDelegation ? { delegationId: humanDelegation.id } : {}) },
+        capabilities: grant, attenuated: true, ...(heldBack.length ? { heldBack } : {}),
+        ...(humanDelegation ? { delegationId: humanDelegation.id } : {}) },
       ...(humanDelegation?.externalIdentities?.githubAccountId
         ? { _githubAccountId: humanDelegation.externalIdentities.githubAccountId } : {}),
     }));
@@ -2210,7 +2216,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       target: args.target,
       parentTaskId: args.parentTaskId,
       // Its world is made from this: where it runs and how big that machine is.
-      project: computer && project ? applyComputer(project, computer) : project,
+      project: computer && project ? applyComputer(project, computer) : project && withoutCheckoutsIfComputerless(project),
       profiles: args.profiles,
       // Each agent field overrides the inherited profile for its role, as the
       // same field does for create_task.
@@ -2270,6 +2276,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // provider, or the default may have become "Any", since then.
       const current = project ? (await store.effectiveTaskConfig(project, args.taskId)).worldProvider : undefined;
       const kind = (isCloudProvider(args.kind) && isCloudProvider(current) ? current : args.kind) as WorldKind;
+      // A task without a computer (wiki features/computerless-tasks): nothing to
+      // allocate, clone, restore or bill, so no lease, no compute wait and no
+      // repository. Its world only says so, and refuses to run anything.
+      if (isComputerless(kind)) {
+        const generation = (((await store.currentWorld(args.taskId))?.generation ?? 0) + 1);
+        const made = await worlds.create(kind, { taskId: args.taskId, generation, organizationId: project?.organizationId,
+          base: args.base, ...(args.target ? { target: args.target } : {}) });
+        const handle = projectId ? (await store.registerWorld(made.handle, projectId)) as WorldHandle : made.handle;
+        (await record(args.taskId, 'world.created', { handle }));
+        (await record(args.taskId, 'world.ready', { provider: kind, generation: handle.generation ?? 1 }));
+        return handle;
+      }
       startCancellationHeartbeat(kind);
       // Provider "Any": the router picks the provider below (compute-router.ts).
       const routed = isAnyProvider(kind);
@@ -2810,9 +2828,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         missingNamespace = recognizedOpenCodePrefix ? openCodePrefix! : 'opencode';
       }
       if (profile && profile.provider !== 'opencode' && enabled.length) missingNamespace = credentialProvider(profile);
-      const ordered = enabled.filter((credential) => profile
+      // A task without a computer runs its agent on an API key only: a login is
+      // its CLI, which needs a computer (wiki features/computerless-tasks).
+      const computerlessTask = isComputerless(args.task?.project?.worldProvider);
+      const ordered = enabled.filter((credential) => (profile
         ? credentialServesProfile(profile, credential, all)
-        : credentialAliases(args.provider).includes(credential.provider));
+        : credentialAliases(args.provider).includes(credential.provider))
+        && (!computerlessTask || credential.kind === 'key'));
       // A native OpenCode fork is stored in the source XDG home. Lease that
       // exact login first so account concurrency, quota failures, and policy
       // attribution remain honest; never reopen one account after leasing
@@ -2852,6 +2874,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // entry makes the coordinator deny the turn with a credential action;
       // `:off` says one that would serve exists but is switched off here, so
       // the fix is switching it on rather than adding another.
+      // Only logins would serve it: the turn says why it can't run without a computer.
+      if (computerlessTask) return [];
       const switchedOff = !!profile && all.some((credential) => credentialServesProfile(profile, credential, all));
       return keys.length || profile?.provider === 'mock'
         ? keys
@@ -2954,6 +2978,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       // A cloud world's disk, before its agent starts (wiki features/computers).
       const remoteWorld = isRemote(args.worldHandle.kind);
+      // A task without a computer (wiki features/computerless-tasks): its agent
+      // runs here with tavya's own tools only, so nothing below that prepares a
+      // machine — disk, credentials as files, MCP servers, work environment — applies.
+      const computerless = isComputerless(args.worldHandle.kind);
       // Runs beside the rest of the preparation; awaited before the prompt, and so
       // before the harness writes anything.
       const turnDiskReady = remoteWorld
@@ -3202,6 +3230,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         try { resolvedAuth = { apiKey: await includedModelKey(store, deps.broker!, organizationId), modelOptions: INCLUDED_MODEL_OPTIONS }; }
         catch (error) { throw capacityFailure(error) ?? error; }
       }
+      // API sessions are stateless. Cloud subscription sessions live in their
+      // sandbox; a requested cross-world session is materialized explicitly below.
+      const apiRail = !!resolvedAuth?.apiKey || (!resolvedAuth && (
+        (profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY) ||
+        (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY) ||
+        (profile.provider === 'opencode' && !!process.env[apiKeyEnv(credentialProvider(profile))])
+      ));
+      // A task without a computer runs its agent here, in the worker, for any
+      // organization: it spends only a key resolved for this organization,
+      // never the worker's own environment on hosted (computerlessApiKey). A
+      // subscription login is its CLI, which needs a computer: say so now,
+      // before the turn waits for a slot it could never use.
+      if (computerless) {
+        const apiKey = computerlessApiKey(profile, { hosted: store.hosted, organizationId,
+          managedRail: managedInstallationRail, resolvedAuth });
+        const gap = computerlessModelGap(profile, { apiKey: !!apiKey });
+        if (gap) throw ApplicationFailure.create({ message: gap, type: 'agent-error', nonRetryable: true });
+        if (apiKey) resolvedAuth = { ...resolvedAuth, apiKey };
+      }
       if (
         organizationId !== 'org_personal'
         && profile.provider !== 'mock'
@@ -3212,13 +3259,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       ) {
         throw new Error(`organization ${organizationId} has no usable ${credentialProvider(profile)} credential; connect an organization login or API key`);
       }
-      // API sessions are stateless. Cloud subscription sessions live in their
-      // sandbox; a requested cross-world session is materialized explicitly below.
-      const apiRail = !!resolvedAuth?.apiKey || (!resolvedAuth && (
-        (profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY) ||
-        (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY) ||
-        (profile.provider === 'opencode' && !!process.env[apiKeyEnv(credentialProvider(profile))])
-      ));
       const remoteSubscriptionRail = isRemote(args.worldHandle.kind) && !apiRail;
       // ── Fork a prior agent (SPEC §10.5) ──────────────────────────────────────
       // Same-provider task forks use the provider's native branch operation. Cross-
@@ -3952,7 +3992,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // restored cloud sandbox or a repeatedly-forked session can still read them.
         const turnMessages = await materializeFileAttachments(world, messages);
         const unreadyTools: string[] = [];
-        const chosenMcp = profile.mcpConnections === undefined ? [] : await timed('tool.connection.prepare', () => prepareConnections(
+        const chosenMcp = profile.mcpConnections === undefined || computerless ? [] : await timed('tool.connection.prepare', () => prepareConnections(
           deps.broker ? new McpConnections(store, deps.broker, organizationId) : undefined, world, profile.mcpConnections!, args.task.projectId, args.taskId, (cleanup) => { mcpCleanup = cleanup; },
           (values) => secrets.add(...values), { toolsOptional: activityAttempt > 1, onUnavailable: (name) => unreadyTools.push(name) }));
         // A retry goes on without a tool that still would not start; the agent and the conversation are told.
@@ -3965,7 +4005,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // Git-profile credentials for the agent subprocess (wiki plans/PLAN-git-config
         // §4B): an agent that pushes or runs `gh` acts as the project's account.
         const skippedEnv: SkippedEnv[] = [];
-        const turnEnv = await (async () => {
+        const turnEnv = computerless ? {} : await (async () => {
           // Remote provider tools receive repository credentials through the
           // broker, but the local harness process must still have host Git
           // credentials scrubbed for non-personal organizations.
@@ -4034,7 +4074,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ...(resolvedAuth ? { resolvedAuth } : {}),
           ...turnEnv,
           // MCP servers the workflow gives its agents (SPEC §7.5).
-          agentMcp: [...(args.task.workflow ? manifest(args.task.workflow)?.agentMcp ?? [] : []), ...chosenMcp],
+          agentMcp: computerless ? [] : [...(args.task.workflow ? manifest(args.task.workflow)?.agentMcp ?? [] : []), ...chosenMcp],
           ...(activityAttempt > 1 ? { toolsOptional: true } : {}),
         } }, {
           adapters: deps.adapters,
@@ -4852,6 +4892,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      * Undefined while the world has none (nothing attached, or a repository
      * it cannot take: a failure is recorded and tried again next turn). */
     async adoptAttachedRepositories(handleInput: WorldHandle, taskId: string): Promise<AdoptedRepositories | undefined> {
+      // A task without a computer has nowhere to check one out; it stays without.
+      if (isComputerless(handleInput.kind)) return undefined;
       const projectId = (await store.getTask(taskId))?.projectId ?? String(handleInput.meta?.projectId ?? '');
       const development = (handle: WorldHandle) => worldRepos(handle).filter((repo) => repo.role !== 'project-wiki');
       const linked = projectId ? (await store.listProjectRepositories(projectId)) : [];
@@ -4888,6 +4930,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      * meanwhile publishes its branch first (the checkpoint's committed layer).
      * `destroy: false` keeps a local world when nothing can checkpoint it. */
     async keepFinalWorkspace(handle: WorldHandle): Promise<KeptWorkspace> {
+      // Nothing was made there: a task without a computer's work is its conversation.
+      if (isComputerless(handle.kind)) return { destroy: true };
       const world = await openWorld(handle);
       if (!deps.checkpoints) {
         if (isRemote(world.handle.kind) || world.handle.meta?.releaseOnCompletion === true)
