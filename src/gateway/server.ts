@@ -1229,7 +1229,8 @@ export class Gateway {
       if (result.resumed) (await this.emitTaskEvent({ taskId: c.taskId!, type: 'connection.resolved', ts: Date.now(),
         payload: { requestId: c.id, connectionId: c.id, status: c.status } }));
       return result.resumed;
-    }).finally(() => { this.connectionSweep = undefined; });
+    }).catch((error) => console.warn('[connections] sweep failed; the next one retries:', error instanceof Error ? error.message : String(error)))
+      .finally(() => { this.connectionSweep = undefined; });
   }
 
   /** Read each organization request ledger once per response, not once per row.
