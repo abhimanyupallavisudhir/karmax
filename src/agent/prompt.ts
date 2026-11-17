@@ -1,5 +1,5 @@
 import { describeMachine, isVmWorldProvider, sameMachine, worldMachine, type MachineShape } from '../domain/computer.js';
-import { computerLimits, providerFeatures as computerFeatures, providerLabel, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
+import { computerLimits, diskGrowsAtStart, providerFeatures as computerFeatures, providerLabel, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
 import type { DiskSpace } from '../world/disk.js';
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
 import { WorldHandle, worldRepos, worldWorkingDirectory } from '../world/types.js';
@@ -280,7 +280,8 @@ function describeMachineAndRoom(world: WorldHandle, taskId: string, requested?: 
     + `(build outputs, caches, old copies) or move large data out of the world.${moreMemory}`;
 }
 
-/** A VM world (Fly.io, Hetzner, AWS, Google Cloud): its disk is a volume that keeps everything and grows in place. */
+/** A VM world (Fly.io, Hetzner, AWS, Google Cloud, Agent37): its disk is a volume that keeps everything and grows in place
+ * (Agent37's at the machine's next start). */
 function describeVmComputer(world: WorldHandle, taskId: string, shape: MachineShape, requested: MachineShape | undefined,
   known: { current: string; allows: string; totalGb?: number; limits: ComputerLimits }): string {
   const machine = worldMachine(world.meta) ?? shape;
@@ -293,7 +294,9 @@ function describeVmComputer(world: WorldHandle, taskId: string, shape: MachineSh
   const max = known.limits.diskGb ?? providerDefaultLimit(world.kind);
   const grow = max === undefined || total < max
     ? `If it runs out of disk, grow it yourself with platform_request(PATCH, "/api/tasks/${taskId}/params", {"params": {"computer": {"diskGb": ${
-      max === undefined ? Math.max(50, total * 2) : Math.min(max, Math.max(50, total * 2))}}}}): it grows at once, nothing moves and nothing needs restarting. `
+      max === undefined ? Math.max(50, total * 2) : Math.min(max, Math.max(50, total * 2))}}}})${diskGrowsAtStart(world.kind)
+      ? ' and then end your turn with pause(3) without jobs: it grows when the machine restarts, with every file kept. '
+      : ': it grows at once, nothing moves and nothing needs restarting. '}`
     : 'Its disk is the largest this account allows: when it fills, delete what you no longer need or move large data out of the world. ';
   return `Computer: ${known.current}.${known.allows} Everything on its disk, Git-ignored files included, survives pauses.${home}${pending} `
     + `${grow}More CPU or memory (cpu, memoryMb) applies after your next pause(3) without jobs.`;

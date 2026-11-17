@@ -11700,6 +11700,7 @@ function providerDisplayName(provider: string): string {
   if (provider === 'hetzner') return 'Hetzner Cloud';
   if (provider === 'aws') return 'AWS';
   if (provider === 'gcp') return 'Google Cloud';
+  if (provider === 'agent37') return 'Agent37';
   return provider.charAt(0).toUpperCase() + provider.slice(1);
 }
 

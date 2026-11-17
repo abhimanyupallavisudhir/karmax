@@ -74,6 +74,9 @@ interface ProviderFacts {
   parked: ParkedHolds;
   /** A machine's own root disk besides the home disk, counted in the account's disk. */
   rootDiskGb?: number;
+  /** Its disk grows only when the machine next starts (Agent37 reboots a
+   * machine it resizes), never under a working agent. */
+  diskGrowsAtStart?: boolean;
 }
 
 /** Options beyond size that a provider may or may not offer. */
@@ -98,6 +101,15 @@ const VM_FEATURES: ComputerFeatures = { desktop: false, allowlist: false, intern
 // reduced to a line per resource so any size can be compared. They rank
 // candidates only: usage is billed from each provider's own records.
 const PROVIDERS: Record<string, ProviderFacts> = {
+  // Agent37 (wiki features/vm-worlds § Agent37): a `vm` instance, its own
+  // kernel, the disk mounted as the home; four shapes up to 4 CPU / 32 GB,
+  // disks of 2–100 GB. A `vm` meters at 2.5× Agent37's default rate:
+  // $2 per vCPU and $1.75 per GB of memory per month, disk $0.09 per GB-month
+  // (agent37.com/docs, 2026-11-16). A start is a cold boot of about 2 s.
+  agent37: { label: 'Agent37', defaults: { cpu: 2, memoryMb: 4096, diskGb: 20 }, limits: { cpu: 4, memoryMb: 32_768, diskGb: 100 }, features: VM_FEATURES,
+    price: { cpuHour: 2 / 730, gbHour: 1.75 / 730, diskGbMonth: 0.09 }, wakeSeconds: 10,
+    region: (config) => { const region = config.region ?? 'eu'; return region === 'eu' || region === 'us' ? region : undefined; },
+    parked: { machine: false, disk: true }, diskGrowsAtStart: true },
   // Measured 2026-10-10: the default template has 22 GB of disk. Until the
   // account is asked, offer only what every account has. E2B's cloud runs in
   // the US; its disk costs nothing extra.
@@ -173,6 +185,11 @@ export function parkedHolds(provider: string): ParkedHolds {
 export function accountDiskGb(provider: string, diskGb: number | undefined): number {
   const facts = PROVIDERS[provider];
   return (diskGb ?? facts?.defaults.diskGb ?? 0) + (facts?.rootDiskGb ?? 0);
+}
+
+/** Whether a world's disk grows only at its machine's next start, not while it runs. */
+export function diskGrowsAtStart(provider: string): boolean {
+  return PROVIDERS[provider]?.diskGrowsAtStart === true;
 }
 
 /** Typical wake time, in seconds. */

@@ -1708,9 +1708,9 @@ const localWorldPath = (v) => (hostLocal() && v.worldPath) || '';
 // Parameters tab. The value is sparse ({provider, cpu, memoryMb, diskGb, flavor,
 // hibernateAfterDays, network}); the block shows the effective machine and a
 // form stores only what differs from what it inherits.
-const COMPUTER_PROVIDER_LABELS = { any: 'Any', e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', aws: 'AWS', gcp: 'Google Cloud',
+const COMPUTER_PROVIDER_LABELS = { any: 'Any', e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', aws: 'AWS', gcp: 'Google Cloud', agent37: 'Agent37',
   worktree: 'This machine', container: 'Docker container' };
-const CLOUD_COMPUTERS = ['e2b', 'daytona', 'fly', 'hetzner', 'aws', 'gcp'];
+const CLOUD_COMPUTERS = ['e2b', 'daytona', 'fly', 'hetzner', 'aws', 'gcp', 'agent37'];
 const COMPUTER_REGION_LABELS = { eu: 'EU', us: 'US' };
 // Provider "Any" (wiki features/compute-routing): the cloud accounts it can
 // choose among — the organization's own, and the managed compute it may use.
@@ -1726,7 +1726,7 @@ const ANY_TIP = 'Runs on the first that fits and has room: your own accounts fir
 // What a machine gets when the Computer asks for nothing more (disk is total GB).
 const COMPUTER_DEFAULTS = { e2b: { cpu: 2, memoryMb: 2048, diskGb: 22 }, daytona: { cpu: 2, memoryMb: 4096, diskGb: 8 },
   fly: { cpu: 2, memoryMb: 2048, diskGb: 20 }, hetzner: { cpu: 2, memoryMb: 2048, diskGb: 20 }, aws: { cpu: 2, memoryMb: 2048, diskGb: 20 },
-  gcp: { cpu: 2, memoryMb: 2048, diskGb: 20 } };
+  gcp: { cpu: 2, memoryMb: 2048, diskGb: 20 }, agent37: { cpu: 2, memoryMb: 4096, diskGb: 20 } };
 // What a computer on the organization's provider account may be: the
 // connection's limits, learned from the provider (src/domain/computer-limits.ts).
 // For "Any", each size is the largest some reachable account allows.
@@ -6295,7 +6295,7 @@ function renderOnboarding() {
       ${onboardingStep(2, 'compute', 'Get computers for your agents', '', `<div class="onboarding-options">
         ${onboardingOption(compute.managed, 'Buy a paid plan', `Includes ${siteNameMarkup()}’s computers`, `${settings}#settings-plan`, compute.managed ? 'Manage plan' : 'View plans')}
         <span class="onboarding-or">or</span>
-        ${onboardingOption(compute.own, 'Connect your own compute', 'E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud', `${settings}#settings-computers`, compute.own ? 'Manage' : 'Connect')}
+        ${onboardingOption(compute.own, 'Connect your own compute', 'E2B, Daytona, Fly.io, Hetzner, AWS, Google Cloud or Agent37', `${settings}#settings-computers`, compute.own ? 'Manage' : 'Connect')}
       </div>`)}
       ${onboardingStep(3, 'project', 'Create your first project', `Start a real task list. Its code can live on ${siteNameMarkup()} or on GitHub.`, `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
       ${onboardingStep(4, 'github', 'Connect GitHub', `Work on your GitHub repositories through reviewed pull requests.`, `<a class="btn sm" data-spa href="${settings}#settings-code">${state.steps.github.complete ? 'Manage GitHub' : 'Connect GitHub'}</a>`)}
@@ -9922,7 +9922,7 @@ function readinessGaps(readiness, projectId) {
   }
   const compute = readiness.compute;
   const plan = `${settings}#settings-plan`, computers = `${settings}#settings-computers`;
-  const providers = 'E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud';
+  const providers = 'E2B, Daytona, Fly.io, Hetzner, AWS, Google Cloud or Agent37';
   // Out of compute: never bought a plan (need: plan) or spent this month's (credit).
   const need = compute?.need ?? (compute?.outOfCredit ? 'credit' : 'computer');
   if (compute && !compute.ready) gaps.push(...(need === 'plan' ? [
@@ -18404,7 +18404,7 @@ const INSIGHT_FUNDING = {
   own: { label: 'Own accounts', color: 'var(--viz-1)', tip: 'Your own provider accounts: the provider bills you at its list price' },
   managed: { label: 'Managed', color: 'var(--viz-2)', tip: 'tavya\'s accounts: charged to your compute credit at twice list price' },
 };
-const INSIGHT_PROVIDERS = { e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', aws: 'AWS', gcp: 'Google Cloud' };
+const INSIGHT_PROVIDERS = { e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', aws: 'AWS', gcp: 'Google Cloud', agent37: 'Agent37' };
 const insProvider = (provider) => INSIGHT_PROVIDERS[provider] || provider;
 // The org-wide track reuses the task pipeline's stages; `resolve` (conflict
 // resolution) is part of landing.
@@ -28223,6 +28223,9 @@ const COMPUTER_PROVIDERS = {
   gcp: { name: 'Google Cloud', keys: '/docs/computers#google-cloud', keyLabel: 'Service account key', keyFile: true,
     tip: 'Paid by the second while it works; a paused computer costs only its disk. Machines of exactly the size you choose, disks up to 64 TB that grow in place.',
     advanced: [['region', 'Zone', 'europe-west3-a'], ['image', 'Image', 'karmax image, else Debian 12']] },
+  agent37: { name: 'Agent37', keys: 'https://www.agent37.com/dashboard/cloud/api-keys',
+    tip: 'The cheapest per hour: whole VMs of up to 4 CPU · 32 GB, disks up to 100 GB that keep everything through pauses and grow at the next start. Prepaid: top up its wallet.',
+    advanced: [['region', 'Region', 'eu (or us, ap-south)'], ['image', 'Template', 'agent37-ubuntu']] },
 };
 /** The dialog's key fields: one secret, a key in parts (AWS), or a key file (Google Cloud). */
 function computerKeyMarkup(info, connection) {
