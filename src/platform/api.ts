@@ -2498,9 +2498,18 @@ export class KarmaxApi {
    * the person it acts for, here now, is the consent it needs. Only that
    * person, and only while they still hold the task's stored authority;
    * anyone else leaves it as it is (the turn then says who renews it).
+   * A run acts through its series' permission, so acting on a run renews the
+   * series' too: otherwise each of its later runs stops the same way (#982).
    */
   private async renewLapsedDelegations(token: string, caller: ScopedToken, task: TaskRecord): Promise<TaskRecord> {
     if (caller.kind !== 'human' || caller.humanSubject?.presence !== 'interactive') return task;
+    const seriesId = typeof task.params?.runOf === 'string' && task.params.runOf !== task.id ? task.params.runOf : undefined;
+    const series = seriesId ? (await this.deps.store.getTask(seriesId)) : undefined;
+    if (series) (await this.renewOwnLapsedDelegations(token, caller, series));
+    return this.renewOwnLapsedDelegations(token, caller, task);
+  }
+
+  private async renewOwnLapsedDelegations(token: string, caller: ScopedToken, task: TaskRecord): Promise<TaskRecord> {
     type Entry = { delegationId?: string; principal?: string; scope?: AuthorizationSelection['scope']; projectIds?: string[]; organizationId?: string };
     const own = task.params?._authorization as Entry | undefined;
     const agents = this.storedAgentAuthorizations(task) as Record<string, Entry>;

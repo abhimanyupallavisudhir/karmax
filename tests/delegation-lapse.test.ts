@@ -239,6 +239,46 @@ describe('a task\'s human delegation', () => {
       expect((await turn(again, await delegationOf(again))).record.humanSubject?.userId).toBe('alice');
     });
 
+    // #977 and #982, 2026-11-17: runs of "Repair GitHub workflow", whose
+    // series' permission had lapsed. Retry on #977 renewed #977 alone, so the
+    // next failure's run (#982) stopped the same way, and so would every one
+    // after it. A run acts through its series' permission: the person acting
+    // on the run renews that too.
+    it('for the series too when they act on one of its runs, so its next run starts', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      const { api } = await blocked();
+      const series = await task('Repair', { repeatable: true, _githubAccountId: '42' });
+      const seriesDelegation = (await tokens.delegateHuman(await alice(), { taskId: series.id, projectId, organizationId, ttlMs: 60_000,
+        externalIdentities: { githubAccountId: '42' } }))!;
+      await store.updateTaskParams(series.id, { ...series.params, _authorization: { level: 'developer', scope: 'projects',
+        projectIds: [projectId], organizationId, principal: 'user:alice', capabilities: ['task:read'], delegationId: seriesDelegation.id } });
+      vi.setSystemTime(Date.now() + 120_000);
+
+      const scheduler = (await tokens.mintPrincipal('system:triggers', ['*'])).token;
+      const { startedTaskId: first } = await api.fireTriggeredTask(scheduler, series.id, 'clone');
+      await store.saveView(first, { taskId: first, title: 'Repair', workflow: 'software-dev', stage: 'do', status: 'blocked',
+        error: 'lapsed', messages: [], actions: [{ kind: 'signal', name: 'retry', label: 'Retry' }], state: {}, updatedAt: 1 } as unknown as TaskView);
+      await api.signalTask(await userToken('alice'), first, 'retry');
+      expect(await delegationOf(series.id)).not.toBe(seriesDelegation.id);
+
+      const { startedTaskId: next } = await api.fireTriggeredTask(scheduler, series.id, 'clone');
+      expect((await turn(next, await delegationOf(next))).record.humanSubject?.externalIdentities?.githubAccountId).toBe('42');
+    });
+
+    it('but not the series for someone it does not act for', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      const { api } = await blocked();
+      const series = await task('Repair', { repeatable: true });
+      const seriesDelegation = (await tokens.delegateHuman(await alice(), { taskId: series.id, projectId, organizationId, ttlMs: 60_000 }))!;
+      await store.updateTaskParams(series.id, { ...series.params, _authorization: { level: 'developer', scope: 'projects',
+        projectIds: [projectId], organizationId, principal: 'user:alice', capabilities: ['task:read'], delegationId: seriesDelegation.id } });
+      vi.setSystemTime(Date.now() + 120_000);
+      const scheduler = (await tokens.mintPrincipal('system:triggers', ['*'])).token;
+      const { startedTaskId: run } = await api.fireTriggeredTask(scheduler, series.id, 'clone');
+      await api.signalTask(await userToken('bob'), run, 'retry').catch(() => undefined);
+      expect(await delegationOf(series.id)).toBe(seriesDelegation.id);
+    });
+
     it('and left alone while it holds', async () => {
       const { api, run, delegation } = await blocked();
       await store.updateTaskParams(run.id, { ...(await store.getTask(run.id))!.params,
