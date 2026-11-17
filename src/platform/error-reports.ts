@@ -379,7 +379,7 @@ export async function reportFromPerson(store: ReportsStore, input: { by: string;
     ...(input.task ? { taskId: input.task.id, projectId: input.task.projectId } : {}),
     ...(input.organizationId ? { organizationId: input.organizationId } : {}),
     detail: { reportedBy: input.by, ...(input.note?.trim() ? { note: input.note.trim().slice(0, 1_000) } : {}), ...(input.task?.error ? {} : { inTheirWords: true }) },
-    ...(fingerprint ? { fingerprint } : {}), ...(when ?? {}) });
+    ...(fingerprint ? { fingerprint } : {}), ...when });
   await current.flush();
   return true;
 }
