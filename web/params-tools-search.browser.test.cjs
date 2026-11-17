@@ -87,8 +87,13 @@ const root = __dirname;
     // A tool picked there is saved.
     await tools.fill('play');
     await options.locator('[data-mcp-id="browser:playwright"]').click();
+    // The button disables when the save starts, before the route has recorded
+    // the request: wait for the request itself.
+    const before = patches.length;
+    const saved = page.waitForRequest((request) => request.url().endsWith('/api/tasks/fixture/params') && request.method() !== 'GET');
     await page.locator('#params-save:not([disabled])').click();
-    await page.waitForFunction(() => document.querySelector('#params-save')?.disabled);
+    await saved;
+    for (let i = 0; i < 100 && patches.length <= before; i++) await new Promise((resolve) => setTimeout(resolve, 20));
     assert.deepEqual(patches.at(-1)['agent:do'].mcpConnections, ['browser:chrome-devtools', 'browser:playwright']);
     assert.deepEqual(errors, []);
     console.log('Parameters Tools search passed');
