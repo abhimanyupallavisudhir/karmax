@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>tavya</title>
+    <!--
+      Capacitor requires a webDir, but this page is never shown: the app loads
+      server.url (capacitor.config.ts). If it ever is, go to the server.
+    -->
+    <script src="server-url.js"></script>
+    <script>
+      if (window.TAVYA_SERVER_URL) location.replace(window.TAVYA_SERVER_URL);
+    </script>
+    <style>
+      html, body { margin: 0; height: 100%; background: #181220; }
+    </style>
+  </head>
+  <body></body>
+</html>

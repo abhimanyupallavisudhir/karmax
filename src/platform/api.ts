@@ -1111,7 +1111,8 @@ export class KarmaxApi {
     if (caller.taskId && caller.taskId !== '*') return undefined;
     if (caller.kind === 'system') return { kind: 'system', principal: caller.principal };
     const grant = caller.identitySessionId ? await new AppGrants(this.deps.store).get(caller.identitySessionId) : undefined;
-    return grant ? { kind: grant.kind, grantId: grant.id, name: grant.name } : undefined;
+    // A phone app's session is the console itself, like a browser sign-in.
+    return grant && grant.kind !== 'app' ? { kind: grant.kind, grantId: grant.id, name: grant.name } : undefined;
   }
 
   /**

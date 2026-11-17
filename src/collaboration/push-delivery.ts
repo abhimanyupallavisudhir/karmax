@@ -2,7 +2,8 @@ import crypto from 'node:crypto';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE } from '../autonomy/vault-keys.js';
 import { slug } from '../cli/refs.js';
-import type { InboxItem } from '../domain/types.js';
+import type { InboxItem, NativePushDevice } from '../domain/types.js';
+import type { NativePush } from './native-push.js';
 import type { Store } from '../store/db.js';
 import type { DeliveryAdapter, DeliveryEnvelope } from './delivery.js';
 import { generateVapidKeys, sendPush, vapidKeyPair, type PushUrgency, type VapidKeyPair } from './web-push.js';
@@ -95,11 +96,13 @@ const PUSH_URGENCY: Record<InboxItem['urgency'], PushUrgency> = { low: 'low', no
 const PUSH_TTL_SECONDS = 24 * 3600;
 
 /**
- * The inbox's `push` channel: one encrypted message to each of the person's
- * devices. A device its push service no longer knows (404/410) is forgotten.
- * The delivery is retried only when no device took it and one might later
- * (429, 5xx, a network error) — retrying after a partial success would ring
- * the devices that already showed it.
+ * The inbox's `push` channel: one message to each of the person's devices —
+ * encrypted Web Push to a browser, FCM to a phone app (`native-push.ts`).
+ * A device its push service no longer knows (404/410, FCM UNREGISTERED) is
+ * forgotten. The delivery is retried only when no device took it and one
+ * might later (429, 5xx, a network error) — retrying after a partial success
+ * would ring the devices that already showed it. Phones are skipped while the
+ * installation has no Firebase account; they stay listed for when it does.
  */
 export class PushDeliveryAdapter implements DeliveryAdapter {
   constructor(private options: {
@@ -108,6 +111,8 @@ export class PushDeliveryAdapter implements DeliveryAdapter {
     siteName: () => Promise<string>;
     /** The console's origin; an https one names this installation to push services (VAPID `sub`). */
     publicUrl?: string;
+    /** The phone apps' sender; without one, phones are skipped. */
+    native?: NativePush;
     fetcher?: typeof fetch;
     log?: (line: string) => void;
   }) {}
@@ -122,21 +127,30 @@ export class PushDeliveryAdapter implements DeliveryAdapter {
   }
 
   async deliver(envelope: DeliveryEnvelope): Promise<void> {
-    const { store } = this.options;
-    const devices = await store.listPushSubscriptions(envelope.inbox.userId);
+    const { store, native } = this.options;
+    const all = await store.listPushSubscriptions(envelope.inbox.userId);
+    const phones = all.filter((device): device is NativePushDevice => device.kind === 'fcm');
+    const devices = [...all.filter((device) => device.kind === 'web'), ...(phones.length && native && await native.available() ? phones : [])];
     if (!devices.length) return;
     const organization = await store.getOrganization(envelope.inbox.organizationId);
     const project = envelope.task?.projectId ? await store.getProject(envelope.task.projectId) : undefined;
     const message = pushMessage(envelope, { organization, project, siteName: await this.options.siteName() });
     const payload = JSON.stringify(message);
-    const vapid = await this.options.keys();
+    const vapid = devices.some((device) => device.kind === 'web') ? await this.options.keys() : undefined;
     // A Topic lets a push service replace a message it still holds for an offline device.
     const topic = crypto.createHash('sha256').update(envelope.inbox.id).digest('base64url').slice(0, 32);
     let delivered = 0;
     const retryable: string[] = [];
     await Promise.all(devices.map(async (device) => {
       try {
-        const status = await sendPush(device, payload, { vapid, subject: this.subject(), urgency: PUSH_URGENCY[envelope.inbox.urgency],
+        if (device.kind === 'fcm') {
+          const { outcome, detail } = await native!.send(device.token, message, PUSH_TTL_SECONDS);
+          if (outcome === 'sent') { delivered++; await store.markPushed(device.id); }
+          else if (outcome === 'gone') await store.expirePushSubscription(device.id);
+          else if (outcome === 'retry') retryable.push(`${device.id}: ${detail}`);
+          return;
+        }
+        const status = await sendPush(device, payload, { vapid: vapid!, subject: this.subject(), urgency: PUSH_URGENCY[envelope.inbox.urgency],
           ttlSeconds: PUSH_TTL_SECONDS, topic, fetcher: this.options.fetcher });
         if (status >= 200 && status < 300) { delivered++; await store.markPushed(device.id); return; }
         if (status === 404 || status === 410) { await store.expirePushSubscription(device.id); return; }

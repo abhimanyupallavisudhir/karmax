@@ -1,6 +1,6 @@
 import { Worker, NativeConnection, Runtime, DefaultLogger, WorkflowBundle } from '@temporalio/worker';
 import { Context } from '@temporalio/activity';
-import { ApplicationFailure } from '@temporalio/common';
+import { ApplicationFailure, IllegalStateError } from '@temporalio/common';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { TASK_QUEUE, TemporalConn } from './config.js';
@@ -65,12 +65,25 @@ export interface WorkerOpts {
   maxCachedWorkflows?: number;
 }
 
+/**
+ * Install the process's Temporal Runtime, or keep the one already there. There
+ * is one per process; a second module copy (a test file after another whose
+ * dev server died mid-shard, wiki ops/ci) finds it installed. Failing then only
+ * turned one failure into a cascade over every later file.
+ */
+export function installRuntime(install: () => void): 'installed' | 'existing' {
+  try { install(); return 'installed'; } catch (error) {
+    if (error instanceof IllegalStateError) return 'existing';
+    throw error;
+  }
+}
+
 let runtimeInstalled = false;
 function ensureQuietRuntime() {
   if (runtimeInstalled) return;
   // Keep worker logs quiet by default; KARMAX_TEMPORAL_LOG=debug to see them.
   const level = (process.env.KARMAX_TEMPORAL_LOG ?? 'WARN').toUpperCase() as any;
-  Runtime.install({ logger: new DefaultLogger(level) });
+  installRuntime(() => Runtime.install({ logger: new DefaultLogger(level) }));
   runtimeInstalled = true;
 }
 

@@ -312,6 +312,10 @@ a { color: var(--accent); text-decoration: none; }
 /* --visible-height is the part of the screen an on-screen keyboard leaves where
    the browser does not resize the page for it (fitToVisualViewport). */
 #app { display: flex; flex-direction: column; height: 100vh; height: var(--visible-height, 100dvh); overflow: hidden; }
+/* Drawn edge to edge under a phone's status bar (the phone apps, wiki features/phone-apps): the console starts below it.
+   Zero in a browser tab, whose own chrome is above the page. */
+:root { --inset-top: env(safe-area-inset-top, 0px); }
+#app { padding-top: var(--inset-top); }
 /* How far the page starts below the window's top: nothing on a computer, the
    phone's bar on a phone. */
 :root { --shell-top: 0px; }
@@ -2709,7 +2713,7 @@ html[data-theme="dark"] .github-signin-btn:active,
   .rail-collapse { display:none; }
   .body { grid-template-columns: 1fr; }
   .rail {
-    display:flex; position:fixed; z-index:80; left:0; top:52px; bottom:0;
+    display:flex; position:fixed; z-index:80; left:0; top:calc(52px + var(--inset-top)); bottom:0;
     width:min(82vw, 300px);
     transform:translateX(-105%); transition:transform .18s ease; box-shadow:var(--shadow);
   }
@@ -2717,7 +2721,7 @@ html[data-theme="dark"] .github-signin-btn:active,
   .rail .rail-top { padding-top: 10px; }
   .rail.mobile-open { transform:translateX(0); }
   .rail-foot { padding-bottom:max(10px, env(safe-area-inset-bottom)); }
-  .rail-scrim { position:fixed; z-index:70; inset:52px 0 0; border:0; background:rgba(10,13,20,.38); }
+  .rail-scrim { position:fixed; z-index:70; inset:calc(52px + var(--inset-top)) 0 0; border:0; background:rgba(10,13,20,.38); }
   .rail-scrim.visible { display:block; }
   .main-inner { padding: 16px max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); }
   .tabs { overflow-x:auto; scrollbar-width:none; }
@@ -4816,3 +4820,9 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
   .row-ask-actions { margin-left: 0; }
   .task-search { min-width: 0; }
 }
+
+/* Phone apps (wiki features/phone-apps): a pasted key stays unreadable over a shoulder. */
+.secret-textarea { -webkit-text-security: disc; font-family: var(--mono, ui-monospace, monospace); font-size: 12px; resize: vertical; }
+.native-push-file { justify-self: start; cursor: pointer; }
+.app-sign-in { display: grid; gap: 14px; justify-items: center; text-align: center; }
+.app-sign-in #app-sign-in { min-width: 200px; }

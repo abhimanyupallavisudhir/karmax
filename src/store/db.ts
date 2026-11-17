@@ -66,6 +66,7 @@ import {
   CredentialNotice,
   DeliveryPreferences,
   DeliveryChannel,
+  PushSubscriptionInput,
   PushSubscriptionRecord,
   Urgency,
   OrganizationIdentityPolicy,
@@ -988,12 +989,15 @@ export class Store {
         claimedAt INTEGER, lastError TEXT, createdAt INTEGER NOT NULL, deliveredAt INTEGER,
         UNIQUE (inboxId, channel)
       );
-      -- A person's devices receiving Web Push: one row per browser subscription
-      -- (endpoint), so a browser that a second person subscribes moves to them.
+      -- A person's devices receiving push: one row per browser subscription
+      -- (kind web: endpoint = the push service URL) or phone app (kind fcm:
+      -- endpoint = its FCM registration token, p256dh/auth empty), so a device
+      -- that a second person subscribes moves to them.
       CREATE TABLE IF NOT EXISTS push_subscriptions (
         id TEXT PRIMARY KEY, userId TEXT NOT NULL, endpoint TEXT NOT NULL UNIQUE,
         p256dh TEXT NOT NULL, auth TEXT NOT NULL, label TEXT,
-        createdAt INTEGER NOT NULL, lastPushedAt INTEGER
+        createdAt INTEGER NOT NULL, lastPushedAt INTEGER,
+        kind TEXT NOT NULL DEFAULT 'web', platform TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(userId);
       CREATE TABLE IF NOT EXISTS organization_identity_policy (
@@ -1386,6 +1390,12 @@ export class Store {
     if (!providerCols.some(column => column.name === 'limits')) await this.db.exec('ALTER TABLE world_provider_connections ADD COLUMN limits TEXT');
     const preferenceCols = await this.db.prepare('PRAGMA table_info(user_preferences)').all() as { name: string }[];
     if (!preferenceCols.some(column => column.name === 'dismissed')) await this.db.exec('ALTER TABLE user_preferences ADD COLUMN dismissed TEXT');
+    // Phone apps' native push devices (wiki features/phone-apps) beside browsers.
+    const pushCols = await this.db.prepare('PRAGMA table_info(push_subscriptions)').all() as { name: string }[];
+    if (!pushCols.some(column => column.name === 'kind')) {
+      await this.db.exec("ALTER TABLE push_subscriptions ADD COLUMN kind TEXT NOT NULL DEFAULT 'web'");
+      await this.db.exec('ALTER TABLE push_subscriptions ADD COLUMN platform TEXT');
+    }
     const repositoryCols = await this.db.prepare('PRAGMA table_info(repositories)').all() as { name: string }[];
     if (!repositoryCols.some(column => column.name === 'upstream')) await this.db.exec('ALTER TABLE repositories ADD COLUMN upstream TEXT');
     // The person a chat-started run acts as (src/integrations/chat-links.ts).
@@ -2972,7 +2982,7 @@ export class Store {
         .get(userId)) as { defaultOrganizationId: string } | undefined)?.defaultOrganizationId ?? (await this.defaultOrganization(userId))?.id ?? null,
         ...(await this.userPreferences(userId)) },
       // The devices receiving push, without their endpoint and keys (credentials, like tokens).
-      pushDevices: (await this.listPushSubscriptions(userId)).map(({ id, label, createdAt, lastPushedAt }) => ({ id, label, createdAt, lastPushedAt })),
+      pushDevices: (await this.listPushSubscriptions(userId)).map(({ id, kind, label, createdAt, lastPushedAt }) => ({ id, kind, label, createdAt, lastPushedAt })),
       security: {
         secretsIncluded: false,
         omitted: ['password hashes', 'session tokens', 'OAuth tokens and state', 'credential values and handles',
@@ -5778,24 +5788,31 @@ export class Store {
       .run(newId('delivery'), inboxId, channel, at, at));
   }
 
-  /** Subscribe a device to a person's pushes. An endpoint is one browser: the
-   * same one subscribed again keeps its row (fresh keys), and subscribed by
-   * someone else moves to them. */
-  async savePushSubscription(userId: string, input: { endpoint: string; keys: { p256dh: string; auth: string }; label?: string },
-    now = Date.now()): Promise<PushSubscriptionRecord> {
+  /** Subscribe a device to a person's pushes. An endpoint (a browser) or an
+   * FCM token (a phone app) is one device: the same one subscribed again keeps
+   * its row (fresh keys), and subscribed by someone else moves to them. A phone
+   * whose token rotated names its previous row in `replaces`, which goes if it
+   * is the caller's own. */
+  async savePushSubscription(userId: string, input: PushSubscriptionInput, now = Date.now()): Promise<PushSubscriptionRecord> {
+    const native = 'kind' in input && input.kind === 'fcm';
+    const address = native ? input.token : input.endpoint;
+    const [p256dh, auth] = native ? ['', ''] : [input.keys.p256dh, input.keys.auth];
+    const platform = native ? input.platform : null;
     return this.db.transaction(async () => {
-      (await this.db.lock(`push-subscription:${input.endpoint}`));
-      const existing = (await this.db.prepare('SELECT id, userId FROM push_subscriptions WHERE endpoint=?').get(input.endpoint)) as any;
+      (await this.db.lock(`push-subscription:${address}`));
+      if (native && input.replaces)
+        (await this.db.prepare('DELETE FROM push_subscriptions WHERE id=? AND userId=? AND endpoint<>?').run(input.replaces, userId, address));
+      const existing = (await this.db.prepare('SELECT id, userId FROM push_subscriptions WHERE endpoint=?').get(address)) as any;
       const label = input.label?.trim().slice(0, 80) || null;
       if (existing && String(existing.userId) === userId) {
-        (await this.db.prepare('UPDATE push_subscriptions SET p256dh=?, auth=?, label=? WHERE id=?')
-          .run(input.keys.p256dh, input.keys.auth, label, existing.id));
+        (await this.db.prepare('UPDATE push_subscriptions SET p256dh=?, auth=?, label=?, kind=?, platform=? WHERE id=?')
+          .run(p256dh, auth, label, native ? 'fcm' : 'web', platform, existing.id));
         return (await this.pushSubscription(String(existing.id)))!;
       }
       if (existing) (await this.db.prepare('DELETE FROM push_subscriptions WHERE id=?').run(existing.id));
       const id = newId('push');
-      (await this.db.prepare(`INSERT INTO push_subscriptions (id, userId, endpoint, p256dh, auth, label, createdAt)
-        VALUES (?, ?, ?, ?, ?, ?, ?)`).run(id, userId, input.endpoint, input.keys.p256dh, input.keys.auth, label, now));
+      (await this.db.prepare(`INSERT INTO push_subscriptions (id, userId, endpoint, p256dh, auth, label, createdAt, kind, platform)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, userId, address, p256dh, auth, label, now, native ? 'fcm' : 'web', platform));
       return (await this.pushSubscription(id))!;
     });
   }
@@ -11465,9 +11482,11 @@ function rowToRepository(r: any): Repository {
 }
 
 function rowToPushSubscription(r: any): PushSubscriptionRecord {
-  return { id: String(r.id), userId: String(r.userId), endpoint: String(r.endpoint),
-    keys: { p256dh: String(r.p256dh), auth: String(r.auth) }, ...(r.label ? { label: String(r.label) } : {}),
+  const base = { id: String(r.id), userId: String(r.userId), ...(r.label ? { label: String(r.label) } : {}),
     createdAt: Number(r.createdAt), ...(r.lastPushedAt == null ? {} : { lastPushedAt: Number(r.lastPushedAt) }) };
+  return r.kind === 'fcm'
+    ? { ...base, kind: 'fcm', token: String(r.endpoint), platform: r.platform === 'ios' ? 'ios' : 'android' }
+    : { ...base, kind: 'web', endpoint: String(r.endpoint), keys: { p256dh: String(r.p256dh), auth: String(r.auth) } };
 }
 
 function rowToInbox(r: any): InboxItem {

@@ -214,6 +214,8 @@ export interface GatewayDeps {
   deliveryChannels?: string[];
   /** The installation's VAPID key pair for Web Push (src/collaboration/push-delivery.ts vaultVapidKeys). */
   pushKeys?: () => Promise<import('../collaboration/web-push.js').VapidKeyPair>;
+  /** The phone apps' native push (FCM; src/collaboration/native-push.ts): usable once its Firebase key is set. */
+  nativePush?: import('../collaboration/native-push.js').NativePush;
   remoteAccess?: RemoteAccessController;
   /** Fetches OAuth client ID metadata documents (default: the outbound SSRF guard). */
   oauthMetadataFetch?: typeof fetch;
@@ -839,13 +841,17 @@ export class Gateway {
 
   private async initialize(deps: GatewayDeps) {
 
-    this.appGrants = new AppGrants(deps.store);
+    // A phone app's grant is a handle on its console session (wiki features/phone-apps).
+    const identity = deps.identity;
+    this.appGrants = new AppGrants(deps.store, identity ? { sessions: {
+      state: (id) => identity.sessionState(id), end: (id) => identity.endSession(id) } } : {});
     this.oauthRoutes = new OAuthRoutes({ store: deps.store, grants: this.appGrants, authorization: deps.authorization,
       oauth: new OAuthServer(deps.store, this.appGrants, { fetchMetadata: deps.oauthMetadataFetch }),
       hostLocal: () => this.hostLocal,
       bearerValid: async (token) => isAppBearer(token) ? !!(await this.appGrantAuth(token)) : !!(await deps.tokens.verify(token)),
       loopback: () => this.loopbackUrl ? { baseUrl: this.loopbackUrl, headers: { 'x-karmax-loopback': this.loopbackSecret } } : undefined,
-      userName: async (userId) => deps.identity?.userById(userId) });
+      userName: async (userId) => deps.identity?.userById(userId),
+      startAppSession: identity ? (userId, headers) => identity.startAppSession(userId, headers) : undefined });
     if (deps.identity) {
       // A principal token minted for an app grant names the grant as its session.
       deps.tokens.connectIdentitySessions((sessionId, userId) => sessionId.startsWith('grant_')
@@ -2403,6 +2409,8 @@ export class Gateway {
         google: this.deps.identity?.googleEnabled ?? false,
         github: this.deps.identity?.githubEnabled ?? false,
         modelBenchmarks: this.artificialAnalysis.available,
+        // The phone apps register for native push only once the installation's Firebase key is set (wiki features/phone-apps).
+        nativePush: (await this.deps.nativePush?.available()) ?? false,
       });
     }
     if (p === '/api/health/live' && method === 'GET') return this.json(res, 200, { ok: true, ts: Date.now() });
@@ -2836,6 +2844,32 @@ export class Gateway {
         await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'error-reports.save', 'installation:error-reports',
           { ...settings, ...identityAuditDetail(callerIdentity) });
         return this.json(res, 200, { settings });
+      }
+      // Native push for the phone apps (wiki features/phone-apps): GET whether
+      // the Firebase service account is set (never the key), PUT {serviceAccount}
+      // saves it once Google accepts it, DELETE removes it.
+      if (p === '/api/settings/native-push') {
+        const nativePush = this.deps.nativePush;
+        if (!nativePush) return this.json(res, 503, { error: 'the vault is unavailable' });
+        if (method === 'GET') return this.json(res, 200, await nativePush.view());
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          if (typeof b.serviceAccount !== 'string' || !b.serviceAccount.trim())
+            return this.json(res, 400, { error: 'serviceAccount must be the Firebase service account key file (JSON)' });
+          let view;
+          try { view = await nativePush.configure(b.serviceAccount); }
+          catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+          await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'native-push.save', 'installation:native-push',
+            { projectId: view.projectId, clientEmail: view.clientEmail, ...identityAuditDetail(callerIdentity) });
+          return this.json(res, 200, view);
+        }
+        if (method === 'DELETE') {
+          await nativePush.remove();
+          await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'native-push.delete', 'installation:native-push',
+            { ...identityAuditDetail(callerIdentity) });
+          return this.json(res, 200, await nativePush.view());
+        }
+        return this.json(res, 405, { error: 'method not allowed' });
       }
       // tavya's included model (wiki features/included-model): GET its
       // settings and this month's use; PUT {managementKey?, model?, effort?, enabled?}
@@ -3996,19 +4030,37 @@ export class Gateway {
       const pushSubscription = p.match(/^\/api\/user\/push-subscriptions(?:\/([^/]+))?$/);
       if (pushSubscription) {
         const subject = requireHumanSubject(callerIdentity);
-        const shown = ({ keys: _keys, userId: _userId, ...device }: PushSubscriptionRecord) => device;
+        // Neither a browser's keys nor a phone's FCM token is read back: each is how the server reaches that device.
+        const shown = (device: PushSubscriptionRecord) => {
+          const { userId: _userId, ...rest } = device;
+          if (rest.kind === 'fcm') { const { token: _token, ...phone } = rest; return phone; }
+          const { keys: _keys, ...browser } = rest;
+          return browser;
+        };
         if (!pushSubscription[1] && method === 'GET')
           return this.json(res, 200, (await store.listPushSubscriptions(subject.userId)).map(shown));
         if (!pushSubscription[1] && method === 'POST') {
-          if (!this.deps.pushKeys) return this.json(res, 404, { error: 'Push notifications are not available on this installation.' });
           const b = await this.body(req);
+          if (b.label !== undefined && typeof b.label !== 'string') return this.json(res, 400, { error: 'label must be text' });
+          // A phone app (wiki features/phone-apps): its FCM registration token.
+          if (b.kind === 'fcm') {
+            if (!(await this.deps.nativePush?.available()))
+              return this.json(res, 409, { error: 'Push to the phone app isn’t set up on this installation (Installation → Phone apps).' });
+            const token = typeof b.token === 'string' ? b.token : '';
+            if (!/^[A-Za-z0-9_:.-]{20,4096}$/.test(token)) return this.json(res, 400, { error: 'token must be an FCM registration token' });
+            if (b.platform !== 'android' && b.platform !== 'ios') return this.json(res, 400, { error: 'platform must be android or ios' });
+            if (b.replaces !== undefined && typeof b.replaces !== 'string') return this.json(res, 400, { error: 'replaces must be a device id' });
+            return this.json(res, 200, shown(await store.savePushSubscription(subject.userId,
+              { kind: 'fcm', token, platform: b.platform, label: b.label, ...(b.replaces ? { replaces: b.replaces } : {}) })));
+          }
+          if (b.kind !== undefined && b.kind !== 'web') return this.json(res, 400, { error: 'kind must be web or fcm' });
+          if (!this.deps.pushKeys) return this.json(res, 404, { error: 'Push notifications are not available on this installation.' });
           const endpoint = typeof b.endpoint === 'string' ? b.endpoint : '';
           if (endpoint.length > 2048 || !pushEndpointAllowed(endpoint))
             return this.json(res, 400, { error: 'endpoint must be a browser push service URL (PushSubscription.endpoint)' });
           try { pushKeyBytes(b.keys); } catch (error) {
             return this.json(res, 400, { error: `keys: ${error instanceof Error ? error.message : String(error)}` });
           }
-          if (b.label !== undefined && typeof b.label !== 'string') return this.json(res, 400, { error: 'label must be text' });
           return this.json(res, 200, shown(await store.savePushSubscription(subject.userId,
             { endpoint, keys: { p256dh: String(b.keys.p256dh), auth: String(b.keys.auth) }, label: b.label })));
         }

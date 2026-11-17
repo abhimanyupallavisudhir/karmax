@@ -327,19 +327,39 @@ export const PUSH_DEFAULT_URGENCIES: Record<Urgency, boolean> = { low: false, no
 /** Where an inbox item is delivered besides the inbox itself. */
 export type DeliveryChannel = 'browser' | 'email' | 'slack' | 'push';
 
-/** One of a person's devices receiving Web Push (RFC 8030): the browser's
- * subscription. `keys` (p256dh, auth) stay on the server. */
-export interface PushSubscriptionRecord {
+interface PushDeviceBase {
   id: string;
   userId: string;
-  endpoint: string;
-  keys: { p256dh: string; auth: string };
-  /** What the person calls the device ("Chrome on Android"), set by the console. */
+  /** What the person calls the device ("Chrome on Android", "tavya on iPhone"), set by the console. */
   label?: string;
   createdAt: number;
   /** The last time a push service accepted a message for it. */
   lastPushedAt?: number;
 }
+
+/** A browser receiving Web Push (RFC 8030): its subscription. `keys` (p256dh,
+ * auth) stay on the server. */
+export interface WebPushDevice extends PushDeviceBase {
+  kind: 'web';
+  endpoint: string;
+  keys: { p256dh: string; auth: string };
+}
+
+/** A phone app receiving native push through FCM (APNs via FCM on iOS):
+ * its FCM registration token (wiki features/phone-apps). */
+export interface NativePushDevice extends PushDeviceBase {
+  kind: 'fcm';
+  token: string;
+  platform: 'android' | 'ios';
+}
+
+/** One of a person's devices receiving push. */
+export type PushSubscriptionRecord = WebPushDevice | NativePushDevice;
+
+/** What subscribing a device sends: a browser's subscription, or a phone's FCM token. */
+export type PushSubscriptionInput =
+  | { kind?: 'web'; endpoint: string; keys: { p256dh: string; auth: string }; label?: string }
+  | { kind: 'fcm'; token: string; platform: 'android' | 'ios'; label?: string; replaces?: string };
 
 export interface OrganizationIdentityPolicy {
   organizationId: string;

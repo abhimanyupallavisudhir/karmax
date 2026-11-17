@@ -1,0 +1,6 @@
+node_modules
+# Local Android SDK / JDK (see README) and copied build artefacts
+.toolchain/
+build-output/
+# Written by capacitor.config.ts from TAVYA_URL on every cap command
+www/server-url.js

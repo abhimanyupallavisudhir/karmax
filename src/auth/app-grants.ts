@@ -20,7 +20,19 @@ import type { AuthorizationProfileId } from '../platform/authorization.js';
  * closing the account) kills every token at once on every gateway replica: each
  * request reads durable state, as `TokenAuthority.verify` does.
  */
-export type AppGrantKind = 'cli' | 'mcp' | 'token';
+export type AppGrantKind = 'cli' | 'mcp' | 'token' | 'app';
+
+/**
+ * The identity provider's browser sessions, as seen by an `app` grant: the
+ * phone app's WebView holds an ordinary console session cookie (wiki
+ * features/phone-apps), and its grant is a handle on that session. The grant
+ * lives exactly as long as the session; revoking the grant ends the session.
+ */
+export interface AppSessions {
+  /** When it was last refreshed and when it expires; undefined once it is gone. */
+  state(sessionId: string): Promise<{ updatedAt: number; expiresAt: number } | undefined>;
+  end(sessionId: string): Promise<void>;
+}
 
 /** What a grant may do at most. The person's current authority always applies
  * on top: a grant can narrow it, never widen it. */
@@ -52,6 +64,8 @@ export interface AppGrant {
   createdBy?: { kind: 'user' } | { kind: 'agent'; principal: string };
   /** Refresh-token family (OAuth grants only). */
   refresh?: { current: string; previous: string[] };
+  /** `app` grants: the console session the phone app's WebView holds. */
+  sessionId?: string;
 }
 
 interface TokenRecord { type: 'access' | 'pat'; grantId: string; userId: string; expiresAt: number }
@@ -80,11 +94,12 @@ export const isAppBearer = (token: string | undefined): token is string =>
   !!token && (token.startsWith('tva_') || token.startsWith('tvp_'));
 
 export class AppGrants {
-  constructor(private store: Store) {}
+  constructor(private store: Store, private options: { sessions?: AppSessions } = {}) {}
 
   async create(input: { userId: string; kind: AppGrantKind; clientId: string; name: string; ceiling?: AppGrantCeiling;
-    resource?: string; expiresAt?: number; createdBy?: AppGrant['createdBy'] }): Promise<AppGrant> {
+    resource?: string; expiresAt?: number; createdBy?: AppGrant['createdBy']; sessionId?: string }): Promise<AppGrant> {
     const now = Date.now();
+    if (input.kind === 'app' && !input.sessionId) throw new AppGrantError('invalid_request', 'An app grant stands for a console session');
     if (input.kind === 'token' && !(Number.isFinite(input.expiresAt) && input.expiresAt! > now && input.expiresAt! <= now + MAX_TOKEN_TTL_MS))
       throw new AppGrantError('invalid_request', 'A personal token needs an expiry between now and one year from now');
     const grant: AppGrant = {
@@ -94,6 +109,7 @@ export class AppGrants {
       ...(input.resource ? { resource: input.resource } : {}),
       createdAt: now, expiresAt: input.kind === 'token' ? input.expiresAt! : now + GRANT_IDLE_TTL_MS,
       ...(input.createdBy ? { createdBy: input.createdBy } : {}),
+      ...(input.kind === 'app' ? { sessionId: input.sessionId } : {}),
     };
     await this.store.transaction(async () => {
       await this.store.kvSet(grantKey(grant.id), JSON.stringify(grant));
@@ -107,9 +123,23 @@ export class AppGrants {
     const raw = await this.store.kvGet(grantKey(id));
     if (!raw) return undefined;
     const grant = JSON.parse(raw) as AppGrant;
+    if (grant.kind === 'app') return this.appGrant(grant);
     if (grant.expiresAt <= Date.now()) { await this.delete(grant); return undefined; }
     if (await this.store.kvGet(`account-closed:${grant.userId}`)) return undefined;
     return grant;
+  }
+
+  /** A phone's grant, alive while its console session is: last used and
+   * expiring when the session was last refreshed and expires. */
+  private async appGrant(grant: AppGrant): Promise<AppGrant | undefined> {
+    // Only the gateway knows the sessions; anywhere else the grant is taken as it is.
+    if (!this.options.sessions) return grant;
+    const state = grant.sessionId ? await this.options.sessions?.state(grant.sessionId) : undefined;
+    if (!state || state.expiresAt <= Date.now() || await this.store.kvGet(`account-closed:${grant.userId}`)) {
+      await this.delete({ ...grant, sessionId: undefined });
+      return undefined;
+    }
+    return { ...grant, lastUsedAt: state.updatedAt, expiresAt: state.expiresAt };
   }
 
   async list(userId: string): Promise<AppGrant[]> {
@@ -276,6 +306,7 @@ export class AppGrants {
   private async delete(grant: AppGrant): Promise<void> {
     await this.store.kvDelete(grantKey(grant.id));
     await this.store.kvDelete(userIndexKey(grant.userId, grant.id));
+    if (grant.kind === 'app' && grant.sessionId) await this.options.sessions?.end(grant.sessionId);
   }
 }
 
