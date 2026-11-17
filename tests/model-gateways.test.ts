@@ -385,6 +385,45 @@ describe('a Claude Code or Codex turn on the credit', () => {
       model: 'anthropic/claude-opus-5.5', env: { ANTHROPIC_DEFAULT_HAIKU_MODEL: '~anthropic/claude-haiku-latest' } });
   });
 
+  // OpenRouter refusing the organization's key under Claude Code, as production
+  // reported it (tavya-error efc0154c44025278, 2026-11-17): it reached the
+  // parent as an agent error, with a link to tavya's OpenRouter workspace.
+  const CANNOT_AFFORD = 'Claude provider unknown: API Error: 402 This request requires more credits, or fewer max_tokens. '
+    + 'You requested up to 128000 tokens, but can only afford 123876. To increase, visit '
+    + 'https://openrouter.ai/workspaces/default/keys/88d4e9b5 and adjust the key\'s total limit';
+
+  it('waits Out of compute when OpenRouter refuses Claude Code at a key limit that already follows the credit, and starts no turn until more arrives', async () => {
+    let turns = 0;
+    const f: any = await turnFixture('claude', 'claude-opus-5-5', async () => {
+      turns++;
+      for (const key of keys.values()) key.usage = key.limit! - 0.5;
+      throw new Error(CANNOT_AFFORD);
+    }, { included: true });
+    const failure = await f.run().catch((error: unknown) => error);
+    expect(failure).toMatchObject({ type: 'world-capacity', message: expect.stringMatching(/^Out of compute: /) });
+    expect(failure.message).not.toMatch(/openrouter\.ai/i);
+    await expect(f.run()).rejects.toMatchObject({ type: 'world-capacity' });
+    expect(turns).toBe(1);
+  });
+
+  it('raises the key\'s limit and goes on when OpenRouter refused Claude Code while the credit had more', async () => {
+    let turns = 0;
+    const f: any = await turnFixture('claude', 'claude-opus-5-5', async () => {
+      if (++turns > 1) return { termination: { kind: 'success', status: 'end_turn' }, output: 'done' };
+      for (const key of keys.values()) key.usage = key.limit!;
+      // A $10 pack, bought while the turn ran.
+      await f.store.createComputeTopUp({ id: 'topup_mid', organizationId: f.organization.id, creditMicros: 10_000_000, amountCents: 1_000,
+        subscriptionId: 'sub_1', requestedAt: Date.now() - 1_000 });
+      await f.store.updateComputeTopUp('topup_mid', { state: 'paid', settledAt: Date.now() - 1_000 });
+      throw new Error(CANNOT_AFFORD);
+    }, { included: true });
+    const failure = await f.run().catch((error: unknown) => error);
+    expect(failure).toMatchObject({ type: 'agent-infra', nonRetryable: false });
+    expect(failure.message).not.toMatch(/openrouter\.ai|can only afford/i);
+    await expect(f.run()).resolves.toBeDefined();
+    expect(turns).toBe(2);
+  });
+
   it('still says which login is missing when nothing serves it, and waits Out of compute without credit', async () => {
     const none = await turnFixture('claude', 'claude-opus-5-5', async () => ({ termination: { kind: 'success', status: 'end_turn' } }));
     expect((await none.order())[0]).toMatch(/^missing:/);
