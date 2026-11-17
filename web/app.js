@@ -20713,7 +20713,7 @@ async function hydrateProjectEvents(proj) {
       if (!confirm(`Delete “${row.querySelector('.setting-label').textContent}”? It stops receiving events.`)) return;
       try { await api(`/api/webhooks/${row.dataset.hook}`, { method: 'DELETE' }); load(); } catch (e) { toast(e.message, true); }
     }));
-    // A chat bot's people rows follow its "Who can ask" row.
+    // A chat bot's people rows (Linked, Guests, then those asking) belong to the row marked data-people above them.
     const people = async (el, patch) => {
       let row = el.closest('.setting-row');
       while (row && !row.dataset.people) row = row.previousElementSibling;

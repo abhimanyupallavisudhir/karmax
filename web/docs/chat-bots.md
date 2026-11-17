@@ -14,9 +14,11 @@ Ask a project for work from Telegram, Slack, Discord or WhatsApp. Each request b
 
 ## Who can ask
 
-A task started from chat works with the authority of whoever connected the bot, and anyone who finds a bot can message it. So a bot takes requests only from people you allow, and nobody at first.
+Anyone who finds a bot can message it, so it only takes requests from people it knows.
 
-Message the bot yourself. It answers that you are not allowed yet, and you appear under the bot's **Who can ask** in Settings → Events. Choose **Allow**. Anyone else who asks shows up there too, with what they asked. **Anyone** lets in everyone who can message the bot, e.g. a private Slack workspace.
+**Link your account.** Message the bot. It answers with a link; open it, signed in to tavya, and choose **Link**. From then on, a task your messages start is yours: it is created by you, does no more than you may do in the project, and its questions and approvals come to you. A link works for 15 minutes and once; message the bot again for a new one. Each bot has its own links, and you can remove yours under **Profile → Chat accounts**. Someone linked who cannot start tasks in the project is told so, and nothing starts.
+
+**Guests.** People without a tavya account can still ask, as guests of whoever connected the bot: their tasks work with that person's authority. Choose **Allow** beside someone under the bot in **Settings → Events**: everyone who messaged the bot without being let in shows up there, with what they asked. **Anyone** makes everyone who can message the bot a guest, e.g. in a private Slack workspace. The bot's **Linked** row lists the people linked to it, and the project can remove them.
 
 ## Ask
 
