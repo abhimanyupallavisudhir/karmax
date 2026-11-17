@@ -38,6 +38,9 @@ export interface ChatMention {
   channel: { id: string; name?: string };
   thread?: string;
   url?: string;
+  /** Only the sender and the bot see the conversation (a direct message), so
+   *  a reply in it reaches no one else. Read from the platform, not the text. */
+  private?: boolean;
 }
 
 export interface ChatDelivery {
@@ -87,6 +90,8 @@ export interface ChatAdapter {
   /** Read a delivery; refuses one the platform did not sign. */
   receive(credentials: ChatCredentials, identity: ChatBotIdentity, delivery: ChatDelivery): ChatInbound | 'refused';
   reply(credentials: ChatCredentials, to: { channel: string; thread?: string }, text: string, fetcher: typeof fetch): Promise<{ messageId?: string }>;
+  /** Post in a shared channel where only `user` sees it, on platforms that can. */
+  whisper?(credentials: ChatCredentials, to: { channel: string; thread?: string; user: string }, text: string, fetcher: typeof fetch): Promise<void>;
 }
 
 // ─── Telegram ────────────────────────────────────────────────────────────────
@@ -120,6 +125,7 @@ const telegram: ChatAdapter = {
       channel: { id: String(chat.id), ...(chat.title || chat.username ? { name: chat.title ?? chat.username } : {}) },
       thread,
       ...(chat.username ? { url: `https://t.me/${chat.username}/${message.message_id}` } : {}),
+      ...(chat.type === 'private' ? { private: true } : {}),
     }] };
   },
   async reply(credentials, to, text, fetcher) {
@@ -153,6 +159,7 @@ const slack: ChatAdapter = {
     return { mentions: [{
       key: `slack:${body.event_id}`, platform: 'slack', text: String(event.text ?? '').replace(/<@[A-Z0-9]+>/g, '').trim(),
       author: { id: String(event.user ?? '') }, channel: { id: String(event.channel ?? '') }, thread: String(event.thread_ts ?? event.ts ?? ''),
+      ...(event.channel_type === 'im' ? { private: true } : {}),
     }] };
   },
   async reply(credentials, to, text, fetcher) {
@@ -160,6 +167,11 @@ const slack: ChatAdapter = {
       headers: { 'content-type': 'application/json; charset=utf-8', authorization: `Bearer ${credentials.botToken}` },
       body: JSON.stringify({ channel: to.channel, text, ...(to.thread ? { thread_ts: to.thread } : {}) }) }, 'Slack');
     return { messageId: sent.ts };
+  },
+  async whisper(credentials, to, text, fetcher) {
+    await call(fetcher, 'https://slack.com/api/chat.postEphemeral', { method: 'POST',
+      headers: { 'content-type': 'application/json; charset=utf-8', authorization: `Bearer ${credentials.botToken}` },
+      body: JSON.stringify({ channel: to.channel, user: to.user, text, ...(to.thread ? { thread_ts: to.thread } : {}) }) }, 'Slack');
   },
 };
 
@@ -240,7 +252,7 @@ const whatsapp: ChatAdapter = {
         const name = names.get(message.from) as string | undefined;
         mentions.push({ key: `whatsapp:${message.id}`, platform: 'whatsapp', text: String(message.text.body).trim(),
           author: { id: String(message.from), ...(name ? { name } : {}) }, channel: { id: String(message.from) },
-          thread: String(message.context?.id ?? message.id) });
+          thread: String(message.context?.id ?? message.id), private: true });
       }
     }
     return { mentions };

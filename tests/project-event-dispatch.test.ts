@@ -4,7 +4,7 @@ import { KarmaxBus } from '../src/contrib/bus.js';
 import { TriggerScheduler } from '../src/platform/trigger-scheduler.js';
 import { forcesRepeatable } from '../src/domain/triggers.js';
 import type { TaskRecord, TaskTrigger } from '../src/domain/types.js';
-import type { ProjectEvent, TriggerContext } from '../src/domain/project-events.js';
+import { EventRunRefused, type ProjectEvent, type TriggerContext } from '../src/domain/project-events.js';
 import { storeBackends } from './helpers/store-backends.js';
 import { ERROR_REPORTS_KEY, ErrorReporter } from '../src/platform/error-reports.js';
 import { ERROR_FIXER_TRIGGER } from '../src/platform/error-fixer.js';
@@ -251,6 +251,20 @@ describe.each(storeBackends)('project event dispatch ($name)', ({ open }) => {
     clock.advance(11 * 60_000);
     await s.sweepProjectEvents();
     expect(await store.getProjectEventClaim(orphan.id, series.id)).toMatchObject({ state: 'started', runId: run.id });
+    expect(fires).toHaveLength(1);
+  });
+
+  it('skips for good a start refused for good (the person who asked may no longer start tasks)', async () => {
+    const series = await armedTask([planned]);
+    const s = new TriggerScheduler({ store, bus, tell, now: clock.now, setTimer: clock.set, clearTimer: clock.clear, reconcileMs: 0, inboxSweepMs: 0,
+      fire: async () => { fires.push({} as Fire); throw new EventRunRefused('the person who asked cannot start tasks in this project'); } });
+    schedulers.push(s);
+    await s.start();
+    const ev = await record();
+    await deliver(s, ev);
+    expect(await store.getProjectEventClaim(ev.id, series.id)).toMatchObject({ state: 'skipped', reason: 'the person who asked cannot start tasks in this project' });
+    clock.advance(60_000);
+    await s.sweepProjectEvents();
     expect(fires).toHaveLength(1);
   });
 

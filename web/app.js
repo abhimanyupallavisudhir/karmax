@@ -4830,7 +4830,7 @@ async function boot() {
     // The public root explains the product before asking for an account. Auth
     // callbacks, invitations and explicit auth routes still land directly on
     // the form they need, so a person following a link never has to hunt.
-    if (S.pendingInvite || S.justVerified || S.signInError || ['/login', '/mcp-callback', '/device', '/oauth/consent'].includes(location.pathname)) return renderLogin();
+    if (S.pendingInvite || S.justVerified || S.signInError || ['/login', '/mcp-callback', '/device', '/oauth/consent', '/link/chat'].includes(location.pathname)) return renderLogin();
     if (location.pathname === '/signup') return renderSignup();
     return renderLanding();
   }
@@ -4842,6 +4842,7 @@ async function boot() {
   S.user = session.user || null;
   if (location.pathname === '/mcp-callback') return finishMcpCallback();
   if (location.pathname === '/device') return renderDeviceApproval();
+  if (location.pathname === '/link/chat') return renderChatLink();
   if (location.pathname === '/oauth/consent') return renderOAuthConsent();
   const route = parseRoute(location.pathname);
   if (route.name === 'invite') {
@@ -20736,17 +20737,22 @@ const CHAT_URL_PASTED = {
 };
 const chatUrlTip = (kind) => `Paste into ${CHAT_URL_PASTED[kind][0]}: ${CHAT_URL_PASTED[kind][1]}`;
 
-// Who a chat bot takes requests from, and who asked without being allowed.
+// Who may ask a chat bot (wiki planned/assistant §3): people who linked their
+// chat account ask as themselves; guests, as whoever connected the bot.
 function chatPeopleHtml(h) {
   const who = (p) => esc(p.name || p.id);
+  const linked = (h.linked || []).map((l) => `<span class="chip pe-person pe-linked" title="${esc(`${CHAT_PLATFORM_LABELS[h.kind] || ''} id ${l.platformUserId}`)}">${esc(l.name || l.userId)}${l.platformName ? ` <span class="setting-muted">· ${esc(l.platformName)}</span>` : ''}<button class="file-chip-x" data-people-unlink="${esc(l.id)}" aria-label="Remove ${esc(l.name || l.userId)}" title="Remove">✕</button></span>`).join('');
   const allowed = (h.allowed || []).map((p) => `<span class="chip pe-person" title="${esc(p.id)}">${who(p)}<button class="file-chip-x" data-people-remove="${esc(p.id)}" aria-label="Remove ${who(p)}" title="Remove">✕</button></span>`).join('');
   const asking = (h.asking || []).map((p) => `<div class="setting-row pe-sub pe-asking" data-person="${esc(p.id)}">
     <span class="setting-label" title="${esc(p.id)}">${who(p)}</span>
     <span class="setting-value setting-muted">${p.text ? `“${esc(p.text.slice(0, 80))}”` : ''}${p.at ? `<span class="setting-sep">·</span>${fmtAgo(p.at)}` : ''}</span>
-    <span class="setting-actions"><button class="btn sm" data-people-allow>Allow</button><button class="btn sm ghost" data-people-dismiss aria-label="Dismiss" title="Dismiss">✕</button></span></div>`).join('');
-  return `<div class="setting-row pe-sub pe-people" data-people="${esc(h.id)}">
-    <span class="setting-label">Who can ask ${policyTip('Only their messages start tasks. Anyone else is told so and shows up here to allow.')}</span>
-    <span class="setting-value">${h.anyone ? '<span class="setting-muted">Anyone who can message the bot</span>' : allowed || '<span class="setting-muted">Nobody yet: message the bot, then allow yourself here</span>'}</span>
+    <span class="setting-actions"><button class="btn sm" data-people-allow title="Let them ask as a guest">Allow</button><button class="btn sm ghost" data-people-dismiss aria-label="Dismiss" title="Dismiss">✕</button></span></div>`).join('');
+  const linkedRow = linked ? `<div class="setting-row pe-sub pe-people-linked" data-people="${esc(h.id)}">
+    <span class="setting-label">Linked ${policyTip('Their messages start tasks as them, with no more than they may do in this project.')}</span>
+    <span class="setting-value">${linked}</span><span class="setting-actions"></span></div>` : '';
+  return `${linkedRow}<div class="setting-row pe-sub pe-people" data-people="${esc(h.id)}">
+    <span class="setting-label">Guests ${policyTip(`They act as ${h.connectedBy || 'whoever connected the bot'}. Anyone else is sent a link to link their account.`)}</span>
+    <span class="setting-value">${h.anyone ? '<span class="setting-muted">Anyone who can message the bot</span>' : allowed || '<span class="setting-muted">None</span>'}</span>
     <span class="setting-actions"><label class="pe-starts">Anyone <input type="checkbox" class="toggle" data-people-anyone ${h.anyone ? 'checked' : ''}></label></span></div>${asking}`;
 }
 
@@ -20790,7 +20796,7 @@ async function hydrateProjectEvents(proj) {
       if (!confirm(`Delete “${row.querySelector('.setting-label').textContent}”? It stops receiving events.`)) return;
       try { await api(`/api/webhooks/${row.dataset.hook}`, { method: 'DELETE' }); load(); } catch (e) { toast(e.message, true); }
     }));
-    // A chat bot's people rows follow its "Who can ask" row.
+    // A chat bot's people rows (Linked, Guests, then those asking) belong to the row marked data-people above them.
     const people = async (el, patch) => {
       let row = el.closest('.setting-row');
       while (row && !row.dataset.people) row = row.previousElementSibling;
@@ -20802,6 +20808,8 @@ async function hydrateProjectEvents(proj) {
     box.querySelectorAll('[data-people-anyone]').forEach((t) => t.addEventListener('change', () => people(t, () => ({ anyone: t.checked }))));
     box.querySelectorAll('[data-people-remove]').forEach((b) => b.addEventListener('click', () =>
       people(b, (h) => ({ allowed: (h.allowed || []).filter((p) => p.id !== b.dataset.peopleRemove) }))));
+    box.querySelectorAll('[data-people-unlink]').forEach((b) => b.addEventListener('click', () =>
+      people(b, () => ({ unlink: [b.dataset.peopleUnlink] }))));
     box.querySelectorAll('[data-people-allow]').forEach((b) => b.addEventListener('click', () => {
       const id = b.closest('[data-person]').dataset.person;
       people(b, (h) => {
@@ -25791,6 +25799,7 @@ function profileView() {
     ${notificationsCard()}
     ${S.meta?.hosted ? '<div class="card"><div class="section-h">Paid subscriptions</div><div id="profile-paid-subscriptions" aria-live="polite"><span class="task-sub">Loading…</span></div></div>' : ''}
     ${u ? appGrantsCard() : ''}
+    ${u ? chatLinksCard() : ''}
     <div class="card" id="data-account">
       <div class="section-h">Data &amp; account</div>
       <div class="setting-rows">
@@ -25975,6 +25984,7 @@ function wireProfileView() {
   wireNotificationsCard();
   void hydrateProfilePaidSubscriptions();
   void hydrateAppGrants();
+  void hydrateChatLinks();
   hydrateProfileGithub();
   wireOrganizationCombo($('#default-organization'), () => S.defaultOrganizationId, async (organizationId) => {
     const preference = await api('/api/user/default-organization', {
@@ -30096,6 +30106,57 @@ async function renderOAuthConsent() {
   $('#consent-allow').addEventListener('click', () => decide('approve'));
   $('#consent-deny').addEventListener('click', () => decide('deny'));
   $('#consent-allow').focus();
+}
+
+// ─── Chat accounts: /link/chat, Profile → Chat accounts (wiki planned/assistant §3)
+// A chat bot sends someone it does not know here; linking makes the runs their
+// messages start act as them. src/integrations/chat-links.ts.
+async function renderChatLink() {
+  document.title = `Link chat account · ${siteName()}`;
+  const t = new URLSearchParams(location.search).get('t') || '';
+  grantFrame('<p class="task-sub">Loading…</p>');
+  let offer;
+  try { offer = await api(`/api/chat-links/pending?t=${encodeURIComponent(t)}`); }
+  catch (error) { return grantDone('Link not valid', plainError(error)); }
+  const platform = CHAT_PLATFORM_LABELS[offer.platform] || 'chat';
+  const bot = offer.bot?.username ? (offer.bot.username.startsWith('+') ? offer.bot.username : `@${offer.bot.username}`) : offer.bot?.name || 'the bot';
+  grantFrame(`<h1 class="grant-title">Link ${esc(platform)} user ${esc(offer.platformName || offer.platformUserId)} to you?</h1>
+    <p class="grant-who"><span class="task-sub" title="${esc(`${platform} id ${offer.platformUserId}`)}">via ${esc(bot)}</span> ${policyTip('Their messages to this bot start tasks as you, with no more than you may do in its project. Link only your own account.')}</p>
+    <div class="grant-actions"><button class="btn primary" id="chat-link-yes">Link</button><button class="btn" id="chat-link-no">Cancel</button></div>
+    <p class="grant-msg" id="grant-msg" role="alert"></p>`);
+  $('#chat-link-yes').addEventListener('click', async () => {
+    $('#chat-link-yes').disabled = $('#chat-link-no').disabled = true;
+    try {
+      await api('/api/chat-links', { method: 'POST', body: JSON.stringify({ t }) });
+      history.replaceState({ kx: 1 }, '', '/link/chat');
+      grantDone('Linked', `Message ${bot} again.`);
+    } catch (error) { $('#grant-msg').textContent = plainError(error); $('#chat-link-yes').disabled = $('#chat-link-no').disabled = false; }
+  });
+  $('#chat-link-no').addEventListener('click', () => { history.replaceState({ kx: 1 }, '', '/link/chat'); grantDone('Not linked', 'You can close this tab.'); });
+  $('#chat-link-yes').focus();
+}
+
+function chatLinksCard() {
+  return `<div class="card" id="chat-links-card" hidden>
+    <div class="section-h">Chat accounts ${policyTip('Messages from these accounts to their bot start tasks as you.')}</div>
+    <div class="setting-rows" id="profile-chat-links"></div></div>`;
+}
+
+async function hydrateChatLinks() {
+  const card = $('#chat-links-card'), box = $('#profile-chat-links');
+  if (!card || !box) return;
+  let links;
+  try { links = (await api('/api/user/chat-links'))?.links || []; } catch { return; }
+  card.hidden = !links.length;
+  box.innerHTML = links.map((link) => `<div class="setting-row" data-chat-link="${esc(link.id)}">
+      <span class="setting-label" title="${esc(`${CHAT_PLATFORM_LABELS[link.platform] || ''} id ${link.platformUserId}`)}">${esc(CHAT_PLATFORM_LABELS[link.platform] || 'Chat')} · ${esc(link.platformName || link.platformUserId)}</span>
+      <span class="setting-value setting-muted">${esc(link.bot.username ? (link.bot.username.startsWith('+') ? link.bot.username : `@${link.bot.username}`) : link.bot.name)}</span>
+      <span class="setting-actions"><button class="btn sm ghost" data-chat-unlink aria-label="Remove" title="Remove">✕</button></span></div>`).join('');
+  box.querySelectorAll('[data-chat-unlink]').forEach((button) => button.addEventListener('click', async () => {
+    button.disabled = true;
+    try { await api(`/api/user/chat-links/${encodeURIComponent(button.closest('[data-chat-link]').dataset.chatLink)}`, { method: 'DELETE' }); await hydrateChatLinks(); }
+    catch (error) { button.disabled = false; toast(error.message, true); }
+  }));
 }
 
 function appGrantsCard() {
