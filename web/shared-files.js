@@ -24,8 +24,7 @@
   root.innerHTML = `<header class="shared-heading"><div class="shared-eyebrow">Shared files</div>
       <div class="shared-toolbar"><p title="A fixed snapshot: later changes aren’t included.">Snapshot · <time datetime="${esc(root.dataset.created)}">${esc(created.toISOString().slice(0, 10))}</time></p></div></header>
     <div class="files-page shared-files-view">
-      <div class="files-bar"><a class="btn sm icon files-up" data-local aria-label="Up a folder" title="Up a folder">${FV.ICONS.up}</a>
-        <div class="files-address"><nav class="files-crumbs" aria-label="Path"></nav></div><span class="files-source"></span></div>
+      <div class="files-bar"><div class="files-address"><nav class="files-crumbs" aria-label="Path"></nav></div><span class="files-source"></span></div>
       <div class="files-body"><div class="files-status" role="status" aria-busy="true">Loading…</div></div></div>`;
   const body = root.querySelector('.files-body');
   let revision = 0, previous = null;
@@ -34,9 +33,6 @@
     const current = ++revision;
     const where = here();
     const parts = FV.parts(where);
-    const up = root.querySelector('.files-up');
-    up.href = href(FV.parent(where));
-    up.classList.toggle('disabled', !parts.length);
     root.querySelector('.files-crumbs').innerHTML = [`<a class="files-crumb files-crumb-root" data-local href="${esc(href(''))}">${esc(rootName)}</a>`,
       ...parts.map((part, i) => `<span class="files-sep" aria-hidden="true">/</span><a class="files-crumb" data-local href="${esc(href(parts.slice(0, i + 1).join('/')))}"${i === parts.length - 1 ? ' aria-current="page"' : ''}>${esc(part)}</a>`)].join('');
     body.innerHTML = '<div class="files-status" role="status" aria-busy="true">Loading…</div>';
