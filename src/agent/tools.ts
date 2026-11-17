@@ -1204,7 +1204,7 @@ export function platformToolHandlers(
     },
     async create_review_info(args) {
       // Without a computer there is nothing to run and no file to open: links only.
-      if (isComputerless(world.handle.kind) && Array.isArray(args?.actions) && args.actions.some((action: any) =>
+      if (isComputerless(world?.handle?.kind) && Array.isArray(args?.actions) && args.actions.some((action: any) =>
         action?.kind !== 'open' || !/^https?:\/\//i.test(String(action?.target ?? ''))))
         return `review info rejected: ${NO_COMPUTER_MESSAGE} Attach only open actions with an https:// URL, or a caption.`;
       // The runtime re-checks the accumulated total; either rejection goes back
@@ -1313,8 +1313,8 @@ export function platformToolHandlers(
       let jobNames: string[] = [];
       let unlisted: string[] = [];
       // Without a computer there are no jobs: a pause is a timer (or an ask).
-      if (isComputerless(world.handle.kind) && requested.length) return `error: ${NO_COMPUTER_MESSAGE}`;
-      if (!isComputerless(world.handle.kind)) try {
+      if (isComputerless(world?.handle?.kind) && requested.length) return `error: ${NO_COMPUTER_MESSAGE}`;
+      if (!isComputerless(world?.handle?.kind)) try {
         if (requested.length) {
           const statuses = await jobStatuses(world, requested, { tailLines: 20 });
           const missing = statuses.filter((job) => job.state === 'missing').map((job) => job.id);
