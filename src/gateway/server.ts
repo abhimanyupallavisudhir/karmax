@@ -2747,10 +2747,14 @@ export class Gateway {
         if (!this.errorReportAdmission.admit(by)) return this.json(res, 429, { error: 'too many reports; try again later' });
         let task: { id: string; projectId: string; error?: string; stage?: string } | undefined;
         if (typeof b.taskId === 'string' && b.taskId) {
-          // Reading its view is the check that the caller may see the task.
-          const view = await api.getTaskView(token, b.taskId);
+          // The caller must be able to read the task where it lives: its
+          // project and organization come from the record, never the request.
           const found = await store.taskMetadata(b.taskId);
-          if (!found) return this.json(res, 404, { error: `no task ${b.taskId}` });
+          const project = found ? await store.getProject(found.projectId) : undefined;
+          if (!found || !(await this.deps.tokens.check(token, 'task:read',
+            { taskId: found.id, projectId: found.projectId, organizationId: project?.organizationId })).ok)
+            return this.json(res, 404, { error: `no task ${b.taskId}` });
+          const view = await api.getTaskView(token, found.id);
           task = { id: found.id, projectId: found.projectId, ...(view?.error ? { error: String(view.error) } : {}), ...(view?.stage ? { stage: String(view.stage) } : {}) };
         }
         const organizationId = task ? (await store.getProject(task.projectId))?.organizationId : undefined;
