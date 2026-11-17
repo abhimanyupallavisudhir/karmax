@@ -95,7 +95,7 @@ import { ARTIFICIAL_ANALYSIS_KEY_ENV, ArtificialAnalysis, toBenchmarks, type Mod
 import type { IdentityService } from '../auth/identity.js';
 import type { RepositoryFiles } from '../store/project-environment.js';
 import { AuthorizationGrantError, ORGANIZATION_GRANT_CEILING, type AuthorizationService } from '../platform/authorization.js';
-import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, ORGANIZATION_WIKI_WRITE_DENIED, allows, type Capability } from '../platform/capabilities.js';
+import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, ORGANIZATION_WIKI_WRITE_DENIED, allows, type Capability, type KnownCapability } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { EXPLANATIONS_ENABLED, RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { hostLocal } from '../config/deployment.js';
@@ -224,7 +224,10 @@ export interface GatewayDeps {
  * Returns the required capability, `'none'` for routes that intentionally need
  * no capability, or undefined for a route this catalog does not know — callers
  * apply the conservative fallback, and tests assert the catalog stays complete. */
-export function routeCapability(method: string, p: string, url?: URL): string | undefined {
+/** The capability a route requires. Typed as the catalogue, so a route can
+ * never require something a grant cannot name (or a `*` grant held back from
+ * a task without a computer could silently lose). */
+export function routeCapability(method: string, p: string, url?: URL): KnownCapability | 'none' | undefined {
   const read = method === 'GET';
   if (p === '/api/connections/config') return read ? 'credential:read' : 'settings:write';
   if (p.startsWith('/api/connections')) return p.endsWith('/execute') || p === '/api/connections/request' ? 'connection:use' : 'credential:read';

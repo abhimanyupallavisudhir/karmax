@@ -25,7 +25,7 @@ import { AdapterTurn, AgentAdapter, PlatformToolContext, RUNAWAY_BACKSTOP, TurnI
  */
 
 export function isComputerlessWorld(world: Pick<World, 'handle'>): boolean {
-  return isComputerless(world.handle.kind);
+  return isComputerless(world?.handle?.kind);
 }
 
 /** An agent this task without a computer cannot run. Not retryable: the

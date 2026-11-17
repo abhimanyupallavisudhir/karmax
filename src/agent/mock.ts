@@ -9,7 +9,7 @@ import { isComputerless } from '../domain/computer.js';
 /** The mock's tools, as a real adapter offers them: in a world, every
  * platform tool; without a computer, tavya's own only. */
 function platformToolHandlers(world: World, ctx: PlatformToolContext) {
-  return isComputerless(world.handle.kind) ? computerlessToolHandlers(world, ctx) : allToolHandlers(world, ctx);
+  return isComputerless(world?.handle?.kind) ? computerlessToolHandlers(world, ctx) : allToolHandlers(world, ctx);
 }
 import { SUB_TASK_ACTIONS, type SubTaskAction } from '../domain/types.js';
 import { readFileSync } from 'node:fs';

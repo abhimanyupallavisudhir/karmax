@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import fs from 'node:fs';
 import { Store } from '../src/store/db.js';
 import { AuthorizationService, organizationScope, projectScope } from '../src/platform/authorization.js';
 import { KarmaxApi } from '../src/platform/api.js';
@@ -168,21 +167,15 @@ describe('scope of the ceiling', () => {
 
 /**
  * Every capability the gateway's routes or the platform tools can require.
- * `routeCapability` returns only string literals, so its source is the
- * complete list of what a route can ask for.
+ * `routeCapability` returns `KnownCapability` and `TOOL_CAPABILITY` holds only
+ * `KnownCapability` values, so the compiler keeps both inside the catalogue:
+ * the catalogue, its families' concrete members and the legacy spellings are
+ * the complete list.
  */
 function requirableCapabilities(): string[] {
-  const server = fs.readFileSync(new URL('../src/gateway/server.ts', import.meta.url), 'utf8');
-  const start = server.indexOf('export function routeCapability(');
-  const body = server.slice(start, server.indexOf('\n}\n', start));
-  const routes = [...body.matchAll(/'([^'\n]*)'/g)].map((match) => match[1]!)
-    .filter((literal) => /^[a-z][a-z-]*(:[a-z*-]+)*$/.test(literal) && literal !== 'none');
-  expect(routes).toContain('task:delete'); // the extraction found the route table
-  expect(routes.length).toBeGreaterThan(50);
   return [...new Set([
-    ...routes,
-    ...Object.values(TOOL_CAPABILITY),
     ...CAPABILITIES.filter((capability) => !capability.endsWith(':*')),
+    ...Object.values(TOOL_CAPABILITY),
     // Families, required only as concrete members.
     'merge-into:main', 'merge-into:tavya/task_1', 'use-credential:cred_1', 'use-credential:item:vi_1', 'use-card:card_1',
     // Legacy spellings stored profiles and tokens still carry.
