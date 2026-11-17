@@ -17,6 +17,11 @@ import { validateTransport } from '../mcp/connections/store.js';
 
 const MCP_CREDENTIALS = 'service-connection-mcp:';
 const KEY = 'service-connections:composio:api-key';
+/** Composio Instant (wiki features/service-connections § Paid tools): the
+ * installation's switch, and what one call holds on the organization's credit
+ * until Composio says what it charged (its prices are descriptions, not limits). */
+const INSTANT_KEY = 'service-connections:instant';
+export const INSTANT_CALL_HOLD_MICROS = 500_000;
 const TTL = 30 * 60_000;
 export interface ServiceConnection {
   id: string;
@@ -48,6 +53,9 @@ export interface ServiceConnection {
   /** A native MCP server account (instead of a Composio toolkit). Its OAuth
    * credentials stay in the vault; the gateway calls the server for the task. */
   mcp?: McpServer;
+  /** Paid through Composio Instant: no account; each call is charged to the
+   * organization's credit at what Composio reports (instant_charge). */
+  instant?: boolean;
   /** Changes on every sign-in, so a stale OAuth exchange cannot overwrite it. */
   revision?: string;
   notifiedAt?: number;
@@ -80,6 +88,10 @@ export interface ConnectionBackend {
   tools(toolkit: string, search: string): Promise<ServiceTool[]>;
   execute(sessionId: string, slug: string, args: Record<string, unknown>): Promise<unknown>;
   disconnect(accountId: string): Promise<void>;
+  /** Composio Instant: whether any of the toolkit's tools can be paid from the installation's wallet. */
+  instantSupported?(toolkit: string): Promise<boolean>;
+  /** A session whose calls Composio pays and reports (instant_charge). */
+  instantSession?(userId: string, toolkit: string): Promise<string>;
 }
 
 /** The SDK runs only in the gateway. No provider key, session/MCP URL, account
@@ -115,6 +127,18 @@ export class ComposioBackend implements ConnectionBackend {
   }
   async execute(sessionId: string, slug: string, args: Record<string, unknown>) {
     return this.client.toolRouter.session.execute(sessionId, { tool_slug: slug, arguments: args });
+  }
+  // Instant's fields (docs.composio.dev/docs/instant-tools) postdate the pinned
+  // client's types; it sends them as given.
+  async instantSupported(toolkit: string) {
+    const query = { toolkit_slug: toolkit, limit: 50, include_pricing: true, toolkit_versions: 'latest' };
+    const page = await this.client.tools.list(query as unknown as Parameters<Composio['tools']['list']>[0]);
+    return page.items.some((tool) => (tool as { instant?: { supported?: boolean } }).instant?.supported === true);
+  }
+  async instantSession(userId: string, toolkit: string) {
+    const body = { user_id: userId, toolkits: { enable: [toolkit] }, instant: { toolkits: { enable: [toolkit] }, return_instant_charge: true },
+      multi_account: { enable: false }, manage_connections: { enable: false }, workbench: { enable: false } };
+    return (await this.client.toolRouter.session.create(body as unknown as Parameters<Composio['toolRouter']['session']['create']>[0])).session_id;
   }
   async disconnect(accountId: string) {
     try { await this.client.connectedAccounts.delete(accountId, { revoke_on_delete: true }); }
@@ -188,6 +212,17 @@ export class ServiceConnections {
     this.locks.set(key, work);
     try { return await work; } finally { if (this.locks.get(key) === work) this.locks.delete(key); }
   }
+  /** Whether agents may use paid tools through Composio Instant, on their organization's credit. */
+  async instantEnabled(): Promise<boolean> { return (await this.store.kvGet(INSTANT_KEY)) === 'on'; }
+  async setInstant(enabled: boolean) {
+    if (enabled && !await this.configured()) throw new ConnectionError('Save the Composio key first');
+    (await this.store.kvSet(INSTANT_KEY, enabled ? 'on' : 'off'));
+  }
+  /** The provider identity an organization's Instant sessions run under. */
+  private async instantUser(org: string) {
+    const installation = (await this.store.kvGet('service-connections:installation')) ?? 'installation';
+    return 'karmax_' + crypto.createHash('sha256').update(JSON.stringify([installation, org, 'instant'])).digest('hex');
+  }
   async all(): Promise<ServiceConnection[]> { return (await this.store.kvEntries(PREFIX)).map(row => JSON.parse(row.value)); }
   async get(org: string, id: string) {
     const raw = (await this.store.kvGet(PREFIX + id));
@@ -208,8 +243,9 @@ export class ServiceConnections {
       (await this.store.kvSet(PREFIX + c.id, JSON.stringify(c)));
       const announce = async (type: string, payload: Record<string, unknown>) =>
         (await this.store.appendEvent({ taskId: c.taskId!, type, ts: c.updatedAt, payload: { requestId: c.id, ...payload } }));
-      if (!before) (await announce('connection.requested', { connectionId: c.id, toolkit: c.toolkit, ...(c.why ? { why: c.why } : {}),
-        ...(c.via ? { via: c.via } : {}) }));
+      // A paid tool (Composio Instant) is usable at once: nobody is asked.
+      if (!before) { if (!c.instant) (await announce('connection.requested', { connectionId: c.id, toolkit: c.toolkit, ...(c.why ? { why: c.why } : {}),
+        ...(c.via ? { via: c.via } : {}) })); }
       else if (before.status !== c.status) (await announce('connection.updated', { connectionId: c.id, status: c.status }));
       if (c.dismissed && !before?.dismissed) (await announce('connection.dismissed', {}));
       return c;
@@ -257,8 +293,14 @@ export class ServiceConnections {
   async catalog(search = '') { return this.remote(async () => (await this.backend()).catalog(search.slice(0, 200))); }
   /** `via`: a sub-task's parent at work, which a new request comes through (sub-task-asks.ts). */
   async request(org: string, toolkit: string, taskId: string, role: string, why: string, via?: Via) {
-    return this.store.transaction(async () => {
     this.slug(toolkit);
+    // A paid tool Composio's wallet can pay for, when nobody in the
+    // organization connected an account of their own: usable at once, each
+    // call on the organization's credit. Asked before the transaction: it is a
+    // call to Composio.
+    const instant = await this.instantEnabled() && !(await this.all()).some(c => c.organizationId === org && c.toolkit === toolkit && this.isAccount(c))
+      && await (async () => { const backend = await this.backend(); return !!backend.instantSupported && await backend.instantSupported(toolkit).catch(() => false); })();
+    return this.store.transaction(async () => {
     // One open request per task and app.
     (await this.store.lock(`service-connections:${org}:${taskId}`));
     const existing = (await this.all()).find(c => c.organizationId === org && c.toolkit === toolkit && c.taskId === taskId && !['disconnected', 'expired'].includes(c.status));
@@ -268,6 +310,9 @@ export class ServiceConnections {
     const inherited = (await this.all()).find(c => c.organizationId === org && c.toolkit === toolkit && c.status === 'active'
       && !!c.taskId && ancestors.includes(c.taskId));
     if (inherited) return inherited;
+    if (instant) return (await this.save({ id: newId('conn'), organizationId: org, toolkit, label: toolkit, instant: true,
+      taskId, role, why: why.slice(0, 2000), projectIds: [], status: 'active', createdAt: Date.now(), updatedAt: Date.now(),
+      ...(via ? { via } : {}) }));
     return (await this.save({ id: newId('conn'), organizationId: org, toolkit, label: toolkit,
       taskId, role, why: why.slice(0, 2000), projectIds: [], status: 'requested', createdAt: Date.now(), updatedAt: Date.now(),
       ...(via ? { via } : {}) }));
@@ -500,6 +545,12 @@ export class ServiceConnections {
   }
   private async authorized(org: string, id: string, taskId: string, projectId: string) {
     const c = (await this.get(org, id));
+    // A paid tool (Composio Instant) is no one's account: the task that asked for it, and its sub-tasks, use it.
+    if (c.instant) {
+      if (!this.canUse(c, await this.taskChain(taskId), projectId)) throw new ConnectionError('This account has not been shared with this task or project', 403);
+      if (c.status !== 'active') throw new ConnectionError('This paid tool is no longer available', 409);
+      return c;
+    }
     if (c.ownerProjectId) {
       if ((await this.store.getProject(c.ownerProjectId))?.organizationId !== org) throw new ConnectionError('The project that owned this account no longer exists', 403);
     } else if (!c.ownerId || !(await this.store.organizationMembership(org, c.ownerId))) throw new ConnectionError('The account owner is no longer a member of this organization', 403);
@@ -535,6 +586,7 @@ export class ServiceConnections {
       // Reject meta-tools, including proxy, remote bash and connection managers.
       if (!/^[A-Z][A-Z0-9_]{1,199}$/.test(slug) || !slug.startsWith(c.toolkit.toUpperCase() + '_') || slug.startsWith('COMPOSIO_'))
         throw new ConnectionError('Tool does not belong to this connection', 403);
+      if (c.instant) return this.executeInstant(c, taskId, projectId, slug, args);
       if (!await timed('service.account-check.remote', () => this.remote(async () => (await this.backend()).active(c.accountId!, c.toolkit)))) {
         c.status = 'expired'; c.sessionId = undefined; (await this.save(c));
         throw new ConnectionError('Account access expired; reconnect it in Connections', 409);
@@ -548,6 +600,42 @@ export class ServiceConnections {
         return await timed('service.action.remote', () => this.remote(async () => (await (await this.backend()).execute(c.sessionId!, slug, args))), undefined, toolFailed);
       } finally { await this.store.countServiceUsage('composio.tool-calls').catch(() => {}); }
     });
+  }
+  /** A paid tool through Composio Instant: hold a bound on the organization's
+   * credit, call, book what Composio says it charged, release the hold. */
+  private async executeInstant(c: ServiceConnection, taskId: string, projectId: string, slug: string, args: Record<string, unknown>) {
+    if (!await this.instantEnabled()) throw new ConnectionError('Paid tools are switched off on this installation', 409);
+    const backend = await this.backend();
+    if (!backend.instantSession) throw new ConnectionError('Paid tools are unavailable', 409);
+    if (!c.sessionId) { c.sessionId = await this.remote(async () => backend.instantSession!(await this.instantUser(c.organizationId), c.toolkit)); (await this.save(c)); }
+    const { holdGeneration, ComputeCreditExhausted } = await import('../world/managed-compute.js');
+    const holdId = `instant:${crypto.randomUUID()}`;
+    const held = await holdGeneration(this.store, { id: holdId, organizationId: c.organizationId, taskId, provider: 'composio',
+      costMicros: INSTANT_CALL_HOLD_MICROS, until: Date.now() + 15 * 60_000, what: `a paid ${c.toolkit} call` })
+      .catch((e) => { throw e instanceof ComputeCreditExhausted ? new ConnectionError(e.message, 402) : e; });
+    (await this.audit(c, `task:${taskId}`, 'execute', slug));
+    let result: unknown;
+    try {
+      result = await timed('service.action.remote', () => this.remote(async () => {
+        try { return await backend.execute(c.sessionId!, slug, args); }
+        catch (e) {
+          if ((e as { status?: number }).status === 402)
+            throw new ConnectionError('The installation’s paid-tools balance at Composio has run out, not your credit: nothing was charged. Try again once the operator has topped it up.', 402);
+          throw e;
+        }
+      }), undefined, toolFailed);
+      return result;
+    } finally {
+      await this.store.countServiceUsage('composio.tool-calls').catch(() => {});
+      const charge = (result as { instant_charge?: { amount?: unknown }; log_id?: unknown } | undefined);
+      const amount = Number(charge?.instant_charge?.amount);
+      if (Number.isFinite(amount) && amount > 0)
+        (await this.store.recordUsage({ id: `usage:composio:${typeof charge?.log_id === 'string' ? charge.log_id : crypto.randomUUID()}`,
+          organizationId: c.organizationId, projectId, taskId, provider: 'composio', kind: 'agent.cost', quantity: 0, unit: 'request',
+          costMicros: Math.round(amount * 1e6), startedAt: Date.now(), endedAt: Date.now(), fundingSource: 'managed', costClassification: 'incurred',
+          metadata: { tool: slug, costBasis: 'composio-instant-charge' } }).catch((e) => console.warn(`[karmax] could not book a paid ${c.toolkit} call:`, e)));
+      if (held) await this.store.closeComputeHold(holdId).catch(() => undefined);
+    }
   }
   /** One bounded MCP session with the account's current credentials. Never retried. */
   private async mcpCall<T>(c: ServiceConnection, taskId: string, run: (client: Awaited<ReturnType<OpenMcp>>) => Promise<T>): Promise<T> {

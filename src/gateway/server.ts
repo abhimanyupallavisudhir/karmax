@@ -106,6 +106,9 @@ import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, ORGANIZATION
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { EXPLANATIONS_ENABLED, RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { hostLocal } from '../config/deployment.js';
+import { releaseRevision } from '../config/revision.js';
+import { FEATURE_FLAGS } from '../config/feature-flags.js';
+import { enabledFeatures, hasEarlyAccess, isRolloutStage, rolloutStages, setEarlyAccess, setRolloutStage } from '../platform/early-access.js';
 import { apiKeyEnv, canonicalModelProvider, credentialAliases, isAgentProvider, isLoginProvider, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 import { WorldRegistry } from '../world/registry.js';
 import { worldHandleForView } from '../world/resolve.js';
@@ -138,6 +141,8 @@ import { defaultAgentProfile, projectReadiness, usableAgentCredentials, type Rea
 import { reportError } from '../platform/error-reports.js';
 import { errorReportSettings, saveErrorReportSettings } from '../platform/error-fixer.js';
 import { includedModel, includedModelView, removeIncludedModelKey, saveIncludedModel } from '../agent/included-model.js';
+import { deleteModelGateway, GATEWAY_PROXY_PATH, modelGatewaysView, saveModelGateway } from '../agent/model-gateways.js';
+import { proxyModelGateway } from './model-gateway-proxy.js';
 import type { Effort } from '../agent/effort.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems, itemHandle, relatedVaultItems, searchVaultItems, weakensProtection } from '../autonomy/vault-items.js';
@@ -240,6 +245,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/connections/config') return read ? 'credential:read' : 'settings:write';
   if (p.startsWith('/api/connections')) return p.endsWith('/execute') || p === '/api/connections/request' ? 'connection:use' : 'credential:read';
   if (/^\/api\/organizations\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'organization:read' : 'organization:edit';
+  if (/^\/api\/organizations\/[^/]+\/early-access$/.test(p)) return read ? 'organization:read' : 'organization:edit';
+  if (p === '/api/settings/feature-flags') return read ? 'settings:read' : 'settings:write';
   if (/^\/api\/projects\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/tasks\/[^/]+\/conversation-share$/.test(p)) return 'task:conversation:share';
   if (p === MCP_CLIENT_METADATA_PATH && read) return 'none';
@@ -323,6 +330,10 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The agent mailbox is a credential surface, org-scoped by its path (the
   // token/session check enforces the tenant boundary from requestScope).
   if (/^\/api\/organizations\/[^/]+\/agent-mail(?:\/|$)/.test(p)) return read ? 'credential:read' : 'credential:write';
+  // Generating spends the organization's credit through tavya's own
+  // OpenRouter connection: the capability of using a connected app.
+  if (/^\/api\/organizations\/[^/]+\/generations(?:\/|$)/.test(p)) return 'connection:use';
+  if (p === '/api/generation-models' && read) return 'none';
   if (/^\/api\/projects\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'project:read' : 'skill:write';
   if (/^\/api\/projects\/[^/]+\/avatar-settings$/.test(p)) return read ? 'project:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/avatars(?:\/[^/]+)?$/.test(p)) return read ? 'project:read' : 'task:create';
@@ -365,6 +376,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The agent-mail inbound webhook authenticates with its own shared secret
   // (like the GitHub webhook), so it needs no capability.
   if (p === '/api/agent-mail/ingest') return 'none';
+  // A model gateway's proxy authenticates each request with its turn's token.
+  if (p === '/api/model-gateway' || p.startsWith('/api/model-gateway/')) return 'none';
   // Incoming webhooks authenticate each delivery with the hook's own secret.
   if (/^\/api\/hooks\/[^/]+$/.test(p)) return 'none';
   if (p === '/api/payments/stripe/callback' || p === '/api/payments/stripe/webhook') return 'none';
@@ -417,7 +430,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The Files page: data under it also needs project:settings:read, checked there.
   if (/^\/api\/projects\/[^/]+\/files(?:\/raw|\/views)?$/.test(p)) return 'repository:read';
   // Changing Files: who may write where (a task's world, a branch) is decided there.
-  if (/^\/api\/projects\/[^/]+\/files\/(?:changes|uploads|plan)$/.test(p)) return 'repository:read';
+  if (/^\/api\/projects\/[^/]+\/files\/(?:changes|uploads(?:\/[^/]+)?|plan)$/.test(p)) return 'repository:read';
   if (/^\/api\/tasks\/[^/]+\/file-location$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/artifacts$/.test(p)) return 'task:read';
   // Public links to a snapshot of a path: anyone who reads Files sees them; making or revoking one is its own capability.
@@ -2175,6 +2188,12 @@ export class Gateway {
         return this.fail(res, error, req);
       }
     }
+    // A model gateway's proxy (wiki features/model-gateways): an agent's harness
+    // sends model requests with a token good for its turn, not a session.
+    if (p === GATEWAY_PROXY_PATH || p.startsWith(`${GATEWAY_PROXY_PATH}/`)) {
+      try { return await proxyModelGateway({ store: this.deps.store, broker: this.deps.broker }, req, res, (req.url ?? p).slice(GATEWAY_PROXY_PATH.length)); }
+      catch (error) { return this.fail(res, error, req); }
+    }
     // Agent mailbox inbound webhook (wiki plans/PLAN-passwords §8): authenticated by a
     // configured shared secret, not a karmax session — so it sits with the other
     // unauthenticated endpoints, before the session gate.
@@ -2472,14 +2491,18 @@ export class Gateway {
         modelBenchmarks: this.artificialAnalysis.available,
       });
     }
-    if (p === '/api/health/live' && method === 'GET') return this.json(res, 200, { ok: true, ts: Date.now() });
+    // The serving commit (public: the repository is) lets a deploy, the
+    // staging smoke suite and the production check prove what is live.
+    const revision = releaseRevision();
+    const revisionField = revision ? { revision } : {};
+    if (p === '/api/health/live' && method === 'GET') return this.json(res, 200, { ok: true, ...revisionField, ts: Date.now() });
     if (p === '/api/health/ready' && method === 'GET') {
       try {
         await withTimeout(this.deps.store.checkDatabaseAsync(), 2_000);
         await withTimeout(this.deps.client.workflowService.getSystemInfo({}), 2_000);
-        return this.json(res, 200, { ok: true, database: 'ready', temporal: 'ready', ts: Date.now() });
+        return this.json(res, 200, { ok: true, database: 'ready', temporal: 'ready', ...revisionField, ts: Date.now() });
       } catch {
-        return this.json(res, 503, { ok: false, ts: Date.now() });
+        return this.json(res, 503, { ok: false, ...revisionField, ts: Date.now() });
       }
     }
 
@@ -2617,6 +2640,40 @@ export class Gateway {
         } else if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
         return this.json(res, 200, { ...(organization ? { enabled: (await store.kvGet(key)) === 'enabled' } : (await sharingPolicy(store, id!))),
           canManage: (await this.deps.tokens.check(token, organization ? 'organization:edit' : 'project:settings:write', requestedScope)).ok });
+      }
+      // Early access (wiki features/early-access): the stage of each feature
+      // flag, set by the operator, and an organization's opt-in.
+      if (p === '/api/settings/feature-flags') {
+        if (method !== 'GET' && method !== 'PUT') return this.json(res, 405, { error: 'method not allowed' });
+        const write = method === 'PUT';
+        if (!(await this.deps.tokens.check(token, write ? 'settings:write' : 'settings:read')).ok)
+          return this.json(res, 403, { error: `Only a ${(await this.siteName)} installation operator can ${write ? 'change' : 'see'} feature rollouts` });
+        if (write) {
+          const body = await this.body(req);
+          if (typeof body.name !== 'string' || !Object.hasOwn(FEATURE_FLAGS, body.name)) return this.json(res, 400, { error: 'no such feature flag' });
+          if (!isRolloutStage(body.stage)) return this.json(res, 400, { error: 'stage is off, early or on' });
+          (await setRolloutStage(store, body.name, body.stage));
+        }
+        const stages = (await rolloutStages(store));
+        return this.json(res, 200, {
+          flags: Object.entries(FEATURE_FLAGS).map(([name, flag]) => ({ name, title: flag.title, description: flag.description,
+            stage: stages[name], shippedStage: flag.stage })),
+          earlyAccessOrganizations: (await store.kvEntries('early-access:organization:')).length,
+          canManage: write || (await this.deps.tokens.check(token, 'settings:write')).ok,
+        });
+      }
+      const earlyAccess = p.match(/^\/api\/organizations\/([^/]+)\/early-access$/);
+      if (earlyAccess) {
+        const organizationId = earlyAccess[1]!;
+        if (!(await store.getOrganization(organizationId))) return this.json(res, 404, { error: 'organization not found' });
+        if (method === 'PUT') {
+          const body = await this.body(req);
+          if (typeof body.enabled !== 'boolean') return this.json(res, 400, { error: 'enabled is true or false' });
+          (await setEarlyAccess(store, organizationId, body.enabled));
+        } else if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
+        return this.json(res, 200, { enabled: (await hasEarlyAccess(store, organizationId)),
+          features: (await enabledFeatures(store, organizationId)),
+          canManage: (await this.deps.tokens.check(token, 'organization:edit', { organizationId })).ok });
       }
       const conversationShare = p.match(/^\/api\/tasks\/([^/]+)\/conversation-share$/);
       if (conversationShare) {
@@ -2933,6 +2990,65 @@ export class Gateway {
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         return this.json(res, 200, { settings: await includedModelView(store, this.deps.broker, computeMonth(Date.now())) });
       }
+      // Generation providers besides OpenRouter (wiki features/generate §
+      // Other providers): fal.ai and Unifically, each with its key (write-only)
+      // and a switch. GET lists them with this month's use; PUT …/:id {apiKey?,
+      // enabled?}; DELETE …/:id removes the key and switches it off.
+      const generationProviderRoute = p.match(/^\/api\/settings\/generation-providers(?:\/([a-z]+))?$/);
+      if (generationProviderRoute) {
+        if (!this.deps.broker) return this.json(res, 503, { error: 'the vault is unavailable' });
+        const providers = await import('../agent/generation-providers.js');
+        const id = generationProviderRoute[1];
+        const view = async () => providers.taskProvidersView(store, this.deps.broker!, computeMonth(Date.now()));
+        if (!id && method === 'GET') return this.json(res, 200, { providers: await view() });
+        if (!id || !(providers.TASK_PROVIDERS as readonly string[]).includes(id)) return this.json(res, 404, { error: `no generation provider ${id ?? ''}` });
+        if (method === 'DELETE') await providers.removeTaskProvider(store, this.deps.broker, id as typeof providers.TASK_PROVIDERS[number]);
+        else if (method === 'PUT') {
+          const b = await this.body(req);
+          try { await providers.saveTaskProvider(store, this.deps.broker, id, { ...(b.apiKey ? { apiKey: String(b.apiKey) } : {}),
+            ...(b.enabled !== undefined ? { enabled: b.enabled === true } : {}) }); }
+          catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        } else return this.json(res, 405, { error: 'method not allowed' });
+        await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), `generation-provider.${method === 'DELETE' ? 'delete' : 'save'}`,
+          `installation:generation-provider:${id}`, { ...identityAuditDetail(callerIdentity) });
+        return this.json(res, 200, { providers: await view() });
+      }
+      // Model gateways (wiki features/model-gateways): Anthropic- or
+      // OpenAI-compatible endpoints the operator adds, which run Claude Code and
+      // Codex on organizations' compute credit; each off until turned on. GET
+      // lists them with this month's use; POST adds one, PUT …/:id changes it,
+      // DELETE …/:id removes it (the key write-only).
+      const modelGatewayRoute = p.match(/^\/api\/settings\/model-gateways(?:\/([A-Za-z0-9_-]+))?$/);
+      if (modelGatewayRoute) {
+        if (!this.deps.broker) return this.json(res, 503, { error: 'the vault is unavailable' });
+        const id = modelGatewayRoute[1];
+        const view = async () => modelGatewaysView(store, this.deps.broker!, computeMonth(Date.now()));
+        if (!id && method === 'GET') return this.json(res, 200, { gateways: await view() });
+        if (id && method === 'DELETE') {
+          if (!(await deleteModelGateway(store, this.deps.broker, id))) return this.json(res, 404, { error: `no model gateway ${id}` });
+          this.modelCatalog.invalidate();
+          await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'model-gateway.delete', `installation:model-gateway:${id}`,
+            { ...identityAuditDetail(callerIdentity) });
+          return this.json(res, 200, { gateways: await view() });
+        }
+        if ((!id && method !== 'POST') || (id && method !== 'PUT')) return this.json(res, 405, { error: 'method not allowed' });
+        const b = await this.body(req);
+        let saved;
+        try {
+          saved = await saveModelGateway(store, this.deps.broker, id, {
+            ...(b.name !== undefined ? { name: String(b.name) } : {}),
+            ...(b.harnesses !== undefined ? { harnesses: Array.isArray(b.harnesses) ? b.harnesses.map(String) as any : [] } : {}),
+            ...(b.baseUrl !== undefined ? { baseUrl: String(b.baseUrl) } : {}),
+            ...(b.models !== undefined ? { models: Array.isArray(b.models) ? b.models.map(String) : String(b.models).split(/[\s,]+/) } : {}),
+            ...(b.priceMultiplier !== undefined ? { priceMultiplier: Number(b.priceMultiplier) } : {}),
+            ...(b.enabled !== undefined ? { enabled: b.enabled === true } : {}),
+            ...(b.apiKey ? { apiKey: String(b.apiKey) } : {}) });
+        } catch (error) { return this.json(res, (error as any)?.status ?? 400, { error: error instanceof Error ? error.message : String(error) }); }
+        this.modelCatalog.invalidate();
+        await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'model-gateway.save', `installation:model-gateway:${saved.id}`,
+          { ...saved, keyChanged: Boolean(b.apiKey), ...identityAuditDetail(callerIdentity) });
+        return this.json(res, id ? 200 : 201, { gateway: saved, gateways: await view() });
+      }
       // Managed compute (wiki features/managed-compute): the installation's
       // own provider accounts, which organizations without their own use and
       // are charged for. GET lists them with this month's use; PUT saves one
@@ -3069,7 +3185,11 @@ export class Gateway {
           return (await store.listOrganizations(callerIdentity.humanSubject?.userId))
             .filter((organization) => !grantOrganization || organization.id === grantOrganization);
         };
-        return this.json(res, 200, (await store.withPreviousSlugs((await listed()))));
+        const organizations = (await store.withPreviousSlugs((await listed())));
+        // The features each has on (wiki features/early-access), for the console's featureOn().
+        if (!Object.keys(FEATURE_FLAGS).length) return this.json(res, 200, organizations);
+        return this.json(res, 200, (await __asyncCollections.map(organizations, async (organization) =>
+          ({ ...organization, features: (await enabledFeatures(store, organization.id)) }))));
       }
       if (p === '/api/organizations' && method === 'POST') {
         const subject = requireHumanSubject(callerIdentity);
@@ -4026,22 +4146,12 @@ export class Gateway {
           const b = await this.body(req);
           const policy = b.policy && typeof b.policy === 'object' ? b.policy : {};
           const currentPolicy = (await store.getOrganizationUsagePolicy(organizationId));
-          const normalizedManagedProviders = (value: unknown): string[] | undefined => Array.isArray(value)
-            ? [...new Set(value.map((provider) => String(provider).trim()).filter(Boolean))].sort()
-            : undefined;
-          const requestedManagedProviders = normalizedManagedProviders((policy as any).managedModelProviders);
-          const managedProvidersChanged = Object.prototype.hasOwnProperty.call(policy, 'managedModelProviders')
-            && (requestedManagedProviders == null || JSON.stringify(requestedManagedProviders)
-              !== JSON.stringify(normalizedManagedProviders(currentPolicy.managedModelProviders)));
-          const ownerOnlyChange = ([
-            ['managedSpendCapMicros', currentPolicy.managedSpendCapMicros ?? null],
-            ['maxActiveAgentTurns', currentPolicy.maxActiveAgentTurns ?? null],
-          ] as const).some(([key, current]) => Object.prototype.hasOwnProperty.call(policy, key)
-            && (policy as any)[key] !== current) || managedProvidersChanged;
+          const ownerOnlyChange = Object.prototype.hasOwnProperty.call(policy, 'maxActiveAgentTurns')
+            && (policy as any).maxActiveAgentTurns !== (currentPolicy.maxActiveAgentTurns ?? null);
           if (ownerOnlyChange) {
             const subject = requireHumanSubject(callerIdentity);
             if ((await store.organizationMembership(organizationId, subject.userId))?.role !== 'owner')
-              return this.json(res, 403, { error: 'only an organization owner can change managed funding or agent concurrency guardrails' });
+              return this.json(res, 403, { error: 'only an organization owner can change agent concurrency guardrails' });
           }
           try { return this.json(res, 200, (await store.setOrganizationUsagePolicy(organizationId, policy))); }
           catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
@@ -5346,6 +5456,15 @@ export class Gateway {
         if (!(await store.getProject(projectId))) return this.json(res, 404, { error: 'project not found' });
         try { return this.json(res, 200, await this.stageFileUpload(req, projectId, session.apiToken)); }
         catch (error) { return this.json(res, (error as { status?: number }).status ?? 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      // An upload given up on (cancelled, or the rest of its batch failed): its bytes go now, not in an hour.
+      const fileUpload = p.match(/^\/api\/projects\/([^/]+)\/files\/uploads\/([^/]+)$/);
+      if (fileUpload && method === 'DELETE') {
+        const upload = this.fileUploads.get(decodeURIComponent(fileUpload[2]!));
+        const principal = (await this.deps.tokens.verify(session.apiToken))?.principal ?? '';
+        if (upload && upload.projectId === fileUpload[1] && upload.principal === principal) this.dropFileUpload(decodeURIComponent(fileUpload[2]!));
+        res.writeHead(204);
+        return void res.end();
       }
       // Where uploads are best kept: Git, data or a secret (the upload dialog's recommendation).
       const filePlan = p.match(/^\/api\/projects\/([^/]+)\/files\/plan$/);
@@ -6685,16 +6804,24 @@ export class Gateway {
             return this.json(res, 503, { error: 'payments are unavailable' });
           const { BudgetService } = await import('../autonomy/payments.js');
           const budget = new BudgetService(store, this.deps.paymentRegistry ?? this.deps.payments!);
+          const waiting = ['pending_approval', 'needs_funding'].includes(request.status);
           const principal = actorPrincipal(callerIdentity.actor);
+          // Either answers a request already decided with its outcome, changing nothing.
           const result = action.operation === 'deny'
             ? (await budget.deny(request.id, principal))
             : await budget.approve(request.id, principal);
+          // A page that still showed the buttons (another tab, a second click)
+          // tells the agent nothing twice (#960).
+          if (!waiting) return this.json(res, 200, { kind: 'payment', result, resumed: false, alreadyResolved: true });
           let resumed = false;
           if (result.status === 'granted') {
             resumed = await api.signalTask(token, taskId, 'followUp',
               `Payment request ${request.id} is approved and ready. Continue the purchase using the same request.`)
               .then(() => true, () => false);
           }
+          // Its buttons are settled now (withSpendResolutions): every open page re-reads.
+          // This POST sends no change notice (task:review:execute), so an event carries it.
+          await this.emitTaskEvent({ taskId, type: 'review.updated', ts: Date.now(), payload: { requestId: request.id } });
           return this.json(res, 200, { kind: 'payment', result, resumed });
         }
         const handle = worldHandleForView(view, taskId, task ? (await store.effectiveProjectConfig(task.projectId)) : undefined);
@@ -7655,8 +7782,10 @@ export class Gateway {
         const actingPrincipal = callerTaskId ? `task:${callerTaskId}` : ownerId;
         try {
           if (p === '/api/connections/config') {
-            if (method === 'PUT') await service.configure(String(b.apiKey ?? ''));
-            if (method === 'GET' || method === 'PUT') return this.json(res, 200, { configured: await service.configured(), canConfigure: (await this.deps.tokens.check(token, 'settings:write')).ok });
+            if (method === 'PUT' && (b.apiKey !== undefined || b.instant === undefined)) await service.configure(String(b.apiKey ?? ''));
+            if (method === 'PUT' && b.instant !== undefined) await service.setInstant(b.instant === true);
+            if (method === 'GET' || method === 'PUT') return this.json(res, 200, { configured: await service.configured(), instant: await service.instantEnabled(),
+              canConfigure: (await this.deps.tokens.check(token, 'settings:write')).ok });
           }
           if (p === '/api/connections/catalog' && method === 'GET')
             return this.json(res, 200, await service.catalog(url.searchParams.get('search') ?? ''));
@@ -7695,6 +7824,9 @@ export class Gateway {
             if (c.status === 'requested' && c.taskId === task.id && !opened.has(c.id) && typeof api.routeConnectionRequest === 'function')
               await api.routeConnectionRequest(token, c).catch((error: unknown) =>
                 console.warn(`[autonomy] could not route connection request ${c.id} to the Avatār:`, error instanceof Error ? error.message : error));
+            // Paid through Composio Instant: usable now, nobody to ask.
+            if (c.status === 'active' && c.instant) return this.json(res, 200, { status: 'connected', connection: service.view(c),
+              detail: 'No account needed: Composio pays for each call and it is charged to your organization’s credit.' });
             return this.json(res, 200, { status: c.status === 'denied' || c.status === 'disconnected' ? 'denied' : 'needs_connection',
               connection: service.view(c), detail: 'A Connect button is available in this task’s Approval Requests. Continue independent work; the task resumes after sign-in.' });
           }
@@ -8537,6 +8669,60 @@ export class Gateway {
           } catch (e) {
             return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
           }
+        }
+      }
+
+      // ── generation on the credit (wiki features/generate) ──
+      // Text, images, video and speech from OpenRouter's models, paid with
+      // the organization's own OpenRouter key or, on tavya's, from its credit.
+      if (p === '/api/generation-models' && method === 'GET') {
+        const generation = await import('../agent/generation.js');
+        const provider = url.searchParams.get('provider') ?? 'openrouter';
+        if (provider === 'fal' || provider === 'unifically') {
+          try { return this.json(res, 200, { provider, models: await generation.providerModels({ store, broker: this.deps.broker }, provider, url.searchParams.get('q') ?? undefined) }); }
+          catch (error) { if (error instanceof generation.GenerationUnavailable) return this.json(res, 409, { error: error.message }); throw error; }
+        }
+        const kind = url.searchParams.get('kind') ?? '';
+        if (!(generation.GENERATION_KINDS as readonly string[]).includes(kind))
+          return this.json(res, 400, { error: `kind must be one of ${generation.GENERATION_KINDS.join(', ')}` });
+        return this.json(res, 200, { kind, models: await generation.generationModels(kind as typeof generation.GENERATION_KINDS[number]) });
+      }
+      const orgGeneration = p.match(/^\/api\/organizations\/([^/]+)\/generations(?:\/([^/]+)(\/content)?)?$/);
+      if (orgGeneration) {
+        const organizationId = decodeURIComponent(orgGeneration[1]!);
+        const jobId = orgGeneration[2] ? decodeURIComponent(orgGeneration[2]) : undefined;
+        const generation = await import('../agent/generation.js');
+        const { ComputeCreditExhausted } = await import('../world/managed-compute.js');
+        const deps = { store, broker: this.deps.broker, configHomes: this.deps.configHomes };
+        const callerTaskId = authRecord.taskId && authRecord.taskId !== '*' ? authRecord.taskId : undefined;
+        const callerTask = callerTaskId ? await store.getTask(callerTaskId) : undefined;
+        const task = callerTask && (await store.getProject(callerTask.projectId))?.organizationId === organizationId
+          ? { taskId: callerTask.id, projectId: callerTask.projectId } : undefined;
+        try {
+          if (!jobId && method === 'POST') {
+            const result = await generation.generate(deps, organizationId, generation.parseGenerationRequest(await this.body(req)), task);
+            return this.json(res, result.jobId ? 202 : 200, result);
+          }
+          if (jobId && !orgGeneration[3] && method === 'GET')
+            return this.json(res, 200, await generation.generationJob(deps, organizationId, jobId, { content: url.searchParams.get('content') === '1' }));
+          if (jobId && orgGeneration[3] && method === 'GET') {
+            const index = Math.max(0, Math.floor(Number(url.searchParams.get('index') ?? 0)) || 0);
+            const content = await generation.generationJobContent(deps, organizationId, jobId, index);
+            res.writeHead(200, { 'content-type': content.headers.get('content-type') ?? 'video/mp4',
+              ...(content.headers.get('content-length') ? { 'content-length': content.headers.get('content-length')! } : {}),
+              'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' });
+            const { Readable } = await import('node:stream');
+            const { pipeline } = await import('node:stream/promises');
+            await pipeline(Readable.fromWeb(content.body as import('node:stream/web').ReadableStream<Uint8Array>), res).catch(() => { if (!res.writableEnded) res.destroy(); });
+            return;
+          }
+          return this.json(res, 405, { error: 'use POST /generations, GET /generations/:jobId or GET /generations/:jobId/content' });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (error instanceof ComputeCreditExhausted) return this.json(res, 402, { error: message });
+          if (error instanceof generation.GenerationUnavailable) return this.json(res, 409, { error: message });
+          if (error instanceof generation.GenerationRequestError) return this.json(res, error.status, { error: message });
+          throw error;
         }
       }
 
@@ -9802,8 +9988,11 @@ export class Gateway {
       start_url: '/',
       scope: '/',
       display: 'standalone',
-      background_color: '#f6f7f9',
-      theme_color: '#5b5bd6',
+      // The dark look's page colour: the splash and the installed app's bars
+      // match the console instead of an indigo frame (the page's own
+      // theme-color meta takes over once it loads).
+      background_color: '#0f0f12',
+      theme_color: '#0f0f12',
       icons: [
         { src: '/brand/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any maskable' },
         { src: '/brand/icon-192.png', sizes: '192x192', type: 'image/png' },

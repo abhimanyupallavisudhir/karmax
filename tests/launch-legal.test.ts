@@ -195,8 +195,8 @@ describe('paid-launch policies', () => {
     expect(billing).toContain('files Git ignores (such as installed dependencies, build output and caches) and running processes are deleted and not restored');
     expect(JSON.stringify(policyDocument('billing'))).toContain('compute top-ups are charged when bought');
     // A changed disclosure is a new version: acceptance evidence names the text a person saw.
-    expect(policyDocument('billing')!.version).toBe('2026-11-06.1');
-    expect(policyDocument('billing')!.effectiveDate).toBe('November 6, 2026');
+    expect(policyDocument('billing')!.version).toBe('2026-11-17.1');
+    expect(policyDocument('billing')!.effectiveDate).toBe('November 17, 2026');
   });
 
   it('states the free trial and the included model, as a new policy version (2026-11-06.1)', () => {

@@ -5,11 +5,13 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AcpAdapter } from '../src/agent/acp.js';
 import { prewarmRemoteAgentHome } from '../src/agent/remote-process.js';
 import { apiKeyEnv } from '../src/agent/provider-registry.js';
+import { Agent37Driver } from '../src/world/agent37.js';
 import { AwsDriver } from '../src/world/aws.js';
 import { FlyDriver } from '../src/world/fly.js';
 import { GcpDriver } from '../src/world/gcp.js';
 import { HetznerDriver } from '../src/world/hetzner.js';
 import { vmProvisionVersion } from '../src/world/vm/provision.js';
+import { diskGrowsAtStart } from '../src/domain/computer-limits.js';
 import { VmWorldProvider, type VmDriver } from '../src/world/vm/provider.js';
 import type { ResolvedWorldProviderConnection } from '../src/world/connections.js';
 import type { World, WorldHandle } from '../src/world/types.js';
@@ -17,7 +19,7 @@ import { cleanHetzner, hetznerInventory } from './helpers/hetzner-live.js';
 import { liveEnabled } from './helpers/live-gate.js';
 
 /**
- * VM worlds on the real Fly.io, Hetzner, AWS and Google Cloud control planes (wiki
+ * VM worlds on the real Agent37, Fly.io, Hetzner, AWS and Google Cloud control planes (wiki
  * features/vm-worlds). One 100 GB world per provider: a real OpenCode turn
  * writes a tracked file and a Git-ignored one, the world parks (no compute
  * billed) and wakes with both, grows to 150 GB while running with nothing
@@ -35,7 +37,8 @@ import { liveEnabled } from './helpers/live-gate.js';
  * (Hetzner's provisioned snapshot, firewall and key too, unless they existed
  * before it ran). About $0.10 of compute and disk per provider.
  *
- * AWS: KARMAX_AWS_KEY (`<access key ID>:<secret>`), KARMAX_AWS_REGION; Google
+ * Agent37: AGENT37_API_KEY, KARMAX_AGENT37_REGION (us, eu, ap-south); a 20 GB world
+ * growing to 30 GB (at its next start). AWS: KARMAX_AWS_KEY (`<access key ID>:<secret>`), KARMAX_AWS_REGION; Google
  * Cloud: KARMAX_GCP_KEY (the service account key file's JSON) or
  * KARMAX_GCP_KEY_FILE, KARMAX_GCP_ZONE. Both build the provisioned image first
  * (as a first world would, in the background) unless KARMAX_LIVE_VM_STOCK=1,
@@ -51,13 +54,17 @@ const hetzner: ResolvedWorldProviderConnection = { provider: 'hetzner', apiKey: 
   config: { region: process.env.KARMAX_HETZNER_LOCATION } };
 // 100 GB growing to 150 GB by default. A Fly account with no payment method
 // refuses volumes over 20 GB in total: KARMAX_LIVE_VM_DISK_GB=10 KARMAX_LIVE_VM_GROW_GB=20.
-const diskGb = Number(process.env.KARMAX_LIVE_VM_DISK_GB ?? 100);
-const growGb = Number(process.env.KARMAX_LIVE_VM_GROW_GB ?? 150);
+const defaultDiskGb = Number(process.env.KARMAX_LIVE_VM_DISK_GB ?? 100);
+const defaultGrowGb = Number(process.env.KARMAX_LIVE_VM_GROW_GB ?? 150);
 const aws: ResolvedWorldProviderConnection = { provider: 'aws', apiKey: process.env.KARMAX_AWS_KEY ?? '',
   config: { region: process.env.KARMAX_AWS_REGION } };
 const gcp: ResolvedWorldProviderConnection = { provider: 'gcp', apiKey: process.env.KARMAX_GCP_KEY
   ?? (process.env.KARMAX_GCP_KEY_FILE ? fs.readFileSync(process.env.KARMAX_GCP_KEY_FILE, 'utf8') : ''), config: { region: process.env.KARMAX_GCP_ZONE } };
+const agent37: ResolvedWorldProviderConnection = { provider: 'agent37', apiKey: process.env.AGENT37_API_KEY ?? '',
+  config: { region: process.env.KARMAX_AGENT37_REGION } };
 const providers = [
+  // Agent37's disks hold at most 100 GB, and grow at the machine's next start.
+  { name: 'Agent37', connection: agent37, driver: () => new Agent37Driver() as VmDriver, diskGb: 20, growGb: 30 },
   { name: 'Fly.io', connection: fly, driver: () => new FlyDriver() as VmDriver },
   { name: 'Hetzner', connection: hetzner, driver: () => new HetznerDriver() as VmDriver },
   { name: 'AWS', connection: aws, driver: () => new AwsDriver() as VmDriver },
@@ -65,7 +72,9 @@ const providers = [
 ];
 const only = process.env.KARMAX_LIVE_VM_ONLY?.split(',').map((name) => name.trim().toLowerCase());
 
-describe.each(providers)('a live $name VM world', ({ name, connection, driver: makeDriver }) => {
+describe.each(providers)('a live $name VM world', ({ name, connection, driver: makeDriver, ...sizes }) => {
+  const diskGb = 'diskGb' in sizes ? sizes.diskGb as number : defaultDiskGb;
+  const growGb = 'growGb' in sizes ? sizes.growGb as number : defaultGrowGb;
   const live = liveEnabled() && !!connection.apiKey && !!modelKey && (!only || only.includes(connection.provider));
   const cloud = isCloud(connection.provider);
   let imageExisted = false;
@@ -176,7 +185,9 @@ describe.each(providers)('a live $name VM world', ({ name, connection, driver: m
 
   it.skipIf(!live)(`grows to ${growGb} GB while running, losing nothing`, async () => {
     const grown = await timed('growS', () => provider.resize(handle, { cpu: 2, memoryMb: 2048, diskGb: growGb }));
-    expect(grown.disk).toBe('grown');
+    // Agent37 reboots a machine it resizes, so the disk waits for the next start.
+    expect(grown.disk).toBe(diskGrowsAtStart(connection.provider) ? 'unchanged' : 'grown');
+    if (diskGrowsAtStart(connection.provider)) expect(grown.restart).toBe(true);
     handle = { ...handle, meta: { ...handle.meta, computer: { cpu: 2, memoryMb: 2048, diskGb: growGb }, machine: grown.machine } };
     let size = await disk();
     // Fly may only show the new size after a restart (`needs_restart`); the next wake grows the filesystem.

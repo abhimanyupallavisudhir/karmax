@@ -45,7 +45,16 @@ export interface SshKeyPair { privateKey: string; publicKey: string }
  * malformed: a world with such a key could never be reached.)
  */
 export function generateSshKeyPair(comment = 'karmax'): SshKeyPair {
-  const jwk = crypto.generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' });
+  return sshKeyPairFromSeed(crypto.randomBytes(32), comment);
+}
+
+/** The ed25519 key pair of a 32-byte seed: the same seed gives the same key,
+ * so a key derived from a secret needs no storage of its own. */
+export function sshKeyPairFromSeed(seedBytes: Buffer, comment = 'karmax'): SshKeyPair {
+  if (seedBytes.length !== 32) throw new Error('an ed25519 seed is 32 bytes');
+  // PKCS#8 for an ed25519 private key is this fixed prefix and the seed.
+  const der = Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), seedBytes]);
+  const jwk = crypto.createPrivateKey({ key: der, format: 'der', type: 'pkcs8' }).export({ format: 'jwk' });
   const seed = Buffer.from(jwk.d!, 'base64url');
   const pub = Buffer.from(jwk.x!, 'base64url');
   const string = (value: Buffer | string) => {

@@ -28,7 +28,7 @@ describe('the task form on the included model', () => {
     const ui = await taskForm(() => ({ agents: [{ ...included, ready: true, cost: 1, included: true }], agentLogin: false, compute: { ready: true } }));
     const note = ui.page.locator('#tf-basic-model');
     await note.waitFor();
-    expect(await note.innerText()).toBe('Default basic model. To use Claude or GPT, connect your logins.');
+    expect(await note.innerText()).toBe('Default basic model. Claude and GPT run on your credit too, or on your own logins.');
     expect(await note.locator('a').getAttribute('href')).toBe('/org/settings#settings-agents');
     // Nothing is missing: no "Can't start yet".
     expect(await ui.page.locator('#tf-ready').isHidden()).toBe(true);

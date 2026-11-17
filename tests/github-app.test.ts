@@ -48,6 +48,12 @@ describe('GitHub App integration', () => {
     await expect(service.workflowPermissionGuidance(repository)).resolves.toMatch(/has not approved/i);
     installationPermissions.workflows = 'write';
     await expect(service.workflowPermissionStatus(connection)).resolves.toMatchObject({ app: 'write', installation: 'write', ready: true });
+    // A refused write (tavya-error 40d814688b2054c8) is explained the same way, for Contents.
+    installationPermissions.contents = 'read';
+    await expect(service.writePermissionGuidance(repository)).resolves
+      .toMatch(/requests Contents: read and write, but acme has not approved it\. Approve the updated App permission at https:\/\/github\.com\/organizations\/acme\/settings\/installations\/42/);
+    installationPermissions.contents = 'write';
+    await expect(service.writePermissionGuidance(repository)).resolves.toMatch(/acme\/app may be archived.*organization settings → GitHub/);
     await expect(service.permissionStatus(connection)).resolves.toMatchObject({
       ready: false,
       missingApp: expect.arrayContaining(['Actions', 'Repository administration', 'Merge queues']),
@@ -796,6 +802,28 @@ describe('GitHub App integration', () => {
         branch: 'main', headSha: 'merged-sha', originatingTaskId: task.id,
       }),
     })]);
+    // The release workflows run after CI, on a schedule or on a dispatch, never
+    // on a push; a failure of one on the default branch still needs a repair.
+    for (const [index, [name, event]] of [['Deploy', 'workflow_run'], ['Promote', 'schedule'],
+      ['Production check', 'schedule'], ['Promote', 'workflow_dispatch']].entries()) {
+      const release = await deliver('workflow_run', `release-${index}`, {
+        installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
+        workflow_run: { event, head_repository: { id: 99 }, id: 710 + index, name, run_attempt: 1, conclusion: 'failure',
+          head_branch: 'main', head_sha: `release-sha-${index}`, html_url: `https://github.com/acme/app/actions/runs/${710 + index}` },
+      });
+      expect(release.projectEvents).toEqual([expect.objectContaining({ type: 'github.workflow.failed',
+        payload: expect.objectContaining({ workflow: name, runId: 710 + index }) })]);
+    }
+    // Any other workflow started that way, or a release one on another branch, is not.
+    for (const [index, run] of [{ name: 'Live', event: 'schedule', head_branch: 'main' },
+      { name: 'Deploy', event: 'workflow_run', head_branch: 'feature' },
+      { name: 'Deploy', event: 'pull_request', head_branch: 'main' }].entries()) {
+      const other = await deliver('workflow_run', `not-release-${index}`, {
+        installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
+        workflow_run: { head_repository: { id: 99 }, id: 720 + index, run_attempt: 1, conclusion: 'failure', head_sha: 'other', ...run },
+      });
+      expect(other.projectEvents).toBeUndefined();
+    }
     const successfulCi = await deliver('workflow_run', 'workflow-ci-success', {
       installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
       workflow_run: { event: 'push', head_repository: { id: 99 }, id: 702, name: 'CI', status: 'completed', conclusion: 'success',

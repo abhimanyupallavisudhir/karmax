@@ -269,8 +269,7 @@ describe('admission', () => {
     const task = await f.store.createTask({ projectId: project.id, title: 'Run', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'Run' } as any });
     const base = { organizationId: f.organization.id, projectId: project.id, taskId: task.id, provider: 'openrouter',
       model: 'openrouter/deepseek/deepseek-v4.1-flash-1017', fundingSource: 'managed' as const };
-    await expect(f.store.admitAgentUsage({ ...base, id: 'adm_legacy' })).rejects.toThrow(/spend cap/);
-    expect(await f.store.admitAgentUsage({ ...base, id: 'adm_1', included: true })).toEqual({ reused: false });
+    expect(await f.store.admitAgentUsage({ ...base, id: 'adm_1' })).toEqual({ reused: false });
   });
 });
 

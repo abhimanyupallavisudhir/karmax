@@ -1,5 +1,5 @@
 import { describeMachine, isVmWorldProvider, sameMachine, worldMachine, type MachineShape } from '../domain/computer.js';
-import { computerLimits, providerFeatures as computerFeatures, providerLabel, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
+import { computerLimits, diskGrowsAtStart, providerFeatures as computerFeatures, providerLabel, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
 import type { DiskSpace } from '../world/disk.js';
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
 import { WorldHandle, worldRepos, worldWorkingDirectory } from '../world/types.js';
@@ -47,6 +47,7 @@ const TOOLS_PREAMBLE = `You are running inside ${BRAND}, an agent-orchestration 
 - find_task(projectId, number), list_agents(taskId), get_conversation(taskId, role), fork_agent(...), and message_agent(taskId, message, role?): discover work by its human #number, inspect or fork another task's agent without mutating its original session, or message any task of your project — it reads the message from your task ("Task #N") at once if working, else it wakes.
 - Prefer native MCP: use servers selected in the agent’s Tools, or request a remote MCP server by its MCP Registry name or official HTTPS URL. Use a Composio toolkit only as the fallback when no suitable remote MCP server exists.
 - list_connections(), request_connection({mcp | toolkit}, why), search_connection_tools(connectionId, search), execute_connection_tool(connectionId, tool, arguments): use people's app accounts (Gmail, Calendar, GitHub, …) through the gateway. When the work needs an account list_connections doesn't show, request it instead of saying you lack access: the user allows one they already connected, or signs in, from a Connect button in the task, which then resumes automatically. Prefer this to asking for passwords or API keys.
+- Services nobody has an account for yet: prefer ones that need none and are claimed later — a Postgres from \`neon claim create --env-pull\` (Neon; 72 h, the claim link from \`neon claim accept --no-open\` when the person is ready: its code lasts 15 min), \`npx wrangler deploy --temporary\` (Cloudflare Workers; claim within 60 min), \`npx create-db\` (Prisma Postgres; 24 h). Keep their credentials in the vault (store_credential) and give the person the claim link before it expires. In an autonomous project nobody claims: sign up instead.
 - start_job(command, cwd?, name?): run a long command (render, build, training run, large test suite) as a durable job that outlives this turn and any interruption; its output goes to a log file, and its name is what people see while you wait on it. Anything you run from your own shell stops when your turn ends.
 - pause(minutes, jobs?, needs_input?): end this turn and be resumed when the listed jobs finish, when a message arrives, or after \`minutes\` — whichever comes first. Without jobs it is a timed pause. pause is for waiting, not for asking: when you need an answer to continue, end your turn with the question (or call escalate_to_human for what only a person can give). Only when you are waiting anyway and someone may answer meanwhile, set needs_input (optionally with message, audience and urgency, as for escalate_to_human): the task shows Needs input and notifies them, and you carry on without the answer once \`minutes\` pass. A message or a sub-task's news that wakes you mid-pause does not end it: answer, and if you end that turn without another pause, open_pr or an ask (needs_input, escalate_to_human), the pause goes on to its deadline.
 - stop_job(jobs): stop durable jobs you no longer need.
@@ -280,7 +281,8 @@ function describeMachineAndRoom(world: WorldHandle, taskId: string, requested?: 
     + `(build outputs, caches, old copies) or move large data out of the world.${moreMemory}`;
 }
 
-/** A VM world (Fly.io, Hetzner, AWS, Google Cloud): its disk is a volume that keeps everything and grows in place. */
+/** A VM world (Fly.io, Hetzner, AWS, Google Cloud, Agent37): its disk is a volume that keeps everything and grows in place
+ * (Agent37's at the machine's next start). */
 function describeVmComputer(world: WorldHandle, taskId: string, shape: MachineShape, requested: MachineShape | undefined,
   known: { current: string; allows: string; totalGb?: number; limits: ComputerLimits }): string {
   const machine = worldMachine(world.meta) ?? shape;
@@ -293,7 +295,9 @@ function describeVmComputer(world: WorldHandle, taskId: string, shape: MachineSh
   const max = known.limits.diskGb ?? providerDefaultLimit(world.kind);
   const grow = max === undefined || total < max
     ? `If it runs out of disk, grow it yourself with platform_request(PATCH, "/api/tasks/${taskId}/params", {"params": {"computer": {"diskGb": ${
-      max === undefined ? Math.max(50, total * 2) : Math.min(max, Math.max(50, total * 2))}}}}): it grows at once, nothing moves and nothing needs restarting. `
+      max === undefined ? Math.max(50, total * 2) : Math.min(max, Math.max(50, total * 2))}}}})${diskGrowsAtStart(world.kind)
+      ? ' and then end your turn with pause(3) without jobs: it grows when the machine restarts, with every file kept. '
+      : ': it grows at once, nothing moves and nothing needs restarting. '}`
     : 'Its disk is the largest this account allows: when it fills, delete what you no longer need or move large data out of the world. ';
   return `Computer: ${known.current}.${known.allows} Everything on its disk, Git-ignored files included, survives pauses.${home}${pending} `
     + `${grow}More CPU or memory (cpu, memoryMb) applies after your next pause(3) without jobs.`;

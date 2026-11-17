@@ -2338,6 +2338,53 @@ describe('PR stage (remote policy "pr")', () => {
     await core.destroyWorld(handle);
   });
 
+  it('stops for the project\'s maintainers with how to grant write access when GitHub refuses the push', async () => {
+    // tavya-error 40d814688b2054c8: GitHub's answer to a credential without
+    // Contents: write reached people as raw git output.
+    const http = await import('node:http');
+    const server = http.createServer((_req, res) => {
+      res.writeHead(403, { 'content-type': 'text/plain' });
+      res.end('Write access to repository not granted.\n');
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    try {
+      const gh = fakeGithub();
+      const repo = await repoWithGithubOrigin('refused');
+      await gitOrThrow(repo, ['config', 'remote.origin.pushurl', `http://127.0.0.1:${port}/acme/widgets.git`]);
+      const guidance = vi.fn(async () => 'Approve the updated App permission at https://github.com/settings/installations/42, then retry the task.');
+      const core = await coreFor(gh, {
+        status() { return { configured: true, oauthConfigured: true, userAuthorized: true }; },
+        async userAccessToken() { return 'connected-user-token'; },
+        async brokerCredentials() { return { env: { GIT_ALLOW_PROTOCOL: 'file:http' } }; },
+        async repositoryCloneToken() { return 'clone-token'; },
+        writePermissionGuidance: guidance,
+      });
+      (await core.store.claimPersonalOrganization('jane'));
+      const project = (await core.store.createProject('Refused', { repos: [repo] }));
+      const connection = (await core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+        installationId: '42', accountLogin: 'acme', accountType: 'Organization' }));
+      const enrolled = (await core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+        providerId: '77', owner: 'acme', name: 'widgets', sshUrl: REMOTE, defaultBranch: 'main', private: true,
+        gitConnectionId: connection.id }));
+      (await core.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+      const task = (await core.store.createTask({ projectId: project.id, title: 'Refused PR', workflow: 'software-dev',
+        workflowVersion: '1.0.0', params: { prompt: 'work' }, createdBy: { kind: 'user', userId: 'jane' } }));
+      const handle = await core.createWorld({ taskId: task.id, projectId: project.id, repo,
+        base: 'main', target: 'main', kind: 'worktree' });
+      await fs.promises.writeFile(path.join(handle.workdir ?? handle.root, 'refused.txt'), 'x');
+      await git(handle.workdir ?? handle.root, ['add', '-A']);
+      await git(handle.workdir ?? handle.root, ['commit', '-q', '-m', 'refused work']);
+
+      const failure = await core.openPr(handle, 'main', { title: 'Refused PR' }).then(() => undefined, (error) => error);
+      expect(failure).toMatchObject({ type: 'repository-access', nonRetryable: true });
+      expect(failure.message).toMatch(/^GitHub refused to let tavya write to acme\/widgets\. Approve the updated App permission at https:\/\/github\.com\/settings\/installations\/42/);
+      expect(failure.message).toContain('GitHub said: Write access to repository not granted.');
+      expect(guidance).toHaveBeenCalledWith(expect.objectContaining({ name: 'widgets' }));
+      await core.destroyWorld(handle);
+    } finally { server.close(); }
+  });
+
   it('identifies a genuinely missing human GitHub PR connection before transport', async () => {
     const gh = fakeGithub();
     const repo = await repoWithGithubOrigin('missing-human');

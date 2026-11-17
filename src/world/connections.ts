@@ -41,7 +41,7 @@ export function fundingRef(connection: { managed?: boolean } | undefined): { fun
 }
 /** Self-hosted fallback keys, imported into the installation owner's connection at boot. */
 const ENVIRONMENT_KEYS: Record<string, string> = { e2b: 'E2B_API_KEY', daytona: 'DAYTONA_API_KEY', fly: 'FLY_API_TOKEN', hetzner: 'HCLOUD_TOKEN',
-  aws: 'KARMAX_AWS_KEY', gcp: 'KARMAX_GCP_KEY' };
+  aws: 'KARMAX_AWS_KEY', gcp: 'KARMAX_GCP_KEY', agent37: 'AGENT37_API_KEY' };
 
 export interface ResolvedWorldProviderConnection {
   organizationId?: string;
@@ -347,6 +347,9 @@ const defaultProbes: ProviderProbes = {
     } else if (provider === 'gcp') {
       const { GcpDriver } = await import('./gcp.js');
       await new GcpDriver().test(connection);
+    } else if (provider === 'agent37') {
+      const { Agent37Driver } = await import('./agent37.js');
+      await new Agent37Driver().test(connection);
     } else {
       const { Daytona } = await import('@daytona/sdk');
       const client = new Daytona({ apiKey: connection.apiKey, apiUrl: connection.config.apiUrl, target: connection.config.target });
@@ -372,6 +375,11 @@ const defaultProbes: ProviderProbes = {
     if (provider === 'gcp') {
       const { GcpDriver } = await import('./gcp.js');
       return new GcpDriver().limits(connection);
+    }
+    // Agent37: the memory its workspace may run at once, as machines.
+    if (provider === 'agent37') {
+      const { Agent37Driver } = await import('./agent37.js');
+      return new Agent37Driver().limits(connection);
     }
     return {};
   },
@@ -504,6 +512,7 @@ function environmentConfig(provider: string): WorldProviderConnection['config'] 
   if (provider === 'hetzner') return { region: process.env.KARMAX_HETZNER_LOCATION, image: process.env.KARMAX_HETZNER_IMAGE };
   if (provider === 'aws') return { region: process.env.KARMAX_AWS_REGION, image: process.env.KARMAX_AWS_IMAGE };
   if (provider === 'gcp') return { region: process.env.KARMAX_GCP_ZONE, image: process.env.KARMAX_GCP_IMAGE };
+  if (provider === 'agent37') return { region: process.env.KARMAX_AGENT37_REGION, image: process.env.KARMAX_AGENT37_TEMPLATE };
   return provider === 'e2b'
     ? { template: process.env.KARMAX_E2B_TEMPLATE,
         desktopTemplate: process.env.KARMAX_E2B_DESKTOP_TEMPLATE }
@@ -514,5 +523,5 @@ function environmentConfig(provider: string): WorldProviderConnection['config'] 
 }
 
 export function providerName(provider: string): string {
-  return ({ e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner Cloud', aws: 'AWS', gcp: 'Google Cloud' } as Record<string, string>)[provider] ?? provider;
+  return ({ e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner Cloud', aws: 'AWS', gcp: 'Google Cloud', agent37: 'Agent37' } as Record<string, string>)[provider] ?? provider;
 }

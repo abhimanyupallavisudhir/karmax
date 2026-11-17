@@ -542,6 +542,7 @@ async function main() {
   const { closeComputeMonths } = await import('./world/managed-compute.js');
   // Every ten minutes: the grace of a huge parked disk can be a few hours.
   const { syncAllIncludedModelUsage } = await import('./agent/included-model.js');
+  const { pruneGatewayTokens } = await import('./agent/model-gateways.js');
   const computeNoticeTimer = new AsyncInterval(async () => {
     // What the included model's keys spent first, so the credit below is current.
     await syncAllIncludedModelUsage(store, broker);
@@ -549,7 +550,9 @@ async function main() {
     publicUrl: process.env.KARMAX_PUBLIC_URL, userEmail: async (userId) => (await identity.userById(userId))?.email ?? undefined,
     siteName: async () => siteNameOf((await store.getSettings('global', 'appearance'))),
     hibernate: (worlds) => worldLifecycle.hibernateForCompute(worlds) });
-    await closeComputeMonths(store); await store.pruneComputeHolds(); }, 10 * 60_000);
+    await closeComputeMonths(store); await store.pruneComputeHolds();
+    // Model-gateway proxy tokens of turns that never ended cleanly (wiki features/model-gateways).
+    await pruneGatewayTokens(store); }, 10 * 60_000);
   computeNoticeTimer.unref();
   startupJobs.push(() => computeNoticeTimer.run());
   // Auto top-up: settle top-ups under way and buy one where credit runs low.

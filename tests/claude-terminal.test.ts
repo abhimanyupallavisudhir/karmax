@@ -255,6 +255,31 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     });
   });
 
+  // Model gateways (wiki features/model-gateways): Claude Code itself, pointed at the gateway.
+  const gateway = { baseUrl: 'https://proxy.example/api/model-gateway', apiKey: 'tmg_turn', model: 'anthropic/claude-opus-5.5',
+    env: { ANTHROPIC_DEFAULT_HAIKU_MODEL: '~anthropic/claude-haiku-latest' } };
+
+  it('runs Claude Code, not the Messages API, through a model gateway, with the gateway in its environment', async () => {
+    sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn' }];
+    await new ClaudeAdapter().runTurn({ ...input, profile: { ...input.profile, model: 'claude-opus-5-5', effort: 'high' },
+      resolvedAuth: { configHome: input.resolvedAuth.configHome, gateway },
+      secretEnv: { ANTHROPIC_BASE_URL: 'https://project.example', ANTHROPIC_AUTH_TOKEN: 'project-bearer' } }, ctx);
+    expect(sdkState.options.model).toBe('anthropic/claude-opus-5.5');
+    expect(sdkState.options.effort).toBe('high');
+    expect(sdkState.options.env).toMatchObject({ ANTHROPIC_BASE_URL: gateway.baseUrl, ANTHROPIC_AUTH_TOKEN: 'tmg_turn',
+      ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', ANTHROPIC_DEFAULT_HAIKU_MODEL: '~anthropic/claude-haiku-latest',
+      CLAUDE_CONFIG_DIR: input.resolvedAuth.configHome });
+    // The final local spawn keeps it, whatever the SDK passes back.
+    const output = path.join(os.tmpdir(), `karmax-gateway-env-${process.pid}.json`);
+    const child = sdkState.options.spawnClaudeCodeProcess({ command: process.execPath,
+      args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(output)}, JSON.stringify({ url: process.env.ANTHROPIC_BASE_URL, token: process.env.ANTHROPIC_AUTH_TOKEN, key: process.env.ANTHROPIC_API_KEY }))`],
+      cwd: os.tmpdir(), env: { ...sdkState.options.env, ANTHROPIC_API_KEY: 'reintroduced', ANTHROPIC_BASE_URL: 'https://elsewhere' },
+      signal: new AbortController().signal });
+    await new Promise((resolve) => child.once('close', resolve));
+    try { expect(JSON.parse(fs.readFileSync(output, 'utf8'))).toEqual({ url: gateway.baseUrl, token: 'tmg_turn', key: '' }); }
+    finally { fs.rmSync(output, { force: true }); }
+  });
+
   it('the shipped Claude binary sees the subscription at the final local spawn boundary', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-claude-auth-'));
     fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({ claudeAiOauth: {

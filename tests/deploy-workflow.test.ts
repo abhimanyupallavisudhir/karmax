@@ -113,8 +113,9 @@ describe('post-push deployment to the public instance', () => {
     expect(script.indexOf('merge-base --is-ancestor')).toBeLessThan(script.indexOf("git show '$DEPLOY_SHA:deploy/karmax'"));
   });
 
-  it('serialises deploys using only GitHub-supported concurrency fields', () => {
-    expect(deploy.concurrency.group).toBe('deploy-production');
+  it('serialises deploys per environment using only GitHub-supported concurrency fields', () => {
+    expect(deploy.concurrency.group).toBe("deploy-${{ inputs.environment || (vars.STAGING_URL != '' && 'staging' || 'production') }}");
+    expect(deploy.environment).toBe("${{ inputs.environment || (vars.STAGING_URL != '' && 'staging' || 'production') }}");
     expect(deploy.concurrency['cancel-in-progress']).toBe(false);
     // An unknown key invalidates the whole workflow before any run is created.
     // GitHub's concurrency schema supports exactly these two fields.
@@ -164,7 +165,7 @@ describe('post-push deployment to the public instance', () => {
 
   it('builds first and snapshots with the validated candidate instead of the old live image', () => {
     const update = operator.split('cmd_update() {')[1]?.split('\n}')[0] ?? '';
-    expect(update.indexOf('build_images --pull')).toBeLessThan(update.indexOf('cmd_backup_candidate'));
+    expect(update.indexOf('if ! candidate_images; then')).toBeLessThan(update.indexOf('if ! cmd_backup_candidate'));
     expect(operator).toContain('dc run --rm --no-deps app npm run backup');
   });
 });
@@ -192,11 +193,13 @@ it.each(['trusted', 'unreviewed'])('checks ancestry before executing a %s deploy
     // GitHub runs `run:` steps with bash -e -o pipefail; the host is `root`.
     const result = spawnSync('bash', ['-eo', 'pipefail', '-c', `
 git() { if [ "$1" = fetch ]; then return 0; fi; command git "$@"; }
+docker() { cat >/dev/null; }
 ssh() { bash -c "\${@: -1}"; }
-export -f git
+export -f git docker
 ` + run.replaceAll('/opt/karmax', root).replaceAll('~/.ssh', `'${root}/ssh'`).replaceAll('sleep 10', 'sleep 0.2')], { cwd: root, encoding: 'utf8', env: {
       ...process.env, DEPLOY_SHA: candidate === 'trusted' ? trusted : unreviewed, RUN_KEY: '1-1',
-      SSH_KEY: 'fake-key', KNOWN_HOSTS: 'fake-host', TARGET: 'fake-target',
+      SSH_KEY: 'fake-key', KNOWN_HOSTS: 'fake-host', TARGET: 'fake-target', GH_TOKEN: 'token', ACTOR: 'ci',
+      RELEASE_IMAGE: `ghcr.io/owner/karmax-app@sha256:${'a'.repeat(64)}`,
     } });
     if (candidate === 'trusted') {
       expect(result.status, result.stderr).toBe(0);
@@ -252,14 +255,19 @@ if (args.includes('cp')) {
   fs.writeFileSync(path.join(args.at(-1), 'manifest.json'), '{}');
 }
 if (args.includes('pg_dump')) process.stdout.write('dump');
+// The release image CI built: labelled with the commit it was built from.
+if (args.join(' ').includes('org.opencontainers.image.revision')) process.stdout.write(process.env.FAKE_IMAGE_REVISION + '\\n');
+if (args[0] === 'login') require('node:fs').readFileSync(0);
 `, { mode: 0o755 });
+    const releaseImage = `ghcr.io/owner/karmax-app@sha256:${'f'.repeat(64)}`;
     const run = deploy.steps.find((step: any) => step.run?.includes('ssh -o')).run as string;
     const result = spawnSync('bash', ['-eo', 'pipefail', '-c', `
 ssh() { (cd ${JSON.stringify(root)} && bash -c "\${@: -1}"); }
 ` + run.replaceAll('/opt/karmax', host).replaceAll('~/.ssh', `'${root}/ssh'`).replaceAll('sleep 10', 'sleep 0.2')], {
       cwd: root, encoding: 'utf8', timeout: 60_000, env: {
         ...process.env, PATH: `${bin}:${process.env.PATH}`, DEPLOY_SHA: candidate, RUN_KEY: '7-1',
-        SSH_KEY: 'fake-key', KNOWN_HOSTS: 'fake-host', TARGET: 'fake-target',
+        SSH_KEY: 'fake-key', KNOWN_HOSTS: 'fake-host', TARGET: 'fake-target', GH_TOKEN: 'run-token', ACTOR: 'ci',
+        RELEASE_IMAGE: releaseImage, FAKE_IMAGE_REVISION: candidate,
       } });
     const status = path.join(host, 'deploy/.updates/7-1');
     expect(result.status, `${result.stdout}\n${result.stderr}\n${fs.existsSync(path.join(status, 'log')) ? fs.readFileSync(path.join(status, 'log'), 'utf8') : ''}`).toBe(0);
@@ -277,9 +285,103 @@ ssh() { (cd ${JSON.stringify(root)} && bash -c "\${@: -1}"); }
     expect(snapshots).toHaveLength(10);
     expect(snapshots.slice(0, 9)).toEqual(earlier.slice(1));
     expect(snapshots[9]).not.toBe(earlier[9]);
+    // CI's release image ran, pulled with the run's token into a throwaway
+    // client configuration, and recorded for later restarts; nothing was built.
+    expect(calls).toContainEqual(['pull', '-q', releaseImage]);
+    expect(calls).toContainEqual(['tag', releaseImage, 'karmax-app']);
+    expect(calls.some(args => args.includes('build') && args.includes('app'))).toBe(false);
+    expect(fs.readFileSync(path.join(host, 'deploy/.release-image'), 'utf8').trim()).toBe(releaseImage);
     // Superseded layers and the replaced image are cleaned up once the new app is ready.
     const up = calls.findIndex(args => args.includes('up'));
     expect(calls.findIndex(args => args.join(' ').startsWith('builder prune -f'))).toBeGreaterThan(up);
     expect(calls.findIndex(args => args.join(' ') === 'image prune -f')).toBeGreaterThan(up);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// Staging first, then production: build once, deploy the same image to both
+// (wiki ops/release-and-deploy, "Path to production").
+describe('build once, staging, promotion', () => {
+  const promote = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'promote.yml'), 'utf8'));
+  const check = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'production-check.yml'), 'utf8'));
+  const step = (name: string) => deploy.steps.find((candidate: any) => candidate.name === name);
+
+  it('publishes the image CI built and booted, only from this job and only for a push or a dispatch', () => {
+    const artifacts = ci.jobs['deploy-artifacts'];
+    expect(artifacts.permissions).toEqual({ contents: 'read', packages: 'write' });
+    for (const [name, job] of Object.entries(ci.jobs) as Array<[string, any]>)
+      if (name !== 'deploy-artifacts') expect(job.permissions?.packages).toBeUndefined();
+    const publish = artifacts.steps.find((candidate: any) => candidate.name === 'Publish the release image');
+    expect(publish.if).toContain("github.event_name == 'push' || github.event_name == 'workflow_dispatch'");
+    // The tag is the commit, and the image must say it was built from it.
+    expect(publish.run).toContain('org.opencontainers.image.revision');
+    expect(publish.run).toContain('docker push "$image:$SHA"');
+    const steps = artifacts.steps.map((candidate: any) => candidate.name);
+    expect(steps.indexOf('Publish the release image')).toBeGreaterThan(steps.indexOf('Install the turnkey stack and boot the hosted control plane'));
+  });
+
+  it('labels the image with its commit, last, so a new commit rebuilds nothing above it', () => {
+    const dockerfile = fs.readFileSync(path.join(repoRoot, 'deploy', 'Dockerfile'), 'utf8');
+    const lines = dockerfile.split('\n');
+    expect(lines.findIndex((line) => line.startsWith('ARG KARMAX_REVISION'))).toBeGreaterThan(lines.findIndex((line) => line.startsWith('COPY src')));
+    expect(dockerfile).toContain('LABEL org.opencontainers.image.revision=$KARMAX_REVISION');
+    expect(dockerfile).toContain('ENV KARMAX_REVISION=$KARMAX_REVISION');
+    expect(operator).toContain('KARMAX_REVISION=$(git -C "$ROOT_DIR" rev-parse --verify -q HEAD');
+  });
+
+  it('deploys to staging when there is one, else to production, and is callable for production', () => {
+    expect(workflow.on.workflow_call.inputs.environment.required).toBe(true);
+    expect(workflow.on.workflow_dispatch.inputs.environment.options).toEqual(['production', 'staging']);
+    expect(deploy.env.DEPLOY_SHA).toBe('${{ inputs.sha || github.event.workflow_run.head_sha }}');
+    expect(workflow.permissions).toEqual({ contents: 'read', packages: 'read', statuses: 'write' });
+  });
+
+  it('names the release image by digest and hands it to the host updater', () => {
+    expect(step('Name the release image').run).toContain('imagetools inspect "$repository:$DEPLOY_SHA"');
+    expect(step('Name the release image').run).toContain('@sha256:[0-9a-f]{64}$');
+    expect(script).toContain("./deploy/.karmax-runner start '$DEPLOY_SHA' '$RUN_KEY' ./deploy/.karmax-update '$RELEASE_IMAGE'");
+    // The token reaches the host on stdin, never in a command line or a file it keeps.
+    const ssh = step('Deploy the validated revision over SSH').run as string;
+    expect(ssh).toContain('printf \'%s\' "$GH_TOKEN" | ssh');
+    expect(ssh).toContain('--password-stdin');
+    expect(ssh).not.toMatch(/-p\s+["']?\$GH_TOKEN/);
+  });
+
+  it('smoke-checks the deployed commit in the same job and records the verdict with the image', () => {
+    const names = deploy.steps.map((candidate: any) => candidate.name ?? candidate.uses);
+    expect(names.indexOf('Smoke-check the deployed instance')).toBeGreaterThan(names.indexOf('Deploy the validated revision over SSH'));
+    expect(step('Smoke-check the deployed instance').run).toContain('--revision "$DEPLOY_SHA"');
+    const record = step('Record the verdict on the commit');
+    expect(record.if).toContain('!cancelled()');
+    expect(record.run).toContain('context="deploy/$DEPLOY_ENVIRONMENT"');
+    expect(record.run).toContain('state=success description=$IMAGE');
+    // A deploy that passed staging is promotable only with its image named.
+    const verdict = (deployed: string, smoked: string) => {
+      const run = record.run.replace(/gh api[\s\S]*?>\/dev\/null\n/, '');
+      return spawnSync('bash', ['-c', run], { encoding: 'utf8', env: { ...process.env,
+        DEPLOYED: deployed, SMOKED: smoked, IMAGE: 'img@sha256:x', DEPLOY_ENVIRONMENT: 'staging' } }).stdout.trim();
+    };
+    expect(verdict('success', 'success')).toBe('deploy/staging: success (img@sha256:x)');
+    expect(verdict('success', 'failure')).toBe('deploy/staging: failure (Deployed; the smoke check failed)');
+    expect(verdict('failure', 'skipped')).toBe('deploy/staging: failure (The deploy failed)');
+  });
+
+  it('promotes on a schedule through the same deploy, with the image staging ran', () => {
+    expect(promote.on.schedule).toHaveLength(1);
+    expect(promote.jobs.choose.if).toBe("vars.STAGING_URL != ''");
+    const production = promote.jobs.production;
+    expect(production.uses).toBe('./.github/workflows/deploy.yml');
+    expect(production.with).toEqual({ environment: 'production', sha: '${{ needs.choose.outputs.sha }}',
+      image: '${{ needs.choose.outputs.image }}' });
+    expect(production.secrets).toBe('inherit');
+    // A called workflow cannot have more authority than its caller grants.
+    expect(promote.permissions).toEqual(workflow.permissions);
+    expect(JSON.stringify(promote.jobs.choose.steps)).toContain('DEPLOYS_PAUSED');
+  });
+
+  it('checks production every 15 minutes, and staging when there is one', () => {
+    expect(check.on.schedule[0].cron).toBe('*/15 * * * *');
+    expect(JSON.stringify(check.jobs.production.steps)).toContain('node scripts/smoke.mjs');
+    expect(check.jobs.staging.if).toBe("vars.STAGING_URL != ''");
+    expect(check.permissions).toEqual({ contents: 'read' });
+  });
 });

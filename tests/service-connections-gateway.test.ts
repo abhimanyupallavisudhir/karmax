@@ -244,7 +244,7 @@ describe('connection gateway flow', () => {
   it('keeps provider configuration installation-scoped and write-only', async () => {
     expect(routeCapability('PUT', '/api/connections/config')).toBe('settings:write');
     const config = await request('/api/connections/config', { token: agent });
-    expect(await config.json()).toEqual({ configured: true, canConfigure: false });
+    expect(await config.json()).toEqual({ configured: true, instant: false, canConfigure: false });
     expect((await request('/api/connections/config', { token: agent, method: 'PUT', body: { apiKey: 'other-key' } })).status).toBe(403);
   });
   it('includes project-shared accounts in human Tools search without exposing other private accounts', async () => {

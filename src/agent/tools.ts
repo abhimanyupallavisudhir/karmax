@@ -34,6 +34,23 @@ export interface ToolSchema {
 }
 
 const MAX_OUTPUT = 12_000;
+/** generate: input images read from the world, at most this large. */
+const MEDIA_REFERENCE_MAX_BYTES = 20_000_000;
+/** generate: how often a waiting video is polled (tests shorten it). */
+const mediaPollMs = () => Number(process.env.KARMAX_MEDIA_POLL_MS) || 15_000;
+const MEDIA_EXTENSIONS: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif',
+  'image/svg+xml': 'svg', 'audio/mpeg': 'mp3', 'audio/mp3': 'mp3', 'audio/pcm': 'pcm', 'audio/wav': 'wav', 'video/mp4': 'mp4', 'video/webm': 'webm' };
+const mediaTypeOf = (file: string) => Object.entries(MEDIA_EXTENSIONS)
+  .find(([, extension]) => file.toLowerCase().endsWith(`.${extension}`) || (extension === 'jpg' && /\.jpeg$/i.test(file)))?.[0] ?? 'application/octet-stream';
+/** Where generate saves file `index` of `count`: the path asked for,
+ * given the file's extension when it has none, and -2, -3, … for the rest. */
+export function mediaPath(target: string, mediaType: string, index: number, count: number): string {
+  const extension = MEDIA_EXTENSIONS[mediaType];
+  const dot = target.lastIndexOf('.'), slash = target.lastIndexOf('/');
+  const hasExtension = dot > slash + 1;
+  const stem = hasExtension ? target.slice(0, dot) : target, suffix = hasExtension ? target.slice(dot) : extension ? `.${extension}` : '';
+  return `${stem}${count > 1 && index > 0 ? `-${index + 1}` : ''}${suffix}`;
+}
 const truncate = (s: string) => (s.length > MAX_OUTPUT ? s.slice(0, MAX_OUTPUT) + '\n…(truncated)' : s);
 /** UTF-8 spends at most 3 bytes per UTF-16 unit, so this many bytes always decode past MAX_OUTPUT. */
 const READ_FILE_MAX_BYTES = MAX_OUTPUT * 4;
@@ -451,6 +468,42 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         publish: { type: 'string', enum: ['discard', 'review'], description: 'Future changes to writable snapshot resources; defaults to review.' },
       },
       required: ['name'],
+    },
+  },
+  {
+    name: 'generate',
+    description:
+      'Use any model OpenRouter serves (or fal.ai / Unifically, below), paid from your organization\'s credit (or its own OpenRouter key), with no account at the lab: text (ask another model: GPT, Gemini, DeepSeek, …; bulk work on a cheap one), an image (gpt-image, Nano Banana, Flux…), a video (Seedance, Veo, Kling…) or speech (ElevenLabs…). Before it runs, what it can cost at most is worked out from the model\'s price list and held on the credit; it is refused when the credit cannot cover that, or when it is above max_cost_usd. Text comes back in the result (and is saved at path if given); media is saved into this world at path. A video waits up to wait_minutes, else returns its job_id: call again with job_id and path to collect it. Models, prices, durations and voices: platform_request GET /api/generation-models?kind=text|image|video|speech.',
+    parameters: {
+      type: 'object',
+      properties: {
+        organization_id: { type: 'string', description: 'Your organization id (named in your prompt).' },
+        kind: { type: 'string', enum: ['text', 'image', 'video', 'speech'] },
+        provider: { type: 'string', enum: ['openrouter', 'fal', 'unifically'], description: 'Default openrouter. fal: ~1,500 models OpenRouter lacks (music, sound effects, 3D, upscaling, lip-sync, background removal…); unifically: Suno and others. Each only where the operator turned it on. With these, pass model and input; kind is optional.' },
+        input: { type: 'object', description: 'fal/unifically: the model\'s own input object, as its docs give it (find models with platform_request GET /api/generation-models?provider=fal&q=music).' },
+        prompt: { type: 'string', description: 'The question or what to make; for speech, the text to say.' },
+        path: { type: 'string', description: 'Where to save it in this world, e.g. assets/hero.png (several images get -2, -3, … before the extension). Required for image, video and speech.' },
+        model: { type: 'string', description: 'OpenRouter model id; default: a good, cheap one for the kind.' },
+        max_cost_usd: { type: 'number', description: 'Refuse unless it can cost at most this much (USD at OpenRouter\'s prices).' },
+        system: { type: 'string', description: 'Text: instructions for the model.' },
+        max_tokens: { type: 'number', description: 'Text: the longest reply, reasoning included (default 8192).' },
+        effort: { type: 'string', enum: ['minimal', 'low', 'medium', 'high'], description: 'Text: reasoning effort, where the model reasons.' },
+        aspect_ratio: { type: 'string', description: 'e.g. 16:9, 1:1, 9:16.' },
+        resolution: { type: 'string', description: 'e.g. 1K, 2K (images); 480p, 720p, 1080p (video). Left out, a video is quoted at the model\'s highest.' },
+        count: { type: 'number', description: 'Images: how many (1–10).' },
+        duration: { type: 'number', description: 'Video: seconds (the model lists which it supports). Left out, it is quoted at the model\'s longest.' },
+        audio: { type: 'boolean', description: 'Video: with sound (default: the model\'s).' },
+        voice: { type: 'string', description: 'Speech: a voice the model offers (default: its first).' },
+        instructions: { type: 'string', description: 'Speech: tone, pace or emotion, where the model supports it.' },
+        references: {
+          type: 'array',
+          description: 'Input images: a file in this world or an https URL. For video, role first_frame/last_frame animates it; for an image, it is edited or followed; for text, the model sees it.',
+          items: { type: 'object', properties: { path: { type: 'string' }, url: { type: 'string' }, role: { type: 'string', enum: ['first_frame', 'last_frame', 'reference'] } } },
+        },
+        job_id: { type: 'string', description: 'Video: collect a job an earlier call started.' },
+        wait_minutes: { type: 'number', description: 'Video: how long to wait for it (default 10, at most 30).' },
+      },
+      required: ['organization_id', 'kind'],
     },
   },
   {
@@ -1117,6 +1170,8 @@ export const SDK_CONTROL_TOOL_NAMES = new Set([
   'stop_job',
   'request_spend',
   'fill_payment_card',
+  // Saves what it made into this turn's world.
+  'generate',
   'open_pr',
   'signal_completion',
   'resolve_decision',
@@ -1461,6 +1516,65 @@ export function platformToolHandlers(
       });
       await ctx.createReviewInfo({ summary: `Project resource proposed: ${String(args.name ?? '')}. Included on confirmation unless excluded.`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
       return JSON.stringify(result);
+    },
+    async generate(args) {
+      const org = encodeURIComponent(String(args?.organization_id ?? ''));
+      const target = String(args?.path ?? '').trim();
+      const kind = args?.job_id ? 'video' : String(args?.kind ?? '');
+      const otherProvider = !!args?.provider && args.provider !== 'openrouter';
+      if (!target && (kind !== 'text' || otherProvider)) throw new Error('path is required: where to save it in this world');
+      type Result = { status: string; jobId?: string; model?: string; quoteUsd?: number; costUsd?: number; funding?: string; error?: string; output?: unknown;
+        text?: string; files?: Array<{ mediaType: string; base64: string }> };
+      const job = (id: string) => `/api/organizations/${org}/generations/${encodeURIComponent(id)}?content=1`;
+      let result: Result;
+      if (args?.job_id) {
+        result = await platformRequest('GET', job(String(args.job_id))) as Result;
+      } else {
+        const references = await Promise.all(((Array.isArray(args?.references) ? args.references : []) as Array<{ path?: string; url?: string; role?: string }>).map(async (ref) => {
+          const role = ref?.role ? { role: String(ref.role) } : {};
+          if (!ref?.path) return { url: String(ref?.url ?? ''), ...role };
+          const bytes = await world.readFileBuffer(String(ref.path));
+          if (bytes.length > MEDIA_REFERENCE_MAX_BYTES) throw new Error(`${ref.path} is larger than ${MEDIA_REFERENCE_MAX_BYTES / 1e6} MB`);
+          return { url: `data:${mediaTypeOf(String(ref.path))};base64,${bytes.toString('base64')}`, ...role };
+        }));
+        result = await platformRequest('POST', `/api/organizations/${org}/generations`, {
+          kind: args?.kind, provider: args?.provider, input: args?.input, prompt: args?.prompt, model: args?.model, maxCostUsd: args?.max_cost_usd, system: args?.system,
+          maxTokens: args?.max_tokens, effort: args?.effort, aspectRatio: args?.aspect_ratio, resolution: args?.resolution,
+          count: args?.count, duration: args?.duration, audio: args?.audio, voice: args?.voice, instructions: args?.instructions,
+          ...(references.length ? { references } : {}),
+        }) as Result;
+      }
+      // A video renders for a minute or several: wait for it, up to the limit.
+      const deadline = Date.now() + Math.min(30, Math.max(0, Number(args?.wait_minutes ?? 10) || 0)) * 60_000;
+      while (result.jobId && (result.status === 'pending' || result.status === 'in_progress') && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, mediaPollMs()));
+        result = await platformRequest('GET', job(result.jobId)) as Result;
+      }
+      const summary = { status: result.status, model: result.model,
+        ...(result.quoteUsd !== undefined ? { quoteUsd: result.quoteUsd } : {}), ...(result.costUsd !== undefined ? { costUsd: result.costUsd } : {}),
+        ...(result.funding ? { paidFrom: result.funding === 'own' ? 'your OpenRouter key' : 'credit' } : {}),
+        ...(result.error ? { error: result.error } : {}) };
+      if (result.status === 'completed' && result.text !== undefined) {
+        if (target) { await world.writeFile(target, result.text); ctx.emit(`generated ${target}`); }
+        return JSON.stringify({ ...summary, ...(target ? { saved: [target] } : {}), text: result.text });
+      }
+      if (result.status === 'completed' && result.files?.length) {
+        const saved: string[] = [];
+        for (const [index, file] of result.files.entries()) {
+          const where = mediaPath(target, file.mediaType, index, result.files.length);
+          const bytes = Buffer.from(file.base64, 'base64');
+          if (world.writeFileBuffer) await world.writeFileBuffer(where, bytes);
+          else throw new Error('this world cannot store binary files');
+          saved.push(where);
+        }
+        ctx.emit(`generated ${saved.join(', ')}`);
+        // Another provider's output says what each file is (clip ids, titles, durations…).
+        const output = result.output === undefined ? undefined : JSON.stringify(result.output);
+        return JSON.stringify({ ...summary, saved, ...(output ? { output: output.length > 4000 ? `${output.slice(0, 4000)}…` : result.output } : {}) });
+      }
+      if (result.status === 'pending' || result.status === 'in_progress')
+        return JSON.stringify({ ...summary, job_id: result.jobId, next: 'Still rendering: call generate again with this job_id and path to collect it.' });
+      return JSON.stringify({ ...summary, ...(result.jobId ? { job_id: result.jobId } : {}), error: result.error ?? 'nothing was generated' });
     },
     async check_agent_mail(args) {
       const q = new URLSearchParams();

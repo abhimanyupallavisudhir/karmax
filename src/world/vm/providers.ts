@@ -1,5 +1,6 @@
 import type { ResolvedWorldProviderConnection } from '../connections.js';
 import type { WorldReferenceKeys } from '../reference-keys.js';
+import { Agent37Driver } from '../agent37.js';
 import { AwsDriver } from '../aws.js';
 import { FlyDriver } from '../fly.js';
 import { GcpDriver } from '../gcp.js';
@@ -36,4 +37,9 @@ export function awsWorldProvider(resolve?: Resolver, referenceKeys?: WorldRefere
 export function gcpWorldProvider(resolve?: Resolver, referenceKeys?: WorldReferenceKeys, ledger?: VmUsageLedger): VmWorldProvider {
   return new VmWorldProvider(new GcpDriver(), resolve ?? environmentResolver('KARMAX_GCP_KEY', () => ({
     region: process.env.KARMAX_GCP_ZONE, image: process.env.KARMAX_GCP_IMAGE })), referenceKeys, { ledger });
+}
+
+export function agent37WorldProvider(resolve?: Resolver, referenceKeys?: WorldReferenceKeys, ledger?: VmUsageLedger): VmWorldProvider {
+  return new VmWorldProvider(new Agent37Driver(), resolve ?? environmentResolver('AGENT37_API_KEY', () => ({
+    region: process.env.KARMAX_AGENT37_REGION, image: process.env.KARMAX_AGENT37_TEMPLATE })), referenceKeys, { ledger });
 }

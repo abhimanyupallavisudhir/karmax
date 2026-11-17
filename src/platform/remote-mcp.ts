@@ -49,6 +49,8 @@ export const REMOTE_MCP_TOOL_NOTES: Readonly<Record<string, RemoteToolNote>> = {
   // Any /api route the caller is authorized for, deletions included.
   platform_request: removes('Call the API'),
   list_connections: reads('List connected apps'),
+  // Spends the organization's credit.
+  generate: changes('Generate text, an image, video or speech'),
   verify_resource_revision: reads('Verify a version of project data'),
   list_world_providers: reads('List cloud computer providers'),
   connect_world_provider: changes('Connect a cloud computer provider'),

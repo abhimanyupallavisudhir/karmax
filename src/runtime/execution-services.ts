@@ -16,7 +16,7 @@ import { TokenAuthority } from '../platform/tokens.js';
 import { CLOUD_WORLD_PROVIDERS, WorldProviderConnectionService } from '../world/connections.js';
 import { E2BWorldProvider } from '../world/e2b.js';
 import { DaytonaWorldProvider } from '../world/daytona.js';
-import { awsWorldProvider, flyWorldProvider, gcpWorldProvider, hetznerWorldProvider } from '../world/vm/providers.js';
+import { agent37WorldProvider, awsWorldProvider, flyWorldProvider, gcpWorldProvider, hetznerWorldProvider } from '../world/vm/providers.js';
 import { LocalObjectStore, S3ObjectStore, managedS3Options } from '../store/objects.js';
 import { DeferredDeleteObjectStore, objectDeleteDelayMs } from '../store/deferred-delete.js';
 import { StorageLocationService } from '../store/storage-locations.js';
@@ -61,7 +61,7 @@ export async function createExecutionServices(input: {
     async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), undefined, referenceKeys));
   worlds.register(new DaytonaWorldProvider(undefined, undefined, undefined, undefined,
     async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), undefined, undefined, referenceKeys));
-  for (const vmProvider of [flyWorldProvider, hetznerWorldProvider, awsWorldProvider, gcpWorldProvider]) {
+  for (const vmProvider of [flyWorldProvider, hetznerWorldProvider, awsWorldProvider, gcpWorldProvider, agent37WorldProvider]) {
     const provider = vmProvider(async (organizationId, kind, options) => (await providerConnections.resolve(organizationId, kind, options)), referenceKeys, store);
     // A VM found stopped under a caller is started again only inside the
     // world's transition lock, and only for a world someone is meant to use:
