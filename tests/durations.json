@@ -39,7 +39,7 @@
   "tests/agent-token-world-generation.test.ts": 0.2,
   "tests/agent-turn-world-access.test.ts": 0.3,
   "tests/agent-work-ui.test.ts": 2.4,
-  "tests/agent37-world.test.ts": 35.6,
+  "tests/agent37-world.test.ts": 43.7,
   "tests/api-key-settings-ui.test.ts": 2.5,
   "tests/app-grants.test.ts": 1.4,
   "tests/approval-announcement.test.ts": 0.3,
