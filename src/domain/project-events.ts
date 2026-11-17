@@ -40,7 +40,8 @@ export interface ProjectEvent {
   actsAs?: string;
   /** How often this key has been recorded: a repeat is counted, not dropped. */
   count: number;
-  /** When it was last recorded (`receivedAt` is the first time). */
+  /** When it was last heard (`receivedAt` is the first time); what keeps it.
+   *  When it last happened is `lastHappenedAt`. */
   lastSeenAt: number;
   /** The latest repeats, newest last: what differed from the first (`payload`). */
   recent?: EventOccurrence[];
@@ -55,8 +56,17 @@ export interface ProjectEvent {
 export type ProjectEventRecord = Omit<ProjectEvent, 'id' | 'receivedAt' | 'count' | 'lastSeenAt' | 'recent' | 'distinct'>
   & { receivedAt?: number; occurrences?: number; distinct?: string[]; tally?: Record<string, string[]> };
 
-/** One repeat of an event's key, kept as a sample. */
+/** One repeat of an event's key, kept as a sample: \`at\` is when it happened
+ *  (its recorder's word, never later than when it was heard). */
 export interface EventOccurrence { at: number; payload: Record<string, unknown> }
+
+/** When the latest occurrence an event knows of happened, which is not when it
+ *  was last heard (\`lastSeenAt\`): a person may report today what a task
+ *  showed last week. Whether a fix held is judged by this. */
+export function lastHappenedAt(event: Pick<ProjectEvent, 'occurredAt' | 'receivedAt' | 'recent'>): number {
+  const first = Number.isFinite(event.occurredAt) ? Math.min(event.occurredAt, event.receivedAt) : event.receivedAt;
+  return Math.max(first, ...(event.recent ?? []).map((occurrence) => occurrence.at));
+}
 
 /** How many repeats an event keeps, how many values per tallied path, and how large a kept repeat may be. */
 export const EVENT_RECENT_OCCURRENCES = 3;
@@ -86,6 +96,8 @@ export interface ProjectEventClaim {
   concurrencyKey?: string;
   /** Its trigger's gate said to start it: it is not asked again while it waits. */
   gated?: boolean;
+  /** Why its gate let it start: kept through the waits after, onto the run it started. */
+  gateReason?: string;
   /** The event's receipt time: claims are retried oldest event first. */
   receivedAt: number;
   updatedAt: number;

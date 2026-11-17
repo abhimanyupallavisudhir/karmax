@@ -22205,7 +22205,7 @@ function eventOutcome(event) {
   if (!claims.length) return '<span class="setting-muted">No task waits for this</span>';
   return claims.map((c) => {
     const run = c.runId ? `<a data-pe-task="${esc(c.runId)}" data-spa href="${esc(taskUrl(c.runId))}">a run</a>` : 'a run';
-    if (c.state === 'started') return `Started ${run}`;
+    if (c.state === 'started') return c.gateReason ? `<span title="${esc(`its gate: ${c.gateReason}`)}">Started ${run}</span>` : `Started ${run}`;
     if (c.state === 'told') return `Told ${run}`;
     if (c.state === 'pending') return 'Starting a run…';
     return `<span class="setting-muted" title="${esc(c.reason || '')}">${c.state === 'deferred' ? 'Waiting' : 'Skipped'}: ${esc(c.reason || '')}</span>`;

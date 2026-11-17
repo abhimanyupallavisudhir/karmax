@@ -202,12 +202,15 @@ export class TokenAuthority {
     let expiredAt: number | undefined;
     for (let next: string | undefined = id; next && !seen.has(next);) {
       seen.add(next);
+      const held = this.delegations.get(next);
       const row = this.store ? (await this.store.humanDelegationRow(next))
-        : this.delegations.has(next) ? { record: this.delegations.get(next) as unknown as Record<string, unknown>, revokedAt: undefined } : undefined;
+        : held ? { record: held as unknown as Record<string, unknown>, expiresAt: held.expiresAt, revokedAt: undefined } : undefined;
       const record = row?.record as unknown as HumanDelegation | undefined;
-      if (!record || row?.revokedAt || (await this.store?.kvGet(`account-closed:${record.humanUserId}`)))
+      if (!row || row.revokedAt || (record && (await this.store?.kvGet(`account-closed:${record.humanUserId}`))))
         return new HumanDelegationLapsed(id);
-      if (record.expiresAt <= Date.now()) expiredAt = Math.min(expiredAt ?? record.expiresAt, record.expiresAt);
+      if (row.expiresAt <= Date.now()) expiredAt = Math.min(expiredAt ?? row.expiresAt, row.expiresAt);
+      // Purged after it expired: how it lapsed is all that is left of it.
+      if (!record) { if (expiredAt === undefined) return new HumanDelegationLapsed(id); break; }
       next = record.parentDelegationId;
     }
     return expiredAt === undefined ? undefined : new HumanDelegationLapsed(id, expiredAt);
