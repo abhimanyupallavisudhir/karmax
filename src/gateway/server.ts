@@ -140,7 +140,7 @@ import { SETTLES_REQUESTS } from '../platform/settled-requests.js';
 import { AuthorizationRequests } from '../platform/authorization-requests.js';
 import { RepositoryAccessRequests } from '../integrations/repository-access.js';
 import { inheritPersonalGithubProfile } from '../autonomy/git-profiles.js';
-import { actorPrincipal, identityAuditDetail, requireHumanSubject,
+import { actorPrincipal, identityAuditDetail, requireHumanSubject, requireInteractiveHuman,
   resolveCallerIdentity } from '../platform/identity.js';
 import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, knownProviderEndpoint, normalizeExplanationSettings,
   requestExplanation, type ExplanationSettings } from '../agent/explanation.js';
@@ -255,6 +255,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // organization credential grant and must remain editable after they join a
   // project only as a Developer (or before they join any project at all).
   if (/^\/api\/user\/(?:git-profiles|github-accounts)(?:\/|$)/.test(p)) return 'none';
+  // A person's own chat accounts (src/integrations/chat-links.ts): the handler
+  // takes the human subject; linking needs the person themself.
+  if (p === '/api/chat-links' || p === '/api/chat-links/pending' || /^\/api\/user\/chat-links(?:\/[^/]+)?$/.test(p)) return 'none';
   // A person's own devices, and the public key they subscribe with.
   if (p === '/api/push/key' || /^\/api\/user\/push-subscriptions(?:\/[^/]+)?$/.test(p)) return 'none';
   if (p === '/api/invitations/accept') return 'none';
@@ -2631,6 +2634,26 @@ export class Gateway {
         } catch (error) {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
+      }
+      // Chat accounts linked to people (wiki planned/assistant §3).
+      if (p === '/api/chat-links/pending' && method === 'GET') {
+        requireHumanSubject(callerIdentity);
+        return this.json(res, 200, await api.pendingChatLink(token, url.searchParams.get('t') ?? ''));
+      }
+      if (p === '/api/chat-links' && method === 'POST') {
+        // A live session: a browser API token alone is not the person.
+        requireInteractiveHuman(callerIdentity);
+        const b = await this.body(req);
+        return this.json(res, 201, await api.linkChatAccount(token, String(b.t ?? '')));
+      }
+      if (p === '/api/user/chat-links' && method === 'GET') {
+        requireHumanSubject(callerIdentity);
+        return this.json(res, 200, { links: await api.listChatLinks(token) });
+      }
+      const chatLinkMatch = p.match(/^\/api\/user\/chat-links\/([^/]+)$/);
+      if (chatLinkMatch && method === 'DELETE') {
+        requireHumanSubject(callerIdentity);
+        return this.json(res, 200, await api.deleteChatLink(token, decodeURIComponent(chatLinkMatch[1]!)));
       }
       // A person's console preferences, the same on every device they sign in on.
       if (p === '/api/user/preferences' && (method === 'GET' || method === 'PATCH')) {
@@ -5553,7 +5576,8 @@ export class Gateway {
           const b = await this.body(req);
           return this.json(res, 200, await api.updateIncomingWebhook(token, hookId, { ...(b.name !== undefined ? { name: String(b.name) } : {}), ...(b.type !== undefined ? { type: String(b.type) } : {}),
             ...(b.allowed !== undefined ? { allowed: b.allowed } : {}), ...(b.anyone !== undefined ? { anyone: b.anyone === true } : {}),
-            ...(Array.isArray(b.dismiss) ? { dismiss: b.dismiss.map(String) } : {}) }));
+            ...(Array.isArray(b.dismiss) ? { dismiss: b.dismiss.map(String) } : {}),
+            ...(Array.isArray(b.unlink) ? { unlink: b.unlink.map(String) } : {}) }));
         }
         if (!webhookMatch[2] && method === 'DELETE') return this.json(res, 200, await api.deleteIncomingWebhook(token, hookId));
       }

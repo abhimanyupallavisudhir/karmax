@@ -10,6 +10,10 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { ChatReplies, chatThreadKey } from '../src/integrations/chat-replies.js';
+import { ChatLinks } from '../src/integrations/chat-links.js';
+import { AuthorizationService, organizationScope, projectScope } from '../src/platform/authorization.js';
+import { EventRunRefused, triggerContext } from '../src/domain/project-events.js';
+import { createTriggerTell } from '../src/platform/trigger-scheduler.js';
 
 /** Chat bots as project event sources (src/integrations/chat-platforms.ts),
  * against each platform's real protocol shapes and a fake platform API. */
@@ -182,7 +186,7 @@ describe('chat bots', () => {
     await vi.waitFor(() => expect(calls.filter((call) => call.url.endsWith('/sendMessage'))).toHaveLength(1));
     const told = calls.find((call) => call.url.endsWith('/sendMessage'))!.body;
     expect(told).toMatchObject({ chat_id: '66', reply_to_message_id: 601 });
-    expect(told.text).toMatch(/^Only people this project allows can ask me\. Someone on it can let you in here: https:\/\/tavya\.example\/[^/]+\/chat\/settings#project-events$/);
+    expect(told.text).toMatch(/^Link your tavya account to ask me: https:\/\/tavya\.example\/link\/chat\?t=tvl_[\w-]+$/);
     let [listed] = await api.listIncomingWebhooks(token, projectId);
     expect(listed!.asking).toEqual([expect.objectContaining({ id: '66', name: 'Eve', text: 'please?' })]);
 
@@ -215,8 +219,360 @@ describe('chat bots', () => {
     const result = await receive(hook.id, raw, { 'x-signature-timestamp': at, 'x-signature-ed25519': crypto.sign(null, Buffer.from(at + raw), privateKey).toString('hex') });
     expect(result.events).toEqual([]);
     expect(result.answer).toMatchObject({ status: 200, body: { type: 4, data: { flags: 64 } } });
-    expect((result.answer!.body as any).data.content).toMatch(/^Only people this project allows can ask me/);
+    expect((result.answer!.body as any).data.content).toMatch(/^Link your tavya account to ask me: https:\/\/tavya\.example\/link\/chat\?t=tvl_/);
     expect(calls.filter((call) => call.url.includes('/channels/'))).toEqual([]);
     expect((await api.listIncomingWebhooks(token, projectId))[0]!.asking).toEqual([expect.objectContaining({ id: 'u-9', name: 'mallory', text: 'wipe it' })]);
+  });
+});
+
+/**
+ * Chat accounts linked to people (wiki planned/assistant §3): someone the bot
+ * does not know gets a link; once they confirm it, their runs act as them —
+ * created by them, with the series' grant cut to what they hold in the project.
+ */
+describe('chat accounts linked to people', () => {
+  let dir: string;
+  let calls: Array<{ url: string; body?: any }>;
+  const override: Record<string, unknown> = {};
+  const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+    const answer = Object.entries(override).find(([fragment]) => url.includes(fragment))?.[1]
+      ?? (url.includes('getMe') ? { ok: true, result: { id: 42, username: 'tavya_bot' } }
+      : url.includes('sendMessage') ? { ok: true, result: { message_id: 900 } } : { ok: true });
+    return new Response(JSON.stringify(answer), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+
+  async function fixture() {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-chat-link-'));
+    calls = [];
+    for (const key of Object.keys(override)) delete override[key];
+    const store = await Store.create(':memory:');
+    const organization = await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
+    const project = await store.createProject('Site', {}, organization.id);
+    const authorization = await AuthorizationService.create(store);
+    await authorization.bootstrapOrganizationOwner('system:test', 'owner', organization.id);
+    for (const userId of ['admin', 'maint', 'dev', 'reader']) await store.setOrganizationMembership(organization.id, userId, 'member');
+    await authorization.grant('system:test', { principalId: 'user:admin', scopeKey: organizationScope(organization.id), profileId: 'administrator' });
+    await authorization.grant('system:test', { principalId: 'user:maint', scopeKey: projectScope(project.id), profileId: 'maintainer' });
+    await authorization.grant('system:test', { principalId: 'user:dev', scopeKey: projectScope(project.id), profileId: 'developer' });
+    await authorization.grant('system:test', { principalId: 'user:reader', scopeKey: projectScope(project.id), profileId: 'viewer' });
+    const tokens = new TokenAuthority(store);
+    const broker = new CredentialBroker(new Vault(dir));
+    const started: any[] = [];
+    const client = { workflow: { getHandle: () => ({}), start: async (_type: string, options: any) => { started.push(options.args[0]); return {}; } } } as any;
+    const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, authorization, broker, worlds: new WorldRegistry() });
+    api.setChatReplies(new ChatReplies({ store, broker, publicUrl: () => 'https://tavya.example', fetcher }));
+    const human = async (userId: string) => (await tokens.mintPrincipal(`user:${userId}`,
+      await authorization.capabilities(`user:${userId}`, project.id, organization.id), project.id, undefined, organization.id)).token;
+    const connect = async (name = 'Telegram bot') => {
+      const { hook } = await api.createIncomingWebhook(await human('maint'), project.id, { name, kind: 'telegram', credentials: { botToken: `123:${name}` } },
+        { hookUrl: (id) => `https://tavya.example/api/hooks/${id}`, fetcher });
+      const secret = calls.filter((call) => call.url.endsWith('/setWebhook')).at(-1)!.body.secret_token as string;
+      let update = 0;
+      const send = (from: { id: number; first_name: string }, text: string) => api.receiveIncomingWebhook(hook.id, { method: 'POST', contentType: 'application/json',
+        raw: Buffer.from(JSON.stringify({ update_id: ++update, message: { message_id: 600 + update, text, from, chat: { id: from.id, type: 'private' } } })),
+        headers: { 'x-telegram-bot-api-secret-token': secret }, query: new URLSearchParams() });
+      return { hook, send };
+    };
+    const linkSent = () => {
+      const text = calls.filter((call) => call.url.endsWith('/sendMessage')).at(-1)?.body.text as string | undefined;
+      return text?.match(/https:\/\/tavya\.example\/link\/chat\?t=(tvl_[\w-]+)/)?.[1];
+    };
+    /** The project's chat series, as the task store installs it, saved by its maintainer. */
+    const series = async (level: string, by = 'maint') => api.createTask(await human(by), { projectId: project.id, workflow: 'just-do',
+      prompt: 'Answer the chat', authorization: { level, scope: 'projects', projectIds: [project.id] },
+      params: { repeatable: true, triggers: [{ kind: 'event', type: 'chat.mention', recurring: true }] } } as any);
+    const system = async () => (await tokens.mintPrincipal('system:triggers', ['*'])).token;
+    return { store, organization, project, authorization, tokens, api, human, connect, linkSent, series, system, started };
+  }
+  afterEach(() => { if (dir) fs.rmSync(dir, { recursive: true, force: true }); });
+
+  const ada = { id: 7, first_name: 'Ada' };
+
+  it('sends someone it does not know a link; signed in, they link the chat account to themselves, once', async () => {
+    const f = await fixture();
+    const { hook, send } = await f.connect();
+    expect((await send(ada, 'fix the login page')).events).toEqual([]);
+    await vi.waitFor(() => expect(f.linkSent()).toBeTruthy());
+    const token = f.linkSent()!;
+    expect(calls.filter((call) => call.url.endsWith('/sendMessage')).at(-1)!.body.text).toMatch(/^Link your tavya account to ask me: https:\/\/tavya\.example\/link\/chat\?t=tvl_/);
+    // Asking again while the link works sends nothing more.
+    await send(ada, 'hello?');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(calls.filter((call) => call.url.endsWith('/sendMessage'))).toHaveLength(1);
+
+    expect(await f.api.pendingChatLink(await f.human('dev'), token)).toMatchObject({ platform: 'telegram', platformName: 'Ada', platformUserId: '7',
+      bot: { name: 'Telegram bot', username: 'tavya_bot' } });
+    const link = await f.api.linkChatAccount(await f.human('dev'), token);
+    expect(link).toMatchObject({ bot: { id: hook.id, name: 'Telegram bot' }, userId: 'dev', platformUserId: '7', platformName: 'Ada' });
+    // The token is single-use, and only ever a digest is stored.
+    await expect(f.api.linkChatAccount(await f.human('maint'), token)).rejects.toThrow(/used already or is not valid/);
+    await expect(f.api.pendingChatLink(await f.human('dev'), token)).rejects.toThrow(/used already, expired or is not valid/);
+    expect(JSON.stringify(await f.store.kvEntries('chat-link'))).not.toContain(token);
+    expect(await f.api.listChatLinks(await f.human('dev'))).toMatchObject([{ id: link.id, platform: 'telegram', platformName: 'Ada', bot: { name: 'Telegram bot' } }]);
+  });
+
+  it('a link token reaches only its person: a group is told to message the bot directly, and the link goes there', async () => {
+    const f = await fixture();
+    const { hook } = await f.connect();
+    const secret = calls.filter((call) => call.url.endsWith('/setWebhook')).at(-1)!.body.secret_token as string;
+    let update = 100;
+    const inGroup = (from: { id: number; first_name: string }, text: string) => f.api.receiveIncomingWebhook(hook.id, { method: 'POST', contentType: 'application/json',
+      raw: Buffer.from(JSON.stringify({ update_id: ++update, message: { message_id: 700 + update, text, from, chat: { id: -100, type: 'supergroup', title: 'Team' } } })),
+      headers: { 'x-telegram-bot-api-secret-token': secret }, query: new URLSearchParams() });
+    const sent = () => calls.filter((call) => call.url.endsWith('/sendMessage')).map((call) => call.body);
+
+    // Someone the bot does not know asks in a group: everyone there would see a
+    // link, so the group is told to message the bot instead, and no token exists.
+    expect((await inGroup(ada, '@tavya_bot fix the login page')).events).toEqual([]);
+    await vi.waitFor(() => expect(sent()).toHaveLength(1));
+    expect(sent()[0]).toMatchObject({ chat_id: '-100' });
+    expect(sent()[0].text).toBe('Message me directly to link your tavya account: https://t.me/tavya_bot');
+    expect(JSON.stringify(sent())).not.toContain('/link/chat');
+    expect(await f.store.kvEntries('chat-link-token:')).toEqual([]);
+    // …once while that would still hold, so the group is not spammed.
+    await inGroup(ada, '@tavya_bot hello?');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(sent()).toHaveLength(1);
+
+    // In a direct message the link goes to them alone.
+    const direct = await f.api.receiveIncomingWebhook(hook.id, { method: 'POST', contentType: 'application/json',
+      raw: Buffer.from(JSON.stringify({ update_id: ++update, message: { message_id: 800, text: 'hi', from: ada, chat: { id: 7, type: 'private' } } })),
+      headers: { 'x-telegram-bot-api-secret-token': secret }, query: new URLSearchParams() });
+    expect(direct.events).toEqual([]);
+    await vi.waitFor(() => expect(sent()).toHaveLength(2));
+    expect(sent()[1]).toMatchObject({ chat_id: '7' });
+    expect(f.linkSent()).toBeTruthy();
+  });
+
+  it('Slack: a channel mention gets its link where only the sender sees it; a failed whisper never falls back to the channel', async () => {
+    const f = await fixture();
+    const { hook } = await f.api.createIncomingWebhook(await f.human('maint'), f.project.id, { name: 'Slack bot', kind: 'slack',
+      credentials: { signingSecret: 'sss', botToken: 'xoxb-1' } }, { hookUrl: (id) => `https://tavya.example/api/hooks/${id}`, fetcher });
+    let n = 0;
+    const slack = (user: string, event: Record<string, unknown>) => {
+      const raw = JSON.stringify({ type: 'event_callback', event_id: `Ev${++n}`, event: { user, ts: `17000.${n}`, ...event } });
+      const at = String(Math.floor(Date.now() / 1000));
+      const signature = `v0=${crypto.createHmac('sha256', 'sss').update(`v0:${at}:${raw}`).digest('hex')}`;
+      return f.api.receiveIncomingWebhook(hook.id, { method: 'POST', contentType: 'application/json', raw: Buffer.from(raw),
+        headers: { 'x-slack-request-timestamp': at, 'x-slack-signature': signature }, query: new URLSearchParams() });
+    };
+    const posted = () => calls.filter((call) => call.url.endsWith('/chat.postMessage')).map((call) => call.body);
+    const whispered = () => calls.filter((call) => call.url.endsWith('/chat.postEphemeral')).map((call) => call.body);
+    calls = [];
+
+    expect((await slack('U7', { type: 'app_mention', channel: 'C1', text: '<@UBOT> fix it' })).events).toEqual([]);
+    await vi.waitFor(() => expect(whispered()).toHaveLength(1));
+    expect(whispered()[0]).toMatchObject({ channel: 'C1', user: 'U7', thread_ts: '17000.1' });
+    expect(whispered()[0].text).toMatch(/^Link your tavya account to ask me: https:\/\/tavya\.example\/link\/chat\?t=tvl_/);
+    expect(posted()).toEqual([]);
+
+    // A direct message is private: the link is posted there.
+    await slack('U8', { type: 'message', channel_type: 'im', channel: 'D8', text: 'hi' });
+    await vi.waitFor(() => expect(posted()).toHaveLength(1));
+    expect(posted()[0]).toMatchObject({ channel: 'D8' });
+    expect(posted()[0].text).toMatch(/\/link\/chat\?t=tvl_/);
+
+    // Slack refuses the whisper: nothing reaches the channel, and their next mention tries again.
+    override['chat.postEphemeral'] = { ok: false, error: 'user_not_in_channel' };
+    await slack('U9', { type: 'app_mention', channel: 'C1', text: '<@UBOT> hi' });
+    await vi.waitFor(() => expect(whispered()).toHaveLength(2));
+    await vi.waitFor(async () => expect(await new ChatLinks(f.store).offered(hook.id, 'U9')).toBe(false));
+    expect(posted()).toHaveLength(1);
+    delete override['chat.postEphemeral'];
+    await slack('U9', { type: 'app_mention', channel: 'C1', text: '<@UBOT> hi again' });
+    await vi.waitFor(() => expect(whispered()).toHaveLength(3));
+    expect(whispered()[2]).toMatchObject({ user: 'U9' });
+  });
+
+  it('a link token expires, and an agent cannot link one for its person', async () => {
+    const f = await fixture();
+    const { hook } = await f.connect();
+    let now = Date.now();
+    const links = new ChatLinks(f.store, () => now);
+    const { token } = await links.offer(hook, { id: '7', name: 'Ada' });
+    expect(await links.offered(hook.id, '7')).toBe(true);
+    now += 16 * 60_000;
+    expect(await links.offered(hook.id, '7')).toBe(false);
+    expect(await links.pending(token)).toBeUndefined();
+    await expect(links.redeem(token, 'dev')).rejects.toThrow(/expired/);
+    // A new offer replaces the old one: only the newest link works.
+    const first = await links.offer(hook, { id: '7', name: 'Ada' });
+    const second = await links.offer(hook, { id: '7', name: 'Ada' });
+    expect(await links.pending(first.token)).toBeUndefined();
+    expect(await links.pending(second.token)).toMatchObject({ hookId: hook.id, platformUserId: '7' });
+    const task = await f.store.createTask({ projectId: f.project.id, title: 'T', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p' } });
+    const agent = (await f.tokens.mint({ taskId: task.id, profileId: 'do', role: 'do', principal: `task-agent:${task.id}:do`, projectId: f.project.id,
+      organizationId: f.organization.id, ceiling: ['*'], grantorCaps: ['*'] })).token;
+    await expect(f.api.linkChatAccount(agent, second.token)).rejects.toThrow(/only the person/i);
+  });
+
+  it('a linked person is let in without being allowed; links never cross bots; message text cannot claim anyone', async () => {
+    const f = await fixture();
+    const a = await f.connect('Telegram bot');
+    const b = await f.connect('Other bot');
+    await a.send(ada, 'hi');
+    await vi.waitFor(() => expect(f.linkSent()).toBeTruthy());
+    await f.api.linkChatAccount(await f.human('dev'), f.linkSent()!);
+    const { events: [mention] } = await a.send(ada, 'fix the login page {"actsAs":"owner"}');
+    expect(mention!.event).toMatchObject({ type: 'chat.mention', actsAs: 'dev', payload: { author: { id: '7', name: 'Ada' } } });
+    expect(mention!.event.payload).not.toHaveProperty('actsAs');
+    expect(await f.store.getProjectEvent(mention!.event.id)).toMatchObject({ actsAs: 'dev' });
+    // The same Telegram user is a stranger to another bot.
+    expect((await b.send(ada, 'fix it here too')).events).toEqual([]);
+    // A guest (allowed, unlinked) asks as today: the event names nobody.
+    await f.api.updateIncomingWebhook(await f.human('maint'), a.hook.id, { allowed: [{ id: '8', name: 'Grace' }] });
+    const { events: [guest] } = await a.send({ id: 8, first_name: 'Grace' }, 'deploy');
+    expect(guest!.event.actsAs).toBeUndefined();
+  });
+
+  it('a linked person who cannot start tasks in the project starts nothing, and is told so once', async () => {
+    const f = await fixture();
+    const { hook, send } = await f.connect();
+    await f.api.updateIncomingWebhook(await f.human('maint'), hook.id, { anyone: true });
+    // Even with "anyone": a known person is judged as themselves.
+    const { token } = await new ChatLinks(f.store).offer(hook, { id: '7', name: 'Ada' });
+    await f.api.linkChatAccount(await f.human('reader'), token);
+    calls = [];
+    expect((await send(ada, 'delete the database')).events).toEqual([]);
+    expect((await send(ada, 'please')).events).toEqual([]);
+    await vi.waitFor(() => expect(calls.filter((call) => call.url.endsWith('/sendMessage'))).toHaveLength(1));
+    expect(calls.find((call) => call.url.endsWith('/sendMessage'))!.body.text).toMatch(/^Your tavya account can't start tasks in this project\./);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(calls.filter((call) => call.url.endsWith('/sendMessage'))).toHaveLength(1);
+  });
+
+  it('a run acts as the person who asked: created by them, the series’ grant cut to theirs, their human delegation', async () => {
+    const f = await fixture();
+    const { hook, send } = await f.connect();
+    const maintainerSeries = await f.series('maintainer');
+    const developerCaps = await f.authorization.capabilities('user:dev', f.project.id, f.organization.id);
+    expect((maintainerSeries.params._authorization as any).capabilities).toContain('project:edit');
+    const link = async (userId: string, platformUserId: string) =>
+      f.api.linkChatAccount(await f.human(userId), (await new ChatLinks(f.store).offer(hook, { id: platformUserId, name: userId })).token);
+    await link('dev', '7');
+    await link('admin', '9');
+
+    // Less authority than the series': the run gets only what the developer holds.
+    const { events: [mention] } = await send(ada, 'fix the login page');
+    const { startedTaskId } = await f.api.fireTriggeredTask(await f.system(), maintainerSeries.id, 'clone', triggerContext(mention!.event));
+    const run = (await f.store.getTask(startedTaskId))!;
+    expect(run.createdBy).toEqual({ kind: 'user', userId: 'dev' });
+    const grant = run.params._authorization as any;
+    expect(grant).toMatchObject({ principal: 'user:dev', profileAttenuated: true });
+    expect(grant.capabilities).not.toContain('project:edit');
+    expect(grant.capabilities.every((cap: string) => developerCaps.some((held) => held === cap || held.endsWith('*') && cap.startsWith(held.slice(0, -1))))).toBe(true);
+    expect(grant.scope).toBeUndefined();
+    expect(await f.store.getHumanDelegation(grant.delegationId)).toMatchObject({ humanUserId: 'dev', taskId: run.id, projectId: f.project.id });
+    expect(f.started.at(-1)).toMatchObject({ taskId: run.id, grantPrincipal: 'user:dev', delegationId: grant.delegationId });
+
+    // More authority than the series': capped at the series' grant.
+    const developerSeries = await f.series('developer');
+    const seriesCaps = (developerSeries.params._authorization as any).capabilities as string[];
+    const { events: [adminAsks] } = await send({ id: 9, first_name: 'Ida' }, 'and the signup page');
+    const adminRun = (await f.store.getTask((await f.api.fireTriggeredTask(await f.system(), developerSeries.id, 'clone', triggerContext(adminAsks!.event))).startedTaskId))!;
+    expect(adminRun.createdBy).toEqual({ kind: 'user', userId: 'admin' });
+    expect([...(adminRun.params._authorization as any).capabilities].sort()).toEqual([...seriesCaps].sort());
+    expect((adminRun.params._authorization as any).capabilities).not.toContain('project:edit');
+
+    // A trigger context claiming someone the stored event does not name changes nothing.
+    const forged = { ...triggerContext(adminAsks!.event), actsAs: 'owner' };
+    const forgedRun = (await f.store.getTask((await f.api.fireTriggeredTask(await f.system(), developerSeries.id, 'clone', forged)).startedTaskId))!;
+    expect(forgedRun.createdBy).toEqual({ kind: 'user', userId: 'admin' });
+
+    // Someone who lost the project between asking and the run starting starts nothing; the dispatcher skips it for good.
+    await f.authorization.revoke('system:test', 'user:dev', projectScope(f.project.id));
+    await expect(f.api.fireTriggeredTask(await f.system(), maintainerSeries.id, 'clone', triggerContext(mention!.event)))
+      .rejects.toBeInstanceOf(EventRunRefused);
+  });
+
+  it('a guest’s run acts as the series, as before', async () => {
+    const f = await fixture();
+    const { hook, send } = await f.connect();
+    await f.api.updateIncomingWebhook(await f.human('maint'), hook.id, { allowed: [{ id: '8', name: 'Grace' }] });
+    const chat = await f.series('maintainer');
+    const { events: [mention] } = await send({ id: 8, first_name: 'Grace' }, 'deploy');
+    const run = (await f.store.getTask((await f.api.fireTriggeredTask(await f.system(), chat.id, 'clone', triggerContext(mention!.event))).startedTaskId))!;
+    expect(run.createdBy).toEqual(chat.createdBy);
+    expect(run.params._authorization).toMatchObject({ principal: 'user:maint' });
+    expect([...(run.params._authorization as any).capabilities].sort()).toEqual([...(chat.params._authorization as any).capabilities].sort());
+  });
+
+  it('a thread reply a run hears is attributed to its linked author', async () => {
+    const f = await fixture();
+    const { hook, send } = await f.connect();
+    await f.api.linkChatAccount(await f.human('dev'), (await new ChatLinks(f.store).offer(hook, { id: '7', name: 'Ada' })).token);
+    const { events: [mention] } = await send(ada, 'also the signup page');
+    const working = await f.store.createTask({ projectId: f.project.id, title: 'Working', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p' } });
+    await f.api.fireTriggeredTask(await f.system(), working.id, 'followUp', triggerContext(mention!.event), { kind: 'event', type: 'chat.mention' } as any);
+    const pending = JSON.parse((await f.store.kvGet(`pending-messages:${working.id}`)) ?? '[]');
+    expect(pending.at(-1)?.message).toMatchObject({ author: 'user:dev' });
+    // A reply `tell`'d to a run (concurrency mode tell) is theirs too; only the platform may say so.
+    const told: any[] = [];
+    await createTriggerTell({ postTaskMessage: async (_token: string, _taskId: string, input: any) => { told.push(input); return { notified: [] }; } } as any, f.tokens)(
+      working.id, triggerContext(mention!.event));
+    expect(told[0]).toMatchObject({ onBehalfOf: 'dev' });
+    const posted = await f.api.postTaskMessage(await f.system(), working.id, { text: 'from chat', onBehalfOf: 'dev' });
+    expect(posted.message).toMatchObject({ author: 'user:dev' });
+    const spoofed = await f.api.postTaskMessage(await f.human('maint'), working.id, { text: 'me', onBehalfOf: 'dev' });
+    expect(spoofed.message).toMatchObject({ author: 'user:maint' });
+  });
+
+  it('the person and the project each list links and remove them', async () => {
+    const f = await fixture();
+    const { hook } = await f.connect();
+    const link = await f.api.linkChatAccount(await f.human('dev'), (await new ChatLinks(f.store).offer(hook, { id: '7', name: 'Ada' })).token);
+    const other = await f.api.linkChatAccount(await f.human('dev'), (await new ChatLinks(f.store).offer(hook, { id: '70', name: 'Ada2' })).token);
+    expect((await f.api.listIncomingWebhooks(await f.human('maint'), f.project.id))[0]!.linked).toEqual([
+      { id: link.id, userId: 'dev', platformUserId: '7', platformName: 'Ada', createdAt: link.createdAt },
+      { id: other.id, userId: 'dev', platformUserId: '70', platformName: 'Ada2', createdAt: other.createdAt }]);
+    // Someone else cannot remove a person's link; the person can.
+    await expect(f.api.deleteChatLink(await f.human('maint'), link.id)).rejects.toThrow(/no such link/);
+    await f.api.deleteChatLink(await f.human('dev'), link.id);
+    expect((await f.api.listChatLinks(await f.human('dev'))).map((entry) => entry.id)).toEqual([other.id]);
+    // The project removes one with the bot's settings.
+    expect((await f.api.updateIncomingWebhook(await f.human('maint'), hook.id, { unlink: [other.id] })).linked).toEqual([]);
+    expect(await f.api.listChatLinks(await f.human('dev'))).toEqual([]);
+    // Deleting the bot takes its links.
+    await f.api.linkChatAccount(await f.human('dev'), (await new ChatLinks(f.store).offer(hook, { id: '7', name: 'Ada' })).token);
+    await f.api.deleteIncomingWebhook(await f.human('maint'), hook.id);
+    expect(await f.api.listChatLinks(await f.human('dev'))).toEqual([]);
+  });
+
+  it('a person’s links are read from their own index, which follows re-linking and removal', async () => {
+    const f = await fixture();
+    const { hook } = await f.connect();
+    const links = new ChatLinks(f.store);
+    const first = await links.redeem((await links.offer(hook, { id: '7', name: 'Ada' })).token, 'dev');
+    await links.redeem((await links.offer(hook, { id: '8', name: 'Grace' })).token, 'maint');
+    expect((await links.forUser('dev')).map((link) => link.id)).toEqual([first.id]);
+    // The same chat user linked to someone else leaves the first person's list.
+    const again = await links.redeem((await links.offer(hook, { id: '7', name: 'Ada' })).token, 'maint');
+    expect(await links.forUser('dev')).toEqual([]);
+    expect((await links.forUser('maint')).map((link) => link.platformUserId)).toEqual(['8', '7']);
+    await links.remove(again);
+    expect((await links.forUser('maint')).map((link) => link.platformUserId)).toEqual(['8']);
+    expect((await f.store.kvEntries('chat-link-user:')).map((row) => row.key)).toEqual([expect.stringMatching(/^chat-link-user:maint:/)]);
+    // A deleted bot takes its people's index rows too.
+    await f.api.deleteIncomingWebhook(await f.human('maint'), hook.id);
+    expect(await f.store.kvEntries('chat-link')).toEqual([]);
+  });
+
+  it('a deleted project or organization takes its links and open link tokens', async () => {
+    const f = await fixture();
+    const { hook } = await f.connect();
+    const links = new ChatLinks(f.store);
+    await links.redeem((await links.offer(hook, { id: '7', name: 'Ada' })).token, 'dev');
+    await links.offer(hook, { id: '8', name: 'Grace' });
+    const other = await f.store.createProject('Other', {}, f.organization.id);
+    const kept = await links.redeem((await links.offer({ id: 'hook_other', projectId: other.id, organizationId: f.organization.id }, { id: '7' })).token, 'dev');
+    // Two links (each with a row in its person's index) and an open offer (its token and the person's offer).
+    expect((await f.store.kvEntries('chat-link')).length).toBe(6);
+    await f.store.deleteProject(f.project.id);
+    expect((await f.store.kvEntries('chat-link')).map((row) => row.key)).toEqual([`chat-link-user:dev:${kept.id}`, `chat-link:hook_other:7`]);
+    expect((await links.forUser('dev')).map((link) => link.id)).toEqual([kept.id]);
+    await f.store.deleteOrganization(f.organization.id);
+    expect(await f.store.kvEntries('chat-link')).toEqual([]);
   });
 });
