@@ -424,6 +424,24 @@ describe('a Claude Code or Codex turn on the credit', () => {
     expect(turns).toBe(2);
   });
 
+  it('waits Out of compute when OpenRouter refuses Codex, as the adapter reports it (tavya-error 04bd4b786b22c16b)', async () => {
+    const { nativeProviderDiagnostic, providerFailure, providerFailureDisplay } = await import('../src/agent/limits.js');
+    const f: any = await turnFixture('codex', 'gpt-6.1-sol', async () => {
+      for (const key of keys.values()) key.usage = key.limit! - 0.5;
+      // What noteLimit in codex.ts builds from the app-server's error notification.
+      const native = { message: 'unexpected status 402 Payment Required: This request requires more credits, or fewer max_tokens. '
+        + 'You requested up to 65536 tokens, but can only afford 26885. To increase, visit https://openrouter.ai/workspaces/default/keys/c1066a83 '
+        + 'and adjust the key\'s total limit, url: https://openrouter.ai/api/v1/responses, cf-ray: a5bb77bd0d134d8a-FRA',
+        codexErrorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 402 } } };
+      const limit = { kind: 'quota' as const, permanence: 'hard' as const, provider: 'codex' as const, source: 'structured' as const,
+        diagnostic: nativeProviderDiagnostic(native, { model: 'openai/gpt-5.5', operation: 'app-server notification' }) };
+      throw providerFailure(providerFailureDisplay(limit), limit);
+    }, { included: true });
+    const failure = await f.run().catch((error: unknown) => error);
+    expect(failure).toMatchObject({ type: 'world-capacity', message: expect.stringMatching(/^Out of compute: /) });
+    expect(failure.message).not.toMatch(/openrouter\.ai|\[object Object\]/i);
+  });
+
   it('still says which login is missing when nothing serves it, and waits Out of compute without credit', async () => {
     const none = await turnFixture('claude', 'claude-opus-5-5', async () => ({ termination: { kind: 'success', status: 'end_turn' } }));
     expect((await none.order())[0]).toMatch(/^missing:/);

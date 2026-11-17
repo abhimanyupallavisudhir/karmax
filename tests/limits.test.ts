@@ -211,6 +211,18 @@ describe('classifyLimitError', () => {
     });
   });
 
+  // Codex's CodexErrorInfo is a tagged enum: unit variants arrive as strings,
+  // the rest as { variant: { httpStatusCode } }. String() of that read
+  // "[object Object]" in an escalation (tavya-error 04bd4b786b22c16b).
+  it('names an object-valued codexErrorInfo by its variant, never [object Object]', () => {
+    const diagnostic = nativeProviderDiagnostic({
+      message: 'unexpected status 402 Payment Required: This request requires more credits, or fewer max_tokens.',
+      codexErrorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 402 } },
+    }, { model: 'openai/gpt-5.5', operation: 'app-server notification' });
+    expect(diagnostic).toMatchObject({ code: 'responseTooManyFailedAttempts', status: 402 });
+    expect(nativeProviderDiagnostic({ message: 'x', code: { nested: true, other: 1 } })?.code).toBeUndefined();
+  });
+
   it('renders credential rejection truthfully instead of calling it a usage limit', () => {
     const failure = providerFailure('Codex credential rejected', {
       kind: 'credential', permanence: 'hard', provider: 'codex',
