@@ -262,38 +262,82 @@ export class Agent37Driver implements VmDriver {
    * Agent37 settles the meter hourly, so a day is reported once it ended two
    * hours ago; `final` (just before an instance is deleted, when it leaves the
    * instance list and its owner with it) reports its days so far, today's too.
+   * What Agent37 had not settled by then (measured: up to ~2 h, 43% of a test
+   * world's charge) is booked once that day is settled, from `deleted` (the
+   * rows `final` read): the day's total less what they booked, as `…:rest` rows.
    */
-  async usage(connection: ResolvedWorldProviderConnection, home: string, since?: number, final?: FinalUsage): Promise<ProviderUsageEvent[]> {
+  async usage(connection: ResolvedWorldProviderConnection, home: string, since?: number, final?: FinalUsage,
+    deleted: ProviderUsageEvent[] = []): Promise<ProviderUsageEvent[]> {
     const now = final?.at ?? Date.now();
-    const owners = new Map<string, Agent37Instance>();
-    for (const instance of await this.instances(connection))
-      if (instance.metadata?.karmaxHome === home && (!final || instance.id === final.ref.instance)) owners.set(instance.id, instance);
-    if (!owners.size) return [];
+    const owners = new Map<string, { owner: Pick<ProviderUsageEvent, 'sandboxId' | 'taskId' | 'organizationId'>; resources: Agent37Resources }>();
+    for (const instance of await this.instances(connection)) {
+      if (instance.metadata?.karmaxHome !== home || (final && instance.id !== final.ref.instance)) continue;
+      if (!final && ['deleted', 'deleting'].includes(instance.status)) continue; // its last reading's records own it
+      const labels = instance.metadata ?? {};
+      owners.set(instance.id, { owner: { sandboxId: instance.id, ...(labels.karmaxTaskId ? { taskId: labels.karmaxTaskId } : {}),
+        ...(labels.karmaxOrganizationId ? { organizationId: labels.karmaxOrganizationId } : {}) },
+      resources: instance.resources ?? { cpu: 2, memory: 4, disk: AGENT37_DEFAULT_DISK_GB } });
+    }
     const last = final ? now : now - 2 * 3_600_000 - 86_400_000;
-    const first = final ? now - FINAL_USAGE_WINDOW_MS : Math.max(since !== undefined ? since - 2 * 86_400_000 : 0, now - 7 * 86_400_000);
+    let first = final ? now - FINAL_USAGE_WINDOW_MS : Math.max(since !== undefined ? since - 2 * 86_400_000 : 0, now - 7 * 86_400_000);
+    // Deleted instances (no longer listed): their owner, shape, the days their
+    // last reading covered and what it booked on each.
+    const gone = new Map<string, { owner: Pick<ProviderUsageEvent, 'sandboxId' | 'taskId' | 'organizationId'>; resources: Agent37Resources;
+      covered: Set<string>; until: number; booked: Map<string, { compute: number; disk: number; awakeMs: number; diskMs: number }> }>();
+    if (!final) for (const event of deleted) {
+      if (owners.has(event.sandboxId)) continue;
+      const entry = gone.get(event.sandboxId) ?? { owner: { sandboxId: event.sandboxId, ...(event.taskId ? { taskId: event.taskId } : {}),
+        ...(event.organizationId ? { organizationId: event.organizationId } : {}) },
+      resources: { cpu: 2, memory: 4, disk: AGENT37_DEFAULT_DISK_GB }, covered: new Set<string>(), until: 0, booked: new Map() };
+      gone.set(event.sandboxId, entry);
+      first = Math.min(first, event.startedAt);
+      entry.until = Math.max(entry.until, event.endedAt);
+      if (event.record === 'owner') {
+        entry.resources = { cpu: event.cpu, memory: event.memoryMb / 1024, disk: event.diskGb ?? AGENT37_DEFAULT_DISK_GB };
+        for (let start = Date.parse(`${day(event.startedAt)}T00:00:00Z`); start <= event.endedAt; start += 86_400_000) entry.covered.add(day(start));
+        continue;
+      }
+      // Rows kept before owner records existed: the days they name.
+      const date = day(event.startedAt);
+      entry.covered.add(date);
+      const booked = entry.booked.get(date) ?? { compute: 0, disk: 0, awakeMs: 0, diskMs: 0 };
+      if (event.kind === 'disk') { booked.disk += event.costMicros ?? 0; booked.diskMs += event.activeMs; }
+      else { booked.compute += event.costMicros ?? 0; booked.awakeMs += event.activeMs; }
+      entry.booked.set(date, booked);
+    }
+    if (!owners.size && !gone.size) return [];
     const events: ProviderUsageEvent[] = [];
     for (let start = Date.parse(`${day(first)}T00:00:00Z`); start <= last; start += 86_400_000) {
       const date = day(start);
       const usage = await this.api(connection)('GET', `/usage?from=${date}&to=${date}`) as Agent37Usage;
       for (const row of usage.instances ?? []) {
-        const instance = owners.get(row.id);
-        if (!instance || !row.compute_micros) continue;
-        const labels = instance.metadata ?? {};
-        const resources = instance.resources ?? { cpu: 2, memory: 4, disk: AGENT37_DEFAULT_DISK_GB };
-        const owner = { sandboxId: row.id, ...(labels.karmaxTaskId ? { taskId: labels.karmaxTaskId } : {}),
-          ...(labels.karmaxOrganizationId ? { organizationId: labels.karmaxOrganizationId } : {}) };
-        const end = Math.min(start + 86_400_000, now);
+        const known = owners.get(row.id) ?? gone.get(row.id);
+        if (!known || !row.compute_micros) continue;
+        const { owner, resources } = known;
+        const deletedOne = owners.has(row.id) ? undefined : gone.get(row.id)!;
+        const end = Math.min(start + 86_400_000, now, deletedOne?.until ?? now);
         // Agent37's day is one sum. Its running minutes at the published rate
         // are the compute; the rest is the disk it held all day.
         const awakeMs = (row.awake_minutes ?? 0) * 60_000;
         const compute = Math.min(row.compute_micros,
           Math.round(awakeMs / 3_600_000 * agent37ComputeDollarsPerHour({ cpu: resources.cpu, memoryMb: resources.memory * 1024 }) * 1e6));
-        if (compute > 0) events.push({ id: `${row.id}:${date}`, ...owner, startedAt: start, endedAt: end, activeMs: awakeMs,
-          cpu: resources.cpu, memoryMb: resources.memory * 1024, costMicros: compute });
-        if (row.compute_micros > compute) events.push({ id: `${row.id}:${date}:disk`, ...owner, kind: 'disk', startedAt: start, endedAt: end,
-          activeMs: end - start, cpu: 0, memoryMb: 0, diskGb: resources.disk, costMicros: row.compute_micros - compute });
+        // A deleted instance: what its last reading did not see, once the day is
+        // settled, on the days that reading covered (earlier ones were booked whole).
+        if (deletedOne && !deletedOne.covered.has(date)) continue;
+        const booked = deletedOne ? deletedOne.booked.get(date) ?? { compute: 0, disk: 0, awakeMs: 0, diskMs: 0 } : undefined;
+        const suffix = booked ? ':rest' : '';
+        const restCompute = compute - (booked?.compute ?? 0);
+        const restDisk = row.compute_micros - compute - (booked?.disk ?? 0);
+        if (restCompute > 0) events.push({ id: `${row.id}:${date}${suffix}`, ...owner, startedAt: start, endedAt: end,
+          activeMs: Math.max(0, awakeMs - (booked?.awakeMs ?? 0)), cpu: resources.cpu, memoryMb: resources.memory * 1024, costMicros: restCompute });
+        if (restDisk > 0) events.push({ id: `${row.id}:${date}:disk${suffix}`, ...owner, kind: 'disk', startedAt: start, endedAt: end,
+          activeMs: Math.max(0, end - start - (booked?.diskMs ?? 0)), cpu: 0, memoryMb: 0, diskGb: resources.disk, costMicros: restDisk });
       }
     }
+    // Before a delete, whose it was: the ledger settles later (see above).
+    if (final) for (const [id, { owner, resources }] of owners)
+      events.push({ id: `${id}:owner`, ...owner, record: 'owner', startedAt: first, endedAt: now, activeMs: 0,
+        cpu: resources.cpu, memoryMb: resources.memory * 1024, diskGb: resources.disk, costMicros: 0 });
     return events;
   }
 
@@ -519,6 +563,7 @@ interface Agent37Instance {
   metadata?: Record<string, string> | null;
   resources?: { cpu: number; memory: number; disk: number };
 }
+type Agent37Resources = { cpu: number; memory: number; disk: number };
 interface Agent37Usage { instances?: Array<{ id: string; compute_micros?: number; awake_minutes?: number }> }
 
 /** `kx-<home>-<world>`: recognisably this deployment's in the workspace's list. */

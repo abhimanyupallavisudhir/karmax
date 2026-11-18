@@ -928,6 +928,26 @@ describe.each(storeBackends)('Store ($name)', ({ name, open }) => {
     expect((await store.getTask(second.id))!.params.confirm).toEqual({ mode: 'human' }); // mirrored onto every attempt
   });
 
+  // #965/#976, 2026-11-17: who reviews the error fixer's runs could not be
+  // changed — its series is no draft, yet it never runs (only its runs do,
+  // each its own intent) and no Review gate of it has ever played.
+  it('lets the review route of a task that has not started change: a series, or a task waiting for its trigger', async () => {
+    const p = (await store.createProject('Acme'));
+    const make = (params: Record<string, unknown>) => store.createTask({ projectId: p.id, title: 'Fix', workflow: 'software-dev',
+      workflowVersion: '1.30.0', params: { prompt: 'fix', ...params }, confirmer: { layers: [{ kind: 'human', audience: ['@creator'] }] } });
+    const series = (await make({ repeatable: true, triggerState: 'armed', triggers: [{ kind: 'event', type: 'app.error', recurring: true }] }));
+    const armed = (await make({ triggerState: 'armed', triggers: [{ kind: 'schedule', at: '2027-01-01T00:00:00Z' }] }));
+    const agent = { layers: [{ kind: 'agent', maxRevisions: 3 }] };
+    for (const task of [series, armed]) {
+      (await store.setIntentConfirmer(task.intentId!, 'confirm', agent));
+      expect((await store.attemptGroup(task.id))!.confirmer).toEqual(agent);
+      expect((await store.getTask(task.id))!.params.confirm).toEqual(agent);
+    }
+    // Once it has fired it runs, and its gate may have played: the form may not re-route it.
+    (await store.updateTaskParams(armed.id, { ...(await store.getTask(armed.id))!.params, triggerState: 'fired' }));
+    await expect((async () => (await store.setIntentConfirmer(armed.intentId!, 'confirm', { layers: [] })))()).rejects.toThrow(/shared/);
+  });
+
   it.skipIf(name !== 'SQLite')('does not turn persisted attempts into top-level tasks on restart', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-attempt-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
