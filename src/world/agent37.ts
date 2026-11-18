@@ -3,7 +3,7 @@ import { Duplex } from 'node:stream';
 import { Client, type ClientChannel } from 'ssh2';
 import { WebSocket, createWebSocketStream } from 'ws';
 import type { MachineShape } from '../domain/computer.js';
-import type { ComputerLimits } from '../domain/computer-limits.js';
+import { AGENT37_SIZES, type ComputerLimits } from '../domain/computer-limits.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
 import type { ProviderUsageEvent, WorldLifecycleState } from './types.js';
 import type { VmAllocation, VmBootKeys, VmDriver, VmListing, VmShape } from './vm/provider.js';
@@ -42,8 +42,9 @@ export const AGENT37_DEFAULT_REGION = 'eu';
 export const AGENT37_REGIONS = ['us', 'eu', 'ap-south'] as const;
 export const AGENT37_DEFAULT_DISK_GB = 20;
 export const AGENT37_MAX_DISK_GB = 100;
-/** The four shapes every instance type offers (docs: instance-sizing), memory in GB. */
-export const AGENT37_SHAPES = [{ cpu: 2, memory: 4 }, { cpu: 4, memory: 8 }, { cpu: 4, memory: 16 }, { cpu: 4, memory: 32 }] as const;
+/** The shapes a `vm` may have (AGENT37_SIZES), memory in GB. */
+export const AGENT37_SHAPES = AGENT37_SIZES.map((size) => ({ cpu: size.cpu, memory: size.memoryMb / 1024 }));
+const LARGEST = AGENT37_SHAPES[AGENT37_SHAPES.length - 1]!;
 /** docs: billing (checked 2026-11-16): per month (730 h) at the default type's
  * rate; a `vm` meters compute at 2.5×, disk unchanged. */
 const MONTH_HOURS = 730;
@@ -77,7 +78,7 @@ export function agent37Shape(resources: { cpu?: number; memoryMb?: number } | un
   const cpu = resources?.cpu ?? 2;
   const memoryMb = resources?.memoryMb ?? 4096;
   const shape = AGENT37_SHAPES.find((candidate) => candidate.cpu >= cpu && candidate.memory * 1024 >= memoryMb);
-  if (!shape) throw new Error(`Agent37 machines have at most 4 CPUs and 32 GB of memory, not ${cpu} CPU · ${Math.round(memoryMb / 1024)} GB`);
+  if (!shape) throw new Error(`Agent37 machines have at most ${LARGEST.cpu} CPUs and ${LARGEST.memory} GB of memory, not ${cpu} CPU · ${Math.round(memoryMb / 1024)} GB`);
   return { cpu: shape.cpu, memory: shape.memory };
 }
 
@@ -350,8 +351,8 @@ export class Agent37Driver implements VmDriver {
    */
   async limits(connection: ResolvedWorldProviderConnection): Promise<ComputerLimits> {
     const billing = await this.api(connection)('GET', '/billing') as { memory_limit_gb?: number };
-    const smallest = AGENT37_SHAPES[0].memory;
-    return { cpu: 4, memoryMb: 32_768, diskGb: AGENT37_MAX_DISK_GB,
+    const smallest = AGENT37_SHAPES[0]!.memory;
+    return { cpu: LARGEST.cpu, memoryMb: LARGEST.memory * 1024, diskGb: AGENT37_MAX_DISK_GB,
       ...(billing.memory_limit_gb ? { pool: { machines: Math.max(1, Math.floor(billing.memory_limit_gb / smallest)) } } : {}),
       checkedAt: Date.now() };
   }

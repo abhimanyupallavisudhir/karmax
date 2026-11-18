@@ -81,6 +81,15 @@ describe('the rule', () => {
     expect(route.candidates.map((candidate) => `${candidate.provider}:${candidate.funding}`))
       .toEqual(['e2b:own', 'hetzner:managed', 'gcp:managed', 'aws:managed']);
     expect(route.candidates[1]!.priceMicrosPerHour).toBe(listPriceMicrosPerHour('hetzner', { cpu: 2, memoryMb: 4096 }));
+    // Agent37 is the cheapest managed machine up to 4 CPU / 32 GB (prices 2026-11-18,
+    // Hetzner at the CPX types fsn1 actually sells); at 8 CPU it sells only 8/64,
+    // which costs more than Hetzner's 8/16.
+    const managed = [option('hetzner', 'managed'), option('fly', 'managed', { region: 'eu' }), option('agent37', 'managed'),
+      option('gcp', 'managed'), option('aws', 'managed')];
+    for (const size of [{}, { cpu: 2, memoryMb: 4096 }, { cpu: 4, memoryMb: 8192, diskGb: 50 }, { cpu: 4, memoryMb: 32_768 }])
+      expect(rankComputeOptions(size, managed).candidates[0]!.provider).toBe('agent37');
+    expect(rankComputeOptions({ cpu: 8, memoryMb: 16_384 }, managed).candidates.map((candidate) => candidate.provider).slice(0, 2))
+      .toEqual(['hetzner', 'agent37']);
     // Two of the organization's own: the cheaper first.
     expect(rankComputeOptions({}, [option('e2b', 'own'), option('hetzner', 'own')]).candidates.map((candidate) => candidate.provider))
       .toEqual(['hetzner', 'e2b']);
