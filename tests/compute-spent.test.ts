@@ -54,7 +54,7 @@ describe('spent compute credit', () => {
     const [spent] = await f.store.listInbox('owner', f.organization.id);
     expect(spent!.subject).toMatchObject({ kind: 'compute', stage: 'spent', usedMicros: 5_200_000, creditMicros: 5_000_000,
       hibernateAt: T + 3 * DAY, computers: 1 });
-    expect(f.sent[0]!.subject).toBe('Acme has used this month\'s tavya compute');
+    expect(f.sent[0]!.subject).toBe('Acme has used this month\'s tavya credits');
     expect(f.sent[0]!.text).toMatch(/Its 1 parked computer keeps its disk until 2026-10-18 12:00 UTC, then it is hibernated/);
     expect(f.sent[0]!.text).toMatch(/files Git ignores \(installed dependencies, build output, caches\) are deleted/);
     expect(await notifyComputeCredit(f.deps, T + DAY)).toBe(0);

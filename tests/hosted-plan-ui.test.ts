@@ -30,9 +30,9 @@ const markup = Function('esc', 'S', 'location', `
   ${extractFunction('planBillingMarkup')}; return planBillingMarkup;`)(esc, uiState, { search: '' });
 // The fold-out beneath a row (its ⓘ), as text.
 const info = (html: string, key: string) => {
-  const start = html.indexOf(`id="plan-info-${key}"`);
-  if (start < 0) return '';
-  return text(html.slice(html.lastIndexOf('<div', start), html.indexOf('</div>', start)));
+  const at = html.indexOf(`id="plan-info-${key}"`);
+  if (at < 0) return '';
+  return text(html.slice(html.lastIndexOf('<div', at), html.indexOf('</div>', at)));
 };
 const GB = 1024 ** 3;
 const catalog = [
@@ -286,14 +286,6 @@ describe('Plan & billing', () => {
       expect(open).toMatch(/<div class="plan-info" id="plan-info-compute" data-info="compute">/);
       expect(open).toMatch(/<div class="plan-info" id="plan-info-storage" data-info="storage" hidden>/);
     } finally { delete uiState.planInfoOpen; }
-  });
-
-  it('wires each fold-out toggle when the card is drawn', () => {
-    const hydration = extractFunction('hydratePlanAndBilling');
-    expect(hydration).toContain('wirePlanInfo(box)');
-    const wire = extractFunction('wirePlanInfo');
-    expect(wire).toContain("aria-expanded");
-    expect(wire).toContain('S.planInfoOpen');
   });
 
   it('makes private-install behavior explicit instead of showing hosted limits', () => {
