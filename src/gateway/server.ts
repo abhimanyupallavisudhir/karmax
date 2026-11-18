@@ -1,6 +1,5 @@
 import { computerDefaults, saveOrganizationComputer, saveProjectComputer, splitComputerValues } from '../platform/computer-settings.js';
 import { type AutonomyScope, type ProjectAutonomy } from '../domain/autonomous-projects.js';
-import { freeCoordinatorName, organizationCoordinatorProject, ORGANIZATION_COORDINATOR_KEY } from '../platform/organization-coordinator.js';
 import { machineWaits, type MachineWait } from '../world/machine-wait.js';
 import { REPOSITORY_ROUTE } from '../world/resource-repository.js';
 import { clientAddress, ClientRequestLimits } from './client-address.js';
@@ -876,8 +875,6 @@ export class Gateway {
   private loopbackUrl?: string;
   private wikiRemotesReady = new Set<string>();
   private wikiRemotesProvisioning = new Set<string>();
-  /** Co-ordinator projects being made, one per organization at a time. */
-  private coordinatorProjects = new Map<string, Promise<Project>>();
   private wikiRemoteRetryAfter = new Map<string, number>();
   /** Holds CDP sessions across a passkey enroll/login click (PLAN-passwords §8). */
   private passkeys?: import('../autonomy/passkey.js').PasskeyManager;
@@ -2903,7 +2900,7 @@ export class Gateway {
           vault: (await new VaultItems(store, this.deps.broker, undefined, organizationId).list())
             .some((item) => item.type === 'login' && item.fields.includes('password')),
           card: (await store.listOrganizationCards(organizationId)).length > 0,
-          project: (await store.listProjects()).some((project) => project.organizationId === organizationId),
+          project: (await store.listOrganizationProjects(organizationId)).some((project) => !project.coordinator),
         };
         if (finishReplay && record?.replay && hostedOnboardingRequired(facts).every(Boolean)) {
           record = { display: record.display, completedAt: Date.now() };
@@ -3317,13 +3314,13 @@ export class Gateway {
           (await this.enableHostedOnboarding(subject.userId, organization.id));
           (await startComputeTrial(store, organization.id, subject.userId));
         }
+        // Every organization has a co-ordinator project (where Ask's tasks live).
+        const { project } = await store.ensureOrganizationCoordinatorProject(organization.id);
         if (b.autonomous !== true) return this.json(res, 200, organization);
-        // An autonomous organization starts with a project its co-ordinator runs
-        // everything from, set up with the organization's whole authority.
-        let project = await this.organizationCoordinator(organization.id, subject.userId);
+        // An autonomous organization's co-ordinator runs everything from it, set
+        // up with the organization's whole authority.
         (await store.setProjectMembership(project.id, { kind: 'user', userId: subject.userId }, 'owner'));
-        await this.installDefaultTasks(project);
-        project = (await store.getProject(project.id)) ?? project;
+        await this.ensureProjectWiki(project, subject.userId);
         const inOrganization = (await this.auth(req, undefined, organization.id))?.apiToken ?? token;
         return this.json(res, 200, { ...organization, project, ...(await this.autonomous(inOrganization, project.id, 'organization')) });
       }
@@ -3340,7 +3337,7 @@ export class Gateway {
           // Someone who joins through an invitation came for that team: it becomes
           // where they land, unless their own workspace already holds projects.
           const home = (await store.defaultOrganization(subject.userId));
-          if (!home || (home.kind === 'personal' && !(await store.listOrganizationProjects(home.id)).length))
+          if (!home || (home.kind === 'personal' && !(await store.listOrganizationProjects(home.id)).some((project) => !project.coordinator)))
             (await store.setDefaultOrganization(subject.userId, membership.organizationId));
           void this.deps.subscriptions?.syncSeats(membership.organizationId).catch((error) =>
             console.error('[subscription] seat sync failed:', error instanceof Error ? error.message : String(error)));
@@ -4097,7 +4094,8 @@ export class Gateway {
         const b = await this.body(req);
         const prompt = typeof b.prompt === 'string' ? b.prompt.trim() : '';
         if (!prompt) return this.json(res, 400, { error: 'prompt is required' });
-        const project = await this.organizationCoordinator(organizationId, callerIdentity.humanSubject?.userId);
+        // Every organization has one; one older than that gets it now.
+        const { project } = await store.ensureOrganizationCoordinatorProject(organizationId);
         await this.wikiForTaskStart(project, callerIdentity.humanSubject?.userId);
         const task = await api.createTask(token, { projectId: project.id, workflow: 'software-dev', prompt, ownAuthority: true,
           ...(Array.isArray(b.images) ? { images: b.images } : {}), ...(Array.isArray(b.files) ? { files: b.files } : {}),
@@ -4809,6 +4807,7 @@ export class Gateway {
         if (method === 'DELETE') {
           const project = await store.getProject(id);
           if (!project) return this.json(res, 404, { error: 'project not found' });
+          if (project.coordinator) return this.json(res, 400, { error: `The ${project.name} project belongs to the organization and cannot be deleted.` });
           // Named, as an organization's deletion is: one confirm() (that Enter
           // accepts) once nearly deleted tavya's own project (#737, #747).
           if (String((await this.body(req))?.confirmName ?? '') !== project.name)
@@ -9898,29 +9897,6 @@ export class Gateway {
   /** Set a just-created project up to run itself (wiki features/autonomy). The
    * project stays when that fails; the answer says why, for its creator to retry
    * from the project (POST /api/projects/:id/autonomy). */
-  /** The organization's co-ordinator project (src/platform/organization-coordinator.ts),
-   * made the first time it is needed: the place work for the whole organization
-   * lives, reached through the organization's authority (no membership is added:
-   * whoever acts for the organization reaches it, nobody else). */
-  private async organizationCoordinator(organizationId: string, userId?: string): Promise<Project> {
-    const existing = await organizationCoordinatorProject(this.deps.store, organizationId);
-    if (existing) return existing;
-    let making = this.coordinatorProjects.get(organizationId);
-    if (!making) {
-      making = (async () => {
-        const again = await organizationCoordinatorProject(this.deps.store, organizationId);
-        if (again) return again;
-        const name = freeCoordinatorName((await this.deps.store.listOrganizationProjects(organizationId)).map((project) => project.name));
-        const project = await this.deps.store.createProject(name, normalizeConfig({}, false, this.deps.hosted === true), organizationId);
-        await this.deps.store.kvSet(ORGANIZATION_COORDINATOR_KEY(organizationId), project.id);
-        await this.ensureProjectWiki(project, userId);
-        return (await this.deps.store.getProject(project.id)) ?? project;
-      })().finally(() => this.coordinatorProjects.delete(organizationId));
-      this.coordinatorProjects.set(organizationId, making);
-    }
-    return making;
-  }
-
   private async autonomous(token: string, projectId: string, scope: AutonomyScope): Promise<{ autonomy?: ProjectAutonomy; autonomyError?: string }> {
     try { return { autonomy: await this.deps.api.makeAutonomous(token, projectId, scope) }; }
     catch (error) { return { autonomyError: error instanceof Error ? error.message : String(error) }; }
@@ -11771,6 +11747,7 @@ export class Gateway {
         name: label || 'Personal', kind: 'personal', ownerUserId: userId }));
       (await this.deps.store.setDefaultOrganization(userId, organization.id));
       (await this.deps.authorization?.bootstrapOrganizationOwner(`user:${userId}`, userId, organization.id));
+      (await this.deps.store.ensureOrganizationCoordinatorProject(organization.id));
       (await this.deps.resources?.storageLocationService()?.ensureManaged(organization.id));
       (await inheritPersonalGithubProfile(this.deps.store, this.deps.broker, userId));
       (await this.linkOwnGithubInstallation(userId, organization));

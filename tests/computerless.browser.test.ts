@@ -146,6 +146,11 @@ describe('a task without a computer, in the console', () => {
     await expect.poll(async () => (await allTasks()).find((task) => task.params?.prompt === 'And what about E2B?')?.projectId,
       { timeout: 15_000 }).toBe(coordinator.id);
     expect((await store.listProjects()).filter((p) => p.name.startsWith('Co-ordinator'))).toHaveLength(1);
+    // It is the organization's for good: its settings offer no rename, move or delete.
+    await page.goto(`${base}/personal/co-ordinator/settings`);
+    await page.locator('#project-advanced').waitFor({ state: 'attached' });
+    await expect.poll(() => page.locator('.setting-row', { hasText: 'Co-ordinator project' }).count(), { timeout: 10_000 }).toBe(1);
+    expect(await page.locator('#delete-project, #move-project, #rename-project').count()).toBe(0);
     expect(errors).toEqual([]);
   });
 

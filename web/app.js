@@ -503,9 +503,15 @@ function slugify(s) {
 function projectSlug(p) { return p ? slugify(p.name) : ''; }
 function projectPath(p) { return p ? [p.folder, p.name].filter(Boolean).join('/') : ''; }
 function projectById(pid) { return (S.projects || []).find((p) => p.id === pid); }
+// The organization's own projects come before its co-ordinator project (where
+// Ask's conversations live), which is only the answer when it is the only one.
 function firstProjectForOrganization(organizationId) {
-  return (S.projects || []).find((p) => p.organizationId === organizationId);
+  return ordinaryProjectForOrganization(organizationId) || (S.projects || []).find((p) => p.organizationId === organizationId);
 }
+function ordinaryProjectForOrganization(organizationId) {
+  return (S.projects || []).find((p) => p.organizationId === organizationId && !p.coordinator);
+}
+const COORDINATOR_PROJECT_TIP = 'The organization’s own project: what you Ask lives here. It can’t be renamed, moved or deleted.';
 // Resolve a URL slug back to a project, optionally scoped to one organization
 // (project slugs need only be unique within their org). Matches the slugified name
 // (the common, human case), falling back to a raw project id for safety. On a slug
@@ -7748,7 +7754,7 @@ function newTaskProjectId(organizationId = S.organizationId) {
   const fromQuery = named && (S.projects || []).find((p) => p.organizationId === organizationId && projectSlug(p) === named)?.id;
   let remembered = null;
   try { remembered = JSON.parse(localStorage.getItem(NEW_TASK_PROJECT_KEY) || '{}')[organizationId]; } catch {}
-  return fromQuery || inOrganization(remembered) || inOrganization(S.projectId) || firstProjectForOrganization(organizationId)?.id || null;
+  return fromQuery || inOrganization(remembered) || inOrganization(S.projectId) || ordinaryProjectForOrganization(organizationId)?.id || null;
 }
 function rememberNewTaskProject(projectId) {
   const organizationId = projectById(projectId)?.organizationId;
@@ -9256,7 +9262,7 @@ function withNewTaskProject(then) {
     // A task lives in a project: with none yet, make one first.
     return projectId ? then(projectId) : toast('Create a project first', false, { label: 'New project', fn: () => newProject() });
   }
-  if (!(S.projects || []).some((project) => project.organizationId === S.organizationId)) {
+  if (!ordinaryProjectForOrganization(S.organizationId)) {
     return toast('Create a project first', false, { label: 'New project', fn: () => newProject() });
   }
   pickProject('New task in…', then);
@@ -22262,6 +22268,8 @@ function settingsView(proj) {
       <div class="setting-rows" id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
     <div class="card" data-settings-advanced hidden><div class="setting-rows">
+      ${proj.coordinator ? `<div class="setting-row"><span class="setting-label">Co-ordinator project ${policyTip(COORDINATOR_PROJECT_TIP)}</span>
+        <span class="setting-value setting-muted">Permanent</span></div>` : `
       <div class="setting-row" data-settings-access="project" data-unsaved hidden><span class="setting-label">Name ${policyTip('Use / to put the project in folders, e.g. Clients/Website.')}</span>
         <span class="setting-value"><input id="project-name" class="setting-input" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders"></span>
         <span class="setting-actions"><button class="btn sm primary" id="rename-project" data-unsaved-save>Save</button></span></div>
@@ -22270,7 +22278,7 @@ function settingsView(proj) {
         <span class="setting-actions"><button class="btn sm" id="move-project">Move…</button></span></div>
       <div class="setting-row danger" data-settings-access="projectDelete" hidden><span class="setting-label">Delete project ${policyTip('Removes the project and all its tasks.')}</span>
         <span class="setting-value setting-muted">Permanent</span>
-        <span class="setting-actions"><button class="btn sm danger" id="delete-project">Delete…</button></span></div>
+        <span class="setting-actions"><button class="btn sm danger" id="delete-project">Delete…</button></span></div>`}
     </div></div>
     <div class="card" id="project-experimental"><div class="section-h">Experimental</div><div id="project-avatar-settings">Loading…</div></div>
     </div></div></div>`;
