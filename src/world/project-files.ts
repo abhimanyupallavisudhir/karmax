@@ -176,6 +176,21 @@ export class ProjectFiles {
     return (await this.locate(projectId, relative, options)).stat();
   }
 
+  /** Where a path a task's agent cited sits in the task's view of Files: the
+   * first of its readings (`worldFilesPaths`) that is there, else the most
+   * literal one, so Files names what is missing. */
+  async citedPath(projectId: string, taskId: string, cited: string, data: boolean): Promise<string> {
+    const task = await this.deps.store.getTask(taskId);
+    if (!task || task.projectId !== projectId) throw new FileNotFoundError('No such task in this project.');
+    const readings = worldFilesPaths(((await this.deps.store.currentWorld(taskId)) ?? task.lastView?.world) as WorldHandle | undefined, cited);
+    if (readings.length === 1) return readings[0]!;
+    for (const reading of readings) {
+      try { await this.stat(projectId, reading, { data, view: { kind: 'task', taskId } }); return reading; }
+      catch (error) { if (!(error instanceof FileNotFoundError)) return reading; }
+    }
+    return readings[0]!;
+  }
+
   /** A file's bytes. `consume` runs while the source is held open (a Git
    * mirror stays borrowed, a live world open, until it settles). */
   async open<T>(projectId: string, relative: string, options: FileReadOptions, consume: (file: OpenedFile) => Promise<T>): Promise<T> {
@@ -811,15 +826,36 @@ function safeSame(a: string, b: string): boolean {
  * (`../<root's name>/docs/a.md` from the root is `docs/a.md`); a path that
  * ends up outside the world throws. */
 export function worldFilesPath(handle: WorldHandle | undefined, cited: string): string {
+  return worldFilesPaths(handle, cited)[0]!;
+}
+
+/** Every place a cited path may mean, most literal first: from the working
+ * folder, then (a relative path) from each checkout, development before the
+ * wiki. Agents link files "in their repository" while working at a world root
+ * that holds several (rw-data#3: `../rw-data/docs/a.md` was the repository
+ * `rw-data`'s). Readings outside the world are dropped; none left throws. */
+export function worldFilesPaths(handle: WorldHandle | undefined, cited: string): string[] {
   const value = String(cited).replace(/\\/g, '/');
   if (!value) throw new Error('missing path');
   const root = String(handle?.root ?? '').replace(/\/+$/, '');
   // A handle naming no folders: the path is already root-relative.
-  if (!root) return splitPath(value).join('/');
-  const workdir = worldWorkingDirectory(handle!).replace(/\\/g, '/').replace(/\/+$/, '');
-  const resolved = path.posix.resolve(workdir, value);
-  if (resolved !== root && !resolved.startsWith(`${root}/`)) throw new Error('That file is outside the task’s world.');
-  return splitPath(resolved.slice(root.length + 1)).join('/');
+  if (!root) return [splitPath(value).join('/')];
+  const posix = (dir: string) => dir.replace(/\\/g, '/').replace(/\/+$/, '');
+  const bases = [posix(worldWorkingDirectory(handle!))];
+  if (!path.posix.isAbsolute(value)) {
+    const repos = worldRepos(handle!);
+    for (const repo of [...repos.filter((r) => r.role !== 'project-wiki'), ...repos.filter((r) => r.role === 'project-wiki')])
+      if (repo.root) bases.push(posix(repo.root));
+  }
+  const found: string[] = [];
+  for (const base of bases) {
+    const resolved = path.posix.resolve(base, value);
+    if (resolved !== root && !resolved.startsWith(`${root}/`)) continue;
+    const relative = splitPath(resolved.slice(root.length + 1)).join('/');
+    if (!found.includes(relative)) found.push(relative);
+  }
+  if (!found.length) throw new Error('That file is outside the task’s world.');
+  return found;
 }
 
 /** `a//b/` → ['a', 'b']; `..` and `.` are refused, not resolved. */
