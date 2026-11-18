@@ -233,7 +233,9 @@ describe.skipIf(!sshdAvailable)('Agent37 worlds (fake Sandbox API, real tunnel a
     const b = [...agent37.instances.keys()].at(-1)!;
     agent37.usage.set(day(0), [{ id: a, compute_micros: micros(5), awake_minutes: 5 }]);
     await booked.destroy(first.handle as WorldHandle);
-    await booked.destroy(second.handle as WorldHandle);
+    // The second through the open world, as a task that ends awake deletes it:
+    // its record must be kept as well (production, 2026-11-17).
+    await second.destroy();
     const today = (await booked.listUsageEvents('org_a')).events;
     expect(today.map((event) => event.id)).toEqual([`${a}:${day(0)}`]);
     // Two days later (the deletes' records moved back): Agent37 has settled the
