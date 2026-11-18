@@ -436,6 +436,10 @@ export interface ProviderUsageEvent {
   /** The provider's own price for this execution, when it publishes one
    * (Fly's per-second formula, Hetzner's hourly price). Absent: karmax's rates. */
   costMicros?: number;
+  /** `owner`: not a charge, never booked. Who owned a world deleted lately,
+   * its shape and the days its last reading covered (`startedAt`–`endedAt`),
+   * kept so a ledger that settles later can still be read for it (Agent37). */
+  record?: 'owner';
 }
 
 /**

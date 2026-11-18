@@ -138,6 +138,38 @@ it('a large upload shows its bytes going up, and survives moving to another fold
   });
 });
 
+it('a folder of thousands of files uploads (no cap), recommended as data, and lands as one commit when kept in Git', async () => {
+  const s = await setup();
+  const { page, step } = s;
+  const folder = path.join(s.local, 'bot_data');
+  const count = 2500; // over the old 2,000-file cap that refused it outright
+  for (let i = 0; i < count; i++) {
+    const sub = path.join(folder, `part-${i % 5}`);
+    if (i < 5) fs.mkdirSync(sub, { recursive: true });
+    fs.writeFileSync(path.join(sub, `item-${i}.json`), `{"i":${i}}\n`);
+  }
+  await step('the dialog recommends data for a big folder; choosing Git commits it all at once', async () => {
+    await s.open('site');
+    const before = s.tree().length;
+    await page.locator('#files-upload').click();
+    const chooser = page.waitForEvent('filechooser');
+    await page.locator('.files-menu button', { hasText: 'A folder' }).click();
+    await (await chooser).setFiles(folder);
+    const dialog = page.locator('dialog.files-upload-dialog');
+    await dialog.waitFor({ timeout: 30_000 });
+    const row = dialog.locator('.files-upload-row', { hasText: 'bot_data' });
+    expect(await row.locator('.files-upload-meta').innerText()).toMatch(/2,500 files.*A large folder/);
+    expect(await row.locator('[data-keep="data"]').getAttribute('aria-checked')).toBe('true');
+    await row.locator('[data-keep="git"]').click();
+    await dialog.locator('.files-upload-go').click();
+    await page.locator('.files-tray.done').waitFor({ timeout: 120_000 });
+    expect(await page.locator('.files-tray.done').innerText()).toContain('Uploaded 2,500 files');
+    await page.locator('#files-body .files-row', { hasText: 'bot_data' }).waitFor();
+    expect(s.tree().length).toBe(before + count);
+    expect(sh(s.bare, 'log', '-1', '--format=%s', 'main').trim()).toBe(`Add or update ${count} files`);
+  });
+}, 180_000); // 2,500 uploads through a browser: about a minute on a CI runner.
+
 it('Cancel stops an upload: nothing lands, and what was already sent is dropped', async () => {
   const s = await setup();
   const { page, step, context } = s;
