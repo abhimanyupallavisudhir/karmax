@@ -109,6 +109,8 @@ const SCOPED = new Map(([
   ['UPDATE human_delegations SET revokedAt=? WHERE id=? AND revokedAt IS NULL', (p) => ({ delegations: [text(p[1])] })],
   // A delegation narrowed, or handed up to another parent, touches itself.
   ['UPDATE human_delegations SET json=? WHERE id=? AND revokedAt IS NULL', (p) => ({ delegations: [text(p[1])] })],
+  // A delegation made to last (extendDelegationsWithoutExpiry) widens nothing it held.
+  ['UPDATE human_delegations SET json=?, expiresAt=? WHERE id=? AND revokedAt IS NULL', (p) => ({ delegations: [text(p[2])] })],
   // Purges empty or delete rows that already authorize nothing (expired or revoked).
   ['UPDATE human_delegations SET json=? WHERE(expiresAt<=? OR revokedAt IS NOT NULL)AND json<>?', () => undefined],
   ['DELETE FROM human_delegations WHERE json=? AND COALESCE(revokedAt,expiresAt)<=?', () => undefined],

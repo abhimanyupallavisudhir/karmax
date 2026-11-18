@@ -10,6 +10,7 @@ const LOCAL_KINDS_SQL = LOCAL_WORLD_KINDS.map((kind) => `'${kind}'`).join(',');
 import { AdmissionBackpressureError } from '../domain/admission-error.js';
 import { utf8Tail } from '../util/utf8-tail.js';
 import * as __asyncCollections from '../util/async-collections.js';
+import { DELEGATION_NO_EXPIRY } from '../domain/delegation-expiry.js';
 import { humanAudience, reviewAudience, runAudience, runAudienceAsync } from './task-audience.js';
 import { credentialIds, taskSelectionTimes, decayVaultUsage, type VaultSelectionUsage, type VaultUsage } from '../util/vault-usage.js';
 import { assertAccountNameAllowed, canonicalAccountName } from '../domain/account-names.js';
@@ -1372,6 +1373,10 @@ export class Store {
         if (current?.expr?.replace(/::text/g, '') === `karmax_seq('${table}', ${ns})`) continue;
         await this.db.exec(`ALTER TABLE ${table} ALTER COLUMN seq SET DEFAULT karmax_seq('${table}', ${ns})`);
       }
+    }
+    if (!(await this.kvGet('migration:delegations-without-expiry'))) {
+      await this.extendDelegationsWithoutExpiry();
+      await this.kvSet('migration:delegations-without-expiry', '1');
     }
     if (!(await this.kvGet('migration:github-pr-observations'))) {
       await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
@@ -6038,6 +6043,13 @@ export class Store {
     return ids.length;
   }
 
+  /** The people who asked to cancel a task (`task.cancel-requested` `by`). */
+  private async cancellersOf(taskId: string): Promise<string[]> {
+    return ((await this.db.prepare(`SELECT DISTINCT json_extract(payload, '$.by') AS by FROM events
+      WHERE taskId=? AND type='task.cancel-requested'`).all(taskId)) as Array<{ by: unknown }>)
+      .map((row) => row.by).filter((by): by is string => typeof by === 'string');
+  }
+
   /** Approval asks on a task that still ask someone: neither answered nor
    * ignored since they were (last) raised. A request passed on to other people
    * is raised again, so an earlier Ignore no longer silences it. */
@@ -6176,6 +6188,15 @@ export class Store {
     } else if (finished) {
       kind = 'update';
       for (const subscriber of (await this.subscribersFor(task.id))) users.push(...(await this.expandPrincipal(subscriber, task.projectId)));
+      // A task you cancelled yourself is not news to you.
+      if (status === 'cancelled') {
+        const cancellers = new Set((await this.cancellersOf(task.id)));
+        users = users.filter((userId) => !cancellers.has(userId));
+      }
+    } else if (ev.type === 'task.cancel-requested' && typeof ev.payload.by === 'string') {
+      // Recorded once the workflow accepted it, so the task may have ended first.
+      (await this.deleteInbox("taskId=? AND userId=? AND kind='update'", [task.id, ev.payload.by]));
+      return;
     }
     if (!kind) return;
     // The requester states urgency ONCE, on the event that raises the ask; the
@@ -10966,6 +10987,26 @@ export class Store {
       json=excluded.json, expiresAt=excluded.expiresAt, revokedAt=NULL`)
       .run(id, JSON.stringify(record), expiresAt));
   
+    });
+  }
+
+  /** Delegations no longer lapse by the clock (tokens.ts DELEGATION_NO_EXPIRY):
+   * every one not revoked whose record is still kept, expired or not, lasts as
+   * long as its task and its person's authority. One purged before this keeps
+   * only how it lapsed; its person's Retry renews it. */
+  async extendDelegationsWithoutExpiry(): Promise<number> {
+    return this.db.transaction(async () => {
+    const rows = (await this.db.prepare('SELECT id, json FROM human_delegations WHERE revokedAt IS NULL AND json<>?')
+      .all(PURGED_DELEGATION)) as Array<{ id: string; json: string }>;
+    let extended = 0;
+    for (const row of rows) {
+      let record: Record<string, unknown>;
+      try { record = JSON.parse(row.json); } catch { continue; }
+      (await this.db.prepare('UPDATE human_delegations SET json=?, expiresAt=? WHERE id=? AND revokedAt IS NULL')
+        .run(JSON.stringify({ ...record, expiresAt: DELEGATION_NO_EXPIRY }), DELEGATION_NO_EXPIRY, row.id));
+      extended++;
+    }
+    return extended;
     });
   }
 

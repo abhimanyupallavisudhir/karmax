@@ -101,7 +101,9 @@ describe('task stage transitions', () => {
     const f = await fixture();
     try {
       await f.api.signalTask(f.token, f.task.id, 'cancel');
-      expect(await f.store.eventsOfType(f.task.id, 'task.cancel-requested')).toHaveLength(1);
+      // Who asked, so the inbox does not tell them of their own cancellation.
+      expect((await f.store.eventsOfType(f.task.id, 'task.cancel-requested')).map((event) => event.payload))
+        .toEqual([{ by: 'test' }]);
       vi.spyOn(f.client.workflow, 'getHandle').mockReturnValue({ signal: async () => { throw new Error('Temporal unavailable'); } });
       await expect(f.api.signalTask(f.token, f.task.id, 'cancel')).rejects.toThrow('Temporal unavailable');
       expect(await f.store.eventsOfType(f.task.id, 'task.cancel-requested')).toHaveLength(1);

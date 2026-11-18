@@ -455,3 +455,47 @@ describe.each(storeBackends)('bulk inbox reads (UI-18) ($name)', ({ open }) => {
     } finally { await f.store.close(); }
   });
 });
+
+/**
+ * A task someone cancelled themselves is not news to them (the hourly smoke
+ * check cancels its own task with its person's token, and each one landed in
+ * their bell as "cancelled"). Others subscribed still hear of it. The cancel
+ * is recorded when the workflow has accepted it, so the task may already have
+ * ended by then: either order leaves the canceller nothing to read.
+ */
+describe.each(storeBackends)('own cancellation ($name)', ({ open }) => {
+  const cancelRequested = (f: Awaited<ReturnType<typeof fixture>>, payload: Record<string, unknown>) =>
+    f.store.appendEvent({ taskId: f.task.id, type: 'task.cancel-requested', ts: Date.now(), payload });
+
+  it('tells subscribers, not the person who cancelled it', async () => {
+    const f = await fixture(open);
+    try {
+      await f.store.subscribeTask(f.task.id, { kind: 'user', userId: 'reviewer' });
+      await cancelRequested(f, { by: 'owner' });
+      await f.view({ stage: 'cancelled', status: 'cancelled' });
+      expect(await f.inbox('owner')).toEqual([]);
+      expect((await f.inbox('reviewer')).map((item) => item.kind)).toEqual(['update']);
+    } finally { await f.store.close(); }
+  });
+
+  it('withdraws the news when the cancel is recorded after the task ended', async () => {
+    const f = await fixture(open);
+    try {
+      await f.store.subscribeTask(f.task.id, { kind: 'user', userId: 'reviewer' });
+      await f.view({ stage: 'cancelled', status: 'cancelled' });
+      expect((await f.inbox('owner')).map((item) => item.kind)).toEqual(['update']);
+      await cancelRequested(f, { by: 'owner' });
+      expect(await f.inbox('owner')).toEqual([]);
+      expect((await f.inbox('reviewer')).map((item) => item.kind)).toEqual(['update']);
+    } finally { await f.store.close(); }
+  });
+
+  it('still tells everyone when nobody in particular cancelled it', async () => {
+    const f = await fixture(open);
+    try {
+      await cancelRequested(f, {});
+      await f.view({ stage: 'cancelled', status: 'cancelled' });
+      expect((await f.inbox('owner')).map((item) => item.kind)).toEqual(['update']);
+    } finally { await f.store.close(); }
+  });
+});

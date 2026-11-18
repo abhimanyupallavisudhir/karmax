@@ -2494,13 +2494,23 @@ export class KarmaxApi {
    * A person acting on a task (a Retry, a message, Run again on a series)
    * renews its permission to act for them when it lapsed or is about to: the
    * task's own delegation and each agent's. A delegation tavya minted must
-   * never strand a task (they last 30 days, and a turn mints from one), and
+   * never strand a task (one from before delegations stopped expiring may
+   * have lapsed, and a turn mints from one), and
    * the person it acts for, here now, is the consent it needs. Only that
    * person, and only while they still hold the task's stored authority;
    * anyone else leaves it as it is (the turn then says who renews it).
+   * A run acts through its series' permission, so acting on a run renews the
+   * series' too: otherwise each of its later runs stops the same way (#982).
    */
   private async renewLapsedDelegations(token: string, caller: ScopedToken, task: TaskRecord): Promise<TaskRecord> {
     if (caller.kind !== 'human' || caller.humanSubject?.presence !== 'interactive') return task;
+    const seriesId = typeof task.params?.runOf === 'string' && task.params.runOf !== task.id ? task.params.runOf : undefined;
+    const series = seriesId ? (await this.deps.store.getTask(seriesId)) : undefined;
+    if (series) (await this.renewOwnLapsedDelegations(token, caller, series));
+    return this.renewOwnLapsedDelegations(token, caller, task);
+  }
+
+  private async renewOwnLapsedDelegations(token: string, caller: ScopedToken, task: TaskRecord): Promise<TaskRecord> {
     type Entry = { delegationId?: string; principal?: string; scope?: AuthorizationSelection['scope']; projectIds?: string[]; organizationId?: string };
     const own = task.params?._authorization as Entry | undefined;
     const agents = this.storedAgentAuthorizations(task) as Record<string, Entry>;
@@ -2844,7 +2854,7 @@ export class KarmaxApi {
       taskId: target.id, ...tokenScopeOf(sourceAuthorization, target.projectId,
         (await this.deps.store.getProject(target.projectId))?.organizationId),
     }).catch(async (error: unknown) => {
-      // The source's lapsed (a series nobody ran by hand for 30 days): the copy
+      // The source's lapsed (one from before delegations stopped expiring): the copy
       // keeps naming it, so its first turn says so and the person's Retry
       // renews it (renewLapsedDelegations), instead of the copy never starting.
       if (await this.deps.tokens.delegationLapsing(sourceDelegation, source.id)) return undefined;
@@ -7925,8 +7935,11 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
         await handle.signal(signal);
         // Interrupt expensive waiting-world maintenance after Temporal accepts
         // cancellation, without waiting for the workflow's next publication.
-        if (signal === SIG.cancel) await this.deps.store.appendEvent({ taskId,
-          type: 'task.cancel-requested', ts: Date.now(), payload: {} });
+        // Who asked, so their own cancellation is not news to them (the inbox).
+        if (signal === SIG.cancel) {
+          const by = speakingUser(caller);
+          await this.deps.store.appendEvent({ taskId, type: 'task.cancel-requested', ts: Date.now(), payload: by ? { by } : {} });
+        }
       }
       if (ACCEPTED_ACTIONS.has(signal)) {
         await this.deps.store.appendEvent({ taskId, type: 'task.transition-requested', ts: Date.now(), payload: { signal } });

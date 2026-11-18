@@ -18,7 +18,7 @@ export interface TaskAuthority {
   organizationId?: string;
 }
 
-type StoredAuthorization = Partial<TaskAuthority> & { principal?: string; heldBack?: Capability[];
+type StoredAuthorization = Partial<TaskAuthority> & { principal?: string; level?: string; heldBack?: Capability[];
   /** A sub-task's projects approved beyond its parent's scope (`request_permission`). */
   addedProjectIds?: string[] };
 
@@ -27,6 +27,26 @@ const scopeOf = (from: Partial<TaskAuthority> | undefined) => ({
   ...(from?.projectIds ? { projectIds: from.projectIds } : {}),
   ...(from?.organizationId ? { organizationId: from.organizationId } : {}),
 });
+
+/**
+ * A person's stored grant as it holds now: no more than they could grant the
+ * same selection today. Delegations no longer expire (domain/delegation-expiry.ts),
+ * so this is what bounds them: removing someone from a project or organization,
+ * or lowering their role, narrows every task they authorized at its next turn.
+ * Anything else (an Avatār's, a legacy grant without a level) is unchanged.
+ */
+export async function personGrantNow(authorization: AuthorizationService | undefined,
+  stored: { capabilities?: Capability[]; principal?: string; level?: string; scope?: AuthorizationSelection['scope']; projectIds?: string[] } | undefined,
+  projectId: string, capabilities: Capability[] = stored?.capabilities ?? []): Promise<Capability[]> {
+  if (!authorization || !stored?.principal?.startsWith('user:') || !stored.level || !stored.scope) return capabilities;
+  const selection: AuthorizationSelection = { level: stored.level, scope: stored.scope,
+    ...(stored.projectIds?.length ? { projectIds: stored.projectIds } : {}) };
+  const principal = stored.principal;
+  // A selection today's rules refuse (an older shape): what they hold in the project.
+  const now = await authorization.taskGrant(principal, projectId, selection).then((grant) => grant.capabilities,
+    () => authorization.capabilities(principal, projectId).catch(() => []));
+  return attenuate(capabilities, now);
+}
 
 /**
  * A task's authority before what was approved for it: its stored grant or,
@@ -39,7 +59,8 @@ export async function baseTaskAuthority(store: Store, authorization: Authorizati
   task: TaskRecord, options: { seen?: Set<string>; grant?: Capability[] } = {}): Promise<TaskAuthority> {
   const seen = options.seen ?? new Set<string>();
   const stored = task.params?._authorization as StoredAuthorization | undefined;
-  const own = { capabilities: stored?.capabilities ?? options.grant ?? [], ...scopeOf(stored) };
+  const own = { capabilities: (await personGrantNow(authorization, stored, task.projectId, stored?.capabilities ?? options.grant ?? [])),
+    ...scopeOf(stored) };
   if (!delegatedFromParent(task)) return own;
   const added = (scope: TaskAuthority) => withProjects(scope, stored?.addedProjectIds, task.projectId);
   if (seen.has(task.parentTaskId)) return added(own);
