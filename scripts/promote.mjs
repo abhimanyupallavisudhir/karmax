@@ -9,6 +9,8 @@
 // Rules (wiki ops/release-and-deploy, "Promotion"):
 // - the candidate is the newest commit newer than production's that passed
 //   staging, at least `soakMinutes` ago;
+// - a commit production already tried and failed (deploy or smoke check) is
+//   not tried again, nor anything older: only a newer commit, or one named;
 // - a promotion waits `intervalMinutes` after the previous one;
 // - nothing is promoted while the repository variable DEPLOYS_PAUSED is true;
 // - a person or agent may name a commit (or take the newest that passed
@@ -35,6 +37,11 @@ export function choosePromotion({ commits, now, soakMinutes = 60, intervalMinute
   const newer = productionAt >= 0 ? commits.slice(0, productionAt) : commits.slice(0, 30);
   const passed = (commit) => commit.statuses[STAGING]?.state === 'success'
     && IMAGE.test(commit.statuses[STAGING]?.description ?? '');
+  // The newest commit production tried, whatever came of it: unless named,
+  // nothing it tried is redeployed and nothing older replaces it.
+  const triedAt = commits.findIndex((commit) => commit.statuses[PRODUCTION]);
+  const untried = triedAt >= 0 ? commits.slice(0, triedAt) : newer;
+  const failed = triedAt >= 0 && triedAt !== productionAt ? commits[triedAt] : undefined;
   const choose = (commit, reason) => ({ sha: commit.sha, image: commit.statuses[STAGING].description, reason });
   const none = (reason) => ({ sha: '', image: '', reason });
 
@@ -51,11 +58,12 @@ export function choosePromotion({ commits, now, soakMinutes = 60, intervalMinute
     const next = new Date(productionTime + intervalMinutes * 60_000).toISOString();
     return none(`production was deployed less than ${intervalMinutes} minutes ago; next promotion after ${next}`);
   }
-  const candidate = newer.find((commit) => passed(commit)
+  const candidate = untried.find((commit) => passed(commit)
     && (immediate || now - Date.parse(commit.statuses[STAGING].createdAt) >= soakMinutes * 60_000));
   if (!candidate) {
-    const waiting = newer.find(passed);
+    const waiting = untried.find(passed);
     return none(waiting ? `${waiting.sha} passed staging less than ${soakMinutes} minutes ago`
+      : failed ? `nothing newer than ${failed.sha}, which failed on production, has passed staging; name a commit to retry it`
       : production ? `nothing newer than production (${production.sha}) has passed staging` : 'nothing has passed staging');
   }
   return choose(candidate, `${candidate.sha} passed staging${immediate ? '' : ` at least ${soakMinutes} minutes ago`}`);
