@@ -90,7 +90,7 @@ import { HOSTED_GIT_ROUTE, hostedRepositoryUrl, isHostedRepository, isValidHoste
 import { materializeGitCredential } from '../world/git-credential.js';
 type Repository = import('../domain/types.js').Repository;
 import { projectArtifactGallery, type GalleryArtifact } from '../platform/artifact-gallery.js';
-import { FileAccessError, FileNotFoundError, ProjectFiles, projectRepositoryCredential, splitPath, worldFilesPath, type FileNode, type FileView, type OpenedFile } from '../world/project-files.js';
+import { FileAccessError, FileNotFoundError, ProjectFiles, projectRepositoryCredential, splitPath, type FileNode, type FileView, type OpenedFile } from '../world/project-files.js';
 import { CHANGE_LIMITS, FileConflictError, ProjectFileChanges, type FileChange, type FileKeeping } from '../world/project-file-changes.js';
 import { createFileShare, currentFileShare, projectFileShares, publicFileShare, publicFilesHtml, revokeFileShare, type FileShare } from './file-sharing.js';
 import { cliVersionOf, olderVersion } from '../domain/cli-version.js';
@@ -5586,7 +5586,7 @@ export class Gateway {
         const task = await store.getTask(fileLocation[1]!);
         if (!task) return this.json(res, 404, { error: 'task not found' });
         let relative: string;
-        try { relative = await this.citedFilePath(task, url.searchParams.get('path') ?? ''); }
+        try { relative = await this.citedFilePath(session.apiToken, task, url.searchParams.get('path') ?? ''); }
         catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         return this.json(res, 200, { projectId: task.projectId, taskId: task.id, ...(task.num != null ? { num: task.num } : {}), path: relative });
       }
@@ -5734,7 +5734,7 @@ export class Gateway {
         if ('error' in view) return this.json(res, view.status, { error: view.error });
         // `cited`: a path as the task's agent wrote it (an image in its message).
         if (view.kind === 'task' && url.searchParams.has('cited')) {
-          try { relative = await this.citedFilePath((await store.getTask(view.taskId))!, relative); }
+          try { relative = await this.citedFilePath(session.apiToken, (await store.getTask(view.taskId))!, relative); }
           catch (error) { return this.json(res, 404, { error: error instanceof Error ? error.message : String(error) }); }
         }
         try {
@@ -11351,9 +11351,10 @@ export class Gateway {
   }
 
   /** Where a path an agent cited (absolute in its world, or relative to its
-   * working folder) sits in its project's Files, relative to the world root. */
-  private async citedFilePath(task: import('../domain/types.js').TaskRecord, cited: string): Promise<string> {
-    return worldFilesPath(((await this.deps.store.currentWorld(task.id)) ?? task.lastView?.world) as WorldHandle | undefined, cited);
+   * working folder or a checkout) sits in its task's view of Files. */
+  private async citedFilePath(token: string, task: import('../domain/types.js').TaskRecord, cited: string): Promise<string> {
+    const data = (await this.deps.tokens.check(token, 'project:settings:read', { projectId: task.projectId })).ok;
+    return this.projectFiles().citedPath(task.projectId, task.id, cited, data);
   }
 
   /** Tasks whose world can be shown (running, parked or saved), newest first, for the view picker. */
