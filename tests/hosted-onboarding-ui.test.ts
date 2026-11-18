@@ -71,7 +71,7 @@ describe('hosted onboarding UI', () => {
     const ui = await hosted({ onboarding: () => status({ completedRequired: 1, ...(trial ? { trial } : {}), steps: { ...status().steps,
       compute: { complete: false, managed: false, own: false } } }) });
     await guide(ui).locator('.onboarding-trial').waitFor();
-    expect(await guide(ui).locator('.onboarding-trial').innerText()).toBe('Free trial: $5 of compute and agents included until Nov 27.');
+    expect(await guide(ui).locator('.onboarding-trial').innerText()).toBe('Free trial: $5 of Fixture credits for computers and agents, until Nov 27.');
     expect(await guide(ui).locator('.onboarding-intro').innerText()).toBe('For the full experience:');
     const step = guide(ui).locator('.onboarding-step').nth(1);
     expect(await step.locator('.onboarding-check').innerText()).toBe('2');
@@ -79,7 +79,7 @@ describe('hosted onboarding UI', () => {
     expect(await step.locator('.onboarding-option small').first().innerText()).toMatch(/^Includes .+’s computers$/) // no trial date on the plan;
     // Without the included model, only compute is included; without a trial, the usual intro.
     trial = { creditMicros: 5_000_000, endsAt, agents: false };
-    await expect.poll(() => guide(ui).locator('.onboarding-trial').innerText(), { timeout: 8_000 }).toBe('Free trial: $5 of compute included until Nov 27.');
+    await expect.poll(() => guide(ui).locator('.onboarding-trial').innerText(), { timeout: 8_000 }).toBe('Free trial: $5 of Fixture credits for computers, until Nov 27.');
     trial = undefined;
     await expect.poll(() => guide(ui).locator('.onboarding-trial').count(), { timeout: 8_000 }).toBe(0);
     expect(await guide(ui).locator('.onboarding-intro').innerText()).toMatch(/^A few real connections/);

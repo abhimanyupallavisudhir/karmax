@@ -845,7 +845,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     'generate',
     {
       description:
-        `Use any model OpenRouter serves, paid from your ${BRAND} organization's credit with no account at the lab: text (GPT, Gemini, DeepSeek, …), an image (gpt-image, Nano Banana, Flux…), a video (Seedance, Veo, Kling…) or speech (ElevenLabs…). What it can cost at most is worked out from the model's price list first and held on the credit; it is refused when the credit cannot cover that, or above maxCostUsd. Text, images and speech come back in this reply. A video returns a jobId: call again with jobId until it is completed, then download it from the URL given (with your ${BRAND} token). Models, prices, durations and voices: platform_request GET /api/generation-models?kind=text|image|video|speech.`,
+        `Use any model OpenRouter serves, paid from your ${BRAND} organization's credit with no account at the lab: text (GPT, Gemini, DeepSeek, …), an image (gpt-image, Nano Banana, Flux…), a video (Seedance, Veo, Kling…) or speech (ElevenLabs…). What it can cost at most is worked out from the model's price list first and held on the credit; it is refused when the credit cannot cover that (Out of credits, with the Plan & billing link where credits are added), or above maxCostUsd. Text, images and speech come back in this reply. A video returns a jobId: call again with jobId until it is completed, then download it from the URL given (with your ${BRAND} token). Models, prices, durations and voices: platform_request GET /api/generation-models?kind=text|image|video|speech.`,
       inputSchema: {
         organizationId: z.string(),
         kind: z.enum(['text', 'image', 'video', 'speech']).optional(),

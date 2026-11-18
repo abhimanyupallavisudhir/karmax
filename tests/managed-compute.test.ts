@@ -11,7 +11,7 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { MANAGED_COMPUTE, WorldProviderConnectionService, connectionScope, fundingRef } from '../src/world/connections.js';
 import { COMPUTE_PACK, COMPUTE_PRICE_MULTIPLIER, HOSTED_PLANS, computeChargeMicros, hostedComputeCreditMicros,
   hostedMonthlyPriceCents, organizationEntitlements } from '../src/domain/entitlements.js';
-import { ComputeCreditExhausted, ManagedComputeBusy, assertComputeCredit, computeCredit } from '../src/world/managed-compute.js';
+import { ComputeCreditExhausted, ManagedComputeBusy, assertComputeCredit, computeCredit, creditsUrl } from '../src/world/managed-compute.js';
 import { RunnerPoolService, WorldLifecycleManager } from '../src/world/runners.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { ProviderCapacityFull } from '../src/agent/limits.js';
@@ -152,16 +152,24 @@ describe('compute credit', () => {
     const spent = await assertComputeCredit(f.store, f.organization.id, 'e2b').catch((error) => error);
     expect(spent).toBeInstanceOf(ComputeCreditExhausted);
     expect(spent).toBeInstanceOf(ProviderCapacityFull);
-    expect(spent.message).toMatch(/^Out of compute: this month's \$5\.00 of compute is used up\. Add a \$10 pack or turn on auto top-up in Plan & billing, or connect your own E2B account/);
+    expect(spent.message).toMatch(/^Out of credits: this month's \$5\.00 of tavya credits is used up\. Add credits or turn on auto top-up in Plan & billing \(\S+\/settings#settings-plan\), or connect your own E2B account/);
 
     // A gifted pack makes room again.
     await f.store.setComputePackGift(f.organization.id, 1, 'operator');
     await expect(assertComputeCredit(f.store, f.organization.id, 'e2b')).resolves.toBeUndefined();
   });
 
+  it('links where an organization adds credits: its own Plan & billing, in full when the address is known', async () => {
+    const f = await fixture();
+    const slug = (await f.store.getOrganization(f.organization.id))!.slug;
+    expect(await creditsUrl(f.store, f.organization.id, 'https://tavya.test/')).toBe(`https://tavya.test/${slug}/settings#settings-plan`);
+    expect(await creditsUrl(f.store, f.organization.id, '')).toBe(`/${slug}/settings#settings-plan`);
+    expect(await creditsUrl(f.store, 'org_gone', 'https://tavya.test')).toBe('https://tavya.test/settings#settings-plan');
+  });
+
   it('says that Free has no managed compute, and leaves private installations unmetered', async () => {
     const f = await fixture();
-    await expect(assertComputeCredit(f.store, f.organization.id, 'e2b')).rejects.toThrow(/^Out of compute: tavya's computers come with a paid plan/);
+    await expect(assertComputeCredit(f.store, f.organization.id, 'e2b')).rejects.toThrow(/^Out of credits: tavya's computers come with a paid plan\. Choose one in Plan & billing \(\S+\/settings#settings-plan\)/);
     const p = await fixture({ hosted: false });
     await p.usage('a', 50_000_000);
     await expect(assertComputeCredit(p.store, p.organization.id, 'e2b')).resolves.toBeUndefined();
@@ -422,8 +430,11 @@ describe('out-of-compute notices', () => {
     const inbox = await f.store.listInbox('owner', f.organization.id);
     expect(inbox).toHaveLength(1);
     expect(inbox[0]!.subject).toMatchObject({ kind: 'compute', usedMicros: 5_000_000, creditMicros: 5_000_000 });
-    expect(sent).toEqual([expect.objectContaining({ to: 'owner@example.test', subject: 'Acme has used this month\'s tavya compute' })]);
-    expect(sent[0]!.text).toMatch(/\$5\.00 of its \$5\.00[\s\S]*add a \$10 pack, turn on auto top-up[\s\S]*https:\/\/tavya\.test\/settings/);
+    expect(sent).toEqual([expect.objectContaining({ to: 'owner@example.test', subject: 'Acme has used this month\'s tavya credits' })]);
+    // The link goes straight to the organization's own Plan & billing.
+    const slug = (await f.store.getOrganization(f.organization.id))!.slug;
+    expect(sent[0]!.text).toMatch(/\$5\.00 of its \$5\.00 of tavya credits[\s\S]*add credits, turn on auto top-up/);
+    expect(sent[0]!.text).toContain(`Add credits: https://tavya.test/${slug}/settings#settings-plan`);
     await f.store.setComputePackGift(f.organization.id, 1, 'operator');
     await notifyComputeCredit(deps, Date.now() + 30 * 60_000);
     expect(await f.store.listInbox('owner', f.organization.id)).toHaveLength(0);

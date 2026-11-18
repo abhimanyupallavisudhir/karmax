@@ -60,12 +60,13 @@ it('gifts, changes, and removes plans from the organization billing screen throu
     await page.getByRole('button', { name: 'Update', exact: true }).waitFor();
     expect(await plan.locator('.plan-limits').innerText()).toMatch(/25 at once/);
     expect(await page.locator('.billing-checkout').count()).toBe(0);
-    // Gifted storage and compute packs: any plan, no billing provider; the tooltip says where the storage comes from.
+    // Gifted storage and credit packs: any plan, no billing provider; the row's ⓘ folds out where the storage comes from.
     await page.getByRole('spinbutton', { name: 'Gifted storage packs' }).fill('2');
     await plan.locator('.billing-gift-packs[data-kind="storage"]').click();
     await expect.poll(async () => (await store.organizationEntitlements(recipient.id)).storageQuotaBytes).toBe(310 * 1024 ** 3);
     await plan.locator('[data-limit="storage"]').filter({ hasText: 'of 310 GB' }).waitFor();
-    expect(await plan.locator('[data-limit="storage"] .info-dot').getAttribute('title')).toContain('110 GB with Team + 2 × 100 GB packs gifted');
+    await plan.getByRole('button', { name: /^Storage credits/ }).click();
+    expect(await plan.locator('#plan-info-storage').innerText()).toMatch(/110 GB\s+with Team\s+200 GB\s+2 × 100 GB packs · gifted/);
     await page.getByRole('spinbutton', { name: 'Gifted compute packs' }).fill('1');
     await plan.locator('.billing-gift-packs[data-kind="compute"]').click();
     await expect.poll(async () => (await store.organizationEntitlements(recipient.id)).giftedComputePacks).toBe(1);
@@ -119,7 +120,7 @@ it('gifts, changes, and removes plans from the organization billing screen throu
   }
 }, 60_000);
 
-it('opens a purchased subscription from the profile and upgrades or cancels it in Subscription billing', async () => {
+it('shows a purchased subscription on the profile and upgrades or cancels it there, in the organization\'s own Plan & billing card', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'subscription-management-browser-'));
   const port = await findFreePortFrom(48830);
   const identity = await IdentityService.open(':memory:', { baseURL: `http://127.0.0.1:${port}` });
@@ -166,11 +167,13 @@ it('opens a purchased subscription from the profile and upgrades or cancels it i
     });
     expect(login.status()).toBe(200);
     await page.goto(`${server.url}/profile`);
-    await page.locator('#profile-paid-subscriptions').getByText(org.name, { exact: true }).waitFor({ timeout: 10_000 }).catch(async error => {
+    const plans = page.locator('#profile-plans');
+    await plans.getByText(org.name, { exact: true }).waitFor({ timeout: 10_000 }).catch(async error => {
       throw new Error(`${error.message}\nPage: ${await page.locator('body').innerText()}\nErrors: ${errors.join('; ')}`);
     });
-    expect(await page.locator('#profile-paid-subscriptions').innerText()).not.toContain('no longer have billing-management access');
+    expect(await plans.innerText()).not.toContain('no longer belong');
     expect((await fetch(`${server.url}/api/user/paid-subscriptions`)).status).toBe(401);
+    expect((await fetch(`${server.url}/api/user/plans`)).status).toBe(401);
     const otherUser = await identity.createUser({ name: 'Other user', email: 'other-billing@example.test', password: 'long-fixture-password' });
     const otherContext = await browser.newContext();
     try {
@@ -181,9 +184,15 @@ it('opens a purchased subscription from the profile and upgrades or cancels it i
       expect(otherList.status()).toBe(200);
       expect(await otherList.json()).toEqual({ subscriptions: [] });
     } finally { await otherContext.close(); }
-    await page.locator('#profile-paid-subscriptions').getByRole('link', { name: 'Plans & billing' }).click();
-    await page.getByRole('button', { name: 'Close setup guide' }).click({ timeout: 10_000 }).catch(() => undefined);
-    await page.getByRole('button', { name: 'Upgrade to Team', exact: true }).click({ timeout: 10_000 }).catch(async error => {
+    // The only organization is open at once: its card, with what it may buy, right here.
+    expect(await plans.locator('.profile-plan-head').getAttribute('aria-expanded')).toBe('true');
+    await plans.locator('.plan-limits').waitFor({ timeout: 10_000 });
+    // Its ⓘ folds out what is behind a figure, beneath its row.
+    const agentsInfo = plans.locator('#plan-info-agents');
+    expect(await agentsInfo.isHidden()).toBe(true);
+    await plans.getByRole('button', { name: /^Agents/ }).click();
+    expect(await agentsInfo.innerText()).toContain('How many agents can work at the same time');
+    await plans.getByRole('button', { name: 'Upgrade to Team', exact: true }).click({ timeout: 10_000 }).catch(async error => {
       throw new Error(`${error.message}\nURL: ${page.url()}\nPage: ${await page.locator('body').innerText()}\nErrors: ${errors.join('; ')}`);
     });
     await expect.poll(() => provider.calls.filter(call => call.method === 'changePlan').length).toBe(1);
@@ -196,7 +205,7 @@ it('opens a purchased subscription from the profile and upgrades or cancels it i
     await expect.poll(() => provider.calls.filter(call => call.method === 'cancelAtPeriodEnd').length).toBe(1);
     await subscription('team', true);
     await page.reload();
-    await page.locator('#org-plan .plan-head .chip').filter({ hasText: /^Ends / }).waitFor();
+    await page.locator('#profile-plans .plan-head .chip').filter({ hasText: /^Ends / }).waitFor();
     expect(await page.getByRole('button', { name: 'Cancel plan', exact: true }).count()).toBe(0);
     // A portal session is fetched only after an explicit user action.
     await page.route('https://portal.test/**', route => route.fulfill({ body: 'Test billing portal' }));

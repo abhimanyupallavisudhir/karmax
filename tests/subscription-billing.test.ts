@@ -588,6 +588,30 @@ describe('subscription administration HTTP authorization', () => {
     await store.db.prepare('DELETE FROM policy_acceptances WHERE organizationId=?').run(org.id);
   });
 
+  it('lists the plan of every organization one belongs to, gifted or bought, for the profile, with the same personal-access rules', async () => {
+    const mine = await store.createOrganization({ name: 'Plans workspace', ownerUserId: 'me' });
+    const elsewhere = await store.createOrganization({ name: 'Not mine', ownerUserId: 'someone-else' });
+    await billing.gift(mine.id, 'team', 'user:operator', 'profile-plans-gift', 3);
+    await store.setStoragePackGift(mine.id, 2, 'user:operator');
+    const plans = (token = browserToken) => fetch(`${base}/api/user/plans`, { headers: { authorization: `Bearer ${token}` } });
+    const result = await (await plans()).json() as any;
+    const row = result.organizations.find((value: any) => value.organizationId === mine.id);
+    expect(row).toMatchObject({ name: 'Plans workspace', role: 'owner', plan: 'team', planName: 'Team', gift: { plan: 'team' },
+      giftedStoragePacks: 2, canManage: true, settingsUrl: `/${mine.slug}/settings#settings-plan` });
+    expect(result.organizations.map((value: any) => value.organizationId)).not.toContain(elsewhere.id);
+    expect(Array.isArray(result.formerSubscriptions)).toBe(true);
+    // Personal: never through an organization-scoped or agent token.
+    const scoped = await tokens.mintPrincipal('user:me', ['payment:*'], undefined, undefined, mine.id);
+    expect((await plans(scoped.token)).status).toBe(403);
+    const agent = await tokens.mint({ taskId: 'task_personal_plans', profileId: 'developer', principal: 'agent:test',
+      ceiling: ['payment:write'], grantorCaps: ['payment:write'] });
+    expect((await plans(agent.token)).status).toBe(403);
+    // A member who is not an owner sees the plan, not the controls.
+    await store.setOrganizationMembership(mine.id, 'replacement-owner', 'owner');
+    await store.setOrganizationMembership(mine.id, 'me', 'member');
+    expect((await (await plans()).json() as any).organizations).toContainEqual(expect.objectContaining({ organizationId: mine.id, role: 'member', canManage: false }));
+  });
+
   it.each(['checkout', 'portal', 'change', 'cancel', 'resume', 'seats', 'sync-seats', 'storage-packs'] as const)(
     'rejects an interactive non-owner from %s', async (action) => {
       const response = await post(action, memberOrganizationId, browserToken);

@@ -289,7 +289,7 @@ describe('the proxy', () => {
       costMicros: 2_500_000, startedAt: Date.now() - 1000, endedAt: Date.now(), fundingSource: 'managed' });
     const spent = await f.call({ model: 'claude-opus-5-5' });
     expect(spent.status).toBe(402);
-    expect(((await spent.json()) as any).error.message).toMatch(/^Out of compute/);
+    expect(((await spent.json()) as any).error.message).toMatch(/^Out of credits: .*Plan & billing \(\S+\/settings#settings-plan\)/);
     await revokeGatewayToken(f.store, f.token);
     expect((await f.call({ model: 'claude-opus-5-5' })).status).toBe(401);
     expect(upstreamCalls).toHaveLength(0);
@@ -393,7 +393,7 @@ describe('a Claude Code or Codex turn on the credit', () => {
     await saveModelGateway(spent.store, spent.broker, undefined, gatewayInput({ enabled: true }));
     await spent.store.recordUsage({ organizationId: spent.organization.id, provider: 'e2b', kind: 'world.active', quantity: 1, unit: 'second',
       costMicros: 2_500_000, startedAt: Date.now() - 1000, endedAt: Date.now(), fundingSource: 'managed' });
-    await expect(spent.run()).rejects.toMatchObject({ type: 'world-capacity', message: expect.stringMatching(/^Out of compute/) });
+    await expect(spent.run()).rejects.toMatchObject({ type: 'world-capacity', message: expect.stringMatching(/^Out of credits/) });
   });
 
   it('prefers a login of the organization\'s own', async () => {

@@ -69,8 +69,7 @@ describe('free trial', () => {
     expect(spent.availableMicros).toBeLessThanOrEqual(0);
     const refused = await assertComputeCredit(f.store, f.organization.id, 'e2b', T + 2 * DAY + 60_000).catch((error) => error);
     expect(refused).toBeInstanceOf(ComputeCreditExhausted);
-    expect(refused.message).toBe('Out of compute: your $5.00 free trial is used up. Choose a plan in Plan & billing, '
-      + 'or connect your own E2B account in Settings → Computers.');
+    expect(refused.message).toMatch(/^Out of credits: your \$5\.00 free trial is used up\. Choose a plan in Plan & billing \(\S+\/settings#settings-plan\), or connect your own E2B account in Settings → Computers\.$/);
   });
 
   it('ends after 14 days whatever is left, and says so', async () => {
@@ -82,7 +81,7 @@ describe('free trial', () => {
     // What it drew still counts against its use; what was left is gone.
     expect(credit).toMatchObject({ usedMicros: 1_000_000, availableMicros: 0, trial: { usedMicros: 1_000_000, leftMicros: 0, monthMicros: 1_000_000 } });
     const refused = await assertComputeCredit(f.store, f.organization.id, 'e2b', after).catch((error) => error);
-    expect(refused.message).toMatch(/^Out of compute: your \$5\.00 free trial ended on 2026-10-24\. Choose a plan in Plan & billing/);
+    expect(refused.message).toMatch(/^Out of credits: your \$5\.00 free trial ended on 2026-10-24\. Choose a plan in Plan & billing/);
   });
 
   it('is drawn before a paid plan\'s own credit', async () => {
@@ -135,6 +134,10 @@ describe('free trial', () => {
       renewsAt: Date.UTC(2026, 10, 1), trial: true });
     expect(message.subject).toBe('Acme\'s free tavya trial is over');
     expect(message.text).toContain('choose a plan in Plan & billing');
+    expect(message.text).not.toMatch(/Add credits:/);
+    expect(computeNoticeEmail('Acme', 'tavya', { stage: 'spent', usedMicros: 5_000_000, creditMicros: 5_000_000,
+      renewsAt: Date.UTC(2026, 10, 1), trial: true }, 'https://tavya.test/acme/settings#settings-plan').text)
+      .toContain('Choose a plan: https://tavya.test/acme/settings#settings-plan');
     expect(message.text).not.toMatch(/renews/);
   });
 });

@@ -213,7 +213,7 @@ export class ComputeRouter {
         // will judge it (holds, top-ups: managed-compute.ts).
         const short = await assertComputeCredit(this.store, organizationId, view.provider, this.now(), { shape: needs })
           .then(() => undefined, (error: unknown) => { if (error instanceof ComputeCreditExhausted) return error; throw error; });
-        if (short) return { ...option, busy: 'out of compute this month', outOfCredit: short.message };
+        if (short) return { ...option, busy: 'out of credits this month', outOfCredit: short.message };
         // The account's budget, its queue and this organization's fair share of it.
         const account = accounts.find((value) => value.provider === view.provider);
         const full = account && await managedRoom(this.store, view.provider, { pool: account.limits.pool, share: account.config.share },
