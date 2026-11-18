@@ -12,7 +12,7 @@ import type { ProjectResourceService } from './resources.js';
 import type { GitBrokerCredential } from './git-broker.js';
 import type { ManifestEntry } from './checkpoint-chunks.js';
 import type { World, WorldHandle } from './types.js';
-import { isRemoteWorldKind, worldRepos, worldRepoSource, worldWorkingRelativePath } from './types.js';
+import { isRemoteWorldKind, worldRepos, worldRepoSource, worldWorkingDirectory } from './types.js';
 import { MirroredCommitMissing, readMirrored } from './git-mirror.js';
 import { catBlob, git, gitWithInput } from './git.js';
 import { materializeGitCredential } from './git-credential.js';
@@ -807,19 +807,19 @@ function safeSame(a: string, b: string): boolean {
 
 /** Where a path a task's agent wrote (absolute in its world, or relative to
  * its working folder) sits in its project's Files: relative to the world
- * root, which Files lays out alike. Outside the world throws. */
+ * root, which Files lays out alike. `..` and `.` resolve as a shell would
+ * (`../<root's name>/docs/a.md` from the root is `docs/a.md`); a path that
+ * ends up outside the world throws. */
 export function worldFilesPath(handle: WorldHandle | undefined, cited: string): string {
   const value = String(cited).replace(/\\/g, '/');
   if (!value) throw new Error('missing path');
-  let relative = value;
-  if (handle) {
-    const root = String(handle.root ?? '').replace(/\/+$/, '');
-    if (value.startsWith('/')) {
-      if (value !== root && !value.startsWith(`${root}/`)) throw new Error('That file is outside the task’s world.');
-      relative = value === root ? '' : value.slice(root.length + 1);
-    } else relative = worldWorkingRelativePath(handle, value);
-  }
-  return splitPath(relative === '.' ? '' : relative).join('/');
+  const root = String(handle?.root ?? '').replace(/\/+$/, '');
+  // A handle naming no folders: the path is already root-relative.
+  if (!root) return splitPath(value).join('/');
+  const workdir = worldWorkingDirectory(handle!).replace(/\\/g, '/').replace(/\/+$/, '');
+  const resolved = path.posix.resolve(workdir, value);
+  if (resolved !== root && !resolved.startsWith(`${root}/`)) throw new Error('That file is outside the task’s world.');
+  return splitPath(resolved.slice(root.length + 1)).join('/');
 }
 
 /** `a//b/` → ['a', 'b']; `..` and `.` are refused, not resolved. */

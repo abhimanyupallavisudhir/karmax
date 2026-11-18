@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { splitPath } from '../src/world/project-files.js';
+import { splitPath, worldFilesPath } from '../src/world/project-files.js';
 import { projectFilesFixture, sh } from './helpers/project-files-fixture.js';
 
 // The project Files page's API (wiki features/project-files): the project laid
@@ -238,6 +238,12 @@ it('shows another branch where a repository has it, a task by its branch, and wh
   expect(await (await locate('/home/user/w/site/src/app.ts')).json()).toEqual({ projectId: f.project.id, taskId: task.id, num: task.num, path: 'site/src/app.ts' });
   expect(((await (await locate('src/app.ts')).json()) as any).path).toBe('site/src/app.ts');
   expect((await locate('/etc/passwd')).status).toBe(400);
+  // `..` resolves against the working folder; only leaving the world is refused.
+  expect(((await (await locate('../site/src/app.ts')).json()) as any).path).toBe('site/src/app.ts');
+  expect(((await (await locate('./src/../src/app.ts')).json()) as any).path).toBe('site/src/app.ts');
+  expect(((await (await locate('/home/user/w/site/../site/src/app.ts')).json()) as any).path).toBe('site/src/app.ts');
+  expect((await locate('../../etc/passwd')).status).toBe(400);
+  expect((await locate('/home/user/w/../x')).status).toBe(400);
   // An image the agent cites by path in its message.
   expect(await (await view(`&task=${task.num}&cited=1`, 'src/app.ts', true)).text()).toBe('export const answer = 7;\n');
   // Reading a task needs task:read.
@@ -260,4 +266,17 @@ it('serves a wiki page’s own files, such as the image it shows', async () => {
   expect(image.headers.get('content-security-policy')).toContain('sandbox');
   expect((await fetch(`${f.server.url}/api/organizations/${f.project.organizationId}/wiki/file?path=../../etc/passwd`, { headers: { authorization: `Bearer ${token}` } })).status).not.toBe(200);
   expect((await fetch(`${f.server.url}/api/organizations/${f.project.organizationId}/wiki/file?path=guides`, { headers: { authorization: `Bearer ${token}` } })).status).toBe(404);
+});
+
+it('places a cited path that climbs with `..` but stays inside the world', () => {
+  // The agent works at the world's root and cites `../<root's name>/…` (rw-data#3).
+  const world = { id: 'w', kind: 'e2b', root: '/home/user/rw-data', workdir: '/home/user/rw-data' } as any;
+  expect(worldFilesPath(world, '../rw-data/docs/cred-candidates-new.md')).toBe('docs/cred-candidates-new.md');
+  expect(worldFilesPath(world, 'docs/./a/../b.md')).toBe('docs/b.md');
+  expect(worldFilesPath(world, '.')).toBe('');
+  expect(() => worldFilesPath(world, '../other/x.md')).toThrow(/outside the task’s world/);
+  expect(() => worldFilesPath(world, '/home/user/rw-data-other/x.md')).toThrow(/outside the task’s world/);
+  // A handle that names no folders: the path is already root-relative, and may not climb.
+  expect(worldFilesPath({ id: 'w' } as any, 'a/b.md')).toBe('a/b.md');
+  expect(() => worldFilesPath({ id: 'w' } as any, '../b.md')).toThrow();
 });
