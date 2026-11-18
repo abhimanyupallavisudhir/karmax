@@ -316,6 +316,31 @@ describe('managed compute admission', () => {
       await measured.save({ organizationId: MANAGED_COMPUTE, provider: 'gcp', config: { limits: { pool: { cpu: 12 } } } });
       expect((await account()).limits).toMatchObject({ cpu: 12, pool: { cpu: 12, machines: 24 }, source: { cpu: 'configured' } });
     });
+
+    it('reads Agent37’s budget again as its wallet’s tier raises it, with nobody re-testing the account', async () => {
+      const f = await fixture();
+      let memoryLimitGb = 40;
+      let reads = 0;
+      const measured = new WorldProviderConnectionService(f.store, f.broker, { check: async () => {},
+        limits: async () => { reads++; return { cpu: 8, memoryMb: 65_536, diskGb: 100, pool: { machines: memoryLimitGb / 4 } }; } });
+      await measured.save({ organizationId: MANAGED_COMPUTE, provider: 'agent37', apiKey: 'sk_live_operator' });
+      await measured.test(MANAGED_COMPUTE, 'agent37');
+      const machines = async () => (await measured.managedConnections()).find((value) => value.provider === 'agent37')!.limits.pool?.machines;
+      expect(await machines()).toBe(10);
+      // The owner tops up to $50 (Tier 2: 200 GB); within the hour nothing asks again.
+      memoryLimitGb = 200;
+      const readsBefore = reads;
+      vi.setSystemTime(Date.now() + 30 * 60_000);
+      expect(await machines()).toBe(10);
+      expect(reads).toBe(readsBefore);
+      vi.setSystemTime(Date.now() + 31 * 60_000);
+      expect(await machines()).toBe(50);
+      // A failed read keeps what was known.
+      vi.setSystemTime(Date.now() + 2 * 3_600_000);
+      const failing = new WorldProviderConnectionService(f.store, f.broker,
+        { check: async () => {}, limits: async () => { throw new Error('Agent37 is down'); } });
+      expect((await failing.managedConnections()).find((value) => value.provider === 'agent37')!.limits.pool?.machines).toBe(50);
+    });
   });
 
   it('bills a lease-priced managed provider (Daytona) as managed', async () => {

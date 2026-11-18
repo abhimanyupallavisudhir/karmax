@@ -389,10 +389,19 @@ const defaultProbes: ProviderProbes = {
 /** What `assertFits` judges: the sizes, and the outbound network asked for. */
 export type ComputerFitSpec = MachineShape & { network?: { unrestricted?: boolean; basic?: boolean } };
 
-/** An account whose limits were never read, or a Daytona account read before
- * its internet was (Tiers 1 and 2 reach essential services only). */
+/** Accounts whose budget changes with nobody re-testing them: Agent37's
+ * memory limit rises with the workspace's lifetime top-ups (its tier). */
+const BUDGET_FOLLOWS_ACCOUNT = new Set(['agent37']);
+const BUDGET_MAX_AGE_MS = 60 * 60_000;
+
+/** An account whose limits were never read, a Daytona account read before
+ * its internet was (Tiers 1 and 2 reach essential services only), or one
+ * whose budget moves on its own and was read over an hour ago. */
 function needsProbe(value: WorldProviderConnection): boolean {
-  return !value.measuredLimits || (value.provider === 'daytona' && !value.measuredLimits.network);
+  const limits = value.measuredLimits;
+  if (!limits) return true;
+  if (value.provider === 'daytona' && !limits.network) return true;
+  return BUDGET_FOLLOWS_ACCOUNT.has(value.provider) && Date.now() - (limits.checkedAt ?? 0) > BUDGET_MAX_AGE_MS;
 }
 
 /** Each size, the largest any reachable account allows ("Any"'s ceiling). */

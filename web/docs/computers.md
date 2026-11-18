@@ -7,10 +7,10 @@ Every task runs on its own cloud computer, unless it needs none (see None, below
 | E2B | up to ~29 GB | memory kept, resumes in a second | the fastest start; a desktop or an outbound allowlist |
 | Daytona | up to 10 GB | resumes in seconds | the same, smaller disks |
 | Fly.io | up to 500 GB | disk kept, wakes in ~5 s | large disks |
-| Hetzner | up to 10 TB | disk kept, wakes in ~30–60 s | the lowest price (EU) |
+| Hetzner | up to 10 TB | disk kept, wakes in ~30–60 s | the largest disks; 8–16 CPU machines (EU) |
 | AWS | up to 16 TB | disk kept, wakes in ~20–40 s | your own AWS account, any region |
 | Google Cloud | up to 64 TB | disk kept, wakes in ~20–40 s | your own Google Cloud project; machines of exactly the size you choose |
-| Agent37 | up to 100 GB | disk kept, wakes in ~10 s | the lowest price per hour; up to 4 CPU · 32 GB |
+| Agent37 | up to 100 GB | disk kept, wakes in ~10 s | the lowest price per hour; up to 8 CPU · 64 GB |
 
 On Fly.io, Hetzner, AWS, Google Cloud and Agent37 a computer's disk keeps everything, including files Git ignores. It grows while the task runs (on Agent37, when the computer next starts). They have no desktop and no outbound allowlist.
 
