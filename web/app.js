@@ -20425,17 +20425,60 @@ function stageFileUpload(pid, file, onProgress, signal) {
 // Whether the browser can still read a chosen file (Chrome refuses one changed since).
 const fileReadable = (file) => file.slice(0, 1).arrayBuffer().then(() => true, () => false);
 
+// An upload of any size goes in rounds: each round's files are staged, then
+// saved as one batch (one commit, one data version), so what waits on the
+// server stays bounded (CHANGE_LIMITS in src/world/project-file-changes.ts
+// allows twice a round). A folder like bot_data (8,598 files, 603 MB) is one round.
+const UPLOAD_ROUND = { files: 10000, bytes: 1024 ** 3 };
+function uploadRounds(items, limits = UPLOAD_ROUND) {
+  const rounds = [];
+  let round = [], bytes = 0;
+  for (const item of items) {
+    const size = item.file.size;
+    if (round.length && (round.length >= limits.files || bytes + size > limits.bytes)) { rounds.push(round); round = []; bytes = 0; }
+    round.push(item); bytes += size;
+  }
+  if (round.length) rounds.push(round);
+  return rounds;
+}
+// One staged file's change. A new data folder is made by the first round it is
+// in (`made` holds those already made); later rounds write into it.
+function uploadChange(item, dir, upload, made) {
+  const change = { op: 'write', path: FV.join(dir, item.rel), upload };
+  if (item.keep === 'secret') return { ...change, keep: 'secret' };
+  if (item.keep !== 'data') return change;
+  if (!item.dataFolder) return { ...change, keep: 'data' };
+  return made.has(item.dataFolder) ? change : { ...change, keep: 'data', dataFolder: item.dataFolder };
+}
+// A folder of many files, or a heavy one, is better kept as data than in Git
+// (GitHub slows down and refuses big pushes): recommended so, the person chooses.
+const LARGE_FOLDER = { files: 1000, bytes: 100 * 1024 * 1024 };
+function recommendLargeFolders(items) {
+  const folders = new Map();
+  for (const item of items) {
+    const parts = FV.parts(item.rel);
+    if (parts.length < 2) continue;
+    const folder = folders.get(parts[0]) || { files: 0, bytes: 0 };
+    folder.files++; folder.bytes += item.file.size;
+    folders.set(parts[0], folder);
+  }
+  return items.map((item) => {
+    const parts = FV.parts(item.rel);
+    const folder = parts.length > 1 && folders.get(parts[0]);
+    if (!folder || (folder.files < LARGE_FOLDER.files && folder.bytes < LARGE_FOLDER.bytes) || item.plan.keep === 'secret' || item.plan.fixed) return item;
+    return { ...item, plan: { keep: 'data', why: 'A large folder' } };
+  });
+}
+
 // `items` ({file, rel, entry?}) may still be coming (a dropped folder being walked):
 // the tray shows from the first moment either way.
-// The server's bounds on one batch (CHANGE_LIMITS in src/world/project-file-changes.ts).
-const UPLOAD_LIMITS = { files: 2000, bytes: 1024 ** 3 };
 async function uploadFilesInto(pid, dir, itemsOrPromise) {
   const controller = new AbortController();
   const tray = filesTray('Preparing upload…', { cancel: () => controller.abort() }).progress(null);
-  // Bytes staged but not saved (cancelled, or the batch failed) are dropped at once, not in an hour.
+  // Bytes staged but not yet saved are dropped at once if the upload stops, not in an hour.
   const staged = new Map();
-  let saved = false;
   let what = 'files';
+  let landed = 0;
   // Where it goes is fixed now: moving to another view meanwhile must not move the upload.
   const view = S.filesView || '';
   try {
@@ -20443,23 +20486,25 @@ async function uploadFilesInto(pid, dir, itemsOrPromise) {
     if (tray.cancelled) return;
     if (!items?.length) return tray.remove();
     const top = [...new Set(items.map((item) => FV.parts(item.rel)[0]))];
-    what = top.length === 1 ? top[0] : `${items.length} files`;
+    what = top.length === 1 ? top[0] : `${items.length.toLocaleString()} files`;
     tray.title(`Preparing ${what}…`);
-    const size = items.reduce((sum, item) => sum + item.file.size, 0);
-    if (items.length > UPLOAD_LIMITS.files || size > UPLOAD_LIMITS.bytes)
-      return tray.end(`${what} is too big to upload at once`, { failed: true,
-        why: `${items.length.toLocaleString()} files, ${FV.formatBytes(size)}: up to ${UPLOAD_LIMITS.files.toLocaleString()} files and ${FV.formatBytes(UPLOAD_LIMITS.bytes)} at a time. Upload it in parts.` });
     const replacing = top.filter((name) => filesNamesHere().has(name));
     if (replacing.length && !confirm(`Replace ${replacing.length === 1 ? `“${replacing[0]}”` : `${replacing.length} items`}?`)) return tray.remove();
-    // In a branch view, what is not for Git (secrets, large or ignored files) is asked about first.
+    // In a branch view, what is not for Git (secrets, large or ignored files, big folders) is asked about first.
     if (!view.startsWith('task:')) {
-      const planned = await api(`/api/projects/${encodeURIComponent(pid)}/files/plan${filesViewQuery(view, '?')}`,
-        { method: 'POST', body: JSON.stringify({ items: items.map((item) => ({ path: FV.join(dir, item.rel), size: item.file.size })) }) });
-      if (tray.cancelled) return;
-      const byPath = new Map((planned.items || []).map((plan) => [plan.path, plan]));
-      items = items.map((item) => ({ ...item, plan: byPath.get(FV.join(dir, item.rel)) || { keep: 'git' } }));
+      const plans = [];
+      let canKeep = false;
+      for (let at = 0; at < items.length; at += UPLOAD_ROUND.files) {
+        const planned = await api(`/api/projects/${encodeURIComponent(pid)}/files/plan${filesViewQuery(view, '?')}`,
+          { method: 'POST', body: JSON.stringify({ items: items.slice(at, at + UPLOAD_ROUND.files).map((item) => ({ path: FV.join(dir, item.rel), size: item.file.size })) }) });
+        plans.push(...(planned.items || []));
+        canKeep = !!planned.canKeep;
+        if (tray.cancelled) return;
+      }
+      const byPath = new Map(plans.map((plan) => [plan.path, plan]));
+      items = recommendLargeFolders(items.map((item) => ({ ...item, plan: byPath.get(FV.join(dir, item.rel)) || { keep: 'git' } })));
       if (items.some((item) => item.plan.keep !== 'git' && !item.plan.fixed)) {
-        items = await chooseUploadPlaces(dir, items, !!planned.canKeep);
+        items = await chooseUploadPlaces(dir, items, canKeep);
         if (!items?.length) return tray.remove();
       }
     }
@@ -20468,6 +20513,8 @@ async function uploadFilesInto(pid, dir, itemsOrPromise) {
     const sent = new Map();
     const started = Date.now();
     const going = new Set();
+    const rounds = uploadRounds(items);
+    let part = 0;
     const paint = () => {
       const done = [...sent.values()].reduce((a, b) => a + b, 0);
       const secs = done > 0 ? ((Date.now() - started) / 1000) * ((total - done) / done) : 0;
@@ -20475,11 +20522,7 @@ async function uploadFilesInto(pid, dir, itemsOrPromise) {
       const now = items.length > 1 ? [...going].map((item) => FV.parts(item.rel).pop()).join(', ') : '';
       tray.progress(total ? done / total : null, `${FV.formatBytes(done)} of ${FV.formatBytes(total)}${left}${now ? ` · ${now}` : ''}`);
     };
-    tray.title(`Uploading ${what}`);
-    paint();
     const unreadable = [], refused = [];
-    let fatal = null;
-    const queue = items.slice();
     const sendOne = async (item) => {
       going.add(item); paint();
       for (let attempt = 0; ; attempt++) {
@@ -20506,34 +20549,46 @@ async function uploadFilesInto(pid, dir, itemsOrPromise) {
       }
       going.delete(item); paint();
     };
-    const worker = async () => { while (queue.length && !fatal) { const item = queue.shift(); try { await sendOne(item); } catch (error) { fatal ||= error; } } };
-    await Promise.all(Array.from({ length: Math.min(UPLOAD_PARALLEL, items.length) }, worker));
-    if (tray.cancelled || fatal?.cancelled) return;
-    if (fatal) throw fatal.status === 0 ? new Error('The connection dropped. Upload again to finish.') : fatal;
-    const ready = items.filter((item) => staged.has(item));
+    const made = new Set();
+    let kept = '';
+    for (const round of rounds) {
+      part++;
+      const counted = rounds.length > 1 ? ` (${part} of ${rounds.length})` : '';
+      tray.title(`Uploading ${what}${counted}`);
+      paint();
+      let fatal = null;
+      const queue = round.slice();
+      const worker = async () => { while (queue.length && !fatal) { const item = queue.shift(); try { await sendOne(item); } catch (error) { fatal ||= error; } } };
+      await Promise.all(Array.from({ length: Math.min(UPLOAD_PARALLEL, round.length) }, worker));
+      if (tray.cancelled || fatal?.cancelled) return;
+      if (fatal) throw fatal.status === 0 ? new Error('The connection dropped. Upload again to finish.') : fatal;
+      const ready = round.filter((item) => staged.has(item));
+      if (!ready.length) continue;
+      tray.title(`Saving ${what}${counted}…`);
+      const changes = ready.map((item) => uploadChange(item, dir, staged.get(item).upload, made));
+      // The server drops what a batch names, saved or not.
+      for (const item of ready) staged.delete(item);
+      const result = await applyFileChanges(pid, changes, null, { view, refresh: false, quiet: true });
+      kept ||= fileChangesSummary(result);
+      for (const item of ready) if (item.keep === 'data' && item.dataFolder) made.add(item.dataFolder);
+      landed += ready.length;
+    }
     const missed = [...names(unreadable), ...refused.map(({ item }) => FV.join(dir, item.rel))];
     const missedWhy = unreadable.length
       ? `${unreadable.length === 1 ? 'It' : 'They'} changed or moved after you chose ${unreadable.length === 1 ? 'it' : 'them'}. Choose ${unreadable.length === 1 ? 'it' : 'them'} again to upload.`
       : refused[0]?.why || '';
-    if (!ready.length) return tray.end(`Couldn’t upload ${what}`, { failed: true, items: missed, why: missedWhy });
-    tray.title(`Saving ${what}…`).progress(null, `${ready.length} file${ready.length === 1 ? '' : 's'}`);
-    const changes = ready.map((item) => ({ op: 'write', path: FV.join(dir, item.rel), upload: staged.get(item).upload,
-      ...(item.keep === 'data' || item.keep === 'secret' ? { keep: item.keep } : {}), ...(item.keep === 'data' && item.dataFolder ? { dataFolder: item.dataFolder } : {}) }));
-    let kept = '';
-    // (The server drops what a batch names, saved or not.)
-    saved = true;
-    for (let at = 0; at < changes.length; at += 1000) {
-      const result = await applyFileChanges(pid, changes.slice(at, at + 1000), null, { view, refresh: at + 1000 >= changes.length, quiet: true });
-      kept ||= fileChangesSummary(result);
-    }
-    const landed = ready.length === 1 ? FV.parts(ready[0].rel).pop() : `${ready.length} files`;
-    if (missed.length) tray.end(`Uploaded ${landed} · ${missed.length} left out`, { failed: true, items: missed, why: missedWhy });
-    else tray.end(`Uploaded ${landed}`, { why: kept });
+    if (!landed) return tray.end(`Couldn’t upload ${what}`, { failed: true, items: missed, why: missedWhy });
+    const said = landed === 1 && items.length === 1 ? FV.parts(items[0].rel).pop() : `${landed.toLocaleString()} files`;
+    if (missed.length) tray.end(`Uploaded ${said} · ${missed.length} left out`, { failed: true, items: missed, why: missedWhy });
+    else tray.end(`Uploaded ${said}`, { why: kept });
   } catch (error) {
     if (error?.cancelled || tray.cancelled) return;
-    tray.end(`Couldn’t upload ${what}`, { failed: true, why: plainError(error?.message || String(error)) });
+    const why = plainError(error?.message || String(error));
+    // What earlier rounds saved stays: say so, so the rest can follow.
+    tray.end(landed ? `Uploaded ${landed.toLocaleString()} files, then stopped` : `Couldn’t upload ${what}`, { failed: true, why });
   } finally {
-    if (!saved) for (const { upload } of staged.values())
+    if (landed) refreshFilesPage();
+    for (const { upload } of staged.values())
       fetch(`/api/projects/${encodeURIComponent(pid)}/files/uploads/${encodeURIComponent(upload)}`,
         { method: 'DELETE', headers: S.token ? { authorization: `Bearer ${S.token}` } : {} }).catch(() => {});
   }
@@ -20575,7 +20630,7 @@ function chooseUploadPlaces(dir, items, canKeep) {
       return `<li class="files-upload-row${row.keep === 'skip' ? ' skipped' : ''}" data-i="${i}">
         <span class="files-icon">${row.folder ? FV.ICONS.directory : FV.ICONS.file}</span>
         <span class="files-upload-name"><span class="files-name" title="${esc(FV.join(dir, row.name))}">${esc(row.name)}${row.folder ? '/' : ''}</span>
-          <span class="files-upload-meta">${row.folder ? `${row.items.length} files · ` : ''}${esc(FV.formatBytes(row.size))}${row.recommended !== 'git' && row.why ? ` · ${esc(row.why)}` : ''}</span></span>
+          <span class="files-upload-meta">${row.folder ? `${row.items.length.toLocaleString()} files · ` : ''}${esc(FV.formatBytes(row.size))}${row.recommended !== 'git' && row.why ? ` · ${esc(row.why)}` : ''}</span></span>
         <span class="segmented sm files-upload-keep" role="radiogroup" aria-label="Keep ${esc(row.name)} in">${choices.map((keep) => {
           const disabled = keep !== 'git' && !canKeep && !row.fixed;
           return `<button type="button" role="radio" data-keep="${keep}" aria-checked="${row.keep === keep}" aria-pressed="${row.keep === keep}"${disabled ? ' disabled' : ''}

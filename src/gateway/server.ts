@@ -5647,15 +5647,16 @@ export class Gateway {
         if (!(await store.getProject(projectId))) return this.json(res, 404, { error: 'project not found' });
         const view = await this.filesView(session.apiToken, projectId, url);
         if ('error' in view) return this.json(res, view.status, { error: view.error });
-        const body = await this.body(req, 8 * 1024 * 1024);
+        const body = await this.body(req, 16 * 1024 * 1024);
         const changes: FileChange[] = [];
         const used: string[] = [];
         const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-file-text-'));
         try {
           const list = Array.isArray(body.changes) ? body.changes : [];
           if (!list.length || list.length > CHANGE_LIMITS.changes) return this.json(res, 400, { error: `changes must list 1 to ${CHANGE_LIMITS.changes} changes` });
+          const principal = (await this.deps.tokens.verify(session.apiToken))?.principal ?? '';
           for (const raw of list) {
-            const change = await this.fileChange(raw, projectId, session, scratch, changes.length, used);
+            const change = await this.fileChange(raw, projectId, session, scratch, changes.length, used, principal);
             if ('error' in change) return this.json(res, change.status, { error: change.error });
             changes.push(change);
           }
@@ -11199,7 +11200,7 @@ export class Gateway {
   private async stageFileUpload(req: http.IncomingMessage, projectId: string, token: string): Promise<{ upload: string; size: number }> {
     const principal = (await this.deps.tokens.verify(token))?.principal ?? '';
     const own = [...this.fileUploads.values()].filter((upload) => upload.principal === principal);
-    if (own.length >= 2000 || own.reduce((sum, upload) => sum + upload.size, 0) > CHANGE_LIMITS.bytes)
+    if (own.length >= CHANGE_LIMITS.files || own.reduce((sum, upload) => sum + upload.size, 0) > CHANGE_LIMITS.bytes)
       throw Object.assign(new Error('Too many uploads waiting: send the changes that use them first.'), { status: 429 });
     const id = crypto.randomBytes(18).toString('base64url');
     const dir = path.join(os.tmpdir(), 'karmax-file-uploads');
@@ -11235,7 +11236,7 @@ export class Gateway {
 
   /** One change of a batch as the request gave it: `write` takes an `upload`
    * id (or `text`), a paste from another view names it (`fromTask`/`fromBranch`/`fromDefault`). */
-  private async fileChange(raw: any, projectId: string, session: Session, scratch: string, index: number, used: string[])
+  private async fileChange(raw: any, projectId: string, session: Session, scratch: string, index: number, used: string[], principal: string)
     : Promise<FileChange | { error: string; status: number }> {
     const op = raw?.op;
     const named = (value: unknown) => typeof value === 'string' && value.trim() ? value : undefined;
@@ -11252,7 +11253,6 @@ export class Gateway {
         return { op, path: where, source, ...keeping };
       }
       const upload = typeof raw.upload === 'string' ? this.fileUploads.get(raw.upload) : undefined;
-      const principal = (await this.deps.tokens.verify(session.apiToken))?.principal ?? '';
       if (!upload || upload.projectId !== projectId || upload.principal !== principal)
         return { error: 'That upload is gone: upload the file again.', status: 400 };
       used.push(raw.upload);

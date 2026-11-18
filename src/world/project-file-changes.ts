@@ -101,8 +101,9 @@ export interface ProjectFileChangesDeps {
   keeping?: FileKeeping;
 }
 
-/** What one batch may carry. */
-export const CHANGE_LIMITS = { changes: 2000, files: 5000, bytes: 1024 * 1024 * 1024, file: 512 * 1024 * 1024 } as const;
+/** What one batch may carry: twice the console's upload round (10,000 files,
+ * 1 GB; web/app.js UPLOAD_ROUND), which uploads anything bigger in rounds. */
+export const CHANGE_LIMITS = { changes: 20_000, files: 20_000, bytes: 2 * 1024 * 1024 * 1024, file: 512 * 1024 * 1024 } as const;
 
 interface GitPlace { name: string; segments: string[]; role: 'development' | 'project-wiki'; sshUrl: string; branch: string }
 
@@ -215,7 +216,7 @@ export class ProjectFileChanges {
       const target = path.join(scratch, 'paste', String(out.length));
       fs.mkdirSync(path.dirname(target), { recursive: true });
       await this.deps.files.open(projectId, where, { data: options.data, view }, async (file) => {
-        if ((bytes += file.size) > CHANGE_LIMITS.bytes) { file.stop(); throw new FileAccessError('Too much to copy at once (1 GB).'); }
+        if ((bytes += file.size) > CHANGE_LIMITS.bytes) { file.stop(); throw new FileAccessError('Too much to copy at once (2 GB).'); }
         const sink = fs.createWriteStream(target);
         await new Promise<void>((resolve, reject) => {
           file.stream.on('error', reject);
@@ -442,48 +443,70 @@ export class ProjectFileChanges {
         };
         const tip = (await run(['rev-parse', 'HEAD'])).trim();
         await run(['read-tree', tip]);
-        const entries = async (rel: string) => parseIndex(await run(['ls-files', '-s', '-z', '--', `:(literal)${rel}`]))
-          .filter((entry) => entry.path === rel || entry.path.startsWith(`${rel}/`));
+        // The branch's tree, read once and changed in memory: a batch of
+        // thousands of files costs a few git processes, not several per file.
+        const tree = new IndexModel(parseIndex(await run(['ls-files', '-s', '-z'])));
+        const writes: Array<{ path: string; source: string; mode: string }> = [];
+        let empty = '';
         for (const op of ops) {
           if (op.op === 'write') {
-            const existing = await entries(op.path);
-            const file = existing.find((entry) => entry.path === op.path);
-            if (!file && existing.length) throw new FileConflictError(`${op.path} is a folder.`);
+            const file = tree.get(op.path);
+            if (!file && tree.isFolder(op.path)) throw new FileConflictError(`${op.path} is a folder.`);
             if (op.expect === null && file) throw new FileConflictError(`${op.path} already exists.`);
             if (op.expect && file?.object !== op.expect) throw new FileConflictError(`${op.path} changed since you opened it.`);
             if (op.expect && !file) throw new FileConflictError(`${op.path} was deleted since you opened it.`);
-            await this.refuseFileOnTheWay(entries, op.path);
-            const object = (await run(['hash-object', '-w', '--no-filters', '--', op.source])).trim();
+            tree.refuseFileOnTheWay(op.path);
             const mode = file && file.mode === '100755' ? '100755' : '100644';
-            await run(['update-index', '--add', '--cacheinfo', `${mode},${object},${op.path}`]);
+            // Hashed below, all at once; until then the entry names its source.
+            tree.set({ mode, object: '', path: op.path });
+            writes.push({ path: op.path, source: op.source, mode });
           } else if (op.op === 'mkdir') {
-            if ((await entries(op.path)).some((entry) => entry.path === op.path)) throw new FileConflictError(`${op.path} already exists.`);
-            await this.refuseFileOnTheWay(entries, op.path);
+            if (tree.get(op.path)) throw new FileConflictError(`${op.path} already exists.`);
+            tree.refuseFileOnTheWay(op.path);
             // Git keeps no empty folders: a new one holds an empty .gitkeep.
             const keep = `${op.path}/.gitkeep`;
-            if (!(await entries(keep)).length) {
-              const empty = (await run(['hash-object', '-w', '--stdin'], '')).trim();
-              await run(['update-index', '--add', '--cacheinfo', `100644,${empty},${keep}`]);
+            if (!tree.under(keep).length) {
+              empty ||= (await run(['hash-object', '-w', '--stdin'], '')).trim();
+              tree.set({ mode: '100644', object: empty, path: keep });
             }
           } else if (op.op === 'delete') {
-            const gone = await entries(op.path);
+            const gone = tree.under(op.path);
             if (!gone.length) throw new FileNotFoundError(`Nothing at ${op.path}`);
-            await run(['update-index', '--force-remove', '-z', '--stdin'], gone.map((entry) => `${entry.path}\0`).join(''));
+            for (const entry of gone) tree.remove(entry.path);
+            for (let at = writes.length - 1; at >= 0; at--) if (writes[at]!.path === op.path || writes[at]!.path.startsWith(`${op.path}/`)) writes.splice(at, 1);
           } else {
-            const copied = await entries(op.from);
+            const copied = tree.under(op.from);
             if (!copied.length) throw new FileNotFoundError(`Nothing at ${op.from}`);
             if (op.to === op.from || op.to.startsWith(`${op.from}/`)) throw new FileConflictError('A folder can’t go inside itself.');
-            if ((await entries(op.to)).length) throw new FileConflictError(`${op.to} already exists.`);
-            await this.refuseFileOnTheWay(entries, op.to);
-            await run(['update-index', '--add', '-z', '--index-info'], copied.map((entry) =>
-              `${entry.mode} ${entry.object}\t${op.to}${entry.path.slice(op.from.length)}\0`).join(''));
+            if (tree.under(op.to).length) throw new FileConflictError(`${op.to} already exists.`);
+            tree.refuseFileOnTheWay(op.to);
+            for (const entry of copied) {
+              const to = `${op.to}${entry.path.slice(op.from.length)}`;
+              tree.set({ ...entry, path: to });
+              // A copy of a file written earlier in this batch is that file.
+              let pending: (typeof writes)[number] | undefined;
+              for (const write of writes) if (write.path === entry.path) pending = write;
+              if (pending) writes.push({ ...pending, path: to });
+            }
           }
         }
-        const tree = (await run(['write-tree'])).trim();
-        if (tree === (await run(['rev-parse', `${tip}^{tree}`])).trim()) return undefined;
+        // Every written file's bytes, in one process; a path written twice keeps its last.
+        const last = new Map(writes.map((write) => [write.path, write]));
+        if (last.size) {
+          const sources = [...last.values()];
+          const objects = (await run(['hash-object', '-w', '--no-filters', '--stdin-paths'], `${sources.map((write) => write.source).join('\n')}\n`)).trim().split('\n');
+          if (objects.length !== sources.length) throw new Error('git hash-object answered for fewer files than it was given');
+          sources.forEach((write, at) => tree.set({ mode: write.mode, object: objects[at]!, path: write.path }));
+        }
+        // The index becomes the tree in memory: removals first, then what changed.
+        const zero = '0'.repeat(tip.length);
+        const lines = [...tree.removed().map((rel) => `0 ${zero}\t${rel}\0`), ...tree.changed().map((entry) => `${entry.mode} ${entry.object}\t${entry.path}\0`)];
+        if (lines.length) await run(['update-index', '--add', '-z', '--index-info'], lines.join(''));
+        const written = (await run(['write-tree'])).trim();
+        if (written === (await run(['rev-parse', `${tip}^{tree}`])).trim()) return undefined;
         const identity = { ...indexEnv, GIT_AUTHOR_NAME: author.name, GIT_AUTHOR_EMAIL: author.email,
           GIT_COMMITTER_NAME: author.name, GIT_COMMITTER_EMAIL: author.email };
-        const made = await git(clone, ['commit-tree', tree, '-p', tip, '-m', commitMessage(ops)], { env: identity });
+        const made = await git(clone, ['commit-tree', written, '-p', tip, '-m', commitMessage(ops)], { env: identity });
         if (made.code !== 0) throw new Error(firstLine(made.stderr || made.stdout));
         const commit = made.stdout.trim();
         const pushed = await git(clone, ['push', '--porcelain', 'origin', `${commit}:refs/heads/${place.branch}`], { env, timeoutMs: 10 * 60_000 });
@@ -502,15 +525,6 @@ export class ProjectFileChanges {
       }
     }
   }
-
-  /** A file where `rel` needs a folder (`a` when writing `a/b`). */
-  private async refuseFileOnTheWay(entries: (rel: string) => Promise<IndexEntry[]>, rel: string): Promise<void> {
-    const parts = rel.split('/');
-    for (let at = 1; at < parts.length; at++) {
-      const prefix = parts.slice(0, at).join('/');
-      if ((await entries(prefix)).some((entry) => entry.path === prefix)) throw new FileConflictError(`${prefix} is a file.`);
-    }
-  }
 }
 
 type LocalChange =
@@ -520,6 +534,50 @@ type LocalChange =
   | { op: 'copy' | 'move'; from: string; to: string };
 
 interface IndexEntry { mode: string; object: string; path: string }
+
+/** A branch's index in memory: files by path, and which paths are folders. */
+class IndexModel {
+  private readonly files = new Map<string, IndexEntry>();
+  private readonly original = new Map<string, IndexEntry>();
+  private folders: Set<string> | undefined;
+  constructor(entries: IndexEntry[]) {
+    for (const entry of entries) { this.files.set(entry.path, entry); this.original.set(entry.path, entry); }
+  }
+  get(rel: string): IndexEntry | undefined { return this.files.get(rel); }
+  set(entry: IndexEntry): void {
+    this.files.set(entry.path, entry);
+    if (this.folders) for (const folder of parentsOf(entry.path)) this.folders.add(folder);
+  }
+  remove(rel: string): void { this.files.delete(rel); this.folders = undefined; }
+  isFolder(rel: string): boolean {
+    if (!this.folders) { this.folders = new Set(); for (const file of this.files.keys()) for (const folder of parentsOf(file)) this.folders.add(folder); }
+    return this.folders.has(rel);
+  }
+  /** The file at `rel`, or every file under the folder `rel`. */
+  under(rel: string): IndexEntry[] {
+    const file = this.files.get(rel);
+    if (file) return [file];
+    if (!this.isFolder(rel)) return [];
+    return [...this.files.values()].filter((entry) => entry.path.startsWith(`${rel}/`));
+  }
+  /** A file where `rel` needs a folder (`a` when writing `a/b`). */
+  refuseFileOnTheWay(rel: string): void {
+    for (const folder of parentsOf(rel)) if (this.files.has(folder)) throw new FileConflictError(`${folder} is a file.`);
+  }
+  removed(): string[] { return [...this.original.keys()].filter((rel) => !this.files.has(rel)); }
+  changed(): IndexEntry[] {
+    return [...this.files.values()].filter((entry) => {
+      const was = this.original.get(entry.path);
+      return !was || was.mode !== entry.mode || was.object !== entry.object;
+    });
+  }
+}
+
+/** `a` and `a/b` for `a/b/c`. */
+function parentsOf(rel: string): string[] {
+  const parts = rel.split('/');
+  return parts.slice(1).map((_, at) => parts.slice(0, at + 1).join('/'));
+}
 
 function parseIndex(output: string): IndexEntry[] {
   const entries: IndexEntry[] = [];
