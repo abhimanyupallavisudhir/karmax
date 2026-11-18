@@ -2,7 +2,7 @@
   {
     "id": "GHSA-fc5q-39xc-vjpf",
     "package": "picomatch",
-    "reason": "ReDoS from an attacker-supplied glob pattern (single-branch repeated extglobs like +(*)); every picomatch through 4.0.7, the latest, no fix as of 2026-11-17. At runtime it is reached only through @daytona/sdk -> fast-glob -> micromatch, which the SDK calls only in Image.fromDockerfile and Image.dockerfileCommands to expand COPY sources. tavya builds Daytona snapshots with Image.base().runCommands() only (src/world/environment-build.ts; runCommands appends RUN lines, no glob), so no pattern reaches picomatch. vite, vitest, tinyglobby and fdir are test tooling given only patterns written in this repository. Same path as the braces exception of 2026-10-03 (wiki incidents/lessons).",
-    "expires": "2026-12-15"
+    "reason": "ReDoS from a glob pattern with single-branch repeated extglobs; affects every picomatch release (<=4.0.7, the latest), no fix as of 2026-11-17. Only a malicious pattern triggers it, and none reaches picomatch here. In production it is reached only through @daytona/sdk -> fast-glob -> micromatch, which the SDK calls only in Image.fromDockerfile to expand a local Dockerfile's COPY sources; tavya never builds a Daytona image from a Dockerfile (src/world/environment-build.ts uses Image.base().runCommands() only). The other paths (vitest, vite, tinyglobby, fdir) are devDependencies, left out of the image by npm ci --omit=dev in deploy/Dockerfile, and match only the repository's own test globs.",
+    "expires": "2026-12-31"
   }
 ]

@@ -2242,7 +2242,9 @@ function agentBlockHtml(prefix, spec, opts) {
   prefix ||= `agent-block-${agentBlockHtml.nextId = (agentBlockHtml.nextId || 0) + 1}`;
   const inh = opts.inherited || {};
   const role = opts.role || 'do';
-  const e = spec || inh; // prefill with the effective spec
+  // Prefill with the effective spec. One that names no harness (the Fork
+  // button's: only its source) runs on the inherited agent, so show that.
+  const e = spec?.provider ? spec : { ...spec, provider: inh.provider, model: inh.model, effort: inh.effort };
   const providerVisible = !e.provider || AGENT_PROVIDERS.includes(e.provider);
   const provider = agentProviderChoice(e.provider);
   const model = providerVisible ? e.model : '';
