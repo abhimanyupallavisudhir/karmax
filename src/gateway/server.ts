@@ -1,5 +1,6 @@
 import { computerDefaults, saveOrganizationComputer, saveProjectComputer, splitComputerValues } from '../platform/computer-settings.js';
-import { ORGANIZATION_COORDINATOR_PROJECT, type AutonomyScope, type ProjectAutonomy } from '../domain/autonomous-projects.js';
+import { type AutonomyScope, type ProjectAutonomy } from '../domain/autonomous-projects.js';
+import { freeCoordinatorName, organizationCoordinatorProject, ORGANIZATION_COORDINATOR_KEY } from '../platform/organization-coordinator.js';
 import { machineWaits, type MachineWait } from '../world/machine-wait.js';
 import { REPOSITORY_ROUTE } from '../world/resource-repository.js';
 import { clientAddress, ClientRequestLimits } from './client-address.js';
@@ -59,7 +60,7 @@ import { compactTaskView, platformRequestPathError } from '../platform/platform-
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { manifest } from '../contrib/manifests.js';
-import { LOCAL_WORLD_KINDS, isComputerless, machineShape, runsOnHost } from '../domain/computer.js';
+import { LOCAL_WORLD_KINDS, NO_COMPUTER, isComputerless, machineShape, runsOnHost } from '../domain/computer.js';
 import { projectSettingsFor, globalSettingsFor, settingsToProjectConfig, resolveParams, effectiveRepos } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { findProviderSession } from '../agent/fork.js';
@@ -297,6 +298,9 @@ export function routeCapability(method: string, p: string, url?: URL): KnownCapa
   if (/^\/api\/organizations\/[^/]+\/views$/.test(p)) return read ? 'task:read' : 'task:edit';
   // Templates are saved task forms: whoever may create tasks may save one.
   if (/^\/api\/organizations\/[^/]+\/templates$/.test(p)) return read ? 'task:read' : 'task:create';
+  // Ask (wiki features/computerless-tasks): a task in the organization's
+  // co-ordinator project, made on first use by whoever may create tasks there.
+  if (/^\/api\/organizations\/[^/]+\/ask$/.test(p) && !read) return 'task:create';
   if (/^\/api\/organizations\/[^/]+\/projects/.test(p)) return read ? 'project:read' : 'project:create';
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
@@ -872,6 +876,8 @@ export class Gateway {
   private loopbackUrl?: string;
   private wikiRemotesReady = new Set<string>();
   private wikiRemotesProvisioning = new Set<string>();
+  /** Co-ordinator projects being made, one per organization at a time. */
+  private coordinatorProjects = new Map<string, Promise<Project>>();
   private wikiRemoteRetryAfter = new Map<string, number>();
   /** Holds CDP sessions across a passkey enroll/login click (PLAN-passwords §8). */
   private passkeys?: import('../autonomy/passkey.js').PasskeyManager;
@@ -3314,9 +3320,8 @@ export class Gateway {
         if (b.autonomous !== true) return this.json(res, 200, organization);
         // An autonomous organization starts with a project its co-ordinator runs
         // everything from, set up with the organization's whole authority.
-        let project = (await store.createProject(ORGANIZATION_COORDINATOR_PROJECT, normalizeConfig({}, false, this.deps.hosted === true), organization.id));
+        let project = await this.organizationCoordinator(organization.id, subject.userId);
         (await store.setProjectMembership(project.id, { kind: 'user', userId: subject.userId }, 'owner'));
-        await this.ensureProjectWiki(project, subject.userId);
         await this.installDefaultTasks(project);
         project = (await store.getProject(project.id)) ?? project;
         const inOrganization = (await this.auth(req, undefined, organization.id))?.apiToken ?? token;
@@ -4084,6 +4089,20 @@ export class Gateway {
         await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'repository.moved-to-github', `repository:${moved.id}`,
           { from: repository.id, to: `${moved.owner}/${moved.name}`, projects: projectIds, ...identityAuditDetail(callerIdentity) });
         return this.json(res, 200, moved);
+      }
+      const organizationAsk = p.match(/^\/api\/organizations\/([^/]+)\/ask$/);
+      if (organizationAsk && method === 'POST') {
+        const organizationId = organizationAsk[1]!;
+        if (!(await store.getOrganization(organizationId))) return this.json(res, 404, { error: 'organization not found' });
+        const b = await this.body(req);
+        const prompt = typeof b.prompt === 'string' ? b.prompt.trim() : '';
+        if (!prompt) return this.json(res, 400, { error: 'prompt is required' });
+        const project = await this.organizationCoordinator(organizationId, callerIdentity.humanSubject?.userId);
+        await this.wikiForTaskStart(project, callerIdentity.humanSubject?.userId);
+        const task = await api.createTask(token, { projectId: project.id, workflow: 'software-dev', prompt, ownAuthority: true,
+          ...(Array.isArray(b.images) ? { images: b.images } : {}), ...(Array.isArray(b.files) ? { files: b.files } : {}),
+          params: { computer: { provider: NO_COMPUTER } } }, receivedAt);
+        return this.json(res, 200, { ...task, project });
       }
       const organizationProjects = p.match(/^\/api\/organizations\/([^/]+)\/projects$/);
       if (organizationProjects) {
@@ -9879,6 +9898,29 @@ export class Gateway {
   /** Set a just-created project up to run itself (wiki features/autonomy). The
    * project stays when that fails; the answer says why, for its creator to retry
    * from the project (POST /api/projects/:id/autonomy). */
+  /** The organization's co-ordinator project (src/platform/organization-coordinator.ts),
+   * made the first time it is needed: the place work for the whole organization
+   * lives, reached through the organization's authority (no membership is added:
+   * whoever acts for the organization reaches it, nobody else). */
+  private async organizationCoordinator(organizationId: string, userId?: string): Promise<Project> {
+    const existing = await organizationCoordinatorProject(this.deps.store, organizationId);
+    if (existing) return existing;
+    let making = this.coordinatorProjects.get(organizationId);
+    if (!making) {
+      making = (async () => {
+        const again = await organizationCoordinatorProject(this.deps.store, organizationId);
+        if (again) return again;
+        const name = freeCoordinatorName((await this.deps.store.listOrganizationProjects(organizationId)).map((project) => project.name));
+        const project = await this.deps.store.createProject(name, normalizeConfig({}, false, this.deps.hosted === true), organizationId);
+        await this.deps.store.kvSet(ORGANIZATION_COORDINATOR_KEY(organizationId), project.id);
+        await this.ensureProjectWiki(project, userId);
+        return (await this.deps.store.getProject(project.id)) ?? project;
+      })().finally(() => this.coordinatorProjects.delete(organizationId));
+      this.coordinatorProjects.set(organizationId, making);
+    }
+    return making;
+  }
+
   private async autonomous(token: string, projectId: string, scope: AutonomyScope): Promise<{ autonomy?: ProjectAutonomy; autonomyError?: string }> {
     try { return { autonomy: await this.deps.api.makeAutonomous(token, projectId, scope) }; }
     catch (error) { return { autonomyError: error instanceof Error ? error.message : String(error) }; }

@@ -6396,6 +6396,7 @@ function renderShell() {
       <button class="icon-btn mobile-menu" id="mobile-menu" aria-controls="rail" aria-label="Sidebar" aria-expanded="false">${ICON.menu}</button>
       <a class="brand" data-spa href="${esc(homeRoute())}" aria-label="Home">${brandMark()}</a>
       <span class="topbar-context" id="topbar-context"></span>
+      <button class="btn primary mobile-ask" id="mobile-ask" type="button" aria-haspopup="dialog" title="Ask ${esc(siteName())} — no computer, starts in seconds">${ICON.chat}<span>Ask</span></button>
     </div>
     ${verificationBanner()}
     <div class="body">
@@ -6438,6 +6439,7 @@ function renderShell() {
   $('#rail-new-task').addEventListener('click', () => openNewTaskForm());
   $('#rail-new-template').addEventListener('click', () => openTemplatePicker());
   $('#rail-ask').addEventListener('click', () => askTavya());
+  $('#mobile-ask').addEventListener('click', () => askTavya());
   $('#rail-help').addEventListener('click', openHelp);
   $('#key-echo').addEventListener('animationend', () => echoKeys('')); // faded out
   wireVerificationBanner();
@@ -9066,10 +9068,12 @@ function openNewTaskForm(template, projectId = template?.projectId) {
 function newTaskTarget() { return S.tab === 'home' ? newTaskProjectId() : S.projectId; }
 
 // "Ask tavya" (wiki features/computerless-tasks): what you type starts a task
-// without a computer in the project new tasks go to, acting with your own
-// authority; its page opens with the message box ready. One conversation is one task.
-function askTavya(projectId) {
-  if (!projectId) return withNewTaskProject((chosen) => askTavya(chosen));
+// without a computer in the organization's co-ordinator project (made on first
+// use), acting with your own authority; its page opens with the message box
+// ready. One conversation is one task. Someone whose authority covers only some
+// projects asks in one of those instead.
+function askTavya() {
+  const organizationId = S.organizationId;
   const previousFocus = document.activeElement;
   const dialog = document.createElement('dialog');
   dialog.className = 'text-prompt ask-dialog';
@@ -9078,7 +9082,7 @@ function askTavya(projectId) {
   dialog.innerHTML = `<form method="dialog"><div class="prompt-field"><textarea name="ask" rows="3" required maxlength="20000" aria-label="Ask ${esc(siteName())}"
       placeholder="Ask ${esc(siteName())} anything: change a setting, find what waits on you, start a task…"></textarea>
       ${mic ? `<div class="prompt-attach-row ask-mic">${mic}</div>` : ''}</div>
-    <div class="inline-form ask-foot"><span class="ask-where">${esc(projectById(projectId)?.name || '')}${policyTip(NO_COMPUTER_TIP)}</span>
+    <div class="inline-form ask-foot"><span class="ask-where">${policyTip(NO_COMPUTER_TIP)}</span>
       <button class="btn primary" value="submit" title="Ask (Enter)">Ask</button></div></form>`;
   const input = dialog.querySelector('textarea');
   const form = dialog.querySelector('form');
@@ -9090,10 +9094,22 @@ function askTavya(projectId) {
     sending = true;
     dialog.querySelector('button[value="submit"]').disabled = true;
     try {
-      const created = await api(`/api/projects/${encodeURIComponent(projectId)}/tasks`, { method: 'POST', body: JSON.stringify({
-        workflow: NEW_TASK_WORKFLOW, ownAuthority: true, params: { prompt: text, computer: { provider: NO_COMPUTER } } }) });
+      let created;
+      try {
+        created = await api(`/api/organizations/${encodeURIComponent(organizationId)}/ask`, { method: 'POST', body: JSON.stringify({ prompt: text }) });
+      } catch (error) {
+        if (error.status !== 403) throw error;
+        // Not someone who acts for the whole organization: ask in the project
+        // their new tasks go to.
+        const projectId = newTaskProjectId(organizationId);
+        if (!projectId) throw error;
+        created = await api(`/api/projects/${encodeURIComponent(projectId)}/tasks`, { method: 'POST', body: JSON.stringify({
+          workflow: NEW_TASK_WORKFLOW, ownAuthority: true, params: { prompt: text, computer: { provider: NO_COMPUTER } } }) });
+      }
+      // A co-ordinator project made just now joins the sidebar.
+      if (!projectById(created.projectId)) { await loadProjects(); renderRail(); }
       dialog.close();
-      await goToTask(created.id);
+      await spaNavigate(`${projectBase(created.projectId)}/tasks/${created.num ?? created.id}`);
       focusWhenReady('.followup-input');
     } catch (error) {
       toast(error.message, true);

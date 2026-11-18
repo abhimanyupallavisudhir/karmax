@@ -350,6 +350,9 @@ a { color: var(--accent); text-decoration: none; }
 }
 /* The open project's name beside the mark, where no sidebar shows it (a phone). */
 .topbar-context { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; color: var(--ink); }
+/* A phone's Ask sits in its top bar, at the thumb's end, instead of in the sidebar. */
+.mobile-bar .mobile-ask { flex: none; margin-left: auto; min-height: 34px; padding: 0 12px; gap: 6px; border-radius: 17px; }
+.mobile-bar .mobile-ask svg { width: 16px; height: 16px; }
 .tab-narrow { display: none; }
 /* The artwork carries its own background and rounded corners (see web/brand/),
    so the mark is just a sized image — no gradient plate behind it. */
@@ -2915,6 +2918,7 @@ html[data-theme="dark"] .github-signin-btn:active,
   .tab-wide { display:none; }
   .tab-narrow { display:inline; }
   #rail-help, .key-echo { display:none; } /* no keyboard to list or echo shortcuts for */
+  .rail-new .btn.rail-ask { display:none; } /* the top bar carries Ask */
   .rail-collapse { display:none; }
   .body { grid-template-columns: 1fr; }
   .rail {
