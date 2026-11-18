@@ -216,7 +216,10 @@ describe('media generation', () => {
     await expect(generateMedia(none.deps, none.organization.id, { kind: 'image', prompt: 'x' }))
       .rejects.toThrow(MediaUnavailable);
     const broke = await fixture({ credit: false });
-    await expect(generateMedia(broke.deps, broke.organization.id, { kind: 'image', prompt: 'x' })).rejects.toBeInstanceOf(ComputeCreditExhausted);
+    const spent = await generateMedia(broke.deps, broke.organization.id, { kind: 'image', prompt: 'x' }).catch((error) => error);
+    expect(spent).toBeInstanceOf(ComputeCreditExhausted);
+    // The agent is told where its people add credits, so it can pass the link on.
+    expect(spent.message).toMatch(/^Out of credits: .*Plan & billing \(\S*\/settings#settings-plan\)/);
     expect(mediaCalls()).toHaveLength(0);
     // OpenRouter refuses for money while the organization's credit is there:
     // tavya's own OpenRouter balance ran out, not the customer's credit.
@@ -427,7 +430,7 @@ describe('holding the quote on the credit', () => {
     const f = await fixture(); // $5 of credit: $2.50 at OpenRouter's prices
     const refused = await generateMedia(f.deps, f.organization.id, { kind: 'video', model: 'google/veo-3.1', prompt: 'x' }).catch((error) => error);
     expect(refused).toBeInstanceOf(ComputeCreditExhausted);
-    expect(refused.message).toMatch(/would cost up to \$6\.40 of credit; \$5\.00 is left/);
+    expect(refused.message).toMatch(/would cost up to \$6\.40 of tavya credits; \$5\.00 is left\. .*Plan & billing \(\/acme\/settings#settings-plan\)\.$/);
     await expect(generateMedia(f.deps, f.organization.id, { kind: 'video', model: 'test/dollar', prompt: 'x', maxCostUsd: 0.5 }))
       .rejects.toThrow(/may cost up to \$1\.000, above maxCostUsd \$0\.5/);
     expect(mediaCalls()).toHaveLength(0);

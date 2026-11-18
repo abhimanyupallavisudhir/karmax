@@ -86,6 +86,20 @@ const screens = {
     computeCreditMicros: 26e6, includedComputeCreditMicros: 16e6, computePacks: 1, compute: compute(8.9e6, 26e6) },
   { managed: true, providerConfigured: true, plan: 'team', billedPlan: 'team', status: 'active', catalog, canManage: true, ...packs, computePacks: 1,
     currentPeriodEnd: Date.UTC(2026, 11, 2), teamSeats: { total: 4, used: 3, gifted: 0, paid: 3, included: 1, limit: null, autoBill: true, priceCents: 500 } }],
+  // tavya credits folded open (task_mwlxentuf97ab46ddc): where they come from, what they paid for, and the price.
+  'plan-credits-info': [{ ...base, plan: 'individual', planName: 'Individual', currentMonthlyPriceCents: 1900, maxMembers: 1, maxActiveAgentRuns: 10,
+    activeAgentRuns: 2, storageQuotaBytes: 50 * GB, includedStorageBytes: 50 * GB, storageUsedBytes: 21 * GB,
+    computeCreditMicros: 25e6, includedComputeCreditMicros: 5e6, computePacks: 1, giftedComputePacks: 1,
+    compute: { ...compute(9.4e6, 25e6), includedModel: 'xiaomi/mimo-v2.6-pro', heldMicros: 0.6e6, topUpMicros: 0,
+      byProvider: [{ provider: 'hetzner', usedMicros: 5.1e6 }, { provider: 'e2b', usedMicros: 1.2e6 }, { provider: 'openrouter', usedMicros: 2.3e6 }, { provider: 'composio', usedMicros: 0.8e6 }] } },
+  { managed: true, providerConfigured: true, plan: 'individual', billedPlan: 'individual', status: 'active', catalog, canManage: true, ...packs, computePacks: 1,
+    currentPeriodEnd: Date.UTC(2026, 11, 3), autoTopUp: { enabled: false, offered: true, capCents: 5000, amountCents: 1000, spentCents: 0 } }, ['compute']],
+  // A gifted Team with gifted packs: storage credits folded open.
+  'plan-gifted-info': [{ ...base, plan: 'team', planName: 'Team', currentMemberCount: 2, currentMonthlyPriceCents: 1900, maxMembers: null, maxActiveAgentRuns: 25,
+    storageQuotaBytes: 310 * GB, includedStorageBytes: 110 * GB, giftedStoragePacks: 2, storageUsedBytes: 41 * GB,
+    computeCreditMicros: 23e6, includedComputeCreditMicros: 13e6, giftedComputePacks: 1, compute: compute(6.2e6, 23e6) },
+  { managed: true, providerConfigured: true, plan: 'team', billedPlan: 'free', status: 'none', catalog, canManage: true, gift: { plan: 'team', seats: 2 }, ...packs,
+    teamSeats: { total: 2, used: 2, gifted: 2, paid: 0, included: 2, limit: 2, autoBill: false, priceCents: 500 } }, ['storage', 'people']],
   // Canceled at the period end: Keep plan withdraws it.
   'plan-ending': [{ ...base, plan: 'individual', planName: 'Individual', currentMonthlyPriceCents: 900, maxMembers: 1, maxActiveAgentRuns: 10,
     storageQuotaBytes: 50 * GB, includedStorageBytes: 50 * GB, storageUsedBytes: 12 * GB, computeCreditMicros: 5e6, includedComputeCreditMicros: 5e6, compute: compute(1.1e6, 5e6) },
@@ -113,11 +127,28 @@ const managedCompute = { providers: [
     const policyLinks = () => '<a href="#">Terms</a> and <a href="#">Billing terms</a>';
     ${constant('COMPUTER_PROVIDERS')}
     const PLAN_ACTIVE = ['active', 'trialing', 'past_due'];
-    ${['formatBytes', 'policyTip', 'policyAcceptanceMarkup', 'planMoney', 'planDollars', 'planMeter', 'planPackName', 'planStepper', 'checkoutTermsTip', 'planBillingMarkup', 'managedRunning', 'managedComputeMarkup', 'includedModelRow'].map(fn).join('\n')}` });
-  for (const [name, [e, state]] of Object.entries(screens)) {
-    await page.evaluate(([e, state]) => { document.querySelector('#shot').innerHTML = planBillingMarkup(e, state); document.querySelector('.plan-operator')?.setAttribute('open', ''); }, [e, state]);
+    ${['formatBytes', 'policyTip', 'policyAcceptanceMarkup', 'planMoney', 'planDollars', 'planMeter', 'planPackName', 'planStepper', 'planRow', 'planLines', 'planCreditUse', 'checkoutTermsTip', 'planBillingMarkup', 'profilePlansMarkup', 'managedRunning', 'managedComputeMarkup', 'includedModelRow'].map(fn).join('\n')}` });
+  for (const [name, [e, state, open]] of Object.entries(screens)) {
+    await page.evaluate(([e, state, open]) => { S.planInfoOpen = new Set(open || []);
+      document.querySelector('#shot').innerHTML = planBillingMarkup(e, state); document.querySelector('.plan-operator')?.setAttribute('open', ''); }, [e, state, open]);
     await page.locator('.main-inner').screenshot({ path: path.join(out, `${name}.png`) });
   }
+  // Profile → Plans & billing: every organization one belongs to, one open into its card.
+  await page.evaluate(([e, state]) => {
+    S.planInfoOpen = new Set(); S.profilePlanOpen = 'o2';
+    document.querySelector('.settings-section-title div').textContent = 'Plans & billing';
+    document.querySelector('#shot').className = 'card';
+    document.querySelector('#shot').innerHTML = profilePlansMarkup({ organizations: [
+      { organizationId: 'o1', name: 'acme', planName: 'Team', gift: null, storagePacks: 1, computePacks: 2, giftedStoragePacks: 0, giftedComputePacks: 0,
+        credits: { usedMicros: 18.2e6, heldMicros: 0, availableMicros: 17.8e6, totalMicros: 36e6 } },
+      { organizationId: 'o2', name: 'nisada-personal', planName: 'Team', gift: { plan: 'team' }, storagePacks: 0, computePacks: 0, giftedStoragePacks: 2, giftedComputePacks: 1,
+        credits: { usedMicros: 6.2e6, heldMicros: 0, availableMicros: 16.8e6, totalMicros: 23e6 } },
+      { organizationId: 'o3', name: 'side-project', planName: 'Individual', gift: null, storagePacks: 0, computePacks: 0, giftedStoragePacks: 0, giftedComputePacks: 0,
+        credits: { usedMicros: 5e6, heldMicros: 0, availableMicros: 0, totalMicros: 5e6 } },
+      { organizationId: 'o4', name: 'sandbox', planName: 'Free', gift: null, credits: null }] });
+    document.querySelector('#profile-plan-o2').innerHTML = planBillingMarkup(e, state);
+  }, screens['plan-gifted-info']);
+  await page.locator('.main-inner').screenshot({ path: path.join(out, 'profile-plans.png') });
   await page.evaluate((view) => {
     document.querySelector('.settings-section-title div').textContent = 'Managed compute';
     document.querySelector('#shot').innerHTML = managedComputeMarkup(view, includedModelRow({ model: 'xiaomi/mimo-v2.6-pro', enabled: true,

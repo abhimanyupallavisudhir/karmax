@@ -178,15 +178,15 @@ export function markdownSource(staticDir: string, pathname: string, origin: stri
 const money = (cents: number) => `$${(cents / 100).toFixed(cents % 100 ? 2 : 0)}`;
 const gigabytes = (bytes: number) => `${Math.round(bytes / 2 ** 30)} GB`;
 
-function planLine(plan: LaunchInfo['pricingCatalog'][number], launch: LaunchInfo, compute: boolean) {
+function planLine(plan: LaunchInfo['pricingCatalog'][number], launch: LaunchInfo, compute: boolean, site: string) {
   const price = plan.monthlyBasePriceCents
     ? `${money(plan.monthlyBasePriceCents)} a month${plan.monthlyAdditionalActiveUserPriceCents ? ` + ${money(plan.monthlyAdditionalActiveUserPriceCents)} per extra person` : ''}`
     : 'free';
   const people = plan.maxMembers === 1 ? '1 person' : 'any number of people';
   const credit = (micros: number) => money(Math.round(micros / 10_000));
   const included = !compute ? ''
-    : plan.computeCreditMicros ? `, ${credit(plan.computeCreditMicros)} of compute a month`
-    : plan.monthlyBasePriceCents === 0 && launch.trial ? `, ${credit(launch.trial.creditMicros)} of compute free for ${launch.trial.days} days` : '';
+    : plan.computeCreditMicros ? `, ${credit(plan.computeCreditMicros)} of ${site} credits a month`
+    : plan.monthlyBasePriceCents === 0 && launch.trial ? `, ${credit(launch.trial.creditMicros)} of ${site} credits free for ${launch.trial.days} days` : '';
   return `${plan.name}: ${price}. ${people}, ${plan.maxActiveAgentRuns} agents at once, ${gigabytes(plan.storageBytes)} storage${included}, unlimited projects.`;
 }
 
@@ -269,8 +269,8 @@ function page(ctx: PublicPageContext, pathname: string): PublicPage | 'not-found
     const plans = ctx.launch.pricingCatalog;
     const description = clip(`${site} pricing: ${plans.map((plan) => `${plan.name} ${plan.monthlyBasePriceCents ? `${money(plan.monthlyBasePriceCents)}/month` : `(${money(0)})`}`).join(', ')}. Every plan has unlimited projects; plans differ in people, agents at once, storage and compute.`);
     return { path: '/pricing', title: `Pricing · ${site}`, name: 'Pricing', description,
-      body: `<h1>Pricing</h1><ul>${plans.map((plan) => `<li>${esc(planLine(plan, ctx.launch, ctx.managedCompute.length > 0))}</li>`).join('')}</ul>${ctx.managedCompute.length
-        ? `<p>Compute is the cloud computers agents work on, charged at ${ctx.launch.packs.computePriceMultiplier}× the provider’s list price. Computers on your own E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud account cost nothing extra. Agents can run on your own Claude or ChatGPT plan or API key, billed by their providers.</p>` : ''}` };
+      body: `<h1>Pricing</h1><ul>${plans.map((plan) => `<li>${esc(planLine(plan, ctx.launch, ctx.managedCompute.length > 0, ctx.siteName))}</li>`).join('')}</ul>${ctx.managedCompute.length
+        ? `<p>${site} credits pay for the cloud computers agents work on, agents on ${site}’s included models and what agents buy through ${site} (images, video, speech, apps), charged at ${ctx.launch.packs.computePriceMultiplier}× the provider’s list price. Computers on your own E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud account cost nothing extra. Agents can run on your own Claude or ChatGPT plan or API key, billed by their providers.</p>` : ''}` };
   }
   if (pathname === '/legal') {
     return { path: '/legal', title: `Policies · ${site}`, name: 'Policies', description: `${site}'s terms, privacy, billing, security and acceptable-use policies, with their current versions.`,

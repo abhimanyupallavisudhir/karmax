@@ -275,7 +275,7 @@ export function routeCapability(method: string, p: string, url?: URL): KnownCapa
   // Anyone signed in may report an error they saw (wiki features/error-reports);
   // a task's is read from the task, which the handler checks they can see.
   if (p === '/api/error-reports' && !read) return 'none';
-  if (p === '/api/user/export' || p === '/api/user/default-organization' || p === '/api/user/preferences' || p === '/api/user/paid-subscriptions'
+  if (p === '/api/user/export' || p === '/api/user/default-organization' || p === '/api/user/preferences' || p === '/api/user/paid-subscriptions' || p === '/api/user/plans'
     || p === '/api/user/onboarding' || p === '/api/user/onboarding/reset' || p === '/api/user/account-deletion-request') return 'none';
   // A signed-in person always owns their own Git identity. It is not an
   // organization credential grant and must remain editable after they join a
@@ -2785,6 +2785,43 @@ export class Gateway {
             settingsUrl: membership ? `${await organizationSettingsPath(store, organization.id)}#settings-plan` : null });
         }
         return this.json(res, 200, { subscriptions });
+      }
+      if (p === '/api/user/plans' && method === 'GET') {
+        // The profile's Plans & billing: every organization one belongs to, its
+        // plan (bought or gifted), its packs and its credits, and where to buy
+        // more; plus subscriptions one paid for in organizations one has left.
+        // Personal and cross-organization, like paid-subscriptions above.
+        const subject = requireHumanSubject(callerIdentity);
+        if (authRecord.organizationId || authRecord.projectId || authRecord.projectIds?.length)
+          return this.json(res, 403, { error: 'unscoped personal access is required' });
+        const managedProviders = ((await this.deps.providerConnections?.managedConnections()) ?? []).map((value) => value.provider);
+        const organizations = [];
+        for (const organization of await store.listOrganizations(subject.userId)) {
+          const membership = await store.organizationMembership(organization.id, subject.userId);
+          if (!membership) continue;
+          const entitlements = await store.organizationEntitlements(organization.id);
+          const paymentAllowed = this.deps.identity && session.userId === subject.userId && this.deps.authorization
+            ? allows(await this.personCaps(session, undefined, organization.id), 'payment:write')
+            : (await this.deps.tokens.check(token, 'payment:write', { organizationId: organization.id })).ok;
+          const credit = entitlements.deployment === 'hosted' && managedProviders.length ? await computeCredit(store, organization.id) : null;
+          organizations.push({ organizationId: organization.id, name: organization.name, slug: organization.slug, role: membership.role,
+            plan: entitlements.plan, planName: entitlements.planName,
+            gift: (await this.deps.subscriptions?.currentGift(organization.id)) ?? null,
+            storagePacks: entitlements.storagePacks, giftedStoragePacks: entitlements.giftedStoragePacks,
+            computePacks: entitlements.computePacks, giftedComputePacks: entitlements.giftedComputePacks,
+            credits: credit ? { usedMicros: credit.usedMicros, heldMicros: credit.heldMicros, availableMicros: credit.availableMicros,
+              totalMicros: (credit.creditMicros ?? 0) + credit.topUpMicros + (credit.trial?.monthMicros ?? 0) } : null,
+            canManage: membership.role === 'owner' && Boolean(paymentAllowed),
+            settingsUrl: `${await organizationSettingsPath(store, organization.id)}#settings-plan` });
+        }
+        const member = new Set(organizations.map((organization) => organization.organizationId));
+        const formerSubscriptions = [];
+        for (const subscription of (await this.deps.subscriptions?.paidSubscriptionsForUser(subject.userId)) ?? []) {
+          if (member.has(subscription.organizationId)) continue;
+          const organization = await store.getOrganization(subscription.organizationId);
+          if (organization) formerSubscriptions.push({ ...subscription, organizationName: organization.name, canManage: false, settingsUrl: null });
+        }
+        return this.json(res, 200, { organizations, formerSubscriptions });
       }
       if (p === '/api/user/default-organization' && (method === 'GET' || method === 'PUT')) {
         const subject = requireHumanSubject(callerIdentity);

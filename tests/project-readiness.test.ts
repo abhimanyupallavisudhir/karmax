@@ -110,7 +110,7 @@ describe('project readiness: can a task here start?', () => {
     await providers.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', apiKey: 'e2b_managed' });
     const never = (await readiness()).compute;
     expect(never).toMatchObject({ ready: false, managed: false, own: false, need: 'plan' });
-    expect(never.outOfCredit).toMatch(/^Out of compute: .*paid plan/);
+    expect(never.outOfCredit).toMatch(/^Out of credits: .*paid plan/);
     await store.setComputePackGift('org_personal', 1, 'operator');
     expect((await readiness()).compute).toEqual({ ready: true, local: false, managed: true, own: false });
     // This month's $10 spent (at twice the provider's $5.50): more credit, not a plan, is what it needs.
@@ -119,7 +119,7 @@ describe('project readiness: can a task here start?', () => {
       unit: 'second', costMicros: 5_500_000, startedAt: Math.max(monthStart, now - 3_600_000), endedAt: now, fundingSource: 'managed' });
     const spent = (await readiness()).compute;
     expect(spent).toMatchObject({ ready: false, need: 'credit' });
-    expect(spent.outOfCredit).toMatch(/^Out of compute: this month's \$10\.00 of compute is used up/);
+    expect(spent.outOfCredit).toMatch(/^Out of credits: this month's \$10\.00 of tavya credits is used up/);
   });
 
   it('says when managed storage is full, which does not stop a task', async () => {

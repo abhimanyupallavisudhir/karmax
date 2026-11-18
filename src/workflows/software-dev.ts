@@ -82,7 +82,7 @@ import type { AgentWait, CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE, TASK_WORKFLOW_TASK_TIMEOUT } from './names.js';
 import { agentTurnId } from './turn-id.js';
 import { taskBranch } from '../domain/brand.js';
-import { conversationPublisher, type TurnConversationBase } from '../domain/view-publication.js';
+import { conversationPublisher, OUT_OF_CREDITS, type TurnConversationBase } from '../domain/view-publication.js';
 import { unattendedJobsReminder, waitForAgent } from './agent-wait.js';
 import { ADOPT_ATTACHED_REPOSITORIES, KEEP_FINAL_WORKSPACE, adoptedProjectConfig, adoptedRepositoriesNote, keptWorkspaceNote } from '../domain/adopted-repositories.js';
 
@@ -2609,7 +2609,7 @@ async function softwareDevImpl(
             status = 'waiting';
             const detail = innermostMessage(err);
             // Spent managed compute credit waits the same way (src/world/managed-compute.ts).
-            waitingFor = { kind: 'retry', summary: /^Out of compute\b/.test(detail) ? 'Out of compute' : 'Waiting for a machine', detail, until: Date.now() + wait };
+            waitingFor = { kind: 'retry', summary: OUT_OF_CREDITS.test(detail) ? 'Out of credits' : 'Waiting for a machine', detail, until: Date.now() + wait };
             retryRequested = false;
             await publish();
             await condition(() => cancelled || retryRequested || halted(), wait);

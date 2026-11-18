@@ -28,7 +28,7 @@ import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import { ServiceError, WorkflowNotFoundError, WorkflowUpdateFailedError, isGrpcServiceError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { COMPUTE_HOLD, computeCredit, holdManagedCompute, outOfCompute, type ComputeHoldRequest } from '../world/managed-compute.js';
+import { COMPUTE_HOLD, computeCredit, creditsUrl, holdManagedCompute, outOfCompute, type ComputeHoldRequest } from '../world/managed-compute.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
 import { capacityCause, ComputeRouter, type RouterConnections } from '../world/compute-router.js';
 import { accountKey, dequeue, enqueue, wakeFullKey } from '../world/compute-queue.js';
@@ -933,9 +933,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         warned = true;
         const at = new Date(endsAt).toISOString().slice(11, 16);
         const message: Message = { id: `compute-${Date.now()}`, role: 'user', ts: Date.now(),
-          text: `(The compute credit for this computer runs out at ${at} UTC, in about ${Math.max(1, Math.round(left / 60_000))} min. `
-            + 'This turn is stopped then and the computer parked until there is more; it continues by itself once credit is added. '
-            + 'Commit what you have now.)' };
+          text: `(The organization's ${BRAND} credits for this computer run out at ${at} UTC, in about ${Math.max(1, Math.round(left / 60_000))} min. `
+            + 'This turn is stopped then and the computer parked until there are more; it continues by itself once credits are added '
+            + `in Plan & billing (${await creditsUrl(store, request.organizationId)}). Commit what you have now.)` };
         await deps.client?.workflow.getHandle(options.taskId).signal('followUp', message, 'do');
         (await record(options.taskId, 'conversation.message', { role: 'do', message }));
       }
@@ -3145,7 +3145,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           deliveredMessages = 0;
           computeResumed = { seen: Math.max(Number(stopped.seen) || 0, restoredJournal?.delivered ?? 0) };
           messages = [{ id: `compute-resumed-${Date.now()}`, role: 'user', ts: Date.now(),
-            text: `(This turn was stopped because the organization's compute credit ran out, and the computer was parked; there is credit again. ${INTERRUPTED_COMMANDS} ${INTERRUPTED_REPLY})` }];
+            text: `(This turn was stopped because the organization ran out of ${BRAND} credits, and the computer was parked; there are credits again. ${INTERRUPTED_COMMANDS} ${INTERRUPTED_REPLY})` }];
           (await record(args.taskId, 'turn.resumed', { role: args.role, reason: 'compute' }));
         }
       }
