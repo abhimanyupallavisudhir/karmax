@@ -7,7 +7,7 @@ import { Agent37Driver, agent37AccessKey, agent37BootScript, agent37ComputeDolla
 import { VmWorldProvider } from '../src/world/vm/provider.js';
 import { listPriceMicrosPerHour, diskGrowsAtStart } from '../src/domain/computer-limits.js';
 import type { ResolvedWorldProviderConnection } from '../src/world/connections.js';
-import type { WorldHandle } from '../src/world/types.js';
+import type { ProviderUsageEvent, WorldHandle } from '../src/world/types.js';
 import { serviceHomeLabel } from '../src/world/services.js';
 import { FakeAgent37 } from './helpers/fake-agent37.js';
 import { sshdAvailable } from './helpers/local-sshd.js';
@@ -207,6 +207,52 @@ describe.skipIf(!sshdAvailable)('Agent37 worlds (fake Sandbox API, real tunnel a
     expect((await booked.listUsageEvents('org_a')).events).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: `${id}:${day(0)}`, taskId: 'task_bill', activeMs: 300_000, costMicros: 500 }),
     ]));
+  });
+
+  it('books what Agent37 settles after a delete once that day is settled, also for a world it had settled nothing of', async () => {
+    const kept = new Map<string, string>();
+    const ledger = { kvEntries: async (prefix: string) => [...kept].filter(([key]) => key.startsWith(prefix)).map(([key, value]) => ({ key, value })),
+      kvSet: (key: string, value: string) => { kept.set(key, value); }, kvDelete: (key: string) => { kept.delete(key); } };
+    const booked = new VmWorldProvider(new Agent37Driver(agent37.options()), async () => connection(agent37.token), undefined, {
+      user: os.userInfo().username, home: agent37.home, provision: { stamp, script: 'true', sudo: false }, ledger });
+    const day = (daysAgo: number) => new Date(Date.now() - daysAgo * 86_400_000).toISOString().slice(0, 10);
+    const rate = agent37ComputeDollarsPerHour({ cpu: 2, memoryMb: 4096 });
+    const micros = (minutes: number) => Math.round(minutes / 60 * rate * 1e6);
+    // Two worlds deleted today: Agent37 had settled 5 awake minutes of the first, nothing of the second.
+    const first = await booked.create({ taskId: 'task_rest', base: 'main', generation: 1, organizationId: 'org_a' });
+    const a = [...agent37.instances.keys()].at(-1)!;
+    const second = await booked.create({ taskId: 'task_none', base: 'main', generation: 1, organizationId: 'org_b' });
+    const b = [...agent37.instances.keys()].at(-1)!;
+    agent37.usage.set(day(0), [{ id: a, compute_micros: micros(5), awake_minutes: 5 }]);
+    await booked.destroy(first.handle as WorldHandle);
+    await booked.destroy(second.handle as WorldHandle);
+    const today = (await booked.listUsageEvents('org_a')).events;
+    expect(today.map((event) => event.id)).toEqual([`${a}:${day(0)}`]);
+    // Two days later (the deletes' records moved back): Agent37 has settled the
+    // whole day, 8 and 3 awake minutes and their disks. The rest is booked once,
+    // as rows of their own, and the day before the delete (booked whole while
+    // the instance was listed) is not booked again.
+    const shift = 2 * 86_400_000;
+    for (const [key, value] of kept) {
+      const entry = JSON.parse(value) as { at: number; events: ProviderUsageEvent[] };
+      kept.set(key, JSON.stringify({ at: entry.at - shift, events: entry.events.map((event) => ({ ...event,
+        id: event.id.replace(day(0), day(2)), startedAt: event.startedAt - shift, endedAt: event.endedAt - shift })) }));
+    }
+    agent37.usage.set(day(2), [{ id: a, compute_micros: micros(8) + 3_000, awake_minutes: 8 }, { id: b, compute_micros: micros(3) + 1_000, awake_minutes: 3 }]);
+    agent37.usage.set(day(4), [{ id: a, compute_micros: 777, awake_minutes: 1 }]);
+    const later = (await booked.listUsageEvents('org_a')).events;
+    expect(later).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: `${a}:${day(2)}`, costMicros: micros(5) }),
+      expect.objectContaining({ id: `${a}:${day(2)}:rest`, taskId: 'task_rest', organizationId: 'org_a', activeMs: 180_000, costMicros: micros(8) - micros(5) }),
+      expect.objectContaining({ id: `${a}:${day(2)}:disk:rest`, kind: 'disk', diskGb: 20, costMicros: 3_000 }),
+    ]));
+    expect(later).toHaveLength(3);
+    expect(later.some((event) => event.record || event.id.includes(day(4)))).toBe(false);
+    // Each organization's deleted worlds are read with its own feed.
+    expect((await booked.listUsageEvents('org_b')).events).toEqual([
+      expect.objectContaining({ id: `${b}:${day(2)}:rest`, taskId: 'task_none', organizationId: 'org_b', activeMs: 180_000, costMicros: micros(3) }),
+      expect.objectContaining({ id: `${b}:${day(2)}:disk:rest`, kind: 'disk', costMicros: 1_000 }),
+    ]);
   });
 
   it('checks a connection without making anything, and says when the wallet is empty', async () => {

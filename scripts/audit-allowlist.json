@@ -2,7 +2,7 @@
   {
     "id": "GHSA-fc5q-39xc-vjpf",
     "package": "picomatch",
-    "reason": "ReDoS when picomatch compiles an attacker-supplied single-branch repeated extglob such as +(*a); affects every picomatch version (<=4.0.7, no patched release as of 2026-11-17). tavya never compiles a glob it did not write: no src/ file imports picomatch, micromatch, fast-glob, tinyglobby or vite. picomatch@2 is reached only through @daytona/sdk -> fast-glob -> micromatch, which the SDK loads only in Image.fromDockerfile/dockerfileCommands to expand a local Dockerfile's COPY sources; src/world/environment-build.ts builds Daytona snapshots with Image.base().runCommands() only. picomatch@4 is reached only through vitest/vite/tinyglobby/fdir (the test runner, and an optional peer of better-auth used only by its test-utils, which tavya does not import). Wiki: incidents/lessons, 2026-11-17.",
-    "expires": "2026-12-15"
+    "reason": "ReDoS from a glob pattern with single-branch repeated extglobs; affects every picomatch release (<=4.0.7, the latest), no fix as of 2026-11-17. Only a malicious pattern triggers it, and none reaches picomatch here: no src/ file imports picomatch, micromatch, fast-glob, tinyglobby, fdir, vite or vitest. In production code it is reached only through @daytona/sdk -> fast-glob -> micromatch, which the SDK calls only in Image.fromDockerfile to expand a local Dockerfile's COPY sources; tavya never builds a Daytona image from a Dockerfile (src/world/environment-build.ts uses Image.base().runCommands() only). The other paths (vitest, vite, tinyglobby, fdir) do ship in the image (better-auth's optional peer vitest makes them devOptional, which npm ci --omit=dev in deploy/Dockerfile keeps), but nothing at runtime loads them: better-auth uses vitest only in its test-utils, which tavya does not import, and the test runner matches only the repository's own test globs.",
+    "expires": "2026-12-31"
   }
 ]

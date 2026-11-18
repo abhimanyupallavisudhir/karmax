@@ -101,7 +101,9 @@ describe('request_spend through the agent loop (SPEC §7.6)', () => {
     const second = await post(`/api/tasks/${t.id}/review-action`, { index: approve });
     expect(second).toMatchObject({ resumed: false, alreadyResolved: true });
     const told = async () => (JSON.stringify(await get(`/api/tasks/${t.id}/conversation`)).match(/is approved and ready/g) ?? []).length;
-    for (let i = 0; i < 50 && !(await told()); i++) await new Promise((r) => setTimeout(r, 100));
+    // The agent hears it once its 6 s sleep ends, which a slow runner takes longer
+    // than 5 s to reach after the approval (CI #2983): wait for it, then for any repeat.
+    for (let i = 0; i < 300 && !(await told()); i++) await new Promise((r) => setTimeout(r, 100));
     await new Promise((r) => setTimeout(r, 1000));
     expect(await told()).toBe(1);
   }, 60_000);
