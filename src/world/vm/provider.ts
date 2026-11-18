@@ -508,9 +508,13 @@ export class VmWorldProvider implements WorldProvider {
 
   private world(handle: WorldHandle, connection: ResolvedWorldProviderConnection, sealed: Record<string, string>, transport: SshTransport): World {
     return new VmWorld(handle, transport, this.home(), {
+      // Like `destroy(handle)`: a world deleted while open (a task ending
+      // awake) keeps its last reading too, or a provider whose ledger lags
+      // (Agent37) never books what the machine used (production, 2026-11-17:
+      // three such worlds, 105,195 µ$, booked nothing).
       destroy: async () => {
         this.dropTransport(handle.id);
-        await this.driver.destroy(connection, sealed);
+        await this.destroyBooked(connection, connectionScope(sealed), sealed, () => this.driver.destroy(connection, sealed));
         this.states.delete(handle.id);
         this.destroyed.add(handle);
       },
