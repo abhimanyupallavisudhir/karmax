@@ -41,6 +41,22 @@ describe('promotion', () => {
     expect(choosePromotion({ commits: [commit(2, unnamed), commit(1, live(300))], now: NOW })).toMatchObject({ sha: '' });
   });
 
+  it('never retries a commit production already tried, but takes the next one', () => {
+    // 3 deployed but failed its production smoke check: a scheduled run must not
+    // redeploy it every half hour, nor fall back to 2, older than what production runs.
+    const failed = { [PRODUCTION]: { state: 'failure', createdAt: minutesAgo(30), description: 'Deployed; the smoke check failed' } };
+    const tried = [commit(3, { ...staged(3, 120), ...failed }), commit(2, staged(2, 200)), commit(1, live(600))];
+    expect(choosePromotion({ commits: tried, now: NOW }))
+      .toMatchObject({ sha: '', reason: expect.stringContaining(`nothing newer than ${sha(3)}`) });
+    expect(choosePromotion({ commits: tried, now: NOW, immediate: true })).toMatchObject({ sha: '' });
+    // Named, it is retried: a person or agent decided to.
+    expect(choosePromotion({ commits: tried, now: NOW, requested: sha(3) })).toMatchObject({ sha: sha(3), image: image(3) });
+    // A newer commit that passed staging is promoted as usual.
+    expect(choosePromotion({ commits: [commit(4, staged(4, 70)), ...tried], now: NOW })).toMatchObject({ sha: sha(4), image: image(4) });
+    expect(choosePromotion({ commits: [commit(4, staged(4, 20)), ...tried], now: NOW }).reason)
+      .toContain('passed staging less than 60 minutes ago');
+  });
+
   it('promotes now on request, waiving soak, interval and pause but never staging', () => {
     const commits = [commit(3, staged(3, 5)), commit(2), commit(1, live(10))];
     expect(choosePromotion({ commits, now: NOW, immediate: true, paused: true })).toMatchObject({ sha: sha(3), image: image(3) });

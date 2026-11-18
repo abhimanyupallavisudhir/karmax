@@ -4,8 +4,9 @@ name: Promote
 # "Promotion"). Every half hour it promotes the newest master commit that
 # passed staging at least PROMOTE_SOAK_MINUTES ago (default 60), at most every
 # PROMOTE_INTERVAL_MINUTES (default 240), unless DEPLOYS_PAUSED is true; all
-# three are repository variables. A dispatch promotes now: the named commit, or
-# the newest that passed staging, waiving soak, interval and pause, but never
+# three are repository variables. A commit that failed on production is not
+# tried again unless named. A dispatch promotes now: the named commit, or the
+# newest that passed staging, waiving soak, interval and pause, but never
 # staging. Production gets the image staging ran (scripts/promote.mjs).
 # Without a staging instance (no STAGING_URL) Deploy goes straight to
 # production and this does nothing.
