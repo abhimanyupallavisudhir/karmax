@@ -16,14 +16,17 @@ const connection = (token: string, region?: string): ResolvedWorldProviderConnec
   config: region ? { region } : {} });
 
 describe('Agent37 sizes, prices and keys', () => {
-  it('gives a Computer the smallest of Agent37’s four shapes that covers it', () => {
+  it('gives a Computer the smallest of Agent37’s vm shapes that covers it', () => {
     expect(agent37Shape(undefined)).toEqual({ cpu: 2, memory: 4 });
     expect(agent37Shape({ cpu: 2, memoryMb: 2048 })).toEqual({ cpu: 2, memory: 4 });
     expect(agent37Shape({ cpu: 1, memoryMb: 6000 })).toEqual({ cpu: 4, memory: 8 });
     expect(agent37Shape({ cpu: 4, memoryMb: 16_384 })).toEqual({ cpu: 4, memory: 16 });
     expect(agent37Shape({ cpu: 2, memoryMb: 20_000 })).toEqual({ cpu: 4, memory: 32 });
-    expect(() => agent37Shape({ cpu: 8, memoryMb: 4096 })).toThrow(/at most 4 CPUs and 32 GB/);
-    expect(() => agent37Shape({ cpu: 4, memoryMb: 65_536 })).toThrow(/at most 4 CPUs and 32 GB/);
+    // A vm's fifth shape (verified live 2026-11-18: 8 CPUs, 62 GB free).
+    expect(agent37Shape({ cpu: 8, memoryMb: 4096 })).toEqual({ cpu: 8, memory: 64 });
+    expect(agent37Shape({ cpu: 4, memoryMb: 65_536 })).toEqual({ cpu: 8, memory: 64 });
+    expect(() => agent37Shape({ cpu: 16, memoryMb: 4096 })).toThrow(/at most 8 CPUs and 64 GB/);
+    expect(() => agent37Shape({ cpu: 8, memoryMb: 131_072 })).toThrow(/at most 8 CPUs and 64 GB/);
     expect(new Agent37Driver().shape(undefined)).toEqual({ cpu: 2, memoryMb: 4096, diskGb: 20 });
     expect(() => new Agent37Driver().shape({ diskGb: 150 })).toThrow(/at most 100 GB/);
   });
@@ -33,6 +36,11 @@ describe('Agent37 sizes, prices and keys', () => {
     expect(agent37ComputeDollarsPerHour({ cpu: 2, memoryMb: 4096 }) * 730 + 4 * 0.09).toBeCloseTo(11.36, 2);
     expect(listPriceMicrosPerHour('agent37', { cpu: 2, memoryMb: 4096, diskGb: 0 }))
       .toBe(Math.round(agent37ComputeDollarsPerHour({ cpu: 2, memoryMb: 4096 }) * 1e6));
+    // Ranked at the shape it is billed at: 2 GB is a 2/4, 8 CPU / 16 GB an 8/64.
+    expect(listPriceMicrosPerHour('agent37', { cpu: 2, memoryMb: 2048, diskGb: 20 }))
+      .toBe(listPriceMicrosPerHour('agent37', { cpu: 2, memoryMb: 4096, diskGb: 20 }));
+    expect(listPriceMicrosPerHour('agent37', { cpu: 8, memoryMb: 16_384, diskGb: 0 }))
+      .toBe(Math.round(agent37ComputeDollarsPerHour({ cpu: 8, memoryMb: 65_536 }) * 1e6));
     expect(diskGrowsAtStart('agent37')).toBe(true);
     expect(diskGrowsAtStart('fly')).toBe(false);
   });
@@ -262,7 +270,7 @@ describe.skipIf(!sshdAvailable)('Agent37 worlds (fake Sandbox API, real tunnel a
     await driver.test(connection(agent37.token));
     expect(agent37.instances.size).toBe(0);
     // Agent37's memory limit (40 GB once topped up) as machines of its smallest shape.
-    expect(await driver.limits(connection(agent37.token))).toMatchObject({ cpu: 4, memoryMb: 32_768, diskGb: 100, pool: { machines: 10 } });
+    expect(await driver.limits(connection(agent37.token))).toMatchObject({ cpu: 8, memoryMb: 65_536, diskGb: 100, pool: { machines: 10 } });
     agent37.balance = 0;
     await expect(driver.test(connection(agent37.token))).rejects.toThrow(/no balance/);
     await expect(driver.test(connection('sk_live_wrong'))).rejects.toThrow(/401/);
