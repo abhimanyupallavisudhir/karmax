@@ -7,7 +7,8 @@ const html = `<!doctype html><html><head><link rel="stylesheet" href="/styles.cs
 <script type="module" src="/app.js"></script><script src="https://cdn.example/x.js"></script></head></html>`;
 
 /** A deployed tavya, answering what the suite asks; `override` breaks one route. */
-function fakeTavya(override: Record<string, () => Response> = {}, task: { answers?: boolean | string } = {}) {
+/** `answers`: what its agent replies to the prompt — the code it was asked for by default. */
+function fakeTavya(override: Record<string, () => Response> = {}, task: { answers?: false | string | ((prompt: string) => string) } = {}) {
   const calls: Array<{ method: string; route: string; auth?: string; body?: any }> = [];
   let prompt = '';
   const fetchImpl = async (url: string, init: RequestInit) => {
@@ -29,11 +30,12 @@ function fakeTavya(override: Record<string, () => Response> = {}, task: { answer
     if (key === 'GET /api/projects/proj_smoke') return json({ id: 'proj_smoke' });
     if (key === 'POST /api/projects/proj_smoke/tasks') { prompt = body.prompt; return json({ id: 'task_smoke' }); }
     if (key === 'GET /api/tasks/task_smoke/conversation') {
-      const [, code] = prompt.match(/in capital letters: ([a-z]+),/) ?? [];
-      const reply = typeof task.answers === 'string' ? task.answers : task.answers === false ? 'I cannot.' : code!.toUpperCase();
+      const [, , code] = prompt.match(/codes ([a-z]+) and ([a-z]+),/) ?? [];
+      const reply = typeof task.answers === 'function' ? task.answers(prompt)
+        : typeof task.answers === 'string' ? task.answers : task.answers === false ? 'I cannot.' : code!;
       return json({ role: 'do', messages: [{ role: 'user', text: prompt }, { role: 'agent', text: reply }] });
     }
-    if (key === 'GET /api/tasks/task_smoke') return json(typeof task.answers === 'string' ? { stage: 'review', status: 'waiting' } : { stage: 'do', status: 'active' });
+    if (key === 'GET /api/tasks/task_smoke') return json(task.answers ? { stage: 'review', status: 'waiting' } : { stage: 'do', status: 'active' });
     return json({ ok: true });
   };
   return { fetchImpl, calls };
@@ -100,19 +102,36 @@ describe('smoke suite', () => {
   // 2026-11-17: Haiku at low effort got about half of the four-digit sums wrong (8393 + 5514
   // → 17907), so Promote marked a good deploy failed, redeployed it (restarting PostgreSQL)
   // and opened a repair task, and Production check needed its rerun. What tavya must prove
-  // is that a real agent's answer comes back, not the model's arithmetic.
-  it('asks for what any model answers right but nothing in the prompt says, and fails at once on another answer', async () => {
+  // is that a real agent's answer comes back, not the model's arithmetic. Its replacement,
+  // "repeat this code in capital letters", failed every hourly task check from 21:06 the
+  // same day: the same agent repeated the code as written ("fnfktvucab", not FNFKTVUCAB).
+  // So the agent now picks one of two codes: nothing a model gets wrong, in any case or
+  // wording, yet a prompt echoed back as the agent's (it holds both) does not pass.
+  it('asks for what any model answers right, and fails at once on another answer', async () => {
     const { fetchImpl, calls } = fakeTavya();
     const env = { SMOKE_TOKEN: 'tvp_smoke', SMOKE_PROJECT_ID: 'proj_smoke' };
     expect(failures(await runSmoke({ url: 'https://s.example', task: true, fetch: fetchImpl }, env, quiet))).toEqual([]);
     const prompt = String(calls.find((call) => call.route === '/api/projects/proj_smoke/tasks')?.body.prompt);
-    const code = prompt.match(/in capital letters: ([a-z]+),/)?.[1];
+    const [, decoy, code] = prompt.match(/codes ([a-z]+) and ([a-z]+),/) ?? [];
     expect(code).toMatch(/^[a-z]{8,}$/);
-    expect(prompt).not.toContain(code!.toUpperCase());
+    expect(decoy).toMatch(/^[a-z]{8,}$/);
+    expect(decoy).not.toBe(code);
+
+    const passes = async (answers: (prompt: string) => string) => {
+      const fake = fakeTavya({}, { answers });
+      return failures(await runSmoke({ url: 'https://s.example', task: true, fetch: fake.fetchImpl }, env, quiet));
+    };
+    const second = (text: string) => text.match(/codes [a-z]+ and ([a-z]+),/)![1]!;
+    expect(await passes((text) => second(text))).toEqual([]);
+    expect(await passes((text) => second(text).toUpperCase())).toEqual([]);
+    expect(await passes((text) => `The second code is ${second(text)}.`)).toEqual([]);
+
+    const echoed = await passes((text) => text);
+    expect(echoed[0]).toMatch(/^task: task task_smoke answered "This is an automated check/);
     const wrong = fakeTavya({}, { answers: 'Sure! Here it is.' });
     const started = Date.now();
     const answered = await runSmoke({ url: 'https://s.example', task: true, fetch: wrong.fetchImpl }, env, quiet);
-    expect(failures(answered)[0]).toMatch(/^task: task task_smoke answered "Sure! Here it is\.", not [A-Z]{8,}/);
+    expect(failures(answered)[0]).toMatch(/^task: task task_smoke answered "Sure! Here it is\.", not [a-z]{8,}/);
     expect(Date.now() - started).toBeLessThan(4_000);
     expect(wrong.calls.some((call) => call.route === '/api/tasks/task_smoke/archive')).toBe(true);
   });
