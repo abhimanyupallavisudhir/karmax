@@ -33,10 +33,18 @@ describe('computer limits', () => {
     expect(accountFeatures('daytona', { network: 'basic' })).toMatchObject({ internet: 'basic', allowlist: false, desktop: true });
     expect(accountFeatures('daytona', { network: 'full' })).toMatchObject({ internet: 'full', allowlist: true });
     expect(computerLimits('daytona', { network: 'basic' })).toMatchObject({ network: 'basic' });
+    // An account not yet read counts as Tiers 1–2, as all but a $500 prepaid one are.
+    expect(computerLimits('daytona')).toMatchObject({ network: 'basic' });
+    expect(accountFeatures('daytona')).toMatchObject({ internet: 'basic', allowlist: false });
+    expect(computerLimits('e2b').network).toBeUndefined();
     expect(() => assertComputerFits({ network: { unrestricted: false } }, { network: 'basic' }, 'daytona'))
       .toThrow("This Daytona account has basic internet only, so it can't use an allowlist");
     // A named provider gives the internet its account has.
     expect(() => assertComputerFits({ network: { unrestricted: true } }, { network: 'basic' }, 'daytona')).not.toThrow();
+    // …which never reaches tavya, so not a world that needs the project's data from it.
+    expect(() => assertComputerFits({ reachesTavya: "this project's data" }, { network: 'basic' }, 'daytona'))
+      .toThrow("This Daytona account has basic internet only, which can't reach tavya, so a computer there can't load this project's data.");
+    expect(() => assertComputerFits({ reachesTavya: "this project's data" }, { network: 'full' }, 'daytona')).not.toThrow();
   });
   it('reads the limit out of each provider\'s refusal', () => {
     expect(limitFromMessage(E2B.disk)).toEqual({ dimension: 'disk', value: 25600, unit: 'MiB' });
@@ -65,7 +73,7 @@ describe('computer limits', () => {
       source: { cpu: 'default', memoryMb: 'default', diskGb: 'default' } });
     const measured = { cpu: 4, memoryMb: 8192, diskGb: 10, pool: { cpu: 10, memoryMb: 10_240, diskGb: 30 }, checkedAt: 5 };
     expect(computerLimits('daytona', measured, { diskGb: 25 })).toEqual({ cpu: 4, memoryMb: 8192, diskGb: 25,
-      pool: { cpu: 10, memoryMb: 10_240, diskGb: 30 }, checkedAt: 5,
+      pool: { cpu: 10, memoryMb: 10_240, diskGb: 30 }, network: 'basic', checkedAt: 5,
       source: { cpu: 'provider', memoryMb: 'provider', diskGb: 'configured' } });
     // A machine can never be bigger than the organization's whole pool.
     expect(computerLimits('daytona', measured, { diskGb: 50 })).toMatchObject({ diskGb: 30, source: { diskGb: 'provider' } });
@@ -136,6 +144,30 @@ describe('provider limit probes', () => {
     const limits = await probeDaytonaLimits('dtn-key', { fetch, apiUrl: 'https://daytona.test/api', target: 'us', now: () => 9 });
     expect(limits).toEqual({ cpu: 4, memoryMb: 8192, diskGb: 10, pool: { cpu: 10, memoryMb: 10_240, diskGb: 30 }, network: 'basic', checkedAt: 9 });
     expect(calls.filter((call) => call.method === 'POST').every((call) => call.body.buildInfo)).toBe(true);
+  });
+
+  // tavya.io's Daytona keys are sandbox-scoped: the organization (and its
+  // usage) answer 403, and every account read so looked like full internet,
+  // so world setup fetched restic from tavya, which Tiers 1–2 never reach
+  // (tavya-error b2ed953c4946ea34: curl (35) Connection reset by peer).
+  it('counts a Daytona account as basic internet unless it is known to be Tier 3 or above', async () => {
+    const probe = (organization: { status: number; body: unknown }, cpuQuota?: number) => probeDaytonaLimits('dtn-key', {
+      apiUrl: 'https://daytona.test/api', now: () => 5,
+      fetch: fakeFetch(({ method, url }) => {
+        if (url.endsWith('/api-keys/current')) return { status: 200, body: { organizationId: 'org-1', permissions: ['write:sandboxes'] } };
+        if (url.endsWith('/organizations/org-1')) return organization;
+        if (url.endsWith('/organizations/org-1/usage')) return cpuQuota === undefined ? { status: 403, body: { message: 'Forbidden' } }
+          : { status: 200, body: { regionUsage: [{ regionId: 'us', totalCpuQuota: cpuQuota, totalMemoryQuota: cpuQuota, totalDiskQuota: 300 }] } };
+        if (method === 'POST') return { status: 400, body: { message: DAYTONA.disk } };
+        return { status: 404, body: {} };
+      }).fetch });
+    const forbidden = { status: 403, body: { message: 'Forbidden' } };
+    expect((await probe(forbidden)).network).toBe('basic');
+    expect((await probe(forbidden, 100)).network).toBe('basic');
+    expect((await probe(forbidden, 250)).network).toBe('full');
+    // What the organization says of itself wins over its quota.
+    expect((await probe({ status: 200, body: { sandboxLimitedNetworkEgress: false } })).network).toBe('full');
+    expect((await probe({ status: 200, body: { sandboxLimitedNetworkEgress: true } }, 500)).network).toBe('basic');
   });
 
   it('keeps what it learned when part of a Daytona probe fails', async () => {

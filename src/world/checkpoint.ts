@@ -28,6 +28,7 @@ import { clearCheckpointStale } from './checkpoint-staleness.js';
 import { ChunkedCheckpointStore, CheckpointRefusedError, formatBytes, type CaptureEntry } from './checkpoint-chunks.js';
 import { transferResourceChunk } from './resource-transfer.js';
 import { isPullRequestView, proposalCheckouts } from './pr-view.js';
+import { reachesTavya } from './tavya-reach.js';
 
 import type { PortableDelta } from './checkpoint-encoding.js';
 const gunzip = promisify(zlib.gunzip);
@@ -322,7 +323,9 @@ export class WorldCheckpointService {
     const config = await this.store.effectiveTaskConfig(project, handle.id);
     if (!isAnyProvider(config.worldProvider)) return undefined;
     const organizationId = project.organizationId;
-    const route = await this.router!.route(organizationId, config, handle.kind, { taskId: handle.id, worldId: handle.id });
+    const tavyaNeed = await reachesTavya(this.store, checkpoint!.projectId);
+    const route = await this.router!.route(organizationId, config, handle.kind, { taskId: handle.id, worldId: handle.id },
+      tavyaNeed ? { reachesTavya: tavyaNeed } : {});
     const { value: restored } = await this.router!.run(organizationId, route,
       (candidate, reason) => this.restore(checkpointId, candidate.provider as WorldKind, { ...ambientActivityHooks(), routed: reason }),
       (decision) => this.store.appendEvent({ taskId: handle.id, type: 'world.routed', ts: Date.now(),

@@ -60,7 +60,8 @@ const SUB_TASK_AGENT_KEYS = ['provider', 'model', 'effort', 'mcpConnections'];
  * gateway's and the worker's WorldProviderConnectionService). */
 export interface ComputerChecks {
   available(organizationId: string | undefined, provider: string): Promise<boolean>;
-  assertFits(organizationId: string | undefined, provider: string | undefined, spec: MachineShape & { network?: ProjectConfig['network'] }): Promise<void>;
+  assertFits(organizationId: string | undefined, provider: string | undefined,
+    spec: MachineShape & { network?: ProjectConfig['network']; reachesTavya?: string }): Promise<void>;
 }
 
 /** A parent's own Computer (its task-level value), which its sub-tasks start

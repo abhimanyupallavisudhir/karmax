@@ -45,6 +45,9 @@ export interface ComputeNeeds extends MachineShape {
   allowlist?: boolean;
   /** Full internet unless the Computer says basic internet is enough (or uses an allowlist). */
   fullInternet?: boolean;
+  /** What its world must fetch from tavya itself (tavya-reach.ts), which
+   * basic internet never reaches, whatever the Computer says is enough. */
+  reachesTavya?: string;
   region?: ComputeRegion;
 }
 
@@ -114,6 +117,7 @@ export function unfit(needs: ComputeNeeds, option: ComputeOption): string | unde
   if (needs.desktop && !features.desktop) return 'no desktop';
   if (needs.allowlist && !features.allowlist) return 'no outbound allowlist';
   if (needs.fullInternet && features.internet === 'basic') return 'basic internet only';
+  if (needs.reachesTavya && features.internet === 'basic') return `basic internet can't reach ${BRAND}`;
   if (needs.region && option.region !== needs.region) return `not in ${REGION_LABEL[needs.region]}`;
   return undefined;
 }
@@ -235,8 +239,8 @@ export class ComputeRouter {
   }
 
   async route(organizationId: string, config: Partial<ProjectConfig> | undefined, prefer?: string,
-    task?: { taskId: string; worldId?: string }): Promise<ComputeRoute> {
-    const needs = computeNeeds(config);
+    task?: { taskId: string; worldId?: string }, more: Pick<ComputeNeeds, 'reachesTavya'> = {}): Promise<ComputeRoute> {
+    const needs = { ...computeNeeds(config), ...(more.reachesTavya ? { reachesTavya: more.reachesTavya } : {}) };
     return { ...rankComputeOptions(needs, await this.options(organizationId, needs, task), prefer), ...(task ? { taskId: task.taskId } : {}) };
   }
 
