@@ -35,17 +35,41 @@ import { loginCliPackages } from './remote-process.js';
  * parks.
  */
 
-/** Providers a login sandbox runs on: machines that start in seconds and bill by
- * the second or minute — E2B and Daytona sandboxes, and the VMs that stop and
- * start in seconds (Agent37, Fly.io). Hetzner (whole hours, ~35 s to wake),
- * AWS and Google Cloud (30–50 s) never are. */
-export const LOGIN_SANDBOX_PROVIDERS: readonly string[] = ['e2b', 'daytona', 'agent37', 'fly'];
+/** Providers a login sandbox runs on, fastest first: machines that start in
+ * seconds and bill by the second or minute — E2B and Daytona sandboxes, and the
+ * VMs that stop and start in seconds (Agent37, Fly.io). Hetzner (whole hours,
+ * ~35 s to wake), AWS and Google Cloud (30–50 s) never are.
+ *
+ * Measured 2026-11-19 (tests/login-sandbox-live.test.ts, wiki
+ * features/computerless-tasks § Start latency), first token of a first
+ * message from a ready sandbox / a follow-up / one after it parked: E2B 7.5 /
+ * 3.5 / 4.2 s; Fly.io 14.0 / 6.8 / 14.9 s; Agent37 16.0 / 6.6 / 15.9 s;
+ * Daytona 17.1 (nothing pooled) / 4.8 / ~17 s (an idle one is deleted). Fly.io
+ * and Agent37 cost a quarter and a ninth of E2B an hour, Daytona as much. */
+export const LOGIN_SANDBOX_PROVIDERS: readonly string[] = ['e2b', 'fly', 'agent37', 'daytona'];
+
+/** The order a turn tries an organization's candidates in: its own accounts
+ * before managed compute (the router's rule: the customer already pays for
+ * them), then the fastest (`LOGIN_SANDBOX_PROVIDERS`) — a login sandbox is
+ * waited on by a person, and a conversation costs cents anywhere. */
+export function orderLoginSandboxCandidates<T extends LoginSandboxCandidate>(candidates: readonly T[]): T[] {
+  const rank = (candidate: T): [number, number] => [candidate.funding === 'managed' ? 1 : 0, LOGIN_SANDBOX_PROVIDERS.indexOf(candidate.provider)];
+  return candidates.map((candidate, index) => ({ candidate, index }))
+    .sort((a, b) => { const [fa, pa] = rank(a.candidate), [fb, pb] = rank(b.candidate); return fa - fb || pa - pb || a.index - b.index; })
+    .map(({ candidate }) => candidate);
+}
 /** Providers whose parked sandbox comes back quickly (E2B resumes in 0.1–0.4 s;
  * an Agent37 or Fly machine starts in seconds, its disk alone billed while
  * stopped), so it is parked and pooled. An idle sandbox elsewhere is deleted
  * instead: Daytona's park archives it, and restoring an archive took ~80 s
  * (2026-11-19), far longer than a new one. */
 export const LOGIN_SANDBOX_PARKS: readonly string[] = ['e2b', 'agent37', 'fly'];
+/** The disk of a login sandbox on a VM (Agent37, Fly.io), which bills for it
+ * while stopped (Agent37 $0.09, Fly $0.15 per GB-month): the CLI and its
+ * homes need well under 1 GB of the home volume. E2B and Daytona keep their
+ * template's size (another size would build a template of its own). */
+export const LOGIN_SANDBOX_VM_DISK_GB = 5;
+const sizeFor = (provider: string) => (provider === 'e2b' || provider === 'daytona' ? {} : { resources: { diskGb: LOGIN_SANDBOX_VM_DISK_GB } });
 /** How many paused, ready-to-claim sandboxes an organization that used one in
  * the last day keeps per provider that parks (`LOGIN_SANDBOX_PARKS`). */
 export const LOGIN_SANDBOX_POOL = () => {
@@ -174,8 +198,8 @@ export class LoginSandboxes {
     const route = await new ComputeRouter(this.deps.store, this.deps.connections)
       .route(organizationId, { network: { unrestricted: true, basic: true } as never });
     const fits = (provider: string) => LOGIN_SANDBOX_PROVIDERS.includes(provider);
-    const candidates = route.candidates.filter((candidate) => fits(candidate.provider))
-      .map((candidate) => ({ provider: candidate.provider, funding: candidate.funding }));
+    const candidates = orderLoginSandboxCandidates(route.candidates.filter((candidate) => fits(candidate.provider))
+      .map((candidate) => ({ provider: candidate.provider, funding: candidate.funding })));
     const rejected = route.rejected.filter((option) => fits(option.provider));
     const busy = rejected.find((option) => option.busy && !option.outOfCredit);
     const spent = rejected.find((option) => option.outOfCredit)?.outOfCredit;
@@ -332,7 +356,7 @@ export class LoginSandboxes {
         const poolKey = `${poolPrefix(organizationId, provider)}${label}`;
         const world = await timed('login-sandbox.pool-create', () => this.registry().get(provider).create({
           taskId: label, organizationId, generation: LOGIN_SANDBOX_GENERATION, base: 'main', scratch: true,
-          network: { unrestricted: true }, warmPackages: packages }));
+          network: { unrestricted: true }, warmPackages: packages, ...sizeFor(provider) }));
         // Known before it runs anything, so the orphan reaper spares it.
         const pooled: PooledSandbox = { organizationId, provider, ...(funding ? { funding } : {}), handle: world.handle, packages, createdAt: this.now() };
         const warming = JSON.stringify(pooled);
@@ -395,7 +419,7 @@ export class LoginSandboxes {
         const world = await timed('login-sandbox.create', () => this.registry().get(candidate.provider).create({
           taskId: input.taskId, organizationId: input.organizationId, generation: LOGIN_SANDBOX_GENERATION,
           base: 'main', scratch: true, ...(input.signal ? { signal: input.signal } : {}),
-          network: { unrestricted: true },
+          network: { unrestricted: true }, ...sizeFor(candidate.provider),
           // A template whose npx cache already holds the CLIs, where the provider has one.
           warmPackages: loginCliPackages(),
         }));

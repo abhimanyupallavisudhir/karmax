@@ -97,11 +97,21 @@ describe.skipIf(!live)(`login sandbox start latency on ${PROVIDER} (live)`, () =
     });
   }, 120_000);
   afterAll(async () => {
+    // Nothing left behind: pooled sandboxes (made in the background) go too, once any refill under way has recorded its own.
+    if (pool) {
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      await (pool as unknown as { refilling: Set<string> }).refilling.size ? new Promise((resolve) => setTimeout(resolve, 240_000)) : undefined;
+      for (const { key, value } of await h.store.kvEntries('login-sandbox-pool:')) {
+        const handle = JSON.parse(value).handle;
+        const provider = h.worlds.get(handle.kind);
+        await (provider.destroy ? provider.destroy(handle) : provider.open(handle).then((world) => world.destroy())).catch((error) => log(`[latency] could not delete ${key}: ${error}`));
+      }
+    }
     if (h) (h.store as { hosted: boolean }).hosted = false;
     log(`[latency] ${PROVIDER} medians (ms): ${JSON.stringify(Object.fromEntries(Object.entries(results).map(([kind, values]) => [kind, { median: median(values), runs: values }])))}`);
     log(`[latency] ${PROVIDER} sandbox opens: ${JSON.stringify(opened)}`);
     await h?.stop();
-  });
+  }, 300_000);
 
   const view = (taskId: string) => h.client.workflow.getHandle(taskId).query<any>('view');
   /** The task's first agent token from now; what it is doing is logged while it takes long. */

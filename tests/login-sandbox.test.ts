@@ -9,7 +9,7 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { makeCoreActivities } from '../src/activities/core.js';
-import { LoginSandboxes, type LoginSandboxRoute } from '../src/agent/login-sandbox.js';
+import { LoginSandboxes, orderLoginSandboxCandidates, type LoginSandboxRoute } from '../src/agent/login-sandbox.js';
 import { computerlessModelNeed } from '../src/agent/computerless.js';
 import { claudeToolSurface } from '../src/agent/claude.js';
 import { codexToolSurface } from '../src/agent/codex.js';
@@ -151,6 +151,8 @@ describe('login sandboxes', () => {
     // No repository, no setup: a scratch sandbox, labelled apart from the task's own worlds.
     expect(e2b.created[0]).toMatchObject({ taskId: task.id, organizationId: org.id, scratch: true, generation: 0 });
     expect(e2b.created[0]!.repos).toBeUndefined();
+    // The template's own size: another would build a template of its own.
+    expect(e2b.created[0]!.resources).toBeUndefined();
     await first.settle();
     const second = await pool.open({ organizationId: org.id, taskId: task.id });
     expect(second.reused).toBe(true);
@@ -308,6 +310,17 @@ describe('login sandboxes', () => {
     delete process.env.KARMAX_LOGIN_SANDBOXES_PER_ORG;
   });
 
+  it('tries the fastest first (measured 2026-11-19: E2B, Fly.io, Agent37, then Daytona), the organization\'s own accounts before managed ones', () => {
+    // As the compute router ranks them: own first, then by price.
+    expect(orderLoginSandboxCandidates([
+      { provider: 'daytona', funding: 'own' }, { provider: 'e2b', funding: 'own' },
+      { provider: 'agent37', funding: 'managed' }, { provider: 'fly', funding: 'managed' }, { provider: 'e2b', funding: 'managed' },
+    ])).toEqual([
+      { provider: 'e2b', funding: 'own' }, { provider: 'daytona', funding: 'own' },
+      { provider: 'e2b', funding: 'managed' }, { provider: 'fly', funding: 'managed' }, { provider: 'agent37', funding: 'managed' },
+    ]);
+  });
+
   it('on a VM that stops in seconds (Agent37, Fly.io) it parks and pools as on E2B; on Daytona an idle one is deleted', async () => {
     process.env.KARMAX_LOGIN_SANDBOX_POOL = '1';
     for (const kind of ['agent37', 'fly']) {
@@ -317,8 +330,9 @@ describe('login sandboxes', () => {
       const pool = sandboxes(routeTo([{ provider: kind, funding: 'managed' }]));
       const task = await taskIn(org.id);
       await (await pool.open({ organizationId: org.id, taskId: task.id })).settle();
-      // A stopped machine waits for the next conversation (only its disk is billed).
+      // A stopped machine waits for the next conversation (only its disk is billed): a small disk.
       await expect.poll(() => vm.parked.length).toBe(1);
+      expect(vm.created.map((spec) => spec.resources)).toEqual([{ diskGb: 5 }, { diskGb: 5 }]);
       expect(vm.created.at(-1)!.taskId).toMatch(/^login-pool-/);
       clock += 10 * 60_000;
       await pool.housekeep();
