@@ -5063,6 +5063,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async commitWork(handle: WorldHandle, message: string): Promise<{ committed: boolean; sha?: string }> {
+      // No computer, no files: nothing to commit (before a sub-task, a fork…), and its world runs no git.
+      if (isComputerless(handle.kind)) return { committed: true };
       let context: ReturnType<typeof activityContext.current> | undefined;
       try { context = activityContext.current(); } catch { /* direct tests */ }
       // git walks every checkout: minutes in a world with a large data tree
