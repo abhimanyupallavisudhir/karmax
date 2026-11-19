@@ -183,8 +183,8 @@ describe('the accounts Any can reach', () => {
     await f.connections.save({ organizationId: f.organization.id, provider: 'e2b', apiKey: 'own' });
     await f.store.setWorldProviderConnectionStatus(f.organization.id, 'e2b', 'error', 'bad key');
     let options = await f.router.options(f.organization.id);
-    expect(options.find((value) => value.provider === 'gcp')).toMatchObject({ busy: 'out of compute this month',
-      outOfCredit: expect.stringMatching(/^Out of compute: tavya's computers come with a paid plan/) });
+    expect(options.find((value) => value.provider === 'gcp')).toMatchObject({ busy: 'out of credits this month',
+      outOfCredit: expect.stringMatching(/^Out of credits: tavya's computers come with a paid plan/) });
     expect(options.find((value) => value.provider === 'e2b')).toMatchObject({ doubt: 'its last connection test failed' });
 
     await f.store.setOrganizationPlan(f.organization.id, 'team');

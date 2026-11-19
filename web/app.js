@@ -4596,14 +4596,17 @@ function plainTaskError(text) {
   }
   const retry = /— retrying (\w+) in (\d+\s*\w+) \((\d+)\/(\d+)\)\s*$/.exec(body);
   const retrying = retry ? ` tavya will try again in ${retry[2]} (attempt ${retry[3]} of ${retry[4]}).` : '';
-  // Out of compute (it names "Plan & billing", which the AI-limit pattern below
+  // Out of credits (it names "Plan & billing", which the AI-limit pattern below
   // would take for a model's billing): what happened in one line; what to do is
-  // the buttons beside it.
-  const spent = /Out of compute: this month's (\$[\d.,]+) of compute is used up( or held)?/i.exec(body);
-  const trial = /Out of compute: your (\$[\d.,]+) free trial (is used up or held|ended|is used up)/i.exec(body);
-  const summary = /Out of compute: .*come with a paid plan/i.test(body) ? `${siteName()}’s computers come with a paid plan.`
+  // the buttons beside it. ("Out of compute" is how it was said before.)
+  const spent = /Out of (?:credits|compute): this month's (\$[\d.,]+) of (?:compute|\S+ credits) is used up( or held)?/i.exec(body);
+  const trial = /Out of (?:credits|compute): your (\$[\d.,]+) free trial (is used up or held|ended|is used up)/i.exec(body);
+  const paidPlan = /Out of (?:credits|compute): \S+'s (computers|included models) come with a paid plan/i.exec(body);
+  const priced = /Out of credits: (.+?) would cost up to (\$[\d.,]+) of \S+ credits; (\$[\d.,]+) is left/i.exec(body);
+  const summary = paidPlan ? `${siteName()}’s ${paidPlan[1]} come with a paid plan.`
     : trial ? `Your ${trial[1]} free trial ${trial[2] === 'ended' ? 'has ended' : trial[2] === 'is used up or held' ? 'is used up or held by work running now' : 'is used up'}.`
-    : spent ? `This month’s ${spent[1]} of compute is used up${spent[2] ? ' or held by work running now' : ''}.`
+    : spent ? `This month’s ${spent[1]} of ${siteName()} credits is used up${spent[2] ? ' or held by work running now' : ''}.`
+    : priced ? `${priced[1][0].toUpperCase()}${priced[1].slice(1)} would cost up to ${priced[2]}; ${priced[3]} of ${siteName()} credits is left.`
     : storageFull(body) ? 'Your organization’s storage is full. Free some space, or add a 100 GB pack in Plan & billing.'
     : /context window|prompt is too long|maximum context length/i.test(body)
     ? 'The conversation grew too long for the AI model. Send a shorter message, or start a new task.'
@@ -4642,8 +4645,15 @@ function setupFixes(text, projectId) {
   // The included model draws on the same credit: there, one's own is a model login or key.
   const own = /Settings → Agents/.test(raw) ? { label: 'Use your own login', href: `${settings}#settings-agents` }
     : { label: 'Use your own account', href: computers };
-  // Never bought a plan, or spent this month's compute: more on the plan, or one's own account.
-  if (/\bOut of compute\b/.test(raw)) return [{ label: /come with a paid plan|free trial/.test(raw) ? 'Choose a plan' : 'Add compute', href: plan }, own];
+  // Never bought a plan, or spent this month's credits: more on the plan, or one's own account
+  // (a generation refused for its price: only more credits). The message names the
+  // organization's own Plan & billing, which is where to add them.
+  if (/\bOut of (?:credits|compute)\b/.test(raw)) {
+    const named = /Plan & billing \(([^)\s]*#settings-plan)\)/.exec(raw)?.[1];
+    const where = named ? (() => { try { const url = new URL(named, location.origin); return `${url.pathname}${url.hash}`; } catch { return plan; } })() : plan;
+    const add = { label: /come with a paid plan|free trial/.test(raw) ? 'Choose a plan' : 'Add credits', href: where };
+    return /would cost up to/.test(raw) ? [add] : [add, own];
+  }
   if (/No computer (?:is connected|this organization can use fits)/.test(raw)) return [{ label: 'Connect a computer', href: computers }];
   // Every one of tavya's computers busy: one's own account starts it now.
   if (/Every computer this task can use is full|of \S+'s [\w. ]+ computers are in use|\S+'s [\w. ]+ computers are using|uses its share of/.test(raw)
@@ -6285,7 +6295,7 @@ function onboardingStep(number, key, title, detail, action) {
 function onboardingTrialHtml(trial) {
   const amount = `$${Math.round(Number(trial.creditMicros) / 1e6)}`;
   const until = new Date(trial.endsAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-  return `<p class="onboarding-trial"><b>Free trial:</b> ${esc(amount)} of compute${trial.agents ? ' and agents' : ''} included until ${esc(until)}.</p>
+  return `<p class="onboarding-trial"><b>Free trial:</b> ${esc(amount)} of ${siteNameMarkup()} credits for computers${trial.agents ? ' and agents' : ''}, until ${esc(until)}.</p>
     <p class="onboarding-intro">For the full experience:</p>`;
 }
 
@@ -10093,12 +10103,12 @@ function readinessGaps(readiness, projectId) {
   const compute = readiness.compute;
   const plan = `${settings}#settings-plan`, computers = `${settings}#settings-computers`;
   const providers = 'E2B, Daytona, Fly.io, Hetzner, AWS, Google Cloud or Agent37';
-  // Out of compute: never bought a plan (need: plan) or spent this month's (credit).
+  // Out of credits: never bought a plan (need: plan) or spent this month's (credit).
   const need = compute?.need ?? (compute?.outOfCredit ? 'credit' : 'computer');
   if (compute && !compute.ready) gaps.push(...(need === 'plan' ? [
     { label: 'Choose a plan', href: plan, tip: `${siteName()}’s computers come with Individual or Team.` },
     { label: 'Connect your own computer', href: computers, tip: `Run tasks on your own ${providers} account.` }]
-    : need === 'credit' ? [{ label: 'Add compute', href: plan, tip: compute.outOfCredit || 'This month’s compute is used up.' },
+    : need === 'credit' ? [{ label: 'Add credits', href: plan, tip: compute.outOfCredit || `This month’s ${siteName()} credits are used up.` },
       { label: 'Use your own account', href: computers, tip: `Run tasks on your own ${providers} account instead.` }]
     : [{ label: 'Connect a computer', href: computers, tip: 'There is nowhere for this task to run yet.' }]));
   // Full storage does not stop a task, but nothing new it saves is kept.
@@ -26742,9 +26752,9 @@ function inboxRowLabel(item) {
     : `${item.subject.serviceName} at ${Math.floor((item.subject.used / item.subject.limit) * 100)}% of its limit${item.subject.level === 95 ? ' — upgrade now' : ''}`;
   if (item.subject?.kind === 'compute') {
     const n = Number(item.subject.computers || 0), computers = `${n} parked computer${n === 1 ? '' : 's'}`;
-    if (item.subject.stage === 'hibernated') return `Out of compute — ${computers} hibernated`;
-    if (item.subject.hibernateAt) return `Out of compute — ${computers} hibernate ${new Date(item.subject.hibernateAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
-    return item.subject.trial ? 'Free trial over — choose a plan' : `Out of compute — renews ${new Date(item.subject.renewsAt).toLocaleDateString()}`;
+    if (item.subject.stage === 'hibernated') return `Out of credits — ${computers} hibernated`;
+    if (item.subject.hibernateAt) return `Out of credits — ${computers} hibernate ${new Date(item.subject.hibernateAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
+    return item.subject.trial ? 'Free trial over — choose a plan' : `Out of credits — renew ${new Date(item.subject.renewsAt).toLocaleDateString()}`;
   }
   if (item.subject?.kind === 'storage') return item.subject.stage === 'deleted'
     ? 'Stored data deleted to fit the limit'
@@ -26760,7 +26770,7 @@ function inboxRowLabel(item) {
 function inboxTitle(item, fallback = item.kind) {
   if (item.subject?.kind === 'credential') return `${item.subject.provider}:${item.subject.account}`;
   if (item.subject?.kind === 'storage') return `Storage · ${formatBytes(item.subject.retainedBytes)} of ${formatBytes(item.subject.quotaBytes)}`;
-  if (item.subject?.kind === 'compute') return `Compute · $${(item.subject.usedMicros / 1e6).toFixed(2)} of $${(item.subject.creditMicros / 1e6).toFixed(2)}`;
+  if (item.subject?.kind === 'compute') return `${siteName()} credits · $${(item.subject.usedMicros / 1e6).toFixed(2)} of $${(item.subject.creditMicros / 1e6).toFixed(2)}`;
   if (item.subject?.kind === 'service-limit') return item.subject.level === 'failed' ? `${item.subject.serviceName} · ${item.subject.error}`
     : `${item.subject.serviceName} · ${item.subject.label} ${limitAmount(item.subject.used, item.subject.unit)} of ${limitAmount(item.subject.limit, item.subject.unit, true)}`;
   return item.task?.title || item.resource?.name || fallback;
@@ -27684,7 +27694,7 @@ function profileView() {
       </div>
     </div>
     ${notificationsCard()}
-    ${S.meta?.hosted ? '<div class="card"><div class="section-h">Paid subscriptions</div><div id="profile-paid-subscriptions" aria-live="polite"><span class="task-sub">Loading…</span></div></div>' : ''}
+    ${S.meta?.hosted ? '<div class="card" id="profile-plans-card"><div class="section-h">Plans &amp; billing</div><div id="profile-plans" aria-live="polite"><span class="task-sub">Loading…</span></div></div>' : ''}
     ${u ? appGrantsCard() : ''}
     ${u ? chatLinksCard() : ''}
     <div class="card" id="data-account">
@@ -27829,31 +27839,76 @@ function wireNotificationsCard() {
   });
 }
 
-function profilePaidSubscriptionsMarkup(subscriptions) {
-  if (!subscriptions.length) return `<p class="setting-muted">None ${policyTip('Unfinished checkouts and gifted plans are not listed.')}</p>`;
+// Profile → Plans & billing: each organization one belongs to on one line (its
+// plan, gifted or bought, its packs, its tavya credits), folding out into that
+// organization's own Plan & billing card, where plans and packs are bought. One
+// is open at a time (the card's controls have ids). Subscriptions one paid for
+// in organizations one has since left stay listed, so they can be found.
+function profilePlansMarkup({ organizations = [], formerSubscriptions = [] }) {
+  if (!organizations.length && !formerSubscriptions.length) return '<p class="setting-muted">No organizations</p>';
+  const one = organizations.length === 1;
+  const rows = organizations.map((o) => {
+    const open = one || S.profilePlanOpen === o.organizationId;
+    const packs = Number(o.storagePacks || 0) + Number(o.computePacks || 0), gifted = Number(o.giftedStoragePacks || 0) + Number(o.giftedComputePacks || 0);
+    const packText = packs + gifted ? `${packs + gifted} pack${packs + gifted === 1 ? '' : 's'}${gifted && packs ? `, ${gifted} gifted` : gifted ? ' gifted' : ''}` : '';
+    const c = o.credits;
+    const credits = !c ? '' : c.totalMicros && c.availableMicros > 0
+      ? `<span class="profile-plan-credits">${planMeter(Number(c.usedMicros || 0) + Number(c.heldMicros || 0), c.totalMicros)}<span><b>${esc(planDollars(c.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(c.totalMicros))}</span></span></span>`
+      : c.totalMicros ? '<span class="profile-plan-credits warn">Out of credits</span>' : '';
+    return `<div class="profile-plan${open ? ' open' : ''}" data-organization="${esc(o.organizationId)}">
+      <button type="button" class="profile-plan-head" aria-expanded="${open}" aria-controls="profile-plan-${esc(o.organizationId)}">
+        <span class="profile-plan-org">${esc(o.name)}</span>
+        <span class="profile-plan-what"><b>${esc(o.planName || 'Free')}</b>${o.gift ? '<span class="chip">Gifted</span>' : ''}${packText ? `<span class="setting-muted">${esc(packText)}</span>` : ''}</span>
+        ${credits || '<span></span>'}<span class="profile-plan-caret" aria-hidden="true">›</span></button>
+      <div class="profile-plan-body" id="profile-plan-${esc(o.organizationId)}"${open ? '' : ' hidden'}></div></div>`;
+  }).join('');
   const statusLabel = { active: 'Active', trialing: 'Trial', past_due: 'Payment overdue', unpaid: 'Unpaid', canceled: 'Cancelled', paused: 'Paused', incomplete: 'Incomplete' };
-  return subscriptions.map(subscription => {
+  const former = formerSubscriptions.map((subscription) => {
     const end = subscription.cancelAtPeriodEnd
       ? ` · cancellation scheduled${subscription.currentPeriodEnd ? ` for ${new Date(subscription.currentPeriodEnd).toLocaleDateString()}` : ''}` : '';
-    return `<div class="member-row"><div><b>${esc(subscription.organizationName)}</b><p class="task-sub">${esc(subscription.planName)} · ${esc(statusLabel[subscription.status] || subscription.status)}${esc(end)}</p>
-      ${!subscription.canManage ? '<p class="task-sub">You no longer have billing-management access. Contact an organization owner or <a href="/legal/billing">billing support</a> for changes or cancellation.</p>' : ''}</div>
-      ${subscription.settingsUrl ? `<a class="btn sm" data-spa href="${esc(subscription.settingsUrl)}">Plans &amp; billing</a>` : ''}</div>`;
+    return `<div class="profile-plan former"><div class="profile-plan-head"><span class="profile-plan-org">${esc(subscription.organizationName)}</span>
+      <span class="profile-plan-what"><b>${esc(subscription.planName)}</b><span class="setting-muted">${esc(statusLabel[subscription.status] || subscription.status)}${esc(end)}</span></span>
+      ${policyTip('You paid for this but no longer belong to the organization. Ask one of its owners, or billing support, to change or cancel it.')}</div></div>`;
   }).join('');
+  return `<div class="profile-plans">${rows}${former}</div>`;
 }
 
-async function hydrateProfilePaidSubscriptions() {
-  const box = $('#profile-paid-subscriptions');
+async function hydrateProfilePlans() {
+  const box = $('#profile-plans');
   if (!box) return;
   const userId = S.user?.id;
-  try {
-    const result = await api('/api/user/paid-subscriptions');
-    if ($('#profile-paid-subscriptions') !== box || S.user?.id !== userId) return;
-    box.innerHTML = profilePaidSubscriptionsMarkup(result.subscriptions);
-  } catch (error) {
-    if ($('#profile-paid-subscriptions') !== box || S.user?.id !== userId) return;
-    box.innerHTML = `<p class="task-sub" role="alert">Could not load paid subscriptions: ${inlineErrorHtml(error)}</p><button class="btn sm" type="button">Retry</button>`;
-    box.querySelector('button')?.addEventListener('click', () => hydrateProfilePaidSubscriptions());
+  let result;
+  try { result = await api('/api/user/plans'); } catch (error) {
+    if ($('#profile-plans') !== box || S.user?.id !== userId) return;
+    box.innerHTML = `<p class="task-sub" role="alert">Could not load plans: ${inlineErrorHtml(error)}</p><button class="btn sm" type="button">Retry</button>`;
+    box.querySelector('button')?.addEventListener('click', () => hydrateProfilePlans());
+    return;
   }
+  if ($('#profile-plans') !== box || S.user?.id !== userId) return;
+  box.innerHTML = profilePlansMarkup(result);
+  const load = (row) => {
+    const body = row.querySelector('.profile-plan-body');
+    body.innerHTML = '<span class="task-sub">Loading…</span>';
+    void hydratePlanAndBilling(row.dataset.organization, body);
+  };
+  box.querySelectorAll('.profile-plan[data-organization]').forEach((row) => {
+    if (row.classList.contains('open')) load(row);
+    row.querySelector('.profile-plan-head').addEventListener('click', () => {
+      const opening = !row.classList.contains('open');
+      // One at a time: close the others (their cards' controls share ids).
+      box.querySelectorAll('.profile-plan.open').forEach((other) => {
+        other.classList.remove('open');
+        other.querySelector('.profile-plan-head').setAttribute('aria-expanded', 'false');
+        const body = other.querySelector('.profile-plan-body'); body.hidden = true; body.innerHTML = '';
+      });
+      S.profilePlanOpen = opening ? row.dataset.organization : null;
+      if (!opening) return;
+      row.classList.add('open');
+      row.querySelector('.profile-plan-head').setAttribute('aria-expanded', 'true');
+      row.querySelector('.profile-plan-body').hidden = false;
+      load(row);
+    });
+  });
 }
 
 function wireProfileView() {
@@ -27871,7 +27926,7 @@ function wireProfileView() {
   });
   if (S.profileUserId && S.profileUserId !== S.user?.id) return;
   wireNotificationsCard();
-  void hydrateProfilePaidSubscriptions();
+  void hydrateProfilePlans();
   void hydrateAppGrants();
   void hydrateChatLinks();
   hydrateProfileGithub();
@@ -28739,7 +28794,44 @@ function planMeter(used, limit) {
   const pct = Math.min(100, (Number(used) || 0) / limit * 100);
   return `<span class="plan-meter${pct >= 100 ? ' over' : pct >= 80 ? ' near' : ''}" role="meter" aria-valuemin="0" aria-valuemax="${esc(limit)}" aria-valuenow="${esc(Math.min(Number(used) || 0, limit))}"><i style="width:${pct.toFixed(1)}%"></i></span>`;
 }
-// A pack is named by what it gives: "100 GB" of storage, "$10" of compute a month.
+// One limit's row. Its label is a button that folds out, beneath the row, what
+// lies behind the figure (where it comes from, what it pays for): readable on a
+// phone, unlike a tooltip. `info`: a sentence, or [term, html] pairs. Folds stay
+// open across re-renders (S.planInfoOpen; wirePlanInfo).
+function planRow(key, label, info, body, className = '', attrs = '') {
+  const open = Boolean(S.planInfoOpen?.has(key));
+  const name = info ? `<button type="button" class="plan-info-toggle" aria-expanded="${open}" aria-controls="plan-info-${key}">${label}<span class="plan-info-icon" aria-hidden="true">ⓘ</span></button>` : label;
+  const details = !info ? '' : typeof info === 'string' ? `<p>${esc(info)}</p>`
+    : `<dl>${info.filter(Boolean).map(([term, html]) => `<dt>${esc(term)}</dt><dd>${html}</dd>`).join('')}</dl>`;
+  return `<div class="setting-row${className ? ` ${className}` : ''}"${attrs}><span class="setting-label">${name}</span>${body}</div>${info ? `<div class="plan-info" id="plan-info-${key}" data-info="${key}"${open ? '' : ' hidden'}>${details}</div>` : ''}`;
+}
+// Amounts and what they are, one per line: "$10.00  1 × $10 pack".
+function planLines(lines) {
+  const shown = lines.filter(Boolean);
+  return shown.length ? `<ul class="plan-lines">${shown.map(([amount, what]) => `<li><b>${esc(amount)}</b><span>${esc(what)}</span></li>`).join('')}</ul>` : '';
+}
+// What this month's credits went on: computers, agents and models (the included
+// model, gateways), and apps and media agents bought (generations, apps).
+function planCreditUse(byProvider) {
+  const use = { computers: 0, models: 0, apps: 0 };
+  for (const row of byProvider || []) {
+    const kind = COMPUTER_PROVIDERS[row.provider] ? 'computers' : row.provider === 'openrouter' || String(row.provider).startsWith('gateway:') ? 'models' : 'apps';
+    use[kind] += Number(row.usedMicros || 0);
+  }
+  return use;
+}
+function wirePlanInfo(box) {
+  box.querySelectorAll('.plan-info-toggle').forEach((button) => button.addEventListener('click', () => {
+    const panel = box.querySelector(`#${button.getAttribute('aria-controls')}`);
+    if (!panel) return;
+    const open = button.getAttribute('aria-expanded') !== 'true';
+    button.setAttribute('aria-expanded', String(open));
+    panel.hidden = !open;
+    S.planInfoOpen ??= new Set();
+    if (open) S.planInfoOpen.add(panel.dataset.info); else S.planInfoOpen.delete(panel.dataset.info);
+  }));
+}
+// A pack is named by what it gives: "100 GB" of storage, "$10" of credits a month.
 function planPackName(kind, pack) {
   return kind === 'compute' ? planDollars(pack?.creditMicros ?? 10_000_000).replace('.00', '') : formatBytes(pack?.bytes ?? 100 * 1024 ** 3);
 }
@@ -28783,8 +28875,9 @@ function openPlanCheckoutDialog(title, price, order, post) {
 }
 function planBillingMarkup(e, state) {
   if (!e) return '<span class="task-sub">Plan information is temporarily unavailable.</span>';
-  if (e.deployment === 'private') return `<div class="setting-rows"><div class="setting-row"><span class="setting-label">Plan</span>
-    <span class="setting-value"><b>Private installation</b> ${policyTip('Hosted plan limits don’t apply. Users, projects and agents are limited only by this installation’s capacity.')}</span></div></div>`;
+  if (e.deployment === 'private') return `<div class="setting-rows plan-limits">${planRow('private', 'Plan',
+    'Hosted plan limits don’t apply. Users, projects and agents are limited only by this installation’s capacity.',
+    '<span class="setting-value"><b>Private installation</b></span>')}</div>`;
   const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
   const day = (ms) => new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
   const catalog = Object.fromEntries((state?.catalog || []).map((plan) => [plan.id, plan]));
@@ -28816,7 +28909,7 @@ function planBillingMarkup(e, state) {
     ? `<button class="btn sm billing-change" data-plan="team" ${disabled}>Upgrade to Team</button>`
     : giftCheckout && state.gift.plan === 'individual' ? `<button class="btn sm billing-buy" data-plan="team" ${disabled}>Upgrade to Team</button>`
     : paying && billed === 'team' ? `<button class="btn sm billing-change" data-plan="individual" ${disabled || (e.activeUsers > 1 ? 'disabled title="Remove other members first"' : '')}>Switch to Individual</button>` : '';
-  const head = `<div class="plan-head"><span class="plan-name">${esc(e.planName)}</span>${statusChip ? `<span class="chip${state?.status === 'past_due' || state?.status === 'unpaid' ? ' failed' : ''}">${esc(statusChip)}</span>` : ''}
+  const head = `<div class="plan-head"><span class="plan-name">${esc(e.planName)}</span>${statusChip ? `<span class="chip${state?.status === 'past_due' || state?.status === 'unpaid' ? ' failed' : statusChip === 'Gifted' ? ' gifted' : ''}">${esc(statusChip)}</span>` : ''}
     <span class="setting-muted plan-price">${esc(price + renews)}</span><span class="label-row-fill"></span>
     ${change}${subscribed || packsOnly ? `<button class="btn sm billing-portal" ${owner ? '' : disabled} title="Payment method and invoices">Billing</button>` : ''}
     ${paying && !state.cancelAtPeriodEnd ? `<button class="btn sm ghost billing-cancel" ${owner ? '' : disabled}>Cancel plan</button>` : ''}
@@ -28829,9 +28922,11 @@ function planBillingMarkup(e, state) {
   const seatPrice = planMoney(seats?.priceCents ?? e.monthlyAdditionalActiveUserPriceCents);
   const people = seats?.total ? `${members} of ${plural(seats.total, 'seat')}`
     : e.maxMembers != null ? `${members} of ${e.maxMembers}` : `${members} ${members === 1 ? 'person' : 'people'}`;
-  const seatTip = !seats?.total ? '' : seats.gifted
-    ? `${plural(seats.gifted, 'seat')} gifted${seats.paid ? `, ${seats.paid} bought` : ''}; each more is ${seatPrice}/month and adds 5 agents at once, 10 GB of storage and $3 of compute a month.`
-    : `First seat included, then ${seatPrice}/month each, adding 5 agents at once, 10 GB of storage and $3 of compute a month. Someone who joins without a free seat is billed one.`;
+  const seatInfo = !seats?.total ? '' : [
+    ['Seats', planLines([seats.gifted ? [String(seats.gifted), 'gifted'] : [String(seats.included || 1), `included with ${e.planName}`],
+      seats.paid ? [String(seats.paid), 'bought'] : null])],
+    ['Each more', esc(`${seatPrice}/month: 5 more agents at once, 10 GB of storage and $3 of ${siteName()} credits a month.`)],
+    seats.gifted ? null : ['Joining', 'Someone who joins without a free seat is billed one.']];
   const unused = seats?.total && seats.total > members ? `<span class="setting-muted">${seats.total - members} free</span>` : '';
   const seatsPending = state?.seatDeficit && seats?.autoBill
     ? `<span class="warn">${plural(state.seatDeficit, 'seat')} not yet billed</span>` : '';
@@ -28840,23 +28935,28 @@ function planBillingMarkup(e, state) {
   const seatCheckout = Boolean(seats?.gifted) && giftCheckout;
   const canSeats = owner && seats?.total != null && (seatCheckout || ((paying && billed === 'team') || (packsOnly && state.gift?.plan === 'team')) && !busy);
   const seatStepper = canSeats ? planStepper('seats', seats.total, `Each seat is ${seatPrice}/month`, seatCheckout, 'seat', Math.max(members, seats.included)) : '';
-  const peopleRow = `<div class="setting-row" data-limit="people"><span class="setting-label">People${seatTip ? ` ${policyTip(seatTip)}` : ''}</span>
-    <span class="setting-value"><b>${esc(people)}</b>${unused}${seatsFull}${e.overMemberLimit ? '<span class="warn">over the limit: agents are paused</span>' : ''}${seatsPending}</span>
-    ${seatsPending || seatStepper ? `<span class="setting-actions">${seatsPending ? `<button class="btn sm billing-sync" ${disabled}>Bill seats</button>` : seatStepper}</span>` : ''}</div>`;
+  const peopleRow = planRow('people', 'People', seatInfo, `<span class="setting-value"><b>${esc(people)}</b>${unused}${seatsFull}${e.overMemberLimit ? '<span class="warn">over the limit: agents are paused</span>' : ''}${seatsPending}</span>
+    ${seatsPending || seatStepper ? `<span class="setting-actions">${seatsPending ? `<button class="btn sm billing-sync" ${disabled}>Bill seats</button>` : seatStepper}</span>` : ''}`,
+  '', ' data-limit="people"');
   // Agents at once.
   const running = Number(e.activeAgentRuns || 0), waiting = Number(e.queuedAgentRuns || 0);
-  const agentsRow = `<div class="setting-row"><span class="setting-label">Agents ${policyTip('How many agents can work at the same time. More wait in line until one finishes.')}</span>
-    <span class="setting-value"><b>${esc(e.maxActiveAgentRuns)} at once</b>${running || waiting ? `<span class="setting-muted">${running} working${waiting ? `, ${waiting} waiting` : ''}</span>` : ''}</span></div>`;
+  const agentsRow = planRow('agents', 'Agents', 'How many agents can work at the same time. More wait in line until one finishes.',
+    `<span class="setting-value"><b>${esc(e.maxActiveAgentRuns)} at once</b>${running || waiting ? `<span class="setting-muted">${running} working${waiting ? `, ${waiting} waiting` : ''}</span>` : ''}</span>`);
   // Storage: used of the quota, the plan's share and the packs in the tooltip.
   const storagePack = state?.storagePack || { bytes: e.storagePackBytes, monthlyPriceCents: 400 };
   const storageUnit = `${planPackName('storage', storagePack)} pack`;
-  const storageParts = [`${formatBytes(e.includedStorageBytes)} with ${e.planName}`,
-    e.storagePacks ? `${e.storagePacks} × ${storageUnit}${e.storagePacks === 1 ? '' : 's'}` : '',
-    e.giftedStoragePacks ? `${e.giftedStoragePacks} × ${storageUnit}${e.giftedStoragePacks === 1 ? '' : 's'} gifted` : ''].filter(Boolean).join(' + ');
+  const packBytes = Number(storagePack.bytes || e.storagePackBytes || 0);
+  const packsOf = (count, unit) => `${count} × ${unit}${count === 1 ? '' : 's'}`;
   const canStorage = canPacks && state?.storagePack?.available;
-  const storageRow = `<div class="setting-row plan-limit" data-limit="storage"><span class="setting-label">Storage ${policyTip(`Project data, saved task workspaces and review files. ${storageParts}.`)}</span>
-    <span class="setting-value">${planMeter(e.storageUsedBytes, e.storageQuotaBytes)}<span><b>${esc(formatBytes(e.storageUsedBytes ?? 0))}</b> <span class="setting-muted">of ${esc(formatBytes(e.storageQuotaBytes))}</span></span></span>
-    ${canStorage ? `<span class="setting-actions">${planStepper('storage', ending ? 0 : Number(state.storagePacks || 0), `Each ${storageUnit} is ${planMoney(storagePack.monthlyPriceCents)}/month`, giftCheckout, storageUnit)}</span>` : ''}</div>`;
+  const storageInfo = [['Limit', planLines([[formatBytes(e.includedStorageBytes), `with ${e.planName}`],
+      e.storagePacks ? [formatBytes(e.storagePacks * packBytes), packsOf(e.storagePacks, storageUnit)] : null,
+      e.giftedStoragePacks ? [formatBytes(e.giftedStoragePacks * packBytes), `${packsOf(e.giftedStoragePacks, storageUnit)} · gifted`] : null])],
+    ['Counts', 'Project data, saved task workspaces and review files.'],
+    canStorage ? ['More', esc(`${planMoney(storagePack.monthlyPriceCents)}/month for each ${storageUnit}.`)] : null];
+  const storageRow = planRow('storage', 'Storage credits', storageInfo,
+    `<span class="setting-value">${planMeter(e.storageUsedBytes, e.storageQuotaBytes)}<span><b>${esc(formatBytes(e.storageUsedBytes ?? 0))}</b> <span class="setting-muted">of ${esc(formatBytes(e.storageQuotaBytes))}</span></span></span>
+    ${canStorage ? `<span class="setting-actions">${planStepper('storage', ending ? 0 : Number(state.storagePacks || 0), `Each ${storageUnit} is ${planMoney(storagePack.monthlyPriceCents)}/month`, giftCheckout, storageUnit)}</span>` : ''}`,
+    'plan-limit', ' data-limit="storage"');
   // Compute: only where the installation runs computers itself.
   let computeRow = '', topUpRow = '';
   if (e.compute) {
@@ -28868,19 +28968,30 @@ function planBillingMarkup(e, state) {
     const pack = state?.computePack || { creditMicros: e.computePackCreditMicros, monthlyPriceCents: 1000 };
     const providers = (e.compute.providers || []).map((id) => COMPUTER_PROVIDERS[id]?.name || id).join(', ');
     const computeUnit = `${planPackName('compute', pack)} pack`;
-    const parts = [trial ? `${planDollars(trial.creditMicros)} free trial ${trialLive ? 'until' : 'ended'} ${day(trial.endsAt)}` : '',
-      e.includedComputeCreditMicros || !trial ? `${planDollars(e.includedComputeCreditMicros)} with ${e.planName}` : '',
-      e.computePacks ? `${e.computePacks} × ${computeUnit}${e.computePacks === 1 ? '' : 's'}` : '',
-      e.giftedComputePacks ? `${e.giftedComputePacks} × ${computeUnit}${e.giftedComputePacks === 1 ? '' : 's'} gifted` : '',
-      topUp ? `${planDollars(topUp)} topped up, kept until used` : ''].filter(Boolean).join(' + ');
-    // The included model draws on it too (its use is the `openrouter` row).
-    const model = (e.compute.byProvider || []).find((row) => row.provider === 'openrouter');
-    const tip = `Cloud computers ${siteName()} runs for you (${providers})${e.compute.includedModel ? ' and its included model' : ''}, at twice the provider’s price: a 2 CPU · 2 GB E2B computer is about $0.27 an hour. Resets ${day(e.compute.to)}. Your own provider accounts and logins aren’t counted. ${credit ? `${parts}.` : ''}${model ? ` ${planDollars(model.usedMicros)} of it on the included model.` : ''}${held ? ` ${planDollars(held)} is held for computers running now.` : ''}`;
+    const packMicros = Number(pack.creditMicros ?? e.computePackCreditMicros ?? 0);
+    // Credits pay for tavya's computers, agents on its included models (and
+    // model gateways), and what agents buy through tavya (generations, apps).
+    const use = planCreditUse(e.compute.byProvider);
     const canCompute = canPacks && state?.computePack?.available;
-    computeRow = `<div class="setting-row plan-limit" data-limit="compute"><span class="setting-label">Compute ${policyTip(tip.trim())}</span>
-      <span class="setting-value">${credit ? `${planMeter(Number(e.compute.usedMicros || 0) + held, credit)}<span><b>${esc(planDollars(e.compute.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(credit))} ${trialLive && !e.computeCreditMicros && !topUp ? `· free until ${esc(day(trial.endsAt))}` : 'this month'}</span></span>`
+    const computeInfo = [
+      ['Pays for', `<ul class="plan-list"><li>${esc(`Computers ${siteName()} runs for you${providers ? ` (${providers})` : ''}`)}</li>`
+        + `<li>${esc(`Agents on ${siteName()}’s included models`)}</li><li>${esc(`What agents buy through ${siteName()}: images, video, speech, apps`)}</li></ul>`],
+      credit ? ['This month', planLines([trial ? [planDollars(trial.creditMicros), `free trial · ${trialLive ? 'until' : 'ended'} ${day(trial.endsAt)}`] : null,
+        e.includedComputeCreditMicros || !trial ? [planDollars(e.includedComputeCreditMicros), `with ${e.planName}`] : null,
+        e.computePacks ? [planDollars(e.computePacks * packMicros), packsOf(e.computePacks, computeUnit)] : null,
+        e.giftedComputePacks ? [planDollars(e.giftedComputePacks * packMicros), `${packsOf(e.giftedComputePacks, computeUnit)} · gifted`] : null,
+        topUp ? [planDollars(topUp), 'topped up · kept until used'] : null])] : null,
+      use.computers || use.models || use.apps || held ? ['Used', planLines([use.computers ? [planDollars(use.computers), 'computers'] : null,
+        use.models ? [planDollars(use.models), 'agents and models'] : null, use.apps ? [planDollars(use.apps), 'apps and media'] : null,
+        held ? [planDollars(held), 'held for work running now'] : null])] : null,
+      ['Price', esc('Twice what providers charge: a 2 CPU · 2 GB E2B computer is about $0.27 an hour. Your own accounts and logins cost nothing here.')],
+      credit && !(trialLive && !e.computeCreditMicros && !topUp) ? ['Renews', esc(day(e.compute.to))] : null,
+      canCompute ? ['More', esc(`${planMoney(pack.monthlyPriceCents)}/month for each ${computeUnit}${state?.autoTopUp?.offered ? ', or turn on auto top-up' : ''}.`)] : null];
+    computeRow = planRow('compute', `${siteName()} credits`, computeInfo,
+      `<span class="setting-value">${credit ? `${planMeter(Number(e.compute.usedMicros || 0) + held, credit)}<span><b>${esc(planDollars(e.compute.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(credit))} ${trialLive && !e.computeCreditMicros && !topUp ? `· free until ${esc(day(trial.endsAt))}` : 'this month'}</span></span>`
         : '<span class="setting-muted">With a paid plan</span>'}</span>
-      ${canCompute ? `<span class="setting-actions">${planStepper('compute', ending ? 0 : Number(state.computePacks || 0), `Each ${computeUnit} adds ${planPackName('compute', pack)} of compute a month for ${planMoney(pack.monthlyPriceCents)}/month`, giftCheckout, computeUnit)}</span>` : ''}</div>`;
+      ${canCompute ? `<span class="setting-actions">${planStepper('compute', ending ? 0 : Number(state.computePacks || 0), `Each ${computeUnit} adds ${planPackName('compute', pack)} of ${siteName()} credits a month for ${planMoney(pack.monthlyPriceCents)}/month`, giftCheckout, computeUnit)}</span>` : ''}`,
+      'plan-limit', ' data-limit="compute"');
     // Auto top-up: once offered (its billing terms approved), or while on.
     const auto = state?.autoTopUp;
     if (auto && (auto.offered || auto.enabled)) {
@@ -28889,9 +29000,9 @@ function planBillingMarkup(e, state) {
       const cap = Math.round(Number(auto.capCents || 0) / 100);
       const paused = auto.enabled && auto.pausedUntil > Date.now()
         ? `<span class="warn" title="${esc(auto.lastError || '')}">Card declined · retries ${esc(day(auto.pausedUntil))}</span>` : '';
-      topUpRow = `<div class="setting-row" data-limit="auto-top-up"><span class="setting-label">Auto top-up ${policyTip(`When compute runs low, buy ${amount} more at once on the saved card, up to this much a month. Top-ups last until used.`)}</span>
-        <span class="setting-value"><input class="toggle billing-auto-topup" type="checkbox" aria-label="Auto top-up" ${auto.enabled ? 'checked' : ''} ${editable ? '' : disabled || 'disabled'}>
-          <span class="setting-muted">up to $</span><input id="billing-auto-cap" class="plan-gift-count" type="number" min="${Math.ceil(auto.amountCents / 100)}" max="10000" step="${Math.ceil(auto.amountCents / 100)}" value="${esc(cap)}" aria-label="Monthly limit in dollars" ${editable ? '' : 'disabled'}><span class="setting-muted">/month${auto.spentCents ? ` · ${esc(planMoney(auto.spentCents))} this month` : ''}</span>${paused}</span></div>`;
+      topUpRow = planRow('auto-top-up', 'Auto top-up', `When ${siteName()} credits run low, buy ${amount} more at once on the saved card, up to this much a month. Top-ups last until used.`,
+        `<span class="setting-value"><input class="toggle billing-auto-topup" type="checkbox" aria-label="Auto top-up" ${auto.enabled ? 'checked' : ''} ${editable ? '' : disabled || 'disabled'}>
+          <span class="setting-muted">up to $</span><input id="billing-auto-cap" class="plan-gift-count" type="number" min="${Math.ceil(auto.amountCents / 100)}" max="10000" step="${Math.ceil(auto.amountCents / 100)}" value="${esc(cap)}" aria-label="Monthly limit in dollars" ${editable ? '' : 'disabled'}><span class="setting-muted">/month${auto.spentCents ? ` · ${esc(planMoney(auto.spentCents))} this month` : ''}</span>${paused}</span>`, '', ' data-limit="auto-top-up"');
     }
   }
   // One-line notices, only when something needs attention.
@@ -28917,7 +29028,7 @@ function planBillingMarkup(e, state) {
       const items = [team ? 'Any number of people' : '1 person',
         per(`${plan.maxActiveAgentRuns} agents at once`, plan.additionalActiveUserAgentRuns),
         per(`${formatBytes(plan.storageBytes)} storage`, plan.additionalActiveUserStorageBytes && formatBytes(plan.additionalActiveUserStorageBytes)),
-        ...(e.compute ? [per(`${dollars(plan.computeCreditMicros)} compute a month`, plan.additionalActiveUserComputeCreditMicros && dollars(plan.additionalActiveUserComputeCreditMicros))] : [])];
+        ...(e.compute ? [per(`${dollars(plan.computeCreditMicros)} ${siteName()} credits a month`, plan.additionalActiveUserComputeCreditMicros && dollars(plan.additionalActiveUserComputeCreditMicros))] : [])];
       return `<div class="plan-choice" data-plan="${esc(plan.id)}"><div class="plan-choice-head"><b>${esc(plan.name)}</b><span>${esc(planMoney(plan.monthlyBasePriceCents))}<small>/month${team ? ` + ${planMoney(plan.monthlyAdditionalActiveUserPriceCents)}/person` : ''}</small></span></div>
         <ul>${items.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>
         ${packsOnly ? `<button class="btn sm primary billing-change" data-plan="${esc(plan.id)}" ${disabled}>Choose ${esc(plan.name)}</button>`
@@ -28930,36 +29041,38 @@ function planBillingMarkup(e, state) {
   // The operator's complimentary plan and packs, and this organization's compute price.
   const computePrice = state?.computePrice;
   const gifts = state?.canGift ? `<details class="plan-operator"><summary>Operator</summary><div class="setting-rows">
-    <div class="setting-row"><span class="setting-label">Plan ${policyTip('Free access until removed. Paid billing, if any, continues separately. A gifted Team covers this many people; its owner buys more seats beside the gift.')}</span><span class="setting-value">
+    ${planRow('gift-plan', 'Plan', 'Free access until removed. Paid billing, if any, continues separately. A gifted Team covers this many people; its owner buys more seats beside the gift.', `<span class="setting-value">
       <select id="billing-gift-plan" aria-label="Gift plan">${Object.values(catalog).filter((plan) => plan.id !== 'free').map((plan) => `<option value="${esc(plan.id)}" ${state.gift?.plan === plan.id ? 'selected' : ''}>${esc(plan.name)}</option>`).join('')}</select>
       <input id="billing-gift-seats" type="number" min="1" max="10000" step="1" value="${esc(state.gift?.seats ?? Math.max(1, members))}" class="plan-gift-count" aria-label="Gifted seats" ${state.gift?.plan === 'individual' ? 'hidden' : ''}><span class="setting-muted billing-gift-seats-unit" ${state.gift?.plan === 'individual' ? 'hidden' : ''}>seats</span></span>
-      <span class="setting-actions"><button class="btn sm billing-gift">${state.gift ? 'Update' : 'Gift'}</button>${state.gift ? '<button class="btn sm ghost billing-gift-remove">Remove</button>' : ''}</span></div>
-    <div class="setting-row"><span class="setting-label">${esc(planPackName('storage', storagePack))} packs ${policyTip(`${formatBytes(storagePack.bytes)} of storage each, on any plan, until set to 0. Nothing is billed.`)}</span><span class="setting-value">
+      <span class="setting-actions"><button class="btn sm billing-gift">${state.gift ? 'Update' : 'Gift'}</button>${state.gift ? '<button class="btn sm ghost billing-gift-remove">Remove</button>' : ''}</span>`)}
+    ${planRow('gift-storage', `${esc(planPackName('storage', storagePack))} packs`, `${formatBytes(storagePack.bytes)} of storage credits each, on any plan, until set to 0. Nothing is billed.`, `<span class="setting-value">
       <input id="billing-gift-packs" type="number" min="0" max="1000" step="1" value="${esc(state.giftedStoragePacks || 0)}" class="plan-gift-count" aria-label="Gifted storage packs"></span>
-      <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="storage">Save</button></span></div>
-    <div class="setting-row"><span class="setting-label">${esc(planPackName('compute', state.computePack ?? { creditMicros: e.computePackCreditMicros }))} compute packs ${policyTip(`${planDollars(state.computePack?.creditMicros ?? e.computePackCreditMicros)} of compute a month each, on any plan, until set to 0. Nothing is billed.`)}</span><span class="setting-value">
+      <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="storage">Save</button></span>`)}
+    ${planRow('gift-compute', `${esc(planPackName('compute', state.computePack ?? { creditMicros: e.computePackCreditMicros }))} credit packs`, `${planDollars(state.computePack?.creditMicros ?? e.computePackCreditMicros)} of ${siteName()} credits a month each, on any plan, until set to 0. Nothing is billed.`, `<span class="setting-value">
       <input id="billing-gift-compute" type="number" min="0" max="1000" step="1" value="${esc(state.giftedComputePacks || 0)}" class="plan-gift-count" aria-label="Gifted compute packs"></span>
-      <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="compute">Save</button></span></div>
-    ${computePrice ? `<div class="setting-row"><span class="setting-label">Compute markup ${policyTip(`Over what providers charge, for this organization's computers and included model. Applies from now on. Empty: the default, ${computePrice.defaultMarkupPercent}%.`)}</span><span class="setting-value">
+      <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="compute">Save</button></span>`)}
+    ${computePrice ? planRow('markup', 'Markup', `Over what providers charge, for everything this organization's ${siteName()} credits pay for. Applies from now on. Empty: the default, ${computePrice.defaultMarkupPercent}%.`, `<span class="setting-value">
       <input id="billing-compute-markup" type="number" min="0" max="1000" step="1" value="${computePrice.markupPercent ?? ''}" placeholder="${esc(computePrice.defaultMarkupPercent)}" class="plan-gift-count" aria-label="Compute markup"><span class="setting-muted">%</span></span>
-      <span class="setting-actions"><button class="btn sm billing-compute-markup">Save</button></span></div>` : ''}
+      <span class="setting-actions"><button class="btn sm billing-compute-markup">Save</button></span>`) : ''}
   </div></details>` : '';
   return `${head}${noteHtml}<div class="setting-rows ruled plan-limits">${peopleRow}${agentsRow}${storageRow}${computeRow}${topUpRow}</div>${choices}${gifts}
     ${subscribed || packsOnly ? `<p class="plan-foot setting-muted">Separate from the cards agents pay with. <a href="/legal/billing" data-public>Billing terms</a></p>` : ''}`;
 }
 
-async function hydratePlanAndBilling(organizationId) {
-  const box = $('#org-plan');
+// Into Organization settings' card, or (profileBillingRow) an organization's
+// row of the profile's Plans & billing.
+async function hydratePlanAndBilling(organizationId, box = $('#org-plan')) {
   if (!box) return;
   const base = `/api/organizations/${encodeURIComponent(organizationId)}`;
   // The phone apps sell nothing (App Store 3.1.1, Play's payments policy): the plan and its limits, read-only, with no checkout.
   const [entitlements, state] = await Promise.all([api(`${base}/entitlements`).catch(() => null),
     nativeApp() ? null : api(`${base}/subscription/status`).catch(() => null)]);
-  if (!$('#org-plan') || S.organizationId !== organizationId) return;
+  if (!box.isConnected || (box.id === 'org-plan' && S.organizationId !== organizationId)) return;
   const giftsOpen = box.querySelector('.plan-operator')?.open;
   box.innerHTML = planBillingMarkup(entitlements, state?.managed ? state : null);
   if (giftsOpen && box.querySelector('.plan-operator')) box.querySelector('.plan-operator').open = true;
-  const reload = () => hydratePlanAndBilling(organizationId);
+  wirePlanInfo(box);
+  const reload = () => hydratePlanAndBilling(organizationId, box);
   const post = (path, body) => api(`${base}/subscription/${path}`, { method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
     ...(body ? { body: JSON.stringify(body) } : {}) });
   const act = (selector, run) => box.querySelectorAll(selector).forEach((button) => button.addEventListener('click', async () => {
@@ -29002,8 +29115,8 @@ async function hydratePlanAndBilling(organizationId) {
   const packOffer = (kind) => {
     const pack = kind === 'compute' ? state.computePack : state.storagePack;
     const name = planPackName(kind, pack);
-    return { pack, name: kind === 'compute' ? `${name} compute pack` : `${name} pack`,
-      what: kind === 'compute' ? `${name} of compute a month` : `${name} of storage` };
+    return { pack, name: kind === 'compute' ? `${name} credit pack` : `${name} pack`,
+      what: kind === 'compute' ? `${name} of ${siteName()} credits a month` : `${name} of storage credits` };
   };
   act('.billing-packs', async (button) => {
     const kind = button.dataset.kind;
@@ -29036,7 +29149,7 @@ async function hydratePlanAndBilling(organizationId) {
   };
   box.querySelector('.billing-auto-topup')?.addEventListener('change', async (event) => {
     const auto = state.autoTopUp;
-    if (event.target.checked && !confirm(`Charge ${planMoney(auto.amountCents)} to the saved card each time compute runs low, up to ${planMoney(auto.capCents)} a month?`)) {
+    if (event.target.checked && !confirm(`Charge ${planMoney(auto.amountCents)} to the saved card each time ${siteName()} credits run low, up to ${planMoney(auto.capCents)} a month?`)) {
       event.target.checked = false; return;
     }
     await autoTopUp({ enabled: event.target.checked });
@@ -29050,8 +29163,8 @@ async function hydratePlanAndBilling(organizationId) {
     for (const el of box.querySelectorAll('#billing-gift-seats, .billing-gift-seats-unit')) el.hidden = event.target.value !== 'team';
   });
   act('.billing-gift', async () => {
-    const plan = $('#billing-gift-plan').value;
-    const seats = Number($('#billing-gift-seats')?.value);
+    const plan = box.querySelector('#billing-gift-plan').value;
+    const seats = Number(box.querySelector('#billing-gift-seats')?.value);
     if (plan === 'team' && (!Number.isInteger(seats) || seats < 1 || seats > 10_000)) throw new Error('Enter a whole number of seats from 1 to 10000');
     await post('gift', { plan, ...(plan === 'team' ? { seats } : {}) }); toast('Plan gifted');
   });
@@ -29061,12 +29174,12 @@ async function hydratePlanAndBilling(organizationId) {
   });
   act('.billing-gift-packs', async (button) => {
     const kind = button.dataset.kind;
-    const packs = Number($(kind === 'compute' ? '#billing-gift-compute' : '#billing-gift-packs').value);
+    const packs = Number(box.querySelector(kind === 'compute' ? '#billing-gift-compute' : '#billing-gift-packs').value);
     if (!Number.isInteger(packs) || packs < 0 || packs > 1000) throw new Error('Enter a whole number from 0 to 1000');
     await post(kind === 'compute' ? 'gift-compute' : 'gift-storage', { packs }); toast(packs ? 'Packs gifted' : 'Gifted packs removed');
   });
   act('.billing-compute-markup', async () => {
-    const value = $('#billing-compute-markup').value.trim();
+    const value = box.querySelector('#billing-compute-markup').value.trim();
     const markupPercent = value === '' ? null : Number(value);
     if (markupPercent !== null && (!Number.isInteger(markupPercent) || markupPercent < 0 || markupPercent > 1000)) throw new Error('Enter a whole percent from 0 to 1000, or leave it empty for the default');
     await post('compute-markup', { markupPercent }); toast(markupPercent === null ? 'Default markup' : `Markup ${markupPercent}%`);
@@ -31246,8 +31359,8 @@ function renderPricing() {
       `${per(plan.maxActiveAgentRuns, plan.additionalActiveUserAgentRuns)} agents at once`,
       `${per(formatBytes(plan.storageBytes), plan.additionalActiveUserStorageBytes ? formatBytes(plan.additionalActiveUserStorageBytes) : '')} storage`,
       ...(compute ? [plan.computeCreditMicros
-        ? `${per(credit(plan.computeCreditMicros), plan.additionalActiveUserComputeCreditMicros ? credit(plan.additionalActiveUserComputeCreditMicros) : '')} of compute a month`
-        : plan.id === 'free' && S.launch?.trial ? `${credit(S.launch.trial.creditMicros)} of compute free for ${S.launch.trial.days} days`
+        ? `${per(credit(plan.computeCreditMicros), plan.additionalActiveUserComputeCreditMicros ? credit(plan.additionalActiveUserComputeCreditMicros) : '')} of ${siteName()} credits a month`
+        : plan.id === 'free' && S.launch?.trial ? `${credit(S.launch.trial.creditMicros)} of ${siteName()} credits free for ${S.launch.trial.days} days`
         : 'Your own cloud computer account'] : [])];
     const priceLine = plan.id === 'free' ? money(0, plan.currency)
       : `${money(plan.monthlyBasePriceCents, plan.currency)}<small> / month${isTeam ? ` + ${money(plan.monthlyAdditionalActiveUserPriceCents, plan.currency)} per extra person` : ''}</small>`;
@@ -31255,12 +31368,12 @@ function renderPricing() {
       <div class="price-value">${priceLine}</div><ul>${items.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>
       ${plan.id === 'free' || checkoutReady ? '<a class="btn primary" href="/signup">Create account</a>' : '<span class="price-unavailable">Paid checkout is not yet enabled.</span>'}</article>`;
   }).join('');
-  // Packs are named by what they give: a "100 GB pack", a "$10 pack" (of compute a month).
+  // Packs are named by what they give: a "100 GB pack" (of storage credits), a "$10 pack" (of tavya credits a month).
   const addOns = packs ? `<div class="pricing-addons"><b>Need more?</b>
       <span><b>${esc(formatBytes(packs.storage.bytes))} pack</b> ${esc(formatBytes(packs.storage.bytes))} more storage · ${esc(money(packs.storage.monthlyPriceCents))}/month</span>
-      ${compute ? `<span><b>${esc(credit(packs.compute.creditMicros))} pack</b> ${esc(credit(packs.compute.creditMicros))} more compute a month · ${esc(money(packs.compute.monthlyPriceCents))}/month</span>` : ''}
+      ${compute ? `<span><b>${esc(credit(packs.compute.creditMicros))} pack</b> ${esc(credit(packs.compute.creditMicros))} more ${esc(siteName())} credits a month · ${esc(money(packs.compute.monthlyPriceCents))}/month</span>` : ''}
       <small>On Individual and Team, as many as you like.</small></div>` : '';
-  const computeTerms = compute && packs ? `<p>Compute is the cloud computers agents work on. ${esc(siteName())} runs them for you at ${packs.computePriceMultiplier}× the provider’s list price (a 2 CPU · 2 GB E2B computer is about $0.27 an hour) and pauses work when the month’s compute is used up, unless you turn on auto top-up (${esc(money(packs.computeTopUpCents ?? 1000))} at a time, up to a monthly limit you set). Computers on your own E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud account cost nothing extra and aren’t counted.</p>` : '';
+  const computeTerms = compute && packs ? `<p>${esc(siteName())} credits pay for the cloud computers agents work on, agents on ${esc(siteName())}’s included models, and what agents buy through ${esc(siteName())} (images, video, speech, apps), at ${packs.computePriceMultiplier}× the provider’s list price (a 2 CPU · 2 GB E2B computer is about $0.27 an hour). Work pauses when the month’s credits are used up, unless you turn on auto top-up (${esc(money(packs.computeTopUpCents ?? 1000))} at a time, up to a monthly limit you set). Computers on your own E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud account cost nothing extra and aren’t counted.</p>` : '';
   renderPublicShell('/pricing', `<main class="pricing-page"><div class="legal-kicker">Hosted plans</div><h1>Free, Individual, and Team</h1>
       <p class="legal-summary">Every plan has unlimited projects. “Agents at once” is how many can work at the same time; more wait in line.</p>
       <div class="pricing-grid">${cards}</div>${addOns}

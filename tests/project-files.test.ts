@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { splitPath, worldFilesPath } from '../src/world/project-files.js';
+import { splitPath, worldFilesPath, worldFilesPaths } from '../src/world/project-files.js';
 import { projectFilesFixture, sh } from './helpers/project-files-fixture.js';
 
 // The project Files page's API (wiki features/project-files): the project laid
@@ -246,6 +246,24 @@ it('shows another branch where a repository has it, a task by its branch, and wh
   expect((await locate('/home/user/w/../x')).status).toBe(400);
   // An image the agent cites by path in its message.
   expect(await (await view(`&task=${task.num}&cited=1`, 'src/app.ts', true)).text()).toBe('export const answer = 7;\n');
+
+  // A world working at its root, its repository in a folder of the root's own
+  // name (rw-data#3): `../site/src/app.ts` from the root names a file that is
+  // not there, from the repository one that is; `src/app.ts` is in the
+  // repository too. Whichever reading finds the file wins.
+  const rooted = await f.store.createTask({ projectId: f.project.id, title: 'At the root', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x' } });
+  const rootedHandle = { id: rooted.id, kind: 'e2b', root: '/home/user/site', workdir: '/home/user/site', branch: 'tavya/task_one', base: 'main',
+    repos: [{ name: 'site', root: '/home/user/site/site', repo: `git@github.com:${f.owner}/site.git`, branch: 'tavya/task_one', base: 'main' }] } as any;
+  await f.store.registerWorld(rootedHandle, f.project.id);
+  await f.store.setWorldState(rootedHandle, 'parked');
+  const locateIn = async (cited: string) => fetch(`${f.server.url}/api/tasks/${rooted.id}/file-location?path=${encodeURIComponent(cited)}`,
+    { headers: { authorization: `Bearer ${f.viewer}` } });
+  expect(((await (await locateIn('../site/src/app.ts')).json()) as any).path).toBe('site/src/app.ts');
+  expect(((await (await locateIn('src/app.ts')).json()) as any).path).toBe('site/src/app.ts');
+  expect(((await (await locateIn('site/src/app.ts')).json()) as any).path).toBe('site/src/app.ts');
+  // Found nowhere: the plain reading (Files says what is missing).
+  expect(((await (await locateIn('docs/missing.md')).json()) as any).path).toBe('docs/missing.md');
+  expect(await (await view(`&task=${rooted.num}&cited=1`, '../site/src/app.ts', true)).text()).toBe('export const answer = 7;\n');
   // Reading a task needs task:read.
   const noTasks = await f.tokenFor(['project:read', 'repository:read']);
   expect((await fetch(`${f.server.url}/api/projects/${f.project.id}/files?path=site&task=${task.num}`, { headers: { authorization: `Bearer ${noTasks}` } })).status).toBe(403);
@@ -279,4 +297,17 @@ it('places a cited path that climbs with `..` but stays inside the world', () =>
   // A handle that names no folders: the path is already root-relative, and may not climb.
   expect(worldFilesPath({ id: 'w' } as any, 'a/b.md')).toBe('a/b.md');
   expect(() => worldFilesPath({ id: 'w' } as any, '../b.md')).toThrow();
+});
+
+it('reads a relative citation from the working folder, then from each checkout', () => {
+  const world = { id: 'w', kind: 'e2b', root: '/home/user/rw-data', workdir: '/home/user/rw-data',
+    repos: [{ name: 'rw-data', root: '/home/user/rw-data/rw-data' }, { name: 'wiki', root: '/home/user/rw-data/wiki', role: 'project-wiki' }] } as any;
+  expect(worldFilesPaths(world, '../rw-data/docs/a.md')).toEqual(['docs/a.md', 'rw-data/docs/a.md']);
+  expect(worldFilesPaths(world, 'docs/a.md')).toEqual(['docs/a.md', 'rw-data/docs/a.md', 'wiki/docs/a.md']);
+  // An absolute path has one reading; climbing out of the world from the root
+  // is still a reading from a checkout; out of every one is refused.
+  expect(worldFilesPaths(world, '/home/user/rw-data/rw-data/docs/a.md')).toEqual(['rw-data/docs/a.md']);
+  expect(worldFilesPaths(world, '../../rw-data/x.md')).toEqual(['x.md']);
+  expect(() => worldFilesPaths(world, '../../../x.md')).toThrow(/outside the task’s world/);
+  expect(worldFilesPaths({ id: 'w' } as any, 'a/b.md')).toEqual(['a/b.md']);
 });

@@ -2218,6 +2218,41 @@ a.ins-task-title:hover { color: var(--accent); }
 .plan-gift-count { width:6em; }
 .plan-foot { margin:10px 0 0; font-size:var(--fs-12); }
 .plan-limits .warn { color:var(--working); }
+/* A limit's label folds out, beneath its row, what lies behind its figure
+   (planRow): terms in the label column, details in the value column. */
+.plan-info-toggle { display:inline-flex; align-items:center; gap:6px; min-height:24px; padding:0; border:0; background:none; color:inherit; font:inherit; text-align:left; cursor:pointer; }
+.plan-info-icon { display:inline-flex; align-items:center; justify-content:center; width:15px; height:15px; border-radius:999px; background:var(--surface-2); color:var(--ink-3); font-size:var(--fs-10); line-height:1; }
+.plan-info-toggle:hover .plan-info-icon, .plan-info-toggle[aria-expanded="true"] .plan-info-icon { background:var(--accent); color:var(--on-accent, #fff); }
+.setting-rows > .setting-row + .plan-info { border-top:0; }
+.plan-info { margin:0 0 10px; padding:10px 12px; border-radius:var(--r-field, 8px); background:var(--surface-2); font-size:var(--fs-13); color:var(--ink-2); }
+.plan-info p { margin:0; }
+.plan-info dl { display:grid; grid-template-columns:128px minmax(0, 1fr); gap:8px 12px; margin:0; }
+.plan-info dt { color:var(--ink-3); }
+.plan-info dd { margin:0; min-width:0; }
+.plan-lines, .plan-list { display:grid; gap:3px; margin:0; padding:0; list-style:none; }
+.plan-lines li { display:grid; grid-template-columns:minmax(64px, max-content) minmax(0, 1fr); gap:10px; }
+.plan-lines b { font-weight:600; color:var(--ink); text-align:right; font-variant-numeric:tabular-nums; }
+@media (max-width:560px) { .plan-info dl { grid-template-columns:1fr; gap:2px; } .plan-info dd + dt { margin-top:6px; } }
+/* Profile → Plans & billing: one line per organization, folding out into its card. */
+.profile-plans { display:flex; flex-direction:column; border-top:1px solid var(--line); }
+.profile-plan { border-bottom:1px solid var(--line); }
+.profile-plan-head { display:grid; grid-template-columns:minmax(0, 1.2fr) minmax(0, 1.4fr) minmax(0, 1.2fr) 16px; align-items:center; gap:12px; width:100%; min-height:44px; padding:6px 0; border:0; background:none; color:inherit; font:inherit; text-align:left; }
+button.profile-plan-head { cursor:pointer; }
+button.profile-plan-head:hover .profile-plan-org { color:var(--accent); }
+.profile-plan.former .profile-plan-head { grid-template-columns:minmax(0, 1.2fr) minmax(0, 2.6fr) 16px; }
+.profile-plan-org { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.profile-plan-what { display:flex; align-items:center; flex-wrap:wrap; gap:6px; font-size:var(--fs-13); }
+.profile-plan-what b { font-weight:600; }
+.profile-plan-credits { display:flex; align-items:center; justify-content:flex-end; gap:8px; font-size:var(--fs-13); font-variant-numeric:tabular-nums; }
+.profile-plan-credits .plan-meter { flex:0 1 72px; }
+.profile-plan-credits.warn { color:var(--working); font-weight:600; }
+.profile-plan-caret { color:var(--ink-3); transition:transform .15s ease; justify-self:end; }
+.profile-plan.open .profile-plan-caret { transform:rotate(90deg); }
+.profile-plan-body { padding:4px 0 14px; }
+/* The row already names the plan and says it is gifted; a head left with nothing else goes. */
+.profile-plan-body .plan-name, .profile-plan-body .plan-head .chip.gifted { display:none; }
+.profile-plan-body .plan-head:not(:has(.btn, .plan-price:not(:empty), .chip:not(.gifted))) { display:none; }
+@media (max-width:560px) { .profile-plan-head { grid-template-columns:minmax(0, 1fr) 16px; } .profile-plan-what, .profile-plan-credits { grid-column:1; justify-content:flex-start; } .profile-plan-caret { grid-column:2; grid-row:1; } }
 .switch { display: flex; align-items: center; gap: 10px; }
 .switch input { width: 38px; height: 22px; }
 .switch.disabled { opacity: .55; cursor: not-allowed; }

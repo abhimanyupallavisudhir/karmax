@@ -90,7 +90,7 @@ import { HOSTED_GIT_ROUTE, hostedRepositoryUrl, isHostedRepository, isValidHoste
 import { materializeGitCredential } from '../world/git-credential.js';
 type Repository = import('../domain/types.js').Repository;
 import { projectArtifactGallery, type GalleryArtifact } from '../platform/artifact-gallery.js';
-import { FileAccessError, FileNotFoundError, ProjectFiles, projectRepositoryCredential, splitPath, worldFilesPath, type FileNode, type FileView, type OpenedFile } from '../world/project-files.js';
+import { FileAccessError, FileNotFoundError, ProjectFiles, projectRepositoryCredential, splitPath, type FileNode, type FileView, type OpenedFile } from '../world/project-files.js';
 import { CHANGE_LIMITS, FileConflictError, ProjectFileChanges, type FileChange, type FileKeeping } from '../world/project-file-changes.js';
 import { createFileShare, currentFileShare, projectFileShares, publicFileShare, publicFilesHtml, revokeFileShare, type FileShare } from './file-sharing.js';
 import { cliVersionOf, olderVersion } from '../domain/cli-version.js';
@@ -275,7 +275,7 @@ export function routeCapability(method: string, p: string, url?: URL): KnownCapa
   // Anyone signed in may report an error they saw (wiki features/error-reports);
   // a task's is read from the task, which the handler checks they can see.
   if (p === '/api/error-reports' && !read) return 'none';
-  if (p === '/api/user/export' || p === '/api/user/default-organization' || p === '/api/user/preferences' || p === '/api/user/paid-subscriptions'
+  if (p === '/api/user/export' || p === '/api/user/default-organization' || p === '/api/user/preferences' || p === '/api/user/paid-subscriptions' || p === '/api/user/plans'
     || p === '/api/user/onboarding' || p === '/api/user/onboarding/reset' || p === '/api/user/account-deletion-request') return 'none';
   // A signed-in person always owns their own Git identity. It is not an
   // organization credential grant and must remain editable after they join a
@@ -2788,6 +2788,43 @@ export class Gateway {
             settingsUrl: membership ? `${await organizationSettingsPath(store, organization.id)}#settings-plan` : null });
         }
         return this.json(res, 200, { subscriptions });
+      }
+      if (p === '/api/user/plans' && method === 'GET') {
+        // The profile's Plans & billing: every organization one belongs to, its
+        // plan (bought or gifted), its packs and its credits, and where to buy
+        // more; plus subscriptions one paid for in organizations one has left.
+        // Personal and cross-organization, like paid-subscriptions above.
+        const subject = requireHumanSubject(callerIdentity);
+        if (authRecord.organizationId || authRecord.projectId || authRecord.projectIds?.length)
+          return this.json(res, 403, { error: 'unscoped personal access is required' });
+        const managedProviders = ((await this.deps.providerConnections?.managedConnections()) ?? []).map((value) => value.provider);
+        const organizations = [];
+        for (const organization of await store.listOrganizations(subject.userId)) {
+          const membership = await store.organizationMembership(organization.id, subject.userId);
+          if (!membership) continue;
+          const entitlements = await store.organizationEntitlements(organization.id);
+          const paymentAllowed = this.deps.identity && session.userId === subject.userId && this.deps.authorization
+            ? allows(await this.personCaps(session, undefined, organization.id), 'payment:write')
+            : (await this.deps.tokens.check(token, 'payment:write', { organizationId: organization.id })).ok;
+          const credit = entitlements.deployment === 'hosted' && managedProviders.length ? await computeCredit(store, organization.id) : null;
+          organizations.push({ organizationId: organization.id, name: organization.name, slug: organization.slug, role: membership.role,
+            plan: entitlements.plan, planName: entitlements.planName,
+            gift: (await this.deps.subscriptions?.currentGift(organization.id)) ?? null,
+            storagePacks: entitlements.storagePacks, giftedStoragePacks: entitlements.giftedStoragePacks,
+            computePacks: entitlements.computePacks, giftedComputePacks: entitlements.giftedComputePacks,
+            credits: credit ? { usedMicros: credit.usedMicros, heldMicros: credit.heldMicros, availableMicros: credit.availableMicros,
+              totalMicros: (credit.creditMicros ?? 0) + credit.topUpMicros + (credit.trial?.monthMicros ?? 0) } : null,
+            canManage: membership.role === 'owner' && Boolean(paymentAllowed),
+            settingsUrl: `${await organizationSettingsPath(store, organization.id)}#settings-plan` });
+        }
+        const member = new Set(organizations.map((organization) => organization.organizationId));
+        const formerSubscriptions = [];
+        for (const subscription of (await this.deps.subscriptions?.paidSubscriptionsForUser(subject.userId)) ?? []) {
+          if (member.has(subscription.organizationId)) continue;
+          const organization = await store.getOrganization(subscription.organizationId);
+          if (organization) formerSubscriptions.push({ ...subscription, organizationName: organization.name, canManage: false, settingsUrl: null });
+        }
+        return this.json(res, 200, { organizations, formerSubscriptions });
       }
       if (p === '/api/user/default-organization' && (method === 'GET' || method === 'PUT')) {
         const subject = requireHumanSubject(callerIdentity);
@@ -5567,7 +5604,7 @@ export class Gateway {
         const task = await store.getTask(fileLocation[1]!);
         if (!task) return this.json(res, 404, { error: 'task not found' });
         let relative: string;
-        try { relative = await this.citedFilePath(task, url.searchParams.get('path') ?? ''); }
+        try { relative = await this.citedFilePath(session.apiToken, task, url.searchParams.get('path') ?? ''); }
         catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         return this.json(res, 200, { projectId: task.projectId, taskId: task.id, ...(task.num != null ? { num: task.num } : {}), path: relative });
       }
@@ -5715,7 +5752,7 @@ export class Gateway {
         if ('error' in view) return this.json(res, view.status, { error: view.error });
         // `cited`: a path as the task's agent wrote it (an image in its message).
         if (view.kind === 'task' && url.searchParams.has('cited')) {
-          try { relative = await this.citedFilePath((await store.getTask(view.taskId))!, relative); }
+          try { relative = await this.citedFilePath(session.apiToken, (await store.getTask(view.taskId))!, relative); }
           catch (error) { return this.json(res, 404, { error: error instanceof Error ? error.message : String(error) }); }
         }
         try {
@@ -11332,9 +11369,10 @@ export class Gateway {
   }
 
   /** Where a path an agent cited (absolute in its world, or relative to its
-   * working folder) sits in its project's Files, relative to the world root. */
-  private async citedFilePath(task: import('../domain/types.js').TaskRecord, cited: string): Promise<string> {
-    return worldFilesPath(((await this.deps.store.currentWorld(task.id)) ?? task.lastView?.world) as WorldHandle | undefined, cited);
+   * working folder or a checkout) sits in its task's view of Files. */
+  private async citedFilePath(token: string, task: import('../domain/types.js').TaskRecord, cited: string): Promise<string> {
+    const data = (await this.deps.tokens.check(token, 'project:settings:read', { projectId: task.projectId })).ok;
+    return this.projectFiles().citedPath(task.projectId, task.id, cited, data);
   }
 
   /** Tasks whose world can be shown (running, parked or saved), newest first, for the view picker. */

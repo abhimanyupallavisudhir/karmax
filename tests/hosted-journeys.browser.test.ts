@@ -119,7 +119,7 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       const guide = page.locator('#hosted-onboarding .onboarding-card');
       await step('the setup guide opens', () => guide.waitFor());
       // A new person's first organization comes with a free trial: shown, but no step is done by it.
-      expect(await guide.locator('.onboarding-trial').innerText()).toMatch(/^Free trial: \$5 of compute/);
+      expect(await guide.locator('.onboarding-trial').innerText()).toMatch(/^Free trial: \$5 of tavya credits/);
       expect(await guide.locator('.onboarding-progress').getAttribute('aria-valuenow')).toBe('0');
       // A step's link tucks the guide into its progress pill while the person works.
       const completed = () => page.locator('#onboarding-expand small').innerText();
@@ -403,7 +403,7 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await plan.getByRole('button', { name: 'Add a 100 GB pack' }).click();
       const dialog = page.getByRole('dialog', { name: 'Add a 100 GB pack' });
       await step('the checkout dialog opens', () => dialog.waitFor());
-      expect(await dialog.innerText()).toContain('100 GB of storage for $4/month');
+      expect(await dialog.innerText()).toContain('100 GB of storage credits for $4/month');
       if (process.env.KARMAX_REVIEW_SCREENSHOT_DIALOG) await page.screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT_DIALOG });
       await dialog.getByRole('button', { name: 'Checkout' }).click();
       await step('checkout needs the policies', () => page.getByText('Accept the current policies to continue.').waitFor());

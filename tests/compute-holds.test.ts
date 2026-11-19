@@ -63,7 +63,7 @@ describe('compute holds', () => {
     expect((await computeCredit(f.store, f.organization.id, T)).availableMicros).toBeLessThanOrEqual(0);
     const refused = await f.hold('e', e!.id).catch((error) => error);
     expect(refused).toBeInstanceOf(ComputeCreditExhausted);
-    expect(refused.message).toMatch(/^Out of compute: this month's \$5\.00 of compute is used up or held by work running now\. Add a \$10 pack or turn on auto top-up in Plan & billing/);
+    expect(refused.message).toMatch(/^Out of credits: this month's \$5\.00 of tavya credits is used up or held by work running now\. Add credits or turn on auto top-up in Plan & billing/);
     expect(await f.store.computeHold('e')).toBeUndefined();
     expect(JSON.parse((await f.store.kvGet(`compute-short:${f.organization.id}`))!)).toMatchObject({ neededMicros: 1_430_500 });
   });
@@ -189,11 +189,11 @@ describe('a turn that outlives its hold', () => {
     const started = Date.now();
     const stopped = await core.runAgentTurn(args('turn-1')).catch((error) => error);
     expect(stopped).toMatchObject({ type: 'world-capacity', nonRetryable: true });
-    expect(stopped.message).toMatch(/^Out of compute: /);
+    expect(stopped.message).toMatch(/^Out of credits: /);
     // Stopped where its hold ended (about three seconds of credit), not run on.
     expect(Date.now() - started).toBeLessThan(8_000);
     expect((await f.store.eventsOfType(task.id, 'agent.activity')).map((event) => event.payload))
-      .toContainEqual(expect.objectContaining({ phase: 'stopped', title: 'Out of compute' }));
+      .toContainEqual(expect.objectContaining({ phase: 'stopped', title: 'Out of credits' }));
     expect(await f.store.computeHold('turn:turn-1')).toMatchObject({ closedAt: expect.any(Number) });
 
     // Until there is credit, the next turn waits without touching the world.
@@ -203,7 +203,7 @@ describe('a turn that outlives its hold', () => {
     const resumed = await core.runAgentTurn(args('turn-3'));
     expect(resumed.output).toBe('done');
     expect(sessions).toEqual(['session-before', 'session-long']);
-    expect(prompts[1]).toMatch(/stopped because the organization's compute credit ran out/);
+    expect(prompts[1]).toMatch(/stopped because the organization ran out of tavya credits/);
     expect((await f.store.eventsOfType(task.id, 'turn.resumed')).map((event) => event.payload)).toContainEqual({ role: 'do', reason: 'compute' });
   }, 30_000);
 });
@@ -216,6 +216,8 @@ describe('waiting for compute credit', () => {
     expect(hasLiveWorldWork(machine)).toBe(true);
     // Workflow histories from before keep their decision.
     expect(hadLiveWorldWork(outOfCompute)).toBe(true);
+    // Said as credits since they are named so; histories that said compute keep parking.
+    expect(hasLiveWorldWork({ waitingFor: { kind: 'retry', summary: 'Out of credits', detail: 'Out of credits: …' } } as any)).toBe(false);
   });
 });
 

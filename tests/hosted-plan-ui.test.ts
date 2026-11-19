@@ -16,6 +16,7 @@ function extractFunction(name: string): string {
 }
 
 const esc = (value: unknown) => String(value ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
+const uiState: any = { launch: { paidLaunch: true, ready: true } };
 const markup = Function('esc', 'S', 'location', `
   const policyTip = (text) => '<i title="' + esc(text) + '">ⓘ</i>';
   const siteName = () => 'tavya';
@@ -25,7 +26,14 @@ const markup = Function('esc', 'S', 'location', `
   ${extractFunction('formatBytes')}
   const PLAN_ACTIVE = ['active', 'trialing', 'past_due'];
   ${extractFunction('planMoney')}; ${extractFunction('planDollars')}; ${extractFunction('planMeter')}; ${extractFunction('planPackName')}; ${extractFunction('planStepper')};
-  ${extractFunction('planBillingMarkup')}; return planBillingMarkup;`)(esc, { launch: { paidLaunch: true, ready: true } }, { search: '' });
+  ${extractFunction('planRow')}; ${extractFunction('planLines')}; ${extractFunction('planCreditUse')};
+  ${extractFunction('planBillingMarkup')}; return planBillingMarkup;`)(esc, uiState, { search: '' });
+// The fold-out beneath a row (its ⓘ), as text.
+const info = (html: string, key: string) => {
+  const at = html.indexOf(`id="plan-info-${key}"`);
+  if (at < 0) return '';
+  return text(html.slice(html.lastIndexOf('<div', at), html.indexOf('</div>', at)));
+};
 const GB = 1024 ** 3;
 const catalog = [
   { id: 'free', name: 'Free', monthlyBasePriceCents: 0, maxActiveAgentRuns: 5, storageBytes: 5 * GB, computeCreditMicros: 0 },
@@ -54,8 +62,9 @@ describe('Plan & billing', () => {
     expect(text(html)).toMatch(/5 at once 1 working, 2 waiting/);
     expect(text(html)).toMatch(/2 GB of 5 GB/);
     expect(html).toContain('role="meter"');
-    // Compute shows only where the installation runs computers itself.
-    expect(text(html)).not.toContain('Compute');
+    // Credits show only where the installation runs computers itself; storage is bought as storage credits.
+    expect(html).not.toContain('data-limit="compute"');
+    expect(text(html)).toMatch(/Storage credits ⓘ/);
     expect(html).toContain('data-plan="individual"');
     expect(html).toContain('Choose Team');
     expect(html).toContain('policy-acceptance');
@@ -72,13 +81,14 @@ describe('Plan & billing', () => {
       compute: { usedMicros: 13_000_000, creditMicros: 15_000_000, from: Date.UTC(2026, 9, 1), to: Date.UTC(2026, 10, 1), providers: ['e2b'] } }),
     status({ plan: 'individual', billedPlan: 'individual', status: 'active', storagePacks: 1, computePacks: 1, currentPeriodEnd: Date.UTC(2026, 10, 3) }));
     expect(text(html)).toMatch(/Individual \$23\/month · renews/);
-    expect(text(html)).toMatch(/\$13\.00 of \$15\.00 this month/);
+    expect(text(html)).toMatch(/tavya credits ⓘ .*\$13\.00 of \$15\.00 this month/);
     expect(html).toMatch(/plan-meter near/);
-    expect(html).toContain('50 GB with Individual + 1 × 100 GB pack');
-    expect(html).toContain('$5.00 with Individual + 1 × $10 pack');
+    // Where the figures come from, folded out beneath the row by its ⓘ.
+    expect(info(html, 'storage')).toMatch(/50 GB with Individual 100 GB 1 × 100 GB pack/);
+    expect(info(html, 'compute')).toMatch(/\$5\.00 with Individual \$10\.00 1 × \$10 pack/);
     expect(html).toContain('data-kind="storage"');
     expect(html).toContain('data-kind="compute" data-packs="2"');
-    expect(html).toContain('Each $10 pack adds $10 of compute a month for $10/month');
+    expect(html).toContain('Each $10 pack adds $10 of tavya credits a month for $10/month');
     // Packs are named by what they give, on their buttons and beside their count.
     expect(html).toContain('aria-label="Add a 100 GB pack"');
     expect(html).toContain('aria-label="Remove a $10 pack"');
@@ -96,13 +106,13 @@ describe('Plan & billing', () => {
     const auto = { enabled: false, offered: true, capCents: 5_000, amountCents: 1_000, spentCents: 0 };
     const html = markup(entitlements(paid), status({ plan: 'individual', billedPlan: 'individual', status: 'active', autoTopUp: auto }));
     expect(text(html)).toMatch(/\$4\.00 of \$15\.00 this month/);
-    expect(html).toContain('$10.00 topped up, kept until used');
-    expect(html).toContain('$1.50 is held for computers running now');
+    expect(info(html, 'compute')).toContain('$10.00 topped up · kept until used');
+    expect(info(html, 'compute')).toContain('$1.50 held for work running now');
     expect(html).toMatch(/aria-valuenow="5500000"/);
     const row = html.slice(html.indexOf('data-limit="auto-top-up"'));
     expect(row).toMatch(/class="toggle billing-auto-topup" type="checkbox" aria-label="Auto top-up"\s+>/);
     expect(row).toMatch(/id="billing-auto-cap"[^>]*value="50"/);
-    expect(row).toContain('When compute runs low, buy $10 more at once on the saved card, up to this much a month. Top-ups last until used.');
+    expect(info(row, 'auto-top-up')).toContain('When tavya credits run low, buy $10 more at once on the saved card, up to this much a month. Top-ups last until used.');
     // On, declined: says so; a member sees it but cannot change it.
     const declined = markup(entitlements(paid), status({ plan: 'individual', billedPlan: 'individual', status: 'active', canManage: false,
       autoTopUp: { ...auto, enabled: true, spentCents: 1_000, pausedUntil: Date.now() + 86_400_000, lastError: 'the payment was declined' } }));
@@ -116,9 +126,9 @@ describe('Plan & billing', () => {
   it('says Free has no managed compute, and that an over-limit organization\'s agents are paused', () => {
     const html = markup(entitlements({ currentMemberCount: 3, overMemberLimit: true,
       compute: { usedMicros: 0, creditMicros: 0, from: 0, to: Date.UTC(2026, 10, 1), providers: ['hetzner'] } }), status());
-    expect(text(html)).toMatch(/Compute .*With a paid plan/);
+    expect(text(html)).toMatch(/tavya credits ⓘ With a paid plan/);
     expect(text(html)).toMatch(/3 of 1 over the limit: agents are paused/);
-    expect(text(html)).toContain('compute a month');
+    expect(text(html)).toContain('$5 tavya credits a month');
   });
 
   it('lets only an owner change the plan, and shows the operator\'s gifts folded away', () => {
@@ -197,7 +207,8 @@ describe('Plan & billing', () => {
     expect(html).toMatch(/billing-seats" data-kind="seats" data-packs="2" aria-label="Remove a seat"\s*>/);
     expect(markup(team, { ...paid, teamSeats: { ...paid.teamSeats, total: 2, paid: 1 } }))
       .toMatch(/data-packs="1" aria-label="Remove a seat" disabled/);
-    expect(html).toContain('Someone who joins without a free seat is billed one.');
+    expect(info(html, 'people')).toMatch(/1 included with Team 2 bought/);
+    expect(info(html, 'people')).toContain('Someone who joins without a free seat is billed one.');
     // A member sees the seats, not the controls.
     expect(markup(team, { ...paid, canManage: false })).not.toContain('billing-seats');
     // Someone joined without a seat: Bill seats, not the stepper.
@@ -220,7 +231,7 @@ describe('Plan & billing', () => {
     const html = markup(team, gifted);
     expect(text(html)).toMatch(/People ⓘ 1 of 1 seat all taken − 1 \+ seat/);
     expect(html).toMatch(/billing-buy" data-kind="seats" data-packs="2" data-add aria-label="Add a seat"/);
-    expect(html).toContain('1 seat gifted; each more is $5/month');
+    expect(info(html, 'people')).toMatch(/1 gifted .*Each more \$5\/month/);
     const beside = markup(team, { ...gifted, billedPlan: 'free', status: 'active', billedMonthlyPriceCents: 900, storagePacks: 1,
       currentPeriodEnd: Date.UTC(2026, 10, 3), teamSeats: { ...gifted.teamSeats, total: 2, paid: 1, limit: 2 } });
     expect(text(beside)).toMatch(/Team Gifted Seats &amp; packs \$9\/month · renews/);
@@ -243,14 +254,44 @@ describe('Plan & billing', () => {
       status({ canGift: true, gift: { plan: 'team', seats: 4 } }));
     expect(operator).toMatch(/id="billing-gift-seats"[^>]*value="4"/);
     expect(text(operator)).toContain('100 GB packs');
-    expect(text(operator)).toContain('$10 compute packs');
+    expect(text(operator)).toContain('$10 credit packs');
     expect(markup(entitlements(), status({ canGift: true, gift: { plan: 'individual' } }))).toMatch(/id="billing-gift-seats"[^>]*hidden/);
+  });
+
+  it('folds what is behind each figure out beneath its row instead of a tooltip, and keeps it open across re-renders', () => {
+    const paid = entitlements({ plan: 'individual', planName: 'Individual', currentMonthlyPriceCents: 1_900, computeCreditMicros: 15_000_000,
+      includedComputeCreditMicros: 5_000_000, computePacks: 1, giftedComputePacks: 1,
+      compute: { usedMicros: 6_000_000, heldMicros: 500_000, creditMicros: 15_000_000, from: Date.UTC(2026, 10, 1), to: Date.UTC(2026, 11, 1),
+        providers: ['e2b'], includedModel: 'x/model', byProvider: [{ provider: 'e2b', usedMicros: 3_000_000 }, { provider: 'openrouter', usedMicros: 2_000_000 },
+          { provider: 'gateway:claude', usedMicros: 500_000 }, { provider: 'composio', usedMicros: 500_000 }] } });
+    const state = status({ plan: 'individual', billedPlan: 'individual', status: 'active', computePacks: 1 });
+    const html = markup(paid, state);
+    // No tooltips in the limits: each label is a button that folds its row's details out.
+    const limits = html.slice(html.indexOf('plan-limits'));
+    expect(limits).not.toMatch(/<i title=/);
+    expect(html).toMatch(/<button type="button" class="plan-info-toggle" aria-expanded="false" aria-controls="plan-info-compute">tavya credits<span class="plan-info-icon" aria-hidden="true">ⓘ<\/span><\/button>/);
+    expect(html).toMatch(/<div class="plan-info" id="plan-info-compute" data-info="compute" hidden>/);
+    // Credits pay for computers, agents on included models and what agents buy through tavya.
+    const credits = info(html, 'compute');
+    expect(credits).toMatch(/Pays for Computers tavya runs for you \(E2B\) Agents on tavya’s included models What agents buy through tavya: images, video, speech, apps/);
+    expect(credits).toMatch(/\$5\.00 with Individual \$10\.00 1 × \$10 pack \$10\.00 1 × \$10 pack · gifted/);
+    expect(credits).toMatch(/Used \$3\.00 computers \$2\.50 agents and models \$0\.50 apps and media \$0\.50 held for work running now/);
+    expect(credits).toMatch(/Renews Dec 1/);
+    expect(info(html, 'agents')).toContain('How many agents can work at the same time.');
+    // Open stays open when the card is drawn again (after a purchase, say).
+    uiState.planInfoOpen = new Set(['compute']);
+    try {
+      const open = markup(paid, state);
+      expect(open).toMatch(/aria-expanded="true" aria-controls="plan-info-compute"/);
+      expect(open).toMatch(/<div class="plan-info" id="plan-info-compute" data-info="compute">/);
+      expect(open).toMatch(/<div class="plan-info" id="plan-info-storage" data-info="storage" hidden>/);
+    } finally { delete uiState.planInfoOpen; }
   });
 
   it('makes private-install behavior explicit instead of showing hosted limits', () => {
     const privateInstall = markup({ deployment: 'private' }, null);
     expect(privateInstall).toContain('Private installation');
-    expect(privateInstall).toContain('Hosted plan limits don’t apply');
+    expect(info(privateInstall, 'private')).toContain('Hosted plan limits don’t apply');
   });
 
   it('loads the plan into Organization settings', () => {

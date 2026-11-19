@@ -2,7 +2,7 @@ import type { Store } from '../store/db.js';
 import type { WorldHandleRef } from '../domain/types.js';
 import { COMPUTE_TERMS, computeChargeMicros } from '../domain/entitlements.js';
 import { isVmWorldProvider, worldMachine } from '../domain/computer.js';
-import { computeCredit, machineRate } from './managed-compute.js';
+import { computeCredit, creditsUrl, machineRate } from './managed-compute.js';
 
 const dollars = (micros: number) => `$${(micros / 1e6).toFixed(2)}`;
 const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
@@ -58,7 +58,7 @@ export function hibernateAt(since: number, perHour: number, multiplier?: number)
  * organization's managed compute credit is spent (an inbox item, withdrawn
  * once there is credit again, and an email), and hibernate its parked
  * managed disks once their grace ends. Its tasks on managed computers wait
- * meanwhile ("Out of compute"). Returns how many owners were newly told. */
+ * meanwhile ("Out of credits"). Returns how many owners were newly told. */
 export async function notifyComputeCredit(deps: {
   store: Store;
   email?: { configured(): Promise<boolean>; send(message: { to: string; subject: string; text: string }): Promise<void> };
@@ -119,7 +119,8 @@ export async function notifyComputeCredit(deps: {
     if (!fresh || !deps.email || !(await deps.email.configured())) continue;
     told += fresh;
     const site = await deps.siteName();
-    const message = computeNoticeEmail(organization.name, site, notice, deps.publicUrl);
+    const message = computeNoticeEmail(organization.name, site, notice,
+      deps.publicUrl ? await creditsUrl(store, organization.id, deps.publicUrl) : undefined);
     for (const userId of owners) {
       const to = await deps.userEmail(userId).catch(() => undefined);
       if (to) await deps.email.send({ to, ...message }).catch((error) =>
@@ -133,24 +134,25 @@ const LOST = 'Their repositories\' files and uncommitted changes are saved and c
   + 'files Git ignores (installed dependencies, build output, caches) are deleted.';
 
 export function computeNoticeEmail(organization: string, site: string, notice: { stage: ComputeNoticeStage; usedMicros: number;
-  creditMicros: number; renewsAt: number; hibernateAt?: number; computers?: number; trial?: boolean }, publicUrl?: string): { subject: string; text: string } {
-  const manage = publicUrl ? `\n\nAdd compute: ${publicUrl.replace(/\/$/, '')}/settings` : '';
+  creditMicros: number; renewsAt: number; hibernateAt?: number; computers?: number; trial?: boolean }, planUrl?: string): { subject: string; text: string } {
+  // `planUrl`: the organization's Plan & billing (creditsUrl), where credits are added.
+  const manage = planUrl ? `\n\n${notice.trial ? 'Choose a plan' : 'Add credits'}: ${planUrl}` : '';
   const computers = (n = 0) => `${n} parked computer${n === 1 ? '' : 's'}`;
   const add = notice.trial ? 'choose a plan in Plan & billing, or connect your own provider account in Settings → Computers'
-    : 'add a $10 pack, turn on auto top-up or change the plan in Plan & billing, or connect your own provider account in Settings → Computers';
-  const renews = notice.trial ? '' : ` The compute renews on ${day(notice.renewsAt)}.`;
+    : 'add credits, turn on auto top-up or change the plan in Plan & billing, or connect your own provider account in Settings → Computers';
+  const renews = notice.trial ? '' : ` The credits renew on ${day(notice.renewsAt)}.`;
   if (notice.stage === 'hibernated') return {
     subject: `${organization}'s parked ${site} computers were hibernated`,
-    text: `${organization} is out of compute on ${site}, so its ${computers(notice.computers)} ${notice.computers === 1 ? 'was' : 'were'} hibernated: `
+    text: `${organization} is out of ${site} credits, so its ${computers(notice.computers)} ${notice.computers === 1 ? 'was' : 'were'} hibernated: `
       + `saved, and ${notice.computers === 1 ? 'its machine and disk' : 'their machines and disks'} deleted. ${LOST} `
       + `To carry on, ${add}.${renews}${manage}`,
   };
   const disks = notice.hibernateAt !== undefined
     ? `\n\nIts ${computers(notice.computers)} keep${notice.computers === 1 ? 's its disk' : ' their disks'} until ${when(notice.hibernateAt)}, `
-      + `then ${notice.computers === 1 ? 'it is' : 'they are'} hibernated so the disks stop costing compute. ${LOST}` : '';
+      + `then ${notice.computers === 1 ? 'it is' : 'they are'} hibernated so the disks stop costing credits. ${LOST}` : '';
   if (notice.stage === 'reminder') return {
     subject: `${organization}'s parked ${site} computers are hibernated on ${when(notice.hibernateAt!)}`,
-    text: `${organization} is still out of compute on ${site}.${disks}\n\nTo keep them, ${add}.${manage}`,
+    text: `${organization} is still out of ${site} credits.${disks}\n\nTo keep them, ${add}.${manage}`,
   };
   if (notice.trial) return {
     subject: `${organization}'s free ${site} trial is over`,
@@ -158,8 +160,8 @@ export function computeNoticeEmail(organization: string, site: string, notice: {
       + `Tasks on ${site}'s computers wait until there is more: ${add}.${disks}${manage}`,
   };
   return {
-    subject: `${organization} has used this month's ${site} compute`,
-    text: `${organization} has used ${dollars(notice.usedMicros)} of its ${dollars(notice.creditMicros)} of compute this month on ${site}. `
-      + `Tasks on ${site}'s computers wait until there is more: ${add}.${renews}${disks}${manage}`,
+    subject: `${organization} has used this month's ${site} credits`,
+    text: `${organization} has used ${dollars(notice.usedMicros)} of its ${dollars(notice.creditMicros)} of ${site} credits this month. `
+      + `Tasks on ${site}'s computers and included models wait until there are more: ${add}.${renews}${disks}${manage}`,
   };
 }

@@ -1,4 +1,4 @@
-// The task page of a task waiting Out of compute, rendered by the real
+// The task page of a task waiting Out of credits, rendered by the real
 // console (web/app.js with a scripted /api): one line saying what happened,
 // the ways out as buttons, the whole reason on hover.
 // Run: node design/billing/shoot-guidance.cjs [outDir]  (default /tmp/billing)
@@ -8,8 +8,10 @@ const { chromium } = require('playwright');
 const root = path.resolve(__dirname, '../..');
 const out = process.argv[2] || '/tmp/billing';
 fs.mkdirSync(out, { recursive: true });
-const spent = "Out of compute: this month's $10.00 of compute is used up. Add a $10 pack or turn on auto top-up in Plan & billing, or connect your own Hetzner account in Settings → Computers. It renews on 2026-12-01.";
-const noPlan = "Out of compute: tavya's computers come with a paid plan. Choose one in Plan & billing, or connect your own E2B account in Settings → Computers.";
+const spent = "Out of credits: this month's $10.00 of tavya credits is used up. Add credits or turn on auto top-up in Plan & billing (https://tavya.io/fern-lab/settings#settings-plan), or connect your own Hetzner account in Settings → Computers. They renew on 2026-12-01.";
+const noPlan = "Out of credits: tavya's computers come with a paid plan. Choose one in Plan & billing (https://tavya.io/fern-lab/settings#settings-plan), or connect your own E2B account in Settings → Computers.";
+// An agent on the included model whose credits ran out mid-task.
+const model = "Out of credits: this month's $10.00 of tavya credits is used up. Add credits or turn on auto top-up in Plan & billing (https://tavya.io/fern-lab/settings#settings-plan), or connect your own agent login or API key in Settings → Agents. They renew on 2026-12-01.";
 (async () => {
   const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
   const page = await browser.newPage({ viewport: { width: 1100, height: 560 }, deviceScaleFactor: 2, locale: 'en-US', timezoneId: 'UTC' });
@@ -31,7 +33,7 @@ const noPlan = "Out of compute: tavya's computers come with a paid plan. Choose 
         projects: [{ id: 'p', organizationId: 'o', name: 'Lab', slug: 'lab' }], projectId: 'p',
         taskEvents: [], sessions: {}, meta: { siteName: 'tavya' }, selected: 'task', taskTab: 'checkin' });
       S.view = { taskId: 'task', num: 12, title: 'Benchmark the new parser on the full corpus', stage: 'do', status: 'waiting',
-        waitingFor: { kind: 'retry', summary: 'Out of compute', until: Date.UTC(2026, 10, 2, 14, 35), detail },
+        waitingFor: { kind: 'retry', summary: 'Out of credits', until: Date.UTC(2026, 10, 2, 14, 35), detail },
         actions: [{ name: 'followUp', enabled: true }],
         transcripts: [{ role: 'do', messages: [
           { role: 'user', text: 'Benchmark the new parser on the full corpus and write up the numbers.', ts: Date.UTC(2026, 10, 2, 13, 2) },
@@ -42,8 +44,9 @@ const noPlan = "Out of compute: tavya's computers come with a paid plan. Choose 
     await page.locator('.wait-notice').scrollIntoViewIfNeeded();
     await page.screenshot({ path: path.join(out, `${name}.png`) });
   };
-  await shoot('task-out-of-compute', spent);
-  await shoot('task-out-of-compute-no-plan', noPlan);
+  await shoot('task-out-of-credits', spent);
+  await shoot('task-out-of-credits-no-plan', noPlan);
+  await shoot('task-out-of-credits-model', model);
   await browser.close();
   if (errors.length) throw new Error(errors.join('\n'));
   console.log(`screens in ${out}`);

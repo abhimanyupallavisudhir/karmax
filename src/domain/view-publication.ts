@@ -264,12 +264,18 @@ export function leavesWorldIdle(view: Pick<TaskView, 'status' | 'waitingFor'>): 
   return (view.status === 'waiting' || view.status === 'blocked') && !hasLiveWorldWork(view) && !watchesJobs(view);
 }
 
+/** The wait for credits, as workflows say it ("Out of compute" before credits
+ * were named so; histories that said it still replay). */
+export const OUT_OF_CREDITS_WAITS = ['Out of credits', 'Out of compute'];
+/** A refusal for spent credits (src/world/managed-compute.ts exhausted()). */
+export const OUT_OF_CREDITS = /^Out of (?:credits|compute)\b/;
+
 /** These waits still own live work or are about to enter a turn (a retry after
  * an infrastructure failure is seconds to minutes away). Waiting for compute
  * credit is not: only a person (a pack, auto top-up, the next month) ends it,
  * and the world must not run up the very bill it waits on, so it parks. */
 export function hasLiveWorldWork(view: Pick<TaskView, 'waitingFor'>): boolean {
-  return hadLiveWorldWork(view) && !(view.waitingFor?.kind === 'retry' && view.waitingFor.summary === 'Out of compute');
+  return hadLiveWorldWork(view) && !(view.waitingFor?.kind === 'retry' && OUT_OF_CREDITS_WAITS.includes(view.waitingFor.summary ?? ''));
 }
 
 /** hasLiveWorldWork before out-of-compute waits parked (workflow histories

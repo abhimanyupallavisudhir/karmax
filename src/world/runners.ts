@@ -1005,7 +1005,7 @@ function inPlaceResizeNotice(shape: MachineShape): string {
 
 /** What the agent hears when its task next runs after its parked computer
  * was hibernated because the organization's compute credit was spent. */
-export const COMPUTE_HIBERNATED_NOTICE = 'While this task waited, the organization ran out of compute credit, so its parked computer '
+export const COMPUTE_HIBERNATED_NOTICE = 'While this task waited, the organization ran out of tavya credits, so its parked computer '
   + 'was hibernated: it was saved and its machine and disk deleted. You are on a new machine with the same files your repositories '
   + 'track, and the same uncommitted changes. Git-ignored files (installed dependencies, build output, caches) and running processes '
   + 'did not carry over: reinstall or restart what you need.';
