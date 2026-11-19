@@ -23,14 +23,14 @@ it('offers a desktop task\'s screen in the rail, and opens it in a new tab', asy
   expect((await button.textContent())?.trim()).toBe('Desktop');
   expect(await button.getAttribute('title')).toBe('Watch and take over this task\'s screen (d)');
   await button.click();
-  await ui.page.waitForFunction(() => (window as any).__opened[0]?.tab.location.href.startsWith('https://'));
+  await ui.page.waitForFunction("window.__opened[0]?.tab.location.href.startsWith('https://')");
   // The tab opens at the click (no popup blocker), detached from the console.
-  const opened = await ui.page.evaluate(() => (window as any).__opened.map((o: any) => ({ url: o.url, opener: o.tab.opener, href: o.tab.location.href })));
+  const opened = await ui.page.evaluate('window.__opened.map((o) => ({ url: o.url, opener: o.tab.opener, href: o.tab.location.href }))');
   expect(opened).toEqual([{ url: '', opener: null, href: 'https://6080-sbx.e2b.app/vnc.html?autoconnect=true' }]);
   expect(ui.calls).toContainEqual(expect.objectContaining({ method: 'POST', path: '/api/tasks/t1/desktop' }));
   // A failure closes the blank tab and says why.
   await ui.run(`openTaskDesktop({ taskId: 't2', worldDesktop: true })`);
-  await ui.page.waitForFunction(() => (window as any).__opened[1]?.tab.closed === true);
+  await ui.page.waitForFunction('window.__opened[1]?.tab.closed === true');
   expect(await ui.page.locator('.toast').last().textContent()).toContain('this is a headless world');
   expect(ui.errors).toEqual([]);
   await ui.close();
