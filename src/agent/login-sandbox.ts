@@ -35,13 +35,17 @@ import { loginCliPackages } from './remote-process.js';
  * parks.
  */
 
-/** Providers a login sandbox runs on: sandboxes that start in seconds and bill by
- * the second. A VM (Hetzner's hourly billing, minutes to provision) never is. */
-export const LOGIN_SANDBOX_PROVIDERS: readonly string[] = ['e2b', 'daytona'];
-/** Providers whose parked sandbox resumes in a second (E2B: 0.1–0.4 s). An
- * idle sandbox elsewhere is deleted instead: Daytona's park archives it, and
- * restoring an archive took ~80 s (2026-11-19), far longer than a new one. */
-export const LOGIN_SANDBOX_PARKS: readonly string[] = ['e2b'];
+/** Providers a login sandbox runs on: machines that start in seconds and bill by
+ * the second or minute — E2B and Daytona sandboxes, and the VMs that stop and
+ * start in seconds (Agent37, Fly.io). Hetzner (whole hours, ~35 s to wake),
+ * AWS and Google Cloud (30–50 s) never are. */
+export const LOGIN_SANDBOX_PROVIDERS: readonly string[] = ['e2b', 'daytona', 'agent37', 'fly'];
+/** Providers whose parked sandbox comes back quickly (E2B resumes in 0.1–0.4 s;
+ * an Agent37 or Fly machine starts in seconds, its disk alone billed while
+ * stopped), so it is parked and pooled. An idle sandbox elsewhere is deleted
+ * instead: Daytona's park archives it, and restoring an archive took ~80 s
+ * (2026-11-19), far longer than a new one. */
+export const LOGIN_SANDBOX_PARKS: readonly string[] = ['e2b', 'agent37', 'fly'];
 /** How many paused, ready-to-claim sandboxes an organization that used one in
  * the last day keeps per provider that parks (`LOGIN_SANDBOX_PARKS`). */
 export const LOGIN_SANDBOX_POOL = () => {

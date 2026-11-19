@@ -284,6 +284,36 @@ describe('login sandboxes', () => {
     expect(e2b.destroyed).toContain('e2b-sbx-3');
   });
 
+  it('on a VM that stops in seconds (Agent37, Fly.io) it parks and pools as on E2B; on Daytona an idle one is deleted', async () => {
+    process.env.KARMAX_LOGIN_SANDBOX_POOL = '1';
+    for (const kind of ['agent37', 'fly']) {
+      const vm = new FakeSandboxes(kind, dir);
+      worlds.register(vm);
+      const org = await store.createOrganization({ name: `VM ${kind}` });
+      const pool = sandboxes(routeTo([{ provider: kind, funding: 'managed' }]));
+      const task = await taskIn(org.id);
+      await (await pool.open({ organizationId: org.id, taskId: task.id })).settle();
+      // A stopped machine waits for the next conversation (only its disk is billed).
+      await expect.poll(() => vm.parked.length).toBe(1);
+      expect(vm.created.at(-1)!.taskId).toMatch(/^login-pool-/);
+      clock += 10 * 60_000;
+      await pool.housekeep();
+      expect((await pool.entry(task.id))?.state).toBe('parked');
+      expect(vm.destroyed).toEqual([]);
+    }
+    const daytona = new FakeSandboxes('daytona', dir);
+    worlds.register(daytona);
+    const org = await store.createOrganization({ name: 'Daytona' });
+    const pool = sandboxes(routeTo([{ provider: 'daytona', funding: 'own' }]));
+    const task = await taskIn(org.id);
+    await (await pool.open({ organizationId: org.id, taskId: task.id })).settle();
+    clock += 10 * 60_000;
+    await pool.housekeep();
+    expect(await pool.entry(task.id)).toBeUndefined();
+    expect(daytona.destroyed).toEqual(['daytona-sbx-1']);
+    expect(daytona.parked).toEqual([]);
+  });
+
   it('the orphan reaper spares a live task\'s login sandbox, and only that one', async () => {
     const org = await store.createOrganization({ name: 'Reaper' });
     const task = await taskIn(org.id);
