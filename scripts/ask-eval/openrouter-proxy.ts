@@ -117,7 +117,9 @@ export class OpenRouterProxy {
       return json(403, { error: { message: 'eval proxy: only the Ask under test may call a model' } });
     }
     if (this.overBudget()) return json(402, { error: { message: `eval proxy: evaluation budget of $${this.budgetUsd} spent` } });
-    trial.systemPrompt ??= request.messages.find((m: any) => m.role === 'system')?.content;
+    const system = request.messages.find((m: any) => m.role === 'system')?.content;
+    // Claude's system prompt comes as text parts marked for caching.
+    trial.systemPrompt ??= Array.isArray(system) ? system.map((part: any) => part.text ?? '').join('') : system;
     trial.requestBodies.push(body.length);
     const round: Round = { at: Date.now(), ttfbMs: 0, totalMs: 0, status: 0, toolCalls: [], toolResults: toolResults(request.messages) };
     trial.rounds.push(round);

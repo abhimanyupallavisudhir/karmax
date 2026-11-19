@@ -10,7 +10,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
 import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, SDK_CONTROL_TOOL_SCHEMAS, COMPUTERLESS_TOOL_SCHEMAS, computerlessToolHandlers, platformToolHandlers } from './tools.js';
-import { isComputerlessWorld, loginNeedsComputer, platformOnlyHarness } from './computerless.js';
+import { AskToolset, isComputerlessWorld, loginNeedsComputer, platformOnlyHarness } from './computerless.js';
 import { CLAUDE_DEFAULT_MODEL, claudeMaxTokens, claudeMessagesEffort } from './effort.js';
 import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
@@ -127,10 +127,12 @@ export class ClaudeAdapter implements AgentAdapter {
     if (mcp.unavailable.length) await ctx.emitActivity?.(toolsUnavailableActivity(mcp.unavailable));
     const reportedUsage = new ReportedUsage();
     try {
-    const handlers: Record<string, (args: any) => Promise<string>> = computerless ? computerlessToolHandlers(input.world, ctx)
+    // Without a computer, Ask's own tool set (more_tools turns on the rest).
+    const toolset = computerless ? new AskToolset(computerlessToolHandlers(input.world, ctx)) : undefined;
+    const handlers: Record<string, (args: any) => Promise<string>> = toolset ? toolset.asHandlers()
       : { ...platformToolHandlers(input.world, ctx, () => workEnvironment(input)), ...mcp.handlers };
-    const tools = computerless ? COMPUTERLESS_TOOL_SCHEMAS.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }))
-      : [...MESSAGES_API_TOOLS, ...mcp.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }))];
+    const staticTools = [...MESSAGES_API_TOOLS, ...mcp.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }))];
+    const tools = () => toolset ? toolset.schemas().map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters })) : staticTools;
 
     const messages: any[] = [];
     const userMsgs = input.messages.filter((m) => m.role !== 'system');
@@ -192,7 +194,10 @@ export class ClaudeAdapter implements AgentAdapter {
             max_tokens: claudeMaxTokens(model),
             system: input.systemPrompt + (mcp.unavailable.length ? `\n\n${toolsUnavailableNotice(mcp.unavailable)}` : ''),
             messages,
-            tools,
+            tools: tools(),
+            // The prefix (tools, system, the conversation so far) is read from cache by
+            // every later round: an Ask makes 5–10 (ask-eval 2026-11-19: 0% cached without it).
+            cache_control: { type: 'ephemeral' },
             // Reasoning effort (SPEC §10.5) — sent only on models that accept it.
             ...(claudeMessagesEffort(model, input.profile.effort) ? { output_config: { effort: claudeMessagesEffort(model, input.profile.effort) } } : {}),
             // Text reaches the task as it is generated (LT-5); the reader rebuilds

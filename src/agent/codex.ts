@@ -12,7 +12,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
 import { PLATFORM_TOOL_SCHEMAS, SDK_CONTROL_TOOL_SCHEMAS, TOOL_SCHEMAS, COMPUTERLESS_TOOL_SCHEMAS, computerlessToolHandlers, platformToolHandlers } from './tools.js';
-import { isComputerlessWorld, loginNeedsComputer, platformOnlyHarness } from './computerless.js';
+import { AskToolset, isComputerlessWorld, loginNeedsComputer, platformOnlyHarness } from './computerless.js';
 import { CONTROL_SERVER_NAME, controlMcpServerSpec, startControlBridge } from './control-bridge.js';
 import { codexReasoningEffort } from './effort.js';
 import { openaiUserContent, materializeImageFiles } from './images.js';
@@ -320,11 +320,13 @@ export class CodexAdapter implements AgentAdapter {
       : await apiMcpTools(input.world, input.agentMcp, ctx.signal, input.toolsOptional);
     if (mcp.unavailable.length) await ctx.emitActivity?.(toolsUnavailableActivity(mcp.unavailable));
     try {
-    const handlers: Record<string, (args: any) => Promise<string>> = computerless ? computerlessToolHandlers(input.world, ctx)
+    // Without a computer, Ask's own tool set (more_tools turns on the rest).
+    const toolset = computerless ? new AskToolset(computerlessToolHandlers(input.world, ctx)) : undefined;
+    const handlers: Record<string, (args: any) => Promise<string>> = toolset ? toolset.asHandlers()
       : { ...platformToolHandlers(input.world, ctx, () => workEnvironment(input)), ...mcp.handlers };
     // Responses API function tools are flat ({type:'function', name, ...}).
-    const tools = computerless ? COMPUTERLESS_TOOL_SCHEMAS.map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters }))
-      : [...RESPONSES_API_TOOLS, ...mcp.tools.map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters }))];
+    const staticTools = [...RESPONSES_API_TOOLS, ...mcp.tools.map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters }))];
+    const tools = () => toolset ? toolset.schemas().map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters })) : staticTools;
 
     // On a fresh session, replay the full conversation so a login switch (which
     // drops the server-bound previous_response_id) doesn't lose context; when
@@ -373,7 +375,7 @@ export class CodexAdapter implements AgentAdapter {
       // it, alongside the chain id. (Claude's metered path does the same.)
       // `stream`: text reaches the task as it is generated (LT-5); the terminal
       // event carries the same response object the non-streaming call returns.
-      const body: any = { model, tools, tool_choice: completionPending ? 'none' : 'auto', store: true, stream: true, input: nextInput,
+      const body: any = { model, tools: tools(), tool_choice: completionPending ? 'none' : 'auto', store: true, stream: true, input: nextInput,
         instructions: input.systemPrompt + (mcp.unavailable.length ? `\n\n${toolsUnavailableNotice(mcp.unavailable)}` : '') };
       if (respId) body.previous_response_id = respId;
       // Reasoning effort (SPEC §10.5) — only reasoning models accept it (not gpt-4.1).

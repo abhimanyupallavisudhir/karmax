@@ -6,7 +6,10 @@ import { CodexAdapter } from '../src/agent/codex.js';
 import { AcpAdapter } from '../src/agent/acp.js';
 import { MockAdapter } from '../src/agent/mock.js';
 import { runTurn } from '../src/agent/runtime.js';
-import { chatCompletionsEndpoint, ComputerlessModelUnsupported, computerlessApiKey, computerlessModelGap } from '../src/agent/computerless.js';
+import { ASK_TOOL_NAMES, chatCompletionsEndpoint, ComputerlessModelUnsupported, computerlessApiKey, computerlessModelGap } from '../src/agent/computerless.js';
+
+// A host-side turn is offered Ask's own tool set (more_tools turns on the rest: tests/ask-cost.test.ts).
+const ASK_OFFERED = [...ASK_TOOL_NAMES, 'more_tools'].sort();
 import { COMPUTERLESS_TOOL_SCHEMAS, WORLD_TOOL_NAMES, computerlessToolHandlers } from '../src/agent/tools.js';
 import { assemblePrompt, NO_COMPUTER_WORLD } from '../src/agent/prompt.js';
 import { WorldRegistry } from '../src/world/registry.js';
@@ -245,7 +248,7 @@ describe('host-side loops of a task without a computer (stubbed model APIs)', ()
     expect(turn.usage).toMatchObject({ inputTokens: 30, outputTokens: 8 });
     expect(calls).toEqual([expect.objectContaining({ method: 'GET', path: '/api/inbox' })]);
     const offered = api.seen[0]!.body.tools.map((tool: { name: string }) => tool.name);
-    expect(offered.sort()).toEqual(COMPUTERLESS_TOOL_SCHEMAS.map((tool) => tool.name).sort());
+    expect(offered.sort()).toEqual(ASK_OFFERED);
     const results = api.seen[1]!.body.messages.at(-1).content;
     expect(results[0]).toMatchObject({ type: 'tool_result', tool_use_id: 'toolu_1' });
     expect(JSON.parse(results[0].content)).toMatchObject({ path: '/api/inbox' });
@@ -260,7 +263,7 @@ describe('host-side loops of a task without a computer (stubbed model APIs)', ()
       resolvedAuth: { apiKey: 'sk-test' } }), context([]));
     expect(turn.output).toBe('Nothing waits on you.');
     const offered = api.seen[0]!.body.tools.map((tool: { name: string }) => tool.name);
-    expect(offered.sort()).toEqual(COMPUTERLESS_TOOL_SCHEMAS.map((tool) => tool.name).sort());
+    expect(offered.sort()).toEqual(ASK_OFFERED);
   });
 
   it('OpenAI-compatible Chat Completions (the included model on OpenRouter): streamed tool calls round-trip', async () => {
@@ -291,10 +294,9 @@ describe('host-side loops of a task without a computer (stubbed model APIs)', ()
     expect(api.seen[0]!.path).toBe('/openrouter/v1/chat/completions');
     expect(api.seen[0]!.headers.authorization).toBe('Bearer sk-or-org');
     const first = api.seen[0]!.body;
-    expect(first).toMatchObject({ model: 'deepseek/deepseek-v4.1-flash-1017', stream: true, provider: { zdr: true }, reasoning: { effort: 'high' } });
+    expect(first).toMatchObject({ model: 'deepseek/deepseek-v4.1-flash-1017', stream: true, provider: { zdr: true, sort: 'price' }, reasoning: { effort: 'high' } });
     expect(first.messages[0]).toEqual({ role: 'system', content: 'system' });
-    expect(first.tools.map((tool: { function: { name: string } }) => tool.function.name).sort())
-      .toEqual(COMPUTERLESS_TOOL_SCHEMAS.map((tool) => tool.name).sort());
+    expect(first.tools.map((tool: { function: { name: string } }) => tool.function.name).sort()).toEqual(ASK_OFFERED);
     // message_agent went through the platform API, and its result came back to the model.
     expect(calls).toEqual([expect.objectContaining({ method: 'POST', path: '/api/tasks/task_9/messages' })]);
     const second = api.seen[1]!.body.messages;
@@ -339,5 +341,16 @@ describe('the prompt of a task without a computer', () => {
     // Its own ids, for tools that take them (add_follow_up_trigger, get_task…): without them cheap models
     // could not follow work they started (ask-eval 2026-11-19: 9/20 → 19/20 with this line).
     expect(prompt).toMatch(/This task's id is task_1 \(project proj_1\)/);
+  });
+
+  it('names the projects its person can reach, so a request about another project needs no lookup', () => {
+    const prompt = assemblePrompt({ profile: { id: 'p', name: 'p', provider: 'claude', role: 'do', capabilities: [] }, role: 'do',
+      task: { taskId: 'task_1', projectId: 'proj_1', title: 'Ask', prompt: 'Summarize the deploy runbook in Website', project: { repos: [] } } as never,
+      world: world.handle, organizationId: 'org_1',
+      projects: [{ id: 'proj_1', name: 'Ask' }, { id: 'proj_2', name: 'Website' }] });
+    // ask-eval 2026-11-19 (low effort): 7 of 9 models looked only in the Ask's own project for a page in Website.
+    expect(prompt).toMatch(/organization org_1/);
+    expect(prompt).toContain('"Website" (proj_2)');
+    expect(prompt).toContain('"Ask" (proj_1)');
   });
 });

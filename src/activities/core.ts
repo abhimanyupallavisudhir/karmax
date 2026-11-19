@@ -3780,7 +3780,24 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             && !['done', 'cancelled', 'failed'].includes(sibling.lastView?.status ?? ''))
           .map((sibling) => ({ id: sibling.id, title: sibling.title, ...(sibling.num ? { num: sibling.num } : {}) }))
         : [];
+      // Without a computer: the organization's projects its person reaches (ids the Ask needs for find_task, wikis…).
+      const reach = isComputerless(promptWorld.kind)
+        ? await (async () => {
+          try {
+            const own = await store.getProject(args.task.projectId);
+            const organizationId = own?.organizationId ?? 'org_personal';
+            const creator = preparationTask?.createdBy;
+            if (creator?.kind !== 'user') return { organizationId };
+            const reachable = new Set((await store.listProjectsReachableBy(creator.userId)).map((project) => project.id));
+            const projects = (await store.listOrganizationProjects(organizationId))
+              .filter((project) => reachable.has(project.id) || project.id === args.task.projectId)
+              .map((project) => ({ id: project.id, name: project.name }));
+            return { organizationId, projects };
+          } catch { return {}; }
+        })()
+        : {};
       const systemPrompt = assemblePrompt({
+        ...reach,
         profile,
         role: args.role,
         task: promptTask,

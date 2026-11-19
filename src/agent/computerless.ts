@@ -8,7 +8,7 @@ import { claudeToolActivity } from './activity.js';
 import { chatUserContent } from './images.js';
 import { apiThrottle, providerErrorFromMessage } from './limits.js';
 import { apiKeyEnv, credentialProvider, modelProviderFromModel } from './provider-registry.js';
-import { COMPUTERLESS_TOOL_SCHEMAS, computerlessToolHandlers } from './tools.js';
+import { COMPUTERLESS_TOOL_SCHEMAS, computerlessToolHandlers, type ToolSchema } from './tools.js';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, RUNAWAY_BACKSTOP, TurnInput } from './types.js';
 
 /**
@@ -154,6 +154,85 @@ export function platformOnlyHarness(input: Pick<TurnInput, 'world' | 'harnessWor
   return !!input.harnessWorld && isComputerlessWorld(input.world);
 }
 
+/**
+ * The platform tools a host-side Ask turn is offered at first (wiki
+ * features/computerless-tasks § What an Ask costs). Every model call resends
+ * every tool's description, and all 65 are ~15k tokens: more than the rest of
+ * an Ask's prompt. These cover what Asks do (ask-eval 2026-11-19: 98% of their
+ * tool calls); `more_tools` lists and turns on the rest.
+ */
+export const ASK_TOOL_NAMES = [
+  'platform_request', 'describe_platform', 'get_task', 'search_tasks', 'find_task', 'get_conversation',
+  'create_task', 'queue_task', 'signal_task', 'message_agent', 'set_task_priority',
+  'add_follow_up_trigger', 'remove_follow_up_trigger', 'my_authorization', 'request_permission',
+  'read_wiki', 'search_wiki', 'list_events', 'pause', 'escalate_to_human',
+  'list_credentials', 'list_connections', 'search_connection_tools', 'execute_connection_tool',
+];
+
+const firstSentence = (text: string) => (text.match(/^[^.\n]*\.?/)?.[0] ?? text).slice(0, 160);
+
+/** Ask's tool set for one host-side turn: {@link ASK_TOOL_NAMES} plus
+ * `more_tools`, which turns on any other tool of a task without a computer
+ * for the rest of the turn. `handlers` are {@link computerlessToolHandlers}:
+ * nothing else is ever callable, offered or not. */
+export class AskToolset {
+  private readonly on = new Set(ASK_TOOL_NAMES);
+  constructor(private readonly handlers: Record<string, (args: any) => Promise<string>>) {}
+
+  schemas(): ToolSchema[] {
+    // A stable order (Ask's own first, then what was turned on) keeps the cached prefix valid.
+    const byName = new Map(COMPUTERLESS_TOOL_SCHEMAS.map((tool) => [tool.name, tool]));
+    const added = COMPUTERLESS_TOOL_SCHEMAS.filter((tool) => this.on.has(tool.name) && !ASK_TOOL_NAMES.includes(tool.name));
+    return [...ASK_TOOL_NAMES.map((name) => byName.get(name)!), ...added, this.moreTools()];
+  }
+
+  private moreTools(): ToolSchema {
+    return {
+      name: 'more_tools',
+      description: 'Your tools are the ones most requests need. Call with no names to list the others '
+        + '(sub-tasks, credentials, payments, cloud providers, GitHub Actions, events, mail, skills, generating media…), '
+        + 'or with names to turn those on for the rest of this turn.',
+      parameters: { type: 'object', properties: { names: { type: 'array', items: { type: 'string' }, description: 'Tools to turn on.' } } },
+    };
+  }
+
+  /** name → handler for every tool this turn may call (offered or not), as the API rails look them up. */
+  asHandlers(): Record<string, (args: any) => Promise<string>> {
+    return Object.fromEntries([...Object.keys(this.handlers), 'more_tools'].map((name) => [name, (args: any) => this.call(name, args)]));
+  }
+
+  async call(name: string, args: any): Promise<string> {
+    if (name === 'more_tools') {
+      const names: string[] = Array.isArray(args?.names) ? args.names.map(String) : [];
+      if (!names.length) {
+        return COMPUTERLESS_TOOL_SCHEMAS.filter((tool) => !this.on.has(tool.name))
+          .map((tool) => `${tool.name}: ${firstSentence(tool.description)}`).join('\n');
+      }
+      const known = new Set(COMPUTERLESS_TOOL_SCHEMAS.map((tool) => tool.name));
+      const added = names.filter((n) => known.has(n));
+      const unknown = names.filter((n) => !known.has(n));
+      for (const n of added) this.on.add(n);
+      return [added.length ? `Turned on: ${added.join(', ')}.` : '',
+        unknown.length ? `Not tools of a task without a computer: ${unknown.join(', ')}.` : ''].filter(Boolean).join(' ');
+    }
+    const handler = this.handlers[name];
+    if (!handler) throw new Error(`unknown tool ${name}: a task without a computer has only tavya's own tools`);
+    return handler(args ?? {});
+  }
+}
+
+/**
+ * OpenRouter routing for one host-side turn: the organization's own
+ * (`modelOptions.provider`: zero data retention, no 4-bit builds) with the
+ * cheapest provider first — the same model costs up to 6× more on another
+ * (ask-eval 2026-11-19: MiMo-V2.6-Pro $0.0037 an Ask on DeepInfra, $0.022 on
+ * PrimaLabs) — and, once one has answered, that one first for the rest of the
+ * turn, so the prefix it cached keeps being read. Others stay as fallbacks.
+ */
+export function openRouterRouting(base: Record<string, unknown> | undefined, served: string | undefined): Record<string, unknown> {
+  return { ...base, sort: 'price', ...(served ? { order: [served], allow_fallbacks: true } : {}) };
+}
+
 /** OpenRouter/OpenAI reasoning effort from a profile's (low…max). */
 function reasoningBody(vendor: string, effort: string | undefined): Record<string, unknown> {
   if (!effort || effort === 'none') return {};
@@ -178,9 +257,14 @@ export async function runChatCompletionsTurn(input: TurnInput, ctx: PlatformTool
   if (!apiKey) throw loginNeedsComputer('opencode');
   const label = `${endpoint.vendor} Chat Completions`;
   (await (await currentTiming())?.mark('provider.selected', { provider: input.profile.provider, model: input.profile.model }));
-  const handlers = computerlessToolHandlers(input.world, ctx);
-  const tools = COMPUTERLESS_TOOL_SCHEMAS.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } }));
-  const messages: any[] = [{ role: 'system', content: input.systemPrompt }];
+  const toolset = new AskToolset(computerlessToolHandlers(input.world, ctx));
+  const tools = () => toolset.schemas().map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } }));
+  const openRouter = endpoint.vendor === 'openrouter';
+  let served: string | undefined;
+  // OpenRouter caches an Anthropic model's prefix only up to a marked block (ask-eval 2026-11-19: 0% cached without it).
+  const marksCache = openRouter && endpoint.model.startsWith('anthropic/');
+  const messages: any[] = [{ role: 'system', content: marksCache
+    ? [{ type: 'text', text: input.systemPrompt, cache_control: { type: 'ephemeral' } }] : input.systemPrompt }];
   const conversation = input.messages.filter((m) => m.role !== 'system');
   for (const m of conversation) messages.push(m.role === 'agent' ? { role: 'assistant', content: m.text } : { role: 'user', content: chatUserContent(m) });
   if (!conversation.length) messages.push({ role: 'user', content: 'Begin the task described in the instructions.' });
@@ -217,10 +301,11 @@ export async function runChatCompletionsTurn(input: TurnInput, ctx: PlatformTool
           body: JSON.stringify({
             model: endpoint.model,
             messages,
-            tools,
+            tools: tools(),
             ...reasoningBody(endpoint.vendor, input.profile.effort),
             // tavya's included model routes only to providers that keep no prompts.
             ...input.resolvedAuth?.modelOptions,
+            ...(openRouter ? { provider: openRouterRouting(input.resolvedAuth?.modelOptions?.provider as Record<string, unknown> | undefined, served) } : {}),
             stream: true,
             stream_options: { include_usage: true },
           }),
@@ -234,6 +319,7 @@ export async function runChatCompletionsTurn(input: TurnInput, ctx: PlatformTool
         (await (await currentTiming())?.markOnce('first.output'));
         return read;
       }));
+      if (openRouter && typeof data?.provider === 'string') served ??= data.provider;
       const usage = data?.usage;
       // Usage accounting is required even when timing collection is absent.
       const roundUsage = reportedUsage.add({ input_tokens: usage?.prompt_tokens, output_tokens: usage?.completion_tokens,
@@ -274,9 +360,7 @@ export async function runChatCompletionsTurn(input: TurnInput, ctx: PlatformTool
         ctx.emitActivity(claudeToolActivity(block, 'started'));
         if (!failed) {
           try {
-            const handler = handlers[name];
-            if (!handler) throw new Error(`unknown tool ${name}: a task without a computer has only tavya's own tools`);
-            result = await handler(args ?? {});
+            result = await toolset.call(name, args);
           } catch (error) {
             failed = true;
             result = error instanceof Error ? error.message : String(error);

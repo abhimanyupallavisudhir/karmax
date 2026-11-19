@@ -63,7 +63,7 @@ process.env.KARMAX_GATEWAY_URL = gateway.internalUrl;
 const jobs = models.flatMap((model) => Array.from({ length: runs }, (_, run) => ({ model, run, seed: undefined as Seeded | undefined })));
 for (let i = 0; i < jobs.length; i += 4) {
   await Promise.all(jobs.slice(i, i + 4).map(async (job) => {
-    try { job.seed = await seedOrganization(h, `${job.model.id} ${job.run}`); }
+    try { job.seed = await seedOrganization(h, `${job.model.spec} ${job.run}`); }
     catch (error) { console.error(`[ask-eval] seed failed for ${job.model.spec}: ${error}`); }
   }));
 }
