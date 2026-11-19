@@ -229,7 +229,15 @@ function describeComputer(world: WorldHandle, taskId: string, requested?: Machin
   providers: Array<{ provider: string; diskGb?: number }> = [], moveTo?: string, anyProvider = false): string {
   const base = describeMachineAndRoom(world, taskId, requested, disk, given, moveTo);
   if (!base) return '';
-  return base + describeOtherProviders(world, taskId, disk, given, providers, moveTo, anyProvider);
+  return base + describeOtherProviders(world, taskId, disk, given, providers, moveTo, anyProvider) + describeDesktop(world);
+}
+
+/** A desktop world's screen, and where people find it: agents asked a person
+ * to click in "the task's desktop view", which no page called that (#1001). */
+function describeDesktop(world: WorldHandle): string {
+  if (world.meta?.environmentFlavor !== 'desktop') return '';
+  return ' It has a screen: your browser is visible on it, and people watch and take over through the Desktop button on '
+    + 'this task\'s page (shortcut d). When you need a person there (a human check, a sign-in step), say so in those words.';
 }
 
 /** How a move to another provider works, said wherever one is offered or pending. */
