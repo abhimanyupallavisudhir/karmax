@@ -41,9 +41,10 @@ export async function seedOrganization(h: Harness, label: string): Promise<Seede
   // A paid organization, whose compute credit pays for the included model's turns.
   await h.store.setOrganizationPlan(organization.id, 'individual');
   const website = await h.store.createProject('Website', {}, organization.id);
-  // A computerless task cannot make a sub-task yet (spawnSubTasks snapshots its
-  // world with git, which the none world refuses), so the project whose task
-  // waits on a sub-task has a repository, and that task the worktree world.
+  // The task that waits on a sub-task has a repository and the worktree world:
+  // when the 2026-11-19 results were measured, a computerless task could not
+  // make a sub-task (spawnSubTasks snapshotted its world with git; fixed in
+  // 4e00b915). Kept so later runs compare with them.
   const data = await h.store.createProject('Data pipeline', { repos: [await h.makeRepo('etl')], defaultBase: 'main' } as any, organization.id);
   const assistant = await h.store.createProject('Assistant', {}, organization.id);
   const ownerToken = (await h.tokens.mintPrincipal('user:owner',

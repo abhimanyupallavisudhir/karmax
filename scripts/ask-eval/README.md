@@ -36,8 +36,10 @@ several stages: one asking a question (Needs input), several in Review, one paus
 a Postgres password error, a full disk), a low-priority task, a parent waiting on a sub-task that asks its parent
 which S3 bucket to use; a wiki runbook (`runbooks/deploy`); an uptime alert in Website's event inbox.
 
-The sub-task's parent has the worktree world: **a computerless task cannot create a sub-task today**
-(`spawnSubTasks` snapshots its world with `git`, which the none world refuses: see the wiki section).
+The sub-task's parent has the worktree world: when the 2026-11-19 results were measured a computerless task could
+not create a sub-task (`spawnSubTasks` snapshotted its world with `git`; fixed in 4e00b915), and later runs keep the
+same seed so they compare. `--variant identity` (the prompt names the Ask's task, project and organization) measured
+what 4e00b915 since does for every Ask; it is now redundant.
 
 ## The questions (`scenarios.ts`)
 
