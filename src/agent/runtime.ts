@@ -286,7 +286,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   }); });
 
   const ctx: PlatformToolContext = {
-    taskId: deps.spendCtx?.taskId ?? input.world.handle.id,
+    taskId: deps.spendCtx?.taskId ?? input.world?.handle?.id,
     openPr() {
       if (input.role !== 'do') throw new Error('open_pr is available only to the Do agent');
       openPrRequested = true;
