@@ -63,6 +63,7 @@ export interface Harness {
   api: KarmaxApi;
   resources: ProjectResourceService;
   broker: CredentialBroker;
+  authorization: AuthorizationService;
   checkpoints?: WorldCheckpointService;
   restartWorker(): Promise<void>;
   /** The live worker, for diagnostics (cache and workflow-thread heap). */
@@ -95,6 +96,10 @@ export async function bootHarness(
     alsoServe?: Provider[];
     /** The login sandboxes of tasks without a computer (src/agent/login-sandbox.ts), made on the harness's store and worlds. */
     loginSandboxes?: (store: Store, worlds: WorldRegistry) => import('../../src/agent/login-sandbox.js').LoginSandboxes;
+    /** Give the API the authorization service, as src/main.ts does: people's
+     * own levels (`ownAuthority`, the Ask box) and task grants resolve as in
+     * production instead of from the caller's token alone. */
+    apiAuthorization?: boolean;
   } = {},
 ): Promise<Harness> {
   const server = await startDevServer({ headless: true, logLevel: 'never' });
@@ -164,6 +169,7 @@ export async function bootHarness(
     resources,
     objects,
     ...overrides,
+    ...(overrides.apiAuthorization ? { authorization } : {}),
     loginSandboxes: overrides.loginSandboxes?.(store, worlds),
     checkpoints,
   };
@@ -173,6 +179,7 @@ export async function bootHarness(
 
   // The vault broker as src/main.ts passes it (incoming webhooks keep their secrets there).
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir, defaultAgentProvider: provider, bus, worlds, broker,
+    ...(overrides.apiAuthorization ? { authorization } : {}),
     refreshCredentialHealth: async (task, credentialProvider, options) => {
       if (credentialProvider) await retryCredentials({ store, client, taskQueue: TASK_QUEUE, broker, configHomes: overrides.configHomes }, task, credentialProvider, options);
     },
@@ -191,6 +198,7 @@ export async function bootHarness(
     api,
     resources,
     broker,
+    authorization,
     checkpoints,
     worker: () => worker,
     async restartWorker() {
