@@ -21,7 +21,8 @@ import { enumerateCredentials, resolveCredentials, type Credential } from './cre
 import { gatherCredentialSources, readPolicyLayers } from './credential-sources.js';
 import { ComputeRouter, type RouterConnections } from '../world/compute-router.js';
 import { computeCredit } from '../world/managed-compute.js';
-import { computerlessApiKey, computerlessModelGap } from '../agent/computerless.js';
+import { computerlessApiKey, computerlessModelNeed, type ComputerlessFix } from '../agent/computerless.js';
+import { LoginSandboxes } from '../agent/login-sandbox.js';
 
 export interface ReadinessDeps {
   store: Store;
@@ -29,6 +30,8 @@ export interface ReadinessDeps {
   configHomes?: ConfigHomeManager;
   broker?: CredentialBroker;
   providerConnections?: RouterConnections;
+  /** Where a login of a task without a computer runs its CLI (by default on `providerConnections`). */
+  loginSandboxes?: LoginSandboxes;
 }
 
 /** What an unready agent lacks: a login or key of `provider` — the harness for
@@ -41,6 +44,8 @@ export interface AgentNeed {
   /** A task without a computer can't run this agent on what the organization
    * has (a login, not a key): why, in a sentence. */
   computerless?: string;
+  /** What fixes that: an API key (or a login), a computer for the login's CLI, or another model. */
+  computerlessFix?: ComputerlessFix;
 }
 
 export interface Readiness {
@@ -53,7 +58,9 @@ export interface Readiness {
   /** `gateway`: a Claude Code or Codex agent runs on the credit through this
    * model gateway ("OpenRouter", or an operator gateway's name; wiki
    * features/model-gateways). */
-  agents: Array<{ provider: string; model?: string; ready: boolean; need?: AgentNeed; cost?: number; included?: true; gateway?: string }>;
+  /** `sandbox`: a task without a computer runs this login's CLI in a small
+   * cloud computer of its own for each conversation (wiki features/computerless-tasks). */
+  agents: Array<{ provider: string; model?: string; ready: boolean; need?: AgentNeed; cost?: number; included?: true; gateway?: string; sandbox?: true }>;
   /** Any enabled login or key at all. */
   agentLogin: boolean;
   compute: {
@@ -101,10 +108,17 @@ export async function projectReadiness(deps: ReadinessDeps,
   scope: { organizationId: string; projectId?: string },
   agents: Array<Pick<AgentProfile, 'provider' | 'model' | 'effort'>> = [],
   /** The task has no computer: its agents run on tavya with an API key or the
-   * included model only, and it needs no compute. */
+   * included model, or a login's CLI in a login sandbox; it needs no compute of its own. */
   options: { computerless?: boolean } = {}): Promise<Readiness> {
   const { all, layers } = await agentCredentials(deps, scope);
   const credentials = resolveCredentials(all, layers);
+  // Where a login's CLI runs for a task without a computer: this machine
+  // (self-hosted), or a login sandbox — asked once, and only when needed.
+  let sandboxCompute: Promise<true | string> | undefined;
+  const loginCompute = () => sandboxCompute ??= !deps.hosted ? Promise.resolve(true as const)
+    : (deps.loginSandboxes ?? new LoginSandboxes({ store: deps.store,
+      ...(deps.providerConnections ? { connections: deps.providerConnections } : {}) }))
+      .unavailable(scope.organizationId).then((reason) => reason ?? true as const);
   const inOrganization = resolveCredentials(all, { global: layers.global });
   // tavya's included model runs on the organization's credit, not a login of its own.
   const included = agents.length ? await includedModel(deps.store, deps.broker) : undefined;
@@ -129,9 +143,15 @@ export async function projectReadiness(deps: ReadinessDeps,
         const onIncluded = rail?.kind === 'included';
         const key = onIncluded || serves(agent, credentials.filter((credential) => credential.kind === 'key'))
           || !!computerlessApiKey(agent, { hosted: deps.hosted, organizationId: scope.organizationId });
-        const gap = computerlessModelGap(agent, { apiKey: key });
+        // A Claude Code / Codex login: its CLI runs in a login sandbox (or on this self-hosted machine).
+        const login = !key && (agent.provider === 'claude' || agent.provider === 'codex')
+          && serves(agent, credentials.filter((credential) => credential.kind === 'login'));
+        const compute = login ? await loginCompute() : undefined;
+        const gap = computerlessModelNeed(agent, { apiKey: key, login, ...(compute ? { compute } : {}) });
         const cost = onIncluded && included ? await relativeCost(included, rail!, agent) : undefined;
-        return { ...agent, ready: !gap, ...(gap ? { need: { ...need(agent), computerless: gap } } : {}),
+        return { ...agent, ready: !gap,
+          ...(gap ? { need: { ...need(agent), computerless: gap.message, computerlessFix: gap.fix } } : {}),
+          ...(login && !gap && deps.hosted ? { sandbox: true as const } : {}),
           ...(cost !== undefined ? { cost: Math.round(cost * 10) / 10 } : {}) };
       }
       const ready = own || !!rail;

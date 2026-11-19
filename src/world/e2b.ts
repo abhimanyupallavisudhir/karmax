@@ -1,5 +1,5 @@
 import { TextDecoder } from 'node:util';
-import { buildSizedTemplate, e2bTemplate, needsSizedTemplate, sizedTemplateName } from './e2b-template.js';
+import { buildSizedTemplate, buildWarmTemplate, e2bTemplate, e2bTemplateExists, needsSizedTemplate, sizedTemplateName, warmTemplateName } from './e2b-template.js';
 import { describeMachine, machineShape, type MachineShape } from '../domain/computer.js';
 import { fitComputer, limitWarning, type ComputerLimits } from '../domain/computer-limits.js';
 import type { WorldReferenceKeys } from './reference-keys.js';
@@ -120,6 +120,9 @@ export interface E2BFactory {
   events?(options: { apiKey?: string; since?: number; offset?: number }): Promise<{ events: unknown[]; resumeAt?: number }>;
   /** Make template `name` exist: `base` built at `shape`'s CPU, memory and disk. */
   ensureTemplate?(base: string, name: string, shape: MachineShape, options: { apiKey?: string }): Promise<{ name?: string; diskGb?: number; shape?: MachineShape; limits?: ComputerLimits } | void>;
+  /** Whether a template exists, and building one whose npx cache holds `packages` (warmTemplateName). */
+  templateExists?(name: string, options: { apiKey?: string }): Promise<boolean>;
+  ensureWarmTemplate?(base: string, name: string, packages: readonly string[], options: { apiKey?: string }): Promise<{ name?: string } | void>;
 }
 
 /** E2B cloud worlds: one isolated sandbox per task attempt, automatically paused
@@ -180,6 +183,10 @@ export class E2BWorldProvider implements WorldProvider {
           error instanceof Error ? error.message : String(error)}`.slice(0, 600));
       }
     }
+    // A login sandbox's CLI, already in the npx cache: its warm template once
+    // built, else the base now while that builds (never waited for).
+    if (spec.warmPackages?.length && selectedTemplate && selectedTemplate === baseTemplate && !needsSizedTemplate(shape))
+      selectedTemplate = (await this.warmTemplate(selectedTemplate, spec.warmPackages, connection?.apiKey).catch(() => undefined)) ?? selectedTemplate;
     const reduced = (['cpu', 'memoryMb', 'diskGb'] as const).filter((key) => shape[key] !== requested[key]);
     if (reduced.length) sizeWarnings.unshift(limitWarning('e2b', reduced, shape, requested));
     const taskNetwork = e2bNetwork(spec);
@@ -289,6 +296,24 @@ export class E2BWorldProvider implements WorldProvider {
       this.states.delete(sandbox.sandboxId);
       throw error;
     }
+  }
+
+  /** The warm template of `base` and `packages` if it exists; if it does not,
+   * its build starts in the background (one per name and key in this
+   * process) and this sandbox starts from `base`. */
+  private warm = new Map<string, { ready: boolean; pending?: Promise<unknown> }>();
+  private async warmTemplate(base: string, packages: readonly string[], apiKey?: string): Promise<string | undefined> {
+    const name = warmTemplateName(base, packages);
+    const key = `${crypto.createHash('sha256').update(apiKey ?? '').digest('hex')}:${name}`;
+    const known = this.warm.get(key);
+    if (known?.ready) return name;
+    if (known?.pending || !this.factory.templateExists || !this.factory.ensureWarmTemplate) return undefined;
+    const options = apiKey ? { apiKey } : {};
+    if (await this.factory.templateExists(name, options)) { this.warm.set(key, { ready: true }); return name; }
+    const pending = timed('e2b.warm-template', () => this.factory.ensureWarmTemplate!(base, name, packages, options))
+      .then(() => { this.warm.set(key, { ready: true }); }, () => { this.warm.delete(key); });
+    this.warm.set(key, { ready: false, pending });
+    return undefined;
   }
 
   /** The template of `base` at `shape`'s size, built on first use and then
@@ -1026,6 +1051,8 @@ function defaultE2BFactory(): E2BFactory {
   };
   return {
     ensureTemplate: buildSizedTemplate,
+    templateExists: e2bTemplateExists,
+    ensureWarmTemplate: buildWarmTemplate,
     async create(options) {
       const { template, desktop, ...opts } = options;
       if (desktop) {

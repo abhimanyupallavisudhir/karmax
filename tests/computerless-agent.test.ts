@@ -105,14 +105,17 @@ describe('tools of a task without a computer', () => {
 });
 
 describe('which models run without a computer', () => {
-  it('API keys and the included model do; subscription logins and unknown vendors do not', () => {
+  it('API keys and the included model do; subscription logins where their CLI can run; unknown vendors do not', () => {
     expect(computerlessModelGap({ provider: 'claude' }, { apiKey: true })).toBeUndefined();
     expect(computerlessModelGap({ provider: 'codex' }, { apiKey: true })).toBeUndefined();
     expect(computerlessModelGap({ provider: 'opencode', model: 'openrouter/deepseek/deepseek-v4.1-flash-1017' }, { apiKey: true })).toBeUndefined();
     expect(computerlessModelGap({ provider: 'opencode', model: 'anthropic/claude-haiku-5-5' }, { apiKey: true })).toBeUndefined();
     expect(computerlessModelGap({ provider: 'mock' }, { apiKey: false })).toBeUndefined();
-    expect(computerlessModelGap({ provider: 'claude' }, { apiKey: false })).toMatch(/Claude Code login runs only on a computer/);
-    expect(computerlessModelGap({ provider: 'codex' }, { apiKey: false })).toMatch(/Codex login runs only on a computer/);
+    // A login's CLI runs in a small sandbox of its own (login-sandbox.test.ts); with nowhere to run it, it says so.
+    expect(computerlessModelGap({ provider: 'claude' }, { apiKey: false, login: true, compute: true })).toBeUndefined();
+    expect(computerlessModelGap({ provider: 'codex' }, { apiKey: false, login: true, compute: true })).toBeUndefined();
+    expect(computerlessModelGap({ provider: 'claude' }, { apiKey: false, login: true })).toMatch(/Claude Code login replies from a small cloud computer, and this organization has none/);
+    expect(computerlessModelGap({ provider: 'codex' }, { apiKey: false })).toMatch(/Codex login or an API key is needed/);
     expect(computerlessModelGap({ provider: 'opencode', model: 'google/gemini-3-pro' }, { apiKey: true })).toMatch(/can't run without a computer/);
     expect(computerlessModelGap({ provider: 'kimi' as never }, { apiKey: true })).toMatch(/can't run without a computer/);
     expect(chatCompletionsEndpoint('openrouter/deepseek/deepseek-v4.1-flash-1017')).toMatchObject({ vendor: 'openrouter', model: 'deepseek/deepseek-v4.1-flash-1017' });
@@ -157,19 +160,19 @@ describe('which models run without a computer', () => {
         [{ provider: 'claude', model: 'claude-opus-5-5' }], { computerless: true });
       const hosted = (await ask(true)).agents[0]!;
       expect(hosted.ready).toBe(false);
-      expect(hosted.need?.computerless).toMatch(/runs only on a computer/);
+      expect(hosted.need?.computerless).toMatch(/Claude Code login or an API key is needed/);
       expect((await ask(false)).agents[0]!.ready).toBe(true);
     } finally {
       if (saved === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = saved;
     }
   });
 
-  it('a subscription login refuses before any request', async () => {
+  it('a subscription login never runs host-side: without a machine for its CLI it refuses before any request', async () => {
     const claude = new ClaudeAdapter().runComputerlessTurn(input({ resolvedAuth: { configHome: '/tmp/home' } }), context([]));
     await expect(claude).rejects.toBeInstanceOf(ComputerlessModelUnsupported);
     const codex = new CodexAdapter().runComputerlessTurn(input({ profile: { id: 'p', name: 'p', provider: 'codex', role: 'do', capabilities: [] },
       resolvedAuth: { configHome: '/tmp/home' } }), context([]));
-    await expect(codex).rejects.toThrow(/Codex login runs only on a computer/);
+    await expect(codex).rejects.toThrow(/Codex login replies from a small cloud computer/);
   });
 
   it('the runtime sends a computerless turn to the host-side rail, and refuses an agent without one', async () => {

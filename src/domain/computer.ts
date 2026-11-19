@@ -265,3 +265,11 @@ export function assertInFlightComputerEdit(current: ComputerSpec, next: Computer
 export function computerResizable(view: { status?: string; pointOfNoReturnPassed?: boolean } | undefined): boolean {
   return !view || (!['done', 'cancelled', 'failed'].includes(view.status ?? '') && !view.pointOfNoReturnPassed);
 }
+
+/** How many subscription-login sandboxes an organization runs at once
+ * (tasks without a computer: wiki features/computerless-tasks), unless its
+ * usage policy says fewer. The installation sets it. */
+export function defaultLoginSandboxes(): number {
+  const value = Number(process.env.KARMAX_LOGIN_SANDBOXES_PER_ORG);
+  return Number.isSafeInteger(value) && value > 0 ? value : 2;
+}

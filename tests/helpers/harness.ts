@@ -93,6 +93,8 @@ export async function bootHarness(
     /** Providers the adapter override also answers for: a task made in the
      *  console's form names its default agent's provider (claude) explicitly. */
     alsoServe?: Provider[];
+    /** The login sandboxes of tasks without a computer (src/agent/login-sandbox.ts), made on the harness's store and worlds. */
+    loginSandboxes?: (store: Store, worlds: WorldRegistry) => import('../../src/agent/login-sandbox.js').LoginSandboxes;
   } = {},
 ): Promise<Harness> {
   const server = await startDevServer({ headless: true, logLevel: 'never' });
@@ -162,6 +164,7 @@ export async function bootHarness(
     resources,
     objects,
     ...overrides,
+    loginSandboxes: overrides.loginSandboxes?.(store, worlds),
     checkpoints,
   };
   let worker: WorkerHandle = await makeWorker(conn, activityDeps);

@@ -10,7 +10,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
 import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, SDK_CONTROL_TOOL_SCHEMAS, COMPUTERLESS_TOOL_SCHEMAS, computerlessToolHandlers, platformToolHandlers } from './tools.js';
-import { isComputerlessWorld, loginNeedsComputer } from './computerless.js';
+import { isComputerlessWorld, loginNeedsComputer, platformOnlyHarness } from './computerless.js';
 import { CLAUDE_DEFAULT_MODEL, claudeMaxTokens, claudeMessagesEffort } from './effort.js';
 import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
@@ -299,7 +299,7 @@ export class ClaudeAdapter implements AgentAdapter {
     catch (error) {
       // A sandbox controls its PTY bytes. Preserve its turn failure, but shared
       // account health must come from a host-side check (confirmSandboxFailure).
-      if (isRemoteAgentWorld(input.world) && error instanceof ProviderFailure)
+      if (isRemoteAgentWorld(input.harnessWorld ?? input.world) && error instanceof ProviderFailure)
         throw new SandboxProviderFailure(error);
       throw error;
     } finally { ctx.reportUsage?.(meter.total()); }
@@ -310,7 +310,7 @@ export class ClaudeAdapter implements AgentAdapter {
       ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
     input = { ...input, resolvedAuth: { ...input.resolvedAuth, configHome } };
     if (input.session) {
-      const repaired = await recoverClaudeToolInputs({ session: input.session, configHome, world: input.world });
+      const repaired = await recoverClaudeToolInputs({ session: input.session, configHome, world: input.harnessWorld ?? input.world });
       if (repaired) {
         input = { ...input, session: repaired, fork: false };
         ctx.emitActivity?.({ id: 'claude-history-recovery', kind: 'status', phase: 'completed',
@@ -361,7 +361,9 @@ export class ClaudeAdapter implements AgentAdapter {
 
   private async runAgentSdkAttempt(input: TurnInput, ctx: PlatformToolContext, meter: ClaudeStreamUsage,
     recovery?: { deliveredMessages: number }): Promise<AdapterTurn> {
-    const work = await claudeWorkEnvironment(input, !!ctx.onSecretEnvChange);
+    // A login of a task without a computer has no shell to give an environment to.
+    const work = platformOnlyHarness(input) ? { settings: undefined, update: async () => {}, cleanup: async () => {} }
+      : await claudeWorkEnvironment(input, !!ctx.onSecretEnvChange);
     const unsubscribe = ctx.onSecretEnvChange?.(work.update);
     try { return await this.runAgentSdkProcess(input, ctx, work.settings, meter, recovery); }
     finally {
@@ -373,7 +375,10 @@ export class ClaudeAdapter implements AgentAdapter {
   private async runAgentSdkProcess(input: TurnInput, ctx: PlatformToolContext,
     workSettings: Awaited<ReturnType<typeof claudeWorkEnvironment>>['settings'], meter: ClaudeStreamUsage,
     recovery?: { deliveredMessages: number }): Promise<AdapterTurn> {
-    const runtimeWorld = input.world.withoutProjectEnvironment?.() ?? input.world;
+    // A task without a computer runs its login's CLI in a machine of its own
+    // (`harnessWorld`), offered only tavya's platform tools (claudeToolSurface).
+    const runtimeWorld = input.harnessWorld ?? input.world.withoutProjectEnvironment?.() ?? input.world;
+    const platformOnly = platformOnlyHarness(input);
     let sdk: any;
     try {
       sdk = await import('@anthropic-ai/claude-agent-sdk');
@@ -397,8 +402,9 @@ export class ClaudeAdapter implements AgentAdapter {
     }
     const { query } = sdk;
     const zod = (await import('zod')).z;
-    const handlers = platformToolHandlers(input.world, ctx, () => workEnvironment(input));
+    const handlers = platformOnly ? computerlessToolHandlers(input.world, ctx) : platformToolHandlers(input.world, ctx, () => workEnvironment(input));
     const remote = isRemoteAgentWorld(runtimeWorld);
+    const surface = claudeToolSurface({ platformOnly, remote });
     const startupAt = Date.now();
     const startupActivity = async (phase: 'started' | 'updated' | 'completed', step: string) => {
       await ctx.emitActivity?.({ id: 'claude-startup', kind: 'status', phase,
@@ -440,7 +446,7 @@ export class ClaudeAdapter implements AgentAdapter {
     await startupActivity('updated', 'prepare-environment');
     const remoteHome = remote
       ? await timed('bootstrap.home', () => seedRemoteAgentHome(runtimeWorld, 'claude', configHome ?? '', input.session,
-        input.profile.mcpConnections === undefined ? undefined : 'none', step => startupActivity('updated', step), input.toolsOptional))
+        input.profile.mcpConnections === undefined && !platformOnly ? undefined : 'none', step => startupActivity('updated', step), input.toolsOptional))
       : undefined;
     // The SDK sees a hangup when the sandbox stream drops; the process knows
     // the agent may still be running there (task 348).
@@ -456,8 +462,8 @@ export class ClaudeAdapter implements AgentAdapter {
     // A remote CLI cannot launch the control plane's absolute stdio-MCP path.
     // Keep every platform/control tool in the SDK host process instead; the
     // Claude wire protocol already supports SDK MCP servers across custom spawn.
-    const controls = controlMcpServer(zod, handlers, remote ? PLATFORM_TOOL_SCHEMAS : SDK_CONTROL_TOOL_SCHEMAS);
-    const configuredMcp = input.profile.mcpConnections === undefined ? configHomeMcpServers(input.resolvedAuth?.configHome) : {};
+    const controls = controlMcpServer(zod, handlers, surface.controls);
+    const configuredMcp = input.profile.mcpConnections === undefined && !platformOnly ? configHomeMcpServers(input.resolvedAuth?.configHome) : {};
     if (input.profile.mcpConnections !== undefined) {
       delete configuredMcp['chrome-devtools']; delete configuredMcp.playwright;
     }
@@ -775,10 +781,12 @@ export class ClaudeAdapter implements AgentAdapter {
         // selected browser/user servers are preserved.
         mcpServers: {
           ...configuredMcp,
-          ...agentMcpToConfig(input.agentMcp),
-          ...(!remote ? { karmax: { ...platform, alwaysLoad: true } } : {}),
+          ...(platformOnly ? {} : agentMcpToConfig(input.agentMcp)),
+          ...(surface.stdioPlatform ? { karmax: { ...platform, alwaysLoad: true } } : {}),
           karmax_control: controls,
         },
+        // No shell, files or browser for a task without a computer: tavya's tools only.
+        ...(surface.builtIns ? { tools: surface.builtIns } : {}),
         strictMcpConfig: true,
         extraArgs: CLAUDE_EXTRA_ARGS,
         env,
@@ -1318,6 +1326,21 @@ export function configHomeMcpServers(home: string | undefined): Record<string, a
   } catch {
     return {};
   }
+}
+
+/**
+ * What a Claude Code turn is offered. A task without a computer
+ * (`platformOnly`): no built-in tool at all (`tools: []` — no Bash, files,
+ * web, sub-agents) and exactly its platform tools, served in-process.
+ * Otherwise: the CLI's own tools, plus the platform tools in-process in a
+ * remote world (it cannot launch the host's stdio server) or the turn-local
+ * controls beside that stdio server here.
+ */
+export function claudeToolSurface(options: { platformOnly: boolean; remote: boolean }): {
+  controls: typeof PLATFORM_TOOL_SCHEMAS; stdioPlatform: boolean; builtIns?: string[];
+} {
+  if (options.platformOnly) return { controls: COMPUTERLESS_TOOL_SCHEMAS, stdioPlatform: false, builtIns: [] };
+  return { controls: options.remote ? PLATFORM_TOOL_SCHEMAS : SDK_CONTROL_TOOL_SCHEMAS, stdioPlatform: !options.remote };
 }
 
 /**

@@ -20,8 +20,10 @@ import { AdapterTurn, AgentAdapter, PlatformToolContext, RUNAWAY_BACKSTOP, TurnI
  * Only API rails can run host-side: the Claude Messages API, the OpenAI
  * Responses API, and OpenAI-compatible Chat Completions for OpenCode models
  * (tavya's included model on OpenRouter, or a key of the organization's own).
- * A subscription login (Claude Code, Codex) is its CLI, which needs a
- * computer: such a task cannot start, and says so (`computerlessModelGap`).
+ * A subscription login (Claude Code, Codex) is its CLI: its turns run that
+ * CLI in a small sandbox of its own, offered the same tools
+ * (src/agent/login-sandbox.ts); with nowhere to run one the task says so
+ * (`computerlessModelNeed`).
  */
 
 export function isComputerlessWorld(world: Pick<World, 'handle'>): boolean {
@@ -61,26 +63,50 @@ export function chatCompletionsEndpoint(model: string | undefined): { vendor: st
 const NEEDS_API = 'A task without a computer runs its agent on tavya itself, which takes an API key or tavya\'s included model. '
   + 'Pick one of those as its Model, or give the task a computer.';
 
+const loginName = (provider: string) => provider === 'claude' ? 'A Claude Code login' : provider === 'codex' ? 'A Codex login' : 'A login';
+
+/** What would let a task without a computer run its model: an API key (or
+ * another model), a computer for its login's CLI, or another model. */
+export type ComputerlessFix = 'key' | 'computer' | 'model';
+
+/** Whether a turn with `auth` runs its login's CLI (in a login sandbox, or on
+ * a self-hosted install's own machine): a Claude Code or Codex login, not a
+ * key or a model gateway. */
+export function runsLoginCli(profile: Pick<AgentProfile, 'provider'>, auth: { apiKey?: string; configHome?: string; gateway?: unknown } | undefined): boolean {
+  return (profile.provider === 'claude' || profile.provider === 'codex') && !auth?.apiKey && !auth?.gateway;
+}
+
 /**
  * Why `profile` cannot run without a computer, or undefined if it can.
  * `apiKey`: the turn has an API key for it (its own, leased, or the included
- * model's). Shared by the turn, which refuses before it starts, and by
- * readiness, which says so on the task form.
+ * model's) — it runs host-side. `login`: a Claude Code or Codex login serves
+ * it — its CLI runs in a small sandbox of its own (src/agent/login-sandbox.ts),
+ * if `compute` says there is somewhere to run one (`true`), else why not.
+ * Shared by the turn, which refuses before it starts, and by readiness,
+ * which says so on the task form.
  */
-export function computerlessModelGap(profile: Pick<AgentProfile, 'provider' | 'model' | 'modelProvider'>, rail: { apiKey: boolean }): string | undefined {
+export function computerlessModelNeed(profile: Pick<AgentProfile, 'provider' | 'model' | 'modelProvider'>,
+  rail: { apiKey: boolean; login?: boolean; compute?: true | string }): { message: string; fix: ComputerlessFix } | undefined {
   if (profile.provider === 'mock') return undefined;
   if (profile.provider === 'opencode') {
     const vendor = credentialProvider(profile);
     if (vendor !== 'anthropic' && !chatCompletionsEndpoint(profile.model))
-      return `OpenCode's ${vendor} models can't run without a computer. ${NEEDS_API}`;
+      return { fix: 'model', message: `OpenCode's ${vendor} models can't run without a computer. ${NEEDS_API}` };
   } else if (profile.provider !== 'claude' && profile.provider !== 'codex') {
-    return `The ${profile.provider} agent can't run without a computer. ${NEEDS_API}`;
+    return { fix: 'model', message: `The ${profile.provider} agent can't run without a computer. ${NEEDS_API}` };
   }
-  if (!rail.apiKey) {
-    const login = profile.provider === 'claude' ? 'A Claude Code login' : profile.provider === 'codex' ? 'A Codex login' : 'A login';
-    return `${login} runs only on a computer. ${NEEDS_API}`;
-  }
-  return undefined;
+  if (rail.apiKey) return undefined;
+  if (profile.provider === 'opencode') return { fix: 'key', message: `An OpenCode login can't run without a computer. ${NEEDS_API}` };
+  if (rail.login && rail.compute === true) return undefined;
+  if (rail.login) return { fix: 'computer', message: `${loginName(profile.provider)} replies from a small cloud computer, and ${
+    rail.compute ?? 'this organization has none it can use'}. Connect a computer (Settings → Computers), or use an API key.` };
+  return { fix: 'key', message: `${loginName(profile.provider)} or an API key is needed: there is neither here.` };
+}
+
+/** {@link computerlessModelNeed}'s sentence alone. */
+export function computerlessModelGap(profile: Pick<AgentProfile, 'provider' | 'model' | 'modelProvider'>,
+  rail: { apiKey: boolean; login?: boolean; compute?: true | string }): string | undefined {
+  return computerlessModelNeed(profile, rail)?.message;
 }
 
 /**
@@ -108,16 +134,24 @@ export function computerlessApiKey(profile: Pick<AgentProfile, 'provider' | 'mod
   return hostKeys && name ? process.env[name] || undefined : undefined;
 }
 
-/** Run one turn of a task without a computer through `adapter`'s host-side rail. */
+/** Run one turn of a task without a computer: its login's CLI in the machine
+ * the activity gave it (`harnessWorld`), else `adapter`'s host-side rail. */
 export async function runComputerlessTurn(adapter: AgentAdapter, input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+  if (input.harnessWorld) return adapter.runTurn(input, ctx);
   if (!adapter.runComputerlessTurn) throw new ComputerlessModelUnsupported(`The ${adapter.provider} agent can't run without a computer. ${NEEDS_API}`);
   return adapter.runComputerlessTurn(input, ctx);
 }
 
-/** The refusal for a subscription login asked to run without a computer. */
+/** The refusal for a subscription login asked to run host-side: its CLI runs
+ * only in a machine (`harnessWorld`), which this turn was not given. */
 export function loginNeedsComputer(provider: string): ComputerlessModelUnsupported {
-  return new ComputerlessModelUnsupported(computerlessModelGap({ provider: provider as AgentProfile['provider'] }, { apiKey: false })
+  return new ComputerlessModelUnsupported(computerlessModelGap({ provider: provider as AgentProfile['provider'] }, { apiKey: false, login: true })
     ?? NEEDS_API);
+}
+
+/** Whether `world` is a task without a computer whose login's CLI runs in a machine of its own this turn. */
+export function platformOnlyHarness(input: Pick<TurnInput, 'world' | 'harnessWorld'>): boolean {
+  return !!input.harnessWorld && isComputerlessWorld(input.world);
 }
 
 /** OpenRouter/OpenAI reasoning effort from a profile's (low…max). */

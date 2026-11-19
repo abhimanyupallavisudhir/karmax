@@ -484,7 +484,8 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     await observe(() => deps.onActivity?.({ id: 'turn', kind: 'turn', phase: 'started', title: 'Agent started working' }));
     if (observerFailed) throw observerError;
     await deps.onProviderStart?.();
-    // A task without a computer runs host-side with tavya's own tools only.
+    // A task without a computer: tavya's own tools only, host-side on an API
+    // key, or its login's CLI in the machine the activity gave it (harnessWorld).
     turn = isComputerlessWorld(input.world) ? await runComputerlessTurn(adapter, input, ctx) : await adapter.runTurn(input, ctx);
     deps.onProviderResult?.(turn);
     if (!deps.signal?.aborted) output.flush();

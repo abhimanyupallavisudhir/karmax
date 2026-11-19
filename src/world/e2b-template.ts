@@ -114,3 +114,44 @@ export async function buildSizedTemplate(base: string, name: string, shape: Mach
   if (target === name) return { name };
   return { name: target, shape: size, limits, ...(size.diskGb !== shape.diskGb && size.diskGb != null ? { diskGb: size.diskGb } : {}) };
 }
+
+
+/** A template derived from `base` whose sandbox user's npx cache already holds
+ * `packages`: a login sandbox (src/agent/login-sandbox.ts) then starts its
+ * pinned Claude Code or Codex at once instead of downloading it (about 16 s
+ * for Claude Code 2.1.322, measured 2026-11-19). Named by its base and exact
+ * versions, so an upgrade of either CLI makes a new one. */
+/** Bumped whenever how a warm template is built changes, so it is built again. */
+const WARM_RECIPE = 'warm-2';
+
+export function warmTemplateName(base: string, packages: readonly string[]): string {
+  const key = [WARM_RECIPE, base, ...[...packages].sort()].join('|');
+  return `karmax-warm-${crypto.createHash('sha256').update(key).digest('hex').slice(0, 16)}`;
+}
+
+/** The command a CLI package installs (`@anthropic-ai/claude-code@x` → claude, `@openai/codex@x` → codex). */
+function binOf(pkg: string): string {
+  const name = pkg.replace(/@[^@/]*$/, '').split('/').pop() ?? pkg;
+  return name === 'claude-code' ? 'claude' : name;
+}
+
+/** Whether a template of that name exists on the account. */
+export async function e2bTemplateExists(name: string, options: { apiKey?: string }): Promise<boolean> {
+  const { Template } = await import('e2b');
+  return Template.exists(name, options.apiKey ? { apiKey: options.apiKey } : {});
+}
+
+/** Build {@link warmTemplateName}'s template (about a minute), unless it exists. */
+export async function buildWarmTemplate(base: string, name: string, packages: readonly string[],
+  options: { apiKey?: string }): Promise<{ name: string }> {
+  const { Template } = await import('e2b');
+  const connection = options.apiKey ? { apiKey: options.apiKey } : {};
+  if (await Template.exists(name, connection)) return { name };
+  // `npm exec --package` fills the same cache `npx <package>` reads (in the
+  // build, `npx <package> --version` answers npm's own version and installs
+  // nothing). The binary's name is the package's last word: claude-code → claude.
+  const warm = packages.map((pkg) => `npm exec --yes --no-audit --no-fund --package=${pkg} -- ${binOf(pkg)} --version`);
+  await Template.build(Template().fromTemplate(base).runCmd(warm, { user: 'user' }), name,
+    { ...connection, ...sizedBuildOptions({}) });
+  return { name };
+}

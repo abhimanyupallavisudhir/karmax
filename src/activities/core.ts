@@ -1,5 +1,6 @@
 import { applyComputer, isAnyProvider, isCloudProvider, isComputerless, machineShape, normalizeComputer, withoutCheckoutsIfComputerless, worldMachine } from '../domain/computer.js';
-import { computerlessApiKey, computerlessModelGap } from '../agent/computerless.js';
+import { computerlessApiKey, computerlessModelNeed, runsLoginCli } from '../agent/computerless.js';
+import { LoginSandboxes, type LoginSandbox } from '../agent/login-sandbox.js';
 import { taskEnded } from '../world/task-ended.js';
 import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
 import { conversationFor, participantLabel, workDigest } from '../domain/participants.js';
@@ -124,7 +125,7 @@ import { CodexHistoryError } from '../agent/codex-history.js';
 import { importWithPanagent, reuseNativeImport, stableImportSessionId, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
 import { SHARE_APPS } from '../agent/conversation-shares.js';
 import { publicShare, publicConversationHtml } from '../gateway/conversation-sharing.js';
-import { isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome, readRemoteImport, RemoteAgentCliUnavailable } from '../agent/remote-process.js';
+import { hostHoldsSession, remoteAgentHomeRelative, isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome, readRemoteImport, RemoteAgentCliUnavailable } from '../agent/remote-process.js';
 import { checkWorldDisk, diskNotice, diskRatio, diskWasFull, DISK_REARM_RATIO, DISK_WARN_RATIO, isDiskFullMessage, largestWorldPaths,
   outOfDiskMessage, worldUsage, type DiskCheck } from '../world/disk.js';
 import { computerLimits } from '../domain/computer-limits.js';
@@ -379,6 +380,9 @@ export interface CoreActivityDeps {
   paymentRegistry?: PaymentRegistry;
   configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
   resources?: import('../world/resources.js').ProjectResourceService;
+  /** Where the subscription-login turns of tasks without a computer run their
+   * CLI (src/agent/login-sandbox.ts); by default on `providerConnections`. */
+  loginSandboxes?: LoginSandboxes;
   /** The organization's provider accounts, which judge a sub-task's Computer. */
   providerConnections?: import('../platform/agent-params.js').ComputerChecks & Partial<RouterConnections>
     & { funding?(organizationId: string | undefined, provider: string): Promise<'managed' | 'own' | undefined> };
@@ -721,6 +725,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
   /** What a running agent turn holds until it ends, however it ends. */
   const turnHolds = new AsyncLocalStorage<Array<() => void>>();
+  const loginSandboxes = deps.loginSandboxes ?? new LoginSandboxes({ store, worlds,
+    ...(deps.providerConnections?.list && deps.providerConnections.managedConnections
+      ? { connections: deps.providerConnections as RouterConnections } : {}) });
   const isRemote = (kind: WorldKind) => worlds.get(kind).capabilities?.remote === true;
   // Whether an agent turn spends THIS host's memory and load. A cloud world
   // (E2B, Daytona, a VM) runs the turn on its own machine on every rail: Claude,
@@ -2854,13 +2861,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         missingNamespace = recognizedOpenCodePrefix ? openCodePrefix! : 'opencode';
       }
       if (profile && profile.provider !== 'opencode' && enabled.length) missingNamespace = credentialProvider(profile);
-      // A task without a computer runs its agent on an API key only: a login is
-      // its CLI, which needs a computer (wiki features/computerless-tasks).
+      // A task without a computer runs its agent on an API key host-side, or a
+      // Claude Code / Codex login's CLI where one can run: a login sandbox on
+      // hosted, this machine on a self-hosted install (wiki features/computerless-tasks).
       const computerlessTask = isComputerless(args.task?.project?.worldProvider);
+      const loginRuns = computerlessTask && (profile ? runsLoginCli(profile, undefined) : ['claude', 'codex'].includes(args.provider))
+        && (!store.hosted || !(await loginSandboxes.unavailable(organizationId)));
       const ordered = enabled.filter((credential) => (profile
         ? credentialServesProfile(profile, credential, all)
         : credentialAliases(args.provider).includes(credential.provider))
-        && (!computerlessTask || credential.kind === 'key'));
+        && (!computerlessTask || credential.kind === 'key' || (loginRuns && credential.kind === 'login')));
       // A native OpenCode fork is stored in the source XDG home. Lease that
       // exact login first so account concurrency, quota failures, and policy
       // attribution remain honest; never reopen one account after leasing
@@ -2899,8 +2909,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // entry makes the coordinator deny the turn with a credential action;
       // `:off` says one that would serve exists but is switched off here, so
       // the fix is switching it on rather than adding another.
-      // Only logins would serve it: the turn says why it can't run without a computer.
-      if (computerlessTask) return [];
+      // Only logins would serve it, and nothing can run their CLI: the turn says why.
+      if (computerlessTask && !loginRuns) return [];
       const switchedOff = !!profile && all.some((credential) => credentialServesProfile(profile, credential, all));
       return keys.length || profile?.provider === 'mock'
         ? keys
@@ -3289,13 +3299,22 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // A task without a computer runs its agent here, in the worker, for any
       // organization: it spends only a key resolved for this organization,
       // never the worker's own environment on hosted (computerlessApiKey). A
-      // subscription login is its CLI, which needs a computer: say so now,
-      // before the turn waits for a slot it could never use.
+      // subscription login is its CLI, which never runs on the shared host: on
+      // hosted it runs in a small sandbox of the task's own (login-sandbox.ts),
+      // on a self-hosted install on this machine. Nowhere to run it: say so
+      // now, before the turn waits for a slot it could never use.
+      let loginCli: 'host' | 'sandbox' | undefined;
       if (computerless) {
         const apiKey = computerlessApiKey(profile, { hosted: store.hosted, organizationId, resolvedAuth });
-        const gap = computerlessModelGap(profile, { apiKey: !!apiKey });
-        if (gap) throw ApplicationFailure.create({ message: gap, type: 'agent-error', nonRetryable: true });
+        // A self-hosted install's own sign-in serves its personal organization, as on a computer.
+        const ambientLogin = !resolvedAuth && !store.hosted && organizationId === 'org_personal' && ambientCredential(profile.provider);
+        const login = !apiKey && runsLoginCli(profile, resolvedAuth) && (!!resolvedAuth?.configHome || ambientLogin);
+        const compute = !login ? undefined : !store.hosted ? true as const
+          : (await loginSandboxes.unavailable(organizationId)) ?? true as const;
+        const need = computerlessModelNeed(profile, { apiKey: !!apiKey, login, ...(compute ? { compute } : {}) });
+        if (need) throw ApplicationFailure.create({ message: need.message, type: 'agent-error', nonRetryable: true });
         if (apiKey) resolvedAuth = { ...resolvedAuth, apiKey };
+        else if (login) loginCli = store.hosted ? 'sandbox' : 'host';
       }
       if (
         organizationId !== 'org_personal'
@@ -3581,6 +3600,41 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             }
           }
         }
+      }
+
+      // A login of a task without a computer: its sandbox (the task's own,
+      // running or parked from an earlier turn, or a new one) is made ready
+      // while the prompt is, and its CLI's home seeded beside it. A sandbox
+      // whose transcript the leased login's home does not hold starts a new
+      // session with the whole conversation (sandboxes come and go).
+      let loginSandboxOpening: Promise<LoginSandbox> | undefined;
+      if (loginCli === 'sandbox') {
+        if (session && !fork && resolvedAuth?.configHome && !hostHoldsSession(resolvedAuth.configHome, profile.provider, session)) {
+          session = undefined;
+          messages = ownView;
+          deliveredMessages = 0;
+        }
+        const turnId = args.agentTurnId ?? legacyAgentTurnId;
+        let queued = false;
+        loginSandboxOpening = loginSandboxes.open({ organizationId, projectId: args.task.projectId, taskId: args.taskId,
+          ...(resolvedAuth?.configHome && profile.provider === 'claude' ? { cliHome: remoteAgentHomeRelative('claude', resolvedAuth.configHome) } : {}),
+          ...(signal ? { signal } : {}), ...(heartbeat ? { heartbeat } : {}),
+          // Beyond the organization's cap the turn waits its turn, and the task says so.
+          onQueued: async ({ inUse, cap }) => {
+            queued = true;
+            await record(args.taskId, 'agent.activity', { id: 'login-sandbox-wait', kind: 'status', phase: 'started',
+              title: `Waiting for a cloud computer (${inUse} of ${cap} in use)`, role: args.role, attempt: activityAttempt,
+              workflowRunId, ...(turnId ? { turnId } : {}) });
+          } }).then(async (opened) => {
+          if (queued) await record(args.taskId, 'agent.activity', { id: 'login-sandbox-wait', kind: 'status', phase: 'completed',
+            title: 'Cloud computer ready', role: args.role, attempt: activityAttempt, workflowRunId, ...(turnId ? { turnId } : {}) });
+          prewarmRemoteAgentHome(opened.world, profile.provider, resolvedAuth?.configHome, session, []);
+          return opened;
+        });
+        loginSandboxOpening.catch(() => undefined);
+        // Whatever way the turn ends, its sandbox stays for the next one and its slot is renewed no more.
+        const opening = loginSandboxOpening;
+        turnHolds.getStore()?.push(() => { void opening.then((opened) => opened.settle()).catch(() => undefined); });
       }
 
       // The sandbox bootstrap, and a native agent's home and browser tools, are
@@ -4103,9 +4157,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (remoteWorld && args.role === 'do' && deps.client) stopDiskWatch = watchTurnDisk(world, args.taskId, organizationId);
         if (computeHold && Number.isFinite(computeHoldEndsAt)) stopComputeWatch = watchComputeHold(computeHold, computeHoldEndsAt, { taskId: args.taskId,
           tell: args.role === 'do' && !!deps.client, stop: (reason) => computeStop.abort(reason) });
+        // Where a login of a task without a computer runs its CLI this turn.
+        let harnessWorld: World | undefined = loginCli === 'host' ? world : undefined;
+        if (loginSandboxOpening) {
+          try { harnessWorld = (await timed('login-sandbox.ready', () => loginSandboxOpening!)).world; }
+          catch (error) { throw capacityFailure(error) ?? error; }
+        }
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,
           world,
+          ...(harnessWorld ? { harnessWorld } : {}),
           messages: turnMessages,
           session,
           deliveredMessages,

@@ -1727,7 +1727,8 @@ const COMPUTER_PROVIDER_LABELS = { any: 'Any', e2b: 'E2B', daytona: 'Daytona', f
   worktree: 'This machine', container: 'Docker container', none: 'None' };
 // No computer (wiki features/computerless-tasks): the agent runs on tavya with its own tools only.
 const NO_COMPUTER = 'none';
-const NO_COMPUTER_TIP = 'No computer: the agent can only use tavya itself. Starts in seconds and uses no compute.';
+const NO_COMPUTER_TIP = 'No computer: the agent can only use tavya itself. On an API key it starts in seconds and uses no compute; '
+  + 'a Claude Code or Codex login replies from a small cloud computer of its own, a few at a time per organization.';
 const CLOUD_COMPUTERS = ['e2b', 'daytona', 'fly', 'hetzner', 'aws', 'gcp', 'agent37'];
 const COMPUTER_REGION_LABELS = { eu: 'EU', us: 'US' };
 // Provider "Any" (wiki features/compute-routing): the cloud accounts it can
@@ -10064,10 +10065,13 @@ function readinessGaps(readiness, projectId) {
   }
   for (const need of needs.values()) {
     const name = ACCOUNT_PROVIDER_LABELS[need.provider] || need.provider;
-    // Without a computer only an API key (or the included model) runs the agent.
+    // Without a computer: an API key (or the included model) runs the agent on
+    // tavya; a Claude Code or Codex login, in a small cloud computer. The fix
+    // is the missing one of those (computerlessFix), or another model.
     if (need.computerless) {
-      gaps.push({ label: /runs only on a computer/.test(need.computerless) ? `Add a ${name} API key` : 'Pick another model',
-        href: `${settings}#settings-agents`, tip: need.computerless });
+      const fix = need.computerlessFix || (/runs only on a computer/.test(need.computerless) ? 'key' : 'model');
+      gaps.push(fix === 'computer' ? { label: 'Connect a computer', href: `${settings}#settings-computers`, tip: need.computerless }
+        : { label: fix === 'key' ? `Add a ${name} API key` : 'Pick another model', href: `${settings}#settings-agents`, tip: need.computerless });
       continue;
     }
     gaps.push(need.off === 'project'

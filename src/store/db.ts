@@ -4,7 +4,7 @@ import { notPullRequestSql, pullRequestOf, type PullRequestOf } from '../domain/
 export interface TaskHeader { id: string; num?: number; title: string; projectId: string; status?: string; stage?: string;
   /** Set when the row is a pull request of its task (SPEC §11.1): the header is its task's. */
   pullRequest?: { taskId: string; checkout: string } }
-import { ANY_PROVIDER, applyComputer, normalizeComputer, LOCAL_WORLD_KINDS, runsOnHost, type ComputerSpec } from '../domain/computer.js';
+import { ANY_PROVIDER, applyComputer, normalizeComputer, LOCAL_WORLD_KINDS, runsOnHost, defaultLoginSandboxes, type ComputerSpec } from '../domain/computer.js';
 /** The local world kinds as an SQL list (`NOT IN (…)`): constants, never input. */
 const LOCAL_KINDS_SQL = LOCAL_WORLD_KINDS.map((kind) => `'${kind}'`).join(',');
 import { AdmissionBackpressureError } from '../domain/admission-error.js';
@@ -2005,6 +2005,7 @@ export class Store {
       maxAgentStartsPerMinute: this.hosted ? 60 : 10_000,
       maxRemoteStartsPerMinute: this.hosted ? 30 : 10_000,
       maxActiveWorlds: this.hosted ? planLimit : 10_000,
+      maxLoginSandboxes: defaultLoginSandboxes(),
     };
     const raw = (await this.kvGet(`organization-usage-policy:${organizationId}`));
     let saved: Partial<OrganizationUsagePolicy> = {};
@@ -2025,6 +2026,9 @@ export class Store {
       // as agent turns. Ignore legacy/custom saved values so there is no second
       // SaaS capacity product hiding behind the plan entitlement.
       maxActiveWorlds: this.hosted ? effectiveAgentLimit : (saved.maxActiveWorlds ?? fallback.maxActiveWorlds),
+      // Bounds the strain on the installation's compute: an owner may lower it, never raise it on hosted.
+      maxLoginSandboxes: this.hosted && Number.isSafeInteger(saved.maxLoginSandboxes)
+        ? Math.min(saved.maxLoginSandboxes!, fallback.maxLoginSandboxes) : (saved.maxLoginSandboxes ?? fallback.maxLoginSandboxes),
     };
   }
 
@@ -2052,6 +2056,7 @@ export class Store {
       maxAgentStartsPerMinute: next.maxAgentStartsPerMinute,
       maxRemoteStartsPerMinute: next.maxRemoteStartsPerMinute,
       ...(!this.hosted ? { maxActiveWorlds: next.maxActiveWorlds } : {}),
+      maxLoginSandboxes: next.maxLoginSandboxes,
     })) if (!Number.isSafeInteger(value) || value < 1 || value > 1_000_000) throw new Error(`${key} must be an integer from 1 to 1000000`);
     if (next.maxActiveAgentTurns != null && (!Number.isSafeInteger(next.maxActiveAgentTurns)
       || next.maxActiveAgentTurns < 1 || next.maxActiveAgentTurns > 1_000_000))

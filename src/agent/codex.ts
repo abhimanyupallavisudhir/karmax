@@ -12,7 +12,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
 import { PLATFORM_TOOL_SCHEMAS, SDK_CONTROL_TOOL_SCHEMAS, TOOL_SCHEMAS, COMPUTERLESS_TOOL_SCHEMAS, computerlessToolHandlers, platformToolHandlers } from './tools.js';
-import { isComputerlessWorld, loginNeedsComputer } from './computerless.js';
+import { isComputerlessWorld, loginNeedsComputer, platformOnlyHarness } from './computerless.js';
 import { CONTROL_SERVER_NAME, controlMcpServerSpec, startControlBridge } from './control-bridge.js';
 import { codexReasoningEffort } from './effort.js';
 import { openaiUserContent, materializeImageFiles } from './images.js';
@@ -116,6 +116,31 @@ export function codexDynamicTools(remote: boolean): Array<{ type: string; name: 
   }));
 }
 
+/** Codex's own tools a task without a computer turns off: shell, patching,
+ * web search, images, browser and computer use, apps, plugins, sub-agents. */
+export const CODEX_PLATFORM_ONLY_FLAGS: readonly string[] = [
+  ...['shell_tool', 'unified_exec', 'view_image', 'image_generation', 'in_app_browser', 'browser_use', 'browser_use_external',
+    'computer_use', 'apps', 'plugins', 'multi_agent', 'memories', 'skill_mcp_dependency_install', 'tool_suggest']
+    .flatMap((feature) => ['-c', `features.${feature}=false`]),
+  '-c', 'include_apply_patch_tool=false', '-c', 'web_search="disabled"',
+];
+
+/**
+ * What a Codex turn is offered. A task without a computer (`platformOnly`):
+ * exactly its platform tools as dynamic tools, Codex's own tools off
+ * (`CODEX_PLATFORM_ONLY_FLAGS`) and a read-only sandbox besides. Otherwise:
+ * Codex's tools with full access (the world is the sandbox), and the platform
+ * tools (remote) or turn-local controls (beside the host's stdio server).
+ */
+export function codexToolSurface(options: { platformOnly: boolean; remote: boolean }): {
+  dynamicTools: ReturnType<typeof codexDynamicTools>; flags: readonly string[]; sandbox: 'read-only' | 'danger-full-access';
+} {
+  if (options.platformOnly) return {
+    dynamicTools: COMPUTERLESS_TOOL_SCHEMAS.map((tool) => ({ type: 'function', name: tool.name, description: tool.description, inputSchema: tool.parameters })),
+    flags: CODEX_PLATFORM_ONLY_FLAGS, sandbox: 'read-only' };
+  return { dynamicTools: codexDynamicTools(options.remote), flags: [], sandbox: 'danger-full-access' };
+}
+
 /** Return a tools-compatible session without rewriting a rollout that another
  * thread may reference. Invalid native history fails before starting a turn. */
 export async function ensureLocalCodexSessionTools(configHome: string, session: string, dynamicTools?: unknown[]): Promise<string> {
@@ -183,7 +208,7 @@ export class CodexAdapter implements AgentAdapter {
     catch (error) {
       // A sandbox controls its PTY bytes. Preserve its turn failure, but shared
       // account health must come from a host-side check (confirmSandboxFailure).
-      if (isRemoteAgentWorld(input.world) && (error instanceof ProviderFailure || error instanceof ProviderStreamError))
+      if (isRemoteAgentWorld(input.harnessWorld ?? input.world) && (error instanceof ProviderFailure || error instanceof ProviderStreamError))
         throw new SandboxProviderFailure(error);
       throw error;
     }
@@ -192,8 +217,10 @@ export class CodexAdapter implements AgentAdapter {
   private async runSubscriptionWithRecovery(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
     // A gateway turn has no ChatGPT login to refresh, and only the app-server takes its provider.
     const gateway = !!input.resolvedAuth?.gateway;
-    if (process.env.KARMAX_CODEX_USE_EXEC === '1' && !isRemoteAgentWorld(input.world) && !gateway) return this.runCodexExec(input, ctx);
-    const remote = isRemoteAgentWorld(input.world);
+    // A task without a computer runs its login in its own machine, with only the app-server's dynamic tools.
+    const agentWorld = input.harnessWorld ?? input.world;
+    if (process.env.KARMAX_CODEX_USE_EXEC === '1' && !isRemoteAgentWorld(agentWorld) && !gateway && !platformOnlyHarness(input)) return this.runCodexExec(input, ctx);
+    const remote = isRemoteAgentWorld(agentWorld);
     const configHome = input.resolvedAuth?.configHome;
     if (!remote || !configHome || gateway) return this.runCodexAppServer(input, ctx);
 
@@ -480,8 +507,10 @@ export class CodexAdapter implements AgentAdapter {
 
   // ─── Codex app-server on a ChatGPT subscription (live JSON-RPC thread) ────────
   private async runCodexAppServer(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
-    const runtimeWorld = input.world.withoutProjectEnvironment?.() ?? input.world;
-    const workEnv = workEnvironment(input);
+    const runtimeWorld = input.harnessWorld ?? input.world.withoutProjectEnvironment?.() ?? input.world;
+    // A task without a computer: tavya's platform tools only (codexToolSurface).
+    const platformOnly = platformOnlyHarness(input);
+    const workEnv = platformOnly ? {} : workEnvironment(input);
     const workConfig = { 'shell_environment_policy.set': workEnv };
     const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? localProviderCli('codex');
     const gateway = input.resolvedAuth?.gateway;
@@ -494,9 +523,10 @@ export class CodexAdapter implements AgentAdapter {
     // login). scrubbedEnv also strips OPENAI_API_KEY so a stray key can't shadow it.
     const remote = isRemoteAgentWorld(runtimeWorld);
     const remoteHome = remote
-      ? await timed('bootstrap.home', () => seedRemoteAgentHome(runtimeWorld, 'codex', input.resolvedAuth?.configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none', undefined, input.toolsOptional))
+      ? await timed('bootstrap.home', () => seedRemoteAgentHome(runtimeWorld, 'codex', input.resolvedAuth?.configHome ?? '', input.session, input.profile.mcpConnections === undefined && !platformOnly ? undefined : 'none', undefined, input.toolsOptional))
       : undefined;
-    const dynamicTools = codexDynamicTools(remote);
+    const surface = codexToolSurface({ platformOnly, remote });
+    const dynamicTools = surface.dynamicTools;
     // Resume/fork cannot override dynamicTools. Migrate into a new rollout
     // identity instead of changing bytes referenced by existing descendants.
     let preparedSession = input.session;
@@ -526,7 +556,11 @@ export class CodexAdapter implements AgentAdapter {
     const custody = remote ? undefined : createCustodyEnv(env);
     if (custody) env = custody.env;
 
-    const mcpFlags = await timed('bootstrap.mcp-config', () => selectedCodexMcpFlags(runtimeWorld, cmd, cwd, env, [...(input.profile.mcpConnections !== undefined && !isRemoteAgentWorld(runtimeWorld) ? [{ name: 'karmax', ...platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505') }] : []), ...(input.agentMcp ?? [])], input.profile.mcpConnections !== undefined, ctx.signal, remoteHome?.configuredMcpServers));
+    const mcpFlags = [...await timed('bootstrap.mcp-config', () => platformOnly
+      // Every configured server off, none added: its tools are the dynamic ones.
+      ? selectedCodexMcpFlags(runtimeWorld, cmd, cwd, env, [], true, ctx.signal, remoteHome?.configuredMcpServers)
+      : selectedCodexMcpFlags(runtimeWorld, cmd, cwd, env, [...(input.profile.mcpConnections !== undefined && !isRemoteAgentWorld(runtimeWorld) ? [{ name: 'karmax', ...platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505') }] : []), ...(input.agentMcp ?? [])], input.profile.mcpConnections !== undefined, ctx.signal, remoteHome?.configuredMcpServers)),
+      ...surface.flags];
 
     // Detached group is the fallback; the inherited custody marker crosses groups.
     const startupEnd = (await (await currentTiming())?.start('process.startup'));
@@ -535,7 +569,7 @@ export class CodexAdapter implements AgentAdapter {
       : spawn(cmd, ['app-server', ...mcpFlags, ...gatewayFlags], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', taskId: input.world.handle.id, role: input.role, owner: process.pid, ...(custody ? { custodyId: custody.custodyId } : {}), startedAt: Date.now() });
     const client = new CodexAppServerClient(child.stdin!, child.stdout!);
-    const platformHandlers = platformToolHandlers(input.world, ctx, () => workEnvironment(input));
+    const platformHandlers = platformOnly ? computerlessToolHandlers(input.world, ctx) : platformToolHandlers(input.world, ctx, () => workEnvironment(input));
     let stderr = '';
     child.stderr?.on('data', (d: Buffer | string) => { stderr = utf8Tail(stderr + d.toString(), 64 * 1024); });
 
@@ -923,7 +957,7 @@ export class CodexAdapter implements AgentAdapter {
           // returning all prior tool/image payloads can stream tens of MB.
           excludeTurns: true,
           cwd,
-          sandbox: 'danger-full-access',
+          sandbox: surface.sandbox,
           approvalPolicy: 'never',
           developerInstructions: input.systemPrompt,
           ...(model ? { model } : {}),
@@ -937,7 +971,7 @@ export class CodexAdapter implements AgentAdapter {
           threadId: preparedSession,
           excludeTurns: true,
           cwd,
-          sandbox: 'danger-full-access',
+          sandbox: surface.sandbox,
           approvalPolicy: 'never',
           ...(model ? { model } : {}),
         });
@@ -945,7 +979,7 @@ export class CodexAdapter implements AgentAdapter {
         const started = await client.request<any>('thread/start', {
           config: workConfig,
           cwd,
-          sandbox: 'danger-full-access',
+          sandbox: surface.sandbox,
           approvalPolicy: 'never',
           developerInstructions: input.systemPrompt,
           dynamicTools,
@@ -979,7 +1013,7 @@ export class CodexAdapter implements AgentAdapter {
           input: nextInput,
           // Reassert this per turn as well as per thread. Besides defending against
           // config/default drift, this updates resumed threads created by older karmax.
-          sandboxPolicy: { type: 'dangerFullAccess' },
+          sandboxPolicy: { type: surface.sandbox === 'read-only' ? 'readOnly' : 'dangerFullAccess' },
           approvalPolicy: 'never',
           ...(model ? { model } : {}),
           ...(effort ? { effort } : {}),

@@ -924,6 +924,12 @@ export function remoteAgentCommand(provider: Provider, command: string, args: st
   return { command: 'npx', args: ['--yes', CODEX_PACKAGE, ...args] };
 }
 
+/** The npm packages a login sandbox's CLIs run from (exactly what
+ * remoteAgentCommand starts), for a template that holds them already. */
+export function loginCliPackages(): string[] {
+  return [process.env.KARMAX_REMOTE_CLAUDE_PACKAGE ?? `@anthropic-ai/claude-code@${installedClaudeCodeVersion()}`, CODEX_PACKAGE];
+}
+
 /** Version of Claude Code explicitly paired with the installed Agent SDK. */
 export function installedClaudeCodeVersion(): string {
   const require = createRequire(import.meta.url);
@@ -1273,6 +1279,12 @@ function configFiles(root: string): Array<{ relative: string; content: Buffer }>
 }
 
 /** The one requested session: Codex's physical lineage or Claude's transcript copies. */
+/** Whether the host's config home holds `session`'s transcript, so a new
+ * sandbox can be seeded with it (a login sandbox: src/agent/login-sandbox.ts). */
+export function hostHoldsSession(root: string, provider: Provider, session: string): boolean {
+  try { return hostHistoryFiles(root, provider, session).length > 0; } catch { return false; }
+}
+
 function hostHistoryFiles(root: string, provider: Provider, session?: string): Array<{ relative: string; content: Buffer }> {
   const files: Array<{ relative: string; content: Buffer }> = [];
   if (session && provider === 'codex') {
