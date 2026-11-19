@@ -47,6 +47,7 @@ A cloud computer per task, several agents at once, schedules and event triggers,
 - [tavya vs Warp Factories](/compare/warp)
 - [tavya vs Manus](/compare/manus)
 - [tavya vs OpenClaw](/compare/openclaw)
+- [tavya vs Mastra Factory](/compare/mastra)
 - [tavya as a Vibe Kanban alternative](/compare/vibe-kanban)
 - [tavya as a Terragon alternative](/compare/terragon)
 

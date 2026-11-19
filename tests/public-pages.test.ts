@@ -126,7 +126,7 @@ describe('public pages for search engines and link previews (hosted)', () => {
     expect((await get('/compare/index.md')).body).toContain('| App integrations | Apps<br>Logins<br>Passwords<br>Secrets<br>Mailbox<br>Wallet | Apps<br>Secrets |');
     // Every comparison says where tavya is ahead, and where the other is.
     expect(hub.body).toMatch(/<h2[^>]*>Where tavya is ahead<\/h2>/);
-    for (const product of ['claude-code', 'codex', 'devin', 'cursor', 'paperclip', 'warp', 'manus', 'openclaw']) {
+    for (const product of ['claude-code', 'codex', 'devin', 'cursor', 'paperclip', 'warp', 'manus', 'openclaw', 'mastra']) {
       const body = (await get(`/compare/${product}.md`)).body;
       expect(body, product).toContain('\n## Where tavya is ahead\n');
       expect(body, product).toMatch(/\n## Where .+ (is|are) ahead\n[\s\S]+\n## Where tavya is ahead\n/);
