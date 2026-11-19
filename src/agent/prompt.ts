@@ -187,7 +187,10 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
     values.worldRepos = '';
     const world = /Working directory: \{\{worldPath\}\}[^\n]*/;
     const fill = (text: string) => text.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
-    return world.test(tpl) ? fill(tpl.replace(world, NO_COMPUTER_WORLD)) : `${fill(tpl)}\n\n# World\n${NO_COMPUTER_WORLD}`;
+    // Its own ids, for the tools that take them (add_follow_up_trigger, get_task, list_events): a
+    // task with a computer reads them from its branch; without these, models could not follow up.
+    const section = `${NO_COMPUTER_WORLD}\nThis task's id is ${args.task.taskId} (project ${args.task.projectId}).`;
+    return world.test(tpl) ? fill(tpl.replace(world, () => section)) : `${fill(tpl)}\n\n# World\n${section}`;
   }
   return tpl.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
 }

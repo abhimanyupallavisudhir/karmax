@@ -336,5 +336,8 @@ describe('the prompt of a task without a computer', () => {
     expect(prompt).not.toMatch(/^- open_pr\(/m);
     expect(prompt).not.toMatch(/Working directory:/);
     expect(prompt).not.toMatch(/Do real work directly in the working directory/);
+    // Its own ids, for tools that take them (add_follow_up_trigger, get_task…): without them cheap models
+    // could not follow work they started (ask-eval 2026-11-19: 9/20 → 19/20 with this line).
+    expect(prompt).toMatch(/This task's id is task_1 \(project proj_1\)/);
   });
 });

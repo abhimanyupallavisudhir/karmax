@@ -10,6 +10,8 @@ import { World } from '../world/types.js';
 
 /** Platform capabilities the agent reaches via the platform MCP, surfaced as tool calls. */
 export interface PlatformToolContext {
+  /** The task this turn belongs to (its world's handle id where absent). */
+  taskId?: string;
   /** Do-agent ONLY: declare that the completed, committed proposal is ready to
    *  publish and enter Review. This is deliberately distinct from merely ending
    *  a model turn or asking a human for input. */

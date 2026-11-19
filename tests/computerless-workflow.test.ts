@@ -83,6 +83,24 @@ describe('a task without a computer', () => {
     await Worker.runReplayHistory({ workflowsPath }, await h.client.workflow.getHandle(task.id).fetchHistory());
   }, 180_000);
 
+  it('creates a sub-task, which also runs without a computer (no git snapshot of a world that has none)', async () => {
+    const project = await h.store.createProject(newId('Assistant sub'), { worldProvider: 'worktree', defaultBase: 'main' });
+    const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
+    const task = await h.api.createTask(token, { projectId: project.id, workflow: 'software-dev', params: {
+      computer: { provider: 'none' },
+      prompt: '@tool create_sub_task {"title": "Look it up", "prompt": "@say Found it."}\n@say Asked a sub-task.',
+    } });
+    await expect.poll(async () => (await h.store.listTasks(project.id)).filter((t: any) => t.parentTaskId === task.id).length,
+      { timeout: 60_000 }).toBe(1);
+    const child = (await h.store.listTasks(project.id)).find((t: any) => t.parentTaskId === task.id)!;
+    await expect.poll(async () => said(await view(child.id)), { timeout: 60_000 }).toContain('Found it.');
+    expect((await h.store.currentWorld(child.id) as WorldHandle).kind).toBe('none');
+    const current = await view(task.id);
+    expect(JSON.stringify(current.error ?? '')).not.toMatch(/git|computer/i);
+    await h.client.workflow.getHandle(child.id).cancel().catch(() => undefined);
+    await h.client.workflow.getHandle(task.id).cancel().catch(() => undefined);
+  }, 120_000);
+
   it('with neither a login nor a key, it says so instead of waiting', async () => {
     const project = await h.store.createProject(newId('Assistant'), { worldProvider: 'worktree', defaultBase: 'main' });
     const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;

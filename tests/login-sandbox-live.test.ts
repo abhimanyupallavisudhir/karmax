@@ -100,7 +100,7 @@ describe.skipIf(!live)(`login sandbox start latency on ${PROVIDER} (live)`, () =
     // Nothing left behind: pooled sandboxes (made in the background) go too, once any refill under way has recorded its own.
     if (pool) {
       await new Promise((resolve) => setTimeout(resolve, 5_000));
-      await (pool as unknown as { refilling: Set<string> }).refilling.size ? new Promise((resolve) => setTimeout(resolve, 240_000)) : undefined;
+      if ((pool as unknown as { refilling: Set<string> }).refilling.size) await new Promise((resolve) => setTimeout(resolve, 240_000));
       for (const { key, value } of await h.store.kvEntries('login-sandbox-pool:')) {
         const handle = JSON.parse(value).handle;
         const provider = h.worlds.get(handle.kind);
