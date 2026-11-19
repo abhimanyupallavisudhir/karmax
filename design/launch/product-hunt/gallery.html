@@ -1,0 +1,67 @@
+<!doctype html>
+<!-- Product Hunt gallery slides (1270×760 CSS px, rendered at 2×) in the launch film's look.
+     One slide per ?n=1..8; make.sh renders them all. Edit SLIDES to change the words. -->
+<html><head><meta charset="utf-8">
+<style>
+  @font-face { font-family: 'Inter'; src: url('../../../web/fonts/inter/InterVariable.woff2') format('woff2'); font-weight: 100 900; }
+  :root { --ink: #0d0c13; --gold2: #e0a33a; --text: #f4f2ff; --muted: #a6a3b8; }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { width: 1270px; height: 760px; overflow: hidden; background: var(--ink); }
+  body { font-family: 'Inter', sans-serif; color: var(--text); -webkit-font-smoothing: antialiased; position: relative; }
+  #bg { position: absolute; inset: 0; background:
+    radial-gradient(900px 520px at 18% -10%, rgba(142,149,255,.20), transparent 60%),
+    radial-gradient(800px 600px at 110% 120%, rgba(240,191,85,.16), transparent 60%), var(--ink); }
+  h1 { position: absolute; left: 0; right: 0; top: 54px; text-align: center; font-size: 52px; font-weight: 720; letter-spacing: -.035em; line-height: 1.08; }
+  .sub { position: absolute; left: 140px; right: 140px; top: 128px; text-align: center; font-size: 21px; line-height: 1.4; color: var(--muted); }
+  .gold { background: linear-gradient(180deg, #ffd77e, var(--gold2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .win { position: absolute; left: 50%; transform: translateX(-50%); border-radius: 14px; overflow: hidden; background: #f7f7f8;
+    box-shadow: 0 30px 90px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.08); }
+  .chrome { height: 32px; background: #ececef; display: flex; align-items: center; padding: 0 14px; gap: 7px; border-bottom: 1px solid #dcdce2; }
+  .chrome i { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+  .chrome i:nth-child(1) { background: #ff5f57; } .chrome i:nth-child(2) { background: #febc2e; } .chrome i:nth-child(3) { background: #28c840; }
+  .url { margin: 0 auto; transform: translateX(-24px); background: #fff; border-radius: 7px; height: 21px; min-width: 300px; padding: 0 12px;
+    font-size: 12px; color: #55545f; display: flex; align-items: center; justify-content: center; }
+  .win img { display: block; object-fit: cover; object-position: left top; }
+  /* The cover */
+  .cover .mark { position: absolute; left: 50%; top: 150px; width: 132px; height: 132px; margin-left: -66px; border-radius: 30px; box-shadow: 0 20px 60px rgba(240,191,85,.25); }
+  .cover .glow { position: absolute; left: 50%; top: 216px; width: 640px; height: 640px; margin: -320px; border-radius: 50%; background: radial-gradient(circle, rgba(240,191,85,.22), transparent 62%); }
+  .cover h1 { top: 318px; font-size: 76px; }
+  .cover .sub { top: 420px; font-size: 25px; left: 170px; right: 170px; }
+  .chips { position: absolute; left: 0; right: 0; top: 560px; display: flex; justify-content: center; gap: 14px; }
+  .chip { font-size: 19px; font-weight: 600; padding: 11px 20px; border-radius: 999px; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.14); }
+  .foot { position: absolute; left: 0; right: 0; bottom: 34px; text-align: center; font-size: 18px; color: var(--muted); letter-spacing: .02em; }
+</style></head>
+<body><div id="bg"></div><div id="slide"></div>
+<script>
+// [headline (*…* in gold), line under it or '', screenshot (web/media/landing/<name>-light.webp), its pixel width × height (2×), CSS px cropped off its top]
+const SLIDES = [
+  null, // 1: the cover, drawn below
+  ['Say what *needs doing.*', 'In plain words, in any project. Claude Code, Codex or OpenCode picks it up.', 'write', 1512, 1164],
+  ['Agents work on *their own computers.*', 'Your repositories, files Git ignores, data, a terminal and a browser.', 'work', 1304, 940],
+  ['Review the *result,* and approve.', 'Or hand the review to another agent, on another vendor’s model.', 'review', 1304, 836, 58],
+  ['Give agents *accounts, keys and a card.*', 'They sign up, sign in and pay, only with what you allow, within a budget.', 'vault', 1920, 840],
+  ['Any model. *Your subscription.*', 'On your Claude or ChatGPT plan, an API key, or tavya’s included model.', 'models', 1452, 760],
+  ['Build the *autonomous company.*', 'Agents create, review and approve the work. A co-ordinator runs the project.', 'autonomous', 1040, 864],
+  ['Not just *code.*', 'Papers, websites, images, video and errands, reviewed like a pull request.', 'errand', 1304, 812],
+];
+const COVER = { title: 'Do *anything* with agents.', sub: 'Each task gets an agent and its own computer, with your accounts and a budget. You approve what comes back.',
+  chips: ['Claude Code · Codex · OpenCode', 'Free plan', 'Open source'] };
+const gold = (text) => text.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])).replace(/\*([^*]+)\*/g, '<span class="gold">$1</span>');
+const n = Number(new URLSearchParams(location.search).get('n') || 1);
+const slide = document.getElementById('slide');
+if (n === 1) {
+  document.body.classList.add('cover');
+  slide.innerHTML = `<div class="glow"></div><img class="mark" src="../../../web/brand/royal-gold-arrow/icon-512.png" alt="">
+    <h1>${gold(COVER.title)}</h1><p class="sub">${gold(COVER.sub)}</p>
+    <div class="chips">${COVER.chips.map((c) => `<span class="chip">${gold(c)}</span>`).join('')}</div><p class="foot">tavya.io</p>`;
+} else {
+  const [title, sub, shot, w, h, crop = 0] = SLIDES[n - 1];
+  // The window fills the space under the words: the screenshot at up to 1.4× its own scale, its top left kept.
+  const top = sub ? 186 : 140, maxW = 1110, maxH = 760 - top - 28 - 32;
+  const scale = Math.min(maxW / (w / 2), maxH / ((h / 2) - crop), 1.4);
+  const iw = Math.round((w / 2) * scale), ih = Math.round(((h / 2) - crop) * scale);
+  slide.innerHTML = `<h1>${gold(title)}</h1>${sub ? `<p class="sub">${gold(sub)}</p>` : ''}
+    <div class="win" style="top:${top}px;width:${iw}px"><div class="chrome"><i></i><i></i><i></i><span class="url">tavya.io</span></div>
+    <div style="width:${iw}px;height:${ih}px;overflow:hidden"><img src="../../../web/media/landing/${shot}-light.webp" style="width:${iw}px;margin-top:${-Math.round(crop * scale)}px" alt=""></div></div>`;
+}
+</script></body></html>
