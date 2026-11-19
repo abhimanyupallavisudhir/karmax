@@ -503,9 +503,15 @@ function slugify(s) {
 function projectSlug(p) { return p ? slugify(p.name) : ''; }
 function projectPath(p) { return p ? [p.folder, p.name].filter(Boolean).join('/') : ''; }
 function projectById(pid) { return (S.projects || []).find((p) => p.id === pid); }
+// The organization's own projects come before its co-ordinator project (where
+// Ask's conversations live), which is only the answer when it is the only one.
 function firstProjectForOrganization(organizationId) {
-  return (S.projects || []).find((p) => p.organizationId === organizationId);
+  return ordinaryProjectForOrganization(organizationId) || (S.projects || []).find((p) => p.organizationId === organizationId);
 }
+function ordinaryProjectForOrganization(organizationId) {
+  return (S.projects || []).find((p) => p.organizationId === organizationId && !p.coordinator);
+}
+const COORDINATOR_PROJECT_TIP = 'The organization’s own project: what you Ask lives here. It can’t be renamed, moved or deleted.';
 // Resolve a URL slug back to a project, optionally scoped to one organization
 // (project slugs need only be unique within their org). Matches the slugified name
 // (the common, human case), falling back to a raw project id for safety. On a slug
@@ -6406,6 +6412,7 @@ function renderShell() {
       <button class="icon-btn mobile-menu" id="mobile-menu" aria-controls="rail" aria-label="Sidebar" aria-expanded="false">${ICON.menu}</button>
       <a class="brand" data-spa href="${esc(homeRoute())}" aria-label="Home">${brandMark()}</a>
       <span class="topbar-context" id="topbar-context"></span>
+      <button class="btn primary mobile-ask" id="mobile-ask" type="button" aria-haspopup="dialog" title="Ask ${esc(siteName())} — no computer, starts in seconds">${ICON.chat}<span>Ask</span></button>
     </div>
     ${verificationBanner()}
     <div class="body">
@@ -6448,6 +6455,7 @@ function renderShell() {
   $('#rail-new-task').addEventListener('click', () => openNewTaskForm());
   $('#rail-new-template').addEventListener('click', () => openTemplatePicker());
   $('#rail-ask').addEventListener('click', () => askTavya());
+  $('#mobile-ask').addEventListener('click', () => askTavya());
   $('#rail-help').addEventListener('click', openHelp);
   $('#key-echo').addEventListener('animationend', () => echoKeys('')); // faded out
   wireVerificationBanner();
@@ -7756,7 +7764,7 @@ function newTaskProjectId(organizationId = S.organizationId) {
   const fromQuery = named && (S.projects || []).find((p) => p.organizationId === organizationId && projectSlug(p) === named)?.id;
   let remembered = null;
   try { remembered = JSON.parse(localStorage.getItem(NEW_TASK_PROJECT_KEY) || '{}')[organizationId]; } catch {}
-  return fromQuery || inOrganization(remembered) || inOrganization(S.projectId) || firstProjectForOrganization(organizationId)?.id || null;
+  return fromQuery || inOrganization(remembered) || inOrganization(S.projectId) || ordinaryProjectForOrganization(organizationId)?.id || null;
 }
 function rememberNewTaskProject(projectId) {
   const organizationId = projectById(projectId)?.organizationId;
@@ -9076,10 +9084,12 @@ function openNewTaskForm(template, projectId = template?.projectId) {
 function newTaskTarget() { return S.tab === 'home' ? newTaskProjectId() : S.projectId; }
 
 // "Ask tavya" (wiki features/computerless-tasks): what you type starts a task
-// without a computer in the project new tasks go to, acting with your own
-// authority; its page opens with the message box ready. One conversation is one task.
-function askTavya(projectId) {
-  if (!projectId) return withNewTaskProject((chosen) => askTavya(chosen));
+// without a computer in the organization's co-ordinator project (made on first
+// use), acting with your own authority; its page opens with the message box
+// ready. One conversation is one task. Someone whose authority covers only some
+// projects asks in one of those instead.
+function askTavya() {
+  const organizationId = S.organizationId;
   const previousFocus = document.activeElement;
   const dialog = document.createElement('dialog');
   dialog.className = 'text-prompt ask-dialog';
@@ -9088,7 +9098,7 @@ function askTavya(projectId) {
   dialog.innerHTML = `<form method="dialog"><div class="prompt-field"><textarea name="ask" rows="3" required maxlength="20000" aria-label="Ask ${esc(siteName())}"
       placeholder="Ask ${esc(siteName())} anything: change a setting, find what waits on you, start a task…"></textarea>
       ${mic ? `<div class="prompt-attach-row ask-mic">${mic}</div>` : ''}</div>
-    <div class="inline-form ask-foot"><span class="ask-where">${esc(projectById(projectId)?.name || '')}${policyTip(NO_COMPUTER_TIP)}</span>
+    <div class="inline-form ask-foot"><span class="ask-where">${policyTip(NO_COMPUTER_TIP)}</span>
       <button class="btn primary" value="submit" title="Ask (Enter)">Ask</button></div></form>`;
   const input = dialog.querySelector('textarea');
   const form = dialog.querySelector('form');
@@ -9100,10 +9110,22 @@ function askTavya(projectId) {
     sending = true;
     dialog.querySelector('button[value="submit"]').disabled = true;
     try {
-      const created = await api(`/api/projects/${encodeURIComponent(projectId)}/tasks`, { method: 'POST', body: JSON.stringify({
-        workflow: NEW_TASK_WORKFLOW, ownAuthority: true, params: { prompt: text, computer: { provider: NO_COMPUTER } } }) });
+      let created;
+      try {
+        created = await api(`/api/organizations/${encodeURIComponent(organizationId)}/ask`, { method: 'POST', body: JSON.stringify({ prompt: text }) });
+      } catch (error) {
+        if (error.status !== 403) throw error;
+        // Not someone who acts for the whole organization: ask in the project
+        // their new tasks go to.
+        const projectId = newTaskProjectId(organizationId);
+        if (!projectId) throw error;
+        created = await api(`/api/projects/${encodeURIComponent(projectId)}/tasks`, { method: 'POST', body: JSON.stringify({
+          workflow: NEW_TASK_WORKFLOW, ownAuthority: true, params: { prompt: text, computer: { provider: NO_COMPUTER } } }) });
+      }
+      // A co-ordinator project made just now joins the sidebar.
+      if (!projectById(created.projectId)) { await loadProjects(); renderRail(); }
       dialog.close();
-      await goToTask(created.id);
+      await spaNavigate(`${projectBase(created.projectId)}/tasks/${created.num ?? created.id}`);
       focusWhenReady('.followup-input');
     } catch (error) {
       toast(error.message, true);
@@ -9250,7 +9272,7 @@ function withNewTaskProject(then) {
     // A task lives in a project: with none yet, make one first.
     return projectId ? then(projectId) : toast('Create a project first', false, { label: 'New project', fn: () => newProject() });
   }
-  if (!(S.projects || []).some((project) => project.organizationId === S.organizationId)) {
+  if (!ordinaryProjectForOrganization(S.organizationId)) {
     return toast('Create a project first', false, { label: 'New project', fn: () => newProject() });
   }
   pickProject('New task in…', then);
@@ -22256,6 +22278,8 @@ function settingsView(proj) {
       <div class="setting-rows" id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
     <div class="card" data-settings-advanced hidden><div class="setting-rows">
+      ${proj.coordinator ? `<div class="setting-row"><span class="setting-label">Co-ordinator project ${policyTip(COORDINATOR_PROJECT_TIP)}</span>
+        <span class="setting-value setting-muted">Permanent</span></div>` : `
       <div class="setting-row" data-settings-access="project" data-unsaved hidden><span class="setting-label">Name ${policyTip('Use / to put the project in folders, e.g. Clients/Website.')}</span>
         <span class="setting-value"><input id="project-name" class="setting-input" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders"></span>
         <span class="setting-actions"><button class="btn sm primary" id="rename-project" data-unsaved-save>Save</button></span></div>
@@ -22264,7 +22288,7 @@ function settingsView(proj) {
         <span class="setting-actions"><button class="btn sm" id="move-project">Move…</button></span></div>
       <div class="setting-row danger" data-settings-access="projectDelete" hidden><span class="setting-label">Delete project ${policyTip('Removes the project and all its tasks.')}</span>
         <span class="setting-value setting-muted">Permanent</span>
-        <span class="setting-actions"><button class="btn sm danger" id="delete-project">Delete…</button></span></div>
+        <span class="setting-actions"><button class="btn sm danger" id="delete-project">Delete…</button></span></div>`}
     </div></div>
     <div class="card" id="project-experimental"><div class="section-h">Experimental</div><div id="project-avatar-settings">Loading…</div></div>
     </div></div></div>`;

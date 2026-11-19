@@ -50,6 +50,7 @@ export class ProjectTransfers {
     const destination = (await s.getOrganization(destinationOrganizationId));
     if (!destination) throw new ProjectTransferError('Destination organization not found.', 404);
     if (project.organizationId === destinationOrganizationId) throw new ProjectTransferError('Choose a different organization.', 400);
+    if (project.coordinator) throw new ProjectTransferError(`The ${project.name} project belongs to its organization and cannot be moved.`, 400);
     const blockers: TransferBlocker[] = [];
     const block = (code: string, message: string, condition: unknown) => { if (condition) blockers.push({ code, message }); };
     const rows = async (table: string) => (await s.db.prepare(`SELECT * FROM ${table} WHERE projectId=?`).all(projectId)) as any[];

@@ -60,6 +60,7 @@ eval(extractFn('slugify'));
 eval(extractFn('projectSlug'));
 eval(extractFn('projectById'));
 eval(extractFn('firstProjectForOrganization'));
+eval(extractFn('ordinaryProjectForOrganization'));
 eval(extractFn('projectBySlug'));
 eval(extractFn('orgSlug'));
 eval(extractFn('organizationById'));
@@ -100,6 +101,14 @@ eq(projectRoute('P1', 'settings'), '/acme/website-redesign/settings', 'project s
 eq(projectRoute('P2'), '/globex/mobile-app', 'project route uses the project’s OWN org, not the current one');
 eq(firstProjectForOrganization('org_globex')?.id, 'P2', 'project fallback skips an earlier project from another organization');
 eq(firstProjectForOrganization('org_missing'), undefined, 'project fallback does not borrow a project from another organization');
+S.projects.unshift({ id: 'C1', name: 'Co-ordinator', organizationId: 'org_globex', coordinator: true });
+eq(firstProjectForOrganization('org_globex')?.id, 'P2', 'project fallback prefers the organization’s own projects to its co-ordinator project');
+eq(ordinaryProjectForOrganization('org_globex')?.id, 'P2', 'the co-ordinator project is not one of the organization’s own');
+S.projects = S.projects.filter((project) => project.organizationId !== 'org_globex' || project.coordinator);
+eq(firstProjectForOrganization('org_globex')?.id, 'C1', 'with nothing else, the co-ordinator project is where the organization lands');
+eq(ordinaryProjectForOrganization('org_globex'), undefined, 'with nothing else, the organization has no project of its own');
+S.projects = [S.projects.find((project) => project.id === 'P1'), { id: 'P2', name: 'Mobile App', organizationId: 'org_globex' },
+  S.projects.find((project) => project.id === 'P3')];
 eq(taskUrl('T9'), '/acme/website-redesign/tasks/42', 'task permalink nests under /<org>/<project>/tasks/:num');
 eq(taskUrl('A2', { id: 'A2', projectId: 'P1', num: 42, otherAttempt: true }), '/acme/website-redesign/tasks/A2',
   'a search row standing in through another attempt opens that attempt, not the principal behind #42');
