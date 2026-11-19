@@ -1233,7 +1233,11 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
   }
 
   /** restic in a remote world: fetched once from this server, with a grant for
-   * the repository it is fetched to use, and checked against its pinned digest. */
+   * the repository it is fetched to use, and checked against its pinned digest.
+   * curl's own `--retry` passes over a connection reset (35, 56), so a passing
+   * one is retried with `--retry-all-errors` where curl has it (7.71+). A world
+   * that never reaches tavya (basic internet) is refused before it is made
+   * (tavya-reach.ts). */
   private async worldBinary(world: World, base: string, repository: Repository): Promise<string> {
     const relative = `${BIN_DIR}/restic-${RESTIC_VERSION}`;
     const absolute = path.posix.join(world.handle.root, relative);
@@ -1249,7 +1253,8 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     const token = await this.deps.tokens.mint({ repository: repository.name, access: 'read', quota: false, expiresAt: Date.now() + 10 * 60_000 });
     const authorization = `authorization: Basic ${Buffer.from(`tavya:${token}`).toString('base64')}`;
     const fetched = await world.exec('bash', ['-c', `set -e; mkdir -p ${BIN_DIR}; t=${BIN_DIR}/.restic-$$
-if command -v curl >/dev/null; then curl -fsSL --retry 3 -H "$3" "$1" -o "$t"
+if command -v curl >/dev/null; then r=; curl --help all 2>/dev/null | grep -q -- --retry-all-errors && r=--retry-all-errors
+  curl -fsSL --connect-timeout 30 --retry 4 $r -H "$3" "$1" -o "$t"
 elif command -v wget >/dev/null; then wget -q --header="$3" -O "$t" "$1"
 else node -e 'const [u,f,h]=process.argv.slice(1);fetch(u,{headers:{authorization:h.slice(h.indexOf(":")+1).trim()}}).then(async r=>{if(!r.ok)throw new Error(r.status);require("fs").writeFileSync(f,Buffer.from(await r.arrayBuffer()))})' "$1" "$t" "$3"; fi
 got=$(sha256sum "$t" 2>/dev/null | cut -d' ' -f1 || node -e 'process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync(process.argv[1])).digest("hex"))' "$t")

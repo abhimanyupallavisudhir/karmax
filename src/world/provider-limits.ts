@@ -48,6 +48,10 @@ export async function probeE2BLimits(apiKey: string, options: ProbeOptions & { a
   return finish(limits, options);
 }
 
+/** Daytona's Tier 3 CPU quota, the first with full internet (Tiers 1–4:
+ * 10, 100, 250, 500 vCPU; daytona.io/docs/en/limits, network-limits). */
+const DAYTONA_FULL_INTERNET_CPU_QUOTA = 250;
+
 export async function probeDaytonaLimits(apiKey: string,
   options: ProbeOptions & { apiUrl?: string; target?: string } = {}): Promise<ComputerLimits> {
   const base = (options.apiUrl ?? 'https://app.daytona.io/api').replace(/\/$/, '');
@@ -64,14 +68,21 @@ export async function probeDaytonaLimits(apiKey: string,
     const organizationId = key.ok && typeof key.body?.organizationId === 'string' ? key.body.organizationId : undefined;
     if (!organizationId) return;
     // Tiers 1 and 2 reach essential services only (registries, Git hosts, AI
-    // and cloud APIs), and no sandbox can change that: "Any" needs to know.
+    // and cloud APIs; not tavya, so not a project's data), and no sandbox can
+    // change that: "Any" and world setup need to know. The organization says
+    // so itself; a key that may not read it (sandbox-scoped, as tavya.io's
+    // are) leaves the tier's CPU quota to tell, and failing that the account
+    // counts as limited, as every account below Tier 3 ($500 prepaid) is.
+    limits.network = 'basic';
     const organization = await call('GET', `${base}/organizations/${encodeURIComponent(organizationId)}`).catch(() => undefined);
     const limited = organization?.ok ? organization.body?.sandboxLimitedNetworkEgress : undefined;
-    if (typeof limited === 'boolean') limits.network = limited ? 'basic' : 'full';
-    const usage = await call('GET', `${base}/organizations/${encodeURIComponent(organizationId)}/usage`);
-    const regions = Array.isArray(usage.body?.regionUsage) ? usage.body.regionUsage as Array<Record<string, unknown>> : [];
+    const usage = await call('GET', `${base}/organizations/${encodeURIComponent(organizationId)}/usage`).catch(() => undefined);
+    const regions = Array.isArray(usage?.body?.regionUsage) ? usage!.body.regionUsage as Array<Record<string, unknown>> : [];
     const containers = regions.filter((region) => (region.sandboxClass ?? 'container') === 'container' && Number(region.totalDiskQuota) > 0);
     const region = containers.find((candidate) => candidate.regionId === options.target) ?? containers[0];
+    const tierCpu = Number(region?.totalCpuQuota);
+    if (typeof limited === 'boolean') limits.network = limited ? 'basic' : 'full';
+    else if (tierCpu >= DAYTONA_FULL_INTERNET_CPU_QUOTA) limits.network = 'full';
     if (!region) return;
     const number = (value: unknown) => (typeof value === 'number' && value > 0 ? value : undefined);
     const own = { cpu: number(region.totalCpuQuota), memoryMb: number(region.totalMemoryQuota) && Number(region.totalMemoryQuota) * 1024,
