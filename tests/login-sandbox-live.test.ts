@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { bootHarness, type Harness } from './helpers/harness.js';
 import { ConfigHomeManager } from '../src/autonomy/config-homes.js';
-import { LoginSandboxes } from '../src/agent/login-sandbox.js';
+import { LOGIN_SANDBOX_PARKS, LoginSandboxes } from '../src/agent/login-sandbox.js';
 import { credPolicyKey } from '../src/platform/credential-sources.js';
 import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 import { newId } from '../src/util/id.js';
@@ -20,7 +20,7 @@ import { TASK_QUEUE } from '../src/temporal/config.js';
  * runs) and resumed (a follow-up after it parked), against the API-key path.
  *
  *   KARMAX_RUN_LIVE=1 E2B_API_KEY=… KARMAX_LIVE_CLAUDE_HOME=<a config home with .credentials.json>
- *   [KARMAX_LIVE_SANDBOX_PROVIDER=e2b|daytona DAYTONA_API_KEY=…] [KARMAX_LIVE_ANTHROPIC_KEY=…] [KARMAX_LIVE_RUNS=3]
+ *   [KARMAX_LIVE_SANDBOX_PROVIDER=e2b|daytona|agent37|fly DAYTONA_API_KEY=… AGENT37_API_KEY=… FLY_API_TOKEN=…] [KARMAX_LIVE_ANTHROPIC_KEY=…] [KARMAX_LIVE_RUNS=3]
  *   npx vitest run tests/login-sandbox-live.test.ts
  *
  * Copy a login whose refresh token is withheld (a sandbox projection) or replaced
@@ -143,8 +143,9 @@ describe.skipIf(!live)(`login sandbox start latency on ${PROVIDER} (live)`, () =
     for (let run = 0; run < RUNS; run++) {
       // A new conversation finds the organization's pooled sandbox once the first has made one
       // (KARMAX_LOGIN_SANDBOX_POOL=0 measures without the pool).
-      if (run > 0 && (process.env.KARMAX_LOGIN_SANDBOX_POOL ?? '1') !== '0' && PROVIDER === 'e2b')
-        await expect.poll(async () => (await h.store.kvEntries('login-sandbox-pool:')).length, { timeout: 120_000, interval: 1_000 }).toBeGreaterThan(0);
+      if (run > 0 && (process.env.KARMAX_LOGIN_SANDBOX_POOL ?? '1') !== '0' && LOGIN_SANDBOX_PARKS.includes(PROVIDER))
+        await expect.poll(async () => (await h.store.kvEntries('login-sandbox-pool:')).filter(({ value }) => JSON.parse(value).ready).length,
+          { timeout: 10 * 60_000, interval: 1_000 }).toBeGreaterThan(0);
       // Cold: a new conversation (its sandbox new, or from the pool).
       const cold = await ask(project.id, token, MODEL);
       const stall = setInterval(async () => {

@@ -83,7 +83,9 @@ const ownerKey = (label: string) => `login-sandbox-owner:${label}`;
 
 /** A paused sandbox whose CLI already ran once, waiting for a conversation. */
 interface PooledSandbox { organizationId: string; provider: string; funding?: 'own' | 'managed'; handle: WorldHandle;
-  packages: string[]; createdAt: number }
+  packages: string[]; createdAt: number;
+  /** Warmed and parked: only then may a conversation claim it (before, the refill would park it under that conversation). */
+  ready?: boolean }
 
 /** What a pooled sandbox runs once before it pauses: the whole CLI start-up,
  * on a key that fails at the first request (nothing is sent anywhere else).
@@ -282,7 +284,7 @@ export class LoginSandboxes {
       let pooled: PooledSandbox;
       try { pooled = JSON.parse(value) as PooledSandbox; } catch { continue; }
       // Taken by this claim alone; one of other CLI versions is not taken (the sweep replaces it).
-      if (pooled.packages.join(' ') !== packages.join(' ') || pooled.funding !== candidate.funding) continue;
+      if (!pooled.ready || pooled.packages.join(' ') !== packages.join(' ') || pooled.funding !== candidate.funding) continue;
       if (!(await this.deps.store.kvCompareAndSet(key, value, undefined))) continue;
       const label = pooled.handle.id;
       await this.deps.store.kvSet(ownerKey(label), input.taskId);
@@ -333,12 +335,18 @@ export class LoginSandboxes {
           network: { unrestricted: true }, warmPackages: packages }));
         // Known before it runs anything, so the orphan reaper spares it.
         const pooled: PooledSandbox = { organizationId, provider, ...(funding ? { funding } : {}), handle: world.handle, packages, createdAt: this.now() };
-        await this.deps.store.kvSet(poolKey, JSON.stringify(pooled));
+        const warming = JSON.stringify(pooled);
+        await this.deps.store.kvSet(poolKey, warming);
         try {
           const homes = (await this.recent(organizationId, provider)).homes;
           await timed('login-sandbox.pool-warm', () => world.exec('bash', ['-c', POOL_WARM_UP(packages, world.handle.root, homes)], { timeoutMs: 150_000 }));
           const provider_ = this.registry().get(provider);
           if (provider_.park) await provider_.park(world.handle);
+          // Claimable from now; the housekeeper may have retired it meanwhile.
+          if (!(await this.deps.store.kvCompareAndSet(poolKey, warming, JSON.stringify({ ...pooled, ready: true })))) {
+            await this.destroyHandle(world.handle);
+            return made;
+          }
         } catch (error) {
           await this.deps.store.kvDelete(poolKey).catch(() => undefined);
           await this.destroyHandle(world.handle);

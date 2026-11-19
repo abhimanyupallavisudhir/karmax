@@ -27,10 +27,12 @@ class FakeSandboxes implements WorldProvider {
   created: WorldSpec[] = [];
   execs: string[] = [];
   opened = 0; parked: string[] = []; destroyed: string[] = [];
+  /** Tests: every exec waits for this first (a pooled sandbox still warming up). */
+  gate?: Promise<void>;
   state = new Map<string, 'running' | 'parked' | 'gone'>();
   constructor(readonly kind: string, private dir: string) {}
   private world(handle: WorldHandle): World {
-    return { handle, exec: async (_cmd: string, args: string[]) => { this.execs.push(args.join(' ')); return { code: 0, stdout: '', stderr: '' }; },
+    return { handle, exec: async (_cmd: string, args: string[]) => { this.execs.push(args.join(' ')); await this.gate; return { code: 0, stdout: '', stderr: '' }; },
       destroy: async () => { await this.destroy(handle); } } as unknown as World;
   }
   async create(spec: WorldSpec): Promise<World> {
@@ -282,6 +284,28 @@ describe('login sandboxes', () => {
     clock += 2 * 24 * 60 * 60_000;
     await pool.housekeep();
     expect(e2b.destroyed).toContain('e2b-sbx-3');
+  });
+
+  it('a pooled sandbox still warming up is not claimed: the conversation gets its own, and the pooled one stays parked', async () => {
+    process.env.KARMAX_LOGIN_SANDBOX_POOL = '1';
+    process.env.KARMAX_LOGIN_SANDBOXES_PER_ORG = '3';
+    const org = await store.createOrganization({ name: 'Warming' });
+    const pool = sandboxes();
+    let release!: () => void;
+    e2b.gate = new Promise((resolve) => { release = resolve; });
+    await (await pool.open({ organizationId: org.id, taskId: (await taskIn(org.id, 'First')).id })).settle();
+    await expect.poll(() => e2b.created.length).toBe(2);
+    const warming = String((e2b.created.at(-1) as WorldSpec).taskId);
+    const second = await pool.open({ organizationId: org.id, taskId: (await taskIn(org.id, 'Second')).id });
+    expect(second.world.handle.id).not.toBe(warming);
+    release();
+    await expect.poll(() => e2b.parked.length).toBe(1);
+    await second.settle();
+    // Warmed and parked, it is claimable now.
+    const third = await pool.open({ organizationId: org.id, taskId: (await taskIn(org.id, 'Third')).id });
+    expect(third.world.handle.id).toBe(warming);
+    await third.settle();
+    delete process.env.KARMAX_LOGIN_SANDBOXES_PER_ORG;
   });
 
   it('on a VM that stops in seconds (Agent37, Fly.io) it parks and pools as on E2B; on Daytona an idle one is deleted', async () => {
