@@ -110,6 +110,7 @@ const ICON = {
   find: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>',
   fork: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></svg>',
   terminal: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg>',
+  desktop: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>',
   laptop: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"/></svg>',
   // The task page's two views: its conversation, and its settings.
   chat: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
@@ -13739,6 +13740,7 @@ function taskRail(v, rec = taskRecord(v.taskId)) {
     ${notesSection(v)}
     <div class="rail-links">
       ${rec?.params?.draft ? '' : approvalHistoryLink(v)}
+      ${railDesktop(v)}
       ${railTerminal(v)}
     </div>
   </div>`;
@@ -13782,6 +13784,30 @@ function railTerminal(v) {
     </div>`;
 }
 
+// A desktop task's screen, which a person can watch and take over (a
+// Cloudflare check, a sign-in step): opened in a tab of its own.
+function railDesktop(v) {
+  if (!v.worldDesktop) return '';
+  return `<div class="ck-item ck-terminal-item">
+      <button type="button" class="ck-terminal-open" id="desktop-open" data-shortcut="task.desktop" title="Watch and take over this task's screen (d)">
+        ${ICON.desktop}<span class="ck-name">Desktop</span>
+      </button>
+    </div>`;
+}
+
+// The desktop's viewer in a new tab. The tab opens at the click, before the
+// request, so no popup blocker takes it; a failure closes it again.
+async function openTaskDesktop(v = S.view) {
+  if (!v?.worldDesktop) return;
+  const tab = window.open('', '_blank');
+  if (tab) tab.opener = null;
+  try {
+    const session = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/desktop`, { method: 'POST' });
+    if (tab) tab.location.href = session.url;
+    else window.open(session.url, '_blank', 'noopener');
+  } catch (error) { tab?.close(); toast(error.message, true); }
+}
+
 // Whether the rail shows. Beside the conversation (a wide window): unless the
 // person closed it. Over it (a narrow one): only when asked for.
 function taskRailNarrow() { return !!window.matchMedia?.('(max-width: 1099px)').matches; }
@@ -13821,6 +13847,7 @@ function wireTaskRail(v) {
   wireTaskOrg(v);
   wireNotes(v);
   wirePullRequestApprovals();
+  $('#desktop-open')?.addEventListener('click', () => openTaskDesktop(v));
   $('#tp-rail [data-open-terminal]')?.addEventListener('click', () => {
     S.taskRailOverlay = false; // the shell shows in place of the floating rail
     toggleTaskTerminal(v);
@@ -15306,7 +15333,6 @@ function terminalPane(v) {
       <span style="flex:1"></span>
       ${localWorldPath(v) ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
       ${v.worldAvailable && !localWorldPath(v) ? '<button class="btn sm" id="terminal-native">Copy attach cmd</button>' : ''}
-      ${v.worldDesktop ? '<button class="btn sm" id="desktop-open">Open desktop</button>' : ''}
       ${(v.checkouts || []).length > 1 ? `<select class="sel sm" id="term-checkout" title="Which branch's checkout to open the shell in">
         ${v.checkouts.map((c) => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join('')}
       </select>` : ''}
@@ -15396,10 +15422,6 @@ function wireCheckinSidebar(v) {
 
   $('#terminal-native')?.addEventListener('click', () => copyNativeAttachCommand(v));
   $('#main').querySelectorAll('.fork-local').forEach((button) => button.addEventListener('click', () => forkCloudSessionLocally(v, button)));
-  $('#desktop-open')?.addEventListener('click', async () => {
-    try { const session = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/desktop`, { method: 'POST' }); window.open(session.url, '_blank', 'noopener'); }
-    catch (error) { toast(error.message, true); }
-  });
 }
 
 function nativeConversationFilename(session) {
@@ -30539,6 +30561,7 @@ function allCommands() {
   // ⌘F finds in the conversation; pressed again in its box, the browser's own find.
   add({ id: 'task.find', title: 'Find in conversation', keybinding: 'meta+f', group: 'Task', help: false,
     available: !!(S.selected && S.view && $('#find-in-conversation')) && document.activeElement?.id !== 'ck-find-input', run: () => openConversationSearch() });
+  add({ id: 'task.desktop', title: 'Open the desktop', keybinding: 'd', group: 'Task', help: false, available: !!(S.selected && S.view?.worldDesktop && $('#desktop-open')), run: () => openTaskDesktop() });
   add({ id: 'task.terminal', title: 'Terminal / conversation', keybinding: 't', group: 'Task', help: false, available: !!(S.selected && S.view && $('#tp-rail [data-open-terminal]:not(:disabled)')), run: () => toggleTaskTerminal() });
   // { / } also walk the settings rail's panes (project or organization settings).
   const onSettings = ['settings', 'organization', 'global'].includes(S.tab) && !S.selected;
