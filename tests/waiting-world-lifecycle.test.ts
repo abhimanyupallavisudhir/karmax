@@ -152,6 +152,40 @@ describe('separate waiting-world maintenance', () => {
     expect(f.park).toHaveBeenCalledOnce();
   });
 
+  // rw-data#3 (2026-11-19): a pause on jobs ended while every login was held
+  // for higher-priority work; parking on that wait stopped the VM and killed
+  // the jobs on each resume.
+  it('keeps a VM running while its turn waits for a login and its jobs run; parks it once they have ended', async () => {
+    const f = await fixture('hetzner');
+    await f.store.createRunnerPool({ id: 'test', organizationId: f.project.organizationId!, name: 'Test', provider: 'hetzner',
+      mode: 'customer', capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
+    const lease = await f.store.requestWorldLease({ runnerPoolId: 'test', organizationId: f.project.organizationId!,
+      projectId: f.project.id, taskId: f.task.id, worldId: f.handle.id });
+    await f.store.updateWorldMeta(f.handle, { worldLeaseId: lease.id });
+    let jobState = 'running';
+    const exec = vi.fn(async (_command: string, args: string[]) => {
+      if (args[2] === 'karmax-job-status') {
+        const boundary = args[3];
+        return { code: 0, stdout: `${boundary} job-0000000a ${jobState === 'running' ? 'running 1795000000' : 'exited 0 1795000000 1795000100'}\nCollect\nrun\n${boundary} end\n`, stderr: '' };
+      }
+      return { code: 0, stdout: 'job-0000000a\n', stderr: '' };
+    });
+    f.open.mockImplementation(async () => ({ handle: f.handle, exec }) as any);
+    const login = { ...f.view, waitingFor: { kind: 'account' as const, provider: 'claude', detail: 'Held for higher-priority work' } };
+    let fence = await f.publish(login);
+    await f.core.parkWaitingWorld(f.task.id, lifecyclePublication(login), fence!);
+    expect(f.park).not.toHaveBeenCalled();
+    expect(f.checkpoint).not.toHaveBeenCalled();
+    expect((await f.store.eventsOfType(f.task.id, 'world.park-deferred')).map(e => e.payload))
+      .toEqual([{ reason: 'jobs-running', jobs: ['job-0000000a'] }]);
+
+    jobState = 'exited';
+    fence = await f.publish(login);
+    await f.core.parkWaitingWorld(f.task.id, lifecyclePublication(login), fence!);
+    expect(f.park).toHaveBeenCalledOnce();
+    expect(await f.store.worldState(f.handle.id)).toBe('parked');
+  });
+
   it.each(['publication', 'status', 'generation', 'run', 'access'])('rejects an obsolete or busy world: %s', async change => {
     const f = (await fixture());
     const fence = await f.publish();
