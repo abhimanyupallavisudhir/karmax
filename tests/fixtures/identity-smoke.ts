@@ -96,11 +96,13 @@ const signupGitOnboardingOnce = signupFirstSession.gitOnboarding === true && sig
 const signupAcceptanceRecorded = (await store.policyAcceptances(String(signupFirstSession.user?.id ?? ''))).some((acceptance) =>
   acceptance.context === 'signup' && acceptance.versions.terms === policyVersions('signup').terms);
 // Self-signup now lands the user in their own personal-workspace organization —
-// no "no access yet" waiting room. Projects is reachable (empty until they make
-// one) and the user owns exactly one personal org.
+// no "no access yet" waiting room. Projects is reachable (only the workspace's
+// co-ordinator project, where Ask's tasks live, until they make one) and the
+// user owns exactly one personal org.
 const signupProjects = await json('/api/projects', { headers: { cookie: signupCookie } });
 const signupProjectsList = signupProjects.ok ? (await signupProjects.json()) as any[] : null;
-const signupEntersApp = signupProjects.status === 200 && Array.isArray(signupProjectsList) && signupProjectsList.length === 0;
+const signupEntersApp = signupProjects.status === 200 && Array.isArray(signupProjectsList)
+  && signupProjectsList.length === 1 && signupProjectsList[0].coordinator === true;
 const signupOrgs = await (await json('/api/organizations', { headers: { cookie: signupCookie } })).json() as any[];
 const signupHasPersonalWorkspace = signupOrgs.length === 1 && signupOrgs[0].kind === 'personal';
 const signupWorkspaceUsesUserName = signupOrgs[0]?.name === 'Waiting user';
