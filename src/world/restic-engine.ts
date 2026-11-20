@@ -218,6 +218,11 @@ const SAVE_POLL_MS = 1_000;
 const SAVE_LOCK_WAIT = '1h';
 /** Upkeep gives way instead: it runs again within the hour. */
 const UPKEEP_LOCK_WAIT = '1m';
+/** A restic job that ended without recording how: the sandbox restarted, or
+ * its processes were killed, or its disk filled, which leaves nothing it can
+ * write (world setup tells that one apart: resources.ts filledDisk). */
+const JOB_LOST = 'restic stopped without finishing (its job ended without recording how: the sandbox restarted, or its processes were killed); it resumes from what it stored when retried';
+
 /** Snapshots a save made that no version came to name, forgotten by upkeep
  * ({@link ResticResources.forgetDiscarded}): `restic-discard:<repository>:<snapshot>`. */
 const DISCARD_PREFIX = 'restic-discard:';
@@ -467,7 +472,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
         }
         if (status.state !== 'running') {
           await forget();
-          throw new Error('restic stopped without finishing (the sandbox was restarted); it resumes from what it stored when retried');
+          throw new Error(JOB_LOST);
         }
         if (options.progress && started.size > ended.size && performance.now() - progressRead >= restoreProgressMs()) await readProgress();
         await new Promise((resolve) => setTimeout(resolve, wait));
@@ -1190,7 +1195,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
         }
         if (status?.state !== 'running') {
           await forget();
-          throw new Error('restic stopped without finishing (the sandbox was restarted); it resumes from what it stored when retried');
+          throw new Error(JOB_LOST);
         }
         await new Promise((resolve) => setTimeout(resolve, wait));
       }
