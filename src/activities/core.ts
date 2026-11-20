@@ -66,8 +66,9 @@ import { FOLLOW_UP_JOURNAL_TYPES, followUpMark } from './follow-up-wakes.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
-import { jobStatuses, startJob, startJobWaiter, stopJobs, describeJobs } from '../world/jobs.js';
+import { jobStatuses, listJobs, startJob, startJobWaiter, stopJobs, describeJobs } from '../world/jobs.js';
 import { autoResolve as runAutoResolve } from '../resolve/cases.js';
+import { reachesTavya } from '../world/tavya-reach.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import type { AuthorizationService } from '../platform/authorization.js';
@@ -175,7 +176,7 @@ import {
 import { lifecycleReplacementKey, lifecycleReplacementMatches } from '../platform/lifecycle-replacement.js';
 import { BRAND } from '../domain/brand.js';
 import { ERROR_EVENT_TYPE, reportError, taskFailure } from '../platform/error-reports.js';
-import { isCapacityEscalation, isDelegationLapseOfItsOwn } from '../domain/escalation.js';
+import { isCapacityEscalation, isComputerChoiceEscalation, isDelegationLapseOfItsOwn } from '../domain/escalation.js';
 import { screenEnvironment, skippedEnvNotice, type SkippedEnv } from '../util/work-env.js';
 
 /** How often staging records its progress as a task event. */
@@ -701,7 +702,8 @@ async function commitInto(world: World, root: string, head: string, source: stri
  * fix (a credential, a hard limit: its audience is only the admins), a
  * provider account's limit stayed full for its whole wait for a machine
  * (people's to free or raise), its permission to act for a person expired
- * (theirs to renew), or the task is itself fixing a reported error
+ * (theirs to renew), its computer cannot reach tavya for the project's data
+ * (another computer is theirs to choose), or the task is itself fixing a reported error
  * (it would report itself in a loop).
  */
 function reportEscalation(task: { id: string; projectId: string; params: Record<string, unknown>; lastView?: TaskView }, view: TaskView): void {
@@ -709,7 +711,7 @@ function reportEscalation(task: { id: string; projectId: string; params: Record<
   if (before?.status === 'blocked' && before.error === view.error) return;
   const audience = (view.waitingFor as { audience?: string[] } | undefined)?.audience;
   if (audience?.length === 1 && audience[0] === '@admins') return;
-  if (isCapacityEscalation(view.error) || isDelegationLapseOfItsOwn(view.error)) return;
+  if (isCapacityEscalation(view.error) || isDelegationLapseOfItsOwn(view.error) || isComputerChoiceEscalation(view.error)) return;
   if ((task.params?.trigger as { type?: string } | undefined)?.type === ERROR_EVENT_TYPE) return;
   // The task says what failed; the activity that failed says where (its stack),
   // which is what tells one bug from another.
@@ -2055,6 +2057,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (!(await valid())) return;
       const before = await parkingTrace.measure('lifecycle.status', () => worlds.status(waitingWorld));
       if (!(await valid())) return;
+      // A wait for a model login comes between the end of the agent's pause
+      // and its next turn: nobody chose it, and the jobs that pause watched
+      // (pause refuses to leave any unwatched) are still the agent's work. A
+      // park would stop them on a VM and freeze them in a sandbox (rw-data#3,
+      // 2026-11-19: every resume during a quota hold rebooted the machine and
+      // killed the collection jobs). The world parks at a later wait instead.
+      if (before === 'ready' && view.waitingFor?.kind === 'account') {
+        const running = await parkingTrace.measure('lifecycle.running-jobs', async () => {
+          try {
+            const world = await openWorld(waitingWorld, taskId);
+            return (await jobStatuses(world, await listJobs(world))).filter(job => job.state === 'running').map(job => job.id);
+          } catch { return []; } // Unreadable: park as before rather than keep a broken world up.
+        });
+        if (running.length) {
+          await worldEvent('world.park-deferred', { reason: 'jobs-running', jobs: running });
+          return;
+        }
+        if (!(await valid())) return;
+      }
       if (before === 'ready') {
         if (deps.checkpoints) {
           try {
@@ -2399,6 +2420,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
       const organizationId = project?.organizationId ?? 'org_personal';
+      // What its world must fetch from tavya itself (its data): an account
+      // with basic internet never reaches tavya, so a named one is refused
+      // before any machine is made, and "Any" passes it over (tavya-reach.ts).
+      const tavyaNeed = projectId && remote ? await reachesTavya(store, projectId) : undefined;
+      if (tavyaNeed && !routed && deps.providerConnections) {
+        try { await deps.providerConnections.assertFits(organizationId, kind, { reachesTavya: tavyaNeed }); }
+        catch (error) {
+          throw ApplicationFailure.create({ type: 'computer-unfit', nonRetryable: true,
+            message: error instanceof Error ? error.message : String(error) });
+        }
+      }
       // Resolve the human creator's profile. A tenant-wide identity is only valid
       // for a system-created task with no human ancestor.
       const gitBinding = (await developmentGitBinding(args.taskId, projectId, args.gitProfile));
@@ -2793,7 +2825,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const router = deps.providerConnections?.list && deps.providerConnections.managedConnections
         ? new ComputeRouter(store, deps.providerConnections as RouterConnections) : undefined;
       if (!router || !project) throw new Error('provider "Any" needs a project and connected computers');
-      const route = await router.route(organizationId, executionConfig, undefined, { taskId: args.taskId, worldId: args.taskId });
+      const route = await router.route(organizationId, executionConfig, undefined, { taskId: args.taskId, worldId: args.taskId },
+        tavyaNeed ? { reachesTavya: tavyaNeed } : {});
       try {
         return (await router.run(organizationId, route, (candidate, reason) => provisionOn(candidate.provider as WorldKind, reason),
           async (decision) => { await record(args.taskId, 'world.routed', { ...decision }); })).value;

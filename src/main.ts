@@ -614,6 +614,13 @@ async function main() {
   const coordinatorRevival = new AsyncInterval(() => api.reviveFailedCoordinators().then(() => undefined), 5 * 60_000);
   coordinatorRevival.unref();
   startupJobs.push(() => coordinatorRevival.run());
+  // Every organization has a co-ordinator project; those made before that get theirs here.
+  startupJobs.push(async () => {
+    for (const organization of await store.listOrganizations()) {
+      await store.ensureOrganizationCoordinatorProject(organization.id).catch((error) =>
+        console.warn(`  • Could not give ${organization.id} its co-ordinator project:`, error instanceof Error ? error.message : error));
+    }
+  });
   // Reconcile missed notification close events without delaying the first API response.
   const inboxCleanup = new AsyncInterval(() => store.pruneStaleInbox().then(() => undefined), 3600_000);
   inboxCleanup.unref();

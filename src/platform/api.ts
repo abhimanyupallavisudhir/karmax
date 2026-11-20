@@ -8484,7 +8484,14 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       if (!computerResizable(task.lastView)) throw new ValidationError('this task\'s computer can\'t be resized: the task has ended');
       try { assertInFlightComputerEdit(computerOf(computerBefore), normalizeComputer(patch.computer) ?? {}); }
       catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
-      patch.computer = (await this.taskComputer(project, { computer: patch.computer })) ?? null;
+      // What never changes in flight can't be dropped either: an edit replaces
+      // the task's Computer whole, and one naming only a provider and sizes made
+      // a desktop task's next machine headless (#1001).
+      let own: ComputerSpec = {};
+      try { own = normalizeComputer(task.params?.computer) ?? {}; } catch { own = {}; }
+      const next: ComputerSpec = { ...(own.flavor ? { flavor: own.flavor } : {}), ...(own.network ? { network: own.network } : {}),
+        ...(await this.taskComputer(project, { computer: patch.computer })) };
+      patch.computer = Object.keys(next).length ? next : null;
     }
     // An in-flight edit can introduce a `resumeFrom` pointer at another task —
     // the same source-side conversation check as createTask/updateArmedParams.

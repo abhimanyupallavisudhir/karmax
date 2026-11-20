@@ -39,11 +39,14 @@ function claudeModels(notes) {
 }
 
 /** Codex names it in words where it joins a catalog or becomes the default:
- *  "Added GPT-6.1 Terra to the model catalogs" → gpt-6.1-terra. */
+ *  "Added GPT-6.1 Terra to the model catalogs" → gpt-6.1-terra, and one
+ *  version may name several: "Added GPT-6.2 Sol and Astra" → gpt-6.2-sol, gpt-6.2-astra. */
 function codexModels(notes) {
   return notes.split('\n').filter((line) => /catalog|default/i.test(line))
-    .flatMap((line) => [...line.matchAll(/\bGPT-(\d+(?:\.\d+)?)(?: ([A-Z][a-z]+)\b)?/g)])
-    .map((match) => `gpt-${match[1]}${match[2] ? `-${match[2].toLowerCase()}` : ''}`);
+    .flatMap((line) => [...line.matchAll(/\bGPT-(\d+(?:\.\d+)?)((?: [A-Z][a-z]+\b)(?:(?:,? and |, )[A-Z][a-z]+\b)*)?/g)])
+    .flatMap((match) => match[2]
+      ? match[2].split(/,? and |, | /).filter(Boolean).map((name) => `gpt-${match[1]}-${name.toLowerCase()}`)
+      : [`gpt-${match[1]}`]);
 }
 
 /** Both are pinned by their own version in the browser image (tests/deployment.test.ts keeps it in step). */

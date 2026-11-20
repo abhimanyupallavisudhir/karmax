@@ -9,6 +9,8 @@
  * the task answers to (its parent for a sub-task, otherwise its creator).
  * Pure: shared by the workflow sandbox, the gateway and tests.
  */
+import { BASIC_INTERNET_CANNOT_REACH } from './computer-limits.js';
+
 export type FailureCause = 'task' | 'project' | 'organization' | 'infrastructure';
 
 export function failureAudience(cause: FailureCause): string[] {
@@ -54,4 +56,13 @@ export const DELEGATION_LAPSED_OF_ITS_OWN = /permission to act for the person wh
 
 export function isDelegationLapseOfItsOwn(error: string | undefined): boolean {
   return typeof error === 'string' && DELEGATION_LAPSED_OF_ITS_OWN.test(error);
+}
+
+/** A task refused a computer whose account has basic internet only, which
+ * never reaches tavya, while its world needs the project's data from tavya
+ * (computer-limits.ts unreachableTavya, world/tavya-reach.ts). Another
+ * computer is people's to choose: not a defect of tavya's, so it is not
+ * reported as an error (tavya-error b2ed953c4946ea34). */
+export function isComputerChoiceEscalation(error: string | undefined): boolean {
+  return typeof error === 'string' && error.includes(BASIC_INTERNET_CANNOT_REACH);
 }

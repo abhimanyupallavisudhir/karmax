@@ -75,6 +75,7 @@ describe('autonomous projects over HTTP', () => {
 
     const plain = await f.call('POST', '/api/organizations', { name: 'Side' });
     expect(plain.json.autonomy).toBeUndefined();
-    expect(await f.store.listOrganizationProjects(plain.json.id)).toEqual([]);
+    // Only the co-ordinator project every organization has.
+    expect((await f.store.listOrganizationProjects(plain.json.id)).map((project) => project.coordinator)).toEqual([true]);
   });
 });

@@ -4,6 +4,7 @@ import { notPullRequestSql, pullRequestOf, type PullRequestOf } from '../domain/
 export interface TaskHeader { id: string; num?: number; title: string; projectId: string; status?: string; stage?: string;
   /** Set when the row is a pull request of its task (SPEC §11.1): the header is its task's. */
   pullRequest?: { taskId: string; checkout: string } }
+import { ORGANIZATION_COORDINATOR_PROJECT } from '../domain/autonomous-projects.js';
 import { ANY_PROVIDER, applyComputer, normalizeComputer, LOCAL_WORLD_KINDS, runsOnHost, defaultLoginSandboxes, type ComputerSpec } from '../domain/computer.js';
 /** The local world kinds as an SQL list (`NOT IN (…)`): constants, never input. */
 const LOCAL_KINDS_SQL = LOCAL_WORLD_KINDS.map((kind) => `'${kind}'`).join(',');
@@ -1588,6 +1589,9 @@ export class Store {
     // so no backfill pass is needed; the first drag densifies that organization.
     if (!projectCols.some((c) => c.name === 'ord')) (await this.db.exec('ALTER TABLE projects ADD COLUMN ord INTEGER NOT NULL DEFAULT 0'));
     if (!projectCols.some((c) => c.name === 'folder')) (await this.db.exec('ALTER TABLE projects ADD COLUMN folder TEXT'));
+    // An organization's co-ordinator project (ensureOrganizationCoordinatorProject): one each.
+    if (!projectCols.some((c) => c.name === 'coordinator')) (await this.db.exec('ALTER TABLE projects ADD COLUMN coordinator INTEGER NOT NULL DEFAULT 0'));
+    (await this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_coordinator ON projects(organizationId) WHERE coordinator = 1'));
     if (!cols.some((c) => c.name === 'credentialSelections')) (await this.db.exec('ALTER TABLE tasks ADD COLUMN credentialSelections TEXT'));
     if (!cols.some((c) => c.name === 'conversation')) (await this.db.exec('ALTER TABLE tasks ADD COLUMN conversation TEXT'));
     if (!cols.some((c) => c.name === 'conversationRef')) (await this.db.exec('ALTER TABLE tasks ADD COLUMN conversationRef TEXT'));
@@ -1748,7 +1752,8 @@ export class Store {
 
   // ─── Projects ──────────────────────────────────────────────────────────────
 
-  async createProject(name: string, requested: ProjectConfig = {}, organizationId = 'org_personal'): Promise<Project> {
+  async createProject(name: string, requested: ProjectConfig = {}, organizationId = 'org_personal',
+    options: { coordinator?: boolean } = {}): Promise<Project> {
     return this.db.transaction(async () => {
     // Slugs are unique per organization; transfers hold both organizations.
     (await this.lockOrganization(organizationId));
@@ -1756,6 +1761,7 @@ export class Store {
     if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
     const path = parseProjectPath(name);
     assertRoutableName('project', path.name);
+    if (!options.coordinator) assertUnreservedProjectName(path.name);
     (await this.assertUniqueProjectName(organizationId, path.name));
     const config = writableProjectConfig(requested);
     validateProjectExecutionConfig(config);
@@ -1763,10 +1769,10 @@ export class Store {
       .prepare('SELECT COALESCE(MAX(ord), -1) AS m FROM projects WHERE organizationId = ?')
       .get(organizationId)) as any).m + 1;
     const p: Project = { id: newId('proj'), organizationId, name: path.name, createdAt: Date.now(), config, order: ord,
-      ...(path.folder ? { folder: path.folder } : {}) };
+      ...(path.folder ? { folder: path.folder } : {}), ...(options.coordinator ? { coordinator: true as const } : {}) };
     (await this.db
-      .prepare('INSERT INTO projects (id, organizationId, name, createdAt, config, ord, folder) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(p.id, organizationId, p.name, p.createdAt, JSON.stringify(p.config), ord, p.folder ?? null));
+      .prepare('INSERT INTO projects (id, organizationId, name, createdAt, config, ord, folder, coordinator) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(p.id, organizationId, p.name, p.createdAt, JSON.stringify(p.config), ord, p.folder ?? null, options.coordinator ? 1 : 0));
     // every project gets a default task list
     (await this.createList(p.id, 'Tasks'));
     return p;
@@ -1797,6 +1803,36 @@ export class Store {
       ORDER BY p.ord, p.createdAt`, [`user:${userId}`, `user:${userId}`, userId, userId])).map(rowToProject);
   }
 
+  /** The organization's co-ordinator project, if it has one yet. */
+  async organizationCoordinatorProject(organizationId: string): Promise<Project | undefined> {
+    const [row] = await this.readRows<any>('SELECT * FROM projects WHERE organizationId=? AND coordinator=1', [organizationId]);
+    return row ? rowToProject(row) : undefined;
+  }
+
+  /** Give the organization its co-ordinator project: the one it has; else the
+   * project an organization-wide autonomy already runs from, or one already
+   * called by the reserved name (both from before co-ordinator projects were
+   * marked); else a new one. `created` says whether a project was made. */
+  async ensureOrganizationCoordinatorProject(organizationId: string): Promise<{ project: Project; created: boolean }> {
+    return this.db.transaction(async () => {
+      (await this.lockOrganization(organizationId));
+      const existing = await this.organizationCoordinatorProject(organizationId);
+      if (existing) return { project: existing, created: false };
+      const projects = await this.listOrganizationProjects(organizationId);
+      let adopt: Project | undefined;
+      for (const project of projects) {
+        const autonomy = await this.kvGet(`autonomy:project:${project.id}`);
+        try { if (autonomy && JSON.parse(autonomy).scope === 'organization') { adopt = project; break; } } catch { /* not a record */ }
+      }
+      adopt ??= projects.find((project) => isReservedProjectName(project.name));
+      if (adopt) {
+        (await this.db.prepare('UPDATE projects SET coordinator=1 WHERE id=?').run(adopt.id));
+        return { project: { ...adopt, coordinator: true }, created: false };
+      }
+      return { project: await this.createProject(ORGANIZATION_COORDINATOR_PROJECT, {}, organizationId, { coordinator: true }), created: true };
+    });
+  }
+
   /** One organization's projects, without reading any other tenant's rows. */
   async listOrganizationProjects(organizationId: string): Promise<Project[]> {
     return (await this.readRows<any>(`SELECT * FROM projects WHERE COALESCE(organizationId, 'org_personal')=?
@@ -1810,6 +1846,8 @@ export class Store {
     if (!existing) throw new Error(`no project ${id}`);
     const path = parseProjectPath(name);
     assertRoutableName('project', path.name);
+    if (existing.coordinator && path.name !== existing.name) throw new Error(COORDINATOR_KEEPS_NAME);
+    if (!existing.coordinator) assertUnreservedProjectName(path.name);
     (await this.assertUniqueProjectName(existing.organizationId ?? 'org_personal', path.name, id));
     (await this.db.prepare('UPDATE projects SET name = ?, folder = ? WHERE id = ?').run(path.name, path.folder ?? null, id));
     const { folder: _, ...rest } = existing;
@@ -2183,6 +2221,7 @@ export class Store {
     (await this.lockProjectOrganization(id));
     const project = (await this.lockedProject(id));
     if (!project) throw new Error('project not found');
+    if (project.coordinator) throw new Error(COORDINATOR_UNDELETABLE);
     const tasks = (await selectRows(this.db, 'tasks', 'projectId=?', [id]));
     const taskIds = tasks.map((row) => String(row.id));
     const intentIds = tasks.map((row) => String(row.intentId)).filter(Boolean);
@@ -12026,7 +12065,18 @@ function writableProjectConfig(config: ProjectConfig): ProjectConfig {
 }
 
 function rowToProject(r: any): Project {
-  return { id: r.id, organizationId: r.organizationId ?? 'org_personal', name: r.name, createdAt: r.createdAt, config: JSON.parse(r.config), order: r.ord ?? 0, ...(r.folder ? { folder: r.folder } : {}) };
+  return { id: r.id, organizationId: r.organizationId ?? 'org_personal', name: r.name, createdAt: r.createdAt, config: JSON.parse(r.config), order: r.ord ?? 0,
+    ...(r.folder ? { folder: r.folder } : {}), ...(Number(r.coordinator) ? { coordinator: true as const } : {}) };
+}
+
+const COORDINATOR_KEEPS_NAME = `The ${ORGANIZATION_COORDINATOR_PROJECT} project keeps its name.`;
+const COORDINATOR_UNDELETABLE = `The ${ORGANIZATION_COORDINATOR_PROJECT} project belongs to the organization and cannot be deleted.`;
+/** The co-ordinator project's name, and its spelling without the hyphen, are its alone. */
+export function isReservedProjectName(name: string): boolean {
+  return ['co-ordinator', 'coordinator'].includes(slugify(name));
+}
+function assertUnreservedProjectName(name: string): void {
+  if (isReservedProjectName(name)) throw new Error(`“${ORGANIZATION_COORDINATOR_PROJECT}” is reserved for the organization's co-ordinator project.`);
 }
 
 /** Canonical form of a sidebar folder path: segments trimmed, empties dropped,

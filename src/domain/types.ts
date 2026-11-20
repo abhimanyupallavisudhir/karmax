@@ -683,6 +683,10 @@ export interface Project {
    * implicit — one exists exactly while a project names it — so there is no
    * folder entity to create, rename, or garbage-collect. Absent = top level. */
   folder?: string;
+  /** The organization's co-ordinator project (Store.ensureOrganizationCoordinatorProject):
+   * one per organization, where its organization-wide work (Ask) lives; it
+   * cannot be deleted, renamed or moved to another organization. */
+  coordinator?: true;
 }
 
 export interface ProjectConfig {

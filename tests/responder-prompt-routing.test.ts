@@ -54,6 +54,15 @@ describe('the computer in the World section', () => {
     expect(assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world })).not.toContain('Computer:');
   });
 
+  // #1001: an agent asked the owner to click in "the task's desktop view",
+  // which no page is called; it now names the Desktop button, and only on a desktop.
+  it('tells a desktop world\'s agent where people find its screen', () => {
+    const at = (meta: Record<string, unknown>) => assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }),
+      world: { ...world, kind: 'e2b', meta: { computer: { cpu: 2, memoryMb: 4096 }, ...meta } } as any });
+    expect(at({ environmentFlavor: 'desktop' })).toContain('people watch and take over through the Desktop button on this task\'s page (shortcut d)');
+    expect(at({ environmentFlavor: 'headless' })).not.toContain('Desktop button');
+  });
+
   // compute-disk item 2: the real ceiling, not a generic "diskGb: 50".
   it('names the disk in use and the largest the account allows, and offers exactly that', () => {
     const e2b = { ...world, kind: 'e2b', meta: { computer: { cpu: 2, memoryMb: 2048 } } } as any;

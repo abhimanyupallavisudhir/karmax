@@ -242,12 +242,15 @@ export class ProviderCapacityFull extends ProviderOutage {
 }
 
 // A request-level safety decision says nothing about the shared login's health.
+// Codex's CodexErrorInfo names three (cyberPolicy, bioPolicy since 0.171.0,
+// misalignmentPolicyViolation); the first two say "flagged for possible
+// cybersecurity/biological risk", never "safety systems".
+const POLICY_CODE = /^(?:misalignmentPolicyViolation|cyberPolicy|bioPolicy|content_policy_violation|safety_violation)$/i;
+const POLICY_TEXT = /misalignmentPolicyViolation|cyberPolicy|bioPolicy|content_policy_violation|safety_violation|blocked by (?:our|the) safety systems|flagged for possible (?:cybersecurity|biological) risk/i;
 export function isProviderPolicyRejection(value: unknown, options: LimitClassifierOptions = {}): boolean {
   const diagnostic = nativeProviderDiagnostic(value);
-  return /^(?:misalignmentPolicyViolation|content_policy_violation|safety_violation)$/i.test(diagnostic?.code ?? '')
-    || !!options.providerOrigin && /misalignmentPolicyViolation|content_policy_violation|safety_violation|blocked by (?:our|the) safety systems/i.test(
-      value instanceof Error ? value.message : diagnostic?.message ?? '',
-    );
+  return POLICY_CODE.test(diagnostic?.code ?? '')
+    || !!options.providerOrigin && POLICY_TEXT.test(value instanceof Error ? value.message : diagnostic?.message ?? '');
 }
 
 export class ProviderPolicyFailure extends Error {

@@ -110,6 +110,7 @@ const ICON = {
   find: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>',
   fork: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></svg>',
   terminal: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg>',
+  desktop: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>',
   laptop: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"/></svg>',
   // The task page's two views: its conversation, and its settings.
   chat: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
@@ -503,9 +504,15 @@ function slugify(s) {
 function projectSlug(p) { return p ? slugify(p.name) : ''; }
 function projectPath(p) { return p ? [p.folder, p.name].filter(Boolean).join('/') : ''; }
 function projectById(pid) { return (S.projects || []).find((p) => p.id === pid); }
+// The organization's own projects come before its co-ordinator project (where
+// Ask's conversations live), which is only the answer when it is the only one.
 function firstProjectForOrganization(organizationId) {
-  return (S.projects || []).find((p) => p.organizationId === organizationId);
+  return ordinaryProjectForOrganization(organizationId) || (S.projects || []).find((p) => p.organizationId === organizationId);
 }
+function ordinaryProjectForOrganization(organizationId) {
+  return (S.projects || []).find((p) => p.organizationId === organizationId && !p.coordinator);
+}
+const COORDINATOR_PROJECT_TIP = 'The organization’s own project: what you Ask lives here. It can’t be renamed, moved or deleted.';
 // Resolve a URL slug back to a project, optionally scoped to one organization
 // (project slugs need only be unique within their org). Matches the slugified name
 // (the common, human case), falling back to a raw project id for safety. On a slug
@@ -1249,7 +1256,7 @@ const NODES = [
 const AGENT_PROVIDERS = ['claude', 'codex', 'opencode'];
 const MODELS = {
   claude: ['default', 'opus[1m]', { id: 'claude-opus-5-5', displayName: 'Opus 5.5' }, { id: 'claude-fable-5-2', displayName: 'Fable 5.2' }, { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, { id: 'claude-sonnet-5-5', displayName: 'Sonnet 5.5' }, { id: 'claude-haiku-5-5', displayName: 'Haiku 5.5' }, 'sonnet', 'haiku'],
-  codex: ['gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
+  codex: ['gpt-6.2-sol', 'gpt-6.2-astra', 'gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
 };
 const agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
@@ -6407,6 +6414,7 @@ function renderShell() {
       <button class="icon-btn mobile-menu" id="mobile-menu" aria-controls="rail" aria-label="Sidebar" aria-expanded="false">${ICON.menu}</button>
       <a class="brand" data-spa href="${esc(homeRoute())}" aria-label="Home">${brandMark()}</a>
       <span class="topbar-context" id="topbar-context"></span>
+      <button class="btn primary mobile-ask" id="mobile-ask" type="button" aria-haspopup="dialog" title="Ask ${esc(siteName())} — no computer, starts in seconds">${ICON.chat}<span>Ask</span></button>
     </div>
     ${verificationBanner()}
     <div class="body">
@@ -6449,6 +6457,7 @@ function renderShell() {
   $('#rail-new-task').addEventListener('click', () => openNewTaskForm());
   $('#rail-new-template').addEventListener('click', () => openTemplatePicker());
   $('#rail-ask').addEventListener('click', () => askTavya());
+  $('#mobile-ask').addEventListener('click', () => askTavya());
   $('#rail-help').addEventListener('click', openHelp);
   $('#key-echo').addEventListener('animationend', () => echoKeys('')); // faded out
   wireVerificationBanner();
@@ -7757,7 +7766,7 @@ function newTaskProjectId(organizationId = S.organizationId) {
   const fromQuery = named && (S.projects || []).find((p) => p.organizationId === organizationId && projectSlug(p) === named)?.id;
   let remembered = null;
   try { remembered = JSON.parse(localStorage.getItem(NEW_TASK_PROJECT_KEY) || '{}')[organizationId]; } catch {}
-  return fromQuery || inOrganization(remembered) || inOrganization(S.projectId) || firstProjectForOrganization(organizationId)?.id || null;
+  return fromQuery || inOrganization(remembered) || inOrganization(S.projectId) || ordinaryProjectForOrganization(organizationId)?.id || null;
 }
 function rememberNewTaskProject(projectId) {
   const organizationId = projectById(projectId)?.organizationId;
@@ -9077,10 +9086,12 @@ function openNewTaskForm(template, projectId = template?.projectId) {
 function newTaskTarget() { return S.tab === 'home' ? newTaskProjectId() : S.projectId; }
 
 // "Ask tavya" (wiki features/computerless-tasks): what you type starts a task
-// without a computer in the project new tasks go to, acting with your own
-// authority; its page opens with the message box ready. One conversation is one task.
-function askTavya(projectId) {
-  if (!projectId) return withNewTaskProject((chosen) => askTavya(chosen));
+// without a computer in the organization's co-ordinator project (made on first
+// use), acting with your own authority; its page opens with the message box
+// ready. One conversation is one task. Someone whose authority covers only some
+// projects asks in one of those instead.
+function askTavya() {
+  const organizationId = S.organizationId;
   const previousFocus = document.activeElement;
   const dialog = document.createElement('dialog');
   dialog.className = 'text-prompt ask-dialog';
@@ -9089,7 +9100,7 @@ function askTavya(projectId) {
   dialog.innerHTML = `<form method="dialog"><div class="prompt-field"><textarea name="ask" rows="3" required maxlength="20000" aria-label="Ask ${esc(siteName())}"
       placeholder="Ask ${esc(siteName())} anything: change a setting, find what waits on you, start a task…"></textarea>
       ${mic ? `<div class="prompt-attach-row ask-mic">${mic}</div>` : ''}</div>
-    <div class="inline-form ask-foot"><span class="ask-where">${esc(projectById(projectId)?.name || '')}${policyTip(NO_COMPUTER_TIP)}</span>
+    <div class="inline-form ask-foot"><span class="ask-where">${policyTip(NO_COMPUTER_TIP)}</span>
       <button class="btn primary" value="submit" title="Ask (Enter)">Ask</button></div></form>`;
   const input = dialog.querySelector('textarea');
   const form = dialog.querySelector('form');
@@ -9101,10 +9112,22 @@ function askTavya(projectId) {
     sending = true;
     dialog.querySelector('button[value="submit"]').disabled = true;
     try {
-      const created = await api(`/api/projects/${encodeURIComponent(projectId)}/tasks`, { method: 'POST', body: JSON.stringify({
-        workflow: NEW_TASK_WORKFLOW, ownAuthority: true, params: { prompt: text, computer: { provider: NO_COMPUTER } } }) });
+      let created;
+      try {
+        created = await api(`/api/organizations/${encodeURIComponent(organizationId)}/ask`, { method: 'POST', body: JSON.stringify({ prompt: text }) });
+      } catch (error) {
+        if (error.status !== 403) throw error;
+        // Not someone who acts for the whole organization: ask in the project
+        // their new tasks go to.
+        const projectId = newTaskProjectId(organizationId);
+        if (!projectId) throw error;
+        created = await api(`/api/projects/${encodeURIComponent(projectId)}/tasks`, { method: 'POST', body: JSON.stringify({
+          workflow: NEW_TASK_WORKFLOW, ownAuthority: true, params: { prompt: text, computer: { provider: NO_COMPUTER } } }) });
+      }
+      // A co-ordinator project made just now joins the sidebar.
+      if (!projectById(created.projectId)) { await loadProjects(); renderRail(); }
       dialog.close();
-      await goToTask(created.id);
+      await spaNavigate(`${projectBase(created.projectId)}/tasks/${created.num ?? created.id}`);
       focusWhenReady('.followup-input');
     } catch (error) {
       toast(error.message, true);
@@ -9251,7 +9274,7 @@ function withNewTaskProject(then) {
     // A task lives in a project: with none yet, make one first.
     return projectId ? then(projectId) : toast('Create a project first', false, { label: 'New project', fn: () => newProject() });
   }
-  if (!(S.projects || []).some((project) => project.organizationId === S.organizationId)) {
+  if (!ordinaryProjectForOrganization(S.organizationId)) {
     return toast('Create a project first', false, { label: 'New project', fn: () => newProject() });
   }
   pickProject('New task in…', then);
@@ -13721,6 +13744,7 @@ function taskRail(v, rec = taskRecord(v.taskId)) {
     ${notesSection(v)}
     <div class="rail-links">
       ${rec?.params?.draft ? '' : approvalHistoryLink(v)}
+      ${railDesktop(v)}
       ${railTerminal(v)}
     </div>
   </div>`;
@@ -13764,6 +13788,30 @@ function railTerminal(v) {
     </div>`;
 }
 
+// A desktop task's screen, which a person can watch and take over (a
+// Cloudflare check, a sign-in step): opened in a tab of its own.
+function railDesktop(v) {
+  if (!v.worldDesktop) return '';
+  return `<div class="ck-item ck-terminal-item">
+      <button type="button" class="ck-terminal-open" id="desktop-open" data-shortcut="task.desktop" title="Watch and take over this task's screen (d)">
+        ${ICON.desktop}<span class="ck-name">Desktop</span>
+      </button>
+    </div>`;
+}
+
+// The desktop's viewer in a new tab. The tab opens at the click, before the
+// request, so no popup blocker takes it; a failure closes it again.
+async function openTaskDesktop(v = S.view) {
+  if (!v?.worldDesktop) return;
+  const tab = window.open('', '_blank');
+  if (tab) tab.opener = null;
+  try {
+    const session = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/desktop`, { method: 'POST' });
+    if (tab) tab.location.href = session.url;
+    else window.open(session.url, '_blank', 'noopener');
+  } catch (error) { tab?.close(); toast(error.message, true); }
+}
+
 // Whether the rail shows. Beside the conversation (a wide window): unless the
 // person closed it. Over it (a narrow one): only when asked for.
 function taskRailNarrow() { return !!window.matchMedia?.('(max-width: 1099px)').matches; }
@@ -13803,6 +13851,7 @@ function wireTaskRail(v) {
   wireTaskOrg(v);
   wireNotes(v);
   wirePullRequestApprovals();
+  $('#desktop-open')?.addEventListener('click', () => openTaskDesktop(v));
   $('#tp-rail [data-open-terminal]')?.addEventListener('click', () => {
     S.taskRailOverlay = false; // the shell shows in place of the floating rail
     toggleTaskTerminal(v);
@@ -15288,7 +15337,6 @@ function terminalPane(v) {
       <span style="flex:1"></span>
       ${localWorldPath(v) ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
       ${v.worldAvailable && !localWorldPath(v) ? '<button class="btn sm" id="terminal-native">Copy attach cmd</button>' : ''}
-      ${v.worldDesktop ? '<button class="btn sm" id="desktop-open">Open desktop</button>' : ''}
       ${(v.checkouts || []).length > 1 ? `<select class="sel sm" id="term-checkout" title="Which branch's checkout to open the shell in">
         ${v.checkouts.map((c) => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join('')}
       </select>` : ''}
@@ -15378,10 +15426,6 @@ function wireCheckinSidebar(v) {
 
   $('#terminal-native')?.addEventListener('click', () => copyNativeAttachCommand(v));
   $('#main').querySelectorAll('.fork-local').forEach((button) => button.addEventListener('click', () => forkCloudSessionLocally(v, button)));
-  $('#desktop-open')?.addEventListener('click', async () => {
-    try { const session = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/desktop`, { method: 'POST' }); window.open(session.url, '_blank', 'noopener'); }
-    catch (error) { toast(error.message, true); }
-  });
 }
 
 function nativeConversationFilename(session) {
@@ -15401,7 +15445,7 @@ function portableForkCommandFor(session, cwd) {
     'mkdir -p "$HOME/.codex/sessions/tavya"',
     `cp -n "${source}" "$HOME/.codex/sessions/tavya/${filename}"`,
     `cd ${shellQuote(cwd)}`,
-    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.167.1"} fork ${shellQuote(sessionId)}`,
+    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.171.0"} fork ${shellQuote(sessionId)}`,
   ].join('\n');
   if (session.provider === 'claude') return [
     `tavya_cwd="$(cd ${shellQuote(cwd)} && pwd -P)"`,
@@ -22260,6 +22304,8 @@ function settingsView(proj) {
       <div class="setting-rows" id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
     <div class="card" data-settings-advanced hidden><div class="setting-rows">
+      ${proj.coordinator ? `<div class="setting-row"><span class="setting-label">Co-ordinator project ${policyTip(COORDINATOR_PROJECT_TIP)}</span>
+        <span class="setting-value setting-muted">Permanent</span></div>` : `
       <div class="setting-row" data-settings-access="project" data-unsaved hidden><span class="setting-label">Name ${policyTip('Use / to put the project in folders, e.g. Clients/Website.')}</span>
         <span class="setting-value"><input id="project-name" class="setting-input" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders"></span>
         <span class="setting-actions"><button class="btn sm primary" id="rename-project" data-unsaved-save>Save</button></span></div>
@@ -22268,7 +22314,7 @@ function settingsView(proj) {
         <span class="setting-actions"><button class="btn sm" id="move-project">Move…</button></span></div>
       <div class="setting-row danger" data-settings-access="projectDelete" hidden><span class="setting-label">Delete project ${policyTip('Removes the project and all its tasks.')}</span>
         <span class="setting-value setting-muted">Permanent</span>
-        <span class="setting-actions"><button class="btn sm danger" id="delete-project">Delete…</button></span></div>
+        <span class="setting-actions"><button class="btn sm danger" id="delete-project">Delete…</button></span></div>`}
     </div></div>
     <div class="card" id="project-experimental"><div class="section-h">Experimental</div><div id="project-avatar-settings">Loading…</div></div>
     </div></div></div>`;
@@ -30519,6 +30565,7 @@ function allCommands() {
   // ⌘F finds in the conversation; pressed again in its box, the browser's own find.
   add({ id: 'task.find', title: 'Find in conversation', keybinding: 'meta+f', group: 'Task', help: false,
     available: !!(S.selected && S.view && $('#find-in-conversation')) && document.activeElement?.id !== 'ck-find-input', run: () => openConversationSearch() });
+  add({ id: 'task.desktop', title: 'Open the desktop', keybinding: 'd', group: 'Task', help: false, available: !!(S.selected && S.view?.worldDesktop && $('#desktop-open')), run: () => openTaskDesktop() });
   add({ id: 'task.terminal', title: 'Terminal / conversation', keybinding: 't', group: 'Task', help: false, available: !!(S.selected && S.view && $('#tp-rail [data-open-terminal]:not(:disabled)')), run: () => toggleTaskTerminal() });
   // { / } also walk the settings rail's panes (project or organization settings).
   const onSettings = ['settings', 'organization', 'global'].includes(S.tab) && !S.selected;
