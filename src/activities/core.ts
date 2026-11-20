@@ -65,7 +65,7 @@ import { FOLLOW_UP_JOURNAL_TYPES, followUpMark } from './follow-up-wakes.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
-import { jobStatuses, startJob, startJobWaiter, stopJobs, describeJobs } from '../world/jobs.js';
+import { jobStatuses, listJobs, startJob, startJobWaiter, stopJobs, describeJobs } from '../world/jobs.js';
 import { autoResolve as runAutoResolve } from '../resolve/cases.js';
 import { reachesTavya } from '../world/tavya-reach.js';
 import { KarmaxBus } from '../contrib/bus.js';
@@ -2050,6 +2050,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (!(await valid())) return;
       const before = await parkingTrace.measure('lifecycle.status', () => worlds.status(waitingWorld));
       if (!(await valid())) return;
+      // A wait for a model login comes between the end of the agent's pause
+      // and its next turn: nobody chose it, and the jobs that pause watched
+      // (pause refuses to leave any unwatched) are still the agent's work. A
+      // park would stop them on a VM and freeze them in a sandbox (rw-data#3,
+      // 2026-11-19: every resume during a quota hold rebooted the machine and
+      // killed the collection jobs). The world parks at a later wait instead.
+      if (before === 'ready' && view.waitingFor?.kind === 'account') {
+        const running = await parkingTrace.measure('lifecycle.running-jobs', async () => {
+          try {
+            const world = await openWorld(waitingWorld, taskId);
+            return (await jobStatuses(world, await listJobs(world))).filter(job => job.state === 'running').map(job => job.id);
+          } catch { return []; } // Unreadable: park as before rather than keep a broken world up.
+        });
+        if (running.length) {
+          await worldEvent('world.park-deferred', { reason: 'jobs-running', jobs: running });
+          return;
+        }
+        if (!(await valid())) return;
+      }
       if (before === 'ready') {
         if (deps.checkpoints) {
           try {
