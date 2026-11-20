@@ -1,6 +1,6 @@
 import { hostedCloneCredential, isHostedRepository } from './hosted-git.js';
 import { isAnyProvider, machineShape, normalizeComputer } from '../domain/computer.js';
-import { providerLabel } from '../domain/computer-limits.js';
+import { diskHolding, providerLabel } from '../domain/computer-limits.js';
 import { BRAND } from '../domain/brand.js';
 import { taskProvider } from './task-provider.js';
 import * as __asyncCollections from '../util/async-collections.js';
@@ -29,8 +29,14 @@ import { ChunkedCheckpointStore, CheckpointRefusedError, formatBytes, type Captu
 import { transferResourceChunk } from './resource-transfer.js';
 import { isPullRequestView, proposalCheckouts } from './pr-view.js';
 import { reachesTavya } from './tavya-reach.js';
+import { setupDataNeed } from './data-disk.js';
 
 import type { PortableDelta } from './checkpoint-encoding.js';
+
+/** The resource versions a world restored from `checkpoint` gets: those it held. */
+const checkpointRevisions = (checkpoint: WorldCheckpoint): Record<string, string> =>
+  Object.fromEntries((checkpoint.resources ?? []).map((resource) => [resource.attachmentId, resource.revisionId]));
+
 const gunzip = promisify(zlib.gunzip);
 /** Legacy whole-document checkpoints (KMX1) remain readable up to this size. */
 const MAX_CHECKPOINT_JSON_BYTES = 192 * 1024 * 1024;
@@ -324,8 +330,9 @@ export class WorldCheckpointService {
     if (!isAnyProvider(config.worldProvider)) return undefined;
     const organizationId = project.organizationId;
     const tavyaNeed = await reachesTavya(this.store, checkpoint!.projectId);
+    const dataNeed = await setupDataNeed(this.store, checkpoint!.projectId, checkpointRevisions(checkpoint!));
     const route = await this.router!.route(organizationId, config, handle.kind, { taskId: handle.id, worldId: handle.id },
-      tavyaNeed ? { reachesTavya: tavyaNeed } : {});
+      { ...(tavyaNeed ? { reachesTavya: tavyaNeed } : {}), ...(dataNeed ? { holdsData: dataNeed } : {}) });
     const { value: restored } = await this.router!.run(organizationId, route,
       (candidate, reason) => this.restore(checkpointId, candidate.provider as WorldKind, { ...ambientActivityHooks(), routed: reason }),
       (decision) => this.store.appendEvent({ taskId: handle.id, type: 'world.routed', ts: Date.now(),
@@ -408,8 +415,14 @@ export class WorldCheckpointService {
     const repositories = (await __asyncCollections.map(checkpoint.repos, async (repo, index) => (await this.store.getRepository(repo.repositoryId))
       ?? organizationRepositories.find((candidate) => sameRepository(candidate.sshUrl, sources[index]!))));
     const selected = provider ?? executionConfig.worldProvider ?? 'worktree';
+    const remote = this.worlds.get(selected).capabilities?.remote === true;
+    // A disk that holds the project data it restores (data-disk.ts), as createWorld asks.
+    const revisions = checkpointRevisions(checkpoint);
+    const dataNeed = remote ? await setupDataNeed(this.store, checkpoint.projectId, revisions) : undefined;
+    const diskGb = diskHolding(selected, executionConfig.resources?.diskGb, dataNeed?.diskGb);
+    const resources = diskGb === executionConfig.resources?.diskGb ? executionConfig.resources : { ...executionConfig.resources, diskGb };
     const environment = (await selectProjectEnvironment(this.store, checkpoint.projectId, selected,
-      executionConfig.environment, checkpoint.environment, executionConfig.resources));
+      executionConfig.environment, checkpoint.environment, resources));
     const primary = checkpoint.repos[0];
     // An idle checkpoint may never have published its task refs, which a fresh
     // remote clone cannot fetch: provision it from base, then check out each
@@ -449,7 +462,6 @@ export class WorldCheckpointService {
     // activities/core.ts do. Without the heartbeat a saturated pool blocks past the
     // activity heartbeat timeout; without the signal the killed activity strands a
     // `queued` lease row that nothing ever releases, permanently eating capacity.
-    const remote = this.worlds.get(selected).capabilities?.remote === true;
     const hooks = options ?? ambientActivityHooks();
     // After the generation it replaces, which may be newer than the checkpoint
     // (task #552: a resize restored generation 1's checkpoint as generation 2,
@@ -464,7 +476,7 @@ export class WorldCheckpointService {
     const acquired = remote
       ? await this.runners.acquire({ project, taskId: checkpoint.worldId, worldId: checkpoint.worldId,
         provider: selected, priority: Number((await this.store.getTask(checkpoint.worldId))?.params.priority ?? 0),
-        resources: executionConfig.resources,
+        resources,
         signal: hooks.signal, heartbeat: hooks.heartbeat, waitUntil: hooks.waitUntil ?? ambientActivityHooks().waitUntil })
       : undefined;
     let world: World;
@@ -486,7 +498,7 @@ export class WorldCheckpointService {
         })), base: project.config.defaultBase ?? 'main', target: project.config.defaultTarget,
         branch: pinnedHeads ? undefined : primary?.branch, ...(cloneCredentials ? { gitCredentials: { httpsTokens: cloneCredentials, ...(hostedGitBase ? { hostedGitBase } : {}) } } : {}),
         ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
-        network: executionConfig.network, environment: environment.environment, resources: executionConfig.resources });
+        network: executionConfig.network, environment: environment.environment, resources });
     } catch (error) {
       if (acquired) (await this.runners.release(acquired.leaseId, selected));
       throw error;
@@ -525,7 +537,6 @@ export class WorldCheckpointService {
       const rootWorkdir = previousHandle?.workdir !== undefined && previousHandle.workdir === previousHandle.root;
       world.handle.workdir = developmentRepos.length === 1 && !rootWorkdir ? developmentRepos[0]!.root : world.handle.root;
       if (this.resources) {
-        const revisions = Object.fromEntries((checkpoint.resources ?? []).map((resource) => [resource.attachmentId, resource.revisionId]));
         world.handle = await this.resources.materialize(checkpoint.projectId, checkpoint.worldId, world,
           generation, revisions);
       }

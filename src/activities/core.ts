@@ -69,6 +69,7 @@ import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
 import { jobStatuses, listJobs, startJob, startJobWaiter, stopJobs, describeJobs } from '../world/jobs.js';
 import { autoResolve as runAutoResolve } from '../resolve/cases.js';
 import { reachesTavya } from '../world/tavya-reach.js';
+import { setupDataNeed } from '../world/data-disk.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import type { AuthorizationService } from '../platform/authorization.js';
@@ -129,7 +130,7 @@ import { publicShare, publicConversationHtml } from '../gateway/conversation-sha
 import { hostHoldsSession, remoteAgentHomeRelative, isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome, readRemoteImport, RemoteAgentCliUnavailable } from '../agent/remote-process.js';
 import { checkWorldDisk, diskNotice, diskRatio, diskWasFull, DISK_REARM_RATIO, DISK_WARN_RATIO, isDiskFullMessage, largestWorldPaths,
   outOfDiskMessage, worldUsage, type DiskCheck } from '../world/disk.js';
-import { computerLimits } from '../domain/computer-limits.js';
+import { ComputerUnfit, computerLimits, diskHolding } from '../domain/computer-limits.js';
 import { materializeFileAttachments } from '../agent/files.js';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -244,6 +245,19 @@ function capacityFailure(error: unknown): ApplicationFailure | undefined {
       return ApplicationFailure.create({ message, type: 'world-capacity', nonRetryable: !queued, cause: cause instanceof Error ? cause : undefined });
     }
   }
+  return undefined;
+}
+
+/** A computer that can never serve its world (ComputerUnfit, anywhere in the
+ * cause chain: too small a disk for the project's data) as `computer-unfit`:
+ * retrying on it only repeats the failure, so it stops at once for a person to
+ * choose another computer, and is not reported as tavya's error
+ * (domain/escalation.ts isComputerChoiceEscalation). */
+function unfitFailure(error: unknown): ApplicationFailure | undefined {
+  for (let cause = error, depth = 0; cause && depth < 8; cause = (cause as { cause?: unknown }).cause, depth++)
+    if (cause instanceof ComputerUnfit || (cause as { name?: string }).name === 'ComputerUnfit')
+      return ApplicationFailure.create({ message: (cause as Error).message, type: 'computer-unfit', nonRetryable: true,
+        cause: cause instanceof Error ? cause : undefined });
   return undefined;
 }
 
@@ -726,7 +740,8 @@ function reportEscalation(task: { id: string; projectId: string; params: Record<
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
   /** What a running agent turn holds until it ends, however it ends. */
-  const turnHolds = new AsyncLocalStorage<Array<() => void>>();
+  /** What a turn holds until it ends, each told the turn's failure if it failed. */
+  const turnHolds = new AsyncLocalStorage<Array<(failure?: unknown) => void>>();
   const loginSandboxes = deps.loginSandboxes ?? new LoginSandboxes({ store, worlds,
     ...(deps.providerConnections?.list && deps.providerConnections.managedConnections
       ? { connections: deps.providerConnections as RouterConnections } : {}) });
@@ -2483,6 +2498,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ...(developmentSources.length > 0 && wikiRoot && (!remote || wikiRepository) ? [wikiRoot] : []),
       ];
       const executionConfig = project ? (await store.effectiveTaskConfig(project, args.taskId)) : undefined;
+      // The resource versions setup restores: a sub-task starts from its
+      // parent's copy of each writable resource, saved when it was created
+      // (prepareChildTask), as it starts from its branch; a fork from its source's.
+      const setupRevisions = projectId ? { ...await parentResourceRevisions(projectId, args.taskId),
+        ...Object.fromEntries((forkCheckpoint?.resources ?? []).map((resource) => [resource.attachmentId, resource.revisionId])) } : {};
+      // What they take on its disk (data-disk.ts): a named computer that can't
+      // hold them is refused before any machine is made, "Any" passes over
+      // accounts that can't, and the machine made is asked for a disk that
+      // holds them. Restoring 31 GB onto E2B's 22 GB filled the disk three
+      // times over before a person heard of it (tavya-error 3b4ed193f5ec0941).
+      const dataNeed = projectId && remote ? await setupDataNeed(store, projectId, setupRevisions) : undefined;
+      if (dataNeed && !routed && deps.providerConnections) {
+        try { await deps.providerConnections.assertFits(organizationId, kind, { holdsData: dataNeed }); }
+        catch (error) { throw unfitFailure(error) ?? error; }
+      }
+      /** The task's Computer on `kind`, its disk large enough for the data. */
+      const sizedFor = (kind: WorldKind): typeof executionConfig => {
+        const diskGb = diskHolding(kind, executionConfig?.resources?.diskGb, dataNeed?.diskGb);
+        return !executionConfig || diskGb === executionConfig.resources?.diskGb ? executionConfig
+          : { ...executionConfig, resources: { ...executionConfig.resources, diskGb } };
+      };
       const githubIsAuthority = remotePolicyOf(executionConfig) === 'pr';
       // Remote providers always need a network transport. Local PR worlds also
       // resolve one when available so GitHub-backed sources can fork from the
@@ -2631,14 +2667,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       const provisionOn = async (kind: WorldKind, routedReason?: string): Promise<WorldHandle> => {
         startCancellationHeartbeat(kind);
+        const sized = sizedFor(kind);
         const environmentSelection = projectId
-          ? (await selectProjectEnvironment(store, projectId, kind, executionConfig?.environment, forkCheckpoint?.environment, executionConfig?.resources))
+          ? (await selectProjectEnvironment(store, projectId, kind, executionConfig?.environment, forkCheckpoint?.environment, sized?.resources))
           : { built: false, environment: executionConfig?.environment };
         let acquired: { leaseId: string; runnerPoolId: string } | undefined;
         if (remote && project && deps.runners) {
           try {
             acquired = await timed('world.runner.wait', async () => deps.runners!.acquire({ project, taskId: args.taskId, worldId: args.taskId, provider: kind,
-              resources: executionConfig?.resources, work: true, waitUntil: ctx ? Math.min(leaseWaitDeadline(ctx.info) ?? Infinity, clock.leaseWaitUntil) : undefined,
+              resources: sized?.resources, work: true, waitUntil: ctx ? Math.min(leaseWaitDeadline(ctx.info) ?? Infinity, clock.leaseWaitUntil) : undefined,
               priority: Number((await store.getTask(args.taskId))?.params.priority ?? 0), signal: activitySignal,
               heartbeat }));
           } catch (error) {
@@ -2676,7 +2713,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               ...(Object.keys(repositoryOrigins).length ? { repositoryOrigins } : {}),
               network: executionConfig?.network,
               environment: environmentSelection.environment,
-              resources: executionConfig?.resources,
+              resources: sized?.resources,
             });
           } catch (error) {
             if (acquired) (await deps.runners?.release(acquired.leaseId, kind));
@@ -2742,13 +2779,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   'The source checkpoint excludes unmanaged Git-ignored files. Recreate caches or attach required data as a project resource.'];
             }
             if (projectId && deps.resources) {
-              // A sub-task starts from its parent's copy of each writable resource,
-              // saved when it was created (prepareChildTask), as it starts from its branch.
-              const revisions = { ...await parentResourceRevisions(projectId, args.taskId),
-                ...Object.fromEntries((forkCheckpoint?.resources ?? [])
-                  .map((resource) => [resource.attachmentId, resource.revisionId])) };
               activitySignal?.throwIfAborted();
-              world.handle = await timed('world.resources', () => deps.resources!.materialize(projectId, args.taskId, world, generation, revisions,
+              world.handle = await timed('world.resources', () => deps.resources!.materialize(projectId, args.taskId, world, generation, setupRevisions,
                 { signal: activitySignal, clock }));
             }
             if (projectId) {
@@ -2766,6 +2798,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
             // The machine this world was made as: the lifecycle sweep resizes it
             // when the task's Computer later asks for another (src/world/runners.ts).
+            // The Computer as asked, not as sized for the data: the sweep must
+            // not take a disk raised for the data for a change of size.
             if (remote && executionConfig) world.handle.meta = { ...world.handle.meta, computer: machineShape(executionConfig) };
             // Where "Any" put it and why: the task page and the World prompt say so.
             if (routedReason) world.handle.meta = { ...world.handle.meta, routed: routedReason };
@@ -2813,7 +2847,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         } catch (error) {
           if (capacityCause(error)?.name === 'ProviderCapacityFull' && remote) {
             const funding = await deps.providerConnections?.funding?.(organizationId, kind).catch(() => undefined);
-            const shape = machineShape(executionConfig);
+            const shape = machineShape(sizedFor(kind));
             await enqueue(store, { taskId: args.taskId, organizationId, account: accountKey(funding === 'managed' ? MANAGED_COMPUTE : organizationId, kind),
               ...(shape.cpu !== undefined ? { cpu: shape.cpu } : {}), ...(shape.diskGb !== undefined ? { diskGb: shape.diskGb } : {}) }).catch(() => undefined);
           }
@@ -2826,7 +2860,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ? new ComputeRouter(store, deps.providerConnections as RouterConnections) : undefined;
       if (!router || !project) throw new Error('provider "Any" needs a project and connected computers');
       const route = await router.route(organizationId, executionConfig, undefined, { taskId: args.taskId, worldId: args.taskId },
-        tavyaNeed ? { reachesTavya: tavyaNeed } : {});
+        { ...(tavyaNeed ? { reachesTavya: tavyaNeed } : {}), ...(dataNeed ? { holdsData: dataNeed } : {}) });
       try {
         return (await router.run(organizationId, route, (candidate, reason) => provisionOn(candidate.provider as WorldKind, reason),
           async (decision) => { await record(args.taskId, 'world.routed', { ...decision }); })).value;
@@ -2838,7 +2872,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       } catch (error) {
         const expired = clock.expired;
         if (expired) throw ApplicationFailure.create({ message: expired.message, type: 'world-infra', nonRetryable: false, cause: expired });
-        throw error;
+        // A computer that can never hold the project's data (the router found
+        // none, or the disk filled while restoring): no retry makes it fit.
+        throw unfitFailure(error) ?? error;
       } finally { stopCancellationHeartbeat(); clock.dispose(); }
     },
 
@@ -3665,9 +3701,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           return opened;
         });
         loginSandboxOpening.catch(() => undefined);
-        // Whatever way the turn ends, its sandbox stays for the next one and its slot is renewed no more.
+        // Whatever way the turn ends, its sandbox stays for the next one and its slot is renewed no more;
+        // one the failed turn lost is forgotten, so the retry gets another (tavya-error 392322d5fc85238d).
         const opening = loginSandboxOpening;
-        turnHolds.getStore()?.push(() => { void opening.then((opened) => opened.settle()).catch(() => undefined); });
+        turnHolds.getStore()?.push((failure) => { void opening.then((opened) => opened.settle(failure)).catch(() => undefined); });
       }
 
       // The sandbox bootstrap, and a native agent's home and browser tools, are
@@ -4468,11 +4505,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (token) (await deps.tokens?.revoke(token));
         // A provider error can quote the agent's output; it reaches workflow history.
         if (err instanceof Error) err.message = secrets.scrub(err.message);
-        // A login sandbox the provider no longer has (killed, expired) is
-        // forgotten, so the retry makes a new one instead of failing on the
-        // same dead sandbox every attempt (production 2026-11-20).
-        if (loginSandboxOpening && !signal?.aborted)
-          await loginSandboxOpening.then((opened) => opened.lost()).catch(() => false);
         // Its compute hold ran out (watchComputeHold): keep the stopped session,
         // so the turn the Out of compute wait starts once there is credit
         // continues it rather than starting this one over.
@@ -7904,9 +7936,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   };
   const agentTurn = activities.runAgentTurn;
   activities.runAgentTurn = async (args) => {
-    const holds: Array<() => void> = [];
+    const holds: Array<(failure?: unknown) => void> = [];
+    let failure: unknown;
     try { return await turnHolds.run(holds, () => agentTurn(args)); }
-    finally { for (const release of holds) release(); }
+    catch (error) { failure = error ?? new Error('agent turn failed'); throw error; }
+    finally { for (const release of holds) release(failure); }
   };
   return activities;
 }

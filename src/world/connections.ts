@@ -1,7 +1,7 @@
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
 import { isAnyProvider, isComputerless, type MachineShape } from '../domain/computer.js';
-import { FREE_COMPUTER_HINT, accountFeatures, assertComputerFits, capLimits, computerLimits, type ComputerFeatures, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
+import { FREE_COMPUTER_HINT, accountFeatures, assertComputerFits, capLimits, computerLimits, type ComputerFeatures, type DataDiskNeed, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
 import { FREE_COMPUTER } from '../domain/entitlements.js';
 import type { WorldProviderConnection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
@@ -388,7 +388,9 @@ const defaultProbes: ProviderProbes = {
 
 /** What `assertFits` judges: the sizes, the outbound network asked for, and
  * what its world must fetch from tavya itself (`reachesTavya`: tavya-reach.ts). */
-export type ComputerFitSpec = MachineShape & { network?: { unrestricted?: boolean; basic?: boolean }; reachesTavya?: string };
+export type ComputerFitSpec = MachineShape & { network?: { unrestricted?: boolean; basic?: boolean }; reachesTavya?: string;
+  /** The project data its setup restores (world/data-disk.ts). */
+  holdsData?: DataDiskNeed };
 
 /** Accounts whose budget changes with nobody re-testing them: Agent37's
  * memory limit rises with the workspace's lifetime top-ups (its tier). */
