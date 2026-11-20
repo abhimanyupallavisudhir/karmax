@@ -12918,7 +12918,7 @@ const ARTIFACT_TEXT_PREVIEW_BYTES = 10 * 1024 * 1024;
 // and seeks), never through a popup the browser could block after an await.
 // The URL is served under a `sandbox` policy, so an HTML page in the frame
 // runs with an opaque origin, as it would in its own tab.
-async function showArtifactViewer({ name, url, view, text, refresh, gallery, links: places }) {
+async function showArtifactViewer({ name, url, view, text, images, refresh, gallery, links: places }) {
   const previousFocus = document.activeElement;
   const dialog = document.createElement('dialog');
   dialog.setAttribute('aria-labelledby', 'artifact-reader-title');
@@ -12947,7 +12947,8 @@ async function showArtifactViewer({ name, url, view, text, refresh, gallery, lin
       content.innerHTML = `<p class="artifact-error">This file can’t be shown here. Download it instead.</p>`;
     } else if (item.view === 'markdown') {
       content.classList.add('msg-text', 'md');
-      mountMarkdownSurface(content, (math) => renderMarkdown(item.text, { math }));
+      // Its images sit beside it (`item.images` says where); without that, their alt text.
+      mountMarkdownSurface(content, (math) => renderMarkdown(item.text, { math }), (body) => FV.resolveImages(body, item.images || (() => null)));
       wireTexToggles(dialog);
     } else if (item.view === 'text') {
       const pre = document.createElement('pre');
@@ -13000,7 +13001,7 @@ async function showArtifactViewer({ name, url, view, text, refresh, gallery, lin
       mount(item);
     } catch (error) { toast(error.message, true); }
   };
-  mount({ name, url, view, text, refresh, links: places });
+  mount({ name, url, view, text, images, refresh, links: places });
   dialog.querySelectorAll('[data-step]').forEach((button) => button.addEventListener('click', () => step(Number(button.dataset.step))));
   dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());
   // A link to somewhere else in the console (a gallery file's task, its place in Files) leaves the viewer.
@@ -13062,7 +13063,8 @@ function downloadHref(url) {
 // What the viewer needs to show what `POST /review-action` resolved
 // (`{ url, name, mediaType, bytes? }`, a signed URL that needs no header):
 // `view: null` means it is downloaded instead. Failures throw, for a toast.
-async function artifactItem(resolved, refresh) {
+// `images(src)` is where a Markdown file's image `src` is read from (null: its alt text).
+async function artifactItem(resolved, refresh, images) {
   const name = resolved.name || 'Attachment';
   const view = artifactView(resolved.mediaType, name);
   const download = { name, url: resolved.url, view: null };
@@ -13074,11 +13076,11 @@ async function artifactItem(resolved, refresh) {
     res.body?.cancel().catch(() => {});
     return download;
   }
-  return { name, url: resolved.url, view, text: await res.text() };
+  return { name, url: resolved.url, view, text: await res.text(), ...(view === 'markdown' && images ? { images } : {}) };
 }
 
-async function openArtifact(resolved, refresh) {
-  const item = await artifactItem(resolved, refresh);
+async function openArtifact(resolved, refresh, images) {
+  const item = await artifactItem(resolved, refresh, images);
   return item.view ? showArtifactViewer(item) : downloadArtifact(item);
 }
 // Files the Review gallery shows (web pages stay links).
@@ -13120,14 +13122,25 @@ function loadReviewThumbnails(v) {
   });
 }
 
+// A Markdown file a Review attached shows the images beside it in its task's
+// world (a `/…` one is absolute there), read as its agent would cite them.
+function reviewMarkdownImages(v, target) {
+  const folder = String(target || '').replace(/[^/]*$/, '');
+  return (src) => {
+    const projectId = taskProjectId(v);
+    return projectId ? citedFileRaw(projectId, v.num ?? v.taskId, src.startsWith('/') ? src : folder + src) : null;
+  };
+}
+
 // The viewer over the Review's files, from the one at `index`: ← and → (or the
 // arrow keys) step through every open action in order.
 async function openReviewGallery(v, index) {
   const order = (v.reviewInfo?.actions || []).map((action, i) => (isReviewTile(action) ? i : -1)).filter((i) => i >= 0);
   const refresh = (i) => () => resolveReviewArtifact(v, i, true);
+  const images = (i) => reviewMarkdownImages(v, v.reviewInfo?.actions?.[i]?.target);
   // Only one file: what it can't show, the browser downloads.
-  if (order.length < 2) return openArtifact(await resolveReviewArtifact(v, index), refresh(index));
-  const load = async (i) => artifactItem(await resolveReviewArtifact(v, i), refresh(i));
+  if (order.length < 2) return openArtifact(await resolveReviewArtifact(v, index), refresh(index), images(index));
+  const load = async (i) => artifactItem(await resolveReviewArtifact(v, i), refresh(i), images(i));
   return showArtifactViewer({ ...(await load(index)), gallery: { order, at: order.indexOf(index), load } });
 }
 
@@ -14824,13 +14837,22 @@ function decodeMarkdownAttribute(value) {
   }[entity]));
 }
 
+// A file as a task's agent cites it (absolute in its world, or relative to its
+// working folder), read through Files' view of that task.
+function citedFileRaw(projectId, task, cited) {
+  return `/api/projects/${encodeURIComponent(projectId)}/files/raw?task=${encodeURIComponent(task)}&cited=1&path=${encodeURIComponent(cited)}`;
+}
+function taskProjectId(v) {
+  return v?.taskId ? taskRecord(v.taskId)?.projectId || v.projectId : null;
+}
+
 // Markdown mode renders anchors itself; replace in-world targets afterwards.
 // Relative links ride in data-md-local, while absolute links retain their href.
 function annotateWorldFileLinks(html, v = S.view) {
   // An image the agent cites by path is read from its task's world (Files' task view).
-  const projectId = v?.taskId ? taskRecord(v.taskId)?.projectId || v.projectId : null;
+  const projectId = taskProjectId(v);
   if (projectId) html = String(html).replace(/<img data-md-src="([^"]*)"/g, (whole, src) =>
-    `<img src="${esc(`/api/projects/${encodeURIComponent(projectId)}/files/raw?task=${encodeURIComponent(v.num ?? v.taskId)}&cited=1&path=${encodeURIComponent(decodeMarkdownAttribute(src))}`)}" data-md-src="${src}"`);
+    `<img src="${esc(citedFileRaw(projectId, v.num ?? v.taskId, decodeMarkdownAttribute(src)))}" data-md-src="${src}"`);
   return String(html).replace(/<a href="([^"]*)"([^>]*)>/g, (anchor, href, attrs) => {
     const local = attrs.match(/\sdata-md-local="([^"]*)"/);
     const fileUrl = worldFileHref(decodeMarkdownAttribute(local ? local[1] : href), v);
@@ -21120,6 +21142,18 @@ function resolveGalleryArtifact(item, fresh = false) {
   return resolveReviewArtifact({ taskId: item.taskId, reviewInfo: { actions } }, item.index, fresh);
 }
 
+// A gallery Markdown file's images sit beside it: in the repository (a `/…`
+// one from its root, as on GitHub), or in its task's world.
+function galleryMarkdownImages(item) {
+  const task = item.num ?? item.taskId;
+  const repository = item.source === 'repository';
+  return (src) => {
+    if (!repository && src.startsWith('/')) return citedFileRaw(item.projectId, task, src);
+    const target = FV.resolve(src.startsWith('/') ? FV.parts(item.path)[0] || '' : FV.parent(item.path), src.replace(/^\/+/, ''));
+    return target === null ? null : filesApi(item.projectId, target, true, false, repository ? '' : `task:${task}`);
+  };
+}
+
 // Fill image and video tiles as they come into view.
 function loadArtifactThumbnails(grid, items) {
   const slots = [...grid.querySelectorAll('.review-tile-media[data-thumb]:not([data-thumbed])')];
@@ -21152,7 +21186,7 @@ async function openArtifactGallery(items, at) {
   const load = async (i) => {
     const item = items[i];
     const resolved = await resolveGalleryArtifact(item);
-    return { ...(await artifactItem(resolved, () => resolveGalleryArtifact(item, true))), links: artifactGalleryLinks(item) };
+    return { ...(await artifactItem(resolved, () => resolveGalleryArtifact(item, true), galleryMarkdownImages(item))), links: artifactGalleryLinks(item) };
   };
   const first = await load(at);
   if (items.length < 2 && !first.view) return downloadArtifact(first);
