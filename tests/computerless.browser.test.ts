@@ -208,6 +208,10 @@ describe('a task without a computer, in the console', () => {
     const mic = dialog.locator('[data-mic]');
     await mic.waitFor();
     await mic.click();
+    // Listening, the box says how to stop by voice; so does the mic's tooltip.
+    expect(await dialog.locator('textarea').getAttribute('placeholder')).toBe('Listening… say “stop listening” to end');
+    expect(await mic.getAttribute('title')).toMatch(/· or say “stop listening”$/);
+    if (process.env.KARMAX_SHOTS) await dialog.screenshot({ path: path.join(process.env.KARMAX_SHOTS, 'ask-listening.png') });
     await page.evaluate(() => (globalThis as any).__speech.at(-1).onresult({ results: [Object.assign([{ transcript: 'what waits on me' }], { isFinal: true })] }));
     expect(await dialog.locator('textarea').inputValue()).toBe('what waits on me');
     if (process.env.KARMAX_SHOTS) await dialog.screenshot({ path: path.join(process.env.KARMAX_SHOTS, 'ask-dictation.png') });
@@ -218,6 +222,10 @@ describe('a task without a computer, in the console', () => {
     await page.keyboard.press('ControlOrMeta+Shift+S');
     await expect.poll(() => mic.getAttribute('aria-pressed')).toBe('true');
     expect(await page.evaluate(() => (globalThis as any).__speech.length)).toBe(2);
+    // Saying the stop ends it here too, and is not typed.
+    await page.evaluate(() => (globalThis as any).__speech.at(-1).onresult({ results: [Object.assign([{ transcript: 'today stop listening' }], { isFinal: true })] }));
+    expect(await mic.getAttribute('aria-pressed')).toBe('false');
+    expect(await dialog.locator('textarea').inputValue()).toBe('what waits on me today');
     expect(errors).toEqual([]);
     await context.close();
   });
