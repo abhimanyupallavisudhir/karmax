@@ -12075,7 +12075,11 @@ function patchTaskPage(main, html) {
   next?.querySelectorAll('[data-conversation-key]').forEach((row) => { row.conversationMarkup = row.outerHTML; });
   const sameThread = previous && next && previous.dataset.taskId === next.dataset.taskId && previous.dataset.role === next.dataset.role;
   if (sameThread) pairs.push([previous, next]);
-  const retained = retainedTaskNodes(main, template.content, pairs);
+  const composer = retainedComposer(main, template.content);
+  let retained = retainedTaskNodes(main, template.content, composer ? [...pairs, composer] : pairs);
+  // A composer that cannot be kept must not cost the conversation its own retention.
+  if (!retained && composer) retained = retainedTaskNodes(main, template.content, pairs);
+  else if (composer) adoptComposerState(...composer);
   if (!retained) {
     if (previous) window.MathJax?.typesetClear?.([previous]);
     main.replaceChildren(template.content);
@@ -12095,6 +12099,44 @@ function patchTaskPage(main, html) {
     patchChildren(old, fresh, retained.nodes);
   }
   return !!sameThread;
+}
+
+// The message box's text field is kept across every repaint of its conversation:
+// replacing the field being typed in drops a phone's keyboard composition (the
+// word being typed, autocorrect, dictation) and, on iOS, the keyboard itself,
+// even when focus and caret are given back — the page "glitches" with every
+// event of a working agent. Returns [live, fresh]: the live field (inside the
+// wiki-reference shell that wraps it once wired) for the fresh one.
+function retainedComposer(main, fragment) {
+  const freshBox = fragment.querySelector('.followup-box');
+  const fresh = freshBox?.querySelector(':scope > .prompt-field > textarea.followup-input');
+  if (!fresh) return null;
+  const sel = (value) => (window.CSS && CSS.escape ? CSS.escape(value) : value);
+  const oldBox = main.querySelector(`.followup-box[data-task-id="${sel(freshBox.dataset.taskId)}"][data-role="${sel(freshBox.dataset.role)}"]`);
+  const field = oldBox?.querySelector('.followup-input');
+  if (!field) return null;
+  const live = field.parentNode.classList.contains('wiki-ref-editor') ? field.parentNode : field;
+  return live.parentNode?.classList.contains('prompt-field') ? [live, fresh] : null;
+}
+// The kept field takes what the fresh one says about the conversation (who it
+// addresses, whether it can send); its text, caret, height and wiring stay. A
+// draft changed by code rather than typing (Unsend, from its button) is the one
+// text it takes: never while the field is being typed in.
+function adoptComposerState(live, fresh) {
+  const field = live.matches('textarea') ? live : live.querySelector('textarea');
+  const box = fresh.closest('.followup-box');
+  const draft = S.followupDrafts?.[`${box.dataset.taskId}/${box.dataset.role}`] ?? '';
+  if (field.value !== draft && document.activeElement !== field) {
+    field.value = draft;
+    field.dispatchEvent(new Event('input', { bubbles: true })); // its height and highlighting follow
+  }
+  const listening = S.dictation?.key === `followup:${box.dataset.taskId}/${box.dataset.role}`;
+  if (listening) S.dictation.placeholder = fresh.placeholder; // shown again once it stops
+  else if (field.placeholder !== fresh.placeholder) field.placeholder = fresh.placeholder;
+  if (field.disabled !== fresh.disabled) field.disabled = fresh.disabled;
+  if (field.getAttribute('rows') !== fresh.getAttribute('rows')) {
+    if (fresh.hasAttribute('rows')) field.setAttribute('rows', fresh.getAttribute('rows')); else field.removeAttribute('rows');
+  }
 }
 
 // Map each fresh node to the live node it keeps: the retained nodes, and the
@@ -12537,6 +12579,9 @@ function restoreFollowupFocus(root, st) {
   const box = root.querySelector(`.followup-box[data-role="${window.CSS && CSS.escape ? CSS.escape(st.role) : st.role}"]`);
   const el = box && box.querySelector('.followup-input');
   if (!el || el.disabled) return;
+  // The field was kept (retainedComposer) and never lost focus: touching its
+  // caret would end a phone keyboard's composition of the word being typed.
+  if (document.activeElement === el) return;
   // Only carry over the value if the box was cleared by the re-render (a sent
   // follow-up empties it); never clobber text the box already holds.
   if (st.value && !el.value) el.value = st.value;
@@ -14251,7 +14296,7 @@ function conversationPane(v, t) {
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
   const pending = pendingMessagesHtml(v, t, entries, canFollowUp);
   const fu = canFollowUp
-    ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
+    ? `<div class="ck-compose"><div class="followup-box" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}">
         <div class="prompt-field">
           <textarea class="followup-input"${narrowViewport() ? ' rows="1"' : ''} placeholder="${followupPlaceholder(v, t, agentName)}" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
           ${t.shared ? newAgentFormsHtml(v, `${v.taskId}/${t.role}`) : ''}
@@ -17188,27 +17233,33 @@ function wireActions(v) {
 }
 
 function wireFollowupSizing(ta, key) {
-  let appliedHeight = ta.style.height;
-  const remember = () => {
-    if (ta.style.height !== appliedHeight) {
-      S.followupHeights[key] = parseFloat(ta.style.height) || 0;
+  // A field kept across repaints (retainedComposer) is sized and wired once;
+  // each repaint only watches its width again (patchTaskPage disposed the watch).
+  if (!ta.sizing) {
+    let appliedHeight = ta.style.height;
+    const remember = () => {
+      if (ta.style.height !== appliedHeight) {
+        S.followupHeights[key] = parseFloat(ta.style.height) || 0;
+        appliedHeight = ta.style.height;
+      }
+    };
+    const grow = () => {
+      remember();
+      const scrollTop = ta.scrollTop;
+      // Measure at the natural height (two rows; one on a phone) so deleting text shrinks the box.
+      ta.style.height = 'auto';
+      const style = getComputedStyle(ta);
+      const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+      const automaticLimit = 12 * parseFloat(style.lineHeight) + padding;
+      ta.style.height = `${Math.max(S.followupHeights[key] || 0, Math.min(ta.scrollHeight, automaticLimit))}px`;
       appliedHeight = ta.style.height;
-    }
-  };
-  const grow = () => {
-    remember();
-    const scrollTop = ta.scrollTop;
-    // Measure at the natural height (two rows; one on a phone) so deleting text shrinks the box.
-    ta.style.height = 'auto';
-    const style = getComputedStyle(ta);
-    const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
-    const automaticLimit = 12 * parseFloat(style.lineHeight) + padding;
-    ta.style.height = `${Math.max(S.followupHeights[key] || 0, Math.min(ta.scrollHeight, automaticLimit))}px`;
-    appliedHeight = ta.style.height;
-    ta.scrollTop = scrollTop;
-  };
-  grow();
-  ta.addEventListener('input', grow);
+      ta.scrollTop = scrollTop;
+    };
+    ta.sizing = { remember, grow };
+    grow();
+    ta.addEventListener('input', grow);
+  }
+  const { remember, grow } = ta.sizing;
   // Wrapping changes on window resize and when entering/leaving full screen.
   // Height-only changes are native manual resizes; don't immediately undo them.
   let width = ta.clientWidth;
@@ -17418,9 +17469,11 @@ function wireNewAgentForms(box, v, key) {
 // A view update rebuilds the box while it is open and refocuses the new one, so
 // the open menu is recorded here and carries over to it, as it was.
 let openAgentMention = null; // { key, owner: the textarea, peopleMode, active }
-function wireAgentMention(ta, box, v, key) {
+function wireAgentMention(ta, box, wiredView, key) {
   if (!ta || ta.dataset.amWired) return;
   ta.dataset.amWired = '1';
+  // The field outlives repaints (retainedComposer): read the task as it is now.
+  const live = () => (S.view?.taskId === wiredView.taskId ? S.view : wiredView);
   let menu = null, items = [], active = 0, token = null, peopleMode = false;
   const close = () => {
     menu?.remove(); menu = null; items = []; token = null; peopleMode = false;
@@ -17433,6 +17486,7 @@ function wireAgentMention(ta, box, v, key) {
     return m ? { start: pos - m[2].length - 1, end: pos, query: m[2] } : null;
   };
   const agentItems = () => {
+    const v = live();
     const pending = Object.keys(followupNewAgents(key));
     const listed = [...(v.participants || []), ...pending.map((k) => ({ key: k, label: participantLabelOf(k, v), state: 'new' }))];
     return listed.map((p, index) => ({ kind: 'agent', index, selector: `agent:${p.key}`, label: p.label, state: p.state }));
@@ -17466,6 +17520,7 @@ function wireAgentMention(ta, box, v, key) {
     if (!item || !token || !ta.isConnected) return close();
     if (item.kind === 'people') { peopleMode = true; active = 0; items = build(); return render(); }
     if (item.kind === 'new') {
+      const v = live();
       const agentKey = nextAgentKeyFor([...(v.participants || []).map((p) => p.key), ...Object.keys(followupNewAgents(key))]);
       const main = v.participants?.find((p) => p.key === 'do')?.spec || v.agents?.do || {};
       followupNewAgents(key)[agentKey] = { provider: main.provider || 'claude', ...(main.model ? { model: main.model } : {}) };
@@ -17611,7 +17666,10 @@ function wireFollowups(v) {
     const key = `${v.taskId}/${role}`;
     const images = (S.followupImages[key] ||= []);
     const files = (S.followupFiles[key] ||= []);
-    ta.addEventListener('input', () => { S.followupDrafts[key] = ta.value; });
+    // The field outlives repaints (retainedComposer): what is wired on it is wired once.
+    const firstWiring = !ta.followupWired;
+    ta.followupWired = true;
+    if (firstWiring) ta.addEventListener('input', () => { S.followupDrafts[key] = ta.value; });
     const chips = box.querySelector('.followup-chips');
     // An upload outlives this render: paint whichever box is on the page when it lands.
     const roleSelector = window.CSS && CSS.escape ? CSS.escape(role) : role;
@@ -17630,6 +17688,8 @@ function wireFollowups(v) {
     wireFollowupSizing(ta, key);
     paint();
     const send = async () => {
+      // What is sent is what the box shows: the mic stops here, not into an emptied box.
+      if (S.dictation?.key === `followup:${key}`) stopDictation();
       const text = ta.value.trim();
       const uploading = pendingAttachments(images).length > 0;
       if (!text && !images.length && !files.length && !uploading) return;
@@ -17685,9 +17745,10 @@ function wireFollowups(v) {
         // would leave the *live* box untouched. Clear the current DOM textarea by
         // a fresh lookup so the box is cleared even in that race.
         const sel = window.CSS && CSS.escape ? CSS.escape(role) : role;
-        const liveTa = $('#main').querySelector(`.followup-box[data-role="${sel}"] .followup-input`);
-        if (liveTa) liveTa.value = '';
-        else if (ta) ta.value = '';
+        const liveTa = $('#main').querySelector(`.followup-box[data-role="${sel}"] .followup-input`) || ta;
+        liveTa.value = '';
+        // The box is kept across repaints (retainedComposer): it shrinks back as if the text were deleted.
+        liveTa.dispatchEvent(new Event('input', { bubbles: true }));
         paint();
         // Sent: hand the keyboard back to the page (u, j/k, …), as Gmail does
         // after a reply; f composes again. The repaint then focuses the thread.
@@ -17704,8 +17765,13 @@ function wireFollowups(v) {
       }
     };
     btn.addEventListener('click', send);
-    // ⌘/Ctrl-Enter sends, matching the rest of the console's compose affordances.
-    ta.addEventListener('keydown', (e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); send(); } });
+    // ⌘/Ctrl-Enter sends, matching the rest of the console's compose affordances:
+    // through the Send on the page now, which a repaint may have replaced.
+    if (firstWiring) ta.addEventListener('keydown', (e) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key !== 'Enter') return;
+      e.preventDefault();
+      ta.closest('.followup-box')?.querySelector('.followup-send')?.click();
+    });
   });
 }
 
@@ -26872,7 +26938,7 @@ function nativePlatform() { return nativeApp() ? window.Capacitor.getPlatform?.(
 // The platform's speech recognizer behind the browser's SpeechRecognition
 // interface, so dictation (toggleDictation) is the same code in a browser and
 // in the app. Android ends it after a pause, like the browser; iOS keeps
-// listening, so a pause after words ends it here.
+// listening, so without `continuous` a pause after words ends it here.
 const NATIVE_SPEECH_PAUSE_MS = 2000;
 function nativeRecognitionClass() {
   const plugin = nativePlugin('SpeechRecognition');
@@ -26945,6 +27011,20 @@ function paintMic(key) {
   button.setAttribute('aria-label', on ? 'Stop dictating' : 'Dictate');
   button.title = commandHint(on ? 'Stop dictating' : 'Dictate', 'compose.voice');
 }
+// Dictation lasts until the person ends it: a tap on the mic, typing, Esc,
+// sending, leaving the page, or DICTATION_SILENCE_MS without a word. A
+// recognizer ends on its own at a pause (Chrome on Android after a breath,
+// Android's own after the end of a sentence); dictation starts the next one,
+// keeping what was heard, so a pause mid-thought does not stop it.
+const DICTATION_SILENCE_MS = 20_000;
+// Chrome on Android repeats earlier words in each result of a continuous
+// session, so there each sentence is a recognizer of its own.
+function continuousDictation() {
+  return nativeApp() || !/Android/i.test(navigator.userAgent || '');
+}
+function joinHeard(...parts) {
+  return parts.reduce((text, part) => (!part ? text : !text || /\s$/.test(text) || /^\s/.test(part) ? text + part : `${text} ${part}`), '').trim();
+}
 function toggleDictation(key) {
   if (S.dictation?.key === key) return stopDictation();
   stopDictation();
@@ -26952,38 +27032,68 @@ function toggleDictation(key) {
   const { field } = micField(key);
   if (!Recognition || !field || field.disabled) return;
   window.speechSynthesis?.cancel(); // never transcribe our own voice
-  const recognition = new Recognition();
-  recognition.lang = document.documentElement.lang || navigator.language || 'en-US';
-  recognition.interimResults = true;
-  recognition.continuous = false; // a pause ends it
   // Words go where the caret was, replacing any selection, spaced from their neighbours.
   const value = field.value, start = field.selectionStart ?? value.length, end = field.selectionEnd ?? value.length;
   const before = value.slice(0, start), after = value.slice(end);
-  const state = { key, recognition, placeholder: field.placeholder, heard: '' };
+  // `said`: what earlier recognizers heard; `written`: the field as dictation last left it.
+  const state = { key, recognition: null, placeholder: field.placeholder, heard: '', said: '', written: value, silence: null, quickEnds: 0 };
   S.dictation = state;
+  // The field changed under dictation (sent, cleared, a form closed): it is no longer ours to write.
+  const ours = () => { const target = micField(key).field; return target && !target.disabled && target.value === state.written ? target : null; };
   const write = (text) => {
-    const target = micField(key).field;
-    if (!target || S.dictation !== state) return;
+    const target = ours();
+    if (!target) return stopDictation();
     const lead = before && text && !/\s$/.test(before) ? ' ' : '';
     const tail = after && text && !/^\s/.test(after) ? ' ' : '';
-    target.value = `${before}${lead}${text}${tail}${after}`;
+    target.value = state.written = `${before}${lead}${text}${tail}${after}`;
     const caret = before.length + lead.length + text.length;
     target.setSelectionRange?.(caret, caret);
     target.dispatchEvent(new Event('input', { bubbles: true })); // drafts, sizing, @ and [[ menus
   };
-  recognition.onresult = (event) => {
-    state.heard = [...event.results].map((result) => result[0]?.transcript || '').join('').trim();
-    write(state.heard);
+  const quiet = () => {
+    clearTimeout(state.silence);
+    state.silence = setTimeout(() => { if (S.dictation === state) stopDictation(); }, DICTATION_SILENCE_MS);
   };
-  recognition.onerror = (event) => {
-    const blocked = nativeApp() ? `Allow the microphone and speech recognition for ${siteName()} in your phone’s settings to dictate.` : 'Allow the microphone for this site to dictate.';
-    const message = { 'not-allowed': blocked, 'service-not-allowed': blocked,
-      'audio-capture': 'No microphone found.', network: 'Dictation needs a connection.' }[event.error];
-    if (message) toast(message, true);
+  const listen = () => {
+    const recognition = new Recognition();
+    const startedAt = Date.now();
+    let session = '', fatal = false;
+    recognition.lang = document.documentElement.lang || navigator.language || 'en-US';
+    recognition.interimResults = true;
+    recognition.continuous = continuousDictation();
+    recognition.onresult = (event) => {
+      if (S.dictation !== state || state.recognition !== recognition) return;
+      session = joinHeard(...[...event.results].map((result) => result[0]?.transcript || ''));
+      state.heard = joinHeard(state.said, session);
+      quiet();
+      write(state.heard);
+    };
+    recognition.onerror = (event) => {
+      // Silence and our own stop are part of dictating; anything else ends it.
+      if (event.error === 'no-speech' || event.error === 'aborted') return;
+      fatal = true;
+      const blocked = nativeApp() ? `Allow the microphone and speech recognition for ${siteName()} in your phone’s settings to dictate.` : 'Allow the microphone for this site to dictate.';
+      const message = { 'not-allowed': blocked, 'service-not-allowed': blocked,
+        'audio-capture': 'No microphone found.', network: 'Dictation needs a connection.' }[event.error];
+      if (message) toast(message, true);
+    };
+    recognition.onend = () => {
+      if (S.dictation !== state || state.recognition !== recognition) return;
+      state.said = joinHeard(state.said, session);
+      // A recognizer that ends at once, time after time, has no microphone to listen with.
+      state.quickEnds = !session && Date.now() - startedAt < 1500 ? state.quickEnds + 1 : 0;
+      if (fatal || state.quickEnds >= 3 || !ours() || document.visibilityState === 'hidden') return stopDictation();
+      // Android's own recognizer is busy for a moment after it ends; a browser's starts again at once.
+      if (!nativeApp()) return listen();
+      setTimeout(() => { if (S.dictation === state && state.recognition === recognition) listen(); }, 250);
+    };
+    state.recognition = recognition;
+    try { recognition.start(); } catch (error) { fatal = true; stopDictation(); toast(error.message, true); }
   };
-  recognition.onend = () => { if (S.dictation === state) stopDictation(); };
   field.placeholder = 'Listening…';
-  try { recognition.start(); } catch (error) { S.dictation = null; field.placeholder = state.placeholder; return toast(error.message, true); }
+  quiet();
+  listen();
+  if (S.dictation !== state) return;
   paintMic(key);
   field.focus();
 }
@@ -26991,7 +27101,8 @@ function stopDictation() {
   const state = S.dictation;
   if (!state) return;
   S.dictation = null;
-  try { state.recognition.stop(); } catch {}
+  clearTimeout(state.silence);
+  try { state.recognition?.stop(); } catch {}
   const { field } = micField(state.key);
   if (field) field.placeholder = state.placeholder;
   paintMic(state.key);
@@ -27022,6 +27133,8 @@ if (typeof document !== 'undefined') {
     if (!S.dictation || event.metaKey || event.ctrlKey || event.altKey) return;
     if (event.key === 'Escape' || event.target.closest?.('.prompt-field')) stopDictation();
   }, true);
+  // Nobody dictates into a page they cannot see (a phone locked, the app switched).
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') stopDictation(); });
 }
 
 // Read replies aloud (Profile, this device): each new answer that lands on the
@@ -27030,7 +27143,8 @@ function readAloudEnabled() {
   try { return typeof speechSynthesis !== 'undefined' && localStorage.getItem('karmax-read-aloud') === '1'; } catch { return false; }
 }
 function readAloud(element) {
-  if (!readAloudEnabled() || !element) return;
+  // While someone dictates, a reply read aloud would be transcribed into their message.
+  if (!readAloudEnabled() || !element || S.dictation) return;
   const copy = element.cloneNode(true);
   copy.querySelectorAll('.msg-meta, button, details:not([open]) > :not(summary), pre').forEach((node) => node.remove());
   const text = copy.textContent.replace(/\s+/g, ' ').trim().slice(0, 4000);

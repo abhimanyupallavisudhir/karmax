@@ -34,6 +34,8 @@ function fakeBrowser({ speech, push }: { speech: boolean; push: boolean }) {
       constructor() { w.__speech.push(this); }
       start() { this.started = true; }
       stop() { if (!this.started) return; this.started = false; this.onend?.(); }
+      /** The browser's own end of a recognizer, at a pause in speech. */
+      end(error?: string) { if (!this.started) return; if (error) this.onerror?.({ error }); this.started = false; this.onend?.(); }
       hear(parts: Array<[string, boolean]>) {
         const results = parts.map(([transcript, isFinal]) => Object.assign([{ transcript }], { isFinal }));
         this.onresult?.({ results });
@@ -101,16 +103,33 @@ it('dictates into the new-task prompt and the message box, editable, and hides t
       await page.evaluate(`${recognizer()}.hear([['the log', false]])`);
       expect(await prompt.inputValue()).toBe('Fix the log');
       await shot(page, 'mic-new-task-listening', '#tf-body .prompt-field');
-      await page.evaluate(`${recognizer()}.hear([['the login page', true]]); ${recognizer()}.stop()`);
+      await page.evaluate(`${recognizer()}.hear([['the login page', true]])`);
       expect(await prompt.inputValue()).toBe('Fix the login page');
+    });
+
+    await step('a pause does not end it: the next words follow what was heard, until the mic is tapped', async () => {
+      const recognizers = await page.evaluate('window.__speech.length') as number;
+      await page.evaluate(`${recognizer()}.end('no-speech')`);
+      expect(await mic.getAttribute('aria-pressed')).toBe('true');
+      expect(await prompt.getAttribute('placeholder')).toBe('Listening…');
+      expect(await page.evaluate('window.__speech.length')).toBe(recognizers + 1);
+      expect(await page.evaluate(`${recognizer()}.started`)).toBe(true);
+      // A desktop browser keeps one recognizer listening across sentences; its results join.
+      expect(await page.evaluate(`${recognizer()}.continuous`)).toBe(true);
+      await page.evaluate(`${recognizer()}.hear([['and its', true], [' footer', false]])`);
+      expect(await prompt.inputValue()).toBe('Fix the login page and its footer');
+      await mic.click();
       expect(await mic.getAttribute('aria-pressed')).toBe('false');
+      expect(await page.evaluate(`${recognizer()}.started`)).toBe(false);
+      expect(await prompt.getAttribute('placeholder')).not.toBe('Listening…');
+      expect(await prompt.inputValue()).toBe('Fix the login page and its footer');
     });
 
     await step('what was heard is editable and saved like typing', async () => {
       await prompt.press('End');
       await page.keyboard.type(' today');
       const draft = async () => (await g.store.listTasks(project.id)).find((task) => task.params?.draft);
-      await expect.poll(async () => (await draft())?.params?.prompt, { timeout: 10_000 }).toBe('Fix the login page today');
+      await expect.poll(async () => (await draft())?.params?.prompt, { timeout: 10_000 }).toBe('Fix the login page and its footer today');
     });
 
     await step('⌘/Ctrl+⇧S starts and stops dictation from the field', async () => {
@@ -128,7 +147,26 @@ it('dictates into the new-task prompt and the message box, editable, and hides t
       await page.evaluate(`${recognizer()}.hear([['and', false]])`);
       await page.keyboard.type('!');
       expect(await mic.getAttribute('aria-pressed')).toBe('false');
-      expect(await prompt.inputValue()).toBe('Fix the login page today and!');
+      expect(await prompt.inputValue()).toBe('Fix the login page and its footer today and!');
+    });
+
+    await step('a microphone the browser cannot use ends it, saying why', async () => {
+      await mic.click();
+      await page.evaluate(`${recognizer()}.end('not-allowed')`);
+      await page.locator('.toast', { hasText: 'Allow the microphone for this site to dictate.' }).waitFor();
+      expect(await mic.getAttribute('aria-pressed')).toBe('false');
+    });
+
+    await step('Chrome on Android, which repeats words in a continuous recognizer, gets one per sentence', async () => {
+      await page.evaluate(`Object.defineProperty(navigator, 'userAgent', { configurable: true, get: () => 'Mozilla/5.0 (Linux; Android 15; Pixel 9) Chrome/140.0 Mobile Safari/537.36' })`);
+      await prompt.fill('');
+      await mic.click();
+      expect(await page.evaluate(`${recognizer()}.continuous`)).toBe(false);
+      await page.evaluate(`${recognizer()}.hear([['Ship it', true]]); ${recognizer()}.end()`);
+      await page.evaluate(`${recognizer()}.hear([['on Friday', false]])`);
+      expect(await prompt.inputValue()).toBe('Ship it on Friday');
+      await mic.click();
+      expect(await mic.getAttribute('aria-pressed')).toBe('false');
       await shot(page, 'mic-new-task', '#tf-body .prompt-field');
       await page.locator('#tf-close').click();
     });
@@ -149,8 +187,16 @@ it('dictates into the new-task prompt and the message box, editable, and hides t
       await page.evaluate(`${recognizer()}.hear([['GitHub, and keep email as a fallback', false]])`);
       expect(await box.locator('.followup-input').inputValue()).toBe('GitHub, and keep email as a fallback');
       await shot(page, 'mic-message-box-listening', '.ck-compose');
-      await page.evaluate(`${recognizer()}.stop()`);
-      expect(await boxMic.getAttribute('aria-pressed')).toBe('false');
+      await page.evaluate(`${recognizer()}.end()`);
+      expect(await boxMic.getAttribute('aria-pressed')).toBe('true');
+      // Sending takes what the box shows and ends dictation: nothing more is written into the emptied box.
+      const listening = await page.evaluate('window.__speech.length') as number;
+      await box.locator('.followup-send').click();
+      await expect.poll(() => boxMic.getAttribute('aria-pressed')).toBe('false');
+      expect(await page.evaluate(`${recognizer()}.started`)).toBe(false);
+      await page.evaluate(`${recognizer()}.hear([['late words', false]])`);
+      expect(await box.locator('.followup-input').inputValue()).not.toContain('late words');
+      expect(await page.evaluate('window.__speech.length')).toBe(listening);
     });
     expect(errors).toEqual([]);
   } finally {
