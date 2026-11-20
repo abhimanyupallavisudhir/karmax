@@ -256,7 +256,7 @@ describe('a spend awaiting approval', () => {
     } }]]) as any;
     const turn = await runTurn({ profile: { id: 'mock', provider: 'mock' }, world: {} as any,
       messages: [{ id: 'm', role: 'user', text: 'x', ts: 0 }], systemPrompt: '', role: 'do' } as any, {
-      adapters, onReviewInfo: (info) => { published.push(info); },
+      adapters, onReviewInfo: (info: unknown) => { published.push(info); },
       shownReviewActions: async () => shown,
       spendCtx: { projectId: 'p', taskId: 't' },
       budget: { request: async () => ({ status: 'needs_approval' as const, requestId: 'spend_1' }) },
