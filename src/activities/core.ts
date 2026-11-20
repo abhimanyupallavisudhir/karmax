@@ -726,7 +726,8 @@ function reportEscalation(task: { id: string; projectId: string; params: Record<
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
   /** What a running agent turn holds until it ends, however it ends. */
-  const turnHolds = new AsyncLocalStorage<Array<() => void>>();
+  /** What a turn holds until it ends, each told the turn's failure if it failed. */
+  const turnHolds = new AsyncLocalStorage<Array<(failure?: unknown) => void>>();
   const loginSandboxes = deps.loginSandboxes ?? new LoginSandboxes({ store, worlds,
     ...(deps.providerConnections?.list && deps.providerConnections.managedConnections
       ? { connections: deps.providerConnections as RouterConnections } : {}) });
@@ -3665,9 +3666,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           return opened;
         });
         loginSandboxOpening.catch(() => undefined);
-        // Whatever way the turn ends, its sandbox stays for the next one and its slot is renewed no more.
+        // Whatever way the turn ends, its sandbox stays for the next one and its slot is renewed no more;
+        // one the failed turn lost is forgotten, so the retry gets another (tavya-error 392322d5fc85238d).
         const opening = loginSandboxOpening;
-        turnHolds.getStore()?.push(() => { void opening.then((opened) => opened.settle()).catch(() => undefined); });
+        turnHolds.getStore()?.push((failure) => { void opening.then((opened) => opened.settle(failure)).catch(() => undefined); });
       }
 
       // The sandbox bootstrap, and a native agent's home and browser tools, are
@@ -7899,9 +7901,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   };
   const agentTurn = activities.runAgentTurn;
   activities.runAgentTurn = async (args) => {
-    const holds: Array<() => void> = [];
+    const holds: Array<(failure?: unknown) => void> = [];
+    let failure: unknown;
     try { return await turnHolds.run(holds, () => agentTurn(args)); }
-    finally { for (const release of holds) release(); }
+    catch (error) { failure = error ?? new Error('agent turn failed'); throw error; }
+    finally { for (const release of holds) release(failure); }
   };
   return activities;
 }

@@ -29,16 +29,23 @@ class FakeSandboxes implements WorldProvider {
   opened = 0; parked: string[] = []; destroyed: string[] = [];
   /** Tests: every exec waits for this first (a pooled sandbox still warming up). */
   gate?: Promise<void>;
-  state = new Map<string, 'running' | 'parked' | 'gone'>();
+  /** Tests: a create returns only after this (the provider has made the sandbox, and it is listed, before it answers). */
+  createGate?: Promise<void>;
+  /** `killed`: killed in the provider by another process, while this one still holds its connection (E2B's open answers from that). */
+  state = new Map<string, 'running' | 'parked' | 'gone' | 'killed'>();
   constructor(readonly kind: string, private dir: string) {}
   private world(handle: WorldHandle): World {
-    return { handle, exec: async (_cmd: string, args: string[]) => { this.execs.push(args.join(' ')); await this.gate; return { code: 0, stdout: '', stderr: '' }; },
+    const id = String(handle.meta?.sandboxId);
+    return { handle, exec: async (_cmd: string, args: string[]) => {
+      if (this.state.get(id) === 'killed') throw Object.assign(new Error('Sandbox is probably not running anymore'), { name: 'SandboxNotFoundError' });
+      this.execs.push(args.join(' ')); await this.gate; return { code: 0, stdout: '', stderr: '' }; },
       destroy: async () => { await this.destroy(handle); } } as unknown as World;
   }
   async create(spec: WorldSpec): Promise<World> {
     this.created.push(spec);
     const id = `${this.kind}-sbx-${this.created.length}`;
     this.state.set(id, 'running');
+    await this.createGate;
     return this.world({ kind: this.kind, id: spec.taskId, root: path.join(this.dir, id), branch: 'b', base: spec.base,
       meta: { sandboxId: id }, repos: [] } as WorldHandle);
   }
@@ -46,8 +53,13 @@ class FakeSandboxes implements WorldProvider {
     const id = String(handle.meta?.sandboxId);
     if (this.state.get(id) === 'gone') throw new Error('sandbox not found');
     this.opened++;
-    this.state.set(id, 'running');
+    if (this.state.get(id) !== 'killed') this.state.set(id, 'running');
     return this.world(handle);
+  }
+  /** The control plane's answer, as E2BWorldProvider.probe gives it. */
+  async probe(handle: WorldHandle): Promise<'ready' | 'parked' | 'missing'> {
+    const state = this.state.get(String(handle.meta?.sandboxId));
+    return state === 'running' ? 'ready' : state === 'parked' ? 'parked' : 'missing';
   }
   async park(handle: WorldHandle): Promise<WorldHandle> { this.parked.push(String(handle.meta?.sandboxId)); this.state.set(String(handle.meta?.sandboxId), 'parked'); return handle; }
   async destroy(handle: WorldHandle): Promise<void> { this.destroyed.push(String(handle.meta?.sandboxId)); this.state.set(String(handle.meta?.sandboxId), 'gone'); }
@@ -352,6 +364,78 @@ describe('login sandboxes', () => {
     expect(daytona.parked).toEqual([]);
   });
 
+  it('the orphan reaper never finds one being made unrecorded: it waits for the record (tavya-error 392322d5fc85238d)', async () => {
+    // Production, 2026-11-20 22:22:05.9: a computerless task's new E2B login sandbox was listed by the lifecycle
+    // sweep before its entry was saved, judged a "duplicate" of the task's `none` world and killed 0.6 s after it was made.
+    process.env.KARMAX_LOGIN_SANDBOX_POOL = '1';
+    const org = await store.createOrganization({ name: 'Racing' });
+    const task = await taskIn(org.id);
+    const pool = sandboxes();
+    // The reaper's judgement, as WorldLifecycleManager.reapOrphanSandboxes makes it: under the label's operation lock.
+    const reaperSpares = (label: string, sandboxId: string) =>
+      worlds.withOperation(label, () => pool.protects(label, (handle) => handle.meta?.sandboxId === sandboxId));
+    let made!: () => void;
+    e2b.createGate = new Promise((resolve) => { made = resolve; });
+    const opening = pool.open({ organizationId: org.id, taskId: task.id });
+    await expect.poll(() => e2b.created.length).toBe(1);
+    // Made in the provider (so listed), its create not answered yet: the reaper looks now.
+    const spared = reaperSpares(task.id, 'e2b-sbx-1');
+    made();
+    expect(await spared).toBe(true);
+    const opened = await opening;
+    // The pool's refill, made the same way, is spared the same way.
+    await expect.poll(() => e2b.created.length).toBe(2);
+    const label = String(e2b.created[1]!.taskId);
+    e2b.createGate = undefined;
+    expect(await reaperSpares(label, 'e2b-sbx-2')).toBe(true);
+    await opened.settle();
+    await expect.poll(() => e2b.parked.length).toBe(1);
+    // A claim moves a pooled sandbox from the pool to its task: the reaper looking meanwhile still spares it.
+    const second = await taskIn(org.id, 'Second');
+    let claimed!: () => void;
+    const claiming = new Promise<void>((resolve) => { claimed = resolve; });
+    const kvSet = store.kvSet.bind(store);
+    (store as any).kvSet = async (key: string, value: string) => {
+      // The moment the pooled sandbox has left the pool, before its task's entry exists.
+      if (key.startsWith('login-sandbox-owner:')) { claimed(); await new Promise((resolve) => setTimeout(resolve, 50)); }
+      return kvSet(key, value);
+    };
+    const claim = pool.open({ organizationId: org.id, taskId: second.id });
+    await claiming;
+    expect(await reaperSpares(label, 'e2b-sbx-2')).toBe(true);
+    (store as any).kvSet = kvSet;
+    expect((await claim).world.handle.id).toBe(label);
+    expect(e2b.destroyed).toEqual([]);
+  });
+
+  it('one lost under a turn is forgotten when the turn fails, so the retry gets a new one instead of the dead one for ever', async () => {
+    const org = await store.createOrganization({ name: 'Lost' });
+    const task = await taskIn(org.id);
+    const pool = sandboxes();
+    const first = await pool.open({ organizationId: org.id, taskId: task.id });
+    // Killed in the provider (reaped by another process, expired, an outage), while this process still holds a connection to it.
+    e2b.state.set('e2b-sbx-1', 'killed');
+    const failure = await first.world.exec('bash', ['-c', 'true']).catch((error: unknown) => error);
+    await first.settle(failure);
+    expect(await pool.entry(task.id)).toBeUndefined();
+    const retry = await pool.open({ organizationId: org.id, taskId: task.id });
+    expect(retry.reused).toBe(false);
+    expect(e2b.created).toHaveLength(2);
+    await retry.settle();
+    // A turn that failed with its sandbox alive keeps it.
+    const third = await pool.open({ organizationId: org.id, taskId: task.id });
+    await third.settle(new Error('the model refused'));
+    expect(third.reused).toBe(true);
+    expect((await pool.entry(task.id))?.handle.meta?.sandboxId).toBe('e2b-sbx-2');
+    // So does one whose provider cannot say (no control-plane probe).
+    const probe = e2b.probe;
+    (e2b as any).probe = undefined;
+    const fourth = await pool.open({ organizationId: org.id, taskId: task.id });
+    await fourth.settle(new Error('lost'));
+    (e2b as any).probe = probe;
+    expect(await pool.entry(task.id)).toBeDefined();
+  });
+
   it('the orphan reaper spares a live task\'s login sandbox, and only that one', async () => {
     const org = await store.createOrganization({ name: 'Reaper' });
     const task = await taskIn(org.id);
@@ -376,7 +460,11 @@ describe('a turn of a task without a computer on a subscription login', () => {
     const captured: TurnInput[] = [];
     const adapters = new Map<any, any>([['claude', {
       provider: 'claude',
-      async runTurn(input: TurnInput) { captured.push(input); return { termination: { kind: 'success', status: 'end_turn' }, output: 'done' }; },
+      async runTurn(input: TurnInput) {
+        captured.push(input);
+        // As the CLI's start does (seedRemoteAgentHome's bootstrap): a dead sandbox fails it.
+        if (input.harnessWorld && input.harnessWorld !== input.world) await input.harnessWorld.exec('true', []);
+        return { termination: { kind: 'success', status: 'end_turn' }, output: 'done' }; },
       async runComputerlessTurn() { throw new Error('a login never runs host-side'); },
     }]]);
     (store as { hosted: boolean }).hosted = hosted;
@@ -411,6 +499,20 @@ describe('a turn of a task without a computer on a subscription login', () => {
     // The turn is over: the sandbox stays, idle, until the sweep parks it.
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect((await pool.entry(task.id))?.busyUntil).toBeUndefined();
+    await none.destroy();
+  });
+
+  it('hosted: a turn whose login sandbox was lost fails once; its retry runs in a new one (tavya-error 392322d5fc85238d)', async () => {
+    const { captured, none, pool, task, turn } = await setup(true, routeTo([{ provider: 'e2b', funding: 'managed' }]));
+    await turn(1);
+    // Killed by another process while this worker keeps its connection: every call into it fails.
+    e2b.state.set('e2b-sbx-1', 'killed');
+    await expect(turn(2)).rejects.toThrow(/not running anymore/);
+    // The activity's retry, and every later turn, get a sandbox that runs.
+    await expect.poll(async () => (await pool.entry(task.id))?.handle.meta?.sandboxId).not.toBe('e2b-sbx-1');
+    await turn(2);
+    expect(captured.at(-1)!.harnessWorld?.handle.meta?.sandboxId).toBe('e2b-sbx-2');
+    expect(e2b.created).toHaveLength(2);
     await none.destroy();
   });
 
