@@ -26995,7 +26995,10 @@ function micButtonHtml(key) {
   if (typeof speechRecognitionClass() !== 'function') return '';
   const on = S.dictation?.key === key;
   return `<button type="button" class="mic-button${on ? ' listening' : ''}" data-mic="${esc(key)}" data-shortcut="compose.voice" aria-pressed="${on}"
-    aria-label="${on ? 'Stop dictating' : 'Dictate'}" title="${esc(commandHint(on ? 'Stop dictating' : 'Dictate', 'compose.voice'))}">${ICON.mic}</button>`;
+    aria-label="${on ? 'Stop dictating' : 'Dictate'}" title="${esc(micTitle(on))}">${ICON.mic}</button>`;
+}
+function micTitle(on) {
+  return on ? `${commandHint('Stop dictating', 'compose.voice')} · or say “${DICTATION_STOP_PHRASE}”` : commandHint('Dictate', 'compose.voice');
 }
 // The field a mic types into: found again each time, since a refresh may have replaced it.
 function micField(key) {
@@ -27009,14 +27012,26 @@ function paintMic(key) {
   button.classList.toggle('listening', on);
   button.setAttribute('aria-pressed', String(on));
   button.setAttribute('aria-label', on ? 'Stop dictating' : 'Dictate');
-  button.title = commandHint(on ? 'Stop dictating' : 'Dictate', 'compose.voice');
+  button.title = micTitle(on);
 }
-// Dictation lasts until the person ends it: a tap on the mic, typing, Esc,
-// sending, leaving the page, or DICTATION_SILENCE_MS without a word. A
+// Dictation lasts until the person ends it: saying "stop listening" (as in
+// Google Docs and Dragon), a tap on the mic, typing, Esc, sending, or leaving
+// the page; DICTATION_SILENCE_MS without a word is only the net for a mic left
+// on, which would type whatever the room says into the message. A
 // recognizer ends on its own at a pause (Chrome on Android after a breath,
 // Android's own after the end of a sentence); dictation starts the next one,
 // keeping what was heard, so a pause mid-thought does not stop it.
-const DICTATION_SILENCE_MS = 20_000;
+const DICTATION_SILENCE_MS = 120_000;
+// The spoken stop: one of these as the last words heard, never typed. It takes
+// effect once the speaker pauses on it (a final result, the recognizer's end,
+// or DICTATION_STOP_SETTLE_MS without more words), so "stop listening to the
+// radio" is just text.
+const DICTATION_STOP_PHRASE = 'stop listening';
+const DICTATION_STOP_SETTLE_MS = 800;
+function beforeStopPhrase(text) {
+  const m = /^(.*?)[\s,;:-]*\bstop (?:listening|dictating|dictation|recording)[\s.,!?]*$/is.exec(text);
+  return m ? m[1].trim() : null;
+}
 // Chrome on Android repeats earlier words in each result of a continuous
 // session, so there each sentence is a recognizer of its own.
 function continuousDictation() {
@@ -27036,7 +27051,7 @@ function toggleDictation(key) {
   const value = field.value, start = field.selectionStart ?? value.length, end = field.selectionEnd ?? value.length;
   const before = value.slice(0, start), after = value.slice(end);
   // `said`: what earlier recognizers heard; `written`: the field as dictation last left it.
-  const state = { key, recognition: null, placeholder: field.placeholder, heard: '', said: '', written: value, silence: null, quickEnds: 0 };
+  const state = { key, recognition: null, placeholder: field.placeholder, heard: '', said: '', written: value, silence: null, stopping: null, quickEnds: 0 };
   S.dictation = state;
   // The field changed under dictation (sent, cleared, a form closed): it is no longer ours to write.
   const ours = () => { const target = micField(key).field; return target && !target.disabled && target.value === state.written ? target : null; };
@@ -27050,6 +27065,8 @@ function toggleDictation(key) {
     target.setSelectionRange?.(caret, caret);
     target.dispatchEvent(new Event('input', { bubbles: true })); // drafts, sizing, @ and [[ menus
   };
+  // The stop phrase said: what came before it stays, and dictation ends.
+  const stopBySpeech = (kept) => { write(kept); if (S.dictation === state) stopDictation(); };
   const quiet = () => {
     clearTimeout(state.silence);
     state.silence = setTimeout(() => { if (S.dictation === state) stopDictation(); }, DICTATION_SILENCE_MS);
@@ -27066,7 +27083,12 @@ function toggleDictation(key) {
       session = joinHeard(...[...event.results].map((result) => result[0]?.transcript || ''));
       state.heard = joinHeard(state.said, session);
       quiet();
-      write(state.heard);
+      clearTimeout(state.stopping);
+      const kept = beforeStopPhrase(state.heard);
+      if (kept == null) return write(state.heard);
+      if (event.results[event.results.length - 1]?.isFinal) return stopBySpeech(kept);
+      write(kept); // the phrase is never shown; more words bring it back as text
+      state.stopping = setTimeout(() => { if (S.dictation === state) stopBySpeech(kept); }, DICTATION_STOP_SETTLE_MS);
     };
     recognition.onerror = (event) => {
       // Silence and our own stop are part of dictating; anything else ends it.
@@ -27080,6 +27102,8 @@ function toggleDictation(key) {
     recognition.onend = () => {
       if (S.dictation !== state || state.recognition !== recognition) return;
       state.said = joinHeard(state.said, session);
+      const kept = beforeStopPhrase(state.said);
+      if (kept != null) return stopBySpeech(kept);
       // A recognizer that ends at once, time after time, has no microphone to listen with.
       state.quickEnds = !session && Date.now() - startedAt < 1500 ? state.quickEnds + 1 : 0;
       if (fatal || state.quickEnds >= 3 || !ours() || document.visibilityState === 'hidden') return stopDictation();
@@ -27090,7 +27114,7 @@ function toggleDictation(key) {
     state.recognition = recognition;
     try { recognition.start(); } catch (error) { fatal = true; stopDictation(); toast(error.message, true); }
   };
-  field.placeholder = 'Listening…';
+  field.placeholder = `Listening… say “${DICTATION_STOP_PHRASE}” to end`;
   quiet();
   listen();
   if (S.dictation !== state) return;
@@ -27102,6 +27126,7 @@ function stopDictation() {
   if (!state) return;
   S.dictation = null;
   clearTimeout(state.silence);
+  clearTimeout(state.stopping);
   try { state.recognition?.stop(); } catch {}
   const { field } = micField(state.key);
   if (field) field.placeholder = state.placeholder;

@@ -186,6 +186,17 @@ it('dictates with the platform\'s recognizer in the app, same mic and shortcut',
       expect(await prompt.inputValue()).toBe('Fix the login page today');
     });
 
+    await step('saying “stop listening” before the recognizer ends stops dictation, without the words', async () => {
+      await mic.click();
+      await expect.poll(() => page.evaluate(`${speech}.calls.filter(([m]) => m === 'start').length`)).toBe(3);
+      await page.evaluate(`${speech}.emit('partialResults', { matches: ['and call me back stop listening'] })`);
+      await page.evaluate(`${speech}.emit('listeningState', { status: 'stopped' })`);
+      await expect.poll(() => mic.getAttribute('aria-pressed')).toBe('false');
+      expect(await prompt.inputValue()).toBe('Fix the login page today and call me back');
+      await page.waitForTimeout(500);
+      expect(await page.evaluate(`${speech}.calls.filter(([m]) => m === 'start').length`)).toBe(3);
+    });
+
     await step('⌘/Ctrl+⇧S starts and stops it; the native recognizer stops too', async () => {
       await prompt.focus();
       await page.keyboard.press('Control+Shift+S');

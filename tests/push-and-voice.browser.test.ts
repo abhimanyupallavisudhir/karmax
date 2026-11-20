@@ -99,7 +99,7 @@ it('dictates into the new-task prompt and the message box, editable, and hides t
       await page.keyboard.type('Fix');
       await mic.click();
       expect(await mic.getAttribute('aria-pressed')).toBe('true');
-      expect(await prompt.getAttribute('placeholder')).toBe('Listening…');
+      expect(await prompt.getAttribute('placeholder')).toBe('Listening… say “stop listening” to end');
       await page.evaluate(`${recognizer()}.hear([['the log', false]])`);
       expect(await prompt.inputValue()).toBe('Fix the log');
       await shot(page, 'mic-new-task-listening', '#tf-body .prompt-field');
@@ -111,7 +111,7 @@ it('dictates into the new-task prompt and the message box, editable, and hides t
       const recognizers = await page.evaluate('window.__speech.length') as number;
       await page.evaluate(`${recognizer()}.end('no-speech')`);
       expect(await mic.getAttribute('aria-pressed')).toBe('true');
-      expect(await prompt.getAttribute('placeholder')).toBe('Listening…');
+      expect(await prompt.getAttribute('placeholder')).toBe('Listening… say “stop listening” to end');
       expect(await page.evaluate('window.__speech.length')).toBe(recognizers + 1);
       expect(await page.evaluate(`${recognizer()}.started`)).toBe(true);
       // A desktop browser keeps one recognizer listening across sentences; its results join.
@@ -121,7 +121,7 @@ it('dictates into the new-task prompt and the message box, editable, and hides t
       await mic.click();
       expect(await mic.getAttribute('aria-pressed')).toBe('false');
       expect(await page.evaluate(`${recognizer()}.started`)).toBe(false);
-      expect(await prompt.getAttribute('placeholder')).not.toBe('Listening…');
+      expect(await prompt.getAttribute('placeholder')).not.toMatch(/^Listening/);
       expect(await prompt.inputValue()).toBe('Fix the login page and its footer');
     });
 
@@ -155,6 +155,31 @@ it('dictates into the new-task prompt and the message box, editable, and hides t
       await page.evaluate(`${recognizer()}.end('not-allowed')`);
       await page.locator('.toast', { hasText: 'Allow the microphone for this site to dictate.' }).waitFor();
       expect(await mic.getAttribute('aria-pressed')).toBe('false');
+    });
+
+    await step('saying “stop listening” ends it, and is never typed; the same words mid-sentence are text', async () => {
+      await prompt.fill('');
+      await mic.click();
+      expect(await mic.getAttribute('title')).toMatch(/^Stop dictating \((Ctrl\+⇧S|⌘⇧S)\) · or say “stop listening”$/);
+      await page.evaluate(`${recognizer()}.hear([['Ship it today stop listening', false]])`);
+      expect(await prompt.inputValue()).toBe('Ship it today');
+      await page.evaluate(`${recognizer()}.hear([['Ship it today stop listening to the radio', false]])`);
+      expect(await prompt.inputValue()).toBe('Ship it today stop listening to the radio');
+      await page.waitForTimeout(1_000);
+      expect(await mic.getAttribute('aria-pressed')).toBe('true');
+      await page.evaluate(`${recognizer()}.hear([['Ship it today stop listening to the radio.', true], [' Stop listening.', true]])`);
+      expect(await mic.getAttribute('aria-pressed')).toBe('false');
+      expect(await page.evaluate(`${recognizer()}.started`)).toBe(false);
+      expect(await prompt.inputValue()).toBe('Ship it today stop listening to the radio.');
+    });
+
+    await step('a stop said without a final result takes effect once the speaker pauses on it', async () => {
+      await prompt.press('End');
+      await mic.click();
+      await page.evaluate(`${recognizer()}.hear([['Then merge, stop listening', false]])`);
+      expect(await prompt.inputValue()).toBe('Ship it today stop listening to the radio. Then merge');
+      await expect.poll(() => mic.getAttribute('aria-pressed'), { timeout: 3_000 }).toBe('false');
+      expect(await prompt.inputValue()).toBe('Ship it today stop listening to the radio. Then merge');
     });
 
     await step('Chrome on Android, which repeats words in a continuous recognizer, gets one per sentence', async () => {
