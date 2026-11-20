@@ -374,7 +374,9 @@ async function justDoImpl(
     // follow-ups it injected in-flight (SPEC §5.6). Follow-ups that landed after the
     // turn's last poll stay after `seen` → delivered on the next turn.
     seen = Math.min(Math.max(turn.delivered ?? deliveredNow, deliveredNow), msgs.length);
-    if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
+    // A turn's review info carries the fields it set (its actions include those
+    // Review showed before it): what it does not set, such as an earlier caption, stays.
+    if (turn.reviewInfo) reviewInfo = { ...reviewInfo, ...turn.reviewInfo };
     // `pause`: resume the agent when it is over.
     if (turn.wait && patched('agent-wait-v1')) {
       const needsInput = turn.wait.needsInput;

@@ -67,9 +67,12 @@ function action(value: unknown, index: number): ReviewAction {
   };
 }
 
+/** One `create_review_info` call: review info, and the earlier actions it takes down. */
+export type ReviewInfoCall = ReviewInfo & { remove?: string[] };
+
 /** Normalize one call's fields, rejecting what the console must never render. */
-export function validateReviewInfoCall(info: ReviewInfo): ReviewInfo {
-  const out: ReviewInfo = {};
+export function validateReviewInfoCall(info: ReviewInfoCall): ReviewInfoCall {
+  const out: ReviewInfoCall = {};
   const caption = text(info.caption, 'caption', MAX_REVIEW_TEXT_LENGTH);
   if (caption !== undefined) out.caption = caption;
   // `summary` is no longer advertised; old/resumed sessions may still send it.
@@ -78,6 +81,10 @@ export function validateReviewInfoCall(info: ReviewInfo): ReviewInfo {
   if (info.actions !== undefined) {
     if (!Array.isArray(info.actions)) reject('actions must be a list');
     out.actions = info.actions.map(action);
+  }
+  if (info.remove !== undefined) {
+    if (!Array.isArray(info.remove) || info.remove.length > MAX_ACTIONS) reject(`remove must be a list of at most ${MAX_ACTIONS} labels or open targets`);
+    out.remove = info.remove.map((name, i) => text(name, `remove[${i}]`, MAX_URL, true)!);
   }
   if (info.links !== undefined) {
     if (!Array.isArray(info.links) || info.links.length > MAX_LINKS) reject(`links must be a list of at most ${MAX_LINKS}`);
@@ -93,12 +100,20 @@ export function validateReviewInfoCall(info: ReviewInfo): ReviewInfo {
   return out;
 }
 
-/** Agents re-attach review info after changing what it shows, so an action
- * naming the same `open` target or `run` label replaces the earlier one in
- * place; anything else appends. */
-export function mergeReviewActions(existing: ReviewAction[], added: ReviewAction[]): ReviewAction[] {
+/** Actions stay until the agent takes them down: an action naming the same
+ * `open` target or `run` label as an earlier one replaces it in place,
+ * anything else appends, and only `remove` (a label, or an open target) drops
+ * one. A name that matches nothing is refused, so a typo cannot pass for a
+ * removal. */
+export function mergeReviewActions(existing: ReviewAction[], added: ReviewAction[], remove: string[] = []): ReviewAction[] {
   const key = (a: ReviewAction) => `${a.kind}\0${a.kind === 'open' ? a.target : a.label}`;
-  const merged = [...existing];
+  const named = (a: ReviewAction, name: string) => a.label === name || (a.kind === 'open' && a.target === name);
+  const missing = remove.filter((name) => !existing.some((a) => named(a, name)));
+  if (missing.length) {
+    const shown = existing.map((a) => a.kind === 'open' ? `${a.label} (${a.target})` : a.label).join(', ');
+    reject(`nothing to remove named ${missing.map((name) => `"${name}"`).join(', ')}; the actions are: ${shown || 'none'}`);
+  }
+  const merged = existing.filter((a) => !remove.some((name) => named(a, name)));
   for (const action of added) {
     const at = merged.findIndex((a) => key(a) === key(action));
     if (at >= 0) merged[at] = action; else merged.push(action);

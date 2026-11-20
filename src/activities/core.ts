@@ -4289,6 +4289,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           },
           subTaskParams: (params: unknown) => subTaskParams(store, { projectId: args.task.projectId, parentTaskId: args.taskId, params,
             ...(deps.providerConnections ? { computers: deps.providerConnections } : {}) }),
+          shownReviewActions: async () => {
+            const view = (await store.getTask(args.taskId))?.lastView;
+            return view ? (await store.withPendingReviewInfo(args.taskId, view)).reviewInfo?.actions : undefined;
+          },
           onReviewInfo: async (info, supplied) => {
             signal?.throwIfAborted();
             if (deps.objects) await preserveReviewArtifacts(store, deps.objects, world, args.taskId, supplied);

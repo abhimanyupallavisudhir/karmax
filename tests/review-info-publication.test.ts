@@ -161,3 +161,107 @@ describe('create_review_info validation', () => {
     ]);
   });
 });
+
+/**
+ * auto-rubric#2: an agent re-attached two refreshed actions and added two new
+ * ones in a later turn, and the nine charts it had attached in an earlier turn
+ * vanished from Review. Actions a later turn does not name stay; only `remove`
+ * takes one down.
+ */
+describe('review actions across turns', () => {
+  const report = { kind: 'open' as const, label: 'Results', target: 'RESULTS.md' };
+  const chart = { kind: 'open' as const, label: 'Chart', target: 'figures/a.png' };
+  const site = { kind: 'open' as const, label: 'Live site', target: 'https://example.com/site' };
+  const serve = { kind: 'run' as const, label: 'Serve', command: 'npm start', server: true };
+
+  async function setup() {
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Review across turns'));
+    const task = (await store.createTask({ projectId: project.id, title: 'Charts', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'work' } }));
+    (await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
+      stage: 'do', status: 'active', messages: [], actions: [], state: {}, updatedAt: 1,
+      reviewInfo: { caption: 'Earlier turn', actions: [report, chart, serve], changedFiles: ['RESULTS.md'] } }));
+    const worlds = new WorldRegistry();
+    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+    let calls: Record<string, unknown>[] = [];
+    const results: string[] = [];
+    const adapters = new Map([['mock', { provider: 'mock', async runTurn(input: any, ctx: any) {
+      const handlers = platformToolHandlers(input.world, ctx);
+      for (const call of calls) results.push(await handlers.create_review_info!(call));
+      return { termination: { kind: 'success' as const, status: 'mock.completed' }, output: 'done' };
+    } }]]) as any;
+    const core = makeCoreActivities({ store, worlds, adapters, profiles: new ProfileResolver(store, 'mock') });
+    let n = 0;
+    const turn = async (...next: Record<string, unknown>[]) => {
+      calls = next; results.length = 0;
+      const result = await core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: `${task.id}#${++n}`,
+        agentSlotGranted: true, worldHandle: world.handle, messages: [],
+        task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {},
+          workflow: 'software-dev', agents: { do: { provider: 'mock' } } },
+      } as any);
+      return { result, results: [...results], shown: (await store.getTask(task.id))?.lastView?.reviewInfo };
+    };
+    return { store, world, turn };
+  }
+
+  it('keeps actions an earlier turn attached when a later turn attaches others', async () => {
+    const { store, world, turn } = await setup();
+    try {
+      const updatedReport = { ...report, label: 'Results (updated)' };
+      const { result, results, shown } = await turn({ caption: 'New charts', actions: [updatedReport, site] });
+      expect(results).toEqual(['review info recorded']);
+      const expected = [updatedReport, chart, serve, site];
+      expect(shown?.actions).toEqual(expected);
+      expect(shown?.caption).toBe('New charts');
+      expect(result.reviewInfo?.actions).toEqual(expected);
+      // A turn that changes only the caption leaves the actions alone.
+      const captionOnly = await turn({ caption: 'Only the caption' });
+      expect(captionOnly.result.reviewInfo?.actions).toBeUndefined();
+      expect(captionOnly.shown?.actions).toEqual(expected);
+    } finally { await world.destroy(); (await store.close()); }
+  });
+
+  it('takes down only the actions named in `remove`, by open target or label', async () => {
+    const { store, world, turn } = await setup();
+    try {
+      const { result, results, shown } = await turn({ remove: ['figures/a.png', 'Serve'], actions: [site] });
+      expect(results).toEqual(['review info recorded']);
+      expect(shown?.actions).toEqual([report, site]);
+      expect(result.reviewInfo?.actions).toEqual([report, site]);
+      // Removing everything leaves an empty list, not the earlier one.
+      const cleared = await turn({ remove: ['Results', 'Live site'] });
+      expect(cleared.shown?.actions).toEqual([]);
+      expect(cleared.result.reviewInfo?.actions).toEqual([]);
+    } finally { await world.destroy(); (await store.close()); }
+  });
+
+  it('rejects a removal that names no action, listing the ones there are', async () => {
+    const { store, world, turn } = await setup();
+    try {
+      const { results, shown } = await turn({ remove: ['figures/missing.png'], actions: [site] });
+      expect(results[0]).toMatch(/^review info rejected: .*figures\/missing\.png.*RESULTS\.md/);
+      expect(shown?.actions).toEqual([report, chart, serve]);
+    } finally { await world.destroy(); (await store.close()); }
+  });
+});
+
+describe('a spend awaiting approval', () => {
+  it('adds its buttons to what Review shows instead of replacing it', async () => {
+    const shown = [{ kind: 'open' as const, label: 'Results', target: 'RESULTS.md' }];
+    const published: any[] = [];
+    const adapters = new Map([['mock', { provider: 'mock', async runTurn(_input: any, ctx: any) {
+      await ctx.requestSpend({ amount: 500, merchant: 'Example', why: 'API credits' });
+      return { termination: { kind: 'success' as const, status: 'mock.completed' }, output: 'done' };
+    } }]]) as any;
+    const turn = await runTurn({ profile: { id: 'mock', provider: 'mock' }, world: {} as any,
+      messages: [{ id: 'm', role: 'user', text: 'x', ts: 0 }], systemPrompt: '', role: 'do' } as any, {
+      adapters, onReviewInfo: (info: unknown) => { published.push(info); },
+      shownReviewActions: async () => shown,
+      spendCtx: { projectId: 'p', taskId: 't' },
+      budget: { request: async () => ({ status: 'needs_approval' as const, requestId: 'spend_1' }) },
+    } as any);
+    expect(turn.reviewInfo?.actions?.map((a) => a.label)).toEqual(['Results', 'Approve spend', 'Deny spend']);
+    expect(published.at(-1)?.actions).toEqual(turn.reviewInfo?.actions);
+  });
+});
