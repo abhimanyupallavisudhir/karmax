@@ -31,6 +31,9 @@ import { credentialResource, resourceSecretHandle, snapshotResource } from '../d
 import { VaultItems, itemHandle, type VaultFieldName } from '../autonomy/vault-items.js';
 import { handleRef, recordSecretRefs } from '../autonomy/task-secrets.js';
 import { ensureWorldExcluded } from './secret-exclude.js';
+import { dataFilledDisk, ComputerUnfit } from '../domain/computer-limits.js';
+import { checkWorldDisk, describeDisk, diskWasFull } from './disk.js';
+import { onDemandResource } from './data-disk.js';
 import { expandPath } from '../util/expand.js';
 import { managedRepoPath } from './worktree.js';
 import { screenEnvironment, type SkippedEnv } from '../util/work-env.js';
@@ -648,7 +651,7 @@ export class ProjectResourceService {
     } catch (error) {
       // Those never started (or cut short) hold a lease nothing will use.
       await failLeases(this.store, [...unsettled]);
-      throw error;
+      throw (await filledDisk(world, restores, error, options.signal)) ?? error;
     }
     world.handle = { ...world.handle, generation, meta: { ...world.handle.meta,
       ...(ephemeralPaths.size ? { ephemeralPaths: [...ephemeralPaths] } : {}),
@@ -2863,8 +2866,25 @@ function sameParts(a: Parts, b: Parts): boolean {
 }
 function sameSet<T>(a: Set<T>, b: Set<T>): boolean { return a.size === b.size && [...a].every((value) => b.has(value)); }
 /** Worlds get its listing, and fetch its parts themselves. */
-function onDemand(value: ResourceAttachment): boolean {
-  return Boolean(value.onDemand) && isSnapshotDriver(value.driver) && value.target.kind === 'path' && !fileShaped(value);
+function onDemand(value: ResourceAttachment): boolean { return onDemandResource(value); }
+
+/**
+ * A restore that failed because the world's disk filled: said as the
+ * computer being too small for the data (ComputerUnfit), not as whatever its
+ * job looked like afterwards. A full disk leaves nothing a restore can write,
+ * so its job cannot even record how it ended and looked lost, "the sandbox was
+ * restarted" (rw-data #8, tavya-error 3b4ed193f5ec0941: 31.3 GB on an E2B
+ * disk of 22 GB, three attempts). The disk is read once the restore has
+ * stopped, while what it wrote is still there; a world that cannot answer, or
+ * a cancelled setup, keeps the original error.
+ */
+async function filledDisk(world: World, restores: Array<{ revision: ResourceRevision }>, error: unknown,
+  signal?: AbortSignal): Promise<ComputerUnfit | undefined> {
+  if (signal?.aborted || error instanceof ComputerUnfit || !restores.length) return undefined;
+  const check = await checkWorldDisk(world, 20_000).catch(() => undefined);
+  if (!check || !diskWasFull(check)) return undefined;
+  const bytes = restores.reduce((sum, entry) => sum + Math.max(0, Number(entry.revision.bytes) || 0), 0);
+  return new ComputerUnfit(dataFilledDisk(bytes, describeDisk(check.disk)), { cause: error });
 }
 function parseCopyEnv(value: string): Array<{ name: string; value: string }> {
   const entries: Array<{ name: string; value: string }> = [];

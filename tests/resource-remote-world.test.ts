@@ -1,4 +1,4 @@
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -23,6 +23,8 @@ import { RESTIC_VERSION } from '../src/world/restic.js';
 import { ensureIdentity, gitOrThrow } from '../src/world/git.js';
 import type { World } from '../src/world/types.js';
 import { SetupClock } from '../src/world/setup-clock.js';
+import { ComputerUnfit, DISK_CANNOT_HOLD_DATA } from '../src/domain/computer-limits.js';
+import { isComputerChoiceEscalation } from '../src/domain/escalation.js';
 
 /** Each test runs real restic several times, as jobs in worlds: ~10-25 s on a
  * 2-CPU host, and CI runners are up to twice as slow. */
@@ -555,3 +557,46 @@ it('stops a restore that stops moving, and fails its lease', async () => {
   const lease = (await f.store.listResourceLeases(world.handle.id)).find((l) => l.attachmentId === file!.attachment.id);
   expect(lease?.state).toBe('failed');
 }, REAL_RESTIC_MS);
+
+// tavya-error 3b4ed193f5ec0941 (rw-data #8, 2026-11-20): 31.3 GB restored onto
+// an E2B disk of 22 GB. E2B's metrics show the disk full 15 s into each of
+// three attempts; with nothing left to write, the restore job could not record
+// how it ended, looked lost, and world setup said "the sandbox was restarted"
+// and retried — the same failure every time — until a person was asked.
+describe('a restore whose job ends without recording how', () => {
+  const FULL = 'KARMAX_USAGE disk_total_kb=23057408 disk_used_kb=23057408 disk_avail_kb=0 disk_avail_before_kb=0 ballast=missing ballast_kb=0\n';
+  /** The job's leader dies without an exit record, as when the disk is full. */
+  const loseTheJob = (world: World) => shimResticRestore(world,
+    `kill -9 "$(cat "${world.handle.root}/${SYSTEM_JOB_ROOT}/$KARMAX_JOB/pid")"; sleep 0.2; exit 1`);
+  function diskReads(world: World, stdout: string) {
+    const exec = world.exec.bind(world);
+    world.exec = async (cmd, args, options) => (args?.[2] === 'disk-guard' && args[3] === 'check'
+      ? { code: 0, stdout, stderr: '' } : exec(cmd, args, options));
+  }
+
+  it('says the computer cannot hold the data when the disk is full, so no retry repeats it', async () => {
+    const f = await fixture();
+    const [file] = await singleFiles(f, 1);
+    const { task, world } = await f.sandbox('Disk fills');
+    loseTheJob(world);
+    diskReads(world, FULL);
+    const failure = await f.resources.materialize(f.project.id, task.id, world, 1).catch((error) => error);
+    expect(failure).toBeInstanceOf(ComputerUnfit);
+    expect(failure.message).toMatch(new RegExp(`^The disk filled up while restoring this project's data \\(\\d.* GB; Disk 22 of 22 GB used \\(100%\\)\\): `
+      + `this computer ${DISK_CANNOT_HOLD_DATA}\\. Give it a larger disk or choose another computer`));
+    expect(isComputerChoiceEscalation(failure.message)).toBe(true);
+    const lease = (await f.store.listResourceLeases(world.handle.id)).find((l) => l.attachmentId === file!.attachment.id);
+    expect(lease?.state).toBe('failed');
+  }, REAL_RESTIC_MS);
+
+  it('says only what is known when the disk has room', async () => {
+    const f = await fixture();
+    await singleFiles(f, 1);
+    const { task, world } = await f.sandbox('Job lost');
+    loseTheJob(world);
+    diskReads(world, 'KARMAX_USAGE disk_total_kb=23057408 disk_used_kb=4000000 disk_avail_kb=19057408 disk_avail_before_kb=19057408 ballast=missing ballast_kb=0\n');
+    const failure = await f.resources.materialize(f.project.id, task.id, world, 1).catch((error) => error);
+    expect(failure).not.toBeInstanceOf(ComputerUnfit);
+    expect(failure.message).toMatch(/^restic stopped without finishing \(its job ended without recording how/);
+  }, REAL_RESTIC_MS);
+});

@@ -292,7 +292,51 @@ export function unreachableTavya(provider: string, what: string): string {
     + `Choose another computer${provider === 'daytona' ? ', or a Daytona account on Tier 3 or above (full internet)' : ''}.`;
 }
 
-export function assertComputerFits(spec: MachineShape & { network?: { unrestricted?: boolean }; reachesTavya?: string },
+/** How a refusal of a computer too small for the project's data says so
+ * (dataTooLarge, dataFilledDisk): a person's choice of computer to change,
+ * not a defect of tavya's (domain/escalation.ts). */
+export const DISK_CANNOT_HOLD_DATA = "can't hold this project's data";
+
+/** What a world's setup restores: the project's data (`bytes`) and the disk
+ * that holds it with room to work (`diskGb`; world/data-disk.ts). */
+export interface DataDiskNeed { bytes: number; diskGb: number }
+
+/** "31.3 GB" (GB of 2^30 bytes, as every disk size here). */
+export function dataSize(bytes: number): string {
+  const value = bytes / 2 ** 30;
+  return `${value >= 100 ? Math.round(value) : value >= 0.1 ? value.toFixed(1) : value.toFixed(2)} GB`;
+}
+
+/** Why a computer on this account can't be the world of a project whose data needs `need`. */
+export function dataTooLarge(provider: string, limitGb: number, need: DataDiskNeed): string {
+  return `This project's data takes ${dataSize(need.bytes)}, so its computer needs ${need.diskGb} GB of disk, and one on this `
+    + `${providerLabel(provider)} account has at most ${limitGb} GB: it ${DISK_CANNOT_HOLD_DATA}. `
+    + 'Choose another computer (Any picks one that fits).';
+}
+
+/** Why world setup stopped when the disk filled while it restored `bytes` of the project's data. */
+export function dataFilledDisk(bytes: number, disk: string): string {
+  return `The disk filled up while restoring this project's data (${dataSize(bytes)}; ${disk}): this computer ${DISK_CANNOT_HOLD_DATA}. `
+    + 'Give it a larger disk or choose another computer (Any picks one that fits).';
+}
+
+/** A computer that can never hold what its world must (dataTooLarge,
+ * dataFilledDisk): retrying on it only repeats the failure, so world setup
+ * fails as `computer-unfit`, for a person to choose another. */
+export class ComputerUnfit extends Error {
+  override name = 'ComputerUnfit';
+}
+
+/** The disk a machine on `provider` is asked for when it must hold `holdsGb`
+ * (its project's data with room to work): `diskGb` (else the provider's
+ * default) when that is enough, otherwise `holdsGb`. Never smaller than asked. */
+export function diskHolding(provider: string, diskGb: number | undefined, holdsGb: number | undefined): number | undefined {
+  if (holdsGb == null) return diskGb;
+  const asked = diskGb ?? PROVIDERS[provider]?.defaults.diskGb;
+  return asked != null && asked >= holdsGb ? diskGb : holdsGb;
+}
+
+export function assertComputerFits(spec: MachineShape & { network?: { unrestricted?: boolean }; reachesTavya?: string; holdsData?: DataDiskNeed },
   limits: ComputerLimits & { source?: EffectiveComputerLimits['source'] }, provider: string): void {
   const account = `on this ${providerLabel(provider)} account`;
   const where = (key: LimitKey) => limits.source?.[key] === 'plan' ? FREE_COMPUTER_HINT : account;
@@ -302,6 +346,8 @@ export function assertComputerFits(spec: MachineShape & { network?: { unrestrict
   if (spec.network?.unrestricted === false && limits.network === 'basic')
     throw new Error(`This ${providerLabel(provider)} account has basic internet only, so it can't use an allowlist`);
   if (spec.reachesTavya && limits.network === 'basic') throw new Error(unreachableTavya(provider, spec.reachesTavya));
+  if (spec.holdsData && limits.diskGb != null && spec.holdsData.diskGb > limits.diskGb)
+    throw new ComputerUnfit(dataTooLarge(provider, limits.diskGb, spec.holdsData));
   if (spec.diskGb != null && limits.diskGb != null && spec.diskGb > limits.diskGb)
     throw new Error(`Disk can be at most ${limits.diskGb} GB ${where('diskGb')}`);
   if (spec.memoryMb != null && limits.memoryMb != null && spec.memoryMb > limits.memoryMb)

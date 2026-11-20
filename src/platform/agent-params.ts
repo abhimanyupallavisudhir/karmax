@@ -1,6 +1,7 @@
 import type { AgentSpec, Avatar, Project, ProjectConfig, SubTaskParams } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { LOCAL_WORLD_KINDS, runsOnHost, applyComputer, machineShape, normalizeComputer, type ComputerSpec, type MachineShape } from '../domain/computer.js';
+import type { DataDiskNeed } from '../domain/computer-limits.js';
 import { manifest } from '../contrib/manifests.js';
 import { isAgentProvider } from '../agent/provider-registry.js';
 import { validateMcpSelection } from '../mcp/connections/store.js';
@@ -61,7 +62,7 @@ const SUB_TASK_AGENT_KEYS = ['provider', 'model', 'effort', 'mcpConnections'];
 export interface ComputerChecks {
   available(organizationId: string | undefined, provider: string): Promise<boolean>;
   assertFits(organizationId: string | undefined, provider: string | undefined,
-    spec: MachineShape & { network?: ProjectConfig['network']; reachesTavya?: string }): Promise<void>;
+    spec: MachineShape & { network?: ProjectConfig['network']; reachesTavya?: string; holdsData?: DataDiskNeed }): Promise<void>;
 }
 
 /** A parent's own Computer (its task-level value), which its sub-tasks start
