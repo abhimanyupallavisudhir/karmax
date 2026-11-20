@@ -162,8 +162,10 @@ export interface LoginSandbox {
   provider: string;
   /** It was running, or parked, from an earlier turn of this task. */
   reused: boolean;
-  /** The turn ended: it stays, running until the sweep parks it. */
-  settle(): Promise<void>;
+  /** The turn ended: it stays, running until the sweep parks it. Given the
+   * turn's failure, it is first asked of its provider whether it still
+   * exists: one that is gone is forgotten, so the retry makes another. */
+  settle(failure?: unknown): Promise<void>;
   /** Something went wrong with it: destroy it now. */
   discard(): Promise<void>;
 }
@@ -258,8 +260,16 @@ export class LoginSandboxes {
       }
       return {
         world: opened.world, provider: entry.provider, reused: opened.reused,
-        settle: async () => {
+        settle: async (failure?: unknown) => {
           stop();
+          // A sandbox lost under the turn (reaped, killed by its provider, expired)
+          // still opens from a connection this process keeps (E2B's), so every
+          // later turn would fail in it for ever (tavya-error 392322d5fc85238d:
+          // 15 attempts, then a person). Only the control plane proves it gone.
+          if (failure !== undefined && await this.gone(entry.handle)) {
+            await this.retire(taskId, 'destroy').catch(() => undefined);
+            return;
+          }
           const current = await this.entry(taskId);
           if (current) await this.save(taskId, { ...current, usedAt: this.now(), busyUntil: undefined });
           // It keeps running for the idle period: the slot is held that long.
@@ -275,6 +285,23 @@ export class LoginSandboxes {
       await this.releaseSlot(organizationId, taskId).catch(() => undefined);
       throw error;
     }
+  }
+
+  /** Whether `handle`'s provider says the sandbox no longer exists (never a guess: unknown is not gone). */
+  private async gone(handle: WorldHandle): Promise<boolean> {
+    return (await this.registry().probe(handle).catch(() => undefined)) === 'missing';
+  }
+
+  /**
+   * Make a sandbox labelled `label` and record it, under the label's world
+   * operation lock. The orphan reaper judges every sandbox it lists under that
+   * lock, so it never finds one of these made but not yet recorded: a login
+   * sandbox is no task world (its task's world is `none`), and unrecorded it
+   * reads as a stray duplicate (tavya-error 392322d5fc85238d: reaped 0.6 s
+   * after it was made, while its create was still answering).
+   */
+  private recorded<T>(label: string, work: () => Promise<T>): Promise<T> {
+    return this.registry().withOperation(label, work);
   }
 
   /** The task's sandbox from an earlier turn, running again; undefined when it has none (or it is gone). */
@@ -309,21 +336,26 @@ export class LoginSandboxes {
       try { pooled = JSON.parse(value) as PooledSandbox; } catch { continue; }
       // Taken by this claim alone; one of other CLI versions is not taken (the sweep replaces it).
       if (!pooled.ready || pooled.packages.join(' ') !== packages.join(' ') || pooled.funding !== candidate.funding) continue;
-      if (!(await this.deps.store.kvCompareAndSet(key, value, undefined))) continue;
       const label = pooled.handle.id;
-      await this.deps.store.kvSet(ownerKey(label), input.taskId);
-      try {
-        const world = await timed('login-sandbox.claim', () => this.registry().get(pooled.provider).open(pooled.handle));
-        const now = this.now();
-        const entry: LoginSandboxEntry = { organizationId: input.organizationId, ...(input.projectId ? { projectId: input.projectId } : {}),
-          provider: pooled.provider, ...(pooled.funding ? { funding: pooled.funding } : {}), handle: pooled.handle,
-          state: 'running', usedAt: now, runningSince: now };
-        await this.save(input.taskId, entry);
-        return { world, entry, reused: false };
-      } catch {
-        await this.deps.store.kvDelete(ownerKey(label)).catch(() => undefined);
-        await this.destroyHandle(pooled.handle);
-      }
+      // From leaving the pool to its task's entry, the reaper waits (it would find it neither pooled nor owned).
+      const claimed = await this.recorded(label, async () => {
+        if (!(await this.deps.store.kvCompareAndSet(key, value, undefined))) return undefined;
+        await this.deps.store.kvSet(ownerKey(label), input.taskId);
+        try {
+          const world = await timed('login-sandbox.claim', () => this.registry().get(pooled.provider).open(pooled.handle));
+          const now = this.now();
+          const entry: LoginSandboxEntry = { organizationId: input.organizationId, ...(input.projectId ? { projectId: input.projectId } : {}),
+            provider: pooled.provider, ...(pooled.funding ? { funding: pooled.funding } : {}), handle: pooled.handle,
+            state: 'running', usedAt: now, runningSince: now };
+          await this.save(input.taskId, entry);
+          return { world, entry, reused: false as const };
+        } catch {
+          await this.deps.store.kvDelete(ownerKey(label)).catch(() => undefined);
+          await this.destroyHandle(pooled.handle);
+          return undefined;
+        }
+      });
+      if (claimed) return claimed;
     }
     return undefined;
   }
@@ -354,13 +386,15 @@ export class LoginSandboxes {
         if (pool.length >= want) return made;
         const label = `${POOL_LABEL_PREFIX}${crypto.randomUUID()}`;
         const poolKey = `${poolPrefix(organizationId, provider)}${label}`;
-        const world = await timed('login-sandbox.pool-create', () => this.registry().get(provider).create({
-          taskId: label, organizationId, generation: LOGIN_SANDBOX_GENERATION, base: 'main', scratch: true,
-          network: { unrestricted: true }, warmPackages: packages, ...sizeFor(provider) }));
-        // Known before it runs anything, so the orphan reaper spares it.
-        const pooled: PooledSandbox = { organizationId, provider, ...(funding ? { funding } : {}), handle: world.handle, packages, createdAt: this.now() };
-        const warming = JSON.stringify(pooled);
-        await this.deps.store.kvSet(poolKey, warming);
+        // Recorded as made, before it runs anything, so the orphan reaper spares it.
+        const { world, pooled, warming } = await this.recorded(label, async () => {
+          const made = await timed('login-sandbox.pool-create', () => this.registry().get(provider).create({
+            taskId: label, organizationId, generation: LOGIN_SANDBOX_GENERATION, base: 'main', scratch: true,
+            network: { unrestricted: true }, warmPackages: packages, ...sizeFor(provider) }));
+          const record: PooledSandbox = { organizationId, provider, ...(funding ? { funding } : {}), handle: made.handle, packages, createdAt: this.now() };
+          await this.deps.store.kvSet(poolKey, JSON.stringify(record));
+          return { world: made, pooled: record, warming: JSON.stringify(record) };
+        });
         try {
           const homes = (await this.recent(organizationId, provider)).homes;
           await timed('login-sandbox.pool-warm', () => world.exec('bash', ['-c', POOL_WARM_UP(packages, world.handle.root, homes)], { timeoutMs: 150_000 }));
@@ -416,21 +450,23 @@ export class LoginSandboxes {
     for (const candidate of route.candidates) {
       try {
         input.signal?.throwIfAborted();
-        const world = await timed('login-sandbox.create', () => this.registry().get(candidate.provider).create({
-          taskId: input.taskId, organizationId: input.organizationId, generation: LOGIN_SANDBOX_GENERATION,
-          base: 'main', scratch: true, ...(input.signal ? { signal: input.signal } : {}),
-          network: { unrestricted: true }, ...sizeFor(candidate.provider),
-          // A template whose npx cache already holds the CLIs, where the provider has one.
-          warmPackages: loginCliPackages(),
-        }));
-        world.handle.meta = { ...world.handle.meta, loginSandbox: true };
-        const now = this.now();
-        const entry: LoginSandboxEntry = { organizationId: input.organizationId, ...(input.projectId ? { projectId: input.projectId } : {}),
-          provider: candidate.provider, ...(candidate.funding ? { funding: candidate.funding } : {}),
-          handle: world.handle, state: 'running', usedAt: now, runningSince: now };
-        // Recorded at once, so the orphan reaper knows it is this task's.
-        await this.save(input.taskId, entry);
-        return { world, entry, reused: false };
+        // Recorded before the reaper may judge it, so it knows it is this task's.
+        return await this.recorded(input.taskId, async () => {
+          const world = await timed('login-sandbox.create', () => this.registry().get(candidate.provider).create({
+            taskId: input.taskId, organizationId: input.organizationId, generation: LOGIN_SANDBOX_GENERATION,
+            base: 'main', scratch: true, ...(input.signal ? { signal: input.signal } : {}),
+            network: { unrestricted: true }, ...sizeFor(candidate.provider),
+            // A template whose npx cache already holds the CLIs, where the provider has one.
+            warmPackages: loginCliPackages(),
+          }));
+          world.handle.meta = { ...world.handle.meta, loginSandbox: true };
+          const now = this.now();
+          const entry: LoginSandboxEntry = { organizationId: input.organizationId, ...(input.projectId ? { projectId: input.projectId } : {}),
+            provider: candidate.provider, ...(candidate.funding ? { funding: candidate.funding } : {}),
+            handle: world.handle, state: 'running', usedAt: now, runningSince: now };
+          await this.save(input.taskId, entry);
+          return { world, entry, reused: false as const };
+        });
       } catch (error) {
         if (input.signal?.aborted) throw error;
         last = error;
