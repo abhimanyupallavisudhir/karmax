@@ -81,7 +81,7 @@ describe('agent CLI release watcher', () => {
       release('rust-v0.171.0', { body: '- Added GPT-6.2 Sol and Astra to model catalogs, with Sol as the default catalog selection. (#62106)' }),
       release('rust-v0.170.1', { body: '- Added GPT-7 Vela, Lyra, and Nova to the model catalog (#1)' }),
     ], { ...context, knownModels: new Set() });
-    expect(events[0].payload.reasons).toEqual([
+    expect(events[0]?.payload.reasons).toEqual([
       'new model gpt-7-vela (0.170.1)', 'new model gpt-7-lyra (0.170.1)', 'new model gpt-7-nova (0.170.1)',
       'new model gpt-6.2-sol (0.171.0)', 'new model gpt-6.2-astra (0.171.0)',
     ]);
