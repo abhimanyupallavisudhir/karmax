@@ -53,13 +53,28 @@ describe('respond_to_sub_task', () => {
   });
 });
 
+describe('an answer to a task that is not one of the caller\'s sub-tasks', () => {
+  // It would be dropped after the turn (ownSubTaskResponses), while the tool had already said
+  // "queued": agents told people their answer was sent (ask-eval 2026-11-19: 10 of 22 cheap runs).
+  it('is refused at once, pointing to message_agent', async () => {
+    const { platformToolHandlers } = await import('../src/agent/tools.js');
+    const responses: unknown[] = [];
+    const handlers = platformToolHandlers({ handle: { id: 'task', root: '/w', branch: 'b', base: 'main' } } as any,
+      { respondToSubTask: (r: unknown) => { responses.push(r); },
+        platformRequest: async () => ({ id: 'other', parentTaskId: 'someone-else', stage: 'do', status: 'waiting', waitingFor: { kind: 'parent' } }) } as any);
+    expect(await handlers.respond_to_sub_task!({ action: 'comment', child_task_id: 'other', text: 'Keep /blog' }))
+      .toMatch(/not one of this task's sub-tasks.*message_agent/);
+    expect(responses).toEqual([]);
+  });
+});
+
 describe('an answer the waiting sub-task cannot act on', () => {
   // Answering, the parent stops waiting for the child; an answer whose flag its
   // wait never reads left both tasks standing still for good.
   it('is refused with the answers that apply, and queued when the child is not waiting for it', async () => {
     const { platformToolHandlers } = await import('../src/agent/tools.js');
     const { applicableSubTaskActions } = await import('../src/domain/sub-task-responses.js');
-    let child: Record<string, unknown> = { stage: 'review', status: 'waiting', waitingFor: { kind: 'parent' }, actions: [] };
+    let child: Record<string, unknown> = { parentTaskId: 'task', stage: 'review', status: 'waiting', waitingFor: { kind: 'parent' }, actions: [] };
     const responses: unknown[] = [];
     const handlers = platformToolHandlers({ handle: { id: 'task', root: '/w', branch: 'b', base: 'main' } } as any,
       { respondToSubTask: (r: unknown) => { responses.push(r); }, platformRequest: async () => child } as any);
@@ -67,12 +82,12 @@ describe('an answer the waiting sub-task cannot act on', () => {
       .toBe('"open_pr" does not apply now: that sub-task is at Review. Answer with confirm | comment | cancel.');
     expect(await handlers.respond_to_sub_task!({ action: 'retry', child_task_id: 'child' })).toMatch(/does not apply/);
     expect(await handlers.respond_to_sub_task!({ action: 'confirm', child_task_id: 'child' })).toMatch(/confirm queued/);
-    child = { stage: 'do', status: 'waiting', waitingFor: { kind: 'parent' } };
+    child = { parentTaskId: 'task', stage: 'do', status: 'waiting', waitingFor: { kind: 'parent' } };
     expect(await handlers.respond_to_sub_task!({ action: 'keep_own', child_task_id: 'child' }))
       .toMatch(/the end of a turn\. Answer with open_pr \| confirm \| comment \| cancel/);
     expect(await handlers.respond_to_sub_task!({ action: 'open_pr', child_task_id: 'child' })).toMatch(/queued/);
     // Still working: an answer waits for its next stop.
-    child = { stage: 'do', status: 'active' };
+    child = { parentTaskId: 'task', stage: 'do', status: 'active' };
     expect(await handlers.respond_to_sub_task!({ action: 'retry', child_task_id: 'child' })).toMatch(/queued/);
     expect(responses).toHaveLength(3);
     expect(applicableSubTaskActions({ stage: 'escalated', status: 'blocked', waitingFor: { kind: 'parent' },

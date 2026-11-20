@@ -1313,7 +1313,10 @@ export function platformToolHandlers(
       // An answer its wait cannot act on would leave it, and this task, waiting.
       if (args?.child_task_id && ctx.platformRequest) {
         const child = await Promise.resolve(ctx.platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args.child_task_id))}`))
-          .catch(() => undefined) as Parameters<typeof applicableSubTaskActions>[0] | undefined;
+          .catch(() => undefined) as (Parameters<typeof applicableSubTaskActions>[0] & { parentTaskId?: string }) | undefined;
+        // Only this task's own children receive it (ownSubTaskResponses drops the rest after the turn): say so now.
+        if (child?.stage && child.parentTaskId !== (ctx.taskId ?? world.handle.id))
+          return `${String(args.child_task_id)} is not one of this task's sub-tasks, so nothing was sent. To tell another task something, use message_agent.`;
         const applicable = child?.stage ? applicableSubTaskActions(child) : undefined;
         if (applicable && !applicable.includes(action as SubTaskAction))
           return `"${action}" does not apply now: that sub-task is at ${child!.stage === 'escalated' || child!.status === 'blocked' ? 'a failed step' : child!.stage === 'review' ? 'Review' : 'the end of a turn'}. Answer with ${applicable.join(' | ')}.`;

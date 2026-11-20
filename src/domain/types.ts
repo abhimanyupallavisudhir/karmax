@@ -985,6 +985,11 @@ export interface OrganizationUsagePolicy {
   /** Hosted: computed from the plan's active-agent concurrency and never
    * independently configurable. Private installs retain their saved pool guard. */
   maxActiveWorlds: number;
+  /** How many small cloud sandboxes the subscription-login turns of tasks
+   * without a computer run at once (wiki features/computerless-tasks); a
+   * turn beyond waits. Hosted: the installation's number
+   * (KARMAX_LOGIN_SANDBOXES_PER_ORG, default 2), never raised by an owner. */
+  maxLoginSandboxes: number;
 }
 
 // ─── Git & GitHub configuration (wiki plans/PLAN-git-config) ────────────────

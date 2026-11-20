@@ -10,6 +10,8 @@ import { World } from '../world/types.js';
 
 /** Platform capabilities the agent reaches via the platform MCP, surfaced as tool calls. */
 export interface PlatformToolContext {
+  /** The task this turn belongs to (its world's handle id where absent). */
+  taskId?: string;
   /** Do-agent ONLY: declare that the completed, committed proposal is ready to
    *  publish and enter Review. This is deliberately distinct from merely ending
    *  a model turn or asking a human for input. */
@@ -130,6 +132,12 @@ export interface TurnInput {
   /** Fork `session` into a NEW session instead of continuing it (SPEC §10.5): the
    *  source is left untouched. Claude → `--fork-session`; Codex → resume a copied rollout. */
   fork?: boolean;
+  /** A task without a computer whose model is a subscription login: the
+   *  machine its login's CLI runs in this turn (a login sandbox, or on a
+   *  self-hosted install the `none` world itself, i.e. this host). `world`
+   *  stays the task's `none` world, which is what its tools see; the CLI is
+   *  offered only tavya's platform tools (wiki features/computerless-tasks). */
+  harnessWorld?: World;
   /** Assembled system prompt (role template + bindings + instructions), snapshotted upstream. */
   systemPrompt: string;
   role: AgentRole;

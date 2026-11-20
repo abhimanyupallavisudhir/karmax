@@ -78,7 +78,9 @@ export const NO_COMPUTER_WORLD = `No computer: you run on ${BRAND} itself, with 
   + 'Work that needs a computer (running code, changing a repository, using a website) goes to a task you create with create_task, giving it one '
   + '(params {"computer": {"provider": "any"}}): describe the work fully in its prompt, follow it (get_conversation, add_follow_up_trigger, message_agent) and report what it did. '
   + 'Irreversible capabilities (deleting, members, teams, authorization, users, revealing credentials, payments and cards) are held back: when you need one, '
-  + 'ask for exactly it with request_permission (a card as use-card:<id>); my_authorization lists what is held back.';
+  + 'ask for exactly it with request_permission (a card as use-card:<id>); my_authorization lists what is held back. '
+  + 'Do only what was asked: change no setting, task or other work the person did not name, and when a request is unclear or would change more than it names, ask first. '
+  + 'Use as few tool calls as the answer needs, then reply briefly.';
 
 /** TOOLS_PREAMBLE for a task without a computer: its world tools dropped, and
  * what it does instead of working in a directory. */
@@ -130,6 +132,10 @@ export interface AssembleArgs {
   bindings?: Record<string, string>;
   /** A sub-task's siblings: its parent's other sub-tasks still at work. */
   siblings?: Array<{ id: string; title: string; num?: number }>;
+  /** Without a computer: the task's organization and the projects its person
+   *  can reach there, so a request naming another project needs no lookup. */
+  organizationId?: string;
+  projects?: Array<{ id: string; name: string }>;
 }
 
 const AGENT_AUTHORED_BINDINGS = ['transcript', 'reviewInfo', 'changedFiles', 'error'] as const;
@@ -187,7 +193,16 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
     values.worldRepos = '';
     const world = /Working directory: \{\{worldPath\}\}[^\n]*/;
     const fill = (text: string) => text.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
-    return world.test(tpl) ? fill(tpl.replace(world, NO_COMPUTER_WORLD)) : `${fill(tpl)}\n\n# World\n${NO_COMPUTER_WORLD}`;
+    // Its own ids, for the tools that take them (add_follow_up_trigger, get_task, list_events): a
+    // task with a computer reads them from its branch; without these, models could not follow up.
+    // The projects too: at low effort most models searched only their own project for a page
+    // in another (ask-eval 2026-11-19, wiki features/computerless-tasks § What an Ask costs).
+    const listed = (args.projects ?? []).slice(0, 30).map((project) => `"${project.name}" (${project.id})`);
+    const more = (args.projects?.length ?? 0) > listed.length ? `, and ${args.projects!.length - listed.length} more` : '';
+    const section = `${NO_COMPUTER_WORLD}\nThis task's id is ${args.task.taskId} (project ${args.task.projectId}`
+      + `${args.organizationId ? `, organization ${args.organizationId}` : ''}).`
+      + (listed.length > 1 ? ` Projects you can reach there: ${listed.join(', ')}${more}.` : '');
+    return world.test(tpl) ? fill(tpl.replace(world, () => section)) : `${fill(tpl)}\n\n# World\n${section}`;
   }
   return tpl.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
 }

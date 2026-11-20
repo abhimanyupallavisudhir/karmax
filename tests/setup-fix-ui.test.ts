@@ -53,6 +53,16 @@ describe('what a person does about a task that cannot start', () => {
     expect((await ui.run<string>(`readinessNoticeHtml(readinessGaps({ agents: [{ provider: 'opencode', model: 'openrouter/openai/gpt-6.1-sol', ready: true, cost: 12.4 }],
       compute: { ready: true }, storage: { full: true, usedBytes: 1, quotaBytes: 1 } }))`)).replace(/<[^>]+>/g, ''))
       .toBe('!On your credit: costs 12× the included model·Storage is full: Add storage');
+    // Without a computer, a Claude Code login is ready (its CLI runs in a small cloud computer): no notice at all.
+    expect(await ui.run(`readinessGaps({ agents: [{ provider: 'claude', ready: true, sandbox: true }], compute: { ready: true, none: true } })`)).toEqual([]);
+    // With nowhere to run it, the fix is a computer, never "Pick another model"; the honest reason is one hover away.
+    const noCompute = await ui.run<any[]>(`readinessGaps({ agents: [{ provider: 'claude', ready: false, need: { provider: 'claude',
+      computerless: 'A Claude Code login replies from a small cloud computer, and this organization has none it can use.', computerlessFix: 'computer' } }],
+      compute: { ready: true, none: true } })`);
+    expect(noCompute).toEqual([{ label: 'Connect a computer', href: '/org/settings#settings-computers', tip: expect.stringMatching(/small cloud computer/) }]);
+    const noKey = await ui.run<any[]>(`readinessGaps({ agents: [{ provider: 'opencode', model: 'google/gemini-3-pro', ready: false,
+      need: { provider: 'google', computerless: "can't run without a computer", computerlessFix: 'model' } }], compute: { ready: true, none: true } })`);
+    expect(noKey.map((gap) => gap.label)).toEqual(['Pick another model']);
     // Ready, or unknown (the readiness call failed): nothing to say.
     expect(await ui.run(`readinessGaps({ agents: [{ provider: 'claude', ready: true }], compute: { ready: true } })`)).toEqual([]);
     expect(await ui.run(`readinessGaps(null)`)).toEqual([]);

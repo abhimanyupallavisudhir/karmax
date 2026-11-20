@@ -2132,6 +2132,7 @@ export class KarmaxApi {
       resolved.remote = 'pr';
     (await this.materializeUnifiedAgents(resolved, project));
     (await this.pinIncludedModelDefaults(manifest, resolved, project));
+    (await this.askEffort(resolved, layers, project));
 
     // Auto-detect the repo's branch policy when base/target weren't set anywhere,
     // instead of guessing "main" (which would make hosted task views disagree
@@ -2214,6 +2215,27 @@ export class KarmaxApi {
         ...(spec?.mcpConnections === undefined && profile.mcpConnections !== undefined ? { mcpConnections: profile.mcpConnections } : {}),
       };
     }
+  }
+
+  /**
+   * A task without a computer (an Ask) thinks at low effort unless a layer of
+   * its own parameters chose one: an Ask is a few platform calls, and its
+   * default model's effort is set for coding (the included model's is max),
+   * which made Asks slow and dear (wiki features/computerless-tasks § What an
+   * Ask costs). An inherited agent is pinned here, as the task form would.
+   */
+  private async askEffort(resolved: ValueMap, layers: (ValueMap | undefined)[], project: Project): Promise<void> {
+    if (!isComputerless((resolved.computer as { provider?: string } | undefined)?.provider)) return;
+    if (layers.some((layer) => (layer?.['agent:do'] as AgentSpec | undefined)?.effort)) return;
+    let spec = resolved['agent:do'] as AgentSpec | undefined;
+    if (!spec?.provider) {
+      const { profile } = await this.defaultAgent('do', project);
+      const provider = (profile?.provider ?? this.deps.defaultAgentProvider ?? defaultProvider().provider) as Provider;
+      const model = profile?.model ?? defaultModel(provider);
+      spec = { ...spec, provider, ...(model ? { model } : {}),
+        ...(spec?.mcpConnections === undefined && profile?.mcpConnections !== undefined ? { mcpConnections: profile.mcpConnections } : {}) };
+    }
+    resolved['agent:do'] = { ...spec, effort: 'low' };
   }
 
   /** Capture the exact provider/model/effort selection that the activity runtime
@@ -9978,3 +10000,4 @@ export type WebhookView = IncomingWebhook & { linked?: Array<LinkedPerson & { na
 
 /** A person's linked chat account, with the bot it was made with. */
 export type ChatLinkView = Omit<ChatLink, 'hookId' | 'projectId' | 'organizationId'> & { bot: { id: string; name: string; username?: string } };
+

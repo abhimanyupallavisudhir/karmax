@@ -52,9 +52,18 @@ it('restores a backup over lost state, and the console carries the restored task
   // The task itself is not what this journey checks: start it as an API caller would.
   const created = await consoleRequest(operator.context, app.url, 'POST', `/api/projects/${project.id}/tasks`,
     { title: '@write restored.txt', prompt: '@write restored.txt :: survived the restore', workflow: 'software-dev' });
-  const reviewed = async () => (await consoleRequest(operator.context, app!.url, 'GET', `/api/projects/${project.id}/tasks`))
-    .find((task: any) => task.title.includes('@write restored.txt'))?.lastView?.stage;
-  await operator.step('the agent reaches Review', () => expect.poll(reviewed, { timeout: 30_000 }).toBe('review'));
+  // Wait for Review's resting point, the human gate, not the first view that
+  // says Review: entering Review runs more activities after that view
+  // (beginResourceReview, the resource steps), and stopping the app while one
+  // runs leaves it Started by a dead worker until its 5-minute start-to-close
+  // timeout, so the restored workflow takes Confirm and then waits on it
+  // (CI #2179 … #3047: "Confirming… Bringing in newer data…", 2026-11-20).
+  const resting = async () => {
+    const view = await consoleRequest(operator.context, app!.url, 'GET', `/api/tasks/${created.id}`);
+    return `${view.stage} ${view.status} ${view.waitingFor?.kind}`;
+  };
+  await operator.step('the agent reaches Review and waits for a person', () =>
+    expect.poll(resting, { timeout: 30_000 }).toBe('review waiting human'));
   expect(operator.errors).toEqual([]);
   await operator.context.close();
   await app.stop();

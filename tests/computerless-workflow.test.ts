@@ -83,10 +83,28 @@ describe('a task without a computer', () => {
     await Worker.runReplayHistory({ workflowsPath }, await h.client.workflow.getHandle(task.id).fetchHistory());
   }, 180_000);
 
-  it('cannot start on a subscription login: it says so instead of waiting', async () => {
+  it('creates a sub-task, which also runs without a computer (no git snapshot of a world that has none)', async () => {
+    const project = await h.store.createProject(newId('Assistant sub'), { worldProvider: 'worktree', defaultBase: 'main' });
+    const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
+    const task = await h.api.createTask(token, { projectId: project.id, workflow: 'software-dev', params: {
+      computer: { provider: 'none' },
+      prompt: '@tool create_sub_task {"title": "Look it up", "prompt": "@say Found it."}\n@say Asked a sub-task.',
+    } });
+    await expect.poll(async () => (await h.store.listTasks(project.id)).filter((t: any) => t.parentTaskId === task.id).length,
+      { timeout: 60_000 }).toBe(1);
+    const child = (await h.store.listTasks(project.id)).find((t: any) => t.parentTaskId === task.id)!;
+    await expect.poll(async () => said(await view(child.id)), { timeout: 60_000 }).toContain('Found it.');
+    expect((await h.store.currentWorld(child.id) as WorldHandle).kind).toBe('none');
+    const current = await view(task.id);
+    expect(JSON.stringify(current.error ?? '')).not.toMatch(/git|computer/i);
+    await h.client.workflow.getHandle(child.id).cancel().catch(() => undefined);
+    await h.client.workflow.getHandle(task.id).cancel().catch(() => undefined);
+  }, 120_000);
+
+  it('with neither a login nor a key, it says so instead of waiting', async () => {
     const project = await h.store.createProject(newId('Assistant'), { worldProvider: 'worktree', defaultBase: 'main' });
     const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
-    // No API key anywhere: only a login could serve Codex, and a login needs a computer.
+    // No API key and no Codex login anywhere: a login could run its CLI here (self-hosted), but there is none.
     const keys = { OPENAI_API_KEY: process.env.OPENAI_API_KEY, ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY };
     delete process.env.OPENAI_API_KEY;
     delete process.env.ANTHROPIC_API_KEY;
@@ -97,7 +115,7 @@ describe('a task without a computer', () => {
     await expect.poll(async () => {
       const current = await view(task.id);
       return JSON.stringify(current.messages) + JSON.stringify(current.error ?? '') + JSON.stringify(current.waitingFor ?? '');
-    }, { timeout: 60_000 }).toMatch(/runs only on a computer|needs an API key|can't run without a computer/i);
+    }, { timeout: 60_000 }).toMatch(/A Codex login or an API key is needed: there is neither here/);
     await h.client.workflow.getHandle(task.id).cancel().catch(() => undefined);
     } finally {
       for (const [name, value] of Object.entries(keys)) if (value !== undefined) process.env[name] = value;
@@ -121,7 +139,7 @@ describe('a task without a computer', () => {
         [agent], { computerless: true });
       const gap = readiness.agents[0]!.need?.computerless;
       expect(readiness.agents[0]!.ready).toBe(false);
-      expect(gap).toMatch(/runs only on a computer/);
+      expect(gap).toMatch(/Claude Code login or an API key is needed/);
       const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
       const task = await h.api.createTask(token, { projectId: project.id, workflow: 'software-dev', params: {
         computer: { provider: 'none' }, prompt: 'hello', 'agent:do': agent,

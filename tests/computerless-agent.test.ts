@@ -6,7 +6,10 @@ import { CodexAdapter } from '../src/agent/codex.js';
 import { AcpAdapter } from '../src/agent/acp.js';
 import { MockAdapter } from '../src/agent/mock.js';
 import { runTurn } from '../src/agent/runtime.js';
-import { chatCompletionsEndpoint, ComputerlessModelUnsupported, computerlessApiKey, computerlessModelGap } from '../src/agent/computerless.js';
+import { ASK_TOOL_NAMES, chatCompletionsEndpoint, ComputerlessModelUnsupported, computerlessApiKey, computerlessModelGap } from '../src/agent/computerless.js';
+
+// A host-side turn is offered Ask's own tool set (more_tools turns on the rest: tests/ask-cost.test.ts).
+const ASK_OFFERED = [...ASK_TOOL_NAMES, 'more_tools'].sort();
 import { COMPUTERLESS_TOOL_SCHEMAS, WORLD_TOOL_NAMES, computerlessToolHandlers } from '../src/agent/tools.js';
 import { assemblePrompt, NO_COMPUTER_WORLD } from '../src/agent/prompt.js';
 import { WorldRegistry } from '../src/world/registry.js';
@@ -105,14 +108,17 @@ describe('tools of a task without a computer', () => {
 });
 
 describe('which models run without a computer', () => {
-  it('API keys and the included model do; subscription logins and unknown vendors do not', () => {
+  it('API keys and the included model do; subscription logins where their CLI can run; unknown vendors do not', () => {
     expect(computerlessModelGap({ provider: 'claude' }, { apiKey: true })).toBeUndefined();
     expect(computerlessModelGap({ provider: 'codex' }, { apiKey: true })).toBeUndefined();
     expect(computerlessModelGap({ provider: 'opencode', model: 'openrouter/deepseek/deepseek-v4.1-flash-1017' }, { apiKey: true })).toBeUndefined();
     expect(computerlessModelGap({ provider: 'opencode', model: 'anthropic/claude-haiku-5-5' }, { apiKey: true })).toBeUndefined();
     expect(computerlessModelGap({ provider: 'mock' }, { apiKey: false })).toBeUndefined();
-    expect(computerlessModelGap({ provider: 'claude' }, { apiKey: false })).toMatch(/Claude Code login runs only on a computer/);
-    expect(computerlessModelGap({ provider: 'codex' }, { apiKey: false })).toMatch(/Codex login runs only on a computer/);
+    // A login's CLI runs in a small sandbox of its own (login-sandbox.test.ts); with nowhere to run it, it says so.
+    expect(computerlessModelGap({ provider: 'claude' }, { apiKey: false, login: true, compute: true })).toBeUndefined();
+    expect(computerlessModelGap({ provider: 'codex' }, { apiKey: false, login: true, compute: true })).toBeUndefined();
+    expect(computerlessModelGap({ provider: 'claude' }, { apiKey: false, login: true })).toMatch(/Claude Code login replies from a small cloud computer, and this organization has none/);
+    expect(computerlessModelGap({ provider: 'codex' }, { apiKey: false })).toMatch(/Codex login or an API key is needed/);
     expect(computerlessModelGap({ provider: 'opencode', model: 'google/gemini-3-pro' }, { apiKey: true })).toMatch(/can't run without a computer/);
     expect(computerlessModelGap({ provider: 'kimi' as never }, { apiKey: true })).toMatch(/can't run without a computer/);
     expect(chatCompletionsEndpoint('openrouter/deepseek/deepseek-v4.1-flash-1017')).toMatchObject({ vendor: 'openrouter', model: 'deepseek/deepseek-v4.1-flash-1017' });
@@ -157,19 +163,19 @@ describe('which models run without a computer', () => {
         [{ provider: 'claude', model: 'claude-opus-5-5' }], { computerless: true });
       const hosted = (await ask(true)).agents[0]!;
       expect(hosted.ready).toBe(false);
-      expect(hosted.need?.computerless).toMatch(/runs only on a computer/);
+      expect(hosted.need?.computerless).toMatch(/Claude Code login or an API key is needed/);
       expect((await ask(false)).agents[0]!.ready).toBe(true);
     } finally {
       if (saved === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = saved;
     }
   });
 
-  it('a subscription login refuses before any request', async () => {
+  it('a subscription login never runs host-side: without a machine for its CLI it refuses before any request', async () => {
     const claude = new ClaudeAdapter().runComputerlessTurn(input({ resolvedAuth: { configHome: '/tmp/home' } }), context([]));
     await expect(claude).rejects.toBeInstanceOf(ComputerlessModelUnsupported);
     const codex = new CodexAdapter().runComputerlessTurn(input({ profile: { id: 'p', name: 'p', provider: 'codex', role: 'do', capabilities: [] },
       resolvedAuth: { configHome: '/tmp/home' } }), context([]));
-    await expect(codex).rejects.toThrow(/Codex login runs only on a computer/);
+    await expect(codex).rejects.toThrow(/Codex login replies from a small cloud computer/);
   });
 
   it('the runtime sends a computerless turn to the host-side rail, and refuses an agent without one', async () => {
@@ -242,7 +248,7 @@ describe('host-side loops of a task without a computer (stubbed model APIs)', ()
     expect(turn.usage).toMatchObject({ inputTokens: 30, outputTokens: 8 });
     expect(calls).toEqual([expect.objectContaining({ method: 'GET', path: '/api/inbox' })]);
     const offered = api.seen[0]!.body.tools.map((tool: { name: string }) => tool.name);
-    expect(offered.sort()).toEqual(COMPUTERLESS_TOOL_SCHEMAS.map((tool) => tool.name).sort());
+    expect(offered.sort()).toEqual(ASK_OFFERED);
     const results = api.seen[1]!.body.messages.at(-1).content;
     expect(results[0]).toMatchObject({ type: 'tool_result', tool_use_id: 'toolu_1' });
     expect(JSON.parse(results[0].content)).toMatchObject({ path: '/api/inbox' });
@@ -257,7 +263,7 @@ describe('host-side loops of a task without a computer (stubbed model APIs)', ()
       resolvedAuth: { apiKey: 'sk-test' } }), context([]));
     expect(turn.output).toBe('Nothing waits on you.');
     const offered = api.seen[0]!.body.tools.map((tool: { name: string }) => tool.name);
-    expect(offered.sort()).toEqual(COMPUTERLESS_TOOL_SCHEMAS.map((tool) => tool.name).sort());
+    expect(offered.sort()).toEqual(ASK_OFFERED);
   });
 
   it('OpenAI-compatible Chat Completions (the included model on OpenRouter): streamed tool calls round-trip', async () => {
@@ -288,10 +294,9 @@ describe('host-side loops of a task without a computer (stubbed model APIs)', ()
     expect(api.seen[0]!.path).toBe('/openrouter/v1/chat/completions');
     expect(api.seen[0]!.headers.authorization).toBe('Bearer sk-or-org');
     const first = api.seen[0]!.body;
-    expect(first).toMatchObject({ model: 'deepseek/deepseek-v4.1-flash-1017', stream: true, provider: { zdr: true }, reasoning: { effort: 'high' } });
+    expect(first).toMatchObject({ model: 'deepseek/deepseek-v4.1-flash-1017', stream: true, provider: { zdr: true, sort: 'price' }, reasoning: { effort: 'high' } });
     expect(first.messages[0]).toEqual({ role: 'system', content: 'system' });
-    expect(first.tools.map((tool: { function: { name: string } }) => tool.function.name).sort())
-      .toEqual(COMPUTERLESS_TOOL_SCHEMAS.map((tool) => tool.name).sort());
+    expect(first.tools.map((tool: { function: { name: string } }) => tool.function.name).sort()).toEqual(ASK_OFFERED);
     // message_agent went through the platform API, and its result came back to the model.
     expect(calls).toEqual([expect.objectContaining({ method: 'POST', path: '/api/tasks/task_9/messages' })]);
     const second = api.seen[1]!.body.messages;
@@ -333,5 +338,19 @@ describe('the prompt of a task without a computer', () => {
     expect(prompt).not.toMatch(/^- open_pr\(/m);
     expect(prompt).not.toMatch(/Working directory:/);
     expect(prompt).not.toMatch(/Do real work directly in the working directory/);
+    // Its own ids, for tools that take them (add_follow_up_trigger, get_task…): without them cheap models
+    // could not follow work they started (ask-eval 2026-11-19: 9/20 → 19/20 with this line).
+    expect(prompt).toMatch(/This task's id is task_1 \(project proj_1\)/);
+  });
+
+  it('names the projects its person can reach, so a request about another project needs no lookup', () => {
+    const prompt = assemblePrompt({ profile: { id: 'p', name: 'p', provider: 'claude', role: 'do', capabilities: [] }, role: 'do',
+      task: { taskId: 'task_1', projectId: 'proj_1', title: 'Ask', prompt: 'Summarize the deploy runbook in Website', project: { repos: [] } } as never,
+      world: world.handle, organizationId: 'org_1',
+      projects: [{ id: 'proj_1', name: 'Ask' }, { id: 'proj_2', name: 'Website' }] });
+    // ask-eval 2026-11-19 (low effort): 7 of 9 models looked only in the Ask's own project for a page in Website.
+    expect(prompt).toMatch(/organization org_1/);
+    expect(prompt).toContain('"Website" (proj_2)');
+    expect(prompt).toContain('"Ask" (proj_1)');
   });
 });

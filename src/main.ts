@@ -44,6 +44,7 @@ import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SEC
   GITHUB_APP_CLIENT_SECRET_HANDLE } from './integrations/github-app.js';
 import { GitHubDeploymentMonitor } from './integrations/github-deployment-monitor.js';
 import { WorldLifecycleManager } from './world/runners.js';
+import { LoginSandboxes } from './agent/login-sandbox.js';
 import { BrowserDeliveryAdapter, DeliveryDispatcher, WebhookDeliveryAdapter } from './collaboration/delivery.js';
 import { PushDeliveryAdapter, vaultVapidKeys } from './collaboration/push-delivery.js';
 import { NativePush } from './collaboration/native-push.js';
@@ -307,6 +308,10 @@ async function main() {
       siteName: async () => siteNameOf((await store.getSettings('global', 'appearance'))) }) });
   const handoffs = new WorldHandoffService(store, worlds, githubApp, runners, worldAccess, p.localCheckouts, resources);
   const worldLifecycle = new WorldLifecycleManager(store, worlds, checkpoints, 60_000, objectStore, runners, worldAccess);
+  // Subscription-login turns of tasks without a computer (wiki features/computerless-tasks):
+  // one registry of their sandboxes for the turns, the sweep and the orphan reaper.
+  const loginSandboxes = new LoginSandboxes({ store, worlds, connections: providerConnections });
+  worldLifecycle.loginSandboxes = loginSandboxes;
   // The project Files page and the wiki's view of a parked task read through
   // one service, so a saved task world is read the same way everywhere.
   const { ProjectFiles, projectRepositoryCredential } = await import('./world/project-files.js');
@@ -389,6 +394,7 @@ async function main() {
     configHomes,
     resources,
     providerConnections,
+    loginSandboxes,
     objects: objectStore,
     contentDir: p.content,
     hostLocal: deployment.hostLocal,
