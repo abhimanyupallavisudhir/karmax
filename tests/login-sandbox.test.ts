@@ -29,6 +29,10 @@ class FakeSandboxes implements WorldProvider {
   opened = 0; parked: string[] = []; destroyed: string[] = [];
   /** Tests: every exec waits for this first (a pooled sandbox still warming up). */
   gate?: Promise<void>;
+  /** Tests: create waits for this once the sandbox exists (its setup still running). */
+  createGate?: Promise<void>;
+  /** Tests: like E2B in the worker process, open trusts a cached sandbox without asking the provider. */
+  cachedOpen = false;
   state = new Map<string, 'running' | 'parked' | 'gone'>();
   constructor(readonly kind: string, private dir: string) {}
   private world(handle: WorldHandle): World {
@@ -39,19 +43,25 @@ class FakeSandboxes implements WorldProvider {
     this.created.push(spec);
     const id = `${this.kind}-sbx-${this.created.length}`;
     this.state.set(id, 'running');
+    await this.createGate;
     return this.world({ kind: this.kind, id: spec.taskId, root: path.join(this.dir, id), branch: 'b', base: spec.base,
       meta: { sandboxId: id }, repos: [] } as WorldHandle);
   }
   async open(handle: WorldHandle): Promise<World> {
     const id = String(handle.meta?.sandboxId);
-    if (this.state.get(id) === 'gone') throw new Error('sandbox not found');
+    if (this.state.get(id) === 'gone' && !this.cachedOpen) throw new Error('sandbox not found');
     this.opened++;
+    if (this.state.get(id) === 'gone') return this.world(handle);
     this.state.set(id, 'running');
     return this.world(handle);
   }
   async park(handle: WorldHandle): Promise<WorldHandle> { this.parked.push(String(handle.meta?.sandboxId)); this.state.set(String(handle.meta?.sandboxId), 'parked'); return handle; }
   async destroy(handle: WorldHandle): Promise<void> { this.destroyed.push(String(handle.meta?.sandboxId)); this.state.set(String(handle.meta?.sandboxId), 'gone'); }
   async status(): Promise<'ready'> { return 'ready'; }
+  async probe(handle: WorldHandle): Promise<'ready' | 'parked' | 'missing'> {
+    const state = this.state.get(String(handle.meta?.sandboxId));
+    return state === 'gone' || !state ? 'missing' : state === 'parked' ? 'parked' : 'ready';
+  }
 }
 
 let dir: string;
@@ -362,7 +372,75 @@ describe('login sandboxes', () => {
     expect(await pool.protects(task.id, () => false)).toBe(false);
     expect(await pool.protects('task_unknown')).toBe(false);
   });
+
+  // Production 2026-11-20 (task_mwpjntlv3153ab275a): the sweep listed the
+  // task's new E2B sandbox 0.7 s after E2B made it, before its record was
+  // saved, took it for a duplicate of the task's world (Computer None) and
+  // killed it. Every retry of the turn then failed on the dead sandbox.
+  it('the orphan reaper spares a login sandbox, or a pooled one, while it is still being made', async () => {
+    process.env.KARMAX_LOGIN_SANDBOX_POOL = '1';
+    const org = await store.createOrganization({ name: 'Making' });
+    const task = await taskIn(org.id);
+    const pool = sandboxes();
+    let finish!: () => void;
+    e2b.createGate = new Promise((resolve) => { finish = resolve; });
+    const opening = pool.open({ organizationId: org.id, taskId: task.id });
+    await waitFor(() => e2b.created.length === 1);
+    // E2B lists it now; the reaper cannot compare it with a record yet.
+    expect(await pool.protects(task.id, () => false)).toBe(true);
+    finish();
+    const opened = await opening;
+    // The pool refills beside it: its new sandbox, too, is spared while made.
+    e2b.createGate = new Promise((resolve) => { finish = resolve; });
+    await waitFor(() => e2b.created.length === 2);
+    expect(await pool.protects(e2b.created[1]!.taskId)).toBe(true);
+    finish();
+    await opened.settle();
+    // Made and recorded: the record decides again, and an unknown label is no one's.
+    const entry = (await pool.entry(task.id))!;
+    expect(await pool.protects(task.id, (handle) => handle.meta?.sandboxId === entry.handle.meta?.sandboxId)).toBe(true);
+    expect(await pool.protects(task.id, () => false)).toBe(false);
+    // A create that died with its process does not protect that label for ever.
+    // (Another organization: this one's next conversation would claim the pooled sandbox.)
+    e2b.createGate = new Promise(() => undefined);
+    const elsewhere = await store.createOrganization({ name: 'Elsewhere' });
+    const other = await taskIn(elsewhere.id, 'Other');
+    void pool.open({ organizationId: elsewhere.id, taskId: other.id }).catch(() => undefined);
+    await waitFor(() => e2b.created.some((spec) => spec.taskId === other.id));
+    expect(await pool.protects(other.id)).toBe(true);
+    clock += 60 * 60_000;
+    expect(await pool.protects(other.id)).toBe(false);
+  });
+
+  it('a sandbox the provider no longer has is forgotten, so the next turn gets a new one', async () => {
+    const org = await store.createOrganization({ name: 'Lost' });
+    const task = await taskIn(org.id);
+    const pool = sandboxes();
+    e2b.cachedOpen = true;
+    await (await pool.open({ organizationId: org.id, taskId: task.id })).settle();
+    e2b.state.set('e2b-sbx-1', 'gone');
+    // Opened from the worker's cache, it looks alive: the turn finds out.
+    const dead = await pool.open({ organizationId: org.id, taskId: task.id });
+    expect(dead.reused).toBe(true);
+    expect(await dead.lost()).toBe(true);
+    expect(await pool.entry(task.id)).toBeUndefined();
+    await dead.settle();
+    const next = await pool.open({ organizationId: org.id, taskId: task.id });
+    expect(next.reused).toBe(false);
+    expect(e2b.created).toHaveLength(2);
+    // A live one is not lost, and stays.
+    expect(await next.lost()).toBe(false);
+    expect((await pool.entry(task.id))?.state).toBe('running');
+    await next.settle();
+  });
 });
+
+async function waitFor(check: () => boolean, ms = 2_000): Promise<void> {
+  for (const until = Date.now() + ms; !check();) {
+    if (Date.now() > until) throw new Error('timed out');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
 
 describe('a turn of a task without a computer on a subscription login', () => {
   async function setup(hosted: boolean, route: () => Promise<LoginSandboxRoute>) {
@@ -376,7 +454,9 @@ describe('a turn of a task without a computer on a subscription login', () => {
     const captured: TurnInput[] = [];
     const adapters = new Map<any, any>([['claude', {
       provider: 'claude',
-      async runTurn(input: TurnInput) { captured.push(input); return { termination: { kind: 'success', status: 'end_turn' }, output: 'done' }; },
+      async runTurn(input: TurnInput) {
+        if ((captured as unknown as { fail?: boolean }).fail) throw new Error('Sandbox is probably not running anymore');
+        captured.push(input); return { termination: { kind: 'success', status: 'end_turn' }, output: 'done' }; },
       async runComputerlessTurn() { throw new Error('a login never runs host-side'); },
     }]]);
     (store as { hosted: boolean }).hosted = hosted;
@@ -411,6 +491,22 @@ describe('a turn of a task without a computer on a subscription login', () => {
     // The turn is over: the sandbox stays, idle, until the sweep parks it.
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect((await pool.entry(task.id))?.busyUntil).toBeUndefined();
+    await none.destroy();
+  });
+
+  it('hosted: a turn whose sandbox vanished drops it, and the retry runs in a new one', async () => {
+    const { captured, none, pool, task, turn } = await setup(true, routeTo([{ provider: 'e2b', funding: 'managed' }]));
+    await turn(1);
+    e2b.cachedOpen = true;
+    e2b.state.set('e2b-sbx-1', 'gone');
+    const adapter = (captured as unknown as { fail?: boolean });
+    adapter.fail = true;
+    await expect(turn(2)).rejects.toThrow(/not running/);
+    expect(await pool.entry(task.id)).toBeUndefined();
+    adapter.fail = false;
+    await turn(2);
+    expect(e2b.created).toHaveLength(2);
+    expect(captured.at(-1)!.harnessWorld?.handle.meta?.sandboxId).toBe('e2b-sbx-2');
     await none.destroy();
   });
 

@@ -4468,6 +4468,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (token) (await deps.tokens?.revoke(token));
         // A provider error can quote the agent's output; it reaches workflow history.
         if (err instanceof Error) err.message = secrets.scrub(err.message);
+        // A login sandbox the provider no longer has (killed, expired) is
+        // forgotten, so the retry makes a new one instead of failing on the
+        // same dead sandbox every attempt (production 2026-11-20).
+        if (loginSandboxOpening && !signal?.aborted)
+          await loginSandboxOpening.then((opened) => opened.lost()).catch(() => false);
         // Its compute hold ran out (watchComputeHold): keep the stopped session,
         // so the turn the Out of compute wait starts once there is credit
         // continues it rather than starting this one over.
