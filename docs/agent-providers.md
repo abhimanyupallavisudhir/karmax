@@ -155,9 +155,74 @@ OpenCode. Profiles and task parameters do not have a second “Credential
 provider” setting.
 
 
+## November 20, 2026 Codex upgrade audit
+
+Codex is now **0.171.0** (from 0.167.1). The stable releases in between are
+0.167.2, 0.168.0, 0.169.0, 0.169.1 and 0.170.0. The watcher started this run
+because 0.171.0 added a model. Read every release's notes and the PR lists that
+touch the app-server, rollouts, models, errors or MCP. Diffed the generated
+app-server protocol (761 → 798 files), the feature defaults
+(`codex-rs/features/src/lib.rs` at both tags) and the model slugs and effort
+levels compiled into both binaries.
+
+- **New models: GPT-6.2 Sol (`gpt-6.2-sol`, now Codex's default) and GPT-6.2
+  Astra (`gpt-6.2-astra`).** Sol has a 500K context window and Astra 272K; both
+  can grow to 872K. Both offer low…max effort plus `ultra`, and their
+  `minimal_client_version` is 0.166.0. tavya now offers both in the offline
+  catalog (`codexModelCatalog`, with Sol as the default) and in the console's
+  offline `MODELS`. Their efforts fall under `codexReasoningEffort`'s GPT-6 rule
+  unchanged. `costs.ts` prices every GPT model with one row, and only ratios
+  within a login matter there, so it has no new row.
+- **The watcher read only Sol.** The release note says "Added GPT-6.2 Sol and
+  Astra to model catalogs", and `codexModels` took one name per GPT version. It
+  now reads a list ("Sol and Astra", "Vela, Lyra, and Nova").
+- **Safety blocks: `cyberPolicy`, and `bioPolicy` (new, #62176).** Both are
+  `CodexErrorInfo` codes for a request-level safety decision. Their messages say
+  "flagged for possible cybersecurity / biological risk", never "safety
+  systems". So tavya treated them as an ordinary turn failure ("codex app-server
+  turn failed: …") rather than an `agent-policy` failure. `cyberPolicy` was
+  already in 0.167.1 and was missed then. `isProviderPolicyRejection` now knows
+  both codes and both phrases (the phrases only at the provider boundary). The
+  other new code, `inferenceHookDenied`, comes from inference hooks, which tavya
+  does not configure.
+- **Protocol: additions only.** No file and no method was removed. The
+  additions: the `modelProvider/*` methods, `account/securitySetup/read`,
+  `thread/search/partial`, an optional `modelProvider` on `model/list`,
+  `moderation` on agent messages, `environmentId` on MCP tool items,
+  `contentTokenCount` on `item/completed`, and an `input_audio` content item by
+  `file_id`. tavya reads none of them.
+- **Feature defaults that changed** do not touch what tavya uses:
+  `incremental_tools_legacy` (now on, Amazon Bedrock only) and
+  `incremental_tools_legacy_gcp` (Vertex AI); `untrusted_as_tool_output` (how
+  client `additionalContext` renders; tavya sends none);
+  `retain_client_tool_outputs`; Code Mode's gRPC host; the TUI workspace.
+  `multi_agent` is deprecated in favour of `agents.enabled`, and tavya sets
+  neither. Rollout compression (`local_thread_store_compression`) is still off.
+- **Rollouts: the same record types as 0.167.1** (`session_meta`,
+  `turn_context`, `world_state`, `token_usage_record`, `response_item`
+  message/reasoning/`additional_tools`, `event_msg`). This was checked against a
+  0.167.1 turn.
+- Unchanged for tavya: `codex exec` keeps project config and MCP servers off in
+  untrusted directories (0.169.0, #60041). tavya drives the app-server and puts
+  its MCP servers in the `CODEX_HOME` config.toml it writes, so they are not
+  project config. Its legacy `codex exec` path passes them with `-c`. Also
+  unchanged: interrupt, steer and late-approval fixes (0.169–0.171); a resumed
+  chat keeping its saved provider (0.168, as since 0.166); `codex exec --remote`.
+- Verified: typecheck; the agent suites with the real-binary Codex suites
+  (lineage, imported ids, foreign provider, native MCP, models: 419 passed); the
+  edited gateway tests; the web regressions; panagent's tests with its native and
+  pinned Codex tests on 0.171.0. Real `codex exec` turns ran on GPT-6.2 Sol and
+  Astra, GPT-6.1 Sol and GPT-5.5, plus a resumed GPT-6.2 Sol turn at `max`. The
+  `live-providers` Codex tests passed (4): the Responses API turn, app-server
+  turns on GPT-5.5 and on the catalog default (now GPT-6.2 Sol; the test now
+  covers whatever model is the default), and the mid-turn `turn/steer`. All 11
+  new rollouts converted in panagent with only the usual target-specific
+  warnings. The watcher's `--dry-run` reports Codex current.
+
 ## November 11, 2026 Codex upgrade audit
 
-Codex is now **0.167.1** (from 0.167.0; the only stable release in between). Its
+Codex is now **0.167.1** (from 0.167.0; the only stable release in between; now
+0.171.0, above). Its
 release notes are empty ("Full Changelog"). The compare holds two cherry-picks
 (#59832, #60040) and the version bump. Read both, diffed the generated app-server
 protocol, and compared the model slugs and effort levels compiled into both
@@ -298,7 +363,7 @@ both binaries.
 ## November 6, 2026 Codex upgrade audit
 
 Codex is now **0.167.0** (from 0.166.0; the only stable release in between; now
-0.167.1, above).
+0.171.0, above).
 Read the release notes and the linked PRs, diffed the generated app-server
 protocol and `codex-rs/features/src/lib.rs` at both tags, and compared the model
 slugs and effort levels compiled into both binaries.
@@ -335,7 +400,7 @@ slugs and effort levels compiled into both binaries.
 ## November 5, 2026 harness upgrade audit
 
 Claude Agent SDK is now **0.3.318** (Claude Code **2.1.318**, from 0.3.281 / 2.1.281)
-and Codex **0.166.0** (from 0.162.1; now 0.167.1, above). Reviewed every release's notes in between and
+and Codex **0.166.0** (from 0.162.1; now 0.171.0, above). Reviewed every release's notes in between and
 the SDK changelog; diffed the generated Codex app-server protocol.
 
 - **New models are selectable.** Claude Sonnet 5.5 (`claude-sonnet-5-5`, 2.1.284)
