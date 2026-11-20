@@ -36,7 +36,7 @@ describe('agent CLI release watcher', () => {
   });
 
   it('knows the models tavya offers from its offline catalog', () => {
-    for (const id of ['claude-opus-5-5', 'claude-sonnet-5-5', 'gpt-6.1-sol', 'gpt-6.1-terra']) expect(known.has(id)).toBe(true);
+    for (const id of ['claude-opus-5-5', 'claude-sonnet-5-5', 'gpt-6.2-sol', 'gpt-6.2-astra', 'gpt-6.1-sol', 'gpt-6.1-terra']) expect(known.has(id)).toBe(true);
   });
 
   it('reports nothing for releases that only fix and add things tavya does not use', () => {
@@ -73,6 +73,18 @@ describe('agent CLI release watcher', () => {
     ], context);
     expect(events.map((event) => [event.key, event.payload.reasons]))
       .toEqual([['codex@0.166.0', ['new model gpt-7 (0.165.0)', 'new model gpt-6.2-luna (0.166.0)']]]);
+  });
+
+  it('reads every model a Codex catalog line names after one GPT version', () => {
+    // 0.171.0: "Added GPT-6.2 Sol and Astra to model catalogs, with Sol as the default catalog selection."
+    const events = newReleases(codex, '0.170.0', [
+      release('rust-v0.171.0', { body: '- Added GPT-6.2 Sol and Astra to model catalogs, with Sol as the default catalog selection. (#62106)' }),
+      release('rust-v0.170.1', { body: '- Added GPT-7 Vela, Lyra, and Nova to the model catalog (#1)' }),
+    ], { ...context, knownModels: new Set() });
+    expect(events[0]?.payload.reasons).toEqual([
+      'new model gpt-7-vela (0.170.1)', 'new model gpt-7-lyra (0.170.1)', 'new model gpt-7-nova (0.170.1)',
+      'new model gpt-6.2-sol (0.171.0)', 'new model gpt-6.2-astra (0.171.0)',
+    ]);
   });
 
   it('upgrades for a high or critical security advisory the pinned version is exposed to', () => {

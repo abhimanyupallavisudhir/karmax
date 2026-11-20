@@ -31,7 +31,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     setTimeout(() => send({ id: msg.id, result: {} }), 100);
   }
   else if (msg.method === 'turn/start') {
-    // Codes from the pinned Codex protocol (0.167.1 has no usageLimitReached; audit R-10).
+    // Codes from the pinned Codex protocol (0.171.0 has no usageLimitReached; audit R-10).
     if (process.env.STUB_MODE?.startsWith('rpc-limit')) { send({ id: msg.id, error: { code: -32000, message: 'try again in 20s', data: { codexErrorInfo: process.env.STUB_MODE === 'rpc-limit-rate' ? 'rateLimitExceeded' : 'usageLimitExceeded' } } }); return; }
     if (process.env.STUB_MODE?.startsWith('rpc-local-')) { send({ id: msg.id, error: { code: -32603, message: process.env.STUB_MODE === 'rpc-local-disk' ? 'Disk quota exceeded' : 'npm registry HTTP 401 unauthorized' } }); return; }
     send({ id: msg.id, result: { turn: { id: 'turn-1' } } });
@@ -67,6 +67,15 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       send({ method: 'error', params: {
         error: { message: 'This request was blocked by our safety systems. Reason: Potentially unintended activity.',
           codexErrorInfo: 'misalignmentPolicyViolation', status: 401 },
+        willRetry: false,
+      } });
+    }
+    else if (mode === 'cyber-block' || mode === 'bio-block') {
+      // Codex's own wording for these blocks (0.171.0 binary): neither says "safety systems".
+      send({ method: 'error', params: {
+        error: mode === 'cyber-block'
+          ? { message: 'This request has been flagged for possible cybersecurity risk.', codexErrorInfo: 'cyberPolicy' }
+          : { message: 'This content was flagged for possible biological risk.', codexErrorInfo: 'bioPolicy' },
         willRetry: false,
       } });
     }
@@ -335,6 +344,17 @@ describe('CodexAdapter app-server security policy', () => {
       name: 'ProviderPolicyFailure',
       message: expect.stringMatching(/Codex safety rejection.*misalignmentPolicyViolation.*Potentially unintended activity/),
       diagnostic: { code: 'misalignmentPolicyViolation', model: 'gpt-5.5' },
+    });
+  });
+
+  it.each([
+    ['cyber-block', 'cyberPolicy', /cybersecurity risk/],
+    ['bio-block', 'bioPolicy', /biological risk/],
+  ])('reports a %s as a safety rejection, not a failure to retry', async (mode, code, text) => {
+    await expect(run(undefined, mode)).rejects.toMatchObject({
+      name: 'ProviderPolicyFailure',
+      message: expect.stringMatching(new RegExp(`Codex safety rejection.*${code}.*${text.source}`)),
+      diagnostic: { code, model: 'gpt-5.5' },
     });
   });
 
