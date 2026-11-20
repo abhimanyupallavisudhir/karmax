@@ -29,7 +29,7 @@ describe('artifact gallery', () => {
     expect(byPath['site/screens/new.png']).toMatchObject({ taskId: f.tasks.active.id, state: 'active', source: 'review', index: 0, name: 'new.png' });
     // Done and in Git: the repository's file now (rewritten since it was attached).
     expect(byPath['site/docs/report.md']).toMatchObject({ taskId: f.tasks.first.id, state: 'done', source: 'repository', at: 1_000,
-      bytes: Buffer.byteLength('# Report\n\nFinal.\n'), label: 'Report' });
+      bytes: Buffer.byteLength('# Report\n\nFinal.\n\n![Final chart](chart.png)\n'), label: 'Report' });
     expect(byPath['site/docs/report.md'].index).toBeUndefined();
     expect(byPath['site/src/app.ts']).toMatchObject({ taskId: f.tasks.source.id, source: 'repository', name: 'app.ts' });
     // Done, never committed: its saved copy.
