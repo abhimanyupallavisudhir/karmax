@@ -583,6 +583,43 @@ describe('software-dev pipeline: landing, review and the merge queue (real Tempo
     await handle.result().catch(() => undefined);
   }, 120_000);
 
+  it('a message in Review answered without touching the proposal returns to Review on its own', async () => {
+    // tavya.io #1020 (2026-11-20): a credential approval reached the agent while
+    // its pull request was in Review; it answered without changing anything, and
+    // the task waited in Do behind "Back to review" for a click that re-proposed
+    // the very same heads.
+    const repo = await h.makeRepo('review-message-unchanged');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.30.0', {
+      taskQueue: TASK_QUEUE, workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Unchanged proposal', prompt: '@write work.txt :: one\n@run git add -A && git commit -qm work\n@openpr' })],
+    });
+    const at = async () => { const v = await view(handle); return `${v.stage}/${v.waitingFor?.kind}`; };
+    const agentTurns = async () => (await view(handle)).messages.filter((m: any) => m.role === 'agent').length;
+    await expect.poll(at, { timeout: 30_000 }).toBe('review/human');
+
+    // The agent answers without open_pr (`@incomplete`), as on #1020.
+    // A question: answered, nothing changed — back in Review without a click.
+    let turns = await agentTurns();
+    await handle.signal('followUp', { id: 'u-ask', role: 'user', ts: Date.now(), text: 'Is the Agent37 email related?\n@say No, unrelated.\n@incomplete' }, 'do');
+    await expect.poll(agentTurns, { timeout: 30_000 }).toBeGreaterThan(turns);
+    await expect.poll(at, { timeout: 30_000 }).toBe('review/human');
+
+    // A change the agent did not propose (here uncommitted) still waits in Do for its open_pr.
+    turns = await agentTurns();
+    await handle.signal('followUp', { id: 'u-edit', role: 'user', ts: Date.now(), text: 'Also add a note.\n@write note.txt :: two\n@incomplete' }, 'do');
+    await expect.poll(agentTurns, { timeout: 30_000 }).toBeGreaterThan(turns);
+    await expect.poll(at, { timeout: 30_000 }).toBe('do/human');
+
+    // Committed, but still not proposed: Do too.
+    turns = await agentTurns();
+    await handle.signal('followUp', { id: 'u-commit', role: 'user', ts: Date.now(), text: 'Commit it.\n@run git add -A && git commit -qm note\n@incomplete' }, 'do');
+    await expect.poll(agentTurns, { timeout: 30_000 }).toBeGreaterThan(turns);
+    await expect.poll(at, { timeout: 30_000 }).toBe('do/human');
+    await handle.signal('cancel');
+    await handle.result().catch(() => undefined);
+  }, 150_000);
+
   it('Open PR from a needs-input pause that watches a job publishes without another turn', async () => {
     const repo = await h.makeRepo('open-pr-pause-job');
     const taskId = newId('task');

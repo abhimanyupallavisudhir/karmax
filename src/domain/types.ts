@@ -2299,6 +2299,8 @@ export interface TaskContinuation {
   collaborations: { pending: string[]; settled: string[] };
   consumed: string[];
   checkoutHeads: Record<string, string>;
+  /** The clean heads of the proposal in Review, while Review is open or a message left it. */
+  reviewedHeads?: Record<string, string>;
   accountPool: number;
   flags: {
     targetLocked: boolean;
