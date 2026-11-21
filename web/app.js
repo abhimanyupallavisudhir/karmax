@@ -2555,27 +2555,39 @@ function resumeChosenInner(rf, task) {
   return `<span class="af-resume-label">⑂ forking ${esc(source)} of ${link}${avatar ? ` <span class="chip avatar-chip" title="Its forks get up to its authorization without approval">✦ Avatār</span>` : ''}</span><button type="button" class="af-resume-clear" title="Clear">✕</button>${grants
     ? avatar
       ? `<label class="af-resume-reauth" hidden title="Granted from this Avatār without approval. Lower it in Authorization and Vault credentials to give the fork less."><input type="checkbox" class="af-resume-reauthorize"> Its authorization <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
-      : `<label class="af-resume-reauth" hidden title="Start this fork with the grants the source task ended with — its authorization level and scope plus the vault credentials it was approved for — instead of the defaults. They land in the Authorization and Vault credentials controls, where you can still adjust them."><input type="checkbox" class="af-resume-reauthorize"> Re-authorize previous grants? <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
+      : `<label class="af-resume-reauth" hidden title="Start this fork with the grants the source task ended with — its authorization and the vault credentials it held, including those approved while it ran — instead of the defaults. You can still adjust them in Authorization and Vault credentials."><input type="checkbox" class="af-resume-reauthorize"> Re-authorize previous grants? <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
     : ''}${t && (t.lastView?.status || t.status) !== 'done'
     ? `<label class="af-resume-dependency" hidden title="Wait for this source task to complete successfully before starting."><input type="checkbox" class="af-resume-add-dependency" data-task-id="${esc(rf.taskId)}"> Also add as dependency?</label>`
     : ''}<label class="af-resume-model" title="Copy this agent’s provider, model and reasoning effort."><input type="checkbox" class="af-resume-reuse-model"> Re-use same AI model</label>`;
 }
 
-// The grants a task ended with, in the task form's own vocabulary: its stored
+// The grants a task ended with, in the task form's own vocabulary: its
 // authorization selection (the elevated one, if a mid-task authorization request
 // was approved) plus the vault items it was granted and their policies. This is
-// what "Re-authorize previous grants?" applies to the fork.
+// what "Re-authorize previous grants?" applies to the fork. The record alone
+// misses the credentials approved while it ran and those it stored itself, so a
+// fork source is read with them first (withEndedGrants).
 function previousTaskGrants(task) {
   const stored = task?.params?._authorization;
   if (!stored) return null;
+  const ended = task._endedGrants;
   return {
-    authorization: normalizedAuthorization({ level: stored.level || stored.profileId, scope: stored.scope, projectIds: stored.projectIds }, task.projectId),
-    credentialGrantIds: (stored.capabilities || [])
+    authorization: normalizedAuthorization(ended?.authorization
+      ?? { level: stored.level || stored.profileId, scope: stored.scope, projectIds: stored.projectIds }, task.projectId),
+    credentialGrantIds: (ended?.credentialGrants ?? stored.capabilities ?? [])
       .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)),
-    credentialPolicies: JSON.parse(JSON.stringify(stored.credentialPolicies || {})),
+    credentialPolicies: JSON.parse(JSON.stringify(ended?.credentialPolicies ?? stored.credentialPolicies ?? {})),
     // An Avatār's forks share its cards and budget (wiki features/avatars).
     ...(task.params.avatar && task.params.paymentPolicy ? { paymentPolicy: JSON.parse(JSON.stringify(task.params.paymentPolicy)) } : {}),
   };
+}
+// A fork source's record with the grants it ended with (GET
+// /api/tasks/:id/authorization), read before it is picked so the form opens
+// with them in place. Without them (no access), its record's.
+function withEndedGrants(task) {
+  if (!task?.params?._authorization || task._endedGrants) return task;
+  return api(`/api/tasks/${encodeURIComponent(task.id)}/authorization`)
+    .then((ended) => ({ ...task, _endedGrants: ended }), () => task);
 }
 // A task's record, also when the task list does not hold it: the list has only
 // active tasks, while a finished (archived) task is the one most often forked or
@@ -3784,7 +3796,11 @@ function wireAgentBox(box) {
       hint: 'Archived tasks are included — click a task to fork its agent, or choose one when it has multiple agents.',
       mode: 'agent',
       defaults: ['draft', 'series'],
-      onPick: ({ task, role, session }) => setResume({ taskId: task.id, role }, task, session),
+      onPick: ({ task, role, session }) => {
+        const pick = (record) => setResume({ taskId: task.id, role }, record, session);
+        const read = withEndedGrants(task);
+        return read?.then ? read.then(pick) : pick(read);
+      },
     }),
   );
   // A pasted link is read at once (debounced), exactly as the agent will read it.
@@ -3846,7 +3862,7 @@ function wireAgentBox(box) {
   // task list is fetched, so its chip names it and offers its options.
   const stored = chosen?.dataset.resume;
   const storedId = (() => { try { return JSON.parse(stored || 'null')?.taskId; } catch { return undefined; } })();
-  if (storedId && !sourceTask()) loadTaskRecord(storedId).then((task) => {
+  if (storedId && !sourceTask()) loadTaskRecord(storedId).then((task) => withEndedGrants(task)).then((task) => {
     if (!task || signal.aborted || chosen.dataset.resume !== stored) return;
     chosen._sourceTask = task;
     chosen.innerHTML = resumeChosenInner(JSON.parse(stored), task);
@@ -15473,7 +15489,7 @@ async function openConversationShare(v, role) {
  * button; an Avatar's row). */
 async function forkTaskAgent(taskId, role, view) {
   const resumeFrom = { taskId, role };
-  const task = await loadTaskRecord(taskId);
+  const task = await withEndedGrants(await loadTaskRecord(taskId));
   openTaskForm('software-dev', undefined, undefined, {
     ...forkBranchDefaults(task || view || {}),
     'agent:do': { resumeFrom },

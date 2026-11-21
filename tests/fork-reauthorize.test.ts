@@ -159,6 +159,20 @@ describe('fork_agent reauthorize', () => {
     (await f.store.close());
   });
 
+  it('carries the credentials and capabilities the source was approved for while it ran', async () => {
+    const f = (await fixture());
+    (await f.store.kvSet(`vault:grant:${f.source.id}`, JSON.stringify([{ cap: 'use-credential:item:cred_fly', grantedBy: 'user:owner', at: 1 }])));
+    (await f.store.kvSet(`permission:grant:${f.source.id}`, JSON.stringify({ do: ['payment:write'] })));
+    const fork = await f.api.forkTaskAgent((await f.tokenFor('owner', ['use-credential:item:cred_safe', 'use-credential:item:cred_fly', 'payment:write'])),
+      { taskId: f.source.id, message: 'continue', reauthorize: true });
+    expect((fork.params._authorization as any).capabilities).toEqual(expect.arrayContaining(['use-credential:item:cred_safe', 'use-credential:item:cred_fly']));
+    expect((await f.store.kvGet(`permission:grant:${fork.id}`))).toBe(JSON.stringify({ do: ['payment:write'] }));
+    // Without reauthorize the fork starts from the defaults, as before.
+    const plain = await f.api.forkTaskAgent((await f.tokenFor('owner')), { taskId: f.source.id, message: 'continue' });
+    expect((await f.store.kvGet(`permission:grant:${plain.id}`))).toBeUndefined();
+    (await f.store.close());
+  });
+
   it('lets an explicit profile override the source level while credentials still carry over', async () => {
     const f = (await fixture());
     const fork = await f.api.forkTaskAgent((await f.tokenFor('owner', ['use-credential:item:cred_safe'])),

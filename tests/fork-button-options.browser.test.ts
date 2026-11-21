@@ -46,6 +46,8 @@ it('the Fork button offers re-authorization and the dependency for an archived s
   };
   const finished = await archivedSource('Finished source', 'done');
   const unfinished = await archivedSource('Shelved source', 'waiting');
+  // Approved for the rest of the source task while it ran: not on its record (auto-rubric#3).
+  await store.kvSet(`vault:grant:${unfinished.id}`, JSON.stringify([{ cap: 'use-credential:item:cred_fly', grantedBy: 'user:owner', at: 1 }]));
   const gateway = await Gateway.create({ store, tokens, worlds, client, api, authorization, bus: new KarmaxBus(),
     contributions: new ContributionRegistry(), overlays: new Overlays(), taskQueue: 'test', staticDir: path.resolve('web'),
     agentInfo: { provider: 'mock', reason: 'fork button test' } });
@@ -84,6 +86,7 @@ it('the Fork button offers re-authorization and the dependency for an archived s
     await fork(page, unfinished.num!);
     expect(await reauthorize.isVisible()).toBe(true);
     expect(await reauthorize.isChecked()).toBe(true);
+    expect(await chosen.locator('.af-resume-reauth-summary').textContent()).toContain('+ 1 credential');
     expect(await level.inputValue()).toBe('maintainer');
     expect(await dependency.isVisible()).toBe(true);
     expect(await dependency.isChecked()).toBe(true);
@@ -94,6 +97,8 @@ it('the Fork button offers re-authorization and the dependency for an archived s
       base: 'main', triggers: [{ kind: 'dependency', tasks: [unfinished.id] }],
       'agent:do': { resumeFrom: { taskId: unfinished.id, role: 'do' } }, _authorization: { level: 'maintainer' } });
     const draft = (await drafts())[0]!;
+    const grantedCredential = draft.params._authorization as { capabilities?: string[]; missingCredentialGrants?: string[] };
+    expect([...grantedCredential.capabilities ?? [], ...grantedCredential.missingCredentialGrants ?? []]).toContain('use-credential:item:cred_fly');
 
     // Reopening that draft still names the archived source and offers its options.
     await page.goto(`${running.url}/personal/forks/tasks/${draft.id}`);

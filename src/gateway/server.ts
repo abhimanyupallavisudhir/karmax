@@ -6416,6 +6416,8 @@ export class Gateway {
         }
       }
       const taskAuthMatch = p.match(/^\/api\/tasks\/([^/]+)\/authorization$/);
+      // The grants it ended with: what "Re-authorize previous grants?" gives a fork.
+      if (taskAuthMatch && method === 'GET') return this.json(res, 200, await api.taskEndedGrants(token, taskAuthMatch[1]!));
       if (taskAuthMatch && method === 'PATCH') {
         const b = await this.body(req);
         try {
