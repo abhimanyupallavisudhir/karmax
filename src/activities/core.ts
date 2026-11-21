@@ -4942,6 +4942,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     /**
+     * Every checkout's head, or nothing if any has uncommitted or untracked
+     * work (or cannot be read): the proposal as it stands, comparable with the
+     * one Review showed. Read-only.
+     */
+    async cleanCheckoutHeads(handle: WorldHandle): Promise<Record<string, string> | undefined> {
+      const world = await openWorld(handle);
+      const heads: Record<string, string> = {};
+      for (const repo of worldRepos(world.handle)) {
+        const head = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: repo.root });
+        const status = await world.exec('git', ['status', '--porcelain'], { cwd: repo.root });
+        if (head.code !== 0 || !head.stdout.trim() || status.code !== 0 || status.stdout.trim()) return undefined;
+        heads[repo.name] = head.stdout.trim();
+      }
+      return heads;
+    },
+
+    /**
      * Can this checkout's pull request open now (`open_pr` with `branch`, SPEC
      * §11.1)? `handle` is the running turn's: a branch added this turn is not in
      * the durable handle yet. Refusals say what to do instead. `current`: the
