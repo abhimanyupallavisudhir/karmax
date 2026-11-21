@@ -2,7 +2,7 @@
 # The rehearsal's stand-in for an E2B sandbox: E2B's own sandbox daemon (the
 # released envd binary, checksum-pinned) in an image with the tools of
 # karmax's E2B template. scripts/rehearsal/fake-e2b.ts runs one per sandbox.
-FROM node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c
+FROM node:26-bookworm-slim@sha256:bc0a2afd3b74ce12222fc8bab99271e66257f021078f5f4a5d687a77d280c1d9
 RUN apt-get update \
     && apt-get install -y --no-install-recommends bash ca-certificates curl git jq openssh-client python3 ripgrep sudo \
     && rm -rf /var/lib/apt/lists/* \
