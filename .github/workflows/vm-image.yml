@@ -34,7 +34,7 @@ jobs:
           tag=$(npx tsx environments/vm/context.ts environments/vm/out)
           image=$(echo "ghcr.io/${{ github.repository_owner }}/karmax-vm:$tag" | tr '[:upper:]' '[:lower:]')
           echo "image=$image" >> "$GITHUB_OUTPUT"
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
       - id: published
         name: Already published?
