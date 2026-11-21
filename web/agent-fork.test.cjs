@@ -168,6 +168,13 @@ const grants = previousTaskGrants(source);
 ok(JSON.stringify(grants.authorization) === JSON.stringify({ level: 'maintainer', scope: 'projects', projectIds: ['p1', 'p2'] }), 'previous grants carry the stored selection');
 ok(grants.credentialGrantIds.join() === 'cred_a,cred_b' && grants.credentialPolicies.cred_a.use === 'ask', 'previous grants carry vault item grants + policies (domain/tag caps are not pickable here)');
 ok(previousTaskGrants({ projectId: 'p1', params: { _authorization: { profileId: 'developer' } } }).authorization.projectIds[0] === 'p1', 'a legacy profileId-only record falls back to its own project');
+{
+  // auto-rubric#3: what the source was approved for while it ran is not on its record.
+  const ended = previousTaskGrants({ ...source, _endedGrants: { authorization: { level: 'administrator', scope: 'organization' },
+    credentialGrants: ['use-credential:item:cred_a', 'use-credential:item:cred_fly', 'use-credential:tag:ops'], credentialPolicies: {} } });
+  ok(ended.authorization.level === 'administrator' && ended.credentialGrantIds.join() === 'cred_a,cred_fly',
+    'the grants a source ended with (read from the server) win over its record');
+}
 
 const listeners = new Map();
 const element = (extra = {}) => ({
@@ -232,6 +239,7 @@ global.readModelField = () => { const [provider, model = '', effort = ''] = ref.
 global.Event = class Event { constructor(type) { this.type = type; } };
 let picker;
 global.openTaskPicker = (config) => { picker = config; };
+global.withEndedGrants = (task) => task; // read already (its record carries _endedGrants)
 global.ACTIVE_VIEW_QUERY = '-is:archived';
 eval(extractFn('wireAgentBox'));
 

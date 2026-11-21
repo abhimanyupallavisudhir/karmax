@@ -8,6 +8,7 @@ import type { AuthorizationService } from './authorization.js';
 import type { TokenAuthority } from './tokens.js';
 import { DELEGATED_PROFILE, delegatedFromParent, delegatingAncestors } from './delegation.js';
 import type { VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
+import { MAIN_AGENT } from '../domain/participants.js';
 
 /** What a task may do and where (SPEC §8.2): its capabilities and the scope
  * its tokens are minted for. No scope ⇒ the task's own project. */
@@ -139,6 +140,31 @@ export async function taskGrants(store: Store, authorization: AuthorizationServi
   const held = await baseTaskAuthority(store, authorization, task);
   return { ...own, ...(selection ? { authorization: selection } : {}),
     credentialGrants: held.capabilities.filter((capability) => capability.startsWith('use-credential:')) };
+}
+
+/**
+ * The grants a task ended with, in task-creation shape: `taskGrants`, plus what
+ * its main agent came to hold while it ran: vault credentials approved "for
+ * this task", the items it stored itself (a task owns them), and capabilities
+ * approved through `request_permission` (`permissionGrants`). A continuation
+ * and a re-authorized fork start from these. The record alone held none of the
+ * three, so a continuation asked again for credentials its source had been
+ * approved for (auto-rubric#3).
+ */
+export async function endedTaskGrants(store: Store, authorization: AuthorizationService | undefined,
+  task: TaskRecord): Promise<ReturnType<typeof previousTaskGrants> & { permissionGrants: Capability[] }> {
+  const grants = await taskGrants(store, authorization, task);
+  const organizationId = (await store.getProject(task.projectId))?.organizationId ?? 'org_personal';
+  const vault = new VaultItems(store, undefined, undefined, organizationId, undefined, task.projectId);
+  const stored = await vault.createdCaps(task.id);
+  const approved = [...await vault.extensionCaps(task.id),
+    ...await new PermissionRequests(store, organizationId).extensionCaps(task.id, MAIN_AGENT)];
+  const credential = (capability: string) => capability.startsWith('use-credential:');
+  return {
+    ...grants,
+    credentialGrants: [...new Set([...grants.credentialGrants, ...stored, ...approved.filter(credential)])],
+    permissionGrants: [...new Set(approved.filter((capability) => !credential(capability)))],
+  };
 }
 
 /**

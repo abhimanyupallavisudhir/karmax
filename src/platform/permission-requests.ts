@@ -174,6 +174,37 @@ export class PermissionRequests {
     }
   }
 
+  /** Add capabilities to what one of a task's agents was approved for. */
+  private async extend(taskId: string, role: string, capabilities: Capability[]): Promise<void> {
+    let grants: Record<string, Capability[]> = {};
+    try {
+      const raw = (await this.store.kvGet(extensionsKey(taskId)));
+      const parsed = raw ? JSON.parse(raw) : {};
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) grants = parsed;
+    } catch {}
+    grants[role] = [...new Set([...(grants[role] ?? []), ...capabilities])];
+    (await this.store.kvSet(extensionsKey(taskId), JSON.stringify(grants)));
+  }
+
+  /**
+   * Start a new task's agent with capabilities approved for it already: what
+   * its source's agent was approved for, carried on by someone who holds them
+   * (`createTask`'s `permissionGrants`; a continuation, a re-authorized fork).
+   */
+  async grant(input: { taskId: string; projectId: string; role: string; capabilities: Capability[]; by: string; from?: string }): Promise<void> {
+    if (!input.capabilities.length) return;
+    return this.store.transaction(async () => {
+      (await this.lockTaskRequests(input.taskId));
+      (await this.extend(input.taskId, input.role, input.capabilities));
+      (await this.store.appendAudit({
+        principalId: input.by,
+        action: 'permission.granted',
+        scopeKey: `project:${input.projectId}`,
+        detail: { taskId: input.taskId, role: input.role, capabilities: input.capabilities, ...(input.from ? { from: input.from } : {}) },
+      }));
+    });
+  }
+
   async request(input: {
     taskId: string;
     projectId: string;
@@ -251,16 +282,7 @@ export class PermissionRequests {
     if (!request) throw new Error(`no permission request ${requestId}`);
     if (request.status !== 'pending') throw new Error(`request ${requestId} is already ${request.status}`);
     (await this.assertUnclaimed(requestId, input.claim));
-    if (input.action === 'approve' && !input.alreadyAuthorized) {
-      let grants: Record<string, Capability[]> = {};
-      try {
-        const raw = (await this.store.kvGet(extensionsKey(request.taskId)));
-        const parsed = raw ? JSON.parse(raw) : {};
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) grants = parsed;
-      } catch {}
-      grants[request.role] = [...new Set([...(grants[request.role] ?? []), ...request.capabilities])];
-      (await this.store.kvSet(extensionsKey(request.taskId), JSON.stringify(grants)));
-    }
+    if (input.action === 'approve' && !input.alreadyAuthorized) (await this.extend(request.taskId, request.role, request.capabilities));
     request.status = input.action === 'approve' ? 'granted' : 'denied';
     request.resolution = { action: input.action, by: input.by, at: Date.now() };
     (await this.save(request));

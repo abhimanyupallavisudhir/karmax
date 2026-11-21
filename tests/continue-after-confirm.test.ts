@@ -4,6 +4,7 @@ import { AuthorizationService, projectScope } from '../src/platform/authorizatio
 import { KarmaxApi } from '../src/platform/api.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { continuesInNewTask } from '../src/domain/forks.js';
+import { PermissionRequests } from '../src/platform/permission-requests.js';
 import type { AuthorizationSelection } from '../src/domain/types.js';
 
 /**
@@ -104,6 +105,39 @@ describe('continue after Confirm', () => {
     await expect(f.api.postTaskMessage(await f.tokenFor('user:owner', []), f.source.id, { text: 'More' }))
       .rejects.toThrow(/cannot grant/);
     expect(f.started).toHaveLength(2);
+    await f.store.close();
+  });
+
+  // auto-rubric#3 (2026-11-21): the source's agent had been approved, while it
+  // ran, for the Fly token "for this task", and had stored the site's keys
+  // itself. Neither is on its record, so its continuation asked for both again.
+  it('a continuation keeps what its agent was granted while it ran', async () => {
+    const f = await fixture();
+    await f.store.saveView(f.source.id, f.landed);
+    await f.store.kvSet(`vault:grant:${f.source.id}`, JSON.stringify([
+      { cap: 'use-credential:item:cred_fly', grantedBy: 'user:owner', at: 1 }]));
+    await f.store.kvSet('vault:items:org_personal', JSON.stringify([{ id: 'cred_site', type: 'env', label: 'Site keys',
+      fields: ['env'], policy: { use: 'auto', reveal: 'ask' }, provenance: { source: 'agent', taskId: f.source.id, at: 1 },
+      createdAt: 1, updatedAt: 1, frecencyUpdatedAt: 1 }]));
+    await f.store.kvSet(`permission:grant:${f.source.id}`, JSON.stringify({ do: ['payment:write'], 'agent-1': ['github:actions:write'] }));
+    const credentials = ['use-credential:item:cred_safe', 'use-credential:item:cred_fly', 'use-credential:item:cred_site'];
+    const ended = await f.api.taskEndedGrants(await f.tokenFor('user:owner'), f.source.id);
+    expect(ended).toMatchObject({ authorization: { level: 'maintainer' }, permissionGrants: ['payment:write'] });
+    expect(ended.credentialGrants.sort()).toEqual([...credentials].sort());
+
+    // Someone who cannot grant what the agent was approved for is refused, not given less.
+    await expect(f.api.postTaskMessage(await f.tokenFor('user:owner', credentials), f.source.id, { text: 'More' }))
+      .rejects.toThrow(/cannot grant payment:write/);
+    await expect(f.api.postTaskMessage(await f.tokenFor('user:owner', ['payment:write']), f.source.id, { text: 'More' }))
+      .rejects.toThrow(/cannot grant/);
+    expect(f.started).toEqual([]);
+
+    const posted = await f.api.postTaskMessage(await f.tokenFor('user:owner', [...credentials, 'payment:write']), f.source.id,
+      { text: 'Now the next piece' });
+    const next = (await f.store.getTask(posted.continuedIn!.id))!;
+    expect((next.params._authorization as { capabilities: string[] }).capabilities).toEqual(expect.arrayContaining(credentials));
+    // The main agent's approvals carry on; another agent's stay with the source.
+    expect(await new PermissionRequests(f.store, 'org_personal').extensionCaps(next.id)).toEqual(['payment:write']);
     await f.store.close();
   });
 
