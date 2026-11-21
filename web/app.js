@@ -2587,7 +2587,7 @@ function previousTaskGrants(task) {
 function withEndedGrants(task) {
   if (!task?.params?._authorization || task._endedGrants) return task;
   return api(`/api/tasks/${encodeURIComponent(task.id)}/authorization`)
-    .then((ended) => ({ ...task, _endedGrants: ended }), () => task);
+    .then((ended) => ended ? { ...task, _endedGrants: ended } : task, () => task);
 }
 // A task's record, also when the task list does not hold it: the list has only
 // active tasks, while a finished (archived) task is the one most often forked or
