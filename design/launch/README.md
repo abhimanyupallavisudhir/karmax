@@ -30,7 +30,7 @@ source GNU AGPL-3.0 at github.com/abhimanyupallavisudhir/karmax; MCP server `htt
 | Launch tags | 3 | Artificial Intelligence · Developer Tools · Productivity |
 | Links | | GitHub https://github.com/abhimanyupallavisudhir/karmax · Docs https://tavya.io/docs |
 | Company info | | Open source |
-| Launch | | Saturday 21 November 2026, 12:01 AM Pacific (08:01 UTC) |
+| Launch | | a Saturday, 12:01 AM Pacific (08:01 UTC); 21 November passed unscheduled, next proposed 5 December |
 
 **Description** (425 characters):
 
