@@ -2873,12 +2873,16 @@ export class Gateway {
         if (typeof b.taskId === 'string' && b.taskId) {
           // The caller must be able to read the task where it lives: its
           // project and organization come from the record, never the request.
+          // The route names no scope (the task is in the body), so a browser
+          // session's token is for no organization in particular; read the task
+          // with the session as it acts in the task's own project.
           const found = await store.taskMetadata(b.taskId);
           const project = found ? await store.getProject(found.projectId) : undefined;
-          if (!found || !(await this.deps.tokens.check(token, 'task:read',
+          const inTask = found ? (await this.auth(req, found.projectId, project?.organizationId))?.apiToken ?? token : token;
+          if (!found || !(await this.deps.tokens.check(inTask, 'task:read',
             { taskId: found.id, projectId: found.projectId, organizationId: project?.organizationId })).ok)
             return this.json(res, 404, { error: `no task ${b.taskId}` });
-          const view = await api.getTaskView(token, found.id);
+          const view = await api.getTaskView(inTask, found.id);
           // It has shown its error since it last changed, at the latest: a report made later is of then.
           const changed = [found.statusChangedAt, view?.updatedAt].filter((at): at is number => typeof at === 'number' && Number.isFinite(at));
           task = { id: found.id, projectId: found.projectId, ...(view?.error ? { error: String(view.error) } : {}), ...(view?.stage ? { stage: String(view.stage) } : {}),

@@ -8,7 +8,7 @@ import { KarmaxBus } from '../src/contrib/bus.js';
 import { ContributionRegistry } from '../src/contrib/registry.js';
 import { Gateway, routeCapability } from '../src/gateway/server.js';
 import { clientWentAway } from '../src/gateway/error-status.js';
-import { ORGANIZATION_GRANT_CEILING } from '../src/platform/authorization.js';
+import { AuthorizationService, ORGANIZATION_GRANT_CEILING, projectScope } from '../src/platform/authorization.js';
 import { PLATFORM_API_CATALOG } from '../src/platform/catalog.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { Store } from '../src/store/db.js';
@@ -179,6 +179,91 @@ describe('error reports through the gateway', () => {
     const events = (await store.listProjectEvents(ops.id)).filter((event) => event.type === ERROR_EVENT_TYPE);
     expect(events.map((event) => (event.payload as { message: string }).message)).not.toContain('aborted');
     expect((await call(tokenFor.operator!, 'PUT', '/api/settings/error-reports', { projectId: null })).status).toBe(200);
+  });
+});
+
+// rw-data #8 (2026-11-21): its owner, signed in to tavya.io, pressed Report on the
+// task's error and got "no task task_mwpi9puz60f1a3e38a". A browser session's token
+// is minted for the organization its route names, and POST /api/error-reports names
+// its task only in the body, so the task was checked against the person's token for
+// no organization in particular, which reads no project of any.
+describe('reporting a task\'s error from a browser session', () => {
+  let home: string;
+  let store: Store;
+  let base: string;
+  let close: () => Promise<void>;
+  let ops: { id: string };
+  let task: { id: string };
+  const operator = { token: '' };
+  const browser = (route: string, body: unknown, cookie = 'krmax_session=owner-browser') =>
+    fetch(`${base}${route}`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+
+  beforeAll(async () => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-error-reports-browser-'));
+    fs.copyFileSync(new URL('../web/index.html', import.meta.url), path.join(home, 'index.html'));
+    store = await Store.create(':memory:');
+    configureErrorReports(store, { role: 'gateway' });
+    const tokens = new TokenAuthority(store);
+    const authorization = await AuthorizationService.create(store);
+    // The person's own organization, where their session acts by default, and another they belong to.
+    await store.claimPersonalOrganization('owner');
+    ops = await store.createProject('tavya');
+    const family = await store.createOrganization({ name: 'Family', ownerUserId: 'owner' });
+    const data = await store.createProject('rw-data', {}, family.id);
+    await authorization.grant('system:test', { principalId: 'user:owner', scopeKey: projectScope(data.id), profileId: 'maintainer' });
+    task = await store.createTask({ projectId: data.id, title: 'collect', workflow: 'software-dev', workflowVersion: '1.30.0', params: { prompt: 'p' } });
+    await store.saveView(task.id, { taskId: task.id, title: 'collect', workflow: 'software-dev', stage: 'setup', status: 'blocked',
+      error: 'Activity task failed → restic stopped without finishing', messages: [], actions: [], state: {}, updatedAt: Date.now() } as any);
+    const identity = {
+      session: async (headers: Headers) => headers.get('cookie')?.includes('krmax_session=owner-browser')
+        ? { session: { id: 'owner-browser', userId: 'owner', expiresAt: new Date(Date.now() + 3_600_000) },
+          user: { id: 'owner', name: 'Owner', email: 'owner@example.com' } }
+        : headers.get('cookie')?.includes('krmax_session=outsider-browser')
+          ? { session: { id: 'outsider-browser', userId: 'outsider', expiresAt: new Date(Date.now() + 3_600_000) },
+            user: { id: 'outsider', name: 'Outsider', email: 'outsider@example.com' } }
+          : undefined,
+      providersForUserAsync: async () => [],
+      sessionActive: async () => true,
+      userById: async (id: string) => ({ id, name: id, email: `${id}@example.com` }),
+      listUsers: async () => [],
+      connectOrganizationNames: () => undefined,
+    };
+    const api = new Proxy({
+      getTaskView: async (_token: string, taskId: string) => (await store.getTask(taskId))?.lastView,
+      createTask: async (_token: string, input: any) => store.createTask({ projectId: input.projectId, title: input.title,
+        workflow: 'software-dev', workflowVersion: '1.30.0', params: { prompt: input.prompt, ...input.params } }),
+    }, { get: (target, key) => key in target ? (target as any)[key] : async () => { throw new Error(`unexpected api.${String(key)}`); } });
+    const gateway = await Gateway.create({
+      store, bus: new KarmaxBus(), tokens, authorization, identity, contributions: new ContributionRegistry(), overlays: new Overlays(),
+      client: {} as any, api, taskQueue: 'test', staticDir: home,
+      agentInfo: { provider: 'mock', reason: 'error reports test' }, worlds: new WorldRegistry(),
+    } as any);
+    const running = await gateway.listen(await findFreePortFrom(48_700));
+    base = running.url;
+    close = running.close;
+    operator.token = (await tokens.mintPrincipal('user:op', ['*'])).token;
+    const saved = await fetch(`${base}/api/settings/error-reports`, { method: 'PUT',
+      headers: { authorization: `Bearer ${operator.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ projectId: ops.id }) });
+    expect(saved.status).toBe(200);
+  }, 30_000);
+
+  afterAll(async () => {
+    await close?.();
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  it('reads the task in its own organization, not the one the session acts in by default', async () => {
+    const answer = await browser('/api/error-reports', { taskId: task.id });
+    expect(await answer.json()).toEqual({ reported: true });
+    const [reported] = (await store.listProjectEvents(ops.id)).filter((event) => event.type === ERROR_EVENT_TYPE && event.payload.taskId === task.id);
+    expect(reported).toMatchObject({ payload: { kind: 'reported', message: 'Activity task failed → restic stopped without finishing',
+      detail: { reportedBy: 'user:owner' } } });
+  });
+
+  it('still answers "no task" to someone who cannot read it', async () => {
+    const answer = await browser('/api/error-reports', { taskId: task.id }, 'krmax_session=outsider-browser');
+    expect(answer.status).toBe(404);
+    expect(await answer.json()).toEqual({ error: `no task ${task.id}` });
   });
 });
 
