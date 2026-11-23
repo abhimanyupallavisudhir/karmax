@@ -46,6 +46,17 @@ export function makeChildActivities(store: Store) {
           ...(pullRequest ? { pullRequest } : {}) };
       });
     },
+    /** The task whose agent reviews `taskId` live (ConfirmLayer.live): whether
+     * it is still working — in Do and neither finished nor stopped on an error,
+     * where a message reaches its agent at once — and how both are named. */
+    async liveReviewer(reviewerTaskId: string, taskId: string) {
+      const [reviewer, task] = await Promise.all([store.getTask(reviewerTaskId), store.getTask(taskId)]);
+      const view = reviewer?.lastView;
+      const live = !!view && view.stage === 'do' && !['done', 'cancelled', 'failed', 'blocked'].includes(view.status ?? '')
+        && !view.state?.lifecycleReplacement;
+      const name = (record: typeof task, id: string) => `Task #${record?.num ?? id}`;
+      return { live, reviewer: name(reviewer, reviewerTaskId), task: name(task, taskId) };
+    },
     /** Which of these children's durable views have settled, and at what stage. */
     async settledChildTasks(parentTaskId: string, childTaskIds: string[]) {
       return (await store.childTaskStates(parentTaskId, childTaskIds))

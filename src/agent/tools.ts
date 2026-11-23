@@ -184,7 +184,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'respond_to_sub_task',
     description:
-      'Answer a sub-task that raised to you. action: "open_pr" (its completed work should open a PR and enter Review), "confirm" (approve what it has: lands a PR at Review, or opens the PR of a child whose turn ended without one), "comment" (send guidance/answer its question so it keeps working), "retry" (retry a failed step), "cancel" (abandon it), or "keep_own" (only when its raise offers it: its publication was refused over files it and a newer version changed differently; publish again keeping its version of them). Omit child_task_id to answer all waiting children. The answer is delivered when your current turn ends. A question only a person can answer: pass it to them with escalate(to, note, task_id) instead of relaying it.',
+      'Answer a sub-task that raised to you, or a task you created that asks for your review. action: "open_pr" (its completed work should open a PR and enter Review), "confirm" (approve what it has: lands a PR at Review, or opens the PR of a child whose turn ended without one), "comment" (send guidance/answer its question so it keeps working), "retry" (retry a failed step), "cancel" (abandon it), or "keep_own" (only when its raise offers it: its publication was refused over files it and a newer version changed differently; publish again keeping its version of them). Omit child_task_id to answer all waiting children. The answer is delivered when your current turn ends. A question only a person can answer: pass it to them with escalate(to, note, task_id) instead of relaying it.',
     parameters: {
       type: 'object',
       properties: {
@@ -604,6 +604,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     description:
       'Create a new task on a project task list. It is queued and started immediately unless `draft` is true. '
       + '`params` carries the full task-form field values for the chosen workflow (including `triggers`, so a draft can be armed on a schedule/dependency/event); '
+      + 'Its Review comes to you: to you yourself while you still work (answer it with respond_to_sub_task), to a fork of you once you have finished; '
+      + '`params.confirm` routes it otherwise, e.g. {"layers": [{"kind": "human", "audience": ["@creator"]}]} for the person you work for, {"layers": []} for none. '
       + '`tags` accepts names or `a/b` paths and creates missing ones. '
       + '`wiki_context` inlines wiki pages as `[[proj:…]]`/`[[org:…]]` references; omit to inherit the default-labelled pages, pass [] for none. '
       + CREATE_TASK_GRANTS,
@@ -1320,9 +1322,11 @@ export function platformToolHandlers(
       if (args?.child_task_id && ctx.platformRequest) {
         const child = await Promise.resolve(ctx.platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args.child_task_id))}`))
           .catch(() => undefined) as (Parameters<typeof applicableSubTaskActions>[0] & { parentTaskId?: string }) | undefined;
-        // Only this task's own children receive it (ownSubTaskResponses drops the rest after the turn): say so now.
-        if (child?.stage && child.parentTaskId !== (ctx.taskId ?? world.handle.id))
-          return `${String(args.child_task_id)} is not one of this task's sub-tasks, so nothing was sent. To tell another task something, use message_agent.`;
+        // Only this task's own children, and tasks waiting for it to review them, receive it
+        // (ownSubTaskResponses drops the rest after the turn): say so now.
+        const self = ctx.taskId ?? world.handle.id;
+        if (child?.stage && child.parentTaskId !== self && child.waitingFor?.reviewerTask !== self)
+          return `${String(args.child_task_id)} is not one of this task's sub-tasks and is not waiting for this task's review, so nothing was sent. To tell another task something, use message_agent.`;
         const applicable = child?.stage ? applicableSubTaskActions(child) : undefined;
         if (applicable && !applicable.includes(action as SubTaskAction))
           return `"${action}" does not apply now: that sub-task is at ${child!.stage === 'escalated' || child!.status === 'blocked' ? 'a failed step' : child!.stage === 'review' ? 'Review' : 'the end of a turn'}. Answer with ${applicable.join(' | ')}.`;

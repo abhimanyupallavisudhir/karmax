@@ -193,6 +193,7 @@ export function assembleTaskInput(
                   ...(l.effort ? { effort: l.effort } : {}),
                   ...(l.mcpConnections !== undefined ? { mcpConnections: l.mcpConnections } : {}),
                   ...(l.resumeFrom ? { resumeFrom: l.resumeFrom } : {}),
+                  ...(l.live === true && l.resumeFrom?.taskId ? { live: true } : {}),
                   ...(l.prompt?.trim() ? { prompt: l.prompt } : {}),
                   ...(Number.isInteger(l.maxRevisions) && l.maxRevisions! >= 0 ? { maxRevisions: l.maxRevisions } : {}),
                   ...agentIdentity(l),

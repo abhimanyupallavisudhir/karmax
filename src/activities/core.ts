@@ -692,7 +692,9 @@ export async function ownSubTaskResponses(store: Pick<Store, 'getTask'>, taskId:
   const kept: SubTaskResponse[] = [];
   const refused: string[] = [];
   for (const response of responses ?? []) {
-    if (!response.childTaskId || (await store.getTask(response.childTaskId))?.parentTaskId === taskId) kept.push(response);
+    const target = response.childTaskId ? await store.getTask(response.childTaskId) : undefined;
+    // Its sub-task, or a task waiting for it to review it (ConfirmLayer.live).
+    if (!response.childTaskId || target?.parentTaskId === taskId || target?.lastView?.waitingFor?.reviewerTask === taskId) kept.push(response);
     else refused.push(response.childTaskId);
   }
   return { ...(kept.length ? { kept } : {}), refused };
