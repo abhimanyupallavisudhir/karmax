@@ -141,6 +141,44 @@ describe('continue after Confirm', () => {
     await f.store.close();
   });
 
+  // 2026-11-23: the error fixer (#891) was switched to agent review, but each
+  // bug's task carries on in a continuation of its own run, and every run made
+  // before the switch had been reviewed by a person. A done task cannot be
+  // edited, so the series' routes never reached a bug that came back.
+  it('a run that holds a key of its series carries on reviewed and answered as the series says now', async () => {
+    const f = await fixture();
+    const agentReview = { layers: [{ kind: 'agent', maxRevisions: 3 }] };
+    const series = await f.store.createTask({ projectId: f.project.id, title: 'Fix: {{summary}}', workflow: 'software-dev', workflowVersion: '1.30.0',
+      params: { prompt: 'fix it', repeatable: true, triggerState: 'armed', confirm: agentReview, responder: { kind: 'agent' },
+        triggers: [{ kind: 'event', type: 'app.error', recurring: true, concurrency: { key: '{{$key}}', mode: 'continue' } }] } as never });
+    await f.store.updateTaskParams(f.source.id, { ...f.source.params, runOf: series.id } as never);
+    await f.store.saveView(f.source.id, f.landed);
+    await f.store.saveKeyedRun({ seriesId: series.id, key: 'checkout', projectId: f.project.id, organizationId: 'org_personal',
+      state: 'run', seen: 1, taskId: f.source.id });
+    const owner = await f.tokenFor('user:owner');
+
+    const next = await f.api.continueTask(owner, f.source.id, { text: 'It came back' }, { followUpTriggers: [] });
+    expect(next.params).toMatchObject({ runOf: series.id, confirm: agentReview, responder: { kind: 'agent' },
+      computer: { cpu: 4, memoryMb: 8192 }, 'agent:do': { provider: 'mock', model: 'm1', resumeFrom: { taskId: f.source.id, role: 'do' } } });
+    expect(await f.store.keyedRun(series.id, 'checkout')).toMatchObject({ taskId: next.id });
+
+    // A route the series leaves to the project's defaults is left to them here too.
+    const { confirm: _confirm, responder: _responder, ...unrouted } = (await f.store.getTask(series.id))!.params;
+    await f.store.updateTaskParams(series.id, unrouted as never);
+    await f.store.saveView(next.id, { ...f.landed, taskId: next.id });
+    const after = await f.api.continueTask(owner, next.id, { text: 'Again' }, { followUpTriggers: [] });
+    expect(after.params.confirm).toBeUndefined();
+    expect(after.params.responder).toBeUndefined();
+
+    // A task that holds no key is not the series' to route: it keeps its own.
+    const loose = await f.store.createTask({ projectId: f.project.id, title: 'Loose run', workflow: 'software-dev', workflowVersion: '1.30.0',
+      params: { ...f.source.params, runOf: series.id } as never });
+    await f.store.saveView(loose.id, { ...f.landed, taskId: loose.id });
+    const kept = await f.api.continueTask(owner, loose.id, { text: 'More' }, { followUpTriggers: [] });
+    expect(kept.params.confirm).toEqual({ layers: [{ kind: 'human', audience: ['@creator'] }] });
+    await f.store.close();
+  });
+
   // andhbhakt.com#5 (2026-10-17): the source was archived when it finished, its
   // continuation copied `archived` and started out archived, and so never
   // showed in its creator's default list while it waited on them.

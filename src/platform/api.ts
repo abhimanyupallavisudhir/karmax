@@ -7602,6 +7602,19 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     // carried on as a run of that series still, and takes the key along.
     const holdsKeys = (await this.deps.store.keyedRunsOfTask(taskId)).length > 0;
     if (holdsKeys && source.params?.runOf) params.runOf = source.params.runOf as ValueMap[string];
+    const series = holdsKeys && typeof source.params?.runOf === 'string' ? (await this.deps.store.getTask(source.params.runOf)) : undefined;
+    if (series) {
+      // Who reviews a series' runs and answers them is the series' to say, and
+      // a finished run cannot be edited: so a key's task carries on routed as
+      // its series is now, not as it was when it first started (#891's runs
+      // went to a person long after the series was switched to its agent).
+      for (const route of [(await this.confirmerFieldOf(source)), (await this.responderFieldOf(source))]) {
+        if (!route) continue;
+        const name = route.field.name;
+        if (series.params[name] === undefined) delete params[name];
+        else params[name] = structuredClone(series.params[name]) as ValueMap[string];
+      }
+    }
     const field = params['agent:do'] === undefined && params['agent:unified'] !== undefined ? 'agent:unified' : 'agent:do';
     const { resumeFrom: _previous, ...agent } = (params[field] ?? {}) as Partial<AgentSpec>;
     params[field] = { ...agent, resumeFrom: { taskId, role: MAIN_AGENT } };
