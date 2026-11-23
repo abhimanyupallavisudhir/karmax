@@ -82,7 +82,7 @@ import type { AgentWait, CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE, TASK_WORKFLOW_TASK_TIMEOUT } from './names.js';
 import { agentTurnId } from './turn-id.js';
 import { taskBranch } from '../domain/brand.js';
-import { conversationPublisher, type TurnConversationBase } from '../domain/view-publication.js';
+import { conversationPublisher, OUT_OF_CREDITS, type TurnConversationBase } from '../domain/view-publication.js';
 import { unattendedJobsReminder, waitForAgent } from './agent-wait.js';
 import { ADOPT_ATTACHED_REPOSITORIES, KEEP_FINAL_WORKSPACE, adoptedProjectConfig, adoptedRepositoriesNote, keptWorkspaceNote } from '../domain/adopted-repositories.js';
 
@@ -394,6 +394,10 @@ const WORLD_REOPENS_WAIT = 'software-dev-world-reopens-wait-v1';
  * Review waits on anyone. Setup used to publish a wait, which parked the world
  * first, and its message started nothing until the park ended (legibench3 #20). */
 const REVIEW_SETUP_FOLLOW_UP = 'software-dev-review-setup-follow-up-v1';
+/** A message in Review that the agent answers without touching the proposal
+ * (every checkout at the head Review showed, nothing uncommitted) returns to
+ * Review: there is nothing new to propose, so no Open PR is asked (#1020). */
+const UNCHANGED_PROPOSAL_RETURNS = 'software-dev-unchanged-proposal-returns-to-review-v1';
 /** "Changed files" lists only work that has not landed: a branch's pull
  * request landing rebuilds it, leaving that pull request's work out, and the
  * whole task landing empties it (it had been the last Review's snapshot). */
@@ -405,6 +409,9 @@ const CHANGED_FILES_AFTER_LANDING = 'software-dev-changed-files-after-landing-v1
 const PR_ESCALATION_MESSAGE_TO_DO = 'software-dev-pr-escalation-message-to-do-v1';
 const quietNotice = (m: Message): boolean => m.id.startsWith(QUIET_NOTICE);
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max)}…` : text;
+/** The same checkouts at the same commits. */
+const sameHeads = (a: Record<string, string>, b: Record<string, string>): boolean =>
+  Object.keys(a).length === Object.keys(b).length && Object.entries(a).every(([name, head]) => b[name] === head);
 /** A turn can return while the agent's own in-harness sub-agents (Claude Agent SDK
  *  Task tool) are still running. We hold in Do and re-prompt so it waits for them,
  *  but bound the re-prompts so a wedged sub-agent can't park the task forever. */
@@ -946,6 +953,9 @@ async function softwareDevImpl(
   // checkout name -> head sha it was approved at (multi-PR Review).
   let checkoutApprovals: CheckoutApprovals = recovery?.checkoutApprovals ?? {};
   let checkoutHeads: Record<string, string> = { ...continued?.checkoutHeads };
+  /** The clean heads of the proposal Review is showing; dropped once Review
+   * approves it or asks for a change (UNCHANGED_PROPOSAL_RETURNS). */
+  let reviewedHeads: Record<string, string> | undefined = continued?.reviewedHeads;
   let cancelled = false;
   let lifecycleReplacement = false;
   let retryRequested = carried?.retryRequested ?? false;
@@ -1927,6 +1937,7 @@ async function softwareDevImpl(
     }
     const repairBeforeReview = (text: string): 'do' => {
       msgs.push({ id: `review-ci-${msgs.length}`, role: 'user', text, ts: Date.now() });
+      reviewedHeads = undefined;
       return 'do';
     };
     // A message the agent has not read ends Review before it waits on anyone:
@@ -1998,6 +2009,7 @@ async function softwareDevImpl(
               id: `cv-${msgs.length}`, role: 'user',
               text: decision.text || 'Please revise the work per the reviewer feedback.', ts: Date.now(),
             });
+            reviewedHeads = undefined;
             return 'do';
           }
         }
@@ -2049,10 +2061,12 @@ async function softwareDevImpl(
       const published = await resourceActivities.publishPullRequestData(input.shippedFrom!.taskId, pullRequestDataKey);
       if (!published.ok) {
         msgs.push({ id: `prd-${msgs.length}`, role: 'user', ts: Date.now(), text: `Its data could not be published: ${published.reason}` });
+        reviewedHeads = undefined;
         return 'do';
       }
     }
     confirmed = true;
+    reviewedHeads = undefined;
     if (intentAuthorizedLanding) {
       landing = {
         authorization: 'authorized', validation: 'pending', provider: 'admitting',
@@ -2609,7 +2623,7 @@ async function softwareDevImpl(
             status = 'waiting';
             const detail = innermostMessage(err);
             // Spent managed compute credit waits the same way (src/world/managed-compute.ts).
-            waitingFor = { kind: 'retry', summary: /^Out of compute\b/.test(detail) ? 'Out of compute' : 'Waiting for a machine', detail, until: Date.now() + wait };
+            waitingFor = { kind: 'retry', summary: OUT_OF_CREDITS.test(detail) ? 'Out of credits' : 'Waiting for a machine', detail, until: Date.now() + wait };
             retryRequested = false;
             await publish();
             await condition(() => cancelled || retryRequested || halted(), wait);
@@ -4650,6 +4664,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         collaborations: { pending: [...pendingCollaborations], settled: [...settledCollaborations] },
         consumed: [...consumed],
         checkoutHeads,
+        ...(reviewedHeads ? { reviewedHeads } : {}),
         accountPool,
         flags: { targetLocked, pointOfNoReturnPassed, branchPreparedForPr, forceHumanRepairReview, providerQueueAccepted,
           prRequested: adoption ? false : prRequested, confirmed, retryRequested, manualEscalationRequested, resourcesApplied,
@@ -5508,6 +5523,14 @@ Inspect the complete current diff and specifically compare its delta from the re
         // — a change a pull request needed — ends the same way: its pull
         // requests are what remain.
         if (shipsBranches && pullRequestsOpened && !turn.raise) prRequested = true;
+        // A message in Review the agent answered leaving the proposal as Review
+        // showed it: nothing new to propose, so straight back to Review.
+        if (!prRequested && reviewedHeads && turnFinished && !turn.raise && !permanentCoordinator && world
+          && patched(UNCHANGED_PROPOSAL_RETURNS)) {
+          const shown = reviewedHeads;
+          const heads = await core.cleanCheckoutHeads(world as WorldHandle).catch(() => undefined);
+          if (heads && sameHeads(heads, shown)) prRequested = true;
+        }
         if (!prRequested) {
           status = 'waiting';
           const question = turn.raise?.detail?.trim() || turn.output?.trim()
@@ -5839,6 +5862,8 @@ Inspect the complete current diff and specifically compare its delta from the re
         landing = { ...landing, authorization: 'reapproval-required', validation: 'failed', provider: 'ejected', detail: 'Integration repair needs human review.' };
         forceHumanRepairReview = true;
       }
+      reviewedHeads = world && patched(UNCHANGED_PROPOSAL_RETURNS)
+        ? await core.cleanCheckoutHeads(world as WorldHandle).catch(() => undefined) : undefined;
       stage = 'review';
       status = 'waiting';
       // `confirmed` is a GATE token, not a latch. Clear it the instant we enter the

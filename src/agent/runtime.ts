@@ -58,6 +58,10 @@ export interface RunTurnDeps {
   onEmit?: (text: string, source?: 'assistant' | 'tool') => void | Promise<void>;
   /** Persist attachments before acknowledging the tool, including turns stopped by escalation. */
   onReviewInfo?: (info: ReviewInfo, supplied: ReviewInfo) => void | Promise<void>;
+  /** The actions the task's Review shows as the turn starts. A turn's
+   *  attachments add to them, so what earlier turns attached stays until the
+   *  agent removes it (auto-rubric#2). Read when first needed. */
+  shownReviewActions?: () => Promise<ReviewAction[] | undefined>;
   /** Durable, provider-neutral turn items (tools, commands, edits, status, text). */
   onActivity?: (activity: AgentActivity) => void | Promise<void>;
   /** Validate and normalize create_sub_task `params` (PL-11). A refusal throws,
@@ -217,6 +221,9 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   let openPrRequested = restored.openPrRequested ?? false;
   let reviewInfo: ReviewInfo | undefined = restored.reviewInfo;
   let reviewPublication = Promise.resolve();
+  // This turn's actions, or — until it attaches any — those Review already shows.
+  const currentActions = async (): Promise<ReviewAction[]> =>
+    reviewInfo?.actions ?? (await deps.shownReviewActions?.()) ?? [];
   let resolution: Transition | undefined = restored.resolution;
   let confirmDecision: ConfirmDecision | undefined = restored.confirmDecision;
   let raise: RaiseToParent | undefined = restored.raise;
@@ -286,6 +293,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   }); });
 
   const ctx: PlatformToolContext = {
+    taskId: deps.spendCtx?.taskId ?? input.world?.handle?.id,
     openPr() {
       if (input.role !== 'do') throw new Error('open_pr is available only to the Do agent');
       openPrRequested = true;
@@ -315,8 +323,9 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       // Providers can dispatch tools concurrently. Serialize accumulation with
       // publication so an overlapping call cannot overwrite another's actions.
       const publication = reviewPublication.then(async () => {
-        const call = validateReviewInfoCall(info);
-        const actions = call.actions ? mergeReviewActions(reviewInfo?.actions ?? [], call.actions) : reviewInfo?.actions;
+        const { remove, ...call } = validateReviewInfoCall(info);
+        const actions = call.actions || remove
+          ? mergeReviewActions(await currentActions(), call.actions ?? [], remove) : reviewInfo?.actions;
         const supplied = Object.fromEntries(Object.entries(call).filter(([, value]) => value !== undefined));
         const nextReviewInfo = { ...reviewInfo, ...supplied, ...(actions ? { actions } : {}) };
         assertReviewInfoTotal(nextReviewInfo);
@@ -432,7 +441,10 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
           : [];
         const supplied: ReviewInfo = { summary: note, ...(actions.length ? { actions } : {}) };
         const publication = reviewPublication.then(async () => {
-          const nextReviewInfo = { ...reviewInfo, summary: note, actions: [...(reviewInfo?.actions ?? []), ...actions] };
+          const shown = await currentActions().catch(() => undefined);
+          // Not knowing what Review shows, it would replace it: leave it, as for a failed save.
+          if (!shown) return;
+          const nextReviewInfo = { ...reviewInfo, summary: note, actions: [...shown, ...actions] };
           // The spend's own record is already saved: failing to show it must not fail the tool.
           await Promise.resolve(deps.onReviewInfo?.(nextReviewInfo, supplied)).catch(() => {});
           reviewInfo = nextReviewInfo;
@@ -484,7 +496,8 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     await observe(() => deps.onActivity?.({ id: 'turn', kind: 'turn', phase: 'started', title: 'Agent started working' }));
     if (observerFailed) throw observerError;
     await deps.onProviderStart?.();
-    // A task without a computer runs host-side with tavya's own tools only.
+    // A task without a computer: tavya's own tools only, host-side on an API
+    // key, or its login's CLI in the machine the activity gave it (harnessWorld).
     turn = isComputerlessWorld(input.world) ? await runComputerlessTurn(adapter, input, ctx) : await adapter.runTurn(input, ctx);
     deps.onProviderResult?.(turn);
     if (!deps.signal?.aborted) output.flush();
@@ -525,7 +538,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     // Its compute hold ran out (wiki features/managed-compute § Holds).
     const outOfCompute = reason instanceof Error && reason.name === 'ComputeCreditExhausted';
     await observe(() => deps.onActivity?.(stopped ? { id: 'turn', kind: 'turn', phase: 'stopped', title: 'Agent stopped' }
-      : outOfCompute ? { id: 'turn', kind: 'turn', phase: 'stopped', title: 'Out of compute', detail: (reason as Error).message.slice(0, 1200) } : {
+      : outOfCompute ? { id: 'turn', kind: 'turn', phase: 'stopped', title: 'Out of credits', detail: (reason as Error).message.slice(0, 1200) } : {
       id: 'turn',
       kind: 'turn',
       phase: 'failed',

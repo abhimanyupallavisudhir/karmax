@@ -110,6 +110,7 @@ const ICON = {
   find: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>',
   fork: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></svg>',
   terminal: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg>',
+  desktop: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>',
   laptop: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"/></svg>',
   // The task page's two views: its conversation, and its settings.
   chat: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
@@ -503,9 +504,15 @@ function slugify(s) {
 function projectSlug(p) { return p ? slugify(p.name) : ''; }
 function projectPath(p) { return p ? [p.folder, p.name].filter(Boolean).join('/') : ''; }
 function projectById(pid) { return (S.projects || []).find((p) => p.id === pid); }
+// The organization's own projects come before its co-ordinator project (where
+// Ask's conversations live), which is only the answer when it is the only one.
 function firstProjectForOrganization(organizationId) {
-  return (S.projects || []).find((p) => p.organizationId === organizationId);
+  return ordinaryProjectForOrganization(organizationId) || (S.projects || []).find((p) => p.organizationId === organizationId);
 }
+function ordinaryProjectForOrganization(organizationId) {
+  return (S.projects || []).find((p) => p.organizationId === organizationId && !p.coordinator);
+}
+const COORDINATOR_PROJECT_TIP = 'The organization’s own project: what you Ask lives here. It can’t be renamed, moved or deleted.';
 // Resolve a URL slug back to a project, optionally scoped to one organization
 // (project slugs need only be unique within their org). Matches the slugified name
 // (the common, human case), falling back to a raw project id for safety. On a slug
@@ -1249,7 +1256,7 @@ const NODES = [
 const AGENT_PROVIDERS = ['claude', 'codex', 'opencode'];
 const MODELS = {
   claude: ['default', 'opus[1m]', { id: 'claude-opus-5-5', displayName: 'Opus 5.5' }, { id: 'claude-fable-5-2', displayName: 'Fable 5.2' }, { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, { id: 'claude-sonnet-5-5', displayName: 'Sonnet 5.5' }, { id: 'claude-haiku-5-5', displayName: 'Haiku 5.5' }, 'sonnet', 'haiku'],
-  codex: ['gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
+  codex: ['gpt-6.2-sol', 'gpt-6.2-astra', 'gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
 };
 const agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
@@ -1727,7 +1734,8 @@ const COMPUTER_PROVIDER_LABELS = { any: 'Any', e2b: 'E2B', daytona: 'Daytona', f
   worktree: 'This machine', container: 'Docker container', none: 'None' };
 // No computer (wiki features/computerless-tasks): the agent runs on tavya with its own tools only.
 const NO_COMPUTER = 'none';
-const NO_COMPUTER_TIP = 'No computer: the agent can only use tavya itself. Starts in seconds and uses no compute.';
+const NO_COMPUTER_TIP = 'No computer: the agent can only use tavya itself. On an API key it starts in seconds and uses no compute; '
+  + 'a Claude Code or Codex login replies from a small cloud computer of its own, a few at a time per organization.';
 const CLOUD_COMPUTERS = ['e2b', 'daytona', 'fly', 'hetzner', 'aws', 'gcp', 'agent37'];
 const COMPUTER_REGION_LABELS = { eu: 'EU', us: 'US' };
 // Provider "Any" (wiki features/compute-routing): the cloud accounts it can
@@ -2547,27 +2555,39 @@ function resumeChosenInner(rf, task) {
   return `<span class="af-resume-label">⑂ forking ${esc(source)} of ${link}${avatar ? ` <span class="chip avatar-chip" title="Its forks get up to its authorization without approval">✦ Avatār</span>` : ''}</span><button type="button" class="af-resume-clear" title="Clear">✕</button>${grants
     ? avatar
       ? `<label class="af-resume-reauth" hidden title="Granted from this Avatār without approval. Lower it in Authorization and Vault credentials to give the fork less."><input type="checkbox" class="af-resume-reauthorize"> Its authorization <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
-      : `<label class="af-resume-reauth" hidden title="Start this fork with the grants the source task ended with — its authorization level and scope plus the vault credentials it was approved for — instead of the defaults. They land in the Authorization and Vault credentials controls, where you can still adjust them."><input type="checkbox" class="af-resume-reauthorize"> Re-authorize previous grants? <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
+      : `<label class="af-resume-reauth" hidden title="Start this fork with the grants the source task ended with — its authorization and the vault credentials it held, including those approved while it ran — instead of the defaults. You can still adjust them in Authorization and Vault credentials."><input type="checkbox" class="af-resume-reauthorize"> Re-authorize previous grants? <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
     : ''}${t && (t.lastView?.status || t.status) !== 'done'
     ? `<label class="af-resume-dependency" hidden title="Wait for this source task to complete successfully before starting."><input type="checkbox" class="af-resume-add-dependency" data-task-id="${esc(rf.taskId)}"> Also add as dependency?</label>`
     : ''}<label class="af-resume-model" title="Copy this agent’s provider, model and reasoning effort."><input type="checkbox" class="af-resume-reuse-model"> Re-use same AI model</label>`;
 }
 
-// The grants a task ended with, in the task form's own vocabulary: its stored
+// The grants a task ended with, in the task form's own vocabulary: its
 // authorization selection (the elevated one, if a mid-task authorization request
 // was approved) plus the vault items it was granted and their policies. This is
-// what "Re-authorize previous grants?" applies to the fork.
+// what "Re-authorize previous grants?" applies to the fork. The record alone
+// misses the credentials approved while it ran and those it stored itself, so a
+// fork source is read with them first (withEndedGrants).
 function previousTaskGrants(task) {
   const stored = task?.params?._authorization;
   if (!stored) return null;
+  const ended = task._endedGrants;
   return {
-    authorization: normalizedAuthorization({ level: stored.level || stored.profileId, scope: stored.scope, projectIds: stored.projectIds }, task.projectId),
-    credentialGrantIds: (stored.capabilities || [])
+    authorization: normalizedAuthorization(ended?.authorization
+      ?? { level: stored.level || stored.profileId, scope: stored.scope, projectIds: stored.projectIds }, task.projectId),
+    credentialGrantIds: (ended?.credentialGrants ?? stored.capabilities ?? [])
       .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)),
-    credentialPolicies: JSON.parse(JSON.stringify(stored.credentialPolicies || {})),
+    credentialPolicies: JSON.parse(JSON.stringify(ended?.credentialPolicies ?? stored.credentialPolicies ?? {})),
     // An Avatār's forks share its cards and budget (wiki features/avatars).
     ...(task.params.avatar && task.params.paymentPolicy ? { paymentPolicy: JSON.parse(JSON.stringify(task.params.paymentPolicy)) } : {}),
   };
+}
+// A fork source's record with the grants it ended with (GET
+// /api/tasks/:id/authorization), read before it is picked so the form opens
+// with them in place. Without them (no access), its record's.
+function withEndedGrants(task) {
+  if (!task?.params?._authorization || task._endedGrants) return task;
+  return api(`/api/tasks/${encodeURIComponent(task.id)}/authorization`)
+    .then((ended) => ended ? { ...task, _endedGrants: ended } : task, () => task);
 }
 // A task's record, also when the task list does not hold it: the list has only
 // active tasks, while a finished (archived) task is the one most often forked or
@@ -3776,7 +3796,11 @@ function wireAgentBox(box) {
       hint: 'Archived tasks are included — click a task to fork its agent, or choose one when it has multiple agents.',
       mode: 'agent',
       defaults: ['draft', 'series'],
-      onPick: ({ task, role, session }) => setResume({ taskId: task.id, role }, task, session),
+      onPick: ({ task, role, session }) => {
+        const pick = (record) => setResume({ taskId: task.id, role }, record, session);
+        const read = withEndedGrants(task);
+        return read?.then ? read.then(pick) : pick(read);
+      },
     }),
   );
   // A pasted link is read at once (debounced), exactly as the agent will read it.
@@ -3838,7 +3862,7 @@ function wireAgentBox(box) {
   // task list is fetched, so its chip names it and offers its options.
   const stored = chosen?.dataset.resume;
   const storedId = (() => { try { return JSON.parse(stored || 'null')?.taskId; } catch { return undefined; } })();
-  if (storedId && !sourceTask()) loadTaskRecord(storedId).then((task) => {
+  if (storedId && !sourceTask()) loadTaskRecord(storedId).then((task) => withEndedGrants(task)).then((task) => {
     if (!task || signal.aborted || chosen.dataset.resume !== stored) return;
     chosen._sourceTask = task;
     chosen.innerHTML = resumeChosenInner(JSON.parse(stored), task);
@@ -4590,14 +4614,17 @@ function plainTaskError(text) {
   }
   const retry = /— retrying (\w+) in (\d+\s*\w+) \((\d+)\/(\d+)\)\s*$/.exec(body);
   const retrying = retry ? ` tavya will try again in ${retry[2]} (attempt ${retry[3]} of ${retry[4]}).` : '';
-  // Out of compute (it names "Plan & billing", which the AI-limit pattern below
+  // Out of credits (it names "Plan & billing", which the AI-limit pattern below
   // would take for a model's billing): what happened in one line; what to do is
-  // the buttons beside it.
-  const spent = /Out of compute: this month's (\$[\d.,]+) of compute is used up( or held)?/i.exec(body);
-  const trial = /Out of compute: your (\$[\d.,]+) free trial (is used up or held|ended|is used up)/i.exec(body);
-  const summary = /Out of compute: .*come with a paid plan/i.test(body) ? `${siteName()}’s computers come with a paid plan.`
+  // the buttons beside it. ("Out of compute" is how it was said before.)
+  const spent = /Out of (?:credits|compute): this month's (\$[\d.,]+) of (?:compute|\S+ credits) is used up( or held)?/i.exec(body);
+  const trial = /Out of (?:credits|compute): your (\$[\d.,]+) free trial (is used up or held|ended|is used up)/i.exec(body);
+  const paidPlan = /Out of (?:credits|compute): \S+'s (computers|included models) come with a paid plan/i.exec(body);
+  const priced = /Out of credits: (.+?) would cost up to (\$[\d.,]+) of \S+ credits; (\$[\d.,]+) is left/i.exec(body);
+  const summary = paidPlan ? `${siteName()}’s ${paidPlan[1]} come with a paid plan.`
     : trial ? `Your ${trial[1]} free trial ${trial[2] === 'ended' ? 'has ended' : trial[2] === 'is used up or held' ? 'is used up or held by work running now' : 'is used up'}.`
-    : spent ? `This month’s ${spent[1]} of compute is used up${spent[2] ? ' or held by work running now' : ''}.`
+    : spent ? `This month’s ${spent[1]} of ${siteName()} credits is used up${spent[2] ? ' or held by work running now' : ''}.`
+    : priced ? `${priced[1][0].toUpperCase()}${priced[1].slice(1)} would cost up to ${priced[2]}; ${priced[3]} of ${siteName()} credits is left.`
     : storageFull(body) ? 'Your organization’s storage is full. Free some space, or add a 100 GB pack in Plan & billing.'
     : /context window|prompt is too long|maximum context length/i.test(body)
     ? 'The conversation grew too long for the AI model. Send a shorter message, or start a new task.'
@@ -4636,8 +4663,15 @@ function setupFixes(text, projectId) {
   // The included model draws on the same credit: there, one's own is a model login or key.
   const own = /Settings → Agents/.test(raw) ? { label: 'Use your own login', href: `${settings}#settings-agents` }
     : { label: 'Use your own account', href: computers };
-  // Never bought a plan, or spent this month's compute: more on the plan, or one's own account.
-  if (/\bOut of compute\b/.test(raw)) return [{ label: /come with a paid plan|free trial/.test(raw) ? 'Choose a plan' : 'Add compute', href: plan }, own];
+  // Never bought a plan, or spent this month's credits: more on the plan, or one's own account
+  // (a generation refused for its price: only more credits). The message names the
+  // organization's own Plan & billing, which is where to add them.
+  if (/\bOut of (?:credits|compute)\b/.test(raw)) {
+    const named = /Plan & billing \(([^)\s]*#settings-plan)\)/.exec(raw)?.[1];
+    const where = named ? (() => { try { const url = new URL(named, location.origin); return `${url.pathname}${url.hash}`; } catch { return plan; } })() : plan;
+    const add = { label: /come with a paid plan|free trial/.test(raw) ? 'Choose a plan' : 'Add credits', href: where };
+    return /would cost up to/.test(raw) ? [add] : [add, own];
+  }
   if (/No computer (?:is connected|this organization can use fits)/.test(raw)) return [{ label: 'Connect a computer', href: computers }];
   // Every one of tavya's computers busy: one's own account starts it now.
   if (/Every computer this task can use is full|of \S+'s [\w. ]+ computers are in use|\S+'s [\w. ]+ computers are using|uses its share of/.test(raw)
@@ -6279,7 +6313,7 @@ function onboardingStep(number, key, title, detail, action) {
 function onboardingTrialHtml(trial) {
   const amount = `$${Math.round(Number(trial.creditMicros) / 1e6)}`;
   const until = new Date(trial.endsAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-  return `<p class="onboarding-trial"><b>Free trial:</b> ${esc(amount)} of compute${trial.agents ? ' and agents' : ''} included until ${esc(until)}.</p>
+  return `<p class="onboarding-trial"><b>Free trial:</b> ${esc(amount)} of ${siteNameMarkup()} credits for computers${trial.agents ? ' and agents' : ''}, until ${esc(until)}.</p>
     <p class="onboarding-intro">For the full experience:</p>`;
 }
 
@@ -6396,6 +6430,7 @@ function renderShell() {
       <button class="icon-btn mobile-menu" id="mobile-menu" aria-controls="rail" aria-label="Sidebar" aria-expanded="false">${ICON.menu}</button>
       <a class="brand" data-spa href="${esc(homeRoute())}" aria-label="Home">${brandMark()}</a>
       <span class="topbar-context" id="topbar-context"></span>
+      <button class="btn primary mobile-ask" id="mobile-ask" type="button" aria-haspopup="dialog" title="Ask ${esc(siteName())} — no computer, starts in seconds">${ICON.chat}<span>Ask</span></button>
     </div>
     ${verificationBanner()}
     <div class="body">
@@ -6438,6 +6473,7 @@ function renderShell() {
   $('#rail-new-task').addEventListener('click', () => openNewTaskForm());
   $('#rail-new-template').addEventListener('click', () => openTemplatePicker());
   $('#rail-ask').addEventListener('click', () => askTavya());
+  $('#mobile-ask').addEventListener('click', () => askTavya());
   $('#rail-help').addEventListener('click', openHelp);
   $('#key-echo').addEventListener('animationend', () => echoKeys('')); // faded out
   wireVerificationBanner();
@@ -7746,7 +7782,7 @@ function newTaskProjectId(organizationId = S.organizationId) {
   const fromQuery = named && (S.projects || []).find((p) => p.organizationId === organizationId && projectSlug(p) === named)?.id;
   let remembered = null;
   try { remembered = JSON.parse(localStorage.getItem(NEW_TASK_PROJECT_KEY) || '{}')[organizationId]; } catch {}
-  return fromQuery || inOrganization(remembered) || inOrganization(S.projectId) || firstProjectForOrganization(organizationId)?.id || null;
+  return fromQuery || inOrganization(remembered) || inOrganization(S.projectId) || ordinaryProjectForOrganization(organizationId)?.id || null;
 }
 function rememberNewTaskProject(projectId) {
   const organizationId = projectById(projectId)?.organizationId;
@@ -9066,10 +9102,12 @@ function openNewTaskForm(template, projectId = template?.projectId) {
 function newTaskTarget() { return S.tab === 'home' ? newTaskProjectId() : S.projectId; }
 
 // "Ask tavya" (wiki features/computerless-tasks): what you type starts a task
-// without a computer in the project new tasks go to, acting with your own
-// authority; its page opens with the message box ready. One conversation is one task.
-function askTavya(projectId) {
-  if (!projectId) return withNewTaskProject((chosen) => askTavya(chosen));
+// without a computer in the organization's co-ordinator project (made on first
+// use), acting with your own authority; its page opens with the message box
+// ready. One conversation is one task. Someone whose authority covers only some
+// projects asks in one of those instead.
+function askTavya() {
+  const organizationId = S.organizationId;
   const previousFocus = document.activeElement;
   const dialog = document.createElement('dialog');
   dialog.className = 'text-prompt ask-dialog';
@@ -9078,7 +9116,7 @@ function askTavya(projectId) {
   dialog.innerHTML = `<form method="dialog"><div class="prompt-field"><textarea name="ask" rows="3" required maxlength="20000" aria-label="Ask ${esc(siteName())}"
       placeholder="Ask ${esc(siteName())} anything: change a setting, find what waits on you, start a task…"></textarea>
       ${mic ? `<div class="prompt-attach-row ask-mic">${mic}</div>` : ''}</div>
-    <div class="inline-form ask-foot"><span class="ask-where">${esc(projectById(projectId)?.name || '')}${policyTip(NO_COMPUTER_TIP)}</span>
+    <div class="inline-form ask-foot"><span class="ask-where">${policyTip(NO_COMPUTER_TIP)}</span>
       <button class="btn primary" value="submit" title="Ask (Enter)">Ask</button></div></form>`;
   const input = dialog.querySelector('textarea');
   const form = dialog.querySelector('form');
@@ -9090,10 +9128,22 @@ function askTavya(projectId) {
     sending = true;
     dialog.querySelector('button[value="submit"]').disabled = true;
     try {
-      const created = await api(`/api/projects/${encodeURIComponent(projectId)}/tasks`, { method: 'POST', body: JSON.stringify({
-        workflow: NEW_TASK_WORKFLOW, ownAuthority: true, params: { prompt: text, computer: { provider: NO_COMPUTER } } }) });
+      let created;
+      try {
+        created = await api(`/api/organizations/${encodeURIComponent(organizationId)}/ask`, { method: 'POST', body: JSON.stringify({ prompt: text }) });
+      } catch (error) {
+        if (error.status !== 403) throw error;
+        // Not someone who acts for the whole organization: ask in the project
+        // their new tasks go to.
+        const projectId = newTaskProjectId(organizationId);
+        if (!projectId) throw error;
+        created = await api(`/api/projects/${encodeURIComponent(projectId)}/tasks`, { method: 'POST', body: JSON.stringify({
+          workflow: NEW_TASK_WORKFLOW, ownAuthority: true, params: { prompt: text, computer: { provider: NO_COMPUTER } } }) });
+      }
+      // A co-ordinator project made just now joins the sidebar.
+      if (!projectById(created.projectId)) { await loadProjects(); renderRail(); }
       dialog.close();
-      await goToTask(created.id);
+      await spaNavigate(`${projectBase(created.projectId)}/tasks/${created.num ?? created.id}`);
       focusWhenReady('.followup-input');
     } catch (error) {
       toast(error.message, true);
@@ -9240,7 +9290,7 @@ function withNewTaskProject(then) {
     // A task lives in a project: with none yet, make one first.
     return projectId ? then(projectId) : toast('Create a project first', false, { label: 'New project', fn: () => newProject() });
   }
-  if (!(S.projects || []).some((project) => project.organizationId === S.organizationId)) {
+  if (!ordinaryProjectForOrganization(S.organizationId)) {
     return toast('Create a project first', false, { label: 'New project', fn: () => newProject() });
   }
   pickProject('New task in…', then);
@@ -10054,10 +10104,13 @@ function readinessGaps(readiness, projectId) {
   }
   for (const need of needs.values()) {
     const name = ACCOUNT_PROVIDER_LABELS[need.provider] || need.provider;
-    // Without a computer only an API key (or the included model) runs the agent.
+    // Without a computer: an API key (or the included model) runs the agent on
+    // tavya; a Claude Code or Codex login, in a small cloud computer. The fix
+    // is the missing one of those (computerlessFix), or another model.
     if (need.computerless) {
-      gaps.push({ label: /runs only on a computer/.test(need.computerless) ? `Add a ${name} API key` : 'Pick another model',
-        href: `${settings}#settings-agents`, tip: need.computerless });
+      const fix = need.computerlessFix || (/runs only on a computer/.test(need.computerless) ? 'key' : 'model');
+      gaps.push(fix === 'computer' ? { label: 'Connect a computer', href: `${settings}#settings-computers`, tip: need.computerless }
+        : { label: fix === 'key' ? `Add a ${name} API key` : 'Pick another model', href: `${settings}#settings-agents`, tip: need.computerless });
       continue;
     }
     gaps.push(need.off === 'project'
@@ -10071,12 +10124,12 @@ function readinessGaps(readiness, projectId) {
   const compute = readiness.compute;
   const plan = `${settings}#settings-plan`, computers = `${settings}#settings-computers`;
   const providers = 'E2B, Daytona, Fly.io, Hetzner, AWS, Google Cloud or Agent37';
-  // Out of compute: never bought a plan (need: plan) or spent this month's (credit).
+  // Out of credits: never bought a plan (need: plan) or spent this month's (credit).
   const need = compute?.need ?? (compute?.outOfCredit ? 'credit' : 'computer');
   if (compute && !compute.ready) gaps.push(...(need === 'plan' ? [
     { label: 'Choose a plan', href: plan, tip: `${siteName()}’s computers come with Individual or Team.` },
     { label: 'Connect your own computer', href: computers, tip: `Run tasks on your own ${providers} account.` }]
-    : need === 'credit' ? [{ label: 'Add compute', href: plan, tip: compute.outOfCredit || 'This month’s compute is used up.' },
+    : need === 'credit' ? [{ label: 'Add credits', href: plan, tip: compute.outOfCredit || `This month’s ${siteName()} credits are used up.` },
       { label: 'Use your own account', href: computers, tip: `Run tasks on your own ${providers} account instead.` }]
     : [{ label: 'Connect a computer', href: computers, tip: 'There is nowhere for this task to run yet.' }]));
   // Full storage does not stop a task, but nothing new it saves is kept.
@@ -12038,7 +12091,11 @@ function patchTaskPage(main, html) {
   next?.querySelectorAll('[data-conversation-key]').forEach((row) => { row.conversationMarkup = row.outerHTML; });
   const sameThread = previous && next && previous.dataset.taskId === next.dataset.taskId && previous.dataset.role === next.dataset.role;
   if (sameThread) pairs.push([previous, next]);
-  const retained = retainedTaskNodes(main, template.content, pairs);
+  const composer = retainedComposer(main, template.content);
+  let retained = retainedTaskNodes(main, template.content, composer ? [...pairs, composer] : pairs);
+  // A composer that cannot be kept must not cost the conversation its own retention.
+  if (!retained && composer) retained = retainedTaskNodes(main, template.content, pairs);
+  else if (composer) adoptComposerState(...composer);
   if (!retained) {
     if (previous) window.MathJax?.typesetClear?.([previous]);
     main.replaceChildren(template.content);
@@ -12058,6 +12115,44 @@ function patchTaskPage(main, html) {
     patchChildren(old, fresh, retained.nodes);
   }
   return !!sameThread;
+}
+
+// The message box's text field is kept across every repaint of its conversation:
+// replacing the field being typed in drops a phone's keyboard composition (the
+// word being typed, autocorrect, dictation) and, on iOS, the keyboard itself,
+// even when focus and caret are given back — the page "glitches" with every
+// event of a working agent. Returns [live, fresh]: the live field (inside the
+// wiki-reference shell that wraps it once wired) for the fresh one.
+function retainedComposer(main, fragment) {
+  const freshBox = fragment.querySelector('.followup-box');
+  const fresh = freshBox?.querySelector(':scope > .prompt-field > textarea.followup-input');
+  if (!fresh) return null;
+  const sel = (value) => (window.CSS && CSS.escape ? CSS.escape(value) : value);
+  const oldBox = main.querySelector(`.followup-box[data-task-id="${sel(freshBox.dataset.taskId)}"][data-role="${sel(freshBox.dataset.role)}"]`);
+  const field = oldBox?.querySelector('.followup-input');
+  if (!field) return null;
+  const live = field.parentNode.classList.contains('wiki-ref-editor') ? field.parentNode : field;
+  return live.parentNode?.classList.contains('prompt-field') ? [live, fresh] : null;
+}
+// The kept field takes what the fresh one says about the conversation (who it
+// addresses, whether it can send); its text, caret, height and wiring stay. A
+// draft changed by code rather than typing (Unsend, from its button) is the one
+// text it takes: never while the field is being typed in.
+function adoptComposerState(live, fresh) {
+  const field = live.matches('textarea') ? live : live.querySelector('textarea');
+  const box = fresh.closest('.followup-box');
+  const draft = S.followupDrafts?.[`${box.dataset.taskId}/${box.dataset.role}`] ?? '';
+  if (field.value !== draft && document.activeElement !== field) {
+    field.value = draft;
+    field.dispatchEvent(new Event('input', { bubbles: true })); // its height and highlighting follow
+  }
+  const listening = S.dictation?.key === `followup:${box.dataset.taskId}/${box.dataset.role}`;
+  if (listening) S.dictation.placeholder = fresh.placeholder; // shown again once it stops
+  else if (field.placeholder !== fresh.placeholder) field.placeholder = fresh.placeholder;
+  if (field.disabled !== fresh.disabled) field.disabled = fresh.disabled;
+  if (field.getAttribute('rows') !== fresh.getAttribute('rows')) {
+    if (fresh.hasAttribute('rows')) field.setAttribute('rows', fresh.getAttribute('rows')); else field.removeAttribute('rows');
+  }
 }
 
 // Map each fresh node to the live node it keeps: the retained nodes, and the
@@ -12500,6 +12595,9 @@ function restoreFollowupFocus(root, st) {
   const box = root.querySelector(`.followup-box[data-role="${window.CSS && CSS.escape ? CSS.escape(st.role) : st.role}"]`);
   const el = box && box.querySelector('.followup-input');
   if (!el || el.disabled) return;
+  // The field was kept (retainedComposer) and never lost focus: touching its
+  // caret would end a phone keyboard's composition of the word being typed.
+  if (document.activeElement === el) return;
   // Only carry over the value if the box was cleared by the re-render (a sent
   // follow-up empties it); never clobber text the box already holds.
   if (st.value && !el.value) el.value = st.value;
@@ -12881,7 +12979,7 @@ const ARTIFACT_TEXT_PREVIEW_BYTES = 10 * 1024 * 1024;
 // and seeks), never through a popup the browser could block after an await.
 // The URL is served under a `sandbox` policy, so an HTML page in the frame
 // runs with an opaque origin, as it would in its own tab.
-async function showArtifactViewer({ name, url, view, text, refresh, gallery, links: places }) {
+async function showArtifactViewer({ name, url, view, text, images, refresh, gallery, links: places }) {
   const previousFocus = document.activeElement;
   const dialog = document.createElement('dialog');
   dialog.setAttribute('aria-labelledby', 'artifact-reader-title');
@@ -12910,7 +13008,8 @@ async function showArtifactViewer({ name, url, view, text, refresh, gallery, lin
       content.innerHTML = `<p class="artifact-error">This file can’t be shown here. Download it instead.</p>`;
     } else if (item.view === 'markdown') {
       content.classList.add('msg-text', 'md');
-      mountMarkdownSurface(content, (math) => renderMarkdown(item.text, { math }));
+      // Its images sit beside it (`item.images` says where); without that, their alt text.
+      mountMarkdownSurface(content, (math) => renderMarkdown(item.text, { math }), (body) => FV.resolveImages(body, item.images || (() => null)));
       wireTexToggles(dialog);
     } else if (item.view === 'text') {
       const pre = document.createElement('pre');
@@ -12963,7 +13062,7 @@ async function showArtifactViewer({ name, url, view, text, refresh, gallery, lin
       mount(item);
     } catch (error) { toast(error.message, true); }
   };
-  mount({ name, url, view, text, refresh, links: places });
+  mount({ name, url, view, text, images, refresh, links: places });
   dialog.querySelectorAll('[data-step]').forEach((button) => button.addEventListener('click', () => step(Number(button.dataset.step))));
   dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());
   // A link to somewhere else in the console (a gallery file's task, its place in Files) leaves the viewer.
@@ -13025,7 +13124,8 @@ function downloadHref(url) {
 // What the viewer needs to show what `POST /review-action` resolved
 // (`{ url, name, mediaType, bytes? }`, a signed URL that needs no header):
 // `view: null` means it is downloaded instead. Failures throw, for a toast.
-async function artifactItem(resolved, refresh) {
+// `images(src)` is where a Markdown file's image `src` is read from (null: its alt text).
+async function artifactItem(resolved, refresh, images) {
   const name = resolved.name || 'Attachment';
   const view = artifactView(resolved.mediaType, name);
   const download = { name, url: resolved.url, view: null };
@@ -13037,11 +13137,11 @@ async function artifactItem(resolved, refresh) {
     res.body?.cancel().catch(() => {});
     return download;
   }
-  return { name, url: resolved.url, view, text: await res.text() };
+  return { name, url: resolved.url, view, text: await res.text(), ...(view === 'markdown' && images ? { images } : {}) };
 }
 
-async function openArtifact(resolved, refresh) {
-  const item = await artifactItem(resolved, refresh);
+async function openArtifact(resolved, refresh, images) {
+  const item = await artifactItem(resolved, refresh, images);
   return item.view ? showArtifactViewer(item) : downloadArtifact(item);
 }
 // Files the Review gallery shows (web pages stay links).
@@ -13083,14 +13183,25 @@ function loadReviewThumbnails(v) {
   });
 }
 
+// A Markdown file a Review attached shows the images beside it in its task's
+// world (a `/…` one is absolute there), read as its agent would cite them.
+function reviewMarkdownImages(v, target) {
+  const folder = String(target || '').replace(/[^/]*$/, '');
+  return (src) => {
+    const projectId = taskProjectId(v);
+    return projectId ? citedFileRaw(projectId, v.num ?? v.taskId, src.startsWith('/') ? src : folder + src) : null;
+  };
+}
+
 // The viewer over the Review's files, from the one at `index`: ← and → (or the
 // arrow keys) step through every open action in order.
 async function openReviewGallery(v, index) {
   const order = (v.reviewInfo?.actions || []).map((action, i) => (isReviewTile(action) ? i : -1)).filter((i) => i >= 0);
   const refresh = (i) => () => resolveReviewArtifact(v, i, true);
+  const images = (i) => reviewMarkdownImages(v, v.reviewInfo?.actions?.[i]?.target);
   // Only one file: what it can't show, the browser downloads.
-  if (order.length < 2) return openArtifact(await resolveReviewArtifact(v, index), refresh(index));
-  const load = async (i) => artifactItem(await resolveReviewArtifact(v, i), refresh(i));
+  if (order.length < 2) return openArtifact(await resolveReviewArtifact(v, index), refresh(index), images(index));
+  const load = async (i) => artifactItem(await resolveReviewArtifact(v, i), refresh(i), images(i));
   return showArtifactViewer({ ...(await load(index)), gallery: { order, at: order.indexOf(index), load } });
 }
 
@@ -13707,6 +13818,7 @@ function taskRail(v, rec = taskRecord(v.taskId)) {
     ${notesSection(v)}
     <div class="rail-links">
       ${rec?.params?.draft ? '' : approvalHistoryLink(v)}
+      ${railDesktop(v)}
       ${railTerminal(v)}
     </div>
   </div>`;
@@ -13750,6 +13862,30 @@ function railTerminal(v) {
     </div>`;
 }
 
+// A desktop task's screen, which a person can watch and take over (a
+// Cloudflare check, a sign-in step): opened in a tab of its own.
+function railDesktop(v) {
+  if (!v.worldDesktop) return '';
+  return `<div class="ck-item ck-terminal-item">
+      <button type="button" class="ck-terminal-open" id="desktop-open" data-shortcut="task.desktop" title="Watch and take over this task's screen (d)">
+        ${ICON.desktop}<span class="ck-name">Desktop</span>
+      </button>
+    </div>`;
+}
+
+// The desktop's viewer in a new tab. The tab opens at the click, before the
+// request, so no popup blocker takes it; a failure closes it again.
+async function openTaskDesktop(v = S.view) {
+  if (!v?.worldDesktop) return;
+  const tab = window.open('', '_blank');
+  if (tab) tab.opener = null;
+  try {
+    const session = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/desktop`, { method: 'POST' });
+    if (tab) tab.location.href = session.url;
+    else window.open(session.url, '_blank', 'noopener');
+  } catch (error) { tab?.close(); toast(error.message, true); }
+}
+
 // Whether the rail shows. Beside the conversation (a wide window): unless the
 // person closed it. Over it (a narrow one): only when asked for.
 function taskRailNarrow() { return !!window.matchMedia?.('(max-width: 1099px)').matches; }
@@ -13789,6 +13925,7 @@ function wireTaskRail(v) {
   wireTaskOrg(v);
   wireNotes(v);
   wirePullRequestApprovals();
+  $('#desktop-open')?.addEventListener('click', () => openTaskDesktop(v));
   $('#tp-rail [data-open-terminal]')?.addEventListener('click', () => {
     S.taskRailOverlay = false; // the shell shows in place of the floating rail
     toggleTaskTerminal(v);
@@ -14188,7 +14325,7 @@ function conversationPane(v, t) {
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
   const pending = pendingMessagesHtml(v, t, entries, canFollowUp);
   const fu = canFollowUp
-    ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
+    ? `<div class="ck-compose"><div class="followup-box" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}">
         <div class="prompt-field">
           <textarea class="followup-input"${narrowViewport() ? ' rows="1"' : ''} placeholder="${followupPlaceholder(v, t, agentName)}" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
           ${t.shared ? newAgentFormsHtml(v, `${v.taskId}/${t.role}`) : ''}
@@ -14761,13 +14898,22 @@ function decodeMarkdownAttribute(value) {
   }[entity]));
 }
 
+// A file as a task's agent cites it (absolute in its world, or relative to its
+// working folder), read through Files' view of that task.
+function citedFileRaw(projectId, task, cited) {
+  return `/api/projects/${encodeURIComponent(projectId)}/files/raw?task=${encodeURIComponent(task)}&cited=1&path=${encodeURIComponent(cited)}`;
+}
+function taskProjectId(v) {
+  return v?.taskId ? taskRecord(v.taskId)?.projectId || v.projectId : null;
+}
+
 // Markdown mode renders anchors itself; replace in-world targets afterwards.
 // Relative links ride in data-md-local, while absolute links retain their href.
 function annotateWorldFileLinks(html, v = S.view) {
   // An image the agent cites by path is read from its task's world (Files' task view).
-  const projectId = v?.taskId ? taskRecord(v.taskId)?.projectId || v.projectId : null;
+  const projectId = taskProjectId(v);
   if (projectId) html = String(html).replace(/<img data-md-src="([^"]*)"/g, (whole, src) =>
-    `<img src="${esc(`/api/projects/${encodeURIComponent(projectId)}/files/raw?task=${encodeURIComponent(v.num ?? v.taskId)}&cited=1&path=${encodeURIComponent(decodeMarkdownAttribute(src))}`)}" data-md-src="${src}"`);
+    `<img src="${esc(citedFileRaw(projectId, v.num ?? v.taskId, decodeMarkdownAttribute(src)))}" data-md-src="${src}"`);
   return String(html).replace(/<a href="([^"]*)"([^>]*)>/g, (anchor, href, attrs) => {
     const local = attrs.match(/\sdata-md-local="([^"]*)"/);
     const fileUrl = worldFileHref(decodeMarkdownAttribute(local ? local[1] : href), v);
@@ -15274,7 +15420,6 @@ function terminalPane(v) {
       <span style="flex:1"></span>
       ${localWorldPath(v) ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
       ${v.worldAvailable && !localWorldPath(v) ? '<button class="btn sm" id="terminal-native">Copy attach cmd</button>' : ''}
-      ${v.worldDesktop ? '<button class="btn sm" id="desktop-open">Open desktop</button>' : ''}
       ${(v.checkouts || []).length > 1 ? `<select class="sel sm" id="term-checkout" title="Which branch's checkout to open the shell in">
         ${v.checkouts.map((c) => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join('')}
       </select>` : ''}
@@ -15344,7 +15489,7 @@ async function openConversationShare(v, role) {
  * button; an Avatar's row). */
 async function forkTaskAgent(taskId, role, view) {
   const resumeFrom = { taskId, role };
-  const task = await loadTaskRecord(taskId);
+  const task = await withEndedGrants(await loadTaskRecord(taskId));
   openTaskForm('software-dev', undefined, undefined, {
     ...forkBranchDefaults(task || view || {}),
     'agent:do': { resumeFrom },
@@ -15364,10 +15509,6 @@ function wireCheckinSidebar(v) {
 
   $('#terminal-native')?.addEventListener('click', () => copyNativeAttachCommand(v));
   $('#main').querySelectorAll('.fork-local').forEach((button) => button.addEventListener('click', () => forkCloudSessionLocally(v, button)));
-  $('#desktop-open')?.addEventListener('click', async () => {
-    try { const session = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/desktop`, { method: 'POST' }); window.open(session.url, '_blank', 'noopener'); }
-    catch (error) { toast(error.message, true); }
-  });
 }
 
 function nativeConversationFilename(session) {
@@ -15387,7 +15528,7 @@ function portableForkCommandFor(session, cwd) {
     'mkdir -p "$HOME/.codex/sessions/tavya"',
     `cp -n "${source}" "$HOME/.codex/sessions/tavya/${filename}"`,
     `cd ${shellQuote(cwd)}`,
-    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.167.1"} fork ${shellQuote(sessionId)}`,
+    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.171.0"} fork ${shellQuote(sessionId)}`,
   ].join('\n');
   if (session.provider === 'claude') return [
     `tavya_cwd="$(cd ${shellQuote(cwd)} && pwd -P)"`,
@@ -17130,27 +17271,33 @@ function wireActions(v) {
 }
 
 function wireFollowupSizing(ta, key) {
-  let appliedHeight = ta.style.height;
-  const remember = () => {
-    if (ta.style.height !== appliedHeight) {
-      S.followupHeights[key] = parseFloat(ta.style.height) || 0;
+  // A field kept across repaints (retainedComposer) is sized and wired once;
+  // each repaint only watches its width again (patchTaskPage disposed the watch).
+  if (!ta.sizing) {
+    let appliedHeight = ta.style.height;
+    const remember = () => {
+      if (ta.style.height !== appliedHeight) {
+        S.followupHeights[key] = parseFloat(ta.style.height) || 0;
+        appliedHeight = ta.style.height;
+      }
+    };
+    const grow = () => {
+      remember();
+      const scrollTop = ta.scrollTop;
+      // Measure at the natural height (two rows; one on a phone) so deleting text shrinks the box.
+      ta.style.height = 'auto';
+      const style = getComputedStyle(ta);
+      const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+      const automaticLimit = 12 * parseFloat(style.lineHeight) + padding;
+      ta.style.height = `${Math.max(S.followupHeights[key] || 0, Math.min(ta.scrollHeight, automaticLimit))}px`;
       appliedHeight = ta.style.height;
-    }
-  };
-  const grow = () => {
-    remember();
-    const scrollTop = ta.scrollTop;
-    // Measure at the natural height (two rows; one on a phone) so deleting text shrinks the box.
-    ta.style.height = 'auto';
-    const style = getComputedStyle(ta);
-    const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
-    const automaticLimit = 12 * parseFloat(style.lineHeight) + padding;
-    ta.style.height = `${Math.max(S.followupHeights[key] || 0, Math.min(ta.scrollHeight, automaticLimit))}px`;
-    appliedHeight = ta.style.height;
-    ta.scrollTop = scrollTop;
-  };
-  grow();
-  ta.addEventListener('input', grow);
+      ta.scrollTop = scrollTop;
+    };
+    ta.sizing = { remember, grow };
+    grow();
+    ta.addEventListener('input', grow);
+  }
+  const { remember, grow } = ta.sizing;
   // Wrapping changes on window resize and when entering/leaving full screen.
   // Height-only changes are native manual resizes; don't immediately undo them.
   let width = ta.clientWidth;
@@ -17360,9 +17507,11 @@ function wireNewAgentForms(box, v, key) {
 // A view update rebuilds the box while it is open and refocuses the new one, so
 // the open menu is recorded here and carries over to it, as it was.
 let openAgentMention = null; // { key, owner: the textarea, peopleMode, active }
-function wireAgentMention(ta, box, v, key) {
+function wireAgentMention(ta, box, wiredView, key) {
   if (!ta || ta.dataset.amWired) return;
   ta.dataset.amWired = '1';
+  // The field outlives repaints (retainedComposer): read the task as it is now.
+  const live = () => (S.view?.taskId === wiredView.taskId ? S.view : wiredView);
   let menu = null, items = [], active = 0, token = null, peopleMode = false;
   const close = () => {
     menu?.remove(); menu = null; items = []; token = null; peopleMode = false;
@@ -17375,6 +17524,7 @@ function wireAgentMention(ta, box, v, key) {
     return m ? { start: pos - m[2].length - 1, end: pos, query: m[2] } : null;
   };
   const agentItems = () => {
+    const v = live();
     const pending = Object.keys(followupNewAgents(key));
     const listed = [...(v.participants || []), ...pending.map((k) => ({ key: k, label: participantLabelOf(k, v), state: 'new' }))];
     return listed.map((p, index) => ({ kind: 'agent', index, selector: `agent:${p.key}`, label: p.label, state: p.state }));
@@ -17408,6 +17558,7 @@ function wireAgentMention(ta, box, v, key) {
     if (!item || !token || !ta.isConnected) return close();
     if (item.kind === 'people') { peopleMode = true; active = 0; items = build(); return render(); }
     if (item.kind === 'new') {
+      const v = live();
       const agentKey = nextAgentKeyFor([...(v.participants || []).map((p) => p.key), ...Object.keys(followupNewAgents(key))]);
       const main = v.participants?.find((p) => p.key === 'do')?.spec || v.agents?.do || {};
       followupNewAgents(key)[agentKey] = { provider: main.provider || 'claude', ...(main.model ? { model: main.model } : {}) };
@@ -17553,7 +17704,10 @@ function wireFollowups(v) {
     const key = `${v.taskId}/${role}`;
     const images = (S.followupImages[key] ||= []);
     const files = (S.followupFiles[key] ||= []);
-    ta.addEventListener('input', () => { S.followupDrafts[key] = ta.value; });
+    // The field outlives repaints (retainedComposer): what is wired on it is wired once.
+    const firstWiring = !ta.followupWired;
+    ta.followupWired = true;
+    if (firstWiring) ta.addEventListener('input', () => { S.followupDrafts[key] = ta.value; });
     const chips = box.querySelector('.followup-chips');
     // An upload outlives this render: paint whichever box is on the page when it lands.
     const roleSelector = window.CSS && CSS.escape ? CSS.escape(role) : role;
@@ -17572,6 +17726,8 @@ function wireFollowups(v) {
     wireFollowupSizing(ta, key);
     paint();
     const send = async () => {
+      // What is sent is what the box shows: the mic stops here, not into an emptied box.
+      if (S.dictation?.key === `followup:${key}`) stopDictation();
       const text = ta.value.trim();
       const uploading = pendingAttachments(images).length > 0;
       if (!text && !images.length && !files.length && !uploading) return;
@@ -17627,9 +17783,10 @@ function wireFollowups(v) {
         // would leave the *live* box untouched. Clear the current DOM textarea by
         // a fresh lookup so the box is cleared even in that race.
         const sel = window.CSS && CSS.escape ? CSS.escape(role) : role;
-        const liveTa = $('#main').querySelector(`.followup-box[data-role="${sel}"] .followup-input`);
-        if (liveTa) liveTa.value = '';
-        else if (ta) ta.value = '';
+        const liveTa = $('#main').querySelector(`.followup-box[data-role="${sel}"] .followup-input`) || ta;
+        liveTa.value = '';
+        // The box is kept across repaints (retainedComposer): it shrinks back as if the text were deleted.
+        liveTa.dispatchEvent(new Event('input', { bubbles: true }));
         paint();
         // Sent: hand the keyboard back to the page (u, j/k, …), as Gmail does
         // after a reply; f composes again. The repaint then focuses the thread.
@@ -17646,8 +17803,13 @@ function wireFollowups(v) {
       }
     };
     btn.addEventListener('click', send);
-    // ⌘/Ctrl-Enter sends, matching the rest of the console's compose affordances.
-    ta.addEventListener('keydown', (e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); send(); } });
+    // ⌘/Ctrl-Enter sends, matching the rest of the console's compose affordances:
+    // through the Send on the page now, which a repaint may have replaced.
+    if (firstWiring) ta.addEventListener('keydown', (e) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key !== 'Enter') return;
+      e.preventDefault();
+      ta.closest('.followup-box')?.querySelector('.followup-send')?.click();
+    });
   });
 }
 
@@ -21062,6 +21224,18 @@ function resolveGalleryArtifact(item, fresh = false) {
   return resolveReviewArtifact({ taskId: item.taskId, reviewInfo: { actions } }, item.index, fresh);
 }
 
+// A gallery Markdown file's images sit beside it: in the repository (a `/…`
+// one from its root, as on GitHub), or in its task's world.
+function galleryMarkdownImages(item) {
+  const task = item.num ?? item.taskId;
+  const repository = item.source === 'repository';
+  return (src) => {
+    if (!repository && src.startsWith('/')) return citedFileRaw(item.projectId, task, src);
+    const target = FV.resolve(src.startsWith('/') ? FV.parts(item.path)[0] || '' : FV.parent(item.path), src.replace(/^\/+/, ''));
+    return target === null ? null : filesApi(item.projectId, target, true, false, repository ? '' : `task:${task}`);
+  };
+}
+
 // Fill image and video tiles as they come into view.
 function loadArtifactThumbnails(grid, items) {
   const slots = [...grid.querySelectorAll('.review-tile-media[data-thumb]:not([data-thumbed])')];
@@ -21094,7 +21268,7 @@ async function openArtifactGallery(items, at) {
   const load = async (i) => {
     const item = items[i];
     const resolved = await resolveGalleryArtifact(item);
-    return { ...(await artifactItem(resolved, () => resolveGalleryArtifact(item, true))), links: artifactGalleryLinks(item) };
+    return { ...(await artifactItem(resolved, () => resolveGalleryArtifact(item, true), galleryMarkdownImages(item))), links: artifactGalleryLinks(item) };
   };
   const first = await load(at);
   if (items.length < 2 && !first.view) return downloadArtifact(first);
@@ -22246,6 +22420,8 @@ function settingsView(proj) {
       <div class="setting-rows" id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
     <div class="card" data-settings-advanced hidden><div class="setting-rows">
+      ${proj.coordinator ? `<div class="setting-row"><span class="setting-label">Co-ordinator project ${policyTip(COORDINATOR_PROJECT_TIP)}</span>
+        <span class="setting-value setting-muted">Permanent</span></div>` : `
       <div class="setting-row" data-settings-access="project" data-unsaved hidden><span class="setting-label">Name ${policyTip('Use / to put the project in folders, e.g. Clients/Website.')}</span>
         <span class="setting-value"><input id="project-name" class="setting-input" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders"></span>
         <span class="setting-actions"><button class="btn sm primary" id="rename-project" data-unsaved-save>Save</button></span></div>
@@ -22254,7 +22430,7 @@ function settingsView(proj) {
         <span class="setting-actions"><button class="btn sm" id="move-project">Move…</button></span></div>
       <div class="setting-row danger" data-settings-access="projectDelete" hidden><span class="setting-label">Delete project ${policyTip('Removes the project and all its tasks.')}</span>
         <span class="setting-value setting-muted">Permanent</span>
-        <span class="setting-actions"><button class="btn sm danger" id="delete-project">Delete…</button></span></div>
+        <span class="setting-actions"><button class="btn sm danger" id="delete-project">Delete…</button></span></div>`}
     </div></div>
     <div class="card" id="project-experimental"><div class="section-h">Experimental</div><div id="project-avatar-settings">Loading…</div></div>
     </div></div></div>`;
@@ -26718,9 +26894,9 @@ function inboxRowLabel(item) {
     : `${item.subject.serviceName} at ${Math.floor((item.subject.used / item.subject.limit) * 100)}% of its limit${item.subject.level === 95 ? ' — upgrade now' : ''}`;
   if (item.subject?.kind === 'compute') {
     const n = Number(item.subject.computers || 0), computers = `${n} parked computer${n === 1 ? '' : 's'}`;
-    if (item.subject.stage === 'hibernated') return `Out of compute — ${computers} hibernated`;
-    if (item.subject.hibernateAt) return `Out of compute — ${computers} hibernate ${new Date(item.subject.hibernateAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
-    return item.subject.trial ? 'Free trial over — choose a plan' : `Out of compute — renews ${new Date(item.subject.renewsAt).toLocaleDateString()}`;
+    if (item.subject.stage === 'hibernated') return `Out of credits — ${computers} hibernated`;
+    if (item.subject.hibernateAt) return `Out of credits — ${computers} hibernate ${new Date(item.subject.hibernateAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
+    return item.subject.trial ? 'Free trial over — choose a plan' : `Out of credits — renew ${new Date(item.subject.renewsAt).toLocaleDateString()}`;
   }
   if (item.subject?.kind === 'storage') return item.subject.stage === 'deleted'
     ? 'Stored data deleted to fit the limit'
@@ -26736,7 +26912,7 @@ function inboxRowLabel(item) {
 function inboxTitle(item, fallback = item.kind) {
   if (item.subject?.kind === 'credential') return `${item.subject.provider}:${item.subject.account}`;
   if (item.subject?.kind === 'storage') return `Storage · ${formatBytes(item.subject.retainedBytes)} of ${formatBytes(item.subject.quotaBytes)}`;
-  if (item.subject?.kind === 'compute') return `Compute · $${(item.subject.usedMicros / 1e6).toFixed(2)} of $${(item.subject.creditMicros / 1e6).toFixed(2)}`;
+  if (item.subject?.kind === 'compute') return `${siteName()} credits · $${(item.subject.usedMicros / 1e6).toFixed(2)} of $${(item.subject.creditMicros / 1e6).toFixed(2)}`;
   if (item.subject?.kind === 'service-limit') return item.subject.level === 'failed' ? `${item.subject.serviceName} · ${item.subject.error}`
     : `${item.subject.serviceName} · ${item.subject.label} ${limitAmount(item.subject.used, item.subject.unit)} of ${limitAmount(item.subject.limit, item.subject.unit, true)}`;
   return item.task?.title || item.resource?.name || fallback;
@@ -26812,7 +26988,7 @@ function nativePlatform() { return nativeApp() ? window.Capacitor.getPlatform?.(
 // The platform's speech recognizer behind the browser's SpeechRecognition
 // interface, so dictation (toggleDictation) is the same code in a browser and
 // in the app. Android ends it after a pause, like the browser; iOS keeps
-// listening, so a pause after words ends it here.
+// listening, so without `continuous` a pause after words ends it here.
 const NATIVE_SPEECH_PAUSE_MS = 2000;
 function nativeRecognitionClass() {
   const plugin = nativePlugin('SpeechRecognition');
@@ -26869,7 +27045,10 @@ function micButtonHtml(key) {
   if (typeof speechRecognitionClass() !== 'function') return '';
   const on = S.dictation?.key === key;
   return `<button type="button" class="mic-button${on ? ' listening' : ''}" data-mic="${esc(key)}" data-shortcut="compose.voice" aria-pressed="${on}"
-    aria-label="${on ? 'Stop dictating' : 'Dictate'}" title="${esc(commandHint(on ? 'Stop dictating' : 'Dictate', 'compose.voice'))}">${ICON.mic}</button>`;
+    aria-label="${on ? 'Stop dictating' : 'Dictate'}" title="${esc(micTitle(on))}">${ICON.mic}</button>`;
+}
+function micTitle(on) {
+  return on ? `${commandHint('Stop dictating', 'compose.voice')} · or say “${DICTATION_STOP_PHRASE}”` : commandHint('Dictate', 'compose.voice');
 }
 // The field a mic types into: found again each time, since a refresh may have replaced it.
 function micField(key) {
@@ -26883,7 +27062,33 @@ function paintMic(key) {
   button.classList.toggle('listening', on);
   button.setAttribute('aria-pressed', String(on));
   button.setAttribute('aria-label', on ? 'Stop dictating' : 'Dictate');
-  button.title = commandHint(on ? 'Stop dictating' : 'Dictate', 'compose.voice');
+  button.title = micTitle(on);
+}
+// Dictation lasts until the person ends it: saying "stop listening" (as in
+// Google Docs and Dragon), a tap on the mic, typing, Esc, sending, or leaving
+// the page; DICTATION_SILENCE_MS without a word is only the net for a mic left
+// on, which would type whatever the room says into the message. A
+// recognizer ends on its own at a pause (Chrome on Android after a breath,
+// Android's own after the end of a sentence); dictation starts the next one,
+// keeping what was heard, so a pause mid-thought does not stop it.
+const DICTATION_SILENCE_MS = 120_000;
+// The spoken stop: one of these as the last words heard, never typed. It takes
+// effect once the speaker pauses on it (a final result, the recognizer's end,
+// or DICTATION_STOP_SETTLE_MS without more words), so "stop listening to the
+// radio" is just text.
+const DICTATION_STOP_PHRASE = 'stop listening';
+const DICTATION_STOP_SETTLE_MS = 800;
+function beforeStopPhrase(text) {
+  const m = /^(.*?)[\s,;:-]*\bstop (?:listening|dictating|dictation|recording)[\s.,!?]*$/is.exec(text);
+  return m ? m[1].trim() : null;
+}
+// Chrome on Android repeats earlier words in each result of a continuous
+// session, so there each sentence is a recognizer of its own.
+function continuousDictation() {
+  return nativeApp() || !/Android/i.test(navigator.userAgent || '');
+}
+function joinHeard(...parts) {
+  return parts.reduce((text, part) => (!part ? text : !text || /\s$/.test(text) || /^\s/.test(part) ? text + part : `${text} ${part}`), '').trim();
 }
 function toggleDictation(key) {
   if (S.dictation?.key === key) return stopDictation();
@@ -26892,38 +27097,77 @@ function toggleDictation(key) {
   const { field } = micField(key);
   if (!Recognition || !field || field.disabled) return;
   window.speechSynthesis?.cancel(); // never transcribe our own voice
-  const recognition = new Recognition();
-  recognition.lang = document.documentElement.lang || navigator.language || 'en-US';
-  recognition.interimResults = true;
-  recognition.continuous = false; // a pause ends it
   // Words go where the caret was, replacing any selection, spaced from their neighbours.
   const value = field.value, start = field.selectionStart ?? value.length, end = field.selectionEnd ?? value.length;
   const before = value.slice(0, start), after = value.slice(end);
-  const state = { key, recognition, placeholder: field.placeholder, heard: '' };
+  // `said`: what earlier recognizers heard; `written`: the field as dictation last left it.
+  const state = { key, recognition: null, placeholder: field.placeholder, heard: '', said: '', written: value, silence: null, stopping: null, quickEnds: 0 };
   S.dictation = state;
+  // The field changed under dictation (sent, cleared, a form closed): it is no longer ours to write.
+  const ours = () => { const target = micField(key).field; return target && !target.disabled && target.value === state.written ? target : null; };
   const write = (text) => {
-    const target = micField(key).field;
-    if (!target || S.dictation !== state) return;
+    const target = ours();
+    if (!target) return stopDictation();
     const lead = before && text && !/\s$/.test(before) ? ' ' : '';
     const tail = after && text && !/^\s/.test(after) ? ' ' : '';
-    target.value = `${before}${lead}${text}${tail}${after}`;
+    target.value = state.written = `${before}${lead}${text}${tail}${after}`;
     const caret = before.length + lead.length + text.length;
     target.setSelectionRange?.(caret, caret);
     target.dispatchEvent(new Event('input', { bubbles: true })); // drafts, sizing, @ and [[ menus
   };
-  recognition.onresult = (event) => {
-    state.heard = [...event.results].map((result) => result[0]?.transcript || '').join('').trim();
-    write(state.heard);
+  // The stop phrase said: what came before it stays, and dictation ends.
+  const stopBySpeech = (kept) => { write(kept); if (S.dictation === state) stopDictation(); };
+  const quiet = () => {
+    clearTimeout(state.silence);
+    state.silence = setTimeout(() => { if (S.dictation === state) stopDictation(); }, DICTATION_SILENCE_MS);
   };
-  recognition.onerror = (event) => {
-    const blocked = nativeApp() ? `Allow the microphone and speech recognition for ${siteName()} in your phone’s settings to dictate.` : 'Allow the microphone for this site to dictate.';
-    const message = { 'not-allowed': blocked, 'service-not-allowed': blocked,
-      'audio-capture': 'No microphone found.', network: 'Dictation needs a connection.' }[event.error];
-    if (message) toast(message, true);
+  const listen = () => {
+    const recognition = new Recognition();
+    const startedAt = Date.now();
+    let session = '', fatal = false;
+    recognition.lang = document.documentElement.lang || navigator.language || 'en-US';
+    recognition.interimResults = true;
+    recognition.continuous = continuousDictation();
+    recognition.onresult = (event) => {
+      if (S.dictation !== state || state.recognition !== recognition) return;
+      session = joinHeard(...[...event.results].map((result) => result[0]?.transcript || ''));
+      state.heard = joinHeard(state.said, session);
+      quiet();
+      clearTimeout(state.stopping);
+      const kept = beforeStopPhrase(state.heard);
+      if (kept == null) return write(state.heard);
+      if (event.results[event.results.length - 1]?.isFinal) return stopBySpeech(kept);
+      write(kept); // the phrase is never shown; more words bring it back as text
+      state.stopping = setTimeout(() => { if (S.dictation === state) stopBySpeech(kept); }, DICTATION_STOP_SETTLE_MS);
+    };
+    recognition.onerror = (event) => {
+      // Silence and our own stop are part of dictating; anything else ends it.
+      if (event.error === 'no-speech' || event.error === 'aborted') return;
+      fatal = true;
+      const blocked = nativeApp() ? `Allow the microphone and speech recognition for ${siteName()} in your phone’s settings to dictate.` : 'Allow the microphone for this site to dictate.';
+      const message = { 'not-allowed': blocked, 'service-not-allowed': blocked,
+        'audio-capture': 'No microphone found.', network: 'Dictation needs a connection.' }[event.error];
+      if (message) toast(message, true);
+    };
+    recognition.onend = () => {
+      if (S.dictation !== state || state.recognition !== recognition) return;
+      state.said = joinHeard(state.said, session);
+      const kept = beforeStopPhrase(state.said);
+      if (kept != null) return stopBySpeech(kept);
+      // A recognizer that ends at once, time after time, has no microphone to listen with.
+      state.quickEnds = !session && Date.now() - startedAt < 1500 ? state.quickEnds + 1 : 0;
+      if (fatal || state.quickEnds >= 3 || !ours() || document.visibilityState === 'hidden') return stopDictation();
+      // Android's own recognizer is busy for a moment after it ends; a browser's starts again at once.
+      if (!nativeApp()) return listen();
+      setTimeout(() => { if (S.dictation === state && state.recognition === recognition) listen(); }, 250);
+    };
+    state.recognition = recognition;
+    try { recognition.start(); } catch (error) { fatal = true; stopDictation(); toast(error.message, true); }
   };
-  recognition.onend = () => { if (S.dictation === state) stopDictation(); };
-  field.placeholder = 'Listening…';
-  try { recognition.start(); } catch (error) { S.dictation = null; field.placeholder = state.placeholder; return toast(error.message, true); }
+  field.placeholder = `Listening… say “${DICTATION_STOP_PHRASE}” to end`;
+  quiet();
+  listen();
+  if (S.dictation !== state) return;
   paintMic(key);
   field.focus();
 }
@@ -26931,7 +27175,9 @@ function stopDictation() {
   const state = S.dictation;
   if (!state) return;
   S.dictation = null;
-  try { state.recognition.stop(); } catch {}
+  clearTimeout(state.silence);
+  clearTimeout(state.stopping);
+  try { state.recognition?.stop(); } catch {}
   const { field } = micField(state.key);
   if (field) field.placeholder = state.placeholder;
   paintMic(state.key);
@@ -26962,6 +27208,8 @@ if (typeof document !== 'undefined') {
     if (!S.dictation || event.metaKey || event.ctrlKey || event.altKey) return;
     if (event.key === 'Escape' || event.target.closest?.('.prompt-field')) stopDictation();
   }, true);
+  // Nobody dictates into a page they cannot see (a phone locked, the app switched).
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') stopDictation(); });
 }
 
 // Read replies aloud (Profile, this device): each new answer that lands on the
@@ -26970,7 +27218,8 @@ function readAloudEnabled() {
   try { return typeof speechSynthesis !== 'undefined' && localStorage.getItem('karmax-read-aloud') === '1'; } catch { return false; }
 }
 function readAloud(element) {
-  if (!readAloudEnabled() || !element) return;
+  // While someone dictates, a reply read aloud would be transcribed into their message.
+  if (!readAloudEnabled() || !element || S.dictation) return;
   const copy = element.cloneNode(true);
   copy.querySelectorAll('.msg-meta, button, details:not([open]) > :not(summary), pre').forEach((node) => node.remove());
   const text = copy.textContent.replace(/\s+/g, ' ').trim().slice(0, 4000);
@@ -27660,7 +27909,7 @@ function profileView() {
       </div>
     </div>
     ${notificationsCard()}
-    ${S.meta?.hosted ? '<div class="card"><div class="section-h">Paid subscriptions</div><div id="profile-paid-subscriptions" aria-live="polite"><span class="task-sub">Loading…</span></div></div>' : ''}
+    ${S.meta?.hosted ? '<div class="card" id="profile-plans-card"><div class="section-h">Plans &amp; billing</div><div id="profile-plans" aria-live="polite"><span class="task-sub">Loading…</span></div></div>' : ''}
     ${u ? appGrantsCard() : ''}
     ${u ? chatLinksCard() : ''}
     <div class="card" id="data-account">
@@ -27805,31 +28054,76 @@ function wireNotificationsCard() {
   });
 }
 
-function profilePaidSubscriptionsMarkup(subscriptions) {
-  if (!subscriptions.length) return `<p class="setting-muted">None ${policyTip('Unfinished checkouts and gifted plans are not listed.')}</p>`;
+// Profile → Plans & billing: each organization one belongs to on one line (its
+// plan, gifted or bought, its packs, its tavya credits), folding out into that
+// organization's own Plan & billing card, where plans and packs are bought. One
+// is open at a time (the card's controls have ids). Subscriptions one paid for
+// in organizations one has since left stay listed, so they can be found.
+function profilePlansMarkup({ organizations = [], formerSubscriptions = [] }) {
+  if (!organizations.length && !formerSubscriptions.length) return '<p class="setting-muted">No organizations</p>';
+  const one = organizations.length === 1;
+  const rows = organizations.map((o) => {
+    const open = one || S.profilePlanOpen === o.organizationId;
+    const packs = Number(o.storagePacks || 0) + Number(o.computePacks || 0), gifted = Number(o.giftedStoragePacks || 0) + Number(o.giftedComputePacks || 0);
+    const packText = packs + gifted ? `${packs + gifted} pack${packs + gifted === 1 ? '' : 's'}${gifted && packs ? `, ${gifted} gifted` : gifted ? ' gifted' : ''}` : '';
+    const c = o.credits;
+    const credits = !c ? '' : c.totalMicros && c.availableMicros > 0
+      ? `<span class="profile-plan-credits">${planMeter(Number(c.usedMicros || 0) + Number(c.heldMicros || 0), c.totalMicros)}<span><b>${esc(planDollars(c.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(c.totalMicros))}</span></span></span>`
+      : c.totalMicros ? '<span class="profile-plan-credits warn">Out of credits</span>' : '';
+    return `<div class="profile-plan${open ? ' open' : ''}" data-organization="${esc(o.organizationId)}">
+      <button type="button" class="profile-plan-head" aria-expanded="${open}" aria-controls="profile-plan-${esc(o.organizationId)}">
+        <span class="profile-plan-org">${esc(o.name)}</span>
+        <span class="profile-plan-what"><b>${esc(o.planName || 'Free')}</b>${o.gift ? '<span class="chip">Gifted</span>' : ''}${packText ? `<span class="setting-muted">${esc(packText)}</span>` : ''}</span>
+        ${credits || '<span></span>'}<span class="profile-plan-caret" aria-hidden="true">›</span></button>
+      <div class="profile-plan-body" id="profile-plan-${esc(o.organizationId)}"${open ? '' : ' hidden'}></div></div>`;
+  }).join('');
   const statusLabel = { active: 'Active', trialing: 'Trial', past_due: 'Payment overdue', unpaid: 'Unpaid', canceled: 'Cancelled', paused: 'Paused', incomplete: 'Incomplete' };
-  return subscriptions.map(subscription => {
+  const former = formerSubscriptions.map((subscription) => {
     const end = subscription.cancelAtPeriodEnd
       ? ` · cancellation scheduled${subscription.currentPeriodEnd ? ` for ${new Date(subscription.currentPeriodEnd).toLocaleDateString()}` : ''}` : '';
-    return `<div class="member-row"><div><b>${esc(subscription.organizationName)}</b><p class="task-sub">${esc(subscription.planName)} · ${esc(statusLabel[subscription.status] || subscription.status)}${esc(end)}</p>
-      ${!subscription.canManage ? '<p class="task-sub">You no longer have billing-management access. Contact an organization owner or <a href="/legal/billing">billing support</a> for changes or cancellation.</p>' : ''}</div>
-      ${subscription.settingsUrl ? `<a class="btn sm" data-spa href="${esc(subscription.settingsUrl)}">Plans &amp; billing</a>` : ''}</div>`;
+    return `<div class="profile-plan former"><div class="profile-plan-head"><span class="profile-plan-org">${esc(subscription.organizationName)}</span>
+      <span class="profile-plan-what"><b>${esc(subscription.planName)}</b><span class="setting-muted">${esc(statusLabel[subscription.status] || subscription.status)}${esc(end)}</span></span>
+      ${policyTip('You paid for this but no longer belong to the organization. Ask one of its owners, or billing support, to change or cancel it.')}</div></div>`;
   }).join('');
+  return `<div class="profile-plans">${rows}${former}</div>`;
 }
 
-async function hydrateProfilePaidSubscriptions() {
-  const box = $('#profile-paid-subscriptions');
+async function hydrateProfilePlans() {
+  const box = $('#profile-plans');
   if (!box) return;
   const userId = S.user?.id;
-  try {
-    const result = await api('/api/user/paid-subscriptions');
-    if ($('#profile-paid-subscriptions') !== box || S.user?.id !== userId) return;
-    box.innerHTML = profilePaidSubscriptionsMarkup(result.subscriptions);
-  } catch (error) {
-    if ($('#profile-paid-subscriptions') !== box || S.user?.id !== userId) return;
-    box.innerHTML = `<p class="task-sub" role="alert">Could not load paid subscriptions: ${inlineErrorHtml(error)}</p><button class="btn sm" type="button">Retry</button>`;
-    box.querySelector('button')?.addEventListener('click', () => hydrateProfilePaidSubscriptions());
+  let result;
+  try { result = await api('/api/user/plans'); } catch (error) {
+    if ($('#profile-plans') !== box || S.user?.id !== userId) return;
+    box.innerHTML = `<p class="task-sub" role="alert">Could not load plans: ${inlineErrorHtml(error)}</p><button class="btn sm" type="button">Retry</button>`;
+    box.querySelector('button')?.addEventListener('click', () => hydrateProfilePlans());
+    return;
   }
+  if ($('#profile-plans') !== box || S.user?.id !== userId) return;
+  box.innerHTML = profilePlansMarkup(result);
+  const load = (row) => {
+    const body = row.querySelector('.profile-plan-body');
+    body.innerHTML = '<span class="task-sub">Loading…</span>';
+    void hydratePlanAndBilling(row.dataset.organization, body);
+  };
+  box.querySelectorAll('.profile-plan[data-organization]').forEach((row) => {
+    if (row.classList.contains('open')) load(row);
+    row.querySelector('.profile-plan-head').addEventListener('click', () => {
+      const opening = !row.classList.contains('open');
+      // One at a time: close the others (their cards' controls share ids).
+      box.querySelectorAll('.profile-plan.open').forEach((other) => {
+        other.classList.remove('open');
+        other.querySelector('.profile-plan-head').setAttribute('aria-expanded', 'false');
+        const body = other.querySelector('.profile-plan-body'); body.hidden = true; body.innerHTML = '';
+      });
+      S.profilePlanOpen = opening ? row.dataset.organization : null;
+      if (!opening) return;
+      row.classList.add('open');
+      row.querySelector('.profile-plan-head').setAttribute('aria-expanded', 'true');
+      row.querySelector('.profile-plan-body').hidden = false;
+      load(row);
+    });
+  });
 }
 
 function wireProfileView() {
@@ -27847,7 +28141,7 @@ function wireProfileView() {
   });
   if (S.profileUserId && S.profileUserId !== S.user?.id) return;
   wireNotificationsCard();
-  void hydrateProfilePaidSubscriptions();
+  void hydrateProfilePlans();
   void hydrateAppGrants();
   void hydrateChatLinks();
   hydrateProfileGithub();
@@ -28715,7 +29009,44 @@ function planMeter(used, limit) {
   const pct = Math.min(100, (Number(used) || 0) / limit * 100);
   return `<span class="plan-meter${pct >= 100 ? ' over' : pct >= 80 ? ' near' : ''}" role="meter" aria-valuemin="0" aria-valuemax="${esc(limit)}" aria-valuenow="${esc(Math.min(Number(used) || 0, limit))}"><i style="width:${pct.toFixed(1)}%"></i></span>`;
 }
-// A pack is named by what it gives: "100 GB" of storage, "$10" of compute a month.
+// One limit's row. Its label is a button that folds out, beneath the row, what
+// lies behind the figure (where it comes from, what it pays for): readable on a
+// phone, unlike a tooltip. `info`: a sentence, or [term, html] pairs. Folds stay
+// open across re-renders (S.planInfoOpen; wirePlanInfo).
+function planRow(key, label, info, body, className = '', attrs = '') {
+  const open = Boolean(S.planInfoOpen?.has(key));
+  const name = info ? `<button type="button" class="plan-info-toggle" aria-expanded="${open}" aria-controls="plan-info-${key}">${label}<span class="plan-info-icon" aria-hidden="true">ⓘ</span></button>` : label;
+  const details = !info ? '' : typeof info === 'string' ? `<p>${esc(info)}</p>`
+    : `<dl>${info.filter(Boolean).map(([term, html]) => `<dt>${esc(term)}</dt><dd>${html}</dd>`).join('')}</dl>`;
+  return `<div class="setting-row${className ? ` ${className}` : ''}"${attrs}><span class="setting-label">${name}</span>${body}</div>${info ? `<div class="plan-info" id="plan-info-${key}" data-info="${key}"${open ? '' : ' hidden'}>${details}</div>` : ''}`;
+}
+// Amounts and what they are, one per line: "$10.00  1 × $10 pack".
+function planLines(lines) {
+  const shown = lines.filter(Boolean);
+  return shown.length ? `<ul class="plan-lines">${shown.map(([amount, what]) => `<li><b>${esc(amount)}</b><span>${esc(what)}</span></li>`).join('')}</ul>` : '';
+}
+// What this month's credits went on: computers, agents and models (the included
+// model, gateways), and apps and media agents bought (generations, apps).
+function planCreditUse(byProvider) {
+  const use = { computers: 0, models: 0, apps: 0 };
+  for (const row of byProvider || []) {
+    const kind = COMPUTER_PROVIDERS[row.provider] ? 'computers' : row.provider === 'openrouter' || String(row.provider).startsWith('gateway:') ? 'models' : 'apps';
+    use[kind] += Number(row.usedMicros || 0);
+  }
+  return use;
+}
+function wirePlanInfo(box) {
+  box.querySelectorAll('.plan-info-toggle').forEach((button) => button.addEventListener('click', () => {
+    const panel = box.querySelector(`#${button.getAttribute('aria-controls')}`);
+    if (!panel) return;
+    const open = button.getAttribute('aria-expanded') !== 'true';
+    button.setAttribute('aria-expanded', String(open));
+    panel.hidden = !open;
+    S.planInfoOpen ??= new Set();
+    if (open) S.planInfoOpen.add(panel.dataset.info); else S.planInfoOpen.delete(panel.dataset.info);
+  }));
+}
+// A pack is named by what it gives: "100 GB" of storage, "$10" of credits a month.
 function planPackName(kind, pack) {
   return kind === 'compute' ? planDollars(pack?.creditMicros ?? 10_000_000).replace('.00', '') : formatBytes(pack?.bytes ?? 100 * 1024 ** 3);
 }
@@ -28759,8 +29090,9 @@ function openPlanCheckoutDialog(title, price, order, post) {
 }
 function planBillingMarkup(e, state) {
   if (!e) return '<span class="task-sub">Plan information is temporarily unavailable.</span>';
-  if (e.deployment === 'private') return `<div class="setting-rows"><div class="setting-row"><span class="setting-label">Plan</span>
-    <span class="setting-value"><b>Private installation</b> ${policyTip('Hosted plan limits don’t apply. Users, projects and agents are limited only by this installation’s capacity.')}</span></div></div>`;
+  if (e.deployment === 'private') return `<div class="setting-rows plan-limits">${planRow('private', 'Plan',
+    'Hosted plan limits don’t apply. Users, projects and agents are limited only by this installation’s capacity.',
+    '<span class="setting-value"><b>Private installation</b></span>')}</div>`;
   const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
   const day = (ms) => new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
   const catalog = Object.fromEntries((state?.catalog || []).map((plan) => [plan.id, plan]));
@@ -28792,7 +29124,7 @@ function planBillingMarkup(e, state) {
     ? `<button class="btn sm billing-change" data-plan="team" ${disabled}>Upgrade to Team</button>`
     : giftCheckout && state.gift.plan === 'individual' ? `<button class="btn sm billing-buy" data-plan="team" ${disabled}>Upgrade to Team</button>`
     : paying && billed === 'team' ? `<button class="btn sm billing-change" data-plan="individual" ${disabled || (e.activeUsers > 1 ? 'disabled title="Remove other members first"' : '')}>Switch to Individual</button>` : '';
-  const head = `<div class="plan-head"><span class="plan-name">${esc(e.planName)}</span>${statusChip ? `<span class="chip${state?.status === 'past_due' || state?.status === 'unpaid' ? ' failed' : ''}">${esc(statusChip)}</span>` : ''}
+  const head = `<div class="plan-head"><span class="plan-name">${esc(e.planName)}</span>${statusChip ? `<span class="chip${state?.status === 'past_due' || state?.status === 'unpaid' ? ' failed' : statusChip === 'Gifted' ? ' gifted' : ''}">${esc(statusChip)}</span>` : ''}
     <span class="setting-muted plan-price">${esc(price + renews)}</span><span class="label-row-fill"></span>
     ${change}${subscribed || packsOnly ? `<button class="btn sm billing-portal" ${owner ? '' : disabled} title="Payment method and invoices">Billing</button>` : ''}
     ${paying && !state.cancelAtPeriodEnd ? `<button class="btn sm ghost billing-cancel" ${owner ? '' : disabled}>Cancel plan</button>` : ''}
@@ -28805,9 +29137,11 @@ function planBillingMarkup(e, state) {
   const seatPrice = planMoney(seats?.priceCents ?? e.monthlyAdditionalActiveUserPriceCents);
   const people = seats?.total ? `${members} of ${plural(seats.total, 'seat')}`
     : e.maxMembers != null ? `${members} of ${e.maxMembers}` : `${members} ${members === 1 ? 'person' : 'people'}`;
-  const seatTip = !seats?.total ? '' : seats.gifted
-    ? `${plural(seats.gifted, 'seat')} gifted${seats.paid ? `, ${seats.paid} bought` : ''}; each more is ${seatPrice}/month and adds 5 agents at once, 10 GB of storage and $3 of compute a month.`
-    : `First seat included, then ${seatPrice}/month each, adding 5 agents at once, 10 GB of storage and $3 of compute a month. Someone who joins without a free seat is billed one.`;
+  const seatInfo = !seats?.total ? '' : [
+    ['Seats', planLines([seats.gifted ? [String(seats.gifted), 'gifted'] : [String(seats.included || 1), `included with ${e.planName}`],
+      seats.paid ? [String(seats.paid), 'bought'] : null])],
+    ['Each more', esc(`${seatPrice}/month: 5 more agents at once, 10 GB of storage and $3 of ${siteName()} credits a month.`)],
+    seats.gifted ? null : ['Joining', 'Someone who joins without a free seat is billed one.']];
   const unused = seats?.total && seats.total > members ? `<span class="setting-muted">${seats.total - members} free</span>` : '';
   const seatsPending = state?.seatDeficit && seats?.autoBill
     ? `<span class="warn">${plural(state.seatDeficit, 'seat')} not yet billed</span>` : '';
@@ -28816,23 +29150,28 @@ function planBillingMarkup(e, state) {
   const seatCheckout = Boolean(seats?.gifted) && giftCheckout;
   const canSeats = owner && seats?.total != null && (seatCheckout || ((paying && billed === 'team') || (packsOnly && state.gift?.plan === 'team')) && !busy);
   const seatStepper = canSeats ? planStepper('seats', seats.total, `Each seat is ${seatPrice}/month`, seatCheckout, 'seat', Math.max(members, seats.included)) : '';
-  const peopleRow = `<div class="setting-row" data-limit="people"><span class="setting-label">People${seatTip ? ` ${policyTip(seatTip)}` : ''}</span>
-    <span class="setting-value"><b>${esc(people)}</b>${unused}${seatsFull}${e.overMemberLimit ? '<span class="warn">over the limit: agents are paused</span>' : ''}${seatsPending}</span>
-    ${seatsPending || seatStepper ? `<span class="setting-actions">${seatsPending ? `<button class="btn sm billing-sync" ${disabled}>Bill seats</button>` : seatStepper}</span>` : ''}</div>`;
+  const peopleRow = planRow('people', 'People', seatInfo, `<span class="setting-value"><b>${esc(people)}</b>${unused}${seatsFull}${e.overMemberLimit ? '<span class="warn">over the limit: agents are paused</span>' : ''}${seatsPending}</span>
+    ${seatsPending || seatStepper ? `<span class="setting-actions">${seatsPending ? `<button class="btn sm billing-sync" ${disabled}>Bill seats</button>` : seatStepper}</span>` : ''}`,
+  '', ' data-limit="people"');
   // Agents at once.
   const running = Number(e.activeAgentRuns || 0), waiting = Number(e.queuedAgentRuns || 0);
-  const agentsRow = `<div class="setting-row"><span class="setting-label">Agents ${policyTip('How many agents can work at the same time. More wait in line until one finishes.')}</span>
-    <span class="setting-value"><b>${esc(e.maxActiveAgentRuns)} at once</b>${running || waiting ? `<span class="setting-muted">${running} working${waiting ? `, ${waiting} waiting` : ''}</span>` : ''}</span></div>`;
+  const agentsRow = planRow('agents', 'Agents', 'How many agents can work at the same time. More wait in line until one finishes.',
+    `<span class="setting-value"><b>${esc(e.maxActiveAgentRuns)} at once</b>${running || waiting ? `<span class="setting-muted">${running} working${waiting ? `, ${waiting} waiting` : ''}</span>` : ''}</span>`);
   // Storage: used of the quota, the plan's share and the packs in the tooltip.
   const storagePack = state?.storagePack || { bytes: e.storagePackBytes, monthlyPriceCents: 400 };
   const storageUnit = `${planPackName('storage', storagePack)} pack`;
-  const storageParts = [`${formatBytes(e.includedStorageBytes)} with ${e.planName}`,
-    e.storagePacks ? `${e.storagePacks} × ${storageUnit}${e.storagePacks === 1 ? '' : 's'}` : '',
-    e.giftedStoragePacks ? `${e.giftedStoragePacks} × ${storageUnit}${e.giftedStoragePacks === 1 ? '' : 's'} gifted` : ''].filter(Boolean).join(' + ');
+  const packBytes = Number(storagePack.bytes || e.storagePackBytes || 0);
+  const packsOf = (count, unit) => `${count} × ${unit}${count === 1 ? '' : 's'}`;
   const canStorage = canPacks && state?.storagePack?.available;
-  const storageRow = `<div class="setting-row plan-limit" data-limit="storage"><span class="setting-label">Storage ${policyTip(`Project data, saved task workspaces and review files. ${storageParts}.`)}</span>
-    <span class="setting-value">${planMeter(e.storageUsedBytes, e.storageQuotaBytes)}<span><b>${esc(formatBytes(e.storageUsedBytes ?? 0))}</b> <span class="setting-muted">of ${esc(formatBytes(e.storageQuotaBytes))}</span></span></span>
-    ${canStorage ? `<span class="setting-actions">${planStepper('storage', ending ? 0 : Number(state.storagePacks || 0), `Each ${storageUnit} is ${planMoney(storagePack.monthlyPriceCents)}/month`, giftCheckout, storageUnit)}</span>` : ''}</div>`;
+  const storageInfo = [['Limit', planLines([[formatBytes(e.includedStorageBytes), `with ${e.planName}`],
+      e.storagePacks ? [formatBytes(e.storagePacks * packBytes), packsOf(e.storagePacks, storageUnit)] : null,
+      e.giftedStoragePacks ? [formatBytes(e.giftedStoragePacks * packBytes), `${packsOf(e.giftedStoragePacks, storageUnit)} · gifted`] : null])],
+    ['Counts', 'Project data, saved task workspaces and review files.'],
+    canStorage ? ['More', esc(`${planMoney(storagePack.monthlyPriceCents)}/month for each ${storageUnit}.`)] : null];
+  const storageRow = planRow('storage', 'Storage credits', storageInfo,
+    `<span class="setting-value">${planMeter(e.storageUsedBytes, e.storageQuotaBytes)}<span><b>${esc(formatBytes(e.storageUsedBytes ?? 0))}</b> <span class="setting-muted">of ${esc(formatBytes(e.storageQuotaBytes))}</span></span></span>
+    ${canStorage ? `<span class="setting-actions">${planStepper('storage', ending ? 0 : Number(state.storagePacks || 0), `Each ${storageUnit} is ${planMoney(storagePack.monthlyPriceCents)}/month`, giftCheckout, storageUnit)}</span>` : ''}`,
+    'plan-limit', ' data-limit="storage"');
   // Compute: only where the installation runs computers itself.
   let computeRow = '', topUpRow = '';
   if (e.compute) {
@@ -28844,19 +29183,30 @@ function planBillingMarkup(e, state) {
     const pack = state?.computePack || { creditMicros: e.computePackCreditMicros, monthlyPriceCents: 1000 };
     const providers = (e.compute.providers || []).map((id) => COMPUTER_PROVIDERS[id]?.name || id).join(', ');
     const computeUnit = `${planPackName('compute', pack)} pack`;
-    const parts = [trial ? `${planDollars(trial.creditMicros)} free trial ${trialLive ? 'until' : 'ended'} ${day(trial.endsAt)}` : '',
-      e.includedComputeCreditMicros || !trial ? `${planDollars(e.includedComputeCreditMicros)} with ${e.planName}` : '',
-      e.computePacks ? `${e.computePacks} × ${computeUnit}${e.computePacks === 1 ? '' : 's'}` : '',
-      e.giftedComputePacks ? `${e.giftedComputePacks} × ${computeUnit}${e.giftedComputePacks === 1 ? '' : 's'} gifted` : '',
-      topUp ? `${planDollars(topUp)} topped up, kept until used` : ''].filter(Boolean).join(' + ');
-    // The included model draws on it too (its use is the `openrouter` row).
-    const model = (e.compute.byProvider || []).find((row) => row.provider === 'openrouter');
-    const tip = `Cloud computers ${siteName()} runs for you (${providers})${e.compute.includedModel ? ' and its included model' : ''}, at twice the provider’s price: a 2 CPU · 2 GB E2B computer is about $0.27 an hour. Resets ${day(e.compute.to)}. Your own provider accounts and logins aren’t counted. ${credit ? `${parts}.` : ''}${model ? ` ${planDollars(model.usedMicros)} of it on the included model.` : ''}${held ? ` ${planDollars(held)} is held for computers running now.` : ''}`;
+    const packMicros = Number(pack.creditMicros ?? e.computePackCreditMicros ?? 0);
+    // Credits pay for tavya's computers, agents on its included models (and
+    // model gateways), and what agents buy through tavya (generations, apps).
+    const use = planCreditUse(e.compute.byProvider);
     const canCompute = canPacks && state?.computePack?.available;
-    computeRow = `<div class="setting-row plan-limit" data-limit="compute"><span class="setting-label">Compute ${policyTip(tip.trim())}</span>
-      <span class="setting-value">${credit ? `${planMeter(Number(e.compute.usedMicros || 0) + held, credit)}<span><b>${esc(planDollars(e.compute.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(credit))} ${trialLive && !e.computeCreditMicros && !topUp ? `· free until ${esc(day(trial.endsAt))}` : 'this month'}</span></span>`
+    const computeInfo = [
+      ['Pays for', `<ul class="plan-list"><li>${esc(`Computers ${siteName()} runs for you${providers ? ` (${providers})` : ''}`)}</li>`
+        + `<li>${esc(`Agents on ${siteName()}’s included models`)}</li><li>${esc(`What agents buy through ${siteName()}: images, video, speech, apps`)}</li></ul>`],
+      credit ? ['This month', planLines([trial ? [planDollars(trial.creditMicros), `free trial · ${trialLive ? 'until' : 'ended'} ${day(trial.endsAt)}`] : null,
+        e.includedComputeCreditMicros || !trial ? [planDollars(e.includedComputeCreditMicros), `with ${e.planName}`] : null,
+        e.computePacks ? [planDollars(e.computePacks * packMicros), packsOf(e.computePacks, computeUnit)] : null,
+        e.giftedComputePacks ? [planDollars(e.giftedComputePacks * packMicros), `${packsOf(e.giftedComputePacks, computeUnit)} · gifted`] : null,
+        topUp ? [planDollars(topUp), 'topped up · kept until used'] : null])] : null,
+      use.computers || use.models || use.apps || held ? ['Used', planLines([use.computers ? [planDollars(use.computers), 'computers'] : null,
+        use.models ? [planDollars(use.models), 'agents and models'] : null, use.apps ? [planDollars(use.apps), 'apps and media'] : null,
+        held ? [planDollars(held), 'held for work running now'] : null])] : null,
+      ['Price', esc('Twice what providers charge: a 2 CPU · 2 GB E2B computer is about $0.27 an hour. Your own accounts and logins cost nothing here.')],
+      credit && !(trialLive && !e.computeCreditMicros && !topUp) ? ['Renews', esc(day(e.compute.to))] : null,
+      canCompute ? ['More', esc(`${planMoney(pack.monthlyPriceCents)}/month for each ${computeUnit}${state?.autoTopUp?.offered ? ', or turn on auto top-up' : ''}.`)] : null];
+    computeRow = planRow('compute', `${siteName()} credits`, computeInfo,
+      `<span class="setting-value">${credit ? `${planMeter(Number(e.compute.usedMicros || 0) + held, credit)}<span><b>${esc(planDollars(e.compute.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(credit))} ${trialLive && !e.computeCreditMicros && !topUp ? `· free until ${esc(day(trial.endsAt))}` : 'this month'}</span></span>`
         : '<span class="setting-muted">With a paid plan</span>'}</span>
-      ${canCompute ? `<span class="setting-actions">${planStepper('compute', ending ? 0 : Number(state.computePacks || 0), `Each ${computeUnit} adds ${planPackName('compute', pack)} of compute a month for ${planMoney(pack.monthlyPriceCents)}/month`, giftCheckout, computeUnit)}</span>` : ''}</div>`;
+      ${canCompute ? `<span class="setting-actions">${planStepper('compute', ending ? 0 : Number(state.computePacks || 0), `Each ${computeUnit} adds ${planPackName('compute', pack)} of ${siteName()} credits a month for ${planMoney(pack.monthlyPriceCents)}/month`, giftCheckout, computeUnit)}</span>` : ''}`,
+      'plan-limit', ' data-limit="compute"');
     // Auto top-up: once offered (its billing terms approved), or while on.
     const auto = state?.autoTopUp;
     if (auto && (auto.offered || auto.enabled)) {
@@ -28865,9 +29215,9 @@ function planBillingMarkup(e, state) {
       const cap = Math.round(Number(auto.capCents || 0) / 100);
       const paused = auto.enabled && auto.pausedUntil > Date.now()
         ? `<span class="warn" title="${esc(auto.lastError || '')}">Card declined · retries ${esc(day(auto.pausedUntil))}</span>` : '';
-      topUpRow = `<div class="setting-row" data-limit="auto-top-up"><span class="setting-label">Auto top-up ${policyTip(`When compute runs low, buy ${amount} more at once on the saved card, up to this much a month. Top-ups last until used.`)}</span>
-        <span class="setting-value"><input class="toggle billing-auto-topup" type="checkbox" aria-label="Auto top-up" ${auto.enabled ? 'checked' : ''} ${editable ? '' : disabled || 'disabled'}>
-          <span class="setting-muted">up to $</span><input id="billing-auto-cap" class="plan-gift-count" type="number" min="${Math.ceil(auto.amountCents / 100)}" max="10000" step="${Math.ceil(auto.amountCents / 100)}" value="${esc(cap)}" aria-label="Monthly limit in dollars" ${editable ? '' : 'disabled'}><span class="setting-muted">/month${auto.spentCents ? ` · ${esc(planMoney(auto.spentCents))} this month` : ''}</span>${paused}</span></div>`;
+      topUpRow = planRow('auto-top-up', 'Auto top-up', `When ${siteName()} credits run low, buy ${amount} more at once on the saved card, up to this much a month. Top-ups last until used.`,
+        `<span class="setting-value"><input class="toggle billing-auto-topup" type="checkbox" aria-label="Auto top-up" ${auto.enabled ? 'checked' : ''} ${editable ? '' : disabled || 'disabled'}>
+          <span class="setting-muted">up to $</span><input id="billing-auto-cap" class="plan-gift-count" type="number" min="${Math.ceil(auto.amountCents / 100)}" max="10000" step="${Math.ceil(auto.amountCents / 100)}" value="${esc(cap)}" aria-label="Monthly limit in dollars" ${editable ? '' : 'disabled'}><span class="setting-muted">/month${auto.spentCents ? ` · ${esc(planMoney(auto.spentCents))} this month` : ''}</span>${paused}</span>`, '', ' data-limit="auto-top-up"');
     }
   }
   // One-line notices, only when something needs attention.
@@ -28893,7 +29243,7 @@ function planBillingMarkup(e, state) {
       const items = [team ? 'Any number of people' : '1 person',
         per(`${plan.maxActiveAgentRuns} agents at once`, plan.additionalActiveUserAgentRuns),
         per(`${formatBytes(plan.storageBytes)} storage`, plan.additionalActiveUserStorageBytes && formatBytes(plan.additionalActiveUserStorageBytes)),
-        ...(e.compute ? [per(`${dollars(plan.computeCreditMicros)} compute a month`, plan.additionalActiveUserComputeCreditMicros && dollars(plan.additionalActiveUserComputeCreditMicros))] : [])];
+        ...(e.compute ? [per(`${dollars(plan.computeCreditMicros)} ${siteName()} credits a month`, plan.additionalActiveUserComputeCreditMicros && dollars(plan.additionalActiveUserComputeCreditMicros))] : [])];
       return `<div class="plan-choice" data-plan="${esc(plan.id)}"><div class="plan-choice-head"><b>${esc(plan.name)}</b><span>${esc(planMoney(plan.monthlyBasePriceCents))}<small>/month${team ? ` + ${planMoney(plan.monthlyAdditionalActiveUserPriceCents)}/person` : ''}</small></span></div>
         <ul>${items.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>
         ${packsOnly ? `<button class="btn sm primary billing-change" data-plan="${esc(plan.id)}" ${disabled}>Choose ${esc(plan.name)}</button>`
@@ -28906,36 +29256,38 @@ function planBillingMarkup(e, state) {
   // The operator's complimentary plan and packs, and this organization's compute price.
   const computePrice = state?.computePrice;
   const gifts = state?.canGift ? `<details class="plan-operator"><summary>Operator</summary><div class="setting-rows">
-    <div class="setting-row"><span class="setting-label">Plan ${policyTip('Free access until removed. Paid billing, if any, continues separately. A gifted Team covers this many people; its owner buys more seats beside the gift.')}</span><span class="setting-value">
+    ${planRow('gift-plan', 'Plan', 'Free access until removed. Paid billing, if any, continues separately. A gifted Team covers this many people; its owner buys more seats beside the gift.', `<span class="setting-value">
       <select id="billing-gift-plan" aria-label="Gift plan">${Object.values(catalog).filter((plan) => plan.id !== 'free').map((plan) => `<option value="${esc(plan.id)}" ${state.gift?.plan === plan.id ? 'selected' : ''}>${esc(plan.name)}</option>`).join('')}</select>
       <input id="billing-gift-seats" type="number" min="1" max="10000" step="1" value="${esc(state.gift?.seats ?? Math.max(1, members))}" class="plan-gift-count" aria-label="Gifted seats" ${state.gift?.plan === 'individual' ? 'hidden' : ''}><span class="setting-muted billing-gift-seats-unit" ${state.gift?.plan === 'individual' ? 'hidden' : ''}>seats</span></span>
-      <span class="setting-actions"><button class="btn sm billing-gift">${state.gift ? 'Update' : 'Gift'}</button>${state.gift ? '<button class="btn sm ghost billing-gift-remove">Remove</button>' : ''}</span></div>
-    <div class="setting-row"><span class="setting-label">${esc(planPackName('storage', storagePack))} packs ${policyTip(`${formatBytes(storagePack.bytes)} of storage each, on any plan, until set to 0. Nothing is billed.`)}</span><span class="setting-value">
+      <span class="setting-actions"><button class="btn sm billing-gift">${state.gift ? 'Update' : 'Gift'}</button>${state.gift ? '<button class="btn sm ghost billing-gift-remove">Remove</button>' : ''}</span>`)}
+    ${planRow('gift-storage', `${esc(planPackName('storage', storagePack))} packs`, `${formatBytes(storagePack.bytes)} of storage credits each, on any plan, until set to 0. Nothing is billed.`, `<span class="setting-value">
       <input id="billing-gift-packs" type="number" min="0" max="1000" step="1" value="${esc(state.giftedStoragePacks || 0)}" class="plan-gift-count" aria-label="Gifted storage packs"></span>
-      <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="storage">Save</button></span></div>
-    <div class="setting-row"><span class="setting-label">${esc(planPackName('compute', state.computePack ?? { creditMicros: e.computePackCreditMicros }))} compute packs ${policyTip(`${planDollars(state.computePack?.creditMicros ?? e.computePackCreditMicros)} of compute a month each, on any plan, until set to 0. Nothing is billed.`)}</span><span class="setting-value">
+      <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="storage">Save</button></span>`)}
+    ${planRow('gift-compute', `${esc(planPackName('compute', state.computePack ?? { creditMicros: e.computePackCreditMicros }))} credit packs`, `${planDollars(state.computePack?.creditMicros ?? e.computePackCreditMicros)} of ${siteName()} credits a month each, on any plan, until set to 0. Nothing is billed.`, `<span class="setting-value">
       <input id="billing-gift-compute" type="number" min="0" max="1000" step="1" value="${esc(state.giftedComputePacks || 0)}" class="plan-gift-count" aria-label="Gifted compute packs"></span>
-      <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="compute">Save</button></span></div>
-    ${computePrice ? `<div class="setting-row"><span class="setting-label">Compute markup ${policyTip(`Over what providers charge, for this organization's computers and included model. Applies from now on. Empty: the default, ${computePrice.defaultMarkupPercent}%.`)}</span><span class="setting-value">
+      <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="compute">Save</button></span>`)}
+    ${computePrice ? planRow('markup', 'Markup', `Over what providers charge, for everything this organization's ${siteName()} credits pay for. Applies from now on. Empty: the default, ${computePrice.defaultMarkupPercent}%.`, `<span class="setting-value">
       <input id="billing-compute-markup" type="number" min="0" max="1000" step="1" value="${computePrice.markupPercent ?? ''}" placeholder="${esc(computePrice.defaultMarkupPercent)}" class="plan-gift-count" aria-label="Compute markup"><span class="setting-muted">%</span></span>
-      <span class="setting-actions"><button class="btn sm billing-compute-markup">Save</button></span></div>` : ''}
+      <span class="setting-actions"><button class="btn sm billing-compute-markup">Save</button></span>`) : ''}
   </div></details>` : '';
   return `${head}${noteHtml}<div class="setting-rows ruled plan-limits">${peopleRow}${agentsRow}${storageRow}${computeRow}${topUpRow}</div>${choices}${gifts}
     ${subscribed || packsOnly ? `<p class="plan-foot setting-muted">Separate from the cards agents pay with. <a href="/legal/billing" data-public>Billing terms</a></p>` : ''}`;
 }
 
-async function hydratePlanAndBilling(organizationId) {
-  const box = $('#org-plan');
+// Into Organization settings' card, or (profileBillingRow) an organization's
+// row of the profile's Plans & billing.
+async function hydratePlanAndBilling(organizationId, box = $('#org-plan')) {
   if (!box) return;
   const base = `/api/organizations/${encodeURIComponent(organizationId)}`;
   // The phone apps sell nothing (App Store 3.1.1, Play's payments policy): the plan and its limits, read-only, with no checkout.
   const [entitlements, state] = await Promise.all([api(`${base}/entitlements`).catch(() => null),
     nativeApp() ? null : api(`${base}/subscription/status`).catch(() => null)]);
-  if (!$('#org-plan') || S.organizationId !== organizationId) return;
+  if (!box.isConnected || (box.id === 'org-plan' && S.organizationId !== organizationId)) return;
   const giftsOpen = box.querySelector('.plan-operator')?.open;
   box.innerHTML = planBillingMarkup(entitlements, state?.managed ? state : null);
   if (giftsOpen && box.querySelector('.plan-operator')) box.querySelector('.plan-operator').open = true;
-  const reload = () => hydratePlanAndBilling(organizationId);
+  wirePlanInfo(box);
+  const reload = () => hydratePlanAndBilling(organizationId, box);
   const post = (path, body) => api(`${base}/subscription/${path}`, { method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
     ...(body ? { body: JSON.stringify(body) } : {}) });
   const act = (selector, run) => box.querySelectorAll(selector).forEach((button) => button.addEventListener('click', async () => {
@@ -28978,8 +29330,8 @@ async function hydratePlanAndBilling(organizationId) {
   const packOffer = (kind) => {
     const pack = kind === 'compute' ? state.computePack : state.storagePack;
     const name = planPackName(kind, pack);
-    return { pack, name: kind === 'compute' ? `${name} compute pack` : `${name} pack`,
-      what: kind === 'compute' ? `${name} of compute a month` : `${name} of storage` };
+    return { pack, name: kind === 'compute' ? `${name} credit pack` : `${name} pack`,
+      what: kind === 'compute' ? `${name} of ${siteName()} credits a month` : `${name} of storage credits` };
   };
   act('.billing-packs', async (button) => {
     const kind = button.dataset.kind;
@@ -29012,7 +29364,7 @@ async function hydratePlanAndBilling(organizationId) {
   };
   box.querySelector('.billing-auto-topup')?.addEventListener('change', async (event) => {
     const auto = state.autoTopUp;
-    if (event.target.checked && !confirm(`Charge ${planMoney(auto.amountCents)} to the saved card each time compute runs low, up to ${planMoney(auto.capCents)} a month?`)) {
+    if (event.target.checked && !confirm(`Charge ${planMoney(auto.amountCents)} to the saved card each time ${siteName()} credits run low, up to ${planMoney(auto.capCents)} a month?`)) {
       event.target.checked = false; return;
     }
     await autoTopUp({ enabled: event.target.checked });
@@ -29026,8 +29378,8 @@ async function hydratePlanAndBilling(organizationId) {
     for (const el of box.querySelectorAll('#billing-gift-seats, .billing-gift-seats-unit')) el.hidden = event.target.value !== 'team';
   });
   act('.billing-gift', async () => {
-    const plan = $('#billing-gift-plan').value;
-    const seats = Number($('#billing-gift-seats')?.value);
+    const plan = box.querySelector('#billing-gift-plan').value;
+    const seats = Number(box.querySelector('#billing-gift-seats')?.value);
     if (plan === 'team' && (!Number.isInteger(seats) || seats < 1 || seats > 10_000)) throw new Error('Enter a whole number of seats from 1 to 10000');
     await post('gift', { plan, ...(plan === 'team' ? { seats } : {}) }); toast('Plan gifted');
   });
@@ -29037,12 +29389,12 @@ async function hydratePlanAndBilling(organizationId) {
   });
   act('.billing-gift-packs', async (button) => {
     const kind = button.dataset.kind;
-    const packs = Number($(kind === 'compute' ? '#billing-gift-compute' : '#billing-gift-packs').value);
+    const packs = Number(box.querySelector(kind === 'compute' ? '#billing-gift-compute' : '#billing-gift-packs').value);
     if (!Number.isInteger(packs) || packs < 0 || packs > 1000) throw new Error('Enter a whole number from 0 to 1000');
     await post(kind === 'compute' ? 'gift-compute' : 'gift-storage', { packs }); toast(packs ? 'Packs gifted' : 'Gifted packs removed');
   });
   act('.billing-compute-markup', async () => {
-    const value = $('#billing-compute-markup').value.trim();
+    const value = box.querySelector('#billing-compute-markup').value.trim();
     const markupPercent = value === '' ? null : Number(value);
     if (markupPercent !== null && (!Number.isInteger(markupPercent) || markupPercent < 0 || markupPercent > 1000)) throw new Error('Enter a whole percent from 0 to 1000, or leave it empty for the default');
     await post('compute-markup', { markupPercent }); toast(markupPercent === null ? 'Default markup' : `Markup ${markupPercent}%`);
@@ -30402,6 +30754,7 @@ function allCommands() {
   // ⌘F finds in the conversation; pressed again in its box, the browser's own find.
   add({ id: 'task.find', title: 'Find in conversation', keybinding: 'meta+f', group: 'Task', help: false,
     available: !!(S.selected && S.view && $('#find-in-conversation')) && document.activeElement?.id !== 'ck-find-input', run: () => openConversationSearch() });
+  add({ id: 'task.desktop', title: 'Open the desktop', keybinding: 'd', group: 'Task', help: false, available: !!(S.selected && S.view?.worldDesktop && $('#desktop-open')), run: () => openTaskDesktop() });
   add({ id: 'task.terminal', title: 'Terminal / conversation', keybinding: 't', group: 'Task', help: false, available: !!(S.selected && S.view && $('#tp-rail [data-open-terminal]:not(:disabled)')), run: () => toggleTaskTerminal() });
   // { / } also walk the settings rail's panes (project or organization settings).
   const onSettings = ['settings', 'organization', 'global'].includes(S.tab) && !S.selected;
@@ -31222,8 +31575,8 @@ function renderPricing() {
       `${per(plan.maxActiveAgentRuns, plan.additionalActiveUserAgentRuns)} agents at once`,
       `${per(formatBytes(plan.storageBytes), plan.additionalActiveUserStorageBytes ? formatBytes(plan.additionalActiveUserStorageBytes) : '')} storage`,
       ...(compute ? [plan.computeCreditMicros
-        ? `${per(credit(plan.computeCreditMicros), plan.additionalActiveUserComputeCreditMicros ? credit(plan.additionalActiveUserComputeCreditMicros) : '')} of compute a month`
-        : plan.id === 'free' && S.launch?.trial ? `${credit(S.launch.trial.creditMicros)} of compute free for ${S.launch.trial.days} days`
+        ? `${per(credit(plan.computeCreditMicros), plan.additionalActiveUserComputeCreditMicros ? credit(plan.additionalActiveUserComputeCreditMicros) : '')} of ${siteName()} credits a month`
+        : plan.id === 'free' && S.launch?.trial ? `${credit(S.launch.trial.creditMicros)} of ${siteName()} credits free for ${S.launch.trial.days} days`
         : 'Your own cloud computer account'] : [])];
     const priceLine = plan.id === 'free' ? money(0, plan.currency)
       : `${money(plan.monthlyBasePriceCents, plan.currency)}<small> / month${isTeam ? ` + ${money(plan.monthlyAdditionalActiveUserPriceCents, plan.currency)} per extra person` : ''}</small>`;
@@ -31231,12 +31584,12 @@ function renderPricing() {
       <div class="price-value">${priceLine}</div><ul>${items.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>
       ${plan.id === 'free' || checkoutReady ? '<a class="btn primary" href="/signup">Create account</a>' : '<span class="price-unavailable">Paid checkout is not yet enabled.</span>'}</article>`;
   }).join('');
-  // Packs are named by what they give: a "100 GB pack", a "$10 pack" (of compute a month).
+  // Packs are named by what they give: a "100 GB pack" (of storage credits), a "$10 pack" (of tavya credits a month).
   const addOns = packs ? `<div class="pricing-addons"><b>Need more?</b>
       <span><b>${esc(formatBytes(packs.storage.bytes))} pack</b> ${esc(formatBytes(packs.storage.bytes))} more storage · ${esc(money(packs.storage.monthlyPriceCents))}/month</span>
-      ${compute ? `<span><b>${esc(credit(packs.compute.creditMicros))} pack</b> ${esc(credit(packs.compute.creditMicros))} more compute a month · ${esc(money(packs.compute.monthlyPriceCents))}/month</span>` : ''}
+      ${compute ? `<span><b>${esc(credit(packs.compute.creditMicros))} pack</b> ${esc(credit(packs.compute.creditMicros))} more ${esc(siteName())} credits a month · ${esc(money(packs.compute.monthlyPriceCents))}/month</span>` : ''}
       <small>On Individual and Team, as many as you like.</small></div>` : '';
-  const computeTerms = compute && packs ? `<p>Compute is the cloud computers agents work on. ${esc(siteName())} runs them for you at ${packs.computePriceMultiplier}× the provider’s list price (a 2 CPU · 2 GB E2B computer is about $0.27 an hour) and pauses work when the month’s compute is used up, unless you turn on auto top-up (${esc(money(packs.computeTopUpCents ?? 1000))} at a time, up to a monthly limit you set). Computers on your own E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud account cost nothing extra and aren’t counted.</p>` : '';
+  const computeTerms = compute && packs ? `<p>${esc(siteName())} credits pay for the cloud computers agents work on, agents on ${esc(siteName())}’s included models, and what agents buy through ${esc(siteName())} (images, video, speech, apps), at ${packs.computePriceMultiplier}× the provider’s list price (a 2 CPU · 2 GB E2B computer is about $0.27 an hour). Work pauses when the month’s credits are used up, unless you turn on auto top-up (${esc(money(packs.computeTopUpCents ?? 1000))} at a time, up to a monthly limit you set). Computers on your own E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud account cost nothing extra and aren’t counted.</p>` : '';
   renderPublicShell('/pricing', `<main class="pricing-page"><div class="legal-kicker">Hosted plans</div><h1>Free, Individual, and Team</h1>
       <p class="legal-summary">Every plan has unlimited projects. “Agents at once” is how many can work at the same time; more wait in line.</p>
       <div class="pricing-grid">${cards}</div>${addOns}

@@ -36,6 +36,15 @@ describe('classifyLimitError', () => {
     expect(isProviderPolicyRejection({ error: { code: 'content_policy_violation' } })).toBe(true);
     expect(isProviderPolicyRejection({ code: 'test_content_policy_violation_fixture' })).toBe(false);
   });
+  it('recognizes every Codex request-level safety code (cyberPolicy, bioPolicy since 0.171.0)', () => {
+    for (const code of ['cyberPolicy', 'bioPolicy', 'misalignmentPolicyViolation'])
+      expect(isProviderPolicyRejection({ error: { message: 'flagged', codexErrorInfo: code } })).toBe(true);
+    expect(isProviderPolicyRejection(new Error('This request has been flagged for possible cybersecurity risk.'), { providerOrigin: true })).toBe(true);
+    expect(isProviderPolicyRejection(new Error('This content was flagged for possible biological risk.'), { providerOrigin: true })).toBe(true);
+    // Only at the provider boundary: a build log may say the same words.
+    expect(isProviderPolicyRejection(new Error('This content was flagged for possible biological risk.'))).toBe(false);
+    expect(isProviderPolicyRejection({ code: 'cyberPolicyFixture' })).toBe(false);
+  });
   it('keeps safety blocks task-local even when the envelope says unauthorized', () => {
     const message = 'misalignmentPolicyViolation HTTP 401 unauthorized: This request was blocked by our safety systems. Reason: Potentially unintended activity.';
     expect(classifyLimitError(message, { providerOrigin: true })).toEqual({ limited: false });

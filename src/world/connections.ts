@@ -1,7 +1,7 @@
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
 import { isAnyProvider, isComputerless, type MachineShape } from '../domain/computer.js';
-import { FREE_COMPUTER_HINT, accountFeatures, assertComputerFits, capLimits, computerLimits, type ComputerFeatures, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
+import { FREE_COMPUTER_HINT, accountFeatures, assertComputerFits, capLimits, computerLimits, type ComputerFeatures, type DataDiskNeed, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
 import { FREE_COMPUTER } from '../domain/entitlements.js';
 import type { WorldProviderConnection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
@@ -386,8 +386,11 @@ const defaultProbes: ProviderProbes = {
   },
 };
 
-/** What `assertFits` judges: the sizes, and the outbound network asked for. */
-export type ComputerFitSpec = MachineShape & { network?: { unrestricted?: boolean; basic?: boolean } };
+/** What `assertFits` judges: the sizes, the outbound network asked for, and
+ * what its world must fetch from tavya itself (`reachesTavya`: tavya-reach.ts). */
+export type ComputerFitSpec = MachineShape & { network?: { unrestricted?: boolean; basic?: boolean }; reachesTavya?: string;
+  /** The project data its setup restores (world/data-disk.ts). */
+  holdsData?: DataDiskNeed };
 
 /** Accounts whose budget changes with nobody re-testing them: Agent37's
  * memory limit rises with the workspace's lifetime top-ups (its tier). */
@@ -428,6 +431,8 @@ function assertSomeFits(spec: ComputerFitSpec, all: Array<{ provider: string; li
   if (!views.length) throw new Error(spec.network?.unrestricted === false
     ? 'None of the computers this organization can use has an outbound allowlist'
     : 'None of the computers this organization can use has full internet; choose "Basic internet is enough"');
+  if (spec.reachesTavya && !views.some((view) => view.features?.internet !== 'basic'))
+    throw new Error(`None of the computers this organization can use reaches ${BRAND} (they have basic internet only), so none can load ${spec.reachesTavya}`);
   const failures: string[] = [];
   for (const view of views) {
     try { assertComputerFits(spec, view.limits, view.provider); return; }

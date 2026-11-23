@@ -91,7 +91,7 @@ it('adds and removes storage and compute packs in Plan & billing, showing only v
 
     await page.getByRole('button', { name: 'Add a $10 pack' }).click();
     await expect.poll(() => provider.calls.filter(call => call.method === 'updateComputePacks').length).toBe(1);
-    expect(dialogs.at(-1)).toBe('Add a $10 compute pack for $10/month?');
+    expect(dialogs.at(-1)).toBe('Add a $10 credit pack for $10/month?');
     expect(provider.calls.at(-1)?.input).toMatchObject({ subscriptionId: 'sub_browser_packs', computePacks: 1 });
 
     await verified(2, 1);
@@ -99,7 +99,8 @@ it('adds and removes storage and compute packs in Plan & billing, showing only v
     await plan.locator('.plan-head').getByText('$37/month', { exact: false }).waitFor();
     expect(await plan.locator('[data-limit="storage"]').innerText()).toMatch(/of 300 GB\s+−\s+2\s+\+\s+100 GB packs/);
     expect(await plan.locator('[data-limit="compute"]').innerText()).toMatch(/\$3\.00\s+of \$20\.00 this month\s+−\s+1\s+\+\s+\$10 pack/);
-    expect(await plan.locator('[data-limit="storage"] .info-dot').getAttribute('title')).toContain('100 GB with Team + 2 × 100 GB packs');
+    await plan.getByRole('button', { name: /^Storage credits/ }).click();
+    expect(await plan.locator('#plan-info-storage').innerText()).toMatch(/100 GB\s+with Team\s+200 GB\s+2 × 100 GB packs/);
     if (process.env.KARMAX_REVIEW_SCREENSHOT) await page.locator('#settings-billing').screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT });
 
     await remove.click();

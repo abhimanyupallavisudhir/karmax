@@ -27,10 +27,10 @@ describe('what a person does about a task that cannot start', () => {
     expect(vendor.map((gap) => [gap.label, gap.href])).toEqual([
       ['Turn on OpenRouter', '/org/web/settings#project-agents'], ['Add an OpenAI account', '/org/settings#settings-agents'],
       ['Turn on xAI', '/org/settings#settings-agents']]);
-    // tavya's computers out of credit: more compute on the plan, or one's own account; the reason is one hover away.
-    const credit = await ui.run<any[]>(`readinessGaps({ agents: [], compute: { ready: false, need: 'credit', outOfCredit: 'Out of compute: spent.' } })`);
+    // tavya's computers out of credits: more credits on the plan, or one's own account; the reason is one hover away.
+    const credit = await ui.run<any[]>(`readinessGaps({ agents: [], compute: { ready: false, need: 'credit', outOfCredit: 'Out of credits: spent.' } })`);
     expect(credit.map((gap) => [gap.label, gap.href, gap.tip])).toEqual([
-      ['Add compute', '/org/settings#settings-plan', 'Out of compute: spent.'],
+      ['Add credits', '/org/settings#settings-plan', 'Out of credits: spent.'],
       ['Use your own account', '/org/settings#settings-computers', expect.stringContaining('your own')]]);
     // Never bought a plan nor connected a computer: either one, said so.
     const none = await ui.run<any[]>(`readinessGaps({ agents: [], compute: { ready: false, need: 'plan', outOfCredit: 'Out of compute: a paid plan.' } })`);
@@ -53,6 +53,16 @@ describe('what a person does about a task that cannot start', () => {
     expect((await ui.run<string>(`readinessNoticeHtml(readinessGaps({ agents: [{ provider: 'opencode', model: 'openrouter/openai/gpt-6.1-sol', ready: true, cost: 12.4 }],
       compute: { ready: true }, storage: { full: true, usedBytes: 1, quotaBytes: 1 } }))`)).replace(/<[^>]+>/g, ''))
       .toBe('!On your credit: costs 12× the included model·Storage is full: Add storage');
+    // Without a computer, a Claude Code login is ready (its CLI runs in a small cloud computer): no notice at all.
+    expect(await ui.run(`readinessGaps({ agents: [{ provider: 'claude', ready: true, sandbox: true }], compute: { ready: true, none: true } })`)).toEqual([]);
+    // With nowhere to run it, the fix is a computer, never "Pick another model"; the honest reason is one hover away.
+    const noCompute = await ui.run<any[]>(`readinessGaps({ agents: [{ provider: 'claude', ready: false, need: { provider: 'claude',
+      computerless: 'A Claude Code login replies from a small cloud computer, and this organization has none it can use.', computerlessFix: 'computer' } }],
+      compute: { ready: true, none: true } })`);
+    expect(noCompute).toEqual([{ label: 'Connect a computer', href: '/org/settings#settings-computers', tip: expect.stringMatching(/small cloud computer/) }]);
+    const noKey = await ui.run<any[]>(`readinessGaps({ agents: [{ provider: 'opencode', model: 'google/gemini-3-pro', ready: false,
+      need: { provider: 'google', computerless: "can't run without a computer", computerlessFix: 'model' } }], compute: { ready: true, none: true } })`);
+    expect(noKey.map((gap) => gap.label)).toEqual(['Pick another model']);
     // Ready, or unknown (the readiness call failed): nothing to say.
     expect(await ui.run(`readinessGaps({ agents: [{ provider: 'claude', ready: true }], compute: { ready: true } })`)).toEqual([]);
     expect(await ui.run(`readinessGaps(null)`)).toEqual([]);
@@ -64,14 +74,19 @@ describe('what a person does about a task that cannot start', () => {
     const fix = (text: string) => ui.run<any>(`setupFix(${JSON.stringify(text)})`);
     expect(await fix('No computer is connected: connect one under Settings → Computers.'))
       .toEqual({ label: 'Connect a computer', href: '/org/settings#settings-computers' });
-    const noPlan = 'infrastructure: Out of compute: tavya\'s computers come with a paid plan. Choose one in Plan & billing, or connect your own E2B account in Settings → Computers.';
+    const noPlan = 'infrastructure: Out of credits: tavya\'s computers come with a paid plan. Choose one in Plan & billing (https://tavya.test/org/settings#settings-plan), or connect your own E2B account in Settings → Computers.';
     expect(await fix(noPlan)).toEqual({ label: 'Choose a plan', href: '/org/settings#settings-plan' });
     const fixes = (text: string) => ui.run<any[]>(`setupFixes(${JSON.stringify(text)})`);
     expect(await fixes(noPlan)).toEqual([{ label: 'Choose a plan', href: '/org/settings#settings-plan' },
       { label: 'Use your own account', href: '/org/settings#settings-computers' }]);
-    const spent = 'Out of compute: this month\'s $10.00 of compute is used up. Add a $10 pack or turn on auto top-up in Plan & billing, or connect your own E2B account in Settings → Computers. It renews on 2026-12-01.';
-    expect(await fixes(spent)).toEqual([{ label: 'Add compute', href: '/org/settings#settings-plan' },
+    const spent = 'Out of credits: this month\'s $10.00 of tavya credits is used up. Add credits or turn on auto top-up in Plan & billing (https://tavya.test/org/settings#settings-plan), or connect your own E2B account in Settings → Computers. They renew on 2026-12-01.';
+    expect(await fixes(spent)).toEqual([{ label: 'Add credits', href: '/org/settings#settings-plan' },
       { label: 'Use your own account', href: '/org/settings#settings-computers' }]);
+    // The organization the message names is the one to top up, whichever is open.
+    expect(await fixes(spent.replace('tavya.test/org/', 'tavya.test/acme/'))).toContainEqual({ label: 'Add credits', href: '/acme/settings#settings-plan' });
+    // Said before credits were named so: still understood.
+    expect(await fixes('Out of compute: this month\'s $10.00 of compute is used up. Add a $10 pack or turn on auto top-up in Plan & billing, or connect your own E2B account in Settings → Computers. It renews on 2026-12-01.'))
+      .toContainEqual({ label: 'Add credits', href: '/org/settings#settings-plan' });
     // tavya's computers are all busy: one's own account starts it now.
     expect(await fixes('Every computer this task can use is full (tavya\'s E2B: All 20 of tavya\'s E2B computers are in use). Waiting for one to free up.'))
       .toEqual([{ label: 'Use your own account', href: '/org/settings#settings-computers' }]);
@@ -91,10 +106,13 @@ describe('what a person does about a task that cannot start', () => {
     expect(await fix('CPU can be at most 2 on the Free plan: choose a plan in Plan & billing for a bigger one'))
       .toEqual({ label: 'Choose a plan', href: '/org/settings#settings-plan' });
     // The free trial, and the included model, which draws on the same credit (its alternative is a login of one's own).
-    expect(await fixes('Out of compute: your $5.00 free trial is used up. Choose a plan in Plan & billing, or connect your own E2B account in Settings → Computers.'))
+    expect(await fixes('Out of credits: your $5.00 free trial is used up. Choose a plan in Plan & billing (/org/settings#settings-plan), or connect your own E2B account in Settings → Computers.'))
       .toEqual([{ label: 'Choose a plan', href: '/org/settings#settings-plan' }, { label: 'Use your own account', href: '/org/settings#settings-computers' }]);
-    expect(await fixes('Out of compute: this month\'s $5.00 of compute is used up. Add a $10 pack or turn on auto top-up in Plan & billing, or connect your own agent login or API key in Settings → Agents. It renews on 2026-12-01.'))
-      .toEqual([{ label: 'Add compute', href: '/org/settings#settings-plan' }, { label: 'Use your own login', href: '/org/settings#settings-agents' }]);
+    expect(await fixes('Out of credits: this month\'s $5.00 of tavya credits is used up. Add credits or turn on auto top-up in Plan & billing (/org/settings#settings-plan), or connect your own agent login or API key in Settings → Agents. They renew on 2026-12-01.'))
+      .toEqual([{ label: 'Add credits', href: '/org/settings#settings-plan' }, { label: 'Use your own login', href: '/org/settings#settings-agents' }]);
+    // A generation refused for its price: add credits there.
+    expect(await fixes('Out of credits: this video on google/veo-3.1 would cost up to $6.40 of tavya credits; $5.00 is left. Choose a cheaper model, a shorter or smaller one, or add credits or turn on auto top-up in Plan & billing (/org/settings#settings-plan).'))
+      .toEqual([{ label: 'Add credits', href: '/org/settings#settings-plan' }]);
     expect(await fix('merge failed: conflict')).toBeNull();
 
     // A task stopped on it shows the fix beside the plain reason.
@@ -114,16 +132,16 @@ describe('what a person does about a task that cannot start', () => {
     expect(await ui.page.locator('#main .wait-notice a.setup-fix').evaluate((link) => [link.textContent, link.getAttribute('href')]))
       .toEqual(['Turn on', '/org/web/settings#project-agents']);
 
-    // Out of compute: one line saying what happened, the ways out as buttons, the whole reason on hover.
+    // Out of credits: one line saying what happened, the ways out as buttons, the whole reason on hover.
     await ui.run(`document.getElementById('main').innerHTML = conversationWaitNotice({ taskId: 't', status: 'waiting',
-      waitingFor: { kind: 'retry', summary: 'Out of compute', until: Date.now() + 60_000, detail: ${JSON.stringify(spent)} } })`);
+      waitingFor: { kind: 'retry', summary: 'Out of credits', until: Date.now() + 60_000, detail: ${JSON.stringify(spent)} } })`);
     const notice = ui.page.locator('#main .wait-notice');
-    expect(await notice.innerText()).toMatch(/^Out of compute, trying at .+ · This month’s \$10\.00 of compute is used up\.\s*Add compute\s*Use your own account$/);
+    expect(await notice.innerText()).toMatch(/^Out of credits, trying at .+ · This month’s \$10\.00 of tavya credits is used up\.\s*Add credits\s*Use your own account$/);
     expect(await notice.getAttribute('title')).toBe(spent);
     expect(await notice.locator('a.setup-fix').evaluateAll((links) => links.map((link) => link.getAttribute('href'))))
       .toEqual(['/org/settings#settings-plan', '/org/settings#settings-computers']);
     await ui.run(`document.getElementById('main').innerHTML = conversationWaitNotice({ taskId: 't', status: 'waiting',
-      waitingFor: { kind: 'retry', summary: 'Out of compute', until: Date.now() + 60_000, detail: ${JSON.stringify(noPlan)} } })`);
+      waitingFor: { kind: 'retry', summary: 'Out of credits', until: Date.now() + 60_000, detail: ${JSON.stringify(noPlan)} } })`);
     expect(await notice.innerText()).toMatch(/· tavya’s computers come with a paid plan\.\s*Choose a plan\s*Use your own account$/);
 
     // An error toast about full storage carries the way out.

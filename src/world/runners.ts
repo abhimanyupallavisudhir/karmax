@@ -50,7 +50,7 @@ const DEFAULT_CAPACITY = { activeWorlds: 20, cpu: 40, memoryMb: 81_920, gpu: 0 }
 const STALE_PARKED_LEASE_MS = 2 * 60_000;
 /** Providers whose own control plane reports billable time (`listUsageEvents`):
  * a runner lease there only reserves capacity, and billing it too would charge twice. */
-const PROVIDER_METERED = new Set(['e2b', 'fly', 'hetzner', 'aws', 'gcp', 'agent37']);
+export const PROVIDER_METERED = new Set(['e2b', 'fly', 'hetzner', 'aws', 'gcp', 'agent37']);
 
 /** Durable admission and cost attribution for execution-plane capacity. The DB
  * queue is the source of truth, so a waiting activity can restart on any worker. */
@@ -301,6 +301,11 @@ export class WorldLifecycleManager {
     private intervalMs = 60_000, private objects?: ObjectStore, private runners?: RunnerPoolService,
     private access?: import('./access.js').WorldAccessService) {}
 
+  /** The sandboxes subscription-login turns of tasks without a computer run in
+   * (src/agent/login-sandbox.ts): parked when idle, gone with their task, and
+   * spared by the orphan reaper while their task lives. Set where they are made. */
+  loginSandboxes?: import('../agent/login-sandbox.js').LoginSandboxes;
+
   /** Ask a task waiting for a machine to try again now (its workflow's Retry);
    * false when it is not waiting for one. Set where the workflow client is. */
   retry?: (taskId: string) => Promise<boolean>;
@@ -479,6 +484,7 @@ export class WorldLifecycleManager {
     }
     for (const [key, probedAt] of this.probedAt)
       if (probedAt < now - Math.max(2 * reconcileAfter, 60_000)) { this.probedAt.delete(key); this.strayRunning.delete(key); }
+    if (this.loginSandboxes) await this.step('login sandboxes', async () => { await this.loginSandboxes!.housekeep(); });
     await this.step('orphan sandboxes', () => this.reapOrphanSandboxes());
     await this.step('provider upkeep', () => this.housekeepProviders());
     let hibernated = 0;
@@ -957,6 +963,8 @@ export class WorldLifecycleManager {
             const current = task ? (await this.store.currentWorld(taskId)) : undefined;
             const duplicate = Boolean(task && current && sandbox.matches && sandbox.matches(current) === false);
             if (task && !duplicate) return;
+            // A task without a computer's login sandbox, or one pooled for the next, is no world of its own (login-sandbox.ts).
+            if (await this.loginSandboxes?.protects(taskId, sandbox.matches)) return;
             try {
               await sandbox.destroy();
               (await this.store.appendAudit({ principalId: 'system:lifecycle', action: 'world.orphanReaped',
@@ -1005,7 +1013,7 @@ function inPlaceResizeNotice(shape: MachineShape): string {
 
 /** What the agent hears when its task next runs after its parked computer
  * was hibernated because the organization's compute credit was spent. */
-export const COMPUTE_HIBERNATED_NOTICE = 'While this task waited, the organization ran out of compute credit, so its parked computer '
+export const COMPUTE_HIBERNATED_NOTICE = 'While this task waited, the organization ran out of tavya credits, so its parked computer '
   + 'was hibernated: it was saved and its machine and disk deleted. You are on a new machine with the same files your repositories '
   + 'track, and the same uncommitted changes. Git-ignored files (installed dependencies, build output, caches) and running processes '
   + 'did not carry over: reinstall or restart what you need.';

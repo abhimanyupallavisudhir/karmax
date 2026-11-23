@@ -184,26 +184,37 @@ const dollars = (micros: number) => `$${(micros / 1e6).toFixed(2)}`;
 
 const day = (at: number) => new Date(at).toISOString().slice(0, 10);
 
-function exhausted(credit: ComputeCredit, provider: string): ComputeCreditExhausted {
+/** Where an organization's owners add credits: its own Plan & billing, as a
+ * full address when the installation's public one is known, so an agent told
+ * it ran out can hand people the link (wiki features/managed-compute). */
+export async function creditsUrl(store: Store, organizationId: string, publicUrl = process.env.KARMAX_PUBLIC_URL): Promise<string> {
+  const slug = (await store.getOrganization(organizationId).catch(() => undefined))?.slug;
+  return `${(publicUrl ?? '').trim().replace(/\/$/, '')}${slug ? `/${encodeURIComponent(slug)}` : ''}/settings#settings-plan`;
+}
+
+/** Why work cannot go on: the organization's tavya credits (the compute
+ * credit: computers, the included model and what agents buy on it) are spent.
+ * Every such message starts "Out of credits:" (the console and the workflow
+ * read that) and names Plan & billing with its address. */
+function exhausted(credit: ComputeCredit, provider: string, url: string): ComputeCreditExhausted {
   // The included model (wiki features/included-model) draws on the same credit.
   const own = provider === 'openrouter' ? 'connect your own agent login or API key in Settings → Agents'
     : `connect your own ${providerName(provider)} account in Settings → Computers`;
+  const billing = `Plan & billing (${url})`;
   if (!credit.creditMicros && !credit.topUpMicros) {
     const trial = credit.trial;
-    if (!trial) return new ComputeCreditExhausted(
-      `Out of compute: ${BRAND}'s computers come with a paid plan. Choose one in Plan & billing, or ${own}.`);
+    if (!trial) return new ComputeCreditExhausted(`Out of credits: ${BRAND}'s ${provider === 'openrouter' ? 'included models' : 'computers'} `
+      + `come with a paid plan. Choose one in ${billing}, or ${own}.`);
     const state = trial.leftMicros > 0 ? `is used up or held by work running now (it ends on ${day(trial.endsAt)})`
       : trial.usedMicros < trial.creditMicros ? `ended on ${day(trial.endsAt)}` : 'is used up';
-    return new ComputeCreditExhausted(`Out of compute: your ${dollars(trial.creditMicros)} free trial ${state}. `
-      + `Choose a plan in Plan & billing, or ${own}.`);
+    return new ComputeCreditExhausted(`Out of credits: your ${dollars(trial.creditMicros)} free trial ${state}. `
+      + `Choose a plan in ${billing}, or ${own}.`);
   }
   const renews = day(credit.to);
   const total = credit.creditMicros! + credit.topUpMicros + (credit.trial?.monthMicros ?? 0);
-  const spent = credit.heldMicros > 0 && credit.usedMicros < total
-    ? `this month's ${dollars(total)} of compute is used up or held by work running now`
-    : `this month's ${dollars(total)} of compute is used up`;
-  return new ComputeCreditExhausted(`Out of compute: ${spent}. `
-    + `Add a $10 pack or turn on auto top-up in Plan & billing, or ${own}. It renews on ${renews}.`);
+  const spent = `this month's ${dollars(total)} of ${BRAND} credits is used up${credit.heldMicros > 0 && credit.usedMicros < total ? ' or held by work running now' : ''}`;
+  return new ComputeCreditExhausted(`Out of credits: ${spent}. `
+    + `Add credits or turn on auto top-up in ${billing}, or ${own}. They renew on ${renews}.`);
 }
 
 /** Hold a generation's quote (provider cost micros) against the credit until
@@ -222,14 +233,14 @@ export async function holdGeneration(store: Store, request: { id: string; organi
     provider: request.provider ?? 'openrouter', amountMicros: request.costMicros, until: request.until }, creditMicros, now)) return true;
   const credit = await computeCredit(store, request.organizationId, now);
   const charge = computeChargeMicros(request.costMicros, await store.computePriceMultiplier(request.organizationId, now));
-  throw new ComputeCreditExhausted(`Out of compute: ${request.what} would cost up to ${dollars(charge)} of credit; `
+  throw new ComputeCreditExhausted(`Out of credits: ${request.what} would cost up to ${dollars(charge)} of ${BRAND} credits; `
     + `${dollars(Math.max(0, credit.availableMicros ?? 0))} is left. Choose a cheaper model, a shorter or smaller one, `
-    + 'or add a $10 pack or auto top-up in Plan & billing.');
+    + `or add credits or turn on auto top-up in Plan & billing (${await creditsUrl(store, request.organizationId)}).`);
 }
 
 /** Why managed work on `provider` cannot go on: the credit as it stands. */
 export async function outOfCompute(store: Store, organizationId: string, provider: string, now = Date.now()): Promise<ComputeCreditExhausted> {
-  return exhausted(await computeCredit(store, organizationId, now), provider);
+  return exhausted(await computeCredit(store, organizationId, now), provider, await creditsUrl(store, organizationId));
 }
 
 /** Refuse new managed-compute work once this month's credit is spent; with
@@ -248,7 +259,7 @@ export async function assertComputeCredit(store: Store, organizationId: string, 
   }
   if (credit.availableMicros >= needed) return;
   (await store.kvSet(`compute-short:${organizationId}`, JSON.stringify({ at: now, neededMicros: needed })));
-  throw exhausted(credit, provider);
+  throw exhausted(credit, provider, await creditsUrl(store, organizationId));
 }
 
 /** Compute holds (wiki features/managed-compute § Holds): work on a managed
@@ -330,7 +341,7 @@ export async function holdManagedCompute(store: Store, request: ComputeHoldReque
       neededMicros: computeChargeMicros((rate.activeMicrosPerHour + rate.diskMicrosPerHour) * COMPUTE_HOLD.windowMs / 3_600_000,
         await store.computePriceMultiplier(request.organizationId, now)) })));
   if (endsAt !== undefined) return endsAt;
-  throw exhausted(await computeCredit(store, request.organizationId, now), request.provider);
+  throw exhausted(await computeCredit(store, request.organizationId, now), request.provider, await creditsUrl(store, request.organizationId));
 }
 
 /** A managed account's budget and fair share, as its connection states them. */

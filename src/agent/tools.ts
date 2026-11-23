@@ -127,7 +127,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'create_review_info',
     description:
-      "Optional. Attach click-to-verify affordances only when they are relevant: `run` actions for useful verification commands (including starting an app/server; set `server: true` and use `openUrls` to open it), and `open` actions for human-readable outputs such as reports, documents, images, or videos. Local open targets must exist and be at most 100 MiB each; their current bytes are saved in durable artifact storage so they remain available after the task lands. Because that snapshot is what reviewers see, call it again after changing anything it shows, with every action that should show; a re-attached action (same `open` target, or same `run` label) replaces the earlier one. Source code is not a human-readable output and must not be attached as an `open` action. `caption` is optional, at most 280 characters, and says WHAT to verify. Put summaries of changes/answers in your normal response, or in a file only when the task requests one. The changed-files list is added automatically.",
+      "Optional. Attach click-to-verify affordances only when they are relevant: `run` actions for useful verification commands (including starting an app/server; set `server: true` and use `openUrls` to open it), and `open` actions for human-readable outputs such as reports, documents, images, or videos. Local open targets must exist and be at most 100 MiB each; their current bytes are saved in durable artifact storage so they remain available after the task lands. Because that snapshot is what reviewers see, call it again after changing anything it shows. Actions stay until removed, including earlier turns': pass only the actions to add or refresh (a re-attached action, same `open` target or same `run` label, replaces the earlier one), and name any that should no longer show in `remove`. Source code is not a human-readable output and must not be attached as an `open` action. `caption` is optional, at most 280 characters, and says WHAT to verify. Put summaries of changes/answers in your normal response, or in a file only when the task requests one. The changed-files list is added automatically.",
     parameters: {
       type: 'object',
       properties: {
@@ -150,6 +150,11 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
             },
             required: ['kind', 'label'],
           },
+        },
+        remove: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Earlier actions to take down, each named by its label or its open target.',
         },
       },
     },
@@ -474,7 +479,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'generate',
     description:
-      'Use any model OpenRouter serves (or fal.ai / Unifically, below), paid from your organization\'s credit (or its own OpenRouter key), with no account at the lab: text (ask another model: GPT, Gemini, DeepSeek, …; bulk work on a cheap one), an image (gpt-image, Nano Banana, Flux…), a video (Seedance, Veo, Kling…) or speech (ElevenLabs…). Before it runs, what it can cost at most is worked out from the model\'s price list and held on the credit; it is refused when the credit cannot cover that, or when it is above max_cost_usd. Text comes back in the result (and is saved at path if given); media is saved into this world at path. A video waits up to wait_minutes, else returns its job_id: call again with job_id and path to collect it. Models, prices, durations and voices: platform_request GET /api/generation-models?kind=text|image|video|speech.',
+      'Use any model OpenRouter serves (or fal.ai / Unifically, below), paid from your organization\'s credit (or its own OpenRouter key), with no account at the lab: text (ask another model: GPT, Gemini, DeepSeek, …; bulk work on a cheap one), an image (gpt-image, Nano Banana, Flux…), a video (Seedance, Veo, Kling…) or speech (ElevenLabs…). Before it runs, what it can cost at most is worked out from the model\'s price list and held on the credit; it is refused when the credit cannot cover that (Out of credits: give your people the Plan & billing link it names), or when it is above max_cost_usd. Text comes back in the result (and is saved at path if given); media is saved into this world at path. A video waits up to wait_minutes, else returns its job_id: call again with job_id and path to collect it. Models, prices, durations and voices: platform_request GET /api/generation-models?kind=text|image|video|speech.',
     parameters: {
       type: 'object',
       properties: {
@@ -1282,6 +1287,7 @@ export function platformToolHandlers(
         await ctx.createReviewInfo(validateReviewInfoCall({
           caption: args?.caption,
           actions: args?.actions,
+          remove: args?.remove,
           summary: args?.summary,
           links: args?.links,
           diff: args?.diff,
@@ -1313,7 +1319,10 @@ export function platformToolHandlers(
       // An answer its wait cannot act on would leave it, and this task, waiting.
       if (args?.child_task_id && ctx.platformRequest) {
         const child = await Promise.resolve(ctx.platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args.child_task_id))}`))
-          .catch(() => undefined) as Parameters<typeof applicableSubTaskActions>[0] | undefined;
+          .catch(() => undefined) as (Parameters<typeof applicableSubTaskActions>[0] & { parentTaskId?: string }) | undefined;
+        // Only this task's own children receive it (ownSubTaskResponses drops the rest after the turn): say so now.
+        if (child?.stage && child.parentTaskId !== (ctx.taskId ?? world.handle.id))
+          return `${String(args.child_task_id)} is not one of this task's sub-tasks, so nothing was sent. To tell another task something, use message_agent.`;
         const applicable = child?.stage ? applicableSubTaskActions(child) : undefined;
         if (applicable && !applicable.includes(action as SubTaskAction))
           return `"${action}" does not apply now: that sub-task is at ${child!.stage === 'escalated' || child!.status === 'blocked' ? 'a failed step' : child!.stage === 'review' ? 'Review' : 'the end of a turn'}. Answer with ${applicable.join(' | ')}.`;

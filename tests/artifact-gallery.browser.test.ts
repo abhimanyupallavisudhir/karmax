@@ -92,6 +92,48 @@ it('shows what Reviews attached under the project’s files, and opens each in t
   expect(errors).toEqual([]);
 }, 120_000);
 
+// A Markdown file shows the images it names beside it, wherever the viewer
+// opens it: a task's Review (one tile or several), and the gallery, whether
+// the file comes from the repository or a task's saved copy.
+it('shows a Markdown file’s own images in the viewer', async () => {
+  const f = await artifactGalleryFixture(cleanups);
+  const { page, errors, step, context } = await openConsole(browser, { viewport: { width: 1280, height: 900 } });
+  cleanups.push(() => context.close());
+  const viewer = page.locator('dialog.artifact-reader');
+  const shows = (alt: string) => page.waitForFunction((name) =>
+    [...document.querySelectorAll('dialog.artifact-reader .artifact-reader-content img')].some((img: any) => img.alt === name && img.naturalWidth === 160), alt);
+  const close = async () => { await page.keyboard.press('Escape'); await viewer.waitFor({ state: 'detached' }); };
+
+  await step('from a Review with several files: an image beside the file, named by its absolute path', async () => {
+    await page.goto(`${f.server.url}/projects/site-builder/tasks/${f.tasks.first.num}`);
+    await page.locator('#review-actions .review-tile', { hasText: 'Report' }).click();
+    await viewer.locator('.artifact-reader-content', { hasText: 'First draft.' }).waitFor();
+    await shows('Draft chart');
+    if (shots) { fs.mkdirSync(shots, { recursive: true }); await page.screenshot({ path: path.join(shots, 'artifact-markdown-images.png') }); }
+    await close();
+  });
+
+  await step('from a Review with one file: a folder up; a missing image is its alt text', async () => {
+    await page.goto(`${f.server.url}/projects/site-builder/tasks/${f.tasks.notes.num}`);
+    await page.locator('#review-actions .review-tile', { hasText: 'Notes' }).click();
+    await shows('Notes chart');
+    await viewer.locator('.artifact-reader-content', { hasText: 'Gone figure' }).waitFor();
+    expect(await viewer.locator('img[alt="Gone figure"]').count()).toBe(0);
+    await close();
+  });
+
+  await step('from the gallery: the repository’s file, then a task’s saved one', async () => {
+    await page.goto(`${f.server.url}/projects/site-builder/files`);
+    await page.locator('#files-artifacts .gallery-tile', { hasText: 'Report' }).click();
+    await viewer.locator('.artifact-reader-content', { hasText: 'Final.' }).waitFor();
+    await shows('Final chart');
+    await page.keyboard.press('ArrowLeft');
+    await shows('Notes chart');
+    await close();
+  });
+  expect(errors).toEqual([]);
+}, 120_000);
+
 it('gives the organization one Files page: a folder per project, and every project’s artifacts', async () => {
   const f = await artifactGalleryFixture(cleanups);
   const { page, errors, step, context } = await openConsole(browser, { viewport: { width: 1280, height: 900 } });

@@ -29,12 +29,15 @@ function png(width: number, height: number, color: (x: number, y: number) => num
 }
 
 export const ROOT = '/home/user/w';
+// Markdown that shows images beside it: in the report's folder, a folder up, and one missing.
+const REPORT_DRAFT = '# Report\n\nFirst draft.\n\n![Draft chart](chart.png)\n';
+const NOTES = '# Notes\n\n![Notes chart](../docs/chart.png)\n\n![Gone figure](missing.png)\n';
 
 export async function artifactGalleryFixture(cleanups: Array<() => Promise<void> | void>) {
-  const f = await projectFilesFixture(cleanups, { files: { 'docs/report.md': '# Report\n\nFirst draft.\n', 'docs/old.png': PNG } });
+  const f = await projectFilesFixture(cleanups, { files: { 'docs/report.md': REPORT_DRAFT, 'docs/old.png': PNG, 'docs/chart.png': PNG } });
   // Later on main: the report is rewritten, the old screenshot deleted.
   sh(f.site.work, 'rm', '-q', 'docs/old.png');
-  fs.writeFileSync(path.join(f.site.work, 'docs/report.md'), '# Report\n\nFinal.\n');
+  fs.writeFileSync(path.join(f.site.work, 'docs/report.md'), '# Report\n\nFinal.\n\n![Final chart](chart.png)\n');
   sh(f.site.work, 'commit', '-qam', 'final report');
   sh(f.site.bare, 'fetch', '-q', f.site.work, '+main:main');
 
@@ -66,7 +69,7 @@ export async function artifactGalleryFixture(cleanups: Array<() => Promise<void>
   const first = await task('Write the report', 'done', [open(`${ROOT}/site/docs/report.md`, 'Report'), open(`${ROOT}/site/docs/old.png`),
     open(`${ROOT}/shots/home.png`, 'Home page'), open(`${ROOT}/shots/unsaved.png`), { kind: 'open', label: 'Site', target: 'https://example.com/' },
     { kind: 'run', label: 'Serve', command: 'npm start' }]);
-  await save(first.id, `${ROOT}/site/docs/report.md`, Buffer.from('# Report\n\nFirst draft.\n'), 1_000);
+  await save(first.id, `${ROOT}/site/docs/report.md`, Buffer.from(REPORT_DRAFT), 1_000);
   await save(first.id, `${ROOT}/site/docs/old.png`, PNG, 1_001);
   await save(first.id, `${ROOT}/shots/home.png`, PNG, 1_002);
   // #2, cancelled: nothing of it shows.
@@ -79,7 +82,7 @@ export async function artifactGalleryFixture(cleanups: Array<() => Promise<void>
   const source = await task('Answer everything', 'done', [open('site/src/app.ts', 'The answer')]);
   // #5, done: notes it attached but never committed, saved.
   const notes = await task('Take notes', 'done', [open(`${ROOT}/site/notes/never.md`, 'Notes')]);
-  await save(notes.id, `${ROOT}/site/notes/never.md`, Buffer.from('# Notes\n'), 2_000);
+  await save(notes.id, `${ROOT}/site/notes/never.md`, Buffer.from(NOTES), 2_000);
   return { ...f, tasks: { first, cancelled, active, source, notes } };
 }
 

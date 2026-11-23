@@ -125,6 +125,10 @@ export interface WorldGitIdentity {
 
 export interface WorldSpec {
   taskId: string;
+  /** npm packages its first command will run (`npx`): a provider that can
+   * start from a template that already holds them does (E2B), so a login
+   * sandbox's CLI starts at once (src/agent/login-sandbox.ts). */
+  warmPackages?: readonly string[];
   /** Activity cancellation propagated into provider allocation/provisioning.
    * Provider implementations must leave no live sandbox when it aborts. */
   signal?: AbortSignal;

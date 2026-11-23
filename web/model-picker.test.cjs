@@ -61,7 +61,7 @@ for (const model of ['claude-opus-5-5', 'claude-fable-5-2', 'claude-sonnet-5-5',
   ok(modelOptions('claude').some(m => m.id === model), `offline picker includes ${model}`);
   ok(effortLevelsFor('claude', model).join() === EFFORT_ORDER.join(), `offline effort control works for ${model}`);
 }
-for (const model of ['gpt-6.1-terra', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']) {
+for (const model of ['gpt-6.2-sol', 'gpt-6.2-astra', 'gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']) {
   ok(modelOptions('codex').includes(model), `offline picker includes ${model}`);
   ok(effortLevelsFor('codex', model).join() === EFFORT_ORDER.join(), `offline effort control works for ${model}`);
 }

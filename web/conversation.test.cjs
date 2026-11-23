@@ -59,7 +59,7 @@ global.S = {
 };
 
 global.DEFAULT_EXPLANATION_SETTINGS = { model: 'google/gemini-3.6-flash' };
-for (const fn of ['safeHref', 'attachmentUrl', 'formatAttachmentBytes', 'renderMessageFiles', 'conversationTextKey', 'conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'worldWikiHref', 'worldFileAnchor', 'wikiRoute', 'decodeMarkdownAttribute', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'renderWaitDetail', 'explanationModelLabel', 'explanationsEnabled', 'texToggleHtml', 'hasMath', 'plainError', 'permissionSentence', 'plainTaskError', 'toolsDidNotStart', 'storageFull', 'namedPlaces', 'setupFixes', 'setupFix', 'setupFixHtml', 'reportErrorHtml', 'taskErrorHtml', 'explainMessageAffordance', 'sharedConversation', 'participantLabelOf', 'messageOrigin', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'formEntryKey', 'formContext', 'withMessageForms', 'renderConversationEntry']) eval(extractFn(fn));
+for (const fn of ['safeHref', 'attachmentUrl', 'formatAttachmentBytes', 'renderMessageFiles', 'conversationTextKey', 'conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'worldWikiHref', 'worldFileAnchor', 'wikiRoute', 'decodeMarkdownAttribute', 'citedFileRaw', 'taskProjectId', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'renderWaitDetail', 'explanationModelLabel', 'explanationsEnabled', 'texToggleHtml', 'hasMath', 'plainError', 'permissionSentence', 'plainTaskError', 'toolsDidNotStart', 'storageFull', 'namedPlaces', 'setupFixes', 'setupFix', 'setupFixHtml', 'reportErrorHtml', 'taskErrorHtml', 'explainMessageAffordance', 'sharedConversation', 'participantLabelOf', 'messageOrigin', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'formEntryKey', 'formContext', 'withMessageForms', 'renderConversationEntry']) eval(extractFn(fn));
 
 let pass = 0;
 let fail = 0;
@@ -270,6 +270,7 @@ eval(extractFn('liveOutputFor'));
 eval(extractFn('forkBranchDefaults'));
 eval(extractFn('taskRecord'));
 eval(`async ${extractFn('loadTaskRecord')}`);
+eval(extractFn('withEndedGrants'));
 eval(`async ${extractFn('forkTaskAgent')}`);
 eval(extractFn('wireCheckinSidebar'));
 eval(extractFn('wireStopAgents'));
@@ -318,6 +319,18 @@ const forkFormsChecked = Promise.all(forkClicks).then(() => {
       && opts.fork.session === S.sessions[role],
       `${status} ${role} fork picks its archived source the way the form's picker does`);
   }
+});
+// A source that ran with grants is read with what it ended with, approvals made while it ran included (auto-rubric#3).
+const endedGrantsChecked = forkFormsChecked.then(async () => {
+  const ended = { authorization: { level: 'maintainer', scope: 'projects', projectIds: ['p1'] }, credentialGrants: ['use-credential:item:cred_fly'] };
+  const fallback = global.api;
+  global.api = async (url) => url === '/api/tasks/granted-task/attempts'
+    ? { attempts: [{ id: 'granted-task', projectId: 'p1', params: { _authorization: { level: 'maintainer' } }, lastView: { status: 'done' } }] }
+    : url === '/api/tasks/granted-task/authorization' ? ended : null;
+  openedForkForms.length = 0;
+  await forkTaskAgent('granted-task', 'do', { taskId: 'granted-task', status: 'done' });
+  ok(openedForkForms[0]?.[4]?.fork?.task?._endedGrants === ended, 'the Fork button opens the form with the grants its source ended with');
+  global.api = fallback;
 });
 ok(!conversationPane(forkView, null).includes('fork-task-agent'), 'missing conversations have no fork action');
 const keyTranscript = { role: 'do', messages: [] };
@@ -475,7 +488,7 @@ ok(conversationPane({ ...revisionView, status: 'active', waitingFor: undefined }
   global.messageCopyButton = stubbedCopy;
 }
 
-forkFormsChecked.then(() => {
+endedGrantsChecked.then(() => {
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 });

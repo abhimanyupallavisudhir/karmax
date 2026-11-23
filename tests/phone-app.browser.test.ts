@@ -170,16 +170,31 @@ it('dictates with the platform\'s recognizer in the app, same mic and shortcut',
       await page.evaluate(`${speech}.emit('partialResults', { matches: ['the login page'] })`);
       expect(await prompt.inputValue()).toBe('Fix the login page');
       await shot(page, 'app-dictation');
-      await page.evaluate(`${speech}.emit('listeningState', { status: 'stopped' })`);
-      await expect.poll(() => mic.getAttribute('aria-pressed')).toBe('false');
     });
 
-    await step('a pause after words ends it, as in the browser', async () => {
-      await mic.click();
-      await expect.poll(() => mic.getAttribute('aria-pressed')).toBe('true');
+    await step('the recognizer ending at a pause does not end dictation: it listens again, after what was heard', async () => {
+      await page.evaluate(`${speech}.emit('listeningState', { status: 'stopped' })`);
+      await expect.poll(() => page.evaluate(`${speech}.calls.filter(([m]) => m === 'start').length`)).toBe(2);
+      expect(await mic.getAttribute('aria-pressed')).toBe('true');
       await page.evaluate(`${speech}.emit('partialResults', { matches: ['today'] })`);
-      await expect.poll(() => mic.getAttribute('aria-pressed'), { timeout: 5_000 }).toBe('false');
       expect(await prompt.inputValue()).toBe('Fix the login page today');
+      // A pause longer than the old 2 s cut-off keeps listening.
+      await page.waitForTimeout(2_500);
+      expect(await mic.getAttribute('aria-pressed')).toBe('true');
+      await mic.click();
+      await expect.poll(() => mic.getAttribute('aria-pressed')).toBe('false');
+      expect(await prompt.inputValue()).toBe('Fix the login page today');
+    });
+
+    await step('saying “stop listening” before the recognizer ends stops dictation, without the words', async () => {
+      await mic.click();
+      await expect.poll(() => page.evaluate(`${speech}.calls.filter(([m]) => m === 'start').length`)).toBe(3);
+      await page.evaluate(`${speech}.emit('partialResults', { matches: ['and call me back stop listening'] })`);
+      await page.evaluate(`${speech}.emit('listeningState', { status: 'stopped' })`);
+      await expect.poll(() => mic.getAttribute('aria-pressed')).toBe('false');
+      expect(await prompt.inputValue()).toBe('Fix the login page today and call me back');
+      await page.waitForTimeout(500);
+      expect(await page.evaluate(`${speech}.calls.filter(([m]) => m === 'start').length`)).toBe(3);
     });
 
     await step('⌘/Ctrl+⇧S starts and stops it; the native recognizer stops too', async () => {

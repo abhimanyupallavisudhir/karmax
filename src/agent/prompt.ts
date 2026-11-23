@@ -41,7 +41,7 @@ import { coordinatorBrief, coordinatorSetting } from '../domain/coordinator.js';
  */
 const TOOLS_PREAMBLE = `You are running inside ${BRAND}, an agent-orchestration platform. Your work happens in a git world (working directory). You have these platform tools available:
 - create_sub_task(title, prompt, params?, draft?): spawn a child task the parent awaits. It acts with your authority (also what you are granted later), so there is nothing to grant it. It runs your agent on your computer's size and provider unless params choose others, e.g. {"agent:do": {"provider": "codex"}, "computer": {"cpu": 2, "memoryMb": 4096}}. It first saves this task's writable project data for the child to start from, so stop anything writing into it (a server, a job, an open SQLite database) before you call it. With draft: true it is only saved, and starts when you call queue_task(id) (or a person runs it): plan sub-tasks as drafts to start them in batches.
-- create_review_info(caption?, actions?): optional click-to-verify affordances for the Review stage. Use only when relevant: "run" actions for verification commands or starting an app/server (set server:true + openUrls to open it), and "open" actions for human-readable outputs such as reports, documents, images, or videos. Source code is not a human-readable output. The optional caption says WHAT to verify and is limited to 280 characters. Put summaries of changes/answers in your normal response, or in a file only when requested. The changed-files list is added automatically. Open targets are snapshotted when attached: after changing what it shows, call it again with every action that should show.
+- create_review_info(caption?, actions?, remove?): optional click-to-verify affordances for the Review stage. Use only when relevant: "run" actions for verification commands or starting an app/server (set server:true + openUrls to open it), and "open" actions for human-readable outputs such as reports, documents, images, or videos. Source code is not a human-readable output. The optional caption says WHAT to verify and is limited to 280 characters. Put summaries of changes/answers in your normal response, or in a file only when requested. The changed-files list is added automatically. Open targets are snapshotted when attached: after changing what it shows, call it again with the changed actions (same open target or run label replaces). Actions stay until named in remove.
 - save_skill(name, content): persist a reusable skill for future tasks.
 - read_wiki(scope, id, path?) and search_wiki(scope, id, query): navigate and grep the organization/project wikis (skills, memories, prompts). Your instructions include each wiki's table of contents and scope ids; read_wiki with a section path expands any [more…] fold. These run host-side, so they work from every world, including cloud sandboxes.
 - find_task(projectId, number), list_agents(taskId), get_conversation(taskId, role), fork_agent(...), and message_agent(taskId, message, role?): discover work by its human #number, inspect or fork another task's agent without mutating its original session, or message any task of your project — it reads the message from your task ("Task #N") at once if working, else it wakes.
@@ -78,7 +78,9 @@ export const NO_COMPUTER_WORLD = `No computer: you run on ${BRAND} itself, with 
   + 'Work that needs a computer (running code, changing a repository, using a website) goes to a task you create with create_task, giving it one '
   + '(params {"computer": {"provider": "any"}}): describe the work fully in its prompt, follow it (get_conversation, add_follow_up_trigger, message_agent) and report what it did. '
   + 'Irreversible capabilities (deleting, members, teams, authorization, users, revealing credentials, payments and cards) are held back: when you need one, '
-  + 'ask for exactly it with request_permission (a card as use-card:<id>); my_authorization lists what is held back.';
+  + 'ask for exactly it with request_permission (a card as use-card:<id>); my_authorization lists what is held back. '
+  + 'Do only what was asked: change no setting, task or other work the person did not name, and when a request is unclear or would change more than it names, ask first. '
+  + 'Use as few tool calls as the answer needs, then reply briefly.';
 
 /** TOOLS_PREAMBLE for a task without a computer: its world tools dropped, and
  * what it does instead of working in a directory. */
@@ -86,7 +88,7 @@ function computerlessPreamble(preamble: string): string {
   return preamble.split('\n').filter((line) => !WORLD_TOOL_LINES.test(line)).map((line) => line
     .replace('Your work happens in a git world (working directory). ', 'This task has no computer. ')
     .replace(/^- create_sub_task\(title, prompt, params\?, draft\?\): .*$/, '- create_sub_task(title, prompt, params?, draft?): spawn a child task the parent awaits. It acts with your authority, and runs without a computer like you unless params give it one, e.g. {"computer": {"provider": "any"}}. With draft: true it is only saved, and starts when you call queue_task(id).')
-    .replace(/^- create_review_info\(caption\?, actions\?\): .*$/, '- create_review_info(caption?, actions?): optional: a caption saying WHAT to verify (at most 280 characters), and "open" actions for https:// links only.')
+    .replace(/^- create_review_info\(caption\?, actions\?, remove\?\): .*$/, '- create_review_info(caption?, actions?, remove?): optional: a caption saying WHAT to verify (at most 280 characters), and "open" actions for https:// links only.')
     .replace(/^- pause\(minutes, jobs\?, needs_input\?\): .*$/, '- pause(minutes, needs_input?): end this turn and be resumed when a message arrives or after `minutes`. pause is for waiting, not for asking: when you need an answer, end your turn with the question. With needs_input (message, audience, urgency as for escalate_to_human) the task shows Needs input meanwhile.')
     .replace(/^Do real work directly in the working directory.*$/, 'Do what is asked with these tools, and report the result in your final response; it ends your turn, and the task waits for the next message. If you need input first, end your turn with the question (or call escalate_to_human for what only a person can give).'))
     .join('\n');
@@ -130,6 +132,10 @@ export interface AssembleArgs {
   bindings?: Record<string, string>;
   /** A sub-task's siblings: its parent's other sub-tasks still at work. */
   siblings?: Array<{ id: string; title: string; num?: number }>;
+  /** Without a computer: the task's organization and the projects its person
+   *  can reach there, so a request naming another project needs no lookup. */
+  organizationId?: string;
+  projects?: Array<{ id: string; name: string }>;
 }
 
 const AGENT_AUTHORED_BINDINGS = ['transcript', 'reviewInfo', 'changedFiles', 'error'] as const;
@@ -187,7 +193,16 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
     values.worldRepos = '';
     const world = /Working directory: \{\{worldPath\}\}[^\n]*/;
     const fill = (text: string) => text.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
-    return world.test(tpl) ? fill(tpl.replace(world, NO_COMPUTER_WORLD)) : `${fill(tpl)}\n\n# World\n${NO_COMPUTER_WORLD}`;
+    // Its own ids, for the tools that take them (add_follow_up_trigger, get_task, list_events): a
+    // task with a computer reads them from its branch; without these, models could not follow up.
+    // The projects too: at low effort most models searched only their own project for a page
+    // in another (ask-eval 2026-11-19, wiki features/computerless-tasks § What an Ask costs).
+    const listed = (args.projects ?? []).slice(0, 30).map((project) => `"${project.name}" (${project.id})`);
+    const more = (args.projects?.length ?? 0) > listed.length ? `, and ${args.projects!.length - listed.length} more` : '';
+    const section = `${NO_COMPUTER_WORLD}\nThis task's id is ${args.task.taskId} (project ${args.task.projectId}`
+      + `${args.organizationId ? `, organization ${args.organizationId}` : ''}).`
+      + (listed.length > 1 ? ` Projects you can reach there: ${listed.join(', ')}${more}.` : '');
+    return world.test(tpl) ? fill(tpl.replace(world, () => section)) : `${fill(tpl)}\n\n# World\n${section}`;
   }
   return tpl.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
 }
@@ -229,7 +244,15 @@ function describeComputer(world: WorldHandle, taskId: string, requested?: Machin
   providers: Array<{ provider: string; diskGb?: number }> = [], moveTo?: string, anyProvider = false): string {
   const base = describeMachineAndRoom(world, taskId, requested, disk, given, moveTo);
   if (!base) return '';
-  return base + describeOtherProviders(world, taskId, disk, given, providers, moveTo, anyProvider);
+  return base + describeOtherProviders(world, taskId, disk, given, providers, moveTo, anyProvider) + describeDesktop(world);
+}
+
+/** A desktop world's screen, and where people find it: agents asked a person
+ * to click in "the task's desktop view", which no page called that (#1001). */
+function describeDesktop(world: WorldHandle): string {
+  if (world.meta?.environmentFlavor !== 'desktop') return '';
+  return ' It has a screen: your browser is visible on it, and people watch and take over through the Desktop button on '
+    + 'this task\'s page (shortcut d). When you need a person there (a human check, a sign-in step), say so in those words.';
 }
 
 /** How a move to another provider works, said wherever one is offered or pending. */

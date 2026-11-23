@@ -1,7 +1,7 @@
 import { ProviderCapacityFull, ProviderOutage } from '../agent/limits.js';
 import { BRAND } from '../domain/brand.js';
 import { machineShape, type ComputeRegion, type MachineShape } from '../domain/computer.js';
-import { cloudProviders, listPriceMicrosPerHour, providerLabel, providerRegion, providerWakeSeconds,
+import { cloudProviders, ComputerUnfit, dataSize, DISK_CANNOT_HOLD_DATA, diskHolding, type DataDiskNeed, listPriceMicrosPerHour, providerLabel, providerRegion, providerWakeSeconds,
   type AccountPool, type ComputerFeatures, type ComputerLimits } from '../domain/computer-limits.js';
 import type { ProjectConfig } from '../domain/types.js';
 import type { Store } from '../store/db.js';
@@ -45,6 +45,13 @@ export interface ComputeNeeds extends MachineShape {
   allowlist?: boolean;
   /** Full internet unless the Computer says basic internet is enough (or uses an allowlist). */
   fullInternet?: boolean;
+  /** What its world must fetch from tavya itself (tavya-reach.ts), which
+   * basic internet never reaches, whatever the Computer says is enough. */
+  reachesTavya?: string;
+  /** The project data its setup restores (world/data-disk.ts): an account
+   * whose disks can't hold it is passed over, and the machine's disk is asked
+   * to hold it (computer-limits.ts diskHolding). */
+  holdsData?: DataDiskNeed;
   region?: ComputeRegion;
 }
 
@@ -114,9 +121,14 @@ export function unfit(needs: ComputeNeeds, option: ComputeOption): string | unde
   if (needs.desktop && !features.desktop) return 'no desktop';
   if (needs.allowlist && !features.allowlist) return 'no outbound allowlist';
   if (needs.fullInternet && features.internet === 'basic') return 'basic internet only';
+  if (needs.reachesTavya && features.internet === 'basic') return `basic internet can't reach ${BRAND}`;
+  if (needs.holdsData && limits.diskGb != null && needs.holdsData.diskGb > limits.diskGb)
+    return `at most ${limits.diskGb} GB disk${dataReasonEnd(needs.holdsData)}`;
   if (needs.region && option.region !== needs.region) return `not in ${REGION_LABEL[needs.region]}`;
   return undefined;
 }
+
+const dataReasonEnd = (data: DataDiskNeed) => `, and its data needs ${data.diskGb}`;
 
 /** Filter and order the options (the rule above). Pure, so it is tested alone. */
 export function rankComputeOptions(needs: ComputeNeeds, options: ComputeOption[], prefer?: string): ComputeRoute {
@@ -130,7 +142,7 @@ export function rankComputeOptions(needs: ComputeNeeds, options: ComputeOption[]
         ...(!unfit(needs, option) && option.busy ? { busy: true, ...(option.outOfCredit ? { outOfCredit: option.outOfCredit } : {}) } : {}) });
       continue;
     }
-    const price = listPriceMicrosPerHour(option.provider, needs);
+    const price = listPriceMicrosPerHour(option.provider, { ...needs, diskGb: diskHolding(option.provider, needs.diskGb, needs.holdsData?.diskGb) });
     candidates.push({ provider: option.provider, funding: option.funding,
       ...(price != null ? { priceMicrosPerHour: price } : {}), ...(option.doubt ? { doubt: option.doubt } : {}) });
   }
@@ -202,8 +214,10 @@ export class ComputeRouter {
       .filter((view) => cloudProviders().includes(view.provider) && view.enabled && view.credentialConfigured);
     const managed = views.some((view) => view.managed);
     const accounts = managed ? await this.connections.managedConnections() : [];
-    const size = { ...(needs.cpu !== undefined ? { cpu: needs.cpu } : {}), ...(needs.diskGb !== undefined ? { diskGb: needs.diskGb } : {}) };
     return Promise.all(views.map(async (view): Promise<ComputeOption> => {
+      // The disk a machine there would get: what is asked, or enough for the data.
+      const diskGb = diskHolding(view.provider, needs.diskGb, needs.holdsData?.diskGb);
+      const size = { ...(needs.cpu !== undefined ? { cpu: needs.cpu } : {}), ...(diskGb !== undefined ? { diskGb } : {}) };
       const funding: ComputeFunding = view.managed ? 'managed' : 'own';
       const region = providerRegion(view.provider, view.config);
       const option: ComputeOption = { provider: view.provider, funding, limits: view.limits, features: view.features,
@@ -213,7 +227,7 @@ export class ComputeRouter {
         // will judge it (holds, top-ups: managed-compute.ts).
         const short = await assertComputeCredit(this.store, organizationId, view.provider, this.now(), { shape: needs })
           .then(() => undefined, (error: unknown) => { if (error instanceof ComputeCreditExhausted) return error; throw error; });
-        if (short) return { ...option, busy: 'out of compute this month', outOfCredit: short.message };
+        if (short) return { ...option, busy: 'out of credits this month', outOfCredit: short.message };
         // The account's budget, its queue and this organization's fair share of it.
         const account = accounts.find((value) => value.provider === view.provider);
         const full = account && await managedRoom(this.store, view.provider, { pool: account.limits.pool, share: account.config.share },
@@ -235,8 +249,9 @@ export class ComputeRouter {
   }
 
   async route(organizationId: string, config: Partial<ProjectConfig> | undefined, prefer?: string,
-    task?: { taskId: string; worldId?: string }): Promise<ComputeRoute> {
-    const needs = computeNeeds(config);
+    task?: { taskId: string; worldId?: string }, more: Pick<ComputeNeeds, 'reachesTavya' | 'holdsData'> = {}): Promise<ComputeRoute> {
+    const needs = { ...computeNeeds(config), ...(more.reachesTavya ? { reachesTavya: more.reachesTavya } : {}),
+      ...(more.holdsData ? { holdsData: more.holdsData } : {}) };
     return { ...rankComputeOptions(needs, await this.options(organizationId, needs, task), prefer), ...(task ? { taskId: task.taskId } : {}) };
   }
 
@@ -302,10 +317,11 @@ export class ComputeRouter {
         if (capacity?.name === 'ProviderCapacityFull') {
           await this.noteFull(organizationId, candidate, cause.message).catch(() => undefined);
           // The provider refused: the task waits its turn for this account too.
+          const diskGb = diskHolding(candidate.provider, route.needs.diskGb, route.needs.holdsData?.diskGb);
           if (route.taskId) await enqueue(this.store, { taskId: route.taskId, organizationId,
             account: accountKey(candidate.funding === 'managed' ? MANAGED_COMPUTE : organizationId, candidate.provider),
             ...(route.needs.cpu !== undefined ? { cpu: route.needs.cpu } : {}),
-            ...(route.needs.diskGb !== undefined ? { diskGb: route.needs.diskGb } : {}) }).catch(() => undefined);
+            ...(diskGb !== undefined ? { diskGb } : {}) }).catch(() => undefined);
         }
       }
     }
@@ -351,7 +367,15 @@ function noFitMessage(route: ComputeRoute): string {
  * out when some candidate is only full, else a plain error that asks people. */
 function noRoom(route: ComputeRoute, full: Array<{ candidate: ComputeCandidate; detail: string }>): Error {
   const busy = route.rejected.filter((option) => option.busy);
-  if (!full.length && !busy.length) return new Error(noFitMessage(route));
+  if (!full.length && !busy.length) {
+    // Too small for the project's data everywhere: no retry makes it fit.
+    const data = route.needs.holdsData;
+    if (data && route.rejected.some((option) => option.reason.endsWith(dataReasonEnd(data))))
+      return new ComputerUnfit(`No computer this organization can use ${DISK_CANNOT_HOLD_DATA} (${dataSize(data.bytes)}, so `
+        + `${data.diskGb} GB of disk): ${route.rejected.map((option) => `${optionLabel(option)}: ${option.reason}`).join('; ')}. `
+        + 'Connect one with a larger disk under Settings → Computers.');
+    return new Error(noFitMessage(route));
+  }
   // Only spent credit stands in the way: say so as the credit check does.
   if (!full.length && busy.every((option) => option.outOfCredit)) return new ComputeCreditExhausted(busy[0]!.outOfCredit!);
   const message = noRoomMessage(route, full);

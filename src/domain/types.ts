@@ -683,6 +683,10 @@ export interface Project {
    * implicit — one exists exactly while a project names it — so there is no
    * folder entity to create, rename, or garbage-collect. Absent = top level. */
   folder?: string;
+  /** The organization's co-ordinator project (Store.ensureOrganizationCoordinatorProject):
+   * one per organization, where its organization-wide work (Ask) lives; it
+   * cannot be deleted, renamed or moved to another organization. */
+  coordinator?: true;
 }
 
 export interface ProjectConfig {
@@ -981,6 +985,11 @@ export interface OrganizationUsagePolicy {
   /** Hosted: computed from the plan's active-agent concurrency and never
    * independently configurable. Private installs retain their saved pool guard. */
   maxActiveWorlds: number;
+  /** How many small cloud sandboxes the subscription-login turns of tasks
+   * without a computer run at once (wiki features/computerless-tasks); a
+   * turn beyond waits. Hosted: the installation's number
+   * (KARMAX_LOGIN_SANDBOXES_PER_ORG, default 2), never raised by an owner. */
+  maxLoginSandboxes: number;
 }
 
 // ─── Git & GitHub configuration (wiki plans/PLAN-git-config) ────────────────
@@ -2290,6 +2299,8 @@ export interface TaskContinuation {
   collaborations: { pending: string[]; settled: string[] };
   consumed: string[];
   checkoutHeads: Record<string, string>;
+  /** The clean heads of the proposal in Review, while Review is open or a message left it. */
+  reviewedHeads?: Record<string, string>;
   accountPool: number;
   flags: {
     targetLocked: boolean;

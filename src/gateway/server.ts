@@ -1,5 +1,5 @@
 import { computerDefaults, saveOrganizationComputer, saveProjectComputer, splitComputerValues } from '../platform/computer-settings.js';
-import { ORGANIZATION_COORDINATOR_PROJECT, type AutonomyScope, type ProjectAutonomy } from '../domain/autonomous-projects.js';
+import { type AutonomyScope, type ProjectAutonomy } from '../domain/autonomous-projects.js';
 import { machineWaits, type MachineWait } from '../world/machine-wait.js';
 import { REPOSITORY_ROUTE } from '../world/resource-repository.js';
 import { clientAddress, ClientRequestLimits } from './client-address.js';
@@ -59,7 +59,7 @@ import { compactTaskView, platformRequestPathError } from '../platform/platform-
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { manifest } from '../contrib/manifests.js';
-import { LOCAL_WORLD_KINDS, isComputerless, machineShape, runsOnHost } from '../domain/computer.js';
+import { LOCAL_WORLD_KINDS, NO_COMPUTER, isComputerless, machineShape, runsOnHost } from '../domain/computer.js';
 import { projectSettingsFor, globalSettingsFor, settingsToProjectConfig, resolveParams, effectiveRepos } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { findProviderSession } from '../agent/fork.js';
@@ -90,7 +90,7 @@ import { HOSTED_GIT_ROUTE, hostedRepositoryUrl, isHostedRepository, isValidHoste
 import { materializeGitCredential } from '../world/git-credential.js';
 type Repository = import('../domain/types.js').Repository;
 import { projectArtifactGallery, type GalleryArtifact } from '../platform/artifact-gallery.js';
-import { FileAccessError, FileNotFoundError, ProjectFiles, projectRepositoryCredential, splitPath, worldFilesPath, type FileNode, type FileView, type OpenedFile } from '../world/project-files.js';
+import { FileAccessError, FileNotFoundError, ProjectFiles, projectRepositoryCredential, splitPath, type FileNode, type FileView, type OpenedFile } from '../world/project-files.js';
 import { CHANGE_LIMITS, FileConflictError, ProjectFileChanges, type FileChange, type FileKeeping } from '../world/project-file-changes.js';
 import { createFileShare, currentFileShare, projectFileShares, publicFileShare, publicFilesHtml, revokeFileShare, type FileShare } from './file-sharing.js';
 import { cliVersionOf, olderVersion } from '../domain/cli-version.js';
@@ -275,7 +275,7 @@ export function routeCapability(method: string, p: string, url?: URL): KnownCapa
   // Anyone signed in may report an error they saw (wiki features/error-reports);
   // a task's is read from the task, which the handler checks they can see.
   if (p === '/api/error-reports' && !read) return 'none';
-  if (p === '/api/user/export' || p === '/api/user/default-organization' || p === '/api/user/preferences' || p === '/api/user/paid-subscriptions'
+  if (p === '/api/user/export' || p === '/api/user/default-organization' || p === '/api/user/preferences' || p === '/api/user/paid-subscriptions' || p === '/api/user/plans'
     || p === '/api/user/onboarding' || p === '/api/user/onboarding/reset' || p === '/api/user/account-deletion-request') return 'none';
   // A signed-in person always owns their own Git identity. It is not an
   // organization credential grant and must remain editable after they join a
@@ -297,6 +297,9 @@ export function routeCapability(method: string, p: string, url?: URL): KnownCapa
   if (/^\/api\/organizations\/[^/]+\/views$/.test(p)) return read ? 'task:read' : 'task:edit';
   // Templates are saved task forms: whoever may create tasks may save one.
   if (/^\/api\/organizations\/[^/]+\/templates$/.test(p)) return read ? 'task:read' : 'task:create';
+  // Ask (wiki features/computerless-tasks): a task in the organization's
+  // co-ordinator project, made on first use by whoever may create tasks there.
+  if (/^\/api\/organizations\/[^/]+\/ask$/.test(p) && !read) return 'task:create';
   if (/^\/api\/organizations\/[^/]+\/projects/.test(p)) return read ? 'project:read' : 'project:create';
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
@@ -2786,6 +2789,43 @@ export class Gateway {
         }
         return this.json(res, 200, { subscriptions });
       }
+      if (p === '/api/user/plans' && method === 'GET') {
+        // The profile's Plans & billing: every organization one belongs to, its
+        // plan (bought or gifted), its packs and its credits, and where to buy
+        // more; plus subscriptions one paid for in organizations one has left.
+        // Personal and cross-organization, like paid-subscriptions above.
+        const subject = requireHumanSubject(callerIdentity);
+        if (authRecord.organizationId || authRecord.projectId || authRecord.projectIds?.length)
+          return this.json(res, 403, { error: 'unscoped personal access is required' });
+        const managedProviders = ((await this.deps.providerConnections?.managedConnections()) ?? []).map((value) => value.provider);
+        const organizations = [];
+        for (const organization of await store.listOrganizations(subject.userId)) {
+          const membership = await store.organizationMembership(organization.id, subject.userId);
+          if (!membership) continue;
+          const entitlements = await store.organizationEntitlements(organization.id);
+          const paymentAllowed = this.deps.identity && session.userId === subject.userId && this.deps.authorization
+            ? allows(await this.personCaps(session, undefined, organization.id), 'payment:write')
+            : (await this.deps.tokens.check(token, 'payment:write', { organizationId: organization.id })).ok;
+          const credit = entitlements.deployment === 'hosted' && managedProviders.length ? await computeCredit(store, organization.id) : null;
+          organizations.push({ organizationId: organization.id, name: organization.name, slug: organization.slug, role: membership.role,
+            plan: entitlements.plan, planName: entitlements.planName,
+            gift: (await this.deps.subscriptions?.currentGift(organization.id)) ?? null,
+            storagePacks: entitlements.storagePacks, giftedStoragePacks: entitlements.giftedStoragePacks,
+            computePacks: entitlements.computePacks, giftedComputePacks: entitlements.giftedComputePacks,
+            credits: credit ? { usedMicros: credit.usedMicros, heldMicros: credit.heldMicros, availableMicros: credit.availableMicros,
+              totalMicros: (credit.creditMicros ?? 0) + credit.topUpMicros + (credit.trial?.monthMicros ?? 0) } : null,
+            canManage: membership.role === 'owner' && Boolean(paymentAllowed),
+            settingsUrl: `${await organizationSettingsPath(store, organization.id)}#settings-plan` });
+        }
+        const member = new Set(organizations.map((organization) => organization.organizationId));
+        const formerSubscriptions = [];
+        for (const subscription of (await this.deps.subscriptions?.paidSubscriptionsForUser(subject.userId)) ?? []) {
+          if (member.has(subscription.organizationId)) continue;
+          const organization = await store.getOrganization(subscription.organizationId);
+          if (organization) formerSubscriptions.push({ ...subscription, organizationName: organization.name, canManage: false, settingsUrl: null });
+        }
+        return this.json(res, 200, { organizations, formerSubscriptions });
+      }
       if (p === '/api/user/default-organization' && (method === 'GET' || method === 'PUT')) {
         const subject = requireHumanSubject(callerIdentity);
         const operator = allows(authRecord.caps, 'authorization:read');
@@ -2833,12 +2873,16 @@ export class Gateway {
         if (typeof b.taskId === 'string' && b.taskId) {
           // The caller must be able to read the task where it lives: its
           // project and organization come from the record, never the request.
+          // The route names no scope (the task is in the body), so a browser
+          // session's token is for no organization in particular; read the task
+          // with the session as it acts in the task's own project.
           const found = await store.taskMetadata(b.taskId);
           const project = found ? await store.getProject(found.projectId) : undefined;
-          if (!found || !(await this.deps.tokens.check(token, 'task:read',
+          const inTask = found ? (await this.auth(req, found.projectId, project?.organizationId))?.apiToken ?? token : token;
+          if (!found || !(await this.deps.tokens.check(inTask, 'task:read',
             { taskId: found.id, projectId: found.projectId, organizationId: project?.organizationId })).ok)
             return this.json(res, 404, { error: `no task ${b.taskId}` });
-          const view = await api.getTaskView(token, found.id);
+          const view = await api.getTaskView(inTask, found.id);
           // It has shown its error since it last changed, at the latest: a report made later is of then.
           const changed = [found.statusChangedAt, view?.updatedAt].filter((at): at is number => typeof at === 'number' && Number.isFinite(at));
           task = { id: found.id, projectId: found.projectId, ...(view?.error ? { error: String(view.error) } : {}), ...(view?.stage ? { stage: String(view.stage) } : {}),
@@ -2897,7 +2941,7 @@ export class Gateway {
           vault: (await new VaultItems(store, this.deps.broker, undefined, organizationId).list())
             .some((item) => item.type === 'login' && item.fields.includes('password')),
           card: (await store.listOrganizationCards(organizationId)).length > 0,
-          project: (await store.listProjects()).some((project) => project.organizationId === organizationId),
+          project: (await store.listOrganizationProjects(organizationId)).some((project) => !project.coordinator),
         };
         if (finishReplay && record?.replay && hostedOnboardingRequired(facts).every(Boolean)) {
           record = { display: record.display, completedAt: Date.now() };
@@ -3311,14 +3355,13 @@ export class Gateway {
           (await this.enableHostedOnboarding(subject.userId, organization.id));
           (await startComputeTrial(store, organization.id, subject.userId));
         }
+        // Every organization has a co-ordinator project (where Ask's tasks live).
+        const { project } = await store.ensureOrganizationCoordinatorProject(organization.id);
         if (b.autonomous !== true) return this.json(res, 200, organization);
-        // An autonomous organization starts with a project its co-ordinator runs
-        // everything from, set up with the organization's whole authority.
-        let project = (await store.createProject(ORGANIZATION_COORDINATOR_PROJECT, normalizeConfig({}, false, this.deps.hosted === true), organization.id));
+        // An autonomous organization's co-ordinator runs everything from it, set
+        // up with the organization's whole authority.
         (await store.setProjectMembership(project.id, { kind: 'user', userId: subject.userId }, 'owner'));
         await this.ensureProjectWiki(project, subject.userId);
-        await this.installDefaultTasks(project);
-        project = (await store.getProject(project.id)) ?? project;
         const inOrganization = (await this.auth(req, undefined, organization.id))?.apiToken ?? token;
         return this.json(res, 200, { ...organization, project, ...(await this.autonomous(inOrganization, project.id, 'organization')) });
       }
@@ -3335,7 +3378,7 @@ export class Gateway {
           // Someone who joins through an invitation came for that team: it becomes
           // where they land, unless their own workspace already holds projects.
           const home = (await store.defaultOrganization(subject.userId));
-          if (!home || (home.kind === 'personal' && !(await store.listOrganizationProjects(home.id)).length))
+          if (!home || (home.kind === 'personal' && !(await store.listOrganizationProjects(home.id)).some((project) => !project.coordinator)))
             (await store.setDefaultOrganization(subject.userId, membership.organizationId));
           void this.deps.subscriptions?.syncSeats(membership.organizationId).catch((error) =>
             console.error('[subscription] seat sync failed:', error instanceof Error ? error.message : String(error)));
@@ -4085,6 +4128,21 @@ export class Gateway {
           { from: repository.id, to: `${moved.owner}/${moved.name}`, projects: projectIds, ...identityAuditDetail(callerIdentity) });
         return this.json(res, 200, moved);
       }
+      const organizationAsk = p.match(/^\/api\/organizations\/([^/]+)\/ask$/);
+      if (organizationAsk && method === 'POST') {
+        const organizationId = organizationAsk[1]!;
+        if (!(await store.getOrganization(organizationId))) return this.json(res, 404, { error: 'organization not found' });
+        const b = await this.body(req);
+        const prompt = typeof b.prompt === 'string' ? b.prompt.trim() : '';
+        if (!prompt) return this.json(res, 400, { error: 'prompt is required' });
+        // Every organization has one; one older than that gets it now.
+        const { project } = await store.ensureOrganizationCoordinatorProject(organizationId);
+        await this.wikiForTaskStart(project, callerIdentity.humanSubject?.userId);
+        const task = await api.createTask(token, { projectId: project.id, workflow: 'software-dev', prompt, ownAuthority: true,
+          ...(Array.isArray(b.images) ? { images: b.images } : {}), ...(Array.isArray(b.files) ? { files: b.files } : {}),
+          params: { computer: { provider: NO_COMPUTER } } }, receivedAt);
+        return this.json(res, 200, { ...task, project });
+      }
       const organizationProjects = p.match(/^\/api\/organizations\/([^/]+)\/projects$/);
       if (organizationProjects) {
         const organizationId = organizationProjects[1]!;
@@ -4790,6 +4848,7 @@ export class Gateway {
         if (method === 'DELETE') {
           const project = await store.getProject(id);
           if (!project) return this.json(res, 404, { error: 'project not found' });
+          if (project.coordinator) return this.json(res, 400, { error: `The ${project.name} project belongs to the organization and cannot be deleted.` });
           // Named, as an organization's deletion is: one confirm() (that Enter
           // accepts) once nearly deleted tavya's own project (#737, #747).
           if (String((await this.body(req))?.confirmName ?? '') !== project.name)
@@ -5549,7 +5608,7 @@ export class Gateway {
         const task = await store.getTask(fileLocation[1]!);
         if (!task) return this.json(res, 404, { error: 'task not found' });
         let relative: string;
-        try { relative = await this.citedFilePath(task, url.searchParams.get('path') ?? ''); }
+        try { relative = await this.citedFilePath(session.apiToken, task, url.searchParams.get('path') ?? ''); }
         catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         return this.json(res, 200, { projectId: task.projectId, taskId: task.id, ...(task.num != null ? { num: task.num } : {}), path: relative });
       }
@@ -5697,7 +5756,7 @@ export class Gateway {
         if ('error' in view) return this.json(res, view.status, { error: view.error });
         // `cited`: a path as the task's agent wrote it (an image in its message).
         if (view.kind === 'task' && url.searchParams.has('cited')) {
-          try { relative = await this.citedFilePath((await store.getTask(view.taskId))!, relative); }
+          try { relative = await this.citedFilePath(session.apiToken, (await store.getTask(view.taskId))!, relative); }
           catch (error) { return this.json(res, 404, { error: error instanceof Error ? error.message : String(error) }); }
         }
         try {
@@ -6361,6 +6420,8 @@ export class Gateway {
         }
       }
       const taskAuthMatch = p.match(/^\/api\/tasks\/([^/]+)\/authorization$/);
+      // The grants it ended with: what "Re-authorize previous grants?" gives a fork.
+      if (taskAuthMatch && method === 'GET') return this.json(res, 200, await api.taskEndedGrants(token, taskAuthMatch[1]!));
       if (taskAuthMatch && method === 'PATCH') {
         const b = await this.body(req);
         try {
@@ -11314,9 +11375,10 @@ export class Gateway {
   }
 
   /** Where a path an agent cited (absolute in its world, or relative to its
-   * working folder) sits in its project's Files, relative to the world root. */
-  private async citedFilePath(task: import('../domain/types.js').TaskRecord, cited: string): Promise<string> {
-    return worldFilesPath(((await this.deps.store.currentWorld(task.id)) ?? task.lastView?.world) as WorldHandle | undefined, cited);
+   * working folder or a checkout) sits in its task's view of Files. */
+  private async citedFilePath(token: string, task: import('../domain/types.js').TaskRecord, cited: string): Promise<string> {
+    const data = (await this.deps.tokens.check(token, 'project:settings:read', { projectId: task.projectId })).ok;
+    return this.projectFiles().citedPath(task.projectId, task.id, cited, data);
   }
 
   /** Tasks whose world can be shown (running, parked or saved), newest first, for the view picker. */
@@ -11729,6 +11791,7 @@ export class Gateway {
         name: label || 'Personal', kind: 'personal', ownerUserId: userId }));
       (await this.deps.store.setDefaultOrganization(userId, organization.id));
       (await this.deps.authorization?.bootstrapOrganizationOwner(`user:${userId}`, userId, organization.id));
+      (await this.deps.store.ensureOrganizationCoordinatorProject(organization.id));
       (await this.deps.resources?.storageLocationService()?.ensureManaged(organization.id));
       (await inheritPersonalGithubProfile(this.deps.store, this.deps.broker, userId));
       (await this.linkOwnGithubInstallation(userId, organization));

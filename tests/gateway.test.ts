@@ -78,7 +78,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(catalog.providers.claude.map((m: any) => m.id))
       .toEqual(expect.arrayContaining(['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5']));
     expect(catalog.providers.codex.map((m: any) => m.id))
-      .toEqual(expect.arrayContaining(['gpt-6.1-terra', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']));
+      .toEqual(expect.arrayContaining(['gpt-6.2-sol', 'gpt-6.2-astra', 'gpt-6.1-terra', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']));
   });
 
   it('charts runnable models from Artificial Analysis: the bundled snapshot, or the live list with a key', async () => {
@@ -190,7 +190,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
         expect(read.mock.calls.some(([file]) => String(file).includes(sessionId))).toBe(false);
       } finally { read.mockRestore(); }
       const sessions: any = await (await fetch(`${base}/api/tasks/${task.id}/sessions`, { headers: auth() })).json();
-      expect(sessions.do).toMatchObject({ id: sessionId, provider: 'codex', downloadable: true, requiredCodexVersion: '0.167.1' });
+      expect(sessions.do).toMatchObject({ id: sessionId, provider: 'codex', downloadable: true, requiredCodexVersion: '0.171.0' });
       const response = await fetch(`${base}${sessions.do.downloadUrl}`, { headers: auth() });
       expect(response.status).toBe(200);
       expect(response.headers.get('content-type')).toContain('application/x-ndjson');

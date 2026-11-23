@@ -9,6 +9,7 @@ import { CodexAdapter } from '../src/agent/codex.js';
 import { ConfigHomeManager, capturedToken } from '../src/autonomy/config-homes.js';
 import { materializeFork } from '../src/agent/fork.js';
 import { probeClaudeUsage } from '../src/agent/usage.js';
+import { codexModelCatalog } from '../src/agent/models.js';
 import { paths } from '../src/config/paths.js';
 import type { PlatformToolContext } from '../src/agent/types.js';
 import { liveEnabled } from './helpers/live-gate.js';
@@ -102,10 +103,13 @@ describe.skipIf(!codexKey)('LIVE Codex — API key (Responses API)', () => {
 });
 
 describe.skipIf(!codexSub)('LIVE Codex — subscription (app-server)', () => {
-  it('runs a headless app-server turn on the subscription and returns text', async () => {
+  // GPT-5.5, and the newest default the pinned Codex's catalog adds (GPT-6.2 Sol
+  // in 0.171.0): OpenAI refuses a model the pinned Codex lacks (incidents/lessons).
+  const newestDefault = codexModelCatalog([]).find((m) => m.isDefault)!.id;
+  it.each(['gpt-5.5', newestDefault])('runs a headless app-server turn on the subscription and returns text (%s)', async (model) => {
     const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
     const r = await new CodexAdapter().runTurn(
-      { profile: profile({ provider: 'codex', model: 'gpt-5.5' }), world: await makeWorld(), messages: [{ id: 'm', role: 'user', text: 'Reply with exactly the word READY and do not modify any files.', ts: 0 }], systemPrompt: SYS, role: 'do', resolvedAuth: { configHome: codexHome } } as any,
+      { profile: profile({ provider: 'codex', model }), world: await makeWorld(), messages: [{ id: 'm', role: 'user', text: 'Reply with exactly the word READY and do not modify any files.', ts: 0 }], systemPrompt: SYS, role: 'do', resolvedAuth: { configHome: codexHome } } as any,
       ctx(),
     );
     expect(r.output.length).toBeGreaterThan(0);

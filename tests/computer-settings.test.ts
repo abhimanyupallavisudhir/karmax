@@ -180,6 +180,27 @@ describe('Computer defaults', () => {
     expect((await store.effectiveTaskConfig(project.id, task.id)).resources).toMatchObject({ cpu: 4, memoryMb: 2048, diskGb: 50 });
   });
 
+  // Task #1001 (2026-11-19): a desktop task's parent moved it to Daytona with
+  // `{provider, cpu, memoryMb, diskGb}`. The edit replaced the task's Computer
+  // whole, so `flavor: desktop` was dropped, and the restore after the failed
+  // move made a headless machine: the person asked to click in its desktop
+  // view had none. What a running task can't change, an edit can't drop.
+  it('keeps a running task\'s experience and network when an edit leaves them out', async () => {
+    const project = await store.createProject('Desktop move', { worldProvider: 'e2b' });
+    const network = { unrestricted: false, allowDomains: ['pypi.org'], allowCidrs: [] };
+    const task = await store.createTask({ projectId: project.id, title: 'Listings', workflow: 'software-dev',
+      workflowVersion: '1.30.0', params: { prompt: 'x', computer: { provider: 'e2b', flavor: 'desktop', cpu: 2, memoryMb: 4096, network } } });
+    await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1, root: '/w',
+      workspaceRoot: '/w', branch: `tavya/${task.id}`, base: 'main', meta: { projectId: project.id, environmentFlavor: 'desktop' } }, project.id);
+    const editor = (await tokens.mintPrincipal('user:editor', ['task:edit', 'task:read'], project.id)).token;
+    await api.updateParams(editor, task.id, { computer: { provider: 'e2b', cpu: 2, memoryMb: 4096, diskGb: 10 } });
+    expect((await store.getTask(task.id))!.params.computer).toEqual({ provider: 'e2b', flavor: 'desktop', cpu: 2, memoryMb: 4096, diskGb: 10, network });
+    expect((await store.effectiveTaskConfig(project.id, task.id)).environment).toMatchObject({ flavor: 'desktop' });
+    // Back to the defaults, still a desktop.
+    await api.updateParams(editor, task.id, { computer: null });
+    expect((await store.getTask(task.id))!.params.computer).toEqual({ flavor: 'desktop', network });
+  });
+
   // pramana#3: a task started before the Computer existed has no edit window for
   // it in its workflow input, so the workflow refused every resize and the form
   // stayed greyed out — exactly when it ran out of disk.

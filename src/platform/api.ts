@@ -87,7 +87,7 @@ import { AuthorizationRequests, type AuthorizationRequest } from './authorizatio
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { untrustedBlock } from '../domain/untrusted.js';
-import { baseTaskAuthority, previousTaskGrants, taskAuthorityNow, taskGrants, tokenScopeOf } from './task-authority.js';
+import { baseTaskAuthority, endedTaskGrants, previousTaskGrants, taskAuthorityNow, taskGrants, tokenScopeOf } from './task-authority.js';
 import { delegatedFromParent } from './delegation.js';
 export { previousTaskGrants };
 import type { KarmaxBus } from '../contrib/bus.js';
@@ -1601,6 +1601,10 @@ export class KarmaxApi {
       /** Sparse blind-use/plaintext policy overrides for the credentials this
        * task was granted. Missing values inherit organization defaults. */
       credentialPolicies?: VaultTaskPolicyOverrides;
+      /** Capabilities the main agent starts with as if approved through
+       *  `request_permission`: what a source task's agent was approved for,
+       *  carried on (`endedTaskGrants`). The caller must hold each. */
+      permissionGrants?: string[];
       /** Total mutually-exclusive attempts to create and queue up front. */
       attempts?: number;
       /** Ordinal priority (index into PRIORITY_NAMES). Part of the creation
@@ -1719,6 +1723,14 @@ export class KarmaxApi {
       );
     }
     const limited = missingCredentialGrants.length > 0 || profileAttenuated;
+    const permissionGrants = [...new Set((args.permissionGrants ?? []).map((capability) => {
+      try { return exactCapability(capability); }
+      catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
+    }))];
+    for (const capability of permissionGrants) {
+      const checked = (await this.deps.tokens.check(token, capability, { projectId: project.id, organizationId }));
+      if (!checked.ok) throw new CapabilityError(`you cannot grant ${capability}: ${checked.reason ?? 'permission denied'}`);
+    }
 
     this.assertProfilesVisible(args.profiles, project);
     // Task-scope overrides: the form's `params` plus the legacy flat fields.
@@ -1880,6 +1892,8 @@ export class KarmaxApi {
         task = (await this.deps.store.getTask(task.id))!;
       }
       (await this.persistTaskCredentialPolicies(task));
+      (await new PermissionRequests(this.deps.store, organizationId).grant({ taskId: task.id, projectId: task.projectId,
+        role: MAIN_AGENT, capabilities: permissionGrants, by: caller.principal }));
       // Every other agent's own authority, attenuated against the creator like
       // the task's. Inside the transaction: a refusal leaves no task behind.
       const { specs, fromDefaults } = this.agentSpecsOf(manifest, agentValues, taskOverrides);
@@ -2132,6 +2146,7 @@ export class KarmaxApi {
       resolved.remote = 'pr';
     (await this.materializeUnifiedAgents(resolved, project));
     (await this.pinIncludedModelDefaults(manifest, resolved, project));
+    (await this.askEffort(resolved, layers, project));
 
     // Auto-detect the repo's branch policy when base/target weren't set anywhere,
     // instead of guessing "main" (which would make hosted task views disagree
@@ -2214,6 +2229,27 @@ export class KarmaxApi {
         ...(spec?.mcpConnections === undefined && profile.mcpConnections !== undefined ? { mcpConnections: profile.mcpConnections } : {}),
       };
     }
+  }
+
+  /**
+   * A task without a computer (an Ask) thinks at low effort unless a layer of
+   * its own parameters chose one: an Ask is a few platform calls, and its
+   * default model's effort is set for coding (the included model's is max),
+   * which made Asks slow and dear (wiki features/computerless-tasks § What an
+   * Ask costs). An inherited agent is pinned here, as the task form would.
+   */
+  private async askEffort(resolved: ValueMap, layers: (ValueMap | undefined)[], project: Project): Promise<void> {
+    if (!isComputerless((resolved.computer as { provider?: string } | undefined)?.provider)) return;
+    if (layers.some((layer) => (layer?.['agent:do'] as AgentSpec | undefined)?.effort)) return;
+    let spec = resolved['agent:do'] as AgentSpec | undefined;
+    if (!spec?.provider) {
+      const { profile } = await this.defaultAgent('do', project);
+      const provider = (profile?.provider ?? this.deps.defaultAgentProvider ?? defaultProvider().provider) as Provider;
+      const model = profile?.model ?? defaultModel(provider);
+      spec = { ...spec, provider, ...(model ? { model } : {}),
+        ...(spec?.mcpConnections === undefined && profile?.mcpConnections !== undefined ? { mcpConnections: profile.mcpConnections } : {}) };
+    }
+    resolved['agent:do'] = { ...spec, effort: 'low' };
   }
 
   /** Capture the exact provider/model/effort selection that the activity runtime
@@ -6573,8 +6609,9 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
    *
    * `reauthorize` starts the fork from the grants the source task ended with —
    * its authorization level/scope (including any mid-task elevation a human
-   * approved) plus its vault credential grants and policies — instead of the
-   * project default. The forked conversation usually continues the same work,
+   * approved), its vault credentials (granted at creation, approved while it
+   * ran, or stored by it) with their policies, and the capabilities its agent
+   * was approved for (`endedTaskGrants`) — instead of the project default. The forked conversation usually continues the same work,
    * so without it every credential the source was approved for is asked again.
    * The grants go through `createTask`'s ordinary checks: the caller cannot hand
    * the fork more than it could grant a fresh task, so an over-broad source
@@ -6588,7 +6625,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const role = args.role ?? 'do';
     if (!(await this.deps.store.kvGet(`session:${args.taskId}:${role}`)) && !(await this.getTaskView(token, args.taskId))?.messages?.length)
       throw new Error(`the ${role} agent has no conversation to fork`);
-    const previous = args.reauthorize ? (await this.taskGrants(source)) : undefined;
+    const previous = args.reauthorize ? (await endedTaskGrants(this.deps.store, this.deps.authorization, source)) : undefined;
     return this.createTask(token, {
       projectId: source.projectId,
       title: args.title ?? `Fork of #${source.num ?? source.id} ${role}`,
@@ -6610,8 +6647,18 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       // fills in when none was named.
       ...(args.authorizationProfile ? { authorizationProfile: args.authorizationProfile }
         : previous?.authorization ? { authorization: previous.authorization } : {}),
-      ...(previous ? { credentialGrants: previous.credentialGrants, credentialPolicies: previous.credentialPolicies } : {}),
+      ...(previous ? { credentialGrants: previous.credentialGrants, credentialPolicies: previous.credentialPolicies,
+        permissionGrants: previous.permissionGrants } : {}),
     });
+  }
+
+  /** The grants a task ended with (`endedTaskGrants`): what "Re-authorize
+   * previous grants?" starts a fork from. */
+  async taskEndedGrants(token: string, taskId: string): Promise<Awaited<ReturnType<typeof endedTaskGrants>>> {
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'get_task', { projectId: task?.projectId, taskId }));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    return endedTaskGrants(this.deps.store, this.deps.authorization, task);
   }
 
   async taskTiming(token: string, taskId: string) {
@@ -7536,7 +7583,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     const { resumeFrom: _previous, ...agent } = (params[field] ?? {}) as Partial<AgentSpec>;
     params[field] = { ...agent, resumeFrom: { taskId, role: MAIN_AGENT } };
     params.prompt = input.text;
-    const previous = (await this.taskGrants(source));
+    const previous = (await endedTaskGrants(this.deps.store, this.deps.authorization, source));
     const continued = await this.createTask(token, {
       projectId: source.projectId,
       workflow: source.workflow,
@@ -7546,6 +7593,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       ...(previous.authorization ? { authorization: previous.authorization } : {}),
       credentialGrants: previous.credentialGrants,
       credentialPolicies: previous.credentialPolicies,
+      permissionGrants: previous.permissionGrants,
       ...(triggered && source.createdBy ? { createdBy: source.createdBy } : {}),
     });
     if (holdsKeys) (await this.deps.store.moveKeyedRuns(taskId, continued.id));
@@ -8462,7 +8510,14 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       if (!computerResizable(task.lastView)) throw new ValidationError('this task\'s computer can\'t be resized: the task has ended');
       try { assertInFlightComputerEdit(computerOf(computerBefore), normalizeComputer(patch.computer) ?? {}); }
       catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
-      patch.computer = (await this.taskComputer(project, { computer: patch.computer })) ?? null;
+      // What never changes in flight can't be dropped either: an edit replaces
+      // the task's Computer whole, and one naming only a provider and sizes made
+      // a desktop task's next machine headless (#1001).
+      let own: ComputerSpec = {};
+      try { own = normalizeComputer(task.params?.computer) ?? {}; } catch { own = {}; }
+      const next: ComputerSpec = { ...(own.flavor ? { flavor: own.flavor } : {}), ...(own.network ? { network: own.network } : {}),
+        ...(await this.taskComputer(project, { computer: patch.computer })) };
+      patch.computer = Object.keys(next).length ? next : null;
     }
     // An in-flight edit can introduce a `resumeFrom` pointer at another task —
     // the same source-side conversation check as createTask/updateArmedParams.
@@ -9971,3 +10026,4 @@ export type WebhookView = IncomingWebhook & { linked?: Array<LinkedPerson & { na
 
 /** A person's linked chat account, with the bot it was made with. */
 export type ChatLinkView = Omit<ChatLink, 'hookId' | 'projectId' | 'organizationId'> & { bot: { id: string; name: string; username?: string } };
+

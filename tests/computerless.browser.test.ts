@@ -66,6 +66,7 @@ describe('a task without a computer, in the console', () => {
     if (priorHome === undefined) delete process.env.KARMAX_HOME; else process.env.KARMAX_HOME = priorHome;
     fs.rmSync(dir, { recursive: true, force: true });
   });
+  const allTasks = async () => (await Promise.all((await store.listProjects()).map((p) => store.listTasks(p.id)))).flat();
   const open = async (route: string): Promise<{ page: Page; errors: string[]; readiness: string[] }> => {
     const context = await browser.newContext({ serviceWorkers: 'block', viewport: { width: 1280, height: 1000 } });
     const page = await context.newPage();
@@ -101,8 +102,10 @@ describe('a task without a computer, in the console', () => {
     expect(errors).toEqual([]);
   });
 
-  it('Ask: a compact button and its shortcut start a task without a computer and open its page', async () => {
+  it('Ask: a compact button and its shortcut start a task without a computer in the organization’s co-ordinator project and open its page', async () => {
     const { page, errors } = await open('/personal/assistant');
+    // Nobody is asked which project: the dialog names none.
+    expect(await page.locator('#mobile-ask').isVisible()).toBe(false); // a computer's Ask is in the sidebar
     const ask = page.locator('#rail-ask');
     await ask.waitFor();
     expect(await ask.getAttribute('title')).toContain('(A)');
@@ -119,18 +122,68 @@ describe('a task without a computer, in the console', () => {
     expect(await box.evaluate((element) => element === (globalThis as any).document.activeElement)).toBe(true);
     await box.fill('Turn on Codex for this project');
     await box.press('Enter');
-    let created: Awaited<ReturnType<Store['listTasks']>>[number] | undefined;
+    let created: Awaited<ReturnType<typeof allTasks>>[number] | undefined;
     await expect.poll(async () => {
-      created = (await store.listTasks(project.id)).find((task) => task.params?.prompt === 'Turn on Codex for this project');
+      created = (await allTasks()).find((task) => task.params?.prompt === 'Turn on Codex for this project');
       return created?.params?.computer;
     }, { timeout: 15_000 }).toEqual({ provider: 'none' });
+    // It lives in the co-ordinator project, made for it, which the sidebar now lists.
+    const coordinator = (await store.getProject(created!.projectId))!;
+    expect(coordinator).toMatchObject({ name: 'Co-ordinator', organizationId: project.organizationId });
+    await expect.poll(() => page.locator('#rail-list').textContent(), { timeout: 10_000 }).toContain('Co-ordinator');
     expect(created!.params.draft).toBe(false);
     // Its page opens with the message box ready for the next message.
     await expect.poll(() => page.evaluate(() => (globalThis as any).document.activeElement?.classList.contains('followup-input')), { timeout: 10_000 }).toBe(true);
     expect((created!.params._authorization as { heldBack?: string[] }).heldBack).toContain('task:delete');
-    await expect.poll(() => page.url(), { timeout: 10_000 }).toContain(String(created!.num ?? created!.id));
+    await expect.poll(() => page.url(), { timeout: 10_000 }).toContain(`/co-ordinator/tasks/${created!.num ?? created!.id}`);
     expect(await dialog.count()).toBe(0);
+
+    // The next question goes to the same project.
+    await ask.click();
+    await dialog.waitFor();
+    await dialog.locator('textarea').fill('And what about E2B?');
+    await dialog.locator('textarea').press('Enter');
+    await expect.poll(async () => (await allTasks()).find((task) => task.params?.prompt === 'And what about E2B?')?.projectId,
+      { timeout: 15_000 }).toBe(coordinator.id);
+    expect((await store.listProjects()).filter((p) => p.name.startsWith('Co-ordinator'))).toHaveLength(1);
+    // It is the organization's for good: its settings offer no rename, move or delete.
+    await page.goto(`${base}/personal/co-ordinator/settings`);
+    await page.locator('#project-advanced').waitFor({ state: 'attached' });
+    await expect.poll(() => page.locator('.setting-row', { hasText: 'Co-ordinator project' }).count(), { timeout: 10_000 }).toBe(1);
+    expect(await page.locator('#delete-project, #move-project, #rename-project').count()).toBe(0);
     expect(errors).toEqual([]);
+  });
+
+  it('On a phone, Ask is in the top bar', async () => {
+    const context = await browser.newContext({ serviceWorkers: 'block', viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+    const page = await context.newPage();
+    const errors: string[] = [];
+    page.on('pageerror', (error) => errors.push(error.message));
+    await page.goto(`${base}/personal/assistant`);
+    const ask = page.locator('.mobile-bar #mobile-ask');
+    await ask.waitFor();
+    expect(await ask.textContent()).toBe('Ask');
+    // Inside the bar, on its right, beside where you are; not again in the sidebar.
+    const bar = (await page.locator('.mobile-bar').boundingBox())!, button = (await ask.boundingBox())!;
+    expect(button.y).toBeGreaterThanOrEqual(bar.y);
+    expect(button.y + button.height).toBeLessThanOrEqual(bar.y + bar.height);
+    expect(bar.x + bar.width - (button.x + button.width)).toBeLessThan(24);
+    if (process.env.KARMAX_SHOTS) await page.screenshot({ path: path.join(process.env.KARMAX_SHOTS, 'ask-phone-bar.png') });
+    await page.locator('#mobile-menu').click();
+    await expect.poll(() => page.locator('#rail-new-task').isVisible()).toBe(true);
+    expect(await page.locator('#rail-ask').isVisible()).toBe(false);
+    await page.locator('#mobile-menu').click();
+
+    await ask.tap();
+    const dialog = page.locator('dialog.ask-dialog');
+    await dialog.waitFor();
+    if (process.env.KARMAX_SHOTS) await page.screenshot({ path: path.join(process.env.KARMAX_SHOTS, 'ask-phone-dialog.png') });
+    await dialog.locator('textarea').fill('Asked from my phone');
+    await dialog.locator('button[value="submit"]').tap();
+    await expect.poll(async () => (await store.getProject((await allTasks())
+      .find((task) => task.params?.prompt === 'Asked from my phone')?.projectId ?? ''))?.name, { timeout: 15_000 }).toBe('Co-ordinator');
+    expect(errors).toEqual([]);
+    await context.close();
   });
 
   it('Ask takes dictation like any message box: a mic in it, and its shortcut works inside the dialog', async () => {
@@ -155,6 +208,10 @@ describe('a task without a computer, in the console', () => {
     const mic = dialog.locator('[data-mic]');
     await mic.waitFor();
     await mic.click();
+    // Listening, the box says how to stop by voice; so does the mic's tooltip.
+    expect(await dialog.locator('textarea').getAttribute('placeholder')).toBe('Listening… say “stop listening” to end');
+    expect(await mic.getAttribute('title')).toMatch(/· or say “stop listening”$/);
+    if (process.env.KARMAX_SHOTS) await dialog.screenshot({ path: path.join(process.env.KARMAX_SHOTS, 'ask-listening.png') });
     await page.evaluate(() => (globalThis as any).__speech.at(-1).onresult({ results: [Object.assign([{ transcript: 'what waits on me' }], { isFinal: true })] }));
     expect(await dialog.locator('textarea').inputValue()).toBe('what waits on me');
     if (process.env.KARMAX_SHOTS) await dialog.screenshot({ path: path.join(process.env.KARMAX_SHOTS, 'ask-dictation.png') });
@@ -165,6 +222,10 @@ describe('a task without a computer, in the console', () => {
     await page.keyboard.press('ControlOrMeta+Shift+S');
     await expect.poll(() => mic.getAttribute('aria-pressed')).toBe('true');
     expect(await page.evaluate(() => (globalThis as any).__speech.length)).toBe(2);
+    // Saying the stop ends it here too, and is not typed.
+    await page.evaluate(() => (globalThis as any).__speech.at(-1).onresult({ results: [Object.assign([{ transcript: 'today stop listening' }], { isFinal: true })] }));
+    expect(await mic.getAttribute('aria-pressed')).toBe('false');
+    expect(await dialog.locator('textarea').inputValue()).toBe('what waits on me today');
     expect(errors).toEqual([]);
     await context.close();
   });

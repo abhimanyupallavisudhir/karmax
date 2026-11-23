@@ -165,7 +165,7 @@ describe('the organization\'s OpenRouter key', () => {
     f.spend(2.5); // the whole trial
     const spent = await includedModelOutOfCredit(f.store, f.broker, f.organization.id, { taskId: 'task_1' }, T + 2000);
     expect(spent).toBeInstanceOf(ComputeCreditExhausted);
-    expect(spent!.message).toMatch(/^Out of compute: your \$5\.00 free trial is used up/);
+    expect(spent!.message).toMatch(/^Out of credits: your \$5\.00 free trial is used up/);
     expect(keys.get('hash1')!.limit).toBe(2.5);
     await expect(includedModelKey(f.store, f.broker, f.organization.id, T + 3000)).rejects.toBeInstanceOf(ComputeCreditExhausted);
   });
@@ -321,7 +321,7 @@ describe('a turn on the included model', () => {
       for (const key of keys.values()) key.usage += 2.5; // all of the trial
       throw new Error('OpenRouter: 402 Key limit exceeded');
     });
-    await expect(f.run()).rejects.toMatchObject({ type: 'world-capacity', message: expect.stringMatching(/^Out of compute: your \$5\.00 free trial is used up/) });
+    await expect(f.run()).rejects.toMatchObject({ type: 'world-capacity', message: expect.stringMatching(/^Out of credits: your \$5\.00 free trial is used up/) });
     // And the next turn does not start.
     await expect(f.run()).rejects.toMatchObject({ type: 'world-capacity' });
   });

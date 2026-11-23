@@ -40,9 +40,9 @@ function label(item: InboxItem, status?: string): string {
     : `${subject.serviceName} at ${Math.floor((subject.used / subject.limit) * 100)}% of its limit${subject.level === 95 ? ' — upgrade now' : ''}`;
   if (subject?.kind === 'compute') {
     const n = Number(subject.computers || 0), computers = `${n} parked computer${n === 1 ? '' : 's'}`;
-    if (subject.stage === 'hibernated') return `Out of compute — ${computers} hibernated`;
-    if (subject.hibernateAt) return `Out of compute — ${computers} hibernate ${day(subject.hibernateAt)}`;
-    return subject.trial ? 'Free trial over — choose a plan' : 'Out of compute';
+    if (subject.stage === 'hibernated') return `Out of credits — ${computers} hibernated`;
+    if (subject.hibernateAt) return `Out of credits — ${computers} hibernate ${day(subject.hibernateAt)}`;
+    return subject.trial ? 'Free trial over — choose a plan' : 'Out of credits — add more';
   }
   if (subject?.kind === 'storage') return subject.stage === 'deleted' ? 'Stored data deleted to fit the limit'
     : `Over the storage limit — free space by ${day(subject.deleteAt)}`;

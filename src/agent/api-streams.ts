@@ -228,18 +228,21 @@ export async function readChatCompletion(res: Response, onText: TextListener, pr
   let usage: unknown;
   let id: string | undefined;
   let model: string | undefined;
+  let served: string | undefined;
   const calls: Array<{ id?: string; type: 'function'; function: { name: string; arguments: string } }> = [];
   for await (const { data } of serverSentEvents(body.events)) {
     if (data === '[DONE]') {
       if (!finish) break;
       const message: Record<string, unknown> = { role: 'assistant', content: content || null };
       if (calls.length) message.tool_calls = calls.filter(Boolean);
-      return { id, model, choices: [{ index: 0, message, finish_reason: finish }], ...(usage ? { usage } : {}) };
+      return { id, model, ...(served ? { provider: served } : {}), choices: [{ index: 0, message, finish_reason: finish }], ...(usage ? { usage } : {}) };
     }
     const chunk = JSON.parse(data);
     if (chunk.error) throw providerErrorFromMessage('opencode', `${provider} stream error: ${JSON.stringify(chunk.error).slice(0, 500)}`, 'structured');
     id ??= chunk.id;
     model ??= chunk.model;
+    // OpenRouter names the provider that served the request.
+    if (typeof chunk.provider === 'string') served ??= chunk.provider;
     if (chunk.usage) usage = chunk.usage;
     const choice = chunk.choices?.[0];
     if (!choice) continue;
