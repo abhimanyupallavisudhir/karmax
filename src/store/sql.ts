@@ -86,7 +86,7 @@ class AsyncDatabase implements SqlDatabase {
   private async access<T>(operation: () => Promise<T>): Promise<T> {
     const scope = this.scope.getStore();
     if (this.closed || (this.closing && !scope?.active)) throw new Error('database is closed');
-    if (scope && !scope.active) throw Error('transaction is already closed');
+    if (scope && !scope.active) throw Error('transaction is already closed: a query started inside it ran after it ended (something it started was not awaited; await it, or start it once the transaction commits: afterCommit)');
     if (this.postgres || scope) return operation();
     return this.enqueue(operation);
   }

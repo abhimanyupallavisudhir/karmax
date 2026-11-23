@@ -15,6 +15,9 @@ import { AccountErasureService } from '../src/privacy/account-erasure.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
+import { GitHubAppService, GITHUB_APP_CLIENT_SECRET_HANDLE } from '../src/integrations/github-app.js';
+import { ProjectGithubAccess } from '../src/integrations/project-github-access.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 const url = process.env.KARMAX_TEST_POSTGRES_URL;
 const integration = url ? describe : describe.skip;
@@ -76,6 +79,35 @@ integration('PostgreSQL cutover', () => {
     } finally {
       await reader.query('ROLLBACK');
       reader.release();
+    }
+  });
+
+  // tavya-error cb701a5d3ee7fe2e (2026-11-23): every GitHub account link on
+  // tavya.io failed with "transaction callback returned with pending queries".
+  // The link told ProjectGithubAccess from inside its transaction, and the
+  // organizations lookup it started ran on that transaction's connection.
+  it('links a GitHub account while project access watches account changes', async () => {
+    const store = await Store.create(url!);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pg-github-link-'));
+    const access = new ProjectGithubAccess({ store, githubApp: {} as never, debounceMs: 60_000 });
+    try {
+      const broker = new CredentialBroker(new Vault(dir));
+      await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret', INSTALLATION_SCOPE);
+      const fetch = (async (input: string | URL | Request) => {
+        const { pathname } = new URL(String(input));
+        if (pathname === '/login/oauth/access_token') return Response.json({ access_token: 'user-token' });
+        if (pathname === '/user') return Response.json({ id: 42, login: 'octocat' });
+        return new Response('not found', { status: 404 });
+      }) as typeof globalThis.fetch;
+      const app = await GitHubAppService.create(store, broker, { clientId: 'Iv1.client', fetch });
+      await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
+      access.watch(app);
+      await expect(app.authorizeUser('owner', 'oauth-code')).resolves.toMatchObject({ id: '42', login: 'octocat' });
+      expect(await app.listUserAccounts('owner')).toEqual([expect.objectContaining({ id: '42', login: 'octocat', active: true })]);
+    } finally {
+      access.stop();
+      await store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 

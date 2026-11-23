@@ -57,7 +57,9 @@ function databaseFailure(error: unknown): unknown {
   return unreachable(error) ? new DatabaseUnavailableError(error) : error;
 }
 
-interface TransactionScope { client: PoolClient; active: boolean; pending: number; failure?: unknown }
+/** `running`: the statements in flight, so a callback that returns under one
+ * of them can be told which (`transaction`). */
+interface TransactionScope { client: PoolClient; active: boolean; pending: number; running: Set<{ sql: string }>; failure?: unknown }
 
 /** Connections per process (`KARMAX_STORE_POOL_SIZE`, default 8). Transactions
  * use all but one (`sql.ts`). It was 4 until the 2026-10 load test: once the
@@ -114,7 +116,7 @@ export class AsyncPostgres {
 
   async result<T extends QueryResultRow = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<Pick<QueryResult<T>, 'rows' | 'rowCount'>> {
     const scope = this.transactionScope.getStore();
-    if (scope && !scope.active) throw new Error('transaction is already closed');
+    if (scope && !scope.active) throw new Error('transaction is already closed: a query started inside it ran after it ended (something it started was not awaited; await it, or start it once the transaction commits: afterCommit)');
     const statements = splitStatements(sql);
     if (statements.length > 1) throw new Error('query() accepts one statement; use exec() for a batch');
     const command = sql.replace(/^(?:\s|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)+/, '');
@@ -140,7 +142,9 @@ export class AsyncPostgres {
     if (scope) {
       if (scope.pending >= this.maxPending) throw new DatabaseCapacityError();
       scope.pending++;
-      try { return await execute(); } finally { scope.pending--; }
+      const running = { sql };
+      scope.running.add(running);
+      try { return await execute(); } finally { scope.pending--; scope.running.delete(running); }
     }
     return this.admitted(execute);
   }
@@ -157,12 +161,17 @@ export class AsyncPostgres {
     }
     return this.admitted(async () => {
       const client = await this.pool.connect().catch(error => { throw databaseFailure(error); });
-      const scope: TransactionScope = { client, active: true, pending: 0 };
+      const scope: TransactionScope = { client, active: true, pending: 0, running: new Set() };
       let broken: Error | undefined;
       try {
         await client.query('BEGIN');
         const result = await this.transactionScope.run(scope, operation);
-        if (scope.pending) throw new Error('transaction callback returned with pending queries');
+        // Work the callback started and did not await (a listener told of the
+        // change, a `void` call) runs on this transaction's connection: it
+        // can neither commit under it nor be left to outlive it.
+        if (scope.pending) throw new Error(`transaction callback returned with pending queries: ${[...scope.running]
+          .map(({ sql }) => sql.replace(/\s+/g, ' ').trim().slice(0, 120)).join('; ')}. Something it started was not `
+          + 'awaited; await it, or start it once the transaction commits (afterCommit)');
         if (scope.failure) throw scope.failure;
         scope.active = false;
         await client.query('COMMIT');

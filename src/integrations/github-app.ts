@@ -635,10 +635,10 @@ export class GitHubAppService {
     return () => this.accountListeners.delete(listener);
   }
 
+  /** Listeners hear of a link or removal once it is committed, never inside
+   * the transaction that saved it (`Store.afterCommit`). */
   private accountsChanged(userId: string): void {
-    for (const listener of this.accountListeners) {
-      try { void Promise.resolve(listener(userId)).catch(() => undefined); } catch { /* a listener never fails the link */ }
-    }
+    for (const listener of this.accountListeners) this.store.afterCommit(() => listener(userId));
   }
 
   /** Public account data needed for the commit byline. A stable GitHub noreply
