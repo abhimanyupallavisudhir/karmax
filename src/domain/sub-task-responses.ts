@@ -8,8 +8,10 @@ import type { SubTaskAction } from './types.js';
  * every one is accepted (undefined).
  */
 export function applicableSubTaskActions(view: {
-  stage: string; status: string; waitingFor?: { kind: string }; actions?: Array<{ name: string }>;
+  stage: string; status: string; waitingFor?: { kind: string; reviewerTask?: string }; actions?: Array<{ name: string }>;
 }): SubTaskAction[] | undefined {
+  // A task of its own waiting for its live reviewer (ConfirmLayer.live).
+  if (view.waitingFor?.kind === 'confirm' && view.waitingFor.reviewerTask) return ['confirm', 'comment', 'cancel'];
   if (view.waitingFor?.kind !== 'parent') return undefined;
   const offered = new Set((view.actions ?? []).map((action) => action.name));
   if (view.stage === 'escalated' || view.status === 'blocked') return ['retry', 'comment', 'cancel',

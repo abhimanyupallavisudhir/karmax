@@ -2799,7 +2799,10 @@ function wireRouteKind(box) {
 function cfLayerHtml(f, layer, agentDefault) {
   const isAgent = layer.kind === 'agent';
   const audience = (layer.audience?.length ? layer.audience : ['@creator']).join(', ');
-  return `<div class="cf-layer" data-kind="${esc(layer.kind)}">
+  // An agent asked itself while its task works, and forked after (ConfirmLayer.live).
+  const live = isAgent && layer.live && layer.resumeFrom?.taskId;
+  const liveAttr = live ? ` data-live="${esc(layer.resumeFrom.taskId)}" title="That task's agent reviews this itself while it still works; a fork of it reviews once it has finished."` : '';
+  return `<div class="cf-layer" data-kind="${esc(layer.kind)}"${liveAttr}>
     <div class="cf-layer-head route-row">
       <span class="cf-layer-num"></span>
       <select class="cf-kind" aria-label="Review step" hidden>${[['human', 'Human confirms'], ['agent', 'Agent reviews']].map(([k, l]) => `<option value="${k}" ${k === layer.kind ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>${routeKindSegmented(layer.kind, 'Review step', 'A person confirms, or an agent reviews')}
@@ -2849,7 +2852,7 @@ function normAuthority(a) {
 const normLayers = (ls) =>
   (ls || []).map((l) =>
     l.kind === 'agent'
-      ? { kind: 'agent', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: agentInstructions(l.prompt), resume: l.resumeFrom || null, mcpConnections: l.mcpConnections, authority: normAuthority(l.authority), maxRevisions: l.maxRevisions ?? null }
+      ? { kind: 'agent', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: agentInstructions(l.prompt), resume: l.resumeFrom || null, mcpConnections: l.mcpConnections, authority: normAuthority(l.authority), maxRevisions: l.maxRevisions ?? null, live: !!(l.live && l.resumeFrom?.taskId) }
       : { kind: 'human', audience: l.audience?.length ? [...l.audience] : ['@creator'] },
   );
 
@@ -2861,7 +2864,10 @@ function readConfirmerLayers(box) {
       return { kind: 'human', audience: audience.length ? audience : ['@creator'] };
     }
     const limit = row.querySelector('.cf-max-revisions-input')?.value.trim();
-    return { kind: 'agent', ...readAgentBlock(row.querySelector('.agent-field')),
+    const spec = readAgentBlock(row.querySelector('.agent-field'));
+    return { kind: 'agent', ...spec,
+      // Still the same task's agent: still asked itself while it works.
+      ...(row.dataset.live && spec.resumeFrom?.taskId === row.dataset.live ? { live: true } : {}),
       ...(limit && Number.isInteger(Number(limit)) && Number(limit) >= 0 ? { maxRevisions: Number(limit) } : {}) };
   });
 }

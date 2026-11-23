@@ -1852,6 +1852,12 @@ export interface ConfirmLayer extends Partial<AgentSpec> {
    * back ("revise") with no person speaking before the Review goes to the
    * task's people instead. Absent ⇒ no limit. */
   maxRevisions?: number;
+  /** Agent layers forking another task's agent (`resumeFrom.taskId`): while
+   * that task is still working (in Do), its agent itself reviews, as a parent
+   * reviews its sub-task (asked in its conversation, deciding with
+   * respond_to_sub_task); a fork of it reviews once it has left Do. The default
+   * Review of a task an agent creates (software-dev; other workflows fork). */
+  live?: boolean;
   /** Agent layers: the review-request message template sent each time the task
    *  reaches Review — optional instructions/guidance ("ensure X, Y and Z"), with
    *  {{prompt}} / {{response}} placeholders for the task prompt and the Do agent's
@@ -2071,6 +2077,9 @@ export interface TaskView {
      * higher-priority work), `quota` (none has quota left until a reset),
      * `slot` (every one with quota runs all it may), `login` (none usable). */
     reason?: 'input' | 'error' | 'authorization' | 'merge' | AccountWaitReason;
+    /** `confirm`: the task whose agent reviews this one live (ConfirmLayer.live);
+     * only it may answer, with respond_to_sub_task. */
+    reviewerTask?: string;
     /** Durable jobs this wait watches (a `job` wait, or an ask that also waits
      * on jobs): their world must keep running, or parking it freezes them. */
     jobs?: string[] };

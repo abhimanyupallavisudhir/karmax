@@ -42,7 +42,7 @@ import {
 import { templateContent, templateName, templateParams, templateAuthorization } from '../domain/task-templates.js';
 import { derivedTaskTitle, isDerivedTaskTitle } from '../domain/task-title.js';
 import { landsByPushOnTavya } from '../domain/hosted-repository.js';
-import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget, type Avatar, type InheritedConversation, type TaskCreatedVia, type TaskCreator } from '../domain/types.js';
+import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget, type Avatar, type InheritedConversation, type TaskCreatedVia, type TaskCreator, type ConfirmConfig } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries,
   normalizeFollowUpTriggers, validateFollowUpTriggers, followUpTriggerSummary, followUpsAfterFiring, taskUnstarted, type FollowUpTrigger, type TaskTrigger, isTrigger } from '../domain/triggers.js';
 import { STORE_TASKS, runsOnInstall, storeTaskNeeds, storeTaskRepeatable, takenFromStore, type StoreNeed, type StoreTask } from '../domain/task-store.js';
@@ -1092,6 +1092,22 @@ export class KarmaxApi {
     return creator;
   }
 
+  /** The Review of a task the calling agent creates: that agent (ConfirmLayer.live),
+   * forked with its own harness, model and effort when it no longer works.
+   * Undefined for a person, or an agent whose task is gone. */
+  private async creatorReview(caller: ScopedToken): Promise<ConfirmConfig | undefined> {
+    const creator = creatorRefOf(caller);
+    if (creator?.kind !== 'task-agent') return undefined;
+    const source = await this.deps.store.getTask(creator.taskId);
+    if (!source) return undefined;
+    const key = caller.participant ?? creator.role;
+    const spec = source.lastView?.participants?.find((participant) => participant.key === key)?.spec
+      ?? (source.params?.[`agent:${key}`] as Partial<AgentSpec> | undefined);
+    const provider = spec?.provider ?? (source.lastView?.agentTurn?.role === key ? source.lastView.agentTurn.provider : undefined);
+    return { layers: [{ kind: 'agent', ...(provider ? { provider } : {}), ...(spec?.model ? { model: spec.model } : {}),
+      ...(spec?.effort ? { effort: spec.effort } : {}), resumeFrom: { taskId: source.id, role: key }, live: true }] };
+  }
+
   /** Who created `task` and with what, as the reader may see it
    * (TaskView.creator): the task whose agent — or the Avatār — created it is
    * named only to a reader who may read that task. */
@@ -1777,6 +1793,13 @@ export class KarmaxApi {
     if (heldBack.length) authorization = { ...authorization, capabilities: withoutCapabilities(authorization.capabilities, heldBack) };
     // A `resumeFrom` pointer reads another task's conversation — authorize it
     // against that task's project before anything is created.
+    // A task an agent creates is reviewed by that agent — itself while it
+    // works, a fork of it after (ConfirmLayer.live) — unless it names its own
+    // Review route: the project's Task defaults are written for people's tasks.
+    if (!args.createdBy && !Object.hasOwn(taskOverrides, 'confirm') && manifest.params.some((field) => field.name === 'confirm')) {
+      const review = await this.creatorReview(caller);
+      if (review) taskOverrides.confirm = review as unknown as ValueMap[string];
+    }
     (await this.validateAndAuthorizeResumeSources(token, taskOverrides, args.projectId));
     (await this.authorizeDependencies(token, taskOverrides));
     (await this.prepareForkWorld(args.projectId, taskOverrides));
@@ -7780,7 +7803,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       throw new CapabilityError('confirming a Review gate needs review:approve (a maintainer-level authorization); an agent reviewing a task records its verdict with confirm_decision');
     // A Reviewer agent is deciding: Confirm would approve the step after it
     // unseen. Wait for its verdict, or stop it and decide.
-    if (signal === SIG.confirm && heldView?.stage === 'review' && (heldView.waitingFor?.kind === 'confirm'
+    if (signal === SIG.confirm && heldView?.stage === 'review' && ((heldView.waitingFor?.kind === 'confirm' && !heldView.waitingFor.reviewerTask)
       || heldView.participants?.some((participant) => participant.role === 'confirm' && participant.state !== 'idle')))
       throw new ValidationError('a Reviewer agent is reviewing this proposal; wait for its verdict, or stop it to decide yourself');
     if (signal === SIG.openPr && heldOrigin && heldOrigin !== 'do')

@@ -372,6 +372,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         'Create a new task on a project task list. It is queued and started immediately unless `draft` is true. '
         + '`params` carries the full task-form field values for the chosen workflow (including `triggers`, so a draft can be armed on a schedule/dependency/event); '
         + '`tags` accepts names or `a/b` paths and creates missing ones. '
+        + 'Created by a task\'s agent, its Review comes to that agent (itself while it works, a fork of it after) unless `params.confirm` routes it otherwise. '
         + 'To inline wiki context into the new task, pass wikiContext: an array of `[[proj:…]]`/`[[org:…]]` references — a page ([[proj:guides/deploy]]), a whole label ([[proj:tag:security]]), or a folder ([[proj:runbooks/*]]). Omit it to inherit the default `default`-labelled pages; pass [] to inline none. '
         + CREATE_TASK_GRANTS,
       inputSchema: {

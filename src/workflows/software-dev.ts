@@ -317,6 +317,9 @@ export interface SoftwareDevInput extends TaskInput {
    *  awaiting its response, so an unanswered raise never dead-parks the parent (SPEC
    *  §5.3 "keep prompting"). Overridable so tests don't wait the full interval. */
   subtaskNagMs?: number;
+  /** How often (ms) a Review waiting on a live reviewer task (ConfirmLayer.live)
+   *  checks that it is still working, else a fork of it reviews. Overridable for tests. */
+  liveReviewCheckMs?: number;
   /** Backoff (ms) the task waits in Do before re-prompting an agent whose own in-harness
    *  sub-agents were still running when its turn returned — interruptible by a human
    *  follow-up. Overridable so tests don't wait the full interval. */
@@ -351,6 +354,11 @@ const MAX_INTEGRATION_BOUNCES = 2;
 /** Default re-prompt cadence for a parent holding an unanswered child raise (SPEC §5.3).
  *  Bounds the subtask-wait so an ignored raise re-enters Do instead of parking forever. */
 const DEFAULT_SUBTASK_NAG_MS = 60_000;
+/** A Review asks the agent that created its task while that task works, and a
+ * fork of it reviews once it no longer does (ConfirmLayer.live). */
+const LIVE_CREATOR_REVIEW = 'software-dev-live-creator-review-v1';
+/** How often such a Review checks that its reviewer task still works. */
+const LIVE_REVIEW_CHECK_MS = 5 * 60_000;
 /** How much of a child's last message its parent sees in the raise for a Do
  *  turn that ended without a PR; the rest is in the child's conversation. */
 const PARENT_RAISE_OUTPUT_CHARS = 2_000;
@@ -1205,6 +1213,11 @@ async function softwareDevImpl(
   // `agentQueue` and run, in call order, at the next turn boundary or at once
   // while the task is parked. The main agent keeps `session`/`sessionHome`/`seen`.
   const multiAgent = minor >= 27;
+  /** Agent Review layers may ask another task's working agent (ConfirmLayer.live). */
+  const liveReviews = multiAgent && patched(LIVE_CREATOR_REVIEW);
+  /** The live reviewer this Review waits on, and its answer once given. */
+  let liveReview: { taskId: string; decision?: ParentResponse } | undefined;
+  let liveReviewAsks = 0;
   /** People (`user:<id>`) who spoke to the main agent in what its last turn
    * answered (v1.27). */
   let speakers: string[] = [];
@@ -1982,6 +1995,14 @@ async function softwareDevImpl(
         const reviewer = reviewerKey(gates.slice(0, layerIndex).filter((candidate) => candidate.kind === 'agent').length);
         const revisionBound = multiAgent && layer.kind === 'agent' && layer.maxRevisions !== undefined
           && (automatedRevisions[reviewer] ?? 0) >= layer.maxRevisions;
+        if (layer.kind === 'agent' && !revisionBound && liveReviews && layer.live && layer.resumeFrom?.taskId) {
+          const live = await liveReviewTurn(layer.resumeFrom.taskId, layer.resumeFrom.role ?? MAIN_AGENT, epoch);
+          if (live === 'cancelled') return 'cancelled';
+          if (live === 'do') return 'do';
+          if (live === 'restart') { layerIndex = 0; confirmed = false; continue; }
+          if (live === 'confirm') { layerIndex++; continue; }
+          // 'fork': the reviewer no longer works — a fork of it reviews below.
+        }
         if (layer.kind === 'agent' && !revisionBound) {
           waitingFor = { kind: 'confirm', ...(gateDetail ? { detail: gateDetail } : {}) };
           await publish();
@@ -2334,6 +2355,12 @@ async function softwareDevImpl(
   // Our parent answered a raise. Map its decision onto the SAME flags a human drives
   // (confirm/retry/cancel/follow-up) so the parent is literally our confirmer.
   setHandler(parentResponseSignal, (resp) => {
+    // A task of its own is answered only by the reviewer it waits on, and only
+    // with a verdict on Review; anything else (a late answer) is dropped.
+    if (liveReviews && !input.parentTaskId) {
+      if (liveReview && !liveReview.decision && ['confirm', 'comment', 'cancel'].includes(resp.action)) liveReview.decision = resp;
+      return;
+    }
     if (resp.action === 'open_pr') {
       if (stage === 'escalated' && escalationAction) {
         if (escalationAction === 'openPr') manualEscalationRequested = true;
@@ -3546,6 +3573,70 @@ async function softwareDevImpl(
    *  human makes. Leased + resolve-wrapped like every other role. Returns the verdict,
    *  or undefined if the agent turn failed or declined to decide (caller falls back to
    *  the human gate so nothing is silently auto-confirmed). */
+  /**
+   * A Review step whose reviewer is another task's agent, asked while that task
+   * still works (ConfirmLayer.live) — as a parent reviews its sub-task: one
+   * message in its conversation, and its respond_to_sub_task verdict. A person
+   * may still decide (Confirm, a message to this task's agent). 'fork' when
+   * that task does not work, or stops working before it answers.
+   */
+  async function liveReviewTurn(reviewerTaskId: string, role: string, epoch: number)
+    : Promise<'confirm' | 'do' | 'cancelled' | 'restart' | 'fork'> {
+    const names = await coreChild.liveReviewer(reviewerTaskId, taskId);
+    if (!names.live) return 'fork';
+    const ask: Message = {
+      id: `u-review-${taskId}-${++liveReviewAsks}`, role: 'user', author: `task:${taskId}`, authorLabel: names.task,
+      to: [agentSelector(role)], ts: Date.now(),
+      text: `${names.task} "${input.title}", which you created, is ready for your review.`
+        + `${reviewInfo?.summary ? `\n\n${reviewInfo.summary}` : ''}\n\n`
+        + `Review its work (get_task "${taskId}" shows its branch and changed files), then answer with respond_to_sub_task `
+        + `(child_task_id: "${taskId}"): "confirm" to approve it, "comment" with what to change, or "cancel" to abandon it.`,
+    };
+    try {
+      await getExternalWorkflowHandle(reviewerTaskId).signal(followUpSignal, ask, role);
+    } catch {
+      return 'fork';
+    }
+    liveReview = { taskId: reviewerTaskId };
+    stepConfirmedByPerson = false;
+    status = 'waiting';
+    waitingFor = { kind: 'confirm', reviewerTask: reviewerTaskId, detail: `${names.reviewer} reviews it` };
+    await publish();
+    // A message to this task's own agent ends the Review, as at any Review step.
+    const reviewAskedAt = msgs.length;
+    const answered = () => !!liveReview?.decision || confirmed || cancelled || confirmEpoch !== epoch
+      || mainUnreadSince(reviewAskedAt);
+    let gone = false;
+    while (!(await waitServing(answered, input.liveReviewCheckMs ?? LIVE_REVIEW_CHECK_MS)))
+      if (!(await coreChild.liveReviewer(reviewerTaskId, taskId)).live) { gone = true; break; }
+    const decision = liveReview.decision;
+    liveReview = undefined;
+    waitingFor = undefined;
+    status = 'active';
+    if (cancelled) return 'cancelled';
+    if (confirmEpoch !== epoch) return 'restart';
+    const note = (text: string) => msgs.push({ id: `review-note-${msgs.length}`, role: 'system', to: [], ts: Date.now(), text });
+    if (decision?.action === 'confirm') { note(`${names.reviewer} approved it.`); return 'confirm'; }
+    if (decision?.action === 'cancel') {
+      note(`${names.reviewer} cancelled it${decision.text ? `: ${decision.text}` : '.'}`);
+      cancelled = true;
+      return 'cancelled';
+    }
+    if (decision?.action === 'comment') {
+      msgs.push({ id: `review-${msgs.length}`, role: 'user', author: `task:${reviewerTaskId}`, authorLabel: names.reviewer,
+        ts: Date.now(), text: decision.text || 'Please revise the work.' });
+      reviewedHeads = undefined;
+      return 'do';
+    }
+    // A person approved this step themselves.
+    if (confirmed) { confirmed = false; return 'confirm'; }
+    if (gone) {
+      note(`${names.reviewer} stopped working before it answered, so a fork of its agent reviews.`);
+      return 'fork';
+    }
+    return 'do';
+  }
+
   async function confirmTurn(layer: ConfirmLayer, reviewer?: string): Promise<import('./contract.js').ConfirmDecision | undefined> {
     if (multiAgent && reviewer) {
       // The Reviewer reads the conversation and says what it thinks; its verdict
