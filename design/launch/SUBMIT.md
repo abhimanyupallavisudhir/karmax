@@ -37,7 +37,7 @@ tavya is a task list where every task gets an AI agent (Claude Code, Codex or Op
 ```
 
 **Thumbnail**
-- [thumbnail.png](product-hunt/out/thumbnail.png)
+- [icon-512.png](../../web/brand/royal-gold-arrow/icon-512.png) (square; Product Hunt scales it to 240×240)
 
 **Gallery (upload in this order)**
 - [gallery-1.jpg](product-hunt/out/gallery-1.jpg)
