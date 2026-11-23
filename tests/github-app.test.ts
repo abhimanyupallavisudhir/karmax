@@ -80,6 +80,40 @@ describe('GitHub App integration', () => {
     (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  // tavya-error cb701a5d3ee7fe2e: linking an account told its listeners from
+  // inside the transaction that saved it, so their queries ran on that
+  // transaction (PostgreSQL: "transaction callback returned with pending
+  // queries", and nothing linked). Listeners hear a link once it is committed.
+  it('tells account listeners about a link only after it is committed, outside its transaction', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-listeners-'));
+    const store = (await Store.create(':memory:'));
+    const broker = new CredentialBroker(new Vault(dir));
+    (await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret', INSTALLATION_SCOPE));
+    const fakeFetch = async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/login/oauth/access_token') return Response.json({ access_token: 'user-token' });
+      if (url.pathname === '/user') return Response.json({ id: 42, login: 'octocat' });
+      return new Response('not found', { status: 404 });
+    };
+    const service = (await GitHubAppService.create(store, broker, { clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch }));
+    (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
+    const heard: Array<Promise<string[]>> = [];
+    service.onUserAccountsChanged((userId) => {
+      // What ProjectGitHubAccess does: look the person's organizations up.
+      const read = (async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        return (await store.listOrganizations(userId)).map((organization) => organization.name);
+      })();
+      heard.push(read);
+      return read;
+    });
+    await service.authorizeUser('owner', 'oauth-code');
+    await vi.waitFor(() => expect(heard).toHaveLength(1));
+    await expect(heard[0]).resolves.toEqual(['Acme']);
+    expect(await service.listUserAccounts('owner')).toEqual([expect.objectContaining({ id: '42', login: 'octocat' })]);
+    (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('observes a user repository role without minting a krmax authorization', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-permission-'));
     const store = (await Store.create(':memory:'));

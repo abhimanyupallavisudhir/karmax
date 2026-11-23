@@ -76,6 +76,21 @@ describe.skipIf(!url)('native asynchronous PostgreSQL', () => {
     expect(await db.query('SELECT 1 AS ok')).toEqual([{ ok: 1 }]);
   });
 
+  // tavya-error cb701a5d3ee7fe2e: the error said only "pending queries"; it
+  // names what was still running, and what to do, so the next one is found at once.
+  it('refuses to commit under a query the callback did not await, naming it', async () => {
+    db = new AsyncPostgres(url!);
+    let detached!: Promise<unknown>;
+    const committed = db.transaction(async () => {
+      // Queued behind the awaited statement, as a listener's lookup is.
+      detached = Promise.resolve().then(() => db.query('SELECT pg_sleep(0.2) AS unawaited_lookup'));
+      await db.query('SELECT 1');
+    });
+    await expect(committed).rejects.toThrow(/^transaction callback returned with pending queries: SELECT pg_sleep\(0\.2\) AS unawaited_lookup\. .*afterCommit/);
+    await detached.catch(() => undefined);
+    expect(await db.query('SELECT 1 AS ok')).toEqual([{ ok: 1 }]);
+  });
+
   it('does not report success when the callback catches a PostgreSQL statement error', async () => {
     db = new AsyncPostgres(url!);
     await expect(db.transaction(async () => {

@@ -321,6 +321,13 @@ export class Store {
   /** Entity locks held until the surrounding transaction ends (`SqlDatabase.lock`). */
   lock(...keys: string[]): Promise<void> { return this.db.lock(...keys); }
 
+  /** Run `operation` once the surrounding transaction commits (now, outside
+   * one), outside its context; a rollback drops it. How a service tells
+   * listeners about a change: one told inside the transaction would see
+   * uncommitted state, and every query it started would run on, and outlive,
+   * the transaction's connection (tavya-error cb701a5d3ee7fe2e). */
+  afterCommit(operation: () => unknown): void { this.db.afterCommit(operation); }
+
   /** Lock a task's row for a read-modify-write of it, or of anything only it
    * owns (its view, params, review info, inbox). Nothing on SQLite. */
   async lockTask(taskId: string): Promise<void> {
