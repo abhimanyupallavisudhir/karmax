@@ -9,6 +9,7 @@ import { ANY_PROVIDER, applyComputer, normalizeComputer, LOCAL_WORLD_KINDS, runs
 /** The local world kinds as an SQL list (`NOT IN (…)`): constants, never input. */
 const LOCAL_KINDS_SQL = LOCAL_WORLD_KINDS.map((kind) => `'${kind}'`).join(',');
 import { AdmissionBackpressureError } from '../domain/admission-error.js';
+import { ConflictError, ValidationError } from '../platform/errors.js';
 import { utf8Tail } from '../util/utf8-tail.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { DELEGATION_NO_EXPIRY } from '../domain/delegation-expiry.js';
@@ -1759,8 +1760,13 @@ export class Store {
 
   // ─── Projects ──────────────────────────────────────────────────────────────
 
+  /** A new project. Its `creator` becomes its owner in the same transaction
+   * when they belong to its organization; one whose authority there comes from
+   * a grant above it (the installation's operator) is not made a member, since
+   * project members belong to the project's organization, and needs no
+   * membership to reach it. */
   async createProject(name: string, requested: ProjectConfig = {}, organizationId = 'org_personal',
-    options: { coordinator?: boolean } = {}): Promise<Project> {
+    options: { coordinator?: boolean; creator?: string } = {}): Promise<Project> {
     return this.db.transaction(async () => {
     // Slugs are unique per organization; transfers hold both organizations.
     (await this.lockOrganization(organizationId));
@@ -1782,6 +1788,8 @@ export class Store {
       .run(p.id, organizationId, p.name, p.createdAt, JSON.stringify(p.config), ord, p.folder ?? null, options.coordinator ? 1 : 0));
     // every project gets a default task list
     (await this.createList(p.id, 'Tasks'));
+    if (options.creator && (await this.organizationMembership(organizationId, options.creator)))
+      (await this.setProjectMembership(p.id, { kind: 'user', userId: options.creator }, 'owner'));
     return p;
   
     });
@@ -3748,7 +3756,7 @@ export class Store {
     const team = (await this.lockTeamOrganization(teamId));
     if (!team) throw new Error(`no team ${teamId}`);
     if (!(await this.organizationMembership(team.organizationId, userId)))
-      throw new Error('a team member must belong to the organization');
+      throw new ValidationError('a team member must belong to the organization');
     const joinedAt = Date.now();
     (await this.db.prepare(`INSERT INTO team_memberships (teamId, userId, role, joinedAt) VALUES (?, ?, ?, ?)
       ON CONFLICT(teamId, userId) DO UPDATE SET role=excluded.role`).run(teamId, userId, 'member', joinedAt));
@@ -3783,7 +3791,7 @@ export class Store {
     if (existing?.role === 'owner' && role !== 'owner') {
       const owners = Number(((await this.db.prepare("SELECT COUNT(*) n FROM project_memberships WHERE projectId=? AND role='owner'")
         .get(projectId)) as any).n);
-      if (owners <= 1) throw new Error('a project must retain at least one owner');
+      if (owners <= 1) throw new ConflictError('a project must retain at least one owner');
     }
     const joinedAt = Date.now();
     (await this.db.prepare(`INSERT INTO project_memberships (projectId, principalKey, principal, role, joinedAt)
@@ -3810,7 +3818,7 @@ export class Store {
     if (row?.role === 'owner') {
       const owners = Number(((await this.db.prepare("SELECT COUNT(*) n FROM project_memberships WHERE projectId=? AND role='owner'")
         .get(projectId)) as any).n);
-      if (owners <= 1) throw new Error('a project must retain at least one owner');
+      if (owners <= 1) throw new ConflictError('a project must retain at least one owner');
     }
     (await this.db.prepare('DELETE FROM project_memberships WHERE projectId=? AND principalKey=?').run(projectId, key));
     this.notifyAccessChanged(`project:${projectId}`);
@@ -3829,16 +3837,16 @@ export class Store {
 
   private async assertPrincipalInOrganization(principal: ProjectPrincipalRef, organizationId: string): Promise<void> {
     if (principal.kind === 'user' && !(await this.organizationMembership(organizationId, principal.userId)))
-      throw new Error('user is not a member of the project organization');
+      throw new ValidationError('user is not a member of the project organization');
     if (principal.kind === 'team' && (await this.getTeam(principal.teamId))?.organizationId !== organizationId)
-      throw new Error('team belongs to another organization');
+      throw new ValidationError('team belongs to another organization');
     if (principal.kind === 'organization' && principal.organizationId !== organizationId)
-      throw new Error('organization principal belongs to another organization');
+      throw new ValidationError('organization principal belongs to another organization');
     if (principal.kind === 'avatar' && (await this.getAvatar(principal.avatarId))?.organizationId !== organizationId)
-      throw new Error('avatar principal belongs to another organization');
+      throw new ValidationError('avatar principal belongs to another organization');
     if (principal.kind === 'task-agent') {
       const project = (await this.getProject((await this.getTask(principal.taskId))?.projectId ?? ''));
-      if (project?.organizationId !== organizationId) throw new Error('task agent belongs to another organization');
+      if (project?.organizationId !== organizationId) throw new ValidationError('task agent belongs to another organization');
     }
   }
 
