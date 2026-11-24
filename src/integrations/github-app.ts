@@ -840,9 +840,43 @@ export class GitHubAppService {
     throw new Error('GitHub installation list exceeded the pagination limit');
   }
 
+  /** Every installation some GitHub account the person linked can administer,
+   * their active account's first (a person may link several of their own).
+   * An account whose authorization GitHub revoked is passed over; only when
+   * none can be asked is that an error. */
+  async administeredInstallations(userId: string): Promise<Array<{ id: string; accountLogin: string; accountType: string; githubAccountId?: string }>> {
+    const accounts = (await this.listUserAccounts(userId)).sort((left, right) => Number(right.active) - Number(left.active));
+    if (!accounts.length) return this.connectableInstallations(userId); // a legacy authorization, or none: its error says so
+    const found = new Map<string, { id: string; accountLogin: string; accountType: string; githubAccountId?: string }>();
+    let failure: unknown;
+    let answered = false;
+    for (const account of accounts) {
+      try {
+        for (const installation of await this.connectableInstallations(userId, account.id))
+          if (!found.has(installation.id)) found.set(installation.id, { ...installation, githubAccountId: account.id });
+        answered = true;
+      } catch (error) { failure ??= error; }
+    }
+    if (!answered) throw failure;
+    return [...found.values()];
+  }
+
+  /** Link an installation to an organization once a GitHub account the person
+   * linked can administer it: `installation_id` is a public number anyone can
+   * put in a URL, and on a hosted cell every tenant's installations belong to
+   * the one App. */
   async connectExistingInstallation(organizationId: string, userId: string, installationId: string) {
-    if (!(await this.connectableInstallations(userId)).some(installation => installation.id === installationId))
-      throw new Error('This GitHub installation is not available to this account');
+    if (!(await this.administeredInstallations(userId)).some(installation => installation.id === installationId)) {
+      // One the App does not have (a made-up number, a removed or suspended
+      // installation) is simply unavailable. One it has may be on another
+      // GitHub account of the person's own: say what to do, never whose it is
+      // (anyone may put any installation id in this URL).
+      const installation = /^\d+$/.test(installationId)
+        ? await this.appRequest<GitHubInstallationPayload>(`/app/installations/${installationId}`).catch(() => undefined)
+        : undefined;
+      if (!installation?.account?.login || installation.suspended_at) throw new Error('This GitHub installation is not available to this account');
+      throw new GitHubInstallationNotAdministeredError((await this.listUserAccounts(userId)).map((account) => `@${account.login}`));
+    }
     return this.connectInstallation(organizationId, installationId);
   }
 
@@ -2213,6 +2247,19 @@ function withoutApiLinks(value: unknown): unknown {
     .map(([key, item]) => [key, withoutApiLinks(item)]));
 }
 
+
+/** The App is installed on a GitHub account none of the person's linked
+ * accounts administers: often another account of their own, which they can
+ * link by signing in to it (the installation callback asks GitHub for it). */
+export class GitHubInstallationNotAdministeredError extends Error {
+  readonly status = 403;
+  constructor(linked: string[]) {
+    super(`The App was installed on a GitHub account that ${linked.length
+      ? `${linked.join(', ')} ${linked.length > 1 ? 'do' : 'does'} not administer`
+      : 'is not connected to your tavya profile'}. Connect the GitHub account you installed it with (or an owner of that organization), then try again.`);
+    this.name = 'GitHubInstallationNotAdministeredError';
+  }
+}
 
 /** A repository GitHub would not make, said so people know what to do. */
 export class GitHubRepositoryCreationError extends Error {

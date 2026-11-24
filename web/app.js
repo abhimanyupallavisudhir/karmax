@@ -7301,11 +7301,19 @@ function queryMentionsFacet(q, facet) { return new RegExp(`(^|\\s)-?(is|has):[^\
 // A `for:` query asks what waits on a person, wherever it sits: a sub-task or a
 // run that needs a human routes to them, so those facets are not hidden.
 function queryNamesPerson(q) { return /(^|\s)for:\S/i.test(q || ''); }
+// Typed words look for a task wherever it sits, so they lift the default fold:
+// a run of a repeatable task or a sub-task whose title matches is the row wanted.
+// Words are what the server reads as free text (an unknown `key:` too, once the
+// field registry has loaded), not `-word` exclusions.
+function querySearchesText(q) {
+  const words = parseQueryClient(q || '').text?.match(/"[^"]*"|\S+/g) || [];
+  return words.some((word) => !word.startsWith('-') && (S.fields.length || !/^[-!]{0,2}[A-Za-z_#][\w.#-]*:/.test(word)));
+}
 function effectiveQuery(q, facets = ['run', 'subtask']) {
   let s = (q || '').trim();
   if (queryNamesPerson(s) || queryMentionsFacet(s, 'folded')) return s;
   const hidden = facets.filter((facet) => !queryMentionsFacet(s, facet));
-  if (hidden.length === 2) return `${s} -is:folded`.trim();
+  if (hidden.length === 2) return querySearchesText(s) ? s : `${s} -is:folded`.trim();
   for (const facet of hidden) s = `${s} -is:${facet}`.trim();
   return s;
 }

@@ -836,7 +836,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS github_install_states (
         tokenHash TEXT PRIMARY KEY, organizationId TEXT NOT NULL, userId TEXT NOT NULL,
         createdAt INTEGER NOT NULL, expiresAt INTEGER NOT NULL, usedAt INTEGER,
-        returnTo TEXT, githubAccountId TEXT, githubLogin TEXT, selectAccount INTEGER, purpose TEXT
+        returnTo TEXT, githubAccountId TEXT, githubLogin TEXT, selectAccount INTEGER, purpose TEXT, installationId TEXT
       );
       CREATE TABLE IF NOT EXISTS world_instances (
         worldId TEXT NOT NULL, generation INTEGER NOT NULL, handle TEXT NOT NULL,
@@ -1586,6 +1586,8 @@ export class Store {
       (await this.db.exec('ALTER TABLE github_install_states ADD COLUMN selectAccount INTEGER'));
     if (!githubStateCols.some((c) => c.name === 'purpose'))
       (await this.db.exec('ALTER TABLE github_install_states ADD COLUMN purpose TEXT'));
+    if (!githubStateCols.some((c) => c.name === 'installationId'))
+      (await this.db.exec('ALTER TABLE github_install_states ADD COLUMN installationId TEXT'));
     const wikiVersionCols = (await this.db.prepare('PRAGMA table_info(organization_wiki_versions)').all()) as any[];
     if (!wikiVersionCols.some((c) => c.name === 'previousPath'))
       (await this.db.exec('ALTER TABLE organization_wiki_versions ADD COLUMN previousPath TEXT'));
@@ -4023,10 +4025,12 @@ export class Store {
    * callback. The state is consumed atomically before any GitHub API call. */
   /** A one-use token binding a GitHub redirect to the karmax user who started it.
    *  `purpose: 'manifest'` marks the App-creation flow, the only one whose
-   *  callback may configure the installation-wide App (see the gateway). */
+   *  callback may configure the installation-wide App (see the gateway).
+   *  `installationId`: an installation to connect once GitHub has said which
+   *  account the person is signed in to (one they have not linked yet). */
   async createGithubInstallState(organizationId: string, userId: string,
     options: number | { ttlMs?: number; returnTo?: 'profile' | 'installation' | 'connection'; githubAccountId?: string;
-      githubLogin?: string; selectAccount?: boolean; purpose?: 'manifest' } = {}): Promise<string> {
+      githubLogin?: string; selectAccount?: boolean; purpose?: 'manifest'; installationId?: string } = {}): Promise<string> {
     return this.db.transaction(async () => {
 
     if (!(await this.organizationMembership(organizationId, userId))) throw new Error('user is not an organization member');
@@ -4038,19 +4042,20 @@ export class Store {
     const githubLogin = typeof options === 'object' ? options.githubLogin?.trim() : undefined;
     const selectAccount = typeof options === 'object' && options.selectAccount;
     const purpose = typeof options === 'object' && options.purpose === 'manifest' ? 'manifest' : null;
+    const installationId = typeof options === 'object' && /^\d+$/.test(options.installationId ?? '') ? options.installationId! : null;
     (await this.db.prepare('DELETE FROM github_install_states WHERE expiresAt<=? OR usedAt IS NOT NULL').run(now));
     (await this.db.prepare(`INSERT INTO github_install_states
-      (tokenHash, organizationId, userId, createdAt, expiresAt, usedAt, returnTo, githubAccountId, githubLogin, selectAccount, purpose)
-      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`)
+      (tokenHash, organizationId, userId, createdAt, expiresAt, usedAt, returnTo, githubAccountId, githubLogin, selectAccount, purpose, installationId)
+      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`)
       .run(sha256(state), organizationId, userId, now, now + Math.max(60_000, ttlMs), returnTo ?? null,
-        githubAccountId ?? null, githubLogin ?? null, selectAccount ? 1 : 0, purpose));
+        githubAccountId ?? null, githubLogin ?? null, selectAccount ? 1 : 0, purpose, installationId));
     return state;
   
     });
   }
 
   async consumeGithubInstallState(state: string, userId: string): Promise<{ organizationId: string; returnTo?: 'profile' | 'installation' | 'connection';
-    githubAccountId?: string; githubLogin?: string; selectAccount?: boolean; purpose?: 'manifest' } | undefined> {
+    githubAccountId?: string; githubLogin?: string; selectAccount?: boolean; purpose?: 'manifest'; installationId?: string } | undefined> {
     return this.db.transaction(async () => {
 
     const hash = sha256(state);
@@ -4058,7 +4063,7 @@ export class Store {
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
       // One-time: a concurrent consumer waits on the row, then sees it used.
-      const row = (await this.db.prepare(`SELECT organizationId, userId, returnTo, githubAccountId, githubLogin, selectAccount, purpose FROM github_install_states
+      const row = (await this.db.prepare(`SELECT organizationId, userId, returnTo, githubAccountId, githubLogin, selectAccount, purpose, installationId FROM github_install_states
         WHERE tokenHash=? AND usedAt IS NULL AND expiresAt>?${this.forUpdate}`).get(hash, now)) as any;
       if (!row || row.userId !== userId) {
         (await this.db.exec('ROLLBACK'));
@@ -4075,6 +4080,7 @@ export class Store {
         ...(row.githubLogin ? { githubLogin: String(row.githubLogin) } : {}),
         ...(row.selectAccount ? { selectAccount: true } : {}),
         ...(row.purpose === 'manifest' ? { purpose: 'manifest' as const } : {}),
+        ...(row.installationId ? { installationId: String(row.installationId) } : {}),
       };
     } catch (error) {
       (await this.db.exec('ROLLBACK'));

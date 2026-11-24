@@ -10,8 +10,8 @@ const fn = (name) => { const start = src.search(new RegExp(`^(?:async )?function
 const constant = (name) => { const start = src.search(new RegExp(`^const ${name} =`, 'm')); assert.ok(start >= 0, name); return src.slice(start, src.indexOf('\n};', start) + 3).replace(/^const /, 'var '); };
 
 test('lists fold sub-tasks and runs except those that need you; archived is never hidden implicitly', () => {
-  const ctx = vm.createContext({});
-  vm.runInContext(['queryMentionsFacet', 'queryNamesPerson', 'effectiveQuery'].map(fn).join('\n'), ctx);
+  const ctx = vm.createContext({ S: { fields: [{ key: 'status' }, { key: 'is' }, { key: 'tag', aliases: ['label'] }] } });
+  vm.runInContext(['queryMentionsFacet', 'queryNamesPerson', 'parseQueryClient', 'querySearchesText', 'effectiveQuery'].map(fn).join('\n'), ctx);
   assert.equal(ctx.effectiveQuery('for:me -is:archived'), 'for:me -is:archived');
   assert.equal(ctx.effectiveQuery('for:"Ana Lima" status:waiting'), 'for:"Ana Lima" status:waiting');
   assert.equal(ctx.effectiveQuery(''), '-is:folded', 'the empty query includes archived tasks');
@@ -20,6 +20,13 @@ test('lists fold sub-tasks and runs except those that need you; archived is neve
   assert.equal(ctx.effectiveQuery('is:subtask'), 'is:subtask -is:run', 'asking for sub-tasks shows them all');
   assert.equal(ctx.effectiveQuery('is:folded'), 'is:folded');
   assert.equal(ctx.effectiveQuery('x', ['run']), 'x -is:run', 'the task picker hides runs only');
+  // Typed words look for a task wherever it sits: a run of a repeatable task
+  // ("Fix: Reported: …") or a sub-task whose title matches is the row wanted.
+  assert.equal(ctx.effectiveQuery('FIx:'), 'FIx:', 'an unknown key: is words, as on the server');
+  assert.equal(ctx.effectiveQuery('-is:archived oauth callback'), '-is:archived oauth callback');
+  assert.equal(ctx.effectiveQuery('"pending queries" status:active'), '"pending queries" status:active');
+  assert.equal(ctx.effectiveQuery('status:active -smoke'), 'status:active -smoke -is:folded', 'excluding a word is not looking for one');
+  assert.equal(ctx.effectiveQuery('label:bug'), 'label:bug -is:folded');
 });
 
 test('the home project filter is one project: clause in the query', () => {

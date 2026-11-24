@@ -127,7 +127,7 @@ import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCook
 import type { RemoteAccessController } from '../remote/access.js';
 import { GithubEvents } from '../integrations/github-events.js';
 import { CHAT_CREDENTIALS } from '../integrations/chat-platforms.js';
-import { GITHUB_APP_PUBLIC_URL_KEY,
+import { GITHUB_APP_PUBLIC_URL_KEY, GitHubInstallationNotAdministeredError,
   type GithubVaultPushEvent } from '../integrations/github-app.js';
 import { scanProjectResources } from '../world/resource-scan.js';
 import { credentialResource, resourceDriverCatalog, resourceSecretHandle, snapshotResource } from '../domain/resource-drivers.js';
@@ -2319,7 +2319,9 @@ export class Gateway {
       try {
         const githubIdentity = await this.deps.githubApp.authorizeUser(identity.user.id, code, (await this.githubPublicUrl(req)), {
           expectedAccountId: pending.githubAccountId,
-          makeActive: pending.selectAccount || !pending.githubAccountId,
+          // Linked to vouch for an installation, an account does not take over
+          // as the one the person works as (the first one linked still does).
+          makeActive: !pending.installationId && (pending.selectAccount || !pending.githubAccountId),
         });
         await this.saveGithubIdentity(identity.user.id, githubIdentity);
         const activeAccountId = (await this.deps.githubApp.activeUserAccountId(identity.user.id));
@@ -2327,6 +2329,15 @@ export class Gateway {
           const { GitProfiles, userGitScope } = await import('../autonomy/git-profiles.js');
           (await new GitProfiles(this.deps.store, this.deps.broker, undefined, userGitScope(identity.user.id))
             .setActiveGithub(activeAccountId));
+        }
+        if (pending.installationId) {
+          // Back from confirming the account an installation was made with (the installation callback).
+          await this.deps.githubApp.connectExistingInstallation(pending.organizationId, identity.user.id, pending.installationId);
+          const destination = pending.returnTo === 'profile'
+            ? (await userProfilePath(this.deps.store, pending.organizationId))
+            : (await organizationSettingsPath(this.deps.store, pending.organizationId));
+          res.writeHead(303, { location: `${destination}?github=connected&organizationId=${encodeURIComponent(pending.organizationId)}` });
+          return void res.end();
         }
         if (pending.returnTo === 'connection') {
           // Started from a task's Connect button: its pending GitHub connections finish now.
@@ -2365,7 +2376,19 @@ export class Gateway {
         // one only when this person can administer it on GitHub.
         const verification = (await this.deps.githubApp.status(identity.user.id));
         if (verification.userAuthorized) {
-          await this.deps.githubApp.connectExistingInstallation(pending.organizationId, identity.user.id, installationId);
+          try { await this.deps.githubApp.connectExistingInstallation(pending.organizationId, identity.user.id, installationId); }
+          catch (error) {
+            if (!(error instanceof GitHubInstallationNotAdministeredError) || !verification.oauthConfigured) throw error;
+            // Installed with a GitHub account the person has not linked (often
+            // another of their own): GitHub says which account they are
+            // signed in to, that account is linked, and the installation is
+            // connected if it administers it (the OAuth callback).
+            const oauthState = (await this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id,
+              { returnTo: pending.returnTo === 'profile' ? 'profile' : 'installation', selectAccount: true, installationId }));
+            res.writeHead(303, { location: await this.deps.githubApp.userAuthorizationUrl(oauthState, (await this.githubPublicUrl(req)),
+              { selectAccount: true }) });
+            return void res.end();
+          }
         } else if (verification.oauthConfigured) {
           // Verify through GitHub first; they then pick the installation they just made.
           const oauthState = (await this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id,
@@ -3973,7 +3996,7 @@ export class Gateway {
         };
         if (!status.userAuthorized && status.oauthConfigured) return authorize();
         try {
-          const installations = status.userAuthorized ? await githubApp.connectableInstallations(subject.userId) : [];
+          const installations = status.userAuthorized ? await githubApp.administeredInstallations(subject.userId) : [];
           const login = status.userAuthorized
             ? (await githubApp.listUserAccounts(subject.userId).catch(() => [])).find((account) => account.active)?.login : undefined;
           return this.json(res, 200, { url: await githubApp.installationUrl(state), installations, canAuthorize: status.oauthConfigured,
