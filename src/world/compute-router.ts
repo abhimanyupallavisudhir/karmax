@@ -257,6 +257,16 @@ export class ComputeRouter {
     return { ...rankComputeOptions(needs, await this.options(organizationId, needs, task), prefer), ...(task ? { taskId: task.taskId } : {}) };
   }
 
+  /** Why `provider`'s account can never be the world of a task that needs
+   * `more` (its project's data from tavya, a disk that holds it), however its
+   * Computer is sized; undefined when it can, or is not one this organization
+   * reaches. */
+  async cannotServe(organizationId: string, provider: string, more: Pick<ComputeNeeds, 'reachesTavya' | 'holdsData'>): Promise<string | undefined> {
+    if (!more.reachesTavya && !more.holdsData) return undefined;
+    const option = (await this.options(organizationId, more)).find((candidate) => candidate.provider === provider);
+    return option ? unfit(more, option) : undefined;
+  }
+
   /** Remember that an account refused for capacity, so the next routing tries it last. */
   async noteFull(organizationId: string, candidate: ComputeCandidate, reason: string): Promise<void> {
     const scope = candidate.funding === 'managed' ? MANAGED_COMPUTE : organizationId;

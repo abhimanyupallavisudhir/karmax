@@ -473,12 +473,12 @@ describe('createWorld with provider "Any"', () => {
 // reset by peer`, since such a sandbox never reaches tavya, and was reported
 // as tavya's own error.
 describe('a world that must reach tavya for its project\'s data', () => {
-  async function activities(withData: boolean) {
+  async function activities(withData: boolean, projectProvider = 'any') {
     const f = await fixture({ plan: 'team' });
     await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'daytona', apiKey: 'dtn' });
     await f.store.setWorldProviderConnectionLimits(MANAGED_COMPUTE, 'daytona', { cpu: 4, network: 'basic', checkedAt: Date.now() });
     await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'aws', apiKey: 'AKIA1234567890ABCDEF:secretvalue' });
-    const project = await f.store.createProject('Data', { worldProvider: 'any' }, f.organization.id);
+    const project = await f.store.createProject('Data', { worldProvider: projectProvider }, f.organization.id);
     if (withData) {
       const managed = await new StorageLocationService(f.store, new LocalObjectStore(path.join(f.dir, 'objects')), f.broker)
         .ensureManaged(f.organization.id);
@@ -510,6 +510,17 @@ describe('a world that must reach tavya for its project\'s data', () => {
     expect(isComputerChoiceEscalation(`Activity task failed → ${failure.message}`)).toBe(true);
   });
 
+  it('lets an inherited basic-internet default give way to Any (tavya-error e47f1fedac093871)', async () => {
+    const a = await activities(true, 'daytona');
+    const taskId = await a.task({});
+    const handle = await a.core.createWorld({ taskId, base: 'main', kind: 'daytona' });
+    expect(handle.kind).toBe('aws');
+    expect(a.daytona.made).toEqual([]);
+    expect(handle.meta?.routed).toBe("Daytona, the default, can't reach tavya; cheapest that fits");
+    const routed = (await a.store.eventsSince(taskId, 0)).find((event) => event.type === 'world.routed');
+    expect(routed?.payload.gaveWay).toEqual({ provider: 'daytona', reason: expect.stringContaining(BASIC_INTERNET_CANNOT_REACH) });
+  });
+
   it('routes Any past it even when basic internet is enough for the task', async () => {
     const a = await activities(true);
     const taskId = await a.task({ provider: 'any', network: { unrestricted: true, basic: true } });
@@ -534,11 +545,11 @@ describe('a world that must reach tavya for its project\'s data', () => {
 // tavya's own error.
 describe("a world that must hold its project's data", () => {
   const GB = 2 ** 30;
-  async function activities(dataBytes: number) {
+  async function activities(dataBytes: number, projectProvider = 'any') {
     const f = await fixture({ plan: 'team' });
     await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'e2b', apiKey: 'e2b' });
     await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'hetzner', apiKey: 'h', config: { limits: { cpu: 4, memoryMb: 8192, diskGb: 200 } } });
-    const project = await f.store.createProject('Data', { worldProvider: 'any' }, f.organization.id);
+    const project = await f.store.createProject('Data', projectProvider === 'organization' ? {} : { worldProvider: projectProvider }, f.organization.id);
     const managed = await new StorageLocationService(f.store, new LocalObjectStore(path.join(f.dir, 'objects')), f.broker)
       .ensureManaged(f.organization.id);
     const attach = async (name: string, bytes: number, extra: Record<string, unknown> = {}) => {
@@ -571,6 +582,37 @@ describe("a world that must hold its project's data", () => {
     expect(a.e2b.made).toEqual([]);
     // Not reported as tavya's error: another computer is people's to choose.
     expect(isComputerChoiceEscalation(`Activity task failed → ${failure.message}`)).toBe(true);
+  });
+
+  // tavya-error e47f1fedac093871 (rw-data #8 again, 2026-11-24): the task
+  // was a "Repair GitHub workflow" run with no Computer of its own, so it
+  // inherited the organization's E2B, stored before Any existed; the clean
+  // refusal above stopped it on every Retry, and would stop every later run.
+  it('lets an inherited default that cannot hold the data give way to Any, and records why', async () => {
+    for (const where of ['project', 'organization'] as const) {
+      const a = await activities(33_604_728_759, where === 'project' ? 'e2b' : 'organization');
+      if (where === 'organization') await a.store.setOrganizationExecutionPolicy(a.organization.id, { worldProvider: 'e2b' });
+      expect((await a.store.effectiveTaskConfig(a.project, await a.task({}))).worldProvider).toBe('e2b');
+      for (const computer of [{}, { cpu: 4, memoryMb: 8192 }]) {
+        const taskId = await a.task(computer);
+        const handle = await a.core.createWorld({ taskId, base: 'main', kind: 'e2b' });
+        expect(handle.kind).toBe('hetzner');
+        expect(a.e2b.made).toEqual([]);
+        const routed = (await a.store.eventsSince(taskId, 0)).find((event) => event.type === 'world.routed');
+        expect(routed?.payload).toMatchObject({ provider: 'hetzner',
+          rejected: [{ provider: 'e2b', funding: 'managed', reason: 'at most 22 GB disk, and its data needs 40' }],
+          gaveWay: { provider: 'e2b', reason: expect.stringContaining(DISK_CANNOT_HOLD_DATA) } });
+        expect(handle.meta?.routed).toBe(`E2B, the default, ${DISK_CANNOT_HOLD_DATA}; cheapest that fits`);
+        expect(a.hetzner.specs.at(-1).resources).toMatchObject({ diskGb: 40 });
+      }
+    }
+  });
+
+  it('keeps an inherited default that holds the data', async () => {
+    const a = await activities(2 * 2 ** 30, 'e2b');
+    const taskId = await a.task({});
+    expect((await a.core.createWorld({ taskId, base: 'main', kind: 'e2b' })).kind).toBe('e2b');
+    expect((await a.store.eventsSince(taskId, 0)).some((event) => event.type === 'world.routed')).toBe(false);
   });
 
   it('routes Any to an account whose disks hold the data, and asks it for a disk that does', async () => {
