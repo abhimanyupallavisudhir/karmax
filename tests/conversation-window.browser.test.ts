@@ -46,7 +46,7 @@ it('reads the newest messages of a long conversation, and earlier ones when aske
       expect((await earlier.innerText()).trim()).toBe('150 earlier messages');
       expect(await page.locator('#ck-thread [data-conversation-key="message:a249"]').count()).toBe(1);
       // The page putting the thread at its top reads nothing: only a person scrolling does.
-      await page.evaluate(() => { document.getElementById('ck-thread')!.scrollTop = 0; });
+      await page.locator('#ck-thread').evaluate((thread) => { thread.scrollTop = 0; });
       await page.waitForTimeout(300);
       expect(await rows()).toBe(100);
       if (shots) await page.screenshot({ path: path.join(shots, 'conversation-window.png') });
