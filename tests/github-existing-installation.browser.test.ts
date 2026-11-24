@@ -72,7 +72,9 @@ it('connects an already-installed GitHub account from settings and survives relo
     // A permission change while the picker is open must be checked on submit.
     visible = false;
     await page.locator('#github-connect-existing').click();
-    await page.getByText('This GitHub installation is not available to this account', { exact: true }).waitFor();
+    // It still exists for the App, so the person is told what to do, never whose it is.
+    await page.getByText('The App was installed on a GitHub account that @owner does not administer. '
+      + 'Connect the GitHub account you installed it with (or an owner of that organization), then try again.', { exact: true }).waitFor();
     expect(await store.listGitConnections(solab.id)).toEqual([]);
     visible = true;
     listingFails = true;
