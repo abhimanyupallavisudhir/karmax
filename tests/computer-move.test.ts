@@ -9,6 +9,7 @@ import { WorldCheckpointService } from '../src/world/checkpoint.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { LocalObjectStore } from '../src/store/objects.js';
+import { StorageLocationService } from '../src/store/storage-locations.js';
 import { assertInFlightComputerEdit } from '../src/domain/computer.js';
 import { providerFeatures } from '../src/domain/computer-limits.js';
 import { ComputeRouter } from '../src/world/compute-router.js';
@@ -106,11 +107,20 @@ describe('moving a running task to another provider', () => {
 
   /** A task whose Computer says "Any", hibernated on E2B; the organization
    * reaches its own E2B and managed Hetzner and AWS. */
-  async function anyFixture(computer: Record<string, unknown> = {}) {
+  async function anyFixture(computer: Record<string, unknown> = {}, projectProvider = 'any', dataBytes = 0) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'computer-any-'));
     const store = await Store.create(':memory:');
     const organization = await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
-    const project = await store.createProject('Any', { worldProvider: 'any' }, organization.id);
+    const project = await store.createProject('Any', { worldProvider: projectProvider }, organization.id);
+    if (dataBytes) {
+      const managed = await new StorageLocationService(store, new LocalObjectStore(path.join(dir, 'data')), new CredentialBroker(new Vault(dir)))
+        .ensureManaged(organization.id);
+      const attachment = await store.createResourceAttachment({ organizationId: organization.id, projectId: project.id, name: 'raw', driver: 'volume@1',
+        target: { kind: 'path', path: 'raw' }, access: 'write', isolation: 'fork', source: {}, credentialHandles: [],
+        storageLocationId: managed.id, publish: 'review' });
+      await store.saveAndPromoteResourceRevision({ attachmentId: attachment.id, engine: 'restic@1', sealedRef: '{}',
+        rootDigest: 'd'.repeat(64), bytes: dataBytes, storageLocationId: managed.id }, undefined);
+    }
     const task = await store.createTask({ projectId: project.id, title: 'Routed', workflow: 'software-dev',
       workflowVersion: '1.27.0', params: { prompt: 'x', computer } as any });
     await store.saveWorldCheckpoint({ id: 'checkpoint-1', worldId: task.id, generation: 1, projectId: project.id,
@@ -128,6 +138,35 @@ describe('moving a running task to another provider', () => {
     (service as any).addNotice = async (_id: string, text: string) => { notices.push(text); };
     return { store, task, service, handle, restored, notices };
   }
+
+  // tavya-error e47f1fedac093871: a provider the task only inherits (its
+  // project's or organization's default) gives way to "Any" once it can never
+  // hold the project's data; one the task's own Computer names never does.
+  it('brings a world back elsewhere when its inherited provider can no longer hold the project\'s data', async () => {
+    const GB = 2 ** 30;
+    const grown = await anyFixture({}, 'e2b', 33 * GB);
+    (grown.service as any).restore = async (_id: string, kind: string, options: any) => {
+      grown.restored.push({ kind, routed: options?.routed });
+      return { ...grown.handle, kind, provider: kind };
+    };
+    expect((await grown.service.restoreWhereTaskRuns('checkpoint-1', grown.handle)).kind).toBe('hetzner');
+    expect(grown.restored.map((entry) => entry.kind)).toEqual(['hetzner']);
+    expect((await grown.store.eventsOfType(grown.task.id, 'world.routed')).at(-1)?.payload)
+      .toMatchObject({ provider: 'hetzner', gaveWay: { provider: 'e2b', reason: 'at most 29 GB disk, and its data needs 42' } });
+    expect(grown.notices).toEqual([expect.stringMatching(/^This task now runs on Hetzner \(E2B, its default computer, can't serve it: at most 29 GB disk/)]);
+
+    // Data it still holds: it comes back where it ran, unrouted.
+    const small = await anyFixture({}, 'e2b', 2 * GB);
+    (small.service as any).restore = async (_id: string, kind: string) => { small.restored.push({ kind }); return { ...small.handle, kind, provider: kind }; };
+    expect((await small.service.restoreWhereTaskRuns('checkpoint-1', small.handle)).kind).toBe('e2b');
+    expect(await small.store.eventsOfType(small.task.id, 'world.routed')).toEqual([]);
+
+    // Its own Computer names E2B: it stays (the restore itself says it can't hold the data).
+    const pinned = await anyFixture({ provider: 'e2b' }, 'e2b', 33 * GB);
+    (pinned.service as any).restore = async (_id: string, kind: string) => { pinned.restored.push({ kind }); return { ...pinned.handle, kind, provider: kind }; };
+    expect((await pinned.service.restoreWhereTaskRuns('checkpoint-1', pinned.handle)).kind).toBe('e2b');
+    expect(await pinned.store.eventsOfType(pinned.task.id, 'world.routed')).toEqual([]);
+  });
 
   it('brings an "Any" world back where it ran when that still fits and has room', async () => {
     const { store, task, service, handle, restored, notices } = await anyFixture();
