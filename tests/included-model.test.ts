@@ -10,7 +10,7 @@ import type { AddressInfo } from 'node:net';
 import { Store } from '../src/store/db.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
-import { INCLUDED_MODEL_DEFAULT, INCLUDED_MODEL_OPTIONS, includedModel, includedModelKey, includedModelRelativeCost, resetIncludedModelPrices, includedModelOutOfCredit, includedModelView, isIncludedModel,
+import { INCLUDED_MODEL_DEFAULT, INCLUDED_MODEL_OPTIONS, includedModel, includedModelKey, includedModelRelativeCost, resetIncludedModelPrices, includedModelTurnFailure, includedModelView, isIncludedModel,
   removeIncludedModelKey, saveIncludedModel, syncIncludedModelUsage } from '../src/agent/included-model.js';
 import { ComputeCreditExhausted, computeCredit, computeMonth, startComputeTrial } from '../src/world/managed-compute.js';
 import { organizationProfileId } from '../src/agent/profiles.js';
@@ -163,7 +163,7 @@ describe('the organization\'s OpenRouter key', () => {
     await startComputeTrial(f.store, f.organization.id, 'owner', T);
     await includedModelKey(f.store, f.broker, f.organization.id, T + 1000);
     f.spend(2.5); // the whole trial
-    const spent = await includedModelOutOfCredit(f.store, f.broker, f.organization.id, { taskId: 'task_1' }, T + 2000);
+    const spent = await includedModelTurnFailure(f.store, f.broker, f.organization.id, { taskId: 'task_1' }, 'Key limit exceeded (total limit)', T + 2000) as ComputeCreditExhausted;
     expect(spent).toBeInstanceOf(ComputeCreditExhausted);
     expect(spent!.message).toMatch(/^Out of credits: your \$5\.00 free trial is used up/);
     expect(keys.get('hash1')!.limit).toBe(2.5);
@@ -324,5 +324,84 @@ describe('a turn on the included model', () => {
     await expect(f.run()).rejects.toMatchObject({ type: 'world-capacity', message: expect.stringMatching(/^Out of credits: your \$5\.00 free trial is used up/) });
     // And the next turn does not start.
     await expect(f.run()).rejects.toMatchObject({ type: 'world-capacity' });
+  });
+
+  // OpenRouter's refusal of a key at its limit, as OpenCode reports it
+  // (tavya-error 5aa54804d0ea52cc, 2026-11-16).
+  const KEY_LIMIT = 'opencode ACP turn failed: Internal error: Key limit exceeded (total limit). Manage it using '
+    + 'https://openrouter.ai/workspaces/default/keys/0123abcd $2.50 of $2.50 used; does not reset.';
+  const addCredit = async (f: { store: Store; organization: { id: string } }, id: string, micros: number) => {
+    await f.store.createComputeTopUp({ id, organizationId: f.organization.id, creditMicros: micros, amountCents: micros / 10_000,
+      subscriptionId: 'sub_1', requestedAt: Date.now() - 1_000 });
+    await f.store.updateComputeTopUp(id, { state: 'paid', settledAt: Date.now() - 1_000 });
+  };
+
+  it('raises the key\'s limit and goes on when the key refused while the credit had more (credit added during the turn)', async () => {
+    let turns = 0;
+    const f: any = await turnFixture(async () => {
+      if (++turns > 1) return { termination: { kind: 'success', status: 'end_turn' }, output: 'done' };
+      for (const key of keys.values()) key.usage = key.limit!; // the key's whole limit: the trial's $5 at 2×
+      await addCredit(f, 'topup_mid', 10_000_000); // a $10 pack, bought while the turn ran
+      throw new Error(KEY_LIMIT);
+    });
+    const failure = await f.run().catch((error: unknown) => error);
+    // Retried as infrastructure (the retry resumes the session), never Resolve or a person.
+    expect(failure).toMatchObject({ type: 'agent-infra', nonRetryable: false });
+    // tavya's own OpenRouter workspace, and its raw refusal, never reach the customer.
+    expect(failure.message).not.toMatch(/openrouter\.ai|Key limit exceeded/i);
+    // The key follows the credit again: what it spent plus the pack (at 2×).
+    expect(keys.get('hash1')!.limit).toBe(7.5);
+    await expect(f.run()).resolves.toBeDefined();
+    expect(turns).toBe(2);
+  });
+
+  it('waits Out of compute, and starts no turn, when the credit left is too little for the model\'s next request', async () => {
+    let turns = 0;
+    const f: any = await turnFixture(async () => {
+      turns++;
+      // $0.10 of credit left ($0.05 at OpenRouter): enough to start, not for
+      // one request at the output cap, which OpenRouter refuses.
+      for (const key of keys.values()) key.usage = key.limit! - 0.05;
+      throw new Error('opencode ACP turn failed: Internal error: This request requires more credits, or fewer max_tokens. '
+        + 'You requested up to 64000 tokens, but can only afford 1234. To increase, visit https://openrouter.ai/settings/keys '
+        + 'and create a key with a higher total limit');
+    });
+    const failure = await f.run().catch((error: unknown) => error);
+    expect(failure).toMatchObject({ type: 'world-capacity', message: expect.stringMatching(/^Out of compute: /) });
+    expect(failure.message).not.toMatch(/openrouter\.ai/i);
+    // The wait's retries start no turn while the credit is what it was…
+    await expect(f.run()).rejects.toMatchObject({ type: 'world-capacity' });
+    expect(turns).toBe(1);
+    // …and the next one runs once more credit arrives.
+    await addCredit(f, 'topup_after', 10_000_000);
+    await expect(f.run()).rejects.toMatchObject({ type: 'world-capacity' });
+    expect(turns).toBe(2);
+  });
+
+  it('never shows tavya\'s OpenRouter links in any other failure of a turn on its key', async () => {
+    const f = await turnFixture(async () => {
+      throw new Error('opencode ACP turn failed: Internal error: No endpoints found matching your data policy. '
+        + 'Configure: https://openrouter.ai/settings/privacy');
+    });
+    const failure = await f.run().catch((error: unknown) => error) as Error;
+    expect(failure.message).toMatch(/No endpoints found/);
+    expect(failure.message).not.toMatch(/openrouter\.ai/i);
+  });
+});
+
+describe('the key\'s limit follows the credit between turns', () => {
+  it('rises when credit is added and stays closed once it is spent', async () => {
+    const f = await fixture();
+    await startComputeTrial(f.store, f.organization.id, 'owner', Date.now() - 60_000);
+    await includedModelKey(f.store, f.broker, f.organization.id);
+    expect(keys.get('hash1')!.limit).toBe(2.5);
+    await f.store.createComputeTopUp({ id: 'topup_1', organizationId: f.organization.id, creditMicros: 10_000_000, amountCents: 1_000,
+      subscriptionId: 'sub_1', requestedAt: Date.now() - 1_000 });
+    await f.store.updateComputeTopUp('topup_1', { state: 'paid', settledAt: Date.now() - 1_000 });
+    await syncIncludedModelUsage(f.store, f.broker, f.organization.id);
+    expect(keys.get('hash1')!.limit).toBe(7.5);
+    f.spend(7.5);
+    await syncIncludedModelUsage(f.store, f.broker, f.organization.id);
+    expect(keys.get('hash1')!.limit).toBe(7.5);
   });
 });

@@ -35,7 +35,7 @@ import { capacityCause, ComputeRouter, type RouterConnections } from '../world/c
 import { accountKey, dequeue, enqueue, wakeFullKey } from '../world/compute-queue.js';
 import { MachineQueued, leaseWaitDeadline } from '../world/machine-wait.js';
 import { SetupClock } from '../world/setup-clock.js';
-import { AgentChannelLost, AgentToolsUnavailable, toolsUnavailableActivity, toolsUnavailableNotice, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
+import { AgentChannelLost, AgentToolsUnavailable, toolsUnavailableActivity, toolsUnavailableNotice, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, isSpentKeyRefusal, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { clearBranchUnpublished, markBranchUnpublished, markCheckpointStale } from '../world/checkpoint-staleness.js';
 import { usageAdmissionId as admissionIdFor } from '../domain/turn-admission.js';
@@ -46,7 +46,8 @@ import { WorldBusy } from '../world/shared-coordination.js';
 import { World, WorldHandle, WorldKind, WorldSpec, type WorldRepo, worldWorkingDirectory, type WorldDiagnosis } from '../world/types.js';
 import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
-import { INCLUDED_MODEL_MIN_MICROS, INCLUDED_MODEL_OPTIONS, includedModelKey, includedModelOutOfCredit, syncIncludedModelUsage } from '../agent/included-model.js';
+import { INCLUDED_MODEL_MIN_MICROS, INCLUDED_MODEL_OPTIONS, includedModelKey, includedModelTurnFailure, syncIncludedModelUsage,
+  withoutOpenRouterLinks } from '../agent/included-model.js';
 import { creditRail, issueGatewayToken, openRouterTurnAuth, proxyRoot, proxyTurnAuth, revokeGatewayToken, type CreditRail } from '../agent/model-gateways.js';
 import {
   apiKeyEnv,
@@ -4530,6 +4531,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (token) (await deps.tokens?.revoke(token));
         // A provider error can quote the agent's output; it reaches workflow history.
         if (err instanceof Error) err.message = secrets.scrub(err.message);
+        // tavya's OpenRouter account (a key's page in its workspace) is no customer's.
+        const includedFailure = included ? (err instanceof Error ? err.message : String(err)) : undefined;
+        if (included && err instanceof Error) err.message = withoutOpenRouterLinks(err.message);
         // Its compute hold ran out (watchComputeHold): keep the stopped session,
         // so the turn the Out of compute wait starts once there is credit
         // continues it rather than starting this one over.
@@ -4561,13 +4565,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             ? probeCodexUsage({ configHome }) : probeClaudeUsage({ configHome }));
           turnError = await confirmSandboxFailure(err, async () => (login ? probe(login) : undefined), Date.now());
         }
-        // On the credit, a turn that stopped because the credit ran out (its
-        // OpenRouter key's limit, or the gateway proxy's refusal) waits for
-        // more like work on tavya's computers.
-        if (included) {
-          const spent = await includedModelOutOfCredit(store, deps.broker!, organizationId,
-            { taskId: args.taskId, projectId: args.task.projectId }).catch(() => undefined);
-          if (spent) throw capacityFailure(spent) ?? spent;
+        // On the organization's OpenRouter key (the included model, or Claude
+        // Code / Codex on the OpenRouter rail), a turn that stopped because the
+        // credit ran out waits for more like work on tavya's computers; one
+        // that the key's limit stopped while the credit had more goes on, the
+        // limit raised. Neither is the agent's error, nor a person's to fix
+        // (tavya-errors 5aa54804d0ea52cc, efc0154c44025278).
+        if (includedFailure !== undefined) {
+          const verdict = await includedModelTurnFailure(store, deps.broker!, organizationId,
+            { taskId: args.taskId, projectId: args.task.projectId }, includedFailure)
+            .catch(() => isSpentKeyRefusal(includedFailure) ? 'retry' as const : undefined);
+          if (verdict === 'retry') throw ApplicationFailure.create({ type: 'agent-infra', nonRetryable: false,
+            message: `The model's spending limit was behind your compute credit; ${BRAND} raised it and continues the turn.`,
+            cause: err instanceof Error ? err : undefined });
+          if (verdict) throw capacityFailure(verdict) ?? verdict;
         }
         if (rail?.kind === 'gateway' && store.hosted) {
           const credit = await computeCredit(store, organizationId).catch(() => undefined);

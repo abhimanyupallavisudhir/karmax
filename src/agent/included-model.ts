@@ -20,6 +20,7 @@ import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js
 import { COMPUTE_PRICE_MULTIPLIER, computeChargeMicros } from '../domain/entitlements.js';
 import type { AgentProfile } from '../domain/types.js';
 import { EFFORTS, type Effort } from './effort.js';
+import { isSpentKeyRefusal } from './limits.js';
 import type { Store } from '../store/db.js';
 import { ComputeCreditExhausted, computeCredit, outOfCompute } from '../world/managed-compute.js';
 import { type ModelPrice, openRouterApiBase, openRouterPrices, resetModelPrices } from './model-prices.js';
@@ -76,7 +77,10 @@ export interface IncludedModelView extends IncludedModelSettings {
   chargedMicros: number;
 }
 
-interface KeyRecord { hash: string; limitUsd?: number }
+/** `refusedAtUsd`: the limit at which OpenRouter last refused the key while
+ * it already followed the credit (what was left was too little for the
+ * model's next request); no turn starts until the credit allows more. */
+interface KeyRecord { hash: string; limitUsd?: number; refusedAtUsd?: number }
 
 /** `openrouter/<model>`: the model as an OpenCode agent names it. */
 export const includedAgentModel = (settings: Pick<IncludedModelSettings, 'model'>) => `openrouter/${settings.model}`;
@@ -225,12 +229,18 @@ export async function includedModelKey(store: Store, broker: CredentialBroker, o
     return key;
   }
   const current = (await openRouter(broker, 'GET', `/keys/${existing.hash}`))?.data ?? {};
-  await bookUsage(store, organizationId, Number(current.usage) || 0, now);
-  const limitUsd = limitFor(Number(current.usage) || 0,
-    await keyRoom(store, organizationId, (await computeCredit(store, organizationId, now)).availableMicros, multiplier, now) ?? available, multiplier);
-  if (limitUsd !== existing.limitUsd || current.disabled) {
+  const usageUsd = Number(current.usage) || 0;
+  await bookUsage(store, organizationId, usageUsd, now);
+  // Credit read again after booking what the key spent since.
+  const left = (await computeCredit(store, organizationId, now)).availableMicros;
+  if (left != null && left < INCLUDED_MODEL_MIN_MICROS) throw await outOfCompute(store, organizationId, 'openrouter', now);
+  const limitUsd = limitFor(usageUsd, await keyRoom(store, organizationId, left, multiplier, now) ?? available, multiplier);
+  // Refused at this limit before, with nothing more since: the turn would be too.
+  if (existing.refusedAtUsd !== undefined && limitUsd < existing.refusedAtUsd + INCLUDED_MODEL_MIN_MICROS / multiplier / 1e6)
+    throw await outOfCompute(store, organizationId, 'openrouter', now);
+  if (limitUsd !== existing.limitUsd || current.disabled || existing.refusedAtUsd !== undefined) {
     await openRouter(broker, 'PATCH', `/keys/${existing.hash}`, { limit: limitUsd, disabled: false });
-    await store.kvSet(keyRecord(organizationId), JSON.stringify({ ...existing, limitUsd } satisfies KeyRecord));
+    await store.kvSet(keyRecord(organizationId), JSON.stringify({ hash: existing.hash, limitUsd } satisfies KeyRecord));
   }
   return broker.resolve(keyHandle(organizationId), { caps: [`use-credential:${keyHandle(organizationId)}`] });
 }
@@ -248,24 +258,37 @@ async function bookUsage(store: Store, organizationId: string, usageUsd: number,
   return store.bookIncludedModelUsage({ organizationId, provider: 'openrouter', totalMicros: Math.round(usageUsd * 1e6), at: now, ...task });
 }
 
-/** Read what the organization's key has spent and book what is new, to
- * `task` when a turn on it just ended; with no credit left, close the key's
- * limit at what it has spent. Returns the micros booked. */
-export async function syncIncludedModelUsage(store: Store, broker: CredentialBroker, organizationId: string,
-  task?: { taskId: string; projectId?: string }, now = Date.now()): Promise<number> {
+/** Read what the organization's key has spent, book what is new (to `task`
+ * when a turn on it just ended) and set the key's limit to what the credit
+ * allows now: up when credit arrived or work held less than it reserved, down
+ * to what it spent once the credit is gone. A limit set only when a turn
+ * starts falls behind a pack bought during a long turn, and the turn then ends
+ * on the key's limit with credit left (tavya-error 5aa54804d0ea52cc). */
+async function syncKey(store: Store, broker: CredentialBroker, organizationId: string,
+  task?: { taskId: string; projectId?: string }, now = Date.now()) {
   const existing = await record(store, organizationId);
-  if (!existing) return 0;
+  if (!existing) return undefined;
   const current = (await openRouter(broker, 'GET', `/keys/${existing.hash}`))?.data ?? {};
   const usageUsd = Number(current.usage) || 0;
   const booked = await bookUsage(store, organizationId, usageUsd, now, task);
-  const available = await keyRoom(store, organizationId, (await computeCredit(store, organizationId, now)).availableMicros,
-    await store.computePriceMultiplier(organizationId, now), now);
-  if (available != null && available <= 0 && existing.limitUsd !== limitFor(usageUsd, 0)) {
-    const limitUsd = limitFor(usageUsd, 0);
-    await openRouter(broker, 'PATCH', `/keys/${existing.hash}`, { limit: limitUsd });
-    await store.kvSet(keyRecord(organizationId), JSON.stringify({ ...existing, limitUsd } satisfies KeyRecord));
+  const multiplier = await store.computePriceMultiplier(organizationId, now);
+  const available = await keyRoom(store, organizationId, (await computeCredit(store, organizationId, now)).availableMicros, multiplier, now);
+  const previousUsd = existing.limitUsd;
+  let limitUsd = previousUsd;
+  if (available != null) {
+    limitUsd = limitFor(usageUsd, available, multiplier);
+    if (limitUsd !== previousUsd) {
+      await openRouter(broker, 'PATCH', `/keys/${existing.hash}`, { limit: limitUsd });
+      await store.kvSet(keyRecord(organizationId), JSON.stringify({ ...existing, limitUsd } satisfies KeyRecord));
+    }
   }
-  return booked;
+  return { existing, booked, usageUsd, limitUsd, previousUsd, available };
+}
+
+/** syncKey; returns the micros booked. */
+export async function syncIncludedModelUsage(store: Store, broker: CredentialBroker, organizationId: string,
+  task?: { taskId: string; projectId?: string }, now = Date.now()): Promise<number> {
+  return (await syncKey(store, broker, organizationId, task, now))?.booked ?? 0;
 }
 
 /** Every organization's key, each sweep: what keys spent between turns (or
@@ -291,12 +314,31 @@ export async function removeIncludedModelKey(store: Store, broker: CredentialBro
   await store.kvDelete(keyRecord(organizationId));
 }
 
-/** A turn on the included model failed: when the credit is what ran out,
- * the task waits for more (Out of compute) instead of failing. */
-export async function includedModelOutOfCredit(store: Store, broker: CredentialBroker, organizationId: string,
-  task: { taskId: string; projectId?: string }, now = Date.now()): Promise<ComputeCreditExhausted | undefined> {
-  await syncIncludedModelUsage(store, broker, organizationId, task, now).catch(() => 0);
+/** What a failed turn on the included model means for its task, from what
+ * the key has spent and the credit has left (`message`: what failed):
+ * - a ComputeCreditExhausted: wait for more credit (Out of compute): it ran
+ *   out, or OpenRouter refused the key at a limit that already followed it
+ *   (what is left cannot pay for the model's next request);
+ * - 'retry': OpenRouter refused the key at a limit behind the credit (raised
+ *   now), or the key could not be read; the retry resumes the session;
+ * - undefined: not the credit; the failure is what it says. */
+export async function includedModelTurnFailure(store: Store, broker: CredentialBroker, organizationId: string,
+  task: { taskId: string; projectId?: string }, message: string, now = Date.now()): Promise<ComputeCreditExhausted | 'retry' | undefined> {
+  const synced = await syncKey(store, broker, organizationId, task, now).catch(() => undefined);
   const credit = await computeCredit(store, organizationId, now);
-  return credit.availableMicros != null && credit.availableMicros < INCLUDED_MODEL_MIN_MICROS
-    ? outOfCompute(store, organizationId, 'openrouter', now) : undefined;
+  if (credit.availableMicros != null && credit.availableMicros < INCLUDED_MODEL_MIN_MICROS)
+    return outOfCompute(store, organizationId, 'openrouter', now);
+  if (!isSpentKeyRefusal(message)) return undefined;
+  // Unread, or the limit was behind the credit (raised now): the retry runs on it.
+  if (!synced || synced.limitUsd === undefined || synced.previousUsd === undefined || synced.limitUsd > synced.previousUsd) return 'retry';
+  await store.kvSet(keyRecord(organizationId), JSON.stringify({ ...synced.existing, limitUsd: synced.limitUsd,
+    refusedAtUsd: synced.limitUsd } satisfies KeyRecord));
+  return outOfCompute(store, organizationId, 'openrouter', now);
+}
+
+/** tavya's OpenRouter account is no customer's: its links (a key's page in
+ * tavya's workspace, its settings) leave what a turn on the included model
+ * says, with the phrase that sends people there. */
+export function withoutOpenRouterLinks(text: string): string {
+  return text.replace(/(?:[\s,;:]*\b(?:manage it using|add more using|to increase, visit|configure|visit|see|at)\b:?)?[\s,;:]*\(?https?:\/\/(?:[\w-]+\.)*openrouter\.ai(?:\/[^\s)]*)?\)?/gi, '');
 }

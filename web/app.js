@@ -4655,6 +4655,9 @@ function plainTaskError(text) {
     : /GitHub PR identity is not connected|reconnect GitHub on your profile|Connect GitHub on your profile/i.test(body) ? 'Connect GitHub on your profile, then press Retry.'
     : /^merge failed: conflict/i.test(body) ? 'These changes conflict with newer work on the same branch. Ask the agent to resolve the conflict.'
     : /^merge failed/i.test(body) ? 'The changes couldn’t be landed. Ask the agent to look into it, or Retry.'
+    // Temporal's timeouts: which activity stays in Details (tavya-error 33f6295a8ac41d4a).
+    : /\bactivity Heartbeat timeout\b/.test(body) ? 'A step of this task stopped responding. Retry usually fixes this.'
+    : /\bactivity StartToClose timeout\b/.test(body) ? 'A step of this task took longer than its time limit. Retry usually fixes this.'
     : /file lock admission (?:timed out|is full)/i.test(body) ? 'The task’s computer was busy with another operation (starting, saving or parking it). Retry usually fixes this.'
     : toolsDidNotStart(body) ? `The agent’s tools didn’t start (${toolsDidNotStart(body)}). Retry carries on without them if they still won’t.`
     : '';
