@@ -222,11 +222,12 @@ export function machineSize(provider: string, shape: MachineShape): { cpu: numbe
 }
 
 /** Why `provider` has no machine for `shape` within an account's per-machine
- * `limits`, or undefined when it has one. Only a provider that sells fixed
+ * `limits` (the most disk, and with how many CPUs, its roomiest allowed size
+ * takes), or undefined when it has one. Only a provider that sells fixed
  * sizes can refuse a shape each part of which is within the limits: a disk
  * too big for the sizes the account allows (a 2-CPU cap and Agent37's 2/4,
  * which takes 60 GB). */
-export function noMachineFor(provider: string, shape: MachineShape, limits: Pick<ComputerLimits, 'cpu' | 'memoryMb'>): string | undefined {
+export function noMachineFor(provider: string, shape: MachineShape, limits: Pick<ComputerLimits, 'cpu' | 'memoryMb'>): { maxDiskGb: number; cpu: number } | undefined {
   const facts = PROVIDERS[provider];
   if (!facts?.sizes) return undefined;
   const wanted = { cpu: shape.cpu ?? facts.defaults.cpu, memoryMb: shape.memoryMb ?? facts.defaults.memoryMb, diskGb: shape.diskGb ?? facts.defaults.diskGb };
@@ -236,7 +237,7 @@ export function noMachineFor(provider: string, shape: MachineShape, limits: Pick
   if (!allowed.length || smallestSize(allowed, wanted)) return undefined;
   // Here every allowed size has a disk range, and none holds the disk.
   const roomiest = allowed.reduce((best, size) => (size.maxDiskGb! > best.maxDiskGb! ? size : best));
-  return `at most ${roomiest.maxDiskGb} GB disk with ${roomiest.cpu} CPU`;
+  return { maxDiskGb: roomiest.maxDiskGb!, cpu: roomiest.cpu };
 }
 
 /** What a parked world on `provider` still holds of its account's budget. */
@@ -399,6 +400,8 @@ export function assertComputerFits(spec: MachineShape & { network?: { unrestrict
     throw new Error(`Memory can be at most ${gb(limits.memoryMb)} GB ${where('memoryMb')}`);
   if (spec.cpu != null && limits.cpu != null && spec.cpu > limits.cpu)
     throw new Error(`CPU can be at most ${limits.cpu} ${where('cpu')}`);
+  const none = noMachineFor(provider, { ...spec, diskGb: diskHolding(provider, spec.diskGb, spec.holdsData?.diskGb) }, limits);
+  if (none) throw new Error(`Disk can be at most ${none.maxDiskGb} GB with ${none.cpu} CPU ${where('cpu')}`);
 }
 
 /** The part of `spec` that fits; what had to give is listed for a warning. */

@@ -45,6 +45,14 @@ describe('computer limits', () => {
     expect(() => assertComputerFits({ reachesTavya: "this project's data" }, { network: 'basic' }, 'daytona'))
       .toThrow("This Daytona account has basic internet only, which can't reach tavya, so a computer there can't load this project's data.");
     expect(() => assertComputerFits({ reachesTavya: "this project's data" }, { network: 'full' }, 'daytona')).not.toThrow();
+    // Agent37's 2/4 takes at most 60 GB (tavya-error 0c739e7379819d38): with a 2-CPU cap there is no machine
+    // for 70 GB, asked or needed by the data; without one, it is a 4/8.
+    expect(() => assertComputerFits({ cpu: 2, memoryMb: 4096, diskGb: 70 }, { cpu: 2, memoryMb: 4096, diskGb: 100 }, 'agent37'))
+      .toThrow('Disk can be at most 60 GB with 2 CPU on this Agent37 account');
+    expect(() => assertComputerFits({ cpu: 2, holdsData: { bytes: 50 * 2 ** 30, diskGb: 65 } }, { cpu: 2, diskGb: 100 }, 'agent37'))
+      .toThrow('Disk can be at most 60 GB with 2 CPU');
+    expect(() => assertComputerFits({ cpu: 2, memoryMb: 4096, diskGb: 60 }, { cpu: 2, memoryMb: 4096, diskGb: 100 }, 'agent37')).not.toThrow();
+    expect(() => assertComputerFits({ cpu: 2, memoryMb: 4096, diskGb: 70 }, { cpu: 8, memoryMb: 65_536, diskGb: 100 }, 'agent37')).not.toThrow();
   });
   it('reads the limit out of each provider\'s refusal', () => {
     expect(limitFromMessage(E2B.disk)).toEqual({ dimension: 'disk', value: 25600, unit: 'MiB' });

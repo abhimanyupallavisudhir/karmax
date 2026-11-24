@@ -126,7 +126,8 @@ export function unfit(needs: ComputeNeeds, option: ComputeOption): string | unde
     return `at most ${limits.diskGb} GB disk${dataReasonEnd(needs.holdsData)}`;
   if (needs.region && option.region !== needs.region) return `not in ${REGION_LABEL[needs.region]}`;
   // Each part fits, but together they may not: a disk only a bigger size takes.
-  return noMachineFor(option.provider, { ...needs, diskGb: diskHolding(option.provider, needs.diskGb, needs.holdsData?.diskGb) }, limits);
+  const none = noMachineFor(option.provider, { ...needs, diskGb: diskHolding(option.provider, needs.diskGb, needs.holdsData?.diskGb) }, limits);
+  return none && `at most ${none.maxDiskGb} GB disk with ${none.cpu} CPU`;
 }
 
 const dataReasonEnd = (data: DataDiskNeed) => `, and its data needs ${data.diskGb}`;
