@@ -185,6 +185,17 @@ describe('evaluateQuery — free text (token-AND over title/notes/prompt/#num)',
     expect(evaluateQuery(tasks, parseQuery('prompt:wiki'), ctx).tasks.map((t) => t.num)).toEqual([4]);
     expect(evaluateQuery(tasks, parseQuery('-prompt:wiki login'), ctx).tasks.map((t) => t.num).sort()).toEqual([1, 2]);
   });
+
+  it('excludes a bare -word (from title, notes and prompt), alone or alongside other terms', () => {
+    expect(evaluateQuery(tasks, parseQuery('-login'), ctx).tasks.map((t) => t.num).sort()).toEqual([3, 4]);
+    expect(evaluateQuery(tasks, parseQuery('login -web'), ctx).tasks.map((t) => t.num)).toEqual([2]);
+    // the word may live only in the prompt
+    expect(evaluateQuery(tasks, parseQuery('-wiki'), ctx).tasks.map((t) => t.num).sort()).toEqual([1, 2, 3]);
+    // combined with a field clause, the way `for:me -smoke` is written
+    expect(evaluateQuery(tasks, parseQuery('num:>=2 -auth'), ctx).tasks.map((t) => t.num).sort()).toEqual([2, 4]);
+    // a lone '-' is not an exclusion
+    expect(evaluateQuery(tasks, parseQuery('-'), ctx).tasks).toHaveLength(0);
+  });
 });
 
 describe('evaluateQuery — conversation: filter (opt-in transcript search)', () => {

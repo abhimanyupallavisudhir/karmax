@@ -612,13 +612,15 @@ function matchDate(ts: number, op: FilterClause['op'], val: DateVal, now: number
 // fallback AND by the fork-from picker — keep the two behaviours in sync when editing.
 // Semantics: token-AND — every whitespace-separated term must appear somewhere in the
 // task's title, notes, prompt, or `#num` (order-independent), so "login fix" matches
-// "fix login". The prompt is included because titles are just the prompt's first line —
+// "fix login"; a bare `-word` excludes tasks containing it. The prompt is included because titles are just the prompt's first line —
 // a task whose prompt opens with a boilerplate preamble is otherwise unfindable.
 function matchText(t: SearchTask, q: string): boolean {
   const needle = q.toLowerCase().trim();
   if (!needle) return true;
   const hay = `${lc(t.title)} ${lc(t.notes)} ${lc(t.params?.prompt)} ${t.num != null ? '#' + t.num : ''}`;
-  return needle.split(/\s+/).every((term) => !term || hay.includes(term));
+  // A bare `-word` excludes, like `-tag:bug` does for a field.
+  return needle.split(/\s+/).every((term) => !term
+    || (term.length > 1 && term.startsWith('-') ? !hay.includes(term.slice(1)) : hay.includes(term)));
 }
 
 // ─── the evaluator ───────────────────────────────────────────────────────────

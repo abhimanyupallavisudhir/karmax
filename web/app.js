@@ -7190,12 +7190,14 @@ function renderMain() {
 // ── tasks ────────────────────────────────────────────────────────────────────
 // Client-side twin of the authoritative `matchText` in src/domain/search.ts — the
 // pre-server fallback while the first evaluation is in flight. Keep the two in
-// sync: token-AND over title / notes / prompt / #num, so "login fix" matches "fix login".
+// sync: token-AND over title / notes / prompt / #num, so "login fix" matches "fix login"
+// and a bare `-word` excludes.
 function taskMatches(t, q) {
   const s = (q || '').toLowerCase().trim();
   if (!s) return true;
   const hay = `${(t.title || '').toLowerCase()} ${(t.notes || '').toLowerCase()} ${(t.params?.prompt || '').toLowerCase()} ${t.num != null ? '#' + t.num : ''}`;
-  return s.split(/\s+/).every((term) => !term || hay.includes(term));
+  return s.split(/\s+/).every((term) => !term
+    || (term.length > 1 && term.startsWith('-') ? !hay.includes(term.slice(1)) : hay.includes(term)));
 }
 
 // The default list folds two kinds of nesting unless the query opts in: the

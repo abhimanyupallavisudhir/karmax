@@ -685,7 +685,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     description:
       'Search/organize a project\'s tasks with a Linear-style query and get back a compact list (num, title, status, priority, tags). '
       + 'Query grammar: `field:value` clauses AND together, commas = OR (`status:active,waiting`), `-` negates (`-tag:bug`), '
-      + 'comparisons on numbers/dates (`priority:>=2`, `created:<7d`), quoted phrases, and bare words = full text. '
+      + 'comparisons on numbers/dates (`priority:>=2`, `created:<7d`), quoted phrases, and bare words = full text (`-word` excludes it). '
       + 'Fields: status, stage, priority, tag (a/b path matches descendants), workflow, created, updated, num, '
       + 'is:<facet> (open/draft/archived/pr/untagged/armed/scheduled/recurring/blocked-on-deps/series/run/…), '
       + 'trigger, schedule, nextRun, dependsOn:#N / blocks:#N, and any workflow param via `param.<key>`. '

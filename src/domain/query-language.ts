@@ -16,6 +16,7 @@
  *   sort:priority-desc  sort:-created   sort directive
  *   group:status                 grouping directive
  *   "multi word"  free text      anything not a known field becomes full-text
+ *   -smoke                       a bare '-word' excludes tasks whose text has it
  *
  * PURE — no Node imports; unit-tested in tests/search.test.ts.
  */
