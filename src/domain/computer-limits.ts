@@ -54,12 +54,26 @@ export interface EffectiveComputerLimits extends ComputerLimits {
 
 const KEYS: LimitKey[] = ['cpu', 'memoryMb', 'diskGb'];
 
+/** One of the machines a provider sells, when it sells a fixed few: its CPUs,
+ * its memory and, when it differs from the provider's, the most disk it may have. */
+export interface MachineSize { cpu: number; memoryMb: number; maxDiskGb?: number }
+
 /** Agent37's `vm` shapes (agent37.com/docs, instance-sizing): four up to
- * 4 CPU / 32 GB, and 8 CPU / 64 GB for VMs only (verified live 2026-11-18). */
-export const AGENT37_SIZES = [
-  { cpu: 2, memoryMb: 4096 }, { cpu: 4, memoryMb: 8192 }, { cpu: 4, memoryMb: 16_384 }, { cpu: 4, memoryMb: 32_768 },
+ * 4 CPU / 32 GB, and 8 CPU / 64 GB for VMs only (verified live 2026-11-18).
+ * A `vm`'s disk range is the shape's: 2–60 GB on 2 CPU / 4 GB, 2–100 GB on
+ * every larger one (enforced from 2026-11-24; a 2/4 with 70 GB was refused). */
+export const AGENT37_SIZES: readonly MachineSize[] = [
+  { cpu: 2, memoryMb: 4096, maxDiskGb: 60 }, { cpu: 4, memoryMb: 8192 }, { cpu: 4, memoryMb: 16_384 }, { cpu: 4, memoryMb: 32_768 },
   { cpu: 8, memoryMb: 65_536 },
-] as const;
+];
+
+/** The smallest of `sizes` with CPU, memory and disk enough for `wanted`;
+ * undefined when none has. A size's disk range is `maxDiskGb`, else unbounded
+ * here (the provider's own disk limit is judged apart). */
+export function smallestSize<T extends MachineSize>(sizes: readonly T[], wanted: { cpu: number; memoryMb: number; diskGb?: number }): T | undefined {
+  return sizes.find((size) => size.cpu >= wanted.cpu && size.memoryMb >= wanted.memoryMb
+    && (wanted.diskGb == null || size.maxDiskGb == null || size.maxDiskGb >= wanted.diskGb));
+}
 
 interface ProviderFacts {
   label: string;
@@ -74,8 +88,9 @@ interface ProviderFacts {
    * per running hour whatever the size (a public IPv4 address). */
   price: { cpuHour: number; gbHour: number; diskGbMonth: number; hour?: number };
   /** The only machines it sells, when it sells a fixed few: a Computer gets
-   * (and is ranked at the price of) the smallest one that covers it. */
-  sizes?: ReadonlyArray<{ cpu: number; memoryMb: number }>;
+   * (and is ranked at the price of) the smallest one that covers it, its disk
+   * included (machineSize). */
+  sizes?: readonly MachineSize[];
   /** Typical seconds from a parked world to a working one (measured, wiki
    * features/vm-worlds); breaks a tie in price. */
   wakeSeconds: number;
@@ -114,7 +129,7 @@ const VM_FEATURES: ComputerFeatures = { desktop: false, allowlist: false, intern
 const PROVIDERS: Record<string, ProviderFacts> = {
   // Agent37 (wiki features/vm-worlds § Agent37): a `vm` instance, its own
   // kernel, the disk mounted as the home; five shapes up to 8 CPU / 64 GB
-  // (AGENT37_SIZES), disks of 2–100 GB. A `vm` meters at 2.5× Agent37's default rate:
+  // (AGENT37_SIZES), disks of 2–100 GB (2–60 GB on the smallest). A `vm` meters at 2.5× Agent37's default rate:
   // $2 per vCPU and $1.75 per GB of memory per month, disk $0.09 per GB-month
   // (agent37.com/docs, 2026-11-16). A start is a cold boot of about 2 s.
   agent37: { label: 'Agent37', defaults: { cpu: 2, memoryMb: 4096, diskGb: 20 }, limits: { cpu: 8, memoryMb: 65_536, diskGb: 100 }, features: VM_FEATURES,
@@ -185,13 +200,43 @@ export function cloudProviders(): string[] {
 export function listPriceMicrosPerHour(provider: string, shape: MachineShape): number | undefined {
   const facts = PROVIDERS[provider];
   if (!facts) return undefined;
+  const disk = shape.diskGb ?? facts.defaults.diskGb;
   const wanted = { cpu: shape.cpu ?? facts.defaults.cpu, memoryMb: shape.memoryMb ?? facts.defaults.memoryMb };
-  const sold = facts.sizes?.find((size) => size.cpu >= wanted.cpu && size.memoryMb >= wanted.memoryMb) ?? wanted;
+  const sold = machineSize(provider, { ...wanted, diskGb: disk }) ?? wanted;
   const cpu = sold.cpu;
   const gb = sold.memoryMb / 1024;
-  const disk = shape.diskGb ?? facts.defaults.diskGb;
   const { price } = facts;
   return Math.round((cpu * price.cpuHour + gb * price.gbHour + disk * price.diskGbMonth / 730 + (price.hour ?? 0)) * 1e6);
+}
+
+/** The machine `provider` gives for `shape` (the provider's default for what
+ * it leaves out): the smallest of its sizes with CPU, memory and disk enough,
+ * or the shape itself where any size is sold; undefined when none of its
+ * sizes has enough. */
+export function machineSize(provider: string, shape: MachineShape): { cpu: number; memoryMb: number } | undefined {
+  const facts = PROVIDERS[provider];
+  const wanted = { cpu: shape.cpu ?? facts?.defaults.cpu ?? 2, memoryMb: shape.memoryMb ?? facts?.defaults.memoryMb ?? 2048 };
+  if (!facts?.sizes) return wanted;
+  const size = smallestSize(facts.sizes, { ...wanted, diskGb: shape.diskGb ?? facts.defaults.diskGb });
+  return size && { cpu: size.cpu, memoryMb: size.memoryMb };
+}
+
+/** Why `provider` has no machine for `shape` within an account's per-machine
+ * `limits`, or undefined when it has one. Only a provider that sells fixed
+ * sizes can refuse a shape each part of which is within the limits: a disk
+ * too big for the sizes the account allows (a 2-CPU cap and Agent37's 2/4,
+ * which takes 60 GB). */
+export function noMachineFor(provider: string, shape: MachineShape, limits: Pick<ComputerLimits, 'cpu' | 'memoryMb'>): string | undefined {
+  const facts = PROVIDERS[provider];
+  if (!facts?.sizes) return undefined;
+  const wanted = { cpu: shape.cpu ?? facts.defaults.cpu, memoryMb: shape.memoryMb ?? facts.defaults.memoryMb, diskGb: shape.diskGb ?? facts.defaults.diskGb };
+  const allowed = facts.sizes.filter((size) => size.cpu >= wanted.cpu && size.memoryMb >= wanted.memoryMb
+    && (limits.cpu == null || size.cpu <= limits.cpu) && (limits.memoryMb == null || size.memoryMb <= limits.memoryMb));
+  // No size within the limits has the CPU and memory: the limits themselves say so.
+  if (!allowed.length || smallestSize(allowed, wanted)) return undefined;
+  // Here every allowed size has a disk range, and none holds the disk.
+  const roomiest = allowed.reduce((best, size) => (size.maxDiskGb! > best.maxDiskGb! ? size : best));
+  return `at most ${roomiest.maxDiskGb} GB disk with ${roomiest.cpu} CPU`;
 }
 
 /** What a parked world on `provider` still holds of its account's budget. */

@@ -156,6 +156,8 @@ bash ${d}/restart.sh
     if (route === '/instances' && method === 'POST') {
       if (this.refuseCreate) return error(this.refuseCreate.status, this.refuseCreate.code, this.refuseCreate.message);
       if (this.balance <= 0) return error(402, 'insufficient_balance', 'top up');
+      const refused = diskRefusal(body.type, body.resources);
+      if (refused) return error(400, 'invalid_request', refused);
       const id = `i${String(++this.ids).padStart(9, '0')}`;
       const instance: Instance = { id, status: 'running', type: body.type, region: body.region ?? 'us', template: body.template,
         name: body.name ?? null, metadata: body.metadata ?? null, mount_path: body.mount_path, env: body.env,
@@ -188,6 +190,9 @@ bash ${d}/restart.sh
     if (action === 'resize') {
       if (instance.status !== 'running') return error(400, 'invalid_request', 'resize a running instance');
       if (body.disk !== undefined && body.disk < instance.resources.disk) return error(400, 'invalid_request', 'disk cannot shrink');
+      const refused = diskRefusal(instance.type, { cpu: body.cpu ?? instance.resources.cpu, memory: body.memory ?? instance.resources.memory,
+        disk: body.disk ?? instance.resources.disk });
+      if (refused) return error(400, 'invalid_request', refused);
       this.halt(instance); // recreated with the new limits: a cold boot
       instance.resources = { cpu: body.cpu ?? instance.resources.cpu, memory: body.memory ?? instance.resources.memory, disk: body.disk ?? instance.resources.disk };
       instance.status = 'running';
@@ -231,4 +236,13 @@ async function freePort(): Promise<number> {
     });
     server.on('error', reject);
   });
+}
+
+/** Agent37's disk range per shape (docs, instance-sizing, enforced from
+ * 2026-11-24): a `vm` takes 2–60 GB on 2 vCPU / 4 GB and 2–100 GB on every
+ * larger shape, in whole GB. Its message, word for word as production saw it. */
+function diskRefusal(type: string, resources: { cpu: number; memory: number; disk: number }): string | undefined {
+  const max = type === 'vm' && resources.cpu === 2 && resources.memory === 4 ? 60 : 100;
+  if (Number.isInteger(resources.disk) && resources.disk >= 2 && resources.disk <= max) return undefined;
+  return `Disk for the ${resources.cpu} vCPU / ${resources.memory} GB shape must be a whole number between 2 and ${max} GB.`;
 }

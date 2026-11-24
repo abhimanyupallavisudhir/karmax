@@ -6,6 +6,7 @@ import { ProviderCapacityFull } from '../src/agent/limits.js';
 import { Agent37Driver, agent37AccessKey, agent37BootScript, agent37ComputeDollarsPerHour, agent37Shape } from '../src/world/agent37.js';
 import { VmWorldProvider } from '../src/world/vm/provider.js';
 import { listPriceMicrosPerHour, diskGrowsAtStart } from '../src/domain/computer-limits.js';
+import { listRate } from '../src/world/managed-compute.js';
 import type { ResolvedWorldProviderConnection } from '../src/world/connections.js';
 import type { ProviderUsageEvent, WorldHandle } from '../src/world/types.js';
 import { serviceHomeLabel } from '../src/world/services.js';
@@ -29,6 +30,21 @@ describe('Agent37 sizes, prices and keys', () => {
     expect(() => agent37Shape({ cpu: 8, memoryMb: 131_072 })).toThrow(/at most 8 CPUs and 64 GB/);
     expect(new Agent37Driver().shape(undefined)).toEqual({ cpu: 2, memoryMb: 4096, diskGb: 20 });
     expect(() => new Agent37Driver().shape({ diskGb: 150 })).toThrow(/at most 100 GB/);
+  });
+
+  it('gives a disk the smallest shape whose range holds it: a 2/4 vm takes at most 60 GB (tavya-error 0c739e7379819d38)', () => {
+    // agent37.com/docs instance-sizing: "2-60 GB of disk on the 2 vCPU / 4 GB shape and 2-100 GB on every larger one".
+    expect(agent37Shape({ cpu: 2, memoryMb: 4096, diskGb: 60 })).toEqual({ cpu: 2, memory: 4 });
+    expect(agent37Shape({ cpu: 2, memoryMb: 4096, diskGb: 61 })).toEqual({ cpu: 4, memory: 8 });
+    expect(new Agent37Driver().shape({ cpu: 2, memoryMb: 4096, diskGb: 70 })).toEqual({ cpu: 4, memoryMb: 8192, diskGb: 70 });
+    expect(new Agent37Driver().shape({ cpu: 2, memoryMb: 2048, diskGb: 59.5 })).toEqual({ cpu: 2, memoryMb: 4096, diskGb: 60 });
+    expect(new Agent37Driver().shape({ cpu: 4, memoryMb: 16_384, diskGb: 100 })).toEqual({ cpu: 4, memoryMb: 16_384, diskGb: 100 });
+    // Ranked at the machine it gets, and held at it.
+    expect(listPriceMicrosPerHour('agent37', { cpu: 2, memoryMb: 4096, diskGb: 70 }))
+      .toBe(listPriceMicrosPerHour('agent37', { cpu: 4, memoryMb: 8192, diskGb: 70 }));
+    expect(listRate('agent37', { cpu: 2, memoryMb: 4096, diskGb: 70 })).toEqual(listRate('agent37', { cpu: 4, memoryMb: 8192, diskGb: 70 }));
+    expect(listPriceMicrosPerHour('agent37', { cpu: 2, memoryMb: 4096, diskGb: 60 }))
+      .toBeLessThan(listPriceMicrosPerHour('agent37', { cpu: 4, memoryMb: 8192, diskGb: 60 })!);
   });
 
   it('prices a vm at 2.5× Agent37’s published default rate, the same in the router', () => {
@@ -128,6 +144,30 @@ describe.skipIf(!sshdAvailable)('Agent37 worlds (fake Sandbox API, real tunnel a
       .toEqual([{ cpu: 4, memory: 8, disk: 40 }]);
     expect([...agent37.instances.values()][0]!.resources).toEqual({ cpu: 4, memory: 8, disk: 40 });
     expect((await woken.readFile('data.bin')).length).toBe(1000);
+  });
+
+  it('makes a 2/4 Computer with more disk than that shape holds on the next shape up, and grows into one the same way', async () => {
+    // Production 2026-11-24 (tavya-error 0c739e7379819d38): Any chose Agent37 for 2 CPU / 4 GB / 70 GB,
+    // and every create was refused "Disk for the 2 vCPU / 4 GB shape must be a whole number between 2 and 60 GB."
+    const world = await provider.create({ taskId: 'task_big', base: 'main', generation: 1, organizationId: 'org_a',
+      resources: { cpu: 2, memoryMb: 4096, diskGb: 70 } });
+    expect(agent37.requests.find((request) => request.method === 'POST' && request.path === '/instances')?.body)
+      .toMatchObject({ resources: { cpu: 4, memory: 8, disk: 70 } });
+    expect(world.handle).toMatchObject({ meta: { machine: { cpu: 4, memoryMb: 8192, diskGb: 70 } } });
+
+    // A 2/4 world asked for 80 GB: its next start moves it to 4/8 with the disk, in one resize.
+    const small = await provider.create({ taskId: 'task_small', base: 'main', generation: 1, organizationId: 'org_a',
+      resources: { cpu: 2, memoryMb: 4096, diskGb: 40 } });
+    const handle = small.handle as WorldHandle;
+    const grown = await provider.resize(handle, { diskGb: 80 });
+    expect(grown).toEqual({ disk: 'unchanged', restart: true, machine: { cpu: 4, memoryMb: 8192, diskGb: 80 } });
+    await provider.park(handle);
+    const before = agent37.requests.length;
+    await provider.open({ ...handle, meta: { ...handle.meta, machine: grown.machine, computer: { cpu: 2, memoryMb: 4096, diskGb: 80 } } });
+    expect(agent37.requests.slice(before).filter((request) => request.path.endsWith('/resize')).map((request) => request.body))
+      .toEqual([{ cpu: 4, memory: 8, disk: 80 }]);
+    expect([...agent37.instances.values()].at(-1))
+      .toMatchObject({ resources: { cpu: 4, memory: 8, disk: 80 } });
   });
 
   it('starts karmax’s sshd again when the machine booted without it (Agent37 moved or rebooted it)', async () => {

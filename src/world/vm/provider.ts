@@ -585,9 +585,10 @@ export class VmWorldProvider implements WorldProvider {
   private async shapeOf(handle: WorldHandle, connection: ResolvedWorldProviderConnection): Promise<VmShape> {
     const made = handle.meta?.machine as VmShape | undefined;
     const wanted = handle.meta?.computer as MachineShape | undefined;
-    // Never shrink the disk; CPU and memory follow the Computer.
-    const shape = await this.driver.shape(wanted ?? made, connection);
-    return made ? { ...shape, diskGb: Math.max(shape.diskGb, made.diskGb) } : shape;
+    // Never shrink the disk; CPU and memory follow the Computer, in a size
+    // that takes the disk (a provider's smaller sizes may hold less).
+    const asked = wanted ?? made;
+    return this.driver.shape(made ? { ...asked, diskGb: Math.max(asked?.diskGb ?? 0, made.diskGb) } : asked, connection);
   }
 
   private transportFor(id: string, connection: ResolvedWorldProviderConnection, sealed: Record<string, string>): SshTransport {

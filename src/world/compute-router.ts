@@ -1,7 +1,7 @@
 import { ProviderCapacityFull, ProviderOutage } from '../agent/limits.js';
 import { BRAND } from '../domain/brand.js';
 import { machineShape, type ComputeRegion, type MachineShape } from '../domain/computer.js';
-import { cloudProviders, ComputerUnfit, dataSize, DISK_CANNOT_HOLD_DATA, diskHolding, type DataDiskNeed, listPriceMicrosPerHour, providerLabel, providerRegion, providerWakeSeconds,
+import { cloudProviders, ComputerUnfit, dataSize, DISK_CANNOT_HOLD_DATA, diskHolding, type DataDiskNeed, listPriceMicrosPerHour, noMachineFor, providerLabel, providerRegion, providerWakeSeconds,
   type AccountPool, type ComputerFeatures, type ComputerLimits } from '../domain/computer-limits.js';
 import type { ProjectConfig } from '../domain/types.js';
 import type { Store } from '../store/db.js';
@@ -125,7 +125,8 @@ export function unfit(needs: ComputeNeeds, option: ComputeOption): string | unde
   if (needs.holdsData && limits.diskGb != null && needs.holdsData.diskGb > limits.diskGb)
     return `at most ${limits.diskGb} GB disk${dataReasonEnd(needs.holdsData)}`;
   if (needs.region && option.region !== needs.region) return `not in ${REGION_LABEL[needs.region]}`;
-  return undefined;
+  // Each part fits, but together they may not: a disk only a bigger size takes.
+  return noMachineFor(option.provider, { ...needs, diskGb: diskHolding(option.provider, needs.diskGb, needs.holdsData?.diskGb) }, limits);
 }
 
 const dataReasonEnd = (data: DataDiskNeed) => `, and its data needs ${data.diskGb}`;
