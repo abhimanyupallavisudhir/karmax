@@ -4160,11 +4160,10 @@ export class Gateway {
             // `repos` attach as in Git & GitHub settings, checked before anything is created.
             const repos = await this.requestedRepositorySources(b.repos, organizationId);
             project = (await store.createProject(String(b.name ?? 'New project'),
-              normalizeConfig(b.config, false, this.deps.hosted === true), organizationId));
+              normalizeConfig(b.config, false, this.deps.hosted === true), organizationId,
+              { creator: callerIdentity.humanSubject?.userId }));
             if (repos.length) project = await store.setProjectRepositorySources(project.id, repos);
           } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
-          if (callerIdentity.humanSubject) (await store.setProjectMembership(project.id,
-            { kind: 'user', userId: callerIdentity.humanSubject.userId }, 'owner'));
           await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
           await this.installDefaultTasks(project);
           return this.json(res, 200, b.autonomous === true ? { ...project, ...(await this.autonomous(token, project.id, 'project')) } : project);
@@ -4729,16 +4728,13 @@ export class Gateway {
         let project;
         try {
           const repos = await this.requestedRepositorySources(b.repos, 'org_personal');
+          // The legacy unhosted collection route creates inside the personal
+          // organization. Its creator owns it, so the same durable membership
+          // authorization used by the production project listing finds it.
           project = (await store.createProject(b.name ?? 'New project',
-            normalizeConfig(b.config, true, false)));
+            normalizeConfig(b.config, true, false), undefined, { creator: callerIdentity.humanSubject?.userId }));
           if (repos.length) project = await store.setProjectRepositorySources(project.id, repos);
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
-        // The legacy unhosted collection route creates inside the personal
-        // organization. Keep its creator discoverable through the same durable
-        // membership authorization used by the production project listing.
-        if (callerIdentity.humanSubject)
-          (await store.setProjectMembership(project.id,
-            { kind: 'user', userId: callerIdentity.humanSubject.userId }, 'owner'));
         await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
         await this.installDefaultTasks(project);
         return this.json(res, 200, b.autonomous === true ? { ...project, ...(await this.autonomous(token, project.id, 'project')) } : project);
