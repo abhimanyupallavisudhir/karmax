@@ -78,7 +78,7 @@ ok(ws.includes('LIST_RELOAD_EVENTS.has(ev.type)'), 'only structural events sched
 
 const open = extractFn('openTask');
 ok(extractFn('refreshTaskHistory').includes('/events?since=0&limit=300'), 'initial task history is bounded');
-ok(open.indexOf('renderTaskLoadingPage(rec);') < open.indexOf('const view = await api'),
+ok(open.indexOf('renderTaskLoadingPage(rec);') < open.indexOf('const view = await fetchTaskView'),
   'opening a task owns the main cell before its compact view request');
 ok(open.indexOf('renderTaskPage();') < open.indexOf('await details'), 'the compact task view paints before secondary resources finish');
 

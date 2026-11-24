@@ -260,7 +260,7 @@ eval(extractFn('waitTitle'));
 eval(extractFn('conversationWaitNotice'));
 eval(extractFn('contentKey'));
 eval(extractFn('conversationFullscreenButton'));
-for (const fn of ['hasMessageForm', 'agentEntryText', 'personMessageText', 'messageFormsIn', 'formSubject', 'answersForm', 'messageFormStates', 'conversationEntryKey', 'conversationFoldHtml', 'loadForkHistory', 'inheritedConversationHtml', 'conversationSearchKey', 'conversationSearchOpen', 'conversationSearchBar', 'pendingMessagesHtml', 'followupPlaceholder', 'conversationPane']) eval(extractFn(fn));
+for (const fn of ['hasMessageForm', 'agentEntryText', 'personMessageText', 'messageFormsIn', 'formSubject', 'answersForm', 'messageFormStates', 'conversationEntryKey', 'conversationFoldHtml', 'loadForkHistory', 'inheritedConversationHtml', 'conversationSearchKey', 'conversationSearchOpen', 'conversationSearchBar', 'pendingMessagesHtml', 'followupPlaceholder', 'earlierMessagesHtml', 'loadingEarlierMessages', 'conversationPane']) eval(extractFn(fn));
 global.narrowViewport = () => false;
 global.fmtKeys = (keys) => keys;
 global.micButtonHtml = () => '';

@@ -56,6 +56,7 @@ import { TokenAuthority, type ScopedToken } from '../platform/tokens.js';
 import { resolveAuthorizationSummary } from '../platform/authorization-summary.js';
 import { participantAuthorization } from '../platform/agent-authority.js';
 import { compactTaskView, platformRequestPathError } from '../platform/platform-request.js';
+import { CONVERSATION_WINDOW_MAX, conversationSlice, conversationWindowSize, windowedConversation } from '../platform/conversation-window.js';
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { manifest } from '../contrib/manifests.js';
@@ -6231,7 +6232,24 @@ export class Gateway {
         // Mirror the record's sequential number onto the view (the workflow only
         // knows the opaque id) so the drawer can show `#num` + a permalink.
         const projected = (await this.withApprovalRequests(view, viewMatch[1]!))!;
-        return this.json(res, 200, rec?.num != null ? { ...projected, num: rec.num } : projected);
+        const numbered = rec?.num != null ? { ...projected, num: rec.num } : projected;
+        // `messages=N`: the console's task page reads the newest N messages, and
+        // nothing of them when `known` names the revision it holds (wiki
+        // ops/performance-history). Without it, the whole conversation.
+        const size = conversationWindowSize(url.searchParams.get('messages'));
+        if (size === null) return this.json(res, 400, { error: `messages must be a whole number from 1 to ${CONVERSATION_WINDOW_MAX}` });
+        return this.json(res, 200, size ? windowedConversation(numbered, size, url.searchParams.get('known') ?? undefined) : numbered);
+      }
+      // Earlier messages of a transcript, for a page that read a window of it.
+      const transcriptMatch = p.match(/^\/api\/tasks\/([^/]+)\/transcript$/);
+      if (transcriptMatch && method === 'GET') {
+        const before = Number(url.searchParams.get('before'));
+        const limit = conversationWindowSize(url.searchParams.get('limit'));
+        if (!Number.isSafeInteger(before) || before < 0 || !limit)
+          return this.json(res, 400, { error: `before must be a message index, and limit a whole number from 1 to ${CONVERSATION_WINDOW_MAX}` });
+        const view = await api.getTaskView(token, transcriptMatch[1]!);
+        if (!view) return this.json(res, 404, { error: 'this task has no conversation yet' });
+        return this.json(res, 200, conversationSlice(view, url.searchParams.get('role') ?? 'do', before, limit));
       }
       // Agent-authored review HTML is its own document under the untrusted-content
       // sandbox; as a srcdoc it would inherit the console's policy and lose its script.

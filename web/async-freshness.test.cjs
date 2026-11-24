@@ -69,6 +69,10 @@ eval(extractFn('runSearch'));
 eval(extractFn('refreshTasks'));
 eval(extractFn('isSeries'));
 eval(extractFn('refreshTask'));
+eval(extractFn('fetchTaskView'));
+eval(extractFn('taskViewUrl'));
+eval(extractFn('adoptConversation'));
+global.CONVERSATION_WINDOW = 100;
 
 (async () => {
   // A response from project A must not populate project B after navigation.
@@ -149,7 +153,7 @@ eval(extractFn('refreshTask'));
   ];
   S.selected = 'task-a';
   S.view = { taskId: 'task-a', title: 'A before' };
-  global.api = (url) => url === '/api/tasks/task-a'
+  global.api = (url) => url.split('?')[0] === '/api/tasks/task-a'
     ? staleTask.promise
     : Promise.resolve(url.includes('/attempts') ? null : url.includes('/sessions') ? {} : []);
   const refreshingTaskA = refreshTask();
@@ -167,7 +171,7 @@ eval(extractFn('refreshTask'));
   S.selected = 'task-a';
   S.view = { taskId: 'task-a', title: 'before' };
   global.api = (url) => {
-    if (url === '/api/tasks/task-a') return ++taskViewCall === 1 ? oldTaskView.promise : freshTaskView.promise;
+    if (url.split('?')[0] === '/api/tasks/task-a') return ++taskViewCall === 1 ? oldTaskView.promise : freshTaskView.promise;
     return Promise.resolve(url.includes('/attempts') ? null : url.includes('/sessions') ? {} : []);
   };
   const oldTaskRefresh = refreshTask();

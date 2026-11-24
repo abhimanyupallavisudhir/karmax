@@ -74,4 +74,35 @@ async function fakeConsole(context, { origin = 'http://console.test', project, t
   return { requests, sockets };
 }
 
-module.exports = { fakeConsole, launch, reply, taskView };
+/**
+ * Answers `GET /api/tasks/<taskId>` and `/transcript` as the gateway does for
+ * a page that reads a window of a conversation (src/platform/conversation-window.ts):
+ * the newest ?messages=N, nothing of them while &known names the current
+ * revision, earlier ones by index. `current()` returns the task's full view.
+ * Undefined for any other request.
+ */
+function conversationWindowApi(taskId, current) {
+  return (p, url) => {
+    const view = current();
+    const messages = view.messages || [];
+    if (p === `/api/tasks/${taskId}`) {
+      const size = Number(url.searchParams.get('messages'));
+      if (!size) return view;
+      const from = Math.max(0, messages.length - size);
+      const window = messages.slice(from);
+      const revision = `${size}:${messages.length}:${JSON.stringify(window).length}`;
+      const { messages: _messages, transcripts, ...status } = view;
+      const conversationWindow = { revision, roles: { do: { from, total: messages.length } } };
+      if (url.searchParams.get('known') === revision) return { ...status, conversationWindow: { ...conversationWindow, unchanged: true } };
+      return { ...status, messages: window, ...(transcripts ? { transcripts: transcripts.map(({ role, label }) => ({ role, label, sameAsMessages: true })) } : {}), conversationWindow };
+    }
+    if (p === `/api/tasks/${taskId}/transcript`) {
+      const before = Math.min(Number(url.searchParams.get('before')), messages.length);
+      const from = Math.max(0, before - Number(url.searchParams.get('limit')));
+      return { role: 'do', from, total: messages.length, messages: messages.slice(from, before) };
+    }
+    return undefined;
+  };
+}
+
+module.exports = { conversationWindowApi, fakeConsole, launch, reply, taskView };

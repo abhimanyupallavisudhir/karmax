@@ -1777,6 +1777,9 @@ textarea.ask-input { resize: vertical; min-height: 4.5em; }
 /* The work between answers reads a step down from them. */
 .ck-thread .fold-body { font-size: var(--fs-14); line-height: 1.55; }
 /* Where a forked conversation branched off its source task: a rule naming it. */
+/* What a long conversation has not read yet: one quiet control at its top. */
+.conv-earlier { align-self: center; margin: 2px 0 6px; }
+.conv-earlier .btn { color: var(--ink-3); font-size: var(--fs-12); }
 .fork-point { display: flex; align-items: center; gap: 10px; margin: 6px 0; color: var(--ink-3); font-size: var(--fs-12); }
 .fork-point::before, .fork-point::after { content: ""; flex: 1; border-top: 1px dashed var(--line-strong); }
 .fork-point a { display: inline-flex; align-items: center; gap: 6px; max-width: 70%; color: inherit; text-decoration: none; }

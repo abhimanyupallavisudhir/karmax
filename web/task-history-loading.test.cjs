@@ -19,7 +19,7 @@ async function main() {
   const paints = [];
   const view = { taskId: 'task', messages: [{ role: 'user', text: 'review' }] };
   const event = { seq: 10, type: 'agent.activity', payload: { role: 'do', kind: 'message', title: 'Findings' } };
-  const c = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0,
+  const c = vm.createContext({ CONVERSATION_WINDOW: 100, noteRowAskEvent: () => {}, rowAskEpoch: 0,
     document: { hidden: false }, resourceReviewCache: new Map(), resourceInventoryCache: new Map(),
     S: { tasks: [], organizationId: 'org' }, term: null,
     DEFAULT_EXPLANATION_SETTINGS: {},
@@ -33,12 +33,12 @@ async function main() {
     api: async url => {
       if (url.endsWith('/events?since=0&limit=300')) return history.promise;
       if (url.split('?')[0].endsWith('/sessions')) return sessions.promise;
-      if (url === '/api/tasks/task') return view;
+      if (url.split('?')[0] === '/api/tasks/task') return view;
       if (url.endsWith('/explanation-settings')) return { effective: {} };
       return [];
     },
   });
-  vm.runInContext(['explanationsEnabled', 'mergeTaskHistory', 'refreshTaskHistory', 'showsTaskApprovals', 'showDraftPage', 'noteTriggerFired', 'isSeries', 'openTask'].map(extract).join('\n'), c);
+  vm.runInContext(['explanationsEnabled', 'mergeTaskHistory', 'refreshTaskHistory', 'showsTaskApprovals', 'showDraftPage', 'noteTriggerFired', 'isSeries', 'openTask', 'fetchTaskView', 'taskViewUrl', 'adoptConversation'].map(extract).join('\n'), c);
   let opened = false;
   const opening = c.openTask('task', 'checkin').then(() => { opened = true; });
   await tick();
@@ -71,8 +71,9 @@ async function main() {
       if (url.includes('/attempt-a/') && ++attemptReads === 1) return staleAttemptHistory.promise;
       return [{ ...event, taskId: url.includes('/attempt-a/') ? 'attempt-a' : 'attempt-b', seq: 30 }];
     }
-    if (url === '/api/tasks/attempt-a' || url === '/api/tasks/attempt-b')
-      return { ...view, taskId: url.split('/').pop() };
+    const path = url.split('?')[0];
+    if (path === '/api/tasks/attempt-a' || path === '/api/tasks/attempt-b')
+      return { ...view, taskId: path.split('/').pop() };
     if (url.endsWith('/explanation-settings')) return { effective: {} };
     return [];
   };
