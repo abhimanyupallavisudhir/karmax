@@ -3245,7 +3245,7 @@ async function softwareDevImpl(
     // Current coordinators park that request until a credential recovers.
     if (grant?.accountId === '(denied)') {
       if (cancelled) throw new Cancelled();
-      throw new CredentialDenied(`No usable ${credentialProvider} credential — every allowed login/key needs attention (funding, re-auth, or re-enable it in credential settings).`);
+      throw new CredentialDenied(`No usable ${credentialProvider} credential — every allowed login/key needs attention: top it up, sign in again, or switch it back on in Settings → Agents.`);
     }
     const passthrough = !grant || grant.accountId === '(passthrough)';
     const leasedHome = passthrough ? undefined : grant?.configHome;

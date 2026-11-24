@@ -509,7 +509,7 @@ export async function refreshClaudeAccessToken(
 
 function claudeSignedOut(configHome: string) {
   const account = path.basename(configHome).replace(/^claude-/, '');
-  const message = `Claude login claude:${account} was signed out by Anthropic (its sign-in expired or was revoked); sign in again in Settings → Codex/Claude`;
+  const message = `Claude login claude:${account} was signed out by Anthropic (its sign-in expired or was revoked); sign in again in Settings → Agents`;
   return providerFailure(message, {
     kind: 'credential',
     permanence: 'hard',
@@ -645,7 +645,7 @@ function codexAccessTokenExpiresAt(configHome?: string): number | undefined {
 function codexSignedOut(configHome?: string) {
   const account = path.basename(path.resolve(configHome ?? process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex')))
     .replace(/^codex-/, '');
-  const message = `Codex login codex:${account} was signed out by OpenAI (its sign-in expired or was revoked); sign in again in Settings → Codex/Claude`;
+  const message = `Codex login codex:${account} was signed out by OpenAI (its sign-in expired or was revoked); sign in again in Settings → Agents`;
   return providerFailure(message, {
     kind: 'credential',
     permanence: 'hard',

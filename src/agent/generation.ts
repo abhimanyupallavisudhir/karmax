@@ -229,7 +229,7 @@ async function keyFor(deps: GenerationDeps, organizationId: string): Promise<{ k
   }
   if (deps.broker && await includedModel(deps.store, deps.broker))
     return { key: await includedModelKey(deps.store, deps.broker, organizationId), funding: 'credit' };
-  throw new GenerationUnavailable('Generation needs an OpenRouter key: connect an OpenRouter API key in Settings → Agent logins'
+  throw new GenerationUnavailable('Generation needs an OpenRouter key: connect an OpenRouter API key in Settings → Agents'
     + (deps.store.hosted ? '' : ', or set OPENROUTER_API_KEY'));
 }
 
@@ -253,7 +253,7 @@ async function failure(deps: GenerationDeps, organizationId: string, funding: Ge
     const credit = await computeCredit(deps.store, organizationId).catch(() => undefined);
     if (credit?.availableMicros != null && credit.availableMicros < INCLUDED_MODEL_MIN_MICROS) return outOfCompute(deps.store, organizationId, 'openrouter');
     return new GenerationUnavailable(`${BRAND}'s OpenRouter balance has run out, not your credit: nothing was charged. `
-      + 'Try again once the operator has topped it up, or connect your own OpenRouter API key in Settings → Agent logins.');
+      + 'Try again once the operator has topped it up, or connect your own OpenRouter API key in Settings → Agents.');
   }
   if (response.status >= 400 && response.status < 500) return new GenerationRequestError(`OpenRouter: ${message || response.statusText}`, response.status === 404 ? 404 : 400);
   return new Error(`OpenRouter failed (${response.status}): ${message}`);

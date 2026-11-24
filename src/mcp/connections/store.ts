@@ -67,7 +67,7 @@ export class McpConnections {
       if (projectId && (await this.store.getProject(projectId))?.organizationId !== this.organizationId) throw new Error('Project does not belong to this organization');
       const prior = input.id ? (await this.get(input.id, projectId)) : undefined;
       if (prior && prior.projectId !== projectId) throw new Error('Edit this connection in its owning settings');
-      if (!prior && (await this.all()).length >= 200) throw new Error('Connection limit reached (200 per organization)');
+      if (!prior && (await this.all()).length >= 200) throw new Error('Connection limit reached (200 per organization): remove one in Settings → Connected apps');
       const transport = validateTransport(input.transport);
       const auth = input.auth ?? 'none';
       if (!['none', 'secrets', 'oauth'].includes(auth) || (auth === 'oauth' && transport.type === 'stdio')) throw new Error('Invalid authentication method');
@@ -118,7 +118,7 @@ export class McpConnections {
         connection.secretNames = Object.keys(secrets);
       }
       const connections = (await this.all()).filter((c) => c.id !== connection.id);
-      if (connections.length >= 200) throw new Error('Connection limit reached (200 per organization)');
+      if (connections.length >= 200) throw new Error('Connection limit reached (200 per organization): remove one in Settings → Connected apps');
       (await this.store.setSettings(this.key(), 'mcp', { connections: [...connections, connection] }));
       if (oauthData !== undefined) await this.setSecret(connection, oauthData);
       return connection;

@@ -736,7 +736,7 @@ function isMissingSnapshot(error: unknown): boolean {
 
 function explainDaytonaError(error: unknown): unknown {
   if (/network access is restricted and cannot be overridden/i.test(String(error)))
-    return new Error('Custom network rules require Daytona Tier 3 or higher. Upgrade Daytona or select unrestricted networking in Compute settings; Daytona account restrictions still apply.', { cause: error });
+    return new Error('Custom network rules require Daytona Tier 3 or higher. Upgrade Daytona at https://app.daytona.io/dashboard, or choose Full internet for this task\'s Computer in Parameters; Daytona account restrictions still apply.', { cause: error });
   return error;
 }
 

@@ -29,7 +29,7 @@ export async function leasedOAuthRefresh(leases: RefreshLeases, handle: string, 
   });
   return stored === undefined ? {} : JSON.parse(stored);
 }
-export type OAuthTarget = Pick<McpConnection, 'id' | 'organizationId' | 'label' | 'auth' | 'transport' | 'revision'>;
+export type OAuthTarget = Pick<McpConnection, 'id' | 'organizationId' | 'projectId' | 'label' | 'auth' | 'transport' | 'revision'>;
 
 export const MCP_CLIENT_METADATA_PATH = '/api/mcp-client-metadata';
 export function mcpClientMetadata(publicOrigin = process.env.KARMAX_PUBLIC_URL) {
@@ -47,7 +47,7 @@ async function authorize(...args: Parameters<typeof auth>) {
   catch (error) {
     // Without registration or client metadata documents, the server accepts only clients registered with it in advance.
     if (error instanceof Error && error.message.includes('does not support dynamic client registration'))
-      throw new Error('This MCP server needs an OAuth app registered with it. Add it in Tools settings with that app’s client details.');
+      throw new Error('This MCP server needs an OAuth app registered with it. Add it in Settings → Connected apps (+ Add custom MCP) with that app’s client details.');
     throw new Error('MCP authorization failed. Retry sign-in, or check the server’s required OAuth client details and installation callback URL.');
   }
 }
@@ -119,7 +119,7 @@ export async function connectionHeaders(service: OAuthVault, c: OAuthTarget, tas
   return exclusive(`${c.organizationId}:${c.id}`, async () => {
     let data = await service.secret(c, taskId);
     const refresh = async (current: any, store: OAuthVault) => {
-      await authorize(provider(store, c, current, current.redirect, () => { throw new Error(`Reconnect “${c.label}” in MCP settings`); }),
+      await authorize(provider(store, c, current, current.redirect, () => { throw new Error(`Reconnect “${c.label}” in ${c.projectId ? 'Project settings' : 'Settings'} → Connected apps`); }),
         { serverUrl: (c.transport as any).url, fetchFn: publicFetch });
       return current;
     };
@@ -130,7 +130,7 @@ export async function connectionHeaders(service: OAuthVault, c: OAuthTarget, tas
       // The SDK saves into `current` as it goes; the lease writes it back once.
       data = await service.refresh(c, taskId, data, (current) => refresh(current, { secret: async () => current, setSecret: async () => {} }));
     }
-    if (!data.tokens?.access_token) throw new Error(`Connect “${c.label}” in MCP settings before running this task`);
+    if (!data.tokens?.access_token) throw new Error(`Connect “${c.label}” in ${c.projectId ? 'Project settings' : 'Settings'} → Connected apps before running this task`);
     return { Authorization: `Bearer ${data.tokens.access_token}` };
   });
 }

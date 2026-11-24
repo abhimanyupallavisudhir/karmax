@@ -111,7 +111,7 @@ async function agentQueueTarget(deps: CoordinatorActivityDeps,
       return {
         workflowId: agentQueueId(organizationId),
         capacity: 0,
-        detail: `${entitlements.planName} allows ${limit} organization user${limit === 1 ? '' : 's'}, but this organization has ${entitlements.currentMemberCount}. Remove ${extra} member${extra === 1 ? '' : 's'} or restore Team to start another agent run.`,
+        detail: `${entitlements.planName} allows ${limit} organization user${limit === 1 ? '' : 's'}, but this organization has ${entitlements.currentMemberCount}. Remove ${extra} member${extra === 1 ? '' : 's'} in Settings → People & authorization, or restore Team in Plan & billing, to start another agent run.`,
       };
     }
     return {
