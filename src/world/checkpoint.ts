@@ -320,28 +320,35 @@ export class WorldCheckpointService {
   /**
    * A task whose Computer says "Any" comes back where it ran when that
    * provider still fits and has room, else on the next candidate
-   * (compute-router.ts). Undefined when the task names a provider.
+   * (compute-router.ts). So does one whose provider is only inherited (its
+   * project's or organization's default) once that provider can never serve
+   * its world: it can't reach tavya for the project's data, or hold it.
+   * Undefined when the task stays on its provider.
    */
   private async restoreRouted(checkpointId: string, handle: WorldHandle): Promise<WorldHandle | undefined> {
     const checkpoint = await this.store.getWorldCheckpoint(checkpointId);
     const project = checkpoint ? await this.store.getProject(checkpoint.projectId) : undefined;
     if (!project?.organizationId) return undefined;
     const config = await this.store.effectiveTaskConfig(project, handle.id);
-    if (!isAnyProvider(config.worldProvider)) return undefined;
     const organizationId = project.organizationId;
     const tavyaNeed = await reachesTavya(this.store, checkpoint!.projectId);
     const dataNeed = await setupDataNeed(this.store, checkpoint!.projectId, checkpointRevisions(checkpoint!));
-    const route = await this.router!.route(organizationId, config, handle.kind, { taskId: handle.id, worldId: handle.id },
-      { ...(tavyaNeed ? { reachesTavya: tavyaNeed } : {}), ...(dataNeed ? { holdsData: dataNeed } : {}) });
+    const more = { ...(tavyaNeed ? { reachesTavya: tavyaNeed } : {}), ...(dataNeed ? { holdsData: dataNeed } : {}) };
+    const gaveWay = isAnyProvider(config.worldProvider) ? undefined : await this.router!.cannotServe(organizationId, handle.kind, more);
+    if (!isAnyProvider(config.worldProvider) && !gaveWay) return undefined;
+    const route = await this.router!.route(organizationId, config, handle.kind, { taskId: handle.id, worldId: handle.id }, more);
     const { value: restored } = await this.router!.run(organizationId, route,
       (candidate, reason) => this.restore(checkpointId, candidate.provider as WorldKind, { ...ambientActivityHooks(), routed: reason }),
       (decision) => this.store.appendEvent({ taskId: handle.id, type: 'world.routed', ts: Date.now(),
-        payload: { ...decision, restore: true, from: handle.kind, checkpointId } }).then(() => undefined));
+        payload: { ...decision, restore: true, from: handle.kind, checkpointId, ...(gaveWay ? { gaveWay: { provider: handle.kind, reason: gaveWay } } : {}) } })
+        .then(() => undefined));
     if (restored.kind !== handle.kind) {
       await this.store.appendEvent({ taskId: handle.id, type: 'world.moved', ts: Date.now(),
         payload: { from: handle.kind, to: restored.kind, checkpointId, generation: restored.generation, routed: true } });
-      await this.addNotice(handle.id, `This task now runs on ${providerLabel(restored.kind)} (its Computer lets ${BRAND} choose, and `
-        + `${providerLabel(handle.kind)} ${route.candidates.some((candidate) => candidate.provider === handle.kind) ? 'had no room' : 'no longer fits it'}). `
+      await this.addNotice(handle.id, `This task now runs on ${providerLabel(restored.kind)} (`
+        + (gaveWay ? `${providerLabel(handle.kind)}, its default computer, can't serve it: ${gaveWay}). `
+          : `its Computer lets ${BRAND} choose, and ${providerLabel(handle.kind)} `
+          + `${route.candidates.some((candidate) => candidate.provider === handle.kind) ? 'had no room' : 'no longer fits it'}). `)
         + 'You are on a new machine with the same files your repositories track, the same uncommitted changes and the same project data. '
         + 'Git-ignored files (installed dependencies, build output, caches) and running processes did not carry over: reinstall or restart what you need.');
     }

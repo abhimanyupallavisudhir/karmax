@@ -30,7 +30,7 @@ import { ServiceError, WorkflowNotFoundError, WorkflowUpdateFailedError, isGrpcS
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
 import { COMPUTE_HOLD, computeCredit, creditsUrl, holdManagedCompute, outOfCompute, type ComputeHoldRequest } from '../world/managed-compute.js';
-import { MANAGED_COMPUTE } from '../world/connections.js';
+import { MANAGED_COMPUTE, type ComputerFitSpec } from '../world/connections.js';
 import { capacityCause, ComputeRouter, type RouterConnections } from '../world/compute-router.js';
 import { accountKey, dequeue, enqueue, wakeFullKey } from '../world/compute-queue.js';
 import { MachineQueued, leaseWaitDeadline } from '../world/machine-wait.js';
@@ -130,7 +130,8 @@ import { publicShare, publicConversationHtml } from '../gateway/conversation-sha
 import { hostHoldsSession, remoteAgentHomeRelative, isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome, readRemoteImport, RemoteAgentCliUnavailable } from '../agent/remote-process.js';
 import { checkWorldDisk, diskNotice, diskRatio, diskWasFull, DISK_REARM_RATIO, DISK_WARN_RATIO, isDiskFullMessage, largestWorldPaths,
   outOfDiskMessage, worldUsage, type DiskCheck } from '../world/disk.js';
-import { ComputerUnfit, computerLimits, diskHolding } from '../domain/computer-limits.js';
+import { ComputerUnfit, DISK_CANNOT_HOLD_DATA, computerLimits, diskHolding, providerLabel } from '../domain/computer-limits.js';
+import { taskProvider } from '../world/task-provider.js';
 import { materializeFileAttachments } from '../agent/files.js';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -2371,7 +2372,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       startCancellationHeartbeat(kind);
       // Provider "Any": the router picks the provider below (compute-router.ts).
-      const routed = isAnyProvider(kind);
+      let routed = isAnyProvider(kind);
       const remote = routed || isRemote(kind);
       if (store.hosted && !remote)
         throw new Error(`hosted deployments cannot run task code in the control plane (${kind}); select a remote runner`);
@@ -2437,16 +2438,33 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
       const organizationId = project?.organizationId ?? 'org_personal';
+      // A provider the task's own Computer names is a pin: one that can never
+      // serve its world stops the task for a person to choose another. One it
+      // only inherits (its project's or organization's default) was never
+      // chosen for this task: one that can't serve it gives way to "Any",
+      // which picks one that can, as its refusal would have told a person to
+      // (tavya-error e47f1fedac093871: every run of an automation stopped).
+      const inherited = !routed && !(await taskProvider(store, args.taskId))
+        && Boolean(project && deps.providerConnections?.list && deps.providerConnections.managedConnections);
+      /** Why `kind` can never serve this world, when it gives way to "Any";
+       * undefined when it serves it; the refusal when it is the task's own. */
+      const servedHere = async (spec: ComputerFitSpec): Promise<string | undefined> => {
+        try { await deps.providerConnections!.assertFits(organizationId, kind, spec); return undefined; }
+        catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (inherited && isComputerChoiceEscalation(message)) return message;
+          throw unfitFailure(error) ?? (spec.reachesTavya ? ApplicationFailure.create({ type: 'computer-unfit', nonRetryable: true, message }) : error);
+        }
+      };
+      /** Why the inherited provider gave way to "Any" (world.routed). */
+      let gaveWay: string | undefined;
       // What its world must fetch from tavya itself (its data): an account
       // with basic internet never reaches tavya, so a named one is refused
       // before any machine is made, and "Any" passes it over (tavya-reach.ts).
       const tavyaNeed = projectId && remote ? await reachesTavya(store, projectId) : undefined;
       if (tavyaNeed && !routed && deps.providerConnections) {
-        try { await deps.providerConnections.assertFits(organizationId, kind, { reachesTavya: tavyaNeed }); }
-        catch (error) {
-          throw ApplicationFailure.create({ type: 'computer-unfit', nonRetryable: true,
-            message: error instanceof Error ? error.message : String(error) });
-        }
+        gaveWay = await servedHere({ reachesTavya: tavyaNeed });
+        if (gaveWay) routed = true;
       }
       // Resolve the human creator's profile. A tenant-wide identity is only valid
       // for a system-created task with no human ancestor.
@@ -2512,8 +2530,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // times over before a person heard of it (tavya-error 3b4ed193f5ec0941).
       const dataNeed = projectId && remote ? await setupDataNeed(store, projectId, setupRevisions) : undefined;
       if (dataNeed && !routed && deps.providerConnections) {
-        try { await deps.providerConnections.assertFits(organizationId, kind, { holdsData: dataNeed }); }
-        catch (error) { throw unfitFailure(error) ?? error; }
+        gaveWay = await servedHere({ holdsData: dataNeed });
+        if (gaveWay) routed = true;
       }
       /** The task's Computer on `kind`, its disk large enough for the data. */
       const sizedFor = (kind: WorldKind): typeof executionConfig => {
@@ -2863,9 +2881,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (!router || !project) throw new Error('provider "Any" needs a project and connected computers');
       const route = await router.route(organizationId, executionConfig, undefined, { taskId: args.taskId, worldId: args.taskId },
         { ...(tavyaNeed ? { reachesTavya: tavyaNeed } : {}), ...(dataNeed ? { holdsData: dataNeed } : {}) });
+      const instead = gaveWay ? `${providerLabel(kind)}, the default, ${gaveWay.includes(DISK_CANNOT_HOLD_DATA)
+        ? DISK_CANNOT_HOLD_DATA : `can't reach ${BRAND}`}` : undefined;
       try {
-        return (await router.run(organizationId, route, (candidate, reason) => provisionOn(candidate.provider as WorldKind, reason),
-          async (decision) => { await record(args.taskId, 'world.routed', { ...decision }); })).value;
+        return (await router.run(organizationId, route,
+          (candidate, reason) => provisionOn(candidate.provider as WorldKind, instead ? `${instead}; ${reason}` : reason),
+          async (decision) => { await record(args.taskId, 'world.routed', { ...decision,
+            ...(gaveWay ? { gaveWay: { provider: kind, reason: gaveWay } } : {}) }); })).value;
       } catch (error) {
         stopCancellationHeartbeat();
         throw capacityFailure(error) ?? error;
