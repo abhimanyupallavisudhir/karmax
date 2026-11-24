@@ -17,9 +17,11 @@ function page(server) {
       taskApprovalsFor: 't', taskApprovalsCount: 1 },
     taskRecord: () => ({ projectId: 'p' }), projectById: () => ({ organizationId: 'o' }), pendingCancellationView: v => v,
     renderTaskPage: () => {}, scheduleTaskPageRender: () => {}, showDraftPage: () => {},
-    api: (url) => { reads.push(url.replace(/\?.*/, '')); return Promise.resolve(server(url)); },
+    CONVERSATION_WINDOW: 100,
+    // The task's view is read as a window of its conversation (taskViewUrl).
+    api: (url) => { reads.push(url.replace(/\?.*/, '')); return Promise.resolve(server(url.replace(/\?messages=\d+(?:&known=[^&]*)?$/, ''))); },
   });
-  vm.runInContext(['refreshTask', 'isSeries', 'showsTaskApprovals', 'ensureTaskApprovals'].map(fn).join('\n'), ctx);
+  vm.runInContext(['refreshTask', 'fetchTaskView', 'taskViewUrl', 'adoptConversation', 'isSeries', 'showsTaskApprovals', 'ensureTaskApprovals'].map(fn).join('\n'), ctx);
   return { ctx, reads };
 }
 const settle = async (ctx) => { for (let i = 0; i < 20; i++) await new Promise(r => setImmediate(r)); };

@@ -191,7 +191,7 @@ eval(extractFn('wireAttempts'));
   let oldView;
   let viewCalls = 0;
   global.api = async (url) => {
-    if (url === '/api/tasks/attempt-1') {
+    if (url.split('?')[0] === '/api/tasks/attempt-1') {
       if (++viewCalls === 1) return new Promise((resolve) => { oldView = resolve; });
       return { taskId: 'attempt-1', title: 'Latest' };
     }
@@ -207,6 +207,10 @@ eval(extractFn('wireAttempts'));
   eval(extractFn('showDraftPage'));
   eval(extractFn('noteTriggerFired'));
   eval(extractFn('openTask'));
+  eval(extractFn('fetchTaskView'));
+  eval(extractFn('taskViewUrl'));
+  eval(extractFn('adoptConversation'));
+  global.CONVERSATION_WINDOW = 100;
   const staleOpen = openTask('attempt-1', 'checkin', true);
   await openTask('attempt-1', 'checkin', true);
   oldView({ taskId: 'attempt-1', title: 'Stale' });

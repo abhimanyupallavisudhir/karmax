@@ -4517,14 +4517,24 @@ function wireMessageCopies(root = document) {
 }
 
 // Shared with the public conversation reader; keep console callers unchanged.
+// Every repaint of a task page renders each message drawn, and rendering
+// (sanitizing above all) is most of a repaint's cost: the cache holds the
+// messages of a conversation window and more, least recently used out first.
 function renderMarkdown(src, opts = {}) {
   const cache = renderMarkdown.cache ||= new Map();
   const key = JSON.stringify([src, opts]);
-  if (cache.has(key)) return cache.get(key);
+  const hit = cache.get(key);
+  if (hit !== undefined) { cache.delete(key); cache.set(key, hit); return hit; }
   const html = globalThis.KarmaxMarkdown.renderMarkdown(src, opts);
-  if (key.length + html.length <= 64_000) {
-    if (cache.size >= 128) cache.delete(cache.keys().next().value);
+  const size = key.length + html.length;
+  if (size <= 64_000) {
     cache.set(key, html);
+    renderMarkdown.chars = (renderMarkdown.chars || 0) + size;
+    while (cache.size > 1000 || renderMarkdown.chars > 8_000_000) {
+      const [oldest, value] = cache.entries().next().value;
+      cache.delete(oldest);
+      renderMarkdown.chars -= oldest.length + value.length;
+    }
   }
   return html;
 }
@@ -11501,6 +11511,82 @@ function liveOutputFor(v, role) {
   return live.text;
 }
 
+// A task page reads the newest CONVERSATION_WINDOW messages of its conversation,
+// and earlier ones only as the reader asks (Earlier, scrolling to the top, Find):
+// a month-long task's every open and refresh carried its whole conversation,
+// and every event redrew all of it (wiki ops/performance-history). A refresh
+// names the revision it holds, and the server leaves the messages out while it
+// is current.
+const CONVERSATION_WINDOW = 100;
+const EARLIER_MESSAGES_PAGE = 200;
+function taskViewUrl(taskId, known) {
+  return `/api/tasks/${encodeURIComponent(taskId)}?messages=${CONVERSATION_WINDOW}${known ? `&known=${encodeURIComponent(known)}` : ''}`;
+}
+// The view a page shows: `view`'s window, after the earlier messages the page
+// already holds (messages are only ever added at the end, and changed near it).
+// Null when the server said the window was unchanged but there is none to keep.
+function adoptConversation(view, previous) {
+  const win = view?.conversationWindow;
+  if (!win) return view;
+  const prior = previous?.taskId === view.taskId && previous.conversationWindow ? previous : null;
+  if (win.unchanged) return prior
+    ? { ...view, messages: prior.messages, transcripts: prior.transcripts, conversationWindow: { ...prior.conversationWindow, revision: win.revision } }
+    : null;
+  const roles = {};
+  const merge = (role, fresh) => {
+    const at = win.roles?.[role] || { from: 0, total: fresh.length };
+    const held = prior?.conversationWindow.roles?.[role];
+    const old = held && (role === 'do' ? prior.messages : prior.transcripts?.find((t) => t.role === role)?.messages);
+    if (old && held.from < at.from && held.total <= at.total) {
+      roles[role] = { from: held.from, total: at.total };
+      return [...old.slice(0, at.from - held.from), ...fresh];
+    }
+    roles[role] = at;
+    return fresh;
+  };
+  const messages = merge('do', view.messages || []);
+  const transcripts = view.transcripts?.map((t) => t.sameAsMessages
+    ? { role: t.role, label: t.label, messages } : { ...t, messages: merge(t.role, t.messages || []) });
+  return { ...view, messages, ...(transcripts ? { transcripts } : {}), conversationWindow: { ...win, roles } };
+}
+// The open task's view, its conversation adopted onto what the page holds.
+async function fetchTaskView(taskId, previous) {
+  const known = previous?.taskId === taskId ? previous.conversationWindow?.revision : undefined;
+  const view = await api(taskViewUrl(taskId, known));
+  if (!view) return view;
+  return adoptConversation(view, previous) ?? adoptConversation(await api(taskViewUrl(taskId)), null);
+}
+// Earlier messages of the open conversation: a page of them, or `all`.
+async function loadEarlierMessages(role, { all = false } = {}) {
+  const v = S.view;
+  const held = v?.conversationWindow?.roles?.[role];
+  if (!held?.from) return;
+  const key = `${v.taskId}/${role}/${held.from}`;
+  const pending = loadEarlierMessages.pending ||= new Map();
+  if (pending.has(key)) return pending.get(key);
+  const promise = (async () => {
+    const limit = all ? held.from : EARLIER_MESSAGES_PAGE;
+    const page = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/transcript?role=${encodeURIComponent(role)}&before=${held.from}&limit=${Math.min(limit, 1000)}`);
+    const now = S.view;
+    if (now?.taskId !== v.taskId || now.conversationWindow?.roles?.[role]?.from !== held.from) return;
+    const prepend = (messages) => [...(page.messages || []), ...messages];
+    const messages = role === 'do' ? prepend(now.messages || []) : now.messages;
+    const transcripts = now.transcripts?.map((t) => t.role === 'do' ? { ...t, messages } : t.role === role ? { ...t, messages: prepend(t.messages || []) } : t);
+    S.view = { ...now, messages, ...(transcripts ? { transcripts } : {}),
+      conversationWindow: { ...now.conversationWindow, roles: { ...now.conversationWindow.roles, [role]: { ...held, from: page.from } } } };
+    renderTaskPage();
+    // A page of up to 1000 at a time: `all` goes on until none is left.
+    if (all && page.from > 0) await loadEarlierMessages(role, { all });
+  })().catch((error) => toast(error.message, true)).finally(() => pending.delete(key));
+  pending.set(key, promise);
+  if (S.selected === v.taskId) scheduleTaskPageRender(); // shows it loading
+  return promise;
+}
+function loadingEarlierMessages(v, role) {
+  const from = v?.conversationWindow?.roles?.[role]?.from;
+  return !!from && !!loadEarlierMessages.pending?.has(`${v.taskId}/${role}/${from}`);
+}
+
 async function refreshTaskHistory(taskId) {
   const rec = taskRecord(taskId);
   if (rec?.params?.draft || rec?.params?.repeatable) return [];
@@ -11676,7 +11762,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       draft ? Promise.resolve([]) : api(`/api/tasks/${encodeURIComponent(taskId)}/explanations`).catch(() => []),
       api(`/api/connections?${approvalQuery}`).catch(() => []),
     ]);
-    const view = await api(`/api/tasks/${taskId}`);
+    const view = await fetchTaskView(taskId, null);
     if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
     // No execution yet: a draft or a task waiting for its trigger is its form.
     if (!view) { if (!showDraftPage(taskId) && !$('#tf-page')) renderTaskLoadingPage(rec, null, true); return; }
@@ -11745,7 +11831,7 @@ async function refreshTask(reason = 'all') {
     // whatever landed meanwhile, e.g. the approvals ensureTaskApprovals loaded.
     const load = (wanted, url) => wanted ? api(url).catch(() => undefined) : undefined;
     const [view, widgets, sessions, attempts, connections] = await Promise.all([
-      api(`/api/tasks/${id}`),
+      fetchTaskView(id, S.view),
       // Widgets are resolved against the view (the rail's stage and changed
       // files), so every lifecycle publication re-resolves them.
       load(has(/view\.updated|review|stage|turn\.result/), `/api/tasks/${id}/widgets`),
@@ -12004,7 +12090,8 @@ function openTagPicker(rec, setTags) {
 function captureConversationScroll(thread) {
   if (!thread) return null;
   const top = thread.getBoundingClientRect().top;
-  const anchor = [...thread.querySelectorAll('[data-conversation-key]')]
+  // The Earlier control stays at the top as messages arrive above it: never the anchor.
+  const anchor = [...thread.querySelectorAll('[data-conversation-key]:not([data-conversation-key="earlier"])')]
     .find((row) => row.getBoundingClientRect().bottom > top);
   return { top: thread.scrollTop, atBottom: thread.scrollHeight - thread.scrollTop - thread.clientHeight <= 2,
     key: anchor?.dataset.conversationKey, offset: anchor ? anchor.getBoundingClientRect().top - top : 0 };
@@ -12323,6 +12410,7 @@ function renderTaskPage() {
     wireTerminal(v.taskId);
     wireExplainMessages(v);
     wireConversationSearch();
+    wireEarlierMessages(document.getElementById('ck-thread'));
   } else if (tab === 'parameters') {
     wireParams(v);
     paintParticipantStates(v);
@@ -13968,16 +14056,18 @@ function toggleTaskTerminal(v = S.view) {
 // Check-in: talking to the task — every agent's conversation (Do / Merge /
 // Merge, SPEC §5.5/§5.6) plus the ephemeral terminal, behind a small sidebar.
 // Falls back to `messages` (Do) for workflows that predate per-role transcripts.
+// `from`: how many earlier messages the page has not read (CONVERSATION_WINDOW).
 function taskTranscripts(v) {
+  const from = (role) => v.conversationWindow?.roles?.[role]?.from || 0;
   // One conversation with several speakers (software-dev ≥1.27): the agents are
   // listed beside it, not as separate transcripts.
-  if (sharedConversation(v)) return [{ role: 'do', label: 'Conversation', messages: v.messages || [], shared: true },
-    ...(S.meta?.resolveAgentEnabled ? (v.transcripts || []).filter((t) => t.role === 'resolve') : [])];
+  if (sharedConversation(v)) return [{ role: 'do', label: 'Conversation', messages: v.messages || [], shared: true, from: from('do') },
+    ...(S.meta?.resolveAgentEnabled ? (v.transcripts || []).filter((t) => t.role === 'resolve').map((t) => ({ ...t, from: from(t.role) })) : [])];
   return (v.transcripts && v.transcripts.length)
     ? v.transcripts
         .filter((t) => S.meta?.resolveAgentEnabled || t.role !== 'resolve')
-        .map((t) => t.role === 'do' ? { ...t, label: 'Agent' } : t)
-    : [{ role: 'do', label: 'Agent', messages: v.messages || [] }];
+        .map((t) => ({ ...t, ...(t.role === 'do' ? { label: 'Agent' } : {}), from: from(t.role) }))
+    : [{ role: 'do', label: 'Agent', messages: v.messages || [], from: from('do') }];
 }
 // The conversation owning the active stage — it gets the live bubble and is the
 // default pane (in Review that's the agent whose work is being reviewed).
@@ -14093,6 +14183,8 @@ function openConversationSearch() {
   if (S.conversationSearch?.key !== key) S.conversationSearch = { key, query: '', index: -1 };
   if (fromSelection) Object.assign(S.conversationSearch, { query: fromSelection, index: -1 });
   renderTaskPage();
+  // Find looks through the whole conversation: read what the page has not.
+  loadEarlierMessages(thread.dataset.role, { all: true });
   const input = document.getElementById('ck-find-input');
   input?.focus();
   input?.select();
@@ -14323,8 +14415,8 @@ function conversationPane(v, t) {
   const question = before?.entry.type === 'message' && messageOrigin(before.entry.message) === 'person' ? before : null;
   const opened = S.conversationFolds?.[`${v.taskId}/${t.role}`] || {};
   loadForkHistory(v, t.role);
-  const inherited = inheritedConversationHtml(v, t, opened);
-  const msgs = historyStatus + inherited + (outline.map((item) => item.fold
+  const inherited = t.from > 0 ? '' : inheritedConversationHtml(v, t, opened);
+  const msgs = historyStatus + inherited + earlierMessagesHtml(v, t) + (outline.map((item) => item.fold
     ? conversationFoldHtml(item, item.key, opened, row)
     : row(item.entry, item === land ? ' data-land' : item === question ? ' data-land-question' : '')).join('')
     || (historyStatus || inherited ? '' : '<div class="msg system">No messages yet</div>'));
@@ -14348,6 +14440,35 @@ function conversationPane(v, t) {
   return `${conversationSearchBar(v, t)}
     <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${pending}${live}${conversationWaitNotice(v)}${conversationError(v)}${conversationApprovalRequests()}${conversationPullRequestAsks(v)}${conversationReviewInfo(v, resourceRequestIndex >= 0)}</div></div>
     ${fu}`;
+}
+
+// The control that reads a conversation's earlier messages; scrolling up to it
+// reads them too (wireEarlierMessages). A fork's inherited conversation comes
+// after all of them, so it waits until they are read.
+function earlierMessagesHtml(v, t) {
+  if (!(t.from > 0)) return '';
+  const loading = loadingEarlierMessages(v, t.role);
+  return `<div class="conv-earlier" data-conversation-key="earlier"><button type="button" class="btn sm" data-earlier-messages="${esc(t.role)}"${loading ? ' disabled aria-busy="true"' : ''}>${loading ? 'Loading earlier messages…' : `${t.from} earlier message${t.from === 1 ? '' : 's'}`}</button></div>`;
+}
+function wireEarlierMessages(thread) {
+  const button = thread?.querySelector('[data-earlier-messages]');
+  if (button && !button.earlierWired) {
+    button.earlierWired = true;
+    button.addEventListener('click', () => loadEarlierMessages(button.dataset.earlierMessages));
+  }
+  // A person scrolling up near the top reads the next page, as in a chat; the
+  // page putting the thread somewhere (a landing, a refresh) does not.
+  if (!thread || thread.earlierWired) return;
+  thread.earlierWired = true;
+  let intent = 0;
+  const touched = () => { intent = Date.now(); };
+  for (const type of ['touchstart', 'touchmove', 'wheel']) thread.addEventListener(type, touched, { passive: true });
+  thread.addEventListener('keydown', touched);
+  thread.addEventListener('scroll', () => {
+    if (thread.scrollTop > 600 || Date.now() - intent > 1000) return;
+    const role = thread.querySelector('[data-earlier-messages]:not([disabled])')?.dataset.earlierMessages;
+    if (role) loadEarlierMessages(role);
+  }, { passive: true });
 }
 
 // Who a message goes to, and on a computer how to call others in. A phone's box
@@ -14616,8 +14737,12 @@ function conversationEntries(t, events = S.taskEvents) {
       sourceKey: e.sourceKey, conversationRole: t.role, ts,
       sortTs: ts, order: wait?.seq ?? event.seq ?? event.ts });
   }
-  const combined = [...messages, ...posted.values(), ...visibleActivities, ...requests.values()];
+  let combined = [...messages, ...posted.values(), ...visibleActivities, ...requests.values()];
   combined.sort((a, b) => (Number(a.sortTs || 0) - Number(b.sortTs || 0)) || (Number(a.order || 0) - Number(b.order || 0)));
+  // A page that has not read the earlier messages (`from`) shows nothing from
+  // before the first it has: the rest comes with them.
+  const since = t.from > 0 ? messages.find((entry) => Number(entry.sortTs) > 100000000000)?.sortTs : undefined;
+  if (since) combined = combined.filter((entry) => messages.includes(entry) || entry.answer || Number(entry.sortTs) >= since);
   const explanations = new Map();
   for (const event of orderedEvents) {
     if (event.type !== 'conversation.explanation' || event.payload?.role !== t.role || !event.payload?.sourceKey) continue;
@@ -14637,6 +14762,8 @@ function conversationEntries(t, events = S.taskEvents) {
   for (const explanation of explanations.values()) {
     const target = targetByKey.get(explanation.explanation.sourceKey)
       ?? (explanation.activityRef ? targetByKey.get(`activity-ref:${explanation.activityRef}`) : undefined);
+    // One about a message the page has not read yet comes with that message.
+    if (target == null && since && Number(explanation.sortTs) < since) continue;
     if (target == null) { orphaned.push(explanation); continue; }
     const list = byTarget.get(target) || [];
     list.push(explanation);
@@ -14653,7 +14780,7 @@ function conversationEntries(t, events = S.taskEvents) {
   // Malformed legacy annotations may lack any resolvable source. Preserve them
   // rather than losing durable data; valid activity annotations always have the
   // recovered source event above and therefore never take this fallback.
-  out.push(...orphaned);
+  out.push(...(since ? orphaned.filter((entry) => Number(entry.sortTs) >= since) : orphaned));
   return out;
 }
 
@@ -14790,15 +14917,19 @@ function conversationFoldHead(fold) {
   return `<summary class="fold-head" title="${esc(tip)}"><span class="fold-icon" aria-hidden="true">${fold.automatic ? '↻' : '⋯'}</span><span class="fold-label">${esc(label)}</span>${fold.automatic && latest ? `<span class="fold-preview">${esc(foldPreview(latest))}</span>` : '<span class="fold-gap"></span>'}<span class="fold-count">${steps} step${steps === 1 ? '' : 's'}${fold.automatic && span ? ` · ${esc(span)}` : ''}</span></summary>`;
 }
 
+// Building an Intl.DateTimeFormat is far dearer than using one, and every
+// repaint formats every row's time.
 function conversationTime(ts) {
   if (Number(ts) < 100000000000) return '';
   const date = new Date(Number(ts));
   if (Number.isNaN(date.getTime())) return '';
-  const today = new Date();
-  const sameDay = date.toDateString() === today.toDateString();
-  return new Intl.DateTimeFormat(undefined, sameDay
+  const now = new Date();
+  const sameDay = date.getFullYear() === now.getFullYear() && date.getMonth() === now.getMonth() && date.getDate() === now.getDate();
+  const formats = conversationTime.formats ||= {};
+  const format = formats[sameDay ? 'time' : 'date'] ||= new Intl.DateTimeFormat(undefined, sameDay
     ? { hour: '2-digit', minute: '2-digit', second: '2-digit' }
-    : { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(date);
+    : { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  return format.format(date);
 }
 
 function conversationTimeHtml(ts) {
@@ -16825,7 +16956,7 @@ function isParamDraftField(draft, name) {
 function paramCurrentValue(f, v, rec) {
   const own = (rec && rec.params) || {};
   if (f.calledAgent) return own[f.name] ?? v.agents?.[f.role] ?? f.participant?.spec;
-  if (f.bind === 'prompt') return own.prompt ?? (v.messages || []).find((m) => m.role === 'user')?.text ?? '';
+  if (f.bind === 'prompt') return own.prompt ?? (v.conversationWindow?.roles?.do?.from ? [] : v.messages || []).find((m) => m.role === 'user')?.text ?? '';
   if (f.name === 'target') return v.targetBranch ?? own.target ?? '';
   if (f.name === 'base') return v.base ?? own.base ?? '';
   if (f.type === 'agent' && f.role) {
