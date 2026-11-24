@@ -1,5 +1,6 @@
 import type { Store } from '../store/db.js';
 import type { StorageNotice } from './managed-storage.js';
+import { creditsUrl } from './managed-compute.js';
 
 const GB = 1024 ** 3;
 const size = (bytes: number) => bytes >= GB ? `${(bytes / GB).toFixed(1)} GB` : `${Math.ceil(bytes / 1024 ** 2)} MB`;
@@ -23,7 +24,9 @@ export function storageNotifier(deps: {
     if (notice.stage === 'resolved' || !deps.email || !(await deps.email.configured())) return;
     const organization = (await deps.store.getOrganization(notice.organizationId));
     const site = (await deps.siteName());
-    const message = storageNoticeEmail(notice, organization?.name ?? notice.organizationId, site, deps.publicUrl);
+    // Where storage is added: the organization's own Plan & billing.
+    const planUrl = deps.publicUrl ? await creditsUrl(deps.store, notice.organizationId, deps.publicUrl) : undefined;
+    const message = storageNoticeEmail(notice, organization?.name ?? notice.organizationId, site, planUrl);
     for (const userId of owners) {
       const to = (await deps.userEmail(userId).catch(() => undefined));
       if (to) await deps.email.send({ to, ...message }).catch((error) =>
@@ -32,16 +35,16 @@ export function storageNotifier(deps: {
   };
 }
 
-export function storageNoticeEmail(notice: StorageNotice, organization: string, site: string, publicUrl?: string): { subject: string; text: string } {
+export function storageNoticeEmail(notice: StorageNotice, organization: string, site: string, planUrl?: string): { subject: string; text: string } {
   const used = `${size(notice.retainedBytes)} of ${size(notice.quotaBytes)}`;
-  const manage = publicUrl ? `\n\nManage storage: ${publicUrl.replace(/\/$/, '')}/settings` : '';
+  const manage = planUrl ? `\n\nAdd storage in Plan & billing: ${planUrl}` : '';
   if (notice.stage === 'deleted') return {
     subject: `${organization}: stored data was deleted on ${site}`,
     text: `${organization} stayed over its ${site} storage limit for 12 months, so stored data was deleted, older versions first, until it fits (${used} used now).${manage}`,
   };
-  const when = notice.stage === 'over' ? `on ${day(notice.deleteAt)}` : `on ${day(notice.deleteAt)} (${notice.stage === '7d' ? '7' : '30'} days)`;
+  const when = notice.stage === 'over' ? day(notice.deleteAt) : `${day(notice.deleteAt)} (${notice.stage === '7d' ? '7' : '30'} days)`;
   return {
     subject: `${organization} is over its ${site} storage limit`,
-    text: `${organization} uses ${used} of storage on ${site}. Until it is within the limit, you can view, download and delete data but not add more.\n\nFree space or upgrade before ${when}; after that, stored data will be deleted, older versions first, until it fits.${manage}`,
+    text: `${organization} uses ${used} of storage on ${site}. Until it is within the limit, you can view, download and delete data but not add more.\n\nFree space, or add storage in Plan & billing, before ${when}; after that, stored data will be deleted, older versions first, until it fits.${manage}`,
   };
 }

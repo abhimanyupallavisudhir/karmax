@@ -703,7 +703,7 @@ function refusalNotice(error: CheckpointRefusedError): string {
 }
 
 function overQuotaNotice(over: { retainedBytes: number; quotaBytes: number; largest: Array<{ path: string; bytes: number }> }): string {
-  return [`Your organization's storage is over its quota (${formatBytes(over.retainedBytes)} of ${formatBytes(over.quotaBytes)}). This checkpoint was kept, but new uploads are refused until data is deleted or the plan grows. Largest uncommitted files:`,
+  return [`Your organization's storage is over its quota (${formatBytes(over.retainedBytes)} of ${formatBytes(over.quotaBytes)}). This checkpoint was kept, but new uploads are refused until data is deleted or storage is added in Plan & billing. Largest uncommitted files:`,
     ...over.largest.map(file => `- ${file.path} (${formatBytes(file.bytes)})`),
     'Commit what belongs in the repository, add generated or downloaded files to .gitignore, or delete what is no longer needed.'].join('\n');
 }

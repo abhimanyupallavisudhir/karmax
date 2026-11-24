@@ -4636,7 +4636,8 @@ function plainTaskError(text) {
     ? 'The conversation grew too long for the AI model. Send a shorter message, or start a new task.'
     : /safety rejection|content policy|flagged/i.test(body) ? 'The AI provider declined this request. Rephrase it and try again.'
     : /No usable \S+ credential|has no usable .* credential/i.test(body) ? 'No AI account is available to run this task. Ask an admin to connect one in organization settings.'
-    : /usage limit|rate.?limit|insufficient_quota|credit balance|billing/i.test(body) ? 'The AI account reached its usage limit. tavya continues when it resets, or an admin can add another account.'
+    : /insufficient_quota|credit balance|requires more credits|insufficient credits|billing\/quota unavailable/i.test(body) ? 'The AI account is out of credit. Top it up at its provider, or add another account.'
+    : /usage limit|rate.?limit|(?<!Plan & )billing/i.test(body) ? 'The AI account reached its usage limit. tavya continues when it resets, or an admin can add another account.'
     : /SIGKILL|out of memory|OOM killer|more memory than it has/i.test(body) ? 'The task’s computer ran out of memory. Retry, or choose a bigger computer in Parameters.'
     : /^Out of disk/i.test(body) ? body.replace(/\s*\(POST \/api\/[^)]*\)/g, '').replace(/\s*Last error:[\s\S]*$/, '')
     : /Sandbox is probably not running|envd|exited with code -1|sandbox (?:was )?(?:restarted|stopped|not found)/i.test(body) ? 'The task’s computer stopped responding. Retry usually fixes this.'
@@ -4662,7 +4663,45 @@ function toolsDidNotStart(text) {
 // an agent account, a computer, compute credit, GitHub.
 // Storage refused over the organization's quota, however it was said.
 function storageFull(text) { return /storage quota exceeded|organization's storage is full/i.test(String(text || '')); }
-function setupFixes(text, projectId) {
+// Where a model login or key is added, with its provider already chosen
+// (Settings → Agents → Add an account; applyAddAccountHint reads `add`).
+const SUBSCRIPTION_LOGINS = new Set(['claude', 'codex']);
+const API_KEY_PROVIDERS = ['anthropic', 'openai', 'google', 'xai', 'kimi', 'moonshotai', 'openrouter', 'groq', 'mistral', 'deepseek'];
+function addAccountHref(provider) {
+  const add = SUBSCRIPTION_LOGINS.has(provider) || API_KEY_PROVIDERS.includes(provider) ? `?add=${encodeURIComponent(provider)}` : '';
+  return `${globalRoute('organization')}${add}#account-add`;
+}
+/** A link from a fix (addAccountHref) chooses the provider to add, once. */
+function applyAddAccountHint() {
+  const params = new URLSearchParams(location.search);
+  const provider = params.get('add');
+  if (!provider) return;
+  params.delete('add');
+  history.replaceState(history.state, '', `${location.pathname}${params.size ? `?${params}` : ''}${location.hash}`);
+  const login = $('#login-provider'), key = $('#acct-provider');
+  if (login && SUBSCRIPTION_LOGINS.has(provider)) { login.value = provider; $('#login-name')?.focus({ preventScroll: true }); }
+  else if (key && API_KEY_PROVIDERS.includes(provider)) { key.value = provider; $('#acct-name')?.focus({ preventScroll: true }); }
+}
+/** Another login for work that waits on, or was stopped by, a login's limit. */
+function addLoginFix(provider) {
+  const who = ACCOUNT_PROVIDER_LABELS[provider] || '';
+  const what = SUBSCRIPTION_LOGINS.has(provider) ? `${who} subscription or API key` : `${who ? `${who} ` : ''}login or API key`;
+  return { label: 'Add a login', href: addAccountHref(provider), title: `Connect another ${what}: work uses it while this one is used up` };
+}
+// An API key out of money is topped up at its provider (a new tab), or replaced here.
+// Each provider's own words first; failing those, the provider a message names
+// (OpenRouter before the labs whose models it routes).
+const PROVIDER_BILLING = [
+  [/credit balance is too low/i, /\banthropic\b/i, 'Anthropic', 'https://platform.claude.com/settings/billing'],
+  [/insufficient_quota|exceeded your current quota/i, /\bopenai\b/i, 'OpenAI', 'https://platform.openai.com/settings/organization/billing/overview'],
+  [/requires more credits|insufficient credits/i, /\bopenrouter\b/i, 'OpenRouter', 'https://openrouter.ai/settings/credits'],
+];
+function providerBillingFix(text) {
+  const found = PROVIDER_BILLING.find(([said]) => said.test(text))
+    ?? [PROVIDER_BILLING[2], PROVIDER_BILLING[0], PROVIDER_BILLING[1]].find(([, named]) => named.test(text));
+  return found ? { label: `Add ${found[2]} credits`, href: found[3], external: true } : null;
+}
+function setupFixes(text, projectId, taskId) {
   const raw = String(text || '');
   const settings = globalRoute('organization');
   const plan = `${settings}#settings-plan`, computers = `${settings}#settings-computers`;
@@ -4684,7 +4723,11 @@ function setupFixes(text, projectId) {
     && !/This organization's \S+ account/.test(raw)) return [own];
   if (storageFull(raw)) return [{ label: 'Add storage', href: plan }];
   // The plan's own limits: agents at once, people, the Free plan's computer size.
-  if (/Waiting for \S+ plan capacity|allows \d+ organization users?, but this organization has/.test(raw)) return [{ label: 'Change plan', href: plan }];
+  if (/Waiting for \S+ plan capacity/.test(raw)) return [{ label: 'Change plan', href: plan }];
+  if (/allows \d+ organization users?, but this organization has/.test(raw))
+    return [{ label: 'Change plan', href: plan }, { label: 'Members', href: `${settings}#settings-people` }];
+  // Self-hosted: this machine runs as many agents as Installation → Host capacity allows.
+  if (/^Waiting for host capacity\b/.test(raw) && S.installationAccess) return [{ label: 'Host capacity', href: `${installationRoute()}#installation-capacity` }];
   if (/on the Free plan: choose a plan/.test(raw)) return [{ label: 'Choose a plan', href: plan }];
   if (/No usable \S+ credential|has no usable .* credential|^No \S+ credential\b|Every allowed credential needs attention/i.test(raw))
     return [{ label: 'Manage accounts', href: `${settings}#settings-agents` }];
@@ -4694,8 +4737,19 @@ function setupFixes(text, projectId) {
   if (/GitHub PR identity is not connected|Connect GitHub on your profile|reconnect GitHub on your profile/i.test(raw))
     return [{ label: 'Connect GitHub', href: '/profile' }];
   if (/connect GitHub in organization settings/i.test(raw)) return [{ label: 'Connect GitHub', href: `${settings}#settings-code` }];
-  // A login's quota is spent until it resets: another login runs it now.
-  if (/Out of quota until a login resets|Waiting for \S+ quota/.test(raw)) return [{ label: 'Add a login', href: `${settings}#settings-agents` }];
+  // A login's quota is spent until it resets, or every login is busy: another login runs it now.
+  const login = /^(?:Waiting for (?:a free )?|Needs an? )(\w+)\b/.exec(raw)?.[1]?.toLowerCase();
+  if (/Out of quota until a login resets|Waiting for \S+ quota|Provider usage limit reached|Every allowed login is running all it may|Waiting for a free \S+ login/.test(raw))
+    return [addLoginFix(login)];
+  // A model said its account hit a limit: a subscription's resets (another login runs
+  // the work now); an API key out of money is topped up at its provider.
+  if (/insufficient_quota|credit balance|requires more credits|insufficient credits|billing\/quota unavailable/i.test(raw)) {
+    const billing = providerBillingFix(raw);
+    return [...(billing ? [billing] : []), { label: 'Manage accounts', href: `${settings}#settings-agents` }];
+  }
+  if (/usage limit|session limit|weekly limit|hit your (?:\w+ )?limit|rate.?limit/i.test(raw) && !/github/i.test(raw)) return [addLoginFix(login)];
+  // A login signed out, or a key the provider refused: sign in again, or replace it.
+  if (/\bcredential rejected\b|was signed out by/i.test(raw)) return [{ label: 'Manage accounts', href: `${settings}#settings-agents` }];
   // GitHub refused to let tavya write: approved on GitHub (the message gives the address), managed here.
   if (/GitHub refused to let \S+ write to|GitHub App workflow permission required/.test(raw)) {
     const onGithub = /https:\/\/github\.com\/[\w./-]*?settings\/installations\/\d+/.exec(raw)?.[0];
@@ -4704,48 +4758,71 @@ function setupFixes(text, projectId) {
   }
   // Waiting its turn, or for room, on tavya's computers: one's own account starts it now.
   if (/waiting ahead of this one for \S+'s |\S+'s? disks take \d+ of (?:their|its) \d+ GB/.test(raw)) return [own];
+  // The task's computer ran out of memory: a bigger one, in its Parameters.
+  if (taskId && /more memory than it has|ran out of memory and was stopped|out of memory: killed process/i.test(raw))
+    return [{ label: 'Bigger computer', href: `${taskUrl(taskId)}/parameters` }];
   // Otherwise: the places it names.
-  return namedPlaces(raw, projectId);
+  return namedPlaces(raw, projectId, taskId);
 }
 /** Every settings place a message can name, linked: a message that tells a
  * person where to change something takes them there. */
-function namedPlaces(text, projectId) {
+const INSTALLATION_PLACES = { 'Host capacity': 'capacity', 'Managed compute': 'compute', 'Phone apps': 'phone-apps', Composio: 'composio', Email: 'email', GitHub: 'github', 'Service limits': 'limits', 'Error reports': 'errors', 'Early access': 'early-access' };
+function namedPlaces(text, projectId, taskId) {
   const settings = globalRoute('organization');
   const project = projectId ? projectRoute(projectId, 'settings') : '';
   const places = [
+    [/\b(?:in|under) (?:its |this task's |the task's )?Parameters\b/, 'Parameters', taskId && `${taskUrl(taskId)}/parameters`],
     [/Plan & billing/, 'Plan & billing', `${settings}#settings-plan`],
     [/Settings \u2192 Computers?\b/, 'Computers', `${settings}#settings-computers`],
     [/Settings \u2192 Agents\b/, 'Agents', `${settings}#settings-agents`],
+    [/Project settings \u2192 Connected apps/i, 'Connected apps', project && `${project}#project-connections`],
+    [/Settings \u2192 Connected apps/, 'Connected apps', `${settings}#settings-connections`],
+    [/Settings \u2192 People\b/, 'Members', `${settings}#settings-people`],
     [/Project settings \u2192 Task defaults/i, 'Task defaults', project && `${project}#project-defaults`],
     [/Settings \u2192 Environment\b/, 'Environment', project && `${project}#project-environment`],
     [/Settings \u2192 (?:Git & GitHub|Resources)\b|organization settings \u2192 GitHub/i, 'GitHub', `${settings}#settings-code`],
     [/\bon your profile\b/, 'Profile', '/profile'],
+    // An operator's places, for an operator.
+    ...Object.entries(INSTALLATION_PLACES).map(([name, id]) => [new RegExp(`Installation \u2192 ${name}\\b`), name,
+      S.installationAccess ? `${installationRoute()}#installation-${id}` : '']),
     [/\b[Pp]roject settings\b/, 'Project settings', project],
     [/\b[Oo]rganization settings\b/, 'Organization settings', settings],
   ];
   const found = [];
   for (const [pattern, label, href] of places)
     if (href && pattern.test(text) && !found.some((place) => place.href === href || place.href.split('#')[0] === href)) found.push({ label, href });
+  // A provider's own page the message gives (its billing, its limits), in a new tab.
+  for (const address of String(text).match(/https:\/\/[^\s)"'<>]+[^\s)"'<>.,;:]/g) || []) {
+    let url;
+    try { url = new URL(address); } catch { continue; }
+    // Not tavya's own places (linked above by name), nor a provider's documentation.
+    if (url.origin === location.origin || /^#(?:settings|project|installation)-/.test(url.hash) || url.hostname.startsWith('docs.')
+      || found.some((place) => place.href === url.href)) continue;
+    found.push({ label: `Open ${url.hostname.replace(/^(?:www|app|console|dashboard)\./, '')}`, href: url.href, external: true });
+  }
   return found.slice(0, 2);
 }
 function setupFix(text) { return setupFixes(text)[0] ?? null; }
-function setupFixHtml(text, projectId) {
-  return setupFixes(text, projectId).map((fix, index) => ` <a class="btn sm setup-fix${index ? ' ghost' : ''}" ${fix.external
-    ? 'target="_blank" rel="noopener"' : 'data-spa'} href="${esc(fix.href)}">${esc(fix.label)}</a>`).join('');
+function setupFixHtml(text, projectId, taskId) {
+  return fixesHtml(setupFixes(text, projectId, taskId));
+}
+function fixesHtml(fixes, ghost = false) {
+  return fixes.map((fix, index) => ` <a class="btn sm setup-fix${index || ghost ? ' ghost' : ''}" ${fix.external
+    ? 'target="_blank" rel="noopener"' : 'data-spa'} href="${esc(fix.href)}"${fix.title ? ` title="${esc(fix.title)}"` : ''}>${esc(fix.label)}</a>`).join('');
 }
 // An error shown in place of what failed to load: the plain sentence, the
 // exact text on hover (for whoever reports it).
-function inlineErrorHtml(error) {
+function inlineErrorHtml(error, projectId) {
   const raw = String(error?.message ?? error ?? '');
   const plain = plainError(error);
-  return plain === raw ? esc(plain) : `<span title="${esc(raw)}">${esc(plain)}</span>`;
+  return `${plain === raw ? esc(plain) : `<span title="${esc(raw)}">${esc(plain)}</span>`}${setupFixHtml(raw, projectId)}`;
 }
 function taskErrorHtml(text, projectId, taskId) {
   const { summary: said, detail, generic } = plainTaskError(text);
-  const fixes = setupFixes(text, projectId).length;
+  const fixes = setupFixes(text, projectId, taskId).length;
   const summary = generic && !fixes && !/\bretry\b/i.test(said) ? `${said} Press Retry to try again.` : said;
   // An error a setting fixes is the person's to fix; any other can be reported.
-  return `<div class="msg-text">${esc(summary)}${setupFixHtml(text, projectId)}${fixes ? '' : reportErrorHtml(taskId)}</div>${detail ? `<details class="error-details"><summary>Details</summary><pre>${esc(detail)}</pre></details>` : ''}`;
+  return `<div class="msg-text">${esc(summary)}${setupFixHtml(text, projectId, taskId)}${fixes ? '' : reportErrorHtml(taskId)}</div>${detail ? `<details class="error-details"><summary>Details</summary><pre>${esc(detail)}</pre></details>` : ''}`;
 }
 
 // ── Report an error (wiki features/error-reports) ────────────────────────────
@@ -16067,16 +16144,17 @@ function conversationWaitNotice(v) {
   const w = v.waitingFor;
   // A wait for a machine is one line; what is full and where is its tooltip.
   const machine = waitTitle(v);
-  if (machine) return `<div class="msg system wait-notice" role="status" title="${esc(machine)}">${esc(waitingText(w))}</div>`;
+  if (machine) return `<div class="msg system wait-notice" role="status" title="${esc(machine)}">${esc(waitingText(w))}${setupFixHtml(machine, v.projectId, v.taskId)}</div>`;
   const reason = w?.kind === 'account' ? accountWaitReason(w) : '';
   if (reason === 'held')
     return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))} <button type="button" class="btn sm ghost" data-run-now="${esc(v.taskId)}" title="${esc(RUN_NOW_TIP)}">Run now</button></div>`;
-  // The label already says what it waits for and until when; a person can do nothing more here.
-  if (reason === 'quota' || reason === 'slot' || reason === 'planning')
-    return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))}</div>`;
+  // The label says what it waits for and until when; another login runs it now.
+  if (reason === 'quota' || reason === 'slot')
+    return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))}${fixesHtml([addLoginFix(w.provider)])}</div>`;
+  if (reason === 'planning') return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))}</div>`;
   const detail = presenceDetail(v);
   const raw = typeof w?.detail === 'string' ? w.detail.trim() : '';
-  return detail ? `<div class="msg system wait-notice" role="status"${raw && raw !== detail ? ` title="${esc(raw)}"` : ''}>${esc(waitingText(v.waitingFor))} · ${esc(detail)}${setupFixHtml(w?.detail, v.projectId)}</div>` : '';
+  return detail ? `<div class="msg system wait-notice" role="status"${raw && raw !== detail ? ` title="${esc(raw)}"` : ''}>${esc(waitingText(v.waitingFor))} · ${esc(detail)}${setupFixHtml(w?.detail, v.projectId, v.taskId)}</div>` : '';
 }
 
 // A targeted human hold carries the actual question a person must answer. Keep
@@ -18106,7 +18184,9 @@ function agentWorkPanel() {
     const pinned = rootTask?.pins?.length;
     const runNow = g.runNow
       ? `<button type="button" class="work-pin" data-run-now-undo="${esc(g.root)}" title="Running now: never held back for higher-priority work. Click to undo" aria-label="Undo run now">⏩</button>`
-      : g.status === 'held' ? `<button type="button" class="btn sm ghost" data-run-now="${esc(g.root)}" title="${esc(RUN_NOW_TIP)}">Run now</button>` : '';
+      : g.status === 'held' ? `<button type="button" class="btn sm ghost" data-run-now="${esc(g.root)}" title="${esc(RUN_NOW_TIP)}">Run now</button>`
+      // Every login it may use is used up: another login runs it now.
+      : g.status === 'quota' ? fixesHtml([addLoginFix()], true) : '';
     const subs = [...g.tasks.values()].filter((t) => t.taskId !== g.root);
     const subRows = subs.length ? `<div class="work-subs" data-root="${esc(g.root)}">${subs.map((t) => {
       const w = t.waiting[0];
@@ -18632,13 +18712,16 @@ function accountDetailHtml({ credential, account, snap, pollable, manage }) {
     const incident = accountIncidentHtml(account);
     if (incident) rows.push(row('Last issue', incident));
   }
-  const actions = credential.kind === 'login' && manage
+  // A key that needs attention is most often out of money: topped up at its provider.
+  const billing = credential.kind === 'key' && account?.status === 'needs-attention' ? providerBillingFix(credential.provider) : null;
+  const topUp = billing ? `<a class="btn sm" href="${esc(billing.href)}" target="_blank" rel="noopener" title="Top up this key at ${esc(billing.label.replace(/^Add | credits$/g, ''))}, then Mark available">${esc(billing.label)} ↗</a>` : '';
+  const actions = topUp + (credential.kind === 'login' && manage
     ? `${credential.signedOut ? '' : '<button type="button" class="btn sm ghost cred-signin-again">Sign in again</button>'}
        <button type="button" class="btn sm ghost cred-rename" title="Rename login">Rename</button>
        <button type="button" class="btn sm ghost danger cred-del" title="Delete login">Delete</button>`
     : credential.kind === 'key' && manage && credential.key.startsWith('key:handle:') && credential.account
       ? `<button type="button" class="btn sm ghost cred-key-edit" title="Edit API key">Edit key</button>
-         <button type="button" class="btn sm ghost danger cred-key-del" title="Delete API key">Delete</button>` : '';
+         <button type="button" class="btn sm ghost danger cred-key-del" title="Delete API key">Delete</button>` : '');
   return `<div class="acct-detail setting-rows ruled">${rows.join('')}${actions ? `<div class="acct-actions">${actions}</div>` : ''}
     <div class="cred-login-flow" hidden></div></div>`;
 }
@@ -24049,7 +24132,7 @@ function agentAccountsCard() {
       <div class="section-h section-h-action"><span>Accounts ${policyTip('Tasks use the first available account, in this order. Drag to reorder; switch one off to skip it. Projects can reorder them for themselves.')}</span>
         <button type="button" class="icon-btn usage-recheck-all" hidden title="Check usage of every account now" aria-label="Check usage of every account now">↻</button></div>
       <div id="cred-editor-global">Loading…</div>
-      <div class="section-h">Add an account</div>
+      <div class="section-h" id="account-add">Add an account</div>
       <div class="setting-rows ruled account-add">
       <div class="setting-row"><span class="setting-label">Subscription ${policyTip('Sign in with a Claude, ChatGPT/Codex or Grok subscription.')}</span>
         <div class="setting-value">
@@ -24067,8 +24150,7 @@ function agentAccountsCard() {
       <div class="setting-row"><span class="setting-label">API key</span>
         <div class="setting-value">
           <select id="acct-provider" aria-label="Model provider" class="account-provider"><option value="" disabled selected>Provider</option>
-            ${['anthropic', 'openai', 'google', 'xai', 'kimi', 'moonshotai', 'openrouter', 'groq', 'mistral', 'deepseek']
-              .map((id) => `<option value="${id}">${ACCOUNT_PROVIDER_LABELS[id]}</option>`).join('')}<option value="other">Other…</option></select>
+            ${API_KEY_PROVIDERS.map((id) => `<option value="${id}">${ACCOUNT_PROVIDER_LABELS[id]}</option>`).join('')}<option value="other">Other…</option></select>
           <input id="acct-provider-other" hidden placeholder="Provider id, e.g. togetherai" aria-label="Other model provider" class="account-provider" spellcheck="false" />
           <input id="acct-name" placeholder="Name, e.g. work" aria-label="Account name" class="grow" />
           <input id="acct-key" type="password" placeholder="Key" aria-label="API key" class="grow" />
@@ -26809,6 +26891,7 @@ function wireGlobalSettings(organizationId) {
     if ($('#login-opencode-note')) $('#login-opencode-note').hidden = !show;
   };
   $('#login-provider')?.addEventListener('change', syncLoginTarget);
+  applyAddAccountHint();
   syncLoginTarget();
   $('#main').querySelectorAll('[data-save]').forEach((b) =>
     b.addEventListener('click', async () => {

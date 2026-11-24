@@ -2721,11 +2721,11 @@ export class Store {
     if (entitlements.overMemberLimit) {
       const extra = count - entitlements.maxMembers;
       throw new EntitlementError(
-        `${entitlements.planName} allows ${entitlements.maxMembers} organization user${entitlements.maxMembers === 1 ? '' : 's'}, but this organization has ${count}. Remove ${extra} member${extra === 1 ? '' : 's'} or restore Team before adding another person.`,
+        `${entitlements.planName} allows ${entitlements.maxMembers} organization user${entitlements.maxMembers === 1 ? '' : 's'}, but this organization has ${count}. Remove ${extra} member${extra === 1 ? '' : 's'} in Settings → People & authorization, or restore Team in Plan & billing, before adding another person.`,
       );
     }
     throw new EntitlementError(
-      `${entitlements.planName} allows ${entitlements.maxMembers} organization user${entitlements.maxMembers === 1 ? '' : 's'}. Upgrade the plan before adding another person.`,
+      `${entitlements.planName} allows ${entitlements.maxMembers} organization user${entitlements.maxMembers === 1 ? '' : 's'}. Upgrade the plan in Plan & billing before adding another person.`,
     );
   }
 
@@ -9366,7 +9366,7 @@ export class Store {
       const limit = entitlements.maxMembers ?? 0;
       const extra = Math.max(1, entitlements.currentMemberCount - limit);
       throw new EntitlementError(
-        `${entitlements.planName} allows ${limit} organization user${limit === 1 ? '' : 's'}, but this organization has ${entitlements.currentMemberCount}. Remove ${extra} member${extra === 1 ? '' : 's'} or restore Team to start another agent run.`,
+        `${entitlements.planName} allows ${limit} organization user${limit === 1 ? '' : 's'}, but this organization has ${entitlements.currentMemberCount}. Remove ${extra} member${extra === 1 ? '' : 's'} in Settings → People & authorization, or restore Team in Plan & billing, to start another agent run.`,
       );
     }
     const policy = (await this.getOrganizationUsagePolicy(input.organizationId));

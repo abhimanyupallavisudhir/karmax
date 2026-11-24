@@ -2419,7 +2419,7 @@ describe('PR stage (remote policy "pr")', () => {
     await git(handle.root, ['commit', '-q', '-m', 'change']);
 
     await expect(core.openPr(handle, 'main', {})).rejects.toThrow(
-      /^Your GitHub connection needs to be renewed\. Open your profile and reconnect GitHub, then press Retry\. .*bad_refresh_token.*2026-08-17T06:30:00\.000Z.*not a branch-history conflict/i,
+      /^Your GitHub connection needs to be renewed\. Reconnect GitHub on your profile, then press Retry\. .*bad_refresh_token.*2026-08-17T06:30:00\.000Z.*not a branch-history conflict/i,
     );
     expect(transport).not.toHaveBeenCalled();
     await core.destroyWorld(handle);
@@ -2618,7 +2618,7 @@ describe('PR stage (remote policy "pr")', () => {
     expect(refused).toMatchObject({ type: 'repository-access', nonRetryable: true });
     expect(refused.message).toMatch(/acme\/secret is private/);
     expect(refused.message).toMatch(/install the tavya GitHub App on acme\/secret/);
-    expect(refused.message).toMatch(/token with the repo scope under Profile → GitHub → Token/);
+    expect(refused.message).toMatch(/token with the repo scope on your profile \(GitHub → Token\)/);
     expect(syncs).toEqual([]);
 
     const profiles = new GitProfiles(core.store, broker, path.join(tmp, 'state'), userGitScope('jane'));
@@ -3069,7 +3069,7 @@ describe('Pull requests opened as a person who cannot see the repository', () =>
   it('asks a creator whose GitHub connection broke to reconnect, in plain words', async () => {
     const { core, gh, handle } = await setup({ github: 'broken' });
     await expect(core.openPr(handle, 'main', { title: 'Member task' })).rejects.toThrow(
-      /^Your GitHub connection needs to be renewed\. Open your profile and reconnect GitHub, then press Retry\./);
+      /^Your GitHub connection needs to be renewed\. Reconnect GitHub on your profile, then press Retry\./);
     expect(gh.prs).toEqual([]);
   });
 

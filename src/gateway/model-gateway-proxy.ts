@@ -60,7 +60,7 @@ export async function proxyModelGateway(deps: { store: Store; broker?: Credentia
   if (store.hosted) {
     const credit = await computeCredit(store, grant.organizationId);
     if (credit.availableMicros != null && credit.availableMicros <= 0)
-      return refuse(res, 402, 'billing_error', (await outOfCompute(store, grant.organizationId, gateway.name)).message);
+      return refuse(res, 402, 'billing_error', (await outOfCompute(store, grant.organizationId, 'openrouter')).message);
   }
   let body: Buffer;
   try { body = await readBody(req); }

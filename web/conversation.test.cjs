@@ -34,6 +34,7 @@ global.projectById = () => ({ id: 'project-1', organizationId: 'org-1' });
 global.organizationById = () => ({ id: 'org-1' });
 global.currentOrg = () => ({ id: 'org-1' });
 global.globalRoute = () => '/org/settings';
+for (const name of ['SUBSCRIPTION_LOGINS', 'API_KEY_PROVIDERS', 'INSTALLATION_PLACES']) eval(`${src.match(new RegExp(`const ${name} = [^\\n]*`))[0]} global.${name} = ${name};`);
 global.projectRoute = () => '/org/project/settings';
 global.taskUrl = (id) => `/acme/app/tasks/${id}`;
 const preferences = new Map();
@@ -59,7 +60,7 @@ global.S = {
 };
 
 global.DEFAULT_EXPLANATION_SETTINGS = { model: 'google/gemini-3.6-flash' };
-for (const fn of ['safeHref', 'attachmentUrl', 'formatAttachmentBytes', 'renderMessageFiles', 'conversationTextKey', 'conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'worldWikiHref', 'worldFileAnchor', 'wikiRoute', 'decodeMarkdownAttribute', 'citedFileRaw', 'taskProjectId', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'renderWaitDetail', 'explanationModelLabel', 'explanationsEnabled', 'texToggleHtml', 'hasMath', 'plainError', 'permissionSentence', 'plainTaskError', 'toolsDidNotStart', 'storageFull', 'namedPlaces', 'setupFixes', 'setupFix', 'setupFixHtml', 'reportErrorHtml', 'taskErrorHtml', 'explainMessageAffordance', 'sharedConversation', 'participantLabelOf', 'messageOrigin', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'formEntryKey', 'formContext', 'withMessageForms', 'renderConversationEntry']) eval(extractFn(fn));
+for (const fn of ['safeHref', 'attachmentUrl', 'formatAttachmentBytes', 'renderMessageFiles', 'conversationTextKey', 'conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'worldWikiHref', 'worldFileAnchor', 'wikiRoute', 'decodeMarkdownAttribute', 'citedFileRaw', 'taskProjectId', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'renderWaitDetail', 'explanationModelLabel', 'explanationsEnabled', 'texToggleHtml', 'hasMath', 'plainError', 'permissionSentence', 'plainTaskError', 'toolsDidNotStart', 'storageFull', 'namedPlaces', 'setupFixes', 'setupFix', 'setupFixHtml', 'fixesHtml', 'addLoginFix', 'addAccountHref', 'providerBillingFix', 'reportErrorHtml', 'taskErrorHtml', 'explainMessageAffordance', 'sharedConversation', 'participantLabelOf', 'messageOrigin', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'formEntryKey', 'formContext', 'withMessageForms', 'renderConversationEntry']) eval(extractFn(fn));
 
 let pass = 0;
 let fail = 0;

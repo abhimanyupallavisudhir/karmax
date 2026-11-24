@@ -123,7 +123,7 @@ describe.each(storeBackends)('hosted plan entitlements ($name)', ({ name, open }
         memberAdmissionAllowed: false,
         agentRunAdmissionAllowed: false,
       });
-      await expect((async () => (await store.setOrganizationMembership(organization.id, 'fourth', 'member')))()).rejects.toThrow(`Remove 2 members or restore Team`);
+      await expect((async () => (await store.setOrganizationMembership(organization.id, 'fourth', 'member')))()).rejects.toThrow(`Remove 2 members in Settings → People & authorization, or restore Team`);
 
       (await store.removeOrganizationMembership(organization.id, 'second'));
       expect((await store.organizationEntitlements(organization.id))).toMatchObject({
@@ -221,7 +221,7 @@ describe.each(storeBackends)('hosted agent-run admission integration ($name)', (
       workflowVersion: '1.0.0', params: { prompt: 'run' } }));
     (await store.setOrganizationPlan(organization.id, 'free'));
     await expect((async () => (await store.admitAgentUsage({ id: 'blocked-turn', organizationId: organization.id,
-      projectId: project.id, taskId: task.id, provider: 'openai', fundingSource: 'byok' })))()).rejects.toThrow(/Remove 1 member or restore Team to start another agent run/);
+      projectId: project.id, taskId: task.id, provider: 'openai', fundingSource: 'byok' })))()).rejects.toThrow(/Remove 1 member in Settings → People & authorization, or restore Team in Plan & billing, to start another agent run/);
     expect(Number(((await store.db.prepare('SELECT COUNT(*) n FROM usage_admissions').get()) as any).n)).toBe(0);
   });
 
@@ -438,7 +438,7 @@ describe.each(storeBackends)('hosted agent-run admission integration ($name)', (
     });
     expect(admission).toMatchObject({
       granted: false, capacity: 0, queueId: `agent-queue:${organization.id}`,
-      detail: 'Free allows 1 organization user, but this organization has 3. Remove 2 members or restore Team to start another agent run.',
+      detail: 'Free allows 1 organization user, but this organization has 3. Remove 2 members in Settings → People & authorization, or restore Team in Plan & billing, to start another agent run.',
     });
     expect(admission.blocked).toBeUndefined();
     expect(executeUpdate).toHaveBeenCalledOnce();

@@ -238,7 +238,9 @@ export async function holdGeneration(store: Store, request: { id: string; organi
     + `or add credits or turn on auto top-up in Plan & billing (${await creditsUrl(store, request.organizationId)}).`);
 }
 
-/** Why managed work on `provider` cannot go on: the credit as it stands. */
+/** Why managed work on `provider` cannot go on: the credit as it stands. `provider`
+ * is a computer's provider, or `openrouter` for any model on the credit (the
+ * included model, a model gateway): its way out is a login of one's own. */
 export async function outOfCompute(store: Store, organizationId: string, provider: string, now = Date.now()): Promise<ComputeCreditExhausted> {
   return exhausted(await computeCredit(store, organizationId, now), provider, await creditsUrl(store, organizationId));
 }

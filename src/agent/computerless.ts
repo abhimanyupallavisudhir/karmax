@@ -61,7 +61,7 @@ export function chatCompletionsEndpoint(model: string | undefined): { vendor: st
 }
 
 const NEEDS_API = 'A task without a computer runs its agent on tavya itself, which takes an API key or tavya\'s included model. '
-  + 'Pick one of those as its Model, or give the task a computer.';
+  + 'Pick one of those as its Model in Parameters, or give the task a computer.';
 
 const loginName = (provider: string) => provider === 'claude' ? 'A Claude Code login' : provider === 'codex' ? 'A Codex login' : 'A login';
 
@@ -100,7 +100,7 @@ export function computerlessModelNeed(profile: Pick<AgentProfile, 'provider' | '
   if (rail.login && rail.compute === true) return undefined;
   if (rail.login) return { fix: 'computer', message: `${loginName(profile.provider)} replies from a small cloud computer, and ${
     rail.compute ?? 'this organization has none it can use'}. Connect a computer (Settings → Computers), or use an API key.` };
-  return { fix: 'key', message: `${loginName(profile.provider)} or an API key is needed: there is neither here.` };
+  return { fix: 'key', message: `${loginName(profile.provider)} or an API key is needed: there is neither here. Add one in Settings → Agents.` };
 }
 
 /** {@link computerlessModelNeed}'s sentence alone. */

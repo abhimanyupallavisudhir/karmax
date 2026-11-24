@@ -452,7 +452,7 @@ export function privateUpstreamGuidance(fork: Repository): string {
   return `${upstream} is private. GitHub shows a private repository to the ${BRAND} GitHub App only where the App is installed, `
     + `so ${BRAND} cannot open or follow a pull request there from your fork ${fork.owner}/${fork.name}. Either ask an owner of `
     + `${fork.upstream!.owner} to install the ${BRAND} GitHub App on ${upstream} and attach ${upstream} itself, or save a GitHub `
-    + `token with the repo scope under Profile → GitHub → Token, then retry.`;
+    + `token with the repo scope on your profile (GitHub → Token), then retry.`;
 }
 
 /** A proposal to someone else's repository carries only what its maintainers
@@ -1332,7 +1332,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const diagnostic = failure
           ? ` Technical detail: GitHub's last answer was "${failure.summary}" [${failure.code}, ${new Date(failure.occurredAt).toISOString()}].`
           : '';
-        throw new Error('Your GitHub connection needs to be renewed. Open your profile and reconnect GitHub, then press Retry.'
+        throw new Error('Your GitHub connection needs to be renewed. Reconnect GitHub on your profile, then press Retry.'
           + `${diagnostic} The pull request for ${slug} is opened as you; this is not a branch-history conflict.`);
       }
       throw new Error(`GitHub identity/authorization is missing for ${slug}. Grant the acting account access to this repository, then connect or re-authorize GitHub on your profile. This is not a branch-history conflict.`);
@@ -3357,7 +3357,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (store.hosted) {
             const credit = await computeCredit(store, organizationId);
             if (credit.availableMicros != null && credit.availableMicros < INCLUDED_MODEL_MIN_MICROS)
-              throw await outOfCompute(store, organizationId, rail.gateway.name);
+              // A model on the credit: its alternative is a login of one's own (Settings → Agents), not a computer.
+              throw await outOfCompute(store, organizationId, 'openrouter');
           }
           const root = proxyRoot(isRemote(args.worldHandle.kind));
           if (!root) throw ApplicationFailure.create({ nonRetryable: true, type: 'agent-error',
@@ -4549,7 +4550,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (rail?.kind === 'gateway' && store.hosted) {
           const credit = await computeCredit(store, organizationId).catch(() => undefined);
           if (credit?.availableMicros != null && credit.availableMicros < INCLUDED_MODEL_MIN_MICROS) {
-            const spent = await outOfCompute(store, organizationId, rail.gateway.name);
+            const spent = await outOfCompute(store, organizationId, 'openrouter');
             throw capacityFailure(spent) ?? spent;
           }
         }

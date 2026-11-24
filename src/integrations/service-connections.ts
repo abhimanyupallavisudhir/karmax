@@ -176,7 +176,7 @@ export class ServiceConnections {
     },
   };
   private target(c: ServiceConnection): OAuthTarget {
-    return { id: c.id, organizationId: c.organizationId, label: c.label, auth: c.mcp!.auth === 'github' ? 'oauth' : c.mcp!.auth,
+    return { id: c.id, organizationId: c.organizationId, projectId: c.ownerProjectId, label: c.label, auth: c.mcp!.auth === 'github' ? 'oauth' : c.mcp!.auth,
       transport: { type: c.mcp!.type, url: c.mcp!.url }, revision: c.revision ?? '' };
   }
 
@@ -329,9 +329,9 @@ export class ServiceConnections {
     try { entry = await registryServer(target); } catch (e) { throw new ConnectionError(e instanceof Error ? e.message : 'MCP Registry is unavailable', 502); }
     if (!entry) throw new ConnectionError(`No MCP Registry server is named ${target}`, 404);
     const remote = entry.options.find((o: any) => o.transport.type !== 'stdio');
-    if (!remote) throw new ConnectionError('This MCP server runs as a local process. Ask the user to add it in Tools settings.');
+    if (!remote) throw new ConnectionError('This MCP server runs as a local process. Ask the user to add it in Settings → Connected apps (+ Add custom MCP).');
     if (remote.fields.some((f: any) => f.isRequired || f.isSecret))
-      throw new ConnectionError('This MCP server needs an API key. Ask the user to add it in Tools settings.');
+      throw new ConnectionError('This MCP server needs an API key. Ask the user to add it in Settings → Connected apps (+ Add custom MCP).');
     return { transport: remote.transport as RemoteMcpTransport, label: entry.title && entry.title !== entry.name ? entry.title : entry.name,
       registry: { name: entry.name, version: entry.version } };
   }
@@ -557,7 +557,7 @@ export class ServiceConnections {
     if (!this.canUse(c, await this.taskChain(taskId), projectId)) throw new ConnectionError('This account has not been shared with this task or project', 403);
     const account = c.grantedConnectionId && c.status === 'active' ? (await this.get(org, c.grantedConnectionId)) : c;
     if (c.status !== 'active' || account.ownerId !== c.ownerId || account.status !== 'active' || !(account.mcp || account.sessionId))
-      throw new ConnectionError('Reconnect this account in Connections before using it', 409);
+      throw new ConnectionError(`Reconnect this account in ${c.ownerProjectId ? 'Project settings' : 'Settings'} → Connected apps before using it`, 409);
     return account;
   }
   async tools(org: string, id: string, taskId: string, projectId: string, search: string) {
@@ -589,7 +589,7 @@ export class ServiceConnections {
       if (c.instant) return this.executeInstant(c, taskId, projectId, slug, args);
       if (!await timed('service.account-check.remote', () => this.remote(async () => (await this.backend()).active(c.accountId!, c.toolkit)))) {
         c.status = 'expired'; c.sessionId = undefined; (await this.save(c));
-        throw new ConnectionError('Account access expired; reconnect it in Connections', 409);
+        throw new ConnectionError(`Account access expired; reconnect it in ${c.ownerProjectId ? 'Project settings' : 'Settings'} → Connected apps`, 409);
       }
       // Membership may have changed while checking the provider account.
       (await this.authorized(org, id, taskId, projectId));
@@ -645,7 +645,7 @@ export class ServiceConnections {
         ? { Authorization: `Bearer ${await this.github!.token(this.githubUser(c)!, c.mcp!.githubAccountId!)}` }
         : await connectionHeaders(this.vault, this.target(c), taskId);
     }
-    catch { throw new ConnectionError('Account access expired; reconnect it in Connections', 409); }
+    catch { throw new ConnectionError(`Account access expired; reconnect it in ${c.ownerProjectId ? 'Project settings' : 'Settings'} → Connected apps`, 409); }
     let client: Awaited<ReturnType<OpenMcp>> | undefined;
     try {
       client = await this.openMcp({ type: c.mcp!.type, url: c.mcp!.url }, headers);

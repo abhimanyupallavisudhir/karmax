@@ -49,6 +49,15 @@ vm.runInContext(
     extractFunction('setupFixes'),
     extractFunction('setupFix'),
     extractFunction('setupFixHtml'),
+    extractFunction('fixesHtml'),
+    extractConst('SUBSCRIPTION_LOGINS'),
+    extractConst('API_KEY_PROVIDERS'),
+    extractConst('INSTALLATION_PLACES'),
+    extractConst('PROVIDER_BILLING'),
+    extractFunction('addAccountHref'),
+    extractFunction('addLoginFix'),
+    extractFunction('providerBillingFix'),
+    extractFunction('namedPlaces'),
     extractFunction('waitTitle'),
     extractFunction('conversationWaitNotice'),
     extractFunction('humanWaitDetail'),
@@ -298,10 +307,11 @@ describe('waiting labels in task summaries', () => {
         detail: 'Free allows 1 organization user, but this organization has 2.',
       },
     })).toContain('Free allows 1 organization user, but this organization has 2.');
-    // A wait for quota says what it waits for and until when, once.
+    // A wait for quota says what it waits for and until when, once, and links adding another login.
     const reset = Date.now() + 3_600_000;
     expect(conversationWaitNotice({ waitingFor: { kind: 'account', provider: 'claude', reason: 'quota', earliestResetAt: reset,
-      detail: 'Out of quota until a login resets' } })).toBe(`<div class="msg system wait-notice" role="status">Waiting for Claude quota until ${waitDeadline(reset)}</div>`);
+      detail: 'Out of quota until a login resets' } })).toBe(`<div class="msg system wait-notice" role="status">Waiting for Claude quota until ${waitDeadline(reset)}`
+      + ' <a class="btn sm setup-fix" data-spa href="/org/settings?add=claude#account-add" title="Connect another Claude subscription or API key: work uses it while this one is used up">Add a login</a></div>');
     // A login that needs a person keeps its explanation.
     expect(conversationWaitNotice({ waitingFor: { kind: 'account', provider: 'claude', reason: 'login',
       detail: 'Every allowed credential needs attention — sign in again or add one' } })).toContain('sign in again');

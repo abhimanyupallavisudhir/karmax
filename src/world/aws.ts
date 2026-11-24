@@ -223,7 +223,7 @@ export class AwsDriver implements VmDriver {
       }
     }
     throw new ProviderCapacityFull(`AWS has no ${types.slice(0, TYPE_FALLBACKS).map((type) => type.name).join(', ')} instance free in ${region} just now. `
-      + 'tavya waits until one is free; to start sooner, give this task another size.', { cause: refused });
+      + 'tavya waits until one is free; to start sooner, give this task another size in Parameters.', { cause: refused });
   }
 
   async endpoint(connection: ResolvedWorldProviderConnection, ref: Record<string, string>) {
@@ -262,7 +262,7 @@ export class AwsDriver implements VmDriver {
     }
     throw new ProviderCapacityFull(`AWS has no ${types.map((type) => type.name).join(', ') || 'instance of this size'} free in `
       + `${zone}, where this world's disk is, just now. tavya waits until one is free; `
-      + 'to start sooner, give this task another size.', { cause: refused });
+      + 'to start sooner, give this task another size in Parameters.', { cause: refused });
   }
 
   /** A new instance on the world's volume, in place of any it has. */
@@ -281,7 +281,7 @@ export class AwsDriver implements VmDriver {
     const instance = await this.launch(connection, { types: here, subnet: subnet.id, image, group, tags: { ...tags, Name: ref.world! },
       userData: cloudInit(keys, homeDevice(volume.volumeId)) });
     if (!instance) throw new ProviderCapacityFull(`AWS has no ${here.map((type) => type.name).join(', ')} instance free in ${subnet.zone}, `
-      + 'where this world\'s disk is, just now. tavya waits until one is free; to start sooner, give this task another size.');
+      + 'where this world\'s disk is, just now. tavya waits until one is free; to start sooner, give this task another size in Parameters.');
     await this.waitInstance(connection, instance.instanceId, ['running']);
     await this.ec2(connection)('AttachVolume', { VolumeId: volume.volumeId, InstanceId: instance.instanceId, Device: HOME_DEVICE });
   }
@@ -838,8 +838,8 @@ export class AwsDriver implements VmDriver {
         if (retried && !last) { await this.sleep(Math.min(30, 2 ** attempt + Math.random())); continue; }
         if (retried) throw new AwsOutage(message, code);
         if (ACCOUNT_LIMIT.has(code ?? '')) throw new ProviderCapacityFull(`${message}. This AWS account's limit is full: tavya waits until `
-          + 'there is room; to start sooner, give this task a smaller size, stop another task, or ask AWS to raise the limit '
-          + '(Service Quotas → Amazon EC2 → Running On-Demand Standard instances).', { cause: new AwsError(message, response.status, code) });
+          + 'there is room; to start sooner, give this task a smaller size in Parameters, stop another task, or ask AWS to raise the limit '
+          + '(Service Quotas → Amazon EC2 → Running On-Demand Standard instances: https://console.aws.amazon.com/servicequotas/home/services/ec2/quotas/L-1216C47A).', { cause: new AwsError(message, response.status, code) });
         throw new AwsError(message, response.status, code);
       }
     };

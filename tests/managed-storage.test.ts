@@ -322,7 +322,8 @@ describe.each(BACKENDS)('%s', (name) => {
         expect((await f.store.listInbox('member-1', f.organizationId))).toHaveLength(0);
         expect(sent.map((message) => message.to)).toEqual(['owner-1@example.com', 'owner-1@example.com']);
         expect(sent[1]).toMatchObject({ subject: expect.stringMatching(/over its tavya storage limit/) });
-        expect(sent[1]!.text).toMatch(/6\.0 GB of 5\.0 GB[\s\S]*before on 2027-10-01 \(30 days\)[\s\S]*https:\/\/tavya\.test\/settings/);
+        // Where storage is added: the organization's own Plan & billing, as a full address.
+        expect(sent[1]!.text).toMatch(/6\.0 GB of 5\.0 GB[\s\S]*Free space, or add storage in Plan & billing, before 2027-10-01 \(30 days\)[\s\S]*Add storage in Plan & billing: https:\/\/tavya\.test\/\S*settings#settings-plan$/);
 
         await notify(notice('resolved'));
         expect((await f.store.listInbox('owner-1', f.organizationId))).toHaveLength(0);

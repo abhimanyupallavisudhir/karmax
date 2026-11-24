@@ -273,7 +273,7 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
     // It names the task holding them, and that the memory decides the server too (pramana#88).
     expect((refused as Error).message).toBe('Hetzner refused a 4-CPU, 8 GB server: the Hetzner account\'s limit on shared CPUs, '
       + 'counted across all its projects, is full; this project\'s other servers use 2 (1 server, task task_busy). tavya waits until enough are free; to start sooner, give this task fewer CPUs '
-      + 'and less memory (Hetzner\'s servers with 8 GB have 4 CPUs), stop another task, or ask Hetzner to raise the limit (Hetzner Console → Limits).');
+      + 'and less memory in Parameters (Hetzner\'s servers with 8 GB have 4 CPUs), stop another task, or ask Hetzner to raise the limit (Hetzner Console → Limits: https://console.hetzner.com/limits).');
     // Nothing of the refused world is left behind.
     expect([hetzner.servers.size, hetzner.volumes.size]).toEqual([1, 1]);
   });
@@ -299,7 +299,7 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
     expect(isTransportError(refused)).toBe(true);
     expect((refused as Error).message).toBe('Hetzner refused a new server: the Hetzner account\'s limit on public IP addresses, '
       + 'counted across all its projects, is full; this project has 1 server. tavya waits until one is free; to start sooner, stop another task, '
-      + 'or ask Hetzner to raise the limit (Hetzner Console → Limits).');
+      + 'or ask Hetzner to raise the limit (Hetzner Console → Limits: https://console.hetzner.com/limits).');
     expect([hetzner.servers.size, hetzner.volumes.size]).toEqual([1, 1]);
   });
 
@@ -404,8 +404,8 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
     expect(refused).toBeInstanceOf(ProviderCapacityFull);
     expect(isTransportError(refused)).toBe(true);
     expect((refused as Error).message).toBe('Hetzner refused a 70 GB disk: the Hetzner account\'s limit on the total size of volumes, '
-      + 'counted across all its projects, is full; this project holds 100 GB in 1 volume. tavya waits until there is room; to start sooner, give this task a smaller disk, '
-      + 'delete another task, or ask Hetzner to raise the limit (Hetzner Console → Limits).');
+      + 'counted across all its projects, is full; this project holds 100 GB in 1 volume. tavya waits until there is room; to start sooner, give this task a smaller disk in Parameters, '
+      + 'delete another task, or ask Hetzner to raise the limit (Hetzner Console → Limits: https://console.hetzner.com/limits).');
     expect(hetzner.volumes.size).toBe(1);
   });
 

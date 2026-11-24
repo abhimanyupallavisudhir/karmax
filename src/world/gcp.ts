@@ -135,7 +135,7 @@ export class GcpDriver implements VmDriver {
       }
     }
     throw new ProviderCapacityFull(`Google Cloud has no ${e2Machine(request.shape).name} machine free in ${this.region(connection)} just now. `
-      + 'tavya waits until one is free; to start sooner, give this task another size.', { cause: refused });
+      + 'tavya waits until one is free; to start sooner, give this task another size in Parameters.', { cause: refused });
   }
 
   async endpoint(connection: ResolvedWorldProviderConnection, ref: Record<string, string>) {
@@ -165,7 +165,7 @@ export class GcpDriver implements VmDriver {
     } catch (error) {
       if (!(error instanceof GcpNoCapacity)) throw error;
       throw new ProviderCapacityFull(`Google Cloud has no ${machine.name} machine free in ${ref.zone}, where this world's disk is, just now. `
-        + 'tavya waits until one is free; to start sooner, give this task another size.', { cause: error });
+        + 'tavya waits until one is free; to start sooner, give this task another size in Parameters.', { cause: error });
     }
   }
 
@@ -180,7 +180,7 @@ export class GcpDriver implements VmDriver {
     } catch (error) {
       if (!(error instanceof GcpNoCapacity)) throw error;
       throw new ProviderCapacityFull(`Google Cloud has no ${e2Machine(shape).name} machine free in ${ref.zone}, where this world's disk is, `
-        + 'just now. tavya waits until one is free; to start sooner, give this task another size.', { cause: error });
+        + 'just now. tavya waits until one is free; to start sooner, give this task another size in Parameters.', { cause: error });
     }
   }
 
@@ -666,7 +666,7 @@ class GcpNoCapacity extends GcpOutage {
 
 function quotaFull(message: string): ProviderCapacityFull {
   return new ProviderCapacityFull(`${message}. This Google Cloud project's quota is full: tavya waits until there is room; to start sooner, `
-    + 'give this task a smaller size, stop another task, or ask Google to raise the quota (IAM & Admin → Quotas).');
+    + 'give this task a smaller size in Parameters, stop another task, or ask Google to raise the quota (IAM & Admin → Quotas: https://console.cloud.google.com/iam-admin/quotas).');
 }
 
 /** An instance's current run: from its last start to its last stop, or on. */

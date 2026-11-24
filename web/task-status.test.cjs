@@ -18,7 +18,9 @@ function fn(name) {
   }
   throw new Error(`unterminated ${name}`);
 }
-const ctx = vm.createContext({ esc: (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'), ACCOUNT_PROVIDER_LABELS: { claude: 'Claude' } });
+const ctx = vm.createContext({ esc: (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'), ACCOUNT_PROVIDER_LABELS: { claude: 'Claude' },
+  // The fixes a wait links (tests/setup-fix-ui.test.ts); none here.
+  setupFixHtml: () => '', fixesHtml: () => '', addLoginFix: () => ({}) });
 vm.runInContext([src.match(/const PARKED_WAITS = [^\n]*/)[0],
   ...['accountWaitReason', 'waitingLabel', 'waitDeadline', 'waitingText', 'stageLabel', 'statusTone', 'statusHtml', 'waitTitle', 'viewStatusHtml', 'stageIndicator', 'conversationWaitNotice'].map(fn)].join('\n'), ctx);
 const label = (html) => [...html.matchAll(/class="status-label">([^<]*)</g)].map((m) => m[1]);

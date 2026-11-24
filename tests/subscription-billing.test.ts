@@ -361,7 +361,7 @@ describe('hosted subscription billing', () => {
       memberAdmissionAllowed: false, agentRunAdmissionAllowed: false,
     });
     await expect((async () => (await billing.assertOrganizationDeletionAllowed(organization.id)))()).rejects.toThrow('provider subscription is past_due');
-    await expect((async () => (await store.setOrganizationMembership(organization.id, 'third', 'member')))()).rejects.toThrow('Remove 1 member or restore Team');
+    await expect((async () => (await store.setOrganizationMembership(organization.id, 'third', 'member')))()).rejects.toThrow('Remove 1 member in Settings → People & authorization, or restore Team');
 
     (await billing.handleWebhook(event('evt_recovered', 'invoice.paid', {
       id: 'in_lifecycle', customer: `cus_${organization.id}`, subscription: 'sub_lifecycle',

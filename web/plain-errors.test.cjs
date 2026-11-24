@@ -18,8 +18,12 @@ function extract(name, kind = 'function') {
 global.esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 eval(`${extract('CAPABILITY_ACTIONS', 'const')}; global.CAPABILITY_ACTIONS = CAPABILITY_ACTIONS;`);
 global.globalRoute = () => '/org/settings';
+global.taskUrl = (id) => `/org/web/tasks/${id}`;
+global.ACCOUNT_PROVIDER_LABELS = { claude: 'Claude' };
+for (const name of ['SUBSCRIPTION_LOGINS', 'API_KEY_PROVIDERS', 'INSTALLATION_PLACES']) eval(`${src.match(new RegExp(`const ${name} = [^\\n]*`))[0]} global.${name} = ${name};`);
+eval(`${extract('PROVIDER_BILLING', 'const')} global.PROVIDER_BILLING = PROVIDER_BILLING;`);
 global.S = {};
-for (const fn of ['permissionSentence', 'plainError', 'plainTaskError', 'toolsDidNotStart', 'storageFull', 'namedPlaces', 'setupFixes', 'setupFix', 'setupFixHtml', 'reportErrorHtml', 'taskErrorHtml']) eval(`global.${fn} = ${extract(fn)}`);
+for (const fn of ['permissionSentence', 'plainError', 'plainTaskError', 'toolsDidNotStart', 'storageFull', 'namedPlaces', 'setupFixes', 'setupFix', 'setupFixHtml', 'fixesHtml', 'addLoginFix', 'addAccountHref', 'providerBillingFix', 'reportErrorHtml', 'taskErrorHtml']) eval(`global.${fn} = ${extract(fn)}`);
 
 let passed = 0;
 const eq = (actual, expected, label) => { assert.strictEqual(actual, expected, label); passed++; };

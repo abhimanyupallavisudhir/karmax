@@ -101,7 +101,7 @@ describe('what a person does about a task that cannot start', () => {
       .toEqual({ label: 'Connect GitHub', href: '/profile' });
     // The plan's own limits link to Plan & billing too.
     expect(await fix('Waiting for Free plan capacity (5 active agent runs)')).toEqual({ label: 'Change plan', href: '/org/settings#settings-plan' });
-    expect(await fix('Free allows 1 organization user, but this organization has 2. Remove 1 member or restore Team to start another agent run.'))
+    expect(await fix('Free allows 1 organization user, but this organization has 2. Remove 1 member in Settings → People & authorization, or restore Team in Plan & billing, to start another agent run.'))
       .toEqual({ label: 'Change plan', href: '/org/settings#settings-plan' });
     expect(await fix('CPU can be at most 2 on the Free plan: choose a plan in Plan & billing for a bigger one'))
       .toEqual({ label: 'Choose a plan', href: '/org/settings#settings-plan' });
@@ -192,7 +192,7 @@ describe('what a person does about a task that cannot start', () => {
       'tavya\'s Hetzner Cloud computers\' disks take 980 of their 1024 GB (parked ones too); waiting for room.'])
       expect(await fixes(wait)).toEqual([{ label: 'Use your own account', href: '/org/settings#settings-computers' }]);
     // A login's quota is spent: another login runs it now.
-    expect(await fixes('Out of quota until a login resets')).toEqual([{ label: 'Add a login', href: '/org/settings#settings-agents' }]);
+    expect(await fixes('Out of quota until a login resets')).toEqual([{ label: 'Add a login', href: '/org/settings#account-add', title: expect.any(String) }]);
     // Any place a message names, in the order it names them, once each.
     expect(await fixes('Build it in Project settings → Environment for faster worlds')).toEqual([{ label: 'Project settings', href: '/org/web/settings' }]);
     expect(await fixes('Set it up in Settings → Environment.')).toEqual([{ label: 'Environment', href: '/org/web/settings#project-environment' }]);
@@ -204,6 +204,101 @@ describe('what a person does about a task that cannot start', () => {
     expect(await ui.page.locator('#main a.setup-fix').evaluate((link) => [link.textContent, link.getAttribute('href')]))
       .toEqual(['Task defaults', '/org/web/settings#project-defaults']);
     expect(await ui.page.locator('#main .msg-text').innerText()).not.toContain('Press Retry to try again. Press Retry');
+    await ui.close();
+  });
+
+  it('links every limit on a model login to adding another one, with its provider chosen (owner, 2026-11-24)', async () => {
+    const ui = await console_();
+    await ui.run(`S.projects = [{ id: 'p', name: 'Web', slug: 'web', organizationId: 'o' }];
+      S.tasks = [{ id: 't', num: 7, projectId: 'p', title: 'Task' }]`);
+    const notice = (waitingFor: object) => ui.run<string>(`(() => {
+      document.getElementById('main').innerHTML = conversationWaitNotice({ taskId: 't', projectId: 'p', status: 'waiting', waitingFor: ${JSON.stringify(waitingFor)} });
+      const link = document.querySelector('#main .wait-notice a.setup-fix');
+      return link ? [document.querySelector('#main .wait-notice').innerText, link.textContent, link.getAttribute('href'), link.title] : null;
+    })()`);
+    // Claude's quota is used up: the notice says until when, and where to connect another subscription.
+    const quota = await notice({ kind: 'account', provider: 'claude', reason: 'quota', earliestResetAt: Date.now() + 3_600_000, detail: 'Out of quota until a login resets' });
+    expect(quota).toEqual([expect.stringMatching(/^Waiting for Claude quota until .+Add a login$/), 'Add a login',
+      '/org/settings?add=claude#account-add', 'Connect another Claude subscription or API key: work uses it while this one is used up']);
+    // Every login busy, and a view from before the coordinator gave a reason.
+    expect((await notice({ kind: 'account', provider: 'codex', reason: 'slot', detail: 'Every allowed login is running all it may' }))?.slice(1, 3))
+      .toEqual(['Add a login', '/org/settings?add=codex#account-add']);
+    expect((await notice({ kind: 'account', detail: 'Provider usage limit reached; the task resumes automatically when quota resets' }))?.slice(1, 3))
+      .toEqual(['Add a login', '/org/settings#account-add']);
+    // A key-based model: the key's vendor is chosen.
+    expect((await notice({ kind: 'account', provider: 'openrouter', reason: 'quota' }))?.[2]).toBe('/org/settings?add=openrouter#account-add');
+    // Planning is a moment away: nothing to do.
+    expect(await notice({ kind: 'account', provider: 'claude', reason: 'planning' })).toBeNull();
+    // A wait for one of tavya's machines: one's own account starts it now.
+    expect((await notice({ kind: 'retry', summary: 'Waiting for a machine', until: Date.now() + 60_000,
+      detail: 'Every computer this task can use is full (tavya\'s E2B: All 20 of tavya\'s E2B computers are in use). Waiting for one to free up.' }))?.slice(1, 3))
+      .toEqual(['Use your own account', '/org/settings#settings-computers']);
+
+    const fixes = (text: string) => ui.run<any[]>(`setupFixes(${JSON.stringify(text)}, 'p', 't')`);
+    // A task stopped by a subscription's limit, and the waits' own words.
+    for (const text of ['agent-limit: You\'ve hit your session limit · resets 3:45pm', 'Claude usage limit reached', 'Waiting for a free Claude login'])
+      expect((await fixes(text))[0]).toMatchObject({ label: 'Add a login' });
+    expect((await fixes('Waiting for Claude quota until 3:00 PM'))[0].href).toBe('/org/settings?add=claude#account-add');
+    // An API key out of money: topped up at its provider (a new tab), or replaced here.
+    expect(await fixes('API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}'))
+      .toEqual([{ label: 'Add Anthropic credits', href: 'https://platform.claude.com/settings/billing', external: true },
+        { label: 'Manage accounts', href: '/org/settings#settings-agents' }]);
+    expect((await fixes('429 insufficient_quota: You exceeded your current quota'))[0].label).toBe('Add OpenAI credits');
+    expect((await fixes('openrouter/anthropic/claude-sonnet-5: 402 This request requires more credits'))[0].label).toBe('Add OpenRouter credits');
+    // GitHub's rate limit is not a model login's.
+    expect(await fixes('GitHub API 403: API rate limit exceeded')).toEqual([]);
+    // The task's computer ran out of memory: a bigger one, in its Parameters.
+    expect(await fixes('exited with code -1 — the sandbox used 2.0 of 2.0 GB; a command in the sandbox likely used more memory than it has.'))
+      .toEqual([{ label: 'Bigger computer', href: '/org/web/tasks/7/parameters' }]);
+    expect(await fixes('Or choose a bigger computer in Parameters.')).toEqual([{ label: 'Parameters', href: '/org/web/tasks/7/parameters' }]);
+    // Shown on the stopped task, in plain words.
+    await ui.run(`document.getElementById('main').innerHTML = taskErrorHtml('Your credit balance is too low to access the Anthropic API.', 'p', 't')`);
+    expect(await ui.page.locator('#main .msg-text').innerText()).toMatch(/^The AI account is out of credit\..*Add Anthropic credits\s*Manage accounts$/);
+
+    // A plan's limit is not a model's, though it names Plan & billing.
+    await ui.run(`document.getElementById('main').innerHTML = taskErrorHtml('Free allows 1 organization user, but this organization has 2. Remove 1 member in Settings → People & authorization, or restore Team in Plan & billing, to start another agent run.', 'p', 't')`);
+    expect(await ui.page.locator('#main .msg-text').innerText()).toMatch(/^Free allows 1 organization user.*Change plan\s*Members$/s);
+
+    // An error shown in place of what failed to load links its fix too.
+    expect(await ui.run(`inlineErrorHtml(new Error('managed storage quota exceeded (1 bytes requested, 1 byte limit)'))`))
+      .toContain('href="/org/settings#settings-plan"');
+
+    // Places messages name, and a provider's own page they give (a new tab).
+    expect(await fixes('Reconnect this account in Settings → Connected apps before using it'))
+      .toEqual([{ label: 'Connected apps', href: '/org/settings#settings-connections' }]);
+    expect(await fixes('Account access expired; reconnect it in Project settings → Connected apps'))
+      .toEqual([{ label: 'Connected apps', href: '/org/web/settings#project-connections' }]);
+    expect(await fixes('Free allows 1 organization user, but this organization has 2. Remove 1 member in Settings → People & authorization, or restore Team in Plan & billing, to start another agent run.'))
+      .toEqual([{ label: 'Change plan', href: '/org/settings#settings-plan' }, { label: 'Members', href: '/org/settings#settings-people' }]);
+    expect(await fixes('This Fly.io organization is on its free trial, which stops every machine after 5 minutes. Add a payment method at https://fly.io/dashboard/acme/billing.'))
+      .toEqual([{ label: 'Open fly.io', href: 'https://fly.io/dashboard/acme/billing', external: true }]);
+    expect(await fixes('Custom network rules require Daytona Tier 3 or higher. Upgrade Daytona at https://app.daytona.io/dashboard, or choose Full internet for this task\'s Computer in Parameters.'))
+      .toEqual([{ label: 'Parameters', href: '/org/web/tasks/7/parameters' }, { label: 'Open daytona.io', href: 'https://app.daytona.io/dashboard', external: true }]);
+    // An operator's places, for an operator only.
+    expect(await fixes('Gemini is not offered on this installation: an operator turns it on in Installation → Managed compute')).toEqual([]);
+    await ui.run(`S.installationAccess = true`);
+    expect(await fixes('Gemini is not offered on this installation: an operator turns it on in Installation → Managed compute'))
+      .toEqual([{ label: 'Managed compute', href: '/installation#installation-compute' }]);
+    await ui.run(`S.installationAccess = false`);
+    // tavya's own address is linked by its name; documentation is no fix.
+    expect(await fixes('Add credits in Plan & billing (https://tavya.io/org/settings#settings-plan).')).toEqual([{ label: 'Plan & billing', href: '/org/settings#settings-plan' }]);
+    expect(await fixes('GitHub API 422: {"message":"Validation Failed","documentation_url":"https://docs.github.com/rest/pulls"}')).toEqual([]);
+
+    // The Queues page: work whose every login is used up offers another.
+    await ui.run(`S.agentWork = { organizationId: 'o', running: [], waiting: [{ taskId: 't', root: 't', projectId: 'p', num: 7, title: 'Task',
+      priority: 'medium', turnId: 'u', status: 'quota', until: Date.now() + 3_600_000 }] };
+      document.getElementById('main').innerHTML = agentWorkPanel()`);
+    expect(await ui.page.locator('#main .work-tree a.setup-fix').evaluate((link) => [link.textContent, link.getAttribute('href')]))
+      .toEqual(['Add a login', '/org/settings#account-add']);
+
+    // Following the link chooses the provider on the add form, once.
+    await ui.run(`history.replaceState(null, '', '/org/settings?add=claude#account-add');
+      document.getElementById('main').innerHTML = agentAccountsCard(); applyAddAccountHint()`);
+    expect(await ui.run(`[document.getElementById('login-provider').value, document.activeElement.id, location.search, location.hash]`))
+      .toEqual(['claude', 'login-name', '', '#account-add']);
+    await ui.run(`history.replaceState(null, '', '/org/settings?add=openrouter#account-add');
+      document.getElementById('main').innerHTML = agentAccountsCard(); applyAddAccountHint()`);
+    expect(await ui.run(`[document.getElementById('acct-provider').value, document.activeElement.id]`)).toEqual(['openrouter', 'acct-name']);
     await ui.close();
   });
 });
