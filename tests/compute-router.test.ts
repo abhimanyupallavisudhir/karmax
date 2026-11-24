@@ -42,6 +42,20 @@ describe('the rule', () => {
     expect(route.candidates[0]).toMatchObject({ provider: 'hetzner', priceMicrosPerHour: listPriceMicrosPerHour('hetzner', { diskGb: 40 }) });
   });
 
+  it('prices a fixed-size provider at the size whose disk range holds the disk, and passes over it when none it may give does', () => {
+    // tavya-error 0c739e7379819d38: a 2/4 Agent37 vm takes at most 60 GB, so 2 CPU / 4 GB / 70 GB is its 4/8.
+    const route = rankComputeOptions({ cpu: 2, memoryMb: 4096, diskGb: 70 }, [option('agent37', 'managed')]);
+    expect(route.candidates[0]).toMatchObject({ provider: 'agent37',
+      priceMicrosPerHour: listPriceMicrosPerHour('agent37', { cpu: 4, memoryMb: 8192, diskGb: 70 }) });
+    // The data's disk counts the same way.
+    expect(rankComputeOptions({ cpu: 2, memoryMb: 4096, holdsData: { bytes: 50 * 2 ** 30, diskGb: 65 } }, [option('agent37', 'managed')])
+      .candidates[0]!.priceMicrosPerHour).toBe(listPriceMicrosPerHour('agent37', { cpu: 4, memoryMb: 8192, diskGb: 65 }));
+    // An account whose machines may have at most 2 CPUs has no machine for that disk.
+    expect(rankComputeOptions({ cpu: 2, memoryMb: 4096, diskGb: 70 },
+      [option('agent37', 'own', { limits: { cpu: 2, memoryMb: 4096, diskGb: 100 } })]).rejected)
+      .toEqual([{ provider: 'agent37', funding: 'own', reason: 'at most 60 GB disk with 2 CPU' }]);
+  });
+
   it('asks Any for the size, desktop, allowlist and region the Computer states', () => {
     expect(computeNeeds({ resources: { cpu: 4, memoryMb: 8192, diskGb: 100 }, environment: { flavor: 'desktop' },
       network: { unrestricted: false }, region: 'eu' })).toEqual({ cpu: 4, memoryMb: 8192, diskGb: 100, desktop: true, allowlist: true, region: 'eu' });

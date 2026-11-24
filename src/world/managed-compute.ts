@@ -1,7 +1,7 @@
 import { ProviderCapacityFull } from '../agent/limits.js';
 import { BRAND } from '../domain/brand.js';
 import { COMPUTE_TERMS, COMPUTE_TRIAL, computeChargeMicros } from '../domain/entitlements.js';
-import { providerDefaults, type AccountPool } from '../domain/computer-limits.js';
+import { machineSize, providerDefaults, type AccountPool } from '../domain/computer-limits.js';
 import { flyComputeDollarsPerSecond, flyGuest, flyVolumeDollarsPerSecond } from './fly.js';
 import { agent37ComputeDollarsPerHour, agent37DiskDollarsPerHour } from './agent37.js';
 import { costMicrosPerSecond } from './runners.js';
@@ -280,7 +280,9 @@ export interface MachineRate { activeMicrosPerHour: number; diskMicrosPerHour: n
 /** Providers' list prices (USD an hour), used until a machine's own usage is
  * booked: rounded up from the drivers' fallback prices, so a first hold is
  * never smaller than what the machine costs. */
-export function listRate(provider: string, shape: { cpu: number; memoryMb: number; diskGb: number }): MachineRate {
+export function listRate(provider: string, asked: { cpu: number; memoryMb: number; diskGb: number }): MachineRate {
+  // Held at the machine it gets (a provider of fixed sizes: the one that covers it, its disk included).
+  const shape = { ...asked, ...machineSize(provider, asked) };
   const memoryGb = shape.memoryMb / 1024;
   const perGbMonth = (price: number) => shape.diskGb * price / 730;
   let active = 0, disk = 0;

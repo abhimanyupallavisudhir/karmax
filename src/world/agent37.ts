@@ -3,7 +3,7 @@ import { Duplex } from 'node:stream';
 import { Client, type ClientChannel } from 'ssh2';
 import { WebSocket, createWebSocketStream } from 'ws';
 import type { MachineShape } from '../domain/computer.js';
-import { AGENT37_SIZES, type ComputerLimits } from '../domain/computer-limits.js';
+import { AGENT37_SIZES, smallestSize, type ComputerLimits } from '../domain/computer-limits.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
 import type { ProviderUsageEvent, WorldLifecycleState } from './types.js';
 import type { VmAllocation, VmBootKeys, VmDriver, VmListing, VmShape } from './vm/provider.js';
@@ -74,12 +74,15 @@ exit 1
 `;
 }
 
-export function agent37Shape(resources: { cpu?: number; memoryMb?: number } | undefined): { cpu: number; memory: number } {
+/** The smallest `vm` shape with the CPUs, memory and disk asked: a shape's
+ * disk range is its own (a 2/4 takes at most 60 GB), so a disk can need a
+ * bigger shape than the CPUs and memory alone. */
+export function agent37Shape(resources: { cpu?: number; memoryMb?: number; diskGb?: number } | undefined): { cpu: number; memory: number } {
   const cpu = resources?.cpu ?? 2;
   const memoryMb = resources?.memoryMb ?? 4096;
-  const shape = AGENT37_SHAPES.find((candidate) => candidate.cpu >= cpu && candidate.memory * 1024 >= memoryMb);
+  const shape = smallestSize(AGENT37_SIZES, { cpu, memoryMb, ...(resources?.diskGb != null ? { diskGb: resources.diskGb } : {}) });
   if (!shape) throw new Error(`Agent37 machines have at most ${LARGEST.cpu} CPUs and ${LARGEST.memory} GB of memory, not ${cpu} CPU · ${Math.round(memoryMb / 1024)} GB`);
-  return { cpu: shape.cpu, memory: shape.memory };
+  return { cpu: shape.cpu, memory: shape.memoryMb / 1024 };
 }
 
 /** US dollars per hour for a running `vm` of this shape. */
@@ -130,10 +133,11 @@ export class Agent37Driver implements VmDriver {
   }
 
   shape(resources: MachineShape | undefined): VmShape {
-    const diskGb = resources?.diskGb ?? AGENT37_DEFAULT_DISK_GB;
-    if (diskGb > AGENT37_MAX_DISK_GB) throw new Error(`An Agent37 disk holds at most ${AGENT37_MAX_DISK_GB} GB, not ${diskGb} GB`);
-    const shape = agent37Shape(resources);
-    return { cpu: shape.cpu, memoryMb: shape.memory * 1024, diskGb: Math.max(2, Math.ceil(diskGb)) };
+    const asked = resources?.diskGb ?? AGENT37_DEFAULT_DISK_GB;
+    if (asked > AGENT37_MAX_DISK_GB) throw new Error(`An Agent37 disk holds at most ${AGENT37_MAX_DISK_GB} GB, not ${asked} GB`);
+    const diskGb = Math.max(2, Math.ceil(asked));
+    const shape = agent37Shape({ ...resources, diskGb });
+    return { cpu: shape.cpu, memoryMb: shape.memory * 1024, diskGb };
   }
 
   async allocate(connection: ResolvedWorldProviderConnection, request: { labels: Record<string, string>; shape: VmShape;
@@ -196,12 +200,14 @@ export class Agent37Driver implements VmDriver {
       instance = await this.waitFor(connection, ref.instance!, 'running');
     }
     // A new size (or a disk asked for while it ran) is a resize of the running
-    // machine: a cold boot, before karmax's sshd starts.
-    const wanted = agent37Shape(shape);
-    const resources = instance.resources ?? { cpu: wanted.cpu, memory: wanted.memory, disk: shape.diskGb };
+    // machine: a cold boot, before karmax's sshd starts. The shape must take
+    // the disk the machine will have, which never shrinks.
+    const resources = instance.resources ?? { ...agent37Shape(shape), disk: shape.diskGb };
+    const disk = Math.max(resources.disk, shape.diskGb);
+    const wanted = agent37Shape({ ...shape, diskGb: disk });
     const change = {
       ...(resources.cpu !== wanted.cpu || resources.memory !== wanted.memory ? { cpu: wanted.cpu, memory: wanted.memory } : {}),
-      ...(resources.disk < shape.diskGb ? { disk: shape.diskGb } : {}),
+      ...(resources.disk < disk ? { disk } : {}),
     };
     if (Object.keys(change).length) {
       await this.retrying(() => api('POST', `/instances/${ref.instance}/resize`, change, 15 * 60_000)).catch((error) => { throw agent37Full(error) ?? error; });
