@@ -44,6 +44,7 @@ import { RESTIC_ENGINE, ROOT_PART, ResticResources, isParted, isPartsCapture, pa
   type ChangeSet, type Repository, type ResticCapture, type ResticPlace } from './restic-engine.js';
 import { pullRequestOf } from '../domain/pull-requests.js';
 import { ResourceConflictError } from './resource-conflict.js';
+import { parseStamp, stampCopy, stampKey } from './resource-stamp.js';
 import type { SetupTime } from './setup-clock.js';
 import { applyMerged, clearMerge, conflictKind, mergeFiles, type FileMerge } from './resource-file-merge.js';
 import { policyFor, readPolicies, type PolicyRule } from './resource-policy.js';
@@ -126,8 +127,14 @@ function parseDelivery(value: string | undefined): Delivery | undefined {
 
 export interface RestoreOptions { signal?: AbortSignal }
 
-/** A writable resource's world copy, saved, with what it changes. */
-interface Inspection { summary: ResourceChangeSummary; repository: Repository; capture: ResticCapture | PartsCapture }
+/** A writable resource's world copy, saved, with what it changes. No
+ * `capture` when the copy's stamp shows it is still the version it forked
+ * (resource-stamp.ts): nothing was saved, and nothing changed. */
+interface Inspection { summary: ResourceChangeSummary; repository: Repository; capture?: ResticCapture | PartsCapture }
+function savedCapture(inspection: Inspection): ResticCapture | PartsCapture {
+  if (!inspection.capture) throw new Error('an unchanged copy has nothing to publish');
+  return inspection.capture;
+}
 /** Progress and cancellation for a long resource save. */
 export interface ResourceWork { checkContinue?: () => Promise<void>; onProgress?: (progress: StagingProgress) => void;
   /** A file this task and a newer version (or a sub-task) changed differently
@@ -652,6 +659,14 @@ export class ProjectResourceService {
       // Those never started (or cut short) hold a lease nothing will use.
       await failLeases(this.store, [...unsettled]);
       throw (await filledDisk(world, restores, error, options.signal)) ?? error;
+    }
+    // A writable copy is exactly its version now: later saves of a copy
+    // nobody touched can be skipped (resource-stamp.ts).
+    for (const entry of restores) {
+      if (entry.attachment.access !== 'write' || entry.target === '.') continue;
+      options.signal?.throwIfAborted();
+      await this.keepStamp(taskId, entry.lease.id, entry.revisionId,
+        await stampCopy(world, path.posix.join(world.handle.root, entry.target), fileShaped(entry.attachment)));
     }
     world.handle = { ...world.handle, generation, meta: { ...world.handle.meta,
       ...(ephemeralPaths.size ? { ephemeralPaths: [...ephemeralPaths] } : {}),
@@ -1629,7 +1644,7 @@ export class ProjectResourceService {
       if (summary.baseRevisionId !== current)
         throw new Error(`${label} has a newer version this task could not take in yet; try again`);
       const snapshot = await this.store.saveResourceRevision({ attachmentId: resource.id, parentRevisionId: current,
-        ...this.restic.revisionFields(inspection.capture, inspection.repository),
+        ...this.restic.revisionFields(savedCapture(inspection), inspection.repository),
         metadata: { checkpoint: true, pullRequest: key, summary }, createdByTaskId: taskId });
       data.push({ attachmentId: resource.id, name: resource.name, path: label, revisionId: snapshot.id,
         ...(current ? { baseRevisionId: current } : {}), summary });
@@ -1813,7 +1828,8 @@ export class ProjectResourceService {
    * that was never current. Delivering again (after a follow-up) replaces a
    * delivery still waiting, and builds on one already taken in. */
   private async deliver(taskId: string, attachment: ResourceAttachment, inspection: Inspection, parentTaskId: string): Promise<void> {
-    const { summary, repository, capture } = inspection;
+    const { summary, repository } = inspection;
+    const capture = savedCapture(inspection); // delivered only when it changed: always saved
     const key = `resource-delivery:${parentTaskId}:${attachment.id}:${taskId}`;
     const waiting = parseDelivery(await this.store.kvGet(key));
     const delivered = await this.store.kvGet(`resource-delivered:${parentTaskId}:${attachment.id}:${taskId}`);
@@ -1946,7 +1962,7 @@ export class ProjectResourceService {
   /** Save what a world holds of a writable resource, and what that changes
    * from the version it started from. */
   private async inspect(taskId: string, attachmentId: string, work: { checkContinue?: () => Promise<void>;
-    onProgress?: (progress: Omit<StagingProgress, 'index' | 'count'>) => void } = {}): Promise<Inspection> {
+    onProgress?: (progress: Omit<StagingProgress, 'index' | 'count'>) => void; save?: boolean } = {}): Promise<Inspection> {
     const { attachment, world, lease, target, handle } = await this.worldResource(taskId, attachmentId);
     // What changed is relative to the version the copy forked from (a
     // sub-task's: its parent's copy), also once restored from a park's capture.
@@ -1967,8 +1983,19 @@ export class ProjectResourceService {
       // Only the parts the world holds are saved; the others stay as they were.
       ({ repository, capture } = await this.saveWorldParts(world, handle, lease, attachment, baseline, saving));
     } else {
-      // Deduplicated against the version the world was restored from, so mostly a scan.
       repository = await this.restic.current(attachment);
+      // Untouched since it was the version it forked: no save, no changes
+      // (resource-stamp.ts). Measured against this task's own later
+      // publication by the save below instead.
+      if (!work.save && baseline && baseline.id === forkedId && await this.stampShows(taskId, lease.id, baseline.id,
+        await stampCopy(world, target, fileShaped(attachment))) && !await this.publishedBy(taskId, attachment.currentRevisionId, forkedId)) {
+        const summary: ResourceChangeSummary = { attachmentId: attachment.id, baseRevisionId: forkedId,
+          added: 0, modified: 0, deleted: 0, bytes: 0, changedPaths: [], ...(forkedId !== forkPointId ? { promoted: true } : {}) };
+        (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:inspect',
+          scopeKey: `project:${attachment.projectId}`, detail: { attachmentId, summary, unchangedCopy: true } }));
+        return { summary, repository };
+      }
+      // Deduplicated against the version the world was restored from, so mostly a scan.
       const parent = this.parentIn(repository, restoredFrom);
       capture = await this.restic.backup({ world, path: target, file: fileShaped(attachment) }, repository, { ...saving, ...(parent ? { parent } : {}) });
     }
@@ -2069,14 +2096,23 @@ export class ProjectResourceService {
         refs.push({ attachmentId: attachment.id, revisionId: await this.recordWorld(world, handle, lease, attachment, saved) });
         continue;
       }
+      // Untouched since it was that version: nothing to save (resource-stamp.ts).
+      // Taken before any save, so a write during the save never hides in it.
+      const place = { world, path: resourceAbsolutePath(handle, attachment), file: fileShaped(attachment) };
+      const stamp = await stampCopy(world, place.path, place.file);
+      if (baseline && await this.stampShows(lease.taskId, lease.id, baseline.id, stamp)) {
+        (await this.store.kvSet(baselineKey, JSON.stringify({ leaseId: lease.id, revisionId: baseline.id })));
+        refs.push({ attachmentId: attachment.id, revisionId: baseline.id });
+        continue;
+      }
       // A park's capture of the task's private copy is work in progress:
       // counted, never refused (see WorldCheckpointService).
-      const captured = await this.capture({ world, path: resourceAbsolutePath(handle, attachment), file: fileShaped(attachment) },
-        attachment, baseline, { key: `checkpoint:${lease.id}`, quota: false, checkContinue, ...progress });
+      const captured = await this.capture(place, attachment, baseline, { key: `checkpoint:${lease.id}`, quota: false, checkContinue, ...progress });
       const revisionId = !captured && baseline ? baseline.id : (await this.store.saveResourceRevision({ attachmentId: attachment.id,
         parentRevisionId: lease.revisionId, ...captured!.fields, metadata: { checkpoint: true, ...carriedIntegration(baseline, lease.taskId) },
         createdByTaskId: lease.taskId })).id;
       (await this.store.kvSet(baselineKey, JSON.stringify({ leaseId: lease.id, revisionId })));
+      await this.keepStamp(lease.taskId, lease.id, revisionId, stamp);
       refs.push({ attachmentId: attachment.id, revisionId });
     }
     return refs;
@@ -2090,6 +2126,33 @@ export class ProjectResourceService {
     if (projectionOf(handle, attachment.id)?.onDemand || onDemand(attachment)) return true;
     const current = attachment.currentRevisionId ? await this.store.getResourceRevision(attachment.currentRevisionId) : undefined;
     return [...revisions, current].some((revision) => isParted(revision));
+  }
+
+  /** Whether a world's copy still is `revisionId`: its stamp now is the one
+   * kept when it was. */
+  private async stampShows(taskId: string, leaseId: string, revisionId: string, digest: string | undefined): Promise<boolean> {
+    if (!digest) return false;
+    const kept = parseStamp(await this.store.kvGet(stampKey(taskId, leaseId)));
+    return kept?.revisionId === revisionId && kept.digest === digest;
+  }
+
+  /** Remember that a copy whose stamp is `digest` is `revisionId` (forget, when it could not be stamped). */
+  private async keepStamp(taskId: string, leaseId: string, revisionId: string, digest: string | undefined): Promise<void> {
+    if (digest) await this.store.kvSet(stampKey(taskId, leaseId), JSON.stringify({ revisionId, digest }));
+    else await this.store.kvDelete(stampKey(taskId, leaseId));
+  }
+
+  /** Whether this task published a version between `forkedId` and the current one. */
+  private async publishedBy(taskId: string, currentId: string | undefined, forkedId: string | undefined): Promise<boolean> {
+    const visited = new Set<string>();
+    for (let id = currentId; id && id !== forkedId && !visited.has(id);) {
+      visited.add(id);
+      const revision = await this.store.getResourceRevision(id);
+      if (!revision) return false;
+      if (revision.createdByTaskId === taskId) return true;
+      id = revision.parentRevisionId;
+    }
+    return false;
   }
 
   /** The version a world's copy of a resource last was: its latest park
@@ -2146,7 +2209,8 @@ export class ProjectResourceService {
   }
 
   /** Leave the snapshots a save made that no version came to name for upkeep to forget. */
-  private async discardCapture(repository: Repository, capture: ResticCapture | PartsCapture): Promise<void> {
+  private async discardCapture(repository: Repository, capture: ResticCapture | PartsCapture | undefined): Promise<void> {
+    if (!capture) return;
     await this.restic.discard(repository, isPartsCapture(capture) ? capture.fresh : [capture.snapshot]);
   }
 
@@ -2367,6 +2431,8 @@ export class ProjectResourceService {
       await this.discardCapture(repository, capture);
       return { attachment, revision: started, summary };
     }
+    // Not saved, as unchanged from a version other than the one publishing measures from: save it now.
+    if (!capture) return this.promoteReviewed(taskId, attachmentId, await this.inspect(taskId, attachmentId, { save: true }), choice);
     const place = { world, path: target, file: fileShaped(attachment) };
     let base = await this.mergeBase(taskId, attachment.currentRevisionId, integrated ?? await this.forkPoint(lease.revisionId));
     let saved = capture;
