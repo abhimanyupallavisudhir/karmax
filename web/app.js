@@ -9225,14 +9225,14 @@ function askTavya() {
   dialog.innerHTML = `<form method="dialog"><div class="prompt-field"><textarea name="ask" rows="3" required maxlength="20000" aria-label="Ask ${esc(siteName())}"
       placeholder="Ask ${esc(siteName())} anything: change a setting, find what waits on you, start a task…"></textarea>
       ${mic ? `<div class="prompt-attach-row ask-mic">${mic}</div>` : ''}</div>
-    <div class="inline-form ask-foot"><span class="ask-where">${policyTip(NO_COMPUTER_TIP)}</span>
+    <div class="inline-form ask-foot"><span class="ask-where">${policyTip(ASK_CEO_TIP)}</span>
       <button class="btn primary" value="submit" title="Ask (Enter)">Ask</button></div></form>`;
   const input = dialog.querySelector('textarea');
   const form = dialog.querySelector('form');
   let sending = false;
   api(`/api/organizations/${encodeURIComponent(organizationId)}/ask-settings`, { maxAge: 30_000 }).then((ask) => {
     const where = dialog.querySelector('.ask-where');
-    if (ask?.target === 'ceo' && where) where.innerHTML = policyTip(`Goes to the organization’s CEO: it can do any work and remembers every Ask.`);
+    if (ask?.target === 'task' && where) where.innerHTML = policyTip(NO_COMPUTER_TIP);
   }).catch(() => {});
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -22964,7 +22964,8 @@ async function hydrateEarlyAccess(organizationId) {
 
 // Where Ask goes (wiki features/computerless-tasks § Ask): a quick task per
 // question, or the organization's CEO.
-const ASK_TARGET_TIP = 'Where Ask sends what you type. Quick task: a new conversation that starts in seconds and can use ' + 'tavya, but not a computer. CEO: the organization’s co-ordinator, which can do any work and remembers every Ask.';
+const ASK_CEO_TIP = 'Goes to the organization’s CEO: it can do any work and remembers every Ask.';
+const ASK_TARGET_TIP = 'Where Ask sends what you type. CEO: the organization’s co-ordinator, which can do any work and remembers every Ask. Quick task: a new conversation that starts in seconds and can use ' + 'tavya, but not a computer.';
 async function hydrateAskTarget(organizationId) {
   const box = $('#organization-ask');
   if (!box) return;
@@ -22974,8 +22975,8 @@ async function hydrateAskTarget(organizationId) {
     if (!box.isConnected) return;
     box.innerHTML = `<div class="setting-row"><span class="setting-label">Ask ${policyTip(ASK_TARGET_TIP.replace('tavya', siteName()))}</span>
       <span class="setting-value"><select id="ask-target" aria-label="Where Ask goes" ${ask.canManage ? '' : 'disabled'}>
-        <option value="task" ${ask.target === 'task' ? 'selected' : ''}>Quick task</option>
-        <option value="ceo" ${ask.target === 'ceo' ? 'selected' : ''}>CEO</option></select></span></div>`;
+        <option value="ceo" ${ask.target === 'ceo' ? 'selected' : ''}>CEO</option>
+        <option value="task" ${ask.target === 'task' ? 'selected' : ''}>Quick task</option></select></span></div>`;
     const select = box.querySelector('select');
     select.onchange = async () => {
       select.disabled = true;

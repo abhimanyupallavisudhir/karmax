@@ -51,6 +51,8 @@ describe('a task without a computer, in the console', () => {
       list: async () => connections } as any;
     const api = new KarmaxApi({ store, tokens, worlds, client, taskQueue: 'test', contentDir: dir, providerConnections });
     project = await store.createProject('Assistant');
+    // These tests are about the quick task Ask can start; by default it goes to the CEO (tested below).
+    await store.setSettings(`organization:${project.organizationId}`, 'ask', { to: 'task' });
     await store.setOrganizationExecutionPolicy(project.organizationId!, { worldProvider: 'e2b', resources: { cpu: 2, memoryMb: 4096 } });
     const gateway = await Gateway.create({ store, tokens, worlds, client, api, bus: new KarmaxBus(), providerConnections,
       contributions: new ContributionRegistry(), overlays: new Overlays(), taskQueue: 'test', staticDir: path.resolve('web'),
@@ -168,6 +170,30 @@ describe('a task without a computer, in the console', () => {
     await expect.poll(() => page.locator('.setting-row', { hasText: 'CEO project' }).count(), { timeout: 10_000 }).toBe(1);
     expect(await page.locator('#delete-project, #move-project, #rename-project').count()).toBe(0);
     expect(errors).toEqual([]);
+  });
+
+  it('by default Ask goes to the organization’s CEO: the first question starts it and its page opens', async () => {
+    const scopeKey = `organization:${project.organizationId}`;
+    await store.setSettings(scopeKey, 'ask', {});
+    try {
+      const { page, errors } = await open('/personal/assistant');
+      await page.locator('#rail-ask').click();
+      const dialog = page.locator('dialog.ask-dialog');
+      await dialog.waitFor();
+      expect(await dialog.locator('.ask-where .info-dot').getAttribute('title')).toMatch(/CEO/);
+      await dialog.locator('textarea').fill('Plan the quarter');
+      await dialog.locator('textarea').press('Enter');
+      let ceo: Awaited<ReturnType<typeof allTasks>>[number] | undefined;
+      await expect.poll(async () => {
+        ceo = (await allTasks()).find((task) => task.params?.coordinator && task.params?.prompt === 'Plan the quarter');
+        return ceo?.params?.draft;
+      }, { timeout: 15_000 }).toBe(false);
+      expect(ceo!.title).toBe('CEO (Organization Co-ordinator)');
+      expect(ceo!.params.computer).not.toEqual({ provider: 'none' });
+      await expect.poll(() => page.url(), { timeout: 10_000 }).toContain(`/ceo/tasks/${ceo!.num ?? ceo!.id}`);
+      expect((await allTasks()).filter((task) => task.params?.prompt === 'Plan the quarter')).toHaveLength(1);
+      expect(errors).toEqual([]);
+    } finally { await store.setSettings(scopeKey, 'ask', { to: 'task' }); }
   });
 
   it('On a phone, Ask is in the top bar', async () => {

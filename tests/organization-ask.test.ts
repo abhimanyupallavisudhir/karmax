@@ -133,9 +133,10 @@ describe('the organization’s co-ordinator project', () => {
   });
 });
 
-describe('Ask', () => {
+describe('Ask, set to a quick task', () => {
   it('puts every question, anyone’s, in the co-ordinator project — one an older organization gets then', async () => {
     const f = await fixture();
+    await f.call('ana', 'PUT', `/api/organizations/${f.organization.id}/ask-settings`, { target: 'task' });
     expect(await f.coordinators()).toEqual([]);
     const first = await f.ask('ana', 'What waits on me?');
     expect(first.status, JSON.stringify(first.json)).toBe(200);
@@ -244,21 +245,22 @@ describe('Ask to the CEO', () => {
   const settings = (f: Awaited<ReturnType<typeof fixture>>, user: string, body?: unknown) =>
     f.call(user, body ? 'PUT' : 'GET', `/api/organizations/${f.organization.id}/ask-settings`, body);
 
-  it('is the organization’s choice: a quick task until someone who may edit the organization picks its CEO', async () => {
+  it('is the organization’s choice: its CEO unless someone who may edit the organization picks a quick task', async () => {
     const f = await fixture();
-    expect(await settings(f, 'ana')).toEqual({ status: 200, json: { target: 'task', canManage: true } });
-    expect((await settings(f, 'bo')).json).toEqual({ target: 'task', canManage: false });
-    expect((await settings(f, 'bo', { target: 'ceo' })).status).toBe(403);
+    expect(await settings(f, 'ana')).toEqual({ status: 200, json: { target: 'ceo', canManage: true } });
+    expect((await settings(f, 'bo')).json).toEqual({ target: 'ceo', canManage: false });
+    expect((await settings(f, 'bo', { target: 'task' })).status).toBe(403);
     expect((await settings(f, 'ana', { target: 'boss' })).status).toBe(400);
-    expect(await settings(f, 'ana', { target: 'ceo' })).toEqual({ status: 200, json: { target: 'ceo', canManage: true } });
-    expect((await settings(f, 'bo')).json.target).toBe('ceo');
+    expect(await settings(f, 'ana', { target: 'task' })).toEqual({ status: 200, json: { target: 'task', canManage: true } });
+    expect((await settings(f, 'bo')).json.target).toBe('task');
+    expect((await settings(f, 'ana', { target: 'ceo' })).json.target).toBe('ceo');
     // Nothing else the organization set changed: its tasks' target branch is still its own.
     expect((await f.store.getSettings(`organization:${f.organization.id}`, '__common__'))?.target).toBeUndefined();
   });
 
   it('the first Ask starts the CEO with what was asked and the asker’s own authority; every later one is a message to it', async () => {
     const f = await fixture();
-    await settings(f, 'ana', { target: 'ceo' });
+    // The default: nobody chose anything.
     const first = await f.ask('bo', 'Plan the launch');
     expect(first.status, JSON.stringify(first.json)).toBe(200);
     expect(first.json).toMatchObject({ ceo: true, title: 'CEO (Organization Co-ordinator)', project: { name: 'CEO', coordinator: true } });
@@ -280,6 +282,32 @@ describe('Ask to the CEO', () => {
     expect(f.signals.some((signal) => signal.taskId === ceo.id && signal.name === 'followUp'
       && JSON.stringify(signal.payload).includes('Also hire a designer'))).toBe(true);
     expect((await f.store.listTasks(first.json.projectId)).length).toBe(1);
+  });
+
+  it('nobody steers a CEO that holds more than they do: their Ask is a quick task with their own authority instead', async () => {
+    const f = await fixture();
+    // Ana, the owner, asks first: the CEO acts with her whole authority.
+    const first = await f.ask('ana', 'Run the firm');
+    const ceo = (await f.store.getTask(first.json.id))!;
+    expect(ceo.params._authorization).toMatchObject({ level: 'superadmin', scope: 'organization' });
+    await f.store.saveView(ceo.id, { taskId: ceo.id, title: ceo.title, stage: 'do', status: 'active', messages: [], state: {}, prs: [],
+      actions: [{ kind: 'signal', name: 'followUp', label: 'Send', enabled: true }] } as never);
+    // Bo, a developer, cannot have it act for him with Ana's authority.
+    const asked = await f.ask('bo', 'Delete the old projects');
+    expect(asked.status, JSON.stringify(asked.json)).toBe(200);
+    expect(asked.json.ceo).toBeUndefined();
+    expect(asked.json.id).not.toBe(ceo.id);
+    const quick = (await f.store.getTask(asked.json.id))!;
+    expect(quick.params).toMatchObject({ prompt: 'Delete the old projects', computer: { provider: 'none' } });
+    expect(quick.params._authorization).toMatchObject({ level: 'developer', scope: 'organization' });
+    expect(f.signals.some((signal) => signal.taskId === ceo.id && JSON.stringify(signal.payload).includes('Delete the old projects'))).toBe(false);
+    // Ana still talks to it.
+    expect((await f.ask('ana', 'And the budget?')).json.id).toBe(ceo.id);
+    // Nor may someone who holds as much, but may not write to a task that is not theirs: a quick task too.
+    await f.store.patchTaskParams(ceo.id, { _authorization: { ...(ceo.params._authorization as object), capabilities: ['task:read'] } });
+    const third = await f.ask('bo', 'What is planned?');
+    expect(third.status, JSON.stringify(third.json)).toBe(200);
+    expect(third.json.id).not.toBe(ceo.id);
   });
 
   it('a CEO someone already wrote to keeps what they wrote and the authority they chose; the Ask is added to it', async () => {

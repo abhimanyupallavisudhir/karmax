@@ -4180,8 +4180,11 @@ export class Gateway {
         const { project } = await store.ensureOrganizationCoordinatorProject(organizationId);
         await this.wikiForTaskStart(project, callerIdentity.humanSubject?.userId);
         const images = Array.isArray(b.images) ? b.images : undefined, files = Array.isArray(b.files) ? b.files : undefined;
-        if (askTarget(await store.getSettings(`organization:${organizationId}`, ASK_SETTINGS)) === 'ceo')
-          return this.json(res, 200, { ...(await this.askCeo(token, callerIdentity, project.id, prompt, images, files)), project, ceo: true });
+        if (askTarget(await store.getSettings(`organization:${organizationId}`, ASK_SETTINGS)) === 'ceo') {
+          const ceo = await this.askCeo(token, callerIdentity, project.id, prompt, images, files);
+          // Someone the CEO holds more than asks a quick task of their own instead.
+          if (ceo) return this.json(res, 200, { ...ceo, project, ceo: true });
+        }
         const task = await api.createTask(token, { projectId: project.id, workflow: 'software-dev', prompt, ownAuthority: true,
           ...(images ? { images } : {}), ...(files ? { files } : {}),
           params: { computer: { provider: NO_COMPUTER } } }, receivedAt);
@@ -10014,15 +10017,24 @@ export class Gateway {
    * Ask, where the organization sends it to its CEO: the CEO's first Ask starts
    * it — told what was asked and acting with the asker's own authority, as a
    * quick Ask would — unless someone already wrote to or started it; every
-   * later one is a message to it (kept until it can take one).
+   * later one is a message to it (kept until it can take one). Undefined when
+   * the CEO holds authority the asker does not: then they get a quick task.
    */
   private async askCeo(token: string, caller: ReturnType<typeof resolveCallerIdentity>, projectId: string, prompt: string,
-    images?: ImageRef[], files?: FileRef[]): Promise<TaskRecord> {
+    images?: ImageRef[], files?: FileRef[]): Promise<TaskRecord | undefined> {
     const { api, store } = this.deps;
     const userId = caller.humanSubject?.userId;
     let ceo = await ensureCeo({ api, store, tokens: this.deps.tokens }, projectId, userId ? { createdBy: { kind: 'user', userId } } : {});
+    // A CEO acts with the authority it was started with; telling it what to do
+    // is acting with that authority. Only someone who holds all of it may.
+    if (!untouchedCeoDraft(ceo)) {
+      const held = (ceo.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities;
+      const asker = (await this.deps.tokens.verify(token))?.caps ?? [];
+      if (!held || !held.every((capability) => allows(asker, capability as Capability))) return undefined;
+    }
     if (!ceo.params?.draft) {
-      await api.signalTask(token, ceo.id, WORKFLOW_SIG.followUp, prompt, undefined, images, files);
+      try { await api.signalTask(token, ceo.id, WORKFLOW_SIG.followUp, prompt, undefined, images, files); }
+      catch (error) { if (error instanceof CapabilityError) return undefined; throw error; } // may not write to it
       return (await store.getTask(ceo.id)) ?? ceo;
     }
     if (untouchedCeoDraft(ceo)) {
