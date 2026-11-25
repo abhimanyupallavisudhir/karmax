@@ -129,13 +129,13 @@ describe('a task without a computer, in the console', () => {
     }, { timeout: 15_000 }).toEqual({ provider: 'none' });
     // It lives in the co-ordinator project, made for it, which the sidebar now lists.
     const coordinator = (await store.getProject(created!.projectId))!;
-    expect(coordinator).toMatchObject({ name: 'Co-ordinator', organizationId: project.organizationId });
-    await expect.poll(() => page.locator('#rail-list').textContent(), { timeout: 10_000 }).toContain('Co-ordinator');
+    expect(coordinator).toMatchObject({ name: 'CEO', organizationId: project.organizationId });
+    await expect.poll(() => page.locator('#rail-list').textContent(), { timeout: 10_000 }).toContain('CEO');
     expect(created!.params.draft).toBe(false);
     // Its page opens with the message box ready for the next message.
     await expect.poll(() => page.evaluate(() => (globalThis as any).document.activeElement?.classList.contains('followup-input')), { timeout: 10_000 }).toBe(true);
     expect((created!.params._authorization as { heldBack?: string[] }).heldBack).toContain('task:delete');
-    await expect.poll(() => page.url(), { timeout: 10_000 }).toContain(`/co-ordinator/tasks/${created!.num ?? created!.id}`);
+    await expect.poll(() => page.url(), { timeout: 10_000 }).toContain(`/ceo/tasks/${created!.num ?? created!.id}`);
     expect(await dialog.count()).toBe(0);
 
     // The next question goes to the same project.
@@ -145,11 +145,11 @@ describe('a task without a computer, in the console', () => {
     await dialog.locator('textarea').press('Enter');
     await expect.poll(async () => (await allTasks()).find((task) => task.params?.prompt === 'And what about E2B?')?.projectId,
       { timeout: 15_000 }).toBe(coordinator.id);
-    expect((await store.listProjects()).filter((p) => p.name.startsWith('Co-ordinator'))).toHaveLength(1);
+    expect((await store.listProjects()).filter((p) => p.coordinator)).toHaveLength(1);
     // It is the organization's for good: its settings offer no rename, move or delete.
-    await page.goto(`${base}/personal/co-ordinator/settings`);
+    await page.goto(`${base}/personal/ceo/settings`);
     await page.locator('#project-advanced').waitFor({ state: 'attached' });
-    await expect.poll(() => page.locator('.setting-row', { hasText: 'Co-ordinator project' }).count(), { timeout: 10_000 }).toBe(1);
+    await expect.poll(() => page.locator('.setting-row', { hasText: 'CEO project' }).count(), { timeout: 10_000 }).toBe(1);
     expect(await page.locator('#delete-project, #move-project, #rename-project').count()).toBe(0);
     expect(errors).toEqual([]);
   });
@@ -181,7 +181,7 @@ describe('a task without a computer, in the console', () => {
     await dialog.locator('textarea').fill('Asked from my phone');
     await dialog.locator('button[value="submit"]').tap();
     await expect.poll(async () => (await store.getProject((await allTasks())
-      .find((task) => task.params?.prompt === 'Asked from my phone')?.projectId ?? ''))?.name, { timeout: 15_000 }).toBe('Co-ordinator');
+      .find((task) => task.params?.prompt === 'Asked from my phone')?.projectId ?? ''))?.name, { timeout: 15_000 }).toBe('CEO');
     expect(errors).toEqual([]);
     await context.close();
   });

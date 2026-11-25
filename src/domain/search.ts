@@ -118,6 +118,10 @@ export const awaitingApproval = (t: { params?: Record<string, unknown> }): boole
  * Avatar stage, finished as far as lists go, and stays editable like a draft. */
 export const restingAvatar = (t: { params?: Record<string, unknown>; lastView?: unknown }): boolean =>
   !!t.params?.avatar && !!t.params?.draft && !t.lastView;
+/** A CEO nobody has written to or started (wiki features/coordinator § CEOs):
+ * there for when someone wants it, so it waits on nobody. */
+export const restingCeo = (t: { params?: Record<string, unknown>; lastView?: unknown }): boolean =>
+  !!t.params?.coordinator && !!t.params?.draft && !t.lastView && !String(t.params?.prompt ?? '').trim();
 const status = (t: SearchTask) => t.lastView?.status
   ?? (restingAvatar(t) ? 'done' : awaitingApproval(t) ? 'waiting' : isArmed(t) ? 'armed' : 'active');
 /** The armed-aware status of a task (exported so compact projections agree with search). */
@@ -289,7 +293,7 @@ function personFor(value: string, ctx?: EvalContext): string | undefined {
   return ctx?.people?.get(v.toLowerCase());
 }
 const ownDraft = (t: SearchTask, userId: string): boolean =>
-  !!t.params?.draft && !awaitingApproval(t) && !restingAvatar(t) && t.createdBy?.kind === 'user' && t.createdBy.userId === userId;
+  !!t.params?.draft && !awaitingApproval(t) && !restingAvatar(t) && !restingCeo(t) && t.createdBy?.kind === 'user' && t.createdBy.userId === userId;
 /** Why `t` needs `userId`: the kinds of the live asks routed to them (matched on
  *  the attempt or its logical task), plus `draft` for their own draft. */
 function attentionReasons(t: SearchTask, userId: string, ctx?: EvalContext): string[] {

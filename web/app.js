@@ -512,7 +512,7 @@ function firstProjectForOrganization(organizationId) {
 function ordinaryProjectForOrganization(organizationId) {
   return (S.projects || []).find((p) => p.organizationId === organizationId && !p.coordinator);
 }
-const COORDINATOR_PROJECT_TIP = 'The organization’s own project: what you Ask lives here. It can’t be renamed, moved or deleted.';
+const COORDINATOR_PROJECT_TIP = 'The organization’s own project, where its CEO and what you Ask live. It can’t be renamed, moved or deleted.';
 // Resolve a URL slug back to a project, optionally scoped to one organization
 // (project slugs need only be unique within their org). Matches the slugified name
 // (the common, human case), falling back to a raw project id for safety. On a slug
@@ -9204,11 +9204,11 @@ function openNewTaskForm(template, projectId = template?.projectId) {
 }
 function newTaskTarget() { return S.tab === 'home' ? newTaskProjectId() : S.projectId; }
 
-// "Ask tavya" (wiki features/computerless-tasks): what you type starts a task
-// without a computer in the organization's co-ordinator project (made on first
-// use), acting with your own authority; its page opens with the message box
-// ready. One conversation is one task. Someone whose authority covers only some
-// projects asks in one of those instead.
+// "Ask tavya" (wiki features/computerless-tasks § Ask): what you type goes where
+// the organization sends Ask — a quick task without a computer in its CEO
+// project, acting with your own authority (one conversation is one task), or
+// its CEO (the first Ask starts it). Its page opens with the message box ready.
+// Someone whose authority covers only some projects asks in one of those.
 function askTavya() {
   const organizationId = S.organizationId;
   const previousFocus = document.activeElement;
@@ -9224,6 +9224,10 @@ function askTavya() {
   const input = dialog.querySelector('textarea');
   const form = dialog.querySelector('form');
   let sending = false;
+  api(`/api/organizations/${encodeURIComponent(organizationId)}/ask-settings`, { maxAge: 30_000 }).then((ask) => {
+    const where = dialog.querySelector('.ask-where');
+    if (ask?.target === 'ceo' && where) where.innerHTML = policyTip(`Goes to the organization’s CEO: it can do any work and remembers every Ask.`);
+  }).catch(() => {});
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     const text = input.value.trim();
@@ -22650,7 +22654,7 @@ function settingsView(proj) {
       <div class="setting-rows" id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
     <div class="card" data-settings-advanced hidden><div class="setting-rows">
-      ${proj.coordinator ? `<div class="setting-row"><span class="setting-label">Co-ordinator project ${policyTip(COORDINATOR_PROJECT_TIP)}</span>
+      ${proj.coordinator ? `<div class="setting-row"><span class="setting-label">CEO project ${policyTip(COORDINATOR_PROJECT_TIP)}</span>
         <span class="setting-value setting-muted">Permanent</span></div>` : `
       <div class="setting-row" data-settings-access="project" data-unsaved hidden><span class="setting-label">Name ${policyTip('Use / to put the project in folders, e.g. Clients/Website.')}</span>
         <span class="setting-value"><input id="project-name" class="setting-input" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders"></span>
@@ -22950,6 +22954,35 @@ async function hydrateEarlyAccess(organizationId) {
       } finally { input.disabled = false; }
     };
   } catch (error) { paneError(box, error, () => hydrateEarlyAccess(organizationId)); }
+}
+
+// Where Ask goes (wiki features/computerless-tasks § Ask): a quick task per
+// question, or the organization's CEO.
+const ASK_TARGET_TIP = 'Where Ask sends what you type. Quick task: a new conversation that starts in seconds and can use ' + 'tavya, but not a computer. CEO: the organization’s co-ordinator, which can do any work and remembers every Ask.';
+async function hydrateAskTarget(organizationId) {
+  const box = $('#organization-ask');
+  if (!box) return;
+  const url = `/api/organizations/${encodeURIComponent(organizationId)}/ask-settings`;
+  try {
+    const ask = await api(url);
+    if (!box.isConnected) return;
+    box.innerHTML = `<div class="setting-row"><span class="setting-label">Ask ${policyTip(ASK_TARGET_TIP.replace('tavya', siteName()))}</span>
+      <span class="setting-value"><select id="ask-target" aria-label="Where Ask goes" ${ask.canManage ? '' : 'disabled'}>
+        <option value="task" ${ask.target === 'task' ? 'selected' : ''}>Quick task</option>
+        <option value="ceo" ${ask.target === 'ceo' ? 'selected' : ''}>CEO</option></select></span></div>`;
+    const select = box.querySelector('select');
+    select.onchange = async () => {
+      select.disabled = true;
+      const previous = ask.target;
+      try {
+        ask.target = (await api(url, { method: 'PUT', body: JSON.stringify({ target: select.value }) })).target;
+        toast(ask.target === 'ceo' ? 'Ask goes to the CEO' : 'Ask starts a quick task');
+      } catch (error) {
+        select.value = previous;
+        toast(error.message, true);
+      } finally { select.disabled = false; }
+    };
+  } catch (error) { paneError(box, error, () => hydrateAskTarget(organizationId)); }
 }
 
 async function hydrateAvatarAvailability(scope, id) {
@@ -24314,6 +24347,7 @@ function globalSettingsView(embedded = false) {
     ${agentMailCard()}
     ${paymentsCard('global')}
     <div class="settings-section-title" id="settings-agents"><div>Agents</div></div>
+    ${embedded ? '<div class="card"><div class="setting-rows" id="organization-ask"><div class="setting-row setting-muted">Loading…</div></div></div>' : ''}
     ${agentAccountsCard()}
     <div class="settings-section-title" id="settings-installation"><div>Workflows ${policyTip(`The recipes tasks run on. Built-ins ship with ${siteName()} and change only with platform releases; each task keeps the version it started on.${S.meta?.hosted ? ` Installing your own isn’t available on hosted ${siteName()}.` : ''}`)}</div></div>
     <div class="card" id="workflows-card">
@@ -30225,6 +30259,7 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
     hydrateSettingsAccess({ organizationId });
     hydrateConversationSharing('organization', organizationId);
     hydrateEarlyAccess(organizationId);
+    hydrateAskTarget(organizationId);
     hydrateAvatarAvailability('organization', organizationId);
     setEventHandler($('#export-organization'), 'click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
     const renameOrganization = async () => {

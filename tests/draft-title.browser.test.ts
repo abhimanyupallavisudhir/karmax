@@ -21,7 +21,7 @@ it('the task list names a draft by what its prompt says now, after it was backsp
   try {
     await signIn(context, g.url, 'ada@example.test', PASSWORD);
     const project = await consoleRequest(context, g.url, 'POST', `/api/organizations/${organization.id}/projects`, { name: 'Website' });
-    const draft = async () => (await g.store.listTasks(project.id)).find((task) => task.params?.draft);
+    const draft = async () => (await g.store.listTasks(project.id)).find((task) => task.params?.draft && !task.params?.coordinator); // not the project's CEO
     const prompt = page.locator('#tf-body textarea[data-field="prompt"]');
 
     await step('type a prompt, wait for the draft', async () => {

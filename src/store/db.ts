@@ -4,7 +4,7 @@ import { notPullRequestSql, pullRequestOf, type PullRequestOf } from '../domain/
 export interface TaskHeader { id: string; num?: number; title: string; projectId: string; status?: string; stage?: string;
   /** Set when the row is a pull request of its task (SPEC §11.1): the header is its task's. */
   pullRequest?: { taskId: string; checkout: string } }
-import { ORGANIZATION_COORDINATOR_PROJECT } from '../domain/autonomous-projects.js';
+import { CEO_PROJECT_NAME, LEGACY_CEO_PROJECT_NAME, RESERVED_PROJECT_SLUGS } from '../domain/coordinator.js';
 import { ANY_PROVIDER, applyComputer, normalizeComputer, LOCAL_WORLD_KINDS, runsOnHost, defaultLoginSandboxes, type ComputerSpec } from '../domain/computer.js';
 /** The local world kinds as an SQL list (`NOT IN (…)`): constants, never input. */
 const LOCAL_KINDS_SQL = LOCAL_WORLD_KINDS.map((kind) => `'${kind}'`).join(',');
@@ -1826,27 +1826,37 @@ export class Store {
     return row ? rowToProject(row) : undefined;
   }
 
-  /** Give the organization its co-ordinator project: the one it has; else the
-   * project an organization-wide autonomy already runs from, or one already
-   * called by the reserved name (both from before co-ordinator projects were
-   * marked); else a new one. `created` says whether a project was made. */
+  /** Give the organization its CEO project: the one it has; else the project
+   * an organization-wide autonomy already runs from, or one already called by a
+   * reserved name (both from before CEO projects were marked); else a new one.
+   * One still called by its old name, "Co-ordinator", is renamed "CEO" (unless
+   * another project already has that name). `created` says whether one was made. */
   async ensureOrganizationCoordinatorProject(organizationId: string): Promise<{ project: Project; created: boolean }> {
     return this.db.transaction(async () => {
       (await this.lockOrganization(organizationId));
+      const renamed = async (project: Project): Promise<Project> => {
+        if (project.name !== LEGACY_CEO_PROJECT_NAME) return project;
+        const taken = (await this.listOrganizationProjects(organizationId))
+          .some((other) => other.id !== project.id && slugify(other.name) === slugify(CEO_PROJECT_NAME));
+        if (taken) return project;
+        (await this.db.prepare('UPDATE projects SET name=? WHERE id=?').run(CEO_PROJECT_NAME, project.id));
+        return { ...project, name: CEO_PROJECT_NAME };
+      };
       const existing = await this.organizationCoordinatorProject(organizationId);
-      if (existing) return { project: existing, created: false };
+      if (existing) return { project: await renamed(existing), created: false };
       const projects = await this.listOrganizationProjects(organizationId);
       let adopt: Project | undefined;
       for (const project of projects) {
         const autonomy = await this.kvGet(`autonomy:project:${project.id}`);
         try { if (autonomy && JSON.parse(autonomy).scope === 'organization') { adopt = project; break; } } catch { /* not a record */ }
       }
-      adopt ??= projects.find((project) => isReservedProjectName(project.name));
+      adopt ??= projects.find((project) => slugify(project.name) === slugify(CEO_PROJECT_NAME))
+        ?? projects.find((project) => isReservedProjectName(project.name));
       if (adopt) {
         (await this.db.prepare('UPDATE projects SET coordinator=1 WHERE id=?').run(adopt.id));
-        return { project: { ...adopt, coordinator: true }, created: false };
+        return { project: await renamed({ ...adopt, coordinator: true }), created: false };
       }
-      return { project: await this.createProject(ORGANIZATION_COORDINATOR_PROJECT, {}, organizationId, { coordinator: true }), created: true };
+      return { project: await this.createProject(CEO_PROJECT_NAME, {}, organizationId, { coordinator: true }), created: true };
     });
   }
 
@@ -12090,14 +12100,14 @@ function rowToProject(r: any): Project {
     ...(r.folder ? { folder: r.folder } : {}), ...(Number(r.coordinator) ? { coordinator: true as const } : {}) };
 }
 
-const COORDINATOR_KEEPS_NAME = `The ${ORGANIZATION_COORDINATOR_PROJECT} project keeps its name.`;
-const COORDINATOR_UNDELETABLE = `The ${ORGANIZATION_COORDINATOR_PROJECT} project belongs to the organization and cannot be deleted.`;
-/** The co-ordinator project's name, and its spelling without the hyphen, are its alone. */
+const COORDINATOR_KEEPS_NAME = `The ${CEO_PROJECT_NAME} project keeps its name.`;
+const COORDINATOR_UNDELETABLE = `The ${CEO_PROJECT_NAME} project belongs to the organization and cannot be deleted.`;
+/** The CEO project's name, and what it was called before (with or without the hyphen), are its alone. */
 export function isReservedProjectName(name: string): boolean {
-  return ['co-ordinator', 'coordinator'].includes(slugify(name));
+  return RESERVED_PROJECT_SLUGS.includes(slugify(name));
 }
 function assertUnreservedProjectName(name: string): void {
-  if (isReservedProjectName(name)) throw new Error(`“${ORGANIZATION_COORDINATOR_PROJECT}” is reserved for the organization's co-ordinator project.`);
+  if (isReservedProjectName(name)) throw new Error(`“${name.trim()}” is reserved for the organization's ${CEO_PROJECT_NAME} project.`);
 }
 
 /** Canonical form of a sidebar folder path: segments trimmed, empties dropped,

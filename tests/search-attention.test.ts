@@ -54,6 +54,15 @@ describe('for: — what needs a person', () => {
     expect(ids('for:me,bob')).toEqual(['bobs-draft', 'child-asks-me', 'input-bob', 'my-draft', 'review-me']);
   });
 
+  it('a CEO nobody has written to waits on nobody; once written to, it is its creator’s draft (wiki features/coordinator § CEOs)', () => {
+    const ceo = (prompt: string) => task('ceo', { params: { draft: true, prompt, coordinator: { wakeHours: 24 } }, createdBy: { kind: 'user', userId: alice }, lastView: undefined });
+    const forMe = (t: SearchTask) => evaluateQuery([t], parseQuery('for:me'), ctx).tasks.map((x) => x.id);
+    expect(forMe(ceo(''))).toEqual([]);
+    expect(forMe(ceo('Run the firm frugally.'))).toEqual(['ceo']);
+    // Still a draft in the list.
+    expect(evaluateQuery([ceo('')], parseQuery('is:draft'), ctx).tasks.map((x) => x.id)).toEqual(['ceo']);
+  });
+
   it('an unknown person, or me without a signed-in user, matches nothing', () => {
     expect(ids('for:nobody')).toEqual([]);
     expect(ids('for:me', { userId: undefined })).toEqual([]);

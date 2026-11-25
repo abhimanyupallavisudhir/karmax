@@ -7,7 +7,9 @@ import { KarmaxApi } from '../src/platform/api.js';
 import { AuthorizationService, organizationScope, projectScope } from '../src/platform/authorization.js';
 import { ProjectTransfers } from '../src/platform/project-transfer.js';
 import { WorldRegistry } from '../src/world/registry.js';
-import { AUTONOMY_KEY, ORGANIZATION_COORDINATOR_PROJECT } from '../src/domain/autonomous-projects.js';
+import { AUTONOMY_KEY } from '../src/domain/autonomous-projects.js';
+import { CEO_KEY, CEO_PROJECT_NAME as ORGANIZATION_COORDINATOR_PROJECT, LEGACY_CEO_PROJECT_NAME, ceoTitle } from '../src/domain/coordinator.js';
+import { ensureCeo, ensureEveryCeo, projectCeo } from '../src/platform/ceo.js';
 
 /**
  * Every organization's co-ordinator project (wiki features/computerless-tasks,
@@ -21,8 +23,11 @@ async function fixture() {
   const store = await Store.create(':memory:');
   const tokens = new TokenAuthority(store);
   const authorization = await AuthorizationService.create(store);
-  const client = { workflow: { getHandle: () => ({ executeUpdate: async () => ({}), query: async () => [], signal: async () => undefined }),
-    start: async () => ({}) } } as any;
+  // What reached a workflow: started, and signalled.
+  const started: string[] = [], signals: Array<{ taskId: string; name: string; payload: any }> = [];
+  const client = { workflow: { getHandle: (taskId: string) => ({ executeUpdate: async () => ({}), query: async () => [],
+    signal: async (name: string, payload: unknown) => { signals.push({ taskId, name, payload }); } }),
+    start: async (_type: unknown, options: { workflowId: string }) => { started.push(options.workflowId); return {}; } } } as any;
   const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, authorization, worlds: new WorldRegistry() });
   const h = await stubGateway({ store, tokens, api, authorization, client });
   closers.push(h.close);
@@ -52,7 +57,8 @@ async function fixture() {
     call(user, 'POST', `/api/organizations/${organizationId}/ask`, { prompt });
   const coordinators = async (organizationId = organization.id) =>
     (await store.listOrganizationProjects(organizationId)).filter((project) => project.coordinator);
-  return { store, organization, site, call, ask, coordinators };
+  const deps = { api, store, tokens };
+  return { store, organization, site, call, ask, coordinators, deps, started, signals };
 }
 
 describe('the organization’s co-ordinator project', () => {
@@ -100,7 +106,7 @@ describe('the organization’s co-ordinator project', () => {
 
   it('its name is reserved: no other project may take it, with or without the hyphen', async () => {
     const f = await fixture();
-    for (const name of [ORGANIZATION_COORDINATOR_PROJECT, 'coordinator', 'Work/Co ordinator']) {
+    for (const name of [ORGANIZATION_COORDINATOR_PROJECT, 'ceo', LEGACY_CEO_PROJECT_NAME, 'coordinator', 'Work/Co ordinator']) {
       await expect(f.store.createProject(name, {}, f.organization.id)).rejects.toThrow(/reserved/);
       await expect(f.store.renameProject(f.site.id, name)).rejects.toThrow(/reserved/);
     }
@@ -162,5 +168,119 @@ describe('Ask', () => {
     expect((await f.ask('ana', '   ')).status).toBe(400);
     expect((await f.call('ana', 'POST', `/api/organizations/${f.organization.id}/ask`, {})).status).toBe(400);
     expect((await f.ask('ana', 'Hi', 'org_nope')).status).toBe(404);
+  });
+});
+
+describe('CEOs: a permanent co-ordinator in every project, and the organization’s in its CEO project', () => {
+  const ceoOf = async (f: Awaited<ReturnType<typeof fixture>>, projectId: string) => (await projectCeo(f.store, projectId))!;
+
+  it('every new organization and project has one: a draft named for what it is, with nothing else in it', async () => {
+    const f = await fixture();
+    const organization = await f.call('ana', 'POST', '/api/organizations', { name: 'Side' });
+    expect(organization.status, JSON.stringify(organization.json)).toBe(200);
+    const [ceoProject] = await f.coordinators(organization.json.id);
+    expect(ceoProject!.name).toBe('CEO');
+    const ceo = await ceoOf(f, ceoProject!.id);
+    expect(ceo).toMatchObject({ title: 'CEO (Organization Co-ordinator)', workflow: 'software-dev', projectId: ceoProject!.id });
+    expect(ceo.params).toMatchObject({ draft: true, prompt: '', coordinator: { wakeHours: 24 } });
+    expect(ceo.createdBy).toEqual({ kind: 'user', userId: 'ana' });
+
+    const shop = await f.call('ana', 'POST', `/api/organizations/${f.organization.id}/projects`, { name: 'Shop', config: {} });
+    expect(shop.status, JSON.stringify(shop.json)).toBe(200);
+    expect(await ceoOf(f, shop.json.id)).toMatchObject({ title: 'CEO (Project Co-ordinator)', params: { draft: true, prompt: '' } });
+  });
+
+  it('boot gives everything from before its CEO, once; a cancelled one is replaced', async () => {
+    const f = await fixture();
+    await ensureEveryCeo(f.deps);
+    await ensureEveryCeo(f.deps);
+    const [ceoProject] = await f.coordinators();
+    for (const [project, title] of [[f.site.id, ceoTitle('project')], [ceoProject!.id, ceoTitle('organization')]] as const) {
+      const tasks = (await f.store.listTasks(project)).filter((task) => task.params?.coordinator);
+      expect(tasks.map((task) => task.title)).toEqual([title]);
+      // For the organization's owner, who hears when it fails.
+      expect(tasks[0]!.createdBy).toEqual({ kind: 'user', userId: 'ana' });
+    }
+    const first = await ceoOf(f, f.site.id);
+    await f.store.saveView(first.id, { taskId: first.id, title: first.title, stage: 'cancelled', status: 'cancelled', messages: [], state: {}, actions: [], prs: [] } as never);
+    const second = await ensureCeo(f.deps, f.site.id);
+    expect(second.id).not.toBe(first.id);
+    expect(second.params).toMatchObject({ draft: true, coordinator: { wakeHours: 24 } });
+    // Made at once from two places, it is still one.
+    const other = await f.store.createProject('Docs', {}, f.organization.id);
+    const both = await Promise.all([ensureCeo(f.deps, other.id), ensureCeo(f.deps, other.id)]);
+    expect(both[0].id).toBe(both[1].id);
+  });
+
+  it('a CEO project still called Co-ordinator is renamed, and an autonomy’s co-ordinator becomes its CEO', async () => {
+    const f = await fixture();
+    const legacy = await f.store.createProject(LEGACY_CEO_PROJECT_NAME, {}, f.organization.id, { coordinator: true });
+    expect((await f.store.ensureOrganizationCoordinatorProject(f.organization.id)).project).toMatchObject({ id: legacy.id, name: 'CEO' });
+    expect((await f.store.getProject(legacy.id))!.name).toBe('CEO');
+
+    const coordinator = await f.store.createTask({ projectId: f.site.id, title: LEGACY_CEO_PROJECT_NAME, workflow: 'software-dev',
+      workflowVersion: '1.30.0', params: { prompt: '', draft: true, coordinator: { wakeHours: 24 } } });
+    await f.store.kvSet(AUTONOMY_KEY(f.site.id), JSON.stringify({ scope: 'project', avatarTaskId: 'a', coordinatorTaskId: coordinator.id,
+      wikiPage: { scope: 'project', path: 'autonomy' }, at: 1 }));
+    const ceo = await ensureCeo(f.deps, f.site.id);
+    expect(ceo).toMatchObject({ id: coordinator.id, title: 'CEO (Project Co-ordinator)' });
+    expect(await f.store.kvGet(CEO_KEY(f.site.id))).toBe(coordinator.id);
+  });
+});
+
+describe('Ask to the CEO', () => {
+  const settings = (f: Awaited<ReturnType<typeof fixture>>, user: string, body?: unknown) =>
+    f.call(user, body ? 'PUT' : 'GET', `/api/organizations/${f.organization.id}/ask-settings`, body);
+
+  it('is the organization’s choice: a quick task until someone who may edit the organization picks its CEO', async () => {
+    const f = await fixture();
+    expect(await settings(f, 'ana')).toEqual({ status: 200, json: { target: 'task', canManage: true } });
+    expect((await settings(f, 'bo')).json).toEqual({ target: 'task', canManage: false });
+    expect((await settings(f, 'bo', { target: 'ceo' })).status).toBe(403);
+    expect((await settings(f, 'ana', { target: 'boss' })).status).toBe(400);
+    expect(await settings(f, 'ana', { target: 'ceo' })).toEqual({ status: 200, json: { target: 'ceo', canManage: true } });
+    expect((await settings(f, 'bo')).json.target).toBe('ceo');
+    // Nothing else the organization set changed: its tasks' target branch is still its own.
+    expect((await f.store.getSettings(`organization:${f.organization.id}`, '__common__'))?.target).toBeUndefined();
+  });
+
+  it('the first Ask starts the CEO with what was asked and the asker’s own authority; every later one is a message to it', async () => {
+    const f = await fixture();
+    await settings(f, 'ana', { target: 'ceo' });
+    const first = await f.ask('bo', 'Plan the launch');
+    expect(first.status, JSON.stringify(first.json)).toBe(200);
+    expect(first.json).toMatchObject({ ceo: true, title: 'CEO (Organization Co-ordinator)', project: { name: 'CEO', coordinator: true } });
+    const ceo = (await f.store.getTask(first.json.id))!;
+    expect(ceo.params).toMatchObject({ prompt: 'Plan the launch', draft: false, coordinator: { wakeHours: 24 } });
+    // Bo's own authority, not the project's default, and no computerless ceiling.
+    expect(ceo.params._authorization).toMatchObject({ level: 'developer', scope: 'organization' });
+    expect((ceo.params._authorization as { heldBack?: string[] }).heldBack).toBeUndefined();
+    expect(f.started).toContain(ceo.id);
+    // No quick task was made.
+    expect((await f.store.listTasks(first.json.projectId)).map((task) => task.id)).toEqual([ceo.id]);
+
+    // Running, it takes messages.
+    await f.store.saveView(ceo.id, { taskId: ceo.id, title: ceo.title, stage: 'do', status: 'active', messages: [], state: {}, prs: [],
+      actions: [{ kind: 'signal', name: 'followUp', label: 'Send', enabled: true }] } as never);
+    const second = await f.ask('ana', 'Also hire a designer');
+    expect(second.status, JSON.stringify(second.json)).toBe(200);
+    expect(second.json.id).toBe(ceo.id);
+    expect(f.signals.some((signal) => signal.taskId === ceo.id && signal.name === 'followUp'
+      && JSON.stringify(signal.payload).includes('Also hire a designer'))).toBe(true);
+    expect((await f.store.listTasks(first.json.projectId)).length).toBe(1);
+  });
+
+  it('a CEO someone already wrote to keeps what they wrote and the authority they chose; the Ask is added to it', async () => {
+    const f = await fixture();
+    await settings(f, 'ana', { target: 'ceo' });
+    const { project } = await f.store.ensureOrganizationCoordinatorProject(f.organization.id);
+    const ceo = await ensureCeo(f.deps, project.id);
+    await f.store.patchTaskParams(ceo.id, { prompt: 'Run the firm frugally.' });
+    const before = (await f.store.getTask(ceo.id))!.params._authorization;
+    const asked = await f.ask('ana', 'Start with the website');
+    expect(asked.status, JSON.stringify(asked.json)).toBe(200);
+    const after = (await f.store.getTask(ceo.id))!;
+    expect(after.params.prompt).toBe('Run the firm frugally.\n\nStart with the website');
+    expect(after.params._authorization).toMatchObject({ level: (before as { level: string }).level, scope: (before as { scope: string }).scope });
   });
 });

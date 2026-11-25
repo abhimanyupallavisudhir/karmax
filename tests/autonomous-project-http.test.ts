@@ -6,7 +6,7 @@ import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import { AuthorizationService, organizationScope } from '../src/platform/authorization.js';
 import { WorldRegistry } from '../src/world/registry.js';
-import { ORGANIZATION_COORDINATOR_PROJECT } from '../src/domain/autonomous-projects.js';
+import { CEO_PROJECT_NAME as ORGANIZATION_COORDINATOR_PROJECT } from '../src/domain/coordinator.js';
 
 /**
  * Autonomous projects and organizations over HTTP (wiki features/autonomy): the
