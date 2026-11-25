@@ -2322,9 +2322,10 @@ export class Gateway {
       try {
         const githubIdentity = await this.deps.githubApp.authorizeUser(identity.user.id, code, (await this.githubPublicUrl(req)), {
           expectedAccountId: pending.githubAccountId,
-          // Linked to vouch for an installation, an account does not take over
-          // as the one the person works as (the first one linked still does).
-          makeActive: !pending.installationId && (pending.selectAccount || !pending.githubAccountId),
+          // Linked to vouch for or make an installation, an account does not
+          // take over as the one the person works as (the first one linked still does).
+          makeActive: !pending.installationId && pending.returnTo !== 'installation'
+            && (pending.selectAccount || !pending.githubAccountId),
         });
         await this.saveGithubIdentity(identity.user.id, githubIdentity);
         const activeAccountId = (await this.deps.githubApp.activeUserAccountId(identity.user.id));
@@ -2356,6 +2357,18 @@ export class Gateway {
           }
           for (const project of (await this.deps.store.listProjects()).filter((candidate) => candidate.organizationId === pending.organizationId))
             await this.ensureProjectWiki(project, identity.user.id);
+        }
+        if (pending.returnTo === 'installation') {
+          // GitHub has said which account the person means. The App already on
+          // it (or on an organization it administers) is offered for this
+          // organization; otherwise GitHub's installer opens, as that account.
+          // Never the installer first: for an account the App is already on,
+          // GitHub shows its settings page, which never returns here.
+          const installUrl = await this.installationStep(pending.organizationId, identity.user.id, githubIdentity.id);
+          if (installUrl) {
+            res.writeHead(303, { location: installUrl });
+            return void res.end();
+          }
         }
         const destination = pending.returnTo === 'profile'
           ? (await userProfilePath(this.deps.store, pending.organizationId))
@@ -11664,6 +11677,18 @@ export class Gateway {
       console.warn(`[github] installation link failed for ${organization.id}: ${error instanceof Error ? error.message : String(error)}`);
     }
     return undefined;
+  }
+
+  /** GitHub's installer for an organization, when the GitHub account the
+   * person just picked administers no installation it lacks; none when the
+   * picker has one to offer (or GitHub could not say, so the picker explains). */
+  private async installationStep(organizationId: string, userId: string, githubAccountId: string): Promise<string | undefined> {
+    const githubApp = this.deps.githubApp!;
+    const installations = await githubApp.connectableInstallations(userId, githubAccountId).catch(() => undefined);
+    if (!installations) return undefined;
+    const connected = new Set((await this.deps.store.listGitConnections(organizationId)).map((connection) => connection.installationId));
+    if (installations.some((installation) => !connected.has(installation.id))) return undefined;
+    return githubApp.installationUrl(await this.deps.store.createGithubInstallState(organizationId, userId));
   }
 
   private async saveGithubIdentity(userId: string,

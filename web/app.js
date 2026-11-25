@@ -23361,27 +23361,39 @@ async function connectOrganizationGithub(organizationId, onConnected) {
   const dialog = document.createElement('dialog');
   dialog.className = 'modal-card';
   // Either pick an account tavya is already installed on, or install it on
-  // one (GitHub asks which). Signed in to GitHub as someone else? Switch first.
+  // one. Installing starts at GitHub's account picker, never at the installer:
+  // for an account the App is already on, the installer shows that
+  // installation's settings page, which never comes back here. Back from the
+  // picker, that account's installation is offered here, or the installer opens.
   const you = result.login ? `<b>${esc(result.login)}</b>` : 'your GitHub account';
   const installed = result.installations.length > 0;
+  const installLabel = installed ? 'Install on another account' : 'Install on GitHub';
+  const installClass = `btn ${installed ? '' : 'primary'}`;
+  const installTip = 'GitHub asks which account first';
   dialog.innerHTML = `<form method="dialog" class="github-connect"><h2>Connect GitHub</h2>
     <p>${installed ? 'Choose the GitHub account whose repositories this organization works on.' : `${siteNameMarkup()} isn’t installed on ${you} yet. Install it there, choosing which repositories it may use.`}</p>
     ${installed ? `<label class="form-row">GitHub account<select id="github-existing-installation">${result.installations.map(item => `<option value="${esc(item.id)}">${esc(item.accountLogin)}</option>`).join('')}</select></label>` : ''}
     <p class="task-sub" role="alert" id="github-connect-error"></p>
     <div class="github-connect-actions">
       ${installed ? '<button class="btn primary" type="button" id="github-connect-existing">Connect</button>' : ''}
-      <a class="btn ${installed ? '' : 'primary'}" href="${esc(result.url)}">${installed ? 'Install on another account' : 'Install on GitHub'}</a>
-      ${result.canAuthorize ? `<button class="btn ghost" type="button" id="github-switch-account" title="Signed in to GitHub as someone else? Switch accounts.">${result.login ? `Not ${esc(result.login)}?` : 'Use another GitHub account'}</button>` : ''}
+      ${result.canAuthorize
+        ? `<button class="${installClass}" type="button" id="github-install" title="${installTip}">${installLabel}</button>`
+        : `<a class="${installClass}" href="${esc(result.url)}">${installLabel}</a>`}
       <button class="btn ghost" type="submit">Cancel</button>
     </div></form>`;
   dialog.addEventListener('close', () => dialog.remove());
-  dialog.querySelector('#github-switch-account')?.addEventListener('click', async () => {
+  dialog.querySelector('#github-install')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
     try {
       const authorization = await api(`/api/organizations/${organizationId}/github/authorize`, {
         method: 'POST', body: JSON.stringify({ returnTo: 'installation', mode: 'add' }),
       });
       location.assign(authorization.url);
-    } catch (error) { dialog.querySelector('#github-connect-error').textContent = plainError(error); }
+    } catch (error) {
+      dialog.querySelector('#github-connect-error').textContent = plainError(error);
+      button.disabled = false;
+    }
   });
   dialog.querySelector('#github-connect-existing')?.addEventListener('click', async (event) => {
     const button = event.currentTarget;

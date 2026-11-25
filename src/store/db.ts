@@ -7212,7 +7212,7 @@ export class Store {
       // Turn ids are `<task>#n` (older runs) or `<task>:<run>#n`; both carry the
       // turn's session checkpoint and journal.
       for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `task-create:${taskId}:`,
-        `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`, `resource-checkpoint:${taskId}:`,
+        `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`, `resource-checkpoint:${taskId}:`, `resource-stamp:${taskId}:`,
         `secretref:${taskId}:`]) await this.kvDeletePrefix(value);
     }
   

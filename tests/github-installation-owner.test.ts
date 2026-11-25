@@ -142,3 +142,35 @@ it('refuses an installation that does not exist for the App without a detour to 
   expect(forged.status).toBe(502);
   expect(forged.text).toContain('This GitHub installation is not available to this account');
 });
+
+// 2026-11-25: the same person, asked to install the App "on another account",
+// picked @tshangdas in GitHub's installer. The App was already on it, so
+// GitHub showed that installation's settings page, whose Save stays disabled
+// until something changes and which never returns to tavya: a dead end.
+// Installing starts at GitHub's account picker instead; back from it, the
+// App already on the picked account is offered, or the installer opens.
+it('offers the App already on the GitHub account the person picks to install on, without making it active', async () => {
+  const f = await fixture();
+  const picked = await f.store.createGithubInstallState(f.team.id, 'me', { returnTo: 'installation', selectAccount: true });
+  const back = await f.authorized(picked, 'code-other');
+  expect(back.status, back.text).toBe(303);
+  expect(back.location).toContain('github=choose-installation');
+  expect((await f.githubApp.administeredInstallations('me')).map((installation) => installation.id).sort()).toEqual(['42', '43']);
+  expect(await f.githubApp.listUserAccounts('me')).toEqual([
+    expect.objectContaining({ login: 'main', active: true }),
+    expect.objectContaining({ login: 'other', active: false }),
+  ]);
+});
+
+it('opens GitHub\'s installer once the picked account has no installation the organization lacks', async () => {
+  const f = await fixture();
+  await f.githubApp.connectExistingInstallation(f.team.id, 'me', '42');
+  const picked = await f.store.createGithubInstallState(f.team.id, 'me', { returnTo: 'installation', selectAccount: true });
+  const back = await f.authorized(picked, 'code-main');
+  expect(back.status, back.text).toBe(303);
+  const installer = new URL(back.location);
+  expect(`${installer.origin}${installer.pathname}`).toBe('https://github.com/apps/test-app/installations/new');
+  // Its state brings the installation back to this organization.
+  expect(await f.store.consumeGithubInstallState(installer.searchParams.get('state')!, 'me'))
+    .toMatchObject({ organizationId: f.team.id });
+});
