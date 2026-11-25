@@ -1,7 +1,7 @@
 import type { Store } from '../store/db.js';
 import type { TokenAuthority } from './tokens.js';
 import type { KarmaxApi } from './api.js';
-import type { PrincipalRef, TaskRecord } from '../domain/types.js';
+import type { AuthorizationSelection, PrincipalRef, TaskRecord } from '../domain/types.js';
 import { AUTONOMY_KEY, type ProjectAutonomy } from '../domain/autonomous-projects.js';
 import { CEO_KEY, ceoTitle, DEFAULT_COORDINATOR_WAKE_HOURS, LEGACY_CEO_PROJECT_NAME, type CeoScope } from '../domain/coordinator.js';
 import { NotFoundError } from './errors.js';
@@ -12,14 +12,27 @@ import { NotFoundError } from './errors.js';
  * draft named for what it is and nothing else. Made with the project or
  * organization, and for those from before at boot (`ensureEveryCeo`).
  *
- * Its draft is made by the platform with the project's default authority —
- * what a member of it may start — so anyone who can run the project's tasks can
- * run it; whoever starts it from Ask gives it their own (src/gateway Ask).
+ * Its authority is fixed, as an autonomous project's (wiki features/autonomy):
+ * an organization's CEO is Super-administrator of the organization, a
+ * project's Project maintainer of its project, each with every vault
+ * credential. The draft asks for it and holds none of it: whoever starts the
+ * CEO grants it, and someone who cannot is asked to have it approved by someone
+ * who can — as any task asking for more than its starter holds (owner,
+ * 2026-11-25).
  */
 export interface CeoDeps { api: KarmaxApi; store: Store; tokens: TokenAuthority }
 
 /** Who made a draft the platform made for a project. */
 export const CEO_PRINCIPAL = 'system:ceo';
+
+/** What a CEO acts with: the same as an autonomous project's or organization's Avatār. */
+export function ceoAuthorization(scope: CeoScope, projectId: string): AuthorizationSelection {
+  return scope === 'organization' ? { level: 'superadmin', scope: 'organization' }
+    : { level: 'maintainer', scope: 'projects', projectIds: [projectId] };
+}
+export const CEO_CREDENTIAL_GRANTS = ['use-credential:*'];
+/** An organization's CEO lives in its CEO project; every other project's is the project's own. */
+export const ceoScopeOf = (project: { coordinator?: true }): CeoScope => (project.coordinator ? 'organization' : 'project');
 /** How long a claim to make a CEO counts as someone making it (a crash leaves one). */
 const CLAIM_STALE_MS = 2 * 60_000;
 const CLAIM_WAIT_MS = 15_000;
@@ -95,11 +108,16 @@ async function createCeoDraft(deps: CeoDeps, projectId: string, createdBy?: Prin
   const project = await store.getProject(projectId);
   if (!project) throw new NotFoundError(`no project ${projectId}`);
   const organizationId = project.organizationId ?? 'org_personal';
-  const scope: CeoScope = project.coordinator ? 'organization' : 'project';
+  const scope = ceoScopeOf(project);
   const owner = createdBy ?? await organizationOwner(store, organizationId);
-  const { token } = await tokens.mintPrincipal(CEO_PRINCIPAL, ['*'], projectId, 10 * 60_000, organizationId);
+  // The platform makes the draft and can grant it nothing: it asks for its
+  // authority, granted only by whoever starts it (queueStoredTask).
+  // Organization-scoped, as asking for organization-wide authority must be.
+  const { token } = await tokens.mintPrincipal(CEO_PRINCIPAL, ['task:create', 'task:read', 'project:read'],
+    scope === 'organization' ? undefined : projectId, 10 * 60_000, organizationId);
   try {
-    return await api.createTask(token, { projectId, draft: true, title: ceoTitle(scope), prompt: '',
+    return await api.createTask(token, { projectId, draft: true, allowAttenuation: true, title: ceoTitle(scope), prompt: '',
+      authorization: ceoAuthorization(scope, projectId), credentialGrants: CEO_CREDENTIAL_GRANTS,
       params: { coordinator: { wakeHours: DEFAULT_COORDINATOR_WAKE_HOURS } }, ...(owner ? { createdBy: owner } : {}) });
   } finally {
     await tokens.revoke(token);

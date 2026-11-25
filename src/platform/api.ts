@@ -1,4 +1,5 @@
 import * as __asyncCollections from '../util/async-collections.js';
+import { CEO_KEY } from '../domain/coordinator.js';
 import { withSpendResolutions } from './spend-review.js';
 import { autonomyRoute, projectAutonomy, setUpAutonomy } from './autonomous-projects.js';
 import type { AutonomyScope, ProjectAutonomy } from '../domain/autonomous-projects.js';
@@ -5624,6 +5625,9 @@ Prefer declining what the task does not need. Then briefly report the decision.`
    * that person — for the person's own. */
   private async routesAuthorizationOf(caller: ScopedToken, task: TaskRecord): Promise<boolean> {
     if (caller.taskId !== '*' && task.createdBy?.kind === 'task-agent' && task.createdBy.taskId === caller.taskId) return true;
+    // A project's CEO is the project's, not its creator's: anyone who may start
+    // tasks there may ask for it to be started (wiki features/coordinator § CEOs).
+    if (task.params?.coordinator && task.params?.draft && (await this.deps.store.kvGet(CEO_KEY(task.projectId))) === task.id) return true;
     const userId = caller.humanSubject?.userId;
     return !!userId && (await this.deps.store.taskCreatorUserId(task.id)) === userId;
   }

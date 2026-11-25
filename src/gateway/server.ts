@@ -1,6 +1,6 @@
 import { computerDefaults, saveOrganizationComputer, saveProjectComputer, splitComputerValues } from '../platform/computer-settings.js';
 import { ASK_SETTINGS, ASK_TARGETS, askTarget } from '../domain/coordinator.js';
-import { ensureCeo, untouchedCeoDraft } from '../platform/ceo.js';
+import { CEO_CREDENTIAL_GRANTS, CEO_PRINCIPAL, ceoAuthorization, ceoScopeOf, ensureCeo } from '../platform/ceo.js';
 import { type AutonomyScope, type ProjectAutonomy } from '../domain/autonomous-projects.js';
 import { machineWaits, type MachineWait } from '../world/machine-wait.js';
 import { REPOSITORY_ROUTE } from '../world/resource-repository.js';
@@ -10014,39 +10014,46 @@ export class Gateway {
   /** What every project comes with from the task store: the repair of failed
    *  deploys (src/integrations/github-events.ts). The project is made either way. */
   /**
-   * Ask, where the organization sends it to its CEO: the CEO's first Ask starts
-   * it — told what was asked and acting with the asker's own authority, as a
-   * quick Ask would — unless someone already wrote to or started it; every
-   * later one is a message to it (kept until it can take one). Undefined when
-   * the CEO holds authority the asker does not: then they get a quick task.
+   * Ask, where the organization sends it to its CEO (wiki features/coordinator
+   * § CEOs). A CEO not started yet takes the Ask into its instructions and is
+   * started by the asker — granting its fixed authority, which they must hold;
+   * one who does not has it sent for approval to someone who can, and approval
+   * starts it. A started CEO takes the Ask as a message, from someone who holds
+   * everything it holds and may write to it. Undefined when the asker may not
+   * steer it: then they get a quick task of their own.
    */
   private async askCeo(token: string, caller: ReturnType<typeof resolveCallerIdentity>, projectId: string, prompt: string,
-    images?: ImageRef[], files?: FileRef[]): Promise<TaskRecord | undefined> {
-    const { api, store } = this.deps;
+    images?: ImageRef[], files?: FileRef[]): Promise<(TaskRecord & { awaitingApproval?: { requestId: string; audience: string[] } }) | undefined> {
+    const { api, store, tokens } = this.deps;
     const userId = caller.humanSubject?.userId;
-    let ceo = await ensureCeo({ api, store, tokens: this.deps.tokens }, projectId, userId ? { createdBy: { kind: 'user', userId } } : {});
-    // A CEO acts with the authority it was started with; telling it what to do
-    // is acting with that authority. Only someone who holds all of it may.
-    if (!untouchedCeoDraft(ceo)) {
-      const held = (ceo.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities;
-      const asker = (await this.deps.tokens.verify(token))?.caps ?? [];
-      if (!held || !held.every((capability) => allows(asker, capability as Capability))) return undefined;
-    }
+    const ceo = await ensureCeo({ api, store, tokens }, projectId, userId ? { createdBy: { kind: 'user', userId } } : {});
     if (!ceo.params?.draft) {
+      // Telling a CEO what to do is acting with its authority: only someone who holds all of it may.
+      const held = (ceo.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities;
+      const asker = (await tokens.verify(token))?.caps ?? [];
+      if (!held || !held.every((capability) => allows(asker, capability as Capability))) return undefined;
       try { await api.signalTask(token, ceo.id, WORKFLOW_SIG.followUp, prompt, undefined, images, files); }
       catch (error) { if (error instanceof CapabilityError) return undefined; throw error; } // may not write to it
       return (await store.getTask(ceo.id)) ?? ceo;
     }
-    if (untouchedCeoDraft(ceo)) {
-      const organizationId = (await store.getProject(projectId))?.organizationId ?? 'org_personal';
-      const own = userId ? await this.deps.authorization?.selectionForPrincipal(`user:${userId}`, organizationId) : undefined;
-      if (own) ceo = await api.setTaskAuthorization(token, ceo.id, own);
+    // The CEO is the project's, not its creator's: the Ask is written into it by the platform.
+    const organizationId = (await store.getProject(projectId))?.organizationId ?? 'org_personal';
+    const { token: writer } = await tokens.mintPrincipal(CEO_PRINCIPAL, ['task:edit', 'task:read', 'project:read'], projectId, 60_000, organizationId);
+    try {
+      const written = String(ceo.params?.prompt ?? '').trim();
+      await api.updateArmedParams(writer, ceo.id, { prompt: written ? `${written}\n\n${prompt}` : prompt,
+        ...(images?.length ? { images: [...((ceo.params?.images as ImageRef[] | undefined) ?? []), ...images] } : {}),
+        ...(files?.length ? { files: [...((ceo.params?.files as FileRef[] | undefined) ?? []), ...files] } : {}) },
+        { keepArmed: false, allowAttenuation: true });
+    } finally { await tokens.revoke(writer); }
+    try { return await api.queueTask(token, ceo.id); }
+    catch (error) {
+      if (!(error instanceof AuthorizationGrantError)) throw error;
+      const asked = await api.requestAuthorization(token, { projectId, target: { kind: 'task', taskId: ceo.id, queueAfterApproval: true },
+        authorization: ceoAuthorization(ceoScopeOf((await store.getProject(projectId))!), projectId), credentialGrants: [...CEO_CREDENTIAL_GRANTS],
+        audience: [], reason: `Start the CEO, asked: ${prompt.length > 200 ? `${prompt.slice(0, 200)}…` : prompt}` });
+      return { ...((await store.getTask(ceo.id)) ?? ceo), awaitingApproval: { requestId: asked.id, audience: asked.audience } };
     }
-    const written = String(ceo.params?.prompt ?? '').trim();
-    await api.updateArmedParams(token, ceo.id, { prompt: written ? `${written}\n\n${prompt}` : prompt,
-      ...(images?.length ? { images: [...((ceo.params?.images as ImageRef[] | undefined) ?? []), ...images] } : {}),
-      ...(files?.length ? { files: [...((ceo.params?.files as FileRef[] | undefined) ?? []), ...files] } : {}) }, { keepArmed: false });
-    return api.queueTask(token, ceo.id);
   }
 
   /** The project's CEO draft (src/platform/ceo.ts), for the person who made the

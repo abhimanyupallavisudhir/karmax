@@ -9257,7 +9257,9 @@ function askTavya() {
       if (!projectById(created.projectId)) { await loadProjects(); renderRail(); }
       dialog.close();
       await spaNavigate(`${projectBase(created.projectId)}/tasks/${created.num ?? created.id}`);
-      focusWhenReady('.followup-input');
+      // Started by someone who holds its authority; anyone else asked for it to be approved.
+      if (created.awaitingApproval) toast('Waiting for approval — the CEO starts once approved');
+      else focusWhenReady('.followup-input');
     } catch (error) {
       toast(error.message, true);
       sending = false;
