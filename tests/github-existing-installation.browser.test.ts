@@ -141,11 +141,13 @@ it('connects an already-installed GitHub account from settings and survives relo
     // Nothing installed on their account yet: installing it there is the one step, said plainly.
     await page.getByText('isn’t installed on', { exact: false }).waitFor();
     expect(await page.locator('#github-connect-existing').count()).toBe(0);
-    const install = page.getByRole('link', { name: 'Install on GitHub' });
-    expect(await install.getAttribute('href')).toContain('/apps/test-app/installations/new?state=');
+    // Installing starts at GitHub's account picker, never at the installer:
+    // for an account the App is already on, the installer is a dead end.
+    const install = page.getByRole('button', { name: 'Install on GitHub' });
     expect(await install.getAttribute('class')).toContain('primary');
+    expect(await page.locator('a[href*="/installations/new"]').count()).toBe(0);
     await page.route('https://github.com/login/oauth/authorize**', route => route.fulfill({ body: 'GitHub account selector' }));
-    await page.locator('#github-switch-account').click();
+    await install.click();
     await page.waitForURL('https://github.com/login/oauth/authorize**');
     const switchUrl = new URL(page.url());
     expect(switchUrl.searchParams.get('prompt')).toBe('select_account');
@@ -157,7 +159,15 @@ it('connects an already-installed GitHub account from settings and survives relo
     const callbackUrl = `${server.url}/api/github/oauth/callback?code=test-code&state=${callbackState}`;
     const callback = await fetch(callbackUrl, { redirect: 'manual' });
     expect(callback.status, await callback.clone().text()).toBe(303);
-    expect(callback.headers.get('location')).toBe(`/solab/settings?github=choose-installation&organizationId=${solab.id}#settings-code`);
+    // @owner's only installation is connected here already: on to GitHub's installer.
+    expect(callback.headers.get('location')).toContain('https://github.com/apps/test-app/installations/new?state=');
     expect((await fetch(callbackUrl, { redirect: 'manual' })).status).toBe(400);
+    // An organization without it is offered it instead.
+    visible = true;
+    const lab = await store.createOrganization({ name: 'Lab', ownerUserId: 'me' });
+    const offered = await fetch(`${server.url}/api/github/oauth/callback?code=test-code&state=${
+      await store.createGithubInstallState(lab.id, 'me', { returnTo: 'installation' })}`, { redirect: 'manual' });
+    expect(offered.status, await offered.clone().text()).toBe(303);
+    expect(offered.headers.get('location')).toBe(`/lab/settings?github=choose-installation&organizationId=${lab.id}#settings-code`);
   } finally { await browser.close(); await server.close(); await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 }, 60_000);
