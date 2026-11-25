@@ -52,7 +52,10 @@ async function parentWithData() {
   /** A process appending to `files` of the resource until stopped. */
   const writer = (files: string[]) => {
     let n = 0;
-    const timer = setInterval(() => { for (const file of files) fs.appendFileSync(path.join(data, file), `line ${n++}\n`); }, 15);
+    const write = () => { for (const file of files) fs.appendFileSync(path.join(data, file), `line ${n++}\n`); };
+    // Already writing when the save starts: an untouched copy is not saved at all (resource-stamp.ts).
+    write();
+    const timer = setInterval(write, 15);
     const stop = () => clearInterval(timer);
     cleanups.push(stop);
     return stop;
