@@ -113,6 +113,8 @@ const ICON = {
   desktop: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>',
   laptop: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"/></svg>',
   // The task page's two views: its conversation, and its settings.
+  // The CEO project: a crown, the organization's own.
+  ceo: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8l4.5 4L12 5l4.5 7L21 8l-2 11H5z"/><path d="M5 19h14"/></svg>',
   chat: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
   sliders: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg>',
   clock: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
@@ -6534,10 +6536,9 @@ function renderShell() {
         </div>
         <div class="rail-top">
           ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
-          <div class="rail-new" role="group" aria-label="New task">
-            <button class="btn primary rail-new-task" id="rail-new-task" type="button" data-shortcut="nav.newTaskDefault" title="${esc(commandHint('New task', 'nav.newTaskDefault'))}">${ICON.plus}<span>New task</span></button>
-            <button class="btn primary rail-new-template" id="rail-new-template" type="button" data-shortcut="nav.newTask" aria-label="New task from template" title="${esc(commandHint('New task from template', 'nav.newTask'))}">${ICON.template}</button>
-            <button class="btn rail-ask" id="rail-ask" type="button" data-shortcut="nav.ask" aria-label="Ask ${esc(siteName())}" aria-haspopup="dialog" title="${esc(commandHint(`Ask ${siteName()} — no computer, starts in seconds`, 'nav.ask'))}">${ICON.chat}</button>
+          <div class="rail-new" role="group" aria-label="Ask or start a task">
+            <button class="btn primary rail-ask" id="rail-ask" type="button" data-shortcut="nav.ask" aria-haspopup="dialog" title="${esc(commandHint(`Ask ${siteName()}`, 'nav.ask'))}">${ICON.chat}<span>Ask ${esc(siteName())}</span></button>
+            <button class="btn rail-new-task" id="rail-new-task" type="button" data-shortcut="nav.newTaskDefault" aria-label="New task" title="${esc(commandHint('New task', 'nav.newTaskDefault'))}">${ICON.plus}</button>
           </div>
           <nav class="rail-org-nav" aria-label="Organization">${RAIL_ORG_NAV.map(([id, label, icon, , , , command]) =>
             `<a class="rail-row" id="${id}" data-spa data-shortcut="${command}" href="#">${ICON[icon]}<span>${label}</span></a>`).join('')}</nav>
@@ -6564,7 +6565,6 @@ function renderShell() {
     <aside class="hosted-onboarding" id="hosted-onboarding" aria-live="polite" hidden></aside>`;
   $('#rail-palette').addEventListener('click', openPalette);
   $('#rail-new-task').addEventListener('click', () => openNewTaskForm());
-  $('#rail-new-template').addEventListener('click', () => openTemplatePicker());
   $('#rail-ask').addEventListener('click', () => askTavya());
   $('#mobile-ask').addEventListener('click', () => askTavya());
   $('#rail-help').addEventListener('click', openHelp);
@@ -6845,8 +6845,11 @@ function inSidebarOrder(projects) {
 // project, so navigating into a tucked-away project never blanks the selection.
 function railProjectRows(projectScoped) {
   const query = (S.projectSearch || '').trim().toLocaleLowerCase();
-  const projects = S.projects.filter((p) => (!S.organizationId || p.organizationId === S.organizationId)
+  const matching = S.projects.filter((p) => (!S.organizationId || p.organizationId === S.organizationId)
     && projectPath(p).toLocaleLowerCase().includes(query));
+  // The organization's CEO project leads, on its own: never in a folder, dragged or renamed.
+  const ceo = matching.find((p) => p.coordinator);
+  const projects = matching.filter((p) => !p.coordinator);
   const root = projectTree(projects);
   const folded = railCollapsedFolders();
   // A project row is an item: box icon, regular text, a link. A folder
@@ -6866,7 +6869,10 @@ function railProjectRows(projectScoped) {
     const active = projectScoped && projects.find((p) => p.id === S.projectId && inside(p, child.path));
     return header(child, depth, false) + (active ? row(active, depth + 1) : '');
   }).join('');
-  return walk(root, 0) || (query ? '<div class="rail-search-empty" role="status">No matching projects</div>' : '');
+  const ceoRow = ceo ? `<div class="proj project-row ceo-project ${projectScoped && ceo.id === S.projectId ? 'active' : ''}" data-id="${ceo.id}" style="--depth:0" draggable="false">
+          <a class="project-link" data-spa href="${projectRoute(ceo.id)}" data-project="${ceo.id}" tabindex="0" title="${esc(COORDINATOR_PROJECT_TIP)}"><span class="glyph">${ICON.ceo}</span><span class="rail-name">${esc(ceo.name)}</span>${forMeCountHtml(ceo.id)}</a>
+        </div>` : '';
+  return (ceoRow + walk(root, 0)) || (query ? '<div class="rail-search-empty" role="status">No matching projects</div>' : '');
 }
 
 // How many tasks each project's For me list holds (its default list), beside

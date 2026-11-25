@@ -620,6 +620,11 @@ async function main() {
     const { ensureEveryCeo } = await import('./platform/ceo.js');
     await ensureEveryCeo({ api, store, tokens });
   });
+  // Every organization's wiki is a Git repository, published where tavya hosts repositories.
+  startupJobs.push(async () => {
+    const { ensureEveryOrganizationWiki } = await import('./wiki/organization-wiki.js');
+    await ensureEveryOrganizationWiki(store, paths().content);
+  });
   // Reconcile missed notification close events without delaying the first API response.
   const inboxCleanup = new AsyncInterval(() => store.pruneStaleInbox().then(() => undefined), 3600_000);
   inboxCleanup.unref();

@@ -107,6 +107,15 @@ describe('a task without a computer, in the console', () => {
     // Nobody is asked which project: the dialog names none.
     expect(await page.locator('#mobile-ask').isVisible()).toBe(false); // a computer's Ask is in the sidebar
     const ask = page.locator('#rail-ask');
+    // The sidebar's bright button is Ask; beside it a plain + starts a task, and no template button.
+    await ask.waitFor();
+    expect(await ask.textContent()).toBe('Ask tavya');
+    expect(await ask.evaluate((element) => element.classList.contains('primary'))).toBe(true);
+    const plus = page.locator('#rail-new-task');
+    expect(await plus.getAttribute('aria-label')).toBe('New task');
+    expect(((await plus.textContent()) ?? '').trim()).toBe('');
+    expect(await plus.evaluate((element) => element.classList.contains('primary'))).toBe(false);
+    expect(await page.locator('#rail-new-template').count()).toBe(0);
     await ask.waitFor();
     expect(await ask.getAttribute('title')).toContain('(A)');
     // The shortcut opens it as the button does.
@@ -131,6 +140,13 @@ describe('a task without a computer, in the console', () => {
     const coordinator = (await store.getProject(created!.projectId))!;
     expect(coordinator).toMatchObject({ name: 'CEO', organizationId: project.organizationId });
     await expect.poll(() => page.locator('#rail-list').textContent(), { timeout: 10_000 }).toContain('CEO');
+    // It leads the projects, with its own icon, and is not dragged or renamed from there.
+    const first = page.locator('#rail-list .proj').first();
+    expect(await first.evaluate((element) => element.classList.contains('ceo-project'))).toBe(true);
+    expect(await first.getAttribute('draggable')).toBe('false');
+    expect(await first.locator('[data-project-edit]').count()).toBe(0);
+    expect(await first.locator('.glyph svg path').first().getAttribute('d')).toBe('M3 8l4.5 4L12 5l4.5 7L21 8l-2 11H5z');
+    if (process.env.KARMAX_SHOTS) await page.locator('#rail').screenshot({ path: path.join(process.env.KARMAX_SHOTS, 'sidebar-ceo.png') });
     expect(created!.params.draft).toBe(false);
     // Its page opens with the message box ready for the next message.
     await expect.poll(() => page.evaluate(() => (globalThis as any).document.activeElement?.classList.contains('followup-input')), { timeout: 10_000 }).toBe(true);
@@ -171,7 +187,8 @@ describe('a task without a computer, in the console', () => {
     if (process.env.KARMAX_SHOTS) await page.screenshot({ path: path.join(process.env.KARMAX_SHOTS, 'ask-phone-bar.png') });
     await page.locator('#mobile-menu').click();
     await expect.poll(() => page.locator('#rail-new-task').isVisible()).toBe(true);
-    expect(await page.locator('#rail-ask').isVisible()).toBe(false);
+    // The drawer leads with Ask too.
+    expect(await page.locator('#rail-ask').isVisible()).toBe(true);
     await page.locator('#mobile-menu').click();
 
     await ask.tap();

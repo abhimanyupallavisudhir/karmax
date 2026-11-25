@@ -212,6 +212,18 @@ describe('CEOs: a permanent co-ordinator in every project, and the organization�
     expect(both[0].id).toBe(both[1].id);
   });
 
+  it('For me lists every CEO first, as if each always waited; the sidebar’s numbers count only what came to wait', async () => {
+    const f = await fixture();
+    await ensureEveryCeo(f.deps);
+    const q = encodeURIComponent('for:me -is:archived');
+    const listed = await f.call('ana', 'GET', `/api/organizations/${f.organization.id}/search?q=${q}`);
+    expect(listed.status, JSON.stringify(listed.json)).toBe(200);
+    const titles = listed.json.tasks.map((task: { title: string }) => task.title);
+    expect(titles.slice(0, 2).sort()).toEqual([ceoTitle('organization'), ceoTitle('project')]);
+    const counted = await f.call('ana', 'GET', `/api/organizations/${f.organization.id}/search?q=${q}&countBy=project`);
+    expect(counted.json).toEqual({ total: 0, counts: {} });
+  });
+
   it('a CEO project still called Co-ordinator is renamed, and an autonomy’s co-ordinator becomes its CEO', async () => {
     const f = await fixture();
     const legacy = await f.store.createProject(LEGACY_CEO_PROJECT_NAME, {}, f.organization.id, { coordinator: true });

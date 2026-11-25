@@ -54,13 +54,22 @@ describe('for: — what needs a person', () => {
     expect(ids('for:me,bob')).toEqual(['bobs-draft', 'child-asks-me', 'input-bob', 'my-draft', 'review-me']);
   });
 
-  it('a CEO nobody has written to waits on nobody; once written to, it is its creator’s draft (wiki features/coordinator § CEOs)', () => {
-    const ceo = (prompt: string) => task('ceo', { params: { draft: true, prompt, coordinator: { wakeHours: 24 } }, createdBy: { kind: 'user', userId: alice }, lastView: undefined });
-    const forMe = (t: SearchTask) => evaluateQuery([t], parseQuery('for:me'), ctx).tasks.map((x) => x.id);
-    expect(forMe(ceo(''))).toEqual([]);
-    expect(forMe(ceo('Run the firm frugally.'))).toEqual(['ceo']);
-    // Still a draft in the list.
-    expect(evaluateQuery([ceo('')], parseQuery('is:draft'), ctx).tasks.map((x) => x.id)).toEqual(['ceo']);
+  it('a CEO is always for whoever sees it, and leads the list, whatever the sort (wiki features/coordinator § CEOs)', () => {
+    const ceo = (id: string, over: Record<string, any> = {}) => task(id, { params: { draft: true, prompt: '', coordinator: { wakeHours: 24 } },
+      createdBy: { kind: 'user', userId: bob }, lastView: undefined, ...over });
+    const all = [...tasks, ceo('ceo'), ceo('working-ceo', { params: { coordinator: { wakeHours: 24 } }, lastView: { status: 'active', stage: 'do', updatedAt: NOW } }),
+      ceo('cancelled-chief', { lastView: { status: 'cancelled', stage: 'cancelled', updatedAt: NOW } })];
+    const run = (q: string) => evaluateQuery(all, parseQuery(q), ctx);
+    // Alice's For me has both live CEOs, a draft of Bob's and one at work, as if each asked her; not the cancelled one.
+    const mine = run('for:me');
+    expect(mine.tasks.map((t) => t.id).slice(0, 2).sort()).toEqual(['ceo', 'working-ceo']);
+    expect(mine.tasks.map((t) => t.id)).not.toContain('cancelled-chief');
+    expect(mine.reasons?.ceo).toEqual(['ceo']);
+    expect(run('for:bob').tasks.map((t) => t.id)).toContain('working-ceo');
+    // First in any list, under any sort.
+    for (const q of ['', 'sort:title', 'sort:created-asc', 'status:active'])
+      expect(run(q).tasks[0]!.id, q).toMatch(/ceo$/);
+    expect(run('').tasks.at(-1)!.id).not.toMatch(/ceo$/);
   });
 
   it('an unknown person, or me without a signed-in user, matches nothing', () => {

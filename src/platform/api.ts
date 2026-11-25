@@ -54,7 +54,7 @@ import { isChatPlatform, type ChatPlatform } from '../integrations/chat-platform
 import { chatThreadKey, type ChatReplies } from '../integrations/chat-replies.js';
 import { ChatLinkError, ChatLinks, type ChatLink } from '../integrations/chat-links.js';
 import { pullRequestOf } from '../domain/pull-requests.js';
-import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
+import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates, isCeo } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
 import { assertComputerFits, diskGrowsAtStart, providerLabel } from '../domain/computer-limits.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
@@ -73,6 +73,7 @@ import { defaultProvider } from '../agent/adapters.js';
 import { MAX_FILE_BYTES, MAX_FILES_BYTES_PER_MESSAGE, MAX_FILES_PER_MESSAGE, sanitizeAttachmentName } from '../store/attachments.js';
 import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES, BUILTIN_WIKI_PREFIX } from '../wiki/wiki.js';
 import { copyRemoteWiki, RemoteWikiSnapshots } from '../wiki/remote-snapshot.js';
+import { ensureOrganizationWiki, organizationWikiPublishTarget } from '../wiki/organization-wiki.js';
 import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, removeProjectWikiRepository, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, profileVisibleTo } from '../agent/profiles.js';
 import { defaultAgentProfile } from './readiness.js';
@@ -6864,8 +6865,11 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
   async countAuthorizedOrganization(projects: Project[], query: string | TaskQuery, principalId: string, now = Date.now()) {
     const { result } = await this.evaluateProjects(projects, query, principalId, now);
     const counts: Record<string, number> = {};
-    for (const task of result.tasks) counts[task.projectId] = (counts[task.projectId] ?? 0) + 1;
-    return { total: result.total, counts };
+    // A CEO is in every For me list for good, so it would put a 1 by every
+    // project for ever: the numbers count what came to wait on someone instead.
+    const counted = result.tasks.filter((task) => !isCeo(task));
+    for (const task of counted) counts[task.projectId] = (counts[task.projectId] ?? 0) + 1;
+    return { total: counted.length, counts };
   }
 
   /** Evaluate one query across already-authorized projects — an organization's,
@@ -9443,11 +9447,17 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     // the previous folder is left staged for whoever commits next.
     if (scope === 'project')
       commitProjectWiki(root, `wiki: update ${page.path}`,
-        previousPath && previousPath !== nextPath ? [page.path, previousPath] : [page.path]);
-    else (await this.deps.store.recordOrganizationWikiVersion({ organizationId: id, path: page.path,
-      operation: previousPath && previousPath !== nextPath ? 'move' : 'write', kind: page.kind,
-      content: page.content, principal: view.principal,
-      previousPath: previousPath && previousPath !== nextPath ? previousPath : undefined }));
+        previousPath && previousPath !== nextPath ? [page.path, previousPath] : [page.path], view.principal);
+    else {
+      (await this.deps.store.recordOrganizationWikiVersion({ organizationId: id, path: page.path,
+        operation: previousPath && previousPath !== nextPath ? 'move' : 'write', kind: page.kind,
+        content: page.content, principal: view.principal,
+        previousPath: previousPath && previousPath !== nextPath ? previousPath : undefined }));
+      // In Git (inOrganizationWiki), by whoever made the edit.
+      if (fs.existsSync(path.join(root, '.git')))
+        commitProjectWiki(root, `wiki: ${previousPath && previousPath !== nextPath ? `move ${previousPath} to` : 'update'} ${page.path}`,
+          previousPath && previousPath !== nextPath ? [page.path, previousPath] : [page.path], view.principal);
+    }
     return page;
   }
 
@@ -9483,12 +9493,13 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
         }));
     }
     const deleted = deleteWikiPage(root, rel, { recursive: selector.recursive });
-    if (deleted && scope === 'project') commitProjectWiki(root, `wiki: delete ${safe}`, [safe]);
+    if (deleted && scope === 'project') commitProjectWiki(root, `wiki: delete ${safe}`, [safe], view.principal);
     if (deleted && scope === 'organization') {
       for (const page of doomed) (await this.deps.store.recordOrganizationWikiVersion({
         organizationId: id, path: page.path, operation: 'delete', kind: page.kind,
         content: page.content, principal: view.principal,
       }));
+      if (fs.existsSync(path.join(root, '.git'))) commitProjectWiki(root, `wiki: delete ${safe}`, [safe], view.principal);
     }
     return { deleted, removed: doomed.map((page) => page.path) };
   }
@@ -9590,6 +9601,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     selector: { taskId?: string; branch?: string } = {}) {
     const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, true, selector) : undefined;
     if (!remote) {
+      if (scope === 'organization') return this.inOrganizationWiki(token, id, () => this.saveWikiPage(token, scope, id, args, selector));
       if (scope !== 'project') return (await this.saveWikiPage(token, scope, id, args, selector));
       const view = (await this.wikiScope(token, scope, id, true, selector));
       // The default branch is the user-facing canonical wiki. Publish that
@@ -9614,6 +9626,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     selector: { taskId?: string; branch?: string; recursive?: boolean } = {}) {
     const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, true, selector) : undefined;
     if (!remote) {
+      if (scope === 'organization') return this.inOrganizationWiki(token, id, () => this.deleteWikiPage(token, scope, id, rel, selector));
       if (scope !== 'project') return (await this.deleteWikiPage(token, scope, id, rel, selector));
       const view = (await this.wikiScope(token, scope, id, true, selector));
       if (view.branch === PROJECT_WIKI_BRANCH && !view.taskId)
@@ -9627,6 +9640,16 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       if (deleted) await remote.flush(`wiki: delete ${safeWikiPath(rel)}`);
       return { deleted };
     } finally { await remote.release(); }
+  }
+
+  /** One edit of the organization wiki (wiki features/organization-wiki): in
+   * its Git repository's lane, committed by the edit itself and published to
+   * its repository on tavya before it is acknowledged. Refused before anything
+   * is set up for a caller who may not write it. */
+  private async inOrganizationWiki<T>(token: string, organizationId: string, mutation: () => Promise<T>): Promise<T> {
+    await this.wikiScope(token, 'organization', organizationId, true);
+    const root = await ensureOrganizationWiki(this.deps.store, this.deps.contentDir ?? paths().content, organizationId);
+    return mutateAndPublishProjectWiki(root, mutation, () => organizationWikiPublishTarget(this.deps.store, organizationId));
   }
 
   /** The canonical wiki takes what was just pushed to its repository's

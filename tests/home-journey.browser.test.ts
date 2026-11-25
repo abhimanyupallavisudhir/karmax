@@ -66,8 +66,12 @@ it('lands on the organization home, For me across projects, Active one click awa
     await step('the other agent pauses', () => expect.poll(async () => (await consoleRequest(context, app!.url, 'GET', `/api/tasks/${paused.id}`))?.waitingFor?.kind,
       { timeout: 60_000 }).toBe('timer'));
 
+    // Every CEO leads For me, as if it always waited (wiki features/coordinator § CEOs); the rest are what came to wait.
+    const ceoRow = "(el) => el.querySelector('.task-title')?.textContent.trim().startsWith('CEO (')";
     const rows = async () => await page.evaluate<string[]>(
-      "[...document.querySelectorAll('#main .task-row:not(.store-row)')].map((el) => el.dataset.id || el.dataset.draft).sort()");
+      `[...document.querySelectorAll('#main .task-row:not(.store-row)')].filter((el) => !(${ceoRow})(el)).map((el) => el.dataset.id || el.dataset.draft).sort()`);
+    const leadingCeos = async () => await page.evaluate<boolean[]>(
+      `[...document.querySelectorAll('#main .task-row:not(.store-row)')].map(${ceoRow})`);
     await step('the root lands on the organization home, For me', async () => {
       await page.goto(app!.url);
       await page.waitForURL(/\/personal$/);
@@ -76,7 +80,10 @@ it('lands on the organization home, For me across projects, Active one click awa
     // A new project starts empty: the default view recommends the task store instead.
     const listed = await rows();
     expect(listed).toEqual([review.id, draft.id].sort());
-    expect(await page.locator('#main .task-row[data-draft]').count()).toBe(1);
+    const ceos = await leadingCeos();
+    expect(ceos.filter(Boolean).length).toBeGreaterThan(0);
+    expect(ceos.slice(0, ceos.filter(Boolean).length).every(Boolean)).toBe(true);
+    expect(await page.locator('#main .task-row[data-draft]').count()).toBe(1 + ceos.filter(Boolean).length);
     expect(await page.locator('.store-recs .store-row[data-store-task="project-wiki"]').count()).toBe(1);
     expect(await page.locator(`[data-id="${review.id}"] .status.attention`).innerText()).toBe('Needs review');
     expect(await page.locator(`[data-id="${review.id}"] .task-project`).innerText()).toBe('website');
@@ -90,7 +97,8 @@ it('lands on the organization home, For me across projects, Active one click awa
 
     // An agent (here: the same person's API token) reads the same list.
     const forMe = await consoleRequest(context, app.url, 'GET', `/api/organizations/${web.organizationId}/search?q=${encodeURIComponent('for:me -is:archived')}`);
-    expect(forMe.tasks.map((task: any) => task.id).sort()).toEqual(listed);
+    expect(forMe.tasks.filter((task: any) => !task.params?.coordinator).map((task: any) => task.id).sort()).toEqual(listed);
+    expect(forMe.tasks[0].params?.coordinator).toBeTruthy(); // a CEO leads it there too
     expect(forMe.reasons[review.id]).toContain('review-requested');
 
     // A repeatable task and one waiting for its trigger name their project like any other row.

@@ -4040,7 +4040,7 @@ export class Gateway {
       if (organizationRepositories) {
         const organizationId = organizationRepositories[1]!;
         if (method === 'GET') return this.json(res, 200,
-          (await __asyncCollections.filter((await store.listRepositories(organizationId)), async (repository) => !(await store.repositoryIsProjectWiki(repository.id)))));
+          (await __asyncCollections.filter((await store.listRepositories(organizationId)), async (repository) => !(await store.repositoryIsWiki(repository.id)))));
         if (method === 'POST') {
           if (this.deps.hosted) return this.json(res, 400, { error: 'Hosted repositories must be imported through the GitHub App' });
           const b = await this.body(req);

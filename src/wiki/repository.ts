@@ -97,7 +97,17 @@ export async function removeProjectWikiRepository(contentDir: string, projectId:
 
 /** Gateway startup must not run Git synchronously on the HTTP event loop. */
 export async function ensureProjectWikiRepositoryAsync(contentDir: string, projectId: string): Promise<string> {
-  const root = wikiRoot(contentDir, 'project', projectId);
+  return ensureWikiRepositoryAt(wikiRoot(contentDir, 'project', projectId), 'project wiki');
+}
+
+/** The organization wiki's canonical checkout as a Git repository too (wiki
+ * features/organization-wiki): its folder migrates in place, its first commit
+ * the baseline of what was there. */
+export async function ensureOrganizationWikiRepository(contentDir: string, organizationId: string): Promise<string> {
+  return ensureWikiRepositoryAt(wikiRoot(contentDir, 'organization', organizationId), 'organization wiki');
+}
+
+async function ensureWikiRepositoryAt(root: string, what: string): Promise<string> {
   return serializeProjectWikiOperation(root, async () => {
     await fs.promises.mkdir(root, { recursive: true });
     if (!fs.existsSync(path.join(root, '.git'))) {
@@ -108,7 +118,7 @@ export async function ensureProjectWikiRepositoryAsync(contentDir: string, proje
     try { await gitAsync(root, ['rev-parse', '--verify', 'HEAD']); }
     catch {
       await gitAsync(root, ['add', '-A']);
-      await gitAsync(root, ['commit', '-q', '--allow-empty', '-m', `${BRAND}: initialize project wiki`]);
+      await gitAsync(root, ['commit', '-q', '--allow-empty', '-m', `${BRAND}: initialize ${what}`]);
     }
     try { await gitAsync(root, ['rev-parse', '--verify', `refs/heads/${PROJECT_WIKI_BRANCH}`]); }
     catch { await gitAsync(root, ['branch', PROJECT_WIKI_BRANCH, 'HEAD']); }
@@ -136,17 +146,25 @@ export async function ensureProjectWikiRepositoryAsync(contentDir: string, proje
  * `wiki: delete …`) pass their page path so a per-page edit is a per-page commit;
  * a rename passes both the new and previous path.
  */
-export function commitProjectWiki(root: string, message: string, pathspecs?: string[]): string {
+export function commitProjectWiki(root: string, message: string, pathspecs?: string[], author?: string): string {
   const specs = (pathspecs ?? []).filter((spec) => spec && !spec.startsWith('-') && !spec.includes('..'));
   // `--` separates pathspecs from options, so a page path can never be read as a
   // git flag even if the filter above is bypassed.
   git(root, specs.length ? ['add', '--all', '--', ...specs] : ['add', '-A']);
-  try { git(root, ['commit', '-q', '-m', message, ...(specs.length ? ['--', ...specs] : [])]); }
+  // Who made the edit, when it was a person or an agent (the committer stays the platform).
+  const by = author ? [`--author=${wikiAuthor(author)}`] : [];
+  try { git(root, ['commit', '-q', ...by, '-m', message, ...(specs.length ? ['--', ...specs] : [])]); }
   catch (error) {
     const status = git(root, ['status', '--porcelain', ...(specs.length ? ['--', ...specs] : [])]);
     if (status) throw error;
   }
   return git(root, ['rev-parse', 'HEAD']);
+}
+
+/** A principal (`user:…`, `task:…`) as a Git author: it names the editor without an e-mail address. */
+export function wikiAuthor(principal: string): string {
+  const name = principal.replace(/[<>\n\r]/g, '').trim() || BRAND;
+  return `${name} <${name.replace(/[^A-Za-z0-9._-]+/g, '-')}@${BRAND}.invalid>`;
 }
 
 export function projectWikiBranches(root: string): string[] {

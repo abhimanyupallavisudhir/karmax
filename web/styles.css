@@ -441,17 +441,12 @@ a { color: var(--accent); text-decoration: none; }
 .rail-top { flex: none; display: flex; flex-direction: column; gap: 8px; padding: 2px 10px 6px; }
 .rail-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 1px; padding: 4px 10px 10px; }
 .rail-org-nav { display: flex; flex-direction: column; gap: 1px; }
-/* The one thing to do from anywhere: a labelled button, not a field or an arrow. */
-.rail-new-task { justify-content: center; width: 100%; min-height: 36px; margin: 2px 0 4px; }
-.rail-new-task svg { flex: none; }
-/* …whose right tip starts one from a template: one pill, split by a hairline. */
-.rail-new { display: flex; margin: 2px 0 4px; }
-.rail-new .rail-new-task { flex: 1; min-width: 0; margin: 0; border-radius: var(--r-btn) 0 0 var(--r-btn); }
-.rail-new .btn.rail-new-template { flex: none; width: 40px; min-height: 36px; padding: 0 2px 0 0; justify-content: center;
-  border-radius: 0 var(--r-btn) var(--r-btn) 0; border-left: 1px solid color-mix(in srgb, var(--primary-ink) 30%, transparent); }
-.rail-new .btn:focus-visible { position: relative; z-index: 1; }
-/* Beside it, apart: ask tavya without a computer (askTavya). */
-.rail-new .btn.rail-ask { flex: none; width: 36px; min-height: 36px; margin-left: 6px; padding: 0; justify-content: center; }
+/* The one thing to do from anywhere: Ask, a labelled button; beside it a plain
+   + starts a task (templates are in the main view's composer and on n). */
+.rail-new { display: flex; gap: 6px; margin: 2px 0 4px; }
+.rail-new .btn.rail-ask { flex: 1; min-width: 0; min-height: 36px; justify-content: center; }
+.rail-new .btn.rail-ask svg, .rail-new .btn.rail-new-task svg { flex: none; }
+.rail-new .btn.rail-new-task { flex: none; width: 36px; min-height: 36px; padding: 0; justify-content: center; }
 /* A place in the organization: icon and name, a full-width row. */
 .rail-row {
   display: flex; align-items: center; gap: 10px; min-height: 34px; padding: 0 10px;
@@ -2956,7 +2951,6 @@ html[data-theme="dark"] .github-signin-btn:active,
   .tab-wide { display:none; }
   .tab-narrow { display:inline; }
   #rail-help, .key-echo { display:none; } /* no keyboard to list or echo shortcuts for */
-  .rail-new .btn.rail-ask { display:none; } /* the top bar carries Ask */
   .rail-collapse { display:none; }
   .body { grid-template-columns: 1fr; }
   .rail {

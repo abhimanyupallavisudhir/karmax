@@ -68,8 +68,10 @@ it('two tabs of one person stay in step, and a read mention leaves For me', asyn
   const bell = (page: Page) => page.evaluate<string>("document.querySelector('#bell-badge').classList.contains('hidden') ? '' : document.querySelector('#bell-badge').textContent");
   const counts = async (page: Page) => (await page.locator('#rail .count').allInnerTexts()).join(',');
   // The For me list on screen, once its search has answered.
+  // Less the CEOs, which are always there (wiki features/coordinator § CEOs).
   const forMe = (page: Page) => page.evaluate<string[] | null>(`location.pathname === '/personal' && document.querySelector('#main .search-count')
-    ? [...document.querySelectorAll('#main .task-row[data-id]')].map((el) => el.dataset.id) : null`);
+    ? [...document.querySelectorAll('#main .task-row[data-id]')].filter((el) => !el.querySelector('.task-title')?.textContent.trim().startsWith('CEO ('))
+      .map((el) => el.dataset.id) : null`);
   const inbox = async (taskId: string) => (await request('GET', `/api/inbox?organizationId=${project.organizationId}`))
     .filter((item: any) => item.taskId === taskId).map((item: any) => `${item.kind}:${item.unread ? 'unread' : 'read'}`);
   const within = { timeout: 8_000 };
@@ -98,7 +100,7 @@ it('two tabs of one person stay in step, and a read mention leaves For me', asyn
   });
   // The API (what an agent's search reads) agrees.
   const search = await request('GET', `/api/organizations/${project.organizationId}/search?q=${encodeURIComponent('for:me -is:archived')}`);
-  expect(search.tasks.map((task: any) => task.id)).toEqual([]);
+  expect(search.tasks.filter((task: any) => !task.params?.coordinator).map((task: any) => task.id)).toEqual([]);
 
   // ── a mention that arrives while its task is on screen ────────────────────
   const watched = await create('Second heads up', '@sleep 4000\n@tool notify {"to":["@creator"],"message":"Second heads up"}\n@pause 120');

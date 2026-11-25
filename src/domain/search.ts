@@ -118,12 +118,12 @@ export const awaitingApproval = (t: { params?: Record<string, unknown> }): boole
  * Avatar stage, finished as far as lists go, and stays editable like a draft. */
 export const restingAvatar = (t: { params?: Record<string, unknown>; lastView?: unknown }): boolean =>
   !!t.params?.avatar && !!t.params?.draft && !t.lastView;
-/** A CEO nobody has written to or started (wiki features/coordinator § CEOs):
- * there for when someone wants it, so it waits on nobody. */
-export const restingCeo = (t: { params?: Record<string, unknown>; lastView?: unknown }): boolean =>
-  !!t.params?.coordinator && !!t.params?.draft && !t.lastView && !String(t.params?.prompt ?? '').trim();
 const status = (t: SearchTask) => t.lastView?.status
   ?? (restingAvatar(t) ? 'done' : awaitingApproval(t) ? 'waiting' : isArmed(t) ? 'armed' : 'active');
+/** A CEO — a permanent co-ordinator (wiki features/coordinator § CEOs) — still
+ * running or there to start: it leads every list, and is always for whoever
+ * sees it, as if it always waited on them. One cancelled or finished is not. */
+export const isCeo = (t: SearchTask): boolean => !!t.params?.coordinator && !['cancelled', 'done'].includes(status(t));
 /** The armed-aware status of a task (exported so compact projections agree with search). */
 export function taskStatus(t: SearchTask): string {
   return status(t);
@@ -293,13 +293,14 @@ function personFor(value: string, ctx?: EvalContext): string | undefined {
   return ctx?.people?.get(v.toLowerCase());
 }
 const ownDraft = (t: SearchTask, userId: string): boolean =>
-  !!t.params?.draft && !awaitingApproval(t) && !restingAvatar(t) && !restingCeo(t) && t.createdBy?.kind === 'user' && t.createdBy.userId === userId;
+  !!t.params?.draft && !awaitingApproval(t) && !restingAvatar(t) && t.createdBy?.kind === 'user' && t.createdBy.userId === userId;
 /** Why `t` needs `userId`: the kinds of the live asks routed to them (matched on
  *  the attempt or its logical task), plus `draft` for their own draft. */
 function attentionReasons(t: SearchTask, userId: string, ctx?: EvalContext): string[] {
   const asks = ctx?.attention?.get(userId);
   const out = [...(asks?.get(t.id)?.kinds ?? []), ...(t.intentId && t.intentId !== t.id ? asks?.get(t.intentId)?.kinds ?? [] : [])];
   if (ownDraft(t, userId)) out.push('draft');
+  if (isCeo(t)) out.push('ceo');
   return [...new Set(out)];
 }
 const projectOf = (t: SearchTask, ctx?: EvalContext) => ctx?.projects?.get(t.projectId);
@@ -790,8 +791,9 @@ export function attentionCandidates(query: TaskQuery, ctx: EvalContext): Set<str
 }
 
 function sortTasks(tasks: SearchTask[], sort: SortClause[], ctx: FieldContext): SearchTask[] {
-  const withIdx = tasks.map((t, i) => ({ t, i }));
+  const withIdx = tasks.map((t, i) => ({ t, i, ceo: isCeo(t) }));
   withIdx.sort((A, B) => {
+    if (A.ceo !== B.ceo) return A.ceo ? -1 : 1; // CEOs lead, whatever the sort
     for (const s of sort) {
       const f = fieldByKey(s.field);
       if (!f?.sortKey) continue;

@@ -4167,6 +4167,37 @@ export class Store {
     return !!(await this.db.prepare('SELECT 1 FROM project_wikis WHERE repositoryId=? LIMIT 1').get(repositoryId));
   }
 
+  /** A project's or an organization's wiki repository: the platform's, hidden
+   * from the repositories people pick and attach. */
+  async repositoryIsWiki(repositoryId: string): Promise<boolean> {
+    if (await this.repositoryIsProjectWiki(repositoryId)) return true;
+    const repository = await this.getRepository(repositoryId);
+    return !!repository && (await this.kvGet(ORGANIZATION_WIKI_REPOSITORY_KEY(repository.organizationId))) === repositoryId;
+  }
+
+  /** The repository tavya hosts the organization's wiki in, if it has one. */
+  async organizationWikiRepository(organizationId: string): Promise<Repository | undefined> {
+    const id = await this.kvGet(ORGANIZATION_WIKI_REPOSITORY_KEY(organizationId));
+    const repository = id ? await this.getRepository(id) : undefined;
+    return repository?.organizationId === organizationId ? repository : undefined;
+  }
+
+  /** The organization wiki's repository on tavya, made and linked when it has
+   * none (src/wiki/organization-wiki.ts). Under the organization's lock, so
+   * racing callers link one. */
+  async linkHostedOrganizationWiki(organizationId: string, name: string): Promise<Repository> {
+    return this.db.transaction(async () => {
+      (await this.lockOrganization(organizationId));
+      const current = await this.organizationWikiRepository(organizationId);
+      if (current) return current;
+      const id = newId('repo');
+      const repository = await this.upsertRepository({ id, organizationId, provider: 'tavya', owner: organizationId, name,
+        sshUrl: hostedRepositoryUrl(id, name), defaultBranch: 'main', private: true });
+      await this.kvSet(ORGANIZATION_WIKI_REPOSITORY_KEY(organizationId), repository.id);
+      return repository;
+    });
+  }
+
   /** The project's wiki repository, made on tavya and linked when it has none
    * (src/wiki/project-wiki-remote.ts). One transaction under the organization's
    * lock, so the gateway and several world set-ups racing link one repository;
@@ -4180,7 +4211,7 @@ export class Store {
       const organizationId = project.organizationId ?? 'org_personal';
       const named = (await this.listRepositories(organizationId))
         .find((candidate) => candidate.provider === 'tavya' && candidate.name.toLowerCase() === name.toLowerCase());
-      if (named && ((await this.projectIdsForRepository(named.id)).length || (await this.repositoryIsProjectWiki(named.id))))
+      if (named && ((await this.projectIdsForRepository(named.id)).length || (await this.repositoryIsWiki(named.id))))
         throw new Error(`the repository ${name} is already in use; rename it to give this project's wiki its name`);
       const id = newId('repo');
       const repository = named ?? await this.upsertRepository({ id, organizationId, provider: 'tavya', owner: organizationId, name,
@@ -4289,7 +4320,7 @@ export class Store {
     // A catalog SSH URL carries its GitHub connection/deploy-key metadata. Keep
     // those attachments synchronized automatically; users edit one plain list.
     const catalog = projectBefore.organizationId
-      ? (await __asyncCollections.filter((await this.listRepositories(projectBefore.organizationId)), async (repository) => !(await this.repositoryIsProjectWiki(repository.id))))
+      ? (await __asyncCollections.filter((await this.listRepositories(projectBefore.organizationId)), async (repository) => !(await this.repositoryIsWiki(repository.id))))
       : [];
     const wanted = new Map(catalog
       .filter((repository) => sources.some((source) => sameRepository(source, repository.sshUrl)))
@@ -12099,6 +12130,9 @@ function rowToProject(r: any): Project {
   return { id: r.id, organizationId: r.organizationId ?? 'org_personal', name: r.name, createdAt: r.createdAt, config: JSON.parse(r.config), order: r.ord ?? 0,
     ...(r.folder ? { folder: r.folder } : {}), ...(Number(r.coordinator) ? { coordinator: true as const } : {}) };
 }
+
+/** The organization's wiki repository, in the key-value store. */
+export const ORGANIZATION_WIKI_REPOSITORY_KEY = (organizationId: string): string => `organization-wiki:repository:${organizationId}`;
 
 const COORDINATOR_KEEPS_NAME = `The ${CEO_PROJECT_NAME} project keeps its name.`;
 const COORDINATOR_UNDELETABLE = `The ${CEO_PROJECT_NAME} project belongs to the organization and cannot be deleted.`;
