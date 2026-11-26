@@ -316,6 +316,8 @@ describe('credential Retry end to end', () => {
     ]);
     await coordinator.setAccountAvailability({ accountId, status: 'available' });
     await h.store.kvDelete(`usage:${accountId}`);
+    // The capped login first, as on auto-rubric#3.
+    await h.store.kvSet(credPolicyKey.organization('org_personal'), JSON.stringify({ order: [accountId, 'login:claude:fable-left'] }));
     healthy = true;
     const fableReset = Date.now() + 36_000_000;
     hostUsage = { ok: true, at: Date.now(), week: { pct: 66, resetLabel: 'Nov 26, 12pm', resetAt: fableReset },
@@ -365,6 +367,7 @@ describe('credential Retry end to end', () => {
       sandboxQuotaFailures = 0;
       hostUsage = undefined;
       await h.store.kvDelete(`usage:${accountId}`);
+      await h.store.kvDelete(credPolicyKey.organization('org_personal'));
       await coordinator.registerAccounts([{ id: accountId, provider: 'claude', kind: 'login', configHome: home, maxConcurrent: 1 }]);
       await homes.remove('claude', 'fable-left');
     }
