@@ -54,22 +54,28 @@ describe('for: — what needs a person', () => {
     expect(ids('for:me,bob')).toEqual(['bobs-draft', 'child-asks-me', 'input-bob', 'my-draft', 'review-me']);
   });
 
-  it('a CEO is always for whoever sees it, and leads the list, whatever the sort (wiki features/coordinator § CEOs)', () => {
-    const ceo = (id: string, over: Record<string, any> = {}) => task(id, { params: { draft: true, prompt: '', coordinator: { wakeHours: 24 } },
-      createdBy: { kind: 'user', userId: bob }, lastView: undefined, ...over });
+  it('the CEOs a list is about are always for whoever sees it, and lead it whatever the sort (wiki features/coordinator § CEOs)', () => {
+    const ceo = (id: string, over: Record<string, any> = {}) => task(id, { params: { draft: true, prompt: '', coordinator: { wakeHours: 24 },
+      _authorization: { principal: 'system:ceo' } }, createdBy: { kind: 'user', userId: alice }, lastView: undefined, ...over });
     const all = [...tasks, ceo('ceo'), ceo('working-ceo', { params: { coordinator: { wakeHours: 24 } }, lastView: { status: 'active', stage: 'do', updatedAt: NOW } }),
-      ceo('cancelled-chief', { lastView: { status: 'cancelled', stage: 'cancelled', updatedAt: NOW } })];
-    const run = (q: string) => evaluateQuery(all, parseQuery(q), ctx);
-    // Alice's For me has both live CEOs, a draft of Bob's and one at work, as if each asked her; not the cancelled one.
+      ceo('cancelled-chief', { lastView: { status: 'cancelled', stage: 'cancelled', updatedAt: NOW } }),
+      // Another project's CEO, which this list is not about: an ordinary row, and nobody's own draft.
+      ceo('other-projects-chief')];
+    const about = { ...ctx, ceos: new Set(['ceo', 'working-ceo', 'cancelled-chief']) };
+    const run = (q: string) => evaluateQuery(all, parseQuery(q), about);
+    // Alice's For me: both live CEOs this list is about — a draft and one at work — not the cancelled one, not the other.
     const mine = run('for:me');
     expect(mine.tasks.map((t) => t.id).slice(0, 2).sort()).toEqual(['ceo', 'working-ceo']);
     expect(mine.tasks.map((t) => t.id)).not.toContain('cancelled-chief');
+    expect(mine.tasks.map((t) => t.id)).not.toContain('other-projects-chief');
     expect(mine.reasons?.ceo).toEqual(['ceo']);
     expect(run('for:bob').tasks.map((t) => t.id)).toContain('working-ceo');
-    // First in any list, under any sort.
+    // First in any list, under any sort; the other is where its sort puts it.
     for (const q of ['', 'sort:title', 'sort:created-asc', 'status:active'])
-      expect(run(q).tasks[0]!.id, q).toMatch(/ceo$/);
-    expect(run('').tasks.at(-1)!.id).not.toMatch(/ceo$/);
+      expect(['ceo', 'working-ceo'], q).toContain(run(q).tasks[0]!.id);
+    expect(run('sort:title').tasks.findIndex((t) => t.id === 'other-projects-chief')).toBeGreaterThan(1);
+    // Without a list's CEOs, a co-ordinator is an ordinary task.
+    expect(evaluateQuery(all, parseQuery('for:me'), ctx).tasks.map((t) => t.id)).not.toContain('working-ceo');
   });
 
   it('an unknown person, or me without a signed-in user, matches nothing', () => {

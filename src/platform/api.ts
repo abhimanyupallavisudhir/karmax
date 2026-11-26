@@ -6824,7 +6824,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
    *  directly rather than minting a token for each (UI-18/RQ-14). */
   async searchAuthorizedTasks(projectId: string, query: string | TaskQuery, principalId: string, now = Date.now()): Promise<EvalResult> {
     const project = (await this.deps.store.getProject(projectId)) ?? { id: projectId, name: projectId } as Project;
-    return (await this.evaluateProjects([project], query, principalId, now)).result;
+    return (await this.evaluateProjects([project], query, principalId, now, 'project')).result;
   }
 
   /**
@@ -6867,11 +6867,11 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
 
   /** One query's rows counted per project, over already-authorized projects; the rows are never sent. */
   async countAuthorizedOrganization(projects: Project[], query: string | TaskQuery, principalId: string, now = Date.now()) {
-    const { result } = await this.evaluateProjects(projects, query, principalId, now);
+    const { result, ceos } = await this.evaluateProjects(projects, query, principalId, now, 'organization');
     const counts: Record<string, number> = {};
     // A CEO is in every For me list for good, so it would put a 1 by every
     // project for ever: the numbers count what came to wait on someone instead.
-    const counted = result.tasks.filter((task) => !isCeo(task));
+    const counted = result.tasks.filter((task) => !isCeo(task, { ceos }));
     for (const task of counted) counts[task.projectId] = (counts[task.projectId] ?? 0) + 1;
     return { total: counted.length, counts };
   }
@@ -6881,7 +6881,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
    *  page of the result. */
   async searchAuthorizedOrganization(projects: Project[], query: string | TaskQuery, principalId: string,
     page: { limit?: number; offset?: number } = {}, now = Date.now()) {
-    const { result, tags } = await this.evaluateProjects(projects, query, principalId, now);
+    const { result, tags } = await this.evaluateProjects(projects, query, principalId, now, 'organization');
     const limit = Math.max(1, Math.min(Number(page.limit) || 200, 500));
     const offset = Math.max(0, Math.floor(Number(page.offset) || 0));
     const tasks = result.tasks.slice(offset, offset + limit);
@@ -6911,7 +6911,11 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
    * the read to those tasks and drafts. Conversation search is intentionally
    * explicit; every other query uses the compact projection.
    */
-  private async evaluateProjects(projects: Project[], query: string | TaskQuery, principalId: string, now: number): Promise<{ result: EvalResult; tags: Tag[] }> {
+  /** `ceos`: which CEOs lead the list and are always in For me — each
+   *  project's own (`project`), or only the organization's (`organization`, so
+   *  an organization's lists are not one CEO per project). */
+  private async evaluateProjects(projects: Project[], query: string | TaskQuery, principalId: string, now: number,
+    ceos: 'project' | 'organization'): Promise<{ result: EvalResult; tags: Tag[]; ceos: Set<string> }> {
     const q: TaskQuery = typeof query === 'string' ? parseQuery(query) : query ?? {};
     const needsConversation = q.filters?.some((clause) =>
       clause.field === 'conversation' || clause.field === 'says') ?? false;
@@ -6949,7 +6953,11 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
         ctx.attention.set(userId, asks);
       }
     }
+    ctx.ceos = new Set((await Promise.all(projects.filter((project) => ceos === 'project' || project.coordinator)
+      .map((project) => this.deps.store.kvGet(CEO_KEY(project.id))))).filter((id): id is string => !!id && !id.startsWith('creating:')));
     const candidates = attentionCandidates(q, ctx);
+    // A CEO is for everyone: read it even when nothing in it waits on them.
+    for (const id of ctx.ceos) candidates?.add(id);
     const tasks: TaskRecord[] = [];
     const tags: Tag[] = [];
     for (const project of projects) {
@@ -6971,7 +6979,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const result = evaluateQuery(tasks, q, { ...ctx, tags });
     const series = result.tasks.filter((task) => isSeries(task.params)).map((task) => task.id);
     if (series.length) result.runCounts = Object.fromEntries(await this.deps.store.runCounts(series));
-    return { result, tags };
+    return { result, tags, ceos: ctx.ceos };
   }
 
   /** The searchable-field registry the UI reads to build its filter/sort/group menus. */

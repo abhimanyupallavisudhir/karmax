@@ -219,15 +219,36 @@ describe('CEOs: a permanent co-ordinator in every project, and the organization�
     expect(both[0].id).toBe(both[1].id);
   });
 
-  it('For me lists every CEO first, as if each always waited; the sidebar’s numbers count only what came to wait', async () => {
+  it('the organization’s lists lead with its CEO alone, and For me always has it, started or not; a project’s, with its own', async () => {
     const f = await fixture();
     await ensureEveryCeo(f.deps);
-    const q = encodeURIComponent('for:me -is:archived');
-    const listed = await f.call('ana', 'GET', `/api/organizations/${f.organization.id}/search?q=${q}`);
-    expect(listed.status, JSON.stringify(listed.json)).toBe(200);
-    const titles = listed.json.tasks.map((task: { title: string }) => task.title);
-    expect(titles.slice(0, 2).sort()).toEqual([ceoTitle('organization'), ceoTitle('project')]);
-    const counted = await f.call('ana', 'GET', `/api/organizations/${f.organization.id}/search?q=${q}&countBy=project`);
+    const search = (scope: string, query: string) =>
+      f.call('ana', 'GET', `/api/${scope}/search?q=${encodeURIComponent(query)}`);
+    const titles = (listed: { json: { tasks: Array<{ title: string }> } }) => listed.json.tasks.map((task) => task.title);
+    const organization = `organizations/${f.organization.id}`;
+
+    // For me across the organization: its CEO first, and no project's CEO.
+    const forMe = await search(organization, 'for:me -is:archived');
+    expect(forMe.status, JSON.stringify(forMe.json)).toBe(200);
+    expect(titles(forMe)).toEqual([ceoTitle('organization')]);
+
+    // Started (no longer a draft, nothing in it waiting on anyone), it is still there.
+    const started = await f.ask('ana', 'Run the firm');
+    expect(started.json.params.draft).toBe(false);
+    expect(titles(await search(organization, 'for:me -is:archived'))).toEqual([ceoTitle('organization')]);
+
+    // A project's own list leads with its CEO, which is for me there.
+    expect(titles(await search(`projects/${f.site.id}`, 'for:me -is:archived'))).toEqual([ceoTitle('project')]);
+
+    // The organization's Active list does not put the projects' CEOs first.
+    await f.store.createTask({ projectId: f.site.id, title: 'Fix the footer', workflow: 'software-dev', workflowVersion: '1.30.0',
+      params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'ana' } });
+    const active = titles(await search(organization, '-is:archived sort:created-desc'));
+    expect(active[0]).toBe(ceoTitle('organization'));
+    expect(active.indexOf('Fix the footer')).toBeLessThan(active.indexOf(ceoTitle('project')));
+
+    // The sidebar's numbers count only what came to wait.
+    const counted = await f.call('ana', 'GET', `/api/${organization}/search?q=${encodeURIComponent('for:me -is:archived')}&countBy=project`);
     expect(counted.json).toEqual({ total: 0, counts: {} });
   });
 
