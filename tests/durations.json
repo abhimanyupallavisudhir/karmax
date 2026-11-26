@@ -693,6 +693,7 @@
   "tests/task-browser-fill.test.ts": 0.3,
   "tests/task-browser.test.ts": 2.9,
   "tests/task-command-workflow.test.ts": 16.9,
+  "tests/task-conversation.test.ts": 0.5,
   "tests/task-creator.browser.test.ts": 12.8,
   "tests/task-creator.test.ts": 3,
   "tests/task-defaults-order.browser.test.ts": 3.6,

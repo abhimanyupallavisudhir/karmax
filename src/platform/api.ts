@@ -112,7 +112,7 @@ import type { ServiceConnection } from '../integrations/service-connections.js';
 import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { avatarAllows, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled, avatarPrincipal, avatarRoleOf, forkedAvatar,
   normalizeAvatarSetting, AVATAR_ROLE_LABELS, type AvatarRole } from './avatars.js';
-import { CapabilityError, NotFoundError, TaskStartedError, ValidationError } from './errors.js';
+import { CapabilityError, ConflictError, NotFoundError, TaskStartedError, ValidationError } from './errors.js';
 import { acceptsQueuedMessages, parsePending, pendingForView, pendingMessagesKey, PENDING_MESSAGES_PREFIX, QUEUED_FOLLOW_UP_ACTION, type PendingMessage, type SentMessage } from './pending-messages.js';
 import type { AccountLeaseAnswer, AccountQueueView } from '../coordinators/account.js';
 import type { SchedulingQueueTask, SchedulingQueueView } from '../scheduling/view.js';
@@ -6573,13 +6573,18 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
   async taskConversation(token: string, taskId: string, role = 'do'): Promise<{ role: string; session?: string; messages: Message[] }> {
     const task = (await this.deps.store.getTask(taskId));
     (await this.require(token, 'get_conversation', { projectId: task?.projectId, taskId }));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    const session = (await this.deps.store.kvGet(`session:${taskId}:${role}`)) || undefined;
     const view = await this.getTaskView(token, taskId);
-    if (!view) throw new Error(`task ${taskId} has no conversation yet`);
+    // A task that has not begun (a draft, one armed on its trigger, a series)
+    // has no view: no agent has said or read anything, so its conversation is
+    // empty, as listTaskAgents counts it — not a failure.
+    if (!view) return { role, session, messages: [] };
     // A shared conversation is the same thread for every agent, read as that agent reads it.
-    if (view.participants) return { role, session: (await this.deps.store.kvGet(`session:${taskId}:${role}`)) || undefined,
+    if (view.participants) return { role, session,
       messages: conversationFor(view.messages, isParticipantKey(role) ? role : MAIN_AGENT).map((m) => ({ ...m })) };
     const transcript = role === 'do' ? undefined : view.transcripts?.find((t) => t.role === role);
-    return { role, session: (await this.deps.store.kvGet(`session:${taskId}:${role}`)) || undefined, messages: (transcript?.messages ?? view.messages).map((m) => ({ ...m })) };
+    return { role, session, messages: (transcript?.messages ?? view.messages).map((m) => ({ ...m })) };
   }
 
   /** The conversation a forked agent began with: each task of its fork lineage
@@ -6652,7 +6657,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     if (!source) throw new NotFoundError(`no task ${args.taskId}`);
     const role = args.role ?? 'do';
     if (!(await this.deps.store.kvGet(`session:${args.taskId}:${role}`)) && !(await this.getTaskView(token, args.taskId))?.messages?.length)
-      throw new Error(`the ${role} agent has no conversation to fork`);
+      throw new ConflictError(`the ${role} agent has no conversation to fork`);
     const previous = args.reauthorize ? (await endedTaskGrants(this.deps.store, this.deps.authorization, source)) : undefined;
     return this.createTask(token, {
       projectId: source.projectId,
