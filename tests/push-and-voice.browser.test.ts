@@ -128,7 +128,7 @@ it('dictates into the new-task prompt and the message box, editable, and hides t
     await step('what was heard is editable and saved like typing', async () => {
       await prompt.press('End');
       await page.keyboard.type(' today');
-      const draft = async () => (await g.store.listTasks(project.id)).find((task) => task.params?.draft);
+      const draft = async () => (await g.store.listTasks(project.id)).find((task) => task.params?.draft && !task.params?.coordinator); // not the project's CEO
       await expect.poll(async () => (await draft())?.params?.prompt, { timeout: 10_000 }).toBe('Fix the login page and its footer today');
     });
 

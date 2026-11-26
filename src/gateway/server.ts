@@ -1,4 +1,6 @@
 import { computerDefaults, saveOrganizationComputer, saveProjectComputer, splitComputerValues } from '../platform/computer-settings.js';
+import { ASK_SETTINGS, ASK_TARGETS, askTarget } from '../domain/coordinator.js';
+import { CEO_CREDENTIAL_GRANTS, CEO_PRINCIPAL, ceoAuthorization, ceoScopeOf, ensureCeo } from '../platform/ceo.js';
 import { type AutonomyScope, type ProjectAutonomy } from '../domain/autonomous-projects.js';
 import { machineWaits, type MachineWait } from '../world/machine-wait.js';
 import { REPOSITORY_ROUTE } from '../world/resource-repository.js';
@@ -44,7 +46,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
-import type { ChildTaskSummary, KarmaxEvent, Organization, PushSubscriptionRecord, TaskView, WorldProviderConnection } from '../domain/types.js';
+import type { ChildTaskSummary, FileRef, ImageRef, KarmaxEvent, Organization, PushSubscriptionRecord, TaskRecord, TaskView, WorldProviderConnection } from '../domain/types.js';
 import { BRAND_FILES, brandIconOf, isBrandIcon, isSkin, isTaskList, siteNameError, siteNameOf, skinOf, taskListOf, BRAND } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { ProjectTransfers, ProjectTransferError } from '../platform/project-transfer.js';
@@ -301,6 +303,7 @@ export function routeCapability(method: string, p: string, url?: URL): KnownCapa
   // Ask (wiki features/computerless-tasks): a task in the organization's
   // co-ordinator project, made on first use by whoever may create tasks there.
   if (/^\/api\/organizations\/[^/]+\/ask$/.test(p) && !read) return 'task:create';
+  if (/^\/api\/organizations\/[^/]+\/ask-settings$/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/projects/.test(p)) return read ? 'project:read' : 'project:create';
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
@@ -3394,6 +3397,7 @@ export class Gateway {
         }
         // Every organization has a co-ordinator project (where Ask's tasks live).
         const { project } = await store.ensureOrganizationCoordinatorProject(organization.id);
+        await this.giveCeo(project.id, subject.userId);
         if (b.autonomous !== true) return this.json(res, 200, organization);
         // An autonomous organization's co-ordinator runs everything from it, set
         // up with the organization's whole authority.
@@ -4049,7 +4053,7 @@ export class Gateway {
       if (organizationRepositories) {
         const organizationId = organizationRepositories[1]!;
         if (method === 'GET') return this.json(res, 200,
-          (await __asyncCollections.filter((await store.listRepositories(organizationId)), async (repository) => !(await store.repositoryIsProjectWiki(repository.id)))));
+          (await __asyncCollections.filter((await store.listRepositories(organizationId)), async (repository) => !(await store.repositoryIsWiki(repository.id)))));
         if (method === 'POST') {
           if (this.deps.hosted) return this.json(res, 400, { error: 'Hosted repositories must be imported through the GitHub App' });
           const b = await this.body(req);
@@ -4175,10 +4179,30 @@ export class Gateway {
         // Every organization has one; one older than that gets it now.
         const { project } = await store.ensureOrganizationCoordinatorProject(organizationId);
         await this.wikiForTaskStart(project, callerIdentity.humanSubject?.userId);
+        const images = Array.isArray(b.images) ? b.images : undefined, files = Array.isArray(b.files) ? b.files : undefined;
+        if (askTarget(await store.getSettings(`organization:${organizationId}`, ASK_SETTINGS)) === 'ceo') {
+          const ceo = await this.askCeo(token, callerIdentity, project.id, prompt, images, files);
+          // Someone the CEO holds more than asks a quick task of their own instead.
+          if (ceo) return this.json(res, 200, { ...ceo, project, ceo: true });
+        }
         const task = await api.createTask(token, { projectId: project.id, workflow: 'software-dev', prompt, ownAuthority: true,
-          ...(Array.isArray(b.images) ? { images: b.images } : {}), ...(Array.isArray(b.files) ? { files: b.files } : {}),
+          ...(images ? { images } : {}), ...(files ? { files } : {}),
           params: { computer: { provider: NO_COMPUTER } } }, receivedAt);
         return this.json(res, 200, { ...task, project });
+      }
+      // Where the organization's Ask goes (wiki features/computerless-tasks § Ask).
+      const askSettings = p.match(/^\/api\/organizations\/([^/]+)\/ask-settings$/);
+      if (askSettings) {
+        const organizationId = askSettings[1]!;
+        if (!(await store.getOrganization(organizationId))) return this.json(res, 404, { error: 'organization not found' });
+        const scopeKey = `organization:${organizationId}`;
+        if (method === 'PUT') {
+          const body = await this.body(req);
+          if (!ASK_TARGETS.includes(body.target)) return this.json(res, 400, { error: `target is ${ASK_TARGETS.map((t) => `"${t}"`).join(' or ')}` });
+          (await store.setSettings(scopeKey, ASK_SETTINGS, { ...(await store.getSettings(scopeKey, ASK_SETTINGS)), to: body.target }));
+        } else if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
+        return this.json(res, 200, { target: askTarget(await store.getSettings(scopeKey, ASK_SETTINGS)),
+          canManage: (await this.deps.tokens.check(token, 'organization:edit', { organizationId })).ok });
       }
       const organizationProjects = p.match(/^\/api\/organizations\/([^/]+)\/projects$/);
       if (organizationProjects) {
@@ -4203,6 +4227,7 @@ export class Gateway {
           } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
           await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
           await this.installDefaultTasks(project);
+          await this.giveCeo(project.id, callerIdentity.humanSubject?.userId);
           return this.json(res, 200, b.autonomous === true ? { ...project, ...(await this.autonomous(token, project.id, 'project')) } : project);
         }
       }
@@ -4774,6 +4799,7 @@ export class Gateway {
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
         await this.installDefaultTasks(project);
+        await this.giveCeo(project.id, callerIdentity.humanSubject?.userId);
         return this.json(res, 200, b.autonomous === true ? { ...project, ...(await this.autonomous(token, project.id, 'project')) } : project);
       }
       const projectAutonomyRoute = p.match(/^\/api\/projects\/([^/]+)\/autonomy$/);
@@ -9987,6 +10013,57 @@ export class Gateway {
 
   /** What every project comes with from the task store: the repair of failed
    *  deploys (src/integrations/github-events.ts). The project is made either way. */
+  /**
+   * Ask, where the organization sends it to its CEO (wiki features/coordinator
+   * § CEOs). A CEO not started yet takes the Ask into its instructions and is
+   * started by the asker — granting its fixed authority, which they must hold;
+   * one who does not has it sent for approval to someone who can, and approval
+   * starts it. A started CEO takes the Ask as a message, from someone who holds
+   * everything it holds and may write to it. Undefined when the asker may not
+   * steer it: then they get a quick task of their own.
+   */
+  private async askCeo(token: string, caller: ReturnType<typeof resolveCallerIdentity>, projectId: string, prompt: string,
+    images?: ImageRef[], files?: FileRef[]): Promise<(TaskRecord & { awaitingApproval?: { requestId: string; audience: string[] } }) | undefined> {
+    const { api, store, tokens } = this.deps;
+    const userId = caller.humanSubject?.userId;
+    const ceo = await ensureCeo({ api, store, tokens }, projectId, userId ? { createdBy: { kind: 'user', userId } } : {});
+    if (!ceo.params?.draft) {
+      // Telling a CEO what to do is acting with its authority: only someone who holds all of it may.
+      const held = (ceo.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities;
+      const asker = (await tokens.verify(token))?.caps ?? [];
+      if (!held || !held.every((capability) => allows(asker, capability as Capability))) return undefined;
+      try { await api.signalTask(token, ceo.id, WORKFLOW_SIG.followUp, prompt, undefined, images, files); }
+      catch (error) { if (error instanceof CapabilityError) return undefined; throw error; } // may not write to it
+      return (await store.getTask(ceo.id)) ?? ceo;
+    }
+    // The CEO is the project's, not its creator's: the Ask is written into it by the platform.
+    const organizationId = (await store.getProject(projectId))?.organizationId ?? 'org_personal';
+    const { token: writer } = await tokens.mintPrincipal(CEO_PRINCIPAL, ['task:edit', 'task:read', 'project:read'], projectId, 60_000, organizationId);
+    try {
+      const written = String(ceo.params?.prompt ?? '').trim();
+      await api.updateArmedParams(writer, ceo.id, { prompt: written ? `${written}\n\n${prompt}` : prompt,
+        ...(images?.length ? { images: [...((ceo.params?.images as ImageRef[] | undefined) ?? []), ...images] } : {}),
+        ...(files?.length ? { files: [...((ceo.params?.files as FileRef[] | undefined) ?? []), ...files] } : {}) },
+        { keepArmed: false, allowAttenuation: true });
+    } finally { await tokens.revoke(writer); }
+    try { return await api.queueTask(token, ceo.id); }
+    catch (error) {
+      if (!(error instanceof AuthorizationGrantError)) throw error;
+      const asked = await api.requestAuthorization(token, { projectId, target: { kind: 'task', taskId: ceo.id, queueAfterApproval: true },
+        authorization: ceoAuthorization(ceoScopeOf((await store.getProject(projectId))!), projectId), credentialGrants: [...CEO_CREDENTIAL_GRANTS],
+        audience: [], reason: `Start the CEO, asked: ${prompt.length > 200 ? `${prompt.slice(0, 200)}…` : prompt}` });
+      return { ...((await store.getTask(ceo.id)) ?? ceo), awaitingApproval: { requestId: asked.id, audience: asked.audience } };
+    }
+  }
+
+  /** The project's CEO draft (src/platform/ceo.ts), for the person who made the
+   * project. Best effort: the project stands without it, and boot makes it. */
+  private async giveCeo(projectId: string, userId?: string): Promise<void> {
+    try { await ensureCeo({ api: this.deps.api, store: this.deps.store, tokens: this.deps.tokens }, projectId,
+      userId ? { createdBy: { kind: 'user', userId } } : {}); }
+    catch (error) { console.warn(`[karmax] could not give ${projectId} its CEO:`, error instanceof Error ? error.message : error); }
+  }
+
   /** Set a just-created project up to run itself (wiki features/autonomy). The
    * project stays when that fails; the answer says why, for its creator to retry
    * from the project (POST /api/projects/:id/autonomy). */
@@ -11853,7 +11930,7 @@ export class Gateway {
         name: label || 'Personal', kind: 'personal', ownerUserId: userId }));
       (await this.deps.store.setDefaultOrganization(userId, organization.id));
       (await this.deps.authorization?.bootstrapOrganizationOwner(`user:${userId}`, userId, organization.id));
-      (await this.deps.store.ensureOrganizationCoordinatorProject(organization.id));
+      await this.giveCeo((await this.deps.store.ensureOrganizationCoordinatorProject(organization.id)).project.id, userId);
       (await this.deps.resources?.storageLocationService()?.ensureManaged(organization.id));
       (await inheritPersonalGithubProfile(this.deps.store, this.deps.broker, userId));
       (await this.linkOwnGithubInstallation(userId, organization));

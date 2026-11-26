@@ -42,8 +42,6 @@ export const AUTONOMY_KEY = (projectId: string) => `autonomy:project:${projectId
 /** The wiki page every task of an autonomous project (or organization) inlines. */
 export const AUTONOMY_WIKI_PATH = 'autonomy';
 
-/** The co-ordinator project an autonomous organization starts with. */
-export const ORGANIZATION_COORDINATOR_PROJECT = 'Co-ordinator';
 
 
 const where = (scope: AutonomyScope) => (scope === 'organization' ? 'organization' : 'project');

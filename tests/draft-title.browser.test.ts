@@ -21,7 +21,7 @@ it('the task list names a draft by what its prompt says now, after it was backsp
   try {
     await signIn(context, g.url, 'ada@example.test', PASSWORD);
     const project = await consoleRequest(context, g.url, 'POST', `/api/organizations/${organization.id}/projects`, { name: 'Website' });
-    const draft = async () => (await g.store.listTasks(project.id)).find((task) => task.params?.draft);
+    const draft = async () => (await g.store.listTasks(project.id)).find((task) => task.params?.draft && !task.params?.coordinator); // not the project's CEO
     const prompt = page.locator('#tf-body textarea[data-field="prompt"]');
 
     await step('type a prompt, wait for the draft', async () => {
@@ -45,7 +45,8 @@ it('the task list names a draft by what its prompt says now, after it was backsp
     await step('the list shows the new words', async () => {
       await page.locator('#tf-close').click();
       const row = page.locator('.task-row[data-draft] .task-title');
-      await expect.poll(() => row.allInnerTexts()).toEqual([expect.stringContaining('Add a dark mode')]);
+      // The project's CEO leads the list (wiki features/coordinator § CEOs); then the draft, by its words.
+      await expect.poll(() => row.allInnerTexts()).toEqual([expect.stringContaining('CEO (Project Co-ordinator)'), expect.stringContaining('Add a dark mode')]);
       if (process.env.KARMAX_SCREENSHOT) await page.screenshot({ path: process.env.KARMAX_SCREENSHOT });
     });
     expect(errors).toEqual([]);

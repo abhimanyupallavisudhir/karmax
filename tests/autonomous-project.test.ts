@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { untouchedCeoDraft } from '../src/platform/ceo.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -87,7 +88,7 @@ describe('autonomous project', () => {
 
     // The co-ordinator: a permanent co-ordinator draft holding the same authority, and that budget.
     const coordinator = (await f.store.getTask(autonomy.coordinatorTaskId))!;
-    expect(coordinator.title).toBe('Co-ordinator');
+    expect(coordinator.title).toBe('CEO (Project Co-ordinator)');
     expect(coordinator.params).toMatchObject({ draft: true, coordinator: { wakeHours: 24 }, multiPr: true,
       paymentPolicy: { budget: 5000, currency: 'usd' } });
     expect(coordinator.params['agent:do']).toBeUndefined();
@@ -204,7 +205,10 @@ describe('autonomous project', () => {
     f.api.saveWikiPageResolved = async () => { throw new Error('wiki offline'); };
     await f.store.setSettings(f.project.id, '__common__', { otherAttempts: 'keep' });
     await expect(f.api.makeAutonomous(f.owner, f.project.id)).rejects.toThrow('wiki offline');
-    expect((await f.store.listTasks(f.project.id)).filter((task) => task.params.avatar || task.params.coordinator)).toEqual([]);
+    // Only the project's own CEO is left, as untouched as it was: no Avatār, and no CEO with its authority.
+    const left = (await f.store.listTasks(f.project.id)).filter((task) => task.params.avatar || task.params.coordinator);
+    expect(left).toHaveLength(1);
+    expect(untouchedCeoDraft(left[0]!)).toBe(true);
     expect(await f.store.getSettings(f.project.id, '__common__')).toEqual({ otherAttempts: 'keep' });
     f.api.saveWikiPageResolved = original;
     expect((await f.api.makeAutonomous(f.owner, f.project.id)).scope).toBe('project');

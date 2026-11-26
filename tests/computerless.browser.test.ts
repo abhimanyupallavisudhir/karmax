@@ -51,6 +51,8 @@ describe('a task without a computer, in the console', () => {
       list: async () => connections } as any;
     const api = new KarmaxApi({ store, tokens, worlds, client, taskQueue: 'test', contentDir: dir, providerConnections });
     project = await store.createProject('Assistant');
+    // These tests are about the quick task Ask can start; by default it goes to the CEO (tested below).
+    await store.setSettings(`organization:${project.organizationId}`, 'ask', { to: 'task' });
     await store.setOrganizationExecutionPolicy(project.organizationId!, { worldProvider: 'e2b', resources: { cpu: 2, memoryMb: 4096 } });
     const gateway = await Gateway.create({ store, tokens, worlds, client, api, bus: new KarmaxBus(), providerConnections,
       contributions: new ContributionRegistry(), overlays: new Overlays(), taskQueue: 'test', staticDir: path.resolve('web'),
@@ -107,6 +109,15 @@ describe('a task without a computer, in the console', () => {
     // Nobody is asked which project: the dialog names none.
     expect(await page.locator('#mobile-ask').isVisible()).toBe(false); // a computer's Ask is in the sidebar
     const ask = page.locator('#rail-ask');
+    // The sidebar's bright button is Ask; beside it a plain + starts a task, and no template button.
+    await ask.waitFor();
+    expect(await ask.textContent()).toBe('Ask tavya');
+    expect(await ask.evaluate((element) => element.classList.contains('primary'))).toBe(true);
+    const plus = page.locator('#rail-new-task');
+    expect(await plus.getAttribute('aria-label')).toBe('New task');
+    expect(((await plus.textContent()) ?? '').trim()).toBe('');
+    expect(await plus.evaluate((element) => element.classList.contains('primary'))).toBe(false);
+    expect(await page.locator('#rail-new-template').count()).toBe(0);
     await ask.waitFor();
     expect(await ask.getAttribute('title')).toContain('(A)');
     // The shortcut opens it as the button does.
@@ -129,13 +140,20 @@ describe('a task without a computer, in the console', () => {
     }, { timeout: 15_000 }).toEqual({ provider: 'none' });
     // It lives in the co-ordinator project, made for it, which the sidebar now lists.
     const coordinator = (await store.getProject(created!.projectId))!;
-    expect(coordinator).toMatchObject({ name: 'Co-ordinator', organizationId: project.organizationId });
-    await expect.poll(() => page.locator('#rail-list').textContent(), { timeout: 10_000 }).toContain('Co-ordinator');
+    expect(coordinator).toMatchObject({ name: 'CEO', organizationId: project.organizationId });
+    await expect.poll(() => page.locator('#rail-list').textContent(), { timeout: 10_000 }).toContain('CEO');
+    // It leads the projects, with its own icon, and is not dragged or renamed from there.
+    const first = page.locator('#rail-list .proj').first();
+    expect(await first.evaluate((element) => element.classList.contains('ceo-project'))).toBe(true);
+    expect(await first.getAttribute('draggable')).toBe('false');
+    expect(await first.locator('[data-project-edit]').count()).toBe(0);
+    expect(await first.locator('.glyph svg path').first().getAttribute('d')).toBe('M3 8l4.5 4L12 5l4.5 7L21 8l-2 11H5z');
+    if (process.env.KARMAX_SHOTS) await page.locator('#rail').screenshot({ path: path.join(process.env.KARMAX_SHOTS, 'sidebar-ceo.png') });
     expect(created!.params.draft).toBe(false);
     // Its page opens with the message box ready for the next message.
     await expect.poll(() => page.evaluate(() => (globalThis as any).document.activeElement?.classList.contains('followup-input')), { timeout: 10_000 }).toBe(true);
     expect((created!.params._authorization as { heldBack?: string[] }).heldBack).toContain('task:delete');
-    await expect.poll(() => page.url(), { timeout: 10_000 }).toContain(`/co-ordinator/tasks/${created!.num ?? created!.id}`);
+    await expect.poll(() => page.url(), { timeout: 10_000 }).toContain(`/ceo/tasks/${created!.num ?? created!.id}`);
     expect(await dialog.count()).toBe(0);
 
     // The next question goes to the same project.
@@ -145,13 +163,37 @@ describe('a task without a computer, in the console', () => {
     await dialog.locator('textarea').press('Enter');
     await expect.poll(async () => (await allTasks()).find((task) => task.params?.prompt === 'And what about E2B?')?.projectId,
       { timeout: 15_000 }).toBe(coordinator.id);
-    expect((await store.listProjects()).filter((p) => p.name.startsWith('Co-ordinator'))).toHaveLength(1);
+    expect((await store.listProjects()).filter((p) => p.coordinator)).toHaveLength(1);
     // It is the organization's for good: its settings offer no rename, move or delete.
-    await page.goto(`${base}/personal/co-ordinator/settings`);
+    await page.goto(`${base}/personal/ceo/settings`);
     await page.locator('#project-advanced').waitFor({ state: 'attached' });
-    await expect.poll(() => page.locator('.setting-row', { hasText: 'Co-ordinator project' }).count(), { timeout: 10_000 }).toBe(1);
+    await expect.poll(() => page.locator('.setting-row', { hasText: 'CEO project' }).count(), { timeout: 10_000 }).toBe(1);
     expect(await page.locator('#delete-project, #move-project, #rename-project').count()).toBe(0);
     expect(errors).toEqual([]);
+  });
+
+  it('by default Ask goes to the organization’s CEO: the first question starts it and its page opens', async () => {
+    const scopeKey = `organization:${project.organizationId}`;
+    await store.setSettings(scopeKey, 'ask', {});
+    try {
+      const { page, errors } = await open('/personal/assistant');
+      await page.locator('#rail-ask').click();
+      const dialog = page.locator('dialog.ask-dialog');
+      await dialog.waitFor();
+      expect(await dialog.locator('.ask-where .info-dot').getAttribute('title')).toMatch(/CEO/);
+      await dialog.locator('textarea').fill('Plan the quarter');
+      await dialog.locator('textarea').press('Enter');
+      let ceo: Awaited<ReturnType<typeof allTasks>>[number] | undefined;
+      await expect.poll(async () => {
+        ceo = (await allTasks()).find((task) => task.params?.coordinator && task.params?.prompt === 'Plan the quarter');
+        return ceo?.params?.draft;
+      }, { timeout: 15_000 }).toBe(false);
+      expect(ceo!.title).toBe('CEO (Organization Co-ordinator)');
+      expect(ceo!.params.computer).not.toEqual({ provider: 'none' });
+      await expect.poll(() => page.url(), { timeout: 10_000 }).toContain(`/ceo/tasks/${ceo!.num ?? ceo!.id}`);
+      expect((await allTasks()).filter((task) => task.params?.prompt === 'Plan the quarter')).toHaveLength(1);
+      expect(errors).toEqual([]);
+    } finally { await store.setSettings(scopeKey, 'ask', { to: 'task' }); }
   });
 
   it('On a phone, Ask is in the top bar', async () => {
@@ -171,7 +213,8 @@ describe('a task without a computer, in the console', () => {
     if (process.env.KARMAX_SHOTS) await page.screenshot({ path: path.join(process.env.KARMAX_SHOTS, 'ask-phone-bar.png') });
     await page.locator('#mobile-menu').click();
     await expect.poll(() => page.locator('#rail-new-task').isVisible()).toBe(true);
-    expect(await page.locator('#rail-ask').isVisible()).toBe(false);
+    // The drawer leads with Ask too.
+    expect(await page.locator('#rail-ask').isVisible()).toBe(true);
     await page.locator('#mobile-menu').click();
 
     await ask.tap();
@@ -181,7 +224,7 @@ describe('a task without a computer, in the console', () => {
     await dialog.locator('textarea').fill('Asked from my phone');
     await dialog.locator('button[value="submit"]').tap();
     await expect.poll(async () => (await store.getProject((await allTasks())
-      .find((task) => task.params?.prompt === 'Asked from my phone')?.projectId ?? ''))?.name, { timeout: 15_000 }).toBe('Co-ordinator');
+      .find((task) => task.params?.prompt === 'Asked from my phone')?.projectId ?? ''))?.name, { timeout: 15_000 }).toBe('CEO');
     expect(errors).toEqual([]);
     await context.close();
   });

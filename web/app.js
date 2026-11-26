@@ -113,6 +113,8 @@ const ICON = {
   desktop: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>',
   laptop: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"/></svg>',
   // The task page's two views: its conversation, and its settings.
+  // The CEO project: a crown, the organization's own.
+  ceo: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8l4.5 4L12 5l4.5 7L21 8l-2 11H5z"/><path d="M5 19h14"/></svg>',
   chat: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
   sliders: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg>',
   clock: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
@@ -512,7 +514,7 @@ function firstProjectForOrganization(organizationId) {
 function ordinaryProjectForOrganization(organizationId) {
   return (S.projects || []).find((p) => p.organizationId === organizationId && !p.coordinator);
 }
-const COORDINATOR_PROJECT_TIP = 'The organization’s own project: what you Ask lives here. It can’t be renamed, moved or deleted.';
+const COORDINATOR_PROJECT_TIP = 'The organization’s own project, where its CEO and what you Ask live. It can’t be renamed, moved or deleted.';
 // Resolve a URL slug back to a project, optionally scoped to one organization
 // (project slugs need only be unique within their org). Matches the slugified name
 // (the common, human case), falling back to a raw project id for safety. On a slug
@@ -6534,10 +6536,9 @@ function renderShell() {
         </div>
         <div class="rail-top">
           ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
-          <div class="rail-new" role="group" aria-label="New task">
-            <button class="btn primary rail-new-task" id="rail-new-task" type="button" data-shortcut="nav.newTaskDefault" title="${esc(commandHint('New task', 'nav.newTaskDefault'))}">${ICON.plus}<span>New task</span></button>
-            <button class="btn primary rail-new-template" id="rail-new-template" type="button" data-shortcut="nav.newTask" aria-label="New task from template" title="${esc(commandHint('New task from template', 'nav.newTask'))}">${ICON.template}</button>
-            <button class="btn rail-ask" id="rail-ask" type="button" data-shortcut="nav.ask" aria-label="Ask ${esc(siteName())}" aria-haspopup="dialog" title="${esc(commandHint(`Ask ${siteName()} — no computer, starts in seconds`, 'nav.ask'))}">${ICON.chat}</button>
+          <div class="rail-new" role="group" aria-label="Ask or start a task">
+            <button class="btn primary rail-ask" id="rail-ask" type="button" data-shortcut="nav.ask" aria-haspopup="dialog" title="${esc(commandHint(`Ask ${siteName()}`, 'nav.ask'))}">${ICON.chat}<span>Ask ${esc(siteName())}</span></button>
+            <button class="btn rail-new-task" id="rail-new-task" type="button" data-shortcut="nav.newTaskDefault" aria-label="New task" title="${esc(commandHint('New task', 'nav.newTaskDefault'))}">${ICON.plus}</button>
           </div>
           <nav class="rail-org-nav" aria-label="Organization">${RAIL_ORG_NAV.map(([id, label, icon, , , , command]) =>
             `<a class="rail-row" id="${id}" data-spa data-shortcut="${command}" href="#">${ICON[icon]}<span>${label}</span></a>`).join('')}</nav>
@@ -6564,7 +6565,6 @@ function renderShell() {
     <aside class="hosted-onboarding" id="hosted-onboarding" aria-live="polite" hidden></aside>`;
   $('#rail-palette').addEventListener('click', openPalette);
   $('#rail-new-task').addEventListener('click', () => openNewTaskForm());
-  $('#rail-new-template').addEventListener('click', () => openTemplatePicker());
   $('#rail-ask').addEventListener('click', () => askTavya());
   $('#mobile-ask').addEventListener('click', () => askTavya());
   $('#rail-help').addEventListener('click', openHelp);
@@ -6845,8 +6845,11 @@ function inSidebarOrder(projects) {
 // project, so navigating into a tucked-away project never blanks the selection.
 function railProjectRows(projectScoped) {
   const query = (S.projectSearch || '').trim().toLocaleLowerCase();
-  const projects = S.projects.filter((p) => (!S.organizationId || p.organizationId === S.organizationId)
+  const matching = S.projects.filter((p) => (!S.organizationId || p.organizationId === S.organizationId)
     && projectPath(p).toLocaleLowerCase().includes(query));
+  // The organization's CEO project leads, on its own: never in a folder, dragged or renamed.
+  const ceo = matching.find((p) => p.coordinator);
+  const projects = matching.filter((p) => !p.coordinator);
   const root = projectTree(projects);
   const folded = railCollapsedFolders();
   // A project row is an item: box icon, regular text, a link. A folder
@@ -6866,7 +6869,10 @@ function railProjectRows(projectScoped) {
     const active = projectScoped && projects.find((p) => p.id === S.projectId && inside(p, child.path));
     return header(child, depth, false) + (active ? row(active, depth + 1) : '');
   }).join('');
-  return walk(root, 0) || (query ? '<div class="rail-search-empty" role="status">No matching projects</div>' : '');
+  const ceoRow = ceo ? `<div class="proj project-row ceo-project ${projectScoped && ceo.id === S.projectId ? 'active' : ''}" data-id="${ceo.id}" style="--depth:0" draggable="false">
+          <a class="project-link" data-spa href="${projectRoute(ceo.id)}" data-project="${ceo.id}" tabindex="0" title="${esc(COORDINATOR_PROJECT_TIP)}"><span class="glyph">${ICON.ceo}</span><span class="rail-name">${esc(ceo.name)}</span>${forMeCountHtml(ceo.id)}</a>
+        </div>` : '';
+  return (ceoRow + walk(root, 0)) || (query ? '<div class="rail-search-empty" role="status">No matching projects</div>' : '');
 }
 
 // How many tasks each project's For me list holds (its default list), beside
@@ -9204,11 +9210,11 @@ function openNewTaskForm(template, projectId = template?.projectId) {
 }
 function newTaskTarget() { return S.tab === 'home' ? newTaskProjectId() : S.projectId; }
 
-// "Ask tavya" (wiki features/computerless-tasks): what you type starts a task
-// without a computer in the organization's co-ordinator project (made on first
-// use), acting with your own authority; its page opens with the message box
-// ready. One conversation is one task. Someone whose authority covers only some
-// projects asks in one of those instead.
+// "Ask tavya" (wiki features/computerless-tasks § Ask): what you type goes where
+// the organization sends Ask — a quick task without a computer in its CEO
+// project, acting with your own authority (one conversation is one task), or
+// its CEO (the first Ask starts it). Its page opens with the message box ready.
+// Someone whose authority covers only some projects asks in one of those.
 function askTavya() {
   const organizationId = S.organizationId;
   const previousFocus = document.activeElement;
@@ -9219,11 +9225,15 @@ function askTavya() {
   dialog.innerHTML = `<form method="dialog"><div class="prompt-field"><textarea name="ask" rows="3" required maxlength="20000" aria-label="Ask ${esc(siteName())}"
       placeholder="Ask ${esc(siteName())} anything: change a setting, find what waits on you, start a task…"></textarea>
       ${mic ? `<div class="prompt-attach-row ask-mic">${mic}</div>` : ''}</div>
-    <div class="inline-form ask-foot"><span class="ask-where">${policyTip(NO_COMPUTER_TIP)}</span>
+    <div class="inline-form ask-foot"><span class="ask-where">${policyTip(ASK_CEO_TIP)}</span>
       <button class="btn primary" value="submit" title="Ask (Enter)">Ask</button></div></form>`;
   const input = dialog.querySelector('textarea');
   const form = dialog.querySelector('form');
   let sending = false;
+  api(`/api/organizations/${encodeURIComponent(organizationId)}/ask-settings`, { maxAge: 30_000 }).then((ask) => {
+    const where = dialog.querySelector('.ask-where');
+    if (ask?.target === 'task' && where) where.innerHTML = policyTip(NO_COMPUTER_TIP);
+  }).catch(() => {});
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     const text = input.value.trim();
@@ -9247,7 +9257,9 @@ function askTavya() {
       if (!projectById(created.projectId)) { await loadProjects(); renderRail(); }
       dialog.close();
       await spaNavigate(`${projectBase(created.projectId)}/tasks/${created.num ?? created.id}`);
-      focusWhenReady('.followup-input');
+      // Started by someone who holds its authority; anyone else asked for it to be approved.
+      if (created.awaitingApproval) toast('Waiting for approval — the CEO starts once approved');
+      else focusWhenReady('.followup-input');
     } catch (error) {
       toast(error.message, true);
       sending = false;
@@ -22650,7 +22662,7 @@ function settingsView(proj) {
       <div class="setting-rows" id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
     <div class="card" data-settings-advanced hidden><div class="setting-rows">
-      ${proj.coordinator ? `<div class="setting-row"><span class="setting-label">Co-ordinator project ${policyTip(COORDINATOR_PROJECT_TIP)}</span>
+      ${proj.coordinator ? `<div class="setting-row"><span class="setting-label">CEO project ${policyTip(COORDINATOR_PROJECT_TIP)}</span>
         <span class="setting-value setting-muted">Permanent</span></div>` : `
       <div class="setting-row" data-settings-access="project" data-unsaved hidden><span class="setting-label">Name ${policyTip('Use / to put the project in folders, e.g. Clients/Website.')}</span>
         <span class="setting-value"><input id="project-name" class="setting-input" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders"></span>
@@ -22950,6 +22962,36 @@ async function hydrateEarlyAccess(organizationId) {
       } finally { input.disabled = false; }
     };
   } catch (error) { paneError(box, error, () => hydrateEarlyAccess(organizationId)); }
+}
+
+// Where Ask goes (wiki features/computerless-tasks § Ask): a quick task per
+// question, or the organization's CEO.
+const ASK_CEO_TIP = 'Goes to the organization’s CEO: it can do any work and remembers every Ask.';
+const ASK_TARGET_TIP = 'Where Ask sends what you type. CEO: the organization’s co-ordinator, which can do any work and remembers every Ask. Quick task: a new conversation that starts in seconds and can use ' + 'tavya, but not a computer.';
+async function hydrateAskTarget(organizationId) {
+  const box = $('#organization-ask');
+  if (!box) return;
+  const url = `/api/organizations/${encodeURIComponent(organizationId)}/ask-settings`;
+  try {
+    const ask = await api(url);
+    if (!box.isConnected) return;
+    box.innerHTML = `<div class="setting-row"><span class="setting-label">Ask ${policyTip(ASK_TARGET_TIP.replace('tavya', siteName()))}</span>
+      <span class="setting-value"><select id="ask-target" aria-label="Where Ask goes" ${ask.canManage ? '' : 'disabled'}>
+        <option value="ceo" ${ask.target === 'ceo' ? 'selected' : ''}>CEO</option>
+        <option value="task" ${ask.target === 'task' ? 'selected' : ''}>Quick task</option></select></span></div>`;
+    const select = box.querySelector('select');
+    select.onchange = async () => {
+      select.disabled = true;
+      const previous = ask.target;
+      try {
+        ask.target = (await api(url, { method: 'PUT', body: JSON.stringify({ target: select.value }) })).target;
+        toast(ask.target === 'ceo' ? 'Ask goes to the CEO' : 'Ask starts a quick task');
+      } catch (error) {
+        select.value = previous;
+        toast(error.message, true);
+      } finally { select.disabled = false; }
+    };
+  } catch (error) { paneError(box, error, () => hydrateAskTarget(organizationId)); }
 }
 
 async function hydrateAvatarAvailability(scope, id) {
@@ -24326,6 +24368,7 @@ function globalSettingsView(embedded = false) {
     ${agentMailCard()}
     ${paymentsCard('global')}
     <div class="settings-section-title" id="settings-agents"><div>Agents</div></div>
+    ${embedded ? '<div class="card"><div class="setting-rows" id="organization-ask"><div class="setting-row setting-muted">Loading…</div></div></div>' : ''}
     ${agentAccountsCard()}
     <div class="settings-section-title" id="settings-installation"><div>Workflows ${policyTip(`The recipes tasks run on. Built-ins ship with ${siteName()} and change only with platform releases; each task keeps the version it started on.${S.meta?.hosted ? ` Installing your own isn’t available on hosted ${siteName()}.` : ''}`)}</div></div>
     <div class="card" id="workflows-card">
@@ -30237,6 +30280,7 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
     hydrateSettingsAccess({ organizationId });
     hydrateConversationSharing('organization', organizationId);
     hydrateEarlyAccess(organizationId);
+    hydrateAskTarget(organizationId);
     hydrateAvatarAvailability('organization', organizationId);
     setEventHandler($('#export-organization'), 'click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
     const renameOrganization = async () => {

@@ -4,7 +4,8 @@ import type { KarmaxApi } from './api.js';
 import type { AuthorizationSelection, ConfirmLayer, ResponderConfig } from '../domain/types.js';
 import { BRAND } from '../domain/brand.js';
 import { COMMON_SETTINGS_WORKFLOW } from '../domain/shared-settings.js';
-import { DEFAULT_COORDINATOR_WAKE_HOURS } from '../domain/coordinator.js';
+import { CEO_KEY, ceoTitle, DEFAULT_COORDINATOR_WAKE_HOURS } from '../domain/coordinator.js';
+import { ensureCeo, untouchedCeoDraft } from './ceo.js';
 import {
   AUTONOMY_AVATAR_ROLES, AUTONOMY_DEFAULT_BUDGET, AUTONOMY_KEY, AUTONOMY_WIKI_PATH, type AutonomyBudget, autonomyAvatarPrompt, autonomyResponderInstructions, autonomyReviewerInstructions,
   autonomyWikiPage, organizationCoordinatorPrompt, type AutonomyScope, type ProjectAutonomy,
@@ -28,7 +29,8 @@ import { CapabilityError, NotFoundError } from './errors.js';
  * - **Wiki:** a `default` page saying there is no human — in the project's
  *   wiki, or the organization's for an organization (skipped when the
  *   organization already has one).
- * - **Co-ordinator:** a permanent co-ordinator draft holding the same authority.
+ * - **Co-ordinator:** the project's CEO (src/platform/ceo.ts): its untouched
+ *   draft is replaced by one holding the same authority as the Avatār.
  *
  * Idempotent: a project already set up returns what it has.
  */
@@ -72,15 +74,23 @@ export async function setUpAutonomy(
     const budgeted = await defaultBudget(store, tokens, token, projectId, organizationId, scope);
 
 
-    // The co-ordinator holds the same authority itself, and its budget (the
-    // default above) is the pool of everything it starts.
-    const coordinator = await api.createTask(token, {
-      projectId, draft: true, title: 'Co-ordinator',
-      prompt: scope === 'organization' ? organizationCoordinatorPrompt() : '',
-      authorization, credentialGrants: ['use-credential:*'],
-      params: { coordinator: { wakeHours: DEFAULT_COORDINATOR_WAKE_HOURS } },
-    });
-    created.push(coordinator.id);
+    // The co-ordinator is the project's CEO. One nobody has touched yet is
+    // replaced by one holding the same authority as the Avatār, with its budget
+    // (the default above) as the pool of everything it starts; one someone has
+    // already written to or started is theirs, and stays as it is.
+    const ceo = await ensureCeo(deps, projectId);
+    let coordinatorId = ceo.id, replaced: string | undefined;
+    if (untouchedCeoDraft(ceo)) {
+      const coordinator = await api.createTask(token, {
+        projectId, draft: true, title: ceoTitle(scope === 'organization' || project.coordinator ? 'organization' : 'project'),
+        prompt: scope === 'organization' ? organizationCoordinatorPrompt() : '',
+        authorization, credentialGrants: ['use-credential:*'],
+        params: { coordinator: { wakeHours: DEFAULT_COORDINATOR_WAKE_HOURS } },
+      });
+      created.push(coordinator.id);
+      coordinatorId = coordinator.id;
+      replaced = ceo.id;
+    }
 
     const wikiPage = await writeAutonomyPage(api, token, scope, scope === 'organization' ? organizationId : projectId, organizationId);
 
@@ -89,9 +99,13 @@ export async function setUpAutonomy(
     const reviewer: ConfirmLayer = { kind: 'agent', ...fork, prompt: autonomyReviewerInstructions(scope) };
     await store.setSettings(projectId, COMMON_SETTINGS_WORKFLOW, { ...common, responder, confirm: { layers: [reviewer] } });
     defaultsWritten = true;
-    const record: ProjectAutonomy = { scope, avatarTaskId: avatar.id, coordinatorTaskId: coordinator.id, wikiPage,
+    const record: ProjectAutonomy = { scope, avatarTaskId: avatar.id, coordinatorTaskId: coordinatorId, wikiPage,
       ...(budgeted ? { budget: budgeted } : {}), at: Date.now() };
     await store.kvSet(AUTONOMY_KEY(projectId), JSON.stringify(record));
+    if (replaced) {
+      await store.kvSet(CEO_KEY(projectId), coordinatorId);
+      await store.deleteTask(replaced).catch(() => undefined);
+    }
     return record;
   } catch (error) {
     if (budgetWritten) await store.setSettings(budgetWritten.scopeKey, 'payments', budgetWritten.previous).catch(() => undefined);

@@ -1846,7 +1846,11 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     for (const path of ['/api/organizations/org_personal/projects', '/api/projects']) {
       const name = path.includes('/organizations/') ? 'Fresh via organization route' : 'Fresh via legacy route';
       const project: any = await post(path, { name });
-      const tasks: any = await fetch(`${base}/api/projects/${project.id}/tasks`, { headers: auth() }).then((r) => r.json());
+      const all: any = await fetch(`${base}/api/projects/${project.id}/tasks`, { headers: auth() }).then((r) => r.json());
+      // Every project also has its CEO, a draft with nothing in it yet (wiki features/coordinator § CEOs).
+      expect(all.filter((task: any) => task.params?.coordinator).map((task: any) => ({ title: task.title, draft: task.params.draft, prompt: task.params.prompt })))
+        .toEqual([{ title: 'CEO (Project Co-ordinator)', draft: true, prompt: '' }]);
+      const tasks = all.filter((task: any) => !task.params?.coordinator);
       expect(tasks.map((task: any) => ({ title: task.title, template: task.params?.template, armed: task.params?.triggerState,
         confirm: task.params?.confirm })), `new project via ${path}`)
         .toEqual([{ title: 'Repair GitHub workflow {{workflow}}', template: 'repair-github-workflow', armed: 'armed',
@@ -1859,7 +1863,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       // Deleting it is respected: it is never installed again.
       expect((await fetch(`${base}/api/tasks/${tasks[0].id}`, { method: 'DELETE', headers: auth() })).status).toBe(200);
       await gateway.installDefaultTasks(project);
-      expect(await h.store.listTasks(project.id)).toEqual([]);
+      expect((await h.store.listTasks(project.id)).filter((task) => !task.params?.coordinator)).toEqual([]);
     }
     // Repositories tavya hosts run no GitHub workflows: nothing to repair (it
     // comes with the first failure once they move to GitHub).

@@ -87,3 +87,35 @@ Should you ever commit something yourself, open_pr(branch) opens that branch's p
 export function coordinatorCheckIn(setting: CoordinatorSetting): string {
   return `(Check-in: it has been ${wakeIntervalText(setting.wakeHours)} since you stopped. Review where the project stands, act on what changed, then end your turn.)`;
 }
+
+/**
+ * The CEO (wiki features/coordinator § CEOs): every project has a permanent
+ * co-ordinator, and every organization one in its own project, its CEO
+ * project. Each starts as a draft named for what it is, with no prompt, and
+ * runs once someone starts it — or, for an organization's, on its first Ask
+ * when the organization sends Ask there.
+ */
+export type CeoScope = 'organization' | 'project';
+/** The organization's own project, where its CEO (and its Asks) live. */
+export const CEO_PROJECT_NAME = 'CEO';
+/** What that project was called before it was the CEO project. */
+export const LEGACY_CEO_PROJECT_NAME = 'Co-ordinator';
+/** Project names (as slugs) only the CEO project may have. */
+export const RESERVED_PROJECT_SLUGS: readonly string[] = ['ceo', 'co-ordinator', 'coordinator'];
+export const ceoTitle = (scope: CeoScope): string =>
+  scope === 'organization' ? 'CEO (Organization Co-ordinator)' : 'CEO (Project Co-ordinator)';
+/** The project's CEO task, in the key-value store. */
+export const CEO_KEY = (projectId: string): string => `ceo:project:${projectId}`;
+
+/** Where the console's Ask goes in an organization: its CEO (`ceo`, the
+ * default), or a quick task without a computer for each question (`task`). */
+export type AskTarget = 'task' | 'ceo';
+export const ASK_TARGETS: readonly AskTarget[] = ['task', 'ceo'];
+/** Owner, 2026-11-25: Ask talks to the CEO unless the organization picks quick tasks. */
+export const DEFAULT_ASK_TARGET: AskTarget = 'ceo';
+/** Kept as `{ to }` in the organization's `ask` settings row: never `target`,
+ * which is a shared task default (the target branch) the store files elsewhere. */
+export const ASK_SETTINGS = 'ask';
+export function askTarget(settings: Record<string, unknown> | undefined): AskTarget {
+  return settings?.to === 'task' ? 'task' : settings?.to === 'ceo' ? 'ceo' : DEFAULT_ASK_TARGET;
+}

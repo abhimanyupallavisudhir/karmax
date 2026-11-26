@@ -614,12 +614,16 @@ async function main() {
   const coordinatorRevival = new AsyncInterval(() => api.reviveFailedCoordinators().then(() => undefined), 5 * 60_000);
   coordinatorRevival.unref();
   startupJobs.push(() => coordinatorRevival.run());
-  // Every organization has a co-ordinator project; those made before that get theirs here.
+  // Every organization has a CEO project, and every project a CEO (src/platform/ceo.ts);
+  // those made before that get theirs here.
   startupJobs.push(async () => {
-    for (const organization of await store.listOrganizations()) {
-      await store.ensureOrganizationCoordinatorProject(organization.id).catch((error) =>
-        console.warn(`  • Could not give ${organization.id} its co-ordinator project:`, error instanceof Error ? error.message : error));
-    }
+    const { ensureEveryCeo } = await import('./platform/ceo.js');
+    await ensureEveryCeo({ api, store, tokens });
+  });
+  // Every organization's wiki is a Git repository, published where tavya hosts repositories.
+  startupJobs.push(async () => {
+    const { ensureEveryOrganizationWiki } = await import('./wiki/organization-wiki.js');
+    await ensureEveryOrganizationWiki(store, paths().content);
   });
   // Reconcile missed notification close events without delaying the first API response.
   const inboxCleanup = new AsyncInterval(() => store.pruneStaleInbox().then(() => undefined), 3600_000);
