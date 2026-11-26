@@ -372,7 +372,9 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     });
     await post(`/api/tasks/${inherited.id}/signal`, { signal: 'confirm' });
     await poll(inherited.id, 'done');
-  });
+    // Two forks through Review and Done: twice the single-fork tests above,
+    // which take 21-27 s on a loaded CI shard (CI #2794, #2828, #3122 timed out at 30 s).
+  }, 90_000);
 
   it('CONTINUES (not forks) when a host-local install receives a raw session id', async () => {
     const b = await post(`/api/projects/${projectId}/tasks`, {

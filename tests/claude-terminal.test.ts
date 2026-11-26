@@ -574,6 +574,24 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     expect(failure.metadata.resetHint).toMatch(/^in \d+s$/);
   });
 
+  // auto-rubric#3: the SDK names only Opus and Sonnet; a Fable cap read as the
+  // login's week sent Fable turns back to logins with no Fable left.
+  it.each([
+    ['seven_day_fable', 'model', 'fable'],
+    ['seven_day_overage_included', 'weekly', undefined],
+    ['seven_day', 'weekly', undefined],
+  ])('classifies a rejected %s rate-limit event as a %s limit', async (rateLimitType, window, note) => {
+    sdkState.messages = [
+      { type: 'rate_limit_event', session_id: 's1',
+        rate_limit_info: { status: 'rejected', rateLimitType, resetsAt: Math.floor(Date.now() / 1000) + 120 } },
+      { type: 'result', subtype: 'success', is_error: false, session_id: 's1' },
+    ];
+    const failure = await new ClaudeAdapter().runTurn(input, ctx).catch((e) => e);
+    expect(failure).toBeInstanceOf(ProviderFailure);
+    expect(failure.metadata.window).toBe(window);
+    expect(failure.metadata.note).toBe(note);
+  });
+
   it('does not mistake unavailable paid overage for exhausted subscription quota', async () => {
     sdkState.messages = [
       {

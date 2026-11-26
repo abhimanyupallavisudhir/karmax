@@ -17,7 +17,7 @@ import { CodexAppServerClient } from './codex-app-server-client.js';
 import { localProviderCli } from './provider-cli.js';
 import { createCustodyEnv, killAgent } from './custody.js';
 import { BRAND } from '../domain/brand.js';
-import { ProviderFailure, ProviderOutage, providerFailure } from './limits.js';
+import { ProviderFailure, ProviderOutage, cappedModelWindow, providerFailure } from './limits.js';
 
 /**
  * Proactive quota (RESOLVE-PLAN §2 / #6). `claude -p '/usage'` prints a parseable
@@ -272,6 +272,36 @@ export function withLastReading(previous: UsageReading | undefined, fresh: Usage
   if (fresh.ok || !fresh.reason.startsWith('probe-failed') || !previous?.ok) return fresh;
   const { failedAt: _failedAt, failure: _failure, ...last } = previous;
   return { ...last, failedAt: fresh.at, failure: fresh.reason };
+}
+
+/** Cache a login's usage reading as `usage:<credential>` — what Settings shows
+ * and what a turn's lease reads for per-model caps (`cappedModelLogins`). */
+export async function cacheUsageReading(store: { kvGet(key: string): Promise<string | undefined | null>; kvSet(key: string, value: string): Promise<unknown> },
+  credential: string, reading: UsageResult): Promise<void> {
+  const raw = await store.kvGet(`usage:${credential}`).catch(() => undefined);
+  let previous: UsageReading | undefined;
+  try { previous = raw ? JSON.parse(raw) as UsageReading : undefined; } catch { previous = undefined; }
+  await store.kvSet(`usage:${credential}`, JSON.stringify(withLastReading(previous, reading)));
+}
+
+/** The logins among `credentials` whose last usage reading shows `model`'s own
+ * weekly cap full and not yet reset, with when each resets. Such a login
+ * still serves every other model, so nothing parks it; a turn of `model` just
+ * must not be sent there (each such turn fails in seconds, and a task tried
+ * every capped login again after each follow-up). */
+export async function cappedModelLogins(store: { kvGet(key: string): Promise<string | undefined | null> },
+  credentials: readonly string[], model: string, now: number): Promise<Map<string, number | undefined>> {
+  const capped = new Map<string, number | undefined>();
+  await Promise.all(credentials.map(async (credential) => {
+    const raw = await store.kvGet(`usage:${credential}`).catch(() => undefined);
+    if (!raw) return;
+    let reading: UsageReading;
+    try { reading = JSON.parse(raw) as UsageReading; } catch { return; }
+    const hit = cappedModelWindow(reading, model, now);
+    // A cap with no readable reset is trusted only while the reading is fresh.
+    if (hit && (hit.resetAt !== undefined || now - reading.at < USAGE_TTL_MS)) capped.set(credential, hit.resetAt);
+  }));
+  return capped;
 }
 
 /** A native quota probe authenticates through the same provider login used for

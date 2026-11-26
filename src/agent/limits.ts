@@ -121,10 +121,17 @@ export async function confirmSandboxFailure(
   err: SandboxProviderFailure,
   probe: () => Promise<UsageResult | undefined>,
   nowMs: number,
+  /** The turn's model: a full weekly cap of that model alone is a model limit
+   *  whatever window the sandbox named (Claude Code reports a Fable cap as an
+   *  unknown `rateLimitType`, read as weekly). */
+  model?: string,
+  /** The host's own reading, for whoever caches it. */
+  onReading?: (reading: UsageResult) => void | Promise<void>,
 ): Promise<Error> {
   const { classification, metadata } = classifyProviderTurnError(err.failure);
   if (!classification.limited || !metadata) return new Error(err.message, { cause: err.failure });
   const reading = await probe().catch(() => undefined);
+  if (reading) await Promise.resolve(onReading?.(reading)).catch(() => undefined);
   const inSeconds = (at?: number) => (at !== undefined && at > nowMs ? `in ${Math.ceil((at - nowMs) / 1000)}s` : undefined);
   if (classification.hard) {
     if (reading && !reading.ok && reading.reason === 'logged-out') return providerFailure(err.message, metadata);
@@ -135,16 +142,48 @@ export async function confirmSandboxFailure(
       + `${BRAND} just used it, so the provider refused this computer, not the login; ${BRAND} will keep retrying)`, { cause: err.failure });
   } else if (reading?.ok) {
     const full = (w?: { pct: number; resetAt?: number }) => !!w && w.pct >= 100;
-    const hit = metadata.window === 'model'
-      ? reading.models?.find((m) => full(m) && (!metadata.note || m.name.toLowerCase().includes(metadata.note.toLowerCase())))
+    const main = metadata.window === 'model' ? undefined
       : full(reading.session) ? reading.session : full(reading.week) ? reading.week : undefined;
+    const modelHit = main ? undefined
+      : (metadata.window === 'model' && metadata.note
+        ? reading.models?.find((m) => full(m) && modelWindowServes(m.name, metadata.note!))
+        : undefined)
+        ?? (model ? cappedModelWindow(reading, model, nowMs) : undefined)
+        ?? (metadata.window === 'model' && !metadata.note ? reading.models?.find(full) : undefined);
+    const hit = main ?? modelHit;
     if (hit) {
-      const window: LimitWindow = metadata.window === 'model' ? 'model' : hit === reading.week ? 'weekly' : '5h';
+      const window: LimitWindow = modelHit ? 'model' : hit === reading.week ? 'weekly' : '5h';
       const resetHint = inSeconds(hit.resetAt) ?? metadata.resetHint;
-      return providerFailure(err.message, { ...metadata, window, ...(resetHint ? { resetHint } : {}) });
+      // A model's cap leaves the login good for every other model: it stays
+      // with the turns of that model (classifyProviderTurnError).
+      return providerFailure(err.message, { ...metadata, window, ...(resetHint ? { resetHint } : {}),
+        ...(modelHit ? { note: modelWindowName(modelHit.name), scope: 'task' as const } : {}) });
     }
   }
   return providerFailure(err.message, { ...metadata, scope: 'task' });
+}
+
+/** A per-model usage window's model, as a model id would contain it:
+ * "Fable" → `fable`, "GPT-5.3-Codex-Spark (week)" → `gpt-5.3-codex-spark`. */
+function modelWindowName(name: string): string {
+  return name.replace(/\s*\([^)]*\)\s*$/, '').trim().toLowerCase().replace(/\s+/g, '-');
+}
+
+/** Whether a per-model window ("Fable", "Opus") limits the model `model`
+ * (`claude-fable-5-2`, the alias `fable`). */
+export function modelWindowServes(name: string, model: string): boolean {
+  const family = modelWindowName(name);
+  return !!family && model.toLowerCase().includes(family);
+}
+
+/** The full weekly window of `model` alone in a usage reading, if it has not
+ * reset yet: a login at 57% of its week can be at 100% of its Fable week, and
+ * then every Fable turn on it fails within seconds. */
+export function cappedModelWindow(reading: UsageResult | undefined, model: string, nowMs: number):
+  { name: string; pct: number; resetAt?: number } | undefined {
+  if (!reading?.ok) return undefined;
+  return reading.models?.find((m) => m.pct >= 100 && (m.resetAt === undefined || m.resetAt > nowMs)
+    && modelWindowServes(m.name, model));
 }
 
 /** The agent's harness resumed work after karmax had closed its input stream —
@@ -531,7 +570,8 @@ export function classifyLimitError(message: string, options: LimitClassifierOpti
   } else if (/session limit|5-?hour/.test(lc)) {
     window = '5h';
   } else {
-    const modelLimit = lc.match(/\b(opus|sonnet|haiku)\b[^.]*limit/);
+    // Replayed (legacy) messages keep the names they were read with.
+    const modelLimit = lc.match(options.legacy ? /\b(opus|sonnet|haiku)\b[^.]*limit/ : /\b(opus|sonnet|haiku|fable)\b[^.]*limit/);
     if (modelLimit) {
       window = 'model';
       note = modelLimit[1];
@@ -649,6 +689,10 @@ export function classifyProviderTurnError(
   if (err instanceof ProviderOutage) return { classification: { limited: false } };
   if (err instanceof ProviderFailure) {
     const m = err.metadata;
+    // One model's cap is no limit of the login: other models' turns may use
+    // it, so it stays with this task, which avoids the login for its model
+    // until the reset and asks for another (wiki features/quota-scheduling).
+    const modelOnly = m.window === 'model' && m.permanence !== 'hard';
     return {
       classification: {
         limited: true,
@@ -659,9 +703,9 @@ export function classifyProviderTurnError(
         resetHint: m.resetHint,
         note: m.note,
         diagnostic: m.diagnostic,
-        ...(m.scope === 'task' ? { taskScoped: true } : {}),
+        ...(m.scope === 'task' || modelOnly ? { taskScoped: true } : {}),
       },
-      metadata: m,
+      metadata: modelOnly && m.scope !== 'task' ? { ...m, scope: 'task' } : m,
     };
   }
   if (!(err instanceof ProviderStreamError)) return { classification: { limited: false } };
@@ -669,8 +713,9 @@ export function classifyProviderTurnError(
   const classification = classifyLimitError(message, { providerOrigin: true });
   if (!classification.limited) return { classification };
   const diagnostic = nativeProviderDiagnostic(message);
+  const modelOnly = classification.window === 'model' && !classification.hard;
   return {
-    classification,
+    classification: modelOnly ? { ...classification, taskScoped: true } : classification,
     metadata: {
       kind: classification.kind ?? 'quota',
       permanence: classification.hard ? 'hard' : 'transient',
@@ -680,6 +725,7 @@ export function classifyProviderTurnError(
       ...(classification.resetHint ? { resetHint: classification.resetHint } : {}),
       ...(classification.note ? { note: classification.note } : {}),
       ...(diagnostic ? { diagnostic } : {}),
+      ...(modelOnly ? { scope: 'task' as const } : {}),
     },
   };
 }

@@ -15,6 +15,8 @@ import {
   ProviderStreamError,
   SandboxProviderFailure,
   confirmSandboxFailure,
+  cappedModelWindow,
+  modelWindowServes,
   isNetworkEdgeBlock,
   ProviderOutage,
 } from '../src/agent/limits.js';
@@ -424,11 +426,50 @@ describe('confirmSandboxFailure (limits reported from inside a sandbox)', () => 
     }
   });
 
-  it('confirms a model-specific limit only against that model window', async () => {
+  it('confirms a model-specific limit only against that model window, and never parks the login on it', async () => {
     const model = providerFailure('Opus limit reached', { kind: 'quota', permanence: 'transient', provider: 'claude', source: 'structured', window: 'model', note: 'opus' });
     const hit = snapshot(10, 10, { models: [{ name: 'Opus', pct: 100, resetLabel: 'Mon', resetAt: now + 7_200_000 }] });
-    expect(classifyProviderTurnError(await confirmSandboxFailure(new SandboxProviderFailure(model), async () => hit, now)).metadata?.scope).toBeUndefined();
-    expect(classifyProviderTurnError(await confirmSandboxFailure(new SandboxProviderFailure(model), async () => snapshot(10, 10), now)).metadata?.scope).toBe('task');
+    const confirmed = classifyProviderTurnError(await confirmSandboxFailure(new SandboxProviderFailure(model), async () => hit, now));
+    // Confirmed (the reading's reset), yet the login still serves other models:
+    // the task avoids it for this model, the coordinator does not park it.
+    expect(confirmed.classification).toMatchObject({ limited: true, window: 'model', note: 'opus', resetHint: 'in 7200s', taskScoped: true });
+    expect(confirmed.metadata?.scope).toBe('task');
+    const unconfirmed = classifyProviderTurnError(await confirmSandboxFailure(new SandboxProviderFailure(model), async () => snapshot(10, 10), now));
+    expect(unconfirmed.metadata?.scope).toBe('task');
+    expect(unconfirmed.classification.resetHint).toBeUndefined();
+  });
+
+  // auto-rubric#3: Claude Code reports a Fable cap with a rate-limit type the SDK
+  // does not name, so it arrives as the login's weekly limit while the login's
+  // week is at 57-66%. The turn's model finds the cap that refused it.
+  it('reads a full cap of the turn model as a model limit whatever window the sandbox named', async () => {
+    const weekly = providerFailure('Claude usage limit reached', { kind: 'quota', permanence: 'transient', provider: 'claude',
+      source: 'structured', window: 'weekly', resetHint: 'in 54023s' });
+    const reading = snapshot(0, 66, { models: [{ name: 'Fable', pct: 100, resetLabel: 'Nov 26, 12pm', resetAt: now + 36_000_000 }] });
+    const seen: unknown[] = [];
+    const fable = classifyProviderTurnError(await confirmSandboxFailure(new SandboxProviderFailure(weekly), async () => reading, now,
+      'claude-fable-5-2', (r) => { seen.push(r); }));
+    expect(fable.classification).toMatchObject({ limited: true, window: 'model', note: 'fable', resetHint: 'in 36000s', taskScoped: true });
+    expect(seen).toEqual([reading]);
+    // Another model's turn on that login was not refused by the Fable cap.
+    const opus = classifyProviderTurnError(await confirmSandboxFailure(new SandboxProviderFailure(weekly), async () => reading, now, 'claude-opus-5-5'));
+    expect(opus.classification).toMatchObject({ limited: true, window: 'weekly', resetHint: 'in 54023s', taskScoped: true });
+  });
+
+  it('matches per-model windows to model ids and aliases', () => {
+    const reading = snapshot(0, 50, { models: [{ name: 'Fable', pct: 100, resetLabel: 'Mon', resetAt: now + 1000 }] });
+    expect(cappedModelWindow(reading, 'claude-fable-5-2', now)?.name).toBe('Fable');
+    expect(cappedModelWindow(reading, 'fable', now)?.name).toBe('Fable');
+    expect(cappedModelWindow(reading, 'claude-opus-5-5', now)).toBeUndefined();
+    expect(cappedModelWindow(reading, 'claude-fable-5-2', now + 2000)).toBeUndefined(); // reset since
+    expect(modelWindowServes('GPT-5.3-Codex-Spark (week)', 'gpt-5.3-codex-spark')).toBe(true);
+  });
+
+  it('keeps a host-side model limit with the task: the login serves other models', () => {
+    const { classification, metadata } = classifyProviderTurnError(providerFailure('Claude usage limit reached', {
+      kind: 'quota', permanence: 'transient', provider: 'claude', source: 'structured', window: 'model', note: 'fable' }));
+    expect(classification).toMatchObject({ limited: true, window: 'model', taskScoped: true });
+    expect(metadata?.scope).toBe('task');
   });
 
   it('flags a hard credential failure only when the host sees the login signed out', async () => {

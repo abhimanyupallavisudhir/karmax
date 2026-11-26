@@ -1092,9 +1092,13 @@ export class ClaudeAdapter implements AgentAdapter {
             || info?.isUsingOverage === true || info?.overageInUse === true;
           if (info?.status === 'rejected' && !overageUsable) {
             const kind = String(info.rateLimitType ?? 'five_hour');
+            // `seven_day_<model>` is that model's own week, whichever model it is:
+            // the SDK names only Opus and Sonnet, and a Fable cap read as the
+            // login's week used to send Fable turns back to capped logins.
+            const modelWeek = /^seven_day_(?!overage|oauth)[a-z]+$/.test(kind);
             const window = kind === 'five_hour' || kind === 'overage'
               ? '5h'
-              : /^seven_day_(?:opus|sonnet)$/.test(kind) ? 'model' : 'weekly';
+              : modelWeek ? 'model' : 'weekly';
             const reset = Number(info.resetsAt);
             const resetMs = Number.isFinite(reset) ? (reset < 1_000_000_000_000 ? reset * 1000 : reset) : 0;
             const seconds = resetMs > Date.now() ? Math.ceil((resetMs - Date.now()) / 1000) : 0;
