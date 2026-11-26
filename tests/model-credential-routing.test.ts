@@ -48,6 +48,43 @@ describe('model-agnostic harness credential routing', () => {
     }
   });
 
+  // auto-rubric#3 (2026-11-26): three logins at 57-66% of their week but 100%
+  // of their Fable week refused every Fable turn in seconds, one after another,
+  // on every follow-up, before the fourth (Fable left) ran it.
+  it('leaves out logins whose usage shows the turn model\'s own weekly cap full', async () => {
+    const organization = await store.createOrganization({ name: 'Fable caps' });
+    const project = await store.createProject('Rubrics', {}, organization.id);
+    const configHomes = new ConfigHomeManager(path.join(dir, 'homes'));
+    const logins = ['personal', 'old', 'redwood'].map((account) => {
+      const home = configHomes.ensure('claude', account, organization.id);
+      fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'fixture-token' } }));
+      return `login:${organization.id}:claude:${account}`;
+    });
+    await store.kvSet(credPolicyKey.organization(organization.id), JSON.stringify({ order: logins }));
+    const now = Date.now();
+    const usage = (fable: number, resetIn: number) => JSON.stringify({ ok: true, at: now - 60_000,
+      week: { pct: 60, resetLabel: 'Nov 30, 3am', resetAt: now + 4 * 86_400_000 },
+      models: [{ name: 'Fable', pct: fable, resetLabel: 'Nov 30, 2:59am', resetAt: now + resetIn }] });
+    await store.kvSet(`usage:${logins[0]}`, usage(100, 9 * 3_600_000));
+    await store.kvSet(`usage:${logins[1]}`, usage(100, 3 * 3_600_000));
+    await store.kvSet(`usage:${logins[2]}`, usage(40, 5 * 86_400_000));
+    const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
+      profiles: new ProfileResolver(store, 'claude'), configHomes });
+    const order = (model: string) => core.resolveCredentialOrder({ taskId: 'fable-task', projectId: project.id, provider: 'claude', role: 'do',
+      task: { projectId: project.id, agents: { do: { provider: 'claude', model } } } as any });
+
+    expect(await order('claude-fable-5-2')).toEqual([logins[2]]);
+    // The capped logins still serve every other model.
+    expect(await order('claude-opus-5-5')).toEqual(logins);
+    // Every login capped: only the one whose cap resets first, so the turn's
+    // refusal makes the task wait for that reset instead of trying each in turn.
+    await store.kvSet(`usage:${logins[2]}`, usage(100, 5 * 86_400_000));
+    expect(await order('claude-fable-5-2')).toEqual([logins[1]]);
+    // A cap that has reset since the reading no longer counts.
+    await store.kvSet(`usage:${logins[0]}`, usage(100, -60_000));
+    expect(await order('claude-fable-5-2')).toEqual([logins[0]]);
+  });
+
   it('uses model prefixes when clear and Credentials precedence when ambiguous', async () => {
     const organization = (await store.createOrganization({ name: 'Design' }));
     const project = (await store.createProject('Site', {}, organization.id));

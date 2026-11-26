@@ -36,7 +36,7 @@ import { accountKey, dequeue, enqueue, wakeFullKey } from '../world/compute-queu
 import { MachineQueued, leaseWaitDeadline } from '../world/machine-wait.js';
 import { SetupClock } from '../world/setup-clock.js';
 import { AgentChannelLost, AgentToolsUnavailable, toolsUnavailableActivity, toolsUnavailableNotice, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
-import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
+import { cacheUsageReading, cappedModelLogins, probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { clearBranchUnpublished, markBranchUnpublished, markCheckpointStale } from '../world/checkpoint-staleness.js';
 import { usageAdmissionId as admissionIdFor } from '../domain/turn-admission.js';
 import { hostStats, hostMemoryTight } from './agent-slots.js';
@@ -45,7 +45,7 @@ import { WorldRegistry } from '../world/registry.js';
 import { WorldBusy } from '../world/shared-coordination.js';
 import { World, WorldHandle, WorldKind, WorldSpec, type WorldRepo, worldWorkingDirectory, type WorldDiagnosis } from '../world/types.js';
 import { finalizeMerge, MergeResult } from '../world/merge.js';
-import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
+import { applyAgentSpec, defaultModel, ProfileResolver } from '../agent/profiles.js';
 import { INCLUDED_MODEL_MIN_MICROS, INCLUDED_MODEL_OPTIONS, includedModelKey, includedModelOutOfCredit, syncIncludedModelUsage } from '../agent/included-model.js';
 import { creditRail, issueGatewayToken, openRouterTurnAuth, proxyRoot, proxyTurnAuth, revokeGatewayToken, type CreditRail } from '../agent/model-gateways.js';
 import {
@@ -2992,6 +2992,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
       const keys = ordered.map((c) => c.key);
+      // A login whose usage shows this model's own weekly cap full serves other
+      // models, not this one: leave it out until the cap resets. When every one
+      // is capped, offer only the one that resets first: the turn's refusal
+      // makes the task wait for that reset (avoiding, in the workflow) rather
+      // than try each capped login in turn (auto-rubric#3: three Fable-capped
+      // logins refused every follow-up before the one with Fable left ran it).
+      const model = profile ? profile.model ?? defaultModel(profile.provider) : undefined;
+      if (model && keys.length) {
+        const capped = await cappedModelLogins(store, keys, model, Date.now());
+        if (capped.size) {
+          const open = keys.filter((key) => !capped.has(key));
+          if (open.length) return open;
+          return [[...capped].sort(([, a], [, b]) => (a ?? Infinity) - (b ?? Infinity))[0]![0]];
+        }
+      }
       // A model the credit pays for needs no credential of the organization's
       // own: the included model (wiki features/included-model), whose key the
       // turn makes itself, or Claude Code / Codex through a model gateway
@@ -4559,7 +4574,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             ? { provider: profile.provider, configHome: resolvedAuth.configHome } : undefined;
           const probe = deps.probeUsage ?? (({ provider, configHome }) => provider === 'codex'
             ? probeCodexUsage({ configHome }) : probeClaudeUsage({ configHome }));
-          turnError = await confirmSandboxFailure(err, async () => (login ? probe(login) : undefined), Date.now());
+          // The reading is the freshest there is: every task's next lease reads
+          // it (resolveCredentialOrder skips a login whose cap covers its model).
+          const account = schedulingAccount;
+          turnError = await confirmSandboxFailure(err, async () => (login ? probe(login) : undefined), Date.now(),
+            profile.model ?? defaultModel(profile.provider), account ? (reading) => cacheUsageReading(store, account, reading) : undefined);
         }
         // On the credit, a turn that stopped because the credit ran out (its
         // OpenRouter key's limit, or the gateway proxy's refusal) waits for

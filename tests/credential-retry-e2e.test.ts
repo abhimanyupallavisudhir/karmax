@@ -302,6 +302,74 @@ describe('credential Retry end to end', () => {
     }
   }, 90_000);
 
+  // auto-rubric#3 (2026-11-26): three logins at 57-66% of their week but 100% of
+  // their Fable week. Claude Code reported each refusal as a weekly limit, the
+  // host saw the week open, so it stayed task-scoped and was forgotten: every
+  // follow-up tried every capped login again before the one with Fable left.
+  it('learns a full model cap from the host reading: later turns of that model skip the login, others still use it', async () => {
+    const coordinator = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+    const spare = homes.ensure('claude', 'fable-left');
+    fs.writeFileSync(path.join(spare, 'karmax-oauth.json'), JSON.stringify({ token: 'fable-left-setup-token' }));
+    await coordinator.registerAccounts([
+      { id: accountId, provider: 'claude', kind: 'login', configHome: home, maxConcurrent: 1 },
+      { id: 'login:claude:fable-left', provider: 'claude', kind: 'login', configHome: spare, maxConcurrent: 1 },
+    ]);
+    await coordinator.setAccountAvailability({ accountId, status: 'available' });
+    await h.store.kvDelete(`usage:${accountId}`);
+    healthy = true;
+    const fableReset = Date.now() + 36_000_000;
+    hostUsage = { ok: true, at: Date.now(), week: { pct: 66, resetLabel: 'Nov 26, 12pm', resetAt: fableReset },
+      models: [{ name: 'Fable', pct: 100, resetLabel: 'Nov 26, 12pm', resetAt: fableReset }] };
+    sandboxLimit = { window: 'weekly', resetHint: 'in 36000s' };
+    sandboxFirstLoginOnly = true;
+    sandboxFailedHome = undefined;
+    sandboxQuotaFailures = 1;
+    homesUsed.length = 0;
+    const run = async (name: string, model: string) => {
+      const repo = await h.makeRepo(`model-cap-${name}`);
+      const project = (await h.store.createProject(`Model cap ${name}`, { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false }));
+      const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
+      const task = await h.api.createTask(token, { projectId: project.id, title: `Model cap ${name}`,
+        prompt: `@write ${name}.txt :: ${name}\n@run git add ${name}.txt && git commit -m ${name}\n@review ${name}`,
+        params: { 'agent:do': { provider: 'claude', model } },
+      });
+      const view = () => h.client.workflow.getHandle(task.id).query('view') as Promise<any>;
+      await expect.poll(async () => (await view()).stage, { timeout: 30_000 }).toBe('review');
+      await h.api.signalTask(token, task.id, 'cancel');
+    };
+    try {
+      const before = turns;
+      await run('fable-first', 'claude-fable-5-2');
+      expect(turns).toBe(before + 2);
+      expect(homesUsed[0]).toBe(home);
+      expect(homesUsed[1]).toBe(spare);
+      // A model's cap is not the login's: nothing parks it.
+      expect(await status(accountId)).toBe('available');
+      // The host's reading is cached for every task's next lease.
+      expect(JSON.parse((await h.store.kvGet(`usage:${accountId}`))!)).toMatchObject({ models: [{ name: 'Fable', pct: 100 }] });
+
+      // The next Fable task goes straight to the login with Fable left.
+      sandboxQuotaFailures = 0;
+      homesUsed.length = 0;
+      await run('fable-next', 'claude-fable-5-2');
+      expect(homesUsed).toEqual([spare]);
+
+      // An Opus task may still use the capped login.
+      await coordinator.setAccountAvailability({ accountId: 'login:claude:fable-left', status: 'manual-off' });
+      homesUsed.length = 0;
+      await run('opus', 'claude-opus-5-5');
+      expect(homesUsed).toEqual([home]);
+    } finally {
+      sandboxLimit = { window: '5h', resetHint: 'in 2s' };
+      sandboxFirstLoginOnly = false;
+      sandboxQuotaFailures = 0;
+      hostUsage = undefined;
+      await h.store.kvDelete(`usage:${accountId}`);
+      await coordinator.registerAccounts([{ id: accountId, provider: 'claude', kind: 'login', configHome: home, maxConcurrent: 1 }]);
+      await homes.remove('claude', 'fable-left');
+    }
+  }, 120_000);
+
   it('parks the login when the host confirms a sandbox-reported limit', async () => {
     const coordinator = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
     await coordinator.setAccountAvailability({ accountId, status: 'available' });
