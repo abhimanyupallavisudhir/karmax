@@ -54,7 +54,7 @@ export const PLATFORM_API_CATALOG = {
   connections: [
     'GET /api/connections (own accounts for humans; explicitly shared task/project accounts for agents; ?taskId= requests list the viewer\'s reusable accounts)',
     'GET /api/connections/catalog?search=',
-    'POST /api/connections/request (task agents with connection:use; body {mcp|toolkit, why}: mcp is an MCP Registry name or public HTTPS URL of a remote server, toolkit a Composio slug; task resumes once the owner allows an existing account or signs in)',
+    'POST /api/connections/request (task agents with connection:use; body {mcp|toolkit|reconnect, why}: mcp is an MCP Registry name or public HTTPS URL of a remote server, toolkit a Composio slug, reconnect the id of a connection the task uses that its owner should sign in again (a missing permission); task resumes once the owner allows an existing account or signs in)',
     'POST /api/connections/connect (verified owner; body {toolkit|id,label?,useConnectionId?,ownerProjectId?}; useConnectionId grants an existing account to the request\'s task without another sign-in; ownerProjectId makes it — or a request of that project\'s task — the project\'s own account: project:settings:write, agents included)',
     'POST /api/connections/:id/refresh', 'POST /api/connections/:id/disconnect (owner; a project\'s account or a request of its task: project:settings:write of that project)', 'POST /api/connections/:id/dismiss (silences an open request without answering it; not by the requesting task)', 'POST /api/connections/:id/callback (verified owner; body {state, code}; finishes a native MCP sign-in)',
     'PUT /api/connections/:id/access (verified owner; body {projectIds}; project settings authority required)',

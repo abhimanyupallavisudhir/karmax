@@ -50,6 +50,15 @@ export interface ServiceConnection {
   /** Set on a task grant: the owner's existing connection it uses. A grant
    * holds no provider account; revoking it never touches the account. */
   grantedConnectionId?: string;
+  /** A sign-in again of this existing account (its id), asked by a task
+   * (`requestReconnect`) or started by its owner: it signs in here, apart, and
+   * once it completes the account takes its credentials (`adopt`), keeping its
+   * id, grants and sharing; until then the account works as before. A task's
+   * then becomes its grant of the account; its owner's own is forgotten. */
+  reconnects?: string;
+  /** Provider accounts a newer sign-in replaced that the provider could not
+   * sign out yet: `reconcile` retries. */
+  retiring?: string[];
   /** A native MCP server account (instead of a Composio toolkit). Its OAuth
    * credentials stay in the vault; the gateway calls the server for the task. */
   mcp?: McpServer;
@@ -245,14 +254,15 @@ export class ServiceConnections {
         (await this.store.appendEvent({ taskId: c.taskId!, type, ts: c.updatedAt, payload: { requestId: c.id, ...payload } }));
       // A paid tool (Composio Instant) is usable at once: nobody is asked.
       if (!before) { if (!c.instant) (await announce('connection.requested', { connectionId: c.id, toolkit: c.toolkit, ...(c.why ? { why: c.why } : {}),
-        ...(c.via ? { via: c.via } : {}) })); }
+        ...(c.via ? { via: c.via } : {}), ...(c.reconnects ? { reconnects: c.reconnects } : {}), ...(c.audience ? { audience: c.audience } : {}),
+        ...(c.ownerProjectId ? { ownerProjectId: c.ownerProjectId } : {}) })); }
       else if (before.status !== c.status) (await announce('connection.updated', { connectionId: c.id, status: c.status }));
       if (c.dismissed && !before?.dismissed) (await announce('connection.dismissed', {}));
       return c;
     });
   }
   view(c: ServiceConnection) {
-    const { accountId, sessionId, notifiedAt, ...view } = c;
+    const { accountId, sessionId, notifiedAt, retiring, ...view } = c;
     return { ...view, ...(c.status === 'disconnected' && accountId ? { disconnectPending: true } : {}) };
   }
   /** Whose account it is: `project:<id>` or `user:<id>`. */
@@ -350,6 +360,83 @@ export class ServiceConnections {
       taskId, role, why: why.slice(0, 2000), projectIds: [], status: 'requested', createdAt: Date.now(), updatedAt: Date.now(),
       ...(via ? { via } : {}) })));
   }
+  /**
+   * A task asks for an account it can use to be signed in again: it lacks a
+   * permission, or the provider no longer honours it. Only a fresh sign-in can
+   * change what the provider granted, so it is never answered with an existing
+   * account; it asks whoever the account is (its owner, or the project's
+   * maintainers), and the account stays usable until the new sign-in completes.
+   */
+  async requestReconnect(org: string, connectionId: string, taskId: string, projectId: string, role: string, why: string, via?: Via) {
+    const used = (await this.get(org, connectionId));
+    if (!this.canUse(used, await this.taskChain(taskId), projectId)) throw new ConnectionError('This account has not been shared with this task or project', 403);
+    const account = used.grantedConnectionId ? (await this.get(org, used.grantedConnectionId)) : used;
+    if (account.instant) throw new ConnectionError('A paid tool has no account to sign in again', 409);
+    if (!['active', 'expired'].includes(account.status) || (!account.ownerId && !account.ownerProjectId))
+      throw new ConnectionError(`This account is ${account.status}: ask for the app again with request_connection (mcp or toolkit), not reconnect`, 409);
+    return this.store.transaction(async () => {
+      (await this.store.lock(`service-connections:${org}:${taskId}`));
+      const open = (await this.all()).find(c => c.organizationId === org && c.taskId === taskId && c.reconnects === account.id && OPEN.includes(c.status));
+      if (open) return open;
+      return this.save({ id: newId('conn'), organizationId: org, toolkit: account.toolkit, label: account.label,
+        ...(account.mcp ? { mcp: { ...account.mcp, githubAccountId: undefined } } : {}),
+        ...(account.ownerProjectId ? { ownerProjectId: account.ownerProjectId, projectIds: [account.ownerProjectId] }
+          : { ownerId: account.ownerId, projectIds: [], audience: [`user:${account.ownerId}`] }),
+        taskId, role, why: why.slice(0, 2000), reconnects: account.id, status: 'requested', createdAt: Date.now(), updatedAt: Date.now(),
+        ...(via ? { via } : {}) });
+    });
+  }
+  /**
+   * A sign-in again has completed: the account it signs in takes its
+   * credentials, and the provider account they replace is signed out. A task's
+   * request becomes its grant of the account; its owner's own sign-in is
+   * forgotten. Returns the account. An account disconnected meanwhile is not
+   * revived: the sign-in stays an account of its own.
+   */
+  private async adopt(r: ServiceConnection): Promise<ServiceConnection> {
+    return this.locked(r.reconnects!, async () => {
+      const account = await this.get(r.organizationId, r.reconnects!).catch(() => undefined);
+      if (!account || ['disconnected', 'denied'].includes(account.status) || account.ownerId !== r.ownerId || account.ownerProjectId !== r.ownerProjectId) {
+        r.reconnects = undefined; (await this.save(r));
+        return r;
+      }
+      const replaced = account.accountId !== r.accountId ? account.accountId : undefined;
+      if (r.mcp) {
+        // Copy before the account's revision changes: a refresh of the old
+        // credentials racing this one is then refused (vault.refresh).
+        if (r.mcp.auth !== 'none' && r.mcp.auth !== 'github')
+          (await this.broker.registerHandle(MCP_CREDENTIALS + account.id, JSON.stringify(await this.vault.secret(this.target(r))), organizationScope(account.organizationId)));
+        account.mcp = { ...account.mcp!, githubAccountId: r.mcp.githubAccountId };
+        if (r.signedInBy) account.signedInBy = r.signedInBy;
+      } else Object.assign(account, { accountId: r.accountId, sessionId: r.sessionId });
+      if (account.status !== 'active') account.notifiedAt = undefined;
+      Object.assign(account, { status: 'active', revision: crypto.randomUUID() });
+      if (replaced) account.retiring = [...(account.retiring ?? []), replaced];
+      (await this.save(account));
+      (await this.audit(account, r.signedInBy ?? r.ownerId ?? this.actor(r), 'reconnected'));
+      (await this.broker.deleteHandle(PREFIX + r.id)); (await this.broker.deleteHandle(MCP_CREDENTIALS + r.id));
+      if (r.taskId) {
+        Object.assign(r, { grantedConnectionId: account.id, label: account.label, accountId: undefined, sessionId: undefined, status: 'active' });
+        (await this.save(r));
+      } else (await this.store.kvDelete(PREFIX + r.id));
+      await this.retire(account).catch(() => { /* reconcile retries */ });
+      return r.taskId ? r : account;
+    });
+  }
+  /** A connection whose sign-in just completed: a sign-in again moves onto its account. */
+  private async signedIn(c: ServiceConnection) {
+    return c.reconnects && c.status === 'active' && !c.grantedConnectionId ? this.adopt(c) : c;
+  }
+  /** Sign out, at the provider, the accounts a newer sign-in replaced. */
+  private async retire(account: ServiceConnection) {
+    for (const old of [...(account.retiring ?? [])]) {
+      await this.remote(async () => (await this.backend()).disconnect(old));
+      const current = (await this.get(account.organizationId, account.id));
+      current.retiring = (current.retiring ?? []).filter(id => id !== old);
+      if (!current.retiring.length) delete current.retiring;
+      (await this.save(current));
+    }
+  }
   private slug(value: string) { if (!/^[a-z][a-z0-9_]{0,79}$/.test(value)) throw new ConnectionError('Invalid app identifier'); }
   private sameApp(a: ServiceConnection, b: ServiceConnection) { return a.mcp ? a.mcp.url === b.mcp?.url : !b.mcp && a.toolkit === b.toolkit; }
   /** An account the person connected themselves, rather than a grant of one. */
@@ -366,7 +453,13 @@ export class ServiceConnections {
    * which any of its maintainers — checked by the gateway — may connect,
    * people and agents alike.
    */
-  async connect(org: string, ownerId: string | undefined, input: { id?: string; toolkit?: string; label?: string; restart?: boolean; useConnectionId?: string; redirect?: string; ownerProjectId?: string }) {
+  async connect(org: string, ownerId: string | undefined, input: { id?: string; toolkit?: string; label?: string; restart?: boolean; useConnectionId?: string; redirect?: string; ownerProjectId?: string }): Promise<{ connection: ReturnType<ServiceConnections['view']>; url?: string; callback?: 'mcp' | 'github' }> {
+    const result = await this.signIn(org, ownerId, input);
+    // Signing an account in again goes on outside the account's lock: a sign-in
+    // that completes at once moves onto the account, which takes that lock.
+    return 'again' in result ? this.connect(org, ownerId, { id: result.again, restart: result.restart, redirect: input.redirect }) : result;
+  }
+  private async signIn(org: string, ownerId: string | undefined, input: { id?: string; toolkit?: string; label?: string; restart?: boolean; useConnectionId?: string; redirect?: string; ownerProjectId?: string }) {
     return this.locked(input.id ?? `${org}:${input.ownerProjectId ? `project:${input.ownerProjectId}` : ownerId}:${input.toolkit}`, async () => {
       let c = input.id ? (await this.get(org, input.id)) : undefined;
       const project = input.ownerProjectId ?? c?.ownerProjectId;
@@ -381,10 +474,20 @@ export class ServiceConnections {
         if (!ownerId) throw new ConnectionError('Sign in as a person to connect your own account', 403);
         if (c?.ownerId && c.ownerId !== ownerId) throw new ConnectionError('This connection belongs to another person', 403);
       }
+      // Signing an account in again happens apart, so it keeps working until the new sign-in completes.
+      if (c?.status === 'active' && input.restart && !c.grantedConnectionId && !c.instant && !c.reconnects) {
+        const open = (await this.all()).find(r => r.organizationId === org && r.reconnects === c!.id && !r.taskId && OPEN.includes(r.status));
+        const r = open ?? (await this.save({ id: newId('conn'), organizationId: org, toolkit: c.toolkit, label: c.label,
+          ...(c.mcp ? { mcp: { ...c.mcp, githubAccountId: undefined } } : {}),
+          ...(c.ownerProjectId ? { ownerProjectId: c.ownerProjectId, projectIds: [c.ownerProjectId] } : { ownerId: c.ownerId, projectIds: [] }),
+          reconnects: c.id, status: 'requested', createdAt: Date.now(), updatedAt: Date.now() }));
+        return { again: r.id, restart: !!open };
+      }
       if (c?.status === 'active') return { connection: this.view(c) };
       if (c && project) Object.assign(c, { ownerProjectId: project, projectIds: [project], ownerId: undefined });
       if (input.useConnectionId && ownerId) {
         if (!c?.taskId) throw new ConnectionError('Only a task request can use an existing account');
+        if (c.reconnects) throw new ConnectionError('Only a new sign-in can change what the account allows: sign in again');
         const account = (await this.get(org, input.useConnectionId));
         if (account.ownerId !== ownerId) throw new ConnectionError('This connection belongs to another person', 403);
         if (!this.sameApp(c, account) || !this.isAccount(account)) throw new ConnectionError('That account is not connected for this app');
@@ -404,7 +507,7 @@ export class ServiceConnections {
         c.sessionId = await this.remote(async () => (await this.backend()).session((await this.user(c!)), toolkit, c!.accountId!));
         c.status = 'active'; c.notifiedAt = undefined;
         (await this.broker.deleteHandle(PREFIX + c.id)); (await this.save(c));
-        return { connection: this.view(c) };
+        return { connection: this.view(await this.signedIn(c)) };
       }
       if (!input.restart && c?.status === 'connecting' && Date.now() - c.updatedAt < TTL && await this.broker.hasHandle(PREFIX + c.id))
         return { connection: this.view(c), url: await this.broker.resolve(PREFIX + c.id, { caps: [`use-credential:${PREFIX + c.id}`] }) };
@@ -436,14 +539,14 @@ export class ServiceConnections {
   private async connectMcp(c: ServiceConnection, ownerId: string | undefined, redirect?: string) {
     Object.assign(c, { ...(c.ownerProjectId ? { signedInBy: ownerId } : { ownerId }), grantedConnectionId: undefined, revision: crypto.randomUUID(), notifiedAt: undefined });
     (await this.broker.deleteHandle(MCP_CREDENTIALS + c.id));
-    if (c.mcp!.auth === 'none') { c.status = 'active'; (await this.save(c)); (await this.audit(c, ownerId ?? this.actor(c), 'connected')); return { connection: this.view(c) }; }
+    if (c.mcp!.auth === 'none') { c.status = 'active'; (await this.save(c)); (await this.audit(c, ownerId ?? this.actor(c), 'connected')); return { connection: this.view(await this.signedIn(c)) }; }
     // Requests recorded before GitHub sign-in existed say `oauth`, which GitHub cannot serve.
     if (c.mcp!.auth === 'oauth' && await authorizesWithGitHub(c.mcp!)) c.mcp!.auth = 'github';
     if (c.mcp!.auth === 'github') {
       if (!this.github) throw new ConnectionError('GitHub sign-in is not set up on this installation. Ask its administrator to set up the GitHub App.', 503);
       if (!ownerId) throw new ConnectionError('GitHub sign-in needs a person: ask a project maintainer to connect it', 403);
       c.mcp!.githubAccountId = undefined;
-      if (await this.signedInWithGitHub(c)) return { connection: this.view(c) };
+      if (await this.signedInWithGitHub(c)) return { connection: this.view(await this.signedIn(c)) };
       c.status = 'connecting'; (await this.save(c));
       try { return { connection: this.view(c), url: await this.github.authorizationUrl(c.organizationId, ownerId), callback: 'github' as const }; }
       catch (e) { throw new ConnectionError(e instanceof Error ? e.message : 'GitHub sign-in is unavailable', 503); }
@@ -476,7 +579,7 @@ export class ServiceConnections {
       catch (e) { throw new ConnectionError(e instanceof Error ? e.message : 'MCP authorization failed'); }
       c.status = 'active'; c.notifiedAt = undefined;
       (await this.save(c)); (await this.audit(c, ownerId ?? this.actor(c), 'connected'));
-      return this.view(c);
+      return this.view(await this.signedIn(c));
     });
   }
   async refresh(org: string, id: string) {
@@ -485,7 +588,7 @@ export class ServiceConnections {
       if (c.mcp) {
         // MCP sign-in completes only through its callback (or, for GitHub, the
         // owner's GitHub sign-in); abandoned sign-ins expire.
-        if (c.status === 'connecting' && c.mcp.auth === 'github' && this.githubUser(c) && await this.signedInWithGitHub(c)) return c;
+        if (c.status === 'connecting' && c.mcp.auth === 'github' && this.githubUser(c) && await this.signedInWithGitHub(c)) return this.signedIn(c);
         if (c.status === 'connecting' && Date.now() - c.updatedAt > TTL) { c.status = 'expired'; c.notifiedAt = undefined; (await this.save(c)); }
         return c;
       }
@@ -496,6 +599,7 @@ export class ServiceConnections {
         c.status = 'active'; c.notifiedAt = undefined;
         (await this.broker.deleteHandle(PREFIX + c.id));
         (await this.save(c));
+        return this.signedIn(c);
       } else if (!active && (c.status === 'active' || Date.now() - c.updatedAt > TTL)) {
         c.status = 'expired'; c.sessionId = undefined; c.notifiedAt = undefined;
         (await this.broker.deleteHandle(PREFIX + c.id)); (await this.save(c));
@@ -534,7 +638,8 @@ export class ServiceConnections {
       // Revoke local access first, even if upstream deletion is unavailable.
       if (!['disconnected', 'denied'].includes(c.status)) c.notifiedAt = undefined;
       // A project's account stays the project's, to reconnect.
-      c.status = c.ownerId || c.ownerProjectId ? 'disconnected' : 'denied'; c.projectIds = c.ownerProjectId ? [c.ownerProjectId] : []; c.sessionId = undefined;
+      // A declined request, a sign-in again among them, is denied; an account, disconnected.
+      c.status = (c.ownerId || c.ownerProjectId) && !(c.reconnects && !c.grantedConnectionId) ? 'disconnected' : 'denied'; c.projectIds = c.ownerProjectId ? [c.ownerProjectId] : []; c.sessionId = undefined;
       (await this.save(c)); (await this.broker.deleteHandle(PREFIX + id)); (await this.broker.deleteHandle(MCP_CREDENTIALS + id));
       for (const grant of (await this.all()).filter(g => g.grantedConnectionId === c.id && g.status !== 'disconnected'))
         (await this.save({ ...grant, status: 'disconnected', notifiedAt: undefined }));
@@ -588,7 +693,9 @@ export class ServiceConnections {
         throw new ConnectionError('Tool does not belong to this connection', 403);
       if (c.instant) return this.executeInstant(c, taskId, projectId, slug, args);
       if (!await timed('service.account-check.remote', () => this.remote(async () => (await this.backend()).active(c.accountId!, c.toolkit)))) {
-        c.status = 'expired'; c.sessionId = undefined; (await this.save(c));
+        // Unless a sign-in again replaced the account meanwhile (`adopt`).
+        const current = (await this.get(c.organizationId, c.id));
+        if (current.accountId === c.accountId) { current.status = 'expired'; current.sessionId = undefined; (await this.save(current)); }
         throw new ConnectionError(`Account access expired; reconnect it in ${c.ownerProjectId ? 'Project settings' : 'Settings'} → Connected apps`, 409);
       }
       // Membership may have changed while checking the provider account.
@@ -697,6 +804,14 @@ export class ServiceConnections {
         if (c.status === 'disconnected' && c.accountId && (c.ownerId || c.ownerProjectId)) {
           try { await this.disconnect(c.organizationId, c.id, c.ownerId); } catch { /* local revocation already succeeded; retry cleanup next sweep */ }
           current = (await this.get(c.organizationId, c.id));
+        }
+        // A sign-in again whose account did not take it yet, or old sign-ins the provider kept.
+        if (current.reconnects && current.status === 'active' && !current.grantedConnectionId) current = await this.adopt(current);
+        if (current.retiring?.length) await this.retire(current);
+        // An owner's own sign-in again that never completed leaves nothing behind.
+        if (current.reconnects && !current.taskId && ['expired', 'denied', 'disconnected'].includes(current.status)) {
+          if (current.accountId) await this.remote(async () => (await this.backend()).disconnect(current.accountId!));
+          (await this.forget(current)); continue;
         }
         // A deleted project's account, signed out at the provider at last.
         if (current.ownerProjectId && !current.accountId && !(await this.store.getProject(current.ownerProjectId))) {

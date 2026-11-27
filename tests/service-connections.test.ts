@@ -196,6 +196,87 @@ describe('service connections', () => {
     await expect(service.connect(org, 'alice', { id: (await service.request(org, 'gmail', 'task_d', 'do', 'x')).id, useConnectionId: account }))
       .rejects.toThrow('not connected');
   });
+  it('lets a task ask for its account to be signed in again, and moves the new sign-in onto that account', async () => {
+    const account = await connected('task_a');
+    const grant = (await service.request(org, 'gmail', 'task_b', 'do', 'Read mail'));
+    await service.connect(org, 'alice', { id: grant.id, useConnectionId: account });
+    const why = 'Gmail refused filter creation: the sign-in lacks “Manage your basic mail settings and filters”';
+    const reconnect = await service.requestReconnect(org, grant.id, 'task_b', project, 'do', why);
+    expect(reconnect).toMatchObject({ status: 'requested', reconnects: account, ownerId: 'alice', toolkit: 'gmail', taskId: 'task_b', why });
+    expect((await service.requestReconnect(org, grant.id, 'task_b', project, 'do', why)).id).toBe(reconnect.id);
+    expect((await store.eventsOfType('task_b', 'connection.requested')).at(-1)?.payload)
+      .toMatchObject({ requestId: reconnect.id, reconnects: account, audience: ['user:alice'] });
+    // Only a fresh sign-in can add permissions: it is never answered with an existing account.
+    expect((await service.reusable(org, 'alice', 'gmail')).map(c => c.id)).toEqual([account]);
+    await expect(service.connect(org, 'alice', { id: reconnect.id, useConnectionId: account })).rejects.toThrow('sign in again');
+    await expect(service.connect(org, 'bob', { id: reconnect.id })).rejects.toThrow('another person');
+
+    // The account keeps working, untouched, while its owner signs in again.
+    vi.mocked(backend.authorize).mockResolvedValueOnce({ id: 'ca_fresh', url: 'https://connect.composio.dev/link/fresh' });
+    vi.mocked(backend.active).mockImplementation(async id => id !== 'ca_fresh');
+    expect((await service.connect(org, 'alice', { id: reconnect.id })).url).toBe('https://connect.composio.dev/link/fresh');
+    await service.refresh(org, reconnect.id);
+    expect(await service.execute(org, grant.id, 'task_b', project, 'GMAIL_FETCH_EMAILS', {})).toMatchObject({ successful: true });
+    expect(backend.execute).toHaveBeenLastCalledWith('session-private', 'GMAIL_FETCH_EMAILS', {});
+    expect(backend.disconnect).not.toHaveBeenCalled();
+
+    // Once it completes, the account (same id, same grants) holds the new sign-in; the old one is signed out.
+    vi.mocked(backend.active).mockResolvedValue(true);
+    vi.mocked(backend.session).mockResolvedValueOnce('session-fresh');
+    await service.refresh(org, reconnect.id);
+    expect(await service.get(org, account)).toMatchObject({ status: 'active', accountId: 'ca_fresh', sessionId: 'session-fresh' });
+    expect(backend.disconnect).toHaveBeenCalledWith('ca_exact');
+    expect(await service.get(org, reconnect.id)).toMatchObject({ status: 'active', grantedConnectionId: account, ownerId: 'alice' });
+    expect((await service.get(org, reconnect.id)).accountId).toBeUndefined();
+    for (const [id, task] of [[grant.id, 'task_b'], [reconnect.id, 'task_b'], [account, 'task_a']] as const) {
+      await service.execute(org, id, task, project, 'GMAIL_FETCH_EMAILS', {});
+      expect(backend.execute).toHaveBeenLastCalledWith('session-fresh', 'GMAIL_FETCH_EMAILS', {});
+    }
+    expect((await service.reusable(org, 'alice', 'gmail')).map(c => c.id)).toEqual([account]);
+    const resumed: string[] = [];
+    await service.reconcile(async c => { resumed.push(`${c.taskId}:${c.id}:${c.status}`); return true; });
+    expect(resumed).toContain(`task_b:${reconnect.id}:active`);
+  });
+  it('refuses a reconnect the task cannot ask for; a declined or abandoned one leaves the account as it was', async () => {
+    const account = await connected('task_a');
+    await expect(service.requestReconnect(org, account, 'task_b', project, 'do', 'x')).rejects.toThrow('not been shared');
+    await expect(service.requestReconnect(org, 'conn_missing', 'task_a', project, 'do', 'x')).rejects.toThrow('not found');
+    const declined = await service.requestReconnect(org, account, 'task_a', project, 'do', 'Needs another permission');
+    expect((await service.disconnect(org, declined.id, 'alice')).status).toBe('denied');
+    expect(await service.get(org, account)).toMatchObject({ status: 'active', accountId: 'ca_exact' });
+
+    vi.mocked(backend.authorize).mockResolvedValueOnce({ id: 'ca_fresh', url: 'https://connect.composio.dev/link/fresh' });
+    vi.mocked(backend.active).mockImplementation(async id => id !== 'ca_fresh');
+    const abandoned = await service.requestReconnect(org, account, 'task_a', project, 'do', 'Needs another permission');
+    expect(abandoned.id).not.toBe(declined.id);
+    await service.connect(org, 'alice', { id: abandoned.id });
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 31 * 60_000);
+    const resume = vi.fn(async () => true); await service.reconcile(resume);
+    expect(resume).toHaveBeenCalledWith(expect.objectContaining({ id: abandoned.id, status: 'expired' }));
+    expect(await service.get(org, account)).toMatchObject({ status: 'active', accountId: 'ca_exact' });
+    expect(await service.execute(org, account, 'task_a', project, 'GMAIL_FETCH_EMAILS', {})).toMatchObject({ successful: true });
+
+    await service.disconnect(org, account, 'alice');
+    await expect(service.requestReconnect(org, account, 'task_a', project, 'do', 'x')).rejects.toThrow('request_connection');
+  });
+  it('signs a person’s connected account in again from Settings without breaking it meanwhile', async () => {
+    const account = await connected('task_a');
+    vi.mocked(backend.authorize).mockResolvedValueOnce({ id: 'ca_fresh', url: 'https://connect.composio.dev/link/fresh' });
+    vi.mocked(backend.active).mockImplementation(async id => id !== 'ca_fresh');
+    await expect(service.connect(org, 'bob', { id: account, restart: true })).rejects.toThrow('another person');
+    const started = await service.connect(org, 'alice', { id: account, restart: true });
+    expect(started).toMatchObject({ url: 'https://connect.composio.dev/link/fresh', connection: { status: 'connecting', reconnects: account } });
+    expect(await service.execute(org, account, 'task_a', project, 'GMAIL_FETCH_EMAILS', {})).toMatchObject({ successful: true });
+    vi.mocked(backend.active).mockResolvedValue(true);
+    vi.mocked(backend.session).mockResolvedValueOnce('session-fresh');
+    // Checking the sign-in reports the account it signed in again; the sign-in itself is gone.
+    expect(await service.refresh(org, started.connection.id)).toMatchObject({ id: account, status: 'active', accountId: 'ca_fresh' });
+    await expect(service.get(org, started.connection.id)).rejects.toThrow('not found');
+    expect((await service.list(org, { ownerId: 'alice' })).map(c => c.id)).toEqual([account]);
+    expect(backend.disconnect).toHaveBeenCalledWith('ca_exact');
+    // Without restart, an active account is left alone.
+    expect(await service.connect(org, 'alice', { id: account })).toEqual({ connection: expect.objectContaining({ id: account, status: 'active' }) });
+  });
   it('offers reusable accounts newest first, with when each was connected', async () => {
     const day = 86_400_000, then = Date.UTC(2026, 8, 12);
     vi.spyOn(Date, 'now').mockReturnValue(then);
@@ -259,6 +340,7 @@ it('uses Composio v3.1 with pinned accounts, disabled workbench, and no automati
 
 describe('native MCP connections', () => {
   let home: string, store: Store, service: ServiceConnections, org: string, project: string;
+  let accessToken = 'access-secret';
   const listTools = vi.fn(async () => ({ tools: [
     { name: 'search_emails', description: 'Search Gmail messages', inputSchema: { type: 'object' } },
     { name: 'list_labels', description: 'List labels', inputSchema: { type: 'object' } }] }));
@@ -266,6 +348,7 @@ describe('native MCP connections', () => {
   const open = vi.fn(async () => ({ listTools, callTool, close: async () => {} }) as any);
   beforeEach(async () => {
     home = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-service-connections-'));
+    accessToken = 'access-secret';
     store = (await Store.create(':memory:'));
     org = (await store.createOrganization({ name: 'Team', ownerUserId: 'alice' })).id;
     project = (await store.createProject('Project', {}, org)).id;
@@ -279,7 +362,7 @@ describe('native MCP connections', () => {
       if (req.url.includes('.well-known')) return json({ issuer: 'https://auth.example', authorization_endpoint: 'https://auth.example/authorize', token_endpoint: 'https://auth.example/token',
         registration_endpoint: 'https://auth.example/register', response_types_supported: ['code'], code_challenge_methods_supported: ['S256'] });
       if (req.url.endsWith('/register')) return json({ ...JSON.parse(body), client_id: 'client' });
-      if (req.url.endsWith('/token')) return json({ access_token: 'access-secret', token_type: 'Bearer', refresh_token: 'refresh-secret', expires_in: 3600 });
+      if (req.url.endsWith('/token')) return json({ access_token: accessToken, token_type: 'Bearer', refresh_token: 'refresh-secret', expires_in: 3600 });
       const registry = [
         { server: { name: 'com.example/keyed', version: '1.0.0', remotes: [{ type: 'streamable-http', url: 'https://keyed.example/mcp', headers: [{ name: 'Authorization', isRequired: true, isSecret: true }] }] }, _meta: { 'io.modelcontextprotocol.registry/official': { status: 'active' } } },
         { server: { name: 'com.example/local', version: '1.0.0', packages: [{ registryType: 'npm', identifier: 'local-mcp', version: '1.0.0', transport: { type: 'stdio' } }] }, _meta: { 'io.modelcontextprotocol.registry/official': { status: 'active' } } },
@@ -335,6 +418,29 @@ describe('native MCP connections', () => {
     await service.disconnect(org, request.id, 'alice');
     await expect(service.execute(org, later.id, 'task_b', project, 'search_emails', {})).rejects.toThrow('Reconnect');
     await expect(service.execute(org, request.id, 'task_a', project, 'search_emails', {})).rejects.toThrow('Reconnect');
+  });
+
+  it('signs an MCP account in again for a task, keeping its credentials until the new sign-in completes', async () => {
+    const server = await service.resolveMcp('com.example/gmail');
+    const redirect = 'https://tavya.example/mcp-callback';
+    const signIn = async (id: string) => {
+      const started = await service.connect(org, 'alice', { id, redirect });
+      return service.finishMcp(org, id, 'alice', new URL(started.url!).searchParams.get('state')!, 'code');
+    };
+    const account = (await service.requestMcp(org, server, 'task_a', 'do', 'Read my mail')).id;
+    await signIn(account);
+    const reconnect = await service.requestReconnect(org, account, 'task_a', project, 'do', 'The server refused: missing scope');
+    expect(reconnect).toMatchObject({ status: 'requested', reconnects: account, mcp: { url: 'https://mail.example/mcp' } });
+    accessToken = 'access-fresh';
+    const started = await service.connect(org, 'alice', { id: reconnect.id, redirect });
+    await service.execute(org, account, 'task_a', project, 'search_emails', {});
+    expect(open).toHaveBeenLastCalledWith(expect.anything(), { Authorization: 'Bearer access-secret' });
+    await service.finishMcp(org, reconnect.id, 'alice', new URL(started.url!).searchParams.get('state')!, 'code');
+    expect(await service.get(org, reconnect.id)).toMatchObject({ status: 'active', grantedConnectionId: account });
+    for (const id of [account, reconnect.id]) {
+      await service.execute(org, id, 'task_a', project, 'search_emails', {});
+      expect(open).toHaveBeenLastCalledWith(expect.anything(), { Authorization: 'Bearer access-fresh' });
+    }
   });
 
   it('explains servers whose sign-in needs a registered OAuth app', async () => {
@@ -413,6 +519,12 @@ describe('GitHub MCP connections', () => {
     // The account stays pinned: removing that GitHub sign-in ends access instead of switching accounts.
     accounts.alice = '999';
     await expect(service.execute(org, request.id, 'task_a', project, 'get_me', {})).rejects.toThrow('reconnect');
+    // Reconnecting it from Settings pins her current GitHub sign-in at once, on the same account.
+    const again = await service.connect(org, 'alice', { id: request.id, restart: true, redirect: 'https://tavya.example/mcp-callback' });
+    expect(again).toEqual({ connection: expect.objectContaining({ id: request.id, status: 'active' }) });
+    expect(await service.execute(org, request.id, 'task_a', project, 'get_me', {})).toBeDefined();
+    expect(open).toHaveBeenLastCalledWith({ type: 'http', url: GITHUB_MCP }, { Authorization: 'Bearer ghu_alice_999' });
+    expect((await service.list(org, { ownerId: 'alice' })).map(c => c.id)).toEqual([request.id]);
   });
 
   it('sends a person without a GitHub sign-in through GitHub, then finishes once they return', async () => {

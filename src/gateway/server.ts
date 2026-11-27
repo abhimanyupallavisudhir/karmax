@@ -1229,8 +1229,12 @@ export class Gateway {
     this.connectionSweep = this.connections()!.reconcile(async (c) => {
       const task = (await this.deps.store.getTask(c.taskId!));
       if (!task || ['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? '')) return true;
-      const message = c.status === 'active'
+      const message = c.status === 'active' && c.reconnects
+        ? `${c.label} was signed in again. Retry with connection ${c.id}: it and every connection to this account now use the new sign-in.`
+        : c.status === 'active'
         ? `${c.label} is connected. Use list_connections, search_connection_tools, and execute_connection_tool with connection ${c.id}. The account is authorized for this task; continue the requested work.`
+        : c.reconnects
+        ? `${c.label} was not signed in again (${c.status === 'expired' ? 'the sign-in was not finished' : 'declined'}); the account works as before. Continue without the missing access or explain what it needs.`
         : `${c.label} connection is ${c.status}. Continue without it or explain the remaining connection step.`;
       const result = await this.deps.api.resumeAfterCredentialDecision(c.taskId!, message, c.role ?? 'do');
       if (result.resumed) (await this.emitTaskEvent({ taskId: c.taskId!, type: 'connection.resolved', ts: Date.now(),
@@ -8105,7 +8109,7 @@ export class Gateway {
               ({ ...c, canManage: c.ownerProjectId ? await maintains(c.ownerProjectId) : !!ownerId && c.ownerId === ownerId })));
             // A person answering a task request may reuse their own connected account.
             if (!callerTaskId && ownerId && taskId) for (const c of listed as Array<typeof listed[number] & { reusable?: unknown }>)
-              if (c.status === 'requested' && (!c.ownerId || c.ownerId === ownerId))
+              if (c.status === 'requested' && !c.reconnects && (!c.ownerId || c.ownerId === ownerId))
                 c.reusable = (await service.reusable(org, ownerId, c)).map(({ id, label, createdAt }) => ({ id, label, createdAt }));
             return this.json(res, 200, listed);
           }
@@ -8114,7 +8118,10 @@ export class Gateway {
             const why = String(b.why ?? '');
             const opened = new Set((await service.pending(task.id)).map((pending) => pending.id));
             let c;
-            if (typeof b.mcp === 'string' && b.mcp.trim()) {
+            if (typeof b.reconnect === 'string' && b.reconnect) {
+              // The account the task has falls short (a permission it lacks, access the provider withdrew): its owner signs in again.
+              c = (await service.requestReconnect(org, b.reconnect, task.id, task.projectId, authRecord.role ?? 'do', why, await api.viaParent(task.id)));
+            } else if (typeof b.mcp === 'string' && b.mcp.trim()) {
               const server = await service.resolveMcp(b.mcp);
               const available = (await service.list(org, { taskId, projectId })).find(c => c.mcp?.url === server.transport.url && c.status === 'active');
               if (available) return this.json(res, 200, { status: 'connected', connection: available });
@@ -8137,7 +8144,9 @@ export class Gateway {
             if (c.status === 'active' && c.instant) return this.json(res, 200, { status: 'connected', connection: service.view(c),
               detail: 'No account needed: Composio pays for each call and it is charged to your organization’s credit.' });
             return this.json(res, 200, { status: c.status === 'denied' || c.status === 'disconnected' ? 'denied' : 'needs_connection',
-              connection: service.view(c), detail: 'A Connect button is available in this task’s Approval Requests. Continue independent work; the task resumes after sign-in.' });
+              connection: service.view(c), detail: c.reconnects
+                ? 'The account’s owner is asked to sign in again from this task’s Approval Requests; the account keeps working meanwhile. Continue independent work; the task resumes after sign-in.'
+                : 'A Connect button is available in this task’s Approval Requests. Continue independent work; the task resumes after sign-in.' });
           }
           if (p === '/api/connections/connect' && method === 'POST') {
             const target = b.id ? (await service.get(org, String(b.id))) : undefined;
