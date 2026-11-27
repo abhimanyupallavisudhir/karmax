@@ -226,6 +226,25 @@ both binaries.
   Claude test on 2.1.332, and every 2.1.332 session the live runs wrote
   converted without a warning. The watcher's `--dry-run` reports Claude Code
   current.
+- Live check after landing (98d5a269 deployed 11:36 UTC by Promote #502):
+  nothing newly fails. Promote #502 logged `Update complete at 98d5a269…` and
+  replayed all 490 running workflows. Its smoke check passed, including a real
+  Claude task. Live `claude` #25 (`claude-permission`, 2 passed), `agent` #26
+  (1 passed) and `e2b` #27 (7 passed) matched the earlier runs (#21–#23).
+  `claude` #25 no longer printed `CLAUDE_SDK_MCP_SERVERS_ARGV_DEPRECATED`.
+  This task's own production turn was resumed on the stale E2B template. It ran
+  SDK 0.3.332 and Claude Code 2.1.332 from `~/.npm/_npx/…/claude-code`, while
+  the template's Codex stayed at 0.153.4. Its argv has `--await-initialize` and
+  `--strict-mcp-config`. It has no `--mcp-config` and no server env or token,
+  where the 2.1.322 turn before the deploy still had
+  `--mcp-config {"mcpServers":{"chrome-devtools":…}}`. Both MCP servers worked
+  from initialize on this remote world. `karmax_control` handled `get_task`
+  and the Actions calls, and Claude itself started the browser
+  (`chrome-devtools-mcp`), which loaded and read a tavya.io page. The session,
+  with 200 records from 2.1.322 and 64 from 2.1.332, converted without a
+  warning in panagent and in karmax's vendored copy, which is byte-identical.
+  It wrote none of the flag-gated `derived-from`, `data-flow-records` or
+  `data-flow-incomplete` records.
 
 ## November 20, 2026 Codex upgrade audit
 
