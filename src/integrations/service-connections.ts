@@ -405,7 +405,7 @@ export class ServiceConnections {
         // Copy before the account's revision changes: a refresh of the old
         // credentials racing this one is then refused (vault.refresh).
         if (r.mcp.auth !== 'none' && r.mcp.auth !== 'github')
-          (await this.broker.registerHandle(MCP_CREDENTIALS + account.id, JSON.stringify(await this.vault.secret(r)), organizationScope(account.organizationId)));
+          (await this.broker.registerHandle(MCP_CREDENTIALS + account.id, JSON.stringify(await this.vault.secret(this.target(r))), organizationScope(account.organizationId)));
         account.mcp = { ...account.mcp!, githubAccountId: r.mcp.githubAccountId };
         if (r.signedInBy) account.signedInBy = r.signedInBy;
       } else Object.assign(account, { accountId: r.accountId, sessionId: r.sessionId });
