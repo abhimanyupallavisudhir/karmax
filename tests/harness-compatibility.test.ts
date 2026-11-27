@@ -6,13 +6,14 @@ import path from 'node:path';
 import http from 'node:http';
 import { once } from 'node:events';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
-import { CLAUDE_EXTRA_ARGS, controlMcpServer } from '../src/agent/claude.js';
+import { CLAUDE_EXTRA_ARGS, CLAUDE_MCP_DELIVERY, controlMcpServer } from '../src/agent/claude.js';
 import { ClaudeStreamUsage } from '../src/agent/claude-stream-usage.js';
 import { PLATFORM_TOOL_SCHEMAS } from '../src/agent/tools.js';
 
-it('Claude 2.1.322 preserves SDK tools, explicit effort, resume and fork', async () => {
+it('Claude 2.1.332 preserves SDK tools, explicit effort, resume and fork', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-sdk-compat-'));
   const requests: any[] = [];
   const calls: string[] = [];
@@ -235,7 +236,7 @@ async function messagesFixture(reply: (body: any) => any,
 // funding-analysis#2: what a turn spent is counted from the CLI's frames, so a turn
 // the usage limit ends is metered too. The main loop streams its final output count
 // (`message_delta`); a sub-agent's frames carry only its exact input and cache counts.
-it('Claude 2.1.322 frames meter every request of a turn, sub-agents included', async () => {
+it('Claude 2.1.332 frames meter every request of a turn, sub-agents included', async () => {
   const spent = (n: number) => ({ input_tokens: 1000 * n + 1, output_tokens: 50 + n,
     cache_read_input_tokens: 100 * n + 2, cache_creation_input_tokens: 10 * n + 3 });
   const fixture = await messagesFixture((body) => {
@@ -341,4 +342,38 @@ it('Claude sees every karmax_control tool and passes free-form objects through',
   expect(tools.filter((t) => t.startsWith('mcp__karmax_control__')).sort())
     .toEqual(PLATFORM_TOOL_SCHEMAS.map((t) => `mcp__karmax_control__${t.name}`).sort());
   expect(calls).toEqual([['create_sub_task', { title: 'child', prompt: 'do it', params: { 'agent:do': { provider: 'codex' } } }]]);
+}, 60_000);
+
+// SDK 0.3.326 deprecated putting MCP servers on Claude Code's command line, which a
+// host that spawns Claude Code itself (as karmax does) gets by default: every
+// server's env and headers were readable in `ps`. Delivered in the initialize
+// request, a stdio server still starts with its env, and none of it is in argv.
+it('Claude starts stdio MCP servers from the initialize request, their env off the command line', async () => {
+  const secret = `mcp-env-${crypto.randomUUID()}`;
+  const fixture = await messagesFixture((body) => lastUser(body).includes('tool_result')
+    ? { type: 'text', text: 'done' }
+    : { type: 'tool_use', id: 'tool_echo', name: 'mcp__fixture__echo', input: { text: 'delivery-marker' } });
+  const argv: string[][] = [];
+  let result = '';
+  const session = query({ prompt: 'delivery-marker', options: {
+    cwd: fixture.home, model: 'claude-opus-5-5', tools: [], strictMcpConfig: true, settingSources: [], env: fixture.env,
+    mcpServersDelivery: CLAUDE_MCP_DELIVERY,
+    mcpServers: { fixture: { command: process.execPath, args: [path.resolve('tests/fixtures/mcp-connection.mjs')],
+      env: { FIXTURE_SECRET: secret } } },
+    spawnClaudeCodeProcess: (o: { command: string; args: string[]; cwd?: string; env: Record<string, string | undefined>; signal: AbortSignal }) => {
+      argv.push([o.command, ...o.args]);
+      return spawn(o.command, o.args, { cwd: o.cwd, env: o.env, signal: o.signal, stdio: ['pipe', 'pipe', 'ignore'] });
+    },
+    canUseTool: async (_name: string, input: any) => ({ behavior: 'allow' as const, updatedInput: input }),
+  } as any });
+  try {
+    for await (const m of session as AsyncIterable<any>) {
+      if (m.type === 'user') for (const block of m.message?.content ?? [])
+        if (block.type === 'tool_result') result += JSON.stringify(block.content);
+    }
+  } finally { session.close(); await fixture.close(); }
+  expect(result).toContain(secret); // the server ran, with its env…
+  expect(argv).toHaveLength(1);
+  expect(argv[0]!.join(' ')).not.toContain(secret); // …which never reached the command line
+  expect(argv[0]).not.toContain('--mcp-config');
 }, 60_000);

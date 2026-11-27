@@ -195,6 +195,12 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     expect(sdkState.options.mcpServers.karmax_control).toMatchObject({ type: 'sdk', name: 'karmax_control' });
   });
 
+  it('sends MCP servers in the initialize request, not on the harness command line', async () => {
+    sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn' }];
+    await new ClaudeAdapter().runTurn(input, ctx);
+    expect(sdkState.options.mcpServersDelivery).toBe('initialize');
+  });
+
   it('keeps project secrets out of the harness while preserving Tavya control env', async () => {
     sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn' }];
     await new ClaudeAdapter().runTurn({

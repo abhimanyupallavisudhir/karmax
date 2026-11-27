@@ -155,6 +155,78 @@ OpenCode. Profiles and task parameters do not have a second “Credential
 provider” setting.
 
 
+## November 27, 2026 Claude Code upgrade audit
+
+Claude Agent SDK is now **0.3.332** (Claude Code **2.1.332**, from 0.3.322 /
+2.1.322). The GitHub releases in between are 2.1.323 and 2.1.325–2.1.331.
+2.1.324 is on npm (SDK 0.3.324 says only "parity") but has no GitHub release
+and no changelog entry. The watcher started this run as a routine catch-up
+(2.1.323 was 14 days old). Read both changelogs over the whole range, diffed
+`sdk.d.ts`, and compared the model ids, effort enums, message/record types,
+rate-limit windows, safety-check reasons and disk-full wordings compiled into
+both binaries.
+
+- **No new model and no new effort level.** The `claude-*` ids in the binary
+  are the same, and so are the effort enums. The model changes in the range are
+  provider aliases and step-downs on Bedrock, Vertex and Foundry. tavya passes
+  exact Anthropic ids, so none of them applies.
+- **MCP servers now go in the initialize request** (`mcpServersDelivery:
+  'initialize'`, `CLAUDE_MCP_DELIVERY` in `src/agent/claude.ts`). SDK 0.3.326
+  deprecated the default, which puts them on Claude Code's command line when a
+  host spawns Claude Code itself, as tavya does (`spawnClaudeCodeProcess`). That
+  left every server's env and headers readable in `ps`, including an agent MCP
+  connection's token. Since 0.3.332 the SDK also warns on every turn
+  (`CLAUDE_SDK_MCP_SERVERS_ARGV_DEPRECATED`), and a later SDK will switch the
+  default. The new delivery needs a Claude Code at least as new as the SDK.
+  Remote worlds run exactly the SDK's `claudeCodeVersion`, so only a
+  `KARMAX_REMOTE_CLAUDE_PACKAGE` override pinned to an older CLI would fail; it
+  fails at start with "Claude Code too old to read MCP servers from initialize".
+  `harness-compatibility` proves it on the real binary: a stdio server starts
+  with its env, and the env is not in argv.
+- **Claude Code's own files are now off limits to tools, even in bypass mode**
+  (2.1.326, and more in 2.1.332). Writes to `$CLAUDE_CONFIG_DIR/.credentials.json`
+  are refused (`safetyCheck`, "This would change Claude Code's sign-in tokens"),
+  and so are its helper temp folder, rm-guard folder and cached organization
+  settings. Six safety checks are new, and all of them deny rather than ask. A
+  probe on both binaries (bypass plus `canUseTool`) showed only that change.
+  Writes to `.claude/`, `.git/hooks`, `~/.bashrc` and `cp`/`mv`/`rm` ran as
+  before, and reading the credentials file still works. No tavya flow writes
+  that file through the agent's tools.
+- **SDK API changes tavya does not hit.** 0.3.327 refuses options that cannot
+  be serialized and hook values that are not arrays. tavya's one hook (the
+  `SessionStart` work-environment source) already uses arrays. 0.3.332 makes
+  `setPermissionMode()` resolve `{ mode }`; tavya never calls it. Mid-turn
+  messages count as the user's in **auto** mode unless marked `isSynthetic`;
+  tavya runs `bypassPermissions`.
+- **Message and record types.** The SDK messages are unchanged for tavya:
+  the new subtypes (`late_allow_not_run`, `shell_cwd`, `prompt_draft_activity`,
+  …) are ignored like any unknown system subtype. `tool_progress` can now
+  beat for a long-running hook, with a `hook-…` id. The session record table
+  gains `derived-from` (last-wins) and `data-flow-records` /
+  `data-flow-incomplete` (accumulate). Feature flags gate all three, and no
+  tavya session has written them yet. panagent would warn on them, and they are
+  not silenced on spec. The rate-limit windows (`five_hour`, `seven_day`,
+  `seven_day_opus`, `seven_day_sonnet`, `seven_day_overage_included`,
+  `overage`) are unchanged, and so is every wording `isDiskFullMessage`
+  matches.
+- Unchanged for tavya, though relevant: several resume fixes (lost recent turns
+  after a crash or an empty reply, invalid timestamps, a retried short read);
+  `CLAUDE_ENV_FILE` from a `SessionStart` hook now reaching Bash under
+  `continue` (tavya uses `resume`, where it already worked); `claude -p`
+  exiting 1 on a full disk in text output (tavya uses stream-json); the
+  `max_tokens` retry removed in 2.1.329 and restored in 2.1.330.
+- Verified: typecheck; the agent suites with the real-binary suites (30 files,
+  360 passed, including `harness-compatibility`: tools, effort, resume, fork,
+  metering incl. sub-agents, mid-turn replay, and the new MCP delivery). The
+  live Claude turns matched master's 2.1.322 run exactly. With
+  `ANTHROPIC_API_KEY`: 6 passed, with native fork failing only on the
+  documented Messages-API fallback. On the subscription: 5 passed, native fork
+  included. Also passed: the permission seam and a whole `live-agent` task. The
+  real `/usage` panel still parses. panagent's tests passed, with its native
+  Claude test on 2.1.332, and every 2.1.332 session the live runs wrote
+  converted without a warning. The watcher's `--dry-run` reports Claude Code
+  current.
+
 ## November 20, 2026 Codex upgrade audit
 
 Codex is now **0.171.0** (from 0.167.1). The stable releases in between are
@@ -254,7 +326,7 @@ binaries.
 
 ## November 10, 2026 Claude Code upgrade audit
 
-Claude Agent SDK is now **0.3.322** (Claude Code **2.1.322**, from 0.3.319 /
+Claude Agent SDK is now **0.3.322** (Claude Code **2.1.322**; now 2.1.332, above; from 0.3.319 /
 2.1.319). 2.1.320 was never released (no tag and no npm package; the SDK changelog
 names a 0.3.320 that npm also lacks), so the range is 2.1.321 and 2.1.322. The
 watcher started this run because 2.1.321 added a model. Read both changelogs,

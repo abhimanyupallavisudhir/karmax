@@ -483,8 +483,9 @@ export class ClaudeAdapter implements AgentAdapter {
     const { forwardEnv: _forwardEnv, ...platform } = platformMcpSpec(
       process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505',
     );
-    // The stdio server inherits KARMAX_TOKEN from the harness environment.
-    // Embedding it here exposes it in the SDK's --mcp-config command line.
+    // The stdio server inherits KARMAX_TOKEN from the harness environment, so
+    // the token is in no server config at all (CLAUDE_MCP_DELIVERY keeps the
+    // others' env and headers off the command line too).
 
     // Only the messages new since the resumed session last advanced (the whole
     // conversation on a fresh session) — the session already holds the rest, so
@@ -793,6 +794,7 @@ export class ClaudeAdapter implements AgentAdapter {
         // No shell, files or browser for a task without a computer: tavya's tools only.
         ...(surface.builtIns ? { tools: surface.builtIns } : {}),
         strictMcpConfig: true,
+        mcpServersDelivery: CLAUDE_MCP_DELIVERY,
         extraArgs: CLAUDE_EXTRA_ARGS,
         env,
         // Spawn the agent harness ourselves (same call the SDK makes internally:
@@ -1322,6 +1324,14 @@ export function jsonSchemaToZodShape(zod: any, schema: any): Record<string, any>
  * `user_message_uuids`; without this receipt the turn waited out the whole settle
  * grace after the agent had finished (#438). */
 export const CLAUDE_EXTRA_ARGS: Record<string, string | null> = { 'replay-user-messages': null };
+
+/** How the SDK hands Claude Code the MCP servers. By default (`argv`) a host that
+ * spawns Claude Code itself, as karmax does, puts them on its command line, where
+ * anything on the machine can read each server's env and headers (an agent MCP
+ * connection's token); SDK 0.3.326 deprecated that. `initialize` sends them over
+ * stdin, which needs a Claude Code at least as new as the SDK's own: remote worlds
+ * run exactly that version (`installedClaudeCodeVersion`). */
+export const CLAUDE_MCP_DELIVERY = 'initialize' as const;
 
 /** Read a config home's MCP servers so strict SDK isolation can preserve its
  * browser/user servers while replacing the on-disk karmax entry for this turn. */
