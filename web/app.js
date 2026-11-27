@@ -25766,25 +25766,25 @@ function connectionRows(connections, inTask = false) {
     // The person's own connected accounts, newest first; Allow uses the one picked.
     const reusable = canConnect && c.status === 'requested' ? c.reusable || [] : [];
     const accountNames = connectionAccountNames(reusable);
-    const status = { requested: c.reusable?.length ? 'access requested' : 'sign-in needed', connecting: 'waiting for sign-in', active: 'connected', expired: 'reconnect needed', disconnected: 'disconnected', denied: 'declined' }[c.status] || c.status;
+    const status = { requested: c.reconnects ? 'sign in again' : c.reusable?.length ? 'access requested' : 'sign-in needed', connecting: 'waiting for sign-in', active: 'connected', expired: 'reconnect needed', disconnected: 'disconnected', denied: 'declined' }[c.status] || c.status;
     const projects = S.projects.filter(p => p.organizationId === c.organizationId);
     const open = ['requested', 'connecting'].includes(c.status);
     return `<div class="approval-request${open && c.dismissed ? ' approval-request-dismissed' : ''}" data-connection="${esc(c.id)}">
       <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span>${open && c.dismissed ? ` ${ignoredChip()}` : ''}</div>
-        ${c.why && inTask ? `<p class="task-sub">${esc(c.why)}</p>` : ''}
+        ${c.why && (inTask || (c.reconnects && open)) ? `<p class="task-sub">${esc(c.why)}</p>` : ''}
         ${open ? subTaskAskLine(c) : ''}
-        <p class="task-sub">${c.ownerProjectId ? 'This project’s account: only its tasks use it.' : c.taskId ? 'This account may be used by the requesting task.' : 'Private until you share it with a project.'}</p>
-        ${own && !inTask ? `<details data-unsaved><summary>Project access</summary><p class="task-sub">Selected projects may run app actions using this account, within the permissions you granted at sign-in.</p>
+        <p class="task-sub">${c.reconnects && open ? 'The account keeps working meanwhile.' : c.ownerProjectId ? 'This project’s account: only its tasks use it.' : c.taskId ? 'This account may be used by the requesting task.' : 'Private until you share it with a project.'}</p>
+        ${own && !inTask && !c.reconnects ? `<details data-unsaved><summary>Project access</summary><p class="task-sub">Selected projects may run app actions using this account, within the permissions you granted at sign-in.</p>
           ${projects.map(p => `<label class="connection-project"><input type="checkbox" value="${esc(p.id)}" ${c.projectIds.includes(p.id) ? 'checked' : ''}> ${esc(p.name)}</label>`).join('')}
           <button type="button" class="btn sm" data-connection-action="access" data-unsaved-save>Save access</button></details>` : ''}
         <span data-connection-result role="status"></span>
       </div><div class="approval-request-actions">
         ${reusable.length > 1 ? `<select class="connection-account" data-connection-account aria-label="Account" title="Your connected accounts, newest first">${reusable.map((account, i) => `<option value="${esc(account.id)}">${esc(accountNames[i])}</option>`).join('')}</select>` : ''}
         ${reusable.length ? `<button type="button" class="btn sm primary" data-connection-action="allow" data-use-connection="${esc(reusable[0].id)}" title="Use your connected account — no new sign-in">Allow</button>` : ''}
-        ${canConnect && ['requested', 'connecting', 'expired', 'disconnected'].includes(c.status) ? `<button type="button" class="btn sm${c.status === 'requested' && c.reusable?.length ? '' : ' primary'}" data-connection-action="connect">${c.status === 'expired' ? 'Reconnect' : c.status === 'requested' && c.reusable?.length ? 'Other account' : `Connect${inTask ? ' for this task' : ''}`}</button>` : ''}
+        ${canConnect && ['requested', 'connecting', 'expired', 'disconnected'].includes(c.status) ? `<button type="button" class="btn sm${c.status === 'requested' && c.reusable?.length ? '' : ' primary'}" data-connection-action="connect">${c.status === 'expired' || c.reconnects ? 'Reconnect' : c.status === 'requested' && c.reusable?.length ? 'Other account' : `Connect${inTask ? ' for this task' : ''}`}</button>` : ''}
         ${mine && c.status === 'connecting' ? '<button type="button" class="btn sm" data-connection-action="restart">Start again</button>' : ''}
         ${mine && !c.grantedConnectionId && ['active', 'connecting'].includes(c.status) ? '<button type="button" class="btn sm" data-connection-action="refresh">Check status</button>' : ''}
-        ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.grantedConnectionId ? 'Revoke' : c.ownerId || c.ownerProjectId ? 'Disconnect' : 'Decline'}</button>` : ''}
+        ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.grantedConnectionId ? 'Revoke' : (c.ownerId || c.ownerProjectId) && !(c.reconnects && open) ? 'Disconnect' : 'Decline'}</button>` : ''}
         ${canConnect && inTask && open && !c.dismissed ? ignoreRequestButton('data-connection-action') : ''}
       </div></div>`;
   }).join('');

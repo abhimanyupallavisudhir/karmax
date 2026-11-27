@@ -357,8 +357,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     parameters: { type: 'object', properties: {} },
   },
   {
-    name: 'request_connection', description: 'Request access to an app for this task. Prefer a native MCP server: pass mcp as its MCP Registry name (e.g. com.example/gmail, find one with GET /api/mcp/registry?search=) or its public HTTPS URL. Use toolkit (a Composio slug such as gmail or googlecalendar) only as the fallback when no suitable remote MCP server exists. The user allows an account they already connected or signs in; a Connect button appears in this task and it resumes automatically. Continue independent work; you may end your turn while it is pending, and the task resumes once it is connected. Reuse accounts from list_connections.',
-    parameters: { type: 'object', properties: { mcp: { type: 'string' }, toolkit: { type: 'string' }, why: { type: 'string' } }, required: ['why'] },
+    name: 'request_connection', description: 'Request access to an app for this task. Prefer a native MCP server: pass mcp as its MCP Registry name (e.g. com.example/gmail, find one with GET /api/mcp/registry?search=) or its public HTTPS URL. Use toolkit (a Composio slug such as gmail or googlecalendar) only as the fallback when no suitable remote MCP server exists. The user allows an account they already connected or signs in; a Connect button appears in this task and it resumes automatically. Continue independent work; you may end your turn while it is pending, and the task resumes once it is connected. Reuse accounts from list_connections. When one falls short (the provider refuses for a missing permission or scope, or access was withdrawn), pass reconnect as its connection id instead, with why naming what is missing: its owner signs in again and the same account gets the new sign-in.',
+    parameters: { type: 'object', properties: { mcp: { type: 'string' }, toolkit: { type: 'string' }, reconnect: { type: 'string', description: 'A connection id from list_connections to have signed in again.' }, why: { type: 'string' } }, required: ['why'] },
   },
   {
     name: 'search_connection_tools', description: 'Search tools and input schemas for a connected account. Use the exact returned tool slug and schema with execute_connection_tool.',
@@ -1499,7 +1499,7 @@ export function platformToolHandlers(
       }));
     },
     async list_connections() { return JSON.stringify(await platformRequest('GET', '/api/connections')); },
-    async request_connection(args) { return JSON.stringify(await platformRequest('POST', '/api/connections/request', { mcp: args?.mcp, toolkit: args?.toolkit, why: args?.why })); },
+    async request_connection(args) { return JSON.stringify(await platformRequest('POST', '/api/connections/request', { mcp: args?.mcp, toolkit: args?.toolkit, reconnect: args?.reconnect, why: args?.why })); },
     async search_connection_tools(args) { return JSON.stringify(await platformRequest('GET', `/api/connections/${encodeURIComponent(String(args?.connection_id ?? ''))}/tools?search=${encodeURIComponent(String(args?.search ?? ''))}`)); },
     async execute_connection_tool(args) { return JSON.stringify(await platformRequest('POST', `/api/connections/${encodeURIComponent(String(args?.connection_id ?? ''))}/execute`, { tool: args?.tool, arguments: args?.arguments })); },
     async list_credentials(args) {

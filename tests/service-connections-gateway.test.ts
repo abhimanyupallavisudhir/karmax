@@ -202,6 +202,29 @@ describe('connection gateway flow', () => {
     for (const secret of ['mcp-access-secret', 'mcp-refresh-secret', String(state)]) expect(exposed).not.toContain(secret);
     vi.restoreAllMocks();
   });
+  it('lets a task ask for an account it uses to be signed in again', async () => {
+    const account = (await service.all()).find(c => c.toolkit === 'gmail' && c.taskId === taskId && c.status === 'active' && !c.grantedConnectionId)!.id;
+    const ask = (token: string, body: unknown) => request('/api/connections/request', { token, method: 'POST', body });
+    // Asking for the app again only finds the account it already has.
+    expect(await (await ask(agent, { toolkit: 'gmail', why: 'Create filters' })).json()).toMatchObject({ status: 'connected', connection: { id: account } });
+    const other = (await store.createTask({ projectId: (await store.createProject('Other', {}, org)).id, title: 'Mail', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'Mail' } })).id;
+    const outsider = (await tokens.mint({ taskId: other, profileId: 'developer', role: 'do', principal: 'user:alice', projectId: project, organizationId: org,
+      ceiling: ['task:read', 'connection:use'], grantorCaps: ['task:read', 'connection:use'] })).token;
+    expect((await ask(outsider, { reconnect: account, why: 'Create filters' })).status).toBe(403);
+    const pending: any = await (await ask(agent, { reconnect: account, why: 'Gmail refused filters: missing settings permission' })).json();
+    expect(pending).toMatchObject({ status: 'needs_connection', connection: { reconnects: account, status: 'requested' } });
+    expect(pending.detail).toMatch(/sign in again/);
+    const rows = await (await request(`/api/connections?taskId=${taskId}&organizationId=${org}`)).json() as any[];
+    expect(rows.find(row => row.id === pending.connection.id)?.reusable).toBeUndefined();
+    expect((await request(`/api/connections/connect?organizationId=${org}`, { user: 'bob', method: 'POST', body: { id: pending.connection.id } })).status).toBe(403);
+    expect(await (await request(`/api/connections/connect?organizationId=${org}`, { method: 'POST', body: { id: pending.connection.id } })).json())
+      .toMatchObject({ url: 'https://connect.composio.dev/link/private', connection: { status: 'connecting' } });
+    signal.mockClear();
+    expect(await (await request(`/api/connections/${pending.connection.id}/refresh?organizationId=${org}`, { method: 'POST', body: {} })).json())
+      .toMatchObject({ id: pending.connection.id, status: 'active', grantedConnectionId: account });
+    await vi.waitFor(() => expect(signal.mock.calls.some(call => JSON.stringify(call).includes('signed in again'))).toBe(true));
+    expect((await request(`/api/connections/${pending.connection.id}/execute`, { token: agent, method: 'POST', body: { tool: 'GMAIL_FETCH_EMAILS', arguments: {} } })).status).toBe(200);
+  });
   it('declines an unclaimed request without requiring an account', async () => {
     const pending = (await service.request(org, 'slack', taskId, 'do', 'Read Slack'));
     const response = await request(`/api/connections/${pending.id}/disconnect?organizationId=${org}`, { method: 'POST', body: {} });
