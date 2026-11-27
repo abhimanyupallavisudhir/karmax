@@ -65,6 +65,7 @@ import { gateFollowUps } from './follow-up-gate.js';
 import { FOLLOW_UP_JOURNAL_TYPES, followUpMark } from './follow-up-wakes.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
+import { consoleOrigin, organizationPath, projectPath, taskPath } from '../domain/console-links.js';
 import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
 import { jobStatuses, listJobs, startJob, startJobWaiter, stopJobs, describeJobs } from '../world/jobs.js';
 import { autoResolve as runAutoResolve } from '../resolve/cases.js';
@@ -3909,8 +3910,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           } catch { return {}; }
         })()
         : {};
+      // Its console pages, so the agent links what it mentions (wiki features/agent-links).
+      const links = await (async () => {
+        try {
+          const project = await store.getProject(args.task.projectId);
+          if (!project) return undefined;
+          const organization = project.organizationId ? await store.getOrganization(project.organizationId) : undefined;
+          const origin = consoleOrigin();
+          return { task: origin + taskPath({ id: args.taskId, num: preparationTask?.num }, project, organization),
+            project: origin + projectPath(project, organization),
+            ...(organization ? { organization: origin + organizationPath(organization) } : {}) };
+        } catch { return undefined; }
+      })();
       const systemPrompt = assemblePrompt({
         ...reach,
+        ...(links ? { links } : {}),
         profile,
         role: args.role,
         task: promptTask,

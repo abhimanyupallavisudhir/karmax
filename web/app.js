@@ -912,6 +912,11 @@ async function applyRoute() {
   }
   const proj = projectBySlug(r.slug, routeOrganization?.id);
   if (!proj) { toast('Project not found', true); return go('/', { replace: true }); }
+  // A link naming the project by its id (agents link other projects so) shows its readable address.
+  if (!r.legacy && r.slug === proj.id && projectSlug(proj) !== proj.id) {
+    const rest = location.pathname.split('/').slice(3);
+    return go(`${projectBase(proj.id)}${rest.length ? `/${rest.join('/')}` : ''}${location.search}${location.hash}`, { replace: true });
+  }
   // Pre-organization /projects/:name/… → rewrite to the org-prefixed permalink.
   if (r.legacy) {
     const dest = r.taskKey
@@ -1119,13 +1124,30 @@ function spaNavigate(href) {
 function installLinkRouter() {
   document.addEventListener('click', (ev) => {
     if (isNewTabClick(ev) || ev.defaultPrevented) return;
-    const a = ev.target.closest('a[data-spa]');
+    const a = ev.target.closest('a[data-spa], a[data-app-link]');
     if (!a) return;
-    const href = a.getAttribute('href');
+    // A link someone wrote (a message, a wiki page) opens a page of this console in place, like ours do.
+    const href = a.hasAttribute('data-spa') ? a.getAttribute('href') : appRoutePath(a.getAttribute('href'));
     if (!href || href[0] !== '/') return; // only same-origin app routes route in place
     ev.preventDefault();
     spaNavigate(href);
   });
+}
+
+// The in-app path of a written link to one of this console's own pages — a task,
+// project, wiki page, setting… (agents link them: src/agent/prompt.ts describeLinks)
+// — or null for anything else (another site, the API, a shared file, the docs).
+// Only an absolute path or URL: a relative one cites a file in a task's world.
+function appRoutePath(href) {
+  if (!/^(?:\/(?!\/)|https?:\/\/)/i.test(String(href || ''))) return null;
+  let url;
+  try { url = new URL(href, location.href); } catch { return null; }
+  if (url.origin !== location.origin) return null;
+  const path = `${url.pathname}${url.search}`;
+  const route = parseRoute(path);
+  const known = route.name === 'profile' || route.name === 'installation'
+    || (route.org ? !!organizationBySlug(route.org) : route.name === 'global' || (route.name === 'project' && route.legacy));
+  return known ? `${path}${url.hash}` : null;
 }
 
 // `title` covers hover on desktop; this covers touch, where there is no hover.
@@ -4527,7 +4549,8 @@ function renderMarkdown(src, opts = {}) {
   const key = JSON.stringify([src, opts]);
   const hit = cache.get(key);
   if (hit !== undefined) { cache.delete(key); cache.set(key, hit); return hit; }
-  const html = globalThis.KarmaxMarkdown.renderMarkdown(src, opts);
+  // Absolute links may name a page of this console (installLinkRouter opens those in place).
+  const html = globalThis.KarmaxMarkdown.renderMarkdown(src, opts).replace(/<a href="((?:\/|https?:)[^"]*)"/g, '<a href="$1" data-app-link');
   const size = key.length + html.length;
   if (size <= 64_000) {
     cache.set(key, html);
@@ -15053,7 +15076,7 @@ function renderConversationText(text, role, v = S.view) {
     const fileUrl = worldFileHref(href, v);
     html += fileUrl
       ? `${worldFileAnchor(fileUrl)}${esc(match[1])}</a>`
-      : `<a href="${esc(safeHref(href))}" target="_blank" rel="noopener">${esc(match[1])}</a>`;
+      : `<a href="${esc(safeHref(href))}" data-app-link target="_blank" rel="noopener">${esc(match[1])}</a>`;
     at = match.index + match[0].length;
   }
   return html + esc(source.slice(at));
@@ -15103,6 +15126,7 @@ function worldFileHref(raw, v = S.view) {
   // durable world record + published branch. The gateway is the authoritative
   // confinement check; a transient `worldAvailable` hint must not decide
   // whether an agent-authored filesystem path becomes a handoff permalink.
+  if (appRoutePath(raw)) return null; // a page of this console, not a file
   const target = worldFileTarget(raw, v?.worldPath, !!v?.taskId && !v?.worldPath);
   if (!target || !v?.taskId) return null;
   return worldWikiHref(target, v) || `${taskUrl(v.taskId)}/file?${fileTargetQuery(target)}`;
@@ -15171,7 +15195,7 @@ function renderWaitDetail(text, v = S.view, math = mathjaxEnabled(), form = null
   let html = '';
   let at = 0;
   for (const match of String(text).matchAll(link)) {
-    html += esc(text.slice(at, match.index)) + `<a href="${esc(safeHref(match[2]))}" target="_blank" rel="noopener">${esc(match[1])}</a>`;
+    html += esc(text.slice(at, match.index)) + `<a href="${esc(safeHref(match[2]))}" data-app-link target="_blank" rel="noopener">${esc(match[1])}</a>`;
     at = match.index + match[0].length;
   }
   return html + esc(String(text).slice(at));

@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE } from '../autonomy/vault-keys.js';
-import { slug } from '../cli/refs.js';
+import { organizationPath, taskPath } from '../domain/console-links.js';
 import type { InboxItem, NativePushDevice } from '../domain/types.js';
 import type { NativePush } from './native-push.js';
 import type { Store } from '../store/db.js';
@@ -68,11 +68,11 @@ function route(item: InboxItem, task: DeliveryEnvelope['task'],
   organization?: { name: string; slug?: string }, project?: { name: string }): string {
   const kind = (item.subject as { kind?: string } | undefined)?.kind;
   if (kind === 'service-limit') return '/installation#installation-limits';
-  const org = organization ? `/${encodeURIComponent(organization.slug || slug(organization.name))}` : '';
+  const org = organization ? organizationPath(organization) : '';
   const settings = { credential: 'settings-agents', storage: 'settings-storage', compute: 'settings-plan' }[kind ?? ''];
   if (settings) return org ? `${org}/settings#${settings}` : '/inbox';
   if (!task || !project || !org) return '/inbox';
-  return `${org}/${encodeURIComponent(slug(project.name))}/tasks/${task.num ?? encodeURIComponent(task.id)}${
+  return `${taskPath(task, project, organization)}${
     item.kind === 'approval-requested' ? '/checkin' : ''}`;
 }
 

@@ -1,5 +1,5 @@
 import type { Store } from '../store/db.js';
-import { slugify } from '../store/db.js';
+import { projectPath } from '../domain/console-links.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { KarmaxEvent, TaskRecord } from '../domain/types.js';
 import type { ProjectEvent } from '../domain/project-events.js';
@@ -141,8 +141,7 @@ export class ChatReplies {
     const project = await this.deps.store.getProject(projectId);
     if (!base || !project) return undefined;
     const organization = project.organizationId ? await this.deps.store.getOrganization(project.organizationId) : undefined;
-    const path = organization ? `${organization.slug ?? slugify(organization.name)}/${slugify(project.name)}` : `projects/${slugify(project.name)}`;
-    return `${base}/${path}/${rest}`;
+    return `${base}${projectPath(project, organization)}/${rest}`;
   }
 }
 

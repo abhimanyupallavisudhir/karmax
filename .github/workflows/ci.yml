@@ -120,6 +120,12 @@ jobs:
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright.outputs.version }}
+      # Nothing here installs from the runner image's Microsoft source, and some
+      # runners get a 403 for it, which fails every apt step below (CI #3132).
+      - name: Drop the runner's Microsoft apt source
+        run: |
+          mapfile -t sources < <(grep -lr packages.microsoft.com /etc/apt/sources.list.d || true)
+          if [ "${#sources[@]}" -gt 0 ]; then sudo rm -f "${sources[@]}"; fi
       - name: Install Chromium for browser regressions
         if: steps.browsers.outputs.cache-hit != 'true'
         run: npx playwright install --with-deps chromium

@@ -37,6 +37,7 @@ global.globalRoute = () => '/org/settings';
 for (const name of ['SUBSCRIPTION_LOGINS', 'API_KEY_PROVIDERS', 'INSTALLATION_PLACES']) eval(`${src.match(new RegExp(`const ${name} = [^\\n]*`))[0]} global.${name} = ${name};`);
 global.projectRoute = () => '/org/project/settings';
 global.taskUrl = (id) => `/acme/app/tasks/${id}`;
+global.appRoutePath = () => null; // web/app-links.test.cjs covers it
 const preferences = new Map();
 global.localStorage = {
   getItem: (key) => preferences.has(key) ? preferences.get(key) : null,

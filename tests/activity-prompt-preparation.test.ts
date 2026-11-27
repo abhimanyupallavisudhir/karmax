@@ -226,3 +226,19 @@ it('tells a forked agent, on its first turn, which task it now is and to work th
   await turn('own-session');
   expect(delivered[1]).toBe('Also fix the docs');
 });
+
+it('tells the agent the console addresses of its task, project and organization, so it links what it mentions', async () => {
+  vi.stubEnv('KARMAX_PUBLIC_URL', 'https://tavya.example/');
+  try {
+    const { project, task, run } = await fixture();
+    const organization = (await store.getOrganization(project.organizationId!))!;
+    const org = `https://tavya.example/${organization.slug}`;
+    const prompt = await run();
+    expect(prompt).toContain(`This task: ${org}/prompt/tasks/${task.num ?? task.id}.`);
+    expect(prompt).toContain(`This project: ${org}/prompt — /tasks/<n>`);
+    expect(prompt).toContain(`Its organization: ${org} — /wiki#<page path>`);
+    expect(prompt).toContain(`e.g. [#12](${org}/prompt/tasks/12)`);
+    // The built-in working instructions ask for it too.
+    expect(prompt).toMatch(/When you refer to a task, project, wiki page, setting or anything else in \S+, link to it/);
+  } finally { vi.unstubAllEnvs(); }
+});
