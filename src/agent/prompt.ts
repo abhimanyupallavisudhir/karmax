@@ -136,7 +136,12 @@ export interface AssembleArgs {
    *  can reach there, so a request naming another project needs no lookup. */
   organizationId?: string;
   projects?: Array<{ id: string; name: string }>;
+  /** The console pages of this task, its project and organization (src/domain/console-links.ts),
+   *  so the agent links what it mentions without looking anything up. */
+  links?: PromptLinks;
 }
+
+export interface PromptLinks { task: string; project: string; organization?: string }
 
 const AGENT_AUTHORED_BINDINGS = ['transcript', 'reviewInfo', 'changedFiles', 'error'] as const;
 
@@ -159,6 +164,7 @@ Input routing for this task: its ordinary Waiting-for-input Responder is an agen
   const coordinator = args.role === 'do' && !args.task.parentTaskId ? coordinatorSetting({ coordinator: args.task.coordinator }) : undefined;
   if (coordinator) preamble += coordinatorBrief(coordinator, BRAND);
   if (args.role === 'do' && args.task.parentTaskId) preamble += describeSiblings(args.task.parentTaskId, args.siblings ?? []);
+  if (args.links) preamble += describeLinks(args.links);
   const target = args.task.target ?? args.world.target ?? args.world.base;
   if (args.role === 'do' && !computerless && (target !== args.world.base || args.task.agents?.do?.resumeFrom)) {
     preamble += `
@@ -205,6 +211,21 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
     return world.test(tpl) ? fill(tpl.replace(world, () => section)) : `${fill(tpl)}\n\n# World\n${section}`;
   }
   return tpl.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
+}
+
+/** Where the console shows what the agent mentions (web/app.js parseRoute), so a
+ * task, wiki page or setting it names is one click away for whoever reads it —
+ * in the conversation, a pull request, an e-mail or a wiki page. */
+function describeLinks(links: PromptLinks): string {
+  const organization = links.organization
+    ? ` Its organization: ${links.organization} — /wiki#<page path>, /settings#<card> (e.g. #settings-agents, #settings-plan); `
+      + `another of its projects: ${links.organization}/<project id>/… with the same paths.`
+    : '';
+  return `
+
+Links: when you mention a task, project, wiki page, file or setting of ${BRAND}, link to it, e.g. [#12](${links.project}/tasks/12). `
+    + `This task: ${links.task}. This project: ${links.project} — /tasks/<n> (or a task id), /wiki#<page path>, /files/<path>, `
+    + `/settings#<card> (e.g. #project-environment, #project-secrets).${organization}`;
 }
 
 /** Who a sub-task works beside: its parent, and the parent's other sub-tasks,
