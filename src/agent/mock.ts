@@ -365,10 +365,17 @@ export class MockAdapter implements AgentAdapter {
         // may park a login (AD-2/AD-7); anything else stays a plain Error.
         case 'fail':
           throw providerErrorFromMessage('mock', rest || 'mock failure');
-        case 'overflow':
-          if (input.session || rest === 'always') throw providerErrorFromMessage('mock', 'prompt is too long: 1200000 tokens > 1000000 maximum');
-          outputs.push('fresh session');
+        case 'overflow': {
+          // @overflow [always] [images] — the resumed session (or, with always,
+          // every session) is refused as too large: tokens, or images in bytes.
+          const images = /\bimages\b/.test(rest);
+          if (input.session || /\balways\b/.test(rest)) throw providerErrorFromMessage('mock', images
+            ? 'Internal error: {"code":413,"message":"Downloaded image content cannot exceed 30MB","metadata":{"error_type":"payload_too_large"}}'
+            : 'prompt is too long: 1200000 tokens > 1000000 maximum');
+          const told = input.messages.some((m) => m.text.includes('Your previous session ended'));
+          outputs.push(told ? 'fresh session, told why' : 'fresh session');
           break;
+        }
         case 'failworld':
           failingWorlds.set(input.world.handle.id, rest || 'mock persistent failure');
           throw providerErrorFromMessage('mock', failingWorlds.get(input.world.handle.id)!);

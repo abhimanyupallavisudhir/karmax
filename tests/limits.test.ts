@@ -515,4 +515,26 @@ describe('isContextOverflow', () => {
   it('leaves an agent\'s own output about long prompts alone', () => {
     expect(isContextOverflow('npm test: 3 failed')).toBe(false);
   });
+  // tavya-error f09e12b58cece40d (2026-11-27): an OpenCode session that had read nine
+  // rendered PDF pages sent them all with every request, past OpenRouter's 30 MB of
+  // images per request. Resuming it fails the same way, as an overflow does.
+  it.each([
+    'opencode ACP turn failed: Internal error: {"code":413,"message":"Downloaded image content cannot exceed 30MB","metadata":{"error_type":"payload_too_large"}}',
+    'API Error: 413 {"type":"error","error":{"type":"request_too_large","message":"Request exceeds the maximum size"}}',
+    'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"messages.12.content.1.image.source.base64: image exceeds 5 MB maximum: 7340032 bytes > 5242880 bytes"}}',
+    'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Too many images in request. A maximum of 100 images may be provided."}}',
+    '413 Request Entity Too Large',
+  ])('recognises a request too large to send: %s', (message) => {
+    expect(isContextOverflow(message)).toBe(true);
+    expect(isTransportError(message)).toBe(false);
+    expect(classifyLimitError(message).limited).toBe(false);
+  });
+  it('leaves other refusals and an agent\'s own words alone', () => {
+    for (const message of [
+      'git push failed: HTTP 413 curl 22 The requested URL returned error: 413',
+      'the uploaded file is too large',
+      'image.png: 4.2 MB',
+      'Rate limit reached: 429 Too Many Requests',
+    ]) expect(isContextOverflow(message)).toBe(false);
+  });
 });

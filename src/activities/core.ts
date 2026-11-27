@@ -35,7 +35,7 @@ import { capacityCause, ComputeRouter, type RouterConnections } from '../world/c
 import { accountKey, dequeue, enqueue, wakeFullKey } from '../world/compute-queue.js';
 import { MachineQueued, leaseWaitDeadline } from '../world/machine-wait.js';
 import { SetupClock } from '../world/setup-clock.js';
-import { AgentChannelLost, AgentToolsUnavailable, toolsUnavailableActivity, toolsUnavailableNotice, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
+import { AgentChannelLost, AgentToolsUnavailable, toolsUnavailableActivity, toolsUnavailableNotice, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, freshSessionNotice, type LimitClassification } from '../agent/limits.js';
 import { cacheUsageReading, cappedModelLogins, probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { clearBranchUnpublished, markBranchUnpublished, markCheckpointStale } from '../world/checkpoint-staleness.js';
 import { usageAdmissionId as admissionIdFor } from '../domain/turn-admission.js';
@@ -652,6 +652,9 @@ export interface RunAgentTurnArgs {
   agentSlotGranted?: boolean;
   /** Current workflow versions own admission, including the remote-rail exemption. */
   agentAdmissionManaged?: boolean;
+  /** The failure that made the workflow replace this role's session with a
+   *  fresh one (agent-context): the new session is told why. */
+  freshSessionCause?: string;
 }
 
 export interface PrepareChildArgs {
@@ -3989,6 +3992,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const notice = await deps.checkpoints?.takeNotice(args.taskId).catch(() => undefined);
         const last = messages.length - 1;
         if (notice) messages = messages.map((message, index) => index === last ? { ...message, text: `${message.text}\n\n(${notice})` } : message);
+      }
+      // A session replaced because it grew too large: say why, or the new one
+      // views the same images (or reads the same output) and fails the same way.
+      if (args.freshSessionCause && !session && !resumedActivityAttempt && messages.length > (deliveredMessages ?? 0)) {
+        const last = messages.length - 1;
+        const notice = freshSessionNotice(args.freshSessionCause);
+        messages = messages.map((message, index) => index === last ? { ...message, text: `${message.text}\n\n(${notice})` } : message);
       }
       if (forkNotice && !resumedActivityAttempt && messages.length > (deliveredMessages ?? 0)) {
         const last = messages.length - 1;

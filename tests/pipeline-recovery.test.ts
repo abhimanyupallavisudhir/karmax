@@ -579,6 +579,27 @@ describe('software-dev pipeline: follow-ups, confirmation modes and recovery (re
     await handle.result();
   }, 60_000);
 
+  // tavya-error f09e12b58cece40d: an OpenCode session that had viewed nine rendered
+  // PDF pages was refused with every request (OpenRouter: 413, "Downloaded image
+  // content cannot exceed 30MB"), and the task stopped for a person.
+  it('restarts Do on a fresh session, told why, when its images made it too large to send', async () => {
+    const repo = await h.makeRepo('app-request-too-large');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE, workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Too large', prompt: 'Start.\n@incomplete', resolveAgentEnabled: false })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    await handle.signal('followUp', { id: 'f1', role: 'user', text: '@overflow images\n@review carried on', ts: 0 });
+    await expect.poll(async () => (await view(handle)).messages.some((m: any) => m.role === 'agent' && m.text?.includes('fresh session, told why')),
+      { timeout: 30_000 }).toBe(true);
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    expect((await view(handle)).error).toBeUndefined();
+    expect((await h.store.eventsSince(taskId, 0)).some((e) => e.type === 'resolve.auto')).toBe(false);
+    await handle.signal('cancel');
+    await handle.result();
+  }, 60_000);
+
   it('asks a person when even a fresh session is larger than the model\'s context', async () => {
     const repo = await h.makeRepo('app-context-overflow-fresh');
     const taskId = newId('task');
@@ -591,7 +612,7 @@ describe('software-dev pipeline: follow-ups, confirmation modes and recovery (re
     await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('escalated');
     const v = await view(handle);
     expect(v.status).toBe('blocked');
-    expect(v.error).toMatch(/prompt is too long.*larger than the model's context window even in a fresh session/);
+    expect(v.error).toMatch(/prompt is too long.*too large for the model even in a fresh session/);
     expect((await h.store.eventsSince(taskId, 0)).some((e) => e.type === 'resolve.auto')).toBe(false);
     await handle.signal('cancel');
     await handle.result();

@@ -2597,11 +2597,13 @@ async function softwareDevImpl(
               freshContext = true;
               session = undefined;
               sessionHome = undefined;
+              // The new session is told why, or it repeats what overflowed the last.
+              freshSessionCause = describeError(err);
               attempt--;
               continue;
             }
             cause = 'task';
-            lastError = `${describeError(err)} — the conversation is larger than the model's context window even in a fresh session; send a narrower follow-up or start a new task`;
+            lastError = `${describeError(err)} — the conversation is too large for the model even in a fresh session; send a narrower follow-up or start a new task`;
             error = lastError;
             break;
           }
@@ -3404,6 +3406,9 @@ async function softwareDevImpl(
   // ── Do turn + sub-task hierarchy (SPEC §5.2/§5.3) ──
   /** Run one Do-agent turn (leased login, resolve-wrapped) and fold its result into
    *  the running conversation. Shared by the main loop and sub-task management. */
+  /** Why Do's session was just replaced by a fresh one (agent-context): said
+   *  to that fresh session's first turn. */
+  let freshSessionCause: string | undefined;
   async function doTurn() {
     let doHome: string | undefined;
     // How many leading `msgs` were actually handed to the agent this turn. Captured
@@ -3438,6 +3443,7 @@ async function softwareDevImpl(
           ...turnMessages(msgs, 'do'),
           session: resume,
           deliveredMessages: resume ? seen : 0,
+          ...(freshSessionCause && !resume ? { freshSessionCause } : {}),
           task: liveInput,
           accountConfigHome,
           accountApiKeyHandle,
@@ -3471,6 +3477,7 @@ async function softwareDevImpl(
       return { completed: false, providerCompleted: false, output: '', stopped: true } as AgentTurnResult & { stopped?: true };
     }
     const turn: AgentTurnResult & { stopped?: true } = ran.value;
+    freshSessionCause = undefined;
     session = turn.session ?? session;
     sessionHome = doHome ?? sessionHome;
     // The turn reports how many `msgs` it actually delivered — the batch captured at

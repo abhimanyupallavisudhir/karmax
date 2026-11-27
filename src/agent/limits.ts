@@ -480,10 +480,34 @@ export function isTransportError(error: unknown): boolean {
  * the conversation itself is too big, so resuming the same session fails the
  * same way on every retry and every follow-up (legibench3#18: "prompt is too
  * long: 11922478 tokens > 1000000 maximum", after Claude Code's own compaction).
+ *
+ * So does a request larger than the provider accepts, in bytes rather than
+ * tokens: every request carries the whole session, images included, so one
+ * that read too many or too large images can never be sent again
+ * (f09e12b58cece40d: nine rendered PDF pages, OpenRouter's 413 "Downloaded
+ * image content cannot exceed 30MB"; Anthropic's 413 `request_too_large`, its
+ * 5 MB per image and its image count).
  */
 export function isContextOverflow(message: string): boolean {
-  return /prompt is too long|context[_ ]length[_ ]exceeded|maximum context length|exceeds the (?:model'?s )?context window|ran out of room in the model'?s context window/i
-    .test(String(message ?? ''));
+  const text = String(message ?? '');
+  return CONTEXT_OVERFLOW.test(text) || REQUEST_TOO_LARGE.test(text);
+}
+
+const CONTEXT_OVERFLOW = /prompt is too long|context[_ ]length[_ ]exceeded|maximum context length|exceeds the (?:model'?s )?context window|ran out of room in the model'?s context window/i;
+const REQUEST_TOO_LARGE = /payload[_ ]too[_ ]large|request[_ ]too[_ ]large|request entity too large|request exceeds the maximum size|image content cannot exceed|image exceeds \d+(?:\.\d+)? ?[KMG]i?B maximum|too many images/i;
+
+/** What a session ended by isContextOverflow says to the one that replaces it:
+ * the work in the world is still there, only the conversation is shorter. */
+export function freshSessionNotice(message: string): string {
+  const images = /image/i.test(message);
+  const tooLarge = images || REQUEST_TOO_LARGE.test(message);
+  return `Your previous session ended because ${tooLarge
+    ? `its requests became larger than the model's provider accepts${images ? ', through the images it had viewed' : ''}`
+    : "it outgrew the model's context window"}: "${message.replace(/\s+/g, ' ').trim().slice(0, 300)}". `
+    + 'This is a new session with the conversation so far; what that session did in the world (files, commits, installed tools) is still there, so check before redoing it. '
+    + (images
+      ? 'Every image you view stays in the session and is sent again with every request: view only the images you need, downscaled (about 1000 px on the long side is plenty) or cropped to the part that matters.'
+      : 'Keep what enters the session small: read files and command output in parts rather than whole.');
 }
 
 /**
