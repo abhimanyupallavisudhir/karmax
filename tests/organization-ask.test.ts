@@ -190,15 +190,22 @@ describe('Ask, set to a quick task', () => {
     expect((await f.call('ana', 'POST', `/api/organizations/${f.organization.id}/ask`, { prompt: 'x', waitMs: 'soon' })).status).toBe(400);
   });
 
-  it('a reply the CEO gave before this Ask is not its answer', async () => {
+  it('never takes a CEO turn as the answer: not one from before, nor one ending while it waits (it may answer someone else)', async () => {
     const f = await fixture();
     const first = await f.ask('ana', 'Start');
     expect(first.status, JSON.stringify(first.json)).toBe(200);
     await f.store.appendEvent({ taskId: first.json.id, type: 'turn.result', ts: Date.now(), payload: { completed: true, output: 'Old answer' } });
-    const again = await f.call('ana', 'POST', `/api/organizations/${f.organization.id}/ask`, { prompt: 'And now?', waitMs: 800 });
+    // The CEO finishes a turn (another person's question) while this Ask is being sent.
+    const busy = setTimeout(() => void f.store.appendEvent({ taskId: first.json.id, type: 'turn.result', ts: Date.now(),
+      payload: { completed: true, output: 'An answer to someone else' } }), 50);
+    const started = Date.now();
+    const again = await f.call('ana', 'POST', `/api/organizations/${f.organization.id}/ask`, { prompt: 'And now?', waitMs: 3_000 });
+    clearTimeout(busy);
     expect(again.status, JSON.stringify(again.json)).toBe(200);
     expect(again.json.id).toBe(first.json.id);
     expect(again.json.reply).toBeUndefined();
+    // It does not wait for a reply it would not take.
+    expect(Date.now() - started).toBeLessThan(2_500);
   });
 
   it('an empty question, or an organization that does not exist, is refused', async () => {
