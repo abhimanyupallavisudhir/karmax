@@ -11281,6 +11281,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   $('#tf-save-avatar')?.addEventListener('click', () => submitCommitted(true));
   wireCoordinatorSection(root);
   wireRolePrompt(root, projectId, draft);
+  wireDraftPending(root, draft);
   $('#tf-draft')?.addEventListener('click', () => submitCommitted(true));
   $('#tf-queue').addEventListener('click', () => submitCommitted(false));
   // A repeatable store task installs; unticked, it runs once.
@@ -20334,6 +20335,22 @@ function wireRolePrompt(root, projectId, draft) {
   });
   prompt.addEventListener('input', () => { if (role) sync(); });
   if (coordinator()) sync();
+}
+// Messages waiting for a draft — an Ask to a CEO not started yet, or the words
+// the role prompt's migration moved out of its prompt — show under the prompt,
+// as they will be sent (wiki features/queued-messages).
+const DRAFT_PENDING_TIP = 'Not sent yet. The agent gets it once the task starts.';
+async function wireDraftPending(root, draft) {
+  const row = draft?.id && root?.querySelector('.prompt-field')?.closest('.form-row');
+  if (!row) return;
+  const { pendingMessages = [] } = await api(`/api/tasks/${encodeURIComponent(draft.id)}/pending-messages`).catch(() => ({}));
+  if (!pendingMessages.length || !row.isConnected || root.querySelector('.tf-pending')) return;
+  const mark = `<button type="button" class="info-dot pending-mark" title="${esc(DRAFT_PENDING_TIP)}" aria-label="${esc(DRAFT_PENDING_TIP)}">${ICON.clock}</button>`;
+  const html = pendingMessages.filter((p) => p.role === 'do').map((p) =>
+    renderConversationEntry({ type: 'message', message: p.message }, { participants: [] })
+      .replace('<div class="msg ', `<div data-pending="${esc(p.message.id)}" class="msg pending `)
+      .replace('<span class="msg-meta-gap"></span>', `${mark}<span class="msg-meta-gap"></span>`)).join('');
+  if (html) row.insertAdjacentHTML('afterend', `<div class="form-row tf-pending">${html}</div>`);
 }
 // The Parameters tab's row: the interval, changeable all the task's life.
 function coordinatorParamRow(field, value, editable, frozenLabel) {

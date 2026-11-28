@@ -80,7 +80,7 @@ export async function setUpAutonomy(
     // already written to or started is theirs, and stays as it is.
     const ceo = await ensureCeo(deps, projectId);
     let coordinatorId = ceo.id, replaced: string | undefined;
-    if (untouchedCeoDraft(ceo)) {
+    if (await untouchedCeoDraft(store, ceo)) {
       const coordinator = await api.createTask(token, {
         projectId, draft: true, title: ceoTitle(scope === 'organization' || project.coordinator ? 'organization' : 'project'),
         prompt: scope === 'organization' ? organizationCoordinatorPrompt() : '',

@@ -114,6 +114,7 @@ import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { avatarAllows, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled, avatarPrincipal, avatarRoleOf, forkedAvatar,
   normalizeAvatarSetting, AVATAR_ROLE_LABELS, type AvatarRole } from './avatars.js';
 import { CapabilityError, ConflictError, NotFoundError, TaskStartedError, ValidationError } from './errors.js';
+import { CEO_PRINCIPAL } from './ceo.js';
 import { acceptsQueuedMessages, parsePending, pendingForView, pendingMessagesKey, PENDING_MESSAGES_PREFIX, QUEUED_FOLLOW_UP_ACTION, type PendingMessage, type SentMessage } from './pending-messages.js';
 import type { AccountLeaseAnswer, AccountQueueView } from '../coordinators/account.js';
 import type { SchedulingQueueTask, SchedulingQueueView } from '../scheduling/view.js';
@@ -7618,14 +7619,41 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     const sender = (await this.deps.tokens.verify(token));
     if (!sender) throw new CapabilityError('who sends this message is unknown');
     if (input.files?.length) (await this.validatePromptFiles(task.projectId, input.files));
+    return this.keepMessage(taskId, input, sender.principal, await this.speaker(sender));
+  }
+
+  /**
+   * The same for words a person wrote before they could be sent as a message:
+   * the one-time migration moves what someone wrote into a CEO draft's prompt
+   * (the Asks of before) to its first message, theirs (wiki features/coordinator
+   * § Role prompt). Platform-internal; nobody known ⇒ the platform's, unsigned.
+   */
+  async keepMessageFromPerson(taskId: string, input: { text: string; images?: ImageRef[]; files?: FileRef[] }, userId: string | undefined): Promise<SentMessage> {
+    if (!(await this.deps.store.getTask(taskId))) throw new NotFoundError(`no task ${taskId}`);
+    if (!userId) return this.keepMessage(taskId, input, CEO_PRINCIPAL, {});
+    const name = await this.deps.store.userDisplayName(userId);
+    return this.keepMessage(taskId, input, `user:${userId}`, { author: `user:${userId}`, ...(name ? { authorLabel: name } : {}) });
+  }
+
+  private async keepMessage(taskId: string, input: { text: string; images?: ImageRef[]; files?: FileRef[] }, by: string,
+    speaker: Partial<Message>): Promise<SentMessage> {
     const message: Message = { id: `u${randomUUID()}`, role: 'user', text: input.text, ts: Date.now(),
       ...(input.images?.length ? { images: input.images } : {}), ...(input.files?.length ? { files: input.files } : {}),
-      ...(await this.speaker(sender)) };
+      ...speaker };
     await this.withPendingLock(taskId, async () =>
-      this.writePending(taskId, [...(await this.readPending(taskId)), { message, role: MAIN_AGENT, by: sender.principal }]));
+      this.writePending(taskId, [...(await this.readPending(taskId)), { message, role: MAIN_AGENT, by }]));
     // It may have started meanwhile.
     void this.flushPendingMessages(taskId);
     return { ...message, queued: true as const };
+  }
+
+  /** The messages waiting for a task that has not started (a draft has no
+   * view to carry them): what its form shows under the prompt. */
+  async pendingMessagesOf(token: string, taskId: string): Promise<NonNullable<TaskView['pendingMessages']>> {
+    const task = (await this.deps.store.getTask(taskId));
+    const caller = (await this.require(token, 'get_conversation', { projectId: task?.projectId, taskId }));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    return pendingForView(await this.readPending(taskId), caller.principal);
   }
 
   /** Who says a message from outside a task's own agents: a person by name, or

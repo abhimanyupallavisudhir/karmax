@@ -277,7 +277,8 @@ describe('making a permanent co-ordinator', () => {
     const draft = await make({ ...stale, draft: true });
     const running = await make({ ...stale, draft: false });
     const edited = await make({ ...stale, prompt: `${old} Plus mine.`, draft: true });
-    expect(await refreshCoordinatorPrompts(f.store)).toEqual({ migrated: 0, refreshed: 2 });
+    const keepMessage = () => { throw new Error('nothing to move'); };
+    expect(await refreshCoordinatorPrompts(f.store, { keepMessage })).toEqual({ migrated: 0, refreshed: 2 });
     const role = coordinatorRolePrompt('project');
     for (const id of [draft.id, running.id]) {
       const task = (await f.store.getTask(id))!;
@@ -286,25 +287,54 @@ describe('making a permanent co-ordinator', () => {
     }
     expect((await f.store.getTask(edited.id))!.params.prompt).toBe(`${old} Plus mine.`);
     // Up to date: nothing more to do.
-    expect(await refreshCoordinatorPrompts(f.store)).toEqual({ migrated: 0, refreshed: 0 });
+    expect(await refreshCoordinatorPrompts(f.store, { keepMessage })).toEqual({ migrated: 0, refreshed: 0 });
   });
 
   it('gives co-ordinators from before the role prompt theirs once, keeping what each was told', async () => {
     const f = await fixture();
-    const { refreshCoordinatorPrompts } = await import('../src/platform/ceo.js');
-    const make = (params: Record<string, unknown>) => f.store.createTask({ projectId: f.project.id, title: 'CEO', workflow: 'software-dev',
+    const { refreshCoordinatorPrompts, CEO_PRINCIPAL, untouchedCeoDraft } = await import('../src/platform/ceo.js');
+    const { CEO_KEY } = await import('../src/domain/coordinator.js');
+    const { parsePending, pendingMessagesKey } = await import('../src/platform/pending-messages.js');
+    const make = (params: Record<string, unknown>, projectId = f.project.id) => f.store.createTask({ projectId, title: 'CEO', workflow: 'software-dev',
       workflowVersion: '1.30.0', params: { prompt: '', coordinator: { wakeHours: 24 }, ...params }, createdBy: { kind: 'user', userId: 'owner' } });
     const blankDraft = await make({ prompt: '', draft: true });
+    // A form-made co-ordinator someone wrote: their prompt, the role above it.
     const writtenDraft = await make({ prompt: 'Plan the launch', draft: true });
     const startedBlank = await make({ prompt: '', draft: false });
     const startedAsked = await make({ prompt: 'Plan the launch', draft: false });
-    expect((await refreshCoordinatorPrompts(f.store)).migrated).toBe(4);
+    // The project's CEO, its old Ask written in: the role becomes its prompt, the Ask its first message.
+    const ceo = await make({ prompt: 'Plan the launch\n\nAlso hire a designer', draft: true,
+      _authorization: { principal: CEO_PRINCIPAL, capabilities: [] } });
+    await f.store.kvSet(CEO_KEY(f.project.id), ceo.id);
+    // Another project's CEO, waiting for approval of the asker's Ask: it is the asker's.
+    const other = await f.store.createProject('Shop', {} as any);
+    const asked = await make({ prompt: 'Open the shop', draft: true, _awaitingApproval: 'authreq_1',
+      _authorization: { principal: CEO_PRINCIPAL, capabilities: [] } }, other.id);
+    await f.store.kvSet(CEO_KEY(other.id), asked.id);
+    await f.store.kvSet('authorization:requests:org_personal', JSON.stringify([{ id: 'authreq_1', type: 'authorization', organizationId: 'org_personal',
+      projectId: other.id, target: { kind: 'task', taskId: asked.id, queueAfterApproval: true }, requestedBy: 'user:asker', status: 'pending',
+      authorization: {}, capabilities: [], missingCapabilities: [], audience: [], recipients: [], reason: 'Start the CEO', createdAt: 1 }]));
+    f.store.connectUserNames(() => [{ id: 'asker', name: 'Asha Asker' }]);
+    const keepMessage = (taskId: string, message: { text: string }, userId: string | undefined) => f.api.keepMessageFromPerson(taskId, message, userId);
+    expect((await refreshCoordinatorPrompts(f.store, { keepMessage })).migrated).toBe(6);
     const role = coordinatorRolePrompt('project');
     const read = async (id: string) => (await f.store.getTask(id))!.params;
+    const queued = async (id: string) => parsePending(await f.store.kvGet(pendingMessagesKey(id)));
     expect(await read(blankDraft.id)).toMatchObject({ prompt: role, [ROLE_PROMPT_PARAM]: rolePromptMarkerFor(role) });
-    // Someone's words stay theirs, under the role it was told until now.
     expect((await read(writtenDraft.id)).prompt).toBe(`${role}\n\nPlan the launch`);
     expect((await read(writtenDraft.id))[ROLE_PROMPT_PARAM]).toBeUndefined();
+    expect(await queued(writtenDraft.id)).toEqual([]);
+    // The CEO: the default role, untouched (so it keeps up with the role text), and one message, the creator's.
+    expect(await read(ceo.id)).toMatchObject({ prompt: role, [ROLE_PROMPT_PARAM]: rolePromptMarkerFor(role) });
+    const [moved, ...more] = await queued(ceo.id);
+    expect(more).toEqual([]);
+    expect(moved).toMatchObject({ role: 'do', by: 'user:owner', message: { role: 'user', text: 'Plan the launch\n\nAlso hire a designer', author: 'user:owner' } });
+    // Left a message, it is no longer the draft the platform made: autonomy keeps it.
+    expect(await untouchedCeoDraft(f.store, (await f.store.getTask(ceo.id))!)).toBe(false);
+    // Awaiting approval: the asker's, by name, and it still waits for that approval.
+    const [ask] = await queued(asked.id);
+    expect(ask).toMatchObject({ by: 'user:asker', message: { text: 'Open the shop', author: 'user:asker', authorLabel: 'Asha Asker' } });
+    expect(await read(asked.id)).toMatchObject({ prompt: role, [ROLE_PROMPT_PARAM]: rolePromptMarkerFor(role), _awaitingApproval: 'authreq_1' });
     // Started: the role is shown, and its turns read what they read before.
     for (const [task, started] of [[startedBlank, ''], [startedAsked, 'Plan the launch']] as const) {
       const params = await read(task.id);
@@ -312,7 +342,8 @@ describe('making a permanent co-ordinator', () => {
       expect(coordinatorTurnPrompt(params, started)).toBe(started ? `${role}\n\n${started}` : role);
     }
     // Once only.
-    expect(await refreshCoordinatorPrompts(f.store)).toEqual({ migrated: 0, refreshed: 0 });
+    expect(await refreshCoordinatorPrompts(f.store, { keepMessage })).toEqual({ migrated: 0, refreshed: 0 });
+    expect(await queued(ceo.id)).toHaveLength(1);
   });
 
   it('refuses an interval out of range, a repeatable co-ordinator and another workflow', async () => {

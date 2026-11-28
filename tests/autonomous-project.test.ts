@@ -209,7 +209,7 @@ describe('autonomous project', () => {
     // Only the project's own CEO is left, as untouched as it was: no Avatār, and no CEO with its authority.
     const left = (await f.store.listTasks(f.project.id)).filter((task) => task.params.avatar || task.params.coordinator);
     expect(left).toHaveLength(1);
-    expect(untouchedCeoDraft(left[0]!)).toBe(true);
+    expect(await untouchedCeoDraft(f.store, left[0]!)).toBe(true);
     expect(await f.store.getSettings(f.project.id, '__common__')).toEqual({ otherAttempts: 'keep' });
     f.api.saveWikiPageResolved = original;
     expect((await f.api.makeAutonomous(f.owner, f.project.id)).scope).toBe('project');

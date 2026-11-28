@@ -1787,6 +1787,8 @@ textarea.ask-input { resize: vertical; min-height: 4.5em; }
 /* Queued until the task can take it (wiki features/queued-messages). */
 .msg.pending { background: transparent; border: 1px dashed var(--line-strong); }
 .msg.pending .msg-text { color: var(--ink-2); }
+/* A draft's waiting messages, under its prompt in the form. */
+.tf-pending { display: flex; flex-direction: column; gap: 6px; }
 .pending-mark.info-dot { width: auto; height: auto; background: transparent; color: var(--ink-3); }
 .pending-mark svg { width: 13px; height: 13px; display: block; }
 .conversation-presence { display: inline-flex; align-items: center; gap: 6px; padding: 2px 7px; border-radius: 999px; color: var(--ink-2); background: var(--surface-2); font-size: var(--fs-11); }

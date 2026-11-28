@@ -34,15 +34,21 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
       params: { prompt: ROLE, coordinator: { wakeHours: 24 }, _rolePrompt: marker },
       lastView: { taskId: 'new', title: 'CEO (Organization Co-ordinator)', workflow: 'software-dev', stage: 'do', status: 'active',
         messages: [{ id: 'm0', role: 'user', text: 'An older role text', ts: 2 }], actions: [], state: {} } };
+    // A CEO draft whose old Ask the migration moved out of its prompt: it waits as its first message.
+    const draftCeo = { id: 'draftceo', projectId: 'p', title: 'CEO (Project Co-ordinator)', workflow: 'software-dev', tags: [], createdAt: 1,
+      params: { draft: true, prompt: ROLE, coordinator: { wakeHours: 24 }, _rolePrompt: marker } };
     const schema = [{ name: 'software-dev', params: [
       { name: 'prompt', type: 'text', label: 'Prompt', scopes: ['task'], bind: 'prompt' },
       { name: 'multiPr', type: 'boolean', label: 'Allow several branches per task', scopes: ['task'], bind: 'project', default: true },
     ], stages: [{ key: 'do', label: 'Working' }] }];
     const creates = [];
     const edits = [];
-    await fakeConsole(context, { project, tasks: [running, legacy, refreshed], schema, async api(p, request) {
+    await fakeConsole(context, { project, tasks: [running, legacy, refreshed, draftCeo], schema, async api(p, request) {
       const method = request.method();
       if (p === '/api/projects/p/coordinator-role') return { kind: 'project', version: 1, prompt: ROLE };
+      if (p === '/api/projects/p/coordinator-role?taskId=draftceo') return { kind: 'project', version: 1, prompt: ROLE };
+      if (p === '/api/tasks/draftceo/pending-messages') return { pendingMessages: [{ role: 'do',
+        message: { id: 'u9', role: 'user', text: 'Plan the launch', ts: 1, author: 'user:ana', authorLabel: 'Ana' } }] };
       if (p === '/api/tasks/old' && method === 'GET') return legacy.lastView;
       if (p === '/api/tasks/new' && method === 'GET') return refreshed.lastView;
       if (p === '/api/projects/p/avatars') return { availability: { organization: true, project: 'inherit', effective: true }, avatars: [] };
@@ -151,6 +157,21 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     await page.goto('http://console.test/org/workspace/tasks/new');
     await thread.getByText("So don't make changes yourself.").waitFor();
     assert.equal(await thread.getByText('An older role text').count(), 0, 'the role as it reads now, once');
+
+    // ── a draft: its role is its prompt, and what waits for it shows under it, by whom ──
+    await page.goto('http://console.test/org/workspace/tasks/draftceo');
+    const waiting = page.locator('#tf-page .tf-pending .msg.pending');
+    await waiting.waitFor();
+    assert.equal(await page.locator('#tf-page textarea[data-field="prompt"]').inputValue(), ROLE);
+    assert.match(await waiting.innerText(), /Ana[\s\S]*Plan the launch/);
+    assert.match(await waiting.locator('.pending-mark').getAttribute('title'), /once the task starts/, 'what it is is a tooltip');
+    if (shots) {
+      await page.waitForTimeout(500); // the page's entrance fades
+      const prompt = await page.locator('[data-row="prompt"]').boundingBox();
+      const queued = await page.locator('.tf-pending').boundingBox();
+      await page.screenshot({ path: `${shots}/coordinator-draft-pending.png`,
+        clip: { x: prompt.x, y: prompt.y, width: prompt.width, height: queued.y + queued.height - prompt.y + 4 } });
+    }
 
     assert.deepEqual(errors, []);
     console.log('ok — coordinator form row, role prompt, forced branches, interval, list chip, Parameters edit and conversation');

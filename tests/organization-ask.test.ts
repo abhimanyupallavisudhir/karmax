@@ -337,6 +337,11 @@ describe('Ask to the CEO', () => {
     expect(f.started).not.toContain(first.json.id);
     expect(parsePending(await f.store.kvGet(pendingMessagesKey(first.json.id))).map(({ message, by }) => [message.text, message.author, by]))
       .toEqual([['Plan the launch', 'user:bo', 'user:bo']]);
+    // The draft's form shows it under the prompt, as the asker's.
+    const shown = await f.call('ana', 'GET', `/api/tasks/${first.json.id}/pending-messages`);
+    expect(shown.status, JSON.stringify(shown.json)).toBe(200);
+    expect(shown.json.pendingMessages).toEqual([expect.objectContaining({ role: 'do', message: expect.objectContaining({ text: 'Plan the launch', author: 'user:bo' }) })]);
+    expect(shown.json.pendingMessages[0].mine).toBeUndefined();
     // What it holds meanwhile is still nothing of what it asks for.
     expect(((await f.store.getTask(first.json.id))!.params._authorization as { capabilities: string[] }).capabilities).not.toContain('payment:write');
 

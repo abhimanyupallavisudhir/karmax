@@ -514,6 +514,7 @@ export function routeCapability(method: string, p: string, url?: URL): KnownCapa
   if (/\/artifacts(?:\/promote)?$/.test(p) || /^\/api\/artifacts\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/preview-leases$/.test(p) || /^\/api\/preview-leases\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/signal$/.test(p) || /^\/api\/tasks\/[^/]+\/agents\/[^/]+\/stop$/.test(p)) return 'task:signal';
+  if (/^\/api\/tasks\/[^/]+\/pending-messages$/.test(p)) return 'task:conversation:read';
   if (/^\/api\/tasks\/[^/]+\/messages(?:\/[^/]+)?$/.test(p)) return 'task:conversation:message';
   if (/\/escalate$/.test(p)) return 'task:escalate';
   if (p.startsWith('/api/tasks/')) return read ? 'task:read' : method === 'DELETE' ? 'task:delete' : 'task:edit';
@@ -6598,6 +6599,10 @@ export class Gateway {
       const stopAgentMatch = p.match(/^\/api\/tasks\/([^/]+)\/agents\/([^/]+)\/stop$/);
       if (stopAgentMatch && method === 'POST')
         return this.json(res, 200, { ok: true, ...(await api.stopAgent(token, stopAgentMatch[1]!, decodeURIComponent(stopAgentMatch[2]!))) });
+      // What waits for a task not started yet: a draft's form shows it (wiki features/queued-messages).
+      const pendingMatch = p.match(/^\/api\/tasks\/([^/]+)\/pending-messages$/);
+      if (pendingMatch && method === 'GET')
+        return this.json(res, 200, { pendingMessages: await api.pendingMessagesOf(token, pendingMatch[1]!) });
       // Take back a message that is still waiting for its task (wiki features/queued-messages).
       const unsendMatch = p.match(/^\/api\/tasks\/([^/]+)\/messages\/([^/]+)$/);
       if (unsendMatch && method === 'DELETE')

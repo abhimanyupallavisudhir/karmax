@@ -1,7 +1,9 @@
 import type { Store } from '../store/db.js';
 import type { TokenAuthority } from './tokens.js';
 import type { KarmaxApi } from './api.js';
-import type { AuthorizationSelection, PrincipalRef, Project, TaskRecord } from '../domain/types.js';
+import type { AuthorizationSelection, FileRef, ImageRef, PrincipalRef, Project, TaskRecord } from '../domain/types.js';
+import { AuthorizationRequests } from './authorization-requests.js';
+import { parsePending, pendingMessagesKey } from './pending-messages.js';
 import { AUTONOMY_KEY, type ProjectAutonomy } from '../domain/autonomous-projects.js';
 import { CEO_KEY, ceoTitle, coordinatorRolePrompt, DEFAULT_COORDINATOR_WAKE_HOURS, LEGACY_CEO_PROJECT_NAME, readRolePromptMarker,
   refreshedRolePrompt, rolePromptHash, ROLE_PROMPT_PARAM, untouchedRolePrompt, COORDINATOR_ROLE_VERSION,
@@ -68,12 +70,13 @@ export async function projectCeo(store: Store, projectId: string): Promise<TaskR
 }
 
 /** Whether the CEO is still the draft the platform made: its prompt is still
- * the role text (or, from before, empty), nobody has started it or asked to
- * have it started, so whoever starts it decides with whose authority. */
-export function untouchedCeoDraft(task: TaskRecord): boolean {
+ * the role text (or, from before, empty), nobody has started it, asked to have
+ * it started or left it a message, so whoever starts it decides with whose authority. */
+export async function untouchedCeoDraft(store: Pick<Store, 'kvGet'>, task: TaskRecord): Promise<boolean> {
   const authorization = task.params?._authorization as { principal?: string } | undefined;
   return !!task.params?.draft && !task.params?._awaitingApproval && authorization?.principal === CEO_PRINCIPAL
-    && (!String(task.params?.prompt ?? '').trim() || untouchedRolePrompt(task.params));
+    && (!String(task.params?.prompt ?? '').trim() || untouchedRolePrompt(task.params))
+    && !parsePending(await store.kvGet(pendingMessagesKey(task.id))).length;
 }
 
 /** The project's CEO, made now as a draft if it has none. `createdBy` is whom
@@ -161,20 +164,50 @@ export async function coordinatorRoleKind(store: Store, project: Pick<Project, '
   } catch { return 'organization'; }
 }
 
+/** Whether the task is its project's CEO (`ensureCeo`'s record), not a
+ * co-ordinator someone made from the task form. */
+async function isProjectCeo(store: Store, task: Pick<TaskRecord, 'id' | 'projectId'>): Promise<boolean> {
+  return (await store.kvGet(CEO_KEY(task.projectId))) === task.id;
+}
+
 /** The kv record of the one-time migration below. */
 export const ROLE_PROMPT_MIGRATION_KEY = 'migration:coordinator-role-prompt:v1';
 
+/** Queue words as a person's first message to a task not started yet
+ * (`KarmaxApi.keepMessageFromPerson`, the path an Ask takes). */
+export type KeepMessage = (taskId: string, message: { text: string; images?: ImageRef[]; files?: FileRef[] },
+  userId: string | undefined) => Promise<unknown>;
+
+/** Who wrote into a CEO draft before the role was its prompt: the asker whose
+ * Ask waits for approval (the old Ask wrote itself into the prompt, then asked),
+ * else whom the CEO is for. Edits record no editor, so that is the fallback. */
+async function writerOf(store: Store, task: { id: string; projectId: string; params: Record<string, unknown> }): Promise<string | undefined> {
+  const awaiting = task.params?._awaitingApproval;
+  if (typeof awaiting === 'string') {
+    const organizationId = (await store.getProject(task.projectId))?.organizationId ?? 'org_personal';
+    const request = (await new AuthorizationRequests(store, organizationId).requests({ taskId: task.id }))
+      .find((candidate) => candidate.id === awaiting);
+    if (request?.requestedBy.startsWith('user:')) return request.requestedBy.slice(5);
+  }
+  return store.taskCreatorUserId(task.id);
+}
+
 /**
  * Boot (wiki features/coordinator § Role prompt). Once: every co-ordinator from
- * before the role was its prompt gets it, keeping what it was told. One never
- * started gets the role as its prompt — above what someone wrote there, which
- * then stays theirs. One already started gets the role as its shown prompt,
- * marked `outsideConversation`: its conversation's first message and its run
- * keep what it started with, and its turns read the role followed by that, as
- * its brief used to say it (`coordinatorTurnPrompt`), so it behaves the same.
- * Every boot: a role prompt nobody edited takes the current role text.
+ * before the role was its prompt gets it, keeping what it was told. A CEO draft
+ * someone wrote in (nearly always Asks, which the old Ask wrote there) gets the
+ * role as its prompt, untouched, and what was written — with its attachments —
+ * becomes its first message, the writer's (`writerOf`), as an Ask is now. Any
+ * other co-ordinator draft gets the role above its words, which stay its
+ * creator's prompt as the form would do. One already started gets the role as
+ * its shown prompt, marked `outsideConversation`: its conversation's first
+ * message and its run keep what it started with, and its turns read the role
+ * followed by that, as its brief used to say it (`coordinatorTurnPrompt`), so
+ * it behaves the same. Every boot: a role prompt nobody edited takes the
+ * current role text.
  */
-export async function refreshCoordinatorPrompts(store: Store, log: (message: string) => void = console.warn): Promise<{ migrated: number; refreshed: number }> {
+export async function refreshCoordinatorPrompts(store: Store, options: { keepMessage: KeepMessage; log?: (message: string) => void }): Promise<{ migrated: number; refreshed: number }> {
+  const { keepMessage, log = console.warn } = options;
   let migrated = 0, refreshed = 0;
   const migrate = !(await store.kvGet(ROLE_PROMPT_MIGRATION_KEY));
   const kinds = new Map<string, CoordinatorRoleKind>();
@@ -196,7 +229,14 @@ export async function refreshCoordinatorPrompts(store: Store, log: (message: str
         const stamp = { kind, version: COORDINATOR_ROLE_VERSION, hash: rolePromptHash(role) };
         if (!taskUnstarted(task.params)) await store.patchTaskParams(task.id, { prompt: role, [ROLE_PROMPT_PARAM]: { ...stamp, outsideConversation: true } });
         else if (!written) await store.patchTaskParams(task.id, { prompt: role, [ROLE_PROMPT_PARAM]: stamp });
-        else await store.patchTaskParams(task.id, { prompt: `${role}\n\n${written}` });
+        else if (await isProjectCeo(store, task)) {
+          // Queued first, so a failure leaves the words where they were.
+          const images = (task.params.images as ImageRef[] | undefined) ?? [], files = (task.params.files as FileRef[] | undefined) ?? [];
+          await keepMessage(task.id, { text: written, ...(images.length ? { images } : {}), ...(files.length ? { files } : {}) },
+            await writerOf(store, task));
+          await store.patchTaskParams(task.id, { prompt: role, [ROLE_PROMPT_PARAM]: stamp,
+            ...(images.length ? { images: [] } : {}), ...(files.length ? { files: [] } : {}) });
+        } else await store.patchTaskParams(task.id, { prompt: `${role}\n\n${written}` });
         migrated++;
         continue;
       }
