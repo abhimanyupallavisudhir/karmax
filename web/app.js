@@ -189,7 +189,7 @@ const S = {
   permissionRequests: [], // exact capability elevations requested by the selected task
   approvalItems: [], // organization vault metadata used to label/bind those requests
   liveOutput: {}, // role → { text, seq, turnId, attempt }: each agent's streamed text so far
-  followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
+  messageDrafts: {}, // half-typed messages (follow-ups by taskId/role, Ask by ask:<org>), read through messageDraft()
   followupHeights: {}, // manual minimum height for each draft, preserved across background renders
   // In-flight parameter edits are deliberately manual-save. Keep their working
   // values outside the DOM so a live task refresh cannot silently erase them.
@@ -5145,6 +5145,7 @@ async function boot() {
     history.replaceState({ kx: 1 }, '', '/');
   S.token = session.token || null; // Better Auth uses an HttpOnly same-origin cookie.
   S.user = session.user || null;
+  forgetOldDrafts();
   wireNativeApp().catch(() => {});
   if (location.pathname === '/mcp-callback') return finishMcpCallback();
   if (location.pathname === '/device') return renderDeviceApproval();
@@ -9233,13 +9234,61 @@ function openNewTaskForm(template, projectId = template?.projectId) {
 }
 function newTaskTarget() { return S.tab === 'home' ? newTaskProjectId() : S.projectId; }
 
+// ── message drafts ────────────────────────────────────────────────────────────
+// What someone has half typed into a message box (a task's follow-up, Ask) is
+// kept per person in this browser as they type, dictation included: it outlives
+// repaints, closing the box, a reload and a server restart, and only a send that
+// went through clears it. Signing out forgets it; untouched for 30 days it goes.
+// (A task's prompt is a draft task on the server: the task form saves it.)
+const DRAFT_STORE = 'tavya.draft.';
+const DRAFT_MAX_AGE_MS = 30 * 24 * 3600_000;
+function draftStoreKey(key) { return `${DRAFT_STORE}${S.user?.id || 'local'}:${key}`; }
+function messageDraft(key) {
+  if (!Object.hasOwn(S.messageDrafts, key)) {
+    let text = '';
+    try { text = JSON.parse(localStorage.getItem(draftStoreKey(key)) || 'null')?.text || ''; } catch { /* private mode */ }
+    S.messageDrafts[key] = text;
+  }
+  return S.messageDrafts[key];
+}
+function setMessageDraft(key, text) {
+  S.messageDrafts[key] = text || '';
+  try {
+    if (text) localStorage.setItem(draftStoreKey(key), JSON.stringify({ text, at: Date.now() }));
+    else localStorage.removeItem(draftStoreKey(key));
+  } catch { /* private mode or full: kept for this page */ }
+}
+/** Drafts typed in another tab are read afresh; old ones go, and a sign-out takes this person's. */
+function storedDraftKeys() {
+  try { return Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i)).filter((k) => k?.startsWith(DRAFT_STORE)); } catch { return []; }
+}
+function forgetOldDrafts(now = Date.now()) {
+  for (const k of storedDraftKeys()) {
+    let at = 0;
+    try { at = Number(JSON.parse(localStorage.getItem(k) || 'null')?.at) || 0; } catch {}
+    if (now - at > DRAFT_MAX_AGE_MS) try { localStorage.removeItem(k); } catch {}
+  }
+}
+function forgetMyDrafts() {
+  const mine = `${DRAFT_STORE}${S.user?.id || 'local'}:`;
+  for (const k of storedDraftKeys()) if (k.startsWith(mine)) try { localStorage.removeItem(k); } catch {}
+  S.messageDrafts = {};
+}
+if (typeof window !== 'undefined') window.addEventListener('storage', (event) => {
+  const mine = `${DRAFT_STORE}${S.user?.id || 'local'}:`;
+  if (event.key?.startsWith(mine)) delete S.messageDrafts[event.key.slice(mine.length)];
+});
+
 // "Ask tavya" (wiki features/computerless-tasks § Ask): what you type goes where
 // the organization sends Ask — a quick task without a computer in its CEO
 // project, acting with your own authority (one conversation is one task), or
 // its CEO (the first Ask starts it). Its page opens with the message box ready.
 // Someone whose authority covers only some projects asks in one of those.
+// Enter is a new line and ⌘/Ctrl+Enter asks, as in every message box; what is
+// typed is kept as a draft until an Ask goes through.
 function askTavya() {
   const organizationId = S.organizationId;
+  const draftKey = `ask:${organizationId}`;
   const previousFocus = document.activeElement;
   const dialog = document.createElement('dialog');
   dialog.className = 'text-prompt ask-dialog';
@@ -9249,9 +9298,11 @@ function askTavya() {
       placeholder="Ask ${esc(siteName())} anything: change a setting, find what waits on you, start a task…"></textarea>
       ${mic ? `<div class="prompt-attach-row ask-mic">${mic}</div>` : ''}</div>
     <div class="inline-form ask-foot"><span class="ask-where">${policyTip(ASK_CEO_TIP)}</span>
-      <button class="btn primary" value="submit" title="Ask (Enter)">Ask</button></div></form>`;
+      <button class="btn primary" value="submit" data-keys="${SEND_KEYS}" title="Ask (${esc(fmtKeys(SEND_KEYS))})">Ask</button></div></form>`;
   const input = dialog.querySelector('textarea');
   const form = dialog.querySelector('form');
+  input.value = messageDraft(draftKey);
+  input.addEventListener('input', () => setMessageDraft(draftKey, input.value));
   let sending = false;
   api(`/api/organizations/${encodeURIComponent(organizationId)}/ask-settings`, { maxAge: 30_000 }).then((ask) => {
     const where = dialog.querySelector('.ask-where');
@@ -9259,6 +9310,8 @@ function askTavya() {
   }).catch(() => {});
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
+    // What is sent is what the box shows: the mic stops here, not into an emptied box.
+    if (S.dictation?.key === 'ask') stopDictation();
     const text = input.value.trim();
     if (!text || sending) return;
     sending = true;
@@ -9276,6 +9329,8 @@ function askTavya() {
         created = await api(`/api/projects/${encodeURIComponent(projectId)}/tasks`, { method: 'POST', body: JSON.stringify({
           workflow: NEW_TASK_WORKFLOW, ownAuthority: true, params: { prompt: text, computer: { provider: NO_COMPUTER } } }) });
       }
+      // Asked: the draft goes (unless more was typed meanwhile, which stays for next time).
+      if (messageDraft(draftKey).trim() === text) setMessageDraft(draftKey, '');
       // A co-ordinator project made just now joins the sidebar.
       if (!projectById(created.projectId)) { await loadProjects(); renderRail(); }
       dialog.close();
@@ -9292,12 +9347,13 @@ function askTavya() {
   dialog.addEventListener('keydown', (event) => {
     event.stopPropagation(); // the console's shortcuts stay outside, but for dictation
     if (runDictationShortcut(event)) return;
-    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); form.requestSubmit(); }
+    if (isSendKey(event)) { event.preventDefault(); form.requestSubmit(); }
   });
   dialog.addEventListener('close', () => { stopDictation(); dialog.remove(); if (!sending) previousFocus?.focus?.(); });
   document.body.appendChild(dialog);
   dialog.showModal();
   input.focus();
+  input.setSelectionRange(input.value.length, input.value.length); // a kept draft goes on where it stopped
 }
 /** Focus what a page is about to render (a task page's message box). */
 function focusWhenReady(selector, deadline = Date.now() + 8000) {
@@ -9473,7 +9529,7 @@ function templateSaveDialog(initialName = '') {
     dialog.querySelector('[data-cancel]').onclick = () => dialog.close();
     dialog.addEventListener('keydown', (event) => {
       event.stopPropagation();
-      if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) { event.preventDefault(); dialog.querySelector('form').requestSubmit(dialog.querySelector('button[value="submit"]')); }
+      if (isSendKey(event)) { event.preventDefault(); dialog.querySelector('form').requestSubmit(dialog.querySelector('button[value="submit"]')); }
     });
     dialog.addEventListener('close', () => {
       const name = dialog.querySelector('input[name="name"]').value.trim();
@@ -10148,7 +10204,7 @@ function initialTaskFormSavedSignature(draft, seedText, signature) {
 // secondary modals still get first ownership of their own keyboard interactions.
 function taskFormKeyAction(e, secondaryModalOpen) {
   if (secondaryModalOpen) return null;
-  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) return 'submit';
+  if (isSendKey(e)) return 'submit';
   if (e.key === 'Escape') return 'close';
   return null;
 }
@@ -10505,7 +10561,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           <span class="tf-hint">${store ? storeFormHint(store) : ''}</span>
           <button class="btn" id="tf-save-avatar" ${values.avatar ? '' : 'hidden'}>Save as Avatār without running</button>
           <button class="btn" id="tf-draft">${editInPlace ? 'Return to draft' : 'Save draft'}</button>`}
-          <button class="btn primary" id="tf-queue">${templateEdit ? 'Save template' : editInPlace ? 'Save' : store?.repeatable && values.repeatable ? 'Install' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
+          <button class="btn primary" id="tf-queue">${templateEdit ? 'Save template' : editInPlace ? 'Save' : store?.repeatable && values.repeatable ? 'Install' : 'Run task'}<span class="kbd">${esc(fmtKeys(SEND_KEYS))}</span></button>
         </div>
       </div>
     </div>`;
@@ -12356,7 +12412,7 @@ function retainedComposer(main, fragment) {
 function adoptComposerState(live, fresh) {
   const field = live.matches('textarea') ? live : live.querySelector('textarea');
   const box = fresh.closest('.followup-box');
-  const draft = S.followupDrafts?.[`${box.dataset.taskId}/${box.dataset.role}`] ?? '';
+  const draft = messageDraft(`${box.dataset.taskId}/${box.dataset.role}`);
   if (field.value !== draft && document.activeElement !== field) {
     field.value = draft;
     field.dispatchEvent(new Event('input', { bubbles: true })); // its height and highlighting follow
@@ -14542,7 +14598,7 @@ function conversationPane(v, t) {
     ? conversationFoldHtml(item, item.key, opened, row)
     : row(item.entry, item === land ? ' data-land' : item === question ? ' data-land-question' : '')).join('')
     || (historyStatus || inherited ? '' : '<div class="msg system">No messages yet</div>'));
-  const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
+  const draft = messageDraft(`${v.taskId}/${t.role}`);
   const pending = pendingMessagesHtml(v, t, entries, canFollowUp);
   const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}">
@@ -14554,7 +14610,7 @@ function conversationPane(v, t) {
             <span class="followup-buttons">
               ${followUp.enabled ? micButtonHtml(`followup:${v.taskId}/${t.role}`) : ''}
               ${t.shared && stoppableAgent(v) ? stopAgentButton(stoppableAgent(v), 'btn followup-stop') : ''}
-              <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}${continues ? ' title="The approved PR lands as it is. The agent carries on in a new task."' : ''}>${continues ? 'Continue' : 'Send'}</button>
+              <button class="btn primary followup-send" data-keys="${SEND_KEYS}" ${followUp.enabled ? '' : 'disabled'} title="${continues ? `Continue (${esc(fmtKeys(SEND_KEYS))}): the approved PR lands as it is; the agent carries on in a new task.` : `Send (${esc(fmtKeys(SEND_KEYS))})`}">${continues ? 'Continue' : 'Send'}</button>
             </span></div>
         </div>
       </div></div>`
@@ -17758,7 +17814,7 @@ function wireNewAgentForms(box, v, key) {
         if (ta) ta.value = ta.value.split(mention.token).join('');
       }
       S.followupMentions[key] = mentions.filter((m) => m.selector !== `agent:${agentKey}`);
-      if (ta) S.followupDrafts[key] = ta.value;
+      if (ta) setMessageDraft(key, ta.value);
       renderTaskPage();
     });
   });
@@ -17969,7 +18025,7 @@ function wireFollowups(v) {
     // The field outlives repaints (retainedComposer): what is wired on it is wired once.
     const firstWiring = !ta.followupWired;
     ta.followupWired = true;
-    if (firstWiring) ta.addEventListener('input', () => { S.followupDrafts[key] = ta.value; });
+    if (firstWiring) ta.addEventListener('input', () => setMessageDraft(key, ta.value));
     const chips = box.querySelector('.followup-chips');
     // An upload outlives this render: paint whichever box is on the page when it lands.
     const roleSelector = window.CSS && CSS.escape ? CSS.escape(role) : role;
@@ -18019,7 +18075,7 @@ function wireFollowups(v) {
           delete S.followupNewAgents[key];
         }
         if (result?.continuedIn) {
-          delete S.followupDrafts[key];
+          setMessageDraft(key, '');
           delete S.followupHeights[key];
           images.length = 0;
           files.length = 0;
@@ -18034,9 +18090,9 @@ function wireFollowups(v) {
         } else showSentReply(v, role, result, false);
         // Clear the persisted draft + image store FIRST, so neither the re-render
         // below nor a background refresh can repopulate the box from them. The box
-        // content is sourced from S.followupDrafts on every render, so this — not
+        // content is sourced from messageDraft() on every render, so this — not
         // touching the DOM — is what actually empties it.
-        delete S.followupDrafts[key];
+        setMessageDraft(key, '');
         delete S.followupHeights[key];
         images.length = 0;
         files.length = 0;
@@ -18065,10 +18121,10 @@ function wireFollowups(v) {
       }
     };
     btn.addEventListener('click', send);
-    // ⌘/Ctrl-Enter sends, matching the rest of the console's compose affordances:
-    // through the Send on the page now, which a repaint may have replaced.
+    // ⌘/Ctrl-Enter sends (isSendKey, as every message box): through the Send
+    // on the page now, which a repaint may have replaced.
     if (firstWiring) ta.addEventListener('keydown', (e) => {
-      if (!(e.metaKey || e.ctrlKey) || e.key !== 'Enter') return;
+      if (!isSendKey(e)) return;
       e.preventDefault();
       ta.closest('.followup-box')?.querySelector('.followup-send')?.click();
     });
@@ -18082,8 +18138,8 @@ async function unsendPending(v, btn) {
   try {
     const { message, role } = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/messages/${encodeURIComponent(btn.dataset.pendingId)}`, { method: 'DELETE' });
     const key = `${v.taskId}/${role}`;
-    const typed = S.followupDrafts[key] || '';
-    S.followupDrafts[key] = typed ? `${message.text}\n\n${typed}` : message.text;
+    const typed = messageDraft(key);
+    setMessageDraft(key, typed ? `${message.text}\n\n${typed}` : message.text);
     (S.followupImages[key] ||= []).unshift(...(message.images || []));
     (S.followupFiles[key] ||= []).unshift(...(message.files || []));
     if (S.view?.taskId === v.taskId) S.view.pendingMessages = (S.view.pendingMessages || []).filter((p) => p.message.id !== message.id);
@@ -28632,6 +28688,7 @@ function wireProfileView() {
   $('#export-user-data')?.addEventListener('click', () => location.assign('/api/user/export'));
   $('#profile-logout')?.addEventListener('click', async () => {
     await forgetPushDevice();
+    forgetMyDrafts();
     try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
     location.reload();
   });
@@ -30993,6 +31050,13 @@ function fmtKeys(binding) {
     .map((s) => `${s.ctrl ? 'Ctrl+' : ''}${s.alt ? (mac ? '⌥' : 'Alt+') : ''}${s.meta ? (mac ? '⌘' : 'Ctrl+') : ''}${s.shift ? '⇧' : ''}${NAME[s.key] || s.key}`)
     .join(' ');
 }
+// ⌘/Ctrl+Enter sends every message box (Ask, a task's prompt, a follow-up); a
+// bare Enter is a new line, and Enter that ends an IME composition never sends
+// (Safari reports it as keyCode 229). On a touch keyboard the Send button sends.
+const SEND_KEYS = 'meta+Enter';
+function isSendKey(e) {
+  return e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && !e.isComposing && e.keyCode !== 229;
+}
 function commandHint(label, id) {
   const declared = (S.contributions?.commands || []).find((command) => command.id === id);
   const binding = declared ? declared.keybinding : HOST_COMMANDS.find((command) => command.id === id)?.key;
@@ -32345,6 +32409,7 @@ function renderAccessPending() {
     } catch (error) { toast(error.message, true); }
   });
   $('#pending-logout').addEventListener('click', async () => {
+    forgetMyDrafts();
     await feedbackFetch('/api/logout', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).catch(() => {});
     location.reload();
   });
