@@ -8,6 +8,13 @@ def tavyaVersionCode = (tavyaSetting('TAVYA_VERSION_CODE') ?: '1') as Integer
 // Release signing (upload key), only when a keystore is supplied through the
 // environment or -P gradle properties; otherwise release builds stay unsigned.
 def tavyaKeystore = tavyaSetting('ANDROID_KEYSTORE_FILE')
+// The console the app loads (TAVYA_URL, written by `npx cap sync` into the
+// assets): its host is what the App Links intent filter claims.
+def tavyaServer = { ->
+    def config = file('src/main/assets/capacitor.config.json')
+    def url = config.exists() ? new groovy.json.JsonSlurper().parse(config)?.server?.url : null
+    return new URI(url ?: 'https://tavya.io')
+}()
 
 android {
     namespace = "io.tavya.app"
@@ -19,6 +26,7 @@ android {
         versionCode tavyaVersionCode
         versionName tavyaPackage.version
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        manifestPlaceholders = [tavyaLinkScheme: tavyaServer.scheme, tavyaLinkHost: tavyaServer.host]
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
              // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
@@ -33,6 +41,11 @@ android {
                 keyAlias tavyaSetting('ANDROID_KEY_ALIAS')
                 keyPassword tavyaSetting('ANDROID_KEY_PASSWORD')
             }
+        }
+    }
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
         }
     }
     buildTypes {
@@ -60,7 +73,11 @@ dependencies {
     // TavyaSignIn opens sign-in in a Custom Tab.
     implementation "androidx.browser:browser:$androidxBrowserVersion"
     implementation project(':capacitor-android')
+    // TavyaMessagingService extends the push plugin's FCM service.
+    implementation "com.google.firebase:firebase-messaging:$firebaseMessagingVersion"
     testImplementation "junit:junit:$junitVersion"
+    testImplementation "org.robolectric:robolectric:$robolectricVersion"
+    testImplementation "androidx.test:core:$androidxTestCoreVersion"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
     implementation project(':capacitor-cordova-android-plugins')

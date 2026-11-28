@@ -164,6 +164,43 @@ describe('Ask, set to a quick task', () => {
     expect(await f.coordinators()).toEqual([]);
   });
 
+  it('waits a few seconds for the reply when asked to (Siri speaks it), and answers without one when it is slower', async () => {
+    const f = await fixture();
+    await f.call('ana', 'PUT', `/api/organizations/${f.organization.id}/ask-settings`, { target: 'task' });
+    // The reply lands while the request waits: the turn's output comes back with the task.
+    const replying = setInterval(async () => {
+      const ceoProject = (await f.coordinators())[0];
+      const asked = ceoProject && (await f.store.listTasks(ceoProject.id)).find((task) => task.params?.prompt === 'How many tasks are open?');
+      if (!asked) return;
+      clearInterval(replying);
+      await f.store.appendEvent({ taskId: asked.id, type: 'turn.result', ts: Date.now(), payload: { completed: true, output: 'Four are open.' } });
+    }, 50);
+    const quick = await f.call('ana', 'POST', `/api/organizations/${f.organization.id}/ask`, { prompt: 'How many tasks are open?', waitMs: 5_000 });
+    clearInterval(replying);
+    expect(quick.status, JSON.stringify(quick.json)).toBe(200);
+    expect(quick.json.reply).toBe('Four are open.');
+    // Nothing within the wait: the task, no reply, after about waitMs.
+    const started = Date.now();
+    const slow = await f.call('ana', 'POST', `/api/organizations/${f.organization.id}/ask`, { prompt: 'Something slow', waitMs: 700 });
+    expect(slow.status).toBe(200);
+    expect(slow.json.reply).toBeUndefined();
+    expect(Date.now() - started).toBeGreaterThanOrEqual(650);
+    expect(Date.now() - started).toBeLessThan(4_000);
+    // A wait is bounded (10 s) and must be a number.
+    expect((await f.call('ana', 'POST', `/api/organizations/${f.organization.id}/ask`, { prompt: 'x', waitMs: 'soon' })).status).toBe(400);
+  });
+
+  it('a reply the CEO gave before this Ask is not its answer', async () => {
+    const f = await fixture();
+    const first = await f.ask('ana', 'Start');
+    expect(first.status, JSON.stringify(first.json)).toBe(200);
+    await f.store.appendEvent({ taskId: first.json.id, type: 'turn.result', ts: Date.now(), payload: { completed: true, output: 'Old answer' } });
+    const again = await f.call('ana', 'POST', `/api/organizations/${f.organization.id}/ask`, { prompt: 'And now?', waitMs: 800 });
+    expect(again.status, JSON.stringify(again.json)).toBe(200);
+    expect(again.json.id).toBe(first.json.id);
+    expect(again.json.reply).toBeUndefined();
+  });
+
   it('an empty question, or an organization that does not exist, is refused', async () => {
     const f = await fixture();
     expect((await f.ask('ana', '   ')).status).toBe(400);

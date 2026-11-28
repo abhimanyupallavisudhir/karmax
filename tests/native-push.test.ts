@@ -6,7 +6,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { BrowserDeliveryAdapter, DeliveryDispatcher } from '../src/collaboration/delivery.js';
-import { FCM_CREDENTIAL_HANDLE, fcmRequestBody, NativePush } from '../src/collaboration/native-push.js';
+import { FCM_CREDENTIAL_HANDLE, fcmRefreshBody, fcmRequestBody, NativePush } from '../src/collaboration/native-push.js';
 import { PushDeliveryAdapter } from '../src/collaboration/push-delivery.js';
 import { generateVapidKeys } from '../src/collaboration/web-push.js';
 import { storeBackends } from './helpers/store-backends.js';
@@ -74,6 +74,11 @@ describe('the FCM message', () => {
         'apns-collapse-id': expect.any(String) }, payload: { aps: { sound: 'default' } } },
     } });
     expect(Buffer.byteLength(body.message.apns.headers['apns-collapse-id'])).toBeLessThanOrEqual(64);
+  });
+
+  it('an Android phone\'s refresh is data only, so the app\'s own code runs in the background and updates its widget', () => {
+    expect(fcmRefreshBody('device-token')).toEqual({ message: { token: 'device-token', data: { type: 'refresh' },
+      android: { priority: 'NORMAL', ttl: '3600s', collapse_key: 'tavya-refresh' } } });
   });
 
   it('stays quiet below high', () => {
@@ -157,11 +162,15 @@ describe.each(storeBackends)('native push delivery ($name)', ({ open }) => {
       await f.ask('high', 'Quiet one');
       await f.ask('critical', 'Loud one');
       await f.dispatcher.drain();
-      // Only the critical ask, only the owner's devices; the access token checked when the key was saved serves both sends.
-      expect(f.g.sends.map((send) => send.body.message.token).sort()).toEqual(['iphone-token', 'pixel-token']);
+      // Only the critical ask, only the owner's devices; the access token checked when the key was saved serves every send.
+      const alerts = f.g.sends.filter((send) => send.body.message.notification);
+      expect(alerts.map((send) => send.body.message.token).sort()).toEqual(['iphone-token', 'pixel-token']);
+      // The Android phone also gets a data-only refresh for its home-screen widget (iOS has none).
+      expect(f.g.sends.filter((send) => !send.body.message.notification).map((send) => [send.body.message.token, send.body.message.data]))
+        .toEqual([['pixel-token', { type: 'refresh' }]]);
       expect(f.webSent).toEqual(['https://fcm.googleapis.com/fcm/send/laptop']);
       expect(f.g.assertions).toHaveLength(0);
-      for (const send of f.g.sends) {
+      for (const send of alerts) {
         expect(send.url).toBe('https://fcm.googleapis.com/v1/projects/tavya-push/messages:send');
         expect(send.authorization).toBe('Bearer ya29.token-1');
         expect(send.body.message.notification.title).toBe('Loud one');
@@ -205,7 +214,7 @@ describe.each(storeBackends)('native push delivery ($name)', ({ open }) => {
       answers.get = (key: string) => { if (key === 'phone' && !refused) { refused = true; return realGet(key); } return undefined; };
       await f.ask('critical', 'after expiry');
       await f.dispatcher.drain();
-      const later = f.g.sends.slice(original);
+      const later = f.g.sends.slice(original).filter((send) => send.body.message.notification);
       expect(later).toHaveLength(2);
       expect(later[0]!.authorization).not.toBe(later[1]!.authorization);
     } finally { await f.store.close(); }
