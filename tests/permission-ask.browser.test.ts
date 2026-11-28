@@ -20,6 +20,9 @@ const projectOnly = {
 };
 const both = { ...projectOnly, id: 'preq_both', capabilities: ['settings:write'],
   ask: permissionAsk({ agent: '#1060\'s agent', capabilities: ['settings:write'], projects: ['admin_docs'], level: 'Developer' }) };
+// A capability request reads as what it lets the agent do, never as ids.
+const capabilities = { ...projectOnly, id: 'preq_caps', capabilities: ['settings:read', 'settings:write'], projectIds: undefined,
+  baseAuthorization: undefined, ask: permissionAsk({ agent: '#1060\'s agent', capabilities: ['settings:read', 'settings:write'] }) };
 
 async function openConsole(page: Page, requests: unknown[]) {
   await page.route('http://perm.test/**', async (route) => {
@@ -74,13 +77,17 @@ it('the approval card says both what it adds and, on hover, every detail', async
   await page.evaluate((requests) => (globalThis as any).eval(`
     S.projects = [];
     document.getElementById('app').innerHTML = permissionRequestRows(${JSON.stringify(requests)}, { inTask: true });
-  `), [projectOnly, both]);
+  `), [projectOnly, both, capabilities]);
   const titles = page.locator('.approval-request-title .approval-request-ask');
   expect(await titles.allInnerTexts()).toEqual([
     'Let #1060\'s agent work in admin_docs too (as Developer)?',
-    'Let #1060\'s agent work in admin_docs too (as Developer) and give it settings:write?',
+    'Let #1060\'s agent work in admin_docs too (as Developer) and edit global settings?',
+    'Let #1060\'s agent view and edit global settings?',
   ]);
   expect(await titles.nth(1).getAttribute('title')).toBe('Projects: admin_docs (as Developer)\nPermissions: settings:write');
+  // The ids a person need not decode are in the tooltip, not the text.
+  expect(await titles.nth(2).getAttribute('title')).toBe('Permissions: settings:read, settings:write');
+  expect(await page.locator('#app .approval-request-title').allInnerTexts()).not.toContainEqual(expect.stringMatching(/settings:/));
   // Compact: the question is the card's title; no empty or repeated chip rows.
   expect(await page.locator('.approval-request-caps, .approval-request-projects').count()).toBe(0);
   expect(await page.locator('#app').innerText()).not.toMatch(/\b0 permissions?\b/);

@@ -5753,7 +5753,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
         ? throughYouText(child, { what: `to connect ${ask.connection.label}`, why: ask.connection.why,
           decline: `platform_request(POST, "/api/connections/${ask.connection.id}/disconnect")` })
         : throughYouText(child, { why: ask.permission.reason,
-          what: `for ${(await this.permissionAskOf(ask.permission, 'its agent', { ids: true })).grant}`,
+          what: `for permission to ${(await this.permissionAskOf(ask.permission, 'its agent', { ids: true })).grant}`,
           decline: `platform_request(POST, "/api/permission-requests/${ask.permission.id}/resolve?organizationId=${ask.organizationId}", {"action": "deny"})` });
     await this.tellTask(request.via.taskId, child, text, { type: 'subtask.parent-unreachable',
       payload: { requestId: request.id, parentTaskId: request.via.taskId } });
@@ -5769,7 +5769,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
   private async askTaskToGrant(grantorId: string, task: TaskRecord, request: PermissionRequest, organizationId: string) {
     const asked = (await this.permissionAskOf(request, taskAgent(task), { ids: true })).grant;
     const resolve = `/api/permission-requests/${request.id}/resolve?organizationId=${organizationId}`;
-    const text = `Task #${task.num ?? task.id} "${task.title}" (${task.id}) asks you for ${asked}, which you hold. `
+    const text = `Task #${task.num ?? task.id} "${task.title}" (${task.id}) asks you for permission to ${asked}, which you hold. `
       + `Grant it if its work needs it: platform_request(POST, "${resolve}", {"action": "approve"}), `
       + `or {"action": "deny"}.\n${untrustedBlock('its reason', request.reason)}`;
     await this.tellTask(grantorId, task, text, { type: 'permission.grantor-unreachable', payload: { requestId: request.id, grantorTaskId: grantorId } });
@@ -6460,8 +6460,8 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const resolved = (await service.resolve(request.id, { action, by: principal, alreadyAuthorized, claim }));
     const granted = (await this.permissionAskOf(resolved, 'its agent', { ids: true })).grant;
     const message = action === 'approve'
-      ? `[${BRAND} permission decision]\n\nApproved for this task's ${resolved.role} agent: ${granted}. Retry the blocked operation now; a newly scoped token will carry the grant.`
-      : `[${BRAND} permission decision]\n\nDenied for this task's ${resolved.role} agent: ${granted}. Do not request these permissions again; continue without them or explain why the task cannot proceed.`;
+      ? `[${BRAND} permission decision]\n\nApproved: this task's ${resolved.role} agent may now ${granted}. Retry the blocked operation now; a newly scoped token will carry the grant.`
+      : `[${BRAND} permission decision]\n\nDenied: this task's ${resolved.role} agent may not ${granted}. Do not request these permissions again; continue without them or explain why the task cannot proceed.`;
     const resume = await this.resumeAfterCredentialDecision(request.taskId, message, request.role);
     const event = {
       taskId: request.taskId,

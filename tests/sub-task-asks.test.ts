@@ -81,7 +81,7 @@ describe('a sub-task asks people through its parent', () => {
       expect((await f.inbox('admin')).map((row) => row.kind)).toEqual(['approval-requested']);
       // The parent's agent is told, not asked to decide.
       const [told] = f.toLead();
-      expect(told!.message.text).toContain('asks people for project:settings:write, through you');
+      expect(told!.message.text).toContain('asks people for permission to edit project settings (project:settings:write), through you');
       expect(told!.message.text).toContain(`escalate(to, note, task_id: "${f.child.id}")`);
       expect(told!.message.text).toContain(`/api/permission-requests/${requested.requestId}/resolve`);
 

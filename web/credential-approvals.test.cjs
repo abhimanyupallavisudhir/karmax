@@ -78,11 +78,11 @@ const permission = {
   reason: 'configure outbound email',
   status: 'pending',
   task: request.task,
-  ask: { question: "Give #12's agent settings:read and settings:write?", detail: 'Permissions: settings:read, settings:write' },
+  ask: { question: "Let #12's agent view and edit global settings?", detail: 'Permissions: settings:read, settings:write' },
 };
 const permissionRows = permissionRequestRows([permission]);
-ok(permissionRows.replace(/&#39;/g, "'").includes("Give #12's agent settings:read and settings:write?"),
-  'permission request row asks what it grants, by name');
+ok(permissionRows.replace(/&#39;/g, "'").includes("Let #12's agent view and edit global settings?"),
+  'permission request row asks what it grants, in words');
 ok(permissionRows.includes('title="Permissions: settings:read, settings:write"'), 'every permission is in its tooltip');
 ok(permissionRows.includes('@team:operators') && permissionRows.includes('configure outbound email'),
   'permission request row explains its audience and reason');

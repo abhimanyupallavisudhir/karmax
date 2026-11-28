@@ -1321,7 +1321,7 @@ describe('task stage transitions', () => {
     // The approval card and For me row: what the gateway lists.
     const [listed] = await f.api.listPermissionRequests(f.token, { organizationId: 'org_personal', taskId: f.task.id });
     expect(listed!.ask).toEqual({ question: `Let ${agentName} work in admin_docs too (as Developer)?`,
-      detail: 'Projects: admin_docs (as Developer)', grant: 'access to admin_docs (as Developer)' });
+      detail: 'Projects: admin_docs (as Developer)', grant: 'work in admin_docs too (as Developer)' });
     // The inbox, browser and phone notifications: the event's words.
     const [event] = await f.store.eventsOfType(f.task.id, 'permission.approval-requested');
     expect(event!.payload.ask).toBe('Let its agent work in admin_docs too (as Developer)?');
@@ -1337,8 +1337,14 @@ describe('task stage transitions', () => {
       audience: ['user:test'], reason: 'Publish and configure.' });
     const listedBoth = (await f.api.listPermissionRequests(f.token, { organizationId: 'org_personal', taskId: f.task.id }))
       .find((request) => request.id === both.requestId)!;
-    expect(listedBoth.ask!.question).toBe(`Let ${agentName} work in admin_docs too (as Developer) and give it settings:write?`);
+    // Capabilities read as what they let the agent do; the ids stay in the tooltip.
+    expect(listedBoth.ask!.question).toBe(`Let ${agentName} work in admin_docs too (as Developer) and edit global settings?`);
     expect(listedBoth.ask!.detail).toBe('Projects: admin_docs (as Developer)\nPermissions: settings:write');
+    // The agent is told the decision in words and ids, which it acts on.
+    f.signalled.length = 0;
+    await f.api.resolvePermissionRequest(f.token, { organizationId: 'org_personal', requestId: both.requestId!, action: 'deny' });
+    expect(JSON.stringify(f.signalled.map((signal) => signal.args))).toContain(
+      `this task's do agent may not work in admin_docs (${docs.id}) too (as Developer) and edit global settings (settings:write)`);
   });
 
   it('requires authority for earlier permission grants belonging to other roles before expanding scope', async () => {
