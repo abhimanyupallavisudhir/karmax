@@ -40,6 +40,7 @@ eval(extractFn('fmtKeys'));
 eval(extractFn('fuzzyScore'));
 eval(extractConst('NEW_TASK_WORKFLOW').replace('const NEW_TASK_WORKFLOW =', 'global.NEW_TASK_WORKFLOW ='));
 eval(extractFn('initialTaskFormSavedSignature'));
+eval(extractFn('isSendKey'));
 eval(extractFn('taskFormKeyAction'));
 
 let pass = 0, fail = 0;
@@ -223,6 +224,8 @@ ok(taskFormKeyAction(ev('Enter', { ctrlKey: true }), false) === 'submit',
   'Ctrl+Enter submits the expanded form regardless of which form control last had focus');
 ok(taskFormKeyAction(ev('Enter', { metaKey: true }), false) === 'submit',
   'Cmd+Enter submits the expanded form regardless of focus');
+ok(taskFormKeyAction(ev('Enter', { ctrlKey: true, isComposing: true }), false) === null,
+  'Enter that ends an IME composition never submits the form');
 ok(taskFormKeyAction(ev('Escape'), false) === 'close',
   'Escape closes the expanded form when no secondary modal is open');
 ok(taskFormKeyAction(ev('Enter', { ctrlKey: true }), true) === null && taskFormKeyAction(ev('Escape'), true) === null,
@@ -312,6 +315,22 @@ S.selected = null;
 ok(allCommands().filter((c) => c.id.startsWith('task.attempt.')).every((c) => !c.available),
   'attempt commands are unavailable outside a task');
 resetChord();
+
+// ── Message boxes: ⌘/Ctrl+Enter sends, Enter is a new line, an IME composition never sends ──
+ok(isSendKey(ev('Enter', { ctrlKey: true })) && isSendKey(ev('Enter', { metaKey: true })), 'Ctrl+Enter and ⌘+Enter send');
+ok(!isSendKey(ev('Enter')) && !isSendKey(ev('Enter', { shiftKey: true })), 'a bare Enter (or Shift+Enter) is a new line');
+ok(!isSendKey(ev('Enter', { ctrlKey: true, isComposing: true })) && !isSendKey(ev('Enter', { ctrlKey: true, keyCode: 229 })),
+  'Enter while an IME composes never sends (Safari reports keyCode 229)');
+ok(!isSendKey(ev('Enter', { ctrlKey: true, shiftKey: true })) && !isSendKey(ev('Enter', { ctrlKey: true, altKey: true })), 'other chords are not Send');
+const askSource = extractFn('askTavya');
+ok(askSource.includes('if (isSendKey(event))') && !/key === 'Enter'/.test(askSource), 'Ask sends only on isSendKey, never on a bare Enter');
+ok(askSource.includes('title="Ask (${esc(fmtKeys(SEND_KEYS))})"'), 'Ask\'s button names its shortcut');
+ok(src.includes("ta.addEventListener('keydown', (e) => {\n      if (!isSendKey(e)) return;"), 'a follow-up sends on isSendKey');
+ok(src.includes('`Send (${esc(fmtKeys(SEND_KEYS))})`'), 'a follow-up\'s Send names its shortcut');
+setPlatform('Linux x86_64');
+ok(fmtKeys('meta+Enter') === 'Ctrl+↵', 'the shortcut reads Ctrl+↵ off a Mac');
+setPlatform('MacIntel');
+ok(fmtKeys('meta+Enter') === '⌘↵', 'and ⌘↵ on a Mac');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
