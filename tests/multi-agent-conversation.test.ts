@@ -358,6 +358,14 @@ describe('software-dev 1.27: one conversation, several agents (real Temporal + g
     await expect.poll(async () => (await view(handle)).waitingFor?.audience, { timeout: 20_000 }).toEqual(['@creator', 'user:bea']);
     // Bea is asked by the wait itself; no separate mention.
     expect(await h.store.eventsOfType(taskId, ['task.mentioned'])).toEqual([]);
+    // #1060: the question is said in the conversation, once, as the Agent's, and
+    // stays there after Bea's answer ends the wait.
+    expect((await view(handle)).messages.filter((m: any) => m.text === 'Which URL style?')).toEqual([
+      expect.objectContaining({ role: 'agent' })]);
+    await handle.signal('followUp', { id: 'u-bea-2', role: 'user', author: 'user:bea', authorLabel: 'Bea', ts: Date.now(), text: 'Slugs.\n@incomplete' });
+    await expect.poll(async () => (await view(handle)).messages.some((m: any) => m.id === 'u-bea-2'), { timeout: 20_000 }).toBe(true);
+    await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 20_000 }).not.toBe('Which URL style?');
+    expect((await view(handle)).messages.filter((m: any) => m.text === 'Which URL style?')).toHaveLength(1);
     await handle.signal('cancel');
     await handle.result();
   });

@@ -794,6 +794,9 @@ export class GitHubAppService {
     const accounts = await this.listUserAccounts(userId);
     if (!accounts.some((account) => account.id === accountId)) throw new Error('GitHub account is not connected');
     (await this.store.kvSet(githubUserActiveAccountKey(userId), accountId));
+    // When the person chose which account: new tasks pin it (KarmaxApi.newTaskGithubAccount).
+    (await this.store.appendAudit({ principalId: `user:${userId}`, action: 'github.user-account.activated',
+      scopeKey: `user:${userId}`, detail: { accountId } }));
   }
 
   async removeUserAccount(userId: string, accountId: string): Promise<string> {

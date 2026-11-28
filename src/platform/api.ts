@@ -116,6 +116,7 @@ import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { avatarAllows, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled, avatarPrincipal, avatarRoleOf, forkedAvatar,
   normalizeAvatarSetting, AVATAR_ROLE_LABELS, type AvatarRole } from './avatars.js';
 import { CapabilityError, ConflictError, NotFoundError, TaskStartedError, ValidationError } from './errors.js';
+import { decidedText, decidingPrincipal, decisionMaker, principalTaskId, withDecisionMaker } from './decision-maker.js';
 import { CEO_PRINCIPAL } from './ceo.js';
 import { acceptsQueuedMessages, parsePending, pendingForView, pendingMessagesKey, PENDING_MESSAGES_PREFIX, QUEUED_FOLLOW_UP_ACTION, type PendingMessage, type SentMessage } from './pending-messages.js';
 import type { AccountLeaseAnswer, AccountQueueView } from '../coordinators/account.js';
@@ -1709,11 +1710,11 @@ export class KarmaxApi {
     const project = (await this.deps.store.getProject(args.projectId));
     if (!project) throw new NotFoundError(`no project ${args.projectId}`);
     const workflow = args.workflow ?? 'software-dev';
-    if (RETIRED_WORKFLOWS.has(workflow)) throw new Error(RETIRED_WORKFLOW_HINT);
+    if (RETIRED_WORKFLOWS.has(workflow)) throw new ValidationError(RETIRED_WORKFLOW_HINT);
     // Honor a per-project version pin (§21d) so a project can hold on a specific
     // version while others take the latest; unpinned → latest.
     const start = this.resolveStart(workflow, (await this.workflowPinFor(args.projectId, workflow)), project.organizationId);
-    if (!start) throw new Error(`unknown workflow "${workflow}"`);
+    if (!start) throw new ValidationError(`unknown workflow "${workflow}"`);
     const { manifest, startType } = start;
     // A fork of an Avatar its creator may call acts with the Avatar's
     // authorization, credentials and GitHub account: nobody grants it again
@@ -1859,11 +1860,8 @@ export class KarmaxApi {
     // active account later must not silently change an existing task's commit or
     // pull-request actor.
     const avatarGithubAccountId = selectedAvatars.find(({ role }) => role === 'do')?.avatar.githubAccountId;
-    const githubAccountId = avatarGithubAccountId ?? (caller.kind === 'agent'
-      ? caller.externalIdentities?.githubAccountId
-      : caller.humanSubject
-        ? (await this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId))
-        : undefined);
+    const newAccount = avatarGithubAccountId ? { githubAccountId: avatarGithubAccountId } : (await this.newTaskGithubAccount(caller));
+    const githubAccountId = newAccount.githubAccountId;
     // Human routing belongs to each workflow confirm layer. Keep accepting the
     // old task-level policy only for API/backward compatibility; the UI never
     // creates one and new workflows publish their current audience with the wait.
@@ -1933,6 +1931,7 @@ export class KarmaxApi {
         organizationId: authorizationScope.scope === 'global' ? undefined
           : (authorizationScope.organizationId ?? project.organizationId),
         externalIdentities: githubAccountId ? { githubAccountId } : undefined,
+        githubAccountChosenByPerson: newAccount.chosenByPerson,
       }));
       if (delegation) {
         (await this.deps.store.updateTaskParams(task.id, {
@@ -3127,12 +3126,8 @@ export class KarmaxApi {
     // already-pinned account with the caller's currently-active account.
     const pinnedGithubAccountId = typeof task.params?._githubAccountId === 'string'
       ? task.params._githubAccountId : undefined;
-    const delegatedGithubAccountId = pinnedGithubAccountId
-      ?? (caller.kind === 'agent'
-        ? caller.externalIdentities?.githubAccountId
-        : caller.humanSubject
-          ? (await this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId))
-          : undefined);
+    const newAccount = pinnedGithubAccountId ? { githubAccountId: pinnedGithubAccountId } : (await this.newTaskGithubAccount(caller));
+    const delegatedGithubAccountId = newAccount.githubAccountId;
     const delegation = (await this.delegateTaskHuman(token, caller, {
       taskId,
       projectId: authorizationScope.scope ? undefined : task.projectId,
@@ -3140,6 +3135,7 @@ export class KarmaxApi {
       organizationId: authorizationScope.scope === 'global' ? undefined
         : (authorizationScope.organizationId ?? organizationId),
       externalIdentities: delegatedGithubAccountId ? { githubAccountId: delegatedGithubAccountId } : undefined,
+      githubAccountChosenByPerson: newAccount.chosenByPerson,
     }));
     if (!editInPlace) {
       // The workflow validator is the single source of truth for the in-flight
@@ -3188,7 +3184,7 @@ export class KarmaxApi {
       try {
         if ((await requests.requests()).find((candidate) => candidate.id === request.id)?.status !== 'pending') continue;
         if ((await this.permissionRequestSatisfied((await this.deps.store.getTask(taskId))!, request)))
-          await this.finishPermissionDecision(requests, request, 'approve', caller.principal, true, claim);
+          await this.finishPermissionDecision(requests, request, 'approve', decidingPrincipal(caller), true, claim);
       } finally {
         (await requests.release(request.id, claim));
       }
@@ -3517,6 +3513,24 @@ export class KarmaxApi {
    * the selected scope. Preserve that wider authorization when the browser's
    * short-lived API token is intentionally narrowed to the current route's
    * project; non-human callers still attenuate strictly from their bearer. */
+  /**
+   * The GitHub account a new task acts as — its commits, pull requests and
+   * merges: the person's active account now (Profile → GitHub, "Use"), whether
+   * they create the task or an agent acting for them does. The task keeps it
+   * (`_githubAccountId`), so a later switch never moves work under way; a
+   * sub-task shares its parent's (deriveHumanDelegation); an Avatar's fork acts
+   * as the Avatar's. An agent's own pin is only the fallback when the person's
+   * choice cannot be read: a long-lived agent (a CEO) handing down the account
+   * it started with kept every task it made on an account the person had left
+   * (#1070).
+   */
+  private async newTaskGithubAccount(caller: ScopedToken): Promise<{ githubAccountId?: string; chosenByPerson?: boolean }> {
+    const chosen = caller.humanSubject
+      ? (await this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId)) : undefined;
+    if (chosen) return { githubAccountId: chosen, chosenByPerson: true };
+    return { githubAccountId: caller.kind === 'agent' ? caller.externalIdentities?.githubAccountId : undefined };
+  }
+
   private async delegateTaskHuman(token: string, caller: ScopedToken, args: HumanDelegationArgs) {
     return this.deps.authorization && caller.kind === 'human' && caller.principal.startsWith('user:')
       ? (await this.deps.tokens.delegateAuthorizedInteractiveHuman(token, args))
@@ -4883,6 +4897,30 @@ export class KarmaxApi {
     };
   }
 
+  /**
+   * The view with the question an agent escalated said in its conversation, as
+   * its own message (wiki features/message-forms § Where a question lives).
+   * Held only in the wait, the question — and any form in it — vanished once
+   * the wait ended or another ask replaced it (#1060); in the conversation it
+   * stays, and shows as answered once it is. Nothing is added when the agent's
+   * last message already says it. The agent has seen what it wrote: a message
+   * past `turnsSeen` is one it has not read, and would wake it.
+   */
+  private withAgentQuestion(task: TaskRecord, view: TaskView, callerRole: string | undefined, text: string, audience: string[])
+    : { view: TaskView; role: AgentRole; message: Message } | undefined {
+    const role: AgentRole = callerRole && callerRole !== 'do' && view.transcripts?.some((t) => t.role === callerRole)
+      ? callerRole as AgentRole : 'do';
+    const said = role === 'do' ? view.messages : view.transcripts?.find((t) => t.role === role)?.messages ?? [];
+    if (said.findLast((m) => m.role === 'agent')?.text.trim() === text.trim()) return undefined;
+    const message: Message = { id: `ask-${randomUUID()}`, role: 'agent', text, ts: Date.now(),
+      ...(this.sharedConversation(task) ? { author: MAIN_AGENT, to: audience } : {}) };
+    const next = this.withConversationMessage(view, role, message);
+    const seen = view.state?.turnsSeen;
+    if (role === 'do' && typeof seen === 'number' && seen >= view.messages.length)
+      next.state = { ...view.state, turnsSeen: next.messages.length };
+    return { view: next, role, message };
+  }
+
   /** Clone a view and append one accepted message to exactly one agent transcript. */
   private withConversationMessage(view: TaskView, role: AgentRole, message: Message): TaskView {
     const messages = view.messages.map((candidate) => ({ ...candidate }));
@@ -5327,7 +5365,9 @@ export class KarmaxApi {
       }
     } else {
       await this.stopTaskActivity(task, view, `Escalated to ${audience.join(', ')}`);
-      held = await this.startTransitionReplacement(task, view, view.stage, true, { audience, detail });
+      const asked = caller.taskId === taskId ? this.withAgentQuestion(task, view, caller.role, detail, audience) : undefined;
+      held = await this.startTransitionReplacement(task, asked?.view ?? view, view.stage, true, { audience, detail });
+      if (asked) await this.publishConversationMessage(taskId, asked.role, asked.message);
     }
     const requestedBy = caller.taskId !== '*'
       ? `task-agent:${caller.taskId}:${caller.profileId}`
@@ -5612,10 +5652,11 @@ Prefer declining what the task does not need. Then briefly report the decision.`
       (await this.require(token, 'withdraw_permission_request', { projectId: permission.projectId, taskId: permission.taskId, organizationId }));
       if (caller.taskId !== permission.taskId) throw new CapabilityError('only the task that asked can withdraw its permission request');
       if (permission.status !== 'pending') return permission;
-      const withdrawn = (await permissions.withdraw(permission.id, caller.principal, reason));
+      const withdrawn = (await permissions.withdraw(permission.id, decidingPrincipal(caller), reason));
       if (withdrawn.status !== 'withdrawn') return withdrawn;
       await emit({ taskId: withdrawn.taskId, type: 'permission.approval-resolved', ts: Date.now(),
-        payload: { requestId: withdrawn.id, action: 'withdraw', resolvedBy: caller.principal, reason } });
+        payload: { requestId: withdrawn.id, action: 'withdraw', resolvedBy: withdrawn.withdrawn?.by, reason } });
+      await this.tellGrantorsDecided(withdrawn);
       // Another of the task's agents took back what this one asked for, and
       // this one may be waiting for the answer: it hears that none is coming.
       const role = (await this.callerRole(caller));
@@ -5635,7 +5676,7 @@ Prefer declining what the task does not need. Then briefly report the decision.`
     if (!target || !(await this.routesAuthorizationOf(caller, target)))
       throw new CapabilityError('only the task creator can withdraw its authorization request');
     if (authorization.status !== 'pending') return authorization;
-    const withdrawn = (await authorizations.withdraw(authorization.id, caller.principal, reason));
+    const withdrawn = (await authorizations.withdraw(authorization.id, decidingPrincipal(caller), reason));
     if (!withdrawn) {
       const now = (await authorizations.requests()).find((candidate) => candidate.id === authorization.id)!;
       if (now.status !== 'pending') return now;
@@ -5644,7 +5685,7 @@ Prefer declining what the task does not need. Then briefly report the decision.`
     // A draft waiting for it to start is a draft again, as after a denial.
     (await this.releaseApprovalWait(withdrawn));
     await emit({ taskId: target.id, type: 'authorization.approval-resolved', ts: Date.now(),
-      payload: { requestId: withdrawn.id, action: 'withdraw', resolvedBy: caller.principal, reason } });
+      payload: { requestId: withdrawn.id, action: 'withdraw', resolvedBy: withdrawn.withdrawn?.by, reason } });
     return withdrawn;
   }
 
@@ -5773,6 +5814,40 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       + `Grant it if its work needs it: platform_request(POST, "${resolve}", {"action": "approve"}), `
       + `or {"action": "deny"}.\n${untrustedBlock('its reason', request.reason)}`;
     await this.tellTask(grantorId, task, text, { type: 'permission.grantor-unreachable', payload: { requestId: request.id, grantorTaskId: grantorId } });
+  }
+
+  /** A request that is no longer pending, as a 409 that says how it ended and
+   * who ended it ("…was already denied by Task #1064's agent"). */
+  private async alreadyDecided(kind: 'permission' | 'authorization',
+    request: { id: string; status: string; resolution?: { by: string }; withdrawn?: { by?: string } }): Promise<ConflictError> {
+    return new ConflictError(`${kind} request ${request.id} was already ${await decidedText(this.deps.store, request)}; nothing to do`);
+  }
+
+  /**
+   * Once a permission request is decided (or taken back), every other task
+   * asked to grant or decline it hears so, in its conversation: the ask it was
+   * sent is stale. The note calls nobody (`to: []`), so a task's agent is not
+   * woken for it; it reads it with the ask on its next turn, and a decision it
+   * still attempts is answered "already denied by …" (alreadyDecided). Tasks
+   * without a shared conversation (before software-dev 1.27) cannot take a
+   * note that calls nobody, and are left to that answer.
+   */
+  private async tellGrantorsDecided(request: PermissionRequest): Promise<void> {
+    const decider = principalTaskId(request.resolution?.by ?? request.withdrawn?.by);
+    const asked = (await this.permissionAskOf(request, 'its agent', { ids: true })).grant;
+    const requester = await this.deps.store.getTask(request.taskId);
+    const text = `Task #${requester?.num ?? request.taskId}'s request ${request.id} for permission to ${asked} was already `
+      + `${await decidedText(this.deps.store, request)}. Nothing to do: do not approve or deny it.`;
+    for (const taskId of request.taskRecipients ?? []) {
+      if (taskId === decider) continue;
+      const target = await this.deps.store.getTask(taskId);
+      if (!target || !this.sharedConversation(target) || ['done', 'cancelled', 'failed'].includes(target.lastView?.status ?? '')) continue;
+      const message: Message = { id: `n${randomUUID()}`, role: 'user', to: [], text, ts: Date.now() };
+      try {
+        await (await this.workflowHandle(taskId)).signal(SIG.followUp, message);
+        (await this.publishConversationMessage(taskId, MAIN_AGENT, message));
+      } catch { /* the task is gone: nobody is left to tell */ }
+    }
   }
 
   /** Say `text` to a task's main agent as `from` (a task acting for it), calling
@@ -6125,7 +6200,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const creator = task?.createdBy?.kind === 'task-agent' ? task.createdBy : undefined;
     const creatorTask = creator && (await this.deps.store.getTask(creator.taskId));
     if (!task || !creator || !creatorTask || ['done', 'cancelled', 'failed'].includes(creatorTask.lastView?.status ?? '')) return;
-    const by = deniedBy.startsWith('user:') ? (await this.deps.store.userDisplayName(deniedBy.slice(5))) ?? 'Someone' : 'Someone';
+    const by = (await decisionMaker(this.deps.store, deniedBy))?.label ?? 'Someone';
     const asked = [`${request.authorization.level} authorization`,
       ...(request.credentialGrants?.length ? [`${request.credentialGrants.length} vault credential${request.credentialGrants.length > 1 ? 's' : ''}`] : [])];
     const message: Message = { id: `u${randomUUID()}`, role: 'user', author: `task:${task.id}`,
@@ -6155,7 +6230,8 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     if (!projectId) throw new ValidationError('taskId is required');
     (await this.require(token, 'task:read', { projectId, organizationId: input.organizationId,
       ...(input.taskId ? { taskId: input.taskId } : {}) }));
-    return (await new AuthorizationRequests(this.deps.store, input.organizationId).requests(input));
+    return __asyncCollections.map(await new AuthorizationRequests(this.deps.store, input.organizationId).requests(input),
+      (request) => withDecisionMaker(this.deps.store, request));
   }
 
   async resolveAuthorizationRequest(
@@ -6166,6 +6242,8 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const request = (await service.requests()).find((candidate) => candidate.id === input.requestId);
     if (!request) throw new NotFoundError(`no authorization request ${input.requestId}`);
     const caller = (await this.require(token, 'task:read', { projectId: request.projectId, organizationId: input.organizationId }));
+    if (request.status !== 'pending') throw await this.alreadyDecided('authorization', request);
+    const decider = decidingPrincipal(caller);
     const avatarId = caller.kind === 'agent' && caller.principal.startsWith('avatar:') ? caller.principal.slice(7) : undefined;
     const humanUserId = avatarId ? undefined : caller.humanSubject?.userId;
     if (!humanUserId && !avatarId) throw new CapabilityError('a routed human or Avatār is required to resolve this request');
@@ -6173,7 +6251,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       || avatarId && !(request.avatarRecipients ?? []).includes(avatarId))
       throw new CapabilityError('this authorization request was not routed to you');
     if (input.action === 'dismiss') {
-      const dismissed = (await service.dismiss(request.id, caller.principal));
+      const dismissed = (await service.dismiss(request.id, decider));
       const event = { taskId: request.target.taskId,
         type: 'authorization.approval-dismissed', ts: Date.now(), payload: { requestId: request.id } };
       const seq = (await this.deps.store.appendEvent(event));
@@ -6188,7 +6266,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       if (!authorization || authorization.attenuated
         || (request.credentialGrants ?? []).some((grant) => !canGrantCredential(caller.caps, grant)))
         throw new CapabilityError('you can no longer grant the complete requested authorization');
-      claimId = await service.claim(request.id, input.action, caller.principal);
+      claimId = await service.claim(request.id, input.action, decider);
       const group = (await this.deps.store.attemptGroup(request.target.taskId));
       const attempts = group?.attempts?.length ? group.attempts : [(await this.deps.store.getTask(request.target.taskId))!];
       const participant = request.target.participant;
@@ -6212,15 +6290,15 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
         queued = true;
       }
     }
-    const resolved = (await service.resolve(request.id, input.action, caller.principal, claimId));
+    const resolved = (await service.resolve(request.id, input.action, decider, claimId));
     // Denied: the task goes back to being a draft its creator can change or run
     // with less, and an agent that created it is told so.
     if (input.action === 'deny') {
       (await this.releaseApprovalWait(request));
-      (await this.tellCreatorDenied(request, caller.principal));
+      (await this.tellCreatorDenied(request, decider));
     }
     const event = { taskId: request.target.taskId, type: 'authorization.approval-resolved', ts: Date.now(), payload: {
-      requestId: request.id, action: input.action, resolvedBy: caller.principal, queued,
+      requestId: request.id, action: input.action, resolvedBy: decider, queued,
     } };
     const seq = (await this.deps.store.appendEvent(event));
     this.deps.bus?.emit({ ...event, seq });
@@ -6245,7 +6323,8 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       .requests({ taskId: input.taskId, status: input.status }), async (request) => {
         const grantors = (await __asyncCollections.map(request.taskRecipients ?? [], (id) => this.deps.store.getTask(id)))
           .filter((record): record is TaskRecord => !!record);
-        return { ...request, task: summary(task), ask: await this.permissionAskOf(request, taskAgent(task)),
+        return { ...(await withDecisionMaker(this.deps.store, request)), task: summary(task),
+          ask: await this.permissionAskOf(request, taskAgent(task)),
           ...(grantors.length ? { grantorTasks: grantors.map(summary) } : {}) };
       });
   }
@@ -6312,6 +6391,9 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       projectId: request.projectId,
       organizationId: input.organizationId,
     }));
+    // Decided already: say so, and by whom, before anything about the caller
+    // (a late grantor was told "belongs to another project", preq_mwzzs9mwfe0322d123).
+    if (request.status !== 'pending') throw await this.alreadyDecided('permission', request);
     // A task the request was routed to decides through its own agent (permissionGrantors).
     const grantorTaskId = caller.kind === 'agent' && caller.taskId !== '*'
       && (request.taskRecipients ?? []).includes(caller.taskId) ? caller.taskId : undefined;
@@ -6323,12 +6405,14 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     if (humanUserId && !request.recipients.includes(humanUserId)
       || avatarId && !(request.avatarRecipients ?? []).includes(avatarId))
       throw new CapabilityError('this permission request was not routed to you');
-    if (request.status !== 'pending') throw new ValidationError(`request ${request.id} is already ${request.status}`);
     // Approval widens scope before the request is marked resolved; the durable
     // claim keeps every other decision out meanwhile, on any gateway replica.
     const claim = (await service.claim(request.id));
-    if (!claim) throw new ValidationError('permission request decision is already in progress');
+    if (!claim) throw new ConflictError('permission request decision is already in progress');
     try {
+      // Decided while this one waited for the claim.
+      const current = (await service.requests({ taskId: request.taskId })).find((candidate) => candidate.id === request.id);
+      if (current && current.status !== 'pending') throw await this.alreadyDecided('permission', current);
       return await this.decidePermission(token, input, service, request, task, caller, claim);
     } finally {
       (await service.release(request.id, claim));
@@ -6341,7 +6425,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     service: PermissionRequests, request: PermissionRequest, task: TaskRecord | undefined, caller: ScopedToken, claim: string,
   ): Promise<PermissionRequest & { resume: Awaited<ReturnType<KarmaxApi['resumeAfterCredentialDecision']>> }> {
     if (input.action === 'dismiss') {
-      const dismissed = (await service.dismiss(request.id, caller.principal, claim));
+      const dismissed = (await service.dismiss(request.id, decidingPrincipal(caller), claim));
       const event = { taskId: request.taskId, type: 'permission.approval-dismissed',
         ts: Date.now(), payload: { requestId: request.id } };
       const seq = (await this.deps.store.appendEvent(event));
@@ -6383,8 +6467,11 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
           // Later capability requests also apply throughout an expanded scope.
           const checked = caller.kind === 'human' && this.deps.authorization && selectedProjects && selectedProjects.length > 1
             ? { ok: allows((await this.deps.authorization.capabilities(caller.principal, projectId, input.organizationId)), capability), reason: 'permission denied' }
+            // The task's id goes only with its own project: paired with another
+            // of its projects it read as "task belongs to another project",
+            // refusing a grantor that holds it there (preq_mwzzs9mwfe0322d123).
             : (await this.deps.tokens.check(token, capability, {
-              taskId: request.taskId, projectId, organizationId: input.organizationId,
+              ...(projectId === request.projectId ? { taskId: request.taskId } : {}), projectId, organizationId: input.organizationId,
             }));
           if (!checked.ok)
             throw new CapabilityError(`you cannot grant ${capability}: ${checked.reason ?? 'permission denied'} (project ${projectId})`);
@@ -6394,7 +6481,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       else if (expanded) await this.setTaskAuthorization(token, request.taskId, expanded, undefined, undefined,
         { acceptAttenuation: false, preserveCredentialGrants: true });
     }
-    return this.finishPermissionDecision(service, request, input.action, caller.principal,
+    return this.finishPermissionDecision(service, request, input.action, decidingPrincipal(caller),
       input.action === 'approve' && !!task && (await this.permissionRequestSatisfied(task, request)), claim);
   }
 
@@ -6412,11 +6499,11 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const scope = (await baseTaskAuthority(this.deps.store, this.deps.authorization,
       { ...task, params: { ...task.params, _authorization: authorization } }));
     const pinned = typeof task.params._githubAccountId === 'string' ? task.params._githubAccountId : undefined;
-    const githubAccountId = pinned ?? (caller.kind === 'agent' ? caller.externalIdentities?.githubAccountId
-      : caller.humanSubject ? (await this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId)) : undefined);
+    const account = pinned ? { githubAccountId: pinned } : (await this.newTaskGithubAccount(caller));
     const delegation = (await this.delegateTaskHuman(token, caller, { taskId: task.id,
       ...tokenScopeOf(scope, task.projectId, organizationId),
-      ...(githubAccountId ? { externalIdentities: { githubAccountId } } : {}) }));
+      ...(account.githubAccountId ? { externalIdentities: { githubAccountId: account.githubAccountId } } : {}),
+      githubAccountChosenByPerson: account.chosenByPerson }));
     (await this.deps.store.patchTaskParams(task.id, { _authorization: { ...authorization,
       ...(delegation ? { delegationId: delegation.id } : {}) } }));
   }
@@ -6458,11 +6545,14 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     principal: string, alreadyAuthorized = false, claim?: string,
   ): Promise<PermissionRequest & { resume: Awaited<ReturnType<KarmaxApi['resumeAfterCredentialDecision']>> }> {
     const resolved = (await service.resolve(request.id, { action, by: principal, alreadyAuthorized, claim }));
+    const by = (await decisionMaker(this.deps.store, principal))?.label;
+    const decided = `${action === 'approve' ? 'Approved' : 'Denied'}${by ? ` by ${by}` : ''}`;
     const granted = (await this.permissionAskOf(resolved, 'its agent', { ids: true })).grant;
     const message = action === 'approve'
-      ? `[${BRAND} permission decision]\n\nApproved: this task's ${resolved.role} agent may now ${granted}. Retry the blocked operation now; a newly scoped token will carry the grant.`
-      : `[${BRAND} permission decision]\n\nDenied: this task's ${resolved.role} agent may not ${granted}. Do not request these permissions again; continue without them or explain why the task cannot proceed.`;
+      ? `[${BRAND} permission decision]\n\n${decided}: this task's ${resolved.role} agent may now ${granted}. Retry the blocked operation now; a newly scoped token will carry the grant.`
+      : `[${BRAND} permission decision]\n\n${decided}: this task's ${resolved.role} agent may not ${granted}. Do not request these permissions again; continue without them or explain why the task cannot proceed.`;
     const resume = await this.resumeAfterCredentialDecision(request.taskId, message, request.role);
+    await this.tellGrantorsDecided(resolved);
     const event = {
       taskId: request.taskId,
       type: 'permission.approval-resolved',
@@ -7969,7 +8059,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       // Opening a proposal defers its confirmation until Review is ready.
       // Only a direct Confirm decision is journalled at this point.
       if (signal === SIG.confirm) {
-        (await recordHumanConfirmation(this.deps.store, taskId, userId ?? caller.principal));
+        (await recordHumanConfirmation(this.deps.store, taskId, userId ?? caller.principal, decidingPrincipal(caller)));
       }
     } else if (signal === SIG.confirm && scopedTask?.confirmationPolicy) {
       const userId = caller.humanSubject?.userId;
@@ -9933,9 +10023,11 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       createdBy: await this.taskCreator(caller, project.id),
       ...(await this.creationVia(caller)),
     }));
+    const workflowAccount = (await this.newTaskGithubAccount(caller));
     const workflowDelegation = (await this.deps.tokens.delegateHuman(token, {
       taskId: task.id, projectId: task.projectId, organizationId: project.organizationId,
-      externalIdentities: caller.externalIdentities,
+      externalIdentities: workflowAccount.githubAccountId ? { githubAccountId: workflowAccount.githubAccountId } : caller.externalIdentities,
+      githubAccountChosenByPerson: workflowAccount.chosenByPerson,
     }));
     if (workflowDelegation) {
       (await this.deps.store.updateTaskParams(task.id, { ...task.params,

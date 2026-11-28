@@ -4996,6 +4996,11 @@ async function checkConsoleRevision() {
   try {
     const meta = await api('/api/meta');
     if (consoleRevisionChanged(S.meta?.consoleRevision, meta.consoleRevision)) {
+      // A form this console refused may be one the new console shows (formProblemHtml).
+      if (!S.consoleOutdated) {
+        S.consoleOutdated = true;
+        if (S.selected && document.querySelector('#ck-thread .ask-form-problem')) scheduleTaskPageRender();
+      }
       if (S.offeredConsoleRevision !== meta.consoleRevision) {
         S.offeredConsoleRevision = meta.consoleRevision;
         toast('Update available', false, { label: 'Reload', fn: () => location.reload() });
@@ -15375,7 +15380,7 @@ function withMessageForms(html, ctx, v = S.view) {
     const problem = parsed.error || (parsed.form.save && !target ? 'This form would change something outside settings, so it was not shown.' : '')
       || (target ? formSecretLeak(parsed.form, target) : '');
     // The agent's mistake stays readable: what went wrong, with its source folded.
-    if (problem) return `<details class="ask-form-problem"><summary>${esc(problem)}</summary>${block}</details>`;
+    if (problem) return formProblemHtml(problem, block);
     const form = parsed.form;
     const live = !!ctx?.live && !ctx.answered?.has(at) && !S.answeredForms?.has(key);
     // What wireMessageForms submits: the form as read, by its key on the page —
@@ -15386,6 +15391,19 @@ function withMessageForms(html, ctx, v = S.view) {
     return KarmaxMarkdown.renderForm(form, { key, live, values: S.formDrafts?.[key] || {}, note, error: S.formErrors?.[key] || '' });
   });
 }
+
+/**
+ * A form this console will not show. A tab opened before a deploy runs the
+ * console of then, which refuses what the current one shows — a settings
+ * target added since (#1060: "the form did not load"). So a refusal asks
+ * whether a newer console is out, and once one is, offers it instead.
+ */
+function formProblemHtml(problem, block) {
+  if (S.consoleOutdated) return `<div class="ask-form-problem outdated" role="status"><span>This form needs the latest ${esc(siteName())}.</span><button type="button" class="btn sm primary" data-reload-console>Reload</button></div>`;
+  if (Date.now() - formRevisionCheckedAt > 30_000) { formRevisionCheckedAt = Date.now(); setTimeout(checkConsoleRevision); }
+  return `<details class="ask-form-problem"><summary>${esc(problem)}</summary>${block}</details>`;
+}
+let formRevisionCheckedAt = 0;
 
 /** Whether a message holds a form (cheap: before rendering). */
 function hasMessageForm(text) { return /```form[ \t]*\n/i.test(String(text || '')); }
@@ -15509,6 +15527,7 @@ function wireMessageForms(root, v) {
   S.formDrafts ||= {};
   S.formErrors ||= {};
   S.answeredForms ||= new Set();
+  root.querySelectorAll('[data-reload-console]').forEach((button) => { button.onclick = () => location.reload(); });
   root.querySelectorAll('form.ask-form.live:not([data-wired])').forEach((formEl) => {
     formEl.dataset.wired = '1';
     const key = formEl.dataset.form;
@@ -25566,6 +25585,18 @@ function credentialRequestTaskLink(request) {
     : `<span>${esc(label)}</span>`;
 }
 
+// Who decided a request (the GET routes' `decidedBy`, src/platform/decision-maker.ts):
+// a person by name, a task's agent linked to its task. Decisions recorded before
+// agents were told apart from the person they act for show that person.
+function decidedByHtml(request) {
+  const maker = request.decidedBy;
+  if (!maker) return '';
+  // Linked only when the console knows its project (it may be another project's).
+  const task = maker.taskId && taskRecord(maker.taskId);
+  const who = task ? `<a data-spa href="${esc(taskUrl(task.id, task))}">${esc(maker.label)}</a>` : esc(maker.label);
+  return `<span class="task-sub">by ${who}</span>`;
+}
+
 // The vault item chosen for each unbound credential request, by request id. It
 // lives outside the row so a re-render of the approvals list keeps the choice.
 const credentialRequestBindings = new Map();
@@ -25627,7 +25658,8 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
     ? `<div class="approval-history"><div class="section-h">Recent decisions</div>${recent.map((request) =>
       `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
         <span>${request.itemId ? esc(itemLabel(request.itemId)) : esc(request.domain || request.name || '?')}</span>
-        <span class="task-sub">${esc(({ once: 'Allowed once', task: 'Allowed for this task', always: 'Always allowed', deny: 'Denied', dismiss: 'Ignored' })[request.resolution?.action] || request.resolution?.action || '')}</span></div>`).join('')}</div>`
+        <span class="task-sub">${esc(({ once: 'Allowed once', task: 'Allowed for this task', always: 'Always allowed', deny: 'Denied', dismiss: 'Ignored' })[request.resolution?.action] || request.resolution?.action || '')}</span>
+        ${decidedByHtml(request)}</div>`).join('')}</div>`
     : '';
   return pendingHtml + history;
 }
@@ -25671,7 +25703,7 @@ function permissionRequestRows(requests, { historyLimit = 20, inTask = false } =
     ? `<div class="approval-history"><div class="section-h">Recent permission decisions</div>${recent.map((request) =>
       `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : request.status === 'withdrawn' ? '' : 'done'}"${request.withdrawn ? ` title="${esc(`Withdrawn: ${request.withdrawn.reason}`)}"` : ''}>${esc(request.status)}</span>
         <span class="mono">${[...request.capabilities, ...(request.projectIds || []).map((id) => `+ ${projectById(id)?.name || id}`)].map(esc).join(', ')}</span>
-        <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
+        ${decidedByHtml(request)}</div>`).join('')}</div>`
     : '';
   return pendingHtml + history;
 }
@@ -25754,7 +25786,7 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
   const history = recent.length ? `<div class="approval-history"><div class="section-h">Recent authorization decisions</div>${recent.map((request) =>
     `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : request.status === 'withdrawn' ? '' : 'done'}"${request.withdrawn ? ` title="${esc(request.withdrawn.reason)}"` : ''}>${esc(request.status)}</span>
       <span>${esc(authorizationSummary(request.authorization, S.projects))}</span>
-      <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>` : '';
+      ${decidedByHtml(request)}</div>`).join('')}</div>` : '';
   return pendingHtml + history;
 }
 

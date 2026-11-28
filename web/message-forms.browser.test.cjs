@@ -26,6 +26,17 @@ const leaky = `${fence({ fields: [{ name: 'key', type: 'secret' }], save: { meth
 const includedModel = `${fence({ fields: [{ name: 'key', label: 'OpenRouter management key', type: 'secret' }],
   save: { method: 'PUT', path: '/api/settings/included-model', body: { managementKey: '{{key}}' } }, submit: 'Turn on the included model' })}`;
 const leakyInstallation = `${fence({ fields: [{ name: 'key', type: 'secret' }], save: { method: 'PUT', path: '/api/settings/installation', body: { siteName: '{{key}}' } } })}`;
+// #1060's escalation, verbatim but for the steps before the form.
+const googleClientAsk = `Sign-in apps is live on tavya.io. To connect Google's own Gmail MCP, tavya needs a Google OAuth client.
+
+1. Open https://console.cloud.google.com/auth/overview/personal?apis=ws,wsmcp&clientType=web&isAgent=true.
+6. Paste the Client ID and Client secret below. They go straight into Installation → Sign-in apps; the secret never enters this conversation.
+
+\`\`\`form
+{"title": "Google OAuth client for tavya", "fields": [{"name": "clientId", "label": "Client ID", "type": "text", "placeholder": "….apps.googleusercontent.com"}, {"name": "clientSecret", "label": "Client secret", "type": "secret"}], "submit": "Save", "save": {"method": "PUT", "path": "/api/settings/oauth-apps/accounts.google.com", "body": {"clientId": "{{clientId}}", "clientSecret": "{{clientSecret}}"}}}
+\`\`\`
+
+After you save, I'll ask admin_docs #6 to request the Gmail connection.`;
 const outside = `${fence({ fields: [{ name: 'who' }], save: { method: 'POST', path: '/api/organizations/o/members', body: { userId: '{{who}}', role: 'owner' } } })}`;
 
 (async () => {
@@ -33,22 +44,25 @@ const outside = `${fence({ fields: [{ name: 'who' }], save: { method: 'POST', pa
   try {
     const project = { id: 'p', organizationId: 'o', name: 'Workspace', config: {} };
     const task = { id: 't', projectId: 'p', num: 1, title: 'Ship it', workflow: 'software-dev', params: {}, tags: [], lastView: { stage: 'do', status: 'waiting' } };
-    const open = async (messages, colorScheme = 'light') => {
+    // `options.view` overrides the task's view; `options.api` answers first.
+    const open = async (messages, colorScheme = 'light', options = {}) => {
       const view = { taskId: 't', stage: 'do', status: 'waiting', workflow: 'software-dev', messages,
-        actions: [{ name: 'followUp', label: 'Send', enabled: true }], waitingFor: { kind: 'human', reason: 'question' } };
+        actions: [{ name: 'followUp', label: 'Send', enabled: true }], waitingFor: { kind: 'human', reason: 'question' }, ...options.view };
       const context = await browser.newContext({ serviceWorkers: 'block', viewport: { width: 1280, height: 900 }, colorScheme });
       const sent = [];
       const { sockets } = await fakeConsole(context, { project, tasks: [task], async api(p, request) {
         if (request.method() !== 'GET') {
           const body = request.postDataJSON();
           sent.push({ path: p, body });
-          if (p === '/api/tasks/t/signal') {
-            const message = { id: `u${sent.length}`, role: 'user', author: 'user:u', text: body.text, ts: Date.now() };
+          if (p === '/api/tasks/t/signal' || p === '/api/tasks/t/messages') {
+            const message = { id: `u${sent.length}`, role: 'user', author: 'user:u', text: body.text, ts: Date.now(), ...(body.to ? { to: body.to } : {}) };
             messages.push(message);
-            return { message, role: 'do' };
+            return p.endsWith('/signal') ? { message, role: 'do' } : { message, notified: [] };
           }
           return { ok: true };
         }
+        const answered = await options.api?.(p, request);
+        if (answered !== undefined) return answered;
         if (p === '/api/tasks/t') return view;
         if (p.endsWith('/events')) return [];
         return undefined;
@@ -67,6 +81,79 @@ const outside = `${fence({ fields: [{ name: 'who' }], save: { method: 'POST', pa
       return { context, page, errors, sent, repaint };
     };
     const signals = (sent) => sent.filter((s) => s.path === '/api/tasks/t/signal').map((s) => s.body);
+
+    // ── #1060: an agent asks for a Google OAuth client with escalate_to_human ──
+    // The exact form its agent wrote. The owner's console, opened before the
+    // deploy that added Sign-in apps, refused it ("the form did not load").
+    {
+      const participants = [{ key: 'do', label: 'Agent', role: 'do', state: 'idle', messages: 3 }];
+      const before = () => [
+        { id: 'm0', role: 'user', text: 'Connect Google\'s Gmail MCP for admin_docs #6', ts: T0 },
+        { id: 'a1', role: 'agent', author: 'do', text: 'Sign-in apps is still not live on tavya.io.', ts: T0 + 1000 },
+        { id: 'n2', role: 'user', text: '(Resumed: your 8-minute pause is over.)', ts: T0 + 2000 },
+      ];
+      // In the wait only (as #1060's escalation was): asked, live, saved where it says.
+      const { context, page, errors, sent } = await open(before(), 'light',
+        { view: { participants, waitingFor: { kind: 'human', audience: ['@creator'], detail: googleClientAsk } } });
+      const form = page.locator('#ck-thread form.ask-form.live');
+      assert.equal(await form.locator('.ask-title').innerText(), 'Google OAuth client for tavya');
+      assert.match(await form.locator('.ask-note').innerText(), /Saved to Sign-in apps, not into the conversation/);
+      assert.equal(await form.getByLabel('Client ID').getAttribute('placeholder'), '….apps.googleusercontent.com');
+      assert.equal(await form.getByLabel('Client secret').getAttribute('type'), 'password');
+      assert.equal(await form.locator('.ask-submit').innerText(), 'Save');
+      if (shots) { await form.scrollIntoViewIfNeeded(); await page.screenshot({ path: `${shots}/form-escalation.png` }); }
+      await form.getByLabel('Client ID').fill('2442-x.apps.googleusercontent.com');
+      await form.getByLabel('Client secret').fill('GOCSPX-secret');
+      await form.locator('.ask-submit').click();
+      await page.waitForFunction(() => !document.querySelector('#ck-thread form.ask-form.live'));
+      assert.deepEqual(sent.map((s) => [s.path, s.body]), [
+        ['/api/settings/oauth-apps/accounts.google.com', { clientId: '2442-x.apps.googleusercontent.com', clientSecret: 'GOCSPX-secret' }],
+        ['/api/tasks/t/messages', { text: '- Client ID: 2442-x.apps.googleusercontent.com\n- Client secret: saved\n\nSaved to Sign-in apps.', to: ['agent:do'] }],
+      ], 'saved first, then the answer to the agent');
+      assert.ok(!(await page.locator('#ck-thread').innerText()).includes('GOCSPX'), 'the secret is on no page');
+      if (shots) await page.screenshot({ path: `${shots}/form-escalation-saved.png` });
+      assert.deepEqual(errors, []);
+      await context.close();
+
+      // Said in the conversation (as escalations now are), it outlives its wait:
+      // another ask replacing it leaves it there, and live.
+      const asked = { id: 'ask-1', role: 'agent', author: 'do', to: ['@creator'], text: googleClientAsk, ts: T0 + 3000 };
+      const replaced = await open([...before(), asked], 'light', { view: { participants,
+        waitingFor: { kind: 'human', audience: ['@creator'], detail: "Let #5's agent view and edit global settings? — To save the Google OAuth client." } } });
+      assert.equal(await replaced.page.locator('#ck-thread .msg.agent:not(.input-request) form.ask-form.live').count(), 1, 'the question stays, still answerable');
+      assert.equal(await replaced.page.locator('#ck-thread .msg.input-request').count(), 1, 'beside the ask that replaced it');
+      if (shots) { await replaced.page.locator('#ck-thread .msg.agent:not(.input-request) form.ask-form').scrollIntoViewIfNeeded(); await replaced.page.screenshot({ path: `${shots}/form-escalation-replaced.png` }); }
+      assert.deepEqual(replaced.errors, []);
+      await replaced.context.close();
+
+      // Answered, the task working again: the question is still there, answered.
+      const done = await open([...before(), asked, { id: 'm4', role: 'user', author: 'user:u', to: ['agent:do'],
+        text: '- Client ID: 2442-x.apps.googleusercontent.com\n- Client secret: saved\n\nSaved to Sign-in apps.', ts: T0 + 4000 }],
+      'light', { view: { participants, status: 'active', waitingFor: undefined } });
+      assert.equal(await done.page.locator('#ck-thread form.ask-form').count(), 1, 'it does not vanish');
+      assert.equal(await done.page.locator('#ck-thread form.ask-form.live').count(), 0, 'it shows as answered');
+      assert.deepEqual(done.errors, []);
+      await done.context.close();
+    }
+
+    // ── a console older than the server offers the current one, not a dead end ──
+    {
+      // A target this console does not know, as Sign-in apps was to the owner's tab.
+      const unknown = fence({ title: 'Google OAuth client for tavya', fields: [{ name: 'clientSecret', label: 'Client secret', type: 'secret' }],
+        save: { method: 'PUT', path: '/api/settings/sign-in-apps/accounts.google.com', body: { clientSecret: '{{clientSecret}}' } } });
+      let metaReads = 0;
+      const { context, page, errors } = await open([{ id: 'a1', role: 'agent', text: unknown, ts: T0 }], 'light', { api: (p) => p === '/api/meta'
+        ? { siteName: 'Fixture', hostLocal: true, consoleRevision: ++metaReads === 1 ? 'one' : 'two', agent: { provider: 'mock' }, worldProviders: [] } : undefined });
+      const outdated = page.locator('#ck-thread .ask-form-problem.outdated');
+      await outdated.waitFor();
+      assert.equal(await outdated.innerText(), 'This form needs the latest Fixture.\nReload');
+      if (shots) { await outdated.scrollIntoViewIfNeeded(); await page.screenshot({ path: `${shots}/form-outdated-console.png` }); }
+      const reloaded = page.waitForEvent('load');
+      await outdated.getByRole('button', { name: 'Reload' }).click();
+      await reloaded;
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
 
     // ── a general form: filled in, sent as an ordinary reply ──
     {

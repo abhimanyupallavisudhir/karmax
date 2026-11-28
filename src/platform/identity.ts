@@ -34,7 +34,7 @@ export function resolveCallerIdentity(record: ScopedToken, sessionUserId?: strin
   return { actor, humanSubject, externalIdentities: record.externalIdentities };
 }
 
-function legacyActor(record: ScopedToken): TokenActor {
+export function legacyActor(record: Pick<ScopedToken, 'kind' | 'taskId' | 'profileId' | 'role' | 'principal'>): TokenActor {
   if (record.kind === 'agent') return { kind: 'task-agent', taskId: record.taskId,
     profileId: record.profileId, role: record.role };
   if (record.kind === 'system') return { kind: 'system', principal: record.principal };

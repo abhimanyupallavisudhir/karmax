@@ -212,6 +212,7 @@
   "tests/daytona-sdk.test.ts": 0.1,
   "tests/daytona-workflow-live.test.ts": 0,
   "tests/daytona-world.test.ts": 0.1,
+  "tests/decision-maker.test.ts": 1.2,
   "tests/default-organization-ui.test.ts": 0,
   "tests/delegated-identity.test.ts": 0.4,
   "tests/delegation-lapse-workflow.test.ts": 9.2,

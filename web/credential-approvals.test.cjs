@@ -33,7 +33,9 @@ global.taskRecord = () => undefined;
 global.projectById = (id) => id === 'project_1' ? { id, name: 'App' } : undefined;
 global.projectBase = () => '/personal/app';
 
-for (const name of ['policyTip', 'credentialRequestTaskLink', 'credentialChoices', 'credentialRequestRows', 'requestReasonLine', 'subTaskAskLine', 'permissionAskHtml', 'permissionRequestRows', 'ignoredChip', 'ignoreRequestButton', 'defaultTaskTab']) eval(extractFn(name));
+global.taskUrl = (id, record) => `/personal/app/tasks/${record?.num ?? id}`;
+
+for (const name of ['policyTip', 'credentialRequestTaskLink', 'decidedByHtml', 'credentialChoices', 'credentialRequestRows', 'requestReasonLine', 'subTaskAskLine', 'permissionAskHtml', 'permissionRequestRows', 'ignoredChip', 'ignoreRequestButton', 'defaultTaskTab']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
@@ -107,6 +109,21 @@ const noted = credentialRequestRows([{ ...request, audience: ['user:ann'], via: 
   [{ id: 'vi_1', label: 'Example login' }]);
 ok(noted.includes('Billing needs &lt;our&gt; login'), 'the parent\'s note shows, escaped');
 ok(!rows.includes('Via '), 'a top-level task request names no parent');
+
+// Recent decisions say who decided — a task's agent as that agent, never the
+// person it acts for (preq_mwzzs9mwfe0322d123: #1064's agent's denial read as the owner's).
+const deniedByAgent = permissionRequestRows([{ ...permission, status: 'denied', resolution: { action: 'deny', by: 'task-agent:task_lead:do', at: 1 },
+  decidedBy: { by: 'task-agent:task_lead:do', label: "Task #64's agent", taskId: 'task_lead', num: 64 } }]);
+ok(deniedByAgent.includes("by Task #64's agent"), 'a decision names the agent that took it');
+ok(!/>deny</.test(deniedByAgent), 'the status chip says it once; the row does not repeat the action');
+global.taskRecord = (id) => id === 'task_lead' ? { id, num: 64, title: 'Apps', projectId: 'project_1' } : undefined;
+const linked = permissionRequestRows([{ ...permission, status: 'denied', decidedBy: { by: 'task-agent:task_lead:do', label: "Task #64's agent", taskId: 'task_lead', num: 64 } }]);
+ok(linked.includes('href="/personal/app/tasks/64"'), 'a task that decided links to its task when the console knows it');
+global.taskRecord = () => undefined;
+const byPerson = credentialRequestRows([{ ...request, status: 'denied', resolution: { action: 'deny', by: 'user:ann', at: 1 },
+  decidedBy: { by: 'user:ann', label: 'Ann' } }], [{ id: 'vi_1', label: 'Example login' }]);
+ok(byPerson.includes('Denied') && byPerson.includes('by Ann'), 'a credential decision keeps what was allowed and says who');
+ok(!permissionRequestRows([{ ...permission, status: 'denied' }]).includes('by '), 'nothing is guessed when no one is recorded');
 
 ok(defaultTaskTab({ approvalRequests: 0, actions: [] }) === 'checkin', 'tasks open on Check-in by default');
 ok(defaultTaskTab({ approvalRequests: 0, actions: [], state: { draft: true } }) === 'parameters', 'drafts open on their parameters');
