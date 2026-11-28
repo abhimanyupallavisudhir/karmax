@@ -1,0 +1,386 @@
+[
+ {
+  "file": "p1-openai-alloy-clean.webm",
+  "prompt": 1,
+  "voice": "openai-alloy",
+  "condition": "clean",
+  "seconds": 7.008,
+  "text": "Open a PR against the karmax repo that fixes the Postgres migration, then ask tavya to review it."
+ },
+ {
+  "file": "p1-openai-alloy-noisy.webm",
+  "prompt": 1,
+  "voice": "openai-alloy",
+  "condition": "noisy",
+  "seconds": 7.008,
+  "text": "Open a PR against the karmax repo that fixes the Postgres migration, then ask tavya to review it."
+ },
+ {
+  "file": "p1-openai-onyx-clean.webm",
+  "prompt": 1,
+  "voice": "openai-onyx",
+  "condition": "clean",
+  "seconds": 6.808,
+  "text": "Open a PR against the karmax repo that fixes the Postgres migration, then ask tavya to review it."
+ },
+ {
+  "file": "p1-openai-onyx-noisy.webm",
+  "prompt": 1,
+  "voice": "openai-onyx",
+  "condition": "noisy",
+  "seconds": 6.808,
+  "text": "Open a PR against the karmax repo that fixes the Postgres migration, then ask tavya to review it."
+ },
+ {
+  "file": "p1-eleven-clean.webm",
+  "prompt": 1,
+  "voice": "eleven",
+  "condition": "clean",
+  "seconds": 6.509,
+  "text": "Open a PR against the karmax repo that fixes the Postgres migration, then ask tavya to review it."
+ },
+ {
+  "file": "p1-eleven-noisy.webm",
+  "prompt": 1,
+  "voice": "eleven",
+  "condition": "noisy",
+  "seconds": 6.509,
+  "text": "Open a PR against the karmax repo that fixes the Postgres migration, then ask tavya to review it."
+ },
+ {
+  "file": "p2-openai-alloy-clean.webm",
+  "prompt": 2,
+  "voice": "openai-alloy",
+  "condition": "clean",
+  "seconds": 8.158,
+  "text": "The task is stuck in Review because the E2B sandbox ran out of disk, so resize the computer."
+ },
+ {
+  "file": "p2-openai-alloy-noisy.webm",
+  "prompt": 2,
+  "voice": "openai-alloy",
+  "condition": "noisy",
+  "seconds": 8.158,
+  "text": "The task is stuck in Review because the E2B sandbox ran out of disk, so resize the computer."
+ },
+ {
+  "file": "p2-openai-onyx-clean.webm",
+  "prompt": 2,
+  "voice": "openai-onyx",
+  "condition": "clean",
+  "seconds": 6.808,
+  "text": "The task is stuck in Review because the E2B sandbox ran out of disk, so resize the computer."
+ },
+ {
+  "file": "p2-openai-onyx-noisy.webm",
+  "prompt": 2,
+  "voice": "openai-onyx",
+  "condition": "noisy",
+  "seconds": 6.808,
+  "text": "The task is stuck in Review because the E2B sandbox ran out of disk, so resize the computer."
+ },
+ {
+  "file": "p2-eleven-clean.webm",
+  "prompt": 2,
+  "voice": "eleven",
+  "condition": "clean",
+  "seconds": 6.184,
+  "text": "The task is stuck in Review because the E2B sandbox ran out of disk, so resize the computer."
+ },
+ {
+  "file": "p2-eleven-noisy.webm",
+  "prompt": 2,
+  "voice": "eleven",
+  "condition": "noisy",
+  "seconds": 6.184,
+  "text": "The task is stuck in Review because the E2B sandbox ran out of disk, so resize the computer."
+ },
+ {
+  "file": "p3-openai-alloy-clean.webm",
+  "prompt": 3,
+  "voice": "openai-alloy",
+  "condition": "clean",
+  "seconds": 5.258,
+  "text": "Merge the panagent branch once CI passes and deploy it to staging."
+ },
+ {
+  "file": "p3-openai-alloy-noisy.webm",
+  "prompt": 3,
+  "voice": "openai-alloy",
+  "condition": "noisy",
+  "seconds": 5.258,
+  "text": "Merge the panagent branch once CI passes and deploy it to staging."
+ },
+ {
+  "file": "p3-openai-onyx-clean.webm",
+  "prompt": 3,
+  "voice": "openai-onyx",
+  "condition": "clean",
+  "seconds": 4.658,
+  "text": "Merge the panagent branch once CI passes and deploy it to staging."
+ },
+ {
+  "file": "p3-openai-onyx-noisy.webm",
+  "prompt": 3,
+  "voice": "openai-onyx",
+  "condition": "noisy",
+  "seconds": 4.658,
+  "text": "Merge the panagent branch once CI passes and deploy it to staging."
+ },
+ {
+  "file": "p3-eleven-clean.webm",
+  "prompt": 3,
+  "voice": "eleven",
+  "condition": "clean",
+  "seconds": 4.605,
+  "text": "Merge the panagent branch once CI passes and deploy it to staging."
+ },
+ {
+  "file": "p3-eleven-noisy.webm",
+  "prompt": 3,
+  "voice": "eleven",
+  "condition": "noisy",
+  "seconds": 4.605,
+  "text": "Merge the panagent branch once CI passes and deploy it to staging."
+ },
+ {
+  "file": "p4-openai-alloy-clean.webm",
+  "prompt": 4,
+  "voice": "openai-alloy",
+  "condition": "clean",
+  "seconds": 8.108,
+  "text": "Add a Temporal activity that saves the world checkpoint to R2, and update the wiki page about OpenRouter."
+ },
+ {
+  "file": "p4-openai-alloy-noisy.webm",
+  "prompt": 4,
+  "voice": "openai-alloy",
+  "condition": "noisy",
+  "seconds": 8.108,
+  "text": "Add a Temporal activity that saves the world checkpoint to R2, and update the wiki page about OpenRouter."
+ },
+ {
+  "file": "p4-openai-onyx-clean.webm",
+  "prompt": 4,
+  "voice": "openai-onyx",
+  "condition": "clean",
+  "seconds": 7.258,
+  "text": "Add a Temporal activity that saves the world checkpoint to R2, and update the wiki page about OpenRouter."
+ },
+ {
+  "file": "p4-openai-onyx-noisy.webm",
+  "prompt": 4,
+  "voice": "openai-onyx",
+  "condition": "noisy",
+  "seconds": 7.258,
+  "text": "Add a Temporal activity that saves the world checkpoint to R2, and update the wiki page about OpenRouter."
+ },
+ {
+  "file": "p4-eleven-clean.webm",
+  "prompt": 4,
+  "voice": "eleven",
+  "condition": "clean",
+  "seconds": 6.695,
+  "text": "Add a Temporal activity that saves the world checkpoint to R2, and update the wiki page about OpenRouter."
+ },
+ {
+  "file": "p4-eleven-noisy.webm",
+  "prompt": 4,
+  "voice": "eleven",
+  "condition": "noisy",
+  "seconds": 6.695,
+  "text": "Add a Temporal activity that saves the world checkpoint to R2, and update the wiki page about OpenRouter."
+ },
+ {
+  "file": "p5-openai-alloy-clean.webm",
+  "prompt": 5,
+  "voice": "openai-alloy",
+  "condition": "clean",
+  "seconds": 5.208,
+  "text": "Please rebase onto master, run npm test, and push the branch to GitHub."
+ },
+ {
+  "file": "p5-openai-alloy-noisy.webm",
+  "prompt": 5,
+  "voice": "openai-alloy",
+  "condition": "noisy",
+  "seconds": 5.208,
+  "text": "Please rebase onto master, run npm test, and push the branch to GitHub."
+ },
+ {
+  "file": "p5-openai-onyx-clean.webm",
+  "prompt": 5,
+  "voice": "openai-onyx",
+  "condition": "clean",
+  "seconds": 5.208,
+  "text": "Please rebase onto master, run npm test, and push the branch to GitHub."
+ },
+ {
+  "file": "p5-openai-onyx-noisy.webm",
+  "prompt": 5,
+  "voice": "openai-onyx",
+  "condition": "noisy",
+  "seconds": 5.208,
+  "text": "Please rebase onto master, run npm test, and push the branch to GitHub."
+ },
+ {
+  "file": "p5-eleven-clean.webm",
+  "prompt": 5,
+  "voice": "eleven",
+  "condition": "clean",
+  "seconds": 4.652,
+  "text": "Please rebase onto master, run npm test, and push the branch to GitHub."
+ },
+ {
+  "file": "p5-eleven-noisy.webm",
+  "prompt": 5,
+  "voice": "eleven",
+  "condition": "noisy",
+  "seconds": 4.652,
+  "text": "Please rebase onto master, run npm test, and push the branch to GitHub."
+ },
+ {
+  "file": "p6-openai-alloy-clean.webm",
+  "prompt": 6,
+  "voice": "openai-alloy",
+  "condition": "clean",
+  "seconds": 4.908,
+  "text": "Why does the Claude Code login keep failing on Hetzner and Fly.io?"
+ },
+ {
+  "file": "p6-openai-alloy-noisy.webm",
+  "prompt": 6,
+  "voice": "openai-alloy",
+  "condition": "noisy",
+  "seconds": 4.908,
+  "text": "Why does the Claude Code login keep failing on Hetzner and Fly.io?"
+ },
+ {
+  "file": "p6-openai-onyx-clean.webm",
+  "prompt": 6,
+  "voice": "openai-onyx",
+  "condition": "clean",
+  "seconds": 4.708,
+  "text": "Why does the Claude Code login keep failing on Hetzner and Fly.io?"
+ },
+ {
+  "file": "p6-openai-onyx-noisy.webm",
+  "prompt": 6,
+  "voice": "openai-onyx",
+  "condition": "noisy",
+  "seconds": 4.708,
+  "text": "Why does the Claude Code login keep failing on Hetzner and Fly.io?"
+ },
+ {
+  "file": "p6-eleven-clean.webm",
+  "prompt": 6,
+  "voice": "eleven",
+  "condition": "clean",
+  "seconds": 4.698,
+  "text": "Why does the Claude Code login keep failing on Hetzner and Fly.io?"
+ },
+ {
+  "file": "p6-eleven-noisy.webm",
+  "prompt": 6,
+  "voice": "eleven",
+  "condition": "noisy",
+  "seconds": 4.698,
+  "text": "Why does the Claude Code login keep failing on Hetzner and Fly.io?"
+ },
+ {
+  "file": "p7-openai-alloy-clean.webm",
+  "prompt": 7,
+  "voice": "openai-alloy",
+  "condition": "clean",
+  "seconds": 5.308,
+  "text": "Rename the krmax wiki section and link it from the README in the panagent repo."
+ },
+ {
+  "file": "p7-openai-alloy-noisy.webm",
+  "prompt": 7,
+  "voice": "openai-alloy",
+  "condition": "noisy",
+  "seconds": 5.308,
+  "text": "Rename the krmax wiki section and link it from the README in the panagent repo."
+ },
+ {
+  "file": "p7-openai-onyx-clean.webm",
+  "prompt": 7,
+  "voice": "openai-onyx",
+  "condition": "clean",
+  "seconds": 6.008,
+  "text": "Rename the krmax wiki section and link it from the README in the panagent repo."
+ },
+ {
+  "file": "p7-openai-onyx-noisy.webm",
+  "prompt": 7,
+  "voice": "openai-onyx",
+  "condition": "noisy",
+  "seconds": 6.008,
+  "text": "Rename the krmax wiki section and link it from the README in the panagent repo."
+ },
+ {
+  "file": "p7-eleven-clean.webm",
+  "prompt": 7,
+  "voice": "eleven",
+  "condition": "clean",
+  "seconds": 4.791,
+  "text": "Rename the krmax wiki section and link it from the README in the panagent repo."
+ },
+ {
+  "file": "p7-eleven-noisy.webm",
+  "prompt": 7,
+  "voice": "eleven",
+  "condition": "noisy",
+  "seconds": 4.791,
+  "text": "Rename the krmax wiki section and link it from the README in the panagent repo."
+ },
+ {
+  "file": "p8-openai-alloy-clean.webm",
+  "prompt": 8,
+  "voice": "openai-alloy",
+  "condition": "clean",
+  "seconds": 6.258,
+  "text": "Give the Postgres project five dollars of compute credit. Stop listening."
+ },
+ {
+  "file": "p8-openai-alloy-noisy.webm",
+  "prompt": 8,
+  "voice": "openai-alloy",
+  "condition": "noisy",
+  "seconds": 6.258,
+  "text": "Give the Postgres project five dollars of compute credit. Stop listening."
+ },
+ {
+  "file": "p8-openai-onyx-clean.webm",
+  "prompt": 8,
+  "voice": "openai-onyx",
+  "condition": "clean",
+  "seconds": 5.658,
+  "text": "Give the Postgres project five dollars of compute credit. Stop listening."
+ },
+ {
+  "file": "p8-openai-onyx-noisy.webm",
+  "prompt": 8,
+  "voice": "openai-onyx",
+  "condition": "noisy",
+  "seconds": 5.658,
+  "text": "Give the Postgres project five dollars of compute credit. Stop listening."
+ },
+ {
+  "file": "p8-eleven-clean.webm",
+  "prompt": 8,
+  "voice": "eleven",
+  "condition": "clean",
+  "seconds": 4.744,
+  "text": "Give the Postgres project five dollars of compute credit. Stop listening."
+ },
+ {
+  "file": "p8-eleven-noisy.webm",
+  "prompt": 8,
+  "voice": "eleven",
+  "condition": "noisy",
+  "seconds": 4.744,
+  "text": "Give the Postgres project five dollars of compute credit. Stop listening."
+ }
+]

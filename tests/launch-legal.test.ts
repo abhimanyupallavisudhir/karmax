@@ -195,11 +195,11 @@ describe('paid-launch policies', () => {
     expect(billing).toContain('files Git ignores (such as installed dependencies, build output and caches) and running processes are deleted and not restored');
     expect(JSON.stringify(policyDocument('billing'))).toContain('compute top-ups are charged when bought');
     // A changed disclosure is a new version: acceptance evidence names the text a person saw.
-    expect(policyDocument('billing')!.version).toBe('2026-11-17.1');
-    expect(policyDocument('billing')!.effectiveDate).toBe('November 17, 2026');
+    expect(policyDocument('billing')!.version).toBe('2026-11-28.1');
+    expect(policyDocument('billing')!.effectiveDate).toBe('November 28, 2026');
   });
 
-  it('says what the phone apps collect, and names FCM as a subprocessor, as a new policy version (2026-11-17.1)', () => {
+  it('says what the phone apps collect, and names FCM as a subprocessor (2026-11-17.1)', () => {
     const privacy = policyDocument('privacy')!;
     const apps = privacy.sections.find((section) => section.heading === 'Phone apps')!;
     const text = [...apps.paragraphs, ...(apps.bullets ?? [])].join(' ');
@@ -207,7 +207,16 @@ describe('paid-launch policies', () => {
     expect(text).toContain('tavya receives and keeps no audio');
     expect(text).toContain('never your password');
     expect(JSON.stringify(policyDocument('subprocessors'))).toContain('Google (Firebase Cloud Messaging)');
-    expect(privacy.version).toBe('2026-11-17.1');
+  });
+
+  it('says where dictation without a recognizer sends the audio, and that tavya keeps none, as a new policy version (2026-11-28.1)', () => {
+    const privacy = policyDocument('privacy')!;
+    const dictation = privacy.sections.find((section) => section.heading === 'Dictation')!.paragraphs.join(' ');
+    expect(dictation).toContain('through OpenRouter to AssemblyAI');
+    expect(dictation).toContain('tavya does not store the audio');
+    const openRouter = (policyDocument('subprocessors')!.sections.flatMap((section) => section.bullets ?? [])).find((bullet) => bullet.startsWith('OpenRouter'))!;
+    expect(openRouter).toContain('the audio of dictated phrases');
+    expect(privacy.version).toBe('2026-11-28.1');
   });
 
   it('states the free trial and the included model, as a new policy version (2026-11-06.1)', () => {
