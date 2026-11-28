@@ -50,3 +50,23 @@ describe('store texts', () => {
     expect(words).not.toMatch(/edit[^.\n]*offline|offline[^.\n]*edit/i);
   });
 });
+
+describe('store screenshots', () => {
+  // Each slot's size in pixels, as the stores require it (screenshots/README.md). The
+  // pictures are laid out in CSS pixels; painted without the device's ratio they come
+  // out a third of the size, and the stores refuse them.
+  const SLOTS: Record<string, [number, number]> = {
+    'ios/iphone-6.9': [1290, 2796], 'ios/iphone-6.5': [1242, 2688], 'ios/ipad-13': [2064, 2752],
+    'android/phone': [1080, 1920], 'android/tablet-7': [1080, 1920], 'android/tablet-10': [1440, 2560],
+  };
+  const size = (file: string) => { const head = fs.readFileSync(file).subarray(16, 24); return [head.readUInt32BE(0), head.readUInt32BE(4)]; };
+  it('are each slot\'s exact size, six to a slot, with the 1024×500 feature graphic', () => {
+    for (const [slot, expected] of Object.entries(SLOTS)) {
+      const dir = path.join(STORE, 'screenshots', slot);
+      const files = fs.readdirSync(dir).filter((name) => name.endsWith('.png'));
+      expect(files, slot).toHaveLength(6);
+      for (const name of files) expect(size(path.join(dir, name)), `${slot}/${name}`).toEqual(expected);
+    }
+    expect(size(path.join(STORE, 'screenshots/android/feature-graphic.png'))).toEqual([1024, 500]);
+  });
+});

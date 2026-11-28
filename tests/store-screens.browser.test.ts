@@ -14,7 +14,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { hostedGateway, launchChromium, type HostedGateway } from './helpers/browser.js';
-import { DEMO, DEMO_FILES, seedDemoOrganization, type DemoOrganization } from './helpers/demo-organization.js';
+import { DEMO, DEMO_FILES, DEMO_FOR_ME, seedDemoOrganization, type DemoOrganization } from './helpers/demo-organization.js';
 
 // Page-side code below runs in the browser; the test project has no DOM types.
 declare const document: any, Image: any, requestAnimationFrame: (run: () => void) => void;
@@ -228,8 +228,19 @@ async function forgetDrafts() {
       if (!(task.title in demo.tasks)) await g.store.deleteTask(task.id);
 }
 
-/** Two frames painted, then every finite animation and transition (dialogs' and forms' fade-in) finished. */
-const settle = (page: Page) => page.evaluate(async () => {
+/** The sidebar's "for you" badges as seeded (a page can paint its last counts before it re-reads them), two
+ * frames painted, then every finite animation and transition (dialogs' and forms' fade-in) finished. */
+const settle = async (page: Page) => {
+  await page.waitForFunction((expected) => {
+    const rows = [...document.querySelectorAll('.project-row')];
+    return rows.length > 0 && rows.every((row) => {
+      const name = row.querySelector('.rail-name')?.textContent ?? '';
+      return (row.querySelector('.count')?.textContent ?? '') === String(expected[name] || '');
+    });
+  }, DEMO_FOR_ME);
+  await paintedAndStill(page);
+};
+const paintedAndStill = (page: Page) => page.evaluate(async () => {
   await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
   type Running = { effect: { getComputedTiming(): { iterations?: number } } | null; finished: Promise<unknown> };
   const animations: Running[] = (document as unknown as { getAnimations(): Running[] }).getAnimations();
@@ -322,7 +333,10 @@ async function compose(page: Page, screen: Buffer, device: Device, caption: [str
   expect(overflow, `${caption.join(' / ')} fits ${device.id}`).toBe(false);
   fs.mkdirSync(path.dirname(out), { recursive: true });
   await page.screenshot({ path: out });
+  expect(pngSize(out), `${device.id} is the store's size`).toEqual({ width: device.width, height: device.height });
 }
+/** A PNG's width and height, from its header. */
+const pngSize = (file: string) => { const head = fs.readFileSync(file).subarray(16, 24); return { width: head.readUInt32BE(0), height: head.readUInt32BE(4) }; };
 /** The app's width inside the picture, and the caption's share of its height. */
 const SCREEN_SCALE = 0.86;
 const CAPTION_SHARE = 0.19;
@@ -422,6 +436,8 @@ it('shoots every store scene from the demo organization', async () => {
     for (const device of devices) {
       const viewport = appViewport(device);
       const { context, page, errors } = await demoContext({ ...viewport, scale: device.scale, mobile: true, init: [fakeApp, device.platform] });
+      // The picture is laid out in CSS pixels and painted at the device's ratio: the store's size in pixels.
+      const framer = await browser.newPage({ deviceScaleFactor: device.scale });
       const files: string[] = [];
       try {
         for (const [index, scene] of SCENES.entries()) {
@@ -433,11 +449,12 @@ it('shoots every store scene from the demo organization', async () => {
           if (scene === 'share') await forgetDrafts();
           if (!OUT) continue;
           const out = path.join(OUT, device.id, `${index + 1}-${scene}.png`);
-          await compose(composer, screen, device, CAPTIONS[scene]![device.platform], out);
+          await compose(framer, screen, device, CAPTIONS[scene]![device.platform], out);
           files.push(out);
         }
         expect(errors).toEqual([]);
       } finally {
+        await framer.close();
         await context.close();
         await forgetDrafts();
       }

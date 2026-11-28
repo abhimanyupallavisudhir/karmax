@@ -72,6 +72,10 @@ const PROJECTS: Record<string, Seed[]> = {
   ],
 };
 
+/** Each project's "for you" count, as its sidebar badge must show it in a picture. */
+export const DEMO_FOR_ME: Record<string, number> = Object.fromEntries(
+  Object.entries(PROJECTS).map(([name, seeds]) => [name, seeds.filter((seed) => seed.waiting).length]));
+
 /** A transcript of `lines` invented exchanges, about `kb` kilobytes. */
 function transcript(name: string, topic: string, kb: number) {
   const lines = [`# ${name}\n`, `Interview about ${topic}. Recorded with consent; names changed.\n`];
