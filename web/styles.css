@@ -5225,6 +5225,11 @@ pre.files-term-screen:focus { box-shadow: inset 0 0 0 2px var(--accent-weak); }
 .files-menu-check { flex: none !important; color: var(--ink-2); }
 .offline-pin-meta { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-3); font-size: var(--fs-11); }
 .offline-place { display: flex; align-items: center; gap: 8px; padding: 6px 16px 10px; color: var(--ink-3); font-size: var(--fs-11); }
+.offline-edit-chip { display: inline-flex; align-items: center; flex: none; height: 18px; padding: 0 7px; border-radius: 999px; background: var(--working-weak); color: var(--working); font-size: var(--fs-11); font-weight: 500; white-space: nowrap; }
+.offline-edit-chip[data-state="refused"] { background: var(--danger-weak); color: var(--danger); }
+.files-link .offline-edit-chip { margin-left: 6px; }
+.offline-edit-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 16px; border-bottom: 1px solid var(--line); font-size: var(--fs-12, 12px); }
+.offline-edit-why { color: var(--ink-3); }
 .offline-meter { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: var(--fs-11); white-space: nowrap; }
 .offline-meter-bar { width: 56px; height: 4px; border-radius: 2px; background: var(--surface-2); overflow: hidden; }
 .offline-meter-bar span { display: block; height: 100%; background: var(--accent); }

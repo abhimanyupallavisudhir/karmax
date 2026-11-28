@@ -5,6 +5,7 @@ import path from 'node:path';
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { launchChromium, openConsole } from './helpers/browser.js';
 import { capsOf, projectFilesFixture, sh } from './helpers/project-files-fixture.js';
+import { fakeOfflineApp } from './helpers/offline-app.js';
 
 // Offline files in the apps (wiki features/offline-files), driven in the
 // shipped console against a real gateway (real Git remotes and restic data),
@@ -28,57 +29,6 @@ const shoot = async (page: Page, name: string) => {
   fs.mkdirSync(shots, { recursive: true });
   await page.screenshot({ path: path.join(shots, `${name}.png`) });
 };
-
-/** The app's native side as the page sees it (runs in the page). */
-function fakeOfflineApp() {
-  const w = globalThis as any;
-  const KEY = 'fake-offline-files';
-  const stored = (): Record<string, string> => JSON.parse(localStorage.getItem(KEY) || '{}');
-  const keep = (map: Record<string, string>) => localStorage.setItem(KEY, JSON.stringify(map));
-  const hex = (buffer: ArrayBuffer) => [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, '0')).join('');
-  const base64 = (bytes: Uint8Array) => { let text = ''; for (const byte of bytes) text += String.fromCharCode(byte); return btoa(text); };
-  const fail = (code: string, message = code) => { throw { code, message }; };
-  w.__offline = { downloads: [] as string[], failNetwork: false, opened: null };
-  const TavyaOfflineFiles = {
-    async download({ url, version, size, blob }: { url: string; version: string; size: number; blob?: string }) {
-      w.__offline.downloads.push(url);
-      if (w.__offline.failNetwork) fail('network', 'The Internet connection appears to be offline.');
-      let response: Response;
-      try { response = await fetch(url, { headers: { 'if-match': `"${version}"` } }); } catch (error) { return fail('network', String(error)); }
-      if (response.status === 412) fail('changed');
-      if (response.status === 403) fail('forbidden');
-      if (response.status === 404) fail('missing');
-      if (!response.ok) fail('http');
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      if (bytes.length !== size) fail('mismatch');
-      if (blob) {
-        const head = new TextEncoder().encode(`blob ${size}\0`);
-        const all = new Uint8Array(head.length + bytes.length);
-        all.set(head); all.set(bytes, head.length);
-        if (hex(await crypto.subtle.digest('SHA-1', all)) !== blob) fail('mismatch');
-      }
-      const hash = hex(await crypto.subtle.digest('SHA-256', bytes));
-      const map = stored(); map[hash] = base64(bytes); keep(map);
-      return { hash, size: bytes.length };
-    },
-    async list() {
-      const files = Object.entries(stored()).map(([hash, data]) => ({ hash, size: atob(data).length }));
-      return { files, bytes: files.reduce((sum, file) => sum + file.size, 0), free: 64 * 1024 ** 3 };
-    },
-    async remove({ hashes }: { hashes: string[] }) { const map = stored(); for (const hash of hashes) delete map[hash]; keep(map); },
-    async wipe() { localStorage.removeItem(KEY); },
-    // Like iOS: no local URL, so the page reads the bytes in chunks.
-    async url() { return { url: null }; },
-    async read({ hash, offset = 0, length = 1 << 20 }: { hash: string; offset?: number; length?: number }) {
-      const binary = atob(stored()[hash] ?? '');
-      const part = binary.slice(offset, offset + length);
-      return { data: btoa(part), eof: offset + part.length >= binary.length };
-    },
-    async open({ hash, name }: { hash: string; name: string }) { w.__offline.opened = { hash, name }; },
-  };
-  const Plugins = { TavyaOfflineFiles };
-  w.Capacitor = { isNativePlatform: () => true, getPlatform: () => 'android', isPluginAvailable: (name: string) => name in Plugins, Plugins };
-}
 
 async function setup() {
   const f = await projectFilesFixture(cleanups);
@@ -206,7 +156,7 @@ it('keeps files and folders offline, refreshes them when tavya changes, and free
 
   await step('past the limit a folder is refused, saying what it needs', async () => {
     await page.evaluate(() => new Promise((resolve) => {
-      const open = indexedDB.open('tavya-offline', 1);
+      const open = indexedDB.open('tavya-offline');
       open.onsuccess = () => { const tx = open.result.transaction('meta', 'readwrite'); tx.objectStore('meta').put(100, 'limit'); tx.oncomplete = () => { open.result.close(); resolve(null); }; };
     }));
     await page.reload();

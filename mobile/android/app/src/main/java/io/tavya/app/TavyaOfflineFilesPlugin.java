@@ -44,6 +44,11 @@ import org.json.JSONException;
  *   url({hash}) → {url}: <console origin>/_capacitor_file_/<path>, which
  *     Capacitor's local server answers in the console's own origin
  *   read({hash, offset, length}) → {data: base64, eof} · open({hash, name})
+ *   saveEdit({id, entry}) · edits() → {edits: [entry]} · dropEdit({id}) ·
+ *   openEdit({id, name}): the native copy of the outbox of edits made offline
+ *     (§ Offline edits), one JSON file per edit in no-backup/offline-edits —
+ *     outside offline-files, so wipe() (signing out) never takes an edit not
+ *     uploaded yet, and a cleared WebView storage can't either.
  *
  * Bytes live in the app's no-backup folder (never in a backup, gone with the
  * app). A download runs off the main thread with the WebView's cookies (the
@@ -64,6 +69,16 @@ public class TavyaOfflineFilesPlugin extends Plugin {
     private File root() { return new File(getContext().getNoBackupFilesDir(), "offline-files"); }
     private File blobs() { return new File(root(), "blobs"); }
     private File temp() { return new File(root(), "tmp"); }
+    private File editsDir() { return new File(getContext().getNoBackupFilesDir(), "offline-edits"); }
+
+    private File editFile(String id) throws Refusal {
+        if (id == null || id.isEmpty()) throw new Refusal("invalid", "An edit needs an id.");
+        try {
+            return new File(editsDir(), hex(MessageDigest.getInstance("SHA-256").digest(id.getBytes(StandardCharsets.UTF_8))) + ".json");
+        } catch (NoSuchAlgorithmException e) {
+            throw new Refusal("failed", "No SHA-256 here.");
+        }
+    }
 
     private File blob(String hash) throws Refusal {
         if (hash == null || !HASH.matcher(hash).matches()) throw new Refusal("invalid", "Not a stored file.");
@@ -232,22 +247,102 @@ public class TavyaOfflineFilesPlugin extends Plugin {
         }
     }
 
+    /** An edit, written whole to a temp file and renamed over the last copy of it. */
+    @PluginMethod
+    public void saveEdit(PluginCall call) {
+        try {
+            String entry = call.getString("entry");
+            if (entry == null) throw new Refusal("invalid", "An edit needs its entry.");
+            File target = editFile(call.getString("id"));
+            editsDir().mkdirs();
+            File scratch = new File(editsDir(), target.getName() + "." + randomName() + ".part");
+            try (FileOutputStream out = new FileOutputStream(scratch)) {
+                out.write(entry.getBytes(StandardCharsets.UTF_8));
+                out.getFD().sync();
+            }
+            if (!scratch.renameTo(target)) { scratch.delete(); throw new IOException("rename failed"); }
+            call.resolve();
+        } catch (Refusal refusal) {
+            call.reject(refusal.getMessage(), refusal.code);
+        } catch (IOException e) {
+            call.reject("Couldn’t keep the edit on this phone.", "space");
+        }
+    }
+
+    @PluginMethod
+    public void edits(PluginCall call) {
+        JSArray list = new JSArray();
+        File[] files = editsDir().listFiles();
+        if (files != null) for (File file : files) {
+            if (!file.getName().matches("^[0-9a-f]{64}\\.json$")) continue;
+            try { list.put(new String(readAll(file), StandardCharsets.UTF_8)); } catch (IOException e) { /* gone meanwhile */ }
+        }
+        JSObject result = new JSObject();
+        result.put("edits", list);
+        call.resolve(result);
+    }
+
+    @PluginMethod
+    public void dropEdit(PluginCall call) {
+        try {
+            editFile(call.getString("id")).delete();
+            call.resolve();
+        } catch (Refusal refusal) {
+            call.reject(refusal.getMessage(), refusal.code);
+        }
+    }
+
+    /** Open in… for an edit: its content under its file's name. */
+    @PluginMethod
+    public void openEdit(PluginCall call) {
+        try {
+            org.json.JSONObject entry = new org.json.JSONObject(new String(readAll(editFile(call.getString("id"))), StandardCharsets.UTF_8));
+            byte[] content = entry.optString("content", "").getBytes(StandardCharsets.UTF_8);
+            openCopy(call, call.getString("name", entry.optString("name", "file")), (out) -> out.write(content));
+        } catch (Refusal refusal) {
+            call.reject(refusal.getMessage(), refusal.code);
+        } catch (IOException | JSONException e) {
+            call.reject("Couldn’t open it.", "failed");
+        }
+    }
+
+    private static byte[] readAll(File file) throws IOException {
+        try (InputStream in = new FileInputStream(file); java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream()) {
+            byte[] buffer = new byte[64 * 1024];
+            int read;
+            while ((read = in.read(buffer)) != -1) out.write(buffer, 0, read);
+            return out.toByteArray();
+        }
+    }
+
+    private interface Body { void write(OutputStream out) throws IOException; }
+
     /** Open in…: a copy with its real name (apps choose by it), through the FileProvider, to any app that views it. */
     @PluginMethod
     public void open(PluginCall call) {
         try {
             File source = blob(call.getString("hash"));
-            String given = new File(call.getString("name", "file")).getName().replace('\0', '_');
+            openCopy(call, call.getString("name", "file"), (out) -> {
+                try (InputStream in = new FileInputStream(source)) {
+                    byte[] buffer = new byte[64 * 1024];
+                    int read;
+                    while ((read = in.read(buffer)) != -1) out.write(buffer, 0, read);
+                }
+            });
+        } catch (Refusal refusal) {
+            call.reject(refusal.getMessage(), refusal.code);
+        }
+    }
+
+    private void openCopy(PluginCall call, String requested, Body body) {
+        try {
+            String given = new File(requested == null ? "file" : requested).getName().replace('\0', '_');
             String name = given.isEmpty() ? "file" : given;
             File folder = new File(getContext().getCacheDir(), "offline-open");
             deleteTree(folder);
             folder.mkdirs();
             File copy = new File(folder, name);
-            try (InputStream in = new FileInputStream(source); OutputStream out = new FileOutputStream(copy)) {
-                byte[] buffer = new byte[64 * 1024];
-                int read;
-                while ((read = in.read(buffer)) != -1) out.write(buffer, 0, read);
-            }
+            try (OutputStream out = new FileOutputStream(copy)) { body.write(out); }
             Uri uri = FileProvider.getUriForFile(getContext(), getContext().getPackageName() + ".fileprovider", copy);
             String extension = MimeTypeMap.getFileExtensionFromUrl(Uri.encode(name)).toLowerCase(Locale.ROOT);
             String type = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension);
@@ -261,8 +356,6 @@ public class TavyaOfflineFilesPlugin extends Plugin {
                     call.reject("No app on this phone opens this file.", "unavailable");
                 }
             });
-        } catch (Refusal refusal) {
-            call.reject(refusal.getMessage(), refusal.code);
         } catch (IOException | IllegalArgumentException e) {
             call.reject("Couldn’t open it.", "failed");
         }

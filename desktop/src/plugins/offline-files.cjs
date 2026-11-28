@@ -6,6 +6,10 @@
 //   list() → {files: [{hash, size}], bytes, free} · remove({hashes}) · wipe()
 //   url({hash}) → {url} (tavya-offline://file/<hash>, for the console only)
 //   read({hash, offset, length}) → {data: base64, eof} · open({hash, name})
+//   saveEdit({id, entry}) · edits() → {edits: [entry]} · dropEdit({id}) ·
+//   openEdit({id, name}): the native copy of the outbox of edits made offline
+//   (§ Offline edits), in <userData>/offline-edits — beside the bytes, not
+//   among them, so wipe() (signing out) never takes an edit not uploaded yet.
 // Downloads run here in main with the console session's cookies, so bytes
 // never cross the bridge. Each lands in a temp file, is checked (its size, and
 // its Git blob id when given), then renamed to its SHA-256, read-only. Two
@@ -31,7 +35,7 @@ const refuse = (code, message) => { throw { code, message }; };
  * `dir`: where the bytes live (default <userData>/offline-files). `request`:
  * how a download is made (default: Electron's net with the session's cookies).
  */
-function createOfflineStore({ dir, origin, request }) {
+function createOfflineStore({ dir, origin, request, editsDir = path.join(path.dirname(dir), 'offline-edits') }) {
   const blobs = path.join(dir, 'blobs');
   const temp = path.join(dir, 'tmp');
   const opened = path.join(dir, 'open');
@@ -152,7 +156,37 @@ function createOfflineStore({ dir, origin, request }) {
     return new Response(Readable.toWeb(fs.createReadStream(file)), { status: 200, headers: { ...cors, 'content-length': String(size) } });
   }
 
-  return { download, list, remove, wipe, read, copyToOpen, serve, dir };
+  // ── the outbox's native copy: one JSON file per edit, written whole then renamed ──
+  const editFile = (id) => path.join(editsDir, `${crypto.createHash('sha256').update(String(id)).digest('hex')}.json`);
+  function saveEdit({ id, entry } = {}) {
+    if (!id || typeof entry !== 'string') refuse('invalid', 'An edit needs an id and its entry.');
+    fs.mkdirSync(editsDir, { recursive: true, mode: 0o700 });
+    const scratch = `${editFile(id)}.${crypto.randomBytes(4).toString('hex')}.part`;
+    fs.writeFileSync(scratch, entry, { mode: 0o600 });
+    fs.renameSync(scratch, editFile(id));
+  }
+  function edits() {
+    const out = [];
+    for (const name of fs.existsSync(editsDir) ? fs.readdirSync(editsDir) : []) {
+      if (!/^[0-9a-f]{64}\.json$/.test(name)) continue;
+      try { out.push(fs.readFileSync(path.join(editsDir, name), 'utf8')); } catch { /* gone meanwhile */ }
+    }
+    return { edits: out };
+  }
+  function dropEdit({ id } = {}) { fs.rmSync(editFile(id), { force: true }); }
+  /** The edit's content as a named file, for the default app. */
+  function editToOpen({ id, name }) {
+    const entry = JSON.parse(fs.readFileSync(editFile(id), 'utf8'));
+    const safe = path.basename(String(name || entry.name || 'file')).replace(/[\0/\\]/g, '_') || 'file';
+    fs.rmSync(opened, { recursive: true, force: true });
+    const folder = path.join(opened, crypto.randomBytes(6).toString('hex'));
+    fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
+    const file = path.join(folder, safe);
+    fs.writeFileSync(file, String(entry.content ?? ''), { mode: 0o600 });
+    return file;
+  }
+
+  return { download, list, remove, wipe, read, copyToOpen, serve, dir, saveEdit, edits, dropEdit, editToOpen };
 }
 
 /** A GET through the console session (its cookies), as {status, body: Readable}. */
@@ -182,6 +216,13 @@ function offlineFilesPlugin({ app, origin, session, net, shell, dir } = {}) {
       read: async (options) => store.read(options),
       open: async (options) => {
         const failure = await shell.openPath(store.copyToOpen(options));
+        if (failure) refuse('failed', failure);
+      },
+      saveEdit: async (options) => { store.saveEdit(options); },
+      edits: async () => store.edits(),
+      dropEdit: async (options) => { store.dropEdit(options); },
+      openEdit: async (options) => {
+        const failure = await shell.openPath(store.editToOpen(options));
         if (failure) refuse('failed', failure);
       },
     },

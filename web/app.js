@@ -21366,7 +21366,8 @@ function wireFilesEditButton(pid, node, body, text) {
   body.querySelector('#files-edit')?.addEventListener('click', () => openFilesEditor(pid, node, text));
   if (S.filesEditOnOpen === node.path) { S.filesEditOnOpen = null; openFilesEditor(pid, node, text); }
 }
-function openFilesEditor(pid, node, text) {
+// `offline`: saved on this device instead (the Offline view): content → Promise, then `close()`.
+function openFilesEditor(pid, node, text, offline = null) {
   const body = $('#files-body');
   if (!body || body.querySelector('#files-editor')) return;
   const name = FV.parts(node.path).pop();
@@ -21385,17 +21386,20 @@ function openFilesEditor(pid, node, text) {
   const paint = () => { state.textContent = saving ? 'Saving…' : dirty() ? 'Edited' : ''; };
   const guard = (event) => { if (dirty()) { event.preventDefault(); event.returnValue = ''; } };
   addEventListener('beforeunload', guard);
-  const close = () => { removeEventListener('beforeunload', guard); refreshFilesPage(); };
+  const close = () => { removeEventListener('beforeunload', guard); if (offline) offline.close(); else refreshFilesPage(); };
   const save = async (overwrite = false) => {
     if (saving) return;
     if (!dirty()) return close();
     saving = true; paint();
     try {
-      await applyFileChanges(pid, [{ op: 'write', path: node.path, text: area.value, ...(overwrite ? {} : { expect: version ?? null }) }], `Saved ${name}`, { refresh: false });
+      if (offline) await offline.save(area.value);
+      else await applyFileChanges(pid, [{ op: 'write', path: node.path, text: area.value, ...(overwrite ? {} : { expect: version ?? null }) }], `Saved ${name}`, { refresh: false });
       text = area.value;
       close();
     } catch (error) {
       if (error.status === 409) toast(error.message, true, { label: 'Overwrite', fn: () => save(true) });
+      // tavya out of reach (or failing): kept on this device, uploaded once it answers.
+      else if (!offline && version && (KarmaxOffline.unreachable(error) || error.status >= 500) && await saveEditOffline(pid, node, area.value, version)) { text = area.value; close(); }
       else filesFail(error);
     } finally { saving = false; if (area.isConnected) paint(); }
   };
@@ -21412,6 +21416,18 @@ function openFilesEditor(pid, node, text) {
   });
   body.querySelector('#files-edit-save').addEventListener('click', () => save());
   body.querySelector('#files-edit-cancel').addEventListener('click', () => { if (!dirty() || confirm('Discard your changes?')) close(); });
+}
+
+// An edit tavya couldn't take now, kept in this device's outbox (wiki features/offline-files § Offline edits).
+async function saveEditOffline(pid, node, content, base) {
+  const engine = offlineFiles();
+  if (!engine || !offlineViewable()) return false;
+  try {
+    await engine.saveEdit({ projectId: pid, view: S.filesView || '', path: node.path, base, content, data: node.source?.kind === 'data',
+      name: FV.parts(node.path).pop(), projectName: projectById(pid)?.name || '' });
+  } catch { return false; }
+  toast('Saved on this device · uploads when online');
+  return true;
 }
 
 // ── the terminal ──
@@ -21615,11 +21631,25 @@ function offlineFiles() {
   const plugin = nativePlugin('TavyaOfflineFiles');
   const Offline = globalThis.KarmaxOffline;
   offlineFiles.engine = plugin && Offline ? Offline.create({ plugin, request: (path, opts) => api(path, opts), origin: location.origin,
-    kind: desktopShell() ? 'desktop' : 'phone' }) : null;
+    kind: desktopShell() ? 'desktop' : 'phone', device: offlineDeviceName, told: offlineEditTold }) : null;
   offlineFiles.engine?.on(() => paintOfflineState());
   return offlineFiles.engine;
 }
-// Offline copies are one person's: another account, signing out or a revoked app wipes them.
+// The device, as a copy kept beside a file names it: "notes (offline edit, iPhone 2026-11-28 14.05).md".
+function offlineDeviceName() {
+  if (desktopShell()) return desktopOsName();
+  if (nativePlatform() === 'ios') return /iPad/.test(navigator.userAgent || '') ? 'iPad' : 'iPhone';
+  return nativePlatform() === 'android' ? 'Android' : '';
+}
+// An offline edit reached tavya: said once, as it lands.
+function offlineEditTold(result, edit) {
+  const name = edit.name || FV.parts(edit.path).pop();
+  if (result.result === 'merged') toast('Merged with newer changes', false, { label: 'Show', fn: () => go(filesRoute(edit.projectId, edit.path, edit.view)) });
+  else if (result.result === 'kept') toast(`Kept both: ${FV.parts(result.path).pop()}`, false, { label: 'Show', fn: () => go(filesRoute(edit.projectId, result.path, edit.view)) });
+  else toast(`Uploaded ${name}`);
+  if (isFilesTab() && S.filesView !== 'offline' && filesProjectId() === edit.projectId && !$('#files-editor')) refreshFilesPage();
+}
+// Offline copies are one person's: another account, signing out or a revoked app wipes them (never an edit not uploaded yet).
 async function startOfflineFiles(user) {
   const engine = offlineFiles();
   if (!engine) return;
@@ -21683,14 +21713,75 @@ function paintOfflineState() {
   const pid = page.dataset.project, view = page.dataset.view || '', here = page.dataset.path || '';
   if (!pid || !offlineViewable(view)) return;
   document.querySelectorAll('#files-body .files-row').forEach((row) => {
-    row.querySelector('.offline-mark')?.remove();
-    const held = engine.covering(pid, view, FV.join(here, row.dataset.name));
+    row.querySelectorAll('.offline-mark, .offline-edit-chip').forEach((old) => old.remove());
+    const at = FV.join(here, row.dataset.name);
+    const held = engine.covering(pid, view, at);
     if (held?.exact) row.querySelector('.files-link')?.insertAdjacentHTML('beforeend', offlineMarkHtml(held.pin));
+    const edit = engine.editFor(pid, view, at);
+    if (edit) row.querySelector('.files-link')?.insertAdjacentHTML('beforeend', offlineEditChipHtml(edit));
   });
   const source = $('#files-source');
   source?.querySelector('.offline-mark')?.remove();
   const held = engine.covering(pid, view, here);
   if (held && source) source.insertAdjacentHTML('afterbegin', offlineMarkHtml(held.pin));
+  // A file with an edit waiting here: what became of it, and what can be done.
+  const edit = S.filesNode?.kind === 'file' && S.filesNode.path === here && !$('#files-editor') ? engine.editFor(pid, view, here) : null;
+  paintOfflineEditBar(edit);
+}
+
+// ── offline edits: the outbox's marks and bar (wiki features/offline-files § Offline edits) ──
+function offlineEditTitle(edit) {
+  if (edit.state === 'refused') return `Not on tavya: ${edit.reason || 'you can’t change this file'}`;
+  if (edit.state === 'failed') return `Not on tavya yet: ${edit.reason || 'it failed'} · tries again`;
+  return 'Saved on this device · uploads when tavya can be reached';
+}
+function offlineEditChipHtml(edit) {
+  return `<span class="offline-edit-chip" data-state="${esc(edit.state || 'queued')}" title="${esc(offlineEditTitle(edit))}">Edited offline</span>`;
+}
+// Above the file (outside what the viewer redraws): the chip and, once tavya
+// refused it, Save a copy / Download; Discard always. No edit: none.
+function paintOfflineEditBar(edit) {
+  $('#offline-edit-bar')?.remove();
+  const body = $('#files-body');
+  if (!body || !edit) return;
+  const engine = offlineFiles();
+  const refused = edit.state === 'refused';
+  const opens = engine.canOpenEdit() && !desktopShell();
+  body.insertAdjacentHTML('beforebegin', `<div class="offline-edit-bar" id="offline-edit-bar" role="status">${offlineEditChipHtml(edit)}
+    ${refused ? '<span class="offline-edit-why">You can’t change this file</span>' : ''}<span class="files-spacer"></span>
+    ${refused ? `<button type="button" class="btn sm" data-edit-act="copy" title="Save it as a new file">Save a copy…</button>
+      <button type="button" class="btn sm" data-edit-act="download">${opens ? 'Open in…' : 'Download'}</button>` : ''}
+    <button type="button" class="btn sm" data-edit-act="discard" title="Throw this edit away">Discard</button></div>`);
+  const bar = $('#offline-edit-bar');
+  bar.querySelectorAll('[data-edit-act]').forEach((button) => button.addEventListener('click', () => offlineEditAction(button.dataset.editAct, edit, opens)));
+}
+async function offlineEditAction(act, edit, opens) {
+  const engine = offlineFiles();
+  const name = edit.name || FV.parts(edit.path).pop();
+  try {
+    if (act === 'discard') {
+      if (!confirm(`Discard your offline edit of ${name}?`)) return;
+      await engine.discardEdit(edit.id);
+    } else if (act === 'download') {
+      if (opens) return await engine.openEdit(edit.id, name);
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(new Blob([edit.content], { type: 'text/plain;charset=utf-8' }));
+      link.download = name;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(link.href), 10_000);
+      return;
+    } else if (act === 'copy') {
+      const to = (await promptText('Save a copy as', edit.path))?.trim();
+      if (!to) return;
+      await engine.saveEditCopy(edit.id, to);
+      toast(`Saved ${FV.parts(to).pop()}`, false, { label: 'Show', fn: () => go(filesRoute(edit.projectId, to, edit.view)) });
+    }
+  } catch (error) { return filesFail(error); }
+  if ($('#files-editor')) return;
+  if ($('#files-page')?.dataset.view === 'offline') { delete $('#files-body').dataset.shows; paintOfflineView(); }
+  else if (isFilesTab()) refreshFilesPage();
 }
 
 // ⋯ and right-click: keep the targets offline, or stop.
@@ -21781,8 +21872,14 @@ async function wireOfflineView({ shell = false } = {}) {
 async function paintOfflineView({ shell = $('#files-page')?.dataset.scope === 'offline' } = {}) {
   const engine = offlineFiles();
   const body = $('#files-body');
-  if (!engine || !body || $('#files-page')?.dataset.view !== 'offline') return;
+  // Never under someone typing: the editor repaints the view when it closes.
+  if (!engine || !body || $('#files-page')?.dataset.view !== 'offline' || body.querySelector('#files-editor')) return;
   const at = offlineState();
+  // An edit no pin holds any more (let go, or a cleared WebView): shown on its own.
+  const loose = String(at.pin || '').startsWith('edit:') ? engine.edits().find((edit) => `edit:${edit.id}` === at.pin) : null;
+  if (loose) return paintLooseEdit(body, loose);
+  const shown = at.pin ? engine.get(at.pin) : null;
+  if (!shown || engine.node(shown, at.sub)?.kind !== 'file') paintOfflineEditBar(null);
   const pin = at.pin ? engine.get(at.pin) : null;
   if (at.pin && !pin) { at.pin = null; at.sub = ''; }
   const crumbs = $('#offline-crumbs');
@@ -21800,17 +21897,24 @@ async function paintOfflineView({ shell = $('#files-page')?.dataset.scope === 'o
   if (actions) actions.innerHTML = '';
   if (!pin) {
     const pins = [...engine.pins()].sort((a, b) => (a.projectName || '').localeCompare(b.projectName || '') || offlinePinName(a).localeCompare(offlinePinName(b)));
-    if (body.dataset.shows === `root\n${pins.map((p) => `${p.id}:${offlineMarkState(p)}:${p.checkedAt}`).join(',')}`) return;
-    body.dataset.shows = `root\n${pins.map((p) => `${p.id}:${offlineMarkState(p)}:${p.checkedAt}`).join(',')}`;
-    body.innerHTML = pins.length ? `<ul class="files-list" role="list">${pins.map((p) => `<li class="files-row kind-${p.kind === 'directory' ? 'directory' : 'file'}" data-pin="${esc(p.id)}" data-name="${esc(offlinePinName(p))}">
+    const edits = engine.edits();
+    const loose = edits.filter((edit) => !engine.covering(edit.projectId, edit.view, edit.path));
+    const editsIn = (p) => edits.filter((edit) => engine.covering(edit.projectId, edit.view, edit.path)?.pin.id === p.id);
+    const shows = `root\n${pins.map((p) => `${p.id}:${offlineMarkState(p)}:${p.checkedAt}`).join(',')}\n${edits.map((edit) => `${edit.id}:${edit.rev}:${edit.state}`).join(',')}`;
+    if (body.dataset.shows === shows) return;
+    body.dataset.shows = shows;
+    body.innerHTML = pins.length || loose.length ? `<ul class="files-list" role="list">${loose.map((edit) => `<li class="files-row kind-file" data-edit="${esc(edit.id)}" data-name="${esc(edit.name)}">
+        <a class="files-link" href="#" data-offline-go="edit:${esc(edit.id)}\n"><span class="files-icon">${FV.ICONS.file}</span>
+          <span class="files-name">${esc(edit.name)}</span><span class="offline-pin-meta">${esc([edit.projectName, FV.parts(edit.path).slice(0, -1).join('/'), KarmaxOffline.branchOf(edit.view) && `branch ${KarmaxOffline.branchOf(edit.view)}`].filter(Boolean).join(' · '))}</span>${offlineEditChipHtml(edit)}</a>
+        <span class="files-size">${esc(FV.formatBytes(new Blob([edit.content]).size))}</span></li>`).join('')}${pins.map((p) => `<li class="files-row kind-${p.kind === 'directory' ? 'directory' : 'file'}" data-pin="${esc(p.id)}" data-name="${esc(offlinePinName(p))}">
         <a class="files-link" href="#" data-offline-go="${esc(p.id)}\n"><span class="files-icon">${p.kind === 'directory' ? FV.ICONS.directory : FV.ICONS.file}</span>
-          <span class="files-name">${esc(offlinePinName(p))}</span><span class="offline-pin-meta">${esc(offlinePinMeta(p))}</span>${offlineMarkHtml(p)}</a>
+          <span class="files-name">${esc(offlinePinName(p))}</span><span class="offline-pin-meta">${esc(offlinePinMeta(p))}</span>${offlineMarkHtml(p)}${editsIn(p).length ? offlineEditChipHtml(editsIn(p)[0]) : ''}</a>
         <span class="files-size">${esc(FV.formatBytes(offlinePinSize(p)))}</span>
         <button type="button" class="files-more" title="More" aria-label="More for ${esc(offlinePinName(p))}" aria-haspopup="menu" tabindex="-1">${FM_ICON.more}</button></li>`).join('')}</ul>`
       : `<div class="files-status muted">${shell ? 'You’re offline. Files you keep offline show here.' : 'Nothing yet. Choose Available offline in a file’s or folder’s ⋯ menu.'}</div>`;
     body.querySelectorAll('[data-offline-go]').forEach((link) => link.addEventListener('click', (event) => { event.preventDefault(); offlineGo(link.dataset.offlineGo.split('\n')[0], ''); }));
     const menu = (row, at) => {
-      const p = engine.get(row.dataset.pin);
+      const p = engine.get(row.dataset.pin || '');
       if (!p) return;
       const file = p.kind === 'file' ? engine.node(p, '') : null;
       openFilesMenu(at, [
@@ -21830,7 +21934,7 @@ async function paintOfflineView({ shell = $('#files-page')?.dataset.scope === 'o
     return;
   }
   const node = engine.node(pin, at.sub);
-  const key = `${pin.id}\n${at.sub}\n${pin.revision}\n${offlineMarkState(pin)}`;
+  const key = `${pin.id}\n${at.sub}\n${pin.revision}\n${offlineMarkState(pin)}\n${engine.edits().map((edit) => `${edit.id}:${edit.rev}:${edit.state}`).join(',')}`;
   if (body.dataset.shows === key) return;
   body.dataset.shows = key;
   if (!node) { body.innerHTML = `<div class="files-status muted">Nothing here on this device.</div>`; return; }
@@ -21838,6 +21942,10 @@ async function paintOfflineView({ shell = $('#files-page')?.dataset.scope === 'o
   if (node.kind === 'directory') {
     body.innerHTML = `${status}<div id="offline-listing"></div>`;
     FV.render(body.querySelector('#offline-listing'), { ...node, path: at.sub }, { href: () => '#', raw: () => '', emptyRoot: 'Empty folder', shows: () => true });
+    body.querySelectorAll('#offline-listing .files-row').forEach((row) => {
+      const edit = engine.editFor(pin.projectId, pin.view, FV.join(pin.path, FV.join(at.sub, row.dataset.name)));
+      if (edit) row.querySelector('.files-link')?.insertAdjacentHTML('beforeend', offlineEditChipHtml(edit));
+    });
     body.querySelectorAll('.files-link').forEach((link) => link.addEventListener('click', (event) => {
       event.preventDefault();
       offlineGo(pin.id, FV.join(at.sub, link.closest('.files-row').dataset.name));
@@ -21875,18 +21983,59 @@ function offlineUp() {
 async function showOfflineFile(body, pin, node, status) {
   const engine = offlineFiles();
   const shows = () => body.isConnected && offlineState().pin === pin.id && body.dataset.shows?.startsWith(`${pin.id}\n${offlineState().sub}\n`);
+  // An edit waiting to upload is what this device shows of the file.
+  const edit = engine.editFor(pin.projectId, pin.view, node.path);
   let bytes;
-  try { bytes = await engine.bytes(node.hash); }
+  try { bytes = edit ? { blob: new Blob([edit.content]) } : await engine.bytes(node.hash); }
   catch (error) { body.innerHTML = `${status}<div class="files-status error" role="alert">${esc(plainError(error?.message || 'Couldn’t read the copy'))}</div>`; return; }
   if (!shows()) return;
+  renderOfflineText(body, { projectId: pin.projectId, view: pin.view, path: node.path, version: node.version, projectName: pin.projectName,
+    node: { ...node, size: edit ? bytes.blob.size : node.size } }, edit, bytes, status, shows);
+}
+// An edit no pin holds: its own place in the Offline view, until it uploads or is discarded.
+function paintLooseEdit(body, edit) {
+  const crumbs = $('#offline-crumbs');
+  if (crumbs) {
+    crumbs.innerHTML = `<a class="files-crumb files-crumb-root" href="#" data-offline-go="" title="What this device keeps">This device</a><span class="files-sep" aria-hidden="true">/</span><a class="files-crumb" href="#" aria-current="page">${esc(edit.name)}</a>`;
+    crumbs.querySelector('[data-offline-go]').addEventListener('click', (event) => { event.preventDefault(); offlineGo(null); });
+  }
+  const key = `edit:${edit.id}\n\n${edit.rev}:${edit.state}`;
+  if (body.dataset.shows === key) return;
+  body.dataset.shows = key;
+  const shows = () => body.isConnected && body.dataset.shows === key;
+  const bytes = { blob: new Blob([edit.content]) };
+  renderOfflineText(body, { projectId: edit.projectId, view: edit.view, path: edit.path, version: edit.base, projectName: edit.projectName,
+    node: { path: edit.path, kind: 'file', size: bytes.blob.size, version: edit.base } }, edit, bytes, '', shows);
+}
+// A file of the Offline view in the Files viewer, from the device's copy or its
+// waiting edit; text gets Edit (saved here, uploaded when tavya answers).
+function renderOfflineText(body, place, edit, bytes, status, shows) {
+  const engine = offlineFiles();
+  const node = place.node;
+  const name = FV.parts(place.path).pop();
   const actions = $('#files-actions');
-  if (actions) {
+  const opensEdit = edit && engine.canOpenEdit();
+  // An edit's text gets a URL of its own (Raw, Download), the last one let go.
+  if (bytes.blob && !bytes.url) {
+    if (renderOfflineText.url) URL.revokeObjectURL(renderOfflineText.url);
+    bytes.url = renderOfflineText.url = URL.createObjectURL(bytes.blob);
+  }
+  if (actions && (node.hash || opensEdit)) {
     actions.innerHTML = `<button type="button" class="btn sm" id="offline-open" title="Open in another app">Open in…</button>`;
-    $('#offline-open').addEventListener('click', () => openOfflineExternally(node, node.path));
+    $('#offline-open').addEventListener('click', () => opensEdit ? engine.openEdit(edit.id, name).catch((error) => filesFail(error)) : openOfflineExternally(node, node.path));
   }
   body.innerHTML = `${status}<div id="offline-file"></div>`;
+  paintOfflineEditBar(edit);
+  const offline = {
+    save: async (content) => {
+      await engine.saveEdit({ projectId: place.projectId, view: place.view, path: place.path, base: edit?.base || place.version, content, name, projectName: place.projectName });
+      toast('Saved on this device · uploads when online');
+      offlineSync();
+    },
+    close: () => { body.querySelector('#files-editor')?.remove(); delete body.dataset.shows; paintOfflineView(); },
+  };
   FV.render(body.querySelector('#offline-file'), { ...node, path: node.path }, {
-    href: () => '#', raw: () => bytes.url, shows, from: null,
+    href: () => '#', raw: () => bytes.url || '', shows, from: null,
     // The copy's bytes; text unless the first 8 KB hold a NUL, as files/raw decides.
     fetch: async () => {
       const blob = bytes.blob || await (await fetch(bytes.url)).blob();
@@ -21895,6 +22044,9 @@ async function showOfflineFile(body, pin, node, status) {
     },
     markdown: (el, text, after) => mountMarkdownSurface(el, (math) => renderMarkdown(text, { math }), after),
     markdownTools: texToggleHtml(), wireTools: wireTexToggles, copy: (text) => copyToClipboard(text).then(() => toast('Copied')), errorText: plainError,
+    ...(place.version ? { textTools: filesEditButtonHtml(), onText: (target, text) => {
+      target.querySelector('#files-edit')?.addEventListener('click', () => openFilesEditor(place.projectId, node, text, offline));
+    } } : {}),
   });
 }
 // "1.2 GB of 2 GB", the limit chosen beside it.
@@ -21913,7 +22065,7 @@ async function paintOfflineMeter(shell) {
     <span>${esc(FV.formatBytes(used))} of</span>
     <select id="offline-limit" class="offline-limit" aria-label="Limit on this device" title="Space this device may use for offline files">${options.map((bytes) =>
       `<option value="${bytes}"${bytes === limit ? ' selected' : ''}>${esc(FV.formatBytes(bytes))}</option>`).join('')}</select>`;
-  $('#offline-limit').addEventListener('change', (event) => engine.setLimit(Number(event.target.value)).catch(() => {}));
+  meter.querySelector('#offline-limit').addEventListener('change', (event) => engine.setLimit(Number(event.target.value)).catch(() => {}));
 }
 
 // Without a network the app opens here instead of the offline page: Files, pins only.
@@ -32023,7 +32175,7 @@ const HOST_COMMANDS = [
   { id: 'files.newFile', title: 'New file', key: 'T', group: 'Files', available: () => isFilesTab() && !!$('#files-new-file'), run: () => $('#files-new-file')?.click() },
   { id: 'files.newFolder', title: 'New folder', key: 'F', group: 'Files', available: () => isFilesTab() && !!$('#files-new-folder'), run: () => $('#files-new-folder')?.click() },
   { id: 'files.upload', title: 'Upload files', key: 'U', group: 'Files', available: () => isFilesTab() && !!$('#files-upload'), run: () => pickFilesToUpload(filesProjectId(), false) },
-  { id: 'files.edit', title: 'Edit file', key: 'e', group: 'Files', available: () => isFilesTab() && !!$('#files-edit'), run: () => $('#files-edit')?.click() },
+  { id: 'files.edit', title: 'Edit file', key: 'e', group: 'Files', available: () => (isFilesTab() || S.tab === 'offline') && !!$('#files-edit'), run: () => $('#files-edit')?.click() },
   { id: 'files.terminal', title: 'Terminal', key: 'ctrl+`', group: 'Files', available: () => isFilesTab() && !!$('#files-terminal'), run: () => $('#files-terminal')?.click() },
   { id: 'nav.orgfiles', title: 'Go to organization files', key: 'g F', ...navCommand(() => orgFilesRoute()) },
   { id: 'nav.orgwiki', title: 'Go to organization wiki', key: 'g W', ...navCommand(() => globalRoute('orgwiki')) },
