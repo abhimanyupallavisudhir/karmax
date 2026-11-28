@@ -107,7 +107,7 @@ describe('who decided a permission request', () => {
     try {
       const id = await f.ask();
       expect(await f.stored(id)).toMatchObject({ audience: [`task:${f.ceo.id}`], taskRecipients: [f.ceo.id, f.lead.id] });
-      expect(f.to(f.ceo.id).map((message) => message.text)).toEqual([expect.stringContaining('asks you for github:actions:write, which you hold')]);
+      expect(f.to(f.ceo.id).map((message) => message.text)).toEqual([expect.stringContaining('asks you for permission to operate GitHub Actions (github:actions:write), which you hold')]);
     } finally { await f.store.close(); }
   });
 
