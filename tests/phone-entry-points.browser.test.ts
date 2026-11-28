@@ -19,6 +19,7 @@ const SHOTS = process.env.KARMAX_SHOTS;
 const shot = async (page: Page, name: string) => {
   if (!SHOTS) return;
   fs.mkdirSync(SHOTS, { recursive: true });
+  await page.waitForTimeout(600); // the form's and dialog's fade-in
   await page.screenshot({ path: path.join(SHOTS, `${name}.png`) });
 };
 
@@ -169,6 +170,8 @@ it('Share to tavya → Add to task…: a recent task’s message box gets the te
       await expect.poll(() => page.locator('#tf-chips .file-chip[data-upload]').count()).toBe(0);
       await page.locator('#tf-add-to-task').click();
       await page.locator('.opt', { hasText: 'Fix the login page' }).waitFor();
+      // Not the project's CEO draft or a repeatable template: only conversations to add to.
+      expect(await page.locator('.opt').count()).toBe(1);
       await shot(page, 'share-add-to-task');
     });
 

@@ -27916,7 +27916,7 @@ function chooseTaskForShare(onPick) {
     sub: projectById(task.projectId)?.name || '', search: `${task.title || ''} ${task.num ?? ''}`, task }));
   const picker = openNumberedPicker({ id: 'share-task', label: 'Add to task', placeholder: 'Add to task…',
     inputLabel: 'Task title or number', empty: 'No such task', entries: [], loading: true, pick: (entry) => onPick(entry.task) });
-  api(`/api/organizations/${encodeURIComponent(organizationId)}/search?q=${encodeURIComponent('-is:archived sort:updated-desc')}&limit=9`)
+  api(`/api/organizations/${encodeURIComponent(organizationId)}/search?q=${encodeURIComponent('-is:archived -is:draft -is:series sort:updated-desc')}&limit=9`)
     .then((result) => picker.setEntries(entries((result?.tasks || []).filter((task) => task.projectId))))
     .catch((error) => { picker.close(); toast(plainError(error), true); });
 }
