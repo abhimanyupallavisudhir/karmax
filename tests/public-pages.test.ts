@@ -275,7 +275,7 @@ describe('public pages for search engines and link previews (hosted)', () => {
     }
     const listed = site.pages.map((entry) => entry.file).sort();
     const files = ['docs', 'compare'].flatMap((dir) => fs.readdirSync(path.join(web, dir)).filter((name) => name.endsWith('.md')).map((name) => `${dir}/${name}`));
-    expect(listed).toEqual([...files, 'about.md', 'changelog.md'].sort());
+    expect(listed).toEqual([...files, 'about.md', 'changelog.md', 'download.md'].sort());
     expect(new Set(site.pages.map((entry) => entry.path)).size).toBe(site.pages.length);
   });
 });

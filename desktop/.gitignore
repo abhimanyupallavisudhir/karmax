@@ -1,0 +1,4 @@
+node_modules
+dist/
+# Written by scripts/configure.cjs at build time.
+app-config.json
