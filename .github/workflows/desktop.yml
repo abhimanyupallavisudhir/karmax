@@ -1,0 +1,299 @@
+name: Desktop
+
+# The desktop apps for Mac and Linux (desktop/, Electron; wiki features/desktop-apps).
+# Every push/PR that touches desktop/ tests the app (unit tests, and the app
+# itself driven under Xvfb against a local gateway) and builds the Linux
+# AppImage and .deb. The Mac build runs only when Mac-specific files changed or
+# on a manual run, because macOS minutes cost the most. A manual run with
+# `release` ticked publishes GitHub release desktop-v<desktop/package.json
+# version>, which https://tavya.io/download/desktop/ serves (downloads and
+# auto-update). Linux files always publish; the Mac files only when signed and
+# notarized, since an unsigned Mac app neither opens without a fight nor updates.
+# Each signing step checks its secrets and skips with a notice naming the
+# missing ones. Secrets and where they come from: desktop/README.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Publish GitHub release desktop-v<version> (bump desktop/package.json first)
+        type: boolean
+        default: false
+      server_url:
+        description: Console URL the app opens (TAVYA_URL)
+        type: string
+        default: https://tavya.io
+  push:
+    # Branches are covered by their pull request run.
+    branches: [master]
+    paths: ['desktop/**', '.github/workflows/desktop.yml', 'tests/desktop-app.electron.test.ts']
+  pull_request:
+    paths: ['desktop/**', '.github/workflows/desktop.yml', 'tests/desktop-app.electron.test.ts']
+
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes the running build. Manual runs (which
+# may be publishing a release) are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+env:
+  # Read by desktop/scripts/configure.cjs (https only, except a LAN dev server).
+  TAVYA_URL: ${{ inputs.server_url || 'https://tavya.io' }}
+  NODE_VERSION: '22.16.0'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  changes:
+    name: what changed
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      mac: ${{ steps.filter.outputs.mac }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            mac:
+              - 'desktop/build/entitlements.mac.plist'
+              - 'desktop/build/icon-mac.png'
+              - 'desktop/electron-builder.config.cjs'
+              - 'desktop/package.json'
+              - 'desktop/package-lock.json'
+              - '.github/workflows/desktop.yml'
+
+  linux:
+    name: linux (test, AppImage + .deb)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop/package-lock.json
+      - id: version
+        run: echo "version=$(node -p "require('./desktop/package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Install the app
+        working-directory: desktop
+        run: npm ci --no-audit --no-fund
+      - name: Unit tests
+        working-directory: desktop
+        run: npm test
+      # The end-to-end test boots a real gateway from the repository's own code.
+      - name: Install the server (for the end-to-end test)
+        run: npm ci --no-audit --no-fund && npm rebuild node-pty
+      # The runner has Chrome's libraries (Electron needs the same); add a display, a key presser and FUSE 2 (AppImages).
+      - name: Display
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q xvfb xdotool
+          sudo apt-get install -y -q libfuse2t64 || sudo apt-get install -y -q libfuse2
+      - name: The app, end to end (Xvfb, against a local gateway)
+        run: xvfb-run -a npx vitest run tests/desktop-app.electron.test.ts
+      - name: Build AppImage and .deb (x64, arm64)
+        working-directory: desktop
+        run: npm run dist:linux
+      # This Ubuntu restricts unprivileged user namespaces (AppArmor), as 24.04+ does
+      # for the people who download it: the AppImage must still start.
+      - name: The AppImage starts here, and a second launch hands over its link
+        working-directory: desktop
+        run: xvfb-run -a scripts/smoke-appimage.sh dist/*-x86_64.AppImage
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tavya-desktop-linux
+          path: |
+            desktop/dist/*.AppImage
+            desktop/dist/*.deb
+            desktop/dist/latest-linux*.yml
+          if-no-files-found: error
+          retention-days: 14
+
+  mac:
+    name: mac (universal DMG)
+    needs: changes
+    # `changes` is skipped on manual runs, so don't let that skip this job.
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.mac == 'true') }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    outputs:
+      publishable: ${{ steps.verify.outputs.publishable }}
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+      # Signing and notarizing only for a release: a pull request's build needs neither.
+      - name: Signing certificate
+        id: sign
+        env:
+          RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+          MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        working-directory: .
+        run: |
+          if [ "$RELEASE" != true ]; then
+            echo "CSC_IDENTITY_AUTO_DISCOVERY=false" >> "$GITHUB_ENV"
+            echo "signed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          missing=()
+          for name in MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD; do
+            if [ -z "${!name}" ]; then missing+=("$name"); fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::notice title=Mac app not signed::Missing secrets: ${missing[*]} (see desktop/README.md). The Mac files are built but not published."
+            echo "CSC_IDENTITY_AUTO_DISCOVERY=false" >> "$GITHUB_ENV"
+            echo "signed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          printf '%s' "$MAC_CERT_P12_BASE64" | base64 -d > "$RUNNER_TEMP/developer-id.p12"
+          { echo "CSC_LINK=$RUNNER_TEMP/developer-id.p12"; echo "CSC_KEY_PASSWORD=$MAC_CERT_PASSWORD"; } >> "$GITHUB_ENV"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+      # notarytool through electron-builder (@electron/notarize): an App Store
+      # Connect API key (the same secrets as mobile.yml's TestFlight upload), else
+      # an Apple ID with an app-specific password.
+      - name: Notarization credentials
+        id: notarize
+        if: steps.sign.outputs.signed == 'true'
+        env:
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+          APPSTORE_API_KEY_P8: ${{ secrets.APPSTORE_API_KEY_P8 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        working-directory: .
+        run: |
+          if [ -n "$APPSTORE_API_KEY_ID" ] && [ -n "$APPSTORE_API_ISSUER_ID" ] && [ -n "$APPSTORE_API_KEY_P8" ]; then
+            key="$RUNNER_TEMP/AuthKey_${APPSTORE_API_KEY_ID}.p8"
+            printf '%s' "$APPSTORE_API_KEY_P8" | base64 -d > "$key"
+            { echo "APPLE_API_KEY=$key"; echo "APPLE_API_KEY_ID=$APPSTORE_API_KEY_ID"; echo "APPLE_API_ISSUER=$APPSTORE_API_ISSUER_ID"; } >> "$GITHUB_ENV"
+            echo "notarized=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$APPLE_ID" ] && [ -n "$APPLE_APP_SPECIFIC_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            { echo "APPLE_ID=$APPLE_ID"; echo "APPLE_APP_SPECIFIC_PASSWORD=$APPLE_APP_SPECIFIC_PASSWORD"; echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"; } >> "$GITHUB_ENV"
+            echo "notarized=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=Mac app not notarized::Missing secrets: APPSTORE_API_KEY_ID, APPSTORE_API_ISSUER_ID, APPSTORE_API_KEY_P8 (or APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID); see desktop/README.md. The Mac files are built but not published."
+            echo "notarized=false" >> "$GITHUB_OUTPUT"
+          fi
+      # Universal links (applinks:<console host>) are a restricted entitlement:
+      # without a Developer ID provisioning profile the app is built without them.
+      - name: Provisioning profile (universal links)
+        if: steps.sign.outputs.signed == 'true'
+        env:
+          MAC_PROVISIONING_PROFILE_BASE64: ${{ secrets.MAC_PROVISIONING_PROFILE_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        working-directory: .
+        run: |
+          if [ -z "$MAC_PROVISIONING_PROFILE_BASE64" ] || [ -z "$APPLE_TEAM_ID" ]; then
+            missing=()
+            for name in MAC_PROVISIONING_PROFILE_BASE64 APPLE_TEAM_ID; do
+              if [ -z "${!name}" ]; then missing+=("$name"); fi
+            done
+            echo "::notice title=No universal links::Missing secrets: ${missing[*]} (see desktop/README.md). https links won't open the app; io.tavya.app:// links still do."
+            exit 0
+          fi
+          printf '%s' "$MAC_PROVISIONING_PROFILE_BASE64" | base64 -d > "$RUNNER_TEMP/tavya.provisionprofile"
+          { echo "MAC_PROVISIONING_PROFILE=$RUNNER_TEMP/tavya.provisionprofile"; echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"; } >> "$GITHUB_ENV"
+      - name: Build universal DMG and zip
+        run: npm run dist:mac
+      - name: Verify signature and notarization
+        id: verify
+        env:
+          SIGNED: ${{ steps.sign.outputs.signed }}
+          NOTARIZED: ${{ steps.notarize.outputs.notarized }}
+        run: |
+          app="dist/mac-universal/tavya.app"
+          lipo -archs "$app/Contents/MacOS/tavya"
+          if [ "$SIGNED" = true ]; then
+            codesign --verify --deep --strict --verbose=2 "$app"
+            if [ "$NOTARIZED" = true ]; then
+              spctl --assess --type execute --verbose=2 "$app"
+              xcrun stapler validate dist/*.dmg
+              echo "publishable=true" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+          fi
+          echo "publishable=false" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tavya-desktop-mac
+          path: |
+            desktop/dist/*.dmg
+            desktop/dist/*.zip
+            desktop/dist/*.blockmap
+            desktop/dist/latest-mac.yml
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove signing material
+        if: always()
+        working-directory: .
+        run: rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP"/AuthKey_*.p8 "$RUNNER_TEMP/tavya.provisionprofile"
+
+  release:
+    name: release (GitHub desktop-v<version>)
+    needs: [linux, mac]
+    # Linux files publish even when the Mac build was skipped or failed.
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.release && needs.linux.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tavya-desktop-linux
+          path: assets
+      - name: Mac files (signed and notarized only)
+        if: needs.mac.outputs.publishable == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tavya-desktop-mac
+          path: assets
+      - name: No Mac files
+        if: needs.mac.outputs.publishable != 'true'
+        run: echo "::notice title=Linux only::This release has no Mac files (the Mac build was skipped, unsigned or not notarized)."
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.linux.outputs.version }}
+          SHA: ${{ github.sha }}
+        run: |
+          tag="desktop-v$VERSION"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error title=Version already released::$tag exists. Raise \"version\" in desktop/package.json and run again."
+            exit 1
+          fi
+          (cd assets && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+          # Never "latest": that stays the CLI's (src/cli/update.ts links releases/latest).
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$SHA" --latest=false \
+            --title "tavya for Mac and Linux $VERSION" \
+            --notes "Download: https://tavya.io/download — installed apps update themselves." \
+            assets/*

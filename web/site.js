@@ -31,6 +31,7 @@
     page('/compare/openclaw', 'compare/openclaw.md', 'tavya vs OpenClaw', 'Compare', '2026-11-14', 'OpenClaw'),
     page('/compare/vibe-kanban', 'compare/vibe-kanban.md', 'tavya as a Vibe Kanban alternative', 'Compare', '2026-11-14', 'Vibe Kanban'),
     page('/compare/terragon', 'compare/terragon.md', 'tavya as a Terragon alternative', 'Compare', '2026-11-14', 'Terragon'),
+    page('/download', 'download.md', 'Download tavya', 'Site', '2026-11-28', 'Download'),
     page('/about', 'about.md', 'About tavya', 'Site', '2026-11-14', 'About'),
     page('/changelog', 'changelog.md', 'Changelog', 'Site', '2026-11-14'),
   ];

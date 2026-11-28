@@ -238,7 +238,7 @@ jobs:
           fetch-depth: 2
 
       # A pull request that changes only paths no image, compose file or
-      # Caddyfile reads (tests, docs, other workflows, the phone apps) skips the builds. Any
+      # Caddyfile reads (tests, docs, other workflows, the phone and desktop apps) skips the builds. Any
       # other path builds, and so does every push, merge group and dispatch.
       - name: Decide whether the change can affect the deployment artifacts
         id: scope
@@ -249,7 +249,7 @@ jobs:
             while IFS= read -r file; do
               case "$file" in
                 '') ;;
-                tests/*|docs/*|design/*|benchmarks/*|scripts/*|mobile/*|web/*.test.cjs) ;;
+                tests/*|docs/*|design/*|benchmarks/*|scripts/*|mobile/*|desktop/*|web/*.test.cjs) ;;
                 .github/workflows/ci.yml) return 0 ;;
                 .github/*) ;;
                 */*) return 0 ;;

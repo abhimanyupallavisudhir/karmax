@@ -1,0 +1,27 @@
+{
+  "name": "tavya",
+  "productName": "tavya",
+  "desktopName": "tavya.desktop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "tavya for Mac and Linux: the hosted console in its own window, with a tray, a global Ask shortcut and notifications.",
+  "author": "tavya <hello@tavya.io>",
+  "homepage": "https://tavya.io",
+  "license": "AGPL-3.0-only",
+  "main": "src/main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.cjs",
+    "icons": "node scripts/render-brand-assets.cjs",
+    "dist:linux": "node scripts/configure.cjs && electron-builder --config electron-builder.config.cjs --linux --publish never",
+    "dist:mac": "node scripts/configure.cjs && electron-builder --config electron-builder.config.cjs --mac --publish never"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.11"
+  },
+  "devDependencies": {
+    "electron": "45.5.0",
+    "electron-builder": "26.18.0",
+    "sharp": "0.35.5"
+  }
+}
