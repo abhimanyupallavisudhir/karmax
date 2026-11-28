@@ -302,6 +302,8 @@ export interface GithubWebhookResult {
   projectEvents?: GithubProjectWebhookEvent[];
   inbox?: GithubInboxEvent[];
   vaultPushes?: GithubVaultPushEvent[];
+  /** Any branch pushed to a repository tavya knows: its projects' Files changed. */
+  pushes?: { organizationId: string; repositoryId: string; ref: string }[];
 }
 
 export type GitHubRepositoryFileStatus =
@@ -1236,11 +1238,13 @@ export class GitHubAppService {
       const repository = (await this.store.listRepositories(connection.organizationId)).find((candidate) =>
         (repositoryPayload?.id && candidate.providerId === String(repositoryPayload.id))
         || `${candidate.owner}/${candidate.name}`.toLowerCase() === String(repositoryPayload?.full_name ?? '').toLowerCase());
-      if (repository && payload.ref === `refs/heads/${repository.defaultBranch}`) {
-        return { accepted: true, vaultPushes: [{ organizationId: connection.organizationId,
+      if (!repository) return { accepted: true };
+      const pushes = [{ organizationId: connection.organizationId, repositoryId: repository.id, ref: String(payload.ref ?? '') }];
+      if (payload.ref === `refs/heads/${repository.defaultBranch}`) {
+        return { accepted: true, pushes, vaultPushes: [{ organizationId: connection.organizationId,
           repositoryId: repository.id, revision: String(payload.after ?? '') }] };
       }
-      return { accepted: true };
+      return { accepted: true, pushes };
     }
     const projectEvents = (await this.failedDefaultBranchWorkflowEvents(event, payload, connection.organizationId));
     if (event === 'workflow_run') {

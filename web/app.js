@@ -6027,6 +6027,8 @@ function connectWs() {
     let ev;
     try { ev = JSON.parse(m.data); } catch { return; }
     if (ev.type === 'pong') return;
+    // The desktop app's push (desktop-push.ts): shown even while the window is hidden, that is when it matters.
+    if (ev.type === 'push') { showDesktopPush(ev); return; }
     noteRowAskEvent(ev);
     if (ev.type === 'timing.setting') { applyTimingSetting(ev.enabled); return; }
     if (ev.type === 'timing' && !S.meta?.timingEnabled) return;
@@ -6132,6 +6134,7 @@ function connectWs() {
     wsHeardAt = Date.now();
     setWsOnline(true);
     syncLiveWatch();
+    announceDesktopPush();
     if (wsHadDropped) checkConsoleRevision();
     // Approval events may have been missed: every list row reloads its asks.
     if (wsHadDropped) rowAskEpoch++;
@@ -6917,6 +6920,7 @@ function refreshForMeCounts(delay = 300) {
       const before = JSON.stringify(S.forMeCounts);
       S.forMeCounts = { organizationId, counts: counts || {} };
       if (JSON.stringify(S.forMeCounts) !== before) renderRail();
+      syncAppBadge(forMeTotal());
     } catch {}
   }, delay);
 }
@@ -27317,10 +27321,14 @@ function wireInboxNotices() {
 }
 
 // ── the phone apps (wiki features/phone-apps) ────────────────────────────────
-// The Android and iOS apps (mobile/) are this console in a WebView, plus what
-// a website does badly on a phone: speech recognition, push and the sign-in.
-// Their native code reaches the page as window.Capacitor; nothing here is
-// bundled into the app, so the console stays one codebase.
+// The Android and iOS apps (mobile/) and the desktop apps (desktop/, wiki
+// features/desktop-apps) are this console in a WebView, plus what a website
+// does badly there: speech recognition, push, the sign-in, a badge. Their
+// native code reaches the page as window.Capacitor — Capacitor's own on
+// phones, the same shape from the Electron preload (getPlatform 'electron';
+// wiki planned/native-apps-round-2 § contracts) — so nothing here is bundled
+// into an app and the console stays one codebase. Code asks for a plugin
+// (nativePlugin), never a platform name, except in words people read.
 function nativeApp() {
   try { return typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.() === true; } catch { return false; }
 }
@@ -27331,6 +27339,14 @@ function nativePlugin(name) {
   return cap.Plugins?.[name] || null;
 }
 function nativePlatform() { return nativeApp() ? window.Capacitor.getPlatform?.() || '' : ''; }
+// The desktop shell's own jobs: badge, Ask hotkey, open at login, updates, raising its window.
+function desktopShell() { return nativePlugin('TavyaDesktop'); }
+// Which computer, in words: "Mac" or "Linux".
+function desktopOsName() { return /Mac/i.test(navigator.platform || navigator.userAgent || '') ? 'Mac' : /Win/i.test(navigator.platform || '') ? 'Windows' : 'Linux'; }
+// Store rules (App Store 3.1.1, Google Play payments) bind the phone apps, so
+// they sell nothing: Plan & billing is read-only there. The desktop apps are
+// downloaded from tavya.io, not a store, and keep the website's Plan & billing.
+function storeApp() { return nativeApp() && !desktopShell(); }
 
 // The platform's speech recognizer behind the browser's SpeechRecognition
 // interface, so dictation (toggleDictation) is the same code in a browser and
@@ -27432,7 +27448,7 @@ function beforeStopPhrase(text) {
 // Chrome on Android repeats earlier words in each result of a continuous
 // session, so there each sentence is a recognizer of its own.
 function continuousDictation() {
-  return nativeApp() || !/Android/i.test(navigator.userAgent || '');
+  return !!nativePlugin('SpeechRecognition') || !/Android/i.test(navigator.userAgent || '');
 }
 function joinHeard(...parts) {
   return parts.reduce((text, part) => (!part ? text : !text || /\s$/.test(text) || /^\s/.test(part) ? text + part : `${text} ${part}`), '').trim();
@@ -27491,7 +27507,8 @@ function toggleDictation(key) {
       // Silence and our own stop are part of dictating; anything else ends it.
       if (event.error === 'no-speech' || event.error === 'aborted') return;
       fatal = true;
-      const blocked = nativeApp() ? `Allow the microphone and speech recognition for ${siteName()} in your phone’s settings to dictate.` : 'Allow the microphone for this site to dictate.';
+      const blocked = nativePlugin('SpeechRecognition') ? `Allow the microphone and speech recognition for ${siteName()} in your phone’s settings to dictate.`
+        : desktopShell() ? `Allow the microphone for ${siteName()} in your computer’s settings to dictate.` : 'Allow the microphone for this site to dictate.';
       const message = { 'not-allowed': blocked, 'service-not-allowed': blocked,
         'audio-capture': 'No microphone found.', network: 'Dictation needs a connection.' }[event.error];
       if (message) toast(message, true);
@@ -27505,7 +27522,7 @@ function toggleDictation(key) {
       state.quickEnds = !session && Date.now() - startedAt < 1500 ? state.quickEnds + 1 : 0;
       if (fatal || state.quickEnds >= 3 || !ours() || document.visibilityState === 'hidden') return stopDictation();
       // Android's own recognizer is busy for a moment after it ends; a browser's starts again at once.
-      if (!nativeApp()) return listen();
+      if (!nativePlugin('SpeechRecognition')) return listen();
       setTimeout(() => { if (S.dictation === state && state.recognition === recognition) listen(); }, 250);
     };
     state.recognition = recognition;
@@ -27585,6 +27602,8 @@ if (typeof document !== 'undefined') document.addEventListener('keydown', (event
 // device a person turned push on for. Turning it on asks for the browser's
 // permission then, never before.
 function pushSupported() {
+  // In the desktop app: over its own live connection, shown with the Notification API (Electron makes it native).
+  if (desktopShell()) return typeof Notification !== 'undefined' && !!S.meta?.deliveryChannels?.includes('push');
   // In the phone app: native push, once the installation has its Firebase key (never a switch that cannot work).
   if (nativeApp()) return !!S.meta?.nativePush && !!nativePlugin('PushNotifications');
   return typeof navigator !== 'undefined' && 'serviceWorker' in navigator && typeof window.PushManager !== 'undefined'
@@ -27593,6 +27612,7 @@ function pushSupported() {
 // "Chrome on Android": what a person recognises a device by in their list.
 function deviceLabel() {
   const ua = navigator.userAgent || '';
+  if (desktopShell()) return `${siteName()} on ${desktopOsName()}`;
   if (nativeApp()) return `${siteName()} on ${nativePlatform() === 'ios' ? (/iPad/.test(ua) ? 'iPad' : 'iPhone') : 'Android'}`;
   const browser = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Firefox\//.test(ua) ? 'Firefox'
     : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'Browser';
@@ -27611,12 +27631,14 @@ function madeWithKey(subscription, publicKey) {
 }
 // This browser's subscription, if it is one of the person's devices on the server and can carry our pushes.
 async function thisPushDevice(devices) {
+  if (desktopShell()) return devices.find((entry) => entry.id === desktopPushState().deviceId) || null;
   if (nativeApp()) return devices.find((entry) => entry.id === nativePushDeviceId()) || null;
   const subscription = await (await pushRegistration())?.pushManager.getSubscription();
   const device = subscription && devices.find((entry) => entry.endpoint === subscription.endpoint);
   return device && madeWithKey(subscription, (await api('/api/push/key')).publicKey) ? device : null;
 }
 async function enablePush() {
+  if (desktopShell()) return enableDesktopPush();
   if (nativeApp()) return enableNativePush();
   if (await Notification.requestPermission() !== 'granted') throw new Error('Allow notifications for this site to turn push on.');
   const { publicKey } = await api('/api/push/key');
@@ -27628,6 +27650,7 @@ async function enablePush() {
   return api('/api/user/push-subscriptions', { method: 'POST', body: JSON.stringify({ ...subscription.toJSON(), label: deviceLabel() }) });
 }
 async function disablePush(devices) {
+  if (desktopShell()) return disableDesktopPush();
   if (nativeApp()) return disableNativePush();
   const subscription = await (await pushRegistration())?.pushManager.getSubscription();
   const device = subscription && devices.find((entry) => entry.endpoint === subscription.endpoint);
@@ -27636,6 +27659,7 @@ async function disablePush(devices) {
 }
 // Signing out stops this device receiving that person's pushes (a shared computer).
 async function forgetPushDevice() {
+  if (desktopShell()) return disableDesktopPush().catch(() => {});
   if (nativeApp()) return disableNativePush().catch(() => {});
   if (!pushSupported()) return;
   try {
@@ -27701,12 +27725,102 @@ async function disableNativePush() {
   await nativePlugin('PushNotifications')?.unregister().catch(() => {});
 }
 
-// Once per app start, signed in: a tapped notification opens its page, and a
-// phone with push on registers again, so a rotated FCM token replaces the old one.
+// Push in the desktop app (src/collaboration/desktop-push.ts): Electron runs
+// no service worker, so the server sends this app's pushes over its live
+// connection while it runs. The app keeps a random key (registering again keeps
+// the device) and the device's id, which it names on every connection.
+const DESKTOP_PUSH = 'karmax-desktop-push';
+function desktopPushState() {
+  try { return JSON.parse(localStorage.getItem(DESKTOP_PUSH) || '{}') || {}; } catch { return {}; }
+}
+function saveDesktopPushState(state) { try { localStorage.setItem(DESKTOP_PUSH, JSON.stringify(state)); } catch {} }
+async function enableDesktopPush() {
+  if (Notification.permission !== 'granted' && await Notification.requestPermission() !== 'granted')
+    throw new Error(`Allow notifications for ${siteName()} in your computer’s settings to turn push on.`);
+  const state = desktopPushState();
+  const key = /^[A-Za-z0-9_-]{16,64}$/.test(state.key || '') ? state.key : base64url(crypto.getRandomValues(new Uint8Array(24)));
+  const device = await api('/api/user/push-subscriptions', { method: 'POST', body: JSON.stringify({ kind: 'desktop', key, label: deviceLabel() }) });
+  saveDesktopPushState({ key, deviceId: device.id });
+  announceDesktopPush();
+  return device;
+}
+async function disableDesktopPush() {
+  const { key, deviceId } = desktopPushState();
+  saveDesktopPushState({ key });
+  if (deviceId) await api(`/api/user/push-subscriptions/${encodeURIComponent(deviceId)}`, { method: 'DELETE' }).catch((error) => { if (error.status !== 404) throw error; });
+  announceDesktopPush();
+}
+// Name this app's device on the open connection (every connect, and after turning push on or off).
+function announceDesktopPush() {
+  if (!desktopShell() || S.ws?.readyState !== WebSocket.OPEN) return;
+  S.ws.send(JSON.stringify({ type: 'push-device', deviceId: desktopPushState().deviceId || null }));
+}
+// A push for this app: the system's notification, its tag replacing an earlier
+// one for the same ask (the console's own popup has the same tag). Not when it
+// is about the page already in front of the person.
+function showDesktopPush(push) {
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  let path = '';
+  try { const url = new URL(push.url || '/', location.origin); if (url.origin === location.origin) path = url.pathname; } catch {}
+  if (path && path === location.pathname && document.visibilityState === 'visible' && document.hasFocus()) return;
+  try {
+    const notification = new Notification(push.title || siteName(), { body: push.body || '', tag: push.tag,
+      silent: !['high', 'critical'].includes(push.urgency), requireInteraction: push.urgency === 'critical' });
+    notification.onclick = () => {
+      desktopShell()?.show?.().catch?.(() => {});
+      window.focus();
+      notification.close();
+      openPushedUrl(push.url);
+    };
+  } catch {}
+}
+
+// Signing out: the shell forgets its device token (it dies with the session
+// anyway) and its badge.
+async function forgetAppIdentity() {
+  await nativePlugin('TavyaSignIn')?.clearDeviceToken?.().catch(() => {});
+  syncAppBadge(0);
+}
+
+// The For-me count on the app's icon (the dock badge, the tray's title).
+let appBadgeShown = null;
+function syncAppBadge(count) {
+  const shell = desktopShell();
+  if (!shell || count === appBadgeShown) return;
+  appBadgeShown = count;
+  shell.setBadge({ count }).catch(() => {});
+}
+function forMeTotal() {
+  return S.forMeCounts?.organizationId === S.organizationId ? Object.values(S.forMeCounts.counts || {}).reduce((sum, n) => sum + (Number(n) || 0), 0) : 0;
+}
+
+// A link into the console from outside it: io.tavya.app://open?path=/… (any
+// shell), the desktop tray's items and its Ask hotkey ({ask: true}). Only a
+// path of this console opens.
+function openAppLink({ url, path, ask } = {}) {
+  if (ask) return askTavya();
+  let target = typeof path === 'string' ? path : '';
+  try {
+    const link = url ? new URL(url) : null;
+    if (link?.protocol === 'io.tavya.app:' && link.host === 'open') target = link.searchParams.get('path') || '/';
+    else if (link && link.origin === location.origin) target = `${link.pathname}${link.search}${link.hash}`;
+  } catch { return; }
+  if (!target.startsWith('/') || target.startsWith('//') || target.startsWith('/\\')) return;
+  openPushedUrl(target);
+}
+
+// Once per app start, signed in: links and the tray open their pages, a tapped
+// notification opens its page, and a phone with push on registers again, so a
+// rotated FCM token replaces the old one.
 let nativeAppWired = false;
 async function wireNativeApp() {
   if (nativeAppWired || !nativeApp()) return;
   nativeAppWired = true;
+  await desktopShell()?.addListener('open', (link) => openAppLink(link || {}));
+  await desktopShell()?.addListener('updateStatus', (status) => paintAppUpdate(status));
+  // Capacitor's App plugin, where a phone shell has it, hands over the links it was opened with.
+  await nativePlugin('App')?.addListener('appUrlOpen', ({ url }) => openAppLink({ url }));
+  syncAppBadge(forMeTotal());
   const push = nativePlugin('PushNotifications');
   if (!push) return;
   await push.addListener('pushNotificationActionPerformed', ({ notification }) => openPushedUrl(notification?.data?.url));
@@ -27715,11 +27829,18 @@ async function wireNativeApp() {
 }
 
 // Signing the app in: the system browser (Google and GitHub refuse sign-in
-// inside an app's WebView) runs the authorization code flow with PKCE for the
-// first-party client tavya-app and returns to io.tavya.app://signed-in; this
-// page then trades the code for its own session cookie (POST /oauth/app-session).
+// inside an app's WebView) runs the authorization code flow with PKCE for a
+// first-party client — tavya-app returning to io.tavya.app://signed-in on
+// phones, tavya-desktop to the shell's one-shot loopback listener (it picks
+// the port) — and this page trades the code for its own session cookie
+// (POST /oauth/app-session). A shell that can keep a device token for its
+// native surfaces (TavyaSignIn.saveDeviceToken) is handed one, never stored here.
 const APP_CLIENT_ID = 'tavya-app';
 const APP_REDIRECT_URI = 'io.tavya.app://signed-in';
+const DESKTOP_CLIENT_ID = 'tavya-desktop';
+const DESKTOP_REDIRECT_URI = 'http://127.0.0.1/signed-in';
+// The apps' clients, as the consent page and Apps and tokens name them.
+const APP_CLIENTS = { [APP_CLIENT_ID]: { label: 'Phone', where: 'on your phone' }, [DESKTOP_CLIENT_ID]: { label: 'Desktop', where: 'on your computer' } };
 function renderAppSignIn(error = '') {
   document.body.classList.remove('landing-active');
   document.title = `Sign in · ${siteName()}`;
@@ -27738,10 +27859,13 @@ async function appSignIn() {
   const random = (bytes) => base64url(crypto.getRandomValues(new Uint8Array(bytes)));
   const verifier = random(32), state = random(16);
   const challenge = base64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
-  const authorize = `${location.origin}/oauth/authorize?${new URLSearchParams({ response_type: 'code', client_id: APP_CLIENT_ID,
-    redirect_uri: APP_REDIRECT_URI, code_challenge: challenge, code_challenge_method: 'S256', state })}`;
+  const desktop = !!desktopShell();
+  const clientId = desktop ? DESKTOP_CLIENT_ID : APP_CLIENT_ID;
+  const authorize = `${location.origin}/oauth/authorize?${new URLSearchParams({ response_type: 'code', client_id: clientId,
+    redirect_uri: desktop ? DESKTOP_REDIRECT_URI : APP_REDIRECT_URI, code_challenge: challenge, code_challenge_method: 'S256', state })}`;
+  const signIn = nativePlugin('TavyaSignIn');
   let back;
-  try { back = new URL((await nativePlugin('TavyaSignIn').open({ url: authorize, callbackScheme: 'io.tavya.app' })).url); }
+  try { back = new URL((await signIn.open({ url: authorize, callbackScheme: 'io.tavya.app' })).url); }
   catch (error) {
     if (error?.code === 'cancelled') return renderAppSignIn();
     throw error;
@@ -27753,10 +27877,14 @@ async function appSignIn() {
     if (back.searchParams.get('error') === 'access_denied') return renderAppSignIn();
     throw new Error(back.searchParams.get('error_description') || 'Sign-in failed. Try again.');
   }
+  // The loopback redirect carries the port the shell listened on: the code is bound to it.
+  const keepsToken = typeof signIn.saveDeviceToken === 'function';
   const response = await fetch('/oauth/app-session', { method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ client_id: APP_CLIENT_ID, code: back.searchParams.get('code') || '', code_verifier: verifier,
-      redirect_uri: APP_REDIRECT_URI, name: deviceLabel() }) });
-  if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error_description || 'Sign-in failed. Try again.');
+    body: JSON.stringify({ client_id: clientId, code: back.searchParams.get('code') || '', code_verifier: verifier,
+      redirect_uri: desktop ? `${back.origin}${back.pathname}` : APP_REDIRECT_URI, name: deviceLabel(), ...(keepsToken ? { device_token: true } : {}) }) });
+  const answer = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(answer.error_description || 'Sign-in failed. Try again.');
+  if (keepsToken && answer.deviceToken) await signIn.saveDeviceToken({ token: answer.deviceToken }).catch(() => {});
   return boot();
 }
 function pushDevicesHtml(devices, current, blocked = false) {
@@ -27764,7 +27892,7 @@ function pushDevicesHtml(devices, current, blocked = false) {
   return `<div class="setting-row" id="push-device-row">
       <span class="setting-label nowrap"><label for="push-this-device">Push to this device</label> ${policyTip('Notifications reach this device even when the app is closed. The Push column chooses which.')}</span>
       <span class="setting-value"></span>
-      <span class="setting-actions"><input class="toggle" type="checkbox" id="push-this-device" ${current ? 'checked' : ''} ${blocked ? `disabled title="${esc(nativeApp() ? `Notifications are off for ${siteName()} in this phone’s settings.` : 'Notifications are blocked in this browser’s site settings.')}"` : ''}/></span>
+      <span class="setting-actions"><input class="toggle" type="checkbox" id="push-this-device" ${current ? 'checked' : ''} ${blocked ? `disabled title="${esc(desktopShell() ? `Notifications are off for ${siteName()} in your computer’s settings.` : nativeApp() ? `Notifications are off for ${siteName()} in this phone’s settings.` : 'Notifications are blocked in this browser’s site settings.')}"` : ''}/></span>
     </div>${others.map((device) => `<div class="setting-row push-device">
       <span class="setting-label">${esc(device.label || 'Device')}</span>
       <span class="setting-value setting-muted">${device.lastPushedAt ? `Last push ${esc(fmtAgo(device.lastPushedAt))}` : `Added ${esc(fmtAgo(device.createdAt))}`}</span>
@@ -27778,7 +27906,7 @@ async function wirePushDevices() {
   const paint = async () => {
     devices = await api('/api/user/push-subscriptions');
     const current = await thisPushDevice(devices).catch(() => null);
-    const blocked = nativeApp() ? await nativePushBlocked() : Notification.permission === 'denied';
+    const blocked = storeApp() ? await nativePushBlocked() : Notification.permission === 'denied';
     if (!slot.isConnected) return;
     slot.innerHTML = pushDevicesHtml(devices, current, blocked);
     slot.querySelector('#push-this-device')?.addEventListener('change', async (event) => {
@@ -28255,6 +28383,7 @@ function profileView() {
         ${profileWalkthroughRow(u?.id)}
       </div>
     </div>
+    ${desktopShell() ? thisAppCard() : ''}
     ${notificationsCard()}
     ${S.meta?.hosted ? '<div class="card" id="profile-plans-card"><div class="section-h">Plans &amp; billing</div><div id="profile-plans" aria-live="polite"><span class="task-sub">Loading…</span></div></div>' : ''}
     ${u ? appGrantsCard() : ''}
@@ -28291,7 +28420,7 @@ function notificationsCard() {
   // Push is a column wherever this installation sends it; the device switch below only where this browser can receive it.
   // In the phone app, push is offered only once it can reach the phone.
   const behaviours = NOTIFY_BEHAVIOURS.filter((behaviour) => behaviour.key !== 'push'
-    || (S.meta?.deliveryChannels?.includes('push') && (!nativeApp() || S.meta?.nativePush)));
+    || (S.meta?.deliveryChannels?.includes('push') && (!storeApp() || S.meta?.nativePush)));
   const permission = typeof Notification === 'undefined' ? 'unsupported' : Notification.permission;
   const permissionNote = {
     denied: '<p class="notify-note">System notifications are blocked in this browser’s site settings.</p>',
@@ -28473,6 +28602,108 @@ async function hydrateProfilePlans() {
   });
 }
 
+// The desktop app's own settings (its shell, TavyaDesktop): the Ask shortcut,
+// opening at login, and its version and updates. Each row is filled from the
+// shell when Profile opens, so the tray's switch and this one agree.
+function thisAppCard() {
+  return `<div class="card" id="this-app">
+    <div class="section-h">This app</div>
+    <div class="setting-rows">
+      <div class="setting-row">
+        <span class="setting-label">Ask shortcut ${policyTip(`Opens Ask from anywhere, even when ${siteName()} is in the background. Click, then press the keys.`)}</span>
+        <span class="setting-value setting-muted" id="app-hotkey-note"></span>
+        <span class="setting-actions"><button class="btn sm" type="button" id="app-hotkey" aria-label="Ask shortcut">…</button></span>
+      </div>
+      <label class="setting-row" for="app-login">
+        <span class="setting-label">Open at login</span>
+        <span class="setting-value"></span>
+        <span class="setting-actions"><input class="toggle" type="checkbox" id="app-login" /></span>
+      </label>
+      <div class="setting-row" id="app-update"><span class="setting-label">Version</span><span class="setting-value setting-muted">…</span><span class="setting-actions"></span></div>
+    </div>
+  </div>`;
+}
+// Electron's names for keys (its accelerators), from a keydown.
+function acceleratorOf(event) {
+  const named = { ' ': 'Space', ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right', Enter: 'Return', Escape: 'Esc' };
+  if (['Control', 'Shift', 'Alt', 'Meta'].includes(event.key)) return null;
+  const key = named[event.key] || (/^F\d{1,2}$/.test(event.key) ? event.key : event.code?.startsWith('Key') ? event.code.slice(3)
+    : event.code?.startsWith('Digit') ? event.code.slice(5) : event.key.length === 1 ? event.key.toUpperCase() : null);
+  const modifiers = [event.ctrlKey && 'Control', event.metaKey && (desktopOsName() === 'Mac' ? 'Command' : 'Super'), event.altKey && 'Alt', event.shiftKey && 'Shift'].filter(Boolean);
+  return key && modifiers.length ? [...modifiers, key].join('+') : null;
+}
+function acceleratorLabel(accelerator) {
+  const mac = desktopOsName() === 'Mac';
+  return String(accelerator || '').split('+').map((part) => mac ? { Command: '⌘', CommandOrControl: '⌘', Control: '⌃', Alt: '⌥', Option: '⌥', Shift: '⇧' }[part] || part
+    : { Control: 'Ctrl', CommandOrControl: 'Ctrl', Command: 'Super' }[part] || part).join(mac ? '' : '+');
+}
+function paintAppHotkey(state) {
+  const button = $('#app-hotkey'), note = $('#app-hotkey-note');
+  if (!button) return;
+  button.textContent = state?.accelerator ? acceleratorLabel(state.accelerator) : 'Set';
+  button.dataset.accelerator = state?.accelerator || '';
+  if (note) note.textContent = state && state.registered === false ? state.reason || 'Another app uses it.' : '';
+}
+// The update row: what is installed, and what to do about a newer one.
+function paintAppUpdate(status) {
+  const row = $('#app-update');
+  if (!row || !status) return;
+  const value = row.querySelector('.setting-value'), actions = row.querySelector('.setting-actions');
+  const said = { checking: 'Checking…', downloading: 'Downloading…', none: 'Up to date', available: `${status.version || 'A new version'} available`,
+    ready: `${status.version || 'Update'} ready`, error: 'Couldn’t check' }[status.state] || '';
+  value.innerHTML = `${esc(status.current || '')}${said ? ` · <span${status.state === 'error' && status.error ? ` title="${esc(status.error)}"` : ''}>${esc(said)}</span>` : ''}`;
+  actions.innerHTML = status.state === 'ready' ? '<button class="btn sm primary" type="button" id="app-update-install">Restart to update</button>'
+    : status.state === 'available' && status.url ? `<a class="btn sm" id="app-update-download" href="${esc(status.url)}" target="_blank" rel="noopener">Download</a>`
+    : status.state === 'unsupported' || status.state === 'checking' || status.state === 'downloading' ? ''
+    : '<button class="btn sm" type="button" id="app-update-check">Check for updates</button>';
+  actions.querySelector('#app-update-install')?.addEventListener('click', () => desktopShell()?.installUpdate?.().catch((error) => toast(plainError(error), true)));
+  actions.querySelector('#app-update-check')?.addEventListener('click', async (event) => {
+    event.currentTarget.disabled = true;
+    paintAppUpdate({ ...status, state: 'checking' });
+    try { paintAppUpdate(await desktopShell().checkForUpdates()); }
+    catch (error) { paintAppUpdate({ ...status, state: 'error', error: plainError(error) }); }
+  });
+}
+async function wireThisApp() {
+  const shell = desktopShell();
+  if (!shell || !$('#this-app')) return;
+  const [hotkey, login, update] = await Promise.all([shell.getHotkey().catch(() => null), shell.getLaunchAtLogin().catch(() => null),
+    shell.getUpdateStatus().catch(() => null)]);
+  paintAppHotkey(hotkey);
+  const toggle = $('#app-login');
+  if (toggle) {
+    toggle.checked = !!login?.enabled;
+    toggle.addEventListener('change', async () => {
+      try { await shell.setLaunchAtLogin({ enabled: toggle.checked }); }
+      catch (error) { toggle.checked = !toggle.checked; toast(plainError(error), true); }
+    });
+  }
+  paintAppUpdate(update);
+  const button = $('#app-hotkey');
+  button?.addEventListener('click', () => {
+    if (button.classList.contains('recording')) return;
+    button.classList.add('recording');
+    button.textContent = 'Press keys…';
+    const finish = async (accelerator) => {
+      document.removeEventListener('keydown', record, true);
+      button.removeEventListener('blur', cancel);
+      button.classList.remove('recording');
+      if (!accelerator) return paintAppHotkey({ accelerator: button.dataset.accelerator, registered: true });
+      try { paintAppHotkey(await shell.setHotkey({ accelerator })); }
+      catch (error) { toast(plainError(error), true); paintAppHotkey({ accelerator: button.dataset.accelerator, registered: true }); }
+    };
+    const cancel = () => finish(null);
+    const record = (event) => {
+      event.preventDefault(); event.stopPropagation();
+      if (event.key === 'Escape') return finish(null);
+      const accelerator = acceleratorOf(event);
+      if (accelerator) finish(accelerator);
+    };
+    document.addEventListener('keydown', record, true);
+    button.addEventListener('blur', cancel);
+  });
+}
+
 function wireProfileView() {
   const reset = $('#profile-reset-onboarding');
   reset?.addEventListener('click', async () => {
@@ -28488,6 +28719,7 @@ function wireProfileView() {
   });
   if (S.profileUserId && S.profileUserId !== S.user?.id) return;
   wireNotificationsCard();
+  wireThisApp().catch(() => {});
   void hydrateProfilePlans();
   void hydrateAppGrants();
   void hydrateChatLinks();
@@ -28632,6 +28864,7 @@ function wireProfileView() {
   $('#export-user-data')?.addEventListener('click', () => location.assign('/api/user/export'));
   $('#profile-logout')?.addEventListener('click', async () => {
     await forgetPushDevice();
+    await forgetAppIdentity();
     try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
     location.reload();
   });
@@ -29031,7 +29264,7 @@ function installationView() {
       <div class="settings-section-title" id="installation-paid-launch"><div>Paid launch</div></div>${paidLaunchCard()}
       <div class="settings-section-title" id="installation-stripe"><div>Agent cards ${policyTip(`Optional: the Stripe Connect application behind the cards agents spend from. Not used for plan subscriptions.`)}</div></div>${stripePlatformCard()}
       <div class="settings-section-title" id="installation-email"><div>Email</div></div>${outboundEmailCard()}
-      <div class="settings-section-title" id="installation-phone-apps"><div>Phone apps ${policyTip(`The ${siteName()} apps for Android and iOS`)}</div></div><div class="card" id="native-push-card"><span class="task-sub">Loading…</span></div>
+      <div class="settings-section-title" id="installation-phone-apps"><div>Phone apps ${policyTip(`The ${siteName()} apps for Android and iOS`)}</div></div><div class="card" id="native-push-card"><span class="task-sub">Loading…</span></div><div class="card" id="app-links-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-access"><div>Phone access ${policyTip(`Open ${siteName()} from your phone over a private Tailscale network`)}</div></div>${phone}
       ${S.meta.hosted ? `<div class="settings-section-title" id="installation-users"><div>Users ${policyTip('Close a person’s account and erase their data. Closing removes sign-in and access, not shared work. Erasure reviews need a documented decision per item; replacing a name is not anonymisation.')}</div></div><div class="card" id="installation-users-card"><span class="task-sub">Loading…</span></div>` : ''}
     </div>
@@ -29133,6 +29366,63 @@ async function wireNativePushCard() {
     catch (error) { toast(error.message, true); }
     await wireNativePushCard();
   });
+}
+// Verified links and store listings (src/platform/app-links.ts): what
+// /.well-known/assetlinks.json and apple-app-site-association name, and the
+// listings /download shows.
+async function wireAppLinksCard() {
+  const card = $('#app-links-card');
+  if (!card) return;
+  let settings;
+  try { ({ settings } = await api('/api/settings/app-links')); }
+  catch (error) { if (card.isConnected) paneError(card, error, () => wireAppLinksCard()); return; }
+  settings = { androidCertFingerprints: [], ...settings };
+  if (!card.isConnected) return;
+  const on = (set, label) => `<span class="chip${set ? ' done' : ''}">${label}</span>`;
+  const store = (url, label) => url ? `<a href="${esc(url)}" target="_blank" rel="noopener">${label}</a>` : '';
+  const listings = [store(settings.appStoreUrl, 'App Store'), store(settings.playStoreUrl, 'Google Play')].filter(Boolean).join(' · ');
+  card.innerHTML = `<div class="setting-rows">
+    <div class="setting-row" id="app-links-row">
+      <span class="setting-label">Links ${policyTip(`Opens ${siteName()} links in the apps instead of the browser. Needs the apps’ signing certificates (Android) and Team ID (iOS).`)}</span>
+      <span class="setting-value">${on(settings.androidCertFingerprints.length, 'Android')} ${on(settings.appleTeamId, 'iOS')}</span>
+      <span class="setting-actions"><button class="btn sm" type="button" data-app-links-edit>Edit</button></span></div>
+    <div class="setting-row" id="app-stores-row">
+      <span class="setting-label">Store listings ${policyTip('Shown on the download page once set.')}</span>
+      <span class="setting-value">${listings || '<span class="setting-muted">None yet</span>'}</span>
+      <span class="setting-actions"><button class="btn sm" type="button" data-app-links-edit>Edit</button></span></div></div>`;
+  card.querySelectorAll('[data-app-links-edit]').forEach((button) => button.addEventListener('click', () => openAppLinksDialog(settings, wireAppLinksCard)));
+}
+function openAppLinksDialog(settings, onSaved) {
+  const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-card computer-dialog" role="dialog" aria-modal="true" aria-label="Phone app links">
+    <div class="modal-head"><b>Links and listings</b><span class="label-row-fill"></span><button class="icon-btn app-links-close" type="button" aria-label="Close">×</button></div>
+    <div class="settings-grid">
+      <label class="form-row"><span>Android certificates ${policyTip('SHA-256 fingerprints, one per line: Play Console → Test and release → App integrity (the app signing key, and the upload key).')}</span>
+        <textarea class="app-links-fingerprints" rows="3" autocomplete="off" spellcheck="false" placeholder="AB:CD:…">${esc(settings.androidCertFingerprints.join('\n'))}</textarea></label>
+      <label class="form-row"><span>Apple Team ID ${policyTip('Apple Developer → Membership.')}</span>
+        <input class="app-links-team" autocomplete="off" spellcheck="false" maxlength="10" value="${esc(settings.appleTeamId || '')}" placeholder="ABCDE12345"></label>
+      <label class="form-row"><span>App Store URL</span><input class="app-links-ios" type="url" value="${esc(settings.appStoreUrl || '')}" placeholder="https://apps.apple.com/…"></label>
+      <label class="form-row"><span>Google Play URL</span><input class="app-links-android" type="url" value="${esc(settings.playStoreUrl || '')}" placeholder="https://play.google.com/…"></label></div>
+    <div class="modal-actions"><span class="label-row-fill"></span><button class="btn app-links-cancel" type="button">Cancel</button><button class="btn primary app-links-save" type="button" data-submit>Save</button></div></div>`;
+  const close = () => { document.removeEventListener('keydown', keydown); overlay.remove(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  const value = (selector) => overlay.querySelector(selector).value.trim();
+  overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  overlay.querySelector('.app-links-close').addEventListener('click', close);
+  overlay.querySelector('.app-links-cancel').addEventListener('click', close);
+  overlay.querySelector('.app-links-save').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+      await api('/api/settings/app-links', { method: 'PUT', body: JSON.stringify({
+        androidCertFingerprints: value('.app-links-fingerprints').split(/[\s,]+/).filter(Boolean),
+        appleTeamId: value('.app-links-team') || null, appStoreUrl: value('.app-links-ios') || null, playStoreUrl: value('.app-links-android') || null }) });
+    } catch (error) { toast(error.message, true); button.disabled = false; return; }
+    close(); toast('Saved'); onSaved?.();
+  });
+  document.addEventListener('keydown', keydown);
+  document.body.appendChild(overlay);
+  overlay.querySelector('.app-links-fingerprints').focus();
 }
 function openNativePushDialog(onSaved) {
   const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
@@ -29627,9 +29917,9 @@ function planBillingMarkup(e, state) {
 async function hydratePlanAndBilling(organizationId, box = $('#org-plan')) {
   if (!box) return;
   const base = `/api/organizations/${encodeURIComponent(organizationId)}`;
-  // The phone apps sell nothing (App Store 3.1.1, Play's payments policy): the plan and its limits, read-only, with no checkout.
+  // The phone apps sell nothing (App Store 3.1.1, Play's payments policy): the plan and its limits, read-only, with no checkout (storeApp).
   const [entitlements, state] = await Promise.all([api(`${base}/entitlements`).catch(() => null),
-    nativeApp() ? null : api(`${base}/subscription/status`).catch(() => null)]);
+    storeApp() ? null : api(`${base}/subscription/status`).catch(() => null)]);
   if (!box.isConnected || (box.id === 'org-plan' && S.organizationId !== organizationId)) return;
   const giftsOpen = box.querySelector('.plan-operator')?.open;
   box.innerHTML = planBillingMarkup(entitlements, state?.managed ? state : null);
@@ -29923,6 +30213,7 @@ function wireInstallationSettings() {
   wireServiceLimitsCard();
   wireManagedComputeCard();
   wireNativePushCard();
+  wireAppLinksCard();
   wireHostCapacityCard();
   $('#timing-enabled')?.addEventListener('change', async event => {
     const control = event.currentTarget; control.disabled = true;
@@ -33086,9 +33377,10 @@ async function renderOAuthConsent() {
   try { [request, projects] = await Promise.all([api(`/api/oauth/authorizations/${encodeURIComponent(id)}`), grantLimitOptions()]); }
   catch (error) { return grantDone('Sign-in expired', error.message); }
   const client = request.client || {};
-  // The phone app is the person's own console: no limit to choose.
-  const phone = client.id === APP_CLIENT_ID;
-  grantFrame(`<h1 class="grant-title">${phone ? `${siteNameMarkup()} on your phone` : esc(client.name || 'An app')}</h1>
+  // The apps are the person's own console: no limit to choose.
+  const app = APP_CLIENTS[client.id];
+  const phone = !!app;
+  grantFrame(`<h1 class="grant-title">${phone ? `${siteNameMarkup()} ${app.where}` : esc(client.name || 'An app')}</h1>
     <p class="grant-who">${grantClientChip(client)} <span class="task-sub" title="${esc(`Returns to ${request.redirectHost || ''}`)}">${phone ? 'Sign the app in as you' : `will act as you${client.kind === 'metadata' ? '' : ` · ${esc(request.redirectHost || '')}`}`}</span></p>
     <div id="consent-limit">${phone ? '' : grantLimitMarkup(request.levels || [], projects, request.requested || {})}</div>
     <div class="grant-actions"><button class="btn primary" id="consent-allow">Allow</button><button class="btn" id="consent-deny">Deny</button></div>
@@ -33176,7 +33468,7 @@ async function hydrateAppGrants() {
   const levels = result.levels || [];
   const day = (epoch) => new Date(epoch).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
   box.innerHTML = result.grants.length ? result.grants.map((grant) => `<div class="member-row app-grant-row" data-grant="${esc(grant.id)}">
-      <div><b>${esc(grant.name)}</b> <span class="chip">${GRANT_KIND_LABEL[grant.kind] || esc(grant.kind)}</span>${grant.current ? ' <span class="chip active">This one</span>' : ''}
+      <div><b>${esc(grant.name)}</b> <span class="chip">${(grant.kind === 'app' && APP_CLIENTS[grant.clientId]?.label) || GRANT_KIND_LABEL[grant.kind] || esc(grant.kind)}</span>${grant.current ? ' <span class="chip active">This one</span>' : ''}
         <p class="task-sub">${esc(grantLimitSummary(levels, projects, grant.ceiling || {}))}${grant.limitedByCreator ? ` ${policyTip('Created by an agent: also limited to what that agent could do.')}` : ''}
           · ${grant.lastUsedAt ? `used ${esc(fmtAgo(grant.lastUsedAt))}` : 'never used'}
           · <span title="${esc(`Created ${new Date(grant.createdAt).toLocaleString()}`)}">${grant.kind === 'token' ? 'expires' : 'expires if unused by'} ${esc(day(grant.expiresAt))}</span></p></div>

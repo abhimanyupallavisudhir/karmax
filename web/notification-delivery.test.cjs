@@ -36,7 +36,7 @@ function browser() {
     api: async () => { if (response instanceof Error) throw response; return response; },
     announceInbox: (items) => alerts.push(...items),
     updateBell() {}, refreshForMeCounts() {}, bgRenderMain() {}, scheduleHomeRefresh() {}, readAsksOnScreen() {}, refreshListQuietly() {}, homeEventChangesList: () => false, patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false,
-    LIST_RELOAD_EVENTS: new Set(), setWsOnline() {}, checkConsoleRevision() {}, syncLiveWatch() {},
+    LIST_RELOAD_EVENTS: new Set(), setWsOnline() {}, checkConsoleRevision() {}, syncLiveWatch() {}, announceDesktopPush() {},
     refreshTasks: async () => {},
     setTimeout: (fn) => { timers.push(fn); return timers.length; },
   });

@@ -47,6 +47,7 @@ import { WorldLifecycleManager } from './world/runners.js';
 import { LoginSandboxes } from './agent/login-sandbox.js';
 import { BrowserDeliveryAdapter, DeliveryDispatcher, WebhookDeliveryAdapter } from './collaboration/delivery.js';
 import { PushDeliveryAdapter, vaultVapidKeys } from './collaboration/push-delivery.js';
+import { DesktopPushSockets } from './collaboration/desktop-push.js';
 import { NativePush } from './collaboration/native-push.js';
 import { hydrateEnvFile, hydrateSecretFiles, validateDeployment } from './config/deployment.js';
 import { WorldHandoffService } from './world/handoff.js';
@@ -323,9 +324,11 @@ async function main() {
   const pushKeys = vaultVapidKeys(broker);
   // The phone apps' native push needs the installation's Firebase key (Installation → Phone apps; wiki features/phone-apps).
   const nativePush = new NativePush({ broker, log: (line) => console.warn(`[push] ${line}`) });
+  // The desktop apps' pushes ride their console's /ws connection (wiki features/desktop-apps).
+  const desktopPush = new DesktopPushSockets();
   const delivery = new DeliveryDispatcher(store, {
     browser: new BrowserDeliveryAdapter(),
-    push: new PushDeliveryAdapter({ store, keys: pushKeys, native: nativePush, publicUrl: process.env.KARMAX_PUBLIC_URL,
+    push: new PushDeliveryAdapter({ store, keys: pushKeys, native: nativePush, desktop: desktopPush, publicUrl: process.env.KARMAX_PUBLIC_URL,
       siteName: async () => siteNameOf((await store.getSettings('global', 'appearance'))),
       log: (line) => console.warn(`[push] ${line}`) }),
     ...(process.env.KARMAX_EMAIL_DELIVERY_URL ? { email: new WebhookDeliveryAdapter(process.env.KARMAX_EMAIL_DELIVERY_URL, 'email') } : {}),
@@ -472,6 +475,7 @@ async function main() {
     // can disable a switch it cannot honour instead of reporting a false "saved".
     pushKeys,
     nativePush,
+    desktopPush,
     deliveryChannels: [
       'browser',
       'push',
