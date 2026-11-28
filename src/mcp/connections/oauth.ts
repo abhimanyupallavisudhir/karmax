@@ -14,6 +14,9 @@ export interface OAuthVault {
    * stored data is still `observed`, and a refresh another process completed
    * meanwhile is returned instead of refreshing again. */
   refresh?(c: OAuthTarget, taskId: string | undefined, observed: any, run: (data: any) => Promise<any>): Promise<any>;
+  /** The installation's OAuth app for an authorization server that registers
+   *  no clients on demand (`oauth-apps.ts`), if an operator registered one. */
+  registeredClient?(authorizationServer: string): Promise<{ client_id: string; client_secret?: string } | undefined>;
 }
 
 /** A leased OAuth refresh of the JSON stored under `handle`, for an `OAuthVault`. */
@@ -47,7 +50,7 @@ async function authorize(...args: Parameters<typeof auth>) {
   catch (error) {
     // Without registration or client metadata documents, the server accepts only clients registered with it in advance.
     if (error instanceof Error && error.message.includes('does not support dynamic client registration'))
-      throw new Error('This MCP server needs an OAuth app registered with it. Add it in Settings → Connected apps (+ Add custom MCP) with that app’s client details.');
+      throw new Error('This MCP server needs an OAuth app registered with its sign-in server. An installation operator adds one in Installation → Sign-in apps (or add the server in Settings → Connected apps → + Add custom MCP with that app’s client details).');
     throw new Error('MCP authorization failed. Retry sign-in, or check the server’s required OAuth client details and installation callback URL.');
   }
 }
@@ -61,18 +64,38 @@ async function exclusive<T>(key: string, run: () => Promise<T>): Promise<T> {
   const next = old.catch(() => {}).then(run); locks.set(key, next);
   try { return await next; } finally { const count = (waiters.get(key) ?? 1) - 1; if (count) waiters.set(key, count); else waiters.delete(key); if (locks.get(key) === next) locks.delete(key); }
 }
+/**
+ * What an authorization server needs beyond the standard to keep a sign-in:
+ * Google issues a refresh token only when asked for offline access, and on a
+ * later sign-in only with fresh consent — without them, an MCP account of
+ * Google's would need signing in again every hour.
+ */
+const AUTHORIZATION_PARAMS: Record<string, Record<string, string>> = {
+  'accounts.google.com': { access_type: 'offline', prompt: 'consent' },
+};
+function withAuthorizationParams(url: URL): URL {
+  for (const [key, value] of Object.entries(AUTHORIZATION_PARAMS[url.hostname] ?? {})) url.searchParams.set(key, value);
+  return url;
+}
 function provider(service: OAuthVault, connection: OAuthTarget, data: any, redirect: string,
   onRedirect: (url: string) => void): OAuthClientProvider {
+  // The installation's app for the server discovery found (saved before the SDK asks
+  // for a client), stamped with that server so the SDK never saves it as this connection's.
+  const registered = async () => {
+    const server = data.discovery?.authorizationServerUrl;
+    const client = server && await service.registeredClient?.(server);
+    return client ? { ...client, issuer: server } : undefined;
+  };
   return {
     redirectUrl: redirect,
     clientMetadataUrl: data.clientMetadataUrl,
     clientMetadata: { client_name: 'Tavya', redirect_uris: [redirect], grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'], token_endpoint_auth_method: data.manualClient?.token_endpoint_auth_method ?? 'none' },
     state: () => data.pending.state,
-    clientInformation: () => data.manualClient ?? data.client,
+    clientInformation: async () => data.manualClient ?? (await registered()) ?? data.client,
     saveClientInformation: async (client) => { data.client = client; (await service.setSecret(connection, data)); },
     tokens: () => data.tokens,
     saveTokens: async (tokens) => { data.tokens = { ...tokens, refresh_token: tokens.refresh_token ?? data.tokens?.refresh_token }; data.expiresAt = Date.now() + (tokens.expires_in ?? 3600) * 1000; (await service.setSecret(connection, data)); },
-    redirectToAuthorization: (url) => { onRedirect(publicUrl(url.href).href); },
+    redirectToAuthorization: (url) => { onRedirect(withAuthorizationParams(publicUrl(url.href)).href); },
     saveCodeVerifier: async (verifier) => { data.pending.verifier = verifier; (await service.setSecret(connection, data)); },
     codeVerifier: () => data.pending?.verifier ?? '',
     discoveryState: () => data.discovery,
@@ -128,7 +151,8 @@ export async function connectionHeaders(service: OAuthVault, c: OAuthTarget, tas
     for (let attempt = 0; attempt < 3 && data.tokens?.access_token && data.expiresAt < Date.now() + 60_000; attempt++) {
       if (!service.refresh) { await refresh(data, service); break; }
       // The SDK saves into `current` as it goes; the lease writes it back once.
-      data = await service.refresh(c, taskId, data, (current) => refresh(current, { secret: async () => current, setSecret: async () => {} }));
+      data = await service.refresh(c, taskId, data, (current) => refresh(current, { secret: async () => current, setSecret: async () => {},
+        registeredClient: service.registeredClient?.bind(service) }));
     }
     if (!data.tokens?.access_token) throw new Error(`Connect “${c.label}” in ${c.projectId ? 'Project settings' : 'Settings'} → Connected apps before running this task`);
     return { Authorization: `Bearer ${data.tokens.access_token}` };

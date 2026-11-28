@@ -225,7 +225,10 @@ describe('service connections', () => {
     vi.mocked(backend.session).mockResolvedValueOnce('session-fresh');
     await service.refresh(org, reconnect.id);
     expect(await service.get(org, account)).toMatchObject({ status: 'active', accountId: 'ca_fresh', sessionId: 'session-fresh' });
-    expect(backend.disconnect).toHaveBeenCalledWith('ca_exact');
+    // Signed out without revoking upstream: both sign-ins are the same person's
+    // grant to the same provider app (Google's), and revoking the old revoked the new (admin_docs#6).
+    expect(backend.disconnect).toHaveBeenCalledWith('ca_exact', { revoke: false });
+    expect(backend.disconnect).toHaveBeenCalledTimes(1);
     expect(await service.get(org, reconnect.id)).toMatchObject({ status: 'active', grantedConnectionId: account, ownerId: 'alice' });
     expect((await service.get(org, reconnect.id)).accountId).toBeUndefined();
     for (const [id, task] of [[grant.id, 'task_b'], [reconnect.id, 'task_b'], [account, 'task_a']] as const) {
@@ -273,9 +276,12 @@ describe('service connections', () => {
     expect(await service.refresh(org, started.connection.id)).toMatchObject({ id: account, status: 'active', accountId: 'ca_fresh' });
     await expect(service.get(org, started.connection.id)).rejects.toThrow('not found');
     expect((await service.list(org, { ownerId: 'alice' })).map(c => c.id)).toEqual([account]);
-    expect(backend.disconnect).toHaveBeenCalledWith('ca_exact');
+    expect(backend.disconnect).toHaveBeenCalledWith('ca_exact', { revoke: false });
     // Without restart, an active account is left alone.
     expect(await service.connect(org, 'alice', { id: account })).toEqual({ connection: expect.objectContaining({ id: account, status: 'active' }) });
+    // Disconnecting the person's last account of the app revokes it upstream.
+    await service.disconnect(org, account, 'alice');
+    expect(backend.disconnect).toHaveBeenLastCalledWith('ca_fresh');
   });
   it('offers reusable accounts newest first, with when each was connected', async () => {
     const day = 86_400_000, then = Date.UTC(2026, 8, 12);
@@ -358,6 +364,8 @@ describe('native MCP connections', () => {
     vi.spyOn(network, 'publicFetch').mockImplementation(async (input, init) => {
       const req = new Request(input, init); const body = await req.text();
       const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } });
+      // An open server publishes no OAuth metadata.
+      if (req.url.startsWith('https://open.example/')) return new Response('{}', { status: 404 });
       if (req.url.includes('oauth-protected-resource')) return json({ resource: 'https://mail.example/mcp', authorization_servers: ['https://auth.example'] });
       if (req.url.includes('.well-known')) return json({ issuer: 'https://auth.example', authorization_endpoint: 'https://auth.example/authorize', token_endpoint: 'https://auth.example/token',
         registration_endpoint: 'https://auth.example/register', response_types_supported: ['code'], code_challenge_methods_supported: ['S256'] });
@@ -454,7 +462,7 @@ describe('native MCP connections', () => {
     });
     const request = (await service.requestMcp(org, await service.resolveMcp('https://mail.example/mcp'), 'task_a', 'do', 'Mail'));
     await expect(service.connect(org, 'alice', { id: request.id, redirect: 'https://tavya.example/mcp-callback' }))
-      .rejects.toThrow('needs an OAuth app registered with it');
+      .rejects.toThrow('Installation → Sign-in apps');
   });
 
   it('connects servers without authentication immediately and expires abandoned sign-ins', async () => {

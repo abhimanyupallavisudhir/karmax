@@ -14,6 +14,7 @@ import { RefreshLeases } from '../autonomy/refresh-lease.js';
 import { authorizesWithGitHub, openRemoteMcp, remoteMcpAuth, type RemoteMcpTransport } from '../mcp/connections/remote.js';
 import { registryServer } from '../mcp/connections/registry.js';
 import { validateTransport } from '../mcp/connections/store.js';
+import { OAuthApps } from '../mcp/connections/oauth-apps.js';
 
 const MCP_CREDENTIALS = 'service-connection-mcp:';
 const KEY = 'service-connections:composio:api-key';
@@ -96,7 +97,8 @@ export interface ConnectionBackend {
   session(userId: string, toolkit: string, accountId: string): Promise<string>;
   tools(toolkit: string, search: string): Promise<ServiceTool[]>;
   execute(sessionId: string, slug: string, args: Record<string, unknown>): Promise<unknown>;
-  disconnect(accountId: string): Promise<void>;
+  /** Deletes the account; `revoke: false` keeps its upstream grant (see `signOut`). */
+  disconnect(accountId: string, options?: { revoke?: boolean }): Promise<void>;
   /** Composio Instant: whether any of the toolkit's tools can be paid from the installation's wallet. */
   instantSupported?(toolkit: string): Promise<boolean>;
   /** A session whose calls Composio pays and reports (instant_charge). */
@@ -149,8 +151,8 @@ export class ComposioBackend implements ConnectionBackend {
       multi_account: { enable: false }, manage_connections: { enable: false }, workbench: { enable: false } };
     return (await this.client.toolRouter.session.create(body as unknown as Parameters<Composio['toolRouter']['session']['create']>[0])).session_id;
   }
-  async disconnect(accountId: string) {
-    try { await this.client.connectedAccounts.delete(accountId, { revoke_on_delete: true }); }
+  async disconnect(accountId: string, { revoke = true }: { revoke?: boolean } = {}) {
+    try { await this.client.connectedAccounts.delete(accountId, { revoke_on_delete: revoke }); }
     catch (error) { if (!(error instanceof Composio.APIError && error.status === 404)) throw error; }
   }
 }
@@ -183,6 +185,7 @@ export class ServiceConnections {
           && this.broker.replaceHandleIfUnchanged(handle, current, next, organizationScope(c.organizationId)),
         run);
     },
+    registeredClient: (server) => new OAuthApps(this.store, this.broker).client(server),
   };
   private target(c: ServiceConnection): OAuthTarget {
     return { id: c.id, organizationId: c.organizationId, projectId: c.ownerProjectId, label: c.label, auth: c.mcp!.auth === 'github' ? 'oauth' : c.mcp!.auth,
@@ -430,12 +433,28 @@ export class ServiceConnections {
   /** Sign out, at the provider, the accounts a newer sign-in replaced. */
   private async retire(account: ServiceConnection) {
     for (const old of [...(account.retiring ?? [])]) {
-      await this.remote(async () => (await this.backend()).disconnect(old));
+      await this.signOut(account, old);
       const current = (await this.get(account.organizationId, account.id));
       current.retiring = (current.retiring ?? []).filter(id => id !== old);
       if (!current.retiring.length) delete current.retiring;
       (await this.save(current));
     }
+  }
+  /**
+   * Signs a provider account out at Composio. Its upstream grant is revoked
+   * only when no other account of the same owner and app still uses it: two
+   * sign-ins of one person to one app (a sign-in again and the account it
+   * replaces, an unfinished one beside a connected one) share the provider's
+   * grant to the app — Google's is per person and app — so revoking one
+   * revokes both (admin_docs#6: a reconnect left Gmail answering 401 until a
+   * second sign-in). Without revocation the deleted account is unusable, but
+   * its token lives on at the provider until the person's last account goes.
+   */
+  private async signOut(c: ServiceConnection, accountId: string) {
+    const owner = (o: ServiceConnection) => o.ownerProjectId ? `project:${o.ownerProjectId}` : o.ownerId;
+    const shared = !!owner(c) && (await this.all()).some(o => !o.mcp && o.toolkit === c.toolkit && owner(o) === owner(c)
+      && !!o.accountId && o.accountId !== accountId && ['active', 'connecting'].includes(o.status));
+    await this.remote(async () => shared ? (await this.backend()).disconnect(accountId, { revoke: false }) : (await this.backend()).disconnect(accountId));
   }
   private slug(value: string) { if (!/^[a-z][a-z0-9_]{0,79}$/.test(value)) throw new ConnectionError('Invalid app identifier'); }
   private sameApp(a: ServiceConnection, b: ServiceConnection) { return a.mcp ? a.mcp.url === b.mcp?.url : !b.mcp && a.toolkit === b.toolkit; }
@@ -492,7 +511,7 @@ export class ServiceConnections {
         if (account.ownerId !== ownerId) throw new ConnectionError('This connection belongs to another person', 403);
         if (!this.sameApp(c, account) || !this.isAccount(account)) throw new ConnectionError('That account is not connected for this app');
         // An unfinished sign-in for this request is no longer needed.
-        if (c.accountId) await this.remote(async () => (await this.backend()).disconnect(c!.accountId!));
+        if (c.accountId) await this.signOut({ ...c, ownerId }, c.accountId);
         if (c.mcp) (await this.broker.deleteHandle(MCP_CREDENTIALS + c.id));
         Object.assign(c, { ownerId, label: account.label, grantedConnectionId: account.id, status: 'active',
           accountId: undefined, sessionId: undefined, notifiedAt: undefined });
@@ -519,7 +538,7 @@ export class ServiceConnections {
       // Retire the previous provider account before replacing its only local
       // reference, so failed/abandoned sign-ins cannot leave orphaned accounts.
       if (c.accountId) {
-        await this.remote(async () => (await this.backend()).disconnect(c!.accountId!));
+        await this.signOut(c, c.accountId);
         c.accountId = undefined; c.sessionId = undefined; c.status = 'expired'; c.notifiedAt = undefined;
         (await this.broker.deleteHandle(PREFIX + c.id)); (await this.save(c));
       }
@@ -643,7 +662,7 @@ export class ServiceConnections {
       (await this.save(c)); (await this.broker.deleteHandle(PREFIX + id)); (await this.broker.deleteHandle(MCP_CREDENTIALS + id));
       for (const grant of (await this.all()).filter(g => g.grantedConnectionId === c.id && g.status !== 'disconnected'))
         (await this.save({ ...grant, status: 'disconnected', notifiedAt: undefined }));
-      if (c.accountId) { await this.remote(async () => (await this.backend()).disconnect(c.accountId!)); c.accountId = undefined; (await this.save(c)); }
+      if (c.accountId) { await this.signOut(c, c.accountId); c.accountId = undefined; (await this.save(c)); }
       (await this.audit(c, ownerId ?? this.actor(c), 'disconnected'));
       return this.view(c);
     });
@@ -810,7 +829,7 @@ export class ServiceConnections {
         if (current.retiring?.length) await this.retire(current);
         // An owner's own sign-in again that never completed leaves nothing behind.
         if (current.reconnects && !current.taskId && ['expired', 'denied', 'disconnected'].includes(current.status)) {
-          if (current.accountId) await this.remote(async () => (await this.backend()).disconnect(current.accountId!));
+          if (current.accountId) await this.signOut(current, current.accountId);
           (await this.forget(current)); continue;
         }
         // A deleted project's account, signed out at the provider at last.

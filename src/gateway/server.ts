@@ -3136,6 +3136,37 @@ export class Gateway {
           { ...settings, ...identityAuditDetail(callerIdentity) });
         return this.json(res, 200, { settings });
       }
+      // Sign-in apps (wiki features/service-connections § Sign-in apps): OAuth
+      // apps an operator registered with authorization servers that register no
+      // clients on demand (Google's, behind its Workspace MCP servers). GET lists
+      // them (never a secret) and where they send people back; PUT {clientId,
+      // clientSecret?} to /:server registers one, DELETE removes it.
+      if (p === '/api/settings/oauth-apps' || p.startsWith('/api/settings/oauth-apps/')) {
+        if (!this.deps.broker) return this.json(res, 503, { error: 'the vault is unavailable' });
+        const { OAuthApps } = await import('../mcp/connections/oauth-apps.js');
+        const apps = new OAuthApps(store, this.deps.broker);
+        const server = p === '/api/settings/oauth-apps' ? undefined : decodeURIComponent(p.slice('/api/settings/oauth-apps/'.length));
+        if (!server) {
+          if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
+          const origin = process.env.KARMAX_PUBLIC_URL ?? (hostLocal() ? url.origin : undefined);
+          return this.json(res, 200, { apps: await apps.list(), redirectUri: origin ? new URL('/mcp-callback', origin).href : undefined });
+        }
+        try {
+          if (method === 'PUT') {
+            const view = await apps.save(server, await this.body(req));
+            await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'oauth-app.save', `installation:oauth-app:${view.server}`,
+              { clientId: view.clientId, ...identityAuditDetail(callerIdentity) });
+            return this.json(res, 200, view);
+          }
+          if (method === 'DELETE') {
+            await apps.remove(server);
+            await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'oauth-app.delete', `installation:oauth-app:${server}`,
+              { ...identityAuditDetail(callerIdentity) });
+            return this.json(res, 200, { apps: await apps.list() });
+          }
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        return this.json(res, 405, { error: 'method not allowed' });
+      }
       // Native push for the phone apps (wiki features/phone-apps): GET whether
       // the Firebase service account is set (never the key), PUT {serviceAccount}
       // saves it once Google accepts it, DELETE removes it.

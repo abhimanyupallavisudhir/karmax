@@ -28,7 +28,7 @@ export async function openRemoteMcp(transport: RemoteMcpTransport, headers: Reco
   catch (error) { await client.close().catch(() => {}); throw error; }
 }
 
-/** Whether a remote server asks for OAuth sign-in (HTTP 401) before initialization. */
+/** Whether a remote server asks for OAuth sign-in: HTTP 401 at initialization, or protected-resource metadata. */
 export async function remoteMcpAuth(transport: RemoteMcpTransport): Promise<'oauth' | 'none'> {
   const response = await publicStreamFetch(new Request(transport.url, transport.type === 'sse'
     ? { headers: { accept: 'text/event-stream' } }
@@ -36,8 +36,15 @@ export async function remoteMcpAuth(transport: RemoteMcpTransport): Promise<'oau
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'tavya', version: '1' } } }) }));
   await response.body?.cancel().catch(() => {});
   if (response.status === 401) return 'oauth';
-  if (response.ok) return 'none';
-  throw new Error(`The MCP server answered HTTP ${response.status}`);
+  if (!response.ok) throw new Error(`The MCP server answered HTTP ${response.status}`);
+  // Some servers answer initialize without a token and refuse only tool calls
+  // (Google's Workspace servers): one that publishes protected-resource
+  // metadata (RFC 9728) naming an authorization server is signed in to.
+  try {
+    const metadata = await discoverOAuthProtectedResourceMetadata(transport.url, undefined, publicFetch);
+    if (metadata.authorization_servers?.length) return 'oauth';
+  } catch { /* none published: an open server */ }
+  return 'none';
 }
 
 /** Whether a server authorizes through GitHub (as GitHub's own MCP server does).
