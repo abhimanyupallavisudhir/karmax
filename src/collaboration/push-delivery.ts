@@ -4,6 +4,7 @@ import { INSTALLATION_SCOPE } from '../autonomy/vault-keys.js';
 import { organizationPath, taskPath } from '../domain/console-links.js';
 import type { InboxItem, NativePushDevice } from '../domain/types.js';
 import type { NativePush } from './native-push.js';
+import type { DesktopPushSockets } from './desktop-push.js';
 import type { Store } from '../store/db.js';
 import type { DeliveryAdapter, DeliveryEnvelope } from './delivery.js';
 import { generateVapidKeys, sendPush, vapidKeyPair, type PushUrgency, type VapidKeyPair } from './web-push.js';
@@ -97,7 +98,8 @@ const PUSH_TTL_SECONDS = 24 * 3600;
 
 /**
  * The inbox's `push` channel: one message to each of the person's devices —
- * encrypted Web Push to a browser, FCM to a phone app (`native-push.ts`).
+ * encrypted Web Push to a browser, FCM to a phone app (`native-push.ts`), the
+ * live connection of a running desktop app (`desktop-push.ts`; none: skipped).
  * A device its push service no longer knows (404/410, FCM UNREGISTERED) is
  * forgotten. The delivery is retried only when no device took it and one
  * might later (429, 5xx, a network error) — retrying after a partial success
@@ -113,6 +115,8 @@ export class PushDeliveryAdapter implements DeliveryAdapter {
     publicUrl?: string;
     /** The phone apps' sender; without one, phones are skipped. */
     native?: NativePush;
+    /** The desktop apps' live connections; without them, desktops are skipped. */
+    desktop?: DesktopPushSockets;
     fetcher?: typeof fetch;
     log?: (line: string) => void;
   }) {}
@@ -127,10 +131,13 @@ export class PushDeliveryAdapter implements DeliveryAdapter {
   }
 
   async deliver(envelope: DeliveryEnvelope): Promise<void> {
-    const { store, native } = this.options;
+    const { store, native, desktop } = this.options;
     const all = await store.listPushSubscriptions(envelope.inbox.userId);
     const phones = all.filter((device): device is NativePushDevice => device.kind === 'fcm');
-    const devices = [...all.filter((device) => device.kind === 'web'), ...(phones.length && native && await native.available() ? phones : [])];
+    // A desktop app is reachable only while it runs (a connection announced it); otherwise it is skipped, never retried.
+    const desktops = desktop ? all.filter((device) => device.kind === 'desktop' && desktop.connected(device.id) > 0) : [];
+    const devices = [...all.filter((device) => device.kind === 'web'), ...desktops,
+      ...(phones.length && native && await native.available() ? phones : [])];
     if (!devices.length) return;
     const organization = await store.getOrganization(envelope.inbox.organizationId);
     const project = envelope.task?.projectId ? await store.getProject(envelope.task.projectId) : undefined;
@@ -143,6 +150,10 @@ export class PushDeliveryAdapter implements DeliveryAdapter {
     const retryable: string[] = [];
     await Promise.all(devices.map(async (device) => {
       try {
+        if (device.kind === 'desktop') {
+          if (desktop!.send(envelope.inbox.userId, device.id, message)) { delivered++; await store.markPushed(device.id); }
+          return;
+        }
         if (device.kind === 'fcm') {
           const { outcome, detail } = await native!.send(device.token, message, PUSH_TTL_SECONDS);
           if (outcome === 'sent') { delivered++; await store.markPushed(device.id); }
@@ -150,6 +161,7 @@ export class PushDeliveryAdapter implements DeliveryAdapter {
           else if (outcome === 'retry') retryable.push(`${device.id}: ${detail}`);
           return;
         }
+        if (device.kind !== 'web') return;
         const status = await sendPush(device, payload, { vapid: vapid!, subject: this.subject(), urgency: PUSH_URGENCY[envelope.inbox.urgency],
           ttlSeconds: PUSH_TTL_SECONDS, topic, fetcher: this.options.fetcher });
         if (status >= 200 && status < 300) { delivered++; await store.markPushed(device.id); return; }

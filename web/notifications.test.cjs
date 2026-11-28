@@ -48,6 +48,7 @@ let pushHere = false;
 global.pushSupported = () => pushHere;
 // A browser, not the phone app (wiki features/phone-apps).
 global.nativeApp = () => false;
+global.storeApp = () => false;
 for (const name of ['urgencyRank', 'notifyPrefs', 'setNotifyPref', 'inboxArrivals', 'announceInbox',
   'notificationSoundPrefs', 'siteName', 'showSystemNotification', 'unlockNotificationAudio', 'inboxEventChanges', 'playNotificationSound', 'inboxRowLabel', 'inboxTitle', 'policyTip', 'notificationsCard']) eval(extractFn(name));
 

@@ -139,7 +139,8 @@ export class AppGrants {
       await this.delete({ ...grant, sessionId: undefined });
       return undefined;
     }
-    return { ...grant, lastUsedAt: state.updatedAt, expiresAt: state.expiresAt };
+    // Its device token's uses count too, but never move the session's expiry.
+    return { ...grant, lastUsedAt: Math.max(state.updatedAt, grant.lastUsedAt ?? 0), expiresAt: state.expiresAt };
   }
 
   async list(userId: string): Promise<AppGrant[]> {
@@ -180,10 +181,17 @@ export class AppGrants {
 
   /** Access + refresh token for an OAuth grant (a new refresh family). */
   async issue(grant: AppGrant): Promise<{ accessToken: string; refreshToken: string; expiresIn: number }> {
+    const refreshToken = await this.issueRefresh(grant);
+    return { accessToken: await this.accessToken(grant), refreshToken, expiresIn: ACCESS_TOKEN_TTL_MS / 1000 };
+  }
+
+  /** A new refresh family for a grant: the only token an app's native code
+   * gets (its device token); any earlier family stops working. */
+  async issueRefresh(grant: AppGrant): Promise<string> {
     const refreshToken = `tvr_${grant.id}.${secret()}`;
     if (!(await this.update(grant.id, (current) => ({ ...current, refresh: { current: digest(refreshToken), previous: [] } }))))
       throw new AppGrantError('invalid_grant', 'The grant was revoked');
-    return { accessToken: await this.accessToken(grant), refreshToken, expiresIn: ACCESS_TOKEN_TTL_MS / 1000 };
+    return refreshToken;
   }
 
   /** The one-time plaintext of a personal access token grant. */
@@ -236,7 +244,7 @@ export class AppGrants {
     let reused = false;
     const updated = await this.update(grant.id, (current) => {
       if (current.refresh?.current !== presented) { reused = true; return undefined; }
-      return { ...current, lastUsedAt: Date.now(), ...(current.kind === 'token' ? {} : { expiresAt: Date.now() + GRANT_IDLE_TTL_MS }),
+      return { ...current, lastUsedAt: Date.now(), ...(slides(current) ? { expiresAt: Date.now() + GRANT_IDLE_TTL_MS } : {}),
         refresh: { current: digest(next), previous: [presented, ...current.refresh.previous].slice(0, ROTATED_REFRESH_KEPT) } };
     });
     if (reused) {
@@ -244,7 +252,9 @@ export class AppGrants {
       throw new AppGrantError('invalid_grant', 'Refresh token reuse detected; the grant was revoked. Sign in again.');
     }
     if (!updated) throw new AppGrantError('invalid_grant', 'The grant was revoked');
-    return { grant: updated, accessToken: await this.accessToken(updated), refreshToken: next, expiresIn: ACCESS_TOKEN_TTL_MS / 1000 };
+    // An app grant's expiry is its session's (read in `get`), never the stored one.
+    const live = slides(updated) || updated.kind === 'token' ? updated : { ...updated, lastUsedAt: Date.now(), expiresAt: grant.expiresAt };
+    return { grant: live, accessToken: await this.accessToken(live), refreshToken: next, expiresIn: ACCESS_TOKEN_TTL_MS / 1000 };
   }
 
   /** RFC 7009: revoking a refresh or personal token revokes its grant; an
@@ -286,8 +296,10 @@ export class AppGrants {
   private async touch(grant: AppGrant): Promise<AppGrant> {
     const now = Date.now();
     if (now - (grant.lastUsedAt ?? 0) < TOUCH_INTERVAL_MS) return grant;
-    return (await this.update(grant.id, (current) => ({ ...current, lastUsedAt: now,
-      ...(current.kind === 'token' ? {} : { expiresAt: now + GRANT_IDLE_TTL_MS }) }), 1)) ?? grant;
+    const touched = await this.update(grant.id, (current) => ({ ...current, lastUsedAt: now,
+      ...(slides(current) ? { expiresAt: now + GRANT_IDLE_TTL_MS } : {}) }), 1);
+    // An app grant's expiry is its session's, read in `get`, not the stored one.
+    return touched ? (grant.kind === 'app' ? { ...touched, expiresAt: grant.expiresAt } : touched) : grant;
   }
 
   /** Compare-and-set loop on the grant record, so a concurrent use or refresh
@@ -309,6 +321,10 @@ export class AppGrants {
     if (grant.kind === 'app' && grant.sessionId) await this.options.sessions?.end(grant.sessionId);
   }
 }
+
+/** `cli` and `mcp` grants live while used; a personal token's expiry is fixed,
+ * and an app grant lives exactly as long as its console session. */
+const slides = (grant: AppGrant) => grant.kind === 'cli' || grant.kind === 'mcp';
 
 function normalizeCeiling(ceiling: AppGrantCeiling | undefined): AppGrantCeiling | undefined {
   if (!ceiling) return undefined;

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import crypto from 'node:crypto';
 import WebSocket from 'ws';
 import { stubGateway } from './helpers/stub-gateway.js';
-import { changeNoticeFor, writtenScope } from '../src/gateway/change-notices.js';
+import { changeNoticeFor, filesChangedByEvent, filesChangedByRequest, writtenScope } from '../src/gateway/change-notices.js';
 
 /**
  * Most writes record no task event (archiving, tags, priority, notes, reading an
@@ -42,6 +42,41 @@ describe('which requests give a notice', () => {
     // An organization they just made is in no organization yet: their other tabs list it.
     expect(changeNoticeFor({ method: 'POST', path: '/api/organizations', status: 200, capability: 'organization:create', scope: {}, userId: 'ana' }))
       .toEqual({ area: 'organization', personal: 'ana' });
+  });
+});
+
+/**
+ * The apps' offline files (wiki features/offline-files) re-check their pins
+ * when a project's files change: `{type: 'changed', area: 'files', projectId}`
+ * for every way they change on the server — a Files write, a resource version,
+ * a wiki page, a task landing, a push to one of its repositories.
+ */
+describe('which changes are a project\'s files changing', () => {
+  it('requests that write files, and not those that only stage or read them', () => {
+    const ok = (method: string, path: string, status = 200) => filesChangedByRequest({ method, path, status });
+    expect(ok('POST', '/api/projects/p/files/changes')).toBe(true);
+    expect(ok('POST', '/api/projects/p/resources')).toBe(true);
+    expect(ok('POST', '/api/projects/p/resources/att_1/import')).toBe(true);
+    expect(ok('POST', '/api/projects/p/resources/att_1/revisions')).toBe(true);
+    expect(ok('POST', '/api/tasks/t/resources/att_1/promote')).toBe(true);
+    expect(ok('PUT', '/api/projects/p/wiki/page')).toBe(true);
+    expect(ok('DELETE', '/api/projects/p/wiki/page')).toBe(true);
+    expect(ok('POST', '/api/projects/p/files/uploads')).toBe(false);
+    expect(ok('POST', '/api/projects/p/files/plan')).toBe(false);
+    expect(ok('GET', '/api/projects/p/files')).toBe(false);
+    expect(ok('POST', '/api/projects/p/files/changes', 409)).toBe(false);
+    expect(ok('POST', '/api/tasks/t/archive')).toBe(false);
+  });
+
+  it('events that move a branch or land a task', () => {
+    expect(filesChangedByEvent({ type: 'merge.result', payload: { merged: true } })).toBe(true);
+    expect(filesChangedByEvent({ type: 'merge.result', payload: { merged: false, conflict: true } })).toBe(false);
+    expect(filesChangedByEvent({ type: 'github.pr.merged', payload: {} })).toBe(true);
+    expect(filesChangedByEvent({ type: 'push.head', payload: { branch: 'b' } })).toBe(true);
+    expect(filesChangedByEvent({ type: 'push.branch', payload: {} })).toBe(true);
+    expect(filesChangedByEvent({ type: 'view.updated', payload: { status: 'done' } })).toBe(true);
+    expect(filesChangedByEvent({ type: 'view.updated', payload: { status: 'running' } })).toBe(false);
+    expect(filesChangedByEvent({ type: 'agent.output', payload: {} })).toBe(false);
   });
 });
 
@@ -116,6 +151,19 @@ describe('the live stream carries them', () => {
       await f.settle();
       expect(otherTab).toHaveLength(1);
       expect(colleague).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+
+  it('a task landing tells the project\'s readers its files changed', async () => {
+    const f = await fixture();
+    try {
+      const ana = await f.mint('ana', f.organization.id), eve = await f.mint('eve', f.elsewhere.id);
+      const [reader, outsider] = [await f.listen(ana), await f.listen(eve)];
+      await f.h.store.appendEvent({ taskId: f.task.id, type: 'merge.result', ts: Date.now(), payload: { merged: true, sha: 'abc' } });
+      await expect.poll(() => reader.filter((m) => m.area === 'files'), { timeout: 3000 })
+        .toEqual([{ type: 'changed', area: 'files', organizationId: f.organization.id, projectId: f.project.id }]);
+      await f.settle();
+      expect(outsider).toEqual([]);
     } finally { await f.close(); }
   });
 

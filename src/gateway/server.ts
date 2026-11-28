@@ -121,7 +121,9 @@ import type { AccessMode, AccessStatus, VaultFieldName, VaultItem, VaultItemType
 import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js';
 import { newId } from '../util/id.js';
 import { DurableEventFanout, type FanoutAudience } from './fanout.js';
-import { ChangeNotices, changeNoticeFor, clientId, writtenScope } from './change-notices.js';
+import { APPLE_APP_SITE_ASSOCIATION_PATH, ASSET_LINKS_PATH, appLinkSettings, appStores, appleAppSiteAssociation, assetLinks, parseAppLinkSettings,
+  saveAppLinkSettings } from '../platform/app-links.js';
+import { ChangeNotices, changeNoticeFor, clientId, filesChangedByEvent, filesChangedByRequest, writtenScope } from './change-notices.js';
 import { affects, authorityChanged, authoritySeq, changedSince, onAuthorityChange, type AuthorityChange, type AuthoritySubject } from '../store/authorization-epoch.js';
 import { AGENT_MAIL_MAX_BYTES, MAIL_FROM_HEADER, MAIL_SIGNATURE_HEADER, MAIL_TO_HEADER, verifyMail } from '../edge/agent-mail-signature.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
@@ -233,6 +235,8 @@ export interface GatewayDeps {
   pushKeys?: () => Promise<import('../collaboration/web-push.js').VapidKeyPair>;
   /** The phone apps' native push (FCM; src/collaboration/native-push.ts): usable once its Firebase key is set. */
   nativePush?: import('../collaboration/native-push.js').NativePush;
+  /** The desktop apps' push over their `/ws` connections (src/collaboration/desktop-push.ts), shared with the push adapter. */
+  desktopPush?: import('../collaboration/desktop-push.js').DesktopPushSockets;
   remoteAccess?: RemoteAccessController;
   /** Fetches OAuth client ID metadata documents (default: the outbound SSRF guard). */
   oauthMetadataFetch?: typeof fetch;
@@ -936,6 +940,11 @@ export class Gateway {
     this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess, deps.resources,
       (taskId) => this.taskSecrets(taskId));
     this.fanout = (await DurableEventFanout.create(deps.store, deps.bus));
+    // A task landing or a branch moving changes its project's files (change-notices.ts):
+    // one listener for the whole gateway, whichever process recorded the event.
+    this.fanout.on((event, projectId) => {
+      if (projectId && filesChangedByEvent(event)) return this.filesChanged([projectId]);
+    });
     // Device OAuth finishes in the provider CLI after `/accounts/connect` has
     // returned. Refreshing only in that request races the eventual auth.json and
     // leaves a visibly connected login absent from the runnable coordinator pool.
@@ -990,6 +999,16 @@ export class Gateway {
     };
   }
 
+  /** Tell the projects' readers their files changed (`area: 'files'`; wiki
+   * features/live-updates): the apps' offline copies re-check their pins. */
+  private async filesChanged(projectIds: Iterable<string>, client?: unknown): Promise<void> {
+    for (const projectId of new Set(projectIds)) {
+      const organizationId = await this.deps.store.projectOrganizationAsync(projectId).catch(() => undefined);
+      const tab = clientId(client);
+      if (organizationId) this.changes.publish({ area: 'files', organizationId, projectId, ...(tab ? { client: tab } : {}) });
+    }
+  }
+
   /** The live event stream (`/ws`): every durable event the caller may read. */
   private async eventStream(ws: import('ws').WebSocket, req: http.IncomingMessage): Promise<void> {
     const lifetime = socketLifetime(ws);
@@ -1021,6 +1040,8 @@ export class Gateway {
     // What this tab shows (RQ-16). Until it says, it gets every readable event.
     let watch: { projectId: string | null; taskId: string | null } | undefined;
     let answered = true;
+    let forgetPushDevice: (() => void) | undefined;
+    lifetime.add(() => forgetPushDevice?.());
     ws.on('pong', () => { answered = true; });
     const pinger = setInterval(() => {
       try {
@@ -1037,6 +1058,21 @@ export class Gateway {
         const message = JSON.parse(data.toString());
         if (message?.type === 'ping') {
           if (ws.readyState === WebSocketClient.OPEN) ws.send('{"type":"pong"}');
+          return;
+        }
+        // The desktop app's console names its push device (desktop-push.ts): only its person's own, one per socket.
+        if (message?.type === 'push-device') {
+          const sockets = this.deps.desktopPush;
+          if (!sockets || !person || typeof message.deviceId !== 'string') return;
+          const device = (await this.deps.store.listPushSubscriptions(auth.userId!)).find((entry) => entry.id === message.deviceId);
+          forgetPushDevice?.();
+          forgetPushDevice = undefined;
+          if (device?.kind !== 'desktop' || lifetime.closed) return;
+          forgetPushDevice = sockets.announce(device.id, auth.userId!, (push) => {
+            if (ws.readyState !== WebSocketClient.OPEN || ws.bufferedAmount > 2 * 1024 * 1024) return false;
+            ws.send(JSON.stringify(push));
+            return true;
+          });
           return;
         }
         if (message?.type === 'watch') {
@@ -1496,6 +1532,9 @@ export class Gateway {
     }
     const recorded = await this.githubEvents.ingest(result);
     for (const event of result.vaultPushes ?? []) await this.enqueueGitPassPush(event);
+    // A push to a project's repository (or its wiki's) changes what its Files shows.
+    for (const push of result.pushes ?? []) await this.filesChanged([...await this.deps.store.projectIdsForRepository(push.repositoryId),
+      ...await this.deps.store.projectIdsForWikiRepository(push.repositoryId)]).catch(() => undefined);
     return recorded;
   }
 
@@ -1914,9 +1953,15 @@ export class Gateway {
     if (p.startsWith(REPOSITORY_ROUTE) && this.deps.resources?.repositoryServer)
       return this.deps.resources.repositoryServer.handle(req, res, p.slice(REPOSITORY_ROUTE.length) + url.search);
     // Repositories tavya hosts: Git clients with a token as the password, never a session.
-    if (p.startsWith(HOSTED_GIT_ROUTE) && this.deps.hostedGit)
-      return this.deps.hostedGit.handle(req, res, p.slice(HOSTED_GIT_ROUTE.length) + url.search,
+    if (p.startsWith(HOSTED_GIT_ROUTE) && this.deps.hostedGit) {
+      await this.deps.hostedGit.handle(req, res, p.slice(HOSTED_GIT_ROUTE.length) + url.search,
         (token, repository, access) => this.hostedGitAllows(token, repository, access));
+      // A push to a hosted repository changes the Files of the projects that use it.
+      const pushed = p.match(/\/(repo_[a-z0-9]+)\/[A-Za-z0-9._-]+?(?:\.git)?\/git-receive-pack$/)?.[1];
+      if (pushed && res.statusCode < 400) await this.filesChanged([...await this.deps.store.projectIdsForRepository(pushed),
+        ...await this.deps.store.projectIdsForWikiRepository(pushed)]).catch(() => undefined);
+      return;
+    }
     const sensitiveNavigation = /^\/api\/tasks\/[^/]+\/(desktop|preview\/)/.test(p);
     if (p.startsWith('/api/') && (!['GET', 'HEAD', 'OPTIONS'].includes(req.method ?? 'GET') || sensitiveNavigation)
       && !this.sameOriginRequest(req)) return this.json(res, 403, { error: 'cross-origin request forbidden' });
@@ -1953,6 +1998,15 @@ export class Gateway {
     if (this.deps.hosted && !loopback && !p.startsWith('/api/health/') && !this.requestLimits.allow(this.clientAddress(req), p))
       return this.json(res, 429, { error: 'too many requests; try again later' });
     if (await this.oauthRoutes.handlePublic(req, res, url)) return;
+    // Verified links for the phone apps (src/platform/app-links.ts): JSON at these exact paths, never a redirect.
+    if ((p === ASSET_LINKS_PATH || p === APPLE_APP_SITE_ASSOCIATION_PATH) && (req.method === 'GET' || req.method === 'HEAD')) {
+      const settings = await appLinkSettings(this.deps.store);
+      const document = p === ASSET_LINKS_PATH ? assetLinks(settings) : appleAppSiteAssociation(settings);
+      if (!document) return this.json(res, 404, { error: 'not found' });
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'public, max-age=300' });
+      res.end(req.method === 'HEAD' ? undefined : JSON.stringify(document));
+      return;
+    }
     if (p.startsWith('/share/conversations/')) {
       const share = req.method === 'GET' ? (await publicShare(this.deps.store, p.slice('/share/conversations/'.length))) : undefined;
       const signedIn = !!(await this.deps.identity?.session(requestHeaders(req.headers)).catch(() => null));
@@ -2059,7 +2113,9 @@ export class Gateway {
     if (p === '/api/launch' && method === 'GET') {
       const info = (await this.deps.paidLaunchSettings?.publicLaunchInfo((await this.siteName)))
         ?? publicLaunchInfo(process.env, undefined, (await this.siteName));
-      return this.json(res, 200, { ...info, managedCompute: await this.managedComputeProviders() });
+      return this.json(res, 200, { ...info, managedCompute: await this.managedComputeProviders(),
+        // The phone apps' store listings (Installation → Phone apps), for /download.
+        appStores: await appStores(this.deps.store) });
     }
     const legalMatch = p.match(/^\/api\/legal\/([^/]+)$/);
     if (legalMatch && method === 'GET') {
@@ -2677,6 +2733,10 @@ export class Gateway {
           scope: await writtenScope(requestedScope, authRecord, store),
           userId: callerIdentity.humanSubject?.userId, client: req.headers[CONSOLE_CLIENT_HEADER] });
         if (notice) this.changes.publish(notice);
+        if (filesChangedByRequest({ method, path: p, status: res.statusCode })) {
+          const scope = await writtenScope(requestedScope, authRecord, store);
+          if (scope.projectId) await this.filesChanged([scope.projectId], req.headers[CONSOLE_CLIENT_HEADER]);
+        }
       })().catch(() => { /* a page that missed it reads again when it next comes into view */ });
     });
     if (decision.required) {
@@ -3174,6 +3234,18 @@ export class Gateway {
           }
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         return this.json(res, 405, { error: 'method not allowed' });
+      }
+      // Verified links for the phone apps (src/platform/app-links.ts): GET the
+      // signing details the .well-known files name, PUT replaces them.
+      if (p === '/api/settings/app-links') {
+        if (method === 'GET') return this.json(res, 200, { settings: await appLinkSettings(store) });
+        if (method !== 'PUT') return this.json(res, 405, { error: 'method not allowed' });
+        const settings = parseAppLinkSettings(await this.body(req));
+        if (typeof settings === 'string') return this.json(res, 400, { error: settings });
+        await saveAppLinkSettings(store, settings);
+        await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'app-links.save', 'installation:app-links',
+          { ...settings, ...identityAuditDetail(callerIdentity) });
+        return this.json(res, 200, { settings });
       }
       // Native push for the phone apps (wiki features/phone-apps): GET whether
       // the Firebase service account is set (never the key), PUT {serviceAccount}
@@ -4475,10 +4547,11 @@ export class Gateway {
       const pushSubscription = p.match(/^\/api\/user\/push-subscriptions(?:\/([^/]+))?$/);
       if (pushSubscription) {
         const subject = requireHumanSubject(callerIdentity);
-        // Neither a browser's keys nor a phone's FCM token is read back: each is how the server reaches that device.
+        // Neither a browser's keys, a phone's FCM token nor a desktop's key is read back: each is how the server reaches that device.
         const shown = (device: PushSubscriptionRecord) => {
           const { userId: _userId, ...rest } = device;
           if (rest.kind === 'fcm') { const { token: _token, ...phone } = rest; return phone; }
+          if (rest.kind === 'desktop') { const { key: _key, ...desktop } = rest; return desktop; }
           const { keys: _keys, ...browser } = rest;
           return browser;
         };
@@ -4498,7 +4571,14 @@ export class Gateway {
             return this.json(res, 200, shown(await store.savePushSubscription(subject.userId,
               { kind: 'fcm', token, platform: b.platform, label: b.label, ...(b.replaces ? { replaces: b.replaces } : {}) })));
           }
-          if (b.kind !== undefined && b.kind !== 'web') return this.json(res, 400, { error: 'kind must be web or fcm' });
+          // A desktop app (wiki features/desktop-apps): reached over its own /ws connection while it runs.
+          if (b.kind === 'desktop') {
+            if (!this.deps.desktopPush) return this.json(res, 404, { error: 'Push to the desktop app is not available on this installation.' });
+            const key = typeof b.key === 'string' ? b.key : '';
+            if (!/^[A-Za-z0-9_-]{16,64}$/.test(key)) return this.json(res, 400, { error: 'key must be 16–64 letters, digits, - or _ that the app keeps' });
+            return this.json(res, 200, shown(await store.savePushSubscription(subject.userId, { kind: 'desktop', key, label: b.label })));
+          }
+          if (b.kind !== undefined && b.kind !== 'web') return this.json(res, 400, { error: 'kind must be web, fcm or desktop' });
           if (!this.deps.pushKeys) return this.json(res, 404, { error: 'Push notifications are not available on this installation.' });
           const endpoint = typeof b.endpoint === 'string' ? b.endpoint : '';
           if (endpoint.length > 2048 || !pushEndpointAllowed(endpoint))

@@ -5999,31 +5999,32 @@ export class Store {
       .run(newId('delivery'), inboxId, channel, at, at));
   }
 
-  /** Subscribe a device to a person's pushes. An endpoint (a browser) or an
-   * FCM token (a phone app) is one device: the same one subscribed again keeps
+  /** Subscribe a device to a person's pushes. An endpoint (a browser), an
+   * FCM token (a phone app) or a desktop app's key is one device: the same one subscribed again keeps
    * its row (fresh keys), and subscribed by someone else moves to them. A phone
    * whose token rotated names its previous row in `replaces`, which goes if it
    * is the caller's own. */
   async savePushSubscription(userId: string, input: PushSubscriptionInput, now = Date.now()): Promise<PushSubscriptionRecord> {
-    const native = 'kind' in input && input.kind === 'fcm';
-    const address = native ? input.token : input.endpoint;
-    const [p256dh, auth] = native ? ['', ''] : [input.keys.p256dh, input.keys.auth];
-    const platform = native ? input.platform : null;
+    const kind = input.kind ?? 'web';
+    // A desktop app's key, prefixed so it can never equal a browser endpoint or an FCM token.
+    const address = input.kind === 'fcm' ? input.token : input.kind === 'desktop' ? `desktop:${input.key}` : input.endpoint;
+    const [p256dh, auth] = input.kind === 'web' || input.kind === undefined ? [input.keys.p256dh, input.keys.auth] : ['', ''];
+    const platform = input.kind === 'fcm' ? input.platform : null;
     return this.db.transaction(async () => {
       (await this.db.lock(`push-subscription:${address}`));
-      if (native && input.replaces)
+      if (input.kind === 'fcm' && input.replaces)
         (await this.db.prepare('DELETE FROM push_subscriptions WHERE id=? AND userId=? AND endpoint<>?').run(input.replaces, userId, address));
       const existing = (await this.db.prepare('SELECT id, userId FROM push_subscriptions WHERE endpoint=?').get(address)) as PushSubscriptionRow | undefined;
       const label = input.label?.trim().slice(0, 80) || null;
       if (existing && String(existing.userId) === userId) {
         (await this.db.prepare('UPDATE push_subscriptions SET p256dh=?, auth=?, label=?, kind=?, platform=? WHERE id=?')
-          .run(p256dh, auth, label, native ? 'fcm' : 'web', platform, existing.id));
+          .run(p256dh, auth, label, kind, platform, existing.id));
         return (await this.pushSubscription(String(existing.id)))!;
       }
       if (existing) (await this.db.prepare('DELETE FROM push_subscriptions WHERE id=?').run(existing.id));
       const id = newId('push');
       (await this.db.prepare(`INSERT INTO push_subscriptions (id, userId, endpoint, p256dh, auth, label, createdAt, kind, platform)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, userId, address, p256dh, auth, label, now, native ? 'fcm' : 'web', platform));
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, userId, address, p256dh, auth, label, now, kind, platform));
       return (await this.pushSubscription(id))!;
     });
   }
@@ -12036,9 +12037,9 @@ type PushSubscriptionRow = Record<string, unknown>;
 function rowToPushSubscription(r: PushSubscriptionRow): PushSubscriptionRecord {
   const base = { id: String(r.id), userId: String(r.userId), ...(r.label ? { label: String(r.label) } : {}),
     createdAt: Number(r.createdAt), ...(r.lastPushedAt == null ? {} : { lastPushedAt: Number(r.lastPushedAt) }) };
-  return r.kind === 'fcm'
-    ? { ...base, kind: 'fcm', token: String(r.endpoint), platform: r.platform === 'ios' ? 'ios' : 'android' }
-    : { ...base, kind: 'web', endpoint: String(r.endpoint), keys: { p256dh: String(r.p256dh), auth: String(r.auth) } };
+  if (r.kind === 'fcm') return { ...base, kind: 'fcm', token: String(r.endpoint), platform: r.platform === 'ios' ? 'ios' : 'android' };
+  if (r.kind === 'desktop') return { ...base, kind: 'desktop', key: String(r.endpoint).replace(/^desktop:/, '') };
+  return { ...base, kind: 'web', endpoint: String(r.endpoint), keys: { p256dh: String(r.p256dh), auth: String(r.auth) } };
 }
 
 function rowToInbox(r: any): InboxItem {

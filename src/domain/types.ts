@@ -353,13 +353,22 @@ export interface NativePushDevice extends PushDeviceBase {
   platform: 'android' | 'ios';
 }
 
-/** One of a person's devices receiving push. */
-export type PushSubscriptionRecord = WebPushDevice | NativePushDevice;
+/** A desktop app (wiki features/desktop-apps): reached over the person's own
+ * `/ws` connections that announced this device's id, while the app runs. Its
+ * `key` is a random id the app keeps, so registering again keeps the row. */
+export interface DesktopPushDevice extends PushDeviceBase {
+  kind: 'desktop';
+  key: string;
+}
 
-/** What subscribing a device sends: a browser's subscription, or a phone's FCM token. */
+/** One of a person's devices receiving push. */
+export type PushSubscriptionRecord = WebPushDevice | NativePushDevice | DesktopPushDevice;
+
+/** What subscribing a device sends: a browser's subscription, a phone's FCM token, or a desktop app's key. */
 export type PushSubscriptionInput =
   | { kind?: 'web'; endpoint: string; keys: { p256dh: string; auth: string }; label?: string }
-  | { kind: 'fcm'; token: string; platform: 'android' | 'ios'; label?: string; replaces?: string };
+  | { kind: 'fcm'; token: string; platform: 'android' | 'ios'; label?: string; replaces?: string }
+  | { kind: 'desktop'; key: string; label?: string };
 
 export interface OrganizationIdentityPolicy {
   organizationId: string;
