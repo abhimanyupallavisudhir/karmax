@@ -1,10 +1,12 @@
 package io.tavya.app;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.net.Uri;
@@ -35,6 +37,12 @@ public class ManifestTest {
         for (ResolveInfo info : context.getPackageManager().queryIntentServices(intent.setPackage(context.getPackageName()), 0))
             names.add(info.serviceInfo.name);
         return names;
+    }
+
+    @Test
+    public void nothingGoesIntoBackups() {
+        // The WebView's signed-in session must not reach Google's backups or a new phone (store review notes, Data safety).
+        assertFalse((context.getApplicationInfo().flags & ApplicationInfo.FLAG_ALLOW_BACKUP) != 0);
     }
 
     @Test

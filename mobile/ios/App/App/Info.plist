@@ -29,14 +29,16 @@
 	<false/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<!-- Asked the first time someone taps the mic (App Review 5.1.1: say what it is for). -->
+	<!-- "Attach files" is a web file input: iOS offers Take Photo or Video there, and kills an app without this string. -->
+	<key>NSCameraUsageDescription</key>
+	<string>tavya uses the camera only when you take a photo or video to attach to a task.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Dictate messages to tavya.</string>
+	<string>tavya listens only while you dictate, to type what you say into a task or message.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Dictate messages to tavya.</string>
-	<key>UIBackgroundModes</key>
-	<array>
-		<string>remote-notification</string>
-	</array>
+	<string>Apple’s speech recognition turns what you dictate into text in tavya.</string>
+	<!-- No UIBackgroundModes: pushes to iPhone are alerts the system shows (src/collaboration/native-push.ts
+	     sends no content-available), so the app runs nothing in the background. -->
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

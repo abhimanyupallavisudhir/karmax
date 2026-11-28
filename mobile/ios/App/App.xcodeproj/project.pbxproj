@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		7A5A0000000000000000A002 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 7A5A0000000000000000A001 /* PrivacyInfo.xcprivacy */; };
+		7A5A0000000000000000A004 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 7A5A0000000000000000A003 /* PrivacyInfo.xcprivacy */; };
 		156F859504DDCEB6E3C7A968 /* TavyaIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 63E3A96AE0E67887D83847BA /* TavyaIntents.swift */; };
 		236C8A1E9E276AFC3631B009 /* ShareViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CCDAB9991AF55BC21964C7A0 /* ShareViewController.swift */; };
 		2FAD9763203C412B000D30F8 /* config.xml in Resources */ = {isa = PBXBuildFile; fileRef = 2FAD9762203C412B000D30F8 /* config.xml */; };
@@ -59,6 +61,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		7A5A0000000000000000A001 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		7A5A0000000000000000A003 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		1EF58EB0998D5F1BAE377033 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
 		2FAD9762203C412B000D30F8 /* config.xml */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = config.xml; sourceTree = "<group>"; };
 		4838C71C186BB2135CC15E21 /* ShareExtension.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = ShareExtension.entitlements; sourceTree = "<group>"; };
@@ -168,6 +172,7 @@
 				0FF1F11E5A7E4C0D9B1A0002 /* TavyaOfflineFilesPlugin.swift */,
 				84878673431CE7BAED6878F6 /* TavyaServer.swift */,
 				63E3A96AE0E67887D83847BA /* TavyaIntents.swift */,
+				7A5A0000000000000000A001 /* PrivacyInfo.xcprivacy */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -188,6 +193,7 @@
 				CCDAB9991AF55BC21964C7A0 /* ShareViewController.swift */,
 				A69D6952493A3887DA14E25A /* Info.plist */,
 				4838C71C186BB2135CC15E21 /* ShareExtension.entitlements */,
+				7A5A0000000000000000A003 /* PrivacyInfo.xcprivacy */,
 			);
 			name = ShareExtension;
 			path = ShareExtension;
@@ -288,6 +294,7 @@
 				50379B232058CBB4000EE86E /* capacitor.config.json in Resources */,
 				504EC30D1FED79650016851F /* Main.storyboard in Resources */,
 				2FAD9763203C412B000D30F8 /* config.xml in Resources */,
+				7A5A0000000000000000A002 /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -295,6 +302,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				7A5A0000000000000000A004 /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -195,7 +195,7 @@ describe('paid-launch policies', () => {
     expect(billing).toContain('files Git ignores (such as installed dependencies, build output and caches) and running processes are deleted and not restored');
     expect(JSON.stringify(policyDocument('billing'))).toContain('compute top-ups are charged when bought');
     // A changed disclosure is a new version: acceptance evidence names the text a person saw.
-    expect(policyDocument('billing')!.version).toBe('2026-11-28.1');
+    expect(policyDocument('billing')!.version).toBe('2026-11-28.2');
     expect(policyDocument('billing')!.effectiveDate).toBe('November 28, 2026');
   });
 
@@ -216,7 +216,30 @@ describe('paid-launch policies', () => {
     expect(dictation).toContain('tavya does not store the audio');
     const openRouter = (policyDocument('subprocessors')!.sections.flatMap((section) => section.bullets ?? [])).find((bullet) => bullet.startsWith('OpenRouter'))!;
     expect(openRouter).toContain('the audio of dictated phrases');
-    expect(privacy.version).toBe('2026-11-28.1');
+    expect(privacy.version).toBe('2026-11-28.2');
+  });
+
+  it('says what the desktop app and the apps’ offline copies keep, and names GitHub for desktop downloads (2026-11-28.2)', () => {
+    const privacy = policyDocument('privacy')!;
+    const section = (heading: string) => {
+      const found = privacy.sections.find((entry) => entry.heading === heading)!;
+      return [...found.paragraphs, ...(found.bullets ?? [])].join(' ');
+    };
+    const phones = section('Phone apps');
+    expect(phones).toContain('Available offline');
+    expect(phones).toContain('never included in the phone’s backups');
+    expect(phones).toContain('deleted when you sign out');
+    expect(phones).toContain('tavya is not told which files you keep');
+    const desktop = section('Desktop app');
+    expect(desktop).toContain('over the app’s own connection to tavya');
+    expect(desktop).toContain('the computer’s keychain');
+    expect(desktop).toContain('GitHub');
+    expect(desktop).toContain('no advertising, analytics or crash-reporting code');
+    expect(desktop).toContain('Available offline');
+    const github = (policyDocument('subprocessors')!.sections.flatMap((entry) => entry.bullets ?? [])).find((bullet) => bullet.startsWith('GitHub'))!;
+    expect(github).toContain('the desktop app’s installers and updates');
+    expect(github).toContain('IP address');
+    expect(privacy.version).toBe('2026-11-28.2');
   });
 
   it('states the free trial and the included model, as a new policy version (2026-11-06.1)', () => {

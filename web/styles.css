@@ -2750,6 +2750,8 @@ html[data-theme="dark"] .lp-light { display: none; }
 .docs-content .legal-document h1,.docs-content .legal-index h1,.docs-content .pricing-page h1 { margin-top:12px; }
 .docs-page { max-width:720px; color:var(--l-text); font-size:16px; line-height:1.7; }
 .docs-page h1 { color:var(--l-ink); }
+.download-shot { margin:20px 0 8px; }
+.download-shot img { width:100%; height:auto; border:1px solid var(--l-line); border-radius:calc(var(--r) + 4px); box-shadow:var(--l-frame-shadow); }
 .download-hero { display:flex; flex-wrap:wrap; align-items:center; gap:10px 16px; margin:20px 0 8px; }
 .docs-page .download-hero a.landing-start { color:var(--l-primary-ink); text-decoration:none; }
 .docs-page .download-hero span.landing-sign-in { color:var(--l-ink-3); cursor:default; }
@@ -5228,6 +5230,14 @@ pre.files-term-screen:focus { box-shadow: inset 0 0 0 2px var(--accent-weak); }
 .offline-meter { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: var(--fs-11); white-space: nowrap; }
 .offline-meter-bar { width: 56px; height: 4px; border-radius: 2px; background: var(--surface-2); overflow: hidden; }
 .offline-meter-bar span { display: block; height: 100%; background: var(--accent); }
+/* On a phone the bar wraps: the address keeps its words and the meter takes the next line;
+   the narrowest screens leave out a pin's project and folder so its name fits. */
+@media (max-width: 720px) {
+  .offline-view .files-bar { flex-wrap: wrap; row-gap: 6px; }
+  .offline-view .files-address { flex: 1 1 8em; min-width: 8em; }
+  .offline-view .offline-meter { margin-left: auto; }
+}
+@media (max-width: 480px) { .offline-view .offline-pin-meta { display: none; } }
 .offline-limit { height: 26px; padding: 0 6px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); color: var(--ink-2); font: inherit; }
 .offline-pill { display: inline-flex; align-items: center; height: 26px; padding: 0 10px; border-radius: 999px; background: var(--working-weak); color: var(--working); font-weight: 500; }
 .offline-keep-dialog { width: min(420px, calc(100vw - 32px)); display: flex; flex-direction: column; gap: 10px; }
