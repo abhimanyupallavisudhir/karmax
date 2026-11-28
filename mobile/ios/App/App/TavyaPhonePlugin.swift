@@ -26,8 +26,9 @@ public class TavyaPhonePlugin: CAPPlugin, CAPBridgedPlugin {
 
     @objc func takeShare(_ call: CAPPluginCall) {
         guard let share = ShareInbox.oldest() else { return call.resolve(["share": NSNull()]) }
-        call.resolve(["share": ["id": share.id, "text": share.text,
-                                "files": share.files.map { ["name": $0.name, "type": $0.type, "size": $0.size] }]])
+        let files: [[String: Any]] = share.files.map { file -> [String: Any] in ["name": file.name, "type": file.type, "size": file.size] }
+        let shared: [String: Any] = ["id": share.id, "text": share.text, "files": files]
+        call.resolve(["share": shared])
     }
 
     @objc func readShareFile(_ call: CAPPluginCall) {
@@ -99,6 +100,7 @@ enum TavyaLinks {
     }
 
     private static func post(_ url: URL) {
-        NotificationCenter.default.post(name: .capacitorOpenURL, object: ["url": url as NSURL, "options": [String: Any]()])
+        let opened: [String: Any] = ["url": url as NSURL, "options": [String: Any]()]
+        NotificationCenter.default.post(name: .capacitorOpenURL, object: opened)
     }
 }
