@@ -93,7 +93,7 @@ describe.skipIf(!runnable)('offline files in the desktop app', () => {
     await page.reload();
     await page.waitForFunction(() => !!navigator.serviceWorker.controller);
     await page.locator('.offline-view .files-row').first().waitFor();
-    await expect.poll(() => page.evaluate(async () => (await (await caches.open('tavya-shell-v1')).keys()).some((request: Request) => request.url.endsWith('/app.js'))), { timeout: 15_000 }).toBe(true);
+    await expect.poll(() => page.evaluate(async () => (await (await (globalThis as any).caches.open('tavya-shell-v1')).keys()).some((request: { url: string }) => request.url.endsWith('/app.js'))), { timeout: 15_000 }).toBe(true);
     await f.server.close();
     await page.reload();
     await page.locator('.offline-shell .files-row', { hasText: 'guide.md' }).waitFor();
