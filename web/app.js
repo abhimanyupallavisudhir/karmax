@@ -4995,6 +4995,11 @@ async function checkConsoleRevision() {
   if (document.hidden) return false;
   try {
     const meta = await api('/api/meta');
+    // Where forms may save is the server's to say: a deploy may have changed it.
+    if (S.meta && meta.messageForms && JSON.stringify(meta.messageForms) !== JSON.stringify(S.meta.messageForms)) {
+      S.meta.messageForms = meta.messageForms;
+      if (S.selected && document.querySelector('#ck-thread .ask-form-problem')) scheduleTaskPageRender();
+    }
     if (consoleRevisionChanged(S.meta?.consoleRevision, meta.consoleRevision)) {
       // A form this console refused may be one the new console shows (formProblemHtml).
       if (!S.consoleOutdated) {
@@ -15296,49 +15301,54 @@ function renderAgentMessageBody(text, v = S.view, math = mathjaxEnabled(), form 
 // it had been typed. A form is answered when a later reply of the person's
 // reads as its answer (messageFormStates): the conversation is the record.
 //
-// A form with `save` first makes that request from this browser, as the person
-// and with their authority (so it can only change what they could change in
-// Settings), then tells the agent it was saved and where. It may only write
-// settings (SETTINGS_TARGETS), and a secret field only into the write-only
-// secret field of a secret store, as a whole value: a secret typed into a form
-// is never shown in the conversation, kept in its history or read back.
-const FORM_BLOCK = /<pre class="md-code lang-form"><code>([\s\S]*?)<\/code><\/pre>/g;
-const SECRET_FIELD_KEY = /^(?:value|secret|secrets|key|apiKey|api_key|managementKey|token|password|clientSecret|privateKey|totp|serviceAccount)$/i;
-// [method, path, what it is (from the path's ids and the body), a secret store?]
-const SETTINGS_TARGETS = [
-  ['POST', /^\/api\/projects\/([^/]+)\/secrets$/, (m, b) => `${formLiteral(b.name) ? `${b.name} · ` : ''}${formProjectName(m[1])} secrets`, true],
-  ['PUT', /^\/api\/projects\/([^/]+)\/environment$/, (m) => `${formProjectName(m[1])} environment`],
-  ['PATCH', /^\/api\/projects\/([^/]+)$/, (m) => `${formProjectName(m[1])} settings`],
-  ['PUT', /^\/api\/settings\/project\/([^/]+)\/[^/]+$/, (m) => `${formProjectName(m[1])} task defaults`],
-  ['PUT', /^\/api\/settings\/managed-compute\/([^/]+)$/, (m) => `Managed compute · ${formProviderName(m[1])}`, true],
-  ['PUT', /^\/api\/settings\/native-push$/, () => 'Phone apps · Firebase key', true],
-  ['PUT', /^\/api\/settings\/included-model$/, () => 'Managed compute · Included model', true],
-  ['POST', /^\/api\/settings\/model-gateways$/, () => 'Managed compute · Model gateways', true],
-  ['PUT', /^\/api\/settings\/model-gateways\/[^/]+$/, () => 'Managed compute · Model gateways', true],
-  ['PUT', /^\/api\/settings\/generation-providers\/[^/]+$/, () => 'Managed compute · Generation', true],
-  ['PUT', /^\/api\/settings\/oauth-apps\/[^/]+$/, () => 'Sign-in apps', true],
-  ['PUT', /^\/api\/settings\/[\w/-]+$/, () => 'Installation settings'],
-  ['PATCH', /^\/api\/organizations\/([^/]+)$/, (m) => `${formOrganizationName(m[1])} settings`],
-  ['POST', /^\/api\/organizations\/([^/]+)\/accounts$/, (m) => `${formOrganizationName(m[1])} agent accounts`, true],
-  ['PATCH', /^\/api\/organizations\/([^/]+)\/accounts\/keys\/[^/]+\/[^/]+$/, (m) => `${formOrganizationName(m[1])} agent accounts`, true],
-  ['PUT', /^\/api\/organizations\/([^/]+)\/world-providers\/([^/]+)$/, (m) => `${formProviderName(m[2])} computers · ${formOrganizationName(m[1])}`, true],
-  ['POST', /^\/api\/organizations\/([^/]+)\/storage$/, (m) => `${formOrganizationName(m[1])} storage`, true],
-  ['POST', /^\/api\/vault\/items$/, (m, b) => `Passwords${formLiteral(b.label) ? ` · ${b.label}` : ''}`, true],
-  ['POST', /^\/api\/mcp$/, (m, b) => `MCP servers${formLiteral(b.label) ? ` · ${b.label}` : ''}`, true],
-  ['PUT', /^\/api\/connections\/config$/, () => 'App connections', true],
-  ['PATCH', /^\/api\/user\/preferences$/, () => 'Your preferences'],
-];
+// A form with `save` is saved by the server as the person, with their
+// authority (POST /api/message-forms/save: so it can only change what they
+// could change in Settings), then the agent is told it was saved and where.
+// Where a form may save is the server's list (src/domain/message-forms.ts,
+// served in /api/meta), which this console draws forms by: only settings, and a
+// secret field only into the write-only secret field of a secret store, as a
+// whole value — a secret typed into a form is never shown in the conversation,
+// kept in its history or read back. The server checks forms when an agent sends
+// them, and marks one it could not refuse (a ```form-refused fence: its reason,
+// then its source).
+const FORM_BLOCK = /<pre class="md-code lang-form(-refused)?"><code>([\s\S]*?)<\/code><\/pre>/g;
+/** The server's save targets, compiled (once per list it serves). */
+function formSaveTargets() {
+  const policy = S.meta?.messageForms;
+  if (formSaveTargets.policy !== policy || !formSaveTargets.compiled) {
+    formSaveTargets.policy = policy;
+    formSaveTargets.compiled = (policy?.targets || []).map((target) => {
+      const [method, route] = String(target.route).split(' ');
+      const source = String(route).split('/').map((segment) => segment === '*' ? '[\\w/-]+'
+        : segment.startsWith(':') ? `(?<${segment.slice(1)}>[^/?]+)` : segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('/');
+      return { ...target, method, pattern: new RegExp(`^${source}$`) };
+    });
+    formSaveTargets.secretKey = new RegExp(policy?.secretKeys?.length ? `^(?:${policy.secretKeys.join('|')})$` : '(?!)', 'i');
+  }
+  return formSaveTargets.compiled;
+}
 function formLiteral(value) { return typeof value === 'string' && value && !value.includes('{{'); }
 function formProjectName(id) { const p = projectById(decodeURIComponent(id)); return p ? p.name : 'Project'; }
 function formOrganizationName(id) { return organizationById(decodeURIComponent(id))?.name || 'Organization'; }
 function formProviderName(id) { return S.meta?.worldProviders?.find?.((p) => p.id === id)?.label || id; }
+/** A target's label for these path ids and body: `{project}` → its name, `{body.x}` → a literal x, `[…]` only when all of it is known. */
+function formTargetLabel(label, params, body) {
+  const names = { project: formProjectName, organization: formOrganizationName, provider: formProviderName };
+  const value = (key) => key.startsWith('body.') ? (formLiteral(body?.[key.slice(5)]) ? body[key.slice(5)] : '')
+    : params[key] ? (names[key] ? names[key](params[key]) : params[key]) : '';
+  return String(label).replace(/\[([^\]]*)\]|\{([\w.]+)\}/g, (_, part, key) => {
+    if (key) return value(key);
+    let missing = false;
+    const filled = part.replace(/\{([\w.]+)\}/g, (__, inner) => value(inner) || (missing = true, ''));
+    return missing ? '' : filled;
+  });
+}
 
 /** Where a form's `save` writes, in words, and whether it may hold secrets — or null when a form may not write there. */
 function settingsTarget(save) {
-  const path = save.path.split('?')[0];
-  for (const [method, pattern, describe, secret] of SETTINGS_TARGETS) {
-    const match = save.method === method && pattern.exec(path);
-    if (match) return { label: describe(match, save.body || {}), secret: !!secret };
+  for (const target of formSaveTargets()) {
+    const match = save.method === target.method && target.pattern.exec(save.path);
+    if (match) return { label: formTargetLabel(target.label, match.groups || {}, save.body || {}), secret: !!target.secret };
   }
   return null;
 }
@@ -15348,12 +15358,13 @@ function formSecretLeak(form, target) {
   const secrets = new Set(form.fields.filter((field) => field.type === 'secret').map((field) => field.name));
   if (!secrets.size) return '';
   if (!target.secret) return 'This form would save a secret where it can be read back, so it was not shown.';
+  formSaveTargets();
   let leak = '';
   const walk = (value, key) => {
     if (typeof value === 'string') {
       for (const [, name] of value.matchAll(/\{\{\s*([\w.-]+)\s*\}\}/g)) {
         if (!secrets.has(name)) continue;
-        if (!/^\{\{\s*[\w.-]+\s*\}\}$/.test(value) || !SECRET_FIELD_KEY.test(String(key))) leak = 'This form would save a secret where it can be read back, so it was not shown.';
+        if (!/^\{\{\s*[\w.-]+\s*\}\}$/.test(value) || !formSaveTargets.secretKey.test(String(key))) leak = 'This form would save a secret where it can be read back, so it was not shown.';
       }
     } else if (Array.isArray(value)) value.forEach((item) => walk(item, key));
     else if (value && typeof value === 'object') Object.entries(value).forEach(([k, item]) => walk(item, k));
@@ -15372,20 +15383,28 @@ function decodeHtml(html) {
 function withMessageForms(html, ctx, v = S.view) {
   if (!html.includes('lang-form')) return html;
   let index = 0;
-  return html.replace(FORM_BLOCK, (block, code) => {
+  return html.replace(FORM_BLOCK, (block, refused, code) => {
+    // One the server refused when the agent said it: its reason, then its source.
+    if (refused) {
+      const [reason, ...source] = decodeHtml(code).split('\n');
+      return formProblemHtml(reason, `<pre class="md-code"><code>${esc(source.join('\n'))}</code></pre>`, 'server');
+    }
     const at = index++;
     const key = `${v?.taskId || 'task'}/${ctx?.key || 'message'}/${at}`;
-    const parsed = KarmaxMarkdown.parseForm(decodeHtml(code));
-    const target = parsed.form?.save ? settingsTarget(parsed.form.save) : null;
-    const problem = parsed.error || (parsed.form.save && !target ? 'This form would change something outside settings, so it was not shown.' : '')
-      || (target ? formSecretLeak(parsed.form, target) : '');
+    const source = decodeHtml(code);
+    const parsed = KarmaxMarkdown.parseForm(source);
     // The agent's mistake stays readable: what went wrong, with its source folded.
-    if (problem) return formProblemHtml(problem, block);
+    if (parsed.error) return formProblemHtml(parsed.error, block, 'console');
+    const target = parsed.form.save ? settingsTarget(parsed.form.save) : null;
+    const problem = (parsed.form.save && !target ? 'This form would change something outside settings, so it was not shown.' : '')
+      || (target ? formSecretLeak(parsed.form, target) : '');
+    if (problem) return formProblemHtml(problem, block, 'policy');
     const form = parsed.form;
     const live = !!ctx?.live && !ctx.answered?.has(at) && !S.answeredForms?.has(key);
-    // What wireMessageForms submits: the form as read, by its key on the page —
-    // with what it asks, when the conversation has moved on since it was asked.
-    if (live) (S.formSpecs ||= new Map()).set(key, ctx.moved ? { ...form, quote: formSubject(form) } : form);
+    // What wireMessageForms submits: the form as read (and its source, for the
+    // server to save from), by its key on the page — with what it asks, when the
+    // conversation has moved on since it was asked.
+    if (live) (S.formSpecs ||= new Map()).set(key, { ...form, source, ...(ctx.moved ? { quote: formSubject(form) } : {}) });
     const secret = form.fields.some((field) => field.type === 'secret');
     const note = target ? `${secret ? ICON.lock : ''}<span>${secret ? 'Saved to' : 'Saves to'} <b>${esc(target.label)}</b>${secret ? ', not into the conversation' : ''}</span>` : '';
     return KarmaxMarkdown.renderForm(form, { key, live, values: S.formDrafts?.[key] || {}, note, error: S.formErrors?.[key] || '' });
@@ -15393,14 +15412,17 @@ function withMessageForms(html, ctx, v = S.view) {
 }
 
 /**
- * A form this console will not show. A tab opened before a deploy runs the
- * console of then, which refuses what the current one shows — a settings
- * target added since (#1060: "the form did not load"). So a refusal asks
- * whether a newer console is out, and once one is, offers it instead.
+ * A form this console will not show, and whose verdict that is (`by`): the
+ * server's when the agent sent it ('server') or by the server's list of targets
+ * ('policy'), else this console's own reading ('console'). Only the last can be
+ * a console out of date — a tab opened before a deploy, whose code reads forms
+ * as then (#1060: "the form did not load"): so it asks whether a newer console
+ * is out, and once one is, offers it instead. A refusal by the list re-reads the
+ * list (checkConsoleRevision), which a deploy may have changed.
  */
-function formProblemHtml(problem, block) {
-  if (S.consoleOutdated) return `<div class="ask-form-problem outdated" role="status"><span>This form needs the latest ${esc(siteName())}.</span><button type="button" class="btn sm primary" data-reload-console>Reload</button></div>`;
-  if (Date.now() - formRevisionCheckedAt > 30_000) { formRevisionCheckedAt = Date.now(); setTimeout(checkConsoleRevision); }
+function formProblemHtml(problem, block, by) {
+  if (by === 'console' && S.consoleOutdated) return `<div class="ask-form-problem outdated" role="status"><span>This form needs the latest ${esc(siteName())}.</span><button type="button" class="btn sm primary" data-reload-console>Reload</button></div>`;
+  if (by !== 'server' && Date.now() - formRevisionCheckedAt > 30_000) { formRevisionCheckedAt = Date.now(); setTimeout(checkConsoleRevision); }
   return `<details class="ask-form-problem"><summary>${esc(problem)}</summary>${block}</details>`;
 }
 let formRevisionCheckedAt = 0;
@@ -15511,18 +15533,6 @@ function messageFormAnswer(form, values, target) {
   return quoted(`${lines.join('\n')}${target ? `\n\nSaved to ${target.label}.` : ''}`);
 }
 
-/** `{{name}}` in a save's body → that field's value (a whole "{{name}}" keeps the value's type). */
-function fillFormTemplate(body, values) {
-  if (typeof body === 'string') {
-    const whole = /^\{\{\s*([\w.-]+)\s*\}\}$/.exec(body);
-    if (whole) return values[whole[1]] ?? '';
-    return body.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (_, name) => values[name] == null ? '' : String(values[name]));
-  }
-  if (Array.isArray(body)) return body.map((item) => fillFormTemplate(item, values));
-  if (body && typeof body === 'object') return Object.fromEntries(Object.entries(body).map(([key, item]) => [key, fillFormTemplate(item, values)]));
-  return body;
-}
-
 function wireMessageForms(root, v) {
   S.formDrafts ||= {};
   S.formErrors ||= {};
@@ -15555,7 +15565,7 @@ function wireMessageForms(root, v) {
       try {
         if (form.save) {
           try {
-            await api(form.save.path, { method: form.save.method, body: JSON.stringify(fillFormTemplate(form.save.body, values)) });
+            await api('/api/message-forms/save', { method: 'POST', body: JSON.stringify({ form: form.source, values }) });
           } catch (error) {
             throw Object.assign(error, { formMessage: `Not saved: ${plainError(error)}` });
           }

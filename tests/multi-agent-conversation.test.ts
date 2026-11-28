@@ -370,14 +370,45 @@ describe('software-dev 1.27: one conversation, several agents (real Temporal + g
     await handle.result();
   });
 
+  it('shows a bad form in a final message as refused, and tells the agent at its next turn', async () => {
+    const repo = await h.makeRepo('refused-form');
+    const taskId = newId('task');
+    const bad = '{"fields":[{"name":"who"}],"save":{"path":"/api/organizations/o/members"}}';
+    const handle = await start(taskId, input({ taskId, repo, title: 'Refused form',
+      prompt: `Start.\n@say Who should own it?\\n\\n\`\`\`form\\n${bad}\\n\`\`\`\n@incomplete` }));
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('human');
+    const asked = (await view(handle)).messages.filter((m: any) => m.role === 'agent').at(-1);
+    expect(asked.text).toBe(`Who should own it?\n\n\`\`\`form-refused\nForm not shown: save POST /api/organizations/o/members isn't an allowed settings route.\n${bad}\n\`\`\``);
+    await handle.signal('followUp', { id: 'u-1', role: 'user', author: 'user:ann', ts: Date.now(), text: 'Me.\n@heardlast\n@incomplete' });
+    await expect.poll(async () => (await view(handle)).messages.filter((m: any) => m.role === 'agent').length, { timeout: 20_000 }).toBe(2);
+    expect((await view(handle)).messages.at(-1).text).toContain("(Your last message's form was not shown to anyone (the form: save POST /api/organizations/o/members isn't an allowed settings route; allowed: POST /api/projects/:project/secrets,");
+    // Told once.
+    await handle.signal('followUp', { id: 'u-2', role: 'user', author: 'user:ann', ts: Date.now(), text: 'And?\n@heardlast\n@incomplete' });
+    await expect.poll(async () => (await view(handle)).messages.filter((m: any) => m.role === 'agent').length, { timeout: 20_000 }).toBe(3);
+    expect((await view(handle)).messages.at(-1).text).not.toContain('form was not shown');
+    await handle.signal('cancel');
+    await handle.result();
+  });
+
   it('escalating a pending request redirects it to other people without interrupting the task', async () => {
     const repo = await h.makeRepo('redirect');
     const taskId = newId('task');
     const handle = await start(taskId, input({ taskId, repo, title: 'Redirect', prompt: 'Which colour?\n@incomplete' }));
     await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('human');
-    await handle.signal('reroute', { audience: ['user:bea'], detail: 'Bea knows the brand colours.' });
+    const agentTurns = authored(await view(handle)).filter((a: string) => a === 'do').length;
+    // The asking agent's new wording is said in the conversation, once, waking nobody.
+    const reworded = { id: 'ask-reworded', role: 'agent', author: 'do', to: ['user:bea'], text: 'Bea knows the brand colours.', ts: Date.now() };
+    await handle.signal('reroute', { audience: ['user:bea'], detail: 'Bea knows the brand colours.', message: reworded });
     await expect.poll(async () => (await view(handle)).waitingFor, { timeout: 10_000 })
       .toMatchObject({ kind: 'human', audience: ['user:bea'], detail: 'Bea knows the brand colours.' });
+    await handle.signal('reroute', { audience: ['user:bea'], detail: 'Bea knows the brand colours.', message: { ...reworded, id: 'ask-again' } });
+    await handle.signal('reroute', { audience: ['user:bea'], detail: 'Bea knows the brand colours.', message: reworded });
+    await expect.poll(async () => (await view(handle)).messages.filter((m: any) => m.text === reworded.text), { timeout: 10_000 })
+      .toEqual([expect.objectContaining({ id: 'ask-reworded', role: 'agent', author: 'do', to: ['user:bea'] })]);
+    const said = await view(handle);
+    expect(said.status).toBe('waiting');
+    expect(authored(said).filter((a: string) => a === 'do')).toHaveLength(agentTurns + 1);
+    expect(said.agentTurn?.state).not.toBe('running');
     await handle.signal('followUp', { id: 'u-answer', role: 'user', author: 'user:bea', ts: Date.now(), text: 'Blue.' });
     await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
     await handle.signal('cancel');

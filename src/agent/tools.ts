@@ -6,6 +6,7 @@ import { MAX_REVIEW_TEXT_LENGTH, ReviewInfoRejected, validateReviewInfoCall } fr
 import { World } from '../world/types.js';
 import { continuedReply } from '../domain/forks.js';
 import { applicableSubTaskActions } from '../domain/sub-task-responses.js';
+import { assertMessageForms } from '../domain/message-forms.js';
 import { readWorldFilePrefix } from '../world/file-prefix.js';
 import { startJob, jobStatuses, describeJobs, listJobs, stopJobs, MAX_JOB_NAME } from '../world/jobs.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
@@ -1235,6 +1236,8 @@ export function platformToolHandlers(
     const message = args?.message === undefined ? undefined : String(args.message).trim();
     if (message !== undefined && !message) throw new Error('message must not be empty');
     if (message && [...message].length > 4_000) throw new Error('message must be at most 4000 characters');
+    // A form nobody would be shown is refused here, saying why (wiki features/message-forms).
+    if (message) assertMessageForms(message);
     let audience: string[] | undefined;
     if (args?.audience !== undefined) {
       audience = [...new Set((Array.isArray(args.audience) ? args.audience : [args.audience])

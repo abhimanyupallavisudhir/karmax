@@ -1066,6 +1066,30 @@ describe('task stage transitions', () => {
       expect.objectContaining({ signal: 'subtaskRedirected', args: [{ childTaskId: child.id }] })]);
   });
 
+  /** A redirect changed only the wait's text: its new wording now goes into the
+   * conversation too, as the asking agent's, addressed to the people asked
+   * (the workflow says it once and wakes nobody: multi-agent-conversation). */
+  it('says a redirected question\'s new wording in the conversation, as its agent\'s', async () => {
+    const f = (await fixture());
+    const task = (await f.store.createTask({ projectId: f.project.id, title: 'Shared', workflow: 'software-dev',
+      workflowVersion: '1.27.0', createdBy: { kind: 'user', userId: 'test' }, params: { prompt: 'work', base: 'main', target: 'main' } }));
+    const waiting: TaskView = { ...f.view, taskId: task.id, status: 'waiting', waitingFor: { kind: 'human', audience: ['@creator'], detail: 'Which colour?' },
+      participants: [{ key: 'do', label: 'Agent', role: 'do', state: 'idle', messages: 1 }] };
+    (await f.store.saveView(task.id, waiting));
+    f.setLiveView(waiting);
+    const agent = (await f.tokens.mint({ taskId: task.id, profileId: 'do', role: 'do',
+      principal: `task-agent:${task.id}:do`, projectId: f.project.id, ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] })).token;
+    (await f.api.escalateToHuman(agent, { audience: ['user:test'], message: 'You chose the brand: which colour?' }));
+    const [reroute] = f.signalled.filter((s) => s.id === task.id);
+    expect(reroute).toMatchObject({ signal: 'reroute', args: [{ audience: ['user:test'], detail: 'You chose the brand: which colour?',
+      message: { role: 'agent', author: 'do', to: ['user:test'], text: 'You chose the brand: which colour?', id: expect.stringMatching(/^ask-/) } }] });
+    // Someone else redirecting it (a person, a parent's agent) speaks for nobody in this conversation.
+    const person = (await f.tokens.mintPrincipal('user:test', ['*'])).token;
+    (await f.api.escalateToHuman(person, { taskId: task.id, audience: ['@creator'], message: 'Over to the creator.' }));
+    expect(f.signalled.filter((s) => s.id === task.id).at(-1)!.args[0]).not.toHaveProperty('message');
+    f.setLiveView(undefined);
+  });
+
   it('rejects an escalation to a missing audience and prevents an agent escalating another task', async () => {
     const f = (await fixture());
     const agentToken = (await f.tokens.mint({

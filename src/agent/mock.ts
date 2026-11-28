@@ -66,6 +66,7 @@ import { readFileSync } from 'node:fs';
  *   @sleep <ms>                     await, but abort promptly if cancelled (tests mid-turn cancel)
  *   @heard                          report the conversation this turn was handed, one
  *                                   `role: first line` entry per message (shared conversations)
+ *   @heardlast                      report the newest message this turn was handed, in full
  *   @instructed <text>              report whether this turn's system prompt contains <text>
  *   @say <markdown>                 the turn's reply (\n decoded); replaces the directive log
  *   @summary <text>                 the completion summary Review shows (default: none)
@@ -469,6 +470,9 @@ export class MockAdapter implements AgentAdapter {
         }
         case 'instructed':
           outputs.push(`${input.systemPrompt.includes(rest) ? 'instructed' : 'not instructed'}: ${rest}`);
+          break;
+        case 'heardlast':
+          outputs.push(`heard last: ${input.messages.at(-1)?.text ?? ''}`);
           break;
         case 'heard':
           outputs.push(`heard: ${input.messages.map((m) => `${m.role}: ${m.text.split('\n')[0]}`).join(' | ')}`);
