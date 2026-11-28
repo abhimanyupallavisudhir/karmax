@@ -128,12 +128,19 @@ describe('a task without a computer, in the console', () => {
     await page.keyboard.press('Escape');
     await expect.poll(() => dialog.count()).toBe(0);
 
+    const tasksBefore = (await allTasks()).length;
     await ask.click();
     await dialog.waitFor();
+    expect(await dialog.locator('button[value="submit"]').getAttribute('title')).toMatch(/^Ask \((Ctrl\+|⌘)↵\)$/);
     const box = dialog.locator('textarea');
     expect(await box.evaluate((element) => element === (globalThis as any).document.activeElement)).toBe(true);
-    await box.fill('Turn on Codex for this project');
+    await box.fill('Turn on Codex for this');
+    // Enter is a new line, never a send (three half-finished questions went that way); ⌘/Ctrl+Enter asks.
     await box.press('Enter');
+    expect(await box.inputValue()).toBe('Turn on Codex for this\n');
+    expect(await allTasks()).toHaveLength(tasksBefore);
+    await box.fill('Turn on Codex for this project');
+    await box.press('ControlOrMeta+Enter');
     let created: Awaited<ReturnType<typeof allTasks>>[number] | undefined;
     await expect.poll(async () => {
       created = (await allTasks()).find((task) => task.params?.prompt === 'Turn on Codex for this project');
@@ -161,7 +168,7 @@ describe('a task without a computer, in the console', () => {
     await ask.click();
     await dialog.waitFor();
     await dialog.locator('textarea').fill('And what about E2B?');
-    await dialog.locator('textarea').press('Enter');
+    await dialog.locator('textarea').press('ControlOrMeta+Enter');
     await expect.poll(async () => (await allTasks()).find((task) => task.params?.prompt === 'And what about E2B?')?.projectId,
       { timeout: 15_000 }).toBe(coordinator.id);
     expect((await store.listProjects()).filter((p) => p.coordinator)).toHaveLength(1);
@@ -183,7 +190,7 @@ describe('a task without a computer, in the console', () => {
       await dialog.waitFor();
       expect(await dialog.locator('.ask-where .info-dot').getAttribute('title')).toMatch(/CEO/);
       await dialog.locator('textarea').fill('Plan the quarter');
-      await dialog.locator('textarea').press('Enter');
+      await dialog.locator('textarea').press('ControlOrMeta+Enter');
       let ceo: Awaited<ReturnType<typeof allTasks>>[number] | undefined;
       await expect.poll(async () => {
         ceo = (await allTasks()).find((task) => task.params?.coordinator && task.title === 'CEO (Organization Co-ordinator)');
@@ -272,6 +279,86 @@ describe('a task without a computer, in the console', () => {
     await page.evaluate(() => (globalThis as any).__speech.at(-1).onresult({ results: [Object.assign([{ transcript: 'today stop listening' }], { isFinal: true })] }));
     expect(await mic.getAttribute('aria-pressed')).toBe('false');
     expect(await dialog.locator('textarea').inputValue()).toBe('what waits on me today');
+    expect(errors).toEqual([]);
+    await context.close();
+  });
+
+  it('Ask keeps what is typed or dictated, through closing it, a reload and a failed send, until an Ask goes through', async () => {
+    const context = await browser.newContext({ serviceWorkers: 'block', viewport: { width: 1280, height: 1000 } });
+    await context.addInitScript(() => {
+      const w = globalThis as any;
+      w.__speech = [];
+      w.SpeechRecognition = w.webkitSpeechRecognition = class {
+        started = false; onresult: any; onend: any; onerror: any; lang = ''; interimResults = false; continuous = true;
+        constructor() { w.__speech.push(this); }
+        start() { this.started = true; }
+        stop() { if (!this.started) return; this.started = false; this.onend?.(); }
+      };
+    });
+    const page = await context.newPage();
+    const errors: string[] = [];
+    page.on('pageerror', (error) => errors.push(error.message));
+    const dialog = page.locator('dialog.ask-dialog');
+    const box = dialog.locator('textarea');
+    // KARMAX_SHOTS=dir: the steps, one frame each (the review's GIF).
+    let frame = 0;
+    const shot = async () => { if (process.env.KARMAX_SHOTS) await page.screenshot({ path: path.join(process.env.KARMAX_SHOTS, `ask-draft-${String(++frame).padStart(2, '0')}.png`) }); };
+    const reopen = async () => {
+      if (await dialog.count()) { await page.keyboard.press('Escape'); await expect.poll(() => dialog.count()).toBe(0); }
+      await page.locator('#rail-ask').click();
+      await dialog.waitFor();
+    };
+    await page.goto(`${base}/personal/assistant`);
+    await reopen();
+    expect(await box.inputValue()).toBe('');
+    await box.pressSequentially('Half a thought');
+    await box.press('Enter'); // a new line, not a send
+    await box.pressSequentially('and a second line');
+    await shot();
+    // Closed and opened again, it is all there, the caret where it stopped.
+    await reopen();
+    expect(await box.inputValue()).toBe('Half a thought\nand a second line');
+    expect(await box.evaluate((el: any) => [el.selectionStart, el.value.length])).toEqual([32, 32]);
+    await shot();
+
+    // Dictation saves as it types: a reload while still listening keeps the words heard.
+    await dialog.locator('[data-mic]').click();
+    await page.evaluate(() => (globalThis as any).__speech.at(-1).onresult({ results: [Object.assign([{ transcript: 'about billing' }], { isFinal: true })] }));
+    expect(await box.inputValue()).toBe('Half a thought\nand a second line about billing');
+    await shot();
+    await page.reload();
+    await reopen();
+    expect(await box.inputValue()).toBe('Half a thought\nand a second line about billing');
+    await shot();
+
+    // A send that fails keeps the text, open or reopened.
+    let refused = 0;
+    await page.route('**/api/organizations/*/ask', (route) => { refused++; return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'Down for a moment' }) }); });
+    await box.press('ControlOrMeta+Enter');
+    await expect.poll(() => refused).toBe(1);
+    await expect.poll(() => dialog.locator('button[value="submit"]').isDisabled()).toBe(false);
+    expect(await box.inputValue()).toBe('Half a thought\nand a second line about billing');
+    await shot();
+    await page.reload();
+    await reopen();
+    expect(await box.inputValue()).toBe('Half a thought\nand a second line about billing');
+
+    // Once an Ask goes through, the draft is gone.
+    await page.unroute('**/api/organizations/*/ask');
+    await box.press('ControlOrMeta+Enter');
+    await expect.poll(async () => (await allTasks()).some((task) => task.params?.prompt === 'Half a thought\nand a second line about billing'),
+      { timeout: 15_000 }).toBe(true);
+    await expect.poll(() => dialog.count(), { timeout: 10_000 }).toBe(0);
+    await shot();
+    // Its page opens: a follow-up typed there is kept through a reload as well (the same drafts).
+    const followup = page.locator('.followup-input');
+    await expect.poll(() => page.evaluate(() => (globalThis as any).document.activeElement?.classList.contains('followup-input')), { timeout: 10_000 }).toBe(true);
+    await followup.pressSequentially('One more thing');
+    await page.reload();
+    await expect.poll(() => followup.inputValue(), { timeout: 10_000 }).toBe('One more thing');
+    await reopen();
+    expect(await box.inputValue()).toBe('');
+    await shot();
     expect(errors).toEqual([]);
     await context.close();
   });

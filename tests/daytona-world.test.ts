@@ -73,7 +73,7 @@ describe('Daytona cloud world provider', () => {
       id: 'daytona-secret-id', state: 'started',
       process: {
         async executeCommand(command) {
-          if (command.includes('find . -type f')) return { exitCode: 0, result: 'a.txt\n' };
+          if (command.includes('find . -name .karmax-injection -prune -o -type f')) return { exitCode: 0, result: 'a.txt\n' };
           if (command.includes("'printf'")) return { exitCode: 0, result: 'hello' };
           if (command.includes('rev-parse')) return { exitCode: 0, result: `${'a'.repeat(40)}\n` };
           return { exitCode: 0, result: '' };

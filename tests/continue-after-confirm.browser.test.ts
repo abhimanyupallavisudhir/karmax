@@ -52,7 +52,7 @@ it('Continue on a finished task opens the task that carries its agent on', async
     const send = page.locator('.followup-box[data-role="do"] .followup-send');
     await send.waitFor();
     expect((await send.textContent())?.trim()).toBe('Continue');
-    expect(await send.getAttribute('title')).toBe('The approved PR lands as it is. The agent carries on in a new task.');
+    expect(await send.getAttribute('title')).toMatch(/^Continue \((Ctrl\+|⌘)↵\): the approved PR lands as it is; the agent carries on in a new task\.$/);
     await page.locator('.followup-box[data-role="do"] .followup-input').fill('Now make the retry wait visible');
     const screenshots = process.env.KARMAX_SCREENSHOT_DIR;
     if (screenshots) await page.screenshot({ path: path.join(screenshots, 'continue-after-confirm.png') });

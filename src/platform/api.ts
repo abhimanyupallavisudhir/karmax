@@ -1,5 +1,6 @@
 import * as __asyncCollections from '../util/async-collections.js';
 import { CEO_KEY } from '../domain/coordinator.js';
+import { cleanedReviewFiles } from '../domain/changed-files.js';
 import { withSpendResolutions } from './spend-review.js';
 import { autonomyRoute, projectAutonomy, setUpAutonomy } from './autonomous-projects.js';
 import type { AutonomyScope, ProjectAutonomy } from '../domain/autonomous-projects.js';
@@ -4280,6 +4281,9 @@ export class KarmaxApi {
     const enrich = async (view: TaskView | undefined): Promise<TaskView | undefined> => {
       if (!view) return view;
       view = await this.deps.store.withPendingReviewInfoAsync(taskId, view);
+      // A list built before tavya's own files were left out (wiki incidents/lessons).
+      const reviewInfo = cleanedReviewFiles(view.reviewInfo);
+      if (reviewInfo !== view.reviewInfo) view = { ...view, reviewInfo };
       view = await withSpendResolutions(this.deps.store, taskId, view);
       if (computerResizable(view) && !(view.editableParams ?? []).includes('computer'))
         view = { ...view, editableParams: [...(view.editableParams ?? []), 'computer'] };

@@ -7635,8 +7635,10 @@ export class Gateway {
       if (widgetsMatch && method === 'GET') {
         const id = widgetsMatch[1]!;
         const t = (await store.getTask(id));
-        const view = (await api.getTaskView(token, id).catch(liveViewUnavailable)) ?? t?.lastView;
-        if (!t || !view) return this.json(res, 200, []);
+        const live = (await api.getTaskView(token, id).catch(liveViewUnavailable)) ?? t?.lastView;
+        if (!t || !live) return this.json(res, 200, []);
+        const { cleanedReviewFiles } = await import('../domain/changed-files.js');
+        const view = { ...live, reviewInfo: cleanedReviewFiles(live.reviewInfo) };
         const { resolveWidgets } = await import('../contrib/widgets.js');
         const slot = (url.searchParams.get('slot') ?? 'task-detail') as any;
         const groups = this.deps.contributions

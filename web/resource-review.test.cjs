@@ -40,7 +40,7 @@ function setup(api) {
     checkoutsSection: () => '', renderWidgetGroups: () => '', notesSection: () => '',
     conversationApprovalRequests: () => '', conversationPullRequestAsks: () => '', taskTranscripts: () => [{ role: 'do' }],
     parametersTab: () => 'parameters', timingTab: () => 'timing', micButtonHtml: () => '',
-    narrowViewport: () => false,
+    narrowViewport: () => false, messageDraft: () => '', SEND_KEYS: 'meta+Enter', fmtKeys: String,
   });
   vm.runInContext(`${freshness}\n${tabs}\n${wire}`, context);
   for (const name of ['humanWaitDetail', 'conversationTextKey', 'conversationInputRequest', 'safeHref', 'contentKey', 'conversationError', 'reviewActionBtn', 'conversationReviewInfo', 'conversationFullscreenButton', 'hasMessageForm', 'agentEntryText', 'personMessageText', 'messageFormsIn', 'formSubject', 'answersForm', 'messageFormStates', 'conversationEntryKey', 'conversationFoldHtml', 'loadForkHistory', 'inheritedConversationHtml', 'conversationSearchKey', 'conversationSearchOpen', 'conversationSearchBar', 'pendingMessagesHtml', 'followupPlaceholder', 'earlierMessagesHtml', 'loadingEarlierMessages', 'conversationPane', 'messageOrigin', 'conversationOutline', 'foldDuration', 'foldPreview', 'conversationFoldHead', 'liveOutputFor', 'formEntryKey', 'formContext', 'withMessageForms', 'renderConversationEntry', 'presenceDetail', 'waitTitle', 'conversationWaitNotice']) {

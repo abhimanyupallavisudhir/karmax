@@ -56,7 +56,10 @@ describe('the none world provider (a task without a computer)', () => {
     await world.writeFile('.karmax-injection/attachments/a.txt', 'hello');
     const reopened = await registry.open(world.handle);
     expect(await reopened.readFile('.karmax-injection/attachments/a.txt')).toBe('hello');
-    expect(await reopened.listFiles()).toEqual(['.karmax-injection/attachments/a.txt']);
+    // tavya's own files are never the task's work (src/domain/changed-files.ts).
+    expect(await reopened.listFiles()).toEqual([]);
+    await reopened.writeFile('answer.md', 'done');
+    expect(await reopened.listFiles()).toEqual(['answer.md']);
     await expect(reopened.writeFile('../escape.txt', 'x')).rejects.toThrow();
     await reopened.destroy();
     expect(fs.existsSync(world.handle.root)).toBe(false);

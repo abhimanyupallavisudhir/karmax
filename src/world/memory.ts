@@ -8,6 +8,7 @@ import { World, WorldHandle, WorldProvider, WorldSpec, ExecOptions, ExecResult, 
 import { openLocalPty, startLocalProcess } from './local-execution.js';
 import { readRegularFilePrefix, regularFileSize } from './file-prefix.js';
 import { taskBranch } from '../domain/brand.js';
+import { PLATFORM_DIR } from '../domain/changed-files.js';
 
 const pexec = promisify(execFile);
 
@@ -99,7 +100,7 @@ class MemoryWorld implements World {
     const walk = (dir: string, prefix: string) => {
       for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
         const rel = prefix ? `${prefix}/${e.name}` : e.name;
-        if (e.isDirectory()) walk(path.join(dir, e.name), rel);
+        if (e.isDirectory()) { if (e.name !== PLATFORM_DIR) walk(path.join(dir, e.name), rel); }
         else out.push(rel);
       }
     };
