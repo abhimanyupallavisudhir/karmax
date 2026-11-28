@@ -2,6 +2,8 @@ import type { AuthorizationSelection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
 import { CAPABILITIES, type Capability } from './capabilities.js';
+import type { DecisionMaker } from './decision-maker.js';
+import { ConflictError } from './errors.js';
 import type { Via } from './sub-task-asks.js';
 
 export interface PermissionRequest {
@@ -40,6 +42,8 @@ export interface PermissionRequest {
   task?: { id: string; num?: number; title: string; projectId: string };
   /** The tasks in `taskRecipients`, projected the same way. */
   grantorTasks?: Array<{ id: string; num?: number; title: string; projectId: string }>;
+  /** Who decided it or took it back, in words (decision-maker.ts); projected, never persisted. */
+  decidedBy?: DecisionMaker;
 }
 
 /** Before PL-8 every request of an organization lived in this one blob. */
@@ -280,7 +284,7 @@ export class PermissionRequests {
     return this.store.transaction(async () => {
     const request = (await this.lockedRequest(requestId));
     if (!request) throw new Error(`no permission request ${requestId}`);
-    if (request.status !== 'pending') throw new Error(`request ${requestId} is already ${request.status}`);
+    if (request.status !== 'pending') throw new ConflictError(`request ${requestId} is already ${request.status}`);
     (await this.assertUnclaimed(requestId, input.claim));
     if (input.action === 'approve' && !input.alreadyAuthorized) (await this.extend(request.taskId, request.role, request.capabilities));
     request.status = input.action === 'approve' ? 'granted' : 'denied';
@@ -305,7 +309,7 @@ export class PermissionRequests {
     return this.store.transaction(async () => {
       const request = (await this.lockedRequest(id));
       if (!request) throw new Error(`no permission request ${id}`);
-      if (request.status !== 'pending') throw new Error(`request ${id} is already ${request.status}`);
+      if (request.status !== 'pending') throw new ConflictError(`request ${id} is already ${request.status}`);
       if (!input.recipients.length && !input.avatarRecipients.length) throw new Error('choose at least one person, team, or Avatar');
       request.audience = [...new Set([...request.audience, ...input.audience])];
       request.recipients = [...new Set(input.recipients)];
@@ -323,7 +327,7 @@ export class PermissionRequests {
     return this.store.transaction(async () => {
     const request = (await this.lockedRequest(id));
     if (!request) throw new Error(`no permission request ${id}`);
-    if (request.status !== 'pending') throw new Error(`request ${id} is already ${request.status}`);
+    if (request.status !== 'pending') throw new ConflictError(`request ${id} is already ${request.status}`);
     (await this.assertUnclaimed(id, claim));
     request.dismissed ??= { by, at: Date.now() };
     (await this.save(request));
