@@ -14,6 +14,13 @@ const REPLY = Symbol('reply');
 
 const launch = () => chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH || undefined, args: ['--no-sandbox'] });
 
+/** Where a message form may save: the server's own list (src/domain/message-forms.ts), as /api/meta serves it. */
+let formPolicy;
+const messageFormPolicy = () => formPolicy ??= JSON.parse(require('node:child_process').execFileSync(process.execPath,
+  ['--experimental-strip-types', '--no-warnings', '--input-type=module', '-e',
+    `const m = await import(${JSON.stringify(path.join(__dirname, '..', '..', 'src', 'domain', 'message-forms.ts'))}); process.stdout.write(JSON.stringify(m.messageFormPolicy()))`],
+  { encoding: 'utf8' }));
+
 /** An answer other than 200 JSON, e.g. `reply(503, { error: 'Search temporarily unavailable' })`. */
 const reply = (status, json) => ({ [REPLY]: true, status, json });
 
@@ -31,7 +38,7 @@ async function fakeConsole(context, { origin = 'http://console.test', project, t
   const organization = { id: project.organizationId, name: 'Organization', slug: 'org' };
   const byId = (p, suffix = '') => tasks.find((task) => p === `/api/tasks/${task.id}${suffix}`);
   const defaults = (p) => {
-    if (p === '/api/meta') return { siteName: 'Fixture', hostLocal: true, consoleRevision: 'one', agent: { provider: 'mock' }, worldProviders: [] };
+    if (p === '/api/meta') return { siteName: 'Fixture', hostLocal: true, consoleRevision: 'one', agent: { provider: 'mock' }, worldProviders: [], messageForms: messageFormPolicy() };
     if (p === '/api/launch') return {};
     if (p === '/api/session') return { authenticated: true, user: { id: 'u', name: 'Tester' } };
     if (p === '/api/settings/installation') return { canManage: false };
@@ -105,4 +112,4 @@ function conversationWindowApi(taskId, current) {
   };
 }
 
-module.exports = { conversationWindowApi, fakeConsole, launch, reply, taskView };
+module.exports = { messageFormPolicy, conversationWindowApi, fakeConsole, launch, reply, taskView };

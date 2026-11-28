@@ -44,6 +44,7 @@ import {
 import { templateContent, templateName, templateParams, templateAuthorization } from '../domain/task-templates.js';
 import { derivedTaskTitle, isDerivedTaskTitle } from '../domain/task-title.js';
 import { landsByPushOnTavya } from '../domain/hosted-repository.js';
+import { assertMessageForms } from '../domain/message-forms.js';
 import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget, type Avatar, type InheritedConversation, type TaskCreatedVia, type TaskCreator, type ConfirmConfig } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries,
   normalizeFollowUpTriggers, validateFollowUpTriggers, followUpTriggerSummary, followUpsAfterFiring, taskUnstarted, type FollowUpTrigger, type TaskTrigger, isTrigger } from '../domain/triggers.js';
@@ -5291,6 +5292,8 @@ export class KarmaxApi {
     args: { taskId?: string; audience: string[]; message: string; urgency?: Urgency },
   ): Promise<TaskView> {
     const caller = (await this.require(token, 'escalate_to_human'));
+    // A form nobody would be shown is refused here, saying why (wiki features/message-forms).
+    assertMessageForms(String(args.message ?? ''));
     const taskId = args.taskId ?? (caller.taskId !== '*' ? caller.taskId : undefined);
     if (!taskId) throw new Error('taskId is required for a non-task caller');
     const task = (await this.deps.store.getTask(taskId));
@@ -5351,8 +5354,12 @@ export class KarmaxApi {
       return { ...view, note: `Passed ${passing.count === 1 ? 'its request' : `its ${passing.count} requests`} on to ${audience.join(', ')}.` } as TaskView;
     }
     if (redirect) {
+      // The task's own agent rewording the question: its new words are said in
+      // the conversation too (once, waking nobody), as the first asking was.
+      const message: Message | undefined = caller.taskId === taskId ? { id: `ask-${randomUUID()}`, role: 'agent', text: detail, ts: Date.now(),
+        author: caller.participant && isParticipantKey(caller.participant) ? caller.participant : MAIN_AGENT, to: audience } : undefined;
       await (await this.workflowHandle(taskId)).signal('reroute', { audience: audience.filter((selector) => !selector.startsWith('avatar:')).length
-        ? audience : [...audience, '@creator'], detail });
+        ? audience : [...audience, '@creator'], detail, ...(message ? { message } : {}) });
       held = { ...view, waitingFor: { ...view.waitingFor!, kind: 'human', audience, detail } };
       // A sub-task's question passed on to people no longer waits on its parent,
       // which would otherwise keep being prompted to answer it (#454).
@@ -7589,6 +7596,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
   async notify(token: string, args: { to?: string[]; message: string; urgency?: Urgency; agents?: AgentSpec[] }): Promise<{ message?: Message; notified: string[] }> {
     const caller = (await this.require(token, 'notify'));
     if (!caller.taskId || caller.taskId === '*') throw new ValidationError('notify is for a task agent; use POST /api/tasks/:id/messages');
+    assertMessageForms(String(args.message ?? ''));
     if (!args.to?.length && !args.agents?.length) throw new ValidationError('notify needs at least one recipient');
     const agents: Record<string, AgentSpec> = {};
     if (args.agents?.length) {

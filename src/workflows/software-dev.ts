@@ -192,8 +192,11 @@ const turnPreparation = proxyActivities<TurnPreparationActivities>({
 // (and the other single-agent workflows) keep working unchanged.
 export const followUpSignal = defineSignal<[Message, string?]>('followUp');
 /** Escalate: redirect the request this task is waiting on to other people
- * (v1.27). A Responder agent's own escalation takes effect when its turn ends. */
-export const rerouteSignal = defineSignal<[{ audience: string[]; detail?: string }]>('reroute');
+ * (v1.27). A Responder agent's own escalation takes effect when its turn ends.
+ * `message`: the new wording, said in the conversation as its author's own (the
+ * task's agent rewording its question); histories before it carry none, so
+ * their replay is unchanged. */
+export const rerouteSignal = defineSignal<[{ audience: string[]; detail?: string; message?: Message }]>('reroute');
 /** Stop one agent, like Ctrl+C (v1.27): its turn ends now — working, or still
  * waiting for a credential, host capacity, a retry or people — or, if it is
  * only queued, it does not run. The task goes on; a stopped main agent waits
@@ -2200,11 +2203,25 @@ async function softwareDevImpl(
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'followUp', role };
   });
-  setHandler(rerouteSignal, async ({ audience, detail }) => {
+  setHandler(rerouteSignal, async ({ audience, detail, message }) => {
     if (!multiAgent || !Array.isArray(audience) || !audience.length) return;
-    if (runningParticipant === 'responder') { pendingReroute = { audience: [...audience], ...(detail ? { detail } : {}) }; return; }
+    // A redirect's new wording is said in the conversation, once: addressed to
+    // the people asked, it wakes no agent, and its author has seen its own words.
+    const say = () => whenLoaded(() => {
+      if (!message?.text?.trim() || msgs.some((m) => m.id === message.id)) return;
+      if (msgs.findLast((m) => m.role === 'agent')?.text.trim() === message.text.trim()) return;
+      const caughtUp = !mainUnread();
+      msgs.push({ ...message, role: 'agent', ts: message.ts || Date.now() });
+      if (caughtUp && messageAuthor(message) === MAIN_AGENT) seen = msgs.length;
+    });
+    if (runningParticipant === 'responder') {
+      pendingReroute = { audience: [...audience], ...(detail ? { detail } : {}) };
+      say();
+      return;
+    }
     if (waitingFor?.kind !== 'human' && waitingFor?.kind !== 'parent') return;
     waitingFor = { ...waitingFor, kind: 'human', audience: [...audience], ...(detail ? { detail } : {}) };
+    say();
     await publish();
   });
   setHandler(stopAgentSignal, async ({ key, by, byLabel }) => {

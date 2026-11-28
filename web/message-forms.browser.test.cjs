@@ -8,7 +8,7 @@
 const assert = require('node:assert/strict');
 const shots = process.env.FORMS_SCREENSHOTS;
 if (shots) require('node:fs').mkdirSync(shots, { recursive: true });
-const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
+const { fakeConsole, launch, messageFormPolicy } = require('../tests/helpers/fake-console.cjs');
 
 const T0 = Date.now() - 3600_000;
 const fence = (spec) => `\`\`\`form\n${JSON.stringify(spec, null, 2)}\n\`\`\``;
@@ -106,8 +106,10 @@ const outside = `${fence({ fields: [{ name: 'who' }], save: { method: 'POST', pa
       await form.getByLabel('Client secret').fill('GOCSPX-secret');
       await form.locator('.ask-submit').click();
       await page.waitForFunction(() => !document.querySelector('#ck-thread form.ask-form.live'));
+      // The server saves it from the form as the agent wrote it, checked against its own list.
       assert.deepEqual(sent.map((s) => [s.path, s.body]), [
-        ['/api/settings/oauth-apps/accounts.google.com', { clientId: '2442-x.apps.googleusercontent.com', clientSecret: 'GOCSPX-secret' }],
+        ['/api/message-forms/save', { form: googleClientAsk.match(/```form\n([\s\S]*?)\n```/)[1],
+          values: { clientId: '2442-x.apps.googleusercontent.com', clientSecret: 'GOCSPX-secret' } }],
         ['/api/tasks/t/messages', { text: '- Client ID: 2442-x.apps.googleusercontent.com\n- Client secret: saved\n\nSaved to Sign-in apps.', to: ['agent:do'] }],
       ], 'saved first, then the answer to the agent');
       assert.ok(!(await page.locator('#ck-thread').innerText()).includes('GOCSPX'), 'the secret is on no page');
@@ -136,17 +138,44 @@ const outside = `${fence({ fields: [{ name: 'who' }], save: { method: 'POST', pa
       await done.context.close();
     }
 
-    // ── a console older than the server offers the current one, not a dead end ──
+    // ── where a form may save is the server's list, read again after a deploy ──
     {
-      // A target this console does not know, as Sign-in apps was to the owner's tab.
-      const unknown = fence({ title: 'Google OAuth client for tavya', fields: [{ name: 'clientSecret', label: 'Client secret', type: 'secret' }],
+      // A target added by a deploy after this tab opened, as Sign-in apps was to #1060's owner.
+      const added = fence({ title: 'Google OAuth client for tavya', fields: [{ name: 'clientSecret', label: 'Client secret', type: 'secret' }],
         save: { method: 'PUT', path: '/api/settings/sign-in-apps/accounts.google.com', body: { clientSecret: '{{clientSecret}}' } } });
+      const policy = messageFormPolicy();
+      const deployed = { ...policy, targets: [{ route: 'PUT /api/settings/sign-in-apps/:app', label: 'Sign-in apps', secret: true }, ...policy.targets] };
       let metaReads = 0;
-      const { context, page, errors } = await open([{ id: 'a1', role: 'agent', text: unknown, ts: T0 }], 'light', { api: (p) => p === '/api/meta'
-        ? { siteName: 'Fixture', hostLocal: true, consoleRevision: ++metaReads === 1 ? 'one' : 'two', agent: { provider: 'mock' }, worldProviders: [] } : undefined });
+      const { context, page, errors } = await open([{ id: 'a1', role: 'agent', text: added, ts: T0 }], 'light', { api: (p) => p === '/api/meta'
+        ? { siteName: 'Fixture', hostLocal: true, consoleRevision: 'one', agent: { provider: 'mock' }, worldProviders: [],
+          messageForms: ++metaReads === 1 ? policy : deployed } : undefined });
+      // Refused by the list this tab was given; the list read again shows it, with no reload.
+      const form = page.locator('#ck-thread form.ask-form.live');
+      await form.waitFor();
+      assert.match(await form.locator('.ask-note').innerText(), /Saved to Sign-in apps, not into the conversation/);
+      assert.equal(await page.locator('#ck-thread .ask-form-problem').count(), 0);
+      assert.ok(metaReads >= 2);
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    // ── an out-of-date console offers the current one, but only for a form it cannot read ──
+    {
+      // A form of a shape a newer console reads; this one finds no fields in it.
+      const newer = fence({ title: 'Pick one', steps: [{ fields: [{ name: 'x' }] }] });
+      let metaReads = 0;
+      const refused = '```form-refused\nForm not shown: save POST /api/organizations/o/members isn\'t an allowed settings route.\n{"fields":[{"name":"who"}],"save":{"path":"/api/organizations/o/members"}}\n```';
+      const { context, page, errors } = await open([{ id: 'a1', role: 'agent', text: newer, ts: T0 }, { id: 'a2', role: 'agent', text: `Or:\n\n${refused}`, ts: T0 + 1 }], 'light',
+        { api: (p) => p === '/api/meta' ? { siteName: 'Fixture', hostLocal: true, consoleRevision: ++metaReads === 1 ? 'one' : 'two',
+          agent: { provider: 'mock' }, worldProviders: [], messageForms: messageFormPolicy() } : undefined });
       const outdated = page.locator('#ck-thread .ask-form-problem.outdated');
       await outdated.waitFor();
       assert.equal(await outdated.innerText(), 'This form needs the latest Fixture.\nReload');
+      // A form the server refused when the agent said it is never "out of date": it says why.
+      const told = page.locator('#ck-thread details.ask-form-problem:not(.outdated)');
+      assert.equal(await told.count(), 1);
+      assert.equal(await told.locator('summary').innerText(), "Form not shown: save POST /api/organizations/o/members isn't an allowed settings route.");
+      assert.match(await told.locator('pre').textContent(), /^\{"fields":\[\{"name":"who"\}\]/);
       if (shots) { await outdated.scrollIntoViewIfNeeded(); await page.screenshot({ path: `${shots}/form-outdated-console.png` }); }
       const reloaded = page.waitForEvent('load');
       await outdated.getByRole('button', { name: 'Reload' }).click();
@@ -212,8 +241,9 @@ const outside = `${fence({ fields: [{ name: 'who' }], save: { method: 'POST', pa
       await form.getByLabel('OpenAI API key').fill('sk-live-123');
       await page.locator('#ck-thread form.ask-form.live .ask-submit').click();
       await page.waitForFunction(() => !document.querySelector('#ck-thread form.ask-form.live'));
-      assert.deepEqual(sent.map((s) => s.path), ['/api/projects/p/secrets', '/api/tasks/t/signal'], 'saved first, then the reply');
-      assert.deepEqual(sent[0].body, { name: 'OPENAI_API_KEY', value: 'sk-live-123' });
+      assert.deepEqual(sent.map((s) => s.path), ['/api/message-forms/save', '/api/tasks/t/signal'], 'saved first, then the reply');
+      assert.deepEqual(JSON.parse(sent[0].body.form).save, { method: 'POST', path: '/api/projects/p/secrets', body: { name: 'OPENAI_API_KEY', value: '{{key}}' } });
+      assert.deepEqual(sent[0].body.values, { key: 'sk-live-123' });
       assert.equal(signals(sent)[0].text, '- OpenAI API key: saved\n\nSaved to OPENAI_API_KEY · Workspace secrets.');
       assert.ok(!JSON.stringify(signals(sent)).includes('sk-live'), 'the secret is not in the reply');
       assert.ok(!(await page.locator('#ck-thread').innerText()).includes('sk-live'), 'nor on the page');
@@ -229,8 +259,9 @@ const outside = `${fence({ fields: [{ name: 'who' }], save: { method: 'POST', pa
       await form.getByLabel('OpenRouter management key').fill('sk-or-v1-mgmt');
       await form.locator('.ask-submit').click();
       await page.waitForFunction(() => !document.querySelector('#ck-thread form.ask-form.live'));
-      assert.deepEqual(sent.map((s) => s.path), ['/api/settings/included-model', '/api/tasks/t/signal']);
-      assert.deepEqual(sent[0].body, { managementKey: 'sk-or-v1-mgmt' });
+      assert.deepEqual(sent.map((s) => s.path), ['/api/message-forms/save', '/api/tasks/t/signal']);
+      assert.equal(JSON.parse(sent[0].body.form).save.path, '/api/settings/included-model');
+      assert.deepEqual(sent[0].body.values, { key: 'sk-or-v1-mgmt' });
       assert.ok(!JSON.stringify(signals(sent)).includes('sk-or'), 'the secret is not in the reply');
       assert.deepEqual(errors, []);
       await context.close();
@@ -239,7 +270,7 @@ const outside = `${fence({ fields: [{ name: 'who' }], save: { method: 'POST', pa
     // ── a refused save says why, keeps the form, and sends nothing ──
     {
       const { context, page, sent } = await open([{ id: 'a1', role: 'agent', text: secure, ts: T0 }]);
-      await context.route('http://console.test/api/projects/p/secrets', (route) => route.fulfill({ status: 403, json: { error: 'denied: project:secret:write' } }));
+      await context.route('http://console.test/api/message-forms/save', (route) => route.fulfill({ status: 403, json: { error: 'denied: project:secret:write' } }));
       const form = page.locator('#ck-thread form.ask-form.live');
       await form.getByLabel('OpenAI API key').fill('sk-live-123');
       await form.locator('.ask-submit').click();
