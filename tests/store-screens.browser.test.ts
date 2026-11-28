@@ -228,7 +228,14 @@ async function forgetDrafts() {
       if (!(task.title in demo.tasks)) await g.store.deleteTask(task.id);
 }
 
-const settle = (page: Page) => page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+/** Two frames painted, then every finite animation and transition (dialogs' and forms' fade-in) finished. */
+const settle = (page: Page) => page.evaluate(async () => {
+  await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  type Running = { effect: { getComputedTiming(): { iterations?: number } } | null; finished: Promise<unknown> };
+  const animations: Running[] = (document as unknown as { getAnimations(): Running[] }).getAnimations();
+  const finite = animations.filter((animation) => animation.effect?.getComputedTiming().iterations !== Infinity);
+  await Promise.all(finite.map((animation) => animation.finished.catch(() => undefined)));
+});
 
 /** Each scene: get the page to it; the shot follows. */
 const scenes: Record<string, (page: Page, platform: Platform) => Promise<void>> = {
@@ -420,7 +427,6 @@ it('shoots every store scene from the demo organization', async () => {
         for (const [index, scene] of SCENES.entries()) {
           await scenes[scene]!(page, device.platform);
           await settle(page);
-          await page.waitForTimeout(350); // dialogs' and forms' fade-in
           const screen = await page.screenshot();
           expect(screen.length, `${device.id} ${scene}`).toBeGreaterThan(10_000);
           if (device.id === 'android/phone' && scene === 'for-me') androidHome = screen;
@@ -446,7 +452,6 @@ it('shoots every store scene from the demo organization', async () => {
           if (dark && scene !== 'for-me') continue;
           await go(page);
           await settle(page);
-          await page.waitForTimeout(350);
           const screen = await page.screenshot();
           expect(screen.length, `desktop ${scene}`).toBeGreaterThan(10_000);
           if (!OUT) continue;
