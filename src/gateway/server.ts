@@ -141,6 +141,7 @@ import { ensureProjectWikiRemote, moveProjectWikiToGithub } from '../wiki/projec
 import { worldRepos, worldWorkingDirectory, worldWorkingRelativePath, type WorldHandle } from '../world/types.js';
 import { enumerateCredentials, normalizePolicy, resolveCredentials } from '../platform/credentials.js';
 import { clientWentAway, errorStatus } from './error-status.js';
+import { decidedText, withDecisionMaker } from '../platform/decision-maker.js';
 import { defaultAgentProfile, projectReadiness, usableAgentCredentials, type ReadinessDeps } from '../platform/readiness.js';
 import { errorReporter, reportError, reportFromPerson } from '../platform/error-reports.js';
 import { errorReportSettings, saveErrorReportSettings } from '../platform/error-fixer.js';
@@ -1309,7 +1310,7 @@ export class Gateway {
     const task = (await this.deps.store.getTask(request.taskId));
     const project = task && (await this.deps.store.getProject(task.projectId));
     if (!task || project?.organizationId !== organizationId) return request;
-    return { ...request, task: { id: task.id, ...(task.num != null ? { num: task.num } : {}),
+    return { ...(await withDecisionMaker(this.deps.store, request)), task: { id: task.id, ...(task.num != null ? { num: task.num } : {}),
       title: task.title, projectId: task.projectId } };
   }
 
@@ -7081,8 +7082,8 @@ export class Gateway {
             action,
           }));
         } catch (error) {
-          return this.json(res, error instanceof CapabilityError ? 403 : 400,
-            { error: error instanceof Error ? error.message : String(error) });
+          // 403 not routed to you, 404 no such request, 409 already decided.
+          return this.json(res, errorStatus(error, 400), { error: error instanceof Error ? error.message : String(error) });
         }
       }
       if (p === '/api/agent/collaboration/request' && method === 'POST') {
@@ -8741,6 +8742,9 @@ export class Gateway {
           const action = String(b.action ?? '');
           if (!['once', 'task', 'always', 'deny', 'dismiss'].includes(action)) return this.json(res, 400, { error: 'action must be once | task | always | deny | dismiss' });
           const asking = (await vault.requests()).find((candidate) => candidate.id === vres[1]);
+          // Decided already: that is the answer, before whether this caller could have.
+          if (asking && asking.status !== 'pending')
+            return this.json(res, 409, { error: `credential request ${asking.id} was already ${await decidedText(store, asking)}; nothing to do` });
           const unwritable = (await this.refusal(token, 'credential:write', requestedScope));
           if (unwritable) {
             const parentDeclines = action === 'deny' && !!callerTaskId && !!asking
