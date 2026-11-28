@@ -124,8 +124,41 @@ export function isPartsCapture(capture: ResticCapture | PartsCapture): capture i
 }
 
 /** A resource's repository in one storage location ({@link repositoryName}). */
-/** One entry of a snapshot directory (`ResticResources.entries`). */
-export interface SnapshotEntry { name: string; type: 'dir' | 'file' | 'symlink' | 'other'; size?: number; linkTarget?: string; modifiedAt?: number }
+/** One entry of a snapshot directory (`ResticResources.entries`, `tree`).
+ * From a tree, a file also has `identity` (its content: `contentIdentity`)
+ * and a folder `tree` (its own tree's id). */
+export interface SnapshotEntry { name: string; type: 'dir' | 'file' | 'symlink' | 'other'; size?: number; linkTarget?: string; modifiedAt?: number;
+  identity?: string; tree?: string }
+
+/** What a file holds, as restic stores it: a digest of its content blobs'
+ * ids (each the SHA-256 of a chunk). The same bytes give the same identity in
+ * every snapshot, whatever their metadata (wiki features/offline-files). */
+export function contentIdentity(content: readonly string[]): string {
+  return crypto.createHash('sha256').update(`restic-content\n${content.join('\n')}`).digest('hex').slice(0, 40);
+}
+
+/** Trees and snapshots never change: read once per process, kept by id. */
+const TREE_CACHE = 4_000;
+const treeCache = new Map<string, Promise<SnapshotEntry[] | undefined>>();
+const snapshotTrees = new Map<string, Promise<string>>();
+function cached<T>(cache: Map<string, Promise<T>>, key: string, read: () => Promise<T>): Promise<T> {
+  const known = cache.get(key);
+  if (known) { cache.delete(key); cache.set(key, known); return known; }
+  const pending = read();
+  pending.catch(() => cache.delete(key));
+  if (cache.size >= TREE_CACHE) cache.delete(cache.keys().next().value!);
+  cache.set(key, pending);
+  return pending;
+}
+/** restic's tree JSON as entries. */
+function treeEntries(stdout: string): SnapshotEntry[] {
+  const nodes = (JSON.parse(stdout).nodes ?? []) as Array<Record<string, any>>;
+  return nodes.map((node) => ({ name: String(node.name), type: node.type === 'dir' || node.type === 'file' || node.type === 'symlink' ? node.type : 'other',
+    ...(node.type === 'file' ? { size: Number(node.size ?? 0), identity: contentIdentity(Array.isArray(node.content) ? node.content : []) } : {}),
+    ...(node.type === 'dir' && typeof node.subtree === 'string' ? { tree: node.subtree } : {}),
+    ...(node.type === 'symlink' && typeof node.linktarget === 'string' ? { linkTarget: node.linktarget } : {}),
+    ...(node.mtime ? { modifiedAt: Date.parse(node.mtime) } : {}) }));
+}
 export interface Repository { attachment: ResourceAttachment; storageLocationId?: string; name: string }
 
 export interface ChangeSet { files: Map<string, '+' | 'M' | '-'>; removedDirectories: string[]; addedDirectories: string[] }
@@ -568,6 +601,43 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
         ...(node.mtime ? { modifiedAt: Date.parse(node.mtime) } : {}) });
     }
     return entries;
+  }
+
+  /** The id of a snapshot's root tree. */
+  snapshotTree(repository: Repository, snapshot: string): Promise<string> {
+    return cached(snapshotTrees, `${repository.name}\n${snapshot}`, async () => {
+      const run = await this.onHost(repository, 'read', false, ['cat', '--no-lock', 'snapshot', snapshot], { key: 'host' });
+      if (run.code !== 0) throw resticFailure(run, 'reading the resource');
+      const tree = JSON.parse(run.stdout).tree;
+      if (typeof tree !== 'string') throw new Error('reading the resource failed: a snapshot without a tree');
+      return tree;
+    });
+  }
+
+  /** What one tree holds (`restic cat blob`): each file with its content
+   * identity, each folder with its tree's id. A tree is immutable, so a new
+   * snapshot that left a folder alone costs nothing to read again. */
+  tree(repository: Repository, id: string): Promise<SnapshotEntry[]> {
+    if (!/^[0-9a-f]{64}$/.test(id)) return Promise.reject(new Error('reading the resource failed: not a tree id'));
+    return cached(treeCache, `${repository.name}\n${id}`, async () => {
+      const run = await this.onHost(repository, 'read', false, ['cat', '--no-lock', 'blob', id], { key: 'host' });
+      if (run.code !== 0) throw resticFailure(run, 'reading the resource');
+      return treeEntries(run.stdout);
+    }) as Promise<SnapshotEntry[]>;
+  }
+
+  /** What the folder `dir` of a snapshot holds (`restic cat tree`, one run
+   * however deep), as `tree` gives it; none when nothing (or a file) is there. */
+  treeAt(repository: Repository, snapshot: string, dir: string): Promise<SnapshotEntry[] | undefined> {
+    const at = dir.replace(/^\/+|\/+$/g, '');
+    return cached(treeCache, `${repository.name}\n${snapshot}\n${at}`, async () => {
+      const run = await this.onHost(repository, 'read', false, ['cat', '--no-lock', 'tree', at ? `${snapshot}:/${at}` : snapshot], { key: 'host' });
+      if (run.code !== 0) {
+        if (/: not (?:a directory|found)\s*$/m.test(run.stderr)) return undefined;
+        throw resticFailure(run, 'reading the resource');
+      }
+      return treeEntries(run.stdout);
+    }) as Promise<SnapshotEntry[] | undefined>;
   }
 
   /** One file of a snapshot, streamed as it is decrypted (`restic dump`).

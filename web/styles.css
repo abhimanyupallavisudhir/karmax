@@ -5211,3 +5211,30 @@ pre.files-term-screen:focus { box-shadow: inset 0 0 0 2px var(--accent-weak); }
   .traffic-stats { gap: 6px 20px; }
   .traffic-stat b { font-size: 18px; }
 }
+
+/* ── Offline files (wiki features/offline-files): marks, the Offline view, the offline shell ── */
+.offline-mark { display: inline-flex; flex: none; color: var(--merged); line-height: 0; }
+.offline-mark[data-state="stale"] { color: var(--attention); }
+.offline-mark[data-state="gone"] { color: var(--ink-3); opacity: .7; }
+.offline-mark[data-state="updating"] svg { animation: offline-spin 1.1s linear infinite; color: var(--ink-3); }
+.offline-mark[data-state="updating"] svg circle { fill: none; stroke: currentColor; stroke-width: 2; stroke-dasharray: 26 14; }
+.offline-mark[data-state="updating"] svg path { display: none; }
+@keyframes offline-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .offline-mark[data-state="updating"] svg { animation: none; } }
+.files-source .offline-mark { margin-right: 8px; align-self: center; }
+.files-menu-check { flex: none !important; color: var(--ink-2); }
+.offline-pin-meta { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-3); font-size: var(--fs-11); }
+.offline-place { display: flex; align-items: center; gap: 8px; padding: 6px 16px 10px; color: var(--ink-3); font-size: var(--fs-11); }
+.offline-meter { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: var(--fs-11); white-space: nowrap; }
+.offline-meter-bar { width: 56px; height: 4px; border-radius: 2px; background: var(--surface-2); overflow: hidden; }
+.offline-meter-bar span { display: block; height: 100%; background: var(--accent); }
+.offline-limit { height: 26px; padding: 0 6px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); color: var(--ink-2); font: inherit; }
+.offline-pill { display: inline-flex; align-items: center; height: 26px; padding: 0 10px; border-radius: 999px; background: var(--working-weak); color: var(--working); font-weight: 500; }
+.offline-keep-dialog { width: min(420px, calc(100vw - 32px)); display: flex; flex-direction: column; gap: 10px; }
+.offline-keep-dialog::backdrop { background: rgb(0 0 0 / .35); }
+.offline-keep-dialog h2 { margin: 0; font-size: var(--h3); }
+.offline-keep-meta { margin: 0; color: var(--ink-3); }
+.offline-keep-refused { margin: 0; color: var(--danger); }
+.offline-keep-actions { display: flex; gap: 8px; margin-top: 4px; }
+.offline-shell { min-height: 100vh; padding: calc(var(--inset-top, 0px) + 12px) 12px 12px; background: var(--paper); box-sizing: border-box; }
+.offline-shell .files-page { max-width: 960px; margin: 0 auto; }

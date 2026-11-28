@@ -156,7 +156,7 @@ jobs:
           xcodebuild -project App.xcodeproj -scheme App \
             -sdk iphonesimulator -configuration Debug \
             -destination 'generic/platform=iOS Simulator' \
-            build CODE_SIGNING_ALLOWED=NO
+            build CODE_SIGNING_ALLOWED=NO TAVYA_HOST="$(node -p 'new URL(process.env.TAVYA_URL).hostname')"
 
   android-release:
     name: android release (Play internal testing)
@@ -342,6 +342,7 @@ jobs:
             -authenticationKeyID "$APPSTORE_API_KEY_ID" \
             -authenticationKeyIssuerID "$APPSTORE_API_ISSUER_ID" \
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Automatic \
+            TAVYA_HOST="$(node -p 'new URL(process.env.TAVYA_URL).hostname')" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER" MARKETING_VERSION="$MARKETING_VERSION"
       - name: Export IPA
         if: steps.secrets.outputs.ready == 'true'

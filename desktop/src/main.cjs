@@ -7,7 +7,7 @@
 const path = require('node:path');
 const fs = require('node:fs');
 const {
-  app, BrowserWindow, Menu, Notification, dialog, Tray, globalShortcut, ipcMain, nativeImage, nativeTheme, safeStorage, session, shell,
+  app, BrowserWindow, Menu, Notification, dialog, Tray, globalShortcut, ipcMain, nativeImage, nativeTheme, net, protocol, safeStorage, session, shell,
   systemPreferences,
 } = require('electron');
 const { SCHEME, serverFromEnvironment } = require('./config.cjs');
@@ -19,7 +19,7 @@ const { createLaunchAtLogin } = require('./autostart.cjs');
 const { Updates, updateKind } = require('./updates.cjs');
 const { DeviceToken } = require('./device-token.cjs');
 const { Bridge } = require('./bridge.cjs');
-const { offlineFilesPlugin } = require('./plugins/offline-files.cjs');
+const { offlineFilesPlugin, registerOfflineScheme } = require('./plugins/offline-files.cjs');
 const { integrateAppImage } = require('./appimage.cjs');
 
 const MAC = process.platform === 'darwin';
@@ -44,6 +44,9 @@ if (process.env.TAVYA_DESKTOP_USER_DATA) app.setPath('userData', process.env.TAV
 // Wayland has no global key grabs; Chromium asks the desktop through the
 // GlobalShortcuts portal instead (src/hotkey.cjs).
 if (LINUX) app.commandLine.appendSwitch('enable-features', 'GlobalShortcutsPortal');
+
+// The console reads the files it keeps offline from tavya-offline:// (src/plugins/offline-files.cjs).
+registerOfflineScheme(protocol);
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -283,7 +286,7 @@ function start() {
       events: ['open', 'updateStatus'],
       onListen: (eventName, contents) => { if (eventName === 'open') flushPendingOpen(contents); },
     });
-    bridge.register('TavyaOfflineFiles', offlineFilesPlugin({ app, origin: ORIGIN }));
+    bridge.register('TavyaOfflineFiles', offlineFilesPlugin({ app, origin: ORIGIN, session: consoleSession, net, shell }));
 
     // ── menus ──
     function trayMenu() {

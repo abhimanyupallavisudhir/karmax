@@ -79,5 +79,13 @@
 	</array>
 	<key>UIViewControllerBasedStatusBarAppearance</key>
 	<true/>
+	<!-- Service workers run in a WKWebView only for app-bound domains: the console's own host
+	     (TAVYA_HOST, a build setting; mobile.yml sets it from TAVYA_URL), so the app opens offline
+	     into the files it keeps (web/service-worker.js; wiki features/offline-files).
+	     Capacitor's ios.limitsNavigationsToAppBoundDomains turns it on. -->
+	<key>WKAppBoundDomains</key>
+	<array>
+		<string>$(TAVYA_HOST)</string>
+	</array>
 </dict>
 </plist>

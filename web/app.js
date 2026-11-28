@@ -652,7 +652,7 @@ function parseRoute(url) {
 }
 
 function filesViewFromQuery(query) {
-  return query.get('task') ? `task:${query.get('task')}` : query.get('branch') ? `branch:${query.get('branch')}` : '';
+  return query.get('task') ? `task:${query.get('task')}` : query.get('branch') ? `branch:${query.get('branch')}` : query.has('offline') ? 'offline' : '';
 }
 
 // Which branch the project wiki shows is part of the page, so it lives in the
@@ -685,6 +685,7 @@ function orgFilesRoute(org = currentOrg()) { return globalRoute('orgfiles', org)
 function filesProjectId() { return S.tab === 'orgfiles' ? S.filesProjectId || null : S.projectId; }
 function isFilesTab(tab = S.tab) { return tab === 'files' || tab === 'orgfiles'; }
 function filesViewQuery(view, lead = '&') {
+  if (view === 'offline') return `${lead}offline`;
   const [kind, ...rest] = String(view || '').split(':');
   const value = rest.join(':');
   return (kind === 'task' || kind === 'branch') && value ? `${lead}${kind}=${encodeURIComponent(value)}` : '';
@@ -5136,7 +5137,8 @@ async function boot() {
   S.pendingInvite = location.pathname === '/invite' && !!new URLSearchParams(location.search).get('token');
   if (session.authRequired && !session.authenticated && !session.token) {
     // The phone app signs in through the system browser (wiki features/phone-apps).
-    if (nativeApp()) return renderAppSignIn();
+    // Signed out (or its app revoked): nothing of the last person stays on the device.
+    if (nativeApp()) { offlineFiles()?.wipe().catch(() => {}); return renderAppSignIn(); }
     // The public root explains the product before asking for an account. Auth
     // callbacks, invitations and explicit auth routes still land directly on
     // the form they need, so a person following a link never has to hunt.
@@ -5150,6 +5152,7 @@ async function boot() {
   S.token = session.token || null; // Better Auth uses an HttpOnly same-origin cookie.
   S.user = session.user || null;
   wireNativeApp().catch(() => {});
+  startOfflineFiles(S.user).catch(() => {});
   if (location.pathname === '/mcp-callback') return finishMcpCallback();
   if (location.pathname === '/device') return renderDeviceApproval();
   if (location.pathname === '/link/chat') return renderChatLink();
@@ -6046,7 +6049,7 @@ function connectWs() {
       if (ev.type === 'changed' ? ev.own && ev.area === 'inbox' : inboxEventChanges(ev)) scheduleInboxReload();
       return;
     }
-    if (ev.type === 'changed') { applyChangeNotice(ev); return; }
+    if (ev.type === 'changed') { noteOfflineFilesChange(ev); applyChangeNotice(ev); return; }
     // Streamed text chunks are the live bubble's, not activity (LT-5).
     if (S.tab === 'activity' && !liveOnlyEvent(ev.type) && (!ev.projectId || ev.projectId === S.projectId)) {
       S.activity.unshift(ev);
@@ -20388,6 +20391,7 @@ function filesBarHtml({ pid, view, crumbs, tools = '' }) {
 
 function filesView(proj) {
   if (!proj) return '<div class="empty">No project.</div>';
+  if (S.filesView === 'offline') return offlineViewHtml({ pid: proj.id });
   const filePath = S.filesPath || '';
   const parts = FV.parts(filePath);
   const sharing = filesState().sharing.get(proj.id);
@@ -20524,8 +20528,9 @@ function installFilesKeys() {
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Backspace' || event.metaKey || event.ctrlKey || event.altKey || event.defaultPrevented) return;
     const page = $('#files-page');
-    if (!isFilesTab() || !page || document.querySelector('dialog[open]')) return;
+    if (!(isFilesTab() || S.tab === 'offline') || !page || document.querySelector('dialog[open], .files-menu')) return;
     if (event.target.closest?.('input, textarea, select, [contenteditable], dialog, .modal-overlay')) return;
+    if (page.dataset.view === 'offline') { if (offlineUp()) event.preventDefault(); return; }
     const up = filesUpRoute(page.dataset.project, page.dataset.path);
     if (!up) return;
     event.preventDefault();
@@ -20535,6 +20540,7 @@ function installFilesKeys() {
 
 async function wireFilesView(proj) {
   if (!proj) return;
+  if (S.filesView === 'offline') return wireOfflineView();
   const pid = proj.id;
   const filePath = S.filesPath || '';
   const bar = $('#files-address');
@@ -20563,6 +20569,9 @@ async function wireFilesView(proj) {
   try { node = await filesLoad(pid, filePath); }
   catch (error) {
     if (!shows()) return;
+    // Out of reach, and this device keeps it: its copy.
+    const held = KarmaxOffline.unreachable(error) && offlineViewable() ? offlineFiles()?.covering(pid, S.filesView || '', filePath) : null;
+    if (held) { S.offlineAt = { pin: held.pin.id, sub: held.sub }; return go(filesRoute(pid, '', 'offline')); }
     $('#files-body').innerHTML = `<div class="files-status error" role="alert"><span>${esc(plainError(error.message))}</span>
       <button class="btn sm" id="files-retry">Try again</button></div>`;
     $('#files-retry')?.addEventListener('click', () => { filesState().cache.clear(); $('#files-page').dataset.path = '\u0000'; renderMain(); });
@@ -20584,6 +20593,7 @@ async function wireFilesView(proj) {
     ...(node.kind === 'file' && node.writable ? { textTools: filesEditButtonHtml(), onText: (body, text) => wireFilesEditButton(pid, node, body, text) } : {}),
   });
   wireFileManager(pid, node);
+  paintOfflineState();
 }
 
 // ── Files: the file manager (wiki features/project-files) ──
@@ -21179,7 +21189,7 @@ function openFilesMenu(at, items) {
   menu.className = 'files-menu';
   menu.setAttribute('role', 'menu');
   menu.innerHTML = items.map((item, i) => item === '-' ? '<div class="files-menu-sep" role="separator"></div>'
-    : `<button type="button" role="menuitem" data-i="${i}"${item.disabled ? ' disabled' : ''}><span>${esc(item.label)}</span>${item.keys ? `<kbd>${esc(item.keys)}</kbd>` : ''}</button>`).join('');
+    : `<button type="button" role="${item.checked === undefined ? 'menuitem' : 'menuitemcheckbox'}" data-i="${i}"${item.checked === undefined ? '' : ` aria-checked="${!!item.checked}"`}${item.title ? ` title="${esc(item.title)}"` : ''}${item.disabled ? ' disabled' : ''}><span>${esc(item.label)}</span>${item.keys ? `<kbd>${esc(item.keys)}</kbd>` : ''}${item.checked ? '<span class="files-menu-check" aria-hidden="true">✓</span>' : ''}</button>`).join('');
   document.body.appendChild(menu);
   const box = at instanceof Element ? at.getBoundingClientRect() : { left: at.x, bottom: at.y, top: at.y };
   const width = menu.offsetWidth, height = menu.offsetHeight;
@@ -21219,6 +21229,7 @@ function filesItemMenu(pid) {
     '-',
     { label: 'Rename', keys: FILES_KEYS.rename, disabled: !writable || mounted || targets.length !== 1, run: () => renameFilesTarget(pid) },
     { label: 'Delete', keys: FILES_KEYS.del, disabled: !writable || mounted, run: () => deleteFilesTargets(pid) },
+    ...offlineMenuItems(pid),
   ];
 }
 function filesFolderMenu(pid) {
@@ -21589,6 +21600,334 @@ function artifactGalleryLinks(item) {
   return `${task}${where ? `<a class="btn sm" data-spa data-viewer-leave href="${esc(where)}" title="${esc(item.path)}">Show in Files</a>` : ''}`;
 }
 
+// ── Files: available offline (wiki features/offline-files) ──
+// In the phone and desktop apps (a shell with the TavyaOfflineFiles plugin):
+// "Available offline" in a row's ⋯ and right-click menus keeps a file or a
+// folder of the default or a branch view on this device. web/offline-files.js
+// is the one engine (pins in IndexedDB, bytes by the plugin); this is its UI:
+// marks on pinned rows, the Offline view (pins, the meter and the limit), the
+// offline shell the app opens into without a network, and its triggers (start,
+// coming back, `online`, a `files` change notice, every 15 minutes).
+const OFFLINE_SYNC_MS = 15 * 60_000;
+const OFFLINE_LIMITS = [1, 2, 5, 10, 20, 50].map((gb) => gb * 1024 ** 3);
+function offlineFiles() {
+  if (offlineFiles.engine !== undefined) return offlineFiles.engine;
+  const plugin = nativePlugin('TavyaOfflineFiles');
+  const Offline = globalThis.KarmaxOffline;
+  offlineFiles.engine = plugin && Offline ? Offline.create({ plugin, request: (path, opts) => api(path, opts), origin: location.origin,
+    kind: desktopShell() ? 'desktop' : 'phone' }) : null;
+  offlineFiles.engine?.on(() => paintOfflineState());
+  return offlineFiles.engine;
+}
+// Offline copies are one person's: another account, signing out or a revoked app wipes them.
+async function startOfflineFiles(user) {
+  const engine = offlineFiles();
+  if (!engine) return;
+  await engine.ensureOwner(typeof user === 'object' ? user?.id : user);
+  if (!startOfflineFiles.wired) {
+    startOfflineFiles.wired = true;
+    window.addEventListener('online', () => offlineSync());
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && Date.now() - (offlineSync.at || 0) > 60_000) offlineSync(); });
+    nativePlugin('App')?.addListener?.('resume', () => offlineSync());
+    setInterval(() => offlineSync(), OFFLINE_SYNC_MS);
+  }
+  offlineSync();
+}
+function offlineSync() {
+  const engine = offlineFiles();
+  if (!engine) return Promise.resolve();
+  offlineSync.at = Date.now();
+  return engine.sync().catch(() => {});
+}
+// A project's files changed on tavya: its pins are checked again (once, for a burst of notices).
+function noteOfflineFilesChange(notice) {
+  const engine = offlineFiles();
+  if (!engine || notice.area !== 'files' || !engine.pins().some((pin) => pin.projectId === notice.projectId)) return;
+  clearTimeout(noteOfflineFilesChange.timer);
+  noteOfflineFilesChange.timer = setTimeout(() => offlineSync(), 1500);
+}
+
+const OFFLINE_ICON = '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="6.5" fill="currentColor"/><path d="M8 4.6v5.2m-2.4-2.3L8 9.9l2.4-2.4" fill="none" stroke="var(--surface, #fff)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const OFFLINE_REASONS = { limit: 'over this device’s limit', offline: 'offline', failed: 'couldn’t download' };
+function offlineClock(at) {
+  if (!at) return 'never';
+  const date = new Date(at);
+  return Date.now() - at < 86_400_000 ? date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : date.toLocaleDateString();
+}
+// A pin's state, as the mark on its row shows it.
+function offlineMarkState(pin) {
+  const engine = offlineFiles();
+  if (engine?.updating(pin.id) || pin.state === 'updating') return 'updating';
+  return pin.state === 'gone' ? 'gone' : pin.state === 'stale' || pin.pending ? 'stale' : 'current';
+}
+function offlineMarkTitle(pin) {
+  const state = offlineMarkState(pin);
+  if (state === 'updating') return 'Updating…';
+  if (state === 'gone') return 'Not on tavya any more';
+  if (state === 'stale') return `Out of date${pin.reason && OFFLINE_REASONS[pin.reason] ? `: ${OFFLINE_REASONS[pin.reason]}` : ''} · checked ${offlineClock(pin.checkedAt)}`;
+  return `Available offline · checked ${offlineClock(pin.checkedAt)}`;
+}
+function offlineMarkHtml(pin) {
+  return `<span class="offline-mark" data-state="${offlineMarkState(pin)}" title="${esc(offlineMarkTitle(pin))}" role="img" aria-label="${esc(offlineMarkTitle(pin))}">${OFFLINE_ICON}</span>`;
+}
+// Views that can be kept: the default and branches (a task's world is ephemeral).
+function offlineViewable(view = S.filesView || '') { return !view || view.startsWith('branch:'); }
+
+// The marks on the Files page: pinned rows, and the place itself when a pin holds it.
+function paintOfflineState() {
+  const engine = offlineFiles();
+  if (!engine || !(isFilesTab() || S.tab === 'offline')) return;
+  const page = $('#files-page');
+  if (!page) return;
+  if (page.dataset.view === 'offline') return paintOfflineView();
+  const pid = page.dataset.project, view = page.dataset.view || '', here = page.dataset.path || '';
+  if (!pid || !offlineViewable(view)) return;
+  document.querySelectorAll('#files-body .files-row').forEach((row) => {
+    row.querySelector('.offline-mark')?.remove();
+    const held = engine.covering(pid, view, FV.join(here, row.dataset.name));
+    if (held?.exact) row.querySelector('.files-link')?.insertAdjacentHTML('beforeend', offlineMarkHtml(held.pin));
+  });
+  const source = $('#files-source');
+  source?.querySelector('.offline-mark')?.remove();
+  const held = engine.covering(pid, view, here);
+  if (held && source) source.insertAdjacentHTML('afterbegin', offlineMarkHtml(held.pin));
+}
+
+// ⋯ and right-click: keep the targets offline, or stop.
+function offlineMenuItems(pid) {
+  const engine = offlineFiles();
+  const view = S.filesView || '';
+  const targets = filesTargets();
+  if (!engine || !offlineViewable(view) || targets.length !== 1 || !['file', 'directory'].includes(targets[0].kind)) return [];
+  const [target] = targets;
+  const held = engine.covering(pid, view, target.path);
+  const file = held && target.kind === 'file' ? engine.node(held.pin, held.sub) : null;
+  return ['-',
+    held && !held.exact
+      ? { label: 'Available offline', checked: true, disabled: true, title: 'In a folder kept offline', run: () => {} }
+      : { label: 'Available offline', checked: !!held, run: () => held ? engine.unpin(held.pin.id) : keepOffline(pid, view, target) },
+    ...(file?.hash && engine.open ? [{ label: 'Open in…', run: () => openOfflineExternally(file, target.path) }] : [])];
+}
+
+// Keep a place offline: a folder first says what it takes (and refuses past the limit).
+async function keepOffline(pid, view, target) {
+  const engine = offlineFiles();
+  const name = FV.parts(target.path).pop() || projectSlug(projectById(pid));
+  let prepared;
+  try { prepared = await engine.prepare({ projectId: pid, view, path: target.path }); }
+  catch (error) { return toast(plainError(error.message), true); }
+  if (prepared.manifest.kind === 'directory') { if (!(await confirmKeepOffline(name, prepared))) return; }
+  else if (!prepared.fits) return toast(prepared.message, true);
+  const proj = projectById(pid);
+  engine.pin({ projectId: pid, view, path: target.path, info: { name, projectName: proj?.name || '', organizationId: proj?.organizationId || '' } }, prepared)
+    .catch((error) => toast(plainError(error.message), true));
+}
+function confirmKeepOffline(name, prepared) {
+  return new Promise((resolve) => {
+    const dialog = document.createElement('dialog');
+    dialog.className = 'modal-card offline-keep-dialog';
+    dialog.setAttribute('aria-labelledby', 'offline-keep-title');
+    const count = prepared.manifest.files.length;
+    dialog.innerHTML = `<h2 id="offline-keep-title">Keep <code>${esc(name)}</code> offline?</h2>
+      <p class="offline-keep-meta">${count.toLocaleString()} file${count === 1 ? '' : 's'} · ${esc(FV.formatBytes(prepared.manifest.bytes))}</p>
+      ${prepared.fits ? '' : `<p class="offline-keep-refused" role="alert">${esc(prepared.message)}</p>`}
+      <div class="offline-keep-actions"><button class="btn primary" type="button" data-keep${prepared.fits ? '' : ' disabled'}>Keep offline</button><button class="btn" type="button" data-cancel>Cancel</button></div>`;
+    document.body.appendChild(dialog);
+    const done = (value) => { dialog.close(); dialog.remove(); resolve(value); };
+    dialog.querySelector('[data-keep]').addEventListener('click', () => done(true));
+    dialog.querySelector('[data-cancel]').addEventListener('click', () => done(false));
+    dialog.addEventListener('cancel', (event) => { event.preventDefault(); done(false); });
+    dialog.addEventListener('click', (event) => { if (event.target === dialog) done(false); });
+    dialog.showModal();
+    dialog.querySelector(prepared.fits ? '[data-keep]' : '[data-cancel]').focus();
+  });
+}
+async function openOfflineExternally(file, filePath) {
+  try { await offlineFiles().open(file.hash, FV.parts(filePath).pop() || 'file'); }
+  catch (error) { toast(plainError(error?.message || 'Couldn’t open it'), true); }
+}
+
+// ── the Offline view: what this device keeps (online in Files' view picker; offline, the whole app) ──
+// Pins first; inside one, its files as they were last downloaded, shown from
+// this device's copies. Where it is lives in S.offlineAt ({pin, sub}), not the URL.
+function offlineState() { return (S.offlineAt ||= { pin: null, sub: '' }); }
+function offlinePinName(pin) { return pin.name || FV.parts(pin.path).pop() || pin.projectName || 'project'; }
+function offlinePinMeta(pin) {
+  const branch = KarmaxOffline.branchOf(pin.view);
+  return [pin.projectName, FV.parts(pin.path).slice(0, -1).join('/'), branch && `branch ${branch}`].filter(Boolean).join(' · ');
+}
+function offlinePinSize(pin) {
+  const seen = new Map();
+  for (const file of pin.files || []) seen.set(file.version, file.size);
+  let total = 0; for (const size of seen.values()) total += size;
+  return total;
+}
+function offlineViewHtml({ shell = false, pid = null } = {}) {
+  return `<div class="files-page offline-view" id="files-page" data-scope="${shell ? 'offline' : 'project'}" data-project="${esc(pid || '')}" data-path="" data-view="offline">
+    ${filesBarHtml({ pid: shell ? null : pid, view: 'offline', crumbs: '<nav class="files-crumbs" aria-label="Path" id="offline-crumbs"></nav>',
+      tools: '<span class="files-actions" id="files-actions"></span><span class="offline-meter" id="offline-meter"></span>' })}
+    <div class="files-body" id="files-body"><div class="files-status" role="status" aria-busy="true">Loading…</div></div>
+  </div>`;
+}
+async function wireOfflineView({ shell = false } = {}) {
+  const engine = offlineFiles();
+  if (!engine) { $('#files-body').innerHTML = '<div class="files-status muted">Files are kept offline in the tavya apps.</div>'; return; }
+  const pid = $('#files-page')?.dataset.project;
+  if (pid) $('#files-view')?.addEventListener('click', () => openFilesViewPicker(pid));
+  installFilesKeys();
+  await engine.load();
+  paintOfflineView({ shell });
+}
+async function paintOfflineView({ shell = $('#files-page')?.dataset.scope === 'offline' } = {}) {
+  const engine = offlineFiles();
+  const body = $('#files-body');
+  if (!engine || !body || $('#files-page')?.dataset.view !== 'offline') return;
+  const at = offlineState();
+  const pin = at.pin ? engine.get(at.pin) : null;
+  if (at.pin && !pin) { at.pin = null; at.sub = ''; }
+  const crumbs = $('#offline-crumbs');
+  const segments = pin ? FV.parts(at.sub) : [];
+  if (crumbs) crumbs.innerHTML = [`<a class="files-crumb files-crumb-root" href="#" data-offline-go="" ${pin ? '' : 'aria-current="page"'} title="What this device keeps">This device</a>`,
+    ...(pin ? [`<span class="files-sep" aria-hidden="true">/</span><a class="files-crumb" href="#" data-offline-go="${esc(pin.id)}\n"${segments.length ? '' : ' aria-current="page"'}>${esc(offlinePinName(pin))}</a>`] : []),
+    ...segments.map((part, i) => `<span class="files-sep" aria-hidden="true">/</span><a class="files-crumb" href="#" data-offline-go="${esc(pin.id)}\n${esc(segments.slice(0, i + 1).join('/'))}"${i === segments.length - 1 ? ' aria-current="page"' : ''}>${esc(part)}</a>`)].join('');
+  crumbs?.querySelectorAll('[data-offline-go]').forEach((link) => link.addEventListener('click', (event) => {
+    event.preventDefault();
+    const [id, sub = ''] = link.dataset.offlineGo.split('\n');
+    offlineGo(id || null, sub);
+  }));
+  paintOfflineMeter(shell);
+  const actions = $('#files-actions');
+  if (actions) actions.innerHTML = '';
+  if (!pin) {
+    const pins = [...engine.pins()].sort((a, b) => (a.projectName || '').localeCompare(b.projectName || '') || offlinePinName(a).localeCompare(offlinePinName(b)));
+    if (body.dataset.shows === `root\n${pins.map((p) => `${p.id}:${offlineMarkState(p)}:${p.checkedAt}`).join(',')}`) return;
+    body.dataset.shows = `root\n${pins.map((p) => `${p.id}:${offlineMarkState(p)}:${p.checkedAt}`).join(',')}`;
+    body.innerHTML = pins.length ? `<ul class="files-list" role="list">${pins.map((p) => `<li class="files-row kind-${p.kind === 'directory' ? 'directory' : 'file'}" data-pin="${esc(p.id)}" data-name="${esc(offlinePinName(p))}">
+        <a class="files-link" href="#" data-offline-go="${esc(p.id)}\n"><span class="files-icon">${p.kind === 'directory' ? FV.ICONS.directory : FV.ICONS.file}</span>
+          <span class="files-name">${esc(offlinePinName(p))}</span><span class="offline-pin-meta">${esc(offlinePinMeta(p))}</span>${offlineMarkHtml(p)}</a>
+        <span class="files-size">${esc(FV.formatBytes(offlinePinSize(p)))}</span>
+        <button type="button" class="files-more" title="More" aria-label="More for ${esc(offlinePinName(p))}" aria-haspopup="menu" tabindex="-1">${FM_ICON.more}</button></li>`).join('')}</ul>`
+      : `<div class="files-status muted">${shell ? 'You’re offline. Files you keep offline show here.' : 'Nothing yet. Choose Available offline in a file’s or folder’s ⋯ menu.'}</div>`;
+    body.querySelectorAll('[data-offline-go]').forEach((link) => link.addEventListener('click', (event) => { event.preventDefault(); offlineGo(link.dataset.offlineGo.split('\n')[0], ''); }));
+    const menu = (row, at) => {
+      const p = engine.get(row.dataset.pin);
+      if (!p) return;
+      const file = p.kind === 'file' ? engine.node(p, '') : null;
+      openFilesMenu(at, [
+        ...(!shell && projectById(p.projectId) ? [{ label: 'Show on tavya', run: () => { S.offlineAt = null; go(filesRoute(p.projectId, p.path, p.view)); } }] : []),
+        ...(file?.hash ? [{ label: 'Open in…', run: () => openOfflineExternally(file, p.path) }] : []),
+        { label: 'Remove from this device', run: () => engine.unpin(p.id) },
+      ]);
+    };
+    body.querySelectorAll('.files-more').forEach((button) => button.addEventListener('click', () => menu(button.closest('.files-row'), button)));
+    body.querySelector('.files-list')?.addEventListener('contextmenu', (event) => {
+      const row = event.target.closest('.files-row');
+      if (!row) return;
+      event.preventDefault();
+      menu(row, { x: event.clientX, y: event.clientY });
+    });
+    wireOfflineListKeys(body);
+    return;
+  }
+  const node = engine.node(pin, at.sub);
+  const key = `${pin.id}\n${at.sub}\n${pin.revision}\n${offlineMarkState(pin)}`;
+  if (body.dataset.shows === key) return;
+  body.dataset.shows = key;
+  if (!node) { body.innerHTML = `<div class="files-status muted">Nothing here on this device.</div>`; return; }
+  const status = `<div class="offline-place">${offlineMarkHtml(pin)}<span>${esc(offlineMarkTitle(pin))}</span></div>`;
+  if (node.kind === 'directory') {
+    body.innerHTML = `${status}<div id="offline-listing"></div>`;
+    FV.render(body.querySelector('#offline-listing'), { ...node, path: at.sub }, { href: () => '#', raw: () => '', emptyRoot: 'Empty folder', shows: () => true });
+    body.querySelectorAll('.files-link').forEach((link) => link.addEventListener('click', (event) => {
+      event.preventDefault();
+      offlineGo(pin.id, FV.join(at.sub, link.closest('.files-row').dataset.name));
+    }));
+    wireOfflineListKeys(body);
+    return;
+  }
+  await showOfflineFile(body, pin, node, status);
+}
+function wireOfflineListKeys(body) {
+  const links = [...body.querySelectorAll('.files-link')];
+  body.querySelector('.files-list')?.addEventListener('keydown', (event) => {
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    event.preventDefault();
+    const at = links.indexOf(document.activeElement);
+    links[Math.max(0, Math.min(links.length - 1, at < 0 ? 0 : at + (event.key === 'ArrowDown' ? 1 : -1)))]?.focus();
+  });
+}
+function offlineGo(pinId, sub = '') {
+  const at = offlineState();
+  at.pin = pinId || null;
+  at.sub = pinId ? sub : '';
+  const body = $('#files-body');
+  if (body) delete body.dataset.shows;
+  paintOfflineView();
+}
+// Backspace on the Offline view: one folder up, then the pins.
+function offlineUp() {
+  const at = offlineState();
+  if (!at.pin) return false;
+  if (at.sub) offlineGo(at.pin, FV.parent(at.sub)); else offlineGo(null);
+  return true;
+}
+// A file from this device's copy, in the Files viewer; "Open in…" hands it to the OS.
+async function showOfflineFile(body, pin, node, status) {
+  const engine = offlineFiles();
+  const shows = () => body.isConnected && offlineState().pin === pin.id && body.dataset.shows?.startsWith(`${pin.id}\n${offlineState().sub}\n`);
+  let bytes;
+  try { bytes = await engine.bytes(node.hash); }
+  catch (error) { body.innerHTML = `${status}<div class="files-status error" role="alert">${esc(plainError(error?.message || 'Couldn’t read the copy'))}</div>`; return; }
+  if (!shows()) return;
+  const actions = $('#files-actions');
+  if (actions) {
+    actions.innerHTML = `<button type="button" class="btn sm" id="offline-open" title="Open in another app">Open in…</button>`;
+    $('#offline-open').addEventListener('click', () => openOfflineExternally(node, node.path));
+  }
+  body.innerHTML = `${status}<div id="offline-file"></div>`;
+  FV.render(body.querySelector('#offline-file'), { ...node, path: node.path }, {
+    href: () => '#', raw: () => bytes.url, shows, from: null,
+    // The copy's bytes; text unless the first 8 KB hold a NUL, as files/raw decides.
+    fetch: async () => {
+      const blob = bytes.blob || await (await fetch(bytes.url)).blob();
+      const head = new Uint8Array(await blob.slice(0, 8192).arrayBuffer());
+      return new Response(blob, { headers: { 'content-type': head.includes(0) ? 'application/octet-stream' : 'text/plain; charset=utf-8' } });
+    },
+    markdown: (el, text, after) => mountMarkdownSurface(el, (math) => renderMarkdown(text, { math }), after),
+    markdownTools: texToggleHtml(), wireTools: wireTexToggles, copy: (text) => copyToClipboard(text).then(() => toast('Copied')), errorText: plainError,
+  });
+}
+// "1.2 GB of 2 GB", the limit chosen beside it.
+async function paintOfflineMeter(shell) {
+  const engine = offlineFiles();
+  const meter = $('#offline-meter');
+  if (!engine || !meter) return;
+  if (shell) {
+    const { checkedAt } = engine.status();
+    meter.innerHTML = `<span class="offline-pill" title="Shows what this device keeps. Reconnects by itself.">Offline · checked ${esc(checkedAt ? fmtAgo(checkedAt) : 'never')}</span>`;
+    return;
+  }
+  const { used, limit } = await engine.usage();
+  const options = [...new Set([...OFFLINE_LIMITS, limit])].sort((a, b) => a - b);
+  meter.innerHTML = `<span class="offline-meter-bar" aria-hidden="true"><span style="width:${Math.min(100, Math.round(used / limit * 100))}%"></span></span>
+    <span>${esc(FV.formatBytes(used))} of</span>
+    <select id="offline-limit" class="offline-limit" aria-label="Limit on this device" title="Space this device may use for offline files">${options.map((bytes) =>
+      `<option value="${bytes}"${bytes === limit ? ' selected' : ''}>${esc(FV.formatBytes(bytes))}</option>`).join('')}</select>`;
+  $('#offline-limit').addEventListener('change', (event) => engine.setLimit(Number(event.target.value)).catch(() => {}));
+}
+
+// Without a network the app opens here instead of the offline page: Files, pins only.
+async function renderOfflineShell() {
+  document.body.classList.remove('landing-active');
+  document.title = `Offline · ${siteName()}`;
+  S.tab = 'offline';
+  $('#app').innerHTML = `<div class="offline-shell">${offlineViewHtml({ shell: true })}</div>`;
+  await wireOfflineView({ shell: true });
+  // Back online: the console proper (the service worker never serves a stale one online).
+  window.addEventListener('online', () => location.reload(), { once: true });
+  offlineFiles()?.on(() => paintOfflineMeter(true));
+}
+
 // ── Files: which tree (the view picker) ──
 // Default: the branches tasks start from. A branch: each repository on it
 // where it has one, else its default. A task: its world, live while it runs,
@@ -21607,6 +21946,7 @@ function filesViewLabelHtml(pid, view) {
     return `${FV.ICONS.directory}<span class="files-view-name">#${esc(value)} ${esc(info?.title || task?.title || '')}</span>${mode}${caret}`;
   }
   if (kind === 'branch') return `${branchIcon}<span class="files-view-name">${esc(value)}</span>${caret}`;
+  if (view === 'offline') return `${OFFLINE_ICON}<span class="files-view-name">Available offline</span>${caret}`;
   const views = filesState().views.get(pid)?.data;
   const defaults = [...new Set((views?.repositories || []).filter((r) => r.role !== 'project-wiki').map((r) => r.default))];
   return `${branchIcon}<span class="files-view-name">${esc(defaults.length === 1 ? defaults[0] : 'Default branches')}</span>${caret}`;
@@ -21653,7 +21993,8 @@ async function openFilesViewPicker(pid) {
   const close = () => { menu.remove(); button.setAttribute('aria-expanded', 'false'); document.removeEventListener('pointerdown', outside, true); };
   const outside = (event) => { if (!menu.contains(event.target) && event.target !== button && !button.contains(event.target)) close(); };
   document.addEventListener('pointerdown', outside, true);
-  const pick = (value) => { close(); go(filesRoute(pid, S.filesPath, value)); };
+  // The Offline view starts at what the device keeps; other views keep the place.
+  const pick = (value) => { close(); go(filesRoute(pid, value === 'offline' ? '' : S.filesPath, value)); };
   const paint = () => {
     const query = input.value.trim().toLowerCase();
     const shown = options.filter((option) => !query || option.search.includes(query));
@@ -21696,6 +22037,9 @@ async function openFilesViewPicker(pid) {
           note: repos.length > 1 && inRepos.length < repos.length ? inRepos.join(', ') : '' })),
     ];
     if (views.error) options.push({ group: 'Branches', value: S.filesView || '', search: '', html: `<span class="files-view-note">${esc(plainError(views.error))}</span>` });
+    // What this device keeps (the apps).
+    if (offlineFiles()) options.push({ group: 'This device', value: 'offline', search: 'available offline device', html: 'Available offline',
+      note: `${offlineFiles().pins().length} kept` });
     active = Math.max(0, options.findIndex((option) => option.value === (S.filesView || '')));
     paint();
     const label = $('#files-view');
@@ -27986,6 +28330,7 @@ function showDesktopPush(push) {
 // anyway) and its badge.
 async function forgetAppIdentity() {
   await nativePlugin('TavyaSignIn')?.clearDeviceToken?.().catch(() => {});
+  await offlineFiles()?.wipe().catch(() => {});
   syncAppBadge(0);
   // The widget and Siri say "Sign in" until the app is signed in again.
   await nativePlugin('TavyaPhone')?.setContext({ organizationId: null, forMe: 0 }).catch(() => {});
@@ -33093,6 +33438,8 @@ fitToVisualViewport();
 // The console could not start (the server restarting, the network down): say
 // so plainly, keep the exact error one hover away, and offer to try again.
 function bootFailed(e) {
+  // No network in an app that keeps files offline: open into them (wiki features/offline-files).
+  if (offlineFiles() && KarmaxOffline.unreachable(e)) return renderOfflineShell().catch(() => {});
   console.error(e);
   document.getElementById('app').innerHTML = `<div class="empty boot-failed" role="alert"><div class="big">Couldn’t load</div>
     <p title="${esc(String(e?.message ?? e))}">${esc(plainError(e))}</p><button class="btn primary" id="boot-retry" type="button">Try again</button></div>`;

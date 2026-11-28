@@ -26,9 +26,9 @@ on:
   push:
     # Branches are covered by their pull request run.
     branches: [master]
-    paths: ['desktop/**', '.github/workflows/desktop.yml', 'tests/desktop-app.electron.test.ts']
+    paths: ['desktop/**', '.github/workflows/desktop.yml', 'tests/desktop-app.electron.test.ts', 'tests/offline-files.electron.test.ts', 'web/offline-files.js', 'web/service-worker.js', 'web/register-service-worker.js']
   pull_request:
-    paths: ['desktop/**', '.github/workflows/desktop.yml', 'tests/desktop-app.electron.test.ts']
+    paths: ['desktop/**', '.github/workflows/desktop.yml', 'tests/desktop-app.electron.test.ts', 'tests/offline-files.electron.test.ts', 'web/offline-files.js', 'web/service-worker.js', 'web/register-service-worker.js']
 
 permissions:
   contents: read
@@ -110,7 +110,7 @@ jobs:
           sudo apt-get install -y -q xvfb xdotool
           sudo apt-get install -y -q libfuse2t64 || sudo apt-get install -y -q libfuse2
       - name: The app, end to end (Xvfb, against a local gateway)
-        run: xvfb-run -a npx vitest run tests/desktop-app.electron.test.ts
+        run: xvfb-run -a npx vitest run tests/desktop-app.electron.test.ts tests/offline-files.electron.test.ts
       - name: Build AppImage and .deb (x64, arm64)
         working-directory: desktop
         run: npm run dist:linux

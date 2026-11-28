@@ -12,6 +12,7 @@
 		2FAD9763203C412B000D30F8 /* config.xml in Resources */ = {isa = PBXBuildFile; fileRef = 2FAD9762203C412B000D30F8 /* config.xml */; };
 		3E273E4E72E9DF047BA63AC8 /* TavyaShared.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED616E53B6517B6DC4DC9580 /* TavyaShared.swift */; };
 		4CD996854F365ADDBA046FDE /* TavyaPhonePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAE980FF4D860CA365A6525F /* TavyaPhonePlugin.swift */; };
+		0FF1F11E5A7E4C0D9B1A0001 /* TavyaOfflineFilesPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FF1F11E5A7E4C0D9B1A0002 /* TavyaOfflineFilesPlugin.swift */; };
 		4D22ABE92AF431CB00220026 /* CapApp-SPM in Frameworks */ = {isa = PBXBuildFile; productRef = 4D22ABE82AF431CB00220026 /* CapApp-SPM */; };
 		50379B232058CBB4000EE86E /* capacitor.config.json in Resources */ = {isa = PBXBuildFile; fileRef = 50379B222058CBB4000EE86E /* capacitor.config.json */; };
 		504EC3081FED79650016851F /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 504EC3071FED79650016851F /* AppDelegate.swift */; };
@@ -82,6 +83,7 @@
 		958DCC722DB07C7200EA8C5F /* debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = debug.xcconfig; path = ../debug.xcconfig; sourceTree = SOURCE_ROOT; };
 		A69D6952493A3887DA14E25A /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		AAE980FF4D860CA365A6525F /* TavyaPhonePlugin.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TavyaPhonePlugin.swift; sourceTree = "<group>"; };
+		0FF1F11E5A7E4C0D9B1A0002 /* TavyaOfflineFilesPlugin.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TavyaOfflineFilesPlugin.swift; sourceTree = "<group>"; };
 		CCDAB9991AF55BC21964C7A0 /* ShareViewController.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
 		ED616E53B6517B6DC4DC9580 /* TavyaShared.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TavyaShared.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -163,6 +165,7 @@
 				50B271D01FEDC1A000F3C39B /* public */,
 				7A5A00000000000000000008 /* Firebase */,
 				AAE980FF4D860CA365A6525F /* TavyaPhonePlugin.swift */,
+				0FF1F11E5A7E4C0D9B1A0002 /* TavyaOfflineFilesPlugin.swift */,
 				84878673431CE7BAED6878F6 /* TavyaServer.swift */,
 				63E3A96AE0E67887D83847BA /* TavyaIntents.swift */,
 			);
@@ -308,6 +311,7 @@
 				7A5A00000000000000000002 /* TavyaSignInPlugin.swift in Sources */,
 				7A5A00000000000000000004 /* SpeechRecognitionPlugin.swift in Sources */,
 				4CD996854F365ADDBA046FDE /* TavyaPhonePlugin.swift in Sources */,
+				0FF1F11E5A7E4C0D9B1A0001 /* TavyaOfflineFilesPlugin.swift in Sources */,
 				EBE6FD06648CA0A946F565E4 /* TavyaServer.swift in Sources */,
 				156F859504DDCEB6E3C7A968 /* TavyaIntents.swift in Sources */,
 				3E273E4E72E9DF047BA63AC8 /* TavyaShared.swift in Sources */,
@@ -508,6 +512,7 @@
 				MARKETING_VERSION = 1.0.0;
 				OTHER_SWIFT_FLAGS = "$(inherited) \"-D\" \"COCOAPODS\" \"-DDEBUG\"";
 				PRODUCT_BUNDLE_IDENTIFIER = io.tavya.app;
+				TAVYA_HOST = tavya.io;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
 				SWIFT_VERSION = 5.0;
@@ -530,6 +535,7 @@
 				);
 				MARKETING_VERSION = 1.0.0;
 				PRODUCT_BUNDLE_IDENTIFIER = io.tavya.app;
+				TAVYA_HOST = tavya.io;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "";
 				SWIFT_VERSION = 5.0;

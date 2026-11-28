@@ -94,7 +94,8 @@ import { HOSTED_GIT_ROUTE, hostedRepositoryUrl, isHostedRepository, isValidHoste
 import { materializeGitCredential } from '../world/git-credential.js';
 type Repository = import('../domain/types.js').Repository;
 import { projectArtifactGallery, type GalleryArtifact } from '../platform/artifact-gallery.js';
-import { FileAccessError, FileNotFoundError, ProjectFiles, projectRepositoryCredential, splitPath, type FileNode, type FileView, type OpenedFile } from '../world/project-files.js';
+import { checkOfflinePins, OFFLINE_CHECK_MAX } from '../world/offline-files.js';
+import { FileAccessError, FileNotFoundError, ManifestTooLargeError, ProjectFiles, projectRepositoryCredential, splitPath, type FileNode, type FileView, type OpenedFile } from '../world/project-files.js';
 import { CHANGE_LIMITS, FileConflictError, ProjectFileChanges, type FileChange, type FileKeeping } from '../world/project-file-changes.js';
 import { createFileShare, currentFileShare, projectFileShares, publicFileShare, publicFilesHtml, revokeFileShare, type FileShare } from './file-sharing.js';
 import { cliVersionOf, olderVersion } from '../domain/cli-version.js';
@@ -462,7 +463,9 @@ export function routeCapability(method: string, p: string, url?: URL): KnownCapa
   // read, whatever the method; saving one is a settings write (or a task edit).
   if (/^\/api\/projects\/[^/]+\/workspace$/.test(p) || /^\/api\/projects\/[^/]+\/git-credential$/.test(p)) return 'repository:read';
   // The Files page: data under it also needs project:settings:read, checked there.
-  if (/^\/api\/projects\/[^/]+\/files(?:\/raw|\/views)?$/.test(p)) return 'repository:read';
+  if (/^\/api\/projects\/[^/]+\/files(?:\/raw|\/views|\/manifest)?$/.test(p)) return 'repository:read';
+  // The apps' offline files (wiki features/offline-files): each pin's project is authorized in the handler.
+  if (p === '/api/offline-files/check' && method === 'POST') return 'none';
   // Changing Files: who may write where (a task's world, a branch) is decided there.
   if (/^\/api\/projects\/[^/]+\/files\/(?:changes|uploads(?:\/[^/]+)?|plan)$/.test(p)) return 'repository:read';
   if (/^\/api\/tasks\/[^/]+\/file-location$/.test(p)) return 'task:read';
@@ -5945,7 +5948,25 @@ export class Gateway {
         }
       }
       // The project as a file tree (wiki features/project-files).
-      const projectFiles = p.match(/^\/api\/projects\/([^/]+)\/files(\/raw|\/views)?$/);
+      // The apps' offline files: many pins checked in one call (wiki features/offline-files).
+      if (p === '/api/offline-files/check' && method === 'POST') {
+        const body = await this.body(req);
+        const pins = Array.isArray(body.pins) ? body.pins : undefined;
+        if (!pins || pins.length > OFFLINE_CHECK_MAX) return this.json(res, 400, { error: `pins must list up to ${OFFLINE_CHECK_MAX} pins` });
+        const access = new Map<string, Promise<{ read: boolean; data: boolean } | undefined>>();
+        const accessTo = (projectId: string) => access.get(projectId) ?? access.set(projectId, (async () => {
+          if (!(await store.getProject(projectId))) return undefined;
+          const [read, data] = await Promise.all([this.deps.tokens.check(session.apiToken, 'repository:read', { projectId }),
+            this.deps.tokens.check(session.apiToken, 'project:settings:read', { projectId })]);
+          return { read: read.ok, data: data.ok };
+        })()).get(projectId)!;
+        const checkedAt = Date.now();
+        const results = await checkOfflinePins(pins, { access: accessTo, revision: (pin, data) => this.projectFiles().revision(pin.projectId, pin.path,
+          { data, view: pin.branch ? { kind: 'branch', name: pin.branch } : { kind: 'default' } }) });
+        res.setHeader('cache-control', 'private, no-store');
+        return this.json(res, 200, { checkedAt, results });
+      }
+      const projectFiles = p.match(/^\/api\/projects\/([^/]+)\/files(\/raw|\/views|\/manifest)?$/);
       if (projectFiles && (method === 'GET' || method === 'HEAD')) {
         const projectId = projectFiles[1]!;
         if (projectFiles[2] === '/views') {
@@ -5971,13 +5992,17 @@ export class Gateway {
             const node = await this.projectFiles().stat(projectId, relative, { data, view });
             return this.json(res, 200, { ...node, writable: await this.filesWritable(session, projectId, view, node) });
           }
+          if (projectFiles[2] === '/manifest') {
+            res.setHeader('cache-control', 'private, no-cache');
+            return this.json(res, 200, await this.projectFiles().manifest(projectId, relative, { data, view }));
+          }
           return await this.projectFiles().open(projectId, relative, { data, view },
             (file) => this.sendProjectFile(req, res, file, url.searchParams.has('download')));
         } catch (error) {
           if (res.headersSent) return void res.destroy();
           const message = error instanceof Error ? error.message : String(error);
           return this.json(res, error instanceof FileNotFoundError ? 404 : error instanceof FileAccessError ? 403
-            : /project not found/.test(message) ? 404 : 502, { error: message });
+            : error instanceof ManifestTooLargeError ? 413 : /project not found/.test(message) ? 404 : 502, { error: message });
         }
       }
       const projectWorkspace = p.match(/^\/api\/projects\/([^/]+)\/workspace$/);
@@ -11775,6 +11800,13 @@ export class Gateway {
   private async sendProjectFile(req: http.IncomingMessage, res: http.ServerResponse, file: OpenedFile, download: boolean): Promise<void> {
     const etag = file.node.version ? `"${file.node.version}"` : undefined;
     if (etag && req.headers['if-none-match'] === etag) { file.stop(); file.done.catch(() => {}); res.writeHead(304, { etag }).end(); return; }
+    // Only the version asked for (an app keeping it offline: wiki features/offline-files), never newer bytes under its name.
+    const wanted = req.headers['if-match'];
+    if (typeof wanted === 'string' && wanted.trim() !== '*' && !wanted.split(',').some((tag) => tag.trim().replace(/^W\//, '') === etag)) {
+      file.stop(); file.done.catch(() => {});
+      res.writeHead(412, { ...(etag ? { etag } : {}), 'cache-control': 'private, no-cache' }).end();
+      return;
+    }
     const name = path.posix.basename(file.node.path) || 'file';
     const extension = path.extname(name).toLowerCase();
     // Media the browser shows as itself; everything else is shown as text

@@ -281,3 +281,72 @@ test('the bridge answers only the console\'s top frame and passes {code, message
   bridge.reset(sender);
   assert.equal(bridge.emit(sender, 'TavyaDesktop', 'open', { path: '/' }), false, 'a new document listens afresh');
 });
+
+// ── offline files (src/plugins/offline-files.cjs; wiki features/offline-files) ──
+{
+  const crypto = require('node:crypto');
+  const os = require('node:os');
+  const { Readable } = require('node:stream');
+  const { createOfflineStore } = require('../src/plugins/offline-files.cjs');
+  const ORIGIN = 'https://tavya.test';
+  const raw = (file) => `${ORIGIN}/api/projects/p/files/raw?path=${encodeURIComponent(file)}`;
+  const gitBlob = (text) => crypto.createHash('sha1').update(`blob ${Buffer.byteLength(text)}\0${text}`).digest('hex');
+  const sha256 = (text) => crypto.createHash('sha256').update(text).digest('hex');
+  function offlineStore(answers) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tavya-offline-test-'));
+    const seen = [];
+    const store = createOfflineStore({ dir, origin: ORIGIN, request: async (url, headers) => {
+      seen.push({ url, headers });
+      const answer = answers[new URL(url).searchParams.get('path')] ?? { status: 404, body: '' };
+      return { status: answer.status ?? 200, body: Readable.from([Buffer.from(answer.body)]) };
+    } });
+    return { dir, store, seen };
+  }
+
+  test('offline files: a download is checked, stored once by its SHA-256, read-only, and served to the console only', async () => {
+    const text = 'hello offline\n';
+    const { dir, store, seen } = offlineStore({ 'a.txt': { body: text }, 'b.txt': { body: text } });
+    const got = await store.download({ url: raw('a.txt'), version: gitBlob(text), size: Buffer.byteLength(text), blob: gitBlob(text) });
+    assert.deepEqual(got, { hash: sha256(text), size: Buffer.byteLength(text) });
+    assert.equal(seen[0].headers['if-match'], `"${gitBlob(text)}"`);
+    const file = path.join(dir, 'blobs', got.hash);
+    assert.equal(fs.statSync(file).mode & 0o777, 0o444);
+    // The same bytes again: one file.
+    await store.download({ url: raw('b.txt'), version: 'data-identity', size: Buffer.byteLength(text) });
+    assert.deepEqual(store.list().files, [{ hash: got.hash, size: Buffer.byteLength(text) }]);
+    assert.equal(typeof store.list().free, 'number');
+    assert.deepEqual(store.read({ hash: got.hash, offset: 6, length: 7 }), { data: Buffer.from('offline').toString('base64'), eof: false });
+    // The scheme: the console, a range, and nobody else.
+    const whole = store.serve(`tavya-offline://file/${got.hash}`, new Headers({ origin: ORIGIN }));
+    assert.equal(whole.status, 200);
+    assert.equal(await whole.text(), text);
+    const part = store.serve(`tavya-offline://file/${got.hash}`, new Headers({ range: 'bytes=0-4' }));
+    assert.equal(part.status, 206);
+    assert.equal(await part.text(), 'hello');
+    assert.equal(store.serve(`tavya-offline://file/${got.hash}`, new Headers({ origin: 'https://preview.example' })).status, 403);
+    assert.equal(store.serve('tavya-offline://file/../../etc/passwd', new Headers()).status, 403);
+    // Open in…: a read-only copy with its real name.
+    const copy = store.copyToOpen({ hash: got.hash, name: '../notes.txt' });
+    assert.equal(path.basename(copy), 'notes.txt');
+    assert.ok(copy.startsWith(path.join(dir, 'open')));
+    store.remove({ hashes: [got.hash] });
+    assert.deepEqual(store.list().files, []);
+    store.wipe();
+    assert.equal(fs.existsSync(dir), false);
+  });
+
+  test('offline files: wrong bytes, a newer version or no access never become a stored file', async () => {
+    const { dir, store } = offlineStore({ 'a.txt': { body: 'actual' }, 'moved.txt': { status: 412, body: '' }, 'gone.txt': { status: 403, body: '' } });
+    await assert.rejects(store.download({ url: raw('a.txt'), version: 'v', size: 6, blob: gitBlob('expected') }), { code: 'mismatch' });
+    await assert.rejects(store.download({ url: raw('a.txt'), version: 'v', size: 99 }), { code: 'mismatch' });
+    await assert.rejects(store.download({ url: raw('moved.txt'), version: 'v', size: 1 }), { code: 'changed' });
+    await assert.rejects(store.download({ url: raw('gone.txt'), version: 'v', size: 1 }), { code: 'forbidden' });
+    await assert.rejects(store.download({ url: raw('nope.txt'), version: 'v', size: 1 }), { code: 'missing' });
+    // Only this console's files/raw.
+    await assert.rejects(store.download({ url: 'https://evil.example/api/projects/p/files/raw?path=a', version: 'v', size: 1 }), { code: 'invalid' });
+    await assert.rejects(store.download({ url: `${ORIGIN}/api/user/export`, version: 'v', size: 1 }), { code: 'invalid' });
+    assert.deepEqual(store.list().files, []);
+    assert.deepEqual(fs.readdirSync(path.join(dir, 'tmp')), []);
+    assert.throws(() => store.read({ hash: '../x' }), { code: 'invalid' });
+  });
+}

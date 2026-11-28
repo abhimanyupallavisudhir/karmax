@@ -87,7 +87,7 @@ test('the socket hands notices over, drops them while hidden like events, and na
   const document = { hidden: false };
   const ctx = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0, S: { clientId: 'tab_abcdefgh', projectId: 'p', tab: 'tasks', tasks: [], taskEvents: [], activity: [], meta: {} },
     location: { protocol: 'https:', host: 'example.test' }, WebSocket: function (url) { urls.push(url); }, document,
-    applyChangeNotice: (notice) => notices.push(notice), patchTaskListFromEvent: () => { throw new Error('a notice is not an event'); } });
+    applyChangeNotice: (notice) => notices.push(notice), noteOfflineFilesChange: () => {}, patchTaskListFromEvent: () => { throw new Error('a notice is not an event'); } });
   vm.runInContext(`${fn('connectWs')}\n${fn('isCrossProjectList')}\n${fn('inboxEventChanges')}`, ctx);
   ctx.connectWs();
   assert.deepEqual(urls, ['wss://example.test/ws?client=tab_abcdefgh']);
