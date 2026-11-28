@@ -362,6 +362,35 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
     expect((await store.getTask(second.id))?.params._githubAccountId).toBe('99');
   });
 
+  // An agent acting for a person (the organization's CEO, which runs for weeks)
+  // used to hand every task it created the account pinned on itself when it
+  // started, so switching back in Profile → GitHub never reached them (#1070).
+  it('pins the person’s active GitHub account, not its creator agent’s, on a task an agent creates', async () => {
+    let active = '42';
+    const organizationId = (await store.getProject(mine))!.organizationId!;
+    const accountApi = new KarmaxApi({ store, client: {} as any, taskQueue: 'karmax', tokens, contentDir,
+      worlds: new WorldRegistry(), githubApp: { activeUserAccountId: async () => active } as any });
+    const ceo = await accountApi.createTask(token, { projectId: mine, prompt: 'coordinate', draft: true });
+    expect((await store.getTask(ceo.id))?.params._githubAccountId).toBe('42');
+    const ceoAgent = (await tokens.mint({ taskId: ceo.id, profileId: 'do', role: 'do', principal: 'user:a',
+      projectId: mine, organizationId, ceiling: ['task:*'], grantorCaps: ['task:*'],
+      delegationId: ((await store.getTask(ceo.id))!.params._authorization as any).delegationId }));
+    expect(ceoAgent.record.externalIdentities).toEqual({ githubAccountId: '42' });
+
+    active = '99';
+    const created = await accountApi.createTask(ceoAgent.token, { projectId: mine, prompt: 'fix it', draft: true });
+    const stored = (await store.getTask(created.id))!;
+    expect(stored.params._githubAccountId).toBe('99');
+    // Its agents act as that account too, still for the same person.
+    const worker = (await tokens.mint({ taskId: created.id, profileId: 'do', role: 'do', principal: 'user:a',
+      projectId: mine, organizationId, ceiling: ['task:*'], grantorCaps: ['task:*'],
+      delegationId: (stored.params._authorization as any).delegationId }));
+    expect(worker.record).toMatchObject({ externalIdentities: { githubAccountId: '99' },
+      humanSubject: { userId: 'a', externalIdentities: { githubAccountId: '99' } } });
+    // The creator keeps its own: a switch never moves work already under way.
+    expect((await store.getTask(ceo.id))?.params._githubAccountId).toBe('42');
+  });
+
   it('backfills verified delegation when a human elevates an existing task and never does so for automation', async () => {
     const organizationId = (await store.getProject(mine))!.organizationId!;
     let active = '99';

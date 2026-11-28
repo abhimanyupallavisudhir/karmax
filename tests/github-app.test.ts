@@ -169,6 +169,9 @@ describe('GitHub App integration', () => {
     ]);
     await service.setActiveUserAccount('owner', '1');
     expect((await service.activeUserAccountId('owner'))).toBe('1');
+    // Recorded, so "which account was active when this task was made" can be answered.
+    expect((await store.auditSince(0, 500)).filter((entry: any) => entry.action === 'github.user-account.activated'))
+      .toEqual([expect.objectContaining({ principalId: 'user:owner' })]);
     expect(await service.removeUserAccount('owner', '2')).toBe('1');
     await expect(service.removeUserAccount('owner', '1')).rejects.toThrow('Connect a new GitHub account first');
     (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
