@@ -87,7 +87,7 @@ const config: CapacitorConfig = {
   // its own Swift port (ios/App/App/SpeechRecognitionPlugin.swift) and the npm
   // package is used for Android and the JS typings only.
   ios: {
-    includePlugins: ['@capacitor/push-notifications', '@capacitor/splash-screen'],
+    includePlugins: ['@capacitor/app', '@capacitor/push-notifications', '@capacitor/splash-screen'],
   },
   plugins: {
     PushNotifications: {

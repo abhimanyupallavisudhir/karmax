@@ -27904,9 +27904,8 @@ async function readSharedFile(phone, id, index, entry) {
   return new File(parts, entry.name || 'shared', { type: entry.type || 'application/octet-stream' });
 }
 // The new task form in the project a new task goes to, holding what was shared.
-function openSharedTaskForm(share) {
-  const projectId = newTaskProjectId();
-  if (!projectId) return withNewTaskProject((chosen) => openSharedTaskForm(share));
+function openSharedTaskForm(share, projectId = newTaskProjectId()) {
+  if (!projectId) return withNewTaskProject((chosen) => openSharedTaskForm(share, chosen));
   return openTaskForm(NEW_TASK_WORKFLOW, undefined, share.text, undefined, { projectId, share });
 }
 // Add to task…: the organization's recently updated tasks; the chosen one's
@@ -27960,6 +27959,12 @@ async function wireNativeApp() {
   await desktopShell()?.addListener('updateStatus', (status) => paintAppUpdate(status));
   // Capacitor's App plugin, where a phone shell has it, hands over the links it was opened with.
   await nativePlugin('App')?.addListener('appUrlOpen', ({ url }) => consoleReady.then(() => openAppLink({ url })));
+  // A share the shell could not announce (iOS's Share Extension may be unable to
+  // open the app) is taken when the app starts or comes back to the front.
+  if (nativePlugin('TavyaPhone')) {
+    consoleReady.then(() => receiveShare());
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') consoleReady.then(() => receiveShare()); });
+  }
   syncAppBadge(forMeTotal());
   const push = nativePlugin('PushNotifications');
   if (!push) return;

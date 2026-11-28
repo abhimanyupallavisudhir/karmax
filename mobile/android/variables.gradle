@@ -17,4 +17,5 @@ ext {
     firebaseMessagingVersion = '25.0.1'
     robolectricVersion = '4.16'
     androidxTestCoreVersion = '1.7.0'
+    mockWebServerVersion = '4.12.0'
 }

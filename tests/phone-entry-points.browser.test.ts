@@ -82,9 +82,9 @@ function fakeApp() {
 }
 
 const calls = (page: Page, plugin: string, method: string) =>
-  page.evaluate(([p, m]) => (window as any).__app[p].calls.filter(([name]: [string]) => name === m).map(([, options]: [string, any]) => options), [plugin, method]);
-const fire = (page: Page, url: string) => page.evaluate((link) => (window as any).__app.App.emit('appUrlOpen', { url: link }), url);
-const share = (page: Page, value: unknown) => page.evaluate((v) => { (window as any).__app.share = v; }, value);
+  page.evaluate(([p, m]) => (globalThis as any).__app[p].calls.filter(([name]: [string]) => name === m).map(([, options]: [string, any]) => options), [plugin, method] as [string, string]);
+const fire = (page: Page, url: string) => page.evaluate((link) => (globalThis as any).__app.App.emit('appUrlOpen', { url: link }), url);
+const share = (page: Page, value: unknown) => page.evaluate((v) => { (globalThis as any).__app.share = v; }, value);
 
 /** The system browser, already signed in to tavya: authorize → consent → Allow → back to the app. */
 async function systemBrowser(context: BrowserContext, email: string) {
@@ -231,6 +231,14 @@ it('Siri, the assistant gesture, the tile and the widget open Ask (listening), a
       expect(page.url()).toBe(`${g.url}/studio/website`);
     });
 
+    await step('a share the shell could not announce (iOS) is taken when the app comes back to the front', async () => {
+      await share(page, { id: 'share-3', text: 'From the share sheet', files: [] });
+      await page.evaluate(() => (globalThis as any).document.dispatchEvent(new Event('visibilitychange')));
+      await page.locator('#tf-page').waitFor();
+      expect(await page.locator('#tf-body textarea[data-field="prompt"]').inputValue()).toBe('From the share sheet');
+      await page.locator('#tf-close').click();
+    });
+
     await step('the phone is told the organization and its For-me count (the widget, Siri)', async () => {
       await expect.poll(async () => (await calls(page, 'TavyaPhone', 'setContext')).at(-1)).toMatchObject({ organizationId: organization.id, forMe: expect.any(Number) });
     });
@@ -259,9 +267,9 @@ it('Profile → This app: whether tavya is the phone’s digital assistant, and 
     });
 
     await step('chosen in the system settings, it says so on return; a phone without the role shows no card', async () => {
-      await page.evaluate(() => { (window as any).__app.assistant = { available: true, held: true }; document.dispatchEvent(new Event('visibilitychange')); });
+      await page.evaluate(() => { const w = globalThis as any; w.__app.assistant = { available: true, held: true }; w.document.dispatchEvent(new Event('visibilitychange')); });
       await expect.poll(() => page.locator('#app-assistant .setting-value').innerText()).toBe('tavya');
-      await page.evaluate(() => localStorage.setItem('fake-no-assistant-role', '1'));
+      await page.evaluate(() => (globalThis as any).localStorage.setItem('fake-no-assistant-role', '1'));
       await page.reload();
       await page.locator('#profile-logout, .profile').first().waitFor();
       await page.waitForTimeout(300);
