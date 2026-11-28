@@ -35,6 +35,3 @@ __pycache__/
 .vscode/
 *.swp
 environments/vm/out/
-# The desktop app's screens (design/desktop/shoot.ts) are review material, kept in the repository.
-!design/desktop/
-!design/desktop/*.png
