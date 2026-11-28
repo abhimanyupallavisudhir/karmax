@@ -265,6 +265,8 @@ for (const fn of ['hasMessageForm', 'agentEntryText', 'personMessageText', 'mess
 global.narrowViewport = () => false;
 global.fmtKeys = (keys) => keys;
 global.micButtonHtml = () => '';
+global.messageDraft = () => '';
+global.SEND_KEYS = 'meta+Enter';
 eval(extractFn('taskPlacesLinks'));
 eval(extractFn('conversationBar'));
 for (const fn of ['humanWaitDetail', 'conversationOutline', 'foldDuration', 'foldPreview', 'conversationFoldHead']) eval(extractFn(fn));
