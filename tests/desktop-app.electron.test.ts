@@ -11,6 +11,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { _electron, type ElectronApplication, type Page } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { DesktopPushSockets } from '../src/collaboration/desktop-push.js';
+import { PushDeliveryAdapter, vaultVapidKeys } from '../src/collaboration/push-delivery.js';
 import { DesktopReleases } from '../src/gateway/desktop-downloads.js';
 import { consoleRequest, hostedGateway, signIn, type HostedGateway } from './helpers/browser.js';
 
@@ -23,6 +25,7 @@ const SHOTS = process.env.KARMAX_SHOTS;
 const PASSWORD = 'correct horse battery staple 42';
 
 let g: HostedGateway;
+const sockets = new DesktopPushSockets();
 let app: ElectronApplication;
 let page: Page;
 let userData: string;
@@ -37,7 +40,8 @@ const opened = () => app.evaluate(() => (globalThis as any).__opened as string[]
 
 describe.skipIf(!runnable)('the desktop app', () => {
   beforeAll(async () => {
-    g = await hostedGateway(() => ({ desktopReleases: new DesktopReleases({ fetch: (async () => Response.json([])) as unknown as typeof fetch }) }));
+    g = await hostedGateway(({ broker }) => ({ desktopReleases: new DesktopReleases({ fetch: (async () => Response.json([])) as unknown as typeof fetch }),
+      hostLocal: true, pushKeys: vaultVapidKeys(broker), desktopPush: sockets, deliveryChannels: ['browser', 'push'] }));
     userData = fs.mkdtempSync(path.join(os.tmpdir(), 'tavya-desktop-test-'));
     app = await _electron.launch({ executablePath: electronPath!, args: [DESKTOP, '--use-fake-device-for-media-stream'], env: env() });
     await app.evaluate(({ shell }) => {
@@ -64,7 +68,9 @@ describe.skipIf(!runnable)('the desktop app', () => {
     expect(bridge).toMatchObject({ native: true, platform: 'electron', plugins: ['TavyaSignIn', 'TavyaDesktop'], offline: false, node: 'undefined' });
     expect(bridge.desktop).toEqual(['addListener', 'checkForUpdates', 'getHotkey', 'getLaunchAtLogin', 'getUpdateStatus', 'installUpdate',
       'removeAllListeners', 'setBadge', 'setHotkey', 'setLaunchAtLogin', 'show']);
-    expect(bridge.signIn).toEqual(['addListener', 'clearDeviceToken', 'open', 'removeAllListeners', 'saveDeviceToken']);
+    // The device token is offered only where the OS keychain can keep it (not under a bare Xvfb).
+    const keychain = (await app.evaluate(() => (globalThis as any).tavyaDesktop.deviceToken())).secure;
+    expect(bridge.signIn).toEqual(['addListener', 'clearDeviceToken', 'open', 'removeAllListeners', ...(keychain ? ['saveDeviceToken'] : [])]);
     expect(bridge.ua).toMatch(/ tavya-app$/);
     expect(bridge.ua.match(/tavya-app/g)).toHaveLength(1);
     const tray = await app.evaluate(() => (globalThis as any).tavyaDesktop.tray());
@@ -151,22 +157,84 @@ describe.skipIf(!runnable)('the desktop app', () => {
     expect(answers).toEqual({ notification: 'granted', requested: 'granted', mic: 'granted', camera: 'NotAllowedError', geolocation: 'denied' });
   });
 
-  it('signs in through the system browser on a one-shot loopback listener', async () => {
-    const authorize = `${g.url}/oauth/authorize?${new URLSearchParams({ response_type: 'code', client_id: 'tavya-desktop', redirect_uri: 'http://127.0.0.1/signed-in', state: 'st' })}`;
-    const result = page.evaluate((url) => (window as any).Capacitor.Plugins.TavyaSignIn.open({ url }), authorize);
+  it('signs in through the system browser and a one-shot loopback listener, and is listed as Desktop', async () => {
+    await g.owner({ name: 'Ada', email: 'ada@example.test', password: PASSWORD, organization: 'Acme' });
+    const signedIn = await fetch(`${g.url}/api/auth/sign-in/email`, { method: 'POST', headers: { origin: g.url, 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'ada@example.test', password: PASSWORD }) });
+    const browserCookie = signedIn.headers.get('set-cookie')!.match(/better-auth\.session_token=[^;]+/)![0];
+    await page.goto(g.url);
+    await page.locator('#app-sign-in').click();
+    // The system browser opens the console's consent for the desktop client, its redirect on this app's port.
     await expect.poll(async () => (await opened()).find((url) => url.includes('/oauth/authorize'))).toBeTruthy();
     const asked = new URL((await opened()).find((url) => url.includes('/oauth/authorize'))!);
+    expect(asked.searchParams.get('client_id')).toBe('tavya-desktop');
     const redirect = new URL(asked.searchParams.get('redirect_uri')!);
-    expect(redirect.hostname).toBe('127.0.0.1');
-    expect(redirect.pathname).toBe('/signed-in');
+    expect([redirect.hostname, redirect.pathname]).toEqual(['127.0.0.1', '/signed-in']);
     expect(Number(redirect.port)).toBeGreaterThan(0);
-    // The browser comes back (here, the test plays it).
-    const back = await fetch(`${redirect.href}?code=c&state=st&iss=${encodeURIComponent(g.url)}`);
-    expect(await back.text()).toMatch(/Signed in/);
-    expect(await result).toEqual({ url: `${redirect.href}?code=c&state=st&iss=${encodeURIComponent(g.url)}` });
+    // The person, signed in there, allows it (the test plays the browser).
+    const authorize = await fetch(asked, { redirect: 'manual', headers: { cookie: browserCookie } });
+    const request = new URL(authorize.headers.get('location')!, g.url).searchParams.get('request')!;
+    const approved = await fetch(`${g.url}/api/oauth/authorizations/${request}/approve`, { method: 'POST',
+      headers: { origin: g.url, cookie: browserCookie, 'content-type': 'application/json' }, body: '{}' });
+    const back = (await approved.json() as { redirectUri: string }).redirectUri;
+    expect(back.startsWith(redirect.href)).toBe(true);
+    // The browser follows the redirect to the app's listener, which answers and closes.
+    expect(await (await fetch(back)).text()).toMatch(/Signed in/);
+    await expect(fetch(back)).rejects.toThrow();
+    await page.locator('.rail').first().waitFor();
+    await page.goto(`${g.url}/profile`);
+    const row = page.locator('.app-grant-row', { hasText: 'tavya on' });
+    await row.waitFor();
+    expect(await row.innerText()).toMatch(/Desktop[\s\S]*This one/);
+    await shot('profile');
     // Not a URL of this console's authorization endpoint: refused, nothing opened.
     const refused = await page.evaluate(() => (window as any).Capacitor.Plugins.TavyaSignIn.open({ url: 'https://example.com/oauth/authorize' }).catch((error: unknown) => error));
     expect(refused).toEqual({ code: 'invalid', message: 'Sign-in must go to this tavya.' });
+  });
+
+  it('opens Ask on the global shortcut, signed in, with the window hidden', async () => {
+    if (spawnSync('xdotool', ['--version']).status !== 0) return;
+    await page.goto(g.url);
+    await page.locator('.rail').first().waitFor();
+    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.hide());
+    spawnSync('xdotool', ['key', 'ctrl+alt+space']);
+    await page.locator('.ask-dialog[open] textarea').waitFor();
+    expect(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.isVisible())).toBe(true);
+    await page.locator('.ask-dialog textarea').fill('What’s waiting on me?');
+    await shot('ask');
+    await page.keyboard.press('Escape');
+  });
+
+  it('notifies over its own connection; a click raises the hidden window on the task', async () => {
+    const user = (await g.identity.listUsers()).find((entry: { email: string }) => entry.email === 'ada@example.test')!;
+    const organization = (await g.store.listOrganizations()).find((entry) => entry.name === 'Acme')!;
+    const project = await g.store.createProject('Website', undefined, organization.id);
+    const task = await g.store.createTask({ projectId: project.id, title: 'Fix the login', workflow: 'just-do', workflowVersion: '1.0.0',
+      params: {} as any, createdBy: { kind: 'user', userId: user.id } });
+    await page.goto(`${g.url}/profile#notifications`);
+    await page.locator('#push-this-device').click();
+    await expect.poll(async () => (await g.store.listPushSubscriptions(user.id)).map((device) => [device.kind, device.label]))
+      .toEqual([['desktop', 'tavya on Linux']]);
+    const [device] = await g.store.listPushSubscriptions(user.id);
+    await expect.poll(() => sockets.connected(device!.id)).toBe(1);
+    // Electron shows the page's Notification natively; record what the page shows.
+    await page.evaluate(() => {
+      const Real = window.Notification;
+      (window as any).__shown = [];
+      (window as any).Notification = Object.assign(function (this: any, title: string, options: NotificationOptions) {
+        const shown = new Real(title, options);
+        (window as any).__shown.push(shown);
+        return shown;
+      }, { permission: Real.permission, requestPermission: Real.requestPermission.bind(Real) });
+    });
+    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.hide());
+    const adapter = new PushDeliveryAdapter({ store: g.store, keys: async () => { throw new Error('no web devices'); }, siteName: async () => 'tavya', desktop: sockets });
+    await adapter.deliver({ inbox: { id: 'inbox_e1', organizationId: organization.id, userId: user.id, eventSeq: 1, taskId: task.id, kind: 'review-requested',
+      urgency: 'high', unread: true, actionable: true, createdAt: Date.now() }, task: { id: task.id, num: task.num, title: task.title, projectId: project.id } });
+    await expect.poll(() => page.evaluate(() => (window as any).__shown.map((n: Notification) => [n.title, n.tag]))).toEqual([['Fix the login', 'inbox_e1']]);
+    await page.evaluate(() => (window as any).__shown[0].onclick?.(new Event('click')));
+    await expect.poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.isVisible())).toBe(true);
+    await expect.poll(() => new URL(page.url()).pathname).toBe(`/acme/website/tasks/${task.num}`);
   });
 
   it('takes dropped files on the new-task form, like the browser', async () => {

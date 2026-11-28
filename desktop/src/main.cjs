@@ -256,7 +256,8 @@ function start() {
           signIn = attempt;
           try { return await attempt.promise; } finally { if (signIn === attempt) signIn = null; }
         },
-        saveDeviceToken: async ({ token }) => { await deviceToken.save(token); },
+        // Offered only where the OS keychain can hold it, so the console never asks for a token nobody can keep.
+        ...(deviceToken.secure() ? { saveDeviceToken: async ({ token }) => { await deviceToken.save(token); } } : {}),
         clearDeviceToken: async () => { await deviceToken.clear(); },
       },
     });
@@ -352,6 +353,7 @@ function start() {
     globalThis.tavyaDesktop = {
       tray: () => ({ tooltip: forMe ? `tavya · ${forMe} for you` : 'tavya', forMe, items: trayMenu().items.map((item) => item.label || item.type) }),
       hotkey: () => hotkey.status(),
+      deviceToken: () => ({ secure: deviceToken.secure(), saved: deviceToken.has() }),
       updates: () => updates.status(),
       window: () => win,
     };

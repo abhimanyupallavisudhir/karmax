@@ -121,6 +121,12 @@ try {
   await until(async () => (await page.locator('#tf-body').innerText()).includes('social-card.csv'), 'the new-task form takes the dropped file', 10_000);
   await page.screenshot({ path: path.join(OUT, 'new-task-drop.png') });
 
+  // Profile → This app: the Ask shortcut, open at login, the version.
+  await page.goto(`${app.url}/profile`);
+  await page.locator('#this-app').scrollIntoViewIfNeeded();
+  await page.waitForTimeout(500);
+  await page.locator('#this-app').screenshot({ path: path.join(OUT, 'this-app.png') });
+
   // The whole screen: the window and, in the panel, the tray icon with its dot.
   await page.goto(app.url);
   await page.locator(`[data-id="${review.id}"]`).waitFor();
