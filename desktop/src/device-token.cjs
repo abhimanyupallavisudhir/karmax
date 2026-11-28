@@ -1,5 +1,5 @@
 // The app's device token (wiki planned/native-apps-round-2, contract 3): a
-// refresh token tvr_… of the desktop's `app` grant, handed over once by the
+// refresh token tvr_<grant>.<secret> of the desktop's `app` grant, handed over once by the
 // console at sign-in (TavyaSignIn.saveDeviceToken) for native surfaces that
 // run without the window (the tray, later). It is encrypted with the OS
 // keychain (Electron safeStorage: Keychain on a Mac, libsecret/KWallet on
@@ -42,7 +42,7 @@ class DeviceToken {
 
   save(token) {
     return this.serial(async () => {
-      if (typeof token !== 'string' || !/^tvr_[A-Za-z0-9_-]{16,}$/.test(token)) throw { code: 'invalid', message: 'Not a device token.' };
+      if (typeof token !== 'string' || !/^tvr_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{16,}$/.test(token)) throw { code: 'invalid', message: 'Not a device token.' };
       this.access = null;
       if (!this.secure()) { this.removeFile(); return false; }
       this.write(token);

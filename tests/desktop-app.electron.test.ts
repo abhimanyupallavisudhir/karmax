@@ -60,10 +60,10 @@ describe.skipIf(!runnable)('the desktop app', () => {
   it('loads the console with the native bridge, the tavya-app user agent and a tray', async () => {
     expect(page.url()).toBe(`${g.url}/`);
     const bridge = await page.evaluate(() => {
-      const cap = (window as any).Capacitor;
+      const cap = (globalThis as any).Capacitor;
       return { native: cap.isNativePlatform(), platform: cap.getPlatform(), plugins: Object.keys(cap.Plugins),
         desktop: Object.keys(cap.Plugins.TavyaDesktop).sort(), signIn: Object.keys(cap.Plugins.TavyaSignIn).sort(),
-        offline: cap.isPluginAvailable('TavyaOfflineFiles'), ua: navigator.userAgent, node: typeof (window as any).require };
+        offline: cap.isPluginAvailable('TavyaOfflineFiles'), ua: (globalThis as any).navigator.userAgent, node: typeof (globalThis as any).require };
     });
     expect(bridge).toMatchObject({ native: true, platform: 'electron', plugins: ['TavyaSignIn', 'TavyaDesktop'], offline: false, node: 'undefined' });
     expect(bridge.desktop).toEqual(['addListener', 'checkForUpdates', 'getHotkey', 'getLaunchAtLogin', 'getUpdateStatus', 'installUpdate',
@@ -78,15 +78,15 @@ describe.skipIf(!runnable)('the desktop app', () => {
   });
 
   it('shows the For-me count the console reports in the tray', async () => {
-    await page.evaluate(() => (window as any).Capacitor.Plugins.TavyaDesktop.setBadge({ count: 3 }));
+    await page.evaluate(() => (globalThis as any).Capacitor.Plugins.TavyaDesktop.setBadge({ count: 3 }));
     expect(await app.evaluate(() => (globalThis as any).tavyaDesktop.tray())).toMatchObject({ tooltip: 'tavya · 3 for you', forMe: 3,
       items: expect.arrayContaining(['For me (3)']) });
-    await page.evaluate(() => (window as any).Capacitor.Plugins.TavyaDesktop.setBadge({ count: 0 }));
+    await page.evaluate(() => (globalThis as any).Capacitor.Plugins.TavyaDesktop.setBadge({ count: 0 }));
     expect((await app.evaluate(() => (globalThis as any).tavyaDesktop.tray())).tooltip).toBe('tavya');
   });
 
   it('registers the global Ask shortcut, changeable, and says plainly when one is taken or invalid', async () => {
-    const desktop = (call: string, options?: unknown) => page.evaluate(([name, args]) => (window as any).Capacitor.Plugins.TavyaDesktop[name as string](args), [call, options] as const);
+    const desktop = (call: string, options?: unknown) => page.evaluate(([name, args]) => (globalThis as any).Capacitor.Plugins.TavyaDesktop[name as string](args), [call, options] as const);
     expect(await desktop('getHotkey')).toMatchObject({ accelerator: 'Control+Alt+Space', registered: true, label: 'Ctrl+Alt+Space' });
     expect(await desktop('setHotkey', { accelerator: 'Control+Alt+K' })).toMatchObject({ accelerator: 'Control+Alt+K', registered: true });
     expect(await app.evaluate(({ globalShortcut }) => [globalShortcut.isRegistered('Control+Alt+K'), globalShortcut.isRegistered('Control+Alt+Space')]))
@@ -101,44 +101,44 @@ describe.skipIf(!runnable)('the desktop app', () => {
 
   it('opens Ask on the shortcut and console pages from io.tavya.app links, through the console\'s listener', async () => {
     await page.evaluate(async () => {
-      (window as any).__opens = [];
-      await (window as any).Capacitor.Plugins.TavyaDesktop.addListener('open', (target: unknown) => (window as any).__opens.push(target));
+      (globalThis as any).__opens = [];
+      await (globalThis as any).Capacitor.Plugins.TavyaDesktop.addListener('open', (target: unknown) => (globalThis as any).__opens.push(target));
     });
     if (spawnSync('xdotool', ['--version']).status === 0) {
       // A real key press, through the X server, while another window could have focus.
       spawnSync('xdotool', ['key', 'ctrl+alt+space']);
-      await expect.poll(() => page.evaluate(() => (window as any).__opens)).toEqual([{ path: null, url: null, ask: true }]);
-      await page.evaluate(() => { (window as any).__opens = []; });
+      await expect.poll(() => page.evaluate(() => (globalThis as any).__opens)).toEqual([{ path: null, url: null, ask: true }]);
+      await page.evaluate(() => { (globalThis as any).__opens = []; });
     }
     // A link opened elsewhere starts a second instance, which hands it over and quits.
     const second = spawn(electronPath!, [DESKTOP, 'io.tavya.app://open?path=/acme/tasks/12'], { env: env(), stdio: 'ignore' });
     const code = await new Promise<number | null>((resolve) => second.on('exit', resolve));
     expect(code).toBe(0);
-    await expect.poll(() => page.evaluate(() => (window as any).__opens))
+    await expect.poll(() => page.evaluate(() => (globalThis as any).__opens))
       .toEqual([{ path: '/acme/tasks/12', url: 'io.tavya.app://open?path=/acme/tasks/12', ask: false }]);
     // A link that leaves the console is refused.
     const evil = spawn(electronPath!, [DESKTOP, 'io.tavya.app://open?path=//evil.example/x'], { env: env(), stdio: 'ignore' });
     await new Promise((resolve) => evil.on('exit', resolve));
     await page.waitForTimeout(300);
-    expect(await page.evaluate(() => (window as any).__opens)).toHaveLength(1);
+    expect(await page.evaluate(() => (globalThis as any).__opens)).toHaveLength(1);
   });
 
   it('keeps running in the tray when the window is closed, and a second launch shows it again', async () => {
     await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.close());
-    expect(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map((window) => window.isVisible()))).toEqual([false]);
+    expect(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map((shown: any) => shown.isVisible()))).toEqual([false]);
     const second = spawn(electronPath!, [DESKTOP], { env: env(), stdio: 'ignore' });
     await new Promise((resolve) => second.on('exit', resolve));
     await expect.poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.isVisible())).toBe(true);
   });
 
   it('keeps the window on the console: other sites, links and new windows open in the system browser', async () => {
-    await page.evaluate(() => { location.href = 'https://example.com/elsewhere'; });
+    await page.evaluate(() => { (globalThis as any).location.href = 'https://example.com/elsewhere'; });
     await expect.poll(opened).toContain('https://example.com/elsewhere');
     expect(page.url()).toBe(`${g.url}/`);
-    await page.evaluate(() => window.open('https://example.org/new', '_blank'));
+    await page.evaluate(() => (globalThis as any).open('https://example.org/new', '_blank'));
     await expect.poll(opened).toContain('https://example.org/new');
     // Nothing but web and mail links leave the app.
-    await page.evaluate(() => { location.href = 'file:///etc/passwd'; });
+    await page.evaluate(() => { (globalThis as any).location.href = 'file:///etc/passwd'; });
     await page.waitForTimeout(300);
     expect(page.url()).toBe(`${g.url}/`);
     expect((await opened()).some((url) => url.startsWith('file:'))).toBe(false);
@@ -146,12 +146,14 @@ describe.skipIf(!runnable)('the desktop app', () => {
 
   it('grants the console notifications and the microphone, and nothing else', async () => {
     const answers = await page.evaluate(async () => {
-      const ask = async (constraints: MediaStreamConstraints) => {
-        try { (await navigator.mediaDevices.getUserMedia(constraints)).getTracks().forEach((track) => track.stop()); return 'granted'; }
+      // Runs in the page (the project's types have no DOM).
+      const w = globalThis as any;
+      const ask = async (constraints: object) => {
+        try { (await w.navigator.mediaDevices.getUserMedia(constraints)).getTracks().forEach((track: any) => track.stop()); return 'granted'; }
         catch (error) { return (error as Error).name; }
       };
-      const geolocation = await new Promise((resolve) => navigator.geolocation.getCurrentPosition(() => resolve('granted'), (error) => resolve(error.code === 1 ? 'denied' : 'error')));
-      return { notification: Notification.permission, requested: await Notification.requestPermission(),
+      const geolocation = await new Promise((resolve) => w.navigator.geolocation.getCurrentPosition(() => resolve('granted'), (error: any) => resolve(error.code === 1 ? 'denied' : 'error')));
+      return { notification: w.Notification.permission, requested: await w.Notification.requestPermission(),
         mic: await ask({ audio: true }), camera: await ask({ video: true }), geolocation };
     });
     expect(answers).toEqual({ notification: 'granted', requested: 'granted', mic: 'granted', camera: 'NotAllowedError', geolocation: 'denied' });
@@ -188,8 +190,39 @@ describe.skipIf(!runnable)('the desktop app', () => {
     expect(await row.innerText()).toMatch(/Desktop[\s\S]*This one/);
     await shot('profile');
     // Not a URL of this console's authorization endpoint: refused, nothing opened.
-    const refused = await page.evaluate(() => (window as any).Capacitor.Plugins.TavyaSignIn.open({ url: 'https://example.com/oauth/authorize' }).catch((error: unknown) => error));
+    const refused = await page.evaluate(() => (globalThis as any).Capacitor.Plugins.TavyaSignIn.open({ url: 'https://example.com/oauth/authorize' }).catch((error: unknown) => error));
     expect(refused).toEqual({ code: 'invalid', message: 'Sign-in must go to this tavya.' });
+  });
+
+  it('keeps a device token the server issues and refreshes it there, one rotation at a time', async () => {
+    // The shell's token store (desktop/src/device-token.cjs) against this server's /oauth/token, with a stand-in keychain.
+    const { DeviceToken } = createRequire(path.join(DESKTOP, 'package.json'))('./src/device-token.cjs');
+    const verifier = 'v'.repeat(43);
+    const challenge = (await import('node:crypto')).createHash('sha256').update(verifier).digest('base64url');
+    const signedIn = await fetch(`${g.url}/api/auth/sign-in/email`, { method: 'POST', headers: { origin: g.url, 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'ada@example.test', password: PASSWORD }) });
+    const cookie = signedIn.headers.get('set-cookie')!.match(/better-auth\.session_token=[^;]+/)![0];
+    const redirect = 'http://127.0.0.1:41234/signed-in';
+    const authorize = await fetch(`${g.url}/oauth/authorize?${new URLSearchParams({ response_type: 'code', client_id: 'tavya-desktop', redirect_uri: redirect,
+      code_challenge: challenge, code_challenge_method: 'S256', state: 's' })}`, { redirect: 'manual', headers: { cookie } });
+    const request = new URL(authorize.headers.get('location')!, g.url).searchParams.get('request')!;
+    const approved = await (await fetch(`${g.url}/api/oauth/authorizations/${request}/approve`, { method: 'POST',
+      headers: { origin: g.url, cookie, 'content-type': 'application/json' }, body: '{}' })).json() as { redirectUri: string };
+    const session = await (await fetch(`${g.url}/oauth/app-session`, { method: 'POST', headers: { origin: g.url, 'content-type': 'application/json' },
+      body: JSON.stringify({ client_id: 'tavya-desktop', code: new URL(approved.redirectUri).searchParams.get('code'), code_verifier: verifier,
+        redirect_uri: redirect, name: 'tavya on Linux', device_token: true }) })).json() as { deviceToken: string };
+    const safeStorage = { isEncryptionAvailable: () => true, getSelectedStorageBackend: () => 'gnome_libsecret',
+      encryptString: (text: string) => Buffer.from(text).reverse(), decryptString: (buffer: Buffer) => Buffer.from(buffer).reverse().toString() };
+    const store = new DeviceToken({ dir: fs.mkdtempSync(path.join(os.tmpdir(), 'tavya-token-')), safeStorage, origin: g.url, platform: 'linux' });
+    expect(await store.save(session.deviceToken)).toBe(true);
+    const access = await store.accessToken();
+    expect(access).toMatch(/^tva_/);
+    const me = await fetch(`${g.url}/api/user/app-grants`, { headers: { authorization: `Bearer ${access}` } });
+    expect(me.status).toBe(200);
+    store.access = null;
+    expect(await store.accessToken()).toMatch(/^tva_/);
+    // The first token was rotated away: presenting it now would revoke the grant, so the store never does.
+    expect(store.read()).not.toBe(session.deviceToken);
   });
 
   it('opens Ask on the global shortcut, signed in, with the window hidden', async () => {
@@ -219,11 +252,12 @@ describe.skipIf(!runnable)('the desktop app', () => {
     await expect.poll(() => sockets.connected(device!.id)).toBe(1);
     // Electron shows the page's Notification natively; record what the page shows.
     await page.evaluate(() => {
-      const Real = window.Notification;
-      (window as any).__shown = [];
-      (window as any).Notification = Object.assign(function (this: any, title: string, options: NotificationOptions) {
+      const w = globalThis as any;
+      const Real = w.Notification;
+      w.__shown = [];
+      w.Notification = Object.assign(function (this: any, title: string, options: object) {
         const shown = new Real(title, options);
-        (window as any).__shown.push(shown);
+        (globalThis as any).__shown.push(shown);
         return shown;
       }, { permission: Real.permission, requestPermission: Real.requestPermission.bind(Real) });
     });
@@ -231,8 +265,8 @@ describe.skipIf(!runnable)('the desktop app', () => {
     const adapter = new PushDeliveryAdapter({ store: g.store, keys: async () => { throw new Error('no web devices'); }, siteName: async () => 'tavya', desktop: sockets });
     await adapter.deliver({ inbox: { id: 'inbox_e1', organizationId: organization.id, userId: user.id, eventSeq: 1, taskId: task.id, kind: 'review-requested',
       urgency: 'high', unread: true, actionable: true, createdAt: Date.now() }, task: { id: task.id, num: task.num, title: task.title, projectId: project.id } });
-    await expect.poll(() => page.evaluate(() => (window as any).__shown.map((n: Notification) => [n.title, n.tag]))).toEqual([['Fix the login', 'inbox_e1']]);
-    await page.evaluate(() => (window as any).__shown[0].onclick?.(new Event('click')));
+    await expect.poll(() => page.evaluate(() => (globalThis as any).__shown.map((n: any) => [n.title, n.tag]))).toEqual([['Fix the login', 'inbox_e1']]);
+    await page.evaluate(() => (globalThis as any).__shown[0].onclick?.(new Event('click')));
     await expect.poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.isVisible())).toBe(true);
     await expect.poll(() => new URL(page.url()).pathname).toBe(`/acme/website/tasks/${task.num}`);
   });
@@ -248,9 +282,10 @@ describe.skipIf(!runnable)('the desktop app', () => {
     await prompt.fill('Make the logo smaller');
     // An OS drag delivers a DataTransfer of files to the page; navigateOnDragDrop is off, so the page keeps it.
     await prompt.evaluate((element) => {
-      const data = new DataTransfer();
-      data.items.add(new File(['a,b\n1,2\n'], 'sizes.csv', { type: 'text/csv' }));
-      for (const type of ['dragenter', 'dragover', 'drop']) element.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: data }));
+      const w = globalThis as any;
+      const data = new w.DataTransfer();
+      data.items.add(new w.File(['a,b\n1,2\n'], 'sizes.csv', { type: 'text/csv' }));
+      for (const type of ['dragenter', 'dragover', 'drop']) element.dispatchEvent(new w.DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: data }));
     });
     await expect.poll(() => page.locator('#tf-body').innerText()).toContain('sizes.csv');
     expect(page.url()).toBe(`${g.url}/dropco/website`);
@@ -262,11 +297,11 @@ describe.skipIf(!runnable)('the desktop app', () => {
     const offline = await _electron.launch({ executablePath: electronPath!, args: [DESKTOP],
       env: { ...env(), TAVYA_URL: 'http://127.0.0.1:9', TAVYA_DESKTOP_USER_DATA: offlineData } });
     try {
-      const window = await offline.firstWindow();
-      await window.locator('#retry').waitFor();
-      expect(await window.locator('h1').innerText()).toBe('Can’t reach 127.0.0.1:9'.replace('’', "'"));
-      expect(await window.evaluate(() => typeof (window as any).Capacitor)).toBe('undefined');
-      if (SHOTS) await window.screenshot({ path: path.join(SHOTS, 'offline.png') });
+      const offlinePage = await offline.firstWindow();
+      await offlinePage.locator('#retry').waitFor();
+      expect(await offlinePage.locator('h1').innerText()).toBe('Can’t reach 127.0.0.1:9'.replace('’', "'"));
+      expect(await offlinePage.evaluate(() => typeof (globalThis as any).Capacitor)).toBe('undefined');
+      if (SHOTS) await offlinePage.screenshot({ path: path.join(SHOTS, 'offline.png') });
     } finally {
       await offline.close();
       fs.rmSync(offlineData, { recursive: true, force: true });

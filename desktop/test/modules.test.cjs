@@ -217,7 +217,7 @@ const fakeSafeStorage = (available = true, backend = 'gnome_libsecret') => ({
 test('the device token is kept encrypted, refreshed one at a time, rotated, and forgotten when the grant is gone', async () => {
   const dir = tmp();
   const calls = [];
-  let live = 'tvr_first_token_0123456789';
+  let live = 'tvr_grant_a1.first0123456789abcdef';
   let active = 0;
   const fetcher = async (url, init) => {
     active++;
@@ -227,31 +227,32 @@ test('the device token is kept encrypted, refreshed one at a time, rotated, and 
     const body = new URLSearchParams(init.body);
     calls.push({ url, grant: body.get('grant_type'), client: body.get('client_id'), token: body.get('refresh_token') });
     if (body.get('refresh_token') !== live) return Response.json({ error: 'invalid_grant' }, { status: 400 });
-    live = `tvr_rotated_${calls.length}_0123456789`;
+    live = `tvr_grant_a1.rotated${calls.length}0123456789abcdef`;
     return Response.json({ access_token: `tva_${calls.length}`, refresh_token: live, expires_in: 3600 });
   };
   const token = new DeviceToken({ dir, safeStorage: fakeSafeStorage(), origin: ORIGIN, fetch: fetcher, platform: 'linux' });
   await assert.rejects(token.save('not-a-token'), { code: 'invalid' });
-  await token.save('tvr_first_token_0123456789');
-  assert.ok(!fs.readFileSync(token.file, 'utf8').includes('tvr_first'), 'never stored in plain text');
+  await assert.rejects(token.save('tva_grant_a1.0123456789abcdef0123'), { code: 'invalid' }, 'an access token is not a device token');
+  await token.save('tvr_grant_a1.first0123456789abcdef');
+  assert.ok(!fs.readFileSync(token.file, 'utf8').includes('tvr_grant'), 'never stored in plain text');
   const [a, b] = await Promise.all([token.accessToken(), token.accessToken()]);
   assert.equal(a, 'tva_1');
   assert.equal(b, 'tva_1', 'the second waits and reuses the fresh access token');
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0], { url: 'https://tavya.io/oauth/token', grant: 'refresh_token', client: 'tavya-desktop', token: 'tvr_first_token_0123456789' });
+  assert.deepEqual(calls[0], { url: 'https://tavya.io/oauth/token', grant: 'refresh_token', client: 'tavya-desktop', token: 'tvr_grant_a1.first0123456789abcdef' });
   token.access = null;
   assert.equal(await token.accessToken(), 'tva_2');
-  assert.equal(calls[1].token, 'tvr_rotated_1_0123456789', 'the rotated token is the one used next');
+  assert.equal(calls[1].token, 'tvr_grant_a1.rotated10123456789abcdef', 'the rotated token is the one used next');
   live = 'revoked';
   token.access = null;
   assert.equal(await token.accessToken(), null);
   assert.equal(token.has(), false, 'invalid_grant deletes it');
-  await token.save('tvr_again_0123456789abcd');
+  await token.save('tvr_grant_a1.again0123456789abcdef');
   await token.clear();
   assert.equal(token.has(), false);
 
   const noKeyring = new DeviceToken({ dir: tmp(), safeStorage: fakeSafeStorage(true, 'basic_text'), origin: ORIGIN, fetch: fetcher, platform: 'linux' });
-  assert.equal(await noKeyring.save('tvr_first_token_0123456789'), false);
+  assert.equal(await noKeyring.save('tvr_grant_a1.first0123456789abcdef'), false);
   assert.equal(noKeyring.has(), false, 'not kept without a keychain');
 });
 
