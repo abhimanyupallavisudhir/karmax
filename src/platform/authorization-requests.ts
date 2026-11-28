@@ -2,6 +2,7 @@ import type { AuthorizationSelection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
 import type { Capability } from './capabilities.js';
+import { ConflictError } from './errors.js';
 
 export type AuthorizationRequestTarget =
   { kind: 'task'; taskId: string; /** One of the task's agents other than the
@@ -96,7 +97,7 @@ export class AuthorizationRequests {
       const all = await this.requests();
       const request = all.find((candidate) => candidate.id === id);
       if (!request) throw new Error(`no authorization request ${id}`);
-      if (request.status !== 'pending') throw new Error(`request ${id} is already ${request.status}`);
+      if (request.status !== 'pending') throw new ConflictError(`request ${id} is already ${request.status}`);
       if (request.claim) throw new Error('authorization request decision is already in progress');
       request.claim = { id: newId('claim'), action, by, at: Date.now() };
       await this.save(all);
@@ -110,7 +111,7 @@ export class AuthorizationRequests {
     const all = (await this.requests());
     const request = all.find((candidate) => candidate.id === id);
     if (!request) throw new Error(`no authorization request ${id}`);
-    if (request.status !== 'pending') throw new Error(`request ${id} is already ${request.status}`);
+    if (request.status !== 'pending') throw new ConflictError(`request ${id} is already ${request.status}`);
     if (request.claim && (request.claim.id !== claimId || request.claim.action !== action || request.claim.by !== by))
       throw new Error('authorization request decision is already in progress');
     if (claimId && !request.claim) throw new Error('authorization request decision claim is no longer active');
@@ -135,7 +136,7 @@ export class AuthorizationRequests {
     const all = (await this.requests());
     const request = all.find((candidate) => candidate.id === id);
     if (!request) throw new Error(`no authorization request ${id}`);
-    if (request.status !== 'pending') throw new Error(`request ${id} is already ${request.status}`);
+    if (request.status !== 'pending') throw new ConflictError(`request ${id} is already ${request.status}`);
     if (request.claim) throw new Error('authorization request decision is already in progress');
     request.dismissed ??= { by, at: Date.now() };
     (await this.save(all));

@@ -1,7 +1,10 @@
 import type { Store } from '../store/db.js';
 
-/** Journal the same human decision for direct and deferred Review confirmation. */
-export async function recordHumanConfirmation(store: Store, taskId: string, userId: string): Promise<void> {
+/** Journal the same human decision for direct and deferred Review confirmation.
+ * `userId` is whose authority it carries (their GitHub merge consent); `by`,
+ * when someone else confirmed with it — an agent standing in for them — is who
+ * did (decision-maker.ts), so the record never says the person confirmed. */
+export async function recordHumanConfirmation(store: Store, taskId: string, userId: string, by?: string): Promise<void> {
   const task = (await store.getTask(taskId));
   if (!task?.lastView || task.lastView.waitingFor?.kind !== 'human') return;
   // A failed Confirm agent can expose the same human decision from its
@@ -11,7 +14,7 @@ export async function recordHumanConfirmation(store: Store, taskId: string, user
       && task.lastView.actions.some((action) => action.name === 'confirm' && action.enabled));
   (await store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
     payload: {
-      userId, audience: task.lastView.waitingFor.audience ?? ['@creator'], satisfied: true,
+      userId, ...(by && by !== `user:${userId}` ? { by } : {}), audience: task.lastView.waitingFor.audience ?? ['@creator'], satisfied: true,
       githubMergeAuthorized: Boolean(task.lastView.prs?.length
         && (reviewConfirmation || task.lastView.stage === 'merge')),
       // Current software-dev treats a Review confirmation as durable

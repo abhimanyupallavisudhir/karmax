@@ -25566,6 +25566,18 @@ function credentialRequestTaskLink(request) {
     : `<span>${esc(label)}</span>`;
 }
 
+// Who decided a request (the GET routes' `decidedBy`, src/platform/decision-maker.ts):
+// a person by name, a task's agent linked to its task. Decisions recorded before
+// agents were told apart from the person they act for show that person.
+function decidedByHtml(request) {
+  const maker = request.decidedBy;
+  if (!maker) return '';
+  // Linked only when the console knows its project (it may be another project's).
+  const task = maker.taskId && taskRecord(maker.taskId);
+  const who = task ? `<a data-spa href="${esc(taskUrl(task.id, task))}">${esc(maker.label)}</a>` : esc(maker.label);
+  return `<span class="task-sub">by ${who}</span>`;
+}
+
 // The vault item chosen for each unbound credential request, by request id. It
 // lives outside the row so a re-render of the approvals list keeps the choice.
 const credentialRequestBindings = new Map();
@@ -25627,7 +25639,8 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
     ? `<div class="approval-history"><div class="section-h">Recent decisions</div>${recent.map((request) =>
       `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
         <span>${request.itemId ? esc(itemLabel(request.itemId)) : esc(request.domain || request.name || '?')}</span>
-        <span class="task-sub">${esc(({ once: 'Allowed once', task: 'Allowed for this task', always: 'Always allowed', deny: 'Denied', dismiss: 'Ignored' })[request.resolution?.action] || request.resolution?.action || '')}</span></div>`).join('')}</div>`
+        <span class="task-sub">${esc(({ once: 'Allowed once', task: 'Allowed for this task', always: 'Always allowed', deny: 'Denied', dismiss: 'Ignored' })[request.resolution?.action] || request.resolution?.action || '')}</span>
+        ${decidedByHtml(request)}</div>`).join('')}</div>`
     : '';
   return pendingHtml + history;
 }
@@ -25675,7 +25688,7 @@ function permissionRequestRows(requests, { historyLimit = 20, inTask = false } =
     ? `<div class="approval-history"><div class="section-h">Recent permission decisions</div>${recent.map((request) =>
       `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : request.status === 'withdrawn' ? '' : 'done'}"${request.withdrawn ? ` title="${esc(`Withdrawn: ${request.withdrawn.reason}`)}"` : ''}>${esc(request.status)}</span>
         <span class="mono">${[...request.capabilities, ...(request.projectIds || []).map((id) => `+ ${projectById(id)?.name || id}`)].map(esc).join(', ')}</span>
-        <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
+        ${decidedByHtml(request)}</div>`).join('')}</div>`
     : '';
   return pendingHtml + history;
 }
@@ -25758,7 +25771,7 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
   const history = recent.length ? `<div class="approval-history"><div class="section-h">Recent authorization decisions</div>${recent.map((request) =>
     `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : request.status === 'withdrawn' ? '' : 'done'}"${request.withdrawn ? ` title="${esc(request.withdrawn.reason)}"` : ''}>${esc(request.status)}</span>
       <span>${esc(authorizationSummary(request.authorization, S.projects))}</span>
-      <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>` : '';
+      ${decidedByHtml(request)}</div>`).join('')}</div>` : '';
   return pendingHtml + history;
 }
 
