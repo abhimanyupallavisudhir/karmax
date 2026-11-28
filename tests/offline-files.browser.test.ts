@@ -236,13 +236,13 @@ it('opens without a network into what the device keeps (the service worker’s o
   await page.goto(`${f.server.url}/personal/site-builder/files/site`);
   await page.locator('.files-row', { hasText: 'README.md' }).waitFor();
   // The app registers the worker in shell mode (it has the plugin); once it controls the page, a load keeps the console.
-  await page.waitForFunction(async () => (await navigator.serviceWorker.getRegistration())?.active?.scriptURL.endsWith('/service-worker.js?shell=1'));
+  await expect.poll(() => page.evaluate(async () => !!(await navigator.serviceWorker.getRegistration())?.active?.scriptURL.endsWith('/service-worker.js?shell=1')), { timeout: 15_000 }).toBe(true);
   await page.reload();
   await page.waitForFunction(() => !!navigator.serviceWorker.controller);
   await page.locator('.files-row', { hasText: 'README.md' }).waitFor();
   await (await menuFor(page, 'README.md')).locator('[role="menuitemcheckbox"]', { hasText: 'Available offline' }).click();
   await mark(page, 'README.md').and(page.locator('[data-state="current"]')).waitFor();
-  await page.waitForFunction(async () => (await (await caches.open('tavya-shell-v1')).keys()).some((request: Request) => request.url.endsWith('/app.js')));
+  await expect.poll(() => page.evaluate(async () => (await (await caches.open('tavya-shell-v1')).keys()).some((request: Request) => request.url.endsWith('/app.js'))), { timeout: 15_000 }).toBe(true);
 
   // No network: the app still opens, into Files with what it keeps.
   await context.setOffline(true);

@@ -89,11 +89,11 @@ describe.skipIf(!runnable)('offline files in the desktop app', () => {
     expect(path.basename(opened)).toBe('guide.md');
     expect(fs.readFileSync(opened, 'utf8')).toBe('## Guide\n');
     // tavya unreachable: the app still opens, into what it keeps.
-    await page.waitForFunction(async () => !!(await navigator.serviceWorker.getRegistration())?.active?.scriptURL.endsWith('?shell=1'));
+    await expect.poll(() => page.evaluate(async () => !!(await navigator.serviceWorker.getRegistration())?.active?.scriptURL.endsWith('?shell=1')), { timeout: 15_000 }).toBe(true);
     await page.reload();
     await page.waitForFunction(() => !!navigator.serviceWorker.controller);
     await page.locator('.offline-view .files-row').first().waitFor();
-    await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 500)));
+    await expect.poll(() => page.evaluate(async () => (await (await caches.open('tavya-shell-v1')).keys()).some((request: Request) => request.url.endsWith('/app.js'))), { timeout: 15_000 }).toBe(true);
     await f.server.close();
     await page.reload();
     await page.locator('.offline-shell .files-row', { hasText: 'guide.md' }).waitFor();
