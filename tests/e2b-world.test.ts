@@ -295,7 +295,7 @@ describe('E2B cloud world provider', () => {
               async kill() { processKilled++; },
             };
           }
-          if (command.includes('find . -type f')) return { stdout: 'a.txt\n', stderr: '', exitCode: 0 };
+          if (command.includes('find . -name .karmax-injection -prune -o -type f')) return { stdout: 'a.txt\n', stderr: '', exitCode: 0 };
           if (command.includes("'printf'")) return { stdout: 'hello', stderr: '', exitCode: 0 };
           if (command.includes('rev-parse')) return { stdout: `${'a'.repeat(40)}\n`, stderr: '', exitCode: 0 };
           return { stdout: '', stderr: '', exitCode: 0 };
