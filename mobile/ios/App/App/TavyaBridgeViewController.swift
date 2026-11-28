@@ -9,6 +9,7 @@ class TavyaBridgeViewController: CAPBridgeViewController {
         bridge?.registerPluginInstance(TavyaSignInPlugin())
         bridge?.registerPluginInstance(SpeechRecognitionPlugin())
         bridge?.registerPluginInstance(TavyaPhonePlugin())
+        bridge?.registerPluginInstance(TavyaOfflineFilesPlugin())
         // Links an App Intent made while the app was starting.
         TavyaLinks.bridgeReady()
     }

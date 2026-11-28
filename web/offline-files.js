@@ -436,7 +436,8 @@
       pins: () => pins || [],
       get: (id) => (pins || []).find((pin) => pin.id === id) || null,
       updating: (id) => updating.has(id),
-      status: () => ({ ...state }),
+      // When tavya was last asked: the latest check, or a pin made since.
+      status: () => ({ ...state, checkedAt: Math.max(state.checkedAt, ...(pins || []).map((pin) => pin.checkedAt || 0)) }),
       hasPins: async () => (await load()).length > 0,
       open: (hash, name) => plugin.open({ hash, name }),
       on: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },

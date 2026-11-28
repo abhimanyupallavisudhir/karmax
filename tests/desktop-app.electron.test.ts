@@ -78,7 +78,7 @@ describe.skipIf(!runnable)('the desktop app', () => {
         desktop: Object.keys(cap.Plugins.TavyaDesktop).sort(), signIn: Object.keys(cap.Plugins.TavyaSignIn).sort(),
         offline: cap.isPluginAvailable('TavyaOfflineFiles'), ua: (globalThis as any).navigator.userAgent, node: typeof (globalThis as any).require };
     });
-    expect(bridge).toMatchObject({ native: true, platform: 'electron', plugins: ['TavyaSignIn', 'TavyaDesktop'], offline: false, node: 'undefined' });
+    expect(bridge).toMatchObject({ native: true, platform: 'electron', plugins: ['TavyaSignIn', 'TavyaDesktop', 'TavyaOfflineFiles'], offline: true, node: 'undefined' });
     expect(bridge.desktop).toEqual(['addListener', 'checkForUpdates', 'getHotkey', 'getLaunchAtLogin', 'getUpdateStatus', 'installUpdate',
       'removeAllListeners', 'setBadge', 'setHotkey', 'setLaunchAtLogin', 'show']);
     // The device token is offered only where the OS keychain can keep it (not under a bare Xvfb).

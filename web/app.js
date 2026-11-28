@@ -21716,7 +21716,8 @@ async function keepOffline(pid, view, target) {
   let prepared;
   try { prepared = await engine.prepare({ projectId: pid, view, path: target.path }); }
   catch (error) { return toast(plainError(error.message), true); }
-  if (prepared.manifest.kind === 'directory' ? !(await confirmKeepOffline(name, prepared)) : !prepared.fits && (toast(prepared.message, true), true)) return;
+  if (prepared.manifest.kind === 'directory') { if (!(await confirmKeepOffline(name, prepared))) return; }
+  else if (!prepared.fits) return toast(prepared.message, true);
   const proj = projectById(pid);
   engine.pin({ projectId: pid, view, path: target.path, info: { name, projectName: proj?.name || '', organizationId: proj?.organizationId || '' } }, prepared)
     .catch((error) => toast(plainError(error.message), true));
@@ -21786,7 +21787,7 @@ async function paintOfflineView({ shell = $('#files-page')?.dataset.scope === 'o
   if (at.pin && !pin) { at.pin = null; at.sub = ''; }
   const crumbs = $('#offline-crumbs');
   const segments = pin ? FV.parts(at.sub) : [];
-  if (crumbs) crumbs.innerHTML = [`<a class="files-crumb files-crumb-root" href="#" data-offline-go="" ${pin ? '' : 'aria-current="page"'}>Available offline</a>`,
+  if (crumbs) crumbs.innerHTML = [`<a class="files-crumb files-crumb-root" href="#" data-offline-go="" ${pin ? '' : 'aria-current="page"'} title="What this device keeps">This device</a>`,
     ...(pin ? [`<span class="files-sep" aria-hidden="true">/</span><a class="files-crumb" href="#" data-offline-go="${esc(pin.id)}\n"${segments.length ? '' : ' aria-current="page"'}>${esc(offlinePinName(pin))}</a>`] : []),
     ...segments.map((part, i) => `<span class="files-sep" aria-hidden="true">/</span><a class="files-crumb" href="#" data-offline-go="${esc(pin.id)}\n${esc(segments.slice(0, i + 1).join('/'))}"${i === segments.length - 1 ? ' aria-current="page"' : ''}>${esc(part)}</a>`)].join('');
   crumbs?.querySelectorAll('[data-offline-go]').forEach((link) => link.addEventListener('click', (event) => {
@@ -21873,7 +21874,6 @@ function offlineUp() {
 // A file from this device's copy, in the Files viewer; "Open in…" hands it to the OS.
 async function showOfflineFile(body, pin, node, status) {
   const engine = offlineFiles();
-  const name = FV.parts(node.path).pop() || 'file';
   const shows = () => body.isConnected && offlineState().pin === pin.id && body.dataset.shows?.startsWith(`${pin.id}\n${offlineState().sub}\n`);
   let bytes;
   try { bytes = await engine.bytes(node.hash); }
@@ -21993,7 +21993,8 @@ async function openFilesViewPicker(pid) {
   const close = () => { menu.remove(); button.setAttribute('aria-expanded', 'false'); document.removeEventListener('pointerdown', outside, true); };
   const outside = (event) => { if (!menu.contains(event.target) && event.target !== button && !button.contains(event.target)) close(); };
   document.addEventListener('pointerdown', outside, true);
-  const pick = (value) => { close(); go(filesRoute(pid, S.filesPath, value)); };
+  // The Offline view starts at what the device keeps; other views keep the place.
+  const pick = (value) => { close(); go(filesRoute(pid, value === 'offline' ? '' : S.filesPath, value)); };
   const paint = () => {
     const query = input.value.trim().toLowerCase();
     const shown = options.filter((option) => !query || option.search.includes(query));

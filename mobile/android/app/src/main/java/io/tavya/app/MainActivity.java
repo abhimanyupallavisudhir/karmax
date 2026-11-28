@@ -13,6 +13,7 @@ public class MainActivity extends BridgeActivity {
         // Local plugins must be registered before the bridge is created in super.onCreate.
         registerPlugin(TavyaSignInPlugin.class);
         registerPlugin(TavyaPhonePlugin.class);
+        registerPlugin(TavyaOfflineFilesPlugin.class);
         // An instance registers after the plugin classes from capacitor.plugins.json,
         // so this replaces the stock PushNotifications plugin (same JS name).
         bridgeBuilder.addPluginInstance(new TavyaPushNotificationsPlugin());

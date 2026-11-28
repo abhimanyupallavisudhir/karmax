@@ -45,7 +45,7 @@ function readPin(raw: unknown): OfflinePin | undefined {
 
 /** Each pin's answer, in the order given. */
 export async function checkOfflinePins(pins: unknown[], deps: OfflineCheckDeps): Promise<OfflineCheck[]> {
-  const results: OfflineCheck[] = new Array(pins.length);
+  const results: OfflineCheck[] = Array.from({ length: pins.length });
   let next = 0;
   const one = async (raw: unknown): Promise<OfflineCheck> => {
     const pin = readPin(raw);

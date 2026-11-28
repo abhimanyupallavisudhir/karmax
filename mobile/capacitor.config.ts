@@ -88,6 +88,11 @@ const config: CapacitorConfig = {
   // package is used for Android and the JS typings only.
   ios: {
     includePlugins: ['@capacitor/app', '@capacitor/push-notifications', '@capacitor/splash-screen'],
+    // WKWebView runs service workers only for app-bound domains (Info.plist
+    // WKAppBoundDomains = the console's host, TAVYA_HOST): the offline shell
+    // needs one (wiki features/offline-files). Other sites already open in the
+    // system browser, and sign-in runs in ASWebAuthenticationSession.
+    limitsNavigationsToAppBoundDomains: true,
   },
   plugins: {
     PushNotifications: {
