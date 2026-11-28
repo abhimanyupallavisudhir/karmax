@@ -27427,6 +27427,172 @@ function nativeRecognitionClass() {
   };
 }
 
+// ── dictation on the server (wiki features/push-and-voice § Server-side dictation)
+// Where neither the app nor the browser recognizes speech (the desktop app's
+// Electron, Firefox), the microphone is recorded here and each phrase, cut at a
+// pause, is sent to POST /api/speech/transcriptions, which answers its words on
+// the organization's credit. Same SpeechRecognition interface, so dictation
+// (toggleDictation) is the same code: each phrase's words arrive as a final
+// result, in the order spoken, while "…" by the mic says one is on its way.
+const SERVER_SPEECH = {
+  frameMs: 50,
+  /** Silence that ends a phrase: a breath between words is shorter. */
+  pauseMs: 700,
+  /** Less voice than this is a click or a cough, not sent. */
+  minVoiceMs: 250,
+  /** A phrase never runs past this (the server takes ≤ 30 s). */
+  maxPhraseMs: 25_000,
+  /** A recording that heard nothing restarts, so a phrase starts at most this much before its first word. */
+  idleMs: 2_000,
+  /** Voice is this much louder than the room's quiet (and above an absolute floor). */
+  voiceOverFloor: 3,
+  minVoiceLevel: 0.01,
+  /** The room's quiet: a quiet moment of the last few seconds (speech has many), at most this. */
+  floorFrames: 100,
+  maxFloor: 0.02,
+  timeoutMs: 20_000,
+};
+function serverRecognitionClass() {
+  if (typeof window === 'undefined' || !S.meta?.serverDictation || !S.organizationId) return null;
+  if (!navigator.mediaDevices?.getUserMedia || typeof window.MediaRecorder !== 'function' || !(window.AudioContext || window.webkitAudioContext)) return null;
+  return ServerSpeechRecognition;
+}
+class ServerSpeechRecognition {
+  constructor() {
+    this.lang = 'en-US'; this.interimResults = true; this.continuous = false;
+    this.onresult = this.onerror = this.onend = null;
+    /** Called with how many phrases are being transcribed (the mic's "…"). */
+    this.onpending = null;
+    /** Results may land after stop(): the phrase being transcribed when dictation ended. */
+    this.flushes = true;
+    this.results = []; this.queue = []; this.segment = null; this.listening = false; this.ended = false; this.failed = false;
+  }
+  start() {
+    this.listening = true;
+    this.run().catch((error) => this.fail(error?.error || (/NotAllowed|Security/.test(error?.name) ? 'not-allowed'
+      : /NotFound|NotReadable|Overconstrained|Abort/.test(error?.name) ? 'audio-capture' : 'network'), error?.message));
+  }
+  async run() {
+    if (navigator.onLine === false) throw { error: 'network' };
+    this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    if (!this.listening) return this.release(); // stopped while the browser asked
+    this.context = new (window.AudioContext || window.webkitAudioContext)();
+    this.analyser = this.context.createAnalyser();
+    this.analyser.fftSize = 1024;
+    this.context.createMediaStreamSource(this.stream).connect(this.analyser);
+    this.samples = new Float32Array(this.analyser.fftSize);
+    this.type = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm', 'audio/mp4'].find((type) => MediaRecorder.isTypeSupported?.(type)) || '';
+    this.record();
+    this.timer = setInterval(() => this.listen(), SERVER_SPEECH.frameMs);
+  }
+  /** Start recording the next phrase. */
+  record() {
+    const recorder = new MediaRecorder(this.stream, { ...(this.type ? { mimeType: this.type } : {}), audioBitsPerSecond: 32_000 });
+    const segment = { recorder, chunks: [], startedAt: performance.now(), voicedMs: 0, lastVoiceAt: 0 };
+    recorder.ondataavailable = (event) => { if (event.data?.size) segment.chunks.push(event.data); };
+    recorder.start();
+    this.segment = segment;
+  }
+  /** Each frame: is someone speaking? A pause after enough voice ends the phrase. */
+  listen() {
+    const segment = this.segment;
+    if (!segment || !this.analyser) return;
+    this.analyser.getFloatTimeDomainData(this.samples);
+    let sum = 0;
+    for (const sample of this.samples) sum += sample * sample;
+    const level = Math.sqrt(sum / this.samples.length), now = performance.now();
+    // The room's quiet: the 10th percentile of the last 5 s, so a steady hum or
+    // fan is quiet, while speech, which pauses between syllables, is not; capped,
+    // so someone who starts talking at once is heard.
+    const levels = this.levels ||= [];
+    levels.push(level);
+    if (levels.length > SERVER_SPEECH.floorFrames) levels.shift();
+    const floor = Math.min(SERVER_SPEECH.maxFloor, [...levels].sort((a, b) => a - b)[Math.floor(levels.length / 10)]);
+    if (level > Math.max(SERVER_SPEECH.minVoiceLevel, floor * SERVER_SPEECH.voiceOverFloor)) {
+      segment.voicedMs += SERVER_SPEECH.frameMs;
+      segment.lastVoiceAt = now;
+    }
+    const spoke = segment.voicedMs >= SERVER_SPEECH.minVoiceMs;
+    if (spoke && (now - segment.lastVoiceAt >= SERVER_SPEECH.pauseMs || now - segment.startedAt >= SERVER_SPEECH.maxPhraseMs)) this.cut(true);
+    else if (!spoke && now - Math.max(segment.startedAt, segment.lastVoiceAt) >= SERVER_SPEECH.idleMs) this.cut(false);
+  }
+  /** End the phrase being recorded (sending it when it held speech) and record the next. */
+  cut(send) {
+    const segment = this.segment;
+    this.segment = null;
+    if (!segment) return;
+    if (send && !this.continuous) this.listening = false; // one phrase, like a browser's recognizer
+    if (this.listening) this.record();
+    segment.recorder.onstop = () => {
+      if (send) this.send(new Blob(segment.chunks, { type: segment.recorder.mimeType || this.type || 'audio/webm' }));
+      if (!this.listening) this.release();
+      this.settle();
+    };
+    try { segment.recorder.stop(); } catch { segment.recorder.onstop(); }
+  }
+  async send(blob) {
+    const entry = { done: false, text: '' };
+    this.queue.push(entry);
+    this.onpending?.(this.queue.length);
+    try {
+      const language = encodeURIComponent(String(this.lang || '').split('-')[0] || 'en');
+      const response = await fetch(`/api/speech/transcriptions?organizationId=${encodeURIComponent(S.organizationId)}&language=${language}`, {
+        method: 'POST', body: blob, signal: AbortSignal.timeout(SERVER_SPEECH.timeoutMs),
+        headers: { 'content-type': blob.type, ...(S.token ? { authorization: `Bearer ${S.token}` } : {}), ...(S.clientId ? { 'x-tavya-client': S.clientId } : {}) },
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const message = { 402: 'Out of credits to dictate.', 429: 'Dictating too fast: try again in a minute.',
+          409: 'Dictation isn’t set up here.' }[response.status] || 'Dictation failed: try again.';
+        this.fail('service', message);
+      } else entry.text = String(body.text || '').trim();
+    } catch {
+      this.fail('network');
+    }
+    entry.done = true;
+    // Words in the order spoken, whichever phrase came back first.
+    while (this.queue[0]?.done) {
+      const { text } = this.queue.shift();
+      if (text && !this.failed) {
+        this.results.push(Object.assign([{ transcript: text, confidence: 1 }], { isFinal: true }));
+        this.onresult?.({ resultIndex: this.results.length - 1, results: this.results });
+      }
+    }
+    this.onpending?.(this.queue.length);
+    this.settle();
+  }
+  /** A refusal ends dictation, with one message. */
+  fail(error, message) {
+    if (this.failed) return;
+    this.failed = true;
+    this.onerror?.({ error, message });
+    this.stop();
+  }
+  stop() {
+    if (!this.listening && !this.segment) return this.settle();
+    this.listening = false;
+    // What was said before the stop is still sent; a recording of silence is not.
+    if (this.segment) this.cut(!this.failed && this.segment.voicedMs >= SERVER_SPEECH.minVoiceMs);
+    else this.release();
+    this.settle();
+  }
+  abort() { this.failed = true; this.stop(); }
+  release() {
+    clearInterval(this.timer);
+    this.timer = null;
+    this.stream?.getTracks().forEach((track) => track.stop());
+    this.context?.close().catch(() => {});
+    this.stream = this.context = this.analyser = null;
+  }
+  /** Ended once nothing is recorded or on its way. */
+  settle() {
+    if (this.ended || this.listening || this.segment || this.queue.length) return;
+    this.ended = true;
+    this.release();
+    this.onend?.();
+  }
+}
+
 // ── voice input (wiki features/push-and-voice) ──────────────────────────────
 // A mic in a prompt field's bottom row: the browser's speech recognition types
 // into the field (interim words as they come), where they can be edited before
@@ -27435,9 +27601,10 @@ function nativeRecognitionClass() {
 // Any prompt field gets one with micButtonHtml(key) in its `.prompt-attach-row`.
 function speechRecognitionClass() {
   if (typeof window === 'undefined') return null;
-  // In the phone app the platform's recognizer (the Android WebView has none of its own).
-  if (nativeApp()) return nativeRecognitionClass();
-  return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+  // In the phone app the platform's recognizer (the Android WebView has none of
+  // its own); where there is none (the desktop app, Firefox), the server's.
+  if (nativeApp()) return nativeRecognitionClass() || serverRecognitionClass();
+  return window.SpeechRecognition || window.webkitSpeechRecognition || serverRecognitionClass();
 }
 function micButtonHtml(key) {
   if (typeof speechRecognitionClass() !== 'function') return '';
@@ -27482,8 +27649,8 @@ function beforeStopPhrase(text) {
 }
 // Chrome on Android repeats earlier words in each result of a continuous
 // session, so there each sentence is a recognizer of its own.
-function continuousDictation() {
-  return !!nativePlugin('SpeechRecognition') || !/Android/i.test(navigator.userAgent || '');
+function continuousDictation(Recognition) {
+  return !!nativePlugin('SpeechRecognition') || Recognition === ServerSpeechRecognition || !/Android/i.test(navigator.userAgent || '');
 }
 function joinHeard(...parts) {
   return parts.reduce((text, part) => (!part ? text : !text || /\s$/.test(text) || /^\s/.test(part) ? text + part : `${text} ${part}`), '').trim();
@@ -27505,7 +27672,7 @@ function toggleDictation(key) {
   const ours = () => { const target = micField(key).field; return target && !target.disabled && target.value === state.written ? target : null; };
   const write = (text) => {
     const target = ours();
-    if (!target) return stopDictation();
+    if (!target) { if (S.dictation === state) stopDictation(); return; }
     const lead = before && text && !/\s$/.test(before) ? ' ' : '';
     const tail = after && text && !/^\s/.test(after) ? ' ' : '';
     target.value = state.written = `${before}${lead}${text}${tail}${after}`;
@@ -27516,6 +27683,7 @@ function toggleDictation(key) {
   // The stop phrase said: what came before it stays, and dictation ends.
   const stopBySpeech = (kept) => { write(kept); if (S.dictation === state) stopDictation(); };
   const quiet = () => {
+    if (S.dictation !== state) return;
     clearTimeout(state.silence);
     state.silence = setTimeout(() => { if (S.dictation === state) stopDictation(); }, DICTATION_SILENCE_MS);
   };
@@ -27525,9 +27693,13 @@ function toggleDictation(key) {
     let session = '', fatal = false;
     recognition.lang = document.documentElement.lang || navigator.language || 'en-US';
     recognition.interimResults = true;
-    recognition.continuous = continuousDictation();
+    recognition.continuous = continuousDictation(Recognition);
+    // The server's recognizer: "…" by the mic while a phrase is on its way.
+    recognition.onpending = (count) => micField(key).button?.classList.toggle('transcribing', count > 0);
     recognition.onresult = (event) => {
-      if (S.dictation !== state || state.recognition !== recognition) return;
+      // A recognizer that flushes (the server's) still brings the phrase it was
+      // transcribing when dictation ended; it lands only in a field left as it was.
+      if (state.recognition !== recognition || (S.dictation !== state && !recognition.flushes)) return;
       session = joinHeard(...[...event.results].map((result) => result[0]?.transcript || ''));
       state.heard = joinHeard(state.said, session);
       quiet();
@@ -27545,7 +27717,7 @@ function toggleDictation(key) {
       const blocked = nativePlugin('SpeechRecognition') ? `Allow the microphone and speech recognition for ${siteName()} in your phone’s settings to dictate.`
         : desktopShell() ? `Allow the microphone for ${siteName()} in your computer’s settings to dictate.` : 'Allow the microphone for this site to dictate.';
       const message = { 'not-allowed': blocked, 'service-not-allowed': blocked,
-        'audio-capture': 'No microphone found.', network: 'Dictation needs a connection.' }[event.error];
+        'audio-capture': 'No microphone found.', network: 'Dictation needs a connection.', service: event.message }[event.error];
       if (message) toast(message, true);
     };
     recognition.onend = () => {

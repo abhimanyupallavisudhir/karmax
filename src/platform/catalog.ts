@@ -345,6 +345,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/organizations/:organizationId/generations with provider fal|unifically (when the operator turned it on): {provider, model, input: the model\'s own input object, maxCostUsd?} → 202 {jobId}; poll it like a video, its files are downloaded from its output',
     'GET /api/generation-models?provider=fal|unifically&q= (that provider\'s models: id, name, category, docs)',
     'GET|PUT|DELETE /api/settings/generation-providers[/:id] (operator: fal or unifically, body {apiKey?, enabled?}; key write-only)',
+    'POST /api/speech/transcriptions?organizationId=&language= (dictation: the body is one phrase of audio, ≤ 30 s, Content-Type audio/webm, audio/ogg, audio/wav, audio/mp4, audio/mpeg or audio/flac → {text, costUsd?, seconds?}; any member of the organization (organization:read); on its credit or its own OpenRouter key, the most 30 s can cost held first (402 Out of credits); 40 a minute and 900 an hour per person (429); the audio is never stored)',
     'GET /api/generation-models?kind=text|image|video|speech (OpenRouter\'s models for that kind: prices, durations, resolutions, voices; the default is marked)',
     'GET /api/organizations/:organizationId/agent-mail?since=&match=&limit= (per-organization agent inbox: address + messages, verification code/link extracted)',
     'GET /api/organizations/:organizationId/agent-mail/providers (mailbox backends + active provider)',
