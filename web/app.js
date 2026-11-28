@@ -4801,7 +4801,7 @@ function setupFixes(text, projectId, taskId) {
 }
 /** Every settings place a message can name, linked: a message that tells a
  * person where to change something takes them there. */
-const INSTALLATION_PLACES = { 'Host capacity': 'capacity', 'Managed compute': 'compute', 'Phone apps': 'phone-apps', Composio: 'composio', Email: 'email', GitHub: 'github', 'Service limits': 'limits', 'Error reports': 'errors', 'Early access': 'early-access' };
+const INSTALLATION_PLACES = { 'Sign-in apps': 'sign-in-apps', 'Host capacity': 'capacity', 'Managed compute': 'compute', 'Phone apps': 'phone-apps', Composio: 'composio', Email: 'email', GitHub: 'github', 'Service limits': 'limits', 'Error reports': 'errors', 'Early access': 'early-access' };
 function namedPlaces(text, projectId, taskId) {
   const settings = globalRoute('organization');
   const project = projectId ? projectRoute(projectId, 'settings') : '';
@@ -15234,6 +15234,7 @@ const SETTINGS_TARGETS = [
   ['POST', /^\/api\/settings\/model-gateways$/, () => 'Managed compute · Model gateways', true],
   ['PUT', /^\/api\/settings\/model-gateways\/[^/]+$/, () => 'Managed compute · Model gateways', true],
   ['PUT', /^\/api\/settings\/generation-providers\/[^/]+$/, () => 'Managed compute · Generation', true],
+  ['PUT', /^\/api\/settings\/oauth-apps\/[^/]+$/, () => 'Sign-in apps', true],
   ['PUT', /^\/api\/settings\/[\w/-]+$/, () => 'Installation settings'],
   ['PATCH', /^\/api\/organizations\/([^/]+)$/, (m) => `${formOrganizationName(m[1])} settings`],
   ['POST', /^\/api\/organizations\/([^/]+)\/accounts$/, (m) => `${formOrganizationName(m[1])} agent accounts`, true],
@@ -25918,6 +25919,43 @@ async function wireInstallationComposioCard() {
   } catch (error) { if (box.isConnected) paneError(box, error, wireInstallationComposioCard); }
 }
 
+// Sign-in apps (wiki features/service-connections § Sign-in apps).
+const OAUTH_APP_NAMES = { 'accounts.google.com': 'Google' };
+async function wireInstallationOAuthAppsCard() {
+  const box = document.getElementById('installation-oauth-apps-card'); if (!box) return;
+  try {
+    const { apps, redirectUri } = await api('/api/settings/oauth-apps');
+    if (!box.isConnected) return;
+    const known = new Set(apps.map((app) => app.server));
+    const rows = apps.map((app) => instRow(esc(OAUTH_APP_NAMES[app.server] || app.server),
+      `<code>${esc(app.clientId)}</code>${app.hasSecret ? '' : ' <span class="chip">No secret</span>'}`,
+      `<button type="button" class="btn sm" data-oauth-app-remove="${esc(app.server)}">Remove</button>`)).join('');
+    const redirect = redirectUri ? policyTip(`Redirect URI: ${redirectUri}`) : '';
+    box.innerHTML = `<div class="setting-rows">${rows}</div>
+      <form data-oauth-app class="setting-rows">${instRow(`Add ${redirect}`,
+        `<input class="setting-input" name="server" value="${known.has('accounts.google.com') ? '' : 'accounts.google.com'}" placeholder="Sign-in server" required aria-label="Sign-in server">
+         <input class="setting-input" name="clientId" placeholder="Client ID" required autocomplete="off" aria-label="Client ID">
+         <input class="setting-input" type="password" name="clientSecret" placeholder="Client secret" autocomplete="new-password" aria-label="Client secret">`,
+        '<button class="btn sm primary">Save</button>')}</form>`;
+    box.querySelectorAll('[data-oauth-app-remove]').forEach((button) => button.addEventListener('click', async () => {
+      button.disabled = true;
+      try { await api(`/api/settings/oauth-apps/${encodeURIComponent(button.dataset.oauthAppRemove)}`, { method: 'DELETE' }); await wireInstallationOAuthAppsCard(); }
+      catch (error) { toast(error.message, true); button.disabled = false; }
+    }));
+    box.querySelector('[data-oauth-app]').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget; const button = form.querySelector('button');
+      const body = { clientId: form.elements.clientId.value, ...(form.elements.clientSecret.value ? { clientSecret: form.elements.clientSecret.value } : {}) };
+      form.elements.clientSecret.value = ''; button.disabled = true;
+      try {
+        await api(`/api/settings/oauth-apps/${encodeURIComponent(form.elements.server.value)}`, { method: 'PUT', body: JSON.stringify(body) });
+        toast('Sign-in app saved');
+        await wireInstallationOAuthAppsCard();
+      } catch (error) { toast(error.message, true); button.disabled = false; }
+    });
+  } catch (error) { if (box.isConnected) paneError(box, error, wireInstallationOAuthAppsCard); }
+}
+
 async function hydrateNativeConnections(organizationId) {
   const root = document.getElementById('native-connections'); if (!root) return;
   const query = mcpScope(null, organizationId);
@@ -28969,7 +29007,7 @@ function installationView() {
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections">
       <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-traffic">Site traffic</a><a href="#installation-errors">Error reports</a><a href="#installation-early-access">Early access</a><a href="#installation-limits">Service limits</a><a href="#installation-compute">Managed compute</a><a href="#installation-capacity">Host capacity</a>
-      <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a><a href="#installation-phone-apps">Phone apps</a>
+      <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-sign-in-apps">Sign-in apps</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a><a href="#installation-phone-apps">Phone apps</a>
       <a href="#installation-access">Phone access</a>${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance</div></div>${appearanceCard()}
@@ -28989,6 +29027,7 @@ function installationView() {
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity ${policyTip(`Admission limits shared by all agent work`)}</div></div>${hostCapacityCard()}
       <div class="settings-section-title" id="installation-github"><div>GitHub</div></div>${installationGithubCard()}
       <div class="settings-section-title" id="installation-composio"><div>Composio</div></div><div class="card" id="installation-composio-card"><span class="task-sub">Loading…</span></div>
+      <div class="settings-section-title" id="installation-sign-in-apps"><div>Sign-in apps ${policyTip('Apps that let people connect MCP servers whose sign-in registers no apps itself, such as Google’s Gmail, Drive and Calendar. One per sign-in server.')}</div></div><div class="card" id="installation-oauth-apps-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-paid-launch"><div>Paid launch</div></div>${paidLaunchCard()}
       <div class="settings-section-title" id="installation-stripe"><div>Agent cards ${policyTip(`Optional: the Stripe Connect application behind the cards agents spend from. Not used for plan subscriptions.`)}</div></div>${stripePlatformCard()}
       <div class="settings-section-title" id="installation-email"><div>Email</div></div>${outboundEmailCard()}
@@ -29895,6 +29934,7 @@ function wireInstallationSettings() {
   });
   wireInstallationGithubCard();
   wireInstallationComposioCard();
+  wireInstallationOAuthAppsCard();
   wirePaidLaunchCard();
   wireStripePlatformCard();
   wireOutboundEmailCard();

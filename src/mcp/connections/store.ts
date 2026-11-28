@@ -7,6 +7,7 @@ import { publicUrl } from './http.js';
 import { leasedOAuthRefresh } from './oauth.js';
 import { RefreshLeases } from '../../autonomy/refresh-lease.js';
 import { handleRef, recordSecretRefs } from '../../autonomy/task-secrets.js';
+import { OAuthApps } from './oauth-apps.js';
 
 export type McpTransport = { type: 'http' | 'sse'; url: string }
   | { type: 'stdio'; command: string; args: string[]; env?: Record<string, string> };
@@ -156,6 +157,8 @@ export class McpConnections {
         && this.broker.replaceHandleIfUnchanged(handle, current, next, organizationScope(this.organizationId)),
       run);
   }
+  /** The installation's OAuth app for an authorization server (`OAuthVault.registeredClient`). */
+  registeredClient(authorizationServer: string) { return new OAuthApps(this.store, this.broker).client(authorizationServer); }
   async setSecret(c: McpConnection, value: unknown) {
     await this.store.transaction(async () => {
       (await this.store.lock(`vault:${this.organizationId}`));

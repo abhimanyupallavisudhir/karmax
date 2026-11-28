@@ -64,6 +64,23 @@ describe('connection gateway flow', () => {
   });
   afterAll(async () => { await close?.(); (await store?.close()); fs.rmSync(home, { recursive: true, force: true }); });
 
+  it('lets an installation operator register sign-in apps for MCP servers; the secret is write-only', async () => {
+    const google = '/api/settings/oauth-apps/' + encodeURIComponent('https://accounts.google.com');
+    expect(routeCapability('PUT', '/api/settings/oauth-apps/accounts.google.com')).toBe('settings:write');
+    expect((await request(google, { token: agent, method: 'PUT', body: { clientId: 'x', clientSecret: 'y' } })).status).toBe(403);
+    const saved = await request(google, { method: 'PUT', body: { clientId: 'gid.apps.googleusercontent.com', clientSecret: 'g-secret' } });
+    expect(saved.status).toBe(200);
+    expect(await saved.json()).toEqual({ server: 'accounts.google.com', clientId: 'gid.apps.googleusercontent.com', hasSecret: true });
+    const listed = await (await request('/api/settings/oauth-apps')).json() as any;
+    expect(listed.apps).toEqual([{ server: 'accounts.google.com', clientId: 'gid.apps.googleusercontent.com', hasSecret: true }]);
+    // Where the app must send people back after signing in.
+    expect(listed.redirectUri).toMatch(/\/mcp-callback$/);
+    expect(JSON.stringify(listed)).not.toContain('g-secret');
+    expect((await request(google, { method: 'PUT', body: { clientId: '' } })).status).toBe(400);
+    expect((await request('/api/settings/oauth-apps/' + encodeURIComponent('http://insecure.example'), { method: 'PUT', body: { clientId: 'x' } })).status).toBe(400);
+    expect((await request(google, { method: 'DELETE' })).status).toBe(200);
+    expect((await (await request('/api/settings/oauth-apps')).json() as any).apps).toEqual([]);
+  });
   it('defaults off and requires installation authority for opt-in', async () => {
     expect(await (await request('/api/settings/global/timing')).json()).toEqual({enabled:false});
     expect((await request('/api/meta').then(r=>r.json()) as any).timingEnabled).toBe(false);
