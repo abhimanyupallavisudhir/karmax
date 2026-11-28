@@ -64,6 +64,16 @@ describe('delegated human identity authority', () => {
 
     await expect((async () => (await tokens.delegateHuman(agent.token, { taskId: 't2', projectId: 'p1', organizationId: 'o1',
       externalIdentities: { githubAccountId: '99' } })))()).rejects.toThrow(/cannot substitute/i);
+    // Host code may give an agent-created task the person's own active account
+    // (KarmaxApi.newTaskGithubAccount); the derived delegation then holds.
+    const chosen = (await tokens.delegateHuman(agent.token, { taskId: 't3', projectId: 'p1', organizationId: 'o1',
+      externalIdentities: { githubAccountId: '99' }, githubAccountChosenByPerson: true }))!;
+    const chosenAgent = (await tokens.mint({ taskId: 't3', profileId: 'do', principal: 'user:alice', projectId: 'p1',
+      organizationId: 'o1', ceiling: ['repository:write'], grantorCaps: ['repository:write'], delegationId: chosen.id }));
+    expect(chosenAgent.record.externalIdentities).toEqual({ githubAccountId: '99' });
+    // A sub-task's derivation shares its parent's account, chosen or not.
+    expect((await tokens.deriveHumanDelegation(chosen.id, { taskId: 't4', projectId: 'p1', organizationId: 'o1' }))
+      .externalIdentities).toEqual({ githubAccountId: '99' });
     await expect((async () => (await tokens.delegateHuman(agent.token, { taskId: 't2', projectId: 'p2', organizationId: 'o1',
       externalIdentities: { githubAccountId: '42' } })))()).rejects.toThrow(/scoped to project p1/i);
     await expect((async () => (await tokens.delegateHuman(agent.token, { taskId: 't2', projectId: 'p1', organizationId: 'o2',

@@ -2,6 +2,7 @@ import * as __asyncCollections from '../util/async-collections.js';
 import type { Store } from '../store/db.js';
 import { Capability, CAPABILITIES, DEVELOPER_WORKSPACE_CAPABILITIES, allows, attenuate } from './capabilities.js';
 import { SHIPPED_BUILTIN_PROFILES } from './builtin-profile-history.js';
+import { ConflictError, NotFoundError, ValidationError } from './errors.js';
 import type { AuthorizationSelection, ProjectMembership } from '../domain/types.js';
 
 export type AuthorizationProfileId = 'viewer' | 'developer' | 'maintainer' | 'administrator' | 'superadmin' | 'god' | string;
@@ -437,14 +438,14 @@ export class AuthorizationService {
   }
 
   async saveProfile(actor: string, scopeKey: AuthorizationScope, profile: AuthorizationProfile): Promise<AuthorizationProfile> {
-    if (!profile.id.trim() || !profile.name.trim()) throw new Error('authorization profile needs an id and name');
-    if (!profile.capabilities.length) throw new Error('authorization profile needs at least one capability');
+    if (!profile.id.trim() || !profile.name.trim()) throw new ValidationError('authorization profile needs an id and name');
+    if (!profile.capabilities.length) throw new ValidationError('authorization profile needs at least one capability');
     for (const cap of profile.capabilities) {
       // `use-credential:` grants are target-scoped (item/tag/domain names), so
       // their concrete values cannot be enumerated in the catalogue (§ the
       // "separate advanced control" of PLAN-authorization).
       if (cap !== '*' && !cap.endsWith(':*') && !CAPABILITIES.includes(cap as any) && !cap.startsWith('merge-into:') && !cap.startsWith('use-credential:'))
-        throw new Error(`unknown capability ${cap}`);
+        throw new ValidationError(`unknown capability ${cap}`);
     }
     const { scopeKey: _claimedScope, ...clean } = profile;
     const saved = { ...clean, id: profile.id.trim(), name: profile.name.trim() };
@@ -457,12 +458,12 @@ export class AuthorizationService {
     if (!input || typeof input.name !== 'string' || !input.name.trim()
       || typeof input.description !== 'string' || !input.description.trim() || input.name.length > 80 || input.description.length > 240 || !Array.isArray(input.capabilities)
       || !input.capabilities.length || input.capabilities.some((cap) => typeof cap !== 'string' || !CAPABILITIES.includes(cap as any)))
-      throw new Error('Choose a name, description, and at least one catalog capability');
+      throw new ValidationError('Choose a name, description, and at least one catalog capability');
     if (input.capabilities.some((cap) => !allows(ORGANIZATION_GRANT_CEILING, cap) || !allows(actorCaps, cap)))
       throw new AuthorizationGrantError('You cannot grant these capabilities in this organization');
     const name = input.name.trim();
     if ((await this.profiles(undefined, organizationId)).some((role) => role.name.toLowerCase() === name.toLowerCase()))
-      throw new Error('A role with this name already exists');
+      throw new ConflictError('A role with this name already exists');
     return (await this.saveProfile(actor, organizationScope(organizationId), {
       id: `role_${crypto.randomUUID()}`, name, description: input.description.trim(),
       capabilities: [...new Set(input.capabilities)], builtin: false,
@@ -471,7 +472,7 @@ export class AuthorizationService {
 
   async deleteProfile(actor: string, scopeKey: AuthorizationScope, id: string): Promise<void> {
     if (scopeKey === 'global' && DEFAULT_AUTHORIZATION_PROFILES.some((p) => p.id === id))
-      throw new Error('built-in global profiles can be customized but not deleted');
+      throw new ValidationError('built-in global profiles can be customized but not deleted');
     (await this.store.deleteAuthorizationProfile(scopeKey, id));
     (await this.audit(actor, 'authorization.profile.deleted', scopeKey, { profileId: id }));
   }
@@ -484,7 +485,7 @@ export class AuthorizationService {
 
   async setDefault(actor: string, profileId: string, projectId?: string): Promise<void> {
     if (!CANONICAL_AUTHORIZATION_LEVELS.includes(profileId as any))
-      throw new Error(`unknown authorization level ${profileId}`);
+      throw new ValidationError(`unknown authorization level ${profileId}`);
     const key = projectId ? `authz:default:project:${projectId}` : 'authz:default:global';
     (await this.store.kvSet(key, profileId));
     (await this.audit(actor, 'authorization.default.changed', projectId ? projectScope(projectId) : 'global', { profileId }));
@@ -497,10 +498,10 @@ export class AuthorizationService {
   async grant(actor: string, input: Omit<PrincipalGrant, 'grantedBy' | 'grantedAt'>): Promise<PrincipalGrant> {
     const projectId = input.scopeKey.startsWith('project:') ? input.scopeKey.slice(8) : undefined;
     const profile = (await this.profile(input.profileId, projectId, input.scopeKey.startsWith('organization:') ? input.scopeKey.slice(13) : undefined));
-    if (!profile) throw new Error(`unknown authorization profile ${input.profileId}`);
+    if (!profile) throw new ValidationError(`unknown authorization profile ${input.profileId}`);
     const grant: PrincipalGrant = { ...input, grantedBy: actor, grantedAt: Date.now() };
     if (grant.capabilities && grant.capabilities.some((cap) => !allows(profile.capabilities, cap)))
-      throw new Error('an explicit grant may narrow but not widen its authorization profile');
+      throw new ValidationError('an explicit grant may narrow but not widen its authorization profile');
     (await this.store.setPrincipalGrant(grant.principalId, grant.scopeKey, grant as any));
     (await this.audit(actor, 'authorization.grant.saved', grant.scopeKey, { principalId: grant.principalId, profileId: grant.profileId }));
     return grant;
@@ -623,7 +624,7 @@ export class AuthorizationService {
     grantorCaps?: Capability[],
   ): Promise<EffectiveAuthorization> {
     const taskProject = (await this.store.getProject(taskProjectId));
-    if (!taskProject) throw new Error(`no project ${taskProjectId}`);
+    if (!taskProject) throw new NotFoundError(`no project ${taskProjectId}`);
     const organizationId = taskProject.organizationId ?? 'org_personal';
     const legacy = typeof requested === 'string';
     const level = (requested === 'operator' ? 'god' : typeof requested === 'string' ? requested : requested.level)
@@ -634,7 +635,7 @@ export class AuthorizationService {
     const normalized = (await this.normalizeSelection(selection, organizationId, legacy));
     const profile = (await this.profile(normalized.level,
       normalized.scope === 'projects' ? normalized.projectIds?.[0] : undefined, organizationId));
-    if (!profile) throw new Error(`unknown authorization level ${normalized.level}`);
+    if (!profile) throw new ValidationError(`unknown authorization level ${normalized.level}`);
     const ceiling = normalized.scope === 'projects'
       ? attenuate(profile.capabilities, PROJECT_GRANT_CEILING)
       : normalized.scope === 'organization'
@@ -670,18 +671,18 @@ export class AuthorizationService {
   ): Promise<AuthorizationSelection> {
     const level = String(input.level || '').trim();
     if (!CANONICAL_AUTHORIZATION_LEVELS.includes(level as any) && !(await this.store.getAuthorizationProfile(organizationScope(organizationId), level)))
-      throw new Error(`unknown authorization level ${level}`);
+      throw new ValidationError(`unknown authorization level ${level}`);
     if (ORGANIZATION_LEVELS[level] && input.scope !== 'organization' && !(level === 'administrator' && allowLegacyAdministratorProject))
-      throw new Error(`${ORGANIZATION_LEVELS[level]} requires organization scope`);
-    if (level === 'god' && input.scope !== 'global') throw new Error('God requires global scope');
+      throw new ValidationError(`${ORGANIZATION_LEVELS[level]} requires organization scope`);
+    if (level === 'god' && input.scope !== 'global') throw new ValidationError('God requires global scope');
     if (!ORGANIZATION_LEVELS[level] && level !== 'god' && !['projects', 'organization'].includes(input.scope))
-      throw new Error(`${level} requires project or organization scope`);
+      throw new ValidationError(`${level} requires project or organization scope`);
     if (input.scope === 'projects') {
       const projectIds = [...new Set((input.projectIds ?? []).map(String).filter(Boolean))];
-      if (!projectIds.length) throw new Error('choose at least one project or @organization');
+      if (!projectIds.length) throw new ValidationError('choose at least one project or @organization');
       for (const projectId of projectIds) {
         if ((await this.store.getProject(projectId))?.organizationId !== organizationId)
-          throw new Error('authorization projects must belong to the same organization');
+          throw new ValidationError('authorization projects must belong to the same organization');
       }
       return { level, scope: 'projects', projectIds };
     }
@@ -749,9 +750,9 @@ export class AuthorizationService {
     selection: AuthorizationSelection,
     grantorCaps?: Capability[],
   ): Promise<EffectiveAuthorization> {
-    if (selection.scope === 'projects') throw new Error('this organization has no projects to authorize');
+    if (selection.scope === 'projects') throw new ValidationError('this organization has no projects to authorize');
     const profile = (await this.profile(selection.level, undefined, organizationId));
-    if (!profile) throw new Error(`unknown authorization level ${selection.level}`);
+    if (!profile) throw new ValidationError(`unknown authorization level ${selection.level}`);
     const ceiling = selection.scope === 'organization'
       ? attenuate(profile.capabilities, ORGANIZATION_GRANT_CEILING) : profile.capabilities;
     const principal = grantorCaps ?? (await this.capabilities(actor, undefined,
