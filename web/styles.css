@@ -1683,7 +1683,7 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
 .ask-form {
   display: grid; gap: 14px; margin: .5em 0 1em; padding: 16px 18px;
   border: 1px solid var(--line-strong); border-radius: var(--r); background: var(--surface);
-  font-size: var(--fs-14); line-height: 1.45;
+  font-size: var(--fs-14); line-height: 1.45; white-space: normal; /* also inside a plain (pre-wrap) message */
 }
 .ask-form.quick { gap: 10px; padding: 0; border: 0; background: none; }
 .ask-form.quick:not(.live) .ask-quick { opacity: .6; }

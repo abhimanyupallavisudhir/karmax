@@ -15202,7 +15202,23 @@ function renderWaitDetail(text, v = S.view, math = mathjaxEnabled(), form = null
 }
 
 function renderAgentMessageBody(text, v = S.view, math = mathjaxEnabled(), form = null) {
-  return markdownEnabled() ? withMessageForms(annotateWorldFileLinks(renderMessageBody(text, math), v), form, v) : renderConversationText(text, 'agent', v);
+  return withMessageForms(markdownEnabled() ? annotateWorldFileLinks(renderMessageBody(text, math), v) : plainWithFormBlocks(text, v), form, v);
+}
+
+// With Markdown rendering off an agent's text stays plain, but its forms are
+// controls, not formatting: each ```form fence becomes the block withMessageForms
+// draws (in messageFormsIn's order), so a secure form is never shown as JSON.
+function plainWithFormBlocks(text, v) {
+  const source = String(text ?? '');
+  let html = '';
+  let at = 0;
+  // The form is a block of its own: the blank lines around it in the text are not.
+  const plain = (part) => renderConversationText(part.replace(/^\n+/, at ? '' : '$&').replace(/\n+$/, ''), 'agent', v);
+  for (const match of source.matchAll(/^[ \t]*```form[ \t]*\n([\s\S]*?)\n[ \t]*```[ \t]*$\n?/gm)) {
+    html += plain(source.slice(at, match.index)) + `<pre class="md-code lang-form"><code>${esc(match[1])}</code></pre>`;
+    at = match.index + match[0].length;
+  }
+  return html + (at ? plain(source.slice(at)) : renderConversationText(source, 'agent', v));
 }
 
 // ── message forms ────────────────────────────────────────────────────────────

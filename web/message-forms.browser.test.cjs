@@ -26,6 +26,9 @@ const leaky = `${fence({ fields: [{ name: 'key', type: 'secret' }], save: { meth
 const includedModel = `${fence({ fields: [{ name: 'key', label: 'OpenRouter management key', type: 'secret' }],
   save: { method: 'PUT', path: '/api/settings/included-model', body: { managementKey: '{{key}}' } }, submit: 'Turn on the included model' })}`;
 const leakyInstallation = `${fence({ fields: [{ name: 'key', type: 'secret' }], save: { method: 'PUT', path: '/api/settings/installation', body: { siteName: '{{key}}' } } })}`;
+// An escalation (the task's waiting request) asking for Google's OAuth client, saved to Sign-in apps.
+const signInApp = `Create the Google OAuth client named **tavya**, then:\n\n${fence({ fields: [{ name: 'clientId', label: 'Client ID' }, { name: 'clientSecret', label: 'Client secret', type: 'secret' }],
+  save: { method: 'PUT', path: '/api/settings/oauth-apps/accounts.google.com', body: { clientId: '{{clientId}}', clientSecret: '{{clientSecret}}' } } })}\n\nThen I connect Gmail.`;
 const outside = `${fence({ fields: [{ name: 'who' }], save: { method: 'POST', path: '/api/organizations/o/members', body: { userId: '{{who}}', role: 'owner' } } })}`;
 
 (async () => {
@@ -33,10 +36,12 @@ const outside = `${fence({ fields: [{ name: 'who' }], save: { method: 'POST', pa
   try {
     const project = { id: 'p', organizationId: 'o', name: 'Workspace', config: {} };
     const task = { id: 't', projectId: 'p', num: 1, title: 'Ship it', workflow: 'software-dev', params: {}, tags: [], lastView: { stage: 'do', status: 'waiting' } };
-    const open = async (messages, colorScheme = 'light') => {
-      const view = { taskId: 't', stage: 'do', status: 'waiting', workflow: 'software-dev', messages,
-        actions: [{ name: 'followUp', label: 'Send', enabled: true }], waitingFor: { kind: 'human', reason: 'question' } };
+    const open = async (messages, colorScheme = 'light', { markdown = true, asking } = {}) => {
+      const view = { taskId: 't', stage: 'do', status: 'waiting', workflow: 'software-dev', messages, updatedAt: T0 + 9000,
+        actions: [{ name: 'followUp', label: 'Send', enabled: true }], waitingFor: { kind: 'human', reason: 'question', ...(asking ? { detail: asking } : {}) } };
       const context = await browser.newContext({ serviceWorkers: 'block', viewport: { width: 1280, height: 900 }, colorScheme });
+      // Profile → Markdown rendering is a per-browser switch.
+      if (!markdown) await context.addInitScript(() => localStorage.setItem('karmax-md-render', '0'));
       const sent = [];
       const { sockets } = await fakeConsole(context, { project, tasks: [task], async api(p, request) {
         if (request.method() !== 'GET') {
@@ -145,6 +150,28 @@ const outside = `${fence({ fields: [{ name: 'who' }], save: { method: 'POST', pa
       assert.deepEqual(sent.map((s) => s.path), ['/api/settings/included-model', '/api/tasks/t/signal']);
       assert.deepEqual(sent[0].body, { managementKey: 'sk-or-v1-mgmt' });
       assert.ok(!JSON.stringify(signals(sent)).includes('sk-or'), 'the secret is not in the reply');
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    // ── with Markdown rendering off, a form is still a form: it is a control, not formatting ──
+    {
+      const { context, page, errors, sent } = await open([{ id: 'a1', role: 'agent', text: 'Checking the deploy.', ts: T0 }], 'light',
+        { markdown: false, asking: signInApp });
+      const form = page.locator('#ck-thread .input-request form.ask-form.live');
+      await form.waitFor();
+      assert.match(await form.locator('.ask-note').innerText(), /Saved to Sign-in apps, not into the conversation/);
+      const text = await page.locator('#ck-thread .input-request').innerText();
+      assert.ok(text.includes('**tavya**') && text.includes('Then I connect Gmail.'), 'the rest of the message stays plain text');
+      assert.ok(!text.includes('"fields"'), 'the form is not shown as its source');
+      if (shots) await page.screenshot({ path: `${shots}/form-plain-text.png` });
+      await form.getByLabel('Client ID').fill('123.apps.googleusercontent.com');
+      await form.getByLabel('Client secret').fill('GOCSPX-abc');
+      await form.locator('.ask-submit').click();
+      await page.waitForFunction(() => !document.querySelector('#ck-thread form.ask-form.live'));
+      assert.deepEqual(sent.map((s) => s.path), ['/api/settings/oauth-apps/accounts.google.com', '/api/tasks/t/signal']);
+      assert.deepEqual(sent[0].body, { clientId: '123.apps.googleusercontent.com', clientSecret: 'GOCSPX-abc' });
+      assert.ok(!JSON.stringify(signals(sent)).includes('GOCSPX'), 'the secret is not in the reply');
       assert.deepEqual(errors, []);
       await context.close();
     }
