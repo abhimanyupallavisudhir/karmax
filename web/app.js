@@ -14497,7 +14497,7 @@ function pendingMessagesHtml(v, t, entries, canUnsend) {
 
 function conversationPane(v, t) {
   if (!t) return '<div class="empty"><div class="big">No conversations yet</div>Agents appear here once the workflow starts one.</div>';
-  const entries = conversationEntries(t);
+  const entries = conversationEntries({ ...t, messages: withRolePrompt(t, t.messages || []) });
   const historyStatus = S.taskHistoryLoading
     ? '<div class="msg system" role="status">Loading conversation history…</div>'
     : S.taskHistoryError
@@ -14813,7 +14813,7 @@ function conversationEntries(t, events = S.taskEvents) {
   // The provider item a transcript reply stands for is the turn's final answer
   // (what the agent said when its turn ended), not narration on the way.
   const answer = (entry) => { if (entry) entry.answer = true; return false; };
-  const messages = withRolePrompt(t, t.messages || [])
+  const messages = (t.messages || [])
     .filter((message) => {
       if (message.role !== 'agent') return true;
       const source = message.sourceActivity;

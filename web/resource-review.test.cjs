@@ -36,7 +36,7 @@ function setup(api) {
     document: { getElementById: (id) => id === 'review-resource-inventory' ? inventory : wrap }, esc: String, formatBytes: String, policyTip: (text) => `<button class="info-dot" title="${text}">ⓘ</button>`, confirm: () => true, toast: () => {},
     S: {}, ICON: {}, siteNameMarkup: () => 'Karmax', siteName: () => 'Karmax', markdownEnabled: () => false, mathjaxEnabled: () => true, renderAgentMessageBody: String, renderWaitDetail: String, explainMessageAffordance: () => '',
     waitingText: () => 'Waiting', liveRoleFor: () => 'do', conversationPresence: () => ({ tone: 'waiting', label: 'Waiting' }),
-    conversationEntries: () => [], subTasksSection: () => '', forkSourcesSection: () => '', agentForksSection: () => '',
+    conversationEntries: () => [], withRolePrompt: (t, messages) => messages, subTasksSection: () => '', forkSourcesSection: () => '', agentForksSection: () => '',
     checkoutsSection: () => '', renderWidgetGroups: () => '', notesSection: () => '',
     conversationApprovalRequests: () => '', conversationPullRequestAsks: () => '', taskTranscripts: () => [{ role: 'do' }],
     parametersTab: () => 'parameters', timingTab: () => 'timing', micButtonHtml: () => '',
