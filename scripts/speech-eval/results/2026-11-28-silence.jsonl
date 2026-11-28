@@ -1,0 +1,16 @@
+{"model":"assemblyai/universal-3-6-pro","clip":"silence-noise.webm","ok":true,"ms":493,"text":"","cost":0.0002499999,"billedSeconds":3}
+{"model":"assemblyai/universal-3-6-pro","clip":"silence-noise.webm","ok":true,"ms":200,"text":"","cost":0.0002499999,"billedSeconds":3}
+{"model":"assemblyai/universal-3-6-pro","clip":"silence-quiet.webm","ok":true,"ms":214,"text":"","cost":0.0002499999,"billedSeconds":3}
+{"model":"assemblyai/universal-3-6-pro","clip":"silence-quiet.webm","ok":true,"ms":218,"text":"","cost":0.0002499999,"billedSeconds":3}
+{"model":"mistralai/voxtral-mini-transcribe-3-0","clip":"silence-noise.webm","ok":true,"ms":1040,"text":"","cost":0.0001749999,"billedSeconds":3}
+{"model":"mistralai/voxtral-mini-transcribe-3-0","clip":"silence-noise.webm","ok":true,"ms":468,"text":"","cost":0.0001749999,"billedSeconds":3}
+{"model":"mistralai/voxtral-mini-transcribe-3-0","clip":"silence-quiet.webm","ok":true,"ms":649,"text":"","cost":0.0001749999,"billedSeconds":3}
+{"model":"mistralai/voxtral-mini-transcribe-3-0","clip":"silence-quiet.webm","ok":true,"ms":413,"text":"","cost":0.0001749999,"billedSeconds":3}
+{"model":"elevenlabs/scribe-v2","clip":"silence-noise.webm","ok":true,"ms":782,"text":"[outro jingle]","cost":0.000225,"billedSeconds":3}
+{"model":"elevenlabs/scribe-v2","clip":"silence-noise.webm","ok":true,"ms":330,"text":"[outro jingle]","cost":0.000225,"billedSeconds":3}
+{"model":"elevenlabs/scribe-v2","clip":"silence-quiet.webm","ok":true,"ms":322,"text":"[pause]","cost":0.000225,"billedSeconds":3}
+{"model":"elevenlabs/scribe-v2","clip":"silence-quiet.webm","ok":true,"ms":329,"text":"[pause]","cost":0.000225,"billedSeconds":3}
+{"model":"openai/gpt-transcribe","clip":"silence-noise.webm","ok":true,"ms":655,"text":"","cost":0.000225,"billedSeconds":3}
+{"model":"openai/gpt-transcribe","clip":"silence-noise.webm","ok":true,"ms":503,"text":"","cost":0.000225,"billedSeconds":3}
+{"model":"openai/gpt-transcribe","clip":"silence-quiet.webm","ok":true,"ms":551,"text":"","cost":0.000225,"billedSeconds":3}
+{"model":"openai/gpt-transcribe","clip":"silence-quiet.webm","ok":true,"ms":555,"text":"","cost":0.000225,"billedSeconds":3}

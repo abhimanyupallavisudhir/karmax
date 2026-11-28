@@ -272,6 +272,9 @@ async function defaultVoice(model: string): Promise<string | undefined> {
   return speechModels.voices.get(model)?.[0];
 }
 
+/** The same payment, quote-free, for other OpenRouter calls on the credit (transcription.ts). */
+export { keyFor as generationKey, failure as openRouterFailure, settle as settleGeneration };
+
 /** Tests: forget cached model metadata. */
 export function resetGenerationCaches(): void { speechModels = undefined; }
 
