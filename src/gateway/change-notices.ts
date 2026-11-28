@@ -43,6 +43,8 @@ const PERSONAL = /^\/api\/(?:inbox|user)(?:\/|$)/;
  * Review asks for its files' signed URLs with a POST; were that a change, two
  * tabs on one task would re-read each other's renders. */
 const READ_ONLY_CAPABILITIES = new Set(['task:review:execute']);
+/** POSTs that only read: an app checking its offline pins (many at once, so a body). */
+const READ_ONLY_PATHS = new Set(['/api/offline-files/check']);
 
 const CLIENT_ID = /^[A-Za-z0-9_-]{8,64}$/;
 export const clientId = (value: unknown): string | undefined =>
@@ -71,7 +73,7 @@ export function changeNoticeFor(request: {
   /** The `x-tavya-client` header, as received. */
   client?: unknown;
 }): ChangeNotice | undefined {
-  if (['GET', 'HEAD', 'OPTIONS'].includes(request.method) || request.status >= 400) return undefined;
+  if (['GET', 'HEAD', 'OPTIONS'].includes(request.method) || request.status >= 400 || READ_ONLY_PATHS.has(request.path)) return undefined;
   const capability = request.capability && request.capability !== 'none' ? request.capability : undefined;
   if (capability && (capability.endsWith(':read') || READ_ONLY_CAPABILITIES.has(capability))) return undefined;
   const area = capability?.split(':')[0] ?? request.path.split('/')[2] ?? '';

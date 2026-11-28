@@ -97,6 +97,20 @@ export type RepositoryPresence = { state: 'present'; size?: number } | { state: 
 
 export class FileNotFoundError extends Error {}
 export class FileAccessError extends Error {}
+/** A folder holds more files than one pin keeps offline. */
+export class ManifestTooLargeError extends Error {
+  constructor(readonly limit: number) { super(`Too many files to keep offline: more than ${limit.toLocaleString('en')} in this folder.`); }
+}
+
+/** One file a pin keeps on a device, relative to the pinned place ('' = the place is this file).
+ * `data`: from a data resource (its version is a content identity, not a Git blob id). */
+export interface ManifestFile { path: string; size: number; version: string; data?: true }
+/** Every file under a place, and its revision (`ProjectFiles.manifest`). */
+export interface FileManifest { path: string; kind: 'file' | 'directory'; revision: string; files: ManifestFile[]; bytes: number }
+/** What a pinned place is now (`ProjectFiles.revision`): a file's version, or a folder's revision. */
+export interface PlaceRevision { kind: 'file' | 'directory'; revision: string; size?: number }
+/** Where a place's offline copy comes from: the default branches or another branch (never a task's world). */
+export interface OfflineReadOptions { data: boolean; view?: FileView; maxFiles?: number }
 
 /** A task's saved uncommitted files: the reader WorldCheckpointService gives. */
 export interface SavedCheckpointFiles {
@@ -134,8 +148,10 @@ export function projectRepositoryCredential(store: Store, options: { hosted?: bo
 
 /** How long a branch tip origin advertised is trusted before asking again. */
 const TIP_MAX_AGE_MS = 30_000;
-/** Snapshot listings never change: kept by snapshot and directory. */
-const LISTING_CACHE = 500;
+/** At most this many files are kept offline under one pin (a folder's manifest). */
+export const MANIFEST_MAX_FILES = 20_000;
+/** restic runs at once while a manifest walks a data folder's trees. */
+const TREE_READS = 4;
 /** A live file larger than this is not read through a provider that cannot stream. */
 const LIVE_UNSTREAMED_MAX = 100 * 1024 * 1024;
 /** What a live world never shows: tavya's own state (tokens, jobs) and Git internals. */
@@ -164,7 +180,6 @@ interface Layout { checkouts: Checkout[]; mounts: Mount[]; rootOverlay?: Overlay
 interface Located { stat: () => Promise<FileNode>; open: <T>(consume: (file: OpenedFile) => Promise<T>) => Promise<T> }
 
 export class ProjectFiles {
-  private readonly listings = new Map<string, SnapshotEntry[]>();
   private readonly saved = new Map<string, Promise<{ files: ManifestEntry[]; read(entry: ManifestEntry): AsyncIterable<Buffer> }>>();
 
   constructor(private readonly deps: ProjectFilesDeps) {}
@@ -213,6 +228,135 @@ export class ProjectFiles {
       pins.data[mount.id] = mount.revisionId ?? null;
     }
     return { pins, node: await this.stat(projectId, relative, { data: options.data, pins }) };
+  }
+
+  /** Every file under `relative` (itself, for a file), each with the version
+   * Files and files/raw give it, and the place's revision: what an app keeps
+   * offline (wiki features/offline-files). Folders are walked recursively, data
+   * mounted inside included, links and submodules left out; more than
+   * `maxFiles` (MANIFEST_MAX_FILES) refuses. The default or a branch view only. */
+  async manifest(projectId: string, relative: string, options: OfflineReadOptions): Promise<FileManifest> {
+    const files: ManifestFile[] = [];
+    const place = await this.offlinePlace(projectId, relative, options, files);
+    if (place.kind === 'file') return { path: place.path, kind: 'file', revision: place.revision,
+      files: [{ path: '', size: place.size ?? 0, version: place.revision, ...(place.data ? { data: true as const } : {}) }], bytes: place.size ?? 0 };
+    files.sort((a, b) => collator.compare(a.path, b.path) || (a.path < b.path ? -1 : 1));
+    return { path: place.path, kind: 'directory', revision: place.revision, files, bytes: files.reduce((sum, file) => sum + file.size, 0) };
+  }
+
+  /** What a pinned place is now, without listing it: a file's version, or a
+   * folder's revision (the tree ids of what it spans: Git trees, restic
+   * trees). It changes exactly when some file under it may have. */
+  async revision(projectId: string, relative: string, options: OfflineReadOptions): Promise<PlaceRevision> {
+    const place = await this.offlinePlace(projectId, relative, options);
+    return place.kind === 'file' ? { kind: 'file', revision: place.revision, size: place.size ?? 0 } : { kind: 'directory', revision: place.revision };
+  }
+
+  /** `manifest` and `revision` in one walk, so both name the same revision.
+   * `files` (when given) receives every file under the place. */
+  private async offlinePlace(projectId: string, relative: string, options: OfflineReadOptions, files?: ManifestFile[])
+    : Promise<{ path: string; kind: 'file' | 'directory'; revision: string; size?: number; data?: boolean }> {
+    if (options.view?.kind === 'task') throw new FileNotFoundError('A task’s files can’t be kept offline.');
+    const segments = splitPath(relative);
+    const display = segments.join('/');
+    const max = options.maxFiles ?? MANIFEST_MAX_FILES;
+    const layout = await this.projectLayout(projectId, { view: options.view });
+    // A mount replaces what its folder has: a file under a deeper mount than its source's root is that mount's.
+    const add = (full: string[], size: number, version: string, depth: number, data = false) => {
+      if (!files || layout.mounts.some((mount) => mount.segments.length > depth && startsWith(full, mount.segments))) return;
+      files.push({ path: full.slice(segments.length).join('/'), size, version, ...(data ? { data: true as const } : {}) });
+      if (files.length > max) throw new ManifestTooLargeError(max);
+    };
+    const components: unknown[] = [];
+    const mount = layout.mounts.filter((candidate) => startsWith(segments, candidate.segments)).sort((a, b) => b.segments.length - a.segments.length)[0];
+    const checkout = mount ? undefined : layout.checkouts.filter((candidate) => startsWith(segments, candidate.segments))
+      .sort((a, b) => b.segments.length - a.segments.length)[0];
+    if (mount) {
+      if (!options.data) throw new FileAccessError('Viewing data needs access to project settings (project:settings:read).');
+      const place = await this.dataPlace(mount, segments.slice(mount.segments.length), files ? add : undefined);
+      if (place.kind === 'file') return { path: display, kind: 'file', revision: place.version, size: place.size, data: true };
+      components.push(['data', mount.id, segments.slice(mount.segments.length).join('/'), place.tree]);
+    } else if (checkout) {
+      const inside = segments.slice(checkout.segments.length);
+      const file = await this.withRepository(projectId, checkout, async (mirror, commit) => {
+        let tree: string | undefined;
+        if (!inside.length) tree = await revParse(mirror, `${commit}^{tree}`);
+        else {
+          const entry = await treeEntry(mirror, commit, inside.join('/'));
+          if (entry?.kind === 'file') return { revision: entry.object, size: entry.size ?? 0 };
+          if (entry?.kind === 'directory') tree = entry.object;
+          // A link or submodule is not kept; nothing there may still be a folder data is mounted below.
+          else if (entry) throw new FileNotFoundError(`Nothing to keep at ${display}`);
+        }
+        components.push(['git', checkout.name, inside.join('/'), tree ?? null]);
+        if (tree && files) await this.gitFiles(mirror, tree, [...checkout.segments, ...inside], checkout.segments.length, add);
+        return undefined;
+      });
+      if (file) return { path: display, kind: 'file', ...file };
+    }
+    // What lies below: each repository at the root, each data mount further down.
+    for (const below of layout.checkouts) {
+      if (below === checkout || below.segments.length <= segments.length || !startsWith(below.segments, segments)) continue;
+      await this.withRepository(projectId, below, async (mirror, commit) => {
+        const tree = await revParse(mirror, `${commit}^{tree}`);
+        components.push(['git', below.name, '', tree]);
+        if (files) await this.gitFiles(mirror, tree, below.segments, below.segments.length, add);
+      });
+    }
+    for (const below of layout.mounts) {
+      if (below === mount || below.segments.length <= segments.length || !startsWith(below.segments, segments)) continue;
+      // Without the right to read data, a folder keeps what else it has.
+      if (!options.data) { components.push(['data', below.id, '', 'no-access']); continue; }
+      const place = await this.dataPlace(below, [], files ? add : undefined);
+      if (place.kind === 'file') { components.push(['data', below.id, '', place.version]); add(below.segments, place.size, place.version, below.segments.length - 1, true); }
+      else components.push(['data', below.id, '', place.tree]);
+    }
+    if (!components.some((component) => (component as unknown[])[3] !== null) && segments.length) throw new FileNotFoundError(`Nothing at ${display}`);
+    return { path: display, kind: 'directory', revision: crypto.createHash('sha256').update(JSON.stringify(components)).digest('hex').slice(0, 40) };
+  }
+
+  /** Every file of a Git tree (one `ls-tree -r`), at `at` in the layout. */
+  private async gitFiles(mirror: string, tree: string, at: string[], depth: number,
+    add: (full: string[], size: number, version: string, depth: number) => void): Promise<void> {
+    const listed = await git(mirror, ['ls-tree', '-r', '-z', '-l', tree]);
+    if (listed.code !== 0) throw new Error(listed.stderr || listed.stdout || 'git ls-tree failed');
+    for (const entry of parseTree(listed.stdout)) if (entry.kind === 'file') add([...at, ...entry.name.split('/')], entry.size ?? 0, entry.object, depth);
+  }
+
+  /** A data resource's place `inside` it: a file (its content identity), or a
+   * folder (its restic tree id; for an on-demand version's root, every
+   * part's), walking every tree below it when `add` is given. */
+  private async dataPlace(mount: Mount, inside: string[], add?: (full: string[], size: number, version: string, depth: number, data?: boolean) => void)
+    : Promise<{ kind: 'file'; version: string; size: number } | { kind: 'directory'; tree: string }> {
+    const version = await this.dataVersion(mount);
+    const missing = () => new FileNotFoundError(`Nothing at ${[...mount.segments, ...inside].join('/')}`);
+    if (!version) { if (inside.length || mount.shape === 'file') throw missing(); return { kind: 'directory', tree: 'empty' }; }
+    const restic = this.deps.resources!.restic;
+    if (mount.shape === 'file') {
+      const file = inside.length ? undefined : await this.onlyFile(version.repository, version.snapshotOf([])!);
+      if (!file) throw missing();
+      return { kind: 'file', version: file.identity ?? tag(version.snapshotOf([])!, ''), size: file.size ?? 0 };
+    }
+    const walk = (roots: Array<{ id: string; at: string[] }>) => add ? walkTrees(roots, (id) => restic.tree(version.repository, id),
+      (at, entry) => add([...mount.segments, ...at, entry.name], entry.size ?? 0, entry.identity!, mount.segments.length, true)) : Promise.resolve();
+    if (!inside.length && version.parts) {
+      const roots: Array<{ id: string; at: string[] }> = [];
+      for (const name of Object.keys(version.parts).sort()) roots.push({ id: await restic.snapshotTree(version.repository, version.parts[name]!.snapshot), at: [] });
+      await walk(roots);
+      return { kind: 'directory', tree: roots.map((root) => root.id).join(',') };
+    }
+    const snapshot = version.snapshotOf(inside);
+    if (!snapshot) throw missing();
+    let tree: string;
+    if (!inside.length) tree = await restic.snapshotTree(version.repository, snapshot);
+    else {
+      const entry = (await this.listing(version.repository, snapshot, inside.slice(0, -1).join('/'))).find((candidate) => candidate.name === inside.at(-1));
+      if (entry?.type === 'file') return { kind: 'file', version: entry.identity ?? tag(snapshot, inside.join('/')), size: entry.size ?? 0 };
+      if (entry?.type !== 'dir' || !entry.tree) throw missing();
+      tree = entry.tree;
+    }
+    await walk([{ id: tree, at: inside }]);
+    return { kind: 'directory', tree };
   }
 
   /** Where each of `paths` stands in the repositories tasks start from:
@@ -543,7 +687,7 @@ export class ProjectFiles {
         return await attempt(checkout.fallbackBranch);
       }
     } catch (error) {
-      if (error instanceof FileNotFoundError || error instanceof FileAccessError) throw error;
+      if (error instanceof FileNotFoundError || error instanceof FileAccessError || error instanceof ManifestTooLargeError) throw error;
       if (error instanceof MirroredCommitMissing) throw new FileNotFoundError(checkout.commit && checkout.overlay !== undefined || checkout.fallbackBranch
         ? `${checkout.name}: this task’s latest commits haven’t reached GitHub yet.` : `${checkout.name}: ${error.message}`);
       throw new Error(`Couldn’t read ${checkout.name}: ${firstLine(error)}`);
@@ -685,14 +829,11 @@ export class ProjectFiles {
       snapshotOf: (inside) => inside.length ? (parts[inside[0]!] && inside[0] !== ROOT_PART ? parts[inside[0]!]!.snapshot : parts[ROOT_PART]?.snapshot) : undefined };
   }
 
+  /** A snapshot folder's entries, from restic's own tree (kept by id): each
+   * file with its content identity, so a file's version is its content's in
+   * every snapshot (wiki features/offline-files). Nothing there lists nothing. */
   private async listing(repository: ResticRepository, snapshot: string, directory: string): Promise<SnapshotEntry[]> {
-    const key = `${repository.name}\n${snapshot}\n${directory}`;
-    const cached = this.listings.get(key);
-    if (cached) { this.listings.delete(key); this.listings.set(key, cached); return cached; }
-    const entries = await this.deps.resources!.restic.entries(repository, snapshot, directory);
-    if (this.listings.size >= LISTING_CACHE) this.listings.delete(this.listings.keys().next().value!);
-    this.listings.set(key, entries);
-    return entries;
+    return (await this.deps.resources!.restic.treeAt(repository, snapshot, directory)) ?? [];
   }
 
   /** The single file a file-shaped resource's snapshot holds. */
@@ -707,7 +848,7 @@ export class ProjectFiles {
     if (mount.shape === 'file') {
       if (inside.length) throw new FileNotFoundError(`Nothing at ${display}`);
       const file = version ? await this.onlyFile(version.repository, version.snapshotOf([])!) : undefined;
-      return { path: display, kind: 'file', source, size: file?.size ?? 0, ...(version ? { version: tag(version.snapshotOf([])!, '') } : {}) };
+      return { path: display, kind: 'file', source, size: file?.size ?? 0, ...(file ? { version: file.identity ?? tag(version!.snapshotOf([])!, '') } : {}) };
     }
     if (!version) {
       if (inside.length) throw new FileNotFoundError(`Nothing at ${display}`);
@@ -733,7 +874,7 @@ export class ProjectFiles {
     }
     if (entry.type === 'dir') return directory(inside.join('/'));
     if (entry.type === 'symlink') return { path: display, kind: 'symlink', source, target: entry.linkTarget ?? '' };
-    return { path: display, kind: 'file', source, size: entry.size ?? 0, version: tag(snapshot, inside.join('/')) };
+    return { path: display, kind: 'file', source, size: entry.size ?? 0, version: entry.identity ?? tag(snapshot, inside.join('/')) };
   }
 
   private async dataOpen<T>(mount: Mount, inside: string[], display: string, consume: (file: OpenedFile) => Promise<T>): Promise<T> {
@@ -781,6 +922,42 @@ for (const entry of fs.readdirSync(real, { withFileTypes: true }).slice(0, 10000
   entries.push(size === undefined ? { name: entry.name, kind } : { name: entry.name, kind, size });
 }
 out({ kind: 'directory', real: relReal, entries });`;
+
+/** `git rev-parse` of one object name. */
+async function revParse(mirror: string, name: string): Promise<string> {
+  const parsed = await git(mirror, ['rev-parse', '--verify', '--quiet', name]);
+  if (parsed.code !== 0) throw new Error(parsed.stderr || `git rev-parse ${name} failed`);
+  return parsed.stdout.trim();
+}
+
+/** Every file in the restic trees below `roots`, a few trees read at once. */
+function walkTrees(roots: Array<{ id: string; at: string[] }>, read: (id: string) => Promise<SnapshotEntry[]>,
+  visit: (at: string[], entry: SnapshotEntry) => void): Promise<void> {
+  const queue = [...roots];
+  let running = 0, failed = false;
+  return new Promise<void>((resolve, reject) => {
+    const fail = (error: unknown) => { if (!failed) { failed = true; reject(error); } };
+    const pump = () => {
+      if (failed) return;
+      if (!queue.length && !running) return resolve();
+      while (running < TREE_READS && queue.length) {
+        const { id, at } = queue.shift()!;
+        running++;
+        read(id).then((entries) => {
+          running--;
+          try {
+            for (const entry of entries) {
+              if (entry.type === 'dir' && entry.tree) queue.push({ id: entry.tree, at: [...at, entry.name] });
+              else if (entry.type === 'file') visit(at, entry);
+            }
+          } catch (error) { return fail(error); }
+          pump();
+        }, fail);
+      }
+    };
+    pump();
+  });
+}
 
 /** An async source of bytes as an OpenedFile; `stop` abandons it. */
 function streamOf(node: FileNode, chunks: AsyncIterable<Buffer>): OpenedFile {
