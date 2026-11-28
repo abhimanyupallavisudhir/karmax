@@ -624,7 +624,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         authorization: {
           type: 'object',
           properties: {
-            level: { type: 'string', description: 'viewer, developer, maintainer, administrator, …' },
+            level: { type: 'string', description: 'viewer, developer or maintainer (scope projects or organization); administrator or superadmin (scope organization); god (scope global); or an organization role id' },
             scope: { type: 'string', enum: ['projects', 'organization', 'global'] },
             projectIds: { type: 'array', items: { type: 'string' } },
           },

@@ -1709,11 +1709,11 @@ export class KarmaxApi {
     const project = (await this.deps.store.getProject(args.projectId));
     if (!project) throw new NotFoundError(`no project ${args.projectId}`);
     const workflow = args.workflow ?? 'software-dev';
-    if (RETIRED_WORKFLOWS.has(workflow)) throw new Error(RETIRED_WORKFLOW_HINT);
+    if (RETIRED_WORKFLOWS.has(workflow)) throw new ValidationError(RETIRED_WORKFLOW_HINT);
     // Honor a per-project version pin (§21d) so a project can hold on a specific
     // version while others take the latest; unpinned → latest.
     const start = this.resolveStart(workflow, (await this.workflowPinFor(args.projectId, workflow)), project.organizationId);
-    if (!start) throw new Error(`unknown workflow "${workflow}"`);
+    if (!start) throw new ValidationError(`unknown workflow "${workflow}"`);
     const { manifest, startType } = start;
     // A fork of an Avatar its creator may call acts with the Avatar's
     // authorization, credentials and GitHub account: nobody grants it again
