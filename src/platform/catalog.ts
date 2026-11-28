@@ -214,7 +214,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/agent/permission-requests (body {capabilities, projectIds?, audience?, reason, urgency?}, or {taskId, audience?, reason} to ask for what a task you created is held for; exact task elevation and additive project scope (capabilities: [] for scope only) routed to tasks (task:<id>), people, teams, or Avatars; no audience asks the nearest who can grant it: a task you act for that holds it, else the lowest of @maintainers, @admins, @superadmins that can; answers canGrant, nearest first; high urgency by default)',
     'POST /api/agent/permission-requests/:id/withdraw (body {reason?}; the requesting task\'s agents take back its pending permission request, or a task\'s creator its held-authorization request; already decided ones are returned unchanged)',
     'GET /api/agent/escalation-targets (people, teams, Avatārs, and special audience selectors — @creator, @maintainers, @admins, @superadmins, @owners, @project, @all — available to the calling task; with capabilities=<a,b> and/or projectIds=: only those who can grant it, nearest first — tasks you act for, then people, teams, Avatārs — with `default` and what you are `missing`)',
-    'GET /api/permission-requests?taskId=&organizationId=',
+    'GET /api/permission-requests?taskId=&organizationId= (each with ask: {question, detail} — what it grants, in the words to show a person)',
     'POST /api/permission-requests/:id/resolve?organizationId= (routed user delegate, Avatār or task agent: body {action: approve|deny|dismiss}; dismiss only silences the request)',
     'GET /api/repository-access-requests?taskId=&organizationId= (GitHub access a task\'s creator lacks to a repository it must open a pull request on; asked of the repository\'s GitHub admins in the organization)',
     'POST /api/repository-access-requests/:id/resolve?organizationId= (a routed person who is still an admin of the repository on GitHub: body {action: approve|deny|dismiss}; dismiss only silences the request; approve adds the creator as a collaborator with write access, accepts the invitation as them and retries the task)',
@@ -428,7 +428,7 @@ export const PLATFORM_API_CATALOG = {
     // The inbox is per-USER by construction, so these three are the human surface:
     // a scoped agent token has no session.userId and gets a 400, whatever its
     // capabilities. An agent watches work through /ws and the task view instead.
-    'GET /api/inbox?since= (verified user subject; delegation accepted — the inbox is per-user)',
+    'GET /api/inbox?since= (verified user subject; delegation accepted — the inbox is per-user; an approval row carries ask: what it grants, in words)',
     'PATCH /api/inbox/:itemId (verified user subject; delegation accepted)',
     'PATCH /api/inbox?organizationId= (body {ids: string[]}, up to 500; marks owned items read; verified user subject, delegation accepted)',
     'GET|PUT /api/inbox/preferences (verified user subject; delegation accepted; body {browser, email, emailUrgencies?, pushUrgencies?: {low|normal|high|critical: boolean}, slack, routine})',

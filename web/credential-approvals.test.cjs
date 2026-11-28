@@ -33,7 +33,7 @@ global.taskRecord = () => undefined;
 global.projectById = (id) => id === 'project_1' ? { id, name: 'App' } : undefined;
 global.projectBase = () => '/personal/app';
 
-for (const name of ['policyTip', 'credentialRequestTaskLink', 'credentialChoices', 'credentialRequestRows', 'requestReasonLine', 'subTaskAskLine', 'permissionAskTitle', 'permissionRequestRows', 'ignoredChip', 'ignoreRequestButton', 'defaultTaskTab']) eval(extractFn(name));
+for (const name of ['policyTip', 'credentialRequestTaskLink', 'credentialChoices', 'credentialRequestRows', 'requestReasonLine', 'subTaskAskLine', 'permissionAskHtml', 'permissionRequestRows', 'ignoredChip', 'ignoreRequestButton', 'defaultTaskTab']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
@@ -68,6 +68,7 @@ ok(rows.includes('Use “Example login” without seeing it?'), 'the request ask
 const sessionRows = credentialRequestRows([request], [{ id: 'vi_1', label: 'notes.test (signed in)', type: 'session' }]);
 ok(/Allow once: Signs the agent's browser in to this site once/.test(sessionRows.replace(/&#39;|’/g, "'")), 'a session once-grant says it signs the browser in once');
 
+// Each request as the gateway lists it: with `ask`, its words (src/domain/permission-ask.ts).
 const permission = {
   id: 'preq_1',
   type: 'permission',
@@ -77,25 +78,25 @@ const permission = {
   reason: 'configure outbound email',
   status: 'pending',
   task: request.task,
+  ask: { question: "Give #12's agent settings:read and settings:write?", detail: 'Permissions: settings:read, settings:write' },
 };
 const permissionRows = permissionRequestRows([permission]);
-ok(permissionRows.includes('settings:read') && permissionRows.includes('settings:write'),
-  'permission request row names every exact capability');
+ok(permissionRows.replace(/&#39;/g, "'").includes("Give #12's agent settings:read and settings:write?"),
+  'permission request row asks what it grants, by name');
+ok(permissionRows.includes('title="Permissions: settings:read, settings:write"'), 'every permission is in its tooltip');
 ok(permissionRows.includes('@team:operators') && permissionRows.includes('configure outbound email'),
   'permission request row explains its audience and reason');
 ok(permissionRows.includes('data-preq-act="approve"') && permissionRows.includes('data-preq-act="deny"'),
   'permission request row exposes approve and deny decisions');
 
-const scopeRows = permissionRequestRows([{ ...permission, capabilities: [], projectIds: ['proj_second<script>'],
-  baseAuthorization: { level: 'developer' } }]);
-ok(scopeRows.includes('proj_second&lt;script&gt;') && !scopeRows.includes('<script>'), 'project scopes are visible and escaped');
-ok(scopeRows.includes('Allowing gives this task its developer access in these projects too.'), 'scope approval explains its full effect');
-// Task #904: a request that only adds a project read "these 0 permissions and projects?" over an empty chip row.
-ok(scopeRows.includes('Give the agent access to this project?') && !scopeRows.includes('approval-request-caps'),
-  'a project-only request asks for access to the project, with no empty capability row');
-ok(permissionAskTitle({ capabilities: [], projectIds: ['a', 'b'] }) === 'Give the agent access to these 2 projects?', 'several projects are counted');
-ok(permissionRows.includes('Give the agent these 2 permissions?'), 'a capability request counts its permissions');
-ok(permissionAskTitle({ capabilities: ['x'], projectIds: ['a'] }) === 'Give the agent this permission and projects?', 'both are named');
+// preq_mx07uw7p312057c6ae (#1060): a request adding only a project read "Give the agent 0 permissions?".
+const scopeRows = permissionRequestRows([{ ...permission, capabilities: [], projectIds: ['proj_docs'],
+  baseAuthorization: { level: 'developer' },
+  ask: { question: "Let #1060's agent work in admin<script> too (as Developer)?", detail: 'Projects: admin<script> (as Developer)' } }]);
+ok(scopeRows.replace(/&#39;/g, "'").includes("Let #1060's agent work in admin&lt;script&gt; too (as Developer)?") && !scopeRows.includes('<script>'),
+  'a project-only request names the project, escaped');
+ok(!/\b0 permissions?\b/.test(scopeRows) && !scopeRows.includes('approval-request-caps'), 'it never counts 0 permissions');
+ok(permissionAskHtml({ capabilities: ['x'] }, 'q') === '<span class="q">Allow this permission request?</span>', 'a request without words still asks plainly');
 
 ok(defaultTaskTab({ approvalRequests: 1, actions: [] }) === 'checkin', 'a task needing approval opens its conversation, where the request waits');
 ok(defaultTaskTab({ approvalRequests: 0, actions: [{ name: 'confirm', enabled: true }] }) === 'checkin', 'review-only tasks retain the Check-in default');

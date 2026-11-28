@@ -1,3 +1,4 @@
+import type { PermissionAsk } from '../domain/permission-ask.js';
 import type { AuthorizationSelection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
@@ -38,6 +39,8 @@ export interface PermissionRequest {
   createdAt: number;
   /** Human-facing metadata projected by the gateway, never persisted. */
   task?: { id: string; num?: number; title: string; projectId: string };
+  /** What it grants, in words (src/domain/permission-ask.ts), projected the same way. */
+  ask?: PermissionAsk;
   /** The tasks in `taskRecipients`, projected the same way. */
   grantorTasks?: Array<{ id: string; num?: number; title: string; projectId: string }>;
 }

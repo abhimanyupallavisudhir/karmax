@@ -4425,8 +4425,9 @@ export class Gateway {
         const items = (await store.listInbox(subject.userId, requestedScope.organizationId,
           { unreadOnly: url.searchParams.get('unread') === '1', limit: Number(url.searchParams.get('limit') ?? 200) }));
         const headers = await store.taskHeaders(items.map((item) => item.taskId));
+        const asks = await store.inboxAsks(items);
         return this.json(res, 200, (await __asyncCollections.map(items, async (item) => {
-          return { ...item, task: headers.get(item.taskId) };
+          return { ...item, task: headers.get(item.taskId), ...(asks.has(item.id) ? { ask: asks.get(item.id) } : {}) };
         })));
       }
       if (p === '/api/inbox' && method === 'PATCH') {

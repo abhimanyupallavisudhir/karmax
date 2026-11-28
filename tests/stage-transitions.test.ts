@@ -11,6 +11,7 @@ import type { TaskView } from '../src/domain/types.js';
 import { QRY_ACCOUNT_TASK_LEASES, QRY_AGENT_QUEUE } from '../src/coordinators/names.js';
 import { AuthorizationService, projectScope } from '../src/platform/authorization.js';
 import { PermissionRequests } from '../src/platform/permission-requests.js';
+import { pushMessage } from '../src/collaboration/push-delivery.js';
 import { sameProposalIdentity, pullRequestSummary } from '../src/workflows/software-dev.js';
 import { lifecycleReplacementKey } from '../src/platform/lifecycle-replacement.js';
 import { RunnerPoolService } from '../src/world/runners.js';
@@ -1287,7 +1288,7 @@ describe('task stage transitions', () => {
       audience: ['user:limited'], reason: 'Expand project scope only.' });
     // Task #904: it waits on what it asked, in words (not "Permission requested: ; add projects: <id>").
     expect((await f.store.getTask(f.task.id))!.lastView?.waitingFor?.detail)
-      .toBe('Permission requested: access to Second — Expand project scope only.');
+      .toBe(`Let #${f.task.num}'s agent work in Second too (as Developer)? — Expand project scope only.`);
     const limited = (await f.tokens.mintPrincipal('user:limited', ['*'], f.project.id, undefined, 'org_personal')).token;
     await expect(f.api.resolvePermissionRequest(limited, {
       organizationId: 'org_personal', requestId: requested.requestId!, action: 'approve',
@@ -1297,6 +1298,47 @@ describe('task stage transitions', () => {
       organizationId: 'org_personal', requestId: requested.requestId!, action: 'deny',
     })).resolves.toMatchObject({ status: 'denied', resume: { resumed: true } });
     expect((await f.store.getTask(f.task.id))!.params._authorization).toEqual(initial);
+  });
+
+  // preq_mx07uw7p312057c6ae (#1060) asked only to work in another project, and its
+  // owner was asked "Give the agent 0 permissions?" — the project never named.
+  it('says what a request grants wherever it is shown, and refuses one that grants nothing', async () => {
+    const f = (await fixture(undefined, true));
+    const docs = (await f.store.createProject('admin_docs'));
+    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: { level: 'developer', scope: 'projects',
+      projectIds: [f.project.id], capabilities: ['task:read'], principal: 'user:test' } }));
+    const agent = (await f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do', principal: 'task-agent:test',
+      projectId: f.project.id, organizationId: 'org_personal', ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] })).token;
+    // Nothing to grant: refused at request_permission, before anyone is asked.
+    for (const empty of [{}, { capabilities: [] }, { capabilities: [], projectIds: [] }])
+      await expect(f.api.requestPermission(agent, { ...empty, audience: ['@owners'], reason: 'Nothing.' }))
+        .rejects.toMatchObject({ status: 400, message: expect.stringMatching(/capabilities, projectIds, or both/) });
+    expect((await new PermissionRequests(f.store, 'org_personal').requests({ taskId: f.task.id }))).toEqual([]);
+
+    const projectOnly = await f.api.requestPermission(agent, { capabilities: [], projectIds: [docs.id],
+      audience: ['user:test'], reason: 'Publish the docs.' });
+    const agentName = `#${f.task.num}'s agent`;
+    // The approval card and For me row: what the gateway lists.
+    const [listed] = await f.api.listPermissionRequests(f.token, { organizationId: 'org_personal', taskId: f.task.id });
+    expect(listed!.ask).toEqual({ question: `Let ${agentName} work in admin_docs too (as Developer)?`,
+      detail: 'Projects: admin_docs (as Developer)', grant: 'access to admin_docs (as Developer)' });
+    // The inbox, browser and phone notifications: the event's words.
+    const [event] = await f.store.eventsOfType(f.task.id, 'permission.approval-requested');
+    expect(event!.payload.ask).toBe('Let its agent work in admin_docs too (as Developer)?');
+    const [item] = (await f.store.listInbox('test', 'org_personal')).filter((row) => row.kind === 'approval-requested');
+    expect((await f.store.inboxAsks([item!])).get(item!.id)).toBe('Let its agent work in admin_docs too (as Developer)?');
+    expect(pushMessage({ inbox: item!, ask: 'Let its agent work in admin_docs too (as Developer)?',
+      task: { id: f.task.id, num: f.task.num, title: f.task.title } }, { siteName: 'tavya' }).body)
+      .toBe(`#${f.task.num} · Let its agent work in admin_docs too (as Developer)?`);
+    await f.api.withdrawPermissionRequest(agent, { requestId: projectOnly.requestId! });
+
+    // Both at once: both named.
+    const both = await f.api.requestPermission(agent, { capabilities: ['settings:write'], projectIds: [docs.id],
+      audience: ['user:test'], reason: 'Publish and configure.' });
+    const listedBoth = (await f.api.listPermissionRequests(f.token, { organizationId: 'org_personal', taskId: f.task.id }))
+      .find((request) => request.id === both.requestId)!;
+    expect(listedBoth.ask!.question).toBe(`Let ${agentName} work in admin_docs too (as Developer) and give it settings:write?`);
+    expect(listedBoth.ask!.detail).toBe('Projects: admin_docs (as Developer)\nPermissions: settings:write');
   });
 
   it('requires authority for earlier permission grants belonging to other roles before expanding scope', async () => {

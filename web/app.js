@@ -8293,7 +8293,7 @@ function rowAskHtml(t) {
       <span data-connection-result hidden></span></div>`;
     }),
     ...pending(loaded.permission).map((request) => `<div class="row-decision" data-preq="${esc(request.id)}">
-      <span class="row-ask-q" title="${esc(request.capabilities.join(', '))}">Give the agent ${request.capabilities.length === 1 ? `<code>${esc(request.capabilities[0])}</code>` : `${request.capabilities.length} permissions`}?</span>
+      ${permissionAskHtml(request, 'row-ask-q')}
       <span class="row-ask-actions"><button type="button" class="btn sm primary" data-preq-act="approve">Allow</button><button type="button" class="btn sm" data-preq-act="deny">Deny</button></span></div>`),
     ...pending(loaded.authorization).filter((request) => request.recipients?.includes(signedIn)).map((request) => `<div class="row-decision" data-areq="${esc(request.id)}">
       <span class="row-ask-q">Give this task ${esc(authorizationSummary(request.authorization, S.projects.filter((project) => project.organizationId === request.organizationId)))}?</span>
@@ -25638,13 +25638,12 @@ function requestReasonLine(request, reason, inTask) {
   return parts.length ? `<div class="task-sub">${parts.join(' — ')}</div>` : '';
 }
 
-// "Give the agent this permission?", "…these 2 permissions and projects?",
-// "…access to this project?" — a request may add projects and nothing else.
-function permissionAskTitle(request) {
-  const caps = request.capabilities.length;
-  const projects = request.projectIds?.length || 0;
-  if (!caps) return `Give the agent access to ${projects === 1 ? 'this project' : `these ${projects} projects`}?`;
-  return `Give the agent ${caps === 1 ? 'this permission' : `these ${caps} permissions`}${projects ? ' and projects' : ''}?`;
+// What a permission request grants, as the gateway words it for every place
+// that shows one (src/domain/permission-ask.ts): "Let #1060's agent work in
+// admin_docs too (as Developer)?", every project and permission in its tooltip.
+function permissionAskHtml(request, className) {
+  const ask = request.ask || {};
+  return `<span class="${className}"${ask.detail ? ` title="${esc(ask.detail)}"` : ''}>${esc(ask.question || 'Allow this permission request?')}</span>`;
 }
 
 function permissionRequestRows(requests, { historyLimit = 20, inTask = false } = {}) {
@@ -25652,21 +25651,18 @@ function permissionRequestRows(requests, { historyLimit = 20, inTask = false } =
   const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
   const pendingHtml = pending.map((request) => `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-preq="${esc(request.id)}">
     <div class="approval-request-main">
-      <div class="approval-request-title">${permissionAskTitle(request)}
+      <div class="approval-request-title">${permissionAskHtml(request, 'approval-request-ask')}
         ${request.dismissed ? ignoredChip() : ''}
       </div>
-      ${request.capabilities.length ? `<div class="approval-request-caps">${request.capabilities.map((capability) =>
-        `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>` : ''}
-      ${request.projectIds?.length ? `<div class="approval-request-projects">Add projects: ${request.projectIds.map((id) => `<span class="chip mono">${esc(projectById(id)?.name || id)}</span>`).join(' ')}</div>` : ''}
       ${requestReasonLine(request, request.reason, inTask)}
       ${subTaskAskLine(request)}
       <div class="approval-request-help">Requested from ${request.audience.map((selector) => {
         const grantor = selector.startsWith('task:') ? (request.grantorTasks || []).find((task) => task.id === selector.slice(5)) : undefined;
         return grantor ? credentialRequestTaskLink({ taskId: grantor.id, task: grantor }) : esc(selector);
-      }).join(', ')}. ${request.projectIds?.length ? `Allowing gives this task its ${esc(request.baseAuthorization?.level && request.baseAuthorization.level !== 'inherited-child' ? request.baseAuthorization.level : 'current')} access in these projects too.` : 'Allowing gives only these, and only to this task.'}</div>
+      }).join(', ')}.</div>
     </div>
     <div class="approval-request-actions">
-      <button class="btn sm primary" data-preq-act="approve" title="Give this task’s agent these permissions">Allow</button>
+      <button class="btn sm primary" data-preq-act="approve" title="Only this task’s agent gets it">Allow</button>
       <button class="btn sm" data-preq-act="deny">Deny</button>
       ${request.dismissed ? '' : ignoreRequestButton('data-preq-act')}
     </div>
@@ -27383,6 +27379,8 @@ function urgencyRank(urgency) {
 // What a row is about. An ask names itself ("review requested"); an update's
 // news is the outcome it is reporting, so it names the task's status instead.
 function inboxRowLabel(item) {
+  // An approval says what it grants (Store.inboxAsks).
+  if (item.ask) return item.ask;
   if (item.subject?.kind === 'service-limit') return item.subject.level === 'failed' ? `Can’t read ${item.subject.serviceName} usage`
     : `${item.subject.serviceName} at ${Math.floor((item.subject.used / item.subject.limit) * 100)}% of its limit${item.subject.level === 95 ? ' — upgrade now' : ''}`;
   if (item.subject?.kind === 'compute') {

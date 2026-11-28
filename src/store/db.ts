@@ -5751,6 +5751,18 @@ export class Store {
     return ((await this.db.prepare(sql).all(userId, organizationId, Math.max(1, Math.min(opts.limit ?? 200, 1000)))) as any[]).map(rowToInbox);
   }
 
+  /** What each approval row asks, in words, where its event says
+   * (`payload.ask`: src/domain/permission-ask.ts): inbox id → text. */
+  async inboxAsks(items: readonly InboxItem[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    for (const item of items) {
+      if (item.kind !== 'approval-requested' || item.subject) continue;
+      const ask = (await this.eventBySeq(item.taskId, item.eventSeq))?.payload?.ask;
+      if (typeof ask === 'string' && ask) out.set(item.id, ask);
+    }
+    return out;
+  }
+
   /**
    * What needs this person in this organization now: task id → the kinds of the
    * live asks routed to them, and when the newest arrived. A hold on the person

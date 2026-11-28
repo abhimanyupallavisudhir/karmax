@@ -5,6 +5,8 @@ export interface DeliveryEnvelope {
   inbox: InboxItem;
   task?: { id: string; num?: number; title: string; projectId?: string; status?: string };
   user?: { id: string; name?: string; email?: string };
+  /** What an approval asks, in words (Store.inboxAsks). */
+  ask?: string;
 }
 
 export interface DeliveryAdapter {
@@ -89,7 +91,8 @@ export class DeliveryDispatcher {
         const adapter = this.adapters[claim.channel];
         if (!adapter) throw new Error(`${claim.channel} delivery is enabled but no adapter is configured`);
         const task = (await this.store.taskHeaders([claim.inbox.taskId])).get(claim.inbox.taskId);
-        await adapter.deliver({ inbox: claim.inbox,
+        const ask = (await this.store.inboxAsks([claim.inbox])).get(claim.inbox.id);
+        await adapter.deliver({ inbox: claim.inbox, ...(ask ? { ask } : {}),
           task: task ? { id: task.id, num: task.num, title: task.title, projectId: task.projectId,
             ...(task.status ? { status: task.status } : {}) } : undefined,
           user: (await this.user?.(claim.inbox.userId)) });

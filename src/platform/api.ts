@@ -92,7 +92,8 @@ import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { untrustedBlock } from '../domain/untrusted.js';
 import { baseTaskAuthority, endedTaskGrants, previousTaskGrants, taskAuthorityNow, taskGrants, tokenScopeOf } from './task-authority.js';
-import { delegatedFromParent } from './delegation.js';
+import { DELEGATED_PROFILE, delegatedFromParent } from './delegation.js';
+import { permissionAsk, taskAgent, type PermissionAsk } from '../domain/permission-ask.js';
 export { previousTaskGrants };
 import type { KarmaxBus } from '../contrib/bus.js';
 import type { WorldRegistry } from '../world/registry.js';
@@ -5466,7 +5467,9 @@ Prefer declining what the task does not need. Then briefly report the decision.`
       throw new ValidationError('projectIds must be an array of nonempty project IDs');
     const requestedProjects = [...new Set((args.projectIds ?? []).map((id) => String(id).trim()).filter(Boolean))];
     if (requestedProjects.length > 32) throw new ValidationError('at most 32 projects may be requested');
-    if (!capabilities.length && !requestedProjects.length) throw new Error('choose at least one capability or project');
+    // A request grants what it names: with neither, it would ask a person to approve nothing.
+    if (!capabilities.length && !requestedProjects.length)
+      throw new ValidationError('Name what to add: capabilities, projectIds, or both.');
     for (const id of requestedProjects) {
       if ((await this.deps.store.getProject(id))?.organizationId !== project.organizationId)
         throw new ValidationError('requested projects must exist in the task organization');
@@ -5538,6 +5541,8 @@ Prefer declining what the task does not need. Then briefly report the decision.`
         ts: Date.now(),
         payload: {
           requestId: request.id,
+          // What it grants, for the inbox and notifications, whose row already names the task.
+          ask: (await this.permissionAskOf(request, 'its agent')).question,
           role: request.role,
           capabilities: request.capabilities,
           projectIds: request.projectIds,
@@ -5563,7 +5568,7 @@ Prefer declining what the task does not need. Then briefly report the decision.`
         await this.stopTaskActivity(task, view, `Waiting for permission approval ${request.id}`);
         await this.startTransitionReplacement(task, view, view.stage, true, {
           audience: request.audience,
-          detail: `${await this.permissionAsk(request)} — ${request.reason}`,
+          detail: `${(await this.permissionAskOf(request, taskAgent(task))).question} — ${request.reason}`,
         });
       }
       for (const grantorId of taskRecipients) await this.askTaskToGrant(grantorId, task, request, project.organizationId);
@@ -5662,27 +5667,32 @@ Prefer declining what the task does not need. Then briefly report the decision.`
     return !!userId && (await this.deps.store.taskCreatorUserId(task.id)) === userId;
   }
 
-  /** What a permission request asks, in words: its capabilities and the
-   * projects it adds, by name ("Permission requested: x; access to Smoke checks"). */
-  private async permissionAsk(request: Pick<PermissionRequest, 'capabilities' | 'projectIds'>): Promise<string> {
-    const projects = await Promise.all((request.projectIds ?? []).map(async (id) =>
-      (await this.deps.store.getProject(id))?.name ?? id));
-    const parts = [
-      ...(request.capabilities.length ? [request.capabilities.join(', ')] : []),
-      ...(projects.length ? [`access to ${projects.join(', ')}`] : []),
-    ];
-    return `Permission requested: ${parts.join('; ')}`;
+  /** What a permission request grants, in words (src/domain/permission-ask.ts):
+   * its projects by name, at the level of the task's authority, and its
+   * capabilities. `ids` adds each project's id, for an agent that must act on it. */
+  private async permissionAskOf(request: Pick<PermissionRequest, 'capabilities' | 'projectIds' | 'baseAuthorization' | 'projectId'>,
+    agent: string, options: { ids?: boolean } = {}): Promise<PermissionAsk> {
+    const projects = await Promise.all((request.projectIds ?? []).map(async (id) => {
+      const name = (await this.deps.store.getProject(id))?.name;
+      return name ? (options.ids ? `${name} (${id})` : name) : id;
+    }));
+    const levelId = projects.length ? request.baseAuthorization?.level : undefined;
+    const level = levelId && levelId !== DELEGATED_PROFILE
+      ? (await this.deps.authorization?.profile(levelId, request.projectId).catch(() => undefined))?.name ?? levelId
+      : undefined;
+    return permissionAsk({ agent, capabilities: request.capabilities, projects, ...(level ? { level } : {}) });
   }
 
   /** Call each Avatār to decide a permission request. */
   private async askAvatarsToDecide(token: string, task: TaskRecord, request: PermissionRequest, organizationId: string, avatarIds: string[]) {
     for (const avatarId of avatarIds) {
       const avatar = (await this.deps.store.getAvatar(avatarId))!;
+      const ask = await this.permissionAskOf(request, taskAgent(task), { ids: true });
       await this.callAvatar(token, avatar, 'confirm', `${avatar.name}: decide permission request`,
-        `Decide whether to approve or deny permission request ${request.id} for task #${task.num ?? task.id}.
+        `Decide whether to approve or deny permission request ${request.id} for task #${task.num ?? task.id}: ${ask.question}
 
-Requested capabilities: ${request.capabilities.join(', ')}
-${request.projectIds?.length ? `Add projects to the task's ${request.baseAuthorization?.level} authorization (existing permissions apply there too): ${request.projectIds.join(', ')}\n` : ''}${untrustedBlock('reason from the requesting agent', request.reason)}
+${ask.detail}${request.projectIds?.length ? '\nIn those projects the task acts with its existing authority.' : ''}
+${untrustedBlock('reason from the requesting agent', request.reason)}
 ${request.via?.note ? `${untrustedBlock(`note from task ${request.via.taskId}, which it came through`, request.via.note)}\n` : ''}
 Resolve the request exactly once by calling platform_request with POST /api/permission-requests/${request.id}/resolve?organizationId=${organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
         { taskId: task.id, type: 'avatar.authorization-dispatch-failed', payload: { requestId: request.id, avatarId } });
@@ -5714,7 +5724,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     for (const pending of asks.permissions) {
       const request = await service.passOn(pending.id, { audience, recipients, avatarRecipients: avatarIds, via });
       const event = { taskId: task.id, type: 'permission.approval-requested', ts: via.at, payload: {
-        requestId: request.id, role: request.role, capabilities: request.capabilities, projectIds: request.projectIds,
+        requestId: request.id, ask: (await this.permissionAskOf(request, 'its agent')).question, role: request.role, capabilities: request.capabilities, projectIds: request.projectIds,
         audience: request.audience, recipients: request.recipients, avatarRecipients: request.avatarRecipients,
         taskRecipients: request.taskRecipients, reason: request.reason, requestedBy: request.requestedBy, via,
         urgency: DEFAULT_URGENCY['approval-requested'] } };
@@ -5743,7 +5753,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
         ? throughYouText(child, { what: `to connect ${ask.connection.label}`, why: ask.connection.why,
           decline: `platform_request(POST, "/api/connections/${ask.connection.id}/disconnect")` })
         : throughYouText(child, { why: ask.permission.reason,
-          what: `for ${[...ask.permission.capabilities, ...(ask.permission.projectIds ?? []).map((id) => `project ${id}`)].join(', ')}`,
+          what: `for ${(await this.permissionAskOf(ask.permission, 'its agent', { ids: true })).grant}`,
           decline: `platform_request(POST, "/api/permission-requests/${ask.permission.id}/resolve?organizationId=${ask.organizationId}", {"action": "deny"})` });
     await this.tellTask(request.via.taskId, child, text, { type: 'subtask.parent-unreachable',
       payload: { requestId: request.id, parentTaskId: request.via.taskId } });
@@ -5757,8 +5767,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
   /** Tell a task's agent that a task acting for it asks for what it holds,
    *  and how to decide. Its reply is the decision, not a message. */
   private async askTaskToGrant(grantorId: string, task: TaskRecord, request: PermissionRequest, organizationId: string) {
-    const asked = request.capabilities.join(', ')
-      + (request.projectIds?.length ? `${request.capabilities.length ? '; ' : ''}projects ${request.projectIds.join(', ')}` : '');
+    const asked = (await this.permissionAskOf(request, taskAgent(task), { ids: true })).grant;
     const resolve = `/api/permission-requests/${request.id}/resolve?organizationId=${organizationId}`;
     const text = `Task #${task.num ?? task.id} "${task.title}" (${task.id}) asks you for ${asked}, which you hold. `
       + `Grant it if its work needs it: platform_request(POST, "${resolve}", {"action": "approve"}), `
@@ -6236,7 +6245,8 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       .requests({ taskId: input.taskId, status: input.status }), async (request) => {
         const grantors = (await __asyncCollections.map(request.taskRecipients ?? [], (id) => this.deps.store.getTask(id)))
           .filter((record): record is TaskRecord => !!record);
-        return { ...request, task: summary(task), ...(grantors.length ? { grantorTasks: grantors.map(summary) } : {}) };
+        return { ...request, task: summary(task), ask: await this.permissionAskOf(request, taskAgent(task)),
+          ...(grantors.length ? { grantorTasks: grantors.map(summary) } : {}) };
       });
   }
 
@@ -6448,9 +6458,10 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     principal: string, alreadyAuthorized = false, claim?: string,
   ): Promise<PermissionRequest & { resume: Awaited<ReturnType<KarmaxApi['resumeAfterCredentialDecision']>> }> {
     const resolved = (await service.resolve(request.id, { action, by: principal, alreadyAuthorized, claim }));
+    const granted = (await this.permissionAskOf(resolved, 'its agent', { ids: true })).grant;
     const message = action === 'approve'
-      ? `[${BRAND} permission decision]\n\nApproved for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Retry the blocked operation now; a newly scoped token will carry the grant.`
-      : `[${BRAND} permission decision]\n\nDenied for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Do not request these permissions again; continue without them or explain why the task cannot proceed.`;
+      ? `[${BRAND} permission decision]\n\nApproved for this task's ${resolved.role} agent: ${granted}. Retry the blocked operation now; a newly scoped token will carry the grant.`
+      : `[${BRAND} permission decision]\n\nDenied for this task's ${resolved.role} agent: ${granted}. Do not request these permissions again; continue without them or explain why the task cannot proceed.`;
     const resume = await this.resumeAfterCredentialDecision(request.taskId, message, request.role);
     const event = {
       taskId: request.taskId,
