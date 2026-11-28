@@ -42,9 +42,10 @@ const TIMEOUT_MS = 20_000;
 const MAX_KEYTERMS = 100;
 
 /** The words a person dictating to tavya says that a recognizer gets wrong
- * without being told ("Tavia", "CarMax", "pan agent"). The organization's
- * own project and repository names are added (keyterms). */
-export const TRANSCRIPTION_KEYTERMS: readonly string[] = [BRAND, 'karmax', 'krmax', 'panagent', 'PR', 'Postgres', 'E2B', 'OpenRouter', 'Temporal',
+ * without being told ("Tavia", "Postgress"). The organization's own project and
+ * repository names are added (keyterms): tavya's own ("karmax", "panagent")
+ * reach it that way, like any customer's. */
+export const TRANSCRIPTION_KEYTERMS: readonly string[] = [BRAND, 'PR', 'Postgres', 'E2B', 'OpenRouter', 'Temporal',
   'R2', 'CI', 'npm', 'GitHub', 'Claude Code', 'Codex', 'OpenCode', 'Hetzner', 'Fly.io', 'Daytona', 'README', 'wiki'];
 
 /** The audio formats OpenRouter's recognizers take, by the request's content type. */

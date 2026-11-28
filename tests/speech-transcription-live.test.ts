@@ -22,6 +22,9 @@ it.skipIf(!live)('transcribes a spoken phrase with tavya\'s jargon on the organi
   const broker = new CredentialBroker(new Vault(dir));
   const organization = await store.createOrganization({ name: 'Live', ownerUserId: 'owner' });
   await broker.registerHandle(`openrouter:${organization.id}:main`, key!, organizationScope(organization.id));
+  // Its repository's name is a key term, as tavya's own organization has it.
+  await store.upsertRepository({ organizationId: organization.id, provider: 'github', owner: 'acme', name: 'karmax',
+    sshUrl: 'git@github.com:acme/karmax.git', defaultBranch: 'main', private: true });
   // "Open a PR against the karmax repo that fixes the Postgres migration, then ask tavya to review it."
   const audio = fs.readFileSync(new URL('../scripts/speech-eval/clips/p1-openai-alloy-noisy.webm', import.meta.url));
   const started = Date.now();
