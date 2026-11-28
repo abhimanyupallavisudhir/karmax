@@ -99,7 +99,7 @@ async function main() {
   let backfills = 0, inboxReloads = 0;
   Object.assign(c, {
     location: { protocol: 'https:', host: 'example.test' },
-    WebSocket: function () {}, setWsOnline() {}, checkConsoleRevision() {},
+    WebSocket: function () {}, setWsOnline() {}, checkConsoleRevision() {}, announceDesktopPush() {},
     refreshTasks: async () => {}, refreshTask: async () => {},
     loadInbox: async () => { inboxReloads++; },
     refreshTaskHistory: async id => { assert.equal(id, 'task'); backfills++; },

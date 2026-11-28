@@ -91,6 +91,36 @@ export function changeNoticeFor(request: {
     ...(client ? { client } : {}) };
 }
 
+/**
+ * A project's files changed (wiki features/live-updates, features/offline-files):
+ * the apps' offline copies re-check their pins on `{type: 'changed', area:
+ * 'files', projectId}`. These routes write what project Files shows — a Files
+ * change, a resource version, a wiki page. (Uploads only stage bytes; the
+ * change that commits them is the write.)
+ */
+const FILES_ROUTES = [
+  /^\/api\/projects\/[^/]+\/files\/changes$/,
+  /^\/api\/projects\/[^/]+\/resources(?:\/[^/]+(?:\/(?:import|revisions))?)?$/,
+  /^\/api\/tasks\/[^/]+\/resources\/[^/]+\/promote$/,
+  /^\/api\/projects\/[^/]+\/wiki\/page$/,
+];
+export function filesChangedByRequest(request: { method: string; path: string; status: number }): boolean {
+  return !['GET', 'HEAD', 'OPTIONS'].includes(request.method) && request.status < 400 && FILES_ROUTES.some((route) => route.test(request.path));
+}
+
+/** Durable events after which a project's files may differ: a branch moved
+ * (a merge landed, a branch was pushed) or a task finished (its code or data
+ * landed). The gateway turns them into the same notice for the task's project. */
+export function filesChangedByEvent(event: { type: string; payload?: unknown }): boolean {
+  const payload = (event.payload ?? {}) as Record<string, unknown>;
+  switch (event.type) {
+    case 'merge.result': return payload.merged === true;
+    case 'github.pr.merged': case 'push.head': case 'push.branch': return true;
+    case 'view.updated': return payload.status === 'done';
+    default: return false;
+  }
+}
+
 export class ChangeNotices {
   private listeners = new Set<(notice: ChangeNotice) => unknown>();
   on(listener: (notice: ChangeNotice) => unknown): () => void {

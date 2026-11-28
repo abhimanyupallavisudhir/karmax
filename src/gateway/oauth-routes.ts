@@ -168,8 +168,9 @@ export class OAuthRoutes {
   }
 
   /**
-   * The phone app's WebView, back from the system browser with
-   * `io.tavya.app://signed-in?code=…`, posts the code and its PKCE verifier
+   * An app's WebView, back from the system browser with
+   * `io.tavya.app://signed-in?code=…` (phones) or at its loopback listener
+   * (desktop), posts the code and its PKCE verifier
    * here and gets the console's own session cookie. Only from the console's
    * origin and as JSON (which a cross-site form cannot send), so another site
    * cannot sign a browser into someone else's account with a code it holds.
@@ -191,10 +192,12 @@ export class OAuthRoutes {
     for (const [name, value] of Object.entries(req.headers)) if (typeof value === 'string') headers.set(name, value);
     try {
       const params = await formParams(req);
-      const { setCookie, grant } = await this.deps.oauth.appSession(params, (userId) => startAppSession(userId, headers));
-      await this.deps.authorization?.audit(`user:${grant.userId}`, 'app-grant.app-signed-in', 'global', { grantId: grant.id, name: grant.name });
+      const { setCookie, grant, deviceToken } = await this.deps.oauth.appSession(params, (userId) => startAppSession(userId, headers));
+      await this.deps.authorization?.audit(`user:${grant.userId}`, 'app-grant.app-signed-in', 'global',
+        { grantId: grant.id, clientId: grant.clientId, name: grant.name, deviceToken: Boolean(deviceToken) });
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', ...NO_STORE, 'set-cookie': setCookie });
-      res.end(JSON.stringify({ ok: true, grantId: grant.id }));
+      // The device token goes to the console page that asked for it, which hands it straight to the app's native store.
+      res.end(JSON.stringify({ ok: true, grantId: grant.id, ...(deviceToken ? { deviceToken } : {}) }));
     } catch (e) {
       if (!(e instanceof OAuthError)) throw e;
       json(res, e.status, { error: e.error, error_description: e.description }, NO_STORE);

@@ -5177,7 +5177,7 @@ pre.files-term-screen:focus { box-shadow: inset 0 0 0 2px var(--accent-weak); }
 .secret-textarea { -webkit-text-security: disc; font-family: var(--mono, ui-monospace, monospace); font-size: 12px; resize: vertical; }
 .native-push-file { justify-self: start; cursor: pointer; }
 .app-sign-in { display: grid; gap: 14px; justify-items: center; text-align: center; }
-.app-sign-in #app-sign-in { min-width: 200px; }
+.app-sign-in #app-sign-in { min-width: 200px; justify-content: center; text-align: center; }
 
 /* ── Installation → Site traffic (wiki features/site-analytics): the Insights
    chart and tables, compact enough for a settings card ─────────────────── */

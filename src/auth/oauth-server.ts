@@ -21,6 +21,12 @@ export const CLI_CLIENT_ID = 'tavya-cli';
  * (`appSession`) — never for bearer tokens. */
 export const APP_CLIENT_ID = 'tavya-app';
 export const APP_REDIRECT_URI = 'io.tavya.app://signed-in';
+/** The desktop apps (wiki features/desktop-apps): the same, returning to a
+ * one-shot loopback listener (RFC 8252 §7.3, §8.3): any port, this path. */
+export const DESKTOP_CLIENT_ID = 'tavya-desktop';
+export const DESKTOP_REDIRECT_URIS = ['http://127.0.0.1/signed-in', 'http://[::1]/signed-in'];
+/** The first-party apps whose code buys a console session, never bearer tokens. */
+export const APP_CLIENT_IDS: readonly string[] = [APP_CLIENT_ID, DESKTOP_CLIENT_ID];
 export const DEVICE_CODE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
 const DEVICE_TTL_MS = 15 * 60_000;
 const DEVICE_INTERVAL_S = 5;
@@ -90,6 +96,7 @@ export class OAuthServer {
     if (!clientId) return undefined;
     if (clientId === CLI_CLIENT_ID) return { clientId, name: 'tavya CLI', redirectUris: [], kind: 'first-party', verified: true };
     if (clientId === APP_CLIENT_ID) return { clientId, name: 'tavya app', redirectUris: [APP_REDIRECT_URI], kind: 'first-party', verified: true };
+    if (clientId === DESKTOP_CLIENT_ID) return { clientId, name: 'tavya desktop app', redirectUris: DESKTOP_REDIRECT_URIS, kind: 'first-party', verified: true };
     if (clientId.startsWith('https://')) return this.metadataClient(clientId);
     const raw = await this.store.kvGet(clientKey(clientId));
     if (!raw) return undefined;
@@ -283,10 +290,10 @@ export class OAuthServer {
   async decideAuthorization(id: string, decision: Approval | 'deny', issuer: string): Promise<{ redirectUri: string } | undefined> {
     const raw = await this.store.kvGet(requestKey(id));
     const record = raw ? JSON.parse(raw) as AuthorizationRequest : undefined;
-    // The phone app is the person's own console: their whole access, approved by them, not by an agent or a limited token.
-    if (record?.clientId === APP_CLIENT_ID && decision !== 'deny'
+    // The apps are the person's own console: their whole access, approved by them, not by an agent or a limited token.
+    if (record && APP_CLIENT_IDS.includes(record.clientId) && decision !== 'deny'
       && (decision.createdBy?.kind === 'agent' || Object.keys(decision.ceiling ?? {}).length))
-      throw new OAuthError('invalid_request', 'The phone app signs in with your whole access, approved by you; it cannot be limited.', 400, false);
+      throw new OAuthError('invalid_request', `The ${record.clientId === APP_CLIENT_ID ? 'phone' : 'desktop'} app signs in with your whole access, approved by you; it cannot be limited.`, 400, false);
     if (!raw || !record || record.expiresAt <= Date.now() || !(await this.store.kvCompareAndSet(requestKey(id), raw, undefined))) return undefined;
     const target = new URL(record.redirectUri);
     if (decision === 'deny') {
@@ -334,8 +341,8 @@ export class OAuthServer {
   }
 
   private async exchangeCode(params: URLSearchParams, client: OAuthClient): Promise<TokenResponse> {
-    if (client.clientId === APP_CLIENT_ID)
-      throw new OAuthError('unauthorized_client', 'The tavya app trades its code for a console session at /oauth/app-session');
+    if (APP_CLIENT_IDS.includes(client.clientId))
+      throw new OAuthError('unauthorized_client', 'The tavya apps trade their code for a console session at /oauth/app-session');
     const { record, spend } = await this.redeemCode(params, client);
     const grant = await this.grants.create({ userId: record.approval.userId, kind: 'mcp', clientId: client.clientId, name: client.name,
       ceiling: record.approval.ceiling, resource: record.resource, createdBy: record.approval.createdBy });
@@ -344,21 +351,28 @@ export class OAuthServer {
   }
 
   /**
-   * The phone app's code → a console session in its WebView (wiki
-   * features/phone-apps). `startSession` makes the identity provider's session
+   * An app's code → a console session in its WebView (wiki features/phone-apps,
+   * features/desktop-apps). `startSession` makes the identity provider's session
    * for the person; the grant records it, so Profile → Apps and tokens lists the
-   * phone and revoking it there ends that session.
+   * phone or computer and revoking it there ends that session.
+   *
+   * With `device_token`, the answer also carries a refresh token of that grant
+   * for the app's native code (`deviceToken`, wiki planned/native-apps-round-2):
+   * it trades for access tokens at the token endpoint while the session lasts.
    */
-  async appSession<T extends { sessionId: string }>(params: URLSearchParams, startSession: (userId: string) => Promise<T>): Promise<T & { grant: AppGrant }> {
-    const client = (await this.client(APP_CLIENT_ID))!;
-    if ((params.get('client_id') ?? APP_CLIENT_ID) !== APP_CLIENT_ID) throw new OAuthError('invalid_client', 'Only the tavya app signs in here', 400);
+  async appSession<T extends { sessionId: string }>(params: URLSearchParams, startSession: (userId: string) => Promise<T>):
+    Promise<T & { grant: AppGrant; deviceToken?: string }> {
+    const clientId = params.get('client_id') ?? APP_CLIENT_ID;
+    if (!APP_CLIENT_IDS.includes(clientId)) throw new OAuthError('invalid_client', 'Only the tavya apps sign in here', 400);
+    const client = (await this.client(clientId))!;
     const { record, spend } = await this.redeemCode(params, client);
     const session = await startSession(record.approval.userId);
     const name = params.get('name')?.trim().slice(0, 100) || client.name;
-    const grant = await this.grants.create({ userId: record.approval.userId, kind: 'app', clientId: APP_CLIENT_ID, name,
+    const grant = await this.grants.create({ userId: record.approval.userId, kind: 'app', clientId, name,
       sessionId: session.sessionId, createdBy: record.approval.createdBy });
     await spend(grant);
-    return { ...session, grant };
+    const deviceToken = params.get('device_token') === 'true' ? await this.grants.issueRefresh(grant) : undefined;
+    return { ...session, grant, ...(deviceToken ? { deviceToken } : {}) };
   }
 
   // ── token and revocation endpoints ───────────────────────────────────────
