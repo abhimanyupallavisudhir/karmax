@@ -126,7 +126,7 @@ describe('public pages for search engines and link previews (hosted)', () => {
     expect((await get('/compare/index.md')).body).toContain('| App integrations | Apps<br>Logins<br>Passwords<br>Secrets<br>Mailbox<br>Wallet | Apps<br>Secrets |');
     // Every comparison says where tavya is ahead, and where the other is.
     expect(hub.body).toMatch(/<h2[^>]*>Where tavya is ahead<\/h2>/);
-    for (const product of ['claude-code', 'codex', 'devin', 'cursor', 'paperclip', 'warp', 'manus', 'openclaw']) {
+    for (const product of ['claude-code', 'codex', 'devin', 'cursor', 'paperclip', 'warp', 'manus', 'openclaw', 'mastra']) {
       const body = (await get(`/compare/${product}.md`)).body;
       expect(body, product).toContain('\n## Where tavya is ahead\n');
       expect(body, product).toMatch(/\n## Where .+ (is|are) ahead\n[\s\S]+\n## Where tavya is ahead\n/);
@@ -137,6 +137,12 @@ describe('public pages for search engines and link previews (hosted)', () => {
     expect(title((await get('/about')).body)).toBe('About tavya · tavya');
     expect((await get('/about')).body).toContain(`<code class="md-inline">${base}/mcp</code>`);
     expect(title((await get('/changelog')).body)).toBe('Changelog · tavya');
+    // About carries a press kit, and every file it offers is served.
+    const about = (await get('/about.md')).body;
+    expect(about).toContain('\n## Press kit\n');
+    const offered = [...about.slice(about.indexOf('## Press kit')).matchAll(/\]\((\/(?:brand|media|social-card)[^)]*)\)/g)].map((match) => match[1]!);
+    expect(offered.length).toBeGreaterThanOrEqual(10);
+    for (const file of offered) expect((await get(file)).status, file).toBe(200);
     const missing = await get('/compare/no-such-product');
     expect([missing.status, missing.headers['x-robots-tag']]).toEqual([404, 'noindex']);
     expect((await get('/compare/')).headers.location).toBe('/compare');

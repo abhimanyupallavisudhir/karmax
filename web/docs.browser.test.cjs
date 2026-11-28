@@ -119,6 +119,14 @@ const site = globalThis.KarmaxSite;
       const links = await page.locator('.docs-page a[href^="/"]').evaluateAll((as) => as.map((a) => [a.getAttribute('href'), 'public' in a.dataset]));
       for (const [href, inPlace] of links) {
         const [route, hash] = href.split('#');
+        // A file (the press kit's logo, film and pictures) must exist, and opens as itself, not as a page.
+        // /brand/<file> follows the installation's icon setting; the default variant's must exist (three legacy variants have no SVG).
+        if (/\.[a-z0-9]+$/i.test(route)) {
+          const file = route.startsWith('/brand/') ? path.join(__dirname, 'brand', 'diamond', route.slice('/brand/'.length)) : path.join(__dirname, route);
+          assert.ok(fs.existsSync(file), `${entry.path}: link ${href} names a file that exists`);
+          assert.ok(!inPlace, `${entry.path}: link ${href} opens the file`);
+          continue;
+        }
         const known = byPath.has(route) || ['/pricing', '/legal', '/signup', '/login'].includes(route) || /^\/legal\/[a-z-]+$/.test(route);
         assert.ok(known, `${entry.path}: link ${href} goes to a page`);
         if (!['/signup', '/login'].includes(route)) assert.ok(inPlace, `${entry.path}: link ${href} opens in place`);

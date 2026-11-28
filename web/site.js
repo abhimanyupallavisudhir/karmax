@@ -29,9 +29,10 @@
     page('/compare/warp', 'compare/warp.md', 'tavya vs Warp Factories', 'Compare', '2026-11-14', 'Warp Factories'),
     page('/compare/manus', 'compare/manus.md', 'tavya vs Manus', 'Compare', '2026-11-14', 'Manus'),
     page('/compare/openclaw', 'compare/openclaw.md', 'tavya vs OpenClaw', 'Compare', '2026-11-14', 'OpenClaw'),
+    page('/compare/mastra', 'compare/mastra.md', 'tavya vs Mastra Factory', 'Compare', '2026-11-19', 'Mastra Factory'),
     page('/compare/vibe-kanban', 'compare/vibe-kanban.md', 'tavya as a Vibe Kanban alternative', 'Compare', '2026-11-14', 'Vibe Kanban'),
     page('/compare/terragon', 'compare/terragon.md', 'tavya as a Terragon alternative', 'Compare', '2026-11-14', 'Terragon'),
-    page('/about', 'about.md', 'About tavya', 'Site', '2026-11-14', 'About'),
+    page('/about', 'about.md', 'About tavya', 'Site', '2026-11-19', 'About'),
     page('/changelog', 'changelog.md', 'Changelog', 'Site', '2026-11-14'),
   ];
 
