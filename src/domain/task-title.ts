@@ -4,12 +4,18 @@
  * most 80 characters, cut at a word. An unstarted task's derived title follows
  * every edit of its prompt (SPEC §10); a title given at creation stays.
  */
+import { rolePromptMarkerFor } from './coordinator.js';
+
 export const UNTITLED_TASK = 'Task';
+/** A permanent co-ordinator whose prompt is its role text (wiki features/coordinator § Role prompt). */
+export const COORDINATOR_TITLE = 'Permanent co-ordinator';
 const MAX_TITLE = 80;
 
-type TitleSource = { prompt?: unknown; command?: unknown } | undefined;
+type TitleSource = { prompt?: unknown; command?: unknown; coordinator?: unknown } | undefined;
 
 export function derivedTaskTitle(params: TitleSource): string {
+  // Its role says what it is, not what it asks.
+  if (params?.coordinator && rolePromptMarkerFor(params.prompt)) return COORDINATOR_TITLE;
   for (const text of [params?.prompt, params?.command]) {
     if (typeof text !== 'string') continue;
     const line = text.split('\n').map((l) => l.replace(/\s+/g, ' ').trim()).find(Boolean);

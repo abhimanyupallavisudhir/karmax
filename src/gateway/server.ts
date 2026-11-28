@@ -1,6 +1,6 @@
 import { computerDefaults, saveOrganizationComputer, saveProjectComputer, splitComputerValues } from '../platform/computer-settings.js';
-import { ASK_SETTINGS, ASK_TARGETS, askTarget } from '../domain/coordinator.js';
-import { CEO_CREDENTIAL_GRANTS, CEO_PRINCIPAL, ceoAuthorization, ceoScopeOf, ensureCeo } from '../platform/ceo.js';
+import { ASK_SETTINGS, ASK_TARGETS, askTarget, coordinatorRolePrompt, COORDINATOR_ROLE_VERSION } from '../domain/coordinator.js';
+import { CEO_CREDENTIAL_GRANTS, CEO_PRINCIPAL, ceoAuthorization, ceoScopeOf, coordinatorRoleKind, ensureCeo } from '../platform/ceo.js';
 import { type AutonomyScope, type ProjectAutonomy } from '../domain/autonomous-projects.js';
 import { machineWaits, type MachineWait } from '../world/machine-wait.js';
 import { REPOSITORY_ROUTE } from '../world/resource-repository.js';
@@ -474,6 +474,8 @@ export function routeCapability(method: string, p: string, url?: URL): KnownCapa
   if (/^\/api\/projects\/[^/]+\/readiness$/.test(p)) return 'task:read';
   // Making a project run itself rewrites its Task defaults (wiki features/autonomy).
   if (/^\/api\/projects\/[^/]+\/autonomy$/.test(p)) return read ? 'project:read' : 'project:settings:write';
+  // A co-ordinator's default role text, for the task form (wiki features/coordinator § Role prompt).
+  if (/^\/api\/projects\/[^/]+\/coordinator-role$/.test(p)) return 'project:read';
   if (/^\/api\/projects\/[^/]+\/tasks/.test(p)) return read ? 'task:read' : 'task:create';
   // Project events: reading needs the event stream; emitting can start runs.
   if (/^\/api\/projects\/[^/]+\/events$/.test(p)) return read ? 'task:event:read' : 'task:create';
@@ -512,6 +514,7 @@ export function routeCapability(method: string, p: string, url?: URL): KnownCapa
   if (/\/artifacts(?:\/promote)?$/.test(p) || /^\/api\/artifacts\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/preview-leases$/.test(p) || /^\/api\/preview-leases\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/signal$/.test(p) || /^\/api\/tasks\/[^/]+\/agents\/[^/]+\/stop$/.test(p)) return 'task:signal';
+  if (/^\/api\/tasks\/[^/]+\/pending-messages$/.test(p)) return 'task:conversation:read';
   if (/^\/api\/tasks\/[^/]+\/messages(?:\/[^/]+)?$/.test(p)) return 'task:conversation:message';
   if (/\/escalate$/.test(p)) return 'task:escalate';
   if (p.startsWith('/api/tasks/')) return read ? 'task:read' : method === 'DELETE' ? 'task:delete' : 'task:edit';
@@ -4849,6 +4852,16 @@ export class Gateway {
         }
         return this.json(res, 405, { error: 'Method not allowed.' });
       }
+      const coordinatorRole = p.match(/^\/api\/projects\/([^/]+)\/coordinator-role$/);
+      if (coordinatorRole) {
+        if (method !== 'GET') return this.json(res, 405, { error: 'Method not allowed.' });
+        const project = await store.getProject(coordinatorRole[1]!);
+        if (!project) return this.json(res, 404, { error: 'Project not found.' });
+        const taskId = url.searchParams.get('taskId');
+        const task = taskId ? await store.getTask(taskId) : undefined;
+        const kind = await coordinatorRoleKind(store, project, task?.projectId === project.id ? task.params : undefined);
+        return this.json(res, 200, { kind, version: COORDINATOR_ROLE_VERSION, prompt: coordinatorRolePrompt(kind) });
+      }
       const projectTransfer = p.match(/^\/api\/projects\/([^/]+)\/transfer$/);
       if (projectTransfer) {
         if (!['GET', 'POST'].includes(method)) return this.json(res, 405, { error: 'Method not allowed.' });
@@ -6586,6 +6599,10 @@ export class Gateway {
       const stopAgentMatch = p.match(/^\/api\/tasks\/([^/]+)\/agents\/([^/]+)\/stop$/);
       if (stopAgentMatch && method === 'POST')
         return this.json(res, 200, { ok: true, ...(await api.stopAgent(token, stopAgentMatch[1]!, decodeURIComponent(stopAgentMatch[2]!))) });
+      // What waits for a task not started yet: a draft's form shows it (wiki features/queued-messages).
+      const pendingMatch = p.match(/^\/api\/tasks\/([^/]+)\/pending-messages$/);
+      if (pendingMatch && method === 'GET')
+        return this.json(res, 200, { pendingMessages: await api.pendingMessagesOf(token, pendingMatch[1]!) });
       // Take back a message that is still waiting for its task (wiki features/queued-messages).
       const unsendMatch = p.match(/^\/api\/tasks\/([^/]+)\/messages\/([^/]+)$/);
       if (unsendMatch && method === 'DELETE')
@@ -10057,12 +10074,14 @@ export class Gateway {
    *  deploys (src/integrations/github-events.ts). The project is made either way. */
   /**
    * Ask, where the organization sends it to its CEO (wiki features/coordinator
-   * § CEOs). A CEO not started yet takes the Ask into its instructions and is
-   * started by the asker — granting its fixed authority, which they must hold;
-   * one who does not has it sent for approval to someone who can, and approval
-   * starts it. A started CEO takes the Ask as a message, from someone who holds
-   * everything it holds and may write to it. Undefined when the asker may not
-   * steer it: then they get a quick task of their own.
+   * § CEOs). Every Ask is a message to it, never its prompt, which stays its
+   * role. A CEO not started yet is started by the asker with its role as its
+   * prompt — granting its fixed authority, which they must hold; one who does
+   * not has it sent for approval to someone who can, and approval starts it —
+   * and the Ask waits as its first message, theirs. A started CEO takes the Ask
+   * as a message from someone who holds everything it holds and may write to
+   * it. Undefined when the asker may not steer it: then they get a quick task
+   * of their own.
    */
   private async askCeo(token: string, caller: ReturnType<typeof resolveCallerIdentity>, projectId: string, prompt: string,
     images?: ImageRef[], files?: FileRef[]): Promise<(TaskRecord & { awaitingApproval?: { requestId: string; audience: string[] } }) | undefined> {
@@ -10074,26 +10093,30 @@ export class Gateway {
       const held = (ceo.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities;
       const asker = (await tokens.verify(token))?.caps ?? [];
       if (!held || !held.every((capability) => allows(asker, capability as Capability))) return undefined;
-      try { await api.signalTask(token, ceo.id, WORKFLOW_SIG.followUp, prompt, undefined, images, files); }
+      try { await api.followUpAsSender(token, ceo.id, prompt, images, files); }
       catch (error) { if (error instanceof CapabilityError) return undefined; throw error; } // may not write to it
       return (await store.getTask(ceo.id)) ?? ceo;
     }
-    // The CEO is the project's, not its creator's: the Ask is written into it by the platform.
-    const organizationId = (await store.getProject(projectId))?.organizationId ?? 'org_personal';
-    const { token: writer } = await tokens.mintPrincipal(CEO_PRINCIPAL, ['task:edit', 'task:read', 'project:read'], projectId, 60_000, organizationId);
+    const ask = { text: prompt, ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}) };
+    if (!String(ceo.params?.prompt ?? '').trim()) {
+      // A draft from before the role was its prompt: it starts with its role.
+      const organizationId = (await store.getProject(projectId))?.organizationId ?? 'org_personal';
+      const { token: writer } = await tokens.mintPrincipal(CEO_PRINCIPAL, ['task:edit', 'task:read', 'project:read'], projectId, 60_000, organizationId);
+      try {
+        await api.updateArmedParams(writer, ceo.id, { prompt: coordinatorRolePrompt(await coordinatorRoleKind(store, (await store.getProject(projectId))!)) },
+          { keepArmed: false, allowAttenuation: true });
+      } finally { await tokens.revoke(writer); }
+    }
     try {
-      const written = String(ceo.params?.prompt ?? '').trim();
-      await api.updateArmedParams(writer, ceo.id, { prompt: written ? `${written}\n\n${prompt}` : prompt,
-        ...(images?.length ? { images: [...((ceo.params?.images as ImageRef[] | undefined) ?? []), ...images] } : {}),
-        ...(files?.length ? { files: [...((ceo.params?.files as FileRef[] | undefined) ?? []), ...files] } : {}) },
-        { keepArmed: false, allowAttenuation: true });
-    } finally { await tokens.revoke(writer); }
-    try { return await api.queueTask(token, ceo.id); }
-    catch (error) {
+      const started = await api.queueTask(token, ceo.id);
+      await api.keepMessageFor(token, ceo.id, ask);
+      return (await store.getTask(ceo.id)) ?? started;
+    } catch (error) {
       if (!(error instanceof AuthorizationGrantError)) throw error;
       const asked = await api.requestAuthorization(token, { projectId, target: { kind: 'task', taskId: ceo.id, queueAfterApproval: true },
         authorization: ceoAuthorization(ceoScopeOf((await store.getProject(projectId))!), projectId), credentialGrants: [...CEO_CREDENTIAL_GRANTS],
         audience: [], reason: `Start the CEO, asked: ${prompt.length > 200 ? `${prompt.slice(0, 200)}…` : prompt}` });
+      await api.keepMessageFor(token, ceo.id, ask);
       return { ...((await store.getTask(ceo.id)) ?? ceo), awaitingApproval: { requestId: asked.id, audience: asked.audience } };
     }
   }

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { untouchedCeoDraft } from '../src/platform/ceo.js';
+import { coordinatorRolePrompt } from '../src/domain/coordinator.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -208,7 +209,7 @@ describe('autonomous project', () => {
     // Only the project's own CEO is left, as untouched as it was: no Avatār, and no CEO with its authority.
     const left = (await f.store.listTasks(f.project.id)).filter((task) => task.params.avatar || task.params.coordinator);
     expect(left).toHaveLength(1);
-    expect(untouchedCeoDraft(left[0]!)).toBe(true);
+    expect(await untouchedCeoDraft(f.store, left[0]!)).toBe(true);
     expect(await f.store.getSettings(f.project.id, '__common__')).toEqual({ otherAttempts: 'keep' });
     f.api.saveWikiPageResolved = original;
     expect((await f.api.makeAutonomous(f.owner, f.project.id)).scope).toBe('project');
@@ -225,7 +226,9 @@ describe('autonomous organization', () => {
     expect(stored(avatar.params)).toMatchObject({ level: 'superadmin', scope: 'organization' });
     expect(stored(avatar.params).capabilities).toEqual(expect.arrayContaining(['project:create', 'payment:write', 'credential:reveal']));
     const coordinator = (await f.store.getTask(autonomy.coordinatorTaskId))!;
-    expect(String(coordinator.params.prompt)).toMatch(/Run this whole organization/);
+    // Its role runs the organization and makes projects that run themselves; untouched, it keeps up with the role text.
+    expect(coordinator.params.prompt).toBe(coordinatorRolePrompt('autonomous-organization'));
+    expect(coordinator.params._rolePrompt).toMatchObject({ kind: 'autonomous-organization' });
     expect(stored(coordinator.params)).toMatchObject({ principal: 'user:owner', level: 'superadmin', scope: 'organization' });
     // The organization's payment defaults carry the $50, so every project's tasks start from it.
     expect(autonomy.budget).toEqual({ scope: 'organization', amount: 5000, currency: 'usd' });

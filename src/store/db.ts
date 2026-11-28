@@ -5039,6 +5039,17 @@ export class Store {
     });
   }
 
+  /** Every permanent co-ordinator, with its params (wiki features/coordinator
+   * § Role prompt: the boot refresh of role prompts nobody edited). */
+  async coordinatorTasks(): Promise<Array<{ id: string; projectId: string; params: Record<string, unknown>; status?: string }>> {
+    const rows = (await this.db.prepare(`SELECT id, projectId, params, json_extract(lastView, '$.status') AS status FROM tasks
+      WHERE json_extract(params, '$.coordinator') IS NOT NULL ORDER BY createdAt`).all()) as Array<{ id: string; projectId: string; params: unknown; status?: string | null }>;
+    return rows.flatMap((row) => {
+      const params = (typeof row.params === 'string' ? JSON.parse(row.params) : row.params) as Record<string, unknown>;
+      return coordinatorSetting(params) ? [{ id: row.id, projectId: row.projectId, params, ...(row.status ? { status: row.status } : {}) }] : [];
+    });
+  }
+
   /** Runs spawned from a series (repeatable template), newest first, archived
    *  ones included. Filtered in SQL, and without their conversations: a daily
    *  series has hundreds of runs, and its lists need each one's status only. */

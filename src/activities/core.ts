@@ -12,6 +12,7 @@ import { buildVersionedBundle } from '../packages/bundle.js';
 import type { WorkflowBundle } from '@temporalio/worker';
 import { concurrentMap } from '../util/concurrent-map.js';
 import { notifyChildSettlement } from '../platform/child-settlement.js';
+import { coordinatorTurnPrompt } from '../domain/coordinator.js';
 import { AdmissionBackpressureError } from '../domain/admission-error.js';
 import { snapshotReplayHistories } from './replay-histories.js';
 import { turnPlatformRequest } from '../agent/platform-request.js';
@@ -3811,8 +3812,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         wikiSnapshot?.release();
       }
       const liveTarget = preparationTask?.lastView?.targetBranch ?? args.task.target;
-      const promptTask = liveTarget && liveTarget !== args.task.target
-        ? { ...args.task, target: liveTarget }
+      // A co-ordinator's role prompt nobody edited reads as stored now, newer
+      // role text included (wiki features/coordinator § Role prompt).
+      const livePrompt = args.role === 'do' && args.task.coordinator && !args.task.parentTaskId
+        ? coordinatorTurnPrompt(preparationTask?.params, args.task.prompt) : args.task.prompt;
+      const promptTask = (liveTarget && liveTarget !== args.task.target) || livePrompt !== args.task.prompt
+        ? { ...args.task, target: liveTarget, prompt: livePrompt }
         : args.task;
       const forkOrigin = preparationTask?.params._forkWorld as ForkWorldSource | undefined;
       const forkContext = forkOrigin ? `\n\nThis task forks the conversation of ${forkOrigin.taskId}. Starting branch: ${args.task.base}. `

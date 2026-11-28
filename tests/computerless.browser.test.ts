@@ -8,6 +8,7 @@ import { Gateway } from '../src/gateway/server.js';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxBus } from '../src/contrib/bus.js';
+import { coordinatorRolePrompt } from '../src/domain/coordinator.js';
 import { ContributionRegistry } from '../src/contrib/registry.js';
 import { Overlays } from '../src/store/overlays.js';
 import { WorldRegistry } from '../src/world/registry.js';
@@ -192,13 +193,15 @@ describe('a task without a computer, in the console', () => {
       await dialog.locator('textarea').press('ControlOrMeta+Enter');
       let ceo: Awaited<ReturnType<typeof allTasks>>[number] | undefined;
       await expect.poll(async () => {
-        ceo = (await allTasks()).find((task) => task.params?.coordinator && task.params?.prompt === 'Plan the quarter');
+        ceo = (await allTasks()).find((task) => task.params?.coordinator && task.title === 'CEO (Organization Co-ordinator)');
         return ceo?.params?.draft;
       }, { timeout: 15_000 }).toBe(false);
-      expect(ceo!.title).toBe('CEO (Organization Co-ordinator)');
+      // It starts with its role as its prompt; the question is its first message, never part of it.
+      expect(ceo!.params.prompt).toBe(coordinatorRolePrompt('organization'));
       expect(ceo!.params.computer).not.toEqual({ provider: 'none' });
       await expect.poll(() => page.url(), { timeout: 10_000 }).toContain(`/ceo/tasks/${ceo!.num ?? ceo!.id}`);
-      expect((await allTasks()).filter((task) => task.params?.prompt === 'Plan the quarter')).toHaveLength(1);
+      await page.locator('#ck-thread').getByText('Plan the quarter').first().waitFor({ timeout: 15_000 });
+      expect((await allTasks()).filter((task) => task.params?.prompt === 'Plan the quarter')).toHaveLength(0);
       expect(errors).toEqual([]);
     } finally { await store.setSettings(scopeKey, 'ask', { to: 'task' }); }
   });

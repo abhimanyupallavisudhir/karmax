@@ -8,6 +8,8 @@
  * gateway and the console.
  */
 
+import { coordinatorRolePrompt } from './coordinator.js';
+
 /** How far the autonomy reaches: one project, or the whole organization (its
  * co-ordinator runs from a project of its own and manages every project). */
 export type AutonomyScope = 'project' | 'organization';
@@ -90,7 +92,8 @@ export function autonomyReviewerInstructions(scope: AutonomyScope): string {
   return `No human reviews this ${where(scope)}: you are its last check before the work lands. Confirm when the work does what the task asked, completely, is tested, and is safe to land (no secrets committed, nothing destructive or irreversible beyond what the task asked for). Otherwise revise, saying exactly what to change.`;
 }
 
-/** The co-ordinator's prompt in an autonomous organization: it runs every project. */
+/** The co-ordinator's prompt in an autonomous organization: its role, which
+ * includes running every project (src/domain/coordinator.ts). */
 export function organizationCoordinatorPrompt(): string {
-  return `Run this whole organization: every project in it is yours to start, steer and finish toward the organization's goals in the organization wiki. Create a project for each separate line of work (POST /api/organizations/<this organization>/projects with {"name": …, "autonomous": true} sets one up to run itself, with its own co-ordinator you then start and steer), and keep a page in the organization wiki with the organization's plan and how each project stands.`;
+  return coordinatorRolePrompt('autonomous-organization');
 }

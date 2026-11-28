@@ -8,7 +8,9 @@ import { AuthorizationService, organizationScope, projectScope } from '../src/pl
 import { ProjectTransfers } from '../src/platform/project-transfer.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { AUTONOMY_KEY } from '../src/domain/autonomous-projects.js';
-import { CEO_KEY, CEO_PROJECT_NAME as ORGANIZATION_COORDINATOR_PROJECT, LEGACY_CEO_PROJECT_NAME, ceoTitle } from '../src/domain/coordinator.js';
+import { CEO_KEY, CEO_PROJECT_NAME as ORGANIZATION_COORDINATOR_PROJECT, LEGACY_CEO_PROJECT_NAME, ceoTitle, coordinatorRolePrompt,
+  rolePromptMarkerFor, ROLE_PROMPT_PARAM } from '../src/domain/coordinator.js';
+import { parsePending, pendingMessagesKey } from '../src/platform/pending-messages.js';
 import { ensureCeo, ensureEveryCeo, projectCeo } from '../src/platform/ceo.js';
 
 /**
@@ -175,7 +177,7 @@ describe('Ask, set to a quick task', () => {
 describe('CEOs: a permanent co-ordinator in every project, and the organization’s in its CEO project', () => {
   const ceoOf = async (f: Awaited<ReturnType<typeof fixture>>, projectId: string) => (await projectCeo(f.store, projectId))!;
 
-  it('every new organization and project has one: a draft named for what it is, with nothing else in it', async () => {
+  it('every new organization and project has one: a draft named for what it is, its role as its prompt', async () => {
     const f = await fixture();
     const organization = await f.call('ana', 'POST', '/api/organizations', { name: 'Side' });
     expect(organization.status, JSON.stringify(organization.json)).toBe(200);
@@ -183,7 +185,9 @@ describe('CEOs: a permanent co-ordinator in every project, and the organization�
     expect(ceoProject!.name).toBe('CEO');
     const ceo = await ceoOf(f, ceoProject!.id);
     expect(ceo).toMatchObject({ title: 'CEO (Organization Co-ordinator)', workflow: 'software-dev', projectId: ceoProject!.id });
-    expect(ceo.params).toMatchObject({ draft: true, prompt: '', coordinator: { wakeHours: 24 } });
+    const organizationRole = coordinatorRolePrompt('organization');
+    expect(ceo.params).toMatchObject({ draft: true, prompt: organizationRole, coordinator: { wakeHours: 24 },
+      [ROLE_PROMPT_PARAM]: rolePromptMarkerFor(organizationRole) });
     expect(ceo.createdBy).toEqual({ kind: 'user', userId: 'ana' });
     // It asks for its fixed authority, as an autonomous organization's, and holds none of it until someone starts it.
     expect(ceo.params._authorization).toMatchObject({ level: 'superadmin', scope: 'organization', principal: 'system:ceo',
@@ -193,7 +197,7 @@ describe('CEOs: a permanent co-ordinator in every project, and the organization�
     const shop = await f.call('ana', 'POST', `/api/organizations/${f.organization.id}/projects`, { name: 'Shop', config: {} });
     expect(shop.status, JSON.stringify(shop.json)).toBe(200);
     const shopCeo = await ceoOf(f, shop.json.id);
-    expect(shopCeo).toMatchObject({ title: 'CEO (Project Co-ordinator)', params: { draft: true, prompt: '' } });
+    expect(shopCeo).toMatchObject({ title: 'CEO (Project Co-ordinator)', params: { draft: true, prompt: coordinatorRolePrompt('project') } });
     expect(shopCeo.params._authorization).toMatchObject({ level: 'maintainer', scope: 'projects', projectIds: [shop.json.id], attenuationAccepted: false });
   });
 
@@ -285,7 +289,7 @@ describe('Ask to the CEO', () => {
     expect((await f.store.getSettings(`organization:${f.organization.id}`, '__common__'))?.target).toBeUndefined();
   });
 
-  it('the first Ask by someone who holds the CEO’s authority starts it with what was asked; every later one is a message to it', async () => {
+  it('the first Ask by someone who holds the CEO’s authority starts it with its role; that Ask and every later one are their messages to it', async () => {
     const f = await fixture();
     // The default: nobody chose anything.
     const first = await f.ask('ana', 'Plan the launch');
@@ -293,7 +297,9 @@ describe('Ask to the CEO', () => {
     expect(first.json).toMatchObject({ ceo: true, title: 'CEO (Organization Co-ordinator)', project: { name: 'CEO', coordinator: true } });
     expect(first.json.awaitingApproval).toBeUndefined();
     const ceo = (await f.store.getTask(first.json.id))!;
-    expect(ceo.params).toMatchObject({ prompt: 'Plan the launch', draft: false, coordinator: { wakeHours: 24 } });
+    // Its prompt is its role, untouched: the Ask is never written into it.
+    const role = coordinatorRolePrompt('organization');
+    expect(ceo.params).toMatchObject({ prompt: role, draft: false, coordinator: { wakeHours: 24 }, [ROLE_PROMPT_PARAM]: rolePromptMarkerFor(role) });
     // The CEO's own authority, granted by Ana, who holds it; no computerless ceiling.
     expect(ceo.params._authorization).toMatchObject({ level: 'superadmin', scope: 'organization', principal: 'user:ana' });
     expect((ceo.params._authorization as { missingCredentialGrants?: string[] }).missingCredentialGrants ?? []).toEqual([]);
@@ -302,25 +308,40 @@ describe('Ask to the CEO', () => {
     expect(f.started).toContain(ceo.id);
     // No quick task was made.
     expect((await f.store.listTasks(first.json.projectId)).map((task) => task.id)).toEqual([ceo.id]);
+    // The Ask waits as its first message, Ana's, until the CEO can take one.
+    const kept = parsePending(await f.store.kvGet(pendingMessagesKey(ceo.id)));
+    expect(kept.map(({ message, by }) => ({ text: message.text, author: message.author, by })))
+      .toEqual([{ text: 'Plan the launch', author: 'user:ana', by: 'user:ana' }]);
 
-    // Running, it takes messages.
+    // Running, it takes it — and every later Ask, signed with who asked.
     await f.store.saveView(ceo.id, { taskId: ceo.id, title: ceo.title, stage: 'do', status: 'active', messages: [], state: {}, prs: [],
       actions: [{ kind: 'signal', name: 'followUp', label: 'Send', enabled: true }] } as never);
+    await f.deps.api.flushPendingMessages(ceo.id);
+    const followUps = () => f.signals.filter((signal) => signal.taskId === ceo.id && signal.name === 'followUp').map((signal) => signal.payload);
+    expect(followUps()).toEqual([expect.objectContaining({ text: 'Plan the launch', author: 'user:ana' })]);
+    expect(parsePending(await f.store.kvGet(pendingMessagesKey(ceo.id)))).toEqual([]);
     const second = await f.ask('ana', 'Also hire a designer');
     expect(second.status, JSON.stringify(second.json)).toBe(200);
     expect(second.json.id).toBe(ceo.id);
-    expect(f.signals.some((signal) => signal.taskId === ceo.id && signal.name === 'followUp'
-      && JSON.stringify(signal.payload).includes('Also hire a designer'))).toBe(true);
+    expect(followUps()[1]).toMatchObject({ text: 'Also hire a designer', author: 'user:ana' });
+    expect((await f.store.getTask(ceo.id))!.params.prompt).toBe(role);
     expect((await f.store.listTasks(first.json.projectId)).length).toBe(1);
   });
 
-  it('someone without its authority who asks first has it sent for approval; approval by someone who holds it starts it', async () => {
+  it('someone without its authority who asks first has it sent for approval, the Ask kept as theirs; approval starts it', async () => {
     const f = await fixture();
     const first = await f.ask('bo', 'Plan the launch');
     expect(first.status, JSON.stringify(first.json)).toBe(200);
-    expect(first.json).toMatchObject({ ceo: true, params: { draft: true, prompt: 'Plan the launch' } });
+    expect(first.json).toMatchObject({ ceo: true, params: { draft: true, prompt: coordinatorRolePrompt('organization') } });
     expect(first.json.awaitingApproval.audience.length).toBeGreaterThan(0);
     expect(f.started).not.toContain(first.json.id);
+    expect(parsePending(await f.store.kvGet(pendingMessagesKey(first.json.id))).map(({ message, by }) => [message.text, message.author, by]))
+      .toEqual([['Plan the launch', 'user:bo', 'user:bo']]);
+    // The draft's form shows it under the prompt, as the asker's.
+    const shown = await f.call('ana', 'GET', `/api/tasks/${first.json.id}/pending-messages`);
+    expect(shown.status, JSON.stringify(shown.json)).toBe(200);
+    expect(shown.json.pendingMessages).toEqual([expect.objectContaining({ role: 'do', message: expect.objectContaining({ text: 'Plan the launch', author: 'user:bo' }) })]);
+    expect(shown.json.pendingMessages[0].mine).toBeUndefined();
     // What it holds meanwhile is still nothing of what it asks for.
     expect(((await f.store.getTask(first.json.id))!.params._authorization as { capabilities: string[] }).capabilities).not.toContain('payment:write');
 
@@ -329,6 +350,7 @@ describe('Ask to the CEO', () => {
     expect(approved.status, JSON.stringify(approved.json)).toBe(200);
     const ceo = (await f.store.getTask(first.json.id))!;
     expect(ceo.params.draft).toBe(false);
+    expect(ceo.params.prompt).toBe(coordinatorRolePrompt('organization'));
     expect(ceo.params._authorization).toMatchObject({ level: 'superadmin', scope: 'organization' });
     expect(f.started).toContain(ceo.id);
   });
@@ -359,7 +381,7 @@ describe('Ask to the CEO', () => {
     expect(third.json.id).not.toBe(ceo.id);
   });
 
-  it('a CEO someone already wrote to keeps what they wrote; the Ask is added to it, and it starts with its own authority', async () => {
+  it('a CEO someone already wrote to keeps what they wrote, untouched; the Ask is its first message, and it starts with its own authority', async () => {
     const f = await fixture();
     await settings(f, 'ana', { target: 'ceo' });
     const { project } = await f.store.ensureOrganizationCoordinatorProject(f.organization.id);
@@ -368,7 +390,17 @@ describe('Ask to the CEO', () => {
     const asked = await f.ask('ana', 'Start with the website');
     expect(asked.status, JSON.stringify(asked.json)).toBe(200);
     const after = (await f.store.getTask(ceo.id))!;
-    expect(after.params.prompt).toBe('Run the firm frugally.\n\nStart with the website');
+    expect(after.params.prompt).toBe('Run the firm frugally.');
     expect(after.params).toMatchObject({ draft: false, _authorization: { level: 'superadmin', scope: 'organization' } });
+    expect(parsePending(await f.store.kvGet(pendingMessagesKey(ceo.id))).map(({ message }) => message.text)).toEqual(['Start with the website']);
+  });
+
+  it('a CEO draft from before the role was its prompt starts with its role', async () => {
+    const f = await fixture();
+    const { project } = await f.store.ensureOrganizationCoordinatorProject(f.organization.id);
+    const ceo = await ensureCeo(f.deps, project.id);
+    await f.store.patchTaskParams(ceo.id, { prompt: '' });
+    expect((await f.ask('ana', 'Hello')).status).toBe(200);
+    expect((await f.store.getTask(ceo.id))!.params).toMatchObject({ draft: false, prompt: coordinatorRolePrompt('organization') });
   });
 });
