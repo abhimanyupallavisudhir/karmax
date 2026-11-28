@@ -82,6 +82,7 @@ import type { AgentWait, CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE, TASK_WORKFLOW_TASK_TIMEOUT } from './names.js';
 import { agentTurnId } from './turn-id.js';
 import { taskBranch } from '../domain/brand.js';
+import { withChangedFiles } from '../domain/changed-files.js';
 import { conversationPublisher, OUT_OF_CREDITS, type TurnConversationBase } from '../domain/view-publication.js';
 import { unattendedJobsReminder, waitForAgent } from './agent-wait.js';
 import { ADOPT_ATTACHED_REPOSITORIES, KEEP_FINAL_WORKSPACE, adoptedProjectConfig, adoptedRepositoriesNote, keptWorkspaceNote } from '../domain/adopted-repositories.js';
@@ -2844,7 +2845,7 @@ async function softwareDevImpl(
       if (manual && world && patched('software-dev-manual-error-proposal-v1')) {
         const preserved = await core.buildReview(world as any, base).catch(() => undefined);
         if (preserved?.changedFiles.length) {
-          reviewInfo = { ...reviewInfo, changedFiles: preserved.changedFiles };
+          reviewInfo = withChangedFiles(reviewInfo, preserved);
           escalationAction = manual.action;
         }
       }
@@ -4296,7 +4297,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     if (!whole || cancelled) return;
     const fresh = await core.buildReview(whole as WorldHandle, base, landedHeads()).catch(() => undefined);
     if (!fresh) return;
-    reviewInfo = { ...reviewInfo, changedFiles: fresh.changedFiles };
+    reviewInfo = withChangedFiles(reviewInfo, fresh);
     await publish();
   }
 
@@ -5545,11 +5546,15 @@ Inspect the complete current diff and specifically compare its delta from the re
       if (landedSoFar) changedFilesStale = false;
       const auto = await (landedSoFar ? core.buildReview(world as any, base, landedSoFar) : core.buildReview(world as any, base)).catch(() => undefined);
       if (auto) {
+        // The list, its count and a summary that only counts files come from
+        // this one build, so the conversation and the rail never disagree.
+        const rebuilt = withChangedFiles(reviewInfo, auto);
         reviewInfo = {
           // Prefer the agent's terse caption; fall back to the git-derived summary.
           caption: reviewInfo?.caption,
-          summary: reviewInfo?.summary ?? auto.summary,
-          changedFiles: auto.changedFiles,
+          summary: rebuilt.summary,
+          changedFiles: rebuilt.changedFiles,
+          changedFileCount: rebuilt.changedFileCount,
           ...(reviewInfo?.actions ? { actions: reviewInfo.actions } : {}),
           ...(reviewInfo?.links ? { links: reviewInfo.links } : {}),
           ...(reviewInfo?.html ? { html: reviewInfo.html } : {}),
@@ -6977,7 +6982,7 @@ Inspect the complete current diff and specifically compare its delta from the re
   status = 'done';
   // What it proposed has landed: "Changed files" no longer lists it.
   changedFilesStale = false;
-  if (reviewInfo?.changedFiles?.length && patched(CHANGED_FILES_AFTER_LANDING)) reviewInfo = { ...reviewInfo, changedFiles: [] };
+  if (reviewInfo?.changedFiles?.length && patched(CHANGED_FILES_AFTER_LANDING)) reviewInfo = { ...reviewInfo, changedFiles: [], ...(reviewInfo.changedFileCount !== undefined ? { changedFileCount: 0 } : {}) };
   // The landing adds to the work summary; it never replaces it.
   const landed = landedNote(world, target, sha);
   if (landed) reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${reviewInfo.summary}\n\n${landed}` : landed };

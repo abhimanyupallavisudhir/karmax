@@ -14289,7 +14289,11 @@ function checkinTab(v) {
 // save. `resourcesShown` — an input request above already carries them.
 function conversationReviewInfo(v, resourcesShown = false) {
   const info = v.reviewInfo || {};
-  const caption = info.caption || info.summary;
+  // A summary that only counts changed files (src/domain/changed-files.ts
+  // isGitDerivedReviewSummary): the rail's "Changed files" shows that count.
+  const COUNT_ONLY_SUMMARY = /^\d+ file\(s\) (?:changed\.(?: Showing \d+; inspect the checkouts for the full list\.)?|in the task workspace\.(?: Showing \d+; inspect the workspace for the full list\.)?)$/;
+  // One count on the page: the rail's, not a second copy here.
+  const caption = info.caption || (COUNT_ONLY_SUMMARY.test(String(info.summary || '').trim()) ? '' : info.summary);
   const atReview = v.stage === 'review';
   const resources = atReview && !resourcesShown;
   if (!caption && !info.actions?.length && !info.links?.length && !info.html && !atReview) return '';
@@ -16835,7 +16839,8 @@ function renderWidgetGroups(groups) {
     .map((g) => {
       const widgets = g.widgets || [];
       const counted = widgets.length && widgets.every((w) => w.type === 'list' || w.type === 'table');
-      const count = counted ? widgets.reduce((n, w) => n + (w.type === 'table' ? w.data?.rows?.length || 0 : Array.isArray(w.data) ? w.data.length : 0), 0) : null;
+      // A shortened list carries its full count (`total`): the one number shown.
+      const count = counted ? widgets.reduce((n, w) => n + (w.type === 'table' ? w.data?.rows?.length || 0 : Number.isInteger(w.total) ? w.total : Array.isArray(w.data) ? w.data.length : 0), 0) : null;
       if (count === 0) return '';
       const key = String(g.title || g.workflow);
       return `<details class="rail-sec rail-widgets" data-widget-group="${esc(key)}"${open.has(key) ? ' open' : ''}>
@@ -16864,10 +16869,13 @@ function renderWidget(w) {
       return head + (Array.isArray(d) && d.length
         ? `<div class="wk-kv">${d.map((r) => `<div class="task-sub"><b>${esc(r.label)}</b>: ${esc(r.value)}</div>`).join('')}</div>`
         : empty(w.empty));
-    case 'list':
+    case 'list': {
+      const more = Array.isArray(d) && Number.isInteger(w.total) && w.total > d.length ? w.total - d.length : 0;
       return head + (Array.isArray(d) && d.length
-        ? `<div class="task-sub" style="flex-wrap:wrap">${d.map((x) => `<span class="branch">${esc(x)}</span>`).join('')}</div>`
+        ? `<div class="task-sub" style="flex-wrap:wrap">${d.map((x) => `<span class="branch">${esc(x)}</span>`).join('')}${more
+          ? `<span class="branch" style="color:var(--ink-3)" title="Too many to list here; the task's terminal shows them all">+${more} more</span>` : ''}</div>`
         : empty(w.empty));
+    }
     case 'table':
       return head + (d && d.rows && d.rows.length
         ? `<table class="wk-table"><thead><tr>${d.columns.map((c) => `<th>${esc(c)}</th>`).join('')}</tr></thead>`

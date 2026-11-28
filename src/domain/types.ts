@@ -1678,8 +1678,12 @@ export interface ReviewInfo {
   summary?: string;
   links?: { label: string; url: string }[];
   diff?: string;
-  /** Files changed vs base (auto-derived from git so Review always shows them). */
+  /** Files changed vs base (auto-derived from git so Review always shows them);
+   * bounded, never tavya's own `.karmax-injection` (src/domain/changed-files.ts). */
   changedFiles?: string[];
+  /** How many files changed, also those `changedFiles` leaves out: the one
+   * count every view shows. Absent on views from before it existed. */
+  changedFileCount?: number;
   /** Agent-authored rich HTML, rendered in a sandboxed iframe (§10.2 tier 4). */
   html?: string;
   /**

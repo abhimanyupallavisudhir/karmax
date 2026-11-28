@@ -380,6 +380,8 @@ export interface World {
   fileSize?(relPath: string): Promise<number>;
   writeFile(relPath: string, content: string): Promise<void>;
   writeFileBuffer?(relPath: string, content: Buffer): Promise<void>;
+  /** World-relative paths of the task's files: never `.git` internals or
+   * tavya's own `.karmax-injection` (src/domain/changed-files.ts). */
   listFiles(): Promise<string[]>;
   startProcess(spec: WorldProcessSpec): Promise<WorldProcess>;
   openPty(spec?: WorldPtySpec): Promise<WorldPty>;

@@ -20,6 +20,9 @@ export interface WidgetSpec {
   title?: string;
   /** Shown when the bound value is empty/missing. */
   empty?: string;
+  /** list: path to how many items there are in all, when the bound list may
+   * be a shortened one (e.g. "reviewInfo.changedFileCount"). */
+  total?: string;
   // table: column field names within each row object (inferred from row 0 if omitted)
   columns?: string[];
   // keyValue: labelled sub-binds, each resolved against the same data root
@@ -36,6 +39,8 @@ export interface ResolvedWidget {
   /** Normalized, ready-to-draw payload (shape depends on type). */
   data: unknown;
   empty?: string;
+  /** list: every item, also those `data` leaves out. */
+  total?: number;
 }
 
 /** Resolve a dot/array path ("a.b.0.c") against an object; undefined if absent. */
@@ -54,7 +59,13 @@ const asArray = (v: unknown): any[] => (Array.isArray(v) ? v : v == null ? [] : 
 /** Resolve a list of widget specs against a view-model into draw-ready descriptors. */
 export function resolveWidgets(specs: WidgetSpec[] | undefined, data: unknown): ResolvedWidget[] {
   if (!specs?.length) return [];
-  return specs.map((spec) => ({ type: spec.type, title: spec.title, empty: spec.empty, data: resolveOne(spec, data) }));
+  return specs.map((spec) => {
+    const resolved: ResolvedWidget = { type: spec.type, title: spec.title, empty: spec.empty, data: resolveOne(spec, data) };
+    const total = spec.type === 'list' && spec.total ? bindPath(data, spec.total) : undefined;
+    if (typeof total === 'number' && Number.isSafeInteger(total) && Array.isArray(resolved.data))
+      resolved.total = Math.max(total, resolved.data.length);
+    return resolved;
+  });
 }
 
 function resolveOne(spec: WidgetSpec, root: unknown): unknown {

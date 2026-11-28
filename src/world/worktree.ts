@@ -16,6 +16,7 @@ import { addCheckoutWith } from './checkout.js';
 import { materializeGitCredential } from './git-credential.js';
 import { readRegularFilePrefix, regularFileSize } from './file-prefix.js';
 import { taskBranch } from '../domain/brand.js';
+import { PLATFORM_DIR, withoutPlatformPaths } from '../domain/changed-files.js';
 
 const pexec = promisify(execFile);
 const managedRepoClones = new Map<string, Promise<string>>();
@@ -25,7 +26,7 @@ function listPlainFiles(root: string, relative = ''): string[] {
   const files: string[] = [];
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
     const next = relative ? path.join(relative, entry.name) : entry.name;
-    if (entry.isDirectory()) files.push(...listPlainFiles(root, next));
+    if (entry.isDirectory()) { if (entry.name !== PLATFORM_DIR) files.push(...listPlainFiles(root, next)); }
     else if (entry.isFile() || entry.isSymbolicLink()) files.push(next.split(path.sep).join('/'));
   }
   return files;
@@ -554,13 +555,13 @@ class WorktreeWorld implements World {
     if (repos.length === 1) {
       const dir = repos[0]!.root;
       const r = await git(dir, ['ls-files', '--cached', '--others', '--exclude-standard']);
-      return r.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+      return withoutPlatformPaths(r.stdout.split('\n').map((s) => s.trim()).filter(Boolean));
     }
     // Multi-repo world: root is the parent — aggregate each repo, prefixed by its subdir.
     const out: string[] = [];
     for (const r of repos) {
       const listed = await git(r.root, ['ls-files', '--cached', '--others', '--exclude-standard']);
-      for (const f of listed.stdout.split('\n').map((s) => s.trim()).filter(Boolean)) out.push(`${r.name}/${f}`);
+      for (const f of withoutPlatformPaths(listed.stdout.split('\n').map((s) => s.trim()).filter(Boolean))) out.push(`${r.name}/${f}`);
     }
     return out;
   }

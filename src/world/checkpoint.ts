@@ -30,6 +30,7 @@ import { transferResourceChunk } from './resource-transfer.js';
 import { isPullRequestView, proposalCheckouts } from './pr-view.js';
 import { reachesTavya } from './tavya-reach.js';
 import { setupDataNeed } from './data-disk.js';
+import { isPlatformPath, PLATFORM_DIR } from '../domain/changed-files.js';
 
 import type { PortableDelta } from './checkpoint-encoding.js';
 
@@ -148,7 +149,7 @@ export class WorldCheckpointService {
         const relative = repo.root === world.handle.root ? change.path : `${repo.name}/${change.path}`;
         // Legacy copyGlobs and broker materializations are inputs, never project
         // data. Do not make them portable merely because they are untracked.
-        if (change.path === '.env' || change.path.startsWith('.karmax-injection/') || ephemeralPaths.has(relative)
+        if (change.path === '.env' || isPlatformPath(change.path) || ephemeralPaths.has(relative)
           || resourcePaths.some((target) => relative === target || relative.startsWith(`${target}/`))) continue;
         if (change.deleted) files.push({ repo: repo.name, path: change.path, deleted: true });
         else {
@@ -178,7 +179,7 @@ export class WorldCheckpointService {
     // paths have their own revisions; injected credentials are never outputs.
     {
       for (const file of await filesOutsideCheckouts(world)) {
-        if (!safeDeltaPath(file) || file === '.env' || file.startsWith('.karmax-injection/')
+        if (!safeDeltaPath(file) || file === '.env' || isPlatformPath(file)
           || ephemeralPaths.has(file)
           || resourcePaths.some((target) => target === '.' || file === target || file.startsWith(`${target}/`))) continue;
         files.push({ repo: '', path: file, readPath: file });
@@ -804,8 +805,8 @@ async function filesOutsideCheckouts(world: World): Promise<string[]> {
   const root = world.handle.root;
   if (isPullRequestView(world.handle) || proposalCheckouts(world.handle)
     || repos.some((repo) => repo.root === root || !repo.root.startsWith(`${root}/`))) return [];
-  const pruned = [...repos.map((repo) => `./${path.posix.relative(root, repo.root)}`), './.karmax-injection'];
-  const listed = await world.exec('find', ['.', '(', '-name', '.git', ...pruned.flatMap((entry) => ['-o', '-path', entry]), ')',
+  const pruned = repos.map((repo) => `./${path.posix.relative(root, repo.root)}`);
+  const listed = await world.exec('find', ['.', '(', '-name', '.git', '-o', '-name', PLATFORM_DIR, ...pruned.flatMap((entry) => ['-o', '-path', entry]), ')',
     '-prune', '-o', '(', '-type', 'f', '-o', '-type', 'l', ')', '-print0'], { cwd: root, timeoutMs: 120_000 });
   if (listed.code !== 0) throw new Error(`could not list the files beside the checkouts: ${listed.stderr || listed.stdout}`);
   return listed.stdout.split('\0').filter(Boolean).map((entry) => entry.replace(/^\.\//, ''));
