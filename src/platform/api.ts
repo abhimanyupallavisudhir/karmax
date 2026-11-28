@@ -4895,6 +4895,30 @@ export class KarmaxApi {
     };
   }
 
+  /**
+   * The view with the question an agent escalated said in its conversation, as
+   * its own message (wiki features/message-forms § Where a question lives).
+   * Held only in the wait, the question — and any form in it — vanished once
+   * the wait ended or another ask replaced it (#1060); in the conversation it
+   * stays, and shows as answered once it is. Nothing is added when the agent's
+   * last message already says it. The agent has seen what it wrote: a message
+   * past `turnsSeen` is one it has not read, and would wake it.
+   */
+  private withAgentQuestion(task: TaskRecord, view: TaskView, callerRole: string | undefined, text: string, audience: string[])
+    : { view: TaskView; role: AgentRole; message: Message } | undefined {
+    const role: AgentRole = callerRole && callerRole !== 'do' && view.transcripts?.some((t) => t.role === callerRole)
+      ? callerRole as AgentRole : 'do';
+    const said = role === 'do' ? view.messages : view.transcripts?.find((t) => t.role === role)?.messages ?? [];
+    if (said.findLast((m) => m.role === 'agent')?.text.trim() === text.trim()) return undefined;
+    const message: Message = { id: `ask-${randomUUID()}`, role: 'agent', text, ts: Date.now(),
+      ...(this.sharedConversation(task) ? { author: MAIN_AGENT, to: audience } : {}) };
+    const next = this.withConversationMessage(view, role, message);
+    const seen = view.state?.turnsSeen;
+    if (role === 'do' && typeof seen === 'number' && seen >= view.messages.length)
+      next.state = { ...view.state, turnsSeen: next.messages.length };
+    return { view: next, role, message };
+  }
+
   /** Clone a view and append one accepted message to exactly one agent transcript. */
   private withConversationMessage(view: TaskView, role: AgentRole, message: Message): TaskView {
     const messages = view.messages.map((candidate) => ({ ...candidate }));
@@ -5339,7 +5363,9 @@ export class KarmaxApi {
       }
     } else {
       await this.stopTaskActivity(task, view, `Escalated to ${audience.join(', ')}`);
-      held = await this.startTransitionReplacement(task, view, view.stage, true, { audience, detail });
+      const asked = caller.taskId === taskId ? this.withAgentQuestion(task, view, caller.role, detail, audience) : undefined;
+      held = await this.startTransitionReplacement(task, asked?.view ?? view, view.stage, true, { audience, detail });
+      if (asked) await this.publishConversationMessage(taskId, asked.role, asked.message);
     }
     const requestedBy = caller.taskId !== '*'
       ? `task-agent:${caller.taskId}:${caller.profileId}`
