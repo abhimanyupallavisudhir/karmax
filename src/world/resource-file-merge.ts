@@ -1,3 +1,6 @@
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { ResourceConflictError } from './resource-conflict.js';
 import { POLICY_FILE } from './resource-policy.js';
@@ -145,6 +148,38 @@ export async function mergeFiles(restic: ResticResources, place: ResticPlace, re
   await writeResolve(world, absolute, where, !!place.file, left.filter((file) => file.kind === 'deleted there').map((file) => file.path));
   throw new ResourceConflictError(options.label, left.map((file) => file.path), options.source,
     guide(options.label, options.source ?? 'a newer published version', where, absolute, left, !!place.file));
+}
+
+/** One file merged line by line on this host, by the same script as a
+ * resource's files (`git merge-file`, else lines both sides only appended:
+ * theirs first): what Files does with an edit made offline (wiki
+ * features/offline-files § Offline edits). `name` only decides how it is read
+ * (a `.gz` is merged uncompressed). Copies over LINE_MERGE_MAX_BYTES are not
+ * merged. */
+export async function mergeCopies(copies: { base: Buffer; theirs: Buffer; mine: Buffer; name: string })
+  : Promise<{ status: 'merged'; content: Buffer } | { status: 'conflict' | 'binary' }> {
+  if (Math.max(copies.base.length, copies.theirs.length, copies.mine.length) > LINE_MERGE_MAX_BYTES) return { status: 'binary' };
+  const name = path.posix.basename(copies.name).replace(/[\0\n\r\\]/g, '_') || 'file';
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-line-merge-'));
+  try {
+    for (const [folder, bytes] of [['base', copies.base], ['other', copies.theirs], ['.work/mine', copies.mine]] as const) {
+      fs.mkdirSync(path.join(dir, folder), { recursive: true });
+      fs.writeFileSync(path.join(dir, folder, name), bytes);
+    }
+    fs.writeFileSync(path.join(dir, '.work', 'list'), `${name}\0`);
+    const run = await new Promise<{ code: number; stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawn('bash', ['-c', MERGE_SCRIPT, 'merge', dir, 'published'], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '', stderr = '';
+      child.stdout.on('data', (chunk) => { stdout += chunk; });
+      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      child.on('error', reject);
+      child.on('close', (code) => resolve({ code: code ?? 1, stdout, stderr }));
+    });
+    if (run.code !== 0) throw new Error(`merging ${name} failed: ${(run.stderr || run.stdout).trim().slice(0, 300)}`);
+    const status = run.stdout.split('\0').find((record) => record.endsWith(`\t${name}`))?.split('\t')[0];
+    if (status === 'merged') return { status, content: fs.readFileSync(path.join(dir, '.work', 'merged', name)) };
+    return { status: status === 'conflict' ? 'conflict' : 'binary' };
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
 /** Put merged files into the resource, in place of this copy's. */

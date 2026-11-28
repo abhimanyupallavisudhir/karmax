@@ -10,6 +10,7 @@ import { git, gitWithInput } from './git.js';
 import { materializeGitCredential } from './git-credential.js';
 import { exampleEnvironmentFile, likelySecret, sqliteDatabase } from '../domain/ignored-files.js';
 import { dotenvFile } from '../domain/dotenv.js';
+import { mergeCopies } from './resource-file-merge.js';
 import { FileAccessError, FileNotFoundError, splitPath, type DataPlace, type FileView, type ProjectFiles, type WritePlaces } from './project-files.js';
 
 /**
@@ -145,6 +146,40 @@ export function planUpload(path: string, size: number, facts: { inData: boolean;
   return { path, keep: 'git' };
 }
 
+/** Where an edit made offline came from, for the name of a copy kept beside
+ * the file: the device's name, when it was made (ms) and the device's offset
+ * from UTC then (minutes east). */
+export interface OfflineEditOrigin { device?: string; at?: number; tz?: number }
+
+/** What became of an edit made offline (`merge` on a write). */
+export interface OfflineEditResult {
+  /** saved: nobody had changed the file; merged: combined line by line with
+   * what changed meanwhile; kept: written beside it, at `path`. */
+  result: 'saved' | 'merged' | 'kept';
+  path: string;
+  /** Why it was kept: the line merge conflicts, a copy is not text, the file
+   * is gone (or is a folder now), or tavya no longer has the version it started from. */
+  why?: 'conflict' | 'binary' | 'deleted' | 'base';
+}
+
+/** The most an offline edit's merge reads of each copy (the console edits ≤ 2 MiB). */
+export const OFFLINE_MERGE_MAX_BYTES = 16 * 1024 * 1024;
+
+/** `notes (offline edit, Pixel 8 2026-11-28 14.05).md` beside `notes.md`, in
+ * the edit's local time; `n` > 1 for the next free name. Pure. */
+export function offlineCopyName(where: string, origin: OfflineEditOrigin, n = 1): string {
+  const segments = where.split('/');
+  const name = segments.pop() ?? where;
+  const dot = name.lastIndexOf('.');
+  const [stem, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ''];
+  const tz = Number.isFinite(origin.tz) ? Math.max(-14 * 60, Math.min(14 * 60, Math.round(origin.tz!))) : 0;
+  const local = new Date((Number.isFinite(origin.at) ? origin.at! : Date.now()) + tz * 60_000);
+  const two = (value: number) => String(value).padStart(2, '0');
+  const when = `${local.getUTCFullYear()}-${two(local.getUTCMonth() + 1)}-${two(local.getUTCDate())} ${two(local.getUTCHours())}.${two(local.getUTCMinutes())}`;
+  const device = String(origin.device ?? '').replace(/[\u0000-\u001f\u007f/\\()]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 40);
+  return [...segments, `${stem} (offline edit${device ? `, ${device}` : ''} ${when})${n > 1 ? ` ${n}` : ''}${ext}`].join('/');
+}
+
 export class ProjectFileChanges {
   constructor(private readonly deps: ProjectFileChangesDeps) {}
 
@@ -183,6 +218,52 @@ export class ProjectFileChanges {
       }
       return result;
     } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+  }
+
+  /** An edit made offline (wiki features/offline-files § Offline edits):
+   * `change.expect` is the version the device started from. Still that
+   * version: saved as it is. Changed meanwhile: merged line by line with the
+   * resources' merge (base = that version, theirs = now, ours = the edit) and
+   * saved over what is there now; when that conflicts, a copy is not text, the
+   * file is gone or its base is no longer on tavya, the edit is written beside
+   * it (`offlineCopyName`) and both are kept. Never overwrites anything. */
+  async applyOffline(projectId: string, view: FileView, change: Extract<FileChange, { op: 'write' }>, origin: OfflineEditOrigin,
+    author: FileChangeAuthor, options: ApplyOptions): Promise<FileChangeResult & { merge: OfflineEditResult }> {
+    if (view.kind === 'task') throw new FileAccessError('Offline edits are of the default or a branch view.');
+    if (typeof change.expect !== 'string' || change.keep) throw new FileAccessError('An offline edit names the version it started from.');
+    const where = splitPath(change.path).join('/');
+    const write = (at: string, source: string, expect: string | null) => this.apply(projectId, view, [{ op: 'write', path: at, source, expect }], author, options);
+    try { return { ...await write(where, change.source, change.expect), merge: { result: 'saved', path: where } }; }
+    catch (error) { if (!(error instanceof FileConflictError)) throw error; }
+    const keep = async (why: NonNullable<OfflineEditResult['why']>) => {
+      for (let n = 1; ; n++) {
+        const at = offlineCopyName(where, origin, n);
+        try { return { ...await write(at, change.source, null), merge: { result: 'kept' as const, path: at, why } }; }
+        catch (error) { if (!(error instanceof FileConflictError) || n >= 50) throw error; }
+      }
+    };
+    const read = { data: options.data, view };
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const now = await this.deps.files.stat(projectId, where, read).catch((error) => { if (error instanceof FileNotFoundError) return undefined; throw error; });
+      if (!now || now.kind !== 'file' || !now.version) return keep('deleted');
+      const base = await this.deps.files.versionBytes(projectId, where, change.expect, read, OFFLINE_MERGE_MAX_BYTES);
+      if (!base) return keep('base');
+      if ((now.size ?? 0) > OFFLINE_MERGE_MAX_BYTES) return keep('binary');
+      const theirs = await this.deps.files.open(projectId, where, read, async (file) => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of file.stream) chunks.push(Buffer.from(chunk));
+        await file.done;
+        return { bytes: Buffer.concat(chunks), version: file.node.version ?? now.version };
+      });
+      const merged = await mergeCopies({ base, theirs: theirs.bytes, mine: fs.readFileSync(change.source), name: where });
+      if (merged.status !== 'merged') return keep(merged.status);
+      const source = `${change.source}.merged`;
+      fs.writeFileSync(source, merged.content);
+      try { return { ...await write(where, source, theirs.version!), merge: { result: 'merged', path: where } }; }
+      catch (error) { if (!(error instanceof FileConflictError)) throw error; /* changed again meanwhile: once more */ }
+      finally { fs.rmSync(source, { force: true }); }
+    }
+    return keep('conflict');
   }
 
   /** Where each upload (`path` where it lands, `size`) is best kept, in a
