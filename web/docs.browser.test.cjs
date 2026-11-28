@@ -151,12 +151,19 @@ const site = globalThis.KarmaxSite;
 
     // Download: the button for this computer first, with the version it gets; the stores that are set.
     await context.route('http://console.test/download/desktop/latest.json', (route) => route.fulfill({ json: { version: '1.2.0', files: {} } }));
+    await context.route('http://console.test/media/download/*', (route) => route.fulfill({ contentType: 'image/webp',
+      body: fs.readFileSync(path.join(__dirname, 'media', 'download', path.basename(new URL(route.request().url()).pathname))) }));
     await page.goto('http://console.test/download');
     await page.locator('#download-this').waitFor();
     assert.equal(await page.locator('#download-this').getAttribute('href'), '/download/desktop/tavya-linux-x64.AppImage');
     await page.locator('#download-version', { hasText: 'Version 1.2.0 · AppImage' }).waitFor();
     assert.deepEqual(await page.locator('.store-badge img').evaluateAll((images) => images.map((image) => image.alt)), ['Download on the App Store'],
       'only the stores the installation has links for');
+    // The app's picture, in the page's look, loaded.
+    const shot = page.locator('.download-shot img.lp-light');
+    assert.equal(await shot.getAttribute('src'), '/media/download/desktop-light.webp');
+    assert.ok(await shot.evaluate((image) => image.decode().then(() => image.naturalWidth)) === 1600, 'the picture loads');
+    assert.ok(await page.locator('.download-shot + .download-hero, .download-hero + .download-shot').count() === 1, 'beside the button');
     if (shots) await page.screenshot({ path: path.join(shots, 'download.png'), fullPage: true });
     const mac = await browser.newContext({ serviceWorkers: 'block', userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36' });
     await fakeConsole(mac, { project: { id: 'p', organizationId: 'o', name: 'Website', config: {} }, async api(p) { if (p === '/api/launch') return { policyVersion: '1', policies, pricingCatalog: [] }; } });

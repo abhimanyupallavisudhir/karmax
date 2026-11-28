@@ -33037,9 +33037,12 @@ async function enhanceDownloadPage() {
     if (using) using.insertAdjacentHTML('beforebegin', section);
     else article.insertAdjacentHTML('beforeend', section);
   }
+  const lede = article.querySelector('h1 + .md-p') || article.querySelector('h1');
+  // The app itself, in the visitor's look (shot from the demo organization: tests/store-screens.browser.test.ts).
+  if (!article.querySelector('.download-shot')) lede.insertAdjacentHTML('afterend', `<figure class="download-shot">${['light', 'dark'].map((look) =>
+    `<img class="lp-${look}" src="/media/download/desktop-${look}.webp" alt="${look === 'light' ? 'The tavya desktop app: the tasks waiting for you' : ''}"${look === 'dark' ? ' aria-hidden="true"' : ''} width="1600" height="1000" decoding="async">`).join('')}</figure>`);
   const target = downloadTarget();
   if (!target) return;
-  const lede = article.querySelector('h1 + .md-p') || article.querySelector('h1');
   lede.insertAdjacentHTML('afterend', `<div class="download-hero"><a class="landing-start lp-large" id="download-this" href="/download/desktop/${target.file}">${esc(target.label)}</a>
     <span class="download-version" id="download-version">${target.detail ? esc(target.detail) : ''}</span></div>`);
   const latest = await fetch('/download/desktop/latest.json').then((response) => response.ok ? response.json() : null).catch(() => null);

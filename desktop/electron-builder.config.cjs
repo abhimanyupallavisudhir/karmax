@@ -67,7 +67,7 @@ module.exports = {
     entitlements: entitlements(),
     entitlementsInherit: path.join(__dirname, 'build', 'entitlements.mac.plist'),
     ...(profile && team ? { provisioningProfile: profile } : {}),
-    extendInfo: { NSMicrophoneUsageDescription: 'tavya uses the microphone while you dictate.' },
+    extendInfo: { NSMicrophoneUsageDescription: 'tavya listens only while you dictate, to type what you say into a task or message.' },
   },
   dmg: { artifactName: 'tavya-${version}-universal.${ext}' },
   linux: {

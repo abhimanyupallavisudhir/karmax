@@ -135,6 +135,10 @@ it('signs the desktop app in through the system browser to a loopback listener, 
   }
 }, 120_000);
 
+// A reloaded page opens its /ws socket only after the console boots; on a loaded CI
+// runner that takes longer than expect.poll's default second (CI #3209).
+const SOCKET_UP = 15_000;
+
 it('notifies over the app\'s own connection, badges the For-me count, opens links, and has its settings in Profile', async () => {
   const { user, organization } = await g.owner({ name: 'Bea', email: 'bea@example.test', password: PASSWORD, organization: 'Bureau' });
   const project = await g.store.createProject('Website', undefined, organization.id);
@@ -157,14 +161,14 @@ it('notifies over the app\'s own connection, badges the For-me count, opens link
       expect((await g.store.listPushSubscriptions(user.id))[0]!.label).toMatch(/^tavya on (Mac|Linux)$/);
       await expect.poll(() => toggle.isChecked()).toBe(true);
       const [device] = await g.store.listPushSubscriptions(user.id);
-      await expect.poll(() => sockets.connected(device!.id)).toBe(1);
+      await expect.poll(() => sockets.connected(device!.id), { timeout: SOCKET_UP }).toBe(1);
       await shot(page, 'desktop-push-settings');
     });
 
     await step('a push arrives over /ws as a notification that replaces by tag, and a click opens its page', async () => {
       await page.goto(`${g.url}/profile`);
       const [device] = await g.store.listPushSubscriptions(user.id);
-      await expect.poll(() => sockets.connected(device!.id)).toBe(1);
+      await expect.poll(() => sockets.connected(device!.id), { timeout: SOCKET_UP }).toBe(1);
       const inbox = { id: 'inbox_d1', organizationId: organization.id, userId: user.id, eventSeq: 1, taskId: task.id, kind: 'review-requested' as const,
         urgency: 'high' as const, unread: true, actionable: true, createdAt: Date.now() };
       await adapter.deliver({ inbox, task: { id: task.id, num: task.num, title: task.title, projectId: project.id } });

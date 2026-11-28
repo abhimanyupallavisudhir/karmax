@@ -20,6 +20,9 @@ deploy/backups/
 deploy/.updates/
 design/*.png
 design/**/*.png
+# Store screenshots are tracked (they are uploaded); the desktop shots and the contact sheet are for looking over.
+mobile/store/screenshots/desktop/
+mobile/store/screenshots/contact-sheet.jpg
 
 # logs / coverage / caches
 *.log

@@ -1,6 +1,6 @@
 # Download tavya
 
-tavya in its own window on your Mac or Linux computer: what's for you in the menu bar, Ask from any app with one shortcut, and notifications. It keeps itself up to date.
+tavya in its own window on your Mac or Linux computer: what's for you in the menu bar, Ask from any app with one shortcut, notifications, dictation, and project files kept offline. It keeps itself up to date.
 
 ## Mac
 
